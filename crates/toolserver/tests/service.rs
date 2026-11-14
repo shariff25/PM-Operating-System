@@ -65,6 +65,8 @@ async fn lists_only_declared_tools() {
             "confluence_search",
             "context_read",
             "context_search",
+            "docs_read",
+            "docs_search",
             "jira_read",
             "jira_search",
         ]

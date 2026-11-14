@@ -1,0 +1,12 @@
+# Who may use PM OS, until SSO replaces this file in Phase 1. Changes go by pull request,
+# reviewed by a platform-owner PM.
+#
+# handle:    the PM OS handle; matches master/people/<handle>/ if that folder exists
+# slack-id:  the Slack member id (Profile → ⋯ → Copy member ID), such as U012AB3CD
+# roles:     pm, skill-author, admin (admin = platform owner)
+#
+# Example:
+#   - handle: ana
+#     slack-id: U012AB3CD
+#     roles: [pm, skill-author]
+members: []

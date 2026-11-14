@@ -17,6 +17,8 @@ use pmos_contract::Sensitivity;
 use serde::Serialize;
 use walkdir::WalkDir;
 
+pub use pmos_contract::text::{snippet, terms};
+
 use crate::store::StoreResult;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -154,14 +156,6 @@ fn first_heading(body: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Lowercased words of two or more characters.
-pub fn terms(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() > 1)
-        .map(str::to_lowercase)
-        .collect()
-}
-
 #[async_trait]
 impl ContextIndex for MemoryIndex {
     async fn search(
@@ -216,24 +210,6 @@ impl ContextIndex for MemoryIndex {
         *current = next;
         Ok(ReindexReport { indexed, removed })
     }
-}
-
-/// The first non-empty body line that mentions a query term, cut to 200 characters.
-pub fn snippet(body: &str, query_terms: &[String]) -> String {
-    let line = body
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("<!--"))
-        .find(|l| {
-            let lower = l.to_lowercase();
-            query_terms.iter().any(|q| lower.contains(q.as_str()))
-        })
-        .unwrap_or_default();
-    let mut out: String = line.chars().take(200).collect();
-    if line.chars().count() > 200 {
-        out.push('…');
-    }
-    out
 }
 
 #[cfg(test)]

@@ -133,7 +133,12 @@ fn build(dir: TempDir, root: PathBuf, stores: Stores, audit: Arc<MemoryAudit>) -
     let jira = Arc::new(FakeConnector::jira());
     let confluence = Arc::new(FakeConnector::confluence());
     let slack = Arc::new(FakeConnector::slack());
-    let connectors: Vec<Arc<dyn Connector>> = vec![jira.clone(), confluence.clone(), slack.clone()];
+    let connectors: Vec<Arc<dyn Connector>> = vec![
+        jira.clone(),
+        confluence.clone(),
+        slack.clone(),
+        Arc::new(FakeConnector::docs()),
+    ];
     let svc = ToolService::new(catalog, stores, connectors).unwrap();
     Fixture {
         _dir: dir,

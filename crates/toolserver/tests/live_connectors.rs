@@ -894,6 +894,7 @@ async fn link_over_http_then_call_through_the_tool_server() {
         Arc::new(Jira::new(tokens.clone(), l.base.clone())),
         Arc::new(Confluence::new(tokens.clone(), l.base.clone())),
         Arc::new(Slack::new(tokens, l.base.clone())),
+        Arc::new(pmos_toolserver::connectors::fake::FakeConnector::docs()),
     ];
     let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
     let cancel = CancellationToken::new();

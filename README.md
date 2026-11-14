@@ -17,10 +17,13 @@ Slack without the PM's approval.
 | `crates/contract` | The content contract and its lint | Rust |
 | `crates/cli` | `pmos`, the command line for skill authors | Rust |
 | `crates/toolserver` | The only path from a sandbox to context and systems: MCP, allowlists, approvals, audit ([docs](docs/toolserver.md)) | Rust |
+| `crates/docs` | `pmos-docs`: MCP server over the public Fortanix support docs ([docs](docs/docs-server.md)) | Rust |
+| `crates/slack` | `pmos-slack`: the Slack bot; today `/docs` ([docs](docs/docs-server.md)) | Rust |
 | `harness/` | Team-service agent on LangChain Deep Agents | TypeScript |
 
-Still to come, per the plan: the gateway, orchestrator, policy checker, and the Slack bot
-(Rust), which is how PMs use PM OS; plus sandbox policies, evals and a few admin pages.
+Still to come, per the plan: the gateway, orchestrator and policy checker (Rust), the rest
+of the Slack bot (mentions, assistant panel, approvals), sandbox policies, evals and a few
+admin pages.
 
 ## Develop
 

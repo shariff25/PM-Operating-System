@@ -31,6 +31,10 @@ pub struct LiveConfig {
     /// `PMOS_ATLASSIAN_AUTH_URL`, `PMOS_ATLASSIAN_API_URL`, `PMOS_SLACK_URL`: overrides for
     /// tests against mock APIs. Default to the real hosts.
     pub endpoints: Endpoints,
+    /// `PMOS_DOCS_URL`: the `pmos-docs` MCP endpoint, such as `http://docs.pmos.internal:8730/mcp`.
+    pub docs_url: String,
+    /// `PMOS_DOCS_TOKEN`: the bearer token `pmos-docs` expects.
+    pub docs_token: Secret,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +158,8 @@ fn live_config(get: &impl Fn(&str) -> Option<String>) -> Result<LiveConfig, Stri
             atlassian_api: get("PMOS_ATLASSIAN_API_URL").unwrap_or(defaults.atlassian_api),
             slack: get("PMOS_SLACK_URL").unwrap_or(defaults.slack),
         },
+        docs_url: need("PMOS_DOCS_URL")?,
+        docs_token: Secret::new(need("PMOS_DOCS_TOKEN")?),
     })
 }
 
@@ -225,6 +231,8 @@ mod tests {
             ("PMOS_ATLASSIAN_CLIENT_SECRET", "atl-secret"),
             ("PMOS_SLACK_CLIENT_ID", "slk"),
             ("PMOS_SLACK_CLIENT_SECRET", "slk-secret"),
+            ("PMOS_DOCS_URL", "http://docs.pmos.internal:8730/mcp"),
+            ("PMOS_DOCS_TOKEN", "docs-token"),
         ];
         let ok = cfg(&base).unwrap();
         let Connectors::Live(live) = ok.connectors else {
@@ -245,6 +253,7 @@ mod tests {
             "PMOS_VAULT_KEY",
             "PMOS_PUBLIC_URL",
             "PMOS_SLACK_CLIENT_SECRET",
+            "PMOS_DOCS_URL",
         ] {
             let partial: Vec<_> = base.iter().copied().filter(|(k, _)| *k != skip).collect();
             assert!(cfg(&partial).unwrap_err().contains(skip), "{skip}");

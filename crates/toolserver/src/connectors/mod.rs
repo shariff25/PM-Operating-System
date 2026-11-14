@@ -8,6 +8,7 @@
 //! model treat it as data, never as instructions.
 
 pub mod atlassian;
+pub mod docs;
 pub mod fake;
 pub mod format;
 pub mod http;

@@ -95,6 +95,18 @@ pub fn input_schema(tool: &str) -> Option<Value> {
             json!({"channel": {"type": "string", "description": "Channel or user id"}, "text": {"type": "string"}}),
             &["channel", "text"],
         ),
+        "docs.search" => object(
+            json!({
+                "query": {"type": "string", "description": "What to look for in the support docs"},
+                "product": {"type": "string", "enum": ["dsm", "ccm", "confidential-ai", "key-insight", "armor", "general"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Maximum results (default 5)"},
+            }),
+            &["query"],
+        ),
+        "docs.read" => object(
+            json!({"url": {"type": "string", "description": "A support.fortanix.com/docs link from a search result"}}),
+            &["url"],
+        ),
         _ => return None,
     };
     Some(schema)
