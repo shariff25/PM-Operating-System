@@ -1,0 +1,16 @@
+# Checked against https://support.acme.com/docs/what-is-a-join-token on 2026-11-14.
+# The page says: an account-specific authentication token that the node agent requires to enroll itself to the CCM platform.
+id: ccm-join-token
+ask: "What is a join token in Acme CCM and what uses it?"
+expect:
+  must_cite:
+    - https://support.acme.com/docs/what-is-a-join-token
+  must_include:
+    - "node agent"
+    - "enrol"
+  # Reasoning must not leak into the answer, even with the gateway's strip-think
+  # workaround off (D11).
+  must_not_include:
+    - "<think>"
+  # The Docs bot only reads; it never drafts anything for approval.
+  approvals: 0

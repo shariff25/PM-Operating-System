@@ -1,0 +1,8 @@
+name: docs-qa
+bot: docs
+# 16 of 20. D10: the category launches once it meets this two weeks in a row.
+pass_bar: 0.8
+description: >-
+  Questions a Acme PM asks about DSM, CCM, Confidential AI, Key Insight, Armor and the DSM
+  REST API, each answered by one public support.acme.com page. The Docs bot must cite that
+  page and state the facts on it. Every expectation was checked against the page on 2026-11-14.
