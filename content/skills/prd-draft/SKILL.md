@@ -6,7 +6,7 @@ metadata:
   version: "0.1.0"
   model: "default"
   data-class: "restricted"
-  tools: "context.search context.read jira.search jira.read confluence.search confluence.read confluence.create_draft"
+  tools: "context.search context.read jira.search jira.read confluence.search confluence.read confluence.create_draft docs.search docs.read"
   surfaces: "slack web cli"
   ships-in: "phase-0"
 ---
@@ -25,7 +25,9 @@ Turn a brief into a review-ready first draft (PRD journey J1).
    - product context for the area (`context.search` in `products`, `personas`, `competitors`);
    - two or three similar past PRDs from `exemplars`;
    - the linked epic and its open issues (`jira.read`, `jira.search`);
-   - recent customer asks in Jira and Confluence call notes.
+   - recent customer asks in Jira and Confluence call notes;
+   - what the public support docs already say about the area (`docs.search`), so the PRD
+     doesn't contradict shipped behavior.
 3. Ask up to three clarifying questions where the answer would change scope, users or success
    metrics. Wait for answers, or for the PM to say "draft anyway".
 4. Write the draft:

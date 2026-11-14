@@ -21,7 +21,7 @@ pub fn input_schema(tool: &str) -> Option<Value> {
     let schema = match tool {
         "context.search" => object(
             json!({
-                "query": {"type": "string", "description": "What to look for"},
+                "query": {"type": "string", "description": "What to look for", "maxLength": 500},
                 "domain": {"type": "string", "enum": CONTEXT_DOMAINS, "description": "Limit to one context domain"},
                 "limit": limit(),
             }),
@@ -40,7 +40,7 @@ pub fn input_schema(tool: &str) -> Option<Value> {
             &["key", "text"],
         ),
         "jira.search" => object(
-            json!({"jql": {"type": "string", "description": "JQL query"}, "limit": limit()}),
+            json!({"jql": {"type": "string", "description": "JQL query", "maxLength": 2000}, "limit": limit()}),
             &["jql"],
         ),
         "jira.read" => object(
@@ -58,7 +58,7 @@ pub fn input_schema(tool: &str) -> Option<Value> {
             &["project", "issue_type", "summary"],
         ),
         "confluence.search" => object(
-            json!({"cql": {"type": "string", "description": "CQL query"}, "limit": limit()}),
+            json!({"cql": {"type": "string", "description": "CQL query", "maxLength": 2000}, "limit": limit()}),
             &["cql"],
         ),
         "confluence.read" => object(json!({"page_id": {"type": "string"}}), &["page_id"]),
@@ -80,7 +80,7 @@ pub fn input_schema(tool: &str) -> Option<Value> {
             &["page_id", "body"],
         ),
         "slack.search" => object(
-            json!({"query": {"type": "string"}, "limit": limit()}),
+            json!({"query": {"type": "string", "maxLength": 500}, "limit": limit()}),
             &["query"],
         ),
         "slack.read_thread" => object(
@@ -94,6 +94,18 @@ pub fn input_schema(tool: &str) -> Option<Value> {
         "slack.send_message" => object(
             json!({"channel": {"type": "string", "description": "Channel or user id"}, "text": {"type": "string"}}),
             &["channel", "text"],
+        ),
+        "docs.search" => object(
+            json!({
+                "query": {"type": "string", "description": "What to look for in the support docs", "maxLength": 500},
+                "product": {"type": "string", "enum": ["dsm", "ccm", "confidential-ai", "key-insight", "armor", "general"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Maximum results (default 5)"},
+            }),
+            &["query"],
+        ),
+        "docs.read" => object(
+            json!({"url": {"type": "string", "description": "A support.acme.com/docs link from a search result"}}),
+            &["url"],
         ),
         _ => return None,
     };
@@ -184,6 +196,8 @@ mod tests {
         .contains("unknown"));
         let search = input_schema("context.search").unwrap();
         assert!(check_args(&search, &json!({"query": "x", "limit": 50})).is_err());
+        // Search input is bounded, so a huge query can't become a huge database query.
+        assert!(check_args(&search, &json!({"query": "x".repeat(501)})).is_err());
         assert!(check_args(&search, &json!("x")).is_err());
     }
 }

@@ -384,5 +384,55 @@ fn repo_content_passes() {
     let errors: Vec<_> = report.errors().collect();
     assert!(errors.is_empty(), "{errors:#?}");
     let names: Vec<_> = report.skills.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["ask", "meeting-notes", "prd-draft"]);
+    assert_eq!(names, vec!["ask", "docs", "meeting-notes", "prd-draft"]);
+}
+
+#[test]
+fn team_file_rules() {
+    let dir = valid_tree();
+    write(
+        dir.path(),
+        "team.yaml",
+        "members:\n  - {handle: ana, slack-id: U0ANA1, roles: [pm, skill-author]}\n  - {handle: Ana, slack-id: U0ANA1, roles: []}\n  - {handle: bo, slack-id: x123, roles: [admin]}\n  - {handle: bo, slack-id: U0BO, roles: [pm]}\n  - {handle: dee, slack-id: U0DEE, email: not-an-email, roles: [pm]}\n",
+    );
+    std::fs::create_dir_all(dir.path().join("master/people/cy")).unwrap();
+    let report = run(&dir);
+    for code in [
+        "team-handle",
+        "team-duplicate",
+        "team-slack-id",
+        "team-roles",
+        "team-email",
+    ] {
+        assert_code(&report, code, Severity::Error);
+    }
+    assert_code(&report, "people-unknown", Severity::Warning);
+    // Both duplicate kinds are reported: the Slack id and the handle.
+    assert_eq!(
+        report
+            .codes()
+            .iter()
+            .filter(|c| **c == "team-duplicate")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn team_file_parses_and_looks_up_by_slack_id() {
+    let team = pmos_contract::model::TeamFile::from_yaml(
+        "members:\n  - {handle: ana, slack-id: U0ANA1, roles: [pm]}\n",
+    )
+    .unwrap();
+    assert_eq!(team.by_slack_id("U0ANA1").unwrap().handle, "ana");
+    assert!(team.by_slack_id("U0BO").is_none());
+    assert_eq!(team.by_handle("ana").unwrap().slack_id, "U0ANA1");
+    assert!(team.by_handle("ana").unwrap().email.is_none());
+    assert!(pmos_contract::model::TeamFile::from_yaml(
+        "members:\n  - {handle: a, slack-id: U1, roles: [owner]}\n"
+    )
+    .is_err());
+    let dir = valid_tree();
+    write(dir.path(), "team.yaml", "members: [\n");
+    assert_code(&run(&dir), "team-parse", Severity::Error);
 }

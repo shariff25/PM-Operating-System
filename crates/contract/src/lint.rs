@@ -104,6 +104,7 @@ pub fn lint(root: &Path, opts: &LintOptions) -> Report {
     cx.check_context(opts);
     cx.check_reviewers();
     cx.check_templates();
+    cx.check_team();
 
     cx.report
         .diagnostics
@@ -562,6 +563,89 @@ impl Cx {
             }
             if body.trim().is_empty() {
                 self.error("template-body-empty", &path, "template is empty");
+            }
+        }
+    }
+}
+
+impl Cx {
+    /// `team.yaml` is optional; without it nobody can use the Slack bot.
+    fn check_team(&mut self) {
+        let path = self.root.join("team.yaml");
+        if !path.is_file() {
+            return;
+        }
+        let Some(text) = self.read(&path) else {
+            return;
+        };
+        let team = match crate::model::TeamFile::from_yaml(&text) {
+            Ok(t) => t,
+            Err(e) => {
+                self.error("team-parse", &path, format!("invalid team.yaml: {e}"));
+                return;
+            }
+        };
+        let mut handles = BTreeSet::new();
+        let mut slack_ids = BTreeSet::new();
+        for m in &team.members {
+            if !crate::model::valid_handle(&m.handle) {
+                self.error(
+                    "team-handle",
+                    &path,
+                    format!(
+                        "`{}` is not a valid handle (lowercase letters, digits, `.`, `_`, `-`)",
+                        m.handle
+                    ),
+                );
+            }
+            if !handles.insert(m.handle.clone()) {
+                self.error(
+                    "team-duplicate",
+                    &path,
+                    format!("handle `{}` is listed twice", m.handle),
+                );
+            }
+            if !crate::model::valid_slack_id(&m.slack_id) {
+                self.error(
+                    "team-slack-id",
+                    &path,
+                    format!("`{}` is not a Slack member id (U… or W…)", m.slack_id),
+                );
+            }
+            if !slack_ids.insert(m.slack_id.clone()) {
+                self.error(
+                    "team-duplicate",
+                    &path,
+                    format!("Slack id `{}` is listed twice", m.slack_id),
+                );
+            }
+            if let Some(email) = &m.email {
+                if !crate::model::valid_email(email) {
+                    self.error(
+                        "team-email",
+                        &path,
+                        format!("`{email}` is not an email address"),
+                    );
+                }
+            }
+            if m.roles.is_empty() {
+                self.error("team-roles", &path, format!("`{}` has no roles", m.handle));
+            }
+        }
+        // A personal master-context folder should belong to someone on the team.
+        if let Some(people) = sorted_entries(&self.root.join("master").join("people")) {
+            for dir in people.into_iter().filter(|p| p.is_dir()) {
+                let name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !handles.contains(&name) {
+                    self.warn(
+                        "people-unknown",
+                        &dir,
+                        format!("`{name}` is not in team.yaml"),
+                    );
+                }
             }
         }
     }
