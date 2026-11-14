@@ -6,6 +6,7 @@
 //! for the team service, Hermes for personal agents) relies on the same contract (MOD-1).
 //! The formats are documented in `docs/contract.md`.
 
+pub mod bots;
 pub mod frontmatter;
 pub mod lint;
 pub mod model;
