@@ -85,7 +85,7 @@ The tool server never uses an installation token.
 With `PMOS_MEMORY=github`, `memory_read` and `memory_update` use the memory repo of the session's
 user, the PM the task is for.
 
-**Memory repo record** (new store, in memory and Postgres, migration `0005`): `user → repo`
+**Memory repo record** (new store, in memory and Postgres, migration `0006_onboarding.sql`): `user → repo`
 (`org/name`), plus `verified_at`.
 
 **Set and read the record:**
@@ -121,7 +121,7 @@ source: "pm-ana, task 0d3f…"   # the bot (or skill) and the run id that wrote 
 
 ## 3. Members (tool server)
 
-**Requests:** a new store in memory and Postgres (same migration), with these fields:
+**Requests:** a new store in memory and Postgres (migration `0006_onboarding.sql`), with these fields:
 - `id` (uuid), `slack_id`, `email`, `name`, `proposed_handle`;
 - `status`: `pending`, `approved`, `rejected` or `failed`;
 - `requested_at`, `decided_by`, `decided_at`, `handle` (the handle granted), `commit`, `error`.
@@ -318,3 +318,30 @@ the `docs` bot.
 
 **Bot runtime:** a content change adds a bot to `GET /v1/bots`; a lint failure keeps the old
 catalog.
+
+## As built (2026-11-14)
+
+Differences from the text above, and codes added while building:
+- **Migration** `0006_onboarding.sql` (`0005` was taken). It also allows `github` as a
+  credentials provider.
+- **More error codes:**
+  - `403 not_admin` and `403 self_removal`;
+  - `404 not_a_member` on removal;
+  - `409 owns_bots`: a member who still owns a team bot can't be removed until it has a new
+    owner, or the content would stop passing the lint;
+  - `409 not_configured`: no content repo or GitHub App;
+  - `422 bad_request`;
+  - memory repo: `502` or `504 github_unavailable` (GitHub gets 1.8 s, inside the Slack
+    modal's ack), and `404 github_off`.
+- **`MemoryStore`** returns `MemoryError` (store failure, refusal or unavailable), so a refusal
+  reaches the model as itself.
+- **Content sync defaults to `0` with fake connectors**, so a developer's checkout isn't pulled.
+- **GitHub links PMs only:** a `bots.*` identity is refused.
+- **The first note in an empty repo** goes through the contents API, because the git data API
+  can't commit to an empty repo.
+- **Slack:**
+  - the memory-repo modal answers inside its ack, with a 2.5 s cap;
+  - `requests` and `remove …` from a non-admin go to their bot as ordinary text;
+  - the catalog reload also watches `tools.yaml` and `skills/**`;
+  - admin cards are tracked in memory, so after a restart a decision updates only the tapped
+    card.

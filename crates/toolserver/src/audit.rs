@@ -35,6 +35,8 @@ pub enum Outcome {
     Started,
     /// The call failed in a connector or on bad input.
     Error,
+    /// An approved member could not be committed to the content repo.
+    Failed,
 }
 
 /// Who made the call: a sandbox over MCP, or an internal service with its own token.

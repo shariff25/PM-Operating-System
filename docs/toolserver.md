@@ -67,10 +67,17 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | `GET /internal/approvals/{id}` | service or bot token | One item |
 | `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?}` | service or bot token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). The audit records which token decided. |
 | `POST /internal/reindex` | service token | Rebuild the context index from the content checkout and re-read `team.yaml`, the bots and their roles; `422` if it fails `pmos lint` |
-| `GET /internal/oauth/{atlassian\|slack}/start?user=` | service token | The URL to send a PM to so they can link their account. `user=bots.<name>` gives the URL for a team bot's own account (`404` unless `<name>` is a team bot). |
-| `GET /oauth/{atlassian\|slack}/callback` | none (the PM's browser) | Finishes linking; shows a short page |
+| `GET /internal/oauth/{atlassian\|slack\|github}/start?user=` | service or bot token | The URL to send a PM to so they can link their account. The bot token gets URLs for team members only (`403` otherwise). `user=bots.<name>` (service token) gives the URL for a team bot's own account (`404` unless `<name>` is a team bot); GitHub links PMs only. |
+| `GET /oauth/{atlassian\|slack\|github}/callback` | none (the PM's browser) | Finishes linking; shows a short page |
 | `GET /internal/credentials?user=` | service token | A PM's linked accounts, without tokens |
 | `DELETE /internal/credentials/{user}/{provider}` | service token | Unlink (the PM disconnects, or a platform owner revokes) |
+| `POST /internal/memory/repo` `{user, repo}` | service or bot token | Check `repo` (`org/name`) with the PM's GitHub token and record it as their memory repo: `200 {repo, verified_at}`. `422 {error, code}` with `not_in_org`, `not_private`, `archived`, `no_push`, `not_found` or `bad_request`; `409 github_not_linked`; `504 github_unavailable` if GitHub doesn't answer within 1.8 s (it runs inside a Slack modal); `404 github_off` without GitHub |
+| `GET /internal/memory/repo?user=` | service or bot token | `{repo, verified_at}`, or `404` |
+| `POST /internal/members/requests` `{slack_id, email, name}` | service or bot token | A request to join: `201 {request}`, or `200 {request}` with the one already pending for that Slack id. `409 already_member`, `422 bad_request`, `429 too_many_pending` (past 20) |
+| `GET /internal/members/requests?status=` | service or bot token | `{requests: […]}`, oldest first; `status` is `pending`, `approved`, `rejected` or `failed` |
+| `POST /internal/members/requests/{id}/decision` `{decision, decided_by, handle?, roles?}` | service or bot token | `approve` or `reject`, by an `admin` in `team.yaml` (`403 not_admin`). See **Members**. `200 {request}`; `409 already_decided` with `request`; `422 bad_handle`; `409 github_not_linked`, `no_push` or `not_configured` (still pending); `502 commit_failed` with `request` (now `failed`) |
+| `POST /internal/members/{handle}/remove` `{decided_by}` | service or bot token | Admin only; not oneself (`403 self_removal`). `200 {handle, commit}`, `404 not_a_member`, `409 owns_bots` if they still own a team bot |
+| `GET /internal/onboarding?user=` or `?slack_id=` | service or bot token | A PM's setup checklist: `member`, `handle`, `admin`, `linked` (`atlassian`, `slack`, `github`), `memory_repo`, `personal_bot` (in the loaded content), and for a non-member by Slack id, `pending_request` |
 
 **Who holds which token:**
 - **Service token** (`PMOS_SERVICE_TOKEN`): the orchestrator, the bot runtime and platform-owner tools. Every route, and the only token that starts bot sessions.
@@ -159,17 +166,18 @@ read scope (see **Bot sessions**); its writes still act as the PM.
 | Slack | the PM's user token (`xoxp`), never a bot token | `assistant.search.context` (Real-time Search; results are never stored), `conversations.replies`, `chat.postMessage` |
 | Support docs | none (public docs); the tool server's `PMOS_DOCS_TOKEN` to `pmos-docs` | `search_docs`, `get_doc` over MCP; see `docs/docs-server.md` |
 
-These API shapes were checked against developer.atlassian.com and docs.slack.dev in November
-2026, and tested against local mocks (`tests/live_connectors.rs`). The first real call
-happens on the Spark after Gate 1.
+These API shapes were checked against developer.atlassian.com, docs.slack.dev and
+docs.github.com in November 2026, and tested against local mocks (`tests/live_connectors.rs`,
+`tests/github.rs`). The first real call happens on the Spark after Gate 1.
 
 **Linking an account.**
 1. The Slack bot (its Accounts tab, or a first-use prompt) asks `/internal/oauth/{provider}/start` for a URL and sends the PM there.
 2. Atlassian or Slack sends the PM's browser back to `/oauth/{provider}/callback`.
 3. The tool server exchanges the code and checks the account belongs to that PM in
    `team.yaml`: the Slack user must be the member's `slack-id`, and the Atlassian account's
-   email (from `/me`, scope `read:me`) must be the member's `email`. Only then does it seal the
-   tokens in the vault. A link forwarded to someone else attaches nothing.
+   email (from `/me`, scope `read:me`) must be the member's `email`. For GitHub, see
+   **GitHub**. Only then does it seal the tokens in the vault. A link forwarded to someone else
+   attaches nothing.
 
 The `state` value is HMAC-signed, names the user and provider, expires in 10 minutes and is
 accepted once. Atlassian asks for `offline_access`, so it returns a refresh token, and
@@ -213,6 +221,127 @@ new one, which replaces the old.
 - Caller-supplied ids (issue keys, page ids, Slack channels and timestamps) are validated
   before they reach a URL.
 
+### GitHub
+
+PM OS uses a GitHub App with **user** access tokens only: each PM links GitHub like Atlassian
+and Slack, and every GitHub call acts as a PM. Memory reads and writes act as the memory's
+owner; content-repo commits act as the platform owner who approved them. The tool server
+never uses an installation token, and GitHub limits a user token to what that PM can already
+reach.
+
+**Linking** (`/internal/oauth/github/start`): `{PMOS_GITHUB_AUTH_URL}/login/oauth/authorize`
+with no scope (the App's permissions apply); the code is exchanged at
+`/login/oauth/access_token`. Before anything is stored:
+1. `GET /user` gives the login.
+2. `GET /user/memberships/orgs/{PMOS_GITHUB_ORG}` must say `state: active`. A pending
+   invitation or no membership is refused.
+3. If the member has `github` in `team.yaml`, the login must equal it (ignoring case).
+   Otherwise one **verified** address from `GET /user/emails` must equal their `email`.
+4. The login is kept as the credential's `external_id`.
+
+**Tokens** expire in 8 hours; the refresh token in about 6 months, and it rotates. GitHub
+answers some errors as `200` with `{"error": …}`: `bad_refresh_token` unlinks the account,
+like Atlassian's `invalid_grant`; any other error keeps it and the call fails as unavailable.
+
+**Calls** (`src/github.rs`) send `Accept: application/vnd.github+json`,
+`X-GitHub-Api-Version: 2022-11-28` and a `User-Agent`, with a 5 s connect and 20 s overall
+timeout. A `401` asks the PM to reconnect (it doesn't unlink). A `403` or `429` with
+`Retry-After`, or with `x-ratelimit-remaining: 0` and `x-ratelimit-reset`, is a rate limit,
+reported with the wait. A commit of several files uses the git data API (get the ref, its
+commit and tree, post blobs, post a tree with `base_tree`, post the commit, then `PATCH` the
+ref with `force: false`). A `422` on the ref update means the branch moved: the commit is
+rebuilt on the new head, up to 3 more times.
+
+**Setting up the GitHub App** (a platform-owner PM, once):
+1. In the Acme org: Settings → Developer settings → GitHub Apps → New GitHub App.
+2. **Callback URL:** `{PMOS_PUBLIC_URL}/oauth/github/callback`. Turn on **Expire user
+   authorization tokens**. No webhook.
+3. **Permissions:** Repository: Contents read and write, Metadata read. Account: Email
+   addresses read. Organization: Members read. Nothing else.
+4. **Where it can be installed:** only on this account. Install it on the Acme org, on
+   all repositories or on the repos PM OS uses: the content repo and the PMs' memory repos.
+   With "only select repositories", add each new memory repo to the installation, or its PM
+   gets `not_found`.
+5. Generate a client secret. Set `PMOS_GITHUB_CLIENT_ID` (the App's Client ID, not its App
+   ID) and `PMOS_GITHUB_CLIENT_SECRET`, `PMOS_GITHUB_ORG`, and `PMOS_CONTENT_REPO` for
+   approving members. The App's private key isn't needed: PM OS never acts as the App.
+6. Each platform owner who approves members links GitHub (`setup` in a Slack DM) and needs
+   push access to the content repo. If `main` is protected, allow these commits (the
+   platform owners, or the App) to push to it.
+
+### Personal memory in GitHub
+
+With `PMOS_MEMORY=github`, `memory_read` and `memory_update` use the memory repo of the
+session's user, a private repo of their own in the org (`src/github_memory.rs`). The
+record of which repo (`memory_repos`) is set with `POST /internal/memory/repo` (the Slack
+`setup` checklist does this).
+- **Layout:** one file per note, `notes/<key>.md`, on the repo's default branch, with front
+  matter: `updated:` (RFC 3339) and `source:` (the bot or skill and the run id, such as
+  `"pm-ana, task 0d3f…"`). The rest of the file is the note.
+- **Reads** list the tree recursively and fetch only the blobs whose sha changed since the last
+  read (a per-repo cache in memory); an unchanged tree fetches no blob.
+- **Writes** commit only that file, with the message `memory: <key> (<source>)`. The first
+  note in an empty repo goes in through the contents API, which also creates the branch.
+- **Re-verification:** a record checked more than 10 minutes ago is checked again. A repo that
+  became public, was archived, left the org or lost push access refuses reads and writes with a
+  tool error naming the reason. A failed check doesn't renew the record.
+- **Tool errors:** no repo set gives `Set up your memory repo first: DM PM OS "setup".`; GitHub
+  not linked asks the PM to link it.
+- With `PMOS_MEMORY=store` (the default), memory stays in Postgres (or in memory) as before.
+
+### Members
+
+Someone not in `team.yaml` asks in Slack; a platform owner (`admin` in `team.yaml`) approves
+or rejects there (`src/onboarding.rs`, `docs/onboarding-spec.md`). Requests are stored in
+`member_requests`; at most one is pending per Slack id, and at most 20 in all. The proposed
+handle comes from `propose_handle`, avoiding `team.yaml` and pending requests.
+
+**Approving** commits, in **one commit** on `PMOS_CONTENT_BRANCH` with the approving admin's
+own GitHub token:
+- `{PMOS_CONTENT_DIR}/team.yaml`: the file at the branch head plus the new member
+  (`handle`, `slack-id`, `email`, `roles`, default `[pm]`), written with `render_team_yaml`;
+- `{PMOS_CONTENT_DIR}/bots/pm-<handle>/BOT.md` from `render_personal_bot`;
+- `{PMOS_POLICIES_DIR}/bots/pm-<handle>.yaml` and `pm-<handle>.sandbox.yaml`, the bot's sandbox
+  policy and launch spec from `pmos_policy`, so `pmos policy check` has nothing missing.
+
+The message is `Add <handle> to PM OS` with the trailer `Approved-by: <admin> (Slack, request
+<id>)`. Before committing, the new `team.yaml` must parse and pass the team lint rules, and
+the content with the new member in it (a scratch copy of the checkout) must pass `pmos lint`,
+since the policies are generated from it. The handle must pass `valid_new_handle` and be
+unused at the branch head (`422 bad_handle` otherwise). Decisions run one at a time, so two
+admins clicking at once make one commit; the store also lets only one decision win.
+
+**POL-2, for these policy files:** they are generated unchanged from the already-reviewed
+`pm-assistant` role template, and the approving platform owner is their reviewer of record,
+named in the `Approved-by` trailer. Any hand change to them still goes by pull request with a
+second owner.
+
+After the commit, the in-memory team includes the new member at once (so the Slack welcome
+checklist works before any pull), and the content checkout is synced (below). A commit that
+fails for any other reason marks the request `failed` with a readable `error` (`502`).
+
+**Removing** (`/internal/members/{handle}/remove`) commits `team.yaml` without the member and
+deletes their `BOT.md` and its two policy files, in one commit. Then every linked account is
+unlinked and their memory-repo record deleted; the repo itself is theirs and is left alone.
+The in-memory team drops them at once. Someone who still owns a team bot can't be removed
+(`409 owns_bots`): the bot's owner must change first, or the content would fail the lint.
+
+**Audit:** every decision and removal is an event with `tool` `members.add` or
+`members.remove`, `user` the admin, the caller (`bot` from Slack), outcome `approved`,
+`rejected`, `failed`, `ok` or `denied`, and `output_ref` the commit sha.
+
+### Content sync
+
+Every `PMOS_CONTENT_SYNC_SECS`, and right after a member commit, the tool server runs
+`git -C <repo root> pull --ff-only` in the repo holding `PMOS_CONTENT_ROOT` (found with
+`git rev-parse --show-toplevel`), with `tokio::process`. If HEAD isn't the commit last loaded,
+it reloads like `POST /internal/reindex`, with the same lint gate: content that fails is
+pulled but not loaded, and is tried again on the next sync. Failures are logged and never stop
+the server. The checkout's own git setup is used (such as a deploy key on the Spark); the tool
+server holds no git credentials and never waits on a prompt (`GIT_TERMINAL_PROMPT=0`).
+`pmos-slack` and `pmos-bots` read the same checkout, so they see a change as soon as the pull
+lands.
+
 ### The vault
 
 Tokens are sealed with AES-256-GCM before any store sees them (`src/vault.rs`, table
@@ -239,13 +368,15 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 | Grants | `grants` | Taken with `DELETE … RETURNING` on a row locked `FOR UPDATE SKIP LOCKED`: one grant, one call, even under concurrency |
 | Approvals | `approvals` | A decision is one conditional `UPDATE … WHERE status = 'pending' AND user_handle = …`: exactly one of several concurrent decisions wins |
 | Audit | `audit_events` | Append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Each event records the caller (`mcp`, `orchestrator` or `bot`) and the session's skill or bot. |
-| Credentials | `credentials` | Tokens sealed by the vault; the database never sees plaintext |
+| Credentials | `credentials` | Tokens sealed by the vault; the database never sees plaintext. Providers `atlassian`, `slack`, `github` |
+| Memory repos | `memory_repos` | One row per PM: `repo` (`org/name`) and `verified_at` |
+| Member requests | `member_requests` | A partial unique index keeps one `pending` request per Slack id; a decision is a conditional `UPDATE … WHERE status = 'pending'`, so exactly one wins |
 
 - **Migrations** run on start-up.
 - **Pruning:** expired sessions and grants are deleted every 10 minutes.
 - **Shutdown:** SIGTERM (what `docker compose stop` sends) or Ctrl-C stops new requests and lets in-flight ones finish. Give the container a stop grace period of at least 30 seconds.
 - **MCP sessions** stay open while idle for up to the session TTL (60 minutes), so a long model step between tool calls doesn't drop the connection.
-- **One replica.** OAuth sign-in states, refresh locks and MCP sessions are in process memory, so run a single tool server. Running two needs those moved to Postgres first; this is tracked in the implementation plan.
+- **One replica.** OAuth sign-in states, refresh locks, MCP sessions, the lock that runs member decisions one at a time and the memory-repo cache are in process memory, so run a single tool server. Running two needs those moved to Postgres first; this is tracked in the implementation plan.
 - **Audit failures:**
   - **Writes fail closed:** they don't run unless their `started` event is recorded.
   - **Reads:** a missing event is logged as `AUDIT EVENT NOT RECORDED` at error level, and the read isn't undone.
@@ -274,6 +405,7 @@ cargo run -p pmos-toolserver
 | `PMOS_CONTENT_ROOT` | `content` | Must pass `pmos lint`, or the server won't start |
 | `PMOS_BIND` | `127.0.0.1:8710` | |
 | `PMOS_ALLOWED_HOSTS` | `toolserver.pmos.internal,localhost,127.0.0.1` | `Host` values `/mcp` accepts |
+| `PMOS_CONTENT_SYNC_SECS` | `300` with live connectors, `0` with fake | How often the content checkout is pulled (see **Content sync**); `0` turns it off, after member commits too |
 
 With `PMOS_CONNECTORS=live`:
 
@@ -287,6 +419,15 @@ With `PMOS_CONNECTORS=live`:
 | `PMOS_SLACK_CLIENT_ID`, `PMOS_SLACK_CLIENT_SECRET` | required | From the internal Slack app |
 | `PMOS_SLACK_SCOPES` | search, history and `chat:write` user scopes | Requested as `user_scope` only |
 | `PMOS_ATLASSIAN_AUTH_URL`, `PMOS_ATLASSIAN_API_URL`, `PMOS_SLACK_URL` | the real hosts | For pointing at mocks |
+| `PMOS_GITHUB_CLIENT_ID`, `PMOS_GITHUB_CLIENT_SECRET` | none | From the GitHub App (see **GitHub**). Set both or neither; without them GitHub linking, `PMOS_MEMORY=github` and approving members are off |
+| `PMOS_GITHUB_ORG` | required with GitHub | The Acme org login. Memory repos and the content repo must be in it |
+| `PMOS_GITHUB_URL` | `https://api.github.com` | API base, for mocks |
+| `PMOS_GITHUB_AUTH_URL` | `https://github.com` | `/login/oauth/authorize` and `/login/oauth/access_token`, for mocks |
+| `PMOS_CONTENT_REPO` | none | `org/name` of the content repo, in `PMOS_GITHUB_ORG`. Required for approving and removing members |
+| `PMOS_CONTENT_BRANCH` | `main` | |
+| `PMOS_CONTENT_DIR` | `content` | Where the content root sits in that repo (`.` for its root) |
+| `PMOS_POLICIES_DIR` | `policies` | Where the sandbox policies sit in that repo, from its root |
+| `PMOS_MEMORY` | `store` | `store` keeps memory in Postgres (or in memory). `github` puts each PM's memory in their own repo and needs the GitHub settings; it is a start-up error without them |
 | `PMOS_DOCS_URL` | required | The `pmos-docs` MCP endpoint, such as `http://docs.pmos.internal:8730/mcp` |
 | `PMOS_DOCS_TOKEN` | required | The bearer token `pmos-docs` expects |
 
@@ -295,7 +436,9 @@ With `PMOS_CONNECTORS=live`:
 The OAuth `state` signing key is derived from `PMOS_SERVICE_TOKEN`, so rotating the service
 token invalidates sign-in links in flight.
 
-After a merge to the content repo, pull the checkout and call `POST /internal/reindex`:
+After a merge to the content repo, the content sync pulls and reloads within
+`PMOS_CONTENT_SYNC_SECS`. To do it at once, or with the sync off, pull the checkout and call
+`POST /internal/reindex`:
 - If the content fails `pmos lint`, the call returns `422` and the index keeps its last good state.
 - Bot and role changes (tools, action settings, read scope) take effect at once.
 - Skill and tool-registry changes take effect on the next restart.

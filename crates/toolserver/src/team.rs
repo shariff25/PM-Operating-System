@@ -58,8 +58,29 @@ impl Team {
         Ok(())
     }
 
+    /// Use `file` as the member list now: the `team.yaml` just committed to the content repo,
+    /// before the checkout is pulled. The next reload reads the checkout again.
+    pub fn replace(&self, file: TeamFile) {
+        *self.file.write().expect("team lock") = file;
+    }
+
     pub fn enforced(&self) -> bool {
         self.enforced
+    }
+
+    /// The whole member list as loaded, for onboarding (`onboarding.rs`).
+    pub fn file(&self) -> TeamFile {
+        self.file.read().expect("team lock").clone()
+    }
+
+    /// The member with this Slack id.
+    pub fn by_slack_id(&self, slack_id: &str) -> Option<TeamMember> {
+        self.file
+            .read()
+            .expect("team lock")
+            .by_slack_id(slack_id)
+            .cloned()
+            .filter(|m| !m.handle.starts_with(BOT_IDENTITY_PREFIX))
     }
 
     /// The member with this handle. A team bot's service identity (`bots.<name>`) is never a
