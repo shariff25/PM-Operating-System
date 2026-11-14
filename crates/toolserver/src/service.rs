@@ -158,6 +158,28 @@ impl ToolService {
         &self.team
     }
 
+    /// Readiness: storage answers within a second, and every connector's own dependency
+    /// (such as the support docs server) answers. Each check is reported by name.
+    pub async fn readiness(&self) -> Vec<(String, Result<(), String>)> {
+        let storage = match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            self.stores.approvals.get("apr_readiness_probe"),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("storage didn't answer within 1 s".into()),
+        };
+        let mut checks = vec![("storage".to_string(), storage)];
+        let mut systems: Vec<_> = self.connectors.iter().collect();
+        systems.sort_by_key(|(name, _)| name.as_str());
+        for (name, connector) in systems {
+            checks.push((name.clone(), connector.ready().await));
+        }
+        checks
+    }
+
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }

@@ -100,6 +100,12 @@ pub trait Connector: Send + Sync {
         action: &str,
         args: &Value,
     ) -> Result<SourceRef, ConnectorError>;
+
+    /// Whether a service this connector depends on (not a PM's own account) answers, for
+    /// `/readyz`. Connectors that act only with each PM's token have nothing to check.
+    async fn ready(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Wrap a connector item as untrusted data for the model.

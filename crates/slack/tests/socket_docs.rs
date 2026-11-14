@@ -13,7 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use pmos_slack::commands::Commands;
-use pmos_slack::socket::Socket;
+use pmos_slack::socket::{Ended, Socket};
 use pmos_slack::toolserver::ToolServer;
 use pmos_toolserver::audit::MemoryAudit;
 use pmos_toolserver::catalog::Catalog;
@@ -65,6 +65,11 @@ async fn play(s: Arc<FakeSlack>, mut ws: WebSocket) {
         return;
     }
     for msg in script {
+        if msg["type"] == "test_go_silent" {
+            // A connection that died without closing: nothing more arrives, nothing is read.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            return;
+        }
         let is_disconnect = msg["type"] == "disconnect";
         if is_disconnect {
             // Give the bot time to send the acks for what came before.
@@ -95,6 +100,18 @@ async fn response(State(s): State<Arc<FakeSlack>>, Json(body): Json<Value>) -> J
     Json(json!({"ok": true}))
 }
 
+/// A `response_url` that refuses Block Kit, as Slack does for invalid blocks.
+async fn picky(
+    State(s): State<Arc<FakeSlack>>,
+    Json(body): Json<Value>,
+) -> (axum::http::StatusCode, &'static str) {
+    if body.get("blocks").is_some() {
+        return (axum::http::StatusCode::BAD_REQUEST, "invalid_blocks");
+    }
+    s.responses.lock().unwrap().push((Instant::now(), body));
+    (axum::http::StatusCode::OK, "ok")
+}
+
 async fn serve(app: Router) -> (String, CancellationToken) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -121,8 +138,12 @@ fn slash(envelope_id: &str, user: &str, text: &str, response_url: &str) -> Value
     })
 }
 
-#[tokio::test]
-async fn docs_command_over_socket_mode() {
+async fn start_toolserver() -> (
+    String,
+    Arc<MemoryAudit>,
+    CancellationToken,
+    CancellationToken,
+) {
     // Tool server with the repo's content (it has the `docs` skill) and fake connectors.
     let content = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content");
     let catalog = Catalog::load(&content, Utc::now().date_naive()).unwrap();
@@ -150,6 +171,13 @@ async fn docs_command_over_socket_mode() {
         ts_cancel.clone(),
     ))
     .await;
+
+    (ts_base, audit, stop_ts, ts_cancel)
+}
+
+#[tokio::test]
+async fn docs_command_over_socket_mode() {
+    let (ts_base, audit, stop_ts, ts_cancel) = start_toolserver().await;
 
     // Fake Slack.
     let slack = Arc::new(FakeSlack::default());
@@ -185,21 +213,22 @@ async fn docs_command_over_socket_mode() {
     .unwrap();
 
     let http = reqwest::Client::new();
-    let bot = Socket {
-        api_base: slack_base.clone(),
-        app_token: APP_TOKEN.into(),
-        commands: Commands {
+    let bot = Socket::new(
+        slack_base.clone(),
+        APP_TOKEN,
+        Commands {
             toolserver: ToolServer::new(ts_base, BOT_TOKEN),
             team_file,
             http: http.clone(),
             response_url_prefix: format!("{slack_base}/hooks/"),
         },
         http,
-    };
+    );
     // `link_disabled` ends the loop; a hang here fails the test.
-    tokio::time::timeout(Duration::from_secs(20), bot.run())
+    let ended = tokio::time::timeout(Duration::from_secs(20), bot.run(CancellationToken::new()))
         .await
         .expect("the bot stops when Socket Mode is disabled");
+    assert_eq!(ended, Ended::Disabled);
     assert_eq!(
         *slack.opens.lock().unwrap(),
         2,
@@ -271,4 +300,114 @@ async fn docs_command_over_socket_mode() {
     stop_slack.cancel();
     stop_ts.cancel();
     ts_cancel.cancel();
+}
+
+#[tokio::test]
+async fn a_silent_connection_is_replaced_and_a_refused_reply_falls_back_to_text() {
+    let (ts_base, _audit, stop_ts, ts_cancel) = start_toolserver().await;
+    let slack = Arc::new(FakeSlack::default());
+    let app = Router::new()
+        .route("/api/apps.connections.open", post(open))
+        .route("/socket", get(socket))
+        .route("/hooks/picky", post(picky))
+        .with_state(slack.clone());
+    let (slack_base, stop_slack) = serve(app).await;
+    *slack.base.lock().unwrap() = slack_base.clone();
+    let hook = format!("{slack_base}/hooks/picky");
+    slack.scripts.lock().unwrap().extend([
+        // The first connection goes quiet without closing.
+        vec![json!({"type": "test_go_silent"})],
+        // The bot notices, reconnects, and keeps working.
+        vec![
+            slash("e1", "U0ANA", "SAML SSO", &hook),
+            json!({"type": "disconnect", "reason": "link_disabled"}),
+        ],
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let team_file = dir.path().join("team.yaml");
+    std::fs::write(
+        &team_file,
+        "members:\n  - {handle: ana, slack-id: U0ANA, roles: [pm]}\n",
+    )
+    .unwrap();
+    let http = reqwest::Client::new();
+    let mut bot = Socket::new(
+        slack_base.clone(),
+        APP_TOKEN,
+        Commands {
+            toolserver: ToolServer::new(ts_base, BOT_TOKEN),
+            team_file,
+            http: http.clone(),
+            response_url_prefix: format!("{slack_base}/hooks/"),
+        },
+        http,
+    );
+    bot.read_deadline = Duration::from_millis(600);
+    bot.ping_every = Duration::from_millis(200);
+
+    let started = Instant::now();
+    let ended = tokio::time::timeout(Duration::from_secs(10), bot.run(CancellationToken::new()))
+        .await
+        .expect("the bot gave up on the silent connection");
+    assert_eq!(ended, Ended::Disabled);
+    assert_eq!(
+        *slack.opens.lock().unwrap(),
+        2,
+        "reconnected after the silence"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // Shutdown waits for the reply in flight.
+    assert_eq!(bot.drain(Duration::from_secs(5)).await, 0);
+    let responses = slack.responses.lock().unwrap().clone();
+    assert_eq!(responses.len(), 1, "the plain-text fallback arrived");
+    let reply = &responses[0].1;
+    assert!(reply.get("blocks").is_none());
+    assert!(
+        reply["text"].as_str().unwrap().contains("SAML SSO"),
+        "{reply}"
+    );
+
+    stop_slack.cancel();
+    stop_ts.cancel();
+    ts_cancel.cancel();
+}
+
+#[tokio::test]
+async fn shutdown_closes_the_connection() {
+    let slack = Arc::new(FakeSlack::default());
+    let app = Router::new()
+        .route("/api/apps.connections.open", post(open))
+        .route("/socket", get(socket))
+        .with_state(slack.clone());
+    let (slack_base, stop_slack) = serve(app).await;
+    *slack.base.lock().unwrap() = slack_base.clone();
+    slack
+        .scripts
+        .lock()
+        .unwrap()
+        .push_back(vec![json!({"type": "test_go_silent"})]);
+    let http = reqwest::Client::new();
+    let bot = Socket::new(
+        slack_base,
+        APP_TOKEN,
+        Commands {
+            toolserver: ToolServer::new("http://127.0.0.1:9", BOT_TOKEN),
+            team_file: "/nonexistent/team.yaml".into(),
+            http: http.clone(),
+            response_url_prefix: "https://hooks.slack.com/".into(),
+        },
+        http,
+    );
+    let shutdown = CancellationToken::new();
+    let stopper = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stopper.cancel();
+    });
+    let ended = tokio::time::timeout(Duration::from_secs(5), bot.run(shutdown))
+        .await
+        .expect("shutdown ends the loop");
+    assert_eq!(ended, Ended::Shutdown);
+    stop_slack.cancel();
 }

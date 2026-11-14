@@ -139,18 +139,23 @@ pub struct AppConfig {
     pub token: String,
     pub base: String,
     pub allowed_hosts: Vec<String>,
+    /// `/readyz` fails once the last successful sync is older than this (twice the sync
+    /// interval). `None` with no schedule.
+    pub stale_after: Option<Duration>,
 }
 
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<Runtime>,
     token: Arc<str>,
+    stale_after: Option<Duration>,
 }
 
 pub fn router(runtime: Arc<Runtime>, config: AppConfig, cancel: CancellationToken) -> Router {
     let state = AppState {
         runtime: runtime.clone(),
         token: config.token.into(),
+        stale_after: config.stale_after,
     };
     let handler = DocsMcp::new(runtime.store.clone(), config.base);
     let mcp = StreamableHttpService::new(
@@ -166,18 +171,10 @@ pub fn router(runtime: Arc<Runtime>, config: AppConfig, cancel: CancellationToke
         .route("/admin/status", get(status))
         .layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
+        .route("/readyz", get(readyz))
         .route("/healthz", get(|| async { "ok" }))
         .merge(protected)
         .with_state(state)
-}
-
-/// Constant-time comparison.
-fn same(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
 }
 
 async fn require_token(State(state): State<AppState>, req: Request, next: Next) -> Response {
@@ -185,8 +182,8 @@ async fn require_token(State(state): State<AppState>, req: Request, next: Next) 
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| same(t, &state.token));
+        .and_then(pmos_runtime::bearer_value)
+        .is_some_and(|t| pmos_runtime::token_eq(t, &state.token));
     if ok {
         next.run(req).await
     } else {
@@ -212,6 +209,38 @@ async fn trigger_sync(State(state): State<AppState>) -> Response {
         runtime.run_claimed().await;
     });
     (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response()
+}
+
+/// `200` when the index answers, has pages and isn't stale; `503` otherwise. No auth: it
+/// names which check failed, nothing more.
+async fn readyz(State(state): State<AppState>) -> Response {
+    let pages = tokio::time::timeout(Duration::from_secs(1), state.runtime.store.count()).await;
+    let storage = matches!(pages, Ok(Ok(_)));
+    let has_pages = matches!(pages, Ok(Ok(n)) if n > 0);
+    let fresh = match (state.stale_after, state.runtime.last_success().await) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(limit), Some(at)) => (Utc::now() - at).to_std().unwrap_or_default() < limit,
+    };
+    let ok = storage && has_pages && fresh;
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let mark = |b: bool| if b { "ok" } else { "down" };
+    (
+        status,
+        Json(json!({
+            "ready": ok,
+            "checks": {
+                "storage": mark(storage),
+                "pages": mark(has_pages),
+                "fresh": mark(fresh),
+            },
+        })),
+    )
+        .into_response()
 }
 
 async fn status(State(state): State<AppState>) -> Response {

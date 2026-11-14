@@ -56,7 +56,7 @@ pub fn results(query: &str, result: &Value) -> Value {
         return json!({
             "response_type": "ephemeral",
             "replace_original": true,
-            "text": format!("No support pages match “{query}”."),
+            "text": format!("No support pages match “{}”.", escape(query)),
             "blocks": [
                 {"type": "section", "text": {"type": "mrkdwn", "text": heading}},
                 {"type": "section", "text": {"type": "mrkdwn", "text": "No pages match. Try different or fewer words."}},
@@ -65,10 +65,11 @@ pub fn results(query: &str, result: &Value) -> Value {
     }
     let mut blocks = vec![json!({"type": "section", "text": {"type": "mrkdwn", "text": heading}})];
     for hit in hits.iter().take(5) {
-        let title = hit["title"].as_str().unwrap_or("Untitled");
+        // Section text is capped at 3,000 characters by Slack; keep well inside it.
+        let title = truncate(hit["title"].as_str().unwrap_or("Untitled"), 150);
         let url = hit["source"]["url"].as_str().unwrap_or_default();
         let snippet = hit["content"]["snippet"].as_str().unwrap_or_default();
-        let mut body = format!("*{}*", link(url, title));
+        let mut body = format!("*{}*", link(url, &title));
         if !snippet.is_empty() {
             body.push('\n');
             body.push_str(&escape(&truncate(snippet, 200)));
@@ -98,7 +99,7 @@ pub fn results(query: &str, result: &Value) -> Value {
     json!({
         "response_type": "ephemeral",
         "replace_original": true,
-        "text": format!("{} support pages for “{query}”", hits.len().min(5)),
+        "text": format!("{} support pages for “{}”", hits.len().min(5), escape(query)),
         "blocks": blocks,
     })
 }
@@ -134,6 +135,18 @@ mod tests {
         ));
         assert!(text.contains("DSM · updated 2026-08-01"));
         assert!(text.contains("Only you can see this"));
+        let long = results(
+            "x",
+            &json!({"results": [{"title": "T".repeat(5000), "source": {"url": "https://support.fortanix.com/docs/x"}, "content": {}}]}),
+        );
+        assert!(
+            long["blocks"][1]["text"]["text"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+                < 400
+        );
         let empty = results("zebra", &json!({"results": []}));
         assert!(serde_json::to_string(&empty)
             .unwrap()

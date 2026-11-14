@@ -80,6 +80,7 @@ async fn start_docs() -> (String, CancellationToken) {
             token: DOCS_TOKEN.into(),
             base: BASE.into(),
             allowed_hosts: vec!["127.0.0.1".into()],
+            stale_after: None,
         },
         cancel.clone(),
     );
@@ -170,6 +171,9 @@ async fn docs_search_and_read_through_the_tool_server() {
                 .unwrap()
         }
     };
+
+    let ready = http.get(format!("{ts}/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), 200, "storage and the docs server answer");
 
     let res = call("docs_search", json!({"query": "SAML SSO", "limit": 3})).await;
     assert_eq!(res.status(), 200);
@@ -273,6 +277,13 @@ async fn a_wrong_docs_token_is_reported_not_hidden() {
     assert_eq!(res.status(), 502);
     let body: Value = res.json().await.unwrap();
     assert!(body["error"].as_str().unwrap().contains("support docs"));
+
+    // Readiness says which dependency is down.
+    let res = http.get(format!("{ts}/readyz")).send().await.unwrap();
+    assert_eq!(res.status(), 503);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["checks"]["storage"], "ok");
+    assert_eq!(body["checks"]["docs"], "down");
     stop_ts.cancel();
     stop_docs.cancel();
 }

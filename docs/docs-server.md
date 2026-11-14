@@ -92,6 +92,7 @@ A failed call returns `isError` with `{code, message}`. `code` is `bad_args`, `n
 | `GET /admin/status` | same | Page count, whether a sync is running, when the last successful sync finished, and the last run's report (counts and first errors) |
 | `POST /admin/sync` | same | Start a sync now (`409` if one is running) |
 | `GET /healthz` | none | Liveness |
+| `GET /readyz` | none | `200` when the index answers, has pages, and the last successful sync is within twice `PMOS_DOCS_SYNC_HOURS`; `503` otherwise, naming the failed check |
 
 | Variable | Default | Notes |
 | --- | --- | --- |
@@ -122,8 +123,16 @@ The tool server needs `PMOS_DOCS_URL` (such as `http://docs.pmos.internal:8730/m
   applies without a restart.
 - **Audit:** each search runs as that PM under the `docs` skill and is audited (`docs.search`,
   user, run `slack-docs-<envelope id>`).
-- **Connection:** Socket Mode, so the Spark needs no inbound connection from Slack. The bot
-  reconnects whenever Slack refreshes the connection, and stops if Socket Mode is turned off.
+- **Connection:** Socket Mode, so the Spark needs no inbound connection from Slack.
+  - The bot reconnects whenever Slack refreshes the connection.
+  - It pings every 30 seconds and reconnects if nothing arrives for 90 seconds, so a link
+    that died silently is replaced.
+  - If Socket Mode is turned off it exits with an error, so the supervisor shows it rather
+    than treating it as a clean stop.
+- **Replies:** each reply's delivery is checked. A Slack 5xx is retried, and if Slack refuses
+  the formatted message, a plain-text version is sent instead. Long titles are shortened.
+- **Shutdown:** on SIGTERM, the bot closes the connection and waits up to 10 seconds for
+  replies in flight.
 
 **Setting up the Slack app** (a platform-owner PM):
 1. Create the app from `docs/slack-app-manifest.yaml` (Socket Mode on, `/docs`, bot scope

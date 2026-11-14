@@ -77,9 +77,15 @@ pub fn router(svc: Arc<ToolService>, config: AppConfig, cancel: CancellationToke
     };
 
     let mcp_svc = svc.clone();
+    // An MCP session lives as long as the PM OS session, so a long model step between tool
+    // calls (rmcp's default idle limit is 5 minutes) doesn't drop it mid-run.
+    let mut sessions = LocalSessionManager::default();
+    sessions.session_config.keep_alive = Some(std::time::Duration::from_secs(
+        (crate::service::DEFAULT_SESSION_TTL_MINUTES * 60) as u64,
+    ));
     let mcp = StreamableHttpService::new(
         move || Ok(PmosMcp::new(mcp_svc.clone())),
-        LocalSessionManager::default().into(),
+        sessions.into(),
         StreamableHttpServerConfig::default()
             .with_allowed_hosts(config.allowed_hosts)
             .with_cancellation_token(cancel.child_token()),
@@ -118,7 +124,9 @@ pub fn router(svc: Arc<ToolService>, config: AppConfig, cancel: CancellationToke
         ));
 
     Router::new()
+        // Liveness: the process answers. Readiness: its dependencies do too.
         .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
         // Public: the PM's browser lands here from Atlassian or Slack.
         .route("/oauth/{provider}/callback", get(oauth_callback))
         .nest("/internal", internal)
@@ -128,6 +136,28 @@ pub fn router(svc: Arc<ToolService>, config: AppConfig, cancel: CancellationToke
 
 fn bearer(req: &Request) -> Option<&str> {
     pmos_runtime::bearer_value(req.headers().get(header::AUTHORIZATION)?.to_str().ok()?)
+}
+
+/// `200` when storage and every connector dependency answer, `503` otherwise, with each
+/// check's result. No auth: it says only which part is down, not why in detail.
+async fn readyz(State(state): State<AppState>) -> Response {
+    let checks = state.svc.readiness().await;
+    let ok = checks.iter().all(|(_, r)| r.is_ok());
+    for (name, result) in &checks {
+        if let Err(e) = result {
+            tracing::warn!(check = %name, error = %e, "not ready");
+        }
+    }
+    let body: serde_json::Map<String, Value> = checks
+        .into_iter()
+        .map(|(name, r)| (name, json!(if r.is_ok() { "ok" } else { "down" })))
+        .collect();
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(json!({ "ready": ok, "checks": body }))).into_response()
 }
 
 fn error(status: StatusCode, message: impl Into<String>) -> Response {

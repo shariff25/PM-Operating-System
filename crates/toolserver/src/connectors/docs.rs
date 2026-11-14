@@ -223,4 +223,12 @@ impl Connector for Docs {
             "docs.{action}: the support docs are read-only"
         )))
     }
+
+    async fn ready(&self) -> Result<(), String> {
+        match tokio::time::timeout(Duration::from_secs(2), self.client()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("support docs didn't answer within 2 s".into()),
+        }
+    }
 }

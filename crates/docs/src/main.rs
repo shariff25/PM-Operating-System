@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
             token: config.token.clone(),
             base: config.sync.base.clone(),
             allowed_hosts: config.allowed_hosts.clone(),
+            stale_after: config.sync_every.map(|every| every * 2),
         },
         cancel.clone(),
     );
@@ -78,7 +79,8 @@ async fn main() -> Result<()> {
     tracing::info!(bind = %config.bind, source = %config.sync.base, "pmos-docs listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            pmos_runtime::shutdown_signal().await;
+            tracing::info!("shutting down: finishing in-flight requests");
             cancel.cancel();
         })
         .await?;

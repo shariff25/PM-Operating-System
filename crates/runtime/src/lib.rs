@@ -14,6 +14,30 @@ pub fn bearer_value(header: &str) -> Option<&str> {
     header.strip_prefix("Bearer ").filter(|t| !t.is_empty())
 }
 
+/// Resolves when the process is asked to stop: Ctrl-C (SIGINT) or SIGTERM, which is what
+/// `docker compose stop` and systemd send. Each service drains in-flight work after this,
+/// rather than being killed mid-write after the grace period.
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

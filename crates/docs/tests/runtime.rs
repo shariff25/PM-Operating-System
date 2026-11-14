@@ -133,3 +133,71 @@ async fn a_crash_in_a_sync_is_recorded_and_does_not_block_the_next() {
     assert!(rt.sync_once().await);
     stop.cancel();
 }
+
+#[tokio::test]
+async fn readyz_fails_on_an_empty_or_stale_index() {
+    let store: Arc<dyn DocsStore> = Arc::new(MemoryStore::default());
+    let runtime = Arc::new(Runtime::new(
+        store.clone(),
+        syncer("http://127.0.0.1:9", store.clone()),
+    ));
+    let app = pmos_docs::app::router(
+        runtime,
+        pmos_docs::app::AppConfig {
+            token: "t".repeat(32),
+            base: "https://support.fortanix.com".into(),
+            allowed_hosts: vec!["127.0.0.1".into()],
+            stale_after: Some(DAY * 2),
+        },
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let ready = || async {
+        let res = reqwest::get(format!("{base}/readyz")).await.unwrap();
+        (
+            res.status().as_u16(),
+            res.json::<serde_json::Value>().await.unwrap(),
+        )
+    };
+
+    let (status, body) = ready().await;
+    assert_eq!(status, 503);
+    assert_eq!(body["checks"]["pages"], "down");
+
+    // Pages, but synced three days ago: stale.
+    store
+        .upsert(&DocPage {
+            url: "https://support.fortanix.com/docs/x.md".into(),
+            slug: "x".into(),
+            title: "X".into(),
+            section: "docs".into(),
+            product: "general".into(),
+            description: None,
+            headings: String::new(),
+            body: "x".into(),
+            updated: None,
+            etag: None,
+            fetched_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    store
+        .record_sync(
+            Utc::now() - chrono::Duration::days(3),
+            true,
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let (status, body) = ready().await;
+    assert_eq!(status, 503);
+    assert_eq!(body["checks"]["fresh"], "down");
+
+    store
+        .record_sync(Utc::now(), true, &serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(ready().await.0, 200);
+}
