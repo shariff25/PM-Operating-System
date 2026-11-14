@@ -39,13 +39,41 @@ network_policies:
               method: POST
               path: /v1/chat/completions
     name: pmos_gateway
-  pmos_toolserver:
+  pmos_runtime:
     binaries:
       - path: /usr/local/bin/node
     endpoints:
       - credential_binding:
-          provider: pmos-docs-session
+          provider: pmos-docs-worker
         enforcement: enforce
+        host: bots.pmos.internal
+        port: 8750
+        protocol: rest
+        rules:
+          - allow:
+              method: POST
+              path: /v1/worker/claim
+          - allow:
+              method: POST
+              path: "/v1/worker/tasks/*/complete"
+          - allow:
+              method: POST
+              path: "/v1/worker/tasks/*/events"
+          - allow:
+              method: POST
+              path: "/v1/worker/tasks/*/fail"
+          - allow:
+              method: POST
+              path: "/v1/worker/tasks/*/heartbeat"
+          - allow:
+              method: POST
+              path: "/v1/worker/tasks/*/trace"
+    name: pmos_runtime
+  pmos_toolserver:
+    binaries:
+      - path: /usr/local/bin/node
+    endpoints:
+      - enforcement: enforce
         host: toolserver.pmos.internal
         mcp:
           versions:

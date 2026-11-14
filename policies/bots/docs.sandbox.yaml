@@ -8,9 +8,9 @@ providers:
   - credential: PMOS_GATEWAY_TOKEN
     name: pmos-docs-gateway
     profile: pmos-gateway
-  - credential: PMOS_SESSION_TOKEN
-    name: pmos-docs-session
-    profile: pmos-session
+  - credential: PMOS_WORKER_TOKEN
+    name: pmos-docs-worker
+    profile: pmos-worker
 role: docs-helper
 sandbox: pmos-docs
 scope: team
