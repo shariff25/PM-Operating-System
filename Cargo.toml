@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/contract", "crates/cli", "crates/runtime", "crates/toolserver", "crates/docs", "crates/slack", "crates/gateway"]
+members = ["crates/contract", "crates/cli", "crates/runtime", "crates/toolserver", "crates/docs", "crates/slack", "crates/gateway", "crates/bots"]
 
 [workspace.package]
 edition = "2021"
@@ -16,6 +16,8 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+chrono-tz = "0.10"
+croner = "4.0"
 hmac = "0.12"
 clap = { version = "4", features = ["derive"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
