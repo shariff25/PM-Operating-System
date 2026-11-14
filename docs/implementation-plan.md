@@ -137,11 +137,13 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
 ### Bots: what changes in the build order (from `bot-decisions.md`)
 - **0d gateway:** add the workaround registry, with a flag and a "delete when" test for each workaround (D11).
 - **0e becomes the bot runtime**, replacing the per-session orchestrator:
-  - bot definitions in `content/bots/<name>/BOT.md`: name, job, team or personal scope, owner, skills, data class, and per-action `auto`/`approve`/`never` settings (v1: all `approve`), checked by `pmos lint`;
+  - bot definitions in `content/bots/<name>/BOT.md`: name, job, team or personal scope, owner, skills, data class, per-action `auto`/`approve`/`never` settings (v1: all `approve`), and, for team bots, the Jira projects, Confluence spaces and Slack channels its owner chose for it to read, enforced by the tool server; checked by `pmos lint`;
   - a durable task queue in Postgres that resumes or fails with a reason after a reboot (D2);
   - task status events and a checklist, posted as one Slack message per milestone (D6);
   - a 30-day trace store (D6);
-  - one long-lived sandbox per bot (D3).
+  - one long-lived sandbox per bot (D3);
+  - **role templates** in `content/roles/<role>/` (D12): each one sets a single role's job text, default skills, data class, approval settings and sandbox policy, and every bot is created from one;
+  - **one role per bot, no coordinator bot in v1** (D12): a bot may read other bots' outputs in the same scope, nothing more. The runtime counts how often PMs chain bots by hand, and a Chief of Staff bot is considered once 3 PMs do it.
 - **0f sandbox policies:**
   - each bot's policy is generated from its role template and kept in git (D3);
   - network is denied by default;
@@ -151,7 +153,7 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
   - a fixed set of real tasks per category, rerun weekly and on every model or harness change;
   - each failure tagged to its bottleneck: model, tool, policy, memory or harness;
   - a category launches only after passing its bar two weeks in a row.
-- **Memory moves to markdown files in git** (D5): team memory in git, personal memory in a private store, a source and date on every entry, and the context mount filtered by data class.
+- **Memory moves to markdown files in git** (D5): team memory in a git repo set in config (default `pm-os-memory`), committed by the tool server on each bot write; personal memory in a private store; a source and date on every entry; and the context mount filtered by data class.
 - **Phase 1:**
   - The first named bots: a team **Docs** bot, which takes over `/docs`, and personal PM bots.
   - Routines in plain language (D8), moved up from Phase 2.
@@ -264,10 +266,11 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
 | 0c-2b Real Atlassian and Slack connectors, encrypted token store | Done | Each PM's own token; AES-256-GCM vault; OAuth 3LO and Slack v2; tested against local mock APIs; first real call after Gate 1 |
 | Support docs + `/docs` in Slack | Done | `crates/docs` (`pmos-docs` MCP server over support.fortanix.com), docs connector and `docs` skill in the tool server, `crates/slack` (Socket Mode, `/docs`), `content/team.yaml`; see `docs/docs-server.md` |
 | Staff-engineer review fixes | Done | Four reviews (security, correctness, scale and operations, design and tests), checked against the code. The 8 blockers and the pilot list are fixed; see **Review follow-ups** for what's left |
-| 0d Gateway | Next | |
-| 0e Harness and orchestrator | Skeleton | Harness only; orchestrator not started |
-| 0f Sandbox policies | Not started | |
-| 0g Evals | Not started | |
+| 0d Gateway | Done | `crates/gateway`: role aliases to local vLLM only, fair queue (interactive, scheduled, personal; per-person cap), usage log, workaround registry (D11), stub model for CI; see `docs/gateway.md` |
+| 0e Bots | Built (mocks and stub model) | `content/bots`, `content/roles` and their lint; tool-server bot sessions (allowlist per role, `never` actions, team-bot read scope with its own account); `crates/bots` runtime (durable tasks with leases, routines, 30-day traces, notifications, one worker token per bot); `harness` worker; Slack DMs, progress, approval cards and routines; `crates/console`. Checked end to end with the real binaries and the stub model. See `docs/bot-runtime-spec.md` |
+| 0f Sandbox policies | Built; verify on the Spark | `crates/policy`, `pmos policy generate/check` in CI, `policies/bots/docs.yaml`, red-team kit. Format checked against OpenShell's repo; items marked "verify on the Spark" in `docs/sandbox-policies.md` |
+| 0g Evals | Built; first live run on the Spark | `crates/evals`, `evals/categories/docs-qa` (20 real questions), failure tags, weekly reports, load test. Latency targets: only p90 queue < 120 s is known; the rest are labelled placeholders |
+| **Gate 1** | Needs the Spark | vLLM with the chosen models; OpenShell; the Slack app; `team.yaml` filled in; the red-team run; two passing benchmark weeks; the load test |
 
 0c notes:
 - Connectors share one `Connector` trait (`read` and `write`, both keyed by action) instead of one trait per system. The real Jira, Confluence and Slack connectors each implement it.

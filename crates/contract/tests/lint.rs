@@ -436,3 +436,132 @@ fn team_file_parses_and_looks_up_by_slack_id() {
     write(dir.path(), "team.yaml", "members: [\n");
     assert_code(&run(&dir), "team-parse", Severity::Error);
 }
+
+fn role(name: &str, extra: &str) -> String {
+    format!("---\nname: {name}\ndescription: Does a job.\nowner: \"@pm\"\nversion: \"0.1.0\"\nskills: \"ask\"\ndata-class: \"internal\"\nmodel: \"default\"\n{extra}---\n\n# Role\n\nInstructions.\n")
+}
+
+fn bot(name: &str, extra: &str) -> String {
+    format!("---\nname: {name}\nrole: helper\nowner: \"@pm\"\ndescription: A bot.\n{extra}---\n\n# Bot\n\nJob.\n")
+}
+
+#[test]
+fn roles_and_bots_parse_and_resolve() {
+    let dir = valid_tree();
+    write(
+        dir.path(),
+        "team.yaml",
+        "members:\n  - {handle: pm, slack-id: U0PM, roles: [pm]}\n",
+    );
+    write(
+        dir.path(),
+        "roles/helper/ROLE.md",
+        &role("helper", "actions:\n  jira.create_issue: never\n"),
+    );
+    write(
+        dir.path(),
+        "bots/ana-bot/BOT.md",
+        &bot("ana-bot", "scope: personal\n"),
+    );
+    write(
+        dir.path(),
+        "bots/team-bot/BOT.md",
+        &bot(
+            "team-bot",
+            "scope: team\nreads:\n  jira-projects: [PM]\nactions:\n  jira.create_issue: approve\n",
+        ),
+    );
+    let report = run(&dir);
+    assert!(
+        report.errors().next().is_none(),
+        "{:#?}",
+        report.diagnostics
+    );
+    assert_eq!(report.roles.len(), 1);
+    assert_eq!(report.bots.len(), 2);
+    let role = &report.roles[0];
+    let personal = report.bots.iter().find(|b| b.name == "ana-bot").unwrap();
+    let team = report.bots.iter().find(|b| b.name == "team-bot").unwrap();
+    assert_eq!(personal.owner, "pm");
+    use pmos_contract::bots::ActionSetting;
+    assert_eq!(
+        personal.action_setting(role, "jira.create_issue"),
+        ActionSetting::Never
+    );
+    assert_eq!(
+        team.action_setting(role, "jira.create_issue"),
+        ActionSetting::Approve
+    );
+    assert_eq!(team.reads.jira_projects, vec!["PM"]);
+    assert_eq!(
+        pmos_contract::bots::role_tools(role, &report.skills),
+        ["context.search", "jira.create_issue"]
+            .map(String::from)
+            .into()
+    );
+}
+
+#[test]
+fn role_and_bot_rules() {
+    let dir = valid_tree();
+    write(
+        dir.path(),
+        "team.yaml",
+        "members:\n  - {handle: pm, slack-id: U0PM, roles: [pm]}\n",
+    );
+    // auto is refused in v1; actions must name write tools; skills must exist and fit the class.
+    write(
+        dir.path(),
+        "roles/helper/ROLE.md",
+        &role(
+            "helper",
+            "actions:\n  jira.create_issue: auto\n  context.search: approve\n  nope.tool: never\n",
+        )
+        .replace("skills: \"ask\"", "skills: \"ask ghost\""),
+    );
+    write(
+        dir.path(),
+        "roles/wide/ROLE.md",
+        &role("wide", "").replace("data-class: \"internal\"", "data-class: \"public\""),
+    );
+    write(dir.path(), "roles/Bad/ROLE.md", &role("Bad", ""));
+    write(
+        dir.path(),
+        "bots/x/BOT.md",
+        &bot("x", "scope: personal\nreads:\n  jira-projects: [PM]\n"),
+    );
+    write(
+        dir.path(),
+        "bots/y/BOT.md",
+        &bot("y", "scope: team\n").replace("role: helper", "role: missing"),
+    );
+    write(
+        dir.path(),
+        "bots/z/BOT.md",
+        &bot("z", "scope: team\n").replace("\"@pm\"", "\"@stranger\""),
+    );
+    write(dir.path(), "bots/w/BOT.md", &bot("other", "scope: team\n"));
+    let report = run(&dir);
+    for code in [
+        "action-auto",
+        "action-not-write",
+        "action-unknown-tool",
+        "role-skill-unknown",
+        "role-skill-data-class",
+        "role-name",
+        "bot-reads-personal",
+        "bot-role-unknown",
+        "bot-owner-unknown",
+        "bot-name",
+    ] {
+        assert_code(&report, code, Severity::Error);
+    }
+    // A team bot with no `reads` over a role that reads Jira gets a warning, not an error.
+    let dir = valid_tree();
+    write(dir.path(), "roles/helper/ROLE.md", &role("helper", ""));
+    write(dir.path(), "bots/t/BOT.md", &bot("t", "scope: team\n"));
+    let report = run(&dir);
+    assert_code(&report, "bot-reads-empty", Severity::Warning);
+    // team.yaml lists nobody yet: an unknown owner only warns.
+    assert_code(&report, "bot-owner-unknown", Severity::Warning);
+}

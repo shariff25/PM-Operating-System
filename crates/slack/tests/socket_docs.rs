@@ -1,17 +1,16 @@
-//! `/docs` end to end: a fake Slack (Socket Mode websocket, `apps.connections.open`, a
-//! `response_url` catcher) and a real tool server with the fake docs connector.
+//! `/docs` end to end: the fake Slack (`common`) with a `response_url` catcher, and a real
+//! tool server with the fake docs connector.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+mod common;
+
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::http::HeaderMap;
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::routing::post;
+use axum::Json;
 use chrono::Utc;
+use common::{serve, FakeSlack, APP_TOKEN};
 use pmos_slack::commands::Commands;
 use pmos_slack::socket::{Ended, Socket};
 use pmos_slack::toolserver::ToolServer;
@@ -25,75 +24,6 @@ use tokio_util::sync::CancellationToken;
 
 const SERVICE_TOKEN: &str = "test-service-token-0123456789abcdef";
 const BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
-const APP_TOKEN: &str = "xapp-1-test";
-
-#[derive(Default)]
-struct FakeSlack {
-    base: Mutex<String>,
-    opens: Mutex<usize>,
-    /// Messages to send on each successive connection.
-    scripts: Mutex<VecDeque<Vec<Value>>>,
-    acks: Mutex<Vec<(Instant, Value)>>,
-    responses: Mutex<Vec<(Instant, Value)>>,
-}
-
-async fn open(State(s): State<Arc<FakeSlack>>, headers: HeaderMap) -> Json<Value> {
-    let auth = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    if auth != format!("Bearer {APP_TOKEN}") {
-        return Json(json!({"ok": false, "error": "invalid_auth"}));
-    }
-    *s.opens.lock().unwrap() += 1;
-    let base = s.base.lock().unwrap().replace("http://", "ws://");
-    Json(json!({"ok": true, "url": format!("{base}/socket")}))
-}
-
-async fn socket(State(s): State<Arc<FakeSlack>>, ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| play(s, socket))
-}
-
-async fn play(s: Arc<FakeSlack>, mut ws: WebSocket) {
-    let script = s.scripts.lock().unwrap().pop_front().unwrap_or_default();
-    let hello = json!({"type": "hello", "num_connections": 1});
-    if ws
-        .send(Message::Text(hello.to_string().into()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-    for msg in script {
-        if msg["type"] == "test_go_silent" {
-            // A connection that died without closing: nothing more arrives, nothing is read.
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            return;
-        }
-        let is_disconnect = msg["type"] == "disconnect";
-        if is_disconnect {
-            // Give the bot time to send the acks for what came before.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-        if ws
-            .send(Message::Text(msg.to_string().into()))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        if is_disconnect {
-            return;
-        }
-        // Read the acknowledgement for this envelope.
-        if let Some(Ok(Message::Text(t))) = ws.recv().await {
-            s.acks
-                .lock()
-                .unwrap()
-                .push((Instant::now(), serde_json::from_str(&t).unwrap()));
-        }
-    }
-}
 
 async fn response(State(s): State<Arc<FakeSlack>>, Json(body): Json<Value>) -> Json<Value> {
     s.responses.lock().unwrap().push((Instant::now(), body));
@@ -110,20 +40,6 @@ async fn picky(
     }
     s.responses.lock().unwrap().push((Instant::now(), body));
     (axum::http::StatusCode::OK, "ok")
-}
-
-async fn serve(app: Router) -> (String, CancellationToken) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let cancel = CancellationToken::new();
-    let ct = cancel.clone();
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { ct.cancelled_owned().await })
-            .await
-            .unwrap();
-    });
-    (base, cancel)
 }
 
 fn slash(envelope_id: &str, user: &str, text: &str, response_url: &str) -> Value {
@@ -181,9 +97,7 @@ async fn docs_command_over_socket_mode() {
 
     // Fake Slack.
     let slack = Arc::new(FakeSlack::default());
-    let app = Router::new()
-        .route("/api/apps.connections.open", post(open))
-        .route("/socket", get(socket))
+    let app = common::routes()
         .route("/hooks/response", post(response))
         .with_state(slack.clone());
     let (slack_base, stop_slack) = serve(app).await;
@@ -294,7 +208,9 @@ async fn docs_command_over_socket_mode() {
         .filter(|e| e.tool == "docs.search")
         .collect();
     assert_eq!(events.len(), 2);
-    assert!(events.iter().all(|e| e.user == "ana" && e.skill == "docs"));
+    assert!(events
+        .iter()
+        .all(|e| e.user == "ana" && e.skill.as_deref() == Some("docs")));
     assert!(events.iter().any(|e| e.run_id == "slack-docs-e5"));
 
     stop_slack.cancel();
@@ -306,9 +222,7 @@ async fn docs_command_over_socket_mode() {
 async fn a_silent_connection_is_replaced_and_a_refused_reply_falls_back_to_text() {
     let (ts_base, _audit, stop_ts, ts_cancel) = start_toolserver().await;
     let slack = Arc::new(FakeSlack::default());
-    let app = Router::new()
-        .route("/api/apps.connections.open", post(open))
-        .route("/socket", get(socket))
+    let app = common::routes()
         .route("/hooks/picky", post(picky))
         .with_state(slack.clone());
     let (slack_base, stop_slack) = serve(app).await;
@@ -376,10 +290,7 @@ async fn a_silent_connection_is_replaced_and_a_refused_reply_falls_back_to_text(
 #[tokio::test]
 async fn shutdown_closes_the_connection() {
     let slack = Arc::new(FakeSlack::default());
-    let app = Router::new()
-        .route("/api/apps.connections.open", post(open))
-        .route("/socket", get(socket))
-        .with_state(slack.clone());
+    let app = common::routes().with_state(slack.clone());
     let (slack_base, stop_slack) = serve(app).await;
     *slack.base.lock().unwrap() = slack_base.clone();
     slack

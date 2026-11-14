@@ -1,0 +1,16 @@
+# Checked against https://support.fortanix.com/docs/what-are-various-limits-and-quotas-in-fortanix-ccm on 2026-11-14.
+# The page says: at most 25 compute node enrollments and 1000 applications per account.
+id: ccm-limits-and-quotas
+ask: "How many compute nodes and how many applications can one Fortanix CCM account have?"
+expect:
+  must_cite:
+    - https://support.fortanix.com/docs/what-are-various-limits-and-quotas-in-fortanix-ccm
+  must_include:
+    - "25"
+    - "1000"
+  # Reasoning must not leak into the answer, even with the gateway's strip-think
+  # workaround off (D11).
+  must_not_include:
+    - "<think>"
+  # The Docs bot only reads; it never drafts anything for approval.
+  approvals: 0

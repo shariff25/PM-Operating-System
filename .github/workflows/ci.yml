@@ -47,6 +47,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --locked -q -p pmos -- lint --root content
+      # Every bot's OpenShell policy is current and keeps the 0f rules (docs/sandbox-policies.md).
+      - run: cargo run --locked -q -p pmos -- policy check --root content --policies policies
 
   harness:
     name: Harness (typecheck, test)

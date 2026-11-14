@@ -135,11 +135,20 @@ The tool server needs `PMOS_DOCS_URL` (such as `http://docs.pmos.internal:8730/m
   replies in flight.
 
 **Setting up the Slack app** (a platform-owner PM):
-1. Create the app from `docs/slack-app-manifest.yaml` (Socket Mode on, `/docs`, bot scope
-   `commands` only).
+1. Create the app from `docs/slack-app-manifest.yaml` (Socket Mode on, `/docs`, the
+   `message.im` event, interactivity, and bot scopes `commands`, `chat:write`,
+   `chat:write.customize`, `im:history`, `users:read`).
 2. Generate an app-level token with `connections:write` and set it as `PMOS_SLACK_APP_TOKEN`.
 3. Set `PMOS_TOOLSERVER_URL`, `PMOS_BOT_TOKEN` (the same value as the tool server's `PMOS_BOT_TOKEN`) and `PMOS_CONTENT_ROOT`.
-4. Add each PM to `content/team.yaml` (handle, Slack member id, roles) by pull request.
+4. For the bots (DMs, approval cards, routines; spec §5 of `docs/bot-runtime-spec.md`), also set:
+   - `PMOS_BOTS_URL` (the runtime, port 8750) and `PMOS_BOTS_TOKEN` (the runtime's `slack` client token);
+   - `PMOS_SLACK_BOT_TOKEN`, the app's bot token (`xoxb-…`);
+   - `PMOS_SLACK_STATE_DIR` (default `state/slack`), where the notification cursor is kept so a
+     restart reposts nothing;
+   - `PMOS_DEFAULT_TZ` (default `UTC`), for routines when Slack has no time zone for the PM.
+
+   Without `PMOS_BOTS_URL` the bot serves `/docs` only.
+5. Add each PM to `content/team.yaml` (handle, Slack member id, roles) by pull request.
 
 ## Network on the Spark
 

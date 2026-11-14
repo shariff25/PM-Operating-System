@@ -5,8 +5,10 @@
 #   1. Basic Information → App-Level Tokens → generate one with the `connections:write` scope.
 #      That's PMOS_SLACK_APP_TOKEN (xapp-…) for pmos-slack.
 #   2. Replace pmos.example.com in redirect_urls with PMOS_PUBLIC_URL.
-#   3. Install the app to the workspace. Each PM then links their own Slack account in PM OS,
-#      which grants the user scopes below to PM OS acting as that PM.
+#   3. Install the app to the workspace. OAuth & Permissions → Bot User OAuth Token (xoxb-…)
+#      is PMOS_SLACK_BOT_TOKEN for pmos-slack: the bots post their replies and approval cards
+#      with it. Each PM then links their own Slack account in PM OS, which grants the user
+#      scopes below to PM OS acting as that PM.
 #
 # Keep this an internal app (not distributed): internal apps keep the higher rate limits.
 display_information:
@@ -14,6 +16,11 @@ display_information:
   description: The Fortanix product team's agent workspace
   background_color: "#1f2937"
 features:
+  # Each PM talks to the bots in their DM with the app (spec §5).
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
   bot_user:
     display_name: PM OS
     always_online: true
@@ -26,10 +33,17 @@ oauth_config:
   redirect_urls:
     - https://pmos.example.com/oauth/slack/callback
   scopes:
-    # The bot itself only needs to receive commands. It never reads channels for answers or
-    # posts messages others can see; reads and posts use each PM's own user token.
+    # The bot posts only in each PM's DM with the app: the bots' replies (under each bot's
+    # own name, chat:write.customize), approval cards and routines. It reads only those DMs
+    # (im:history, for message.im) and each PM's time zone (users:read, for routines). It
+    # never reads channels for answers; reads and anything sent on a PM's behalf use that
+    # PM's own user token.
     bot:
       - commands
+      - chat:write
+      - chat:write.customize
+      - im:history
+      - users:read
     # Granted per PM when they link their account (see crates/toolserver/src/config.rs,
     # DEFAULT_SLACK_SCOPES).
     user:
@@ -43,6 +57,12 @@ oauth_config:
       - mpim:history
       - chat:write
 settings:
+  # Over Socket Mode, so no request URLs: events and button presses arrive on the socket.
+  event_subscriptions:
+    bot_events:
+      - message.im
+  interactivity:
+    is_enabled: true
   socket_mode_enabled: true
   org_deploy_enabled: false
   token_rotation_enabled: false

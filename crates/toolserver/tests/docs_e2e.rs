@@ -339,10 +339,19 @@ async fn the_bot_token_is_limited_to_its_own_skills() {
         .await
         .unwrap();
     assert_eq!(res.status(), 404);
-    // ... nor approvals, grants, linking or reindexing.
+    // ... nor bot sessions, ...
+    let res = http
+        .post(format!("{ts}/internal/sessions"))
+        .bearer_auth(BOT_TOKEN)
+        .json(&json!({"user": "ana", "bot": "docs", "run_id": "r1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
+    // ... nor inbox listings, grants, linking or reindexing. (It may read and decide one
+    // item, for approval cards: `tests/bots.rs`.)
     for (method, path) in [
         ("GET", "/internal/approvals?user=ana"),
-        ("POST", "/internal/approvals/apr_x/decision"),
         ("POST", "/internal/grants"),
         ("POST", "/internal/reindex"),
         ("GET", "/internal/credentials?user=ana"),
@@ -378,10 +387,7 @@ async fn a_stuck_docs_call_times_out_without_blocking_others() {
         DOCS_TOKEN,
         std::time::Duration::from_secs(2),
     ));
-    let caller = || Caller {
-        user: "ana",
-        run_id: "r1",
-    };
+    let caller = || Caller::new("ana", "r1");
     // Connect first, so both calls share one connection.
     docs.read(caller(), "search", &json!({"query": "SAML"}))
         .await

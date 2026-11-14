@@ -1,0 +1,16 @@
+# Checked against https://support.fortanix.com/docs/fortanix-dsm-account-quorum-policy on 2026-11-14.
+# The page says: rules can require quorum group members, a minimum number of administrators, an application, a second-factor key or password re-entry; account requests expire after 10 days by default.
+id: dsm-account-quorum-policy
+ask: "In a DSM account quorum approval policy, what kinds of approvers can a rule require, and when does an account quorum approval request expire by default?"
+expect:
+  must_cite:
+    - https://support.fortanix.com/docs/fortanix-dsm-account-quorum-policy
+  must_include:
+    - "administrator"
+    - "10 days"
+  # Reasoning must not leak into the answer, even with the gateway's strip-think
+  # workaround off (D11).
+  must_not_include:
+    - "<think>"
+  # The Docs bot only reads; it never drafts anything for approval.
+  approvals: 0
