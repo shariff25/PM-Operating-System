@@ -37,7 +37,8 @@ Only public pages are indexed (decided 2026-11-14).
 - **Pace:** one request per second across the whole sync, at most 2 in flight. A 429 holds
   every worker back for its `Retry-After` (60 seconds if absent, never more than 5 minutes),
   doubles the gap up to 10 seconds, and retries that page up to 3 times.
-- **Speed:** a full first sync of about 1,800 pages takes roughly 40 minutes. Later syncs send
+- **Speed:** a full first sync of about 1,800 pages takes about 30 minutes (measured
+  2026-11-14: 1,798 pages, 0 failures, no 429s). Later syncs send
   `If-None-Match`, so unchanged pages cost a 304.
 - **Never empties the index:**
   - A failed fetch keeps the page's last good copy.
