@@ -1,0 +1,32 @@
+[package]
+name = "pmos-gateway"
+description = "PM OS model gateway: one OpenAI-compatible endpoint in front of the local open-weight models"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version = "1.88"
+
+[[bin]]
+name = "pmos-gateway"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes = "1"
+chrono.workspace = true
+futures-util = "0.3"
+pmos-contract.workspace = true
+pmos-runtime.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio-util.workspace = true

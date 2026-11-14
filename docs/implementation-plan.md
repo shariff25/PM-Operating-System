@@ -266,8 +266,9 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
 | 0c-2b Real Atlassian and Slack connectors, encrypted token store | Done | Each PM's own token; AES-256-GCM vault; OAuth 3LO and Slack v2; tested against local mock APIs; first real call after Gate 1 |
 | Support docs + `/docs` in Slack | Done | `crates/docs` (`pmos-docs` MCP server over support.acme.com), docs connector and `docs` skill in the tool server, `crates/slack` (Socket Mode, `/docs`), `content/team.yaml`; see `docs/docs-server.md` |
 | Staff-engineer review fixes | Done | Four reviews (security, correctness, scale and operations, design and tests), checked against the code. The 8 blockers and the pilot list are fixed; see **Review follow-ups** for what's left |
-| 0d Gateway | Next | |
-| 0e Harness and orchestrator | Skeleton | Harness only; orchestrator not started |
+| 0d Gateway | Done | `crates/gateway`: role aliases to local vLLM only, fair queue (interactive, scheduled, personal; per-person cap), usage log, workaround registry (D11), stub model for CI; see `docs/gateway.md` |
+| 0e Bot runtime | Next | Slice 1: the Docs bot in a Slack DM (the first hands-on preview); slice 2: personal bots, approval cards, routines, traces, console |
+| 0e Harness | Skeleton | The harness runs a turn through the gateway (checked with the stub model) |
 | 0f Sandbox policies | Not started | |
 | 0g Evals | Not started | |
 
