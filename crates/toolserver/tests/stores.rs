@@ -142,6 +142,7 @@ contract!(
     decisions_follow_the_rules,
     decisions_win_once_under_concurrency,
     completion_records_results_and_failures,
+    interrupted_writes_are_found,
     memory_is_per_user,
     context_search_and_get,
     reindex_tracks_the_content_repo,
@@ -335,7 +336,8 @@ async fn decisions_follow_the_rules(b: &Backend) {
         .decide(&item.id, "ana", Decision::Edit, Some(edited.clone()), later)
         .await
         .unwrap();
-    assert_eq!(decided.status, Status::Approved);
+    // Approved and running: `executing` until the write's outcome is stored.
+    assert_eq!(decided.status, Status::Executing);
     assert_eq!(decided.args, edited);
     assert_eq!(
         decided.args_hash,
@@ -419,6 +421,56 @@ async fn completion_records_results_and_failures(b: &Backend) {
         .await
         .unwrap()
         .is_none());
+    // Only an executing item takes an outcome: a pending one, or one already completed,
+    // is left alone.
+    let pending = a.create(new_item("ana", &args), now()).await.unwrap();
+    assert!(a
+        .complete(&pending.id, Ok(json!({})))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(a
+        .complete(&ok.id, Err("late".into()))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        a.get(&ok.id).await.unwrap().unwrap().status,
+        Status::Approved
+    );
+}
+
+async fn interrupted_writes_are_found(b: &Backend) {
+    let a = b.stores.approvals.as_ref();
+    let args = json!({"title": "PRD"});
+    let early = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide(&early.id, "ana", Decision::Approve, None, now())
+        .await
+        .unwrap();
+    let late = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide(
+        &late.id,
+        "ana",
+        Decision::Approve,
+        None,
+        now() + Duration::minutes(20),
+    )
+    .await
+    .unwrap();
+    let done = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide(&done.id, "ana", Decision::Approve, None, now())
+        .await
+        .unwrap();
+    a.complete(&done.id, Ok(json!({}))).await.unwrap();
+
+    let stuck: Vec<_> = a
+        .stuck(now() + Duration::minutes(10))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(stuck, vec![early.id]);
 }
 
 // ----- memory -----------------------------------------------------------------------------
@@ -538,6 +590,21 @@ async fn audit_records_events(b: &Backend) {
         assert_eq!(outcomes, vec!["pending", "approved"]);
         let sources: Vec<String> = rows[0].get("sources");
         assert_eq!(sources, vec!["context/products/ccm.md", "jira:PM-101"]);
+
+        // Append-only: no update, delete or truncate, even by the table's owner.
+        for sql in [
+            "UPDATE audit_events SET outcome = 'ok'",
+            "DELETE FROM audit_events",
+            "TRUNCATE audit_events",
+        ] {
+            let err = sqlx::query(sql).execute(pg.pool()).await.unwrap_err();
+            assert!(err.to_string().contains("append-only"), "{sql}: {err}");
+        }
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events")
+            .fetch_one(pg.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }
 

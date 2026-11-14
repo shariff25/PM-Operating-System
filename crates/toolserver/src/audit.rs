@@ -30,6 +30,9 @@ pub enum Outcome {
     Rejected,
     /// A grant was recorded for a write the PM approved in the harness.
     Granted,
+    /// An approved write is about to run. Recorded first: if this can't be recorded, the
+    /// write doesn't run.
+    Started,
     /// The call failed in a connector or on bad input.
     Error,
 }

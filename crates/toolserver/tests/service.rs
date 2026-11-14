@@ -395,6 +395,7 @@ async fn a_grant_runs_exactly_the_approved_call_once() {
         vec![
             Outcome::Granted,
             Outcome::Pending,
+            Outcome::Started,
             Outcome::Approved,
             Outcome::Pending
         ]
@@ -533,6 +534,165 @@ async fn edit_runs_the_edited_arguments_and_reject_runs_nothing() {
     assert_eq!(item.status, Status::Rejected);
     assert_eq!(f.jira.writes().len(), 1);
     assert_eq!(f.audit.events().pop().unwrap().outcome, Outcome::Rejected);
+}
+
+#[tokio::test]
+async fn an_edit_is_checked_like_any_call() {
+    let f = fixture();
+    let id = pending_issue(&f).await;
+    for bad in [
+        json!({"project": "PM", "issue_type": "Sub-task", "summary": "x"}),
+        json!({"project": "PM", "issue_type": "Story", "summary": "x", "epic": 101}),
+        json!({"project": "PM", "issue_type": "Story", "summary": "x", "assignee": "bo"}),
+        json!("not an object"),
+    ] {
+        let err = f
+            .svc
+            .decide(&id, "ana", Decision::Edit, Some(bad.clone()), now())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DecisionError::InvalidArgs(_)),
+            "{bad}: {err:?}"
+        );
+    }
+    assert!(f.jira.writes().is_empty());
+    let item = f.svc.approval(&id).await.unwrap().unwrap();
+    assert_eq!(
+        item.status,
+        Status::Pending,
+        "a bad edit doesn't use the item up"
+    );
+}
+
+#[tokio::test]
+async fn an_item_runs_only_if_its_skill_still_declares_the_tool() {
+    let f = fixture();
+    // An item queued under `ask`, which declares no write tools (say, after a skill change).
+    let item = f
+        .stores
+        .approvals
+        .create(
+            pmos_toolserver::approvals::NewItem {
+                user: "ana",
+                skill: "ask",
+                run_id: "r1",
+                tool: "jira.create_issue",
+                args: &json!({"project": "PM", "issue_type": "Story", "summary": "x"}),
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    let err = f
+        .svc
+        .decide(&item.id, "ana", Decision::Approve, None, now())
+        .await
+        .unwrap_err();
+    assert_eq!(err, DecisionError::NotAllowed("jira.create_issue".into()));
+    assert!(f.jira.writes().is_empty());
+    assert_eq!(
+        f.svc.approval(&item.id).await.unwrap().unwrap().status,
+        Status::Pending
+    );
+}
+
+#[tokio::test]
+async fn no_write_runs_unless_the_audit_log_records_it() {
+    let f = fixture();
+    let id = pending_issue(&f).await;
+    f.audit_switch
+        .down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = f
+        .svc
+        .decide(&id, "ana", Decision::Approve, None, now())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DecisionError::Decide(DecideError::Store(_))),
+        "{err:?}"
+    );
+    assert!(f.jira.writes().is_empty(), "fail closed");
+    let item = f.svc.approval(&id).await.unwrap().unwrap();
+    assert_eq!(item.status, Status::Failed);
+    assert!(item.result.unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .contains("audit log"));
+
+    // The same holds for a write approved in the harness, and its grant survives.
+    let s = f
+        .svc
+        .create_session("ana", "meeting-notes", "r2", None, now())
+        .await
+        .unwrap();
+    let args = json!({"project": "PM", "issue_type": "Story", "summary": "SCIM"});
+    f.audit_switch
+        .down
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    f.svc
+        .grant(&s, "jira_create_issue", &args, now())
+        .await
+        .unwrap();
+    f.audit_switch
+        .down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = f
+        .svc
+        .call(&s, "jira_create_issue", args.clone(), now())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ToolError::Unavailable(_)), "{err:?}");
+    assert!(f.jira.writes().is_empty());
+    f.audit_switch
+        .down
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let res = f
+        .svc
+        .call(&s, "jira_create_issue", args, now())
+        .await
+        .unwrap();
+    assert_eq!(res["status"], "done", "the grant was put back");
+}
+
+#[tokio::test]
+async fn an_interrupted_write_is_marked_outcome_unknown() {
+    let f = fixture();
+    let id = pending_issue(&f).await;
+    // The process died after the decision, mid-write: the item is left `executing`.
+    f.stores
+        .approvals
+        .decide(&id, "ana", Decision::Approve, None, now())
+        .await
+        .unwrap();
+
+    // Not yet stale.
+    assert_eq!(
+        f.svc
+            .reconcile(Duration::minutes(10), now() + Duration::minutes(5))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        f.svc
+            .reconcile(Duration::minutes(10), now() + Duration::minutes(11))
+            .await
+            .unwrap(),
+        1
+    );
+    let item = f.svc.approval(&id).await.unwrap().unwrap();
+    assert_eq!(item.status, Status::Failed);
+    let message = item.result.unwrap()["error"].as_str().unwrap().to_string();
+    assert!(
+        message.contains("may or may not have happened"),
+        "{message}"
+    );
+    assert!(message.contains("check jira"), "{message}");
+    let last = f.audit.events().pop().unwrap();
+    assert_eq!((last.outcome, last.output_ref), (Outcome::Error, Some(id)));
+    assert!(f.jira.writes().is_empty(), "nothing is retried");
 }
 
 #[tokio::test]

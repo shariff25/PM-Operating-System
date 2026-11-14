@@ -270,8 +270,11 @@ async fn draft_waits_for_approval_then_lands() {
             ("slack.send_message".to_string(), Outcome::Denied),
             ("confluence.create_draft".to_string(), Outcome::Pending),
             ("confluence.create_draft".to_string(), Outcome::Denied),
+            // Each write is recorded as starting before it runs.
+            ("confluence.create_draft".to_string(), Outcome::Started),
             ("confluence.create_draft".to_string(), Outcome::Approved),
             ("confluence.create_draft".to_string(), Outcome::Granted),
+            ("confluence.create_draft".to_string(), Outcome::Started),
             ("confluence.create_draft".to_string(), Outcome::Approved),
         ]
     );
@@ -379,9 +382,9 @@ async fn draft_lands_with_postgres_stores() {
         .fetch_all(&pool)
         .await
         .unwrap();
-    // Search, the queued write, and the approval. Listing tools isn't a call, so it isn't
-    // audited.
-    assert_eq!(outcomes, vec!["ok", "pending", "approved"]);
+    // Search, the queued write, the write starting, and its approval. Listing tools isn't a
+    // call, so it isn't audited.
+    assert_eq!(outcomes, vec!["ok", "pending", "started", "approved"]);
 
     // Only the token's hash is in the database.
     let stored: Vec<String> = sqlx::query_scalar("SELECT token_hash FROM sessions")

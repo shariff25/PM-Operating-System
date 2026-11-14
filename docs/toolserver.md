@@ -35,6 +35,19 @@ harness ──same call (edited args if edited)──► tool server: grant matc
   pending item in the PM's inbox instead.
 - Only the item's own user can approve it there (`403` for anyone else). Approve and edit
   run the write as that user.
+- **Edits are checked before anything changes.** Edited arguments are checked against the
+  tool's schema like any call (`400` if they fail), and the item's skill must still declare
+  the tool (`409` if not). A refused decision leaves the item pending.
+- **An item moves through states:** `pending`, then `executing` while the write runs, then
+  `approved` (with the result) or `failed`.
+  - The write runs in its own task, so an approver who disconnects can't cancel it halfway.
+  - If the process dies mid-write, the item stays `executing`. On the next start, and every
+    10 minutes for anything stuck longer than that, it becomes `failed` with "it may or may
+    not have happened: check Jira before trying again". Nothing is retried automatically.
+- **No write runs unless the audit log records it starting** (outcome `started`). If that
+  record fails, the write doesn't run, and a harness grant is put back.
+- **A timeout or 5xx on a write** is reported as "may or may not have happened", never as
+  "unavailable", so neither the model nor the PM retries into a duplicate.
 
 ## Endpoints
 
@@ -153,12 +166,15 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 | Sessions | `sessions` | Only the SHA-256 of each token is stored |
 | Grants | `grants` | Taken with `DELETE … RETURNING` on a row locked `FOR UPDATE SKIP LOCKED`: one grant, one call, even under concurrency |
 | Approvals | `approvals` | A decision is one conditional `UPDATE … WHERE status = 'pending' AND user_handle = …`: exactly one of several concurrent decisions wins |
-| Audit | `audit_events` | Append-only: a trigger rejects `UPDATE` and `DELETE` |
+| Audit | `audit_events` | Append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Each event records the caller (`mcp`, `orchestrator` or `bot`). |
 | Credentials | `credentials` | Tokens sealed by the vault; the database never sees plaintext |
 
 - **Migrations** run on start-up.
 - **Pruning:** expired sessions and grants are deleted every 10 minutes.
-- **Audit failures:** if an audit event can't be recorded, the server logs `AUDIT EVENT NOT RECORDED` at error level. The call itself is not undone.
+- **Audit failures:**
+  - **Writes fail closed:** they don't run unless their `started` event is recorded.
+  - **Reads:** a missing event is logged as `AUDIT EVENT NOT RECORDED` at error level, and the read isn't undone.
+- **Database roles (recommended):** run migrations as an owner role, and give the tool server's role only `SELECT, INSERT` on `audit_events`. The triggers already stop the owner from rewriting history; the separate role also stops anyone from dropping them through the app's connection.
 - **Tests:** `tests/stores.rs` runs the same contract cases against both backends, including the concurrency cases.
   - Set `PMOS_TEST_DATABASE_URL` to run the Postgres side. CI does.
   - Without it, the Postgres cases are skipped locally and fail in CI.
