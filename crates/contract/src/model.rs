@@ -215,3 +215,96 @@ pub struct TemplateFrontMatter {
     pub owner: String,
     pub version: String,
 }
+
+/// A role in PM OS (ADM-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Role {
+    Pm,
+    SkillAuthor,
+    /// Platform owner: runs the Spark, reviews sandbox policies.
+    Admin,
+}
+
+/// One person who may use PM OS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct TeamMember {
+    /// PM OS handle: lowercase letters, digits, `.`, `_` and `-`.
+    pub handle: String,
+    /// Slack member id, such as `U012AB3CD`.
+    pub slack_id: String,
+    /// Atlassian account email. Linking Jira and Confluence checks the signed-in account
+    /// has this email, so a forwarded link can't attach someone else's account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    pub roles: Vec<Role>,
+}
+
+/// `content/team.yaml`: who may use PM OS, until SSO replaces it (Phase 1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamFile {
+    #[serde(default)]
+    pub members: Vec<TeamMember>,
+}
+
+impl TeamFile {
+    pub fn from_yaml(text: &str) -> Result<Self, serde_norway::Error> {
+        serde_norway::from_str(text)
+    }
+
+    /// The member with this Slack id.
+    pub fn by_slack_id(&self, slack_id: &str) -> Option<&TeamMember> {
+        self.members.iter().find(|m| m.slack_id == slack_id)
+    }
+
+    /// The member with this PM OS handle.
+    pub fn by_handle(&self, handle: &str) -> Option<&TeamMember> {
+        self.members.iter().find(|m| m.handle == handle)
+    }
+
+    /// `<content_root>/team.yaml`. A missing file is an empty team; a file that doesn't parse
+    /// is an error, so a typo never silently opens or closes access.
+    pub fn load(content_root: &std::path::Path) -> Result<Self, String> {
+        let path = content_root.join("team.yaml");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Self::from_yaml(&text).map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+}
+
+/// A plausible email address: one `@`, something either side, a dot in the domain, no
+/// spaces. Deliverability isn't checked; this catches typos in `team.yaml`.
+pub fn valid_email(email: &str) -> bool {
+    match email.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+                && !domain.contains('@')
+                && !email.chars().any(char::is_whitespace)
+        }
+        None => false,
+    }
+}
+
+/// A valid PM OS handle (the tool server and harness apply the same rule).
+pub fn valid_handle(handle: &str) -> bool {
+    let mut chars = handle.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
+        && handle.len() <= 64
+}
+
+/// A Slack member id: `U` or `W`, then uppercase letters and digits.
+pub fn valid_slack_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    matches!(chars.next(), Some('U' | 'W'))
+        && id.len() >= 3
+        && id.len() <= 32
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}

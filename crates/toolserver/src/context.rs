@@ -1,18 +1,25 @@
 //! The context library as the tool server serves it.
 //!
-//! [`ContextIndex`] is the seam for the Postgres index (pgvector plus full-text search) that
-//! replaces [`MemoryIndex`] in 0c-2. Both serve only files under `content/context/`, so a
-//! path a caller sends can never reach anything else on disk.
+//! [`ContextIndex`] has two implementations: [`MemoryIndex`] (keyword scoring, for tests and
+//! dev) and the Postgres index in `pg.rs` (full-text search, rebuilt from the content repo on
+//! start-up and on `POST /internal/reindex`). Both serve only files under `content/context/`,
+//! so a path a caller sends can never reach anything else on disk.
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::RwLock;
 
+use async_trait::async_trait;
 use chrono::NaiveDate;
 use pmos_contract::frontmatter;
 use pmos_contract::model::parse_context_front_matter;
 use pmos_contract::Sensitivity;
 use serde::Serialize;
 use walkdir::WalkDir;
+
+pub use pmos_contract::text::{query_terms, snippet, terms};
+
+use crate::store::StoreResult;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContextDoc {
@@ -41,82 +48,115 @@ pub struct Hit {
     pub snippet: String,
 }
 
+#[async_trait]
 pub trait ContextIndex: Send + Sync {
-    /// Best matches for `query`, highest score first, optionally within one domain.
-    fn search(&self, query: &str, domain: Option<&str>, limit: usize) -> Vec<Hit>;
+    /// Best matches for `query` at or below `ceiling`, highest score first, optionally within
+    /// one domain. The ceiling is applied in the search itself, so files above it never take
+    /// the places of files the caller may see; `withheld` counts the matches above it.
+    async fn search(
+        &self,
+        query: &str,
+        domain: Option<&str>,
+        ceiling: Sensitivity,
+        limit: usize,
+    ) -> StoreResult<SearchResults>;
     /// The document at `path`, if it is an indexed context file.
-    fn get(&self, path: &str) -> Option<ContextDoc>;
+    async fn get(&self, path: &str) -> StoreResult<Option<ContextDoc>>;
+    /// Make the index match `docs` exactly: add or update every doc, drop the rest.
+    async fn reindex(&self, docs: Vec<ContextDoc>) -> StoreResult<ReindexReport>;
+}
+
+/// Search hits the caller may see, and how many matches were above its ceiling.
+#[derive(Debug, Clone, Default)]
+pub struct SearchResults {
+    pub hits: Vec<Hit>,
+    pub withheld: usize,
+}
+
+/// What a reindex changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ReindexReport {
+    pub indexed: usize,
+    pub removed: u64,
+}
+
+/// Every context file under `<content_root>/context/<domain>/` with valid front matter,
+/// sorted by path. Files the lint would reject are skipped; the server refuses to start on
+/// lint errors, so in practice nothing is skipped.
+pub fn load_docs(content_root: &Path) -> Vec<ContextDoc> {
+    let dir = content_root.join("context");
+    let mut docs = Vec::new();
+    for entry in WalkDir::new(&dir)
+        .min_depth(2)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if !entry.file_type().is_file()
+            || path.extension().is_none_or(|x| x != "md")
+            || path.file_name().is_some_and(|n| n == "README.md")
+        {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(doc) = frontmatter::split(&text) else {
+            continue;
+        };
+        let Ok(fm) = parse_context_front_matter(doc.yaml) else {
+            continue;
+        };
+        let rel = path
+            .strip_prefix(content_root)
+            .unwrap_or(path)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let domain = rel.split('/').nth(1).unwrap_or_default().to_string();
+        let title = fm
+            .title
+            .clone()
+            .or_else(|| first_heading(doc.body))
+            .unwrap_or_else(|| rel.clone());
+        docs.push(ContextDoc {
+            path: rel,
+            domain,
+            title,
+            owner: fm.owner,
+            last_reviewed: fm.last_reviewed,
+            sensitivity: fm.sensitivity,
+            body: doc.body.to_string(),
+        });
+    }
+    docs
 }
 
 /// Keyword index over the context files, built at start-up.
 #[derive(Default)]
 pub struct MemoryIndex {
-    docs: BTreeMap<String, ContextDoc>,
+    docs: RwLock<BTreeMap<String, ContextDoc>>,
 }
 
 impl MemoryIndex {
-    /// Index every context file under `<content_root>/context/` that has valid front matter.
-    /// Files the lint would reject are skipped; the server refuses to start on lint errors,
-    /// so in practice nothing is skipped.
     pub fn load(content_root: &Path) -> Self {
-        let dir = content_root.join("context");
-        let mut docs = BTreeMap::new();
-        for entry in WalkDir::new(&dir)
-            .min_depth(2)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            let path = entry.path();
-            if !entry.file_type().is_file()
-                || path.extension().is_none_or(|x| x != "md")
-                || path.file_name().is_some_and(|n| n == "README.md")
-            {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            let Ok(doc) = frontmatter::split(&text) else {
-                continue;
-            };
-            let Ok(fm) = parse_context_front_matter(doc.yaml) else {
-                continue;
-            };
-            let rel = path
-                .strip_prefix(content_root)
-                .unwrap_or(path)
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            let domain = rel.split('/').nth(1).unwrap_or_default().to_string();
-            let title = fm
-                .title
-                .clone()
-                .or_else(|| first_heading(doc.body))
-                .unwrap_or_else(|| rel.clone());
-            docs.insert(
-                rel.clone(),
-                ContextDoc {
-                    path: rel,
-                    domain,
-                    title,
-                    owner: fm.owner,
-                    last_reviewed: fm.last_reviewed,
-                    sensitivity: fm.sensitivity,
-                    body: doc.body.to_string(),
-                },
-            );
+        Self::from_docs(load_docs(content_root))
+    }
+
+    pub fn from_docs(docs: Vec<ContextDoc>) -> Self {
+        Self {
+            docs: RwLock::new(docs.into_iter().map(|d| (d.path.clone(), d)).collect()),
         }
-        Self { docs }
     }
 
     pub fn len(&self) -> usize {
-        self.docs.len()
+        self.docs.read().expect("index lock").len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.docs.is_empty()
+        self.len() == 0
     }
 }
 
@@ -126,21 +166,22 @@ fn first_heading(body: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-fn terms(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() > 1)
-        .map(str::to_lowercase)
-        .collect()
-}
-
+#[async_trait]
 impl ContextIndex for MemoryIndex {
-    fn search(&self, query: &str, domain: Option<&str>, limit: usize) -> Vec<Hit> {
-        let query_terms = terms(query);
+    async fn search(
+        &self,
+        query: &str,
+        domain: Option<&str>,
+        ceiling: Sensitivity,
+        limit: usize,
+    ) -> StoreResult<SearchResults> {
+        let query_terms = query_terms(query);
         if query_terms.is_empty() {
-            return Vec::new();
+            return Ok(SearchResults::default());
         }
-        let mut hits: Vec<Hit> = self
-            .docs
+        let docs = self.docs.read().expect("index lock");
+        let mut withheld = 0;
+        let mut hits: Vec<Hit> = docs
             .values()
             .filter(|d| domain.is_none_or(|want| d.domain == want))
             .filter_map(|doc| {
@@ -151,7 +192,14 @@ impl ContextIndex for MemoryIndex {
                     score += 3.0 * title.iter().filter(|t| *t == q).count() as f32;
                     score += body.iter().filter(|t| *t == q).count() as f32;
                 }
-                (score > 0.0).then(|| Hit {
+                if score <= 0.0 {
+                    return None;
+                }
+                if doc.sensitivity > ceiling {
+                    withheld += 1;
+                    return None;
+                }
+                Some(Hit {
                     snippet: snippet(&doc.body, &query_terms),
                     doc: doc.clone(),
                     score,
@@ -165,30 +213,22 @@ impl ContextIndex for MemoryIndex {
                 .then_with(|| a.doc.path.cmp(&b.doc.path))
         });
         hits.truncate(limit);
-        hits
+        Ok(SearchResults { hits, withheld })
     }
 
-    fn get(&self, path: &str) -> Option<ContextDoc> {
-        self.docs.get(path).cloned()
+    async fn get(&self, path: &str) -> StoreResult<Option<ContextDoc>> {
+        Ok(self.docs.read().expect("index lock").get(path).cloned())
     }
-}
 
-/// The first non-empty body line that mentions a query term, cut to 200 characters.
-fn snippet(body: &str, query_terms: &[String]) -> String {
-    let line = body
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("<!--"))
-        .find(|l| {
-            let lower = l.to_lowercase();
-            query_terms.iter().any(|q| lower.contains(q.as_str()))
-        })
-        .unwrap_or_default();
-    let mut out: String = line.chars().take(200).collect();
-    if line.chars().count() > 200 {
-        out.push('…');
+    async fn reindex(&self, docs: Vec<ContextDoc>) -> StoreResult<ReindexReport> {
+        let mut current = self.docs.write().expect("index lock");
+        let indexed = docs.len();
+        let next: BTreeMap<String, ContextDoc> =
+            docs.into_iter().map(|d| (d.path.clone(), d)).collect();
+        let removed = current.keys().filter(|k| !next.contains_key(*k)).count() as u64;
+        *current = next;
+        Ok(ReindexReport { indexed, removed })
     }
-    out
 }
 
 #[cfg(test)]
@@ -205,8 +245,8 @@ mod tests {
         format!("---\ntitle: {title}\nowner: \"@pm\"\nlast-reviewed: 2026-11-01\nsensitivity: {sensitivity}\n---\n\n{body}\n")
     }
 
-    #[test]
-    fn indexes_and_ranks() {
+    #[tokio::test]
+    async fn indexes_and_ranks() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write(
@@ -228,22 +268,39 @@ mod tests {
             "README and files outside a domain are skipped"
         );
 
-        let hits = index.search("key management", None, 10);
+        let hits = index
+            .search("key management", None, Sensitivity::Restricted, 10)
+            .await
+            .unwrap()
+            .hits;
         assert_eq!(hits[0].doc.path, "context/competitors/acme.md");
         assert_eq!(hits[1].doc.path, "context/products/ccm.md");
         assert!(hits[0].snippet.contains("key management"));
 
-        let hits = index.search("key", Some("products"), 10);
+        let hits = index
+            .search("key", Some("products"), Sensitivity::Restricted, 10)
+            .await
+            .unwrap()
+            .hits;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc.domain, "products");
 
-        assert!(index.search("", None, 10).is_empty());
-        assert!(index.get("context/products/ccm.md").is_some());
-        assert!(index.get("../secrets.md").is_none());
+        assert!(index
+            .search("", None, Sensitivity::Restricted, 10)
+            .await
+            .unwrap()
+            .hits
+            .is_empty());
+        assert!(index
+            .get("context/products/ccm.md")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(index.get("../secrets.md").await.unwrap().is_none());
     }
 
-    #[test]
-    fn title_falls_back_to_heading() {
+    #[tokio::test]
+    async fn title_falls_back_to_heading() {
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
@@ -252,7 +309,12 @@ mod tests {
         );
         let index = MemoryIndex::load(dir.path());
         assert_eq!(
-            index.get("context/glossary/terms.md").unwrap().title,
+            index
+                .get("context/glossary/terms.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .title,
             "Glossary"
         );
     }

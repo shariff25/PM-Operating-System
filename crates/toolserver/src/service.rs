@@ -1,5 +1,6 @@
-//! The tool server's rules, independent of transport. MCP (`mcp.rs`) and the internal HTTP
-//! API (`api.rs`) are thin layers over [`ToolService`].
+//! The tool server's rules, independent of transport and storage. MCP (`mcp.rs`) and the
+//! internal HTTP API (`app.rs`) are thin layers over [`ToolService`]; the stores behind it are
+//! in memory or in Postgres (`store.rs`).
 //!
 //! Every call goes through these rules:
 //! 1. The tool must be one the session's skill declared (PRD: Authorization).
@@ -16,16 +17,16 @@ use pmos_contract::model::CONTEXT_DOMAINS;
 use pmos_contract::{Skill, ToolKind};
 use serde_json::{json, Value};
 
-use crate::approvals::{
-    args_hash, ApprovalItem, ApprovalStore, DecideError, Decision, NewItem, Status,
-};
-use crate::audit::{AuditEvent, AuditSink, Outcome};
+use crate::approvals::{args_hash, ApprovalItem, DecideError, Decision, NewItem, Status};
+use crate::audit::{AuditEvent, Client, Outcome};
 use crate::catalog::{Catalog, ToolSpec};
 use crate::connectors::{untrusted, Caller, Connector, ConnectorError};
-use crate::context::{ContextDoc, ContextIndex};
-use crate::memory::{valid_key, MemoryStore};
+use crate::context::{load_docs, ContextDoc, ReindexReport};
+use crate::memory::valid_key;
 use crate::schemas::check_args;
-use crate::session::{valid_handle, Session, SessionStore};
+use crate::session::{token_hash, valid_handle, Session};
+use crate::store::{StoreError, Stores};
+use crate::team::Team;
 
 pub const DEFAULT_SESSION_TTL_MINUTES: i64 = 60;
 const DEFAULT_LIMIT: usize = 5;
@@ -45,6 +46,9 @@ pub enum ToolError {
     NotFound(String),
     #[error("{0}")]
     Connector(String),
+    /// Storage failed. The call did not complete; it is safe to retry.
+    #[error("PM OS storage is unavailable; try again shortly")]
+    Unavailable(String),
 }
 
 impl From<ConnectorError> for ToolError {
@@ -52,8 +56,15 @@ impl From<ConnectorError> for ToolError {
         match e {
             ConnectorError::NotFound(id) => ToolError::NotFound(id),
             ConnectorError::BadArgs(m) => ToolError::InvalidArgs(m),
+            ConnectorError::Forbidden(m) => ToolError::Forbidden(m),
             other => ToolError::Connector(other.to_string()),
         }
+    }
+}
+
+impl From<StoreError> for ToolError {
+    fn from(e: StoreError) -> Self {
+        ToolError::Unavailable(e.0)
     }
 }
 
@@ -65,6 +76,18 @@ pub enum SessionError {
     InvalidUser(String),
     #[error("run_id must be 1–128 characters")]
     InvalidRun,
+    #[error("`{0}` is not in team.yaml")]
+    NotAMember(String),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ReindexError {
+    #[error("content does not pass `pmos lint`:\n{0}")]
+    Lint(String),
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -73,16 +96,25 @@ pub enum DecisionError {
     Decide(#[from] DecideError),
     #[error("tool `{0}` is no longer served")]
     UnknownTool(String),
+    #[error("the item's skill no longer declares `{0}`")]
+    NotAllowed(String),
+    #[error("invalid arguments: {0}")]
+    InvalidArgs(String),
+    #[error("the write task failed: {0}")]
+    Internal(String),
+}
+
+impl From<StoreError> for DecisionError {
+    fn from(e: StoreError) -> Self {
+        DecisionError::Decide(DecideError::Store(e))
+    }
 }
 
 pub struct ToolService {
     catalog: Catalog,
-    sessions: SessionStore,
-    approvals: ApprovalStore,
-    context: Arc<dyn ContextIndex>,
-    memory: Arc<dyn MemoryStore>,
+    stores: Stores,
     connectors: HashMap<String, Arc<dyn Connector>>,
-    audit: Arc<dyn AuditSink>,
+    team: Arc<Team>,
     stale_after_days: i64,
 }
 
@@ -90,10 +122,8 @@ impl ToolService {
     /// Fails if any registry tool belongs to a system with no handler.
     pub fn new(
         catalog: Catalog,
-        context: Arc<dyn ContextIndex>,
-        memory: Arc<dyn MemoryStore>,
+        stores: Stores,
         connectors: Vec<Arc<dyn Connector>>,
-        audit: Arc<dyn AuditSink>,
     ) -> Result<Self, String> {
         let connectors: HashMap<String, Arc<dyn Connector>> = connectors
             .into_iter()
@@ -111,23 +141,91 @@ impl ToolService {
         }
         Ok(Self {
             catalog,
-            sessions: SessionStore::default(),
-            approvals: ApprovalStore::default(),
-            context,
-            memory,
+            stores,
             connectors,
-            audit,
+            team: Team::open(),
             stale_after_days: pmos_contract::lint::DEFAULT_STALE_AFTER_DAYS,
         })
+    }
+
+    /// Only people in `team` may have sessions (when it is enforced).
+    pub fn with_team(mut self, team: Arc<Team>) -> Self {
+        self.team = team;
+        self
+    }
+
+    pub fn team(&self) -> &Arc<Team> {
+        &self.team
+    }
+
+    /// Readiness: storage answers within a second, and every connector's own dependency
+    /// (such as the support docs server) answers. Each check is reported by name.
+    pub async fn readiness(&self) -> Vec<(String, Result<(), String>)> {
+        let storage = match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            self.stores.approvals.get("apr_readiness_probe"),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("storage didn't answer within 1 s".into()),
+        };
+        let mut checks = vec![("storage".to_string(), storage)];
+        let mut systems: Vec<_> = self.connectors.iter().collect();
+        systems.sort_by_key(|(name, _)| name.as_str());
+        for (name, connector) in systems {
+            checks.push((name.clone(), connector.ready().await));
+        }
+        checks
     }
 
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 
+    /// Rebuild the context index from the content repo checkout at `content_root`, after a
+    /// merge. Content that fails `pmos lint` is refused and the index is left as it was.
+    /// Skill and tool registry changes take effect on the next restart.
+    pub async fn reindex(
+        &self,
+        content_root: &std::path::Path,
+        now: DateTime<Utc>,
+    ) -> Result<ReindexReport, ReindexError> {
+        let report = pmos_contract::lint(
+            content_root,
+            &pmos_contract::LintOptions::new(now.date_naive()),
+        );
+        if report.has_errors() {
+            let lines: Vec<String> = report
+                .errors()
+                .map(|d| format!("  {}: {}: {}", d.code, d.path, d.message))
+                .collect();
+            return Err(ReindexError::Lint(lines.join("\n")));
+        }
+        if let Err(e) = self.team.reload() {
+            return Err(ReindexError::Lint(format!("  team.yaml: {e}")));
+        }
+        Ok(self.stores.context.reindex(load_docs(content_root)).await?)
+    }
+
+    /// Record an audit event. A failure is logged at error level: the audit log is a
+    /// control, so a platform owner needs to see it, but it never undoes the call itself.
+    async fn audit(&self, event: AuditEvent) {
+        if let Err(e) = self.stores.audit.record(event.clone()).await {
+            tracing::error!(
+                error = %e,
+                run_id = %event.run_id,
+                tool = %event.tool,
+                outcome = ?event.outcome,
+                "AUDIT EVENT NOT RECORDED"
+            );
+        }
+    }
+
     // ----- sessions -------------------------------------------------------------------
 
-    pub fn create_session(
+    pub async fn create_session(
         &self,
         user: &str,
         skill: &str,
@@ -138,6 +236,9 @@ impl ToolService {
         if !valid_handle(user) {
             return Err(SessionError::InvalidUser(user.to_string()));
         }
+        if !self.team.allows(user) {
+            return Err(SessionError::NotAMember(user.to_string()));
+        }
         if self.catalog.skill(skill).is_none() {
             return Err(SessionError::UnknownSkill(skill.to_string()));
         }
@@ -145,32 +246,44 @@ impl ToolService {
             return Err(SessionError::InvalidRun);
         }
         let ttl = ttl.unwrap_or_else(|| Duration::minutes(DEFAULT_SESSION_TTL_MINUTES));
-        Ok(self.sessions.create(user, skill, run_id, ttl, now))
+        let session = Session::new(user, skill, run_id, ttl, now);
+        self.stores.sessions.insert(&session, now).await?;
+        Ok(session)
     }
 
-    pub fn session(&self, token: &str, now: DateTime<Utc>) -> Option<Session> {
-        self.sessions.get(token, now)
+    /// The live session for `token`. A session whose skill is no longer in the catalog
+    /// (content changed since it was created) is treated as gone.
+    pub async fn session(
+        &self,
+        token: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Session>, StoreError> {
+        Ok(self
+            .stores
+            .sessions
+            .get(token, now)
+            .await?
+            .filter(|s| self.catalog.skill(&s.skill).is_some()))
     }
 
-    pub fn revoke_session(&self, token: &str) -> bool {
-        self.sessions.revoke(token)
+    pub async fn revoke_session(&self, token: &str) -> Result<bool, StoreError> {
+        self.stores.sessions.revoke(token).await
     }
 
-    fn skill_of(&self, session: &Session) -> &Skill {
-        // Sessions are only created for skills in the catalog, and the catalog is fixed for
-        // the life of the process.
-        self.catalog
-            .skill(&session.skill)
-            .expect("session skill is in the catalog")
+    fn skill_of(&self, session: &Session) -> Option<&Skill> {
+        self.catalog.skill(&session.skill)
     }
 
     /// The tools this session may call.
     pub fn list_tools(&self, session: &Session) -> Vec<&ToolSpec> {
-        self.catalog.tools_for(self.skill_of(session))
+        self.skill_of(session)
+            .map(|skill| self.catalog.tools_for(skill))
+            .unwrap_or_default()
     }
 
     // ----- tool calls -----------------------------------------------------------------
 
+    /// A call from an agent sandbox over MCP.
     pub async fn call(
         &self,
         session: &Session,
@@ -178,8 +291,22 @@ impl ToolService {
         args: Value,
         now: DateTime<Utc>,
     ) -> Result<Value, ToolError> {
+        self.call_as(Client::Mcp, session, harness_name, args, now)
+            .await
+    }
+
+    /// A call by `client`, which is recorded in the audit log.
+    pub async fn call_as(
+        &self,
+        client: Client,
+        session: &Session,
+        harness_name: &str,
+        args: Value,
+        now: DateTime<Utc>,
+    ) -> Result<Value, ToolError> {
         let args = if args.is_null() { json!({}) } else { args };
         let mut event = AuditEvent {
+            client,
             at: now,
             run_id: session.run_id.clone(),
             user: session.user.clone(),
@@ -204,7 +331,7 @@ impl ToolService {
             };
             event.detail = Some(e.to_string());
         }
-        self.audit.record(event);
+        self.audit(event).await;
         result
     }
 
@@ -221,20 +348,26 @@ impl ToolService {
             .tool(harness_name)
             .ok_or_else(|| ToolError::UnknownTool(harness_name.to_string()))?;
         event.tool = spec.name.clone();
-        let skill = self.skill_of(session);
+        let skill = self
+            .skill_of(session)
+            .ok_or_else(|| ToolError::NotAllowed(spec.harness_name.clone()))?;
         if !skill.tools.contains(&spec.name) {
             return Err(ToolError::NotAllowed(spec.harness_name.clone()));
         }
         check_args(&spec.input_schema, args).map_err(ToolError::InvalidArgs)?;
 
         match (spec.kind, spec.system.as_str()) {
-            (ToolKind::Read, "context") => self.context_tool(skill, spec, args, now, event),
-            (ToolKind::Read, "memory") => Ok(json!({ "notes": self.memory.read(&session.user) })),
-            (ToolKind::Internal, "memory") => self.memory_update(session, args, now),
+            (ToolKind::Read, "context") => self.context_tool(skill, spec, args, now, event).await,
+            (ToolKind::Read, "memory") => {
+                let notes = self.stores.memory.read(&session.user).await?;
+                Ok(json!({ "notes": notes }))
+            }
+            (ToolKind::Internal, "memory") => self.memory_update(session, args, now).await,
             (ToolKind::Read, system) => {
                 let connector = self.connector(system)?;
                 let caller = Caller {
                     user: &session.user,
+                    run_id: &session.run_id,
                 };
                 let items = connector.read(caller, spec.action(), args).await?;
                 event.sources = items
@@ -257,7 +390,7 @@ impl ToolService {
             .ok_or_else(|| ToolError::Connector(format!("no connector for `{system}`")))
     }
 
-    fn context_tool(
+    async fn context_tool(
         &self,
         skill: &Skill,
         spec: &ToolSpec,
@@ -281,16 +414,18 @@ impl ToolService {
                     .map(|n| n as usize)
                     .unwrap_or(DEFAULT_LIMIT)
                     .min(MAX_LIMIT);
-                let hits = self.context.search(query, domain, MAX_LIMIT * 2);
-                let (allowed, withheld): (Vec<_>, Vec<_>) =
-                    hits.into_iter().partition(|h| h.doc.sensitivity <= ceiling);
-                let allowed: Vec<_> = allowed.into_iter().take(limit).collect();
+                let found = self
+                    .stores
+                    .context
+                    .search(query, domain, ceiling, limit)
+                    .await?;
+                let allowed = found.hits;
                 event.sources = allowed.iter().map(|h| h.doc.path.clone()).collect();
-                if !withheld.is_empty() {
+                if found.withheld > 0 {
                     // Audited, not shown to the model: the result list simply omits them.
                     event.detail = Some(format!(
                         "{} result(s) above data class {ceiling} withheld",
-                        withheld.len()
+                        found.withheld
                     ));
                 }
                 Ok(json!({
@@ -309,8 +444,10 @@ impl ToolService {
                     ));
                 }
                 let doc = self
+                    .stores
                     .context
                     .get(path)
+                    .await?
                     .ok_or_else(|| ToolError::NotFound(path.to_string()))?;
                 if doc.sensitivity > ceiling {
                     return Err(ToolError::Forbidden(format!(
@@ -348,7 +485,7 @@ impl ToolService {
         v
     }
 
-    fn memory_update(
+    async fn memory_update(
         &self,
         session: &Session,
         args: &Value,
@@ -361,7 +498,12 @@ impl ToolService {
             ));
         }
         let text = args["text"].as_str().unwrap_or_default();
-        Ok(json!({ "note": self.memory.update(&session.user, key, text, now) }))
+        let note = self
+            .stores
+            .memory
+            .update(&session.user, key, text, now)
+            .await?;
+        Ok(json!({ "note": note }))
     }
 
     async fn write(
@@ -372,26 +514,58 @@ impl ToolService {
         now: DateTime<Utc>,
         event: &mut AuditEvent,
     ) -> Result<Value, ToolError> {
+        let key = token_hash(&session.token);
         if self
+            .stores
             .approvals
-            .take_grant(&session.token, &spec.name, args, now)
+            .take_grant(&key, &spec.name, args, now)
+            .await?
         {
-            let written = self.execute_write(&session.user, spec, args).await?;
+            // Fail closed: the write runs only once the audit log has recorded it starting.
+            let started = AuditEvent {
+                outcome: Outcome::Started,
+                detail: Some("approved in the harness; writing".into()),
+                ..event.clone()
+            };
+            if let Err(e) = self.stores.audit.record(started).await {
+                tracing::error!(error = %e, tool = %spec.name, "AUDIT UNAVAILABLE: approved write not run");
+                // The grant was used up; put it back so the PM needn't approve again.
+                let _ = self
+                    .stores
+                    .approvals
+                    .add_grant(&key, &spec.name, args, now)
+                    .await;
+                return Err(ToolError::Unavailable(e.0));
+            }
+            let written = self
+                .execute_write(
+                    Caller {
+                        user: &session.user,
+                        run_id: &session.run_id,
+                    },
+                    spec,
+                    args,
+                )
+                .await?;
             event.outcome = Outcome::Approved;
             event.detail = Some("approved in the harness".into());
             event.output_ref = written["url"].as_str().map(String::from);
             return Ok(written);
         }
-        let item = self.approvals.create(
-            NewItem {
-                user: &session.user,
-                skill: &session.skill,
-                run_id: &session.run_id,
-                tool: &spec.name,
-                args,
-            },
-            now,
-        );
+        let item = self
+            .stores
+            .approvals
+            .create(
+                NewItem {
+                    user: &session.user,
+                    skill: &session.skill,
+                    run_id: &session.run_id,
+                    tool: &spec.name,
+                    args,
+                },
+                now,
+            )
+            .await?;
         event.outcome = Outcome::Pending;
         event.output_ref = Some(item.id.clone());
         Ok(json!({
@@ -406,14 +580,23 @@ impl ToolService {
 
     async fn execute_write(
         &self,
-        user: &str,
+        caller: Caller<'_>,
         spec: &ToolSpec,
         args: &Value,
     ) -> Result<Value, ToolError> {
         let connector = self.connector(&spec.system)?;
         let written = connector
-            .write(Caller { user }, spec.action(), args)
-            .await?;
+            .write(caller, spec.action(), args)
+            .await
+            .map_err(|e| match e {
+                // A timeout or a 5xx after sending: the write may have happened. Saying
+                // "unavailable" would invite a retry and a duplicate.
+                ConnectorError::Unavailable(detail) => ToolError::Connector(format!(
+                    "{system} didn't confirm the write ({detail}). It may or may not have happened: check {system} before trying again, and don't retry automatically.",
+                    system = spec.system
+                )),
+                other => other.into(),
+            })?;
         Ok(json!({
             "status": "done",
             "system": written.system,
@@ -426,7 +609,7 @@ impl ToolService {
 
     /// Record that the PM approved this exact write in the harness, so the call that follows
     /// runs without a second approval.
-    pub fn grant(
+    pub async fn grant(
         &self,
         session: &Session,
         harness_name: &str,
@@ -443,12 +626,18 @@ impl ToolService {
                 spec.name
             )));
         }
-        if !self.skill_of(session).tools.contains(&spec.name) {
+        let declared = self
+            .skill_of(session)
+            .is_some_and(|s| s.tools.contains(&spec.name));
+        if !declared {
             return Err(ToolError::NotAllowed(spec.harness_name.clone()));
         }
-        self.approvals
-            .add_grant(&session.token, &spec.name, args, now);
-        self.audit.record(AuditEvent {
+        self.stores
+            .approvals
+            .add_grant(&token_hash(&session.token), &spec.name, args, now)
+            .await?;
+        self.audit(AuditEvent {
+            client: Client::Orchestrator,
             at: now,
             run_id: session.run_id.clone(),
             user: session.user.clone(),
@@ -459,53 +648,84 @@ impl ToolService {
             args_hash: Some(args_hash(args)),
             output_ref: None,
             detail: None,
-        });
+        })
+        .await;
         Ok(())
     }
 
-    pub fn approvals(&self, user: &str, status: Option<Status>) -> Vec<ApprovalItem> {
-        self.approvals.list(user, status)
-    }
-
-    pub fn approval(&self, id: &str) -> Option<ApprovalItem> {
-        self.approvals.get(id)
-    }
-
-    /// A person's decision on an inbox item. Approve and edit run the write as the item's
-    /// user; reject closes it.
-    pub async fn decide(
+    pub async fn approvals(
         &self,
+        user: &str,
+        status: Option<Status>,
+    ) -> Result<Vec<ApprovalItem>, StoreError> {
+        self.stores.approvals.list(user, status).await
+    }
+
+    pub async fn approval(&self, id: &str) -> Result<Option<ApprovalItem>, StoreError> {
+        self.stores.approvals.get(id).await
+    }
+
+    /// Decide an inbox item as `decided_by`. Approve and edit run the write as the item's
+    /// user; edited arguments are checked like any call's, and the skill must still declare
+    /// the tool.
+    ///
+    /// The write runs in its own task, so a caller that disconnects can't cancel it halfway,
+    /// and every way out of here is audited. The item is `executing` while the write runs;
+    /// if the process dies then, [`ToolService::reconcile`] resolves it on the next start.
+    pub async fn decide(
+        self: &Arc<Self>,
         id: &str,
         decided_by: &str,
         decision: Decision,
         edited_args: Option<Value>,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecisionError> {
+        // Check the write is still allowed before changing anything. Ownership and status
+        // are checked again, atomically, by the store.
+        if decision != Decision::Reject {
+            if let Some(current) = self.stores.approvals.get(id).await? {
+                if current.user == decided_by && current.status == Status::Pending {
+                    let spec = self.write_spec(&current)?;
+                    if decision == Decision::Edit {
+                        let args = edited_args.as_ref().ok_or(DecideError::MissingArgs)?;
+                        check_args(&spec.input_schema, args).map_err(DecisionError::InvalidArgs)?;
+                    }
+                }
+            }
+        }
+
         let item = match self
+            .stores
             .approvals
             .decide(id, decided_by, decision, edited_args, now)
+            .await
         {
             Ok(item) => item,
             Err(e) => {
-                if let (DecideError::Forbidden, Some(item)) = (&e, self.approvals.get(id)) {
-                    self.audit.record(AuditEvent {
-                        at: now,
-                        run_id: item.run_id,
-                        user: decided_by.to_string(),
-                        skill: item.skill,
-                        tool: item.tool,
-                        outcome: Outcome::Denied,
-                        sources: Vec::new(),
-                        args_hash: Some(item.args_hash),
-                        output_ref: Some(item.id),
-                        detail: Some("decision by someone other than the item's user".into()),
-                    });
+                if e == DecideError::Forbidden {
+                    if let Ok(Some(item)) = self.stores.approvals.get(id).await {
+                        self.audit(AuditEvent {
+                            client: Client::Orchestrator,
+                            at: now,
+                            run_id: item.run_id,
+                            user: decided_by.to_string(),
+                            skill: item.skill,
+                            tool: item.tool,
+                            outcome: Outcome::Denied,
+                            sources: Vec::new(),
+                            args_hash: Some(item.args_hash),
+                            output_ref: Some(item.id),
+                            detail: Some("decision by someone other than the item's user".into()),
+                        })
+                        .await;
+                    }
                 }
                 return Err(e.into());
             }
         };
 
-        let mut event = AuditEvent {
+        let event = AuditEvent {
+            client: Client::Orchestrator,
             at: now,
             run_id: item.run_id.clone(),
             user: item.user.clone(),
@@ -518,30 +738,139 @@ impl ToolService {
             detail: (decision == Decision::Edit).then(|| "edited before approval".to_string()),
         };
         if item.status == Status::Rejected {
-            self.audit.record(event);
+            self.audit(event).await;
             return Ok(item);
         }
 
+        let this = self.clone();
+        tokio::spawn(async move { this.run_approved(item, event).await })
+            .await
+            .map_err(|e| DecisionError::Internal(e.to_string()))?
+    }
+
+    /// The tool for an inbox item, if the item's skill may still run it.
+    fn write_spec(&self, item: &ApprovalItem) -> Result<ToolSpec, DecisionError> {
         let spec = self
             .catalog
             .tools()
             .find(|t| t.name == item.tool)
             .cloned()
             .ok_or_else(|| DecisionError::UnknownTool(item.tool.clone()))?;
-        let result = self.execute_write(&item.user, &spec, &item.args).await;
-        let done = match result {
+        let declared = self
+            .catalog
+            .skill(&item.skill)
+            .is_some_and(|s| s.tools.contains(&spec.name));
+        if !declared {
+            return Err(DecisionError::NotAllowed(item.tool.clone()));
+        }
+        Ok(spec)
+    }
+
+    /// Run an approved (`executing`) item's write and store the outcome.
+    async fn run_approved(
+        &self,
+        item: ApprovalItem,
+        mut event: AuditEvent,
+    ) -> Result<ApprovalItem, DecisionError> {
+        let finish = |result: Result<Value, String>| {
+            let id = item.id.clone();
+            async move { self.stores.approvals.complete(&id, result).await }
+        };
+        // Checked before the decision; this catches a catalog that changed in between.
+        let spec = match self.write_spec(&item) {
+            Ok(spec) => spec,
+            Err(e) => {
+                event.outcome = Outcome::Error;
+                event.detail = Some(e.to_string());
+                self.audit(event).await;
+                let _ = finish(Err(e.to_string())).await;
+                return Err(e);
+            }
+        };
+        // Fail closed: no write runs unless the audit log has recorded that it is starting.
+        let started = AuditEvent {
+            outcome: Outcome::Started,
+            detail: Some("approved in the inbox; writing".into()),
+            ..event.clone()
+        };
+        if let Err(e) = self.stores.audit.record(started).await {
+            tracing::error!(error = %e, id = %item.id, "AUDIT UNAVAILABLE: approved write not run");
+            let _ = finish(Err("PM OS couldn't record the write in the audit log, so it didn't run. Approve it again shortly.".into())).await;
+            return Err(DecisionError::Decide(DecideError::Store(e)));
+        }
+
+        let result = self
+            .execute_write(
+                Caller {
+                    user: &item.user,
+                    run_id: &item.run_id,
+                },
+                &spec,
+                &item.args,
+            )
+            .await;
+        let outcome = match &result {
             Ok(written) => {
                 event.outcome = Outcome::Approved;
                 event.output_ref = written["url"].as_str().map(String::from);
-                self.approvals.complete(&item.id, Ok(written))
+                Ok(written.clone())
             }
             Err(e) => {
                 event.outcome = Outcome::Error;
                 event.detail = Some(e.to_string());
-                self.approvals.complete(&item.id, Err(e.to_string()))
+                Err(e.to_string())
             }
         };
-        self.audit.record(event);
-        Ok(done.unwrap_or(item))
+        let stored = finish(outcome).await;
+        if stored.is_err() {
+            let note = "outcome not saved to the inbox; the reconciler will mark it";
+            event.detail = Some(match event.detail.take() {
+                Some(d) => format!("{d}; {note}"),
+                None => note.to_string(),
+            });
+        }
+        // The outcome is audited even when storing it failed.
+        self.audit(event).await;
+        Ok(stored?.unwrap_or(item))
+    }
+
+    /// Resolve writes left `executing` for longer than `older_than` (the process died
+    /// mid-write). Their outcome is unknown, so they become `failed` with a note to check the
+    /// target system before trying again; nothing is retried automatically. Returns how many.
+    pub async fn reconcile(
+        &self,
+        older_than: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<usize, StoreError> {
+        let stuck = self.stores.approvals.stuck(now - older_than).await?;
+        for item in &stuck {
+            let system = item.tool.split('.').next().unwrap_or("the system");
+            let message = format!(
+                "PM OS stopped before confirming this write. It may or may not have happened: check {system} before trying again."
+            );
+            if self
+                .stores
+                .approvals
+                .complete(&item.id, Err(message.clone()))
+                .await?
+                .is_some()
+            {
+                self.audit(AuditEvent {
+                    client: Client::Orchestrator,
+                    at: now,
+                    run_id: item.run_id.clone(),
+                    user: item.user.clone(),
+                    skill: item.skill.clone(),
+                    tool: item.tool.clone(),
+                    outcome: Outcome::Error,
+                    sources: Vec::new(),
+                    args_hash: Some(item.args_hash.clone()),
+                    output_ref: Some(item.id.clone()),
+                    detail: Some(format!("outcome unknown: {message}")),
+                })
+                .await;
+            }
+        }
+        Ok(stuck.len())
     }
 }

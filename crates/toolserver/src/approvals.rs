@@ -9,10 +9,13 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use crate::store::{StoreError, StoreResult};
 
 /// How long a grant stays valid after the PM approves.
 pub const GRANT_TTL_MINUTES: i64 = 15;
@@ -40,21 +43,42 @@ fn canonicalize(value: &Value) -> Value {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Grant {
-    session_token: String,
-    tool: String,
-    args_hash: String,
-    expires_at: DateTime<Utc>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
+    /// Waiting for its user to decide.
     Pending,
+    /// Approved; the write is running. An item left here (a crash mid-write) is resolved
+    /// by the start-up reconciler as `failed`, outcome unknown.
+    Executing,
+    /// Approved, and the write succeeded; `result` holds what was written.
     Approved,
     Rejected,
+    /// Approved, but the write failed or its outcome is unknown; `result` says which.
     Failed,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Executing => "executing",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "executing" => Some(Self::Executing),
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -95,17 +119,8 @@ pub enum DecideError {
     NotPending,
     #[error("an edit decision needs the edited arguments")]
     MissingArgs,
-}
-
-#[derive(Default)]
-pub struct ApprovalStore {
-    state: Mutex<State>,
-}
-
-#[derive(Default)]
-struct State {
-    grants: Vec<Grant>,
-    items: BTreeMap<String, ApprovalItem>,
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 pub struct NewItem<'a> {
@@ -116,75 +131,164 @@ pub struct NewItem<'a> {
     pub args: &'a Value,
 }
 
-impl ApprovalStore {
-    pub fn add_grant(&self, session_token: &str, tool: &str, args: &Value, now: DateTime<Utc>) {
-        let mut state = self.state.lock().expect("approvals lock");
-        state.grants.retain(|g| g.expires_at > now);
-        state.grants.push(Grant {
-            session_token: session_token.to_string(),
-            tool: tool.to_string(),
-            args_hash: args_hash(args),
-            expires_at: now + Duration::minutes(GRANT_TTL_MINUTES),
-        });
-    }
-
-    /// Consume a grant matching this exact call. Returns whether one existed.
-    pub fn take_grant(
-        &self,
-        session_token: &str,
-        tool: &str,
-        args: &Value,
-        now: DateTime<Utc>,
-    ) -> bool {
-        let hash = args_hash(args);
-        let mut state = self.state.lock().expect("approvals lock");
-        state.grants.retain(|g| g.expires_at > now);
-        let found = state.grants.iter().position(|g| {
-            g.session_token == session_token && g.tool == tool && g.args_hash == hash
-        });
-        match found {
-            Some(i) => {
-                state.grants.swap_remove(i);
-                true
-            }
-            None => false,
-        }
-    }
-
-    pub fn create(&self, new: NewItem<'_>, now: DateTime<Utc>) -> ApprovalItem {
-        let item = ApprovalItem {
+impl NewItem<'_> {
+    pub fn into_item(self, now: DateTime<Utc>) -> ApprovalItem {
+        ApprovalItem {
             id: format!("apr_{}", uuid::Uuid::new_v4().simple()),
-            user: new.user.to_string(),
-            skill: new.skill.to_string(),
-            run_id: new.run_id.to_string(),
-            tool: new.tool.to_string(),
-            args: new.args.clone(),
-            args_hash: args_hash(new.args),
+            user: self.user.to_string(),
+            skill: self.skill.to_string(),
+            run_id: self.run_id.to_string(),
+            tool: self.tool.to_string(),
+            args: self.args.clone(),
+            args_hash: args_hash(self.args),
             status: Status::Pending,
             created_at: now,
             decided_at: None,
             decided_by: None,
             result: None,
-        };
+        }
+    }
+}
+
+/// Grants and approval items. `session_key` is the session token's hash
+/// ([`crate::session::token_hash`]), never the token itself.
+#[async_trait]
+pub trait ApprovalRepo: Send + Sync {
+    /// Record that the PM approved this exact call; valid for [`GRANT_TTL_MINUTES`].
+    async fn add_grant(
+        &self,
+        session_key: &str,
+        tool: &str,
+        args: &Value,
+        now: DateTime<Utc>,
+    ) -> StoreResult<()>;
+
+    /// Consume one live grant matching this exact call. Returns whether one existed. Two
+    /// concurrent calls with one grant: exactly one gets `true`.
+    async fn take_grant(
+        &self,
+        session_key: &str,
+        tool: &str,
+        args: &Value,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool>;
+
+    async fn create(&self, new: NewItem<'_>, now: DateTime<Utc>) -> StoreResult<ApprovalItem>;
+
+    async fn get(&self, id: &str) -> StoreResult<Option<ApprovalItem>>;
+
+    /// Items for one user, newest first, optionally filtered by status.
+    async fn list(&self, user: &str, status: Option<Status>) -> StoreResult<Vec<ApprovalItem>>;
+
+    /// Record a decision. Only the item's own user may decide, and only once: of two
+    /// concurrent decisions, exactly one succeeds. Approve and edit move the item to
+    /// `executing` and return it with the arguments to run; the caller runs the write and then
+    /// calls `complete`.
+    async fn decide(
+        &self,
+        id: &str,
+        decided_by: &str,
+        decision: Decision,
+        edited_args: Option<Value>,
+        now: DateTime<Utc>,
+    ) -> Result<ApprovalItem, DecideError>;
+
+    /// Store the outcome of an executing write: `approved` with the result, or `failed`
+    /// with the error. Only an `executing` item changes; `None` otherwise.
+    async fn complete(
+        &self,
+        id: &str,
+        result: Result<Value, String>,
+    ) -> StoreResult<Option<ApprovalItem>>;
+
+    /// Items still `executing` that were decided at or before `before`: writes interrupted
+    /// by a crash or restart.
+    async fn stuck(&self, before: DateTime<Utc>) -> StoreResult<Vec<ApprovalItem>>;
+}
+
+#[derive(Debug, Clone)]
+struct Grant {
+    session_key: String,
+    tool: String,
+    args_hash: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Default)]
+pub struct MemoryApprovals {
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    grants: Vec<Grant>,
+    items: BTreeMap<String, ApprovalItem>,
+}
+
+#[async_trait]
+impl ApprovalRepo for MemoryApprovals {
+    async fn add_grant(
+        &self,
+        session_key: &str,
+        tool: &str,
+        args: &Value,
+        now: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        let mut state = self.state.lock().expect("approvals lock");
+        state.grants.retain(|g| g.expires_at > now);
+        state.grants.push(Grant {
+            session_key: session_key.to_string(),
+            tool: tool.to_string(),
+            args_hash: args_hash(args),
+            expires_at: now + Duration::minutes(GRANT_TTL_MINUTES),
+        });
+        Ok(())
+    }
+
+    async fn take_grant(
+        &self,
+        session_key: &str,
+        tool: &str,
+        args: &Value,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        let hash = args_hash(args);
+        let mut state = self.state.lock().expect("approvals lock");
+        state.grants.retain(|g| g.expires_at > now);
+        let found = state
+            .grants
+            .iter()
+            .position(|g| g.session_key == session_key && g.tool == tool && g.args_hash == hash);
+        Ok(match found {
+            Some(i) => {
+                state.grants.swap_remove(i);
+                true
+            }
+            None => false,
+        })
+    }
+
+    async fn create(&self, new: NewItem<'_>, now: DateTime<Utc>) -> StoreResult<ApprovalItem> {
+        let item = new.into_item(now);
         self.state
             .lock()
             .expect("approvals lock")
             .items
             .insert(item.id.clone(), item.clone());
-        item
+        Ok(item)
     }
 
-    pub fn get(&self, id: &str) -> Option<ApprovalItem> {
-        self.state
+    async fn get(&self, id: &str) -> StoreResult<Option<ApprovalItem>> {
+        Ok(self
+            .state
             .lock()
             .expect("approvals lock")
             .items
             .get(id)
-            .cloned()
+            .cloned())
     }
 
-    /// Items for one user, newest first, optionally filtered by status.
-    pub fn list(&self, user: &str, status: Option<Status>) -> Vec<ApprovalItem> {
+    async fn list(&self, user: &str, status: Option<Status>) -> StoreResult<Vec<ApprovalItem>> {
         let state = self.state.lock().expect("approvals lock");
         let mut items: Vec<_> = state
             .items
@@ -193,12 +297,10 @@ impl ApprovalStore {
             .cloned()
             .collect();
         items.sort_by_key(|item| std::cmp::Reverse(item.created_at));
-        items
+        Ok(items)
     }
 
-    /// Record a decision. On approve or edit, returns the item with the arguments to run;
-    /// the caller runs the write and then calls [`ApprovalStore::complete`].
-    pub fn decide(
+    async fn decide(
         &self,
         id: &str,
         decided_by: &str,
@@ -216,12 +318,12 @@ impl ApprovalStore {
         }
         match decision {
             Decision::Reject => item.status = Status::Rejected,
-            Decision::Approve => item.status = Status::Approved,
+            Decision::Approve => item.status = Status::Executing,
             Decision::Edit => {
                 let args = edited_args.ok_or(DecideError::MissingArgs)?;
                 item.args_hash = args_hash(&args);
                 item.args = args;
-                item.status = Status::Approved;
+                item.status = Status::Executing;
             }
         }
         item.decided_at = Some(now);
@@ -229,18 +331,40 @@ impl ApprovalStore {
         Ok(item.clone())
     }
 
-    /// Store the outcome of an approved write.
-    pub fn complete(&self, id: &str, result: Result<Value, String>) -> Option<ApprovalItem> {
+    async fn complete(
+        &self,
+        id: &str,
+        result: Result<Value, String>,
+    ) -> StoreResult<Option<ApprovalItem>> {
         let mut state = self.state.lock().expect("approvals lock");
-        let item = state.items.get_mut(id)?;
+        let Some(item) = state
+            .items
+            .get_mut(id)
+            .filter(|i| i.status == Status::Executing)
+        else {
+            return Ok(None);
+        };
         match result {
-            Ok(value) => item.result = Some(value),
+            Ok(value) => {
+                item.status = Status::Approved;
+                item.result = Some(value);
+            }
             Err(message) => {
                 item.status = Status::Failed;
                 item.result = Some(serde_json::json!({ "error": message }));
             }
         }
-        Some(item.clone())
+        Ok(Some(item.clone()))
+    }
+
+    async fn stuck(&self, before: DateTime<Utc>) -> StoreResult<Vec<ApprovalItem>> {
+        let state = self.state.lock().expect("approvals lock");
+        Ok(state
+            .items
+            .values()
+            .filter(|i| i.status == Status::Executing && i.decided_at.is_some_and(|d| d <= before))
+            .cloned()
+            .collect())
     }
 }
 
@@ -248,10 +372,6 @@ impl ApprovalStore {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn t(s: &str) -> DateTime<Utc> {
-        s.parse().unwrap()
-    }
 
     #[test]
     fn hash_ignores_key_order() {
@@ -262,115 +382,16 @@ mod tests {
     }
 
     #[test]
-    fn grant_matches_once_with_same_args() {
-        let store = ApprovalStore::default();
-        let now = t("2026-11-14T10:00:00Z");
-        let args = json!({"summary": "Add SSO"});
-        store.add_grant("tok", "jira.create_issue", &args, now);
-
-        assert!(!store.take_grant(
-            "tok",
-            "jira.create_issue",
-            &json!({"summary": "Other"}),
-            now
-        ));
-        assert!(!store.take_grant("other", "jira.create_issue", &args, now));
-        assert!(!store.take_grant("tok", "slack.send_message", &args, now));
-        assert!(store.take_grant("tok", "jira.create_issue", &args, now));
-        assert!(
-            !store.take_grant("tok", "jira.create_issue", &args, now),
-            "single use"
-        );
-    }
-
-    #[test]
-    fn grant_expires() {
-        let store = ApprovalStore::default();
-        let now = t("2026-11-14T10:00:00Z");
-        let args = json!({"summary": "Add SSO"});
-        store.add_grant("tok", "jira.create_issue", &args, now);
-        let later = now + Duration::minutes(GRANT_TTL_MINUTES);
-        assert!(!store.take_grant("tok", "jira.create_issue", &args, later));
-    }
-
-    fn item(store: &ApprovalStore, now: DateTime<Utc>) -> ApprovalItem {
-        store.create(
-            NewItem {
-                user: "ana",
-                skill: "prd-draft",
-                run_id: "run-1",
-                tool: "confluence.create_draft",
-                args: &json!({"title": "PRD"}),
-            },
-            now,
-        )
-    }
-
-    #[test]
-    fn only_owner_decides_once() {
-        let store = ApprovalStore::default();
-        let now = t("2026-11-14T10:00:00Z");
-        let it = item(&store, now);
-        assert_eq!(
-            store.decide(&it.id, "bo", Decision::Approve, None, now),
-            Err(DecideError::Forbidden)
-        );
-        let decided = store
-            .decide(&it.id, "ana", Decision::Approve, None, now)
-            .unwrap();
-        assert_eq!(decided.status, Status::Approved);
-        assert_eq!(
-            store.decide(&it.id, "ana", Decision::Reject, None, now),
-            Err(DecideError::NotPending)
-        );
-        assert_eq!(
-            store.decide("apr_missing", "ana", Decision::Approve, None, now),
-            Err(DecideError::NotFound)
-        );
-    }
-
-    #[test]
-    fn edit_replaces_args() {
-        let store = ApprovalStore::default();
-        let now = t("2026-11-14T10:00:00Z");
-        let it = item(&store, now);
-        assert_eq!(
-            store.decide(&it.id, "ana", Decision::Edit, None, now),
-            Err(DecideError::MissingArgs)
-        );
-        let edited = json!({"title": "PRD v2"});
-        let decided = store
-            .decide(&it.id, "ana", Decision::Edit, Some(edited.clone()), now)
-            .unwrap();
-        assert_eq!(decided.args, edited);
-        assert_eq!(decided.args_hash, args_hash(&edited));
-    }
-
-    #[test]
-    fn list_filters_by_user_and_status() {
-        let store = ApprovalStore::default();
-        let now = t("2026-11-14T10:00:00Z");
-        let a = item(&store, now);
-        let _b = item(&store, now + Duration::minutes(1));
-        store
-            .decide(&a.id, "ana", Decision::Reject, None, now)
-            .unwrap();
-        assert_eq!(store.list("ana", None).len(), 2);
-        assert_eq!(store.list("ana", Some(Status::Pending)).len(), 1);
-        assert!(store.list("bo", None).is_empty());
-    }
-
-    #[test]
-    fn failed_write_is_recorded() {
-        let store = ApprovalStore::default();
-        let now = t("2026-11-14T10:00:00Z");
-        let it = item(&store, now);
-        store
-            .decide(&it.id, "ana", Decision::Approve, None, now)
-            .unwrap();
-        let done = store
-            .complete(&it.id, Err("space not found".into()))
-            .unwrap();
-        assert_eq!(done.status, Status::Failed);
+    fn status_round_trips() {
+        for s in [
+            Status::Pending,
+            Status::Executing,
+            Status::Approved,
+            Status::Rejected,
+            Status::Failed,
+        ] {
+            assert_eq!(Status::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(Status::parse("maybe"), None);
     }
 }

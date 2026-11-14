@@ -1,0 +1,17 @@
+# Who may use PM OS, until SSO replaces this file in Phase 1. Changes go by pull request,
+# reviewed by a platform-owner PM.
+#
+# handle:    the PM OS handle; matches master/people/<handle>/ if that folder exists
+# slack-id:  the Slack member id (Profile → ⋯ → Copy member ID), such as U012AB3CD
+# email:     the PM's Atlassian account email; needed to connect Jira and Confluence
+# roles:     pm, skill-author, admin (admin = platform owner)
+#
+# Linking an account checks it belongs to the PM listed here: the Slack member id for
+# Slack, the email for Atlassian.
+#
+# Example:
+#   - handle: ana
+#     slack-id: U012AB3CD
+#     email: ana@example.com
+#     roles: [pm, skill-author]
+members: []

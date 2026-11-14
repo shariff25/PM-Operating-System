@@ -16,12 +16,15 @@ Slack without the PM's approval.
 | `content/` | Skills, context library, master context, reviewer rubrics, templates, tool registry | Markdown, YAML |
 | `crates/contract` | The content contract and its lint | Rust |
 | `crates/cli` | `pmos`, the command line for skill authors | Rust |
+| `crates/runtime` | Small pieces every service shares: constant-time token checks, SIGTERM-aware shutdown | Rust |
 | `crates/toolserver` | The only path from a sandbox to context and systems: MCP, allowlists, approvals, audit ([docs](docs/toolserver.md)) | Rust |
+| `crates/docs` | `pmos-docs`: MCP server over the public Fortanix support docs ([docs](docs/docs-server.md)) | Rust |
+| `crates/slack` | `pmos-slack`: the Slack bot; today `/docs` ([docs](docs/docs-server.md)) | Rust |
 | `harness/` | Team-service agent on LangChain Deep Agents | TypeScript |
 
-Still to come, per the plan: Postgres and the real Atlassian and Slack connectors, the
-gateway, orchestrator, Slack app and policy checker (Rust), sandbox policies, evals, and the
-web workspace (TypeScript).
+Still to come, per the plan: the gateway, orchestrator and policy checker (Rust), the rest
+of the Slack bot (mentions, assistant panel, approvals), sandbox policies, evals and a few
+admin pages.
 
 ## Develop
 

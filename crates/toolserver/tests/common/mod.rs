@@ -4,24 +4,106 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use pmos_toolserver::audit::MemoryAudit;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use pmos_toolserver::audit::{AuditEvent, AuditSink, MemoryAudit};
 use pmos_toolserver::catalog::Catalog;
 use pmos_toolserver::connectors::fake::FakeConnector;
 use pmos_toolserver::connectors::Connector;
-use pmos_toolserver::context::MemoryIndex;
-use pmos_toolserver::memory::InMemoryStore;
-use pmos_toolserver::ToolService;
+use pmos_toolserver::context::load_docs;
+use pmos_toolserver::pg::PgStore;
+use pmos_toolserver::store::{StoreError, StoreResult};
+use pmos_toolserver::{Stores, ToolService};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::Connection;
+use std::str::FromStr;
 use tempfile::TempDir;
 
 pub fn now() -> DateTime<Utc> {
     "2026-11-14T10:00:00Z".parse().unwrap()
 }
 
+/// A Postgres store in its own fresh schema, for one test.
+///
+/// Needs `PMOS_TEST_DATABASE_URL`. Without it, returns `None` locally (the test is skipped)
+/// and panics in CI (`CI` is set), so a missing database can't pass silently.
+pub struct TestPg {
+    pub store: PgStore,
+    base: PgConnectOptions,
+    schema: String,
+}
+
+impl TestPg {
+    pub async fn new() -> Option<Self> {
+        let Ok(url) = std::env::var("PMOS_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "PMOS_TEST_DATABASE_URL must be set in CI so the Postgres tests run"
+            );
+            eprintln!("skipping Postgres case: PMOS_TEST_DATABASE_URL is not set");
+            return None;
+        };
+        let base = PgConnectOptions::from_str(&url).expect("PMOS_TEST_DATABASE_URL parses");
+        let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = sqlx::PgConnection::connect_with(&base)
+            .await
+            .expect("connect");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&mut admin)
+            .await
+            .expect("create schema");
+        admin.close().await.ok();
+        let pool = PgPoolOptions::new()
+            .max_connections(12)
+            .connect_with(base.clone().options([("search_path", schema.as_str())]))
+            .await
+            .expect("connect to test schema");
+        let store = PgStore::from_pool(pool);
+        store.migrate().await.expect("migrations apply");
+        Some(Self {
+            store,
+            base,
+            schema,
+        })
+    }
+
+    pub async fn drop_schema(self) {
+        self.store.pool().close().await;
+        if let Ok(mut admin) = sqlx::PgConnection::connect_with(&self.base).await {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA {} CASCADE",
+                self.schema
+            )))
+            .execute(&mut admin)
+            .await;
+        }
+    }
+}
+
+/// An audit sink that can be switched off, to test that writes fail closed.
+pub struct SwitchAudit {
+    inner: Arc<dyn AuditSink>,
+    pub down: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl AuditSink for SwitchAudit {
+    async fn record(&self, event: AuditEvent) -> StoreResult<()> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(StoreError("audit log unreachable".into()));
+        }
+        self.inner.record(event).await
+    }
+}
+
 pub struct Fixture {
     pub _dir: TempDir,
     pub root: PathBuf,
     pub svc: Arc<ToolService>,
+    /// The stores behind `svc`, to set up states the service can't reach on its own.
+    pub stores: Stores,
     pub audit: Arc<MemoryAudit>,
+    pub audit_switch: Arc<SwitchAudit>,
     pub jira: Arc<FakeConnector>,
     pub confluence: Arc<FakeConnector>,
     pub slack: Arc<FakeConnector>,
@@ -49,6 +131,89 @@ fn write(root: &Path, rel: &str, text: &str) {
 /// The repo's content, plus a Restricted context file and an `internal-brief` skill whose
 /// data class is `internal`.
 pub fn fixture() -> Fixture {
+    let (dir, root) = content_tree();
+    let (stores, audit) = Stores::in_memory(&root);
+    build(dir, root, stores, audit)
+}
+
+/// The same fixture with every store in Postgres. `None` when no test database is set.
+pub async fn pg_fixture() -> Option<(Fixture, TestPg)> {
+    let pg = TestPg::new().await?;
+    let (dir, root) = content_tree();
+    pg.store.reindex(&load_docs(&root)).await.expect("reindex");
+    let fixture = build(
+        dir,
+        root,
+        pg.store.stores(),
+        Arc::new(MemoryAudit::default()),
+    );
+    Some((fixture, pg))
+}
+
+/// The in-memory fixture with `team.yaml` enforced, as with live connectors.
+pub fn team_fixture(members: &[&str]) -> Fixture {
+    let (dir, root) = content_tree();
+    let (stores, audit) = Stores::in_memory(&root);
+    let team = pmos_toolserver::team::Team::of(
+        members
+            .iter()
+            .map(|h| pmos_contract::model::TeamMember {
+                handle: h.to_string(),
+                slack_id: "U0TEST".into(),
+                email: None,
+                roles: vec![pmos_contract::model::Role::Pm],
+            })
+            .collect(),
+    );
+    build_with(dir, root, stores, audit, Some(team))
+}
+
+fn build(dir: TempDir, root: PathBuf, stores: Stores, audit: Arc<MemoryAudit>) -> Fixture {
+    build_with(dir, root, stores, audit, None)
+}
+
+fn build_with(
+    dir: TempDir,
+    root: PathBuf,
+    mut stores: Stores,
+    audit: Arc<MemoryAudit>,
+    team: Option<Arc<pmos_toolserver::team::Team>>,
+) -> Fixture {
+    let audit_switch = Arc::new(SwitchAudit {
+        inner: stores.audit.clone(),
+        down: AtomicBool::new(false),
+    });
+    stores.audit = audit_switch.clone();
+    let catalog = Catalog::load(&root, now().date_naive()).expect("fixture content lints");
+    let jira = Arc::new(FakeConnector::jira());
+    let confluence = Arc::new(FakeConnector::confluence());
+    let slack = Arc::new(FakeConnector::slack());
+    let connectors: Vec<Arc<dyn Connector>> = vec![
+        jira.clone(),
+        confluence.clone(),
+        slack.clone(),
+        Arc::new(FakeConnector::docs()),
+    ];
+    let mut svc = ToolService::new(catalog, stores.clone(), connectors).unwrap();
+    if let Some(team) = team {
+        svc = svc.with_team(team);
+    }
+    Fixture {
+        _dir: dir,
+        root,
+        svc: Arc::new(svc),
+        stores,
+        audit,
+        audit_switch,
+        jira,
+        confluence,
+        slack,
+    }
+}
+
+/// The repo's content, plus a Restricted context file and an `internal-brief` skill whose
+/// data class is `internal`.
+fn content_tree() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("content");
     copy_dir(
@@ -71,27 +236,5 @@ pub fn fixture() -> Fixture {
         "---\nname: internal-brief\ndescription: Test skill limited to internal data.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"internal\"\n  tools: \"context.search context.read jira.search jira.create_issue memory.read memory.update\"\n---\n\n# /internal-brief\n\nTest.\n",
     );
 
-    let catalog = Catalog::load(&root, now().date_naive()).expect("fixture content lints");
-    let audit = Arc::new(MemoryAudit::default());
-    let jira = Arc::new(FakeConnector::jira());
-    let confluence = Arc::new(FakeConnector::confluence());
-    let slack = Arc::new(FakeConnector::slack());
-    let connectors: Vec<Arc<dyn Connector>> = vec![jira.clone(), confluence.clone(), slack.clone()];
-    let svc = ToolService::new(
-        catalog,
-        Arc::new(MemoryIndex::load(&root)),
-        Arc::new(InMemoryStore::default()),
-        connectors,
-        audit.clone(),
-    )
-    .unwrap();
-    Fixture {
-        _dir: dir,
-        root,
-        svc: Arc::new(svc),
-        audit,
-        jira,
-        confluence,
-        slack,
-    }
+    (dir, root)
 }

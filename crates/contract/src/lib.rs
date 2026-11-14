@@ -9,6 +9,7 @@
 pub mod frontmatter;
 pub mod lint;
 pub mod model;
+pub mod text;
 
 pub use lint::{lint, Diagnostic, LintOptions, Report, Severity};
 pub use model::{Sensitivity, Skill, ToolDef, ToolKind, ToolRegistry};

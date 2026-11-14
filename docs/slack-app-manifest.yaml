@@ -1,0 +1,48 @@
+# PM OS Slack app manifest (Socket Mode).
+#
+# To create the app: api.slack.com/apps → Create New App → From an app manifest → pick the
+# workspace → paste this file. Then:
+#   1. Basic Information → App-Level Tokens → generate one with the `connections:write` scope.
+#      That's PMOS_SLACK_APP_TOKEN (xapp-…) for pmos-slack.
+#   2. Replace pmos.example.com in redirect_urls with PMOS_PUBLIC_URL.
+#   3. Install the app to the workspace. Each PM then links their own Slack account in PM OS,
+#      which grants the user scopes below to PM OS acting as that PM.
+#
+# Keep this an internal app (not distributed): internal apps keep the higher rate limits.
+display_information:
+  name: PM OS
+  description: The Fortanix product team's agent workspace
+  background_color: "#1f2937"
+features:
+  bot_user:
+    display_name: PM OS
+    always_online: true
+  slash_commands:
+    - command: /docs
+      description: Search the Fortanix support docs (only you see the results)
+      usage_hint: "[product:dsm] what you're looking for"
+      should_escape: false
+oauth_config:
+  redirect_urls:
+    - https://pmos.example.com/oauth/slack/callback
+  scopes:
+    # The bot itself only needs to receive commands. It never reads channels for answers or
+    # posts messages others can see; reads and posts use each PM's own user token.
+    bot:
+      - commands
+    # Granted per PM when they link their account (see crates/toolserver/src/config.rs,
+    # DEFAULT_SLACK_SCOPES).
+    user:
+      - search:read.public
+      - search:read.private
+      - search:read.im
+      - search:read.mpim
+      - channels:history
+      - groups:history
+      - im:history
+      - mpim:history
+      - chat:write
+settings:
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false

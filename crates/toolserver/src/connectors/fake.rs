@@ -96,6 +96,33 @@ impl FakeConnector {
         )
     }
 
+    pub fn docs() -> Self {
+        let page = |slug: &str, title: &str, snippet: &str| Item {
+            source: SourceRef {
+                system: "docs".into(),
+                id: format!("https://support.fortanix.com/docs/{slug}.md"),
+                url: format!("https://support.fortanix.com/docs/{slug}"),
+            },
+            title: title.to_string(),
+            content: json!({"product": "dsm", "snippet": snippet}),
+        };
+        Self::new(
+            "docs",
+            vec![
+                page(
+                    "dsm-key-rotation",
+                    "Fortanix DSM Key Rotation",
+                    "Key rotation creates a new key version.",
+                ),
+                page(
+                    "dsm-saml-sso",
+                    "Configure SAML SSO for Fortanix DSM",
+                    "DSM supports SAML 2.0 single sign-on.",
+                ),
+            ],
+        )
+    }
+
     pub fn slack() -> Self {
         Self::new(
             "slack",
@@ -162,13 +189,13 @@ impl Connector for FakeConnector {
             "read" | "read_thread" => {
                 let id = match (str_arg(args, &["channel"]), str_arg(args, &["ts"])) {
                     (Some(channel), Some(ts)) => format!("{channel}:{ts}"),
-                    _ => str_arg(args, &["key", "page_id", "id"])
+                    _ => str_arg(args, &["key", "page_id", "url", "id"])
                         .ok_or_else(|| ConnectorError::BadArgs("an id is required".into()))?
                         .to_string(),
                 };
                 self.items
                     .iter()
-                    .find(|i| i.source.id == id)
+                    .find(|i| i.source.id == id || i.source.url == id)
                     .cloned()
                     .map(|i| vec![i])
                     .ok_or(ConnectorError::NotFound(id))
@@ -206,7 +233,10 @@ mod tests {
     #[tokio::test]
     async fn search_read_and_write() {
         let jira = FakeConnector::jira();
-        let caller = Caller { user: "ana" };
+        let caller = Caller {
+            user: "ana",
+            run_id: "r1",
+        };
         let hits = jira
             .read(caller, "search", &json!({"jql": "sso"}))
             .await
@@ -237,7 +267,10 @@ mod tests {
         let slack = FakeConnector::slack();
         let thread = slack
             .read(
-                Caller { user: "ana" },
+                Caller {
+                    user: "ana",
+                    run_id: "r1",
+                },
                 "read_thread",
                 &json!({"channel": "C0FIELD", "ts": "1731500000.000100"}),
             )

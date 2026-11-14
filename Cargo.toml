@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/contract", "crates/cli", "crates/toolserver"]
+members = ["crates/contract", "crates/cli", "crates/runtime", "crates/toolserver", "crates/docs", "crates/slack"]
 
 [workspace.package]
 edition = "2021"
@@ -9,15 +9,22 @@ publish = false
 rust-version = "1.85"
 
 [workspace.dependencies]
+aes-gcm = "0.10"
+subtle = "2.6"
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+hmac = "0.12"
 clap = { version = "4", features = ["derive"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+reqwest = { version = "0.13", features = ["json", "form", "query"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
 sha2 = "0.10"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "json", "migrate", "macros"] }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
@@ -27,3 +34,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 pmos-contract = { path = "crates/contract" }
+pmos-runtime = { path = "crates/runtime" }
+
+# Line tables keep backtraces readable at a fraction of the disk (full debug info made the
+# test binaries ~20 GB).
+[profile.dev]
+debug = "line-tables-only"
