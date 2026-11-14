@@ -60,8 +60,9 @@ One worker per bot sandbox, serving one bot. It loops:
    task (D2). One task's error never stops the loop.
 
 **Stopping:** on SIGTERM or SIGINT the worker stops claiming. The current task has
-`PMOS_WORKER_STOP_GRACE_MS` to finish; otherwise it fails with "worker stopped: PM OS was
-restarting while I worked on this. Please ask again." Then the process exits.
+`PMOS_WORKER_STOP_GRACE_MS` to finish. If it doesn't, the worker reports nothing and exits:
+the task's lease runs out and the runtime retries it once, or fails it with a stated reason
+if it was already retried (D2).
 
 ### Configuration
 

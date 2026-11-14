@@ -26,7 +26,6 @@ export {
   type TraceEntry,
 } from "./runtime-client.js";
 export {
-  STOPPED_REASON,
   botSystemPrompt,
   createWorker,
   gatewayHeaders,

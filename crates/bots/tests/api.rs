@@ -1146,10 +1146,27 @@ async fn every_endpoint_checks_the_client() {
         .await
         .unwrap();
     assert_eq!(res.status(), 401);
+    // The shared feed and the bot list need no PM; the Slack bot reads them for everyone.
     let (status, _) = env.get("/v1/bots", "slack", None).await;
-    assert_eq!(status, 400);
+    assert_eq!(status, 200);
+    let (status, _) = env.get("/v1/notifications", "slack", None).await;
+    assert_eq!(status, 200);
+    // A malformed PM is refused; per-PM calls without one are refused.
     let (status, _) = env.get("/v1/bots", "slack", Some("Not A Handle")).await;
     assert_eq!(status, 400);
+    let (status, _) = env
+        .post(
+            "/v1/tasks",
+            "slack",
+            None,
+            json!({"bot": "docs", "requested_by": "ana", "text": "t", "source": "slack"}),
+        )
+        .await;
+    assert_eq!(status, 403);
+    let (status, _) = env.get("/v1/routines", "slack", None).await;
+    assert_eq!(status, 403);
+    let (status, _) = env.get("/v1/tasks", "slack", None).await;
+    assert_eq!(status, 403);
     // Slack acts only for its PM.
     let (status, _) = env
         .post(

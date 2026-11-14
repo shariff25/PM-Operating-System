@@ -22,6 +22,14 @@ Evals (pmos-evals) ──┘   tasks, routines,      └──► pmos-toolserve
 
 Every service reads its tokens from env and compares them with `pmos_runtime::token_eq`. It shuts down on `pmos_runtime::shutdown_signal()`.
 
+**As built (2026-11-14), settled while merging the parallel work:**
+- **Claim answer:** it also carries `gateway: {model, headers}`, the model role and the gateway headers for the task.
+- **Running tasks:** carry `worker` and `lease_until`. A worker call on a task that is no longer running answers `409 {status}`, which tells the worker to stop.
+- **Notifications:** each carries `at`; `approval_closed` items carry `outcomes`.
+- **No PM needed:** the Slack client sends no `X-Pmos-User` for the shared notification feed or the bot list. Every per-PM call (tasks, routines) still needs it, and is refused without it.
+- **Skill or bot:** tool-server sessions, approval items and audit events carry either `skill` or `bot`, never both. For bot sessions `skill` is `null`.
+- **Worker shutdown:** a worker that is told to stop leaves its unfinished task alone. The lease runs out and the runtime retries the task once (D2).
+
 ## 1. Bots and roles (built: `pmos_contract::bots`)
 
 - **Bots:** `content/bots/<name>/BOT.md`, linted by `pmos lint`.
