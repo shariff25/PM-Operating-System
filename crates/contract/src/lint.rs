@@ -779,6 +779,7 @@ impl Cx {
         };
         let mut handles = BTreeSet::new();
         let mut slack_ids = BTreeSet::new();
+        let mut github_logins = BTreeSet::new();
         for m in &team.members {
             if !crate::model::valid_handle(&m.handle) {
                 self.error(
@@ -817,6 +818,21 @@ impl Cx {
                         "team-email",
                         &path,
                         format!("`{email}` is not an email address"),
+                    );
+                }
+            }
+            if let Some(login) = &m.github {
+                if !crate::onboarding::valid_github_login(login) {
+                    self.error(
+                        "team-github",
+                        &path,
+                        format!("`{login}` is not a GitHub login"),
+                    );
+                } else if !github_logins.insert(login.to_ascii_lowercase()) {
+                    self.error(
+                        "team-duplicate",
+                        &path,
+                        format!("GitHub login `{login}` is listed twice"),
                     );
                 }
             }

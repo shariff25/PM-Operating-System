@@ -722,6 +722,7 @@ fn member(handle: &str, slack_id: &str, email: Option<&str>) -> pmos_contract::m
         handle: handle.into(),
         slack_id: slack_id.into(),
         email: email.map(String::from),
+        github: None,
         roles: vec![pmos_contract::model::Role::Pm],
     }
 }

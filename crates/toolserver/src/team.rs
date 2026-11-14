@@ -92,6 +92,7 @@ mod tests {
             handle: handle.into(),
             slack_id: "U0TEST".into(),
             email: None,
+            github: None,
             roles: vec![Role::Pm],
         }
     }
