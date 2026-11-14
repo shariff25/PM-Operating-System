@@ -55,6 +55,7 @@ impl From<ConnectorError> for ToolError {
         match e {
             ConnectorError::NotFound(id) => ToolError::NotFound(id),
             ConnectorError::BadArgs(m) => ToolError::InvalidArgs(m),
+            ConnectorError::Forbidden(m) => ToolError::Forbidden(m),
             other => ToolError::Connector(other.to_string()),
         }
     }
@@ -302,6 +303,7 @@ impl ToolService {
                 let connector = self.connector(system)?;
                 let caller = Caller {
                     user: &session.user,
+                    run_id: &session.run_id,
                 };
                 let items = connector.read(caller, spec.action(), args).await?;
                 event.sources = items
@@ -457,7 +459,16 @@ impl ToolService {
             .take_grant(&key, &spec.name, args, now)
             .await?
         {
-            let written = self.execute_write(&session.user, spec, args).await?;
+            let written = self
+                .execute_write(
+                    Caller {
+                        user: &session.user,
+                        run_id: &session.run_id,
+                    },
+                    spec,
+                    args,
+                )
+                .await?;
             event.outcome = Outcome::Approved;
             event.detail = Some("approved in the harness".into());
             event.output_ref = written["url"].as_str().map(String::from);
@@ -491,14 +502,12 @@ impl ToolService {
 
     async fn execute_write(
         &self,
-        user: &str,
+        caller: Caller<'_>,
         spec: &ToolSpec,
         args: &Value,
     ) -> Result<Value, ToolError> {
         let connector = self.connector(&spec.system)?;
-        let written = connector
-            .write(Caller { user }, spec.action(), args)
-            .await?;
+        let written = connector.write(caller, spec.action(), args).await?;
         Ok(json!({
             "status": "done",
             "system": written.system,
@@ -628,7 +637,16 @@ impl ToolService {
             .find(|t| t.name == item.tool)
             .cloned()
             .ok_or_else(|| DecisionError::UnknownTool(item.tool.clone()))?;
-        let result = self.execute_write(&item.user, &spec, &item.args).await;
+        let result = self
+            .execute_write(
+                Caller {
+                    user: &item.user,
+                    run_id: &item.run_id,
+                },
+                &spec,
+                &item.args,
+            )
+            .await;
         let outcome = match &result {
             Ok(written) => {
                 event.outcome = Outcome::Approved;

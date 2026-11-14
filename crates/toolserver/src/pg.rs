@@ -27,6 +27,7 @@ use crate::context::{snippet, terms, ContextDoc, ContextIndex, Hit, ReindexRepor
 use crate::memory::{MemoryStore, Note};
 use crate::session::{token_hash, Session, SessionRepo};
 use crate::store::{StoreError, StoreResult, Stores};
+use crate::vault::{CredentialStore, Provider, SealedCredential};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -80,7 +81,8 @@ impl PgStore {
             memory: s.clone(),
             sessions: s.clone(),
             approvals: s.clone(),
-            audit: s,
+            audit: s.clone(),
+            credentials: s,
         }
     }
 
@@ -523,5 +525,89 @@ impl AuditSink for PgStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+fn sealed_from_row(r: &PgRow) -> StoreResult<SealedCredential> {
+    let provider: String = r.try_get("provider")?;
+    Ok(SealedCredential {
+        user: r.try_get("user_handle")?,
+        provider: Provider::parse(&provider).ok_or_else(|| bad_row("provider", &provider))?,
+        key_id: r.try_get("key_id")?,
+        access_token: r.try_get("access_token")?,
+        refresh_token: r.try_get("refresh_token")?,
+        expires_at: r.try_get("expires_at")?,
+        scopes: r.try_get("scopes")?,
+        cloud_id: r.try_get("cloud_id")?,
+        site_url: r.try_get("site_url")?,
+        external_id: r.try_get("external_id")?,
+        updated_at: r.try_get("updated_at")?,
+    })
+}
+
+const CREDENTIAL_COLUMNS: &str = "user_handle, provider, key_id, access_token, refresh_token, \
+                                  expires_at, scopes, cloud_id, site_url, external_id, updated_at";
+
+#[async_trait]
+impl CredentialStore for PgStore {
+    async fn get(&self, user: &str, provider: Provider) -> StoreResult<Option<SealedCredential>> {
+        let sql = format!(
+            "SELECT {CREDENTIAL_COLUMNS} FROM credentials WHERE user_handle = $1 AND provider = $2"
+        );
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(user)
+            .bind(provider.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(sealed_from_row).transpose()
+    }
+
+    async fn put(&self, c: &SealedCredential) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO credentials
+                 (user_handle, provider, key_id, access_token, refresh_token, expires_at, scopes,
+                  cloud_id, site_url, external_id, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT (user_handle, provider) DO UPDATE SET
+                 key_id = EXCLUDED.key_id, access_token = EXCLUDED.access_token,
+                 refresh_token = EXCLUDED.refresh_token, expires_at = EXCLUDED.expires_at,
+                 scopes = EXCLUDED.scopes, cloud_id = EXCLUDED.cloud_id,
+                 site_url = EXCLUDED.site_url, external_id = EXCLUDED.external_id,
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(&c.user)
+        .bind(c.provider.as_str())
+        .bind(&c.key_id)
+        .bind(&c.access_token)
+        .bind(&c.refresh_token)
+        .bind(c.expires_at)
+        .bind(&c.scopes)
+        .bind(&c.cloud_id)
+        .bind(&c.site_url)
+        .bind(&c.external_id)
+        .bind(c.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete(&self, user: &str, provider: Provider) -> StoreResult<bool> {
+        let done = sqlx::query("DELETE FROM credentials WHERE user_handle = $1 AND provider = $2")
+            .bind(user)
+            .bind(provider.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    async fn list(&self, user: &str) -> StoreResult<Vec<SealedCredential>> {
+        let sql = format!(
+            "SELECT {CREDENTIAL_COLUMNS} FROM credentials WHERE user_handle = $1 ORDER BY provider"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(user)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(sealed_from_row).collect()
     }
 }

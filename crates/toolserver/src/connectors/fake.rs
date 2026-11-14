@@ -206,7 +206,10 @@ mod tests {
     #[tokio::test]
     async fn search_read_and_write() {
         let jira = FakeConnector::jira();
-        let caller = Caller { user: "ana" };
+        let caller = Caller {
+            user: "ana",
+            run_id: "r1",
+        };
         let hits = jira
             .read(caller, "search", &json!({"jql": "sso"}))
             .await
@@ -237,7 +240,10 @@ mod tests {
         let slack = FakeConnector::slack();
         let thread = slack
             .read(
-                Caller { user: "ana" },
+                Caller {
+                    user: "ana",
+                    run_id: "r1",
+                },
                 "read_thread",
                 &json!({"channel": "C0FIELD", "ts": "1731500000.000100"}),
             )

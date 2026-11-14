@@ -33,6 +33,7 @@ async fn start_with(fixture: common::Fixture) -> Server {
         AppConfig {
             service_token: SERVICE_TOKEN.into(),
             content_root: fixture.root.clone(),
+            oauth: None,
             allowed_hosts: vec!["127.0.0.1".into(), "localhost".into()],
         },
         cancel.clone(),
