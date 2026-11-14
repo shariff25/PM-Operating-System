@@ -144,6 +144,48 @@ Rules: `team-parse`, `team-handle`, `team-slack-id`, `team-email`, `team-duplica
 handle or Slack id listed twice), `team-roles` (no roles), `people-unknown` (warning: a `master/people/` folder
 for someone not on the team).
 
+## Roles and bots: `roles/<role>/ROLE.md`, `bots/<name>/BOT.md`
+
+PM OS is a team of named bots (`docs/bot-decisions.md`). Each bot is made from one **role**.
+
+```yaml
+# roles/pm-assistant/ROLE.md
+---
+name: pm-assistant            # equals the folder name
+description: A PM's personal assistant …
+owner: "@handle"
+version: "0.1.0"
+skills: "ask meeting-notes prd-draft"   # skills its bots may run
+data-class: "restricted"      # the bots' ceiling; no skill may be above it
+model: "default"              # gateway model role
+actions:                      # per outbound tool: approve | never (auto is refused in v1)
+  slack.send_message: approve
+---
+Standing instructions for the role.
+```
+
+```yaml
+# bots/docs/BOT.md
+---
+name: docs
+role: docs-helper
+scope: team                   # team | personal
+owner: "@handle"              # personal: the PM it works for
+description: One line for the roster.
+reads:                        # team bots only: what they may read
+  jira-projects: [PM]
+  confluence-spaces: [PM]
+  slack-channels: [C0123ABC]
+actions: {}                   # overrides of the role's settings
+---
+The bot's job description.
+```
+
+Rules:
+- **Roles:** `role-parse`, `role-name`, `role-version`, `role-description`, `role-body-empty`, `role-skills`, `role-skill-unknown`, `role-skill-data-class`.
+- **Bots:** `bot-parse`, `bot-name`, `bot-description`, `bot-body-empty`, `bot-role-unknown`, `bot-owner-unknown` (an error once `team.yaml` lists people), `bot-reads-personal`, and `bot-reads-empty` (warning).
+- **Actions:** `action-auto`, `action-not-write`, `action-unknown-tool`.
+
 ## Templates: `templates/*.md`
 
 ```yaml

@@ -9,6 +9,8 @@ use std::sync::{Arc, RwLock};
 
 use pmos_contract::model::{TeamFile, TeamMember};
 
+use crate::session::BOT_IDENTITY_PREFIX;
+
 pub struct Team {
     path: Option<PathBuf>,
     file: RwLock<TeamFile>,
@@ -60,7 +62,12 @@ impl Team {
         self.enforced
     }
 
+    /// The member with this handle. A team bot's service identity (`bots.<name>`) is never a
+    /// member, even if `team.yaml` lists it.
     pub fn member(&self, handle: &str) -> Option<TeamMember> {
+        if handle.starts_with(BOT_IDENTITY_PREFIX) {
+            return None;
+        }
         self.file
             .read()
             .expect("team lock")
@@ -68,8 +75,36 @@ impl Team {
             .cloned()
     }
 
-    /// May `handle` use PM OS?
+    /// May `handle` use PM OS? Never a team bot's service identity, enforced or not.
     pub fn allows(&self, handle: &str) -> bool {
-        !self.enforced || self.member(handle).is_some()
+        !handle.starts_with(BOT_IDENTITY_PREFIX)
+            && (!self.enforced || self.member(handle).is_some())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pmos_contract::model::Role;
+
+    fn member(handle: &str) -> TeamMember {
+        TeamMember {
+            handle: handle.into(),
+            slack_id: "U0TEST".into(),
+            email: None,
+            roles: vec![Role::Pm],
+        }
+    }
+
+    #[test]
+    fn bot_identities_are_never_members() {
+        let team = Team::of(vec![member("ana"), member("bots.docs")]);
+        assert!(team.allows("ana"));
+        assert!(!team.allows("eve"));
+        assert!(team.member("bots.docs").is_none(), "listed, but never a PM");
+        assert!(!team.allows("bots.docs"));
+        let open = Team::open();
+        assert!(open.allows("eve"));
+        assert!(!open.allows("bots.docs"));
     }
 }

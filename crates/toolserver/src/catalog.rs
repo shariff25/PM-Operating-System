@@ -2,8 +2,10 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::NaiveDate;
+use pmos_contract::bots::{Bot, Role};
 use pmos_contract::model::harness_tool_name;
 use pmos_contract::{lint, LintOptions, Skill, ToolKind, ToolRegistry};
 use serde::Serialize;
@@ -43,10 +45,70 @@ pub enum CatalogError {
     MissingSchema(String),
 }
 
+/// The named bots and their roles (`content/bots/`, `content/roles/`). Loaded at start-up
+/// with the skills, and reloaded on `POST /internal/reindex`.
+#[derive(Debug, Clone, Default)]
+pub struct Roster {
+    roles: BTreeMap<String, Arc<Role>>,
+    bots: BTreeMap<String, Arc<Bot>>,
+}
+
+impl Roster {
+    /// The roles and bots of a lint report that passed.
+    pub fn from_report(report: &pmos_contract::Report) -> Self {
+        let roster = Self {
+            roles: report
+                .roles
+                .iter()
+                .map(|r| (r.name.clone(), Arc::new(r.clone())))
+                .collect(),
+            bots: report
+                .bots
+                .iter()
+                .map(|b| (b.name.clone(), Arc::new(b.clone())))
+                .collect(),
+        };
+        for bot in roster.bots.values() {
+            let reads = &bot.reads;
+            let bad = reads
+                .jira_projects
+                .iter()
+                .chain(&reads.confluence_spaces)
+                .filter(|k| !crate::connectors::scope::valid_key(k))
+                .chain(
+                    reads
+                        .slack_channels
+                        .iter()
+                        .filter(|c| !crate::connectors::scope::valid_channel(c)),
+                );
+            for entry in bad {
+                tracing::warn!(bot = %bot.name, entry = %entry, "read scope entry isn't a valid key or channel id; reads in that system are refused");
+            }
+        }
+        roster
+    }
+
+    /// A bot and its role. `None` if either is missing.
+    pub fn bot(&self, name: &str) -> Option<(Arc<Bot>, Arc<Role>)> {
+        let bot = self.bots.get(name)?;
+        let role = self.roles.get(&bot.role)?;
+        Some((bot.clone(), role.clone()))
+    }
+
+    pub fn bots(&self) -> impl Iterator<Item = &Bot> {
+        self.bots.values().map(|b| b.as_ref())
+    }
+
+    pub fn roles(&self) -> impl Iterator<Item = &Role> {
+        self.roles.values().map(|r| r.as_ref())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Catalog {
     tools: BTreeMap<String, ToolSpec>,
     skills: BTreeMap<String, Skill>,
+    roster: Roster,
 }
 
 impl Catalog {
@@ -81,12 +143,23 @@ impl Catalog {
                 },
             );
         }
+        let roster = Roster::from_report(&report);
         let skills = report
             .skills
             .into_iter()
             .map(|s| (s.name.clone(), s))
             .collect();
-        Ok(Self { tools, skills })
+        Ok(Self {
+            tools,
+            skills,
+            roster,
+        })
+    }
+
+    /// The bots and roles as they were at start-up. [`crate::ToolService`] keeps the live
+    /// copy, which `POST /internal/reindex` replaces.
+    pub fn roster(&self) -> &Roster {
+        &self.roster
     }
 
     pub fn skill(&self, name: &str) -> Option<&Skill> {
@@ -141,6 +214,12 @@ mod tests {
         let create = catalog.tool("jira_create_issue").unwrap();
         assert_eq!(create.action(), "create_issue");
         assert_eq!(create.kind, ToolKind::Write);
+
+        let (bot, role) = catalog.roster().bot("docs").unwrap();
+        assert_eq!(role.name, "docs-helper");
+        assert_eq!(bot.role, "docs-helper");
+        assert!(catalog.roster().bot("nobody").is_none());
+        assert!(catalog.roster().roles().any(|r| r.name == "pm-assistant"));
     }
 
     #[test]

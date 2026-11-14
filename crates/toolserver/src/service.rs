@@ -3,28 +3,32 @@
 //! in memory or in Postgres (`store.rs`).
 //!
 //! Every call goes through these rules:
-//! 1. The tool must be one the session's skill declared (PRD: Authorization).
-//! 2. Context reads return nothing above the skill's `data-class`.
-//! 3. Connector output is wrapped as untrusted data.
-//! 4. A write runs only with a matching grant or an approval by its own user (OUT-4).
+//! 1. The tool must be one the session's skill declared, or, for a bot session, one of its
+//!    role's tools that the bot isn't set to `never` use (PRD: Authorization; D7).
+//! 2. Context reads return nothing above the skill's or role's `data-class`.
+//! 3. Connector output is wrapped as untrusted data. A team bot reads with its own accounts,
+//!    inside its read scope.
+//! 4. A write runs only with a matching grant or an approval by its own user (OUT-4), and
+//!    always as that user.
 //! 5. Every call and decision is audited (ADM-2).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Duration, Utc};
+use pmos_contract::bots::{role_tools, ActionSetting, Bot, BotScope, Role};
 use pmos_contract::model::CONTEXT_DOMAINS;
-use pmos_contract::{Skill, ToolKind};
+use pmos_contract::{Sensitivity, ToolKind};
 use serde_json::{json, Value};
 
 use crate::approvals::{args_hash, ApprovalItem, DecideError, Decision, NewItem, Status};
 use crate::audit::{AuditEvent, Client, Outcome};
-use crate::catalog::{Catalog, ToolSpec};
-use crate::connectors::{untrusted, Caller, Connector, ConnectorError};
+use crate::catalog::{Catalog, Roster, ToolSpec};
+use crate::connectors::{untrusted, Caller, Connector, ConnectorError, TeamBot};
 use crate::context::{load_docs, ContextDoc, ReindexReport};
 use crate::memory::valid_key;
 use crate::schemas::check_args;
-use crate::session::{token_hash, valid_handle, Session};
+use crate::session::{bot_identity, token_hash, valid_handle, Session};
 use crate::store::{StoreError, Stores};
 use crate::team::Team;
 
@@ -38,6 +42,9 @@ pub enum ToolError {
     UnknownTool(String),
     #[error("tool `{0}` is not declared by this skill")]
     NotAllowed(String),
+    /// A bot session called a tool its role doesn't have.
+    #[error("tool `{0}` is not one of this bot's tools")]
+    NotInRole(String),
     #[error("invalid arguments: {0}")]
     InvalidArgs(String),
     #[error("forbidden: {0}")]
@@ -72,12 +79,17 @@ impl From<StoreError> for ToolError {
 pub enum SessionError {
     #[error("unknown skill `{0}`")]
     UnknownSkill(String),
+    #[error("unknown bot `{0}`")]
+    UnknownBot(String),
     #[error("invalid user handle `{0}`")]
     InvalidUser(String),
     #[error("run_id must be 1–128 characters")]
     InvalidRun,
     #[error("`{0}` is not in team.yaml")]
     NotAMember(String),
+    /// A personal bot serves its owner only.
+    #[error("`{bot}` is {owner}'s personal bot; only {owner} can use it")]
+    NotOwner { bot: String, owner: String },
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -98,10 +110,61 @@ pub enum DecisionError {
     UnknownTool(String),
     #[error("the item's skill no longer declares `{0}`")]
     NotAllowed(String),
+    /// The item's bot is gone, its role lost the tool, or it is now set to `never`.
+    #[error("the item's bot may no longer use `{0}`")]
+    BotNotAllowed(String),
+    /// Only people in `team.yaml` decide approvals (when it is enforced).
+    #[error("`{0}` is not in team.yaml, so they can't decide approvals")]
+    NotAMember(String),
     #[error("invalid arguments: {0}")]
     InvalidArgs(String),
     #[error("the write task failed: {0}")]
     Internal(String),
+}
+
+/// What one session (or one approval item) may do: from its skill, or from its bot's role
+/// and action settings.
+struct Policy {
+    /// Registry names it may call.
+    tools: BTreeSet<String>,
+    /// The highest data class it may read.
+    ceiling: Sensitivity,
+    bot: Option<(Arc<Bot>, Arc<Role>)>,
+}
+
+impl Policy {
+    /// A write tool its bot is set to `never` use.
+    fn never(&self, spec: &ToolSpec) -> bool {
+        spec.kind == ToolKind::Write
+            && self.bot.as_ref().is_some_and(|(bot, role)| {
+                bot.action_setting(role, &spec.name) == ActionSetting::Never
+            })
+    }
+
+    /// May the session call `spec`? Refusals name the rule, for the model and the audit log.
+    fn check(&self, spec: &ToolSpec) -> Result<(), ToolError> {
+        if !self.tools.contains(&spec.name) {
+            return Err(match self.bot {
+                Some(_) => ToolError::NotInRole(spec.harness_name.clone()),
+                None => ToolError::NotAllowed(spec.harness_name.clone()),
+            });
+        }
+        if let (true, Some((bot, _))) = (self.never(spec), &self.bot) {
+            return Err(ToolError::Forbidden(format!(
+                "the {} bot may never use {}: its setting for it is `never`",
+                bot.name, spec.name
+            )));
+        }
+        Ok(())
+    }
+
+    /// The team bot whose reads use its own accounts and read scope, if any.
+    fn team_bot(&self) -> Option<&Bot> {
+        self.bot
+            .as_ref()
+            .map(|(bot, _)| bot.as_ref())
+            .filter(|bot| bot.scope == BotScope::Team)
+    }
 }
 
 impl From<StoreError> for DecisionError {
@@ -112,6 +175,8 @@ impl From<StoreError> for DecisionError {
 
 pub struct ToolService {
     catalog: Catalog,
+    /// Bots and roles: loaded with the catalog, replaced on reindex.
+    roster: RwLock<Arc<Roster>>,
     stores: Stores,
     connectors: HashMap<String, Arc<dyn Connector>>,
     team: Arc<Team>,
@@ -140,6 +205,7 @@ impl ToolService {
             }
         }
         Ok(Self {
+            roster: RwLock::new(Arc::new(catalog.roster().clone())),
             catalog,
             stores,
             connectors,
@@ -184,9 +250,15 @@ impl ToolService {
         &self.catalog
     }
 
+    /// The bots and roles now in force.
+    pub fn roster(&self) -> Arc<Roster> {
+        self.roster.read().expect("roster lock").clone()
+    }
+
     /// Rebuild the context index from the content repo checkout at `content_root`, after a
-    /// merge. Content that fails `pmos lint` is refused and the index is left as it was.
-    /// Skill and tool registry changes take effect on the next restart.
+    /// merge, and reload `team.yaml`, the bots and their roles. Content that fails `pmos lint`
+    /// is refused and everything is left as it was. Skill and tool registry changes take
+    /// effect on the next restart.
     pub async fn reindex(
         &self,
         content_root: &std::path::Path,
@@ -206,6 +278,8 @@ impl ToolService {
         if let Err(e) = self.team.reload() {
             return Err(ReindexError::Lint(format!("  team.yaml: {e}")));
         }
+        // Live sessions pick up the new roles and settings on their next call.
+        *self.roster.write().expect("roster lock") = Arc::new(Roster::from_report(&report));
         Ok(self.stores.context.reindex(load_docs(content_root)).await?)
     }
 
@@ -251,8 +325,45 @@ impl ToolService {
         Ok(session)
     }
 
-    /// The live session for `token`. A session whose skill is no longer in the catalog
-    /// (content changed since it was created) is treated as gone.
+    /// A session for a task `bot` does for `user` (`docs/bot-runtime-spec.md` §2). Its tools
+    /// are its role's, less any write the bot is set to `never` use; its data class is its
+    /// role's. A personal bot serves its owner only; a team bot, any team member.
+    pub async fn create_bot_session(
+        &self,
+        user: &str,
+        bot: &str,
+        run_id: &str,
+        ttl: Option<Duration>,
+        now: DateTime<Utc>,
+    ) -> Result<Session, SessionError> {
+        if !valid_handle(user) {
+            return Err(SessionError::InvalidUser(user.to_string()));
+        }
+        if !self.team.allows(user) {
+            return Err(SessionError::NotAMember(user.to_string()));
+        }
+        let (found, _) = self
+            .roster()
+            .bot(bot)
+            .ok_or_else(|| SessionError::UnknownBot(bot.to_string()))?;
+        if found.scope == BotScope::Personal && found.owner != user {
+            return Err(SessionError::NotOwner {
+                bot: found.name.clone(),
+                owner: found.owner.clone(),
+            });
+        }
+        if run_id.is_empty() || run_id.len() > 128 {
+            return Err(SessionError::InvalidRun);
+        }
+        let ttl = ttl.unwrap_or_else(|| Duration::minutes(DEFAULT_SESSION_TTL_MINUTES));
+        let session = Session::for_bot(user, bot, run_id, ttl, now);
+        self.stores.sessions.insert(&session, now).await?;
+        Ok(session)
+    }
+
+    /// The live session for `token`. A session whose skill or bot is no longer in the content
+    /// (it changed since the session was created), or whose personal bot changed owner, is
+    /// treated as gone.
     pub async fn session(
         &self,
         token: &str,
@@ -263,22 +374,57 @@ impl ToolService {
             .sessions
             .get(token, now)
             .await?
-            .filter(|s| self.catalog.skill(&s.skill).is_some()))
+            .filter(|s| self.policy(s).is_some()))
     }
 
     pub async fn revoke_session(&self, token: &str) -> Result<bool, StoreError> {
         self.stores.sessions.revoke(token).await
     }
 
-    fn skill_of(&self, session: &Session) -> Option<&Skill> {
-        self.catalog.skill(&session.skill)
+    /// What a session, or an approval item, with this skill or bot for `user` may do.
+    fn policy_for(&self, skill: Option<&str>, bot: Option<&str>, user: &str) -> Option<Policy> {
+        match (skill, bot) {
+            (Some(skill), None) => {
+                let skill = self.catalog.skill(skill)?;
+                Some(Policy {
+                    tools: skill.tools.iter().cloned().collect(),
+                    ceiling: skill.data_class,
+                    bot: None,
+                })
+            }
+            (None, Some(bot)) => {
+                let (bot, role) = self.roster().bot(bot)?;
+                if bot.scope == BotScope::Personal && bot.owner != user {
+                    return None;
+                }
+                Some(Policy {
+                    tools: role_tools(&role, self.catalog.skills()),
+                    ceiling: role.data_class,
+                    bot: Some((bot, role)),
+                })
+            }
+            _ => None,
+        }
     }
 
-    /// The tools this session may call.
+    fn policy(&self, session: &Session) -> Option<Policy> {
+        self.policy_for(
+            session.skill.as_deref(),
+            session.bot.as_deref(),
+            &session.user,
+        )
+    }
+
+    /// The tools this session may call: its skill's, or its bot's role's less any write the
+    /// bot is set to `never` use.
     pub fn list_tools(&self, session: &Session) -> Vec<&ToolSpec> {
-        self.skill_of(session)
-            .map(|skill| self.catalog.tools_for(skill))
-            .unwrap_or_default()
+        let Some(policy) = self.policy(session) else {
+            return Vec::new();
+        };
+        self.catalog
+            .tools()
+            .filter(|t| policy.check(t).is_ok())
+            .collect()
     }
 
     // ----- tool calls -----------------------------------------------------------------
@@ -311,6 +457,7 @@ impl ToolService {
             run_id: session.run_id.clone(),
             user: session.user.clone(),
             skill: session.skill.clone(),
+            bot: session.bot.clone(),
             tool: harness_name.to_string(),
             outcome: Outcome::Ok,
             sources: Vec::new(),
@@ -324,9 +471,10 @@ impl ToolService {
             .await;
         if let Err(e) = &result {
             event.outcome = match e {
-                ToolError::UnknownTool(_) | ToolError::NotAllowed(_) | ToolError::Forbidden(_) => {
-                    Outcome::Denied
-                }
+                ToolError::UnknownTool(_)
+                | ToolError::NotAllowed(_)
+                | ToolError::NotInRole(_)
+                | ToolError::Forbidden(_) => Outcome::Denied,
                 _ => Outcome::Error,
             };
             event.detail = Some(e.to_string());
@@ -348,16 +496,17 @@ impl ToolService {
             .tool(harness_name)
             .ok_or_else(|| ToolError::UnknownTool(harness_name.to_string()))?;
         event.tool = spec.name.clone();
-        let skill = self
-            .skill_of(session)
+        let policy = self
+            .policy(session)
             .ok_or_else(|| ToolError::NotAllowed(spec.harness_name.clone()))?;
-        if !skill.tools.contains(&spec.name) {
-            return Err(ToolError::NotAllowed(spec.harness_name.clone()));
-        }
+        policy.check(spec)?;
         check_args(&spec.input_schema, args).map_err(ToolError::InvalidArgs)?;
 
         match (spec.kind, spec.system.as_str()) {
-            (ToolKind::Read, "context") => self.context_tool(skill, spec, args, now, event).await,
+            (ToolKind::Read, "context") => {
+                self.context_tool(policy.ceiling, spec, args, now, event)
+                    .await
+            }
             (ToolKind::Read, "memory") => {
                 let notes = self.stores.memory.read(&session.user).await?;
                 Ok(json!({ "notes": notes }))
@@ -365,11 +514,33 @@ impl ToolService {
             (ToolKind::Internal, "memory") => self.memory_update(session, args, now).await,
             (ToolKind::Read, system) => {
                 let connector = self.connector(system)?;
-                let caller = Caller {
-                    user: &session.user,
-                    run_id: &session.run_id,
-                };
-                let items = connector.read(caller, spec.action(), args).await?;
+                // A team bot reads with its own accounts, inside its read scope; anyone else
+                // reads as the PM.
+                let team_bot = policy.team_bot();
+                let identity = team_bot.map(|b| bot_identity(&b.name));
+                let mut caller = Caller::new(&session.user, &session.run_id);
+                if let (Some(bot), Some(identity)) = (team_bot, identity.as_deref()) {
+                    caller = caller.for_team_bot(TeamBot {
+                        name: &bot.name,
+                        identity,
+                        reads: &bot.reads,
+                    });
+                }
+                let items = connector
+                    .read(caller, spec.action(), args)
+                    .await
+                    .map_err(|e| match (e, caller.team_bot) {
+                        (
+                            ConnectorError::NotConnected(_) | ConnectorError::Reconnect(_),
+                            Some(bot),
+                        ) => ConnectorError::NotConnected(format!(
+                            "the {} bot has no working {} account; ask a platform owner to link one for `{}`",
+                            bot.name,
+                            if system == "slack" { "Slack" } else { "Atlassian (Jira and Confluence)" },
+                            bot.identity
+                        )),
+                        (e, _) => e,
+                    })?;
                 event.sources = items
                     .iter()
                     .map(|i| format!("{}:{}", i.source.system, i.source.id))
@@ -390,15 +561,15 @@ impl ToolService {
             .ok_or_else(|| ToolError::Connector(format!("no connector for `{system}`")))
     }
 
+    /// `ceiling` is the session's data class: its skill's, or its bot's role's.
     async fn context_tool(
         &self,
-        skill: &Skill,
+        ceiling: Sensitivity,
         spec: &ToolSpec,
         args: &Value,
         now: DateTime<Utc>,
         event: &mut AuditEvent,
     ) -> Result<Value, ToolError> {
-        let ceiling = skill.data_class;
         let today = now.date_naive();
         match spec.action() {
             "search" => {
@@ -451,7 +622,7 @@ impl ToolService {
                     .ok_or_else(|| ToolError::NotFound(path.to_string()))?;
                 if doc.sensitivity > ceiling {
                     return Err(ToolError::Forbidden(format!(
-                        "{path} is {} and this skill handles at most {ceiling}",
+                        "{path} is {} and this session handles at most {ceiling}",
                         doc.sensitivity
                     )));
                 }
@@ -537,15 +708,9 @@ impl ToolService {
                     .await;
                 return Err(ToolError::Unavailable(e.0));
             }
+            // Always as the PM, never as a bot.
             let written = self
-                .execute_write(
-                    Caller {
-                        user: &session.user,
-                        run_id: &session.run_id,
-                    },
-                    spec,
-                    args,
-                )
+                .execute_write(Caller::new(&session.user, &session.run_id), spec, args)
                 .await?;
             event.outcome = Outcome::Approved;
             event.detail = Some("approved in the harness".into());
@@ -558,7 +723,8 @@ impl ToolService {
             .create(
                 NewItem {
                     user: &session.user,
-                    skill: &session.skill,
+                    skill: session.skill.as_deref(),
+                    bot: session.bot.as_deref(),
                     run_id: &session.run_id,
                     tool: &spec.name,
                     args,
@@ -626,12 +792,10 @@ impl ToolService {
                 spec.name
             )));
         }
-        let declared = self
-            .skill_of(session)
-            .is_some_and(|s| s.tools.contains(&spec.name));
-        if !declared {
-            return Err(ToolError::NotAllowed(spec.harness_name.clone()));
-        }
+        // A grant can't make a `never` write possible.
+        self.policy(session)
+            .ok_or_else(|| ToolError::NotAllowed(spec.harness_name.clone()))?
+            .check(spec)?;
         self.stores
             .approvals
             .add_grant(&token_hash(&session.token), &spec.name, args, now)
@@ -642,6 +806,7 @@ impl ToolService {
             run_id: session.run_id.clone(),
             user: session.user.clone(),
             skill: session.skill.clone(),
+            bot: session.bot.clone(),
             tool: spec.name.clone(),
             outcome: Outcome::Granted,
             sources: Vec::new(),
@@ -665,13 +830,8 @@ impl ToolService {
         self.stores.approvals.get(id).await
     }
 
-    /// Decide an inbox item as `decided_by`. Approve and edit run the write as the item's
-    /// user; edited arguments are checked like any call's, and the skill must still declare
-    /// the tool.
-    ///
-    /// The write runs in its own task, so a caller that disconnects can't cancel it halfway,
-    /// and every way out of here is audited. The item is `executing` while the write runs;
-    /// if the process dies then, [`ToolService::reconcile`] resolves it on the next start.
+    /// Decide an inbox item as `decided_by`, for the orchestrator. See
+    /// [`ToolService::decide_as`].
     pub async fn decide(
         self: &Arc<Self>,
         id: &str,
@@ -680,6 +840,57 @@ impl ToolService {
         edited_args: Option<Value>,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecisionError> {
+        self.decide_as(
+            Client::Orchestrator,
+            id,
+            decided_by,
+            decision,
+            edited_args,
+            now,
+        )
+        .await
+    }
+
+    /// Decide an inbox item as `decided_by`, for `client` (the orchestrator, or the Slack bot
+    /// from an approval card), which the audit log records. `decided_by` must be in
+    /// `team.yaml` when it is enforced, and must be the item's own user. Approve and edit run
+    /// the write as the item's user; edited arguments are checked like any call's, and the
+    /// item's skill must still declare the tool (or its bot's role still have it, not set to
+    /// `never`).
+    ///
+    /// The write runs in its own task, so a caller that disconnects can't cancel it halfway,
+    /// and every way out of here is audited. The item is `executing` while the write runs;
+    /// if the process dies then, [`ToolService::reconcile`] resolves it on the next start.
+    pub async fn decide_as(
+        self: &Arc<Self>,
+        client: Client,
+        id: &str,
+        decided_by: &str,
+        decision: Decision,
+        edited_args: Option<Value>,
+        now: DateTime<Utc>,
+    ) -> Result<ApprovalItem, DecisionError> {
+        let denied = |item: ApprovalItem, why: &str| AuditEvent {
+            client,
+            at: now,
+            run_id: item.run_id,
+            user: decided_by.to_string(),
+            skill: item.skill,
+            bot: item.bot,
+            tool: item.tool,
+            outcome: Outcome::Denied,
+            sources: Vec::new(),
+            args_hash: Some(item.args_hash),
+            output_ref: Some(item.id),
+            detail: Some(why.to_string()),
+        };
+        if !self.team.allows(decided_by) {
+            if let Ok(Some(item)) = self.stores.approvals.get(id).await {
+                self.audit(denied(item, "decision by someone not in team.yaml"))
+                    .await;
+            }
+            return Err(DecisionError::NotAMember(decided_by.to_string()));
+        }
         // Check the write is still allowed before changing anything. Ownership and status
         // are checked again, atomically, by the store.
         if decision != Decision::Reject {
@@ -704,19 +915,10 @@ impl ToolService {
             Err(e) => {
                 if e == DecideError::Forbidden {
                     if let Ok(Some(item)) = self.stores.approvals.get(id).await {
-                        self.audit(AuditEvent {
-                            client: Client::Orchestrator,
-                            at: now,
-                            run_id: item.run_id,
-                            user: decided_by.to_string(),
-                            skill: item.skill,
-                            tool: item.tool,
-                            outcome: Outcome::Denied,
-                            sources: Vec::new(),
-                            args_hash: Some(item.args_hash),
-                            output_ref: Some(item.id),
-                            detail: Some("decision by someone other than the item's user".into()),
-                        })
+                        self.audit(denied(
+                            item,
+                            "decision by someone other than the item's user",
+                        ))
                         .await;
                     }
                 }
@@ -725,11 +927,12 @@ impl ToolService {
         };
 
         let event = AuditEvent {
-            client: Client::Orchestrator,
+            client,
             at: now,
             run_id: item.run_id.clone(),
             user: item.user.clone(),
             skill: item.skill.clone(),
+            bot: item.bot.clone(),
             tool: item.tool.clone(),
             outcome: Outcome::Rejected,
             sources: Vec::new(),
@@ -748,7 +951,8 @@ impl ToolService {
             .map_err(|e| DecisionError::Internal(e.to_string()))?
     }
 
-    /// The tool for an inbox item, if the item's skill may still run it.
+    /// The tool for an inbox item, if the item's skill may still run it, or its bot's role
+    /// still has it and the bot isn't now set to `never` use it.
     fn write_spec(&self, item: &ApprovalItem) -> Result<ToolSpec, DecisionError> {
         let spec = self
             .catalog
@@ -756,14 +960,14 @@ impl ToolService {
             .find(|t| t.name == item.tool)
             .cloned()
             .ok_or_else(|| DecisionError::UnknownTool(item.tool.clone()))?;
-        let declared = self
-            .catalog
-            .skill(&item.skill)
-            .is_some_and(|s| s.tools.contains(&spec.name));
-        if !declared {
-            return Err(DecisionError::NotAllowed(item.tool.clone()));
+        let allowed = self
+            .policy_for(item.skill.as_deref(), item.bot.as_deref(), &item.user)
+            .is_some_and(|p| p.check(&spec).is_ok());
+        match (allowed, &item.bot) {
+            (true, _) => Ok(spec),
+            (false, Some(_)) => Err(DecisionError::BotNotAllowed(item.tool.clone())),
+            (false, None) => Err(DecisionError::NotAllowed(item.tool.clone())),
         }
-        Ok(spec)
     }
 
     /// Run an approved (`executing`) item's write and store the outcome.
@@ -799,15 +1003,9 @@ impl ToolService {
             return Err(DecisionError::Decide(DecideError::Store(e)));
         }
 
+        // As the item's own PM, never as a bot.
         let result = self
-            .execute_write(
-                Caller {
-                    user: &item.user,
-                    run_id: &item.run_id,
-                },
-                &spec,
-                &item.args,
-            )
+            .execute_write(Caller::new(&item.user, &item.run_id), &spec, &item.args)
             .await;
         let outcome = match &result {
             Ok(written) => {
@@ -861,6 +1059,7 @@ impl ToolService {
                     run_id: item.run_id.clone(),
                     user: item.user.clone(),
                     skill: item.skill.clone(),
+                    bot: item.bot.clone(),
                     tool: item.tool.clone(),
                     outcome: Outcome::Error,
                     sources: Vec::new(),

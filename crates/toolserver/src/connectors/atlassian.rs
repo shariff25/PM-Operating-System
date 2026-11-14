@@ -1,5 +1,6 @@
 //! Jira and Confluence on Atlassian Cloud, called as the signed-in PM with their own OAuth
-//! 2.0 (3LO) token through `api.atlassian.com/ex/{jira|confluence}/{cloudid}`.
+//! 2.0 (3LO) token through `api.atlassian.com/ex/{jira|confluence}/{cloudid}`. A team bot's
+//! reads use its own account instead, inside its read scope (`scope.rs`).
 //!
 //! APIs used (checked against developer.atlassian.com, November 2026):
 //! - Jira: `GET /rest/api/3/search/jql` (enhanced JQL search, paged by `nextPageToken`),
@@ -16,7 +17,8 @@ use serde_json::{json, Value};
 use super::format::{adf_to_text, markdown_to_adf, markdown_to_storage, storage_to_text};
 use super::http::{arg, client, issue_key, key_like, limit, numeric_id, send_json};
 use super::{
-    clip, Caller, Connector, ConnectorError, Item, SourceRef, DRAFTED_MARKER, MAX_BODY_CHARS,
+    clip, Caller, Connector, ConnectorError, Item, SourceRef, TeamBot, DRAFTED_MARKER,
+    MAX_BODY_CHARS,
 };
 
 /// Each Jira comment returned to the model, at most.
@@ -53,6 +55,13 @@ async fn site(
         token,
         web,
     })
+}
+
+/// An Atlassian id, which some endpoints send as a string and some as a number.
+fn json_id(v: &Value) -> Option<String> {
+    v.as_str()
+        .map(String::from)
+        .or_else(|| v.as_u64().map(|n| n.to_string()))
 }
 
 fn escape_html(s: &str) -> String {
@@ -135,17 +144,32 @@ impl Connector for Jira {
         action: &str,
         args: &Value,
     ) -> Result<Vec<Item>, ConnectorError> {
-        let site = site(self.tokens.as_ref(), &self.api_base, "jira", caller.user).await?;
+        // A team bot's scope is checked before its token is fetched or anything is sent.
+        let jql = match (action, caller.team_bot) {
+            ("search", Some(bot)) => Some(bot.jql(arg(args, "jql")?)?),
+            ("search", None) => Some(arg(args, "jql")?.to_string()),
+            _ => None,
+        };
+        if let (Some(bot), "read") = (caller.team_bot, action) {
+            bot.check_issue(issue_key(arg(args, "key")?)?)?;
+        }
+        let site = site(
+            self.tokens.as_ref(),
+            &self.api_base,
+            "jira",
+            caller.reader(),
+        )
+        .await?;
         match action {
             "search" => {
-                let jql = arg(args, "jql")?;
+                let jql = jql.unwrap_or_default();
                 let max = limit(args, 10, 50).to_string();
                 let body = send_json(
                     self.http
                         .get(format!("{}/rest/api/3/search/jql", site.base))
                         .bearer_auth(site.token.token.expose())
                         .query(&[
-                            ("jql", jql),
+                            ("jql", jql.as_str()),
                             ("maxResults", max.as_str()),
                             ("fields", "summary,status,issuetype,assignee,updated"),
                         ]),
@@ -174,6 +198,10 @@ impl Connector for Jira {
                     &format!("issue {key}"),
                 )
                 .await?;
+                // A moved issue comes back under its new key: check where it is now.
+                if let Some(bot) = caller.team_bot {
+                    bot.check_issue(issue["key"].as_str().unwrap_or_default())?;
+                }
                 Ok(vec![Self::issue_item(&site, &issue)])
             }
             other => Err(ConnectorError::Unsupported(format!("jira.{other}"))),
@@ -260,6 +288,43 @@ impl Confluence {
         send_json(req, "Confluence", &format!("page {id}")).await
     }
 
+    /// Is `page` in one of the team bot's spaces? The v2 page names its space by id, so the
+    /// listed keys are looked up (`GET /wiki/api/v2/spaces?keys=`) and compared by id. A page
+    /// with no space id is refused.
+    async fn check_page_space(
+        &self,
+        site: &Site,
+        bot: TeamBot<'_>,
+        id: &str,
+        page: &Value,
+    ) -> Result<(), ConnectorError> {
+        let spaces = bot.confluence_spaces()?;
+        let page_space = json_id(&page["spaceId"]);
+        let listed = send_json(
+            self.http
+                .get(format!("{}/wiki/api/v2/spaces", site.base))
+                .bearer_auth(site.token.token.expose())
+                .query(&[("keys", spaces.join(",").as_str()), ("limit", "250")]),
+            "Confluence",
+            "the bot's spaces",
+        )
+        .await?;
+        let allowed = listed["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|s| {
+                s["key"]
+                    .as_str()
+                    .is_some_and(|k| spaces.iter().any(|w| w == k))
+            })
+            .filter_map(|s| json_id(&s["id"]));
+        match page_space {
+            Some(space) if allowed.into_iter().any(|a| a == space) => Ok(()),
+            _ => Err(bot.outside_spaces(id, spaces)),
+        }
+    }
+
     fn footer(caller: Caller<'_>) -> String {
         format!(
             "<p><em>{DRAFTED_MARKER} · run {}</em></p>",
@@ -280,22 +345,31 @@ impl Connector for Confluence {
         action: &str,
         args: &Value,
     ) -> Result<Vec<Item>, ConnectorError> {
+        // A team bot's scope is checked before its token is fetched or anything is sent.
+        let cql = match (action, caller.team_bot) {
+            ("search", Some(bot)) => Some(bot.cql(arg(args, "cql")?)?),
+            ("search", None) => Some(arg(args, "cql")?.to_string()),
+            _ => None,
+        };
+        if let (Some(bot), "read") = (caller.team_bot, action) {
+            bot.confluence_spaces()?;
+        }
         let site = site(
             self.tokens.as_ref(),
             &self.api_base,
             "confluence",
-            caller.user,
+            caller.reader(),
         )
         .await?;
         match action {
             "search" => {
-                let cql = arg(args, "cql")?;
+                let cql = cql.unwrap_or_default();
                 let max = limit(args, 10, 50).to_string();
                 let body = send_json(
                     self.http
                         .get(format!("{}/wiki/rest/api/search", site.base))
                         .bearer_auth(site.token.token.expose())
-                        .query(&[("cql", cql), ("limit", max.as_str())]),
+                        .query(&[("cql", cql.as_str()), ("limit", max.as_str())]),
                     "Confluence",
                     "the search",
                 )
@@ -329,6 +403,11 @@ impl Connector for Confluence {
             "read" => {
                 let id = numeric_id(arg(args, "page_id")?, "Confluence page id")?;
                 let page = self.page(&site, id, true).await?;
+                // After the fetch, before anything is returned: the page's space must be one
+                // the team bot may read.
+                if let Some(bot) = caller.team_bot {
+                    self.check_page_space(&site, bot, id, &page).await?;
+                }
                 Ok(vec![Item {
                     source: SourceRef {
                         system: "confluence".into(),

@@ -2,6 +2,8 @@
 //! REST APIs) and Slack. The mock records every request so the tests can check exactly what
 //! would go over the wire: whose token, which path, which body.
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use base64::Engine;
 use chrono::{Duration, Utc};
+use pmos_toolserver::audit::Outcome;
 use pmos_toolserver::catalog::Catalog;
 use pmos_toolserver::connectors::atlassian::{Confluence, Jira};
 use pmos_toolserver::connectors::slack::Slack;
@@ -20,6 +23,7 @@ use pmos_toolserver::connectors::{Caller, Connector, ConnectorError};
 use pmos_toolserver::oauth::{
     AppCredentials, Endpoints, OAuth, OAuthConfig, OAuthError, TokenError, TokenSource,
 };
+use pmos_toolserver::service::ToolError;
 use pmos_toolserver::team::Team;
 use pmos_toolserver::vault::{Credential, KeyRing, MemoryCredentials, Provider, Secret, Vault};
 use pmos_toolserver::{router, AppConfig, Stores, ToolService};
@@ -188,6 +192,12 @@ async fn handle(
                     "body": {"type": "doc", "version": 1, "content": [{"type": "paragraph",
                         "content": [{"type": "text", "text": "Also OIDC?"}]}]}}]}}}),
         ),
+        // A moved issue: asked for as PM-9, it comes back under its new key.
+        ("GET", "/ex/jira/cloud-1/rest/api/3/issue/PM-9") => reply(
+            ok,
+            json!({"key": "SECRET-9", "fields": {"summary": "Moved", "status": {"name": "To Do"},
+                "issuetype": {"name": "Story"}}}),
+        ),
         ("GET", p) if p.starts_with("/ex/jira/cloud-1/rest/api/3/issue/") => reply(
             StatusCode::NOT_FOUND,
             json!({"errorMessages": ["Issue does not exist"]}),
@@ -199,19 +209,32 @@ async fn handle(
 
         // Confluence
         ("GET", "/ex/confluence/cloud-1/wiki/api/v2/spaces") => {
-            if req.query.get("keys").map(String::as_str) == Some("PM") {
-                reply(ok, json!({"results": [{"id": "98765", "key": "PM"}]}))
-            } else {
-                reply(ok, json!({"results": []}))
-            }
+            // `keys` is a comma-separated list; PM is id 98765 (a string), HR 11111 (a number).
+            let keys = req.query.get("keys").cloned().unwrap_or_default();
+            let results: Vec<Value> = keys
+                .split(',')
+                .filter_map(|k| match k {
+                    "PM" => Some(json!({"id": "98765", "key": "PM"})),
+                    "HR" => Some(json!({"id": 11111, "key": "HR"})),
+                    _ => None,
+                })
+                .collect();
+            reply(ok, json!({ "results": results }))
         }
+        ("GET", "/ex/confluence/cloud-1/wiki/api/v2/pages/557") => reply(
+            ok,
+            json!({"id": "557", "title": "Salary bands", "status": "current", "spaceId": "11111",
+                   "version": {"number": 1}, "body": {"storage": {"value": "<p>secret</p>"}},
+                   "_links": {"webui": "/spaces/HR/pages/557"}}),
+        ),
         ("POST", "/ex/confluence/cloud-1/wiki/api/v2/pages") => reply(
             ok,
             json!({"id": "555", "status": "draft", "_links": {"webui": "/spaces/PM/pages/555/PRD"}}),
         ),
         ("GET", "/ex/confluence/cloud-1/wiki/api/v2/pages/555") => reply(
             ok,
-            json!({"id": "555", "title": "PRD: SSO", "status": "current", "version": {"number": 3},
+            json!({"id": "555", "title": "PRD: SSO", "status": "current", "spaceId": "98765",
+                   "version": {"number": 3},
                    "body": {"storage": {"value": "<h1>PRD</h1><p>Hello &amp; welcome</p>"}},
                    "_links": {"webui": "/spaces/PM/pages/555/PRD"}}),
         ),
@@ -263,6 +286,16 @@ async fn handle(
         ("POST", "/api/assistant.search.context") => {
             if req.form().get("query").map(String::as_str) == Some("ratelimit") {
                 return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "7")], "").into_response();
+            }
+            if req.form().get("query").map(String::as_str) == Some("launch") {
+                return reply(
+                    ok,
+                    json!({"ok": true, "results": {"messages": [
+                        {"author_user_id": "U2", "channel_id": "C0SECRET", "channel_name": "exec",
+                         "message_ts": "1731500001.000100", "content": "Launch slips a month"},
+                        {"author_user_id": "U3", "channel_id": "C0FIELD", "channel_name": "field-questions",
+                         "message_ts": "1731500002.000100", "content": "When is the launch?"}]}}),
+                );
             }
             reply(
                 ok,
@@ -393,10 +426,7 @@ async fn link(l: &Live, user: &str, provider: Provider) {
 }
 
 fn ana() -> Caller<'static> {
-    Caller {
-        user: "ana",
-        run_id: "run-7",
-    }
+    Caller::new("ana", "run-7")
 }
 
 /// Store an Atlassian credential directly, for expiry and failure cases.
@@ -517,10 +547,7 @@ async fn every_call_uses_the_callers_own_token() {
         .read(ana(), "search", &json!({"jql": "project = PM"}))
         .await
         .unwrap();
-    let bo = Caller {
-        user: "bo",
-        run_id: "run-8",
-    };
+    let bo = Caller::new("bo", "run-8");
     l.jira
         .read(bo, "search", &json!({"jql": "project = PM"}))
         .await
@@ -533,10 +560,7 @@ async fn every_call_uses_the_callers_own_token() {
         .collect();
     assert_eq!(auths, vec!["Bearer at-ana", "Bearer at-bo"]);
 
-    let cy = Caller {
-        user: "cy",
-        run_id: "run-9",
-    };
+    let cy = Caller::new("cy", "run-9");
     let err = l
         .jira
         .read(cy, "search", &json!({"jql": "x"}))
@@ -1073,6 +1097,7 @@ async fn slack_errors_map_to_actionable_messages() {
 // ----- through the tool server ------------------------------------------------------------
 
 const SERVICE_TOKEN: &str = "test-service-token-0123456789abcdef";
+const BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
 
 #[tokio::test]
 async fn link_over_http_then_call_through_the_tool_server() {
@@ -1218,6 +1243,352 @@ async fn link_over_http_then_call_through_the_tool_server() {
         .call(&s, "jira_search", json!({"jql": "x"}), Utc::now())
         .await
         .is_err());
+
+    cancel.cancel();
+    l.cancel.cancel();
+}
+
+// ----- team bots --------------------------------------------------------------------------
+
+/// The scope of the fixture's team bot `scout`, except Confluence `PM` so pages can match.
+fn scout_reads() -> pmos_contract::bots::Reads {
+    pmos_contract::bots::Reads {
+        jira_projects: vec!["PM".into()],
+        confluence_spaces: vec!["PM".into()],
+        slack_channels: vec!["C0FIELD".into()],
+    }
+}
+
+#[tokio::test]
+async fn a_team_bot_reads_with_its_own_account_inside_its_scope() {
+    use pmos_toolserver::connectors::TeamBot;
+    let l = live().await;
+    put_atlassian(&l, "ana", "at-ana", "rt", 3600).await;
+    put_atlassian(&l, "bots.scout", "at-bot", "rt", 3600).await;
+    put_slack(&l, "ana", "xoxp-ana").await;
+    put_slack(&l, "bots.scout", "xoxp-bot").await;
+    let reads = scout_reads();
+    let scout = Caller::new("ana", "tsk_1").for_team_bot(TeamBot {
+        name: "scout",
+        identity: "bots.scout",
+        reads: &reads,
+    });
+    let sent = |path: &str| l.mock.requests(path).len();
+
+    // Jira search: the JQL is wrapped in the scope, and runs with the bot's token.
+    l.jira
+        .read(
+            scout,
+            "search",
+            &json!({"jql": "text ~ SSO ORDER BY updated DESC"}),
+        )
+        .await
+        .unwrap();
+    let search = l.mock.requests("search/jql").pop().unwrap();
+    assert_eq!(
+        search.query["jql"],
+        r#"project in ("PM") AND (text ~ SSO) ORDER BY updated DESC"#
+    );
+    assert_eq!(search.auth.as_deref(), Some("Bearer at-bot"));
+    // A query that would close the group is refused before anything is sent.
+    let err = l
+        .jira
+        .read(scout, "search", &json!({"jql": "x) OR (project = HR"}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConnectorError::BadArgs(_)), "{err:?}");
+    assert_eq!(sent("search/jql"), 1);
+
+    // Jira read: the key's project is checked before the call, and again on the issue that
+    // comes back (a moved issue changes key).
+    let issue = l
+        .jira
+        .read(scout, "read", &json!({"key": "PM-1"}))
+        .await
+        .unwrap();
+    assert_eq!(issue[0].source.id, "PM-1");
+    assert_eq!(
+        l.mock.requests("issue/PM-1")[0].auth.as_deref(),
+        Some("Bearer at-bot")
+    );
+    assert!(matches!(
+        l.jira.read(scout, "read", &json!({"key": "HR-1"})).await,
+        Err(ConnectorError::Forbidden(_))
+    ));
+    assert_eq!(sent("issue/HR-1"), 0, "no call outside the scope");
+    let err = l
+        .jira
+        .read(scout, "read", &json!({"key": "PM-9"}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ConnectorError::Forbidden(ref m) if m.contains("SECRET-9")),
+        "{err:?}"
+    );
+
+    // Confluence search: the CQL is wrapped.
+    l.confluence
+        .read(scout, "search", &json!({"cql": "type = page"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        l.mock.requests("rest/api/search")[0].query["cql"],
+        r#"space in ("PM") AND (type = page)"#
+    );
+    // Confluence read: the page's space is checked after the fetch, before anything returns.
+    let page = l
+        .confluence
+        .read(scout, "read", &json!({"page_id": "555"}))
+        .await
+        .unwrap();
+    assert_eq!(page[0].title, "PRD: SSO");
+    let spaces = l.mock.exact("/ex/confluence/cloud-1/wiki/api/v2/spaces");
+    assert_eq!(spaces[0].query["keys"], "PM");
+    assert_eq!(spaces[0].auth.as_deref(), Some("Bearer at-bot"));
+    for (id, why) in [("557", "in HR"), ("556", "no space id")] {
+        let err = l
+            .confluence
+            .read(scout, "read", &json!({"page_id": id}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ConnectorError::Forbidden(ref m) if m.contains(&format!("page {id}"))),
+            "{why}: {err:?}"
+        );
+        assert_eq!(
+            sent(&format!("pages/{id}")),
+            1,
+            "{why}: fetched, then refused"
+        );
+    }
+
+    // Slack search: results outside the listed channels are dropped.
+    let hits = l
+        .slack
+        .read(scout, "search", &json!({"query": "launch"}))
+        .await
+        .unwrap();
+    let ids: Vec<_> = hits.iter().map(|h| h.source.id.as_str()).collect();
+    assert_eq!(ids, vec!["C0FIELD:1731500002.000100"]);
+    assert_eq!(
+        l.mock.requests("assistant.search.context")[0]
+            .auth
+            .as_deref(),
+        Some("Bearer xoxp-bot")
+    );
+    // The PM's own search keeps everything they can see.
+    let all = l
+        .slack
+        .read(ana(), "search", &json!({"query": "launch"}))
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    // Slack thread: the channel must be listed.
+    assert!(matches!(
+        l.slack
+            .read(
+                scout,
+                "read_thread",
+                &json!({"channel": "C0SECRET", "ts": "1731500001.000100"})
+            )
+            .await,
+        Err(ConnectorError::Forbidden(_))
+    ));
+    assert_eq!(sent("conversations.replies"), 0);
+    l.slack
+        .read(
+            scout,
+            "read_thread",
+            &json!({"channel": "C0FIELD", "ts": "1731500000.000100"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        l.mock.requests("conversations.replies")[0].auth.as_deref(),
+        Some("Bearer xoxp-bot")
+    );
+    l.cancel.cancel();
+}
+
+#[tokio::test]
+async fn a_team_bots_own_account_links_without_the_team_yaml_check() {
+    // team.yaml is enforced and lists only Ana; the mock signs in as Ana's accounts.
+    let team = Team::of(vec![member("ana", "U0ANA", Some("ana@example.com"))]);
+    let l = live_with(Some(team)).await;
+    link(&l, "bots.scout", Provider::Atlassian).await;
+    link(&l, "bots.scout", Provider::Slack).await;
+    for provider in [Provider::Atlassian, Provider::Slack] {
+        assert!(l.vault.get("bots.scout", provider).await.unwrap().is_some());
+    }
+    // Only `bots.<valid bot name>` skips the check; a PM's link is still checked.
+    for bad in ["bots.", "bots.Scout", "bots.a--b"] {
+        assert_eq!(
+            l.oauth.authorize_url(bad, Provider::Slack, Utc::now()),
+            Err(OAuthError::InvalidUser),
+            "{bad}"
+        );
+    }
+    let url = l
+        .oauth
+        .authorize_url("eve", Provider::Slack, Utc::now())
+        .unwrap();
+    assert!(matches!(
+        l.oauth
+            .complete(Provider::Slack, "good-code", &state_of(&url), Utc::now())
+            .await,
+        Err(OAuthError::WrongAccount(..))
+    ));
+    l.cancel.cancel();
+}
+
+#[tokio::test]
+async fn a_team_bot_session_reads_as_the_bot_and_writes_as_the_pm() {
+    let l = live().await;
+    let (_dir, content) = common::content_tree();
+    let catalog = Catalog::load(&content, Utc::now().date_naive()).unwrap();
+    let (stores, audit) = Stores::in_memory(&content);
+    let tokens: Arc<dyn TokenSource> = l.oauth.clone();
+    let connectors: Vec<Arc<dyn Connector>> = vec![
+        Arc::new(Jira::new(tokens.clone(), l.base.clone())),
+        Arc::new(Confluence::new(tokens.clone(), l.base.clone())),
+        Arc::new(Slack::new(tokens, l.base.clone())),
+        Arc::new(pmos_toolserver::connectors::fake::FakeConnector::docs()),
+    ];
+    let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
+    put_atlassian(&l, "ana", "at-ana", "rt", 3600).await;
+    put_atlassian(&l, "bots.scout", "at-bot", "rt", 3600).await;
+    put_slack(&l, "ana", "xoxp-ana").await;
+
+    let s = svc
+        .create_bot_session("ana", "scout", "tsk_7", None, Utc::now())
+        .await
+        .unwrap();
+    let out = svc
+        .call(&s, "jira_search", json!({"jql": "text ~ SSO"}), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(out["results"][0]["untrusted"], true);
+    let search = l.mock.requests("search/jql").pop().unwrap();
+    assert_eq!(search.auth.as_deref(), Some("Bearer at-bot"));
+    assert_eq!(search.query["jql"], r#"project in ("PM") AND (text ~ SSO)"#);
+
+    // scout reads Confluence ENG only: page 555 is in PM.
+    let err = svc
+        .call(&s, "confluence_read", json!({"page_id": "555"}), Utc::now())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ToolError::Forbidden(_)), "{err:?}");
+    assert_eq!(audit.events().last().unwrap().outcome, Outcome::Denied);
+
+    // The bot has no Slack account linked: the error says who links it, and Ana's own token
+    // is never used instead.
+    let err = svc
+        .call(
+            &s,
+            "slack_read_thread",
+            json!({"channel": "C0FIELD", "ts": "1731500000.000100"}),
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "the scout bot has no working Slack account; ask a platform owner to link one for `bots.scout`"
+    );
+    assert!(l.mock.requests("conversations.replies").is_empty());
+
+    // A write waits for Ana, then runs with Ana's token, not the bot's.
+    let args = json!({"project": "PM", "issue_type": "Task", "summary": "Follow up"});
+    let out = svc
+        .call(&s, "jira_create_issue", args, Utc::now())
+        .await
+        .unwrap();
+    let id = out["approval_id"].as_str().unwrap();
+    svc.decide(
+        id,
+        "ana",
+        pmos_toolserver::approvals::Decision::Approve,
+        None,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let created = l.mock.exact("/ex/jira/cloud-1/rest/api/3/issue");
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0].auth.as_deref(), Some("Bearer at-ana"));
+
+    // A personal bot reads as its owner, with no scope.
+    let mine = svc
+        .create_bot_session("ana", "pm-ana", "tsk_8", None, Utc::now())
+        .await
+        .unwrap();
+    svc.call(
+        &mine,
+        "jira_search",
+        json!({"jql": "text ~ SSO"}),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let search = l.mock.requests("search/jql").pop().unwrap();
+    assert_eq!(search.auth.as_deref(), Some("Bearer at-ana"));
+    assert_eq!(search.query["jql"], "text ~ SSO");
+
+    // Linking a bot's account: only a team bot, and only with the service token.
+    let cancel = CancellationToken::new();
+    let app = router(
+        svc.clone(),
+        AppConfig {
+            service_token: SERVICE_TOKEN.into(),
+            bot: Some(pmos_toolserver::app::BotAccess {
+                token: BOT_TOKEN.into(),
+                skills: vec!["docs".into()],
+            }),
+            content_root: content.clone(),
+            allowed_hosts: vec!["127.0.0.1".into()],
+            oauth: Some(l.oauth.clone()),
+        },
+        cancel.clone(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ts = format!("http://{}", listener.local_addr().unwrap());
+    let ct = cancel.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { ct.cancelled_owned().await })
+            .await
+            .unwrap();
+    });
+    let http = reqwest::Client::new();
+    let start = |user: &'static str, token: &'static str| {
+        http.get(format!("{ts}/internal/oauth/slack/start?user={user}"))
+            .bearer_auth(token)
+            .send()
+    };
+    let res = start("bots.scout", SERVICE_TOKEN).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let state = state_of(res.json::<Value>().await.unwrap()["url"].as_str().unwrap());
+    let back = http
+        .get(format!("{ts}/oauth/slack/callback"))
+        .query(&[("code", "good-code"), ("state", state.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(back.status(), 200);
+    assert!(l
+        .vault
+        .get("bots.scout", Provider::Slack)
+        .await
+        .unwrap()
+        .is_some());
+    for user in ["bots.nobody", "bots.pm-ana"] {
+        assert_eq!(
+            start(user, SERVICE_TOKEN).await.unwrap().status(),
+            404,
+            "{user}"
+        );
+    }
+    assert_eq!(start("bots.scout", BOT_TOKEN).await.unwrap().status(), 403);
 
     cancel.cancel();
     l.cancel.cancel();

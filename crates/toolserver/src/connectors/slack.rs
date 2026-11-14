@@ -1,5 +1,6 @@
 //! Slack, called with the PM's own user token (`xoxp`), never a bot token: reads see what
-//! the PM can see, and posts appear as the PM, marked as drafted with PM OS (SLK-7).
+//! the PM can see, and posts appear as the PM, marked as drafted with PM OS (SLK-7). A team
+//! bot reads with its own linked user token instead, only in its listed channels (`scope.rs`).
 //!
 //! Methods used (checked against docs.slack.dev, November 2026):
 //! - `assistant.search.context`: the Real-time Search API. Results are never stored: they
@@ -183,9 +184,11 @@ impl Connector for Slack {
             "search" => {
                 let query = arg(args, "query")?;
                 let max = limit(args, 10, 20).to_string();
+                // A team bot keeps only results in its listed channels.
+                let channels = caller.team_bot.map(|b| b.slack_channels()).transpose()?;
                 let body = self
                     .call(
-                        caller.user,
+                        caller.reader(),
                         "assistant.search.context",
                         &[
                             ("query", query),
@@ -202,6 +205,9 @@ impl Connector for Slack {
                     .flatten()
                     .filter_map(|m| {
                         let channel = m["channel_id"].as_str()?;
+                        if channels.is_some_and(|listed| !listed.iter().any(|c| c == channel)) {
+                            return None;
+                        }
                         let ts = m["message_ts"].as_str()?;
                         Some(Item {
                             source: SourceRef {
@@ -228,9 +234,12 @@ impl Connector for Slack {
             "read_thread" => {
                 let channel = slack_id(arg(args, "channel")?)?;
                 let ts = slack_ts(arg(args, "ts")?)?;
+                if let Some(bot) = caller.team_bot {
+                    bot.check_channel(channel)?;
+                }
                 let body = self
                     .call(
-                        caller.user,
+                        caller.reader(),
                         "conversations.replies",
                         &[("channel", channel), ("ts", ts), ("limit", "50")],
                         &format!("thread {channel}:{ts}"),

@@ -60,6 +60,9 @@ pub struct Diagnostic {
 pub struct Report {
     pub files_checked: usize,
     pub skills: Vec<Skill>,
+    /// Roles and bots that parsed, for services that load them (the bot runtime).
+    pub roles: Vec<crate::bots::Role>,
+    pub bots: Vec<crate::bots::Bot>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -105,6 +108,7 @@ pub fn lint(root: &Path, opts: &LintOptions) -> Report {
     cx.check_reviewers();
     cx.check_templates();
     cx.check_team();
+    cx.check_roles_and_bots(registry.as_ref());
 
     cx.report
         .diagnostics
@@ -569,6 +573,194 @@ impl Cx {
 }
 
 impl Cx {
+    /// `roles/<role>/ROLE.md` and `bots/<name>/BOT.md` (both optional folders).
+    fn check_roles_and_bots(&mut self, registry: Option<&ToolRegistry>) {
+        use crate::bots::{valid_name, ActionSetting, BotFrontMatter, BotScope, RoleFrontMatter};
+
+        // Each outbound setting must name a write tool; `auto` waits for the benchmark (D7, D10).
+        let check_actions =
+            |cx: &mut Cx,
+             path: &Path,
+             actions: &std::collections::BTreeMap<String, ActionSetting>| {
+                for (tool, setting) in actions {
+                    match registry.and_then(|r| r.get(tool)) {
+                        Some(t) if t.kind == crate::model::ToolKind::Write => {}
+                        Some(_) => cx.error(
+                            "action-not-write",
+                            path,
+                            format!("`{tool}` is not an outbound (write) tool"),
+                        ),
+                        None if registry.is_some() => cx.error(
+                            "action-unknown-tool",
+                            path,
+                            format!("`{tool}` is not in tools.yaml"),
+                        ),
+                        None => {}
+                    }
+                    if *setting == ActionSetting::Auto {
+                        cx.error(
+                        "action-auto",
+                        path,
+                        format!(
+                            "`{tool}: auto` is not allowed in v1: every outbound action is approve or never"
+                        ),
+                    );
+                    }
+                }
+            };
+
+        let mut roles = std::collections::BTreeMap::new();
+        let roles_dir = self.root.join("roles");
+        if let Some(entries) = sorted_entries(&roles_dir) {
+            for dir in entries.into_iter().filter(|p| p.is_dir()) {
+                let path = dir.join("ROLE.md");
+                let dir_name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !path.is_file() {
+                    self.error("role-missing-file", &dir, "role directory has no ROLE.md");
+                    continue;
+                }
+                let Some((fm, body)) =
+                    self.read_front_matter::<RoleFrontMatter>(&path, "role-parse")
+                else {
+                    continue;
+                };
+                if fm.name != dir_name || !valid_name(&fm.name) {
+                    self.error("role-name", &path, format!("name `{}` must equal the folder name and use lowercase letters, digits and single hyphens", fm.name));
+                }
+                self.check_owner(&path, &fm.owner);
+                if !is_semver(&fm.version) {
+                    self.error(
+                        "role-version",
+                        &path,
+                        format!("version `{}` is not MAJOR.MINOR.PATCH", fm.version),
+                    );
+                }
+                if fm.description.trim().is_empty() {
+                    self.error("role-description", &path, "description is empty");
+                }
+                if body.trim().is_empty() {
+                    self.error("role-body-empty", &path, "role has no instructions");
+                }
+                check_actions(self, &path, &fm.actions);
+                let Some(role) = fm.clone().into_role(body) else {
+                    self.error(
+                        "role-parse",
+                        &path,
+                        format!(
+                            "data-class `{}` or model `{}` is not valid",
+                            fm.data_class, fm.model
+                        ),
+                    );
+                    continue;
+                };
+                if role.skills.is_empty() {
+                    self.error("role-skills", &path, "role lists no skills");
+                }
+                for name in &role.skills {
+                    match self.report.skills.iter().find(|s| &s.name == name) {
+                        None => self.error(
+                            "role-skill-unknown",
+                            &path,
+                            format!("skill `{name}` is not in skills/"),
+                        ),
+                        Some(skill) if skill.data_class > role.data_class => self.error(
+                            "role-skill-data-class",
+                            &path,
+                            format!(
+                                "skill `{name}` handles {} data, above the role's {}",
+                                skill.data_class, role.data_class
+                            ),
+                        ),
+                        Some(_) => {}
+                    }
+                }
+                roles.insert(role.name.clone(), role);
+            }
+        }
+
+        let team = crate::model::TeamFile::load(&self.root).unwrap_or_default();
+        let bots_dir = self.root.join("bots");
+        if let Some(entries) = sorted_entries(&bots_dir) {
+            for dir in entries.into_iter().filter(|p| p.is_dir()) {
+                let path = dir.join("BOT.md");
+                let dir_name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !path.is_file() {
+                    self.error("bot-missing-file", &dir, "bot directory has no BOT.md");
+                    continue;
+                }
+                let Some((fm, body)) = self.read_front_matter::<BotFrontMatter>(&path, "bot-parse")
+                else {
+                    continue;
+                };
+                if fm.name != dir_name || !valid_name(&fm.name) {
+                    self.error("bot-name", &path, format!("name `{}` must equal the folder name and use lowercase letters, digits and single hyphens", fm.name));
+                }
+                if fm.description.trim().is_empty() {
+                    self.error("bot-description", &path, "description is empty");
+                }
+                if body.trim().is_empty() {
+                    self.error("bot-body-empty", &path, "bot has no job description");
+                }
+                self.check_owner(&path, &fm.owner);
+                check_actions(self, &path, &fm.actions);
+                let bot = fm.into_bot(body);
+                let owner_known = team.by_handle(&bot.owner).is_some();
+                if !owner_known && !bot.owner.to_ascii_uppercase().starts_with("TODO") {
+                    if team.members.is_empty() {
+                        self.warn(
+                            "bot-owner-unknown",
+                            &path,
+                            format!(
+                                "owner `{}` is not in team.yaml (team.yaml lists nobody yet)",
+                                bot.owner
+                            ),
+                        );
+                    } else {
+                        self.error(
+                            "bot-owner-unknown",
+                            &path,
+                            format!("owner `{}` is not in team.yaml", bot.owner),
+                        );
+                    }
+                }
+                match roles.get(&bot.role) {
+                    None => self.error(
+                        "bot-role-unknown",
+                        &path,
+                        format!("role `{}` is not in roles/", bot.role),
+                    ),
+                    Some(role) => {
+                        if bot.scope == BotScope::Personal && !bot.reads.is_empty() {
+                            self.error(
+                                "bot-reads-personal",
+                                &path,
+                                "a personal bot reads as its owner; `reads` is only for team bots",
+                            );
+                        }
+                        // A team bot that reads Jira, Confluence or Slack needs a chosen scope.
+                        let tools = crate::bots::role_tools(role, &self.report.skills);
+                        let reads_systems = tools.iter().any(|t| {
+                            t.starts_with("jira.")
+                                || t.starts_with("confluence.")
+                                || t.starts_with("slack.")
+                        });
+                        if bot.scope == BotScope::Team && reads_systems && bot.reads.is_empty() {
+                            self.warn("bot-reads-empty", &path, "this team bot can read Jira, Confluence or Slack but lists nothing under `reads`, so it will read nothing there");
+                        }
+                    }
+                }
+                self.report.bots.push(bot);
+            }
+        }
+        self.report.roles = roles.into_values().collect();
+    }
+
     /// `team.yaml` is optional; without it nobody can use the Slack bot.
     fn check_team(&mut self) {
         let path = self.root.join("team.yaml");

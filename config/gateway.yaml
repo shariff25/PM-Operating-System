@@ -1,0 +1,25 @@
+# PM OS gateway: which local model serves each role. Callers name a role (`pmos/default`),
+# never a model, so swapping a model is a change here plus a benchmark run (D11).
+#
+# - upstreams: the vLLM servers on the Spark (OpenAI-compatible base URLs). Only local or
+#   private-network hosts are accepted: prompts never leave the Spark.
+# - roles: `model` is each server's --served-model-name. `workarounds` switches on entries
+#   from the gateway's workaround registry (GET /v1/pmos/workarounds).
+# - limits: how many requests run at once, per person, and how many may wait.
+#
+# Confirm the served model names on the Spark before first use.
+upstreams:
+  qwen: http://127.0.0.1:8001/v1
+  nemotron: http://127.0.0.1:8002/v1
+roles:
+  default:
+    upstream: qwen
+    model: qwen3.6-35b-a3b
+    workarounds: [strip-think]
+  extraction:
+    upstream: nemotron
+    model: nemotron-3-nano-30b-a3b
+limits:
+  max-in-flight: 4
+  per-user: 2
+  max-queue: 64

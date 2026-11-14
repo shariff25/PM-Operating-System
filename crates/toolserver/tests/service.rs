@@ -575,7 +575,8 @@ async fn an_item_runs_only_if_its_skill_still_declares_the_tool() {
         .create(
             pmos_toolserver::approvals::NewItem {
                 user: "ana",
-                skill: "ask",
+                skill: Some("ask"),
+                bot: None,
                 run_id: "r1",
                 tool: "jira.create_issue",
                 args: &json!({"project": "PM", "issue_type": "Story", "summary": "x"}),
