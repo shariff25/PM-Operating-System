@@ -16,7 +16,11 @@ use pmos_toolserver::approvals::{
 };
 use pmos_toolserver::audit::{AuditEvent, MemoryAudit, Outcome};
 use pmos_toolserver::context::{ContextDoc, MemoryIndex};
+use pmos_toolserver::members::{
+    Created, Decided, MemoryRequests, NewRequest, RequestStatus, MAX_PENDING,
+};
 use pmos_toolserver::memory::InMemoryStore;
+use pmos_toolserver::memory_repo::{MemoryRepo, MemoryRepos};
 use pmos_toolserver::pg::PgStore;
 use pmos_toolserver::session::{token_hash, MemorySessions, Session};
 use pmos_toolserver::vault::{
@@ -82,6 +86,8 @@ impl Backend {
                 approvals: Arc::new(MemoryApprovals::default()),
                 audit: audit.clone(),
                 credentials: Arc::new(MemoryCredentials::default()),
+                memory_repos: Arc::new(MemoryRepos::default()),
+                member_requests: Arc::new(MemoryRequests::default()),
             },
             memory_audit: Some(audit),
             pg: None,
@@ -153,6 +159,10 @@ contract!(
     credentials_are_per_user_and_provider,
     credential_replace_is_conditional,
     vault_round_trips_through_the_store,
+    github_credentials_are_stored,
+    memory_repos_are_per_user,
+    member_requests_follow_the_rules,
+    member_requests_are_decided_once_under_concurrency,
 );
 
 // ----- sessions ---------------------------------------------------------------------------
@@ -562,12 +572,24 @@ async fn interrupted_writes_are_found(b: &Backend) {
 
 async fn memory_is_per_user(b: &Backend) {
     let m = b.stores.memory.as_ref();
-    m.update("ana", "areas", "CCM", now()).await.unwrap();
-    m.update("ana", "areas", "CCM, DSM", now() + Duration::minutes(1))
+    m.update("ana", "areas", "CCM", "ask, task r1", now())
         .await
         .unwrap();
-    m.update("ana", "style", "short", now()).await.unwrap();
-    m.update("bo", "areas", "DSM", now()).await.unwrap();
+    m.update(
+        "ana",
+        "areas",
+        "CCM, DSM",
+        "ask, task r2",
+        now() + Duration::minutes(1),
+    )
+    .await
+    .unwrap();
+    m.update("ana", "style", "short", "ask, task r1", now())
+        .await
+        .unwrap();
+    m.update("bo", "areas", "DSM", "ask, task r3", now())
+        .await
+        .unwrap();
     let ana = m.read("ana").await.unwrap();
     let keys: Vec<_> = ana.iter().map(|n| n.key.as_str()).collect();
     assert_eq!(keys, vec!["areas", "style"]);
@@ -896,6 +918,201 @@ async fn vault_round_trips_through_the_store(b: &Backend) {
                 .unwrap();
         assert_eq!(hits, 0, "no plaintext token in the database");
     }
+}
+
+async fn github_credentials_are_stored(b: &Backend) {
+    // The migration widens the provider check to `github`.
+    let c = b.stores.credentials.as_ref();
+    c.put(&sealed("ana", Provider::Github, "v1.k1.sealed-g"))
+        .await
+        .unwrap();
+    let got = c.get("ana", Provider::Github).await.unwrap().unwrap();
+    assert_eq!(got.provider, Provider::Github);
+    assert_eq!(c.list("ana").await.unwrap().len(), 1);
+}
+
+// ----- onboarding -------------------------------------------------------------------------
+
+async fn memory_repos_are_per_user(b: &Backend) {
+    let r = b.stores.memory_repos.as_ref();
+    assert!(r.get("ana").await.unwrap().is_none());
+    let record = MemoryRepo {
+        user: "ana".into(),
+        repo: "fortanix/pm-os-memory-ana".into(),
+        verified_at: now(),
+    };
+    r.put(&record).await.unwrap();
+    assert_eq!(r.get("ana").await.unwrap(), Some(record.clone()));
+    assert!(r.get("bo").await.unwrap().is_none());
+    let moved = MemoryRepo {
+        repo: "fortanix/ana-notes".into(),
+        verified_at: now() + Duration::minutes(11),
+        ..record
+    };
+    r.put(&moved).await.unwrap();
+    assert_eq!(r.get("ana").await.unwrap(), Some(moved));
+    assert!(r.delete("ana").await.unwrap());
+    assert!(!r.delete("ana").await.unwrap());
+    assert!(r.get("ana").await.unwrap().is_none());
+}
+
+fn new_request<'a>(slack_id: &'a str, handle: &'a str) -> NewRequest<'a> {
+    NewRequest {
+        slack_id,
+        email: "new@fortanix.com",
+        name: "New Person",
+        proposed_handle: handle,
+    }
+}
+
+fn decided(status: RequestStatus, by: &str) -> Decided {
+    Decided {
+        status,
+        decided_by: by.into(),
+        handle: (status == RequestStatus::Approved).then(|| "nia".to_string()),
+        commit: (status == RequestStatus::Approved).then(|| "abc123".to_string()),
+        error: (status == RequestStatus::Failed).then(|| "it broke".to_string()),
+    }
+}
+
+async fn member_requests_follow_the_rules(b: &Backend) {
+    let s = b.stores.member_requests.as_ref();
+    let Created::New(first) = s.create(new_request("U0NIA", "nia"), now()).await.unwrap() else {
+        panic!("a new request");
+    };
+    assert_eq!(first.status, RequestStatus::Pending);
+    assert_eq!(first.proposed_handle, "nia");
+    // One pending request per Slack id.
+    let again = s
+        .create(new_request("U0NIA", "nia2"), now() + Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(again, Created::Existing(first.clone()));
+    assert_eq!(s.pending_for("U0NIA").await.unwrap(), Some(first.clone()));
+    assert_eq!(s.get(&first.id).await.unwrap(), Some(first.clone()));
+    assert!(s.get("no-such-id").await.unwrap().is_none());
+
+    let Created::New(second) = s
+        .create(new_request("U0OMI", "omi"), now() + Duration::minutes(2))
+        .await
+        .unwrap()
+    else {
+        panic!("a new request");
+    };
+    let approved = s
+        .decide(
+            &first.id,
+            &decided(RequestStatus::Approved, "raj"),
+            now() + Duration::minutes(3),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(approved.status, RequestStatus::Approved);
+    assert_eq!(approved.decided_by.as_deref(), Some("raj"));
+    assert_eq!(approved.decided_at, Some(now() + Duration::minutes(3)));
+    assert_eq!(approved.handle.as_deref(), Some("nia"));
+    assert_eq!(approved.commit.as_deref(), Some("abc123"));
+    // Decided once.
+    assert!(s
+        .decide(&first.id, &decided(RequestStatus::Rejected, "kim"), now())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(s.get(&first.id).await.unwrap(), Some(approved.clone()));
+    let failed = s
+        .decide(&second.id, &decided(RequestStatus::Failed, "raj"), now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.error.as_deref(), Some("it broke"));
+    // A decided request doesn't block a new one.
+    assert!(s.pending_for("U0NIA").await.unwrap().is_none());
+    let Created::New(third) = s
+        .create(new_request("U0NIA", "nia"), now() + Duration::minutes(4))
+        .await
+        .unwrap()
+    else {
+        panic!("a new request");
+    };
+
+    let ids = |v: Vec<pmos_toolserver::members::MemberRequest>| -> Vec<String> {
+        v.into_iter().map(|r| r.id).collect()
+    };
+    assert_eq!(
+        ids(s.list(None).await.unwrap()),
+        vec![first.id.clone(), second.id.clone(), third.id.clone()],
+        "oldest first"
+    );
+    assert_eq!(
+        ids(s.list(Some(RequestStatus::Pending)).await.unwrap()),
+        vec![third.id.clone()]
+    );
+    assert_eq!(
+        ids(s.list(Some(RequestStatus::Failed)).await.unwrap()),
+        vec![second.id.clone()]
+    );
+
+    // At most MAX_PENDING pending.
+    for n in 1..MAX_PENDING {
+        let slack = format!("U0P{n}");
+        assert!(matches!(
+            s.create(new_request(&slack, "p"), now()).await.unwrap(),
+            Created::New(_)
+        ));
+    }
+    assert_eq!(
+        s.create(new_request("U0LAST", "p"), now()).await.unwrap(),
+        Created::TooMany
+    );
+    // Someone with a pending request still gets it back.
+    assert!(matches!(
+        s.create(new_request("U0NIA", "nia"), now()).await.unwrap(),
+        Created::Existing(_)
+    ));
+}
+
+async fn member_requests_are_decided_once_under_concurrency(b: &Backend) {
+    let s = b.stores.member_requests.clone();
+    let Created::New(r) = s.create(new_request("U0NIA", "nia"), now()).await.unwrap() else {
+        panic!("a new request");
+    };
+    let tasks: Vec<_> = (0..8)
+        .map(|i| {
+            let s = s.clone();
+            let id = r.id.clone();
+            tokio::spawn(async move {
+                let status = if i % 2 == 0 {
+                    RequestStatus::Approved
+                } else {
+                    RequestStatus::Rejected
+                };
+                s.decide(&id, &decided(status, "raj"), now()).await.unwrap()
+            })
+        })
+        .collect();
+    let mut won = 0;
+    for t in tasks {
+        if t.await.unwrap().is_some() {
+            won += 1;
+        }
+    }
+    assert_eq!(won, 1);
+    // Concurrent requests for one Slack id make one pending request.
+    let tasks: Vec<_> = (0..8)
+        .map(|_| {
+            let s = s.clone();
+            tokio::spawn(async move { s.create(new_request("U0OMI", "omi"), now()).await.unwrap() })
+        })
+        .collect();
+    let mut created = 0;
+    for t in tasks {
+        if matches!(t.await.unwrap(), Created::New(_)) {
+            created += 1;
+        }
+    }
+    assert_eq!(created, 1);
+    assert_eq!(s.list(Some(RequestStatus::Pending)).await.unwrap().len(), 1);
 }
 
 // ----- Postgres only ----------------------------------------------------------------------
