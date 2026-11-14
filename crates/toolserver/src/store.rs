@@ -7,7 +7,9 @@ use std::sync::Arc;
 use crate::approvals::{ApprovalRepo, MemoryApprovals};
 use crate::audit::{AuditSink, MemoryAudit};
 use crate::context::{ContextIndex, MemoryIndex};
+use crate::members::{MemberRequestStore, MemoryRequests};
 use crate::memory::{InMemoryStore, MemoryStore};
+use crate::memory_repo::{MemoryRepoStore, MemoryRepos};
 use crate::session::{MemorySessions, SessionRepo};
 use crate::vault::{CredentialStore, MemoryCredentials};
 
@@ -28,6 +30,10 @@ pub struct Stores {
     pub audit: Arc<dyn AuditSink>,
     /// Sealed OAuth credentials; see `vault.rs`.
     pub credentials: Arc<dyn CredentialStore>,
+    /// Which GitHub repo holds each PM's memory; see `memory_repo.rs`.
+    pub memory_repos: Arc<dyn MemoryRepoStore>,
+    /// Requests to join PM OS; see `members.rs`.
+    pub member_requests: Arc<dyn MemberRequestStore>,
 }
 
 impl Stores {
@@ -42,6 +48,8 @@ impl Stores {
             approvals: Arc::new(MemoryApprovals::default()),
             audit: audit.clone(),
             credentials: Arc::new(MemoryCredentials::default()),
+            memory_repos: Arc::new(MemoryRepos::default()),
+            member_requests: Arc::new(MemoryRequests::default()),
         };
         (stores, audit)
     }

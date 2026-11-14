@@ -7,7 +7,8 @@
 //! - A grant is consumed by `DELETE … RETURNING` on one row picked `FOR UPDATE SKIP LOCKED`,
 //!   so of two concurrent calls with one grant, exactly one runs.
 //! - A decision is one conditional `UPDATE … WHERE status = 'pending' AND user_handle = …`,
-//!   so of two concurrent decisions, exactly one wins.
+//!   so of two concurrent decisions, exactly one wins. Member requests are decided the same
+//!   way, and a partial unique index keeps one pending request per Slack id.
 
 use std::time::Duration as StdDuration;
 
@@ -26,7 +27,11 @@ use crate::audit::{AuditEvent, AuditSink};
 use crate::context::{
     query_terms, snippet, ContextDoc, ContextIndex, Hit, ReindexReport, SearchResults,
 };
-use crate::memory::{MemoryStore, Note};
+use crate::members::{
+    Created, Decided, MemberRequest, MemberRequestStore, NewRequest, RequestStatus, MAX_PENDING,
+};
+use crate::memory::{MemoryResult, MemoryStore, Note};
+use crate::memory_repo::{MemoryRepo, MemoryRepoStore};
 use crate::session::{token_hash, Session, SessionRepo};
 use crate::store::{StoreError, StoreResult, Stores};
 use crate::vault::{CredentialStore, Provider, SealedCredential};
@@ -84,7 +89,9 @@ impl PgStore {
             sessions: s.clone(),
             approvals: s.clone(),
             audit: s.clone(),
-            credentials: s,
+            credentials: s.clone(),
+            memory_repos: s.clone(),
+            member_requests: s,
         }
     }
 
@@ -238,14 +245,16 @@ impl ContextIndex for PgStore {
 
 #[async_trait]
 impl MemoryStore for PgStore {
-    async fn read(&self, user: &str) -> StoreResult<Vec<Note>> {
+    async fn read(&self, user: &str) -> MemoryResult<Vec<Note>> {
         let rows = sqlx::query(
             "SELECT key, text, updated_at FROM memory_notes WHERE user_handle = $1 ORDER BY key",
         )
         .bind(user)
         .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
+        .await
+        .map_err(StoreError::from)?;
+        let notes = rows
+            .iter()
             .map(|r| {
                 Ok(Note {
                     key: r.try_get("key")?,
@@ -253,7 +262,8 @@ impl MemoryStore for PgStore {
                     updated_at: r.try_get("updated_at")?,
                 })
             })
-            .collect()
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok(notes)
     }
 
     async fn update(
@@ -261,8 +271,9 @@ impl MemoryStore for PgStore {
         user: &str,
         key: &str,
         text: &str,
+        _source: &str,
         now: DateTime<Utc>,
-    ) -> StoreResult<Note> {
+    ) -> MemoryResult<Note> {
         sqlx::query(
             "INSERT INTO memory_notes (user_handle, key, text, updated_at)
              VALUES ($1, $2, $3, $4)
@@ -274,7 +285,8 @@ impl MemoryStore for PgStore {
         .bind(text)
         .bind(now)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(StoreError::from)?;
         Ok(Note {
             key: key.to_string(),
             text: text.to_string(),
@@ -679,5 +691,167 @@ impl CredentialStore for PgStore {
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(sealed_from_row).collect()
+    }
+}
+
+#[async_trait]
+impl MemoryRepoStore for PgStore {
+    async fn get(&self, user: &str) -> StoreResult<Option<MemoryRepo>> {
+        let row = sqlx::query("SELECT repo, verified_at FROM memory_repos WHERE user_handle = $1")
+            .bind(user)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| {
+            Ok(MemoryRepo {
+                user: user.to_string(),
+                repo: r.try_get("repo")?,
+                verified_at: r.try_get("verified_at")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn put(&self, record: &MemoryRepo) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO memory_repos (user_handle, repo, verified_at) VALUES ($1, $2, $3)
+             ON CONFLICT (user_handle) DO UPDATE SET repo = EXCLUDED.repo,
+                 verified_at = EXCLUDED.verified_at",
+        )
+        .bind(&record.user)
+        .bind(&record.repo)
+        .bind(record.verified_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete(&self, user: &str) -> StoreResult<bool> {
+        let done = sqlx::query("DELETE FROM memory_repos WHERE user_handle = $1")
+            .bind(user)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+}
+
+fn request_from_row(r: &PgRow) -> StoreResult<MemberRequest> {
+    let status: String = r.try_get("status")?;
+    Ok(MemberRequest {
+        id: r.try_get("id")?,
+        slack_id: r.try_get("slack_id")?,
+        email: r.try_get("email")?,
+        name: r.try_get("name")?,
+        proposed_handle: r.try_get("proposed_handle")?,
+        status: RequestStatus::parse(&status).ok_or_else(|| bad_row("status", &status))?,
+        requested_at: r.try_get("requested_at")?,
+        decided_by: r.try_get("decided_by")?,
+        decided_at: r.try_get("decided_at")?,
+        handle: r.try_get("handle")?,
+        commit: r.try_get("commit_sha")?,
+        error: r.try_get("error")?,
+    })
+}
+
+const REQUEST_COLUMNS: &str = "id, slack_id, email, name, proposed_handle, status, requested_at, \
+                               decided_by, decided_at, handle, commit_sha, error";
+
+#[async_trait]
+impl MemberRequestStore for PgStore {
+    async fn create(&self, new: NewRequest<'_>, now: DateTime<Utc>) -> StoreResult<Created> {
+        if let Some(existing) = self.pending_for(new.slack_id).await? {
+            return Ok(Created::Existing(existing));
+        }
+        let pending: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM member_requests WHERE status = 'pending'")
+                .fetch_one(&self.pool)
+                .await?;
+        if pending as usize >= MAX_PENDING {
+            return Ok(Created::TooMany);
+        }
+        let request = new.into_request(now);
+        let inserted = sqlx::query(
+            "INSERT INTO member_requests
+                 (id, slack_id, email, name, proposed_handle, status, requested_at)
+             VALUES ($1, $2, $3, $4, $5, 'pending', $6)
+             ON CONFLICT (slack_id) WHERE status = 'pending' DO NOTHING",
+        )
+        .bind(&request.id)
+        .bind(&request.slack_id)
+        .bind(&request.email)
+        .bind(&request.name)
+        .bind(&request.proposed_handle)
+        .bind(request.requested_at)
+        .execute(&self.pool)
+        .await?;
+        if inserted.rows_affected() == 1 {
+            return Ok(Created::New(request));
+        }
+        // Another request for the same Slack id won the race.
+        match self.pending_for(&request.slack_id).await? {
+            Some(existing) => Ok(Created::Existing(existing)),
+            None => Err(StoreError(
+                "a member request vanished while being created".into(),
+            )),
+        }
+    }
+
+    async fn get(&self, id: &str) -> StoreResult<Option<MemberRequest>> {
+        let sql = format!("SELECT {REQUEST_COLUMNS} FROM member_requests WHERE id = $1");
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(request_from_row).transpose()
+    }
+
+    async fn pending_for(&self, slack_id: &str) -> StoreResult<Option<MemberRequest>> {
+        let sql = format!(
+            "SELECT {REQUEST_COLUMNS} FROM member_requests
+             WHERE slack_id = $1 AND status = 'pending'"
+        );
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(slack_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(request_from_row).transpose()
+    }
+
+    async fn list(&self, status: Option<RequestStatus>) -> StoreResult<Vec<MemberRequest>> {
+        let sql = format!(
+            "SELECT {REQUEST_COLUMNS} FROM member_requests
+             WHERE ($1::text IS NULL OR status = $1)
+             ORDER BY requested_at, id"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(status.map(RequestStatus::as_str))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(request_from_row).collect()
+    }
+
+    async fn decide(
+        &self,
+        id: &str,
+        decided: &Decided,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Option<MemberRequest>> {
+        let sql = format!(
+            "UPDATE member_requests
+             SET status = $2, decided_by = $3, decided_at = $4, handle = $5, commit_sha = $6,
+                 error = $7
+             WHERE id = $1 AND status = 'pending'
+             RETURNING {REQUEST_COLUMNS}"
+        );
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .bind(decided.status.as_str())
+            .bind(&decided.decided_by)
+            .bind(now)
+            .bind(&decided.handle)
+            .bind(&decided.commit)
+            .bind(&decided.error)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(request_from_row).transpose()
     }
 }

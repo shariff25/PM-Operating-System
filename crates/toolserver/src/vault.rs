@@ -1,7 +1,8 @@
 //! Per-user OAuth tokens, encrypted at rest.
 //!
 //! Every connector call acts as the signed-in PM with that PM's own token: Atlassian OAuth 2.0
-//! (3LO) for Jira and Confluence, and the PM's Slack user token. Tokens are sealed with
+//! (3LO) for Jira and Confluence, the PM's Slack user token, and a GitHub App user token for
+//! the PM's memory repo and the content-repo commits a platform owner approves. Tokens are sealed with
 //! AES-256-GCM before they reach any store. The additional authenticated data binds each
 //! ciphertext to its user, provider and field, so a sealed token copied into another
 //! user's row will not decrypt.
@@ -29,6 +30,7 @@ use crate::store::{StoreError, StoreResult};
 pub enum Provider {
     Atlassian,
     Slack,
+    Github,
 }
 
 impl Provider {
@@ -36,6 +38,7 @@ impl Provider {
         match self {
             Self::Atlassian => "atlassian",
             Self::Slack => "slack",
+            Self::Github => "github",
         }
     }
 
@@ -43,6 +46,7 @@ impl Provider {
         match s {
             "atlassian" => Some(Self::Atlassian),
             "slack" => Some(Self::Slack),
+            "github" => Some(Self::Github),
             _ => None,
         }
     }
@@ -52,6 +56,7 @@ impl Provider {
         match self {
             Self::Atlassian => "Atlassian (Jira and Confluence)",
             Self::Slack => "Slack",
+            Self::Github => "GitHub",
         }
     }
 
@@ -106,7 +111,7 @@ pub struct Credential {
     pub cloud_id: Option<String>,
     /// Atlassian site URL, such as `https://example.atlassian.net`, for links back.
     pub site_url: Option<String>,
-    /// The user's id at the provider, such as a Slack `U…` id.
+    /// The user's id at the provider: a Slack `U…` id, or a GitHub login.
     pub external_id: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
