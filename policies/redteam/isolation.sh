@@ -2,7 +2,7 @@
 # PM OS sandbox red-team: isolation between two bots' OpenShell sandboxes (D3, POL-*).
 #
 # RUN THIS ON THE SPARK. It can't run in CI: it needs a live OpenShell gateway, both bots'
-# sandboxes, and the PM OS tool server and gateway behind *.pmos.internal.
+# sandboxes, and the PM OS tool server, gateway and bot runtime behind *.pmos.internal.
 #
 #   policies/redteam/isolation.sh <bot-a> <bot-b>      e.g. isolation.sh docs pm-ana
 #
@@ -10,10 +10,11 @@
 #   - runs under the committed policy, non-root, with no_new_privs and no capabilities;
 #   - can write only its workspace, and can't write its skills or master context;
 #   - can't read bot B's files, see B's processes, or hold B's tokens;
-#   - can't use B's credential placeholders against the gateway or the tool server;
-#   - can't reach anything but toolserver.pmos.internal:8710/mcp and
-#     gateway.pmos.internal:8740, and each blocked call is logged with its destination and
-#     the policy that blocked it.
+#   - can't use B's credential placeholders against the gateway or the bot runtime;
+#   - can't reach anything but toolserver.pmos.internal:8710/mcp, gateway.pmos.internal:8740
+#     (chat) and bots.pmos.internal:8750 (the worker routes), and each blocked call is logged
+#     with its destination and the policy that blocked it.
+# It never claims a task: the runtime controls use a heartbeat on a made-up task id.
 # The checklist in checklist.md gives each check's id (RT-n), and the items to do by hand.
 #
 # What it expects from OpenShell (from its docs at github.com/NVIDIA/OpenShell, main at
@@ -54,7 +55,10 @@ CHAT_MODEL=${CHAT_MODEL:-pmos/default}
 DENIED_TOOL=${DENIED_TOOL:-jira_search}
 TOOLSERVER=http://toolserver.pmos.internal:8710
 GATEWAY=http://gateway.pmos.internal:8740
+RUNTIME=http://bots.pmos.internal:8750
 WORKSPACE=/sandbox/workspace
+# A task id that can't exist, so worker calls with a valid token get the runtime's 404.
+FAKE_TASK=tsk_00000000000000000000000000000000
 
 if [ $# -ne 2 ]; then
   echo "usage: $0 <bot-a> <bot-b>" >&2
@@ -139,17 +143,19 @@ full=$("$OPENSHELL" policy get "$SA" --full --output json 2>/dev/null | jq -c '.
 if [ -z "$base" ]; then
   fail RT-1 "couldn't read A's base policy"
 else
-  want_rules='["pmos_gateway","pmos_toolserver"]'
+  want_rules='["pmos_gateway","pmos_runtime","pmos_toolserver"]'
   got_rules=$(jq -c '.network_policies | keys' <<<"$base")
   got_full=$(jq -c '.network_policies | keys' <<<"${full:-$base}")
   hosts=$(jq -c '[.network_policies[].endpoints[] | "\(.host):\(.port)"] | sort' <<<"$base")
-  bound=$(jq -c '[.network_policies[].endpoints[].credential_binding.provider] | sort' <<<"$base")
-  want_bound=$(jq -cn --arg a "$A" '["pmos-\($a)-gateway", "pmos-\($a)-session"]')
+  # Per rule, the providers its endpoints bind (the tool server binds none in v1).
+  bound=$(jq -cS '.network_policies | map_values([.endpoints[].credential_binding.provider // empty])' <<<"$base")
+  want_bound=$(jq -cSn --arg a "$A" \
+    '{pmos_gateway: ["pmos-\($a)-gateway"], pmos_runtime: ["pmos-\($a)-worker"], pmos_toolserver: []}')
   compat=$(jq -r '.landlock.compatibility // "missing"' <<<"$base")
   if [ "$got_rules" = "$want_rules" ] && [ "$got_full" = "$want_rules" ] &&
-    [ "$hosts" = '["gateway.pmos.internal:8740","toolserver.pmos.internal:8710"]' ] &&
+    [ "$hosts" = '["bots.pmos.internal:8750","gateway.pmos.internal:8740","toolserver.pmos.internal:8710"]' ] &&
     [ "$bound" = "$want_bound" ] && [ "$compat" = hard_requirement ]; then
-    pass RT-1 "A's base and effective policies have only the two PM OS rules, bound to A's providers"
+    pass RT-1 "A's base and effective policies have only the three PM OS rules, bound to A's own providers"
   else
     fail RT-1 "A's policy differs from policies/bots/$A.yaml: rules=$got_rules effective=$got_full hosts=$hosts bound=$bound landlock=$compat"
   fi
@@ -259,22 +265,31 @@ wait "$sleeper" 2>/dev/null
 
 a_env=$(sx "$SA" env 2>/dev/null)
 b_gateway=$(sx "$SB" printenv PMOS_GATEWAY_TOKEN 2>/dev/null)
-b_session=$(sx "$SB" printenv PMOS_SESSION_TOKEN 2>/dev/null)
+b_worker=$(sx "$SB" printenv PMOS_WORKER_TOKEN 2>/dev/null)
 raw=$(grep -E '^PMOS_[A-Z_]*TOKEN=' <<<"$a_env" | grep -v '=openshell:resolve:env:' | cut -d= -f1)
 if [ -z "$raw" ]; then
   pass RT-7 "every PMOS_*TOKEN in A is an OpenShell placeholder"
 else
   fail RT-7 "A holds raw tokens in: $(tr '\n' ' ' <<<"$raw")"
 fi
-for name in PMOS_SERVICE_TOKEN PMOS_BOT_TOKEN PMOS_WORKER_TOKEN; do
+for name in PMOS_GATEWAY_TOKEN PMOS_WORKER_TOKEN; do
+  if grep -q "^$name=openshell:resolve:env:" <<<"$a_env"; then
+    pass RT-7 "A's $name is a placeholder"
+  else
+    fail RT-7 "A's $name is missing or not a placeholder: the bot can't work, or holds a raw token"
+  fi
+done
+# Service and Slack-bot tokens never; and no session provider in v1 (the per-task session
+# token comes in the claim response, in the worker's memory only).
+for name in PMOS_SERVICE_TOKEN PMOS_BOT_TOKEN PMOS_SESSION_TOKEN; do
   if grep -q "^$name=" <<<"$a_env"; then
-    fail RT-7 "A has $name, a service credential no bot sandbox may hold"
+    fail RT-7 "A has $name, which no bot sandbox may hold"
   else
     pass RT-7 "A has no $name"
   fi
 done
 leak=0
-for t in "$b_gateway" "$b_session" "${B_REAL_TOKEN:-}"; do
+for t in "$b_gateway" "$b_worker" "${B_REAL_TOKEN:-}"; do
   [ -n "$t" ] || continue
   if grep -qF -- "$t" <<<"$a_env"; then leak=1; fi
   if printf '%s\n' "$t" | sx "$SA" sh -c 'read t; grep -rlsqIF --exclude-dir=proc -- "$t" /' >/dev/null 2>&1; then leak=1; fi
@@ -288,7 +303,7 @@ fi
 # --- RT-8: B's placeholders don't work from A -------------------------------------------------
 
 a_gateway=$(sed -n 's/^PMOS_GATEWAY_TOKEN=//p' <<<"$a_env")
-a_session=$(sed -n 's/^PMOS_SESSION_TOKEN=//p' <<<"$a_env")
+a_worker=$(sed -n 's/^PMOS_WORKER_TOKEN=//p' <<<"$a_env")
 control=$(http_from "$SA" POST "$GATEWAY/v1/chat/completions" "$a_gateway" "$(chat_body)" | status_of)
 if [ "$control" = 200 ]; then
   pass RT-8 "control: A's own gateway credential works"
@@ -303,15 +318,24 @@ if [ -n "$b_gateway" ]; then
     fail RT-8 "B's gateway placeholder works from A"
   fi
 fi
-init=$(mcp_call 1 initialize '{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"redteam","version":"0"}}')
-if [ -n "$b_session" ]; then
-  got=$(http_from "$SA" POST "$TOOLSERVER/mcp" "$b_session" "$init" | status_of)
-  if [ "$got" != 200 ]; then
-    pass RT-8 "B's session placeholder is refused from A ($got)"
+# The runtime: a heartbeat on a task that can't exist. With a valid worker token the runtime
+# answers 404 (so the credential resolved), and nothing is claimed or changed.
+heartbeat="$RUNTIME/v1/worker/tasks/$FAKE_TASK/heartbeat"
+control=$(http_from "$SA" POST "$heartbeat" "$a_worker" '{}' | status_of)
+if [ "$control" = 404 ]; then
+  pass RT-8 "control: A's own worker credential reaches the runtime (404 for a made-up task)"
+else
+  fail RT-8 "control: A's own worker heartbeat returned ${control:-nothing}, not 404; the B check below is inconclusive"
+fi
+if [ -n "$b_worker" ]; then
+  got=$(http_from "$SA" POST "$heartbeat" "$b_worker" '{}' | status_of)
+  if [ "$got" != 404 ] && [ "$got" != 200 ]; then
+    pass RT-8 "B's worker placeholder is refused from A ($got)"
   else
-    fail RT-8 "B's session placeholder opens an MCP session from A"
+    fail RT-8 "B's worker placeholder is accepted by the runtime from A ($got)"
   fi
 fi
+init=$(mcp_call 1 initialize '{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"redteam","version":"0"}}')
 
 # --- RT-9: blocked calls are blocked, and logged with destination and policy ------------------
 
@@ -332,10 +356,17 @@ expect_denied RT-9 https://api.atlassian.com/me GET "" "" "direct Atlassian (Jir
 expect_denied RT-9 https://support.fortanix.com/ GET "" "" "the support docs site from A"
 expect_denied RT-9 http://docs.pmos.internal:8730/mcp POST "" "$init" "the docs server, bypassing the tool server"
 expect_denied RT-9 http://169.254.169.254/latest/meta-data/ GET "" "" "the cloud metadata address"
-expect_denied RT-9 "$TOOLSERVER/internal/call" POST "$a_session" '{"tool":"docs.search","args":{}}' "the tool server's /internal routes"
+expect_denied RT-9 "$TOOLSERVER/internal/call" POST "" '{"tool":"docs.search","args":{}}' "the tool server's /internal routes"
 expect_denied RT-9 "$GATEWAY/v1/models" GET "$a_gateway" "" "a gateway route other than chat"
+expect_denied RT-9 "$RUNTIME/v1/tasks" GET "$a_worker" "" "the runtime's task list"
+expect_denied RT-9 "$RUNTIME/v1/routines" GET "$a_worker" "" "the runtime's routines"
+expect_denied RT-9 "$RUNTIME/v1/notifications" GET "$a_worker" "" "the runtime's notification feed"
+expect_denied RT-9 "$RUNTIME/v1/worker/tasks/$FAKE_TASK/x/heartbeat" POST "$a_worker" '{}' "a worker route with an extra path segment"
+expect_denied RT-9 "$RUNTIME/v1/worker/claim" GET "$a_worker" "" "GET on the claim route"
+# No session token is needed: OpenShell refuses the tool name before the request reaches the
+# tool server.
 call=$(mcp_call 2 tools/call "$(jq -cn --arg t "$DENIED_TOOL" '{name: $t, arguments: {}}')")
-expect_denied RT-9 "$TOOLSERVER/mcp" POST "$a_session" "$call" "tools/call $DENIED_TOOL, outside A's role"
+expect_denied RT-9 "$TOOLSERVER/mcp" POST "" "$call" "tools/call $DENIED_TOOL, outside A's role"
 if sx "$SA" sh -c 'command -v curl' >/dev/null 2>&1; then
   if sx "$SA" curl -s -o /dev/null -m 10 "$GATEWAY/v1/chat/completions" >/dev/null 2>&1; then
     fail RT-9 "curl (not the worker binary) reached the gateway"
@@ -360,6 +391,8 @@ check_log RT-10 'slack\.com(:443)?' "slack.com"
 check_log RT-10 'api\.atlassian\.com(:443)?' "api.atlassian.com"
 check_log RT-10 'docs\.pmos\.internal:8730' "docs.pmos.internal:8730"
 check_log RT-10 'toolserver\.pmos\.internal:8710/internal' "the tool server's /internal route"
+check_log RT-10 'bots\.pmos\.internal:8750/v1/tasks' "the runtime's task list"
+check_log RT-10 'bots\.pmos\.internal:8750/v1/routines' "the runtime's routines"
 check_log RT-10 'toolserver\.pmos\.internal:8710/mcp.*policy:pmos_toolserver|policy:pmos_toolserver.*toolserver\.pmos\.internal' "the out-of-role tool call, naming rule pmos_toolserver"
 note "The blocking policy is $SA's active revision above; 'policy:-' means no rule matched (default deny)."
 

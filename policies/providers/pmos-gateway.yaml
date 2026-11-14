@@ -7,7 +7,7 @@
 category: inference
 credentials:
   - auth_style: bearer
-    description: "The bot's own entry in the gateway's PMOS_GATEWAY_TOKENS"
+    description: "The bot's own entry in the gateway's PMOS_GATEWAY_TOKENS (bot-<bot>=...)"
     env_vars:
       - PMOS_GATEWAY_TOKEN
     name: gateway_token

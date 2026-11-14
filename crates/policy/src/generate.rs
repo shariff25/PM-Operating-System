@@ -17,9 +17,8 @@ use crate::openshell::{
 };
 use crate::spec::{ProviderAttachment, SandboxSpec, Upload};
 use crate::{
-    provider_name, sandbox_name, yaml, Service, CONTENT_MOUNT, GATEWAY_ROUTES, GENERATED_MARKER,
-    MCP_VERSIONS, RUN_AS, SYSTEM_READ_ONLY, SYSTEM_READ_WRITE, TOOLSERVER_MCP_PATH, WORKER_BINARY,
-    WORKSPACE,
+    provider_name, sandbox_name, yaml, Service, CONTENT_MOUNT, GENERATED_MARKER, MCP_VERSIONS,
+    RUN_AS, SYSTEM_READ_ONLY, SYSTEM_READ_WRITE, TOOLSERVER_MCP_PATH, WORKER_BINARY, WORKSPACE,
 };
 
 /// Everything about one bot that its sandbox policy depends on.
@@ -162,11 +161,24 @@ impl BotContext {
             port: Some(service.port()),
             protocol: Some(service.protocol().into()),
             enforcement: Some("enforce".into()),
-            credential_binding: Some(CredentialBinding {
-                provider: provider_name(&self.bot, service),
-            }),
+            credential_binding: provider_name(&self.bot, service)
+                .map(|provider| CredentialBinding { provider }),
             ..Endpoint::default()
         };
+        if let Some(routes) = service.routes() {
+            return Endpoint {
+                rules: routes
+                    .iter()
+                    .map(|(method, path)| AllowRule {
+                        allow: Allow {
+                            path: Some(path.to_string()),
+                            ..Allow::method(method)
+                        },
+                    })
+                    .collect(),
+                ..base
+            };
+        }
         match service {
             Service::ToolServer => {
                 let mut rules: Vec<AllowRule> =
@@ -196,29 +208,18 @@ impl BotContext {
                     ..base
                 }
             }
-            Service::Gateway => Endpoint {
-                rules: GATEWAY_ROUTES
-                    .iter()
-                    .map(|(method, path)| AllowRule {
-                        allow: Allow {
-                            path: Some(path.to_string()),
-                            ..Allow::method(method)
-                        },
-                    })
-                    .collect(),
-                ..base
-            },
+            // REST services returned above.
+            Service::Gateway | Service::Runtime => base,
         }
     }
 
     /// The bot's launch spec.
     pub fn spec(&self) -> SandboxSpec {
-        let mut providers: Vec<ProviderAttachment> = Service::ALL
-            .into_iter()
-            .map(|s| ProviderAttachment {
-                name: provider_name(&self.bot, s),
-                profile: s.profile().into(),
-                credential: s.credential_env().into(),
+        let mut providers: Vec<ProviderAttachment> = Service::credentialed()
+            .map(|(_, c)| ProviderAttachment {
+                name: format!("pmos-{}-{}", self.bot, c.suffix),
+                profile: c.profile.into(),
+                credential: c.env.into(),
             })
             .collect();
         providers.sort();
@@ -273,39 +274,54 @@ fn render<T: serde::Serialize>(value: &T) -> String {
     yaml::to_yaml(value).expect("policy types serialize to JSON")
 }
 
-/// The two provider profiles every bot's providers are created from. Both are endpointless,
-/// so a credential resolves only where a policy binds that exact provider instance.
+/// The provider profiles every bot's providers are created from, one per credentialed
+/// service. All are endpointless, so a credential resolves only where a policy binds that exact
+/// provider instance.
 pub fn provider_profiles() -> BTreeMap<String, String> {
-    let gateway = json!({
-        "id": Service::Gateway.profile(),
-        "display_name": "PM OS gateway",
-        "description": "One bot's client token for the PM OS model gateway. Endpointless: each bot's policy binds its own instance to gateway.pmos.internal:8740.",
-        "category": "inference",
-        "inference_capable": true,
-        "credentials": [{
-            "name": "gateway_token",
-            "description": "The bot's own entry in the gateway's PMOS_GATEWAY_TOKENS",
-            "env_vars": [Service::Gateway.credential_env()],
-            "required": true,
-            "auth_style": "bearer",
-        }],
-    });
-    let session = json!({
-        "id": Service::ToolServer.profile(),
-        "display_name": "PM OS tool-server session",
-        "description": "One bot's tool-server session token. Endpointless: each bot's policy binds its own instance to toolserver.pmos.internal:8710/mcp.",
-        "category": "other",
-        "inference_capable": false,
-        "credentials": [{
-            "name": "session_token",
-            "description": "The session for the bot's current task; the bot runtime rotates the value per task with `openshell provider update`",
-            "env_vars": [Service::ToolServer.credential_env()],
-            "required": true,
-            "auth_style": "bearer",
-            "stable_placeholder": true,
-        }],
-    });
-    [gateway, session]
+    let profile = |service: Service| {
+        let c = service
+            .credential()
+            .expect("profiles are made only for credentialed services");
+        let (display_name, description, category, inference_capable, name, what) = match service {
+            Service::Gateway => (
+                "PM OS gateway",
+                "One bot's client token for the PM OS model gateway.",
+                "inference",
+                true,
+                "gateway_token",
+                "The bot's own entry in the gateway's PMOS_GATEWAY_TOKENS (bot-<bot>=...)",
+            ),
+            _ => (
+                "PM OS bot runtime worker",
+                "One bot's worker client token for the PM OS bot runtime; it may claim only that bot's tasks.",
+                "other",
+                false,
+                "worker_token",
+                "The bot's own entry in the runtime's PMOS_BOTS_TOKENS (worker-<bot>=...)",
+            ),
+        };
+        json!({
+            "id": c.profile,
+            "display_name": display_name,
+            "description": format!(
+                "{description} Endpointless: each bot's policy binds its own instance to {}:{}.",
+                service.host(),
+                service.port()
+            ),
+            "category": category,
+            "inference_capable": inference_capable,
+            "credentials": [{
+                "name": name,
+                "description": what,
+                "env_vars": [c.env],
+                "required": true,
+                "auth_style": "bearer",
+            }],
+        })
+    };
+    Service::credentialed()
+        .map(|(s, _)| profile(s))
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|profile| {
             let id = profile["id"].as_str().unwrap_or_default().to_string();
@@ -467,7 +483,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_policy_allows_only_the_two_services() {
+    fn the_policy_allows_only_the_three_services() {
         let p = docs().policy();
         let dests: Vec<(String, u16)> = p
             .network_policies
@@ -479,6 +495,7 @@ pub(crate) mod tests {
             dests,
             vec![
                 ("gateway.pmos.internal".to_string(), 8740),
+                ("bots.pmos.internal".to_string(), 8750),
                 ("toolserver.pmos.internal".to_string(), 8710)
             ]
         );
@@ -523,23 +540,33 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_gateway_allows_chat_only() {
+    fn the_gateway_allows_chat_only_and_the_runtime_worker_routes_only() {
         let p = docs().policy();
-        let gw = &p.network_policies["pmos_gateway"].endpoints[0];
-        assert_eq!(gw.protocol.as_deref(), Some("rest"));
-        let routes: Vec<_> = gw
-            .rules
-            .iter()
-            .map(|r| {
-                (
-                    r.allow.method.clone().unwrap(),
-                    r.allow.path.clone().unwrap(),
-                )
-            })
-            .collect();
+        let routes = |rule: &str| -> Vec<String> {
+            let e = &p.network_policies[rule].endpoints[0];
+            assert_eq!(e.protocol.as_deref(), Some("rest"));
+            e.rules
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{} {}",
+                        r.allow.method.as_deref().unwrap(),
+                        r.allow.path.as_deref().unwrap()
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(routes("pmos_gateway"), ["POST /v1/chat/completions"]);
         assert_eq!(
-            routes,
-            vec![("POST".to_string(), "/v1/chat/completions".to_string())]
+            routes("pmos_runtime"),
+            [
+                "POST /v1/worker/claim",
+                "POST /v1/worker/tasks/*/complete",
+                "POST /v1/worker/tasks/*/events",
+                "POST /v1/worker/tasks/*/fail",
+                "POST /v1/worker/tasks/*/heartbeat",
+                "POST /v1/worker/tasks/*/trace",
+            ]
         );
     }
 
@@ -588,16 +615,25 @@ pub(crate) mod tests {
     #[test]
     fn credentials_are_the_bots_own_providers() {
         let p = docs().policy();
-        let bound: Vec<_> = p
-            .network_policies
-            .values()
-            .flat_map(|r| &r.endpoints)
-            .map(|e| e.credential_binding.as_ref().unwrap().provider.clone())
-            .collect();
-        assert_eq!(bound, ["pmos-docs-gateway", "pmos-docs-session"]);
+        let bound = |rule: &str| {
+            p.network_policies[rule].endpoints[0]
+                .credential_binding
+                .as_ref()
+                .map(|b| b.provider.clone())
+        };
+        assert_eq!(bound("pmos_gateway").as_deref(), Some("pmos-docs-gateway"));
+        assert_eq!(bound("pmos_runtime").as_deref(), Some("pmos-docs-worker"));
+        // The session token is per task and comes in the claim response: no provider.
+        assert_eq!(bound("pmos_toolserver"), None);
         let spec = docs().spec();
         let names: Vec<_> = spec.providers.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["pmos-docs-gateway", "pmos-docs-session"]);
+        assert_eq!(names, ["pmos-docs-gateway", "pmos-docs-worker"]);
+        let envs: Vec<_> = spec
+            .providers
+            .iter()
+            .map(|p| p.credential.as_str())
+            .collect();
+        assert_eq!(envs, ["PMOS_GATEWAY_TOKEN", "PMOS_WORKER_TOKEN"]);
         // Two bots never share a provider.
         let other = pm_ana().spec();
         assert!(other
@@ -642,16 +678,16 @@ pub(crate) mod tests {
         let profiles = provider_profiles();
         assert_eq!(
             profiles.keys().collect::<Vec<_>>(),
-            ["providers/pmos-gateway.yaml", "providers/pmos-session.yaml"]
+            ["providers/pmos-gateway.yaml", "providers/pmos-worker.yaml"]
         );
         for text in profiles.values() {
             let v: serde_json::Value = serde_norway::from_str(text).unwrap();
             assert!(v.get("endpoints").is_none() && v.get("binaries").is_none());
             assert_eq!(v["credentials"][0]["auth_style"], "bearer");
         }
-        let session: serde_json::Value =
-            serde_norway::from_str(&profiles["providers/pmos-session.yaml"]).unwrap();
-        assert_eq!(session["credentials"][0]["stable_placeholder"], true);
+        let worker: serde_json::Value =
+            serde_norway::from_str(&profiles["providers/pmos-worker.yaml"]).unwrap();
+        assert_eq!(worker["credentials"][0]["env_vars"][0], "PMOS_WORKER_TOKEN");
     }
 
     #[test]
