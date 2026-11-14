@@ -15,9 +15,12 @@ pub mod connectors;
 pub mod context;
 pub mod mcp;
 pub mod memory;
+pub mod pg;
 pub mod schemas;
 pub mod service;
 pub mod session;
+pub mod store;
 
 pub use app::{router, AppConfig};
 pub use service::ToolService;
+pub use store::Stores;

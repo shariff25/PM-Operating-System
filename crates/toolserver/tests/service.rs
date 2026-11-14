@@ -17,41 +17,39 @@ fn outcomes(f: &common::Fixture) -> Vec<(String, Outcome)> {
         .collect()
 }
 
-#[test]
-fn sessions_validate_user_and_skill() {
+#[tokio::test]
+async fn sessions_validate_user_and_skill() {
     let f = fixture();
     assert_eq!(
-        f.svc.create_session("Ana", "ask", "r1", None, now()),
+        f.svc.create_session("Ana", "ask", "r1", None, now()).await,
         Err(SessionError::InvalidUser("Ana".into()))
     );
     assert_eq!(
-        f.svc.create_session("ana", "nope", "r1", None, now()),
+        f.svc.create_session("ana", "nope", "r1", None, now()).await,
         Err(SessionError::UnknownSkill("nope".into()))
     );
     assert_eq!(
-        f.svc.create_session("ana", "ask", "", None, now()),
+        f.svc.create_session("ana", "ask", "", None, now()).await,
         Err(SessionError::InvalidRun)
     );
     let s = f
         .svc
         .create_session("ana", "ask", "r1", Some(Duration::minutes(5)), now())
+        .await
         .unwrap();
-    assert!(f
-        .svc
-        .session(&s.token, now() + Duration::minutes(4))
-        .is_some());
-    assert!(f
-        .svc
-        .session(&s.token, now() + Duration::minutes(5))
-        .is_none());
+    let soon = now() + Duration::minutes(4);
+    let expired = now() + Duration::minutes(5);
+    assert!(f.svc.session(&s.token, soon).await.unwrap().is_some());
+    assert!(f.svc.session(&s.token, expired).await.unwrap().is_none());
 }
 
-#[test]
-fn lists_only_declared_tools() {
+#[tokio::test]
+async fn lists_only_declared_tools() {
     let f = fixture();
     let s = f
         .svc
         .create_session("ana", "prd-draft", "r1", None, now())
+        .await
         .unwrap();
     let names: Vec<_> = f
         .svc
@@ -79,6 +77,7 @@ async fn undeclared_and_unknown_tools_are_denied_and_audited() {
     let s = f
         .svc
         .create_session("ana", "ask", "r1", None, now())
+        .await
         .unwrap();
     let err = f
         .svc
@@ -113,6 +112,7 @@ async fn arguments_are_checked_against_the_schema() {
     let s = f
         .svc
         .create_session("ana", "ask", "r1", None, now())
+        .await
         .unwrap();
     let err = f
         .svc
@@ -139,10 +139,12 @@ async fn context_respects_the_skill_data_class() {
     let internal = f
         .svc
         .create_session("ana", "internal-brief", "r1", None, now())
+        .await
         .unwrap();
     let restricted = f
         .svc
         .create_session("ana", "ask", "r2", None, now())
+        .await
         .unwrap();
 
     // Search: the internal skill never sees the Restricted file.
@@ -220,6 +222,7 @@ async fn context_flags_stale_files() {
     let s = f
         .svc
         .create_session("ana", "ask", "r1", None, now())
+        .await
         .unwrap();
     let doc = f
         .svc
@@ -241,6 +244,7 @@ async fn context_read_rejects_paths_outside_the_library() {
     let s = f
         .svc
         .create_session("ana", "ask", "r1", None, now())
+        .await
         .unwrap();
     for path in [
         "context/../tools.yaml",
@@ -274,6 +278,7 @@ async fn connector_results_are_wrapped_as_untrusted() {
     let s = f
         .svc
         .create_session("ana", "ask", "r1", None, now())
+        .await
         .unwrap();
     let res = f
         .svc
@@ -304,6 +309,7 @@ async fn writes_without_a_grant_wait_for_approval() {
     let s = f
         .svc
         .create_session("ana", "prd-draft", "r1", None, now())
+        .await
         .unwrap();
     let res = f
         .svc
@@ -313,7 +319,7 @@ async fn writes_without_a_grant_wait_for_approval() {
     assert_eq!(res["status"], "pending_approval");
     assert!(f.confluence.writes().is_empty());
     let id = res["approval_id"].as_str().unwrap();
-    let items = f.svc.approvals("ana", Some(Status::Pending));
+    let items = f.svc.approvals("ana", Some(Status::Pending)).await.unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].id, id);
     assert_eq!(items[0].tool, "confluence.create_draft");
@@ -328,9 +334,11 @@ async fn a_grant_runs_exactly_the_approved_call_once() {
     let s = f
         .svc
         .create_session("ana", "prd-draft", "r1", None, now())
+        .await
         .unwrap();
     f.svc
         .grant(&s, "confluence_create_draft", &draft(), now())
+        .await
         .unwrap();
 
     // Different arguments: no match, so it queues.
@@ -383,13 +391,16 @@ async fn grants_belong_to_their_session_and_expire() {
     let a = f
         .svc
         .create_session("ana", "prd-draft", "r1", None, now())
+        .await
         .unwrap();
     let b = f
         .svc
         .create_session("ana", "prd-draft", "r2", None, now())
+        .await
         .unwrap();
     f.svc
         .grant(&a, "confluence_create_draft", &draft(), now())
+        .await
         .unwrap();
     let res = f
         .svc
@@ -410,19 +421,24 @@ async fn grants_belong_to_their_session_and_expire() {
     assert!(f.confluence.writes().is_empty());
 }
 
-#[test]
-fn grants_only_for_declared_write_tools() {
+#[tokio::test]
+async fn grants_only_for_declared_write_tools() {
     let f = fixture();
     let s = f
         .svc
         .create_session("ana", "prd-draft", "r1", None, now())
+        .await
         .unwrap();
     assert!(matches!(
-        f.svc.grant(&s, "jira_search", &json!({"jql": "x"}), now()),
+        f.svc
+            .grant(&s, "jira_search", &json!({"jql": "x"}), now())
+            .await,
         Err(ToolError::InvalidArgs(_))
     ));
     assert!(matches!(
-        f.svc.grant(&s, "slack_send_message", &json!({}), now()),
+        f.svc
+            .grant(&s, "slack_send_message", &json!({}), now())
+            .await,
         Err(ToolError::NotAllowed(_))
     ));
 }
@@ -431,6 +447,7 @@ async fn pending_issue(f: &common::Fixture) -> String {
     let s = f
         .svc
         .create_session("ana", "meeting-notes", "r1", None, now())
+        .await
         .unwrap();
     let res = f
         .svc
@@ -508,10 +525,12 @@ async fn memory_is_per_user() {
     let ana = f
         .svc
         .create_session("ana", "internal-brief", "r1", None, now())
+        .await
         .unwrap();
     let bo = f
         .svc
         .create_session("bo", "internal-brief", "r2", None, now())
+        .await
         .unwrap();
     f.svc
         .call(
@@ -548,12 +567,13 @@ async fn memory_is_per_user() {
     assert_eq!(theirs["notes"], json!([]));
 
     // Memory writes stay inside PM OS, so they need no approval.
-    assert!(f.svc.approvals("ana", None).is_empty());
+    assert!(f.svc.approvals("ana", None).await.unwrap().is_empty());
 
     // A skill that didn't declare memory tools can't use them.
     let ask = f
         .svc
         .create_session("ana", "ask", "r3", None, now())
+        .await
         .unwrap();
     let err = f
         .svc

@@ -1,11 +1,14 @@
-//! Per-user memory (MEM-1). Each user reads and writes only their own notes. The Postgres
-//! store replaces [`InMemoryStore`] in 0c-2 behind the same trait.
+//! Per-user memory (MEM-1). Each user reads and writes only their own notes, in memory
+//! ([`InMemoryStore`]) or in Postgres (`pg.rs`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+
+use crate::store::StoreResult;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Note {
@@ -14,9 +17,18 @@ pub struct Note {
     pub updated_at: DateTime<Utc>,
 }
 
+#[async_trait]
 pub trait MemoryStore: Send + Sync {
-    fn read(&self, user: &str) -> Vec<Note>;
-    fn update(&self, user: &str, key: &str, text: &str, now: DateTime<Utc>) -> Note;
+    /// The user's notes, by key.
+    async fn read(&self, user: &str) -> StoreResult<Vec<Note>>;
+    /// Create or replace one note.
+    async fn update(
+        &self,
+        user: &str,
+        key: &str,
+        text: &str,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Note>;
 }
 
 #[derive(Default)]
@@ -24,17 +36,25 @@ pub struct InMemoryStore {
     notes: Mutex<HashMap<String, BTreeMap<String, Note>>>,
 }
 
+#[async_trait]
 impl MemoryStore for InMemoryStore {
-    fn read(&self, user: &str) -> Vec<Note> {
-        self.notes
+    async fn read(&self, user: &str) -> StoreResult<Vec<Note>> {
+        Ok(self
+            .notes
             .lock()
             .expect("memory lock")
             .get(user)
             .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
-    fn update(&self, user: &str, key: &str, text: &str, now: DateTime<Utc>) -> Note {
+    async fn update(
+        &self,
+        user: &str,
+        key: &str,
+        text: &str,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Note> {
         let note = Note {
             key: key.to_string(),
             text: text.to_string(),
@@ -46,7 +66,7 @@ impl MemoryStore for InMemoryStore {
             .entry(user.to_string())
             .or_default()
             .insert(key.to_string(), note.clone());
-        note
+        Ok(note)
     }
 }
 
@@ -63,17 +83,17 @@ pub fn valid_key(key: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn users_see_only_their_notes() {
+    #[tokio::test]
+    async fn users_see_only_their_notes() {
         let store = InMemoryStore::default();
         let now: DateTime<Utc> = "2026-11-14T10:00:00Z".parse().unwrap();
-        store.update("ana", "areas", "CCM", now);
-        store.update("ana", "areas", "CCM, DSM", now);
-        store.update("bo", "style", "short", now);
-        let ana = store.read("ana");
+        store.update("ana", "areas", "CCM", now).await.unwrap();
+        store.update("ana", "areas", "CCM, DSM", now).await.unwrap();
+        store.update("bo", "style", "short", now).await.unwrap();
+        let ana = store.read("ana").await.unwrap();
         assert_eq!(ana.len(), 1);
         assert_eq!(ana[0].text, "CCM, DSM");
-        assert!(store.read("cy").is_empty());
+        assert!(store.read("cy").await.unwrap().is_empty());
     }
 
     #[test]

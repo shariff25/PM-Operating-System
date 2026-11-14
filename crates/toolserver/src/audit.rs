@@ -9,8 +9,11 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+
+use crate::store::{StoreError, StoreResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,8 +55,10 @@ pub struct AuditEvent {
     pub detail: Option<String>,
 }
 
+#[async_trait]
 pub trait AuditSink: Send + Sync {
-    fn record(&self, event: AuditEvent);
+    /// Store one event. An error means the event was not recorded; callers log it loudly.
+    async fn record(&self, event: AuditEvent) -> StoreResult<()>;
 }
 
 /// Keeps events in memory. Used in tests and when no log file is configured.
@@ -68,9 +73,28 @@ impl MemoryAudit {
     }
 }
 
+#[async_trait]
 impl AuditSink for MemoryAudit {
-    fn record(&self, event: AuditEvent) {
+    async fn record(&self, event: AuditEvent) -> StoreResult<()> {
         self.events.lock().expect("audit lock").push(event);
+        Ok(())
+    }
+}
+
+/// Records every event in several sinks, such as Postgres plus a JSON-lines file that is
+/// shipped off-box. Fails if any sink fails, after trying them all.
+pub struct TeeAudit(pub Vec<std::sync::Arc<dyn AuditSink>>);
+
+#[async_trait]
+impl AuditSink for TeeAudit {
+    async fn record(&self, event: AuditEvent) -> StoreResult<()> {
+        let mut first_error = None;
+        for sink in &self.0 {
+            if let Err(e) = sink.record(event.clone()).await {
+                first_error.get_or_insert(e);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -88,20 +112,14 @@ impl JsonlAudit {
     }
 }
 
+#[async_trait]
 impl AuditSink for JsonlAudit {
-    fn record(&self, event: AuditEvent) {
-        let line = match serde_json::to_string(&event) {
-            Ok(line) => line,
-            Err(e) => {
-                tracing::error!(error = %e, "cannot serialize audit event");
-                return;
-            }
-        };
+    async fn record(&self, event: AuditEvent) -> StoreResult<()> {
+        let line = serde_json::to_string(&event).map_err(|e| StoreError(e.to_string()))?;
         let mut file = self.file.lock().expect("audit lock");
-        if let Err(e) = writeln!(file, "{line}").and_then(|_| file.flush()) {
-            // An audit write that fails must be loud: the run log is a control.
-            tracing::error!(error = %e, "cannot write audit event");
-        }
+        writeln!(file, "{line}")
+            .and_then(|_| file.flush())
+            .map_err(|e| StoreError(e.to_string()))
     }
 }
 
@@ -124,13 +142,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn jsonl_appends_one_line_per_event() {
+    struct Failing;
+
+    #[async_trait]
+    impl AuditSink for Failing {
+        async fn record(&self, _event: AuditEvent) -> StoreResult<()> {
+            Err(StoreError("disk full".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tee_writes_every_sink_and_reports_failure() {
+        let a = std::sync::Arc::new(MemoryAudit::default());
+        let b = std::sync::Arc::new(MemoryAudit::default());
+        let tee = TeeAudit(vec![a.clone(), std::sync::Arc::new(Failing), b.clone()]);
+        let err = tee.record(event()).await.unwrap_err();
+        assert_eq!(err, StoreError("disk full".into()));
+        assert_eq!(a.events().len(), 1);
+        assert_eq!(
+            b.events().len(),
+            1,
+            "a failing sink doesn't stop the others"
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_appends_one_line_per_event() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let sink = JsonlAudit::open(&path).unwrap();
-        sink.record(event());
-        sink.record(event());
+        sink.record(event()).await.unwrap();
+        sink.record(event()).await.unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<_> = text.lines().collect();
         assert_eq!(lines.len(), 2);
