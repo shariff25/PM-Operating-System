@@ -5,6 +5,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use pmos_contract::text::{snippet, terms};
 use serde::Serialize;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
@@ -54,6 +55,15 @@ pub trait DocsStore: Send + Sync {
         limit: usize,
     ) -> StoreResult<Vec<Hit>>;
     async fn products(&self) -> StoreResult<Vec<ProductCount>>;
+    /// Record a finished sync run, successful or not, with its report.
+    async fn record_sync(
+        &self,
+        finished_at: DateTime<Utc>,
+        ok: bool,
+        report: &serde_json::Value,
+    ) -> StoreResult<()>;
+    /// When the last successful sync finished, across restarts.
+    async fn last_success(&self) -> StoreResult<Option<DateTime<Utc>>>;
 }
 
 // ----- memory -----------------------------------------------------------------------------
@@ -61,6 +71,7 @@ pub trait DocsStore: Send + Sync {
 #[derive(Default)]
 pub struct MemoryStore {
     pages: RwLock<BTreeMap<String, DocPage>>,
+    last_success: RwLock<Option<DateTime<Utc>>>,
 }
 
 #[async_trait]
@@ -169,11 +180,25 @@ impl DocsStore for MemoryStore {
             .map(|(product, pages)| ProductCount { product, pages })
             .collect())
     }
+
+    async fn record_sync(
+        &self,
+        finished_at: DateTime<Utc>,
+        ok: bool,
+        _report: &serde_json::Value,
+    ) -> StoreResult<()> {
+        if ok {
+            *self.last_success.write().expect("docs lock") = Some(finished_at);
+        }
+        Ok(())
+    }
+
+    async fn last_success(&self) -> StoreResult<Option<DateTime<Utc>>> {
+        Ok(*self.last_success.read().expect("docs lock"))
+    }
 }
 
 // ----- Postgres ---------------------------------------------------------------------------
-
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Clone)]
 pub struct PgStore {
@@ -199,7 +224,11 @@ impl PgStore {
     }
 
     pub async fn migrate(&self) -> StoreResult<()> {
-        MIGRATOR
+        let mut migrator = sqlx::migrate!("./migrations");
+        // Its own bookkeeping table, so sharing a database with the tool server (whose
+        // migrations use the default `_sqlx_migrations`) can't clash.
+        migrator.dangerous_set_table_name("_pmos_docs_migrations");
+        migrator
             .run(&self.pool)
             .await
             .map_err(|e| StoreError(e.to_string()))
@@ -340,5 +369,35 @@ impl DocsStore for PgStore {
                 })
             })
             .collect()
+    }
+
+    async fn record_sync(
+        &self,
+        finished_at: DateTime<Utc>,
+        ok: bool,
+        report: &serde_json::Value,
+    ) -> StoreResult<()> {
+        sqlx::query("INSERT INTO docs_syncs (finished_at, ok, report) VALUES ($1, $2, $3)")
+            .bind(finished_at)
+            .bind(ok)
+            .bind(report)
+            .execute(&self.pool)
+            .await?;
+        // Keep a few weeks of history, not forever.
+        sqlx::query(
+            "DELETE FROM docs_syncs WHERE id NOT IN \
+             (SELECT id FROM docs_syncs ORDER BY id DESC LIMIT 100)",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn last_success(&self) -> StoreResult<Option<DateTime<Utc>>> {
+        Ok(
+            sqlx::query_scalar("SELECT max(finished_at) FROM docs_syncs WHERE ok")
+                .fetch_one(&self.pool)
+                .await?,
+        )
     }
 }

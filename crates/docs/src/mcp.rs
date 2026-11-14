@@ -6,9 +6,8 @@
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
-    ToolAnnotations,
+    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
@@ -90,19 +89,19 @@ impl DocsMcp {
         ))
     }
 
-    pub async fn call(&self, name: &str, args: &Map<String, Value>) -> Result<Value, String> {
+    pub async fn call(&self, name: &str, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
         let allowed: &[&str] = match name {
             "search_docs" => &["query", "product", "limit"],
             "get_doc" => &["url"],
             "list_products" => &[],
-            other => return Err(format!("unknown tool `{other}`")),
+            other => return Err(ToolFailure::bad_args(format!("unknown tool `{other}`"))),
         };
         if let Some(extra) = args.keys().find(|k| !allowed.contains(&k.as_str())) {
-            return Err(format!("unknown argument `{extra}`"));
+            return Err(ToolFailure::bad_args(format!("unknown argument `{extra}`")));
         }
         let storage = |e: crate::store::StoreError| {
             tracing::error!(error = %e, "docs storage error");
-            "the docs index is unavailable; try again shortly".to_string()
+            ToolFailure::unavailable("the docs index is unavailable; try again shortly")
         };
         match name {
             "search_docs" => {
@@ -117,10 +116,10 @@ impl DocsMcp {
                         Some(p.as_str())
                     }
                     Some(_) => {
-                        return Err(format!(
+                        return Err(ToolFailure::bad_args(format!(
                             "`product` must be one of {}",
                             Self::products().join(", ")
-                        ))
+                        )))
                     }
                 };
                 let limit = match args.get("limit") {
@@ -161,7 +160,9 @@ impl DocsMcp {
                     .get(&url)
                     .await
                     .map_err(storage)?
-                    .ok_or("that page isn't in the index; search for it first")?;
+                    .ok_or_else(|| {
+                        ToolFailure::not_found("that page isn't in the index; search for it first")
+                    })?;
                 let truncated = page.body.chars().count() > MAX_DOC_CHARS;
                 let markdown: String = page.body.chars().take(MAX_DOC_CHARS).collect();
                 Ok(json!({
@@ -180,6 +181,46 @@ impl DocsMcp {
                 Ok(json!({ "products": products }))
             }
         }
+    }
+}
+
+/// Why a tool call failed: `code` is one of `bad_args`, `not_found` or `unavailable`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolFailure {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl ToolFailure {
+    pub fn bad_args(message: impl Into<String>) -> Self {
+        Self {
+            code: "bad_args",
+            message: message.into(),
+        }
+    }
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: "not_found",
+            message: message.into(),
+        }
+    }
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: "unavailable",
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for ToolFailure {
+    fn from(message: String) -> Self {
+        Self::bad_args(message)
+    }
+}
+
+impl From<&str> for ToolFailure {
+    fn from(message: &str) -> Self {
+        Self::bad_args(message)
     }
 }
 
@@ -209,7 +250,11 @@ impl ServerHandler for DocsMcp {
         let args = request.arguments.unwrap_or_default();
         let result = match self.call(&request.name, &args).await {
             Ok(value) => CallToolResult::structured(value),
-            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+            // A machine-readable code, so the tool server needn't parse the wording.
+            Err(failure) => CallToolResult::structured_error(json!({
+                "code": failure.code,
+                "message": failure.message,
+            })),
         };
         Ok(result.into())
     }

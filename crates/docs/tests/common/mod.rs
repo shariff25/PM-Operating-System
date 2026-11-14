@@ -33,6 +33,12 @@ pub struct Portal {
     pub conditional: Mutex<HashMap<String, Vec<String>>>,
     /// Answer 429 (`Retry-After: 1`) this many more times, by path.
     pub throttle: Mutex<HashMap<String, usize>>,
+    /// Serve these paths with this `Content-Type` instead.
+    pub content_types: Mutex<HashMap<String, String>>,
+    /// Answer these paths with a 302 to this location.
+    pub redirects: Mutex<HashMap<String, String>>,
+    /// Stream this many bytes for these paths, with no `Content-Length`.
+    pub streamed: Mutex<HashMap<String, usize>>,
 }
 
 impl Portal {
@@ -100,6 +106,15 @@ async fn handle(State(p): State<Arc<Portal>>, uri: Uri, headers: HeaderMap) -> R
             .or_default()
             .push(v.to_string());
     }
+    if let Some(to) = p.redirects.lock().unwrap().get(&path).cloned() {
+        return (StatusCode::FOUND, [("location", to)]).into_response();
+    }
+    if let Some(n) = p.streamed.lock().unwrap().get(&path).copied() {
+        // Chunked, so the size is only known by reading it.
+        let chunks = (0..n.div_ceil(8192))
+            .map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 8192])));
+        return axum::body::Body::from_stream(futures_util::stream::iter(chunks)).into_response();
+    }
     match path.as_str() {
         "/robots.txt" => {
             let (status, body) = p.robots.lock().unwrap().clone();
@@ -133,7 +148,18 @@ async fn handle(State(p): State<Arc<Portal>>, uri: Uri, headers: HeaderMap) -> R
             if inm == Some(page.etag.as_str()) {
                 return StatusCode::NOT_MODIFIED.into_response();
             }
-            ([("etag", page.etag.clone())], page.body).into_response()
+            let ct = p
+                .content_types
+                .lock()
+                .unwrap()
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| "text/markdown; charset=utf-8".into());
+            (
+                [("etag", page.etag.clone()), ("content-type", ct)],
+                page.body,
+            )
+                .into_response()
         }
     }
 }

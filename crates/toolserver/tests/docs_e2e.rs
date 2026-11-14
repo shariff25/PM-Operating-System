@@ -83,6 +83,18 @@ async fn start_docs() -> (String, CancellationToken) {
         },
         cancel.clone(),
     );
+    // Requests whose body mentions "stall" hang, like a stuck query.
+    let app = app.layer(axum::middleware::from_fn(
+        |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            let (parts, body) = req.into_parts();
+            let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+            if bytes.windows(5).any(|w| w == b"stall") {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+            next.run(axum::extract::Request::from_parts(parts, bytes.into()))
+                .await
+        },
+    ));
     let (base, stop) = serve(app).await;
     (format!("{base}/mcp"), stop)
 }
@@ -343,5 +355,51 @@ async fn the_bot_token_is_limited_to_its_own_skills() {
     assert_eq!(res.status(), 401);
 
     stop_ts.cancel();
+    stop_docs.cancel();
+}
+
+#[tokio::test]
+async fn a_stuck_docs_call_times_out_without_blocking_others() {
+    use pmos_toolserver::connectors::{Caller, ConnectorError};
+    let (docs_url, stop_docs) = start_docs().await;
+    let docs = Arc::new(Docs::with_timeout(
+        docs_url,
+        DOCS_TOKEN,
+        std::time::Duration::from_secs(2),
+    ));
+    let caller = || Caller {
+        user: "ana",
+        run_id: "r1",
+    };
+    // Connect first, so both calls share one connection.
+    docs.read(caller(), "search", &json!({"query": "SAML"}))
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let stuck = {
+        let docs = docs.clone();
+        tokio::spawn(async move {
+            docs.read(caller(), "search", &json!({"query": "stall"}))
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let other = docs
+        .read(caller(), "search", &json!({"query": "SAML"}))
+        .await
+        .unwrap();
+    assert_eq!(other.len(), 1);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the second call didn't wait for the stuck one"
+    );
+
+    let err = stuck.await.unwrap().unwrap_err();
+    assert!(
+        matches!(err, ConnectorError::Unavailable(ref m) if m.contains("didn't answer")),
+        "{err:?}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
     stop_docs.cancel();
 }
