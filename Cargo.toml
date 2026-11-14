@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/contract", "crates/cli", "crates/runtime", "crates/toolserver", "crates/docs", "crates/slack", "crates/gateway"]
+members = ["crates/contract", "crates/cli", "crates/runtime", "crates/toolserver", "crates/docs", "crates/slack", "crates/gateway", "crates/policy"]
 
 [workspace.package]
 edition = "2021"
@@ -34,6 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 pmos-contract = { path = "crates/contract" }
+pmos-policy = { path = "crates/policy" }
 pmos-runtime = { path = "crates/runtime" }
 
 # Line tables keep backtraces readable at a fraction of the disk (full debug info made the
