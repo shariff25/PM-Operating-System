@@ -10,6 +10,20 @@ pub fn terms(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The most distinct words a search query uses. Longer queries are cut, so one query can't
+/// become an enormous database query.
+pub const MAX_QUERY_TERMS: usize = 32;
+
+/// The words of a search query: [`terms`], without repeats, at most [`MAX_QUERY_TERMS`].
+pub fn query_terms(query: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    terms(query)
+        .into_iter()
+        .filter(|t| seen.insert(t.clone()))
+        .take(MAX_QUERY_TERMS)
+        .collect()
+}
+
 /// The first non-empty line of `body` that mentions a query term, cut to 200 characters.
 /// HTML comments and markdown heading markers don't count as content.
 pub fn snippet(body: &str, query_terms: &[String]) -> String {
@@ -33,6 +47,13 @@ pub fn snippet(body: &str, query_terms: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_terms_are_distinct_and_bounded() {
+        assert_eq!(query_terms("key key rotation Key"), vec!["key", "rotation"]);
+        let long: String = (0..100).map(|i| format!("w{i} ")).collect();
+        assert_eq!(query_terms(&long).len(), MAX_QUERY_TERMS);
+    }
 
     #[test]
     fn terms_drop_operators_and_short_words() {

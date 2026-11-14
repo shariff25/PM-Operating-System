@@ -36,7 +36,7 @@ admin/     a few server-rendered admin pages, served by the orchestrator (Phase 
 evals/     golden tasks per skill, bake-off, load test
 docs/      implementation-plan.md, contract.md
 ```
-Rust: Cargo workspace using axum, sqlx, rmcp, clap, serde, chrono and slack-morphism. Each crate is checked for maintenance before it is added.
+Rust: Cargo workspace using axum, sqlx, rmcp, reqwest, clap, serde and chrono; the Slack bot speaks Socket Mode directly with tokio-tungstenite. Each crate is checked for maintenance before it is added.
 TypeScript: pnpm workspace with `harness/`. No frontend app.
 
 ## Interface: the PM OS Slack bot
@@ -230,6 +230,7 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
 | 0c-2a Postgres stores | Done | Every store in Postgres behind async traits; same contract tests on both backends; CI runs Postgres |
 | 0c-2b Real Atlassian and Slack connectors, encrypted token store | Done | Each PM's own token; AES-256-GCM vault; OAuth 3LO and Slack v2; tested against local mock APIs; first real call after Gate 1 |
 | Support docs + `/docs` in Slack | Done | `crates/docs` (`pmos-docs` MCP server over support.acme.com), docs connector and `docs` skill in the tool server, `crates/slack` (Socket Mode, `/docs`), `content/team.yaml`; see `docs/docs-server.md` |
+| Staff-engineer review fixes | Done | Four reviews (security, correctness, scale and operations, design and tests), checked against the code. The 8 blockers and the pilot list are fixed; see **Review follow-ups** for what's left |
 | 0d Gateway | Next | |
 | 0e Harness and orchestrator | Skeleton | Harness only; orchestrator not started |
 | 0f Sandbox policies | Not started | |
@@ -238,6 +239,60 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
 0c notes:
 - Connectors share one `Connector` trait (`read` and `write`, both keyed by action) instead of one trait per system. The real Jira, Confluence and Slack connectors each implement it.
 - Writes that the PM approved in the harness run through single-use grants, so the PM is never asked twice.
+
+## Review follow-ups
+From the staff-engineer review (2026-11-14). Fixed before any real token: every blocker and
+the pilot list. Still open, roughly in priority order:
+
+**Before a second replica or Phase 3:**
+- Move these to Postgres:
+  - OAuth used states, as a table with a unique key;
+  - refresh locks, as `pg_advisory_xact_lock`;
+  - MCP sessions, by sticky routing or stateless MCP.
+- Elect one docs-sync leader.
+
+**Security hardening:**
+- TLS (or mTLS) between services, and the public OAuth callback on its own listener, separate from `/internal` and `/mcp`.
+- Untrusted-content wrapping:
+  - wrap connector error text too;
+  - give memory notes provenance, a cap, and approval when written from runs that read untrusted content.
+- Slack posts:
+  - escape `<!channel>`, mentions and link syntax;
+  - show the raw text on approval cards;
+  - set `unfurl_links=false`.
+- Pin the Slack workspace or enterprise id in the bot.
+- Vault:
+  - authenticate `key_id` and the metadata fields in the AAD;
+  - zeroize secrets in memory;
+  - add a `pmos admin vault reseal` command for rows that are never read.
+- Call Slack `auth.revoke` and end the user's sessions on unlink.
+
+**Operations:**
+- A request id per call (the run id), passed downstream, and `duration_ms` plus an error class in the audit.
+- Audit retention: monthly partitions, and rotation for the JSON-lines file.
+- Per-user concurrency and per-session call budgets on the tool server.
+- An approval inbox with paging, expiry for pending items, and purging of stored draft bodies after N days (SLK-8).
+- Paging (`offset`) for truncated Jira, Confluence and docs reads.
+
+**Code structure:**
+- Typed error codes on `/internal`, with request and response types in a shared `pmos-api` crate.
+- Check at start-up that each connector handles every action registered for it.
+- One product list, shared by `pmos-docs`, the tool server schema and `/docs`.
+- Move the remaining shared setup into `pmos-runtime`: Postgres pool, bearer middleware, test fixtures.
+
+**Duplicate writes:** beyond the "outcome unknown" message:
+- record write attempts by argument hash;
+- search Jira for the run-id marker before creating.
+
+**CI:**
+- `cargo deny` and `cargo audit`;
+- one MSRV across crates;
+- reuse the build between jobs;
+- a TypeScript lint.
+
+**Tests:**
+- split the large Slack scenario test;
+- clean up Postgres test schemas when a test panics.
 
 ## Open questions
 - None blocking.

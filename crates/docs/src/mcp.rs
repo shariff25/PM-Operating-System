@@ -17,7 +17,9 @@ use crate::page::PRODUCTS;
 use crate::store::DocsStore;
 
 /// `get_doc` returns at most this many characters of markdown.
-pub const MAX_DOC_CHARS: usize = 40_000;
+/// The most of a page `get_doc` returns: enough for any guide's substance, small enough to
+/// share a local model's context with other sessions.
+pub const MAX_DOC_CHARS: usize = 12_000;
 pub const MAX_RESULTS: u64 = 10;
 
 #[derive(Clone)]

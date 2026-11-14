@@ -49,7 +49,8 @@ fn to_tool(spec: &ToolSpec) -> Tool {
     };
     let annotations = ToolAnnotations::with_title(spec.name.clone())
         .read_only(spec.kind == ToolKind::Read)
-        .destructive(false)
+        // Updating an existing page replaces its body; everything else adds.
+        .destructive(spec.name == "confluence.update_page")
         .open_world(!matches!(spec.system.as_str(), "context" | "memory"));
     let description = match spec.kind {
         ToolKind::Write => format!(

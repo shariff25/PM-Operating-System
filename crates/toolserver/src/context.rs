@@ -17,7 +17,7 @@ use pmos_contract::Sensitivity;
 use serde::Serialize;
 use walkdir::WalkDir;
 
-pub use pmos_contract::text::{snippet, terms};
+pub use pmos_contract::text::{query_terms, snippet, terms};
 
 use crate::store::StoreResult;
 
@@ -50,17 +50,27 @@ pub struct Hit {
 
 #[async_trait]
 pub trait ContextIndex: Send + Sync {
-    /// Best matches for `query`, highest score first, optionally within one domain.
+    /// Best matches for `query` at or below `ceiling`, highest score first, optionally within
+    /// one domain. The ceiling is applied in the search itself, so files above it never take
+    /// the places of files the caller may see; `withheld` counts the matches above it.
     async fn search(
         &self,
         query: &str,
         domain: Option<&str>,
+        ceiling: Sensitivity,
         limit: usize,
-    ) -> StoreResult<Vec<Hit>>;
+    ) -> StoreResult<SearchResults>;
     /// The document at `path`, if it is an indexed context file.
     async fn get(&self, path: &str) -> StoreResult<Option<ContextDoc>>;
     /// Make the index match `docs` exactly: add or update every doc, drop the rest.
     async fn reindex(&self, docs: Vec<ContextDoc>) -> StoreResult<ReindexReport>;
+}
+
+/// Search hits the caller may see, and how many matches were above its ceiling.
+#[derive(Debug, Clone, Default)]
+pub struct SearchResults {
+    pub hits: Vec<Hit>,
+    pub withheld: usize,
 }
 
 /// What a reindex changed.
@@ -162,13 +172,15 @@ impl ContextIndex for MemoryIndex {
         &self,
         query: &str,
         domain: Option<&str>,
+        ceiling: Sensitivity,
         limit: usize,
-    ) -> StoreResult<Vec<Hit>> {
-        let query_terms = terms(query);
+    ) -> StoreResult<SearchResults> {
+        let query_terms = query_terms(query);
         if query_terms.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchResults::default());
         }
         let docs = self.docs.read().expect("index lock");
+        let mut withheld = 0;
         let mut hits: Vec<Hit> = docs
             .values()
             .filter(|d| domain.is_none_or(|want| d.domain == want))
@@ -180,7 +192,14 @@ impl ContextIndex for MemoryIndex {
                     score += 3.0 * title.iter().filter(|t| *t == q).count() as f32;
                     score += body.iter().filter(|t| *t == q).count() as f32;
                 }
-                (score > 0.0).then(|| Hit {
+                if score <= 0.0 {
+                    return None;
+                }
+                if doc.sensitivity > ceiling {
+                    withheld += 1;
+                    return None;
+                }
+                Some(Hit {
                     snippet: snippet(&doc.body, &query_terms),
                     doc: doc.clone(),
                     score,
@@ -194,7 +213,7 @@ impl ContextIndex for MemoryIndex {
                 .then_with(|| a.doc.path.cmp(&b.doc.path))
         });
         hits.truncate(limit);
-        Ok(hits)
+        Ok(SearchResults { hits, withheld })
     }
 
     async fn get(&self, path: &str) -> StoreResult<Option<ContextDoc>> {
@@ -249,16 +268,29 @@ mod tests {
             "README and files outside a domain are skipped"
         );
 
-        let hits = index.search("key management", None, 10).await.unwrap();
+        let hits = index
+            .search("key management", None, Sensitivity::Restricted, 10)
+            .await
+            .unwrap()
+            .hits;
         assert_eq!(hits[0].doc.path, "context/competitors/acme.md");
         assert_eq!(hits[1].doc.path, "context/products/ccm.md");
         assert!(hits[0].snippet.contains("key management"));
 
-        let hits = index.search("key", Some("products"), 10).await.unwrap();
+        let hits = index
+            .search("key", Some("products"), Sensitivity::Restricted, 10)
+            .await
+            .unwrap()
+            .hits;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc.domain, "products");
 
-        assert!(index.search("", None, 10).await.unwrap().is_empty());
+        assert!(index
+            .search("", None, Sensitivity::Restricted, 10)
+            .await
+            .unwrap()
+            .hits
+            .is_empty());
         assert!(index
             .get("context/products/ccm.md")
             .await

@@ -23,7 +23,9 @@ use crate::approvals::{
     GRANT_TTL_MINUTES,
 };
 use crate::audit::{AuditEvent, AuditSink};
-use crate::context::{snippet, terms, ContextDoc, ContextIndex, Hit, ReindexReport};
+use crate::context::{
+    query_terms, snippet, ContextDoc, ContextIndex, Hit, ReindexReport, SearchResults,
+};
 use crate::memory::{MemoryStore, Note};
 use crate::session::{token_hash, Session, SessionRepo};
 use crate::store::{StoreError, StoreResult, Stores};
@@ -163,28 +165,51 @@ impl ContextIndex for PgStore {
         &self,
         query: &str,
         domain: Option<&str>,
+        ceiling: Sensitivity,
         limit: usize,
-    ) -> StoreResult<Vec<Hit>> {
+    ) -> StoreResult<SearchResults> {
         // Terms are letters and digits only, so the tsquery text can't carry operators.
-        let query_terms = terms(query);
+        let query_terms = query_terms(query);
         if query_terms.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchResults::default());
         }
         let tsquery = query_terms.join(" | ");
+        let allowed: Vec<String> = [
+            Sensitivity::Public,
+            Sensitivity::Internal,
+            Sensitivity::Restricted,
+        ]
+        .into_iter()
+        .filter(|s| *s <= ceiling)
+        .map(|s| s.to_string())
+        .collect();
+        // Allowed matches only; the count of the others comes from a window over every match.
         let rows = sqlx::query(
-            "SELECT path, domain, title, owner, last_reviewed, sensitivity, body,
-                    ts_rank_cd(tsv, q) AS score
-             FROM context_docs, to_tsquery('english', $1) AS q
-             WHERE tsv @@ q AND ($2::text IS NULL OR domain = $2)
-             ORDER BY score DESC, path
+            "SELECT * FROM (
+                 SELECT path, domain, title, owner, last_reviewed, sensitivity, body,
+                        ts_rank_cd(tsv, q) AS score,
+                        sensitivity = ANY($4) AS allowed,
+                        count(*) FILTER (WHERE NOT (sensitivity = ANY($4))) OVER () AS withheld
+                 FROM context_docs, to_tsquery('english', $1) AS q
+                 WHERE tsv @@ q AND ($2::text IS NULL OR domain = $2)
+             ) matches
+             ORDER BY allowed DESC, score DESC, path
              LIMIT $3",
         )
         .bind(&tsquery)
         .bind(domain)
         .bind(limit as i64)
+        .bind(&allowed)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter()
+        let withheld = rows
+            .first()
+            .map(|r| r.try_get::<i64, _>("withheld"))
+            .transpose()?
+            .unwrap_or(0) as usize;
+        let hits = rows
+            .iter()
+            .filter(|row| row.try_get::<bool, _>("allowed").unwrap_or(false))
             .map(|row| {
                 let doc = doc_from_row(row)?;
                 Ok(Hit {
@@ -193,7 +218,8 @@ impl ContextIndex for PgStore {
                     doc,
                 })
             })
-            .collect()
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok(SearchResults { hits, withheld })
     }
 
     async fn get(&self, path: &str) -> StoreResult<Option<ContextDoc>> {

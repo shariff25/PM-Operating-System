@@ -215,6 +215,17 @@ async fn handle(
                    "body": {"storage": {"value": "<h1>PRD</h1><p>Hello &amp; welcome</p>"}},
                    "_links": {"webui": "/spaces/PM/pages/555/PRD"}}),
         ),
+        ("GET", "/ex/confluence/cloud-1/wiki/api/v2/pages/556") => reply(
+            ok,
+            json!({"id": "556", "title": "Draft PRD", "status": "draft", "version": {"number": 1},
+                   "body": {"storage": {"value": "<p>draft</p>"}},
+                   "_links": {"webui": "/spaces/PM/pages/556"}}),
+        ),
+        ("PUT", "/ex/confluence/cloud-1/wiki/api/v2/pages/556") => reply(
+            StatusCode::CONFLICT,
+            json!({"errors": [{"status": 409, "title": "Version must be incremented when updating a page"}],
+                   "errorMessages": ["Version must be incremented when updating a page. Current Version: [2]."]}),
+        ),
         ("PUT", "/ex/confluence/cloud-1/wiki/api/v2/pages/555") => reply(
             ok,
             json!({"id": "555", "_links": {"webui": "/spaces/PM/pages/555/PRD"}}),
@@ -920,7 +931,33 @@ async fn confluence_update_bumps_the_version_and_read_returns_text() {
         .json();
     assert_eq!(put["version"]["number"], 4);
     assert_eq!(put["title"], "PRD: SSO", "title kept");
-    assert_eq!(put["status"], "current");
+    assert_eq!(put["status"], "current", "a published page stays published");
+
+    // A draft stays a draft, and a version clash says what to do.
+    let err = l
+        .confluence
+        .write(
+            ana(),
+            "update_page",
+            &json!({"page_id": "556", "body": "New draft"}),
+        )
+        .await
+        .unwrap_err();
+    let put = l
+        .mock
+        .requests("pages/556")
+        .into_iter()
+        .find(|r| r.method == "PUT")
+        .unwrap()
+        .json();
+    assert_eq!(
+        put["status"], "draft",
+        "updating a draft must not publish it"
+    );
+    assert!(
+        matches!(&err, ConnectorError::BadArgs(m) if m.contains("changed since PM OS read it")),
+        "{err:?}"
+    );
 
     let hits = l
         .confluence

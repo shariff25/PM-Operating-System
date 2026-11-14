@@ -40,6 +40,9 @@ fn slack_id(value: &str) -> Result<&str, ConnectorError> {
     }
 }
 
+/// Each thread message returned to the model, at most.
+const MAX_MESSAGE_CHARS: usize = 2_000;
+
 /// A message timestamp, such as `1731500000.000100`.
 fn slack_ts(value: &str) -> Result<&str, ConnectorError> {
     let ok = value.split_once('.').is_some_and(|(a, b)| {
@@ -229,7 +232,7 @@ impl Connector for Slack {
                     .call(
                         caller.user,
                         "conversations.replies",
-                        &[("channel", channel), ("ts", ts), ("limit", "100")],
+                        &[("channel", channel), ("ts", ts), ("limit", "50")],
                         &format!("thread {channel}:{ts}"),
                     )
                     .await?;
@@ -237,7 +240,10 @@ impl Connector for Slack {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .map(|m| json!({"user": m["user"], "ts": m["ts"], "text": m["text"]}))
+                    .map(|m| {
+                        let text = m["text"].as_str().unwrap_or_default();
+                        json!({"user": m["user"], "ts": m["ts"], "text": super::clip(text, MAX_MESSAGE_CHARS).0})
+                    })
                     .collect();
                 Ok(vec![Item {
                     source: SourceRef {

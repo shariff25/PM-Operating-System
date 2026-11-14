@@ -108,6 +108,18 @@ pub trait Connector: Send + Sync {
     }
 }
 
+/// The most text one body field returns to the model. A local model's context window is
+/// shared by every session on the GPU, so a 150 KB page must not land in one prompt.
+pub const MAX_BODY_CHARS: usize = 12_000;
+
+/// `text` cut to `max` characters, and whether anything was cut.
+pub fn clip(text: &str, max: usize) -> (String, bool) {
+    let mut chars = text.chars();
+    let out: String = chars.by_ref().take(max).collect();
+    let cut = chars.next().is_some();
+    (out, cut)
+}
+
 /// Wrap a connector item as untrusted data for the model.
 pub fn untrusted(item: &Item) -> Value {
     serde_json::json!({
@@ -117,4 +129,15 @@ pub fn untrusted(item: &Item) -> Value {
         "title": item.title,
         "content": item.content,
     })
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::clip;
+
+    #[test]
+    fn clips_on_characters() {
+        assert_eq!(clip("héllo", 2), ("hé".to_string(), true));
+        assert_eq!(clip("hi", 2), ("hi".to_string(), false));
+    }
 }

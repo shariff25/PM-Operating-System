@@ -21,6 +21,9 @@ pub struct Config {
     pub sync: SyncConfig,
 }
 
+/// The shortest gap between requests to the portal.
+pub const MIN_DELAY_MS: u64 = 250;
+
 impl Config {
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|k| std::env::var(k).ok())
@@ -43,6 +46,13 @@ impl Config {
         };
         let hours = num("PMOS_DOCS_SYNC_HOURS", 24)?;
         let defaults = SyncConfig::default();
+        let delay_ms = num("PMOS_DOCS_DELAY_MS", defaults.delay.as_millis() as u64)?;
+        // The portal rate-limited a faster crawl; never go below 4 requests a second.
+        if delay_ms < MIN_DELAY_MS {
+            return Err(format!(
+                "PMOS_DOCS_DELAY_MS must be at least {MIN_DELAY_MS} (the portal rate-limits faster crawls)"
+            ));
+        }
         let base = get("PMOS_DOCS_BASE_URL").unwrap_or(defaults.base.clone());
         if !base.starts_with("https://")
             && !base.starts_with("http://127.0.0.1")
@@ -68,10 +78,7 @@ impl Config {
                 base,
                 concurrency: num("PMOS_DOCS_CONCURRENCY", defaults.concurrency as u64)?.clamp(1, 4)
                     as usize,
-                delay: Duration::from_millis(num(
-                    "PMOS_DOCS_DELAY_MS",
-                    defaults.delay.as_millis() as u64,
-                )?),
+                delay: Duration::from_millis(delay_ms),
                 ..defaults
             },
         })
@@ -92,6 +99,17 @@ mod tests {
     }
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn the_crawl_cannot_be_made_too_fast() {
+        let err = cfg(&[
+            ("PMOS_DOCS_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_DOCS_DELAY_MS", "0"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("at least 250"), "{err}");
+    }
 
     #[test]
     fn defaults_and_limits() {

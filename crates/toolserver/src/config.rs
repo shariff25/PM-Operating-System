@@ -51,10 +51,10 @@ pub struct Config {
     pub bind: SocketAddr,
     /// `PMOS_SERVICE_TOKEN`: required; the orchestrator's token for `/internal`. At least 32
     /// characters.
-    pub service_token: String,
+    pub service_token: Secret,
     /// `PMOS_BOT_TOKEN`: the Slack bot's own token, at least 32 characters and different from
     /// the service token. Optional; without it the bot can't connect.
-    pub bot_token: Option<String>,
+    pub bot_token: Option<Secret>,
     /// `PMOS_BOT_SKILLS`: space- or comma-separated skills the bot may start sessions for.
     /// Default `docs`.
     pub bot_skills: Vec<String>,
@@ -98,6 +98,12 @@ impl Config {
             .map(String::from)
             .collect();
         let dev = get("PMOS_DEV").as_deref() == Some("1");
+        if dev && get("PMOS_CONNECTORS").as_deref() == Some("live") {
+            return Err(
+                "PMOS_DEV=1 keeps tokens and the audit log in memory; it can't be used with PMOS_CONNECTORS=live"
+                    .into(),
+            );
+        }
         let audit_log = get("PMOS_AUDIT_LOG").map(PathBuf::from);
         let database_url = get("PMOS_DATABASE_URL").filter(|u| !u.is_empty());
         if database_url.is_none() && !dev {
@@ -131,8 +137,8 @@ impl Config {
                 .unwrap_or_else(|| "content".into())
                 .into(),
             bind,
-            service_token,
-            bot_token,
+            service_token: Secret::new(service_token),
+            bot_token: bot_token.map(Secret::new),
             bot_skills,
             database_url,
             audit_log,
@@ -203,6 +209,29 @@ mod tests {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
     #[test]
+    fn dev_mode_and_live_connectors_dont_mix_and_tokens_never_print() {
+        let err = cfg(&[
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "live"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("PMOS_DEV=1"), "{err}");
+
+        let ok = cfg(&[
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_BOT_TOKEN", "bot-token-0123456789abcdef-0123456"),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ])
+        .unwrap();
+        let printed = format!("{ok:?}");
+        assert!(!printed.contains(TOKEN), "{printed}");
+        assert!(!printed.contains("bot-token"), "{printed}");
+        assert_eq!(ok.bot_skills, vec!["docs"]);
+    }
+
+    #[test]
     fn requires_token_audit_and_connectors() {
         assert!(cfg(&[]).is_err());
         assert!(cfg(&[
@@ -224,7 +253,7 @@ mod tests {
         .is_err());
         let live_missing = cfg(&[
             ("PMOS_SERVICE_TOKEN", TOKEN),
-            ("PMOS_DEV", "1"),
+            ("PMOS_DATABASE_URL", "postgresql://pmos@db/pmos"),
             ("PMOS_CONNECTORS", "live"),
         ])
         .unwrap_err();
@@ -247,7 +276,7 @@ mod tests {
         let key = KeyRing::generate_spec("k1");
         let base = [
             ("PMOS_SERVICE_TOKEN", TOKEN),
-            ("PMOS_DEV", "1"),
+            ("PMOS_DATABASE_URL", "postgresql://pmos@db/pmos"),
             ("PMOS_CONNECTORS", "live"),
             ("PMOS_VAULT_KEY", key.as_str()),
             ("PMOS_PUBLIC_URL", "https://pmos.example.com"),
