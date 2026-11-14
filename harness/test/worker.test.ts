@@ -6,7 +6,6 @@ import { pendingApprovals } from "../src/mcp-tools.js";
 import { milestoneFor } from "../src/progress.js";
 import {
   type Logger,
-  STOPPED_REASON,
   type WorkerConfig,
   createWorker,
   gatewayBaseUrl,
@@ -293,7 +292,7 @@ describe("harness worker", () => {
     expect(finished(runtime, "tsk_1")).toBeUndefined();
   });
 
-  it("stop() fails the running task with 'worker stopped', then run() returns", async () => {
+  it("stop() leaves an unfinished task for the runtime to retry, then run() returns", async () => {
     const { runtime, mcp, worker, running } = await setup({
       claims: [claim("tsk_1")],
       models: {
@@ -308,14 +307,12 @@ describe("harness worker", () => {
     await running;
     expect(Date.now() - started).toBeLessThan(3_000);
 
-    const failed = runtime.forTask("tsk_1", "fail")[0];
-    expect(failed?.body.reason).toBe(STOPPED_REASON);
-    expect(failed?.body.reason).toMatch(/^worker stopped/);
+    // Neither failed nor completed: the lease runs out and the runtime retries it (D2).
+    expect(finished(runtime, "tsk_1")).toBeUndefined();
     // Nothing more is claimed or reported once stopped, even if the abandoned run moves on.
     const count = runtime.requests.length;
     await new Promise((r) => setTimeout(r, 150));
     expect(runtime.requests.length).toBe(count);
-    expect(runtime.requests.at(-1)?.path).toBe("/v1/worker/tasks/tsk_1/fail");
   });
 
   it("stop() lets a task that finishes within the grace period complete", async () => {

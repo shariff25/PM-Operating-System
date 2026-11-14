@@ -3,7 +3,7 @@
 //!
 //! | Client | May |
 //! | --- | --- |
-//! | `slack` | create tasks as `X-Pmos-User`; read that PM's tasks, routines and the notification feed |
+//! | `slack` | create tasks as `X-Pmos-User`; read that PM's tasks and routines; read the shared notification feed and the bot list (no PM needed) |
 //! | `worker` | claim, heartbeat, events, trace, complete, fail |
 //! | `console` | read everything; pause, resume and delete routines; cancel tasks |
 //! | `evals` | create tasks with `source: "eval"`, and read them |
@@ -149,6 +149,17 @@ fn optional_body<T: DeserializeOwned + Default>(bytes: &Bytes) -> Result<T, Erro
     }
 }
 
+/// A Slack call made for one PM must name them in `X-Pmos-User`. (The shared feed and the
+/// bot list don't call this.)
+fn pm(caller: &Caller) -> Result<(), Error> {
+    if caller.kind == ClientKind::Slack && caller.user.is_none() {
+        return Err(forbidden(
+            "say which PM this is for in X-Pmos-User (a PM OS handle)",
+        ));
+    }
+    Ok(())
+}
+
 fn allow(caller: &Caller, kinds: &[ClientKind], what: &str) -> Result<(), Error> {
     if kinds.contains(&caller.kind) {
         Ok(())
@@ -175,21 +186,22 @@ async fn authenticate(State(state): State<AppState>, mut req: Request, next: Nex
         return error(StatusCode::UNAUTHORIZED, "a PM OS bots token is required");
     };
     let user = match client.kind {
-        ClientKind::Slack => {
-            let user = req
-                .headers()
-                .get(USER_HEADER)
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .unwrap_or_default();
-            if !valid_handle(user) {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "the Slack client must say which PM it acts for in X-Pmos-User (a PM OS handle)",
-                );
+        // The Slack client names the PM it acts for on per-PM calls (tasks, routines). The
+        // shared notification feed and the bot list need no PM. Without the header, every
+        // per-PM check compares against an empty handle and refuses.
+        ClientKind::Slack => match req.headers().get(USER_HEADER) {
+            None => None,
+            Some(v) => {
+                let user = v.to_str().map(str::trim).unwrap_or_default();
+                if !valid_handle(user) {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "X-Pmos-User must be a PM OS handle",
+                    );
+                }
+                Some(user.to_string())
             }
-            Some(user.to_string())
-        }
+        },
         _ => None,
     };
     req.extensions_mut().insert(Caller {
@@ -353,6 +365,7 @@ async fn list_tasks(
     };
     match caller.kind {
         ClientKind::Slack => {
+            pm(&caller)?;
             if filter
                 .requested_by
                 .as_deref()
@@ -645,6 +658,7 @@ struct ParseBody {
 }
 
 fn own(caller: &Caller, owner: &str) -> Result<(), Error> {
+    pm(caller)?;
     if caller.kind == ClientKind::Slack && owner != caller.user() {
         return Err(forbidden(
             "the Slack client manages only the routines of the PM in X-Pmos-User",

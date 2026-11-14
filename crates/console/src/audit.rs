@@ -21,8 +21,11 @@ pub struct AuditEvent {
     pub run_id: String,
     #[serde(default)]
     pub user: String,
+    /// `null` for a bot session, which names its bot instead.
     #[serde(default)]
-    pub skill: String,
+    pub skill: Option<String>,
+    #[serde(default)]
+    pub bot: Option<String>,
     #[serde(default)]
     pub tool: String,
     #[serde(default)]
@@ -106,5 +109,34 @@ mod tests {
         assert!(events_for_run("/no/such/file".into(), "tsk_a".into())
             .await
             .is_err());
+    }
+
+    /// A bot task's audit line, as the tool server writes it (`skill: null`, `bot` set), must
+    /// not be skipped.
+    #[tokio::test]
+    async fn reads_bot_session_lines_as_the_tool_server_writes_them() {
+        use pmos_toolserver::audit::{AuditEvent as Written, Client, Outcome};
+        let written = Written {
+            at: chrono::Utc::now(),
+            client: Client::Mcp,
+            run_id: "tsk_bot".into(),
+            user: "ana".into(),
+            skill: None,
+            bot: Some("docs".into()),
+            tool: "docs.search".into(),
+            outcome: Outcome::Ok,
+            sources: vec![],
+            args_hash: None,
+            output_ref: None,
+            detail: None,
+        };
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", serde_json::to_string(&written).unwrap()).unwrap();
+        let (events, _) = events_for_run(file.path().into(), "tsk_bot".into())
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].bot.as_deref(), Some("docs"));
+        assert_eq!(events[0].skill, None);
     }
 }

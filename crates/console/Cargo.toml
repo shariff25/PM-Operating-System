@@ -30,5 +30,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# Contract test: the console reads audit lines exactly as the tool server writes them.
+pmos-toolserver = { path = "../toolserver" }
 tempfile.workspace = true
 tokio-util.workspace = true

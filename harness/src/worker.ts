@@ -7,8 +7,9 @@
  * - Writes are never paused in the harness. They reach the tool server, which answers
  *   `pending_approval`; the worker hands those approval ids to the runtime on completion.
  * - One task's error never stops the loop: the task fails with a reason a PM can read.
- * - `stop()` (SIGTERM) stops claiming, gives the current task a grace period to finish, then
- *   fails it with "worker stopped" and lets `run()` return.
+ * - `stop()` (SIGTERM) stops claiming and gives the current task a grace period to finish.
+ *   A task still running after that is left alone, not failed: its lease runs out and the
+ *   runtime retries it (D2: resume after a restart, or fail with a stated reason).
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
@@ -27,9 +28,6 @@ import {
   type TaskEvent,
   type TraceEntry,
 } from "./runtime-client.js";
-
-export const STOPPED_REASON =
-  "worker stopped: PM OS was restarting while I worked on this. Please ask again.";
 
 export type LogLevel = "info" | "warn" | "error";
 export type Logger = (level: LogLevel, message: string, fields?: Record<string, unknown>) => void;
@@ -427,11 +425,16 @@ export function createWorker(config: WorkerConfig): Worker {
       log("info", "completed task", { task: task.id, approvals: outcome.approvals.length });
     } catch (error) {
       const aborted = error instanceof TaskAborted ? error.reason : undefined;
-      if (aborted === "lost") {
+      // No longer ours, or we're shutting down: report nothing. On shutdown the lease runs out
+      // and the runtime retries the task on another start, as D2 asks.
+      if (aborted === "lost" || aborted === "stopped") {
+        if (aborted === "stopped") {
+          log("info", "left task for the runtime to retry", { task: task.id });
+        }
         await reporter.close();
         return;
       }
-      const reason = aborted === "stopped" ? STOPPED_REASON : pmReason(error);
+      const reason = pmReason(error);
       log("warn", "failed task", {
         task: task.id,
         reason,

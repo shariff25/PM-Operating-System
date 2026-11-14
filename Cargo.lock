@@ -1696,6 +1696,7 @@ dependencies = [
  "hmac 0.12.1",
  "pmos-contract",
  "pmos-runtime",
+ "pmos-toolserver",
  "reqwest",
  "serde",
  "serde_json",
