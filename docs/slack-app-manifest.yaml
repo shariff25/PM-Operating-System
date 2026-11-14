@@ -38,12 +38,18 @@ oauth_config:
     # (im:history, for message.im) and each PM's time zone (users:read, for routines). It
     # never reads channels for answers; reads and anything sent on a PM's behalf use that
     # PM's own user token.
+    #
+    # Onboarding (docs/onboarding-spec.md): when someone taps Request access, the bot reads
+    # their name and email (users:read, users:read.email) and DMs each platform owner a card,
+    # and later the new member their welcome, opening those DMs itself (im:write).
     bot:
       - commands
       - chat:write
       - chat:write.customize
       - im:history
+      - im:write
       - users:read
+      - users:read.email
     # Granted per PM when they link their account (see crates/toolserver/src/config.rs,
     # DEFAULT_SLACK_SCOPES).
     user:

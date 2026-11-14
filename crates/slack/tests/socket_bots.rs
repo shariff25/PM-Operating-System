@@ -372,6 +372,8 @@ impl Stack {
             toolserver: ToolServer::new(ts_base, TOOL_BOT_TOKEN),
             team_file,
             default_tz: "UTC".into(),
+            github_org: None,
+            response_url_prefix: "https://hooks.slack.com/".into(),
         });
         Self {
             slack,
@@ -397,6 +399,7 @@ impl Stack {
                 team_file: "/nonexistent/team.yaml".into(),
                 http: http.clone(),
                 response_url_prefix: "https://hooks.slack.com/".into(),
+                request_access: true,
             },
             http,
         )
