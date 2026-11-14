@@ -137,7 +137,7 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
 ### Bots: what changes in the build order (from `bot-decisions.md`)
 - **0d gateway:** add the workaround registry, with a flag and a "delete when" test for each workaround (D11).
 - **0e becomes the bot runtime**, replacing the per-session orchestrator:
-  - bot definitions in `content/bots/<name>/BOT.md`: name, job, team or personal scope, owner, skills, data class, and per-action `auto`/`approve`/`never` settings (v1: all `approve`), checked by `pmos lint`;
+  - bot definitions in `content/bots/<name>/BOT.md`: name, job, team or personal scope, owner, skills, data class, per-action `auto`/`approve`/`never` settings (v1: all `approve`), and, for team bots, the Jira projects, Confluence spaces and Slack channels its owner chose for it to read, enforced by the tool server; checked by `pmos lint`;
   - a durable task queue in Postgres that resumes or fails with a reason after a reboot (D2);
   - task status events and a checklist, posted as one Slack message per milestone (D6);
   - a 30-day trace store (D6);
@@ -151,7 +151,7 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
   - a fixed set of real tasks per category, rerun weekly and on every model or harness change;
   - each failure tagged to its bottleneck: model, tool, policy, memory or harness;
   - a category launches only after passing its bar two weeks in a row.
-- **Memory moves to markdown files in git** (D5): team memory in git, personal memory in a private store, a source and date on every entry, and the context mount filtered by data class.
+- **Memory moves to markdown files in git** (D5): team memory in a git repo set in config (default `pm-os-memory`), committed by the tool server on each bot write; personal memory in a private store; a source and date on every entry; and the context mount filtered by data class.
 - **Phase 1:**
   - The first named bots: a team **Docs** bot, which takes over `/docs`, and personal PM bots.
   - Routines in plain language (D8), moved up from Phase 2.
