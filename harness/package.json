@@ -6,6 +6,8 @@
   "type": "module",
   "main": "./src/index.ts",
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "worker": "node dist/main.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
@@ -15,6 +17,7 @@
     "@langchain/langgraph-checkpoint": "^1.2.2",
     "@langchain/langgraph-sdk": "^1.16.0",
     "@langchain/openai": "^1.8.4",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "deepagents": "^1.16.5",
     "langchain": "^1.6.6",
     "langsmith": "^0.12.0",
