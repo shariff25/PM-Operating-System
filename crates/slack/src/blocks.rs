@@ -1,4 +1,4 @@
-//! Block Kit messages for `/docs`.
+//! Block Kit messages for `/docs`, and the escaping every Slack message uses.
 
 use serde_json::{json, Value};
 
@@ -11,7 +11,7 @@ pub fn escape(text: &str) -> String {
 
 /// A link a Slack message can show: only `https://` URLs, with `|` and `>` removed so they
 /// can't break out of the `<url|label>` syntax.
-fn link(url: &str, label: &str) -> String {
+pub fn link(url: &str, label: &str) -> String {
     let safe_url: String = url.chars().filter(|c| !"|<> ".contains(*c)).collect();
     let label = escape(label).replace('|', "¦");
     if safe_url.starts_with("https://") {
@@ -21,7 +21,8 @@ fn link(url: &str, label: &str) -> String {
     }
 }
 
-fn truncate(text: &str, max: usize) -> String {
+/// At most `max` characters, with an ellipsis if anything was cut.
+pub fn truncate(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max).collect();
     if text.chars().count() > max {
         out.push('…');
