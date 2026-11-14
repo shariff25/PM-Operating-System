@@ -84,7 +84,7 @@ It never holds prompts or answers. Events go to the service log, and with `PMOS_
 | `PMOS_GATEWAY_STUB` | off | `1` answers with a deterministic stub model and no model server, for CI and development |
 | `PMOS_GATEWAY_WORKAROUNDS` | `on` | `off` for the benchmark run |
 | `PMOS_GATEWAY_CLOUD_TEST` | off | **Testing only.** `1` accepts the Claude test upstream (below) |
-| `PMOS_GATEWAY_ANTHROPIC_KEY` | a placeholder | **Testing only.** The Claude API key; leave unset where the network proxy injects it |
+| `PMOS_GATEWAY_ANTHROPIC_KEY` | none | **Testing only.** The Claude API key for the Claude test upstream |
 
 **Allowed upstream hosts:**
 - loopback and private addresses;

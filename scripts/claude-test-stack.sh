@@ -11,10 +11,10 @@
 #   PMOS_SLACK_APP_TOKEN  the test Slack app's app-level token (xapp-…, connections:write)
 #   PMOS_SLACK_BOT_TOKEN  the test Slack app's bot token (xoxb-…)
 #   PMOS_TEST_SLACK_ID    your member id in the test workspace (U…)
+#   PMOS_GATEWAY_ANTHROPIC_KEY  a Claude API key
 # Optional:
 #   PMOS_TEST_HANDLE      your PM OS handle in the test (default: tester)
 #   PMOS_TEST_STATE       where state and logs go (default: state/claude-test)
-#   PMOS_GATEWAY_ANTHROPIC_KEY  the Claude API key, unless the network proxy injects one
 #
 # Stop with Ctrl-C; every service is stopped with it.
 set -euo pipefail
@@ -22,6 +22,7 @@ set -euo pipefail
 : "${PMOS_SLACK_APP_TOKEN:?set PMOS_SLACK_APP_TOKEN (the test app's xapp- token)}"
 : "${PMOS_SLACK_BOT_TOKEN:?set PMOS_SLACK_BOT_TOKEN (the test app's xoxb- token)}"
 : "${PMOS_TEST_SLACK_ID:?set PMOS_TEST_SLACK_ID (your member id in the test workspace)}"
+: "${PMOS_GATEWAY_ANTHROPIC_KEY:?set PMOS_GATEWAY_ANTHROPIC_KEY (a Claude API key)}"
 HANDLE="${PMOS_TEST_HANDLE:-tester}"
 
 ROOT="$(git rev-parse --show-toplevel)"

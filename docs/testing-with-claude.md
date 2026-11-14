@@ -51,12 +51,12 @@ The stack reads these settings. None of them goes in a file in the repo.
 | `PMOS_SLACK_APP_TOKEN` | The app-level token (`xapp-…`) |
 | `PMOS_TEST_SLACK_ID` | Your member id (`U…`); not secret |
 | `PMOS_TEST_HANDLE` | Optional: your handle in the test (default `tester`) |
-| `PMOS_GATEWAY_ANTHROPIC_KEY` | The Claude API key. In a Claude Code cloud session, leave it unset: the key is saved as a network secret for `api.anthropic.com` and the proxy adds it. |
+| `PMOS_GATEWAY_ANTHROPIC_KEY` | A Claude API key from the Claude Console (<https://platform.claude.com>). Use a key in a workspace with a spend limit set for testing. |
 
 **In a Claude Code cloud session:** add the variables in the environment's settings (the
 environment menu in the session's title bar, then **Edit**, then environment variables). They
 reach a session when it starts or resumes. The network must also allow `slack.com`,
-`wss-primary.slack.com`, `wss-backup.slack.com` and `api.anthropic.com`.
+`wss-primary.slack.com` and `wss-backup.slack.com`; `api.anthropic.com` is always reachable.
 
 **On your own machine:** export them in your shell. You need Rust, Node 22, pnpm and openssl.
 

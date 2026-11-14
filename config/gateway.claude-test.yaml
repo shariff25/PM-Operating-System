@@ -4,7 +4,7 @@
 # real PM tokens or Fortanix data.
 #
 # The gateway refuses this file unless PMOS_GATEWAY_CLOUD_TEST=1. The API key comes from
-# PMOS_GATEWAY_ANTHROPIC_KEY, or from the network proxy where it injects one. See
+# PMOS_GATEWAY_ANTHROPIC_KEY. See
 # docs/testing-with-claude.md.
 upstreams:
   claude: anthropic+https://api.anthropic.com
