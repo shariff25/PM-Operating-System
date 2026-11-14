@@ -381,11 +381,14 @@ async fn live_with(team: Option<Arc<Team>>) -> Live {
                 client_secret: Secret::new("slk-secret"),
                 scopes: vec!["chat:write".into()],
             }),
+            github: None,
+            github_org: None,
             state_key: b"test-state-key".to_vec(),
             endpoints: Endpoints {
                 atlassian_auth: base.clone(),
                 atlassian_api: base.clone(),
                 slack: base.clone(),
+                ..Endpoints::default()
             },
         },
         vault.clone(),

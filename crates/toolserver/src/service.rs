@@ -26,7 +26,7 @@ use crate::audit::{AuditEvent, Client, Outcome};
 use crate::catalog::{Catalog, Roster, ToolSpec};
 use crate::connectors::{untrusted, Caller, Connector, ConnectorError, TeamBot};
 use crate::context::{load_docs, ContextDoc, ReindexReport};
-use crate::memory::valid_key;
+use crate::memory::{valid_key, MemoryError};
 use crate::schemas::check_args;
 use crate::session::{bot_identity, token_hash, valid_handle, Session};
 use crate::store::{StoreError, Stores};
@@ -72,6 +72,16 @@ impl From<ConnectorError> for ToolError {
 impl From<StoreError> for ToolError {
     fn from(e: StoreError) -> Self {
         ToolError::Unavailable(e.0)
+    }
+}
+
+impl From<MemoryError> for ToolError {
+    fn from(e: MemoryError) -> Self {
+        match e {
+            MemoryError::Store(e) => e.into(),
+            // Shown to the model as written: what the PM has to do, or what is down.
+            MemoryError::Refused(m) | MemoryError::Unavailable(m) => ToolError::Connector(m),
+        }
     }
 }
 
@@ -250,6 +260,11 @@ impl ToolService {
         &self.catalog
     }
 
+    /// The stores behind the service, for the onboarding endpoints (`onboarding.rs`).
+    pub fn stores(&self) -> &Stores {
+        &self.stores
+    }
+
     /// The bots and roles now in force.
     pub fn roster(&self) -> Arc<Roster> {
         self.roster.read().expect("roster lock").clone()
@@ -285,7 +300,7 @@ impl ToolService {
 
     /// Record an audit event. A failure is logged at error level: the audit log is a
     /// control, so a platform owner needs to see it, but it never undoes the call itself.
-    async fn audit(&self, event: AuditEvent) {
+    pub async fn audit(&self, event: AuditEvent) {
         if let Err(e) = self.stores.audit.record(event.clone()).await {
             tracing::error!(
                 error = %e,
@@ -669,10 +684,18 @@ impl ToolService {
             ));
         }
         let text = args["text"].as_str().unwrap_or_default();
+        // Who wrote it, kept with the note in a GitHub memory repo: the bot or skill, and the
+        // run.
+        let writer = session
+            .bot
+            .as_deref()
+            .or(session.skill.as_deref())
+            .unwrap_or("pm-os");
+        let source = format!("{writer}, task {}", session.run_id);
         let note = self
             .stores
             .memory
-            .update(&session.user, key, text, now)
+            .update(&session.user, key, text, &source, now)
             .await?;
         Ok(json!({ "note": note }))
     }
