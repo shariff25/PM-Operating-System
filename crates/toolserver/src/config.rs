@@ -8,7 +8,7 @@ use crate::vault::{KeyRing, Secret};
 
 /// Default Atlassian scopes: Jira classic scopes, Confluence granular scopes for the v2 page
 /// API and CQL search. `offline_access` is always added for refresh tokens.
-pub const DEFAULT_ATLASSIAN_SCOPES: &str = "read:jira-work write:jira-work read:jira-user \
+pub const DEFAULT_ATLASSIAN_SCOPES: &str = "read:me read:jira-work write:jira-work read:jira-user \
      search:confluence read:page:confluence write:page:confluence read:space:confluence";
 
 /// Default Slack user scopes: Real-time Search, thread history, and posting as the PM.

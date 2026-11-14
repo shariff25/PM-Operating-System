@@ -147,6 +147,7 @@ contract!(
     reindex_tracks_the_content_repo,
     audit_records_events,
     credentials_are_per_user_and_provider,
+    credential_replace_is_conditional,
     vault_round_trips_through_the_store,
 );
 
@@ -592,6 +593,33 @@ async fn credentials_are_per_user_and_provider(b: &Backend) {
     assert!(!c.delete("ana", Provider::Slack).await.unwrap());
     assert_eq!(c.list("ana").await.unwrap().len(), 1);
     assert!(c.get("bo", Provider::Atlassian).await.unwrap().is_some());
+}
+
+async fn credential_replace_is_conditional(b: &Backend) {
+    let c = b.stores.credentials.as_ref();
+    let first = sealed("ana", Provider::Atlassian, "a1");
+    c.put(&first).await.unwrap();
+    let stored = c.get("ana", Provider::Atlassian).await.unwrap().unwrap();
+
+    // Replacing the version that was read works once; the stale second writer loses.
+    let newer = SealedCredential {
+        access_token: "v1.k1.sealed-a2".into(),
+        updated_at: stored.updated_at + Duration::seconds(5),
+        ..stored.clone()
+    };
+    assert!(c.replace(&newer, stored.updated_at).await.unwrap());
+    let stale = SealedCredential {
+        access_token: "v1.k1.sealed-stale".into(),
+        ..stored.clone()
+    };
+    assert!(!c.replace(&stale, stored.updated_at).await.unwrap());
+    let got = c.get("ana", Provider::Atlassian).await.unwrap().unwrap();
+    assert_eq!(got.access_token, "v1.k1.sealed-a2");
+
+    // Replace never inserts: an unlinked account stays unlinked.
+    assert!(c.delete("ana", Provider::Atlassian).await.unwrap());
+    assert!(!c.replace(&newer, newer.updated_at).await.unwrap());
+    assert!(c.get("ana", Provider::Atlassian).await.unwrap().is_none());
 }
 
 async fn vault_round_trips_through_the_store(b: &Backend) {

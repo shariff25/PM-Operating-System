@@ -592,6 +592,30 @@ impl CredentialStore for PgStore {
         Ok(())
     }
 
+    async fn replace(&self, c: &SealedCredential, expected: DateTime<Utc>) -> StoreResult<bool> {
+        let done = sqlx::query(
+            "UPDATE credentials SET
+                 key_id = $3, access_token = $4, refresh_token = $5, expires_at = $6,
+                 scopes = $7, cloud_id = $8, site_url = $9, external_id = $10, updated_at = $11
+             WHERE user_handle = $1 AND provider = $2 AND updated_at = $12",
+        )
+        .bind(&c.user)
+        .bind(c.provider.as_str())
+        .bind(&c.key_id)
+        .bind(&c.access_token)
+        .bind(&c.refresh_token)
+        .bind(c.expires_at)
+        .bind(&c.scopes)
+        .bind(&c.cloud_id)
+        .bind(&c.site_url)
+        .bind(&c.external_id)
+        .bind(c.updated_at)
+        .bind(expected)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
     async fn delete(&self, user: &str, provider: Provider) -> StoreResult<bool> {
         let done = sqlx::query("DELETE FROM credentials WHERE user_handle = $1 AND provider = $2")
             .bind(user)

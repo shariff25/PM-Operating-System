@@ -65,6 +65,11 @@ async fn main() -> Result<()> {
         stores.audit = Arc::new(TeeAudit(vec![stores.audit.clone(), file]));
     }
 
+    let live = matches!(config.connectors, Connectors::Live(_));
+    // With live connectors only people in team.yaml may use PM OS, and a linked account must
+    // be theirs.
+    let team = Team::load(&config.content_root, live).map_err(anyhow::Error::msg)?;
+
     let (connectors, oauth): (Vec<Arc<dyn Connector>>, Option<Arc<OAuth>>) =
         match &config.connectors {
             Connectors::Fake => {
@@ -81,17 +86,20 @@ async fn main() -> Result<()> {
             }
             Connectors::Live(live) => {
                 let vault = Vault::new(live.vault_keys.clone(), stores.credentials.clone());
-                let oauth = Arc::new(OAuth::new(
-                    OAuthConfig {
-                        public_base_url: live.public_url.clone(),
-                        atlassian: Some(live.atlassian.clone()),
-                        atlassian_site: live.atlassian_site.clone(),
-                        slack: Some(live.slack.clone()),
-                        state_key: state_key(&config.service_token),
-                        endpoints: live.endpoints.clone(),
-                    },
-                    vault,
-                ));
+                let oauth = Arc::new(
+                    OAuth::new(
+                        OAuthConfig {
+                            public_base_url: live.public_url.clone(),
+                            atlassian: Some(live.atlassian.clone()),
+                            atlassian_site: live.atlassian_site.clone(),
+                            slack: Some(live.slack.clone()),
+                            state_key: state_key(&config.service_token),
+                            endpoints: live.endpoints.clone(),
+                        },
+                        vault,
+                    )
+                    .with_team(team.clone()),
+                );
                 let tokens: Arc<dyn TokenSource> = oauth.clone();
                 tracing::info!(
                     public_url = %live.public_url,
@@ -116,9 +124,6 @@ async fn main() -> Result<()> {
             }
         };
 
-    let live = matches!(config.connectors, Connectors::Live(_));
-    // With live connectors only people in team.yaml may use PM OS.
-    let team = Team::load(&config.content_root, live).map_err(anyhow::Error::msg)?;
     for skill in &config.bot_skills {
         if catalog.skill(skill).is_none() {
             anyhow::bail!("PMOS_BOT_SKILLS names unknown skill `{skill}`");
@@ -127,7 +132,7 @@ async fn main() -> Result<()> {
     let skills = catalog.skills().count();
     let svc = ToolService::new(catalog, stores, connectors)
         .map_err(anyhow::Error::msg)?
-        .with_team(team);
+        .with_team(team.clone());
     let app = router(
         Arc::new(svc),
         AppConfig {

@@ -144,6 +144,14 @@ pub trait CredentialStore: Send + Sync {
     async fn get(&self, user: &str, provider: Provider) -> StoreResult<Option<SealedCredential>>;
     /// Insert or replace the user's credential for that provider.
     async fn put(&self, credential: &SealedCredential) -> StoreResult<()>;
+    /// Replace the stored credential only if it is still the one read earlier (its
+    /// `updated_at` is `expected`). False if it changed or was deleted meanwhile, so a
+    /// stale write can't overwrite a newer token or bring back an unlinked account.
+    async fn replace(
+        &self,
+        credential: &SealedCredential,
+        expected: DateTime<Utc>,
+    ) -> StoreResult<bool>;
     async fn delete(&self, user: &str, provider: Provider) -> StoreResult<bool>;
     async fn list(&self, user: &str) -> StoreResult<Vec<SealedCredential>>;
 }
@@ -170,6 +178,21 @@ impl CredentialStore for MemoryCredentials {
             credential.clone(),
         );
         Ok(())
+    }
+
+    async fn replace(
+        &self,
+        credential: &SealedCredential,
+        expected: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        let mut rows = self.rows.lock().expect("credentials lock");
+        match rows.get_mut(&(credential.user.clone(), credential.provider)) {
+            Some(row) if row.updated_at == expected => {
+                *row = credential.clone();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn delete(&self, user: &str, provider: Provider) -> StoreResult<bool> {
@@ -395,9 +418,22 @@ impl Vault {
         };
         let credential = self.unseal(&sealed)?;
         if sealed.key_id != self.keys.active_id() {
-            self.put(&credential).await?;
+            // Re-seal under the active key, unless someone wrote a newer credential meanwhile.
+            self.store
+                .replace(&self.seal(&credential)?, sealed.updated_at)
+                .await?;
         }
         Ok(Some(credential))
+    }
+
+    /// Replace the credential only if it is still the version with `expected` as its
+    /// `updated_at`. See [`CredentialStore::replace`].
+    pub async fn replace(
+        &self,
+        credential: &Credential,
+        expected: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.store.replace(&self.seal(credential)?, expected).await
     }
 
     pub async fn delete(&self, user: &str, provider: Provider) -> StoreResult<bool> {
