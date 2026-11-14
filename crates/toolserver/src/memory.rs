@@ -1,5 +1,6 @@
-//! Per-user memory (MEM-1). Each user reads and writes only their own notes, in memory
-//! ([`InMemoryStore`]) or in Postgres (`pg.rs`).
+//! Per-user memory (MEM-1). Each user reads and writes only their own notes: in memory
+//! ([`InMemoryStore`]), in Postgres (`pg.rs`), or, with `PMOS_MEMORY=github`, in the PM's own
+//! private repo in the GitHub org (`github_memory.rs`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -8,7 +9,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::store::StoreResult;
+use crate::store::StoreError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Note {
@@ -17,18 +18,36 @@ pub struct Note {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Why memory couldn't be read or written.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MemoryError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The PM must act first: set up a memory repo, link GitHub, or fix the repo. The text
+    /// is shown to the model as the tool error.
+    #[error("{0}")]
+    Refused(String),
+    /// The memory's home (GitHub) didn't answer or refused for a reason of its own.
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+pub type MemoryResult<T> = Result<T, MemoryError>;
+
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
     /// The user's notes, by key.
-    async fn read(&self, user: &str) -> StoreResult<Vec<Note>>;
-    /// Create or replace one note.
+    async fn read(&self, user: &str) -> MemoryResult<Vec<Note>>;
+    /// Create or replace one note. `source` names who wrote it: the bot or skill and the run
+    /// id, such as `pm-ana, task 0d3f…`. Only the GitHub store records it.
     async fn update(
         &self,
         user: &str,
         key: &str,
         text: &str,
+        source: &str,
         now: DateTime<Utc>,
-    ) -> StoreResult<Note>;
+    ) -> MemoryResult<Note>;
 }
 
 #[derive(Default)]
@@ -38,7 +57,7 @@ pub struct InMemoryStore {
 
 #[async_trait]
 impl MemoryStore for InMemoryStore {
-    async fn read(&self, user: &str) -> StoreResult<Vec<Note>> {
+    async fn read(&self, user: &str) -> MemoryResult<Vec<Note>> {
         Ok(self
             .notes
             .lock()
@@ -53,8 +72,9 @@ impl MemoryStore for InMemoryStore {
         user: &str,
         key: &str,
         text: &str,
+        _source: &str,
         now: DateTime<Utc>,
-    ) -> StoreResult<Note> {
+    ) -> MemoryResult<Note> {
         let note = Note {
             key: key.to_string(),
             text: text.to_string(),
@@ -87,9 +107,15 @@ mod tests {
     async fn users_see_only_their_notes() {
         let store = InMemoryStore::default();
         let now: DateTime<Utc> = "2026-11-14T10:00:00Z".parse().unwrap();
-        store.update("ana", "areas", "CCM", now).await.unwrap();
-        store.update("ana", "areas", "CCM, DSM", now).await.unwrap();
-        store.update("bo", "style", "short", now).await.unwrap();
+        store.update("ana", "areas", "CCM", "t", now).await.unwrap();
+        store
+            .update("ana", "areas", "CCM, DSM", "t", now)
+            .await
+            .unwrap();
+        store
+            .update("bo", "style", "short", "t", now)
+            .await
+            .unwrap();
         let ana = store.read("ana").await.unwrap();
         assert_eq!(ana.len(), 1);
         assert_eq!(ana[0].text, "CCM, DSM");

@@ -1,5 +1,5 @@
-//! Linking each PM's own accounts: Atlassian OAuth 2.0 (3LO) for Jira and Confluence, and
-//! Slack OAuth v2 user tokens.
+//! Linking each PM's own accounts: Atlassian OAuth 2.0 (3LO) for Jira and Confluence, Slack
+//! OAuth v2 user tokens, and GitHub App user tokens (`docs/onboarding-spec.md` §1).
 //!
 //! Flow: the Slack bot or an admin page asks `GET /internal/oauth/{provider}/start?user=` for
 //! an authorize URL and sends the PM there. The provider redirects the PM's browser to the
@@ -7,9 +7,14 @@
 //! tokens in the vault. The `state` parameter is HMAC-signed, names the user and provider,
 //! expires in 10 minutes and is accepted once.
 //!
-//! [`OAuth`] is also the connectors' [`TokenSource`]. It refreshes an expiring Atlassian
-//! token (rotating refresh tokens: each refresh returns a new refresh token) under a per-user
-//! lock, so concurrent calls make one refresh.
+//! [`OAuth`] is also the connectors' [`TokenSource`]. It refreshes an expiring Atlassian or
+//! GitHub token (rotating refresh tokens: each refresh returns a new refresh token) under a
+//! per-user lock, so concurrent calls make one refresh.
+//!
+//! A GitHub link is checked before anything is stored: the account must be an active member
+//! of `PMOS_GITHUB_ORG`, and its login must be the member's `github` in `team.yaml` or, if
+//! that isn't set, one of its verified emails must be their `email`. The login is kept as the
+//! credential's `external_id`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -48,6 +53,10 @@ pub struct Endpoints {
     pub atlassian_api: String,
     /// `https://slack.com`
     pub slack: String,
+    /// `https://github.com`: `/login/oauth/authorize` and `/login/oauth/access_token`.
+    pub github_auth: String,
+    /// `https://api.github.com`
+    pub github_api: String,
 }
 
 impl Default for Endpoints {
@@ -56,6 +65,8 @@ impl Default for Endpoints {
             atlassian_auth: "https://auth.atlassian.com".into(),
             atlassian_api: "https://api.atlassian.com".into(),
             slack: "https://slack.com".into(),
+            github_auth: "https://github.com".into(),
+            github_api: "https://api.github.com".into(),
         }
     }
 }
@@ -78,6 +89,10 @@ pub struct OAuthConfig {
     /// grant covers several sites.
     pub atlassian_site: Option<String>,
     pub slack: Option<AppCredentials>,
+    /// The GitHub App. Its permissions apply, so `scopes` is unused.
+    pub github: Option<AppCredentials>,
+    /// The GitHub org a linked GitHub account must be an active member of.
+    pub github_org: Option<String>,
     /// Key for signing `state`.
     pub state_key: Vec<u8>,
     pub endpoints: Endpoints,
@@ -184,6 +199,12 @@ impl OAuth {
         match provider {
             Provider::Atlassian => self.config.atlassian.as_ref(),
             Provider::Slack => self.config.slack.as_ref(),
+            // GitHub linking needs the org to check membership against.
+            Provider::Github => self
+                .config
+                .github
+                .as_ref()
+                .filter(|_| self.config.github_org.is_some()),
         }
         .ok_or(OAuthError::NotConfigured(provider))
     }
@@ -254,7 +275,8 @@ impl OAuth {
         provider: Provider,
         now: DateTime<Utc>,
     ) -> Result<String, OAuthError> {
-        if !linkable(user) {
+        // GitHub serves PMs only: a team bot has no memory and commits nothing.
+        if !linkable(user) || (provider == Provider::Github && is_bot_identity(user)) {
             return Err(OAuthError::InvalidUser);
         }
         let app = self.app(provider)?;
@@ -289,6 +311,18 @@ impl OAuth {
                     ("state", state.as_str()),
                 ],
             ),
+            // No scope: a GitHub App's permissions apply.
+            Provider::Github => reqwest::Url::parse_with_params(
+                &format!(
+                    "{}/login/oauth/authorize",
+                    self.config.endpoints.github_auth
+                ),
+                &[
+                    ("client_id", app.client_id.as_str()),
+                    ("redirect_uri", redirect.as_str()),
+                    ("state", state.as_str()),
+                ],
+            ),
         };
         Ok(url
             .map_err(|e| OAuthError::Exchange(provider, e.to_string()))?
@@ -304,11 +338,16 @@ impl OAuth {
         now: DateTime<Utc>,
     ) -> Result<CredentialInfo, OAuthError> {
         let user = self.take_state(state, provider, now)?;
-        let credential = match provider {
+        let mut credential = match provider {
             Provider::Atlassian => self.exchange_atlassian(&user, code, now).await?,
             Provider::Slack => self.exchange_slack(&user, code, now).await?,
+            Provider::Github => self.exchange_github(&user, code, now).await?,
         };
-        self.check_identity(&credential).await?;
+        if provider == Provider::Github {
+            credential.external_id = Some(self.check_github(&credential).await?);
+        } else {
+            self.check_identity(&credential).await?;
+        }
         self.vault.put(&credential).await?;
         tracing::info!(user = %user, provider = %provider, "account linked");
         Ok(CredentialInfo {
@@ -371,8 +410,135 @@ impl OAuth {
                     return wrong("the Atlassian email isn't the email in team.yaml");
                 }
             }
+            Provider::Github => unreachable!("GitHub links are checked by check_github"),
         }
         Ok(())
+    }
+
+    /// A GET to the GitHub API with a just-issued user token.
+    async fn github_get(&self, token: &Secret, path: &str) -> Result<(u16, Value), OAuthError> {
+        let res = self
+            .http
+            .get(format!("{}{path}", self.config.endpoints.github_api))
+            .bearer_auth(token.expose())
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", crate::github::API_VERSION)
+            .header(
+                "User-Agent",
+                concat!("pmos-toolserver/", env!("CARGO_PKG_VERSION")),
+            )
+            .send()
+            .await
+            .map_err(|e| OAuthError::Exchange(Provider::Github, e.to_string()))?;
+        let status = res.status().as_u16();
+        Ok((status, res.json().await.unwrap_or(Value::Null)))
+    }
+
+    /// The GitHub account that signed in must be an active member of the org, and the PM's:
+    /// their `github` login in `team.yaml`, else a verified email equal to their `email`.
+    /// Returns the login. Nothing is stored otherwise.
+    async fn check_github(&self, credential: &Credential) -> Result<String, OAuthError> {
+        let provider = Provider::Github;
+        let wrong = |why: String| Err(OAuthError::WrongAccount(provider, why));
+        let failed = |what: &str, status: u16| {
+            OAuthError::Exchange(provider, format!("{what} returned {status}"))
+        };
+        let token = &credential.access_token;
+        let (status, me) = self.github_get(token, "/user").await?;
+        let login = match me["login"].as_str() {
+            Some(login) if status == 200 => login.to_string(),
+            _ => return Err(failed("the profile lookup", status)),
+        };
+        let org = self
+            .config
+            .github_org
+            .as_deref()
+            .ok_or(OAuthError::NotConfigured(provider))?;
+        let (status, membership) = self
+            .github_get(token, &format!("/user/memberships/orgs/{org}"))
+            .await?;
+        match status {
+            200 if membership["state"] == "active" => {}
+            200 | 403 | 404 => {
+                return wrong(format!(
+                    "the GitHub account isn't an active member of `{org}`"
+                ))
+            }
+            s => return Err(failed("the org membership lookup", s)),
+        }
+        if !self.team.enforced() {
+            return Ok(login);
+        }
+        let Some(member) = self.team.member(&credential.user) else {
+            return wrong("not in team.yaml".into());
+        };
+        if let Some(expected) = member.github.as_deref() {
+            if !login.eq_ignore_ascii_case(expected) {
+                return wrong("the GitHub login isn't the github login in team.yaml".into());
+            }
+            return Ok(login);
+        }
+        let Some(expected) = member.email.as_deref() else {
+            return wrong("team.yaml has no github login or email for this PM".into());
+        };
+        let (status, emails) = self.github_get(token, "/user/emails").await?;
+        if status != 200 {
+            return Err(failed("the email lookup", status));
+        }
+        let verified = emails.as_array().into_iter().flatten().any(|e| {
+            e["verified"].as_bool() == Some(true)
+                && e["email"]
+                    .as_str()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(expected))
+        });
+        if !verified {
+            return wrong("no verified GitHub email is the email in team.yaml".into());
+        }
+        Ok(login)
+    }
+
+    /// POST to GitHub's token endpoint. GitHub answers some errors as `200` with
+    /// `{"error": …}`, so the body decides, not only the status.
+    async fn post_github_token(&self, form: &[(&str, &str)]) -> Result<Value, (u16, String)> {
+        let res = self
+            .http
+            .post(format!(
+                "{}/login/oauth/access_token",
+                self.config.endpoints.github_auth
+            ))
+            .header("Accept", "application/json")
+            .form(form)
+            .send()
+            .await
+            .map_err(|e| (0, e.to_string()))?;
+        let status = res.status().as_u16();
+        let json: Value = res.json().await.unwrap_or(Value::Null);
+        match json["error"].as_str() {
+            Some(e) => Err((status, e.to_string())),
+            None if (200..300).contains(&status) => Ok(json),
+            None => Err((status, "error".to_string())),
+        }
+    }
+
+    async fn exchange_github(
+        &self,
+        user: &str,
+        code: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Credential, OAuthError> {
+        let app = self.app(Provider::Github)?;
+        let redirect = self.redirect_uri(Provider::Github);
+        let tokens = self
+            .post_github_token(&[
+                ("client_id", app.client_id.as_str()),
+                ("client_secret", app.client_secret.expose()),
+                ("code", code),
+                ("redirect_uri", redirect.as_str()),
+            ])
+            .await
+            .map_err(|(_, e)| OAuthError::Exchange(Provider::Github, e))?;
+        github_credential(user, &tokens, now)
+            .ok_or_else(|| OAuthError::Exchange(Provider::Github, "no access token".into()))
     }
 
     async fn post_atlassian_token(&self, body: Value) -> Result<Value, (u16, String)> {
@@ -583,6 +749,41 @@ impl OAuth {
                 }
                 Err(e) => return Err(TokenError::Unavailable(provider, e)),
             },
+            Provider::Github => {
+                let app = self
+                    .app(provider)
+                    .map_err(|e| TokenError::Unavailable(provider, e.to_string()))?;
+                match self
+                    .post_github_token(&[
+                        ("client_id", app.client_id.as_str()),
+                        ("client_secret", app.client_secret.expose()),
+                        ("grant_type", "refresh_token"),
+                        ("refresh_token", refresh.expose()),
+                    ])
+                    .await
+                {
+                    Ok(t) => github_credential(&current.user, &t, now)
+                        .map(|c| Credential {
+                            // Rotating: keep the new one; the old one stops working.
+                            refresh_token: c.refresh_token.or(current.refresh_token.clone()),
+                            external_id: current.external_id.clone(),
+                            ..c
+                        })
+                        .ok_or(TokenError::Reconnect(provider))?,
+                    // As with Atlassian, only a refused refresh token unlinks.
+                    Err((_, e)) if e == "bad_refresh_token" => return self.unlink(&current).await,
+                    Err((status, e)) => {
+                        if e == "incorrect_client_credentials" || (400..500).contains(&status) {
+                            tracing::error!(
+                                status,
+                                error = %e,
+                                "GitHub refused the token refresh; check PMOS_GITHUB_CLIENT_ID/SECRET"
+                            );
+                        }
+                        return Err(TokenError::Unavailable(provider, e));
+                    }
+                }
+            }
         };
         if refreshed.access_token.expose().is_empty() {
             return Err(TokenError::Reconnect(provider));
@@ -705,6 +906,25 @@ fn slack_user_credential(user: &str, json: &Value, now: DateTime<Utc>) -> Option
     })
 }
 
+/// The user token in a GitHub token response. It expires in 8 hours and its refresh token
+/// in about 6 months, unless the App has token expiry turned off.
+fn github_credential(user: &str, json: &Value, now: DateTime<Utc>) -> Option<Credential> {
+    Some(Credential {
+        user: user.to_string(),
+        provider: Provider::Github,
+        access_token: Secret::new(json["access_token"].as_str().filter(|t| !t.is_empty())?),
+        refresh_token: json["refresh_token"].as_str().map(Secret::new),
+        expires_at: json["expires_in"]
+            .as_i64()
+            .map(|s| now + Duration::seconds(s)),
+        scopes: json["scope"].as_str().unwrap_or_default().to_string(),
+        cloud_id: None,
+        site_url: None,
+        external_id: None,
+        updated_at: now,
+    })
+}
+
 #[async_trait]
 impl TokenSource for OAuth {
     async fn token(&self, user: &str, provider: Provider) -> Result<AccessToken, TokenError> {
@@ -732,6 +952,12 @@ mod tests {
                 }),
                 atlassian_site: None,
                 slack: None,
+                github: Some(AppCredentials {
+                    client_id: "gh-client".into(),
+                    client_secret: Secret::new("gh-secret"),
+                    scopes: Vec::new(),
+                }),
+                github_org: Some("acme".into()),
                 state_key: b"state-key-for-tests".to_vec(),
                 endpoints: Endpoints::default(),
             },
@@ -771,6 +997,27 @@ mod tests {
         assert_eq!(q["response_type"], "code");
         assert_eq!(q["prompt"], "consent");
         assert!(!url.as_str().contains("atl-secret"));
+    }
+
+    #[test]
+    fn github_authorize_url_has_no_scope_and_serves_pms_only() {
+        let o = oauth();
+        let url =
+            reqwest::Url::parse(&o.authorize_url("ana", Provider::Github, now()).unwrap()).unwrap();
+        assert_eq!(url.host_str(), Some("github.com"));
+        assert_eq!(url.path(), "/login/oauth/authorize");
+        let q: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q["client_id"], "gh-client");
+        assert_eq!(
+            q["redirect_uri"],
+            "https://pmos.example.com/oauth/github/callback"
+        );
+        assert!(!q.contains_key("scope"));
+        assert!(!url.as_str().contains("gh-secret"));
+        assert_eq!(
+            o.authorize_url("bots.docs", Provider::Github, now()),
+            Err(OAuthError::InvalidUser)
+        );
     }
 
     #[test]
