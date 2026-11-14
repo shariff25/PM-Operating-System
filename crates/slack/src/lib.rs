@@ -25,6 +25,7 @@ pub mod commands;
 pub mod member_cards;
 pub mod members;
 pub mod notify;
+pub mod proxy;
 pub mod runtime;
 pub mod slackapi;
 pub mod socket;

@@ -143,9 +143,10 @@ impl Socket {
     /// `shutdown` fires.
     pub async fn run_once(&self, shutdown: &CancellationToken) -> Result<Ended, SocketError> {
         let url = self.open().await?;
-        let (ws, _) = tokio_tungstenite::connect_async(url.as_str())
+        let proxy = crate::proxy::proxy_for(&url, |k| std::env::var(k).ok());
+        let ws = crate::proxy::connect(&url, proxy.as_ref())
             .await
-            .map_err(|e| SocketError::Ws(e.to_string()))?;
+            .map_err(SocketError::Ws)?;
         let (mut tx, mut rx) = ws.split();
         let mut ping = tokio::time::interval(self.ping_every);
         ping.tick().await;

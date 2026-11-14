@@ -1,4 +1,5 @@
 /target
+/state/
 node_modules/
 dist/
 *.tsbuildinfo

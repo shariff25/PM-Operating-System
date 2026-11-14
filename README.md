@@ -44,6 +44,9 @@ pnpm install
 pnpm typecheck && pnpm test                 # harness
 ```
 
+To try PM OS end to end before the Spark is ready, run it against a test Slack workspace with
+a Claude model behind the gateway (testing only): [docs/testing-with-claude.md](docs/testing-with-claude.md).
+
 ## Contributing content
 
 Change anything in `content/` by pull request. CI runs `pmos lint`. Context files need an
