@@ -136,6 +136,8 @@ macro_rules! contract {
 
 contract!(
     sessions_expire_and_revoke,
+    bot_sessions_keep_their_bot,
+    approval_items_and_audit_events_keep_their_bot,
     grants_match_one_exact_call_once,
     grants_are_taken_once_under_concurrency,
     approvals_list_newest_first_and_filter,
@@ -190,6 +192,87 @@ async fn sessions_expire_and_revoke(b: &Backend) {
         .await
         .unwrap()
         .is_none());
+}
+
+async fn bot_sessions_keep_their_bot(b: &Backend) {
+    let bot = Session::for_bot("ana", "scout", "tsk_1", Duration::minutes(30), now());
+    let skill = Session::new("ana", "ask", "r1", Duration::minutes(30), now());
+    b.stores.sessions.insert(&bot, now()).await.unwrap();
+    b.stores.sessions.insert(&skill, now()).await.unwrap();
+    let got = b
+        .stores
+        .sessions
+        .get(&bot.token, now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, bot);
+    assert_eq!(got.bot.as_deref(), Some("scout"));
+    assert_eq!(got.skill, None);
+    let got = b
+        .stores
+        .sessions
+        .get(&skill.token, now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((got.skill.as_deref(), got.bot), (Some("ask"), None));
+    assert!(b.stores.sessions.revoke(&bot.token).await.unwrap());
+}
+
+async fn approval_items_and_audit_events_keep_their_bot(b: &Backend) {
+    let a = b.stores.approvals.as_ref();
+    let args = json!({"project": "PM", "issue_type": "Task", "summary": "x"});
+    let item = a
+        .create(
+            NewItem {
+                user: "ana",
+                skill: None,
+                bot: Some("scout"),
+                run_id: "tsk_1",
+                tool: "jira.create_issue",
+                args: &args,
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(item.bot.as_deref(), Some("scout"));
+    assert_eq!(a.get(&item.id).await.unwrap().unwrap(), item);
+    assert_eq!(a.list("ana", None).await.unwrap(), vec![item.clone()]);
+    let decided = a
+        .decide(&item.id, "ana", Decision::Approve, None, now())
+        .await
+        .unwrap();
+    assert_eq!(
+        (decided.bot.as_deref(), decided.skill),
+        (Some("scout"), None)
+    );
+
+    b.stores
+        .audit
+        .record(AuditEvent {
+            skill: None,
+            bot: Some("scout".into()),
+            ..event(Outcome::Denied)
+        })
+        .await
+        .unwrap();
+    if let Some(mem) = &b.memory_audit {
+        let e = mem.events().pop().unwrap();
+        assert_eq!((e.skill, e.bot.as_deref()), (None, Some("scout")));
+    }
+    if let Some(pg) = &b.pg {
+        let row = sqlx::query("SELECT skill, bot FROM audit_events")
+            .fetch_one(pg.pool())
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<String>, _>("skill"), None);
+        assert_eq!(
+            row.get::<Option<String>, _>("bot").as_deref(),
+            Some("scout")
+        );
+    }
 }
 
 // ----- grants -----------------------------------------------------------------------------
@@ -268,7 +351,8 @@ async fn grants_are_taken_once_under_concurrency(b: &Backend) {
 fn new_item<'a>(user: &'a str, args: &'a Value) -> NewItem<'a> {
     NewItem {
         user,
-        skill: "prd-draft",
+        skill: Some("prd-draft"),
+        bot: None,
         run_id: "r1",
         tool: "confluence.create_draft",
         args,
@@ -643,7 +727,8 @@ fn event(outcome: Outcome) -> AuditEvent {
         at: now(),
         run_id: "run-a".into(),
         user: "ana".into(),
-        skill: "prd-draft".into(),
+        skill: Some("prd-draft".into()),
+        bot: None,
         tool: "confluence.create_draft".into(),
         outcome,
         sources: vec!["context/products/ccm.md".into(), "jira:PM-101".into()],
@@ -835,6 +920,37 @@ mod postgres_only {
             .collect();
         assert_eq!(stored, vec![token_hash(&s.token)]);
         assert!(!stored.contains(&s.token));
+        b.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_or_item_names_a_skill_or_a_bot_never_both() {
+        let Some(b) = Backend::postgres(Vec::new()).await else {
+            return;
+        };
+        let pg = b.pg.as_ref().unwrap();
+        for (skill, bot) in [(Some("ask"), Some("scout")), (None, None)] {
+            let err = sqlx::query(
+                "INSERT INTO sessions (token_hash, user_handle, skill, bot, run_id, created_at, expires_at)
+                 VALUES ('h', 'ana', $1, $2, 'r', now(), now())",
+            )
+            .bind(skill)
+            .bind(bot)
+            .execute(pg.pool())
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("sessions_skill_or_bot"), "{err}");
+            let err = sqlx::query(
+                "INSERT INTO approvals (id, user_handle, skill, bot, run_id, tool, args, args_hash, status, created_at)
+                 VALUES ('apr_x', 'ana', $1, $2, 'r', 't', '{}', 'h', 'pending', now())",
+            )
+            .bind(skill)
+            .bind(bot)
+            .execute(pg.pool())
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("approvals_skill_or_bot"), "{err}");
+        }
         b.finish().await;
     }
 

@@ -24,7 +24,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 
-use crate::session::valid_handle;
+use crate::session::{is_bot_identity, valid_handle};
+
+/// Who may have linked accounts: a PM, or a team bot's service identity.
+fn linkable(user: &str) -> bool {
+    valid_handle(user) || is_bot_identity(user)
+}
 use crate::store::{StoreError, StoreResult};
 use crate::team::Team;
 use crate::vault::{Credential, CredentialInfo, Provider, Secret, Vault};
@@ -227,7 +232,7 @@ impl OAuth {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .ok_or(OAuthError::BadState)?;
-        if claims.p != provider || claims.e <= now.timestamp() || !valid_handle(&claims.u) {
+        if claims.p != provider || claims.e <= now.timestamp() || !linkable(&claims.u) {
             return Err(OAuthError::BadState);
         }
         let mut used = self.used_states.lock().expect("state lock");
@@ -240,14 +245,16 @@ impl OAuth {
         Ok(claims.u)
     }
 
-    /// The URL to send `user` to, to link their `provider` account.
+    /// The URL to send `user` to, to link their `provider` account. `user` is a PM's handle,
+    /// or a team bot's service identity `bots.<name>` for a platform owner linking the bot's
+    /// own read-only account.
     pub fn authorize_url(
         &self,
         user: &str,
         provider: Provider,
         now: DateTime<Utc>,
     ) -> Result<String, OAuthError> {
-        if !valid_handle(user) {
+        if !linkable(user) {
             return Err(OAuthError::InvalidUser);
         }
         let app = self.app(provider)?;
@@ -316,7 +323,14 @@ impl OAuth {
 
     /// The account that signed in must be the one `team.yaml` lists for this PM. Nothing is
     /// stored otherwise.
+    ///
+    /// A team bot's identity (`bots.<name>`) isn't a PM, so `team.yaml` has nothing to check
+    /// it against: its link URL comes only from a platform owner's service-token call.
     async fn check_identity(&self, credential: &Credential) -> Result<(), OAuthError> {
+        if is_bot_identity(&credential.user) {
+            tracing::info!(identity = %credential.user, provider = %credential.provider, "linking a team bot's own account");
+            return Ok(());
+        }
         if !self.team.enforced() {
             return Ok(());
         }
@@ -770,6 +784,17 @@ mod tests {
             o.authorize_url("../x", Provider::Atlassian, now()),
             Err(OAuthError::InvalidUser)
         );
+        // A team bot's identity links; anything else under `bots.` doesn't.
+        assert!(o
+            .authorize_url("bots.docs", Provider::Atlassian, now())
+            .is_ok());
+        for bad in ["bots.", "bots.Docs", "bots.a--b"] {
+            assert_eq!(
+                o.authorize_url(bad, Provider::Atlassian, now()),
+                Err(OAuthError::InvalidUser),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

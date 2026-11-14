@@ -211,9 +211,13 @@ fn build_with(
     }
 }
 
-/// The repo's content, plus a Restricted context file and an `internal-brief` skill whose
-/// data class is `internal`.
-fn content_tree() -> (TempDir, PathBuf) {
+/// The repo's content (with the team bot `docs`), plus:
+/// - a Restricted context file and an `internal-brief` skill whose data class is `internal`;
+/// - a `field-scout` role (internal, skill `field-watch`, `slack.post_reply: never`);
+/// - team bots `scout` (reads Jira `PM`, Confluence `ENG`, Slack `C0FIELD`) and `blind`
+///   (reads nothing), both `field-scout`;
+/// - `pm-ana`, Ana's personal `pm-assistant` bot, with `slack.send_message: never`.
+pub fn content_tree() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("content");
     copy_dir(
@@ -235,6 +239,36 @@ fn content_tree() -> (TempDir, PathBuf) {
         "skills/internal-brief/SKILL.md",
         "---\nname: internal-brief\ndescription: Test skill limited to internal data.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"internal\"\n  tools: \"context.search context.read jira.search jira.create_issue memory.read memory.update\"\n---\n\n# /internal-brief\n\nTest.\n",
     );
+    write(
+        &root,
+        "skills/field-watch/SKILL.md",
+        "---\nname: field-watch\ndescription: Test skill that watches field questions.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"internal\"\n  tools: \"context.search context.read jira.search jira.read jira.create_issue confluence.search confluence.read slack.search slack.read_thread slack.post_reply\"\n---\n\n# /field-watch\n\nTest.\n",
+    );
+    write(
+        &root,
+        "roles/field-scout/ROLE.md",
+        "---\nname: field-scout\ndescription: Test role that watches field questions.\nowner: \"@pm\"\nversion: \"0.1.0\"\nskills: \"field-watch\"\ndata-class: \"internal\"\nmodel: \"default\"\nactions:\n  slack.post_reply: never\n---\n\n# Field scout\n\nWatch the field channel.\n",
+    );
+    write(
+        &root,
+        "bots/scout/BOT.md",
+        "---\nname: scout\nrole: field-scout\nscope: team\nowner: \"@ana\"\ndescription: Test team bot.\nreads:\n  jira-projects: [PM]\n  confluence-spaces: [ENG]\n  slack-channels: [C0FIELD]\n---\n\n# Scout\n\nAnswer field questions.\n",
+    );
+    write(
+        &root,
+        "bots/blind/BOT.md",
+        "---\nname: blind\nrole: field-scout\nscope: team\nowner: \"@ana\"\ndescription: Test team bot with no read scope.\n---\n\n# Blind\n\nReads nothing.\n",
+    );
+    write(
+        &root,
+        "bots/pm-ana/BOT.md",
+        "---\nname: pm-ana\nrole: pm-assistant\nscope: personal\nowner: \"@ana\"\ndescription: Ana's assistant.\nactions:\n  slack.send_message: never\n---\n\n# Ana's assistant\n\nHelp Ana.\n",
+    );
 
     (dir, root)
+}
+
+/// Write a file under the fixture's content root, as a merge to the content repo would.
+pub fn write_content(root: &Path, rel: &str, text: &str) {
+    write(root, rel, text)
 }
