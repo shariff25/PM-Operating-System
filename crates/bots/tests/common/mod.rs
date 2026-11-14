@@ -80,6 +80,7 @@ fn member(handle: &str, slack_id: &str) -> TeamMember {
         handle: handle.into(),
         slack_id: slack_id.into(),
         email: None,
+        github: None,
         roles: vec![TeamRole::Pm],
     }
 }
