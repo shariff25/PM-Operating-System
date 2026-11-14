@@ -1,0 +1,35 @@
+[package]
+name = "pmos-toolserver"
+description = "PM OS tool server: the only path from an agent sandbox to context and systems of record"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version = "1.88"
+
+[[bin]]
+name = "pmos-toolserver"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+pmos-contract.workspace = true
+rmcp = { version = "3.10", features = ["server", "transport-streamable-http-server"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+rmcp = { version = "3.10", features = ["client", "transport-streamable-http-client-reqwest"] }
+tempfile.workspace = true

@@ -39,7 +39,8 @@ Jira and Confluence, and the PM's Slack user token for Slack. Inside the harness
 underscores (`jira.create_issue` is `jira_create_issue`), because OpenAI-style function names
 allow no dots.
 
-Rules: `tools-missing`, `tools-parse`, `tool-duplicate`, `tool-name`.
+Rules: `tools-missing`, `tools-parse`, `tool-duplicate`, `tool-name`,
+`tool-harness-collision` (two names that become the same harness name).
 
 ## Skills: `skills/<name>/SKILL.md`
 
