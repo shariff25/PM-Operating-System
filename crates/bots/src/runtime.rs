@@ -6,7 +6,7 @@
 //! Every method takes `now`, so tests can move the clock; the background loops pass the
 //! real time.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -165,7 +165,9 @@ pub struct RoutineChange {
 
 pub struct Runtime {
     pub store: Arc<dyn BotsStore>,
-    pub catalog: Arc<Catalog>,
+    /// The bots, roles and team, swapped whole when the content changes (`catalog::Reloader`).
+    /// Each use takes its own snapshot, so a reload never changes a catalog mid-call.
+    catalog: RwLock<Arc<Catalog>>,
     toolserver: ToolServer,
     gateway: Gateway,
     /// Bumped on every change a long-poll may be waiting for (a new task, a notification).
@@ -193,12 +195,23 @@ impl Runtime {
     ) -> Self {
         Self {
             store,
-            catalog,
+            catalog: RwLock::new(catalog),
             toolserver,
             gateway,
             changed: watch::channel(0).0,
             stop,
         }
+    }
+
+    /// The catalog as it is now.
+    pub fn catalog(&self) -> Arc<Catalog> {
+        self.catalog.read().expect("catalog lock").clone()
+    }
+
+    /// Replace the catalog. Tasks already claimed keep the bot, role and tools they were
+    /// claimed with; new claims, tasks and routines use the new one.
+    pub fn set_catalog(&self, catalog: Arc<Catalog>) {
+        *self.catalog.write().expect("catalog lock") = catalog;
     }
 
     fn bump(&self) {
@@ -223,9 +236,10 @@ impl Runtime {
 
     // ----- tasks ---------------------------------------------------------------------------
 
-    pub fn bot(&self, name: &str) -> Result<&Bot> {
-        self.catalog
+    pub fn bot(&self, name: &str) -> Result<Bot> {
+        self.catalog()
             .bot(name)
+            .cloned()
             .ok_or_else(|| Error::NotFound(format!("there's no bot called `{name}`")))
     }
 
@@ -244,8 +258,8 @@ impl Runtime {
             return Err(e);
         }
         let bot = self.bot(&new.bot)?;
-        self.catalog
-            .may_use(&new.requested_by, bot)
+        self.catalog()
+            .may_use(&new.requested_by, &bot)
             .map_err(Error::Forbidden)?;
         let task = Task::queued(
             &bot.name,
@@ -321,10 +335,10 @@ impl Runtime {
             let Some(task) = self.store.claim(bots, worker, lease_until, now).await? else {
                 return Ok(None);
             };
-            let found = self
-                .catalog
+            let catalog = self.catalog();
+            let found = catalog
                 .bot(&task.bot)
-                .and_then(|b| self.catalog.role(b).map(|r| (b, r)));
+                .and_then(|b| catalog.role(b).map(|r| (b, r)));
             let Some((bot, role)) = found else {
                 let reason = format!("the bot `{}` no longer exists", task.bot);
                 self.fail_claimed(&task, worker, &reason, now).await?;
@@ -346,7 +360,7 @@ impl Runtime {
                         .and_then(|v| v.as_str().map(str::to_string))
                         .unwrap_or_else(|| "default".into());
                     return Ok(Some(Claim {
-                        tools: self.catalog.tools(bot).into_iter().collect(),
+                        tools: catalog.tools(bot).into_iter().collect(),
                         bot: bot.clone(),
                         role: role.clone(),
                         session_token,
@@ -728,9 +742,11 @@ impl Runtime {
 
     // ----- routines (D8) -------------------------------------------------------------------
 
-    fn bot_for(&self, name: &str, owner: &str) -> Result<&Bot> {
+    fn bot_for(&self, name: &str, owner: &str) -> Result<Bot> {
         let bot = self.bot(name)?;
-        self.catalog.may_use(owner, bot).map_err(Error::Forbidden)?;
+        self.catalog()
+            .may_use(owner, &bot)
+            .map_err(Error::Forbidden)?;
         Ok(bot)
     }
 
@@ -885,9 +901,10 @@ impl Runtime {
                 continue;
             };
             // Why this run can't go ahead, if it can't; the routine is then paused.
-            let problem = match self.catalog.bot(&r.bot) {
+            let catalog = self.catalog();
+            let problem = match catalog.bot(&r.bot) {
                 None => Some(format!("its bot `{}` no longer exists", r.bot)),
-                Some(bot) => self.catalog.may_use(&r.owner, bot).err(),
+                Some(bot) => catalog.may_use(&r.owner, bot).err(),
             };
             let next = routines::next_run(&r.schedule, now);
             let problem = problem.or_else(|| next.as_ref().err().cloned());
