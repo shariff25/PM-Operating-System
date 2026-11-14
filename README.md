@@ -19,9 +19,8 @@ Slack without the PM's approval.
 | `crates/toolserver` | The only path from a sandbox to context and systems: MCP, allowlists, approvals, audit ([docs](docs/toolserver.md)) | Rust |
 | `harness/` | Team-service agent on LangChain Deep Agents | TypeScript |
 
-Still to come, per the plan: Postgres and the real Atlassian and Slack connectors, the
-gateway, orchestrator, Slack app and policy checker (Rust), sandbox policies, evals, and the
-web workspace (TypeScript).
+Still to come, per the plan: the gateway, orchestrator, policy checker, and the Slack bot
+(Rust), which is how PMs use PM OS; plus sandbox policies, evals and a few admin pages.
 
 ## Develop
 

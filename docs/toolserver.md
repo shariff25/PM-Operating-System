@@ -54,7 +54,7 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | `GET /internal/credentials?user=` | service token | A PM's linked accounts, without tokens |
 | `DELETE /internal/credentials/{user}/{provider}` | service token | Unlink (the PM disconnects, or a platform owner revokes) |
 
-Only the orchestrator, the Slack app and the web workspace hold the service token. Sandboxes
+Only the orchestrator and the Slack bot hold the service token. Sandboxes
 get only their own session token. A tool error (refused, invalid arguments, not found) comes
 back as an MCP tool result with `isError: true`, so the model can read why.
 
@@ -83,7 +83,7 @@ These API shapes were checked against developer.atlassian.com and docs.slack.dev
 happens on the Spark after Gate 1.
 
 **Linking an account.**
-1. The web workspace or Slack app asks `/internal/oauth/{provider}/start` for a URL and sends the PM there.
+1. The Slack bot (its Accounts tab, or a first-use prompt) asks `/internal/oauth/{provider}/start` for a URL and sends the PM there.
 2. Atlassian or Slack sends the PM's browser back to `/oauth/{provider}/callback`.
 3. The tool server exchanges the code and seals the tokens in the vault.
 
