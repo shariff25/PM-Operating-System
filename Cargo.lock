@@ -1592,6 +1592,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmos-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "pmos-contract",
+ "pmos-runtime",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "pmos-runtime"
 version = "0.1.0"
 dependencies = [
