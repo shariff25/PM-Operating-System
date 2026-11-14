@@ -130,6 +130,7 @@ async fn main() -> Result<()> {
         }
     }
     let skills = catalog.skills().count();
+    let bots = catalog.roster().bots().count();
     let svc = ToolService::new(catalog, stores, connectors)
         .map_err(anyhow::Error::msg)?
         .with_team(team.clone());
@@ -164,6 +165,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         bind = %config.bind,
         skills,
+        bots,
         postgres = config.database_url.is_some(),
         "pmos-toolserver listening"
     );

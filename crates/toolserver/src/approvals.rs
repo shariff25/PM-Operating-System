@@ -85,7 +85,11 @@ impl Status {
 pub struct ApprovalItem {
     pub id: String,
     pub user: String,
-    pub skill: String,
+    /// The skill whose session asked for the write; `None` when a bot's session did.
+    pub skill: Option<String>,
+    /// The bot whose session asked for the write, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot: Option<String>,
     pub run_id: String,
     /// Registry name, such as `confluence.create_draft`.
     pub tool: String,
@@ -125,7 +129,10 @@ pub enum DecideError {
 
 pub struct NewItem<'a> {
     pub user: &'a str,
-    pub skill: &'a str,
+    /// The session's skill, or `None` for a bot session.
+    pub skill: Option<&'a str>,
+    /// The session's bot, for a bot session.
+    pub bot: Option<&'a str>,
     pub run_id: &'a str,
     pub tool: &'a str,
     pub args: &'a Value,
@@ -136,7 +143,8 @@ impl NewItem<'_> {
         ApprovalItem {
             id: format!("apr_{}", uuid::Uuid::new_v4().simple()),
             user: self.user.to_string(),
-            skill: self.skill.to_string(),
+            skill: self.skill.map(String::from),
+            bot: self.bot.map(String::from),
             run_id: self.run_id.to_string(),
             tool: self.tool.to_string(),
             args: self.args.clone(),

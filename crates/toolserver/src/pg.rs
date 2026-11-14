@@ -287,12 +287,14 @@ impl MemoryStore for PgStore {
 impl SessionRepo for PgStore {
     async fn insert(&self, session: &Session, _now: DateTime<Utc>) -> StoreResult<()> {
         sqlx::query(
-            "INSERT INTO sessions (token_hash, user_handle, skill, run_id, created_at, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO sessions
+                 (token_hash, user_handle, skill, bot, run_id, created_at, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(token_hash(&session.token))
         .bind(&session.user)
         .bind(&session.skill)
+        .bind(&session.bot)
         .bind(&session.run_id)
         .bind(session.created_at)
         .bind(session.expires_at)
@@ -303,7 +305,7 @@ impl SessionRepo for PgStore {
 
     async fn get(&self, token: &str, now: DateTime<Utc>) -> StoreResult<Option<Session>> {
         let row = sqlx::query(
-            "SELECT user_handle, skill, run_id, created_at, expires_at
+            "SELECT user_handle, skill, bot, run_id, created_at, expires_at
              FROM sessions WHERE token_hash = $1 AND expires_at > $2",
         )
         .bind(token_hash(token))
@@ -315,6 +317,7 @@ impl SessionRepo for PgStore {
                 token: token.to_string(),
                 user: r.try_get("user_handle")?,
                 skill: r.try_get("skill")?,
+                bot: r.try_get("bot")?,
                 run_id: r.try_get("run_id")?,
                 created_at: r.try_get("created_at")?,
                 expires_at: r.try_get("expires_at")?,
@@ -338,6 +341,7 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
         id: r.try_get("id")?,
         user: r.try_get("user_handle")?,
         skill: r.try_get("skill")?,
+        bot: r.try_get("bot")?,
         run_id: r.try_get("run_id")?,
         tool: r.try_get("tool")?,
         args: r.try_get("args")?,
@@ -350,7 +354,7 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
     })
 }
 
-const ITEM_COLUMNS: &str = "id, user_handle, skill, run_id, tool, args, args_hash, status, \
+const ITEM_COLUMNS: &str = "id, user_handle, skill, bot, run_id, tool, args, args_hash, status, \
                             created_at, decided_at, decided_by, result";
 
 #[async_trait]
@@ -402,12 +406,13 @@ impl ApprovalRepo for PgStore {
         let item = new.into_item(now);
         sqlx::query(
             "INSERT INTO approvals
-                 (id, user_handle, skill, run_id, tool, args, args_hash, status, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                 (id, user_handle, skill, bot, run_id, tool, args, args_hash, status, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(&item.id)
         .bind(&item.user)
         .bind(&item.skill)
+        .bind(&item.bot)
         .bind(&item.run_id)
         .bind(&item.tool)
         .bind(&item.args)
@@ -547,14 +552,15 @@ impl AuditSink for PgStore {
     async fn record(&self, event: AuditEvent) -> StoreResult<()> {
         sqlx::query(
             "INSERT INTO audit_events
-                 (at, run_id, user_handle, skill, tool, outcome, sources, args_hash, output_ref,
-                  detail, client)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                 (at, run_id, user_handle, skill, bot, tool, outcome, sources, args_hash,
+                  output_ref, detail, client)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(event.at)
         .bind(&event.run_id)
         .bind(&event.user)
         .bind(&event.skill)
+        .bind(&event.bot)
         .bind(&event.tool)
         .bind(outcome_str(event.outcome))
         .bind(&event.sources)
