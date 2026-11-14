@@ -2,7 +2,7 @@
 //! 3 seconds) and, for slow work, a follow-up that replies through `response_url`.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use pmos_contract::model::TeamFile;
@@ -44,18 +44,27 @@ pub struct Commands {
 
 pub const SLACK_RESPONSE_URL_PREFIX: &str = "https://hooks.slack.com/";
 
+/// What someone outside `team.yaml` is told, privately.
+pub const NOT_A_MEMBER: &str = "PM OS is for the Acme product team. If you need access, ask a \
+                                platform-owner PM to add you.";
+
+/// Read `team.yaml`. Unreadable or unparseable means nobody may use the bot, never everyone.
+pub fn load_team(team_file: &Path) -> TeamFile {
+    match std::fs::read_to_string(team_file) {
+        Ok(text) => TeamFile::from_yaml(&text).unwrap_or_else(|e| {
+            tracing::error!(error = %e, "team.yaml does not parse; nobody can use the bot");
+            TeamFile::default()
+        }),
+        Err(e) => {
+            tracing::error!(error = %e, path = %team_file.display(), "team.yaml unreadable");
+            TeamFile::default()
+        }
+    }
+}
+
 impl Commands {
     fn team(&self) -> TeamFile {
-        match std::fs::read_to_string(&self.team_file) {
-            Ok(text) => TeamFile::from_yaml(&text).unwrap_or_else(|e| {
-                tracing::error!(error = %e, "team.yaml does not parse; nobody can use the bot");
-                TeamFile::default()
-            }),
-            Err(e) => {
-                tracing::error!(error = %e, path = %self.team_file.display(), "team.yaml unreadable");
-                TeamFile::default()
-            }
-        }
+        load_team(&self.team_file)
     }
 
     /// Handle one `slash_commands` payload.
@@ -76,10 +85,7 @@ impl Commands {
         let Some(member) = team.by_slack_id(slack_id) else {
             tracing::info!(slack_id, "/docs from someone not in team.yaml");
             return Reply {
-                ack: blocks::text(
-                    "PM OS is for the Acme product team. If you need access, ask a \
-                     platform-owner PM to add you.",
-                ),
+                ack: blocks::text(NOT_A_MEMBER),
                 follow_up: None,
             };
         };
