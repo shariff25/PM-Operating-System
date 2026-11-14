@@ -1,0 +1,19 @@
+[package]
+name = "pmos-policy"
+description = "PM OS sandbox policies: one NVIDIA OpenShell policy per bot, generated and checked"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+pmos-contract.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+walkdir.workspace = true
