@@ -1,0 +1,35 @@
+[package]
+name = "pmos-bots"
+description = "PM OS bot runtime: tasks, routines, traces and notifications for the named bots"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version = "1.88"
+
+[[bin]]
+name = "pmos-bots"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+croner.workspace = true
+pmos-contract.workspace = true
+pmos-runtime.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
