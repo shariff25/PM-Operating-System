@@ -26,7 +26,8 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::config::{Client, Models, Role};
+use crate::anthropic;
+use crate::config::{Client, Models, Role, UpstreamKind};
 use crate::scheduler::{Permit, Priority, Scheduler};
 use crate::usage::{UsageEvent, UsageLog};
 use crate::{stub, workarounds};
@@ -40,6 +41,8 @@ pub struct GatewayConfig {
     pub usage: Arc<UsageLog>,
     pub stub: bool,
     pub workarounds_on: bool,
+    /// The Claude API key for testing-only Claude roles (`anthropic.rs`); unused otherwise.
+    pub anthropic_key: String,
 }
 
 struct Inner {
@@ -48,8 +51,11 @@ struct Inner {
     usage: Arc<UsageLog>,
     sched: Arc<Scheduler>,
     http: reqwest::Client,
+    /// For the testing-only Claude upstream: a whole answer arrives at once, so allow longer.
+    claude_http: reqwest::Client,
     stub: bool,
     workarounds_on: bool,
+    anthropic_key: String,
 }
 
 #[derive(Clone)]
@@ -81,14 +87,21 @@ pub fn router(cfg: GatewayConfig) -> Router {
         .read_timeout(Duration::from_secs(120))
         .build()
         .expect("http client builds");
+    let claude_http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(600))
+        .build()
+        .expect("http client builds");
     let state = AppState(Arc::new(Inner {
         models: cfg.models,
         clients: cfg.clients,
         usage: cfg.usage,
         sched,
         http,
+        claude_http,
         stub: cfg.stub,
         workarounds_on: cfg.workarounds_on,
+        anthropic_key: cfg.anthropic_key,
     }));
     let v1 = Router::new()
         .route("/models", get(models))
@@ -370,6 +383,14 @@ async fn forward(
         });
     }
 
+    if role.kind == UpstreamKind::ClaudeTest {
+        let res = claude(inner, &role, endpoint, &req, stream, &mut event).await;
+        event.latency_ms = started.elapsed().as_millis() as u64;
+        inner.usage.record(event);
+        drop(permit);
+        return finish(res);
+    }
+
     let url = format!("{}/{}", role.upstream, endpoint.path());
     let res = match inner.http.post(&url).json(&req).send().await {
         Ok(r) => r,
@@ -460,4 +481,88 @@ async fn forward(
     inner.usage.record(event);
     drop(permit);
     finish(Json(answer).into_response())
+}
+
+/// One call to the testing-only Claude upstream (`anthropic.rs`): the request translated to
+/// the Messages API and the answer back. A streamed request gets the whole answer as one
+/// event stream once it is ready.
+async fn claude(
+    inner: &Inner,
+    role: &Role,
+    endpoint: Endpoint,
+    req: &Value,
+    stream: bool,
+    event: &mut UsageEvent,
+) -> Response {
+    if endpoint != Endpoint::Chat {
+        event.status = 400;
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "the `{}` role is the Claude test upstream, which has no embeddings",
+                role.name
+            ),
+        );
+    }
+    let body = match anthropic::to_messages(req, &role.model, role.effort.as_deref()) {
+        Ok(b) => b,
+        Err(m) => {
+            event.status = 400;
+            return error(StatusCode::BAD_REQUEST, "invalid_request_error", m);
+        }
+    };
+    let res = inner
+        .claude_http
+        .post(format!("{}/v1/messages", role.upstream))
+        .header("x-api-key", &inner.anthropic_key)
+        .header("anthropic-version", anthropic::API_VERSION)
+        .header("anthropic-beta", anthropic::FALLBACK_BETA)
+        .json(&body)
+        .send()
+        .await;
+    let res = match res {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(upstream = %role.upstream, error = %e, "Claude test upstream unreachable");
+            event.status = 502;
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                format!(
+                    "the `{}` model (Claude test upstream) is unavailable",
+                    role.name
+                ),
+            );
+        }
+    };
+    let status = res.status();
+    event.status = status.as_u16();
+    let answer: Value = res.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        tracing::warn!(
+            status = status.as_u16(),
+            "Claude test upstream refused the request"
+        );
+        return (
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(anthropic::error_body(&answer, status.as_u16())),
+        )
+            .into_response();
+    }
+    let answer = anthropic::from_messages(&answer, &role.model);
+    event.prompt_tokens = answer["usage"]["prompt_tokens"].as_u64();
+    event.completion_tokens = answer["usage"]["completion_tokens"].as_u64();
+    if stream {
+        (
+            [
+                (header::CONTENT_TYPE, "text/event-stream"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            anthropic::as_stream(&answer),
+        )
+            .into_response()
+    } else {
+        Json(answer).into_response()
+    }
 }

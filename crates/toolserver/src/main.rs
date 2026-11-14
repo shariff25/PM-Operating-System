@@ -80,12 +80,19 @@ async fn main() -> Result<()> {
     {
         Connectors::Fake => {
             tracing::warn!("PMOS_CONNECTORS=fake: serving fixture Jira, Confluence and Slack");
+            let docs: Arc<dyn Connector> = match &config.fake_mode_docs {
+                Some((url, token)) => {
+                    tracing::info!(url = %url, "docs tools use the real pmos-docs (public support docs)");
+                    Arc::new(Docs::new(url.clone(), token.expose()))
+                }
+                None => Arc::new(FakeConnector::docs()),
+            };
             (
                 vec![
                     Arc::new(FakeConnector::jira()),
                     Arc::new(FakeConnector::confluence()),
                     Arc::new(FakeConnector::slack()),
-                    Arc::new(FakeConnector::docs()),
+                    docs,
                 ],
                 None,
             )

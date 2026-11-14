@@ -1658,6 +1658,7 @@ dependencies = [
  "pmos-contract",
  "pmos-policy",
  "serde_json",
+ "serde_norway",
 ]
 
 [[package]]
@@ -1813,6 +1814,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "pmos-contract",

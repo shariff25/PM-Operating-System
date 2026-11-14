@@ -127,6 +127,10 @@ pub struct Config {
     /// `PMOS_CONNECTORS`: `live` (real Atlassian and Slack, each PM's own token) or `fake`
     /// (fixtures, for dev and tests). Required, so the choice is always deliberate.
     pub connectors: Connectors,
+    /// With `PMOS_CONNECTORS=fake`: `PMOS_DOCS_URL` and `PMOS_DOCS_TOKEN` both set point the
+    /// docs tools at a real `pmos-docs` (the public support docs) while Jira, Confluence and
+    /// Slack stay fixtures. For testing a bot on real docs without any PM's tokens.
+    pub fake_mode_docs: Option<(String, Secret)>,
     /// `PMOS_MEMORY`: `store` (default) or `github`, which needs live connectors and GitHub.
     pub memory: MemoryBackend,
     /// `PMOS_CONTENT_SYNC_SECS`: how often the content checkout is pulled; `0` turns it off.
@@ -184,6 +188,12 @@ impl Config {
             }
             None => return Err("PMOS_CONNECTORS is required (`live` or `fake`)".into()),
         };
+        let fake_mode_docs = match (&connectors, get("PMOS_DOCS_URL"), get("PMOS_DOCS_TOKEN")) {
+            (Connectors::Fake, Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
+                Some((url, Secret::new(token)))
+            }
+            _ => None,
+        };
         let memory = match get("PMOS_MEMORY").as_deref() {
             None | Some("") | Some("store") => MemoryBackend::Store,
             Some("github") => MemoryBackend::Github,
@@ -228,6 +238,7 @@ impl Config {
             audit_log,
             allowed_hosts,
             connectors,
+            fake_mode_docs,
             memory,
             content_sync_secs,
         })
@@ -443,6 +454,17 @@ mod tests {
             .allowed_hosts
             .contains(&"toolserver.pmos.internal".to_string()));
         assert!(matches!(ok.connectors, Connectors::Fake));
+        assert!(ok.fake_mode_docs.is_none());
+        let docs = cfg(&[
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+            ("PMOS_DOCS_URL", "http://127.0.0.1:8730/mcp"),
+            ("PMOS_DOCS_TOKEN", "docs-token"),
+        ])
+        .unwrap();
+        let (url, _) = docs.fake_mode_docs.expect("fake mode can use real docs");
+        assert_eq!(url, "http://127.0.0.1:8730/mcp");
     }
 
     #[test]
