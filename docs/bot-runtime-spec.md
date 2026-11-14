@@ -213,9 +213,15 @@ Admins (role `admin` in `team.yaml`) see everything; a PM sees their own bots, r
 ## 7. Sandbox policies (0f): `crates/policy` and `pmos policy`
 - **Per bot:** `policies/bots/<bot>.yaml` is generated from the bot's role (the D3 role template) by `pmos policy generate`.
 - **Checked in CI:** `pmos policy check` verifies the files are current and every rule holds:
-  - **Network:** egress denied by default, allowing only `toolserver.pmos.internal:8710` (MCP) and `gateway.pmos.internal:8740`;
+  - **Network:** egress denied by default, allowing only:
+    - `toolserver.pmos.internal:8710` (MCP on `/mcp`, the role's tools only);
+    - `gateway.pmos.internal:8740` (`POST /v1/chat/completions`);
+    - `bots.pmos.internal:8750`, the worker routes only: `POST /v1/worker/claim` and `POST /v1/worker/tasks/*/{heartbeat,events,trace,complete,fail}`;
   - **Filesystem:** the bot's own workspace is writable; `skills/` and its master context are read-only; nothing else is mounted;
-  - **Credentials:** only the bot's own session and gateway credentials, injected per sandbox;
+  - **Credentials:** only the bot's own, per sandbox:
+    - its gateway client token (provider `pmos-<bot>-gateway`; one `bot-<bot>` entry per bot in `PMOS_GATEWAY_TOKENS`);
+    - its runtime worker token (provider `pmos-<bot>-worker`; one `worker-<bot>` entry per bot in `PMOS_BOTS_TOKENS`, which claims only that bot's tasks);
+    - the tool-server session token, which comes in each claim response (v1 decision, 2026-11-14). It lives for one task, is scoped to the bot, and the tool server refuses anything outside the bot's role. The tool-server endpoint binds no provider. Rotating a per-bot session provider instead is a recorded future option (`docs/sandbox-policies.md`);
   - **Processes:** no privilege escalation.
 - **Changes:** a network-policy change is a reviewed pull request by a second platform-owner PM (POL-2).
 - **Format:** NVIDIA OpenShell's policy format, verified against its docs where reachable, else marked "verify on the Spark".

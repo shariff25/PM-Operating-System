@@ -50,7 +50,7 @@ harness behaves. The schema field it sits in is still confirmed. The full list i
 | --- | --- | --- |
 | `bots/<bot>.yaml` | OpenShell sandbox policy, `version: 1` | `openshell sandbox create --policy` and `openshell policy set` |
 | `bots/<bot>.sandbox.yaml` | PM OS launch spec | the sandbox launcher: `--provider` and `--upload` flags |
-| `providers/pmos-gateway.yaml`, `providers/pmos-session.yaml` | OpenShell provider profiles | `openshell provider profile import` (once) |
+| `providers/pmos-gateway.yaml`, `providers/pmos-worker.yaml` | OpenShell provider profiles | `openshell provider profile import` (once) |
 
 OpenShell rejects unknown fields (confirmed), so the policy file can't carry PM OS metadata such
 as which providers to attach or which content to upload. The launch spec holds that, and it is
@@ -91,15 +91,22 @@ are inaccessible (confirmed).
 
 ### `network_policies` (applied live)
 
-Anything not allowed is denied (confirmed). There are two rules, and each lists the worker binary
-as the only binary allowed to connect.
+Anything not allowed is denied (confirmed). There are three rules, and each lists the worker
+binary as the only binary allowed to connect.
 
 | Rule (also its name in logs) | Endpoint | Inspection | Allowed | Credential |
 | --- | --- | --- | --- | --- |
-| `pmos_toolserver` | `toolserver.pmos.internal:8710`, `path: /mcp` | `protocol: mcp`, `enforcement: enforce`, `mcp.versions: [2025-03-26, 2025-06-18, 2025-11-25]` | `initialize`, `notifications/initialized`, `tools/list`; `tools/call` only for the role's tools by exact MCP name (`docs_read`, `docs_search`) | `credential_binding.provider: pmos-<bot>-session` |
+| `pmos_toolserver` | `toolserver.pmos.internal:8710`, `path: /mcp` | `protocol: mcp`, `enforcement: enforce`, `mcp.versions: [2025-03-26, 2025-06-18, 2025-11-25]` | `initialize`, `notifications/initialized`, `tools/list`; `tools/call` only for the role's tools by exact MCP name (`docs_read`, `docs_search`) | none: the per-task session token comes in the claim response |
 | `pmos_gateway` | `gateway.pmos.internal:8740` | `protocol: rest`, `enforcement: enforce` | `POST /v1/chat/completions` | `credential_binding.provider: pmos-<bot>-gateway` |
+| `pmos_runtime` | `bots.pmos.internal:8750` | `protocol: rest`, `enforcement: enforce` | `POST /v1/worker/claim`, and `POST /v1/worker/tasks/*/heartbeat`, `/events`, `/trace`, `/complete`, `/fail` | `credential_binding.provider: pmos-<bot>-worker` |
 
 What each part does:
+
+- **Runtime routes:** the worker claims tasks and reports on them (spec sections 3 and 4), and
+  nothing else: no `GET /v1/tasks`, routines, notifications or bot listings, which belong to
+  other clients. In OpenShell's REST path globs `*` matches exactly one path segment
+  (confirmed), so `/v1/worker/tasks/*/heartbeat` admits one task id and nothing deeper. The
+  worker token can claim only its own bot's tasks; the runtime enforces that, not the policy.
 
 - **Tool calls:** the MCP tool allowlist is the same set the tool server gives the session
   (`role_tools`, with dots turned into `_` as `harness_tool_name` does). A role's tool set to
@@ -120,47 +127,69 @@ What each part does:
 
 ## Credentials
 
-Each bot gets two OpenShell **provider instances** of its own:
+A sandbox holds three credentials, all of them its own bot's:
 
-| Instance | Profile | Environment variable in the sandbox | Bound to |
-| --- | --- | --- | --- |
-| `pmos-<bot>-session` | `pmos-session` | `PMOS_SESSION_TOKEN` | `toolserver.pmos.internal:8710/mcp` |
-| `pmos-<bot>-gateway` | `pmos-gateway` | `PMOS_GATEWAY_TOKEN` | `gateway.pmos.internal:8740` |
+| Credential | How it gets in | Used for |
+| --- | --- | --- |
+| Gateway client token | provider `pmos-<bot>-gateway` (profile `pmos-gateway`), placeholder in `PMOS_GATEWAY_TOKEN` | `gateway.pmos.internal:8740` |
+| Runtime worker token | provider `pmos-<bot>-worker` (profile `pmos-worker`), placeholder in `PMOS_WORKER_TOKEN` | `bots.pmos.internal:8750` |
+| Tool-server session token | the claim response, one per task | `toolserver.pmos.internal:8710/mcp` |
 
-**How OpenShell handles them (confirmed):**
+**One token per bot, per service.** Each bot needs its own entry in the gateway's
+`PMOS_GATEWAY_TOKENS` (for example `bot-docs=…`) and in the runtime's `PMOS_BOTS_TOKENS`
+(`worker-docs=…`). The runtime lets a worker token claim only its own bot's tasks. Never give two
+bots' providers the same value.
+
+**How OpenShell handles the two providers (confirmed):**
 
 - **Placeholders:** the sandbox sees only an opaque placeholder, `openshell:resolve:env:…`. The
   proxy replaces it with the real value just before forwarding a request, and only when:
   1. the network policy allows the binary and destination;
   2. the credential is bound to that host, port and path;
   3. the placeholder is in the `Authorization` header (both profiles use `auth_style: bearer`,
-     which is what the tool server and gateway read).
+     which is what the gateway and runtime read).
 - **Endpointless profiles:** both profiles are endpointless, so a credential resolves only where
   a policy names that exact instance with `credential_binding.provider`. That is how "only this
   bot's credentials" becomes a checkable line in the policy. A placeholder used anywhere else
   gets `credential_endpoint_mismatch`.
 - **Unknown placeholders:** a placeholder from another sandbox, or an expired one, fails closed.
-- **Rotation:** `pmos-session` sets `stable_placeholder: true`, so the bot runtime can rotate the
-  session token for each task with `openshell provider update` without restarting the worker.
-  This needs a gateway and supervisor that support it; the CLI checks that before importing the
-  profile.
-- **No other credentials:** there is no service, bot or worker token in a sandbox. Credentials
-  are never rewritten into bodies or WebSocket messages, never signed, and never sent
-  uninspected.
+- **No other credentials:** there is no service or Slack-bot token in a sandbox. Credentials are
+  never rewritten into bodies or WebSocket messages, never signed, and never sent uninspected.
+
+### The tool-server session token (v1 decision, 2026-11-14)
+
+The per-task session token comes in the claim response, as the runtime and harness already do
+(spec sections 3 and 4). So the tool-server endpoint binds **no** provider, and `pmos policy
+check` refuses one there (`cred-binding`). The reasons this is acceptable in v1:
+
+- **Short-lived:** the token lives for one task.
+- **Narrow:** it is scoped to that one bot, and the tool server refuses anything outside the
+  bot's role.
+- **Same channel:** it reaches the sandbox only over the bot's own, credentialed runtime
+  connection.
+
+Unlike the gateway and worker tokens, it is a real value inside the sandbox, not a placeholder.
+
+**Future option:** a per-bot session provider (`pmos-<bot>-session`, endpointless, with
+`stable_placeholder: true`), bound to the tool-server endpoint. The runtime would set its value
+for each task with `openshell provider update` instead of returning it in the claim. The worker
+would then see only a placeholder, and OpenShell would keep the token from being sent anywhere
+but `/mcp`. OpenShell supports this (`stable_placeholder` exists for "a host service rotates the
+value"); it needs runtime and harness changes, and a POL-2 review.
 
 **Run once on the Spark:**
 
 ```sh
 openshell provider profile lint   -f policies/providers/pmos-gateway.yaml
 openshell provider profile import -f policies/providers/pmos-gateway.yaml --global
-openshell provider profile import -f policies/providers/pmos-session.yaml --global
+openshell provider profile import -f policies/providers/pmos-worker.yaml --global
 ```
 
 **Then, per bot:**
 
 ```sh
 openshell provider create --name pmos-docs-gateway --type pmos-gateway --credential PMOS_GATEWAY_TOKEN
-openshell provider create --name pmos-docs-session --type pmos-session --credential PMOS_SESSION_TOKEN
+openshell provider create --name pmos-docs-worker  --type pmos-worker  --credential PMOS_WORKER_TOKEN
 ```
 
 The command names come from OpenShell's docs and its example profile headers. The docs show both
@@ -172,7 +201,7 @@ The launcher reads `policies/bots/<bot>.sandbox.yaml` and runs, for the Docs bot
 
 ```sh
 openshell sandbox create --name pmos-docs --policy policies/bots/docs.yaml \
-  --provider pmos-docs-gateway --provider pmos-docs-session \
+  --provider pmos-docs-gateway --provider pmos-docs-worker \
   --upload content/master/AGENTS.md:/sandbox/master/AGENTS.md \
   --upload content/skills/docs:/sandbox/skills/docs
 openshell sandbox exec -n pmos-docs --workdir /sandbox/workspace -- /usr/local/bin/node <worker>
@@ -196,14 +225,15 @@ skills, tools or credentials, and is also reported as `policy-orphan`.
 | --- | --- |
 | `policy-parse` | The file is a valid OpenShell policy: YAML, known fields only, right types. |
 | `policy-version` | `version` is 1. |
-| `policy-missing` | Every bot has a policy and a launch spec, and both provider profiles exist. |
+| `policy-missing` | Every bot has a policy and a launch spec, and every provider profile exists. |
 | `policy-stale` | Each generated file is exactly what `pmos policy generate` writes. |
 | `policy-orphan` | No generated file is left for a bot that no longer exists. |
 | `content-invalid` | The content passes `pmos lint`, so policies can be generated. |
-| `net-egress` | Egress only to `toolserver.pmos.internal:8710` and `gateway.pmos.internal:8740`: no other host or port, no wildcard, no `ports` list, no host-less IP range. Direct Slack, Jira, Confluence or support-docs hosts get a hint that those go through the tool server. |
-| `net-inspection` | Both endpoints are inspected (`mcp` on `/mcp`, and `rest`) and enforced; no `tls: skip`, no access preset. |
+| `net-egress` | Egress only to `toolserver.pmos.internal:8710`, `gateway.pmos.internal:8740` and `bots.pmos.internal:8750`, each host on exactly its port: no other host or port, no wildcard, no `ports` list, no host-less IP range. Direct Slack, Jira, Confluence or support-docs hosts get a hint that those go through the tool server. |
+| `net-inspection` | Every endpoint is inspected (`mcp` on `/mcp` for the tool server, `rest` for the gateway and runtime) and enforced; no `tls: skip`, no access preset. |
 | `net-tools` | MCP allows only the four methods above, `tools/call` only for the role's tools by exact name, and neither `allow_all_known_mcp_methods` nor `strict_tool_names: false`. |
 | `net-gateway-routes` | The gateway allows only `POST /v1/chat/completions`. |
+| `net-runtime-routes` | The runtime allows only `POST /v1/worker/claim` and `POST /v1/worker/tasks/*/heartbeat`, `/events`, `/trace`, `/complete` and `/fail`, each exactly as written. `GET /v1/tasks`, `/v1/routines`, a wider glob such as `/v1/worker/**`, or another method all fail. |
 | `net-binaries` | Only the worker binary may open connections. |
 | `net-middleware` | No network middleware. |
 | `fs-workdir` | `filesystem_policy` is present and `include_workdir` is false. |
@@ -211,8 +241,8 @@ skills, tools or credentials, and is also reported as `policy-orphan`.
 | `fs-readable` | Readable: the system paths, the role's skills and the bot's master context, or paths inside them, only. Another role's skill, another PM's master file, other content and wider paths are each named. |
 | `fs-landlock` | `landlock.compatibility` is `hard_requirement`. |
 | `fs-uploads` | The launch spec uploads only the role's skills and the bot's master context, each to its read-only path and never under a writable one. |
-| `cred-binding` | Each endpoint binds this bot's own provider for that service. Another bot's provider is named as such. No credential rewriting, signing or uninspected credentials. |
-| `cred-providers` | The launch spec attaches this bot's session and gateway providers and nothing else. |
+| `cred-binding` | The gateway and runtime endpoints bind exactly this bot's own provider (`pmos-<bot>-gateway`, `pmos-<bot>-worker`), and the tool-server endpoint binds none. Another bot's provider is named as such. No credential rewriting, signing or uninspected credentials. |
+| `cred-providers` | The launch spec attaches this bot's gateway and worker providers and nothing else (no session provider in v1). |
 | `proc-identity` | `run_as_user` and `run_as_group` are `sandbox` (or a numeric id of at least 1000); never root. |
 | `spec-parse` | The launch spec is valid: known fields only. |
 | `spec-identity` | The launch spec names its own bot, role, scope, sandbox and policy, with the workspace as the working directory. |
@@ -277,22 +307,19 @@ be checked without a live OpenShell. Each one is also marked in the code comment
 | MCP revisions and methods | the harness and tool server use a 2025 revision, and send only `initialize`, `notifications/initialized`, `tools/list` and `tools/call` | E-1: a real task with no denials in the log |
 | MCP over Streamable HTTP | OpenShell's MCP inspection passes the `POST`s the client sends to `/mcp` (and any `GET` or `DELETE` it sends) | E-1 |
 | Requests to other paths on the tool server's port | refused, since the only endpoint there is `path: /mcp` | RT-9 (`/internal/call`) |
+| Runtime path globs | `/v1/worker/tasks/*/heartbeat` matches a real task id (`tsk_<hex>`), and nothing with more segments | RT-9, E-1 |
 | Node's `fetch` | goes through the sandbox proxy with no proxy settings | RT-8, RT-9 |
-| `stable_placeholder` | supported by the installed gateway and supervisor | P-3, E-2 |
 | CLI command names | `openshell provider profile import`, `policy set --wait`, `logs --source sandbox`, `settings get` | P-3, RT-2 |
 | Landlock ABI | kernel 6.2 or later on DGX OS | P-1 |
 
-## Open questions (spec gaps raised, not worked around)
+## Decisions on the first version's gaps (2026-11-14)
 
-1. **The worker can't reach the bot runtime.** Section 4 has the harness worker claim tasks from
-   `PMOS_BOTS_URL` (port 8750), but section 7 allows only the tool server and the gateway, as
-   this implementation does. One of these has to change:
-   - add `bots.pmos.internal:8750` (`/v1/worker/*` only) to the policy, as a POL-2 change to the
-     spec;
-   - or run the claim loop outside the sandbox, with the launcher handing each task in.
-2. **Where the session token comes from.** Section 3 returns `session_token` in the claim
-   response, which would put a real token in the sandbox. This policy expects it as the
-   `pmos-<bot>-session` provider's placeholder instead, rotated per task with
-   `openshell provider update`. The runtime and harness pieces need to agree.
-3. **The gateway token per bot.** The gateway reads `PMOS_GATEWAY_TOKENS=name=token,…`; each bot
-   needs its own entry for `pmos-<bot>-gateway` to hold.
+1. **The worker reaches the bot runtime.** The worker runs inside the sandbox and claims from
+   `bots.pmos.internal:8750`. The policy allows only the worker routes (`pmos_runtime` above),
+   with the bot's own worker token (`worker-<bot>` in `PMOS_BOTS_TOKENS`, provider
+   `pmos-<bot>-worker`). The runtime lets that token claim only its own bot's tasks.
+2. **The session token comes in the claim response** (see "The tool-server session token"
+   above). The tool-server endpoint binds no provider. Rotating a per-bot session provider is
+   the recorded future option.
+3. **One gateway client token per bot:** `bot-<bot>` in `PMOS_GATEWAY_TOKENS`, held by
+   `pmos-<bot>-gateway`.
