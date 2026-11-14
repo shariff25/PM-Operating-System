@@ -1,0 +1,19 @@
+[package]
+name = "pmos"
+description = "PM OS command line for skill authors"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "pmos"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+pmos-contract.workspace = true
+serde_json.workspace = true
