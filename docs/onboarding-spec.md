@@ -155,17 +155,29 @@ source: "pm-ana, task 0d3f…"   # the bot (or skill) and the run id that wrote 
          `render_team_yaml` and the new member (`handle`, `slack-id`, `email`, `roles`);
        - `{dir}/bots/pm-<handle>/BOT.md` from `render_personal_bot`.
 
+       - the bot's sandbox policy, `policies/bots/pm-<handle>.yaml` and
+         `policies/bots/pm-<handle>.sandbox.yaml`, generated with `pmos_policy` from the content
+         with the new files, under `PMOS_POLICIES_DIR` (default `policies`, from the content
+         repo root). Without them CI's `pmos policy check` reports `policy-missing`.
+
+         **POL-2:** the policy is generated unchanged from the already-reviewed `pm-assistant`
+         role, and the approving platform owner is the reviewer of record, named in the
+         `Approved-by` trailer. Hand changes still go by pull request with a second owner.
+
        Before committing, check that the new `team.yaml` parses and passes the team lint rules
        (`team-*`). The commit message is `Add <handle> to PM OS` with the trailer
        `Approved-by: <admin> (Slack, request <id>)`.
     4. **Answer** `200 {request}`: the status becomes `approved`, with `handle` and `commit` (the
-       sha). Then sync the content checkout at once (below).
+       sha). The in-memory team already includes the new member when this answer is sent, so
+       the welcome checklist's `oauth/.../start` and `onboarding` calls work at once. Then sync
+       the content checkout (below).
     5. **If the commit fails** for any other reason, the status becomes `failed` with a readable
        `error`, and the answer is `502 {request}`.
 - **`POST /internal/members/{handle}/remove {decided_by}`:** admin only, and an admin may not
   remove themselves.
-  1. Commit `team.yaml` without the member, and delete their `pm-<handle>` `BOT.md` (git data API,
-     with `sha: null` in the tree).
+  1. Commit `team.yaml` without the member, and delete their `pm-<handle>` `BOT.md` and its two
+     policy files (git data API, with `sha: null` in the tree). The member is gone from the
+     in-memory team when the answer is sent.
   2. Then unlink all their credentials and delete their memory-repo record. The repo itself is
      theirs and is left alone.
   3. Answer `200 {handle, commit}`, or `404` if they aren't a member.
