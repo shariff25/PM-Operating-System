@@ -134,11 +134,21 @@ new one, which replaces the old.
 - "permission denied" on a 403, audited as `denied`.
 - A rate limit with its `Retry-After`.
 
+**What the model gets back** is bounded, because the context window on the Spark's local model is shared by every session:
+- **Bodies:** a Jira description, a Confluence page or a docs page is cut at 12,000 characters and marked `truncated`.
+- **Jira comments:** at most 20, each cut at 1,000 characters.
+- **Slack threads:** at most 50 messages, each cut at 2,000 characters.
+- **Searches:** at most 20 results.
+- **Input:** query strings are at most 500 characters (JQL and CQL 2,000), and a search uses at most 32 distinct words.
+
 **What gets written.**
 - Every Slack post and Jira description ends with "Drafted with PM OS", and the Jira and
   Confluence ones also carry the run id, so a reader can trace them back to the run (SLK-7, OUT-1).
 - Raw HTML in a Confluence draft's markdown is escaped, so a draft can't add macros the PM
   didn't see in the approval card.
+- **Updating a Confluence page keeps its status**, so updating a draft doesn't publish it.
+  If someone saved a newer version first, the update fails with "page changed since PM OS
+  read it". MCP marks `confluence_update_page` as destructive, because it replaces the body.
 - Caller-supplied ids (issue keys, page ids, Slack channels and timestamps) are validated
   before they reach a URL.
 
@@ -211,11 +221,15 @@ With `PMOS_CONNECTORS=live`:
 | `PMOS_VAULT_KEY` | required | `key_id:base64key[,…]`; generate a key with `openssl rand -base64 32` |
 | `PMOS_PUBLIC_URL` | required | `https://` URL PMs' browsers reach; callbacks are `{url}/oauth/{provider}/callback`, registered with each app |
 | `PMOS_ATLASSIAN_CLIENT_ID`, `PMOS_ATLASSIAN_CLIENT_SECRET` | required | From the Atlassian developer console (OAuth 2.0 integration) |
-| `PMOS_ATLASSIAN_SCOPES` | Jira classic plus Confluence granular read/write and search | `offline_access` is always added |
+| `PMOS_ATLASSIAN_SCOPES` | `read:me`, Jira classic, Confluence granular read/write and search | `offline_access` is always added; keep `read:me`, which the link check needs |
 | `PMOS_ATLASSIAN_SITE` | none | Needed only if a grant covers several sites |
 | `PMOS_SLACK_CLIENT_ID`, `PMOS_SLACK_CLIENT_SECRET` | required | From the internal Slack app |
 | `PMOS_SLACK_SCOPES` | search, history and `chat:write` user scopes | Requested as `user_scope` only |
 | `PMOS_ATLASSIAN_AUTH_URL`, `PMOS_ATLASSIAN_API_URL`, `PMOS_SLACK_URL` | the real hosts | For pointing at mocks |
+| `PMOS_DOCS_URL` | required | The `pmos-docs` MCP endpoint, such as `http://docs.pmos.internal:8730/mcp` |
+| `PMOS_DOCS_TOKEN` | required | The bearer token `pmos-docs` expects |
+
+`PMOS_DEV=1` (everything in memory) is refused with `PMOS_CONNECTORS=live`, so real tokens and the audit log can't end up in a process that forgets them.
 
 The OAuth `state` signing key is derived from `PMOS_SERVICE_TOKEN`, so rotating the service
 token invalidates sign-in links in flight.

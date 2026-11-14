@@ -70,7 +70,7 @@ the shared back-off above.
 | Tool | Input | Returns |
 | --- | --- | --- |
 | `search_docs` | `query`, `product?`, `limit` (1–10, default 5) | Title, page URL, product, section, updated date, snippet |
-| `get_doc` | `url` (a page link or its `.md`) | The page's markdown (up to 40,000 characters) and metadata |
+| `get_doc` | `url` (a page link or its `.md`) | The page's markdown (up to 12,000 characters, with `truncated` if cut) and metadata |
 | `list_products` | none | Product labels with page counts |
 
 `get_doc` only serves pages already in the index. It never fetches the URL it's given, so a

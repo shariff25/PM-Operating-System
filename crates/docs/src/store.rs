@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use pmos_contract::text::{snippet, terms};
+use pmos_contract::text::{query_terms, snippet, terms};
 use serde::Serialize;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
@@ -115,7 +115,7 @@ impl DocsStore for MemoryStore {
         product: Option<&str>,
         limit: usize,
     ) -> StoreResult<Vec<Hit>> {
-        let q = terms(query);
+        let q = query_terms(query);
         if q.is_empty() {
             return Ok(Vec::new());
         }
@@ -324,7 +324,7 @@ impl DocsStore for PgStore {
         limit: usize,
     ) -> StoreResult<Vec<Hit>> {
         // Terms are letters and digits only, so the tsquery can't carry operators.
-        let q = terms(query);
+        let q = query_terms(query);
         if q.is_empty() {
             return Ok(Vec::new());
         }

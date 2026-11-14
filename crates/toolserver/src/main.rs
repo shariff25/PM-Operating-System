@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
                             atlassian: Some(live.atlassian.clone()),
                             atlassian_site: live.atlassian_site.clone(),
                             slack: Some(live.slack.clone()),
-                            state_key: state_key(&config.service_token),
+                            state_key: state_key(config.service_token.expose()),
                             endpoints: live.endpoints.clone(),
                         },
                         vault,
@@ -147,9 +147,9 @@ async fn main() -> Result<()> {
     let app = router(
         svc,
         AppConfig {
-            service_token: config.service_token.clone(),
-            bot: config.bot_token.clone().map(|token| BotAccess {
-                token,
+            service_token: config.service_token.expose().to_string(),
+            bot: config.bot_token.as_ref().map(|token| BotAccess {
+                token: token.expose().to_string(),
                 skills: config.bot_skills.clone(),
             }),
             content_root: config.content_root.clone(),

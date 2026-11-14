@@ -1,7 +1,7 @@
 //! Linking each PM's own accounts: Atlassian OAuth 2.0 (3LO) for Jira and Confluence, and
 //! Slack OAuth v2 user tokens.
 //!
-//! Flow: the web workspace or Slack app asks `GET /internal/oauth/{provider}/start?user=` for
+//! Flow: the Slack bot or an admin page asks `GET /internal/oauth/{provider}/start?user=` for
 //! an authorize URL and sends the PM there. The provider redirects the PM's browser to the
 //! public `GET /oauth/{provider}/callback`. The tool server exchanges the code and seals the
 //! tokens in the vault. The `state` parameter is HMAC-signed, names the user and provider,

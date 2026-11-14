@@ -414,20 +414,18 @@ impl ToolService {
                     .map(|n| n as usize)
                     .unwrap_or(DEFAULT_LIMIT)
                     .min(MAX_LIMIT);
-                let hits = self
+                let found = self
                     .stores
                     .context
-                    .search(query, domain, MAX_LIMIT * 2)
+                    .search(query, domain, ceiling, limit)
                     .await?;
-                let (allowed, withheld): (Vec<_>, Vec<_>) =
-                    hits.into_iter().partition(|h| h.doc.sensitivity <= ceiling);
-                let allowed: Vec<_> = allowed.into_iter().take(limit).collect();
+                let allowed = found.hits;
                 event.sources = allowed.iter().map(|h| h.doc.path.clone()).collect();
-                if !withheld.is_empty() {
+                if found.withheld > 0 {
                     // Audited, not shown to the model: the result list simply omits them.
                     event.detail = Some(format!(
                         "{} result(s) above data class {ceiling} withheld",
-                        withheld.len()
+                        found.withheld
                     ));
                 }
                 Ok(json!({

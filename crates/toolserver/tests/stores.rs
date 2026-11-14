@@ -145,6 +145,7 @@ contract!(
     interrupted_writes_are_found,
     memory_is_per_user,
     context_search_and_get,
+    context_search_applies_the_ceiling_in_the_store,
     reindex_tracks_the_content_repo,
     audit_records_events,
     credentials_are_per_user_and_provider,
@@ -495,7 +496,11 @@ async fn memory_is_per_user(b: &Backend) {
 
 async fn context_search_and_get(b: &Backend) {
     let c = b.stores.context.as_ref();
-    let hits = c.search("key management", None, 10).await.unwrap();
+    let hits = c
+        .search("key management", None, Sensitivity::Restricted, 10)
+        .await
+        .unwrap()
+        .hits;
     let paths: Vec<_> = hits.iter().map(|h| h.doc.path.as_str()).collect();
     assert_eq!(paths.len(), 2, "{paths:?}");
     assert!(paths.contains(&"context/products/ccm.md"));
@@ -507,21 +512,90 @@ async fn context_search_and_get(b: &Backend) {
     assert!(hits.iter().all(|h| h.score > 0.0));
     assert!(hits[0].snippet.to_lowercase().contains("key management"));
 
-    let only = c.search("key", Some("products"), 10).await.unwrap();
+    let only = c
+        .search("key", Some("products"), Sensitivity::Restricted, 10)
+        .await
+        .unwrap()
+        .hits;
     assert_eq!(only.len(), 1);
     assert_eq!(only[0].doc.domain, "products");
 
-    assert_eq!(c.search("key management", None, 1).await.unwrap().len(), 1);
-    assert!(c.search("", None, 10).await.unwrap().is_empty());
-    assert!(c.search("zebra", None, 10).await.unwrap().is_empty());
+    assert_eq!(
+        c.search("key management", None, Sensitivity::Restricted, 1)
+            .await
+            .unwrap()
+            .hits
+            .len(),
+        1
+    );
+    assert!(c
+        .search("", None, Sensitivity::Restricted, 10)
+        .await
+        .unwrap()
+        .hits
+        .is_empty());
+    assert!(c
+        .search("zebra", None, Sensitivity::Restricted, 10)
+        .await
+        .unwrap()
+        .hits
+        .is_empty());
     // Query syntax characters are just separators, never operators.
-    let odd = c.search("key & | ! ( :* roadmap", None, 10).await.unwrap();
+    let odd = c
+        .search("key & | ! ( :* roadmap", None, Sensitivity::Restricted, 10)
+        .await
+        .unwrap()
+        .hits;
     assert!(!odd.is_empty());
 
     let nda = c.get("context/partners/nda.md").await.unwrap().unwrap();
     assert_eq!(nda.sensitivity, Sensitivity::Restricted);
     assert!(nda.body.contains("under NDA"));
     assert!(c.get("context/partners/none.md").await.unwrap().is_none());
+}
+
+async fn context_search_applies_the_ceiling_in_the_store(b: &Backend) {
+    // Thirty restricted files that match strongly, and one internal file that barely does.
+    let mut docs: Vec<ContextDoc> = (0..30)
+        .map(|i| {
+            doc(
+                &format!("context/partners/quasar-{i}.md"),
+                "Quasar quasar",
+                Sensitivity::Restricted,
+                "# Quasar\n\nQuasar quasar quasar.\n",
+            )
+        })
+        .collect();
+    docs.push(doc(
+        "context/products/plan.md",
+        "Plan",
+        Sensitivity::Internal,
+        "# Plan\n\nOne mention of quasar.\n",
+    ));
+    b.stores.context.reindex(docs).await.unwrap();
+    let c = b.stores.context.as_ref();
+
+    // An internal skill still finds the file it may see, and learns nothing else.
+    let found = c
+        .search("quasar", None, Sensitivity::Internal, 5)
+        .await
+        .unwrap();
+    let paths: Vec<_> = found.hits.iter().map(|h| h.doc.path.as_str()).collect();
+    assert_eq!(paths, vec!["context/products/plan.md"]);
+    assert_eq!(found.withheld, 30);
+
+    let all = c
+        .search("quasar", None, Sensitivity::Restricted, 5)
+        .await
+        .unwrap();
+    assert_eq!(all.hits.len(), 5);
+    assert_eq!(all.withheld, 0);
+    assert!(c
+        .search("quasar", None, Sensitivity::Public, 5)
+        .await
+        .unwrap()
+        .hits
+        .is_empty());
 }
 
 async fn reindex_tracks_the_content_repo(b: &Backend) {
@@ -541,11 +615,24 @@ async fn reindex_tracks_the_content_repo(b: &Backend) {
 
     let c = b.stores.context.as_ref();
     assert!(c.get("context/partners/nda.md").await.unwrap().is_none());
-    let quantum = c.search("quantum", None, 5).await.unwrap();
+    let quantum = c
+        .search("quantum", None, Sensitivity::Restricted, 5)
+        .await
+        .unwrap()
+        .hits;
     assert_eq!(quantum[0].doc.path, "context/products/ccm.md");
-    let trusted = c.search("trusted", None, 5).await.unwrap();
+    let trusted = c
+        .search("trusted", None, Sensitivity::Restricted, 5)
+        .await
+        .unwrap()
+        .hits;
     assert_eq!(trusted[0].doc.path, "context/glossary/terms.md");
-    assert!(c.search("roadmap", None, 5).await.unwrap().is_empty());
+    assert!(c
+        .search("roadmap", None, Sensitivity::Restricted, 5)
+        .await
+        .unwrap()
+        .hits
+        .is_empty());
 }
 
 // ----- audit ------------------------------------------------------------------------------

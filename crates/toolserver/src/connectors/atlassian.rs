@@ -15,7 +15,12 @@ use serde_json::{json, Value};
 
 use super::format::{adf_to_text, markdown_to_adf, markdown_to_storage, storage_to_text};
 use super::http::{arg, client, issue_key, key_like, limit, numeric_id, send_json};
-use super::{Caller, Connector, ConnectorError, Item, SourceRef, DRAFTED_MARKER};
+use super::{
+    clip, Caller, Connector, ConnectorError, Item, SourceRef, DRAFTED_MARKER, MAX_BODY_CHARS,
+};
+
+/// Each Jira comment returned to the model, at most.
+const MAX_COMMENT_CHARS: usize = 1_000;
 use crate::oauth::{AccessToken, TokenSource};
 use crate::vault::Provider;
 
@@ -84,7 +89,11 @@ impl Jira {
             "updated": f["updated"],
         });
         if f["description"].is_object() {
-            content["description"] = json!(adf_to_text(&f["description"]));
+            let (text, cut) = clip(&adf_to_text(&f["description"]), MAX_BODY_CHARS);
+            content["description"] = json!(text);
+            if cut {
+                content["truncated"] = json!(true);
+            }
         }
         if let Some(parent) = f["parent"]["key"].as_str() {
             content["parent"] = json!(parent);
@@ -98,7 +107,7 @@ impl Jira {
                 .map(|c| json!({
                     "author": c["author"]["displayName"],
                     "created": c["created"],
-                    "text": adf_to_text(&c["body"]),
+                    "text": clip(&adf_to_text(&c["body"]), MAX_COMMENT_CHARS).0,
                 }))
                 .collect::<Vec<_>>());
         }
@@ -327,11 +336,22 @@ impl Connector for Confluence {
                         url: Self::web_url(&site, page["_links"]["webui"].as_str(), id),
                     },
                     title: page["title"].as_str().unwrap_or_default().to_string(),
-                    content: json!({
-                        "status": page["status"],
-                        "version": page["version"]["number"],
-                        "body": storage_to_text(page["body"]["storage"]["value"].as_str().unwrap_or_default()),
-                    }),
+                    content: {
+                        let (body, cut) = clip(
+                            &storage_to_text(
+                                page["body"]["storage"]["value"]
+                                    .as_str()
+                                    .unwrap_or_default(),
+                            ),
+                            MAX_BODY_CHARS,
+                        );
+                        json!({
+                            "status": page["status"],
+                            "version": page["version"]["number"],
+                            "body": body,
+                            "truncated": cut,
+                        })
+                    },
                 }])
             }
             other => Err(ConnectorError::Unsupported(format!("confluence.{other}"))),
@@ -413,7 +433,9 @@ impl Connector for Confluence {
                         .bearer_auth(site.token.token.expose())
                         .json(&json!({
                             "id": id,
-                            "status": "current",
+                            // Keep the page's status: updating a draft PM OS made must not
+                            // publish it.
+                            "status": current["status"].as_str().unwrap_or("current"),
                             "title": current["title"],
                             "body": {
                                 "representation": "storage",
@@ -424,7 +446,14 @@ impl Connector for Confluence {
                     "Confluence",
                     &format!("page {id}"),
                 )
-                .await?;
+                .await
+                .map_err(|e| match e {
+                    // Someone saved a newer version after PM OS read it.
+                    ConnectorError::BadArgs(m) if m.to_lowercase().contains("version") => ConnectorError::BadArgs(format!(
+                        "page {id} changed since PM OS read it; read it again and redo the update ({m})"
+                    )),
+                    other => other,
+                })?;
                 Ok(SourceRef {
                     system: "confluence".into(),
                     id: id.to_string(),
