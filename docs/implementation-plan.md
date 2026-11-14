@@ -170,7 +170,8 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
 | 0a Contract and lint | Done | `crates/contract`, `crates/cli`, CI |
 | 0b Seed content | Done | 3 skills, 7 reviewers, 3 templates, context skeleton |
 | 0c Tool server | Done (fakes) | `crates/toolserver`; see `docs/toolserver.md` |
-| 0c-2 Postgres, real Atlassian and Slack connectors, token store | Next | Behind the existing `ContextIndex`, `MemoryStore`, `Connector` traits |
+| 0c-2a Postgres stores | Done | Every store in Postgres behind async traits; same contract tests on both backends; CI runs Postgres |
+| 0c-2b Real Atlassian and Slack connectors, encrypted token store | Next | Behind `Connector`; tested against local mock APIs; no real tokens before Gate 1 |
 | 0d Gateway | Not started | |
 | 0e Harness and orchestrator | Skeleton | Harness only; orchestrator not started |
 | 0f Sandbox policies | Not started | |

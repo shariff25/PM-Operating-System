@@ -22,11 +22,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approvals::{DecideError, Decision, Status};
 use crate::mcp::PmosMcp;
-use crate::service::{DecisionError, SessionError, ToolError, ToolService};
+use crate::service::{DecisionError, ReindexError, SessionError, ToolError, ToolService};
+use crate::store::StoreError;
 
 #[derive(Clone)]
 pub struct AppConfig {
     pub service_token: String,
+    /// The content repo checkout `POST /internal/reindex` reads.
+    pub content_root: std::path::PathBuf,
     /// `Host` values the MCP endpoint accepts (DNS-rebinding protection).
     pub allowed_hosts: Vec<String>,
 }
@@ -35,12 +38,14 @@ pub struct AppConfig {
 struct AppState {
     svc: Arc<ToolService>,
     service_token: Arc<str>,
+    content_root: Arc<std::path::Path>,
 }
 
 pub fn router(svc: Arc<ToolService>, config: AppConfig, cancel: CancellationToken) -> Router {
     let state = AppState {
         svc: svc.clone(),
         service_token: config.service_token.into(),
+        content_root: config.content_root.into(),
     };
 
     let mcp_svc = svc.clone();
@@ -65,6 +70,7 @@ pub fn router(svc: Arc<ToolService>, config: AppConfig, cancel: CancellationToke
         .route("/approvals", get(list_approvals))
         .route("/approvals/{id}", get(get_approval))
         .route("/approvals/{id}/decision", post(decide))
+        .route("/reindex", post(reindex))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_service_token,
@@ -89,6 +95,15 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
 }
 
+/// Storage is down. The detail goes to the log, not the caller.
+fn unavailable(e: StoreError) -> Response {
+    tracing::error!(error = %e, "storage unavailable");
+    error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "PM OS storage is unavailable",
+    )
+}
+
 /// Constant-time comparison, so the service token can't be guessed byte by byte.
 fn same(a: &str, b: &str) -> bool {
     a.len() == b.len()
@@ -99,8 +114,13 @@ fn same(a: &str, b: &str) -> bool {
 }
 
 async fn require_session(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
-    let Some(session) = bearer(&req).and_then(|t| state.svc.session(t, Utc::now())) else {
+    let Some(token) = bearer(&req) else {
         return error(StatusCode::UNAUTHORIZED, "missing or expired PM OS session");
+    };
+    let session = match state.svc.session(token, Utc::now()).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return error(StatusCode::UNAUTHORIZED, "missing or expired PM OS session"),
+        Err(e) => return unavailable(e),
     };
     req.extensions_mut().insert(session);
     next.run(req).await
@@ -132,6 +152,7 @@ async fn create_session(State(state): State<AppState>, Json(body): Json<NewSessi
     match state
         .svc
         .create_session(&body.user, &body.skill, &body.run_id, ttl, Utc::now())
+        .await
     {
         Ok(session) => {
             let tools: Vec<_> = state
@@ -151,15 +172,16 @@ async fn create_session(State(state): State<AppState>, Json(body): Json<NewSessi
                 .into_response()
         }
         Err(e @ SessionError::UnknownSkill(_)) => error(StatusCode::NOT_FOUND, e.to_string()),
+        Err(SessionError::Store(e)) => unavailable(e),
         Err(e) => error(StatusCode::BAD_REQUEST, e.to_string()),
     }
 }
 
 async fn revoke_session(State(state): State<AppState>, Path(token): Path<String>) -> Response {
-    if state.svc.revoke_session(&token) {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        error(StatusCode::NOT_FOUND, "no such session")
+    match state.svc.revoke_session(&token).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "no such session"),
+        Err(e) => unavailable(e),
     }
 }
 
@@ -173,12 +195,15 @@ struct NewGrant {
 
 async fn create_grant(State(state): State<AppState>, Json(body): Json<NewGrant>) -> Response {
     let now = Utc::now();
-    let Some(session) = state.svc.session(&body.session_token, now) else {
-        return error(StatusCode::NOT_FOUND, "no such session");
+    let session = match state.svc.session(&body.session_token, now).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "no such session"),
+        Err(e) => return unavailable(e),
     };
-    match state.svc.grant(&session, &body.tool, &body.args, now) {
+    match state.svc.grant(&session, &body.tool, &body.args, now).await {
         Ok(()) => StatusCode::CREATED.into_response(),
         Err(e @ ToolError::NotAllowed(_)) => error(StatusCode::FORBIDDEN, e.to_string()),
+        Err(ToolError::Unavailable(e)) => unavailable(StoreError(e)),
         Err(e) => error(StatusCode::BAD_REQUEST, e.to_string()),
     }
 }
@@ -190,13 +215,17 @@ struct ApprovalQuery {
 }
 
 async fn list_approvals(State(state): State<AppState>, Query(q): Query<ApprovalQuery>) -> Response {
-    Json(json!({ "items": state.svc.approvals(&q.user, q.status) })).into_response()
+    match state.svc.approvals(&q.user, q.status).await {
+        Ok(items) => Json(json!({ "items": items })).into_response(),
+        Err(e) => unavailable(e),
+    }
 }
 
 async fn get_approval(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match state.svc.approval(&id) {
-        Some(item) => Json(item).into_response(),
-        None => error(StatusCode::NOT_FOUND, "no such approval item"),
+    match state.svc.approval(&id).await {
+        Ok(Some(item)) => Json(item).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "no such approval item"),
+        Err(e) => unavailable(e),
     }
 }
 
@@ -218,15 +247,33 @@ async fn decide(
         .await
     {
         Ok(item) => Json(item).into_response(),
+        Err(DecisionError::Decide(DecideError::Store(e))) => unavailable(e),
         Err(DecisionError::Decide(e)) => {
             let status = match e {
                 DecideError::NotFound => StatusCode::NOT_FOUND,
                 DecideError::Forbidden => StatusCode::FORBIDDEN,
                 DecideError::NotPending => StatusCode::CONFLICT,
                 DecideError::MissingArgs => StatusCode::BAD_REQUEST,
+                DecideError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
             };
             error(status, e.to_string())
         }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Rebuild the context index after a merge to the content repo.
+async fn reindex(State(state): State<AppState>) -> Response {
+    match state.svc.reindex(&state.content_root, Utc::now()).await {
+        Ok(report) => {
+            tracing::info!(
+                indexed = report.indexed,
+                removed = report.removed,
+                "context reindexed"
+            );
+            Json(report).into_response()
+        }
+        Err(e @ ReindexError::Lint(_)) => error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
+        Err(ReindexError::Store(e)) => unavailable(e),
     }
 }

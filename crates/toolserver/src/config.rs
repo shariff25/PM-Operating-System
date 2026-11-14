@@ -11,7 +11,11 @@ pub struct Config {
     pub bind: SocketAddr,
     /// `PMOS_SERVICE_TOKEN`: required; guards `/internal`. At least 32 characters.
     pub service_token: String,
-    /// `PMOS_AUDIT_LOG`: JSON-lines audit file. Required unless `PMOS_DEV=1`.
+    /// `PMOS_DATABASE_URL`: Postgres for every store. Required unless `PMOS_DEV=1`, which
+    /// keeps everything in memory.
+    pub database_url: Option<String>,
+    /// `PMOS_AUDIT_LOG`: also write audit events to this JSON-lines file, for shipping
+    /// off-box. Optional.
     pub audit_log: Option<PathBuf>,
     /// `PMOS_ALLOWED_HOSTS`: comma-separated `Host` values for `/mcp`.
     /// Default `toolserver.pmos.internal,localhost,127.0.0.1`.
@@ -33,8 +37,12 @@ impl Config {
         }
         let dev = get("PMOS_DEV").as_deref() == Some("1");
         let audit_log = get("PMOS_AUDIT_LOG").map(PathBuf::from);
-        if audit_log.is_none() && !dev {
-            return Err("PMOS_AUDIT_LOG is required (or set PMOS_DEV=1 for a local run)".into());
+        let database_url = get("PMOS_DATABASE_URL").filter(|u| !u.is_empty());
+        if database_url.is_none() && !dev {
+            return Err(
+                "PMOS_DATABASE_URL is required (or set PMOS_DEV=1 to keep everything in memory)"
+                    .into(),
+            );
         }
         let connectors = get("PMOS_CONNECTORS").ok_or("PMOS_CONNECTORS is required (fake)")?;
         if connectors != "fake" {
@@ -58,6 +66,7 @@ impl Config {
                 .into(),
             bind,
             service_token,
+            database_url,
             audit_log,
             allowed_hosts,
             connectors,
@@ -92,7 +101,7 @@ mod tests {
         assert!(
             cfg(&[("PMOS_SERVICE_TOKEN", TOKEN), ("PMOS_CONNECTORS", "fake")])
                 .unwrap_err()
-                .contains("PMOS_AUDIT_LOG")
+                .contains("PMOS_DATABASE_URL")
         );
         assert!(cfg(&[
             ("PMOS_SERVICE_TOKEN", TOKEN),

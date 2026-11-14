@@ -23,12 +23,16 @@ struct Server {
 }
 
 async fn start() -> Server {
-    let fixture = common::fixture();
+    start_with(common::fixture()).await
+}
+
+async fn start_with(fixture: common::Fixture) -> Server {
     let cancel = CancellationToken::new();
     let app = router(
         Arc::clone(&fixture.svc),
         AppConfig {
             service_token: SERVICE_TOKEN.into(),
+            content_root: fixture.root.clone(),
             allowed_hosts: vec!["127.0.0.1".into(), "localhost".into()],
         },
         cancel.clone(),
@@ -292,5 +296,164 @@ async fn revoked_sessions_are_refused() {
         .await
         .unwrap();
     assert_eq!(res.status(), 401);
+    s.cancel.cancel();
+}
+
+/// The same flow with every store in Postgres: the session, the pending item, the decision
+/// and the audit trail all go through the database.
+#[tokio::test]
+async fn draft_lands_with_postgres_stores() {
+    let Some((fixture, pg)) = common::pg_fixture().await else {
+        return;
+    };
+    let pool = pg.store.pool().clone();
+    let s = start_with(fixture).await;
+    let token = create_session(&s.base, "prd-draft").await;
+
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("{}/mcp", s.base))
+            .auth_header(token.clone()),
+    );
+    let client = ClientConfig::default().serve(transport).await.unwrap();
+    assert_eq!(
+        client
+            .list_tools(Default::default())
+            .await
+            .unwrap()
+            .tools
+            .len(),
+        7
+    );
+
+    // Context search runs on Postgres full-text search.
+    let found = client
+        .call_tool(
+            CallToolRequestParams::new("context_search").with_arguments(
+                json!({"query": "key management"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    let results = found.structured_content.unwrap()["results"].clone();
+    assert!(results
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["path"] == "context/partners/acme-nda.md"));
+
+    let args = json!({"space": "PM", "title": "PRD: SSO", "body": "Draft"});
+    let pending = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_create_draft")
+                .with_arguments(args.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert_eq!(pending["status"], "pending_approval");
+    let id = pending["approval_id"].as_str().unwrap().to_string();
+
+    let decided: Value = http()
+        .post(format!("{}/internal/approvals/{id}/decision", s.base))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&json!({"decided_by": "ana", "decision": "approve"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(decided["status"], "approved");
+    assert_eq!(s.fixture.confluence.writes().len(), 1);
+
+    let outcomes: Vec<String> = sqlx::query_scalar("SELECT outcome FROM audit_events ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    // Search, the queued write, and the approval. Listing tools isn't a call, so it isn't
+    // audited.
+    assert_eq!(outcomes, vec!["ok", "pending", "approved"]);
+
+    // Only the token's hash is in the database.
+    let stored: Vec<String> = sqlx::query_scalar("SELECT token_hash FROM sessions")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(!stored.contains(&token));
+
+    let _ = client.cancel().await;
+    s.cancel.cancel();
+    pg.drop_schema().await;
+}
+
+#[tokio::test]
+async fn reindex_picks_up_content_changes_and_refuses_bad_content() {
+    let s = start().await;
+    let reindex = || {
+        http()
+            .post(format!("{}/internal/reindex", s.base))
+            .bearer_auth(SERVICE_TOKEN)
+            .send()
+    };
+    let before: Value = reindex().await.unwrap().json().await.unwrap();
+
+    // A merged change adds a context file.
+    std::fs::write(
+        s.fixture.root.join("context/competitors/zeta.md"),
+        "---\nowner: \"@pm\"\nlast-reviewed: 2026-11-10\nsensitivity: internal\n---\n\n# Zeta\n\nZeta ships a quantum vault.\n",
+    )
+    .unwrap();
+    let after: Value = reindex().await.unwrap().json().await.unwrap();
+    assert_eq!(after["indexed"], before["indexed"].as_u64().unwrap() + 1);
+    let session = s
+        .fixture
+        .svc
+        .create_session("ana", "ask", "r1", None, chrono::Utc::now())
+        .await
+        .unwrap();
+    let found = s
+        .fixture
+        .svc
+        .call(
+            &session,
+            "context_search",
+            json!({"query": "quantum"}),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["results"][0]["path"], "context/competitors/zeta.md");
+
+    // A change that breaks the lint is refused, and the index keeps the last good state.
+    std::fs::write(
+        s.fixture.root.join("context/competitors/broken.md"),
+        "no front matter",
+    )
+    .unwrap();
+    let refused = reindex().await.unwrap();
+    assert_eq!(refused.status(), 422);
+    let still = s
+        .fixture
+        .svc
+        .call(
+            &session,
+            "context_search",
+            json!({"query": "quantum"}),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(still["results"][0]["path"], "context/competitors/zeta.md");
+
+    let unauthorized = http()
+        .post(format!("{}/internal/reindex", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), 401);
     s.cancel.cancel();
 }

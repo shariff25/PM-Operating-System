@@ -48,6 +48,7 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | `GET /internal/approvals?user=&status=` | service token | A PM's inbox, newest first |
 | `GET /internal/approvals/{id}` | service token | One item |
 | `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?}` | service token | `approve`, `edit` (with `args`) or `reject` |
+| `POST /internal/reindex` | service token | Rebuild the context index from the content checkout; `422` if it fails `pmos lint` |
 
 Only the orchestrator, the Slack app and the web workspace hold the service token. Sandboxes
 get only their own session token. A tool error (refused, invalid arguments, not found) comes
@@ -61,30 +62,56 @@ uses. The registry is `content/tools.yaml`; each tool's input schema is in
 `crates/toolserver/src/schemas.rs`. The server refuses to start if a registry tool has no
 schema or no connector.
 
+## Storage
+
+Every store sits behind an async trait (`crates/toolserver/src/store.rs`). Each has an in-memory
+implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
+(`crates/toolserver/src/pg.rs`, schema in `crates/toolserver/migrations/`).
+
+| Store | Postgres table | Notes |
+| --- | --- | --- |
+| Context index | `context_docs` | Full-text search (title weighted over body), rebuilt from the content repo on start-up and on `POST /internal/reindex`. Embeddings are added once the gateway serves the embedding model. |
+| Memory | `memory_notes` | One row per user and key |
+| Sessions | `sessions` | Only the SHA-256 of each token is stored |
+| Grants | `grants` | Taken with `DELETE … RETURNING` on a row locked `FOR UPDATE SKIP LOCKED`: one grant, one call, even under concurrency |
+| Approvals | `approvals` | A decision is one conditional `UPDATE … WHERE status = 'pending' AND user_handle = …`: exactly one of several concurrent decisions wins |
+| Audit | `audit_events` | Append-only: a trigger rejects `UPDATE` and `DELETE` |
+
+- **Migrations** run on start-up.
+- **Pruning:** expired sessions and grants are deleted every 10 minutes.
+- **Audit failures:** if an audit event can't be recorded, the server logs `AUDIT EVENT NOT RECORDED` at error level. The call itself is not undone.
+- **Tests:** `tests/stores.rs` runs the same contract cases against both backends, including the concurrency cases.
+  - Set `PMOS_TEST_DATABASE_URL` to run the Postgres side. CI does.
+  - Without it, the Postgres cases are skipped locally and fail in CI.
+
 ## Running it
 
 ```sh
 PMOS_SERVICE_TOKEN=$(openssl rand -hex 32) \
 PMOS_CONNECTORS=fake \
-PMOS_AUDIT_LOG=/var/lib/pmos/audit.jsonl \
+PMOS_DATABASE_URL=postgresql://pmos@localhost/pmos \
 cargo run -p pmos-toolserver
 ```
 
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `PMOS_SERVICE_TOKEN` | required | At least 32 characters |
-| `PMOS_CONNECTORS` | required | Only `fake` until 0c-2 (no real tokens before Gate 1) |
-| `PMOS_AUDIT_LOG` | required | JSON lines; `PMOS_DEV=1` keeps events in memory instead |
+| `PMOS_CONNECTORS` | required | Only `fake` until the real connectors land (no real tokens before Gate 1) |
+| `PMOS_DATABASE_URL` | required | Postgres for every store. `PMOS_DEV=1` without it keeps everything in memory. |
+| `PMOS_AUDIT_LOG` | none | Also writes audit events to this JSON-lines file, for shipping off-box |
 | `PMOS_CONTENT_ROOT` | `content` | Must pass `pmos lint`, or the server won't start |
 | `PMOS_BIND` | `127.0.0.1:8710` | |
 | `PMOS_ALLOWED_HOSTS` | `toolserver.pmos.internal,localhost,127.0.0.1` | `Host` values `/mcp` accepts |
 
-## Not yet (0c-2)
+After a merge to the content repo, pull the checkout and call `POST /internal/reindex`:
+- If the content fails `pmos lint`, the call returns `422` and the index keeps its last good state.
+- Skill and tool-registry changes take effect on the next restart.
 
-- **Postgres** behind the existing traits: `ContextIndex` (pgvector plus full-text search,
-  reindexed on merge), `MemoryStore`, sessions, approvals and audit.
+## Not yet
+
 - **Real connectors** behind `Connector`:
   - Jira and Confluence on Atlassian Cloud REST with each user's OAuth 2.0 (3LO) token.
   - Slack with each PM's own user token. Real-time Search results are never stored.
 - **Per-user token storage:** encrypted, and attached only to that user's sandbox through
   OpenShell credential placeholders.
+- **Embeddings** in the context index, once the gateway (0d) serves the embedding model.
