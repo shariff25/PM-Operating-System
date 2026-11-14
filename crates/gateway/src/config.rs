@@ -299,8 +299,8 @@ pub struct Config {
     pub workarounds_on: bool,
     /// `PMOS_GATEWAY_CLOUD_TEST=1`: **testing only**, accept the Claude test upstream.
     pub cloud_test: bool,
-    /// `PMOS_GATEWAY_ANTHROPIC_KEY`: the Claude API key for the test upstream. Unset, a
-    /// placeholder is sent and the network proxy is expected to put the real key in.
+    /// `PMOS_GATEWAY_ANTHROPIC_KEY`: the Claude API key for the test upstream. Required when
+    /// a role uses it; empty otherwise.
     pub anthropic_key: String,
 }
 
@@ -337,9 +337,7 @@ impl Config {
             stub: get("PMOS_GATEWAY_STUB").as_deref() == Some("1"),
             workarounds_on,
             cloud_test: get("PMOS_GATEWAY_CLOUD_TEST").as_deref() == Some("1"),
-            anthropic_key: get("PMOS_GATEWAY_ANTHROPIC_KEY")
-                .filter(|k| !k.is_empty())
-                .unwrap_or_else(|| "pmos-proxy-injected".into()),
+            anthropic_key: get("PMOS_GATEWAY_ANTHROPIC_KEY").unwrap_or_default(),
         })
     }
 }

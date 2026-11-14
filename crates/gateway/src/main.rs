@@ -29,6 +29,11 @@ async fn main() -> Result<()> {
         .values()
         .any(|r| r.kind == pmos_gateway::config::UpstreamKind::ClaudeTest)
     {
+        if config.anthropic_key.trim().is_empty() {
+            anyhow::bail!(
+                "a role uses the Claude test upstream; set PMOS_GATEWAY_ANTHROPIC_KEY to a Claude API key"
+            );
+        }
         tracing::warn!(
             "TESTING ONLY: a role uses the Claude test upstream, so its prompts leave this machine; \
              use test data and test accounts only"
