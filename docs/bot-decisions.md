@@ -11,7 +11,7 @@ the product lessons doc shared on 2026-11-14.
 - The PRD says *what* to build; this doc says *how to decide*. Where they conflict, flag it rather than pick one.
 
 **Status:**
-- **Missing:** D12 and the unship list were cut off when the doc was shared.
+- **Missing:** the unship list. D12 arrived separately on 2026-11-14.
 - **Settled:** the conflicts with earlier decisions, and the follow-up questions, were settled on 2026-11-14 (see **Resolved conflicts**).
 
 ## Where PM OS differs from Grok Bot
@@ -39,7 +39,7 @@ the product lessons doc shared on 2026-11-14.
 | D9 | **The launch-post test.** A feature ships only if "PM OS can now ___" is something a PM cares about. Finished features that fail it are cut. | Every shipped capability has a "can now" line in the changelog. | **Adopt now:** PR template and `CHANGELOG.md`. |
 | D10 | **Finishing the job beats 90%.** A task category launches only when bots finish it end to end. Real tasks are rerun weekly and on every model or harness change, and each failure is tagged to its bottleneck. | Each launched category meets its pass bar two weeks in a row. | **Planned** as 0g evals; reshaped into per-category benchmarks with failure tags. |
 | D11 | **Every workaround has an expiry date.** Scaffolding for model weakness sits behind a flag with a "delete when" test. The model sits behind one OpenAI-compatible endpoint. | Switching models is a config change plus one benchmark. | **Partly:** the harness already calls model roles (`pmos/default`, `pmos/extraction`) through the gateway. Add a workaround registry when the gateway lands (0d). |
-| D12 | *(not received)* | | |
+| D12 | **One role per bot; a Chief of Staff only when it emerges.** v1 ships single-role bots, with no coordinator bot that delegates to others. We build one once several PMs (proposed: 3) set it up by hand. A bot may read other bots' outputs in the same scope, nothing more. Count how often PMs chain bots by hand. | Role templates exist. *(The line may have been cut off; confirm whether it continues.)* | **Gap.** Role templates are new. They also feed D3: each bot's sandbox policy is generated from its role template. **Not a conflict:** `/review`'s parallel reviewer sub-agents stay inside one bot, so they aren't a coordinator. Skill chaining (SKL-6) was already Phase 3. |
 
 ## Resolved conflicts (decided 2026-11-14)
 
@@ -71,5 +71,7 @@ the product lessons doc shared on 2026-11-14.
 
 ## Open questions
 
-- **D12 and the unship list:** they were cut off; the PM is finding them.
+- **The unship list** is still to come.
+- **D12's "Done when"** may be cut off after "role templates exist". Is it complete?
+- **What counts as "chaining by hand"** (D12's metric). The proposal: a PM passes one bot's output to another bot within an hour, either by forwarding the message or by citing the task. It is counted in the trace store and shown in the console.
 - **Personal memory store.** The proposal: a private git repository per PM on the Spark, never pushed to the shared remote, and backed up with the rest of the Spark.

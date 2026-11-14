@@ -141,7 +141,9 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
   - a durable task queue in Postgres that resumes or fails with a reason after a reboot (D2);
   - task status events and a checklist, posted as one Slack message per milestone (D6);
   - a 30-day trace store (D6);
-  - one long-lived sandbox per bot (D3).
+  - one long-lived sandbox per bot (D3);
+  - **role templates** in `content/roles/<role>/` (D12): each one sets a single role's job text, default skills, data class, approval settings and sandbox policy, and every bot is created from one;
+  - **one role per bot, no coordinator bot in v1** (D12): a bot may read other bots' outputs in the same scope, nothing more. The runtime counts how often PMs chain bots by hand, and a Chief of Staff bot is considered once 3 PMs do it.
 - **0f sandbox policies:**
   - each bot's policy is generated from its role template and kept in git (D3);
   - network is denied by default;
