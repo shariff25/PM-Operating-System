@@ -11,7 +11,9 @@ service and personal agents go through the same server, so they follow the same 
 | Rule | How | PRD |
 | --- | --- | --- |
 | A skill calls only the tools it declares | `tools/list` returns the session skill's tools only; any other call is refused and audited as `denied` | Authorization |
-| A skill reads nothing above its data class | `context_search` drops results above the skill's `data-class`; `context_read` refuses them | Data classes |
+| A bot calls only its role's tools, and never a `never` action | A bot session's `tools/list` is its role's tools less any write set to `never`; anything else is refused and audited as `denied` (see **Bot sessions**) | D7 |
+| A skill reads nothing above its data class | `context_search` drops results above the skill's `data-class` (a bot session's role's); `context_read` refuses them | Data classes |
+| A team bot reads only what its owner chose | Its Jira, Confluence and Slack reads use its own account and stay inside its `reads` list; anything else is `403`, audited as `denied` | Decision 26 |
 | External content is data, not instructions | Every Jira, Confluence and Slack item comes back wrapped as `{"untrusted": true, "source": …, "content": …}` | Untrusted content |
 | Nothing is written outside PM OS without approval | A write runs only with a matching grant or an inbox approval by its own user; otherwise it returns `pending_approval` and does nothing | OUT-4 |
 | Everything is audited | One event per call and per decision: user, skill, run, tool, outcome, sources read, argument hash, output reference. Never message bodies | ADM-2, SLK-8 |
@@ -57,25 +59,83 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | `GET /readyz` | none | Readiness: `200` when storage answers within a second and every connector's own dependency (the support docs server) answers; `503` otherwise, naming the check that failed |
 | `POST /mcp` (Streamable HTTP) | `Bearer <session token>` | MCP for the harness: `tools/list`, `tools/call` |
 | `POST /internal/sessions` `{user, skill, run_id, ttl_minutes?}` | service or bot token | Create a session; returns `token` and the session's tools. `403` if the user isn't in `team.yaml` (live connectors), or the bot asks for a skill outside `PMOS_BOT_SKILLS`. |
+| `POST /internal/sessions` `{user, bot, run_id, ttl_minutes?}` | service token | Create a bot session (see **Bot sessions**). Send `skill` or `bot`, never both (`400`). `404` for an unknown bot; `403` if `user` may not use it. |
 | `DELETE /internal/session` + `X-Pmos-Session` | service or bot token | Revoke a session (sandbox ended) |
 | `POST /internal/call` + `X-Pmos-Session` `{tool, args}` | service or bot token | One tool call for the session, with the same rules as MCP: allowlist, argument checks, approvals for writes, audit (which records the caller). |
 | `POST /internal/grants` `{session_token, tool, args}` | service token | Record an approval given in the harness |
 | `GET /internal/approvals?user=&status=` | service token | A PM's inbox, newest first |
-| `GET /internal/approvals/{id}` | service token | One item |
-| `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?}` | service token | `approve`, `edit` (with `args`) or `reject` |
-| `POST /internal/reindex` | service token | Rebuild the context index from the content checkout and re-read `team.yaml`; `422` if it fails `pmos lint` |
-| `GET /internal/oauth/{atlassian\|slack}/start?user=` | service token | The URL to send a PM to so they can link their account |
+| `GET /internal/approvals/{id}` | service or bot token | One item |
+| `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?}` | service or bot token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). The audit records which token decided. |
+| `POST /internal/reindex` | service token | Rebuild the context index from the content checkout and re-read `team.yaml`, the bots and their roles; `422` if it fails `pmos lint` |
+| `GET /internal/oauth/{atlassian\|slack}/start?user=` | service token | The URL to send a PM to so they can link their account. `user=bots.<name>` gives the URL for a team bot's own account (`404` unless `<name>` is a team bot). |
 | `GET /oauth/{atlassian\|slack}/callback` | none (the PM's browser) | Finishes linking; shows a short page |
 | `GET /internal/credentials?user=` | service token | A PM's linked accounts, without tokens |
 | `DELETE /internal/credentials/{user}/{provider}` | service token | Unlink (the PM disconnects, or a platform owner revokes) |
 
 **Who holds which token:**
-- **Service token** (`PMOS_SERVICE_TOKEN`): the orchestrator and platform-owner tools. Every route.
-- **Bot token** (`PMOS_BOT_TOKEN`): the Slack bot. Only sessions for the skills in `PMOS_BOT_SKILLS` and calls within them. A session started for another skill looks to the bot like one that doesn't exist, and every other route returns `403`.
+- **Service token** (`PMOS_SERVICE_TOKEN`): the orchestrator, the bot runtime and platform-owner tools. Every route, and the only token that starts bot sessions.
+- **Bot token** (`PMOS_BOT_TOKEN`): the Slack bot. Only sessions for the skills in `PMOS_BOT_SKILLS` and calls within them, plus reading and deciding one approval item (`GET /internal/approvals/{id}` and its `decision`), for Slack approval cards. A session started for another skill, or any bot session, looks to the bot like one that doesn't exist, and every other route returns `403`.
 - **Session token:** each sandbox gets only its own.
 
 Session tokens are sent in headers, never in a URL, so access logs and proxies don't record them. A tool error (refused, invalid arguments, not found) comes
 back as an MCP tool result with `isError: true`, so the model can read why.
+
+## Bot sessions
+
+A named bot (`content/bots/<name>/BOT.md`, made from one role in `content/roles/`) gets a
+session per task: the bot runtime sends `POST /internal/sessions {user, bot, run_id}` with the
+service token. Bots and roles load with the skills at start-up and reload on
+`POST /internal/reindex`; a live session follows the new settings on its next call, and a
+session whose bot is gone (or whose personal bot changed owner) stops working.
+Spec: `docs/bot-runtime-spec.md` §2.
+
+| Session property | Rule |
+| --- | --- |
+| Tools | `role_tools(role, skills)`: the union of the role's skills' tools |
+| Data class | the role's `data-class` |
+| A write set to `never` (`bot.action_setting(role, tool)`, the bot's override, else the role's) | not in `tools/list`; a call is refused (`403` on `/internal/call`, an MCP tool error), audited as `denied`, and never reaches the inbox. A harness grant can't make it run. |
+| A write set to `approve` | the usual grant-or-inbox path. The item records the bot, and is checked again when decided: if the bot is gone, its role lost the tool or it is now `never`, the decision is `409` and the item stays pending. |
+| `user` | the PM the task is for. A personal bot serves only its owner (`403` otherwise); a team bot, any team member (`team.yaml`, when enforced). Never a `bots.*` identity. |
+
+Sessions, approval items and audit events record either `skill` or `bot`, never both; a bot
+session's `skill` is `null`.
+
+**Who a bot reads and writes as.**
+- **Personal bots** read as their owner, with the owner's linked accounts and no scope.
+- **Team bots** read Jira, Confluence and Slack as the bot's own service identity,
+  `bots.<name>`. A platform owner links its read-only accounts with
+  `GET /internal/oauth/{provider}/start?user=bots.<name>` (service token), then opens the
+  URL signed in as the bot's account. The `team.yaml` identity check is skipped only for
+  `bots.<valid bot name>`; such a handle is never a PM, so it gets no session and can't
+  decide approvals. `GET /internal/credentials?user=bots.<name>` and
+  `DELETE /internal/credentials/bots.<name>/{provider}` list and unlink it. If it isn't
+  linked, a read fails with "the `<name>` bot has no working … account", never falling back
+  to the PM's.
+- **Writes** from any bot session run as `user`, with the approving PM's own token, never as
+  the bot.
+
+**A team bot's read scope** is its `reads` list in `BOT.md`, enforced in the connectors (the
+fake ones apply it too):
+
+| Tool | How |
+| --- | --- |
+| `jira.search` | the JQL becomes `project in ("A", "B") AND (<jql>)`; a trailing `ORDER BY` stays outside the group |
+| `jira.read` | the key's project must be listed, checked before the call and again on the issue returned (a moved issue changes key) |
+| `confluence.search` | the CQL becomes `space in ("A") AND (<cql>)` |
+| `confluence.read` | the page's space (by id, from `GET /wiki/api/v2/spaces?keys=`) must be listed, checked after the fetch and before anything is returned; a page with no space is refused |
+| `slack.search` | results outside the listed channels are dropped |
+| `slack.read_thread` | the channel must be listed |
+
+- An empty list means no access to that system. An out-of-scope read is `403`, audited as
+  `denied`.
+- **No query injection.** Project and space keys must match `^[A-Z][A-Z0-9_]{0,19}$` and
+  channels must be ids (`C…` or `G…`); an entry that doesn't is refused at read time (and
+  logged at start-up), never put in a query. A query is wrapped only if its quotes are
+  closed, its parentheses balanced, it has no backslash outside a quote and its `ORDER BY` is
+  a plain list of fields, so nothing in it can reach outside the `( … )`. Otherwise it is
+  `400`.
+- `docs.*` and `context.*` have no read scope: the docs are public, and context follows the
+  data class.
 
 ## Tools
 
@@ -88,8 +148,9 @@ schema or no connector.
 ## Connectors and account linking
 
 With `PMOS_CONNECTORS=live`, every Jira, Confluence and Slack call acts as the PM, with the
-PM's own token. There is no shared service identity, so a PM can only read and change what
-they could in the product itself.
+PM's own token, so a PM can only read and change what they could in the product itself. The
+one exception is a team bot's reads, which use the bot's own read-only accounts inside its
+read scope (see **Bot sessions**); its writes still act as the PM.
 
 | System | Auth | Calls |
 | --- | --- | --- |
@@ -174,10 +235,10 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 | --- | --- | --- |
 | Context index | `context_docs` | Full-text search (title weighted over body), rebuilt from the content repo on start-up and on `POST /internal/reindex`. Embeddings are added once the gateway serves the embedding model. |
 | Memory | `memory_notes` | One row per user and key |
-| Sessions | `sessions` | Only the SHA-256 of each token is stored |
+| Sessions | `sessions` | Only the SHA-256 of each token is stored. Each names a `skill` or a `bot` (a check constraint keeps it to one) |
 | Grants | `grants` | Taken with `DELETE … RETURNING` on a row locked `FOR UPDATE SKIP LOCKED`: one grant, one call, even under concurrency |
 | Approvals | `approvals` | A decision is one conditional `UPDATE … WHERE status = 'pending' AND user_handle = …`: exactly one of several concurrent decisions wins |
-| Audit | `audit_events` | Append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Each event records the caller (`mcp`, `orchestrator` or `bot`). |
+| Audit | `audit_events` | Append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Each event records the caller (`mcp`, `orchestrator` or `bot`) and the session's skill or bot. |
 | Credentials | `credentials` | Tokens sealed by the vault; the database never sees plaintext |
 
 - **Migrations** run on start-up.
@@ -236,6 +297,7 @@ token invalidates sign-in links in flight.
 
 After a merge to the content repo, pull the checkout and call `POST /internal/reindex`:
 - If the content fails `pmos lint`, the call returns `422` and the index keeps its last good state.
+- Bot and role changes (tools, action settings, read scope) take effect at once.
 - Skill and tool-registry changes take effect on the next restart.
 
 ## Not yet

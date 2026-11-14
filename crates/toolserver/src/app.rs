@@ -3,9 +3,11 @@
 //!
 //! - `/mcp` needs a session token (`Authorization: Bearer pmos_s_…`).
 //! - `/internal` needs a service token, and each internal client has its own:
-//!   - `PMOS_SERVICE_TOKEN`: the orchestrator and platform-owner tools. Every route.
+//!   - `PMOS_SERVICE_TOKEN`: the orchestrator, the bot runtime and platform-owner tools.
+//!     Every route, and the only token that starts bot sessions.
 //!   - `PMOS_BOT_TOKEN`: the Slack bot. Only sessions for its skills (`PMOS_BOT_SKILLS`) and
-//!     calls within them; never approvals, grants, linking or reindexing.
+//!     calls within them, plus reading and deciding one approval item (Slack approval
+//!     cards); never inbox listings, grants, linking or reindexing.
 //!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
@@ -31,8 +33,10 @@ use crate::audit::Client;
 use crate::mcp::PmosMcp;
 use crate::oauth::{OAuth, OAuthError};
 use crate::service::{DecisionError, ReindexError, SessionError, ToolError, ToolService};
+use crate::session::BOT_IDENTITY_PREFIX;
 use crate::store::StoreError;
 use crate::vault::Provider;
+use pmos_contract::bots::BotScope;
 
 /// What the Slack bot's token may do.
 #[derive(Clone, Debug)]
@@ -101,8 +105,6 @@ pub fn router(svc: Arc<ToolService>, config: AppConfig, cancel: CancellationToke
     let admin = Router::new()
         .route("/grants", post(create_grant))
         .route("/approvals", get(list_approvals))
-        .route("/approvals/{id}", get(get_approval))
-        .route("/approvals/{id}/decision", post(decide))
         .route("/reindex", post(reindex))
         .route("/oauth/{provider}/start", get(oauth_start))
         .route("/credentials", get(list_credentials))
@@ -112,11 +114,14 @@ pub fn router(svc: Arc<ToolService>, config: AppConfig, cancel: CancellationToke
         )
         .layer(middleware::from_fn(orchestrator_only));
 
-    // Any internal client; the bot is limited to its own skills inside each handler.
+    // Any internal client; the bot is limited to its own skills inside each handler. Both
+    // may read and decide one approval item: the Slack bot does so from approval cards.
     let internal = Router::new()
         .route("/sessions", post(create_session))
         .route("/session", axum::routing::delete(revoke_session))
         .route("/call", post(call_tool))
+        .route("/approvals/{id}", get(get_approval))
+        .route("/approvals/{id}/decision", post(decide))
         .merge(admin)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -214,15 +219,16 @@ async fn orchestrator_only(req: Request, next: Next) -> Response {
     }
 }
 
-/// May `client` work with sessions for `skill`? The bot only for its own skills.
-fn client_may_use(state: &AppState, client: Client, skill: &str) -> bool {
-    match client {
-        Client::Orchestrator => true,
-        Client::Bot => state
+/// May `client` work with sessions for `skill`? The orchestrator for any skill and every
+/// bot session (`skill: None`); the Slack bot only for its own skills.
+fn client_may_use(state: &AppState, client: Client, skill: Option<&str>) -> bool {
+    match (client, skill) {
+        (Client::Orchestrator, _) => true,
+        (Client::Bot, Some(skill)) => state
             .bot
             .as_ref()
             .is_some_and(|b| b.skills.iter().any(|s| s == skill)),
-        Client::Mcp => false,
+        (Client::Bot, None) | (Client::Mcp, _) => false,
     }
 }
 
@@ -242,17 +248,19 @@ async fn header_session(
             ))
         })?;
     match state.svc.session(token, Utc::now()).await {
-        Ok(Some(session)) if client_may_use(state, client, &session.skill) => Ok(session),
+        Ok(Some(session)) if client_may_use(state, client, session.skill.as_deref()) => Ok(session),
         // A session the client may not use looks the same as one that doesn't exist.
         Ok(_) => Err(Box::new(error(StatusCode::NOT_FOUND, "no such session"))),
         Err(e) => Err(Box::new(unavailable(e))),
     }
 }
 
+/// `{user, skill, run_id, ttl_minutes?}` or `{user, bot, run_id, ttl_minutes?}`.
 #[derive(Deserialize)]
 struct NewSession {
     user: String,
-    skill: String,
+    skill: Option<String>,
+    bot: Option<String>,
     run_id: String,
     ttl_minutes: Option<i64>,
 }
@@ -262,20 +270,41 @@ async fn create_session(
     Extension(client): Extension<Client>,
     Json(body): Json<NewSession>,
 ) -> Response {
-    if !client_may_use(&state, client, &body.skill) {
+    if body.skill.is_some() == body.bot.is_some() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "send either `skill` or `bot`, not both",
+        );
+    }
+    if !client_may_use(&state, client, body.skill.as_deref()) {
+        let what = match (&body.skill, &body.bot) {
+            (Some(skill), _) => format!("`{skill}` sessions"),
+            (None, _) => "bot sessions".to_string(),
+        };
         return error(
             StatusCode::FORBIDDEN,
-            format!("this token may not start `{}` sessions", body.skill),
+            format!("this token may not start {what}"),
         );
     }
     let ttl = body
         .ttl_minutes
         .map(|m| Duration::minutes(m.clamp(1, 24 * 60)));
-    match state
-        .svc
-        .create_session(&body.user, &body.skill, &body.run_id, ttl, Utc::now())
-        .await
-    {
+    let created = match (&body.skill, &body.bot) {
+        (Some(skill), _) => {
+            state
+                .svc
+                .create_session(&body.user, skill, &body.run_id, ttl, Utc::now())
+                .await
+        }
+        (None, Some(bot)) => {
+            state
+                .svc
+                .create_bot_session(&body.user, bot, &body.run_id, ttl, Utc::now())
+                .await
+        }
+        (None, None) => unreachable!("checked above"),
+    };
+    match created {
         Ok(session) => {
             let tools: Vec<_> = state
                 .svc
@@ -293,8 +322,12 @@ async fn create_session(
             )
                 .into_response()
         }
-        Err(e @ SessionError::UnknownSkill(_)) => error(StatusCode::NOT_FOUND, e.to_string()),
-        Err(e @ SessionError::NotAMember(_)) => error(StatusCode::FORBIDDEN, e.to_string()),
+        Err(e @ (SessionError::UnknownSkill(_) | SessionError::UnknownBot(_))) => {
+            error(StatusCode::NOT_FOUND, e.to_string())
+        }
+        Err(e @ (SessionError::NotAMember(_) | SessionError::NotOwner { .. })) => {
+            error(StatusCode::FORBIDDEN, e.to_string())
+        }
         Err(SessionError::Store(e)) => unavailable(e),
         Err(e) => error(StatusCode::BAD_REQUEST, e.to_string()),
     }
@@ -333,7 +366,9 @@ async fn create_grant(State(state): State<AppState>, Json(body): Json<NewGrant>)
     };
     match state.svc.grant(&session, &body.tool, &body.args, now).await {
         Ok(()) => StatusCode::CREATED.into_response(),
-        Err(e @ ToolError::NotAllowed(_)) => error(StatusCode::FORBIDDEN, e.to_string()),
+        Err(e @ (ToolError::NotAllowed(_) | ToolError::NotInRole(_) | ToolError::Forbidden(_))) => {
+            error(StatusCode::FORBIDDEN, e.to_string())
+        }
         Err(ToolError::Unavailable(e)) => unavailable(StoreError(e)),
         Err(e) => error(StatusCode::BAD_REQUEST, e.to_string()),
     }
@@ -369,12 +404,20 @@ struct DecisionBody {
 
 async fn decide(
     State(state): State<AppState>,
+    Extension(client): Extension<Client>,
     Path(id): Path<String>,
     Json(body): Json<DecisionBody>,
 ) -> Response {
     match state
         .svc
-        .decide(&id, &body.decided_by, body.decision, body.args, Utc::now())
+        .decide_as(
+            client,
+            &id,
+            &body.decided_by,
+            body.decision,
+            body.args,
+            Utc::now(),
+        )
         .await
     {
         Ok(item) => Json(item).into_response(),
@@ -390,9 +433,12 @@ async fn decide(
             error(status, e.to_string())
         }
         Err(e @ DecisionError::InvalidArgs(_)) => error(StatusCode::BAD_REQUEST, e.to_string()),
-        Err(e @ (DecisionError::UnknownTool(_) | DecisionError::NotAllowed(_))) => {
-            error(StatusCode::CONFLICT, e.to_string())
-        }
+        Err(e @ DecisionError::NotAMember(_)) => error(StatusCode::FORBIDDEN, e.to_string()),
+        Err(
+            e @ (DecisionError::UnknownTool(_)
+            | DecisionError::NotAllowed(_)
+            | DecisionError::BotNotAllowed(_)),
+        ) => error(StatusCode::CONFLICT, e.to_string()),
         Err(e @ DecisionError::Internal(_)) => {
             tracing::error!(error = %e, "approved write task failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -433,7 +479,8 @@ struct UserQuery {
     user: String,
 }
 
-/// The URL to send a PM to so they can link their account.
+/// The URL to send a PM to so they can link their account. With `user=bots.<name>`, the URL
+/// a platform owner uses to link a team bot's own read-only account.
 async fn oauth_start(
     State(state): State<AppState>,
     Path(provider): Path<String>,
@@ -443,6 +490,19 @@ async fn oauth_start(
         Ok(x) => x,
         Err((status, message)) => return error(status, message),
     };
+    if let Some(name) = q.user.strip_prefix(BOT_IDENTITY_PREFIX) {
+        let team_bot = state
+            .svc
+            .roster()
+            .bot(name)
+            .is_some_and(|(bot, _)| bot.scope == BotScope::Team);
+        if !team_bot {
+            return error(
+                StatusCode::NOT_FOUND,
+                format!("no team bot `{name}`: only a team bot has accounts of its own"),
+            );
+        }
+    }
     match oauth.authorize_url(&q.user, provider, Utc::now()) {
         Ok(url) => Json(json!({ "url": url })).into_response(),
         Err(e @ OAuthError::NotConfigured(_)) => error(StatusCode::NOT_FOUND, e.to_string()),
@@ -583,9 +643,10 @@ async fn call_tool(
         Ok(result) => Json(json!({ "result": result })).into_response(),
         Err(e) => {
             let status = match &e {
-                ToolError::UnknownTool(_) | ToolError::NotAllowed(_) | ToolError::Forbidden(_) => {
-                    StatusCode::FORBIDDEN
-                }
+                ToolError::UnknownTool(_)
+                | ToolError::NotAllowed(_)
+                | ToolError::NotInRole(_)
+                | ToolError::Forbidden(_) => StatusCode::FORBIDDEN,
                 ToolError::InvalidArgs(_) => StatusCode::BAD_REQUEST,
                 ToolError::NotFound(_) => StatusCode::NOT_FOUND,
                 ToolError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,

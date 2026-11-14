@@ -66,7 +66,11 @@ pub struct AuditEvent {
     pub client: Client,
     pub run_id: String,
     pub user: String,
-    pub skill: String,
+    /// The session's skill; `None` for a bot session.
+    pub skill: Option<String>,
+    /// The session's bot, for a bot session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot: Option<String>,
     /// Registry name, such as `jira.create_issue`.
     pub tool: String,
     pub outcome: Outcome,
@@ -160,7 +164,8 @@ mod tests {
             at: "2026-11-14T00:00:00Z".parse().unwrap(),
             run_id: "run-1".into(),
             user: "ana".into(),
-            skill: "ask".into(),
+            skill: Some("ask".into()),
+            bot: None,
             tool: "context.search".into(),
             outcome: Outcome::Ok,
             sources: vec!["context/products/ccm.md".into()],

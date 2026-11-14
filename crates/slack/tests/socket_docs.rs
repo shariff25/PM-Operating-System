@@ -294,7 +294,9 @@ async fn docs_command_over_socket_mode() {
         .filter(|e| e.tool == "docs.search")
         .collect();
     assert_eq!(events.len(), 2);
-    assert!(events.iter().all(|e| e.user == "ana" && e.skill == "docs"));
+    assert!(events
+        .iter()
+        .all(|e| e.user == "ana" && e.skill.as_deref() == Some("docs")));
     assert!(events.iter().any(|e| e.run_id == "slack-docs-e5"));
 
     stop_slack.cancel();
