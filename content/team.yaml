@@ -1,9 +1,11 @@
-# Who may use PM OS, until SSO replaces this file in Phase 1. Changes go by pull request,
-# reviewed by a platform-owner PM.
+# Who may use PM OS, until SSO replaces this file in Phase 1. New members ask in Slack and a
+# platform-owner PM approves there; PM OS then commits the change here (docs/onboarding-spec.md).
+# Hand edits still go by pull request, reviewed by a platform-owner PM.
 #
 # handle:    the PM OS handle; matches master/people/<handle>/ if that folder exists
 # slack-id:  the Slack member id (Profile → ⋯ → Copy member ID), such as U012AB3CD
 # email:     the PM's Atlassian account email; needed to connect Jira and Confluence
+# github:    optional GitHub login in the Fortanix org; else a verified GitHub email must match
 # roles:     pm, skill-author, admin (admin = platform owner)
 #
 # Linking an account checks it belongs to the PM listed here: the Slack member id for
