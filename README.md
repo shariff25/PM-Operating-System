@@ -20,11 +20,18 @@ Slack without the PM's approval.
 | `crates/runtime` | Small pieces every service shares: constant-time token checks, SIGTERM-aware shutdown | Rust |
 | `crates/toolserver` | The only path from a sandbox to context and systems: MCP, allowlists, approvals, audit ([docs](docs/toolserver.md)) | Rust |
 | `crates/docs` | `pmos-docs`: MCP server over the public Acme support docs ([docs](docs/docs-server.md)) | Rust |
-| `crates/slack` | `pmos-slack`: the Slack bot; today `/docs` ([docs](docs/docs-server.md)) | Rust |
-| `harness/` | Team-service agent on LangChain Deep Agents | TypeScript |
+| `crates/slack` | `pmos-slack`: the Slack bot: DMs to bots, progress, approval cards, routines, `/docs` ([docs](docs/docs-server.md)) | Rust |
+| `crates/bots` | `pmos-bots`: the bot runtime: durable tasks, routines, traces, notifications ([docs](docs/bots-runtime.md)) | Rust |
+| `crates/console` | `pmos-console`: the four-screen console: bots, routines, approvals, activity ([docs](docs/console.md)) | Rust |
+| `crates/policy` | `pmos policy`: one OpenShell sandbox policy per bot, checked in CI ([docs](docs/sandbox-policies.md)) | Rust |
+| `crates/evals` | `pmos-evals`: benchmarks per task category, failure tags, load test ([docs](docs/evals.md)) | Rust |
+| `content/bots`, `content/roles` | The named bots and the roles they're made from | Markdown |
+| `policies/` | Generated sandbox policies, provider profiles and the red-team kit | YAML |
+| `evals/` | Benchmark categories, tasks and weekly reports | YAML, Markdown |
+| `harness/` | The agent on LangChain Deep Agents, and the worker that runs it in each bot's sandbox ([docs](harness/README.md)) | TypeScript |
 
-Still to come, per the plan: the bot runtime and policy checker (Rust), the rest of the
-Slack bot (a DM per bot, approval cards), sandbox policies, benchmarks and the console.
+Phase 0 is built. What's left needs the DGX Spark: vLLM serving the models, OpenShell, the
+Slack app, and the first live runs (see the plan's **Status**).
 
 ## Develop
 

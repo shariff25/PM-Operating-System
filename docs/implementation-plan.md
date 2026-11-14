@@ -267,10 +267,10 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
 | Support docs + `/docs` in Slack | Done | `crates/docs` (`pmos-docs` MCP server over support.acme.com), docs connector and `docs` skill in the tool server, `crates/slack` (Socket Mode, `/docs`), `content/team.yaml`; see `docs/docs-server.md` |
 | Staff-engineer review fixes | Done | Four reviews (security, correctness, scale and operations, design and tests), checked against the code. The 8 blockers and the pilot list are fixed; see **Review follow-ups** for what's left |
 | 0d Gateway | Done | `crates/gateway`: role aliases to local vLLM only, fair queue (interactive, scheduled, personal; per-person cap), usage log, workaround registry (D11), stub model for CI; see `docs/gateway.md` |
-| 0e Bot runtime | Next | Slice 1: the Docs bot in a Slack DM (the first hands-on preview); slice 2: personal bots, approval cards, routines, traces, console |
-| 0e Harness | Skeleton | The harness runs a turn through the gateway (checked with the stub model) |
-| 0f Sandbox policies | Not started | |
-| 0g Evals | Not started | |
+| 0e Bots | Built (mocks and stub model) | `content/bots`, `content/roles` and their lint; tool-server bot sessions (allowlist per role, `never` actions, team-bot read scope with its own account); `crates/bots` runtime (durable tasks with leases, routines, 30-day traces, notifications, one worker token per bot); `harness` worker; Slack DMs, progress, approval cards and routines; `crates/console`. Checked end to end with the real binaries and the stub model. See `docs/bot-runtime-spec.md` |
+| 0f Sandbox policies | Built; verify on the Spark | `crates/policy`, `pmos policy generate/check` in CI, `policies/bots/docs.yaml`, red-team kit. Format checked against OpenShell's repo; items marked "verify on the Spark" in `docs/sandbox-policies.md` |
+| 0g Evals | Built; first live run on the Spark | `crates/evals`, `evals/categories/docs-qa` (20 real questions), failure tags, weekly reports, load test. Latency targets: only p90 queue < 120 s is known; the rest are labelled placeholders |
+| **Gate 1** | Needs the Spark | vLLM with the chosen models; OpenShell; the Slack app; `team.yaml` filled in; the red-team run; two passing benchmark weeks; the load test |
 
 0c notes:
 - Connectors share one `Connector` trait (`read` and `write`, both keyed by action) instead of one trait per system. The real Jira, Confluence and Slack connectors each implement it.
