@@ -1746,6 +1746,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmos-evals"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "pmos-gateway"
 version = "0.1.0"
 dependencies = [
