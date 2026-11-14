@@ -42,6 +42,7 @@ async fn search_and_read_over_mcp() {
             token: TOKEN.into(),
             base: portal_base.clone(),
             allowed_hosts: vec!["127.0.0.1".into()],
+            stale_after: Some(std::time::Duration::from_secs(3600)),
         },
         cancel.clone(),
     );
@@ -73,6 +74,10 @@ async fn search_and_read_over_mcp() {
             .status(),
         200
     );
+    // Ready: the index answers, has pages, and was synced within the hour.
+    let ready = http.get(format!("{base}/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), 200);
+    assert_eq!(ready.json::<Value>().await.unwrap()["ready"], true);
 
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("{base}/mcp")).auth_header(TOKEN),

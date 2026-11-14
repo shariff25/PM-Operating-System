@@ -53,7 +53,8 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 
 | Endpoint | Auth | Purpose |
 | --- | --- | --- |
-| `GET /healthz` | none | Liveness |
+| `GET /healthz` | none | Liveness: the process answers |
+| `GET /readyz` | none | Readiness: `200` when storage answers within a second and every connector's own dependency (the support docs server) answers; `503` otherwise, naming the check that failed |
 | `POST /mcp` (Streamable HTTP) | `Bearer <session token>` | MCP for the harness: `tools/list`, `tools/call` |
 | `POST /internal/sessions` `{user, skill, run_id, ttl_minutes?}` | service or bot token | Create a session; returns `token` and the session's tools. `403` if the user isn't in `team.yaml` (live connectors), or the bot asks for a skill outside `PMOS_BOT_SKILLS`. |
 | `DELETE /internal/session` + `X-Pmos-Session` | service or bot token | Revoke a session (sandbox ended) |
@@ -171,6 +172,9 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 
 - **Migrations** run on start-up.
 - **Pruning:** expired sessions and grants are deleted every 10 minutes.
+- **Shutdown:** SIGTERM (what `docker compose stop` sends) or Ctrl-C stops new requests and lets in-flight ones finish. Give the container a stop grace period of at least 30 seconds.
+- **MCP sessions** stay open while idle for up to the session TTL (60 minutes), so a long model step between tool calls doesn't drop the connection.
+- **One replica.** OAuth sign-in states, refresh locks and MCP sessions are in process memory, so run a single tool server. Running two needs those moved to Postgres first; this is tracked in the implementation plan.
 - **Audit failures:**
   - **Writes fail closed:** they don't run unless their `started` event is recorded.
   - **Reads:** a missing event is logged as `AUDIT EVENT NOT RECORDED` at error level, and the read isn't undone.

@@ -1577,6 +1577,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "pmos-contract",
+ "pmos-runtime",
  "reqwest",
  "rmcp",
  "serde",
@@ -1596,6 +1597,7 @@ name = "pmos-runtime"
 version = "0.1.0"
 dependencies = [
  "subtle",
+ "tokio",
 ]
 
 [[package]]
@@ -1607,6 +1609,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "pmos-contract",
+ "pmos-runtime",
  "pmos-toolserver",
  "reqwest",
  "rustls",

@@ -137,17 +137,49 @@ impl Commands {
                 Err(CallError::Unavailable) => {
                     blocks::text("PM OS couldn't search the docs right now. Try again in a minute.")
                 }
-                Err(CallError::Refused(why)) => {
-                    blocks::text(&format!("PM OS couldn't run that search: {why}"))
-                }
+                Err(CallError::Refused(why)) => blocks::text(&format!(
+                    "PM OS couldn't run that search: {}",
+                    blocks::escape(&why)
+                )),
             };
-            if let Err(e) = this.http.post(&response_url).json(&message).send().await {
-                tracing::warn!(error = %e, "could not reply to /docs");
-            }
+            post_reply(&this.http, &response_url, &message).await;
         });
         Reply {
             ack: blocks::searching(&query),
             follow_up: Some(follow_up),
         }
     }
+}
+
+/// Send a reply to Slack's `response_url`, so the PM never stares at "Searching…" forever:
+/// retry once on a 5xx or a network error, and if Slack refuses the message (a 4xx such as
+/// `invalid_blocks`), send its plain-text version instead.
+pub async fn post_reply(http: &reqwest::Client, response_url: &str, message: &Value) {
+    let mut message = message.clone();
+    for attempt in 0..3 {
+        let res = http.post(response_url).json(&message).send().await;
+        match res {
+            Ok(r) if r.status().is_success() => return,
+            Ok(r) if r.status().is_client_error() && message.get("blocks").is_some() => {
+                let body = r.text().await.unwrap_or_default();
+                tracing::warn!(%body, "Slack refused the /docs reply; sending plain text");
+                if let Some(obj) = message.as_object_mut() {
+                    obj.remove("blocks");
+                }
+            }
+            Ok(r) if r.status().is_client_error() => {
+                tracing::warn!(status = %r.status(), "Slack refused the /docs reply");
+                return;
+            }
+            Ok(r) => {
+                tracing::warn!(status = %r.status(), attempt, "replying to /docs failed");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, attempt, "replying to /docs failed");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+    tracing::error!("could not reply to /docs after retrying");
 }

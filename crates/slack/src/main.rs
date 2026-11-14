@@ -1,9 +1,11 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use pmos_slack::commands::{Commands, SLACK_RESPONSE_URL_PREFIX};
-use pmos_slack::socket::Socket;
+use pmos_slack::socket::{Ended, Socket};
 use pmos_slack::toolserver::ToolServer;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 fn need(key: &str) -> Result<String> {
@@ -35,19 +37,41 @@ async fn main() -> Result<()> {
     if !team_file.is_file() {
         return Err(anyhow!("{} not found", team_file.display()));
     }
-    let http = reqwest::Client::new();
-    let socket = Socket {
-        api_base: std::env::var("PMOS_SLACK_URL").unwrap_or_else(|_| "https://slack.com".into()),
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let socket = Socket::new(
+        std::env::var("PMOS_SLACK_URL").unwrap_or_else(|_| "https://slack.com".into()),
         app_token,
-        commands: Commands {
+        Commands {
             toolserver,
             team_file,
             http: http.clone(),
             response_url_prefix: SLACK_RESPONSE_URL_PREFIX.into(),
         },
         http,
-    };
+    );
+    let shutdown = CancellationToken::new();
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            pmos_runtime::shutdown_signal().await;
+            shutdown.cancel();
+        });
+    }
     tracing::info!("pmos-slack starting (Socket Mode)");
-    socket.run().await;
-    Ok(())
+    let ended = socket.run(shutdown).await;
+    // Let replies already being worked on reach Slack.
+    let cut_off = socket.drain(Duration::from_secs(10)).await;
+    if cut_off > 0 {
+        tracing::warn!(cut_off, "shut down before every /docs reply was sent");
+    }
+    match ended {
+        // A non-zero exit, so a supervisor shows it rather than treating it as a clean stop.
+        Ended::Disabled => Err(anyhow!(
+            "Socket Mode is turned off for this Slack app; turn it on in the app's settings"
+        )),
+        _ => Ok(()),
+    }
 }
