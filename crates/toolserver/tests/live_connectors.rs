@@ -20,6 +20,7 @@ use pmos_toolserver::connectors::{Caller, Connector, ConnectorError};
 use pmos_toolserver::oauth::{
     AppCredentials, Endpoints, OAuth, OAuthConfig, OAuthError, TokenError, TokenSource,
 };
+use pmos_toolserver::team::Team;
 use pmos_toolserver::vault::{Credential, KeyRing, MemoryCredentials, Provider, Secret, Vault};
 use pmos_toolserver::{router, AppConfig, Stores, ToolService};
 use serde_json::{json, Value};
@@ -117,6 +118,10 @@ async fn handle(
                     json!({"access_token": "at-1", "refresh_token": "rt-1", "expires_in": 3600,
                            "scope": "read:jira-work offline_access"}),
                 ),
+                Some("refresh_token") if b["refresh_token"] == "rt-badclient" => reply(
+                    StatusCode::UNAUTHORIZED,
+                    json!({"error": "invalid_client", "error_description": "Client authentication failed."}),
+                ),
                 Some("refresh_token") if b["refresh_token"] == "rt-revoked" => reply(
                     StatusCode::FORBIDDEN,
                     json!({"error": "invalid_grant", "error_description": "Unknown or invalid refresh token."}),
@@ -139,6 +144,15 @@ async fn handle(
             json!([{"id": "cloud-1", "url": "https://example.atlassian.net", "name": "example",
                     "scopes": ["read:jira-work"]}]),
         ),
+
+        // The signed-in Atlassian account's profile.
+        ("GET", "/me") => match auth.as_str() {
+            "Bearer at-1" => reply(
+                ok,
+                json!({"account_id": "acc-ana", "email": "Ana@Example.com", "name": "Ana"}),
+            ),
+            _ => reply(StatusCode::UNAUTHORIZED, json!({"code": 401})),
+        },
 
         // Atlassian APIs: status overrides by token
         (_, p) if p.starts_with("/ex/") && auth == "Bearer at-401" => reply(
@@ -299,12 +313,17 @@ struct Live {
 }
 
 async fn live() -> Live {
+    live_with(None).await
+}
+
+/// Live connectors with `team.yaml` enforced, as in production.
+async fn live_with(team: Option<Arc<Team>>) -> Live {
     let (base, mock, cancel) = start_mock().await;
     let vault = Vault::new(
         KeyRing::from_spec(&KeyRing::generate_spec("k1")).unwrap(),
         Arc::new(MemoryCredentials::default()),
     );
-    let oauth = Arc::new(OAuth::new(
+    let oauth = OAuth::new(
         OAuthConfig {
             public_base_url: "https://pmos.example.com".into(),
             atlassian: Some(AppCredentials {
@@ -326,7 +345,11 @@ async fn live() -> Live {
             },
         },
         vault.clone(),
-    ));
+    );
+    let oauth = Arc::new(match team {
+        Some(team) => oauth.with_team(team),
+        None => oauth,
+    });
     let tokens: Arc<dyn TokenSource> = oauth.clone();
     Live {
         jira: Jira::new(tokens.clone(), base.clone()),
@@ -578,6 +601,137 @@ async fn a_refused_refresh_unlinks_the_account() {
         .is_none());
     let err = l.oauth.token("ana", Provider::Atlassian).await.unwrap_err();
     assert_eq!(err, TokenError::NotConnected(Provider::Atlassian));
+    l.cancel.cancel();
+}
+
+#[tokio::test]
+async fn a_client_error_on_refresh_keeps_the_account() {
+    // A mistyped or rotated client secret is ours to fix; unlinking would make every PM
+    // reconnect.
+    let l = live().await;
+    put_atlassian(&l, "ana", "at-old", "rt-badclient", -10).await;
+    let err = l.oauth.token("ana", Provider::Atlassian).await.unwrap_err();
+    assert!(
+        matches!(err, TokenError::Unavailable(Provider::Atlassian, ref e) if e == "invalid_client"),
+        "{err:?}"
+    );
+    let kept = l.vault.get("ana", Provider::Atlassian).await.unwrap();
+    assert_eq!(
+        kept.unwrap().refresh_token.unwrap().expose(),
+        "rt-badclient"
+    );
+    l.cancel.cancel();
+}
+
+#[tokio::test]
+async fn unlinking_during_a_refresh_stays_unlinked() {
+    let l = Arc::new(live().await);
+    put_atlassian(&l, "ana", "at-old", "rt-old", -10).await;
+    // The mock holds each refresh for 100 ms; unlink while this one is in flight.
+    let refreshing = {
+        let l = l.clone();
+        tokio::spawn(async move { l.oauth.token("ana", Provider::Atlassian).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(l
+        .oauth
+        .unlink_account("ana", Provider::Atlassian)
+        .await
+        .unwrap());
+    let _ = refreshing.await.unwrap();
+    assert!(
+        l.vault
+            .get("ana", Provider::Atlassian)
+            .await
+            .unwrap()
+            .is_none(),
+        "the refresh must not write the account back"
+    );
+    l.cancel.cancel();
+}
+
+#[tokio::test]
+async fn a_stale_write_cannot_replace_a_newer_credential() {
+    let l = live().await;
+    put_atlassian(&l, "ana", "at-1", "rt-1", 3600).await;
+    let old = l
+        .vault
+        .get("ana", Provider::Atlassian)
+        .await
+        .unwrap()
+        .unwrap();
+    let newer = Credential {
+        refresh_token: Some(Secret::new("rt-2")),
+        updated_at: old.updated_at + Duration::seconds(1),
+        ..old.clone()
+    };
+    assert!(l.vault.replace(&newer, old.updated_at).await.unwrap());
+    // A write based on the old row (such as a re-seal or a slower refresh) is refused.
+    let stale = Credential {
+        refresh_token: Some(Secret::new("rt-1")),
+        ..old.clone()
+    };
+    assert!(!l.vault.replace(&stale, old.updated_at).await.unwrap());
+    let now = l
+        .vault
+        .get("ana", Provider::Atlassian)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(now.refresh_token.unwrap().expose(), "rt-2");
+    l.cancel.cancel();
+}
+
+fn member(handle: &str, slack_id: &str, email: Option<&str>) -> pmos_contract::model::TeamMember {
+    pmos_contract::model::TeamMember {
+        handle: handle.into(),
+        slack_id: slack_id.into(),
+        email: email.map(String::from),
+        roles: vec![pmos_contract::model::Role::Pm],
+    }
+}
+
+#[tokio::test]
+async fn a_linked_account_must_belong_to_the_pm_it_is_linked_for() {
+    // The mock signs in Slack user U0ANA and Atlassian user Ana@Example.com.
+    let team = Team::of(vec![
+        member("ana", "U0ANA", Some("ana@example.com")),
+        member("bo", "U0BO", Some("bo@example.com")),
+        member("cy", "U0CY", None),
+    ]);
+    let l = live_with(Some(team)).await;
+    let try_link = |user: &'static str, provider| {
+        let url = l.oauth.authorize_url(user, provider, Utc::now()).unwrap();
+        let oauth = l.oauth.clone();
+        async move {
+            oauth
+                .complete(provider, "good-code", &state_of(&url), Utc::now())
+                .await
+        }
+    };
+
+    // Ana's own accounts link.
+    try_link("ana", Provider::Slack).await.unwrap();
+    try_link("ana", Provider::Atlassian).await.unwrap();
+
+    // Bo's link, opened by Ana (a forwarded link), attaches nothing to Bo.
+    for provider in [Provider::Slack, Provider::Atlassian] {
+        let err = try_link("bo", provider).await.unwrap_err();
+        assert!(
+            matches!(err, OAuthError::WrongAccount(p, _) if p == provider),
+            "{err:?}"
+        );
+        assert!(l.vault.get("bo", provider).await.unwrap().is_none());
+    }
+    // Atlassian needs an email in team.yaml to check against; nobody outside the team links.
+    assert!(matches!(
+        try_link("cy", Provider::Atlassian).await.unwrap_err(),
+        OAuthError::WrongAccount(..)
+    ));
+    assert!(matches!(
+        try_link("eve", Provider::Slack).await.unwrap_err(),
+        OAuthError::WrongAccount(..)
+    ));
     l.cancel.cancel();
 }
 

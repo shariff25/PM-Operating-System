@@ -132,11 +132,16 @@ use the Slack bot.
 members:
   - handle: ana            # PM OS handle; matches master/people/<handle>/ if present
     slack-id: U012AB3CD    # Slack member id (U… or W…)
+    email: ana@example.com # optional; Atlassian account email, needed to link Jira/Confluence
     roles: [pm, skill-author]   # pm | skill-author | admin (admin = platform owner)
 ```
 
-Rules: `team-parse`, `team-handle`, `team-slack-id`, `team-duplicate` (a handle or Slack id
-listed twice), `team-roles` (no roles), `people-unknown` (warning: a `master/people/` folder
+With live connectors the tool server enforces this file: only members get sessions, and a
+linked account must match the member (the Slack member id for Slack, the email for
+Atlassian).
+
+Rules: `team-parse`, `team-handle`, `team-slack-id`, `team-email`, `team-duplicate` (a
+handle or Slack id listed twice), `team-roles` (no roles), `people-unknown` (warning: a `master/people/` folder
 for someone not on the team).
 
 ## Templates: `templates/*.md`

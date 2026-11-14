@@ -619,6 +619,15 @@ impl Cx {
                     format!("Slack id `{}` is listed twice", m.slack_id),
                 );
             }
+            if let Some(email) = &m.email {
+                if !crate::model::valid_email(email) {
+                    self.error(
+                        "team-email",
+                        &path,
+                        format!("`{email}` is not an email address"),
+                    );
+                }
+            }
             if m.roles.is_empty() {
                 self.error("team-roles", &path, format!("`{}` has no roles", m.handle));
             }

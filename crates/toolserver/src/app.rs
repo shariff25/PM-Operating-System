@@ -464,6 +464,14 @@ async fn oauth_callback(
             "Link expired",
             "This sign-in link is invalid or has expired. Start again from PM OS.",
         ),
+        Err(e @ OAuthError::WrongAccount(..)) => {
+            tracing::warn!(provider = %provider, error = %e, "account linking refused");
+            page(
+                StatusCode::FORBIDDEN,
+                "Not connected",
+                "This sign-in link was made for someone else. Ask PM OS for your own link.",
+            )
+        }
         Err(e) => {
             tracing::warn!(provider = %provider, error = %e, "account linking failed");
             page(
@@ -495,7 +503,7 @@ async fn revoke_credential(
         Ok(x) => x,
         Err((status, message)) => return error(status, message),
     };
-    match oauth.vault().delete(&user, provider).await {
+    match oauth.unlink_account(&user, provider).await {
         Ok(true) => {
             tracing::info!(user = %user, provider = %provider, "account unlinked");
             StatusCode::NO_CONTENT.into_response()

@@ -91,7 +91,10 @@ happens on the Spark after Gate 1.
 **Linking an account.**
 1. The Slack bot (its Accounts tab, or a first-use prompt) asks `/internal/oauth/{provider}/start` for a URL and sends the PM there.
 2. Atlassian or Slack sends the PM's browser back to `/oauth/{provider}/callback`.
-3. The tool server exchanges the code and seals the tokens in the vault.
+3. The tool server exchanges the code and checks the account belongs to that PM in
+   `team.yaml`: the Slack user must be the member's `slack-id`, and the Atlassian account's
+   email (from `/me`, scope `read:me`) must be the member's `email`. Only then does it seal the
+   tokens in the vault. A link forwarded to someone else attaches nothing.
 
 The `state` value is HMAC-signed, names the user and provider, expires in 10 minutes and is
 accepted once. Atlassian asks for `offline_access`, so it returns a refresh token, and
@@ -100,8 +103,16 @@ several sites.
 
 **Refresh.** An Atlassian token within 60 seconds of expiry is refreshed under a per-user lock,
 so concurrent calls make one refresh. Atlassian refresh tokens rotate: each refresh returns a
-new one, which replaces the old. If Atlassian refuses the refresh (revoked, or unused for 90
-days), the account is unlinked and the PM is asked to reconnect.
+new one, which replaces the old.
+- **Only a refused grant unlinks.** If Atlassian answers `invalid_grant` (revoked, or unused for
+  90 days), the account is unlinked and the PM is asked to reconnect.
+- **Any other refusal keeps the account.** For example `invalid_client` after a mistyped
+  client secret, or a firewall page. The call fails as unavailable and an error is logged for
+  the platform owner, rather than making every PM reconnect.
+- **Saving the new token is conditional.** It is written only over the row it was refreshed
+  from, and retried if storage blips. Unlinking waits for any refresh in flight, so an
+  unlinked account never comes back. Re-sealing after a key rotation is conditional the
+  same way.
 
 **Errors the model sees** are written for the PM:
 - "connect Atlassian (Jira and Confluence) in PM OS first" when no account is linked.

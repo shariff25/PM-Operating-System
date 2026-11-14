@@ -393,7 +393,7 @@ fn team_file_rules() {
     write(
         dir.path(),
         "team.yaml",
-        "members:\n  - {handle: ana, slack-id: U0ANA1, roles: [pm, skill-author]}\n  - {handle: Ana, slack-id: U0ANA1, roles: []}\n  - {handle: bo, slack-id: x123, roles: [admin]}\n  - {handle: bo, slack-id: U0BO, roles: [pm]}\n",
+        "members:\n  - {handle: ana, slack-id: U0ANA1, roles: [pm, skill-author]}\n  - {handle: Ana, slack-id: U0ANA1, roles: []}\n  - {handle: bo, slack-id: x123, roles: [admin]}\n  - {handle: bo, slack-id: U0BO, roles: [pm]}\n  - {handle: dee, slack-id: U0DEE, email: not-an-email, roles: [pm]}\n",
     );
     std::fs::create_dir_all(dir.path().join("master/people/cy")).unwrap();
     let report = run(&dir);
@@ -402,6 +402,7 @@ fn team_file_rules() {
         "team-duplicate",
         "team-slack-id",
         "team-roles",
+        "team-email",
     ] {
         assert_code(&report, code, Severity::Error);
     }
@@ -425,6 +426,8 @@ fn team_file_parses_and_looks_up_by_slack_id() {
     .unwrap();
     assert_eq!(team.by_slack_id("U0ANA1").unwrap().handle, "ana");
     assert!(team.by_slack_id("U0BO").is_none());
+    assert_eq!(team.by_handle("ana").unwrap().slack_id, "U0ANA1");
+    assert!(team.by_handle("ana").unwrap().email.is_none());
     assert!(pmos_contract::model::TeamFile::from_yaml(
         "members:\n  - {handle: a, slack-id: U1, roles: [owner]}\n"
     )

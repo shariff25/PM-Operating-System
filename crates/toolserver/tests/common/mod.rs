@@ -138,6 +138,7 @@ pub fn team_fixture(members: &[&str]) -> Fixture {
             .map(|h| pmos_contract::model::TeamMember {
                 handle: h.to_string(),
                 slack_id: "U0TEST".into(),
+                email: None,
                 roles: vec![pmos_contract::model::Role::Pm],
             })
             .collect(),

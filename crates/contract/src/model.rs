@@ -234,6 +234,10 @@ pub struct TeamMember {
     pub handle: String,
     /// Slack member id, such as `U012AB3CD`.
     pub slack_id: String,
+    /// Atlassian account email. Linking Jira and Confluence checks the signed-in account
+    /// has this email, so a forwarded link can't attach someone else's account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     pub roles: Vec<Role>,
 }
 
@@ -269,6 +273,22 @@ impl TeamFile {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
+    }
+}
+
+/// A plausible email address: one `@`, something either side, a dot in the domain, no
+/// spaces. Deliverability isn't checked; this catches typos in `team.yaml`.
+pub fn valid_email(email: &str) -> bool {
+    match email.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+                && !domain.contains('@')
+                && !email.chars().any(char::is_whitespace)
+        }
+        None => false,
     }
 }
 

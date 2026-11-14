@@ -25,7 +25,8 @@ use serde_json::Value;
 use sha2::Sha256;
 
 use crate::session::valid_handle;
-use crate::store::StoreError;
+use crate::store::{StoreError, StoreResult};
+use crate::team::Team;
 use crate::vault::{Credential, CredentialInfo, Provider, Secret, Vault};
 
 /// How long a `state` value is accepted.
@@ -91,6 +92,10 @@ pub enum OAuthError {
     Exchange(Provider, String),
     #[error("no Atlassian site matches; set PMOS_ATLASSIAN_SITE (sites: {0})")]
     SiteChoice(String),
+    /// The account that signed in isn't the one `team.yaml` lists for this PM, so a link
+    /// forwarded to someone else can't attach their account to the sender.
+    #[error("the {label} account that signed in doesn't belong to this PM: {detail}", label = .0.label(), detail = .1)]
+    WrongAccount(Provider, String),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -136,6 +141,7 @@ pub struct OAuth {
     http: reqwest::Client,
     used_states: Mutex<HashMap<String, DateTime<Utc>>>,
     refresh_locks: Mutex<HashMap<(String, Provider), RefreshLock>>,
+    team: Arc<Team>,
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -155,7 +161,14 @@ impl OAuth {
             http,
             used_states: Mutex::new(HashMap::new()),
             refresh_locks: Mutex::new(HashMap::new()),
+            team: Team::open(),
         }
+    }
+
+    /// Check every linked account against `team` (Slack member id, Atlassian email).
+    pub fn with_team(mut self, team: Arc<Team>) -> Self {
+        self.team = team;
+        self
     }
 
     pub fn vault(&self) -> &Vault {
@@ -288,6 +301,7 @@ impl OAuth {
             Provider::Atlassian => self.exchange_atlassian(&user, code, now).await?,
             Provider::Slack => self.exchange_slack(&user, code, now).await?,
         };
+        self.check_identity(&credential).await?;
         self.vault.put(&credential).await?;
         tracing::info!(user = %user, provider = %provider, "account linked");
         Ok(CredentialInfo {
@@ -298,6 +312,53 @@ impl OAuth {
             external_id: credential.external_id,
             updated_at: credential.updated_at,
         })
+    }
+
+    /// The account that signed in must be the one `team.yaml` lists for this PM. Nothing is
+    /// stored otherwise.
+    async fn check_identity(&self, credential: &Credential) -> Result<(), OAuthError> {
+        if !self.team.enforced() {
+            return Ok(());
+        }
+        let provider = credential.provider;
+        let wrong = |why: &str| Err(OAuthError::WrongAccount(provider, why.to_string()));
+        let Some(member) = self.team.member(&credential.user) else {
+            return wrong("not in team.yaml");
+        };
+        match provider {
+            Provider::Slack => {
+                if credential.external_id.as_deref() != Some(member.slack_id.as_str()) {
+                    return wrong("the Slack user isn't the slack-id in team.yaml");
+                }
+            }
+            Provider::Atlassian => {
+                let Some(expected) = member.email.as_deref() else {
+                    return wrong("team.yaml has no email for this PM");
+                };
+                let me = self
+                    .http
+                    .get(format!("{}/me", self.config.endpoints.atlassian_api))
+                    .bearer_auth(credential.access_token.expose())
+                    .send()
+                    .await
+                    .map_err(|e| OAuthError::Exchange(provider, e.to_string()))?;
+                if !me.status().is_success() {
+                    return Err(OAuthError::Exchange(
+                        provider,
+                        format!("profile lookup returned {}", me.status()),
+                    ));
+                }
+                let me: Value = me
+                    .json()
+                    .await
+                    .map_err(|e| OAuthError::Exchange(provider, e.to_string()))?;
+                let email = me["email"].as_str().unwrap_or_default();
+                if !email.eq_ignore_ascii_case(expected) {
+                    return wrong("the Atlassian email isn't the email in team.yaml");
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn post_atlassian_token(&self, body: Value) -> Result<Value, (u16, String)> {
@@ -473,8 +534,20 @@ impl OAuth {
                         updated_at: now,
                         ..current.clone()
                     },
-                    Err((400..=403, _)) => return self.unlink(&current).await,
-                    Err((_, e)) => return Err(TokenError::Unavailable(provider, e)),
+                    // Only a refused grant means the PM's link is dead. Anything else, such as
+                    // `invalid_client` after a mistyped client secret, or a firewall page, is
+                    // ours to fix: unlinking would make every PM reconnect.
+                    Err((_, e)) if e == "invalid_grant" => return self.unlink(&current).await,
+                    Err((status, e)) => {
+                        if (400..500).contains(&status) {
+                            tracing::error!(
+                                status,
+                                error = %e,
+                                "Atlassian refused the token refresh; check PMOS_ATLASSIAN_CLIENT_ID/SECRET"
+                            );
+                        }
+                        return Err(TokenError::Unavailable(provider, e));
+                    }
                 }
             }
             Provider::Slack => match self
@@ -500,8 +573,50 @@ impl OAuth {
         if refreshed.access_token.expose().is_empty() {
             return Err(TokenError::Reconnect(provider));
         }
-        self.vault.put(&refreshed).await?;
-        Ok(refreshed)
+        self.save_refreshed(&current, refreshed).await
+    }
+
+    /// Store a refreshed credential, only over the row it was refreshed from. If the PM
+    /// unlinked meanwhile, the unlink stands. Atlassian rotates refresh tokens, so losing
+    /// the new one forces a reconnect: retry before giving up.
+    async fn save_refreshed(
+        &self,
+        current: &Credential,
+        refreshed: Credential,
+    ) -> Result<Credential, TokenError> {
+        let provider = current.provider;
+        let mut attempt = 0;
+        loop {
+            match self.vault.replace(&refreshed, current.updated_at).await {
+                Ok(true) => return Ok(refreshed),
+                Ok(false) => {
+                    tracing::info!(user = %current.user, provider = %provider, "unlinked during refresh; not restoring it");
+                    return Err(TokenError::NotConnected(provider));
+                }
+                Err(e) if attempt < 2 => {
+                    attempt += 1;
+                    tracing::warn!(error = %e, attempt, "saving a refreshed token failed; retrying");
+                    tokio::time::sleep(StdDuration::from_millis(200 * attempt)).await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        user = %current.user,
+                        provider = %provider,
+                        error = %e,
+                        "REFRESHED TOKEN NOT SAVED: the PM may need to reconnect"
+                    );
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+
+    /// Unlink an account (the PM disconnects, or a platform owner revokes). Waits for any
+    /// refresh in flight, so that refresh can't write the account back.
+    pub async fn unlink_account(&self, user: &str, provider: Provider) -> StoreResult<bool> {
+        let lock = self.lock_for(user, provider);
+        let _guard = lock.lock().await;
+        self.vault.delete(user, provider).await
     }
 
     /// The provider refused the refresh token: the link is dead. Remove it so the PM is
