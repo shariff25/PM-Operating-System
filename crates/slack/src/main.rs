@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
             "PMOS_SLACK_APP_TOKEN must be an app-level token (xapp-…) with connections:write"
         ));
     }
-    let toolserver = ToolServer::new(need("PMOS_TOOLSERVER_URL")?, need("PMOS_SERVICE_TOKEN")?);
+    let toolserver = ToolServer::new(need("PMOS_TOOLSERVER_URL")?, need("PMOS_BOT_TOKEN")?);
     let team_file =
         PathBuf::from(std::env::var("PMOS_CONTENT_ROOT").unwrap_or_else(|_| "content".into()))
             .join("team.yaml");

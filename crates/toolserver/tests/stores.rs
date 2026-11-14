@@ -499,6 +499,7 @@ async fn reindex_tracks_the_content_repo(b: &Backend) {
 
 fn event(outcome: Outcome) -> AuditEvent {
     AuditEvent {
+        client: pmos_toolserver::audit::Client::Mcp,
         at: now(),
         run_id: "run-a".into(),
         user: "ana".into(),

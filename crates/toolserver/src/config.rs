@@ -49,8 +49,15 @@ pub struct Config {
     pub content_root: PathBuf,
     /// `PMOS_BIND`: listen address. Default `127.0.0.1:8710`.
     pub bind: SocketAddr,
-    /// `PMOS_SERVICE_TOKEN`: required; guards `/internal`. At least 32 characters.
+    /// `PMOS_SERVICE_TOKEN`: required; the orchestrator's token for `/internal`. At least 32
+    /// characters.
     pub service_token: String,
+    /// `PMOS_BOT_TOKEN`: the Slack bot's own token, at least 32 characters and different from
+    /// the service token. Optional; without it the bot can't connect.
+    pub bot_token: Option<String>,
+    /// `PMOS_BOT_SKILLS`: space- or comma-separated skills the bot may start sessions for.
+    /// Default `docs`.
+    pub bot_skills: Vec<String>,
     /// `PMOS_DATABASE_URL`: Postgres for every store. Required unless `PMOS_DEV=1`, which
     /// keeps everything in memory.
     pub database_url: Option<String>,
@@ -75,6 +82,21 @@ impl Config {
         if service_token.len() < 32 {
             return Err("PMOS_SERVICE_TOKEN must be at least 32 characters".into());
         }
+        let bot_token = get("PMOS_BOT_TOKEN").filter(|t| !t.is_empty());
+        if let Some(t) = &bot_token {
+            if t.len() < 32 {
+                return Err("PMOS_BOT_TOKEN must be at least 32 characters".into());
+            }
+            if t == &service_token {
+                return Err("PMOS_BOT_TOKEN must differ from PMOS_SERVICE_TOKEN".into());
+            }
+        }
+        let bot_skills: Vec<String> = get("PMOS_BOT_SKILLS")
+            .unwrap_or_else(|| "docs".into())
+            .split([' ', ','])
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
         let dev = get("PMOS_DEV").as_deref() == Some("1");
         let audit_log = get("PMOS_AUDIT_LOG").map(PathBuf::from);
         let database_url = get("PMOS_DATABASE_URL").filter(|u| !u.is_empty());
@@ -110,6 +132,8 @@ impl Config {
                 .into(),
             bind,
             service_token,
+            bot_token,
+            bot_skills,
             database_url,
             audit_log,
             allowed_hosts,

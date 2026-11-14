@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 const SERVICE_TOKEN: &str = "test-service-token-0123456789abcdef";
+const BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
 const APP_TOKEN: &str = "xapp-1-test";
 
 #[derive(Default)]
@@ -138,6 +139,10 @@ async fn docs_command_over_socket_mode() {
         svc,
         AppConfig {
             service_token: SERVICE_TOKEN.into(),
+            bot: Some(pmos_toolserver::app::BotAccess {
+                token: BOT_TOKEN.into(),
+                skills: vec!["docs".into()],
+            }),
             content_root: content,
             allowed_hosts: vec!["127.0.0.1".into()],
             oauth: None,
@@ -184,7 +189,7 @@ async fn docs_command_over_socket_mode() {
         api_base: slack_base.clone(),
         app_token: APP_TOKEN.into(),
         commands: Commands {
-            toolserver: ToolServer::new(ts_base, SERVICE_TOKEN),
+            toolserver: ToolServer::new(ts_base, BOT_TOKEN),
             team_file,
             http: http.clone(),
             response_url_prefix: format!("{slack_base}/hooks/"),

@@ -18,7 +18,7 @@ use pmos_contract::{Skill, ToolKind};
 use serde_json::{json, Value};
 
 use crate::approvals::{args_hash, ApprovalItem, DecideError, Decision, NewItem, Status};
-use crate::audit::{AuditEvent, Outcome};
+use crate::audit::{AuditEvent, Client, Outcome};
 use crate::catalog::{Catalog, ToolSpec};
 use crate::connectors::{untrusted, Caller, Connector, ConnectorError};
 use crate::context::{load_docs, ContextDoc, ReindexReport};
@@ -26,6 +26,7 @@ use crate::memory::valid_key;
 use crate::schemas::check_args;
 use crate::session::{token_hash, valid_handle, Session};
 use crate::store::{StoreError, Stores};
+use crate::team::Team;
 
 pub const DEFAULT_SESSION_TTL_MINUTES: i64 = 60;
 const DEFAULT_LIMIT: usize = 5;
@@ -75,6 +76,8 @@ pub enum SessionError {
     InvalidUser(String),
     #[error("run_id must be 1–128 characters")]
     InvalidRun,
+    #[error("`{0}` is not in team.yaml")]
+    NotAMember(String),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -105,6 +108,7 @@ pub struct ToolService {
     catalog: Catalog,
     stores: Stores,
     connectors: HashMap<String, Arc<dyn Connector>>,
+    team: Arc<Team>,
     stale_after_days: i64,
 }
 
@@ -133,8 +137,19 @@ impl ToolService {
             catalog,
             stores,
             connectors,
+            team: Team::open(),
             stale_after_days: pmos_contract::lint::DEFAULT_STALE_AFTER_DAYS,
         })
+    }
+
+    /// Only people in `team` may have sessions (when it is enforced).
+    pub fn with_team(mut self, team: Arc<Team>) -> Self {
+        self.team = team;
+        self
+    }
+
+    pub fn team(&self) -> &Arc<Team> {
+        &self.team
     }
 
     pub fn catalog(&self) -> &Catalog {
@@ -159,6 +174,9 @@ impl ToolService {
                 .map(|d| format!("  {}: {}: {}", d.code, d.path, d.message))
                 .collect();
             return Err(ReindexError::Lint(lines.join("\n")));
+        }
+        if let Err(e) = self.team.reload() {
+            return Err(ReindexError::Lint(format!("  team.yaml: {e}")));
         }
         Ok(self.stores.context.reindex(load_docs(content_root)).await?)
     }
@@ -189,6 +207,9 @@ impl ToolService {
     ) -> Result<Session, SessionError> {
         if !valid_handle(user) {
             return Err(SessionError::InvalidUser(user.to_string()));
+        }
+        if !self.team.allows(user) {
+            return Err(SessionError::NotAMember(user.to_string()));
         }
         if self.catalog.skill(skill).is_none() {
             return Err(SessionError::UnknownSkill(skill.to_string()));
@@ -234,6 +255,7 @@ impl ToolService {
 
     // ----- tool calls -----------------------------------------------------------------
 
+    /// A call from an agent sandbox over MCP.
     pub async fn call(
         &self,
         session: &Session,
@@ -241,8 +263,22 @@ impl ToolService {
         args: Value,
         now: DateTime<Utc>,
     ) -> Result<Value, ToolError> {
+        self.call_as(Client::Mcp, session, harness_name, args, now)
+            .await
+    }
+
+    /// A call by `client`, which is recorded in the audit log.
+    pub async fn call_as(
+        &self,
+        client: Client,
+        session: &Session,
+        harness_name: &str,
+        args: Value,
+        now: DateTime<Utc>,
+    ) -> Result<Value, ToolError> {
         let args = if args.is_null() { json!({}) } else { args };
         let mut event = AuditEvent {
+            client,
             at: now,
             run_id: session.run_id.clone(),
             user: session.user.clone(),
@@ -548,6 +584,7 @@ impl ToolService {
             .add_grant(&token_hash(&session.token), &spec.name, args, now)
             .await?;
         self.audit(AuditEvent {
+            client: Client::Orchestrator,
             at: now,
             run_id: session.run_id.clone(),
             user: session.user.clone(),
@@ -596,6 +633,7 @@ impl ToolService {
                 if e == DecideError::Forbidden {
                     if let Ok(Some(item)) = self.stores.approvals.get(id).await {
                         self.audit(AuditEvent {
+                            client: Client::Orchestrator,
                             at: now,
                             run_id: item.run_id,
                             user: decided_by.to_string(),
@@ -615,6 +653,7 @@ impl ToolService {
         };
 
         let mut event = AuditEvent {
+            client: Client::Orchestrator,
             at: now,
             run_id: item.run_id.clone(),
             user: item.user.clone(),

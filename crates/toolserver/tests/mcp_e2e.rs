@@ -32,6 +32,7 @@ async fn start_with(fixture: common::Fixture) -> Server {
         Arc::clone(&fixture.svc),
         AppConfig {
             service_token: SERVICE_TOKEN.into(),
+            bot: None,
             content_root: fixture.root.clone(),
             oauth: None,
             allowed_hosts: vec!["127.0.0.1".into(), "localhost".into()],
@@ -284,8 +285,9 @@ async fn revoked_sessions_are_refused() {
     let s = start().await;
     let token = create_session(&s.base, "ask").await;
     let res = http()
-        .delete(format!("{}/internal/sessions/{token}", s.base))
+        .delete(format!("{}/internal/session", s.base))
         .bearer_auth(SERVICE_TOKEN)
+        .header("x-pmos-session", &token)
         .send()
         .await
         .unwrap();

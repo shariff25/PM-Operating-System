@@ -128,7 +128,34 @@ pub async fn pg_fixture() -> Option<(Fixture, TestPg)> {
     Some((fixture, pg))
 }
 
+/// The in-memory fixture with `team.yaml` enforced, as with live connectors.
+pub fn team_fixture(members: &[&str]) -> Fixture {
+    let (dir, root) = content_tree();
+    let (stores, audit) = Stores::in_memory(&root);
+    let team = pmos_toolserver::team::Team::of(
+        members
+            .iter()
+            .map(|h| pmos_contract::model::TeamMember {
+                handle: h.to_string(),
+                slack_id: "U0TEST".into(),
+                roles: vec![pmos_contract::model::Role::Pm],
+            })
+            .collect(),
+    );
+    build_with(dir, root, stores, audit, Some(team))
+}
+
 fn build(dir: TempDir, root: PathBuf, stores: Stores, audit: Arc<MemoryAudit>) -> Fixture {
+    build_with(dir, root, stores, audit, None)
+}
+
+fn build_with(
+    dir: TempDir,
+    root: PathBuf,
+    stores: Stores,
+    audit: Arc<MemoryAudit>,
+    team: Option<Arc<pmos_toolserver::team::Team>>,
+) -> Fixture {
     let catalog = Catalog::load(&root, now().date_naive()).expect("fixture content lints");
     let jira = Arc::new(FakeConnector::jira());
     let confluence = Arc::new(FakeConnector::confluence());
@@ -139,7 +166,10 @@ fn build(dir: TempDir, root: PathBuf, stores: Stores, audit: Arc<MemoryAudit>) -
         slack.clone(),
         Arc::new(FakeConnector::docs()),
     ];
-    let svc = ToolService::new(catalog, stores, connectors).unwrap();
+    let mut svc = ToolService::new(catalog, stores, connectors).unwrap();
+    if let Some(team) = team {
+        svc = svc.with_team(team);
+    }
     Fixture {
         _dir: dir,
         root,

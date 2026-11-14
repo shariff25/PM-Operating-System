@@ -254,6 +254,22 @@ impl TeamFile {
     pub fn by_slack_id(&self, slack_id: &str) -> Option<&TeamMember> {
         self.members.iter().find(|m| m.slack_id == slack_id)
     }
+
+    /// The member with this PM OS handle.
+    pub fn by_handle(&self, handle: &str) -> Option<&TeamMember> {
+        self.members.iter().find(|m| m.handle == handle)
+    }
+
+    /// `<content_root>/team.yaml`. A missing file is an empty team; a file that doesn't parse
+    /// is an error, so a typo never silently opens or closes access.
+    pub fn load(content_root: &std::path::Path) -> Result<Self, String> {
+        let path = content_root.join("team.yaml");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Self::from_yaml(&text).map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
 }
 
 /// A valid PM OS handle (the tool server and harness apply the same rule).

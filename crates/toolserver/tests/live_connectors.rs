@@ -902,6 +902,7 @@ async fn link_over_http_then_call_through_the_tool_server() {
         svc.clone(),
         AppConfig {
             service_token: SERVICE_TOKEN.into(),
+            bot: None,
             content_root: content.clone(),
             allowed_hosts: vec!["127.0.0.1".into()],
             oauth: Some(l.oauth.clone()),
