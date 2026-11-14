@@ -406,7 +406,84 @@ both_envs!(
     workers_are_held_to_their_claim,
     a_failed_task_says_why,
     routines_are_managed_by_their_owner,
+    a_bots_own_worker_touches_only_that_bots_tasks,
 );
+
+/// Each bot's sandbox holds its own worker token (`worker-docs`), so a compromised Docs-bot
+/// sandbox can't claim Ana's personal-bot task and receive its restricted session.
+async fn a_bots_own_worker_touches_only_that_bots_tasks(env: &Env) {
+    let (status, personal) = env
+        .post(
+            "/v1/tasks",
+            "slack",
+            Some("ana"),
+            json!({"bot": "pm-ana", "requested_by": "ana", "text": "draft my PRD", "source": "slack"}),
+        )
+        .await;
+    assert_eq!(status, 201, "{personal}");
+    let personal_id = id(&personal);
+
+    // Asking for another bot's tasks is refused; asking for nothing gets only its own (none yet).
+    let (status, _) = env
+        .post(
+            "/v1/worker/claim",
+            "worker-docs",
+            None,
+            json!({"worker": "docs-1", "bots": ["pm-ana"]}),
+        )
+        .await;
+    assert_eq!(status, 403);
+    let (status, _) = env
+        .post(
+            "/v1/worker/claim",
+            "worker-docs",
+            None,
+            json!({"worker": "docs-1"}),
+        )
+        .await;
+    assert_eq!(status, 204, "the queued task is pm-ana's, not docs'");
+
+    // Its own bot's task, it gets.
+    let docs_task = id(&env.ask("What ports does DSM need?").await);
+    let (status, claim) = env
+        .post(
+            "/v1/worker/claim",
+            "worker-docs",
+            None,
+            json!({"worker": "docs-1"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{claim}");
+    assert_eq!(claim["task"]["id"], docs_task.as_str());
+
+    // Ana's task is claimed by a worker that may serve it; the Docs worker can't touch it.
+    let (status, claim) = env
+        .post(
+            "/v1/worker/claim",
+            "worker",
+            None,
+            json!({"worker": "any-1", "bots": ["pm-ana"]}),
+        )
+        .await;
+    assert_eq!(status, 200, "{claim}");
+    for (path, body) in [
+        ("heartbeat", json!({})),
+        ("events", json!({"kind": "milestone", "text": "x"})),
+        ("trace", json!({"entries": []})),
+        ("complete", json!({"result": "stolen", "approvals": []})),
+        ("fail", json!({"reason": "x"})),
+    ] {
+        let (status, _) = env
+            .post(
+                &format!("/v1/worker/tasks/{personal_id}/{path}"),
+                "worker-docs",
+                None,
+                body,
+            )
+            .await;
+        assert_eq!(status, 404, "{path}");
+    }
+}
 
 // ----- task creation rules -----------------------------------------------------------------
 

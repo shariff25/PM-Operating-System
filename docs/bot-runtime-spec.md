@@ -28,6 +28,7 @@ Every service reads its tokens from env and compares them with `pmos_runtime::to
 - **Notifications:** each carries `at`; `approval_closed` items carry `outcomes`.
 - **No PM needed:** the Slack client sends no `X-Pmos-User` for the shared notification feed or the bot list. Every per-PM call (tasks, routines) still needs it, and is refused without it.
 - **Skill or bot:** tool-server sessions, approval items and audit events carry either `skill` or `bot`, never both. For bot sessions `skill` is `null`.
+- **One worker token per bot:** `worker-<bot>` in `PMOS_BOTS_TOKENS`. That worker can claim, and report on, only its bot's tasks. Another bot's task answers `404`, and claiming for another bot is `403`. This way a compromised sandbox can't take another bot's tasks or their tool-server sessions.
 - **Worker shutdown:** a worker that is told to stop leaves its unfinished task alone. The lease runs out and the runtime retries the task once (D2).
 
 ## 1. Bots and roles (built: `pmos_contract::bots`)

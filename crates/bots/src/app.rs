@@ -50,6 +50,8 @@ struct AppState {
 struct Caller {
     kind: ClientKind,
     user: Option<String>,
+    /// A per-bot worker's bot (`worker-<bot>`).
+    bot: Option<String>,
 }
 
 impl Caller {
@@ -160,6 +162,20 @@ fn pm(caller: &Caller) -> Result<(), Error> {
     Ok(())
 }
 
+/// A per-bot worker may only touch its own bot's tasks; anyone else's look like they don't
+/// exist (`404`).
+async fn worker_owns(state: &AppState, caller: &Caller, id: &str) -> Result<(), Error> {
+    let Some(own) = &caller.bot else {
+        return Ok(());
+    };
+    let task = state.rt.task(id).await?;
+    if &task.bot == own {
+        Ok(())
+    } else {
+        Err(Error::NotFound(format!("no task {id}")))
+    }
+}
+
 fn allow(caller: &Caller, kinds: &[ClientKind], what: &str) -> Result<(), Error> {
     if kinds.contains(&caller.kind) {
         Ok(())
@@ -207,6 +223,7 @@ async fn authenticate(State(state): State<AppState>, mut req: Request, next: Nex
     req.extensions_mut().insert(Caller {
         kind: client.kind,
         user,
+        bot: client.bot.clone(),
     });
     next.run(req).await
 }
@@ -450,7 +467,19 @@ async fn claim(
         return Err(bad("`worker` must name the worker"));
     }
     let wait = Duration::from_millis(req.wait_ms.unwrap_or(0));
-    let bots = req.bots.filter(|b| !b.is_empty());
+    let mut bots = req.bots.filter(|b| !b.is_empty());
+    // A per-bot worker claims only its own bot's tasks.
+    if let Some(own) = &caller.bot {
+        if bots
+            .as_ref()
+            .is_some_and(|b| b.iter().any(|name| name != own))
+        {
+            return Err(forbidden(format!(
+                "this worker serves only the `{own}` bot"
+            )));
+        }
+        bots = Some(vec![own.clone()]);
+    }
     match state
         .rt
         .claim(req.worker.trim(), bots.as_deref(), wait)
@@ -476,6 +505,7 @@ async fn heartbeat(
     bytes: Bytes,
 ) -> Reply {
     allow(&caller, &[ClientKind::Worker], "heartbeat tasks")?;
+    worker_owns(&state, &caller, &id).await?;
     let req: WorkerRef = optional_body(&bytes)?;
     let until = state
         .rt
@@ -503,6 +533,7 @@ async fn worker_events(
     bytes: Bytes,
 ) -> Reply {
     allow(&caller, &[ClientKind::Worker], "report task events")?;
+    worker_owns(&state, &caller, &id).await?;
     let req: EventBody = body(&bytes)?;
     let text = req
         .text
@@ -557,6 +588,7 @@ async fn worker_trace(
     bytes: Bytes,
 ) -> Reply {
     allow(&caller, &[ClientKind::Worker], "write traces")?;
+    worker_owns(&state, &caller, &id).await?;
     let req: TraceBody = body(&bytes)?;
     let entries = req.entries.into_iter().map(|e| (e.kind, e.body)).collect();
     let n = state.rt.add_trace(&id, entries, model::now()).await?;
@@ -580,6 +612,7 @@ async fn complete(
     bytes: Bytes,
 ) -> Reply {
     allow(&caller, &[ClientKind::Worker], "complete tasks")?;
+    worker_owns(&state, &caller, &id).await?;
     let req: CompleteBody = body(&bytes)?;
     let task = state
         .rt
@@ -609,6 +642,7 @@ async fn fail(
     bytes: Bytes,
 ) -> Reply {
     allow(&caller, &[ClientKind::Worker], "fail tasks")?;
+    worker_owns(&state, &caller, &id).await?;
     let req: FailBody = body(&bytes)?;
     let task = state
         .rt

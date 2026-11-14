@@ -45,7 +45,7 @@ docs server.
 ## Configuration
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `PMOS_BOTS_TOKENS` | required | `name=token,…` with names `slack`, `worker`, `console`, `evals`. Each token is at least 32 characters, and all are distinct. |
+| `PMOS_BOTS_TOKENS` | required | `name=token,…` with names `slack`, `worker-<bot>` (one per bot sandbox: it claims and reports only that bot's tasks), `console` and `evals`. A plain `worker` serves every bot and is for development only. Each token is at least 32 characters, and all are distinct. |
 | `PMOS_BOTS_DATABASE_URL` | required | Postgres. Not needed with `PMOS_DEV=1`, which keeps everything in memory. |
 | `PMOS_DEV` | off | `1`: the memory store |
 | `PMOS_BOTS_BIND` | `127.0.0.1:8750` | |

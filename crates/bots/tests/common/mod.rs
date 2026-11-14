@@ -31,6 +31,8 @@ use tokio_util::sync::CancellationToken;
 
 pub const SLACK: &str = "slack-token-0123456789abcdef0123456789";
 pub const WORKER: &str = "worker-token-0123456789abcdef012345678";
+/// The Docs bot's own worker token (`worker-docs`): it serves only `docs`.
+pub const DOCS_WORKER: &str = "docs-worker-token-0123456789abcdef0123";
 pub const CONSOLE: &str = "console-token-0123456789abcdef01234567";
 pub const EVALS: &str = "evals-token-0123456789abcdef0123456789";
 pub const SERVICE: &str = "service-token-0123456789abcdef0123456";
@@ -38,7 +40,7 @@ pub const GATEWAY: &str = "gateway-token-0123456789abcdef0123456";
 
 pub fn clients() -> Vec<Client> {
     parse_clients(&format!(
-        "slack={SLACK},worker={WORKER},console={CONSOLE},evals={EVALS}"
+        "slack={SLACK},worker={WORKER},worker-docs={DOCS_WORKER},console={CONSOLE},evals={EVALS}"
     ))
     .unwrap()
 }
@@ -432,6 +434,7 @@ impl Env {
         let token = match client {
             "slack" => Some(SLACK),
             "worker" => Some(WORKER),
+            "worker-docs" => Some(DOCS_WORKER),
             "console" => Some(CONSOLE),
             "evals" => Some(EVALS),
             _ => None,
