@@ -12,16 +12,24 @@ Decisions already made in this conversation:
 - **Open-weight models only, no frontier API.** Qwen3.6-35B-A3B is the default model and Nemotron 3 Nano 30B-A3B handles extraction and triage, both on vLLM. The bake-off adds Qwen 3.5 122B and gpt-oss-120b as challengers.
 - **Harness: LangChain Deep Agents (`deepagents` 1.16.5, MIT, TypeScript) for the team service; Hermes on NemoClaw for personal agents.**
 - **Context layer:** markdown in git (`content/`), indexed into Postgres (pgvector + full-text search) on merge, served only through the Rust tool server's MCP tools. Memory also lives in Postgres and is exposed to the harness as `/memories/*.md`. There is no Letta, Mem0, Graphiti or Cognee in v1.
+- **Named bots, not features** (decided 2026-11-14, from the Grok Bot lessons; see [`bot-decisions.md`](bot-decisions.md)). PM OS is a small team of named bots, each with a job, memory, its own OpenShell sandbox and a policy. They run always-on on the Spark, read freely, and draft anything outbound for a PM to approve. That doc's decisions D1–D11 are requirements, and they supersede the older bullets below where they differ:
+  - one sandbox per bot (not per session);
+  - memory as markdown in git (not Postgres);
+  - a small PM-facing console (not admin pages only);
+  - routines in Phase 1.
 - **The Slack bot is the interface** (decided 2026-11-14). PMs tag it in any thread, chat with it in Slack's assistant panel, run skills with slash commands, and approve in Slack. There is no web workspace. Platform-owner PMs get a few small admin pages (audit search, sandbox policies, usage) and the `pmos` CLI. See **Interface: the PM OS Slack bot** below.
 
 ## Architecture
 ```
-Slack bot (Rust) ──┐  ← the PMs' interface: mentions, assistant panel, slash commands, approvals
-CLI pmos (Rust) ───┼─► orchestrator (Rust: queue, sandbox launcher) ─► OpenShell sandbox per session
-Admin pages (Ph2) ─┘  ← platform-owner PMs only                         └─ harness (TS, deepagents)
-                                                                           ├─ MCP ─► toolserver (Rust): connectors, context, memory, approvals, audit ─► Postgres
-                                                                           └─ HTTP ─► gateway (Rust): open-weight routing, priority queue ─► vLLM
+Slack (DM per bot, approval cards) ─┐
+Console (roster, routines,          ├─► bot runtime (Rust: durable task queue, scheduler, routines,
+  approvals, audit/trace)           │      status events, sandbox launcher)
+CLI pmos (Rust) ────────────────────┘         └─► one long-lived OpenShell sandbox per bot
+                                                    └─ harness (TS, deepagents): job, skills, memory files
+                                                       ├─ MCP ─► toolserver (Rust): connectors, context, approvals, audit ─► Postgres
+                                                       └─ HTTP ─► gateway (Rust): one OpenAI-compatible endpoint ─► vLLM
 ```
+(Before 2026-11-14 this was one sandbox per session behind an orchestrator; see `bot-decisions.md`.)
 The sandbox network policy allows only the tool server and the gateway. All writes outside PM OS become approval items.
 
 ## Repo layout
@@ -125,6 +133,31 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
 **What runs where:** steps 0a–0c and 0f–0g are built and tested here against fakes and a stub model. vLLM, the OpenShell runtime, real OAuth and the baseline need the Spark.
 
 **Gate 1:** evals pass, the load test meets targets, and the sandbox red-team passes.
+
+### Bots: what changes in the build order (from `bot-decisions.md`)
+- **0d gateway:** add the workaround registry, with a flag and a "delete when" test for each workaround (D11).
+- **0e becomes the bot runtime**, replacing the per-session orchestrator:
+  - bot definitions in `content/bots/<name>/BOT.md`: name, job, team or personal scope, owner, skills, data class, and per-action `auto`/`approve`/`never` settings (v1: all `approve`), checked by `pmos lint`;
+  - a durable task queue in Postgres that resumes or fails with a reason after a reboot (D2);
+  - task status events and a checklist, posted as one Slack message per milestone (D6);
+  - a 30-day trace store (D6);
+  - one long-lived sandbox per bot (D3).
+- **0f sandbox policies:**
+  - each bot's policy is generated from its role template and kept in git (D3);
+  - network is denied by default;
+  - a test shows bot A can't read bot B's files or tokens;
+  - blocked calls are logged with their destination and the policy that blocked them.
+- **0g evals become D10 benchmarks:**
+  - a fixed set of real tasks per category, rerun weekly and on every model or harness change;
+  - each failure tagged to its bottleneck: model, tool, policy, memory or harness;
+  - a category launches only after passing its bar two weeks in a row.
+- **Memory moves to markdown files in git** (D5): team memory in git, personal memory in a private store, a source and date on every entry, and the context mount filtered by data class.
+- **Phase 1:**
+  - The first named bots: a team **Docs** bot, which takes over `/docs`, and personal PM bots.
+  - Routines in plain language (D8), moved up from Phase 2.
+  - The console's four screens (D1).
+  - Per-action approval settings, PM edits saved as feedback, and a prompt-injection test (D7).
+- **Every feature PR opens with its "PM OS can now ___" line**, and the changelog collects them (D9).
 
 ### Phase 1: Pilot (weeks 4–7), 2–3 champion PMs → Gate 2
 - SSO and the three roles: PM, skill author, admin (ADM-1). Slack users are mapped to PM OS users at onboarding.
