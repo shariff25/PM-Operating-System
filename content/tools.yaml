@@ -1,0 +1,80 @@
+# Every tool the PM OS tool server exposes. A skill may only call tools it declares in its
+# SKILL.md `metadata.tools`, and only tools listed here (PRD: Security, Authorization).
+#
+# kind:
+#   read      reads under the signed-in user's own permissions
+#   internal  changes PM OS's own state only (memory)
+#   write     writes outside PM OS; needs explicit approval per action (OUT-4)
+#
+# All connectors act as the signed-in user with that user's own token: Atlassian OAuth 2.0
+# for Jira and Confluence, the PM's Slack user token for Slack.
+tools:
+  # Context library (served from the git content repo, indexed in Postgres)
+  - name: context.search
+    system: context
+    kind: read
+    description: Hybrid keyword and semantic search over the context library; filters by domain and sensitivity
+  - name: context.read
+    system: context
+    kind: read
+    description: Read one context file with its owner, review date and sensitivity
+
+  # Memory (MEM-1, MEM-2)
+  - name: memory.read
+    system: memory
+    kind: read
+    description: Read the user's or the project's memory notes
+  - name: memory.update
+    system: memory
+    kind: internal
+    description: Add or change a note in the user's own memory
+
+  # Jira
+  - name: jira.search
+    system: jira
+    kind: read
+    description: Search issues with JQL
+  - name: jira.read
+    system: jira
+    kind: read
+    description: Read an issue or epic with its comments and links
+  - name: jira.create_issue
+    system: jira
+    kind: write
+    description: Create an epic, story or task
+
+  # Confluence (doc tool of record)
+  - name: confluence.search
+    system: confluence
+    kind: read
+    description: Search pages with CQL
+  - name: confluence.read
+    system: confluence
+    kind: read
+    description: Read a page and its comments
+  - name: confluence.create_draft
+    system: confluence
+    kind: write
+    description: Create a draft page in a space, linked back to the run (OUT-1)
+  - name: confluence.update_page
+    system: confluence
+    kind: write
+    description: Update an existing page
+
+  # Slack (as the PM, with their own user token)
+  - name: slack.search
+    system: slack
+    kind: read
+    description: Search messages the PM can see (Real-time Search API); results are never stored
+  - name: slack.read_thread
+    system: slack
+    kind: read
+    description: Read a thread the PM is in
+  - name: slack.post_reply
+    system: slack
+    kind: write
+    description: Post a reply in a thread as the PM, marked as drafted with PM OS (SLK-7)
+  - name: slack.send_message
+    system: slack
+    kind: write
+    description: Send a message as the PM to a channel or person
