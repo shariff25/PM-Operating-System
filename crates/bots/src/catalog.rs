@@ -1,10 +1,19 @@
-//! The bots, their roles and who may use them, loaded once at start-up from the content
-//! repo through the same lint CI runs (`pmos_contract::lint`). A tree with lint errors stops
-//! the runtime from starting, so a bad bot definition is caught before any task uses it.
-//! After a content change, restart the runtime to pick it up.
+//! The bots, their roles and who may use them, loaded from the content repo through the same
+//! lint CI runs (`pmos_contract::lint`). A tree with lint errors stops the runtime from
+//! starting, so a bad bot definition is caught before any task uses it.
+//!
+//! **Reloading** (onboarding spec §5): every 30 seconds, [`Reloader`] checks a fingerprint of
+//! the files the catalog is built from (`team.yaml`, `tools.yaml`, `bots/**`, `roles/**` and
+//! `skills/**`: paths, sizes and modification times). If it changed, the tree is linted and
+//! loaded again and the new catalog replaces the old one whole. A tree that fails the lint
+//! leaves the old catalog in place and logs the errors. A task already claimed keeps the bot,
+//! role and tools it was claimed with.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::NaiveDate;
 use pmos_contract::bots::{role_tools, ActionSetting, Bot, BotScope, Role};
@@ -166,5 +175,130 @@ impl Catalog {
                 bot.name
             )),
         }
+    }
+}
+
+/// How often [`Reloader`] looks for a content change.
+pub const RELOAD_EVERY: Duration = Duration::from_secs(30);
+
+/// The files and folders under the content root the catalog is built from.
+const WATCHED: [&str; 5] = ["team.yaml", "tools.yaml", "bots", "roles", "skills"];
+
+/// A fingerprint of the watched files: their paths, sizes and modification times. A file
+/// that can't be read still counts, as missing.
+pub fn fingerprint(root: &Path) -> u64 {
+    let mut entries: Vec<(String, u64, u128)> = Vec::new();
+    for name in WATCHED {
+        collect(root, &root.join(name), &mut entries);
+    }
+    entries.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn collect(root: &Path, path: &Path, out: &mut Vec<(String, u64, u128)>) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.is_dir() {
+        let Ok(dir) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in dir.flatten() {
+            collect(root, &entry.path(), out);
+        }
+        return;
+    }
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned();
+    out.push((rel, meta.len(), modified));
+}
+
+/// What one [`Reloader::check`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reload {
+    /// Nothing the catalog is built from changed.
+    Unchanged,
+    /// The content changed and the new catalog is in place, with this many bots.
+    Reloaded { bots: usize },
+    /// The content changed but doesn't pass the lint (or can't be read): the old catalog
+    /// stays.
+    Kept(String),
+}
+
+/// Reloads the runtime's catalog when the content changes.
+pub struct Reloader {
+    root: PathBuf,
+    seen: u64,
+}
+
+impl Reloader {
+    /// Watch `root`. Make it before loading the first catalog, so a change made while that
+    /// loads is still seen.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let seen = fingerprint(&root);
+        Self { root, seen }
+    }
+
+    /// Reload if the content changed since the last check.
+    pub async fn check(&mut self, rt: &crate::Runtime, today: NaiveDate) -> Reload {
+        let root = self.root.clone();
+        let now = tokio::task::spawn_blocking(move || fingerprint(&root))
+            .await
+            .unwrap_or(self.seen);
+        if now == self.seen {
+            return Reload::Unchanged;
+        }
+        // Remembered whatever the outcome, so a tree that fails the lint is reported once,
+        // not every 30 seconds.
+        self.seen = now;
+        let root = self.root.clone();
+        let loaded = tokio::task::spawn_blocking(move || Catalog::load(&root, today))
+            .await
+            .unwrap_or_else(|e| Err(format!("loading the catalog panicked: {e}")));
+        match loaded {
+            Ok(catalog) => {
+                let bots = catalog.bots.len();
+                rt.set_catalog(Arc::new(catalog));
+                tracing::info!(bots, "content changed; catalog reloaded");
+                Reload::Reloaded { bots }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "content changed but fails the lint; keeping the old catalog");
+                Reload::Kept(e)
+            }
+        }
+    }
+
+    /// Check every `every` until the runtime stops.
+    pub fn spawn(
+        mut self,
+        rt: Arc<crate::Runtime>,
+        every: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tokio::select! {
+                    _ = rt.stop.cancelled() => break,
+                    _ = tick.tick() => {
+                        self.check(&rt, chrono::Utc::now().date_naive()).await;
+                    }
+                }
+            }
+        })
     }
 }

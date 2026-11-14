@@ -37,10 +37,62 @@ docs server.
 **At start-up, the runtime:**
 1. Lints `PMOS_CONTENT_ROOT` with the same lint CI runs (`pmos_contract::lint`), and refuses
    to start on any error. Warnings are counted in the log; `pmos lint` lists them.
-2. Loads the bots, their roles and skills, `tools.yaml` and `team.yaml`. A change to any of
-   them needs a restart.
+2. Loads the bots, their roles and skills, `tools.yaml` and `team.yaml`. Later changes are
+   picked up without a restart (see **Content changes**).
 3. Recovers tasks the last process left `working` (see **Durability**), and runs once any
    routine that came due while it was down.
+
+## Content changes
+
+Every 30 seconds the runtime checks a fingerprint of `team.yaml`, `tools.yaml`, `bots/**`,
+`roles/**` and `skills/**` under `PMOS_CONTENT_ROOT` (paths, sizes and modification times).
+When it changes:
+- **The tree passes the lint:** it is loaded again, and the new catalog replaces the old one
+  in one step. A new bot shows up in `GET /v1/bots` and can take tasks; a member added to
+  `team.yaml` can use the team bots.
+- **The tree fails the lint:** the catalog already loaded stays, and the errors are logged
+  once (`content changed but fails the lint; keeping the old catalog`). The next change is
+  checked again.
+- **Tasks already claimed** keep the bot, role and tools they were claimed with, even if
+  their bot changes or goes. Tasks still queued, new tasks and routines use the new catalog,
+  so a queued task whose bot is gone fails at its claim with "the bot `x` no longer exists".
+
+The content root is the tool server's checkout, which it pulls every `PMOS_CONTENT_SYNC_SECS`
+and right after a member is approved (`docs/onboarding-spec.md` §3), so a new member's bot is
+listed within about half a minute of the pull.
+
+## A new member's worker (operations, for now)
+
+When a platform owner approves someone in Slack, the tool server commits their `team.yaml`
+entry and `bots/pm-<handle>/BOT.md`, and `pm-<handle>` appears in `GET /v1/bots` without a
+restart. Nothing claims its tasks yet: worker tokens are per bot and live in config, and a
+bot's sandbox is started by hand. Until that is automated, a platform owner does this on the
+Spark for each new member (the bot is `pm-<handle>`, as `personal_bot_name` makes it):
+
+1. **Policies.** Pull the content repo, then run `cargo run -q -p pmos -- policy generate`
+   and `cargo run -q -p pmos -- policy check`. Commit `policies/bots/pm-<handle>.yaml` and
+   `.sandbox.yaml`. A new bot is a network change, so it needs a second platform owner's
+   review (POL-2, `policies/README.md`). Until it is committed, `pmos policy check` reports
+   the bot as `policy-missing`.
+2. **Tokens.** Make two new tokens (`openssl rand -hex 24`), never reused from another bot:
+   - add `worker-pm-<handle>=<token>` to `PMOS_BOTS_TOKENS`;
+   - add `bot-pm-<handle>=<token>` to the gateway's `PMOS_GATEWAY_TOKENS`.
+   Restart `pmos-bots` and `pmos-gateway` to load them. Tasks are durable, so a restart loses
+   nothing (see **Durability**); a task already queued for the new bot simply waits.
+3. **Providers.** Create the bot's two OpenShell providers from those tokens:
+   `pmos-pm-<handle>-worker` (profile `pmos-worker`) and `pmos-pm-<handle>-gateway` (profile
+   `pmos-gateway`), as in **Credentials** in `docs/sandbox-policies.md`.
+4. **Sandbox.** Create `pmos-pm-<handle>` from `policies/bots/pm-<handle>.sandbox.yaml` and
+   start its worker, as in **Creating a bot's sandbox** in `docs/sandbox-policies.md`. Then run
+   `policies/redteam/isolation.sh`.
+5. **Check.** The member DMs PM OS `setup`: step 5 shows their bot once it is in the roster.
+   A first DM to it should get "Working on it" within a few seconds; if tasks stay queued, the
+   worker isn't claiming (check its token and the runtime log for `401`).
+
+Removing a member (`remove <handle>` in Slack) deletes their `BOT.md`, so the bot leaves the
+catalog at the next check. Then stop and delete their sandbox, remove both tokens and
+providers, regenerate the policies (the old files are `policy-orphan`), and restart
+`pmos-bots` and `pmos-gateway`.
 
 ## Configuration
 | Variable | Default | Notes |
@@ -97,7 +149,8 @@ queued ──claim──► working ──complete──► done
     task fails with that reason, and the next task is tried.
   - **Tool server unavailable:** the task goes back to the queue without using up an
     attempt, and the claim is `503`.
-  - **Bot gone after a restart:** the task fails with "the bot `x` no longer exists".
+  - **Bot gone after a restart or a content change:** the task fails with "the bot `x` no
+    longer exists".
 - **Worker calls** (heartbeat, events, trace, complete, fail):
   - Each may carry `"worker": "<name>"`; if it does, that worker must hold the claim.
   - A task that is no longer `working` (cancelled, recovered, finished) answers `409` with
@@ -220,6 +273,9 @@ call. The console reads them with `GET /v1/tasks/{id}/trace`.
   routine parsing with valid and invalid model replies, and the auth matrix;
 - **Clock-driven tests:** lease recovery (both branches), the scheduler (due, missed once,
   paused, can no longer run), and redaction and retention.
+- **Catalog tests:** the seeded content loads, a tree with lint errors refuses to start, a
+  content change adds a bot to `GET /v1/bots` while a claimed task keeps its bot, and a
+  change that fails the lint keeps the old catalog.
 
 Postgres cases need `PMOS_TEST_DATABASE_URL`; each test makes its own schema. Without it
 they are skipped locally, and they fail in CI.
