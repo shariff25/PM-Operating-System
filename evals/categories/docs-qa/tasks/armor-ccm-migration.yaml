@@ -1,0 +1,16 @@
+# Checked against https://support.fortanix.com/docs/migrate-from-fortanix-ccm-saas-to-fortanix-armor on 2026-11-14.
+# The page says: node agents and attestation clients move to api.armor.fortanix.com; existing application certificates remain valid.
+id: armor-ccm-migration
+ask: "We're a Fortanix CCM SaaS customer: what endpoint do our node agents and attestation clients use after the move to Fortanix Armor, and do existing application certificates need reissuing?"
+expect:
+  must_cite:
+    - https://support.fortanix.com/docs/migrate-from-fortanix-ccm-saas-to-fortanix-armor
+  must_include:
+    - "api.armor.fortanix.com"
+    - "valid"
+  # Reasoning must not leak into the answer, even with the gateway's strip-think
+  # workaround off (D11).
+  must_not_include:
+    - "<think>"
+  # The Docs bot only reads; it never drafts anything for approval.
+  approvals: 0

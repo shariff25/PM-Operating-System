@@ -1,0 +1,30 @@
+# Defaults for pmos-evals. Command-line flags and environment variables override them.
+
+runner:
+  # The bot runtime (pmos-bots). Overridden by --bots-url or PMOS_BOTS_URL.
+  bots_url: http://127.0.0.1:8750
+  # Who the eval tasks are for (`requested_by`). Team bots serve team members only, so this
+  # handle must be in content/team.yaml. Overridden by --as or PMOS_EVALS_AS.
+  requested_by: evals
+  # How often a task is polled, and how long one task may take before it is graded as timed out.
+  poll_ms: 2000
+  task_timeout_seconds: 600
+  # Tasks in flight at once during `run`. One sandbox serves each bot, so more than one mostly
+  # adds queue time; `load` ignores this and sends all of its tasks at once.
+  concurrency: 1
+
+# Latency targets for `pmos-evals load`, in seconds, at p50 and p90. Queue time is from task
+# creation until a worker picks it up; total time is from creation until the task settles.
+latency_targets:
+  queue_p50:
+    seconds: 30
+    source: "Default, not from the PRD (no p50 queue target is in the repo); replace with the PRD's"
+  queue_p90:
+    seconds: 120
+    source: "docs/implementation-plan.md, Phase 3: a second Spark if p90 queue time passes 2 minutes"
+  total_p50:
+    seconds: 60
+    source: "Default, not from the PRD (no total-time target is in the repo); replace with the PRD's"
+  total_p90:
+    seconds: 180
+    source: "Default, not from the PRD (no total-time target is in the repo); replace with the PRD's"
