@@ -6,6 +6,9 @@
 //! 4. A `disconnect` (`warning`, `refresh_requested`, `link_disabled`) means reconnect.
 //!    Slack refreshes connections every few hours, so this is normal.
 //!
+//! The acknowledgement goes first; slow work (a `/docs` search, a DM becoming a task, an
+//! approval being decided) runs in a follow-up after it.
+//!
 //! A connection can die silently (a NAT or firewall drops it). The bot pings every
 //! `ping_every` and reconnects if nothing at all arrives for `read_deadline`.
 
@@ -18,7 +21,8 @@ use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-use crate::commands::Commands;
+use crate::bots::Bots;
+use crate::commands::{Commands, FollowUp};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SocketError {
@@ -33,6 +37,9 @@ pub struct Socket {
     pub api_base: String,
     pub app_token: String,
     pub commands: Commands,
+    /// DMs, approval cards and routines. Without it only `/docs` works; events and
+    /// interactions are acknowledged and dropped.
+    pub bots: Option<Bots>,
     pub http: reqwest::Client,
     /// Reconnect if nothing arrives for this long. Default 90 s.
     pub read_deadline: Duration,
@@ -64,6 +71,7 @@ impl Socket {
             api_base: api_base.into(),
             app_token: app_token.into(),
             commands,
+            bots: None,
             http,
             read_deadline: Duration::from_secs(90),
             ping_every: Duration::from_secs(30),
@@ -71,7 +79,13 @@ impl Socket {
         }
     }
 
-    fn spawn_follow_up(&self, work: crate::commands::FollowUp) {
+    /// Serve DMs, approval cards and routines too.
+    pub fn with_bots(mut self, bots: Bots) -> Self {
+        self.bots = Some(bots);
+        self
+    }
+
+    fn spawn_follow_up(&self, work: FollowUp) {
         let mut set = self.follow_ups.lock().expect("follow-ups lock");
         while set.try_join_next().is_some() {}
         set.spawn(work);
@@ -184,21 +198,36 @@ impl Socket {
             let Some(envelope_id) = envelope["envelope_id"].as_str() else {
                 continue;
             };
-            let ack = match envelope["type"].as_str() {
-                Some("slash_commands") => {
-                    let reply = self.commands.handle(&envelope["payload"], envelope_id);
-                    if let Some(work) = reply.follow_up {
-                        self.spawn_follow_up(work);
-                    }
-                    json!({"envelope_id": envelope_id, "payload": reply.ack})
+            let payload = &envelope["payload"];
+            let (ack, follow_up) = match (envelope["type"].as_str(), &self.bots) {
+                (Some("slash_commands"), _) => {
+                    let reply = self.commands.handle(payload, envelope_id);
+                    (
+                        json!({"envelope_id": envelope_id, "payload": reply.ack}),
+                        reply.follow_up,
+                    )
                 }
-                // Events and interactions arrive with the full bot (Phase 1). Acknowledge so
-                // Slack doesn't retry them.
-                _ => json!({"envelope_id": envelope_id}),
+                (Some("events_api"), Some(bots)) => {
+                    (json!({"envelope_id": envelope_id}), bots.event(payload))
+                }
+                (Some("interactive"), Some(bots)) => {
+                    let (reply, work) = bots.interactive(payload);
+                    let mut ack = json!({"envelope_id": envelope_id});
+                    if let Some(reply) = reply {
+                        ack["payload"] = reply;
+                    }
+                    (ack, work)
+                }
+                // Anything else is acknowledged, so Slack doesn't retry it.
+                _ => (json!({"envelope_id": envelope_id}), None),
             };
-            tx.send(Message::Text(ack.to_string().into()))
-                .await
-                .map_err(|e| SocketError::Ws(e.to_string()))?;
+            let sent = tx.send(Message::Text(ack.to_string().into())).await;
+            // The work runs even if the ack was lost: a retried event is then recognized and
+            // skipped, rather than handled twice or not at all.
+            if let Some(work) = follow_up {
+                self.spawn_follow_up(work);
+            }
+            sent.map_err(|e| SocketError::Ws(e.to_string()))?;
         }
     }
 
