@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use pmos_bots::catalog::Catalog;
+use pmos_bots::catalog::{Catalog, Reloader, RELOAD_EVERY};
 use pmos_bots::clients::{Gateway, ToolServer};
 use pmos_bots::config::Config;
 use pmos_bots::pg::PgStore;
@@ -19,7 +19,9 @@ async fn main() -> Result<()> {
     let config = Config::from_env().map_err(anyhow::Error::msg)?;
 
     // A content tree with lint errors stops the start: no task should run against a bot
-    // definition CI would reject.
+    // definition CI would reject. After that, a content change is picked up without a
+    // restart; one that fails the lint keeps the catalog already loaded.
+    let reloader = Reloader::new(&config.content_root);
     let catalog = Catalog::load(&config.content_root, chrono::Utc::now().date_naive())
         .map_err(anyhow::Error::msg)?;
 
@@ -49,7 +51,8 @@ async fn main() -> Result<()> {
     ));
     // Their first pass runs now: tasks interrupted by the last shutdown are recovered and a
     // routine missed while down runs once.
-    let loops = rt.spawn_loops();
+    let mut loops = rt.spawn_loops();
+    loops.push(reloader.spawn(rt.clone(), RELOAD_EVERY));
 
     let app = router(rt, config.clients.clone());
     let listener = tokio::net::TcpListener::bind(config.bind)

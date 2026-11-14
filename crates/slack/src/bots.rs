@@ -7,21 +7,34 @@
 //! 3. else the PM's personal bot `pm-<handle>`, if it exists;
 //! 4. else `docs`.
 //!
+//! **Commands first:** typed alone in a DM, `setup` (or `status`, `onboarding`), and for
+//! platform owners `requests` and `remove <handle>`, are handled before any of that
+//! (onboarding, in `members.rs`). `docs: setup` still goes to the `docs` bot. Someone not in
+//! `team.yaml` gets a note with **Request access**.
+//!
 //! Every envelope is acknowledged before any of this runs (Slack wants the ack within
-//! 3 seconds); the work happens in follow-ups. The PM is always the Slack user mapped through
-//! `team.yaml`: the runtime and the tool server apply that PM's access, never the bot's.
+//! 3 seconds); the work happens in follow-ups. The one exception is the memory-repo modal,
+//! whose answer must be in the ack to show as a field error: [`Bots::late_ack`] waits for the
+//! tool server, never longer than the ack allows. The PM is always the Slack user mapped
+//! through `team.yaml`: the runtime and the tool server apply that PM's access, never the
+//! bot's.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pmos_contract::model::TeamFile;
+use pmos_contract::onboarding::personal_bot_name;
 use serde_json::{json, Value};
 
 use crate::blocks::escape;
 use crate::bounded::Bounded;
 use crate::cards::{self, action};
 use crate::commands::{load_team, FollowUp, NOT_A_MEMBER};
+use crate::member_cards::{self, action as member_action};
+use crate::members::{self, DmCommand, Onboarding};
 use crate::runtime::{display_name, BotInfo, Runtime, RuntimeError};
 use crate::slackapi::{Posted, SlackApi};
 use crate::toolserver::{CallError, ToolServer};
@@ -41,7 +54,17 @@ pub struct BotsConfig {
     pub team_file: PathBuf,
     /// The time zone for routines when Slack has none for the PM (`PMOS_DEFAULT_TZ`).
     pub default_tz: String,
+    /// The GitHub org memory repos live in (`PMOS_GITHUB_ORG`), to prefill the memory-repo
+    /// modal. Without it the PM types the org.
+    pub github_org: Option<String>,
+    /// Where an interaction's `response_url` may point. Slack's is always
+    /// `https://hooks.slack.com/`; tests set a local mock.
+    pub response_url_prefix: String,
 }
+
+/// An acknowledgement that has to wait for an answer, and the work after it. It resolves
+/// within the time Slack allows for the ack.
+pub type LateAck = Pin<Box<dyn Future<Output = (Option<Value>, Option<FollowUp>)> + Send>>;
 
 /// A thread: `(channel, thread_ts)`.
 type ThreadKey = (String, String);
@@ -70,6 +93,7 @@ struct Inner {
     questions: Mutex<Bounded<ThreadKey, Question>>,
     drafts: Mutex<Bounded<String, Draft>>,
     roster: Mutex<Option<(Instant, Vec<BotInfo>)>>,
+    onboarding: Onboarding,
 }
 
 #[derive(Clone)]
@@ -78,22 +102,26 @@ pub struct Bots {
 }
 
 /// One DM from a PM.
-struct Dm {
-    user: String,
-    channel: String,
+pub(crate) struct Dm {
+    pub(crate) user: String,
+    pub(crate) channel: String,
     /// The thread to reply in: the message's thread, or the message itself.
-    thread_ts: String,
-    text: String,
+    pub(crate) thread_ts: String,
+    /// The message was a reply in a thread (not a new message in the DM).
+    pub(crate) in_thread: bool,
+    pub(crate) text: String,
 }
 
 /// One button press.
-struct Click {
-    user: String,
-    channel: String,
-    message_ts: String,
-    thread_ts: Option<String>,
-    trigger_id: String,
-    value: String,
+pub(crate) struct Click {
+    pub(crate) user: String,
+    pub(crate) channel: String,
+    pub(crate) message_ts: String,
+    pub(crate) thread_ts: Option<String>,
+    pub(crate) trigger_id: String,
+    pub(crate) value: String,
+    /// Where to answer a click on an ephemeral message, which `chat.update` can't change.
+    pub(crate) response_url: Option<String>,
 }
 
 impl Click {
@@ -108,6 +136,7 @@ impl Click {
             thread_ts: s(&payload["message"]["thread_ts"]),
             trigger_id: s(&payload["trigger_id"]).unwrap_or_default(),
             value: s(&payload["actions"][0]["value"]).unwrap_or_default(),
+            response_url: s(&payload["response_url"]),
         })
     }
 }
@@ -121,9 +150,11 @@ enum Change {
 
 impl Bots {
     pub fn new(cfg: BotsConfig) -> Self {
+        let onboarding = Onboarding::new(cfg.github_org.clone(), cfg.response_url_prefix.clone());
         Self {
             inner: Arc::new(Inner {
                 cfg,
+                onboarding,
                 threads: Mutex::new(Bounded::new(5000)),
                 seen: Mutex::new(Bounded::new(5000)),
                 questions: Mutex::new(Bounded::new(500)),
@@ -147,6 +178,10 @@ impl Bots {
 
     pub fn team(&self) -> TeamFile {
         load_team(&self.inner.cfg.team_file)
+    }
+
+    pub(crate) fn onboarding(&self) -> &Onboarding {
+        &self.inner.onboarding
     }
 
     /// Remember that `bot` works in this thread, so the PM's next message there goes to it.
@@ -186,6 +221,14 @@ impl Bots {
         }
     }
 
+    /// The bots straight from the runtime (and kept for the next minute), for the setup
+    /// checklist, which has to see a new member's bot as soon as it is listed.
+    pub async fn fresh_roster(&self) -> Result<Vec<BotInfo>, RuntimeError> {
+        let bots = self.runtime().bots().await?;
+        *self.inner.roster.lock().expect("roster lock") = Some((Instant::now(), bots.clone()));
+        Ok(bots)
+    }
+
     /// The name `bot` posts under.
     pub async fn display_name(&self, bot: &str) -> String {
         let roster = self.roster().await.unwrap_or_default();
@@ -220,10 +263,12 @@ impl Bots {
             tracing::info!(event_id, "event already handled; ignoring the retry");
             return None;
         }
+        let thread_ts = event["thread_ts"].as_str().map(String::from);
         let dm = Dm {
             user,
             channel,
-            thread_ts: event["thread_ts"].as_str().map(String::from).unwrap_or(ts),
+            in_thread: thread_ts.is_some(),
+            thread_ts: thread_ts.unwrap_or(ts),
             text: plain_text(event["text"].as_str().unwrap_or_default()),
         };
         let this = self.clone();
@@ -261,6 +306,30 @@ impl Bots {
                     action::ROUTINE_DELETE => {
                         Box::pin(async move { this.change_routine(click, Change::Delete).await })
                     }
+                    member_action::REQUEST_ACCESS => {
+                        Box::pin(async move { this.request_access(click).await })
+                    }
+                    member_action::APPROVE => {
+                        Box::pin(async move { this.decide_member(click, "approve", None).await })
+                    }
+                    member_action::REJECT => {
+                        Box::pin(async move { this.decide_member(click, "reject", None).await })
+                    }
+                    member_action::EDIT => {
+                        Box::pin(async move { this.open_handle_modal(click).await })
+                    }
+                    member_action::REMOVE_CONFIRM => {
+                        Box::pin(async move { this.remove_member(click, true).await })
+                    }
+                    member_action::REMOVE_CANCEL => {
+                        Box::pin(async move { this.remove_member(click, false).await })
+                    }
+                    member_action::SETUP_REFRESH => {
+                        Box::pin(async move { this.refresh_setup(click).await })
+                    }
+                    member_action::SETUP_MEMORY => {
+                        Box::pin(async move { this.open_memory_modal(click).await })
+                    }
                     _ => return (None, None),
                 };
                 (None, Some(work))
@@ -290,8 +359,29 @@ impl Bots {
                     })),
                 )
             }
+            Some("view_submission")
+                if payload["view"]["callback_id"] == member_action::HANDLE_MODAL =>
+            {
+                self.submit_handle(payload)
+            }
             _ => (None, None),
         }
+    }
+
+    /// An interaction whose acknowledgement has to wait for an answer: the memory-repo
+    /// modal, so the tool server's refusal shows as a field error. `None` for everything
+    /// else, which [`Bots::interactive`] acknowledges at once.
+    pub fn late_ack(&self, payload: &Value) -> Option<LateAck> {
+        if payload["type"] == "view_submission"
+            && payload["view"]["callback_id"] == member_action::MEMORY_MODAL
+        {
+            let this = self.clone();
+            let payload = payload.clone();
+            return Some(Box::pin(
+                async move { this.submit_memory_repo(payload).await },
+            ));
+        }
+        None
     }
 
     // ---- DMs ----
@@ -300,14 +390,28 @@ impl Bots {
         let team = self.team();
         let Some(member) = team.by_slack_id(&dm.user) else {
             tracing::info!(slack_id = %dm.user, "DM from someone not in team.yaml");
-            self.private(&dm.channel, &dm.user, None, NOT_A_MEMBER)
-                .await;
+            let (text, blocks) = member_cards::request_access_note();
+            if let Err(e) = self
+                .slack()
+                .ephemeral_blocks(&dm.channel, &dm.user, None, &text, blocks)
+                .await
+            {
+                tracing::warn!(error = %e, "private note failed");
+            }
             return;
         };
         let handle = member.handle.clone();
         let text = dm.text.trim().to_string();
         if text.is_empty() {
             return;
+        }
+        match members::dm_command(&text, member.is_admin(), &team) {
+            Some(DmCommand::Setup) => return self.post_setup(&dm, &handle).await,
+            Some(DmCommand::Requests) => return self.list_requests(&dm).await,
+            Some(DmCommand::Remove(who)) => {
+                return self.confirm_remove(&dm, &handle, &who).await;
+            }
+            None => {}
         }
         if is_routine_list(&text) {
             let message = self
@@ -858,7 +962,13 @@ impl Bots {
         }
     }
 
-    async fn private(&self, channel: &str, user: &str, thread_ts: Option<&str>, text: &str) {
+    pub(crate) async fn private(
+        &self,
+        channel: &str,
+        user: &str,
+        thread_ts: Option<&str>,
+        text: &str,
+    ) {
         if let Err(e) = self.slack().ephemeral(channel, user, thread_ts, text).await {
             tracing::warn!(error = %e, "private note failed");
         }
@@ -892,7 +1002,7 @@ pub fn choose_bot(
     if let Some(bot) = prefix.or(thread_bot) {
         return bot.to_string();
     }
-    let personal = format!("pm-{handle}");
+    let personal = personal_bot_name(handle);
     if roster.iter().any(|b| b.name == personal) {
         personal
     } else {

@@ -5,6 +5,10 @@
 //! Approval cards use the same token to read one inbox item and record the PM's decision
 //! (spec §2): `decided_by` is the clicking PM's handle, and the tool server checks it.
 //!
+//! Onboarding (`docs/onboarding-spec.md` §3) uses the same token: access requests and their
+//! decisions, removing a member, the setup checklist's state, OAuth start links and the
+//! memory repo. Those answers carry a `code` the bot turns into a sentence.
+//!
 //! The bot has its own token (`PMOS_BOT_TOKEN`), which the tool server limits to sessions
 //! for the bot's skills. Session tokens go in the `X-Pmos-Session` header, never in a URL.
 
@@ -21,6 +25,50 @@ pub enum CallError {
     Unavailable,
     #[error("{0}")]
     Refused(String),
+}
+
+/// A refusal from the onboarding endpoints, with its status and `code`.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum ApiError {
+    #[error("PM OS is unavailable right now")]
+    Unavailable,
+    #[error("{error}")]
+    Refused {
+        status: u16,
+        /// The answer's `code`, such as `github_not_linked`; empty if it had none.
+        code: String,
+        /// The answer's `error`, for a person; may be empty.
+        error: String,
+        /// The whole answer, for the `request` some refusals carry.
+        body: Value,
+    },
+}
+
+impl ApiError {
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            ApiError::Refused { code, .. } if !code.is_empty() => Some(code),
+            _ => None,
+        }
+    }
+
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            ApiError::Refused { status, .. } => Some(*status),
+            ApiError::Unavailable => None,
+        }
+    }
+}
+
+/// The OAuth providers the setup checklist links.
+pub const PROVIDERS: [&str; 3] = ["atlassian", "slack", "github"];
+
+/// A request object, from an answer that wraps it (`{request}`) or is it.
+pub fn request_of(body: &Value) -> &Value {
+    match body.get("request") {
+        Some(r) if r.is_object() => r,
+        _ => body,
+    }
 }
 
 #[derive(Clone)]
@@ -155,6 +203,179 @@ impl ToolServer {
         )
         .await
     }
+}
+
+impl ToolServer {
+    /// Send an onboarding request: the status and body of a success, or the refusal. A `502`
+    /// is a refusal too (a failed approval answers `502 {request}`); other `5xx` and network
+    /// errors are [`ApiError::Unavailable`].
+    async fn api(req: reqwest::RequestBuilder) -> Result<(u16, Value), ApiError> {
+        let res = req.send().await.map_err(|e| {
+            tracing::warn!(error = %e, "tool server unreachable");
+            ApiError::Unavailable
+        })?;
+        let status = res.status();
+        let json: Value = res.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            return Ok((status.as_u16(), json));
+        }
+        if status.is_server_error() && status.as_u16() != 502 {
+            tracing::warn!(%status, "tool server error");
+            return Err(ApiError::Unavailable);
+        }
+        Err(ApiError::Refused {
+            status: status.as_u16(),
+            code: json["code"].as_str().unwrap_or_default().to_string(),
+            error: json["error"].as_str().unwrap_or_default().to_string(),
+            body: json,
+        })
+    }
+
+    fn get(&self, path: &str, timeout: Duration) -> reqwest::RequestBuilder {
+        self.http
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .timeout(timeout)
+    }
+
+    fn post_json(&self, path: &str, timeout: Duration, body: &Value) -> reqwest::RequestBuilder {
+        self.http
+            .post(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .timeout(timeout)
+            .json(body)
+    }
+
+    /// `POST /internal/members/requests`. `true` with a new request (`201`), `false` with the
+    /// one already pending for this Slack id (`200`).
+    pub async fn request_access(
+        &self,
+        slack_id: &str,
+        email: &str,
+        name: &str,
+    ) -> Result<(bool, Value), ApiError> {
+        let (status, body) = Self::api(self.post_json(
+            "/internal/members/requests",
+            Duration::from_secs(10),
+            &json!({"slack_id": slack_id, "email": email, "name": name}),
+        ))
+        .await?;
+        Ok((status == 201, request_of(&body).clone()))
+    }
+
+    /// `GET /internal/members/requests?status=pending`.
+    pub async fn pending_requests(&self) -> Result<Vec<Value>, ApiError> {
+        let (_, body) = Self::api(
+            self.get("/internal/members/requests", Duration::from_secs(10))
+                .query(&[("status", "pending")]),
+        )
+        .await?;
+        Ok(body["requests"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// `POST /internal/members/requests/{id}/decision`: `approve` (with `handle` in place of
+    /// the proposed one) or `reject`. Returns the request as decided. Approving commits to
+    /// the content repo, so this can take a while.
+    pub async fn decide_member(
+        &self,
+        id: &str,
+        decided_by: &str,
+        decision: &str,
+        handle: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        if !request_id_ok(id) {
+            return Err(refused_locally("not a request id"));
+        }
+        let mut body = json!({"decision": decision, "decided_by": decided_by});
+        if let Some(handle) = handle {
+            body["handle"] = json!(handle);
+        }
+        let (_, body) = Self::api(self.post_json(
+            &format!("/internal/members/requests/{id}/decision"),
+            Duration::from_secs(60),
+            &body,
+        ))
+        .await?;
+        Ok(request_of(&body).clone())
+    }
+
+    /// `POST /internal/members/{handle}/remove`. Returns `{handle, commit}`.
+    pub async fn remove_member(&self, handle: &str, decided_by: &str) -> Result<Value, ApiError> {
+        if !pmos_contract::model::valid_handle(handle) {
+            return Err(refused_locally("not a handle"));
+        }
+        let (_, body) = Self::api(self.post_json(
+            &format!("/internal/members/{handle}/remove"),
+            Duration::from_secs(60),
+            &json!({"decided_by": decided_by}),
+        ))
+        .await?;
+        Ok(body)
+    }
+
+    /// `GET /internal/onboarding?user=`: what a member has set up.
+    pub async fn onboarding(&self, handle: &str) -> Result<Value, ApiError> {
+        let (_, body) = Self::api(
+            self.get("/internal/onboarding", Duration::from_secs(10))
+                .query(&[("user", handle)]),
+        )
+        .await?;
+        Ok(body)
+    }
+
+    /// `GET /internal/oauth/{provider}/start?user=`: the link that starts linking `provider`
+    /// for a member.
+    pub async fn oauth_start(&self, provider: &str, handle: &str) -> Result<String, ApiError> {
+        if !PROVIDERS.contains(&provider) {
+            return Err(refused_locally("not a provider"));
+        }
+        let (_, body) = Self::api(
+            self.get(
+                &format!("/internal/oauth/{provider}/start"),
+                Duration::from_secs(10),
+            )
+            .query(&[("user", handle)]),
+        )
+        .await?;
+        body["url"]
+            .as_str()
+            .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .map(String::from)
+            .ok_or(ApiError::Unavailable)
+    }
+
+    /// `POST /internal/memory/repo`: set a member's memory repo. The tool server checks it
+    /// with their GitHub token. `timeout` is short when the answer must fit in an ack.
+    pub async fn set_memory_repo(
+        &self,
+        handle: &str,
+        repo: &str,
+        timeout: Duration,
+    ) -> Result<Value, ApiError> {
+        let (_, body) = Self::api(self.post_json(
+            "/internal/memory/repo",
+            timeout,
+            &json!({"user": handle, "repo": repo}),
+        ))
+        .await?;
+        Ok(body)
+    }
+}
+
+fn refused_locally(error: &str) -> ApiError {
+    ApiError::Refused {
+        status: 400,
+        code: String::new(),
+        error: error.into(),
+        body: Value::Null,
+    }
+}
+
+/// A request id is a UUID; anything else never reaches a URL.
+pub fn request_id_ok(id: &str) -> bool {
+    id.len() <= 36
+        && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        && uuid::Uuid::parse_str(id).is_ok()
 }
 
 /// `apr_` and hex, as the tool server makes them; anything else never reaches a URL.

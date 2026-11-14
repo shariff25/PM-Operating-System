@@ -365,6 +365,10 @@ pub struct Env {
 
 impl Env {
     async fn with_store(store: Arc<dyn BotsStore>, pg: Option<TestPg>) -> Self {
+        Self::with_parts(store, pg, catalog()).await
+    }
+
+    async fn with_parts(store: Arc<dyn BotsStore>, pg: Option<TestPg>, catalog: Catalog) -> Self {
         let stop = CancellationToken::new();
         let ts = Arc::new(MockToolServer::default());
         let gw = Arc::new(MockGateway::default());
@@ -387,7 +391,7 @@ impl Env {
         .await;
         let rt = Arc::new(Runtime::new(
             store.clone(),
-            Arc::new(catalog()),
+            Arc::new(catalog),
             ToolServer::new(&ts_base, SERVICE),
             Gateway::new(&format!("{gw_base}/v1"), GATEWAY),
             stop.child_token(),
@@ -407,6 +411,11 @@ impl Env {
 
     pub async fn memory() -> Self {
         Self::with_store(Arc::new(MemoryStore::default()), None).await
+    }
+
+    /// In memory, with the bots of `catalog` (such as one loaded from a content tree).
+    pub async fn memory_with(catalog: Catalog) -> Self {
+        Self::with_parts(Arc::new(MemoryStore::default()), None, catalog).await
     }
 
     pub async fn postgres() -> Option<Self> {
