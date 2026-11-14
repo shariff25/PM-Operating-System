@@ -11,7 +11,9 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde_json::json;
@@ -24,27 +26,60 @@ use crate::sync::{SyncReport, Syncer};
 /// Shared between the HTTP handlers and the background sync loop.
 pub struct Runtime {
     pub store: Arc<dyn DocsStore>,
-    pub syncer: Syncer,
+    pub syncer: Arc<Syncer>,
     pub last: Mutex<Option<Result<SyncReport, String>>>,
+    /// When the last run in this process finished, and whether it succeeded.
+    last_attempt: Mutex<Option<(DateTime<Utc>, bool)>>,
     running: AtomicBool,
 }
+
+/// Clears the running flag however the run ends.
+struct Running<'a>(&'a AtomicBool);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// After a failed run, try again this soon rather than waiting a whole interval.
+pub const RETRY_FAILED_AFTER: Duration = Duration::from_secs(60 * 60);
 
 impl Runtime {
     pub fn new(store: Arc<dyn DocsStore>, syncer: Syncer) -> Self {
         Self {
             store,
-            syncer,
+            syncer: Arc::new(syncer),
             last: Mutex::new(None),
+            last_attempt: Mutex::new(None),
             running: AtomicBool::new(false),
         }
     }
 
     /// Run one sync unless one is already running. Returns false if one was.
     pub async fn sync_once(&self) -> bool {
-        if self.running.swap(true, Ordering::SeqCst) {
+        if !self.claim() {
             return false;
         }
-        let result = self.syncer.run(Utc::now()).await;
+        self.run_claimed().await;
+        true
+    }
+
+    /// Mark a sync as running. False if one already is.
+    fn claim(&self) -> bool {
+        !self.running.swap(true, Ordering::SeqCst)
+    }
+
+    /// Run a sync claimed with [`Runtime::claim`]. The run is its own task, so a panic in it
+    /// is recorded as a failed sync instead of taking the scheduler down.
+    async fn run_claimed(&self) {
+        let _running = Running(&self.running);
+        let syncer = self.syncer.clone();
+        let result = match tokio::spawn(async move { syncer.run(Utc::now()).await }).await {
+            Ok(r) => r.map_err(|e| e.to_string()),
+            Err(e) => Err(format!("the sync stopped unexpectedly: {e}")),
+        };
+        let finished = Utc::now();
         match &result {
             Ok(r) => tracing::info!(
                 listed = r.listed,
@@ -56,13 +91,46 @@ impl Runtime {
             ),
             Err(e) => tracing::warn!(error = %e, "docs sync failed"),
         }
-        *self.last.lock().expect("status lock") = Some(result.map_err(|e| e.to_string()));
-        self.running.store(false, Ordering::SeqCst);
-        true
+        let (ok, report) = match &result {
+            Ok(r) => (true, json!(r)),
+            Err(e) => (false, json!({ "error": e })),
+        };
+        if let Err(e) = self.store.record_sync(finished, ok, &report).await {
+            tracing::warn!(error = %e, "couldn't record the sync run");
+        }
+        *self.last_attempt.lock().expect("status lock") = Some((finished, ok));
+        *self.last.lock().expect("status lock") = Some(result);
     }
 
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
+    }
+
+    /// Is a sync due? Yes if the index has never been synced, if the last success is older
+    /// than `every`, or if the last run failed more than [`RETRY_FAILED_AFTER`] ago. With no
+    /// schedule (`every` is `None`), only when it has never been synced.
+    pub async fn due(&self, every: Option<Duration>, now: DateTime<Utc>) -> bool {
+        let last_success = match self.store.last_success().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't read the last sync time; syncing");
+                return true;
+            }
+        };
+        let Some(last_success) = last_success else {
+            return true;
+        };
+        let age = |t: DateTime<Utc>| (now - t).to_std().unwrap_or_default();
+        if let Some((at, false)) = *self.last_attempt.lock().expect("status lock") {
+            if at > last_success && age(at) >= RETRY_FAILED_AFTER {
+                return true;
+            }
+        }
+        every.is_some_and(|every| age(last_success) >= every)
+    }
+
+    pub async fn last_success(&self) -> Option<DateTime<Utc>> {
+        self.store.last_success().await.ok().flatten()
     }
 }
 
@@ -131,7 +199,8 @@ async fn require_token(State(state): State<AppState>, req: Request, next: Next) 
 }
 
 async fn trigger_sync(State(state): State<AppState>) -> Response {
-    if state.runtime.is_running() {
+    // Claim before spawning, so two requests can't both be told "started".
+    if !state.runtime.claim() {
         return (
             StatusCode::CONFLICT,
             Json(json!({"status": "already running"})),
@@ -140,7 +209,7 @@ async fn trigger_sync(State(state): State<AppState>) -> Response {
     }
     let runtime = state.runtime.clone();
     tokio::spawn(async move {
-        runtime.sync_once().await;
+        runtime.run_claimed().await;
     });
     (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response()
 }
@@ -158,9 +227,11 @@ async fn status(State(state): State<AppState>) -> Response {
         }
     };
     let last = state.runtime.last.lock().expect("status lock").clone();
+    let last_success = state.runtime.last_success().await;
     Json(json!({
         "pages": pages,
         "syncing": state.runtime.is_running(),
+        "last_success_at": last_success,
         "last_sync": match last {
             None => json!(null),
             Some(Ok(report)) => json!(report),

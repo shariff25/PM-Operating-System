@@ -91,6 +91,12 @@ both!(
     robots_and_login_only_pages_are_not_indexed,
     oversized_pages_are_skipped,
     search_ranks_titles_first_and_filters_by_product,
+    redirects_stay_on_the_portal,
+    bodies_are_capped_however_they_are_sent,
+    an_html_page_keeps_the_last_good_copy,
+    many_login_walls_at_once_keep_every_page,
+    a_rate_limited_robots_txt_skips_the_run,
+    sync_runs_are_recorded,
 );
 
 #[tokio::test]
@@ -336,4 +342,138 @@ async fn search_ranks_titles_first_and_filters_by_product(c: &Case) {
         .map(|p| (p.product.as_str(), p.pages))
         .collect();
     assert_eq!(names, vec![("ccm", 1), ("dsm", 2), ("general", 1)]);
+}
+
+async fn redirects_stay_on_the_portal(c: &Case) {
+    // Another server (another port: another origin) the portal tries to send us to.
+    let (other, other_portal, stop_other) = start_portal().await;
+    other_portal.set_page("evil", "\"e\"", &page_md("Evil", "evil", "INTERNAL-SECRET"));
+    c.portal.redirects.lock().unwrap().insert(
+        "/docs/dsm-backup.md".into(),
+        format!("{other}/docs/evil.md"),
+    );
+    // A redirect within the portal is followed.
+    c.portal.redirects.lock().unwrap().insert(
+        "/docs/getting-started.md".into(),
+        format!("{}/docs/dsm-key-rotation.md", c.base),
+    );
+    let r = c.syncer.run(Utc::now()).await.unwrap();
+    assert_eq!(
+        other_portal.hits("/docs/evil.md"),
+        0,
+        "never left the portal"
+    );
+    assert_eq!(r.failed, 1);
+    assert!(r.errors.iter().any(|e| e.contains("dsm-backup")));
+    assert!(c.store.get(&c.url("dsm-backup")).await.unwrap().is_none());
+    let followed = c
+        .store
+        .get(&c.url("getting-started"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(followed.body.contains("Rotate"), "{}", followed.body);
+    stop_other.cancel();
+}
+
+async fn bodies_are_capped_however_they_are_sent(c: &Case) {
+    // No Content-Length: the cap applies while reading (the cap here is 64 KB).
+    c.portal
+        .streamed
+        .lock()
+        .unwrap()
+        .insert("/docs/dsm-backup.md".into(), 1024 * 1024);
+    let r = c.syncer.run(Utc::now()).await.unwrap();
+    assert_eq!(r.too_large, 1);
+    assert_eq!(r.fetched, 3);
+
+    // The index has its own cap.
+    c.portal
+        .streamed
+        .lock()
+        .unwrap()
+        .insert("/llms.txt".into(), pmos_docs::sync::MAX_INDEX_BYTES + 8192);
+    assert!(matches!(
+        c.syncer.run(Utc::now()).await,
+        Err(SyncError::Index(e)) if e.contains("size cap")
+    ));
+}
+
+async fn an_html_page_keeps_the_last_good_copy(c: &Case) {
+    c.syncer.run(Utc::now()).await.unwrap();
+    // The portal starts answering with an HTML page (a login wall, an error page) and 200.
+    c.portal
+        .set_page("dsm-backup", "\"b2\"", "<html>Sign in</html>");
+    c.portal.content_types.lock().unwrap().insert(
+        "/docs/dsm-backup.md".into(),
+        "text/html; charset=utf-8".into(),
+    );
+    let r = c.syncer.run(Utc::now()).await.unwrap();
+    assert_eq!(r.failed, 1);
+    assert!(r.errors[0].contains("text/html"), "{:?}", r.errors);
+    let kept = c.store.get(&c.url("dsm-backup")).await.unwrap().unwrap();
+    assert!(!kept.body.contains("Sign in"));
+}
+
+async fn many_login_walls_at_once_keep_every_page(c: &Case) {
+    // Twelve pages, all indexed.
+    let slugs: Vec<String> = (0..12).map(|i| format!("kb-{i}")).collect();
+    let entries: Vec<(&str, &str, Option<&str>)> = slugs
+        .iter()
+        .map(|s| (s.as_str(), "KB page", None))
+        .collect();
+    c.portal.set_index(&c.base, &entries);
+    for s in &slugs {
+        c.portal
+            .set_page(s, "\"k\"", &page_md("KB page", s, "Body."));
+    }
+    c.syncer.run(Utc::now()).await.unwrap();
+    assert_eq!(c.store.count().await.unwrap(), 12);
+
+    // Then a bot wall answers 403 for most of them: that's not twelve pages going private.
+    for s in &slugs[..8] {
+        c.portal.set_status(s, 403);
+    }
+    let r = c.syncer.run(Utc::now()).await.unwrap();
+    assert_eq!(r.restricted, 8);
+    assert!(r.errors[0].contains("blocking"), "{:?}", r.errors);
+    assert_eq!(c.store.count().await.unwrap(), 12, "kept every page");
+
+    // One page going private is still dropped.
+    for s in &slugs[..8] {
+        c.portal.set_status(s, 200);
+    }
+    c.portal.set_status(&slugs[0], 401);
+    let r = c.syncer.run(Utc::now()).await.unwrap();
+    assert_eq!(r.restricted, 1);
+    assert_eq!(c.store.count().await.unwrap(), 11);
+}
+
+async fn a_rate_limited_robots_txt_skips_the_run(c: &Case) {
+    *c.portal.robots.lock().unwrap() = (429, String::new());
+    assert!(matches!(
+        c.syncer.run(Utc::now()).await,
+        Err(SyncError::Robots(_))
+    ));
+    assert_eq!(c.portal.total_hits(), 1, "only robots.txt was requested");
+}
+
+async fn sync_runs_are_recorded(c: &Case) {
+    assert_eq!(c.store.last_success().await.unwrap(), None);
+    let t1 = Utc::now();
+    c.store
+        .record_sync(t1, false, &serde_json::json!({"error": "x"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        c.store.last_success().await.unwrap(),
+        None,
+        "failures don't count"
+    );
+    c.store
+        .record_sync(t1, true, &serde_json::json!({"listed": 4}))
+        .await
+        .unwrap();
+    let got = c.store.last_success().await.unwrap().unwrap();
+    assert!((got - t1).num_milliseconds().abs() < 1);
 }

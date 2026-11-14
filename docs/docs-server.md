@@ -32,20 +32,34 @@ Only public pages are indexed (decided 2026-11-14).
 
 ## How the sync behaves
 
-- **Robots:** reads `robots.txt` first. If it's missing, everything is allowed. If the portal
-  can't answer (5xx), nothing is fetched that run.
+- **Robots:** reads `robots.txt` first, with full `*` and `$` pattern matching. If it's
+  missing (404), everything is allowed. If the portal can't answer (5xx) or is rate-limiting
+  (429), nothing is fetched that run.
 - **Pace:** one request per second across the whole sync, at most 2 in flight. A 429 holds
   every worker back for its `Retry-After` (60 seconds if absent, never more than 5 minutes),
   doubles the gap up to 10 seconds, and retries that page up to 3 times.
 - **Speed:** a full first sync of about 1,800 pages takes about 30 minutes (measured
-  2026-11-14: 1,798 pages, 0 failures, no 429s). Later syncs send
-  `If-None-Match`, so unchanged pages cost a 304.
+  2026-11-14: 1,798 pages, 0 failures, no 429s). Later syncs send `If-None-Match`, so
+  unchanged pages cost a 304.
+- **Portal content is untrusted:**
+  - Redirects are followed only within the portal (same scheme, host and port), at most 3.
+  - Every body is read with a hard cap, whether or not it says its length: pages 2 MB (and
+    skipped if larger), `llms.txt` 5 MB, `robots.txt` 512 KB.
+  - A page must be served as markdown or plain text. An HTML answer, such as a login or
+    error page, counts as a failed fetch.
 - **Never empties the index:**
   - A failed fetch keeps the page's last good copy.
-  - Pages leave the index only when they leave `llms.txt`.
-  - If the index shrinks below half the stored pages, removals are skipped that run.
-- **Page cap:** pages over 2 MB are skipped.
-- **Schedule:** on start-up, then every `PMOS_DOCS_SYNC_HOURS` (default 24).
+  - Pages leave the index only when they leave `llms.txt`, become disallowed, or need a login.
+  - If more than 5 pages, or 2% of them, need a login in one run, that looks like the portal
+    blocking the crawler rather than pages going private. Every page is kept, and the run
+    reports it.
+  - If the index would shrink below half the stored pages, removals are skipped that run.
+- **Schedule:** checked every 10 minutes. A sync runs when the index has never been synced,
+  when the last successful sync is older than `PMOS_DOCS_SYNC_HOURS` (default 24), or an hour
+  after a failed run. Each run is recorded in `docs_syncs`, so a restart doesn't re-crawl a
+  fresh index.
+- **Crashes:** a crash inside a run is recorded as a failed sync, and never leaves "sync
+  running" stuck.
 
 **Found in testing (2026-11-14):** the portal sits behind Cloudflare and started answering 429
 after about 700 requests at 5 per second. That is why the default pace is 1 per second, with
@@ -62,21 +76,29 @@ the shared back-off above.
 `get_doc` only serves pages already in the index. It never fetches the URL it's given, so a
 caller can't use it to make the server request other addresses.
 
+A failed call returns `isError` with `{code, message}`. `code` is `bad_args`, `not_found` or
+`unavailable`, so the tool server maps errors without parsing their wording.
+
+**Tool server side:**
+- The tool server's connector shares one MCP connection across all sessions, and never holds
+  a lock during a call.
+- Each call has a 10-second deadline, so a stuck docs server can't hold up other PMs' searches.
+
 ## Endpoints and configuration
 
 | Endpoint | Auth | Purpose |
 | --- | --- | --- |
 | `POST /mcp` | `Bearer PMOS_DOCS_TOKEN` | MCP (Streamable HTTP) |
-| `GET /admin/status` | same | Page count, whether a sync is running, the last sync's report (counts and first errors) |
+| `GET /admin/status` | same | Page count, whether a sync is running, when the last successful sync finished, and the last run's report (counts and first errors) |
 | `POST /admin/sync` | same | Start a sync now (`409` if one is running) |
 | `GET /healthz` | none | Liveness |
 
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `PMOS_DOCS_TOKEN` | required | At least 32 characters; the tool server's `PMOS_DOCS_TOKEN` must match |
-| `PMOS_DOCS_DATABASE_URL` | required | Its own Postgres database; `PMOS_DEV=1` keeps the index in memory |
+| `PMOS_DOCS_DATABASE_URL` | required | Postgres; `PMOS_DEV=1` keeps the index in memory. Its migrations are tracked in `_pmos_docs_migrations`, so it can share a database with the tool server. |
 | `PMOS_DOCS_BIND` | `127.0.0.1:8730` | |
-| `PMOS_DOCS_SYNC_HOURS` | `24` | `0` syncs only on start-up and on demand |
+| `PMOS_DOCS_SYNC_HOURS` | `24` | `0` syncs only when the index has never been synced, and on demand |
 | `PMOS_DOCS_DELAY_MS` | `1000` | Gap between requests |
 | `PMOS_DOCS_CONCURRENCY` | `2` | Capped at 4 |
 | `PMOS_DOCS_BASE_URL` | `https://support.fortanix.com` | For tests |
