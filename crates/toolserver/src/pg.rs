@@ -509,8 +509,8 @@ impl AuditSink for PgStore {
         sqlx::query(
             "INSERT INTO audit_events
                  (at, run_id, user_handle, skill, tool, outcome, sources, args_hash, output_ref,
-                  detail)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                  detail, client)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(event.at)
         .bind(&event.run_id)
@@ -522,6 +522,7 @@ impl AuditSink for PgStore {
         .bind(&event.args_hash)
         .bind(&event.output_ref)
         .bind(&event.detail)
+        .bind(event.client.as_str())
         .execute(&self.pool)
         .await?;
         Ok(())

@@ -1,4 +1,4 @@
-import { cpSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
@@ -132,6 +132,44 @@ describe("createPmosAgent", () => {
       "edit",
       "reject",
     ]);
+  });
+});
+
+describe("content mount", () => {
+  const readFile = (path: string) =>
+    new AIMessage({
+      content: "",
+      tool_calls: [{ id: crypto.randomUUID(), name: "read_file", args: { file_path: path } }],
+    });
+
+  it("does not expose the context library or other PMs' personal context", async () => {
+    // Context files carry data-class labels that only the tool server enforces, so the
+    // sandbox must never read them directly.
+    mkdirSync(join(contentRoot, "context", "products"), { recursive: true });
+    writeFileSync(join(contentRoot, "context", "products", "secret.md"), "RESTRICTED-MARKER");
+    mkdirSync(join(contentRoot, "master", "people", "bea"), { recursive: true });
+    writeFileSync(join(contentRoot, "master", "people", "bea", "AGENTS.md"), "BEA-PRIVATE");
+    mkdirSync(join(contentRoot, "master", "people", "ana"), { recursive: true });
+    writeFileSync(join(contentRoot, "master", "people", "ana", "AGENTS.md"), "ANA-NOTES");
+
+    const model = new ScriptedModel([
+      readFile("/content/context/products/secret.md"),
+      readFile("/content/master/people/bea/AGENTS.md"),
+      readFile("/content/skills/ask/SKILL.md"),
+      new AIMessage("done"),
+    ]);
+    const agent = createPmosAgent({ contentRoot, model, user: "ana" });
+    const result = await agent.invoke({ messages: [new HumanMessage("read")] }, thread());
+    const out = result.messages
+      .filter(ToolMessage.isInstance)
+      .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
+      .join("\n");
+
+    expect(out).not.toContain("RESTRICTED-MARKER");
+    expect(out).not.toContain("BEA-PRIVATE");
+    expect(out).toContain("name: ask");
+    // The PM's own personal context is still loaded.
+    expect(systemText(model.prompts[0] ?? [])).toContain("ANA-NOTES");
   });
 });
 

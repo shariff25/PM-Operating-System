@@ -18,6 +18,20 @@ fn outcomes(f: &common::Fixture) -> Vec<(String, Outcome)> {
 }
 
 #[tokio::test]
+async fn with_live_connectors_only_team_members_get_sessions() {
+    let f = common::team_fixture(&["ana"]);
+    assert!(f
+        .svc
+        .create_session("ana", "ask", "r1", None, now())
+        .await
+        .is_ok());
+    assert_eq!(
+        f.svc.create_session("eve", "ask", "r1", None, now()).await,
+        Err(SessionError::NotAMember("eve".into()))
+    );
+}
+
+#[tokio::test]
 async fn sessions_validate_user_and_skill() {
     let f = fixture();
     assert_eq!(

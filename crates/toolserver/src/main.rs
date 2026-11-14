@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use pmos_toolserver::app::BotAccess;
 use pmos_toolserver::audit::{AuditSink, JsonlAudit, TeeAudit};
 use pmos_toolserver::catalog::Catalog;
 use pmos_toolserver::config::{Config, Connectors};
@@ -14,6 +15,7 @@ use pmos_toolserver::connectors::Connector;
 use pmos_toolserver::context::load_docs;
 use pmos_toolserver::oauth::{OAuth, OAuthConfig, TokenSource};
 use pmos_toolserver::pg::PgStore;
+use pmos_toolserver::team::Team;
 use pmos_toolserver::vault::Vault;
 use pmos_toolserver::{router, AppConfig, Stores, ToolService};
 use tokio_util::sync::CancellationToken;
@@ -114,12 +116,26 @@ async fn main() -> Result<()> {
             }
         };
 
+    let live = matches!(config.connectors, Connectors::Live(_));
+    // With live connectors only people in team.yaml may use PM OS.
+    let team = Team::load(&config.content_root, live).map_err(anyhow::Error::msg)?;
+    for skill in &config.bot_skills {
+        if catalog.skill(skill).is_none() {
+            anyhow::bail!("PMOS_BOT_SKILLS names unknown skill `{skill}`");
+        }
+    }
     let skills = catalog.skills().count();
-    let svc = ToolService::new(catalog, stores, connectors).map_err(anyhow::Error::msg)?;
+    let svc = ToolService::new(catalog, stores, connectors)
+        .map_err(anyhow::Error::msg)?
+        .with_team(team);
     let app = router(
         Arc::new(svc),
         AppConfig {
             service_token: config.service_token.clone(),
+            bot: config.bot_token.clone().map(|token| BotAccess {
+                token,
+                skills: config.bot_skills.clone(),
+            }),
             content_root: config.content_root.clone(),
             allowed_hosts: config.allowed_hosts.clone(),
             oauth,

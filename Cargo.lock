@@ -1591,6 +1591,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmos-runtime"
+version = "0.1.0"
+dependencies = [
+ "subtle",
+]
+
+[[package]]
 name = "pmos-slack"
 version = "0.1.0"
 dependencies = [
@@ -1627,6 +1634,7 @@ dependencies = [
  "hmac 0.12.1",
  "pmos-contract",
  "pmos-docs",
+ "pmos-runtime",
  "pulldown-cmark",
  "reqwest",
  "rmcp",

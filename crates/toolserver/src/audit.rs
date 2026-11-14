@@ -34,9 +34,33 @@ pub enum Outcome {
     Error,
 }
 
+/// Who made the call: a sandbox over MCP, or an internal service with its own token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Client {
+    /// An agent sandbox, over `/mcp` with a session token.
+    #[default]
+    Mcp,
+    /// The orchestrator or a platform-owner tool, with `PMOS_SERVICE_TOKEN`.
+    Orchestrator,
+    /// The Slack bot, with `PMOS_BOT_TOKEN`.
+    Bot,
+}
+
+impl Client {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::Orchestrator => "orchestrator",
+            Self::Bot => "bot",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AuditEvent {
     pub at: DateTime<Utc>,
+    pub client: Client,
     pub run_id: String,
     pub user: String,
     pub skill: String,
@@ -129,6 +153,7 @@ mod tests {
 
     fn event() -> AuditEvent {
         AuditEvent {
+            client: Client::Mcp,
             at: "2026-11-14T00:00:00Z".parse().unwrap(),
             run_id: "run-1".into(),
             user: "ana".into(),

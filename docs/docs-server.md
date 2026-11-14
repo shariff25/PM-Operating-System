@@ -107,7 +107,7 @@ The tool server needs `PMOS_DOCS_URL` (such as `http://docs.pmos.internal:8730/m
 1. Create the app from `docs/slack-app-manifest.yaml` (Socket Mode on, `/docs`, bot scope
    `commands` only).
 2. Generate an app-level token with `connections:write` and set it as `PMOS_SLACK_APP_TOKEN`.
-3. Set `PMOS_TOOLSERVER_URL`, `PMOS_SERVICE_TOKEN` and `PMOS_CONTENT_ROOT`.
+3. Set `PMOS_TOOLSERVER_URL`, `PMOS_BOT_TOKEN` (the same value as the tool server's `PMOS_BOT_TOKEN`) and `PMOS_CONTENT_ROOT`.
 4. Add each PM to `content/team.yaml` (handle, Slack member id, roles) by pull request.
 
 ## Network on the Spark

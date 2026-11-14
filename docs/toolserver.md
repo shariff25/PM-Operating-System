@@ -42,21 +42,25 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | --- | --- | --- |
 | `GET /healthz` | none | Liveness |
 | `POST /mcp` (Streamable HTTP) | `Bearer <session token>` | MCP for the harness: `tools/list`, `tools/call` |
-| `POST /internal/sessions` `{user, skill, run_id, ttl_minutes?}` | service token | Create a session; returns `token` and the session's tools |
-| `DELETE /internal/sessions/{token}` | service token | Revoke a session (sandbox ended) |
-| `POST /internal/sessions/{token}/call` `{tool, args}` | service token | One tool call for the session, with the same rules as MCP: allowlist, argument checks, approvals for writes, audit. For the Slack bot and orchestrator. |
+| `POST /internal/sessions` `{user, skill, run_id, ttl_minutes?}` | service or bot token | Create a session; returns `token` and the session's tools. `403` if the user isn't in `team.yaml` (live connectors), or the bot asks for a skill outside `PMOS_BOT_SKILLS`. |
+| `DELETE /internal/session` + `X-Pmos-Session` | service or bot token | Revoke a session (sandbox ended) |
+| `POST /internal/call` + `X-Pmos-Session` `{tool, args}` | service or bot token | One tool call for the session, with the same rules as MCP: allowlist, argument checks, approvals for writes, audit (which records the caller). |
 | `POST /internal/grants` `{session_token, tool, args}` | service token | Record an approval given in the harness |
 | `GET /internal/approvals?user=&status=` | service token | A PM's inbox, newest first |
 | `GET /internal/approvals/{id}` | service token | One item |
 | `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?}` | service token | `approve`, `edit` (with `args`) or `reject` |
-| `POST /internal/reindex` | service token | Rebuild the context index from the content checkout; `422` if it fails `pmos lint` |
+| `POST /internal/reindex` | service token | Rebuild the context index from the content checkout and re-read `team.yaml`; `422` if it fails `pmos lint` |
 | `GET /internal/oauth/{atlassian\|slack}/start?user=` | service token | The URL to send a PM to so they can link their account |
 | `GET /oauth/{atlassian\|slack}/callback` | none (the PM's browser) | Finishes linking; shows a short page |
 | `GET /internal/credentials?user=` | service token | A PM's linked accounts, without tokens |
 | `DELETE /internal/credentials/{user}/{provider}` | service token | Unlink (the PM disconnects, or a platform owner revokes) |
 
-Only the orchestrator and the Slack bot hold the service token. Sandboxes
-get only their own session token. A tool error (refused, invalid arguments, not found) comes
+**Who holds which token:**
+- **Service token** (`PMOS_SERVICE_TOKEN`): the orchestrator and platform-owner tools. Every route.
+- **Bot token** (`PMOS_BOT_TOKEN`): the Slack bot. Only sessions for the skills in `PMOS_BOT_SKILLS` and calls within them. A session started for another skill looks to the bot like one that doesn't exist, and every other route returns `403`.
+- **Session token:** each sandbox gets only its own.
+
+Session tokens are sent in headers, never in a URL, so access logs and proxies don't record them. A tool error (refused, invalid arguments, not found) comes
 back as an MCP tool result with `isError: true`, so the model can read why.
 
 ## Tools
@@ -159,8 +163,10 @@ cargo run -p pmos-toolserver
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `PMOS_SERVICE_TOKEN` | required | At least 32 characters |
-| `PMOS_CONNECTORS` | required | `live` for real Atlassian and Slack with each PM's own token; `fake` for fixture data (dev, tests, and everything before Gate 1) |
+| `PMOS_SERVICE_TOKEN` | required | The orchestrator's token. At least 32 characters |
+| `PMOS_BOT_TOKEN` | none | The Slack bot's own token: at least 32 characters and different from the service token |
+| `PMOS_BOT_SKILLS` | `docs` | Skills the bot may start sessions for |
+| `PMOS_CONNECTORS` | required | `live` for real Atlassian and Slack with each PM's own token, and only people in `team.yaml` may have sessions; `fake` for fixture data (dev, tests, and everything before Gate 1), with `team.yaml` not enforced |
 | `PMOS_DATABASE_URL` | required | Postgres for every store. `PMOS_DEV=1` without it keeps everything in memory. |
 | `PMOS_AUDIT_LOG` | none | Also writes audit events to this JSON-lines file, for shipping off-box |
 | `PMOS_CONTENT_ROOT` | `content` | Must pass `pmos lint`, or the server won't start |

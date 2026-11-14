@@ -21,6 +21,7 @@ pub mod schemas;
 pub mod service;
 pub mod session;
 pub mod store;
+pub mod team;
 pub mod vault;
 
 pub use app::{router, AppConfig};
