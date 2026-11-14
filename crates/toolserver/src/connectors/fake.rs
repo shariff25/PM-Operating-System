@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{Caller, Connector, ConnectorError, Item, SourceRef};
+use super::{Caller, Connector, ConnectorError, Item, SourceRef, TeamBot};
 
 /// A write the fake received.
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +151,30 @@ fn item(system: &str, id: &str, title: &str, content: Value) -> Item {
     }
 }
 
+impl FakeConnector {
+    /// A team bot with nothing listed for this system reads nothing in it.
+    fn system_in_scope(&self, bot: TeamBot<'_>) -> Result<(), ConnectorError> {
+        match self.system.as_str() {
+            "jira" => bot.jira_projects().map(drop),
+            "confluence" => bot.confluence_spaces().map(drop),
+            "slack" => bot.slack_channels().map(drop),
+            _ => Ok(()),
+        }
+    }
+
+    /// A team bot's read scope, applied to a fixture item the way the live connectors apply
+    /// it: by Jira project, Confluence space (`content.space`) or Slack channel.
+    fn item_in_scope(&self, bot: TeamBot<'_>, item: &Item) -> Result<(), ConnectorError> {
+        let id = item.source.id.as_str();
+        match self.system.as_str() {
+            "jira" => bot.check_issue(id),
+            "confluence" => bot.check_space(id, item.content["space"].as_str().unwrap_or_default()),
+            "slack" => bot.check_channel(id.split(':').next().unwrap_or_default()),
+            _ => Ok(()),
+        }
+    }
+}
+
 fn str_arg<'a>(args: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|k| args.get(*k).and_then(Value::as_str))
@@ -164,10 +188,13 @@ impl Connector for FakeConnector {
 
     async fn read(
         &self,
-        _caller: Caller<'_>,
+        caller: Caller<'_>,
         action: &str,
         args: &Value,
     ) -> Result<Vec<Item>, ConnectorError> {
+        if let Some(bot) = caller.team_bot {
+            self.system_in_scope(bot)?;
+        }
         match action {
             "search" => {
                 let query = str_arg(args, &["query", "jql", "cql"])
@@ -182,6 +209,12 @@ impl Connector for FakeConnector {
                         let hay = format!("{} {}", i.title, i.content).to_lowercase();
                         words.iter().any(|w| hay.contains(w))
                     })
+                    // As if the query were wrapped in the team bot's scope.
+                    .filter(|i| {
+                        caller
+                            .team_bot
+                            .is_none_or(|b| self.item_in_scope(b, i).is_ok())
+                    })
                     .take(limit)
                     .cloned()
                     .collect())
@@ -193,12 +226,25 @@ impl Connector for FakeConnector {
                         .ok_or_else(|| ConnectorError::BadArgs("an id is required".into()))?
                         .to_string(),
                 };
-                self.items
+                // Like the live connectors: a Jira key or Slack channel is checked before the
+                // fetch, a Confluence page's space after it.
+                if let Some(bot) = caller.team_bot {
+                    match self.system.as_str() {
+                        "jira" => bot.check_issue(&id)?,
+                        "slack" => bot.check_channel(id.split(':').next().unwrap_or_default())?,
+                        _ => {}
+                    }
+                }
+                let item = self
+                    .items
                     .iter()
                     .find(|i| i.source.id == id || i.source.url == id)
                     .cloned()
-                    .map(|i| vec![i])
-                    .ok_or(ConnectorError::NotFound(id))
+                    .ok_or(ConnectorError::NotFound(id))?;
+                if let Some(bot) = caller.team_bot {
+                    self.item_in_scope(bot, &item)?;
+                }
+                Ok(vec![item])
             }
             other => Err(ConnectorError::Unsupported(other.to_string())),
         }
@@ -233,10 +279,7 @@ mod tests {
     #[tokio::test]
     async fn search_read_and_write() {
         let jira = FakeConnector::jira();
-        let caller = Caller {
-            user: "ana",
-            run_id: "r1",
-        };
+        let caller = Caller::new("ana", "r1");
         let hits = jira
             .read(caller, "search", &json!({"jql": "sso"}))
             .await
@@ -267,15 +310,53 @@ mod tests {
         let slack = FakeConnector::slack();
         let thread = slack
             .read(
-                Caller {
-                    user: "ana",
-                    run_id: "r1",
-                },
+                Caller::new("ana", "r1"),
                 "read_thread",
                 &json!({"channel": "C0FIELD", "ts": "1731500000.000100"}),
             )
             .await
             .unwrap();
         assert_eq!(thread.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_team_bot_reads_only_inside_its_scope() {
+        let reads = pmos_contract::bots::Reads {
+            jira_projects: vec!["ENG".into()],
+            confluence_spaces: vec!["PM".into()],
+            slack_channels: Vec::new(),
+        };
+        let caller = Caller::new("ana", "r1").for_team_bot(TeamBot {
+            name: "scout",
+            identity: "bots.scout",
+            reads: &reads,
+        });
+        assert_eq!(caller.reader(), "bots.scout");
+        let jira = FakeConnector::jira();
+        let hits = jira
+            .read(caller, "search", &json!({"jql": "sso"}))
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "PM-101 is outside ENG");
+        assert!(matches!(
+            jira.read(caller, "read", &json!({"key": "PM-101"})).await,
+            Err(ConnectorError::Forbidden(_))
+        ));
+        let confluence = FakeConnector::confluence();
+        assert_eq!(
+            confluence
+                .read(caller, "read", &json!({"page_id": "9001"}))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // Nothing listed for Slack: no Slack at all.
+        assert!(matches!(
+            FakeConnector::slack()
+                .read(caller, "search", &json!({"query": "sso"}))
+                .await,
+            Err(ConnectorError::Forbidden(_))
+        ));
     }
 }

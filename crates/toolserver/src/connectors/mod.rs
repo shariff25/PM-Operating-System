@@ -2,7 +2,11 @@
 //!
 //! Every call carries the signed-in user, and the real connectors (0c-2) act with that
 //! user's own token: Atlassian OAuth 2.0 (3LO) through `api.atlassian.com/ex/{product}/{cloudId}`,
-//! and the PM's own Slack user token. There is no shared service identity.
+//! and the PM's own Slack user token.
+//!
+//! The one exception is a team bot's reads (`docs/bot-runtime-spec.md` §2): they use the
+//! bot's own read-only accounts (`bots.<name>`), limited to its read scope in `scope.rs`.
+//! Writes always act as the PM.
 //!
 //! Connector output is untrusted: the tool server wraps every item so the harness and the
 //! model treat it as data, never as instructions.
@@ -12,6 +16,7 @@ pub mod docs;
 pub mod fake;
 pub mod format;
 pub mod http;
+pub mod scope;
 pub mod slack;
 
 use async_trait::async_trait;
@@ -36,9 +41,48 @@ pub struct Item {
 /// Who a connector call acts for, and which run it belongs to.
 #[derive(Debug, Clone, Copy)]
 pub struct Caller<'a> {
+    /// The PM the call is for. Writes always act as this PM, with their own token.
     pub user: &'a str,
     /// Written into drafts so a reader can trace them back to the run (OUT-1).
     pub run_id: &'a str,
+    /// Set for a team bot's session: reads use the bot's own accounts and stay inside the
+    /// read scope its owner chose. `None` reads as `user`.
+    pub team_bot: Option<TeamBot<'a>>,
+}
+
+impl<'a> Caller<'a> {
+    /// A call for `user` that reads and writes as them.
+    pub fn new(user: &'a str, run_id: &'a str) -> Self {
+        Self {
+            user,
+            run_id,
+            team_bot: None,
+        }
+    }
+
+    /// The same call, reading as a team bot within its read scope.
+    pub fn for_team_bot(self, bot: TeamBot<'a>) -> Self {
+        Self {
+            team_bot: Some(bot),
+            ..self
+        }
+    }
+
+    /// Whose linked accounts a read uses: a team bot's own identity, else the PM's.
+    pub fn reader(&self) -> &'a str {
+        self.team_bot.map_or(self.user, |b| b.identity)
+    }
+}
+
+/// A team bot reading with its own service identity (decision 26: the PM-chosen scope).
+#[derive(Debug, Clone, Copy)]
+pub struct TeamBot<'a> {
+    /// The bot's name, such as `docs`.
+    pub name: &'a str,
+    /// `bots.<name>`: the identity its accounts are linked under.
+    pub identity: &'a str,
+    /// What it may read. An empty list means nothing in that system.
+    pub reads: &'a pmos_contract::bots::Reads,
 }
 
 /// Appended to everything PM OS writes on a PM's behalf (SLK-7).
