@@ -16,10 +16,12 @@ Slack without the PM's approval.
 | `content/` | Skills, context library, master context, reviewer rubrics, templates, tool registry | Markdown, YAML |
 | `crates/contract` | The content contract and its lint | Rust |
 | `crates/cli` | `pmos`, the command line for skill authors | Rust |
+| `crates/toolserver` | The only path from a sandbox to context and systems: MCP, allowlists, approvals, audit ([docs](docs/toolserver.md)) | Rust |
 | `harness/` | Team-service agent on LangChain Deep Agents | TypeScript |
 
-Still to come, per the plan: the tool server, gateway, orchestrator, Slack app, policy checker
-(Rust), sandbox policies, evals, and the web workspace (TypeScript).
+Still to come, per the plan: Postgres and the real Atlassian and Slack connectors, the
+gateway, orchestrator, Slack app and policy checker (Rust), sandbox policies, evals, and the
+web workspace (TypeScript).
 
 ## Develop
 

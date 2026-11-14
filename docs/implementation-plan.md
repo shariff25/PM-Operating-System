@@ -152,7 +152,34 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
   - The posted reply still carries the "drafted with PM OS" marker.
   - User tokens are stored encrypted in the tool server and attached only to that user's sandbox (OpenShell credential placeholders).
 
-## Open questions (not blocking PR 1)
-- Who the platform owner is. This blocks Gate 1.
-- Whether to confirm Atlassian Cloud (as assumed) or Data Center. This changes the auth flow for the connectors.
-- Updating the PRD text that still mentions a frontier API, as suggestions in the doc.
+- **Atlassian Cloud is confirmed.** Connectors use Atlassian Cloud REST with per-user OAuth 2.0 (3LO), through `api.atlassian.com/ex/{jira|confluence}/{cloudId}`.
+- **Models are local and open-weight only.** The gateway has no outbound model route at all.
+- **The platform owners are product managers**, not a dedicated engineer.
+  - Platform-owner rights go to named PMs in the `admin` role.
+  - Sandbox-policy changes still need a second platform-owner PM who isn't the author (POL-2).
+  - Operations must stay PM-runnable:
+    - one `docker compose` stack on the Spark;
+    - `pmos admin` commands for health, restart, model swap and token revocation;
+    - day-2 runbooks in `docs/runbooks/` written for a technical PM;
+    - upgrades only through the eval gate.
+  - Gate 1 adds "a platform-owner PM can restore from backup by following the runbook".
+
+## Status
+| Package | State | Notes |
+| --- | --- | --- |
+| 0a Contract and lint | Done | `crates/contract`, `crates/cli`, CI |
+| 0b Seed content | Done | 3 skills, 7 reviewers, 3 templates, context skeleton |
+| 0c Tool server | Done (fakes) | `crates/toolserver`; see `docs/toolserver.md` |
+| 0c-2 Postgres, real Atlassian and Slack connectors, token store | Next | Behind the existing `ContextIndex`, `MemoryStore`, `Connector` traits |
+| 0d Gateway | Not started | |
+| 0e Harness and orchestrator | Skeleton | Harness only; orchestrator not started |
+| 0f Sandbox policies | Not started | |
+| 0g Evals | Not started | |
+
+0c notes:
+- Connectors share one `Connector` trait (`read` and `write`, both keyed by action) instead of one trait per system. The real Jira, Confluence and Slack connectors each implement it.
+- Writes that the PM approved in the harness run through single-use grants, so the PM is never asked twice.
+
+## Open questions
+- None blocking.
+- The PRD still mentions a frontier API and an engineer as platform owner; suggest edits to the doc.

@@ -71,6 +71,11 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// Parse `tools.yaml`.
+    pub fn from_yaml(text: &str) -> Result<Self, serde_norway::Error> {
+        serde_norway::from_str(text)
+    }
+
     pub fn get(&self, name: &str) -> Option<&ToolDef> {
         self.tools.iter().find(|t| t.name == name)
     }
@@ -78,6 +83,30 @@ impl ToolRegistry {
     pub fn write_tools(&self) -> impl Iterator<Item = &ToolDef> {
         self.tools.iter().filter(|t| t.kind == ToolKind::Write)
     }
+
+    /// Map of harness tool name to tool. Errors name the first pair that collides.
+    pub fn by_harness_name(&self) -> Result<BTreeMap<String, &ToolDef>, String> {
+        let mut map: BTreeMap<String, &ToolDef> = BTreeMap::new();
+        for tool in &self.tools {
+            let name = harness_tool_name(&tool.name);
+            if let Some(existing) = map.get(&name) {
+                return Err(format!(
+                    "tools `{}` and `{}` both map to harness name `{name}`",
+                    existing.name, tool.name
+                ));
+            }
+            map.insert(name, tool);
+        }
+        Ok(map)
+    }
+}
+
+/// The name a tool has in MCP and inside a harness. Registry names use dots
+/// (`jira.create_issue`); OpenAI-style function names allow only letters, digits, `_` and
+/// `-`, so dots become `_`. The TypeScript harness applies the same rule
+/// (`harness/src/registry.ts`).
+pub fn harness_tool_name(name: &str) -> String {
+    name.replace('.', "_")
 }
 
 /// Front matter of a `SKILL.md`, as the Agent Skills spec defines it. PM OS fields live in
@@ -159,6 +188,11 @@ pub struct ContextFrontMatter {
     pub owner: String,
     pub last_reviewed: NaiveDate,
     pub sensitivity: Sensitivity,
+}
+
+/// Parse a context file's front matter (the YAML between the `---` lines).
+pub fn parse_context_front_matter(yaml: &str) -> Result<ContextFrontMatter, serde_norway::Error> {
+    serde_norway::from_str(yaml)
 }
 
 /// Front matter of a reviewer persona (REV-2). The body is the rubric.

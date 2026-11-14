@@ -111,6 +111,31 @@ fn duplicate_and_misnamed_tools() {
 }
 
 #[test]
+fn harness_name_collision() {
+    let dir = valid_tree();
+    write(
+        dir.path(),
+        "tools.yaml",
+        "tools:\n  - name: context.search\n    system: context\n    kind: read\n  - name: jira.create_issue\n    system: jira\n    kind: write\n  - name: a.b_c\n    system: a\n    kind: read\n  - name: a_b.c\n    system: a_b\n    kind: read\n",
+    );
+    assert_code(&run(&dir), "tool-harness-collision", Severity::Error);
+}
+
+#[test]
+fn harness_names_from_registry() {
+    let registry = pmos_contract::ToolRegistry::from_yaml(
+        "tools:\n  - {name: jira.create_issue, system: jira, kind: write}\n  - {name: confluence.read, system: confluence, kind: read}\n",
+    )
+    .unwrap();
+    let names: Vec<_> = registry.by_harness_name().unwrap().into_keys().collect();
+    assert_eq!(names, vec!["confluence_read", "jira_create_issue"]);
+    assert_eq!(
+        pmos_contract::model::harness_tool_name("slack.post_reply"),
+        "slack_post_reply"
+    );
+}
+
+#[test]
 fn unknown_tool_kind_is_a_parse_error() {
     let dir = valid_tree();
     write(

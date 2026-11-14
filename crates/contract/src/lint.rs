@@ -207,6 +207,7 @@ impl Cx {
             }
         };
         let mut seen = BTreeSet::new();
+        let mut harness_names: std::collections::BTreeMap<String, &str> = Default::default();
         for tool in &registry.tools {
             if !seen.insert(tool.name.as_str()) {
                 self.error(
@@ -217,6 +218,20 @@ impl Cx {
             }
             if let Err(msg) = validate_tool_name(&tool.name, &tool.system) {
                 self.error("tool-name", &path, format!("tool `{}`: {msg}", tool.name));
+            }
+            let harness = crate::model::harness_tool_name(&tool.name);
+            match harness_names.get(&harness) {
+                Some(first) if *first != tool.name => {
+                    let msg = format!(
+                        "tools `{first}` and `{}` both map to harness name `{harness}`",
+                        tool.name
+                    );
+                    self.error("tool-harness-collision", &path, msg);
+                }
+                Some(_) => {}
+                None => {
+                    harness_names.insert(harness, &tool.name);
+                }
             }
         }
         Some(registry)
