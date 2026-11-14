@@ -5,11 +5,15 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use pmos_toolserver::audit::{AuditSink, JsonlAudit, TeeAudit};
 use pmos_toolserver::catalog::Catalog;
-use pmos_toolserver::config::Config;
+use pmos_toolserver::config::{Config, Connectors};
+use pmos_toolserver::connectors::atlassian::{Confluence, Jira};
 use pmos_toolserver::connectors::fake::FakeConnector;
+use pmos_toolserver::connectors::slack::Slack;
 use pmos_toolserver::connectors::Connector;
 use pmos_toolserver::context::load_docs;
+use pmos_toolserver::oauth::{OAuth, OAuthConfig, TokenSource};
 use pmos_toolserver::pg::PgStore;
+use pmos_toolserver::vault::Vault;
 use pmos_toolserver::{router, AppConfig, Stores, ToolService};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -58,12 +62,54 @@ async fn main() -> Result<()> {
         stores.audit = Arc::new(TeeAudit(vec![stores.audit.clone(), file]));
     }
 
-    let connectors: Vec<Arc<dyn Connector>> = vec![
-        Arc::new(FakeConnector::jira()),
-        Arc::new(FakeConnector::confluence()),
-        Arc::new(FakeConnector::slack()),
-    ];
-    tracing::warn!("serving fake Jira, Confluence and Slack connectors");
+    let (connectors, oauth): (Vec<Arc<dyn Connector>>, Option<Arc<OAuth>>) =
+        match &config.connectors {
+            Connectors::Fake => {
+                tracing::warn!("PMOS_CONNECTORS=fake: serving fixture Jira, Confluence and Slack");
+                (
+                    vec![
+                        Arc::new(FakeConnector::jira()),
+                        Arc::new(FakeConnector::confluence()),
+                        Arc::new(FakeConnector::slack()),
+                    ],
+                    None,
+                )
+            }
+            Connectors::Live(live) => {
+                let vault = Vault::new(live.vault_keys.clone(), stores.credentials.clone());
+                let oauth = Arc::new(OAuth::new(
+                    OAuthConfig {
+                        public_base_url: live.public_url.clone(),
+                        atlassian: Some(live.atlassian.clone()),
+                        atlassian_site: live.atlassian_site.clone(),
+                        slack: Some(live.slack.clone()),
+                        state_key: state_key(&config.service_token),
+                        endpoints: live.endpoints.clone(),
+                    },
+                    vault,
+                ));
+                let tokens: Arc<dyn TokenSource> = oauth.clone();
+                tracing::info!(
+                    public_url = %live.public_url,
+                    vault_key = %live.vault_keys.active_id(),
+                    "live connectors: every call acts with the PM's own token"
+                );
+                (
+                    vec![
+                        Arc::new(Jira::new(
+                            tokens.clone(),
+                            live.endpoints.atlassian_api.clone(),
+                        )),
+                        Arc::new(Confluence::new(
+                            tokens.clone(),
+                            live.endpoints.atlassian_api.clone(),
+                        )),
+                        Arc::new(Slack::new(tokens, live.endpoints.slack.clone())),
+                    ],
+                    Some(oauth),
+                )
+            }
+        };
 
     let skills = catalog.skills().count();
     let svc = ToolService::new(catalog, stores, connectors).map_err(anyhow::Error::msg)?;
@@ -73,6 +119,7 @@ async fn main() -> Result<()> {
             service_token: config.service_token.clone(),
             content_root: config.content_root.clone(),
             allowed_hosts: config.allowed_hosts.clone(),
+            oauth,
         },
         cancel.clone(),
     );
@@ -108,4 +155,14 @@ fn spawn_pruner(pg: PgStore, cancel: CancellationToken) {
             }
         }
     });
+}
+
+/// The key that signs OAuth `state`, derived from the service token so there is one fewer
+/// secret to manage. Rotating the service token invalidates sign-in links in flight.
+fn state_key(service_token: &str) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(service_token.as_bytes())
+        .expect("HMAC takes any key length");
+    mac.update(b"pmos-oauth-state-v1");
+    mac.finalize().into_bytes().to_vec()
 }

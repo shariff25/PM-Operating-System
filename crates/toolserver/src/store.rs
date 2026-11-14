@@ -9,6 +9,7 @@ use crate::audit::{AuditSink, MemoryAudit};
 use crate::context::{ContextIndex, MemoryIndex};
 use crate::memory::{InMemoryStore, MemoryStore};
 use crate::session::{MemorySessions, SessionRepo};
+use crate::vault::{CredentialStore, MemoryCredentials};
 
 /// A storage failure: the database is down, a query failed, or a row didn't decode.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -25,6 +26,8 @@ pub struct Stores {
     pub sessions: Arc<dyn SessionRepo>,
     pub approvals: Arc<dyn ApprovalRepo>,
     pub audit: Arc<dyn AuditSink>,
+    /// Sealed OAuth credentials; see `vault.rs`.
+    pub credentials: Arc<dyn CredentialStore>,
 }
 
 impl Stores {
@@ -38,6 +41,7 @@ impl Stores {
             sessions: Arc::new(MemorySessions::default()),
             approvals: Arc::new(MemoryApprovals::default()),
             audit: audit.clone(),
+            credentials: Arc::new(MemoryCredentials::default()),
         };
         (stores, audit)
     }

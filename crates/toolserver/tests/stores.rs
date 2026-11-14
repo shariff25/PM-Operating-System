@@ -19,6 +19,9 @@ use pmos_toolserver::context::{ContextDoc, MemoryIndex};
 use pmos_toolserver::memory::InMemoryStore;
 use pmos_toolserver::pg::PgStore;
 use pmos_toolserver::session::{token_hash, MemorySessions, Session};
+use pmos_toolserver::vault::{
+    Credential, KeyRing, MemoryCredentials, Provider, SealedCredential, Secret, Vault,
+};
 use pmos_toolserver::Stores;
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -78,6 +81,7 @@ impl Backend {
                 sessions: Arc::new(MemorySessions::default()),
                 approvals: Arc::new(MemoryApprovals::default()),
                 audit: audit.clone(),
+                credentials: Arc::new(MemoryCredentials::default()),
             },
             memory_audit: Some(audit),
             pg: None,
@@ -142,6 +146,8 @@ contract!(
     context_search_and_get,
     reindex_tracks_the_content_repo,
     audit_records_events,
+    credentials_are_per_user_and_provider,
+    vault_round_trips_through_the_store,
 );
 
 // ----- sessions ---------------------------------------------------------------------------
@@ -530,6 +536,97 @@ async fn audit_records_events(b: &Backend) {
         assert_eq!(outcomes, vec!["pending", "approved"]);
         let sources: Vec<String> = rows[0].get("sources");
         assert_eq!(sources, vec!["context/products/ccm.md", "jira:PM-101"]);
+    }
+}
+
+// ----- credentials ------------------------------------------------------------------------
+
+fn sealed(user: &str, provider: Provider, token: &str) -> SealedCredential {
+    SealedCredential {
+        user: user.into(),
+        provider,
+        key_id: "k1".into(),
+        access_token: format!("v1.k1.sealed-{token}"),
+        refresh_token: Some(format!("v1.k1.sealed-r-{token}")),
+        expires_at: Some(now()),
+        scopes: "read:jira-work".into(),
+        cloud_id: Some("cloud-1".into()),
+        site_url: Some("https://example.atlassian.net".into()),
+        external_id: None,
+        updated_at: now(),
+    }
+}
+
+async fn credentials_are_per_user_and_provider(b: &Backend) {
+    let c = b.stores.credentials.as_ref();
+    c.put(&sealed("ana", Provider::Atlassian, "a1"))
+        .await
+        .unwrap();
+    c.put(&sealed("ana", Provider::Slack, "s1")).await.unwrap();
+    c.put(&sealed("bo", Provider::Atlassian, "b1"))
+        .await
+        .unwrap();
+
+    let got = c.get("ana", Provider::Atlassian).await.unwrap().unwrap();
+    assert_eq!(got, sealed("ana", Provider::Atlassian, "a1"));
+    assert!(c.get("cy", Provider::Atlassian).await.unwrap().is_none());
+
+    // Reconnecting replaces the row.
+    c.put(&sealed("ana", Provider::Atlassian, "a2"))
+        .await
+        .unwrap();
+    let got = c.get("ana", Provider::Atlassian).await.unwrap().unwrap();
+    assert_eq!(got.access_token, "v1.k1.sealed-a2");
+
+    let providers: Vec<_> = c
+        .list("ana")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|x| x.provider)
+        .collect();
+    assert_eq!(providers, vec![Provider::Atlassian, Provider::Slack]);
+
+    assert!(c.delete("ana", Provider::Slack).await.unwrap());
+    assert!(!c.delete("ana", Provider::Slack).await.unwrap());
+    assert_eq!(c.list("ana").await.unwrap().len(), 1);
+    assert!(c.get("bo", Provider::Atlassian).await.unwrap().is_some());
+}
+
+async fn vault_round_trips_through_the_store(b: &Backend) {
+    let vault = Vault::new(
+        KeyRing::from_spec(&KeyRing::generate_spec("k1")).unwrap(),
+        b.stores.credentials.clone(),
+    );
+    let cred = Credential {
+        user: "ana".into(),
+        provider: Provider::Slack,
+        access_token: Secret::new("xoxp-plaintext-token"),
+        refresh_token: None,
+        expires_at: None,
+        scopes: "chat:write search:read.public".into(),
+        cloud_id: None,
+        site_url: None,
+        external_id: Some("U0ANA".into()),
+        updated_at: now(),
+    };
+    vault.put(&cred).await.unwrap();
+    assert_eq!(vault.get("ana", Provider::Slack).await.unwrap(), Some(cred));
+    let raw = b
+        .stores
+        .credentials
+        .get("ana", Provider::Slack)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!raw.access_token.contains("xoxp"));
+    if let Some(pg) = &b.pg {
+        let hits: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM credentials WHERE access_token LIKE '%xoxp%'")
+                .fetch_one(pg.pool())
+                .await
+                .unwrap();
+        assert_eq!(hits, 0, "no plaintext token in the database");
     }
 }
 
