@@ -16,22 +16,23 @@ use crate::generate::{generate, generated_dir_files, BotContext};
 use crate::openshell::{self, Endpoint, Policy};
 use crate::spec;
 use crate::{
-    provider_name, provider_owner, sandbox_name, Service, CONTENT_MOUNT, GATEWAY_ROUTES,
-    MCP_METHODS, MIN_NUMERIC_ID, RUN_AS, WORKER_BINARY, WORKSPACE,
+    provider_name, provider_owner, sandbox_name, Service, CONTENT_MOUNT, MCP_METHODS,
+    MIN_NUMERIC_ID, RUN_AS, WORKER_BINARY, WORKSPACE,
 };
 
 /// Every rule, with what it requires. Ids are stable: CI output and docs refer to them.
-pub const RULES: [(&str, &str); 22] = [
+pub const RULES: [(&str, &str); 23] = [
     (POLICY_PARSE, "The file is a valid OpenShell policy: YAML, known fields only, right types."),
     (POLICY_VERSION, "`version` is 1."),
-    (POLICY_MISSING, "Every bot has a policy and a launch spec, and both provider profiles exist."),
+    (POLICY_MISSING, "Every bot has a policy and a launch spec, and every provider profile exists."),
     (POLICY_STALE, "Each generated file is exactly what `pmos policy generate` writes."),
     (POLICY_ORPHAN, "No generated file is left for a bot that no longer exists."),
     (CONTENT_INVALID, "The content passes `pmos lint`, so policies can be generated."),
-    (NET_EGRESS, "Egress only to toolserver.pmos.internal:8710 and gateway.pmos.internal:8740: no other host, port, wildcard or IP range."),
-    (NET_INSPECTION, "Both endpoints are inspected (`mcp` on /mcp, `rest`) and enforced; no `tls: skip`, no access preset."),
+    (NET_EGRESS, "Egress only to toolserver.pmos.internal:8710, gateway.pmos.internal:8740 and bots.pmos.internal:8750: no other host, port, wildcard or IP range."),
+    (NET_INSPECTION, "Every endpoint is inspected (`mcp` on /mcp for the tool server, `rest` for the gateway and runtime) and enforced; no `tls: skip`, no access preset."),
     (NET_TOOLS, "MCP: only initialize, notifications/initialized, tools/list and tools/call, and tools/call only for the role's tools, by exact name."),
     (NET_GATEWAY_ROUTES, "Gateway: only POST /v1/chat/completions."),
+    (NET_RUNTIME_ROUTES, "Runtime: only POST /v1/worker/claim and POST /v1/worker/tasks/*/{heartbeat,events,trace,complete,fail}, exactly; no task, routine or notification routes."),
     (NET_BINARIES, "Only the worker binary may open connections."),
     (NET_MIDDLEWARE, "No network middleware."),
     (FS_WORKDIR, "`filesystem_policy` is present and `include_workdir` is false."),
@@ -39,8 +40,8 @@ pub const RULES: [(&str, &str); 22] = [
     (FS_READABLE, "Readable: OpenShell's system paths, the role's skills and the bot's master context (or paths inside them) only. No `..`."),
     (FS_LANDLOCK, "`landlock.compatibility` is `hard_requirement`, so a sandbox never runs without its filesystem rules."),
     (FS_UPLOADS, "The launch spec uploads only the role's skills and the bot's master context, each to a read-only path."),
-    (CRED_BINDING, "Each endpoint binds this bot's own provider for that service; no credential rewriting, signing or uninspected credentials."),
-    (CRED_PROVIDERS, "The launch spec attaches this bot's session and gateway providers and nothing else."),
+    (CRED_BINDING, "The gateway and runtime endpoints bind exactly this bot's own provider (`pmos-<bot>-gateway`, `pmos-<bot>-worker`); the tool-server endpoint binds none; no credential rewriting, signing or uninspected credentials."),
+    (CRED_PROVIDERS, "The launch spec attaches this bot's gateway and worker providers and nothing else."),
     (PROC_IDENTITY, "`run_as_user` and `run_as_group` are `sandbox` (or a numeric id of at least 1000); never root."),
     (SPEC_PARSE, "The launch spec is valid: known fields only."),
     (SPEC_IDENTITY, "The launch spec names its own bot, role, scope, sandbox, policy and the workspace as workdir."),
@@ -56,6 +57,7 @@ pub const NET_EGRESS: &str = "net-egress";
 pub const NET_INSPECTION: &str = "net-inspection";
 pub const NET_TOOLS: &str = "net-tools";
 pub const NET_GATEWAY_ROUTES: &str = "net-gateway-routes";
+pub const NET_RUNTIME_ROUTES: &str = "net-runtime-routes";
 pub const NET_BINARIES: &str = "net-binaries";
 pub const NET_MIDDLEWARE: &str = "net-middleware";
 pub const FS_WORKDIR: &str = "fs-workdir";
@@ -349,7 +351,12 @@ fn check_network(ctx: &BotContext, policy: &Policy, out: &mut Out) {
             check_binding(ctx, key, service, ep, out);
             match service {
                 Service::ToolServer => check_mcp(ctx, key, ep, out),
-                Service::Gateway => check_gateway(key, ep, out),
+                Service::Gateway => {
+                    check_routes(NET_GATEWAY_ROUTES, "gateway", key, service, ep, out)
+                }
+                Service::Runtime => {
+                    check_routes(NET_RUNTIME_ROUTES, "bot runtime", key, service, ep, out)
+                }
             }
         }
     }
@@ -455,7 +462,23 @@ fn check_inspection(key: &str, service: Service, ep: &Endpoint, out: &mut Out) {
 }
 
 fn check_binding(ctx: &BotContext, key: &str, service: Service, ep: &Endpoint, out: &mut Out) {
-    let expected = provider_name(&ctx.bot, service);
+    let Some(expected) = provider_name(&ctx.bot, service) else {
+        // The tool server: the per-task session token comes in the claim response, so no
+        // provider may be bound here (a static one would outlive the task).
+        if let Some(b) = &ep.credential_binding {
+            out.add(
+                CRED_BINDING,
+                format!(
+                    "rule `{key}` binds provider `{}` to {}:{}; the tool server takes only the per-task session token from the claim, so it binds no provider",
+                    b.provider,
+                    service.host(),
+                    service.port()
+                ),
+            );
+        }
+        check_loosened(key, ep, out);
+        return;
+    };
     match &ep.credential_binding {
         None => out.add(
             CRED_BINDING,
@@ -481,6 +504,11 @@ fn check_binding(ctx: &BotContext, key: &str, service: Service, ep: &Endpoint, o
             ),
         },
     }
+    check_loosened(key, ep, out);
+}
+
+/// Credential handling beyond the default `Authorization` placement.
+fn check_loosened(key: &str, ep: &Endpoint, out: &mut Out) {
     let loosened = [
         (
             ep.request_body_credential_rewrite,
@@ -583,24 +611,32 @@ fn check_mcp(ctx: &BotContext, key: &str, ep: &Endpoint, out: &mut Out) {
     }
 }
 
-fn check_gateway(key: &str, ep: &Endpoint, out: &mut Out) {
-    let allowed: Vec<String> = GATEWAY_ROUTES
-        .iter()
-        .map(|(m, p)| format!("{m} {p}"))
-        .collect();
+/// A REST endpoint's allow rules must each be one of the service's routes, exactly: same
+/// method, same path pattern (so `/v1/worker/**` or `*` instead of a route fails).
+fn check_routes(
+    rule_id: &'static str,
+    what: &str,
+    key: &str,
+    service: Service,
+    ep: &Endpoint,
+    out: &mut Out,
+) {
+    let routes = service.routes().unwrap_or_default();
+    let allowed: Vec<String> = routes.iter().map(|(m, p)| format!("{m} {p}")).collect();
     for rule in &ep.rules {
         let route = (
             rule.allow.method.as_deref().unwrap_or(""),
             rule.allow.path.as_deref().unwrap_or(""),
         );
-        if !GATEWAY_ROUTES.contains(&route) {
+        if !routes.contains(&route) {
             out.add(
-                NET_GATEWAY_ROUTES,
+                rule_id,
                 format!(
-                    "rule `{key}` allows `{} {}` on the gateway; only {} is allowed",
+                    "rule `{key}` allows `{} {}` on the {what}; only {} {} allowed",
                     route.0,
                     route.1,
-                    allowed.join(", ")
+                    allowed.join(", "),
+                    if allowed.len() == 1 { "is" } else { "are" }
                 ),
             );
         }
@@ -650,19 +686,16 @@ pub fn check_spec(
     }
 
     for p in &spec.providers {
-        match Service::ALL
-            .into_iter()
-            .find(|s| provider_name(&ctx.bot, *s) == p.name)
+        match Service::credentialed()
+            .find(|(s, _)| provider_name(&ctx.bot, *s).as_deref() == Some(p.name.as_str()))
         {
-            Some(s) => {
-                if p.profile != s.profile() || p.credential != s.credential_env() {
+            Some((_, c)) => {
+                if p.profile != c.profile || p.credential != c.env {
                     out.add(
                         CRED_PROVIDERS,
                         format!(
                             "provider `{}` must use profile `{}` and credential {}",
-                            p.name,
-                            s.profile(),
-                            s.credential_env()
+                            p.name, c.profile, c.env
                         ),
                     );
                 }
@@ -678,7 +711,7 @@ pub fn check_spec(
                 _ => out.add(
                     CRED_PROVIDERS,
                     format!(
-                        "attaches provider `{}`; a bot's sandbox gets only its own session and gateway providers",
+                        "attaches provider `{}`; a bot's sandbox gets only its own gateway and worker providers",
                         p.name
                     ),
                 ),
@@ -940,6 +973,14 @@ mod tests {
             .endpoints[0]
     }
 
+    fn rt(p: &mut Policy) -> &mut Endpoint {
+        &mut p
+            .network_policies
+            .get_mut("pmos_runtime")
+            .unwrap()
+            .endpoints[0]
+    }
+
     fn fs(p: &mut Policy) -> &mut crate::openshell::FilesystemPolicy {
         p.filesystem_policy.as_mut().unwrap()
     }
@@ -1193,6 +1234,65 @@ mod tests {
     }
 
     #[test]
+    fn net_runtime_routes_allows_only_the_worker_routes() {
+        let route = |m: &str, path: &str| AllowRule {
+            allow: Allow {
+                path: Some(path.into()),
+                ..Allow::method(m)
+            },
+        };
+        // A hand edit reading tasks or routines on 8750 fails.
+        for (m, path) in [
+            ("GET", "/v1/tasks"),
+            ("GET", "/v1/tasks/*"),
+            ("GET", "/v1/routines"),
+            ("POST", "/v1/routines"),
+            ("GET", "/v1/notifications"),
+            ("POST", "/v1/tasks"),
+            // Wider patterns than the exact routes.
+            ("POST", "/v1/worker/**"),
+            ("POST", "/v1/worker/tasks/**"),
+            ("*", "/v1/worker/claim"),
+            // A route's method changed.
+            ("GET", "/v1/worker/claim"),
+        ] {
+            let v = with(|p| rt(p).rules.push(route(m, path)));
+            only(&v, NET_RUNTIME_ROUTES);
+            assert!(v[0]
+                .message
+                .contains(&format!("`{m} {path}` on the bot runtime")));
+        }
+        // An access preset instead of rules is an inspection failure.
+        only(
+            &with(|p| rt(p).access = Some("read-write".into())),
+            NET_INSPECTION,
+        );
+        // The runtime only on 8750, and only inspected and enforced.
+        only(&with(|p| rt(p).port = Some(8751)), NET_EGRESS);
+        only(
+            &with(|p| rt(p).enforcement = Some("audit".into())),
+            NET_INSPECTION,
+        );
+        // Each generated route alone is fine; dropping routes is only stale.
+        assert_eq!(with(|p| rt(p).rules.truncate(1)), vec![]);
+    }
+
+    #[test]
+    fn nothing_else_may_be_reached_on_the_runtime_host() {
+        let v = with(|p| {
+            let mut extra = rt(p).clone();
+            extra.port = Some(8760);
+            p.network_policies
+                .get_mut("pmos_runtime")
+                .unwrap()
+                .endpoints
+                .push(extra);
+        });
+        only(&v, NET_EGRESS);
+        assert!(v[0].message.contains("bots.pmos.internal:8760"));
+    }
+
+    #[test]
     fn net_binaries_allows_only_the_worker() {
         let v = with(|p| {
             p.network_policies
@@ -1321,23 +1421,42 @@ mod tests {
 
     #[test]
     fn cred_binding_requires_this_bots_provider_for_each_service() {
-        only(&with(|p| gw(p).credential_binding = None), CRED_BINDING);
-        // This bot's own session token on the gateway is still the wrong credential.
-        let v = with(|p| {
-            gw(p).credential_binding = Some(CredentialBinding {
-                provider: "pmos-docs-session".into(),
+        let bind = |provider: &str| {
+            Some(CredentialBinding {
+                provider: provider.into(),
             })
-        });
+        };
+        only(&with(|p| gw(p).credential_binding = None), CRED_BINDING);
+        only(&with(|p| rt(p).credential_binding = None), CRED_BINDING);
+        // This bot's own worker token on the gateway is still the wrong credential.
+        let v = with(|p| gw(p).credential_binding = bind("pmos-docs-worker"));
         only(&v, CRED_BINDING);
         assert!(v[0]
             .message
             .contains("takes only this bot's `pmos-docs-gateway`"));
-        let v = with(|p| {
-            ts(p).credential_binding = Some(CredentialBinding {
-                provider: "atlassian".into(),
-            })
-        });
+        // Another bot's worker token on the runtime.
+        let v = with(|p| rt(p).credential_binding = bind("pmos-pm-ana-worker"));
         only(&v, CRED_BINDING);
+        assert!(v[0].message.contains("bot `pm-ana`'s credentials"));
+        // The tool server binds nothing: not a session provider, not this bot's own gateway
+        // token, nothing else.
+        for provider in ["pmos-docs-session", "pmos-docs-gateway", "atlassian"] {
+            let v = with(|p| ts(p).credential_binding = bind(provider));
+            only(&v, CRED_BINDING);
+            assert!(
+                v[0].message.contains("binds no provider"),
+                "{}",
+                v[0].message
+            );
+        }
+        only(
+            &with(|p| ts(p).request_body_credential_rewrite = true),
+            CRED_BINDING,
+        );
+        only(
+            &with(|p| rt(p).credential_signing = Some("sigv4".into())),
+            CRED_BINDING,
+        );
         only(
             &with(|p| gw(p).request_body_credential_rewrite = true),
             CRED_BINDING,
@@ -1418,13 +1537,24 @@ mod tests {
         };
         let v = spec_with(|s| {
             s.providers.push(attach(
-                "pmos-pm-ana-session",
-                "pmos-session",
-                "PMOS_SESSION_TOKEN",
+                "pmos-pm-ana-worker",
+                "pmos-worker",
+                "PMOS_WORKER_TOKEN",
             ))
         });
         only(&v, CRED_PROVIDERS);
         assert!(v[0].message.contains("bot `pm-ana`'s credentials"));
+        // There is no session provider any more: the session token comes in the claim.
+        only(
+            &spec_with(|s| {
+                s.providers.push(attach(
+                    "pmos-docs-session",
+                    "pmos-session",
+                    "PMOS_SESSION_TOKEN",
+                ))
+            }),
+            CRED_PROVIDERS,
+        );
         only(
             &spec_with(|s| s.providers.push(attach("my-slack", "slack", "SLACK_TOKEN"))),
             CRED_PROVIDERS,
