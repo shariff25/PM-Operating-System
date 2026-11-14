@@ -231,16 +231,21 @@ async fn header_session(
     state: &AppState,
     client: Client,
     headers: &axum::http::HeaderMap,
-) -> Result<crate::session::Session, Response> {
+) -> Result<crate::session::Session, Box<Response>> {
     let token = headers
         .get(SESSION_HEADER)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "missing X-Pmos-Session header"))?;
+        .ok_or_else(|| {
+            Box::new(error(
+                StatusCode::BAD_REQUEST,
+                "missing X-Pmos-Session header",
+            ))
+        })?;
     match state.svc.session(token, Utc::now()).await {
         Ok(Some(session)) if client_may_use(state, client, &session.skill) => Ok(session),
         // A session the client may not use looks the same as one that doesn't exist.
-        Ok(_) => Err(error(StatusCode::NOT_FOUND, "no such session")),
-        Err(e) => Err(unavailable(e)),
+        Ok(_) => Err(Box::new(error(StatusCode::NOT_FOUND, "no such session"))),
+        Err(e) => Err(Box::new(unavailable(e))),
     }
 }
 
@@ -302,7 +307,7 @@ async fn revoke_session(
 ) -> Response {
     let session = match header_session(&state, client, &headers).await {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match state.svc.revoke_session(&session.token).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -568,7 +573,7 @@ async fn call_tool(
 ) -> Response {
     let session = match header_session(&state, client, &headers).await {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match state
         .svc
