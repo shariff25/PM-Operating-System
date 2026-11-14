@@ -354,7 +354,14 @@ async fn decide(
             };
             error(status, e.to_string())
         }
-        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e @ DecisionError::InvalidArgs(_)) => error(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e @ (DecisionError::UnknownTool(_) | DecisionError::NotAllowed(_))) => {
+            error(StatusCode::CONFLICT, e.to_string())
+        }
+        Err(e @ DecisionError::Internal(_)) => {
+            tracing::error!(error = %e, "approved write task failed");
+            error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
     }
 }
 

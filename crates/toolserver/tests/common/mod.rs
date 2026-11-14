@@ -4,12 +4,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use pmos_toolserver::audit::MemoryAudit;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use pmos_toolserver::audit::{AuditEvent, AuditSink, MemoryAudit};
 use pmos_toolserver::catalog::Catalog;
 use pmos_toolserver::connectors::fake::FakeConnector;
 use pmos_toolserver::connectors::Connector;
 use pmos_toolserver::context::load_docs;
 use pmos_toolserver::pg::PgStore;
+use pmos_toolserver::store::{StoreError, StoreResult};
 use pmos_toolserver::{Stores, ToolService};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::Connection;
@@ -77,11 +80,30 @@ impl TestPg {
     }
 }
 
+/// An audit sink that can be switched off, to test that writes fail closed.
+pub struct SwitchAudit {
+    inner: Arc<dyn AuditSink>,
+    pub down: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl AuditSink for SwitchAudit {
+    async fn record(&self, event: AuditEvent) -> StoreResult<()> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(StoreError("audit log unreachable".into()));
+        }
+        self.inner.record(event).await
+    }
+}
+
 pub struct Fixture {
     pub _dir: TempDir,
     pub root: PathBuf,
     pub svc: Arc<ToolService>,
+    /// The stores behind `svc`, to set up states the service can't reach on its own.
+    pub stores: Stores,
     pub audit: Arc<MemoryAudit>,
+    pub audit_switch: Arc<SwitchAudit>,
     pub jira: Arc<FakeConnector>,
     pub confluence: Arc<FakeConnector>,
     pub slack: Arc<FakeConnector>,
@@ -153,10 +175,15 @@ fn build(dir: TempDir, root: PathBuf, stores: Stores, audit: Arc<MemoryAudit>) -
 fn build_with(
     dir: TempDir,
     root: PathBuf,
-    stores: Stores,
+    mut stores: Stores,
     audit: Arc<MemoryAudit>,
     team: Option<Arc<pmos_toolserver::team::Team>>,
 ) -> Fixture {
+    let audit_switch = Arc::new(SwitchAudit {
+        inner: stores.audit.clone(),
+        down: AtomicBool::new(false),
+    });
+    stores.audit = audit_switch.clone();
     let catalog = Catalog::load(&root, now().date_naive()).expect("fixture content lints");
     let jira = Arc::new(FakeConnector::jira());
     let confluence = Arc::new(FakeConnector::confluence());
@@ -167,7 +194,7 @@ fn build_with(
         slack.clone(),
         Arc::new(FakeConnector::docs()),
     ];
-    let mut svc = ToolService::new(catalog, stores, connectors).unwrap();
+    let mut svc = ToolService::new(catalog, stores.clone(), connectors).unwrap();
     if let Some(team) = team {
         svc = svc.with_team(team);
     }
@@ -175,7 +202,9 @@ fn build_with(
         _dir: dir,
         root,
         svc: Arc::new(svc),
+        stores,
         audit,
+        audit_switch,
         jira,
         confluence,
         slack,

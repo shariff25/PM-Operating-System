@@ -426,8 +426,8 @@ impl ApprovalRepo for PgStore {
     ) -> Result<ApprovalItem, DecideError> {
         let (status, args) = match decision {
             Decision::Reject => (Status::Rejected, None),
-            Decision::Approve => (Status::Approved, None),
-            Decision::Edit => (Status::Approved, edited_args),
+            Decision::Approve => (Status::Executing, None),
+            Decision::Edit => (Status::Executing, edited_args),
         };
         let missing_args = decision == Decision::Edit && args.is_none();
         if !missing_args {
@@ -481,8 +481,8 @@ impl ApprovalRepo for PgStore {
         };
         let sql = format!(
             "UPDATE approvals
-             SET result = $2, status = CASE WHEN $3 THEN 'failed' ELSE status END
-             WHERE id = $1
+             SET result = $2, status = CASE WHEN $3 THEN 'failed' ELSE 'approved' END
+             WHERE id = $1 AND status = 'executing'
              RETURNING {ITEM_COLUMNS}"
         );
         let row = sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -492,6 +492,19 @@ impl ApprovalRepo for PgStore {
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(item_from_row).transpose()
+    }
+
+    async fn stuck(&self, before: DateTime<Utc>) -> StoreResult<Vec<ApprovalItem>> {
+        let sql = format!(
+            "SELECT {ITEM_COLUMNS} FROM approvals
+             WHERE status = 'executing' AND decided_at <= $1
+             ORDER BY decided_at"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(before)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(item_from_row).collect()
     }
 }
 

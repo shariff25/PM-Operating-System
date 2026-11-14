@@ -133,8 +133,19 @@ async fn main() -> Result<()> {
     let svc = ToolService::new(catalog, stores, connectors)
         .map_err(anyhow::Error::msg)?
         .with_team(team.clone());
+    let svc = Arc::new(svc);
+    // One replica: anything still `executing` from a previous process was interrupted.
+    match svc.reconcile(chrono::Duration::zero(), Utc::now()).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            items = n,
+            "approved writes interrupted by a restart marked failed (outcome unknown)"
+        ),
+        Err(e) => tracing::error!(error = %e, "reconciling interrupted writes failed"),
+    }
+    spawn_reconciler(svc.clone(), cancel.clone());
     let app = router(
-        Arc::new(svc),
+        svc,
         AppConfig {
             service_token: config.service_token.clone(),
             bot: config.bot_token.clone().map(|token| BotAccess {
@@ -174,6 +185,24 @@ fn spawn_pruner(pg: PgStore, cancel: CancellationToken) {
                 _ = tick.tick() => {
                     if let Err(e) = pg.prune(Utc::now()).await {
                         tracing::warn!(error = %e, "pruning expired sessions and grants failed");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Writes still `executing` after 10 minutes are stuck (connector calls time out long
+/// before that): mark them failed, outcome unknown.
+fn spawn_reconciler(svc: Arc<ToolService>, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(PRUNE_EVERY);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    if let Err(e) = svc.reconcile(chrono::Duration::minutes(10), Utc::now()).await {
+                        tracing::warn!(error = %e, "reconciling stuck writes failed");
                     }
                 }
             }

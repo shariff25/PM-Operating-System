@@ -96,6 +96,12 @@ pub enum DecisionError {
     Decide(#[from] DecideError),
     #[error("tool `{0}` is no longer served")]
     UnknownTool(String),
+    #[error("the item's skill no longer declares `{0}`")]
+    NotAllowed(String),
+    #[error("invalid arguments: {0}")]
+    InvalidArgs(String),
+    #[error("the write task failed: {0}")]
+    Internal(String),
 }
 
 impl From<StoreError> for DecisionError {
@@ -495,6 +501,22 @@ impl ToolService {
             .take_grant(&key, &spec.name, args, now)
             .await?
         {
+            // Fail closed: the write runs only once the audit log has recorded it starting.
+            let started = AuditEvent {
+                outcome: Outcome::Started,
+                detail: Some("approved in the harness; writing".into()),
+                ..event.clone()
+            };
+            if let Err(e) = self.stores.audit.record(started).await {
+                tracing::error!(error = %e, tool = %spec.name, "AUDIT UNAVAILABLE: approved write not run");
+                // The grant was used up; put it back so the PM needn't approve again.
+                let _ = self
+                    .stores
+                    .approvals
+                    .add_grant(&key, &spec.name, args, now)
+                    .await;
+                return Err(ToolError::Unavailable(e.0));
+            }
             let written = self
                 .execute_write(
                     Caller {
@@ -543,7 +565,18 @@ impl ToolService {
         args: &Value,
     ) -> Result<Value, ToolError> {
         let connector = self.connector(&spec.system)?;
-        let written = connector.write(caller, spec.action(), args).await?;
+        let written = connector
+            .write(caller, spec.action(), args)
+            .await
+            .map_err(|e| match e {
+                // A timeout or a 5xx after sending: the write may have happened. Saying
+                // "unavailable" would invite a retry and a duplicate.
+                ConnectorError::Unavailable(detail) => ToolError::Connector(format!(
+                    "{system} didn't confirm the write ({detail}). It may or may not have happened: check {system} before trying again, and don't retry automatically.",
+                    system = spec.system
+                )),
+                other => other.into(),
+            })?;
         Ok(json!({
             "status": "done",
             "system": written.system,
@@ -612,16 +645,35 @@ impl ToolService {
         self.stores.approvals.get(id).await
     }
 
-    /// A person's decision on an inbox item. Approve and edit run the write as the item's
-    /// user; reject closes it.
+    /// Decide an inbox item as `decided_by`. Approve and edit run the write as the item's
+    /// user; edited arguments are checked like any call's, and the skill must still declare
+    /// the tool.
+    ///
+    /// The write runs in its own task, so a caller that disconnects can't cancel it halfway,
+    /// and every way out of here is audited. The item is `executing` while the write runs;
+    /// if the process dies then, [`ToolService::reconcile`] resolves it on the next start.
     pub async fn decide(
-        &self,
+        self: &Arc<Self>,
         id: &str,
         decided_by: &str,
         decision: Decision,
         edited_args: Option<Value>,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecisionError> {
+        // Check the write is still allowed before changing anything. Ownership and status
+        // are checked again, atomically, by the store.
+        if decision != Decision::Reject {
+            if let Some(current) = self.stores.approvals.get(id).await? {
+                if current.user == decided_by && current.status == Status::Pending {
+                    let spec = self.write_spec(&current)?;
+                    if decision == Decision::Edit {
+                        let args = edited_args.as_ref().ok_or(DecideError::MissingArgs)?;
+                        check_args(&spec.input_schema, args).map_err(DecisionError::InvalidArgs)?;
+                    }
+                }
+            }
+        }
+
         let item = match self
             .stores
             .approvals
@@ -652,7 +704,7 @@ impl ToolService {
             }
         };
 
-        let mut event = AuditEvent {
+        let event = AuditEvent {
             client: Client::Orchestrator,
             at: now,
             run_id: item.run_id.clone(),
@@ -670,12 +722,63 @@ impl ToolService {
             return Ok(item);
         }
 
+        let this = self.clone();
+        tokio::spawn(async move { this.run_approved(item, event).await })
+            .await
+            .map_err(|e| DecisionError::Internal(e.to_string()))?
+    }
+
+    /// The tool for an inbox item, if the item's skill may still run it.
+    fn write_spec(&self, item: &ApprovalItem) -> Result<ToolSpec, DecisionError> {
         let spec = self
             .catalog
             .tools()
             .find(|t| t.name == item.tool)
             .cloned()
             .ok_or_else(|| DecisionError::UnknownTool(item.tool.clone()))?;
+        let declared = self
+            .catalog
+            .skill(&item.skill)
+            .is_some_and(|s| s.tools.contains(&spec.name));
+        if !declared {
+            return Err(DecisionError::NotAllowed(item.tool.clone()));
+        }
+        Ok(spec)
+    }
+
+    /// Run an approved (`executing`) item's write and store the outcome.
+    async fn run_approved(
+        &self,
+        item: ApprovalItem,
+        mut event: AuditEvent,
+    ) -> Result<ApprovalItem, DecisionError> {
+        let finish = |result: Result<Value, String>| {
+            let id = item.id.clone();
+            async move { self.stores.approvals.complete(&id, result).await }
+        };
+        // Checked before the decision; this catches a catalog that changed in between.
+        let spec = match self.write_spec(&item) {
+            Ok(spec) => spec,
+            Err(e) => {
+                event.outcome = Outcome::Error;
+                event.detail = Some(e.to_string());
+                self.audit(event).await;
+                let _ = finish(Err(e.to_string())).await;
+                return Err(e);
+            }
+        };
+        // Fail closed: no write runs unless the audit log has recorded that it is starting.
+        let started = AuditEvent {
+            outcome: Outcome::Started,
+            detail: Some("approved in the inbox; writing".into()),
+            ..event.clone()
+        };
+        if let Err(e) = self.stores.audit.record(started).await {
+            tracing::error!(error = %e, id = %item.id, "AUDIT UNAVAILABLE: approved write not run");
+            let _ = finish(Err("PM OS couldn't record the write in the audit log, so it didn't run. Approve it again shortly.".into())).await;
+            return Err(DecisionError::Decide(DecideError::Store(e)));
+        }
+
         let result = self
             .execute_write(
                 Caller {
@@ -698,8 +801,56 @@ impl ToolService {
                 Err(e.to_string())
             }
         };
-        let done = self.stores.approvals.complete(&item.id, outcome).await?;
+        let stored = finish(outcome).await;
+        if stored.is_err() {
+            let note = "outcome not saved to the inbox; the reconciler will mark it";
+            event.detail = Some(match event.detail.take() {
+                Some(d) => format!("{d}; {note}"),
+                None => note.to_string(),
+            });
+        }
+        // The outcome is audited even when storing it failed.
         self.audit(event).await;
-        Ok(done.unwrap_or(item))
+        Ok(stored?.unwrap_or(item))
+    }
+
+    /// Resolve writes left `executing` for longer than `older_than` (the process died
+    /// mid-write). Their outcome is unknown, so they become `failed` with a note to check the
+    /// target system before trying again; nothing is retried automatically. Returns how many.
+    pub async fn reconcile(
+        &self,
+        older_than: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<usize, StoreError> {
+        let stuck = self.stores.approvals.stuck(now - older_than).await?;
+        for item in &stuck {
+            let system = item.tool.split('.').next().unwrap_or("the system");
+            let message = format!(
+                "PM OS stopped before confirming this write. It may or may not have happened: check {system} before trying again."
+            );
+            if self
+                .stores
+                .approvals
+                .complete(&item.id, Err(message.clone()))
+                .await?
+                .is_some()
+            {
+                self.audit(AuditEvent {
+                    client: Client::Orchestrator,
+                    at: now,
+                    run_id: item.run_id.clone(),
+                    user: item.user.clone(),
+                    skill: item.skill.clone(),
+                    tool: item.tool.clone(),
+                    outcome: Outcome::Error,
+                    sources: Vec::new(),
+                    args_hash: Some(item.args_hash.clone()),
+                    output_ref: Some(item.id.clone()),
+                    detail: Some(format!("outcome unknown: {message}")),
+                })
+                .await;
+            }
+        }
+        Ok(stuck.len())
     }
 }
