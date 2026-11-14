@@ -94,12 +94,9 @@ fn new_token() -> String {
 }
 
 /// A user handle: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit.
-/// Matches the harness's check, so a handle can never escape `master/people/`.
+/// The same rule as the harness and `team.yaml`, so a handle can never escape `master/people/`.
 pub fn valid_handle(user: &str) -> bool {
-    let mut chars = user.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
-        && user.len() <= 64
+    pmos_contract::model::valid_handle(user)
 }
 
 #[cfg(test)]

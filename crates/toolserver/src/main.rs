@@ -7,6 +7,7 @@ use pmos_toolserver::audit::{AuditSink, JsonlAudit, TeeAudit};
 use pmos_toolserver::catalog::Catalog;
 use pmos_toolserver::config::{Config, Connectors};
 use pmos_toolserver::connectors::atlassian::{Confluence, Jira};
+use pmos_toolserver::connectors::docs::Docs;
 use pmos_toolserver::connectors::fake::FakeConnector;
 use pmos_toolserver::connectors::slack::Slack;
 use pmos_toolserver::connectors::Connector;
@@ -71,6 +72,7 @@ async fn main() -> Result<()> {
                         Arc::new(FakeConnector::jira()),
                         Arc::new(FakeConnector::confluence()),
                         Arc::new(FakeConnector::slack()),
+                        Arc::new(FakeConnector::docs()),
                     ],
                     None,
                 )
@@ -105,6 +107,7 @@ async fn main() -> Result<()> {
                             live.endpoints.atlassian_api.clone(),
                         )),
                         Arc::new(Slack::new(tokens, live.endpoints.slack.clone())),
+                        Arc::new(Docs::new(live.docs_url.clone(), live.docs_token.expose())),
                     ],
                     Some(oauth),
                 )

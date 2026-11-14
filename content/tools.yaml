@@ -78,3 +78,13 @@ tools:
     system: slack
     kind: write
     description: Send a message as the PM to a channel or person
+
+  # Acme support docs (public; served by the pmos-docs MCP server)
+  - name: docs.search
+    system: docs
+    kind: read
+    description: Search the public Acme support documentation (support.acme.com)
+  - name: docs.read
+    system: docs
+    kind: read
+    description: Read one support page as markdown, by the url a search returned

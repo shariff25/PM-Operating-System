@@ -44,6 +44,7 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | `POST /mcp` (Streamable HTTP) | `Bearer <session token>` | MCP for the harness: `tools/list`, `tools/call` |
 | `POST /internal/sessions` `{user, skill, run_id, ttl_minutes?}` | service token | Create a session; returns `token` and the session's tools |
 | `DELETE /internal/sessions/{token}` | service token | Revoke a session (sandbox ended) |
+| `POST /internal/sessions/{token}/call` `{tool, args}` | service token | One tool call for the session, with the same rules as MCP: allowlist, argument checks, approvals for writes, audit. For the Slack bot and orchestrator. |
 | `POST /internal/grants` `{session_token, tool, args}` | service token | Record an approval given in the harness |
 | `GET /internal/approvals?user=&status=` | service token | A PM's inbox, newest first |
 | `GET /internal/approvals/{id}` | service token | One item |
@@ -77,6 +78,7 @@ they could in the product itself.
 | Jira | Atlassian OAuth 2.0 (3LO), via `api.atlassian.com/ex/jira/{cloudid}` | `GET /rest/api/3/search/jql`, `GET /rest/api/3/issue/{key}`, `POST /rest/api/3/issue` (description in Atlassian Document Format) |
 | Confluence | same token, via `api.atlassian.com/ex/confluence/{cloudid}` | `GET /wiki/rest/api/search?cql=`, `GET /wiki/api/v2/pages/{id}`, `GET /wiki/api/v2/spaces?keys=`, `POST /wiki/api/v2/pages` (always `status: draft`), `PUT /wiki/api/v2/pages/{id}` (version + 1) |
 | Slack | the PM's user token (`xoxp`), never a bot token | `assistant.search.context` (Real-time Search; results are never stored), `conversations.replies`, `chat.postMessage` |
+| Support docs | none (public docs); the tool server's `PMOS_DOCS_TOKEN` to `pmos-docs` | `search_docs`, `get_doc` over MCP; see `docs/docs-server.md` |
 
 These API shapes were checked against developer.atlassian.com and docs.slack.dev in November
 2026, and tested against local mocks (`tests/live_connectors.rs`). The first real call

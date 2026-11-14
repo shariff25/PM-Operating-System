@@ -6,7 +6,7 @@ metadata:
   version: "0.1.0"
   model: "default"
   data-class: "restricted"
-  tools: "context.search context.read confluence.search confluence.read jira.search jira.read"
+  tools: "context.search context.read confluence.search confluence.read jira.search jira.read docs.search docs.read"
   surfaces: "slack web cli"
   ships-in: "phase-0"
 ---
@@ -19,7 +19,8 @@ Answer the PM's question from the team's own sources.
 1. Restate the question to yourself in one line. If it is ambiguous in a way that changes the
    answer, ask one clarifying question and stop.
 2. Search the context library first (`context.search`), then Confluence and Jira if the
-   context library does not answer it. Read the most relevant two to five results in full.
+   context library does not answer it. For how-to and configuration questions about Acme
+   products, also search the public support docs (`docs.search`). Read the most relevant two to five results in full.
 3. Answer in at most five sentences or one short table. Lead with the direct answer.
 4. Cite every factual claim inline as `[source](link)`. Claims you cannot cite get
    `[unverified]`.

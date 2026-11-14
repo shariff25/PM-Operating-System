@@ -153,6 +153,8 @@ async fn draft_waits_for_approval_then_lands() {
             "confluence_search",
             "context_read",
             "context_search",
+            "docs_read",
+            "docs_search",
             "jira_read",
             "jira_search",
         ]
@@ -323,7 +325,7 @@ async fn draft_lands_with_postgres_stores() {
             .unwrap()
             .tools
             .len(),
-        7
+        9
     );
 
     // Context search runs on Postgres full-text search.

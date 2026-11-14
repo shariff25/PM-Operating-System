@@ -14,6 +14,7 @@ content/
   context/<domain>/*.md              context library
   reviewers/*.md                     reviewer personas
   templates/*.md                     document templates
+  team.yaml                          who may use PM OS (optional)
 ```
 
 `README.md` files are documentation and are never linted as content.
@@ -121,6 +122,22 @@ The body is the rubric. `/review` runs each chosen persona as a parallel sub-age
 the findings by severity: blocker, major or minor (REV-1, REV-2).
 
 Rules: `reviewer-parse`, `reviewer-flags`, `reviewer-body-empty`.
+
+## Team: `team.yaml`
+
+Who may use PM OS until SSO replaces this file (Phase 1). It's optional; without it nobody can
+use the Slack bot.
+
+```yaml
+members:
+  - handle: ana            # PM OS handle; matches master/people/<handle>/ if present
+    slack-id: U012AB3CD    # Slack member id (U… or W…)
+    roles: [pm, skill-author]   # pm | skill-author | admin (admin = platform owner)
+```
+
+Rules: `team-parse`, `team-handle`, `team-slack-id`, `team-duplicate` (a handle or Slack id
+listed twice), `team-roles` (no roles), `people-unknown` (warning: a `master/people/` folder
+for someone not on the team).
 
 ## Templates: `templates/*.md`
 

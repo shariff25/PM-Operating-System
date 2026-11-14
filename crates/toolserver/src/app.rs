@@ -72,6 +72,7 @@ pub fn router(svc: Arc<ToolService>, config: AppConfig, cancel: CancellationToke
     let internal = Router::new()
         .route("/sessions", post(create_session))
         .route("/sessions/{token}", axum::routing::delete(revoke_session))
+        .route("/sessions/{token}/call", post(call_tool))
         .route("/grants", post(create_grant))
         .route("/approvals", get(list_approvals))
         .route("/approvals/{id}", get(get_approval))
@@ -420,5 +421,43 @@ async fn revoke_credential(
         }
         Ok(false) => error(StatusCode::NOT_FOUND, "no such linked account"),
         Err(e) => unavailable(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ToolCall {
+    tool: String,
+    #[serde(default)]
+    args: Value,
+}
+
+/// Run one tool call for a session, for trusted internal callers (the Slack bot, the
+/// orchestrator). The same rules as MCP apply: the skill's allowlist, argument checks,
+/// approvals for writes and the audit log.
+async fn call_tool(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    Json(body): Json<ToolCall>,
+) -> Response {
+    let now = Utc::now();
+    let session = match state.svc.session(&token, now).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "no such session"),
+        Err(e) => return unavailable(e),
+    };
+    match state.svc.call(&session, &body.tool, body.args, now).await {
+        Ok(result) => Json(json!({ "result": result })).into_response(),
+        Err(e) => {
+            let status = match &e {
+                ToolError::UnknownTool(_) | ToolError::NotAllowed(_) | ToolError::Forbidden(_) => {
+                    StatusCode::FORBIDDEN
+                }
+                ToolError::InvalidArgs(_) => StatusCode::BAD_REQUEST,
+                ToolError::NotFound(_) => StatusCode::NOT_FOUND,
+                ToolError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+                ToolError::Connector(_) => StatusCode::BAD_GATEWAY,
+            };
+            error(status, e.to_string())
+        }
     }
 }
