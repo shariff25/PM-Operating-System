@@ -12,12 +12,13 @@ Decisions already made in this conversation:
 - **Open-weight models only, no frontier API.** Qwen3.6-35B-A3B is the default model and Nemotron 3 Nano 30B-A3B handles extraction and triage, both on vLLM. The bake-off adds Qwen 3.5 122B and gpt-oss-120b as challengers.
 - **Harness: LangChain Deep Agents (`deepagents` 1.16.5, MIT, TypeScript) for the team service; Hermes on NemoClaw for personal agents.**
 - **Context layer:** markdown in git (`content/`), indexed into Postgres (pgvector + full-text search) on merge, served only through the Rust tool server's MCP tools. Memory also lives in Postgres and is exposed to the harness as `/memories/*.md`. There is no Letta, Mem0, Graphiti or Cognee in v1.
+- **The Slack bot is the interface** (decided 2026-11-14). PMs tag it in any thread, chat with it in Slack's assistant panel, run skills with slash commands, and approve in Slack. There is no web workspace. Platform-owner PMs get a few small admin pages (audit search, sandbox policies, usage) and the `pmos` CLI. See **Interface: the PM OS Slack bot** below.
 
 ## Architecture
 ```
-Slack app (Rust) ─┐
-Web (TS, Ph2) ────┼─► orchestrator (Rust: queue, sandbox launcher) ─► OpenShell sandbox per session
-CLI pmos (Rust) ──┘                                                     └─ harness (TS, deepagents)
+Slack bot (Rust) ──┐  ← the PMs' interface: mentions, assistant panel, slash commands, approvals
+CLI pmos (Rust) ───┼─► orchestrator (Rust: queue, sandbox launcher) ─► OpenShell sandbox per session
+Admin pages (Ph2) ─┘  ← platform-owner PMs only                         └─ harness (TS, deepagents)
                                                                            ├─ MCP ─► toolserver (Rust): connectors, context, memory, approvals, audit ─► Postgres
                                                                            └─ HTTP ─► gateway (Rust): open-weight routing, priority queue ─► vLLM
 ```
@@ -28,14 +29,58 @@ The sandbox network policy allows only the tool server and the gateway. All writ
 content/   master/AGENTS.md, master/people/<handle>/AGENTS.md, context/<domain>/*.md,
            skills/<name>/SKILL.md, reviewers/*.md, templates/*.md, tools.yaml
 policies/  team-session.yaml, personal-agent.yaml, scheduled-job.yaml
-crates/    contract (types + lint), cli (pmos), toolserver, gateway, orchestrator, slack, policy-check
+crates/    contract (types + lint), cli (pmos), toolserver, gateway, orchestrator,
+           slack (the bot), policy-check
 harness/   TS deepagents runner
-web/       TS React + Vite (Phase 2)
+admin/     a few server-rendered admin pages, served by the orchestrator (Phase 2)
 evals/     golden tasks per skill, bake-off, load test
 docs/      implementation-plan.md, contract.md
 ```
 Rust: Cargo workspace using axum, sqlx, rmcp, clap, serde, chrono and slack-morphism. Each crate is checked for maintenance before it is added.
-TypeScript: pnpm workspace with `harness/` now and `web/` in Phase 2.
+TypeScript: pnpm workspace with `harness/`. No frontend app.
+
+## Interface: the PM OS Slack bot
+
+PMs already live in Slack, so PM OS works there like a teammate you can tag, much like
+chat-native bots on other platforms. Unlike those bots, it never posts in public by itself:
+an answer is first shown only to the person who asked, and it is posted, as that PM, only
+when they click.
+
+### How PMs use it
+| Entry point | What happens | Slack API |
+| --- | --- | --- |
+| **Tag it in a thread:** `@PM OS does DSM support SAML SSO?` | Reads the thread and searches the context library, Jira, Confluence and Slack as the asker. Replies with a cited answer **visible only to the asker**, with buttons: **Post to thread**, **Edit**, **Discard**. | `app_mention` event, `chat.postEphemeral` |
+| **Assistant panel** (Slack's AI-app side panel, next to any conversation) | A private chat with PM OS: questions, skills, follow-ups. Shows "Searching Jira…" status and streams answers. Suggests skills as one-tap prompts. | `assistant_thread_started`, `assistant.threads.setStatus`, `assistant.threads.setSuggestedPrompts`, `chat.startStream` |
+| **DM the bot** | Same as the panel, for clients without it. | `message.im` |
+| **Slash commands:** `/prd-draft`, `/meeting-notes`, `/review`, `/ask` … | Runs the skill. Long jobs reply in the thread when done (SUR-1), with a link to the Confluence draft. | slash commands |
+| **App Home tabs:** Inbox, Skills, Accounts | **Inbox:** pending approvals, approved or discarded in a batch (SLK-10). **Skills:** the catalog (SKL-3). **Accounts:** link or unlink Jira, Confluence and Slack. | `app_home_opened`, `views.publish` |
+| **Reply assistant** (SLK-1 to SLK-12) | Questions aimed at the PM get a drafted reply in a DM review card: Approve, Edit, Snooze, Reject. | Events API, Block Kit |
+
+### Rules the bot keeps
+- **Nothing is posted without a click.** **Post to thread** or **Approve** is the approval (OUT-4, SLK-5).
+  - The orchestrator records the decision as a tool-server grant, and the post goes out with the PM's own Slack user token, marked "Drafted with PM OS" (SLK-7).
+  - There is no auto-send setting.
+- **The audience check runs on Post** (SLK-6). A draft citing Restricted sources is blocked in channels where some members lack access. External (Slack Connect) channels need a second confirmation.
+- **Only PM OS users can invoke it.**
+  - The Slack user is mapped to a PM OS user at SSO onboarding, and reads use that PM's linked accounts.
+  - Anyone else who tags it gets a private note saying who to ask. Readers (PMM, SEs, engineering leads) come in Phase 3.
+- **The bot token is only for plumbing:** receiving events, private replies, review cards, modals and App Home. It never reads channels for answers and never posts visible messages.
+- **Ephemeral replies don't last** (they're gone on reload), so every draft is also an Inbox item until it is posted or discarded.
+- **Connection:** Socket Mode, so the Spark needs no inbound connection from Slack. The OAuth callback only needs to be reachable from PMs' browsers on the internal network.
+
+### Where each web-workspace requirement now lives
+| PRD requirement | Now |
+| --- | --- |
+| WEB-1 chat home | Assistant panel and DM |
+| WEB-2 approval cards inline | Ephemeral answer with buttons; DM review cards; Inbox tab |
+| WEB-3 plain request suggests a skill | Suggested prompts and skill buttons on the answer |
+| WEB-4 chats per user, deletable, logged | Assistant threads are per user. `/pmos forget` deletes PM OS's own copy; Slack's copy follows the workspace retention policy. Every turn is still audited (ADM-2). |
+| SUR-3 web workspace | Replaced by the bot, App Home and the admin pages |
+| SLK-10 inbox view | App Home Inbox tab |
+| SKL-3 catalog | App Home Skills tab; publishing stays by pull request (SKL-4) |
+| REV-3 accept or dismiss reviewer comments | Buttons on each `/review` finding |
+| MOD-2 personal agent | `/pmos agent start`, `stop` and `status` |
+| ADM-2 audit search, ADM-4 usage, POL-1 to 6 policies | Admin pages (read and search), `pmos audit` and `pmos policy` CLI. Policy changes are edited in git and reviewed by a second platform-owner PM, so there is no form editor (a change from POL-2). |
 
 ## Phases
 
@@ -82,8 +127,13 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
 **Gate 1:** evals pass, the load test meets targets, and the sandbox red-team passes.
 
 ### Phase 1: Pilot (weeks 4–7), 2–3 champion PMs → Gate 2
-- SSO and the three roles: PM, skill author, admin (ADM-1).
-- The Slack bot, with DMs, slash commands and replies in thread (SUR-1).
+- SSO and the three roles: PM, skill author, admin (ADM-1). Slack users are mapped to PM OS users at onboarding.
+- **The Slack bot** (`crates/slack`, Socket Mode), the pilot's interface:
+  - tag-to-ask with private answers and **Post to thread**;
+  - the assistant panel with streaming and status;
+  - DMs and slash commands, with long jobs replying in thread (SUR-1);
+  - the App Home Inbox and Accounts tabs.
+- Account linking from Slack: the Accounts tab and first-use prompts start the OAuth flows the tool server already has.
 - The `pmos` CLI running the same skills (SUR-2).
 - The remaining launch skills: `/review` (parallel sub-agents, one critique grouped by severity), `/call-synth`, `/competitive-brief`, `/release-notes` and `/status-update`.
 - The Slack reply assistant, SLK-1 to SLK-8: triage, grounded drafts, an approval card, an audience check, and a 24-hour expiry that deletes stored Slack content.
@@ -92,19 +142,26 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
 **Gate 2:** champions use it weekly, with no guardrail incident.
 
 ### Phase 2: Team launch (weeks 8–12) → Gate 3
-- Web workspace in TypeScript with React and Vite: chat home, inbox, reviews, skills, scheduled jobs, policy view and audit log (WEB-1 to 4, SUR-3).
-- API types generated from the Rust OpenAPI spec.
+- **The bot, the rest of the way:**
+  - the App Home Skills tab and suggested-skill prompts (WEB-3, SKL-3);
+  - reviewer accept and dismiss buttons (REV-3);
+  - `/pmos forget`;
+  - personal-agent commands (MOD-2).
+- **Admin pages for platform-owner PMs**, server-rendered by the orchestrator behind SSO. There is no frontend build. They cover:
+  - audit search with CSV export (ADM-2);
+  - usage: weekly active PMs, runs per skill, queue time, reviewer acceptance (ADM-4);
+  - sandbox policies and the running sandboxes, read-only, plus recreate and revoke actions (POL-1, POL-4 to 6).
+- `pmos audit` and `pmos policy` CLI commands.
 - Skill catalog and skill publishing by pull request (SKL-3/4), plus `/new-skill`.
 - Memory (MEM-1/2), scheduled jobs and digests (SKL-5, SLK-9).
-- Reviewer accept and dismiss (REV-3).
-- Policy portal (POL-1 to 6) and usage dashboard (ADM-4).
 - Personal-agent blueprint on Hermes/NemoClaw, with contract tests (MOD-2 to 6).
 - Team-launch skills: `/poc-plan`, `/partner-brief`, `/advisory-draft`, `/jira-draft` and `/launch-checklist`.
 
 **Gate 3:** at least 80% of PMs active weekly, and the success metrics are on track.
 
 ### Phase 3: Expand (week 13 on)
-- Readers: PMM, SEs and engineering leads.
+- Readers: PMM, SEs and engineering leads can tag the bot for context-library answers, read-only.
+- A web workspace, only if the pilot shows PMs want one.
 - More connectors.
 - Context-update pull requests proposed from calls (CTX-5).
 - Skill chaining (SKL-6).
@@ -183,4 +240,5 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
 
 ## Open questions
 - None blocking.
+- Before building the bot (Phase 1): does Fortanix's Slack plan allow the AI-app assistant panel? If not, the DM gives the same experience.
 - The PRD still mentions a frontier API and an engineer as platform owner; suggest edits to the doc.
