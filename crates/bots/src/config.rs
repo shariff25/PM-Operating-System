@@ -43,6 +43,10 @@ impl ClientKind {
 #[derive(Clone)]
 pub struct Client {
     pub kind: ClientKind,
+    /// For a worker named `worker-<bot>`: the one bot it serves. Each bot's sandbox holds its
+    /// own worker token, so a compromised sandbox can't claim another bot's tasks (and their
+    /// tool-server sessions). A plain `worker` serves every bot: development only.
+    pub bot: Option<String>,
     pub token: String,
 }
 
@@ -50,6 +54,7 @@ impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
             .field("kind", &self.kind)
+            .field("bot", &self.bot)
             .field("token", &"<redacted>")
             .finish()
     }
@@ -138,23 +143,35 @@ pub fn parse_clients(spec: &str) -> Result<Vec<Client>, String> {
             .ok_or("PMOS_BOTS_TOKENS entries are `name=token`")?;
         let name = name.trim();
         let token = token.trim();
-        let kind = ClientKind::parse(name).ok_or_else(|| {
-            format!(
-                "PMOS_BOTS_TOKENS: unknown client `{name}`; the clients are slack, worker, console and evals"
-            )
-        })?;
+        let (kind, bot) = match name.strip_prefix("worker-") {
+            Some(bot) if pmos_contract::bots::valid_name(bot) => {
+                (ClientKind::Worker, Some(bot.to_string()))
+            }
+            _ => (
+                ClientKind::parse(name).ok_or_else(|| {
+                    format!(
+                        "PMOS_BOTS_TOKENS: unknown client `{name}`; the clients are slack, worker-<bot>, worker, console and evals"
+                    )
+                })?,
+                None,
+            ),
+        };
         if token.len() < 32 {
             return Err(format!(
                 "PMOS_BOTS_TOKENS: the token for `{name}` must be at least 32 characters"
             ));
         }
-        if clients.iter().any(|c| c.kind == kind || c.token == token) {
+        if clients
+            .iter()
+            .any(|c| (c.kind == kind && c.bot == bot) || c.token == token)
+        {
             return Err(format!(
                 "PMOS_BOTS_TOKENS: `{name}` repeats a client name or token"
             ));
         }
         clients.push(Client {
             kind,
+            bot,
             token: token.into(),
         });
     }
@@ -191,6 +208,25 @@ mod tests {
                 "gateway-token-0123456789abcdef0123".into(),
             ),
         ]
+    }
+
+    #[test]
+    fn per_bot_workers_serve_one_bot() {
+        let t = |c: char| c.to_string().repeat(32);
+        let clients = parse_clients(&format!(
+            "worker-docs={},worker-pm-ana={},worker={}",
+            t('a'),
+            t('b'),
+            t('c')
+        ))
+        .unwrap();
+        assert_eq!(clients[0].bot.as_deref(), Some("docs"));
+        assert_eq!(clients[1].bot.as_deref(), Some("pm-ana"));
+        assert_eq!(clients[2].bot, None);
+        assert!(clients.iter().all(|c| c.kind == ClientKind::Worker));
+        // The same bot twice, or a bad bot name, is refused.
+        assert!(parse_clients(&format!("worker-docs={},worker-docs={}", t('a'), t('b'))).is_err());
+        assert!(parse_clients(&format!("worker-Docs={}", t('a'))).is_err());
     }
 
     #[test]

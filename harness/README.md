@@ -69,7 +69,7 @@ if it was already retried (D2).
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `PMOS_BOTS_URL` | required | The bot runtime, e.g. `http://127.0.0.1:8750` |
-| `PMOS_WORKER_TOKEN` | required | The runtime's `worker` client token (`PMOS_BOTS_TOKENS`) |
+| `PMOS_WORKER_TOKEN` | required | This bot's own runtime token, `worker-<bot>` in `PMOS_BOTS_TOKENS`: it can claim and report only this bot's tasks |
 | `PMOS_WORKER_BOT` | required | The one bot this worker serves, e.g. `docs` |
 | `PMOS_GATEWAY_URL` | required | The gateway, e.g. `http://127.0.0.1:8740/v1`; `/v1` is added if missing |
 | `PMOS_GATEWAY_TOKEN` | placeholder | The gateway client token. In a sandbox, OpenShell may inject it at the network boundary instead. |
