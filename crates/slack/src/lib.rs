@@ -8,6 +8,9 @@
 //!   **Reject**; only the PM it is for can decide it, through the tool server.
 //! - **Routines (D8):** "every weekday at 8am …" is read back for a one-tap confirm; "my
 //!   routines" lists them with **Pause**, **Resume** and **Delete**.
+//! - **Onboarding** (`docs/onboarding-spec.md` §4): someone outside `team.yaml` taps
+//!   **Request access**, a platform owner approves them in a DM card, and the new member gets
+//!   a welcome and a setup checklist (`setup`) for their accounts, memory repo and bot.
 //! - **`/docs`:** search the Fortanix support docs from any conversation, with results only
 //!   the asker can see, through the tool server's `docs` skill.
 //!
@@ -19,6 +22,8 @@ pub mod bots;
 pub mod bounded;
 pub mod cards;
 pub mod commands;
+pub mod member_cards;
+pub mod members;
 pub mod notify;
 pub mod runtime;
 pub mod slackapi;

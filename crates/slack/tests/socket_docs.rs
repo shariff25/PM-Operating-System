@@ -135,6 +135,7 @@ async fn docs_command_over_socket_mode() {
             team_file,
             http: http.clone(),
             response_url_prefix: format!("{slack_base}/hooks/"),
+            request_access: false,
         },
         http,
     );
@@ -253,6 +254,7 @@ async fn a_silent_connection_is_replaced_and_a_refused_reply_falls_back_to_text(
             team_file,
             http: http.clone(),
             response_url_prefix: format!("{slack_base}/hooks/"),
+            request_access: false,
         },
         http,
     );
@@ -307,6 +309,7 @@ async fn shutdown_closes_the_connection() {
             team_file: "/nonexistent/team.yaml".into(),
             http: http.clone(),
             response_url_prefix: "https://hooks.slack.com/".into(),
+            request_access: false,
         },
         http,
     );

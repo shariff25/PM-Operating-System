@@ -66,6 +66,8 @@ async fn main() -> Result<()> {
                 toolserver: toolserver.clone(),
                 team_file: team_file.clone(),
                 default_tz: optional("PMOS_DEFAULT_TZ").unwrap_or_else(|| "UTC".into()),
+                github_org: optional("PMOS_GITHUB_ORG"),
+                response_url_prefix: SLACK_RESPONSE_URL_PREFIX.into(),
             }))
         }
         None => {
@@ -82,6 +84,7 @@ async fn main() -> Result<()> {
             team_file,
             http: http.clone(),
             response_url_prefix: SLACK_RESPONSE_URL_PREFIX.into(),
+            request_access: bots.is_some(),
         },
         http,
     );

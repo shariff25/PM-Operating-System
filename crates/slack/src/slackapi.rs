@@ -1,5 +1,7 @@
 //! The Slack Web API, as the bot uses it: post and edit its messages, private notes, the
-//! Edit modal, and a PM's time zone. It uses the bot token (`xoxb-…`).
+//! Edit modal, a PM's time zone, and for onboarding a person's name and email
+//! (`users:read.email`) and a DM with someone who hasn't written yet (`im:write`). It uses the
+//! bot token (`xoxb-…`).
 //!
 //! A message is never sent twice on purpose: a call is retried only when Slack certainly
 //! didn't take it (no connection, `429` rate limit, `503`). If Slack refuses the Block Kit
@@ -164,6 +166,44 @@ impl SlackApi {
         self.call("chat.postEphemeral", &body).await.map(|_| ())
     }
 
+    /// `chat.postEphemeral` with blocks: a note with buttons only `user` sees.
+    pub async fn ephemeral_blocks(
+        &self,
+        channel: &str,
+        user: &str,
+        thread_ts: Option<&str>,
+        text: &str,
+        blocks: Value,
+    ) -> Result<(), SlackError> {
+        let mut body = json!({"channel": channel, "user": user, "text": text, "blocks": blocks});
+        if let Some(ts) = thread_ts {
+            body["thread_ts"] = json!(ts);
+        }
+        self.call_with_text_fallback("chat.postEphemeral", body)
+            .await
+            .map(|_| ())
+    }
+
+    /// `conversations.open` (scope `im:write`): the app's DM channel with `user`.
+    pub async fn open_dm(&self, user: &str) -> Result<String, SlackError> {
+        let res = self
+            .call("conversations.open", &json!({"users": user}))
+            .await?;
+        res["channel"]["id"]
+            .as_str()
+            .filter(|c| !c.is_empty())
+            .map(String::from)
+            .ok_or_else(|| SlackError::Refused {
+                method: "conversations.open".into(),
+                error: "no channel".into(),
+            })
+    }
+
+    /// Reply through an interaction's `response_url` (an ephemeral message's only handle).
+    pub async fn respond(&self, response_url: &str, message: &Value) {
+        crate::commands::post_reply(&self.http, response_url, message).await;
+    }
+
     /// `views.open`: show a modal. `trigger_id` is valid for 3 seconds after the click.
     pub async fn open_view(&self, trigger_id: &str, view: Value) -> Result<(), SlackError> {
         self.call(
@@ -172,6 +212,33 @@ impl SlackApi {
         )
         .await
         .map(|_| ())
+    }
+
+    /// `users.info` (scopes `users:read`, `users:read.email`): the user object, with
+    /// `real_name` and `profile.email`.
+    pub async fn user_info(&self, user: &str) -> Result<Value, SlackError> {
+        let res = self
+            .http
+            .get(format!("{}/api/users.info", self.base))
+            .bearer_auth(&self.token)
+            .query(&[("user", user)])
+            .send()
+            .await
+            .map_err(|e| SlackError::Unreachable(e.to_string()))?;
+        let json: Value = res
+            .json()
+            .await
+            .map_err(|e| SlackError::Unreachable(format!("users.info: {e}")))?;
+        if json["ok"].as_bool() != Some(true) {
+            return Err(SlackError::Refused {
+                method: "users.info".into(),
+                error: json["error"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_string(),
+            });
+        }
+        Ok(json["user"].clone())
     }
 
     /// The user's IANA time zone from `users.info` (scope `users:read`), if Slack has one.
