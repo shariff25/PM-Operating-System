@@ -4,6 +4,8 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- PM OS can now onboard you itself: DM it, tap **Request access**, and once a platform owner approves you get your own `pm-<you>` bot and a `setup` checklist to connect your accounts.
+- PM OS can now keep your bot's notes in your own private repo in the Fortanix GitHub org, so you can read and edit what it remembers.
 - PM OS can now be talked to as named bots: DM the Docs bot (`docs: …`) or your own `pm-<you>` bot in Slack, and watch its progress in one message.
 - PM OS can now draft a Jira issue, Confluence page or Slack message and show you a card to Approve, Edit or Reject before anything is sent.
 - PM OS can now run a routine you describe in plain words ("every weekday at 8am, summarize #launch"), and you can pause or delete it from Slack.

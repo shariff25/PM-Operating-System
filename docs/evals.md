@@ -50,7 +50,7 @@ client `evals`. For each task it:
 | `pmos-evals check [--category docs-qa]` | Validates the category and task files, and `config.yaml` | 0 valid, 2 problems (every problem listed) |
 | `pmos-evals run --category docs-qa` | Runs the category and writes its report | 0 met the bar, 1 below it |
 | `pmos-evals history --category docs-qa` | Has the bar been met two weeks in a row? | 0 yes, 1 no |
-| `pmos-evals load --tasks 5` | The load test | 0 within every target, 1 not |
+| `pmos-evals load --tasks 5` | The load test | 0 if every task finished, 1 if not (`--enforce-targets`: also 1 on a missed latency target) |
 
 An error (no token, a bad file, a report that can't be written) exits 2.
 
@@ -233,8 +233,10 @@ So queue time can be over-counted by up to one poll interval when a task has no 
 
 - **No PRD targets in the repo.** The repo doesn't contain the PRD's latency targets, so the
   last three are labelled defaults. Replace them with the PRD numbers when they're added.
-- **Failing the test.** It fails if any target is missed, or any task doesn't finish: not
-  created, timed out, failed or cancelled.
+- **Latency is not a priority (decided 2026-11-14).** The targets are reported, and a miss is
+  shown, but it doesn't fail the test or gate Gate 1.
+- **Failing the test.** It fails if any task doesn't finish: not created, timed out, failed or
+  cancelled. With `--enforce-targets` it also fails on a missed target.
 
 ## Adding a category
 
@@ -302,6 +304,7 @@ CI.
   `tool` or `name`. They read an error from `isError`, `is_error`, `error` or `status`.
   - Confirm this against the harness worker once it lands.
 - **Load-test targets:** only "p90 queue under 2 minutes" is in the repo. The other three are
-  labelled defaults.
+  labelled defaults. Latency isn't a priority, so they're informational unless
+  `--enforce-targets` is passed.
 - **Who evals run as:** the spec doesn't name an identity for eval tasks. `requested_by` is a
   config default (`evals`), so that handle has to be in `team.yaml`, or `--as` must name a PM.

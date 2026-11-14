@@ -127,12 +127,12 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
    - At least 20 golden tasks per P0 skill, including retrieval checks.
    - A CI regression gate.
    - A model and harness bake-off runner.
-   - A load test for 5 concurrent sessions, measured against the PRD latency targets.
+   - A load test for 5 concurrent sessions. It reports latency; latency is not a priority and doesn't gate (decided 2026-11-14).
    - A measured time baseline for the core artifacts.
 
 **What runs where:** steps 0a–0c and 0f–0g are built and tested here against fakes and a stub model. vLLM, the OpenShell runtime, real OAuth and the baseline need the Spark.
 
-**Gate 1:** evals pass, the load test meets targets, and the sandbox red-team passes.
+**Gate 1:** evals pass, every load-test task finishes (latency is reported, not gated), and the sandbox red-team passes.
 
 ### Bots: what changes in the build order (from `bot-decisions.md`)
 - **0d gateway:** add the workaround registry, with a flag and a "delete when" test for each workaround (D11).
@@ -153,7 +153,7 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
   - a fixed set of real tasks per category, rerun weekly and on every model or harness change;
   - each failure tagged to its bottleneck: model, tool, policy, memory or harness;
   - a category launches only after passing its bar two weeks in a row.
-- **Memory moves to markdown files in git** (D5): team memory in a git repo set in config (default `pm-os-memory`), committed by the tool server on each bot write; personal memory in a private store; a source and date on every entry; and the context mount filtered by data class.
+- **Memory moves to markdown files in git** (D5): team memory in a git repo set in config (default `pm-os-memory`), committed by the tool server on each bot write; personal memory in each PM's own private repo in the Fortanix GitHub org (decided 2026-11-14; `PMOS_MEMORY=github`); a source and date on every entry; and the context mount filtered by data class.
 - **Phase 1:**
   - The first named bots: a team **Docs** bot, which takes over `/docs`, and personal PM bots.
   - Routines in plain language (D8), moved up from Phase 2.
@@ -269,8 +269,9 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
 | 0d Gateway | Done | `crates/gateway`: role aliases to local vLLM only, fair queue (interactive, scheduled, personal; per-person cap), usage log, workaround registry (D11), stub model for CI; see `docs/gateway.md` |
 | 0e Bots | Built (mocks and stub model) | `content/bots`, `content/roles` and their lint; tool-server bot sessions (allowlist per role, `never` actions, team-bot read scope with its own account); `crates/bots` runtime (durable tasks with leases, routines, 30-day traces, notifications, one worker token per bot); `harness` worker; Slack DMs, progress, approval cards and routines; `crates/console`. Checked end to end with the real binaries and the stub model. See `docs/bot-runtime-spec.md` |
 | 0f Sandbox policies | Built; verify on the Spark | `crates/policy`, `pmos policy generate/check` in CI, `policies/bots/docs.yaml`, red-team kit. Format checked against OpenShell's repo; items marked "verify on the Spark" in `docs/sandbox-policies.md` |
-| 0g Evals | Built; first live run on the Spark | `crates/evals`, `evals/categories/docs-qa` (20 real questions), failure tags, weekly reports, load test. Latency targets: only p90 queue < 120 s is known; the rest are labelled placeholders |
-| **Gate 1** | Needs the Spark | vLLM with the chosen models; OpenShell; the Slack app; `team.yaml` filled in; the red-team run; two passing benchmark weeks; the load test |
+| 0g Evals | Built; first live run on the Spark | `crates/evals`, `evals/categories/docs-qa` (20 real questions), failure tags, weekly reports, load test. Latency is reported, not gated (decided 2026-11-14) |
+| Onboarding and GitHub memory | Built (this PR); first live run on the Spark | New members ask in Slack, a platform owner approves, PM OS commits `team.yaml` and their personal bot; guided setup; each PM's memory in a private repo in the Fortanix GitHub org ([spec](onboarding-spec.md)) |
+| **Gate 1** | Needs the Spark | vLLM with the chosen models; OpenShell; the Slack app and the GitHub App; the first platform owners in `team.yaml` (everyone else onboards through the bot); the red-team run; two passing benchmark weeks; the load test (every task finishes) |
 
 0c notes:
 - Connectors share one `Connector` trait (`read` and `write`, both keyed by action) instead of one trait per system. The real Jira, Confluence and Slack connectors each implement it.

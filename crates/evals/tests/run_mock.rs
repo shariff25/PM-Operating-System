@@ -310,7 +310,10 @@ async fn load_test_reports_percentiles_against_targets() {
     assert!(!result.passed(&tight));
     assert!(result
         .to_markdown("docs", &tight)
-        .contains("**Missed a target.**"));
+        .contains("**Missed a target.** Latency targets are for information"));
+    // Latency doesn't fail the test unless asked to.
+    assert!(result.verdict(&tight, false));
+    assert!(!result.verdict(&tight, true));
 }
 
 #[tokio::test]
@@ -344,6 +347,10 @@ async fn load_test_counts_unfinished_tasks() {
     std::fs::write(dir.path().join("config.yaml"), common::CONFIG).unwrap();
     let config = Config::load(dir.path()).unwrap();
     assert!(!result.passed(&config.latency_targets));
+    assert!(
+        !result.verdict(&config.latency_targets, false),
+        "unfinished tasks always fail"
+    );
     assert!(result
         .to_markdown("docs", &config.latency_targets)
         .contains("timed out while `working`"));
