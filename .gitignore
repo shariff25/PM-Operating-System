@@ -12,3 +12,7 @@ dist/
 /deploy/.env
 /deploy/live.env
 /deploy/backups/
+
+# Research notes and reports (kept local unless asked)
+/research_notes/
+/reports/
