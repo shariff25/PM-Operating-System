@@ -20,7 +20,7 @@ Slack without the PM's approval.
 | `crates/runtime` | Small pieces every service shares: constant-time token checks, SIGTERM-aware shutdown | Rust |
 | `crates/toolserver` | The only path from a sandbox to context and systems: MCP, allowlists, approvals, audit ([docs](docs/toolserver.md)) | Rust |
 | `crates/docs` | `pmos-docs`: MCP server over the public Fortanix support docs ([docs](docs/docs-server.md)) | Rust |
-| `crates/slack` | `pmos-slack`: the Slack bot: DMs to bots, progress, approval cards, routines, onboarding, `/docs` ([docs](docs/docs-server.md)) | Rust |
+| `crates/slack` | `pmos-slack`: the Slack bot: DMs to bots, progress, approval cards with reject reasons, the triage digest, routines, onboarding, `/docs` ([docs](docs/docs-server.md)) | Rust |
 | `crates/bots` | `pmos-bots`: the bot runtime: durable tasks, routines, traces, notifications ([docs](docs/bots-runtime.md)) | Rust |
 | `crates/console` | `pmos-console`: the four-screen console: bots, routines, approvals, activity ([docs](docs/console.md)) | Rust |
 | `crates/policy` | `pmos policy`: one OpenShell sandbox policy per bot, checked in CI ([docs](docs/sandbox-policies.md)) | Rust |
