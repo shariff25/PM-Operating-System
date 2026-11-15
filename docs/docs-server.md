@@ -146,11 +146,19 @@ The tool server needs `PMOS_DOCS_URL` (such as `http://docs.pmos.internal:8730/m
 4. For the bots (DMs, approval cards, routines; spec §5 of `docs/bot-runtime-spec.md`), also set:
    - `PMOS_BOTS_URL` (the runtime, port 8750) and `PMOS_BOTS_TOKEN` (the runtime's `slack` client token);
    - `PMOS_SLACK_BOT_TOKEN`, the app's bot token (`xoxb-…`);
-   - `PMOS_SLACK_STATE_DIR` (default `state/slack`), where the notification cursor is kept so a
-     restart reposts nothing;
-   - `PMOS_DEFAULT_TZ` (default `UTC`), for routines when Slack has no time zone for the PM;
+   - `PMOS_SLACK_STATE_DIR` (default `state/slack`), where the notification cursor and the
+     triage digest's sent dates are kept, so a restart reposts nothing;
+   - `PMOS_DEFAULT_TZ` (default `UTC`), for routines when Slack has no time zone for the PM, and
+     for the triage digest. With the digest on, it must be an IANA name (`Europe/London`) or
+     the bot won't start;
    - `PMOS_GITHUB_ORG` (optional), the GitHub org memory repos live in, to prefill the
-     memory-repo form. Without it the PM types the org.
+     memory-repo form. Without it the PM types the org;
+   - `PMOS_TRIAGE_AT` (default `09:00`), when the triage digest goes out on weekdays, in
+     `PMOS_DEFAULT_TZ`; `off` turns it off;
+   - `PMOS_TRIAGE_MIN_EDIT` (default `0.3`, from 0 to 1), the edit distance from which an
+     edited draft is listed in the digest;
+   - `PMOS_CONSOLE_PUBLIC_URL` (optional), the console's `https://` origin, so each digest row
+     links to its task page. Without it, or with an `http://` one, the rows have no links.
 
    Without `PMOS_BOTS_URL` the bot serves `/docs` only.
 5. List at least one platform owner (`admin`) in `content/team.yaml` by pull request. After
@@ -215,6 +223,47 @@ Every Slack envelope is still acknowledged within 3 seconds. The memory-repo for
 answer that has to be in the acknowledgement (Slack shows field errors only from it), so the
 bot waits up to 2.2 seconds for the tool server there; slower than that, the form says to try
 again.
+
+## Approval feedback in Slack (`pmos-slack`)
+
+The contract is `docs/improvement-loop-spec.md` §4. It needs the bots (`PMOS_BOTS_URL`), and
+the tool server's feedback ledger (§1), which keeps labels and metadata only, never message
+text.
+
+**Reasons on reject:**
+- **Reject** on an approval card no longer decides at once. The card changes in place to six
+  reasons: **Wrong facts**, **Wrong place**, **Tone**, **Incomplete**, **Shouldn't have
+  drafted** and **Other**, and a **Back** button.
+- One tap on a reason rejects the draft with that reason (`wrong_facts`, `wrong_target`,
+  `tone`, `incomplete`, `should_not_draft`, `other`), and the card says "Rejected by Ana:
+  Tone".
+- **Back** puts **Approve**, **Edit** and **Reject** back. Nothing is decided until a reason
+  is tapped.
+- As with the other buttons, only the PM the draft is for can use them; anyone else gets a
+  private note and nothing is sent. Each tap is acknowledged at once and the card is updated a
+  moment later. A card decided meanwhile shows its outcome instead.
+
+**The daily triage digest:**
+- **When:** weekdays at `PMOS_TRIAGE_AT` (default 09:00) in `PMOS_DEFAULT_TZ`.
+  `PMOS_TRIAGE_AT=off` turns it off.
+- **Who:** each bot's quality owner, the `owner` in the runtime's bot list, gets one DM for all
+  their bots. A bot with no owner, or whose owner isn't in `team.yaml`, is skipped and logged.
+- **What:** the drafts decided since the previous digest (so Monday's covers the weekend) that
+  were rejected, or approved after an edit with an edit distance of at least
+  `PMOS_TRIAGE_MIN_EDIT`. Rows are grouped by bot, newest first, up to 30. Each shows:
+  - the tool;
+  - the handle of the PM it was for;
+  - the outcome and reason, or how much the edit changed, as a percentage;
+  - a link to the console's task page (`PMOS_CONSOLE_PUBLIC_URL/tasks/<run_id>`), when set.
+
+  The ledger holds no message text, so neither does the digest. It ends with "Worth keeping?
+  Write a case card: `evals/case-card.md`" and a reminder that Slack text leaves the trace
+  after 24 hours.
+- **When nothing qualifies:** no message.
+- **At most once a day per owner:** the date each owner was last sent one is kept in
+  `PMOS_SLACK_STATE_DIR/triage.sent`. A restart after the digest's time on a weekday sends that
+  day's digest to the owners who haven't had it. If the ledger can't be read, or a DM fails, the
+  bot tries again every 5 minutes, up to 6 times, sending only to the owners still waiting.
 
 ## Network on the Spark
 
