@@ -356,6 +356,29 @@ describe("harness worker", () => {
     expect(request?.body.model).toBe("pmos/default");
   });
 
+  it("calls the reasoning model for a role pinned to it", async () => {
+    const gateway = await startFakeGateway("A critique.");
+    cleanups.push(gateway.close);
+    const reasoning = claim("tsk_reason");
+    const { runtime } = await setup({
+      claims: [{ ...reasoning, role: { ...DOCS_ROLE, model: "reasoning" } }],
+      config: { gatewayUrl: gateway.url },
+    });
+    const done = await waitFor(() => finished(runtime, "tsk_reason"));
+    expect(done.body.result).toBe("A critique.");
+    expect(gateway.requests[0]?.body.model).toBe("pmos/reasoning");
+  });
+
+  it("fails a task whose role names a model role PM OS doesn't have", async () => {
+    const bad = claim("tsk_bad_model");
+    const { runtime } = await setup({
+      claims: [{ ...bad, role: { ...DOCS_ROLE, model: "huge" } }],
+      models: { tsk_bad_model: new ScriptedModel([new AIMessage("should not run")]) },
+    });
+    const failed = await waitFor(() => runtime.forTask("tsk_bad_model", "fail")[0]);
+    expect(failed.body.reason).toContain("model role PM OS doesn't have");
+  });
+
   it("fails a task that runs past its step limit", async () => {
     const { runtime } = await setup({
       claims: [claim("tsk_loop")],
@@ -399,6 +422,7 @@ describe("worker helpers", () => {
     expect(milestoneFor("confluence_create_draft", "write")).toBe("Drafting in Confluence");
     expect(milestoneFor("slack_read_thread", "read")).toBe("Reading Slack");
     expect(milestoneFor("context_search", "read")).toBe("Checking team context");
+    expect(milestoneFor("stats_sample_size", "read")).toBe("Running the numbers");
     expect(milestoneFor("read_file", undefined)).toBeNull();
     expect(milestoneFor("write_todos", undefined)).toBeNull();
   });

@@ -32,6 +32,17 @@ context/personas/. -->
 6. **Use the team's files.** Start from the matching template in `templates/`, the context
    library and past exemplars. Do not invent product facts, numbers, customers or dates.
 
+## The bar
+Every document you draft passes these before the PM sees it. The checks in full, and how to
+run them, are in `/content/playbooks/bar.md`.
+1. **Problem first:** who has the problem, and the evidence, before the solution.
+2. **Alternatives:** at least two real options, and why the others lost.
+3. **A recommendation, stated first:** one, in the opening lines.
+4. **A measurable outcome:** a metric with a number, a date and a source, plus a guardrail.
+5. **Non-goals and tradeoffs,** stated.
+6. **The riskiest assumption,** and the cheapest way to test it.
+7. **Nothing unverified left unflagged.**
+
 ## How we write
 <!-- TODO(owner): adjust the voice rules below to your team's style guide (context/style/). -->
 - Lead with the answer, decision or ask. Then the detail.
@@ -42,4 +53,6 @@ context/personas/. -->
 ## Where things live
 - Context library: `context/<domain>/` (search it with `context.search`).
 - Templates: `templates/`. Reviewer rubrics: `reviewers/`.
+- Playbooks: `playbooks/` (how a senior PM approaches each kind of work; `bar.md` is the
+  bar above).
 - Drafts land in Confluence; work items in Jira.

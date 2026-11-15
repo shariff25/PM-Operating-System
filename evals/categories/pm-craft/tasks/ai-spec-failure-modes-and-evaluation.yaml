@@ -1,0 +1,23 @@
+# seed: replace with case cards
+# The AI-product track: a spec for an AI feature says how it fails and how it will be
+# evaluated before it says anything about launch. Fixture: the docs page vault-key-rotation
+# ("Key rotation creates a new key version."), which the feature would answer from. The
+# ai-feature-spec template has the headings Failure modes and Evaluation
+# (content/templates/ai-feature-spec.md).
+id: ai-spec-failure-modes-and-evaluation
+ask: "Draft anyway, no questions: an AI feature spec in the PM space for a feature in the Acme Vault console that explains key rotation to admins in plain words, answering from the public docs (docs page vault-key-rotation)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["AI spec:", "Failure modes", "Evaluation"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: ai-feature-spec
+tags:
+  - model/draft-content

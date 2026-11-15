@@ -1,0 +1,20 @@
+# Does a pm-craft draft open with its recommendation? The bar's third check
+# (content/playbooks/bar.md): one recommendation, in the opening lines. The deterministic
+# checks see that the headings are there; this judge looks at whether the document leads with
+# a position a reader could act on.
+#
+# Advisory: it has no labels yet (recommendation-first.labels.jsonl is empty), so it is
+# reported and never fails a run or the gate. It blocks only once calibrated on at least 100
+# labels with TPR and TNR of at least 0.8 (docs/runbooks/quality.md, "Calibrating a judge").
+name: recommendation-first
+failure_mode: model/no-recommendation
+question: >-
+  Does the draft state one recommendation in its opening lines? Answer yes if the first
+  section or the first few sentences of the draft say what the author recommends or concludes
+  (one option, decision, bottom line or headline), before the background and the analysis.
+  Answer no if the draft lists options without choosing one, gives its recommendation only
+  after the analysis, or gives none. If the output contains no draft (the assistant asked a
+  question or answered in the thread), answer yes.
+alias: pmos/extraction
+applies_to: [pm-craft]
+labels: recommendation-first.labels.jsonl

@@ -114,6 +114,7 @@ async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_o
     let yaml = format!(
         "upstreams: {{a: '{upstream}'}}\n\
          roles:\n  default: {{upstream: a, model: qwen-test, workarounds: [strip-think]}}\n  \
+         reasoning: {{upstream: a, model: qwen-test, workarounds: [strip-think]}}\n  \
          extraction: {{upstream: a, model: nemo-test}}\n  embedding: {{upstream: a, model: embed-test}}\n\
          limits: {{max-in-flight: {}, per-user: {}, max-queue: {}}}\n",
         limits.max_in_flight, limits.per_user, limits.max_queue
@@ -190,7 +191,12 @@ async fn roles_route_to_their_local_model_and_nothing_else_gets_through() {
         .collect();
     assert_eq!(
         ids,
-        vec!["pmos/default", "pmos/embedding", "pmos/extraction"]
+        vec![
+            "pmos/default",
+            "pmos/embedding",
+            "pmos/extraction",
+            "pmos/reasoning"
+        ]
     );
 
     // A role alias reaches its model; the answer says which model served it.
@@ -327,7 +333,10 @@ async fn workarounds_apply_per_role_and_switch_off_together() {
         .unwrap();
     assert_eq!(reg["enabled"], true);
     assert_eq!(reg["workarounds"][0]["id"], "strip-think");
-    assert_eq!(reg["workarounds"][0]["roles"], json!(["pmos/default"]));
+    assert_eq!(
+        reg["workarounds"][0]["roles"],
+        json!(["pmos/default", "pmos/reasoning"])
+    );
     assert!(reg["workarounds"][0]["delete_when"]
         .as_str()
         .unwrap()
@@ -507,6 +516,18 @@ async fn the_stub_model_needs_no_model_server() {
         body["choices"][0]["message"]["content"],
         "Stub reply to: What is Acme Vault?"
     );
+    // The PM assistant's role answers too.
+    let body: Value = chat(&gw, "pmos/reasoning", "Critique this PRD")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "Stub reply to: Critique this PRD"
+    );
     let text = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(TOKEN)
@@ -550,6 +571,31 @@ fn the_repo_config_is_valid() {
     let models = Models::from_yaml(&text).unwrap();
     assert!(models.role("pmos/default").is_some());
     assert!(models.role("pmos/extraction").is_some());
+    assert!(models.role("pmos/reasoning").is_some());
+}
+
+/// Every shipped gateway config serves `pmos/reasoning`, on the same upstream, model and
+/// workarounds as `pmos/default` until the bake-off picks a larger model.
+#[test]
+fn every_repo_config_serves_reasoning_like_default() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for (file, cloud_test) in [
+        ("config/gateway.yaml", false),
+        ("deploy/gateway.yaml", false),
+        ("config/gateway.claude-test.yaml", true),
+    ] {
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        let models = Models::parse(&text, cloud_test).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let default = models.role("pmos/default").unwrap();
+        let reasoning = models
+            .role("pmos/reasoning")
+            .unwrap_or_else(|| panic!("{file} has no reasoning role"));
+        assert_eq!(reasoning.upstream, default.upstream, "{file}");
+        assert_eq!(reasoning.model, default.model, "{file}");
+        assert_eq!(reasoning.workarounds, default.workarounds, "{file}");
+        assert_eq!(reasoning.kind, default.kind, "{file}");
+        assert_eq!(reasoning.effort, default.effort, "{file}");
+    }
 }
 
 /// What the mock Claude Messages API saw: headers and body of each request.

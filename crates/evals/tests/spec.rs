@@ -452,7 +452,7 @@ fn affected_categories_follow_bot_role_and_skills() {
     );
     assert_eq!(affected(&["content/bots/docs/BOT.md"]), ["docs-qa"]);
     // Personal bots: pm-<requested_by>, made from pm-assistant and its skills.
-    let personal = ["confluence-draft", "jira-draft", "slack-reply"];
+    let personal = ["confluence-draft", "jira-draft", "pm-craft", "slack-reply"];
     assert_eq!(affected(&["content/roles/pm-assistant/ROLE.md"]), personal);
     assert_eq!(affected(&["./content/skills/prd-draft/SKILL.md"]), personal);
     assert_eq!(affected(&["content/bots/pm-evals/BOT.md"]), personal);

@@ -1,0 +1,23 @@
+# seed: replace with case cards
+# Fixtures: the docs pages vault-saml-sso and vault-key-rotation for what Acme Vault does;
+# no fixture describes Initech (the spec's fictional competitor), so a good brief puts what
+# it can't source under Unknowns. The competitive-brief skill titles its draft
+# `Competitive brief: …` and follows content/templates/competitive-brief.md: Bottom line,
+# Where they win, Where we win, Evidence, What to do, Unknowns.
+id: structure-competitive-brief
+ask: "Draft anyway, no questions: a competitive brief in the PM space on Initech against Acme Vault for SAML SSO and key rotation, from the team's context and the public docs."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Competitive brief:", "Bottom line", "Where they win", "Where we win", "Unknowns"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: competitive-brief
+tags:
+  - model/draft-content

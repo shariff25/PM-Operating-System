@@ -1,9 +1,12 @@
 export {
   CONTENT_MOUNT,
   MODEL_ALIASES,
+  READ_ONLY_CONTENT_DIRS,
+  REVIEW_SKILL,
   createPmosAgent,
   gatewayModel,
   memorySources,
+  reviewerSubagents,
   stageSkills,
   type GatewayModelOptions,
   type ModelRole,

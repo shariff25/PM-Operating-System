@@ -379,7 +379,7 @@ mod tests {
     use super::*;
 
     const YAML: &str = "upstreams:\n  qwen: http://127.0.0.1:8001/v1/\n  nemo: http://vllm-nemotron:8000/v1\n\
-roles:\n  default: {upstream: qwen, model: qwen3.6-35b-a3b, workarounds: [strip-think]}\n  extraction: {upstream: nemo, model: nemotron-3-nano}\n";
+roles:\n  default: {upstream: qwen, model: qwen3.6-35b-a3b, workarounds: [strip-think]}\n  reasoning: {upstream: qwen, model: qwen3.6-35b-a3b, workarounds: [strip-think]}\n  extraction: {upstream: nemo, model: nemotron-3-nano}\n";
 
     #[test]
     fn reads_roles_and_resolves_aliases() {
@@ -396,7 +396,14 @@ roles:\n  default: {upstream: qwen, model: qwen3.6-35b-a3b, workarounds: [strip-
             "concrete names are refused"
         );
         assert!(m.role("pmos/nope").is_none());
-        assert_eq!(m.aliases(), vec!["pmos/default", "pmos/extraction"]);
+        assert_eq!(
+            m.aliases(),
+            vec!["pmos/default", "pmos/extraction", "pmos/reasoning"]
+        );
+        assert_eq!(
+            m.role("pmos/reasoning").unwrap().model,
+            m.role("pmos/default").unwrap().model
+        );
         assert_eq!(m.limits, Limits::default());
     }
 

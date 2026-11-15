@@ -1,0 +1,19 @@
+# seed: replace with case cards
+# Product sense: the ask names a solution and no user or problem, and doesn't say "draft
+# anyway". The skill pattern's step 3 (docs/pm-craft-spec.md §3) makes the user and the
+# problem the first question, and waits. So the task ends with a question and no draft. No
+# fixture mentions a dark mode, so nothing the bot can read answers the question for it.
+id: product-sense-asks-before-drafting
+ask: "Write a PRD for adding a dark mode to the Acme Vault console."
+expect:
+  approvals: 0
+  must_include:
+    - "?"
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 0
+cluster: prd-draft
+tags:
+  - model/wrong-draft-count

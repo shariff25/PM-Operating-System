@@ -1,0 +1,23 @@
+# seed: replace with case cards
+# Fixtures: epic PM-101 and the docs page vault-saml-sso. The experiment-design skill titles
+# its draft `Experiment: …` and follows content/templates/experiment-plan.md: Hypothesis,
+# Primary metric, Guardrail metrics, Sample size and duration, Decision rule, Risks. The ask
+# gives a baseline and an effect so the skill can call stats.sample_size; the number itself is
+# checked in numbers-sample-size-from-tool.
+id: structure-experiment-design
+ask: "Draft anyway, no questions: an experiment plan in the PM space for testing a guided setup checklist on the SAML SSO page of the Acme Vault console (Jira epic PM-101). Today 20% of admins who start SSO setup finish it, and we want to detect a 15% relative lift."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Experiment:", "Hypothesis", "Primary metric", "Guardrail metrics", "Decision rule"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: experiment-design
+tags:
+  - model/draft-content

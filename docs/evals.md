@@ -95,7 +95,7 @@ export PMOS_EVALS_TOKEN=… PMOS_EVALS_TRACE_TOKEN=… PMOS_EVALS_AS=ana
 export PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1 PMOS_EVALS_GATEWAY_TOKEN=…   # for judges
 pmos-evals run --category docs-qa --note "weekly"
 pmos-evals history --category docs-qa
-for c in jira-draft confluence-draft slack-reply; do pmos-evals run --category "$c" --note "weekly"; done
+for c in jira-draft confluence-draft slack-reply pm-craft; do pmos-evals run --category "$c" --note "weekly"; done
 ```
 
 Then commit `evals/reports/`, both files of each run. The reports are the history; a run that
@@ -318,7 +318,9 @@ tool:
   tables above). Every one it can emit must be listed; a test and `check` enforce that.
 - **Owners add sub-tags by pull request,** usually after a 100-trace review
   (`docs/runbooks/quality.md`). Some exist only for people and judges to apply, such as
-  `model/unfaithful-to-source`, `model/followed-injection` and `policy/should-not-draft`.
+  `model/unfaithful-to-source`, `model/followed-injection`, `policy/should-not-draft`, and the
+  three the pm-craft judges apply: `model/no-recommendation`, `model/unmeasurable-outcome` and
+  `model/no-riskiest-assumption`.
 - **Where tags are used:** a task's `tags` (the failure modes it exists to catch), a judge's
   `failure_mode`, and sub-tags in committed reports. `pmos-evals check` validates the taxonomy
   and every one of these.
@@ -494,7 +496,14 @@ writes `evals/judges/<name>.calibration.json`:
 `check` prints each judge's label count and status. The report records whether each judge was
 blocking when the run asked it.
 
-**Shipped:** `faithful-to-cited-page` for docs-qa, with no labels yet, so it is advisory.
+**Shipped,** each with no labels yet, so each is advisory:
+
+| Judge | Applies to | A "no" means |
+| --- | --- | --- |
+| `faithful-to-cited-page` | `docs-qa` | `model/unfaithful-to-source`: the answer says something the pages it read don't |
+| `recommendation-first` | `pm-craft` | `model/no-recommendation`: the draft doesn't open with one recommendation |
+| `metric-with-guardrail` | `pm-craft` | `model/unmeasurable-outcome`: no metric with a number, a date and a method, or no guardrail |
+| `names-riskiest-assumption` | `pm-craft` | `model/no-riskiest-assumption`: no riskiest assumption, or no way to test it |
 
 ### Load test
 `pmos-evals load --tasks 5 [--category docs-qa]`:
@@ -624,6 +633,46 @@ asks for.
   `model/wrong-draft-count`) until a skill does.
 - **Running them** needs the stack on the fake connectors and a member whose personal bot
   exists (`--as <handle>` runs against `pm-<handle>`).
+
+### `pm-craft`
+The senior-PM bar (`docs/pm-craft.md`; the spec is §6 of `docs/pm-craft-spec.md`). Seventeen
+seed tasks for `bot: personal`, on the same fake fixtures as the seed categories plus the fake
+docs pages. Like them, it is marked "seed: replace with case cards", has no `pass_bar` and
+runs each task once.
+
+| Tasks | The ask | What is checked |
+| --- | --- | --- |
+| `structure-<skill>`, one per doc skill (12) | "Draft anyway, no questions: …" for a document in the PM space | One `confluence.create_draft` draft in space PM, with `space`, `title` and `body`; its text has the skill's title prefix (`Problem:`, `Strategy:`, `PRD:`, …) and three or more of the template's headings; no `<think>`, `TODO` or `<!--` left in it |
+| `product-sense-asks-before-drafting` | A PRD for a solution with no user or problem, and no "draft anyway" | No draft (`approvals: 0`, `count: 0`), and the answer asks a question (`?`) |
+| `decision-recommends-among-options` | A decision doc between two options | The draft has "Recommendation" and "Options" |
+| `numbers-sample-size-from-tool` | An experiment plan for a 10% baseline and a 10% relative lift, with the defaults | The draft has the per-arm sample size `stats.sample_size` returns |
+| `ai-spec-failure-modes-and-evaluation` | An AI feature spec | The draft has "Failure modes" and "Evaluation" |
+| `review-prd-by-severity` | A review of fixture page 9002 | No draft or page update; the answer names a "blocker" and ends with the "three changes" that matter most |
+
+- **The headings are the contract.** Each `must_include` heading is written exactly as §1 of
+  `docs/pm-craft-spec.md` lists it, and as the template in `content/templates/` has it. Change
+  a template's heading and its task in the same pull request.
+- **Structure, not judgment.** A draft with every heading and a weak argument passes. The
+  three judges (`recommendation-first`, `metric-with-guardrail`, `names-riskiest-assumption`)
+  read for the argument. They are advisory until calibrated, so today they are reported and
+  nothing more.
+- **A judge answers yes when there is nothing to judge.** The judges see every task in the
+  category, the ones with no draft too, so each question says to answer yes when the output
+  holds no draft. `metric-with-guardrail` also answers yes for a draft that proposes nothing
+  to build, change or test, such as a call synthesis.
+- **The sample-size task** expects the number from the spec's formula (14,749 per arm). The
+  check drops thousands separators, so "14,749" and "14749" both match. If the tool's formula
+  or rounding changes, change the task with it.
+- **Clusters.** Tasks that exercise one skill share a `cluster` (`decision-doc`,
+  `experiment-design`, `ai-feature-spec`, `prd-draft`), so the standard error treats them as
+  related.
+- **The gate.** `pmos-evals affected` lists `pm-craft` for a change under `evals/`, the
+  `pm-assistant` role or any of its skills. A change to only `content/playbooks/`,
+  `content/templates/`, `content/reviewers/` or `content/context/exemplars/` doesn't trigger
+  the gate, though every pm-craft skill reads them. Run the category by hand after one
+  (`deploy/pmos-admin evals-run --category pm-craft --note "…"`).
+- **Running it** needs the stack on the fake connectors, the `stats.*` tools in the tool
+  server, and a member whose personal bot runs the craft skills.
 
 ## CI
 `cargo test -p pmos-evals` checks the benchmark machinery with no network. It runs:

@@ -75,7 +75,7 @@ async fn a_bot_session_gets_its_roles_tools_less_never() {
         ]
     );
 
-    // pm-assistant's four skills, less the bot's own `slack.send_message: never`.
+    // pm-assistant's skills, less the bot's own `slack.send_message: never`.
     let mine = bot_session(&f, "ana", "pm-ana").await;
     assert_eq!(
         tool_names(&f, &mine),
@@ -93,6 +93,8 @@ async fn a_bot_session_gets_its_roles_tools_less_never() {
             "slack_post_reply",
             "slack_read_thread",
             "slack_search",
+            "stats_compare",
+            "stats_sample_size",
         ]
     );
 }
