@@ -166,6 +166,7 @@ impl Stack {
             default_tz: "America/Los_Angeles".into(),
             github_org: None,
             response_url_prefix: "https://hooks.slack.com/".into(),
+            state_dir: self.state.path().to_path_buf(),
         })
     }
 

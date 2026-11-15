@@ -5,6 +5,7 @@ use anyhow::{anyhow, Result};
 use pmos_slack::bots::{Bots, BotsConfig};
 use pmos_slack::commands::{Commands, SLACK_RESPONSE_URL_PREFIX};
 use pmos_slack::notify::Notifier;
+use pmos_slack::reply::Snoozer;
 use pmos_slack::runtime::Runtime;
 use pmos_slack::slackapi::SlackApi;
 use pmos_slack::socket::{Ended, Socket};
@@ -83,6 +84,8 @@ async fn main() -> Result<()> {
         .build()?;
 
     let default_tz = optional("PMOS_DEFAULT_TZ").unwrap_or_else(|| "UTC".into());
+    let state_dir =
+        PathBuf::from(optional("PMOS_SLACK_STATE_DIR").unwrap_or_else(|| "state/slack".into()));
     // The bots (DMs, approval cards, routines) need the runtime; without it, `/docs` only.
     let bots = match optional("PMOS_BOTS_URL") {
         Some(bots_url) => {
@@ -100,6 +103,7 @@ async fn main() -> Result<()> {
                 default_tz: default_tz.clone(),
                 github_org: optional("PMOS_GITHUB_ORG"),
                 response_url_prefix: SLACK_RESPONSE_URL_PREFIX.into(),
+                state_dir: state_dir.clone(),
             }))
         }
         None => {
@@ -130,10 +134,12 @@ async fn main() -> Result<()> {
     }
     let mut notifier = None;
     let mut digest = None;
+    let mut snoozer = None;
     if let Some(bots) = bots {
-        let state_dir =
-            PathBuf::from(optional("PMOS_SLACK_STATE_DIR").unwrap_or_else(|| "state/slack".into()));
-        tracing::info!(state_dir = %state_dir.display(), "notification cursor kept here");
+        tracing::info!(state_dir = %state_dir.display(), "notification cursor and snoozes kept here");
+        snoozer = Some(tokio::spawn(
+            Snoozer::new(bots.clone()).run(shutdown.child_token()),
+        ));
         if let Some(cfg) = triage_config(&default_tz)? {
             tracing::info!(at = %cfg.at, tz = %cfg.tz, min_edit = cfg.min_edit, "triage digest on weekdays");
             digest = Some(tokio::spawn(
@@ -161,6 +167,9 @@ async fn main() -> Result<()> {
     }
     if let Some(digest) = digest {
         let _ = tokio::time::timeout(Duration::from_secs(5), digest).await;
+    }
+    if let Some(snoozer) = snoozer {
+        let _ = tokio::time::timeout(Duration::from_secs(5), snoozer).await;
     }
     match ended {
         // A non-zero exit, so a supervisor shows it rather than treating it as a clean stop.

@@ -373,6 +373,7 @@ impl Stack {
         let team = tempfile::tempdir().unwrap();
         let team_file = team.path().join("team.yaml");
         std::fs::write(&team_file, TEAM).unwrap();
+        let state = tempfile::tempdir().unwrap();
         let http = reqwest::Client::new();
         let bots = Bots::new(BotsConfig {
             slack: SlackApi::new(slack_base, SLACK_BOT_TOKEN, http.clone()),
@@ -382,6 +383,7 @@ impl Stack {
             default_tz: "UTC".into(),
             github_org: None,
             response_url_prefix: "https://hooks.slack.com/".into(),
+            state_dir: state.path().to_path_buf(),
         });
         Self {
             slack,
@@ -389,7 +391,7 @@ impl Stack {
             runtime,
             tools,
             bots,
-            state: tempfile::tempdir().unwrap(),
+            state,
             _team: team,
             stop: vec![stop_slack, stop_rt, stop_ts],
             socket: None,
@@ -1460,9 +1462,10 @@ async fn envelopes_are_acked_before_slow_work() {
         );
         assert!(acked < work_at, "{id}: the ack comes before the work");
     }
-    // The card shows the decision is under way before the slow write returns.
+    // The card shows the decision is under way before the slow write returns (a reply
+    // draft: "Posting…").
     let first_update = stack.calls("chat.update", 1).await[0].clone();
-    assert!(text_of(&first_update).contains("Approving…"));
+    assert!(text_of(&first_update).contains("Posting…"));
     assert!(first_update.at < decided_at);
     stack.calls("chat.update", 2).await;
     stack.stop().await;
