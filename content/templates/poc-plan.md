@@ -48,4 +48,5 @@ Out of scope:
 | | |
 
 ## Exit and next steps
-<!-- What happens on pass, on partial pass and on fail. -->
+<!-- What happens on pass (buy), on partial pass (extend once, with a date) and on fail
+(stop, and what we learned). Agreed with the customer before the POC starts. -->

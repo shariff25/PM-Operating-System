@@ -12,6 +12,10 @@
 # The exemplars in content/context/exemplars/ and the templates in content/templates/ come
 # from the checkout's content.
 #
+# The launch skills add six more structure tasks (release-notes, status-update, poc-plan,
+# partner-brief, advisory-draft, launch-checklist). The seventh, jira-draft, drafts Jira issues
+# and not a page, so its tasks are in evals/categories/jira-draft/.
+#
 # What the tasks check is deterministic: a draft exists (or doesn't), it is in the right
 # space, its title has the skill's prefix, and its body has the template's headings, written
 # exactly as docs/pm-craft-spec.md §1 lists them. Whether the thinking is good is for the
@@ -23,7 +27,8 @@ bot: personal
 description: >-
   A PM asks their personal bot for senior-PM work: a problem statement, strategy, decision,
   metrics tree, experiment plan or readout, PRD, call synthesis, competitive brief, sizing, AI
-  feature spec or eval plan, or a review of a page. The bot must draft one Confluence page
+  feature spec or eval plan, release notes, status update, POC plan, partner brief, advisory
+  or launch checklist, or a review of a page. The bot must draft one Confluence page
   from the skill's template, ask about the problem when it is given only a solution, take
   sample sizes from the stats tools, and review without drafting. Seed tasks against the fake
   Jira, Confluence and docs fixtures.

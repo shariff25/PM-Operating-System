@@ -1,0 +1,22 @@
+# seed: replace with case cards
+# Fixture: epic PM-101 and the docs page vault-saml-sso. Globex is the fictional customer.
+# The poc-plan skill titles its draft `POC plan: …` and follows content/templates/poc-
+# plan.md: Objective, Scope, Success criteria, Environment and prerequisites, Timeline,
+# Roles, Risks, Exit and next steps.
+id: structure-poc-plan
+ask: "Draft anyway, no questions: a POC plan in the PM space for a trial of SAML SSO in the Acme Vault console with Globex (epic PM-101)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["POC plan:", "Objective", "Scope", "Success criteria", "Exit and next steps"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: poc-plan
+tags:
+  - model/draft-content

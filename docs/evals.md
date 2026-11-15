@@ -618,7 +618,8 @@ to answer. The judge `faithful-to-cited-page` applies to the category, advisory 
 labels.
 
 ### The seed categories: `jira-draft`, `confluence-draft`, `slack-reply`
-Three tasks each for `bot: personal`, against the fake connectors' fixtures
+Three tasks each (four for `jira-draft`, which also checks that an issue already in Jira is
+not recreated) for `bot: personal`, against the fake connectors' fixtures
 (`crates/toolserver/src/connectors/fake.rs`): Jira project PM (epic PM-101, story PM-102, bug
 PM-103 with a planted prompt injection), Confluence space PM (pages 9001 and 9002), and the
 `#field-questions` thread (channel C0FIELD, ts 1731500000.000100). Every task has `drafts:`
@@ -635,14 +636,14 @@ asks for.
   exists (`--as <handle>` runs against `pm-<handle>`).
 
 ### `pm-craft`
-The senior-PM bar (`docs/pm-craft.md`; the spec is §6 of `docs/pm-craft-spec.md`). Seventeen
+The senior-PM bar (`docs/pm-craft.md`; the spec is §6 of `docs/pm-craft-spec.md`). Twenty-three
 seed tasks for `bot: personal`, on the same fake fixtures as the seed categories plus the fake
 docs pages. Like them, it is marked "seed: replace with case cards", has no `pass_bar` and
 runs each task once.
 
 | Tasks | The ask | What is checked |
 | --- | --- | --- |
-| `structure-<skill>`, one per doc skill (12) | "Draft anyway, no questions: …" for a document in the PM space | One `confluence.create_draft` draft in space PM, with `space`, `title` and `body`; its text has the skill's title prefix (`Problem:`, `Strategy:`, `PRD:`, …) and three or more of the template's headings; no `<think>`, `TODO` or `<!--` left in it |
+| `structure-<skill>`, one per skill that drafts a page (18) | "Draft anyway, no questions: …" for a document in the PM space | One `confluence.create_draft` draft in space PM, with `space`, `title` and `body`; its text has the skill's title prefix (`Problem:`, `Strategy:`, `PRD:`, …) and three or more of the template's headings; no `<think>`, `TODO` or `<!--` left in it |
 | `product-sense-asks-before-drafting` | A PRD for a solution with no user or problem, and no "draft anyway" | No draft (`approvals: 0`, `count: 0`), and the answer asks a question (`?`) |
 | `decision-recommends-among-options` | A decision doc between two options | The draft has "Recommendation" and "Options" |
 | `numbers-sample-size-from-tool` | An experiment plan for a 10% baseline and a 10% relative lift, with the defaults | The draft has the per-arm sample size `stats.sample_size` returns |
