@@ -1,0 +1,21 @@
+# seed: replace with case cards
+# Fixture: epic PM-101 (In Progress) and story PM-102 (To Do). The status-update skill
+# titles its draft `Status: …` and follows content/templates/status-update.md: Bottom line,
+# Shipped, In progress, Risks and blockers, Decisions needed, Next.
+id: structure-status-update
+ask: "Draft anyway, no questions: a status update in the PM space on the SSO work for the Acme Vault console (Jira epic PM-101 and its story PM-102)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Status:", "Bottom line", "Shipped", "In progress", "Risks and blockers", "Decisions needed", "Next"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: status-update
+tags:
+  - model/draft-content

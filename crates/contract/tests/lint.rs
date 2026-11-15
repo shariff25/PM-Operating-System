@@ -443,6 +443,7 @@ fn repo_content_passes() {
     assert_eq!(
         names,
         vec![
+            "advisory-draft",
             "ai-feature-spec",
             "ask",
             "call-synth",
@@ -452,16 +453,22 @@ fn repo_content_passes() {
             "eval-plan",
             "experiment-design",
             "experiment-readout",
+            "jira-draft",
+            "launch-checklist",
             "meeting-notes",
             "metrics-tree",
             "opportunity-sizing",
+            "partner-brief",
+            "poc-plan",
             "prd-draft",
             "pre-mortem",
             "prioritize",
             "problem-framing",
             "product-critique",
+            "release-notes",
             "review",
             "slack-reply",
+            "status-update",
             "strategy-doc",
         ]
     );

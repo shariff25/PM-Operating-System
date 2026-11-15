@@ -25,8 +25,10 @@ tools, not the model's arithmetic.
 | Strategy and decisions | `strategy-doc`, `decision-doc`, `prioritize`, `pre-mortem` |
 | Metrics and experiments | `metrics-tree`, `experiment-design`, `experiment-readout` |
 | Documents and review | `prd-draft`, `review` (a panel of 11 reviewers, up to 4 a run, read-only) |
-| Customers and market | `call-synth`, `competitive-brief`, `opportunity-sizing` |
+| Customers and market | `call-synth`, `competitive-brief`, `opportunity-sizing`, `poc-plan`, `partner-brief` |
 | AI products | `ai-feature-spec`, `eval-plan` |
+| Delivery and launch | `release-notes`, `status-update`, `launch-checklist`, `jira-draft` |
+| Trust | `advisory-draft` (drafts only; security and legal approve first) |
 
 What each skill is for, with an example ask, is in [`docs/pm-craft.md`](docs/pm-craft.md).
 
