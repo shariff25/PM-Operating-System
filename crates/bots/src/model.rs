@@ -249,7 +249,8 @@ text_enum!(
 pub struct ApprovalOutcome {
     pub id: String,
     pub tool: Option<String>,
-    /// `approved`, `rejected`, `failed`, or `missing` when the tool server no longer has it.
+    /// `approved`, `rejected`, `failed`, `expired` (a Slack draft nobody decided within a
+    /// day), or `missing` when the tool server no longer has it.
     pub status: String,
     pub decided_by: Option<String>,
 }
