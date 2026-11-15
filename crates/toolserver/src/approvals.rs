@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::ledger::{args_edit_distance, LedgerOutcome, LedgerQuery, LedgerRow, Reason};
 use crate::store::{StoreError, StoreResult};
 
 /// How long a grant stays valid after the PM approves.
@@ -113,6 +114,30 @@ pub enum Decision {
     Reject,
 }
 
+/// A decision with what came with it: the edited arguments for `edit`, and optionally a
+/// reason for `reject` (the ledger keeps it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Verdict {
+    pub decision: Decision,
+    pub args: Option<Value>,
+    pub reason: Option<Reason>,
+}
+
+impl Verdict {
+    pub fn new(decision: Decision, args: Option<Value>) -> Self {
+        Self {
+            decision,
+            args,
+            reason: None,
+        }
+    }
+
+    /// The reason to store: only a rejection keeps one.
+    fn stored_reason(&self) -> Option<Reason> {
+        self.reason.filter(|_| self.decision == Decision::Reject)
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DecideError {
     #[error("approval item not found")]
@@ -136,10 +161,34 @@ pub struct NewItem<'a> {
     pub run_id: &'a str,
     pub tool: &'a str,
     pub args: &'a Value,
+    /// For the ledger: the content repo's `HEAD` when the item was drafted.
+    pub content_sha: Option<&'a str>,
+    /// For the ledger: the drafting role's gateway alias, such as `pmos/default`.
+    pub model_alias: Option<&'a str>,
 }
 
 impl NewItem<'_> {
-    pub fn into_item(self, now: DateTime<Utc>) -> ApprovalItem {
+    /// The item's ledger row, as created.
+    pub fn ledger_row(&self, item: &ApprovalItem) -> LedgerRow {
+        LedgerRow {
+            id: item.id.clone(),
+            run_id: item.run_id.clone(),
+            user: item.user.clone(),
+            bot: item.bot.clone(),
+            skill: item.skill.clone(),
+            tool: item.tool.clone(),
+            content_sha: self.content_sha.map(String::from),
+            model_alias: self.model_alias.map(String::from),
+            outcome: LedgerOutcome::Pending,
+            edit_distance: None,
+            reason: None,
+            created_at: item.created_at,
+            decided_at: None,
+            decided_by: None,
+        }
+    }
+
+    pub fn into_item(&self, now: DateTime<Utc>) -> ApprovalItem {
         ApprovalItem {
             id: format!("apr_{}", uuid::Uuid::new_v4().simple()),
             user: self.user.to_string(),
@@ -158,8 +207,10 @@ impl NewItem<'_> {
     }
 }
 
-/// Grants and approval items. `session_key` is the session token's hash
-/// ([`crate::session::token_hash`]), never the token itself.
+/// Grants, approval items and the feedback ledger (`ledger.rs`). `session_key` is the
+/// session token's hash ([`crate::session::token_hash`]), never the token itself.
+///
+/// Creating, deciding and completing an item update its ledger row in the same operation.
 #[async_trait]
 pub trait ApprovalRepo: Send + Sync {
     /// Record that the PM approved this exact call; valid for [`GRANT_TTL_MINUTES`].
@@ -181,6 +232,7 @@ pub trait ApprovalRepo: Send + Sync {
         now: DateTime<Utc>,
     ) -> StoreResult<bool>;
 
+    /// Create a pending item and its ledger row.
     async fn create(&self, new: NewItem<'_>, now: DateTime<Utc>) -> StoreResult<ApprovalItem>;
 
     async fn get(&self, id: &str) -> StoreResult<Option<ApprovalItem>>;
@@ -188,10 +240,7 @@ pub trait ApprovalRepo: Send + Sync {
     /// Items for one user, newest first, optionally filtered by status.
     async fn list(&self, user: &str, status: Option<Status>) -> StoreResult<Vec<ApprovalItem>>;
 
-    /// Record a decision. Only the item's own user may decide, and only once: of two
-    /// concurrent decisions, exactly one succeeds. Approve and edit move the item to
-    /// `executing` and return it with the arguments to run; the caller runs the write and then
-    /// calls `complete`.
+    /// Record a decision with no reason. See [`ApprovalRepo::decide_with`].
     async fn decide(
         &self,
         id: &str,
@@ -199,10 +248,29 @@ pub trait ApprovalRepo: Send + Sync {
         decision: Decision,
         edited_args: Option<Value>,
         now: DateTime<Utc>,
+    ) -> Result<ApprovalItem, DecideError> {
+        self.decide_with(id, decided_by, Verdict::new(decision, edited_args), now)
+            .await
+    }
+
+    /// Record a decision. Only the item's own user may decide, and only once: of two
+    /// concurrent decisions, exactly one succeeds. Approve and edit move the item to
+    /// `executing` and return it with the arguments to run; the caller runs the write and then
+    /// calls `complete`.
+    ///
+    /// The ledger row takes the decision: a rejection with its reason, or an approval with
+    /// the edit distance between the original and the final arguments (`0.0` unchanged).
+    async fn decide_with(
+        &self,
+        id: &str,
+        decided_by: &str,
+        verdict: Verdict,
+        now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError>;
 
     /// Store the outcome of an executing write: `approved` with the result, or `failed`
-    /// with the error. Only an `executing` item changes; `None` otherwise.
+    /// with the error. Only an `executing` item changes; `None` otherwise. The ledger row
+    /// becomes `approved`, `edited` (approved after a change to its arguments) or `failed`.
     async fn complete(
         &self,
         id: &str,
@@ -212,6 +280,10 @@ pub trait ApprovalRepo: Send + Sync {
     /// Items still `executing` that were decided at or before `before`: writes interrupted
     /// by a crash or restart.
     async fn stuck(&self, before: DateTime<Utc>) -> StoreResult<Vec<ApprovalItem>>;
+
+    /// Ledger rows matching `query`, as reported (with `expired` worked out), newest
+    /// activity first.
+    async fn ledger(&self, query: &LedgerQuery) -> StoreResult<Vec<LedgerRow>>;
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +303,13 @@ pub struct MemoryApprovals {
 struct State {
     grants: Vec<Grant>,
     items: BTreeMap<String, ApprovalItem>,
+    ledger: BTreeMap<String, Ledgered>,
+}
+
+/// A stored ledger row, and whether the decision changed the item's arguments.
+struct Ledgered {
+    row: LedgerRow,
+    edited: bool,
 }
 
 #[async_trait]
@@ -278,11 +357,12 @@ impl ApprovalRepo for MemoryApprovals {
 
     async fn create(&self, new: NewItem<'_>, now: DateTime<Utc>) -> StoreResult<ApprovalItem> {
         let item = new.into_item(now);
-        self.state
-            .lock()
-            .expect("approvals lock")
-            .items
-            .insert(item.id.clone(), item.clone());
+        let row = new.ledger_row(&item);
+        let mut state = self.state.lock().expect("approvals lock");
+        state.items.insert(item.id.clone(), item.clone());
+        state
+            .ledger
+            .insert(item.id.clone(), Ledgered { row, edited: false });
         Ok(item)
     }
 
@@ -308,12 +388,11 @@ impl ApprovalRepo for MemoryApprovals {
         Ok(items)
     }
 
-    async fn decide(
+    async fn decide_with(
         &self,
         id: &str,
         decided_by: &str,
-        decision: Decision,
-        edited_args: Option<Value>,
+        verdict: Verdict,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError> {
         let mut state = self.state.lock().expect("approvals lock");
@@ -324,19 +403,41 @@ impl ApprovalRepo for MemoryApprovals {
         if item.status != Status::Pending {
             return Err(DecideError::NotPending);
         }
-        match decision {
-            Decision::Reject => item.status = Status::Rejected,
-            Decision::Approve => item.status = Status::Executing,
+        let reason = verdict.stored_reason();
+        let (distance, edited) = match verdict.decision {
+            Decision::Reject => {
+                item.status = Status::Rejected;
+                (None, false)
+            }
+            Decision::Approve => {
+                item.status = Status::Executing;
+                (Some(0.0), false)
+            }
             Decision::Edit => {
-                let args = edited_args.ok_or(DecideError::MissingArgs)?;
-                item.args_hash = args_hash(&args);
+                let args = verdict.args.ok_or(DecideError::MissingArgs)?;
+                let distance = args_edit_distance(&item.args, &args);
+                let new_hash = args_hash(&args);
+                let edited = new_hash != item.args_hash;
+                item.args_hash = new_hash;
                 item.args = args;
                 item.status = Status::Executing;
+                (Some(distance), edited)
             }
-        }
+        };
         item.decided_at = Some(now);
         item.decided_by = Some(decided_by.to_string());
-        Ok(item.clone())
+        let item = item.clone();
+        if let Some(entry) = state.ledger.get_mut(id) {
+            if verdict.decision == Decision::Reject {
+                entry.row.outcome = LedgerOutcome::Rejected;
+            }
+            entry.row.edit_distance = distance;
+            entry.row.reason = reason;
+            entry.row.decided_at = Some(now);
+            entry.row.decided_by = Some(decided_by.to_string());
+            entry.edited = edited;
+        }
+        Ok(item)
     }
 
     async fn complete(
@@ -352,6 +453,7 @@ impl ApprovalRepo for MemoryApprovals {
         else {
             return Ok(None);
         };
+        let failed = result.is_err();
         match result {
             Ok(value) => {
                 item.status = Status::Approved;
@@ -362,7 +464,15 @@ impl ApprovalRepo for MemoryApprovals {
                 item.result = Some(serde_json::json!({ "error": message }));
             }
         }
-        Ok(Some(item.clone()))
+        let item = item.clone();
+        if let Some(entry) = state.ledger.get_mut(id) {
+            entry.row.outcome = match (failed, entry.edited) {
+                (true, _) => LedgerOutcome::Failed,
+                (false, true) => LedgerOutcome::Edited,
+                (false, false) => LedgerOutcome::Approved,
+            };
+        }
+        Ok(Some(item))
     }
 
     async fn stuck(&self, before: DateTime<Utc>) -> StoreResult<Vec<ApprovalItem>> {
@@ -373,6 +483,25 @@ impl ApprovalRepo for MemoryApprovals {
             .filter(|i| i.status == Status::Executing && i.decided_at.is_some_and(|d| d <= before))
             .cloned()
             .collect())
+    }
+
+    async fn ledger(&self, query: &LedgerQuery) -> StoreResult<Vec<LedgerRow>> {
+        let state = self.state.lock().expect("approvals lock");
+        let mut rows: Vec<LedgerRow> = state
+            .ledger
+            .values()
+            .map(|e| e.row.clone().reported(query.expire_before))
+            .filter(|r| query.matches(r))
+            .collect();
+        rows.sort_by(|a, b| {
+            b.activity_at()
+                .cmp(&a.activity_at())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if let Some(limit) = query.limit {
+            rows.truncate(limit);
+        }
+        Ok(rows)
     }
 }
 

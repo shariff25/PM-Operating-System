@@ -7,8 +7,9 @@
 //!     Every route, and the only token that starts bot sessions.
 //!   - `PMOS_BOT_TOKEN`: the Slack bot. Only sessions for its skills (`PMOS_BOT_SKILLS`) and
 //!     calls within them, reading and deciding one approval item (Slack approval cards),
-//!     onboarding (member requests and decisions, memory repos, setup status), and link URLs
-//!     for team members; never inbox listings, grants, revoking or reindexing.
+//!     onboarding (member requests and decisions, memory repos, setup status), link URLs
+//!     for team members, and reading the feedback ledger (the triage digest); never inbox
+//!     listings, grants, revoking, reindexing or the ledger summary.
 //!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
@@ -22,15 +23,16 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::approvals::{DecideError, Decision, Status};
+use crate::approvals::{DecideError, Decision, Status, Verdict};
 use crate::audit::Client;
+use crate::ledger::{LedgerOutcome, LedgerQuery, Reason, MAX_LIMIT};
 use crate::mcp::PmosMcp;
 use crate::members::RequestStatus;
 use crate::oauth::{OAuth, OAuthError};
@@ -126,6 +128,7 @@ pub fn router_with(
         .route("/grants", post(create_grant))
         .route("/approvals", get(list_approvals))
         .route("/reindex", post(reindex))
+        .route("/ledger/summary", get(ledger_summary))
         .route("/credentials", get(list_credentials))
         .route(
             "/credentials/{user}/{provider}",
@@ -135,13 +138,15 @@ pub fn router_with(
 
     // Any internal client; the bot is limited to its own skills inside each handler. Both
     // may read and decide one approval item: the Slack bot does so from approval cards. Both
-    // run onboarding, and the bot gets link URLs for team members only.
+    // run onboarding, and the bot gets link URLs for team members only. Both read the
+    // ledger: the Slack bot for the daily triage digest.
     let internal = Router::new()
         .route("/sessions", post(create_session))
         .route("/session", axum::routing::delete(revoke_session))
         .route("/call", post(call_tool))
         .route("/approvals/{id}", get(get_approval))
         .route("/approvals/{id}/decision", post(decide))
+        .route("/ledger", get(ledger))
         .route("/oauth/{provider}/start", get(oauth_start))
         .route("/memory/repo", post(set_memory_repo).get(get_memory_repo))
         .route(
@@ -432,6 +437,9 @@ struct DecisionBody {
     decided_by: String,
     decision: Decision,
     args: Option<Value>,
+    /// Only with `reject`: one of the ledger's reasons.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 async fn decide(
@@ -440,16 +448,27 @@ async fn decide(
     Path(id): Path<String>,
     Json(body): Json<DecisionBody>,
 ) -> Response {
+    let reason = match body.reason.as_deref() {
+        None => None,
+        Some(r) => match Reason::parse(r) {
+            Some(reason) => Some(reason),
+            None => {
+                let known: Vec<&str> = Reason::ALL.iter().map(|r| r.as_str()).collect();
+                return error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("unknown reason `{r}`: use one of {}", known.join(", ")),
+                );
+            }
+        },
+    };
+    let verdict = Verdict {
+        decision: body.decision,
+        args: body.args,
+        reason,
+    };
     match state
         .svc
-        .decide_as(
-            client,
-            &id,
-            &body.decided_by,
-            body.decision,
-            body.args,
-            Utc::now(),
-        )
+        .decide_verdict(client, &id, &body.decided_by, verdict, Utc::now())
         .await
     {
         Ok(item) => Json(item).into_response(),
@@ -465,6 +484,9 @@ async fn decide(
             error(status, e.to_string())
         }
         Err(e @ DecisionError::InvalidArgs(_)) => error(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e @ DecisionError::ReasonNotAllowed) => {
+            error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+        }
         Err(e @ DecisionError::NotAMember(_)) => error(StatusCode::FORBIDDEN, e.to_string()),
         Err(
             e @ (DecisionError::UnknownTool(_)
@@ -475,6 +497,118 @@ async fn decide(
             tracing::error!(error = %e, "approved write task failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
+    }
+}
+
+// ----- the feedback ledger (docs/improvement-loop-spec.md §1) -------------------------------
+
+#[derive(Deserialize)]
+struct LedgerParams {
+    since: Option<String>,
+    until: Option<String>,
+    bot: Option<String>,
+    /// Comma-separated outcomes.
+    outcome: Option<String>,
+    min_edit: Option<String>,
+    limit: Option<String>,
+}
+
+fn unprocessable(message: impl Into<String>) -> Response {
+    error(StatusCode::UNPROCESSABLE_ENTITY, message)
+}
+
+/// An optional RFC 3339 time parameter; empty is the same as absent.
+fn time_param(name: &str, value: Option<&str>) -> Result<Option<DateTime<Utc>>, String> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => DateTime::parse_from_rfc3339(v)
+            .map(|t| Some(t.with_timezone(&Utc)))
+            .map_err(|_| format!("`{name}` must be an RFC 3339 time")),
+    }
+}
+
+/// The ledger query from the parameters, or why they don't make one (`422`).
+fn ledger_query(q: &LedgerParams) -> Result<LedgerQuery, String> {
+    let since = time_param("since", q.since.as_deref())?;
+    let until = time_param("until", q.until.as_deref())?;
+    let mut outcomes = Vec::new();
+    for name in q
+        .outcome
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+    {
+        let outcome = LedgerOutcome::parse(name).ok_or_else(|| {
+            let known: Vec<&str> = LedgerOutcome::ALL.iter().map(|o| o.as_str()).collect();
+            format!("unknown outcome `{name}`: use {}", known.join(", "))
+        })?;
+        outcomes.push(outcome);
+    }
+    let param = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+    };
+    let min_edit = match param(&q.min_edit) {
+        None => None,
+        Some(v) => Some(
+            v.parse::<f64>()
+                .ok()
+                .filter(|d| (0.0..=1.0).contains(d))
+                .ok_or("`min_edit` must be a number from 0 to 1")?,
+        ),
+    };
+    let limit = match param(&q.limit) {
+        None => MAX_LIMIT,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=MAX_LIMIT).contains(n))
+            .ok_or(format!("`limit` must be from 1 to {MAX_LIMIT}"))?,
+    };
+    Ok(LedgerQuery {
+        since,
+        until,
+        bot: param(&q.bot),
+        outcomes,
+        min_edit,
+        limit: Some(limit),
+        // Set by the service from PMOS_LEDGER_EXPIRE_DAYS.
+        expire_before: Utc::now(),
+    })
+}
+
+/// `{rows: [...]}`, newest first. Labels and metadata only: no draft or message text.
+async fn ledger(State(state): State<AppState>, Query(q): Query<LedgerParams>) -> Response {
+    let query = match ledger_query(&q) {
+        Ok(query) => query,
+        Err(why) => return unprocessable(why),
+    };
+    match state.svc.ledger(query, Utc::now()).await {
+        Ok(rows) => Json(json!({ "rows": rows })).into_response(),
+        Err(e) => unavailable(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SummaryParams {
+    since: Option<String>,
+    bot: Option<String>,
+}
+
+/// Counts, label coverage, median edit distance and rejection reasons per bot and tool.
+async fn ledger_summary(State(state): State<AppState>, Query(q): Query<SummaryParams>) -> Response {
+    let since = match time_param("since", q.since.as_deref()) {
+        Ok(since) => since,
+        Err(why) => return unprocessable(why),
+    };
+    let bot = q.bot.filter(|b| !b.trim().is_empty());
+    match state.svc.ledger_summary(since, bot, Utc::now()).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(e) => unavailable(e),
     }
 }
 

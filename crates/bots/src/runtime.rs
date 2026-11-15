@@ -19,7 +19,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::catalog::Catalog;
-use crate::clients::{valid_approval_id, ApprovalState, CallError, Gateway, ToolServer};
+use crate::clients::{valid_approval_id, ApprovalState, CallError, Gateway, TaskDraft, ToolServer};
 use crate::model::{
     self, ApprovalOutcome, ChecklistItem, Draft, NewNotification, Notification, NotificationKind,
     Routine, Schedule, SlackRef, Source, Task, TaskStatus, TraceKind, GAVE_UP_REASON,
@@ -686,6 +686,26 @@ impl Runtime {
             self.bump();
         }
         Ok(closed)
+    }
+
+    /// The task's drafted outbound actions, one per approval item, in the order the worker
+    /// reported them, read from the tool server with the service token
+    /// (`docs/improvement-loop-spec.md` §3).
+    pub async fn drafts(&self, task: &Task) -> Result<Vec<TaskDraft>> {
+        let mut drafts = Vec::with_capacity(task.approvals.len());
+        for id in &task.approvals {
+            match self.toolserver.draft(id).await {
+                Ok(Some(draft)) => drafts.push(draft),
+                Ok(None) => drafts.push(TaskDraft::missing(id)),
+                Err(e) => {
+                    tracing::warn!(error = %e, task = %task.id, "couldn't read drafts");
+                    return Err(Error::Unavailable(format!(
+                        "{e}; the task's drafts can't be read, try again shortly"
+                    )));
+                }
+            }
+        }
+        Ok(drafts)
     }
 
     // ----- notifications -------------------------------------------------------------------
