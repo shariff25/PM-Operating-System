@@ -1,0 +1,20 @@
+# seed: replace with case cards
+# The roadmap-tradeoffs skill titles its draft `Roadmap trade-offs:` and follows
+# content/templates/roadmap-tradeoffs.md. It always says what stops (the heading What we stop).
+id: structure-roadmap-tradeoffs
+ask: "Draft anyway, no questions: roadmap trade-offs in the PM space for next year: audit log export or SCIM user provisioning (Jira story PM-102) for the Acme Vault console, given the October Acme Cloud call notes (Confluence page 9001)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Roadmap trade-offs:", "The choice", "What we stop", "Cross-team effects"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: roadmap-tradeoffs
+tags:
+  - model/draft-content

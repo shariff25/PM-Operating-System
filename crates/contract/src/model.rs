@@ -168,6 +168,8 @@ pub struct Skill {
     pub tools: Vec<String>,
     pub surfaces: Vec<String>,
     pub ships_in: Option<String>,
+    /// The catalog heading the skill is listed under, such as "Everyday" (`metadata.track`).
+    pub track: Option<String>,
 }
 
 /// Domains of the context library (CTX-1), plus `exemplars` for past PRDs and plans (CTX-4).

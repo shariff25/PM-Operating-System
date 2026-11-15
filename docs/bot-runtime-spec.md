@@ -97,7 +97,7 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 | `slack` | create tasks (as `X-Pmos-User`), read their own tasks, notifications, and routines for `X-Pmos-User` |
 | `worker` | claim, heartbeat, events, trace, complete, fail |
 | `console` | read everything; pause, resume and delete routines; cancel tasks |
-| `evals` | create tasks with `source: "eval"`, and read them |
+| `evals` | create tasks with `source: "eval"` (and a task `level`), and read them |
 
 ### Task
 ```json
@@ -121,9 +121,11 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 ### API
 | Method and path | Client | Notes |
 | --- | --- | --- |
+| `GET /v1/members/{handle}/settings` | slack (own handle, from `X-Pmos-User`), console | `{"handle": "ana", "level": "senior"}`. An unset level reads as `senior`. |
+| `PUT /v1/members/{handle}/settings` `{level}` | slack (own handle only) | The same shape. The handle must be a member. An unknown level is `400`; another member's handle is `403`. |
 | `GET /v1/bots` | all | `[{name, role, scope, owner, description}]` |
 | `GET /v1/bots/{name}` | all | the bot, its role, its tools, and each write tool's setting |
-| `POST /v1/tasks` `{bot, requested_by, text, source, slack?}` | slack, evals | `201` with the Task. `403` if `requested_by` may not use the bot: personal bots serve their owner only, and team bots serve team members. |
+| `POST /v1/tasks` `{bot, requested_by, text, source, slack?, level?}` | slack, evals | `201` with the Task. `403` if `requested_by` may not use the bot: personal bots serve their owner only, and team bots serve team members. |
 | `GET /v1/tasks/{id}`, `GET /v1/tasks?bot=&requested_by=&status=&limit=` | slack (own), console, evals | |
 | `POST /v1/tasks/{id}/cancel` | slack (own), console | |
 | `GET /v1/tasks/{id}/events` | slack (own), console, evals | `[{at, kind, text}]` |
@@ -141,6 +143,23 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 | `PATCH /v1/routines/{id}` `{enabled?, schedule?, prompt?}` | slack (own), console | |
 | `DELETE /v1/routines/{id}` | slack (own), console | |
 | `GET /healthz`, `GET /readyz` | none | readiness covers storage plus the tool server and the gateway |
+
+### Levels and member settings
+A PM's level (`senior`, `staff` or `principal`; `docs/levels.md`) is their own working
+preference, so it lives in the runtime, which builds each task's claim, and not in `team.yaml`.
+- **Store:** `member_settings {handle (key), level, updated_at}`, on the memory and Postgres
+  stores.
+- **The claim carries `level`:** the task's own `level` if it has one, else the setting of
+  `task.requested_by`, else `senior`.
+- **A task's own level:** `POST /v1/tasks` accepts an optional `level` from client `evals` only
+  (`403` from any other client), stored on the task. A benchmark category's `level` is sent this
+  way.
+- **The harness** parses `level` in the claim (default `senior`) and, for a personal bot, adds to
+  the system prompt: "Your PM works at the <Senior|Staff|Principal> level. Read
+  /content/playbooks/levels.md and work at that level's scope, horizon and audience, unless the
+  request says otherwise." Every bot's prompt also says "Today is <YYYY-MM-DD>."
+- **Slack:** the DM commands `level`, `level senior`, `level staff` and `level principal`
+  read and write the setting through the two routes above.
 
 ### Routines (D8)
 ```json
@@ -233,7 +252,7 @@ Admins (role `admin` in `team.yaml`) see everything; a PM sees their own bots, r
   They are written as a script for the Spark, plus generator unit tests here.
 
 ## 8. Benchmarks (0g): `evals/` and `pmos-evals`
-- **Categories:** `evals/categories/<name>/category.yaml` holds `{name, bot, pass_bar}`.
+- **Categories:** `evals/categories/<name>/category.yaml` holds `{name, bot, pass_bar, level?}`.
   - Tasks are `tasks/*.yaml` with `{id, ask, expect: {must_cite?: [url], must_include?: [text], must_not_include?: [text], approvals?: n}}`.
   - The first category is `docs-qa`: a template category. A team writes its own questions against its own docs site; the example tasks run against the fake docs fixtures (`evals/categories/docs-qa/README.md`).
 - **Runner:** `pmos-evals run --category docs-qa` creates tasks through the runtime API (client `evals`), waits for them, and grades each one.

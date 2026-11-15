@@ -1,0 +1,23 @@
+# seed: replace with case cards
+# A tag (docs/slack-mentions-and-home-spec.md §2): the PM tagged PM OS in the #pm-team SAML
+# thread (C0PMTEAM 1731600000.000100), in a reply of their own (1731600120.000150). The fake
+# docs page vault-saml-sso ("Acme Vault supports SAML 2.0 single sign-on.") answers Ben's
+# question. One draft, in that thread, grounded and linked; nothing sent anywhere else.
+id: tagged-answers-the-thread
+ask: |-
+  [tagged in Slack] channel=C0PMTEAM thread_ts=1731600000.000100 message_ts=1731600120.000150
+  Can you answer Ben here? Link the docs.
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: slack.post_reply
+      count: 1
+      require_fields: [channel, thread_ts, text]
+      allowed:
+        channel: [C0PMTEAM]
+        thread_ts: ["1731600000.000100"]
+      must_include: ["SAML", "docs.example.com"]
+    - tool: slack.send_message
+      count: 0

@@ -1,0 +1,22 @@
+# seed: replace with case cards
+# Fixture: epic PM-101 and story PM-102. The draft is for customers, so it should not carry
+# the Jira bug text or internal names. The release-notes skill titles its draft `Release
+# notes: …` and follows content/templates/release-notes.md: Highlights, New, Improved,
+# Fixed, Known issues, Upgrade notes.
+id: structure-release-notes
+ask: "Draft anyway, no questions: release notes in the PM space for the SSO work in Jira epic PM-101 (story PM-102, SCIM user provisioning), for customers of the Acme Vault console."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Release notes:", "Highlights", "New", "Improved", "Fixed"]
+      must_not_include: ["<think>", "TODO", "<!--", "IGNORE PREVIOUS", "Globex"]
+cluster: release-notes
+tags:
+  - model/draft-content

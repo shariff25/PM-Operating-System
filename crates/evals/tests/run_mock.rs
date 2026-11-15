@@ -152,6 +152,10 @@ async fn full_run_grades_tags_and_writes_reports() {
     assert!(bodies
         .iter()
         .all(|b| b["source"] == "eval" && b["bot"] == "docs" && b["requested_by"] == "ana"));
+    assert!(
+        bodies.iter().all(|b| b.get("level").is_none()),
+        "no level without one in category.yaml: the requester's setting applies"
+    );
 
     let by_id = |id: &str| report.tasks.iter().find(|t| t.id == id).unwrap();
     assert!(by_id("t-pass").passed, "{:?}", by_id("t-pass").failures);
@@ -282,8 +286,21 @@ async fn load_test_reports_percentiles_against_targets() {
         poll: Duration::from_millis(10),
         timeout: Duration::from_secs(5),
     };
-    let result = run_load(&rt, "docs", "ana", &["ask".to_string()], 5, &follow).await;
+    let result = run_load(
+        &rt,
+        "docs",
+        "ana",
+        &["ask".to_string()],
+        Some("staff"),
+        5,
+        &follow,
+    )
+    .await;
     assert_eq!(mock.created_bodies().len(), 5);
+    assert!(
+        mock.created_bodies().iter().all(|b| b["level"] == "staff"),
+        "the category's level goes on every task"
+    );
     assert_eq!(result.unfinished(), 0);
 
     // One task at a time: queue times about 0, 60, 120, 180 and 240 ms.
@@ -340,6 +357,7 @@ async fn load_test_counts_unfinished_tasks() {
         "docs",
         "ana",
         &["stuck".to_string(), "fine".to_string()],
+        None,
         4,
         &follow,
     )
@@ -404,6 +422,7 @@ async fn cli_run_history_and_check() {
         String::from_utf8_lossy(&check.stderr)
     );
     assert!(String::from_utf8_lossy(&check.stdout).contains("cat: 1 tasks for bot `docs`"));
+    assert!(!String::from_utf8_lossy(&check.stdout).contains("level"));
 
     let no_token = run(s(&["run", "--category", "cat", "--bots-url", &url]))
         .await
@@ -473,4 +492,76 @@ async fn cli_run_history_and_check() {
     let history = run(s(&["history", "--category", "cat"])).await.unwrap();
     assert_eq!(history.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&history.stdout).contains("has not met"));
+}
+
+/// A category at a level (`docs/staff-principal-spec.md` §6): every task the runner creates
+/// carries it, and `check` reports it.
+#[tokio::test]
+async fn a_category_level_goes_on_every_task_and_check_reports_it() {
+    let mock = Arc::new(Mock::default());
+    let good = "Done.".to_string();
+    for ask in ["q-one", "q-two"] {
+        mock.script(
+            ask,
+            Script {
+                result: Some(good.clone()),
+                ..Script::default()
+            },
+        );
+    }
+    let url = spawn(mock.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (a, ay) = task("t-one", "q-one", "  approvals: 0\n");
+    let (b, by) = task("t-two", "q-two", "  approvals: 0\n");
+    write_category(
+        dir.path(),
+        "staff-craft",
+        "personal",
+        1.0,
+        &[(a.as_str(), ay), (b.as_str(), by)],
+    );
+    let path = dir.path().join("categories/staff-craft/category.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{yaml}level: staff\n")).unwrap();
+    common::write_taxonomy(dir.path());
+    let category = load_category(dir.path(), "staff-craft").unwrap();
+    assert_eq!(category.level.as_deref(), Some("staff"));
+
+    let rt = Runtime::new(&url, TOKEN, None);
+    let mut o = opts(1500);
+    o.repeats = 2;
+    let report = run_category(&rt, &url, &category, &o).await;
+    let bodies = mock.created_bodies();
+    assert_eq!(bodies.len(), 4);
+    assert!(
+        bodies
+            .iter()
+            .all(|b| b["level"] == "staff" && b["bot"] == "pm-ana" && b["source"] == "eval"),
+        "{bodies:?}"
+    );
+    assert_eq!(report.tasks.len(), 4);
+
+    let out = tokio::task::spawn_blocking({
+        let root = dir.path().to_path_buf();
+        move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_pmos-evals"))
+                .arg("--root")
+                .arg(&root)
+                .arg("check")
+                .output()
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("staff-craft: 2 tasks for bot `personal`, bar 100%, level staff"),
+        "{stdout}"
+    );
 }

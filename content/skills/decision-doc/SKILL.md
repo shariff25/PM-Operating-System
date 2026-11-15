@@ -9,6 +9,7 @@ metadata:
   tools: "context.search context.read jira.search jira.read confluence.search confluence.read confluence.create_draft docs.search docs.read"
   surfaces: "slack web cli"
   ships-in: "pilot"
+  track: "Strategy and decisions"
 ---
 
 # /decision-doc
@@ -45,9 +46,14 @@ and what each costs.
    - tradeoffs with evidence, what the pick gives up, why each loser lost;
    - reversible or one-way, the cost of undoing it, the riskiest assumption and its
      cheapest test, a review date.
-5. Check the draft against `/content/playbooks/bar.md`. Fix what fails, once. What the
-   sources can't settle goes under "Open questions" with a suggested owner.
-6. Propose the draft with `confluence.create_draft`, titled `Decision: <the question>`, in
+5. Read `/content/playbooks/levels.md`. At the Staff or Principal level, end the
+   document, after the template's headings, with `## Cross-team effects` (which teams
+   pay, what they stop, who must agree). At Principal, add `## What must be true` after
+   it (two or three conditions over 2 to 3 years, each with its failing signpost).
+6. Check the draft against `/content/playbooks/bar.md` and the level's checks in
+   `levels.md`. Fix what fails, once. What the sources can't settle goes under "Open
+   questions" with a suggested owner.
+7. Propose the draft with `confluence.create_draft`, titled `Decision: <the question>`, in
    the space the PM named or their default. Then reply with the recommendation in one line,
    what is waiting for approval, and the top open question.
 

@@ -1,0 +1,20 @@
+# seed: replace with case cards
+# The okr-draft skill titles its draft `OKRs:` and follows content/templates/okrs.md: one
+# objective and at most four key results.
+id: structure-okr-draft
+ask: "Draft anyway, no questions: OKRs in the PM space for the next two quarters for enterprise identity across Acme Vault (SAML SSO, Jira epic PM-101, and SCIM, story PM-102)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["OKRs:", "Objective", "Key results", "What we won't chase", "How each is measured"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: okr-draft
+tags:
+  - model/draft-content

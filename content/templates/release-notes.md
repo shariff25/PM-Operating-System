@@ -12,9 +12,12 @@ Released <date>.
 <!-- Two or three sentences a customer would care about. -->
 
 ## New
+<!-- What changed for the customer, not the ticket title. Customer-facing words only: no
+internal names, customer names or unreleased work. -->
 - **<Feature>.** What it does and who it helps. (<JIRA-KEY>)
 
 ## Improved
+<!-- Something that already existed and now works better, and what the customer notices. -->
 -
 
 ## Fixed

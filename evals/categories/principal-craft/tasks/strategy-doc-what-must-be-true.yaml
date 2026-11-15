@@ -1,0 +1,22 @@
+# seed: replace with case cards
+# At the Principal level a strategy-doc ends with `## Cross-team effects` and
+# `## What must be true` (the conditions the bet depends on over 2 to 3 years, with a signpost
+# for each), after the template's own headings (docs/staff-principal-spec.md §1).
+# Fixtures: epic PM-101, story PM-102 and page 9001.
+id: strategy-doc-what-must-be-true
+ask: "Draft anyway, no questions: a strategy doc in the PM space for where Acme Vault goes in enterprise identity over the next three years (SAML SSO and SCIM), from Jira epic PM-101, story PM-102 and the October Acme Cloud call notes (Confluence page 9001)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Strategy:", "Diagnosis", "Guiding choice", "Cross-team effects", "What must be true"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: strategy-doc
+tags:
+  - model/draft-content

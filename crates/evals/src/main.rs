@@ -323,6 +323,30 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// `pmos-evals check`'s line for a category: "staff-craft: 8 tasks for bot `personal`, no
+/// bar (reports only), level staff".
+fn check_line(c: &pmos_evals::spec::Category) -> String {
+    format!(
+        "{}: {} tasks for bot `{}`, {}{}{}",
+        c.name,
+        c.tasks.len(),
+        c.bot,
+        match c.pass_bar {
+            Some(b) => format!("bar {:.0}%", b * 100.0),
+            None => "no bar (reports only)".into(),
+        },
+        if c.repeats > 1 {
+            format!(", {} repeats", c.repeats)
+        } else {
+            String::new()
+        },
+        match &c.level {
+            Some(level) => format!(", level {level}"),
+            None => String::new(),
+        }
+    )
+}
+
 fn check(root: &Path, category: Option<String>, content: &Path) -> Result<bool> {
     let mut problems: Vec<String> = Vec::new();
     let all = category_names(root)?;
@@ -358,21 +382,7 @@ fn check(root: &Path, category: Option<String>, content: &Path) -> Result<bool> 
     for name in &names {
         match load_category(root, name) {
             Ok(c) => {
-                println!(
-                    "{}: {} tasks for bot `{}`, {}{}",
-                    c.name,
-                    c.tasks.len(),
-                    c.bot,
-                    match c.pass_bar {
-                        Some(b) => format!("bar {:.0}%", b * 100.0),
-                        None => "no bar (reports only)".into(),
-                    },
-                    if c.repeats > 1 {
-                        format!(", {} repeats", c.repeats)
-                    } else {
-                        String::new()
-                    }
-                );
+                println!("{}", check_line(&c));
                 if let Some(reg) = &registry {
                     problems.extend(check_draft_tools(root, &c, reg));
                 }
@@ -581,7 +591,16 @@ async fn real_main(cli: Cli) -> Result<bool> {
             let r = resolve(&args.conn, &config, None)?;
             let bot = resolve_bot(&category.bot, &r.requested_by);
             let asks: Vec<String> = category.tasks.iter().map(|t| t.ask.clone()).collect();
-            let result = run_load(&r.rt, &bot, &r.requested_by, &asks, args.tasks, &r.follow).await;
+            let result = run_load(
+                &r.rt,
+                &bot,
+                &r.requested_by,
+                &asks,
+                category.level.as_deref(),
+                args.tasks,
+                &r.follow,
+            )
+            .await;
             let targets = &config.latency_targets;
             print!("{}", result.to_markdown(&bot, targets));
             Ok(result.verdict(targets, args.enforce_targets))

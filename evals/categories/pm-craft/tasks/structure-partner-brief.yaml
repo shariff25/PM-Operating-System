@@ -1,0 +1,23 @@
+# seed: replace with case cards
+# Fixture: epic PM-101 and page 9001 ("Two customers asked for SSO and audit export."). The
+# fixtures hold nothing on the partner, so the brief's gaps are open questions. The partner-
+# brief skill titles its draft `Partner brief: …` and follows content/templates/partner-
+# brief.md: Bottom line, Who they are, What each side gets, How we work together, Risks,
+# Open questions.
+id: structure-partner-brief
+ask: "Draft anyway, no questions: a partner brief in the PM space on a partnership with Initech to bring SSO to Acme Vault customers (Jira epic PM-101, Confluence page 9001)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Partner brief:", "Bottom line", "What each side gets", "How we work together", "Open questions"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: partner-brief
+tags:
+  - model/draft-content

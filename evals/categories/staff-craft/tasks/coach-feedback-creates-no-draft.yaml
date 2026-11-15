@@ -1,0 +1,19 @@
+# seed: replace with case cards
+# The coach-feedback skill answers the PM who asked, in the thread: the three changes that
+# matter most, each as a question first and a suggestion second, and one thing done well. It
+# sends nothing to the author, creates no page and updates none. Fixture: page 9002 "PRD: Key
+# export v2" in space PM, whose body is one line ("Past PRD used as an exemplar.").
+id: coach-feedback-creates-no-draft
+ask: "Coach me on how to give feedback to the PM who wrote the Key export v2 PRD (Confluence page 9002). What are the three changes that matter most?"
+expect:
+  approvals: 0
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 0
+    - tool: confluence.update_page
+      count: 0
+cluster: coach-feedback
+tags:
+  - model/wrong-draft-count

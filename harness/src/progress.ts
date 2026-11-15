@@ -21,6 +21,7 @@ const FAMILY_MILESTONES: Record<string, { read: string; write: string }> = {
   context: { read: "Checking team context", write: "Checking team context" },
   memory: { read: "Checking its notes", write: "Updating its notes" },
   stats: { read: "Running the numbers", write: "Running the numbers" },
+  bets: { read: "Checking your bets register", write: "Drafting a bets register update" },
 };
 
 /** The tool family of a harness tool name: `jira_create_issue` is `jira`. */

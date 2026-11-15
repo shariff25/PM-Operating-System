@@ -212,7 +212,8 @@ impl LedgerQuery {
 }
 
 /// The text an edit distance is measured on: the item's string arguments, at any depth,
-/// in key order (arrays in their own order), joined with newlines.
+/// in key order (arrays in their own order), joined with newlines. A reply's top-level
+/// `message_ts` is left out: it is an id, never edited, not draft text.
 pub fn draft_text(args: &Value) -> String {
     fn walk(value: &Value, out: &mut Vec<String>) {
         match value {
@@ -226,7 +227,14 @@ pub fn draft_text(args: &Value) -> String {
         }
     }
     let mut parts = Vec::new();
-    walk(args, &mut parts);
+    match args {
+        Value::Object(map) => {
+            let sorted: BTreeMap<&String, &Value> =
+                map.iter().filter(|(k, _)| *k != "message_ts").collect();
+            sorted.into_values().for_each(|v| walk(v, &mut parts));
+        }
+        other => walk(other, &mut parts),
+    }
     parts.join("\n")
 }
 
@@ -417,6 +425,10 @@ mod tests {
             "priority": 3,
         });
         assert_eq!(args_edit_distance(&args, &reordered), 0.0);
+        // A reply's tagged message is an id, not draft text.
+        let tagged =
+            json!({"channel": "C1", "thread_ts": "1.1", "message_ts": "1.2", "text": "Yes."});
+        assert_eq!(draft_text(&tagged), "C1\nYes.\n1.1");
     }
 
     #[test]

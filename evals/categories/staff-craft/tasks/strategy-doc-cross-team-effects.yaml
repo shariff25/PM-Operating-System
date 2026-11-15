@@ -1,0 +1,21 @@
+# seed: replace with case cards
+# At the Staff level a strategy-doc ends with `## Cross-team effects` (which teams pay, what
+# they stop, who must agree), after the template's own headings (docs/staff-principal-spec.md §1).
+# Fixtures: epic PM-101, story PM-102 and page 9001.
+id: strategy-doc-cross-team-effects
+ask: "Draft anyway, no questions: a strategy doc in the PM space for enterprise identity across Acme Vault and Acme Cloud (SAML SSO and SCIM), from Jira epic PM-101, story PM-102 and the October Acme Cloud call notes (Confluence page 9001)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Strategy:", "Diagnosis", "Guiding choice", "What we will do", "Cross-team effects"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: strategy-doc
+tags:
+  - model/draft-content

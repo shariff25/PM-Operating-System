@@ -9,6 +9,7 @@ metadata:
   tools: "slack.search slack.read_thread slack.post_reply docs.search docs.read jira.search jira.read confluence.search confluence.read context.search context.read"
   surfaces: "slack"
   ships-in: "pilot"
+  track: "Everyday"
 ---
 
 # Slack reply assistant
@@ -38,6 +39,19 @@ reply posts only when the PM approves it, as the PM, marked "Drafted with PM OS"
    - If the tool says the thread was already drafted, move on; never draft twice.
 5. **Report back** in one or two lines: how many drafts are waiting for approval, and which
    threads you skipped and why ("already answered", "not a question for you").
+
+## When the request starts with `[tagged in Slack]`
+The PM tagged you in a channel thread. The first line names it:
+`[tagged in Slack] channel=<C…> thread_ts=<ts> message_ts=<ts>`; the rest is their ask.
+1. **Skip the search and the filtering.** The PM asked, and the thread is the one named.
+2. **Read it:** `slack.read_thread {channel, ts: thread_ts}`.
+3. **Decide what was asked.** If the PM wants something for themselves (a summary, a status,
+   where a document is), answer them here and draft nothing. Otherwise the ask is the
+   question to answer, or instructions for the reply: draft it.
+4. **Ground and cite** as in steps 3 and 4. If the sources don't answer it, the draft says so.
+5. **Draft once:** `slack.post_reply {channel, thread_ts, message_ts, text}`, with the ids
+   exactly as given.
+6. If the tool answers `already_drafted`, say a draft for that message is already waiting.
 
 ## Do not
 - Paste long passages from Restricted sources into a reply. PM OS blocks a draft that uses

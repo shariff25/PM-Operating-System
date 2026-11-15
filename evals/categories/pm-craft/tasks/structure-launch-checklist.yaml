@@ -1,0 +1,21 @@
+# seed: replace with case cards
+# Fixture: epic PM-101 and story PM-102. The launch-checklist skill titles its draft `Launch
+# checklist: …` and follows content/templates/launch-checklist.md: Launch decision,
+# Readiness, Owners and dates, Go/no-go criteria, Rollback, Communications, Open items.
+id: structure-launch-checklist
+ask: "Draft anyway, no questions: a launch checklist in the PM space for the SAML SSO launch in the Acme Vault console (Jira epic PM-101 and story PM-102)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Launch checklist:", "Launch decision", "Readiness", "Go/no-go criteria", "Rollback", "Open items"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: launch-checklist
+tags:
+  - model/draft-content

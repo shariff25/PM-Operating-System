@@ -1,0 +1,32 @@
+# seed: replace with case cards
+#
+# The Principal-PM bar (docs/levels.md; the spec is docs/staff-principal-spec.md §6). The
+# runner sends `level: principal` on each task, so the bot works on the company and its
+# market, 2 to 3 years ahead. These tasks run against the fake connectors' fixtures
+# (crates/toolserver/src/connectors/fake.rs):
+# - Jira project PM: epic PM-101 "SSO for the Acme Vault console" (in progress), story PM-102
+#   "SCIM user provisioning" (to do) and bug PM-103 "export fails for large key sets" (to do);
+# - the rollup fixtures (docs/staff-principal-spec.md §3), used only by jira.rollup: the three PM
+#   issues and project CLD with CLD-11 (epic, in progress), CLD-12 (story, done) and CLD-13
+#   (story, to do, due 2026-10-01, unassigned); PM-102 blocks CLD-13. By project: PM 3, CLD 3,
+#   one overdue and one unassigned in CLD, one link;
+# - Confluence space PM: page 9001 "Acme Cloud customer call notes, October" ("Two customers
+#   asked for SSO and audit export.") and page 9002 "PRD: Key export v2";
+# - the docs pages vault-saml-sso and vault-key-rotation, at https://docs.example.com/docs/<slug>.
+#
+# What the tasks check is deterministic: a draft exists, it is in the right space, its title
+# has the skill's prefix, its body has the template's headings (spec §2), the Principal
+# sections are there, and the investment case carries the payback stats.cashflow returns.
+# Whether the thinking is good is for the advisory judge business-effect-as-range
+# (evals/judges/) and for people. Replace the tasks with case cards (evals/case-card.md) as
+# real ones come in. No pass_bar until then: the category reports only.
+name: principal-craft
+bot: personal
+level: principal
+description: >-
+  A Principal PM asks their personal bot for work on company bets: a vision, an investment
+  case with cash-flow numbers, a pricing proposal, a platform strategy, an exec brief, and
+  strategy and decision docs that say what must be true. The bot must draft one Confluence
+  page from the skill's template, take payback and net present value from the cash-flow tool,
+  and end strategy and decision docs with the Principal sections. Seed tasks against the fake
+  Jira, Confluence and docs fixtures.

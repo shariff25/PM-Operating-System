@@ -80,6 +80,9 @@ async fn a_bot_session_gets_its_roles_tools_less_never() {
     assert_eq!(
         tool_names(&f, &mine),
         vec![
+            "bets_list",
+            "bets_read",
+            "bets_record",
             "confluence_create_draft",
             "confluence_read",
             "confluence_search",
@@ -89,10 +92,12 @@ async fn a_bot_session_gets_its_roles_tools_less_never() {
             "docs_search",
             "jira_create_issue",
             "jira_read",
+            "jira_rollup",
             "jira_search",
             "slack_post_reply",
             "slack_read_thread",
             "slack_search",
+            "stats_cashflow",
             "stats_compare",
             "stats_sample_size",
         ]
@@ -814,14 +819,17 @@ async fn the_bot_token_reads_and_decides_one_item() {
     let e = s.fixture.audit.events().last().cloned().unwrap();
     assert_eq!((e.outcome, e.client), (Outcome::Rejected, Client::Bot));
 
-    // Everything else about approvals stays orchestrator-only.
+    // It may list a member's pending items (the App Home; `tests/slack_reply.rs`): none are
+    // left. Everything else about approvals stays orchestrator-only.
     let res = http
         .get(format!("{}/internal/approvals?user=ana", s.base))
         .bearer_auth(BOT_TOKEN)
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 403);
+    assert_eq!(res.status(), 200);
+    let listed: Value = res.json().await.unwrap();
+    assert_eq!(listed, json!({"approvals": [], "total": 0}));
     let res = post(
         &s.base,
         BOT_TOKEN,

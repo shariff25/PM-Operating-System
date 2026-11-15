@@ -26,6 +26,7 @@ describe("tool registry", () => {
       .sort();
     expect(Object.keys(interruptOn).sort()).toEqual(writes);
     expect(writes).toEqual([
+      "bets_record",
       "confluence_create_draft",
       "confluence_update_page",
       "jira_create_issue",

@@ -9,6 +9,7 @@ metadata:
   tools: "context.search context.read confluence.search confluence.read jira.search jira.read docs.search docs.read"
   surfaces: "slack web cli"
   ships-in: "phase-0"
+  track: "Everyday"
 ---
 
 # /ask

@@ -8,7 +8,7 @@ Slack without the PM's approval.
 
 - Plan and phases: [`docs/implementation-plan.md`](docs/implementation-plan.md)
 - File formats: [`docs/contract.md`](docs/contract.md)
-- Working with it as a PM: [`docs/pm-craft.md`](docs/pm-craft.md)
+- Working with it as a PM: [`docs/pm-craft.md`](docs/pm-craft.md); at Staff or Principal level: [`docs/levels.md`](docs/levels.md)
 
 ## What it does
 
@@ -24,11 +24,25 @@ tools, not the model's arithmetic.
 | Product sense | `product-critique`, `problem-framing` |
 | Strategy and decisions | `strategy-doc`, `decision-doc`, `prioritize`, `pre-mortem` |
 | Metrics and experiments | `metrics-tree`, `experiment-design`, `experiment-readout` |
-| Documents and review | `prd-draft`, `review` (a panel of 11 reviewers, up to 4 a run, read-only) |
-| Customers and market | `call-synth`, `competitive-brief`, `opportunity-sizing` |
+| Spec and review | `prd-draft`, `review` (a panel of 11 reviewers, up to 4 a run, read-only) |
+| Customer and market | `call-synth`, `competitive-brief`, `opportunity-sizing`, `poc-plan`, `partner-brief` |
 | AI products | `ai-feature-spec`, `eval-plan` |
+| Delivery and launch | `release-notes`, `status-update`, `launch-checklist`, `jira-draft`, `advisory-draft` (drafts only; security and legal approve first) |
+| Leading across teams | `portfolio-review`, `roadmap-tradeoffs`, `okr-draft`, `business-review`, `alignment-plan`, `coach-feedback`, `bets-register` |
+| Company bets | `vision-doc`, `investment-case`, `pricing-proposal`, `platform-strategy`, `exec-brief` |
 
-What each skill is for, with an example ask, is in [`docs/pm-craft.md`](docs/pm-craft.md).
+**It works at your level.** Each PM sets `senior` (the default), `staff` or `principal`
+(`level staff` in a DM), which changes the scope, horizon and audience of what PM OS writes.
+Staff and Principal PMs also get a rollup of Jira issues across teams, cash-flow numbers for
+business cases, and a register of bets with a monthly review
+([`docs/levels.md`](docs/levels.md)).
+
+What each skill is for, with an example ask, is in [`docs/pm-craft.md`](docs/pm-craft.md). The
+tracks are each skill's `track` field, and the Slack App Home lists skills by them.
+
+In Slack, tag `@PM OS` in a thread to get a draft reply in your DM
+([how](docs/slack-reply.md)), and open the app's **Home** for your waiting drafts, the skills
+and your connected accounts ([how](docs/slack-home.md)).
 
 ## Repo layout
 
@@ -41,7 +55,7 @@ What each skill is for, with an example ask, is in [`docs/pm-craft.md`](docs/pm-
 | `crates/runtime` | Small pieces every service shares: constant-time token checks, SIGTERM-aware shutdown | Rust |
 | `crates/toolserver` | The only path from a sandbox to context and systems: MCP, allowlists, approvals, audit ([docs](docs/toolserver.md)) | Rust |
 | `crates/docs` | `pmos-docs`: MCP server over your company's public docs site ([docs](docs/docs-server.md)) | Rust |
-| `crates/slack` | `pmos-slack`: the Slack bot: DMs to bots, progress, approval cards with reject reasons, the triage digest, routines, onboarding, `/docs` ([docs](docs/docs-server.md)) | Rust |
+| `crates/slack` | `pmos-slack`: the Slack bot: DMs to bots, progress, approval cards with reject reasons, tagging in threads, the App Home, the triage digest, routines, onboarding, `/docs` ([docs](docs/docs-server.md)) | Rust |
 | `crates/bots` | `pmos-bots`: the bot runtime: durable tasks, routines, traces, notifications ([docs](docs/bots-runtime.md)) | Rust |
 | `crates/console` | `pmos-console`: the four-screen console: bots, routines, approvals, activity ([docs](docs/console.md)) | Rust |
 | `crates/policy` | `pmos policy`: one OpenShell sandbox policy per bot, checked in CI ([docs](docs/sandbox-policies.md)) | Rust |

@@ -4,9 +4,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { configFromEnv } from "../src/main.js";
 import { pendingApprovals } from "../src/mcp-tools.js";
 import { milestoneFor } from "../src/progress.js";
+import { ClaimSchema } from "../src/runtime-client.js";
 import {
   type Logger,
   type WorkerConfig,
+  botSystemPrompt,
   createWorker,
   gatewayBaseUrl,
   pmReason,
@@ -218,6 +220,23 @@ describe("harness worker", () => {
     expect(system).not.toContain("meeting-notes");
   });
 
+  it("tells a team bot today's date from the worker's clock, and no level", async () => {
+    const model = new ScriptedModel([new AIMessage("ok")]);
+    const { runtime } = await setup({
+      claims: [{ ...claim("tsk_date"), level: "principal" }],
+      models: { tsk_date: model },
+      config: { now: () => new Date("2026-11-15T23:59:00Z") },
+    });
+    await waitFor(() => runtime.forTask("tsk_date", "complete")[0]);
+    const system = systemText(model.prompts[0] ?? []);
+    const first = system.indexOf("You are docs, a PM OS bot, working on a request from ana.");
+    const date = system.indexOf("Today is 2026-11-15.");
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(date).toBeGreaterThan(first);
+    expect(system.indexOf("ROLE-INSTRUCTIONS")).toBeGreaterThan(date);
+    expect(system).not.toContain("Your PM works at");
+  });
+
   it("fails a task with a reason a PM can read and keeps claiming", async () => {
     const { runtime } = await setup({
       claims: [claim("tsk_bad"), claim("tsk_good")],
@@ -402,6 +421,55 @@ describe("harness worker", () => {
   });
 });
 
+describe("the bot's system prompt", () => {
+  const NOW = new Date("2026-03-01T00:30:00Z");
+  const personal = (level?: string) =>
+    ClaimSchema.parse({
+      ...claim("tsk_p"),
+      bot: { ...DOCS_BOT, name: "pm-ana", scope: "personal" },
+      ...(level ? { level } : {}),
+    });
+  const levelLine = (title: string) =>
+    `Your PM works at the ${title} level. Read /content/playbooks/levels.md and work at that level's scope, horizon and audience, unless the request says otherwise.`;
+
+  it.each([
+    ["senior", "Senior"],
+    ["staff", "Staff"],
+    ["principal", "Principal"],
+  ])("tells a personal bot its PM works at the %s level", (level, title) => {
+    const lines = botSystemPrompt(personal(level), NOW).split("\n\n");
+    expect(lines.slice(0, 4)).toEqual([
+      "You are pm-ana, a PM OS bot, working on a request from ana.",
+      "Today is 2026-03-01.",
+      levelLine(title),
+      "ROLE-INSTRUCTIONS: search the docs first and cite every page.",
+    ]);
+  });
+
+  it("gives a team bot the date and no level line", () => {
+    const parsed = ClaimSchema.parse({ ...claim("tsk_t"), level: "staff" });
+    const text = botSystemPrompt(parsed, NOW);
+    expect(text.split("\n\n").slice(0, 3)).toEqual([
+      "You are docs, a PM OS bot, working on a request from ana.",
+      "Today is 2026-03-01.",
+      "ROLE-INSTRUCTIONS: search the docs first and cite every page.",
+    ]);
+    expect(text).not.toContain("levels.md");
+  });
+
+  it("reads a claim with no level (an older runtime) as senior", () => {
+    const parsed = personal();
+    expect(parsed.level).toBe("senior");
+    expect(botSystemPrompt(parsed, NOW)).toContain(levelLine("Senior"));
+    expect(() => ClaimSchema.parse({ ...claim("tsk_x"), level: "vp" })).toThrow();
+  });
+
+  it("uses the UTC date", () => {
+    const late = new Date("2026-12-31T23:59:59-05:00");
+    expect(botSystemPrompt(personal("staff"), late)).toContain("Today is 2027-01-01.");
+  });
+});
+
 describe("worker helpers", () => {
   it("reads approval ids from structured content or JSON text", () => {
     const value = { status: "pending_approval", approval_id: "apr_9" };
@@ -423,6 +491,11 @@ describe("worker helpers", () => {
     expect(milestoneFor("slack_read_thread", "read")).toBe("Reading Slack");
     expect(milestoneFor("context_search", "read")).toBe("Checking team context");
     expect(milestoneFor("stats_sample_size", "read")).toBe("Running the numbers");
+    expect(milestoneFor("stats_cashflow", "read")).toBe("Running the numbers");
+    expect(milestoneFor("jira_rollup", "read")).toBe("Reading Jira");
+    expect(milestoneFor("bets_list", "read")).toBe("Checking your bets register");
+    expect(milestoneFor("bets_read", "read")).toBe("Checking your bets register");
+    expect(milestoneFor("bets_record", "write")).toBe("Drafting a bets register update");
     expect(milestoneFor("read_file", undefined)).toBeNull();
     expect(milestoneFor("write_todos", undefined)).toBeNull();
   });

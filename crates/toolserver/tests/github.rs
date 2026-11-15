@@ -1077,9 +1077,82 @@ async fn the_slack_bot_gets_link_urls_for_members_only() {
         .await;
         assert_eq!(status, 403, "{user}");
     }
-    // Revoking stays orchestrator-only.
+}
+
+#[tokio::test]
+async fn the_slack_bot_unlinks_members_accounts_only() {
+    let e = env().await;
+    link(&e, "ana", "ana").await;
+    // A member's account: unlinked (the App Home's Disconnect), and audited with the client.
     let (status, _) = bot(&e, Method::DELETE, "/internal/credentials/ana/github", None).await;
-    assert_eq!(status, 403);
+    assert_eq!(status, 204);
+    assert!(e
+        .vault
+        .get("ana", Provider::Github)
+        .await
+        .unwrap()
+        .is_none());
+    let last = e.audit.events().last().cloned().unwrap();
+    assert_eq!(
+        (
+            last.tool.as_str(),
+            last.client,
+            last.outcome,
+            last.user.as_str(),
+            last.output_ref.as_deref()
+        ),
+        (
+            "credentials.unlink",
+            Client::Bot,
+            Outcome::Ok,
+            "ana",
+            Some("github")
+        )
+    );
+    // Nothing left to unlink.
+    let (status, _) = bot(&e, Method::DELETE, "/internal/credentials/ana/github", None).await;
+    assert_eq!(status, 404);
+    // Not a member, or a team bot's own account: refused, and audited as denied.
+    put_github(&e, "bots.docs", "r-bot", 3600).await;
+    for user in ["nobody", "bots.docs"] {
+        let (status, body) = bot(
+            &e,
+            Method::DELETE,
+            &format!("/internal/credentials/{user}/github"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 403, "{user}");
+        assert_eq!(
+            body["error"],
+            "this token may unlink accounts of team members only"
+        );
+        let last = e.audit.events().last().cloned().unwrap();
+        assert_eq!(
+            (last.tool.as_str(), last.client, last.outcome),
+            ("credentials.unlink", Client::Bot, Outcome::Denied)
+        );
+    }
+    assert!(e
+        .vault
+        .get("bots.docs", Provider::Github)
+        .await
+        .unwrap()
+        .is_some());
+    // The service token may unlink anyone's, as before, audited as the orchestrator.
+    let res = e
+        .http
+        .delete(format!("{}/internal/credentials/bots.docs/github", e.ts))
+        .bearer_auth(SERVICE_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    let last = e.audit.events().last().cloned().unwrap();
+    assert_eq!(
+        (last.client, last.outcome),
+        (Client::Orchestrator, Outcome::Ok)
+    );
 }
 
 // ----- memory -----------------------------------------------------------------------------
@@ -1174,6 +1247,122 @@ async fn notes_are_written_and_read_in_the_pms_repo() {
         e.mock.commit(&head).message,
         "memory: areas (pm-ana, task t-9)"
     );
+}
+
+/// The bets register on GitHub memory (`docs/staff-principal-spec.md` §5): nothing is
+/// committed before approval; approval commits one note, `notes/bet-<key>.md`, as Ana; an
+/// update appends evidence.
+#[tokio::test]
+async fn bets_live_in_the_pms_memory_repo() {
+    let e = env().await;
+    set_up_memory(&e, &[("README.md", "Ana's memory\n")]).await;
+    common::write_content(
+        &e.root,
+        "skills/bets-test/SKILL.md",
+        "---\nname: bets-test\ndescription: Test skill that keeps the bets register.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"reasoning\"\n  data-class: \"internal\"\n  tools: \"bets.list bets.read bets.record\"\n---\n\n# /bets-test\n\nTest.\n",
+    );
+    let connectors: Vec<Arc<dyn Connector>> = vec![
+        Arc::new(FakeConnector::jira()),
+        Arc::new(FakeConnector::confluence()),
+        Arc::new(FakeConnector::slack()),
+        Arc::new(FakeConnector::docs()),
+    ];
+    let svc = Arc::new(
+        ToolService::new(
+            Catalog::load(&e.root, Utc::now().date_naive()).unwrap(),
+            e.stores.clone(),
+            connectors,
+        )
+        .unwrap()
+        .with_team(Team::of(team())),
+    );
+    let now = Utc::now();
+    let s = svc
+        .create_session("ana", "bets-test", "run-b", None, now)
+        .await
+        .unwrap();
+    let head = e.mock.head(MEMORY_REPO);
+    let out = svc
+        .call(
+            &s,
+            "bets_record",
+            json!({
+                "key": "sso-enterprise",
+                "title": "SSO wins the enterprise tier",
+                "bet": "SAML SSO in the console moves enterprise trials to paid.",
+                "metric": "Enterprise trial-to-paid conversion",
+                "riskiest_assumption": "SSO is the blocker, not price",
+                "review_by": "2027-02-01",
+            }),
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out["status"], "pending_approval");
+    assert_eq!(e.mock.head(MEMORY_REPO), head, "nothing committed yet");
+
+    let id = out["approval_id"].as_str().unwrap();
+    let item = svc
+        .decide(
+            id,
+            "ana",
+            pmos_toolserver::approvals::Decision::Approve,
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        item.result.as_ref().unwrap()["created"],
+        true,
+        "{:?}",
+        item.result
+    );
+    let head = e.mock.head(MEMORY_REPO);
+    assert_eq!(e.mock.changed(&head), vec!["notes/bet-sso-enterprise.md"]);
+    assert_eq!(
+        e.mock.commit(&head).message,
+        "memory: bet-sso-enterprise (bets-test, task run-b, approved by ana)"
+    );
+    let file = &e.mock.files(MEMORY_REPO)["notes/bet-sso-enterprise.md"];
+    assert!(
+        file.contains("# Bet: SSO wins the enterprise tier\n"),
+        "{file}"
+    );
+    for r in e.mock.requests("POST", "/repos/") {
+        assert_eq!(r.auth.as_deref(), Some("Bearer ghu-ana-1"), "as Ana");
+    }
+
+    let out = svc
+        .call(
+            &s,
+            "bets_record",
+            json!({"key": "sso-enterprise", "evidence": [
+                {"date": "2026-11-20", "text": "Two trials asked for SSO", "source": "CONF-9001"}]}),
+            now,
+        )
+        .await
+        .unwrap();
+    let id = out["approval_id"].as_str().unwrap();
+    let item = svc
+        .decide(
+            id,
+            "ana",
+            pmos_toolserver::approvals::Decision::Approve,
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(item.result.as_ref().unwrap()["created"], false);
+    let read = svc
+        .call(&s, "bets_read", json!({"key": "sso-enterprise"}), now)
+        .await
+        .unwrap();
+    assert_eq!(read["bet"]["evidence"][0]["source"], "CONF-9001");
+    assert_eq!(read["bet"]["metric"], "Enterprise trial-to-paid conversion");
+    let listed = svc.call(&s, "bets_list", json!({}), now).await.unwrap();
+    assert_eq!(listed["bets"][0]["key"], "sso-enterprise");
 }
 
 #[tokio::test]

@@ -10,15 +10,22 @@
 #      with it. Each PM then links their own Slack account in PM OS, which grants the user
 #      scopes below to PM OS acting as that PM.
 #
+# Updating an installed app: paste this file over the app's manifest (App Manifest in the
+# app's settings) and reinstall it, so the workspace grants any new scopes and events. The
+# App Home and tagging (docs/slack-mentions-and-home-spec.md) added app_mentions:read and the
+# app_mention and app_home_opened events.
+#
 # Keep this an internal app (not distributed): internal apps keep the higher rate limits.
 display_information:
   name: PM OS
   description: The product team's agent workspace
   background_color: "#1f2937"
 features:
-  # Each PM talks to the bots in their DM with the app (spec §5).
+  # Each PM talks to the bots in their DM with the app (spec §5). The Home tab shows their
+  # Inbox (drafts waiting for them), the Skills catalog and their Accounts
+  # (docs/slack-mentions-and-home-spec.md §4), published with views.publish.
   app_home:
-    home_tab_enabled: false
+    home_tab_enabled: true
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
   bot_user:
@@ -36,14 +43,23 @@ oauth_config:
     # The bot posts only in each PM's DM with the app: the bots' replies (under each bot's
     # own name, chat:write.customize), approval cards and routines. It reads only those DMs
     # (im:history, for message.im) and each PM's time zone (users:read, for routines). It
-    # never reads channels for answers; reads and anything sent on a PM's behalf use that
-    # PM's own user token.
+    # never reads channels: reads and anything sent on a PM's behalf use that PM's own user
+    # token.
+    #
+    # In a channel, the bot only learns that it was tagged (app_mentions:read, for the
+    # app_mention event: who tagged it, where, and the tagging message itself). It answers
+    # privately: one line only the asker sees in the thread (chat.postEphemeral), and the
+    # draft in the asker's DM. The thread is read by the PM's own bot with the PM's own token,
+    # and a reply posts there only when the PM approves it, as the PM.
     #
     # Onboarding (docs/onboarding-spec.md): when someone taps Request access, the bot reads
     # their name and email (users:read, users:read.email) and DMs each platform owner a card,
     # and later the new member their welcome, opening those DMs itself (im:write).
     bot:
       - commands
+      # The app_mention event when someone tags @PM OS in a channel it is in; never the
+      # channel's other messages.
+      - app_mentions:read
       - chat:write
       - chat:write.customize
       - im:history
@@ -75,6 +91,10 @@ settings:
   event_subscriptions:
     bot_events:
       - message.im
+      # Someone tagged @PM OS in a channel (docs/slack-mentions-and-home-spec.md §2).
+      - app_mention
+      # A PM opened the app's Home tab: publish their Inbox, Skills or Accounts (§4).
+      - app_home_opened
   interactivity:
     is_enabled: true
   socket_mode_enabled: true

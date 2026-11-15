@@ -73,6 +73,8 @@ user, `channel` and `thread_ts` from the last 7 days that is `pending`, `executi
   `{"status": "already_drafted", "approval_id": "<existing>"}`, with the message "A reply to
   this thread is already waiting for <user> (or was posted); don't draft another."
 - It is audited as `ok` with detail `already drafted`.
+- **Tagging PM OS in a thread** adds `message_ts`, which makes the rule per message:
+  `docs/slack-mentions-and-home-spec.md` §3.
 
 **What the draft was built from.** Each session tracks the highest sensitivity it has read:
 - `context.*` results count at their file's `sensitivity`;

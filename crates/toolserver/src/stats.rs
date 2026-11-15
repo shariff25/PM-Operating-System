@@ -1,5 +1,6 @@
-//! The stats tools (`stats.sample_size`, `stats.compare`): deterministic experiment maths,
-//! so a skill quotes a computed number instead of a guessed one (`docs/pm-craft-spec.md` §5).
+//! The stats tools (`stats.sample_size`, `stats.compare`, `stats.cashflow`): deterministic
+//! experiment and cash flow maths, so a skill quotes a computed number instead of a guessed
+//! one (`docs/pm-craft-spec.md` §5, `docs/staff-principal-spec.md` §4).
 //!
 //! No connector and no external data: the result is computed here from the arguments, so it
 //! is returned as is, not wrapped as untrusted content. The service still checks the skill
@@ -15,12 +16,18 @@ use serde_json::{json, Map, Value};
 /// The most arms (control included) `stats.sample_size` sizes for.
 pub const MAX_VARIANTS: u64 = 10;
 
-/// Run one stats tool by its action (`sample_size`, `compare`). An `Err` is an invalid
-/// argument, said in a sentence the model can act on.
+/// The most scenarios `stats.cashflow` takes.
+pub const MAX_SCENARIOS: u64 = 5;
+/// The most years in one `stats.cashflow` scenario.
+pub const MAX_YEARS: u64 = 10;
+
+/// Run one stats tool by its action (`sample_size`, `compare`, `cashflow`). An `Err` is an
+/// invalid argument, said in a sentence the model can act on.
 pub fn call(action: &str, args: &Value) -> Result<Value, String> {
     match action {
         "sample_size" => sample_size(args),
         "compare" => compare(args),
+        "cashflow" => cashflow(args),
         other => Err(format!("unknown stats tool `stats.{other}`")),
     }
 }
@@ -460,6 +467,147 @@ pub fn compare(args: &Value) -> Result<Value, String> {
     }))
 }
 
+// ----- stats.cashflow ------------------------------------------------------------------
+
+/// A non-negative amount of money at `path`.
+fn money(v: &Value, key: &str, path: &str) -> Result<f64, String> {
+    match v.get(key) {
+        None | Some(Value::Null) => Err(format!("`{path}.{key}` is required")),
+        Some(n) => match n.as_f64() {
+            Some(n) if n.is_finite() && n >= 0.0 => Ok(n),
+            Some(n) if n.is_finite() => Err(format!("`{path}.{key}` must be 0 or more (got {n})")),
+            _ => Err(format!("`{path}.{key}` must be a number")),
+        },
+    }
+}
+
+fn only_fields(v: &Value, path: &str, allowed: &[&str]) -> Result<(), String> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| format!("`{path}` must be an object"))?;
+    match obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+        Some(extra) => Err(format!("unknown field `{path}.{extra}`")),
+        None => Ok(()),
+    }
+}
+
+/// The year, counted in years and fractions from the start of year 1, when `cumulative`
+/// (which starts at minus `upfront`) first reaches zero: straight-line within the year.
+/// `None` if it never does.
+fn payback(upfront: f64, net: &[f64]) -> Option<f64> {
+    if upfront <= 0.0 {
+        return Some(0.0);
+    }
+    let mut cumulative = -upfront;
+    for (i, &n) in net.iter().enumerate() {
+        let next = cumulative + n;
+        if next >= 0.0 {
+            // `cumulative < 0 <= next`, so `n > 0`.
+            return Some(i as f64 + -cumulative / n);
+        }
+        cumulative = next;
+    }
+    None
+}
+
+/// Net and cumulative cash by year, payback and net present value for 1 to 5 scenarios.
+///
+/// The upfront amount is spent at the start (year 0) and each year's net (revenue minus
+/// cost) arrives at the end of that year: `npv = −upfront + Σ net_y / (1 + rate)^y`.
+pub fn cashflow(args: &Value) -> Result<Value, String> {
+    if let Some(obj) = args.as_object() {
+        if let Some(extra) = obj
+            .keys()
+            .find(|k| !matches!(k.as_str(), "scenarios" | "discount_rate"))
+        {
+            return Err(format!("unknown argument `{extra}`"));
+        }
+    }
+    let rate = number(args, "discount_rate")?.unwrap_or(0.1);
+    if !(0.0..=1.0).contains(&rate) {
+        return Err(format!(
+            "`discount_rate` must be between 0 and 1: 0.1 is 10% a year (got {rate})"
+        ));
+    }
+    let scenarios = args
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .ok_or("`scenarios` is required: a list of {name, upfront, years}")?;
+    if scenarios.is_empty() || scenarios.len() as u64 > MAX_SCENARIOS {
+        return Err(format!(
+            "`scenarios` must have 1 to {MAX_SCENARIOS} entries (got {})",
+            scenarios.len()
+        ));
+    }
+    let mut names: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for (i, s) in scenarios.iter().enumerate() {
+        let path = format!("scenarios[{i}]");
+        only_fields(s, &path, &["name", "upfront", "years"])?;
+        let name = s["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| format!("`{path}.name` is required: a short name such as base"))?;
+        if name.chars().count() > 100 {
+            return Err(format!("`{path}.name` is longer than 100 characters"));
+        }
+        if names.contains(&name) {
+            return Err(format!(
+                "two scenarios are named `{name}`; name each one differently"
+            ));
+        }
+        names.push(name);
+        let upfront = money(s, "upfront", &path)?;
+        let years = s["years"]
+            .as_array()
+            .ok_or_else(|| format!("`{path}.years` is required: a list of {{revenue, cost}}"))?;
+        if years.is_empty() || years.len() as u64 > MAX_YEARS {
+            return Err(format!(
+                "`{path}.years` must have 1 to {MAX_YEARS} entries (got {})",
+                years.len()
+            ));
+        }
+        let mut net = Vec::new();
+        let (mut revenue, mut cost) = (0.0, 0.0);
+        for (y, year) in years.iter().enumerate() {
+            let ypath = format!("{path}.years[{y}]");
+            only_fields(year, &ypath, &["revenue", "cost"])?;
+            let r = money(year, "revenue", &ypath)?;
+            let c = money(year, "cost", &ypath)?;
+            revenue += r;
+            cost += c;
+            net.push(r - c);
+        }
+        let mut cumulative = Vec::new();
+        let mut running = -upfront;
+        let mut npv = -upfront;
+        for (y, n) in net.iter().enumerate() {
+            running += n;
+            cumulative.push(round(running, 2));
+            npv += n / (1.0 + rate).powi(y as i32 + 1);
+        }
+        out.push(json!({
+            "name": name,
+            "upfront": round(upfront, 2),
+            "net_by_year": net.iter().map(|n| round(*n, 2)).collect::<Vec<_>>(),
+            "cumulative_by_year": cumulative,
+            "payback_years": payback(upfront, &net).map(|p| round(p, 1)),
+            "npv": round(npv, 2),
+            "total_revenue": round(revenue, 2),
+            "total_cost": round(cost, 2),
+        }));
+    }
+    Ok(json!({
+        "scenarios": out,
+        "assumptions": {"discount_rate": rate},
+        "note": format!(
+            "Arithmetic on the inputs given, not a forecast: the numbers are only as good as the assumptions behind them. The upfront amount is spent at the start; each year's net (revenue minus cost) arrives at the end of the year and is discounted at {}% a year. Payback is when the cumulative cash first reaches zero, straight-line within the year; null means it never does within the years given.",
+            round(rate * 100.0, 4)
+        ),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +821,105 @@ mod tests {
         ];
         for args in bad {
             assert!(compare(&args).is_err(), "{args}");
+        }
+    }
+
+    #[test]
+    fn cashflow_worked_case() {
+        let out = cashflow(&json!({
+            "scenarios": [{"name": "base", "upfront": 100, "years": [
+                {"revenue": 60, "cost": 10}, {"revenue": 80, "cost": 10}
+            ]}],
+            "discount_rate": 0.1
+        }))
+        .unwrap();
+        let s = &out["scenarios"][0];
+        assert_eq!(s["name"], "base");
+        assert_eq!(s["net_by_year"], json!([50.0, 70.0]));
+        assert_eq!(s["cumulative_by_year"], json!([-50.0, 20.0]));
+        // 1 + 50/70 = 1.714
+        assert_eq!(s["payback_years"], 1.7);
+        // −100 + 50/1.1 + 70/1.21 = 3.3058
+        assert_eq!(s["npv"], 3.31);
+        assert_eq!(s["total_revenue"], 140.0);
+        assert_eq!(s["total_cost"], 20.0);
+        assert_eq!(out["assumptions"], json!({"discount_rate": 0.1}));
+        assert!(out["note"].as_str().unwrap().contains("not a forecast"));
+    }
+
+    #[test]
+    fn cashflow_edges() {
+        // Never pays back.
+        let out = cashflow(&json!({"scenarios": [
+            {"name": "low", "upfront": 100, "years": [{"revenue": 20, "cost": 10}, {"revenue": 20, "cost": 10}]}
+        ]}))
+        .unwrap();
+        assert_eq!(out["scenarios"][0]["payback_years"], Value::Null);
+        assert_eq!(
+            out["scenarios"][0]["cumulative_by_year"],
+            json!([-90.0, -80.0])
+        );
+        assert_eq!(out["assumptions"]["discount_rate"], 0.1, "the default");
+        // Nothing upfront: paid back at once.
+        let out = cashflow(&json!({"scenarios": [
+            {"name": "free", "upfront": 0, "years": [{"revenue": 5, "cost": 10}]}
+        ], "discount_rate": 0}))
+        .unwrap();
+        assert_eq!(out["scenarios"][0]["payback_years"], 0.0);
+        assert_eq!(out["scenarios"][0]["npv"], -5.0);
+        // Exactly zero at the end of a year: paid back at that year.
+        let out = cashflow(&json!({"scenarios": [
+            {"name": "even", "upfront": 100, "years": [{"revenue": 50, "cost": 0}, {"revenue": 50, "cost": 0}]}
+        ], "discount_rate": 0}))
+        .unwrap();
+        assert_eq!(out["scenarios"][0]["payback_years"], 2.0);
+        assert_eq!(out["scenarios"][0]["npv"], 0.0);
+        // Three scenarios keep their order.
+        let out = cashflow(&json!({"scenarios": [
+            {"name": "low", "upfront": 10, "years": [{"revenue": 1, "cost": 0}]},
+            {"name": "base", "upfront": 10, "years": [{"revenue": 10, "cost": 0}]},
+            {"name": "high", "upfront": 10, "years": [{"revenue": 40, "cost": 0}]}
+        ]}))
+        .unwrap();
+        let names: Vec<_> = out["scenarios"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].clone())
+            .collect();
+        assert_eq!(names, vec!["low", "base", "high"]);
+        assert_eq!(out["scenarios"][2]["payback_years"], 0.3);
+    }
+
+    #[test]
+    fn cashflow_refuses_bad_input() {
+        let year = json!({"revenue": 1, "cost": 1});
+        let one = |s: Value| json!({"scenarios": [s]});
+        let bad = [
+            json!({}),
+            json!({"scenarios": []}),
+            json!({"scenarios": [
+                {"name": "a", "upfront": 1, "years": [year]}, {"name": "b", "upfront": 1, "years": [year]},
+                {"name": "c", "upfront": 1, "years": [year]}, {"name": "d", "upfront": 1, "years": [year]},
+                {"name": "e", "upfront": 1, "years": [year]}, {"name": "f", "upfront": 1, "years": [year]}
+            ]}),
+            one(json!({"name": "a", "upfront": -1, "years": [year]})),
+            one(json!({"name": "a", "upfront": 1, "years": []})),
+            one(json!({"name": "a", "upfront": 1, "years": vec![year.clone(); 11]})),
+            one(json!({"name": "a", "upfront": 1, "years": [{"revenue": -1, "cost": 0}]})),
+            one(json!({"name": "a", "upfront": 1, "years": [{"revenue": 1}]})),
+            one(json!({"name": "a", "upfront": 1, "years": [{"revenue": 1, "cost": 0, "tax": 1}]})),
+            one(json!({"name": "", "upfront": 1, "years": [year]})),
+            one(json!({"upfront": 1, "years": [year]})),
+            one(json!({"name": "a", "upfront": "1", "years": [year]})),
+            one(json!({"name": "a", "years": [year]})),
+            json!({"scenarios": [{"name": "a", "upfront": 1, "years": [year]}], "discount_rate": 1.5}),
+            json!({"scenarios": [{"name": "a", "upfront": 1, "years": [year]}], "discount_rate": -0.1}),
+            json!({"scenarios": [{"name": "a", "upfront": 1, "years": [year]}, {"name": "a", "upfront": 1, "years": [year]}]}),
+            json!({"scenarios": [{"name": "a", "upfront": 1, "years": [year]}], "currency": "USD"}),
+        ];
+        for args in bad {
+            assert!(cashflow(&args).is_err(), "{args}");
         }
     }
 }

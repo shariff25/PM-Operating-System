@@ -6,7 +6,8 @@
 //!   message per milestone.
 //! - **Result:** the final answer is a new message, so the PM is notified.
 //! - **Failure:** the stated reason, as a new message.
-//! - **Approvals (D7):** a card per pending item, from the tool server.
+//! - **Approvals (D7):** a card per pending item, from the tool server. A new or closed
+//!   approval also refreshes the PM's App Home if they have opened it (`home.rs`).
 //! - **Restarts:** the cursor is saved to `<state dir>/notifications.cursor` after each batch,
 //!   so a restart doesn't post anything twice. With no saved cursor (the first start), items
 //!   older than an hour are skipped rather than flooding the PMs' DMs.
@@ -192,6 +193,7 @@ impl Notifier {
                     let card = self.card(&id).await;
                     self.say(&task_id, &bot, &username, card).await;
                 }
+                self.refresh_home(item);
             }
             "approval_closed" => {
                 if !text.trim().is_empty() {
@@ -199,6 +201,7 @@ impl Notifier {
                         .await;
                 }
                 self.tasks.remove(&task_id);
+                self.refresh_home(item);
             }
             "failed" => {
                 self.finish_progress(&task_id, Stage::Failed).await;
@@ -212,6 +215,13 @@ impl Notifier {
                 self.tasks.remove(&task_id);
             }
             other => tracing::warn!(kind = other, "unknown notification kind; ignored"),
+        }
+    }
+
+    /// Republish the requester's App Home, if they have it open; best effort.
+    fn refresh_home(&self, item: &Value) {
+        if let Some(handle) = item["requested_by"].as_str() {
+            self.bots.refresh_home(handle);
         }
     }
 

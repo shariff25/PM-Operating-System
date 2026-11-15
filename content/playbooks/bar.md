@@ -62,6 +62,9 @@ Cite or flag, without exception.
 - **Fails when:** any figure or claim has neither a source nor a flag, or a sample size,
   interval or p-value was worked out by hand instead of with the stats tools.
 
+At the Staff and Principal levels, run the extra checks in `/content/playbooks/levels.md` in
+the same pass.
+
 ## How to run the check
 1. Run it once, after the draft is complete and before proposing it.
 2. For each check, find the sentence in the draft that passes it. If you can't point to one,

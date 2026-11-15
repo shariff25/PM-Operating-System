@@ -1,0 +1,20 @@
+# seed: replace with case cards
+# The alignment-plan skill titles its draft `Alignment plan:` and follows
+# content/templates/alignment-plan.md. It names roles, never guesses at a named person's motives.
+id: structure-alignment-plan
+ask: "Draft anyway, no questions: an alignment plan in the PM space for moving SCIM user provisioning (Jira story PM-102) ahead of audit log export. The Acme Cloud team would have to wait; we need their lead and the engineering director to agree."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Alignment plan:", "Who decides", "Who must agree", "Objections and answers", "Fallback"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: alignment-plan
+tags:
+  - model/draft-content

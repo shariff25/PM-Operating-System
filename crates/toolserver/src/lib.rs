@@ -9,6 +9,7 @@
 pub mod app;
 pub mod approvals;
 pub mod audit;
+pub mod bets;
 pub mod catalog;
 pub mod config;
 pub mod connectors;

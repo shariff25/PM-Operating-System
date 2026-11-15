@@ -9,6 +9,7 @@ metadata:
   tools: "context.search context.read jira.search jira.read confluence.search confluence.read confluence.create_draft docs.search docs.read"
   surfaces: "slack web cli"
   ships-in: "phase-0"
+  track: "Spec and review"
 ---
 
 # /prd-draft
@@ -48,10 +49,14 @@ first, then the options, the pick and what it takes to ship.
    - requirements with IDs, one testable statement each; P0 only what the bet needs;
    - an outcome metric with baseline, target, date and source, and a guardrail;
    - the riskiest assumption first under "Risks and mitigations", with its cheapest test.
-5. Check the draft against `/content/playbooks/bar.md`. Fix what fails, once. What can't be
-   fixed from the sources goes under "Open questions" with a suggested owner. List every
-   source under "Sources".
-6. Propose the draft with `confluence.create_draft`, titled `PRD: <feature>`, in the space
+5. Read `/content/playbooks/levels.md`. At the Staff or Principal level, end the
+   document, after the template's headings, with `## Cross-team effects` (which teams
+   pay, what they stop, who must agree). At Principal, add `## What must be true` after
+   it (two or three conditions over 2 to 3 years, each with its failing signpost).
+6. Check the draft against `/content/playbooks/bar.md` and the level's checks in
+   `levels.md`. Fix what fails, once. What can't be fixed from the sources goes under
+   "Open questions" with a suggested owner. List every source under "Sources".
+7. Propose the draft with `confluence.create_draft`, titled `PRD: <feature>`, in the space
    the PM named or their default. Then reply with the recommendation in one line, what is
    waiting for approval, and the top open question. Offer /review next.
 
