@@ -16,6 +16,7 @@ pub mod content_sync;
 pub mod context;
 pub mod github;
 pub mod github_memory;
+pub mod ledger;
 pub mod mcp;
 pub mod members;
 pub mod memory;

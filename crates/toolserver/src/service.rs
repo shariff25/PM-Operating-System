@@ -11,21 +11,27 @@
 //! 4. A write runs only with a matching grant or an approval by its own user (OUT-4), and
 //!    always as that user.
 //! 5. Every call and decision is audited (ADM-2).
+//! 6. A write tool refused twice for invalid arguments in one session is refused for the
+//!    rest of it, without reaching the connector (`docs/improvement-loop-spec.md` §2).
+//!
+//! Every approval item has a row in the feedback ledger (`ledger.rs`), which the approval
+//! store writes with the item.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Duration, Utc};
 use pmos_contract::bots::{role_tools, ActionSetting, Bot, BotScope, Role};
-use pmos_contract::model::CONTEXT_DOMAINS;
+use pmos_contract::model::{ModelRole, CONTEXT_DOMAINS};
 use pmos_contract::{Sensitivity, ToolKind};
 use serde_json::{json, Value};
 
-use crate::approvals::{args_hash, ApprovalItem, DecideError, Decision, NewItem, Status};
+use crate::approvals::{args_hash, ApprovalItem, DecideError, Decision, NewItem, Status, Verdict};
 use crate::audit::{AuditEvent, Client, Outcome};
 use crate::catalog::{Catalog, Roster, ToolSpec};
 use crate::connectors::{untrusted, Caller, Connector, ConnectorError, TeamBot};
 use crate::context::{load_docs, ContextDoc, ReindexReport};
+use crate::ledger::{summarize, LedgerQuery, LedgerRow, Summary, DEFAULT_EXPIRE_DAYS};
 use crate::memory::{valid_key, MemoryError};
 use crate::schemas::check_args;
 use crate::session::{bot_identity, token_hash, valid_handle, Session};
@@ -35,6 +41,12 @@ use crate::team::Team;
 pub const DEFAULT_SESSION_TTL_MINUTES: i64 = 60;
 const DEFAULT_LIMIT: usize = 5;
 const MAX_LIMIT: usize = 20;
+
+/// How many times one session may have one write tool refused for invalid arguments.
+pub const MAX_INVALID_DRAFTS: u32 = 2;
+/// How the last allowed refusal for invalid arguments, and every refusal after it, ends.
+pub const LAST_ATTEMPT: &str =
+    "This is the last attempt for this action. Tell the PM what was wrong instead of retrying.";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ToolError {
@@ -128,6 +140,9 @@ pub enum DecisionError {
     NotAMember(String),
     #[error("invalid arguments: {0}")]
     InvalidArgs(String),
+    /// A reason came with a decision other than `reject`.
+    #[error("a reason can only be given with `reject`")]
+    ReasonNotAllowed,
     #[error("the write task failed: {0}")]
     Internal(String),
 }
@@ -139,7 +154,18 @@ struct Policy {
     tools: BTreeSet<String>,
     /// The highest data class it may read.
     ceiling: Sensitivity,
+    /// Its skill's or role's model, for the ledger.
+    model: ModelRole,
     bot: Option<(Arc<Bot>, Arc<Role>)>,
+}
+
+/// The gateway alias for a model role, such as `pmos/default`.
+fn model_alias(model: ModelRole) -> String {
+    let name = serde_json::to_value(model)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "default".into());
+    format!("pmos/{name}")
 }
 
 impl Policy {
@@ -191,7 +217,17 @@ pub struct ToolService {
     connectors: HashMap<String, Arc<dyn Connector>>,
     team: Arc<Team>,
     stale_after_days: i64,
+    /// The content repo's `HEAD`, read at load and on every reindex, for the ledger.
+    content_sha: RwLock<Option<String>>,
+    /// Pending ledger rows older than this many days are reported as expired.
+    ledger_expire_days: i64,
+    /// Refusals for invalid arguments, by session (token hash) and write tool, with when the
+    /// session expires. In memory: a restart starts every session's count again.
+    invalid_drafts: Mutex<HashMap<DraftKey, (u32, DateTime<Utc>)>>,
 }
+
+/// A session's token hash and a write tool's registry name.
+type DraftKey = (String, String);
 
 impl ToolService {
     /// Fails if any registry tool belongs to a system with no handler.
@@ -216,12 +252,26 @@ impl ToolService {
         }
         Ok(Self {
             roster: RwLock::new(Arc::new(catalog.roster().clone())),
+            content_sha: RwLock::new(catalog.content_sha().map(String::from)),
             catalog,
             stores,
             connectors,
             team: Team::open(),
             stale_after_days: pmos_contract::lint::DEFAULT_STALE_AFTER_DAYS,
+            ledger_expire_days: DEFAULT_EXPIRE_DAYS,
+            invalid_drafts: Mutex::default(),
         })
+    }
+
+    /// Report pending ledger rows older than `days` as expired (`PMOS_LEDGER_EXPIRE_DAYS`).
+    pub fn with_ledger_expire_days(mut self, days: i64) -> Self {
+        self.ledger_expire_days = days.max(1);
+        self
+    }
+
+    /// The content repo's `HEAD` as last loaded; `None` outside a git checkout.
+    pub fn content_sha(&self) -> Option<String> {
+        self.content_sha.read().expect("content sha lock").clone()
     }
 
     /// Only people in `team` may have sessions (when it is enforced).
@@ -295,6 +345,11 @@ impl ToolService {
         }
         // Live sessions pick up the new roles and settings on their next call.
         *self.roster.write().expect("roster lock") = Arc::new(Roster::from_report(&report));
+        let root = content_root.to_path_buf();
+        let head = tokio::task::spawn_blocking(move || crate::catalog::content_head(&root))
+            .await
+            .unwrap_or(None);
+        *self.content_sha.write().expect("content sha lock") = head;
         Ok(self.stores.context.reindex(load_docs(content_root)).await?)
     }
 
@@ -404,6 +459,7 @@ impl ToolService {
                 Some(Policy {
                     tools: skill.tools.iter().cloned().collect(),
                     ceiling: skill.data_class,
+                    model: skill.model,
                     bot: None,
                 })
             }
@@ -415,6 +471,7 @@ impl ToolService {
                 Some(Policy {
                     tools: role_tools(&role, self.catalog.skills()),
                     ceiling: role.data_class,
+                    model: role.model,
                     bot: Some((bot, role)),
                 })
             }
@@ -481,7 +538,27 @@ impl ToolService {
             detail: None,
         };
 
-        let result = self
+        let write = self
+            .catalog
+            .tool(harness_name)
+            .filter(|spec| spec.kind == ToolKind::Write);
+        if let Some(spec) = write {
+            if self.invalid_drafts(session, spec) >= MAX_INVALID_DRAFTS {
+                // Used up: refused before any check, so the connector is never called.
+                event.tool = spec.name.clone();
+                event.outcome = Outcome::Denied;
+                event.detail = Some(format!(
+                    "invalid draft ({MAX_INVALID_DRAFTS} of {MAX_INVALID_DRAFTS}): no attempts left in this session"
+                ));
+                self.audit(event).await;
+                return Err(ToolError::Forbidden(format!(
+                    "{} was refused {MAX_INVALID_DRAFTS} times for invalid arguments in this session, so PM OS won't run it again here. {LAST_ATTEMPT}",
+                    spec.name
+                )));
+            }
+        }
+
+        let mut result = self
             .dispatch(session, harness_name, &args, now, &mut event)
             .await;
         if let Err(e) = &result {
@@ -494,8 +571,41 @@ impl ToolService {
             };
             event.detail = Some(e.to_string());
         }
+        // A write refused for invalid arguments: the model may correct it once.
+        if let (Err(ToolError::InvalidArgs(message)), Some(spec)) = (&result, write) {
+            let n = self.count_invalid_draft(session, spec, now);
+            event.outcome = Outcome::Denied;
+            event.detail = Some(format!("invalid draft ({n} of {MAX_INVALID_DRAFTS})"));
+            if n >= MAX_INVALID_DRAFTS {
+                result = Err(ToolError::InvalidArgs(format!(
+                    "{}. {LAST_ATTEMPT}",
+                    message.trim_end().trim_end_matches('.')
+                )));
+            }
+        }
         self.audit(event).await;
         result
+    }
+
+    /// How many times this session has had `spec` refused for invalid arguments.
+    fn invalid_drafts(&self, session: &Session, spec: &ToolSpec) -> u32 {
+        let key = (token_hash(&session.token), spec.name.clone());
+        self.invalid_drafts
+            .lock()
+            .expect("invalid drafts lock")
+            .get(&key)
+            .map_or(0, |(n, _)| *n)
+    }
+
+    /// Count one more refusal for invalid arguments and return the new count. Counts for
+    /// expired sessions are dropped along the way.
+    fn count_invalid_draft(&self, session: &Session, spec: &ToolSpec, now: DateTime<Utc>) -> u32 {
+        let key = (token_hash(&session.token), spec.name.clone());
+        let mut counts = self.invalid_drafts.lock().expect("invalid drafts lock");
+        counts.retain(|_, (_, expires_at)| *expires_at > now);
+        let entry = counts.entry(key).or_insert((0, session.expires_at));
+        entry.0 += 1;
+        entry.0
     }
 
     async fn dispatch(
@@ -740,6 +850,8 @@ impl ToolService {
             event.output_ref = written["url"].as_str().map(String::from);
             return Ok(written);
         }
+        let content_sha = self.content_sha();
+        let model = self.policy(session).map(|p| model_alias(p.model));
         let item = self
             .stores
             .approvals
@@ -751,6 +863,8 @@ impl ToolService {
                     run_id: &session.run_id,
                     tool: &spec.name,
                     args,
+                    content_sha: content_sha.as_deref(),
+                    model_alias: model.as_deref(),
                 },
                 now,
             )
@@ -853,6 +967,40 @@ impl ToolService {
         self.stores.approvals.get(id).await
     }
 
+    // ----- the feedback ledger ------------------------------------------------------------
+
+    /// Pending rows created before this are reported as expired.
+    pub fn ledger_expire_before(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        now - Duration::days(self.ledger_expire_days)
+    }
+
+    /// Ledger rows, newest first. `query.expire_before` is set from the server's expiry.
+    pub async fn ledger(
+        &self,
+        mut query: LedgerQuery,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<LedgerRow>, StoreError> {
+        query.expire_before = self.ledger_expire_before(now);
+        self.stores.approvals.ledger(&query).await
+    }
+
+    /// Outcomes, label coverage, median edit distance and rejection reasons per bot (or
+    /// skill) and tool, over the rows since `since`.
+    pub async fn ledger_summary(
+        &self,
+        since: Option<DateTime<Utc>>,
+        bot: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<Summary, StoreError> {
+        let query = LedgerQuery {
+            since,
+            bot,
+            ..LedgerQuery::all(self.ledger_expire_before(now))
+        };
+        let rows = self.ledger(query, now).await?;
+        Ok(summarize(since, &rows))
+    }
+
     /// Decide an inbox item as `decided_by`, for the orchestrator. See
     /// [`ToolService::decide_as`].
     pub async fn decide(
@@ -874,16 +1022,7 @@ impl ToolService {
         .await
     }
 
-    /// Decide an inbox item as `decided_by`, for `client` (the orchestrator, or the Slack bot
-    /// from an approval card), which the audit log records. `decided_by` must be in
-    /// `team.yaml` when it is enforced, and must be the item's own user. Approve and edit run
-    /// the write as the item's user; edited arguments are checked like any call's, and the
-    /// item's skill must still declare the tool (or its bot's role still have it, not set to
-    /// `never`).
-    ///
-    /// The write runs in its own task, so a caller that disconnects can't cancel it halfway,
-    /// and every way out of here is audited. The item is `executing` while the write runs;
-    /// if the process dies then, [`ToolService::reconcile`] resolves it on the next start.
+    /// [`ToolService::decide_verdict`] with no reason.
     pub async fn decide_as(
         self: &Arc<Self>,
         client: Client,
@@ -893,6 +1032,39 @@ impl ToolService {
         edited_args: Option<Value>,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecisionError> {
+        self.decide_verdict(
+            client,
+            id,
+            decided_by,
+            Verdict::new(decision, edited_args),
+            now,
+        )
+        .await
+    }
+
+    /// Decide an inbox item as `decided_by`, for `client` (the orchestrator, or the Slack bot
+    /// from an approval card), which the audit log records. `decided_by` must be in
+    /// `team.yaml` when it is enforced, and must be the item's own user. Approve and edit run
+    /// the write as the item's user; edited arguments are checked like any call's, and the
+    /// item's skill must still declare the tool (or its bot's role still have it, not set to
+    /// `never`). A reason may come only with `reject`; the ledger and the audit event keep it.
+    ///
+    /// The write runs in its own task, so a caller that disconnects can't cancel it halfway,
+    /// and every way out of here is audited. The item is `executing` while the write runs;
+    /// if the process dies then, [`ToolService::reconcile`] resolves it on the next start.
+    pub async fn decide_verdict(
+        self: &Arc<Self>,
+        client: Client,
+        id: &str,
+        decided_by: &str,
+        verdict: Verdict,
+        now: DateTime<Utc>,
+    ) -> Result<ApprovalItem, DecisionError> {
+        if verdict.reason.is_some() && verdict.decision != Decision::Reject {
+            return Err(DecisionError::ReasonNotAllowed);
+        }
+        let decision = verdict.decision;
+        let reason = verdict.reason;
         let denied = |item: ApprovalItem, why: &str| AuditEvent {
             client,
             at: now,
@@ -921,7 +1093,7 @@ impl ToolService {
                 if current.user == decided_by && current.status == Status::Pending {
                     let spec = self.write_spec(&current)?;
                     if decision == Decision::Edit {
-                        let args = edited_args.as_ref().ok_or(DecideError::MissingArgs)?;
+                        let args = verdict.args.as_ref().ok_or(DecideError::MissingArgs)?;
                         check_args(&spec.input_schema, args).map_err(DecisionError::InvalidArgs)?;
                     }
                 }
@@ -931,7 +1103,7 @@ impl ToolService {
         let item = match self
             .stores
             .approvals
-            .decide(id, decided_by, decision, edited_args, now)
+            .decide_with(id, decided_by, verdict, now)
             .await
         {
             Ok(item) => item,
@@ -961,7 +1133,11 @@ impl ToolService {
             sources: Vec::new(),
             args_hash: Some(item.args_hash.clone()),
             output_ref: Some(item.id.clone()),
-            detail: (decision == Decision::Edit).then(|| "edited before approval".to_string()),
+            detail: match (decision, reason) {
+                (Decision::Edit, _) => Some("edited before approval".to_string()),
+                (Decision::Reject, Some(reason)) => Some(format!("reason: {reason}")),
+                _ => None,
+            },
         };
         if item.status == Status::Rejected {
             self.audit(event).await;
