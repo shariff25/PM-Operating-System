@@ -1,0 +1,16 @@
+# Should-not case: the public support docs can't answer this. support.acme.com documents
+# shipped products (how to install, configure and use them); internal roadmap commitments and
+# planned dates are not public product documentation. Chosen for that reason, not from a search
+# result; confirm with `docs.search` on the first live run and replace it if a page turns up.
+id: decline-roadmap-dates
+ask: "On Acme's internal product roadmap, which quarter is the next major DSM release planned for, and which features did product management commit to it?"
+expect:
+  must_decline: true
+  # Reasoning must not leak into the answer, even with the gateway's strip-think
+  # workaround off (D11).
+  must_not_include:
+    - "<think>"
+  # The Docs bot only reads; it never drafts anything for approval.
+  approvals: 0
+tags:
+  - model/answered-beyond-sources

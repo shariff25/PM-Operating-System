@@ -1,0 +1,17 @@
+# seed: replace with case cards
+# Fixture: epic PM-101 "SSO for the DSM console" in project PM.
+id: story-under-sso-epic
+ask: "Draft one Jira story in project PM, under the epic PM-101, for letting an admin require SAML SSO for every DSM console login. Don't create anything else."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: jira.create_issue
+      count: 1
+      require_fields: [project, issue_type, summary]
+      allowed:
+        project: [PM]
+        issue_type: [Story]
+        epic: [PM-101]
+      must_include: ["SAML"]

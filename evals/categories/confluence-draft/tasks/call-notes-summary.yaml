@@ -1,0 +1,16 @@
+# seed: replace with case cards
+# Fixture: page 9001 "CCM customer call notes, October" in space PM: "Two customers asked for
+# SSO and audit export."
+id: call-notes-summary
+ask: "Draft a Confluence page in the PM space titled 'CCM customer asks, October' that summarises what customers asked for in the October CCM call notes."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["SSO", "audit export"]
