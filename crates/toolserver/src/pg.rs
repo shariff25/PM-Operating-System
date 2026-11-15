@@ -526,12 +526,21 @@ impl ApprovalRepo for PgStore {
             .map(item_from_row)
             .transpose()?
             .ok_or(DecideError::NotFound)?;
-        // The same checks, in the same order, as the in-memory store.
-        if current.user != decided_by {
-            return Err(DecideError::Forbidden);
-        }
-        if current.status != Status::Pending {
-            return Err(DecideError::NotPending);
+        // The same checks, in the same order, as the in-memory store. A refusal ends the
+        // transaction at once: a dropped one keeps its row lock until the connection is next
+        // used, and a concurrent decision on this item would wait on it.
+        let refused = if current.user != decided_by {
+            Some(DecideError::Forbidden)
+        } else if current.status != Status::Pending {
+            Some(DecideError::NotPending)
+        } else if verdict.decision == Decision::Edit && verdict.args.is_none() {
+            Some(DecideError::MissingArgs)
+        } else {
+            None
+        };
+        if let Some(e) = refused {
+            tx.rollback().await.map_err(StoreError::from)?;
+            return Err(e);
         }
         let reason = verdict
             .reason
@@ -540,6 +549,7 @@ impl ApprovalRepo for PgStore {
             Decision::Reject => (Status::Rejected, None, None),
             Decision::Approve => (Status::Executing, None, Some(0.0)),
             Decision::Edit => {
+                // Checked above, before anything changed.
                 let args = verdict.args.ok_or(DecideError::MissingArgs)?;
                 let distance = args_edit_distance(&current.args, &args);
                 (Status::Executing, Some(args), Some(distance))
