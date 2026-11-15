@@ -1,0 +1,52 @@
+name: Eval gate
+
+# The eval gate (docs/evals.md, "The gate"): a change to a bot's role, skills or bot file, to
+# the evals, or to the gateway's model config must not make the benchmarks worse. It runs on
+# the Spark, where the runtime, the worker and the models are; registering that runner is in
+# docs/runbooks/upgrade.md. Until one is registered this job waits in the queue, and a platform
+# owner runs `deploy/pmos-admin evals-gate` by hand and pastes the result into the PR.
+
+on:
+  pull_request:
+    paths:
+      - "content/skills/**"
+      - "content/roles/**"
+      - "content/bots/**"
+      - "evals/**"
+      - "deploy/gateway.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evals-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Eval gate (Spark)
+    # The Spark runs code from the PR with access to its models, so only PRs from branches
+    # of this repository run here, never from forks.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, pmos-spark]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The gate compares with the base branch's reports and diffs against it.
+          fetch-depth: 0
+      - name: Gate
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -o pipefail
+          git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          deploy/pmos-admin evals-gate --base "origin/${BASE_REF}" | tee "$RUNNER_TEMP/evals-gate.md"
+      - name: Summary
+        if: always()
+        run: |
+          if [ -s "$RUNNER_TEMP/evals-gate.md" ]; then
+            cat "$RUNNER_TEMP/evals-gate.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The eval gate produced no summary; see the Gate step's log." >> "$GITHUB_STEP_SUMMARY"
+          fi
