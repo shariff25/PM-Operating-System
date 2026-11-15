@@ -42,6 +42,28 @@ pub struct History {
 /// that isn't a report is an error naming the file, so a broken report is never skipped
 /// silently.
 pub fn load_reports(dir: &Path, category: &str) -> Result<Vec<Report>, String> {
+    Ok(load_named(dir, category)?
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect())
+}
+
+/// The category's latest report in `dir` (by date, then start time) with its file name.
+pub fn latest_report(dir: &Path, category: &str) -> Result<Option<(String, Report)>, String> {
+    Ok(load_named(dir, category)?.pop())
+}
+
+/// Every report in `dir`, of every category, each with its file name.
+pub fn load_all(dir: &Path) -> Result<Vec<(String, Report)>, String> {
+    load_where(dir, |_| true)
+}
+
+/// [`load_reports`], each with its file name.
+pub fn load_named(dir: &Path, category: &str) -> Result<Vec<(String, Report)>, String> {
+    load_where(dir, |r| r.category == category)
+}
+
+fn load_where(dir: &Path, keep: impl Fn(&Report) -> bool) -> Result<Vec<(String, Report)>, String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -57,11 +79,12 @@ pub fn load_reports(dir: &Path, category: &str) -> Result<Vec<Report>, String> {
             .map_err(|e| format!("{}: can't read: {e}", path.display()))?;
         let report: Report = serde_json::from_str(&text)
             .map_err(|e| format!("{}: not a pmos-evals report: {e}", path.display()))?;
-        if report.category == category {
-            reports.push(report);
+        if keep(&report) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            reports.push((name, report));
         }
     }
-    reports.sort_by_key(|r| (r.date, r.started_at));
+    reports.sort_by_key(|(_, r)| (r.date, r.started_at));
     Ok(reports)
 }
 

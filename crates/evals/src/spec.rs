@@ -2,7 +2,7 @@
 //!
 //! Loading validates everything and reports every problem at once, each with the file it is in.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -10,13 +10,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::grade::normalize_text;
 
+/// The `bot:` value that means "the personal bot of whoever the tasks are for".
+pub const PERSONAL_BOT: &str = "personal";
+
 /// A category: one bot, a pass bar, and the tasks it is graded on.
 #[derive(Debug, Clone)]
 pub struct Category {
     pub name: String,
+    /// A bot name, or [`PERSONAL_BOT`]; see [`resolve_bot`].
     pub bot: String,
-    /// The fraction of tasks (0–1) that must pass.
-    pub pass_bar: f64,
+    /// The fraction of attempts (0–1) that must pass. `None`: the category reports only.
+    pub pass_bar: Option<f64>,
+    /// How many times each task runs (at least 1).
+    pub repeats: u32,
     pub description: String,
     pub tasks: Vec<EvalTask>,
 }
@@ -26,17 +32,51 @@ pub struct Category {
 struct CategoryFile {
     name: String,
     bot: String,
-    pass_bar: f64,
+    #[serde(default)]
+    pass_bar: Option<f64>,
+    #[serde(default)]
+    repeats: Option<u32>,
     description: String,
 }
 
+/// The bot a category's tasks go to: its `bot`, or for `bot: personal` the personal bot of
+/// `requested_by`, `pm-<requested_by>` (with `.` and `_` as hyphens, as onboarding names it).
+pub fn resolve_bot(bot: &str, requested_by: &str) -> String {
+    if bot == PERSONAL_BOT {
+        pmos_contract::onboarding::personal_bot_name(requested_by)
+    } else {
+        bot.to_string()
+    }
+}
+
 /// One task: what to ask, and what a passing answer looks like.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EvalTask {
     pub id: String,
     pub ask: String,
     pub expect: Expect,
+    /// Tasks in one cluster share a source, so they are not independent; the standard error
+    /// is clustered by it. Default: the first `must_cite` URL, else the task id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
+    /// A task that once broke and was fixed. The gate fails if it flips back to failing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub regression: bool,
+    /// Failure modes from `evals/taxonomy.yaml` this task is there to catch, such as
+    /// `model/answered-beyond-sources`. Informational; `check` validates them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+impl EvalTask {
+    /// The task's cluster: `cluster`, else its first `must_cite` URL, else its id.
+    pub fn cluster(&self) -> String {
+        self.cluster
+            .clone()
+            .or_else(|| self.expect.must_cite.first().cloned())
+            .unwrap_or_else(|| self.id.clone())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -54,6 +94,13 @@ pub struct Expect {
     /// How many approval items the task must end with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvals: Option<u32>,
+    /// The answer must say it can't answer from its sources: it contains one of the
+    /// `decline_phrases` in `evals/config.yaml`. Such a task has no `must_cite`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub must_decline: bool,
+    /// Checks on the task's drafts, one entry per tool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drafts: Vec<DraftCheck>,
 }
 
 impl Expect {
@@ -62,7 +109,33 @@ impl Expect {
             && self.must_include.is_empty()
             && self.must_not_include.is_empty()
             && self.approvals.is_none()
+            && !self.must_decline
+            && self.drafts.is_empty()
     }
+}
+
+/// Checks on one tool's drafts: the approval items the task ended with, read from
+/// `GET /v1/tasks/{id}/drafts`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DraftCheck {
+    /// The registry name, such as `jira.create_issue`.
+    pub tool: String,
+    /// Arguments every draft of this tool must have, not empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub require_fields: Vec<String>,
+    /// For each argument named, the values it may have, such as `project: [PM]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub allowed: BTreeMap<String, Vec<String>>,
+    /// Text every draft of this tool must contain (in its string arguments).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub must_include: Vec<String>,
+    /// Text no draft of this tool may contain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub must_not_include: Vec<String>,
+    /// How many drafts of this tool there must be. Default: at least one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
 }
 
 /// Every problem found while loading, each as `path: message`.
@@ -87,7 +160,7 @@ impl fmt::Display for SpecErrors {
 impl std::error::Error for SpecErrors {}
 
 /// Lowercase letters, digits and single hyphens, starting with a letter or digit.
-fn is_slug(s: &str) -> bool {
+pub fn is_slug(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && !s.starts_with('-')
@@ -152,10 +225,16 @@ pub fn load_category(root: &Path, name: &str) -> Result<Category, SpecErrors> {
             file.bot
         ));
     }
-    if !file.pass_bar.is_finite() || !(0.0..=1.0).contains(&file.pass_bar) {
+    if let Some(bar) = file.pass_bar {
+        if !bar.is_finite() || !(0.0..=1.0).contains(&bar) {
+            errors.push(format!(
+                "{shown}: `pass_bar` is {bar}; it is a fraction from 0 to 1, such as 0.8"
+            ));
+        }
+    }
+    if file.repeats == Some(0) {
         errors.push(format!(
-            "{shown}: `pass_bar` is {}; it is a fraction from 0 to 1, such as 0.8",
-            file.pass_bar
+            "{shown}: `repeats` is 0; each task runs at least once"
         ));
     }
     if file.description.trim().is_empty() {
@@ -218,6 +297,7 @@ pub fn load_category(root: &Path, name: &str) -> Result<Category, SpecErrors> {
         name: file.name,
         bot: file.bot,
         pass_bar: file.pass_bar,
+        repeats: file.repeats.unwrap_or(1).max(1),
         description: file.description.trim().to_string(),
         tasks,
     })
@@ -241,8 +321,16 @@ fn validate_task(task: &EvalTask, stem: &str, shown: &str, errors: &mut Vec<Stri
     let e = &task.expect;
     if e.is_empty() {
         errors.push(format!(
-            "{shown}: `expect` has no checks; give at least one of must_cite, must_include, must_not_include or approvals"
+            "{shown}: `expect` has no checks; give at least one of must_cite, must_include, must_not_include, approvals, must_decline or drafts"
         ));
+    }
+    if e.must_decline && !e.must_cite.is_empty() {
+        errors.push(format!(
+            "{shown}: a `must_decline` task has no `must_cite`: no page answers it"
+        ));
+    }
+    if task.cluster.as_deref().is_some_and(|c| c.trim().is_empty()) {
+        errors.push(format!("{shown}: `cluster` is empty"));
     }
     for url in &e.must_cite {
         match reqwest::Url::parse(url) {
@@ -270,6 +358,94 @@ fn validate_task(task: &EvalTask, stem: &str, shown: &str, errors: &mut Vec<Stri
             ));
         }
     }
+    let mut tools = HashSet::new();
+    for d in &e.drafts {
+        validate_draft_check(d, shown, errors);
+        if !tools.insert(d.tool.as_str()) {
+            errors.push(format!(
+                "{shown}: drafts has `{}` twice; give one entry per tool",
+                d.tool
+            ));
+        }
+    }
+}
+
+/// A registry tool name: `<system>.<action>`, in lowercase letters, digits and `_`.
+fn is_tool_name(s: &str) -> bool {
+    let part = |p: &str| {
+        !p.is_empty()
+            && p.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    };
+    matches!(s.split_once('.'), Some((a, b)) if part(a) && part(b))
+}
+
+fn validate_draft_check(d: &DraftCheck, shown: &str, errors: &mut Vec<String>) {
+    let tool = &d.tool;
+    if !is_tool_name(tool) {
+        errors.push(format!(
+            "{shown}: drafts tool `{tool}` is not a registry name such as `jira.create_issue`"
+        ));
+    }
+    if d.require_fields.iter().any(|f| f.trim().is_empty()) {
+        errors.push(format!(
+            "{shown}: drafts `{tool}`: require_fields has an empty entry"
+        ));
+    }
+    for (field, values) in &d.allowed {
+        if values.is_empty() {
+            errors.push(format!(
+                "{shown}: drafts `{tool}`: allowed `{field}` lists no values"
+            ));
+        }
+    }
+    for (field, list) in [
+        ("must_include", &d.must_include),
+        ("must_not_include", &d.must_not_include),
+    ] {
+        if list.iter().any(|t| normalize_text(t).is_empty()) {
+            errors.push(format!(
+                "{shown}: drafts `{tool}`: {field} has an empty entry"
+            ));
+        }
+    }
+    let checks_content = !d.require_fields.is_empty()
+        || !d.allowed.is_empty()
+        || !d.must_include.is_empty()
+        || !d.must_not_include.is_empty();
+    if d.count == Some(0) && checks_content {
+        errors.push(format!(
+            "{shown}: drafts `{tool}`: `count: 0` means no drafts, so its other checks never run"
+        ));
+    }
+}
+
+/// Drafts checks that name a tool `content/tools.yaml` doesn't list as a write tool, each as
+/// `path: message`. `check` runs this when it can read the registry.
+pub fn check_draft_tools(
+    root: &Path,
+    category: &Category,
+    registry: &pmos_contract::model::ToolRegistry,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for task in &category.tasks {
+        for d in &task.expect.drafts {
+            let is_write = registry
+                .get(&d.tool)
+                .is_some_and(|t| t.kind == pmos_contract::model::ToolKind::Write);
+            if !is_write {
+                errors.push(format!(
+                    "{}: drafts tool `{}` is not a write tool in content/tools.yaml",
+                    category_dir(root, &category.name)
+                        .join("tasks")
+                        .join(format!("{}.yaml", task.id))
+                        .display(),
+                    d.tool
+                ));
+            }
+        }
+    }
+    errors
 }
 
 #[cfg(test)]
@@ -285,5 +461,33 @@ mod tests {
         assert!(!is_slug("a--b"));
         assert!(!is_slug(""));
         assert!(!is_slug("a_b"));
+    }
+
+    #[test]
+    fn tool_names() {
+        assert!(is_tool_name("jira.create_issue"));
+        assert!(!is_tool_name("jira"));
+        assert!(!is_tool_name("Jira.create"));
+        assert!(!is_tool_name(".x"));
+    }
+
+    #[test]
+    fn personal_resolves_to_the_requesters_bot() {
+        assert_eq!(resolve_bot("personal", "ana"), "pm-ana");
+        assert_eq!(resolve_bot("personal", "ana.lee"), "pm-ana-lee");
+        assert_eq!(resolve_bot("docs", "ana"), "docs");
+    }
+
+    #[test]
+    fn the_cluster_defaults_to_the_first_page_then_the_id() {
+        let mut t = EvalTask {
+            id: "t".into(),
+            ..EvalTask::default()
+        };
+        assert_eq!(t.cluster(), "t");
+        t.expect.must_cite = vec!["https://a/x".into(), "https://a/y".into()];
+        assert_eq!(t.cluster(), "https://a/x");
+        t.cluster = Some("ports".into());
+        assert_eq!(t.cluster(), "ports");
     }
 }

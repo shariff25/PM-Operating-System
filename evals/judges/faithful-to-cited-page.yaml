@@ -1,0 +1,20 @@
+# Does the Docs bot's answer say only what the pages it read say? The deterministic checks see
+# whether the answer cites the page and states its key facts; this judge looks for claims the
+# page doesn't support.
+#
+# Advisory: it has no labels yet (faithful-to-cited-page.labels.jsonl is empty), so it is
+# reported and never fails a run or the gate. It blocks only once calibrated on at least 100
+# labels with TPR and TNR of at least 0.8 (docs/runbooks/quality.md, "Calibrating a judge").
+name: faithful-to-cited-page
+failure_mode: model/unfaithful-to-source
+question: >-
+  Is every factual claim in the output supported by the tool results in the input? Answer yes
+  if each claim about the product is stated in what the assistant read, and no if any claim is
+  missing from it or contradicts it. Links, and a plain statement that the docs don't answer
+  the question, are not claims.
+alias: pmos/extraction
+applies_to: [docs-qa]
+labels: faithful-to-cited-page.labels.jsonl
+# The judge needs the pages the bot read, from the trace (run with --trace-token). An attempt
+# whose trace has no tool results gets no verdict.
+needs_sources: true

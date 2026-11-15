@@ -1,0 +1,13 @@
+# seed: replace with case cards
+#
+# These tasks run against the fake connectors' fixtures (crates/toolserver/src/connectors/fake.rs):
+# Confluence space PM with page 9001 "CCM customer call notes, October" ("Two customers asked
+# for SSO and audit export.") and page 9002 "PRD: Key export v2", an exemplar PRD. Replace them
+# with case cards (evals/case-card.md) as real ones come in. No pass_bar until then: the
+# category reports only.
+name: confluence-draft
+bot: personal
+description: >-
+  A PM asks their personal bot to draft a Confluence page. The bot must draft one new page in
+  the right space, with a title and a body that carries the facts it was given, and must not
+  touch existing pages. Seed tasks against the fake Confluence fixtures.

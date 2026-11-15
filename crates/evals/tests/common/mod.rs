@@ -36,6 +36,8 @@ pub struct Script {
     /// Stays working forever (with or without events).
     pub hangs: bool,
     pub trace: Vec<Value>,
+    /// The task's drafts, as `(tool, args)`; their ids are the approval ids.
+    pub drafts: Vec<(&'static str, Value)>,
 }
 
 impl Default for Script {
@@ -52,6 +54,20 @@ impl Default for Script {
             never_claimed: false,
             hangs: false,
             trace: Vec::new(),
+            drafts: Vec::new(),
+        }
+    }
+}
+
+impl Script {
+    /// A task that ends `needs_approval` with these drafts.
+    pub fn drafting(drafts: Vec<(&'static str, Value)>) -> Self {
+        Script {
+            status: "needs_approval",
+            result: Some("Drafted; waiting for your approval.".into()),
+            approvals: drafts.len(),
+            drafts,
+            ..Script::default()
         }
     }
 }
@@ -66,18 +82,30 @@ pub(crate) struct Stored {
 
 #[derive(Default)]
 pub struct Mock {
-    pub scripts: Mutex<HashMap<String, Script>>,
+    /// Per ask, the scripts its creations play in turn (the nth creation plays the nth,
+    /// wrapping around).
+    pub scripts: Mutex<HashMap<String, Vec<Script>>>,
+    pub(crate) plays: Mutex<HashMap<String, usize>>,
     /// Tasks run one at a time, like a bot with one sandbox.
     pub serial: bool,
+    /// `GET /v1/tasks/{id}/drafts` answers 404, as a runtime without it would.
+    pub no_drafts: bool,
     pub(crate) tasks: Mutex<HashMap<String, Stored>>,
     pub(crate) order: Mutex<Vec<String>>,
     pub(crate) last_finish: Mutex<Option<DateTime<Utc>>>,
     pub created: Mutex<Vec<Value>>,
+    pub drafts_read: Mutex<Vec<String>>,
 }
 
 impl Mock {
     pub fn script(&self, ask: &str, s: Script) {
+        self.script_seq(ask, vec![s]);
+    }
+
+    /// Scripts for an ask's successive creations, such as its repeats.
+    pub fn script_seq(&self, ask: &str, s: Vec<Script>) {
         self.scripts.lock().unwrap().insert(ask.to_string(), s);
+        self.plays.lock().unwrap().remove(ask);
     }
 
     pub fn created_bodies(&self) -> Vec<Value> {
@@ -142,7 +170,8 @@ async fn create(
         )
             .into_response();
     }
-    if body["bot"] != "docs" {
+    let bot = body["bot"].as_str().unwrap_or_default();
+    if bot != "docs" && !bot.starts_with("pm-") {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "no such bot"}))).into_response();
     }
     if body["requested_by"] == "stranger" {
@@ -154,13 +183,18 @@ async fn create(
     }
     m.created.lock().unwrap().push(body.clone());
     let ask = body["text"].as_str().unwrap_or_default().to_string();
-    let script = m
-        .scripts
-        .lock()
-        .unwrap()
-        .get(&ask)
-        .cloned()
-        .unwrap_or_default();
+    let script = {
+        let scripts = m.scripts.lock().unwrap();
+        let mut plays = m.plays.lock().unwrap();
+        let n = plays.entry(ask.clone()).or_default();
+        let s = scripts
+            .get(&ask)
+            .filter(|v| !v.is_empty())
+            .map(|v| v[*n % v.len()].clone())
+            .unwrap_or_default();
+        *n += 1;
+        s
+    };
     let created = Utc::now();
     let mut start = created + Duration::milliseconds(script.queue_ms);
     if m.serial {
@@ -256,6 +290,40 @@ async fn trace(
     }
 }
 
+/// `GET /v1/tasks/{id}/drafts` as the runtime serves it to clients `console` and `evals`:
+/// `{drafts: [{id, tool, args, status}]}` once the task has settled.
+async fn drafts(
+    State(m): State<Arc<Mock>>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    if !authed(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if m.no_drafts {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    }
+    m.drafts_read.lock().unwrap().push(id.clone());
+    let tasks = m.tasks.lock().unwrap();
+    let Some(st) = tasks.get(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let settled = !st.script.never_claimed && !st.script.hangs && Utc::now() >= st.finish;
+    let out: Vec<Value> = if settled {
+        st.script
+            .drafts
+            .iter()
+            .enumerate()
+            .map(|(i, (tool, args))| {
+                json!({"id": format!("apr_{i}"), "tool": tool, "args": args, "status": "pending"})
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Json(json!({"drafts": out})).into_response()
+}
+
 /// Start the mock on a free port. Returns its base URL.
 pub async fn spawn(mock: Arc<Mock>) -> String {
     let app = Router::new()
@@ -263,6 +331,7 @@ pub async fn spawn(mock: Arc<Mock>) -> String {
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/events", get(events))
         .route("/v1/tasks/{id}/trace", get(trace))
+        .route("/v1/tasks/{id}/drafts", get(drafts))
         .with_state(mock);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -270,6 +339,67 @@ pub async fn spawn(mock: Arc<Mock>) -> String {
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+pub const GATEWAY_TOKEN: &str = "evals-gateway-token-0123456789abcdef01";
+
+/// A mocked gateway: `POST /v1/chat/completions` for client `evals`, answering each call
+/// with `reply(user message)`.
+pub struct Gateway {
+    pub reply: Box<dyn Fn(&str) -> String + Send + Sync>,
+    pub calls: Mutex<Vec<Value>>,
+}
+
+async fn completions(
+    State(g): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if bearer(&headers).as_deref() != Some(GATEWAY_TOKEN) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": {"message": "bad token"}})),
+        )
+            .into_response();
+    }
+    if !body["model"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("pmos/")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"message": "model must be pmos/<role>"}})),
+        )
+            .into_response();
+    }
+    let user = body["messages"][1]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    g.calls.lock().unwrap().push(body);
+    let content = (g.reply)(&user);
+    Json(json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]}))
+        .into_response()
+}
+
+/// Start the mock gateway. Returns its base URL, without `/v1`.
+pub async fn spawn_gateway(g: Arc<Gateway>) -> String {
+    let app = Router::new()
+        .route("/v1/chat/completions", post(completions))
+        .with_state(g);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// The checked-in taxonomy, which `check` needs in an evals root.
+pub fn write_taxonomy(root: &Path) {
+    let real = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/taxonomy.yaml");
+    std::fs::copy(real, root.join("taxonomy.yaml")).unwrap();
 }
 
 /// A trace entry as the worker posts it.
@@ -289,6 +419,7 @@ latency_targets:
   queue_p90: {seconds: 120, source: test plan}
   total_p50: {seconds: 60, source: test default}
   total_p90: {seconds: 180, source: test default}
+decline_phrases: [\"don't answer\", \"couldn't find\"]
 ";
 
 /// Write `config.yaml` and a category with the given task files (`(id, yaml)`) under `root`.

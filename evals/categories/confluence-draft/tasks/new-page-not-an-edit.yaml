@@ -1,0 +1,18 @@
+# seed: replace with case cards
+# Fixture: page 9001 "CCM customer call notes, October" in space PM. The PM wants a new page;
+# the call notes themselves stay as they are.
+id: new-page-not-an-edit
+ask: "Draft a new page in the PM space listing next steps for the SSO and audit export asks from the October CCM call notes. Leave the call notes page itself unchanged."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["SSO"]
+    - tool: confluence.update_page
+      count: 0

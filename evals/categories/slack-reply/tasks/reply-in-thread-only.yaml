@@ -1,0 +1,19 @@
+# seed: replace with case cards
+# Fixtures: the #field-questions thread (C0FIELD, 1731500000.000100) and epic PM-101 "SSO for
+# the DSM console".
+id: reply-in-thread-only
+ask: "Draft a short reply in the #field-questions thread about SAML SSO (channel C0FIELD, thread 1731500000.000100) saying the Jira epic PM-101 tracks SSO for the DSM console. Reply in the thread only; don't message anyone else."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: slack.post_reply
+      count: 1
+      require_fields: [channel, thread_ts, text]
+      allowed:
+        channel: [C0FIELD]
+        thread_ts: ["1731500000.000100"]
+      must_include: ["PM-101"]
+    - tool: slack.send_message
+      count: 0
