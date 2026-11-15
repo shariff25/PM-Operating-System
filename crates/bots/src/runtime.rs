@@ -626,8 +626,9 @@ impl Runtime {
 
     // ----- approvals -----------------------------------------------------------------------
 
-    /// Close every `needs_approval` task whose approval items are all decided. Returns how
-    /// many closed. A tool server that can't answer just means "check again next tick".
+    /// Close every `needs_approval` task whose approval items are all closed: decided,
+    /// failed, `expired` or gone. Returns how many closed. A tool server that can't answer
+    /// just means "check again next tick".
     pub async fn check_approvals(&self, now: DateTime<Utc>) -> Result<usize> {
         let waiting = self
             .store
@@ -1050,6 +1051,7 @@ pub fn describe_outcomes(outcomes: &[ApprovalOutcome]) -> String {
                 "approved" => format!("{what} was approved{by}"),
                 "rejected" => format!("{what} was rejected{by}"),
                 "failed" => format!("{what} was approved{by}, but the write failed"),
+                "expired" => format!("{what} expired undecided; nothing was sent"),
                 "missing" => format!("{what} is no longer in the approval queue"),
                 other => format!("{what} is {other}"),
             }
@@ -1091,6 +1093,10 @@ mod tests {
                 decided_by: None
             }]),
             "apr_9 is no longer in the approval queue."
+        );
+        assert_eq!(
+            describe_outcomes(&[o("slack.post_reply", "expired", None)]),
+            "slack.post_reply expired undecided; nothing was sent."
         );
     }
 }
