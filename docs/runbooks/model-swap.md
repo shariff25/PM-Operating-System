@@ -22,7 +22,7 @@ changes only `deploy/.env` and `deploy/gateway.yaml`, and then has to pass the b
    ```
 5. **Run the benchmarks** for every category that uses the role:
    ```sh
-   deploy/pmos-admin evals run --category docs-qa --as <you> --note "model swap: <model>"
+   deploy/pmos-admin evals-run --category docs-qa --note "model swap: <model>"
    ```
    - **If it misses the bar,** swap back: undo steps 2–3 and restart.
    - **To retire the workarounds** (D11), rerun with them off: set

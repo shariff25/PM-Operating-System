@@ -161,7 +161,7 @@ Only after the red-team checklist passes.
    something that needs Jira.
 6. **Run the benchmarks** (`docs/evals.md`):
    ```sh
-   deploy/pmos-admin evals run --category docs-qa --as <your handle> --note "gate 1"
+   deploy/pmos-admin evals-run --category docs-qa --note "gate 1"
    deploy/pmos-admin evals load --tasks 5 --as <your handle>
    ```
    Commit the reports in `/srv/pmos/content-repo/evals/reports`.

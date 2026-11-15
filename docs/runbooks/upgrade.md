@@ -29,7 +29,7 @@ reach PMs until the affected category still meets its bar (D10).
    deploy/pmos-admin sandbox <bot>
    ```
 6. **Check:** run `deploy/pmos-admin smoke <your handle>`, then the benchmarks for any category
-   the change touches (`deploy/pmos-admin evals run --category <c> --as <you>`).
+   the change touches (`deploy/pmos-admin evals-run --category <c>`).
 
 ## Rolling back
 
