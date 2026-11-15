@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # TESTING ONLY: run every PM OS service on this machine against a test Slack workspace, with a
-# Claude model behind the gateway (docs/testing-with-claude.md).
+# cloud model behind the gateway (docs/testing-with-claude.md). Prompts leave this machine, so
+# use fake data only.
+#
+# Two model modes:
+#   Claude (the default): config/gateway.claude-test.yaml, the Claude test upstream.
+#   Another provider: set PMOS_TEST_MODEL_URL to any OpenAI-compatible API's base URL (e.g.
+#     https://generativelanguage.googleapis.com/v1beta/openai). The script writes
+#     $STATE/gateway.yaml with one `openai+<url>` upstream and every role on PMOS_TEST_MODEL.
 #
 # What runs: pmos-docs (your public docs site, if PMOS_DOCS_BASE_URL is set), the tool server (fake Jira, Confluence and
-# Slack fixtures), the gateway (Claude test upstream), the bot runtime, one harness worker per
+# Slack fixtures), the gateway (the test upstream), the bot runtime, one harness worker per
 # bot (docs and pm-<you>), and the Slack bot. Everything keeps its state in memory and in
 # $STATE; nothing touches the real content repo.
 #
@@ -11,7 +18,13 @@
 #   PMOS_SLACK_APP_TOKEN  the test Slack app's app-level token (xapp-…, connections:write)
 #   PMOS_SLACK_BOT_TOKEN  the test Slack app's bot token (xoxb-…)
 #   PMOS_TEST_SLACK_ID    your member id in the test workspace (U…)
+# and for Claude:
 #   PMOS_GATEWAY_ANTHROPIC_KEY  a Claude API key
+# or for another provider:
+#   PMOS_TEST_MODEL_URL   the provider's OpenAI-compatible base URL (https)
+#   PMOS_TEST_MODEL       the model name for every role (it must support tool calling)
+#   PMOS_GATEWAY_REMOTE_KEY  the provider's API key
+#   PMOS_TEST_MODEL_FAST  optional: a model for the `extraction` role (default PMOS_TEST_MODEL)
 # Optional:
 #   PMOS_TEST_HANDLE      your PM OS handle in the test (default: tester)
 #   PMOS_TEST_STATE       where state and logs go (default: state/claude-test)
@@ -26,7 +39,18 @@ set -euo pipefail
 : "${PMOS_SLACK_APP_TOKEN:?set PMOS_SLACK_APP_TOKEN (the test app's xapp- token)}"
 : "${PMOS_SLACK_BOT_TOKEN:?set PMOS_SLACK_BOT_TOKEN (the test app's xoxb- token)}"
 : "${PMOS_TEST_SLACK_ID:?set PMOS_TEST_SLACK_ID (your member id in the test workspace)}"
-: "${PMOS_GATEWAY_ANTHROPIC_KEY:?set PMOS_GATEWAY_ANTHROPIC_KEY (a Claude API key)}"
+if [ -n "${PMOS_TEST_MODEL_URL:-}" ]; then
+  : "${PMOS_TEST_MODEL:?set PMOS_TEST_MODEL (the model name at PMOS_TEST_MODEL_URL)}"
+  : "${PMOS_GATEWAY_REMOTE_KEY:?set PMOS_GATEWAY_REMOTE_KEY (the API key for PMOS_TEST_MODEL_URL)}"
+  case "$PMOS_TEST_MODEL_URL" in
+    https://*) ;;
+    *) echo "error: PMOS_TEST_MODEL_URL must start with https://" >&2; exit 1 ;;
+  esac
+  MODEL_DESC="$PMOS_TEST_MODEL at $PMOS_TEST_MODEL_URL"
+else
+  : "${PMOS_GATEWAY_ANTHROPIC_KEY:?set PMOS_GATEWAY_ANTHROPIC_KEY (a Claude API key), or PMOS_TEST_MODEL_URL for another provider}"
+  MODEL_DESC="Claude (config/gateway.claude-test.yaml)"
+fi
 HANDLE="${PMOS_TEST_HANDLE:-tester}"
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -46,6 +70,27 @@ cp -r content "$STATE/content"
 "$BIN/pmos" member add --root "$STATE/content" --handle "$HANDLE" \
   --slack-id "$PMOS_TEST_SLACK_ID" --roles pm,admin >/dev/null
 "$BIN/pmos" lint --root "$STATE/content" | tail -1
+
+if [ -n "${PMOS_TEST_MODEL_URL:-}" ]; then
+  GATEWAY_CONFIG="$STATE/gateway.yaml"
+  echo "== gateway config in $GATEWAY_CONFIG ($MODEL_DESC)"
+  cat >"$GATEWAY_CONFIG" <<EOF
+# TESTING ONLY, written by scripts/claude-test-stack.sh: every role on a remote
+# OpenAI-compatible API, so prompts leave this machine. Fake data only.
+upstreams:
+  remote: "openai+${PMOS_TEST_MODEL_URL%/}"
+roles:
+  default: {upstream: remote, model: "$PMOS_TEST_MODEL"}
+  reasoning: {upstream: remote, model: "$PMOS_TEST_MODEL"}
+  extraction: {upstream: remote, model: "${PMOS_TEST_MODEL_FAST:-$PMOS_TEST_MODEL}"}
+limits:
+  max-in-flight: 4
+  per-user: 2
+  max-queue: 64
+EOF
+else
+  GATEWAY_CONFIG=config/gateway.claude-test.yaml
+fi
 
 # Fresh tokens between the services for this run only.
 tok() { openssl rand -hex 24; }
@@ -90,7 +135,7 @@ start toolserver env PMOS_DEV=1 PMOS_CONNECTORS=fake \
   "$BIN/pmos-toolserver"
 wait_for http://127.0.0.1:8710/healthz toolserver
 
-start gateway env PMOS_GATEWAY_CLOUD_TEST=1 PMOS_GATEWAY_CONFIG=config/gateway.claude-test.yaml \
+start gateway env PMOS_GATEWAY_CLOUD_TEST=1 PMOS_GATEWAY_CONFIG="$GATEWAY_CONFIG" \
   PMOS_GATEWAY_TOKENS="runtime=$GW_RUNTIME,worker=$GW_WORKER" \
   PMOS_GATEWAY_USAGE_LOG="$STATE/usage.jsonl" \
   "$BIN/pmos-gateway"
@@ -121,10 +166,12 @@ start slack env PMOS_SLACK_APP_TOKEN="$PMOS_SLACK_APP_TOKEN" \
   "$BIN/pmos-slack"
 
 echo
-echo "== PM OS test stack is up. In the test Slack workspace, DM the PM OS app:"
+echo "== PM OS test stack is up, with $MODEL_DESC behind the gateway."
+echo "   In the test Slack workspace, DM the PM OS app:"
 echo "   docs: how do I get started?         (the Docs bot, your docs site)"
 echo "   summarize the open launch issues    (your bot $BOT_PERSONAL, fake Jira)"
 echo "   setup                               (the onboarding checklist)"
-echo "   Logs: $STATE/logs. Ctrl-C stops everything."
+echo "   Logs: $STATE/logs; model calls (who, role, tokens; never text): $STATE/usage.jsonl."
+echo "   Prompts go to the test model off this machine: fake data only. Ctrl-C stops everything."
 wait -n "${PIDS[@]}" || true
 echo "a service stopped; see $STATE/logs" >&2

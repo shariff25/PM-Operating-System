@@ -4,6 +4,7 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- PM OS can now be tried with another provider's model standing in for the local models: any OpenAI-compatible API, such as Gemini, set with `PMOS_TEST_MODEL_URL` and `PMOS_TEST_MODEL` (testing only, fake data only; [how](docs/testing-with-claude.md#another-provider)).
 - PM OS now works at your level: Senior, Staff or Principal ([how to use it](docs/levels.md)).
   - PM OS can now work at your level: DM `level staff` (or `senior`, or `principal`) and it changes the scope, horizon and audience of what it writes, adds a Cross-team effects section at Staff and a What must be true section at Principal, and brings in the executive, CFO, CTO or CEO reviewers.
   - PM OS can now do 12 new kinds of work, in two tracks. **Leading across teams:** `portfolio-review`, `roadmap-tradeoffs`, `okr-draft`, `business-review`, `alignment-plan`, `coach-feedback`, `bets-register`. **Company bets:** `vision-doc`, `investment-case`, `pricing-proposal`, `platform-strategy`, `exec-brief`.
