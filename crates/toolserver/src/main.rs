@@ -175,7 +175,8 @@ async fn main() -> Result<()> {
     let svc = ToolService::new(catalog, stores, connectors)
         .map_err(anyhow::Error::msg)?
         .with_team(team.clone())
-        .with_ledger_expire_days(config.ledger_expire_days);
+        .with_ledger_expire_days(config.ledger_expire_days)
+        .with_slack_draft_ttl_hours(config.slack_draft_ttl_hours);
     let svc = Arc::new(svc);
     // One replica: anything still `executing` from a previous process was interrupted.
     match svc.reconcile(chrono::Duration::zero(), Utc::now()).await {
@@ -187,6 +188,7 @@ async fn main() -> Result<()> {
         Err(e) => tracing::error!(error = %e, "reconciling interrupted writes failed"),
     }
     spawn_reconciler(svc.clone(), cancel.clone());
+    spawn_draft_sweeper(svc.clone(), cancel.clone());
     let mut onboarding = Onboarding::new(svc.clone(), oauth.clone(), github_setup);
     if config.content_sync_secs > 0 {
         let sync = ContentSync::new(&config.content_root, svc.clone());
@@ -261,6 +263,28 @@ fn spawn_reconciler(svc: Arc<ToolService>, cancel: CancellationToken) {
                         tracing::warn!(error = %e, "reconciling stuck writes failed");
                     }
                 }
+            }
+        }
+    });
+}
+
+/// Every 10 minutes, from start-up: undecided Slack drafts past `PMOS_SLACK_DRAFT_TTL_HOURS`
+/// expire, and decided ones lose their text that long after their decision.
+fn spawn_draft_sweeper(svc: Arc<ToolService>, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(PRUNE_EVERY);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick.tick() => match svc.sweep_slack_drafts(Utc::now()).await {
+                    Ok(swept) if swept.expired + swept.redacted > 0 => tracing::info!(
+                        expired = swept.expired,
+                        redacted = swept.redacted,
+                        "Slack drafts swept"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "sweeping Slack drafts failed"),
+                },
             }
         }
     });

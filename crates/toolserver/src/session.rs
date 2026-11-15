@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use pmos_contract::Sensitivity;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -25,10 +26,13 @@ pub struct Session {
     pub run_id: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    /// The highest data class the session has read so far (`docs/slack-reply-spec.md` §3).
+    /// Each approval item it drafts records it.
+    pub sources_sensitivity: Sensitivity,
 }
 
 impl Session {
-    /// A new skill session with a fresh token.
+    /// A new skill session with a fresh token, having read nothing yet.
     pub fn new(user: &str, skill: &str, run_id: &str, ttl: Duration, now: DateTime<Utc>) -> Self {
         Self {
             token: new_token(),
@@ -38,6 +42,7 @@ impl Session {
             run_id: run_id.to_string(),
             created_at: now,
             expires_at: now + ttl,
+            sources_sensitivity: Sensitivity::Public,
         }
     }
 
@@ -59,6 +64,9 @@ pub trait SessionRepo: Send + Sync {
     async fn get(&self, token: &str, now: DateTime<Utc>) -> StoreResult<Option<Session>>;
     /// End a session. Returns whether it existed.
     async fn revoke(&self, token: &str) -> StoreResult<bool>;
+    /// Record that the session read data of class `read`: its `sources_sensitivity` becomes
+    /// `read` if that is higher, and never goes down.
+    async fn raise_sensitivity(&self, token: &str, read: Sensitivity) -> StoreResult<()>;
 }
 
 #[derive(Default)]
@@ -87,6 +95,13 @@ impl SessionRepo for MemorySessions {
             .expect("session lock")
             .remove(token)
             .is_some())
+    }
+
+    async fn raise_sensitivity(&self, token: &str, read: Sensitivity) -> StoreResult<()> {
+        if let Some(s) = self.sessions.lock().expect("session lock").get_mut(token) {
+            s.sources_sensitivity = s.sources_sensitivity.max(read);
+        }
+        Ok(())
     }
 }
 

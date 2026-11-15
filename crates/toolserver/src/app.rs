@@ -37,7 +37,10 @@ use crate::mcp::PmosMcp;
 use crate::members::RequestStatus;
 use crate::oauth::{OAuth, OAuthError};
 use crate::onboarding::{DecisionInput, Onboarding, Refusal};
-use crate::service::{DecisionError, ReindexError, SessionError, ToolError, ToolService};
+use crate::service::{
+    DecisionError, ReindexError, SessionError, ToolError, ToolService, AUDIENCE_BLOCKED,
+    AUDIENCE_UNAVAILABLE, NEEDS_EXTERNAL_CONFIRM,
+};
 use crate::session::BOT_IDENTITY_PREFIX;
 use crate::store::StoreError;
 use crate::vault::Provider;
@@ -440,6 +443,18 @@ struct DecisionBody {
     /// Only with `reject`: one of the ledger's reasons.
     #[serde(default)]
     reason: Option<String>,
+    /// For a Slack write to an externally shared channel: the PM confirmed posting there.
+    #[serde(default)]
+    confirm_external: bool,
+}
+
+/// An error with a machine-readable `code`, and any extra fields.
+fn coded(status: StatusCode, code: &str, message: String, extra: Value) -> Response {
+    let mut body = json!({ "code": code, "error": message });
+    if let (Some(body), Value::Object(extra)) = (body.as_object_mut(), extra) {
+        body.extend(extra);
+    }
+    (status, Json(body)).into_response()
 }
 
 async fn decide(
@@ -465,6 +480,7 @@ async fn decide(
         decision: body.decision,
         args: body.args,
         reason,
+        confirm_external: body.confirm_external,
     };
     match state
         .svc
@@ -473,11 +489,32 @@ async fn decide(
     {
         Ok(item) => Json(item).into_response(),
         Err(DecisionError::Decide(DecideError::Store(e))) => unavailable(e),
+        Err(e @ DecisionError::Decide(DecideError::Expired)) => {
+            coded(StatusCode::CONFLICT, "expired", e.to_string(), json!({}))
+        }
+        Err(ref e @ DecisionError::AudienceBlocked(a)) => coded(
+            StatusCode::CONFLICT,
+            AUDIENCE_BLOCKED,
+            e.to_string(),
+            json!({"outsiders": a.outsiders, "members": a.members, "external": a.external}),
+        ),
+        Err(ref e @ DecisionError::NeedsExternalConfirm(a)) => coded(
+            StatusCode::CONFLICT,
+            NEEDS_EXTERNAL_CONFIRM,
+            e.to_string(),
+            json!({"members": a.members, "external": a.external}),
+        ),
+        Err(e @ DecisionError::AudienceUnavailable(_)) => coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            AUDIENCE_UNAVAILABLE,
+            e.to_string(),
+            json!({}),
+        ),
         Err(DecisionError::Decide(e)) => {
             let status = match e {
                 DecideError::NotFound => StatusCode::NOT_FOUND,
                 DecideError::Forbidden => StatusCode::FORBIDDEN,
-                DecideError::NotPending => StatusCode::CONFLICT,
+                DecideError::NotPending | DecideError::Expired => StatusCode::CONFLICT,
                 DecideError::MissingArgs => StatusCode::BAD_REQUEST,
                 DecideError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
             };
