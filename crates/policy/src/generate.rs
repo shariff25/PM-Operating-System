@@ -18,7 +18,8 @@ use crate::openshell::{
 use crate::spec::{ProviderAttachment, SandboxSpec, Upload};
 use crate::{
     provider_name, sandbox_name, yaml, Service, CONTENT_MOUNT, GENERATED_MARKER, MCP_VERSIONS,
-    RUN_AS, SYSTEM_READ_ONLY, SYSTEM_READ_WRITE, TOOLSERVER_MCP_PATH, WORKER_BINARY, WORKSPACE,
+    RUN_AS, SYSTEM_READ_ONLY, SYSTEM_READ_WRITE, TOOLSERVER_MCP_PATH, TOOL_REGISTRY, WORKER_BINARY,
+    WORKSPACE,
 };
 
 /// Everything about one bot that its sandbox policy depends on.
@@ -84,14 +85,16 @@ impl BotContext {
         }
     }
 
-    /// The content uploaded into the sandbox, read-only: the role's skills and the bot's
-    /// master context, each at the same relative path under [`CONTENT_MOUNT`].
+    /// The content uploaded into the sandbox, read-only: the role's skills, the bot's master
+    /// context and the tool registry (`tools.yaml`, which the worker reads to tell reads from
+    /// writes), each at the same relative path under [`CONTENT_MOUNT`].
     pub fn uploads(&self) -> Vec<Upload> {
         let mut uploads: Vec<Upload> = self
             .skills
             .iter()
             .map(|s| format!("skills/{s}"))
             .chain(self.master.iter().cloned())
+            .chain(std::iter::once(TOOL_REGISTRY.to_string()))
             .map(|from| Upload {
                 to: format!("{CONTENT_MOUNT}/{from}"),
                 from,
@@ -595,7 +598,11 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             content,
-            ["/sandbox/master/AGENTS.md", "/sandbox/skills/docs"]
+            [
+                "/sandbox/master/AGENTS.md",
+                "/sandbox/skills/docs",
+                "/sandbox/tools.yaml"
+            ]
         );
     }
 
