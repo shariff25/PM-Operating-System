@@ -28,7 +28,15 @@ reach PMs until the affected category still meets its bar (D10).
    openshell sandbox delete pmos-<bot>
    deploy/pmos-admin sandbox <bot>
    ```
-6. **If the Slack app manifest changed** (`docs/slack-app-manifest.yaml`), update the app
+6. **If a role's skills or tools changed** (the changelog says so), regenerate the bots'
+   sandbox policies in your content repo, commit the result, then recreate each bot's
+   sandbox as in step 5. A policy lists the tools its bot may call, so a bot keeps its old
+   list until this is done:
+   ```sh
+   deploy/pmos-admin pmos policy generate --root content --out policies
+   deploy/pmos-admin pmos policy check
+   ```
+7. **If the Slack app manifest changed** (`docs/slack-app-manifest.yaml`), update the app
    and reinstall it; see below.
 7. **Check:** run `deploy/pmos-admin smoke <your handle>`, then the benchmarks for any category
    the change touches (`deploy/pmos-admin evals-run --category <c>`).
