@@ -183,6 +183,10 @@ sends a `needs_approval` notification with the ids.
   `approval_closed` notification says what happened, such as "jira.create_issue was approved
   by ana; slack.send_message was rejected by ana." Its `outcomes` lists each item's `tool`,
   `status` and `decided_by`.
+- **Closed states:** `approved`, `rejected`, `failed`, and `expired`: a Slack draft nobody
+  decided within `PMOS_SLACK_DRAFT_TTL_HOURS` (24 hours; `docs/toolserver.md`, **Slack
+  drafts**). An expired item reads "slack.post_reply expired undecided; nothing was sent",
+  with no `decided_by`.
 - **Lost items:** an id the tool server no longer knows counts as closed ("no longer in the
   approval queue"), so a task can't wait forever.
 - **Outages:** if the tool server can't answer, the check is simply tried again on the next
@@ -196,7 +200,8 @@ sends a `needs_approval` notification with the ids.
   (`GET /internal/approvals/{id}`) with its own service token, so the evals client never holds
   a tool-server token. `args` are the item's arguments as they stand (the edited ones once a
   PM edited them); `status` is the item's (`pending`, `executing`, `approved`, `rejected`,
-  `failed`).
+  `failed`, `expired`). A Slack draft's text reads `"[expired]"` once it expired, or a day
+  after its decision.
 - **Lost items** read `{"id": …, "tool": null, "args": null, "status": "missing"}`.
 - **Outages:** if the tool server can't answer, the call is `503`, never a partial list.
 - A task that drafted nothing, or hasn't finished, has `{"drafts": []}`.
