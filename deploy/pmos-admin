@@ -13,6 +13,8 @@
 #   pmos-admin reindex                reload content after a merge (lint-gated)
 #   pmos-admin revoke <handle> <atlassian|slack|github>
 #                                     remove a PM's linked account and its tokens
+#   pmos-admin ledger [--since 7d] [--export]
+#                                     what happened to the bots' drafts (feedback ledger)
 #   pmos-admin add-bot <bot>          give a new bot its own runtime and gateway tokens
 #   pmos-admin sandbox <bot>          create the bot's OpenShell sandbox and start its worker
 #   pmos-admin pause <bot> / resume <bot>
@@ -190,6 +192,41 @@ case "$cmd" in
   revoke)
     [ $# -eq 2 ] || { say "usage: pmos-admin revoke <handle> <atlassian|slack|github>" >&2; exit 2; }
     internal DELETE "/internal/credentials/$1/$2" && say "revoked $2 for $1"
+    ;;
+
+  ledger)
+    since=7d
+    export=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --since) since=$2; shift 2 ;;
+        --export) export=1; shift ;;
+        *) say "usage: pmos-admin ledger [--since 7d|24h|<date>] [--export]" >&2; exit 2 ;;
+      esac
+    done
+    case "$since" in
+      *d) from=$(date -u -d "-${since%d} days" +%Y-%m-%dT%H:%M:%SZ) ;;
+      *h) from=$(date -u -d "-${since%h} hours" +%Y-%m-%dT%H:%M:%SZ) ;;
+      *) from=$(date -u -d "$since" +%Y-%m-%dT%H:%M:%SZ) ;;
+    esac
+    if [ "$export" = 1 ]; then
+      # JSON lines, one ledger row each (labels and metadata only; no message text).
+      internal GET "/internal/ledger?since=$from&limit=1000" | python3 -c 'import json,sys
+for r in json.load(sys.stdin)["rows"]: print(json.dumps(r))'
+      exit 0
+    fi
+    internal GET "/internal/ledger/summary?since=$from" | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+print(f"drafts since {s.get("since", "?")}: {s["rows"]}, labelled {s["label_coverage"]:.0%} (phase 0 gate: 95%)")
+print(f"  {"bot/skill":<18} {"tool":<26} {"n":>4} {"ok":>4} {"edit":>4} {"rej":>4} {"exp":>4} {"med edit":>8}  reasons")
+for g in s["groups"]:
+    c = g["counts"]
+    med = g.get("median_edit_distance")
+    reasons = ", ".join(f"{k} {v}" for k, v in sorted(g.get("reasons", {}).items()) if v)
+    who = g.get("bot") or g.get("skill") or "?"
+    print(f"  {who:<18} {g["tool"]:<26} {g["rows"]:>4} {c.get("approved",0):>4} {c.get("edited",0):>4} {c.get("rejected",0):>4} {c.get("expired",0):>4} {(f"{med:.0%}" if med is not None else "-"):>8}  {reasons}")
+'
     ;;
 
   add-bot)
