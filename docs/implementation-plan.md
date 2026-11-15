@@ -254,7 +254,7 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
     - `pmos admin` commands for health, restart, model swap and token revocation;
     - day-2 runbooks in `docs/runbooks/` written for a technical PM;
     - upgrades only through the eval gate.
-  - Gate 1 adds "a platform-owner PM can restore from backup by following the runbook".
+  - Gate 1 adds "a platform-owner PM can restore from backup by following the runbook" (`docs/runbooks/backup-restore.md`).
 
 ## Status
 | Package | State | Notes |
@@ -271,6 +271,7 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
 | 0f Sandbox policies | Built; verify on the Spark | `crates/policy`, `pmos policy generate/check` in CI, `policies/bots/docs.yaml`, red-team kit. Format checked against OpenShell's repo; items marked "verify on the Spark" in `docs/sandbox-policies.md` |
 | 0g Evals | Built; first live run on the Spark | `crates/evals`, `evals/categories/docs-qa` (20 real questions), failure tags, weekly reports, load test. Latency is reported, not gated (decided 2026-11-14) |
 | Onboarding and GitHub memory | Built (this PR); first live run on the Spark | New members ask in Slack, a platform owner approves, PM OS commits `team.yaml` and their personal bot; guided setup; each PM's memory in a private repo in the Acme GitHub org ([spec](onboarding-spec.md)) |
+| Spark deployment kit | Built (this PR); first run on the Spark | `deploy/`: one Compose stack (Postgres, docs, tool server, gateway, bots, Slack, console, two vLLM servers), the service and worker images, `setup.sh`, `pmos-admin` (status, logs, backup and restore, reindex, revoke, bot sandboxes, smoke test, benchmarks), and runbooks in `docs/runbooks/`. CI builds the images, starts the stack and runs a task end to end. |
 | Claude test in a test Slack workspace (testing only) | Built; **deferred until the test workspace is ready** (2026-11-15) | Every service on one machine with Claude behind the gateway, fake Jira, Confluence and Slack, and the real public support docs. Waiting on a test Slack workspace and app, plus four environment variables: `PMOS_SLACK_BOT_TOKEN`, `PMOS_SLACK_APP_TOKEN`, `PMOS_TEST_SLACK_ID` and `PMOS_GATEWAY_ANTHROPIC_KEY` ([guide](testing-with-claude.md)) |
 | **Gate 1** | Needs the Spark | vLLM with the chosen models; OpenShell; the Slack app and the GitHub App; the first platform owners in `team.yaml` (everyone else onboards through the bot); the red-team run; two passing benchmark weeks; the load test (every task finishes) |
 
@@ -290,7 +291,7 @@ the pilot list. Still open, roughly in priority order:
 - Elect one docs-sync leader.
 
 **Security hardening:**
-- TLS (or mTLS) between services, and the public OAuth callback on its own listener, separate from `/internal` and `/mcp`.
+- TLS (or mTLS) between services, and the public OAuth callback on its own listener, separate from `/internal` and `/mcp`. *Until then, the install runbook's reverse proxy exposes only `/oauth/*`; every service port is published on 127.0.0.1 only.*
 - Untrusted-content wrapping:
   - wrap connector error text too;
   - give memory notes provenance, a cap, and approval when written from runs that read untrusted content.
