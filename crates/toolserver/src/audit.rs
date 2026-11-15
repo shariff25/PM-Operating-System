@@ -37,6 +37,8 @@ pub enum Outcome {
     Error,
     /// An approved member could not be committed to the content repo.
     Failed,
+    /// A Slack draft nobody decided in time expired, and its text was removed.
+    Expired,
 }
 
 /// Who made the call: a sandbox over MCP, or an internal service with its own token.

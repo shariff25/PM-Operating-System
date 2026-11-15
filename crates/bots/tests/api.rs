@@ -272,6 +272,46 @@ async fn results_with_approvals_wait_until_every_item_is_decided(env: &Env) {
     assert_eq!(last["outcomes"][1]["status"], "rejected");
 }
 
+/// A Slack draft nobody decided within a day is `expired`: a closed state, so the task
+/// settles when its last item expires, and Slack hears `approval_closed`.
+async fn a_task_settles_when_its_last_approval_expires(env: &Env) {
+    let task = env.ask("Draft my replies").await;
+    let tid = id(&task);
+    env.claim().await;
+    env.post(
+        &format!("/v1/worker/tasks/{tid}/complete"),
+        "worker",
+        None,
+        json!({"result": "Drafted two replies.", "approvals": ["apr_r1", "apr_r2"]}),
+    )
+    .await;
+    env.ts
+        .set_approval("apr_r1", "slack.post_reply", "approved", Some("ana"));
+    env.ts
+        .set_approval("apr_r2", "slack.post_reply", "pending", None);
+    let now = pmos_bots::model::now();
+    assert_eq!(
+        env.rt.check_approvals(now).await.unwrap(),
+        0,
+        "still waiting"
+    );
+    env.ts
+        .set_approval("apr_r2", "slack.post_reply", "expired", None);
+    assert_eq!(env.rt.check_approvals(now).await.unwrap(), 1);
+    assert_eq!(env.rt.check_approvals(now).await.unwrap(), 0, "closed once");
+
+    let (_, t) = env.get(&format!("/v1/tasks/{tid}"), "console", None).await;
+    assert_eq!(t["status"], "done");
+    let last = env.feed().await.last().unwrap().clone();
+    assert_eq!(last["kind"], "approval_closed");
+    assert_eq!(
+        last["text"],
+        "slack.post_reply was approved by ana; slack.post_reply expired undecided; nothing was sent."
+    );
+    assert_eq!(last["outcomes"][1]["status"], "expired");
+    assert_eq!(last["outcomes"][1]["decided_by"], Value::Null);
+}
+
 async fn approvals_the_tool_server_lost_still_close(env: &Env) {
     let task = env.ask("Anything").await;
     env.claim().await;
@@ -401,6 +441,7 @@ async fn a_failed_task_says_why(env: &Env) {
 both_envs!(
     a_task_runs_from_slack_to_a_result,
     results_with_approvals_wait_until_every_item_is_decided,
+    a_task_settles_when_its_last_approval_expires,
     approvals_the_tool_server_lost_still_close,
     two_workers_one_task_one_claim,
     workers_are_held_to_their_claim,

@@ -160,6 +160,7 @@ async fn decisions_through_the_service_label_their_rows() {
                 decision: Decision::Reject,
                 args: None,
                 reason: Some(Reason::WrongTarget),
+                confirm_external: false,
             },
             now(),
         )
@@ -235,6 +236,7 @@ async fn a_reason_is_only_accepted_with_reject() {
                     decision,
                     args,
                     reason: Some(Reason::Tone),
+                    confirm_external: false,
                 },
                 now(),
             )
@@ -279,6 +281,7 @@ async fn the_summary_counts_outcomes_coverage_edits_and_reasons() {
                 decision: Decision::Reject,
                 args: None,
                 reason: Some(Reason::Incomplete),
+                confirm_external: false,
             },
             now(),
         )

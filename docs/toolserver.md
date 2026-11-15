@@ -20,6 +20,8 @@ service and personal agents go through the same server, so they follow the same 
 | Arguments match the tool's schema | Required keys, no unknown keys, types and enums checked before any handler runs | — |
 | A bad draft gets one correction | A write tool refused twice for invalid arguments in a session is refused for the rest of it, without reaching the connector (see **Invalid drafts**) | — |
 | Every draft is labelled | Each approval item has a row in the feedback ledger: what became of it, never its text (see **Feedback ledger**) | — |
+| A Slack post reaches only who it may | Before a Slack write runs, its channel's members are checked against `team.yaml` and the draft's sources: restricted sources never reach outsiders, and a Slack Connect channel needs a second confirmation (see **Slack drafts**) | SLK-6 |
+| No Slack text past a day | An undecided Slack draft expires after 24 hours; a decided one loses its text 24 hours after the decision (see **Slack drafts**) | SLK-8 |
 
 ## How a write gets approved
 
@@ -43,7 +45,8 @@ harness ──same call (edited args if edited)──► tool server: grant matc
   tool's schema like any call (`400` if they fail), and the item's skill must still declare
   the tool (`409` if not). A refused decision leaves the item pending.
 - **An item moves through states:** `pending`, then `executing` while the write runs, then
-  `approved` (with the result) or `failed`.
+  `approved` (with the result) or `failed`. A pending Slack draft nobody decides becomes
+  `expired` (see **Slack drafts**). `approved`, `rejected`, `failed` and `expired` are closed.
   - The write runs in its own task, so an approver who disconnects can't cancel it halfway.
   - If the process dies mid-write, the item stays `executing`. On the next start, and every
     10 minutes for anything stuck longer than that, it becomes `failed` with "it may or may
@@ -65,9 +68,9 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | `DELETE /internal/session` + `X-Pmos-Session` | service or bot token | Revoke a session (sandbox ended) |
 | `POST /internal/call` + `X-Pmos-Session` `{tool, args}` | service or bot token | One tool call for the session, with the same rules as MCP: allowlist, argument checks, approvals for writes, audit (which records the caller). |
 | `POST /internal/grants` `{session_token, tool, args}` | service token | Record an approval given in the harness |
-| `GET /internal/approvals?user=&status=` | service token | A PM's inbox, newest first |
-| `GET /internal/approvals/{id}` | service or bot token | One item |
-| `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?}` | service or bot token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). |
+| `GET /internal/approvals?user=&status=` | service token | A PM's inbox, newest first. `status` is `pending`, `executing`, `approved`, `rejected`, `failed` or `expired` |
+| `GET /internal/approvals/{id}` | service or bot token | One item: `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity` and `redacted_at` |
+| `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?}` | service or bot token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. |
 | `GET /internal/ledger?since=&until=&bot=&outcome=&min_edit=&limit=` | service or bot token | `{rows: […]}`, newest first. See **Feedback ledger**. `422` for a bad parameter |
 | `GET /internal/ledger/summary?since=&bot=` | service token | Per bot (or skill) and tool: counts by outcome, label coverage, median edit distance, rejection reasons. `422` for a bad `since` |
 | `POST /internal/reindex` | service token | Rebuild the context index from the content checkout and re-read `team.yaml`, the bots and their roles; `422` if it fails `pmos lint` |
@@ -115,9 +118,10 @@ makes no item, so no row.
 
 - **No text.** Rows hold labels and metadata only: never the draft's arguments, never Slack
   text. Every field may go to the Slack bot.
-- **`expired`** is not stored. A row still `pending` and never decided is reported as
-  `expired` once it is older than `PMOS_LEDGER_EXPIRE_DAYS` (default 7). An approved write
-  still running stays `pending` until its outcome is stored.
+- **`expired`** is stored for a Slack draft that expired (see **Slack drafts**), with no
+  `decided_at`. For every other tool it is worked out on read: a row still `pending` and
+  never decided is reported as `expired` once it is older than `PMOS_LEDGER_EXPIRE_DAYS`
+  (default 7). An approved write still running stays `pending` until its outcome is stored.
 - **`edited`** means the decision changed the item's arguments (their hash differs). An
   `edit` decision that sends back the same arguments is `approved`.
 - **The edit distance** is the normalized character-level Levenshtein distance between the
@@ -145,6 +149,71 @@ first:
 decided or expired: phase 0's 95% gate), `median_edit_distance` (over rows that have one;
 `null` if none) and `reasons` (rejections by reason, `none` for those without one).
 `since` matches like the ledger's.
+
+## Slack drafts
+
+The tool server's part of the Slack reply assistant (`docs/slack-reply-spec.md` §3): it
+applies to `slack.post_reply` and `slack.send_message` items, from any skill or bot.
+
+**One draft per thread.** A `slack.post_reply` call first looks for the same user's reply to
+the same `channel` and `thread_ts`, created in the last 7 days, that is `pending`,
+`executing` or `approved`. If there is one, nothing new is queued, and the call succeeds
+with `{"status": "already_drafted", "approval_id": "<that one>", "message": "A reply to this
+thread is already waiting for <user> (or was posted); don't draft another."}`, audited as
+`ok` with detail `already drafted`. A rejected, failed or expired reply doesn't block a new
+one. In Postgres a transaction-scoped advisory lock per user and thread makes concurrent
+drafts create one item.
+
+**What a draft was built from.** Each session records the highest data class it has read
+(`sessions.sources_sensitivity`, which only rises):
+- `context_search` and `context_read`: each result's own `sensitivity`;
+- Jira, Confluence, Slack and memory reads: `internal`;
+- the support docs: `public`.
+
+A read that finds nothing counts for nothing. Every new approval item stores the session's
+value as `sources_sensitivity`; items made before migration 0008 have none, and the audience
+check treats them as `restricted`.
+
+**The audience check (SLK-6).** Approving or editing a Slack write first asks Slack who can
+see the channel, with the PM's own token (never a team bot's): `conversations.info`
+(`is_ext_shared`, `is_shared`, `is_im`) and `conversations.members` (paged, at most 1,000; a
+channel with more counts as having outsiders). An edit is checked against its edited
+channel. Then, in order:
+
+1. **Restricted sources never reach outsiders.** If `sources_sensitivity` is `restricted` and
+   any member isn't in `team.yaml` (by Slack id), or the channel is shared outside the
+   company (`is_ext_shared`): `409 {code: "audience_blocked", error, outsiders, members,
+   external}`. Nothing is written and the item stays `pending`; the PM can reject it. An edit
+   doesn't change what the draft was built from, so it is blocked too.
+2. **Slack Connect needs a second confirmation.** If the channel is externally shared and the
+   decision lacks `confirm_external: true`: `409 {code: "needs_external_confirm", error,
+   members, external}`. The item stays `pending`; the same decision with `confirm_external:
+   true` posts.
+3. Otherwise the write goes ahead.
+
+If either Slack call fails (no such channel, a missing scope, Slack down), the decision fails
+closed: `503 {code: "audience_unavailable", error}`, nothing written, the item still
+`pending`. A block or confirmation request is audited as `denied` with its code in `detail`
+(`audience_blocked: 2 not in team.yaml, external: false`, `needs_external_confirm`); an
+unavailable check as `error` (`audience_unavailable: …`). Rejecting is never checked. A write
+approved in the harness with a grant doesn't go through this check.
+
+The members count against `team.yaml` as loaded, enforced or not: with fake connectors and an
+empty `team.yaml`, everyone is an outsider.
+
+**The 24-hour expiry (SLK-8).** A sweeper runs at start-up and every 10 minutes:
+- **Undecided drafts expire.** A `pending` Slack draft older than `PMOS_SLACK_DRAFT_TTL_HOURS`
+  (default 24) becomes `expired`. Every string argument except a top-level `channel` and
+  `thread_ts` becomes `"[expired]"`; the `args_hash` is kept, and `redacted_at` records when.
+  The ledger row is stored as `expired`, and the item is audited with outcome `expired`.
+- **Decided drafts lose their text** the same way, the same time after their decision
+  (`approved`, `rejected` or `failed`; the status stays). The posted copy lives in Slack, and
+  `result` keeps its link.
+- **Deciding an expired draft,** or a pending one already past its time that the sweeper
+  hasn't reached (it is expired then and there), answers `409 {code: "expired", error}`.
+
+Other tools' items never expire this way; the ledger still reports them as `expired` after
+`PMOS_LEDGER_EXPIRE_DAYS`.
 
 ## Invalid drafts
 
@@ -237,7 +306,7 @@ read scope (see **Bot sessions**); its writes still act as the PM.
 | --- | --- | --- |
 | Jira | Atlassian OAuth 2.0 (3LO), via `api.atlassian.com/ex/jira/{cloudid}` | `GET /rest/api/3/search/jql`, `GET /rest/api/3/issue/{key}`, `POST /rest/api/3/issue` (description in Atlassian Document Format) |
 | Confluence | same token, via `api.atlassian.com/ex/confluence/{cloudid}` | `GET /wiki/rest/api/search?cql=`, `GET /wiki/api/v2/pages/{id}`, `GET /wiki/api/v2/spaces?keys=`, `POST /wiki/api/v2/pages` (always `status: draft`), `PUT /wiki/api/v2/pages/{id}` (version + 1) |
-| Slack | the PM's user token (`xoxp`), never a bot token | `assistant.search.context` (Real-time Search; results are never stored), `conversations.replies`, `chat.postMessage` |
+| Slack | the PM's user token (`xoxp`), never a bot token | `assistant.search.context` (Real-time Search; results are never stored), `conversations.replies`, `chat.postMessage`, and for the audience check before a post, `conversations.info` and `conversations.members` (always the PM's token, even in a team bot's task) |
 | Support docs | none (public docs); the tool server's `PMOS_DOCS_TOKEN` to `pmos-docs` | `search_docs`, `get_doc` over MCP; see `docs/docs-server.md` |
 
 These API shapes were checked against developer.atlassian.com, docs.slack.dev and
@@ -440,8 +509,8 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 | Memory | `memory_notes` | One row per user and key |
 | Sessions | `sessions` | Only the SHA-256 of each token is stored. Each names a `skill` or a `bot` (a check constraint keeps it to one) |
 | Grants | `grants` | Taken with `DELETE … RETURNING` on a row locked `FOR UPDATE SKIP LOCKED`: one grant, one call, even under concurrency |
-| Approvals | `approvals` | A decision locks the item (`SELECT … FOR UPDATE`) and changes it only while it is `pending`: exactly one of several concurrent decisions wins |
-| Feedback ledger | `ledger` | One row per approval item, written in the same transaction as the item on create, decide and complete. `expired` is worked out on read |
+| Approvals | `approvals` | A decision locks the item (`SELECT … FOR UPDATE`) and changes it only while it is `pending`: exactly one of several concurrent decisions wins. A Slack reply is created under an advisory lock per user and thread. The Slack draft sweep takes items `FOR UPDATE SKIP LOCKED`, leaving one a decision holds to the decision |
+| Feedback ledger | `ledger` | One row per approval item, written in the same transaction as the item on create, decide, complete and expire. `expired` is stored for Slack drafts and worked out on read for the rest |
 | Audit | `audit_events` | Append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Each event records the caller (`mcp`, `orchestrator` or `bot`) and the session's skill or bot. |
 | Credentials | `credentials` | Tokens sealed by the vault; the database never sees plaintext. Providers `atlassian`, `slack`, `github` |
 | Memory repos | `memory_repos` | One row per PM: `repo` (`org/name`) and `verified_at` |
@@ -449,6 +518,10 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 
 - **Migrations** run on start-up.
 - **Pruning:** expired sessions and grants are deleted every 10 minutes.
+- **Retention of Slack text:** approval items keep a Slack draft's text at most
+  `PMOS_SLACK_DRAFT_TTL_HOURS` (24) after creation if undecided, or after the decision; the
+  sweeper runs every 10 minutes (see **Slack drafts**). The ledger and the audit log never
+  hold it.
 - **Shutdown:** SIGTERM (what `docker compose stop` sends) or Ctrl-C stops new requests and lets in-flight ones finish. Give the container a stop grace period of at least 30 seconds.
 - **MCP sessions** stay open while idle for up to the session TTL (60 minutes), so a long model step between tool calls doesn't drop the connection.
 - **One replica.** OAuth sign-in states, refresh locks, MCP sessions, the lock that runs member decisions one at a time and the memory-repo cache are in process memory, so run a single tool server. Running two needs those moved to Postgres first; this is tracked in the implementation plan.
@@ -482,6 +555,7 @@ cargo run -p pmos-toolserver
 | `PMOS_ALLOWED_HOSTS` | `toolserver.pmos.internal,localhost,127.0.0.1` | `Host` values `/mcp` accepts |
 | `PMOS_CONTENT_SYNC_SECS` | `300` with live connectors, `0` with fake | How often the content checkout is pulled (see **Content sync**); `0` turns it off, after member commits too |
 | `PMOS_LEDGER_EXPIRE_DAYS` | `7` | Days after which a draft still pending is reported as `expired` in the feedback ledger. A whole number, 1 or more |
+| `PMOS_SLACK_DRAFT_TTL_HOURS` | `24` | Hours after which an undecided Slack draft expires, and a decided one loses its text after its decision. A whole number from 1 to 24: no Slack text is kept longer |
 
 With `PMOS_CONNECTORS=live`:
 
@@ -493,7 +567,7 @@ With `PMOS_CONNECTORS=live`:
 | `PMOS_ATLASSIAN_SCOPES` | `read:me`, Jira classic, Confluence granular read/write and search | `offline_access` is always added; keep `read:me`, which the link check needs |
 | `PMOS_ATLASSIAN_SITE` | none | Needed only if a grant covers several sites |
 | `PMOS_SLACK_CLIENT_ID`, `PMOS_SLACK_CLIENT_SECRET` | required | From the internal Slack app |
-| `PMOS_SLACK_SCOPES` | search, history and `chat:write` user scopes | Requested as `user_scope` only |
+| `PMOS_SLACK_SCOPES` | search (`search:read.public`, `.private`, `.im`, `.mpim`), history (`channels:history`, `groups:history`, `im:history`, `mpim:history`), channel info and members for the audience check (`channels:read`, `groups:read`, `mpim:read`, `im:read`) and `chat:write` | Requested as `user_scope` only. A PM linked before the `:read` scopes were added must link Slack again: until then the audience check answers `503 audience_unavailable` ("reconnect Slack") |
 | `PMOS_ATLASSIAN_AUTH_URL`, `PMOS_ATLASSIAN_API_URL`, `PMOS_SLACK_URL` | the real hosts | For pointing at mocks |
 | `PMOS_GITHUB_CLIENT_ID`, `PMOS_GITHUB_CLIENT_SECRET` | none | From the GitHub App (see **GitHub**). Set both or neither; without them GitHub linking, `PMOS_MEMORY=github` and approving members are off |
 | `PMOS_GITHUB_ORG` | required with GitHub | The Fortanix org login. Memory repos and the content repo must be in it |
