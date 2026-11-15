@@ -35,6 +35,10 @@ jobs:
         with:
           # The gate compares with the base branch's reports and diffs against it.
           fetch-depth: 0
+      # pmos-admin reads the stack's settings from deploy/.env, which is never in git. Use the
+      # Spark's own (PMOS_SPARK_DIR in the runner's environment, default /opt/pmos).
+      - name: The Spark's settings
+        run: ln -sf "${PMOS_SPARK_DIR:-/opt/pmos}/deploy/.env" deploy/.env
       - name: Gate
         env:
           BASE_REF: ${{ github.base_ref }}
