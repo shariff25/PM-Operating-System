@@ -591,14 +591,14 @@ mod tests {
         let app = [
             ("PMOS_GITHUB_CLIENT_ID", "Iv1.gh"),
             ("PMOS_GITHUB_CLIENT_SECRET", "gh-secret"),
-            ("PMOS_GITHUB_ORG", "acme"),
+            ("PMOS_GITHUB_ORG", "example-org"),
         ];
         let ok = cfg(&with(&base, &app)).unwrap();
         let Connectors::Live(live) = &ok.connectors else {
             panic!("expected live");
         };
         let gh = live.github.as_ref().unwrap();
-        assert_eq!(gh.org, "acme");
+        assert_eq!(gh.org, "example-org");
         assert_eq!(gh.content_branch, "main");
         assert_eq!(gh.content_dir, "content");
         assert_eq!(gh.policies_dir, "policies");
@@ -613,7 +613,7 @@ mod tests {
         let full = cfg(&with(
             &with(&base, &app),
             &[
-                ("PMOS_CONTENT_REPO", "Acme/pm-os"),
+                ("PMOS_CONTENT_REPO", "Example-Org/pm-os"),
                 ("PMOS_CONTENT_DIR", "./"),
                 ("PMOS_MEMORY", "github"),
                 ("PMOS_CONTENT_SYNC_SECS", "0"),
@@ -627,7 +627,7 @@ mod tests {
             panic!("expected live");
         };
         let gh = live.github.as_ref().unwrap();
-        assert_eq!(gh.content_repo.as_deref(), Some("Acme/pm-os"));
+        assert_eq!(gh.content_repo.as_deref(), Some("Example-Org/pm-os"));
         assert_eq!(gh.content_dir, "", "`./` is the repo root");
         assert_eq!(live.endpoints.github_api, "http://127.0.0.1:9");
 
@@ -638,9 +638,12 @@ mod tests {
         refused(&[("PMOS_MEMORY", "github")], "PMOS_MEMORY=github needs");
         refused(&[("PMOS_MEMORY", "s3")], "PMOS_MEMORY must be");
         refused(&[("PMOS_GITHUB_CLIENT_ID", "x")], "set together");
-        refused(&[("PMOS_GITHUB_ORG", "acme")], "needs the GitHub App");
         refused(
-            &[("PMOS_CONTENT_REPO", "acme/pm-os")],
+            &[("PMOS_GITHUB_ORG", "example-org")],
+            "needs the GitHub App",
+        );
+        refused(
+            &[("PMOS_CONTENT_REPO", "example-org/pm-os")],
             "needs the GitHub App",
         );
         refused(&app[..2], "PMOS_GITHUB_ORG is required");

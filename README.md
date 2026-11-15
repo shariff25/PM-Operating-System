@@ -19,7 +19,7 @@ Slack without the PM's approval.
 | `crates/gateway` | `pmos-gateway`: one OpenAI-compatible endpoint in front of the local models; roles, fair queueing, usage log ([docs](docs/gateway.md)) | Rust |
 | `crates/runtime` | Small pieces every service shares: constant-time token checks, SIGTERM-aware shutdown | Rust |
 | `crates/toolserver` | The only path from a sandbox to context and systems: MCP, allowlists, approvals, audit ([docs](docs/toolserver.md)) | Rust |
-| `crates/docs` | `pmos-docs`: MCP server over the public Acme support docs ([docs](docs/docs-server.md)) | Rust |
+| `crates/docs` | `pmos-docs`: MCP server over your company's public docs site ([docs](docs/docs-server.md)) | Rust |
 | `crates/slack` | `pmos-slack`: the Slack bot: DMs to bots, progress, approval cards with reject reasons, the triage digest, routines, onboarding, `/docs` ([docs](docs/docs-server.md)) | Rust |
 | `crates/bots` | `pmos-bots`: the bot runtime: durable tasks, routines, traces, notifications ([docs](docs/bots-runtime.md)) | Rust |
 | `crates/console` | `pmos-console`: the four-screen console: bots, routines, approvals, activity ([docs](docs/console.md)) | Rust |
@@ -33,6 +33,17 @@ Slack without the PM's approval.
 
 Phase 0 is built. What's left needs the DGX Spark: vLLM serving the models, OpenShell, the
 Slack app, and the first live runs (see the plan's **Status**).
+
+## Make it your team's
+
+PM OS isn't tied to one company. To set it up for yours:
+1. Fill in the `TODO(owner)` markers in `content/master/AGENTS.md`: the company, products,
+   audiences and voice.
+2. Copy `content/context/products/example-product.md` once per product, and add your product
+   names to `content/context/glossary/terms.md`.
+3. Point the Docs bot at your public docs site with `PMOS_DOCS_BASE_URL` in `deploy/.env`,
+   and optionally a products file ([docs](docs/docs-server.md#pointing-the-docs-bot-at-your-docs)).
+4. Write your own `docs-qa` benchmark questions against your docs (`docs/evals.md`).
 
 ## Run it on the Spark
 

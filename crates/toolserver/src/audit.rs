@@ -172,7 +172,7 @@ mod tests {
             bot: None,
             tool: "context.search".into(),
             outcome: Outcome::Ok,
-            sources: vec!["context/products/ccm.md".into()],
+            sources: vec!["context/products/cloud.md".into()],
             args_hash: None,
             output_ref: None,
             detail: None,

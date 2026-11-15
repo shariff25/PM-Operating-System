@@ -278,7 +278,7 @@ async fn a_bot_reads_nothing_above_its_roles_data_class() {
         .call(
             &scout,
             "context_read",
-            json!({"path": "context/partners/acme-nda.md"}),
+            json!({"path": "context/partners/globex-nda.md"}),
             now(),
         )
         .await
@@ -290,7 +290,7 @@ async fn a_bot_reads_nothing_above_its_roles_data_class() {
         .call(&scout, "context_search", json!({"query": "roadmap"}), now())
         .await
         .unwrap();
-    assert!(!found.to_string().contains("acme-nda"));
+    assert!(!found.to_string().contains("globex-nda"));
 
     let mine = bot_session(&f, "ana", "pm-ana").await;
     let doc = f
@@ -298,7 +298,7 @@ async fn a_bot_reads_nothing_above_its_roles_data_class() {
         .call(
             &mine,
             "context_read",
-            json!({"path": "context/partners/acme-nda.md"}),
+            json!({"path": "context/partners/globex-nda.md"}),
             now(),
         )
         .await

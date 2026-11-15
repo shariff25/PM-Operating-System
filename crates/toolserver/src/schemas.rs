@@ -28,7 +28,7 @@ pub fn input_schema(tool: &str) -> Option<Value> {
             &["query"],
         ),
         "context.read" => object(
-            json!({"path": {"type": "string", "description": "Path from a search result, such as context/products/ccm.md"}}),
+            json!({"path": {"type": "string", "description": "Path from a search result, such as context/products/example-product.md"}}),
             &["path"],
         ),
         "memory.read" => object(json!({}), &[]),
@@ -97,14 +97,14 @@ pub fn input_schema(tool: &str) -> Option<Value> {
         ),
         "docs.search" => object(
             json!({
-                "query": {"type": "string", "description": "What to look for in the support docs", "maxLength": 500},
-                "product": {"type": "string", "enum": ["dsm", "ccm", "confidential-ai", "key-insight", "armor", "general"]},
+                "query": {"type": "string", "description": "What to look for in your company's public docs", "maxLength": 500},
+                "product": {"type": "string", "maxLength": 64, "description": "A product id from the docs site's products list, or `general`"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Maximum results (default 5)"},
             }),
             &["query"],
         ),
         "docs.read" => object(
-            json!({"url": {"type": "string", "description": "A support.acme.com/docs link from a search result"}}),
+            json!({"url": {"type": "string", "description": "A docs page link from a search result"}}),
             &["url"],
         ),
         _ => return None,

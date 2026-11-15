@@ -107,9 +107,12 @@ mod tests {
     async fn users_see_only_their_notes() {
         let store = InMemoryStore::default();
         let now: DateTime<Utc> = "2026-11-14T10:00:00Z".parse().unwrap();
-        store.update("ana", "areas", "CCM", "t", now).await.unwrap();
         store
-            .update("ana", "areas", "CCM, DSM", "t", now)
+            .update("ana", "areas", "Acme Cloud", "t", now)
+            .await
+            .unwrap();
+        store
+            .update("ana", "areas", "Acme Cloud, Acme Vault", "t", now)
             .await
             .unwrap();
         store
@@ -118,7 +121,7 @@ mod tests {
             .unwrap();
         let ana = store.read("ana").await.unwrap();
         assert_eq!(ana.len(), 1);
-        assert_eq!(ana[0].text, "CCM, DSM");
+        assert_eq!(ana[0].text, "Acme Cloud, Acme Vault");
         assert!(store.read("cy").await.unwrap().is_empty());
     }
 

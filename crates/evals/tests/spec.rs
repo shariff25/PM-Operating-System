@@ -2,8 +2,7 @@
 
 mod common;
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use common::write_category;
 use pmos_evals::config::Config;
@@ -20,7 +19,7 @@ fn a_valid_category_loads() {
     let dir = tempfile::tempdir().unwrap();
     write_category(dir.path(), "cat", "docs", 0.8, &[
         ("b-task", "id: b-task\nask: \"Two?\"\nexpect:\n  approvals: 0\n".into()),
-        ("a-task", "id: a-task\nask: \"One?\"\nexpect:\n  must_cite: [https://support.acme.com/docs/x]\n  must_include: [one]\n".into()),
+        ("a-task", "id: a-task\nask: \"One?\"\nexpect:\n  must_cite: [https://docs.example.com/docs/x]\n  must_include: [one]\n".into()),
     ]);
     let c = load_category(dir.path(), "cat").unwrap();
     assert_eq!(
@@ -163,18 +162,25 @@ fn the_checked_in_evals_are_valid() {
     }
 }
 
-/// docs-qa: 20 answerable tasks for the Docs bot, each citing one support.acme.com page as
-/// the bot cites it (the page URL without `.md`), spread across the products; and at least
-/// three the docs don't answer, which the bot must decline. Each task runs three times.
+/// docs-qa is a template: it reports only (no bar) until a team writes questions against its
+/// own docs, and ships examples on the fake docs fixtures: answerable tasks that each cite one
+/// docs.example.com page as the bot cites it (the page URL without `.md`), and should-decline
+/// tasks with no page. Each task runs three times.
 #[test]
-fn docs_qa_has_twenty_questions_across_the_products() {
-    let c = load_category(&evals_root(), "docs-qa").unwrap();
+fn docs_qa_is_a_template_on_the_fake_docs() {
+    let root = evals_root();
+    let c = load_category(&root, "docs-qa").unwrap();
     assert_eq!(c.bot, "docs");
     assert_eq!(c.repeats, 3);
+    assert_eq!(
+        c.pass_bar, None,
+        "reports only until a team's own tasks are in"
+    );
+    assert!(root.join("categories/docs-qa/README.md").is_file());
     let (declines, answerable): (Vec<_>, Vec<_>) =
         c.tasks.iter().partition(|t| t.expect.must_decline);
-    assert_eq!(answerable.len(), 20);
-    assert!(declines.len() >= 3, "{}", declines.len());
+    assert_eq!(answerable.len(), 2);
+    assert_eq!(declines.len(), 2);
     for t in &declines {
         assert!(t.id.starts_with("decline-"), "{}", t.id);
         assert!(t.expect.must_cite.is_empty(), "{}", t.id);
@@ -183,27 +189,18 @@ fn docs_qa_has_twenty_questions_across_the_products() {
             .tags
             .contains(&"model/answered-beyond-sources".to_string()));
     }
-    let mut asks = HashSet::new();
-    let mut products: HashMap<&str, usize> = HashMap::new();
+    // The fake docs connector's pages (crates/toolserver/src/connectors/fake.rs).
+    let fixtures = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../toolserver/src/connectors/fake.rs"),
+    )
+    .unwrap();
+    let mut ids: Vec<_> = answerable.iter().map(|t| t.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["vault-key-rotation", "vault-saml-sso"]);
     for t in answerable {
-        assert!(
-            asks.insert(t.ask.clone()),
-            "{}: the same question twice",
-            t.id
-        );
         assert_eq!(t.expect.must_cite.len(), 1, "{}", t.id);
         let url = &t.expect.must_cite[0];
-        assert!(
-            url.starts_with("https://support.acme.com/docs/")
-                || url.starts_with("https://support.acme.com/apidocs/"),
-            "{}: {url}",
-            t.id
-        );
-        assert!(
-            !url.ends_with(".md") && !url.ends_with('/'),
-            "{}: {url}",
-            t.id
-        );
+        assert_eq!(url, &format!("https://docs.example.com/docs/{}", t.id));
         assert!(!t.expect.must_include.is_empty(), "{}", t.id);
         assert!(
             t.expect.must_not_include.contains(&"<think>".to_string()),
@@ -211,14 +208,11 @@ fn docs_qa_has_twenty_questions_across_the_products() {
             t.id
         );
         assert_eq!(t.expect.approvals, Some(0), "{}", t.id);
-        let product = t.id.split('-').next().unwrap();
-        *products.entry(product).or_default() += 1;
-    }
-    for p in ["dsm", "ccm", "confidential", "key", "armor", "api"] {
-        assert!(
-            products.get(p).copied().unwrap_or(0) >= 2,
-            "{p}: {products:?}"
-        );
+        // The fixture page exists and states the fact.
+        assert!(fixtures.contains(&format!("\"{}\"", t.id)), "{}", t.id);
+        for fact in &t.expect.must_include {
+            assert!(fixtures.contains(fact.as_str()), "{}: {fact}", t.id);
+        }
     }
 }
 

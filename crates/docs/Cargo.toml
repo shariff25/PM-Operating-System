@@ -1,6 +1,6 @@
 [package]
 name = "pmos-docs"
-description = "PM OS docs server: indexes the Acme support docs and serves search over MCP"
+description = "PM OS docs server: indexes a public docs site and serves search over MCP"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true

@@ -35,29 +35,35 @@ pub fn text(message: &str) -> Value {
     json!({ "response_type": "ephemeral", "text": message })
 }
 
-pub const USAGE: &str = "Search the Acme support docs: `/docs <what you're looking for>`.\n\
-     Narrow to a product with `product:dsm` (or `ccm`, `confidential-ai`, `key-insight`, \
-     `armor`). Example: `/docs product:dsm rotate a key`";
+pub const USAGE: &str = "Search the docs: `/docs <what you're looking for>`.\n\
+     Narrow to one product with `product:<id>`, using an id from your docs products list \
+     (or `general`). Example: `/docs product:vault rotate a key`";
 
 pub fn searching(query: &str) -> Value {
-    text(&format!(
-        "Searching Acme support docs for “{}”…",
-        escape(query)
-    ))
+    text(&format!("Searching the docs for “{}”…", escape(query)))
 }
 
 /// The results message, built from the tool server's `docs_search` result.
 pub fn results(query: &str, result: &Value) -> Value {
     let hits: Vec<&Value> = result["results"].as_array().into_iter().flatten().collect();
-    let heading = format!(
-        "*Acme support docs* · “{}”",
-        escape(&truncate(query, 80))
-    );
+    let heading = format!("*Docs* · “{}”", escape(&truncate(query, 80)));
+    // No docs site is configured: the tool server passes the docs server's note on.
+    if let Some(note) = result["note"].as_str().filter(|_| hits.is_empty()) {
+        return json!({
+            "response_type": "ephemeral",
+            "replace_original": true,
+            "text": escape(note),
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": heading}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": escape(&truncate(note, 500))}},
+            ],
+        });
+    }
     if hits.is_empty() {
         return json!({
             "response_type": "ephemeral",
             "replace_original": true,
-            "text": format!("No support pages match “{}”.", escape(query)),
+            "text": format!("No docs pages match “{}”.", escape(query)),
             "blocks": [
                 {"type": "section", "text": {"type": "mrkdwn", "text": heading}},
                 {"type": "section", "text": {"type": "mrkdwn", "text": "No pages match. Try different or fewer words."}},
@@ -95,12 +101,12 @@ pub fn results(query: &str, result: &Value) -> Value {
     }
     blocks.push(
         json!({"type": "context", "elements": [{"type": "mrkdwn", "text":
-        "Only you can see this · from support.acme.com"}]}),
+        "Only you can see this · from the docs"}]}),
     );
     json!({
         "response_type": "ephemeral",
         "replace_original": true,
-        "text": format!("{} support pages for “{}”", hits.len().min(5), escape(query)),
+        "text": format!("{} docs pages for “{}”", hits.len().min(5), escape(query)),
         "blocks": blocks,
     })
 }
@@ -123,22 +129,22 @@ mod tests {
     #[test]
     fn results_and_empty() {
         let result = json!({"results": [{
-            "title": "Configure SAML SSO <for> DSM",
-            "source": {"url": "https://support.acme.com/docs/dsm-saml-sso"},
-            "content": {"snippet": "DSM supports SAML 2.0.", "product": "dsm", "section": "docs", "updated": "2026-08-01T05:56:18Z"},
+            "title": "Configure SAML SSO <for> Acme Vault",
+            "source": {"url": "https://docs.example.com/docs/vault-saml-sso"},
+            "content": {"snippet": "Acme Vault supports SAML 2.0.", "product": "vault", "section": "docs", "updated": "2026-08-01T05:56:18Z"},
         }]});
         let msg = results("saml", &result);
         assert_eq!(msg["response_type"], "ephemeral");
         assert_eq!(msg["replace_original"], true);
         let text = serde_json::to_string(&msg["blocks"]).unwrap();
         assert!(text.contains(
-            "<https://support.acme.com/docs/dsm-saml-sso|Configure SAML SSO &lt;for&gt; DSM>"
+            "<https://docs.example.com/docs/vault-saml-sso|Configure SAML SSO &lt;for&gt; Acme Vault>"
         ));
-        assert!(text.contains("DSM · updated 2026-08-01"));
+        assert!(text.contains("VAULT · updated 2026-08-01"));
         assert!(text.contains("Only you can see this"));
         let long = results(
             "x",
-            &json!({"results": [{"title": "T".repeat(5000), "source": {"url": "https://support.acme.com/docs/x"}, "content": {}}]}),
+            &json!({"results": [{"title": "T".repeat(5000), "source": {"url": "https://docs.example.com/docs/x"}, "content": {}}]}),
         );
         assert!(
             long["blocks"][1]["text"]["text"]
@@ -152,5 +158,12 @@ mod tests {
         assert!(serde_json::to_string(&empty)
             .unwrap()
             .contains("No pages match"));
+        let unconfigured = results(
+            "saml",
+            &json!({"results": [], "note": "No docs site is configured; ask a platform owner to set PMOS_DOCS_BASE_URL."}),
+        );
+        let s = serde_json::to_string(&unconfigured).unwrap();
+        assert!(s.contains("No docs site is configured"), "{s}");
+        assert!(!s.contains("No pages match"));
     }
 }

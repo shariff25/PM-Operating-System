@@ -227,12 +227,61 @@ impl PgStore {
         let mut migrator = sqlx::migrate!("./migrations");
         // Its own bookkeeping table, so sharing a database with the tool server (whose
         // migrations use the default `_sqlx_migrations`) can't clash.
-        migrator.dangerous_set_table_name("_pmos_docs_migrations");
+        migrator.dangerous_set_table_name(MIGRATIONS_TABLE);
+        self.accept_reworded(&migrator).await?;
         migrator
             .run(&self.pool)
             .await
             .map_err(|e| StoreError(e.to_string()))
     }
+
+    /// A database migrated before a migration's comments were reworded holds the old
+    /// checksum, and sqlx would refuse to start. Where the stored checksum is one listed in
+    /// [`REWORDED`], record the current one instead: the SQL itself is unchanged.
+    async fn accept_reworded(&self, migrator: &sqlx::migrate::Migrator) -> StoreResult<()> {
+        let table: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(MIGRATIONS_TABLE)
+            .fetch_one(&self.pool)
+            .await?;
+        if table.is_none() {
+            return Ok(());
+        }
+        for m in migrator.iter() {
+            for (version, old) in REWORDED {
+                if *version != m.version {
+                    continue;
+                }
+                let done = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE {MIGRATIONS_TABLE} SET checksum = $1 WHERE version = $2 AND checksum = $3"
+                )))
+                .bind(m.checksum.as_ref())
+                .bind(m.version)
+                .bind(hex(old))
+                .execute(&self.pool)
+                .await?;
+                if done.rows_affected() > 0 {
+                    tracing::info!(version, "accepted a migration whose comments were reworded");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+const MIGRATIONS_TABLE: &str = "_pmos_docs_migrations";
+
+/// `(version, old SHA-384 checksum)` of migrations whose comments changed after release.
+/// 0001's header comment once named a specific docs site.
+pub const REWORDED: &[(i64, &str)] = &[(
+    1,
+    "c2790f44573b1a5a03254980759dc5564f27199917cd1c6a6ec8f428751ca733576abbe4f220b0bac437ba4b29ff7153",
+)];
+
+/// Decode lowercase hex; the constants above are well-formed.
+pub fn hex(s: &str) -> Vec<u8> {
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex constant"))
+        .collect()
 }
 
 const COLUMNS: &str =

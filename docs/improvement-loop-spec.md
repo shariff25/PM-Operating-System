@@ -137,7 +137,7 @@ with `edit_distance ≥ PMOS_TRIAGE_MIN_EDIT` (default 0.3).
 **New expectations.**
 - **`must_decline: true`.** The answer must say it can't answer from its sources. It matches any
   of `decline_phrases` in `evals/config.yaml`, and it must have no `must_cite`. These are the
-  should-not cases; docs-qa gains at least 3 of them, questions the support docs don't answer,
+  should-not cases; docs-qa gains at least 3 of them, questions the public docs don't answer,
   each checked against the docs.
 - **`drafts:`.** Checks on the task's drafts (section 3). Each entry gives:
   - `tool`;

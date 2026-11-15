@@ -255,7 +255,7 @@ pub struct TeamMember {
     /// has this email, so a forwarded link can't attach someone else's account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    /// GitHub login in the Acme org. Optional: linking GitHub checks this login when it is
+    /// GitHub login in your GitHub org. Optional: linking GitHub checks this login when it is
     /// set, and otherwise a verified email on the GitHub account matching `email`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<String>,

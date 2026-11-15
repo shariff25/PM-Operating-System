@@ -715,7 +715,7 @@ pub fn reply_blocked(item: &Value, outsiders: Option<u64>) -> (String, Value) {
     let why = match outsiders {
         Some(1) => format!("1 person in {place} isn't on the product team"),
         Some(n) if n > 1 => format!("{n} people in {place} aren't on the product team"),
-        _ => format!("{place} is shared outside Acme"),
+        _ => format!("{place} is shared outside the company"),
     };
     let line = format!(
         ":no_entry: This draft was built from restricted sources and {why}, so PM OS won't \
@@ -737,7 +737,7 @@ pub fn reply_confirm_external(item: &Value, edited: bool) -> (String, Value) {
     let id = item["id"].as_str().unwrap_or_default();
     let place = reply_place(item);
     let line = format!(
-        ":warning: {place} is an external channel (Slack Connect): people outside Acme \
+        ":warning: {place} is an external channel (Slack Connect): people outside the company \
          will see this reply. Post it there anyway?"
     );
     let value = if edited {
@@ -879,11 +879,11 @@ mod tests {
 
     #[test]
     fn markdown_becomes_safe_mrkdwn() {
-        let md = "# Ports\nDSM needs **443** <script> & more. See [the docs](https://support.acme.com/x) or [bad](javascript:alert(1)).\n- one\n```\na < b\n```";
+        let md = "# Ports\nAcme Vault needs **443** <script> & more. See [the docs](https://docs.example.com/x) or [bad](javascript:alert(1)).\n- one\n```\na < b\n```";
         let out = mrkdwn(md);
         assert!(out.starts_with("*Ports*\n"));
         assert!(out.contains("*443* &lt;script&gt; &amp; more"));
-        assert!(out.contains("<https://support.acme.com/x|the docs>"));
+        assert!(out.contains("<https://docs.example.com/x|the docs>"));
         assert!(!out.contains("javascript"), "{out}");
         assert!(out.contains("• one"));
         assert!(out.contains("a &lt; b"));
@@ -952,7 +952,7 @@ mod tests {
         json!({
             "id": "apr_r1", "user": "ana", "tool": "slack.post_reply", "status": "pending",
             "args": {"channel": "C0LAUNCH", "thread_ts": "1731500000.000100",
-                     "text": "Yes, SSO ships in 5.1 <!here> & see <https://support.acme.com/sso|the SSO guide> or [notes](https://wiki.example.com/n). Ask <@U0BOB>."},
+                     "text": "Yes, SSO ships in 5.1 <!here> & see <https://docs.example.com/sso|the SSO guide> or [notes](https://wiki.example.com/n). Ask <@U0BOB>."},
             "sources_sensitivity": "internal",
             "audience": {"members": 14, "external": true},
             "created_at": "2026-11-15T09:00:00Z",
@@ -967,7 +967,7 @@ mod tests {
         let s = blocks.to_string();
         assert!(s.contains("*Reply drafted for <#C0LAUNCH>* · <https://slack.com/archives/C0LAUNCH/p1731500000000100|open the thread>"), "{s}");
         // The draft, quoted, its links kept, and everything else escaped.
-        assert!(s.contains("> Yes, SSO ships in 5.1 &lt;!here&gt; &amp; see <https://support.acme.com/sso|the SSO guide> or <https://wiki.example.com/n|notes>. Ask <@U0BOB>."), "{s}");
+        assert!(s.contains("> Yes, SSO ships in 5.1 &lt;!here&gt; &amp; see <https://docs.example.com/sso|the SSO guide> or <https://wiki.example.com/n|notes>. Ask <@U0BOB>."), "{s}");
         assert!(s.contains("Visible to 14 people · External channel"));
         assert!(s.contains("built from internal sources"));
         assert!(s.contains("marked “Drafted with PM OS”"));
@@ -1004,7 +1004,7 @@ mod tests {
         let (_, shared) = reply_blocked(&item, None);
         assert!(shared
             .to_string()
-            .contains("<#C0LAUNCH> is shared outside Acme"));
+            .contains("<#C0LAUNCH> is shared outside the company"));
         let (_, confirm) = reply_confirm_external(&item, false);
         assert!(confirm.to_string().contains("Post to external channel"));
         let (_, confirm_edit) = reply_confirm_external(&item, true);

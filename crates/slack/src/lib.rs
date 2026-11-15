@@ -18,7 +18,7 @@
 //! - **Onboarding** (`docs/onboarding-spec.md` §4): someone outside `team.yaml` taps
 //!   **Request access**, a platform owner approves them in a DM card, and the new member gets
 //!   a welcome and a setup checklist (`setup`) for their accounts, memory repo and bot.
-//! - **`/docs`:** search the Acme support docs from any conversation, with results only
+//! - **`/docs`:** search the company's public docs from any conversation, with results only
 //!   the asker can see, through the tool server's `docs` skill.
 //!
 //! It connects with Socket Mode (outbound only) and maps each Slack user to a PM OS handle

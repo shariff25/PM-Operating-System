@@ -1,9 +1,9 @@
 # seed: replace with case cards
-# Two mentions in one #acme-shared thread (C0ACMECX 1731601500.000700, reply 1731601800.000800)
-# get one draft, in the thread, grounded in the fake docs page dsm-key-rotation ("Key rotation
+# Two mentions in one #globex-shared thread (C0GLOBEXCX 1731601500.000700, reply 1731601800.000800)
+# get one draft, in the thread, grounded in the fake docs page vault-key-rotation ("Key rotation
 # creates a new key version.").
 id: triage-one-draft-per-thread
-ask: "Someone at Acme asked me twice in #acme-shared about key rotation. Draft my reply."
+ask: "Someone at Globex asked me twice in #globex-shared about key rotation. Draft my reply."
 expect:
   must_not_include:
     - "<think>"
@@ -12,6 +12,6 @@ expect:
       count: 1
       require_fields: [channel, thread_ts, text]
       allowed:
-        channel: [C0ACMECX]
+        channel: [C0GLOBEXCX]
         thread_ts: ["1731601500.000700"]
       must_include: ["version"]

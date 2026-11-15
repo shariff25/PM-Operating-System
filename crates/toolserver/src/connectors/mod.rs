@@ -128,6 +128,10 @@ pub enum ConnectorError {
     Forbidden(String),
     #[error("rate limited; retry after {0} s")]
     RateLimited(u64),
+    /// The system isn't set up for this deployment (such as no docs site). A read answers
+    /// with no results and this note, not an error.
+    #[error("{0}")]
+    NotConfigured(String),
 }
 
 impl From<crate::oauth::TokenError> for ConnectorError {

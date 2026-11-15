@@ -1,7 +1,7 @@
 # seed: replace with case cards
-# Fixture: epic PM-101 "SSO for the DSM console" in project PM.
+# Fixture: epic PM-101 "SSO for the Acme Vault console" in project PM.
 id: story-under-sso-epic
-ask: "Draft one Jira story in project PM, under the epic PM-101, for letting an admin require SAML SSO for every DSM console login. Don't create anything else."
+ask: "Draft one Jira story in project PM, under the epic PM-101, for letting an admin require SAML SSO for every Acme Vault console login. Don't create anything else."
 expect:
   approvals: 1
   must_not_include:

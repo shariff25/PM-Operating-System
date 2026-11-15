@@ -41,7 +41,7 @@ const DOCS_BOT = {
   description: "The team's Docs bot.",
   reads: {},
   actions: {},
-  job: "BOT-JOB: answer the product team's questions about Acme products.",
+  job: "BOT-JOB: answer the product team's questions about the company's products.",
 };
 
 function claim(id: string, overrides: { priority?: string; text?: string } = {}) {
@@ -52,7 +52,7 @@ function claim(id: string, overrides: { priority?: string; text?: string } = {})
       requested_by: "ana",
       source: "slack",
       priority: overrides.priority ?? "interactive",
-      text: overrides.text ?? "What ports does DSM need?",
+      text: overrides.text ?? "What ports does Acme Vault need?",
       status: "working",
       checklist: [],
       approvals: [],
@@ -147,10 +147,10 @@ const traceEntries = (runtime: FakeRuntime, id: string) =>
 describe("harness worker", () => {
   it("claims, runs, reports progress and trace, then completes with the approvals", async () => {
     const model = new ScriptedModel([
-      call("docs_search", { query: "dsm ports" }),
-      call("docs_search", { query: "dsm firewall" }),
-      call("confluence_create_draft", { space: "PM", title: "DSM ports", body: "4443" }),
-      new AIMessage("DSM needs **port 4443**. A Confluence draft is waiting for your approval."),
+      call("docs_search", { query: "vault ports" }),
+      call("docs_search", { query: "vault firewall" }),
+      call("confluence_create_draft", { space: "PM", title: "Acme Vault ports", body: "4443" }),
+      new AIMessage("Acme Vault needs **port 4443**. A Confluence draft is waiting for your approval."),
     ]);
     const { runtime, mcp } = await setup({ claims: [claim("tsk_1")], models: { tsk_1: model } });
     const done = await waitFor(() => finished(runtime, "tsk_1"));
@@ -158,7 +158,7 @@ describe("harness worker", () => {
     // Sequence: claim, then events and trace, then complete last.
     expect(done.path).toBe("/v1/worker/tasks/tsk_1/complete");
     expect(done.body).toEqual({
-      result: "DSM needs **port 4443**. A Confluence draft is waiting for your approval.",
+      result: "Acme Vault needs **port 4443**. A Confluence draft is waiting for your approval.",
       approvals: ["apr_1"],
     });
     const order = runtime.requests.map((r) => r.path);
@@ -332,7 +332,7 @@ describe("harness worker", () => {
   });
 
   it("calls the gateway with the task's user, run and priority headers", async () => {
-    const gateway = await startFakeGateway("Port 4443, see https://support.acme.com/docs/ports");
+    const gateway = await startFakeGateway("Port 4443, see https://docs.example.com/docs/ports");
     cleanups.push(gateway.close);
     const { runtime } = await setup({
       claims: [claim("tsk_gw", { priority: "scheduled" })],
@@ -344,7 +344,7 @@ describe("harness worker", () => {
     });
     const done = await waitFor(() => finished(runtime, "tsk_gw"));
     expect(done.body).toEqual({
-      result: "Port 4443, see https://support.acme.com/docs/ports",
+      result: "Port 4443, see https://docs.example.com/docs/ports",
       approvals: [],
     });
     const request = gateway.requests[0];

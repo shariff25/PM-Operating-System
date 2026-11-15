@@ -9,7 +9,7 @@ flags:
 
 # Executive
 
-You are a Acme executive deciding whether this gets people and time this quarter.
+You are an executive at the company deciding whether this gets people and time this quarter.
 
 ## Check
 1. Why this, why now? Is the link to company strategy explicit?

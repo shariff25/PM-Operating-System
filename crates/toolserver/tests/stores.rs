@@ -48,16 +48,16 @@ fn doc(path: &str, title: &str, sensitivity: Sensitivity, body: &str) -> Context
 fn library() -> Vec<ContextDoc> {
     vec![
         doc(
-            "context/products/ccm.md",
-            "CCM",
+            "context/products/cloud.md",
+            "Acme Cloud",
             Sensitivity::Internal,
-            "# CCM\n\nKey management for multi-cloud estates.\n",
+            "# Acme Cloud\n\nKey management for multi-cloud estates.\n",
         ),
         doc(
-            "context/competitors/acme.md",
-            "Acme key management",
+            "context/competitors/initech.md",
+            "Initech key management",
             Sensitivity::Internal,
-            "# Acme\n\nAcme sells key management appliances.\n",
+            "# Initech\n\nInitech sells key management appliances.\n",
         ),
         doc(
             "context/partners/nda.md",
@@ -1171,13 +1171,13 @@ async fn ledger_rows_follow_concurrent_decisions(b: &Backend) {
 
 async fn memory_is_per_user(b: &Backend) {
     let m = b.stores.memory.as_ref();
-    m.update("ana", "areas", "CCM", "ask, task r1", now())
+    m.update("ana", "areas", "Acme Cloud", "ask, task r1", now())
         .await
         .unwrap();
     m.update(
         "ana",
         "areas",
-        "CCM, DSM",
+        "Acme Cloud, Acme Vault",
         "ask, task r2",
         now() + Duration::minutes(1),
     )
@@ -1186,13 +1186,13 @@ async fn memory_is_per_user(b: &Backend) {
     m.update("ana", "style", "short", "ask, task r1", now())
         .await
         .unwrap();
-    m.update("bo", "areas", "DSM", "ask, task r3", now())
+    m.update("bo", "areas", "Acme Vault", "ask, task r3", now())
         .await
         .unwrap();
     let ana = m.read("ana").await.unwrap();
     let keys: Vec<_> = ana.iter().map(|n| n.key.as_str()).collect();
     assert_eq!(keys, vec!["areas", "style"]);
-    assert_eq!(ana[0].text, "CCM, DSM");
+    assert_eq!(ana[0].text, "Acme Cloud, Acme Vault");
     assert_eq!(ana[0].updated_at, now() + Duration::minutes(1));
     assert!(m.read("cy").await.unwrap().is_empty());
 }
@@ -1208,10 +1208,10 @@ async fn context_search_and_get(b: &Backend) {
         .hits;
     let paths: Vec<_> = hits.iter().map(|h| h.doc.path.as_str()).collect();
     assert_eq!(paths.len(), 2, "{paths:?}");
-    assert!(paths.contains(&"context/products/ccm.md"));
-    assert!(paths.contains(&"context/competitors/acme.md"));
+    assert!(paths.contains(&"context/products/cloud.md"));
+    assert!(paths.contains(&"context/competitors/initech.md"));
     assert_eq!(
-        paths[0], "context/competitors/acme.md",
+        paths[0], "context/competitors/initech.md",
         "a title match ranks first"
     );
     assert!(hits.iter().all(|h| h.score > 0.0));
@@ -1307,7 +1307,7 @@ async fn reindex_tracks_the_content_repo(b: &Backend) {
     // One file edited, one deleted, one added.
     let mut docs = library();
     docs.retain(|d| d.path != "context/partners/nda.md");
-    docs[0].body = "# CCM\n\nNow with quantum-safe keys.\n".into();
+    docs[0].body = "# Acme Cloud\n\nNow with quantum-safe keys.\n".into();
     docs.push(doc(
         "context/glossary/terms.md",
         "Glossary",
@@ -1325,7 +1325,7 @@ async fn reindex_tracks_the_content_repo(b: &Backend) {
         .await
         .unwrap()
         .hits;
-    assert_eq!(quantum[0].doc.path, "context/products/ccm.md");
+    assert_eq!(quantum[0].doc.path, "context/products/cloud.md");
     let trusted = c
         .search("trusted", None, Sensitivity::Restricted, 5)
         .await
@@ -1352,7 +1352,7 @@ fn event(outcome: Outcome) -> AuditEvent {
         bot: None,
         tool: "confluence.create_draft".into(),
         outcome,
-        sources: vec!["context/products/ccm.md".into(), "jira:PM-101".into()],
+        sources: vec!["context/products/cloud.md".into(), "jira:PM-101".into()],
         args_hash: Some("abc".into()),
         output_ref: Some("apr_1".into()),
         detail: None,
@@ -1382,7 +1382,7 @@ async fn audit_records_events(b: &Backend) {
         let outcomes: Vec<String> = rows.iter().map(|r| r.get("outcome")).collect();
         assert_eq!(outcomes, vec!["pending", "approved"]);
         let sources: Vec<String> = rows[0].get("sources");
-        assert_eq!(sources, vec!["context/products/ccm.md", "jira:PM-101"]);
+        assert_eq!(sources, vec!["context/products/cloud.md", "jira:PM-101"]);
 
         // Append-only: no update, delete or truncate, even by the table's owner.
         for sql in [
@@ -1537,14 +1537,14 @@ async fn memory_repos_are_per_user(b: &Backend) {
     assert!(r.get("ana").await.unwrap().is_none());
     let record = MemoryRepo {
         user: "ana".into(),
-        repo: "acme/pm-os-memory-ana".into(),
+        repo: "example-org/pm-os-memory-ana".into(),
         verified_at: now(),
     };
     r.put(&record).await.unwrap();
     assert_eq!(r.get("ana").await.unwrap(), Some(record.clone()));
     assert!(r.get("bo").await.unwrap().is_none());
     let moved = MemoryRepo {
-        repo: "acme/ana-notes".into(),
+        repo: "example-org/ana-notes".into(),
         verified_at: now() + Duration::minutes(11),
         ..record
     };
@@ -1558,7 +1558,7 @@ async fn memory_repos_are_per_user(b: &Backend) {
 fn new_request<'a>(slack_id: &'a str, handle: &'a str) -> NewRequest<'a> {
     NewRequest {
         slack_id,
-        email: "new@acme.com",
+        email: "new@example.com",
         name: "New Person",
         proposed_handle: handle,
     }

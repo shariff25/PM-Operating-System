@@ -58,6 +58,16 @@ services:
       PMOS_DOCS_BIND: 0.0.0.0:8730
       PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN:?}
       PMOS_DOCS_DATABASE_URL: postgresql://pmos_docs:${PMOS_DB_DOCS_PASSWORD}@postgres/pmos_docs
+      # Your docs site (docs/docs-server.md, "Pointing the Docs bot at your docs"). Blank
+      # PMOS_DOCS_BASE_URL: the server starts with an empty index and says no site is configured.
+      PMOS_DOCS_BASE_URL: ${PMOS_DOCS_BASE_URL:-}
+      PMOS_DOCS_NAME: ${PMOS_DOCS_NAME:-the public docs}
+      PMOS_DOCS_PAGE_PREFIXES: ${PMOS_DOCS_PAGE_PREFIXES:-/}
+      PMOS_DOCS_API_PREFIX: ${PMOS_DOCS_API_PREFIX:-}
+      # A path inside the container: the repo's config/ is mounted at /etc/pmos/config.
+      PMOS_DOCS_PRODUCTS: ${PMOS_DOCS_PRODUCTS:-}
+    volumes:
+      - ../config:/etc/pmos/config:ro
     depends_on: { postgres: { condition: service_healthy } }
     healthcheck: &health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8730/healthz"]

@@ -496,7 +496,7 @@ async fn model_server_errors_are_passed_on_and_an_outage_is_reported() {
 async fn the_stub_model_needs_no_model_server() {
     // Nothing listens on this port.
     let gw = start_gateway("http://127.0.0.1:9/v1", wide(), true, true).await;
-    let body: Value = chat(&gw, "pmos/default", "What is DSM?")
+    let body: Value = chat(&gw, "pmos/default", "What is Acme Vault?")
         .send()
         .await
         .unwrap()
@@ -505,7 +505,7 @@ async fn the_stub_model_needs_no_model_server() {
         .unwrap();
     assert_eq!(
         body["choices"][0]["message"]["content"],
-        "Stub reply to: What is DSM?"
+        "Stub reply to: What is Acme Vault?"
     );
     let text = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", gw.base))

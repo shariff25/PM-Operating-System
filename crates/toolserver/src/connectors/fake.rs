@@ -50,10 +50,10 @@ impl FakeConnector {
                 item(
                     "jira",
                     "PM-101",
-                    "Epic: SSO for the DSM console",
+                    "Epic: SSO for the Acme Vault console",
                     json!({
                         "type": "Epic", "status": "In Progress",
-                        "description": "Customers ask for SAML SSO in the DSM console.",
+                        "description": "Customers ask for SAML SSO in the Acme Vault console.",
                     }),
                 ),
                 item(
@@ -86,7 +86,7 @@ impl FakeConnector {
                 item(
                     "confluence",
                     "9001",
-                    "CCM customer call notes, October",
+                    "Acme Cloud customer call notes, October",
                     json!({
                         "space": "PM", "body": "Two customers asked for SSO and audit export.",
                     }),
@@ -107,24 +107,24 @@ impl FakeConnector {
         let page = |slug: &str, title: &str, snippet: &str| Item {
             source: SourceRef {
                 system: "docs".into(),
-                id: format!("https://support.acme.com/docs/{slug}.md"),
-                url: format!("https://support.acme.com/docs/{slug}"),
+                id: format!("https://docs.example.com/docs/{slug}.md"),
+                url: format!("https://docs.example.com/docs/{slug}"),
             },
             title: title.to_string(),
-            content: json!({"product": "dsm", "snippet": snippet}),
+            content: json!({"product": "vault", "snippet": snippet}),
         };
         Self::new(
             "docs",
             vec![
                 page(
-                    "dsm-key-rotation",
-                    "Acme DSM Key Rotation",
+                    "vault-key-rotation",
+                    "Acme Vault Key Rotation",
                     "Key rotation creates a new key version.",
                 ),
                 page(
-                    "dsm-saml-sso",
-                    "Configure SAML SSO for Acme DSM",
-                    "DSM supports SAML 2.0 single sign-on.",
+                    "vault-saml-sso",
+                    "Configure SAML SSO for Acme Vault",
+                    "Acme Vault supports SAML 2.0 single sign-on.",
                 ),
             ],
         )
@@ -140,7 +140,7 @@ impl FakeConnector {
     /// |---|---|---|---|
     /// | `C0PMTEAM` | #pm-team | U0EVALS, U0BEN, U0CY | all team |
     /// | `C0FIELD` | #field-questions | U0EVALS, U0BEN, U0SE | one outsider (U0SE) |
-    /// | `C0ACMECX` | #acme-shared | U0EVALS, U0BEN, W0ACME1 | Slack Connect |
+    /// | `C0GLOBEXCX` | #globex-shared | U0EVALS, U0BEN, W0GLOBEX1 | Slack Connect |
     /// | `D0EVALSBEN` | DM with ben | U0EVALS, U0BEN | a DM |
     ///
     /// Any other channel id has no audience (`not found`), as when Slack's calls fail.
@@ -153,7 +153,7 @@ impl FakeConnector {
                 "Thread in #field-questions",
                 json!({
                     "channel": "C0FIELD", "ts": "1731500000.000100",
-                    "messages": [{"user": "U0SE", "text": "Does DSM support SAML SSO yet?"}],
+                    "messages": [{"user": "U0SE", "text": "Does Acme Vault support SAML SSO yet?"}],
                 }),
             )],
         );
@@ -184,7 +184,7 @@ impl FakeConnector {
             ),
             (
                 SLACK_CONNECT.into(),
-                audience(members(&["U0EVALS", "U0BEN", "W0ACME1"]), true, false),
+                audience(members(&["U0EVALS", "U0BEN", "W0GLOBEX1"]), true, false),
             ),
             (
                 SLACK_DM.into(),
@@ -200,14 +200,14 @@ pub const SLACK_PM: &str = "evals";
 /// [`SLACK_PM`]'s Slack member id. Fixture messages mention it as `<@U0EVALS>`.
 pub const SLACK_PM_ID: &str = "U0EVALS";
 /// The product team in the Slack fixtures, `(handle, Slack id)`, as `team.yaml` would list
-/// them. U0SE (a sales engineer) and W0ACME1 (at Acme, over Slack Connect) are not on it.
+/// them. U0SE (a sales engineer) and W0GLOBEX1 (at Globex, over Slack Connect) are not on it.
 pub const SLACK_TEAM: [(&str, &str); 3] = [("evals", "U0EVALS"), ("ben", "U0BEN"), ("cy", "U0CY")];
 /// #pm-team: only the product team.
 pub const SLACK_ALL_TEAM: &str = "C0PMTEAM";
 /// #field-questions: the team and one outsider, U0SE.
 pub const SLACK_WITH_OUTSIDER: &str = "C0FIELD";
-/// #acme-shared: a Slack Connect channel with Acme.
-pub const SLACK_CONNECT: &str = "C0ACMECX";
+/// #globex-shared: a Slack Connect channel with Globex.
+pub const SLACK_CONNECT: &str = "C0GLOBEXCX";
 /// The PM's DM with ben.
 pub const SLACK_DM: &str = "D0EVALSBEN";
 
@@ -297,7 +297,7 @@ fn slack_threads() -> Vec<FixtureThread> {
                 "U0BEN",
                 "Ben",
                 "1731600000.000100",
-                "<@U0EVALS> does DSM support SAML SSO for the console yet? A customer is asking.",
+                "<@U0EVALS> does Acme Vault support SAML SSO for the console yet? A customer is asking.",
                 true,
             )],
         },
@@ -328,7 +328,7 @@ fn slack_threads() -> Vec<FixtureThread> {
                 "U0CY",
                 "Cy",
                 "1731600600.000400",
-                "FYI <@U0EVALS>: the October CCM customer call notes are up in Confluence.",
+                "FYI <@U0EVALS>: the October Acme Cloud customer call notes are up in Confluence.",
                 true,
             )],
         },
@@ -353,24 +353,24 @@ fn slack_threads() -> Vec<FixtureThread> {
                 "U0SE",
                 "Sam (SE)",
                 "1731601200.000600",
-                "<@U0EVALS> what will the DSM SaaS enterprise tier cost for 500 keys next year?",
+                "<@U0EVALS> what will the Acme Vault SaaS enterprise tier cost for 500 keys next year?",
                 true,
             )],
         },
         FixtureThread {
             channel: SLACK_CONNECT,
-            channel_name: "#acme-shared",
+            channel_name: "#globex-shared",
             messages: vec![
                 msg(
-                    "W0ACME1",
-                    "Alex (Acme)",
+                    "W0GLOBEX1",
+                    "Alex (Globex)",
                     "1731601500.000700",
-                    "<@U0EVALS> does rotating a key in DSM create a new key version?",
+                    "<@U0EVALS> does rotating a key in Acme Vault create a new key version?",
                     true,
                 ),
                 msg(
-                    "W0ACME1",
-                    "Alex (Acme)",
+                    "W0GLOBEX1",
+                    "Alex (Globex)",
                     "1731601800.000800",
                     "<@U0EVALS> bumping this, any update?",
                     true,
@@ -614,8 +614,8 @@ mod tests {
                 "C0PMTEAM:1731600600.000400",
                 "C0PMTEAM:1731600900.000500",
                 "C0FIELD:1731601200.000600",
-                "C0ACMECX:1731601500.000700",
-                "C0ACMECX:1731601800.000800",
+                "C0GLOBEXCX:1731601500.000700",
+                "C0GLOBEXCX:1731601800.000800",
             ]
         );
         assert_eq!(hits[3].content["is_bot"], true);
@@ -652,11 +652,11 @@ mod tests {
             .read(
                 caller,
                 "read_thread",
-                &json!({"channel": "C0ACMECX", "ts": "1731601800.000800"}),
+                &json!({"channel": "C0GLOBEXCX", "ts": "1731601800.000800"}),
             )
             .await
             .unwrap();
-        assert_eq!(twice[0].source.id, "C0ACMECX:1731601500.000700");
+        assert_eq!(twice[0].source.id, "C0GLOBEXCX:1731601500.000700");
 
         // Audiences.
         let team: Vec<String> = SLACK_TEAM.iter().map(|(_, id)| id.to_string()).collect();

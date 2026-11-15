@@ -1,6 +1,6 @@
-//! HTTP: `/mcp` (MCP over Streamable HTTP), `/admin/sync` and `/admin/status`, `/healthz`.
-//! Everything but `/healthz` needs the bearer token only the tool server and platform-owner
-//! PMs hold.
+//! HTTP: `/mcp` (MCP over Streamable HTTP), `/admin/sync` and `/admin/status`, `/healthz`
+//! and `/readyz`. Everything but the health checks needs the bearer token only the tool
+//! server and platform-owner PMs hold.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,13 +20,15 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::mcp::DocsMcp;
+use crate::page::{Products, Site};
 use crate::store::DocsStore;
 use crate::sync::{SyncReport, Syncer};
 
 /// Shared between the HTTP handlers and the background sync loop.
 pub struct Runtime {
     pub store: Arc<dyn DocsStore>,
-    pub syncer: Arc<Syncer>,
+    /// `None` when no docs site is configured: nothing is ever synced.
+    pub syncer: Option<Arc<Syncer>>,
     pub last: Mutex<Option<Result<SyncReport, String>>>,
     /// When the last run in this process finished, and whether it succeeded.
     last_attempt: Mutex<Option<(DateTime<Utc>, bool)>>,
@@ -47,18 +49,34 @@ pub const RETRY_FAILED_AFTER: Duration = Duration::from_secs(60 * 60);
 
 impl Runtime {
     pub fn new(store: Arc<dyn DocsStore>, syncer: Syncer) -> Self {
+        Self::with_syncer(store, Some(syncer))
+    }
+
+    /// A runtime with no docs site: the index stays as it is (empty on a first start) and
+    /// nothing is synced.
+    pub fn unconfigured(store: Arc<dyn DocsStore>) -> Self {
+        Self::with_syncer(store, None)
+    }
+
+    fn with_syncer(store: Arc<dyn DocsStore>, syncer: Option<Syncer>) -> Self {
         Self {
             store,
-            syncer: Arc::new(syncer),
+            syncer: syncer.map(Arc::new),
             last: Mutex::new(None),
             last_attempt: Mutex::new(None),
             running: AtomicBool::new(false),
         }
     }
 
-    /// Run one sync unless one is already running. Returns false if one was.
+    /// Whether a docs site is configured, so there is anything to sync.
+    pub fn configured(&self) -> bool {
+        self.syncer.is_some()
+    }
+
+    /// Run one sync unless one is already running or no site is configured. Returns false
+    /// if it didn't run.
     pub async fn sync_once(&self) -> bool {
-        if !self.claim() {
+        if !self.configured() || !self.claim() {
             return false;
         }
         self.run_claimed().await;
@@ -74,7 +92,9 @@ impl Runtime {
     /// is recorded as a failed sync instead of taking the scheduler down.
     async fn run_claimed(&self) {
         let _running = Running(&self.running);
-        let syncer = self.syncer.clone();
+        let Some(syncer) = self.syncer.clone() else {
+            return;
+        };
         let result = match tokio::spawn(async move { syncer.run(Utc::now()).await }).await {
             Ok(r) => r.map_err(|e| e.to_string()),
             Err(e) => Err(format!("the sync stopped unexpectedly: {e}")),
@@ -108,8 +128,12 @@ impl Runtime {
 
     /// Is a sync due? Yes if the index has never been synced, if the last success is older
     /// than `every`, or if the last run failed more than [`RETRY_FAILED_AFTER`] ago. With no
-    /// schedule (`every` is `None`), only when it has never been synced.
+    /// schedule (`every` is `None`), only when it has never been synced. Never with no
+    /// docs site.
     pub async fn due(&self, every: Option<Duration>, now: DateTime<Utc>) -> bool {
+        if !self.configured() {
+            return false;
+        }
         let last_success = match self.store.last_success().await {
             Ok(t) => t,
             Err(e) => {
@@ -137,7 +161,11 @@ impl Runtime {
 #[derive(Clone)]
 pub struct AppConfig {
     pub token: String,
-    pub base: String,
+    /// How tools name the site (`PMOS_DOCS_NAME`).
+    pub name: String,
+    /// The docs site, or `None` when none is configured.
+    pub site: Option<Site>,
+    pub products: Products,
     pub allowed_hosts: Vec<String>,
     /// `/readyz` fails once the last successful sync is older than this (twice the sync
     /// interval). `None` with no schedule.
@@ -157,7 +185,12 @@ pub fn router(runtime: Arc<Runtime>, config: AppConfig, cancel: CancellationToke
         token: config.token.into(),
         stale_after: config.stale_after,
     };
-    let handler = DocsMcp::new(runtime.store.clone(), config.base);
+    let handler = DocsMcp::new(
+        runtime.store.clone(),
+        config.name,
+        config.site,
+        config.products,
+    );
     let mcp = StreamableHttpService::new(
         move || Ok(handler.clone()),
         LocalSessionManager::default().into(),
@@ -195,7 +228,20 @@ async fn require_token(State(state): State<AppState>, req: Request, next: Next) 
     }
 }
 
+/// What `/readyz`, `/admin/sync` and `/admin/status` say when no site is configured.
+pub const NOT_CONFIGURED: &str = "docs site not configured";
+
 async fn trigger_sync(State(state): State<AppState>) -> Response {
+    if !state.runtime.configured() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not configured",
+                "error": format!("{NOT_CONFIGURED}: set PMOS_DOCS_BASE_URL to the site to index"),
+            })),
+        )
+            .into_response();
+    }
     // Claim before spawning, so two requests can't both be told "started".
     if !state.runtime.claim() {
         return (
@@ -211,9 +257,20 @@ async fn trigger_sync(State(state): State<AppState>) -> Response {
     (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response()
 }
 
-/// `200` when the index answers, has pages and isn't stale; `503` otherwise. No auth: it
-/// names which check failed, nothing more.
+/// `200` when a docs site is configured and the index answers, has pages and isn't stale;
+/// `503` otherwise. No auth: it names which check failed, nothing more.
 async fn readyz(State(state): State<AppState>) -> Response {
+    if !state.runtime.configured() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ready": false,
+                "detail": NOT_CONFIGURED,
+                "checks": {"site": "not configured"},
+            })),
+        )
+            .into_response();
+    }
     let pages = tokio::time::timeout(Duration::from_secs(1), state.runtime.store.count()).await;
     let storage = matches!(pages, Ok(Ok(_)));
     let has_pages = matches!(pages, Ok(Ok(n)) if n > 0);
@@ -258,6 +315,8 @@ async fn status(State(state): State<AppState>) -> Response {
     let last = state.runtime.last.lock().expect("status lock").clone();
     let last_success = state.runtime.last_success().await;
     Json(json!({
+        "configured": state.runtime.configured(),
+        "detail": (!state.runtime.configured()).then_some(NOT_CONFIGURED),
         "pages": pages,
         "syncing": state.runtime.is_running(),
         "last_success_at": last_success,

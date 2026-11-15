@@ -1,0 +1,15 @@
+# Example task on the fake docs fixtures. Checked against the fixture page
+# https://docs.example.com/docs/vault-saml-sso: "Acme Vault supports SAML 2.0 single sign-on."
+id: vault-saml-sso
+ask: "Does Acme Vault support SAML single sign-on, and which SAML version?"
+expect:
+  must_cite:
+    - https://docs.example.com/docs/vault-saml-sso
+  must_include:
+    - "SAML 2.0"
+  # Reasoning must not leak into the answer, even with the gateway's strip-think
+  # workaround off (D11).
+  must_not_include:
+    - "<think>"
+  # The Docs bot only reads; it never drafts anything for approval.
+  approvals: 0

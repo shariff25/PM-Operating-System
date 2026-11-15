@@ -191,7 +191,7 @@ fn tool_rules() {
 
 #[test]
 fn a_page_that_was_never_retrieved_is_the_tool_and_one_that_was_is_the_model() {
-    let page = "https://support.acme.com/docs/what-is-a-join-token";
+    let page = "https://docs.example.com/docs/what-is-a-join-token";
     let missing = failing(vec![Check::MissingCitation { url: page.into() }]);
     let call = (
         "tool_call",
@@ -204,7 +204,7 @@ fn a_page_that_was_never_retrieved_is_the_tool_and_one_that_was_is_the_model() {
             call.clone(),
             (
                 "tool_result",
-                json!({"tool": "docs.search", "content": [{"url": "https://support.acme.com/docs/other.md"}]}),
+                json!({"tool": "docs.search", "content": [{"url": "https://docs.example.com/docs/other.md"}]}),
             ),
         ],
     );
@@ -265,7 +265,7 @@ fn model_failures_get_a_sub_tag_from_what_failed() {
         (Check::NotDeclined, "model/answered-beyond-sources"),
         (
             Check::MissingCitation {
-                url: "https://support.acme.com/docs/x".into(),
+                url: "https://docs.example.com/docs/x".into(),
             },
             "model/missing-citation",
         ),

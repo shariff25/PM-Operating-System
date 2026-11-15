@@ -16,8 +16,7 @@ use pmos_evals::spec::load_category;
 use pmos_evals::tag::Tag;
 use serde_json::json;
 
-const PAGE: &str =
-    "https://support.acme.com/docs/acme-data-security-manager-port-requirements";
+const PAGE: &str = "https://docs.example.com/docs/acme-vault-port-requirements";
 
 fn task(id: &str, ask: &str, extra: &str) -> (String, String) {
     (
@@ -35,7 +34,7 @@ fn scripted(mock: &Mock) -> Vec<(String, String)> {
     );
     let tool_call = entry(
         "tool_call",
-        json!({"tool": "docs.search", "args": {"query": "dsm ports"}}),
+        json!({"tool": "docs.search", "args": {"query": "vault ports"}}),
     );
     mock.script(
         "q-pass",
@@ -54,7 +53,7 @@ fn scripted(mock: &Mock) -> Vec<(String, String)> {
     );
     mock.script("q-tool", Script {
         result: Some("KMIP is on 5696.".into()),
-        trace: vec![tool_call.clone(), entry("tool_result", json!({"tool": "docs.search", "content": [{"url": "https://support.acme.com/docs/other"}]}))],
+        trace: vec![tool_call.clone(), entry("tool_result", json!({"tool": "docs.search", "content": [{"url": "https://docs.example.com/docs/other"}]}))],
         ..Script::default()
     });
     mock.script(

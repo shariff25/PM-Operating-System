@@ -228,9 +228,9 @@ pub fn normalize_text(s: &str) -> String {
 }
 
 /// A URL as citations are compared: no scheme, no `www.`, no query string or fragment, no
-/// trailing slash, no `.md` extension, lowercase, and the portal's `/v1/docs/` links read as
-/// `/docs/`. So `https://support.acme.com/docs/x.md?utm=1` cites
-/// `https://support.acme.com/docs/x/`.
+/// trailing slash, no `.md` extension, lowercase, and versioned `/v1/docs/` links (as some
+/// docs platforms serve them) read as `/docs/`. So `https://docs.example.com/docs/x.md?utm=1` cites
+/// `https://docs.example.com/docs/x/`.
 pub fn normalize_url(url: &str) -> String {
     let mut u = url.trim().to_lowercase();
     for scheme in ["https://", "http://"] {

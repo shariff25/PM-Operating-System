@@ -231,7 +231,7 @@ expect:
   - a `.md` extension;
   - letter case.
 
-  The portal's `/v1/docs/<slug>` links count as `/docs/<slug>`.
+  A docs portal's `/v1/docs/<slug>` links count as `/docs/<slug>`.
 
 **Text** is compared after normalising both sides the same way:
 - lowercase;
@@ -545,14 +545,14 @@ So queue time can be over-counted by up to one poll interval when a task has no 
 3. **Write one file per task, `tasks/<id>.yaml`.** The `id` must match the file name. Real
    cases come from case cards (`evals/case-card.md`).
    ```yaml
-   id: dsm-port-requirements
-   ask: "Which ports do applications need open to reach an on-premises Acme DSM cluster?"
+   id: vault-saml-sso
+   ask: "Does Acme Vault support single sign-on with SAML?"
    expect:
-     must_cite: [https://support.acme.com/docs/acme-data-security-manager-port-requirements]
-     must_include: ["443", "5696"]
+     must_cite: [https://docs.example.com/docs/vault-saml-sso]
+     must_include: ["SAML 2.0"]
      must_not_include: ["<think>"]
      approvals: 0
-   cluster: dsm-ports    # optional; default: the first must_cite URL, else the id
+   cluster: vault-sso    # optional; default: the first must_cite URL, else the id
    regression: true      # optional: the gate fails if it flips back to failing
    tags: [model/missing-fact]   # optional: failure modes it exists to catch
    ```
@@ -580,16 +580,25 @@ So queue time can be over-counted by up to one poll interval when a task has no 
    It launches once `history` says the bar was met two weeks in a row.
 
 ### `docs-qa`
-Twenty questions for the Docs bot, built from the public portal on 2026-11-14, and three it
-must decline. Each runs three times (`repeats: 3`); the bar is 80% of attempts.
+A template category for the Docs bot. PM OS can't ship real questions, because every team's
+docs site is different (`PMOS_DOCS_BASE_URL`, `docs/docs-server.md`). So a team writes its own
+questions against its own docs; `evals/categories/docs-qa/README.md` walks through it. Each
+task runs three times (`repeats: 3`). It has no bar (`pass_bar` unset, so it only reports)
+until your team writes its own questions; then set one, such as 80% of attempts.
 
-**How they were built:**
-- **Pages:** `llms.txt` was read, then the `.md` version of each page used, at one request per
-  second.
-- **Coverage:** DSM, CCM, Confidential AI, Key Insight, Armor and the DSM REST API.
-- **Checked against the page:** each task's comment quotes what its page says, and every
-  `must_include` term was checked against that page with the normalisation above.
-- **When the portal changes a page:** fix the task from the new page, and note it in the
+**The example tasks** ask about Acme Vault, a fictional product, and are answered by the fake
+docs fixtures (`https://docs.example.com/docs/vault-saml-sso` and `…/vault-key-rotation`), so
+the category runs and passes its checks before you point PM OS at your docs. Replace them
+with your own.
+
+**Writing your own:**
+- **Pages:** read your site's `llms.txt`, then the `.md` version of each page you use, at
+  most one request per second.
+- **Coverage:** spread the twenty questions across your products (the ids in your products
+  file) and your API reference, if you index one.
+- **Checked against the page:** quote what the page says in a comment on each task, and check
+  every `must_include` term against that page with the normalisation above.
+- **When your docs change a page:** fix the task from the new page, and note it in the
   commit.
 
 **The should-not cases** (`decline-*`, `must_decline: true`) ask for what public product docs
@@ -631,7 +640,9 @@ asks for.
 (`deploy/compose.evals.yaml`), never against what PMs use. It has:
 - a tool server, runtime and the Docs and `pm-evals` workers, on a checkout's content;
 - the member `evals` added to that copy of `team.yaml`;
-- fake Jira, Confluence and Slack fixtures, and the real public support docs;
+- fake Jira, Confluence, Slack and docs fixtures. To benchmark your own docs site, set
+  `PMOS_EVAL_DOCS_URL=http://docs.pmos.internal:8730/mcp` in `deploy/.env`, and the eval
+  tool server reads the main stack's docs index, read-only;
 - the live gateway's models, under the `evals` client's token.
 
 `pmos-admin` starts it with fresh tokens for every run and removes it afterwards. So:

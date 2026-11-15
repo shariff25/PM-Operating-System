@@ -14,12 +14,12 @@ Allow about half a day, most of it waiting for the first image build and model d
   - GitHub, for the code and content repos;
   - Docker Hub and `nvcr.io`, for images;
   - Hugging Face, for models;
-  - `support.acme.com`, for the docs;
+  - your docs site's host (`PMOS_DOCS_BASE_URL`), for the Docs bot;
   - Slack: `slack.com`, `wss-primary.slack.com` and `wss-backup.slack.com`;
   - from Gate 1: `api.atlassian.com`, `auth.atlassian.com` and `api.github.com`.
 
   If the Spark has an outbound proxy, you'll set it in stage 1.
-- **The repo in the Acme org.** The content repo must be in the Acme GitHub org
+- **The repo in your GitHub org.** The content repo must be in your company's GitHub org
   (`PMOS_CONTENT_REPO` must be in `PMOS_GITHUB_ORG`). If it still lives elsewhere, move it first.
 
 ## Stage 1: Code, content and settings
@@ -39,7 +39,12 @@ deploy/setup.sh --content /srv/pmos/content-repo --clone <the content repo> --st
    - use the `git@github.com:` URL for the checkout's remote.
 3. **The proxy, if the Spark has one.** In `deploy/.env`, set `HTTPS_PROXY` and `NO_PROXY`.
    Also set `PMOS_BUILD_CA` if the proxy re-signs TLS.
-4. **Save the settings.** Copy `deploy/.env` into the team password manager now. It holds the
+4. **Your docs site (optional).** For the Docs bot, set `PMOS_DOCS_BASE_URL` (and, if you
+   need them, `PMOS_DOCS_NAME`, `PMOS_DOCS_PAGE_PREFIXES`, `PMOS_DOCS_API_PREFIX` and
+   `PMOS_DOCS_PRODUCTS`) in `deploy/.env`. The site must publish `llms.txt` and markdown
+   pages: see "Pointing the Docs bot at your docs" in `docs/docs-server.md`. You can leave it
+   blank and add it later; until then the Docs bot says no docs site is configured.
+5. **Save the settings.** Copy `deploy/.env` into the team password manager now. It holds the
    vault key; without it, stored tokens can't be read.
 
 ## Stage 2: First start, without models or Slack
@@ -54,7 +59,8 @@ deploy/pmos-admin status
 - every container is `healthy`;
 - `toolserver`, `gateway` and `bots` show `ok`;
 - the gateway says `"stub":true`;
-- `docs` turns ready once its first sync of the support docs finishes, after a few minutes.
+- `docs` turns ready once its first sync of your docs site finishes (about a second per page);
+  with no `PMOS_DOCS_BASE_URL` it stays not ready (`docs site not configured`), which is expected.
 
 **Add the first platform owners.** Everyone after them joins through the bot.
 
@@ -124,7 +130,7 @@ The bring-up worker isn't isolated. Replace it with the Docs bot's real sandbox.
 ## Stage 5: Slack
 
 1. **Create the app.** At <https://api.slack.com/apps>, create an app from
-   `docs/slack-app-manifest.yaml` in the Acme workspace, and install it. A workspace admin
+   `docs/slack-app-manifest.yaml` in your company's workspace, and install it. A workspace admin
    may need to approve it.
 2. **Add the tokens to `deploy/.env`:**
    - `PMOS_SLACK_BOT_TOKEN` (`xoxb-…`);
@@ -132,7 +138,7 @@ The bring-up worker isn't isolated. Replace it with the Docs bot's real sandbox.
    - `PMOS_CONSOLE_SLACK_URL`.
 3. **Start Slack:** run `deploy/pmos-admin up --models`. The Slack bot starts once its tokens
    are set.
-4. **Check it:** DM the app `docs: what does DSM do?`. You should see a progress message, then
+4. **Check it:** DM the app `docs:` and a question your docs site answers. You should see a progress message, then
    an answer with links.
 
 ## Stage 6: Live connectors (Gate 1)

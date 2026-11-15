@@ -8,7 +8,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use pmos_docs::page::{Products, Site};
 use pmos_docs::store::PgStore;
+use pmos_docs::sync::SyncConfig;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::Connection;
 use tokio_util::sync::CancellationToken;
@@ -72,10 +74,30 @@ impl Portal {
         }
     }
 
+    /// Serve a page at any path, such as `/guides/vault/sso.md`.
+    pub fn set_path(&self, path: &str, etag: &str, body: &str) {
+        self.pages.lock().unwrap().insert(
+            path.into(),
+            MockPage {
+                etag: etag.into(),
+                body: body.into(),
+                status: 200,
+            },
+        );
+    }
+
+    /// Set the index to pages at these paths (path, title), under one `## Docs` heading.
+    pub fn set_index_paths(&self, base: &str, entries: &[(&str, &str)]) {
+        let mut s = String::from("# Acme\n\n## Docs\n\n");
+        for (path, title) in entries {
+            s.push_str(&format!("- [{title}]({base}{path})\n"));
+        }
+        *self.index.lock().unwrap() = s;
+    }
+
     /// Set the index to these pages (slug, title, description).
     pub fn set_index(&self, base: &str, entries: &[(&str, &str, Option<&str>)]) {
-        let mut s =
-            String::from("# Acme\n\n> Knowledge base documentation for Acme.\n\n## v1\n\n");
+        let mut s = String::from("# Acme\n\n> Knowledge base documentation for Acme.\n\n## v1\n\n");
         for (slug, title, desc) in entries {
             s.push_str(&format!("- [{title}]({base}/docs/{slug}.md)"));
             if let Some(d) = desc {
@@ -90,7 +112,7 @@ impl Portal {
 pub fn page_md(title: &str, slug: &str, body: &str) -> String {
     format!(
         "---\ntitle: \"{title}\"\nslug: \"{slug}\"\nupdated: 2026-10-01T10:00:00Z\n---\n\n\
-         > ## Documentation Index\n> Fetch the complete documentation index at: https://support.acme.com/llms.txt\n\n\
+         > ## Documentation Index\n> Fetch the complete documentation index at: https://docs.example.com/llms.txt\n\n\
          # {title}\n\n{body}\n"
     )
 }
@@ -181,50 +203,68 @@ pub async fn start_portal() -> (String, Arc<Portal>, CancellationToken) {
     (base, portal, cancel)
 }
 
-/// Four pages: two DSM, one CCM, one general.
+/// The products the tests label pages with: Acme Vault and Acme Cloud.
+pub fn products() -> Products {
+    Products::parse(
+        "products:\n  - id: vault\n    name: Acme Vault\n    keywords: [vault]\n  - id: cloud\n    name: Acme Cloud\n    keywords: [cloud]\n",
+    )
+    .unwrap()
+}
+
+/// The mock site's pages live under `/docs/`.
+pub fn site(base: &str) -> Site {
+    Site::new(base).with_prefixes(&["/docs/"])
+}
+
+/// A fast crawl of the mock site, with the test products.
+pub fn sync_config(base: &str) -> SyncConfig {
+    SyncConfig {
+        products: products(),
+        delay: std::time::Duration::from_millis(1),
+        ..SyncConfig::new(site(base))
+    }
+}
+
+/// Four pages: two Acme Vault, one Acme Cloud, one general.
 pub fn seed(base: &str, portal: &Portal) {
     portal.set_index(
         base,
         &[
             (
-                "dsm-key-rotation",
-                "Acme DSM Key Rotation",
-                Some("Rotate keys in DSM"),
+                "vault-key-rotation",
+                "Acme Vault Key Rotation",
+                Some("Rotate keys in Acme Vault"),
             ),
-            ("dsm-backup", "Acme DSM Backup and Restore", None),
-            (
-                "ccm-overview",
-                "Confidential Computing Manager Overview",
-                None,
-            ),
+            ("vault-backup", "Acme Vault Backup and Restore", None),
+            ("cloud-overview", "Acme Cloud Overview", None),
             ("getting-started", "Getting Started", None),
         ],
     );
     portal.set_page(
-        "dsm-key-rotation",
+        "vault-key-rotation",
         "\"r1\"",
         &page_md(
-            "Acme DSM Key Rotation",
-            "dsm-key-rotation",
+            "Acme Vault Key Rotation",
+            "vault-key-rotation",
             "## Rotate a key\n\nKey rotation creates a new key version.\n\n## Rotation policy\n\nSet a rotation interval.",
         ),
     );
     portal.set_page(
-        "dsm-backup",
+        "vault-backup",
         "\"b1\"",
         &page_md(
-            "Acme DSM Backup and Restore",
-            "dsm-backup",
+            "Acme Vault Backup and Restore",
+            "vault-backup",
             "## Backup\n\nBack up the cluster. Keys are included.",
         ),
     );
     portal.set_page(
-        "ccm-overview",
+        "cloud-overview",
         "\"c1\"",
         &page_md(
-            "Confidential Computing Manager Overview",
-            "ccm-overview",
-            "CCM runs enclaves and attests them.",
+            "Acme Cloud Overview",
+            "cloud-overview",
+            "Acme Cloud runs enclaves and attests them.",
         ),
     );
     portal.set_page(

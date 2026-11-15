@@ -16,7 +16,7 @@ You are a field sales engineer who will install this at a customer site and run 
    one listed?
 2. Platforms: which clouds, hypervisors, OS versions and Kubernetes distributions are
    supported? Anything a typical customer runs that is missing?
-3. Install and day-one setup: how many steps, how long, what needs a Acme engineer?
+3. Install and day-one setup: how many steps, how long, what needs one of our engineers on site?
 4. POC: are the success criteria measurable in the time a POC has?
 5. What will the customer's security or platform team push back on?
 

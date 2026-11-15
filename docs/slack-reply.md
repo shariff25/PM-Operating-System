@@ -28,7 +28,7 @@ link it again: the audience check below needs four more read permissions.
    - FYIs and announcements;
    - bot messages;
    - questions meant for someone else.
-3. **Find the answer.** It looks in the team's context, Confluence, Jira and the support docs,
+3. **Find the answer.** It looks in the team's context, Confluence, Jira and the public docs,
    and cites them. If they don't answer it, the draft says so instead of guessing, and it never
    promises dates, prices or scope for you.
 4. **Draft.** You get one card per thread, and never two for the same thread.
@@ -54,14 +54,14 @@ When you tap **Post as you**, PM OS checks the channel first:
 
 | Situation | What happens |
 | --- | --- |
-| The draft used **restricted** sources, and someone in the channel isn't on the product team, or the channel is shared outside Acme | **Blocked.** Nothing posts. The card offers only Reject: answer in the thread yourself if it still needs a reply. |
+| The draft used **restricted** sources, and someone in the channel isn't on the product team, or the channel is shared outside the company | **Blocked.** Nothing posts. The card offers only Reject: answer in the thread yourself if it still needs a reply. |
 | The channel is shared with another company (Slack Connect) | **Confirm first.** The card asks again before posting to an external channel. |
 | Otherwise | It posts. |
 
 **Who counts as the product team:** `team.yaml`.
 
 **What counts as restricted:** a draft is restricted if your bot read any restricted context
-while writing it. Jira, Confluence and Slack reads count as internal, and the support docs as
+while writing it. Jira, Confluence and Slack reads count as internal, and the public docs as
 public.
 
 ## What PM OS keeps

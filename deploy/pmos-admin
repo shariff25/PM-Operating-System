@@ -181,7 +181,7 @@ case "$cmd" in
     if compose exec -T docs curl -fsS -m 5 http://127.0.0.1:8730/readyz >/dev/null 2>&1; then
       row docs ok "ready"
     else
-      row docs "not" "ready (an empty index until the first sync finishes is normal)"
+      row docs "not" "ready (normal until the first sync finishes; or no docs site set in PMOS_DOCS_BASE_URL)"
     fi
     ;;
 
@@ -413,7 +413,7 @@ for g in s["groups"]:
     # One Docs-bot question through the whole stack, as the Slack bot would send it.
     [ $# -eq 1 ] || { say "usage: pmos-admin smoke <handle in team.yaml>" >&2; exit 2; }
     auth=(-H "Authorization: Bearer $PMOS_RT_SLACK_TOKEN" -H "X-Pmos-User: $1")
-    body=$(printf '{"bot":"docs","requested_by":"%s","text":"What does Acme DSM do?","source":"slack","slack":{"channel":"smoke","thread_ts":"0.0"}}' "$1")
+    body=$(printf '{"bot":"docs","requested_by":"%s","text":"What does the docs site say about getting started?","source":"slack","slack":{"channel":"smoke","thread_ts":"0.0"}}' "$1")
     task=$(curl -sS --noproxy '*' -X POST http://127.0.0.1:8750/v1/tasks "${auth[@]}" -H 'content-type: application/json' -d "$body")
     id=$(sed -n 's/.*"id":"\(tsk_[0-9a-f]*\)".*/\1/p' <<<"$task")
     [ -n "$id" ] || { say "the runtime refused the task: $task" >&2; exit 1; }

@@ -1,5 +1,5 @@
--- pmos-docs: the support-docs index. Rebuilt from support.acme.com by the sync job;
--- the portal stays the source of truth.
+-- pmos-docs: the docs index. Rebuilt from the configured docs site by the sync job;
+-- the site stays the source of truth.
 CREATE TABLE docs_pages (
     url         text PRIMARY KEY,
     slug        text NOT NULL,

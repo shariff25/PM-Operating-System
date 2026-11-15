@@ -178,7 +178,7 @@ mod tests {
         TeamMember {
             handle: handle.into(),
             slack_id: slack.into(),
-            email: Some(format!("{handle}+x@acme.com")),
+            email: Some(format!("{handle}+x@example.com")),
             github: Some("Ana-F".into()),
             roles: vec![Role::Pm, Role::SkillAuthor],
         }
@@ -207,12 +207,12 @@ mod tests {
     fn handles_come_from_the_email_and_avoid_taken_ones() {
         let mut taken = BTreeSet::new();
         assert_eq!(
-            propose_handle("Ana.Kumar@acme.com", "", &taken),
+            propose_handle("Ana.Kumar@example.com", "", &taken),
             "ana-kumar"
         );
         taken.insert("ana-kumar".to_string());
         assert_eq!(
-            propose_handle("ana.kumar@acme.com", "", &taken),
+            propose_handle("ana.kumar@example.com", "", &taken),
             "ana-kumar2"
         );
         assert_eq!(propose_handle("@x.com", "Raj Patel", &taken), "raj-patel");
