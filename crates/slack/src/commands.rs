@@ -40,11 +40,15 @@ pub struct Commands {
     /// Where `response_url` may point. Slack's is always `https://hooks.slack.com/`; tests
     /// set a local mock.
     pub response_url_prefix: String,
+    /// Offer **Request access** to someone not in `team.yaml`. Needs the bots (`PMOS_BOTS_URL`),
+    /// which handle the tap; without them the note says who to ask.
+    pub request_access: bool,
 }
 
 pub const SLACK_RESPONSE_URL_PREFIX: &str = "https://hooks.slack.com/";
 
-/// What someone outside `team.yaml` is told, privately.
+/// What someone outside `team.yaml` is told, privately, where there is no **Request access**
+/// button.
 pub const NOT_A_MEMBER: &str = "PM OS is for the Acme product team. If you need access, ask a \
                                 platform-owner PM to add you.";
 
@@ -85,7 +89,11 @@ impl Commands {
         let Some(member) = team.by_slack_id(slack_id) else {
             tracing::info!(slack_id, "/docs from someone not in team.yaml");
             return Reply {
-                ack: blocks::text(NOT_A_MEMBER),
+                ack: if self.request_access {
+                    crate::member_cards::request_access_ack()
+                } else {
+                    blocks::text(NOT_A_MEMBER)
+                },
                 follow_up: None,
             };
         };
@@ -157,7 +165,8 @@ impl Commands {
     }
 }
 
-/// Send a reply to Slack's `response_url`, so the PM never stares at "Searching…" forever:
+/// Send a reply to Slack's `response_url` (for `/docs`, so the PM never stares at
+/// "Searching…" forever, and for taps on ephemeral notes):
 /// retry once on a 5xx or a network error, and if Slack refuses the message (a 4xx such as
 /// `invalid_blocks`), send its plain-text version instead.
 pub async fn post_reply(http: &reqwest::Client, response_url: &str, message: &Value) {
@@ -168,24 +177,24 @@ pub async fn post_reply(http: &reqwest::Client, response_url: &str, message: &Va
             Ok(r) if r.status().is_success() => return,
             Ok(r) if r.status().is_client_error() && message.get("blocks").is_some() => {
                 let body = r.text().await.unwrap_or_default();
-                tracing::warn!(%body, "Slack refused the /docs reply; sending plain text");
+                tracing::warn!(%body, "Slack refused the reply; sending plain text");
                 if let Some(obj) = message.as_object_mut() {
                     obj.remove("blocks");
                 }
             }
             Ok(r) if r.status().is_client_error() => {
-                tracing::warn!(status = %r.status(), "Slack refused the /docs reply");
+                tracing::warn!(status = %r.status(), "Slack refused the reply");
                 return;
             }
             Ok(r) => {
-                tracing::warn!(status = %r.status(), attempt, "replying to /docs failed");
+                tracing::warn!(status = %r.status(), attempt, "replying through response_url failed");
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             Err(e) => {
-                tracing::warn!(error = %e, attempt, "replying to /docs failed");
+                tracing::warn!(error = %e, attempt, "replying through response_url failed");
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
     }
-    tracing::error!("could not reply to /docs after retrying");
+    tracing::error!("could not reply through response_url after retrying");
 }

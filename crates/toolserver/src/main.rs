@@ -6,18 +6,22 @@ use chrono::Utc;
 use pmos_toolserver::app::BotAccess;
 use pmos_toolserver::audit::{AuditSink, JsonlAudit, TeeAudit};
 use pmos_toolserver::catalog::Catalog;
-use pmos_toolserver::config::{Config, Connectors};
+use pmos_toolserver::config::{Config, Connectors, MemoryBackend};
 use pmos_toolserver::connectors::atlassian::{Confluence, Jira};
 use pmos_toolserver::connectors::docs::Docs;
 use pmos_toolserver::connectors::fake::FakeConnector;
 use pmos_toolserver::connectors::slack::Slack;
 use pmos_toolserver::connectors::Connector;
+use pmos_toolserver::content_sync::ContentSync;
 use pmos_toolserver::context::load_docs;
+use pmos_toolserver::github::GitHub;
+use pmos_toolserver::github_memory::GitHubMemory;
 use pmos_toolserver::oauth::{OAuth, OAuthConfig, TokenSource};
+use pmos_toolserver::onboarding::{GitHubSetup, Onboarding};
 use pmos_toolserver::pg::PgStore;
 use pmos_toolserver::team::Team;
 use pmos_toolserver::vault::Vault;
-use pmos_toolserver::{router, AppConfig, Stores, ToolService};
+use pmos_toolserver::{router_with, AppConfig, Stores, ToolService};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -70,59 +74,96 @@ async fn main() -> Result<()> {
     // be theirs.
     let team = Team::load(&config.content_root, live).map_err(anyhow::Error::msg)?;
 
-    let (connectors, oauth): (Vec<Arc<dyn Connector>>, Option<Arc<OAuth>>) =
-        match &config.connectors {
-            Connectors::Fake => {
-                tracing::warn!("PMOS_CONNECTORS=fake: serving fixture Jira, Confluence and Slack");
-                (
-                    vec![
-                        Arc::new(FakeConnector::jira()),
-                        Arc::new(FakeConnector::confluence()),
-                        Arc::new(FakeConnector::slack()),
-                        Arc::new(FakeConnector::docs()),
-                    ],
-                    None,
+    let mut github_setup = None;
+    let (connectors, oauth): (Vec<Arc<dyn Connector>>, Option<Arc<OAuth>>) = match &config
+        .connectors
+    {
+        Connectors::Fake => {
+            tracing::warn!("PMOS_CONNECTORS=fake: serving fixture Jira, Confluence and Slack");
+            let docs: Arc<dyn Connector> = match &config.fake_mode_docs {
+                Some((url, token)) => {
+                    tracing::info!(url = %url, "docs tools use the real pmos-docs (public support docs)");
+                    Arc::new(Docs::new(url.clone(), token.expose()))
+                }
+                None => Arc::new(FakeConnector::docs()),
+            };
+            (
+                vec![
+                    Arc::new(FakeConnector::jira()),
+                    Arc::new(FakeConnector::confluence()),
+                    Arc::new(FakeConnector::slack()),
+                    docs,
+                ],
+                None,
+            )
+        }
+        Connectors::Live(live) => {
+            let vault = Vault::new(live.vault_keys.clone(), stores.credentials.clone());
+            let oauth = Arc::new(
+                OAuth::new(
+                    OAuthConfig {
+                        public_base_url: live.public_url.clone(),
+                        atlassian: Some(live.atlassian.clone()),
+                        atlassian_site: live.atlassian_site.clone(),
+                        slack: Some(live.slack.clone()),
+                        github: live.github.as_ref().map(|g| g.app.clone()),
+                        github_org: live.github.as_ref().map(|g| g.org.clone()),
+                        state_key: state_key(config.service_token.expose()),
+                        endpoints: live.endpoints.clone(),
+                    },
+                    vault,
                 )
-            }
-            Connectors::Live(live) => {
-                let vault = Vault::new(live.vault_keys.clone(), stores.credentials.clone());
-                let oauth = Arc::new(
-                    OAuth::new(
-                        OAuthConfig {
-                            public_base_url: live.public_url.clone(),
-                            atlassian: Some(live.atlassian.clone()),
-                            atlassian_site: live.atlassian_site.clone(),
-                            slack: Some(live.slack.clone()),
-                            state_key: state_key(config.service_token.expose()),
-                            endpoints: live.endpoints.clone(),
-                        },
-                        vault,
-                    )
-                    .with_team(team.clone()),
-                );
-                let tokens: Arc<dyn TokenSource> = oauth.clone();
+                .with_team(team.clone()),
+            );
+            let tokens: Arc<dyn TokenSource> = oauth.clone();
+            tracing::info!(
+                public_url = %live.public_url,
+                vault_key = %live.vault_keys.active_id(),
+                "live connectors: every call acts with the PM's own token"
+            );
+            if let Some(gh) = &live.github {
+                let github = Arc::new(GitHub::new(live.endpoints.github_api.clone()));
+                if config.memory == MemoryBackend::Github {
+                    stores.memory = Arc::new(GitHubMemory::new(
+                        github.clone(),
+                        tokens.clone(),
+                        stores.memory_repos.clone(),
+                        gh.org.clone(),
+                    ));
+                    tracing::info!(org = %gh.org, "PMOS_MEMORY=github: each PM's memory is in their own repo");
+                }
                 tracing::info!(
-                    public_url = %live.public_url,
-                    vault_key = %live.vault_keys.active_id(),
-                    "live connectors: every call acts with the PM's own token"
+                    org = %gh.org,
+                    content_repo = gh.content_repo.as_deref().unwrap_or("none"),
+                    "GitHub linking on"
                 );
-                (
-                    vec![
-                        Arc::new(Jira::new(
-                            tokens.clone(),
-                            live.endpoints.atlassian_api.clone(),
-                        )),
-                        Arc::new(Confluence::new(
-                            tokens.clone(),
-                            live.endpoints.atlassian_api.clone(),
-                        )),
-                        Arc::new(Slack::new(tokens, live.endpoints.slack.clone())),
-                        Arc::new(Docs::new(live.docs_url.clone(), live.docs_token.expose())),
-                    ],
-                    Some(oauth),
-                )
+                github_setup = Some(GitHubSetup {
+                    github,
+                    org: gh.org.clone(),
+                    content_repo: gh.content_repo.clone(),
+                    content_branch: gh.content_branch.clone(),
+                    content_dir: gh.content_dir.clone(),
+                    policies_dir: gh.policies_dir.clone(),
+                    content_root: config.content_root.clone(),
+                });
             }
-        };
+            (
+                vec![
+                    Arc::new(Jira::new(
+                        tokens.clone(),
+                        live.endpoints.atlassian_api.clone(),
+                    )),
+                    Arc::new(Confluence::new(
+                        tokens.clone(),
+                        live.endpoints.atlassian_api.clone(),
+                    )),
+                    Arc::new(Slack::new(tokens, live.endpoints.slack.clone())),
+                    Arc::new(Docs::new(live.docs_url.clone(), live.docs_token.expose())),
+                ],
+                Some(oauth),
+            )
+        }
+    };
 
     for skill in &config.bot_skills {
         if catalog.skill(skill).is_none() {
@@ -145,7 +186,17 @@ async fn main() -> Result<()> {
         Err(e) => tracing::error!(error = %e, "reconciling interrupted writes failed"),
     }
     spawn_reconciler(svc.clone(), cancel.clone());
-    let app = router(
+    let mut onboarding = Onboarding::new(svc.clone(), oauth.clone(), github_setup);
+    if config.content_sync_secs > 0 {
+        let sync = ContentSync::new(&config.content_root, svc.clone());
+        sync.clone().spawn(
+            Duration::from_secs(config.content_sync_secs),
+            cancel.clone(),
+        );
+        onboarding = onboarding.with_sync(sync);
+        tracing::info!(every_secs = config.content_sync_secs, "content sync on");
+    }
+    let app = router_with(
         svc,
         AppConfig {
             service_token: config.service_token.expose().to_string(),
@@ -157,6 +208,7 @@ async fn main() -> Result<()> {
             allowed_hosts: config.allowed_hosts.clone(),
             oauth,
         },
+        Some(Arc::new(onboarding)),
         cancel.clone(),
     );
     let listener = tokio::net::TcpListener::bind(config.bind)

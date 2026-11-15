@@ -91,6 +91,9 @@ pub const WORKER_BINARY: &str = "/usr/local/bin/node";
 /// Verify on the Spark: `/sandbox` is the sandbox's working directory with the Docker driver,
 /// and uploads into paths that Landlock makes read-only succeed at `sandbox create --upload`.
 pub const CONTENT_MOUNT: &str = "/sandbox";
+/// The tool registry, uploaded with the content: the worker reads it at start-up to tell a
+/// bot's read tools from its writes. It holds only tool names, systems and kinds.
+pub const TOOL_REGISTRY: &str = "tools.yaml";
 /// The bot's own writable workspace, and the working directory its worker runs in.
 pub const WORKSPACE: &str = "/sandbox/workspace";
 

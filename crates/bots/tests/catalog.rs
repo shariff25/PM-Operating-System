@@ -1,11 +1,17 @@
-//! Loading bots from the content repo through the lint: the seeded tree loads, and a tree
-//! with a lint error stops the runtime from starting.
+//! Loading bots from the content repo through the lint: the seeded tree loads, a tree with
+//! a lint error stops the runtime from starting, and a content change is picked up without a
+//! restart unless it fails the lint (onboarding spec §5).
+
+mod common;
 
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
-use pmos_bots::catalog::Catalog;
+use common::Env;
+use pmos_bots::catalog::{fingerprint, Catalog, Reload, Reloader};
 use pmos_contract::bots::{ActionSetting, BotScope};
+use pmos_contract::onboarding::{bot_path, render_personal_bot};
+use serde_json::{json, Value};
 
 fn content() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content")
@@ -89,4 +95,107 @@ fn a_tree_with_lint_errors_refuses_to_load() {
     let err = Catalog::load(dir.path(), today()).err().expect("refused");
     assert!(err.contains("lint errors"), "{err}");
     assert!(err.contains("bots/broken/BOT.md"), "{err}");
+}
+
+const TEAM: &str = "members:\n  - handle: ana\n    slack-id: U0ANA\n    email: ana@example.com\n    roles: [pm, admin]\n";
+
+fn names(bots: &Value) -> Vec<String> {
+    bots.as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_content_change_is_picked_up_and_a_bad_one_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir(&content(), dir.path());
+    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
+    let mut reloader = Reloader::new(dir.path());
+    let env = Env::memory_with(Catalog::load(dir.path(), today()).expect("loads")).await;
+    assert_eq!(reloader.check(&env.rt, today()).await, Reload::Unchanged);
+    let (status, bots) = env.get("/v1/bots", "slack", Some("ana")).await;
+    assert_eq!(status, 200);
+    assert_eq!(names(&bots), ["docs"]);
+
+    // A task claimed before the change keeps the bot it was claimed with.
+    let task = env.ask("What ports does DSM need?").await;
+    let (status, claim) = env.claim().await;
+    assert_eq!(status, 200, "{claim}");
+    assert_eq!(claim["bot"]["name"], "docs");
+
+    // The member approved in Slack: the tool server commits their bot, the checkout pulls.
+    // The docs bot goes in the same change.
+    let bot_md = dir.path().join(bot_path("pm-ana"));
+    std::fs::create_dir_all(bot_md.parent().unwrap()).unwrap();
+    std::fs::write(&bot_md, render_personal_bot("ana")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("bots/docs")).unwrap();
+    assert_eq!(
+        reloader.check(&env.rt, today()).await,
+        Reload::Reloaded { bots: 1 }
+    );
+    let (_, bots) = env.get("/v1/bots", "slack", Some("ana")).await;
+    assert_eq!(names(&bots), ["pm-ana"], "no restart needed");
+    let (status, t) = env
+        .post(
+            "/v1/tasks",
+            "slack",
+            Some("ana"),
+            json!({"bot": "pm-ana", "requested_by": "ana", "text": "Draft a PRD", "source": "slack"}),
+        )
+        .await;
+    assert_eq!(status, 201, "{t}");
+    // The docs task finishes although its bot is gone.
+    let tid = task["id"].as_str().unwrap();
+    let (status, done) = env
+        .post(
+            &format!("/v1/worker/tasks/{tid}/complete"),
+            "worker",
+            None,
+            json!({"result": "Port 443."}),
+        )
+        .await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["status"], "done");
+
+    // A change that fails the lint keeps the catalog that is loaded, and is reported once.
+    let broken = dir.path().join("bots/broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(
+        broken.join("BOT.md"),
+        "---\nname: broken\nrole: no-such-role\nscope: team\nowner: \"@ana\"\ndescription: x\n---\n\nx\n",
+    )
+    .unwrap();
+    match reloader.check(&env.rt, today()).await {
+        Reload::Kept(e) => assert!(e.contains("bots/broken/BOT.md"), "{e}"),
+        other => panic!("expected the old catalog kept, got {other:?}"),
+    }
+    let (_, bots) = env.get("/v1/bots", "slack", Some("ana")).await;
+    assert_eq!(names(&bots), ["pm-ana"]);
+    assert_eq!(reloader.check(&env.rt, today()).await, Reload::Unchanged);
+
+    // Fixing it loads again.
+    std::fs::remove_dir_all(&broken).unwrap();
+    assert_eq!(
+        reloader.check(&env.rt, today()).await,
+        Reload::Reloaded { bots: 1 }
+    );
+    env.finish().await;
+}
+
+#[test]
+fn the_fingerprint_follows_the_watched_files_only() {
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir(&content(), dir.path());
+    let before = fingerprint(dir.path());
+    assert_eq!(fingerprint(dir.path()), before);
+    std::fs::write(dir.path().join("README-extra.md"), "not watched").unwrap();
+    assert_eq!(
+        fingerprint(dir.path()),
+        before,
+        "only the catalog's files count"
+    );
+    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
+    assert_ne!(fingerprint(dir.path()), before);
 }

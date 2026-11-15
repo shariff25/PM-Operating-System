@@ -129,6 +129,7 @@ async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_o
         usage: usage.clone(),
         stub,
         workarounds_on,
+        anthropic_key: "test-key".into(),
     });
     let (base, stop) = serve(app).await;
     Gw { base, usage, stop }
@@ -549,4 +550,178 @@ fn the_repo_config_is_valid() {
     let models = Models::from_yaml(&text).unwrap();
     assert!(models.role("pmos/default").is_some());
     assert!(models.role("pmos/extraction").is_some());
+}
+
+/// What the mock Claude Messages API saw: headers and body of each request.
+#[derive(Default)]
+struct Claude {
+    seen: Mutex<Vec<(axum::http::HeaderMap, Value)>>,
+}
+
+async fn mock_messages(
+    State(c): State<Arc<Claude>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let refuse = body["system"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("REFUSE-ME");
+    c.seen.lock().unwrap().push((headers, body));
+    if refuse {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"type": "error", "error": {"type": "invalid_request_error", "message": "nope"}})),
+        )
+            .into_response();
+    }
+    Json(json!({
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": ""},
+            {"type": "text", "text": "Port 443."},
+            {"type": "tool_use", "id": "toolu_1", "name": "docs_search", "input": {"query": "ports"}}
+        ],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 12, "output_tokens": 4}
+    }))
+    .into_response()
+}
+
+#[tokio::test]
+async fn the_claude_test_upstream_needs_its_switch_and_translates_both_ways() {
+    let claude = Arc::new(Claude::default());
+    let (up, stop_up) = serve(
+        Router::new()
+            .route("/v1/messages", post(mock_messages))
+            .with_state(claude.clone()),
+    )
+    .await;
+    let yaml = format!(
+        "upstreams: {{claude: 'anthropic+{up}'}}\n\
+         roles:\n  default: {{upstream: claude, model: claude-opus-5-5, effort: medium}}\n"
+    );
+    // Off by default: the gateway refuses to start with it.
+    let err = Models::from_yaml(&yaml).unwrap_err();
+    assert!(err.contains("PMOS_GATEWAY_CLOUD_TEST=1"), "{err}");
+    // A non-local Claude upstream must be https.
+    let err = Models::parse(
+        "upstreams: {c: 'anthropic+http://api.example.com'}\nroles: {default: {upstream: c, model: m}}\n",
+        true,
+    )
+    .unwrap_err();
+    assert!(err.contains("https"), "{err}");
+    // Effort is only for the Claude upstream.
+    let err = Models::parse(
+        "upstreams: {q: 'http://127.0.0.1:1/v1'}\nroles: {default: {upstream: q, model: m, effort: low}}\n",
+        true,
+    )
+    .unwrap_err();
+    assert!(err.contains("only the Claude test upstream"), "{err}");
+
+    let models = Models::parse(&yaml, true).unwrap();
+    let usage = Arc::new(UsageLog::new(None).unwrap());
+    let (gw, stop_gw) = serve(router(GatewayConfig {
+        models,
+        clients: vec![Client {
+            name: "runtime".into(),
+            token: TOKEN.into(),
+        }],
+        usage: usage.clone(),
+        stub: false,
+        workarounds_on: true,
+        anthropic_key: "sk-test-placeholder".into(),
+    }))
+    .await;
+    let http = reqwest::Client::new();
+    let ask = json!({
+        "model": "pmos/default",
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": "You are the Docs bot."},
+            {"role": "user", "content": "What ports?"}
+        ],
+        "tools": [{"type": "function", "function": {"name": "docs_search", "parameters": {"type": "object", "properties": {}}}}]
+    });
+    let res = http
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth(TOKEN)
+        .header("X-Pmos-User", "ana")
+        .json(&ask)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let answer: Value = res.json().await.unwrap();
+    let choice = &answer["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls");
+    assert_eq!(choice["message"]["content"], "Port 443.");
+    assert_eq!(
+        choice["message"]["tool_calls"][0]["function"]["name"],
+        "docs_search"
+    );
+    assert_eq!(answer["usage"]["prompt_tokens"], 12);
+
+    {
+        let seen = claude.seen.lock().unwrap();
+        let (headers, body) = &seen[0];
+        assert_eq!(headers["x-api-key"], "sk-test-placeholder");
+        assert_eq!(headers["anthropic-version"], "2026-10-21");
+        assert_eq!(headers["anthropic-beta"], "server-side-fallback-2026-07-01");
+        assert!(
+            headers.get("authorization").is_none(),
+            "the client token never goes upstream"
+        );
+        assert_eq!(body["model"], "claude-opus-5-5");
+        assert_eq!(body["output_config"]["effort"], "medium");
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["system"], "You are the Docs bot.");
+    }
+
+    // A streamed request gets the answer as an event stream.
+    let mut streamed = ask.clone();
+    streamed["stream"] = json!(true);
+    let text = http
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth(TOKEN)
+        .json(&streamed)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains("Port 443.") && text.ends_with("data: [DONE]\n\n"),
+        "{text}"
+    );
+
+    // An error from the Messages API comes back with its message and status.
+    let mut bad = ask.clone();
+    bad["messages"][0]["content"] = json!("REFUSE-ME");
+    let res = http
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth(TOKEN)
+        .json(&bad)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["message"], "nope");
+
+    // No embeddings on the Claude upstream.
+    let res = http
+        .post(format!("{gw}/v1/embeddings"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"model": "pmos/default", "input": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    stop_gw.cancel();
+    stop_up.cancel();
 }

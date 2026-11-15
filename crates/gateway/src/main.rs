@@ -15,7 +15,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env().map_err(anyhow::Error::msg)?;
     let text = std::fs::read_to_string(&config.models_path)
         .with_context(|| format!("reading {}", config.models_path.display()))?;
-    let models = Models::from_yaml(&text).map_err(anyhow::Error::msg)?;
+    let models = Models::parse(&text, config.cloud_test).map_err(anyhow::Error::msg)?;
     let usage =
         Arc::new(UsageLog::new(config.usage_log.as_deref()).context("opening the usage log")?);
     if config.stub {
@@ -23,6 +23,21 @@ async fn main() -> Result<()> {
     }
     if !config.workarounds_on {
         tracing::warn!("PMOS_GATEWAY_WORKAROUNDS=off: every workaround is switched off");
+    }
+    if models
+        .roles
+        .values()
+        .any(|r| r.kind == pmos_gateway::config::UpstreamKind::ClaudeTest)
+    {
+        if config.anthropic_key.trim().is_empty() {
+            anyhow::bail!(
+                "a role uses the Claude test upstream; set PMOS_GATEWAY_ANTHROPIC_KEY to a Claude API key"
+            );
+        }
+        tracing::warn!(
+            "TESTING ONLY: a role uses the Claude test upstream, so its prompts leave this machine; \
+             use test data and test accounts only"
+        );
     }
     for role in models.roles.values() {
         tracing::info!(role = %role.alias(), model = %role.model, upstream = %role.upstream, "model role");
@@ -33,6 +48,7 @@ async fn main() -> Result<()> {
         usage,
         stub: config.stub,
         workarounds_on: config.workarounds_on,
+        anthropic_key: config.anthropic_key.clone(),
     });
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await

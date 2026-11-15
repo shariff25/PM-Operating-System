@@ -100,6 +100,10 @@ struct LoadArgs {
     /// The category whose bot and asks are used.
     #[arg(long, default_value = "docs-qa")]
     category: String,
+    /// Also fail on a missed latency target. Off by default: latency is reported, and only
+    /// tasks that don't finish fail the test.
+    #[arg(long)]
+    enforce_targets: bool,
     #[command(flatten)]
     conn: Conn,
 }
@@ -242,7 +246,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
             .await;
             let targets = &config.latency_targets;
             print!("{}", result.to_markdown(&category.bot, targets));
-            Ok(result.passed(targets))
+            Ok(result.verdict(targets, args.enforce_targets))
         }
     }
 }

@@ -39,7 +39,7 @@ pub const RULES: [(&str, &str); 23] = [
     (FS_WRITABLE, "Writable: the bot's workspace, /tmp and /dev/null (or paths inside them) only. No content is writable."),
     (FS_READABLE, "Readable: OpenShell's system paths, the role's skills and the bot's master context (or paths inside them) only. No `..`."),
     (FS_LANDLOCK, "`landlock.compatibility` is `hard_requirement`, so a sandbox never runs without its filesystem rules."),
-    (FS_UPLOADS, "The launch spec uploads only the role's skills and the bot's master context, each to a read-only path."),
+    (FS_UPLOADS, "The launch spec uploads only the role's skills, the bot's master context and the tool registry, each to a read-only path."),
     (CRED_BINDING, "The gateway and runtime endpoints bind exactly this bot's own provider (`pmos-<bot>-gateway`, `pmos-<bot>-worker`); the tool-server endpoint binds none; no credential rewriting, signing or uninspected credentials."),
     (CRED_PROVIDERS, "The launch spec attaches this bot's gateway and worker providers and nothing else."),
     (PROC_IDENTITY, "`run_as_user` and `run_as_group` are `sandbox` (or a numeric id of at least 1000); never root."),
@@ -732,7 +732,7 @@ pub fn check_spec(
             None => out.add(
                 FS_UPLOADS,
                 format!(
-                    "uploads `{}`, which is neither a skill of role `{}` nor the bot's master context",
+                    "uploads `{}`, which is not a skill of role `{}`, the bot's master context or the tool registry",
                     u.from, ctx.role
                 ),
             ),
@@ -1578,7 +1578,7 @@ mod tests {
                 .push(up("context/products", "/sandbox/context/products"))
         });
         assert_eq!(rules_of(&v), vec![FS_UPLOADS]);
-        assert!(v.iter().any(|x| x.message.contains("neither a skill")));
+        assert!(v.iter().any(|x| x.message.contains("is not a skill")));
         let v = spec_with(|s| s.uploads.push(up("skills/ask", "/sandbox/skills/ask")));
         assert_eq!(rules_of(&v), vec![FS_UPLOADS]);
         // The right content in a writable place is still refused.

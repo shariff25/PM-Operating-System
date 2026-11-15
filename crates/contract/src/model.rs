@@ -222,8 +222,25 @@ pub struct TemplateFrontMatter {
 pub enum Role {
     Pm,
     SkillAuthor,
-    /// Platform owner: runs the Spark, reviews sandbox policies.
+    /// Platform owner: runs the Spark, reviews sandbox policies, approves new members.
     Admin,
+}
+
+impl Role {
+    /// The name as written in `team.yaml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Pm => "pm",
+            Role::SkillAuthor => "skill-author",
+            Role::Admin => "admin",
+        }
+    }
+}
+
+impl TeamMember {
+    pub fn is_admin(&self) -> bool {
+        self.roles.contains(&Role::Admin)
+    }
 }
 
 /// One person who may use PM OS.
@@ -238,6 +255,10 @@ pub struct TeamMember {
     /// has this email, so a forwarded link can't attach someone else's account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    /// GitHub login in the Acme org. Optional: linking GitHub checks this login when it is
+    /// set, and otherwise a verified email on the GitHub account matching `email`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<String>,
     pub roles: Vec<Role>,
 }
 
@@ -257,6 +278,11 @@ impl TeamFile {
     /// The member with this Slack id.
     pub fn by_slack_id(&self, slack_id: &str) -> Option<&TeamMember> {
         self.members.iter().find(|m| m.slack_id == slack_id)
+    }
+
+    /// The platform owners: members with the `admin` role.
+    pub fn admins(&self) -> impl Iterator<Item = &TeamMember> {
+        self.members.iter().filter(|m| m.is_admin())
     }
 
     /// The member with this PM OS handle.
