@@ -184,8 +184,14 @@ impl ToolServer {
 
     /// `POST /internal/approvals/{id}/decision`. `decision` is `approve`, `edit` (with `args`)
     /// or `reject` (with an optional `reason`, one of [`crate::cards::REASONS`]; the tool
-    /// server takes a reason only with `reject`). Returns the item as decided; an approved
-    /// write has run by then.
+    /// server takes a reason only with `reject`). `confirm_external` is the second
+    /// confirmation for a Slack write to an externally shared channel
+    /// (`docs/slack-reply-spec.md` §3); it is sent only when `true`. Returns the item as
+    /// decided; an approved write has run by then.
+    ///
+    /// A refusal keeps its status, `code` and body: the reply card turns `audience_blocked`,
+    /// `needs_external_confirm` and `expired` (`409`) and `audience_unavailable` (`503`) into
+    /// their own sentences. Any other `5xx`, or no answer, is [`ApiError::Unavailable`].
     pub async fn decide(
         &self,
         id: &str,
@@ -193,9 +199,10 @@ impl ToolServer {
         decision: &str,
         args: Option<Value>,
         reason: Option<&str>,
-    ) -> Result<Value, CallError> {
+        confirm_external: bool,
+    ) -> Result<Value, ApiError> {
         if !approval_id_ok(id) {
-            return Err(CallError::Refused("not an approval id".into()));
+            return Err(refused_locally("not an approval id"));
         }
         let mut body = json!({"decided_by": decided_by, "decision": decision});
         if let Some(args) = args {
@@ -204,14 +211,37 @@ impl ToolServer {
         if let Some(reason) = reason {
             body["reason"] = json!(reason);
         }
-        Self::finish(
-            self.http
-                .post(format!("{}/internal/approvals/{id}/decision", self.base))
-                .bearer_auth(&self.token)
-                .timeout(Duration::from_secs(60))
-                .json(&body),
-        )
-        .await
+        if confirm_external {
+            body["confirm_external"] = json!(true);
+        }
+        let res = self
+            .http
+            .post(format!("{}/internal/approvals/{id}/decision", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(60))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "tool server unreachable");
+                ApiError::Unavailable
+            })?;
+        let status = res.status();
+        let json: Value = res.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            return Ok(json);
+        }
+        let code = json["code"].as_str().unwrap_or_default().to_string();
+        if status.is_server_error() && status.as_u16() != 502 && code.is_empty() {
+            tracing::warn!(%status, "tool server error");
+            return Err(ApiError::Unavailable);
+        }
+        Err(ApiError::Refused {
+            status: status.as_u16(),
+            code,
+            error: json["error"].as_str().unwrap_or("refused").to_string(),
+            body: json,
+        })
     }
 
     /// `GET /internal/ledger`: the feedback ledger's rows (labels and metadata, never message

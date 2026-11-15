@@ -501,6 +501,7 @@ impl Stack {
             default_tz: "UTC".into(),
             github_org: Some("acme".into()),
             response_url_prefix: format!("{slack_base}/hooks/"),
+            state_dir: team.path().join("state"),
         });
         let socket = Socket::new(
             slack_base.clone(),
