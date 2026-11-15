@@ -49,6 +49,19 @@ says "and N more; they appear as you clear these."
 and rejects; the footer says so: "To edit or snooze a draft, use its card in our DM."
 Rejecting from the Home records no reason; to say why, reject on the card.
 
+**What the Slack bot can see and change.** The bot is the approval screen, so the tool server
+limits what its token can do:
+- **A draft is read for the PM it belongs to.** Opening, editing or deciding a card reads the
+  draft as you (`GET /internal/approvals/{id}?user=<you>`); a card that isn't yours answers
+  "Only the PM this approval is for can decide it. Nothing was changed."
+- **An edit changes what a draft says, never where it goes.** The editor offers the text,
+  title, summary, description and body only, never the channel, thread, page, space,
+  project, issue type or epic. If the tool server still finds a changed target (`422`),
+  the card says so and keeps its buttons.
+- **The triage digest** reads the feedback ledger without approval ids: each row links to
+  its task by `run_id`.
+- **New members** are added as PMs. Admins are added by a pull request to `team.yaml`.
+
 ## Skills
 
 **What PM OS can do for you in Slack,** grouped by track:

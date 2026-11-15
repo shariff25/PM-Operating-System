@@ -189,8 +189,11 @@ impl Notifier {
                     .flatten()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
+                // The cards are read for the PM the task is for: the tool server shows the
+                // bot an item only for the member it belongs to.
+                let requester = item["requested_by"].as_str().unwrap_or_default();
                 for id in ids {
-                    let card = self.card(&id).await;
+                    let card = self.card(&id, requester).await;
                     self.say(&task_id, &bot, &username, card).await;
                 }
                 self.refresh_home(item);
@@ -288,10 +291,11 @@ impl Notifier {
         self.bots.update(&channel, &ts, message).await;
     }
 
-    /// The approval card for one item, retried briefly if the tool server is unavailable.
-    async fn card(&self, id: &str) -> (String, Value) {
+    /// The approval card for one item, read for `requested_by` (the task's PM), retried
+    /// briefly if the tool server is unavailable.
+    async fn card(&self, id: &str, requested_by: &str) -> (String, Value) {
         for attempt in 0..3 {
-            match self.bots.toolserver().approval(id).await {
+            match self.bots.toolserver().approval(id, requested_by).await {
                 Ok(item) if item["status"] == "pending" => return cards::approval_card(&item),
                 Ok(item) => {
                     let line = cards::decision_line(&item, "", false);

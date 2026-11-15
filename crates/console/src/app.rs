@@ -81,8 +81,36 @@ pub fn router(config: Config) -> Router {
                 "There's no such page.",
             )
         })
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            through_the_proxy,
+        ))
         .layer(axum::middleware::map_response(security_headers))
         .with_state(state)
+}
+
+/// With `PMOS_CONSOLE_TRUST_PROXY=1`, every request but the container's health check must
+/// carry the sign-in proxy's `X-Pmos-Proxy-Secret`, or it is refused with `401` before any
+/// handler (or `X-Forwarded-User`) is looked at.
+async fn through_the_proxy(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if req.uri().path() == "/healthz" || auth::from_proxy(&state.0.identity, req.headers()) {
+        return next.run(req).await;
+    }
+    tracing::warn!(path = %req.uri().path(), "refused: no valid X-Pmos-Proxy-Secret");
+    not_from_proxy()
+}
+
+fn not_from_proxy() -> Response {
+    message(
+        StatusCode::UNAUTHORIZED,
+        None,
+        "Not signed in",
+        "Open the console through the PM OS sign-in.",
+    )
 }
 
 /// Every response: no caching, no framing, no sniffing, and the page policy.
@@ -170,6 +198,7 @@ impl FromRequestParts<AppState> for Signed {
         })?;
         match auth::viewer(&state.0.identity, &parts.headers, &team) {
             Ok(viewer) => Ok(Self { viewer, team }),
+            Err(AuthError::NotFromProxy) => Err(not_from_proxy()),
             Err(AuthError::NoUser) => Err(message(
                 StatusCode::UNAUTHORIZED,
                 None,

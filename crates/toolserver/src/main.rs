@@ -207,6 +207,10 @@ async fn main() -> Result<()> {
                 token: token.expose().to_string(),
                 skills: config.bot_skills.clone(),
             }),
+            console_token: config
+                .console_token
+                .as_ref()
+                .map(|t| t.expose().to_string()),
             content_root: config.content_root.clone(),
             allowed_hosts: config.allowed_hosts.clone(),
             oauth,

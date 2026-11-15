@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
     let mut loops = rt.spawn_loops();
     loops.push(reloader.spawn(rt.clone(), RELOAD_EVERY));
 
-    let app = router(rt, config.clients.clone());
+    let app = router(rt, config.clients.clone(), config.evals_as.clone());
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;

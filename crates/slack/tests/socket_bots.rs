@@ -259,17 +259,34 @@ struct MockTools {
     items: Mutex<HashMap<String, Value>>,
     /// `POST /internal/approvals/{id}/decision`: (when, id, body).
     decisions: Mutex<Vec<(Instant, String, Value)>>,
+    /// `GET /internal/approvals/{id}`: (id, the `user` it named).
+    reads: Mutex<Vec<(String, Option<String>)>>,
+    /// Refuse the next edit with `422`, as for one that changed a target.
+    refuse_next_edit: Mutex<bool>,
 }
 
 type Ts = State<Arc<MockTools>>;
 
-async fn ts_get(State(ts): Ts, Path(id): Path<String>, headers: HeaderMap) -> Response {
+/// `GET /internal/approvals/{id}?user=`: as the tool server answers the bot's token, `404`
+/// unless the item is `user`'s (S2).
+async fn ts_get(
+    State(ts): Ts,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
     if bearer(&headers) != TOOL_BOT_TOKEN {
         return refuse(StatusCode::UNAUTHORIZED, "bad token");
     }
+    ts.reads
+        .lock()
+        .unwrap()
+        .push((id.clone(), q.get("user").cloned()));
     match ts.items.lock().unwrap().get(&id) {
-        Some(item) => Json(item.clone()).into_response(),
-        None => refuse(StatusCode::NOT_FOUND, "no such approval item"),
+        Some(item) if q.get("user").is_some_and(|u| item["user"] == u.as_str()) => {
+            Json(item.clone()).into_response()
+        }
+        _ => refuse(StatusCode::NOT_FOUND, "no such approval item"),
     }
 }
 
@@ -307,6 +324,22 @@ async fn ts_decide(
             StatusCode::UNPROCESSABLE_ENTITY,
             "a reason goes only with reject",
         );
+    }
+    // An edit from the bot may not change where the draft goes (S2).
+    let forced =
+        body["decision"] == "edit" && std::mem::take(&mut *ts.refuse_next_edit.lock().unwrap());
+    if forced
+        || body["decision"] == "edit"
+            && pmos_slack::cards::TARGETS
+                .iter()
+                .any(|t| body["args"][*t] != item["args"][*t])
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "an edit can't change where the draft goes",
+                        "code": "target_changed"})),
+        )
+            .into_response();
     }
     item["decided_by"] = body["decided_by"].clone();
     match body["decision"].as_str() {
@@ -858,7 +891,16 @@ async fn approval_cards_are_decided_by_their_own_pm() {
     assert!(ack.get("payload").is_none());
     let notes = stack.calls("chat.postEphemeral", 1).await;
     assert_eq!(notes[0].body["user"], "U0BOB");
-    assert!(text_of(&notes[0]).contains("Only Ana can decide this one"));
+    assert!(text_of(&notes[0]).contains("Only the PM this approval is for can decide it"));
+    {
+        // Every read names the PM it is for: the notifier read the cards for Ana (the task's
+        // `requested_by`), and Bob's click read the item for Bob, which the tool server
+        // doesn't find.
+        let reads = stack.tools.reads.lock().unwrap().clone();
+        assert!(reads.iter().all(|(_, u)| u.is_some()), "{reads:?}");
+        assert!(reads.contains(&("apr_a1".into(), Some("ana".into()))));
+        assert!(reads.contains(&("apr_a1".into(), Some("bob".into()))));
+    }
     // Someone outside the team: the same.
     stack
         .send(click(
@@ -960,6 +1002,8 @@ async fn approval_cards_are_decided_by_their_own_pm() {
                     "state": {"values": {
                         "field:title": {"value": {"type": "plain_text_input", "value": title}},
                         "field:body": {"value": {"type": "plain_text_input", "value": "Better body"}},
+                        // A forged field for where the draft goes: never sent.
+                        "field:space": {"value": {"type": "plain_text_input", "value": "OTHER"}},
                     }},
                 },
             },
@@ -969,6 +1013,18 @@ async fn approval_cards_are_decided_by_their_own_pm() {
     let ack = stack.send(submit("v1", " ")).await;
     assert_eq!(ack["payload"]["response_action"], "errors");
     assert!(ack["payload"]["errors"]["field:title"].is_string());
+    // The tool server refuses an edit that changes a target (422): the card says so plainly
+    // and keeps its buttons.
+    *stack.tools.refuse_next_edit.lock().unwrap() = true;
+    stack.send(submit("v1b", "Better title")).await;
+    until("the refused edit", || {
+        stack.slack.calls("chat.update").into_iter().find(|u| {
+            u.body["ts"] == t2.as_str()
+                && text_of(u).contains("not where it goes")
+                && text_of(u).contains("apr_approve")
+        })
+    })
+    .await;
     // The edit is approved with the edited arguments; the rest are kept.
     let ack = stack.send(submit("v2", "Better title")).await;
     assert!(ack.get("payload").is_none(), "the modal closes");
@@ -997,6 +1053,10 @@ async fn approval_cards_are_decided_by_their_own_pm() {
             (
                 "apr_a3".into(),
                 json!({"decided_by": "ana", "decision": "reject", "reason": "incomplete"})
+            ),
+            (
+                "apr_a2".into(),
+                json!({"decided_by": "ana", "decision": "edit", "args": {"space": "PM", "title": "Better title", "body": "Better body"}})
             ),
             (
                 "apr_a2".into(),
@@ -1108,7 +1168,7 @@ async fn reject_asks_why_and_back_restores_the_card() {
         .await;
     let notes = stack.calls("chat.postEphemeral", 1).await;
     assert_eq!(notes[0].body["user"], "U0BOB");
-    assert!(text_of(&notes[0]).contains("Only Ana can decide this one"));
+    assert!(text_of(&notes[0]).contains("Only the PM this approval is for can decide it"));
     stack
         .send(click("r5", "U0BOB", "apr_back", "apr_r1", "D0ANA", ts))
         .await;

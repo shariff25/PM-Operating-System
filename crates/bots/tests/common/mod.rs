@@ -45,6 +45,12 @@ pub fn clients() -> Vec<Client> {
     .unwrap()
 }
 
+/// `PMOS_EVALS_AS` for the runtime under test: ben is the benchmark member here (a team member
+/// in the fixed catalog), so eval tasks run as him and as nobody else.
+pub fn evals_as() -> Vec<String> {
+    vec!["ben".into()]
+}
+
 /// A whole-second time, so both stores keep it exactly.
 pub fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
@@ -407,7 +413,7 @@ impl Env {
             Gateway::new(&format!("{gw_base}/v1"), GATEWAY),
             stop.child_token(),
         ));
-        let base = serve(router(rt.clone(), clients()), &stop).await;
+        let base = serve(router(rt.clone(), clients(), evals_as()), &stop).await;
         Self {
             base,
             rt,
