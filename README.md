@@ -29,9 +29,19 @@ Slack without the PM's approval.
 | `policies/` | Generated sandbox policies, provider profiles and the red-team kit | YAML |
 | `evals/` | Benchmark categories, tasks and weekly reports | YAML, Markdown |
 | `harness/` | The agent on LangChain Deep Agents, and the worker that runs it in each bot's sandbox ([docs](harness/README.md)) | TypeScript |
+| `deploy/` | Running PM OS on the Spark: one Compose stack, images, `setup.sh` and `pmos-admin` ([runbooks](docs/runbooks/README.md)) | Docker, Bash |
 
 Phase 0 is built. What's left needs the DGX Spark: vLLM serving the models, OpenShell, the
 Slack app, and the first live runs (see the plan's **Status**).
+
+## Run it on the Spark
+
+```sh
+deploy/setup.sh --content /srv/pmos/content-repo --clone <content repo>
+deploy/pmos-admin build && deploy/pmos-admin up && deploy/pmos-admin status
+```
+
+The full install, up to Gate 1, and day-2 operations are in [docs/runbooks](docs/runbooks/README.md).
 
 ## Develop
 
