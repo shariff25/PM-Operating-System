@@ -6,7 +6,8 @@
 //!   local server. A concrete model name is refused, so callers never depend on one.
 //! - `GET /v1/models`: the role aliases.
 //! - `GET /v1/pmos/workarounds`: the workaround registry and which roles use what (D11).
-//! - `GET /healthz` (process up), `GET /readyz` (every model server answers).
+//! - `GET /healthz` (process up), `GET /readyz` (every model server answers; `cloud_test` says
+//!   whether a testing-only upstream, whose prompts leave this machine, is on).
 //!
 //! Every `/v1` call needs a client token. `X-Pmos-User` (a handle), `X-Pmos-Priority`
 //! (`interactive`, `scheduled` or `personal`) and `X-Pmos-Run` place it in the queue and the
@@ -28,6 +29,7 @@ use serde_json::{json, Value};
 
 use crate::anthropic;
 use crate::config::{Client, Models, Role, UpstreamKind};
+use crate::remote::{StreamScanner, ToolCallExtras};
 use crate::scheduler::{Permit, Priority, Scheduler};
 use crate::usage::{UsageEvent, UsageLog};
 use crate::{stub, workarounds};
@@ -43,6 +45,8 @@ pub struct GatewayConfig {
     pub workarounds_on: bool,
     /// The Claude API key for testing-only Claude roles (`anthropic.rs`); unused otherwise.
     pub anthropic_key: String,
+    /// The bearer key for testing-only remote OpenAI-compatible roles; unused otherwise.
+    pub remote_key: String,
 }
 
 struct Inner {
@@ -56,6 +60,9 @@ struct Inner {
     stub: bool,
     workarounds_on: bool,
     anthropic_key: String,
+    remote_key: String,
+    /// Remote test upstreams only: tool-call `extra_content` to give back (`remote.rs`).
+    extras: Arc<ToolCallExtras>,
 }
 
 #[derive(Clone)]
@@ -81,6 +88,8 @@ impl Endpoint {
 
 pub fn router(cfg: GatewayConfig) -> Router {
     let sched = Scheduler::new(cfg.models.limits);
+    // Both clients use the system proxy (`HTTPS_PROXY`, `NO_PROXY`) and trust store, so a
+    // remote test upstream works from behind a proxy.
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         // A long generation streams for minutes; a server that goes silent this long is stuck.
@@ -102,6 +111,8 @@ pub fn router(cfg: GatewayConfig) -> Router {
         stub: cfg.stub,
         workarounds_on: cfg.workarounds_on,
         anthropic_key: cfg.anthropic_key,
+        remote_key: cfg.remote_key,
+        extras: Arc::default(),
     }));
     let v1 = Router::new()
         .route("/models", get(models))
@@ -196,12 +207,33 @@ async fn readyz(State(state): State<AppState>) -> Response {
         .collect();
     upstreams.sort();
     upstreams.dedup();
+    let cloud_test = state
+        .0
+        .models
+        .roles
+        .values()
+        .any(|r| r.kind.is_cloud_test());
     let mut checks = serde_json::Map::new();
     let mut ok = true;
     for base in upstreams {
+        let remote = state
+            .0
+            .models
+            .roles
+            .values()
+            .any(|r| r.upstream == base && r.kind == UpstreamKind::RemoteOpenAi);
+        let probe = if remote {
+            state
+                .0
+                .http
+                .get(format!("{base}/models"))
+                .bearer_auth(&state.0.remote_key)
+        } else {
+            state.0.http.get(format!("{base}/models"))
+        };
         let up = tokio::time::timeout(
-            Duration::from_secs(2),
-            state.0.http.get(format!("{base}/models")).send(),
+            Duration::from_secs(if remote { 5 } else { 2 }),
+            probe.send(),
         )
         .await
         .is_ok_and(|r| r.is_ok_and(|r| r.status().is_success()));
@@ -215,7 +247,10 @@ async fn readyz(State(state): State<AppState>) -> Response {
     };
     (
         status,
-        Json(json!({"ready": ok, "upstreams": checks, "running": running, "waiting": waiting})),
+        Json(
+            json!({"ready": ok, "upstreams": checks, "cloud_test": cloud_test,
+                    "running": running, "waiting": waiting}),
+        ),
     )
         .into_response()
 }
@@ -392,7 +427,18 @@ async fn forward(
     }
 
     let url = format!("{}/{}", role.upstream, endpoint.path());
-    let res = match inner.http.post(&url).json(&req).send().await {
+    let remote = role.kind == UpstreamKind::RemoteOpenAi;
+    let upstream_req = if remote {
+        let restored = inner.extras.restore(&role.upstream, &mut req);
+        if restored > 0 {
+            tracing::debug!(role = %role.alias(), restored, "restored tool-call extra_content");
+        }
+        // The client's own gateway token never goes upstream; the remote key does.
+        inner.http.post(&url).bearer_auth(&inner.remote_key)
+    } else {
+        inner.http.post(&url)
+    };
+    let res = match upstream_req.json(&req).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(upstream = %role.upstream, error = %e, "model server unreachable");
@@ -416,8 +462,13 @@ async fn forward(
             started,
             _permit: permit,
         };
+        // Remote test upstreams: remember tool-call extra_content as it passes (`remote.rs`).
+        let mut scanner = remote.then(|| StreamScanner::new(inner.extras.clone(), &role.upstream));
         let body = res.bytes_stream().map(move |chunk| {
             let _hold = &end;
+            if let (Some(s), Ok(bytes)) = (&mut scanner, &chunk) {
+                s.feed(bytes);
+            }
             chunk.map_err(std::io::Error::other)
         });
         return finish(
@@ -471,6 +522,9 @@ async fn forward(
             );
         }
     };
+    if remote && endpoint == Endpoint::Chat {
+        inner.extras.remember_answer(&role.upstream, &answer);
+    }
     if endpoint == Endpoint::Chat {
         event.workarounds =
             workarounds::apply(&role.workarounds, inner.workarounds_on, &mut answer);

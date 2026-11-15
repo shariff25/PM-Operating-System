@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use pmos_gateway::config::{Config, Models};
+use pmos_gateway::config::{Config, Models, UpstreamKind};
 use pmos_gateway::usage::UsageLog;
 use pmos_gateway::{router, GatewayConfig};
 use tracing_subscriber::EnvFilter;
@@ -24,19 +24,27 @@ async fn main() -> Result<()> {
     if !config.workarounds_on {
         tracing::warn!("PMOS_GATEWAY_WORKAROUNDS=off: every workaround is switched off");
     }
+    config.check_keys(&models).map_err(anyhow::Error::msg)?;
     if models
         .roles
         .values()
-        .any(|r| r.kind == pmos_gateway::config::UpstreamKind::ClaudeTest)
+        .any(|r| r.kind == UpstreamKind::ClaudeTest)
     {
-        if config.anthropic_key.trim().is_empty() {
-            anyhow::bail!(
-                "a role uses the Claude test upstream; set PMOS_GATEWAY_ANTHROPIC_KEY to a Claude API key"
-            );
-        }
         tracing::warn!(
             "TESTING ONLY: a role uses the Claude test upstream, so its prompts leave this machine; \
              use test data and test accounts only"
+        );
+    }
+    for role in models
+        .roles
+        .values()
+        .filter(|r| r.kind == UpstreamKind::RemoteOpenAi)
+    {
+        tracing::warn!(
+            role = %role.alias(),
+            upstream = %role.upstream_host(),
+            "TESTING ONLY: a remote test upstream is on (an OpenAI-compatible API on the internet), \
+             so this role's prompts leave this machine; use test data and test accounts only"
         );
     }
     for role in models.roles.values() {
@@ -49,6 +57,7 @@ async fn main() -> Result<()> {
         stub: config.stub,
         workarounds_on: config.workarounds_on,
         anthropic_key: config.anthropic_key.clone(),
+        remote_key: config.remote_key.clone(),
     });
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await

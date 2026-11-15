@@ -75,7 +75,7 @@ One event per call:
 - priority, stream or not, status;
 - queue and total time, token counts, workarounds applied.
 
-It never holds prompts or answers. Events go to the service log, and with `PMOS_GATEWAY_USAGE_LOG` also to a JSON-lines file for shipping off-box. Because every upstream must be local, "restricted data sent off the Spark" is zero by construction; the upstream host on each event lets anyone check.
+It never holds prompts or answers. Events go to the service log, and with `PMOS_GATEWAY_USAGE_LOG` also to a JSON-lines file for shipping off-box. Because every upstream must be local outside testing, "restricted data sent off the Spark" is zero by construction; the upstream host on each event lets anyone check (a testing-only upstream shows its remote host).
 
 ## Configuration
 | Variable | Default | Notes |
@@ -86,8 +86,16 @@ It never holds prompts or answers. Events go to the service log, and with `PMOS_
 | `PMOS_GATEWAY_USAGE_LOG` | none | JSON-lines usage file |
 | `PMOS_GATEWAY_STUB` | off | `1` answers with a deterministic stub model and no model server, for CI and development |
 | `PMOS_GATEWAY_WORKAROUNDS` | `on` | `off` for the benchmark run |
-| `PMOS_GATEWAY_CLOUD_TEST` | off | **Testing only.** `1` accepts the Claude test upstream (below) |
+| `PMOS_GATEWAY_CLOUD_TEST` | off | **Testing only.** `1` accepts the Claude test upstream and remote test upstreams (below) |
 | `PMOS_GATEWAY_ANTHROPIC_KEY` | none | **Testing only.** The Claude API key for the Claude test upstream |
+| `PMOS_GATEWAY_REMOTE_KEY` | none | **Testing only.** The API key for remote test upstreams (`openai+https://…`), sent as `Authorization: Bearer`. Never logged. |
+
+**Upstream forms:**
+- `http://<local host>/<base>`: an OpenAI-compatible local model server (vLLM). The only form
+  outside testing.
+- `anthropic+https://api.anthropic.com`: the Claude test upstream (testing only, below).
+- `openai+https://<host>/<base path>`: a remote test upstream, any OpenAI-compatible API on the
+  internet (testing only, below).
 
 **Allowed upstream hosts:**
 - loopback and private addresses;
@@ -114,6 +122,27 @@ Anything else stops the gateway at start-up.
 - **Limits:** no embeddings.
 - **Per-role setting:** `effort:` (low to max) sets `output_config.effort`.
 - **Example config:** `config/gateway.claude-test.yaml`. How to run a full test stack with it is in
+  [testing-with-claude.md](testing-with-claude.md).
+
+**Remote test upstreams (testing only):**
+- **What it is:** an upstream written `openai+https://<host>/<base path>`, such as
+  `openai+https://generativelanguage.googleapis.com/v1beta/openai`, sends a role's calls to
+  that OpenAI-compatible API, so PM OS can be tried with another provider's model.
+- **When the gateway accepts it:** only with `PMOS_GATEWAY_CLOUD_TEST=1`, only over `https`,
+  and only with `PMOS_GATEWAY_REMOTE_KEY` set; otherwise it refuses to start. At start-up it
+  logs a warning per role that a remote test upstream is on and prompts leave the machine, and
+  `GET /readyz` reports `"cloud_test": true`.
+- **What changes for callers:** nothing. Requests are forwarded in the OpenAI format, without
+  translation, to `<base path>/chat/completions` (and `/embeddings`), streaming included,
+  through the same queue, per-user limits and usage log. The key goes as
+  `Authorization: Bearer`; the caller's gateway token never goes upstream.
+- **Compatibility:** every field the harness sends is forwarded; none had to be removed. One
+  thing is added back: such an API may attach `extra_content` to the tool calls it returns
+  (Gemini's thought signature) and refuse a later request whose history lacks it, which the
+  harness's client drops. The gateway remembers it per tool-call id and puts it back
+  (`crates/gateway/src/remote.rs`). Local upstreams never get this.
+- **Per-role setting:** none beyond `model` and `workarounds` (`effort` is Claude only).
+- **How to run a full test stack with it:** "Another provider" in
   [testing-with-claude.md](testing-with-claude.md).
 
 **Shutdown:** SIGTERM finishes in-flight calls before exiting.

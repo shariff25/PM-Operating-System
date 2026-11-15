@@ -91,6 +91,18 @@ pub enum UpstreamKind {
     /// **Testing only:** the Claude Messages API, written `anthropic+https://…` and allowed
     /// only with `PMOS_GATEWAY_CLOUD_TEST=1` (`anthropic.rs`).
     ClaudeTest,
+    /// **Testing only:** an OpenAI-compatible API on the public internet, written
+    /// `openai+https://<host>/<base path>` and allowed only with `PMOS_GATEWAY_CLOUD_TEST=1`.
+    /// Requests are forwarded as they are (no translation), with `PMOS_GATEWAY_REMOTE_KEY` as
+    /// the bearer token and the fields in `app::REMOTE_DROPPED_FIELDS` removed.
+    RemoteOpenAi,
+}
+
+impl UpstreamKind {
+    /// A testing-only upstream: prompts sent to it leave this machine.
+    pub fn is_cloud_test(self) -> bool {
+        matches!(self, Self::ClaudeTest | Self::RemoteOpenAi)
+    }
 }
 
 impl Role {
@@ -119,8 +131,9 @@ impl Models {
         Self::parse(text, false)
     }
 
-    /// The config, also accepting `anthropic+https://` (Claude) upstreams when `cloud_test`
-    /// is set. Testing only: prompts to those leave the machine.
+    /// The config, also accepting `anthropic+https://` (Claude) and `openai+https://` (a
+    /// remote OpenAI-compatible API) upstreams when `cloud_test` is set. Testing only:
+    /// prompts to those leave the machine.
     pub fn parse(text: &str, cloud_test: bool) -> Result<Self, String> {
         let file: ModelsFile =
             serde_norway::from_str(text).map_err(|e| format!("gateway config: {e}"))?;
@@ -147,9 +160,12 @@ impl Models {
                     spec.upstream
                 )
             })?;
-            let (kind, base) = match base.strip_prefix("anthropic+") {
-                Some(rest) => (UpstreamKind::ClaudeTest, rest),
-                None => (UpstreamKind::OpenAi, base.as_str()),
+            let (kind, base) = if let Some(rest) = base.strip_prefix("anthropic+") {
+                (UpstreamKind::ClaudeTest, rest)
+            } else if let Some(rest) = base.strip_prefix("openai+") {
+                (UpstreamKind::RemoteOpenAi, rest)
+            } else {
+                (UpstreamKind::OpenAi, base.as_str())
             };
             let url = reqwest::Url::parse(base)
                 .map_err(|e| format!("gateway config: upstream `{}`: {e}", spec.upstream))?;
@@ -160,14 +176,23 @@ impl Models {
                 ));
             }
             let host = url.host_str().unwrap_or_default();
-            if kind == UpstreamKind::ClaudeTest {
+            if kind.is_cloud_test() {
                 if !cloud_test {
-                    return Err(format!(
-                        "gateway config: upstream `{}` is the Claude test upstream; it needs \
-                         PMOS_GATEWAY_CLOUD_TEST=1 (testing only: prompts leave this machine)",
-                        spec.upstream
-                    ));
+                    return Err(match kind {
+                        UpstreamKind::ClaudeTest => format!(
+                            "gateway config: upstream `{}` is the Claude test upstream; it needs \
+                             PMOS_GATEWAY_CLOUD_TEST=1 (testing only: prompts leave this machine)",
+                            spec.upstream
+                        ),
+                        _ => format!(
+                            "gateway config: upstream `{}` is a remote test upstream (an \
+                             OpenAI-compatible API on the internet), so prompts would leave this \
+                             machine; it is for testing only and needs PMOS_GATEWAY_CLOUD_TEST=1",
+                            spec.upstream
+                        ),
+                    });
                 }
+                // Plain http only to a local mock (the tests); a real remote API is https.
                 if url.scheme() != "https" && !is_local_host(host, &file.local_hosts) {
                     return Err(format!(
                         "gateway config: upstream `{}` must use https",
@@ -281,7 +306,7 @@ impl std::fmt::Debug for Client {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// `PMOS_GATEWAY_BIND`, default `127.0.0.1:8740`.
     pub bind: SocketAddr,
@@ -302,6 +327,26 @@ pub struct Config {
     /// `PMOS_GATEWAY_ANTHROPIC_KEY`: the Claude API key for the test upstream. Required when
     /// a role uses it; empty otherwise.
     pub anthropic_key: String,
+    /// `PMOS_GATEWAY_REMOTE_KEY`: the bearer key for remote OpenAI-compatible test upstreams
+    /// (`openai+https://…`). Required when a role uses one; empty otherwise.
+    pub remote_key: String,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |k: &str| if k.is_empty() { "" } else { "<redacted>" };
+        f.debug_struct("Config")
+            .field("bind", &self.bind)
+            .field("models_path", &self.models_path)
+            .field("clients", &self.clients)
+            .field("usage_log", &self.usage_log)
+            .field("stub", &self.stub)
+            .field("workarounds_on", &self.workarounds_on)
+            .field("cloud_test", &self.cloud_test)
+            .field("anthropic_key", &redacted(&self.anthropic_key))
+            .field("remote_key", &redacted(&self.remote_key))
+            .finish()
+    }
 }
 
 impl Config {
@@ -338,7 +383,27 @@ impl Config {
             workarounds_on,
             cloud_test: get("PMOS_GATEWAY_CLOUD_TEST").as_deref() == Some("1"),
             anthropic_key: get("PMOS_GATEWAY_ANTHROPIC_KEY").unwrap_or_default(),
+            remote_key: get("PMOS_GATEWAY_REMOTE_KEY").unwrap_or_default(),
         })
+    }
+
+    /// Refuses to start when a role uses a testing-only upstream whose key is missing.
+    pub fn check_keys(&self, models: &Models) -> Result<(), String> {
+        let uses = |kind| models.roles.values().any(|r| r.kind == kind);
+        if uses(UpstreamKind::ClaudeTest) && self.anthropic_key.trim().is_empty() {
+            return Err(
+                "a role uses the Claude test upstream; set PMOS_GATEWAY_ANTHROPIC_KEY to a Claude API key"
+                    .into(),
+            );
+        }
+        if uses(UpstreamKind::RemoteOpenAi) && self.remote_key.trim().is_empty() {
+            return Err(
+                "a role uses a remote test upstream (openai+https://…); set PMOS_GATEWAY_REMOTE_KEY \
+                 to that API's key"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 }
 
