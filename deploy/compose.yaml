@@ -87,6 +87,7 @@ services:
       PMOS_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
       PMOS_DOCS_URL: http://docs.pmos.internal:8730/mcp
       PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN}
+      PMOS_LEDGER_EXPIRE_DAYS: ${PMOS_LEDGER_EXPIRE_DAYS:-7}
     volumes:
       # The content checkout: the tool server pulls it (content sync), the others read it.
       - ${PMOS_CONTENT_CHECKOUT:?}:/srv/content-repo
@@ -160,6 +161,10 @@ services:
       PMOS_SLACK_STATE_DIR: /var/lib/pmos/slack
       PMOS_DEFAULT_TZ: ${PMOS_DEFAULT_TZ:-America/Los_Angeles}
       PMOS_GITHUB_ORG: ${PMOS_GITHUB_ORG:-}
+      # The daily triage digest to each bot's quality owner (docs/runbooks/quality.md).
+      PMOS_TRIAGE_AT: ${PMOS_TRIAGE_AT:-09:00}
+      PMOS_TRIAGE_MIN_EDIT: ${PMOS_TRIAGE_MIN_EDIT:-0.3}
+      PMOS_CONSOLE_PUBLIC_URL: ${PMOS_CONSOLE_PUBLIC_URL:-}
     volumes:
       - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
       - ${PMOS_STATE_DIR}/slack:/var/lib/pmos/slack
