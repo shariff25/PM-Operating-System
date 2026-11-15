@@ -7,7 +7,10 @@
 //!    Slack refreshes connections every few hours, so this is normal.
 //!
 //! The acknowledgement goes first; slow work (a `/docs` search, a DM becoming a task, an
-//! approval being decided) runs in a follow-up after it.
+//! approval being decided) runs in a follow-up after it. An interaction whose answer has to
+//! be in the ack (the memory-repo modal's field errors) is worked on beside the loop, and its
+//! ack is sent when ready, at most [`LATE_ACK_WITHIN`] after it arrived; other envelopes are
+//! acknowledged meanwhile.
 //!
 //! A connection can die silently (a NAT or firewall drops it). The bot pings every
 //! `ping_every` and reconnects if nothing at all arrives for `read_deadline`.
@@ -17,12 +20,17 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use crate::bots::Bots;
 use crate::commands::{Commands, FollowUp};
+
+/// The longest a late ack waits before it is sent without an answer (Slack wants every ack
+/// within 3 seconds).
+pub const LATE_ACK_WITHIN: Duration = Duration::from_millis(2500);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SocketError {
@@ -135,18 +143,27 @@ impl Socket {
     /// `shutdown` fires.
     pub async fn run_once(&self, shutdown: &CancellationToken) -> Result<Ended, SocketError> {
         let url = self.open().await?;
-        let (ws, _) = tokio_tungstenite::connect_async(url.as_str())
+        let proxy = crate::proxy::proxy_for(&url, |k| std::env::var(k).ok());
+        let ws = crate::proxy::connect(&url, proxy.as_ref())
             .await
-            .map_err(|e| SocketError::Ws(e.to_string()))?;
+            .map_err(SocketError::Ws)?;
         let (mut tx, mut rx) = ws.split();
         let mut ping = tokio::time::interval(self.ping_every);
         ping.tick().await;
         let mut last_heard = tokio::time::Instant::now();
+        // Acks that waited for an answer, sent on this connection when ready.
+        let (late_tx, mut late_rx) = mpsc::unbounded_channel::<Value>();
         loop {
             let msg = tokio::select! {
                 _ = shutdown.cancelled() => {
                     let _ = tx.send(Message::Close(None)).await;
                     return Ok(Ended::Shutdown);
+                }
+                Some(ack) = late_rx.recv() => {
+                    tx.send(Message::Text(ack.to_string().into()))
+                        .await
+                        .map_err(|e| SocketError::Ws(e.to_string()))?;
+                    continue;
                 }
                 _ = ping.tick() => {
                     tx.send(Message::Ping(Default::default()))
@@ -199,6 +216,32 @@ impl Socket {
                 continue;
             };
             let payload = &envelope["payload"];
+            if envelope["type"] == "interactive" {
+                if let Some(late) = self.bots.as_ref().and_then(|b| b.late_ack(payload)) {
+                    let late_tx = late_tx.clone();
+                    let envelope_id = envelope_id.to_string();
+                    self.spawn_follow_up(Box::pin(async move {
+                        let (reply, work) = tokio::time::timeout(LATE_ACK_WITHIN, late)
+                            .await
+                            .unwrap_or_else(|_| {
+                                tracing::warn!(
+                                    "an answer for an ack took too long; acking without it"
+                                );
+                                (None, None)
+                            });
+                        let mut ack = json!({"envelope_id": envelope_id});
+                        if let Some(reply) = reply {
+                            ack["payload"] = reply;
+                        }
+                        // The connection may have gone meanwhile; Slack then retries.
+                        let _ = late_tx.send(ack);
+                        if let Some(work) = work {
+                            work.await;
+                        }
+                    }));
+                    continue;
+                }
+            }
             let (ack, follow_up) = match (envelope["type"].as_str(), &self.bots) {
                 (Some("slash_commands"), _) => {
                     let reply = self.commands.handle(payload, envelope_id);

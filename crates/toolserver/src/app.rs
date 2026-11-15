@@ -6,8 +6,9 @@
 //!   - `PMOS_SERVICE_TOKEN`: the orchestrator, the bot runtime and platform-owner tools.
 //!     Every route, and the only token that starts bot sessions.
 //!   - `PMOS_BOT_TOKEN`: the Slack bot. Only sessions for its skills (`PMOS_BOT_SKILLS`) and
-//!     calls within them, plus reading and deciding one approval item (Slack approval
-//!     cards); never inbox listings, grants, linking or reindexing.
+//!     calls within them, reading and deciding one approval item (Slack approval cards),
+//!     onboarding (member requests and decisions, memory repos, setup status), and link URLs
+//!     for team members; never inbox listings, grants, revoking or reindexing.
 //!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
@@ -31,7 +32,9 @@ use tokio_util::sync::CancellationToken;
 use crate::approvals::{DecideError, Decision, Status};
 use crate::audit::Client;
 use crate::mcp::PmosMcp;
+use crate::members::RequestStatus;
 use crate::oauth::{OAuth, OAuthError};
+use crate::onboarding::{DecisionInput, Onboarding, Refusal};
 use crate::service::{DecisionError, ReindexError, SessionError, ToolError, ToolService};
 use crate::session::BOT_IDENTITY_PREFIX;
 use crate::store::StoreError;
@@ -69,15 +72,32 @@ struct AppState {
     bot: Option<Arc<BotAccess>>,
     content_root: Arc<std::path::Path>,
     oauth: Option<Arc<OAuth>>,
+    onboarding: Arc<Onboarding>,
 }
 
+/// The app, with onboarding but no GitHub: member requests can be made and rejected, and
+/// approving one answers `not_configured`.
 pub fn router(svc: Arc<ToolService>, config: AppConfig, cancel: CancellationToken) -> Router {
+    router_with(svc, config, None, cancel)
+}
+
+/// The app with `onboarding` set up (GitHub, the content repo, content sync), as `main`
+/// builds it. `None` is the same as [`router`].
+pub fn router_with(
+    svc: Arc<ToolService>,
+    config: AppConfig,
+    onboarding: Option<Arc<Onboarding>>,
+    cancel: CancellationToken,
+) -> Router {
+    let onboarding = onboarding
+        .unwrap_or_else(|| Arc::new(Onboarding::new(svc.clone(), config.oauth.clone(), None)));
     let state = AppState {
         svc: svc.clone(),
         service_token: config.service_token.into(),
         bot: config.bot.map(Arc::new),
         content_root: config.content_root.into(),
         oauth: config.oauth.clone(),
+        onboarding,
     };
 
     let mcp_svc = svc.clone();
@@ -106,7 +126,6 @@ pub fn router(svc: Arc<ToolService>, config: AppConfig, cancel: CancellationToke
         .route("/grants", post(create_grant))
         .route("/approvals", get(list_approvals))
         .route("/reindex", post(reindex))
-        .route("/oauth/{provider}/start", get(oauth_start))
         .route("/credentials", get(list_credentials))
         .route(
             "/credentials/{user}/{provider}",
@@ -115,13 +134,26 @@ pub fn router(svc: Arc<ToolService>, config: AppConfig, cancel: CancellationToke
         .layer(middleware::from_fn(orchestrator_only));
 
     // Any internal client; the bot is limited to its own skills inside each handler. Both
-    // may read and decide one approval item: the Slack bot does so from approval cards.
+    // may read and decide one approval item: the Slack bot does so from approval cards. Both
+    // run onboarding, and the bot gets link URLs for team members only.
     let internal = Router::new()
         .route("/sessions", post(create_session))
         .route("/session", axum::routing::delete(revoke_session))
         .route("/call", post(call_tool))
         .route("/approvals/{id}", get(get_approval))
         .route("/approvals/{id}/decision", post(decide))
+        .route("/oauth/{provider}/start", get(oauth_start))
+        .route("/memory/repo", post(set_memory_repo).get(get_memory_repo))
+        .route(
+            "/members/requests",
+            post(create_member_request).get(list_member_requests),
+        )
+        .route(
+            "/members/requests/{id}/decision",
+            post(decide_member_request),
+        )
+        .route("/members/{handle}/remove", post(remove_member))
+        .route("/onboarding", get(onboarding_status))
         .merge(admin)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -480,12 +512,20 @@ struct UserQuery {
 }
 
 /// The URL to send a PM to so they can link their account. With `user=bots.<name>`, the URL
-/// a platform owner uses to link a team bot's own read-only account.
+/// a platform owner uses to link a team bot's own read-only account (service token only).
+/// The Slack bot may ask only for team members.
 async fn oauth_start(
     State(state): State<AppState>,
+    Extension(client): Extension<Client>,
     Path(provider): Path<String>,
     Query(q): Query<UserQuery>,
 ) -> Response {
+    if client != Client::Orchestrator && state.svc.team().member(&q.user).is_none() {
+        return error(
+            StatusCode::FORBIDDEN,
+            "this token may get link URLs for team members only",
+        );
+    }
     let (oauth, provider) = match linking(&state, &provider) {
         Ok(x) => x,
         Err((status, message)) => return error(status, message),
@@ -654,5 +694,181 @@ async fn call_tool(
             };
             error(status, e.to_string())
         }
+    }
+}
+
+// ----- onboarding (docs/onboarding-spec.md §2–3) -------------------------------------------
+
+fn refusal(r: Refusal) -> Response {
+    (r.status, Json(r.body())).into_response()
+}
+
+#[derive(Deserialize)]
+struct MemoryRepoBody {
+    user: String,
+    repo: String,
+}
+
+/// Check a repo with the PM's GitHub token and record it as their memory repo.
+async fn set_memory_repo(
+    State(state): State<AppState>,
+    Json(body): Json<MemoryRepoBody>,
+) -> Response {
+    match state
+        .onboarding
+        .set_memory_repo(&body.user, &body.repo, Utc::now())
+        .await
+    {
+        Ok(record) => Json(record).into_response(),
+        Err(r) => refusal(r),
+    }
+}
+
+async fn get_memory_repo(State(state): State<AppState>, Query(q): Query<UserQuery>) -> Response {
+    match state.onboarding.memory_repo(&q.user).await {
+        Ok(Some(record)) => Json(record).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no memory repo set", "code": "not_found"})),
+        )
+            .into_response(),
+        Err(e) => unavailable(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct MemberRequestBody {
+    #[serde(default)]
+    slack_id: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// `201 {request}` for a new request, `200 {request}` for the one already pending.
+async fn create_member_request(
+    State(state): State<AppState>,
+    Json(body): Json<MemberRequestBody>,
+) -> Response {
+    match state
+        .onboarding
+        .request(&body.slack_id, &body.email, &body.name, Utc::now())
+        .await
+    {
+        Ok((created, request)) => {
+            let status = if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(json!({ "request": request }))).into_response()
+        }
+        Err(r) => refusal(r),
+    }
+}
+
+#[derive(Deserialize)]
+struct RequestsQuery {
+    status: Option<String>,
+}
+
+async fn list_member_requests(
+    State(state): State<AppState>,
+    Query(q): Query<RequestsQuery>,
+) -> Response {
+    let status =
+        match q.status.as_deref() {
+            None => None,
+            Some(s) => match RequestStatus::parse(s) {
+                Some(status) => Some(status),
+                None => return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({"error": format!("unknown status `{s}`"), "code": "bad_request"})),
+                )
+                    .into_response(),
+            },
+        };
+    match state.onboarding.requests(status).await {
+        Ok(requests) => Json(json!({ "requests": requests })).into_response(),
+        Err(e) => unavailable(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct MemberDecisionBody {
+    #[serde(default)]
+    decision: String,
+    #[serde(default)]
+    decided_by: String,
+    handle: Option<String>,
+    roles: Option<Vec<String>>,
+}
+
+async fn decide_member_request(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Path(id): Path<String>,
+    Json(body): Json<MemberDecisionBody>,
+) -> Response {
+    let input = DecisionInput {
+        decision: body.decision,
+        decided_by: body.decided_by,
+        handle: body.handle,
+        roles: body.roles,
+    };
+    match state
+        .onboarding
+        .decide(client, &id, input, Utc::now())
+        .await
+    {
+        Ok(request) => Json(json!({ "request": request })).into_response(),
+        Err(r) => refusal(r),
+    }
+}
+
+#[derive(Deserialize)]
+struct RemoveBody {
+    #[serde(default)]
+    decided_by: String,
+}
+
+async fn remove_member(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Path(handle): Path<String>,
+    Json(body): Json<RemoveBody>,
+) -> Response {
+    match state
+        .onboarding
+        .remove(client, &handle, &body.decided_by, Utc::now())
+        .await
+    {
+        Ok(commit) => Json(json!({ "handle": handle, "commit": commit })).into_response(),
+        Err(r) => refusal(r),
+    }
+}
+
+#[derive(Deserialize)]
+struct OnboardingQuery {
+    user: Option<String>,
+    slack_id: Option<String>,
+}
+
+/// A PM's setup checklist, by handle, or by Slack id for someone not yet a member.
+async fn onboarding_status(
+    State(state): State<AppState>,
+    Query(q): Query<OnboardingQuery>,
+) -> Response {
+    if q.user.is_none() && q.slack_id.is_none() {
+        return error(StatusCode::BAD_REQUEST, "send `user` or `slack_id`");
+    }
+    match state
+        .onboarding
+        .status(q.user.as_deref(), q.slack_id.as_deref())
+        .await
+    {
+        Ok(status) => Json(status).into_response(),
+        Err(e) => unavailable(e),
     }
 }

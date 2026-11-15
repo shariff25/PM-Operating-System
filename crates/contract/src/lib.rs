@@ -10,6 +10,7 @@ pub mod bots;
 pub mod frontmatter;
 pub mod lint;
 pub mod model;
+pub mod onboarding;
 pub mod text;
 
 pub use lint::{lint, Diagnostic, LintOptions, Report, Severity};

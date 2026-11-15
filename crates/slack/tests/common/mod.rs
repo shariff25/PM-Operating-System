@@ -1,7 +1,7 @@
 //! A fake Slack for the Socket Mode tests: `apps.connections.open`, the Socket Mode
 //! websocket (scripted per connection, or fed live by the test), and the Web API calls the
 //! bot makes (`chat.postMessage`, `chat.update`, `chat.postEphemeral`, `views.open`,
-//! `users.info`), each recorded with when it arrived.
+//! `users.info`, `conversations.open`), each recorded with when it arrived.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
@@ -45,6 +45,8 @@ pub struct FakeSlack {
     next_ts: Mutex<u64>,
     /// `users.info` time zones by user id; anyone else is `user_not_found`.
     pub tz: Mutex<HashMap<String, String>>,
+    /// `users.info` user objects by id (name, `profile.email`), for onboarding.
+    pub users: Mutex<HashMap<String, Value>>,
 }
 
 impl FakeSlack {
@@ -136,6 +138,14 @@ async fn web_api(
         }
         "chat.update" => Json(json!({"ok": true, "channel": body["channel"], "ts": body["ts"]})),
         "chat.postEphemeral" => Json(json!({"ok": true, "message_ts": "1.0"})),
+        // The app's DM with a user: `U…` → `D…`, as `chat.postMessage` does.
+        "conversations.open" => {
+            let user = body["users"].as_str().unwrap_or_default();
+            match user.strip_prefix('U') {
+                Some(rest) => Json(json!({"ok": true, "channel": {"id": format!("D{rest}")}})),
+                None => Json(json!({"ok": false, "error": "user_not_found"})),
+            }
+        }
         "views.open" => Json(json!({"ok": true})),
         _ => Json(json!({"ok": false, "error": "unknown_method"})),
     }
@@ -151,6 +161,11 @@ async fn users_info(
         method: "users.info".into(),
         body: json!({"user": user}),
     });
+    if let Some(found) = s.users.lock().unwrap().get(&user) {
+        let mut found = found.clone();
+        found["id"] = json!(user);
+        return Json(json!({"ok": true, "user": found}));
+    }
     match s.tz.lock().unwrap().get(&user) {
         Some(tz) => Json(json!({"ok": true, "user": {"id": user, "tz": tz}})),
         None => Json(json!({"ok": false, "error": "user_not_found"})),

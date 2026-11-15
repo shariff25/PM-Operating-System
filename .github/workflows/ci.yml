@@ -63,3 +63,34 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
+
+  deploy:
+    name: Deploy kit (images, stack, smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scripts parse
+        run: for f in deploy/setup.sh deploy/pmos-admin deploy/postgres-init.sh scripts/claude-test-stack.sh; do bash -n "$f"; done
+      - name: Settings
+        run: deploy/setup.sh --content "$GITHUB_WORKSPACE" --state "$RUNNER_TEMP/pmos-state"
+      - run: docker compose -f deploy/compose.yaml --env-file deploy/.env config -q
+      - name: Images
+        run: deploy/pmos-admin build
+      - name: Stack up (stub model, fake connectors, bring-up worker)
+        run: |
+          deploy/pmos-admin up --bringup
+          for i in $(seq 1 30); do deploy/pmos-admin status | grep -Eq '^ +bots +ok' && break; sleep 5; done
+          deploy/pmos-admin status
+      - name: A member and a Docs-bot task end to end
+        run: |
+          deploy/pmos-admin pmos member add --root content --handle ci --slack-id U0CI00001 --roles pm,admin
+          deploy/pmos-admin pmos policy generate --root content --out policies
+          deploy/pmos-admin lint
+          deploy/pmos-admin reindex
+          sleep 35   # the bot runtime reloads the catalog within 30 seconds
+          deploy/pmos-admin smoke ci
+      - name: Backup
+        run: deploy/pmos-admin backup
+      - name: Logs on failure
+        if: failure()
+        run: for s in toolserver gateway bots worker-docs docs; do deploy/pmos-admin logs "$s" || true; done

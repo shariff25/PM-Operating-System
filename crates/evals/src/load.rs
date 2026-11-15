@@ -98,10 +98,23 @@ impl LoadResult {
         self.unfinished() == 0 && self.measure(targets).iter().all(Measured::met)
     }
 
+    /// The exit verdict. Latency is not a priority (decided 2026-11-14), so by default the
+    /// test fails only when a task doesn't finish; `enforce_targets` also fails it on a
+    /// missed latency target.
+    pub fn verdict(&self, targets: &LatencyTargets, enforce_targets: bool) -> bool {
+        if enforce_targets {
+            self.passed(targets)
+        } else {
+            self.unfinished() == 0
+        }
+    }
+
     pub fn to_markdown(&self, bot: &str, targets: &LatencyTargets) -> String {
         let mut s = String::new();
         let verdict = if self.passed(targets) {
             "**Within the targets.**"
+        } else if self.unfinished() == 0 {
+            "**Missed a target.** Latency targets are for information; they don't gate Gate 1."
         } else {
             "**Missed a target.**"
         };

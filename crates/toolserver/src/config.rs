@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::github::{valid_login, valid_repo};
 use crate::oauth::{AppCredentials, Endpoints};
 use crate::vault::{KeyRing, Secret};
 
@@ -28,13 +29,69 @@ pub struct LiveConfig {
     pub atlassian_site: Option<String>,
     /// `PMOS_SLACK_CLIENT_ID`, `PMOS_SLACK_CLIENT_SECRET`, `PMOS_SLACK_SCOPES`.
     pub slack: AppCredentials,
-    /// `PMOS_ATLASSIAN_AUTH_URL`, `PMOS_ATLASSIAN_API_URL`, `PMOS_SLACK_URL`: overrides for
-    /// tests against mock APIs. Default to the real hosts.
+    /// The GitHub App and the content repo, when `PMOS_GITHUB_CLIENT_ID` and
+    /// `PMOS_GITHUB_CLIENT_SECRET` are set. Without them GitHub linking, `PMOS_MEMORY=github`
+    /// and approving members are off.
+    pub github: Option<GitHubConfig>,
+    /// `PMOS_ATLASSIAN_AUTH_URL`, `PMOS_ATLASSIAN_API_URL`, `PMOS_SLACK_URL`,
+    /// `PMOS_GITHUB_AUTH_URL`, `PMOS_GITHUB_URL`: overrides for tests against mock APIs.
+    /// Default to the real hosts.
     pub endpoints: Endpoints,
     /// `PMOS_DOCS_URL`: the `pmos-docs` MCP endpoint, such as `http://docs.pmos.internal:8730/mcp`.
     pub docs_url: String,
     /// `PMOS_DOCS_TOKEN`: the bearer token `pmos-docs` expects.
     pub docs_token: Secret,
+}
+
+/// GitHub (`docs/onboarding-spec.md` §1): a GitHub App used only with each PM's user token.
+#[derive(Debug, Clone)]
+pub struct GitHubConfig {
+    /// `PMOS_GITHUB_CLIENT_ID`, `PMOS_GITHUB_CLIENT_SECRET`. The App's permissions apply, so
+    /// there are no scopes.
+    pub app: AppCredentials,
+    /// `PMOS_GITHUB_ORG`: the org login. Memory repos and the content repo must be in it.
+    pub org: String,
+    /// `PMOS_CONTENT_REPO`: `org/name` of the content repo, needed to approve members.
+    pub content_repo: Option<String>,
+    /// `PMOS_CONTENT_BRANCH`. Default `main`.
+    pub content_branch: String,
+    /// `PMOS_CONTENT_DIR`: where the content root sits in that repo. Default `content`; empty
+    /// for the repo root.
+    pub content_dir: String,
+    /// `PMOS_POLICIES_DIR`: where the sandbox policies sit in that repo, from its root.
+    /// Default `policies`. A new member's two policy files are committed under it.
+    pub policies_dir: String,
+}
+
+/// A folder in the content repo, from its root: `.` or empty for the root itself.
+fn repo_dir(var: &str, value: &str) -> Result<String, String> {
+    let dir = value.trim().trim_matches('/');
+    let dir = if dir == "." { "" } else { dir };
+    let ok = dir.is_empty()
+        || dir.split('/').all(|seg| {
+            !seg.is_empty()
+                && seg != "."
+                && seg != ".."
+                && seg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        });
+    if ok {
+        Ok(dir.to_string())
+    } else {
+        Err(format!(
+            "{var} must be a relative path in the content repo, not `{value}`"
+        ))
+    }
+}
+
+/// Where personal memory lives: `PMOS_MEMORY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryBackend {
+    /// `store`: Postgres, or memory with `PMOS_DEV=1`.
+    Store,
+    /// `github`: each PM's own private repo in the GitHub org.
+    Github,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +127,15 @@ pub struct Config {
     /// `PMOS_CONNECTORS`: `live` (real Atlassian and Slack, each PM's own token) or `fake`
     /// (fixtures, for dev and tests). Required, so the choice is always deliberate.
     pub connectors: Connectors,
+    /// With `PMOS_CONNECTORS=fake`: `PMOS_DOCS_URL` and `PMOS_DOCS_TOKEN` both set point the
+    /// docs tools at a real `pmos-docs` (the public support docs) while Jira, Confluence and
+    /// Slack stay fixtures. For testing a bot on real docs without any PM's tokens.
+    pub fake_mode_docs: Option<(String, Secret)>,
+    /// `PMOS_MEMORY`: `store` (default) or `github`, which needs live connectors and GitHub.
+    pub memory: MemoryBackend,
+    /// `PMOS_CONTENT_SYNC_SECS`: how often the content checkout is pulled; `0` turns it off.
+    /// Default 300 with live connectors, 0 with fake ones (a dev checkout isn't pulled).
+    pub content_sync_secs: u64,
 }
 
 impl Config {
@@ -122,6 +188,34 @@ impl Config {
             }
             None => return Err("PMOS_CONNECTORS is required (`live` or `fake`)".into()),
         };
+        let fake_mode_docs = match (&connectors, get("PMOS_DOCS_URL"), get("PMOS_DOCS_TOKEN")) {
+            (Connectors::Fake, Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
+                Some((url, Secret::new(token)))
+            }
+            _ => None,
+        };
+        let memory = match get("PMOS_MEMORY").as_deref() {
+            None | Some("") | Some("store") => MemoryBackend::Store,
+            Some("github") => MemoryBackend::Github,
+            Some(other) => {
+                return Err(format!(
+                    "PMOS_MEMORY must be `store` or `github`, not `{other}`"
+                ))
+            }
+        };
+        let github_on = matches!(&connectors, Connectors::Live(live) if live.github.is_some());
+        if memory == MemoryBackend::Github && !github_on {
+            return Err("PMOS_MEMORY=github needs PMOS_CONNECTORS=live and GitHub \
+                        (PMOS_GITHUB_CLIENT_ID, PMOS_GITHUB_CLIENT_SECRET, PMOS_GITHUB_ORG)"
+                .into());
+        }
+        let content_sync_secs = match get("PMOS_CONTENT_SYNC_SECS").filter(|s| !s.is_empty()) {
+            Some(s) => s.trim().parse().map_err(|_| {
+                format!("PMOS_CONTENT_SYNC_SECS must be a number of seconds, not `{s}`")
+            })?,
+            None if matches!(connectors, Connectors::Live(_)) => 300,
+            None => 0,
+        };
         let bind = get("PMOS_BIND")
             .unwrap_or_else(|| "127.0.0.1:8710".into())
             .parse()
@@ -144,8 +238,76 @@ impl Config {
             audit_log,
             allowed_hosts,
             connectors,
+            fake_mode_docs,
+            memory,
+            content_sync_secs,
         })
     }
+}
+
+/// The GitHub settings, given the App's id and secret.
+fn github_config(
+    get: &impl Fn(&str) -> Option<String>,
+    client_id: String,
+    client_secret: String,
+) -> Result<GitHubConfig, String> {
+    let set = |k: &str| {
+        get(k)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let org = set("PMOS_GITHUB_ORG").ok_or("PMOS_GITHUB_ORG is required with the GitHub App")?;
+    if !valid_login(&org) {
+        return Err(format!(
+            "PMOS_GITHUB_ORG: `{org}` is not a GitHub org login"
+        ));
+    }
+    let content_repo = set("PMOS_CONTENT_REPO");
+    if let Some(repo) = &content_repo {
+        if !valid_repo(repo) {
+            return Err(format!(
+                "PMOS_CONTENT_REPO must be `org/name`, not `{repo}`"
+            ));
+        }
+        let owner = repo.split('/').next().unwrap_or_default();
+        if !owner.eq_ignore_ascii_case(&org) {
+            return Err(format!(
+                "PMOS_CONTENT_REPO must be in PMOS_GITHUB_ORG (`{org}`), not `{owner}`"
+            ));
+        }
+    }
+    let content_branch = set("PMOS_CONTENT_BRANCH").unwrap_or_else(|| "main".into());
+    let branch_ok = content_branch
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        && !content_branch.contains("..")
+        && !content_branch.starts_with('/')
+        && !content_branch.ends_with('/');
+    if !branch_ok {
+        return Err(format!(
+            "PMOS_CONTENT_BRANCH: `{content_branch}` is not a branch name"
+        ));
+    }
+    let content_dir = repo_dir(
+        "PMOS_CONTENT_DIR",
+        &get("PMOS_CONTENT_DIR").unwrap_or_else(|| "content".into()),
+    )?;
+    let policies_dir = repo_dir(
+        "PMOS_POLICIES_DIR",
+        &get("PMOS_POLICIES_DIR").unwrap_or_else(|| "policies".into()),
+    )?;
+    Ok(GitHubConfig {
+        app: AppCredentials {
+            client_id,
+            client_secret: Secret::new(client_secret),
+            scopes: Vec::new(),
+        },
+        org,
+        content_repo,
+        content_branch,
+        content_dir,
+        policies_dir,
+    })
 }
 
 fn live_config(get: &impl Fn(&str) -> Option<String>) -> Result<LiveConfig, String> {
@@ -169,6 +331,26 @@ fn live_config(get: &impl Fn(&str) -> Option<String>) -> Result<LiveConfig, Stri
         return Err("PMOS_PUBLIC_URL must be an https:// URL".into());
     }
     let defaults = Endpoints::default();
+    let github_id = get("PMOS_GITHUB_CLIENT_ID").filter(|v| !v.trim().is_empty());
+    let github_secret = get("PMOS_GITHUB_CLIENT_SECRET").filter(|v| !v.trim().is_empty());
+    let github = match (github_id, github_secret) {
+        (Some(id), Some(secret)) => Some(github_config(get, id, secret)?),
+        (None, None) => {
+            for k in ["PMOS_GITHUB_ORG", "PMOS_CONTENT_REPO"] {
+                if get(k).is_some_and(|v| !v.trim().is_empty()) {
+                    return Err(format!(
+                        "{k} needs the GitHub App: set PMOS_GITHUB_CLIENT_ID and PMOS_GITHUB_CLIENT_SECRET"
+                    ));
+                }
+            }
+            None
+        }
+        _ => {
+            return Err(
+                "PMOS_GITHUB_CLIENT_ID and PMOS_GITHUB_CLIENT_SECRET must be set together".into(),
+            )
+        }
+    };
     Ok(LiveConfig {
         vault_keys,
         public_url,
@@ -183,10 +365,13 @@ fn live_config(get: &impl Fn(&str) -> Option<String>) -> Result<LiveConfig, Stri
             client_secret: Secret::new(need("PMOS_SLACK_CLIENT_SECRET")?),
             scopes: scopes("PMOS_SLACK_SCOPES", DEFAULT_SLACK_SCOPES),
         },
+        github,
         endpoints: Endpoints {
             atlassian_auth: get("PMOS_ATLASSIAN_AUTH_URL").unwrap_or(defaults.atlassian_auth),
             atlassian_api: get("PMOS_ATLASSIAN_API_URL").unwrap_or(defaults.atlassian_api),
             slack: get("PMOS_SLACK_URL").unwrap_or(defaults.slack),
+            github_auth: get("PMOS_GITHUB_AUTH_URL").unwrap_or(defaults.github_auth),
+            github_api: get("PMOS_GITHUB_URL").unwrap_or(defaults.github_api),
         },
         docs_url: need("PMOS_DOCS_URL")?,
         docs_token: Secret::new(need("PMOS_DOCS_TOKEN")?),
@@ -269,6 +454,17 @@ mod tests {
             .allowed_hosts
             .contains(&"toolserver.pmos.internal".to_string()));
         assert!(matches!(ok.connectors, Connectors::Fake));
+        assert!(ok.fake_mode_docs.is_none());
+        let docs = cfg(&[
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+            ("PMOS_DOCS_URL", "http://127.0.0.1:8730/mcp"),
+            ("PMOS_DOCS_TOKEN", "docs-token"),
+        ])
+        .unwrap();
+        let (url, _) = docs.fake_mode_docs.expect("fake mode can use real docs");
+        assert_eq!(url, "http://127.0.0.1:8730/mcp");
     }
 
     #[test]
@@ -315,5 +511,142 @@ mod tests {
         http_url.retain(|(k, _)| *k != "PMOS_PUBLIC_URL");
         http_url.push(("PMOS_PUBLIC_URL", "http://pmos.example.com"));
         assert!(cfg(&http_url).unwrap_err().contains("https://"));
+
+        // GitHub is off without the App, and memory stays in the store.
+        assert!(live.github.is_none());
+        assert_eq!(ok.memory, MemoryBackend::Store);
+        assert_eq!(ok.content_sync_secs, 300);
+    }
+
+    fn live_base(key: &str) -> Vec<(&str, &str)> {
+        vec![
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DATABASE_URL", "postgresql://pmos@db/pmos"),
+            ("PMOS_CONNECTORS", "live"),
+            ("PMOS_VAULT_KEY", key),
+            ("PMOS_PUBLIC_URL", "https://pmos.example.com"),
+            ("PMOS_ATLASSIAN_CLIENT_ID", "atl"),
+            ("PMOS_ATLASSIAN_CLIENT_SECRET", "atl-secret"),
+            ("PMOS_SLACK_CLIENT_ID", "slk"),
+            ("PMOS_SLACK_CLIENT_SECRET", "slk-secret"),
+            ("PMOS_DOCS_URL", "http://docs.pmos.internal:8730/mcp"),
+            ("PMOS_DOCS_TOKEN", "docs-token"),
+        ]
+    }
+
+    fn with<'a>(
+        base: &[(&'a str, &'a str)],
+        extra: &[(&'a str, &'a str)],
+    ) -> Vec<(&'a str, &'a str)> {
+        let mut v: Vec<_> = base
+            .iter()
+            .copied()
+            .filter(|(k, _)| !extra.iter().any(|(e, _)| e == k))
+            .collect();
+        v.extend_from_slice(extra);
+        v
+    }
+
+    #[test]
+    fn github_settings_are_checked_at_start_up() {
+        let key = KeyRing::generate_spec("k1");
+        let base = live_base(&key);
+        let app = [
+            ("PMOS_GITHUB_CLIENT_ID", "Iv1.gh"),
+            ("PMOS_GITHUB_CLIENT_SECRET", "gh-secret"),
+            ("PMOS_GITHUB_ORG", "fortanix"),
+        ];
+        let ok = cfg(&with(&base, &app)).unwrap();
+        let Connectors::Live(live) = &ok.connectors else {
+            panic!("expected live");
+        };
+        let gh = live.github.as_ref().unwrap();
+        assert_eq!(gh.org, "fortanix");
+        assert_eq!(gh.content_branch, "main");
+        assert_eq!(gh.content_dir, "content");
+        assert_eq!(gh.policies_dir, "policies");
+        assert!(gh.content_repo.is_none());
+        assert_eq!(live.endpoints.github_api, "https://api.github.com");
+        assert_eq!(live.endpoints.github_auth, "https://github.com");
+        assert!(
+            !format!("{ok:?}").contains("gh-secret"),
+            "secrets never print"
+        );
+
+        let full = cfg(&with(
+            &with(&base, &app),
+            &[
+                ("PMOS_CONTENT_REPO", "Fortanix/pm-os"),
+                ("PMOS_CONTENT_DIR", "./"),
+                ("PMOS_MEMORY", "github"),
+                ("PMOS_CONTENT_SYNC_SECS", "0"),
+                ("PMOS_GITHUB_URL", "http://127.0.0.1:9"),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(full.memory, MemoryBackend::Github);
+        assert_eq!(full.content_sync_secs, 0);
+        let Connectors::Live(live) = &full.connectors else {
+            panic!("expected live");
+        };
+        let gh = live.github.as_ref().unwrap();
+        assert_eq!(gh.content_repo.as_deref(), Some("Fortanix/pm-os"));
+        assert_eq!(gh.content_dir, "", "`./` is the repo root");
+        assert_eq!(live.endpoints.github_api, "http://127.0.0.1:9");
+
+        let refused = |extra: &[(&str, &str)], needle: &str| {
+            let err = cfg(&with(&base, extra)).unwrap_err();
+            assert!(err.contains(needle), "{extra:?}: {err}");
+        };
+        refused(&[("PMOS_MEMORY", "github")], "PMOS_MEMORY=github needs");
+        refused(&[("PMOS_MEMORY", "s3")], "PMOS_MEMORY must be");
+        refused(&[("PMOS_GITHUB_CLIENT_ID", "x")], "set together");
+        refused(&[("PMOS_GITHUB_ORG", "fortanix")], "needs the GitHub App");
+        refused(
+            &[("PMOS_CONTENT_REPO", "fortanix/pm-os")],
+            "needs the GitHub App",
+        );
+        refused(&app[..2], "PMOS_GITHUB_ORG is required");
+        let app_with = |extra: (&'static str, &'static str)| {
+            let mut v = app.to_vec();
+            v.push(extra);
+            v
+        };
+        refused(
+            &app_with(("PMOS_CONTENT_REPO", "pm-os")),
+            "must be `org/name`",
+        );
+        refused(
+            &app_with(("PMOS_CONTENT_REPO", "other/pm-os")),
+            "must be in PMOS_GITHUB_ORG",
+        );
+        refused(&app_with(("PMOS_CONTENT_DIR", "../x")), "PMOS_CONTENT_DIR");
+        refused(
+            &app_with(("PMOS_POLICIES_DIR", "/abs/../x")),
+            "PMOS_POLICIES_DIR",
+        );
+        refused(
+            &app_with(("PMOS_CONTENT_BRANCH", "a b")),
+            "PMOS_CONTENT_BRANCH",
+        );
+        refused(
+            &app_with(("PMOS_GITHUB_ORG", "-bad")),
+            "not a GitHub org login",
+        );
+        refused(
+            &app_with(("PMOS_CONTENT_SYNC_SECS", "soon")),
+            "PMOS_CONTENT_SYNC_SECS",
+        );
+
+        // Fake connectors can't keep memory in GitHub, and don't pull by default.
+        let fake = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert_eq!(cfg(&fake).unwrap().content_sync_secs, 0);
+        assert!(cfg(&with(&fake, &[("PMOS_MEMORY", "github")]))
+            .unwrap_err()
+            .contains("PMOS_MEMORY=github needs"));
     }
 }

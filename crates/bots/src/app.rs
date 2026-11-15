@@ -253,11 +253,11 @@ async fn readyz(State(state): State<AppState>) -> Response {
 // ----- bots -------------------------------------------------------------------------------
 
 async fn list_bots(State(state): State<AppState>) -> Response {
-    Json(state.rt.catalog.summaries()).into_response()
+    Json(state.rt.catalog().summaries()).into_response()
 }
 
 async fn get_bot(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    match state.rt.catalog.detail(&name) {
+    match state.rt.catalog().detail(&name) {
         Some(d) => Json(d).into_response(),
         None => error(
             StatusCode::NOT_FOUND,

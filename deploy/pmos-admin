@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# PM OS operations on the Spark, for platform-owner PMs (docs/runbooks/README.md).
+#
+#   pmos-admin build                  build the service and worker images on this machine
+#   pmos-admin up [--models] [--console] [--bringup]
+#                                     start the stack (Slack joins when its tokens are set)
+#   pmos-admin down                   stop everything (data is kept)
+#   pmos-admin status                 is every service up and ready?
+#   pmos-admin logs <service> [-f]    a service's logs
+#   pmos-admin restart <service>      restart one service
+#   pmos-admin backup                 databases and logs to deploy/backups/<time>/
+#   pmos-admin restore <dir>          put a backup back (stops the services while it runs)
+#   pmos-admin reindex                reload content after a merge (lint-gated)
+#   pmos-admin revoke <handle> <atlassian|slack|github>
+#                                     remove a PM's linked account and its tokens
+#   pmos-admin add-bot <bot>          give a new bot its own runtime and gateway tokens
+#   pmos-admin sandbox <bot>          create the bot's OpenShell sandbox and start its worker
+#   pmos-admin pause <bot> / resume <bot>
+#                                     stop or restart a bot's sandbox
+#   pmos-admin lint                   pmos lint and pmos policy check on the content checkout
+#   pmos-admin pmos <args>            the pmos CLI on the checkout, e.g. `pmos member add …`
+#                                     (paths are relative to the checkout: --root content)
+#   pmos-admin evals <args>           pmos-evals (benchmarks, load test) against the stack
+#   pmos-admin smoke <handle>         one Docs-bot question through the whole stack
+set -euo pipefail
+
+DEPLOY="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$DEPLOY/.." && pwd)"
+ENV="$DEPLOY/.env"
+[ -f "$ENV" ] || { echo "no deploy/.env yet: run deploy/setup.sh first" >&2; exit 1; }
+set -a
+# shellcheck disable=SC1090
+. "$ENV"
+set +a
+
+compose() { docker compose --project-directory "$DEPLOY" -f "$DEPLOY/compose.yaml" --env-file "$ENV" "$@"; }
+say() { printf '%s\n' "$*"; }
+row() { printf '  %-12s %-6s %s\n' "$1" "$2" "$3"; }
+
+profiles() {
+  local p=()
+  if [ -n "${PMOS_SLACK_APP_TOKEN:-}" ] && [ -n "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
+    p+=(--profile slack)
+  fi
+  for arg in "$@"; do
+    case "$arg" in
+      --models) p+=(--profile models) ;;
+      --console) p+=(--profile console) ;;
+      --bringup) p+=(--profile bringup) ;;
+      *) say "unknown option $arg" >&2; exit 2 ;;
+    esac
+  done
+  [ ${#p[@]} -eq 0 ] || printf '%s\n' "${p[@]}"
+}
+
+# A call to the tool server's internal API as the orchestrator.
+internal() { # method path [json]
+  curl -fsS --noproxy '*' -X "$1" "http://127.0.0.1:8710$2" \
+    -H "Authorization: Bearer $PMOS_SERVICE_TOKEN" -H 'content-type: application/json' \
+    ${3:+-d "$3"}
+}
+
+# The `pmos` CLI in the image, in the content checkout, as the checkout's owner.
+pmos_cli() {
+  docker run --rm --user "${PMOS_UID:-10001}:${PMOS_GID:-10001}" \
+    -v "$PMOS_CONTENT_CHECKOUT:/srv/content-repo" -w /srv/content-repo \
+    "pmos:${PMOS_VERSION:-local}" "$@"
+}
+
+# Replace or append KEY=VALUE in deploy/.env.
+set_env() {
+  local tmp
+  tmp=$(mktemp)
+  if grep -qE "^$1=" "$ENV"; then
+    awk -v k="$1" -v v="$2" -F= 'BEGIN{OFS="="} $1==k{print k, v; next} {print}' "$ENV" >"$tmp"
+  else
+    cat "$ENV" >"$tmp"
+    printf '%s=%s\n' "$1" "$2" >>"$tmp"
+  fi
+  cat "$tmp" >"$ENV"
+  rm -f "$tmp"
+}
+
+cmd=${1:-help}
+shift || true
+case "$cmd" in
+  build)
+    args=(--build-arg "HTTPS_PROXY=${HTTPS_PROXY:-}" --build-arg "NO_PROXY=${NO_PROXY:-}")
+    if [ -n "${HTTPS_PROXY:-}" ]; then args+=(--network host); fi
+    if [ -n "${PMOS_BUILD_CA:-}" ]; then args+=(--secret "id=ca,src=$PMOS_BUILD_CA"); fi
+    tag=${PMOS_VERSION:-local}
+    say "== building pmos:$tag (the Rust services; the first build takes a while)"
+    DOCKER_BUILDKIT=1 docker build "${args[@]}" -f "$DEPLOY/Dockerfile" -t "pmos:$tag" "$ROOT"
+    say "== building pmos-worker:$tag (the bots' sandbox image)"
+    DOCKER_BUILDKIT=1 docker build "${args[@]}" -f "$DEPLOY/Dockerfile.worker" -t "pmos-worker:$tag" "$ROOT"
+    ;;
+
+  up)
+    mapfile -t prof < <(profiles "$@")
+    if [ -z "${PMOS_SLACK_APP_TOKEN:-}" ] || [ -z "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
+      say "note: the Slack bot is off until PMOS_SLACK_APP_TOKEN and PMOS_SLACK_BOT_TOKEN are set"
+    fi
+    compose "${prof[@]}" up -d
+    say "started; check with: deploy/pmos-admin status"
+    ;;
+
+  down)
+    compose --profile slack --profile console --profile models --profile bringup down
+    ;;
+
+  status)
+    say "== containers"
+    compose --profile slack --profile console --profile models --profile bringup ps \
+      --format 'table {{.Service}}\t{{.Status}}'
+    say "== readiness"
+    check() { # name url
+      local body code
+      body=$(curl -sS --noproxy '*' -m 5 -w '\n%{http_code}' "$2" 2>/dev/null) || { row "$1" DOWN "no answer from $2"; return; }
+      code=${body##*$'\n'}
+      body=${body%$'\n'*}
+      if [ "$code" = 200 ]; then row "$1" ok "${body:0:90}"; else row "$1" "$code" "${body:0:90}"; fi
+    }
+    check toolserver http://127.0.0.1:8710/readyz
+    check gateway http://127.0.0.1:8740/readyz
+    check bots http://127.0.0.1:8750/readyz
+    if compose --profile console ps --status running --services 2>/dev/null | grep -qx console; then
+      check console http://127.0.0.1:8760/healthz
+    fi
+    if compose exec -T docs curl -fsS -m 5 http://127.0.0.1:8730/readyz >/dev/null 2>&1; then
+      row docs ok "ready"
+    else
+      row docs "not" "ready (an empty index until the first sync finishes is normal)"
+    fi
+    ;;
+
+  logs)
+    [ $# -ge 1 ] || { say "usage: pmos-admin logs <service> [-f]" >&2; exit 2; }
+    svc=$1
+    shift
+    compose --profile slack --profile console --profile models --profile bringup logs --tail 200 "$@" "$svc"
+    ;;
+
+  restart)
+    [ $# -eq 1 ] || { say "usage: pmos-admin restart <service>" >&2; exit 2; }
+    compose --profile slack --profile console --profile models --profile bringup restart "$1"
+    ;;
+
+  backup)
+    dir="$DEPLOY/backups/$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+    for db in toolserver bots docs; do
+      say "  dumping pmos_$db"
+      compose exec -T postgres pg_dump -U postgres -Fc "pmos_$db" >"$dir/pmos_$db.dump"
+    done
+    for d in audit usage; do
+      if [ -d "$PMOS_STATE_DIR/$d" ]; then tar -C "$PMOS_STATE_DIR" -czf "$dir/$d.tgz" "$d"; fi
+    done
+    (cd "$dir" && sha256sum ./* >SHA256SUMS)
+    say "backup in $dir"
+    say "It holds sealed tokens: keep it with deploy/.env's vault key, and both somewhere safe."
+    ;;
+
+  restore)
+    [ $# -eq 1 ] && [ -d "$1" ] || { say "usage: pmos-admin restore <backup dir>" >&2; exit 2; }
+    dir=$(cd "$1" && pwd)
+    (cd "$dir" && sha256sum -c --quiet SHA256SUMS) || { say "the backup's checksums don't match; not restoring" >&2; exit 1; }
+    say "This replaces every PM OS database with the backup in $dir."
+    read -r -p "Type RESTORE to go on: " answer
+    [ "$answer" = RESTORE ] || { say "stopped; nothing changed"; exit 1; }
+    compose --profile slack --profile console --profile bringup stop docs toolserver gateway bots slack console worker-docs 2>/dev/null || true
+    compose up -d postgres
+    until compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+    for db in toolserver bots docs; do
+      say "  restoring pmos_$db"
+      compose exec -T postgres psql -U postgres -v ON_ERROR_STOP=1 -q \
+        -c "DROP DATABASE IF EXISTS pmos_$db WITH (FORCE)" -c "CREATE DATABASE pmos_$db OWNER pmos_$db"
+      compose exec -T postgres pg_restore -U postgres --role="pmos_$db" --no-owner -d "pmos_$db" <"$dir/pmos_$db.dump"
+    done
+    for d in audit usage; do
+      if [ -f "$dir/$d.tgz" ]; then tar -C "$PMOS_STATE_DIR" -xzf "$dir/$d.tgz"; fi
+    done
+    say "restored; start the services again with: deploy/pmos-admin up"
+    ;;
+
+  reindex)
+    internal POST /internal/reindex && echo
+    ;;
+
+  revoke)
+    [ $# -eq 2 ] || { say "usage: pmos-admin revoke <handle> <atlassian|slack|github>" >&2; exit 2; }
+    internal DELETE "/internal/credentials/$1/$2" && say "revoked $2 for $1"
+    ;;
+
+  add-bot)
+    [ $# -eq 1 ] || { say "usage: pmos-admin add-bot <bot>" >&2; exit 2; }
+    bot=$1
+    if [ "$bot" = docs ]; then
+      say "the Docs bot's tokens are built in (PMOS_RT_DOCS_WORKER_TOKEN)"
+      exit 0
+    fi
+    if [[ ",${PMOS_RT_WORKER_TOKENS:-}," == *",worker-$bot="* ]]; then
+      say "$bot already has tokens"
+      exit 0
+    fi
+    rt=$(openssl rand -hex 24)
+    gw=$(openssl rand -hex 24)
+    set_env PMOS_RT_WORKER_TOKENS "${PMOS_RT_WORKER_TOKENS:+$PMOS_RT_WORKER_TOKENS,}worker-$bot=$rt"
+    set_env PMOS_GW_BOT_TOKENS "${PMOS_GW_BOT_TOKENS:+$PMOS_GW_BOT_TOKENS,}bot-$bot=$gw"
+    compose up -d bots gateway
+    say "tokens added for $bot; the runtime and gateway were restarted with them."
+    say "next: deploy/pmos-admin sandbox $bot"
+    ;;
+
+  sandbox)
+    # Verify on the Spark: the OpenShell command names and flags (`--image`, keeping the worker
+    # running after `sandbox exec`), as listed in docs/sandbox-policies.md.
+    [ $# -eq 1 ] || { say "usage: pmos-admin sandbox <bot>" >&2; exit 2; }
+    bot=$1
+    command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
+    spec="$PMOS_CONTENT_CHECKOUT/policies/bots/$bot.sandbox.yaml"
+    policy="$PMOS_CONTENT_CHECKOUT/policies/bots/$bot.yaml"
+    [ -f "$spec" ] && [ -f "$policy" ] || { say "no generated policy for $bot in the content checkout; run pmos policy generate and merge it" >&2; exit 1; }
+    if [ "$bot" = docs ]; then
+      rt=$PMOS_RT_DOCS_WORKER_TOKEN
+      gw=$PMOS_GW_DOCS_BOT_TOKEN
+    else
+      rt=$(tr ',' '\n' <<<"${PMOS_RT_WORKER_TOKENS:-}" | sed -n "s/^worker-$bot=//p")
+      gw=$(tr ',' '\n' <<<"${PMOS_GW_BOT_TOKENS:-}" | sed -n "s/^bot-$bot=//p")
+      [ -n "$rt" ] && [ -n "$gw" ] || { say "run deploy/pmos-admin add-bot $bot first" >&2; exit 1; }
+    fi
+    sandbox="pmos-$bot"
+    # Uploads come from the generated spec: `from` is relative to the content root.
+    uploads=()
+    while read -r from to; do
+      uploads+=(--upload "$PMOS_CONTENT_CHECKOUT/content/$from:$to")
+    done < <(awk '/^  - from: /{f=$3} /^    to: /{print f, $2}' "$spec")
+    PMOS_GATEWAY_TOKEN=$gw openshell provider create --name "$sandbox-gateway" --type pmos-gateway --credential PMOS_GATEWAY_TOKEN
+    PMOS_WORKER_TOKEN=$rt openshell provider create --name "$sandbox-worker" --type pmos-worker --credential PMOS_WORKER_TOKEN
+    openshell sandbox create --name "$sandbox" --image "pmos-worker:${PMOS_VERSION:-local}" --policy "$policy" \
+      --provider "$sandbox-gateway" --provider "$sandbox-worker" "${uploads[@]}"
+    openshell sandbox exec -n "$sandbox" --workdir /sandbox/workspace -- env \
+      PMOS_BOTS_URL=http://bots.pmos.internal:8750 PMOS_WORKER_BOT="$bot" \
+      PMOS_GATEWAY_URL=http://gateway.pmos.internal:8740/v1 \
+      PMOS_TOOLSERVER_MCP_URL=http://toolserver.pmos.internal:8710/mcp \
+      PMOS_CONTENT_ROOT=/sandbox \
+      /usr/local/bin/node /opt/pmos/harness/dist/main.js &
+    say "sandbox $sandbox created and its worker started"
+    ;;
+
+  pause)
+    [ $# -eq 1 ] || { say "usage: pmos-admin pause <bot>" >&2; exit 2; }
+    openshell sandbox stop -n "pmos-$1"
+    say "pmos-$1 stopped; its queued tasks wait (and fail after their retry) until resume"
+    ;;
+
+  resume)
+    [ $# -eq 1 ] || { say "usage: pmos-admin resume <bot>" >&2; exit 2; }
+    openshell sandbox start -n "pmos-$1"
+    ;;
+
+  lint)
+    pmos_cli sh -c 'pmos lint --root content && pmos policy check --root content --policies policies'
+    ;;
+
+  pmos)
+    pmos_cli pmos "$@"
+    ;;
+
+  evals)
+    # The benchmarks and load test (docs/evals.md), run in the image on the stack's network.
+    # Reports are written to evals/reports in the content checkout; commit them.
+    docker run --rm --user "${PMOS_UID:-10001}:${PMOS_GID:-10001}" --network pmos_pmos \
+      -v "$PMOS_CONTENT_CHECKOUT:/srv/content-repo" -w /srv/content-repo \
+      -e PMOS_BOTS_URL=http://bots.pmos.internal:8750 -e PMOS_EVALS_TOKEN="$PMOS_RT_EVALS_TOKEN" \
+      -e PMOS_EVALS_ROOT=evals "pmos:${PMOS_VERSION:-local}" pmos-evals "$@"
+    ;;
+
+  smoke)
+    # One Docs-bot question through the whole stack, as the Slack bot would send it.
+    [ $# -eq 1 ] || { say "usage: pmos-admin smoke <handle in team.yaml>" >&2; exit 2; }
+    auth=(-H "Authorization: Bearer $PMOS_RT_SLACK_TOKEN" -H "X-Pmos-User: $1")
+    body=$(printf '{"bot":"docs","requested_by":"%s","text":"What does Fortanix DSM do?","source":"slack","slack":{"channel":"smoke","thread_ts":"0.0"}}' "$1")
+    task=$(curl -sS --noproxy '*' -X POST http://127.0.0.1:8750/v1/tasks "${auth[@]}" -H 'content-type: application/json' -d "$body")
+    id=$(sed -n 's/.*"id":"\(tsk_[0-9a-f]*\)".*/\1/p' <<<"$task")
+    [ -n "$id" ] || { say "the runtime refused the task: $task" >&2; exit 1; }
+    say "task $id queued; waiting up to 3 minutes for a worker"
+    status=queued
+    for _ in $(seq 1 90); do
+      status=$(curl -sS --noproxy '*' "http://127.0.0.1:8750/v1/tasks/$id" "${auth[@]}" | sed -n 's/.*"status":"\([a-z_]*\)".*/\1/p')
+      case "$status" in done|failed|cancelled|needs_approval) break ;; esac
+      sleep 2
+    done
+    curl -sS --noproxy '*' "http://127.0.0.1:8750/v1/tasks/$id/events" "${auth[@]}" | tr '{' '\n' | sed -n 's/.*"kind":"\([a-z_]*\)".*"text":"\([^"]*\)".*/  \1: \2/p'
+    echo
+    if [ "$status" = done ]; then say "smoke test passed"; else say "smoke test ended as: $status" >&2; exit 1; fi
+    ;;
+
+  help|-h|--help)
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+    ;;
+
+  *)
+    say "unknown command $cmd; see deploy/pmos-admin help" >&2
+    exit 2
+    ;;
+esac

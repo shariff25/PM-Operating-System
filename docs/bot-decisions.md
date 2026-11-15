@@ -39,7 +39,7 @@ the product lessons doc shared on 2026-11-14.
 | D9 | **The launch-post test.** A feature ships only if "PM OS can now ___" is something a PM cares about. Finished features that fail it are cut. | Every shipped capability has a "can now" line in the changelog. | **Adopt now:** PR template and `CHANGELOG.md`. |
 | D10 | **Finishing the job beats 90%.** A task category launches only when bots finish it end to end. Real tasks are rerun weekly and on every model or harness change, and each failure is tagged to its bottleneck. | Each launched category meets its pass bar two weeks in a row. | **Planned** as 0g evals; reshaped into per-category benchmarks with failure tags. |
 | D11 | **Every workaround has an expiry date.** Scaffolding for model weakness sits behind a flag with a "delete when" test. The model sits behind one OpenAI-compatible endpoint. | Switching models is a config change plus one benchmark. | **Partly:** the harness already calls model roles (`pmos/default`, `pmos/extraction`) through the gateway. Add a workaround registry when the gateway lands (0d). |
-| D12 | **One role per bot; a Chief of Staff only when it emerges.** v1 ships single-role bots, with no coordinator bot that delegates to others. We build one once several PMs (proposed: 3) set it up by hand. A bot may read other bots' outputs in the same scope, nothing more. Count how often PMs chain bots by hand. | Role templates exist. *(The line may have been cut off; confirm whether it continues.)* | **Gap.** Role templates are new. They also feed D3: each bot's sandbox policy is generated from its role template. **Not a conflict:** `/review`'s parallel reviewer sub-agents stay inside one bot, so they aren't a coordinator. Skill chaining (SKL-6) was already Phase 3. |
+| D12 | **One role per bot; a Chief of Staff only when it emerges.** v1 ships single-role bots, with no coordinator bot that delegates to others. We build one once several PMs (proposed: 3) set it up by hand. A bot may read other bots' outputs in the same scope, nothing more. Count how often PMs chain bots by hand. | Role templates exist. *(Confirmed complete: done for Phase 0, see resolved decision 11.)* | **Built.** Role templates are in `content/roles/`. They also feed D3: each bot's sandbox policy is generated from its role template. **Not a conflict:** `/review`'s parallel reviewer sub-agents stay inside one bot, so they aren't a coordinator. Skill chaining (SKL-6) was already Phase 3. |
 
 ## Resolved conflicts (decided 2026-11-14)
 
@@ -54,7 +54,7 @@ the product lessons doc shared on 2026-11-14.
    - The audit log stays append-only and metadata-only.
 3. **Memory (D5): markdown files in git.**
    - **Team memory** is in git, and PMs edit it by pull request or commit.
-   - **Personal memory** is in a separate private store, readable only by its owner and their bots.
+   - **Personal memory** is in each PM's own **private repo in the Fortanix GitHub org** (decided 2026-11-14). The PM links GitHub; every read and write acts with their own token, and the tool server refuses a repo that is public, archived, outside the org or without push access. See `docs/onboarding-spec.md` §2.
    - Every entry carries its source and date.
 4. **Console (D1): a small server-rendered console** with four screens only: bot roster, routines, approval queue and audit or trace. It replaces the planned platform-owner-only admin pages. Slack stays the main surface, and approvals still happen in Slack cards.
 
@@ -68,10 +68,17 @@ the product lessons doc shared on 2026-11-14.
    - PMs edit by pull request or direct commit; git history is the review trail.
    - The content repo keeps its review-by-pull-request rule.
 7. **Slash commands stay as shortcuts (decided 2026-11-14).** `/docs` asks the Docs bot; a command is never a feature of its own (D1).
+8. **Onboarding is done by the bot (decided 2026-11-14).**
+   - Someone not in `team.yaml` taps **Request access** in Slack. A platform owner (`admin`) approves or rejects it on a card.
+   - On approval, PM OS commits the new `team.yaml` entry and the member's personal bot (`pm-<handle>`) to the content repo, with the approver's own GitHub token and an `Approved-by` trailer. Git stays the source of truth.
+   - The bot fills in the Slack id and email itself, then walks the new member through `setup`: Jira and Confluence, Slack, GitHub, their memory repo.
+   - Platform owners remove members with `remove <handle>`, which also unlinks their accounts.
+   - Spec: `docs/onboarding-spec.md`.
+9. **One Slack app (decided 2026-11-14).** All bots share the PM OS app and post under their own names (`chat:write.customize`). A DM goes to a bot by a `<bot>:` prefix, else the thread's bot, else the PM's personal bot, else `docs`. Separate apps only if pilot PMs find this confusing, and then only for the most-used bots.
+10. **Latency is not a priority (decided 2026-11-14).** The load test reports latency but fails only when a task doesn't finish; Gate 1 doesn't gate on latency.
+11. **D12 is done for Phase 0 (decided 2026-11-14).** The "Done when" is met: role templates exist, the lint requires exactly one role per bot, and sandbox policies are generated from roles. Still to build in the pilot: the "chaining by hand" count in the console (below), and the reviewer, researcher and Slack-triage roles with the Phase 1 skills.
 
 ## Open questions
 
 - **The unship list** is still to come.
-- **D12's "Done when"** may be cut off after "role templates exist". Is it complete?
-- **What counts as "chaining by hand"** (D12's metric). The proposal: a PM passes one bot's output to another bot within an hour, either by forwarding the message or by citing the task. It is counted in the trace store and shown in the console.
-- **Personal memory store.** The proposal: a private git repository per PM on the Spark, never pushed to the shared remote, and backed up with the rest of the Spark.
+- **What counts as "chaining by hand"** (D12's metric, to build in the pilot). The proposal: a PM passes one bot's output to another bot within an hour, either by forwarding the message or by citing the task. It is counted in the trace store and shown in the console.

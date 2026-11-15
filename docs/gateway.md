@@ -83,6 +83,8 @@ It never holds prompts or answers. Events go to the service log, and with `PMOS_
 | `PMOS_GATEWAY_USAGE_LOG` | none | JSON-lines usage file |
 | `PMOS_GATEWAY_STUB` | off | `1` answers with a deterministic stub model and no model server, for CI and development |
 | `PMOS_GATEWAY_WORKAROUNDS` | `on` | `off` for the benchmark run |
+| `PMOS_GATEWAY_CLOUD_TEST` | off | **Testing only.** `1` accepts the Claude test upstream (below) |
+| `PMOS_GATEWAY_ANTHROPIC_KEY` | none | **Testing only.** The Claude API key for the Claude test upstream |
 
 **Allowed upstream hosts:**
 - loopback and private addresses;
@@ -91,5 +93,24 @@ It never holds prompts or answers. Events go to the service log, and with `PMOS_
 - anything listed under `local-hosts:` in the config.
 
 Anything else stops the gateway at start-up.
+
+**The Claude test upstream (testing only, decided 2026-11-14):**
+- **What it is:** an upstream written `anthropic+https://api.anthropic.com` sends a role's
+  calls to the Claude Messages API (`crates/gateway/src/anthropic.rs`), so PM OS can be tried
+  before the Spark's local models are up.
+- **When the gateway accepts it:** only with `PMOS_GATEWAY_CLOUD_TEST=1`. It then logs a
+  warning at start-up that prompts leave the machine.
+- **What changes for callers:** nothing. They still send OpenAI-style requests, and the
+  gateway translates them:
+  - tool calls and results are translated both ways;
+  - sampling parameters are dropped;
+  - forced tool choice becomes an instruction;
+  - `response_format` asks for JSON only;
+  - a streamed request gets the whole answer as one event stream;
+  - refusals reach the caller as `content_filter`.
+- **Limits:** no embeddings.
+- **Per-role setting:** `effort:` (low to max) sets `output_config.effort`.
+- **Example config:** `config/gateway.claude-test.yaml`. How to run a full test stack with it is in
+  [testing-with-claude.md](testing-with-claude.md).
 
 **Shutdown:** SIGTERM finishes in-flight calls before exiting.

@@ -1,4 +1,5 @@
 /target
+/state/
 node_modules/
 dist/
 *.tsbuildinfo
@@ -6,3 +7,12 @@ dist/
 
 # Local agent worktrees and tool state
 /.claude/
+
+# Spark deployment: secrets and backups stay on the machine
+/deploy/.env
+/deploy/live.env
+/deploy/backups/
+
+# Research notes and reports (kept local unless asked)
+/research_notes/
+/reports/

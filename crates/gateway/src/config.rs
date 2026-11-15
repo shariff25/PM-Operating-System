@@ -51,6 +51,9 @@ struct RoleSpec {
     model: String,
     #[serde(default)]
     workarounds: Vec<String>,
+    /// Claude test upstream only: `output_config.effort`.
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,6 +77,20 @@ pub struct Role {
     pub model: String,
     /// Workaround ids switched on for this role (see `workarounds.rs`).
     pub workarounds: Vec<String>,
+    /// The API the upstream speaks.
+    pub kind: UpstreamKind,
+    /// Claude test upstream only: the effort level sent with each request.
+    pub effort: Option<String>,
+}
+
+/// What an upstream speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamKind {
+    /// An OpenAI-compatible local model server (vLLM). The only kind outside testing.
+    OpenAi,
+    /// **Testing only:** the Claude Messages API, written `anthropic+https://…` and allowed
+    /// only with `PMOS_GATEWAY_CLOUD_TEST=1` (`anthropic.rs`).
+    ClaudeTest,
 }
 
 impl Role {
@@ -97,7 +114,14 @@ pub struct Models {
 }
 
 impl Models {
+    /// The config, refusing any upstream that isn't a local model server.
     pub fn from_yaml(text: &str) -> Result<Self, String> {
+        Self::parse(text, false)
+    }
+
+    /// The config, also accepting `anthropic+https://` (Claude) upstreams when `cloud_test`
+    /// is set. Testing only: prompts to those leave the machine.
+    pub fn parse(text: &str, cloud_test: bool) -> Result<Self, String> {
         let file: ModelsFile =
             serde_norway::from_str(text).map_err(|e| format!("gateway config: {e}"))?;
         if file.roles.is_empty() {
@@ -123,6 +147,10 @@ impl Models {
                     spec.upstream
                 )
             })?;
+            let (kind, base) = match base.strip_prefix("anthropic+") {
+                Some(rest) => (UpstreamKind::ClaudeTest, rest),
+                None => (UpstreamKind::OpenAi, base.as_str()),
+            };
             let url = reqwest::Url::parse(base)
                 .map_err(|e| format!("gateway config: upstream `{}`: {e}", spec.upstream))?;
             if !matches!(url.scheme(), "http" | "https") {
@@ -132,7 +160,21 @@ impl Models {
                 ));
             }
             let host = url.host_str().unwrap_or_default();
-            if !is_local_host(host, &file.local_hosts) {
+            if kind == UpstreamKind::ClaudeTest {
+                if !cloud_test {
+                    return Err(format!(
+                        "gateway config: upstream `{}` is the Claude test upstream; it needs \
+                         PMOS_GATEWAY_CLOUD_TEST=1 (testing only: prompts leave this machine)",
+                        spec.upstream
+                    ));
+                }
+                if url.scheme() != "https" && !is_local_host(host, &file.local_hosts) {
+                    return Err(format!(
+                        "gateway config: upstream `{}` must use https",
+                        spec.upstream
+                    ));
+                }
+            } else if !is_local_host(host, &file.local_hosts) {
                 return Err(format!(
                     "gateway config: upstream `{}` ({host}) is not on this machine or its private network; \
                      PM OS sends prompts only to local models",
@@ -141,6 +183,19 @@ impl Models {
             }
             if spec.model.trim().is_empty() {
                 return Err(format!("gateway config: role `{name}` has no model"));
+            }
+            if let Some(e) = &spec.effort {
+                if kind != UpstreamKind::ClaudeTest {
+                    return Err(format!(
+                        "gateway config: role `{name}` sets `effort`, which only the Claude test upstream takes"
+                    ));
+                }
+                if !crate::anthropic::EFFORTS.contains(&e.as_str()) {
+                    return Err(format!(
+                        "gateway config: role `{name}` effort `{e}` must be one of {}",
+                        crate::anthropic::EFFORTS.join(", ")
+                    ));
+                }
             }
             for w in &spec.workarounds {
                 if !workarounds::known(w) {
@@ -161,6 +216,8 @@ impl Models {
                     upstream: base.trim_end_matches('/').to_string(),
                     model: spec.model,
                     workarounds: spec.workarounds,
+                    kind,
+                    effort: spec.effort,
                 },
             );
         }
@@ -240,6 +297,11 @@ pub struct Config {
     /// `PMOS_GATEWAY_WORKAROUNDS=off`: switch every workaround off, for the benchmark run
     /// that decides whether they can be deleted (D11).
     pub workarounds_on: bool,
+    /// `PMOS_GATEWAY_CLOUD_TEST=1`: **testing only**, accept the Claude test upstream.
+    pub cloud_test: bool,
+    /// `PMOS_GATEWAY_ANTHROPIC_KEY`: the Claude API key for the test upstream. Required when
+    /// a role uses it; empty otherwise.
+    pub anthropic_key: String,
 }
 
 impl Config {
@@ -274,6 +336,8 @@ impl Config {
                 .map(PathBuf::from),
             stub: get("PMOS_GATEWAY_STUB").as_deref() == Some("1"),
             workarounds_on,
+            cloud_test: get("PMOS_GATEWAY_CLOUD_TEST").as_deref() == Some("1"),
+            anthropic_key: get("PMOS_GATEWAY_ANTHROPIC_KEY").unwrap_or_default(),
         })
     }
 }
