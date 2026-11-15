@@ -18,6 +18,8 @@ service and personal agents go through the same server, so they follow the same 
 | Nothing is written outside PM OS without approval | A write runs only with a matching grant or an inbox approval by its own user; otherwise it returns `pending_approval` and does nothing | OUT-4 |
 | Everything is audited | One event per call and per decision: user, skill, run, tool, outcome, sources read, argument hash, output reference. Never message bodies | ADM-2, SLK-8 |
 | Arguments match the tool's schema | Required keys, no unknown keys, types and enums checked before any handler runs | — |
+| A bad draft gets one correction | A write tool refused twice for invalid arguments in a session is refused for the rest of it, without reaching the connector (see **Invalid drafts**) | — |
+| Every draft is labelled | Each approval item has a row in the feedback ledger: what became of it, never its text (see **Feedback ledger**) | — |
 
 ## How a write gets approved
 
@@ -65,7 +67,9 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | `POST /internal/grants` `{session_token, tool, args}` | service token | Record an approval given in the harness |
 | `GET /internal/approvals?user=&status=` | service token | A PM's inbox, newest first |
 | `GET /internal/approvals/{id}` | service or bot token | One item |
-| `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?}` | service or bot token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). The audit records which token decided. |
+| `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?}` | service or bot token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). |
+| `GET /internal/ledger?since=&until=&bot=&outcome=&min_edit=&limit=` | service or bot token | `{rows: […]}`, newest first. See **Feedback ledger**. `422` for a bad parameter |
+| `GET /internal/ledger/summary?since=&bot=` | service token | Per bot (or skill) and tool: counts by outcome, label coverage, median edit distance, rejection reasons. `422` for a bad `since` |
 | `POST /internal/reindex` | service token | Rebuild the context index from the content checkout and re-read `team.yaml`, the bots and their roles; `422` if it fails `pmos lint` |
 | `GET /internal/oauth/{atlassian\|slack\|github}/start?user=` | service or bot token | The URL to send a PM to so they can link their account. The bot token gets URLs for team members only (`403` otherwise). `user=bots.<name>` (service token) gives the URL for a team bot's own account (`404` unless `<name>` is a team bot); GitHub links PMs only. |
 | `GET /oauth/{atlassian\|slack\|github}/callback` | none (the PM's browser) | Finishes linking; shows a short page |
@@ -81,11 +85,81 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 
 **Who holds which token:**
 - **Service token** (`PMOS_SERVICE_TOKEN`): the orchestrator, the bot runtime and platform-owner tools. Every route, and the only token that starts bot sessions.
-- **Bot token** (`PMOS_BOT_TOKEN`): the Slack bot. Only sessions for the skills in `PMOS_BOT_SKILLS` and calls within them, plus reading and deciding one approval item (`GET /internal/approvals/{id}` and its `decision`), for Slack approval cards. A session started for another skill, or any bot session, looks to the bot like one that doesn't exist, and every other route returns `403`.
+- **Bot token** (`PMOS_BOT_TOKEN`): the Slack bot. Only sessions for the skills in `PMOS_BOT_SKILLS` and calls within them, plus reading and deciding one approval item (`GET /internal/approvals/{id}` and its `decision`), for Slack approval cards, the onboarding routes, and `GET /internal/ledger` for the daily triage digest. A session started for another skill, or any bot session, looks to the bot like one that doesn't exist, and every other route (the ledger summary among them) returns `403`.
 - **Session token:** each sandbox gets only its own.
 
 Session tokens are sent in headers, never in a URL, so access logs and proxies don't record them. A tool error (refused, invalid arguments, not found) comes
 back as an MCP tool result with `isError: true`, so the model can read why.
+
+## Feedback ledger
+
+One row per approval item, so one per drafted outbound action
+(`docs/improvement-loop-spec.md` §1, `src/ledger.rs`). The approval store writes it in the
+same operation that creates the item, decides it and stores its write's outcome (in Postgres,
+the same transaction), so a row is never missing. A write approved in the harness with a grant
+makes no item, so no row.
+
+| Field | Meaning |
+| --- | --- |
+| `id` | The approval item's id |
+| `run_id` | The task id (`tsk_…`) or skill run id |
+| `user` | The PM the draft is for |
+| `bot`, `skill` | Who drafted it; one of them is `null` |
+| `tool` | Registry name, such as `jira.create_issue` |
+| `content_sha` | The content repo's `HEAD` when the item was created (`git rev-parse HEAD`, read at start-up and on every reindex or content sync); `null` outside a git checkout |
+| `model_alias` | The drafting skill's or role's gateway alias, such as `pmos/default` |
+| `outcome` | `pending`, `approved` (unchanged), `edited` (approved after an edit), `rejected`, `failed` (approved, but the write failed or its outcome is unknown) or `expired` |
+| `edit_distance` | `0.0`–`1.0` once approved; `null` while pending and when rejected |
+| `reason` | Only for `rejected`, when one was given |
+| `created_at`, `decided_at`, `decided_by` | |
+
+- **No text.** Rows hold labels and metadata only: never the draft's arguments, never Slack
+  text. Every field may go to the Slack bot.
+- **`expired`** is not stored. A row still `pending` and never decided is reported as
+  `expired` once it is older than `PMOS_LEDGER_EXPIRE_DAYS` (default 7). An approved write
+  still running stays `pending` until its outcome is stored.
+- **`edited`** means the decision changed the item's arguments (their hash differs). An
+  `edit` decision that sends back the same arguments is `approved`.
+- **The edit distance** is the normalized character-level Levenshtein distance between the
+  original and the final text, divided by the longer one's length. The text is the item's
+  string arguments, at any depth, in key order, joined with newlines. Each side is cut to its
+  first 20,000 characters, and a shared prefix and suffix are skipped first, so small edits to
+  long drafts stay cheap.
+- **Items from before the ledger** (migration `0007_ledger.sql`) get a row each, with
+  `content_sha`, `model_alias` and `edit_distance` `null`.
+
+**Reading it.** `GET /internal/ledger` (service or bot token) returns `{rows: […]}`, newest
+first:
+
+| Parameter | Meaning |
+| --- | --- |
+| `since`, `until` | RFC 3339 times. They match a row's last change, `decided_at` once decided, else `created_at`: `since` inclusive, `until` exclusive. So "the past day" includes an older draft rejected today. |
+| `bot` | One bot's rows |
+| `outcome` | Comma-separated reported outcomes, such as `rejected,edited`; `expired` and `pending` filter as reported |
+| `min_edit` | `0`–`1`: drop rows whose edit distance is below it. Rows with no edit distance (pending, rejected, expired) are kept, so `outcome=rejected,edited&min_edit=0.3` reads "rejected, or edited by at least 0.3" |
+| `limit` | `1`–`1000`, default `1000` |
+
+**The summary.** `GET /internal/ledger/summary?since=&bot=` (service token) returns
+`{since, rows, label_coverage, groups: […]}`. Each group is one bot (or skill) and tool, with
+`rows`, `counts` (every outcome, zeros included), `label_coverage` (the share of rows that are
+decided or expired: phase 0's 95% gate), `median_edit_distance` (over rows that have one;
+`null` if none) and `reasons` (rejections by reason, `none` for those without one).
+`since` matches like the ledger's.
+
+## Invalid drafts
+
+A write call refused for invalid arguments (a schema error, or a connector's bad-argument
+answer such as a bad Jira field) is the one refusal a model can act on, so it gets one
+correction (`docs/improvement-loop-spec.md` §2):
+- **Counted per session and write tool**, in memory with the session (a restart starts the
+  counts again). Reads, and other refusals, aren't counted.
+- **The second refusal's message** ends "This is the last attempt for this action. Tell the
+  PM what was wrong instead of retrying."
+- **Then refused for the session.** Any further call to that tool in the session is refused
+  (`403` on `/internal/call`, an MCP tool error) with a message ending the same way, before any
+  check, grant or connector call, so nothing is drafted or written.
+- **Audited** as `denied`, with `detail` `invalid draft (1 of 2)`, then `invalid draft (2 of 2)`;
+  later refusals `invalid draft (2 of 2): no attempts left in this session`.
 
 ## Bot sessions
 
@@ -366,7 +440,8 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 | Memory | `memory_notes` | One row per user and key |
 | Sessions | `sessions` | Only the SHA-256 of each token is stored. Each names a `skill` or a `bot` (a check constraint keeps it to one) |
 | Grants | `grants` | Taken with `DELETE … RETURNING` on a row locked `FOR UPDATE SKIP LOCKED`: one grant, one call, even under concurrency |
-| Approvals | `approvals` | A decision is one conditional `UPDATE … WHERE status = 'pending' AND user_handle = …`: exactly one of several concurrent decisions wins |
+| Approvals | `approvals` | A decision locks the item (`SELECT … FOR UPDATE`) and changes it only while it is `pending`: exactly one of several concurrent decisions wins |
+| Feedback ledger | `ledger` | One row per approval item, written in the same transaction as the item on create, decide and complete. `expired` is worked out on read |
 | Audit | `audit_events` | Append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Each event records the caller (`mcp`, `orchestrator` or `bot`) and the session's skill or bot. |
 | Credentials | `credentials` | Tokens sealed by the vault; the database never sees plaintext. Providers `atlassian`, `slack`, `github` |
 | Memory repos | `memory_repos` | One row per PM: `repo` (`org/name`) and `verified_at` |
@@ -406,6 +481,7 @@ cargo run -p pmos-toolserver
 | `PMOS_BIND` | `127.0.0.1:8710` | |
 | `PMOS_ALLOWED_HOSTS` | `toolserver.pmos.internal,localhost,127.0.0.1` | `Host` values `/mcp` accepts |
 | `PMOS_CONTENT_SYNC_SECS` | `300` with live connectors, `0` with fake | How often the content checkout is pulled (see **Content sync**); `0` turns it off, after member commits too |
+| `PMOS_LEDGER_EXPIRE_DAYS` | `7` | Days after which a draft still pending is reported as `expired` in the feedback ledger. A whole number, 1 or more |
 
 With `PMOS_CONNECTORS=live`:
 
@@ -445,6 +521,9 @@ After a merge to the content repo, the content sync pulls and reloads within
 
 ## Not yet
 
+- **`pmos-admin ledger`** (the summary, and `--export` as JSON lines) lives with the deployment
+  kit; until it does, call `GET /internal/ledger/summary` and `GET /internal/ledger` with the
+  service token.
 - **First real calls** with real tokens and data, on the Spark after Gate 1. The sandbox network policy (0f) must allow only the tool server and gateway, not these hosts.
 - **Embeddings** in the context index, once the gateway (0d) serves the embedding model.
 - **Paging** past the first page of results (`nextPageToken`, `cursor`). Skills ask for small result sets for now.
