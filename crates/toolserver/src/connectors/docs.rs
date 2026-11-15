@@ -1,4 +1,4 @@
-//! The Fortanix support docs, through the `pmos-docs` MCP server.
+//! Your company's public docs, through the `pmos-docs` MCP server.
 //!
 //! The docs are public, so no user token is needed. Calls still go through the tool server
 //! like any other system: the skill must declare `docs.search` or `docs.read`, every call is
@@ -65,7 +65,7 @@ impl Docs {
         ClientConfig::default()
             .serve(transport)
             .await
-            .map_err(|e| ConnectorError::Unavailable(format!("support docs: {e}")))
+            .map_err(|e| ConnectorError::Unavailable(format!("docs server: {e}")))
     }
 
     /// The live client, connecting if there is none.
@@ -108,7 +108,7 @@ impl Docs {
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
                     return Err(ConnectorError::Unavailable(format!(
-                        "support docs didn't answer within {} s",
+                        "the docs server didn't answer within {} s",
                         self.timeout.as_secs()
                     )))
                 }
@@ -117,14 +117,14 @@ impl Docs {
                 Ok(result) if result.is_error == Some(true) => return Err(tool_failure(&result)),
                 Ok(result) => {
                     return result.structured_content.ok_or_else(|| {
-                        ConnectorError::Unavailable("support docs returned no data".into())
+                        ConnectorError::Unavailable("the docs server returned no data".into())
                     })
                 }
                 Err(e) if attempt == 0 => {
-                    tracing::warn!(error = %e, "support docs call failed; reconnecting");
+                    tracing::warn!(error = %e, "docs server call failed; reconnecting");
                     self.forget(&client).await;
                 }
-                Err(e) => return Err(ConnectorError::Unavailable(format!("support docs: {e}"))),
+                Err(e) => return Err(ConnectorError::Unavailable(format!("docs server: {e}"))),
             }
         }
         unreachable!("the loop returns on its second attempt")
@@ -147,6 +147,7 @@ fn tool_failure(result: &rmcp::model::CallToolResult) -> ConnectorError {
         });
     match failure["code"].as_str() {
         Some("not_found") => ConnectorError::NotFound(message),
+        Some("not_configured") => ConnectorError::NotConfigured(message),
         Some("unavailable") => ConnectorError::Unavailable(message),
         _ => ConnectorError::BadArgs(message),
     }
@@ -180,6 +181,12 @@ impl Connector for Docs {
         match action {
             "search" => {
                 let out = self.call("search_docs", args).await?;
+                // No docs site is configured: the server says so in a note.
+                if let Some(note) = out["note"].as_str() {
+                    if out["results"].as_array().is_none_or(|r| r.is_empty()) {
+                        return Err(ConnectorError::NotConfigured(note.to_string()));
+                    }
+                }
                 Ok(out["results"]
                     .as_array()
                     .into_iter()
@@ -220,7 +227,7 @@ impl Connector for Docs {
         _args: &Value,
     ) -> Result<SourceRef, ConnectorError> {
         Err(ConnectorError::Unsupported(format!(
-            "docs.{action}: the support docs are read-only"
+            "docs.{action}: the docs are read-only"
         )))
     }
 
@@ -228,7 +235,7 @@ impl Connector for Docs {
         match tokio::time::timeout(Duration::from_secs(2), self.client()).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(e.to_string()),
-            Err(_) => Err("support docs didn't answer within 2 s".into()),
+            Err(_) => Err("the docs server didn't answer within 2 s".into()),
         }
     }
 }

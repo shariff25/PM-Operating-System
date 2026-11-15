@@ -1,7 +1,7 @@
 # TESTING ONLY: a Claude model behind the gateway, for trying PM OS before the Spark's local
 # models are up (decided 2026-11-14). Prompts sent to these roles leave the machine, so use it
-# only with a test Slack workspace, fake connectors and the public support docs; never with
-# real PM tokens or Fortanix data.
+# only with a test Slack workspace, fake connectors and your public docs site; never with
+# real PM tokens or company data.
 #
 # The gateway refuses this file unless PMOS_GATEWAY_CLOUD_TEST=1. The API key comes from
 # PMOS_GATEWAY_ANTHROPIC_KEY. See

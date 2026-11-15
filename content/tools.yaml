@@ -79,12 +79,12 @@ tools:
     kind: write
     description: Send a message as the PM to a channel or person
 
-  # Fortanix support docs (public; served by the pmos-docs MCP server)
+  # Your company's public docs site (served by the pmos-docs MCP server; PMOS_DOCS_BASE_URL)
   - name: docs.search
     system: docs
     kind: read
-    description: Search the public Fortanix support documentation (support.fortanix.com)
+    description: Search your company's public docs
   - name: docs.read
     system: docs
     kind: read
-    description: Read one support page as markdown, by the url a search returned
+    description: Read one page of your company's public docs as markdown, by the url a search returned

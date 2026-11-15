@@ -162,7 +162,7 @@ export async function startFakeMcp(options: { searchDelayMs?: number } = {}): Pr
         return structured({
           untrusted: true,
           source: "docs",
-          content: [{ url: "https://support.fortanix.com/docs/ports", title: `Ports (${query})` }],
+          content: [{ url: "https://docs.example.com/docs/ports", title: `Ports (${query})` }],
         });
       },
     );

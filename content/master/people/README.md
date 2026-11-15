@@ -7,7 +7,7 @@ add to the team rules but not override them (CTX-3). Keep it short:
 # <Name>'s context
 
 ## Areas I own
-- e.g. CCM key management, Confidential AI POCs
+- e.g. Billing and payments, enterprise SSO, POCs for the EMEA region
 
 ## How I like drafts
 - e.g. Lead with the customer problem; keep PRDs under 6 pages

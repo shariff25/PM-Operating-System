@@ -176,7 +176,7 @@ async fn draft_waits_for_approval_then_lands() {
     assert_eq!(denied.is_error, Some(true));
 
     // The write queues instead of running.
-    let args = json!({"space": "PM", "title": "PRD: SSO for DSM", "body": "Draft body"});
+    let args = json!({"space": "PM", "title": "PRD: SSO for Acme Vault", "body": "Draft body"});
     let result = client
         .call_tool(
             CallToolRequestParams::new("confluence_create_draft")
@@ -350,7 +350,7 @@ async fn draft_lands_with_postgres_stores() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|r| r["path"] == "context/partners/acme-nda.md"));
+        .any(|r| r["path"] == "context/partners/globex-nda.md"));
 
     let args = json!({"space": "PM", "title": "PRD: SSO", "body": "Draft"});
     let pending = client

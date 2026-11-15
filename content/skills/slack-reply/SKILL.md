@@ -25,8 +25,8 @@ reply posts only when the PM approves it, as the PM, marked "Drafted with PM OS"
    - it isn't a question or request for the PM (someone else is asked, or it's a statement);
    - it's an FYI, an announcement, a bot message or a reaction-only thread.
 3. **Find the answer** in the team's sources, not from memory: the context library
-   (`context.search`, `context.read`), Confluence and Jira, and the public support docs for
-   how-to and configuration questions about Fortanix products. Read the most relevant two to
+   (`context.search`, `context.read`), Confluence and Jira, and the company's public docs for
+   how-to and configuration questions about the products. Read the most relevant two to
    five results in full.
 4. **Draft one reply per thread** with `slack.post_reply`, in the thread:
    - Short: two to four sentences, in the PM's voice, first person.

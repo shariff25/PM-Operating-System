@@ -7,10 +7,12 @@
 # Why a separate stack:
 # - **The evaluator is separate.** The gate measures a pull request's roles, skills and bots,
 #   so it must run on that checkout's content without touching what PMs are using.
-# - **No PM data.** It runs fake Jira, Confluence and Slack fixtures plus the real public
-#   support docs, and holds no PM tokens.
+# - **No PM data.** It runs fake Jira, Confluence, Slack and docs fixtures, and holds no PM
+#   tokens. The example benchmarks are written against those fixtures. To benchmark your own
+#   docs site instead, set PMOS_EVAL_DOCS_URL=http://docs.pmos.internal:8730/mcp in
+#   deploy/.env: the tool server then reads the main stack's docs index (read-only).
 # - **Shared models.** It shares only the main stack's gateway (the models, under the `evals`
-#   client's token) and the docs server (read-only), over the main stack's network.
+#   client's token), over the main stack's network.
 #
 # pmos-admin starts it with fresh tokens for every run and removes it afterwards; everything is
 # in memory. The workers here are plain containers, not OpenShell sandboxes: acceptable only
@@ -45,8 +47,9 @@ services:
       PMOS_SERVICE_TOKEN: ${PMOS_EVAL_SERVICE_TOKEN:?}
       PMOS_BOT_TOKEN: ${PMOS_EVAL_BOT_TOKEN:?}
       PMOS_CONTENT_ROOT: /srv/content
-      PMOS_DOCS_URL: http://docs.pmos.internal:8730/mcp
-      PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN:?}
+      # Empty: the fake docs fixtures. Set PMOS_EVAL_DOCS_URL for your own docs index.
+      PMOS_DOCS_URL: ${PMOS_EVAL_DOCS_URL:-}
+      PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN:-}
       NO_PROXY: "*"
     volumes:
       - ${PMOS_EVAL_CONTENT}:/srv/content:ro

@@ -88,7 +88,7 @@ fn tasks_data() -> Vec<Value> {
             "tsk_ana1",
             "docs",
             "ana",
-            &format!("What ports does DSM need? {HOSTILE}"),
+            &format!("What ports does Acme Vault need? {HOSTILE}"),
         ),
         task_json("tsk_ben1", "pm-ben", "ben", "Ben's private question"),
     ]
@@ -135,7 +135,7 @@ async fn runtime(
         .into_response(),
         ("GET", ["v1", "bots", "docs"]) => Json(json!({
             "name": "docs", "role": "docs-helper", "scope": "team", "owner": "root",
-            "reads": {"jira_projects": ["DSM"], "confluence-spaces": ["SUP"], "slack_channels": []},
+            "reads": {"jira_projects": ["Acme Vault"], "confluence-spaces": ["SUP"], "slack_channels": []},
             "tools": ["docs.search", "docs.get"], "actions": {}
         }))
         .into_response(),
@@ -170,7 +170,7 @@ async fn runtime(
         .into_response(),
         ("GET", ["v1", "tasks", _, "trace"]) => Json(json!([
             {"at": "2026-11-14T09:00:01Z", "kind": "prompt", "body": {"messages": [{"role": "user", "content": HOSTILE}]}},
-            {"at": "2026-11-14T09:00:02Z", "kind": "tool_call", "body": {"tool": "docs.search", "args": {"query": "DSM ports"}}},
+            {"at": "2026-11-14T09:00:02Z", "kind": "tool_call", "body": {"tool": "docs.search", "args": {"query": "Acme Vault ports"}}},
             {"at": "2026-11-14T09:00:03Z", "kind": "model_reply", "body": "Port 443 </pre><b>bold</b>"},
         ]))
         .into_response(),
@@ -294,7 +294,7 @@ async fn console(opts: Options) -> Console {
             "{}",
             json!({"at": "2026-11-14T09:00:02Z", "client": "mcp", "run_id": "tsk_ana1",
                    "user": "ana", "skill": "docs", "tool": "docs.search", "outcome": "ok",
-                   "sources": ["support.fortanix.com/dsm/ports"], "detail": HOSTILE})
+                   "sources": ["docs.example.com/vault/ports"], "detail": HOSTILE})
         )
         .unwrap();
         writeln!(
@@ -433,7 +433,7 @@ async fn bots_screen_shows_the_roster_with_scope_and_settings() {
         "id=\"bot-pm-ana\"",
         "id=\"bot-pm-ben\"",
         "docs-helper",
-        "Jira projects: <code>DSM</code>",
+        "Jira projects: <code>Acme Vault</code>",
         "Confluence spaces: <code>SUP</code>",
         "Slack channels: <span class=\"muted\">none</span>",
         "As its owner, with their linked accounts",
@@ -661,7 +661,7 @@ async fn activity_lists_recent_tasks_by_who_may_see_them() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("href=\"/tasks/tsk_ana1\""));
     assert!(body.contains("href=\"/tasks/tsk_ben1\""));
-    assert!(body.contains("What ports does DSM need? &lt;script&gt;"));
+    assert!(body.contains("What ports does Acme Vault need? &lt;script&gt;"));
     assert_escaped(&body);
     assert!(c
         .runtime
@@ -690,11 +690,11 @@ async fn a_task_page_shows_events_trace_and_audit_escaped() {
         "(1/2 done)",
         // The trace, every entry.
         "&quot;content&quot;: &quot;&lt;script&gt;",
-        "&quot;query&quot;: &quot;DSM ports&quot;",
+        "&quot;query&quot;: &quot;Acme Vault ports&quot;",
         "Port 443 &lt;/pre&gt;&lt;b&gt;bold&lt;/b&gt;",
         // Audit events for this run only.
         "<code>docs.search</code>",
-        "support.fortanix.com/dsm/ports",
+        "docs.example.com/vault/ports",
         // The task itself.
         "Answer with &lt;script&gt;",
         "✓ Search the docs",

@@ -542,7 +542,7 @@ async fn dms_go_to_the_right_bot_as_the_right_pm() {
             "U0ANA",
             "100.1",
             None,
-            "what ports does DSM need?",
+            "what ports does Acme Vault need?",
         ))
         .await;
     tasks(1).await;
@@ -566,7 +566,7 @@ async fn dms_go_to_the_right_bot_as_the_right_pm() {
             "U0ANA",
             "100.3",
             Some("100.2"),
-            "and for CCM?",
+            "and for Acme Cloud?",
         ))
         .await;
     tasks(3).await;
@@ -605,7 +605,7 @@ async fn dms_go_to_the_right_bot_as_the_right_pm() {
             "U0ANA",
             "100.1",
             None,
-            "what ports does DSM need?",
+            "what ports does Acme Vault need?",
         ))
         .await;
     // Someone else's personal bot: the runtime refuses, the PM is told why.
@@ -631,9 +631,9 @@ async fn dms_go_to_the_right_bot_as_the_right_pm() {
     );
 
     let expect = [
-        ("pm-ana", "ana", "100.1", "what ports does DSM need?"),
+        ("pm-ana", "ana", "100.1", "what ports does Acme Vault need?"),
         ("docs", "ana", "100.2", "what is SAML & SSO?"),
-        ("docs", "ana", "100.2", "and for CCM?"),
+        ("docs", "ana", "100.2", "and for Acme Cloud?"),
         ("pm-ana", "ana", "100.2", "draft a PRD"),
         ("docs", "bob", "100.5", "hello"),
         ("pm-ana", "bob", "100.10", "show me Ana's notes"),
@@ -652,7 +652,7 @@ async fn dms_go_to_the_right_bot_as_the_right_pm() {
 
     assert_eq!(ephemeral.len(), 1);
     assert_eq!(ephemeral[0].body["user"], "U0STRANGER");
-    assert!(text_of(&ephemeral[0]).contains("PM OS is for the Fortanix product team"));
+    assert!(text_of(&ephemeral[0]).contains("PM OS is for the product team"));
     assert_eq!(
         notes.len(),
         1,
@@ -683,7 +683,7 @@ async fn notifications_edit_one_message_per_task_and_survive_a_restart() {
         json!({"id": "n0", "task_id": "tsk_0", "bot": "docs", "requested_by": "ana", "slack": slack("90.1"), "kind": "milestone", "text": "Old work", "at": old}),
         json!({"id": "n1", "task_id": "tsk_1", "bot": "docs", "requested_by": "ana", "slack": slack("100.2"), "kind": "milestone", "text": "Working on it", "at": now}),
         json!({"id": "n2", "task_id": "tsk_1", "bot": "docs", "requested_by": "ana", "slack": slack("100.2"), "kind": "milestone", "text": "Searching the support docs", "at": now}),
-        json!({"id": "n3", "task_id": "tsk_1", "bot": "docs", "requested_by": "ana", "slack": slack("100.2"), "kind": "done", "text": "DSM needs **port 443** <open>. See [Ports](https://support.fortanix.com/ports).", "at": now}),
+        json!({"id": "n3", "task_id": "tsk_1", "bot": "docs", "requested_by": "ana", "slack": slack("100.2"), "kind": "done", "text": "Acme Vault needs **port 443** <open>. See [Ports](https://docs.example.com/ports).", "at": now}),
         json!({"id": "n4", "task_id": "tsk_2", "bot": "pm-ana", "requested_by": "ana", "slack": slack("100.1"), "kind": "failed", "text": "the tool server was unreachable", "at": now}),
     ]);
     let (stop, handle) = stack.notifier();
@@ -723,7 +723,7 @@ async fn notifications_edit_one_message_per_task_and_survive_a_restart() {
     assert_eq!(answer.body["username"], "Docs");
     let blocks = answer.body["blocks"].to_string();
     assert!(blocks.contains("*port 443* &lt;open&gt;"), "{blocks}");
-    assert!(blocks.contains("<https://support.fortanix.com/ports|Ports>"));
+    assert!(blocks.contains("<https://docs.example.com/ports|Ports>"));
     // A failure says why, as the bot that failed.
     let failed = &posts[2];
     assert_eq!(failed.body["username"], "PM Ana");
@@ -806,7 +806,7 @@ async fn approval_cards_are_decided_by_their_own_pm() {
                 "apr_a3",
                 "ana",
                 "jira.create_issue",
-                json!({"project": "DSM", "summary": "Fix <login>", "description": "Steps"}),
+                json!({"project": "Acme Vault", "summary": "Fix <login>", "description": "Steps"}),
             ),
         );
     }
@@ -1031,7 +1031,7 @@ async fn reject_asks_why_and_back_restores_the_card() {
             "apr_r1",
             "ana",
             "jira.create_issue",
-            json!({"project": "DSM", "summary": "Fix <login>", "description": "Steps"}),
+            json!({"project": "Acme Vault", "summary": "Fix <login>", "description": "Steps"}),
         ),
     );
     stack.connect();
@@ -1264,13 +1264,13 @@ async fn routines_are_made_and_changed_in_slack() {
             "U0BOB",
             "200.2",
             None,
-            "routine: monday digest of DSM docs changes",
+            "routine: monday digest of Acme Vault docs changes",
         ))
         .await;
     let p = parses(2).await;
     assert_eq!(p[1].1["bot"], "docs");
     assert_eq!(p[1].1["tz"], "UTC");
-    assert_eq!(p[1].1["text"], "monday digest of DSM docs changes");
+    assert_eq!(p[1].1["text"], "monday digest of Acme Vault docs changes");
     let bob_readback = stack.calls("chat.postMessage", 2).await[1].clone();
     assert_eq!(bob_readback.body["username"], "Docs");
     let bob_key = button_value(&bob_readback.body, "rtn_cancel");
@@ -1301,7 +1301,7 @@ async fn routines_are_made_and_changed_in_slack() {
             "U0ANA",
             "200.3",
             None,
-            "every day sometime, check the DSM queue",
+            "every day sometime, check the Acme Vault queue",
         ))
         .await;
     let question = stack.calls("chat.postMessage", 3).await[2].clone();
@@ -1314,7 +1314,7 @@ async fn routines_are_made_and_changed_in_slack() {
     let p = parses(4).await;
     assert_eq!(
         p[3].1["text"],
-        "every day sometime, check the DSM queue\nat 9am"
+        "every day sometime, check the Acme Vault queue\nat 9am"
     );
     let second = stack.calls("chat.postMessage", 4).await[3].clone();
     assert!(text_of(&second).contains("rtn_create"));
@@ -1432,7 +1432,7 @@ async fn envelopes_are_acked_before_slow_work() {
             "U0ANA",
             "300.1",
             None,
-            "what changed in DSM 5.0?",
+            "what changed in Acme Vault 5.0?",
         ))
         .await;
     stack

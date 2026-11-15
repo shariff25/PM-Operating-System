@@ -2,7 +2,7 @@
 //! with a tap, and routines are set up and changed in plain language.
 //!
 //! **Which bot a DM goes to:**
-//! 1. a `<bot>:` prefix (`docs: what ports does DSM need?`);
+//! 1. a `<bot>:` prefix (`docs: what ports does Acme Vault need?`);
 //! 2. else the bot already working in that thread;
 //! 3. else the PM's personal bot `pm-<handle>`, if it exists;
 //! 4. else `docs`.
@@ -1330,9 +1330,9 @@ mod tests {
     fn routing_order() {
         let roster = vec![bot("docs"), bot("pm-ana")];
         // 1. the prefix wins over everything.
-        let (prefix, rest) = split_prefix("docs: what ports does DSM need?", &roster);
+        let (prefix, rest) = split_prefix("docs: what ports does Acme Vault need?", &roster);
         assert_eq!(prefix.as_deref(), Some("docs"));
-        assert_eq!(rest, "what ports does DSM need?");
+        assert_eq!(rest, "what ports does Acme Vault need?");
         assert_eq!(
             choose_bot(prefix.as_deref(), Some("pm-ana"), "ana", &roster),
             "docs"
@@ -1363,7 +1363,7 @@ mod tests {
             routine_request("routine: friday digest").as_deref(),
             Some("friday digest")
         );
-        assert!(routine_request("every ticket in DSM, what's the status?").is_none());
+        assert!(routine_request("every ticket in Acme Vault, what's the status?").is_none());
         assert!(routine_request("each of these").is_none());
         assert!(routine_request("routine:").is_none());
         assert!(is_routine_list("My routines?"));

@@ -1,6 +1,6 @@
 ---
 name: pm-assistant
-description: A PM's personal assistant that answers questions, writes up meetings and drafts PRDs from the team's context, Jira, Confluence and the support docs.
+description: A PM's personal assistant that answers questions, writes up meetings and drafts PRDs from the team's context, Jira, Confluence and the public docs.
 owner: "TODO"
 version: "0.1.0"
 skills: "ask meeting-notes prd-draft slack-reply"

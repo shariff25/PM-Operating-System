@@ -93,7 +93,7 @@ fn markdown_report_puts_the_top_bottleneck_first() {
             Tag::Tool,
             "page-not-retrieved",
             Check::MissingCitation {
-                url: "https://support.fortanix.com/docs/a".into(),
+                url: "https://docs.example.com/docs/a".into(),
             },
         )),
     ));
@@ -160,7 +160,7 @@ fn markdown_report_puts_the_top_bottleneck_first() {
         md.contains("| `t00` | pass |  | done | 1.3 | 12.5 |  |"),
         "{md}"
     );
-    assert!(md.contains("| `tool-a` | **FAIL** | tool (`page-not-retrieved`) | failed | 1.3 | 12.5 | doesn't cite https://support.fortanix.com/docs/a |"), "{md}");
+    assert!(md.contains("| `tool-a` | **FAIL** | tool (`page-not-retrieved`) | failed | 1.3 | 12.5 | doesn't cite https://docs.example.com/docs/a |"), "{md}");
     assert!(md.contains("### `harness-a`"));
     assert!(
         md.contains("- **Tag:** harness by rule `interrupted`: because \\| interrupted"),
@@ -314,7 +314,7 @@ const OLD_REPORT: &str = r#"{
   "note": "weekly",
   "tasks": [
     {
-      "id": "dsm-port-requirements",
+      "id": "vault-port-requirements",
       "ask": "Which ports?",
       "task_id": "tsk_1",
       "status": "done",
@@ -327,7 +327,7 @@ const OLD_REPORT: &str = r#"{
       "trace_read": false
     },
     {
-      "id": "ccm-join-token",
+      "id": "cloud-join-token",
       "ask": "Where is the join token?",
       "task_id": "tsk_2",
       "status": "done",
@@ -365,7 +365,7 @@ fn old_single_repeat_reports_still_load() {
         "{md}"
     );
     assert!(
-        md.contains("| `ccm-join-token` | **FAIL** | model (`model`) |"),
+        md.contains("| `cloud-join-token` | **FAIL** | model (`model`) |"),
         "{md}"
     );
     assert!(!md.contains("pass^"), "{md}");

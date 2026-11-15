@@ -20,15 +20,14 @@ pub struct Reply {
     pub follow_up: Option<FollowUp>,
 }
 
-/// Product filters `/docs` accepts as `product:<name>`.
-const PRODUCTS: [&str; 6] = [
-    "dsm",
-    "ccm",
-    "confidential-ai",
-    "key-insight",
-    "armor",
-    "general",
-];
+/// Whether `id` looks like a docs product id (`product:<id>`): 1–64 lowercase letters,
+/// digits and `-`. Which ids exist is the docs server's to say; it refuses unknown ones.
+fn product_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
 
 #[derive(Clone)]
 pub struct Commands {
@@ -49,7 +48,7 @@ pub const SLACK_RESPONSE_URL_PREFIX: &str = "https://hooks.slack.com/";
 
 /// What someone outside `team.yaml` is told, privately, where there is no **Request access**
 /// button.
-pub const NOT_A_MEMBER: &str = "PM OS is for the Fortanix product team. If you need access, ask a \
+pub const NOT_A_MEMBER: &str = "PM OS is for the product team. If you need access, ask a \
                                 platform-owner PM to add you.";
 
 /// Read `team.yaml`. Unreadable or unparseable means nobody may use the bot, never everyone.
@@ -108,7 +107,7 @@ impl Commands {
         let words: Vec<&str> = text
             .split_whitespace()
             .filter(|w| match w.strip_prefix("product:") {
-                Some(p) if PRODUCTS.contains(&p) => {
+                Some(p) if product_id(p) => {
                     product = Some(p.to_string());
                     false
                 }

@@ -53,6 +53,8 @@ POLICIES=${POLICIES:-$(cd "$HERE/.." && pwd)}
 WORKER_BINARY=${WORKER_BINARY:-/usr/local/bin/node}
 CHAT_MODEL=${CHAT_MODEL:-pmos/default}
 DENIED_TOOL=${DENIED_TOOL:-jira_search}
+# Your public docs site (PMOS_DOCS_BASE_URL in deploy/.env); any outside host works if unset.
+DOCS_SITE=${PMOS_DOCS_BASE_URL:-https://docs.example.com}
 TOOLSERVER=http://toolserver.pmos.internal:8710
 GATEWAY=http://gateway.pmos.internal:8740
 RUNTIME=http://bots.pmos.internal:8750
@@ -353,7 +355,7 @@ expect_denied() { # id url method token body description
 }
 expect_denied RT-9 https://slack.com/api/api.test GET "" "" "direct Slack from A"
 expect_denied RT-9 https://api.atlassian.com/me GET "" "" "direct Atlassian (Jira, Confluence) from A"
-expect_denied RT-9 https://support.fortanix.com/ GET "" "" "the support docs site from A"
+expect_denied RT-9 "${DOCS_SITE%/}/" GET "" "" "the public docs site from A"
 expect_denied RT-9 http://docs.pmos.internal:8730/mcp POST "" "$init" "the docs server, bypassing the tool server"
 expect_denied RT-9 http://169.254.169.254/latest/meta-data/ GET "" "" "the cloud metadata address"
 expect_denied RT-9 "$TOOLSERVER/internal/call" POST "" '{"tool":"docs.search","args":{}}' "the tool server's /internal routes"

@@ -181,7 +181,7 @@ async fn context_respects_the_skill_data_class() {
         .map(|r| r["path"].as_str().unwrap().to_string())
         .collect();
     assert!(paths.contains(&"context/products/key-management.md".to_string()));
-    assert!(!paths.contains(&"context/partners/acme-nda.md".to_string()));
+    assert!(!paths.contains(&"context/partners/globex-nda.md".to_string()));
     let search_event = f.audit.events().pop().unwrap();
     assert!(search_event.detail.unwrap().contains("withheld"));
 
@@ -199,7 +199,7 @@ async fn context_respects_the_skill_data_class() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|r| r["path"] == "context/partners/acme-nda.md"));
+        .any(|r| r["path"] == "context/partners/globex-nda.md"));
     assert!(
         f.audit.events().pop().unwrap().detail.is_none(),
         "nothing withheld"
@@ -211,7 +211,7 @@ async fn context_respects_the_skill_data_class() {
         .call(
             &internal,
             "context_read",
-            json!({"path": "context/partners/acme-nda.md"}),
+            json!({"path": "context/partners/globex-nda.md"}),
             now(),
         )
         .await
@@ -223,13 +223,13 @@ async fn context_respects_the_skill_data_class() {
         .call(
             &restricted,
             "context_read",
-            json!({"path": "context/partners/acme-nda.md"}),
+            json!({"path": "context/partners/globex-nda.md"}),
             now(),
         )
         .await
         .unwrap();
     assert!(doc["body"].as_str().unwrap().contains("under NDA"));
-    assert_eq!(doc["cite"], "context/partners/acme-nda.md");
+    assert_eq!(doc["cite"], "context/partners/globex-nda.md");
 }
 
 #[tokio::test]
@@ -716,7 +716,7 @@ async fn memory_is_per_user() {
         .call(
             &ana,
             "memory_update",
-            json!({"key": "areas", "text": "CCM"}),
+            json!({"key": "areas", "text": "Acme Cloud"}),
             now(),
         )
         .await
@@ -738,7 +738,7 @@ async fn memory_is_per_user() {
         .call(&ana, "memory_read", json!({}), now())
         .await
         .unwrap();
-    assert_eq!(mine["notes"][0]["text"], "CCM");
+    assert_eq!(mine["notes"][0]["text"], "Acme Cloud");
     let theirs = f
         .svc
         .call(&bo, "memory_read", json!({}), now())

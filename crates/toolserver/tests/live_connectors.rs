@@ -178,13 +178,13 @@ async fn handle(
         ("GET", "/ex/jira/cloud-1/rest/api/3/search/jql") => reply(
             ok,
             json!({"isLast": true, "issues": [{"key": "PM-1", "fields": {
-                "summary": "SSO for DSM", "status": {"name": "To Do"}, "issuetype": {"name": "Story"},
+                "summary": "SSO for Acme Vault", "status": {"name": "To Do"}, "issuetype": {"name": "Story"},
                 "assignee": {"displayName": "Ana"}, "updated": "2026-11-10T10:00:00.000+0000"}}]}),
         ),
         ("GET", "/ex/jira/cloud-1/rest/api/3/issue/PM-1") => reply(
             ok,
             json!({"key": "PM-1", "fields": {
-                "summary": "SSO for DSM", "status": {"name": "To Do"}, "issuetype": {"name": "Story"},
+                "summary": "SSO for Acme Vault", "status": {"name": "To Do"}, "issuetype": {"name": "Story"},
                 "description": {"type": "doc", "version": 1, "content": [
                     {"type": "paragraph", "content": [{"type": "text", "text": "Customers want SAML."}]}]},
                 "parent": {"key": "PM-100"},
@@ -301,7 +301,7 @@ async fn handle(
                 ok,
                 json!({"ok": true, "results": {"messages": [{"author_user_id": "U2",
                     "author_name": "Sam SE", "channel_id": "C0FIELD", "channel_name": "field-questions",
-                    "message_ts": "1731500000.000100", "content": "Does DSM support SAML SSO yet?",
+                    "message_ts": "1731500000.000100", "content": "Does Acme Vault support SAML SSO yet?",
                     "is_author_bot": false,
                     "permalink": "https://example.slack.com/archives/C0FIELD/p1731500000000100"}]},
                     "response_metadata": {"next_cursor": ""}}),
@@ -310,10 +310,10 @@ async fn handle(
         ("POST", "/api/conversations.replies") => reply(
             ok,
             json!({"ok": true, "messages": [
-                {"user": "U2", "ts": "1731500000.000100", "text": "Does DSM support SAML SSO yet?"},
+                {"user": "U2", "ts": "1731500000.000100", "text": "Does Acme Vault support SAML SSO yet?"},
                 {"user": "U3", "ts": "1731500005.000100", "text": "+1"}]}),
         ),
-        // The audience check: C0TEAM (members over two pages), C0ACME (Slack Connect),
+        // The audience check: C0TEAM (members over two pages), C0GLOBEX (Slack Connect),
         // C0HUGE (members without end), C0NOPE (members refused), C0GONE (no such channel).
         ("POST", "/api/conversations.info") => {
             let f = req.form();
@@ -321,7 +321,7 @@ async fn handle(
             if channel == "C0GONE" {
                 return reply(ok, json!({"ok": false, "error": "channel_not_found"}));
             }
-            let ext = channel == "C0ACME";
+            let ext = channel == "C0GLOBEX";
             reply(
                 ok,
                 json!({"ok": true, "channel": {"id": channel, "is_ext_shared": ext,
@@ -341,7 +341,7 @@ async fn handle(
                     ok,
                     json!({"ok": true, "members": ["U0CY"], "response_metadata": {"next_cursor": ""}}),
                 ),
-                (Some("C0ACME"), _) => reply(
+                (Some("C0GLOBEX"), _) => reply(
                     ok,
                     json!({"ok": true, "members": ["U0ANA", "W0EXT"],
                            "response_metadata": {"next_cursor": ""}}),
@@ -876,7 +876,7 @@ async fn jira_search_read_and_create() {
         hits[0].source.url,
         "https://example.atlassian.net/browse/PM-1"
     );
-    assert_eq!(hits[0].title, "PM-1: SSO for DSM");
+    assert_eq!(hits[0].title, "PM-1: SSO for Acme Vault");
     let search = &l.mock.requests("search/jql")[0];
     assert_eq!(search.query["jql"], "project = PM AND text ~ SSO");
     assert_eq!(search.query["maxResults"], "5");
@@ -1077,7 +1077,10 @@ async fn slack_search_thread_and_reply_as_the_pm() {
         .await
         .unwrap();
     assert_eq!(hits[0].source.id, "C0FIELD:1731500000.000100");
-    assert_eq!(hits[0].content["text"], "Does DSM support SAML SSO yet?");
+    assert_eq!(
+        hits[0].content["text"],
+        "Does Acme Vault support SAML SSO yet?"
+    );
     let search = &l.mock.requests("assistant.search.context")[0];
     assert_eq!(search.auth.as_deref(), Some("Bearer xoxp-ana"));
     assert_eq!(search.form()["query"], "SAML SSO");
@@ -1170,9 +1173,9 @@ async fn slack_audience_is_read_with_the_pms_token() {
     assert!(!pages[0].form().contains_key("cursor"));
     assert_eq!(pages[1].form()["cursor"], "page2");
 
-    let acme = l.slack.audience(ana(), "C0ACME").await.unwrap();
-    assert!(acme.external && acme.shared);
-    assert_eq!(acme.members, vec!["U0ANA", "W0EXT"]);
+    let globex = l.slack.audience(ana(), "C0GLOBEX").await.unwrap();
+    assert!(globex.external && globex.shared);
+    assert_eq!(globex.members, vec!["U0ANA", "W0EXT"]);
 
     // Capped at 1,000 members.
     let huge = l.slack.audience(ana(), "C0HUGE").await.unwrap();
@@ -1194,7 +1197,7 @@ async fn slack_audience_is_read_with_the_pms_token() {
         identity: "bots.scout",
         reads: &reads,
     });
-    l.slack.audience(bot, "C0ACME").await.unwrap();
+    l.slack.audience(bot, "C0GLOBEX").await.unwrap();
     assert_eq!(
         l.mock
             .exact("/api/conversations.info")
@@ -1293,13 +1296,13 @@ async fn slack_writes_check_their_audience_before_posting() {
     assert_eq!(decide(team, false).await.unwrap().status, Status::Approved);
     assert_eq!(l.mock.requests("chat.postMessage").len(), 1);
 
-    let acme = draft("C0ACME").await;
+    let globex = draft("C0GLOBEX").await;
     assert!(matches!(
-        decide(acme.clone(), false).await,
+        decide(globex.clone(), false).await,
         Err(DecisionError::NeedsExternalConfirm(_))
     ));
     assert_eq!(l.mock.requests("chat.postMessage").len(), 1, "not posted");
-    assert_eq!(decide(acme, true).await.unwrap().status, Status::Approved);
+    assert_eq!(decide(globex, true).await.unwrap().status, Status::Approved);
     assert_eq!(l.mock.requests("chat.postMessage").len(), 2);
 
     for channel in ["C0GONE", "C0NOPE"] {

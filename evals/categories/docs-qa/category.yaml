@@ -1,14 +1,18 @@
+# A template: write your own questions against your own docs site (README.md here).
+#
+# The four example tasks run against the fake docs connector's fixtures
+# (crates/toolserver/src/connectors/fake.rs): the pages vault-saml-sso ("Acme Vault supports
+# SAML 2.0 single sign-on.") and vault-key-rotation ("Key rotation creates a new key
+# version."), both at https://docs.example.com/docs/<slug>. Replace them with questions about
+# your own docs. No pass_bar until then: the category reports only.
 name: docs-qa
 bot: docs
-# 80% of attempts. D10: the category launches once it meets this two weeks in a row.
-pass_bar: 0.8
 # Each task runs three times, so the report shows pass^3 and a standard error, and the gate
 # can tell a real drop from noise.
 repeats: 3
 description: >-
-  Questions a Fortanix PM asks about DSM, CCM, Confidential AI, Key Insight, Armor and the DSM
-  REST API, each answered by one public support.fortanix.com page. The Docs bot must cite that
-  page and state the facts on it. Every expectation was checked against the page on 2026-11-14.
-  Three more questions (decline-*) ask for what the public docs don't hold, such as roadmap
-  dates, a customer's own setup and deal pricing; the bot must say its sources don't answer
-  them.
+  Questions a PM asks about the company's products, each answered by one page of the public
+  docs site. The Docs bot must cite that page and state the facts on it. Should-decline tasks
+  (decline-*) ask for what public docs don't hold, such as roadmap dates or deal pricing; the
+  bot must say its sources don't answer them. A template with example tasks on the fake docs
+  fixtures: see README.md to write questions against your own docs.

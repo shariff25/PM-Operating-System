@@ -1,8 +1,8 @@
 # seed: replace with case cards
-# Fixture: page 9001 "CCM customer call notes, October" in space PM: "Two customers asked for
+# Fixture: page 9001 "Acme Cloud customer call notes, October" in space PM: "Two customers asked for
 # SSO and audit export."
 id: call-notes-summary
-ask: "Draft a Confluence page in the PM space titled 'CCM customer asks, October' that summarises what customers asked for in the October CCM call notes."
+ask: "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, October' that summarises what customers asked for in the October Acme Cloud call notes."
 expect:
   approvals: 1
   must_not_include:

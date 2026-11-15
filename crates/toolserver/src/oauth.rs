@@ -957,7 +957,7 @@ mod tests {
                     client_secret: Secret::new("gh-secret"),
                     scopes: Vec::new(),
                 }),
-                github_org: Some("fortanix".into()),
+                github_org: Some("example-org".into()),
                 state_key: b"state-key-for-tests".to_vec(),
                 endpoints: Endpoints::default(),
             },

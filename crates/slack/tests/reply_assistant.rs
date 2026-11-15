@@ -300,7 +300,7 @@ fn reply(id: &str, sensitivity: &str, age: chrono::Duration) -> Value {
         "tool": "slack.post_reply", "status": "pending", "args_hash": "x",
         "args": {
             "channel": "C0LAUNCH", "thread_ts": "1731500000.000100",
-            "text": "SSO ships in 5.1. See <https://support.fortanix.com/sso|the SSO guide>.",
+            "text": "SSO ships in 5.1. See <https://docs.example.com/sso|the SSO guide>.",
         },
         "sources_sensitivity": sensitivity,
         "created_at": rfc3339(Utc::now() - age),
@@ -569,7 +569,7 @@ async fn the_reply_card_shows_the_draft_never_the_question_and_posts_as_you() {
         s.contains("*Reply drafted for <#C0LAUNCH>* · <https://slack.com/archives/C0LAUNCH/p1731500000000100|open the thread>"),
         "{s}"
     );
-    assert!(s.contains("> SSO ships in 5.1. See <https://support.fortanix.com/sso|the SSO guide>."));
+    assert!(s.contains("> SSO ships in 5.1. See <https://docs.example.com/sso|the SSO guide>."));
     assert!(s.contains("Visible to 14 people"));
     assert!(s.contains("built from internal sources"));
     assert!(
@@ -1109,7 +1109,7 @@ async fn reply_assistant_on_off_and_status() {
     })
     .await;
     assert_eq!(note.body["user"], "U0STRANGER");
-    assert!(text_of(&note).contains("PM OS is for the Fortanix product team"));
+    assert!(text_of(&note).contains("PM OS is for the product team"));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         stack.routine_writes().len(),

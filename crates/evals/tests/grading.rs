@@ -10,7 +10,7 @@ use pmos_evals::outcome::Outcome;
 use pmos_evals::spec::{DraftCheck, EvalTask, Expect};
 use serde_json::json;
 
-const PAGE: &str = "https://support.fortanix.com/docs/fortanix-saas-ip-whitelisting";
+const PAGE: &str = "https://docs.example.com/docs/acme-saas-ip-whitelisting";
 
 fn task(expect: Expect) -> EvalTask {
     EvalTask {
@@ -38,22 +38,22 @@ fn done(result: &str) -> Outcome {
 fn citations_match_loosely() {
     let n = normalize_url(PAGE);
     for variant in [
-        "https://support.fortanix.com/docs/fortanix-saas-ip-whitelisting/",
-        "https://support.fortanix.com/docs/fortanix-saas-ip-whitelisting.md",
-        "https://support.fortanix.com/docs/fortanix-saas-ip-whitelisting?utm_source=slack",
-        "https://support.fortanix.com/docs/fortanix-saas-ip-whitelisting.md?x=1#30-ranges",
-        "http://www.support.fortanix.com/docs/fortanix-saas-ip-whitelisting",
-        "HTTPS://Support.Fortanix.com/docs/Fortanix-SaaS-IP-Whitelisting",
-        "https://support.fortanix.com/v1/docs/fortanix-saas-ip-whitelisting",
+        "https://docs.example.com/docs/acme-saas-ip-whitelisting/",
+        "https://docs.example.com/docs/acme-saas-ip-whitelisting.md",
+        "https://docs.example.com/docs/acme-saas-ip-whitelisting?utm_source=slack",
+        "https://docs.example.com/docs/acme-saas-ip-whitelisting.md?x=1#30-ranges",
+        "http://www.docs.example.com/docs/acme-saas-ip-whitelisting",
+        "HTTPS://Docs.Example.com/docs/Acme-SaaS-IP-Whitelisting",
+        "https://docs.example.com/v1/docs/acme-saas-ip-whitelisting",
     ] {
         assert_eq!(normalize_url(variant), n, "{variant}");
     }
     assert_ne!(
-        normalize_url("https://support.fortanix.com/docs/fortanix-saas-ip-whitelisting-2"),
+        normalize_url("https://docs.example.com/docs/acme-saas-ip-whitelisting-2"),
         n
     );
     assert_ne!(
-        normalize_url("https://support.fortanix.com/apidocs/fortanix-saas-ip-whitelisting"),
+        normalize_url("https://docs.example.com/apidocs/acme-saas-ip-whitelisting"),
         n
     );
 }
@@ -96,13 +96,13 @@ fn text_is_compared_loosely() {
 fn a_good_answer_passes() {
     let t = task(Expect {
         must_cite: vec![PAGE.into()],
-        must_include: vec!["ip-ranges.fortanix.com".into(), "30 days".into()],
+        must_include: vec!["ip-ranges.example.com".into(), "30 days".into()],
         must_not_include: vec!["<think>".into()],
         approvals: Some(0),
         ..Expect::default()
     });
     let answer = format!(
-        "Fortanix announces new IPs at **ip-ranges.fortanix.com** at least 30\u{a0}days ahead.\n\n[Fortanix SaaS IP Whitelisting]({PAGE}.md)"
+        "Acme announces new IPs at **ip-ranges.example.com** at least 30\u{a0}days ahead.\n\n[Acme SaaS IP Whitelisting]({PAGE}.md)"
     );
     let g = grade(&t, &done(&answer));
     assert!(g.passed(), "{:?}", g.failures);
@@ -111,10 +111,7 @@ fn a_good_answer_passes() {
 #[test]
 fn each_expectation_is_checked() {
     let t = task(Expect {
-        must_cite: vec![
-            PAGE.into(),
-            "https://support.fortanix.com/docs/other".into(),
-        ],
+        must_cite: vec![PAGE.into(), "https://docs.example.com/docs/other".into()],
         must_include: vec!["30 days".into(), "IPv6".into()],
         must_not_include: vec!["<think>".into()],
         approvals: None,
@@ -125,7 +122,7 @@ fn each_expectation_is_checked() {
         g.failures,
         vec![
             Check::MissingCitation {
-                url: "https://support.fortanix.com/docs/other".into()
+                url: "https://docs.example.com/docs/other".into()
             },
             Check::MissingText {
                 text: "IPv6".into()

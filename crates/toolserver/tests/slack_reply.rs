@@ -3,7 +3,7 @@
 //! what a draft was built from, the audience check, and the 24-hour expiry.
 //!
 //! The Slack fixtures are the fake connector's (`connectors/fake.rs`): #pm-team (`C0PMTEAM`,
-//! all team), #field-questions (`C0FIELD`, one outsider), #acme-shared (`C0ACMECX`, Slack
+//! all team), #field-questions (`C0FIELD`, one outsider), #globex-shared (`C0GLOBEXCX`, Slack
 //! Connect). Postgres cases need `PMOS_TEST_DATABASE_URL`, as in `tests/stores.rs`.
 
 mod common;
@@ -104,7 +104,7 @@ async fn restricted_draft(f: &Fixture, run: &str, args: Value) -> String {
         run,
         Some((
             "context_read",
-            json!({"path": "context/partners/acme-nda.md"}),
+            json!({"path": "context/partners/globex-nda.md"}),
         )),
         args,
     )
@@ -303,7 +303,7 @@ async fn sources_sensitivity_is_recorded_from_reads(f: &Fixture) {
             "context-restricted",
             Some((
                 "context_read",
-                json!({"path": "context/partners/acme-nda.md"}),
+                json!({"path": "context/partners/globex-nda.md"}),
             )),
             Sensitivity::Restricted,
         ),
@@ -329,7 +329,7 @@ async fn sources_sensitivity_is_recorded_from_reads(f: &Fixture) {
     for (tool, read) in [
         (
             "context_read",
-            json!({"path": "context/partners/acme-nda.md"}),
+            json!({"path": "context/partners/globex-nda.md"}),
         ),
         ("docs_search", json!({"query": "rotation"})),
     ] {
@@ -493,7 +493,7 @@ async fn restricted_drafts_never_reach_outsiders(f: &Fixture) {
         .call(
             &s,
             "context_read",
-            json!({"path": "context/partners/acme-nda.md"}),
+            json!({"path": "context/partners/globex-nda.md"}),
             now(),
         )
         .await
@@ -558,13 +558,13 @@ async fn external_channels_need_a_second_confirmation(f: &Fixture) {
         .call(
             &s,
             "slack_send_message",
-            json!({"channel": SLACK_CONNECT, "text": "Hello Acme"}),
+            json!({"channel": SLACK_CONNECT, "text": "Hello Globex"}),
             now(),
         )
         .await
         .unwrap();
     let sent = sent["approval_id"].as_str().unwrap();
-    let edit = json!({"channel": SLACK_CONNECT, "text": "Hello, Acme team"});
+    let edit = json!({"channel": SLACK_CONNECT, "text": "Hello, Globex team"});
     assert!(matches!(
         decide(f, sent, Decision::Edit, Some(edit.clone()), false, now()).await,
         Err(DecisionError::NeedsExternalConfirm(_))
@@ -976,7 +976,7 @@ async fn decision_answers_over_http() {
     let s = start().await;
     let nda = Some((
         "context_read",
-        json!({"path": "context/partners/acme-nda.md"}),
+        json!({"path": "context/partners/globex-nda.md"}),
     ));
     let jira = Some(("jira_read", json!({"key": "PM-101"})));
     let approve = json!({"decided_by": SLACK_PM, "decision": "approve"});

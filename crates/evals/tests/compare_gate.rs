@@ -291,7 +291,7 @@ fn the_gate_fails_when_a_check_that_passed_now_fails() {
     let mut base = report("2026-11-02", &[("a", None, ONE), ("b", None, ALL)]);
     let mut cand = report("2026-11-09", &[("a", None, ONE), ("b", None, ALL)]);
     let cite = Check::MissingCitation {
-        url: "https://support.fortanix.com/docs/x".into(),
+        url: "https://docs.example.com/docs/x".into(),
     };
     for l in cand.tasks.iter_mut().filter(|l| l.id == "a") {
         l.passed = false;
@@ -301,7 +301,7 @@ fn the_gate_fails_when_a_check_that_passed_now_fails() {
     assert!(
         r.reasons.contains(&FailReason::CheckFlipped {
             task: "a".into(),
-            check: "must_cite:support.fortanix.com/docs/x".into(),
+            check: "must_cite:docs.example.com/docs/x".into(),
         }),
         "{:?}",
         r.reasons

@@ -26,7 +26,7 @@ Turn a brief into a review-ready first draft (PRD journey J1).
    - two or three similar past PRDs from `exemplars`;
    - the linked epic and its open issues (`jira.read`, `jira.search`);
    - recent customer asks in Jira and Confluence call notes;
-   - what the public support docs already say about the area (`docs.search`), so the PRD
+   - what the public docs already say about the area (`docs.search`), so the PRD
      doesn't contradict shipped behavior.
 3. Ask up to three clarifying questions where the answer would change scope, users or success
    metrics. Wait for answers, or for the PM to say "draft anyway".

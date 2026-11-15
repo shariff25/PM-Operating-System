@@ -1,7 +1,7 @@
 # seed: replace with case cards
 #
 # These tasks run against the fake connectors' fixtures (crates/toolserver/src/connectors/fake.rs):
-# Confluence space PM with page 9001 "CCM customer call notes, October" ("Two customers asked
+# Confluence space PM with page 9001 "Acme Cloud customer call notes, October" ("Two customers asked
 # for SSO and audit export.") and page 9002 "PRD: Key export v2", an exemplar PRD. Replace them
 # with case cards (evals/case-card.md) as real ones come in. No pass_bar until then: the
 # category reports only.

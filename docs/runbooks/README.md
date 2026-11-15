@@ -23,7 +23,7 @@ commands.
 | Service | Port (on the Spark) | What it does |
 | --- | --- | --- |
 | `postgres` | none | One database per service |
-| `docs` | none | The Fortanix support docs index |
+| `docs` | none | The public docs index (your docs site) |
 | `toolserver` | 127.0.0.1:8710 | The only way bots reach Jira, Confluence, Slack, context and memory. Also handles approvals, audit and the OAuth callback. |
 | `gateway` | 127.0.0.1:8740 | The local models, with fair queueing between users |
 | `bots` | 127.0.0.1:8750 | Tasks, routines, traces and notifications |

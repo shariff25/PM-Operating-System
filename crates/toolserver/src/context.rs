@@ -23,7 +23,7 @@ use crate::store::StoreResult;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContextDoc {
-    /// Path relative to the content root, such as `context/products/ccm.md`. Also the
+    /// Path relative to the content root, such as `context/products/cloud.md`. Also the
     /// citation reference.
     pub path: String,
     pub domain: String,
@@ -251,13 +251,17 @@ mod tests {
         let root = dir.path();
         write(
             root,
-            "context/products/ccm.md",
-            &doc("CCM", "internal", "Key management for clouds."),
+            "context/products/cloud.md",
+            &doc("Acme Cloud", "internal", "Key management for clouds."),
         );
         write(
             root,
-            "context/competitors/acme.md",
-            &doc("Acme", "internal", "Acme sells key management. Key key."),
+            "context/competitors/initech.md",
+            &doc(
+                "Initech",
+                "internal",
+                "Initech sells key management. Key key.",
+            ),
         );
         write(root, "context/products/README.md", "# Products\n");
         write(root, "context/loose.md", &doc("Loose", "internal", "key"));
@@ -273,8 +277,8 @@ mod tests {
             .await
             .unwrap()
             .hits;
-        assert_eq!(hits[0].doc.path, "context/competitors/acme.md");
-        assert_eq!(hits[1].doc.path, "context/products/ccm.md");
+        assert_eq!(hits[0].doc.path, "context/competitors/initech.md");
+        assert_eq!(hits[1].doc.path, "context/products/cloud.md");
         assert!(hits[0].snippet.contains("key management"));
 
         let hits = index
@@ -292,7 +296,7 @@ mod tests {
             .hits
             .is_empty());
         assert!(index
-            .get("context/products/ccm.md")
+            .get("context/products/cloud.md")
             .await
             .unwrap()
             .is_some());

@@ -2,7 +2,7 @@
 # TESTING ONLY: run every PM OS service on this machine against a test Slack workspace, with a
 # Claude model behind the gateway (docs/testing-with-claude.md).
 #
-# What runs: pmos-docs (the public support docs), the tool server (fake Jira, Confluence and
+# What runs: pmos-docs (your public docs site, if PMOS_DOCS_BASE_URL is set), the tool server (fake Jira, Confluence and
 # Slack fixtures), the gateway (Claude test upstream), the bot runtime, one harness worker per
 # bot (docs and pm-<you>), and the Slack bot. Everything keeps its state in memory and in
 # $STATE; nothing touches the real content repo.
@@ -15,6 +15,10 @@
 # Optional:
 #   PMOS_TEST_HANDLE      your PM OS handle in the test (default: tester)
 #   PMOS_TEST_STATE       where state and logs go (default: state/claude-test)
+#   PMOS_DOCS_BASE_URL    your public docs site for the Docs bot, e.g. https://docs.example.com
+#                         (also PMOS_DOCS_NAME, PMOS_DOCS_PAGE_PREFIXES, PMOS_DOCS_API_PREFIX and
+#                         PMOS_DOCS_PRODUCTS; see docs/docs-server.md). Unset: the Docs bot
+#                         says no docs site is configured.
 #
 # Stop with Ctrl-C; every service is stopped with it.
 set -euo pipefail
@@ -118,7 +122,7 @@ start slack env PMOS_SLACK_APP_TOKEN="$PMOS_SLACK_APP_TOKEN" \
 
 echo
 echo "== PM OS test stack is up. In the test Slack workspace, DM the PM OS app:"
-echo "   docs: what ports does DSM need?     (the Docs bot, real support docs)"
+echo "   docs: how do I get started?         (the Docs bot, your docs site)"
 echo "   summarize the open launch issues    (your bot $BOT_PERSONAL, fake Jira)"
 echo "   setup                               (the onboarding checklist)"
 echo "   Logs: $STATE/logs. Ctrl-C stops everything."

@@ -1,16 +1,16 @@
-//! Keeps the index in step with the portal.
+//! Keeps the index in step with the docs site (`PMOS_DOCS_BASE_URL`).
 //!
 //! One run:
-//! 1. Read `robots.txt`. If it's missing (4xx), everything is allowed. If the portal can't
+//! 1. Read `robots.txt`. If it's missing (4xx), everything is allowed. If the docs site can't
 //!    say (5xx or no answer), the run stops and fetches nothing.
-//! 2. Read the `llms.txt` index.
+//! 2. Read the `llms.txt` index, keeping the pages under the configured path prefixes.
 //! 3. Fetch each listed page's markdown, a few at a time with a pause between requests, as
 //!    a conditional GET (`If-None-Match`), so unchanged pages cost a 304.
 //! 4. Remove pages that left the index, unless the index shrank so much that it looks broken.
 //!
 //! A page that fails to fetch keeps its last good copy; one bad run never empties the index.
 //!
-//! The portal's content is untrusted input: redirects are followed only within the portal,
+//! The site's content is untrusted input: redirects are followed only within the site,
 //! every body is read with a hard size cap, and a page must be served as markdown or text.
 
 use std::collections::HashSet;
@@ -23,7 +23,7 @@ use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::page::{parse_index, parse_page, product_of, DocPage, IndexEntry};
+use crate::page::{parse_index, parse_page, DocPage, IndexEntry, Products, Site};
 use crate::robots::Robots;
 use crate::store::DocsStore;
 
@@ -32,21 +32,25 @@ pub const AGENT: &str = "pmos-docs";
 
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
-    /// `https://support.fortanix.com`
-    pub base: String,
+    /// The site and the pages of it to index.
+    pub site: Site,
+    /// How pages are labelled with products.
+    pub products: Products,
     pub concurrency: usize,
     /// Minimum gap between request starts, across the whole sync (1 s = 1 request/second).
-    /// Doubles, up to [`MAX_GAP`], each time the portal answers 429.
+    /// Doubles, up to [`MAX_GAP`], each time the docs site answers 429.
     pub delay: Duration,
     pub max_page_bytes: usize,
     /// Skip removals if fewer than this share of the stored pages would remain.
     pub min_keep_ratio: f64,
 }
 
-impl Default for SyncConfig {
-    fn default() -> Self {
+impl SyncConfig {
+    /// The defaults for `site`: no products, two workers, one request a second.
+    pub fn new(site: Site) -> Self {
         Self {
-            base: "https://support.fortanix.com".into(),
+            site,
+            products: Products::default(),
             concurrency: 2,
             delay: Duration::from_millis(1000),
             max_page_bytes: 2 * 1024 * 1024,
@@ -63,7 +67,7 @@ pub struct SyncReport {
     pub listed: usize,
     /// Pages downloaded and stored (new or changed).
     pub fetched: usize,
-    /// Pages the portal said hadn't changed (304).
+    /// Pages the docs site said hadn't changed (304).
     pub unchanged: usize,
     pub failed: usize,
     pub skipped_robots: usize,
@@ -88,19 +92,19 @@ pub enum SyncError {
 }
 
 const MAX_ERRORS: usize = 10;
-/// Caps on what the portal can make us read.
+/// Caps on what the docs site can make us read.
 pub const MAX_ROBOTS_BYTES: usize = 512 * 1024;
 pub const MAX_INDEX_BYTES: usize = 5 * 1024 * 1024;
-/// Redirects followed per request, all within the portal.
+/// Redirects followed per request, all within the docs site.
 const MAX_REDIRECTS: usize = 3;
 /// More 401/403 answers than this in one run (at least 5, else 2% of the listed pages) look
-/// like the portal blocking us rather than pages going private: keep every page.
+/// like the docs site blocking us rather than pages going private: keep every page.
 fn restricted_storm(restricted: usize, listed: usize) -> bool {
     restricted > (listed / 50).max(5)
 }
 /// The slowest pace the sync backs off to.
 pub const MAX_GAP: Duration = Duration::from_secs(10);
-/// Retries for a page the portal rate-limited.
+/// Retries for a page the docs site rate-limited.
 pub const MAX_RETRIES: usize = 3;
 /// Wait this long after a 429 without `Retry-After`; never longer than 5 minutes.
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -186,7 +190,7 @@ impl Capped {
     }
 }
 
-/// Markdown or plain text, as the portal serves its `.md` pages. A missing header is
+/// Markdown or plain text, as the docs site serves its `.md` pages. A missing header is
 /// accepted; HTML (a login page, an error page) is not.
 fn is_text(res: &reqwest::Response) -> bool {
     match res
@@ -235,9 +239,9 @@ enum Outcome {
 
 impl Syncer {
     pub fn new(config: SyncConfig, store: Arc<dyn DocsStore>) -> Self {
-        // Follow redirects only within the portal (same scheme and host), so a hijacked page
+        // Follow redirects only within the site (same scheme and host), so a hijacked page
         // can't point the crawler at an internal service.
-        let base = reqwest::Url::parse(&config.base).ok();
+        let base = reqwest::Url::parse(&config.site.base).ok();
         let redirects = reqwest::redirect::Policy::custom(move |attempt| {
             let same_site = base.as_ref().is_some_and(|b| {
                 attempt.url().scheme() == b.scheme()
@@ -249,7 +253,7 @@ impl Syncer {
             } else if same_site {
                 attempt.follow()
             } else {
-                attempt.error("redirect outside the portal")
+                attempt.error("redirect outside the docs site")
             }
         });
         let http = reqwest::Client::builder()
@@ -257,7 +261,7 @@ impl Syncer {
             .connect_timeout(Duration::from_secs(10))
             .redirect(redirects)
             .user_agent(format!(
-                "{AGENT}/{} (internal Fortanix PM OS docs index)",
+                "{AGENT}/{} (PM OS docs index)",
                 env!("CARGO_PKG_VERSION")
             ))
             .build()
@@ -270,7 +274,7 @@ impl Syncer {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.config.base.trim_end_matches('/'))
+        format!("{}{path}", self.config.site.base)
     }
 
     async fn robots(&self) -> Result<Robots, SyncError> {
@@ -287,7 +291,7 @@ impl Syncer {
                 .map_err(|e| SyncError::Robots(e.describe()))?;
             Ok(Robots::parse(&String::from_utf8_lossy(&bytes), AGENT))
         } else if status == StatusCode::TOO_MANY_REQUESTS {
-            // Not "missing": the portal is asking us to slow down. Don't crawl this run.
+            // Not "missing": the docs site is asking us to slow down. Don't crawl this run.
             Err(SyncError::Robots(status.to_string()))
         } else if status.is_client_error() {
             Ok(Robots::default())
@@ -311,7 +315,7 @@ impl Syncer {
             .map_err(|e| SyncError::Index(e.describe()))?;
         Ok(parse_index(
             &String::from_utf8_lossy(&bytes),
-            &self.config.base,
+            &self.config.site,
         ))
     }
 
@@ -331,11 +335,7 @@ impl Syncer {
         let disallowed: Arc<Mutex<HashSet<String>>> = Arc::default();
         let mut restricted = HashSet::new();
         for entry in entries.iter().cloned() {
-            let path = entry
-                .url
-                .strip_prefix(self.config.base.trim_end_matches('/'))
-                .unwrap_or(&entry.url)
-                .to_string();
+            let path = self.config.site.path_of(&entry.url).to_string();
             if !robots.allows(&path) {
                 disallowed
                     .lock()
@@ -392,7 +392,7 @@ impl Syncer {
         }
 
         // A page that now needs a login loses any copy from when it was public, unless so
-        // many did at once that it looks like the portal is blocking us.
+        // many did at once that it looks like the docs site is blocking us.
         let mut disallowed = disallowed.lock().expect("robots set").clone();
         if restricted_storm(restricted.len(), entries.len()) {
             tracing::warn!(
@@ -403,7 +403,7 @@ impl Syncer {
             report.errors.insert(
                 0,
                 format!(
-                    "{} pages answered 401/403 at once: that looks like the portal blocking the crawler, so their last copies were kept",
+                    "{} pages answered 401/403 at once: that looks like the docs site blocking the crawler, so their last copies were kept",
                     restricted.len()
                 ),
             );
@@ -511,7 +511,14 @@ async fn fetch_one(
             .to_string()
     });
     let page = DocPage {
-        product: product_of(&title, &entry.url, parsed.api_title.as_deref()).to_string(),
+        product: cfg
+            .products
+            .product_of(
+                &title,
+                cfg.site.path_of(&entry.url),
+                parsed.api_title.as_deref(),
+            )
+            .to_string(),
         url: entry.url.clone(),
         slug,
         title,

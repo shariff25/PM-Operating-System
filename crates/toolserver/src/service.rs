@@ -749,9 +749,15 @@ impl ToolService {
                         reads: &bot.reads,
                     });
                 }
-                let items = connector
-                    .read(caller, spec.action(), args)
-                    .await
+                let items = match connector.read(caller, spec.action(), args).await {
+                    // Not set up here: say so plainly, as an answer rather than an error, so
+                    // an agent or Slack can tell the PM.
+                    Err(ConnectorError::NotConfigured(note)) => {
+                        return Ok(json!({ "results": [], "note": note }));
+                    }
+                    other => other,
+                };
+                let items = items
                     .map_err(|e| match (e, caller.team_bot) {
                         (
                             ConnectorError::NotConnected(_) | ConnectorError::Reconnect(_),

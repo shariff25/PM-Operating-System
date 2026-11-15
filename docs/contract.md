@@ -92,7 +92,7 @@ Domains: `products`, `personas`, `competitors`, `partners`, `stakeholders`, `sty
 
 ```yaml
 ---
-title: CCM                  # optional
+title: Acme Vault           # optional
 owner: "@handle"            # required; "TODO" warns until someone takes it
 last-reviewed: 2026-11-14   # required, YYYY-MM-DD
 sensitivity: internal       # required: public | internal | restricted
@@ -111,9 +111,9 @@ Rules: `context-domain`, `context-parse`, `context-stale` (warning), `context-fu
 ```yaml
 ---
 name: Security architect
-lens: Threat model; attestation and key-handling correctness
+lens: Threat model; correctness of security claims and defaults
 flags:
-  - Wrong claims about TEEs, attestation or key release
+  - Wrong or unscoped security claims
 owner: "@handle"            # optional
 ---
 ```

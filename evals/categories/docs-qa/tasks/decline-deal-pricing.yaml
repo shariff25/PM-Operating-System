@@ -1,9 +1,8 @@
-# Should-not case: the public support docs can't answer this. The terms of one customer's deal
-# (its discount, its negotiated price) are commercial and private, never in public product
-# documentation. "Example Corp" is a placeholder, not a real customer. Chosen for that reason,
-# not from a search result; confirm with `docs.search` on the first live run.
+# Should-decline example: one customer's deal terms (its discount, its negotiated price) are
+# commercial and private, never in public product documentation. "Globex" is a fictional
+# customer.
 id: decline-deal-pricing
-ask: "What discount did Fortanix give Example Corp on its 2026 DSM SaaS renewal, and what per-key price did they end up paying?"
+ask: "What discount did we give Globex on its 2026 Acme Vault SaaS renewal, and what per-key price did they end up paying?"
 expect:
   must_decline: true
   # Reasoning must not leak into the answer, even with the gateway's strip-think

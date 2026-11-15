@@ -268,13 +268,13 @@ pub fn content_tree() -> (TempDir, PathBuf) {
     );
     write(
         &root,
-        "context/partners/acme-nda.md",
-        "---\ntitle: Acme partnership (NDA)\nowner: \"@pm\"\nlast-reviewed: 2026-11-01\nsensitivity: restricted\n---\n\n# Acme\n\nJoint roadmap for key management under NDA.\n",
+        "context/partners/globex-nda.md",
+        "---\ntitle: Globex partnership (NDA)\nowner: \"@pm\"\nlast-reviewed: 2026-11-01\nsensitivity: restricted\n---\n\n# Globex\n\nJoint roadmap for key management under NDA.\n",
     );
     write(
         &root,
         "context/products/key-management.md",
-        "---\ntitle: Key management overview\nowner: \"@pm\"\nlast-reviewed: 2026-06-01\nsensitivity: internal\n---\n\n# Key management\n\nPublic overview of key management in DSM.\n",
+        "---\ntitle: Key management overview\nowner: \"@pm\"\nlast-reviewed: 2026-06-01\nsensitivity: internal\n---\n\n# Key management\n\nPublic overview of key management in Acme Vault.\n",
     );
     write(
         &root,

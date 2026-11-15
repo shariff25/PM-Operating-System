@@ -238,7 +238,7 @@ async fn must_decline_through_a_run() {
     mock.script(
         "q-made-up",
         Script {
-            result: Some("DSM 6 ships in Q3 with quantum keys.".into()),
+            result: Some("Acme Vault 6 ships in Q3 with quantum keys.".into()),
             ..Script::default()
         },
     );

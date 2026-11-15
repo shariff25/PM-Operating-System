@@ -50,7 +50,7 @@ async fn bots_are_listed_with_their_tools_and_settings() {
 // ----- the task lifecycle -----------------------------------------------------------------
 
 async fn a_task_runs_from_slack_to_a_result(env: &Env) {
-    let task = env.ask("What ports does DSM need?").await;
+    let task = env.ask("What ports does Acme Vault need?").await;
     let tid = id(&task);
     assert!(tid.starts_with("tsk_") && tid.len() == 36);
     assert_eq!(task["status"], "queued");
@@ -142,7 +142,7 @@ async fn a_task_runs_from_slack_to_a_result(env: &Env) {
             &w("complete"),
             "worker",
             None,
-            json!({"result": "DSM needs port 443.", "approvals": []}),
+            json!({"result": "Acme Vault needs port 443.", "approvals": []}),
         )
         .await;
     assert_eq!(status, 200, "{done}");
@@ -152,7 +152,7 @@ async fn a_task_runs_from_slack_to_a_result(env: &Env) {
         .get(&format!("/v1/tasks/{tid}"), "slack", Some("ana"))
         .await;
     assert_eq!(status, 200);
-    assert_eq!(got["result"], "DSM needs port 443.");
+    assert_eq!(got["result"], "Acme Vault needs port 443.");
     assert_eq!(
         got["checklist"][0],
         json!({"item": "Search the docs", "done": true})
@@ -196,7 +196,7 @@ async fn a_task_runs_from_slack_to_a_result(env: &Env) {
     assert_eq!(feed[0]["requested_by"], "ana");
     assert_eq!(feed[0]["slack"]["channel"], "D0ANA");
     assert_eq!(feed[1]["kind"], "done");
-    assert_eq!(feed[1]["text"], "DSM needs port 443.");
+    assert_eq!(feed[1]["text"], "Acme Vault needs port 443.");
 
     // Nothing else is queued.
     let (status, _) = env.claim().await;
@@ -578,7 +578,7 @@ async fn a_bots_own_worker_touches_only_that_bots_tasks(env: &Env) {
     assert_eq!(status, 204, "the queued task is pm-ana's, not docs'");
 
     // Its own bot's task, it gets.
-    let docs_task = id(&env.ask("What ports does DSM need?").await);
+    let docs_task = id(&env.ask("What ports does Acme Vault need?").await);
     let (status, claim) = env
         .post(
             "/v1/worker/claim",

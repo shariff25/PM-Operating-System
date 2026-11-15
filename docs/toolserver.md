@@ -61,7 +61,7 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | Endpoint | Auth | Purpose |
 | --- | --- | --- |
 | `GET /healthz` | none | Liveness: the process answers |
-| `GET /readyz` | none | Readiness: `200` when storage answers within a second and every connector's own dependency (the support docs server) answers; `503` otherwise, naming the check that failed |
+| `GET /readyz` | none | Readiness: `200` when storage answers within a second and every connector's own dependency (the docs server) answers; `503` otherwise, naming the check that failed |
 | `POST /mcp` (Streamable HTTP) | `Bearer <session token>` | MCP for the harness: `tools/list`, `tools/call` |
 | `POST /internal/sessions` `{user, skill, run_id, ttl_minutes?}` | service or bot token | Create a session; returns `token` and the session's tools. `403` if the user isn't in `team.yaml` (live connectors), or the bot asks for a skill outside `PMOS_BOT_SKILLS`. |
 | `POST /internal/sessions` `{user, bot, run_id, ttl_minutes?}` | service token | Create a bot session (see **Bot sessions**). Send `skill` or `bot`, never both (`400`). `404` for an unknown bot; `403` if `user` may not use it. |
@@ -168,7 +168,7 @@ drafts create one item.
 (`sessions.sources_sensitivity`, which only rises):
 - `context_search` and `context_read`: each result's own `sensitivity`;
 - Jira, Confluence, Slack and memory reads: `internal`;
-- the support docs: `public`.
+- the public docs: `public`.
 
 A read that finds nothing counts for nothing. Every new approval item stores the session's
 value as `sources_sensitivity`; items made before migration 0008 have none, and the audience
@@ -307,7 +307,7 @@ read scope (see **Bot sessions**); its writes still act as the PM.
 | Jira | Atlassian OAuth 2.0 (3LO), via `api.atlassian.com/ex/jira/{cloudid}` | `GET /rest/api/3/search/jql`, `GET /rest/api/3/issue/{key}`, `POST /rest/api/3/issue` (description in Atlassian Document Format) |
 | Confluence | same token, via `api.atlassian.com/ex/confluence/{cloudid}` | `GET /wiki/rest/api/search?cql=`, `GET /wiki/api/v2/pages/{id}`, `GET /wiki/api/v2/spaces?keys=`, `POST /wiki/api/v2/pages` (always `status: draft`), `PUT /wiki/api/v2/pages/{id}` (version + 1) |
 | Slack | the PM's user token (`xoxp`), never a bot token | `assistant.search.context` (Real-time Search; results are never stored), `conversations.replies`, `chat.postMessage`, and for the audience check before a post, `conversations.info` and `conversations.members` (always the PM's token, even in a team bot's task) |
-| Support docs | none (public docs); the tool server's `PMOS_DOCS_TOKEN` to `pmos-docs` | `search_docs`, `get_doc` over MCP; see `docs/docs-server.md` |
+| Public docs | none (public docs); the tool server's `PMOS_DOCS_TOKEN` to `pmos-docs` | `search_docs`, `get_doc` over MCP; see `docs/docs-server.md` |
 
 These API shapes were checked against developer.atlassian.com, docs.slack.dev and
 docs.github.com in November 2026, and tested against local mocks (`tests/live_connectors.rs`,
@@ -396,12 +396,12 @@ ref with `force: false`). A `422` on the ref update means the branch moved: the 
 rebuilt on the new head, up to 3 more times.
 
 **Setting up the GitHub App** (a platform-owner PM, once):
-1. In the Fortanix org: Settings → Developer settings → GitHub Apps → New GitHub App.
+1. In your GitHub org: Settings → Developer settings → GitHub Apps → New GitHub App.
 2. **Callback URL:** `{PMOS_PUBLIC_URL}/oauth/github/callback`. Turn on **Expire user
    authorization tokens**. No webhook.
 3. **Permissions:** Repository: Contents read and write, Metadata read. Account: Email
    addresses read. Organization: Members read. Nothing else.
-4. **Where it can be installed:** only on this account. Install it on the Fortanix org, on
+4. **Where it can be installed:** only on this account. Install it on your org, on
    all repositories or on the repos PM OS uses: the content repo and the PMs' memory repos.
    With "only select repositories", add each new memory repo to the installation, or its PM
    gets `not_found`.
@@ -570,7 +570,7 @@ With `PMOS_CONNECTORS=live`:
 | `PMOS_SLACK_SCOPES` | search (`search:read.public`, `.private`, `.im`, `.mpim`), history (`channels:history`, `groups:history`, `im:history`, `mpim:history`), channel info and members for the audience check (`channels:read`, `groups:read`, `mpim:read`, `im:read`) and `chat:write` | Requested as `user_scope` only. A PM linked before the `:read` scopes were added must link Slack again: until then the audience check answers `503 audience_unavailable` ("reconnect Slack") |
 | `PMOS_ATLASSIAN_AUTH_URL`, `PMOS_ATLASSIAN_API_URL`, `PMOS_SLACK_URL` | the real hosts | For pointing at mocks |
 | `PMOS_GITHUB_CLIENT_ID`, `PMOS_GITHUB_CLIENT_SECRET` | none | From the GitHub App (see **GitHub**). Set both or neither; without them GitHub linking, `PMOS_MEMORY=github` and approving members are off |
-| `PMOS_GITHUB_ORG` | required with GitHub | The Fortanix org login. Memory repos and the content repo must be in it |
+| `PMOS_GITHUB_ORG` | required with GitHub | Your GitHub org's login. Memory repos and the content repo must be in it |
 | `PMOS_GITHUB_URL` | `https://api.github.com` | API base, for mocks |
 | `PMOS_GITHUB_AUTH_URL` | `https://github.com` | `/login/oauth/authorize` and `/login/oauth/access_token`, for mocks |
 | `PMOS_CONTENT_REPO` | none | `org/name` of the content repo, in `PMOS_GITHUB_ORG`. Required for approving and removing members |

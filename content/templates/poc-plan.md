@@ -37,7 +37,7 @@ Out of scope:
 | 1 | Kickoff and environment ready | |
 
 ## Roles
-| Role | Customer | Fortanix |
+| Role | Customer | Our team |
 | --- | --- | --- |
 | Executive sponsor | | |
 | Technical lead | | |
