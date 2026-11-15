@@ -9,6 +9,7 @@ use pmos_slack::runtime::Runtime;
 use pmos_slack::slackapi::SlackApi;
 use pmos_slack::socket::{Ended, Socket};
 use pmos_slack::toolserver::ToolServer;
+use pmos_slack::triage::{self, Triage, TriageConfig};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -21,6 +22,36 @@ fn need(key: &str) -> Result<String> {
 
 fn optional(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// The triage digest's settings, or `None` with `PMOS_TRIAGE_AT=off`.
+fn triage_config(default_tz: &str) -> Result<Option<TriageConfig>> {
+    let Some(at) =
+        triage::parse_at(optional("PMOS_TRIAGE_AT").as_deref()).map_err(|e| anyhow!(e))?
+    else {
+        return Ok(None);
+    };
+    let tz = default_tz.parse().map_err(|_| {
+        anyhow!("PMOS_DEFAULT_TZ must be an IANA time zone, such as Europe/London (or set PMOS_TRIAGE_AT=off)")
+    })?;
+    let min_edit = triage::parse_min_edit(optional("PMOS_TRIAGE_MIN_EDIT").as_deref())
+        .map_err(|e| anyhow!(e))?;
+    let console_url =
+        optional("PMOS_CONSOLE_PUBLIC_URL").map(|u| u.trim().trim_end_matches('/').to_string());
+    if console_url
+        .as_deref()
+        .is_some_and(|u| !u.starts_with("https://"))
+    {
+        tracing::warn!(
+            "PMOS_CONSOLE_PUBLIC_URL isn't https://; the triage digest shows no console links"
+        );
+    }
+    Ok(Some(TriageConfig {
+        at,
+        tz,
+        min_edit,
+        console_url,
+    }))
 }
 
 #[tokio::main]
@@ -51,6 +82,7 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(15))
         .build()?;
 
+    let default_tz = optional("PMOS_DEFAULT_TZ").unwrap_or_else(|| "UTC".into());
     // The bots (DMs, approval cards, routines) need the runtime; without it, `/docs` only.
     let bots = match optional("PMOS_BOTS_URL") {
         Some(bots_url) => {
@@ -65,7 +97,7 @@ async fn main() -> Result<()> {
                 runtime: Runtime::new(bots_url, need("PMOS_BOTS_TOKEN")?, http.clone()),
                 toolserver: toolserver.clone(),
                 team_file: team_file.clone(),
-                default_tz: optional("PMOS_DEFAULT_TZ").unwrap_or_else(|| "UTC".into()),
+                default_tz: default_tz.clone(),
                 github_org: optional("PMOS_GITHUB_ORG"),
                 response_url_prefix: SLACK_RESPONSE_URL_PREFIX.into(),
             }))
@@ -97,10 +129,19 @@ async fn main() -> Result<()> {
         });
     }
     let mut notifier = None;
+    let mut digest = None;
     if let Some(bots) = bots {
         let state_dir =
             PathBuf::from(optional("PMOS_SLACK_STATE_DIR").unwrap_or_else(|| "state/slack".into()));
         tracing::info!(state_dir = %state_dir.display(), "notification cursor kept here");
+        if let Some(cfg) = triage_config(&default_tz)? {
+            tracing::info!(at = %cfg.at, tz = %cfg.tz, min_edit = cfg.min_edit, "triage digest on weekdays");
+            digest = Some(tokio::spawn(
+                Triage::new(bots.clone(), cfg, &state_dir).run(shutdown.child_token()),
+            ));
+        } else {
+            tracing::info!("PMOS_TRIAGE_AT is off: no triage digest");
+        }
         socket = socket.with_bots(bots.clone());
         notifier = Some(tokio::spawn(
             Notifier::new(bots, state_dir).run(shutdown.child_token()),
@@ -117,6 +158,9 @@ async fn main() -> Result<()> {
     }
     if let Some(notifier) = notifier {
         let _ = tokio::time::timeout(Duration::from_secs(5), notifier).await;
+    }
+    if let Some(digest) = digest {
+        let _ = tokio::time::timeout(Duration::from_secs(5), digest).await;
     }
     match ended {
         // A non-zero exit, so a supervisor shows it rather than treating it as a clean stop.
