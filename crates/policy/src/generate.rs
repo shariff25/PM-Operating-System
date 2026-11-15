@@ -18,8 +18,8 @@ use crate::openshell::{
 use crate::spec::{ProviderAttachment, SandboxSpec, Upload};
 use crate::{
     provider_name, sandbox_name, yaml, Service, CONTENT_MOUNT, GENERATED_MARKER, MCP_VERSIONS,
-    RUN_AS, SYSTEM_READ_ONLY, SYSTEM_READ_WRITE, TOOLSERVER_MCP_PATH, TOOL_REGISTRY, WORKER_BINARY,
-    WORKSPACE,
+    RUN_AS, SHARED_CONTENT_DIRS, SYSTEM_READ_ONLY, SYSTEM_READ_WRITE, TOOLSERVER_MCP_PATH,
+    TOOL_REGISTRY, WORKER_BINARY, WORKSPACE,
 };
 
 /// Everything about one bot that its sandbox policy depends on.
@@ -35,6 +35,8 @@ pub struct BotContext {
     pub mcp_tools: BTreeSet<String>,
     /// The bot's master context files, relative to the content root.
     pub master: Vec<String>,
+    /// The [`SHARED_CONTENT_DIRS`] the content has, which the harness mounts for every bot.
+    pub shared: Vec<String>,
 }
 
 impl BotContext {
@@ -55,6 +57,11 @@ impl BotContext {
                 master.push(personal);
             }
         }
+        let shared = SHARED_CONTENT_DIRS
+            .iter()
+            .filter(|d| content_root.join(d).is_dir())
+            .map(|d| d.to_string())
+            .collect();
         Some(Self {
             bot: bot.name.clone(),
             role: role.name.clone(),
@@ -62,6 +69,7 @@ impl BotContext {
             skills: skills.into_iter().collect(),
             mcp_tools,
             master,
+            shared,
         })
     }
 
@@ -74,6 +82,7 @@ impl BotContext {
             skills: Vec::new(),
             mcp_tools: BTreeSet::new(),
             master: Vec::new(),
+            shared: Vec::new(),
         }
     }
 
@@ -86,14 +95,16 @@ impl BotContext {
     }
 
     /// The content uploaded into the sandbox, read-only: the role's skills, the bot's master
-    /// context and the tool registry (`tools.yaml`, which the worker reads to tell reads from
-    /// writes), each at the same relative path under [`CONTENT_MOUNT`].
+    /// context, the shared templates, reviewers and playbooks, and the tool registry
+    /// (`tools.yaml`, which the worker reads to tell reads from writes), each at the same
+    /// relative path under [`CONTENT_MOUNT`].
     pub fn uploads(&self) -> Vec<Upload> {
         let mut uploads: Vec<Upload> = self
             .skills
             .iter()
             .map(|s| format!("skills/{s}"))
             .chain(self.master.iter().cloned())
+            .chain(self.shared.iter().cloned())
             .chain(std::iter::once(TOOL_REGISTRY.to_string()))
             .map(|from| Upload {
                 to: format!("{CONTENT_MOUNT}/{from}"),
@@ -465,6 +476,7 @@ pub(crate) mod tests {
             skills: vec!["docs".into()],
             mcp_tools: ["docs_read", "docs_search"].map(String::from).into(),
             master: vec!["master/AGENTS.md".into()],
+            shared: vec!["playbooks".into(), "reviewers".into(), "templates".into()],
         }
     }
 
@@ -482,6 +494,7 @@ pub(crate) mod tests {
                 "master/AGENTS.md".into(),
                 "master/people/ana/AGENTS.md".into(),
             ],
+            shared: vec!["templates".into()],
         }
     }
 
@@ -590,6 +603,9 @@ pub(crate) mod tests {
         // bot's content is readable.
         for p in &fs.read_write {
             assert!(!p.starts_with("/sandbox/skills") && !p.starts_with("/sandbox/master"));
+            assert!(!["templates", "reviewers", "playbooks"]
+                .iter()
+                .any(|d| p.starts_with(&format!("/sandbox/{d}"))));
         }
         let content: Vec<_> = fs
             .read_only
@@ -600,7 +616,10 @@ pub(crate) mod tests {
             content,
             [
                 "/sandbox/master/AGENTS.md",
+                "/sandbox/playbooks",
+                "/sandbox/reviewers",
                 "/sandbox/skills/docs",
+                "/sandbox/templates",
                 "/sandbox/tools.yaml"
             ]
         );

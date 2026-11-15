@@ -1,0 +1,22 @@
+# seed: replace with case cards
+# Fixtures: epic PM-101 and story PM-102. The decision-doc skill titles its draft
+# `Decision: …` and follows content/templates/decision-doc.md: Recommendation, Context,
+# Options, Criteria, Tradeoffs, Reversibility, Open questions. The recommendation and the
+# options have their own task (decision-recommends-among-options).
+id: structure-decision-doc
+ask: "Draft anyway, no questions: a decision doc in the PM space on whether SCIM user provisioning (Jira story PM-102) ships in the same release as SAML SSO for the Acme Vault console (epic PM-101) or in the one after."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Decision:", "Criteria", "Tradeoffs", "Reversibility", "Open questions"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: decision-doc
+tags:
+  - model/draft-content

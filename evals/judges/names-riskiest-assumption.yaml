@@ -1,0 +1,20 @@
+# Does a pm-craft draft name its riskiest assumption? The bar's sixth check
+# (content/playbooks/bar.md): the riskiest assumption, and the cheapest way to test it. A
+# list of risks passes the deterministic checks; this judge looks for the one assumption the
+# recommendation depends on most, and a test for it.
+#
+# Advisory: it has no labels yet (names-riskiest-assumption.labels.jsonl is empty), so it is
+# reported and never fails a run or the gate. It blocks only once calibrated on at least 100
+# labels with TPR and TNR of at least 0.8 (docs/runbooks/quality.md, "Calibrating a judge").
+name: names-riskiest-assumption
+failure_mode: model/no-riskiest-assumption
+question: >-
+  Does the draft single out its riskiest assumption and say how to test it? Answer yes if it
+  names one assumption as the riskiest (the one its recommendation or estimate depends on
+  most) and gives a cheap way to test it. Answer no if it names no assumption, lists risks or
+  assumptions without singling one out, or gives no way to test the one it names. If the
+  output contains no draft (the assistant asked a question or answered in the thread), answer
+  yes.
+alias: pmos/extraction
+applies_to: [pm-craft]
+labels: names-riskiest-assumption.labels.jsonl

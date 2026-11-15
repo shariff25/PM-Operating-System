@@ -135,15 +135,19 @@ pub enum ModelRole {
     Default,
     /// Extraction and triage (Nemotron 3 Nano 30B-A3B at launch).
     Extraction,
+    /// The PM assistant's drafting and critique (the `default` model at launch; the bake-off
+    /// may point it at a larger one).
+    Reasoning,
 }
 
 impl ModelRole {
-    pub const ALL: [&'static str; 2] = ["default", "extraction"];
+    pub const ALL: [&'static str; 3] = ["default", "extraction", "reasoning"];
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "default" => Some(Self::Default),
             "extraction" => Some(Self::Extraction),
+            "reasoning" => Some(Self::Reasoning),
             _ => None,
         }
     }
@@ -210,6 +214,17 @@ pub struct ReviewerFrontMatter {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct TemplateFrontMatter {
+    #[serde(default)]
+    pub title: Option<String>,
+    pub owner: String,
+    pub version: String,
+}
+
+/// Front matter of a playbook (`content/playbooks/<name>.md`): the craft guidance a skill
+/// reads before it drafts. The body is the playbook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PlaybookFrontMatter {
     #[serde(default)]
     pub title: Option<String>,
     pub owner: String,
@@ -333,4 +348,21 @@ pub fn valid_slack_id(id: &str) -> bool {
         && id.len() >= 3
         && id.len() <= 32
         && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_roles_parse() {
+        for name in ModelRole::ALL {
+            let role = ModelRole::parse(name).expect(name);
+            let yaml = serde_norway::to_string(&role).unwrap();
+            assert_eq!(yaml.trim(), name);
+        }
+        assert_eq!(ModelRole::parse("reasoning"), Some(ModelRole::Reasoning));
+        assert_eq!(ModelRole::parse("Reasoning"), None);
+        assert_eq!(ModelRole::parse("large"), None);
+    }
 }

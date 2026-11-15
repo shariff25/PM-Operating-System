@@ -1,0 +1,23 @@
+# seed: replace with case cards
+# Decisions: a decision doc recommends one option and shows the others. Fixtures: page 9001
+# ("Two customers asked for SSO and audit export.") and story PM-102 "SCIM user provisioning".
+# The decision-doc template opens with Recommendation and lists the Options
+# (content/templates/decision-doc.md). Whether the recommendation comes first and is a real
+# choice is for the judge recommendation-first.
+id: decision-recommends-among-options
+ask: "Draft anyway, no questions: a decision doc in the PM space on which to build first for Acme Vault, audit log export or SCIM user provisioning (Jira story PM-102), given the October Acme Cloud call notes (Confluence page 9001)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Decision:", "Recommendation", "Options"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: decision-doc
+tags:
+  - model/no-recommendation

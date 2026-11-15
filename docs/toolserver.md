@@ -295,6 +295,75 @@ uses. The registry is `content/tools.yaml`; each tool's input schema is in
 `crates/toolserver/src/schemas.rs`. The server refuses to start if a registry tool has no
 schema or no connector.
 
+### The stats tools
+
+`stats.sample_size` and `stats.compare` (system `stats`, kind `read`) do the arithmetic of an
+experiment, so a model never does. The `experiment-design` and `experiment-readout` skills
+declare them (`docs/pm-craft.md`).
+- **Deterministic:** the same arguments always give the same answer.
+- **No outside system:** they compute inside the tool server, so they need no linked account
+  and have no read scope.
+- **Allowlisted and audited** like any read: a skill must declare the tool, and every call is
+  in the audit log.
+
+**`stats.sample_size`: how many users a test needs.**
+
+| Argument | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `metric` | `"proportion"` or `"mean"` | required | What is measured: a rate, or a mean |
+| `baseline` | number | required | The baseline rate, above 0 and below 1, for a proportion; the baseline mean for a mean |
+| `std_dev` | number > 0 | required for `mean` | The standard deviation |
+| `mde` | number > 0 | required | The minimum detectable effect |
+| `mde_kind` | `"relative"` or `"absolute"` | `"relative"` | Relative: `0.05` means 5% of the baseline. Absolute: in the metric's own units |
+| `alpha` | number | `0.05` | The significance level |
+| `power` | number | `0.8` | The chance of detecting an effect of size `mde` |
+| `two_sided` | boolean | `true` | A two-sided test |
+| `variants` | integer, at most 10 | `2` | Total arms, including control |
+| `daily_users` | number | none | Users entering the experiment per day, all arms together |
+
+It returns:
+
+| Field | Meaning |
+| --- | --- |
+| `per_arm` | Users each arm needs, rounded up |
+| `total` | Users in all arms |
+| `days` | `ceil(total / daily_users)`; only when `daily_users` is given |
+| `assumptions` | The values it used, defaults included |
+| `note` | Says to run whole weeks |
+
+The formulas, with `z_{α/2}` and `z_β` the normal quantiles for `alpha` and `power`:
+- **Proportion:** the two-proportion z-test with unpooled variance, where `p1` is the
+  baseline and `p2` the baseline with the effect:
+  `n = (z_{α/2} + z_β)² · (p1(1−p1) + p2(1−p2)) / (p2 − p1)²`.
+- **Mean:** `n = 2 · (z_{α/2} + z_β)² · σ² / δ²`, where `σ` is `std_dev` and `δ` the absolute
+  effect.
+
+**`stats.compare`: reading a finished test.**
+
+| Argument | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `control` | `{users, conversions}` | required | The control arm's counts |
+| `treatment` | `{users, conversions}` | required | The treatment arm's counts |
+| `alpha` | number | `0.05` | The significance level |
+
+It returns:
+
+| Field | Meaning |
+| --- | --- |
+| `control_rate`, `treatment_rate` | Conversions ÷ users, for each arm |
+| `absolute_lift` | The treatment rate minus the control rate |
+| `relative_lift` | The absolute lift ÷ the control rate |
+| `ci_low`, `ci_high` | The confidence interval of the absolute lift, at `1 − alpha` |
+| `p_value` | From a two-proportion z-test |
+| `significant` | Whether `p_value` is below `alpha` |
+| `note` | Warns that a result read before the planned sample size is not reliable |
+
+The p-value uses the pooled variance; the interval uses the unpooled variance.
+
+**Bad input is refused** as invalid arguments (`400` on `/internal/call`, an MCP tool result
+with `isError: true`):
+a rate outside 0 to 1, zero users, more conversions than users, or an `mde` of 0 or less.
+
 ## Connectors and account linking
 
 With `PMOS_CONNECTORS=live`, every Jira, Confluence and Slack call acts as the PM, with the

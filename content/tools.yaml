@@ -88,3 +88,13 @@ tools:
     system: docs
     kind: read
     description: Read one page of your company's public docs as markdown, by the url a search returned
+
+  # Experiment statistics (computed by the tool server; no connector, nothing leaves PM OS)
+  - name: stats.sample_size
+    system: stats
+    kind: read
+    description: "Users needed per arm and in total (and days, given daily traffic) for an A/B test on a proportion or a mean: two-sample z-test, defaults alpha 0.05, power 0.8, two-sided, 2 arms"
+  - name: stats.compare
+    system: stats
+    kind: read
+    description: "Compare a control and a treatment conversion rate: rates, absolute and relative lift, the confidence interval of the lift, p-value and significance (two-proportion z-test)"

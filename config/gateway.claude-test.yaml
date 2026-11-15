@@ -13,6 +13,11 @@ roles:
     upstream: claude
     model: claude-opus-5-5
     effort: medium
+  # The PM assistant's drafting and critique. Point it at a larger model if the bake-off picks one.
+  reasoning:
+    upstream: claude
+    model: claude-opus-5-5
+    effort: medium
   extraction:
     upstream: claude
     model: claude-opus-5-5

@@ -4,6 +4,13 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- PM OS now works like a senior PM: it questions the problem, recommends, and checks its own work ([how to use it](docs/pm-craft.md)).
+  - PM OS can now be held to a written bar: it asks who has the problem before it drafts a solution, and every document weighs real alternatives, opens with one recommendation, names a measurable outcome with a guardrail and its riskiest assumption, and is checked against `content/playbooks/bar.md` before you see it. Six playbooks say how each kind of work is done, and you can edit them and the example documents to match your team.
+  - PM OS can now do 15 new kinds of work, by track. **Product sense:** `product-critique`, `problem-framing`. **Strategy and decisions:** `strategy-doc`, `decision-doc`, `prioritize`, `pre-mortem`. **Metrics and experiments:** `metrics-tree`, `experiment-design`, `experiment-readout`. **Customers and market:** `call-synth`, `competitive-brief`, `opportunity-sizing`. **Review:** `review`. **AI products:** `ai-feature-spec`, `eval-plan`. The PRD skill is upgraded to the same bar. Say "draft anyway" to skip the questions.
+  - PM OS can now review a page with a panel of up to four of eleven reviewers, four of them new (senior PM, data scientist, design and UX, AI safety). They only read, and you get the findings by severity and the three changes that matter most.
+  - PM OS can now get its experiment numbers right: sample sizes and test results come from two statistics tools (`stats.sample_size`, `stats.compare`), not from the model's arithmetic.
+  - PM OS can now spec an AI feature and plan its evaluation: intended behaviour, failure modes, misuse, human oversight, and the tests that gate launch.
+  - PM OS can now be measured against the bar: the `pm-craft` benchmark category has 17 seed tasks and three advisory judges (recommendation first, metric with guardrail, riskiest assumption).
 - PM OS can now be set up by any company's product-management team: the team charter, product files and glossary are templates to fill in, and you point the Docs bot at your own docs site with `PMOS_DOCS_BASE_URL` (plus an optional products file for `/docs product:<id>`).
 - PM OS can now draft replies to questions people ask you in Slack: type `reply assistant on`, and approve, edit, snooze or reject each draft before it posts as you.
 - PM OS can now learn from your edits and rejections: a rejected draft asks why in one tap, each bot's owner gets a daily list of what went wrong, and changes to a bot's skills must pass its benchmarks before they merge.

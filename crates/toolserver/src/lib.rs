@@ -27,6 +27,7 @@ pub mod pg;
 pub mod schemas;
 pub mod service;
 pub mod session;
+pub mod stats;
 pub mod store;
 pub mod team;
 pub mod vault;

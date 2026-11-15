@@ -11,8 +11,8 @@ use walkdir::WalkDir;
 
 use crate::frontmatter;
 use crate::model::{
-    ContextFrontMatter, ModelRole, ReviewerFrontMatter, Sensitivity, Skill, SkillFrontMatter,
-    TemplateFrontMatter, ToolRegistry, CONTEXT_DOMAINS, PHASES, SURFACES,
+    ContextFrontMatter, ModelRole, PlaybookFrontMatter, ReviewerFrontMatter, Sensitivity, Skill,
+    SkillFrontMatter, TemplateFrontMatter, ToolRegistry, CONTEXT_DOMAINS, PHASES, SURFACES,
 };
 
 /// Days after `last-reviewed` before a context file is flagged stale (CTX-2).
@@ -107,6 +107,7 @@ pub fn lint(root: &Path, opts: &LintOptions) -> Report {
     cx.check_context(opts);
     cx.check_reviewers();
     cx.check_templates();
+    cx.check_playbooks();
     cx.check_team();
     cx.check_roles_and_bots(registry.as_ref());
 
@@ -567,6 +568,25 @@ impl Cx {
             }
             if body.trim().is_empty() {
                 self.error("template-body-empty", &path, "template is empty");
+            }
+        }
+    }
+
+    /// `playbooks/*.md`: the craft guidance skills read before drafting. The folder is
+    /// optional; each file needs `owner` and `version` and a body.
+    fn check_playbooks(&mut self) {
+        let Some(entries) = sorted_entries(&self.root.join("playbooks")) else {
+            return;
+        };
+        for path in markdown_files(entries) {
+            let Some((fm, body)) =
+                self.read_front_matter::<PlaybookFrontMatter>(&path, "playbook-parse")
+            else {
+                continue;
+            };
+            self.check_owner(&path, &fm.owner);
+            if body.trim().is_empty() {
+                self.error("playbook-body-empty", &path, "playbook is empty");
             }
         }
     }

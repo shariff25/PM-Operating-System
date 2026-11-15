@@ -1,0 +1,21 @@
+# seed: replace with case cards
+# Fixtures: page 9001's customer asks and epic PM-101. The problem-framing skill titles its
+# draft `Problem: …` and follows content/templates/problem-statement.md: Who has the problem,
+# The problem, Evidence, What they do today, Why now, What we don't know.
+id: structure-problem-framing
+ask: "Draft anyway, no questions: a problem statement in the PM space for the SSO asks in the October Acme Cloud call notes (Confluence page 9001) and Jira epic PM-101."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Problem:", "Who has the problem", "Evidence", "What they do today", "Why now", "What we don't know"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: problem-framing
+tags:
+  - model/draft-content

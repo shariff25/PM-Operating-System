@@ -218,6 +218,10 @@ struct Policy {
     bot: Option<(Arc<Bot>, Arc<Role>)>,
 }
 
+/// Systems the tool server answers itself, with no connector: the context library, memory
+/// and the stats tools.
+pub const LOCAL_SYSTEMS: [&str; 3] = ["context", "memory", "stats"];
+
 /// The data class a connector read counts as: the public support docs are `public`;
 /// Jira, Confluence, Slack and anything else are `internal`.
 fn connector_class(system: &str) -> Sensitivity {
@@ -320,7 +324,7 @@ impl ToolService {
             .map(|c| (c.system().to_string(), c))
             .collect();
         for tool in catalog.tools() {
-            let served = matches!(tool.system.as_str(), "context" | "memory")
+            let served = LOCAL_SYSTEMS.contains(&tool.system.as_str())
                 || connectors.contains_key(&tool.system);
             if !served {
                 return Err(format!(
@@ -735,6 +739,12 @@ impl ToolService {
                 Ok(json!({ "notes": notes }))
             }
             (ToolKind::Internal, "memory") => self.memory_update(session, args, now).await,
+            // Computed here from the arguments: no connector, nothing external read, so the
+            // result is returned as is (not wrapped as untrusted) and the session's data class
+            // doesn't change.
+            (ToolKind::Read, "stats") => {
+                crate::stats::call(spec.action(), args).map_err(ToolError::InvalidArgs)
+            }
             (ToolKind::Read, system) => {
                 let connector = self.connector(system)?;
                 // A team bot reads with its own accounts, inside its read scope; anyone else

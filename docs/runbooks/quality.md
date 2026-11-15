@@ -100,9 +100,9 @@ A case card turns one real case into an eval task. The template is `evals/case-c
 6. **Once the failure is fixed,** mark the task `regression: true`, so the gate fails if it
    ever breaks again.
 
-The seed tasks in `jira-draft`, `confluence-draft` and `slack-reply` are placeholders on fake
-fixtures. Replace them with case cards as these come in; give a category a `pass_bar` once it
-holds real cases.
+The seed tasks in `jira-draft`, `confluence-draft`, `slack-reply` and `pm-craft` are
+placeholders on fake fixtures. Replace them with case cards as these come in; give a category
+a `pass_bar` once it holds real cases.
 
 ## When one exists: calibrating a judge
 
