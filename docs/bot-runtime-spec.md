@@ -102,7 +102,7 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 ### Task
 ```json
 {"id": "tsk_<32 hex>", "bot": "docs", "requested_by": "ana", "source": "slack|routine|cli|eval",
- "priority": "interactive|scheduled|personal", "text": "What ports does DSM need?",
+ "priority": "interactive|scheduled|personal", "text": "Does Acme Vault support SAML SSO?",
  "status": "queued|working|needs_approval|done|failed|cancelled",
  "checklist": [{"item": "Search the docs", "done": true}], "result": "markdown or null",
  "error": "stated reason or null", "approvals": ["apr_…"],
@@ -178,7 +178,7 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 
 ## 5. Slack (`crates/slack`)
 - **DM routing:** one Slack app, `PM OS`, with a DM per PM. A message's bot is chosen this way:
-  1. a `<bot>:` prefix (`docs: what ports does DSM need?`);
+  1. a `<bot>:` prefix (`docs: does Acme Vault support SAML SSO?`);
   2. else the bot already working in that thread;
   3. else the PM's personal bot `pm-<handle>` if it exists;
   4. else `docs`.
@@ -235,7 +235,7 @@ Admins (role `admin` in `team.yaml`) see everything; a PM sees their own bots, r
 ## 8. Benchmarks (0g): `evals/` and `pmos-evals`
 - **Categories:** `evals/categories/<name>/category.yaml` holds `{name, bot, pass_bar}`.
   - Tasks are `tasks/*.yaml` with `{id, ask, expect: {must_cite?: [url], must_include?: [text], must_not_include?: [text], approvals?: n}}`.
-  - The first category is `docs-qa`: 20 real questions answered by support.acme.com pages.
+  - The first category is `docs-qa`: a template category. A team writes its own questions against its own docs site; the example tasks run against the fake docs fixtures (`evals/categories/docs-qa/README.md`).
 - **Runner:** `pmos-evals run --category docs-qa` creates tasks through the runtime API (client `evals`), waits for them, and grades each one.
 - **Failure tags:** every failure is tagged `model`, `tool`, `policy`, `memory` or `harness`, by rules over the task's events and trace (D10).
 - **Report:** written as markdown under `evals/reports/<date>-<category>.md`. A category passes when it meets its `pass_bar` two weeks in a row.

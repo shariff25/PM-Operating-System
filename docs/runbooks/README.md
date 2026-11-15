@@ -12,7 +12,8 @@ commands.
 | [install.md](install.md) | Once: setting up the Spark, up to Gate 1 |
 | [daily.md](daily.md) | Every day, and when someone says "PM OS is slow or down" |
 | [backup-restore.md](backup-restore.md) | Backups (weekly at least), and putting one back |
-| [upgrade.md](upgrade.md) | Deploying a new version of PM OS |
+| [upgrade.md](upgrade.md) | Deploying a new version of PM OS, and registering the Spark CI runner |
+| [quality.md](quality.md) | For each bot's quality owner: the triage digest, trace reviews, case cards, judges and the eval gate |
 | [model-swap.md](model-swap.md) | Changing which model serves a role (D11) |
 | [bots-and-members.md](bots-and-members.md) | A new member's bot, pausing a bot, revoking someone's tokens |
 | [incidents.md](incidents.md) | Something went wrong: a bot misbehaves, a token leaks, a service won't start |
@@ -22,7 +23,7 @@ commands.
 | Service | Port (on the Spark) | What it does |
 | --- | --- | --- |
 | `postgres` | none | One database per service |
-| `docs` | none | The Acme support docs index |
+| `docs` | none | The public docs index (your docs site) |
 | `toolserver` | 127.0.0.1:8710 | The only way bots reach Jira, Confluence, Slack, context and memory. Also handles approvals, audit and the OAuth callback. |
 | `gateway` | 127.0.0.1:8740 | The local models, with fair queueing between users |
 | `bots` | 127.0.0.1:8750 | Tasks, routines, traces and notifications |

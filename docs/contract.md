@@ -1,6 +1,6 @@
 # PM OS content contract
 
-Skills, context, reviewer rubrics and templates are plain markdown in `content/`. Any harness
+Skills, context, playbooks, reviewer rubrics and templates are plain markdown in `content/`. Any harness
 that reads them must follow this contract (MOD-1). Today that means Deep Agents for the team
 service and Hermes on NemoClaw for personal agents. `pmos lint` checks it on every pull
 request; the rule IDs below are what the lint reports.
@@ -14,6 +14,7 @@ content/
   context/<domain>/*.md              context library
   reviewers/*.md                     reviewer personas
   templates/*.md                     document templates
+  playbooks/*.md                     how a kind of PM work is done, and the bar (optional)
   team.yaml                          who may use PM OS (optional)
 ```
 
@@ -55,7 +56,7 @@ description: Write a first-draft PRD from a brief ...   # ≤ 1,024 characters; 
 metadata:
   owner: "@handle"              # required
   version: "0.1.0"              # required, MAJOR.MINOR.PATCH
-  model: "default"              # required: default | extraction (gateway model role)
+  model: "default"              # required: default | extraction | reasoning (gateway model role)
   data-class: "restricted"      # required: public | internal | restricted
   tools: "context.search jira.read confluence.create_draft"   # required, space-separated
   surfaces: "slack web cli"     # optional, defaults to all three
@@ -68,8 +69,14 @@ Instructions ...
 
 - `tools` is an allowlist: the skill may call only these tools (PRD: Authorization). Each must
   be in `tools.yaml`.
-- `model` names a role, not a model. The gateway maps `default` and `extraction` to
-  open-weight models, so a bake-off result changes no skill files.
+- `model` names a role, not a model. The gateway maps `default`, `extraction` and `reasoning`
+  to open-weight models, so a bake-off result changes no skill files.
+
+| Role | Addressed as | Used for |
+| --- | --- | --- |
+| `default` | `pmos/default` | Answers and everyday drafts |
+| `extraction` | `pmos/extraction` | Extraction and triage, and the benchmark judges |
+| `reasoning` | `pmos/reasoning` | The PM-craft skills (`docs/pm-craft.md`): work that weighs alternatives and checks itself against the bar. It ships pointing at the same model as `default`; a platform owner can point it at a larger one in the gateway config (`docs/gateway.md`) |
 - `data-class` is the most sensitive data the skill may handle. The gateway routes everything
   to local models.
 
@@ -92,7 +99,7 @@ Domains: `products`, `personas`, `competitors`, `partners`, `stakeholders`, `sty
 
 ```yaml
 ---
-title: CCM                  # optional
+title: Acme Vault           # optional
 owner: "@handle"            # required; "TODO" warns until someone takes it
 last-reviewed: 2026-11-14   # required, YYYY-MM-DD
 sensitivity: internal       # required: public | internal | restricted
@@ -111,15 +118,21 @@ Rules: `context-domain`, `context-parse`, `context-stale` (warning), `context-fu
 ```yaml
 ---
 name: Security architect
-lens: Threat model; attestation and key-handling correctness
+lens: Threat model; correctness of security claims and defaults
 flags:
-  - Wrong claims about TEEs, attestation or key release
+  - Wrong or unscoped security claims
 owner: "@handle"            # optional
 ---
 ```
 
 The body is the rubric. `/review` runs each chosen persona as a parallel sub-agent and merges
 the findings by severity: blocker, major or minor (REV-1, REV-2).
+- **One sub-agent per file.** When a role's skills include `review`, the harness registers a
+  sub-agent for every file here: its name is the file stem, its description the `lens`, its
+  prompt the rubric.
+- **Read tools only.** A reviewer gets the session's `read` tools (`tools.yaml`) and nothing
+  else, so it can't write, draft or approve.
+- **At most 4 a run,** always including `senior-pm`.
 
 Rules: `reviewer-parse`, `reviewer-flags`, `reviewer-body-empty`.
 
@@ -197,6 +210,46 @@ version: "0.1.0"
 ```
 
 Rules: `template-parse`, `template-version`, `template-body-empty`.
+
+**Headings are part of the contract.** A skill drafts from its template with the `##` headings
+unchanged and in order, and the `pm-craft` benchmarks check them by name
+(`docs/pm-craft-spec.md` §1 lists them). Change a heading and its benchmark task together.
+
+## Playbooks: `playbooks/*.md`
+
+A playbook says how a kind of PM work is done: what to ask, what good looks like, and the
+shape of the answer. `bar.md` is the one every doc skill checks its draft against
+(`docs/pm-craft.md`). The directory is optional.
+
+```yaml
+---
+title: The bar              # optional
+owner: "@handle"            # required
+version: "0.1.0"            # required
+---
+```
+
+Shipped: `bar`, `product-sense`, `strategy`, `metrics-and-experiments`, `customer-insight`
+and `ai-products`.
+
+Rules: `playbook-parse` (the front matter is missing or wrong), `playbook-body-empty`.
+
+## What a sandbox sees
+
+The harness mounts these read-only in a bot's sandbox, each only if the directory exists:
+
+| Path in the sandbox | From | Which files |
+| --- | --- | --- |
+| `/content/skills/` | `content/skills/` | Only the skills of the bot's role |
+| `/content/templates/` | `content/templates/` | All |
+| `/content/reviewers/` | `content/reviewers/` | All |
+| `/content/playbooks/` | `content/playbooks/` | All |
+
+A skill reads its playbook and template by path, such as `/content/playbooks/bar.md` and
+`/content/templates/decision-doc.md`. The context library is not mounted: it is read through
+`context.search` and `context.read`, which enforce each file's `sensitivity`. Templates,
+reviewers and playbooks carry no sensitivity label, so keep customer names and other
+restricted material out of them and in the context library.
 
 ## Running the lint
 

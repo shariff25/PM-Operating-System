@@ -124,9 +124,9 @@ mod tests {
         let r = Robots::parse(text, "pmos-docs");
         assert!(!r.allows("/files/guide.pdf"));
         assert!(r.allows("/files/guide.pdf.md"), "`$` anchors the end");
-        assert!(!r.allows("/docs/dsm/internal/notes.md"));
+        assert!(!r.allows("/docs/vault/internal/notes.md"));
         assert!(
-            r.allows("/docs/dsm/internal/public/page.md"),
+            r.allows("/docs/vault/internal/public/page.md"),
             "longer Allow wins"
         );
         assert!(!r.allows("/exact"));

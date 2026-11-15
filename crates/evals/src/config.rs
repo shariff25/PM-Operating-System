@@ -9,6 +9,10 @@ use serde::Deserialize;
 pub struct Config {
     pub runner: Runner,
     pub latency_targets: LatencyTargets,
+    /// What a `must_decline` answer says: it passes when it contains any of these, compared
+    /// as text is (see [`crate::grade::normalize_text`]).
+    #[serde(default)]
+    pub decline_phrases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -79,6 +83,13 @@ impl Config {
                     "latency_targets.{name}.source is empty; say where the number comes from"
                 ));
             }
+        }
+        if config
+            .decline_phrases
+            .iter()
+            .any(|p| crate::grade::normalize_text(p).is_empty())
+        {
+            errors.push("decline_phrases has an empty entry".to_string());
         }
         if errors.is_empty() {
             Ok(config)

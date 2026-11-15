@@ -1,0 +1,22 @@
+# seed: replace with case cards
+# Fixture: page 9001 "Acme Cloud customer call notes, October": "Two customers asked for
+# SSO and audit export." The call-synth skill titles its draft `Call synthesis: …` and
+# follows content/templates/call-synthesis.md: Headline, Themes, Quotes, Who said what, What
+# to do, Gaps. "SSO" checks the synthesis is of that page.
+id: structure-call-synth
+ask: "Draft anyway, no questions: a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Call synthesis:", "Headline", "Themes", "Who said what", "What to do", "SSO"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: call-synth
+tags:
+  - model/draft-content

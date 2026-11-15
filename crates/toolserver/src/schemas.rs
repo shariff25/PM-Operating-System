@@ -28,7 +28,7 @@ pub fn input_schema(tool: &str) -> Option<Value> {
             &["query"],
         ),
         "context.read" => object(
-            json!({"path": {"type": "string", "description": "Path from a search result, such as context/products/ccm.md"}}),
+            json!({"path": {"type": "string", "description": "Path from a search result, such as context/products/example-product.md"}}),
             &["path"],
         ),
         "memory.read" => object(json!({}), &[]),
@@ -97,16 +97,53 @@ pub fn input_schema(tool: &str) -> Option<Value> {
         ),
         "docs.search" => object(
             json!({
-                "query": {"type": "string", "description": "What to look for in the support docs", "maxLength": 500},
-                "product": {"type": "string", "enum": ["dsm", "ccm", "confidential-ai", "key-insight", "armor", "general"]},
+                "query": {"type": "string", "description": "What to look for in your company's public docs", "maxLength": 500},
+                "product": {"type": "string", "maxLength": 64, "description": "A product id from the docs site's products list, or `general`"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Maximum results (default 5)"},
             }),
             &["query"],
         ),
         "docs.read" => object(
-            json!({"url": {"type": "string", "description": "A support.acme.com/docs link from a search result"}}),
+            json!({"url": {"type": "string", "description": "A docs page link from a search result"}}),
             &["url"],
         ),
+        "stats.sample_size" => object(
+            json!({
+                "metric": {"type": "string", "enum": ["proportion", "mean"], "description": "`proportion` for a rate such as conversion, `mean` for an average such as revenue per user"},
+                "baseline": {"type": "number", "description": "The control's current value: a rate between 0 and 1 (exclusive) for a proportion, or the mean"},
+                "std_dev": {"type": "number", "description": "The metric's standard deviation; required for `mean`, more than 0"},
+                "mde": {"type": "number", "description": "The minimum detectable effect, more than 0: 0.05 is 5% of the baseline when `mde_kind` is relative"},
+                "mde_kind": {"type": "string", "enum": ["relative", "absolute"], "description": "How to read `mde` (default relative)"},
+                "alpha": {"type": "number", "description": "Significance level (default 0.05)"},
+                "power": {"type": "number", "description": "Statistical power (default 0.8)"},
+                "two_sided": {"type": "boolean", "description": "Two-sided test (default true)"},
+                "variants": {"type": "integer", "minimum": 2, "maximum": crate::stats::MAX_VARIANTS, "description": "Arms including control (default 2)"},
+                "daily_users": {"type": "integer", "minimum": 1, "description": "Users entering the experiment per day, all arms together; adds `days`"},
+            }),
+            &["metric", "baseline", "mde"],
+        ),
+        "stats.compare" => {
+            let arm = |which: &str| {
+                json!({
+                    "type": "object",
+                    "description": format!("The {which} arm: users exposed and how many converted"),
+                    "properties": {
+                        "users": {"type": "integer", "minimum": 1},
+                        "conversions": {"type": "integer", "minimum": 0},
+                    },
+                    "required": ["users", "conversions"],
+                    "additionalProperties": false,
+                })
+            };
+            object(
+                json!({
+                    "control": arm("control"),
+                    "treatment": arm("treatment"),
+                    "alpha": {"type": "number", "description": "Significance level (default 0.05)"},
+                }),
+                &["control", "treatment"],
+            )
+        }
         _ => return None,
     };
     Some(schema)
@@ -162,6 +199,15 @@ pub fn check_args(schema: &Value, args: &Value) -> Result<(), String> {
                     return Err(format!("argument `{key}` must be between {min} and {max}"));
                 }
             }
+            Some("number") if !value.is_number() => {
+                return Err(format!("argument `{key}` must be a number"));
+            }
+            Some("boolean") if !value.is_boolean() => {
+                return Err(format!("argument `{key}` must be true or false"));
+            }
+            Some("object") if !value.is_object() => {
+                return Err(format!("argument `{key}` must be an object"));
+            }
             _ => {}
         }
     }
@@ -199,5 +245,20 @@ mod tests {
         // Search input is bounded, so a huge query can't become a huge database query.
         assert!(check_args(&search, &json!({"query": "x".repeat(501)})).is_err());
         assert!(check_args(&search, &json!("x")).is_err());
+    }
+
+    #[test]
+    fn checks_numbers_booleans_and_objects() {
+        let s = input_schema("stats.sample_size").unwrap();
+        let ok = json!({"metric": "proportion", "baseline": 0.1, "mde": 0.1, "two_sided": false});
+        assert!(check_args(&s, &ok).is_ok());
+        let bad = json!({"metric": "proportion", "baseline": "0.1", "mde": 0.1});
+        assert!(check_args(&s, &bad).unwrap_err().contains("number"));
+        let bad = json!({"metric": "proportion", "baseline": 0.1, "mde": 0.1, "two_sided": "yes"});
+        assert!(check_args(&s, &bad).unwrap_err().contains("true or false"));
+        let bad = json!({"metric": "proportion", "baseline": 0.1, "mde": 0.1, "variants": 11});
+        assert!(check_args(&s, &bad).is_err());
+        let c = input_schema("stats.compare").unwrap();
+        assert!(check_args(&c, &json!({"control": 1, "treatment": {}})).is_err());
     }
 }

@@ -2,12 +2,13 @@
 
 mod common;
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use common::write_category;
 use pmos_evals::config::Config;
+use pmos_evals::judge::load_judges;
 use pmos_evals::spec::{category_names, load_category};
+use pmos_evals::taxonomy::Taxonomy;
 
 fn evals_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../evals")
@@ -18,13 +19,14 @@ fn a_valid_category_loads() {
     let dir = tempfile::tempdir().unwrap();
     write_category(dir.path(), "cat", "docs", 0.8, &[
         ("b-task", "id: b-task\nask: \"Two?\"\nexpect:\n  approvals: 0\n".into()),
-        ("a-task", "id: a-task\nask: \"One?\"\nexpect:\n  must_cite: [https://support.acme.com/docs/x]\n  must_include: [one]\n".into()),
+        ("a-task", "id: a-task\nask: \"One?\"\nexpect:\n  must_cite: [https://docs.example.com/docs/x]\n  must_include: [one]\n".into()),
     ]);
     let c = load_category(dir.path(), "cat").unwrap();
     assert_eq!(
         (c.name.as_str(), c.bot.as_str(), c.pass_bar),
-        ("cat", "docs", 0.8)
+        ("cat", "docs", Some(0.8))
     );
+    assert_eq!(c.repeats, 1);
     let ids: Vec<&str> = c.tasks.iter().map(|t| t.id.as_str()).collect();
     assert_eq!(ids, ["a-task", "b-task"]);
     assert_eq!(c.tasks[1].expect.approvals, Some(0));
@@ -160,34 +162,45 @@ fn the_checked_in_evals_are_valid() {
     }
 }
 
-/// docs-qa: 20 tasks for the Docs bot, each citing one support.acme.com page as the bot
-/// cites it (the page URL without `.md`), spread across the products.
+/// docs-qa is a template: it reports only (no bar) until a team writes questions against its
+/// own docs, and ships examples on the fake docs fixtures: answerable tasks that each cite one
+/// docs.example.com page as the bot cites it (the page URL without `.md`), and should-decline
+/// tasks with no page. Each task runs three times.
 #[test]
-fn docs_qa_has_twenty_questions_across_the_products() {
-    let c = load_category(&evals_root(), "docs-qa").unwrap();
+fn docs_qa_is_a_template_on_the_fake_docs() {
+    let root = evals_root();
+    let c = load_category(&root, "docs-qa").unwrap();
     assert_eq!(c.bot, "docs");
-    assert_eq!(c.tasks.len(), 20);
-    let mut asks = HashSet::new();
-    let mut products: HashMap<&str, usize> = HashMap::new();
-    for t in &c.tasks {
-        assert!(
-            asks.insert(t.ask.clone()),
-            "{}: the same question twice",
-            t.id
-        );
+    assert_eq!(c.repeats, 3);
+    assert_eq!(
+        c.pass_bar, None,
+        "reports only until a team's own tasks are in"
+    );
+    assert!(root.join("categories/docs-qa/README.md").is_file());
+    let (declines, answerable): (Vec<_>, Vec<_>) =
+        c.tasks.iter().partition(|t| t.expect.must_decline);
+    assert_eq!(answerable.len(), 2);
+    assert_eq!(declines.len(), 2);
+    for t in &declines {
+        assert!(t.id.starts_with("decline-"), "{}", t.id);
+        assert!(t.expect.must_cite.is_empty(), "{}", t.id);
+        assert_eq!(t.expect.approvals, Some(0), "{}", t.id);
+        assert!(t
+            .tags
+            .contains(&"model/answered-beyond-sources".to_string()));
+    }
+    // The fake docs connector's pages (crates/toolserver/src/connectors/fake.rs).
+    let fixtures = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../toolserver/src/connectors/fake.rs"),
+    )
+    .unwrap();
+    let mut ids: Vec<_> = answerable.iter().map(|t| t.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["vault-key-rotation", "vault-saml-sso"]);
+    for t in answerable {
         assert_eq!(t.expect.must_cite.len(), 1, "{}", t.id);
         let url = &t.expect.must_cite[0];
-        assert!(
-            url.starts_with("https://support.acme.com/docs/")
-                || url.starts_with("https://support.acme.com/apidocs/"),
-            "{}: {url}",
-            t.id
-        );
-        assert!(
-            !url.ends_with(".md") && !url.ends_with('/'),
-            "{}: {url}",
-            t.id
-        );
+        assert_eq!(url, &format!("https://docs.example.com/docs/{}", t.id));
         assert!(!t.expect.must_include.is_empty(), "{}", t.id);
         assert!(
             t.expect.must_not_include.contains(&"<think>".to_string()),
@@ -195,13 +208,261 @@ fn docs_qa_has_twenty_questions_across_the_products() {
             t.id
         );
         assert_eq!(t.expect.approvals, Some(0), "{}", t.id);
-        let product = t.id.split('-').next().unwrap();
-        *products.entry(product).or_default() += 1;
+        // The fixture page exists and states the fact.
+        assert!(fixtures.contains(&format!("\"{}\"", t.id)), "{}", t.id);
+        for fact in &t.expect.must_include {
+            assert!(fixtures.contains(fact.as_str()), "{}: {fact}", t.id);
+        }
     }
-    for p in ["dsm", "ccm", "confidential", "key", "armor", "api"] {
+}
+
+#[test]
+fn new_fields_are_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    write_category(dir.path(), "cat", "personal", 0.5, &[
+        ("cites", "id: cites\nask: \"x\"\nexpect:\n  must_decline: true\n  must_cite: [https://a.example/x]\n".into()),
+        ("bad-drafts", "id: bad-drafts\nask: \"x\"\nexpect:\n  drafts:\n    - tool: Jira\n      require_fields: [\"\"]\n      allowed: {project: []}\n      must_include: [\"**\"]\n    - tool: slack.send_message\n      count: 0\n      must_include: [hi]\n    - tool: slack.send_message\n".into()),
+        ("blank-cluster", "id: blank-cluster\nask: \"x\"\ncluster: \" \"\nexpect:\n  must_decline: true\n".into()),
+    ]);
+    std::fs::write(
+        dir.path().join("categories/cat/category.yaml"),
+        "name: cat\nbot: personal\nrepeats: 0\ndescription: d\n",
+    )
+    .unwrap();
+    let errors = load_category(dir.path(), "cat").unwrap_err().0;
+    let has = |file: &str, text: &str| {
         assert!(
-            products.get(p).copied().unwrap_or(0) >= 2,
-            "{p}: {products:?}"
+            errors.iter().any(|e| e.contains(file) && e.contains(text)),
+            "no error on {file} with `{text}` in {errors:#?}"
+        )
+    };
+    has("category.yaml", "`repeats` is 0");
+    has("cites.yaml", "a `must_decline` task has no `must_cite`");
+    has(
+        "bad-drafts.yaml",
+        "drafts tool `Jira` is not a registry name",
+    );
+    has("bad-drafts.yaml", "require_fields has an empty entry");
+    has("bad-drafts.yaml", "allowed `project` lists no values");
+    has(
+        "bad-drafts.yaml",
+        "drafts `Jira`: must_include has an empty entry",
+    );
+    has("bad-drafts.yaml", "`count: 0` means no drafts");
+    has("bad-drafts.yaml", "drafts has `slack.send_message` twice");
+    has("blank-cluster.yaml", "`cluster` is empty");
+    assert_eq!(errors.len(), 9, "{errors:#?}");
+}
+
+#[test]
+fn bar_and_repeats_are_optional() {
+    let dir = tempfile::tempdir().unwrap();
+    write_category(dir.path(), "cat", "personal", 0.5, &[(
+        "t",
+        "id: t\nask: \"x\"\nexpect:\n  drafts:\n    - tool: jira.create_issue\n      allowed: {project: [PM]}\n".into(),
+    )]);
+    std::fs::write(
+        dir.path().join("categories/cat/category.yaml"),
+        "name: cat\nbot: personal\ndescription: d\n",
+    )
+    .unwrap();
+    let c = load_category(dir.path(), "cat").unwrap();
+    assert_eq!((c.pass_bar, c.repeats), (None, 1));
+    assert_eq!(c.tasks[0].expect.drafts[0].allowed["project"], ["PM"]);
+}
+
+/// The seed categories: at least three tasks each for the personal bot, no bar, every task
+/// with drafts checks on write tools in content/tools.yaml, and the seed marker. (slack-reply
+/// also has the reply assistant's triage tasks.)
+#[test]
+fn the_seed_categories_are_ready_to_report() {
+    let root = evals_root();
+    let content = root.join("../content");
+    let registry = pmos_contract::model::ToolRegistry::from_yaml(
+        &std::fs::read_to_string(content.join("tools.yaml")).unwrap(),
+    )
+    .unwrap();
+    for name in ["jira-draft", "confluence-draft", "slack-reply"] {
+        let c = load_category(&root, name).unwrap();
+        assert_eq!(c.bot, "personal", "{name}");
+        assert_eq!(c.pass_bar, None, "{name}");
+        assert!(c.tasks.len() >= 3, "{name}: {} tasks", c.tasks.len());
+        let header =
+            std::fs::read_to_string(root.join("categories").join(name).join("category.yaml"))
+                .unwrap();
+        assert!(
+            header.starts_with("# seed: replace with case cards"),
+            "{name}"
+        );
+        for t in &c.tasks {
+            assert!(!t.expect.drafts.is_empty(), "{name}/{}", t.id);
+        }
+        assert_eq!(
+            pmos_evals::spec::check_draft_tools(&root, &c, &registry),
+            Vec::<String>::new()
         );
     }
+}
+
+#[test]
+fn drafts_tools_must_be_write_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    write_category(dir.path(), "cat", "personal", 0.5, &[(
+        "t",
+        "id: t\nask: \"x\"\nexpect:\n  drafts:\n    - tool: jira.search\n    - tool: jira.delete_issue\n    - tool: jira.create_issue\n".into(),
+    )]);
+    let c = load_category(dir.path(), "cat").unwrap();
+    let registry = pmos_contract::model::ToolRegistry::from_yaml(
+        "tools:\n  - {name: jira.search, system: jira, kind: read}\n  - {name: jira.create_issue, system: jira, kind: write}\n",
+    )
+    .unwrap();
+    let errors = pmos_evals::spec::check_draft_tools(dir.path(), &c, &registry);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors[0].contains("`jira.search` is not a write tool"));
+    assert!(errors[1].contains("`jira.delete_issue`"));
+}
+
+#[test]
+fn the_checked_in_taxonomy_is_valid_and_has_the_spec_examples() {
+    let t = Taxonomy::load(&evals_root()).unwrap();
+    for sub in pmos_evals::tag::SUB_TAGS {
+        assert!(t.contains(sub), "{sub}");
+    }
+    for example in [
+        "tool/wrong-confluence-space",
+        "model/missing-citation",
+        "model/answered-beyond-sources",
+        "harness/approval-count",
+    ] {
+        assert!(
+            t.describe(example).is_some_and(|d| !d.is_empty()),
+            "{example}"
+        );
+    }
+    // Every tag a checked-in task or judge uses is listed.
+    let root = evals_root();
+    for name in category_names(&root).unwrap() {
+        for task in load_category(&root, &name).unwrap().tasks {
+            for tag in &task.tags {
+                assert!(t.contains(tag), "{name}/{}: {tag}", task.id);
+            }
+        }
+    }
+    for j in load_judges(&root).unwrap() {
+        assert!(t.contains(&j.failure_mode), "{}", j.failure_mode);
+    }
+}
+
+#[test]
+fn taxonomy_problems_are_reported() {
+    let errors = Taxonomy::parse(
+        "model:\n  description: d\n  tags:\n    Bad_Name: x\n    empty: \"\"\nweather:\n  description: d\ntool:\n  description: \"\"\n",
+        "taxonomy.yaml",
+    )
+    .unwrap_err();
+    let has = |text: &str| {
+        assert!(
+            errors.iter().any(|e| e.contains(text)),
+            "no `{text}` in {errors:#?}"
+        )
+    };
+    has("`weather` is not a bottleneck");
+    has("`policy` is missing");
+    has("`tool` has no description");
+    has("`model/Bad_Name`: a sub-tag is lowercase");
+    has("`model/empty` has no description");
+    has("`model/missing-citation` is missing; the automatic tagger emits it");
+    assert!(Taxonomy::parse("model: [", "taxonomy.yaml").is_err());
+}
+
+#[test]
+fn the_checked_in_judge_is_advisory_with_empty_labels() {
+    let root = evals_root();
+    let judges = load_judges(&root).unwrap();
+    let j = judges
+        .iter()
+        .find(|j| j.name == "faithful-to-cited-page")
+        .expect("the example judge");
+    assert_eq!(j.alias, "pmos/extraction");
+    assert_eq!(j.applies_to, ["docs-qa"]);
+    assert!(j.needs_sources);
+    assert!(pmos_evals::judge::load_labels(&root, j).unwrap().is_empty());
+    let cal = pmos_evals::judge::load_calibration(&root, j).unwrap();
+    let status = pmos_evals::judge::status(j, cal.as_ref());
+    assert!(!status.blocking, "{}", status.reason);
+}
+
+#[test]
+fn judge_files_are_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let judges = dir.path().join("judges");
+    std::fs::create_dir_all(&judges).unwrap();
+    std::fs::write(
+        judges.join("j.yaml"),
+        "name: other\nfailure_mode: nope\nquestion: \" \"\nalias: gpt-4\napplies_to: []\nlabels: missing.jsonl\n",
+    )
+    .unwrap();
+    std::fs::write(
+        judges.join("k.yaml"),
+        "name: k\nfailure_mode: model/x\nquestion: q?\napplies_to: [cat]\nlabels: k.jsonl\n",
+    )
+    .unwrap();
+    std::fs::write(
+        judges.join("k.jsonl"),
+        "{\"input\": \"a\", \"output\": \"b\"}\n",
+    )
+    .unwrap();
+    let errors = load_judges(dir.path()).unwrap_err();
+    let has = |text: &str| {
+        assert!(
+            errors.iter().any(|e| e.contains(text)),
+            "no `{text}` in {errors:#?}"
+        )
+    };
+    has("`name` `other` must be lowercase letters, digits and hyphens, and match the file name");
+    has("`failure_mode` `nope` is a taxonomy sub-tag");
+    has("`question` is empty");
+    has("`alias` `gpt-4` is a gateway alias");
+    has("`applies_to` names no category");
+    has("missing.jsonl: can't read");
+    has("k.jsonl:1: not a label");
+    // The default alias, and a missing directory is no judges.
+    std::fs::write(judges.join("k.jsonl"), "").unwrap();
+    std::fs::remove_file(judges.join("j.yaml")).unwrap();
+    let ok = load_judges(dir.path()).unwrap();
+    assert_eq!(ok[0].alias, "pmos/extraction");
+    assert!(load_judges(&dir.path().join("nowhere")).unwrap().is_empty());
+}
+
+#[test]
+fn affected_categories_follow_bot_role_and_skills() {
+    let root = evals_root();
+    let content = root.join("../content");
+    let affected = |paths: &[&str]| {
+        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        pmos_evals::affected::affected(&root, &content, "content", "evals", &paths).unwrap()
+    };
+    let all = category_names(&root).unwrap();
+    assert_eq!(affected(&["evals/categories/docs-qa/category.yaml"]), all);
+    assert_eq!(affected(&["deploy/gateway.yaml"]), all);
+    assert_eq!(affected(&["content/skills/docs/SKILL.md"]), ["docs-qa"]);
+    assert_eq!(
+        affected(&["content/roles/docs-helper/ROLE.md"]),
+        ["docs-qa"]
+    );
+    assert_eq!(affected(&["content/bots/docs/BOT.md"]), ["docs-qa"]);
+    // Personal bots: pm-<requested_by>, made from pm-assistant and its skills.
+    let personal = ["confluence-draft", "jira-draft", "pm-craft", "slack-reply"];
+    assert_eq!(affected(&["content/roles/pm-assistant/ROLE.md"]), personal);
+    assert_eq!(affected(&["./content/skills/prd-draft/SKILL.md"]), personal);
+    assert_eq!(affected(&["content/bots/pm-evals/BOT.md"]), personal);
+    assert!(affected(&["content/bots/pm-ana/BOT.md"]).is_empty());
+    assert!(affected(&[
+        "README.md",
+        "content/context/x.md",
+        "crates/evals/src/run.rs"
+    ])
+    .is_empty());
+    // A skill directory's name must match whole: `ask` doesn't match `asked`.
+    assert!(affected(&["content/skills/asked/SKILL.md"]).is_empty());
 }

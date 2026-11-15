@@ -79,12 +79,22 @@ tools:
     kind: write
     description: Send a message as the PM to a channel or person
 
-  # Acme support docs (public; served by the pmos-docs MCP server)
+  # Your company's public docs site (served by the pmos-docs MCP server; PMOS_DOCS_BASE_URL)
   - name: docs.search
     system: docs
     kind: read
-    description: Search the public Acme support documentation (support.acme.com)
+    description: Search your company's public docs
   - name: docs.read
     system: docs
     kind: read
-    description: Read one support page as markdown, by the url a search returned
+    description: Read one page of your company's public docs as markdown, by the url a search returned
+
+  # Experiment statistics (computed by the tool server; no connector, nothing leaves PM OS)
+  - name: stats.sample_size
+    system: stats
+    kind: read
+    description: "Users needed per arm and in total (and days, given daily traffic) for an A/B test on a proportion or a mean: two-sample z-test, defaults alpha 0.05, power 0.8, two-sided, 2 arms"
+  - name: stats.compare
+    system: stats
+    kind: read
+    description: "Compare a control and a treatment conversion rate: rates, absolute and relative lift, the confidence interval of the lift, p-value and significance (two-proportion z-test)"

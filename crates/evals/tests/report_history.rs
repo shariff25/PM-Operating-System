@@ -14,6 +14,7 @@ fn line(id: &str, failure: Option<(Tag, &str, Check)>) -> TaskReport {
                 tag,
                 rule: rule.into(),
                 reason: format!("because | {rule}"),
+                sub: None,
             }),
             vec![check],
         ),
@@ -22,6 +23,10 @@ fn line(id: &str, failure: Option<(Tag, &str, Check)>) -> TaskReport {
     TaskReport {
         id: id.into(),
         ask: format!("Question {id}?"),
+        repeat: 1,
+        cluster: None,
+        regression: false,
+        judges: Vec::new(),
         task_id: Some(format!("tsk_{id}")),
         status: Some(if passed { "done" } else { "failed" }.into()),
         passed,
@@ -56,11 +61,14 @@ fn report(date: &str, passed: usize, total: usize) -> Report {
         date,
         started_at: at,
         finished_at: at + chrono::Duration::minutes(3),
-        pass_bar: 0.8,
+        pass_bar: Some(0.8),
         runtime_url: "http://127.0.0.1:8750".into(),
         requested_by: "ana".into(),
         gateway_workarounds: None,
         note: None,
+        repeats: 1,
+        judges: Vec::new(),
+        judges_skipped: None,
         tasks,
     }
 }
@@ -85,7 +93,7 @@ fn markdown_report_puts_the_top_bottleneck_first() {
             Tag::Tool,
             "page-not-retrieved",
             Check::MissingCitation {
-                url: "https://support.acme.com/docs/a".into(),
+                url: "https://docs.example.com/docs/a".into(),
             },
         )),
     ));
@@ -152,7 +160,7 @@ fn markdown_report_puts_the_top_bottleneck_first() {
         md.contains("| `t00` | pass |  | done | 1.3 | 12.5 |  |"),
         "{md}"
     );
-    assert!(md.contains("| `tool-a` | **FAIL** | tool (`page-not-retrieved`) | failed | 1.3 | 12.5 | doesn't cite https://support.acme.com/docs/a |"), "{md}");
+    assert!(md.contains("| `tool-a` | **FAIL** | tool (`page-not-retrieved`) | failed | 1.3 | 12.5 | doesn't cite https://docs.example.com/docs/a |"), "{md}");
     assert!(md.contains("### `harness-a`"));
     assert!(
         md.contains("- **Tag:** harness by rule `interrupted`: because \\| interrupted"),
@@ -290,4 +298,142 @@ fn weeks_are_consecutive_across_a_year_end() {
         &[report("2026-12-21", 20, 20), report("2027-01-05", 20, 20)],
     );
     assert!(!h.two_weeks_met);
+}
+
+/// A report as `pmos-evals run` wrote it before repeats, sub-tags, judges and optional bars.
+const OLD_REPORT: &str = r#"{
+  "category": "docs-qa",
+  "bot": "docs",
+  "date": "2026-11-09",
+  "started_at": "2026-11-09T09:00:00Z",
+  "finished_at": "2026-11-09T09:03:00Z",
+  "pass_bar": 0.8,
+  "runtime_url": "http://127.0.0.1:8750",
+  "requested_by": "ana",
+  "gateway_workarounds": null,
+  "note": "weekly",
+  "tasks": [
+    {
+      "id": "vault-port-requirements",
+      "ask": "Which ports?",
+      "task_id": "tsk_1",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 1.0,
+      "total_secs": 9.0,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "cloud-join-token",
+      "ask": "Where is the join token?",
+      "task_id": "tsk_2",
+      "status": "done",
+      "passed": false,
+      "failures": [{"check": "missing_text", "text": "join token"}],
+      "tag": {"tag": "model", "rule": "model", "reason": "doesn't say \"join token\""},
+      "queue_secs": 1.0,
+      "total_secs": 9.0,
+      "attempts": 1,
+      "trace_read": true
+    }
+  ]
+}"#;
+
+#[test]
+fn old_single_repeat_reports_still_load() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("2026-11-09-docs-qa.json"), OLD_REPORT).unwrap();
+    let r = load_reports(dir.path(), "docs-qa").unwrap().remove(0);
+    assert_eq!(r.repeats, 1);
+    assert_eq!(r.pass_bar, Some(0.8));
+    assert!(r.judges.is_empty());
+    assert_eq!(r.tasks[1].repeat, 1);
+    assert_eq!(r.tasks[1].cluster, None);
+    assert!(!r.tasks[1].regression);
+    assert_eq!(r.tasks[1].tag.as_ref().unwrap().sub, None);
+    assert_eq!(r.met_bar(), Some(false));
+    // Its numbers, comparison and markdown work as for a new report.
+    let s = pmos_evals::stats::summaries(&r);
+    assert_eq!((s[0].passes, s[0].runs, s[1].passes), (1, 1, 0));
+    assert_eq!(pmos_evals::stats::pass_hat_k(&s), Some(0.5));
+    let md = r.to_markdown();
+    assert!(
+        md.contains("**Below the bar.** 1 of 2 tasks passed (50%)"),
+        "{md}"
+    );
+    assert!(
+        md.contains("| `cloud-join-token` | **FAIL** | model (`model`) |"),
+        "{md}"
+    );
+    assert!(!md.contains("pass^"), "{md}");
+    let read = pmos_evals::report::read(&dir.path().join("2026-11-09-docs-qa.md")).unwrap();
+    assert_eq!(read, r);
+}
+
+#[test]
+fn reports_show_sub_tags_and_reports_only_categories() {
+    let mut r = report("2026-11-09", 1, 3);
+    r.pass_bar = None;
+    for (i, sub) in ["model/missing-fact", "model/missing-fact"]
+        .iter()
+        .enumerate()
+    {
+        r.tasks[i + 1].tag.as_mut().unwrap().sub = Some(sub.to_string());
+    }
+    let md = r.to_markdown();
+    assert!(
+        md.contains(
+            "**Reports only.** 1 of 3 tasks passed (33%); the category has no pass bar yet."
+        ),
+        "{md}"
+    );
+    assert!(
+        md.contains("| `model/missing-fact` | 2 | `t01`, `t02` |"),
+        "{md}"
+    );
+    assert!(
+        md.contains("| `t01` | **FAIL** | model/missing-fact (`model`) |"),
+        "{md}"
+    );
+    assert_eq!(r.met_bar(), None);
+}
+
+#[test]
+fn repeats_show_passes_out_of_k_and_pass_hat_k() {
+    let mut r = report("2026-11-09", 0, 0);
+    r.repeats = 3;
+    // t-a passes 3/3, t-b 1/3.
+    for (id, passes) in [("t-a", 3), ("t-b", 1)] {
+        for k in 1..=3u32 {
+            let mut l = if k <= passes {
+                line(id, None)
+            } else {
+                line(
+                    id,
+                    Some((Tag::Model, "model", Check::MissingText { text: "x".into() })),
+                )
+            };
+            l.repeat = k;
+            r.tasks.push(l);
+        }
+    }
+    assert_eq!((r.passed(), r.total()), (4, 6));
+    let md = r.to_markdown();
+    assert!(
+        md.contains(
+            "4 of 6 attempts passed (67%) over 2 tasks run 3 times each, against a bar of 80%."
+        ),
+        "{md}"
+    );
+    assert!(
+        md.contains("| pass^3 | 50% (1 of 2 tasks passed every run) |"),
+        "{md}"
+    );
+    assert!(md.contains("| `t-a` | 3/3 |"), "{md}");
+    assert!(md.contains("| `t-b` | **1/3** | model ×2 |"), "{md}");
+    assert!(md.contains("### `t-b`, run 3 of 3"), "{md}");
+    assert!(md.contains("| Pass rate | 66.7% ± "), "{md}");
 }

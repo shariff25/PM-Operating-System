@@ -169,6 +169,47 @@ pub fn team_fixture(members: &[&str]) -> Fixture {
     build_with(dir, root, stores, audit, Some(team))
 }
 
+/// For the Slack reply assistant: `team.yaml` enforced with the Slack fixtures' team
+/// ([`pmos_toolserver::connectors::fake::SLACK_TEAM`]: evals, ben and cy), and a `reply-test`
+/// skill whose data class is `restricted`, with the context, Jira, docs and Slack tools. In
+/// memory, or with `postgres` every store in Postgres (`None` when no test database is set).
+pub async fn reply_fixture(postgres: bool) -> Option<(Fixture, Option<TestPg>)> {
+    let (dir, root) = content_tree();
+    write(
+        &root,
+        "skills/reply-test/SKILL.md",
+        "---\nname: reply-test\ndescription: Test skill that drafts Slack replies.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"restricted\"\n  tools: \"context.search context.read jira.search jira.read docs.search docs.read slack.search slack.read_thread slack.post_reply slack.send_message jira.create_issue\"\n---\n\n# /reply-test\n\nTest.\n",
+    );
+    let team = pmos_toolserver::team::Team::of(
+        pmos_toolserver::connectors::fake::SLACK_TEAM
+            .iter()
+            .map(|(handle, slack_id)| pmos_contract::model::TeamMember {
+                handle: handle.to_string(),
+                slack_id: slack_id.to_string(),
+                email: None,
+                github: None,
+                roles: vec![pmos_contract::model::Role::Pm],
+            })
+            .collect(),
+    );
+    if postgres {
+        let pg = TestPg::new().await?;
+        pg.store.reindex(&load_docs(&root)).await.expect("reindex");
+        let mut stores = pg.store.stores();
+        // Audited to Postgres, and to memory for the test to read.
+        let audit = Arc::new(MemoryAudit::default());
+        stores.audit = Arc::new(pmos_toolserver::audit::TeeAudit(vec![
+            stores.audit.clone(),
+            audit.clone(),
+        ]));
+        let f = build_with(dir, root, stores, audit, Some(team));
+        Some((f, Some(pg)))
+    } else {
+        let (stores, audit) = Stores::in_memory(&root);
+        Some((build_with(dir, root, stores, audit, Some(team)), None))
+    }
+}
+
 fn build(dir: TempDir, root: PathBuf, stores: Stores, audit: Arc<MemoryAudit>) -> Fixture {
     build_with(dir, root, stores, audit, None)
 }
@@ -227,13 +268,13 @@ pub fn content_tree() -> (TempDir, PathBuf) {
     );
     write(
         &root,
-        "context/partners/acme-nda.md",
-        "---\ntitle: Acme partnership (NDA)\nowner: \"@pm\"\nlast-reviewed: 2026-11-01\nsensitivity: restricted\n---\n\n# Acme\n\nJoint roadmap for key management under NDA.\n",
+        "context/partners/globex-nda.md",
+        "---\ntitle: Globex partnership (NDA)\nowner: \"@pm\"\nlast-reviewed: 2026-11-01\nsensitivity: restricted\n---\n\n# Globex\n\nJoint roadmap for key management under NDA.\n",
     );
     write(
         &root,
         "context/products/key-management.md",
-        "---\ntitle: Key management overview\nowner: \"@pm\"\nlast-reviewed: 2026-06-01\nsensitivity: internal\n---\n\n# Key management\n\nPublic overview of key management in DSM.\n",
+        "---\ntitle: Key management overview\nowner: \"@pm\"\nlast-reviewed: 2026-06-01\nsensitivity: internal\n---\n\n# Key management\n\nPublic overview of key management in Acme Vault.\n",
     );
     write(
         &root,

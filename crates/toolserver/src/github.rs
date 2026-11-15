@@ -562,13 +562,13 @@ mod tests {
 
     #[test]
     fn repo_names() {
-        assert!(valid_repo("acme/pm-os-memory-ana"));
-        assert!(valid_repo("Acme/a.b_c"));
+        assert!(valid_repo("example-org/pm-os-memory-ana"));
+        assert!(valid_repo("Example-Org/a.b_c"));
         for bad in [
-            "acme",
+            "example-org",
             "/x",
-            "acme/",
-            "acme/..",
+            "example-org/",
+            "example-org/..",
             "a/b/c",
             "fort anix/x",
             "-x/y",

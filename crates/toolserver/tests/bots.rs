@@ -75,7 +75,7 @@ async fn a_bot_session_gets_its_roles_tools_less_never() {
         ]
     );
 
-    // pm-assistant's three skills, less the bot's own `slack.send_message: never`.
+    // pm-assistant's skills, less the bot's own `slack.send_message: never`.
     let mine = bot_session(&f, "ana", "pm-ana").await;
     assert_eq!(
         tool_names(&f, &mine),
@@ -90,6 +90,11 @@ async fn a_bot_session_gets_its_roles_tools_less_never() {
             "jira_create_issue",
             "jira_read",
             "jira_search",
+            "slack_post_reply",
+            "slack_read_thread",
+            "slack_search",
+            "stats_compare",
+            "stats_sample_size",
         ]
     );
 }
@@ -275,7 +280,7 @@ async fn a_bot_reads_nothing_above_its_roles_data_class() {
         .call(
             &scout,
             "context_read",
-            json!({"path": "context/partners/acme-nda.md"}),
+            json!({"path": "context/partners/globex-nda.md"}),
             now(),
         )
         .await
@@ -287,7 +292,7 @@ async fn a_bot_reads_nothing_above_its_roles_data_class() {
         .call(&scout, "context_search", json!({"query": "roadmap"}), now())
         .await
         .unwrap();
-    assert!(!found.to_string().contains("acme-nda"));
+    assert!(!found.to_string().contains("globex-nda"));
 
     let mine = bot_session(&f, "ana", "pm-ana").await;
     let doc = f
@@ -295,7 +300,7 @@ async fn a_bot_reads_nothing_above_its_roles_data_class() {
         .call(
             &mine,
             "context_read",
-            json!({"path": "context/partners/acme-nda.md"}),
+            json!({"path": "context/partners/globex-nda.md"}),
             now(),
         )
         .await
@@ -703,9 +708,11 @@ async fn mcp_lists_and_calls_only_what_the_bot_may() {
     let tools = client.list_tools(Default::default()).await.unwrap();
     let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
     assert!(names.contains(&"jira_create_issue".to_string()));
-    assert!(!names.contains(&"slack_send_message".to_string()));
+    assert!(!names.contains(&"slack_send_message".to_string()), "never");
+    // The slack-reply skill's tools are in the role; the reply itself still needs approval.
+    assert!(names.contains(&"slack_post_reply".to_string()));
     assert!(
-        !names.contains(&"slack_search".to_string()),
+        !names.contains(&"memory_update".to_string()),
         "not in the role"
     );
 

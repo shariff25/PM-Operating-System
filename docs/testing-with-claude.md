@@ -5,9 +5,9 @@ tried end to end with a Claude model behind the gateway, in a Slack workspace ma
 Prompts to Claude leave the machine. So this setup uses only:
 - a test Slack workspace;
 - fake Jira, Confluence and Slack fixtures;
-- the public Acme support docs.
+- your company's public docs site (`PMOS_DOCS_BASE_URL`), if you set one.
 
-Never use it with real PM tokens or Acme data. The production rule (local open-weight
+Never use it with real PM tokens or company data. The production rule (local open-weight
 models only) is unchanged: the gateway refuses the Claude upstream unless
 `PMOS_GATEWAY_CLOUD_TEST=1` is set.
 
@@ -15,7 +15,7 @@ models only) is unchanged: the gateway refuses the Claude upstream unless
 
 | Try | What happens |
 | --- | --- |
-| `docs: what ports does DSM need?` | The Docs bot searches the real support docs and answers with links |
+| `docs: how do I get started?` | The Docs bot searches your docs site and answers with links (with no `PMOS_DOCS_BASE_URL`, it says no docs site is configured) |
 | Any other DM | Your personal bot `pm-<you>` answers from the fake Jira, Confluence and Slack fixtures and the team context |
 | A request to draft a Jira issue or a Slack reply | An **Approve / Edit / Reject** card. Approving writes to the fixtures only. |
 | `every weekday at 9am, summarize the launch issues` | A routine is parsed and confirmed |

@@ -35,10 +35,15 @@ async fn main() -> Result<()> {
             Arc::new(MemoryStore::default())
         }
     };
-    let runtime = Arc::new(Runtime::new(
-        store.clone(),
-        Syncer::new(config.sync.clone(), store),
-    ));
+    let runtime = Arc::new(match &config.sync {
+        Some(sync) => Runtime::new(store.clone(), Syncer::new(sync.clone(), store)),
+        None => {
+            tracing::warn!(
+                "no docs site configured (PMOS_DOCS_BASE_URL is unset): serving an empty index and not syncing"
+            );
+            Runtime::unconfigured(store)
+        }
+    });
 
     // Sync when due: on a first start, then on schedule.
     let cancel = CancellationToken::new();
@@ -67,7 +72,9 @@ async fn main() -> Result<()> {
         runtime,
         AppConfig {
             token: config.token.clone(),
-            base: config.sync.base.clone(),
+            name: config.name.clone(),
+            site: config.sync.as_ref().map(|s| s.site.clone()),
+            products: config.products.clone(),
             allowed_hosts: config.allowed_hosts.clone(),
             stale_after: config.sync_every.map(|every| every * 2),
         },
@@ -76,7 +83,11 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;
-    tracing::info!(bind = %config.bind, source = %config.sync.base, "pmos-docs listening");
+    let source = config
+        .sync
+        .as_ref()
+        .map_or("none", |s| s.site.base.as_str());
+    tracing::info!(bind = %config.bind, source, "pmos-docs listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             pmos_runtime::shutdown_signal().await;

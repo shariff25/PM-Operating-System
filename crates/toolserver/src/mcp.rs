@@ -51,7 +51,7 @@ fn to_tool(spec: &ToolSpec) -> Tool {
         .read_only(spec.kind == ToolKind::Read)
         // Updating an existing page replaces its body; everything else adds.
         .destructive(spec.name == "confluence.update_page")
-        .open_world(!matches!(spec.system.as_str(), "context" | "memory"));
+        .open_world(!crate::service::LOCAL_SYSTEMS.contains(&spec.system.as_str()));
     let description = match spec.kind {
         ToolKind::Write => format!(
             "{} Needs the PM's approval per call: without it, returns pending_approval and does nothing.",

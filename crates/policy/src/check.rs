@@ -400,11 +400,11 @@ fn destination(key: &str, ep: &Endpoint, out: &mut Out) -> Option<Service> {
         return Some(service);
     }
     let lower = host.to_ascii_lowercase();
-    let hint = if ["slack", "atlassian", "jira", "confluence", "acme"]
+    let hint = if ["slack", "atlassian", "jira", "confluence"]
         .iter()
         .any(|s| lower.contains(s))
     {
-        " (Slack, Jira, Confluence and the support docs are reached only through the tool server)"
+        " (Slack, Jira, Confluence and the docs server are reached only through the tool server)"
     } else {
         ""
     };

@@ -37,6 +37,8 @@ pub enum Outcome {
     Error,
     /// An approved member could not be committed to the content repo.
     Failed,
+    /// A Slack draft nobody decided in time expired, and its text was removed.
+    Expired,
 }
 
 /// Who made the call: a sandbox over MCP, or an internal service with its own token.
@@ -170,7 +172,7 @@ mod tests {
             bot: None,
             tool: "context.search".into(),
             outcome: Outcome::Ok,
-            sources: vec!["context/products/ccm.md".into()],
+            sources: vec!["context/products/cloud.md".into()],
             args_hash: None,
             output_ref: None,
             detail: None,

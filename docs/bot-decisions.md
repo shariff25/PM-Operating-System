@@ -54,7 +54,7 @@ the product lessons doc shared on 2026-11-14.
    - The audit log stays append-only and metadata-only.
 3. **Memory (D5): markdown files in git.**
    - **Team memory** is in git, and PMs edit it by pull request or commit.
-   - **Personal memory** is in each PM's own **private repo in the Acme GitHub org** (decided 2026-11-14). The PM links GitHub; every read and write acts with their own token, and the tool server refuses a repo that is public, archived, outside the org or without push access. See `docs/onboarding-spec.md` §2.
+   - **Personal memory** is in each PM's own **private repo in your GitHub org** (decided 2026-11-14). The PM links GitHub; every read and write acts with their own token, and the tool server refuses a repo that is public, archived, outside the org or without push access. See `docs/onboarding-spec.md` §2.
    - Every entry carries its source and date.
 4. **Console (D1): a small server-rendered console** with four screens only: bot roster, routines, approval queue and audit or trace. It replaces the planned platform-owner-only admin pages. Slack stays the main surface, and approvals still happen in Slack cards.
 

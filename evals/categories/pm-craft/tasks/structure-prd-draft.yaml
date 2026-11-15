@@ -1,0 +1,22 @@
+# seed: replace with case cards
+# Fixtures: story PM-102 and epic PM-101; the exemplar PRDs are page 9002 and
+# content/context/exemplars/. The prd-draft skill titles its draft `PRD: …` and follows
+# content/templates/prd.md, whose headings include Problem and evidence, Goals and non-goals,
+# Alternatives considered, Success metrics and Launch criteria.
+id: structure-prd-draft
+ask: "Draft anyway, no questions: a PRD in the PM space for SCIM user provisioning in the Acme Vault console, from Jira story PM-102 and epic PM-101."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["PRD:", "Problem and evidence", "Goals and non-goals", "Alternatives considered", "Success metrics", "Launch criteria"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: prd-draft
+tags:
+  - model/draft-content

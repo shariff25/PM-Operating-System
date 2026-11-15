@@ -79,12 +79,13 @@ mod tests {
 
     #[test]
     fn strips_reasoning_from_the_answer() {
-        let mut r = reply("<think>\nThe user wants SAML.\n</think>\n\nDSM supports SAML 2.0.");
+        let mut r =
+            reply("<think>\nThe user wants SAML.\n</think>\n\nAcme Vault supports SAML 2.0.");
         let on = vec!["strip-think".to_string()];
         assert_eq!(apply(&on, true, &mut r), vec!["strip-think"]);
         assert_eq!(
             r["choices"][0]["message"]["content"],
-            "DSM supports SAML 2.0."
+            "Acme Vault supports SAML 2.0."
         );
         assert_eq!(
             r["choices"][0]["message"]["reasoning_content"],

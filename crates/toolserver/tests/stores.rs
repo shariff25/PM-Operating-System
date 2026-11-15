@@ -12,10 +12,11 @@ use std::sync::Arc;
 use chrono::Duration;
 use pmos_contract::Sensitivity;
 use pmos_toolserver::approvals::{
-    DecideError, Decision, MemoryApprovals, NewItem, Status, GRANT_TTL_MINUTES,
+    DecideError, Decision, MemoryApprovals, NewItem, Status, Verdict, GRANT_TTL_MINUTES,
 };
 use pmos_toolserver::audit::{AuditEvent, MemoryAudit, Outcome};
 use pmos_toolserver::context::{ContextDoc, MemoryIndex};
+use pmos_toolserver::ledger::{LedgerOutcome, LedgerQuery, LedgerRow, Reason};
 use pmos_toolserver::members::{
     Created, Decided, MemoryRequests, NewRequest, RequestStatus, MAX_PENDING,
 };
@@ -47,16 +48,16 @@ fn doc(path: &str, title: &str, sensitivity: Sensitivity, body: &str) -> Context
 fn library() -> Vec<ContextDoc> {
     vec![
         doc(
-            "context/products/ccm.md",
-            "CCM",
+            "context/products/cloud.md",
+            "Acme Cloud",
             Sensitivity::Internal,
-            "# CCM\n\nKey management for multi-cloud estates.\n",
+            "# Acme Cloud\n\nKey management for multi-cloud estates.\n",
         ),
         doc(
-            "context/competitors/acme.md",
-            "Acme key management",
+            "context/competitors/initech.md",
+            "Initech key management",
             Sensitivity::Internal,
-            "# Acme\n\nAcme sells key management appliances.\n",
+            "# Initech\n\nInitech sells key management appliances.\n",
         ),
         doc(
             "context/partners/nda.md",
@@ -142,6 +143,7 @@ macro_rules! contract {
 
 contract!(
     sessions_expire_and_revoke,
+    session_sensitivity_only_rises,
     bot_sessions_keep_their_bot,
     approval_items_and_audit_events_keep_their_bot,
     grants_match_one_exact_call_once,
@@ -151,6 +153,11 @@ contract!(
     decisions_win_once_under_concurrency,
     completion_records_results_and_failures,
     interrupted_writes_are_found,
+    replies_are_drafted_once_per_thread,
+    slack_drafts_expire_and_lose_their_text,
+    ledger_rows_record_every_outcome,
+    ledger_reads_filter_and_order,
+    ledger_rows_follow_concurrent_decisions,
     memory_is_per_user,
     context_search_and_get,
     context_search_applies_the_ceiling_in_the_store,
@@ -204,6 +211,40 @@ async fn sessions_expire_and_revoke(b: &Backend) {
         .is_none());
 }
 
+async fn session_sensitivity_only_rises(b: &Backend) {
+    let s = Session::new("ana", "ask", "r1", Duration::minutes(30), now());
+    b.stores.sessions.insert(&s, now()).await.unwrap();
+    let read = || async {
+        b.stores
+            .sessions
+            .get(&s.token, now())
+            .await
+            .unwrap()
+            .unwrap()
+            .sources_sensitivity
+    };
+    assert_eq!(read().await, Sensitivity::Public);
+    for (raise, want) in [
+        (Sensitivity::Internal, Sensitivity::Internal),
+        (Sensitivity::Public, Sensitivity::Internal),
+        (Sensitivity::Restricted, Sensitivity::Restricted),
+        (Sensitivity::Internal, Sensitivity::Restricted),
+    ] {
+        b.stores
+            .sessions
+            .raise_sensitivity(&s.token, raise)
+            .await
+            .unwrap();
+        assert_eq!(read().await, want, "after {raise}");
+    }
+    // An unknown token is a no-op.
+    b.stores
+        .sessions
+        .raise_sensitivity("pmos_s_unknown", Sensitivity::Restricted)
+        .await
+        .unwrap();
+}
+
 async fn bot_sessions_keep_their_bot(b: &Backend) {
     let bot = Session::for_bot("ana", "scout", "tsk_1", Duration::minutes(30), now());
     let skill = Session::new("ana", "ask", "r1", Duration::minutes(30), now());
@@ -242,6 +283,9 @@ async fn approval_items_and_audit_events_keep_their_bot(b: &Backend) {
                 run_id: "tsk_1",
                 tool: "jira.create_issue",
                 args: &args,
+                content_sha: None,
+                model_alias: None,
+                sources_sensitivity: Sensitivity::Internal,
             },
             now(),
         )
@@ -366,6 +410,9 @@ fn new_item<'a>(user: &'a str, args: &'a Value) -> NewItem<'a> {
         run_id: "r1",
         tool: "confluence.create_draft",
         args,
+        content_sha: Some("0123456789abcdef0123456789abcdef01234567"),
+        model_alias: Some("pmos/default"),
+        sources_sensitivity: Sensitivity::Internal,
     }
 }
 
@@ -568,17 +615,569 @@ async fn interrupted_writes_are_found(b: &Backend) {
     assert_eq!(stuck, vec![early.id]);
 }
 
+// ----- Slack drafts (docs/slack-reply-spec.md §3) -----------------------------------------
+
+fn slack_item<'a>(tool: &'a str, args: &'a Value) -> NewItem<'a> {
+    NewItem {
+        user: "ana",
+        skill: None,
+        bot: Some("pm-ana"),
+        run_id: "tsk_1",
+        tool,
+        args,
+        content_sha: None,
+        model_alias: Some("pmos/default"),
+        sources_sensitivity: Sensitivity::Restricted,
+    }
+}
+
+async fn replies_are_drafted_once_per_thread(b: &Backend) {
+    use pmos_toolserver::approvals::Drafted;
+    let a = b.stores.approvals.as_ref();
+    let args = json!({"channel": "C0PMTEAM", "thread_ts": "1731600000.000100", "text": "Yes"});
+    let since = now() - Duration::days(7);
+    let Drafted::New(first) = a
+        .create_reply(slack_item("slack.post_reply", &args), since, now())
+        .await
+        .unwrap()
+    else {
+        panic!("the first draft is new");
+    };
+    assert_eq!(first.sources_sensitivity, Some(Sensitivity::Restricted));
+    let other = json!({"channel": "C0PMTEAM", "thread_ts": "1731600000.000100", "text": "No"});
+    assert_eq!(
+        a.create_reply(slack_item("slack.post_reply", &other), since, now())
+            .await
+            .unwrap(),
+        Drafted::Existing(first.clone())
+    );
+    // Older than the window: doesn't count.
+    let later = now() + Duration::days(8);
+    assert!(matches!(
+        a.create_reply(
+            slack_item("slack.post_reply", &other),
+            later - Duration::days(7),
+            later
+        )
+        .await
+        .unwrap(),
+        Drafted::New(_)
+    ));
+    // Arguments with no thread are created as usual.
+    let no_thread = json!({"channel": "C0PMTEAM", "text": "Hi"});
+    for _ in 0..2 {
+        assert!(matches!(
+            a.create_reply(slack_item("slack.post_reply", &no_thread), since, now())
+                .await
+                .unwrap(),
+            Drafted::New(_)
+        ));
+    }
+
+    // Concurrent drafts for one thread: one is created.
+    let race = json!({"channel": "C0FIELD", "thread_ts": "1731601200.000600", "text": "x"});
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let approvals = b.stores.approvals.clone();
+        let race = race.clone();
+        handles.push(tokio::spawn(async move {
+            approvals
+                .create_reply(slack_item("slack.post_reply", &race), since, now())
+                .await
+                .unwrap()
+        }));
+    }
+    let mut created = 0;
+    for h in handles {
+        if matches!(h.await.unwrap(), Drafted::New(_)) {
+            created += 1;
+        }
+    }
+    assert_eq!(created, 1);
+}
+
+async fn slack_drafts_expire_and_lose_their_text(b: &Backend) {
+    use pmos_toolserver::approvals::{EXPIRED_TEXT, SLACK_DRAFT_TOOLS};
+    let a = b.stores.approvals.as_ref();
+    let reply = json!({"channel": "C0PMTEAM", "thread_ts": "1731600000.000100", "text": "Yes"});
+    let message = json!({"channel": "C0PMTEAM", "text": "Standup moved"});
+    let issue = json!({"summary": "SCIM"});
+    let old = a
+        .create(slack_item("slack.post_reply", &reply), now())
+        .await
+        .unwrap();
+    let sent = a
+        .create(slack_item("slack.send_message", &message), now())
+        .await
+        .unwrap();
+    let young = a
+        .create(
+            slack_item("slack.post_reply", &reply),
+            now() + Duration::hours(2),
+        )
+        .await
+        .unwrap();
+    let jira = a
+        .create(slack_item("jira.create_issue", &issue), now())
+        .await
+        .unwrap();
+    let decided = a
+        .create(slack_item("slack.post_reply", &reply), now())
+        .await
+        .unwrap();
+    a.decide(&decided.id, "ana", Decision::Reject, None, now())
+        .await
+        .unwrap();
+
+    let at = now() + Duration::hours(24);
+    let expired = a
+        .expire(&SLACK_DRAFT_TOOLS, now() + Duration::hours(1), at)
+        .await
+        .unwrap();
+    // Oldest first; these two were created at the same time, so by id.
+    let ids: Vec<&str> = expired.iter().map(|i| i.id.as_str()).collect();
+    let mut want = vec![old.id.as_str(), sent.id.as_str()];
+    want.sort();
+    assert_eq!(ids, want);
+    assert!(expired.iter().all(|i| i.status == Status::Expired));
+    let stored = a.get(&old.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, Status::Expired);
+    assert_eq!(
+        stored.args,
+        json!({"channel": "C0PMTEAM", "thread_ts": "1731600000.000100", "text": EXPIRED_TEXT})
+    );
+    assert_eq!(stored.args_hash, old.args_hash);
+    assert_eq!(stored.redacted_at, Some(at));
+    assert_eq!(
+        a.get(&sent.id).await.unwrap().unwrap().args,
+        json!({"channel": "C0PMTEAM", "text": EXPIRED_TEXT})
+    );
+    for kept in [&young.id, &jira.id] {
+        assert_eq!(a.get(kept).await.unwrap().unwrap().status, Status::Pending);
+    }
+    assert!(a
+        .expire(&SLACK_DRAFT_TOOLS, now() + Duration::hours(1), at)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // An expired item can't be decided, by its user; anyone else is still forbidden.
+    assert_eq!(
+        a.decide(&old.id, "ana", Decision::Approve, None, at).await,
+        Err(DecideError::Expired)
+    );
+    assert_eq!(
+        a.decide(&old.id, "bo", Decision::Approve, None, at).await,
+        Err(DecideError::Forbidden)
+    );
+
+    // The ledger stores it, with no decision.
+    let rows = a
+        .ledger(&LedgerQuery::all(now() - Duration::days(30)))
+        .await
+        .unwrap();
+    let row = ledger_row(&rows, &old.id);
+    assert_eq!(row.outcome, LedgerOutcome::Expired);
+    assert!(row.decided_at.is_none());
+    assert_eq!(ledger_row(&rows, &jira.id).outcome, LedgerOutcome::Pending);
+    let only = a
+        .ledger(&LedgerQuery {
+            outcomes: vec![LedgerOutcome::Expired],
+            ..LedgerQuery::all(now() - Duration::days(30))
+        })
+        .await
+        .unwrap();
+    assert_eq!(only.len(), 2);
+
+    // Decided items lose their text once, after `before`; pending and expired ones aren't
+    // touched by this.
+    assert_eq!(
+        a.redact_decided(&SLACK_DRAFT_TOOLS, now() - Duration::seconds(1), at)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        a.redact_decided(&SLACK_DRAFT_TOOLS, now(), at)
+            .await
+            .unwrap(),
+        1
+    );
+    let redacted = a.get(&decided.id).await.unwrap().unwrap();
+    assert_eq!(redacted.status, Status::Rejected);
+    assert_eq!(redacted.args["text"], EXPIRED_TEXT);
+    assert_eq!(redacted.redacted_at, Some(at));
+    assert_eq!(
+        a.redact_decided(&SLACK_DRAFT_TOOLS, at, at).await.unwrap(),
+        0,
+        "once"
+    );
+    assert_eq!(a.get(&young.id).await.unwrap().unwrap().args["text"], "Yes");
+}
+
+// ----- the feedback ledger ----------------------------------------------------------------
+
+fn bot_item<'a>(bot: &'a str, args: &'a Value) -> NewItem<'a> {
+    NewItem {
+        user: "ana",
+        skill: None,
+        bot: Some(bot),
+        run_id: "tsk_1",
+        tool: "jira.create_issue",
+        args,
+        content_sha: None,
+        model_alias: Some("pmos/extraction"),
+        sources_sensitivity: Sensitivity::Internal,
+    }
+}
+
+fn ledger_row(rows: &[LedgerRow], id: &str) -> LedgerRow {
+    rows.iter()
+        .find(|r| r.id == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("no ledger row for {id}"))
+}
+
+async fn ledger_rows_record_every_outcome(b: &Backend) {
+    let a = b.stores.approvals.as_ref();
+    let args = json!({"title": "Release notes", "body": "Fixed the login bug."});
+    let decided = now() + Duration::minutes(5);
+
+    let unchanged = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide(&unchanged.id, "ana", Decision::Approve, None, decided)
+        .await
+        .unwrap();
+    a.complete(&unchanged.id, Ok(json!({"status": "done"})))
+        .await
+        .unwrap();
+
+    let edited = a.create(new_item("ana", &args), now()).await.unwrap();
+    let final_args = json!({"title": "Release notes", "body": "Fixed the logout bug."});
+    a.decide(
+        &edited.id,
+        "ana",
+        Decision::Edit,
+        Some(final_args.clone()),
+        decided,
+    )
+    .await
+    .unwrap();
+    a.complete(&edited.id, Ok(json!({"status": "done"})))
+        .await
+        .unwrap();
+
+    // Edited back to exactly what was drafted: approved unchanged.
+    let same = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide(&same.id, "ana", Decision::Edit, Some(args.clone()), decided)
+        .await
+        .unwrap();
+    a.complete(&same.id, Ok(json!({}))).await.unwrap();
+
+    let rejected = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide_with(
+        &rejected.id,
+        "ana",
+        Verdict {
+            decision: Decision::Reject,
+            args: None,
+            reason: Some(Reason::WrongFacts),
+            confirm_external: false,
+        },
+        decided,
+    )
+    .await
+    .unwrap();
+    let bare_reject = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide(&bare_reject.id, "ana", Decision::Reject, None, decided)
+        .await
+        .unwrap();
+    // A reason with an approval is not kept (the service refuses it before this).
+    let approved_with_reason = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide_with(
+        &approved_with_reason.id,
+        "ana",
+        Verdict {
+            decision: Decision::Approve,
+            args: None,
+            reason: Some(Reason::Tone),
+            confirm_external: false,
+        },
+        decided,
+    )
+    .await
+    .unwrap();
+
+    let failed = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide(&failed.id, "ana", Decision::Approve, None, decided)
+        .await
+        .unwrap();
+    a.complete(&failed.id, Err("space not found".into()))
+        .await
+        .unwrap();
+
+    let old = a
+        .create(new_item("ana", &args), now() - Duration::days(8))
+        .await
+        .unwrap();
+    let fresh = a.create(new_item("ana", &args), now()).await.unwrap();
+    // A failed decision changes nothing.
+    assert_eq!(
+        a.decide(&fresh.id, "bo", Decision::Reject, None, decided)
+            .await,
+        Err(DecideError::Forbidden)
+    );
+
+    let rows = a
+        .ledger(&LedgerQuery::all(now() - Duration::days(7)))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 9, "one row per item");
+
+    let r = ledger_row(&rows, &unchanged.id);
+    assert_eq!(r.outcome, LedgerOutcome::Approved);
+    assert_eq!(r.edit_distance, Some(0.0));
+    assert_eq!(r.reason, None);
+    assert_eq!(r.decided_at, Some(decided));
+    assert_eq!(r.decided_by.as_deref(), Some("ana"));
+    assert_eq!(r.created_at, now());
+    assert_eq!(r.user, "ana");
+    assert_eq!(r.run_id, "r1");
+    assert_eq!(r.skill.as_deref(), Some("prd-draft"));
+    assert_eq!(r.bot, None);
+    assert_eq!(r.tool, "confluence.create_draft");
+    assert_eq!(
+        r.content_sha.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
+    );
+    assert_eq!(r.model_alias.as_deref(), Some("pmos/default"));
+
+    let r = ledger_row(&rows, &edited.id);
+    assert_eq!(r.outcome, LedgerOutcome::Edited);
+    let expected = pmos_toolserver::ledger::args_edit_distance(&args, &final_args);
+    assert!(expected > 0.0 && expected < 0.2, "{expected}");
+    assert!((r.edit_distance.unwrap() - expected).abs() < 1e-9);
+
+    let r = ledger_row(&rows, &same.id);
+    assert_eq!(r.outcome, LedgerOutcome::Approved);
+    assert_eq!(r.edit_distance, Some(0.0));
+
+    let r = ledger_row(&rows, &rejected.id);
+    assert_eq!(r.outcome, LedgerOutcome::Rejected);
+    assert_eq!(r.reason, Some(Reason::WrongFacts));
+    assert_eq!(r.edit_distance, None);
+    assert_eq!(r.decided_by.as_deref(), Some("ana"));
+
+    let r = ledger_row(&rows, &bare_reject.id);
+    assert_eq!(r.outcome, LedgerOutcome::Rejected);
+    assert_eq!(r.reason, None);
+
+    let r = ledger_row(&rows, &approved_with_reason.id);
+    assert_eq!(r.outcome, LedgerOutcome::Pending, "still writing");
+    assert_eq!(r.reason, None);
+    assert_eq!(r.edit_distance, Some(0.0));
+
+    let r = ledger_row(&rows, &failed.id);
+    assert_eq!(r.outcome, LedgerOutcome::Failed);
+    assert_eq!(r.edit_distance, Some(0.0));
+
+    let r = ledger_row(&rows, &old.id);
+    assert_eq!(r.outcome, LedgerOutcome::Expired);
+    assert_eq!(r.decided_at, None);
+    // Expiry is worked out on read: with a longer window the same row is pending.
+    let longer = a
+        .ledger(&LedgerQuery::all(now() - Duration::days(30)))
+        .await
+        .unwrap();
+    assert_eq!(ledger_row(&longer, &old.id).outcome, LedgerOutcome::Pending);
+
+    let r = ledger_row(&rows, &fresh.id);
+    assert_eq!(r.outcome, LedgerOutcome::Pending);
+    assert_eq!(r.decided_at, None);
+    assert_eq!(r.decided_by, None);
+}
+
+async fn ledger_reads_filter_and_order(b: &Backend) {
+    let a = b.stores.approvals.as_ref();
+    let args = json!({"summary": "Login fails on Safari", "project": "PM"});
+    let t = |m: i64| now() + Duration::minutes(m);
+
+    // docs: rejected at +30, edited heavily at +20, approved at +10, pending since +5.
+    let rejected = a.create(bot_item("docs", &args), t(0)).await.unwrap();
+    a.decide_with(
+        &rejected.id,
+        "ana",
+        Verdict {
+            decision: Decision::Reject,
+            args: None,
+            reason: Some(Reason::Tone),
+            confirm_external: false,
+        },
+        t(30),
+    )
+    .await
+    .unwrap();
+    let heavy = a.create(bot_item("docs", &args), t(1)).await.unwrap();
+    a.decide(
+        &heavy.id,
+        "ana",
+        Decision::Edit,
+        Some(json!({"summary": "Checkout crashes", "project": "PM"})),
+        t(20),
+    )
+    .await
+    .unwrap();
+    a.complete(&heavy.id, Ok(json!({}))).await.unwrap();
+    let approved = a.create(bot_item("docs", &args), t(2)).await.unwrap();
+    a.decide(&approved.id, "ana", Decision::Approve, None, t(10))
+        .await
+        .unwrap();
+    a.complete(&approved.id, Ok(json!({}))).await.unwrap();
+    let pending = a.create(bot_item("docs", &args), t(5)).await.unwrap();
+    // scout: one pending at +3.
+    let scout = a.create(bot_item("scout", &args), t(3)).await.unwrap();
+
+    let all = LedgerQuery::all(now() - Duration::days(7));
+    let ids = |rows: Vec<LedgerRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+    // Newest change first: a decision, or the creation of an undecided item.
+    assert_eq!(
+        ids(a.ledger(&all).await.unwrap()),
+        vec![
+            rejected.id.clone(),
+            heavy.id.clone(),
+            approved.id.clone(),
+            pending.id.clone(),
+            scout.id.clone(),
+        ]
+    );
+    let q = LedgerQuery {
+        bot: Some("scout".into()),
+        ..all.clone()
+    };
+    assert_eq!(ids(a.ledger(&q).await.unwrap()), vec![scout.id.clone()]);
+    let q = LedgerQuery {
+        since: Some(t(5)),
+        until: Some(t(30)),
+        ..all.clone()
+    };
+    assert_eq!(
+        ids(a.ledger(&q).await.unwrap()),
+        vec![heavy.id.clone(), approved.id.clone(), pending.id.clone()],
+        "since is inclusive, until exclusive"
+    );
+    let q = LedgerQuery {
+        outcomes: vec![LedgerOutcome::Rejected, LedgerOutcome::Edited],
+        ..all.clone()
+    };
+    assert_eq!(
+        ids(a.ledger(&q).await.unwrap()),
+        vec![rejected.id.clone(), heavy.id.clone()]
+    );
+    // The triage digest's read: rejected, or edited by at least 0.3.
+    let q = LedgerQuery {
+        outcomes: vec![LedgerOutcome::Rejected, LedgerOutcome::Edited],
+        min_edit: Some(0.3),
+        ..all.clone()
+    };
+    assert_eq!(
+        ids(a.ledger(&q).await.unwrap()),
+        vec![rejected.id.clone(), heavy.id.clone()]
+    );
+    let q = LedgerQuery {
+        min_edit: Some(0.99),
+        outcomes: vec![LedgerOutcome::Edited, LedgerOutcome::Approved],
+        ..all.clone()
+    };
+    assert!(a.ledger(&q).await.unwrap().is_empty());
+    let q = LedgerQuery {
+        limit: Some(2),
+        ..all.clone()
+    };
+    assert_eq!(
+        ids(a.ledger(&q).await.unwrap()),
+        vec![rejected.id.clone(), heavy.id.clone()]
+    );
+    // Expired is a reported outcome, and filters like one.
+    let later = LedgerQuery {
+        outcomes: vec![LedgerOutcome::Expired],
+        ..LedgerQuery::all(t(4))
+    };
+    assert_eq!(ids(a.ledger(&later).await.unwrap()), vec![scout.id.clone()]);
+    let q = LedgerQuery {
+        outcomes: vec![LedgerOutcome::Pending],
+        ..LedgerQuery::all(t(4))
+    };
+    assert_eq!(ids(a.ledger(&q).await.unwrap()), vec![pending.id.clone()]);
+}
+
+async fn ledger_rows_follow_concurrent_decisions(b: &Backend) {
+    let args = json!({"title": "PRD"});
+    let item = b
+        .stores
+        .approvals
+        .create(new_item("ana", &args), now())
+        .await
+        .unwrap();
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let approvals = b.stores.approvals.clone();
+        let id = item.id.clone();
+        handles.push(tokio::spawn(async move {
+            let verdict = if i % 2 == 0 {
+                Verdict::new(Decision::Approve, None)
+            } else {
+                Verdict {
+                    decision: Decision::Reject,
+                    args: None,
+                    reason: Some(Reason::Incomplete),
+                    confirm_external: false,
+                }
+            };
+            approvals
+                .decide_with(&id, "ana", verdict, now() + Duration::minutes(i))
+                .await
+        }));
+    }
+    let mut winners = Vec::new();
+    for h in handles {
+        if let Ok(item) = h.await.unwrap() {
+            winners.push(item);
+        }
+    }
+    assert_eq!(winners.len(), 1);
+    let won = &winners[0];
+    let rows = b
+        .stores
+        .approvals
+        .ledger(&LedgerQuery::all(now()))
+        .await
+        .unwrap();
+    let row = ledger_row(&rows, &item.id);
+    assert_eq!(row.decided_at, won.decided_at, "the winner's decision");
+    match won.status {
+        Status::Rejected => {
+            assert_eq!(row.outcome, LedgerOutcome::Rejected);
+            assert_eq!(row.reason, Some(Reason::Incomplete));
+        }
+        _ => {
+            assert_eq!(row.outcome, LedgerOutcome::Pending);
+            assert_eq!(row.edit_distance, Some(0.0));
+            assert_eq!(row.reason, None);
+        }
+    }
+}
+
 // ----- memory -----------------------------------------------------------------------------
 
 async fn memory_is_per_user(b: &Backend) {
     let m = b.stores.memory.as_ref();
-    m.update("ana", "areas", "CCM", "ask, task r1", now())
+    m.update("ana", "areas", "Acme Cloud", "ask, task r1", now())
         .await
         .unwrap();
     m.update(
         "ana",
         "areas",
-        "CCM, DSM",
+        "Acme Cloud, Acme Vault",
         "ask, task r2",
         now() + Duration::minutes(1),
     )
@@ -587,13 +1186,13 @@ async fn memory_is_per_user(b: &Backend) {
     m.update("ana", "style", "short", "ask, task r1", now())
         .await
         .unwrap();
-    m.update("bo", "areas", "DSM", "ask, task r3", now())
+    m.update("bo", "areas", "Acme Vault", "ask, task r3", now())
         .await
         .unwrap();
     let ana = m.read("ana").await.unwrap();
     let keys: Vec<_> = ana.iter().map(|n| n.key.as_str()).collect();
     assert_eq!(keys, vec!["areas", "style"]);
-    assert_eq!(ana[0].text, "CCM, DSM");
+    assert_eq!(ana[0].text, "Acme Cloud, Acme Vault");
     assert_eq!(ana[0].updated_at, now() + Duration::minutes(1));
     assert!(m.read("cy").await.unwrap().is_empty());
 }
@@ -609,10 +1208,10 @@ async fn context_search_and_get(b: &Backend) {
         .hits;
     let paths: Vec<_> = hits.iter().map(|h| h.doc.path.as_str()).collect();
     assert_eq!(paths.len(), 2, "{paths:?}");
-    assert!(paths.contains(&"context/products/ccm.md"));
-    assert!(paths.contains(&"context/competitors/acme.md"));
+    assert!(paths.contains(&"context/products/cloud.md"));
+    assert!(paths.contains(&"context/competitors/initech.md"));
     assert_eq!(
-        paths[0], "context/competitors/acme.md",
+        paths[0], "context/competitors/initech.md",
         "a title match ranks first"
     );
     assert!(hits.iter().all(|h| h.score > 0.0));
@@ -708,7 +1307,7 @@ async fn reindex_tracks_the_content_repo(b: &Backend) {
     // One file edited, one deleted, one added.
     let mut docs = library();
     docs.retain(|d| d.path != "context/partners/nda.md");
-    docs[0].body = "# CCM\n\nNow with quantum-safe keys.\n".into();
+    docs[0].body = "# Acme Cloud\n\nNow with quantum-safe keys.\n".into();
     docs.push(doc(
         "context/glossary/terms.md",
         "Glossary",
@@ -726,7 +1325,7 @@ async fn reindex_tracks_the_content_repo(b: &Backend) {
         .await
         .unwrap()
         .hits;
-    assert_eq!(quantum[0].doc.path, "context/products/ccm.md");
+    assert_eq!(quantum[0].doc.path, "context/products/cloud.md");
     let trusted = c
         .search("trusted", None, Sensitivity::Restricted, 5)
         .await
@@ -753,7 +1352,7 @@ fn event(outcome: Outcome) -> AuditEvent {
         bot: None,
         tool: "confluence.create_draft".into(),
         outcome,
-        sources: vec!["context/products/ccm.md".into(), "jira:PM-101".into()],
+        sources: vec!["context/products/cloud.md".into(), "jira:PM-101".into()],
         args_hash: Some("abc".into()),
         output_ref: Some("apr_1".into()),
         detail: None,
@@ -783,7 +1382,7 @@ async fn audit_records_events(b: &Backend) {
         let outcomes: Vec<String> = rows.iter().map(|r| r.get("outcome")).collect();
         assert_eq!(outcomes, vec!["pending", "approved"]);
         let sources: Vec<String> = rows[0].get("sources");
-        assert_eq!(sources, vec!["context/products/ccm.md", "jira:PM-101"]);
+        assert_eq!(sources, vec!["context/products/cloud.md", "jira:PM-101"]);
 
         // Append-only: no update, delete or truncate, even by the table's owner.
         for sql in [
@@ -938,14 +1537,14 @@ async fn memory_repos_are_per_user(b: &Backend) {
     assert!(r.get("ana").await.unwrap().is_none());
     let record = MemoryRepo {
         user: "ana".into(),
-        repo: "acme/pm-os-memory-ana".into(),
+        repo: "example-org/pm-os-memory-ana".into(),
         verified_at: now(),
     };
     r.put(&record).await.unwrap();
     assert_eq!(r.get("ana").await.unwrap(), Some(record.clone()));
     assert!(r.get("bo").await.unwrap().is_none());
     let moved = MemoryRepo {
-        repo: "acme/ana-notes".into(),
+        repo: "example-org/ana-notes".into(),
         verified_at: now() + Duration::minutes(11),
         ..record
     };
@@ -959,7 +1558,7 @@ async fn memory_repos_are_per_user(b: &Backend) {
 fn new_request<'a>(slack_id: &'a str, handle: &'a str) -> NewRequest<'a> {
     NewRequest {
         slack_id,
-        email: "new@acme.com",
+        email: "new@example.com",
         name: "New Person",
         proposed_handle: handle,
     }
@@ -1236,6 +1835,50 @@ mod postgres_only {
             return;
         };
         b.pg.as_ref().unwrap().migrate().await.unwrap();
+        b.finish().await;
+    }
+
+    /// Migration 0007 gives every item made before the ledger a row.
+    #[tokio::test]
+    async fn the_ledger_migration_backfills_existing_items() {
+        let Some(b) = Backend::postgres(Vec::new()).await else {
+            return;
+        };
+        let pg = b.pg.as_ref().unwrap();
+        let args = json!({"title": "PRD"});
+        let a = b.stores.approvals.as_ref();
+        let pending = a.create(new_item("ana", &args), now()).await.unwrap();
+        let running = a.create(new_item("ana", &args), now()).await.unwrap();
+        a.decide(&running.id, "ana", Decision::Approve, None, now())
+            .await
+            .unwrap();
+        let rejected = a.create(new_item("ana", &args), now()).await.unwrap();
+        a.decide(&rejected.id, "ana", Decision::Reject, None, now())
+            .await
+            .unwrap();
+        // Back to how a database looked before 0007, then apply it by hand.
+        sqlx::query("DROP TABLE ledger")
+            .execute(pg.pool())
+            .await
+            .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(include_str!(
+            "../migrations/0007_ledger.sql"
+        )))
+        .execute(pg.pool())
+        .await
+        .unwrap();
+        let rows = a.ledger(&LedgerQuery::all(now())).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        let outcome = |id: &str| rows.iter().find(|r| r.id == id).unwrap().outcome;
+        assert_eq!(outcome(&pending.id), LedgerOutcome::Pending);
+        assert_eq!(outcome(&running.id), LedgerOutcome::Pending);
+        assert_eq!(outcome(&rejected.id), LedgerOutcome::Rejected);
+        assert!(rows.iter().all(|r| r.content_sha.is_none()));
+        // The write still running finishes into its backfilled row.
+        a.complete(&running.id, Ok(json!({}))).await.unwrap();
+        let rows = a.ledger(&LedgerQuery::all(now())).await.unwrap();
+        let r = rows.iter().find(|r| r.id == running.id).unwrap();
+        assert_eq!(r.outcome, LedgerOutcome::Approved);
         b.finish().await;
     }
 }

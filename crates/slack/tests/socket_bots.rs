@@ -5,6 +5,7 @@
 //! - Notifications: one progress message per task edited in place, then a new message for
 //!   the result; failures with their reason; the cursor survives a restart.
 //! - Approval cards: approve, edit (modal) and reject, decided by their own PM only.
+//! - Reject asks why: six reasons and Back, in place; a reason goes with the decision.
 //! - Routines: create, question, cancel, list, pause, resume, delete.
 //! - Every envelope is acknowledged before its work, even with slow backends.
 
@@ -300,6 +301,13 @@ async fn ts_decide(
     if item["status"] != "pending" {
         return refuse(StatusCode::CONFLICT, "approval item is already decided");
     }
+    // A reason goes only with `reject` (spec §1 of `docs/improvement-loop-spec.md`).
+    if body.get("reason").is_some() && body["decision"] != "reject" {
+        return refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a reason goes only with reject",
+        );
+    }
     item["decided_by"] = body["decided_by"].clone();
     match body["decision"].as_str() {
         Some("reject") => item["status"] = json!("rejected"),
@@ -365,6 +373,7 @@ impl Stack {
         let team = tempfile::tempdir().unwrap();
         let team_file = team.path().join("team.yaml");
         std::fs::write(&team_file, TEAM).unwrap();
+        let state = tempfile::tempdir().unwrap();
         let http = reqwest::Client::new();
         let bots = Bots::new(BotsConfig {
             slack: SlackApi::new(slack_base, SLACK_BOT_TOKEN, http.clone()),
@@ -374,6 +383,7 @@ impl Stack {
             default_tz: "UTC".into(),
             github_org: None,
             response_url_prefix: "https://hooks.slack.com/".into(),
+            state_dir: state.path().to_path_buf(),
         });
         Self {
             slack,
@@ -381,7 +391,7 @@ impl Stack {
             runtime,
             tools,
             bots,
-            state: tempfile::tempdir().unwrap(),
+            state,
             _team: team,
             stop: vec![stop_slack, stop_rt, stop_ts],
             socket: None,
@@ -532,7 +542,7 @@ async fn dms_go_to_the_right_bot_as_the_right_pm() {
             "U0ANA",
             "100.1",
             None,
-            "what ports does DSM need?",
+            "what ports does Acme Vault need?",
         ))
         .await;
     tasks(1).await;
@@ -556,7 +566,7 @@ async fn dms_go_to_the_right_bot_as_the_right_pm() {
             "U0ANA",
             "100.3",
             Some("100.2"),
-            "and for CCM?",
+            "and for Acme Cloud?",
         ))
         .await;
     tasks(3).await;
@@ -595,7 +605,7 @@ async fn dms_go_to_the_right_bot_as_the_right_pm() {
             "U0ANA",
             "100.1",
             None,
-            "what ports does DSM need?",
+            "what ports does Acme Vault need?",
         ))
         .await;
     // Someone else's personal bot: the runtime refuses, the PM is told why.
@@ -621,9 +631,9 @@ async fn dms_go_to_the_right_bot_as_the_right_pm() {
     );
 
     let expect = [
-        ("pm-ana", "ana", "100.1", "what ports does DSM need?"),
+        ("pm-ana", "ana", "100.1", "what ports does Acme Vault need?"),
         ("docs", "ana", "100.2", "what is SAML & SSO?"),
-        ("docs", "ana", "100.2", "and for CCM?"),
+        ("docs", "ana", "100.2", "and for Acme Cloud?"),
         ("pm-ana", "ana", "100.2", "draft a PRD"),
         ("docs", "bob", "100.5", "hello"),
         ("pm-ana", "bob", "100.10", "show me Ana's notes"),
@@ -642,7 +652,7 @@ async fn dms_go_to_the_right_bot_as_the_right_pm() {
 
     assert_eq!(ephemeral.len(), 1);
     assert_eq!(ephemeral[0].body["user"], "U0STRANGER");
-    assert!(text_of(&ephemeral[0]).contains("PM OS is for the Acme product team"));
+    assert!(text_of(&ephemeral[0]).contains("PM OS is for the product team"));
     assert_eq!(
         notes.len(),
         1,
@@ -673,7 +683,7 @@ async fn notifications_edit_one_message_per_task_and_survive_a_restart() {
         json!({"id": "n0", "task_id": "tsk_0", "bot": "docs", "requested_by": "ana", "slack": slack("90.1"), "kind": "milestone", "text": "Old work", "at": old}),
         json!({"id": "n1", "task_id": "tsk_1", "bot": "docs", "requested_by": "ana", "slack": slack("100.2"), "kind": "milestone", "text": "Working on it", "at": now}),
         json!({"id": "n2", "task_id": "tsk_1", "bot": "docs", "requested_by": "ana", "slack": slack("100.2"), "kind": "milestone", "text": "Searching the support docs", "at": now}),
-        json!({"id": "n3", "task_id": "tsk_1", "bot": "docs", "requested_by": "ana", "slack": slack("100.2"), "kind": "done", "text": "DSM needs **port 443** <open>. See [Ports](https://support.acme.com/ports).", "at": now}),
+        json!({"id": "n3", "task_id": "tsk_1", "bot": "docs", "requested_by": "ana", "slack": slack("100.2"), "kind": "done", "text": "Acme Vault needs **port 443** <open>. See [Ports](https://docs.example.com/ports).", "at": now}),
         json!({"id": "n4", "task_id": "tsk_2", "bot": "pm-ana", "requested_by": "ana", "slack": slack("100.1"), "kind": "failed", "text": "the tool server was unreachable", "at": now}),
     ]);
     let (stop, handle) = stack.notifier();
@@ -713,7 +723,7 @@ async fn notifications_edit_one_message_per_task_and_survive_a_restart() {
     assert_eq!(answer.body["username"], "Docs");
     let blocks = answer.body["blocks"].to_string();
     assert!(blocks.contains("*port 443* &lt;open&gt;"), "{blocks}");
-    assert!(blocks.contains("<https://support.acme.com/ports|Ports>"));
+    assert!(blocks.contains("<https://docs.example.com/ports|Ports>"));
     // A failure says why, as the bot that failed.
     let failed = &posts[2];
     assert_eq!(failed.body["username"], "PM Ana");
@@ -796,7 +806,7 @@ async fn approval_cards_are_decided_by_their_own_pm() {
                 "apr_a3",
                 "ana",
                 "jira.create_issue",
-                json!({"project": "DSM", "summary": "Fix <login>", "description": "Steps"}),
+                json!({"project": "Acme Vault", "summary": "Fix <login>", "description": "Steps"}),
             ),
         );
     }
@@ -885,16 +895,32 @@ async fn approval_cards_are_decided_by_their_own_pm() {
         "no buttons once decided"
     );
 
-    // Ana rejects the third.
+    // Ana rejects the third: the card asks why, and a reason decides it.
     stack
         .send(click("c4", "U0ANA", "apr_reject", "apr_a3", "D0ANA", &t3))
         .await;
-    until("the rejected card", || {
+    until("the reasons", || {
         stack
             .slack
             .calls("chat.update")
             .into_iter()
-            .find(|u| u.body["ts"] == t3.as_str() && text_of(u).contains("Rejected by Ana"))
+            .find(|u| u.body["ts"] == t3.as_str() && text_of(u).contains("apr_reason_incomplete"))
+    })
+    .await;
+    stack
+        .send(click(
+            "c4r",
+            "U0ANA",
+            "apr_reason_incomplete",
+            "apr_a3",
+            "D0ANA",
+            &t3,
+        ))
+        .await;
+    until("the rejected card", || {
+        stack.slack.calls("chat.update").into_iter().find(|u| {
+            u.body["ts"] == t3.as_str() && text_of(u).contains("Rejected by Ana: Incomplete")
+        })
     })
     .await;
 
@@ -970,7 +996,7 @@ async fn approval_cards_are_decided_by_their_own_pm() {
             ),
             (
                 "apr_a3".into(),
-                json!({"decided_by": "ana", "decision": "reject"})
+                json!({"decided_by": "ana", "decision": "reject", "reason": "incomplete"})
             ),
             (
                 "apr_a2".into(),
@@ -980,6 +1006,172 @@ async fn approval_cards_are_decided_by_their_own_pm() {
     );
     stop.cancel();
     handle.await.unwrap();
+    stack.stop().await;
+}
+
+/// The blocks of the latest `chat.update` of the message at `ts`, once one matches `want`.
+async fn card_update(stack: &Stack, ts: &str, what: &str, want: impl Fn(&str) -> bool) -> Call {
+    until(what, || {
+        stack
+            .slack
+            .calls("chat.update")
+            .into_iter()
+            .rev()
+            .find(|u| u.body["ts"] == ts && want(&text_of(u)))
+    })
+    .await
+}
+
+#[tokio::test]
+async fn reject_asks_why_and_back_restores_the_card() {
+    let mut stack = Stack::new().await;
+    stack.tools.items.lock().unwrap().insert(
+        "apr_r1".into(),
+        approval(
+            "apr_r1",
+            "ana",
+            "jira.create_issue",
+            json!({"project": "Acme Vault", "summary": "Fix <login>", "description": "Steps"}),
+        ),
+    );
+    stack.connect();
+    let ts = "1700000000.000042";
+    let decisions = || stack.tools.decisions.lock().unwrap().len();
+
+    // Reject turns the card into the six reasons and Back; nothing is decided yet.
+    let ack = stack
+        .send(click("r1", "U0ANA", "apr_reject", "apr_r1", "D0ANA", ts))
+        .await;
+    assert!(
+        ack.get("payload").is_none(),
+        "acked at once, the work follows"
+    );
+    let reasons = card_update(&stack, ts, "the reasons", |t| t.contains("apr_back")).await;
+    let buttons: Vec<(String, String, String)> = reasons.body["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|b| b["elements"].as_array().cloned().unwrap_or_default())
+        .filter(|e| e["type"] == "button")
+        .map(|e| {
+            (
+                e["text"]["text"].as_str().unwrap().to_string(),
+                e["action_id"].as_str().unwrap().to_string(),
+                e["value"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let labels: Vec<&str> = buttons.iter().map(|b| b.0.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "Wrong facts",
+            "Wrong place",
+            "Tone",
+            "Incomplete",
+            "Shouldn't have drafted",
+            "Other",
+            "Back"
+        ]
+    );
+    assert!(buttons.iter().all(|b| b.2 == "apr_r1"));
+    assert!(!text_of(&reasons).contains("apr_approve"));
+    assert!(
+        text_of(&reasons).contains("*Summary:* Fix &lt;login&gt;"),
+        "the draft stays on the card"
+    );
+    assert_eq!(decisions(), 0);
+
+    // Back restores Approve, Edit and Reject.
+    stack
+        .send(click("r2", "U0ANA", "apr_back", "apr_r1", "D0ANA", ts))
+        .await;
+    let back = card_update(&stack, ts, "the card back", |t| t.contains("apr_approve")).await;
+    let s = text_of(&back);
+    assert!(s.contains("apr_edit") && s.contains("apr_reject") && !s.contains("apr_reason_"));
+    assert_eq!(decisions(), 0);
+
+    // Someone else's reason click is refused, and nothing is sent.
+    stack
+        .send(click("r3", "U0ANA", "apr_reject", "apr_r1", "D0ANA", ts))
+        .await;
+    card_update(&stack, ts, "the reasons again", |t| t.contains("apr_back")).await;
+    stack
+        .send(click(
+            "r4",
+            "U0BOB",
+            "apr_reason_tone",
+            "apr_r1",
+            "D0ANA",
+            ts,
+        ))
+        .await;
+    let notes = stack.calls("chat.postEphemeral", 1).await;
+    assert_eq!(notes[0].body["user"], "U0BOB");
+    assert!(text_of(&notes[0]).contains("Only Ana can decide this one"));
+    stack
+        .send(click("r5", "U0BOB", "apr_back", "apr_r1", "D0ANA", ts))
+        .await;
+    stack.calls("chat.postEphemeral", 2).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(decisions(), 0, "no decision for anyone else");
+
+    // Ana's reason decides it, with the reason.
+    stack
+        .send(click(
+            "r6",
+            "U0ANA",
+            "apr_reason_tone",
+            "apr_r1",
+            "D0ANA",
+            ts,
+        ))
+        .await;
+    card_update(&stack, ts, "the rejected card", |t| {
+        t.contains("Rejected by Ana: Tone")
+    })
+    .await;
+    let sent: Vec<(String, Value)> = stack
+        .tools
+        .decisions
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, id, b)| (id.clone(), b.clone()))
+        .collect();
+    assert_eq!(
+        sent,
+        vec![(
+            "apr_r1".into(),
+            json!({"decided_by": "ana", "decision": "reject", "reason": "tone"})
+        )]
+    );
+
+    // A reason or Back on a card decided meanwhile shows the outcome, and sends nothing.
+    stack
+        .send(click("r7", "U0ANA", "apr_back", "apr_r1", "D0ANA", ts))
+        .await;
+    stack
+        .send(click(
+            "r8",
+            "U0ANA",
+            "apr_reason_other",
+            "apr_r1",
+            "D0ANA",
+            ts,
+        ))
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let last = stack.slack.calls("chat.update").last().unwrap().clone();
+    assert!(text_of(&last).contains("Rejected by Ana"));
+    assert!(!text_of(&last).contains("apr_approve"));
+    assert_eq!(decisions(), 1);
+
+    // Every click was acknowledged inside Slack's 3 seconds.
+    for id in ["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8"] {
+        let (acked, _) = stack.slack.ack(id).unwrap();
+        assert!(acked.duration_since(stack.slack.sent_at(id).unwrap()) < Duration::from_secs(3));
+    }
     stack.stop().await;
 }
 
@@ -1072,13 +1264,13 @@ async fn routines_are_made_and_changed_in_slack() {
             "U0BOB",
             "200.2",
             None,
-            "routine: monday digest of DSM docs changes",
+            "routine: monday digest of Acme Vault docs changes",
         ))
         .await;
     let p = parses(2).await;
     assert_eq!(p[1].1["bot"], "docs");
     assert_eq!(p[1].1["tz"], "UTC");
-    assert_eq!(p[1].1["text"], "monday digest of DSM docs changes");
+    assert_eq!(p[1].1["text"], "monday digest of Acme Vault docs changes");
     let bob_readback = stack.calls("chat.postMessage", 2).await[1].clone();
     assert_eq!(bob_readback.body["username"], "Docs");
     let bob_key = button_value(&bob_readback.body, "rtn_cancel");
@@ -1109,7 +1301,7 @@ async fn routines_are_made_and_changed_in_slack() {
             "U0ANA",
             "200.3",
             None,
-            "every day sometime, check the DSM queue",
+            "every day sometime, check the Acme Vault queue",
         ))
         .await;
     let question = stack.calls("chat.postMessage", 3).await[2].clone();
@@ -1122,7 +1314,7 @@ async fn routines_are_made_and_changed_in_slack() {
     let p = parses(4).await;
     assert_eq!(
         p[3].1["text"],
-        "every day sometime, check the DSM queue\nat 9am"
+        "every day sometime, check the Acme Vault queue\nat 9am"
     );
     let second = stack.calls("chat.postMessage", 4).await[3].clone();
     assert!(text_of(&second).contains("rtn_create"));
@@ -1240,7 +1432,7 @@ async fn envelopes_are_acked_before_slow_work() {
             "U0ANA",
             "300.1",
             None,
-            "what changed in DSM 5.0?",
+            "what changed in Acme Vault 5.0?",
         ))
         .await;
     stack
@@ -1270,9 +1462,10 @@ async fn envelopes_are_acked_before_slow_work() {
         );
         assert!(acked < work_at, "{id}: the ack comes before the work");
     }
-    // The card shows the decision is under way before the slow write returns.
+    // The card shows the decision is under way before the slow write returns (a reply
+    // draft: "Posting…").
     let first_update = stack.calls("chat.update", 1).await[0].clone();
-    assert!(text_of(&first_update).contains("Approving…"));
+    assert!(text_of(&first_update).contains("Posting…"));
     assert!(first_update.at < decided_at);
     stack.calls("chat.update", 2).await;
     stack.stop().await;

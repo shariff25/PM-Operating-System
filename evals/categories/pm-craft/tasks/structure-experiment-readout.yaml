@@ -1,0 +1,22 @@
+# seed: replace with case cards
+# No fixture holds experiment results, so the ask carries them. The experiment-readout skill
+# titles its draft `Readout: …`, gets its rates, lift, interval and p-value from
+# stats.compare, and follows content/templates/experiment-readout.md: Decision, Result,
+# Guardrails, What we learned, Next steps.
+id: structure-experiment-readout
+ask: "Draft anyway, no questions: an experiment readout in the PM space for the guided SSO setup test in the Acme Vault console (Jira epic PM-101). Control: 10,000 admins started setup and 1,000 finished. Treatment: 10,000 started and 1,100 finished. The planned sample size was 10,000 per arm, and support tickets about SSO did not change."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Readout:", "Result", "Guardrails", "What we learned", "Next steps"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: experiment-readout
+tags:
+  - model/draft-content

@@ -1,0 +1,15 @@
+# Should-decline example: public docs describe shipped products, not internal roadmap
+# commitments or planned dates, so no page answers this. With your own docs, confirm with
+# `docs.search` that no page turns up before you keep a task like it.
+id: decline-roadmap-dates
+ask: "On the internal product roadmap, which quarter is the next major Acme Vault release planned for, and which features did product management commit to it?"
+expect:
+  must_decline: true
+  # Reasoning must not leak into the answer, even with the gateway's strip-think
+  # workaround off (D11).
+  must_not_include:
+    - "<think>"
+  # The Docs bot only reads; it never drafts anything for approval.
+  approvals: 0
+tags:
+  - model/answered-beyond-sources

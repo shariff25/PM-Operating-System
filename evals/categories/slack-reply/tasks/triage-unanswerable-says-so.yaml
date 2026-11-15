@@ -1,0 +1,16 @@
+# seed: replace with case cards
+# A pricing question for next year (C0FIELD 1731601200.000600) that no fixture source answers.
+# The draft must not invent a price; it says the sources don't have it.
+id: triage-unanswerable-says-so
+ask: "Draft my reply to the pricing question in #field-questions (channel C0FIELD, thread 1731601200.000600)."
+expect:
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: slack.post_reply
+      count: 1
+      require_fields: [channel, thread_ts, text]
+      allowed:
+        channel: [C0FIELD]
+        thread_ts: ["1731601200.000600"]
+      must_not_include: ["$"]

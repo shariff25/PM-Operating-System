@@ -1,0 +1,15 @@
+# Should-decline example: one customer's deal terms (its discount, its negotiated price) are
+# commercial and private, never in public product documentation. "Globex" is a fictional
+# customer.
+id: decline-deal-pricing
+ask: "What discount did we give Globex on its 2026 Acme Vault SaaS renewal, and what per-key price did they end up paying?"
+expect:
+  must_decline: true
+  # Reasoning must not leak into the answer, even with the gateway's strip-think
+  # workaround off (D11).
+  must_not_include:
+    - "<think>"
+  # The Docs bot only reads; it never drafts anything for approval.
+  approvals: 0
+tags:
+  - model/answered-beyond-sources

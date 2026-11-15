@@ -112,7 +112,7 @@ async fn docs_command_over_socket_mode() {
             json!({"type": "disconnect", "reason": "refresh_requested"}),
         ],
         vec![
-            slash("e5", "U0ANA", "product:dsm key rotation", &hook),
+            slash("e5", "U0ANA", "product:vault key rotation", &hook),
             json!({"type": "disconnect", "reason": "link_disabled"}),
         ],
     ]);
@@ -174,7 +174,7 @@ async fn docs_command_over_socket_mode() {
     assert!(by_id("e2").1["payload"]["text"]
         .as_str()
         .unwrap()
-        .contains("PM OS is for the Acme product team"));
+        .contains("PM OS is for the product team"));
     assert!(by_id("e3").1["payload"]["text"]
         .as_str()
         .unwrap()
@@ -199,7 +199,7 @@ async fn docs_command_over_socket_mode() {
     assert_eq!(first["response_type"], "ephemeral");
     let blocks = serde_json::to_string(&first["blocks"]).unwrap();
     assert!(blocks.contains(
-        "<https://support.acme.com/docs/dsm-saml-sso|Configure SAML SSO for Acme DSM>"
+        "<https://docs.example.com/docs/vault-saml-sso|Configure SAML SSO for Acme Vault>"
     ));
 
     // Every search went through the tool server as Ana, under the `docs` skill, and was audited.

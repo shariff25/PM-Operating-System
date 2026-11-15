@@ -120,7 +120,7 @@ async fn a_content_change_is_picked_up_and_a_bad_one_is_not() {
     assert_eq!(names(&bots), ["docs"]);
 
     // A task claimed before the change keeps the bot it was claimed with.
-    let task = env.ask("What ports does DSM need?").await;
+    let task = env.ask("What ports does Acme Vault need?").await;
     let (status, claim) = env.claim().await;
     assert_eq!(status, 200, "{claim}");
     assert_eq!(claim["bot"]["name"], "docs");

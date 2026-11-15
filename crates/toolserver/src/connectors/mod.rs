@@ -88,6 +88,25 @@ pub struct TeamBot<'a> {
 /// Appended to everything PM OS writes on a PM's behalf (SLK-7).
 pub const DRAFTED_MARKER: &str = "Drafted with PM OS";
 
+/// The most channel members an audience check reads (`docs/slack-reply-spec.md` §3).
+pub const MAX_AUDIENCE_MEMBERS: usize = 1000;
+
+/// Who can see a Slack conversation, as the PM's token sees it: for the audience check
+/// before a Slack write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Audience {
+    /// Shared with another organization (Slack Connect): `is_ext_shared`.
+    pub external: bool,
+    /// Shared with another workspace or organization: `is_shared`.
+    pub shared: bool,
+    /// A direct message: `is_im`.
+    pub im: bool,
+    /// Member ids, at most [`MAX_AUDIENCE_MEMBERS`].
+    pub members: Vec<String>,
+    /// More members than were read: the list stopped at the cap.
+    pub truncated: bool,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConnectorError {
     #[error("not found: {0}")]
@@ -109,6 +128,10 @@ pub enum ConnectorError {
     Forbidden(String),
     #[error("rate limited; retry after {0} s")]
     RateLimited(u64),
+    /// The system isn't set up for this deployment (such as no docs site). A read answers
+    /// with no results and this note, not an error.
+    #[error("{0}")]
+    NotConfigured(String),
 }
 
 impl From<crate::oauth::TokenError> for ConnectorError {
@@ -144,6 +167,20 @@ pub trait Connector: Send + Sync {
         action: &str,
         args: &Value,
     ) -> Result<SourceRef, ConnectorError>;
+
+    /// Who can see `channel`, read with the PM's own token (never a team bot's). Only Slack
+    /// has conversations.
+    async fn audience(
+        &self,
+        caller: Caller<'_>,
+        channel: &str,
+    ) -> Result<Audience, ConnectorError> {
+        let _ = (caller, channel);
+        Err(ConnectorError::Unsupported(format!(
+            "{}.audience",
+            self.system()
+        )))
+    }
 
     /// Whether a service this connector depends on (not a PM's own account) answers, for
     /// `/readyz`. Connectors that act only with each PM's token have nothing to check.

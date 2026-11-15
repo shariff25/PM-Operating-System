@@ -1,10 +1,10 @@
-//! The support docs end to end: tool server `/internal` session and call, the docs
+//! The public docs end to end: tool server `/internal` session and call, the docs
 //! connector, and a real `pmos-docs` MCP server holding indexed pages.
 
 use std::sync::Arc;
 
 use chrono::Utc;
-use pmos_docs::page::DocPage;
+use pmos_docs::page::{DocPage, Products, Site};
 use pmos_docs::store::{DocsStore, MemoryStore};
 use pmos_docs::sync::{SyncConfig, Syncer};
 use pmos_toolserver::app::BotAccess;
@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 const DOCS_TOKEN: &str = "docs-token-for-tests-0123456789abcdef";
 const SERVICE_TOKEN: &str = "test-service-token-0123456789abcdef";
 const BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
-const BASE: &str = "https://support.acme.com";
+const BASE: &str = "https://docs.example.com";
 
 fn page(slug: &str, title: &str, body: &str) -> DocPage {
     DocPage {
@@ -27,7 +27,7 @@ fn page(slug: &str, title: &str, body: &str) -> DocPage {
         slug: slug.into(),
         title: title.into(),
         section: "docs".into(),
-        product: "dsm".into(),
+        product: "vault".into(),
         description: None,
         headings: String::new(),
         body: body.into(),
@@ -52,33 +52,49 @@ async fn serve(app: axum::Router) -> (String, CancellationToken) {
 }
 
 async fn start_docs() -> (String, CancellationToken) {
+    start_docs_with(true).await
+}
+
+/// `configured`: false runs `pmos-docs` with no docs site, as with `PMOS_DOCS_BASE_URL`
+/// unset.
+async fn start_docs_with(configured: bool) -> (String, CancellationToken) {
     let store: Arc<dyn DocsStore> = Arc::new(MemoryStore::default());
     store
         .upsert(&page(
-            "dsm-saml-sso",
-            "Configure SAML SSO for Acme DSM",
-            "# Configure SAML SSO\n\nDSM supports SAML 2.0 single sign-on with Okta and Azure AD.",
+            "vault-saml-sso",
+            "Configure SAML SSO for Acme Vault",
+            "# Configure SAML SSO\n\nAcme Vault supports SAML 2.0 single sign-on with Okta and Azure AD.",
         ))
         .await
         .unwrap();
     store
         .upsert(&page(
-            "dsm-backup",
+            "vault-backup",
             "Backup and Restore",
             "Back up the cluster nightly.",
         ))
         .await
         .unwrap();
-    let runtime = Arc::new(pmos_docs::app::Runtime::new(
-        store.clone(),
-        Syncer::new(SyncConfig::default(), store),
-    ));
+    let site = Site::new(BASE).with_prefixes(&["/docs/"]);
+    let runtime = Arc::new(if configured {
+        pmos_docs::app::Runtime::new(
+            store.clone(),
+            Syncer::new(SyncConfig::new(site.clone()), store),
+        )
+    } else {
+        pmos_docs::app::Runtime::unconfigured(Arc::new(MemoryStore::default()))
+    });
     let cancel = CancellationToken::new();
     let app = pmos_docs::app::router(
         runtime,
         pmos_docs::app::AppConfig {
             token: DOCS_TOKEN.into(),
-            base: BASE.into(),
+            name: "the Acme docs".into(),
+            site: configured.then_some(site),
+            products: Products::parse(
+                "products:\n  - id: vault\n    name: Acme Vault\n    keywords: [vault]\n",
+            )
+            .unwrap(),
             allowed_hosts: vec!["127.0.0.1".into()],
             stale_after: None,
         },
@@ -183,8 +199,11 @@ async fn docs_search_and_read_through_the_tool_server() {
         first["untrusted"], true,
         "wrapped like any external content"
     );
-    assert_eq!(first["title"], "Configure SAML SSO for Acme DSM");
-    assert_eq!(first["source"]["url"], format!("{BASE}/docs/dsm-saml-sso"));
+    assert_eq!(first["title"], "Configure SAML SSO for Acme Vault");
+    assert_eq!(
+        first["source"]["url"],
+        format!("{BASE}/docs/vault-saml-sso")
+    );
     assert!(first["content"]["snippet"]
         .as_str()
         .unwrap()
@@ -192,7 +211,7 @@ async fn docs_search_and_read_through_the_tool_server() {
 
     let res = call(
         "docs_read",
-        json!({"url": format!("{BASE}/docs/dsm-saml-sso")}),
+        json!({"url": format!("{BASE}/docs/vault-saml-sso")}),
     )
     .await;
     let body: Value = res.json().await.unwrap();
@@ -253,9 +272,65 @@ async fn docs_search_and_read_through_the_tool_server() {
     // The audit names the page read (its indexed `.md` URL), not its content.
     assert_eq!(
         events[0].sources,
-        vec![format!("docs:{BASE}/docs/dsm-saml-sso.md")]
+        vec![format!("docs:{BASE}/docs/vault-saml-sso.md")]
     );
 
+    stop_ts.cancel();
+    stop_docs.cancel();
+}
+
+#[tokio::test]
+async fn with_no_docs_site_a_search_says_so_plainly() {
+    let (docs_url, stop_docs) = start_docs_with(false).await;
+    let (ts, audit, stop_ts) = start_toolserver(Docs::new(docs_url, DOCS_TOKEN)).await;
+    let http = reqwest::Client::new();
+    let token = session(&http, &ts, "docs").await;
+    let call = |tool: &'static str, args: Value| {
+        let http = http.clone();
+        let url = format!("{ts}/internal/call");
+        let token = token.clone();
+        async move {
+            http.post(url)
+                .bearer_auth(SERVICE_TOKEN)
+                .header("x-pmos-session", token)
+                .json(&json!({"tool": tool, "args": args}))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let note = "No docs site is configured; ask a platform owner to set PMOS_DOCS_BASE_URL.";
+    // An answer, not an error: no results and the note, for the agent or Slack to relay.
+    for (tool, args) in [
+        ("docs_search", json!({"query": "SAML SSO"})),
+        (
+            "docs_read",
+            json!({"url": format!("{BASE}/docs/vault-saml-sso")}),
+        ),
+    ] {
+        let res = call(tool, args).await;
+        assert_eq!(res.status(), 200, "{tool}");
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(
+            body["result"],
+            json!({"results": [], "note": note}),
+            "{tool}"
+        );
+    }
+    // The tool server is still ready: the docs server answers.
+    let ready = http.get(format!("{ts}/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), 200);
+    // An unknown product is still refused, naming the configured ids.
+    let res = call("docs_search", json!({"query": "x", "product": "spaceship"})).await;
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("vault, general"),
+        "{body}"
+    );
+    let outcomes: Vec<_> = audit.events().iter().map(|e| e.outcome).collect();
+    use pmos_toolserver::audit::Outcome::*;
+    assert_eq!(outcomes, vec![Ok, Ok, Error]);
     stop_ts.cancel();
     stop_docs.cancel();
 }
@@ -276,7 +351,7 @@ async fn a_wrong_docs_token_is_reported_not_hidden() {
         .unwrap();
     assert_eq!(res.status(), 502);
     let body: Value = res.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("support docs"));
+    assert!(body["error"].as_str().unwrap().contains("docs server"));
 
     // Readiness says which dependency is down.
     let res = http.get(format!("{ts}/readyz")).send().await.unwrap();

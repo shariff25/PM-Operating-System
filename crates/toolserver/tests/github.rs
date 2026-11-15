@@ -261,12 +261,12 @@ fn org_state(login: &str) -> Option<&'static str> {
 
 fn emails(login: &str) -> Value {
     match login {
-        "ana" => json!([{"email": "ana@acme.com", "verified": true, "primary": true}]),
+        "ana" => json!([{"email": "ana@example.com", "verified": true, "primary": true}]),
         "bo" => json!([
-            {"email": "bo@acme.com", "verified": false, "primary": false},
+            {"email": "bo@example.com", "verified": false, "primary": false},
             {"email": "bo@home.example", "verified": true, "primary": true}
         ]),
-        other => json!([{"email": format!("{other}@acme.com"), "verified": true}]),
+        other => json!([{"email": format!("{other}@example.com"), "verified": true}]),
     }
 }
 
@@ -369,7 +369,7 @@ async fn handle(
     }
     if let Some(org) = path.strip_prefix("/user/memberships/orgs/") {
         return match (org, org_state(&login)) {
-            ("acme", Some(state)) => {
+            ("example-org", Some(state)) => {
                 reply(StatusCode::OK, json!({"state": state, "role": "member"}))
             }
             _ => not_found(),
@@ -628,15 +628,15 @@ async fn start_mock() -> (String, Arc<Mock>) {
 
 const SERVICE_TOKEN: &str = "test-service-token-0123456789abcdef";
 const BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
-const CONTENT_REPO: &str = "acme/pm-os";
-const MEMORY_REPO: &str = "acme/pm-os-memory-ana";
+const CONTENT_REPO: &str = "example-org/pm-os";
+const MEMORY_REPO: &str = "example-org/pm-os-memory-ana";
 const TEAM_HEADER: &str = "# Who may use PM OS.\n";
 
 fn member(handle: &str, slack: &str, github: Option<&str>, roles: Vec<Role>) -> TeamMember {
     TeamMember {
         handle: handle.into(),
         slack_id: slack.into(),
-        email: Some(format!("{handle}@acme.com")),
+        email: Some(format!("{handle}@example.com")),
         github: github.map(String::from),
         roles,
     }
@@ -696,7 +696,7 @@ async fn env() -> Env {
                     client_secret: Secret::new("gh-secret"),
                     scopes: Vec::new(),
                 }),
-                github_org: Some("acme".into()),
+                github_org: Some("example-org".into()),
                 state_key: b"test-state-key".to_vec(),
                 endpoints: Endpoints {
                     github_auth: base.clone(),
@@ -714,7 +714,7 @@ async fn env() -> Env {
         github.clone(),
         tokens,
         stores.memory_repos.clone(),
-        "acme",
+        "example-org",
     ));
     let catalog = Catalog::load(&root, Utc::now().date_naive()).unwrap();
     let connectors: Vec<Arc<dyn Connector>> = vec![
@@ -733,7 +733,7 @@ async fn env() -> Env {
         Some(oauth.clone()),
         Some(GitHubSetup {
             github,
-            org: "acme".into(),
+            org: "example-org".into(),
             content_repo: Some(CONTENT_REPO.into()),
             content_branch: "main".into(),
             content_dir: "content".into(),
@@ -897,7 +897,7 @@ async fn linking_checks_the_account_then_the_refresh_rotates_the_tokens() {
         .starts_with("pmos-toolserver/"));
     assert_eq!(
         e.mock
-            .requests("GET", "/user/memberships/orgs/acme")
+            .requests("GET", "/user/memberships/orgs/example-org")
             .len(),
         1
     );
@@ -1030,7 +1030,7 @@ async fn someone_outside_the_org_is_refused() {
     let e = env().await;
     let err = try_link(&e, "eve", "eve").await.unwrap_err();
     assert!(
-        err.to_string().contains("active member of `acme`"),
+        err.to_string().contains("active member of `example-org`"),
         "{err}"
     );
     let err = try_link(&e, "pen", "pen").await.unwrap_err();
@@ -1122,7 +1122,7 @@ async fn notes_are_written_and_read_in_the_pms_repo() {
         .call(
             &s,
             "memory_update",
-            json!({"key": "areas", "text": "CCM, DSM"}),
+            json!({"key": "areas", "text": "Acme Cloud, Acme Vault"}),
             now,
         )
         .await
@@ -1141,7 +1141,7 @@ async fn notes_are_written_and_read_in_the_pms_repo() {
     let file = &e.mock.files(MEMORY_REPO)["notes/areas.md"];
     assert!(file.starts_with("---\nupdated: "), "{file}");
     assert!(
-        file.contains("source: \"internal-brief, task run-1\"\n---\nCCM, DSM"),
+        file.contains("source: \"internal-brief, task run-1\"\n---\nAcme Cloud, Acme Vault"),
         "{file}"
     );
     for r in e.mock.requests("POST", "/repos/") {
@@ -1161,12 +1161,12 @@ async fn notes_are_written_and_read_in_the_pms_repo() {
     let notes = read["notes"].as_array().unwrap();
     assert_eq!(notes.len(), 2, "{read}");
     assert_eq!(notes[0]["key"], "areas");
-    assert_eq!(notes[0]["text"], "CCM, DSM");
+    assert_eq!(notes[0]["text"], "Acme Cloud, Acme Vault");
     assert_eq!(notes[1]["key"], "style");
     // A note written by a bot names the bot.
     e.stores
         .memory
-        .update("ana", "areas", "CCM only", "pm-ana, task t-9", now)
+        .update("ana", "areas", "Acme Cloud only", "pm-ana, task t-9", now)
         .await
         .unwrap();
     let head = e.mock.head(MEMORY_REPO);
@@ -1184,7 +1184,7 @@ async fn the_cache_fetches_only_blobs_that_changed() {
     let now = Utc::now();
     // An empty repo: the first note goes in through the contents API.
     assert!(m.read("ana").await.unwrap().is_empty());
-    m.update("ana", "areas", "CCM", "t, task 1", now)
+    m.update("ana", "areas", "Acme Cloud", "t, task 1", now)
         .await
         .unwrap();
     assert_eq!(e.mock.requests("PUT", "/contents/notes/areas.md").len(), 1);
@@ -1208,14 +1208,14 @@ async fn the_cache_fetches_only_blobs_that_changed() {
     );
     assert!(
         e.mock
-            .requests("GET", "/repos/acme/pm-os-memory-ana")
+            .requests("GET", "/repos/example-org/pm-os-memory-ana")
             .len()
             <= 1,
         "the tree only; the repo was verified minutes ago"
     );
     assert!(e
         .mock
-        .requests("GET", "/repos/acme/pm-os-memory-ana")
+        .requests("GET", "/repos/example-org/pm-os-memory-ana")
         .iter()
         .all(|r| r.path.contains("/git/trees/")));
 
@@ -1237,7 +1237,7 @@ async fn a_repo_that_turns_public_is_refused() {
     let e = env().await;
     set_up_memory(&e, &[("README.md", "x\n")]).await;
     let m = e.stores.memory.as_ref();
-    m.update("ana", "areas", "CCM", "t, task 1", Utc::now())
+    m.update("ana", "areas", "Acme Cloud", "t, task 1", Utc::now())
         .await
         .unwrap();
     e.mock.edit_repo(MEMORY_REPO, |r| r.private = false);
@@ -1296,17 +1296,17 @@ async fn setting_a_memory_repo_checks_it_first() {
 
     link(&e, "ana", "ana").await;
     e.mock
-        .add_repo("acme/public-notes", false, &["ana"], &["ana"], &[]);
+        .add_repo("example-org/public-notes", false, &["ana"], &["ana"], &[]);
     e.mock
-        .add_repo("acme/read-only", true, &["ana"], &[], &[]);
+        .add_repo("example-org/read-only", true, &["ana"], &[], &[]);
     e.mock
-        .add_repo("acme/old", true, &["ana"], &["ana"], &[]);
-    e.mock.edit_repo("acme/old", |r| r.archived = true);
+        .add_repo("example-org/old", true, &["ana"], &["ana"], &[]);
+    e.mock.edit_repo("example-org/old", |r| r.archived = true);
     for (repo, code) in [
-        ("acme/public-notes", "not_private"),
-        ("acme/read-only", "no_push"),
-        ("acme/old", "archived"),
-        ("acme/nothing-here", "not_found"),
+        ("example-org/public-notes", "not_private"),
+        ("example-org/read-only", "no_push"),
+        ("example-org/old", "archived"),
+        ("example-org/nothing-here", "not_found"),
         ("someone-else/pm-os-memory-ana", "not_in_org"),
         ("not a repo", "bad_request"),
     ] {
@@ -1365,14 +1365,14 @@ async fn decide(e: &Env, id: &str, body: Value) -> (u16, Value) {
 #[tokio::test]
 async fn a_request_then_an_approval_commits_both_files_in_one_commit() {
     let e = env().await;
-    let (status, body) = request(&e, "U0NIA", "Nia.Lee@acme.com", "Nia Lee").await;
+    let (status, body) = request(&e, "U0NIA", "Nia.Lee@example.com", "Nia Lee").await;
     assert_eq!(status, 201, "{body}");
     let r = &body["request"];
     assert_eq!(r["status"], "pending");
     assert_eq!(r["proposed_handle"], "nia-lee");
     let id = r["id"].as_str().unwrap().to_string();
     // Asking again gives the same request.
-    let (status, again) = request(&e, "U0NIA", "nia.lee@acme.com", "Nia").await;
+    let (status, again) = request(&e, "U0NIA", "nia.lee@example.com", "Nia").await;
     assert_eq!(status, 200);
     assert_eq!(again["request"]["id"], id.as_str());
     let (_, pending) = bot(
@@ -1452,7 +1452,7 @@ async fn a_request_then_an_approval_commits_both_files_in_one_commit() {
     assert_eq!(parsed.members.len(), team().len() + 1);
     let nia = parsed.by_handle("nia-lee").unwrap();
     assert_eq!(nia.slack_id, "U0NIA");
-    assert_eq!(nia.email.as_deref(), Some("Nia.Lee@acme.com"));
+    assert_eq!(nia.email.as_deref(), Some("Nia.Lee@example.com"));
     assert_eq!(nia.roles, vec![Role::Pm]);
     assert_eq!(
         files["content/bots/pm-nia-lee/BOT.md"],
@@ -1486,7 +1486,7 @@ async fn a_request_then_an_approval_commits_both_files_in_one_commit() {
 #[tokio::test]
 async fn only_an_admin_with_github_and_push_access_can_approve() {
     let e = env().await;
-    let (_, body) = request(&e, "U0NIA", "nia@acme.com", "Nia").await;
+    let (_, body) = request(&e, "U0NIA", "nia@example.com", "Nia").await;
     let id = body["request"]["id"].as_str().unwrap().to_string();
 
     // A PM isn't a platform owner.
@@ -1562,7 +1562,7 @@ async fn only_an_admin_with_github_and_push_access_can_approve() {
 async fn a_ref_conflict_is_retried_and_a_failure_is_recorded() {
     let e = env().await;
     link(&e, "raj", "raj-gh").await;
-    let (_, body) = request(&e, "U0NIA", "nia@acme.com", "Nia").await;
+    let (_, body) = request(&e, "U0NIA", "nia@example.com", "Nia").await;
     let id = body["request"]["id"].as_str().unwrap().to_string();
 
     // Someone pushes twice while PM OS commits: it rebuilds the commit on the new head.
@@ -1592,7 +1592,7 @@ async fn a_ref_conflict_is_retried_and_a_failure_is_recorded() {
     );
 
     // A branch that never stops moving: the request fails, readably.
-    let (_, body) = request(&e, "U0OMI", "omi@acme.com", "Omi").await;
+    let (_, body) = request(&e, "U0OMI", "omi@example.com", "Omi").await;
     let id = body["request"]["id"].as_str().unwrap().to_string();
     *e.mock.conflicts.lock().unwrap() = 100;
     let (status, body) = decide(&e, &id, json!({"decision": "approve", "decided_by": "raj"})).await;
@@ -1632,7 +1632,7 @@ async fn removal_commits_and_unlinks() {
         .memory_repos
         .put(&MemoryRepo {
             user: "bo".into(),
-            repo: "acme/pm-os-memory-bo".into(),
+            repo: "example-org/pm-os-memory-bo".into(),
             verified_at: Utc::now(),
         })
         .await
@@ -1709,12 +1709,12 @@ async fn removal_commits_and_unlinks() {
 #[tokio::test]
 async fn requests_are_checked() {
     let e = env().await;
-    let (status, body) = request(&e, "U0ANA", "ana@acme.com", "Ana").await;
+    let (status, body) = request(&e, "U0ANA", "ana@example.com", "Ana").await;
     assert_eq!(
         (status, body["code"].as_str()),
         (409, Some("already_member"))
     );
-    for (slack, email) in [("U0X", "not-an-email"), ("bad", "x@acme.com"), ("", "")] {
+    for (slack, email) in [("U0X", "not-an-email"), ("bad", "x@example.com"), ("", "")] {
         let (status, body) = request(&e, slack, email, "X").await;
         assert_eq!(
             (status, body["code"].as_str()),
@@ -1723,10 +1723,10 @@ async fn requests_are_checked() {
         );
     }
     for n in 0..20 {
-        let (status, _) = request(&e, &format!("U0N{n}"), &format!("n{n}@acme.com"), "").await;
+        let (status, _) = request(&e, &format!("U0N{n}"), &format!("n{n}@example.com"), "").await;
         assert_eq!(status, 201);
     }
-    let (status, body) = request(&e, "U0N99", "n99@acme.com", "").await;
+    let (status, body) = request(&e, "U0N99", "n99@example.com", "").await;
     assert_eq!(
         (status, body["code"].as_str()),
         (429, Some("too_many_pending"))

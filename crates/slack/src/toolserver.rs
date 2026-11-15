@@ -5,6 +5,9 @@
 //! Approval cards use the same token to read one inbox item and record the PM's decision
 //! (spec §2): `decided_by` is the clicking PM's handle, and the tool server checks it.
 //!
+//! The triage digest reads the feedback ledger (`GET /internal/ledger`,
+//! `docs/improvement-loop-spec.md` §1) with it too.
+//!
 //! Onboarding (`docs/onboarding-spec.md` §3) uses the same token: access requests and their
 //! decisions, removing a member, the setup checklist's state, OAuth start links and the
 //! memory repo. Those answers carry a `code` the bot turns into a sentence.
@@ -14,6 +17,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 
 /// The header that carries a session token on the tool server's `/internal` API.
@@ -179,30 +183,114 @@ impl ToolServer {
     }
 
     /// `POST /internal/approvals/{id}/decision`. `decision` is `approve`, `edit` (with `args`)
-    /// or `reject`. Returns the item as decided; an approved write has run by then.
+    /// or `reject` (with an optional `reason`, one of [`crate::cards::REASONS`]; the tool
+    /// server takes a reason only with `reject`). `confirm_external` is the second
+    /// confirmation for a Slack write to an externally shared channel
+    /// (`docs/slack-reply-spec.md` §3); it is sent only when `true`. Returns the item as
+    /// decided; an approved write has run by then.
+    ///
+    /// A refusal keeps its status, `code` and body: the reply card turns `audience_blocked`,
+    /// `needs_external_confirm` and `expired` (`409`) and `audience_unavailable` (`503`) into
+    /// their own sentences. Any other `5xx`, or no answer, is [`ApiError::Unavailable`].
     pub async fn decide(
         &self,
         id: &str,
         decided_by: &str,
         decision: &str,
         args: Option<Value>,
-    ) -> Result<Value, CallError> {
+        reason: Option<&str>,
+        confirm_external: bool,
+    ) -> Result<Value, ApiError> {
         if !approval_id_ok(id) {
-            return Err(CallError::Refused("not an approval id".into()));
+            return Err(refused_locally("not an approval id"));
         }
         let mut body = json!({"decided_by": decided_by, "decision": decision});
         if let Some(args) = args {
             body["args"] = args;
         }
-        Self::finish(
-            self.http
-                .post(format!("{}/internal/approvals/{id}/decision", self.base))
-                .bearer_auth(&self.token)
-                .timeout(Duration::from_secs(60))
-                .json(&body),
-        )
-        .await
+        if let Some(reason) = reason {
+            body["reason"] = json!(reason);
+        }
+        if confirm_external {
+            body["confirm_external"] = json!(true);
+        }
+        let res = self
+            .http
+            .post(format!("{}/internal/approvals/{id}/decision", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(60))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "tool server unreachable");
+                ApiError::Unavailable
+            })?;
+        let status = res.status();
+        let json: Value = res.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            return Ok(json);
+        }
+        let code = json["code"].as_str().unwrap_or_default().to_string();
+        if status.is_server_error() && status.as_u16() != 502 && code.is_empty() {
+            tracing::warn!(%status, "tool server error");
+            return Err(ApiError::Unavailable);
+        }
+        Err(ApiError::Refused {
+            status: status.as_u16(),
+            code,
+            error: json["error"].as_str().unwrap_or("refused").to_string(),
+            body: json,
+        })
     }
+
+    /// `GET /internal/ledger`: the feedback ledger's rows (labels and metadata, never message
+    /// text), newest first.
+    pub async fn ledger(&self, query: &LedgerQuery) -> Result<Vec<Value>, CallError> {
+        let mut params: Vec<(&str, String)> = vec![
+            ("since", rfc3339(query.since)),
+            ("until", rfc3339(query.until)),
+        ];
+        if let Some(bot) = &query.bot {
+            params.push(("bot", bot.clone()));
+        }
+        if !query.outcomes.is_empty() {
+            params.push(("outcome", query.outcomes.join(",")));
+        }
+        if let Some(min) = query.min_edit {
+            params.push(("min_edit", min.to_string()));
+        }
+        params.push(("limit", query.limit.clamp(1, LEDGER_LIMIT).to_string()));
+        let body = Self::finish(
+            self.http
+                .get(format!("{}/internal/ledger", self.base))
+                .bearer_auth(&self.token)
+                .timeout(Duration::from_secs(20))
+                .query(&params),
+        )
+        .await?;
+        Ok(body["rows"].as_array().cloned().unwrap_or_default())
+    }
+}
+
+/// The most rows `GET /internal/ledger` returns at once.
+pub const LEDGER_LIMIT: usize = 1000;
+
+/// A `GET /internal/ledger` query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LedgerQuery {
+    pub since: DateTime<Utc>,
+    pub until: DateTime<Utc>,
+    pub bot: Option<String>,
+    /// Outcomes to include (`rejected`, `edited`, …); empty for all.
+    pub outcomes: Vec<&'static str>,
+    /// Only rows with `edit_distance` at least this.
+    pub min_edit: Option<f64>,
+    pub limit: usize,
+}
+
+fn rfc3339(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 impl ToolServer {

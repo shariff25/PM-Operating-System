@@ -1,0 +1,17 @@
+# seed: replace with case cards
+# The routine prompt over all the fixture mentions: drafts for the three threads that need an
+# answer, none for the answered thread, the FYI or the bot reminder, and one (not two) for the
+# thread with two mentions.
+id: triage-drafts-only-what-needs-an-answer
+ask: "[reply-assistant] Check Slack for messages since the last run that ask me something or need my answer, and draft a reply to each with the slack-reply skill. Skip anything I already answered."
+expect:
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: slack.post_reply
+      count: 3
+      require_fields: [channel, thread_ts, text]
+      allowed:
+        thread_ts: ["1731600000.000100", "1731601200.000600", "1731601500.000700"]
+    - tool: slack.send_message
+      count: 0

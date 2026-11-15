@@ -6,9 +6,16 @@
 //! Concurrency rules the schema and queries keep:
 //! - A grant is consumed by `DELETE … RETURNING` on one row picked `FOR UPDATE SKIP LOCKED`,
 //!   so of two concurrent calls with one grant, exactly one runs.
-//! - A decision is one conditional `UPDATE … WHERE status = 'pending' AND user_handle = …`,
-//!   so of two concurrent decisions, exactly one wins. Member requests are decided the same
-//!   way, and a partial unique index keeps one pending request per Slack id.
+//! - An approval decision locks its item (`SELECT … FOR UPDATE`) and updates it only while
+//!   it is still `pending`, so of two concurrent decisions, exactly one wins. Member requests
+//!   are decided with one conditional `UPDATE … WHERE status = 'pending'`, and a partial
+//!   unique index keeps one pending request per Slack id.
+//! - An approval item and its ledger row are written in one transaction, on create, decide,
+//!   complete and expire, so a row is never missing or behind its item.
+//! - A Slack reply is drafted under a transaction-scoped advisory lock on its user and thread,
+//!   so of two concurrent drafts for one thread, exactly one is created.
+//! - The Slack draft sweep picks items `FOR UPDATE SKIP LOCKED`: one a decision holds is
+//!   left to the decision.
 
 use std::time::Duration as StdDuration;
 
@@ -20,13 +27,14 @@ use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
 
 use crate::approvals::{
-    args_hash, ApprovalItem, ApprovalRepo, DecideError, Decision, NewItem, Status,
-    GRANT_TTL_MINUTES,
+    args_hash, redact_args, reply_thread, ApprovalItem, ApprovalRepo, DecideError, Decision,
+    Drafted, NewItem, Status, Verdict, GRANT_TTL_MINUTES, REPLY_TOOL,
 };
 use crate::audit::{AuditEvent, AuditSink};
 use crate::context::{
     query_terms, snippet, ContextDoc, ContextIndex, Hit, ReindexReport, SearchResults,
 };
+use crate::ledger::{args_edit_distance, LedgerOutcome, LedgerQuery, LedgerRow, Reason};
 use crate::members::{
     Created, Decided, MemberRequest, MemberRequestStore, NewRequest, RequestStatus, MAX_PENDING,
 };
@@ -300,8 +308,9 @@ impl SessionRepo for PgStore {
     async fn insert(&self, session: &Session, _now: DateTime<Utc>) -> StoreResult<()> {
         sqlx::query(
             "INSERT INTO sessions
-                 (token_hash, user_handle, skill, bot, run_id, created_at, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                 (token_hash, user_handle, skill, bot, run_id, created_at, expires_at,
+                  sources_sensitivity)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(token_hash(&session.token))
         .bind(&session.user)
@@ -310,6 +319,7 @@ impl SessionRepo for PgStore {
         .bind(&session.run_id)
         .bind(session.created_at)
         .bind(session.expires_at)
+        .bind(session.sources_sensitivity.to_string())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -317,7 +327,7 @@ impl SessionRepo for PgStore {
 
     async fn get(&self, token: &str, now: DateTime<Utc>) -> StoreResult<Option<Session>> {
         let row = sqlx::query(
-            "SELECT user_handle, skill, bot, run_id, created_at, expires_at
+            "SELECT user_handle, skill, bot, run_id, created_at, expires_at, sources_sensitivity
              FROM sessions WHERE token_hash = $1 AND expires_at > $2",
         )
         .bind(token_hash(token))
@@ -325,6 +335,7 @@ impl SessionRepo for PgStore {
         .fetch_optional(&self.pool)
         .await?;
         row.map(|r| {
+            let read: String = r.try_get("sources_sensitivity")?;
             Ok(Session {
                 token: token.to_string(),
                 user: r.try_get("user_handle")?,
@@ -333,9 +344,26 @@ impl SessionRepo for PgStore {
                 run_id: r.try_get("run_id")?,
                 created_at: r.try_get("created_at")?,
                 expires_at: r.try_get("expires_at")?,
+                sources_sensitivity: Sensitivity::parse(&read)
+                    .ok_or_else(|| bad_row("sensitivity", &read))?,
             })
         })
         .transpose()
+    }
+
+    async fn raise_sensitivity(&self, token: &str, read: Sensitivity) -> StoreResult<()> {
+        // Raised in one statement, so two concurrent reads can't lower it.
+        sqlx::query(
+            "UPDATE sessions SET sources_sensitivity = $2
+             WHERE token_hash = $1
+               AND array_position(ARRAY['public', 'internal', 'restricted'], sources_sensitivity)
+                   < array_position(ARRAY['public', 'internal', 'restricted'], $2::text)",
+        )
+        .bind(token_hash(token))
+        .bind(read.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn revoke(&self, token: &str) -> StoreResult<bool> {
@@ -349,6 +377,7 @@ impl SessionRepo for PgStore {
 
 fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
     let status: String = r.try_get("status")?;
+    let read: Option<String> = r.try_get("sources_sensitivity")?;
     Ok(ApprovalItem {
         id: r.try_get("id")?,
         user: r.try_get("user_handle")?,
@@ -363,11 +392,90 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
         decided_at: r.try_get("decided_at")?,
         decided_by: r.try_get("decided_by")?,
         result: r.try_get("result")?,
+        sources_sensitivity: read
+            .map(|s| Sensitivity::parse(&s).ok_or_else(|| bad_row("sensitivity", &s)))
+            .transpose()?,
+        redacted_at: r.try_get("redacted_at")?,
     })
 }
 
 const ITEM_COLUMNS: &str = "id, user_handle, skill, bot, run_id, tool, args, args_hash, status, \
-                            created_at, decided_at, decided_by, result";
+                            created_at, decided_at, decided_by, result, sources_sensitivity, \
+                            redacted_at";
+
+/// Insert a new item and its ledger row, inside `tx`.
+async fn insert_item(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    item: &ApprovalItem,
+    row: &LedgerRow,
+) -> StoreResult<()> {
+    sqlx::query(
+        "INSERT INTO approvals
+             (id, user_handle, skill, bot, run_id, tool, args, args_hash, status, created_at,
+              sources_sensitivity)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(&item.id)
+    .bind(&item.user)
+    .bind(&item.skill)
+    .bind(&item.bot)
+    .bind(&item.run_id)
+    .bind(&item.tool)
+    .bind(&item.args)
+    .bind(&item.args_hash)
+    .bind(item.status.as_str())
+    .bind(item.created_at)
+    .bind(item.sources_sensitivity.map(|s| s.to_string()))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO ledger
+             (id, run_id, user_handle, bot, skill, tool, content_sha, model_alias, outcome,
+              created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(&row.id)
+    .bind(&row.run_id)
+    .bind(&row.user)
+    .bind(&row.bot)
+    .bind(&row.skill)
+    .bind(&row.tool)
+    .bind(&row.content_sha)
+    .bind(&row.model_alias)
+    .bind(row.outcome.as_str())
+    .bind(row.created_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// The tool names as a Postgres array parameter.
+fn tool_names(tools: &[&str]) -> Vec<String> {
+    tools.iter().map(|t| t.to_string()).collect()
+}
+
+fn ledger_from_row(r: &PgRow) -> StoreResult<LedgerRow> {
+    let outcome: String = r.try_get("outcome")?;
+    let reason: Option<String> = r.try_get("reason")?;
+    Ok(LedgerRow {
+        id: r.try_get("id")?,
+        run_id: r.try_get("run_id")?,
+        user: r.try_get("user_handle")?,
+        bot: r.try_get("bot")?,
+        skill: r.try_get("skill")?,
+        tool: r.try_get("tool")?,
+        content_sha: r.try_get("content_sha")?,
+        model_alias: r.try_get("model_alias")?,
+        outcome: LedgerOutcome::parse(&outcome).ok_or_else(|| bad_row("outcome", &outcome))?,
+        edit_distance: r.try_get("edit_distance")?,
+        reason: reason
+            .map(|s| Reason::parse(&s).ok_or_else(|| bad_row("reason", &s)))
+            .transpose()?,
+        created_at: r.try_get("created_at")?,
+        decided_at: r.try_get("decided_at")?,
+        decided_by: r.try_get("decided_by")?,
+    })
+}
 
 #[async_trait]
 impl ApprovalRepo for PgStore {
@@ -416,24 +524,54 @@ impl ApprovalRepo for PgStore {
 
     async fn create(&self, new: NewItem<'_>, now: DateTime<Utc>) -> StoreResult<ApprovalItem> {
         let item = new.into_item(now);
-        sqlx::query(
-            "INSERT INTO approvals
-                 (id, user_handle, skill, bot, run_id, tool, args, args_hash, status, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-        )
-        .bind(&item.id)
-        .bind(&item.user)
-        .bind(&item.skill)
-        .bind(&item.bot)
-        .bind(&item.run_id)
-        .bind(&item.tool)
-        .bind(&item.args)
-        .bind(&item.args_hash)
-        .bind(item.status.as_str())
-        .bind(item.created_at)
-        .execute(&self.pool)
-        .await?;
+        let row = new.ledger_row(&item);
+        let mut tx = self.pool.begin().await?;
+        insert_item(&mut tx, &item, &row).await?;
+        tx.commit().await?;
         Ok(item)
+    }
+
+    async fn create_reply(
+        &self,
+        new: NewItem<'_>,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Drafted> {
+        let Some((channel, thread_ts)) = reply_thread(new.args) else {
+            return Ok(Drafted::New(ApprovalRepo::create(self, new, now).await?));
+        };
+        let item = new.into_item(now);
+        let row = new.ledger_row(&item);
+        let mut tx = self.pool.begin().await?;
+        // One drafter per user and thread at a time: a concurrent call waits here, then sees
+        // this one's item. The lock ends with the transaction.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("pmos-reply\n{}\n{channel}\n{thread_ts}", new.user))
+            .execute(&mut *tx)
+            .await?;
+        let sql = format!(
+            "SELECT {ITEM_COLUMNS} FROM approvals
+             WHERE user_handle = $1 AND tool = $2 AND args ->> 'channel' = $3
+               AND args ->> 'thread_ts' = $4 AND created_at >= $5
+               AND status IN ('pending', 'executing', 'approved')
+             ORDER BY created_at DESC, id LIMIT 1"
+        );
+        let existing = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(new.user)
+            .bind(REPLY_TOOL)
+            .bind(channel)
+            .bind(thread_ts)
+            .bind(since)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some(existing) = existing {
+            // Nothing to write: end the transaction now, so the lock goes with it.
+            tx.rollback().await?;
+            return Ok(Drafted::Existing(item_from_row(&existing)?));
+        }
+        insert_item(&mut tx, &item, &row).await?;
+        tx.commit().await?;
+        Ok(Drafted::New(item))
     }
 
     async fn get(&self, id: &str) -> StoreResult<Option<ApprovalItem>> {
@@ -459,58 +597,96 @@ impl ApprovalRepo for PgStore {
         rows.iter().map(item_from_row).collect()
     }
 
-    async fn decide(
+    async fn decide_with(
         &self,
         id: &str,
         decided_by: &str,
-        decision: Decision,
-        edited_args: Option<Value>,
+        verdict: Verdict,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError> {
-        let (status, args) = match decision {
-            Decision::Reject => (Status::Rejected, None),
-            Decision::Approve => (Status::Executing, None),
-            Decision::Edit => (Status::Executing, edited_args),
-        };
-        let missing_args = decision == Decision::Edit && args.is_none();
-        if !missing_args {
-            let new_hash = args.as_ref().map(args_hash);
-            let sql = format!(
-                "UPDATE approvals
-                 SET status = $3, args = COALESCE($4, args), args_hash = COALESCE($5, args_hash),
-                     decided_at = $6, decided_by = $2
-                 WHERE id = $1 AND user_handle = $2 AND status = 'pending'
-                 RETURNING {ITEM_COLUMNS}"
-            );
-            let row = sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(id)
-                .bind(decided_by)
-                .bind(status.as_str())
-                .bind(&args)
-                .bind(&new_hash)
-                .bind(now)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(StoreError::from)?;
-            if let Some(row) = row {
-                return Ok(item_from_row(&row)?);
-            }
-        }
-        // Nothing changed: work out why, in the same order the in-memory store checks.
-        let current = ApprovalRepo::get(self, id)
-            .await?
+        let mut tx = self.pool.begin().await.map_err(StoreError::from)?;
+        // The lock makes a concurrent decision wait, then see this one's result.
+        let sql = format!("SELECT {ITEM_COLUMNS} FROM approvals WHERE id = $1 FOR UPDATE");
+        let current = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(StoreError::from)?
+            .as_ref()
+            .map(item_from_row)
+            .transpose()?
             .ok_or(DecideError::NotFound)?;
-        if current.user != decided_by {
-            Err(DecideError::Forbidden)
+        // The same checks, in the same order, as the in-memory store. A refusal ends the
+        // transaction at once: a dropped one keeps its row lock until the connection is next
+        // used, and a concurrent decision on this item would wait on it.
+        let refused = if current.user != decided_by {
+            Some(DecideError::Forbidden)
+        } else if current.status == Status::Expired {
+            Some(DecideError::Expired)
         } else if current.status != Status::Pending {
-            Err(DecideError::NotPending)
-        } else if missing_args {
-            Err(DecideError::MissingArgs)
+            Some(DecideError::NotPending)
+        } else if verdict.decision == Decision::Edit && verdict.args.is_none() {
+            Some(DecideError::MissingArgs)
         } else {
-            // Pending, owned, and the update still matched nothing: it was decided between the
-            // two queries.
-            Err(DecideError::NotPending)
+            None
+        };
+        if let Some(e) = refused {
+            tx.rollback().await.map_err(StoreError::from)?;
+            return Err(e);
         }
+        let reason = verdict
+            .reason
+            .filter(|_| verdict.decision == Decision::Reject);
+        let (status, args, distance) = match verdict.decision {
+            Decision::Reject => (Status::Rejected, None, None),
+            Decision::Approve => (Status::Executing, None, Some(0.0)),
+            Decision::Edit => {
+                // Checked above, before anything changed.
+                let args = verdict.args.ok_or(DecideError::MissingArgs)?;
+                let distance = args_edit_distance(&current.args, &args);
+                (Status::Executing, Some(args), Some(distance))
+            }
+        };
+        let new_hash = args.as_ref().map(args_hash);
+        let edited = new_hash.as_ref().is_some_and(|h| h != &current.args_hash);
+        let sql = format!(
+            "UPDATE approvals
+             SET status = $3, args = COALESCE($4, args), args_hash = COALESCE($5, args_hash),
+                 decided_at = $6, decided_by = $2
+             WHERE id = $1 AND user_handle = $2 AND status = 'pending'
+             RETURNING {ITEM_COLUMNS}"
+        );
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .bind(decided_by)
+            .bind(status.as_str())
+            .bind(&args)
+            .bind(&new_hash)
+            .bind(now)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(StoreError::from)?
+            // Held under the lock, so this can't happen; refuse rather than guess.
+            .ok_or(DecideError::NotPending)?;
+        let item = item_from_row(&row)?;
+        sqlx::query(
+            "UPDATE ledger
+             SET outcome = CASE WHEN $2 THEN 'rejected' ELSE outcome END,
+                 edit_distance = $3, reason = $4, edited = $5, decided_at = $6, decided_by = $7
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(verdict.decision == Decision::Reject)
+        .bind(distance)
+        .bind(reason.map(Reason::as_str))
+        .bind(edited)
+        .bind(now)
+        .bind(decided_by)
+        .execute(&mut *tx)
+        .await
+        .map_err(StoreError::from)?;
+        tx.commit().await.map_err(StoreError::from)?;
+        Ok(item)
     }
 
     async fn complete(
@@ -522,6 +698,7 @@ impl ApprovalRepo for PgStore {
             Ok(value) => (false, value),
             Err(message) => (true, serde_json::json!({ "error": message })),
         };
+        let mut tx = self.pool.begin().await?;
         let sql = format!(
             "UPDATE approvals
              SET result = $2, status = CASE WHEN $3 THEN 'failed' ELSE 'approved' END
@@ -532,8 +709,22 @@ impl ApprovalRepo for PgStore {
             .bind(id)
             .bind(&value)
             .bind(failed)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
+        if row.is_some() {
+            sqlx::query(
+                "UPDATE ledger
+                 SET outcome = CASE WHEN $2 THEN 'failed'
+                                    WHEN edited THEN 'edited'
+                                    ELSE 'approved' END
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(failed)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         row.as_ref().map(item_from_row).transpose()
     }
 
@@ -548,6 +739,125 @@ impl ApprovalRepo for PgStore {
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(item_from_row).collect()
+    }
+
+    async fn ledger(&self, query: &LedgerQuery) -> StoreResult<Vec<LedgerRow>> {
+        // `outcome` is the reported one, with `expired` worked out; the filters match
+        // `LedgerQuery::matches`.
+        let outcomes: Vec<&str> = query.outcomes.iter().map(|o| o.as_str()).collect();
+        let rows = sqlx::query(
+            "SELECT * FROM (
+                 SELECT id, run_id, user_handle, bot, skill, tool, content_sha, model_alias,
+                        CASE WHEN outcome = 'pending' AND decided_at IS NULL AND created_at < $1
+                             THEN 'expired' ELSE outcome END AS outcome,
+                        edit_distance, reason, created_at, decided_at, decided_by,
+                        COALESCE(decided_at, created_at) AS activity_at
+                 FROM ledger
+                 WHERE ($2::timestamptz IS NULL OR COALESCE(decided_at, created_at) >= $2)
+                   AND ($3::timestamptz IS NULL OR COALESCE(decided_at, created_at) < $3)
+                   AND ($4::text IS NULL OR bot = $4)
+                   AND ($5::double precision IS NULL OR edit_distance IS NULL
+                        OR edit_distance >= $5)
+             ) l
+             WHERE cardinality($6::text[]) = 0 OR outcome = ANY($6)
+             ORDER BY activity_at DESC, id
+             LIMIT $7",
+        )
+        .bind(query.expire_before)
+        .bind(query.since)
+        .bind(query.until)
+        .bind(&query.bot)
+        .bind(query.min_edit)
+        .bind(&outcomes)
+        .bind(query.limit.map(|n| i64::try_from(n).unwrap_or(i64::MAX)))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(ledger_from_row).collect()
+    }
+
+    async fn expire(
+        &self,
+        tools: &[&str],
+        before: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Vec<ApprovalItem>> {
+        let mut tx = self.pool.begin().await?;
+        // An item a decision holds is skipped: it is being decided, so it won't expire.
+        let sql = format!(
+            "SELECT {ITEM_COLUMNS} FROM approvals
+             WHERE status = 'pending' AND tool = ANY($1) AND created_at <= $2
+             ORDER BY created_at, id
+             FOR UPDATE SKIP LOCKED"
+        );
+        let due = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(tool_names(tools))
+            .bind(before)
+            .fetch_all(&mut *tx)
+            .await?
+            .iter()
+            .map(item_from_row)
+            .collect::<StoreResult<Vec<_>>>()?;
+        if due.is_empty() {
+            tx.rollback().await?;
+            return Ok(Vec::new());
+        }
+        let mut expired = Vec::with_capacity(due.len());
+        for item in due {
+            let sql = format!(
+                "UPDATE approvals SET status = 'expired', args = $2, redacted_at = $3
+                 WHERE id = $1 AND status = 'pending'
+                 RETURNING {ITEM_COLUMNS}"
+            );
+            let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&item.id)
+                .bind(redact_args(&item.args))
+                .bind(now)
+                .fetch_one(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE ledger SET outcome = 'expired' WHERE id = $1")
+                .bind(&item.id)
+                .execute(&mut *tx)
+                .await?;
+            expired.push(item_from_row(&row)?);
+        }
+        tx.commit().await?;
+        Ok(expired)
+    }
+
+    async fn redact_decided(
+        &self,
+        tools: &[&str],
+        before: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<usize> {
+        let mut tx = self.pool.begin().await?;
+        let due = sqlx::query(
+            "SELECT id, args FROM approvals
+             WHERE redacted_at IS NULL AND tool = ANY($1)
+               AND status IN ('approved', 'rejected', 'failed') AND decided_at <= $2
+             ORDER BY decided_at, id
+             FOR UPDATE SKIP LOCKED",
+        )
+        .bind(tool_names(tools))
+        .bind(before)
+        .fetch_all(&mut *tx)
+        .await?;
+        if due.is_empty() {
+            tx.rollback().await?;
+            return Ok(0);
+        }
+        for row in &due {
+            let id: String = row.try_get("id")?;
+            let args: Value = row.try_get("args")?;
+            sqlx::query("UPDATE approvals SET args = $2, redacted_at = $3 WHERE id = $1")
+                .bind(&id)
+                .bind(redact_args(&args))
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(due.len())
     }
 }
 

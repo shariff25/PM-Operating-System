@@ -102,6 +102,9 @@ done
 if [ ${#missing[@]} -gt 0 ]; then
   warn "not set yet: ${missing[*]} (the Slack bot stays off until they are)"
 fi
+if ! grep -qE "^PMOS_DOCS_BASE_URL=.+" "$ENV"; then
+  warn "PMOS_DOCS_BASE_URL is not set: the Docs bot has no docs site until it is (optional)"
+fi
 
 echo
 echo "Next:"

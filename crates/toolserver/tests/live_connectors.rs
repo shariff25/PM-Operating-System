@@ -178,13 +178,13 @@ async fn handle(
         ("GET", "/ex/jira/cloud-1/rest/api/3/search/jql") => reply(
             ok,
             json!({"isLast": true, "issues": [{"key": "PM-1", "fields": {
-                "summary": "SSO for DSM", "status": {"name": "To Do"}, "issuetype": {"name": "Story"},
+                "summary": "SSO for Acme Vault", "status": {"name": "To Do"}, "issuetype": {"name": "Story"},
                 "assignee": {"displayName": "Ana"}, "updated": "2026-11-10T10:00:00.000+0000"}}]}),
         ),
         ("GET", "/ex/jira/cloud-1/rest/api/3/issue/PM-1") => reply(
             ok,
             json!({"key": "PM-1", "fields": {
-                "summary": "SSO for DSM", "status": {"name": "To Do"}, "issuetype": {"name": "Story"},
+                "summary": "SSO for Acme Vault", "status": {"name": "To Do"}, "issuetype": {"name": "Story"},
                 "description": {"type": "doc", "version": 1, "content": [
                     {"type": "paragraph", "content": [{"type": "text", "text": "Customers want SAML."}]}]},
                 "parent": {"key": "PM-100"},
@@ -301,7 +301,7 @@ async fn handle(
                 ok,
                 json!({"ok": true, "results": {"messages": [{"author_user_id": "U2",
                     "author_name": "Sam SE", "channel_id": "C0FIELD", "channel_name": "field-questions",
-                    "message_ts": "1731500000.000100", "content": "Does DSM support SAML SSO yet?",
+                    "message_ts": "1731500000.000100", "content": "Does Acme Vault support SAML SSO yet?",
                     "is_author_bot": false,
                     "permalink": "https://example.slack.com/archives/C0FIELD/p1731500000000100"}]},
                     "response_metadata": {"next_cursor": ""}}),
@@ -310,9 +310,54 @@ async fn handle(
         ("POST", "/api/conversations.replies") => reply(
             ok,
             json!({"ok": true, "messages": [
-                {"user": "U2", "ts": "1731500000.000100", "text": "Does DSM support SAML SSO yet?"},
+                {"user": "U2", "ts": "1731500000.000100", "text": "Does Acme Vault support SAML SSO yet?"},
                 {"user": "U3", "ts": "1731500005.000100", "text": "+1"}]}),
         ),
+        // The audience check: C0TEAM (members over two pages), C0GLOBEX (Slack Connect),
+        // C0HUGE (members without end), C0NOPE (members refused), C0GONE (no such channel).
+        ("POST", "/api/conversations.info") => {
+            let f = req.form();
+            let channel = f.get("channel").cloned().unwrap_or_default();
+            if channel == "C0GONE" {
+                return reply(ok, json!({"ok": false, "error": "channel_not_found"}));
+            }
+            let ext = channel == "C0GLOBEX";
+            reply(
+                ok,
+                json!({"ok": true, "channel": {"id": channel, "is_ext_shared": ext,
+                       "is_shared": ext, "is_im": false, "name": "a-channel"}}),
+            )
+        }
+        ("POST", "/api/conversations.members") => {
+            let f = req.form();
+            let cursor = f.get("cursor").map(String::as_str).unwrap_or_default();
+            match (f.get("channel").map(String::as_str), cursor) {
+                (Some("C0TEAM"), "") => reply(
+                    ok,
+                    json!({"ok": true, "members": ["U0ANA", "U0BEN"],
+                           "response_metadata": {"next_cursor": "page2"}}),
+                ),
+                (Some("C0TEAM"), "page2") => reply(
+                    ok,
+                    json!({"ok": true, "members": ["U0CY"], "response_metadata": {"next_cursor": ""}}),
+                ),
+                (Some("C0GLOBEX"), _) => reply(
+                    ok,
+                    json!({"ok": true, "members": ["U0ANA", "W0EXT"],
+                           "response_metadata": {"next_cursor": ""}}),
+                ),
+                (Some("C0HUGE"), _) => {
+                    let n: usize = f.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
+                    let members: Vec<String> = (0..n).map(|i| format!("U0HUGE{i:04}")).collect();
+                    reply(
+                        ok,
+                        json!({"ok": true, "members": members,
+                               "response_metadata": {"next_cursor": "more"}}),
+                    )
+                }
+                _ => reply(ok, json!({"ok": false, "error": "missing_scope"})),
+            }
+        }
         ("POST", "/api/chat.postMessage") => {
             let f = req.form();
             if f.get("channel").map(String::as_str) == Some("C0GONE") {
@@ -831,7 +876,7 @@ async fn jira_search_read_and_create() {
         hits[0].source.url,
         "https://example.atlassian.net/browse/PM-1"
     );
-    assert_eq!(hits[0].title, "PM-1: SSO for DSM");
+    assert_eq!(hits[0].title, "PM-1: SSO for Acme Vault");
     let search = &l.mock.requests("search/jql")[0];
     assert_eq!(search.query["jql"], "project = PM AND text ~ SSO");
     assert_eq!(search.query["maxResults"], "5");
@@ -1032,7 +1077,10 @@ async fn slack_search_thread_and_reply_as_the_pm() {
         .await
         .unwrap();
     assert_eq!(hits[0].source.id, "C0FIELD:1731500000.000100");
-    assert_eq!(hits[0].content["text"], "Does DSM support SAML SSO yet?");
+    assert_eq!(
+        hits[0].content["text"],
+        "Does Acme Vault support SAML SSO yet?"
+    );
     let search = &l.mock.requests("assistant.search.context")[0];
     assert_eq!(search.auth.as_deref(), Some("Bearer xoxp-ana"));
     assert_eq!(search.form()["query"], "SAML SSO");
@@ -1095,6 +1143,183 @@ async fn slack_errors_map_to_actionable_messages() {
         l.slack.read(ana(), "search", &json!({"query": "x"})).await,
         Err(ConnectorError::Reconnect(_))
     ));
+    l.cancel.cancel();
+}
+
+#[tokio::test]
+async fn slack_audience_is_read_with_the_pms_token() {
+    let l = live().await;
+    put_slack(&l, "ana", "xoxp-ana").await;
+
+    let team = l.slack.audience(ana(), "C0TEAM").await.unwrap();
+    assert_eq!(
+        team,
+        pmos_toolserver::connectors::Audience {
+            external: false,
+            shared: false,
+            im: false,
+            members: vec!["U0ANA".into(), "U0BEN".into(), "U0CY".into()],
+            truncated: false,
+        }
+    );
+    let info = &l.mock.exact("/api/conversations.info")[0];
+    assert_eq!(info.auth.as_deref(), Some("Bearer xoxp-ana"));
+    assert_eq!(info.form()["channel"], "C0TEAM");
+    let pages = l.mock.exact("/api/conversations.members");
+    assert_eq!(pages.len(), 2, "paged");
+    assert!(pages
+        .iter()
+        .all(|p| p.auth.as_deref() == Some("Bearer xoxp-ana")));
+    assert!(!pages[0].form().contains_key("cursor"));
+    assert_eq!(pages[1].form()["cursor"], "page2");
+
+    let globex = l.slack.audience(ana(), "C0GLOBEX").await.unwrap();
+    assert!(globex.external && globex.shared);
+    assert_eq!(globex.members, vec!["U0ANA", "W0EXT"]);
+
+    // Capped at 1,000 members.
+    let huge = l.slack.audience(ana(), "C0HUGE").await.unwrap();
+    assert_eq!(huge.members.len(), 1000);
+    assert!(huge.truncated);
+    let asked: Vec<String> = l
+        .mock
+        .exact("/api/conversations.members")
+        .iter()
+        .filter(|r| r.form()["channel"] == "C0HUGE")
+        .map(|r| r.form()["limit"].clone())
+        .collect();
+    assert_eq!(asked, vec!["200"; 5]);
+
+    // A team bot's session still checks with the PM's token: the PM is the one posting.
+    let reads = pmos_contract::bots::Reads::default();
+    let bot = ana().for_team_bot(pmos_toolserver::connectors::TeamBot {
+        name: "scout",
+        identity: "bots.scout",
+        reads: &reads,
+    });
+    l.slack.audience(bot, "C0GLOBEX").await.unwrap();
+    assert_eq!(
+        l.mock
+            .exact("/api/conversations.info")
+            .last()
+            .unwrap()
+            .auth
+            .as_deref(),
+        Some("Bearer xoxp-ana")
+    );
+
+    // Failures map as for any Slack call.
+    assert!(matches!(
+        l.slack.audience(ana(), "C0GONE").await,
+        Err(ConnectorError::NotFound(_))
+    ));
+    assert!(matches!(
+        l.slack.audience(ana(), "C0NOPE").await,
+        Err(ConnectorError::Reconnect(_))
+    ));
+    assert!(matches!(
+        l.slack.audience(ana(), "c0-bad").await,
+        Err(ConnectorError::BadArgs(_))
+    ));
+    l.cancel.cancel();
+}
+
+/// The audience check through the tool server, against the mock Slack: an external channel
+/// needs the second confirmation, and failing channel calls post nothing.
+#[tokio::test]
+async fn slack_writes_check_their_audience_before_posting() {
+    use pmos_toolserver::approvals::{Decision, Status, Verdict};
+    use pmos_toolserver::audit::Client;
+    use pmos_toolserver::service::DecisionError;
+
+    let l = live().await;
+    put_slack(&l, "ana", "xoxp-ana").await;
+    let content = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content");
+    let catalog = Catalog::load(&content, Utc::now().date_naive()).unwrap();
+    let (stores, _) = Stores::in_memory(&content);
+    let tokens: Arc<dyn TokenSource> = l.oauth.clone();
+    let connectors: Vec<Arc<dyn Connector>> = vec![
+        Arc::new(Jira::new(tokens.clone(), l.base.clone())),
+        Arc::new(Confluence::new(tokens.clone(), l.base.clone())),
+        Arc::new(Slack::new(tokens, l.base.clone())),
+        Arc::new(pmos_toolserver::connectors::fake::FakeConnector::docs()),
+    ];
+    let member = |handle: &str, slack_id: &str| pmos_contract::model::TeamMember {
+        handle: handle.into(),
+        slack_id: slack_id.into(),
+        email: None,
+        github: None,
+        roles: vec![pmos_contract::model::Role::Pm],
+    };
+    let svc = Arc::new(
+        ToolService::new(catalog, stores, connectors)
+            .unwrap()
+            .with_team(Team::of(vec![
+                member("ana", "U0ANA"),
+                member("ben", "U0BEN"),
+                member("cy", "U0CY"),
+            ])),
+    );
+    let s = svc
+        .create_session("ana", "meeting-notes", "run-a", None, Utc::now())
+        .await
+        .unwrap();
+    let draft = |channel: &'static str| {
+        let svc = svc.clone();
+        let s = s.clone();
+        async move {
+            let res = svc
+                .call(
+                    &s,
+                    "slack_send_message",
+                    json!({"channel": channel, "text": "Notes are up."}),
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            res["approval_id"].as_str().unwrap().to_string()
+        }
+    };
+    let decide = |id: String, confirm_external: bool| {
+        let svc = svc.clone();
+        async move {
+            let verdict = Verdict {
+                confirm_external,
+                ..Verdict::new(Decision::Approve, None)
+            };
+            svc.decide_verdict(Client::Bot, &id, "ana", verdict, Utc::now())
+                .await
+        }
+    };
+
+    let team = draft("C0TEAM").await;
+    assert_eq!(decide(team, false).await.unwrap().status, Status::Approved);
+    assert_eq!(l.mock.requests("chat.postMessage").len(), 1);
+
+    let globex = draft("C0GLOBEX").await;
+    assert!(matches!(
+        decide(globex.clone(), false).await,
+        Err(DecisionError::NeedsExternalConfirm(_))
+    ));
+    assert_eq!(l.mock.requests("chat.postMessage").len(), 1, "not posted");
+    assert_eq!(decide(globex, true).await.unwrap().status, Status::Approved);
+    assert_eq!(l.mock.requests("chat.postMessage").len(), 2);
+
+    for channel in ["C0GONE", "C0NOPE"] {
+        let id = draft(channel).await;
+        assert!(
+            matches!(
+                decide(id.clone(), true).await,
+                Err(DecisionError::AudienceUnavailable(_))
+            ),
+            "{channel}"
+        );
+        assert_eq!(
+            svc.approval(&id).await.unwrap().unwrap().status,
+            Status::Pending
+        );
+    }
+    assert_eq!(l.mock.requests("chat.postMessage").len(), 2);
     l.cancel.cancel();
 }
 

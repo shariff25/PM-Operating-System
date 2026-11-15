@@ -64,7 +64,7 @@ enum MemberCommand {
         /// Atlassian account email.
         #[arg(long)]
         email: Option<String>,
-        /// GitHub login in the Acme org.
+        /// GitHub login in your GitHub org.
         #[arg(long)]
         github: Option<String>,
         /// Roles, comma-separated: pm, skill-author, admin.

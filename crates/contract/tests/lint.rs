@@ -368,6 +368,62 @@ fn template_bad_version() {
 }
 
 #[test]
+fn playbooks_are_optional_and_checked() {
+    let dir = valid_tree();
+    write(
+        dir.path(),
+        "playbooks/bar.md",
+        "---\ntitle: The bar\nowner: \"@pm\"\nversion: \"0.1.0\"\n---\n\n# The bar\n\n1. Problem first.\n",
+    );
+    write(dir.path(), "playbooks/README.md", "# Playbooks\n");
+    assert!(
+        run(&dir).diagnostics.is_empty(),
+        "{:#?}",
+        run(&dir).diagnostics
+    );
+}
+
+#[test]
+fn playbook_needs_owner_version_and_body() {
+    let dir = valid_tree();
+    // No version: the front matter does not parse.
+    write(
+        dir.path(),
+        "playbooks/strategy.md",
+        "---\ntitle: Strategy\nowner: \"@pm\"\n---\n\n# Strategy\n",
+    );
+    // No body.
+    write(
+        dir.path(),
+        "playbooks/bar.md",
+        "---\nowner: \"@pm\"\nversion: \"0.1.0\"\n---\n\n",
+    );
+    // An unassigned owner is a warning, as for templates.
+    write(
+        dir.path(),
+        "playbooks/ai-products.md",
+        "---\nowner: \"TODO\"\nversion: \"0.1.0\"\n---\n\n# AI products\n",
+    );
+    let report = run(&dir);
+    assert_code(&report, "playbook-parse", Severity::Error);
+    assert_code(&report, "playbook-body-empty", Severity::Error);
+    assert_code(&report, "owner-unassigned", Severity::Warning);
+}
+
+#[test]
+fn skill_may_use_the_reasoning_model() {
+    let dir = valid_tree();
+    let meta = GOOD_META.replace("\"default\"", "\"reasoning\"");
+    write(dir.path(), "skills/ask/SKILL.md", &skill("ask", &meta));
+    let report = run(&dir);
+    assert!(report.diagnostics.is_empty(), "{:#?}", report.diagnostics);
+    assert_eq!(
+        report.skills[0].model,
+        pmos_contract::model::ModelRole::Reasoning
+    );
+}
+
+#[test]
 fn readme_files_are_ignored() {
     let dir = valid_tree();
     write(dir.path(), "reviewers/README.md", "# Reviewers\n");
@@ -384,7 +440,31 @@ fn repo_content_passes() {
     let errors: Vec<_> = report.errors().collect();
     assert!(errors.is_empty(), "{errors:#?}");
     let names: Vec<_> = report.skills.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["ask", "docs", "meeting-notes", "prd-draft"]);
+    assert_eq!(
+        names,
+        vec![
+            "ai-feature-spec",
+            "ask",
+            "call-synth",
+            "competitive-brief",
+            "decision-doc",
+            "docs",
+            "eval-plan",
+            "experiment-design",
+            "experiment-readout",
+            "meeting-notes",
+            "metrics-tree",
+            "opportunity-sizing",
+            "prd-draft",
+            "pre-mortem",
+            "prioritize",
+            "problem-framing",
+            "product-critique",
+            "review",
+            "slack-reply",
+            "strategy-doc",
+        ]
+    );
 }
 
 #[test]
