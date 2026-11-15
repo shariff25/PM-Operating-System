@@ -384,7 +384,10 @@ fn repo_content_passes() {
     let errors: Vec<_> = report.errors().collect();
     assert!(errors.is_empty(), "{errors:#?}");
     let names: Vec<_> = report.skills.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["ask", "docs", "meeting-notes", "prd-draft"]);
+    assert_eq!(
+        names,
+        vec!["ask", "docs", "meeting-notes", "prd-draft", "slack-reply"]
+    );
 }
 
 #[test]
