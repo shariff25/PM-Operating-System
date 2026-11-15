@@ -5,6 +5,7 @@
 //! - Notifications: one progress message per task edited in place, then a new message for
 //!   the result; failures with their reason; the cursor survives a restart.
 //! - Approval cards: approve, edit (modal) and reject, decided by their own PM only.
+//! - Reject asks why: six reasons and Back, in place; a reason goes with the decision.
 //! - Routines: create, question, cancel, list, pause, resume, delete.
 //! - Every envelope is acknowledged before its work, even with slow backends.
 
@@ -299,6 +300,13 @@ async fn ts_decide(
     }
     if item["status"] != "pending" {
         return refuse(StatusCode::CONFLICT, "approval item is already decided");
+    }
+    // A reason goes only with `reject` (spec §1 of `docs/improvement-loop-spec.md`).
+    if body.get("reason").is_some() && body["decision"] != "reject" {
+        return refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a reason goes only with reject",
+        );
     }
     item["decided_by"] = body["decided_by"].clone();
     match body["decision"].as_str() {
@@ -885,16 +893,32 @@ async fn approval_cards_are_decided_by_their_own_pm() {
         "no buttons once decided"
     );
 
-    // Ana rejects the third.
+    // Ana rejects the third: the card asks why, and a reason decides it.
     stack
         .send(click("c4", "U0ANA", "apr_reject", "apr_a3", "D0ANA", &t3))
         .await;
-    until("the rejected card", || {
+    until("the reasons", || {
         stack
             .slack
             .calls("chat.update")
             .into_iter()
-            .find(|u| u.body["ts"] == t3.as_str() && text_of(u).contains("Rejected by Ana"))
+            .find(|u| u.body["ts"] == t3.as_str() && text_of(u).contains("apr_reason_incomplete"))
+    })
+    .await;
+    stack
+        .send(click(
+            "c4r",
+            "U0ANA",
+            "apr_reason_incomplete",
+            "apr_a3",
+            "D0ANA",
+            &t3,
+        ))
+        .await;
+    until("the rejected card", || {
+        stack.slack.calls("chat.update").into_iter().find(|u| {
+            u.body["ts"] == t3.as_str() && text_of(u).contains("Rejected by Ana: Incomplete")
+        })
     })
     .await;
 
@@ -970,7 +994,7 @@ async fn approval_cards_are_decided_by_their_own_pm() {
             ),
             (
                 "apr_a3".into(),
-                json!({"decided_by": "ana", "decision": "reject"})
+                json!({"decided_by": "ana", "decision": "reject", "reason": "incomplete"})
             ),
             (
                 "apr_a2".into(),
@@ -980,6 +1004,172 @@ async fn approval_cards_are_decided_by_their_own_pm() {
     );
     stop.cancel();
     handle.await.unwrap();
+    stack.stop().await;
+}
+
+/// The blocks of the latest `chat.update` of the message at `ts`, once one matches `want`.
+async fn card_update(stack: &Stack, ts: &str, what: &str, want: impl Fn(&str) -> bool) -> Call {
+    until(what, || {
+        stack
+            .slack
+            .calls("chat.update")
+            .into_iter()
+            .rev()
+            .find(|u| u.body["ts"] == ts && want(&text_of(u)))
+    })
+    .await
+}
+
+#[tokio::test]
+async fn reject_asks_why_and_back_restores_the_card() {
+    let mut stack = Stack::new().await;
+    stack.tools.items.lock().unwrap().insert(
+        "apr_r1".into(),
+        approval(
+            "apr_r1",
+            "ana",
+            "jira.create_issue",
+            json!({"project": "DSM", "summary": "Fix <login>", "description": "Steps"}),
+        ),
+    );
+    stack.connect();
+    let ts = "1700000000.000042";
+    let decisions = || stack.tools.decisions.lock().unwrap().len();
+
+    // Reject turns the card into the six reasons and Back; nothing is decided yet.
+    let ack = stack
+        .send(click("r1", "U0ANA", "apr_reject", "apr_r1", "D0ANA", ts))
+        .await;
+    assert!(
+        ack.get("payload").is_none(),
+        "acked at once, the work follows"
+    );
+    let reasons = card_update(&stack, ts, "the reasons", |t| t.contains("apr_back")).await;
+    let buttons: Vec<(String, String, String)> = reasons.body["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|b| b["elements"].as_array().cloned().unwrap_or_default())
+        .filter(|e| e["type"] == "button")
+        .map(|e| {
+            (
+                e["text"]["text"].as_str().unwrap().to_string(),
+                e["action_id"].as_str().unwrap().to_string(),
+                e["value"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let labels: Vec<&str> = buttons.iter().map(|b| b.0.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "Wrong facts",
+            "Wrong place",
+            "Tone",
+            "Incomplete",
+            "Shouldn't have drafted",
+            "Other",
+            "Back"
+        ]
+    );
+    assert!(buttons.iter().all(|b| b.2 == "apr_r1"));
+    assert!(!text_of(&reasons).contains("apr_approve"));
+    assert!(
+        text_of(&reasons).contains("*Summary:* Fix &lt;login&gt;"),
+        "the draft stays on the card"
+    );
+    assert_eq!(decisions(), 0);
+
+    // Back restores Approve, Edit and Reject.
+    stack
+        .send(click("r2", "U0ANA", "apr_back", "apr_r1", "D0ANA", ts))
+        .await;
+    let back = card_update(&stack, ts, "the card back", |t| t.contains("apr_approve")).await;
+    let s = text_of(&back);
+    assert!(s.contains("apr_edit") && s.contains("apr_reject") && !s.contains("apr_reason_"));
+    assert_eq!(decisions(), 0);
+
+    // Someone else's reason click is refused, and nothing is sent.
+    stack
+        .send(click("r3", "U0ANA", "apr_reject", "apr_r1", "D0ANA", ts))
+        .await;
+    card_update(&stack, ts, "the reasons again", |t| t.contains("apr_back")).await;
+    stack
+        .send(click(
+            "r4",
+            "U0BOB",
+            "apr_reason_tone",
+            "apr_r1",
+            "D0ANA",
+            ts,
+        ))
+        .await;
+    let notes = stack.calls("chat.postEphemeral", 1).await;
+    assert_eq!(notes[0].body["user"], "U0BOB");
+    assert!(text_of(&notes[0]).contains("Only Ana can decide this one"));
+    stack
+        .send(click("r5", "U0BOB", "apr_back", "apr_r1", "D0ANA", ts))
+        .await;
+    stack.calls("chat.postEphemeral", 2).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(decisions(), 0, "no decision for anyone else");
+
+    // Ana's reason decides it, with the reason.
+    stack
+        .send(click(
+            "r6",
+            "U0ANA",
+            "apr_reason_tone",
+            "apr_r1",
+            "D0ANA",
+            ts,
+        ))
+        .await;
+    card_update(&stack, ts, "the rejected card", |t| {
+        t.contains("Rejected by Ana: Tone")
+    })
+    .await;
+    let sent: Vec<(String, Value)> = stack
+        .tools
+        .decisions
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, id, b)| (id.clone(), b.clone()))
+        .collect();
+    assert_eq!(
+        sent,
+        vec![(
+            "apr_r1".into(),
+            json!({"decided_by": "ana", "decision": "reject", "reason": "tone"})
+        )]
+    );
+
+    // A reason or Back on a card decided meanwhile shows the outcome, and sends nothing.
+    stack
+        .send(click("r7", "U0ANA", "apr_back", "apr_r1", "D0ANA", ts))
+        .await;
+    stack
+        .send(click(
+            "r8",
+            "U0ANA",
+            "apr_reason_other",
+            "apr_r1",
+            "D0ANA",
+            ts,
+        ))
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let last = stack.slack.calls("chat.update").last().unwrap().clone();
+    assert!(text_of(&last).contains("Rejected by Ana"));
+    assert!(!text_of(&last).contains("apr_approve"));
+    assert_eq!(decisions(), 1);
+
+    // Every click was acknowledged inside Slack's 3 seconds.
+    for id in ["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8"] {
+        let (acked, _) = stack.slack.ack(id).unwrap();
+        assert!(acked.duration_since(stack.slack.sent_at(id).unwrap()) < Duration::from_secs(3));
+    }
     stack.stop().await;
 }
 

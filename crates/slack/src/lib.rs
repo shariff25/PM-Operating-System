@@ -5,7 +5,11 @@
 //!   a `<bot>:` prefix) in the bots runtime. Progress, answers and failures come back in the
 //!   thread from the runtime's notification feed, posted under the bot's own name.
 //! - **Approval cards (D7):** each write a bot drafts is a card with **Approve**, **Edit** and
-//!   **Reject**; only the PM it is for can decide it, through the tool server.
+//!   **Reject**; only the PM it is for can decide it, through the tool server. **Reject**
+//!   asks why first, with six one-tap reasons the feedback ledger keeps
+//!   (`docs/improvement-loop-spec.md` §4).
+//! - **Triage digest:** on weekday mornings each bot's quality owner gets a DM of the drafts
+//!   that were rejected or heavily edited since the last one (`triage.rs`).
 //! - **Routines (D8):** "every weekday at 8am …" is read back for a one-tap confirm; "my
 //!   routines" lists them with **Pause**, **Resume** and **Delete**.
 //! - **Onboarding** (`docs/onboarding-spec.md` §4): someone outside `team.yaml` taps
