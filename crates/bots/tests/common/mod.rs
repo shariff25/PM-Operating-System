@@ -176,6 +176,8 @@ pub struct MockToolServer {
     /// Approval items by id.
     pub approvals: Mutex<HashMap<String, Value>>,
     pub approval_reads: Mutex<usize>,
+    /// Approval reads answer `503`.
+    pub approvals_down: Mutex<bool>,
     pub ready: Mutex<bool>,
 }
 
@@ -186,6 +188,7 @@ impl Default for MockToolServer {
             sessions: Mutex::default(),
             approvals: Mutex::default(),
             approval_reads: Mutex::new(0),
+            approvals_down: Mutex::new(false),
             ready: Mutex::new(true),
         }
     }
@@ -256,6 +259,13 @@ async fn ts_approval(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     *ts.approval_reads.lock().unwrap() += 1;
+    if *ts.approvals_down.lock().unwrap() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "PM OS storage is unavailable"})),
+        )
+            .into_response();
+    }
     match ts.approvals.lock().unwrap().get(&id) {
         Some(item) => Json(item.clone()).into_response(),
         None => (

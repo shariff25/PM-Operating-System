@@ -6,7 +6,11 @@
 //! | `slack` | create tasks as `X-Pmos-User`; read that PM's tasks and routines; read the shared notification feed and the bot list (no PM needed) |
 //! | `worker` | claim, heartbeat, events, trace, complete, fail |
 //! | `console` | read everything; pause, resume and delete routines; cancel tasks |
-//! | `evals` | create tasks with `source: "eval"`, and read them |
+//! | `evals` | create tasks with `source: "eval"`, and read them and their drafts |
+//!
+//! A task's drafts (`GET /v1/tasks/{id}/drafts`) are for the console and evals only: the
+//! runtime reads them from the tool server with its own service token, so the evals client
+//! never holds one.
 //!
 //! A task or routine another PM owns answers `404` to the Slack client, the same as one that
 //! doesn't exist. Request bodies that don't parse are `400`; `422` is kept for "the routine
@@ -73,6 +77,7 @@ pub fn router(rt: Arc<Runtime>, clients: Vec<Client>) -> Router {
         .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/tasks/{id}/events", get(task_events))
         .route("/tasks/{id}/trace", get(task_trace))
+        .route("/tasks/{id}/drafts", get(task_drafts))
         .route("/worker/claim", post(claim))
         .route("/worker/tasks/{id}/heartbeat", post(heartbeat))
         .route("/worker/tasks/{id}/events", post(worker_events))
@@ -438,6 +443,23 @@ async fn task_trace(
     visible_task(&state, &caller, &id).await?;
     let trace = state.rt.store.trace(&id).await?;
     Ok(Json(trace).into_response())
+}
+
+/// `{drafts: [{id, tool, args, status}]}`: the task's approval items as the tool server has
+/// them now.
+async fn task_drafts(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> Reply {
+    allow(
+        &caller,
+        &[ClientKind::Console, ClientKind::Evals],
+        "read drafts",
+    )?;
+    let task = visible_task(&state, &caller, &id).await?;
+    let drafts = state.rt.drafts(&task).await?;
+    Ok(Json(json!({ "drafts": drafts })).into_response())
 }
 
 // ----- workers ----------------------------------------------------------------------------
