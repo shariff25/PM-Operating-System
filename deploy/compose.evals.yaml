@@ -1,0 +1,123 @@
+# The eval stack: a separate, short-lived copy of the tool server, bot runtime and workers that
+# the benchmarks and the eval gate run against (docs/evals.md, docs/runbooks/quality.md).
+#
+#   deploy/pmos-admin evals-run --category docs-qa    the weekly benchmark, on main
+#   deploy/pmos-admin evals-gate --base origin/main   the gate, on a PR's checkout
+#
+# Why a separate stack:
+# - **The evaluator is separate.** The gate measures a pull request's roles, skills and bots,
+#   so it must run on that checkout's content without touching what PMs are using.
+# - **No PM data.** It runs fake Jira, Confluence and Slack fixtures plus the real public
+#   support docs, and holds no PM tokens.
+# - **Shared models.** It shares only the main stack's gateway (the models, under the `evals`
+#   client's token) and the docs server (read-only), over the main stack's network.
+#
+# pmos-admin starts it with fresh tokens for every run and removes it afterwards; everything is
+# in memory. The workers here are plain containers, not OpenShell sandboxes: acceptable only
+# because nothing in this stack can reach a PM's accounts or a real system.
+
+name: pmos-evals
+
+x-service: &service
+  image: pmos:${PMOS_VERSION:-local}
+  init: true
+  user: "${PMOS_UID:-10001}:${PMOS_GID:-10001}"
+  networks: [evals, pmos]
+
+x-worker: &worker
+  image: pmos-worker:${PMOS_VERSION:-local}
+  init: true
+  networks: [evals, pmos]
+  volumes:
+    - ${PMOS_EVAL_CONTENT:?}:/srv/content:ro
+  depends_on:
+    bots: { condition: service_healthy }
+
+services:
+  toolserver:
+    <<: *service
+    command: ["pmos-toolserver"]
+    environment:
+      PMOS_DEV: "1"
+      PMOS_CONNECTORS: fake
+      PMOS_BIND: 0.0.0.0:8710
+      PMOS_ALLOWED_HOSTS: toolserver,localhost,127.0.0.1
+      PMOS_SERVICE_TOKEN: ${PMOS_EVAL_SERVICE_TOKEN:?}
+      PMOS_BOT_TOKEN: ${PMOS_EVAL_BOT_TOKEN:?}
+      PMOS_CONTENT_ROOT: /srv/content
+      PMOS_DOCS_URL: http://docs.pmos.internal:8730/mcp
+      PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN:?}
+      NO_PROXY: "*"
+    volumes:
+      - ${PMOS_EVAL_CONTENT}:/srv/content:ro
+    healthcheck: &health
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8710/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  bots:
+    <<: *service
+    command: ["pmos-bots"]
+    environment:
+      PMOS_DEV: "1"
+      PMOS_BOTS_BIND: 0.0.0.0:8750
+      PMOS_BOTS_TOKENS: evals=${PMOS_EVAL_RT_EVALS:?},console=${PMOS_EVAL_RT_CONSOLE:?},worker-docs=${PMOS_EVAL_RT_DOCS:?},worker-pm-evals=${PMOS_EVAL_RT_PERSONAL:?}
+      PMOS_CONTENT_ROOT: /srv/content
+      PMOS_TOOLSERVER_URL: http://toolserver:8710
+      PMOS_SERVICE_TOKEN: ${PMOS_EVAL_SERVICE_TOKEN}
+      PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
+      PMOS_GATEWAY_TOKEN: ${PMOS_GW_EVALS_TOKEN:?}
+      NO_PROXY: "*"
+    volumes:
+      - ${PMOS_EVAL_CONTENT}:/srv/content:ro
+    depends_on:
+      toolserver: { condition: service_healthy }
+    healthcheck:
+      <<: *health
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8750/healthz"]
+
+  worker-docs:
+    <<: *worker
+    environment: &worker-env
+      PMOS_BOTS_URL: http://bots:8750
+      PMOS_WORKER_BOT: docs
+      PMOS_WORKER_TOKEN: ${PMOS_EVAL_RT_DOCS}
+      PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
+      PMOS_GATEWAY_TOKEN: ${PMOS_GW_EVALS_TOKEN}
+      PMOS_TOOLSERVER_MCP_URL: http://toolserver:8710/mcp
+      PMOS_CONTENT_ROOT: /srv/content
+      NO_PROXY: "*"
+
+  worker-personal:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      PMOS_WORKER_BOT: pm-evals
+      PMOS_WORKER_TOKEN: ${PMOS_EVAL_RT_PERSONAL}
+
+  # pmos-evals itself, run with `docker compose run`. It works in the checkout being measured,
+  # where its reports are written.
+  runner:
+    <<: *service
+    entrypoint: ["pmos-evals"]
+    working_dir: /srv/checkout
+    environment:
+      PMOS_BOTS_URL: http://bots:8750
+      PMOS_EVALS_TOKEN: ${PMOS_EVAL_RT_EVALS}
+      PMOS_EVALS_TRACE_TOKEN: ${PMOS_EVAL_RT_CONSOLE}
+      PMOS_EVALS_AS: evals
+      PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
+      PMOS_EVALS_GATEWAY_TOKEN: ${PMOS_GW_EVALS_TOKEN}
+      NO_PROXY: "*"
+    volumes:
+      - ${PMOS_EVAL_CHECKOUT:?}:/srv/checkout
+      - ${PMOS_EVAL_BASELINE:?}:/srv/baseline:ro
+      - ${PMOS_EVAL_OUT:?}:/srv/out
+    profiles: [runner]
+
+networks:
+  evals: {}
+  pmos:
+    external: true
+    name: pmos_pmos
