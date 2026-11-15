@@ -8,8 +8,10 @@
 //!   - `PMOS_BOT_TOKEN`: the Slack bot. Only sessions for its skills (`PMOS_BOT_SKILLS`) and
 //!     calls within them, reading and deciding one approval item (Slack approval cards),
 //!     onboarding (member requests and decisions, memory repos, setup status), link URLs
-//!     for team members, and reading the feedback ledger (the triage digest); never inbox
-//!     listings, grants, revoking, reindexing or the ledger summary.
+//!     for team members, a team member's pending approvals (the App Home Inbox) and
+//!     unlinking a team member's account (the App Home Accounts), and reading the feedback
+//!     ledger (the triage digest); never other inbox listings, grants, revoking sessions,
+//!     listing credentials, reindexing or the ledger summary.
 //!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
@@ -31,7 +33,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::approvals::{DecideError, Decision, Status, Verdict};
-use crate::audit::Client;
+use crate::audit::{AuditEvent, Client, Outcome};
 use crate::ledger::{LedgerOutcome, LedgerQuery, Reason, MAX_LIMIT};
 use crate::mcp::PmosMcp;
 use crate::members::RequestStatus;
@@ -129,21 +131,23 @@ pub fn router_with(
     // Orchestrator only.
     let admin = Router::new()
         .route("/grants", post(create_grant))
-        .route("/approvals", get(list_approvals))
         .route("/reindex", post(reindex))
         .route("/ledger/summary", get(ledger_summary))
         .route("/credentials", get(list_credentials))
-        .route(
-            "/credentials/{user}/{provider}",
-            axum::routing::delete(revoke_credential),
-        )
         .layer(middleware::from_fn(orchestrator_only));
 
     // Any internal client; the bot is limited to its own skills inside each handler. Both
     // may read and decide one approval item: the Slack bot does so from approval cards. Both
     // run onboarding, and the bot gets link URLs for team members only. Both read the
-    // ledger: the Slack bot for the daily triage digest.
+    // ledger: the Slack bot for the daily triage digest. The Slack bot may also list a team
+    // member's pending approvals and unlink a team member's account, for the App Home
+    // (`docs/slack-mentions-and-home-spec.md` §3); each handler limits it.
     let internal = Router::new()
+        .route("/approvals", get(list_approvals))
+        .route(
+            "/credentials/{user}/{provider}",
+            axum::routing::delete(revoke_credential),
+        )
         .route("/sessions", post(create_session))
         .route("/session", axum::routing::delete(revoke_session))
         .route("/call", post(call_tool))
@@ -416,12 +420,51 @@ async fn create_grant(State(state): State<AppState>, Json(body): Json<NewGrant>)
 
 #[derive(Deserialize)]
 struct ApprovalQuery {
-    user: String,
-    status: Option<Status>,
+    user: Option<String>,
+    status: Option<String>,
 }
 
-async fn list_approvals(State(state): State<AppState>, Query(q): Query<ApprovalQuery>) -> Response {
-    match state.svc.approvals(&q.user, q.status).await {
+/// The most pending items the Slack bot gets in one listing.
+pub const BOT_PENDING_LIMIT: usize = 50;
+
+/// A PM's approval items.
+///
+/// - **The orchestrator:** `{"items": [...]}`, every item of `user`'s, newest first,
+///   optionally only those with `status`.
+/// - **The Slack bot** (the App Home Inbox): `{"approvals": [...], "total": n}`, only
+///   `pending` items whatever `status` says, oldest first, at most [`BOT_PENDING_LIMIT`];
+///   `total` counts them all. `user` must be a team member.
+async fn list_approvals(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Query(q): Query<ApprovalQuery>,
+) -> Response {
+    let Some(user) = q.user.filter(|u| !u.trim().is_empty()) else {
+        return error(StatusCode::BAD_REQUEST, "`user` is required");
+    };
+    if client == Client::Bot {
+        // As for sessions: enforced with live connectors, open in dev and tests.
+        if !state.svc.team().allows(&user) {
+            return error(
+                StatusCode::FORBIDDEN,
+                "this token may list approvals for team members only",
+            );
+        }
+        return match state.svc.pending_approvals(&user, BOT_PENDING_LIMIT).await {
+            Ok((approvals, total)) => {
+                Json(json!({ "approvals": approvals, "total": total })).into_response()
+            }
+            Err(e) => unavailable(e),
+        };
+    }
+    let status = match q.status.as_deref() {
+        None => None,
+        Some(s) => match Status::parse(s) {
+            Some(status) => Some(status),
+            None => return error(StatusCode::BAD_REQUEST, format!("unknown status `{s}`")),
+        },
+    };
+    match state.svc.approvals(&user, status).await {
         Ok(items) => Json(json!({ "items": items })).into_response(),
         Err(e) => unavailable(e),
     }
@@ -807,22 +850,69 @@ async fn list_credentials(State(state): State<AppState>, Query(q): Query<UserQue
     }
 }
 
-/// Unlink an account (the PM disconnects, or a platform owner revokes).
+/// What an unlink is audited as.
+pub const UNLINK_TOOL: &str = "credentials.unlink";
+
+/// Unlink an account (the PM disconnects, or a platform owner revokes). The Slack bot may
+/// unlink a team member's account only (the App Home's **Disconnect**). Every answer but a
+/// malformed one is audited, with the client.
 async fn revoke_credential(
     State(state): State<AppState>,
+    Extension(client): Extension<Client>,
     Path((user, provider)): Path<(String, String)>,
 ) -> Response {
+    let audit = |outcome: Outcome, detail: String| {
+        let svc = state.svc.clone();
+        let (user, provider) = (user.clone(), provider.clone());
+        async move {
+            svc.audit(AuditEvent {
+                at: Utc::now(),
+                client,
+                run_id: format!("unlink-{user}-{provider}"),
+                user,
+                skill: None,
+                bot: None,
+                tool: UNLINK_TOOL.to_string(),
+                outcome,
+                sources: Vec::new(),
+                args_hash: None,
+                output_ref: Some(provider),
+                detail: Some(detail),
+            })
+            .await;
+        }
+    };
+    // As for sessions: enforced with live connectors (the only mode that links accounts),
+    // and never a team bot's own account.
+    if client != Client::Orchestrator && !state.svc.team().allows(&user) {
+        audit(
+            Outcome::Denied,
+            "unlink for someone who isn't a team member".into(),
+        )
+        .await;
+        return error(
+            StatusCode::FORBIDDEN,
+            "this token may unlink accounts of team members only",
+        );
+    }
     let (oauth, provider) = match linking(&state, &provider) {
         Ok(x) => x,
         Err((status, message)) => return error(status, message),
     };
     match oauth.unlink_account(&user, provider).await {
         Ok(true) => {
-            tracing::info!(user = %user, provider = %provider, "account unlinked");
+            tracing::info!(user = %user, provider = %provider, client = client.as_str(), "account unlinked");
+            audit(Outcome::Ok, "unlinked".into()).await;
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(false) => error(StatusCode::NOT_FOUND, "no such linked account"),
-        Err(e) => unavailable(e),
+        Ok(false) => {
+            audit(Outcome::Ok, "nothing was linked".into()).await;
+            error(StatusCode::NOT_FOUND, "no such linked account")
+        }
+        Err(e) => {
+            audit(Outcome::Error, "storage unavailable".into()).await;
+            unavailable(e)
+        }
     }
 }
 

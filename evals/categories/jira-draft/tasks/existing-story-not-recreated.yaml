@@ -1,0 +1,24 @@
+# seed: replace with case cards
+# Fixture: epic PM-101 and its story PM-102 "SCIM user provisioning". The jira-draft skill
+# searches Jira before it proposes anything and lists what already exists instead of
+# recreating it, so of the two items in the note only the new one becomes an issue, and the
+# answer names PM-102 as the duplicate.
+id: existing-story-not-recreated
+ask: "Turn these notes into Jira stories under epic PM-101 in project PM: 1) SCIM user provisioning for the Acme Vault console, 2) a SAML SSO sign-in page that shows the admin's chosen IdP name. Check Jira first and don't recreate anything that is already there. Give each a description with acceptance criteria."
+expect:
+  approvals: 1
+  must_include:
+    - "PM-102"
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: jira.create_issue
+      count: 1
+      require_fields: [project, issue_type, summary, description]
+      allowed:
+        project: [PM]
+        issue_type: [Story]
+        epic: [PM-101]
+      must_include: ["SAML"]
+tags:
+  - model/wrong-draft-count

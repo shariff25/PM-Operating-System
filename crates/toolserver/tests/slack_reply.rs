@@ -67,6 +67,9 @@ both!(
     undecided_drafts_expire_and_lose_their_text,
     decided_drafts_lose_their_text_a_day_later,
     an_overdue_draft_expires_when_decided,
+    a_tagged_reply_is_one_draft_per_message,
+    a_tagged_message_id_is_kept_and_never_sent,
+    the_pending_list_is_oldest_first_and_capped,
 );
 
 async fn session(f: &Fixture, run: &str) -> Session {
@@ -883,6 +886,225 @@ async fn unrecorded_sources_count_as_restricted() {
     pg.drop_schema().await;
 }
 
+// ----- tagging: one draft per message (docs/slack-mentions-and-home-spec.md §3) -----------
+
+fn tagged(channel: &str, thread_ts: &str, message_ts: &str, text: &str) -> Value {
+    json!({"channel": channel, "thread_ts": thread_ts, "message_ts": message_ts, "text": text})
+}
+
+async fn a_tagged_reply_is_one_draft_per_message(f: &Fixture) {
+    let thread = "1731600000.000100";
+    let s = session(f, "tsk_tag1").await;
+    let first = draft_at(
+        f,
+        &s,
+        tagged(
+            SLACK_ALL_TEAM,
+            thread,
+            "1731600300.000200",
+            "Yes: SAML 2.0.",
+        ),
+        now(),
+    )
+    .await;
+    assert_eq!(first["status"], "pending_approval", "{first}");
+    let id = first["approval_id"].as_str().unwrap().to_string();
+
+    // The same tagged message again, from another run: the first draft stands.
+    let other = session(f, "tsk_tag2").await;
+    let again = draft_at(
+        f,
+        &other,
+        tagged(SLACK_ALL_TEAM, thread, "1731600300.000200", "Other words."),
+        now() + Duration::minutes(5),
+    )
+    .await;
+    assert_eq!(
+        again,
+        json!({
+            "status": "already_drafted",
+            "approval_id": id,
+            "message": "A reply to this message is already waiting for evals (or was posted); don't draft another.",
+        })
+    );
+
+    // A second tag later in the same thread is a new draft.
+    let second = draft_at(
+        f,
+        &s,
+        tagged(
+            SLACK_ALL_TEAM,
+            thread,
+            "1731600600.000400",
+            "And SCIM in 4.3.",
+        ),
+        now(),
+    )
+    .await;
+    assert_eq!(second["status"], "pending_approval", "{second}");
+    assert_ne!(second["approval_id"], json!(id));
+
+    // Without `message_ts` the rule is per thread, as before: the tagged drafts count.
+    let untagged = draft_at(f, &s, reply(SLACK_ALL_TEAM, thread, "Plain reply."), now()).await;
+    assert_eq!(untagged["status"], "already_drafted");
+    assert_eq!(
+        untagged["message"],
+        "A reply to this thread is already waiting for evals (or was posted); don't draft another."
+    );
+    // ...and a reply-assistant draft doesn't stop a tag in its thread.
+    let plain_thread = "1731601500.000700";
+    let plain = draft_at(f, &s, reply(SLACK_ALL_TEAM, plain_thread, "Plain."), now()).await;
+    assert_eq!(plain["status"], "pending_approval");
+    let tag = draft_at(
+        f,
+        &s,
+        tagged(SLACK_ALL_TEAM, plain_thread, "1731601600.000800", "Tagged."),
+        now(),
+    )
+    .await;
+    assert_eq!(tag["status"], "pending_approval", "{tag}");
+
+    // A bad id is refused before anything is queued.
+    let bad = f
+        .svc
+        .call(
+            &s,
+            "slack_post_reply",
+            tagged(SLACK_ALL_TEAM, thread, "not-a-ts", "x"),
+            now(),
+        )
+        .await;
+    assert!(bad.unwrap_err().to_string().contains("timestamp"));
+
+    // A rejected tag draft doesn't block a new one for the same message.
+    decide(f, &id, Decision::Reject, None, false, now())
+        .await
+        .unwrap();
+    let redraft = draft_at(
+        f,
+        &s,
+        tagged(SLACK_ALL_TEAM, thread, "1731600300.000200", "Try again."),
+        now(),
+    )
+    .await;
+    assert_eq!(redraft["status"], "pending_approval", "{redraft}");
+}
+
+async fn a_tagged_message_id_is_kept_and_never_sent(f: &Fixture) {
+    let posted_args = tagged(
+        SLACK_ALL_TEAM,
+        "1731600000.000100",
+        "1731600300.000200",
+        "Posted text.",
+    );
+    let posted = internal_draft(f, "tsk_tk1", posted_args.clone()).await;
+    let undecided = internal_draft(
+        f,
+        "tsk_tk2",
+        tagged(
+            SLACK_ALL_TEAM,
+            "1731600000.000100",
+            "1731600600.000400",
+            "Never decided.",
+        ),
+    )
+    .await;
+
+    // Approved: what reaches Slack has no `message_ts`.
+    decide(f, &posted, Decision::Approve, None, false, hours(2))
+        .await
+        .unwrap();
+    let writes = f.slack.writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0].args,
+        json!({"channel": SLACK_ALL_TEAM, "thread_ts": "1731600000.000100", "text": "Posted text."})
+    );
+    // The ledger's edit distance measures the text, not the id: unchanged is 0.
+    let rows = f
+        .stores
+        .approvals
+        .ledger(&LedgerQuery::all(now() - Duration::days(365)))
+        .await
+        .unwrap();
+    let row = rows.iter().find(|r| r.id == posted).unwrap();
+    assert_eq!(row.edit_distance, Some(0.0));
+
+    // Expiry keeps it.
+    let swept = f.svc.sweep_slack_drafts(hours(24)).await.unwrap();
+    assert_eq!(swept.expired, 1);
+    let expired = item(f, &undecided).await;
+    assert_eq!(expired.status, Status::Expired);
+    assert_eq!(
+        expired.args,
+        json!({
+            "channel": SLACK_ALL_TEAM, "thread_ts": "1731600000.000100",
+            "message_ts": "1731600600.000400", "text": EXPIRED_TEXT,
+        })
+    );
+
+    // So does the purge of a decided draft's text.
+    let swept = f.svc.sweep_slack_drafts(hours(26)).await.unwrap();
+    assert_eq!(swept.redacted, 1);
+    let gone = item(f, &posted).await;
+    assert_eq!(
+        gone.args,
+        json!({
+            "channel": SLACK_ALL_TEAM, "thread_ts": "1731600000.000100",
+            "message_ts": "1731600300.000200", "text": EXPIRED_TEXT,
+        })
+    );
+    assert_eq!(gone.args_hash, args_hash(&posted_args));
+
+    // An approved tag draft still blocks a second one for that message, after the purge.
+    let s = session(f, "tsk_tk3").await;
+    let again = draft_at(f, &s, posted_args, hours(27)).await;
+    assert_eq!(again["status"], "already_drafted");
+    assert_eq!(again["approval_id"], json!(posted));
+}
+
+// ----- the pending list for the App Home ---------------------------------------------------
+
+async fn the_pending_list_is_oldest_first_and_capped(f: &Fixture) {
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let s = session(f, &format!("tsk_pl{i}")).await;
+        let res = draft_at(
+            f,
+            &s,
+            reply(SLACK_ALL_TEAM, &format!("173160000{i}.000100"), "x"),
+            now() + Duration::minutes(i),
+        )
+        .await;
+        ids.push(res["approval_id"].as_str().unwrap().to_string());
+    }
+    // Decided items, and someone else's, are left out.
+    decide(f, &ids[1], Decision::Reject, None, false, now())
+        .await
+        .unwrap();
+    let ben = f
+        .svc
+        .create_session("ben", "reply-test", "tsk_plben", None, now())
+        .await
+        .unwrap();
+    draft_at(
+        f,
+        &ben,
+        reply(SLACK_ALL_TEAM, "1731609999.000100", "x"),
+        now(),
+    )
+    .await;
+
+    let (items, total) = f.svc.pending_approvals(SLACK_PM, 50).await.unwrap();
+    let got: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(got, vec![&ids[0], &ids[2], &ids[3], &ids[4]]);
+    assert_eq!(total, 4);
+    assert!(items.iter().all(|i| i.status == Status::Pending));
+    let (items, total) = f.svc.pending_approvals(SLACK_PM, 2).await.unwrap();
+    let got: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!((got, total), (vec![ids[0].as_str(), ids[2].as_str()], 4));
+}
+
 // ----- over HTTP ----------------------------------------------------------------------------
 
 const SERVICE_TOKEN: &str = "test-service-token-0123456789abcdef";
@@ -1095,4 +1317,126 @@ async fn decision_answers_over_http() {
         !ledger.to_string().contains("[expired]"),
         "no args in the ledger"
     );
+}
+
+#[tokio::test]
+async fn the_bot_lists_a_members_pending_approvals_over_http() {
+    let s = start().await;
+    let jira = Some(("jira_read", json!({"key": "PM-101"})));
+    // 52 pending drafts, oldest first by creation, and one decided.
+    let mut ids = Vec::new();
+    for i in 0..52i64 {
+        let at = Utc::now() - Duration::minutes(120 - i);
+        let session =
+            s.f.svc
+                .create_session(
+                    SLACK_PM,
+                    "reply-test",
+                    &format!("tsk_hp{i}"),
+                    Some(Duration::hours(48)),
+                    at,
+                )
+                .await
+                .unwrap();
+        let res =
+            s.f.svc
+                .call(
+                    &session,
+                    "slack_post_reply",
+                    reply(SLACK_ALL_TEAM, &format!("17316{i:05}.000100"), "x"),
+                    at,
+                )
+                .await
+                .unwrap();
+        ids.push(res["approval_id"].as_str().unwrap().to_string());
+    }
+    let decided = s
+        .draft(
+            "tsk_hpd",
+            jira,
+            reply(SLACK_ALL_TEAM, "1731699999.000100", "x"),
+            0,
+        )
+        .await;
+    s.decide(
+        &decided,
+        json!({"decided_by": SLACK_PM, "decision": "reject"}),
+    )
+    .await;
+
+    let get = |token: &'static str, query: String| {
+        let base = s.base.clone();
+        async move {
+            let res = reqwest::Client::new()
+                .get(format!("{base}/internal/approvals{query}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            let status = res.status().as_u16();
+            (status, res.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+
+    // The bot: pending only, oldest first, at most 50, with the total. `status` is ignored.
+    for query in [
+        format!("?user={SLACK_PM}"),
+        format!("?user={SLACK_PM}&status=rejected"),
+        format!("?user={SLACK_PM}&status=nonsense"),
+    ] {
+        let (status, body) = get(BOT_TOKEN, query.clone()).await;
+        assert_eq!(status, 200, "{query}: {body}");
+        assert_eq!(body["total"], 52, "{query}");
+        let listed: Vec<&str> = body["approvals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .collect();
+        let want: Vec<&str> = ids[..50].iter().map(String::as_str).collect();
+        assert_eq!(listed, want, "{query}");
+        assert!(body["approvals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["status"] == "pending"));
+        assert!(body.get("items").is_none());
+    }
+    // Each item reads as `GET /internal/approvals/{id}` returns it.
+    let (_, one) = get(BOT_TOKEN, format!("/{}", ids[0])).await;
+    let (_, body) = get(BOT_TOKEN, format!("?user={SLACK_PM}")).await;
+    assert_eq!(body["approvals"][0], one);
+
+    // A non-member, a team bot's identity, or no user: refused.
+    for query in ["?user=eve", "?user=bots.docs"] {
+        let (status, body) = get(BOT_TOKEN, query.into()).await;
+        assert_eq!(status, 403, "{query}");
+        assert_eq!(
+            body["error"],
+            "this token may list approvals for team members only"
+        );
+    }
+    let (status, body) = get(BOT_TOKEN, String::new()).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (400, Some("`user` is required"))
+    );
+
+    // The orchestrator: unchanged. Every item, newest first, `status` filters, no cap.
+    let (status, body) = get(SERVICE_TOKEN, format!("?user={SLACK_PM}")).await;
+    assert_eq!(status, 200);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 53);
+    assert_eq!(items[0]["id"], json!(decided));
+    assert!(body.get("total").is_none());
+    let (_, body) = get(SERVICE_TOKEN, format!("?user={SLACK_PM}&status=rejected")).await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    let (_, body) = get(SERVICE_TOKEN, format!("?user={SLACK_PM}&status=pending")).await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 52);
+    assert_eq!(body["items"][0]["id"], json!(ids[51]));
+    let (status, _) = get(SERVICE_TOKEN, format!("?user={SLACK_PM}&status=nonsense")).await;
+    assert_eq!(status, 400);
+    // ...and may list anyone's.
+    let (status, _) = get(SERVICE_TOKEN, "?user=eve".into()).await;
+    assert_eq!(status, 200);
 }

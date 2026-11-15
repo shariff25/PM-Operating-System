@@ -13,6 +13,9 @@ use crate::grade::normalize_text;
 /// The `bot:` value that means "the personal bot of whoever the tasks are for".
 pub const PERSONAL_BOT: &str = "personal";
 
+/// The levels a category may run at (`docs/staff-principal-spec.md` §6).
+pub const LEVELS: [&str; 3] = ["senior", "staff", "principal"];
+
 /// A category: one bot, a pass bar, and the tasks it is graded on.
 #[derive(Debug, Clone)]
 pub struct Category {
@@ -23,6 +26,9 @@ pub struct Category {
     pub pass_bar: Option<f64>,
     /// How many times each task runs (at least 1).
     pub repeats: u32,
+    /// The level every task runs at (`senior`, `staff` or `principal`), sent as the task's
+    /// own `level`. `None`: the requester's setting in the runtime.
+    pub level: Option<String>,
     pub description: String,
     pub tasks: Vec<EvalTask>,
 }
@@ -36,6 +42,8 @@ struct CategoryFile {
     pass_bar: Option<f64>,
     #[serde(default)]
     repeats: Option<u32>,
+    #[serde(default)]
+    level: Option<String>,
     description: String,
 }
 
@@ -237,6 +245,13 @@ pub fn load_category(root: &Path, name: &str) -> Result<Category, SpecErrors> {
             "{shown}: `repeats` is 0; each task runs at least once"
         ));
     }
+    if let Some(level) = &file.level {
+        if !LEVELS.contains(&level.as_str()) {
+            errors.push(format!(
+                "{shown}: `level` is `{level}`; use senior, staff or principal"
+            ));
+        }
+    }
     if file.description.trim().is_empty() {
         errors.push(format!("{shown}: `description` is empty"));
     }
@@ -298,6 +313,7 @@ pub fn load_category(root: &Path, name: &str) -> Result<Category, SpecErrors> {
         bot: file.bot,
         pass_bar: file.pass_bar,
         repeats: file.repeats.unwrap_or(1).max(1),
+        level: file.level,
         description: file.description.trim().to_string(),
         tasks,
     })

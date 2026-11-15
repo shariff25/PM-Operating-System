@@ -8,7 +8,8 @@
 //!
 //! Slack drafts keep their text a limited time (`docs/slack-reply-spec.md` §3): an undecided
 //! one becomes `expired` after `PMOS_SLACK_DRAFT_TTL_HOURS`, and a decided one loses its text
-//! that long after its decision. Either way only `channel`, `thread_ts` and the args hash stay.
+//! that long after its decision. Either way only `channel`, `thread_ts`, `message_ts` and the
+//! args hash stay.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -29,15 +30,17 @@ pub const GRANT_TTL_MINUTES: i64 = 15;
 /// The Slack drafts that expire and lose their text after `PMOS_SLACK_DRAFT_TTL_HOURS`
 /// (`docs/slack-reply-spec.md` §3).
 pub const SLACK_DRAFT_TOOLS: [&str; 2] = ["slack.post_reply", "slack.send_message"];
-/// The one tool that drafts at most once per thread.
+/// The one tool that drafts at most once per thread, or once per message with `message_ts`.
 pub const REPLY_TOOL: &str = "slack.post_reply";
 /// What a removed string argument reads.
 pub const EXPIRED_TEXT: &str = "[expired]";
 /// The arguments an expired or decided Slack draft keeps: where it was for, not what it said.
-const KEPT_ARGS: [&str; 2] = ["channel", "thread_ts"];
+/// `message_ts` is the tagged message a reply answers (`docs/slack-mentions-and-home-spec.md`
+/// §3): an id, not text.
+pub const KEPT_ARGS: [&str; 3] = ["channel", "thread_ts", "message_ts"];
 
 /// `args` with every string replaced by [`EXPIRED_TEXT`], at any depth, except a top-level
-/// `channel` and `thread_ts`.
+/// `channel`, `thread_ts` and `message_ts`.
 pub fn redact_args(args: &Value) -> Value {
     fn all(value: &Value) -> Value {
         match value {
@@ -65,6 +68,12 @@ pub fn redact_args(args: &Value) -> Value {
 /// The thread a `slack.post_reply` call is for: its `channel` and `thread_ts`.
 pub fn reply_thread(args: &Value) -> Option<(&str, &str)> {
     Some((args["channel"].as_str()?, args["thread_ts"].as_str()?))
+}
+
+/// The message a `slack.post_reply` call answers, if it names one: its `message_ts`. A PM
+/// who tags PM OS twice in one thread gets a draft for each tag.
+pub fn reply_message(args: &Value) -> Option<&str> {
+    args["message_ts"].as_str()
 }
 
 /// SHA-256 of the canonical JSON form of `args` (object keys sorted at every level).
@@ -284,11 +293,13 @@ pub enum Drafted {
 }
 
 /// Does `item` stop `user` drafting another reply to `thread`? It does if it is their reply
-/// to that thread, created at or after `since`, and waiting, being posted or posted.
+/// to that thread, created at or after `since`, and waiting, being posted or posted. With
+/// `message` (the new call's `message_ts`), only a reply to that same message does.
 pub fn blocks_reply(
     item: &ApprovalItem,
     user: &str,
     thread: (&str, &str),
+    message: Option<&str>,
     since: DateTime<Utc>,
 ) -> bool {
     item.user == user
@@ -299,6 +310,7 @@ pub fn blocks_reply(
             Status::Pending | Status::Executing | Status::Approved
         )
         && reply_thread(&item.args) == Some(thread)
+        && message.is_none_or(|m| reply_message(&item.args) == Some(m))
 }
 
 /// Grants, approval items and the feedback ledger (`ledger.rs`). `session_key` is the
@@ -331,8 +343,9 @@ pub trait ApprovalRepo: Send + Sync {
 
     /// Create a pending reply item, unless the same user has a reply to the same thread
     /// (`channel` and `thread_ts`) created at or after `since` that is pending, executing or
-    /// approved: then return that one and create nothing. Of two concurrent calls for one
-    /// thread, exactly one creates. Arguments that name no thread are created as usual.
+    /// approved: then return that one and create nothing. When the new call names a
+    /// `message_ts`, only a reply to that same message counts. Of two concurrent calls for
+    /// one thread, exactly one creates. Arguments that name no thread are created as usual.
     async fn create_reply(
         &self,
         new: NewItem<'_>,
@@ -504,7 +517,7 @@ impl ApprovalRepo for MemoryApprovals {
             let existing = state
                 .items
                 .values()
-                .filter(|i| blocks_reply(i, new.user, thread, since))
+                .filter(|i| blocks_reply(i, new.user, thread, reply_message(new.args), since))
                 .max_by_key(|i| i.created_at);
             if let Some(existing) = existing {
                 return Ok(Drafted::Existing(existing.clone()));
@@ -757,5 +770,19 @@ mod tests {
         );
         assert_eq!(reply_thread(&args), Some(("C0PMTEAM", "1731600000.000100")));
         assert_eq!(reply_thread(&json!({"channel": "C1"})), None);
+        assert_eq!(reply_message(&args), None);
+        // The tagged message is kept too: it is an id.
+        let tagged = json!({
+            "channel": "C0PMTEAM", "thread_ts": "1731600000.000100",
+            "message_ts": "1731600300.000200", "text": "Yes.",
+        });
+        assert_eq!(
+            redact_args(&tagged),
+            json!({
+                "channel": "C0PMTEAM", "thread_ts": "1731600000.000100",
+                "message_ts": "1731600300.000200", "text": EXPIRED_TEXT,
+            })
+        );
+        assert_eq!(reply_message(&tagged), Some("1731600300.000200"));
     }
 }

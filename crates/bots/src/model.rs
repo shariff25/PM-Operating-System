@@ -103,6 +103,47 @@ impl Source {
 }
 
 text_enum!(
+    /// The altitude a PM works at (`docs/staff-principal-spec.md` §1). `senior` is the default.
+    #[derive(Default)]
+    Level {
+        #[default]
+        Senior = "senior",
+        Staff = "staff",
+        Principal = "principal",
+    }
+);
+
+impl Level {
+    /// "Senior", "Staff", "Principal": how a PM reads it.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Senior => "Senior",
+            Self::Staff => "Staff",
+            Self::Principal => "Principal",
+        }
+    }
+
+    /// `senior`, `staff` or `principal`, or why not, for a `400`.
+    pub fn parse_or_explain(s: &str) -> Result<Self, String> {
+        Self::parse(s.trim()).ok_or_else(|| {
+            format!(
+                "`{}` isn't a level: use senior, staff or principal",
+                s.trim()
+            )
+        })
+    }
+}
+
+/// A PM's own working preferences (`member_settings`). A PM with no row reads as the
+/// defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberSettings {
+    pub handle: String,
+    pub level: Level,
+    pub updated_at: DateTime<Utc>,
+}
+
+text_enum!(
     TaskStatus {
         Queued = "queued",
         Working = "working",
@@ -143,6 +184,10 @@ pub struct Task {
     pub approvals: Vec<String>,
     pub slack: Option<SlackRef>,
     pub routine_id: Option<String>,
+    /// The task's own level, set only by the evals client (a benchmark category's level).
+    /// Without one, the claim uses the requester's setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<Level>,
     pub attempts: i32,
     /// The worker holding the current claim, while `working`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,6 +224,7 @@ impl Task {
             approvals: Vec::new(),
             slack,
             routine_id,
+            level: None,
             attempts: 0,
             worker: None,
             lease_until: None,

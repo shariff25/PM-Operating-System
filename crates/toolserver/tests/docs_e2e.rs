@@ -423,10 +423,10 @@ async fn the_bot_token_is_limited_to_its_own_skills() {
         .await
         .unwrap();
     assert_eq!(res.status(), 403);
-    // ... nor inbox listings, grants, linking or reindexing. (It may read and decide one
-    // item, for approval cards: `tests/bots.rs`.)
+    // ... nor grants, credential listings or reindexing. (It may read and decide one item,
+    // for approval cards, and list a member's pending items, for the App Home:
+    // `tests/bots.rs`.)
     for (method, path) in [
-        ("GET", "/internal/approvals?user=ana"),
         ("POST", "/internal/grants"),
         ("POST", "/internal/reindex"),
         ("GET", "/internal/credentials?user=ana"),

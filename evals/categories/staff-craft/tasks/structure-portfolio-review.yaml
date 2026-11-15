@@ -1,0 +1,23 @@
+# seed: replace with case cards
+# The portfolio-review skill calls jira.rollup and quotes its counts and links exactly. The fake
+# rollup returns six issues by project: PM 3 and CLD 3, and PM-102 blocks CLD-13 (spec §3). The
+# portfolio-review template opens Bottom line, Where things stand, Dependencies and conflicts,
+# At risk. The title starts `Portfolio review:`. The checks name the blocking link, which the
+# model cannot guess; the counts are in the tool result the draft must quote.
+id: structure-portfolio-review
+ask: "Draft anyway, no questions: a portfolio review in the PM space across the PM project and the CLD project (use the cross-team rollup for project in (PM, CLD)), for the Acme Vault and Acme Cloud directors."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Portfolio review:", "Where things stand", "Dependencies and conflicts", "PM-102", "CLD-13"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: portfolio-review
+tags:
+  - model/draft-content

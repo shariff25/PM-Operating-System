@@ -21,9 +21,9 @@ use tokio_util::sync::CancellationToken;
 use crate::catalog::Catalog;
 use crate::clients::{valid_approval_id, ApprovalState, CallError, Gateway, TaskDraft, ToolServer};
 use crate::model::{
-    self, ApprovalOutcome, ChecklistItem, Draft, NewNotification, Notification, NotificationKind,
-    Routine, Schedule, SlackRef, Source, Task, TaskStatus, TraceKind, GAVE_UP_REASON,
-    LEASE_SECONDS, MAX_ATTEMPTS, RETRY_EVENT,
+    self, ApprovalOutcome, ChecklistItem, Draft, Level, MemberSettings, NewNotification,
+    Notification, NotificationKind, Routine, Schedule, SlackRef, Source, Task, TaskStatus,
+    TraceKind, GAVE_UP_REASON, LEASE_SECONDS, MAX_ATTEMPTS, RETRY_EVENT,
 };
 use crate::routines::{self, Parsed};
 use crate::store::{
@@ -98,6 +98,8 @@ pub struct NewTask {
     pub text: String,
     pub source: Source,
     pub slack: Option<SlackRef>,
+    /// The task's own level (the evals client only; `app.rs` checks).
+    pub level: Option<Level>,
 }
 
 /// What the harness needs to call the gateway for this task: the bot's model role and the
@@ -118,6 +120,8 @@ pub struct Claim {
     pub session_token: String,
     pub lease_until: DateTime<Utc>,
     pub gateway: GatewayHints,
+    /// The level to work at: the task's own, else the requester's setting, else `senior`.
+    pub level: Level,
 }
 
 /// The session token never reaches a log through `Debug`.
@@ -128,6 +132,7 @@ impl std::fmt::Debug for Claim {
             .field("bot", &self.bot.name)
             .field("session_token", &"<redacted>")
             .field("lease_until", &self.lease_until)
+            .field("level", &self.level)
             .finish()
     }
 }
@@ -261,7 +266,7 @@ impl Runtime {
         self.catalog()
             .may_use(&new.requested_by, &bot)
             .map_err(Error::Forbidden)?;
-        let task = Task::queued(
+        let mut task = Task::queued(
             &bot.name,
             &new.requested_by,
             new.source,
@@ -270,6 +275,7 @@ impl Runtime {
             None,
             now,
         );
+        task.level = new.level;
         self.store.create_task(&task, "queued").await?;
         tracing::info!(task = %task.id, bot = %task.bot, source = %task.source, "task queued");
         self.bump();
@@ -350,7 +356,8 @@ impl Runtime {
                 .await
             {
                 Ok(session_token) => {
-                    tracing::info!(task = %task.id, bot = %bot.name, %worker, attempt = task.attempts, "task claimed");
+                    let level = self.claim_level(&task).await;
+                    tracing::info!(task = %task.id, bot = %bot.name, %worker, attempt = task.attempts, %level, "task claimed");
                     let mut headers = serde_json::Map::new();
                     headers.insert("X-Pmos-User".into(), json!(task.requested_by));
                     headers.insert("X-Pmos-Run".into(), json!(task.id));
@@ -369,6 +376,7 @@ impl Runtime {
                             model: format!("pmos/{model_role}"),
                             headers,
                         },
+                        level,
                         task,
                     }));
                 }
@@ -395,6 +403,22 @@ impl Runtime {
                         "{what} is unavailable right now; try the claim again shortly"
                     )));
                 }
+            }
+        }
+    }
+
+    /// The level a claimed task runs at: its own, else its requester's setting, else
+    /// `senior`. A settings read that fails right after the claim falls back to `senior`
+    /// rather than strand the task.
+    async fn claim_level(&self, task: &Task) -> Level {
+        if let Some(level) = task.level {
+            return level;
+        }
+        match self.store.member_settings(&task.requested_by).await {
+            Ok(settings) => settings.map(|s| s.level).unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(error = %e, task = %task.id, "couldn't read the requester's level; using senior");
+                Level::default()
             }
         }
     }
@@ -759,6 +783,53 @@ impl Runtime {
             );
         }
         Ok(out)
+    }
+
+    // ----- member settings -----------------------------------------------------------------
+
+    /// A PM's settings; an unset level reads as `senior`.
+    pub async fn member_settings(&self, handle: &str) -> Result<MemberSettings> {
+        if !valid_handle(handle) {
+            return Err(Error::BadRequest(format!(
+                "`{handle}` isn't a PM OS handle"
+            )));
+        }
+        Ok(self
+            .store
+            .member_settings(handle)
+            .await?
+            .unwrap_or_else(|| MemberSettings {
+                handle: handle.to_string(),
+                level: Level::default(),
+                updated_at: DateTime::<Utc>::UNIX_EPOCH,
+            }))
+    }
+
+    /// Set a PM's level. Only members of `team.yaml` have settings.
+    pub async fn set_member_level(
+        &self,
+        handle: &str,
+        level: Level,
+        now: DateTime<Utc>,
+    ) -> Result<MemberSettings> {
+        if !valid_handle(handle) {
+            return Err(Error::BadRequest(format!(
+                "`{handle}` isn't a PM OS handle"
+            )));
+        }
+        if !self.catalog().is_member(handle) {
+            return Err(Error::Forbidden(format!(
+                "`{handle}` isn't listed in team.yaml, so has no settings to change"
+            )));
+        }
+        let settings = MemberSettings {
+            handle: handle.to_string(),
+            level,
+            updated_at: now,
+        };
+        self.store.set_member_settings(&settings).await?;
+        tracing::info!(%handle, %level, "level set");
+        Ok(settings)
     }
 
     // ----- routines (D8) -------------------------------------------------------------------

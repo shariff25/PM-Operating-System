@@ -1,0 +1,20 @@
+# seed: replace with case cards
+# The vision-doc skill titles its draft `Vision:` and follows content/templates/vision.md: a
+# narrative of the product in 2 to 3 years, from the customer's side.
+id: structure-vision-doc
+ask: "Draft anyway, no questions: a vision doc in the PM space for Acme Vault in 2029, from the October Acme Cloud call notes (Confluence page 9001) and Jira epic PM-101."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Vision:", "The future in one paragraph", "What changes for them", "What must be true", "Signposts"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: vision-doc
+tags:
+  - model/draft-content

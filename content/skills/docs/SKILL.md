@@ -9,6 +9,7 @@ metadata:
   tools: "docs.search docs.read"
   surfaces: "slack cli"
   ships-in: "phase-0"
+  track: "Everyday"
 ---
 
 # /docs

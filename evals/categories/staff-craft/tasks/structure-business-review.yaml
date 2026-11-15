@@ -1,0 +1,20 @@
+# seed: replace with case cards
+# The business-review skill titles its draft `Business review:` and follows
+# content/templates/business-review.md: results against plan, then why, then what changes.
+id: structure-business-review
+ask: "Draft anyway, no questions: a business review in the PM space for the Acme Vault console last quarter, from the PM and CLD Jira projects and the October Acme Cloud call notes (Confluence page 9001), for the directors."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Business review:", "Results against plan", "Why", "What we are changing", "Decisions needed"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: business-review
+tags:
+  - model/draft-content

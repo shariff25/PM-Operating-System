@@ -9,6 +9,7 @@ metadata:
   tools: "context.search context.read jira.search jira.create_issue slack.send_message"
   surfaces: "slack web cli"
   ships-in: "phase-0"
+  track: "Everyday"
 ---
 
 # /meeting-notes

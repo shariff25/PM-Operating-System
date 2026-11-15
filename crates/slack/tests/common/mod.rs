@@ -1,7 +1,8 @@
 //! A fake Slack for the Socket Mode tests: `apps.connections.open`, the Socket Mode
 //! websocket (scripted per connection, or fed live by the test), and the Web API calls the
 //! bot makes (`chat.postMessage`, `chat.update`, `chat.postEphemeral`, `views.open`,
-//! `users.info`, `conversations.open`), each recorded with when it arrived.
+//! `views.publish`, `users.info`, `conversations.open`, `chat.getPermalink`), each recorded
+//! with when it arrived.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
@@ -47,6 +48,8 @@ pub struct FakeSlack {
     pub tz: Mutex<HashMap<String, String>>,
     /// `users.info` user objects by id (name, `profile.email`), for onboarding.
     pub users: Mutex<HashMap<String, Value>>,
+    /// `chat.getPermalink` answers `channel_not_found` for these channels.
+    pub no_permalink: Mutex<Vec<String>>,
 }
 
 impl FakeSlack {
@@ -85,6 +88,7 @@ pub fn routes() -> Router<Arc<FakeSlack>> {
     Router::new()
         .route("/api/apps.connections.open", post(open))
         .route("/api/users.info", get(users_info))
+        .route("/api/chat.getPermalink", get(permalink))
         .route("/api/{method}", post(web_api))
         .route("/socket", get(socket))
 }
@@ -147,8 +151,29 @@ async fn web_api(
             }
         }
         "views.open" => Json(json!({"ok": true})),
+        "views.publish" => Json(json!({"ok": true, "view": body["view"]})),
         _ => Json(json!({"ok": false, "error": "unknown_method"})),
     }
+}
+
+async fn permalink(
+    State(s): State<Arc<FakeSlack>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let channel = q.get("channel").cloned().unwrap_or_default();
+    let ts = q.get("message_ts").cloned().unwrap_or_default();
+    s.calls.lock().unwrap().push(Call {
+        at: Instant::now(),
+        method: "chat.getPermalink".into(),
+        body: json!({"channel": channel, "message_ts": ts}),
+    });
+    if s.no_permalink.lock().unwrap().contains(&channel) {
+        return Json(json!({"ok": false, "error": "channel_not_found"}));
+    }
+    Json(json!({
+        "ok": true, "channel": channel,
+        "permalink": format!("https://acme.slack.com/archives/{channel}/p{}", ts.replace('.', "")),
+    }))
 }
 
 async fn users_info(

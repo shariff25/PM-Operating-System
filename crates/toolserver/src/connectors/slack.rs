@@ -283,6 +283,8 @@ impl Connector for Slack {
         let text = arg(args, "text")?;
         match action {
             "post_reply" => {
+                // Only the channel, thread and text are sent: `message_ts` (the tagged message
+                // the reply answers) is PM OS's own bookkeeping and never reaches Slack.
                 let ts = slack_ts(arg(args, "thread_ts")?)?;
                 self.post(caller, channel, Some(ts), text).await
             }

@@ -1101,7 +1101,7 @@ async fn slack_search_thread_and_reply_as_the_pm() {
         .write(
             ana(),
             "post_reply",
-            &json!({"channel": "C0FIELD", "thread_ts": "1731500000.000100", "text": "Yes, in 4.2."}),
+            &json!({"channel": "C0FIELD", "thread_ts": "1731500000.000100", "message_ts": "1731500050.000200", "text": "Yes, in 4.2."}),
         )
         .await
         .unwrap();
@@ -1115,6 +1115,10 @@ async fn slack_search_thread_and_reply_as_the_pm() {
     let form = post.form();
     assert_eq!(form["thread_ts"], "1731500000.000100");
     assert_eq!(form["text"], "Yes, in 4.2.\n\n_Drafted with PM OS_");
+    assert!(
+        !form.contains_key("message_ts"),
+        "the tagged message's id is PM OS's own, never sent: {form:?}"
+    );
     l.cancel.cancel();
 }
 

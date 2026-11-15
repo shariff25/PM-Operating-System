@@ -79,6 +79,33 @@ fn valid_tree_is_clean() {
     let ask = &report.skills[0];
     assert_eq!(ask.tools, vec!["context.search", "jira.create_issue"]);
     assert_eq!(ask.surfaces, vec!["slack", "web", "cli"]);
+    assert_eq!(ask.track, None, "track is optional");
+}
+
+#[test]
+fn skill_track_is_parsed_and_checked() {
+    let dir = valid_tree();
+    let meta = format!("{GOOD_META}  track: \"Strategy and decisions\"\n");
+    write(dir.path(), "skills/ask/SKILL.md", &skill("ask", &meta));
+    let report = run(&dir);
+    assert!(report.diagnostics.is_empty(), "{:#?}", report.diagnostics);
+    assert_eq!(
+        report.skills[0].track.as_deref(),
+        Some("Strategy and decisions")
+    );
+
+    // 40 characters is the most.
+    let meta = format!("{GOOD_META}  track: \"{}\"\n", "x".repeat(40));
+    write(dir.path(), "skills/ask/SKILL.md", &skill("ask", &meta));
+    assert!(run(&dir).diagnostics.is_empty());
+
+    for bad in ["", "   ", &"x".repeat(41)] {
+        let meta = format!("{GOOD_META}  track: \"{bad}\"\n");
+        write(dir.path(), "skills/ask/SKILL.md", &skill("ask", &meta));
+        let report = run(&dir);
+        assert_code(&report, "skill-track", Severity::Error);
+        assert!(report.skills.is_empty(), "{bad:?}");
+    }
 }
 
 #[test]
@@ -443,26 +470,45 @@ fn repo_content_passes() {
     assert_eq!(
         names,
         vec![
+            "advisory-draft",
             "ai-feature-spec",
+            "alignment-plan",
             "ask",
+            "bets-register",
+            "business-review",
             "call-synth",
+            "coach-feedback",
             "competitive-brief",
             "decision-doc",
             "docs",
             "eval-plan",
+            "exec-brief",
             "experiment-design",
             "experiment-readout",
+            "investment-case",
+            "jira-draft",
+            "launch-checklist",
             "meeting-notes",
             "metrics-tree",
+            "okr-draft",
             "opportunity-sizing",
+            "partner-brief",
+            "platform-strategy",
+            "poc-plan",
+            "portfolio-review",
             "prd-draft",
             "pre-mortem",
+            "pricing-proposal",
             "prioritize",
             "problem-framing",
             "product-critique",
+            "release-notes",
             "review",
+            "roadmap-tradeoffs",
             "slack-reply",
+            "status-update",
             "strategy-doc",
+            "vision-doc",
         ]
     );
 }

@@ -3,10 +3,10 @@
 //!
 //! | Client | May |
 //! | --- | --- |
-//! | `slack` | create tasks as `X-Pmos-User`; read that PM's tasks and routines; read the shared notification feed and the bot list (no PM needed) |
+//! | `slack` | create tasks as `X-Pmos-User`; read that PM's tasks and routines; read and set that PM's settings; read the shared notification feed and the bot list (no PM needed) |
 //! | `worker` | claim, heartbeat, events, trace, complete, fail |
-//! | `console` | read everything; pause, resume and delete routines; cancel tasks |
-//! | `evals` | create tasks with `source: "eval"`, and read them and their drafts |
+//! | `console` | read everything, settings included; pause, resume and delete routines; cancel tasks |
+//! | `evals` | create tasks with `source: "eval"` (and a task's own `level`), and read them and their drafts |
 //!
 //! A task's drafts (`GET /v1/tasks/{id}/drafts`) are for the console and evals only: the
 //! runtime reads them from the tool server with its own service token, so the evals client
@@ -33,7 +33,8 @@ use serde_json::{json, Value};
 
 use crate::config::{Client, ClientKind};
 use crate::model::{
-    self, ChecklistItem, Draft, Schedule, SlackRef, Source, Task, TaskStatus, TraceKind,
+    self, ChecklistItem, Draft, Level, MemberSettings, Schedule, SlackRef, Source, Task,
+    TaskStatus, TraceKind,
 };
 use crate::runtime::{Error, NewTask, RoutineChange, Runtime, WorkerEvent};
 use crate::store::TaskFilter;
@@ -85,6 +86,10 @@ pub fn router(rt: Arc<Runtime>, clients: Vec<Client>) -> Router {
         .route("/worker/tasks/{id}/complete", post(complete))
         .route("/worker/tasks/{id}/fail", post(fail))
         .route("/notifications", get(notifications))
+        .route(
+            "/members/{handle}/settings",
+            get(get_member_settings).put(put_member_settings),
+        )
         .route("/routines/parse", post(parse_routine))
         .route("/routines", post(create_routine).get(list_routines))
         .route(
@@ -282,6 +287,9 @@ struct CreateTask {
     source: Source,
     #[serde(default)]
     slack: Option<SlackRef>,
+    /// The task's own level: the evals client only.
+    #[serde(default)]
+    level: Option<Level>,
 }
 
 async fn create_task(
@@ -295,6 +303,11 @@ async fn create_task(
         "create tasks",
     )?;
     let req: CreateTask = body(&bytes)?;
+    if req.level.is_some() && caller.kind != ClientKind::Evals {
+        return Err(forbidden(
+            "only the evals client sets a task's level; a PM's own level comes from their settings",
+        ));
+    }
     match caller.kind {
         ClientKind::Slack => {
             if req.requested_by != caller.user() {
@@ -322,6 +335,7 @@ async fn create_task(
                 text: req.text,
                 source: req.source,
                 slack: req.slack,
+                level: req.level,
             },
             model::now(),
         )
@@ -700,6 +714,61 @@ async fn notifications(
         .notifications(after, Duration::from_millis(q.wait_ms.unwrap_or(0)))
         .await?;
     Ok(Json(json!({"cursor": cursor.to_string(), "items": items})).into_response())
+}
+
+// ----- member settings --------------------------------------------------------------------
+
+/// `{"handle": "...", "level": "senior"}`.
+fn settings_reply(s: &MemberSettings) -> Response {
+    Json(json!({"handle": s.handle, "level": s.level})).into_response()
+}
+
+/// The Slack client reads and sets only the settings of the PM in `X-Pmos-User`.
+fn own_settings(caller: &Caller, handle: &str) -> Result<(), Error> {
+    pm(caller)?;
+    if caller.kind == ClientKind::Slack && handle != caller.user() {
+        return Err(forbidden(
+            "the Slack client reads and sets only the settings of the PM in X-Pmos-User",
+        ));
+    }
+    Ok(())
+}
+
+async fn get_member_settings(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(handle): Path<String>,
+) -> Reply {
+    allow(
+        &caller,
+        &[ClientKind::Slack, ClientKind::Console],
+        "read member settings",
+    )?;
+    own_settings(&caller, &handle)?;
+    Ok(settings_reply(&state.rt.member_settings(&handle).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutSettings {
+    level: String,
+}
+
+async fn put_member_settings(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(handle): Path<String>,
+    bytes: Bytes,
+) -> Reply {
+    allow(&caller, &[ClientKind::Slack], "change member settings")?;
+    own_settings(&caller, &handle)?;
+    let req: PutSettings = body(&bytes)?;
+    let level = Level::parse_or_explain(&req.level).map_err(bad)?;
+    let settings = state
+        .rt
+        .set_member_level(&handle, level, model::now())
+        .await?;
+    Ok(settings_reply(&settings))
 }
 
 // ----- routines ---------------------------------------------------------------------------

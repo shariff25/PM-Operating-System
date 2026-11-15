@@ -12,10 +12,16 @@
 # a bot reminder (…900.000500), a pricing question the sources can't answer in #field-questions
 # (C0FIELD 1731601200.000600), and two mentions in one #globex-shared thread (C0GLOBEXCX
 # 1731601500.000700). They run as `evals`, the eval stack's member with that Slack id.
+#
+# The tagged-* tasks start with the `[tagged in Slack]` marker the Slack app sends when the PM
+# tags PM OS in a thread (docs/slack-mentions-and-home-spec.md §2): the thread is named, so the
+# bot reads it, skips the search and drafts one reply there. tagged-answers-the-thread is a tag
+# in the #pm-team SAML thread (C0PMTEAM 1731600000.000100, tag 1731600120.000150).
 name: slack-reply
 bot: personal
 description: >-
-  The Slack reply assistant: a PM's personal bot finds questions asked of the PM, or is asked
-  to reply in a thread, and drafts one grounded reply per thread for the PM to approve,
+  The Slack reply assistant: a PM's personal bot finds questions asked of the PM, is asked
+  to reply in a thread, or is tagged in one, and drafts one grounded reply per thread (one per
+  tagged message) for the PM to approve,
   skipping threads that don't need one. Seed tasks against the fake Slack, docs and Jira
   fixtures.

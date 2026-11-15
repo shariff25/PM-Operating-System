@@ -63,6 +63,7 @@ fn skill(name: &str, tools: &[&str]) -> Skill {
         tools: tools.iter().map(|t| t.to_string()).collect(),
         surfaces: vec!["slack".into()],
         ships_in: None,
+        track: None,
     }
 }
 
@@ -434,6 +435,30 @@ impl Env {
         Some(Self::with_store(store, Some(pg)).await)
     }
 
+    /// A second runtime on this one's Postgres database, as after a restart. `None` in
+    /// memory. Finish it before this one.
+    pub async fn restarted(&self) -> Option<Self> {
+        let pg = self.pg.as_ref()?;
+        let store: Arc<dyn BotsStore> = Arc::new(pg.reconnect().await);
+        Some(Self::with_store(store, None).await)
+    }
+
+    pub async fn put(
+        &self,
+        path: &str,
+        client: &str,
+        user: Option<&str>,
+        body: Value,
+    ) -> (u16, Value) {
+        let res = self
+            .req(reqwest::Method::PUT, path, client, user)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        read(res).await
+    }
+
     pub async fn finish(self) {
         self.stop.cancel();
         if let Some(pg) = self.pg {
@@ -600,6 +625,25 @@ impl TestPg {
             base,
             schema,
         })
+    }
+
+    /// A new pool on the same schema, as a restarted process would open.
+    pub async fn reconnect(&self) -> PgStore {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(
+                self.base
+                    .clone()
+                    .options([("search_path", self.schema.as_str())]),
+            )
+            .await
+            .expect("reconnect to test schema");
+        let store = PgStore::from_pool(pool);
+        store
+            .migrate()
+            .await
+            .expect("migrations are already applied");
+        store
     }
 
     pub async fn drop_schema(self) {

@@ -20,6 +20,8 @@ pub const DEFAULT_STALE_AFTER_DAYS: i64 = 90;
 /// Agent Skills spec limits.
 pub const MAX_SKILL_NAME_LEN: usize = 64;
 pub const MAX_SKILL_DESCRIPTION_LEN: usize = 1024;
+/// The longest `metadata.track`: a catalog heading, such as "Strategy and decisions".
+pub const MAX_SKILL_TRACK_LEN: usize = 40;
 
 /// Metadata keys every PM OS skill must set.
 pub const REQUIRED_SKILL_METADATA: [&str; 5] = ["owner", "version", "model", "data-class", "tools"];
@@ -436,6 +438,26 @@ impl Cx {
             }
         }
 
+        // A catalog heading (the Slack App Home groups skills by it): optional, but not empty.
+        let track = meta.get("track").map(|s| s.trim().to_string());
+        if let Some(track) = &track {
+            if track.is_empty() {
+                self.error(
+                    "skill-track",
+                    path,
+                    "track is empty; set it or leave it out",
+                );
+                ok = false;
+            } else if track.chars().count() > MAX_SKILL_TRACK_LEN {
+                self.error(
+                    "skill-track",
+                    path,
+                    format!("track is longer than {MAX_SKILL_TRACK_LEN} characters"),
+                );
+                ok = false;
+            }
+        }
+
         if !ok {
             return None;
         }
@@ -449,6 +471,7 @@ impl Cx {
             tools,
             surfaces,
             ships_in,
+            track,
         })
     }
 

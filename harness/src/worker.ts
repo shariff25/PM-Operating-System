@@ -68,6 +68,8 @@ export interface WorkerConfig {
   maxSteps?: number;
   logger?: Logger;
   fetch?: typeof fetch;
+  /** The clock for the system prompt's date line (tests). Defaults to the real time. */
+  now?: () => Date;
   /** Builds the chat model for a task instead of the gateway model (tests). */
   model?: (claim: Claim, headers: Record<string, string>) => BaseChatModel;
 }
@@ -102,12 +104,27 @@ export function gatewayHeaders(claim: Claim): Record<string, string> {
   };
 }
 
-/** The bot's standing context: who it is, its role's instructions and its job. */
-export function botSystemPrompt(claim: Claim): string {
+const LEVEL_TITLES: Record<Claim["level"], string> = {
+  senior: "Senior",
+  staff: "Staff",
+  principal: "Principal",
+};
+
+/**
+ * The bot's standing context: who it is, today's date (UTC, from `now`), the PM's level for a
+ * personal bot (docs/staff-principal-spec.md §1), its role's instructions and its job.
+ */
+export function botSystemPrompt(claim: Claim, now: Date = new Date()): string {
   const parts = [
     `You are ${claim.bot.name}, a PM OS bot, working on a request from ${claim.task.requested_by}.`,
-    claim.role.instructions.trim(),
+    `Today is ${now.toISOString().slice(0, 10)}.`,
   ];
+  if (claim.bot.scope === "personal") {
+    parts.push(
+      `Your PM works at the ${LEVEL_TITLES[claim.level]} level. Read /content/playbooks/levels.md and work at that level's scope, horizon and audience, unless the request says otherwise.`,
+    );
+  }
+  parts.push(claim.role.instructions.trim());
   if (claim.bot.job.trim()) {
     parts.push(`## Your job\n\n${claim.bot.job.trim()}`);
   }
@@ -378,7 +395,7 @@ export function createWorker(config: WorkerConfig): Worker {
         user,
         tools: toolset.tools,
         skills: role.skills,
-        systemPrompt: botSystemPrompt(claim),
+        systemPrompt: botSystemPrompt(claim, config.now?.() ?? new Date()),
         interruptOnWrites: false,
         stagingRoot,
       });

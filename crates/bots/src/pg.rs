@@ -12,9 +12,9 @@ use sqlx::types::Json;
 use sqlx::{PgConnection, Row};
 
 use crate::model::{
-    redacted_body, trace_tool, ApprovalOutcome, ChecklistItem, Event, NewNotification,
-    Notification, NotificationKind, Output, Priority, Routine, Schedule, SlackRef, Source, Task,
-    TaskStatus, TraceEntry, TraceKind,
+    redacted_body, trace_tool, ApprovalOutcome, ChecklistItem, Event, Level, MemberSettings,
+    NewNotification, Notification, NotificationKind, Output, Priority, Routine, Schedule, SlackRef,
+    Source, Task, TaskStatus, TraceEntry, TraceKind,
 };
 use crate::store::{
     apply, BotsStore, Refused, RoutinePatch, RoutineRun, StoreError, StoreResult, TaskFilter,
@@ -57,8 +57,8 @@ impl PgStore {
 }
 
 const TASK_COLUMNS: &str = "id, bot, requested_by, source, priority, text, status, checklist, \
-     result, error, approvals, slack, routine_id, attempts, worker, lease_until, created_at, \
-     updated_at";
+     result, error, approvals, slack, routine_id, level, attempts, worker, lease_until, \
+     created_at, updated_at";
 
 fn bad(what: &str, value: &str) -> StoreError {
     StoreError(format!("unexpected {what} `{value}` in storage"))
@@ -71,6 +71,11 @@ fn task_from_row(r: &PgRow) -> StoreResult<Task> {
     let checklist: Json<Vec<ChecklistItem>> = r.try_get("checklist")?;
     let approvals: Json<Vec<String>> = r.try_get("approvals")?;
     let slack: Option<Json<SlackRef>> = r.try_get("slack")?;
+    let level: Option<String> = r.try_get("level")?;
+    let level = match level {
+        Some(l) => Some(Level::parse(&l).ok_or_else(|| bad("level", &l))?),
+        None => None,
+    };
     Ok(Task {
         id: r.try_get("id")?,
         bot: r.try_get("bot")?,
@@ -85,6 +90,7 @@ fn task_from_row(r: &PgRow) -> StoreResult<Task> {
         approvals: approvals.0,
         slack: slack.map(|s| s.0),
         routine_id: r.try_get("routine_id")?,
+        level,
         attempts: r.try_get("attempts")?,
         worker: r.try_get("worker")?,
         lease_until: r.try_get("lease_until")?,
@@ -121,9 +127,9 @@ async fn insert_task(conn: &mut PgConnection, t: &Task) -> StoreResult<()> {
     sqlx::query(
         "INSERT INTO bots_tasks (id, bot, requested_by, source, priority, priority_rank, text,
              status, checklist, result, error, approvals, slack, routine_id, attempts, worker,
-             lease_until, created_at, updated_at)
+             lease_until, created_at, updated_at, level)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-             $18, $19)",
+             $18, $19, $20)",
     )
     .bind(&t.id)
     .bind(&t.bot)
@@ -144,6 +150,7 @@ async fn insert_task(conn: &mut PgConnection, t: &Task) -> StoreResult<()> {
     .bind(t.lease_until)
     .bind(t.created_at)
     .bind(t.updated_at)
+    .bind(t.level.map(Level::as_str))
     .execute(conn)
     .await?;
     Ok(())
@@ -620,5 +627,36 @@ impl BotsStore for PgStore {
         }
         tx.commit().await?;
         Ok(true)
+    }
+
+    async fn member_settings(&self, handle: &str) -> StoreResult<Option<MemberSettings>> {
+        let row = sqlx::query(
+            "SELECT handle, level, updated_at FROM bots_member_settings WHERE handle = $1",
+        )
+        .bind(handle)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| {
+            let level: String = r.try_get("level")?;
+            Ok(MemberSettings {
+                handle: r.try_get("handle")?,
+                level: Level::parse(&level).ok_or_else(|| bad("level", &level))?,
+                updated_at: r.try_get("updated_at")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn set_member_settings(&self, s: &MemberSettings) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO bots_member_settings (handle, level, updated_at) VALUES ($1, $2, $3)
+             ON CONFLICT (handle) DO UPDATE SET level = $2, updated_at = $3",
+        )
+        .bind(&s.handle)
+        .bind(s.level.as_str())
+        .bind(s.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }

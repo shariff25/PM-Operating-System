@@ -40,12 +40,25 @@ panel, numbers from tools, and benchmarks that say whether the bar is met.
 | `opportunity-sizing` | `opportunity-sizing.md` | `Sizing:` | |
 | `ai-feature-spec` | `ai-feature-spec.md` | `AI spec:` | |
 | `eval-plan` | `eval-plan.md` | `Eval plan:` | |
+| `release-notes` | `release-notes.md` | `Release notes:` | |
+| `status-update` | `status-update.md` | `Status:` | |
+| `poc-plan` | `poc-plan.md` | `POC plan:` | |
+| `partner-brief` | `partner-brief.md` | `Partner brief:` | |
+| `advisory-draft` | `advisory.md` | `Advisory:` | |
+| `launch-checklist` | `launch-checklist.md` | `Launch checklist:` | |
+| `jira-draft` | none (Jira issues, one approval each) | no page | drops `confluence.create_draft`; adds `jira.create_issue` |
 
 - **The base tool set** of a doc skill: `context.search context.read jira.search jira.read
   confluence.search confluence.read confluence.create_draft docs.search docs.read`. Skills
   that answer in the thread drop `confluence.create_draft`.
 - **Front matter** as today: `data-class: "restricted"`, `surfaces: "slack web cli"`,
   `ships-in: "pilot"`, `model: "reasoning"`, `owner: "TODO"`, `version: "0.1.0"`.
+- **The launch skills** (the last seven rows) differ from that default in three ways. Model:
+  `release-notes`, `status-update` and `jira-draft` use `default`; the rest use `reasoning`.
+  `ships-in`: `release-notes` and `status-update` are `pilot`; the other five are
+  `team-launch`. Tools: `jira-draft` is `context.search context.read jira.search jira.read
+  jira.create_issue confluence.search confluence.read docs.search docs.read`; the others
+  take the base set.
 - **Drafts** go to `confluence.create_draft`, in the space the PM named or their default.
 
 **Required `##` headings of each template** (the benchmarks check these exact strings):
@@ -64,6 +77,12 @@ panel, numbers from tools, and benchmarks that say whether the bar is met.
 | `opportunity-sizing.md` | Estimate, Method, Assumptions, Sensitivity, What would change it |
 | `ai-feature-spec.md` | Summary, Users and jobs, Intended behaviour, Examples, Failure modes, Misuse and safety, Evaluation, Cost and latency, Human oversight, Rollout and monitoring, Open questions |
 | `eval-plan.md` | What we are testing, Datasets, Graders, Thresholds, Slices, Regression set, Who reviews failures |
+| `release-notes.md` | Highlights, New, Improved, Fixed, Known issues, Upgrade notes |
+| `status-update.md` | Bottom line, Shipped, In progress, Risks and blockers, Decisions needed, Next |
+| `poc-plan.md` | Objective, Scope, Success criteria, Environment and prerequisites, Timeline, Roles, Risks, Exit and next steps |
+| `partner-brief.md` | Bottom line, Who they are, What each side gets, How we work together, Risks, Open questions |
+| `advisory.md` | Summary, Who is affected, What happened, What to do, What we are doing, Timeline, Contact |
+| `launch-checklist.md` | Launch decision, Readiness, Owners and dates, Go/no-go criteria, Rollback, Communications, Open items |
 
 **Reviewers** (`content/reviewers/<name>.md`), four new: `senior-pm`, `data-scientist`,
 `design-ux`, `ai-safety`. Same front matter and output format as the existing seven.

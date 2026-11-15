@@ -8,6 +8,9 @@ model's arithmetic. A panel of eleven reviewers reads any draft on request, and 
 covers AI features. You still own every output: each page is a draft until you approve it.
 The build spec is `docs/pm-craft-spec.md`.
 
+**Staff or Principal PM?** Set your level (`level staff` in a DM) and PM OS works across teams
+or on company bets, with 12 more skills. See `docs/levels.md`.
+
 **Why it is built from structure, not a clever prompt.** The models are local and mid-sized.
 The quality comes from what they work from and are checked against:
 - **a written bar** (`content/playbooks/bar.md`);
@@ -62,10 +65,18 @@ fictional Acme Vault.
 | Customers and market | `opportunity-sizing` | An estimate with its method, assumptions and sensitivity | "Size the opportunity for audit log export." | A draft page, `Sizing: …` |
 | AI products | `ai-feature-spec` | A spec for an AI feature: behaviour, failure modes, evaluation, oversight | "Spec an assistant that answers SSO setup questions from the docs." | A draft page, `AI spec: …` |
 | AI products | `eval-plan` | How an AI feature will be tested before and after launch | "Write an eval plan for the SSO setup assistant." | A draft page, `Eval plan: …` |
+| Delivery and launch | `release-notes` | Customer-facing notes from a fix version, checked against the docs | "Write release notes for the Acme Vault SSO release." | A draft page, `Release notes: …` |
+| Delivery and launch | `status-update` | A one-page update for stakeholders, bottom line first | "Write this month's status update on SSO." | A draft page, `Status: …` |
+| Delivery and launch | `launch-checklist` | A go/no-go: the decision first, then readiness by area, with owners and dates | "Are we ready to launch SAML SSO? Write the launch checklist." | A draft page, `Launch checklist: …` |
+| Delivery and launch | `jira-draft` | Turn a PRD, call notes or a thread into Jira issues, skipping what exists | "Turn the SCIM section of the PRD into stories under PM-101." | Up to eight approval cards, one per issue |
+| Customers and market | `poc-plan` | A POC with success criteria agreed before it starts, and an exit | "Plan a POC of SAML SSO with Globex." | A draft page, `POC plan: …` |
+| Customers and market | `partner-brief` | Whether to partner, what each side gets and the smallest joint test | "Write a partner brief on Initech for SSO." | A draft page, `Partner brief: …` |
+| Trust | `advisory-draft` | A customer advisory from confirmed facts only; security and legal approve it first | "Draft an advisory on the key export timing out." | A draft page, `Advisory: …` |
 
 ### How a doc skill works
 
-The twelve skills that draft a page all take the same six steps.
+The eighteen skills that draft a page all take the same six steps. `jira-draft` follows the
+same pattern but proposes Jira issues, each its own approval card, and no page.
 
 1. **Read.** The skill reads its playbook and its template, and finds an exemplar: a finished
    example of that kind of document, from `content/context/exemplars/`.
@@ -87,6 +98,28 @@ The four skills that answer in the thread (`product-critique`, `prioritize`, `pr
 **An example.** Ask "Write a PRD for adding a dark mode to the Acme Vault console" and you
 get a question back, not a PRD: who is asking for it, and what problem it solves for them.
 Answer it, or say "draft anyway", and the draft follows.
+
+### The launch skills
+
+- **`release-notes`** writes for customers: what changed for them, grouped New, Improved and
+  Fixed, never ticket titles, internal names, customer names or unreleased work. It checks each
+  claim against the public docs and flags what the docs contradict.
+- **`status-update`** puts the bottom line (on track, at risk or off track, and why) first.
+  Every risk has an owner and a date, and only decisions that need the reader are listed.
+- **`launch-checklist`** states the go or no-go as a recommendation first. Each area (product,
+  docs, support, sales, legal, security, monitoring, rollback) has an owner, a date, a state
+  and evidence; a rollback has a trigger and an owner.
+- **`jira-draft`** searches Jira first and lists duplicates. It proposes at most eight issues
+  a run, with testable acceptance criteria and a link to the source, and sets no assignee,
+  sprint or story points you didn't give.
+- **`poc-plan`** has success criteria agreed with the customer before the POC starts, each
+  measurable, and an exit: buy, extend once, or stop. Customer names are restricted.
+- **`partner-brief`** says what each side concretely gets and what the smallest joint test is.
+  Partner NDA material is restricted and stays out of anything external.
+- **`advisory-draft`** only drafts. Security and legal must approve before anything is sent;
+  run `/review` with `security-architect` and `legal-compliance`. It never invents a CVE id, a
+  severity, affected versions or a fix date: what the sources don't give reads "not yet
+  confirmed" and goes on the open list.
 
 ## The review panel
 
@@ -201,7 +234,7 @@ request; `pmos lint` checks it, and the file's owner reviews it.
 
 ## What the benchmarks do and don't prove
 
-The `pm-craft` category (`evals/categories/pm-craft/`, described in `docs/evals.md`) has 17
+The `pm-craft` category (`evals/categories/pm-craft/`, described in `docs/evals.md`) has 23
 seed tasks on the fake fixtures.
 
 | They check, deterministically | They don't check |

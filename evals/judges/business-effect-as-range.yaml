@@ -1,0 +1,21 @@
+# Does a principal-craft draft state the business effect as a range? The Principal bar's first
+# extra check (content/playbooks/levels.md): the business effect (revenue, cost or margin) is
+# a range with its assumptions, and the document says what is hard to reverse at company
+# scale. A single confident number passes the deterministic checks; this judge looks for the
+# range and the assumptions behind it.
+#
+# Advisory: it has no labels yet (business-effect-as-range.labels.jsonl is empty), so it is
+# reported and never fails a run or the gate. It blocks only once calibrated on at least 100
+# labels with TPR and TNR of at least 0.8 (docs/runbooks/quality.md, "Calibrating a judge").
+name: business-effect-as-range
+failure_mode: model/no-business-effect
+question: >-
+  Does the draft state the business effect as a range with its assumptions? Answer yes if it
+  gives the effect on revenue, cost or margin as a low-to-high range (or low, base and high
+  scenarios), says what each end assumes, and says what would be hard to reverse at company
+  scale. Answer no if it gives no business effect, gives one number with no range, states a
+  range with no assumptions, or says nothing about what is hard to reverse. If the output
+  contains no draft (the assistant asked a question or answered in the thread), answer yes.
+alias: pmos/extraction
+applies_to: [principal-craft]
+labels: business-effect-as-range.labels.jsonl

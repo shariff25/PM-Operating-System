@@ -432,6 +432,46 @@ impl ToolServer {
             .ok_or(ApiError::Unavailable)
     }
 
+    /// `GET /internal/approvals?user=`: a member's pending approval items, oldest first, for
+    /// the App Home's Inbox (`docs/slack-mentions-and-home-spec.md` §3). The tool server
+    /// returns at most 50, plus `total`; without `total`, the list's length is the count.
+    pub async fn pending_approvals(&self, handle: &str) -> Result<(Vec<Value>, usize), ApiError> {
+        if !pmos_contract::model::valid_handle(handle) {
+            return Err(refused_locally("not a handle"));
+        }
+        let (_, body) = Self::api(
+            self.get("/internal/approvals", Duration::from_secs(10))
+                .query(&[("user", handle)]),
+        )
+        .await?;
+        let items = body["approvals"].as_array().cloned().unwrap_or_default();
+        let total = body["total"]
+            .as_u64()
+            .map_or(items.len(), |t| (t as usize).max(items.len()));
+        Ok((items, total))
+    }
+
+    /// `DELETE /internal/credentials/{handle}/{provider}`: unlink one of a member's accounts.
+    pub async fn unlink(&self, handle: &str, provider: &str) -> Result<(), ApiError> {
+        if !pmos_contract::model::valid_handle(handle) {
+            return Err(refused_locally("not a handle"));
+        }
+        if !PROVIDERS.contains(&provider) {
+            return Err(refused_locally("not a provider"));
+        }
+        Self::api(
+            self.http
+                .delete(format!(
+                    "{}/internal/credentials/{handle}/{provider}",
+                    self.base
+                ))
+                .bearer_auth(&self.token)
+                .timeout(Duration::from_secs(10)),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// `POST /internal/memory/repo`: set a member's memory repo. The tool server checks it
     /// with their GitHub token. `timeout` is short when the answer must fit in an ack.
     pub async fn set_memory_repo(

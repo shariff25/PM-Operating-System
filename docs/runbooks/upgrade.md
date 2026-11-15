@@ -28,8 +28,39 @@ reach PMs until the affected category still meets its bar (D10).
    openshell sandbox delete pmos-<bot>
    deploy/pmos-admin sandbox <bot>
    ```
-6. **Check:** run `deploy/pmos-admin smoke <your handle>`, then the benchmarks for any category
+6. **If a role's skills or tools changed** (the changelog says so), regenerate the bots'
+   sandbox policies in your content repo, commit the result, then recreate each bot's
+   sandbox as in step 5. A policy lists the tools its bot may call, so a bot keeps its old
+   list until this is done:
+   ```sh
+   deploy/pmos-admin pmos policy generate --root content --out policies
+   deploy/pmos-admin pmos policy check
+   ```
+7. **If the Slack app manifest changed** (`docs/slack-app-manifest.yaml`), update the app
+   and reinstall it; see below.
+8. **Check:** run `deploy/pmos-admin smoke <your handle>`, then the benchmarks for any category
    the change touches (`deploy/pmos-admin evals-run --category <c>`).
+
+## Updating the Slack app
+
+A new scope or event in `docs/slack-app-manifest.yaml` does nothing until the app in Slack has
+it. **Tagging and the App Home** (`docs/slack-home.md`) need:
+
+| What | Value |
+| --- | --- |
+| Bot scope | `app_mentions:read` |
+| Bot events | `app_mention`, `app_home_opened` |
+| App Home | the Home tab on |
+
+1. **Update the app from the manifest.** At <https://api.slack.com/apps>, open the app, go to
+   **App Manifest**, paste the new `docs/slack-app-manifest.yaml` and save.
+2. **Reinstall it** (**Install App**, then **Reinstall to Workspace**). A workspace admin may
+   need to approve the new scope. The bot token (`PMOS_SLACK_BOT_TOKEN`) usually stays the
+   same; if Slack shows a new one, put it in `deploy/.env` and run `deploy/pmos-admin up`.
+3. **Check:** open the app's **Home** tab in Slack, and tag `@PM OS` in a thread in a channel
+   the app is in. Without the update, tags are ignored and the Home tab is missing.
+
+PMs don't need to link Slack again: their own tokens' scopes are unchanged.
 
 ## Rolling back
 

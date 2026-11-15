@@ -214,6 +214,44 @@ impl SlackApi {
         .map(|_| ())
     }
 
+    /// `views.publish`: replace `user`'s App Home with `view` (`docs/slack-mentions-and-home-spec.md`
+    /// §4). Needs no scope beyond the Home tab being enabled.
+    pub async fn publish_view(&self, user: &str, view: Value) -> Result<(), SlackError> {
+        self.call("views.publish", &json!({"user_id": user, "view": view}))
+            .await
+            .map(|_| ())
+    }
+
+    /// `chat.getPermalink`: a link to one message. Slack answers it only for conversations
+    /// the app can see, so a caller falls back to a plain channel mention. Only an
+    /// `https://` link is returned.
+    pub async fn permalink(&self, channel: &str, message_ts: &str) -> Result<String, SlackError> {
+        let refused = |error: &str| SlackError::Refused {
+            method: "chat.getPermalink".into(),
+            error: error.into(),
+        };
+        let res = self
+            .http
+            .get(format!("{}/api/chat.getPermalink", self.base))
+            .bearer_auth(&self.token)
+            .query(&[("channel", channel), ("message_ts", message_ts)])
+            .send()
+            .await
+            .map_err(|e| SlackError::Unreachable(e.to_string()))?;
+        let json: Value = res
+            .json()
+            .await
+            .map_err(|e| SlackError::Unreachable(format!("chat.getPermalink: {e}")))?;
+        if json["ok"].as_bool() != Some(true) {
+            return Err(refused(json["error"].as_str().unwrap_or("unknown error")));
+        }
+        json["permalink"]
+            .as_str()
+            .filter(|u| u.starts_with("https://") && !u.contains(['|', '<', '>', ' ']))
+            .map(String::from)
+            .ok_or_else(|| refused("no permalink"))
+    }
+
     /// `users.info` (scopes `users:read`, `users:read.email`): the user object, with
     /// `real_name` and `profile.email`.
     pub async fn user_info(&self, user: &str) -> Result<Value, SlackError> {

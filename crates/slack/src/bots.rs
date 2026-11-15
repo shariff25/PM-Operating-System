@@ -10,8 +10,13 @@
 //! **Commands first:** typed alone in a DM, `setup` (or `status`, `onboarding`), and for
 //! platform owners `requests` and `remove <handle>`, are handled before any of that
 //! (onboarding, in `members.rs`), and so are `reply assistant on`, `off` and status (the reply
-//! assistant, in `reply.rs`). `docs: setup` still goes to the `docs` bot. Someone not in
+//! assistant, in `reply.rs`), `bets review on`, `off` and status (`bets_review.rs`) and
+//! `level` and `level <level>` (`level.rs`), in that order. `docs: setup` still goes to the
+//! `docs` bot. Someone not in
 //! `team.yaml` gets a note with **Request access**.
+//!
+//! Tagging PM OS in a channel (`app_mention`) is in `mention.rs`, and the App Home
+//! (`app_home_opened` and its clicks) in `home.rs` (`docs/slack-mentions-and-home-spec.md`).
 //!
 //! A `slack.post_reply` draft gets the reply card (`docs/slack-reply-spec.md` §5): **Post as
 //! you**, **Edit**, **Snooze** and **Reject**, and the audience check's refusals each in
@@ -38,12 +43,14 @@ use crate::blocks::escape;
 use crate::bounded::Bounded;
 use crate::cards::{self, action};
 use crate::commands::{load_team, FollowUp, NOT_A_MEMBER};
+use crate::home::Home;
 use crate::member_cards::{self, action as member_action};
 use crate::members::{self, DmCommand, Onboarding};
 use crate::reply::{self, SnoozeStore};
 use crate::runtime::{display_name, BotInfo, Runtime, RuntimeError};
 use crate::slackapi::{Posted, SlackApi};
 use crate::toolserver::{ApiError, ToolServer};
+use crate::{bets_review, level};
 
 /// The bot a DM goes to when nothing else picks one.
 pub const DEFAULT_BOT: &str = "docs";
@@ -107,6 +114,8 @@ struct Inner {
     /// Edited arguments a `needs_external_confirm` answer held back, by approval id, for
     /// **Post to external channel**.
     held_edits: Mutex<Bounded<String, Value>>,
+    /// Who has opened the App Home, and the skills catalog.
+    home: Home,
 }
 
 #[derive(Clone)]
@@ -179,6 +188,7 @@ impl Bots {
                 cfg,
                 snoozes,
                 held_edits: Mutex::new(Bounded::new(500)),
+                home: Home::default(),
                 onboarding,
                 threads: Mutex::new(Bounded::new(5000)),
                 seen: Mutex::new(Bounded::new(5000)),
@@ -209,6 +219,39 @@ impl Bots {
         &self.inner.onboarding
     }
 
+    pub(crate) fn home_state(&self) -> &Home {
+        &self.inner.home
+    }
+
+    /// The content repo (`PMOS_CONTENT_ROOT`): the directory `team.yaml` is in.
+    pub(crate) fn content_root(&self) -> PathBuf {
+        self.inner
+            .cfg
+            .team_file
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// `true` the first time an event is seen: Slack retries an event it thinks was missed.
+    /// The key is the payload's `event_id`, else `fallback`.
+    pub(crate) fn first_event(&self, payload: &Value, fallback: String) -> bool {
+        let event_id = payload["event_id"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or(fallback);
+        let first = self
+            .inner
+            .seen
+            .lock()
+            .expect("seen lock")
+            .first_time(event_id.clone());
+        if !first {
+            tracing::info!(event_id, "event already handled; ignoring the retry");
+        }
+        first
+    }
+
     /// The snoozed reply cards.
     pub fn snoozes(&self) -> &SnoozeStore {
         &self.inner.snoozes
@@ -235,6 +278,15 @@ impl Bots {
             (channel.to_string(), thread_ts.to_string()),
             bot.to_string(),
         );
+    }
+
+    /// Forget the bot of a thread whose task wasn't created.
+    pub(crate) fn forget_thread(&self, channel: &str, thread_ts: &str) {
+        self.inner
+            .threads
+            .lock()
+            .expect("threads lock")
+            .remove(&(channel.to_string(), thread_ts.to_string()));
     }
 
     pub fn thread_bot(&self, channel: &str, thread_ts: &str) -> Option<String> {
@@ -280,11 +332,16 @@ impl Bots {
         named(&roster, bot)
     }
 
-    /// Handle an `events_api` payload. Only a PM's own DMs (`message.im`) do anything; the
-    /// bot's own messages, edits and other subtypes, and retries of an event already handled,
-    /// are ignored.
+    /// Handle an `events_api` payload: a PM's own DMs (`message.im`), a tag in a channel
+    /// (`app_mention`) and the App Home (`app_home_opened`). The bot's own messages, edits and
+    /// other subtypes, and retries of an event already handled, are ignored.
     pub fn event(&self, payload: &Value) -> Option<FollowUp> {
         let event = &payload["event"];
+        match event["type"].as_str() {
+            Some("app_mention") => return self.mention(payload),
+            Some("app_home_opened") => return self.home_opened(payload),
+            _ => {}
+        }
         if event["type"] != "message" || event["channel_type"] != "im" {
             return None;
         }
@@ -294,18 +351,7 @@ impl Bots {
         let user = event["user"].as_str()?.to_string();
         let channel = event["channel"].as_str()?.to_string();
         let ts = event["ts"].as_str()?.to_string();
-        let event_id = payload["event_id"]
-            .as_str()
-            .map(String::from)
-            .unwrap_or_else(|| format!("{channel}:{ts}"));
-        if !self
-            .inner
-            .seen
-            .lock()
-            .expect("seen lock")
-            .first_time(event_id.clone())
-        {
-            tracing::info!(event_id, "event already handled; ignoring the retry");
+        if !self.first_event(payload, format!("{channel}:{ts}")) {
             return None;
         }
         let thread_ts = event["thread_ts"].as_str().map(String::from);
@@ -325,6 +371,8 @@ impl Bots {
     pub fn interactive(&self, payload: &Value) -> (Option<Value>, Option<FollowUp>) {
         let this = self.clone();
         match payload["type"].as_str() {
+            // The App Home: its clicks have no message, which a `Click` needs.
+            Some("block_actions") if payload["view"]["type"] == "home" => self.home_action(payload),
             Some("block_actions") => {
                 let Some(click) = Click::from_payload(payload) else {
                     return (None, None);
@@ -479,6 +527,12 @@ impl Bots {
         }
         if let Some(cmd) = reply::command(&text) {
             return self.reply_assistant(&dm, &handle, cmd).await;
+        }
+        if let Some(cmd) = bets_review::command(&text) {
+            return self.bets_review(&dm, &handle, cmd).await;
+        }
+        if let Some(cmd) = level::command(&text) {
+            return self.level_command(&dm, &handle, cmd).await;
         }
         if is_routine_list(&text) {
             let message = self

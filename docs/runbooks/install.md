@@ -140,6 +140,11 @@ The bring-up worker isn't isolated. Replace it with the Docs bot's real sandbox.
    are set.
 4. **Check it:** DM the app `docs:` and a question your docs site answers. You should see a progress message, then
    an answer with links.
+5. **Check tagging and the Home.** The manifest turns on the Home tab, the events
+   `app_mention` and `app_home_opened`, and the bot scope `app_mentions:read`. Open the app in
+   Slack: its **Home** tab shows your Inbox. Once you have a personal bot and Slack linked
+   (Stage 6), tag `@PM OS` in a thread in a channel the app is in; the draft arrives in your DM
+   (`docs/slack-home.md`, `docs/slack-reply.md`).
 
 ## Stage 6: Live connectors (Gate 1)
 
