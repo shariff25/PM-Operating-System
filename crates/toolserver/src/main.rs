@@ -174,7 +174,8 @@ async fn main() -> Result<()> {
     let bots = catalog.roster().bots().count();
     let svc = ToolService::new(catalog, stores, connectors)
         .map_err(anyhow::Error::msg)?
-        .with_team(team.clone());
+        .with_team(team.clone())
+        .with_ledger_expire_days(config.ledger_expire_days);
     let svc = Arc::new(svc);
     // One replica: anything still `executing` from a previous process was interrupted.
     match svc.reconcile(chrono::Duration::zero(), Utc::now()).await {

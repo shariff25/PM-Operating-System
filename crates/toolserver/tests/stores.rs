@@ -12,10 +12,11 @@ use std::sync::Arc;
 use chrono::Duration;
 use pmos_contract::Sensitivity;
 use pmos_toolserver::approvals::{
-    DecideError, Decision, MemoryApprovals, NewItem, Status, GRANT_TTL_MINUTES,
+    DecideError, Decision, MemoryApprovals, NewItem, Status, Verdict, GRANT_TTL_MINUTES,
 };
 use pmos_toolserver::audit::{AuditEvent, MemoryAudit, Outcome};
 use pmos_toolserver::context::{ContextDoc, MemoryIndex};
+use pmos_toolserver::ledger::{LedgerOutcome, LedgerQuery, LedgerRow, Reason};
 use pmos_toolserver::members::{
     Created, Decided, MemoryRequests, NewRequest, RequestStatus, MAX_PENDING,
 };
@@ -151,6 +152,9 @@ contract!(
     decisions_win_once_under_concurrency,
     completion_records_results_and_failures,
     interrupted_writes_are_found,
+    ledger_rows_record_every_outcome,
+    ledger_reads_filter_and_order,
+    ledger_rows_follow_concurrent_decisions,
     memory_is_per_user,
     context_search_and_get,
     context_search_applies_the_ceiling_in_the_store,
@@ -242,6 +246,8 @@ async fn approval_items_and_audit_events_keep_their_bot(b: &Backend) {
                 run_id: "tsk_1",
                 tool: "jira.create_issue",
                 args: &args,
+                content_sha: None,
+                model_alias: None,
             },
             now(),
         )
@@ -366,6 +372,8 @@ fn new_item<'a>(user: &'a str, args: &'a Value) -> NewItem<'a> {
         run_id: "r1",
         tool: "confluence.create_draft",
         args,
+        content_sha: Some("0123456789abcdef0123456789abcdef01234567"),
+        model_alias: Some("pmos/default"),
     }
 }
 
@@ -566,6 +574,353 @@ async fn interrupted_writes_are_found(b: &Backend) {
         .map(|i| i.id)
         .collect();
     assert_eq!(stuck, vec![early.id]);
+}
+
+// ----- the feedback ledger ----------------------------------------------------------------
+
+fn bot_item<'a>(bot: &'a str, args: &'a Value) -> NewItem<'a> {
+    NewItem {
+        user: "ana",
+        skill: None,
+        bot: Some(bot),
+        run_id: "tsk_1",
+        tool: "jira.create_issue",
+        args,
+        content_sha: None,
+        model_alias: Some("pmos/extraction"),
+    }
+}
+
+fn ledger_row(rows: &[LedgerRow], id: &str) -> LedgerRow {
+    rows.iter()
+        .find(|r| r.id == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("no ledger row for {id}"))
+}
+
+async fn ledger_rows_record_every_outcome(b: &Backend) {
+    let a = b.stores.approvals.as_ref();
+    let args = json!({"title": "Release notes", "body": "Fixed the login bug."});
+    let decided = now() + Duration::minutes(5);
+
+    let unchanged = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide(&unchanged.id, "ana", Decision::Approve, None, decided)
+        .await
+        .unwrap();
+    a.complete(&unchanged.id, Ok(json!({"status": "done"})))
+        .await
+        .unwrap();
+
+    let edited = a.create(new_item("ana", &args), now()).await.unwrap();
+    let final_args = json!({"title": "Release notes", "body": "Fixed the logout bug."});
+    a.decide(
+        &edited.id,
+        "ana",
+        Decision::Edit,
+        Some(final_args.clone()),
+        decided,
+    )
+    .await
+    .unwrap();
+    a.complete(&edited.id, Ok(json!({"status": "done"})))
+        .await
+        .unwrap();
+
+    // Edited back to exactly what was drafted: approved unchanged.
+    let same = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide(&same.id, "ana", Decision::Edit, Some(args.clone()), decided)
+        .await
+        .unwrap();
+    a.complete(&same.id, Ok(json!({}))).await.unwrap();
+
+    let rejected = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide_with(
+        &rejected.id,
+        "ana",
+        Verdict {
+            decision: Decision::Reject,
+            args: None,
+            reason: Some(Reason::WrongFacts),
+        },
+        decided,
+    )
+    .await
+    .unwrap();
+    let bare_reject = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide(&bare_reject.id, "ana", Decision::Reject, None, decided)
+        .await
+        .unwrap();
+    // A reason with an approval is not kept (the service refuses it before this).
+    let approved_with_reason = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide_with(
+        &approved_with_reason.id,
+        "ana",
+        Verdict {
+            decision: Decision::Approve,
+            args: None,
+            reason: Some(Reason::Tone),
+        },
+        decided,
+    )
+    .await
+    .unwrap();
+
+    let failed = a.create(new_item("ana", &args), now()).await.unwrap();
+    a.decide(&failed.id, "ana", Decision::Approve, None, decided)
+        .await
+        .unwrap();
+    a.complete(&failed.id, Err("space not found".into()))
+        .await
+        .unwrap();
+
+    let old = a
+        .create(new_item("ana", &args), now() - Duration::days(8))
+        .await
+        .unwrap();
+    let fresh = a.create(new_item("ana", &args), now()).await.unwrap();
+    // A failed decision changes nothing.
+    assert_eq!(
+        a.decide(&fresh.id, "bo", Decision::Reject, None, decided)
+            .await,
+        Err(DecideError::Forbidden)
+    );
+
+    let rows = a
+        .ledger(&LedgerQuery::all(now() - Duration::days(7)))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 9, "one row per item");
+
+    let r = ledger_row(&rows, &unchanged.id);
+    assert_eq!(r.outcome, LedgerOutcome::Approved);
+    assert_eq!(r.edit_distance, Some(0.0));
+    assert_eq!(r.reason, None);
+    assert_eq!(r.decided_at, Some(decided));
+    assert_eq!(r.decided_by.as_deref(), Some("ana"));
+    assert_eq!(r.created_at, now());
+    assert_eq!(r.user, "ana");
+    assert_eq!(r.run_id, "r1");
+    assert_eq!(r.skill.as_deref(), Some("prd-draft"));
+    assert_eq!(r.bot, None);
+    assert_eq!(r.tool, "confluence.create_draft");
+    assert_eq!(
+        r.content_sha.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
+    );
+    assert_eq!(r.model_alias.as_deref(), Some("pmos/default"));
+
+    let r = ledger_row(&rows, &edited.id);
+    assert_eq!(r.outcome, LedgerOutcome::Edited);
+    let expected = pmos_toolserver::ledger::args_edit_distance(&args, &final_args);
+    assert!(expected > 0.0 && expected < 0.2, "{expected}");
+    assert!((r.edit_distance.unwrap() - expected).abs() < 1e-9);
+
+    let r = ledger_row(&rows, &same.id);
+    assert_eq!(r.outcome, LedgerOutcome::Approved);
+    assert_eq!(r.edit_distance, Some(0.0));
+
+    let r = ledger_row(&rows, &rejected.id);
+    assert_eq!(r.outcome, LedgerOutcome::Rejected);
+    assert_eq!(r.reason, Some(Reason::WrongFacts));
+    assert_eq!(r.edit_distance, None);
+    assert_eq!(r.decided_by.as_deref(), Some("ana"));
+
+    let r = ledger_row(&rows, &bare_reject.id);
+    assert_eq!(r.outcome, LedgerOutcome::Rejected);
+    assert_eq!(r.reason, None);
+
+    let r = ledger_row(&rows, &approved_with_reason.id);
+    assert_eq!(r.outcome, LedgerOutcome::Pending, "still writing");
+    assert_eq!(r.reason, None);
+    assert_eq!(r.edit_distance, Some(0.0));
+
+    let r = ledger_row(&rows, &failed.id);
+    assert_eq!(r.outcome, LedgerOutcome::Failed);
+    assert_eq!(r.edit_distance, Some(0.0));
+
+    let r = ledger_row(&rows, &old.id);
+    assert_eq!(r.outcome, LedgerOutcome::Expired);
+    assert_eq!(r.decided_at, None);
+    // Expiry is worked out on read: with a longer window the same row is pending.
+    let longer = a
+        .ledger(&LedgerQuery::all(now() - Duration::days(30)))
+        .await
+        .unwrap();
+    assert_eq!(ledger_row(&longer, &old.id).outcome, LedgerOutcome::Pending);
+
+    let r = ledger_row(&rows, &fresh.id);
+    assert_eq!(r.outcome, LedgerOutcome::Pending);
+    assert_eq!(r.decided_at, None);
+    assert_eq!(r.decided_by, None);
+}
+
+async fn ledger_reads_filter_and_order(b: &Backend) {
+    let a = b.stores.approvals.as_ref();
+    let args = json!({"summary": "Login fails on Safari", "project": "PM"});
+    let t = |m: i64| now() + Duration::minutes(m);
+
+    // docs: rejected at +30, edited heavily at +20, approved at +10, pending since +5.
+    let rejected = a.create(bot_item("docs", &args), t(0)).await.unwrap();
+    a.decide_with(
+        &rejected.id,
+        "ana",
+        Verdict {
+            decision: Decision::Reject,
+            args: None,
+            reason: Some(Reason::Tone),
+        },
+        t(30),
+    )
+    .await
+    .unwrap();
+    let heavy = a.create(bot_item("docs", &args), t(1)).await.unwrap();
+    a.decide(
+        &heavy.id,
+        "ana",
+        Decision::Edit,
+        Some(json!({"summary": "Checkout crashes", "project": "PM"})),
+        t(20),
+    )
+    .await
+    .unwrap();
+    a.complete(&heavy.id, Ok(json!({}))).await.unwrap();
+    let approved = a.create(bot_item("docs", &args), t(2)).await.unwrap();
+    a.decide(&approved.id, "ana", Decision::Approve, None, t(10))
+        .await
+        .unwrap();
+    a.complete(&approved.id, Ok(json!({}))).await.unwrap();
+    let pending = a.create(bot_item("docs", &args), t(5)).await.unwrap();
+    // scout: one pending at +3.
+    let scout = a.create(bot_item("scout", &args), t(3)).await.unwrap();
+
+    let all = LedgerQuery::all(now() - Duration::days(7));
+    let ids = |rows: Vec<LedgerRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+    // Newest change first: a decision, or the creation of an undecided item.
+    assert_eq!(
+        ids(a.ledger(&all).await.unwrap()),
+        vec![
+            rejected.id.clone(),
+            heavy.id.clone(),
+            approved.id.clone(),
+            pending.id.clone(),
+            scout.id.clone(),
+        ]
+    );
+    let q = LedgerQuery {
+        bot: Some("scout".into()),
+        ..all.clone()
+    };
+    assert_eq!(ids(a.ledger(&q).await.unwrap()), vec![scout.id.clone()]);
+    let q = LedgerQuery {
+        since: Some(t(5)),
+        until: Some(t(30)),
+        ..all.clone()
+    };
+    assert_eq!(
+        ids(a.ledger(&q).await.unwrap()),
+        vec![heavy.id.clone(), approved.id.clone(), pending.id.clone()],
+        "since is inclusive, until exclusive"
+    );
+    let q = LedgerQuery {
+        outcomes: vec![LedgerOutcome::Rejected, LedgerOutcome::Edited],
+        ..all.clone()
+    };
+    assert_eq!(
+        ids(a.ledger(&q).await.unwrap()),
+        vec![rejected.id.clone(), heavy.id.clone()]
+    );
+    // The triage digest's read: rejected, or edited by at least 0.3.
+    let q = LedgerQuery {
+        outcomes: vec![LedgerOutcome::Rejected, LedgerOutcome::Edited],
+        min_edit: Some(0.3),
+        ..all.clone()
+    };
+    assert_eq!(
+        ids(a.ledger(&q).await.unwrap()),
+        vec![rejected.id.clone(), heavy.id.clone()]
+    );
+    let q = LedgerQuery {
+        min_edit: Some(0.99),
+        outcomes: vec![LedgerOutcome::Edited, LedgerOutcome::Approved],
+        ..all.clone()
+    };
+    assert!(a.ledger(&q).await.unwrap().is_empty());
+    let q = LedgerQuery {
+        limit: Some(2),
+        ..all.clone()
+    };
+    assert_eq!(
+        ids(a.ledger(&q).await.unwrap()),
+        vec![rejected.id.clone(), heavy.id.clone()]
+    );
+    // Expired is a reported outcome, and filters like one.
+    let later = LedgerQuery {
+        outcomes: vec![LedgerOutcome::Expired],
+        ..LedgerQuery::all(t(4))
+    };
+    assert_eq!(ids(a.ledger(&later).await.unwrap()), vec![scout.id.clone()]);
+    let q = LedgerQuery {
+        outcomes: vec![LedgerOutcome::Pending],
+        ..LedgerQuery::all(t(4))
+    };
+    assert_eq!(ids(a.ledger(&q).await.unwrap()), vec![pending.id.clone()]);
+}
+
+async fn ledger_rows_follow_concurrent_decisions(b: &Backend) {
+    let args = json!({"title": "PRD"});
+    let item = b
+        .stores
+        .approvals
+        .create(new_item("ana", &args), now())
+        .await
+        .unwrap();
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let approvals = b.stores.approvals.clone();
+        let id = item.id.clone();
+        handles.push(tokio::spawn(async move {
+            let verdict = if i % 2 == 0 {
+                Verdict::new(Decision::Approve, None)
+            } else {
+                Verdict {
+                    decision: Decision::Reject,
+                    args: None,
+                    reason: Some(Reason::Incomplete),
+                }
+            };
+            approvals
+                .decide_with(&id, "ana", verdict, now() + Duration::minutes(i))
+                .await
+        }));
+    }
+    let mut winners = Vec::new();
+    for h in handles {
+        if let Ok(item) = h.await.unwrap() {
+            winners.push(item);
+        }
+    }
+    assert_eq!(winners.len(), 1);
+    let won = &winners[0];
+    let rows = b
+        .stores
+        .approvals
+        .ledger(&LedgerQuery::all(now()))
+        .await
+        .unwrap();
+    let row = ledger_row(&rows, &item.id);
+    assert_eq!(row.decided_at, won.decided_at, "the winner's decision");
+    match won.status {
+        Status::Rejected => {
+            assert_eq!(row.outcome, LedgerOutcome::Rejected);
+            assert_eq!(row.reason, Some(Reason::Incomplete));
+        }
+        _ => {
+            assert_eq!(row.outcome, LedgerOutcome::Pending);
+            assert_eq!(row.edit_distance, Some(0.0));
+            assert_eq!(row.reason, None);
+        }
+    }
 }
 
 // ----- memory -----------------------------------------------------------------------------
@@ -1236,6 +1591,50 @@ mod postgres_only {
             return;
         };
         b.pg.as_ref().unwrap().migrate().await.unwrap();
+        b.finish().await;
+    }
+
+    /// Migration 0007 gives every item made before the ledger a row.
+    #[tokio::test]
+    async fn the_ledger_migration_backfills_existing_items() {
+        let Some(b) = Backend::postgres(Vec::new()).await else {
+            return;
+        };
+        let pg = b.pg.as_ref().unwrap();
+        let args = json!({"title": "PRD"});
+        let a = b.stores.approvals.as_ref();
+        let pending = a.create(new_item("ana", &args), now()).await.unwrap();
+        let running = a.create(new_item("ana", &args), now()).await.unwrap();
+        a.decide(&running.id, "ana", Decision::Approve, None, now())
+            .await
+            .unwrap();
+        let rejected = a.create(new_item("ana", &args), now()).await.unwrap();
+        a.decide(&rejected.id, "ana", Decision::Reject, None, now())
+            .await
+            .unwrap();
+        // Back to how a database looked before 0007, then apply it by hand.
+        sqlx::query("DROP TABLE ledger")
+            .execute(pg.pool())
+            .await
+            .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(include_str!(
+            "../migrations/0007_ledger.sql"
+        )))
+        .execute(pg.pool())
+        .await
+        .unwrap();
+        let rows = a.ledger(&LedgerQuery::all(now())).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        let outcome = |id: &str| rows.iter().find(|r| r.id == id).unwrap().outcome;
+        assert_eq!(outcome(&pending.id), LedgerOutcome::Pending);
+        assert_eq!(outcome(&running.id), LedgerOutcome::Pending);
+        assert_eq!(outcome(&rejected.id), LedgerOutcome::Rejected);
+        assert!(rows.iter().all(|r| r.content_sha.is_none()));
+        // The write still running finishes into its backfilled row.
+        a.complete(&running.id, Ok(json!({}))).await.unwrap();
+        let rows = a.ledger(&LedgerQuery::all(now())).await.unwrap();
+        let r = rows.iter().find(|r| r.id == running.id).unwrap();
+        assert_eq!(r.outcome, LedgerOutcome::Approved);
         b.finish().await;
     }
 }

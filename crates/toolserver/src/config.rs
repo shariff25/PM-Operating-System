@@ -136,6 +136,9 @@ pub struct Config {
     /// `PMOS_CONTENT_SYNC_SECS`: how often the content checkout is pulled; `0` turns it off.
     /// Default 300 with live connectors, 0 with fake ones (a dev checkout isn't pulled).
     pub content_sync_secs: u64,
+    /// `PMOS_LEDGER_EXPIRE_DAYS`: a draft still pending after this many days is reported as
+    /// `expired` in the feedback ledger. Default 7.
+    pub ledger_expire_days: i64,
 }
 
 impl Config {
@@ -216,6 +219,17 @@ impl Config {
             None if matches!(connectors, Connectors::Live(_)) => 300,
             None => 0,
         };
+        let ledger_expire_days = match get("PMOS_LEDGER_EXPIRE_DAYS").filter(|s| !s.is_empty()) {
+            Some(s) => s
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .filter(|d| *d >= 1)
+                .ok_or_else(|| {
+                    format!("PMOS_LEDGER_EXPIRE_DAYS must be a whole number of days (1 or more), not `{s}`")
+                })?,
+            None => crate::ledger::DEFAULT_EXPIRE_DAYS,
+        };
         let bind = get("PMOS_BIND")
             .unwrap_or_else(|| "127.0.0.1:8710".into())
             .parse()
@@ -241,6 +255,7 @@ impl Config {
             fake_mode_docs,
             memory,
             content_sync_secs,
+            ledger_expire_days,
         })
     }
 }
@@ -648,5 +663,26 @@ mod tests {
         assert!(cfg(&with(&fake, &[("PMOS_MEMORY", "github")]))
             .unwrap_err()
             .contains("PMOS_MEMORY=github needs"));
+    }
+
+    #[test]
+    fn ledger_expiry_defaults_to_a_week() {
+        let fake = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert_eq!(cfg(&fake).unwrap().ledger_expire_days, 7);
+        assert_eq!(
+            cfg(&with(&fake, &[("PMOS_LEDGER_EXPIRE_DAYS", "14")]))
+                .unwrap()
+                .ledger_expire_days,
+            14
+        );
+        for bad in ["0", "-1", "soon", "1.5"] {
+            assert!(cfg(&with(&fake, &[("PMOS_LEDGER_EXPIRE_DAYS", bad)]))
+                .unwrap_err()
+                .contains("PMOS_LEDGER_EXPIRE_DAYS"));
+        }
     }
 }

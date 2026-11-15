@@ -580,6 +580,8 @@ async fn an_item_runs_only_if_its_skill_still_declares_the_tool() {
                 run_id: "r1",
                 tool: "jira.create_issue",
                 args: &json!({"project": "PM", "issue_type": "Story", "summary": "x"}),
+                content_sha: None,
+                model_alias: None,
             },
             now(),
         )
