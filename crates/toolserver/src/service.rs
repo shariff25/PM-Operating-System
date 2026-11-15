@@ -16,6 +16,12 @@
 //!
 //! Every approval item has a row in the feedback ledger (`ledger.rs`), which the approval
 //! store writes with the item.
+//!
+//! Slack drafts follow the reply assistant's rules too (`docs/slack-reply-spec.md` §3): one
+//! `slack.post_reply` draft per thread; every item records the highest data class its session
+//! had read; a Slack write's audience is checked before it posts; and an undecided Slack draft
+//! expires after `PMOS_SLACK_DRAFT_TTL_HOURS`, losing its text, as a decided one does that
+//! long after its decision.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
@@ -26,10 +32,13 @@ use pmos_contract::model::{ModelRole, CONTEXT_DOMAINS};
 use pmos_contract::{Sensitivity, ToolKind};
 use serde_json::{json, Value};
 
-use crate::approvals::{args_hash, ApprovalItem, DecideError, Decision, NewItem, Status, Verdict};
+use crate::approvals::{
+    args_hash, ApprovalItem, DecideError, Decision, Drafted, NewItem, Status, Verdict, REPLY_TOOL,
+    SLACK_DRAFT_TOOLS,
+};
 use crate::audit::{AuditEvent, Client, Outcome};
 use crate::catalog::{Catalog, Roster, ToolSpec};
-use crate::connectors::{untrusted, Caller, Connector, ConnectorError, TeamBot};
+use crate::connectors::{untrusted, Audience, Caller, Connector, ConnectorError, TeamBot};
 use crate::context::{load_docs, ContextDoc, ReindexReport};
 use crate::ledger::{summarize, LedgerQuery, LedgerRow, Summary, DEFAULT_EXPIRE_DAYS};
 use crate::memory::{valid_key, MemoryError};
@@ -47,6 +56,18 @@ pub const MAX_INVALID_DRAFTS: u32 = 2;
 /// How the last allowed refusal for invalid arguments, and every refusal after it, ends.
 pub const LAST_ATTEMPT: &str =
     "This is the last attempt for this action. Tell the PM what was wrong instead of retrying.";
+
+/// Hours an undecided Slack draft waits before it expires, and a decided one keeps its text
+/// (`PMOS_SLACK_DRAFT_TTL_HOURS`). Also the most allowed: no Slack text is kept longer.
+pub const DEFAULT_SLACK_DRAFT_TTL_HOURS: i64 = 24;
+/// How far back an earlier reply to the same thread stops a new draft.
+pub const REPLY_WINDOW_DAYS: i64 = 7;
+
+/// What the tool server answers when a Slack write's audience stops it, as `409` codes.
+pub const AUDIENCE_BLOCKED: &str = "audience_blocked";
+pub const NEEDS_EXTERNAL_CONFIRM: &str = "needs_external_confirm";
+/// As a `503` code: Slack's channel calls failed, so nothing was posted.
+pub const AUDIENCE_UNAVAILABLE: &str = "audience_unavailable";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ToolError {
@@ -145,6 +166,44 @@ pub enum DecisionError {
     ReasonNotAllowed,
     #[error("the write task failed: {0}")]
     Internal(String),
+    /// A draft built from restricted sources would reach people outside the product team.
+    /// Nothing was written; the item is still pending.
+    #[error("{}", audience_blocked_text(.0))]
+    AudienceBlocked(AudienceSummary),
+    /// The channel is shared outside the company, and the decision didn't confirm posting
+    /// there. Nothing was written; the item is still pending.
+    #[error("this channel is shared with people outside the company (Slack Connect); confirm to post there. Nothing was posted yet")]
+    NeedsExternalConfirm(AudienceSummary),
+    /// Slack's channel calls failed, so the audience is unknown. Nothing was written.
+    #[error("PM OS couldn't check who can see this channel ({0}), so nothing was posted; try again shortly")]
+    AudienceUnavailable(String),
+}
+
+/// What the audience check found, for the decision's answer: how many can see the channel,
+/// how many of them aren't in `team.yaml`, and whether it is shared outside the company.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudienceSummary {
+    pub members: usize,
+    pub outsiders: usize,
+    pub external: bool,
+}
+
+fn audience_blocked_text(a: &AudienceSummary) -> String {
+    let who = match (a.outsiders, a.external) {
+        (0, _) => "the channel is shared outside the company".to_string(),
+        (1, false) => "1 person in this channel isn't on the product team".to_string(),
+        (n, false) => format!("{n} people in this channel aren't on the product team"),
+        (1, true) => {
+            "1 person in this channel isn't on the product team, and it is shared outside the company"
+                .to_string()
+        }
+        (n, true) => format!(
+            "{n} people in this channel aren't on the product team, and it is shared outside the company"
+        ),
+    };
+    format!(
+        "this draft uses restricted sources and {who}, so PM OS won't post it. Nothing was posted"
+    )
 }
 
 /// What one session (or one approval item) may do: from its skill, or from its bot's role
@@ -157,6 +216,15 @@ struct Policy {
     /// Its skill's or role's model, for the ledger.
     model: ModelRole,
     bot: Option<(Arc<Bot>, Arc<Role>)>,
+}
+
+/// The data class a connector read counts as: the public support docs are `public`;
+/// Jira, Confluence, Slack and anything else are `internal`.
+fn connector_class(system: &str) -> Sensitivity {
+    match system {
+        "docs" => Sensitivity::Public,
+        _ => Sensitivity::Internal,
+    }
 }
 
 /// The gateway alias for a model role, such as `pmos/default`.
@@ -224,6 +292,17 @@ pub struct ToolService {
     /// Refusals for invalid arguments, by session (token hash) and write tool, with when the
     /// session expires. In memory: a restart starts every session's count again.
     invalid_drafts: Mutex<HashMap<DraftKey, (u32, DateTime<Utc>)>>,
+    /// How long an undecided Slack draft waits, and a decided one keeps its text.
+    slack_draft_ttl: Duration,
+}
+
+/// What one sweep of Slack drafts did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Swept {
+    /// Undecided drafts that expired.
+    pub expired: usize,
+    /// Decided drafts whose text was removed.
+    pub redacted: usize,
 }
 
 /// A session's token hash and a write tool's registry name.
@@ -260,7 +339,20 @@ impl ToolService {
             stale_after_days: pmos_contract::lint::DEFAULT_STALE_AFTER_DAYS,
             ledger_expire_days: DEFAULT_EXPIRE_DAYS,
             invalid_drafts: Mutex::default(),
+            slack_draft_ttl: Duration::hours(DEFAULT_SLACK_DRAFT_TTL_HOURS),
         })
+    }
+
+    /// Expire undecided Slack drafts, and remove decided ones' text, after `hours`
+    /// (`PMOS_SLACK_DRAFT_TTL_HOURS`), from 1 to [`DEFAULT_SLACK_DRAFT_TTL_HOURS`].
+    pub fn with_slack_draft_ttl_hours(mut self, hours: i64) -> Self {
+        self.slack_draft_ttl = Duration::hours(hours.clamp(1, DEFAULT_SLACK_DRAFT_TTL_HOURS));
+        self
+    }
+
+    /// How long an undecided Slack draft waits before it expires.
+    pub fn slack_draft_ttl(&self) -> Duration {
+        self.slack_draft_ttl
     }
 
     /// Report pending ledger rows older than `days` as expired (`PMOS_LEDGER_EXPIRE_DAYS`).
@@ -629,11 +721,17 @@ impl ToolService {
 
         match (spec.kind, spec.system.as_str()) {
             (ToolKind::Read, "context") => {
-                self.context_tool(policy.ceiling, spec, args, now, event)
-                    .await
+                let (found, read) = self
+                    .context_tool(policy.ceiling, spec, args, now, event)
+                    .await?;
+                self.note_read(session, read).await?;
+                Ok(found)
             }
             (ToolKind::Read, "memory") => {
                 let notes = self.stores.memory.read(&session.user).await?;
+                if !notes.is_empty() {
+                    self.note_read(session, Some(Sensitivity::Internal)).await?;
+                }
                 Ok(json!({ "notes": notes }))
             }
             (ToolKind::Internal, "memory") => self.memory_update(session, args, now).await,
@@ -670,6 +768,10 @@ impl ToolService {
                     .iter()
                     .map(|i| format!("{}:{}", i.source.system, i.source.id))
                     .collect();
+                if !items.is_empty() {
+                    self.note_read(session, Some(connector_class(system)))
+                        .await?;
+                }
                 Ok(json!({ "results": items.iter().map(untrusted).collect::<Vec<_>>() }))
             }
             (ToolKind::Write, _) => self.write(session, spec, args, now, event).await,
@@ -680,13 +782,51 @@ impl ToolService {
         }
     }
 
+    /// Record that `session` read data of class `read` (nothing if `None`), so the items it
+    /// drafts say what they were built from. Fails closed: if it can't be recorded, the read
+    /// isn't returned.
+    async fn note_read(
+        &self,
+        session: &Session,
+        read: Option<Sensitivity>,
+    ) -> Result<(), ToolError> {
+        match read {
+            // Every session starts at public.
+            Some(class) if class > Sensitivity::Public => Ok(self
+                .stores
+                .sessions
+                .raise_sensitivity(&session.token, class)
+                .await?),
+            _ => Ok(()),
+        }
+    }
+
+    /// The highest data class `session` has read, as stored now: the session passed in may
+    /// have been loaded before its latest reads.
+    async fn sources_sensitivity(
+        &self,
+        session: &Session,
+        now: DateTime<Utc>,
+    ) -> Result<Sensitivity, ToolError> {
+        let stored = self
+            .stores
+            .sessions
+            .get(&session.token, now)
+            .await?
+            .map(|s| s.sources_sensitivity);
+        Ok(stored.map_or(session.sources_sensitivity, |s| {
+            s.max(session.sources_sensitivity)
+        }))
+    }
+
     fn connector(&self, system: &str) -> Result<&Arc<dyn Connector>, ToolError> {
         self.connectors
             .get(system)
             .ok_or_else(|| ToolError::Connector(format!("no connector for `{system}`")))
     }
 
-    /// `ceiling` is the session's data class: its skill's, or its bot's role's.
+    /// `ceiling` is the session's data class: its skill's, or its bot's role's. Returns the
+    /// result and the highest data class in it (`None` when nothing was found).
     async fn context_tool(
         &self,
         ceiling: Sensitivity,
@@ -694,7 +834,7 @@ impl ToolService {
         args: &Value,
         now: DateTime<Utc>,
         event: &mut AuditEvent,
-    ) -> Result<Value, ToolError> {
+    ) -> Result<(Value, Option<Sensitivity>), ToolError> {
         let today = now.date_naive();
         match spec.action() {
             "search" => {
@@ -724,13 +864,15 @@ impl ToolService {
                         found.withheld
                     ));
                 }
-                Ok(json!({
+                let read = allowed.iter().map(|h| h.doc.sensitivity).max();
+                let found = json!({
                     "results": allowed.iter().map(|h| {
                         let mut v = self.doc_meta(&h.doc, today);
                         v["snippet"] = json!(h.snippet);
                         v
                     }).collect::<Vec<_>>()
-                }))
+                });
+                Ok((found, read))
             }
             "read" => {
                 let path = args["path"].as_str().unwrap_or_default();
@@ -754,7 +896,7 @@ impl ToolService {
                 event.sources = vec![doc.path.clone()];
                 let mut v = self.doc_meta(&doc, today);
                 v["body"] = json!(doc.body);
-                Ok(v)
+                Ok((v, Some(doc.sensitivity)))
             }
             other => Err(ToolError::UnknownTool(format!("context.{other}"))),
         }
@@ -852,23 +994,39 @@ impl ToolService {
         }
         let content_sha = self.content_sha();
         let model = self.policy(session).map(|p| model_alias(p.model));
-        let item = self
-            .stores
-            .approvals
-            .create(
-                NewItem {
-                    user: &session.user,
-                    skill: session.skill.as_deref(),
-                    bot: session.bot.as_deref(),
-                    run_id: &session.run_id,
-                    tool: &spec.name,
-                    args,
-                    content_sha: content_sha.as_deref(),
-                    model_alias: model.as_deref(),
-                },
-                now,
-            )
-            .await?;
+        let new = NewItem {
+            user: &session.user,
+            skill: session.skill.as_deref(),
+            bot: session.bot.as_deref(),
+            run_id: &session.run_id,
+            tool: &spec.name,
+            args,
+            content_sha: content_sha.as_deref(),
+            model_alias: model.as_deref(),
+            sources_sensitivity: self.sources_sensitivity(session, now).await?,
+        };
+        let item = if spec.name == REPLY_TOOL {
+            let since = now - Duration::days(REPLY_WINDOW_DAYS);
+            match self.stores.approvals.create_reply(new, since, now).await? {
+                Drafted::New(item) => item,
+                // One draft per thread: the earlier one stands, and nothing new is queued.
+                Drafted::Existing(existing) => {
+                    event.outcome = Outcome::Ok;
+                    event.detail = Some("already drafted".into());
+                    event.output_ref = Some(existing.id.clone());
+                    return Ok(json!({
+                        "status": "already_drafted",
+                        "approval_id": existing.id,
+                        "message": format!(
+                            "A reply to this thread is already waiting for {} (or was posted); don't draft another.",
+                            session.user
+                        ),
+                    }));
+                }
+            }
+        } else {
+            self.stores.approvals.create(new, now).await?
+        };
         event.outcome = Outcome::Pending;
         event.output_ref = Some(item.id.clone());
         Ok(json!({
@@ -1049,6 +1207,10 @@ impl ToolService {
     /// item's skill must still declare the tool (or its bot's role still have it, not set to
     /// `never`). A reason may come only with `reject`; the ledger and the audit event keep it.
     ///
+    /// A Slack draft past `PMOS_SLACK_DRAFT_TTL_HOURS` is expired and can't be decided. Before
+    /// approving or editing a Slack write, its channel's audience is checked
+    /// ([`ToolService::check_audience`]); a refusal leaves the item pending.
+    ///
     /// The write runs in its own task, so a caller that disconnects can't cancel it halfway,
     /// and every way out of here is audited. The item is `executing` while the write runs;
     /// if the process dies then, [`ToolService::reconcile`] resolves it on the next start.
@@ -1086,17 +1248,38 @@ impl ToolService {
             }
             return Err(DecisionError::NotAMember(decided_by.to_string()));
         }
+        let current = self.stores.approvals.get(id).await?;
+        // A Slack draft past its time expires now, even if the sweeper hasn't reached it: the
+        // store then refuses the decision as `expired`.
+        let overdue = current.as_ref().is_some_and(|c| self.overdue(c, now));
+        if overdue {
+            self.expire_drafts(now).await?;
+        }
         // Check the write is still allowed before changing anything. Ownership and status
         // are checked again, atomically, by the store.
-        if decision != Decision::Reject {
-            if let Some(current) = self.stores.approvals.get(id).await? {
-                if current.user == decided_by && current.status == Status::Pending {
-                    let spec = self.write_spec(&current)?;
-                    if decision == Decision::Edit {
-                        let args = verdict.args.as_ref().ok_or(DecideError::MissingArgs)?;
-                        check_args(&spec.input_schema, args).map_err(DecisionError::InvalidArgs)?;
-                    }
+        let open = current
+            .as_ref()
+            .filter(|c| !overdue && c.user == decided_by && c.status == Status::Pending);
+        if let (true, Some(current)) = (decision != Decision::Reject, open) {
+            let spec = self.write_spec(current)?;
+            let args = match decision {
+                Decision::Edit => {
+                    let args = verdict.args.as_ref().ok_or(DecideError::MissingArgs)?;
+                    check_args(&spec.input_schema, args).map_err(DecisionError::InvalidArgs)?;
+                    args
                 }
+                _ => &current.args,
+            };
+            if SLACK_DRAFT_TOOLS.contains(&current.tool.as_str()) {
+                self.check_audience(
+                    client,
+                    current,
+                    args,
+                    verdict.confirm_external,
+                    decided_by,
+                    now,
+                )
+                .await?;
             }
         }
 
@@ -1148,6 +1331,141 @@ impl ToolService {
         tokio::spawn(async move { this.run_approved(item, event).await })
             .await
             .map_err(|e| DecisionError::Internal(e.to_string()))?
+    }
+
+    /// Who can see the channel a Slack write is for, checked with the PM's own token before
+    /// it posts (`docs/slack-reply-spec.md` §3). In order:
+    /// 1. a draft built from restricted sources (or from unrecorded ones) is blocked if anyone
+    ///    in the channel isn't in `team.yaml`, or the channel is shared outside the company;
+    /// 2. an externally shared channel needs `confirm_external`;
+    /// 3. otherwise the write goes ahead.
+    ///
+    /// If Slack's channel calls fail, nothing is written. Every refusal is audited.
+    async fn check_audience(
+        &self,
+        client: Client,
+        item: &ApprovalItem,
+        args: &Value,
+        confirm_external: bool,
+        decided_by: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), DecisionError> {
+        let event = |outcome, detail: String| AuditEvent {
+            client,
+            at: now,
+            run_id: item.run_id.clone(),
+            user: decided_by.to_string(),
+            skill: item.skill.clone(),
+            bot: item.bot.clone(),
+            tool: item.tool.clone(),
+            outcome,
+            sources: Vec::new(),
+            args_hash: Some(item.args_hash.clone()),
+            output_ref: Some(item.id.clone()),
+            detail: Some(detail),
+        };
+        let channel = args["channel"].as_str().unwrap_or_default();
+        let found = match self.connector("slack") {
+            Ok(slack) => slack
+                .audience(Caller::new(&item.user, &item.run_id), channel)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let audience: Audience = match found {
+            Ok(audience) => audience,
+            Err(why) => {
+                self.audit(event(
+                    Outcome::Error,
+                    format!("{AUDIENCE_UNAVAILABLE}: {why}"),
+                ))
+                .await;
+                return Err(DecisionError::AudienceUnavailable(why));
+            }
+        };
+        let counted = audience
+            .members
+            .iter()
+            .filter(|m| self.team.by_slack_id(m).is_none())
+            .count();
+        // Members past the cap weren't read: count them as at least one outsider.
+        let outsiders = counted.max(usize::from(audience.truncated));
+        let summary = AudienceSummary {
+            members: audience.members.len(),
+            outsiders,
+            external: audience.external,
+        };
+        let restricted = item
+            .sources_sensitivity
+            .is_none_or(|s| s == Sensitivity::Restricted);
+        if restricted && (outsiders > 0 || audience.external) {
+            self.audit(event(
+                Outcome::Denied,
+                format!(
+                    "{AUDIENCE_BLOCKED}: {outsiders} not in team.yaml, external: {}",
+                    audience.external
+                ),
+            ))
+            .await;
+            return Err(DecisionError::AudienceBlocked(summary));
+        }
+        if audience.external && !confirm_external {
+            self.audit(event(Outcome::Denied, NEEDS_EXTERNAL_CONFIRM.to_string()))
+                .await;
+            return Err(DecisionError::NeedsExternalConfirm(summary));
+        }
+        Ok(())
+    }
+
+    /// Is `item` a Slack draft still pending past its time?
+    fn overdue(&self, item: &ApprovalItem, now: DateTime<Utc>) -> bool {
+        item.status == Status::Pending
+            && SLACK_DRAFT_TOOLS.contains(&item.tool.as_str())
+            && item.created_at <= now - self.slack_draft_ttl
+    }
+
+    /// Expire every Slack draft still pending past its time, and audit each. Returns how
+    /// many.
+    async fn expire_drafts(&self, now: DateTime<Utc>) -> Result<usize, StoreError> {
+        let expired = self
+            .stores
+            .approvals
+            .expire(&SLACK_DRAFT_TOOLS, now - self.slack_draft_ttl, now)
+            .await?;
+        for item in &expired {
+            self.audit(AuditEvent {
+                client: Client::Orchestrator,
+                at: now,
+                run_id: item.run_id.clone(),
+                user: item.user.clone(),
+                skill: item.skill.clone(),
+                bot: item.bot.clone(),
+                tool: item.tool.clone(),
+                outcome: Outcome::Expired,
+                sources: Vec::new(),
+                args_hash: Some(item.args_hash.clone()),
+                output_ref: Some(item.id.clone()),
+                detail: Some(format!(
+                    "undecided after {} h: nothing was posted, and the draft's text was removed",
+                    self.slack_draft_ttl.num_hours()
+                )),
+            })
+            .await;
+        }
+        Ok(expired.len())
+    }
+
+    /// The Slack draft sweep (`docs/slack-reply-spec.md` §3), run every 10 minutes: undecided
+    /// drafts past `PMOS_SLACK_DRAFT_TTL_HOURS` expire, and decided ones lose their text that
+    /// long after their decision. The posted copy lives in Slack.
+    pub async fn sweep_slack_drafts(&self, now: DateTime<Utc>) -> Result<Swept, StoreError> {
+        let expired = self.expire_drafts(now).await?;
+        let redacted = self
+            .stores
+            .approvals
+            .redact_decided(&SLACK_DRAFT_TOOLS, now - self.slack_draft_ttl, now)
+            .await?;
+        Ok(Swept { expired, redacted })
     }
 
     /// The tool for an inbox item, if the item's skill may still run it, or its bot's role

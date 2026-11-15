@@ -7,6 +7,8 @@
 //!   go back to the model for this call only, and the audit log keeps ids only.
 //! - `conversations.replies`: a thread.
 //! - `chat.postMessage`: a reply (`thread_ts`) or a message.
+//! - `conversations.info` and `conversations.members`: who can see a channel, for the
+//!   audience check before a post (`docs/slack-reply-spec.md` §3). Always the PM's token.
 
 use std::sync::Arc;
 
@@ -14,7 +16,10 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::http::{arg, client, limit};
-use super::{Caller, Connector, ConnectorError, Item, SourceRef, DRAFTED_MARKER};
+use super::{
+    Audience, Caller, Connector, ConnectorError, Item, SourceRef, DRAFTED_MARKER,
+    MAX_AUDIENCE_MEMBERS,
+};
 use crate::oauth::TokenSource;
 use crate::vault::Provider;
 
@@ -284,6 +289,68 @@ impl Connector for Slack {
             "send_message" => self.post(caller, channel, None, text).await,
             other => Err(ConnectorError::Unsupported(format!("slack.{other}"))),
         }
+    }
+
+    async fn audience(
+        &self,
+        caller: Caller<'_>,
+        channel: &str,
+    ) -> Result<Audience, ConnectorError> {
+        let channel = slack_id(channel)?;
+        let what = format!("channel {channel}");
+        // The PM's own token: they are the one posting.
+        let info = self
+            .call(
+                caller.user,
+                "conversations.info",
+                &[("channel", channel)],
+                &what,
+            )
+            .await?;
+        let flag = |name: &str| info["channel"][name].as_bool().unwrap_or(false);
+        let (external, shared, im) = (flag("is_ext_shared"), flag("is_shared"), flag("is_im"));
+
+        let mut members = Vec::new();
+        let mut cursor = String::new();
+        let truncated = loop {
+            let page = (MAX_AUDIENCE_MEMBERS - members.len()).min(200).to_string();
+            let mut form = vec![("channel", channel), ("limit", page.as_str())];
+            if !cursor.is_empty() {
+                form.push(("cursor", cursor.as_str()));
+            }
+            let body = self
+                .call(caller.user, "conversations.members", &form, &what)
+                .await?;
+            let before = members.len();
+            members.extend(
+                body["members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(String::from),
+            );
+            cursor = body["response_metadata"]["next_cursor"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if cursor.is_empty() {
+                break false;
+            }
+            // At the cap, or an empty page that still names a cursor (which would never end):
+            // there may be members not read.
+            if members.len() >= MAX_AUDIENCE_MEMBERS || members.len() == before {
+                break true;
+            }
+        };
+        members.truncate(MAX_AUDIENCE_MEMBERS);
+        Ok(Audience {
+            external,
+            shared,
+            im,
+            members,
+            truncated,
+        })
     }
 }
 

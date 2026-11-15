@@ -143,6 +143,7 @@ macro_rules! contract {
 
 contract!(
     sessions_expire_and_revoke,
+    session_sensitivity_only_rises,
     bot_sessions_keep_their_bot,
     approval_items_and_audit_events_keep_their_bot,
     grants_match_one_exact_call_once,
@@ -152,6 +153,8 @@ contract!(
     decisions_win_once_under_concurrency,
     completion_records_results_and_failures,
     interrupted_writes_are_found,
+    replies_are_drafted_once_per_thread,
+    slack_drafts_expire_and_lose_their_text,
     ledger_rows_record_every_outcome,
     ledger_reads_filter_and_order,
     ledger_rows_follow_concurrent_decisions,
@@ -208,6 +211,40 @@ async fn sessions_expire_and_revoke(b: &Backend) {
         .is_none());
 }
 
+async fn session_sensitivity_only_rises(b: &Backend) {
+    let s = Session::new("ana", "ask", "r1", Duration::minutes(30), now());
+    b.stores.sessions.insert(&s, now()).await.unwrap();
+    let read = || async {
+        b.stores
+            .sessions
+            .get(&s.token, now())
+            .await
+            .unwrap()
+            .unwrap()
+            .sources_sensitivity
+    };
+    assert_eq!(read().await, Sensitivity::Public);
+    for (raise, want) in [
+        (Sensitivity::Internal, Sensitivity::Internal),
+        (Sensitivity::Public, Sensitivity::Internal),
+        (Sensitivity::Restricted, Sensitivity::Restricted),
+        (Sensitivity::Internal, Sensitivity::Restricted),
+    ] {
+        b.stores
+            .sessions
+            .raise_sensitivity(&s.token, raise)
+            .await
+            .unwrap();
+        assert_eq!(read().await, want, "after {raise}");
+    }
+    // An unknown token is a no-op.
+    b.stores
+        .sessions
+        .raise_sensitivity("pmos_s_unknown", Sensitivity::Restricted)
+        .await
+        .unwrap();
+}
+
 async fn bot_sessions_keep_their_bot(b: &Backend) {
     let bot = Session::for_bot("ana", "scout", "tsk_1", Duration::minutes(30), now());
     let skill = Session::new("ana", "ask", "r1", Duration::minutes(30), now());
@@ -248,6 +285,7 @@ async fn approval_items_and_audit_events_keep_their_bot(b: &Backend) {
                 args: &args,
                 content_sha: None,
                 model_alias: None,
+                sources_sensitivity: Sensitivity::Internal,
             },
             now(),
         )
@@ -374,6 +412,7 @@ fn new_item<'a>(user: &'a str, args: &'a Value) -> NewItem<'a> {
         args,
         content_sha: Some("0123456789abcdef0123456789abcdef01234567"),
         model_alias: Some("pmos/default"),
+        sources_sensitivity: Sensitivity::Internal,
     }
 }
 
@@ -576,6 +615,206 @@ async fn interrupted_writes_are_found(b: &Backend) {
     assert_eq!(stuck, vec![early.id]);
 }
 
+// ----- Slack drafts (docs/slack-reply-spec.md §3) -----------------------------------------
+
+fn slack_item<'a>(tool: &'a str, args: &'a Value) -> NewItem<'a> {
+    NewItem {
+        user: "ana",
+        skill: None,
+        bot: Some("pm-ana"),
+        run_id: "tsk_1",
+        tool,
+        args,
+        content_sha: None,
+        model_alias: Some("pmos/default"),
+        sources_sensitivity: Sensitivity::Restricted,
+    }
+}
+
+async fn replies_are_drafted_once_per_thread(b: &Backend) {
+    use pmos_toolserver::approvals::Drafted;
+    let a = b.stores.approvals.as_ref();
+    let args = json!({"channel": "C0PMTEAM", "thread_ts": "1731600000.000100", "text": "Yes"});
+    let since = now() - Duration::days(7);
+    let Drafted::New(first) = a
+        .create_reply(slack_item("slack.post_reply", &args), since, now())
+        .await
+        .unwrap()
+    else {
+        panic!("the first draft is new");
+    };
+    assert_eq!(first.sources_sensitivity, Some(Sensitivity::Restricted));
+    let other = json!({"channel": "C0PMTEAM", "thread_ts": "1731600000.000100", "text": "No"});
+    assert_eq!(
+        a.create_reply(slack_item("slack.post_reply", &other), since, now())
+            .await
+            .unwrap(),
+        Drafted::Existing(first.clone())
+    );
+    // Older than the window: doesn't count.
+    let later = now() + Duration::days(8);
+    assert!(matches!(
+        a.create_reply(
+            slack_item("slack.post_reply", &other),
+            later - Duration::days(7),
+            later
+        )
+        .await
+        .unwrap(),
+        Drafted::New(_)
+    ));
+    // Arguments with no thread are created as usual.
+    let no_thread = json!({"channel": "C0PMTEAM", "text": "Hi"});
+    for _ in 0..2 {
+        assert!(matches!(
+            a.create_reply(slack_item("slack.post_reply", &no_thread), since, now())
+                .await
+                .unwrap(),
+            Drafted::New(_)
+        ));
+    }
+
+    // Concurrent drafts for one thread: one is created.
+    let race = json!({"channel": "C0FIELD", "thread_ts": "1731601200.000600", "text": "x"});
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let approvals = b.stores.approvals.clone();
+        let race = race.clone();
+        handles.push(tokio::spawn(async move {
+            approvals
+                .create_reply(slack_item("slack.post_reply", &race), since, now())
+                .await
+                .unwrap()
+        }));
+    }
+    let mut created = 0;
+    for h in handles {
+        if matches!(h.await.unwrap(), Drafted::New(_)) {
+            created += 1;
+        }
+    }
+    assert_eq!(created, 1);
+}
+
+async fn slack_drafts_expire_and_lose_their_text(b: &Backend) {
+    use pmos_toolserver::approvals::{EXPIRED_TEXT, SLACK_DRAFT_TOOLS};
+    let a = b.stores.approvals.as_ref();
+    let reply = json!({"channel": "C0PMTEAM", "thread_ts": "1731600000.000100", "text": "Yes"});
+    let message = json!({"channel": "C0PMTEAM", "text": "Standup moved"});
+    let issue = json!({"summary": "SCIM"});
+    let old = a
+        .create(slack_item("slack.post_reply", &reply), now())
+        .await
+        .unwrap();
+    let sent = a
+        .create(slack_item("slack.send_message", &message), now())
+        .await
+        .unwrap();
+    let young = a
+        .create(
+            slack_item("slack.post_reply", &reply),
+            now() + Duration::hours(2),
+        )
+        .await
+        .unwrap();
+    let jira = a
+        .create(slack_item("jira.create_issue", &issue), now())
+        .await
+        .unwrap();
+    let decided = a
+        .create(slack_item("slack.post_reply", &reply), now())
+        .await
+        .unwrap();
+    a.decide(&decided.id, "ana", Decision::Reject, None, now())
+        .await
+        .unwrap();
+
+    let at = now() + Duration::hours(24);
+    let expired = a
+        .expire(&SLACK_DRAFT_TOOLS, now() + Duration::hours(1), at)
+        .await
+        .unwrap();
+    // Oldest first; these two were created at the same time, so by id.
+    let ids: Vec<&str> = expired.iter().map(|i| i.id.as_str()).collect();
+    let mut want = vec![old.id.as_str(), sent.id.as_str()];
+    want.sort();
+    assert_eq!(ids, want);
+    assert!(expired.iter().all(|i| i.status == Status::Expired));
+    let stored = a.get(&old.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, Status::Expired);
+    assert_eq!(
+        stored.args,
+        json!({"channel": "C0PMTEAM", "thread_ts": "1731600000.000100", "text": EXPIRED_TEXT})
+    );
+    assert_eq!(stored.args_hash, old.args_hash);
+    assert_eq!(stored.redacted_at, Some(at));
+    assert_eq!(
+        a.get(&sent.id).await.unwrap().unwrap().args,
+        json!({"channel": "C0PMTEAM", "text": EXPIRED_TEXT})
+    );
+    for kept in [&young.id, &jira.id] {
+        assert_eq!(a.get(kept).await.unwrap().unwrap().status, Status::Pending);
+    }
+    assert!(a
+        .expire(&SLACK_DRAFT_TOOLS, now() + Duration::hours(1), at)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // An expired item can't be decided, by its user; anyone else is still forbidden.
+    assert_eq!(
+        a.decide(&old.id, "ana", Decision::Approve, None, at).await,
+        Err(DecideError::Expired)
+    );
+    assert_eq!(
+        a.decide(&old.id, "bo", Decision::Approve, None, at).await,
+        Err(DecideError::Forbidden)
+    );
+
+    // The ledger stores it, with no decision.
+    let rows = a
+        .ledger(&LedgerQuery::all(now() - Duration::days(30)))
+        .await
+        .unwrap();
+    let row = ledger_row(&rows, &old.id);
+    assert_eq!(row.outcome, LedgerOutcome::Expired);
+    assert!(row.decided_at.is_none());
+    assert_eq!(ledger_row(&rows, &jira.id).outcome, LedgerOutcome::Pending);
+    let only = a
+        .ledger(&LedgerQuery {
+            outcomes: vec![LedgerOutcome::Expired],
+            ..LedgerQuery::all(now() - Duration::days(30))
+        })
+        .await
+        .unwrap();
+    assert_eq!(only.len(), 2);
+
+    // Decided items lose their text once, after `before`; pending and expired ones aren't
+    // touched by this.
+    assert_eq!(
+        a.redact_decided(&SLACK_DRAFT_TOOLS, now() - Duration::seconds(1), at)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        a.redact_decided(&SLACK_DRAFT_TOOLS, now(), at)
+            .await
+            .unwrap(),
+        1
+    );
+    let redacted = a.get(&decided.id).await.unwrap().unwrap();
+    assert_eq!(redacted.status, Status::Rejected);
+    assert_eq!(redacted.args["text"], EXPIRED_TEXT);
+    assert_eq!(redacted.redacted_at, Some(at));
+    assert_eq!(
+        a.redact_decided(&SLACK_DRAFT_TOOLS, at, at).await.unwrap(),
+        0,
+        "once"
+    );
+    assert_eq!(a.get(&young.id).await.unwrap().unwrap().args["text"], "Yes");
+}
+
 // ----- the feedback ledger ----------------------------------------------------------------
 
 fn bot_item<'a>(bot: &'a str, args: &'a Value) -> NewItem<'a> {
@@ -588,6 +827,7 @@ fn bot_item<'a>(bot: &'a str, args: &'a Value) -> NewItem<'a> {
         args,
         content_sha: None,
         model_alias: Some("pmos/extraction"),
+        sources_sensitivity: Sensitivity::Internal,
     }
 }
 
@@ -641,6 +881,7 @@ async fn ledger_rows_record_every_outcome(b: &Backend) {
             decision: Decision::Reject,
             args: None,
             reason: Some(Reason::WrongFacts),
+            confirm_external: false,
         },
         decided,
     )
@@ -659,6 +900,7 @@ async fn ledger_rows_record_every_outcome(b: &Backend) {
             decision: Decision::Approve,
             args: None,
             reason: Some(Reason::Tone),
+            confirm_external: false,
         },
         decided,
     )
@@ -768,6 +1010,7 @@ async fn ledger_reads_filter_and_order(b: &Backend) {
             decision: Decision::Reject,
             args: None,
             reason: Some(Reason::Tone),
+            confirm_external: false,
         },
         t(30),
     )
@@ -887,6 +1130,7 @@ async fn ledger_rows_follow_concurrent_decisions(b: &Backend) {
                     decision: Decision::Reject,
                     args: None,
                     reason: Some(Reason::Incomplete),
+                    confirm_external: false,
                 }
             };
             approvals

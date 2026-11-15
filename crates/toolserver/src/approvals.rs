@@ -5,12 +5,17 @@
 //! it here. Grants are single-use and short-lived. A write with no grant never runs; it
 //! becomes a pending **approval item** in the PM's inbox, and runs only when its own user
 //! approves it there.
+//!
+//! Slack drafts keep their text a limited time (`docs/slack-reply-spec.md` §3): an undecided
+//! one becomes `expired` after `PMOS_SLACK_DRAFT_TTL_HOURS`, and a decided one loses its text
+//! that long after its decision. Either way only `channel`, `thread_ts` and the args hash stay.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use pmos_contract::Sensitivity;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -20,6 +25,47 @@ use crate::store::{StoreError, StoreResult};
 
 /// How long a grant stays valid after the PM approves.
 pub const GRANT_TTL_MINUTES: i64 = 15;
+
+/// The Slack drafts that expire and lose their text after `PMOS_SLACK_DRAFT_TTL_HOURS`
+/// (`docs/slack-reply-spec.md` §3).
+pub const SLACK_DRAFT_TOOLS: [&str; 2] = ["slack.post_reply", "slack.send_message"];
+/// The one tool that drafts at most once per thread.
+pub const REPLY_TOOL: &str = "slack.post_reply";
+/// What a removed string argument reads.
+pub const EXPIRED_TEXT: &str = "[expired]";
+/// The arguments an expired or decided Slack draft keeps: where it was for, not what it said.
+const KEPT_ARGS: [&str; 2] = ["channel", "thread_ts"];
+
+/// `args` with every string replaced by [`EXPIRED_TEXT`], at any depth, except a top-level
+/// `channel` and `thread_ts`.
+pub fn redact_args(args: &Value) -> Value {
+    fn all(value: &Value) -> Value {
+        match value {
+            Value::String(_) => Value::String(EXPIRED_TEXT.into()),
+            Value::Array(items) => Value::Array(items.iter().map(all).collect()),
+            Value::Object(map) => {
+                Value::Object(map.iter().map(|(k, v)| (k.clone(), all(v))).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    match args {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    let kept = KEPT_ARGS.contains(&k.as_str()) && v.is_string();
+                    (k.clone(), if kept { v.clone() } else { all(v) })
+                })
+                .collect(),
+        ),
+        other => all(other),
+    }
+}
+
+/// The thread a `slack.post_reply` call is for: its `channel` and `thread_ts`.
+pub fn reply_thread(args: &Value) -> Option<(&str, &str)> {
+    Some((args["channel"].as_str()?, args["thread_ts"].as_str()?))
+}
 
 /// SHA-256 of the canonical JSON form of `args` (object keys sorted at every level).
 pub fn args_hash(args: &Value) -> String {
@@ -57,6 +103,9 @@ pub enum Status {
     Rejected,
     /// Approved, but the write failed or its outcome is unknown; `result` says which.
     Failed,
+    /// A Slack draft nobody decided within `PMOS_SLACK_DRAFT_TTL_HOURS`. Nothing was posted,
+    /// and its text is gone.
+    Expired,
 }
 
 impl Status {
@@ -67,6 +116,7 @@ impl Status {
             Self::Approved => "approved",
             Self::Rejected => "rejected",
             Self::Failed => "failed",
+            Self::Expired => "expired",
         }
     }
 
@@ -77,6 +127,7 @@ impl Status {
             "approved" => Some(Self::Approved),
             "rejected" => Some(Self::Rejected),
             "failed" => Some(Self::Failed),
+            "expired" => Some(Self::Expired),
             _ => None,
         }
     }
@@ -104,6 +155,13 @@ pub struct ApprovalItem {
     pub decided_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    /// The highest data class the drafting session had read when the item was created.
+    /// `None` for items made before it was recorded, which count as `restricted`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sources_sensitivity: Option<Sensitivity>,
+    /// When a Slack draft's text was removed: on expiry, or a day after its decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redacted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -114,13 +172,15 @@ pub enum Decision {
     Reject,
 }
 
-/// A decision with what came with it: the edited arguments for `edit`, and optionally a
-/// reason for `reject` (the ledger keeps it).
+/// A decision with what came with it: the edited arguments for `edit`, optionally a reason
+/// for `reject` (the ledger keeps it), and for a Slack write, whether the PM confirmed
+/// posting to an externally shared channel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Verdict {
     pub decision: Decision,
     pub args: Option<Value>,
     pub reason: Option<Reason>,
+    pub confirm_external: bool,
 }
 
 impl Verdict {
@@ -129,6 +189,7 @@ impl Verdict {
             decision,
             args,
             reason: None,
+            confirm_external: false,
         }
     }
 
@@ -146,6 +207,9 @@ pub enum DecideError {
     Forbidden,
     #[error("approval item is already decided")]
     NotPending,
+    /// A Slack draft nobody decided in time: nothing was posted.
+    #[error("this draft expired before it was decided; nothing was posted")]
+    Expired,
     #[error("an edit decision needs the edited arguments")]
     MissingArgs,
     #[error(transparent)]
@@ -165,6 +229,8 @@ pub struct NewItem<'a> {
     pub content_sha: Option<&'a str>,
     /// For the ledger: the drafting role's gateway alias, such as `pmos/default`.
     pub model_alias: Option<&'a str>,
+    /// The highest data class the drafting session had read.
+    pub sources_sensitivity: Sensitivity,
 }
 
 impl NewItem<'_> {
@@ -203,8 +269,36 @@ impl NewItem<'_> {
             decided_at: None,
             decided_by: None,
             result: None,
+            sources_sensitivity: Some(self.sources_sensitivity),
+            redacted_at: None,
         }
     }
+}
+
+/// What [`ApprovalRepo::create_reply`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Drafted {
+    New(ApprovalItem),
+    /// A reply to the same thread was already waiting, being posted, or posted.
+    Existing(ApprovalItem),
+}
+
+/// Does `item` stop `user` drafting another reply to `thread`? It does if it is their reply
+/// to that thread, created at or after `since`, and waiting, being posted or posted.
+pub fn blocks_reply(
+    item: &ApprovalItem,
+    user: &str,
+    thread: (&str, &str),
+    since: DateTime<Utc>,
+) -> bool {
+    item.user == user
+        && item.tool == REPLY_TOOL
+        && item.created_at >= since
+        && matches!(
+            item.status,
+            Status::Pending | Status::Executing | Status::Approved
+        )
+        && reply_thread(&item.args) == Some(thread)
 }
 
 /// Grants, approval items and the feedback ledger (`ledger.rs`). `session_key` is the
@@ -234,6 +328,17 @@ pub trait ApprovalRepo: Send + Sync {
 
     /// Create a pending item and its ledger row.
     async fn create(&self, new: NewItem<'_>, now: DateTime<Utc>) -> StoreResult<ApprovalItem>;
+
+    /// Create a pending reply item, unless the same user has a reply to the same thread
+    /// (`channel` and `thread_ts`) created at or after `since` that is pending, executing or
+    /// approved: then return that one and create nothing. Of two concurrent calls for one
+    /// thread, exactly one creates. Arguments that name no thread are created as usual.
+    async fn create_reply(
+        &self,
+        new: NewItem<'_>,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Drafted>;
 
     async fn get(&self, id: &str) -> StoreResult<Option<ApprovalItem>>;
 
@@ -284,6 +389,26 @@ pub trait ApprovalRepo: Send + Sync {
     /// Ledger rows matching `query`, as reported (with `expired` worked out), newest
     /// activity first.
     async fn ledger(&self, query: &LedgerQuery) -> StoreResult<Vec<LedgerRow>>;
+
+    /// Expire `pending` items for `tools` created at or before `before`: each becomes
+    /// `expired`, its arguments go through [`redact_args`] (the args hash is kept),
+    /// `redacted_at` is `now`, and its ledger row is stored as `expired`. Returns them,
+    /// oldest first.
+    async fn expire(
+        &self,
+        tools: &[&str],
+        before: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Vec<ApprovalItem>>;
+
+    /// Remove the text of decided (`approved`, `rejected` or `failed`) items for `tools`,
+    /// decided at or before `before`, that still have it, the same way. Returns how many.
+    async fn redact_decided(
+        &self,
+        tools: &[&str],
+        before: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<usize>;
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +491,32 @@ impl ApprovalRepo for MemoryApprovals {
         Ok(item)
     }
 
+    async fn create_reply(
+        &self,
+        new: NewItem<'_>,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Drafted> {
+        let item = new.into_item(now);
+        let row = new.ledger_row(&item);
+        let mut state = self.state.lock().expect("approvals lock");
+        if let Some(thread) = reply_thread(new.args) {
+            let existing = state
+                .items
+                .values()
+                .filter(|i| blocks_reply(i, new.user, thread, since))
+                .max_by_key(|i| i.created_at);
+            if let Some(existing) = existing {
+                return Ok(Drafted::Existing(existing.clone()));
+            }
+        }
+        state.items.insert(item.id.clone(), item.clone());
+        state
+            .ledger
+            .insert(item.id.clone(), Ledgered { row, edited: false });
+        Ok(Drafted::New(item))
+    }
+
     async fn get(&self, id: &str) -> StoreResult<Option<ApprovalItem>> {
         Ok(self
             .state
@@ -399,6 +550,9 @@ impl ApprovalRepo for MemoryApprovals {
         let item = state.items.get_mut(id).ok_or(DecideError::NotFound)?;
         if item.user != decided_by {
             return Err(DecideError::Forbidden);
+        }
+        if item.status == Status::Expired {
+            return Err(DecideError::Expired);
         }
         if item.status != Status::Pending {
             return Err(DecideError::NotPending);
@@ -503,6 +657,56 @@ impl ApprovalRepo for MemoryApprovals {
         }
         Ok(rows)
     }
+
+    async fn expire(
+        &self,
+        tools: &[&str],
+        before: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Vec<ApprovalItem>> {
+        let mut state = self.state.lock().expect("approvals lock");
+        let mut expired = Vec::new();
+        for item in state.items.values_mut().filter(|i| {
+            i.status == Status::Pending
+                && tools.contains(&i.tool.as_str())
+                && i.created_at <= before
+        }) {
+            item.status = Status::Expired;
+            item.args = redact_args(&item.args);
+            item.redacted_at = Some(now);
+            expired.push(item.clone());
+        }
+        for item in &expired {
+            if let Some(entry) = state.ledger.get_mut(&item.id) {
+                entry.row.outcome = LedgerOutcome::Expired;
+            }
+        }
+        expired.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        Ok(expired)
+    }
+
+    async fn redact_decided(
+        &self,
+        tools: &[&str],
+        before: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<usize> {
+        let mut state = self.state.lock().expect("approvals lock");
+        let mut n = 0;
+        for item in state.items.values_mut().filter(|i| {
+            matches!(
+                i.status,
+                Status::Approved | Status::Rejected | Status::Failed
+            ) && tools.contains(&i.tool.as_str())
+                && i.redacted_at.is_none()
+                && i.decided_at.is_some_and(|d| d <= before)
+        }) {
+            item.args = redact_args(&item.args);
+            item.redacted_at = Some(now);
+            n += 1;
+        }
+        Ok(n)
+    }
 }
 
 #[cfg(test)]
@@ -526,9 +730,32 @@ mod tests {
             Status::Approved,
             Status::Rejected,
             Status::Failed,
+            Status::Expired,
         ] {
             assert_eq!(Status::parse(s.as_str()), Some(s));
         }
         assert_eq!(Status::parse("maybe"), None);
+    }
+
+    #[test]
+    fn redaction_keeps_only_where_the_draft_was_for() {
+        let args = json!({
+            "channel": "C0PMTEAM", "thread_ts": "1731600000.000100",
+            "text": "Yes, SSO ships in 4.2.", "blocks": [{"text": "x", "n": 2}], "n": 1,
+        });
+        assert_eq!(
+            redact_args(&args),
+            json!({
+                "channel": "C0PMTEAM", "thread_ts": "1731600000.000100",
+                "text": EXPIRED_TEXT, "blocks": [{"text": EXPIRED_TEXT, "n": 2}], "n": 1,
+            })
+        );
+        // Kept only at the top level, and only as strings.
+        assert_eq!(
+            redact_args(&json!({"nested": {"channel": "C1"}, "channel": ["C1"]})),
+            json!({"nested": {"channel": EXPIRED_TEXT}, "channel": [EXPIRED_TEXT]})
+        );
+        assert_eq!(reply_thread(&args), Some(("C0PMTEAM", "1731600000.000100")));
+        assert_eq!(reply_thread(&json!({"channel": "C1"})), None);
     }
 }

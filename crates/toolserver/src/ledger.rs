@@ -34,7 +34,9 @@ pub enum LedgerOutcome {
     Rejected,
     /// Approved, but the write failed or its outcome is unknown.
     Failed,
-    /// Pending for longer than the expiry. Never stored: worked out when the row is read.
+    /// Never decided. Stored for a Slack draft that expired after
+    /// `PMOS_SLACK_DRAFT_TTL_HOURS`; for any other tool, worked out when the row is read, for
+    /// a row pending longer than `PMOS_LEDGER_EXPIRE_DAYS`.
     Expired,
 }
 
@@ -147,7 +149,7 @@ impl LedgerRow {
     }
 
     /// The row as reported: a stored `pending` row that was never decided and was created
-    /// before `expire_before` reads as `expired`.
+    /// before `expire_before` reads as `expired`. A stored `expired` row reads as it is.
     pub fn reported(mut self, expire_before: DateTime<Utc>) -> Self {
         if self.outcome == LedgerOutcome::Pending
             && self.decided_at.is_none()
