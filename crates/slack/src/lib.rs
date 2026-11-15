@@ -34,3 +34,4 @@ pub mod runtime;
 pub mod slackapi;
 pub mod socket;
 pub mod toolserver;
+pub mod triage;
