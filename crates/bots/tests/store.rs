@@ -348,6 +348,52 @@ async fn notifications_are_ordered_and_paged(store: Arc<dyn BotsStore>) {
     assert_eq!(store.notifications(0, 100).await.unwrap().len(), 3);
 }
 
+/// An eval task's changes never reach the Slack feed, on either store (spec §3): its
+/// transition still applies, but no notification is written.
+async fn eval_tasks_write_no_notifications(store: Arc<dyn BotsStore>) {
+    let now = at(2026, 11, 14, 10, 0);
+    let mut eval = task("docs", "evals", Source::Eval, 1);
+    eval.slack = None;
+    store.create_task(&eval, "queued").await.unwrap();
+    let claimed = store
+        .claim(None, "w1", now + Duration::seconds(120), now)
+        .await
+        .unwrap()
+        .expect("the eval task is claimed");
+    assert_eq!(claimed.id, eval.id);
+    let change = Transition {
+        to: Some(TaskStatus::Done),
+        event: Some(("status".into(), "done".into())),
+        notify: Some(NewNotification::new(NotificationKind::Done, "the answer")),
+        ..Transition::from(&[TaskStatus::Working])
+    };
+    let done = store
+        .transition(&eval.id, &change, now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.status, TaskStatus::Done, "the change itself applies");
+    assert!(
+        store.notifications(0, 100).await.unwrap().is_empty(),
+        "an eval task notifies nobody"
+    );
+    // A Slack task's same change does notify.
+    let slack = task("docs", "ana", Source::Slack, 2);
+    store.create_task(&slack, "queued").await.unwrap();
+    store
+        .claim(None, "w1", now + Duration::seconds(120), now)
+        .await
+        .unwrap();
+    store
+        .transition(&slack.id, &change, now)
+        .await
+        .unwrap()
+        .unwrap();
+    let feed = store.notifications(0, 100).await.unwrap();
+    assert_eq!(feed.len(), 1);
+    assert_eq!(feed[0].task_id, slack.id);
+}
+
 /// Notifications written at the same time from many tasks still get distinct, increasing
 /// numbers with no gaps a reader could skip.
 async fn concurrent_notifications_have_distinct_numbers(store: Arc<dyn BotsStore>) {
@@ -671,6 +717,7 @@ both_stores!(
     a_refused_change_leaves_the_task_claimable,
     expired_leases_are_found,
     notifications_are_ordered_and_paged,
+    eval_tasks_write_no_notifications,
     concurrent_notifications_have_distinct_numbers,
     traces_redact_slack_and_expire,
     routines_crud,

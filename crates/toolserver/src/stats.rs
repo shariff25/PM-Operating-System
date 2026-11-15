@@ -216,13 +216,25 @@ fn round_sig(x: f64, digits: i32) -> f64 {
 
 /// A sample size from the formula: rounded up, but not past floating-point noise (a value a
 /// hair above a whole number is that number).
-fn ceil_n(n: f64) -> u64 {
+/// The most users per arm `stats.sample_size` answers with: past this the inputs describe
+/// an effect too small to test, and the numbers would only overflow.
+pub const MAX_PER_ARM: f64 = 1e12;
+
+/// `n` rounded up to whole users, or why it isn't an answer: not finite, or more than
+/// [`MAX_PER_ARM`].
+fn ceil_n(n: f64) -> Result<u64, String> {
+    if !n.is_finite() || n > MAX_PER_ARM {
+        return Err(
+            "that needs more than 10^12 users per arm: the effect is too small to detect; make `mde` larger"
+                .into(),
+        );
+    }
     let nearest = n.round();
-    if (n - nearest).abs() < 1e-9 * n.max(1.0) {
+    Ok(if (n - nearest).abs() < 1e-9 * n.max(1.0) {
         nearest as u64
     } else {
         n.ceil() as u64
-    }
+    })
 }
 
 // ----- stats.sample_size ---------------------------------------------------------------
@@ -316,7 +328,7 @@ pub fn sample_size(args: &Value) -> Result<Value, String> {
             "test".into(),
             json!("two-proportion z-test, unpooled variance"),
         );
-        ceil_n(n)
+        ceil_n(n)?
     } else {
         let sd = number(args, "std_dev")?
             .ok_or("`std_dev` is required for a `mean` metric (the metric's standard deviation)")?;
@@ -338,9 +350,10 @@ pub fn sample_size(args: &Value) -> Result<Value, String> {
         assumptions.insert("target".into(), json!(round_sig(baseline + delta, 10)));
         assumptions.insert("absolute_effect".into(), json!(round_sig(delta, 10)));
         assumptions.insert("test".into(), json!("two-sample z-test on means"));
-        ceil_n(n)
+        ceil_n(n)?
     };
-    let total = per_arm * variants;
+    let too_many = || "the total sample size is too large to compute".to_string();
+    let total = per_arm.checked_mul(variants).ok_or_else(too_many)?;
 
     assumptions.insert("alpha".into(), json!(alpha));
     assumptions.insert("power".into(), json!(power));
@@ -367,13 +380,14 @@ pub fn sample_size(args: &Value) -> Result<Value, String> {
     if let Some(daily) = daily_users {
         let days = total.div_ceil(daily);
         let weeks = days.div_ceil(7);
+        let week_days = weeks.checked_mul(7).ok_or_else(too_many)?;
         assumptions.insert("daily_users".into(), json!(daily));
         out["days"] = json!(days);
         note.push_str(&format!(
             " At {daily} users a day that is {days} day{}; run whole weeks so every weekday is covered: plan {weeks} week{} ({} days).",
             if days == 1 { "" } else { "s" },
             if weeks == 1 { "" } else { "s" },
-            weeks * 7
+            week_days
         ));
     }
     note.push_str(" Decide the sample size before the test starts and don't stop early on a good-looking result.");
@@ -757,6 +771,10 @@ mod tests {
             json!({"metric": "median", "baseline": 0.1, "mde": 0.1}),
             json!({"metric": "proportion", "baseline": "ten", "mde": 0.1}),
             json!({"baseline": 0.1, "mde": 0.1}),
+            // Too small an effect: more than 10^12 users per arm, or not finite.
+            json!({"metric": "mean", "baseline": 10.0, "std_dev": 1e9, "mde": 1e-6, "mde_kind": "absolute"}),
+            json!({"metric": "mean", "baseline": 10.0, "std_dev": 1e300, "mde": 1e-300, "mde_kind": "absolute"}),
+            json!({"metric": "proportion", "baseline": 0.5, "mde": 1e-12, "mde_kind": "absolute"}),
         ];
         for args in bad {
             assert!(sample_size(&args).is_err(), "{args}");

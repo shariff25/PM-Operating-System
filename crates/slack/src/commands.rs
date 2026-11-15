@@ -154,6 +154,10 @@ impl Commands {
                     "PM OS couldn't run that search: {}",
                     blocks::escape(&why)
                 )),
+                Err(e @ CallError::NotFound) => blocks::text(&format!(
+                    "PM OS couldn't run that search: {}",
+                    blocks::escape(&e.to_string())
+                )),
             };
             post_reply(&this.http, &response_url, &message).await;
         });

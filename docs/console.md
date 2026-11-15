@@ -6,7 +6,7 @@ things up. It has four screens and nothing else, so there's never a screen for o
 
 ```
 browser ──SSO proxy──► pmos-console :8760 ──► pmos-bots :8750 (client "console")
-                                         └──► pmos-toolserver :8710 (approvals, service token)
+                                         └──► pmos-toolserver :8710 (approvals, console token)
                                          └──► tool server audit file (read-only, optional)
 ```
 
@@ -41,13 +41,18 @@ console before any call: a PM's routine action is checked against their own rout
 - **Behind the Spark's SSO proxy:** with `PMOS_CONSOLE_TRUST_PROXY=1`, the proxy's
   `X-Forwarded-User` names the person. It may be a PM OS handle or the member's email.
   Without that setting the header is ignored.
+- **The proxy's secret:** with `PMOS_CONSOLE_TRUST_PROXY=1`, every request but `/healthz`
+  must also carry `X-Pmos-Proxy-Secret` equal to `PMOS_CONSOLE_PROXY_SECRET` (at least 32
+  characters; the console won't start without it). It is compared in constant time before
+  `X-Forwarded-User` is read; a request without it, or with a wrong one, is `401`.
 - **Development:** `PMOS_CONSOLE_DEV_USER=<handle>` makes every request that person.
 - Set exactly one of the two; the console won't start with both or neither.
 - **The person must be in `team.yaml`.** It's re-read on every request, so removing someone
   takes effect at once. Nobody signed in is `401`; someone not on the team is `403`.
 
-With `PMOS_CONSOLE_TRUST_PROXY=1`, anyone who can reach the console's port can claim to be
-anyone. Bind it where only the proxy can reach it (the default is `127.0.0.1:8760`).
+Only the proxy holds the secret, so a caller that reaches the console's port some other way
+can't name a user. Still bind it where only the proxy can reach it (the default is
+`127.0.0.1:8760`).
 
 ## Forms
 
@@ -55,7 +60,7 @@ Pause, resume and delete are `POST` forms. Each one is checked twice before anyt
 - **A form token** bound to the person: an HMAC of their handle under a key made at start-up.
   A restart invalidates open forms; reloading the page gives a fresh one.
 - **Its origin:** `Sec-Fetch-Site` must not be another site, and `Origin` (or else `Referer`)
-  must be the console. That's `PMOS_CONSOLE_PUBLIC_URL` when set, or else the request's
+  must be present and be the console; a post with neither is refused. That's `PMOS_CONSOLE_PUBLIC_URL` when set, or else the request's
   `Host`. Behind a proxy that rewrites `Host`, set `PMOS_CONSOLE_PUBLIC_URL`.
 
 A refused form is `403` and changes nothing. A done action redirects back to Routines with a
@@ -80,7 +85,9 @@ results.
 | Tool server `GET /internal/approvals?user=<handle>&status=pending` | Approvals: once for a PM, once per `team.yaml` member for an admin |
 | The tool server's audit file | A task's audit events: lines whose `run_id` is the task id, at most 500 |
 
-All runtime calls carry the `console` client token, and tool server calls the service token.
+All runtime calls carry the `console` client token. Tool server calls carry the tool
+server's own `console` token (`PMOS_CONSOLE_TS_TOKEN` there), which may read approvals
+(`GET /internal/approvals`, `GET /internal/approvals/{id}`) and nothing else.
 Each call times out after 10 seconds. If an upstream is down, the screen says which one, with
 `502`. On a task page, a missing events list, trace or audit file only blanks that section.
 
@@ -97,7 +104,7 @@ show. Where the spec leaves a shape open, it accepts either form:
 ```sh
 PMOS_CONSOLE_DEV_USER=ana \
 PMOS_BOTS_TOKEN=<the runtime's console token> \
-PMOS_TOOLSERVER_TOKEN=<the tool server's service token> \
+PMOS_TOOLSERVER_TOKEN=<the tool server's PMOS_CONSOLE_TS_TOKEN> \
 cargo run -p pmos-console
 ```
 
@@ -105,11 +112,12 @@ cargo run -p pmos-console
 | --- | --- | --- |
 | `PMOS_CONSOLE_BIND` | `127.0.0.1:8760` | |
 | `PMOS_CONSOLE_TRUST_PROXY` | off | `1` to trust `X-Forwarded-User` from the SSO proxy |
+| `PMOS_CONSOLE_PROXY_SECRET` | none | Required with `PMOS_CONSOLE_TRUST_PROXY=1`, at least 32 characters: what the proxy sends in `X-Pmos-Proxy-Secret` |
 | `PMOS_CONSOLE_DEV_USER` | none | A handle in `team.yaml`; every request is that person. Development only |
 | `PMOS_BOTS_URL` | `http://127.0.0.1:8750` | The bot runtime |
 | `PMOS_BOTS_TOKEN` | required | The `console` entry of the runtime's `PMOS_BOTS_TOKENS`. At least 32 characters |
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | |
-| `PMOS_TOOLSERVER_TOKEN` | required | The tool server's `PMOS_SERVICE_TOKEN`, which the approvals list needs. At least 32 characters, and different from `PMOS_BOTS_TOKEN` |
+| `PMOS_TOOLSERVER_TOKEN` | required | The tool server's read-only console token (`PMOS_CONSOLE_TS_TOKEN` there; never the service token). At least 32 characters, and different from `PMOS_BOTS_TOKEN` |
 | `PMOS_CONTENT_ROOT` | `content` | Where `team.yaml` is. The console won't start if it doesn't parse |
 | `PMOS_CONSOLE_AUDIT_LOG` | none | The tool server's `PMOS_AUDIT_LOG` file, mounted read-only. Without it, task pages say audit events aren't available |
 | `PMOS_CONSOLE_SLACK_URL` | none | The workspace, such as `https://acme.slack.com`, for links to Slack and to a task's thread |
