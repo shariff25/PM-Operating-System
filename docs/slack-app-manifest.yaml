@@ -61,6 +61,12 @@ oauth_config:
       - groups:history
       - im:history
       - mpim:history
+      # Channel info and members, for the audience check before PM OS posts as the PM
+      # (docs/slack-reply-spec.md §3).
+      - channels:read
+      - groups:read
+      - mpim:read
+      - im:read
       - chat:write
       # The audience check before a reply or message posts as the PM
       # (docs/slack-reply-spec.md §3): conversations.info (is it shared outside the company?)

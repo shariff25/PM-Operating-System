@@ -46,7 +46,9 @@ pub struct ApprovalState {
 }
 
 impl ApprovalState {
-    /// Still waiting for a PM, or approved and being written.
+    /// Still waiting for a PM, or approved and being written. Every other state is closed:
+    /// `approved`, `rejected`, `failed`, and `expired` (a Slack draft nobody decided within a
+    /// day).
     pub fn is_open(&self) -> bool {
         matches!(self.status.as_str(), "pending" | "executing")
     }
@@ -275,7 +277,7 @@ mod tests {
             .is_open()
         };
         assert!(open("pending") && open("executing"));
-        assert!(!open("approved") && !open("rejected") && !open("failed"));
+        assert!(!open("approved") && !open("rejected") && !open("failed") && !open("expired"));
     }
 
     #[test]
