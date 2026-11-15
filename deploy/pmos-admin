@@ -26,6 +26,8 @@
 #   pmos-admin evals-run --category <c> [--checkout <dir>] [--note <why>]
 #                                     a benchmark on the eval stack (fake systems, real docs and
 #                                     models); the report lands in <dir>/evals/reports to commit
+#   pmos-admin evals-stack [--checkout <dir>] <pmos-evals args>
+#                                     any pmos-evals command on the eval stack (judge calibrate …)
 #   pmos-admin evals-gate [--base origin/main]
 #                                     the eval gate for this checkout's changes (CI runs it)
 #   pmos-admin smoke <handle>         one Docs-bot question through the whole stack
@@ -356,9 +358,11 @@ for g in s["groups"]:
       -e PMOS_EVALS_ROOT=evals "pmos:${PMOS_VERSION:-local}" pmos-evals "$@"
     ;;
 
-  evals-run)
+  evals-run|evals-stack)
+    # evals-run: `pmos-evals run <args>`; evals-stack: `pmos-evals <args>` (judge calibrate, …).
     checkout=$PMOS_CONTENT_CHECKOUT
     args=()
+    [ "$cmd" = evals-run ] && args+=(run)
     while [ $# -gt 0 ]; do
       case "$1" in
         --checkout) checkout=$2; shift 2 ;;
@@ -366,8 +370,10 @@ for g in s["groups"]:
       esac
     done
     eval_stack_up "$checkout"
-    evals_runner run "${args[@]}"
-    say "report written under $checkout/evals/reports; commit it so the gate can compare against it"
+    evals_runner "${args[@]}"
+    if [ "$cmd" = evals-run ]; then
+      say "report written under $checkout/evals/reports; commit it so the gate can compare against it"
+    fi
     ;;
 
   evals-gate)

@@ -110,9 +110,12 @@ calibrated judge can fail the eval gate.
    - **Labelled before you see the judge's verdict,** so it doesn't sway you.
 2. **Calibrate** on the Spark, where the gateway is:
    ```sh
-   export PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1 PMOS_EVALS_GATEWAY_TOKEN=…   # PMOS_GW_EVALS_TOKEN
-   pmos-evals judge calibrate <name>
+   cd /opt/pmos
+   deploy/pmos-admin evals-stack judge calibrate <name>
    ```
+   This runs on the eval stack, using the content checkout's `evals/` and the live gateway's
+   judge model. Commit the `<name>.calibration.json` it writes in
+   `/srv/pmos/content-repo/evals/judges/`.
    It prints n, the true-positive rate (TPR: says yes when you did) and the true-negative rate
    (TNR: says no when you did), and whether the judge now blocks, and writes
    `<name>.calibration.json`.

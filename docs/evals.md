@@ -627,23 +627,44 @@ asks for.
 **On every PR,** the GitHub-hosted `content` job also runs
 `cargo run -p pmos-evals -- check --root evals --content content`.
 
-**The eval gate** (`.github/workflows/evals-gate.yml`) runs the live benchmark on pull requests
-that change `content/skills/**`, `content/roles/**`, `content/bots/**`, `evals/**` or
+**The eval stack.** Benchmarks run against their own short-lived copy of the services
+(`deploy/compose.evals.yaml`), never against what PMs use. It has:
+- a tool server, runtime and the Docs and `pm-evals` workers, on a checkout's content;
+- the member `evals` added to that copy of `team.yaml`;
+- fake Jira, Confluence and Slack fixtures, and the real public support docs;
+- the live gateway's models, under the `evals` client's token.
+
+`pmos-admin` starts it with fresh tokens for every run and removes it afterwards. So:
+- the gate measures a pull request's own roles and skills;
+- no PM's data or accounts are reachable;
+- weekly reports and gate runs come from the same setup, so they compare like with like.
+
+**The eval gate** (`.github/workflows/evals-gate.yml`) runs on pull requests that change
+`content/skills/**`, `content/roles/**`, `content/bots/**`, `evals/**` or
 `deploy/gateway.yaml`:
 - **Where:** a self-hosted runner on the Spark (labels `self-hosted, pmos-spark`), where the
   runtime, the worker and the models are. PRs from forks never run there. Registering the
   runner is in `docs/runbooks/upgrade.md`.
 - **What:** `deploy/pmos-admin evals-gate --base origin/<base branch>`. It lists the changed
-  paths (`git diff --name-only <base>...HEAD`), passes them to `pmos-evals affected`, runs
-  `pmos-evals gate` for each affected category with the base branch's reports as the
-  baseline, and prints the summaries as one markdown document. The job appends it to the job
+  paths (`git diff --name-only <base>...HEAD`), passes them to `pmos-evals affected`, starts
+  the eval stack on the PR's checkout, runs `pmos-evals gate` for each affected category with
+  the base branch's committed reports as the baseline, and prints the summaries as one markdown document. The job appends it to the job
   summary. It exits 1 if any category's gate failed, 2 on an error, and 0 otherwise, including
   when no category is affected.
 - **Until a runner is registered,** the job waits in the queue. A platform owner runs
   `deploy/pmos-admin evals-gate --base origin/main` on the Spark from the PR's branch, and
   pastes the result into the PR.
 
-The weekly runs and the runs after model and harness changes are still by hand, on the Spark.
+**Weekly runs, and runs after a model or harness change,** are by hand on the Spark, on the
+eval stack and the content checkout (`main`):
+
+```sh
+deploy/pmos-admin evals-run --category docs-qa --note "weekly"
+```
+
+The report lands in `/srv/pmos/content-repo/evals/reports`. Commit it by pull request so the
+next gate compares against it. `deploy/pmos-admin evals load` still runs on the live stack,
+because the load test measures the stack PMs use.
 
 ## Gaps against the spec
 - **Traces are console-only (§3),** but D10 tags failures from the trace. The runner takes an

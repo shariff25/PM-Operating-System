@@ -1,6 +1,6 @@
 # The improvement loop, phases 0 and 1: build spec
 
-**Source:** `reports/Self improvement loops for PM OS.md` (deep research, 2026-11-15).
+**Source:** [`docs/research/self-improvement-loops.md`](research/self-improvement-loops.md) (deep research, 2026-11-15).
 **Decision:** build phase 0 now, plus the tooling phase 1 needs. Shadow runs, canary flags, the
 improver bot (phase 2) and training (phase 3) come later, each after its phase's gate is met.
 
