@@ -8,6 +8,9 @@
 //!   **Reject**; only the PM it is for can decide it, through the tool server. **Reject**
 //!   asks why first, with six one-tap reasons the feedback ledger keeps
 //!   (`docs/improvement-loop-spec.md` §4).
+//! - **The reply assistant** (`docs/slack-reply-spec.md` §1 and §5): `reply assistant on`,
+//!   `off` and status manage a PM's `[reply-assistant]` routine; each reply it drafts is a
+//!   reply card with **Post as you**, **Edit**, **Snooze** and **Reject** (`reply.rs`).
 //! - **Triage digest:** on weekday mornings each bot's quality owner gets a DM of the drafts
 //!   that were rejected or heavily edited since the last one (`triage.rs`).
 //! - **Routines (D8):** "every weekday at 8am …" is read back for a one-tap confirm; "my
@@ -30,6 +33,7 @@ pub mod member_cards;
 pub mod members;
 pub mod notify;
 pub mod proxy;
+pub mod reply;
 pub mod runtime;
 pub mod slackapi;
 pub mod socket;

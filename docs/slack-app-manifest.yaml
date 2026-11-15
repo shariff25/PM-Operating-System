@@ -62,6 +62,14 @@ oauth_config:
       - im:history
       - mpim:history
       - chat:write
+      # The audience check before a reply or message posts as the PM
+      # (docs/slack-reply-spec.md §3): conversations.info (is it shared outside the company?)
+      # and conversations.members (is everyone on the product team?), for public and private
+      # channels, group DMs and DMs.
+      - channels:read
+      - groups:read
+      - mpim:read
+      - im:read
 settings:
   # Over Socket Mode, so no request URLs: events and button presses arrive on the socket.
   event_subscriptions:
