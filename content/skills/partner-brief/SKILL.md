@@ -9,6 +9,7 @@ metadata:
   tools: "context.search context.read jira.search jira.read confluence.search confluence.read confluence.create_draft docs.search docs.read"
   surfaces: "slack web cli"
   ships-in: "team-launch"
+  track: "Customer and market"
 ---
 
 # /partner-brief

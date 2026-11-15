@@ -18,6 +18,10 @@
 //! - **Onboarding** (`docs/onboarding-spec.md` §4): someone outside `team.yaml` taps
 //!   **Request access**, a platform owner approves them in a DM card, and the new member gets
 //!   a welcome and a setup checklist (`setup`) for their accounts, memory repo and bot.
+//! - **Tagging PM OS in a channel** (`docs/slack-mentions-and-home-spec.md` §2): `@PM OS …`
+//!   in a thread starts a task for the PM's personal bot, answered in their DM; the thread
+//!   gets one line only they see (`mention.rs`).
+//! - **The App Home** (same spec, §4): Inbox, Skills and Accounts (`home.rs`).
 //! - **`/docs`:** search the company's public docs from any conversation, with results only
 //!   the asker can see, through the tool server's `docs` skill.
 //!
@@ -29,8 +33,10 @@ pub mod bots;
 pub mod bounded;
 pub mod cards;
 pub mod commands;
+pub mod home;
 pub mod member_cards;
 pub mod members;
+pub mod mention;
 pub mod notify;
 pub mod proxy;
 pub mod reply;

@@ -142,6 +142,26 @@ impl Runtime {
             .collect())
     }
 
+    /// `GET /v1/bots/{name}`: one bot with its role (`role.skills` lists the skills it may
+    /// use).
+    pub async fn bot(&self, name: &str) -> Result<Value, RuntimeError> {
+        if !safe_id(name) {
+            return Err(RuntimeError::Refused("not a bot name".into()));
+        }
+        self.send(self.request(Method::GET, &format!("/v1/bots/{name}"), None))
+            .await
+    }
+
+    /// The skill names a bot's role lists, from [`Runtime::bot`]'s answer.
+    pub fn role_skills(detail: &Value) -> Vec<String> {
+        detail["role"]["skills"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.as_str().map(String::from))
+            .collect()
+    }
+
     /// `POST /v1/tasks` as `user`, from Slack, replying in `channel`/`thread_ts`.
     pub async fn create_task(
         &self,

@@ -61,6 +61,7 @@ metadata:
   tools: "context.search jira.read confluence.create_draft"   # required, space-separated
   surfaces: "slack web cli"     # optional, defaults to all three
   ships-in: "phase-0"           # optional: phase-0 | pilot | team-launch | later
+  track: "Spec and review"      # optional, ≤ 40 characters: the catalog heading it is listed under
 ---
 
 # /prd-draft
@@ -79,11 +80,16 @@ Instructions ...
 | `reasoning` | `pmos/reasoning` | The PM-craft skills (`docs/pm-craft.md`): work that weighs alternatives and checks itself against the bar. It ships pointing at the same model as `default`; a platform owner can point it at a larger one in the gateway config (`docs/gateway.md`) |
 - `data-class` is the most sensitive data the skill may handle. The gateway routes everything
   to local models.
+- `track` groups skills into a catalog, such as the Slack App Home's **Skills** section
+  (`docs/slack-home.md`). It is free text, but the shipped skills use eight: Everyday,
+  Product sense, Strategy and decisions, Metrics and experiments, Spec and review, Customer
+  and market, AI products, Delivery and launch. A skill without one is listed under
+  "Other".
 
 Rules: `front-matter`, `skill-parse`, `skill-name`, `skill-description`, `skill-body-empty`,
 `skill-metadata-missing`, `skill-metadata-type`, `skill-version`, `skill-model`,
 `skill-data-class`, `skill-unknown-tool`, `skill-tool-duplicate`, `skill-surface`,
-`skill-phase`, `skill-missing-file`.
+`skill-phase`, `skill-track` (empty, or longer than 40 characters), `skill-missing-file`.
 
 ## Master context: `master/AGENTS.md`
 

@@ -9,6 +9,7 @@ metadata:
   tools: "context.search context.read jira.search jira.read confluence.search confluence.read confluence.create_draft docs.search docs.read"
   surfaces: "slack web cli"
   ships-in: "pilot"
+  track: "Delivery and launch"
 ---
 
 # /status-update

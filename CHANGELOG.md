@@ -4,6 +4,9 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- Tag PM OS in a thread, and a Home for your drafts, skills and accounts.
+  - PM OS can now be tagged in any channel thread: write `@PM OS` and what you want, and a draft reply arrives in your DM to post as you, one per tag ([how](docs/slack-reply.md)).
+  - PM OS can now show what's waiting for you in its Slack Home: tick drafts and approve or reject them together, browse the skills by track, and connect or disconnect your accounts ([how](docs/slack-home.md)).
 - PM OS now works like a senior PM: it questions the problem, recommends, and checks its own work ([how to use it](docs/pm-craft.md)).
   - PM OS can now be held to a written bar: it asks who has the problem before it drafts a solution, and every document weighs real alternatives, opens with one recommendation, names a measurable outcome with a guardrail and its riskiest assumption, and is checked against `content/playbooks/bar.md` before you see it. Six playbooks say how each kind of work is done, and you can edit them and the example documents to match your team.
   - PM OS can now do 15 new kinds of work, by track. **Product sense:** `product-critique`, `problem-framing`. **Strategy and decisions:** `strategy-doc`, `decision-doc`, `prioritize`, `pre-mortem`. **Metrics and experiments:** `metrics-tree`, `experiment-design`, `experiment-readout`. **Customers and market:** `call-synth`, `competitive-brief`, `opportunity-sizing`. **Review:** `review`. **AI products:** `ai-feature-spec`, `eval-plan`. The PRD skill is upgraded to the same bar. Say "draft anyway" to skip the questions.

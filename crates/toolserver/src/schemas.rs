@@ -13,6 +13,18 @@ fn object(properties: Value, required: &[&str]) -> Value {
     })
 }
 
+/// A Slack message timestamp, such as `1731600300.000200`.
+pub const SLACK_TS_PATTERN: &str = r"^\d{1,12}\.\d{1,9}$";
+
+/// Does `s` match [`SLACK_TS_PATTERN`]? Checked by hand: no regex engine here.
+fn is_slack_ts(s: &str) -> bool {
+    let digits = |p: &str, max: usize| {
+        !p.is_empty() && p.len() <= max && p.bytes().all(|b| b.is_ascii_digit())
+    };
+    s.split_once('.')
+        .is_some_and(|(a, b)| digits(a, 12) && digits(b, 9))
+}
+
 fn limit() -> Value {
     json!({"type": "integer", "minimum": 1, "maximum": 20, "description": "Maximum results (default 5)"})
 }
@@ -88,7 +100,12 @@ pub fn input_schema(tool: &str) -> Option<Value> {
             &["channel", "ts"],
         ),
         "slack.post_reply" => object(
-            json!({"channel": {"type": "string"}, "thread_ts": {"type": "string"}, "text": {"type": "string"}}),
+            json!({
+                "channel": {"type": "string"},
+                "thread_ts": {"type": "string"},
+                "message_ts": {"type": "string", "pattern": SLACK_TS_PATTERN, "description": "The message the reply answers, when PM OS was tagged in it: one draft per message instead of per thread"},
+                "text": {"type": "string"},
+            }),
             &["channel", "thread_ts", "text"],
         ),
         "slack.send_message" => object(
@@ -150,7 +167,8 @@ pub fn input_schema(tool: &str) -> Option<Value> {
 }
 
 /// Check the arguments' top level against a schema built by this module: required keys
-/// present, no unknown keys, and string, integer and enum types right. Full JSON Schema
+/// present, no unknown keys, and string, integer and enum types right, and a string's
+/// `pattern` when it is [`SLACK_TS_PATTERN`] (the only one used). Full JSON Schema
 /// validation is not needed for these flat objects.
 pub fn check_args(schema: &Value, args: &Value) -> Result<(), String> {
     let obj = args
@@ -179,6 +197,11 @@ pub fn check_args(schema: &Value, args: &Value) -> Result<(), String> {
                     if s.chars().count() as u64 > max {
                         return Err(format!("argument `{key}` is longer than {max} characters"));
                     }
+                }
+                if prop["pattern"].as_str() == Some(SLACK_TS_PATTERN) && !is_slack_ts(s) {
+                    return Err(format!(
+                        "argument `{key}` must be a Slack message timestamp, such as 1731600300.000200"
+                    ));
                 }
                 if let Some(options) = prop["enum"].as_array() {
                     if !options.iter().any(|o| o == value) {
@@ -260,5 +283,32 @@ mod tests {
         assert!(check_args(&s, &bad).is_err());
         let c = input_schema("stats.compare").unwrap();
         assert!(check_args(&c, &json!({"control": 1, "treatment": {}})).is_err());
+    }
+
+    #[test]
+    fn a_reply_may_name_the_message_it_answers() {
+        let s = input_schema("slack.post_reply").unwrap();
+        let base = json!({"channel": "C0PMTEAM", "thread_ts": "1731600000.000100", "text": "Yes."});
+        assert!(check_args(&s, &base).is_ok(), "message_ts is optional");
+        let mut tagged = base.clone();
+        tagged["message_ts"] = json!("1731600300.000200");
+        assert!(check_args(&s, &tagged).is_ok());
+        for bad in [
+            "",
+            "1731600300",
+            "1731600300.",
+            ".000200",
+            "17316x0300.000200",
+            "1234567890123.1",
+            "1.1234567890",
+        ] {
+            tagged["message_ts"] = json!(bad);
+            assert!(
+                check_args(&s, &tagged).unwrap_err().contains("timestamp"),
+                "{bad:?}"
+            );
+        }
+        tagged["message_ts"] = json!(1731600300);
+        assert!(check_args(&s, &tagged).unwrap_err().contains("string"));
     }
 }

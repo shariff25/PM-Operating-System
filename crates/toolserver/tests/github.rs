@@ -1077,9 +1077,82 @@ async fn the_slack_bot_gets_link_urls_for_members_only() {
         .await;
         assert_eq!(status, 403, "{user}");
     }
-    // Revoking stays orchestrator-only.
+}
+
+#[tokio::test]
+async fn the_slack_bot_unlinks_members_accounts_only() {
+    let e = env().await;
+    link(&e, "ana", "ana").await;
+    // A member's account: unlinked (the App Home's Disconnect), and audited with the client.
     let (status, _) = bot(&e, Method::DELETE, "/internal/credentials/ana/github", None).await;
-    assert_eq!(status, 403);
+    assert_eq!(status, 204);
+    assert!(e
+        .vault
+        .get("ana", Provider::Github)
+        .await
+        .unwrap()
+        .is_none());
+    let last = e.audit.events().last().cloned().unwrap();
+    assert_eq!(
+        (
+            last.tool.as_str(),
+            last.client,
+            last.outcome,
+            last.user.as_str(),
+            last.output_ref.as_deref()
+        ),
+        (
+            "credentials.unlink",
+            Client::Bot,
+            Outcome::Ok,
+            "ana",
+            Some("github")
+        )
+    );
+    // Nothing left to unlink.
+    let (status, _) = bot(&e, Method::DELETE, "/internal/credentials/ana/github", None).await;
+    assert_eq!(status, 404);
+    // Not a member, or a team bot's own account: refused, and audited as denied.
+    put_github(&e, "bots.docs", "r-bot", 3600).await;
+    for user in ["nobody", "bots.docs"] {
+        let (status, body) = bot(
+            &e,
+            Method::DELETE,
+            &format!("/internal/credentials/{user}/github"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 403, "{user}");
+        assert_eq!(
+            body["error"],
+            "this token may unlink accounts of team members only"
+        );
+        let last = e.audit.events().last().cloned().unwrap();
+        assert_eq!(
+            (last.tool.as_str(), last.client, last.outcome),
+            ("credentials.unlink", Client::Bot, Outcome::Denied)
+        );
+    }
+    assert!(e
+        .vault
+        .get("bots.docs", Provider::Github)
+        .await
+        .unwrap()
+        .is_some());
+    // The service token may unlink anyone's, as before, audited as the orchestrator.
+    let res = e
+        .http
+        .delete(format!("{}/internal/credentials/bots.docs/github", e.ts))
+        .bearer_auth(SERVICE_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    let last = e.audit.events().last().cloned().unwrap();
+    assert_eq!(
+        (last.client, last.outcome),
+        (Client::Orchestrator, Outcome::Ok)
+    );
 }
 
 // ----- memory -----------------------------------------------------------------------------

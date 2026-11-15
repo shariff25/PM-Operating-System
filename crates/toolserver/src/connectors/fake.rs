@@ -517,10 +517,17 @@ impl Connector for FakeConnector {
     ) -> Result<SourceRef, ConnectorError> {
         let mut writes = self.writes.lock().expect("fake lock");
         let id = format!("{}-W{}", self.system.to_uppercase(), writes.len() + 1);
+        // What would be sent: like the live connector, a reply's `message_ts` stays behind.
+        let mut sent = args.clone();
+        if self.system == "slack" {
+            if let Some(map) = sent.as_object_mut() {
+                map.remove("message_ts");
+            }
+        }
         writes.push(FakeWrite {
             user: caller.user.to_string(),
             action: action.to_string(),
-            args: args.clone(),
+            args: sent,
             id: id.clone(),
         });
         Ok(SourceRef {
