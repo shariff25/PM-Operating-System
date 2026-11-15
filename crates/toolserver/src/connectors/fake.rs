@@ -380,6 +380,68 @@ fn slack_threads() -> Vec<FixtureThread> {
     ]
 }
 
+/// The issues `jira.rollup` counts in the fake (`docs/staff-principal-spec.md` §3), as
+/// `GET /rest/api/3/search/jql` would return them with the rollup's fields. A set of its own,
+/// so search results don't change: the three `PM` issues (PM-101 in progress, PM-102 and
+/// PM-103 to do), and in `CLD` the epic CLD-11 (in progress), CLD-12 (a story under it,
+/// done) and CLD-13 (a story under it, to do, due 2026-10-01, unassigned). PM-102 blocks
+/// CLD-13. Returned whatever the JQL says (a team bot still sees only its projects).
+pub fn rollup_fixtures() -> Vec<Value> {
+    let status =
+        |name: &str, category: &str| json!({"name": name, "statusCategory": {"key": category}});
+    let project = |key: &str| json!({"key": key, "name": key});
+    let person = |id: &str, name: &str| json!({"accountId": id, "displayName": name});
+    let epic_type = json!({"name": "Epic", "hierarchyLevel": 1});
+    let story_type = json!({"name": "Story", "hierarchyLevel": 0});
+    let blocks = json!({"name": "Blocks", "inward": "is blocked by", "outward": "blocks"});
+    vec![
+        json!({"key": "PM-101", "fields": {
+            "summary": "SSO for the Acme Vault console",
+            "status": status("In Progress", "indeterminate"), "project": project("PM"),
+            "issuetype": epic_type, "assignee": person("acc-ana", "Ana"),
+            "fixVersions": [{"name": "Vault 3.2"}], "issuelinks": [],
+        }}),
+        json!({"key": "PM-102", "fields": {
+            "summary": "SCIM user provisioning",
+            "status": status("To Do", "new"), "project": project("PM"),
+            "issuetype": story_type,
+            "parent": {"key": "PM-101", "fields": {"summary": "SSO for the Acme Vault console", "issuetype": epic_type}},
+            "assignee": person("acc-ana", "Ana"),
+            "fixVersions": [{"name": "Vault 3.2"}],
+            "issuelinks": [{"type": blocks, "outwardIssue": {"key": "CLD-13", "fields": {"status": status("To Do", "new")}}}],
+        }}),
+        json!({"key": "PM-103", "fields": {
+            "summary": "Export fails for large key sets",
+            "status": status("To Do", "new"), "project": project("PM"),
+            "issuetype": {"name": "Bug", "hierarchyLevel": 0}, "assignee": person("acc-bo", "Bo"),
+            "fixVersions": [], "issuelinks": [],
+        }}),
+        json!({"key": "CLD-11", "fields": {
+            "summary": "Cloud identity platform",
+            "status": status("In Progress", "indeterminate"), "project": project("CLD"),
+            "issuetype": epic_type, "assignee": person("acc-cy", "Cy"),
+            "fixVersions": [{"name": "Cloud 2026.12"}], "issuelinks": [],
+        }}),
+        json!({"key": "CLD-12", "fields": {
+            "summary": "Tenant-level SAML settings",
+            "status": status("Done", "done"), "project": project("CLD"),
+            "issuetype": story_type,
+            "parent": {"key": "CLD-11", "fields": {"summary": "Cloud identity platform", "issuetype": epic_type}},
+            "assignee": person("acc-cy", "Cy"),
+            "fixVersions": [{"name": "Cloud 2026.12"}], "issuelinks": [],
+        }}),
+        json!({"key": "CLD-13", "fields": {
+            "summary": "SCIM endpoint for Acme Cloud tenants",
+            "status": status("To Do", "new"), "project": project("CLD"),
+            "issuetype": story_type,
+            "parent": {"key": "CLD-11", "fields": {"summary": "Cloud identity platform", "issuetype": epic_type}},
+            "assignee": null, "duedate": "2026-10-01",
+            "fixVersions": [{"name": "Cloud 2026.12"}],
+            "issuelinks": [{"type": blocks, "inwardIssue": {"key": "PM-102", "fields": {"status": status("To Do", "new")}}}],
+        }}),
+    ]
+}
+
 fn item(system: &str, id: &str, title: &str, content: Value) -> Item {
     Item {
         source: SourceRef {
@@ -450,6 +512,31 @@ impl Connector for FakeConnector {
             self.system_in_scope(bot)?;
         }
         match action {
+            "rollup" if self.system == "jira" => {
+                let (group_by, max) = super::rollup::options(args)?;
+                let issues: Vec<_> = rollup_fixtures()
+                    .iter()
+                    .filter_map(super::rollup::RollupIssue::from_jira)
+                    // As if the JQL were wrapped in the team bot's scope.
+                    .filter(|i| {
+                        caller
+                            .team_bot
+                            .is_none_or(|b| b.check_issue(&i.key).is_ok())
+                    })
+                    .collect();
+                let truncated = (issues.len() > max).then_some(super::rollup::Truncated::Cap);
+                let issues = &issues[..issues.len().min(max)];
+                let content = super::rollup::rollup(
+                    issues,
+                    group_by,
+                    chrono::Utc::now().date_naive(),
+                    truncated,
+                );
+                Ok(vec![super::rollup::item(
+                    content,
+                    "https://jira.fake.pmos.internal/issues/".into(),
+                )])
+            }
             "search" => {
                 let query = str_arg(args, &["query", "jql", "cql"])
                     .ok_or_else(|| ConnectorError::BadArgs("a query is required".into()))?

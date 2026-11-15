@@ -1,0 +1,19 @@
+# seed: replace with case cards
+# The bets-register skill opens a bet with one bets.record call, an approval like every write
+# (docs/staff-principal-spec.md §5). A new bet needs key, title, bet, metric,
+# riskiest_assumption and review_by, so the ask gives them all.
+id: open-bet-records-one-draft
+ask: "Draft anyway, no questions: open a bet in my bets register. Key sso-unlocks-enterprise, title \"SSO unlocks enterprise deals\". The bet: shipping SAML SSO for the Acme Vault console lets us close the two customers who asked for it (Confluence page 9001). Metric: enterprise deals won that named SSO, 4 by 2027-06-30, from the sales log. Riskiest assumption: SSO, not audit export, is what blocks those deals. Test: ask both customers whether SSO alone would let them sign. Review by 2027-02-01."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: bets.record
+      count: 1
+      require_fields: [key, title, bet, metric, riskiest_assumption, review_by]
+    - tool: confluence.create_draft
+      count: 0
+cluster: bets-register
+tags:
+  - model/incomplete-draft

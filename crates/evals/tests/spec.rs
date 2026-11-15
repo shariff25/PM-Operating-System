@@ -34,6 +34,39 @@ fn a_valid_category_loads() {
 }
 
 #[test]
+fn a_category_may_set_a_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let task = || {
+        vec![(
+            "a-task",
+            "id: a-task\nask: \"One?\"\nexpect:\n  approvals: 0\n".to_string(),
+        )]
+    };
+    write_category(dir.path(), "cat", "personal", 0.8, &task());
+    assert_eq!(
+        load_category(dir.path(), "cat").unwrap().level,
+        None,
+        "optional"
+    );
+    let path = dir.path().join("categories/cat/category.yaml");
+    let base = std::fs::read_to_string(&path).unwrap();
+    for level in ["senior", "staff", "principal"] {
+        std::fs::write(&path, format!("{base}level: {level}\n")).unwrap();
+        assert_eq!(
+            load_category(dir.path(), "cat").unwrap().level.as_deref(),
+            Some(level)
+        );
+    }
+    std::fs::write(&path, format!("{base}level: director\n")).unwrap();
+    let errors = load_category(dir.path(), "cat").unwrap_err().0;
+    assert!(
+        errors.iter().any(|e| e.contains("category.yaml")
+            && e.contains("`level` is `director`; use senior, staff or principal")),
+        "{errors:#?}"
+    );
+}
+
+#[test]
 fn every_problem_is_reported_with_its_file() {
     let dir = tempfile::tempdir().unwrap();
     write_category(dir.path(), "cat", "Docs Bot", 1.5, &[
@@ -452,7 +485,14 @@ fn affected_categories_follow_bot_role_and_skills() {
     );
     assert_eq!(affected(&["content/bots/docs/BOT.md"]), ["docs-qa"]);
     // Personal bots: pm-<requested_by>, made from pm-assistant and its skills.
-    let personal = ["confluence-draft", "jira-draft", "pm-craft", "slack-reply"];
+    let personal = [
+        "confluence-draft",
+        "jira-draft",
+        "pm-craft",
+        "principal-craft",
+        "slack-reply",
+        "staff-craft",
+    ];
     assert_eq!(affected(&["content/roles/pm-assistant/ROLE.md"]), personal);
     assert_eq!(affected(&["./content/skills/prd-draft/SKILL.md"]), personal);
     assert_eq!(affected(&["content/bots/pm-evals/BOT.md"]), personal);

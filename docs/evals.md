@@ -12,7 +12,7 @@ evals/
   config.yaml                         runner defaults, decline phrases, load-test targets
   taxonomy.yaml                       second-level failure tags under the five bottlenecks
   case-card.md                        the template for turning a real case into a task
-  categories/<name>/category.yaml     {name, bot, pass_bar?, repeats?, description}
+  categories/<name>/category.yaml     {name, bot, level?, pass_bar?, repeats?, description}
   categories/<name>/tasks/<id>.yaml   {id, ask, expect, cluster?, regression?, tags?}
   judges/<name>.yaml                  an LLM judge
   judges/<name>.labels.jsonl          its labels (empty: none yet)
@@ -319,8 +319,9 @@ tool:
 - **Owners add sub-tags by pull request,** usually after a 100-trace review
   (`docs/runbooks/quality.md`). Some exist only for people and judges to apply, such as
   `model/unfaithful-to-source`, `model/followed-injection`, `policy/should-not-draft`, and the
-  three the pm-craft judges apply: `model/no-recommendation`, `model/unmeasurable-outcome` and
-  `model/no-riskiest-assumption`.
+  three the pm-craft judges apply (`model/no-recommendation`, `model/unmeasurable-outcome` and
+  `model/no-riskiest-assumption`) and the two the level judges apply (`model/no-tradeoff-named`
+  and `model/no-business-effect`).
 - **Where tags are used:** a task's `tags` (the failure modes it exists to catch), a judge's
   `failure_mode`, and sub-tags in committed reports. `pmos-evals check` validates the taxonomy
   and every one of these.
@@ -504,6 +505,8 @@ blocking when the run asked it.
 | `recommendation-first` | `pm-craft` | `model/no-recommendation`: the draft doesn't open with one recommendation |
 | `metric-with-guardrail` | `pm-craft` | `model/unmeasurable-outcome`: no metric with a number, a date and a method, or no guardrail |
 | `names-riskiest-assumption` | `pm-craft` | `model/no-riskiest-assumption`: no riskiest assumption, or no way to test it |
+| `says-what-stops` | `staff-craft` | `model/no-tradeoff-named`: the draft names nothing that stops or goes unfunded, or the teams that give it up |
+| `business-effect-as-range` | `principal-craft` | `model/no-business-effect`: no business effect, one number with no range or assumptions, or nothing on what is hard to reverse |
 
 ### Load test
 `pmos-evals load --tasks 5 [--category docs-qa]`:
@@ -674,6 +677,50 @@ runs each task once.
   (`deploy/pmos-admin evals-run --category pm-craft --note "…"`).
 - **Running it** needs the stack on the fake connectors, the `stats.*` tools in the tool
   server, and a member whose personal bot runs the craft skills.
+
+### `staff-craft` and `principal-craft`
+The Staff and Principal bars (`docs/levels.md`; the spec is §6 of
+`docs/staff-principal-spec.md`). Eight seed tasks each, for `bot: personal`, on the same fake
+fixtures as `pm-craft` plus the rollup's. Like the others they are marked "seed: replace with
+case cards", have no `pass_bar` and run each task once.
+
+- **`level` in `category.yaml`** is optional: `senior`, `staff` or `principal`. The runner
+  sends it as the `level` of each task it creates (`POST /v1/tasks`, client `evals` only), so
+  the bot works at that level whatever the PM's own setting is. A category with no `level`
+  sends none.
+
+**`staff-craft`** (`level: staff`):
+
+| Tasks | The ask | What is checked |
+| --- | --- | --- |
+| `structure-portfolio-review` | A portfolio review across projects `PM` and `CLD` | Title `Portfolio review:`, "Where things stand", "Dependencies and conflicts", and the rollup's link: "PM-102" and "CLD-13" |
+| `structure-roadmap-tradeoffs`, `structure-okr-draft`, `structure-business-review`, `structure-alignment-plan` | "Draft anyway, no questions: …" | One `confluence.create_draft` draft in space PM, with the skill's title prefix and three or more of its template's headings |
+| `strategy-doc-cross-team-effects` | A strategy doc at the Staff level | The draft has "Cross-team effects" |
+| `coach-feedback-creates-no-draft` | Coaching on fixture page 9002 | No draft and no page update (`approvals: 0`) |
+| `open-bet-records-one-draft` | Open a bet, with every field given | One `bets.record` draft with `key`, `title`, `bet`, `metric`, `riskiest_assumption` and `review_by`, and no page |
+
+**`principal-craft`** (`level: principal`):
+
+| Tasks | The ask | What is checked |
+| --- | --- | --- |
+| `structure-vision-doc`, `structure-investment-case`, `structure-pricing-proposal`, `structure-platform-strategy`, `structure-exec-brief` | "Draft anyway, no questions: …" | As above, with the skill's title prefix (`Vision:`, `Investment case:`, `Pricing:`, `Platform strategy:`, `Exec brief:`) and template headings |
+| `investment-case-payback-from-tool` | An investment case with exact inputs: upfront 100, year 1 revenue 60 and cost 10, year 2 revenue 80 and cost 10, discount rate 10% | The draft has the payback `stats.cashflow` returns, `1.7` |
+| `strategy-doc-what-must-be-true` | A strategy doc at the Principal level | The draft has "Cross-team effects" and "What must be true" |
+| `decision-doc-what-must-be-true` | A decision doc at the Principal level | The draft has "What must be true" |
+
+- **The headings are the contract,** as for `pm-craft`: each is written exactly as §2 of
+  `docs/staff-principal-spec.md` lists it. Change a template's heading and its task together.
+- **The numbers come from tools.** The portfolio task's link is the fake rollup's (`PM-102`
+  blocks `CLD-13`). The investment task expects payback `1.7` (1 + 50 / 70, rounded to 1
+  decimal; net present value is 3.31). If `stats.cashflow`'s formula or rounding changes,
+  change the task with it.
+- **Structure, not judgment.** Two advisory judges read for the argument: `says-what-stops`
+  (Staff) and `business-effect-as-range` (Principal). Until calibrated they are reported and
+  nothing more.
+- **The gate.** As for `pm-craft`: `pmos-evals affected` lists both categories for a change
+  under `evals/`, the `pm-assistant` role or any of its skills.
+- **Running them** needs the stack on the fake connectors, the `stats.*`, `jira.rollup` and
+  `bets.*` tools, and a member whose personal bot runs the new skills.
 
 ## CI
 `cargo test -p pmos-evals` checks the benchmark machinery with no network. It runs:

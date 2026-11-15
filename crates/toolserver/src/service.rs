@@ -218,9 +218,14 @@ struct Policy {
     bot: Option<(Arc<Bot>, Arc<Role>)>,
 }
 
-/// Systems the tool server answers itself, with no connector: the context library, memory
-/// and the stats tools.
-pub const LOCAL_SYSTEMS: [&str; 3] = ["context", "memory", "stats"];
+/// Systems the tool server answers itself, with no connector: the context library, memory,
+/// the stats tools and the bets register (whose one write, `bets.record`, the server runs
+/// itself once it is approved).
+pub const LOCAL_SYSTEMS: [&str; 4] = ["context", "memory", "stats", "bets"];
+
+/// Why a team bot can't use the bets register.
+const BETS_PERSONAL: &str =
+    "the bets register is a PM's own memory: only the PM's own sessions and personal bot can use it, never a team bot";
 
 /// The data class a connector read counts as: the public support docs are `public`;
 /// Jira, Confluence, Slack and anything else are `internal`.
@@ -229,6 +234,16 @@ fn connector_class(system: &str) -> Sensitivity {
         "docs" => Sensitivity::Public,
         _ => Sensitivity::Internal,
     }
+}
+
+/// What an approved write points to, for the audit log: the page or issue it wrote, or, for
+/// the bets register, the bet's note.
+fn output_ref(written: &Value) -> Option<String> {
+    written["url"].as_str().map(String::from).or_else(|| {
+        written["bet"]["key"]
+            .as_str()
+            .map(|k| format!("memory:{}", crate::bets::note_key(k)))
+    })
 }
 
 /// The gateway alias for a model role, such as `pmos/default`.
@@ -745,6 +760,18 @@ impl ToolService {
             (ToolKind::Read, "stats") => {
                 crate::stats::call(spec.action(), args).map_err(ToolError::InvalidArgs)
             }
+            // The bets register is the PM's own memory, like the memory tools: never a team
+            // bot's.
+            (_, "bets") if policy.team_bot().is_some() => {
+                Err(ToolError::Forbidden(BETS_PERSONAL.into()))
+            }
+            (ToolKind::Read, "bets") => self.bets_read(session, spec.action(), args).await,
+            (ToolKind::Write, "bets") => {
+                // Checked against the bet as it is now before anything is queued, so a bad
+                // call is refused here and not in the PM's inbox.
+                self.bets_merge(&session.user, args, now).await?;
+                self.write(session, spec, args, now, event).await
+            }
             (ToolKind::Read, system) => {
                 let connector = self.connector(system)?;
                 // A team bot reads with its own accounts, inside its read scope; anyone else
@@ -968,6 +995,96 @@ impl ToolService {
         Ok(json!({ "note": note }))
     }
 
+    /// `bets.list` and `bets.read`: the session user's notes whose keys start `bet-`.
+    /// Reading a bet raises the session to `internal`, as reading memory does.
+    async fn bets_read(
+        &self,
+        session: &Session,
+        action: &str,
+        args: &Value,
+    ) -> Result<Value, ToolError> {
+        let notes = self.stores.memory.read(&session.user).await?;
+        let mut bets: Vec<(crate::bets::Bet, DateTime<Utc>)> = notes
+            .iter()
+            .filter_map(|n| {
+                crate::bets::bet_key(&n.key)
+                    .map(|k| (crate::bets::Bet::parse(k, &n.text), n.updated_at))
+            })
+            .collect();
+        match action {
+            "list" => {
+                if !bets.is_empty() {
+                    self.note_read(session, Some(Sensitivity::Internal)).await?;
+                }
+                if let Some(status) = args["status"].as_str() {
+                    bets.retain(|(b, _)| b.status == status);
+                }
+                crate::bets::sort_for_review(&mut bets);
+                Ok(json!({
+                    "bets": bets.iter().map(|(b, at)| b.summary(*at)).collect::<Vec<_>>()
+                }))
+            }
+            "read" => {
+                let key = args["key"].as_str().unwrap_or_default();
+                let (bet, at) = bets
+                    .iter()
+                    .find(|(b, _)| b.key == key)
+                    .ok_or_else(|| ToolError::NotFound(format!("bet `{key}`")))?;
+                self.note_read(session, Some(Sensitivity::Internal)).await?;
+                Ok(json!({ "bet": bet.json(*at) }))
+            }
+            other => Err(ToolError::UnknownTool(format!("bets.{other}"))),
+        }
+    }
+
+    /// Merge a `bets.record` call into `user`'s bet as it is now, as of `now`, without saving
+    /// it. Returns the bet to save and whether it is new.
+    async fn bets_merge(
+        &self,
+        user: &str,
+        args: &Value,
+        now: DateTime<Utc>,
+    ) -> Result<(crate::bets::Bet, bool), ToolError> {
+        let key = args["key"].as_str().unwrap_or_default();
+        let note_key = crate::bets::note_key(key);
+        let current = self
+            .stores
+            .memory
+            .read(user)
+            .await?
+            .into_iter()
+            .find(|n| n.key == note_key)
+            .map(|n| crate::bets::Bet::parse(key, &n.text));
+        crate::bets::merge(current, args, now.date_naive()).map_err(ToolError::InvalidArgs)
+    }
+
+    /// Run an approved `bets.record`: merge it into the bet as it is now and save the note,
+    /// as `user`. `writer` (the bot or skill) is recorded with the note where memory keeps
+    /// it (a GitHub memory repo).
+    async fn bets_record(
+        &self,
+        user: &str,
+        run_id: &str,
+        writer: &str,
+        args: &Value,
+        now: DateTime<Utc>,
+    ) -> Result<Value, ToolError> {
+        let (bet, created) = self.bets_merge(user, args, now).await?;
+        let source = format!("{writer}, task {run_id}, approved by {user}");
+        let note = self
+            .stores
+            .memory
+            .update(
+                user,
+                &crate::bets::note_key(&bet.key),
+                &bet.render(),
+                &source,
+                now,
+            )
+            .await?;
+        Ok(json!({ "bet": bet.json(note.updated_at), "created": created }))
+    }
+
     async fn write(
         &self,
         session: &Session,
@@ -1000,12 +1117,19 @@ impl ToolService {
                 return Err(ToolError::Unavailable(e.0));
             }
             // Always as the PM, never as a bot.
+            let writer = session.bot.as_deref().or(session.skill.as_deref());
             let written = self
-                .execute_write(Caller::new(&session.user, &session.run_id), spec, args)
+                .execute_write(
+                    Caller::new(&session.user, &session.run_id),
+                    writer,
+                    spec,
+                    args,
+                    now,
+                )
                 .await?;
             event.outcome = Outcome::Approved;
             event.detail = Some("approved in the harness".into());
-            event.output_ref = written["url"].as_str().map(String::from);
+            event.output_ref = output_ref(&written);
             return Ok(written);
         }
         let content_sha = self.content_sha();
@@ -1061,12 +1185,31 @@ impl ToolService {
         }))
     }
 
+    /// Run an approved write as `caller`'s PM: through its connector, or, for the bets
+    /// register (no connector), here. `writer` is the item's bot or skill.
     async fn execute_write(
         &self,
         caller: Caller<'_>,
+        writer: Option<&str>,
         spec: &ToolSpec,
         args: &Value,
+        now: DateTime<Utc>,
     ) -> Result<Value, ToolError> {
+        if spec.system == "bets" {
+            return match spec.action() {
+                "record" => {
+                    self.bets_record(
+                        caller.user,
+                        caller.run_id,
+                        writer.unwrap_or("pm-os"),
+                        args,
+                        now,
+                    )
+                    .await
+                }
+                other => Err(ToolError::UnknownTool(format!("bets.{other}"))),
+            };
+        }
         let connector = self.connector(&spec.system)?;
         let written = connector
             .write(caller, spec.action(), args)
@@ -1314,6 +1457,16 @@ impl ToolService {
                 }
                 _ => &current.args,
             };
+            // A bet is merged into the note as it is now: check that still works, with the
+            // edited arguments if there are any, before deciding.
+            if spec.system == "bets" {
+                self.bets_merge(&current.user, args, now)
+                    .await
+                    .map_err(|e| match e {
+                        ToolError::InvalidArgs(m) => DecisionError::InvalidArgs(m),
+                        other => DecisionError::Internal(other.to_string()),
+                    })?;
+            }
             if SLACK_DRAFT_TOOLS.contains(&current.tool.as_str()) {
                 self.check_audience(
                     client,
@@ -1521,9 +1674,12 @@ impl ToolService {
             .find(|t| t.name == item.tool)
             .cloned()
             .ok_or_else(|| DecisionError::UnknownTool(item.tool.clone()))?;
+        // The bets register is never a team bot's, even if its role gained the tool.
         let allowed = self
             .policy_for(item.skill.as_deref(), item.bot.as_deref(), &item.user)
-            .is_some_and(|p| p.check(&spec).is_ok());
+            .is_some_and(|p| {
+                p.check(&spec).is_ok() && !(spec.system == "bets" && p.team_bot().is_some())
+            });
         match (allowed, &item.bot) {
             (true, _) => Ok(spec),
             (false, Some(_)) => Err(DecisionError::BotNotAllowed(item.tool.clone())),
@@ -1565,13 +1721,20 @@ impl ToolService {
         }
 
         // As the item's own PM, never as a bot.
+        let writer = item.bot.as_deref().or(item.skill.as_deref());
         let result = self
-            .execute_write(Caller::new(&item.user, &item.run_id), &spec, &item.args)
+            .execute_write(
+                Caller::new(&item.user, &item.run_id),
+                writer,
+                &spec,
+                &item.args,
+                event.at,
+            )
             .await;
         let outcome = match &result {
             Ok(written) => {
                 event.outcome = Outcome::Approved;
-                event.output_ref = written["url"].as_str().map(String::from);
+                event.output_ref = output_ref(written);
                 Ok(written.clone())
             }
             Err(e) => {

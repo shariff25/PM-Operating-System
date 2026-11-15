@@ -31,6 +31,8 @@ model:
     no-recommendation: The draft doesn't open with one recommendation; it lists options without choosing, or buries its conclusion after the analysis. Found by the recommendation-first judge, or by a reviewer.
     unmeasurable-outcome: The draft's success can't be checked; its metric has no number, no date or no way to measure it, or there is no guardrail metric. Found by the metric-with-guardrail judge, or by a reviewer.
     no-riskiest-assumption: The draft names no riskiest assumption, or no cheap way to test it; a list of risks with none singled out counts. Found by the names-riskiest-assumption judge, or by a reviewer.
+    no-tradeoff-named: The Staff-level draft names nothing that stops or goes unfunded, or the teams that give it up; it only adds work. Found by the says-what-stops judge, or by a reviewer.
+    no-business-effect: The Principal-level draft gives no business effect (revenue, cost or margin), gives one number with no range or assumptions, or says nothing about what is hard to reverse. Found by the business-effect-as-range judge, or by a reviewer.
 
 tool:
   description: A tool failed, couldn't be reached, didn't surface what was needed, or was pointed at the wrong place.

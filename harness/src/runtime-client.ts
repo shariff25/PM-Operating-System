@@ -40,6 +40,8 @@ export const ClaimSchema = z.object({
   tools: z.array(z.string()).default([]),
   session_token: z.string().min(1),
   lease_until: z.string().optional(),
+  /** The level to work at (docs/staff-principal-spec.md §1); an older runtime sends none. */
+  level: z.enum(["senior", "staff", "principal"]).default("senior"),
 });
 
 export type Claim = z.infer<typeof ClaimSchema>;

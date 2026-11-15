@@ -14,8 +14,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::model::{
-    is_slack_tool, redacted_body, trace_tool, ChecklistItem, Event, NewNotification, Notification,
-    Routine, Schedule, Task, TaskStatus, TraceEntry, TraceKind,
+    is_slack_tool, redacted_body, trace_tool, ChecklistItem, Event, MemberSettings,
+    NewNotification, Notification, Routine, Schedule, Task, TaskStatus, TraceEntry, TraceKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -189,6 +189,11 @@ pub trait BotsStore: Send + Sync {
     /// Enqueue one run of a routine. False if it was no longer due (another tick ran it, or
     /// it was paused or changed meanwhile).
     async fn run_routine(&self, run: &RoutineRun, now: DateTime<Utc>) -> StoreResult<bool>;
+
+    /// A PM's settings, if they ever set any.
+    async fn member_settings(&self, handle: &str) -> StoreResult<Option<MemberSettings>>;
+    /// Save a PM's settings, replacing any they had.
+    async fn set_member_settings(&self, settings: &MemberSettings) -> StoreResult<()>;
 }
 
 /// Apply `change` to `task` if its guards hold. Shared by both stores so they decide alike.
@@ -272,6 +277,7 @@ struct State {
     notifications: Vec<Notification>,
     notification_seq: i64,
     routines: BTreeMap<String, Routine>,
+    member_settings: BTreeMap<String, MemberSettings>,
 }
 
 impl State {
@@ -585,5 +591,16 @@ impl BotsStore for MemoryStore {
             s.notify(&task, n, now);
         }
         Ok(true)
+    }
+
+    async fn member_settings(&self, handle: &str) -> StoreResult<Option<MemberSettings>> {
+        Ok(self.state().member_settings.get(handle).cloned())
+    }
+
+    async fn set_member_settings(&self, settings: &MemberSettings) -> StoreResult<()> {
+        self.state()
+            .member_settings
+            .insert(settings.handle.clone(), settings.clone());
+        Ok(())
     }
 }

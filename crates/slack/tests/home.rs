@@ -4,7 +4,8 @@
 //! - Opening it publishes the Inbox for a member, and the note for a non-member.
 //! - The section buttons switch sections, and the section survives a republish.
 //! - Ticked drafts are decided one at a time, and the notice counts each outcome.
-//! - Skills: grouped by track, only the role's Slack skills.
+//! - Skills: the PM's level first (left out when the runtime doesn't say), grouped by track,
+//!   only the role's Slack skills, with the two tracks for Staff and Principal work last.
 //! - Accounts: Connect for an unlinked account, Disconnect (to the tool server) for a linked
 //!   one.
 //! - A `needs_approval` notification republishes an open Home.
@@ -357,6 +358,81 @@ async fn skills_group_by_track_and_show_only_the_roles_slack_skills() {
     let s = view_text(&stack.published(2).await);
     assert!(s.contains("*ask*") && !s.contains("strategy-doc*"));
     assert_eq!(stack.runtime.details.lock().unwrap()[1], "docs");
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn skills_show_the_level_and_the_tracks_for_staff_and_principal_work() {
+    let stack = Stack::new().await;
+    stack.skill("ask", "Answer a question.", "slack", Some("Everyday"));
+    stack.skill(
+        "launch-plan",
+        "Plan a launch.",
+        "slack",
+        Some("Delivery and launch"),
+    );
+    stack.skill(
+        "exec-brief",
+        "Brief the execs.",
+        "slack",
+        Some("Company bets"),
+    );
+    stack.skill(
+        "portfolio-review",
+        "Review the portfolio.",
+        "slack",
+        Some("Leading across teams"),
+    );
+    stack.runtime.role_skills.lock().unwrap().insert(
+        "pm-ana".to_string(),
+        ["ask", "launch-plan", "exec-brief", "portfolio-review"]
+            .map(String::from)
+            .to_vec(),
+    );
+    stack
+        .runtime
+        .levels
+        .lock()
+        .unwrap()
+        .insert("ana".into(), "staff".into());
+    stack
+        .send(home_opened("e1", "Ev1", "U0ANA", Some("skills")))
+        .await;
+    let published = stack.published(1).await;
+    let blocks = published["view"]["blocks"].as_array().unwrap();
+    let first = blocks
+        .iter()
+        .find(|b| b["type"] == "section")
+        .expect("a section");
+    assert_eq!(
+        first["text"]["text"],
+        "You're set to the *Staff* level. Change it by sending me `level …`.",
+        "the first thing in the Skills section"
+    );
+    let headers: Vec<&str> = blocks
+        .iter()
+        .skip(1)
+        .filter(|b| b["type"] == "header")
+        .map(|b| b["text"]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        headers,
+        [
+            "Everyday",
+            "Delivery and launch",
+            "Leading across teams",
+            "Company bets"
+        ]
+    );
+
+    // The settings call fails: the line is left out, the skills still show.
+    *stack.runtime.settings_down.lock().unwrap() = true;
+    stack
+        .send(home_opened("e2", "Ev2", "U0ANA", Some("skills")))
+        .await;
+    let s = view_text(&stack.published(2).await);
+    assert!(!s.contains("level"), "{s}");
+    assert!(s.contains("*portfolio-review*"));
     stack.stop().await;
 }
 

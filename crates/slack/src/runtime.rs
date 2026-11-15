@@ -256,6 +256,40 @@ impl Runtime {
         .await
     }
 
+    /// `GET /v1/members/{handle}/settings`: the PM's level (`senior`, `staff` or
+    /// `principal`).
+    pub async fn level(&self, handle: &str) -> Result<String, RuntimeError> {
+        if !safe_id(handle) {
+            return Err(RuntimeError::Refused("not a PM OS handle".into()));
+        }
+        let json = self
+            .send(self.request(
+                Method::GET,
+                &format!("/v1/members/{handle}/settings"),
+                Some(handle),
+            ))
+            .await?;
+        level_of(&json)
+    }
+
+    /// `PUT /v1/members/{handle}/settings {level}`: the level as saved.
+    pub async fn set_level(&self, handle: &str, level: &str) -> Result<String, RuntimeError> {
+        if !safe_id(handle) {
+            return Err(RuntimeError::Refused("not a PM OS handle".into()));
+        }
+        let json = self
+            .send(
+                self.request(
+                    Method::PUT,
+                    &format!("/v1/members/{handle}/settings"),
+                    Some(handle),
+                )
+                .json(&json!({ "level": level })),
+            )
+            .await?;
+        level_of(&json)
+    }
+
     /// `DELETE /v1/routines/{id}`.
     pub async fn delete_routine(&self, owner: &str, id: &str) -> Result<(), RuntimeError> {
         if !safe_id(id) {
@@ -265,6 +299,14 @@ impl Runtime {
             .await
             .map(|_| ())
     }
+}
+
+/// The `level` of a settings answer; an answer without one is treated as unavailable.
+fn level_of(json: &Value) -> Result<String, RuntimeError> {
+    json["level"]
+        .as_str()
+        .map(String::from)
+        .ok_or(RuntimeError::Unavailable)
 }
 
 /// A list returned bare (`[…]`) or wrapped (`{"<key>": […]}` or `{"items": […]}`).

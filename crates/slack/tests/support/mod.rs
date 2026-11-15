@@ -49,6 +49,9 @@ fn answer(status: StatusCode, body: Value) -> Response {
 
 // ---- Mock runtime ----
 
+/// A routine write: (method, routine id, X-Pmos-User, body).
+pub type RoutineWrite = (String, String, Option<String>, Value);
+
 #[derive(Default)]
 pub struct MockRuntime {
     /// `POST /v1/tasks`: (X-Pmos-User, body).
@@ -60,9 +63,173 @@ pub struct MockRuntime {
     /// Each bot's role's skills.
     pub role_skills: Mutex<HashMap<String, Vec<String>>>,
     pub feed: Mutex<Vec<Value>>,
+    /// `member_settings`: each handle's level; unset reads as `senior`.
+    pub levels: Mutex<HashMap<String, String>>,
+    /// The settings routes answer `503`.
+    pub settings_down: Mutex<bool>,
+    /// `PUT /v1/members/{handle}/settings`: (X-Pmos-User, handle, body).
+    pub settings_writes: Mutex<Vec<(Option<String>, String, Value)>>,
+    pub routines: Mutex<Vec<Value>>,
+    /// Routine writes: (method, routine id, X-Pmos-User, body).
+    pub routine_writes: Mutex<Vec<RoutineWrite>>,
 }
 
 type Rt = State<Arc<MockRuntime>>;
+
+fn pmos_user(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-pmos-user")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+}
+
+/// The runtime's settings checks: the slack client, for the PM in `X-Pmos-User` only.
+fn settings_refusal(rt: &MockRuntime, headers: &HeaderMap, handle: &str) -> Option<Response> {
+    if bearer(headers) != BOTS_TOKEN {
+        return Some(answer(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "bad token"}),
+        ));
+    }
+    if pmos_user(headers).as_deref() != Some(handle) {
+        return Some(answer(
+            StatusCode::FORBIDDEN,
+            json!({"error": "own settings only"}),
+        ));
+    }
+    if *rt.settings_down.lock().unwrap() {
+        return Some(answer(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "storage unavailable"}),
+        ));
+    }
+    None
+}
+
+async fn rt_get_settings(
+    State(rt): Rt,
+    Path(handle): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(no) = settings_refusal(&rt, &headers, &handle) {
+        return no;
+    }
+    let level = rt
+        .levels
+        .lock()
+        .unwrap()
+        .get(&handle)
+        .cloned()
+        .unwrap_or_else(|| "senior".into());
+    Json(json!({"handle": handle, "level": level})).into_response()
+}
+
+async fn rt_put_settings(
+    State(rt): Rt,
+    Path(handle): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    rt.settings_writes
+        .lock()
+        .unwrap()
+        .push((pmos_user(&headers), handle.clone(), body.clone()));
+    if let Some(no) = settings_refusal(&rt, &headers, &handle) {
+        return no;
+    }
+    let level = body["level"].as_str().unwrap_or_default().to_string();
+    if !["senior", "staff", "principal"].contains(&level.as_str()) {
+        return answer(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "use senior, staff or principal"}),
+        );
+    }
+    rt.levels
+        .lock()
+        .unwrap()
+        .insert(handle.clone(), level.clone());
+    Json(json!({"handle": handle, "level": level})).into_response()
+}
+
+async fn rt_create_routine(State(rt): Rt, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let user = pmos_user(&headers);
+    rt.routine_writes
+        .lock()
+        .unwrap()
+        .push(("POST".into(), String::new(), user, body.clone()));
+    let mut routines = rt.routines.lock().unwrap();
+    let mut routine = body["draft"].clone();
+    routine["id"] = json!(format!("rtn_{}", routines.len() + 1));
+    routine["enabled"] = json!(true);
+    routine["next_run_at"] = json!("2026-12-01T09:00:00Z");
+    routines.push(routine.clone());
+    answer(StatusCode::CREATED, routine)
+}
+
+async fn rt_routines(
+    State(rt): Rt,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let owner = q.get("owner").cloned().unwrap_or_default();
+    if pmos_user(&headers).as_deref() != Some(owner.as_str()) {
+        return answer(StatusCode::FORBIDDEN, json!({"error": "own routines only"}));
+    }
+    let mine: Vec<Value> = rt
+        .routines
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r["owner"] == owner.as_str())
+        .cloned()
+        .collect();
+    Json(json!(mine)).into_response()
+}
+
+async fn rt_patch_routine(
+    State(rt): Rt,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let user = pmos_user(&headers);
+    rt.routine_writes.lock().unwrap().push((
+        "PATCH".into(),
+        id.clone(),
+        user.clone(),
+        body.clone(),
+    ));
+    let mut routines = rt.routines.lock().unwrap();
+    match routines
+        .iter_mut()
+        .find(|r| r["id"] == id.as_str() && r["owner"].as_str() == user.as_deref())
+    {
+        Some(r) => {
+            if let Some(e) = body.get("enabled") {
+                r["enabled"] = e.clone();
+            }
+            Json(r.clone()).into_response()
+        }
+        None => answer(StatusCode::NOT_FOUND, json!({"error": "no such routine"})),
+    }
+}
+
+async fn rt_delete_routine(State(rt): Rt, Path(id): Path<String>, headers: HeaderMap) -> Response {
+    let user = pmos_user(&headers);
+    rt.routine_writes.lock().unwrap().push((
+        "DELETE".into(),
+        id.clone(),
+        user.clone(),
+        Value::Null,
+    ));
+    let mut routines = rt.routines.lock().unwrap();
+    let before = routines.len();
+    routines.retain(|r| !(r["id"] == id.as_str() && r["owner"].as_str() == user.as_deref()));
+    if routines.len() == before {
+        return answer(StatusCode::NOT_FOUND, json!({"error": "no such routine"}));
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
 
 async fn rt_bots(headers: HeaderMap) -> Response {
     if bearer(&headers) != BOTS_TOKEN {
@@ -325,6 +492,15 @@ impl Stack {
                 .route("/v1/bots/{name}", get(rt_bot))
                 .route("/v1/tasks", post(rt_create_task))
                 .route("/v1/notifications", get(rt_notifications))
+                .route(
+                    "/v1/members/{handle}/settings",
+                    get(rt_get_settings).put(rt_put_settings),
+                )
+                .route("/v1/routines", post(rt_create_routine).get(rt_routines))
+                .route(
+                    "/v1/routines/{id}",
+                    axum::routing::patch(rt_patch_routine).delete(rt_delete_routine),
+                )
                 .with_state(runtime.clone()),
         )
         .await;
@@ -453,6 +629,23 @@ impl Stack {
             s.cancel();
         }
     }
+}
+
+/// A DM envelope from `user`, in their DM channel (`D` + their id without the `U`).
+pub fn dm(envelope_id: &str, user: &str, ts: &str, text: &str) -> Value {
+    let channel = format!("D{}", user.trim_start_matches('U'));
+    json!({
+        "envelope_id": envelope_id, "type": "events_api",
+        "payload": {"type": "event_callback", "event_id": format!("Ev-{envelope_id}"), "event": {
+            "type": "message", "channel_type": "im", "channel": channel, "user": user,
+            "text": text, "ts": ts, "event_ts": ts,
+        }},
+    })
+}
+
+/// The `text` and blocks of a Web API call, as one string.
+pub fn call_text(call: &Call) -> String {
+    format!("{} {}", call.body["text"], call.body["blocks"])
 }
 
 /// An `app_mention` envelope.

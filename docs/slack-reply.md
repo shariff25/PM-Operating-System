@@ -50,6 +50,18 @@ DM PM OS:
 **Before turning it on:** link Slack with `setup`. If you linked Slack before this feature,
 link it again: the audience check below needs four more read permissions.
 
+## Other DM commands
+
+These are commands to PM OS, typed alone in a DM:
+
+| You type | What happens |
+| --- | --- |
+| `level` | Says your level (Senior, Staff or Principal) and how to change it |
+| `level senior`, `level staff` or `level principal` | Sets the level your personal bot works at (`docs/levels.md`) |
+| `bets review on` | Starts a monthly review of your bets register: 09:00 on the 1st, in your time zone |
+| `bets review` | Says whether it's on and when it next runs |
+| `bets review off` | Stops it |
+
 ## What happens on each check
 
 1. **Search.** Your bot searches Slack for messages since the last check that mention you or

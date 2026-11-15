@@ -1,0 +1,20 @@
+# seed: replace with case cards
+# The exec-brief skill titles its draft `Exec brief:` and follows content/templates/exec-brief.md:
+# one page, the ask first.
+id: structure-exec-brief
+ask: "Draft anyway, no questions: an exec brief in the PM space asking the executive team to fund SAML SSO for the Acme Vault console (Jira epic PM-101), given the October Acme Cloud call notes (Confluence page 9001)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Exec brief:", "The ask", "Why now", "Options", "Next step"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: exec-brief
+tags:
+  - model/draft-content

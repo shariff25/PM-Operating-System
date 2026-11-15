@@ -10,7 +10,9 @@
 //! **Commands first:** typed alone in a DM, `setup` (or `status`, `onboarding`), and for
 //! platform owners `requests` and `remove <handle>`, are handled before any of that
 //! (onboarding, in `members.rs`), and so are `reply assistant on`, `off` and status (the reply
-//! assistant, in `reply.rs`). `docs: setup` still goes to the `docs` bot. Someone not in
+//! assistant, in `reply.rs`), `bets review on`, `off` and status (`bets_review.rs`) and
+//! `level` and `level <level>` (`level.rs`), in that order. `docs: setup` still goes to the
+//! `docs` bot. Someone not in
 //! `team.yaml` gets a note with **Request access**.
 //!
 //! Tagging PM OS in a channel (`app_mention`) is in `mention.rs`, and the App Home
@@ -48,6 +50,7 @@ use crate::reply::{self, SnoozeStore};
 use crate::runtime::{display_name, BotInfo, Runtime, RuntimeError};
 use crate::slackapi::{Posted, SlackApi};
 use crate::toolserver::{ApiError, ToolServer};
+use crate::{bets_review, level};
 
 /// The bot a DM goes to when nothing else picks one.
 pub const DEFAULT_BOT: &str = "docs";
@@ -524,6 +527,12 @@ impl Bots {
         }
         if let Some(cmd) = reply::command(&text) {
             return self.reply_assistant(&dm, &handle, cmd).await;
+        }
+        if let Some(cmd) = bets_review::command(&text) {
+            return self.bets_review(&dm, &handle, cmd).await;
+        }
+        if let Some(cmd) = level::command(&text) {
+            return self.level_command(&dm, &handle, cmd).await;
         }
         if is_routine_list(&text) {
             let message = self

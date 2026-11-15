@@ -38,6 +38,10 @@ tools:
     system: jira
     kind: read
     description: Read an issue or epic with its comments and links
+  - name: jira.rollup
+    system: jira
+    kind: read
+    description: "Count the issues a JQL query finds, grouped by project (default), epic, status, assignee or fix_version: per group the total, to do, in progress, done, overdue and unassigned, plus the links that cross groups or leave the query. Reads up to max_issues (default 500, at most 1000) with the PM's access; no descriptions or comments. Quote its counts; never count issues yourself"
   - name: jira.create_issue
     system: jira
     kind: write
@@ -98,3 +102,22 @@ tools:
     system: stats
     kind: read
     description: "Compare a control and a treatment conversion rate: rates, absolute and relative lift, the confidence interval of the lift, p-value and significance (two-proportion z-test)"
+  - name: stats.cashflow
+    system: stats
+    kind: read
+    description: "Cash flow arithmetic for 1 to 5 scenarios (each an upfront cost and 1 to 10 years of revenue and cost): net and cumulative cash by year, payback in years (null if it never pays back) and net present value at discount_rate (default 0.1). Arithmetic on the inputs given, not a forecast; quote its numbers exactly"
+
+  # The bets register (one note per bet in the PM's own memory, key bet-<key>; the tool
+  # server owns the note's format)
+  - name: bets.list
+    system: bets
+    kind: read
+    description: "List the PM's bets, soonest review first: key, title, status (open, confirmed, refuted, dropped), review_by and updated_at; filter by status"
+  - name: bets.read
+    system: bets
+    kind: read
+    description: "Read one bet by key: the bet, its metric, riskiest assumption, test, dates, evidence and decisions"
+  - name: bets.record
+    system: bets
+    kind: write
+    description: "Open a bet or update one in the PM's bets register. A new bet needs title, bet, metric, riskiest_assumption and review_by, and starts open. On an existing bet the fields given replace the old ones, and evidence (up to 5 entries, each with a date and its source) and a decision are appended; never send the whole note"

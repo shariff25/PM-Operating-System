@@ -3,7 +3,8 @@
 //! reads use its own account instead, inside its read scope (`scope.rs`).
 //!
 //! APIs used (checked against developer.atlassian.com, November 2026):
-//! - Jira: `GET /rest/api/3/search/jql` (enhanced JQL search, paged by `nextPageToken`),
+//! - Jira: `GET /rest/api/3/search/jql` (enhanced JQL search, paged by `nextPageToken`;
+//!   `jira.rollup` follows the pages),
 //!   `GET /rest/api/3/issue/{key}`, `POST /rest/api/3/issue` (description in ADF).
 //! - Confluence: `GET /wiki/rest/api/search?cql=` (v1 CQL search),
 //!   `GET /wiki/api/v2/pages/{id}?body-format=storage`, `GET /wiki/api/v2/spaces?keys=`,
@@ -12,10 +13,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::NaiveDate;
 use serde_json::{json, Value};
 
 use super::format::{adf_to_text, markdown_to_adf, markdown_to_storage, storage_to_text};
 use super::http::{arg, client, issue_key, key_like, limit, numeric_id, send_json};
+use super::rollup;
 use super::{
     clip, Caller, Connector, ConnectorError, Item, SourceRef, TeamBot, DRAFTED_MARKER,
     MAX_BODY_CHARS,
@@ -77,6 +80,10 @@ pub struct Jira {
     tokens: Arc<dyn TokenSource>,
     api_base: String,
     http: reqwest::Client,
+    /// How long one `jira.rollup` may take in all.
+    rollup_budget: std::time::Duration,
+    /// "Today" for `overdue`, fixed for tests; `None` is the real date (UTC).
+    today: Option<NaiveDate>,
 }
 
 impl Jira {
@@ -85,7 +92,93 @@ impl Jira {
             tokens,
             api_base: api_base.into(),
             http: client(),
+            rollup_budget: rollup::DEFAULT_BUDGET,
+            today: None,
         }
+    }
+
+    /// Give `jira.rollup` this long in all, instead of 45 seconds (for tests).
+    pub fn with_rollup_budget(mut self, budget: std::time::Duration) -> Self {
+        self.rollup_budget = budget;
+        self
+    }
+
+    /// Count `overdue` as of `today` instead of the real date (for tests).
+    pub fn with_today(mut self, today: NaiveDate) -> Self {
+        self.today = Some(today);
+        self
+    }
+
+    /// `jira.rollup`: page through the search, 100 issues at a time, following
+    /// `nextPageToken`, until the last page, `max_issues`, or the time budget.
+    async fn rollup(&self, site: &Site, jql: &str, args: &Value) -> Result<Item, ConnectorError> {
+        let (group_by, max) = rollup::options(args)?;
+        let deadline = tokio::time::Instant::now() + self.rollup_budget;
+        let mut issues = Vec::new();
+        let mut token: Option<String> = None;
+        let mut truncated = None;
+        loop {
+            let want = (max - issues.len()).min(rollup::PAGE_SIZE).to_string();
+            let mut query = vec![
+                ("jql", jql.to_string()),
+                ("maxResults", want),
+                ("fields", rollup::FIELDS.to_string()),
+            ];
+            if let Some(t) = &token {
+                query.push(("nextPageToken", t.clone()));
+            }
+            let request = send_json(
+                self.http
+                    .get(format!("{}/rest/api/3/search/jql", site.base))
+                    .bearer_auth(site.token.token.expose())
+                    .query(&query),
+                "Jira",
+                "the rollup's search",
+            );
+            let page = match tokio::time::timeout_at(deadline, request).await {
+                Ok(page) => page?,
+                Err(_) => {
+                    truncated = Some(rollup::Truncated::Time);
+                    break;
+                }
+            };
+            let found = page["issues"].as_array().map_or(&[][..], Vec::as_slice);
+            let room = max - issues.len();
+            issues.extend(
+                found
+                    .iter()
+                    .take(room)
+                    .filter_map(rollup::RollupIssue::from_jira),
+            );
+            let next = page["nextPageToken"]
+                .as_str()
+                .filter(|t| !t.is_empty() && page["isLast"].as_bool() != Some(true))
+                .map(String::from);
+            if found.len() >= room {
+                if found.len() > room || next.is_some() {
+                    truncated = Some(rollup::Truncated::Cap);
+                }
+                break;
+            }
+            // An empty page with a token would loop for ever.
+            match next {
+                Some(t) if !found.is_empty() => token = Some(t),
+                _ => break,
+            }
+            if tokio::time::Instant::now() >= deadline {
+                truncated = Some(rollup::Truncated::Time);
+                break;
+            }
+        }
+        let today = self
+            .today
+            .unwrap_or_else(|| chrono::Utc::now().date_naive());
+        let content = rollup::rollup(&issues, group_by, today, truncated);
+        let url =
+            reqwest::Url::parse_with_params(&format!("{}/issues/", site.web), &[("jql", jql)])
+                .map(String::from)
+                .unwrap_or_else(|_| format!("{}/issues/", site.web));
+        Ok(rollup::item(content, url))
     }
 
     fn issue_item(site: &Site, issue: &Value) -> Item {
@@ -146,8 +239,8 @@ impl Connector for Jira {
     ) -> Result<Vec<Item>, ConnectorError> {
         // A team bot's scope is checked before its token is fetched or anything is sent.
         let jql = match (action, caller.team_bot) {
-            ("search", Some(bot)) => Some(bot.jql(arg(args, "jql")?)?),
-            ("search", None) => Some(arg(args, "jql")?.to_string()),
+            ("search" | "rollup", Some(bot)) => Some(bot.jql(arg(args, "jql")?)?),
+            ("search" | "rollup", None) => Some(arg(args, "jql")?.to_string()),
             _ => None,
         };
         if let (Some(bot), "read") = (caller.team_bot, action) {
@@ -161,6 +254,9 @@ impl Connector for Jira {
         )
         .await?;
         match action {
+            "rollup" => Ok(vec![
+                self.rollup(&site, &jql.unwrap_or_default(), args).await?,
+            ]),
             "search" => {
                 let jql = jql.unwrap_or_default();
                 let max = limit(args, 10, 50).to_string();

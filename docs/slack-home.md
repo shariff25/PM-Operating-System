@@ -4,6 +4,10 @@
 what it's connected to, in one place. Three buttons at the top switch between them: **Inbox**,
 **Skills** and **Accounts**. The build spec is `docs/slack-mentions-and-home-spec.md` §4.
 
+**Your level is shown at the top of the Skills section,** as the line "You're set to the
+*Staff* level. Change it by sending me `level …`." (`docs/levels.md`). If PM OS can't read your
+level, the line is left out.
+
 You need to be on the product team (`team.yaml`). Anyone else sees "PM OS is for the product
 team. DM me to ask for access."
 
@@ -59,6 +63,8 @@ Rejecting from the Home records no reason; to say why, reject on the card.
 | Customer and market | Call synthesis, competitive briefs, sizing, PoC plans, partner briefs |
 | AI products | AI feature specs and eval plans |
 | Delivery and launch | Release notes, status updates, launch checklists, Jira drafts, advisories |
+| Leading across teams | Portfolio reviews, roadmap trade-offs, OKRs, business reviews, alignment plans, coaching, the bets register |
+| Company bets | Vision docs, investment cases, pricing proposals, platform strategy, exec briefs |
 
 Each line is a skill's name and what it's for. You see the skills your personal bot can run;
 without a personal bot, the Docs bot's. If PM OS can't load the bot's details, it lists every
