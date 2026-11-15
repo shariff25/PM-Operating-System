@@ -146,10 +146,11 @@ The tool server needs `PMOS_DOCS_URL` (such as `http://docs.pmos.internal:8730/m
 4. For the bots (DMs, approval cards, routines; spec §5 of `docs/bot-runtime-spec.md`), also set:
    - `PMOS_BOTS_URL` (the runtime, port 8750) and `PMOS_BOTS_TOKEN` (the runtime's `slack` client token);
    - `PMOS_SLACK_BOT_TOKEN`, the app's bot token (`xoxb-…`);
-   - `PMOS_SLACK_STATE_DIR` (default `state/slack`), where the notification cursor and the
-     triage digest's sent dates are kept, so a restart reposts nothing;
-   - `PMOS_DEFAULT_TZ` (default `UTC`), for routines when Slack has no time zone for the PM, and
-     for the triage digest. With the digest on, it must be an IANA name (`Europe/London`) or
+   - `PMOS_SLACK_STATE_DIR` (default `state/slack`), where the notification cursor, the
+     triage digest's sent dates and the reply cards' snoozes are kept, so a restart reposts
+     nothing and loses no snooze;
+   - `PMOS_DEFAULT_TZ` (default `UTC`), for routines (the reply assistant's too) and **Snooze**
+     when Slack has no time zone for the PM, and for the triage digest. With the digest on, it must be an IANA name (`Europe/London`) or
      the bot won't start;
    - `PMOS_GITHUB_ORG` (optional), the GitHub org memory repos live in, to prefill the
      memory-repo form. Without it the PM types the org;
@@ -264,6 +265,86 @@ text.
   `PMOS_SLACK_STATE_DIR/triage.sent`. A restart after the digest's time on a weekday sends that
   day's digest to the owners who haven't had it. If the ledger can't be read, or a DM fails, the
   bot tries again every 5 minutes, up to 6 times, sending only to the owners still waiting.
+
+## The reply assistant in Slack (`pmos-slack`)
+
+The contract is `docs/slack-reply-spec.md` (§1 and §5 for Slack; §3 for the tool server's
+audience check and expiry). It needs the bots (`PMOS_BOTS_URL`) and the member's personal
+bot `pm-<handle>`.
+
+**The commands,** typed alone in a DM:
+- `reply assistant on` creates the member's routine directly with `POST /v1/routines`; the
+  model isn't involved. The routine:
+  - runs on `pm-<handle>`, every 30 minutes from 08:00 to 17:30 on weekdays
+    (`*/30 8-17 * * 1-5`), in the member's Slack time zone, else `PMOS_DEFAULT_TZ`;
+  - has a prompt starting `[reply-assistant]`, which is how Slack finds it again;
+  - sends its result to the member's DM, and its writes need approval.
+
+  If it is already on, the bot says so with the next run; if it was paused, it is resumed.
+- `reply assistant off` deletes it. Drafts already waiting stay until they're decided or
+  expire.
+- `reply assistant` (or `reply assistant status`) says whether it is on, and when it next
+  runs.
+- A member without a personal bot is told the assistant runs on `pm-<handle>` and that
+  nothing was changed. Someone outside `team.yaml` gets the usual **Request access** note.
+- The member's other routines are never touched; "my routines" still lists them all.
+
+**The reply card.** Each `slack.post_reply` draft gets its own card in the member's DM:
+- **Header:** "Reply drafted for #channel" (or "for your DM"), with a link to the thread.
+  - The channel is a Slack mention (`<#C…>`), so Slack shows its name to whoever can see it,
+    and the bot never reads the channel.
+  - The thread link is built as `https://slack.com/archives/<channel>/p<thread_ts without
+    the dot>`, the format the tool server's Slack connector uses for its own links, rather
+    than asked of `chat.getPermalink`, which the bot token can't answer for channels the bot
+    isn't in.
+- **The draft,** quoted, as Slack will show it: its `https://` links and `@person` mentions
+  are kept, and everything else is escaped (an `@here` in a draft shows as text).
+- **The question's text is never on the card.** It isn't in the approval item, and the card
+  shows only the draft.
+- **A context line:** who it is for, that it posts as you marked "Drafted with PM OS", what
+  it was built from (`public`, `internal` or `restricted` sources), and the audience when the
+  item knows it ("Visible to 14 people", "External channel").
+- **The buttons:**
+  - **Post as you** approves it;
+  - **Edit** opens the usual editor, whose submit button reads **Post as you**;
+  - **Snooze** (below);
+  - **Reject** asks why, with the usual six reasons.
+
+  As with every card, only the member the draft is for can use them; each tap is
+  acknowledged at once, and a card decided meanwhile shows its outcome.
+- **Once posted:** "Posted by Ana — see the reply", linking the reply in Slack.
+
+**What the tool server can answer** when a draft is posted, each with its own card:
+- `audience_blocked`: "This draft uses restricted sources and 3 people in #channel aren't on
+  the product team" (or "#channel is shared outside Fortanix"), "so nothing was posted", with
+  only **Edit** and **Reject**. The draft stays waiting.
+- `needs_external_confirm`: the card says the channel is shared with people outside Fortanix
+  and adds **Post to external channel**, which sends the decision again with
+  `confirm_external: true`. After an edit it resends the edit, so the edited text is what
+  posts; if the bot restarted in between, it asks for the edit again instead.
+- `expired`: "Expired after 24 hours; nothing was posted", with no buttons. A draft the tool
+  server already marked `expired` shows the same.
+- `audience_unavailable`: Slack didn't answer the channel check, so nothing was posted; the
+  buttons stay, to try again.
+
+**Snooze:**
+- **The choices:** 1 hour, 4 hours, or tomorrow at 09:00 in the member's Slack time zone
+  (else `PMOS_DEFAULT_TZ`), with **Back**.
+- **The expiry:** a choice that would end after the draft expires isn't offered. The expiry
+  is the item's `expires_at`, else 24 hours after it was drafted. With no choice left, the
+  card says it's too late to snooze.
+- **The card** becomes "Snoozed until Mon 16 Nov 14:00 GMT", with the header and no draft.
+- **At that time,** if the draft is still waiting, the card is posted again as a new message
+  in the DM, and the snoozed message says it's back. A draft decided or expired meanwhile
+  isn't posted again; its snoozed message shows the outcome instead.
+- **Restarts:** snoozes are kept in `PMOS_SLACK_STATE_DIR/snoozes.json` (approval ids,
+  message ids and times, never message text), so a restart keeps them. The bot looks for
+  due snoozes every 30 seconds.
+
+**Slack scopes:** the audience check reads a channel's sharing and members with each PM's
+own token, so the user scopes now include `channels:read`, `groups:read`, `mpim:read` and
+`im:read` (`docs/slack-app-manifest.yaml`). PMs who linked Slack before this need to link it
+again to grant them.
 
 ## Network on the Spark
 
