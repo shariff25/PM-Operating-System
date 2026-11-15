@@ -91,8 +91,10 @@ migration `0008_slack_reply.sql`).
 - **The rules,** in order:
   1. **Restricted sources reaching outsiders are blocked.** If `sources_sensitivity` is
      `restricted` and any member isn't in `team.yaml`, or the channel is externally shared,
-     answer `409 {code: "audience_blocked", error, outsiders: <count>}`. Nothing is written;
-     the item stays `pending`, so the PM can edit or reject it.
+     answer `409 {code: "audience_blocked", error, outsiders: <count>}`. Nothing is written
+     and the item stays `pending`. An edit doesn't unblock it: the draft was built from
+     restricted sources whatever its text now says, so the card offers only Reject, and the
+     PM answers in the thread themselves.
   2. **External channels need a second confirmation.** If the channel is externally shared
      (Slack Connect) and the decision lacks `confirm_external: true`, answer
      `409 {code: "needs_external_confirm", error}`.
@@ -141,8 +143,9 @@ closed states.
 - Snoozes are kept in the state directory, so they survive restarts.
 
 **Answers from the tool server:**
-- `audience_blocked`: the card shows the reason in plain words ("This draft uses restricted
-  sources and N people in #channel aren't on the product team"), with **Edit** and **Reject**.
+- `audience_blocked`: the card shows the reason in plain words ("This draft was built from
+  restricted sources and N people in #channel aren't on the product team"), with only
+  **Reject**: an edit can't unblock it.
 - `needs_external_confirm`: the card adds **Post to external channel**, which sends the
   decision again with `confirm_external: true`.
 - `expired`: the card reads "Expired after 24 hours; nothing was posted".

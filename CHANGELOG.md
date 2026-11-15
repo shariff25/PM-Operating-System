@@ -4,6 +4,7 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- PM OS can now draft replies to questions people ask you in Slack: type `reply assistant on`, and approve, edit, snooze or reject each draft before it posts as you.
 - PM OS can now learn from your edits and rejections: a rejected draft asks why in one tap, each bot's owner gets a daily list of what went wrong, and changes to a bot's skills must pass its benchmarks before they merge.
 - PM OS can now be installed on the Spark with one setup script and run day to day with `pmos-admin`: status, backups and restore, adding bots, and runbooks written for PM platform owners.
 - PM OS can now be tried end to end in a test Slack workspace before the Spark is ready, with a Claude model standing in for the local models (testing only).

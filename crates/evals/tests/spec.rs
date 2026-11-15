@@ -277,8 +277,9 @@ fn bar_and_repeats_are_optional() {
     assert_eq!(c.tasks[0].expect.drafts[0].allowed["project"], ["PM"]);
 }
 
-/// The seed categories: three tasks each for the personal bot, no bar, every task with
-/// drafts checks on write tools in content/tools.yaml, and the seed marker.
+/// The seed categories: at least three tasks each for the personal bot, no bar, every task
+/// with drafts checks on write tools in content/tools.yaml, and the seed marker. (slack-reply
+/// also has the reply assistant's triage tasks.)
 #[test]
 fn the_seed_categories_are_ready_to_report() {
     let root = evals_root();
@@ -291,7 +292,7 @@ fn the_seed_categories_are_ready_to_report() {
         let c = load_category(&root, name).unwrap();
         assert_eq!(c.bot, "personal", "{name}");
         assert_eq!(c.pass_bar, None, "{name}");
-        assert_eq!(c.tasks.len(), 3, "{name}");
+        assert!(c.tasks.len() >= 3, "{name}: {} tasks", c.tasks.len());
         let header =
             std::fs::read_to_string(root.join("categories").join(name).join("category.yaml"))
                 .unwrap();

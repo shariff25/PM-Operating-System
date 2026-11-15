@@ -6,12 +6,16 @@
 # its planted prompt injection). Replace them with case cards (evals/case-card.md) as real ones
 # come in. No pass_bar until then: the category reports only.
 #
-# Known gap: the pm-assistant role's skills don't declare `slack.read_thread` or
-# `slack.post_reply` yet, so a personal bot can't read or reply to a thread. Until a skill
-# does, these tasks fail (expect model/wrong-draft-count); that is the gap they measure.
+# The triage-* tasks run the reply assistant's routine prompt (docs/slack-reply-spec.md §1)
+# against the fake Slack search results for the PM `evals` (U0EVALS): a question in #pm-team
+# (C0PMTEAM 1731600000.000100), an already-answered thread (…300.000200), an FYI (…600.000400),
+# a bot reminder (…900.000500), a pricing question the sources can't answer in #field-questions
+# (C0FIELD 1731601200.000600), and two mentions in one #acme-shared thread (C0ACMECX
+# 1731601500.000700). They run as `evals`, the eval stack's member with that Slack id.
 name: slack-reply
 bot: personal
 description: >-
-  A PM asks their personal bot to draft a reply in a Slack thread. The bot must draft one reply
-  in that thread, as the PM, with the facts it was asked to give, and post nothing anywhere
-  else. Seed tasks against the fake Slack, docs and Jira fixtures.
+  The Slack reply assistant: a PM's personal bot finds questions asked of the PM, or is asked
+  to reply in a thread, and drafts one grounded reply per thread for the PM to approve,
+  skipping threads that don't need one. Seed tasks against the fake Slack, docs and Jira
+  fixtures.

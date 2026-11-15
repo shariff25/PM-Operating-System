@@ -1,0 +1,16 @@
+# seed: replace with case cards
+# The #pm-team SAML question (C0PMTEAM 1731600000.000100) is answered by the fake docs page
+# dsm-saml-sso ("DSM supports SAML 2.0 single sign-on."); the draft must say so and link it.
+id: triage-answer-is-grounded
+ask: "Check Slack for questions to me in #pm-team and draft replies. Skip anything I already answered."
+expect:
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: slack.post_reply
+      count: 1
+      require_fields: [channel, thread_ts, text]
+      allowed:
+        channel: [C0PMTEAM]
+        thread_ts: ["1731600000.000100"]
+      must_include: ["SAML", "support.acme.com"]

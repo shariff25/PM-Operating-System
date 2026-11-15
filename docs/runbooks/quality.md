@@ -45,6 +45,15 @@ a link to the console's task page.
    `should_not_draft` at a skill that drafts too eagerly (`policy/should-not-draft`); `tone` at
    instructions, not facts.
 
+**Reply-assistant drafts** (`slack.post_reply`, `docs/slack-reply.md`) arrive in the same
+digest. Two patterns are worth a case card:
+- **Many expired drafts:** the bot drafts replies nobody wanted; look for threads it should
+  have skipped.
+- **Rejections with `should_not_draft`:** an FYI or an already-answered thread got a draft.
+
+A reply blocked by the audience check stays pending until it's rejected or expires. That's the
+check working, not a quality failure.
+
 For the week as a whole, `deploy/pmos-admin ledger --since 7d` prints counts by outcome, the
 label coverage (decided or expired rows; phase 0 wants 95%) and the median edit distance.
 

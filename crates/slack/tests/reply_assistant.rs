@@ -657,7 +657,8 @@ async fn each_refusal_gets_its_own_card() {
         },
     );
 
-    // Restricted sources and outsiders: why, in plain words, with only Edit and Reject.
+    // Restricted sources and outsiders: why, in plain words, with only Reject (an edit can't
+    // unblock a draft built from restricted sources).
     stack
         .click("b1", "U0ANA", "apr_approve", "apr_b1", "1.1")
         .await;
@@ -665,9 +666,9 @@ async fn each_refusal_gets_its_own_card() {
         .card("1.1", "the blocked card", |t| t.contains("restricted"))
         .await;
     assert!(text_of(&blocked).contains(
-        "This draft uses restricted sources and 3 people in <#C0LAUNCH> aren't on the product team"
+        "This draft was built from restricted sources and 3 people in <#C0LAUNCH> aren't on the product team"
     ));
-    assert_eq!(labels(&blocked.body), ["Edit", "Reject"]);
+    assert_eq!(labels(&blocked.body), ["Reject"]);
 
     // An external channel: a second confirmation, sent with confirm_external.
     stack
