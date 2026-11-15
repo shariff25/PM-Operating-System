@@ -12,9 +12,11 @@ use crate::vault::{KeyRing, Secret};
 pub const DEFAULT_ATLASSIAN_SCOPES: &str = "read:me read:jira-work write:jira-work read:jira-user \
      search:confluence read:page:confluence write:page:confluence read:space:confluence";
 
-/// Default Slack user scopes: Real-time Search, thread history, and posting as the PM.
+/// Default Slack user scopes: Real-time Search, thread history, channel info and members (the
+/// audience check before a post), and posting as the PM.
 pub const DEFAULT_SLACK_SCOPES: &str = "search:read.public search:read.private search:read.im \
-     search:read.mpim channels:history groups:history im:history mpim:history chat:write";
+     search:read.mpim channels:history groups:history im:history mpim:history channels:read \
+     groups:read mpim:read im:read chat:write";
 
 /// What `PMOS_CONNECTORS=live` needs.
 #[derive(Debug, Clone)]
@@ -136,6 +138,12 @@ pub struct Config {
     /// `PMOS_CONTENT_SYNC_SECS`: how often the content checkout is pulled; `0` turns it off.
     /// Default 300 with live connectors, 0 with fake ones (a dev checkout isn't pulled).
     pub content_sync_secs: u64,
+    /// `PMOS_LEDGER_EXPIRE_DAYS`: a draft still pending after this many days is reported as
+    /// `expired` in the feedback ledger. Default 7.
+    pub ledger_expire_days: i64,
+    /// `PMOS_SLACK_DRAFT_TTL_HOURS`: an undecided Slack draft expires after this many hours,
+    /// and a decided one loses its text this long after its decision. 1 to 24; default 24.
+    pub slack_draft_ttl_hours: i64,
 }
 
 impl Config {
@@ -216,6 +224,29 @@ impl Config {
             None if matches!(connectors, Connectors::Live(_)) => 300,
             None => 0,
         };
+        let ledger_expire_days = match get("PMOS_LEDGER_EXPIRE_DAYS").filter(|s| !s.is_empty()) {
+            Some(s) => s
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .filter(|d| *d >= 1)
+                .ok_or_else(|| {
+                    format!("PMOS_LEDGER_EXPIRE_DAYS must be a whole number of days (1 or more), not `{s}`")
+                })?,
+            None => crate::ledger::DEFAULT_EXPIRE_DAYS,
+        };
+        let max_ttl = crate::service::DEFAULT_SLACK_DRAFT_TTL_HOURS;
+        let slack_draft_ttl_hours = match get("PMOS_SLACK_DRAFT_TTL_HOURS").filter(|s| !s.is_empty()) {
+            Some(s) => s
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .filter(|h| (1..=max_ttl).contains(h))
+                .ok_or_else(|| {
+                    format!("PMOS_SLACK_DRAFT_TTL_HOURS must be a whole number of hours from 1 to {max_ttl} (no Slack text is kept longer), not `{s}`")
+                })?,
+            None => max_ttl,
+        };
         let bind = get("PMOS_BIND")
             .unwrap_or_else(|| "127.0.0.1:8710".into())
             .parse()
@@ -241,6 +272,8 @@ impl Config {
             fake_mode_docs,
             memory,
             content_sync_secs,
+            ledger_expire_days,
+            slack_draft_ttl_hours,
         })
     }
 }
@@ -492,6 +525,10 @@ mod tests {
             .scopes
             .contains(&"write:page:confluence".to_string()));
         assert!(live.slack.scopes.contains(&"chat:write".to_string()));
+        // The audience check reads channel info and members as the PM.
+        for scope in ["channels:read", "groups:read", "mpim:read", "im:read"] {
+            assert!(live.slack.scopes.contains(&scope.to_string()), "{scope}");
+        }
         assert_eq!(live.endpoints.atlassian_api, "https://api.atlassian.com");
         assert!(
             !format!("{live:?}").contains("atl-secret"),
@@ -554,14 +591,14 @@ mod tests {
         let app = [
             ("PMOS_GITHUB_CLIENT_ID", "Iv1.gh"),
             ("PMOS_GITHUB_CLIENT_SECRET", "gh-secret"),
-            ("PMOS_GITHUB_ORG", "fortanix"),
+            ("PMOS_GITHUB_ORG", "example-org"),
         ];
         let ok = cfg(&with(&base, &app)).unwrap();
         let Connectors::Live(live) = &ok.connectors else {
             panic!("expected live");
         };
         let gh = live.github.as_ref().unwrap();
-        assert_eq!(gh.org, "fortanix");
+        assert_eq!(gh.org, "example-org");
         assert_eq!(gh.content_branch, "main");
         assert_eq!(gh.content_dir, "content");
         assert_eq!(gh.policies_dir, "policies");
@@ -576,7 +613,7 @@ mod tests {
         let full = cfg(&with(
             &with(&base, &app),
             &[
-                ("PMOS_CONTENT_REPO", "Fortanix/pm-os"),
+                ("PMOS_CONTENT_REPO", "Example-Org/pm-os"),
                 ("PMOS_CONTENT_DIR", "./"),
                 ("PMOS_MEMORY", "github"),
                 ("PMOS_CONTENT_SYNC_SECS", "0"),
@@ -590,7 +627,7 @@ mod tests {
             panic!("expected live");
         };
         let gh = live.github.as_ref().unwrap();
-        assert_eq!(gh.content_repo.as_deref(), Some("Fortanix/pm-os"));
+        assert_eq!(gh.content_repo.as_deref(), Some("Example-Org/pm-os"));
         assert_eq!(gh.content_dir, "", "`./` is the repo root");
         assert_eq!(live.endpoints.github_api, "http://127.0.0.1:9");
 
@@ -601,9 +638,12 @@ mod tests {
         refused(&[("PMOS_MEMORY", "github")], "PMOS_MEMORY=github needs");
         refused(&[("PMOS_MEMORY", "s3")], "PMOS_MEMORY must be");
         refused(&[("PMOS_GITHUB_CLIENT_ID", "x")], "set together");
-        refused(&[("PMOS_GITHUB_ORG", "fortanix")], "needs the GitHub App");
         refused(
-            &[("PMOS_CONTENT_REPO", "fortanix/pm-os")],
+            &[("PMOS_GITHUB_ORG", "example-org")],
+            "needs the GitHub App",
+        );
+        refused(
+            &[("PMOS_CONTENT_REPO", "example-org/pm-os")],
             "needs the GitHub App",
         );
         refused(&app[..2], "PMOS_GITHUB_ORG is required");
@@ -648,5 +688,48 @@ mod tests {
         assert!(cfg(&with(&fake, &[("PMOS_MEMORY", "github")]))
             .unwrap_err()
             .contains("PMOS_MEMORY=github needs"));
+    }
+
+    #[test]
+    fn ledger_expiry_defaults_to_a_week() {
+        let fake = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert_eq!(cfg(&fake).unwrap().ledger_expire_days, 7);
+        assert_eq!(
+            cfg(&with(&fake, &[("PMOS_LEDGER_EXPIRE_DAYS", "14")]))
+                .unwrap()
+                .ledger_expire_days,
+            14
+        );
+        for bad in ["0", "-1", "soon", "1.5"] {
+            assert!(cfg(&with(&fake, &[("PMOS_LEDGER_EXPIRE_DAYS", bad)]))
+                .unwrap_err()
+                .contains("PMOS_LEDGER_EXPIRE_DAYS"));
+        }
+    }
+
+    #[test]
+    fn slack_drafts_expire_within_a_day() {
+        let fake = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert_eq!(cfg(&fake).unwrap().slack_draft_ttl_hours, 24);
+        assert_eq!(
+            cfg(&with(&fake, &[("PMOS_SLACK_DRAFT_TTL_HOURS", "4")]))
+                .unwrap()
+                .slack_draft_ttl_hours,
+            4
+        );
+        // Never longer than a day: no Slack text is kept past 24 hours.
+        for bad in ["0", "25", "48", "soon", "1.5"] {
+            assert!(cfg(&with(&fake, &[("PMOS_SLACK_DRAFT_TTL_HOURS", bad)]))
+                .unwrap_err()
+                .contains("PMOS_SLACK_DRAFT_TTL_HOURS"));
+        }
     }
 }

@@ -50,7 +50,7 @@ async fn bots_are_listed_with_their_tools_and_settings() {
 // ----- the task lifecycle -----------------------------------------------------------------
 
 async fn a_task_runs_from_slack_to_a_result(env: &Env) {
-    let task = env.ask("What ports does DSM need?").await;
+    let task = env.ask("What ports does Acme Vault need?").await;
     let tid = id(&task);
     assert!(tid.starts_with("tsk_") && tid.len() == 36);
     assert_eq!(task["status"], "queued");
@@ -142,7 +142,7 @@ async fn a_task_runs_from_slack_to_a_result(env: &Env) {
             &w("complete"),
             "worker",
             None,
-            json!({"result": "DSM needs port 443.", "approvals": []}),
+            json!({"result": "Acme Vault needs port 443.", "approvals": []}),
         )
         .await;
     assert_eq!(status, 200, "{done}");
@@ -152,7 +152,7 @@ async fn a_task_runs_from_slack_to_a_result(env: &Env) {
         .get(&format!("/v1/tasks/{tid}"), "slack", Some("ana"))
         .await;
     assert_eq!(status, 200);
-    assert_eq!(got["result"], "DSM needs port 443.");
+    assert_eq!(got["result"], "Acme Vault needs port 443.");
     assert_eq!(
         got["checklist"][0],
         json!({"item": "Search the docs", "done": true})
@@ -196,7 +196,7 @@ async fn a_task_runs_from_slack_to_a_result(env: &Env) {
     assert_eq!(feed[0]["requested_by"], "ana");
     assert_eq!(feed[0]["slack"]["channel"], "D0ANA");
     assert_eq!(feed[1]["kind"], "done");
-    assert_eq!(feed[1]["text"], "DSM needs port 443.");
+    assert_eq!(feed[1]["text"], "Acme Vault needs port 443.");
 
     // Nothing else is queued.
     let (status, _) = env.claim().await;
@@ -270,6 +270,46 @@ async fn results_with_approvals_wait_until_every_item_is_decided(env: &Env) {
     );
     assert_eq!(last["approvals"], json!(["apr_1", "apr_2"]));
     assert_eq!(last["outcomes"][1]["status"], "rejected");
+}
+
+/// A Slack draft nobody decided within a day is `expired`: a closed state, so the task
+/// settles when its last item expires, and Slack hears `approval_closed`.
+async fn a_task_settles_when_its_last_approval_expires(env: &Env) {
+    let task = env.ask("Draft my replies").await;
+    let tid = id(&task);
+    env.claim().await;
+    env.post(
+        &format!("/v1/worker/tasks/{tid}/complete"),
+        "worker",
+        None,
+        json!({"result": "Drafted two replies.", "approvals": ["apr_r1", "apr_r2"]}),
+    )
+    .await;
+    env.ts
+        .set_approval("apr_r1", "slack.post_reply", "approved", Some("ana"));
+    env.ts
+        .set_approval("apr_r2", "slack.post_reply", "pending", None);
+    let now = pmos_bots::model::now();
+    assert_eq!(
+        env.rt.check_approvals(now).await.unwrap(),
+        0,
+        "still waiting"
+    );
+    env.ts
+        .set_approval("apr_r2", "slack.post_reply", "expired", None);
+    assert_eq!(env.rt.check_approvals(now).await.unwrap(), 1);
+    assert_eq!(env.rt.check_approvals(now).await.unwrap(), 0, "closed once");
+
+    let (_, t) = env.get(&format!("/v1/tasks/{tid}"), "console", None).await;
+    assert_eq!(t["status"], "done");
+    let last = env.feed().await.last().unwrap().clone();
+    assert_eq!(last["kind"], "approval_closed");
+    assert_eq!(
+        last["text"],
+        "slack.post_reply was approved by ana; slack.post_reply expired undecided; nothing was sent."
+    );
+    assert_eq!(last["outcomes"][1]["status"], "expired");
+    assert_eq!(last["outcomes"][1]["decided_by"], Value::Null);
 }
 
 async fn approvals_the_tool_server_lost_still_close(env: &Env) {
@@ -401,13 +441,107 @@ async fn a_failed_task_says_why(env: &Env) {
 both_envs!(
     a_task_runs_from_slack_to_a_result,
     results_with_approvals_wait_until_every_item_is_decided,
+    a_task_settles_when_its_last_approval_expires,
     approvals_the_tool_server_lost_still_close,
     two_workers_one_task_one_claim,
     workers_are_held_to_their_claim,
     a_failed_task_says_why,
     routines_are_managed_by_their_owner,
     a_bots_own_worker_touches_only_that_bots_tasks,
+    drafts_are_read_from_the_tool_server_for_console_and_evals,
 );
+
+/// `GET /v1/tasks/{id}/drafts` (`docs/improvement-loop-spec.md` §3): the runtime reads each
+/// approval item from the tool server with its own service token.
+async fn drafts_are_read_from_the_tool_server_for_console_and_evals(env: &Env) {
+    let (status, task) = env
+        .post(
+            "/v1/tasks",
+            "evals",
+            None,
+            json!({"bot": "docs", "requested_by": "ben", "text": "File it", "source": "eval"}),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let tid = id(&task);
+    let path = format!("/v1/tasks/{tid}/drafts");
+
+    // Nothing drafted yet.
+    let (status, body) = env.get(&path, "evals", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({"drafts": []}));
+
+    let (status, _) = env.claim().await;
+    assert_eq!(status, 200);
+    env.post(
+        &format!("/v1/worker/tasks/{tid}/complete"),
+        "worker",
+        None,
+        json!({"result": "Drafted.", "approvals": ["apr_2", "apr_1", "apr_gone"]}),
+    )
+    .await;
+    env.ts.approvals.lock().unwrap().insert(
+        "apr_1".into(),
+        json!({"id": "apr_1", "user": "ben", "bot": "docs", "run_id": tid,
+            "tool": "jira.create_issue", "args": {"project": "PM", "summary": "SCIM"},
+            "args_hash": "h", "status": "pending", "created_at": "2026-11-14T10:00:00Z"}),
+    );
+    env.ts
+        .set_approval("apr_2", "slack.send_message", "rejected", Some("ben"));
+
+    let reads = *env.ts.approval_reads.lock().unwrap();
+    let (status, body) = env.get(&path, "evals", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({"drafts": [
+            {"id": "apr_2", "tool": "slack.send_message", "args": {}, "status": "rejected"},
+            {"id": "apr_1", "tool": "jira.create_issue",
+             "args": {"project": "PM", "summary": "SCIM"}, "status": "pending"},
+            {"id": "apr_gone", "tool": null, "args": null, "status": "missing"},
+        ]}),
+        "in the worker's order; an item the tool server lost reads missing"
+    );
+    assert_eq!(
+        *env.ts.approval_reads.lock().unwrap(),
+        reads + 3,
+        "fetched from the tool server with the service token"
+    );
+    let (status, console) = env.get(&path, "console", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(console, body);
+
+    // Slack and workers may not read drafts; evals sees only eval tasks.
+    let (status, _) = env.get(&path, "slack", Some("ben")).await;
+    assert_eq!(status, 403);
+    let (status, _) = env.get(&path, "worker", None).await;
+    assert_eq!(status, 403);
+    let slack_task = env.ask("Not an eval").await;
+    let (status, _) = env
+        .get(
+            &format!("/v1/tasks/{}/drafts", id(&slack_task)),
+            "evals",
+            None,
+        )
+        .await;
+    assert_eq!(status, 404);
+    let (status, _) = env
+        .get(
+            &format!("/v1/tasks/{}/drafts", id(&slack_task)),
+            "console",
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = env.get("/v1/tasks/tsk_nope/drafts", "console", None).await;
+    assert_eq!(status, 404);
+
+    // The tool server down: try again later, not an empty list.
+    *env.ts.approvals_down.lock().unwrap() = true;
+    let (status, body) = env.get(&path, "evals", None).await;
+    assert_eq!(status, 503, "{body}");
+    *env.ts.approvals_down.lock().unwrap() = false;
+}
 
 /// Each bot's sandbox holds its own worker token (`worker-docs`), so a compromised Docs-bot
 /// sandbox can't claim Ana's personal-bot task and receive its restricted session.
@@ -444,7 +578,7 @@ async fn a_bots_own_worker_touches_only_that_bots_tasks(env: &Env) {
     assert_eq!(status, 204, "the queued task is pm-ana's, not docs'");
 
     // Its own bot's task, it gets.
-    let docs_task = id(&env.ask("What ports does DSM need?").await);
+    let docs_task = id(&env.ask("What ports does Acme Vault need?").await);
     let (status, claim) = env
         .post(
             "/v1/worker/claim",
@@ -1114,6 +1248,12 @@ async fn every_endpoint_checks_the_client() {
             format!("/v1/tasks/{tid}/trace"),
             json!(null),
             &["console"],
+        ),
+        (
+            Method::GET,
+            format!("/v1/tasks/{tid}/drafts"),
+            json!(null),
+            &["console", "evals"],
         ),
         (
             Method::POST,

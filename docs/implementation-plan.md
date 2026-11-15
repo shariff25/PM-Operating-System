@@ -1,8 +1,7 @@
 # PM OS — implementation plan and phases
 
 ## Context
-The PRD ("PM OS for the Fortanix Product Team", claude.ai artifact FwKYdeMgiLGd3rhC1Mc1UU) defines an internal agent
-workspace for the product team, running on one DGX Spark: 8 launch skills, a 7-persona reviewer panel, a team
+The PM OS PRD defines an internal agent workspace for the product team, running on one DGX Spark: 8 launch skills, a 7-persona reviewer panel, a team
 context library, a Slack reply assistant with human approval, every run in an NVIDIA OpenShell sandbox, pilot by
 week 7 and full team by week 12. This repo (`shariff25/pm-operating-system`) is empty apart from a README. It becomes
 both the team's content repo (the PRD's "files are the source of truth") and the service code.
@@ -57,7 +56,7 @@ when they click.
 ### How PMs use it
 | Entry point | What happens | Slack API |
 | --- | --- | --- |
-| **Tag it in a thread:** `@PM OS does DSM support SAML SSO?` | Reads the thread and searches the context library, Jira, Confluence and Slack as the asker. Replies with a cited answer **visible only to the asker**, with buttons: **Post to thread**, **Edit**, **Discard**. | `app_mention` event, `chat.postEphemeral` |
+| **Tag it in a thread:** `@PM OS does Acme Vault support SAML SSO?` | Reads the thread and searches the context library, Jira, Confluence and Slack as the asker. Replies with a cited answer **visible only to the asker**, with buttons: **Post to thread**, **Edit**, **Discard**. | `app_mention` event, `chat.postEphemeral` |
 | **Assistant panel** (Slack's AI-app side panel, next to any conversation) | A private chat with PM OS: questions, skills, follow-ups. Shows "Searching Jira…" status and streams answers. Suggests skills as one-tap prompts. | `assistant_thread_started`, `assistant.threads.setStatus`, `assistant.threads.setSuggestedPrompts`, `chat.startStream` |
 | **DM the bot** | Same as the panel, for clients without it. | `message.im` |
 | **Slash commands:** `/prd-draft`, `/meeting-notes`, `/review`, `/ask` … | Runs the skill. Long jobs reply in the thread when done (SUR-1), with a link to the Confluence draft. | slash commands |
@@ -98,7 +97,7 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
 1. **0a. Contract and lint.** First PR, detailed below.
 2. **0b. Seed content.**
    - Team `AGENTS.md`.
-   - Context folders, each with a README and a placeholder file. Owners and facts are left as TODO; no Fortanix facts are invented.
+   - Context folders, each with a README and a placeholder file. Owners and facts are left as TODO; no company or product facts are invented.
    - The 7 reviewer rubrics, built from the PRD appendix.
    - PRD, POC plan and release-notes templates.
    - Skills `/ask`, `/meeting-notes` and `/prd-draft`.
@@ -153,7 +152,7 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
   - a fixed set of real tasks per category, rerun weekly and on every model or harness change;
   - each failure tagged to its bottleneck: model, tool, policy, memory or harness;
   - a category launches only after passing its bar two weeks in a row.
-- **Memory moves to markdown files in git** (D5): team memory in a git repo set in config (default `pm-os-memory`), committed by the tool server on each bot write; personal memory in each PM's own private repo in the Fortanix GitHub org (decided 2026-11-14; `PMOS_MEMORY=github`); a source and date on every entry; and the context mount filtered by data class.
+- **Memory moves to markdown files in git** (D5): team memory in a git repo set in config (default `pm-os-memory`), committed by the tool server on each bot write; personal memory in each PM's own private repo in your GitHub org (decided 2026-11-14; `PMOS_MEMORY=github`); a source and date on every entry; and the context mount filtered by data class.
 - **Phase 1:**
   - The first named bots: a team **Docs** bot, which takes over `/docs`, and personal PM bots.
   - Routines in plain language (D8), moved up from Phase 2.
@@ -264,15 +263,18 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
 | 0c Tool server | Done (fakes) | `crates/toolserver`; see `docs/toolserver.md` |
 | 0c-2a Postgres stores | Done | Every store in Postgres behind async traits; same contract tests on both backends; CI runs Postgres |
 | 0c-2b Real Atlassian and Slack connectors, encrypted token store | Done | Each PM's own token; AES-256-GCM vault; OAuth 3LO and Slack v2; tested against local mock APIs; first real call after Gate 1 |
-| Support docs + `/docs` in Slack | Done | `crates/docs` (`pmos-docs` MCP server over support.fortanix.com), docs connector and `docs` skill in the tool server, `crates/slack` (Socket Mode, `/docs`), `content/team.yaml`; see `docs/docs-server.md` |
+| Public docs + `/docs` in Slack | Done | `crates/docs` (`pmos-docs` MCP server over your docs site, `PMOS_DOCS_BASE_URL`), docs connector and `docs` skill in the tool server, `crates/slack` (Socket Mode, `/docs`), `content/team.yaml`; see `docs/docs-server.md` |
 | Staff-engineer review fixes | Done | Four reviews (security, correctness, scale and operations, design and tests), checked against the code. The 8 blockers and the pilot list are fixed; see **Review follow-ups** for what's left |
 | 0d Gateway | Done | `crates/gateway`: role aliases to local vLLM only, fair queue (interactive, scheduled, personal; per-person cap), usage log, workaround registry (D11), stub model for CI; see `docs/gateway.md` |
 | 0e Bots | Built (mocks and stub model) | `content/bots`, `content/roles` and their lint; tool-server bot sessions (allowlist per role, `never` actions, team-bot read scope with its own account); `crates/bots` runtime (durable tasks with leases, routines, 30-day traces, notifications, one worker token per bot); `harness` worker; Slack DMs, progress, approval cards and routines; `crates/console`. Checked end to end with the real binaries and the stub model. See `docs/bot-runtime-spec.md` |
 | 0f Sandbox policies | Built; verify on the Spark | `crates/policy`, `pmos policy generate/check` in CI, `policies/bots/docs.yaml`, red-team kit. Format checked against OpenShell's repo; items marked "verify on the Spark" in `docs/sandbox-policies.md` |
 | 0g Evals | Built; first live run on the Spark | `crates/evals`, `evals/categories/docs-qa` (20 real questions), failure tags, weekly reports, load test. Latency is reported, not gated (decided 2026-11-14) |
-| Onboarding and GitHub memory | Built (this PR); first live run on the Spark | New members ask in Slack, a platform owner approves, PM OS commits `team.yaml` and their personal bot; guided setup; each PM's memory in a private repo in the Fortanix GitHub org ([spec](onboarding-spec.md)) |
+| Onboarding and GitHub memory | Built (this PR); first live run on the Spark | New members ask in Slack, a platform owner approves, PM OS commits `team.yaml` and their personal bot; guided setup; each PM's memory in a private repo in your GitHub org ([spec](onboarding-spec.md)) |
 | Spark deployment kit | Built (this PR); first run on the Spark | `deploy/`: one Compose stack (Postgres, docs, tool server, gateway, bots, Slack, console, two vLLM servers), the service and worker images, `setup.sh`, `pmos-admin` (status, logs, backup and restore, reindex, revoke, bot sandboxes, smoke test, benchmarks), and runbooks in `docs/runbooks/`. CI builds the images, starts the stack and runs a task end to end. |
-| Claude test in a test Slack workspace (testing only) | Built; **deferred until the test workspace is ready** (2026-11-15) | Every service on one machine with Claude behind the gateway, fake Jira, Confluence and Slack, and the real public support docs. Waiting on a test Slack workspace and app, plus four environment variables: `PMOS_SLACK_BOT_TOKEN`, `PMOS_SLACK_APP_TOKEN`, `PMOS_TEST_SLACK_ID` and `PMOS_GATEWAY_ANTHROPIC_KEY` ([guide](testing-with-claude.md)) |
+| Improvement loop, phases 0–1 (tooling) | Built (this PR); runs on the Spark | From the deep research ([report](research/self-improvement-loops.md), [spec](improvement-loop-spec.md)). **Measurement:** a feedback ledger of every draft's outcome, one-tap reject reasons, a daily triage digest for each bot's quality owner. **Benchmarks:** 3 runs per task, pass^3 and error bars, flips and a gate, should-decline cases, checks on drafts, second-level failure tags, calibrated judges, seed draft categories. **Running them:** an eval stack, and an eval gate on PRs (self-hosted Spark runner). **Later, each after its gate:** shadow and canary releases, the improver bot (phase 2), training (phase 3). |
+| Slack reply assistant (SLK-1 to SLK-8) | Built (this PR); first live run on the Spark | `reply assistant on` starts a routine on the PM's personal bot that finds questions to them (with their own token), drafts grounded replies with the `slack-reply` skill, one per thread, and shows each on a card (Post as you, Edit, Snooze, Reject). The audience check blocks restricted drafts where outsiders would see them and asks again for Slack Connect. Drafts expire after 24 hours and their text is deleted ([how it works](slack-reply.md), [spec](slack-reply-spec.md)). |
+| Claude test in a test Slack workspace (testing only) | Built; **deferred until the test workspace is ready** (2026-11-15) | Every service on one machine with Claude behind the gateway, fake Jira, Confluence and Slack, and your public docs site, if one is set. Waiting on a test Slack workspace and app, plus four environment variables: `PMOS_SLACK_BOT_TOKEN`, `PMOS_SLACK_APP_TOKEN`, `PMOS_TEST_SLACK_ID` and `PMOS_GATEWAY_ANTHROPIC_KEY` ([guide](testing-with-claude.md)) |
+| PM craft (senior-PM bar) | Built (this PR); the bar is measured on the Spark | PM OS works to a written bar: problem first, alternatives, a recommendation, a measurable outcome with a guardrail, the riskiest assumption. **Content:** six playbooks, 16 skills on one pattern (ask, draft from a template and an exemplar, check against the bar, propose a Confluence draft), 12 templates, five exemplars, four new reviewers (`senior-pm`, `data-scientist`, `design-ux`, `ai-safety`), and an AI-product track. **Code:** the review panel as read-only sub-agents (up to 4 a run), `stats.sample_size` and `stats.compare` in the tool server, the `reasoning` model role, playbook lint. **Benchmarks:** `evals/categories/pm-craft` (17 seed tasks, structure checks) and three advisory judges. Whether the local models meet the bar is decided by those benchmarks on the real stack; the `reasoning` role can be pointed at a larger model if they don't ([how PMs use it](pm-craft.md), [spec](pm-craft-spec.md)). |
 | **Gate 1** | Needs the Spark | vLLM with the chosen models; OpenShell; the Slack app and the GitHub App; the first platform owners in `team.yaml` (everyone else onboards through the bot); the red-team run; two passing benchmark weeks; the load test (every task finishes) |
 
 0c notes:
@@ -335,5 +337,5 @@ the pilot list. Still open, roughly in priority order:
 
 ## Open questions
 - None blocking.
-- Before building the bot (Phase 1): does Fortanix's Slack plan allow the AI-app assistant panel? If not, the DM gives the same experience.
+- Before building the bot (Phase 1): does your Slack plan allow the AI-app assistant panel? If not, the DM gives the same experience.
 - The PRD still mentions a frontier API and an engineer as platform owner; suggest edits to the doc.

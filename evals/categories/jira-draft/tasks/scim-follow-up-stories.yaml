@@ -1,0 +1,17 @@
+# seed: replace with case cards
+# Fixture: epic PM-101 and its story PM-102 "SCIM user provisioning" ("Provision and
+# deprovision users from the IdP").
+id: scim-follow-up-stories
+ask: "Read PM-102 and draft two Jira stories under epic PM-101 for the follow-up work: syncing IdP groups over SCIM, and removing a user's Acme Vault access when the IdP deprovisions them. Give each a description."
+expect:
+  approvals: 2
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: jira.create_issue
+      count: 2
+      require_fields: [project, issue_type, summary, description]
+      allowed:
+        project: [PM]
+        issue_type: [Story]
+        epic: [PM-101]

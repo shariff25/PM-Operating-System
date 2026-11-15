@@ -872,7 +872,7 @@ impl Bots {
         if !mc::valid_repo(&repo) {
             let example = format!(
                 "{}/pm-os-memory-{}",
-                org.as_deref().unwrap_or("fortanix"),
+                org.as_deref().unwrap_or("your-org"),
                 member.handle
             );
             return (

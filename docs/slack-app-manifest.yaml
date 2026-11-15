@@ -13,7 +13,7 @@
 # Keep this an internal app (not distributed): internal apps keep the higher rate limits.
 display_information:
   name: PM OS
-  description: The Fortanix product team's agent workspace
+  description: The product team's agent workspace
   background_color: "#1f2937"
 features:
   # Each PM talks to the bots in their DM with the app (spec §5).
@@ -26,8 +26,8 @@ features:
     always_online: true
   slash_commands:
     - command: /docs
-      description: Search the Fortanix support docs (only you see the results)
-      usage_hint: "[product:dsm] what you're looking for"
+      description: Search the public docs (only you see the results)
+      usage_hint: "[product:<id>] what you're looking for"
       should_escape: false
 oauth_config:
   redirect_urls:
@@ -62,6 +62,14 @@ oauth_config:
       - im:history
       - mpim:history
       - chat:write
+      # The audience check before a reply or message posts as the PM
+      # (docs/slack-reply-spec.md §3): conversations.info (is it shared outside the company?)
+      # and conversations.members (is everyone on the product team?), for public and private
+      # channels, group DMs and DMs.
+      - channels:read
+      - groups:read
+      - mpim:read
+      - im:read
 settings:
   # Over Socket Mode, so no request URLs: events and button presses arrive on the socket.
   event_subscriptions:

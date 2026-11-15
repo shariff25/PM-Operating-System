@@ -1,0 +1,16 @@
+# seed: replace with case cards
+# Fixtures: page 9002 "PRD: Key export v2" (the exemplar) and page 9001's customer asks. The
+# prd-draft skill titles its draft `PRD: <feature>`.
+id: prd-from-exemplar
+ask: "Draft anyway, no questions: a first-draft PRD in the PM space for exporting audit logs from the Acme Vault console, using the Key export v2 PRD as the exemplar and the October Acme Cloud call notes for customer asks."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["PRD:", "audit"]

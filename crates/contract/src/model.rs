@@ -135,15 +135,19 @@ pub enum ModelRole {
     Default,
     /// Extraction and triage (Nemotron 3 Nano 30B-A3B at launch).
     Extraction,
+    /// The PM assistant's drafting and critique (the `default` model at launch; the bake-off
+    /// may point it at a larger one).
+    Reasoning,
 }
 
 impl ModelRole {
-    pub const ALL: [&'static str; 2] = ["default", "extraction"];
+    pub const ALL: [&'static str; 3] = ["default", "extraction", "reasoning"];
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "default" => Some(Self::Default),
             "extraction" => Some(Self::Extraction),
+            "reasoning" => Some(Self::Reasoning),
             _ => None,
         }
     }
@@ -216,6 +220,17 @@ pub struct TemplateFrontMatter {
     pub version: String,
 }
 
+/// Front matter of a playbook (`content/playbooks/<name>.md`): the craft guidance a skill
+/// reads before it drafts. The body is the playbook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PlaybookFrontMatter {
+    #[serde(default)]
+    pub title: Option<String>,
+    pub owner: String,
+    pub version: String,
+}
+
 /// A role in PM OS (ADM-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -255,7 +270,7 @@ pub struct TeamMember {
     /// has this email, so a forwarded link can't attach someone else's account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    /// GitHub login in the Fortanix org. Optional: linking GitHub checks this login when it is
+    /// GitHub login in your GitHub org. Optional: linking GitHub checks this login when it is
     /// set, and otherwise a verified email on the GitHub account matching `email`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<String>,
@@ -333,4 +348,21 @@ pub fn valid_slack_id(id: &str) -> bool {
         && id.len() >= 3
         && id.len() <= 32
         && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_roles_parse() {
+        for name in ModelRole::ALL {
+            let role = ModelRole::parse(name).expect(name);
+            let yaml = serde_norway::to_string(&role).unwrap();
+            assert_eq!(yaml.trim(), name);
+        }
+        assert_eq!(ModelRole::parse("reasoning"), Some(ModelRole::Reasoning));
+        assert_eq!(ModelRole::parse("Reasoning"), None);
+        assert_eq!(ModelRole::parse("large"), None);
+    }
 }

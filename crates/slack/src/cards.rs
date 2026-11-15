@@ -21,12 +21,44 @@ pub mod action {
     pub const APPROVE: &str = "apr_approve";
     pub const EDIT: &str = "apr_edit";
     pub const REJECT: &str = "apr_reject";
+    /// A reason button is this prefix and the reason's code: `apr_reason_tone`.
+    pub const REASON_PREFIX: &str = "apr_reason_";
+    /// Back from the reasons to the card's own buttons.
+    pub const BACK: &str = "apr_back";
     pub const EDIT_MODAL: &str = "apr_edit_modal";
+    /// **Snooze** on a reply card: its choices in place.
+    pub const SNOOZE: &str = "apr_snooze";
+    /// A snooze choice is this prefix and the choice's code: `apr_snooze_4h`.
+    pub const SNOOZE_PREFIX: &str = "apr_snooze_";
+    /// **Post to external channel**: the decision again, with `confirm_external`.
+    pub const POST_EXTERNAL: &str = "apr_post_external";
     pub const ROUTINE_CREATE: &str = "rtn_create";
     pub const ROUTINE_CANCEL: &str = "rtn_cancel";
     pub const ROUTINE_PAUSE: &str = "rtn_pause";
     pub const ROUTINE_RESUME: &str = "rtn_resume";
     pub const ROUTINE_DELETE: &str = "rtn_delete";
+}
+
+/// Why a draft was rejected: the code the tool server's ledger stores, and the button's
+/// label (`docs/improvement-loop-spec.md` §1 and §4).
+pub const REASONS: [(&str, &str); 6] = [
+    ("wrong_facts", "Wrong facts"),
+    ("wrong_target", "Wrong place"),
+    ("tone", "Tone"),
+    ("incomplete", "Incomplete"),
+    ("should_not_draft", "Shouldn't have drafted"),
+    ("other", "Other"),
+];
+
+/// The reason code a button's action id carries, if it is one of [`REASONS`].
+pub fn reason_of_action(action_id: &str) -> Option<&'static str> {
+    let code = action_id.strip_prefix(action::REASON_PREFIX)?;
+    REASONS.iter().find(|(c, _)| *c == code).map(|(c, _)| *c)
+}
+
+/// The label of a reason code: `tone` → "Tone". `None` for anything else.
+pub fn reason_label(code: &str) -> Option<&'static str> {
+    REASONS.iter().find(|(c, _)| *c == code).map(|(_, l)| *l)
 }
 
 fn section(text: &str) -> Value {
@@ -272,6 +304,9 @@ pub fn args_summary(args: &Value) -> String {
 }
 
 fn approval_head(item: &Value) -> Vec<Value> {
+    if is_reply(item) {
+        return reply_head(item);
+    }
     let tool = item["tool"].as_str().unwrap_or("a write");
     vec![
         section(&format!(
@@ -289,23 +324,50 @@ fn approval_head(item: &Value) -> Vec<Value> {
 
 fn approval_buttons(item: &Value) -> Value {
     let id = item["id"].as_str().unwrap_or_default();
-    let mut elements = vec![button("Approve", action::APPROVE, id, Some("primary"))];
+    let mut elements = if is_reply(item) {
+        vec![button("Post as you", action::APPROVE, id, Some("primary"))]
+    } else {
+        vec![button("Approve", action::APPROVE, id, Some("primary"))]
+    };
     if !editable_fields(item).is_empty() {
         elements.push(button("Edit", action::EDIT, id, None));
+    }
+    if is_reply(item) {
+        elements.push(button("Snooze", action::SNOOZE, id, None));
     }
     elements.push(button("Reject", action::REJECT, id, Some("danger")));
     json!({"type": "actions", "block_id": format!("approval:{id}"), "elements": elements})
 }
 
 /// A pending approval card: the tool, its arguments, and **Approve**, **Edit**, **Reject**.
+/// A reply draft gets the reply card instead: **Post as you**, **Edit**, **Snooze** and
+/// **Reject**.
 pub fn approval_card(item: &Value) -> (String, Value) {
     let tool = item["tool"].as_str().unwrap_or("a write");
     let mut blocks = approval_head(item);
     blocks.push(approval_buttons(item));
-    (
-        format!("Approval needed: {}", escape(&tool_label(tool))),
-        Value::Array(blocks),
-    )
+    let text = if is_reply(item) {
+        format!("{}: approval needed", reply_title(item))
+    } else {
+        format!("Approval needed: {}", escape(&tool_label(tool)))
+    };
+    (text, Value::Array(blocks))
+}
+
+/// The card after **Reject**: why, as six one-tap reasons, and **Back** to the card's own
+/// buttons. Nothing is decided until a reason is chosen.
+pub fn approval_reasons(item: &Value) -> (String, Value) {
+    let id = item["id"].as_str().unwrap_or_default();
+    let mut elements: Vec<Value> = REASONS
+        .iter()
+        .map(|(code, label)| button(label, &format!("{}{code}", action::REASON_PREFIX), id, None))
+        .collect();
+    elements.push(button("Back", action::BACK, id, None));
+    let mut blocks = approval_head(item);
+    blocks.push(section("*Why reject it?* Nothing is sent either way."));
+    blocks
+        .push(json!({"type": "actions", "block_id": format!("reject:{id}"), "elements": elements}));
+    ("Why reject it?".into(), Value::Array(blocks))
 }
 
 /// The card with a line under it instead of the buttons: decided, or being decided.
@@ -326,12 +388,26 @@ pub fn approval_retry(item: &Value, error: &str) -> (String, Value) {
 /// "Approved by Ana — <link>", "Rejected by Ana", or what went wrong, from the decided item.
 pub fn decision_line(item: &Value, decided_by: &str, edited: bool) -> String {
     let who = escape(&person(item["decided_by"].as_str().unwrap_or(decided_by)));
-    let verb = if edited {
-        "Edited and approved"
-    } else {
-        "Approved"
+    let verb = match (edited, is_reply(item)) {
+        (true, true) => "Edited and posted",
+        (false, true) => "Posted",
+        (true, false) => "Edited and approved",
+        (false, false) => "Approved",
     };
     match item["status"].as_str().unwrap_or_default() {
+        "approved" if is_reply(item) => {
+            match item["result"]["url"]
+                .as_str()
+                .filter(|u| u.starts_with("https://"))
+            {
+                Some(url) => format!(
+                    ":white_check_mark: {verb} by {who} — {}",
+                    link(url, "see the reply")
+                ),
+                None => format!(":white_check_mark: {verb} by {who}"),
+            }
+        }
+        "expired" => EXPIRED_LINE.to_string(),
         "approved" => {
             let result = &item["result"];
             match result["url"].as_str().filter(|u| u.starts_with("https://")) {
@@ -342,7 +418,10 @@ pub fn decision_line(item: &Value, decided_by: &str, edited: bool) -> String {
                 None => format!(":white_check_mark: {verb} by {who}"),
             }
         }
-        "rejected" => format!(":no_entry_sign: Rejected by {who}"),
+        "rejected" => match item["reason"].as_str().and_then(reason_label) {
+            Some(reason) => format!(":no_entry_sign: Rejected by {who}: {}", escape(reason)),
+            None => format!(":no_entry_sign: Rejected by {who}"),
+        },
         "failed" => format!(
             ":warning: {verb} by {who}, but the write failed: {}",
             escape(&truncate(
@@ -401,11 +480,16 @@ pub fn edit_modal(item: &Value, channel: &str, message_ts: &str) -> Option<Value
         "channel": channel,
         "ts": message_ts,
     });
+    let (title, submit) = if is_reply(item) {
+        ("Edit before posting", "Post as you")
+    } else {
+        ("Edit before approving", "Approve")
+    };
     Some(json!({
         "type": "modal",
         "callback_id": action::EDIT_MODAL,
-        "title": {"type": "plain_text", "text": "Edit before approving"},
-        "submit": {"type": "plain_text", "text": "Approve"},
+        "title": {"type": "plain_text", "text": title},
+        "submit": {"type": "plain_text", "text": submit},
         "close": {"type": "plain_text", "text": "Cancel"},
         "private_metadata": metadata.to_string(),
         "blocks": blocks,
@@ -441,6 +525,271 @@ pub fn empty_fields(state_values: &Value) -> serde_json::Map<String, Value> {
         }
     }
     errors
+}
+
+// ---- The reply card (`docs/slack-reply-spec.md` §5) ----
+
+/// The tool whose approval items get the reply card.
+pub const REPLY_TOOL: &str = "slack.post_reply";
+
+/// What an expired draft's card says.
+pub const EXPIRED_LINE: &str = ":hourglass: Expired after 24 hours; nothing was posted.";
+
+pub fn is_reply(item: &Value) -> bool {
+    item["tool"] == REPLY_TOOL
+}
+
+/// A Slack id that can go in `<#…>` or `<@…>`: capital letters and digits only.
+fn slack_id_ok(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 24
+        && id
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// A message timestamp: digits, a dot, digits.
+fn ts_ok(ts: &str) -> bool {
+    ts.split_once('.').is_some_and(|(a, b)| {
+        !a.is_empty()
+            && !b.is_empty()
+            && a.len() + b.len() <= 24
+            && a.chars().chain(b.chars()).all(|c| c.is_ascii_digit())
+    })
+}
+
+/// Where a reply goes, as `mrkdwn`: the channel as a Slack mention (Slack shows its name to
+/// whoever can see it, so the bot never has to read the channel), or "your DM", with the
+/// other person when the item says who.
+pub fn reply_place(item: &Value) -> String {
+    let channel = item["args"]["channel"].as_str().unwrap_or_default();
+    if channel.starts_with('D') {
+        match item["audience"]["dm_with"]
+            .as_str()
+            .filter(|u| slack_id_ok(u))
+        {
+            Some(user) => format!("your DM with <@{user}>"),
+            None => "your DM".into(),
+        }
+    } else if slack_id_ok(channel) {
+        format!("<#{channel}>")
+    } else {
+        "a Slack channel".into()
+    }
+}
+
+/// "Reply drafted for #launch", as `mrkdwn`.
+pub fn reply_title(item: &Value) -> String {
+    format!("Reply drafted for {}", reply_place(item))
+}
+
+/// The thread's link: `https://slack.com/archives/<channel>/p<thread_ts without the dot>`,
+/// the format the tool server's Slack connector gives its own results. Slack opens it in the
+/// workspace for anyone who can see the channel. It is built here rather than asked of
+/// `chat.getPermalink`, which the bot token can't answer for channels the bot isn't in.
+pub fn thread_link(channel: &str, thread_ts: &str) -> Option<String> {
+    (slack_id_ok(channel) && ts_ok(thread_ts)).then(|| {
+        format!(
+            "https://slack.com/archives/{channel}/p{}",
+            thread_ts.replace('.', "")
+        )
+    })
+}
+
+/// A reply draft as safe `mrkdwn`, as Slack will show it once posted: `<https://…|label>`
+/// and `[label](https://…)` links are kept (https only), as are `<@U…>` and `<#C…>`
+/// mentions; anything else in angle brackets, `<!here>` included, is escaped.
+pub fn reply_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&inline(&rest[..open]));
+        let Some(close) = rest[open..].find('>') else {
+            rest = &rest[open..];
+            break;
+        };
+        let inner = &rest[open + 1..open + close];
+        let (target, label) = match inner.split_once('|') {
+            Some((t, l)) => (t, Some(l)),
+            None => (inner, None),
+        };
+        let kept = if target.starts_with("https://") && !target.contains(char::is_whitespace) {
+            Some(link(target, label.unwrap_or(target)))
+        } else if let Some(id) = target.strip_prefix('@').filter(|id| slack_id_ok(id)) {
+            Some(format!("<@{id}>"))
+        } else {
+            target
+                .strip_prefix('#')
+                .filter(|id| slack_id_ok(id))
+                .map(|id| format!("<#{id}>"))
+        };
+        match kept {
+            Some(k) => out.push_str(&k),
+            None => out.push_str(&escape(&rest[open..=open + close])),
+        }
+        rest = &rest[open + close + 1..];
+    }
+    out.push_str(&inline(rest));
+    out
+}
+
+/// "Visible to 14 people", "External channel": what the item knows of who will see it.
+fn audience_parts(audience: &Value) -> Vec<String> {
+    let mut parts = Vec::new();
+    if let Some(n) = audience["members"].as_u64() {
+        parts.push(if n == 1 {
+            "Visible to 1 person".into()
+        } else {
+            format!("Visible to {n} people")
+        });
+    }
+    if audience["external"].as_bool() == Some(true) {
+        parts.push("External channel".into());
+    }
+    parts
+}
+
+/// The reply card's head: where it goes with the thread's link, the draft, and who will see
+/// it. The question's text is never on the card: it isn't in the item, and nothing here
+/// reads the thread.
+fn reply_head(item: &Value) -> Vec<Value> {
+    let args = &item["args"];
+    let mut title = format!("*{}*", reply_title(item));
+    if let Some(url) = thread_link(
+        args["channel"].as_str().unwrap_or_default(),
+        args["thread_ts"].as_str().unwrap_or_default(),
+    ) {
+        title.push_str(" · ");
+        title.push_str(&link(&url, "open the thread"));
+    }
+    let mut blocks = vec![section(&title)];
+    let text = args["text"].as_str().unwrap_or_default();
+    if item["status"] != "expired" && !text.trim().is_empty() && text != "[expired]" {
+        let quoted: Vec<String> = reply_text(&truncate(text, 2500))
+            .lines()
+            .map(|l| format!("> {l}"))
+            .collect();
+        blocks.extend(sections(&quoted.join("\n")));
+    }
+    let mut meta = vec![
+        format!(
+            "for {}",
+            escape(&person(item["user"].as_str().unwrap_or("you")))
+        ),
+        "posts as you, marked “Drafted with PM OS”".to_string(),
+    ];
+    if let Some(s) = item["sources_sensitivity"]
+        .as_str()
+        .filter(|s| matches!(*s, "public" | "internal" | "restricted"))
+    {
+        meta.push(format!("built from {s} sources"));
+    }
+    meta.extend(audience_parts(&item["audience"]));
+    blocks.push(context(&meta.join(" · ")));
+    blocks
+}
+
+/// The reply card's title and one line, with no draft and no buttons: snoozed, or posted
+/// again below.
+pub fn reply_note(item: &Value, line: &str) -> (String, Value) {
+    let args = &item["args"];
+    let mut title = format!("*{}*", reply_title(item));
+    if let Some(url) = thread_link(
+        args["channel"].as_str().unwrap_or_default(),
+        args["thread_ts"].as_str().unwrap_or_default(),
+    ) {
+        title.push_str(" · ");
+        title.push_str(&link(&url, "open the thread"));
+    }
+    (truncate(line, 300), json!([section(&title), section(line)]))
+}
+
+/// The `audience_blocked` answer: why, in plain words, with only **Reject**. Editing can't
+/// unblock it: the draft was built from restricted sources whatever its text now says, so
+/// the PM answers in the thread themselves if it still needs an answer.
+/// `outsiders` is how many members aren't in `team.yaml`; with none, the channel is
+/// externally shared.
+pub fn reply_blocked(item: &Value, outsiders: Option<u64>) -> (String, Value) {
+    let id = item["id"].as_str().unwrap_or_default();
+    let place = reply_place(item);
+    let why = match outsiders {
+        Some(1) => format!("1 person in {place} isn't on the product team"),
+        Some(n) if n > 1 => format!("{n} people in {place} aren't on the product team"),
+        _ => format!("{place} is shared outside the company"),
+    };
+    let line = format!(
+        ":no_entry: This draft was built from restricted sources and {why}, so PM OS won't \
+         post it there. Reject it, and answer in the thread yourself if it still needs a reply."
+    );
+    let elements = vec![button("Reject", action::REJECT, id, Some("danger"))];
+    let mut blocks = approval_head(item);
+    blocks.push(section(&line));
+    blocks.push(
+        json!({"type": "actions", "block_id": format!("blocked:{id}"), "elements": elements}),
+    );
+    (truncate(&line, 300), Value::Array(blocks))
+}
+
+/// The `needs_external_confirm` answer: **Post to external channel** sends the decision
+/// again with `confirm_external`. After an edit, its value says so (`<id>:edit`), so the
+/// edited text is what posts.
+pub fn reply_confirm_external(item: &Value, edited: bool) -> (String, Value) {
+    let id = item["id"].as_str().unwrap_or_default();
+    let place = reply_place(item);
+    let line = format!(
+        ":warning: {place} is an external channel (Slack Connect): people outside the company \
+         will see this reply. Post it there anyway?"
+    );
+    let value = if edited {
+        format!("{id}:edit")
+    } else {
+        id.to_string()
+    };
+    let mut elements = vec![button(
+        "Post to external channel",
+        action::POST_EXTERNAL,
+        &value,
+        Some("primary"),
+    )];
+    if !editable_fields(item).is_empty() {
+        elements.push(button("Edit", action::EDIT, id, None));
+    }
+    elements.push(button("Reject", action::REJECT, id, Some("danger")));
+    let mut shown = item.clone();
+    shown["audience"]["external"] = json!(true);
+    let mut blocks = approval_head(&shown);
+    blocks.push(section(&line));
+    blocks.push(
+        json!({"type": "actions", "block_id": format!("external:{id}"), "elements": elements}),
+    );
+    (truncate(&line, 300), Value::Array(blocks))
+}
+
+/// **Snooze**'s choices in place, each `(code, label)`, and **Back**. With none left before
+/// the draft expires, it says so.
+pub fn snooze_choices(item: &Value, choices: &[(&str, &str)], expires: &str) -> (String, Value) {
+    let id = item["id"].as_str().unwrap_or_default();
+    let mut elements: Vec<Value> = choices
+        .iter()
+        .map(|(code, label)| button(label, &format!("{}{code}", action::SNOOZE_PREFIX), id, None))
+        .collect();
+    elements.push(button("Back", action::BACK, id, None));
+    let line = if choices.is_empty() {
+        format!(
+            "*Too late to snooze:* the draft expires {}. Post, edit or reject it.",
+            escape(expires)
+        )
+    } else {
+        format!(
+            "*Snooze until when?* The card comes back here then. The draft expires {}.",
+            escape(expires)
+        )
+    };
+    let mut blocks = approval_head(item);
+    blocks.push(section(&line));
+    blocks
+        .push(json!({"type": "actions", "block_id": format!("snooze:{id}"), "elements": elements}));
+    ("Snooze until when?".into(), Value::Array(blocks))
 }
 
 /// A routine read back for a one-tap confirm (D8).
@@ -530,11 +879,11 @@ mod tests {
 
     #[test]
     fn markdown_becomes_safe_mrkdwn() {
-        let md = "# Ports\nDSM needs **443** <script> & more. See [the docs](https://support.fortanix.com/x) or [bad](javascript:alert(1)).\n- one\n```\na < b\n```";
+        let md = "# Ports\nAcme Vault needs **443** <script> & more. See [the docs](https://docs.example.com/x) or [bad](javascript:alert(1)).\n- one\n```\na < b\n```";
         let out = mrkdwn(md);
         assert!(out.starts_with("*Ports*\n"));
         assert!(out.contains("*443* &lt;script&gt; &amp; more"));
-        assert!(out.contains("<https://support.fortanix.com/x|the docs>"));
+        assert!(out.contains("<https://docs.example.com/x|the docs>"));
         assert!(!out.contains("javascript"), "{out}");
         assert!(out.contains("• one"));
         assert!(out.contains("a &lt; b"));
@@ -592,6 +941,150 @@ mod tests {
         );
         done["status"] = json!("rejected");
         assert!(decision_line(&done, "ana", false).contains("Rejected by Ana"));
+        done["reason"] = json!("should_not_draft");
+        assert_eq!(
+            decision_line(&done, "ana", false),
+            ":no_entry_sign: Rejected by Ana: Shouldn't have drafted"
+        );
+    }
+
+    fn reply_item() -> Value {
+        json!({
+            "id": "apr_r1", "user": "ana", "tool": "slack.post_reply", "status": "pending",
+            "args": {"channel": "C0LAUNCH", "thread_ts": "1731500000.000100",
+                     "text": "Yes, SSO ships in 5.1 <!here> & see <https://docs.example.com/sso|the SSO guide> or [notes](https://wiki.example.com/n). Ask <@U0BOB>."},
+            "sources_sensitivity": "internal",
+            "audience": {"members": 14, "external": true},
+            "created_at": "2026-11-15T09:00:00Z",
+        })
+    }
+
+    #[test]
+    fn reply_cards() {
+        let item = reply_item();
+        let (text, blocks) = approval_card(&item);
+        assert_eq!(text, "Reply drafted for <#C0LAUNCH>: approval needed");
+        let s = blocks.to_string();
+        assert!(s.contains("*Reply drafted for <#C0LAUNCH>* · <https://slack.com/archives/C0LAUNCH/p1731500000000100|open the thread>"), "{s}");
+        // The draft, quoted, its links kept, and everything else escaped.
+        assert!(s.contains("> Yes, SSO ships in 5.1 &lt;!here&gt; &amp; see <https://docs.example.com/sso|the SSO guide> or <https://wiki.example.com/n|notes>. Ask <@U0BOB>."), "{s}");
+        assert!(s.contains("Visible to 14 people · External channel"));
+        assert!(s.contains("built from internal sources"));
+        assert!(s.contains("marked “Drafted with PM OS”"));
+        let labels: Vec<&str> = blocks.as_array().unwrap().last().unwrap()["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["text"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, ["Post as you", "Edit", "Snooze", "Reject"]);
+        // Not the generic card's argument list.
+        assert!(!s.contains("*Thread ts:*") && !s.contains("*Channel:*"));
+
+        // A DM, and channel ids that aren't ids.
+        let mut dm = item.clone();
+        dm["args"]["channel"] = json!("D0ANA");
+        assert_eq!(reply_title(&dm), "Reply drafted for your DM");
+        dm["audience"]["dm_with"] = json!("U0BOB");
+        assert_eq!(reply_title(&dm), "Reply drafted for your DM with <@U0BOB>");
+        let mut odd = item.clone();
+        odd["args"]["channel"] = json!("C1>|<!here");
+        assert_eq!(reply_title(&odd), "Reply drafted for a Slack channel");
+        assert_eq!(thread_link("C1", "../x"), None);
+
+        // Refusals.
+        let (_, blocked) = reply_blocked(&item, Some(3));
+        let s = blocked.to_string();
+        assert!(s.contains(
+            "This draft was built from restricted sources and 3 people in <#C0LAUNCH> aren't on the product team"
+        ));
+        assert!(s.contains(action::REJECT));
+        assert!(!s.contains(action::EDIT), "an edit can't unblock it");
+        assert!(!s.contains(action::APPROVE) && !s.contains(action::SNOOZE));
+        let (_, shared) = reply_blocked(&item, None);
+        assert!(shared
+            .to_string()
+            .contains("<#C0LAUNCH> is shared outside the company"));
+        let (_, confirm) = reply_confirm_external(&item, false);
+        assert!(confirm.to_string().contains("Post to external channel"));
+        let (_, confirm_edit) = reply_confirm_external(&item, true);
+        assert!(confirm_edit
+            .to_string()
+            .contains("\"value\":\"apr_r1:edit\""));
+
+        // Decided and expired.
+        let mut done = item.clone();
+        done["status"] = json!("approved");
+        done["decided_by"] = json!("ana");
+        done["result"] = json!({"url": "https://slack.com/archives/C0LAUNCH/p1731500000000200"});
+        assert_eq!(
+            decision_line(&done, "ana", true),
+            ":white_check_mark: Edited and posted by Ana — <https://slack.com/archives/C0LAUNCH/p1731500000000200|see the reply>"
+        );
+        let mut expired = item.clone();
+        expired["status"] = json!("expired");
+        expired["args"]["text"] = json!("[expired]");
+        assert_eq!(decision_line(&expired, "ana", false), EXPIRED_LINE);
+        let (_, closed) = approval_closed(&expired, EXPIRED_LINE);
+        assert!(
+            !closed.to_string().contains("[expired]"),
+            "no draft once expired"
+        );
+
+        // The editor posts.
+        let modal = edit_modal(&item, "D0ANA", "1.0").unwrap();
+        assert_eq!(modal["submit"]["text"], "Post as you");
+    }
+
+    #[test]
+    fn reply_text_keeps_only_safe_markup() {
+        assert_eq!(reply_text("a < b"), "a &lt; b");
+        assert_eq!(
+            reply_text("<javascript:x|y> <#C1> <#c1>"),
+            "&lt;javascript:x|y&gt; <#C1> &lt;#c1&gt;"
+        );
+        assert_eq!(
+            reply_text("<https://x.com/a>"),
+            "<https://x.com/a|https://x.com/a>"
+        );
+        assert_eq!(reply_text("<!channel>"), "&lt;!channel&gt;");
+    }
+
+    #[test]
+    fn reject_reasons() {
+        let item = json!({
+            "id": "apr_1", "user": "ana", "tool": "jira.create_issue",
+            "args": {"summary": "Fix <login>"}, "status": "pending",
+        });
+        let (_, blocks) = approval_reasons(&item);
+        let actions = blocks.as_array().unwrap().last().unwrap();
+        let ids: Vec<&str> = actions["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["action_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "apr_reason_wrong_facts",
+                "apr_reason_wrong_target",
+                "apr_reason_tone",
+                "apr_reason_incomplete",
+                "apr_reason_should_not_draft",
+                "apr_reason_other",
+                action::BACK,
+            ]
+        );
+        assert!(actions["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["value"] == "apr_1"));
+        assert!(blocks.to_string().contains("*Summary:* Fix &lt;login&gt;"));
+        assert_eq!(reason_of_action("apr_reason_tone"), Some("tone"));
+        assert_eq!(reason_of_action("apr_reason_bogus"), None);
+        assert_eq!(reason_of_action("apr_reject"), None);
     }
 
     #[test]

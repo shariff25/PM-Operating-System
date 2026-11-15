@@ -190,20 +190,20 @@ mod tests {
     #[test]
     fn adf_from_markdown() {
         let doc = markdown_to_adf(
-            "# Goal\n\nShip SSO\nfor DSM.\n\n- SAML\n- OIDC\n\n1. Design\n2. Build",
+            "# Goal\n\nShip SSO\nfor Acme Vault.\n\n- SAML\n- OIDC\n\n1. Design\n2. Build",
         );
         assert_eq!(doc["type"], "doc");
         assert_eq!(doc["version"], 1);
         let c = doc["content"].as_array().unwrap();
         assert_eq!(c[0]["type"], "heading");
         assert_eq!(c[0]["attrs"]["level"], 1);
-        assert_eq!(c[1]["content"][0]["text"], "Ship SSO for DSM.");
+        assert_eq!(c[1]["content"][0]["text"], "Ship SSO for Acme Vault.");
         assert_eq!(c[2]["type"], "bulletList");
         assert_eq!(c[2]["content"].as_array().unwrap().len(), 2);
         assert_eq!(c[3]["type"], "orderedList");
         assert_eq!(
             adf_to_text(&doc),
-            "Goal\nShip SSO for DSM.\nSAML\nOIDC\nDesign\nBuild"
+            "Goal\nShip SSO for Acme Vault.\nSAML\nOIDC\nDesign\nBuild"
         );
     }
 

@@ -1,10 +1,10 @@
-//! The support portal's formats.
+//! The docs site's formats, and which of its pages are indexed.
 //!
-//! support.fortanix.com publishes a documentation index at `/llms.txt`:
-//! `## v1` (docs) and `## v1-api (API Reference)` sections of `- [Title](url.md)` lines,
-//! sometimes followed by `: description`. Each page has a markdown version at that URL:
-//! YAML front matter (`title`, `slug`, `updated`, `published`, `canonical`), a short
-//! "Documentation Index" note, then the page body.
+//! The site publishes a documentation index at `/llms.txt` (the llms.txt convention):
+//! `## ...` sections of `- [Title](url.md)` lines, sometimes followed by `: description`; a
+//! section whose heading mentions "API" is the API reference. Each page has a markdown
+//! version at that URL, optionally with YAML front matter (`title`, `slug`, `updated`) and a
+//! leading "Documentation Index" note, then the page body.
 
 use chrono::{DateTime, Utc};
 use pmos_contract::frontmatter;
@@ -19,7 +19,7 @@ pub struct DocPage {
     pub title: String,
     /// `docs` or `api`.
     pub section: String,
-    /// Product label for filtering, such as `dsm`; see [`product_of`].
+    /// Product id for filtering, such as `vault`; see [`Products::product_of`].
     pub product: String,
     pub description: Option<String>,
     /// The page's `##`–`####` headings, one per line.
@@ -52,22 +52,105 @@ pub struct IndexEntry {
     pub description: Option<String>,
 }
 
-/// The URL paths pages live under: guides and knowledge base, and the API reference.
-pub const PAGE_PREFIXES: [&str; 2] = ["/docs/", "/apidocs/"];
-
-/// The flat page path under one of [`PAGE_PREFIXES`], if `url` is one: `{base}{prefix}{slug}`
-/// with a plain slug (no `/`, `?`, `#` or `..`).
-pub fn page_path<'a>(url: &'a str, base: &str) -> Option<(&'static str, &'a str)> {
-    let rest = url.strip_prefix(base.trim_end_matches('/'))?;
-    PAGE_PREFIXES.iter().find_map(|prefix| {
-        let slug = rest.strip_prefix(prefix)?;
-        let ok = !slug.is_empty() && !slug.contains(['/', '?', '#']) && !slug.contains("..");
-        ok.then_some((*prefix, slug))
-    })
+/// The docs site being indexed: where it is and which of its pages count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Site {
+    /// `https://docs.example.com`, without a trailing slash.
+    pub base: String,
+    /// URL path prefixes whose pages are indexed, each starting and ending with `/`. `/`
+    /// takes every page on the site.
+    pub prefixes: Vec<String>,
+    /// Pages under this prefix are the API reference (section `api`).
+    pub api_prefix: Option<String>,
 }
 
-/// Parse `llms.txt`. Keeps only `.md` pages under [`PAGE_PREFIXES`], deduplicated, in order.
-pub fn parse_index(text: &str, base: &str) -> Vec<IndexEntry> {
+/// A path prefix as `/path/`: a leading and a trailing slash.
+pub fn normalize_prefix(prefix: &str) -> Option<String> {
+    let trimmed = prefix.trim().trim_matches('/');
+    if prefix.trim().is_empty() {
+        return None;
+    }
+    if trimmed.is_empty() {
+        return Some("/".into());
+    }
+    let ok = !trimmed.contains(['?', '#', ' '])
+        && !trimmed
+            .split('/')
+            .any(|s| s.is_empty() || s == "." || s == "..");
+    ok.then(|| format!("/{trimmed}/"))
+}
+
+impl Site {
+    /// Every page on `base`, no API section.
+    pub fn new(base: impl Into<String>) -> Self {
+        Self {
+            base: base.into().trim_end_matches('/').to_string(),
+            prefixes: vec!["/".into()],
+            api_prefix: None,
+        }
+    }
+
+    pub fn with_prefixes(mut self, prefixes: &[&str]) -> Self {
+        self.prefixes = prefixes
+            .iter()
+            .filter_map(|p| normalize_prefix(p))
+            .collect();
+        self
+    }
+
+    pub fn with_api_prefix(mut self, prefix: &str) -> Self {
+        self.api_prefix = normalize_prefix(prefix);
+        self
+    }
+
+    /// The page path under one of the prefixes, if `url` is a page of this site:
+    /// `{base}{prefix}{rest}`, where `rest` is one or more non-empty path segments with no
+    /// `?`, `#` or `..`. Returns the prefix and `rest`.
+    pub fn page_path<'a>(&'a self, url: &'a str) -> Option<(&'a str, &'a str)> {
+        let rest = url.strip_prefix(self.base.as_str())?;
+        // The longest prefix wins, so `/docs/api/` can sit inside `/docs/`.
+        let mut prefixes: Vec<&String> = self.prefixes.iter().collect();
+        prefixes.sort_by_key(|p| std::cmp::Reverse(p.len()));
+        prefixes.into_iter().find_map(|prefix| {
+            let slug = rest.strip_prefix(prefix.as_str())?;
+            let ok = !slug.is_empty()
+                && !slug.contains(['?', '#', '\\'])
+                && !slug.contains("..")
+                && !slug.split('/').any(str::is_empty);
+            ok.then_some((prefix.as_str(), slug))
+        })
+    }
+
+    /// Whether `url` is an API reference page: under [`Site::api_prefix`].
+    pub fn is_api(&self, url: &str) -> bool {
+        let Some(api) = &self.api_prefix else {
+            return false;
+        };
+        url.strip_prefix(self.base.as_str())
+            .is_some_and(|rest| rest.starts_with(api.as_str()))
+    }
+
+    /// `url`'s path on the site, such as `/docs/vault-key-rotation.md`.
+    pub fn path_of<'a>(&self, url: &'a str) -> &'a str {
+        url.strip_prefix(self.base.as_str()).unwrap_or(url)
+    }
+
+    /// The prefixes for a person: "https://docs.example.com/docs/ and /apidocs/", or the
+    /// site alone for `/`.
+    pub fn describe(&self) -> String {
+        if self.prefixes.iter().all(|p| p == "/") {
+            return self.base.clone();
+        }
+        let mut parts = self.prefixes.clone();
+        if let Some(first) = parts.first_mut() {
+            *first = format!("{}{first}", self.base);
+        }
+        parts.join(" and ")
+    }
+}
+
+/// Parse `llms.txt`. Keeps only `.md` pages of `site`, deduplicated, in order.
+pub fn parse_index(text: &str, site: &Site) -> Vec<IndexEntry> {
     let mut section = "docs".to_string();
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -91,12 +174,12 @@ pub fn parse_index(text: &str, base: &str) -> Vec<IndexEntry> {
             continue;
         };
         let url = url.trim();
-        let valid = url.ends_with(".md") && page_path(url, base).is_some();
+        let valid = url.ends_with(".md") && site.page_path(url).is_some();
         if !valid || !seen.insert(url.to_string()) {
             continue;
         }
-        // API reference pages are the API section wherever the index lists them.
-        let section = if url.contains("/apidocs/") {
+        // Pages under the API prefix are the API section wherever the index lists them.
+        let section = if site.is_api(url) {
             "api".to_string()
         } else {
             section.clone()
@@ -133,7 +216,7 @@ pub struct ParsedPage {
     pub headings: String,
     pub body: String,
     /// For API reference pages: the OpenAPI document's `info.title`, such as
-    /// "Fortanix DSM REST API".
+    /// "Acme Vault REST API".
     pub api_title: Option<String>,
 }
 
@@ -234,15 +317,125 @@ fn strip_openapi(body: &str) -> (String, Option<String>) {
     (out.join("\n"), title)
 }
 
-/// Product labels people filter by, matched against the title and URL. The first rule that
-/// matches wins, so more specific names come before shorter ones.
-pub const PRODUCTS: [(&str, &[&str]); 5] = [
-    ("confidential-ai", &["confidential ai", "confidential-ai"]),
-    ("ccm", &["confidential computing manager", "ccm"]),
-    ("key-insight", &["key insight", "key-insight"]),
-    ("armor", &["armor"]),
-    ("dsm", &["data security manager", "dsm", "sdkms"]),
-];
+/// The product every page belongs to when no configured product matches.
+pub const GENERAL: &str = "general";
+
+/// One product people can filter by.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Product {
+    /// Lowercase letters, digits and `-`, such as `vault`.
+    pub id: String,
+    /// For people, such as "Acme Vault". Defaults to the id.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Words (or phrases) that mark a page as this product's, matched as whole words in the
+    /// page's title or URL path, ignoring case.
+    pub keywords: Vec<String>,
+}
+
+/// The configured products (`PMOS_DOCS_PRODUCTS`), in match order. Empty: every page is
+/// [`GENERAL`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Products(Vec<Product>);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProductsFile {
+    #[serde(default)]
+    products: Vec<Product>,
+}
+
+/// The longest product id: the tool server caps `product` at 64 characters.
+pub const MAX_PRODUCT_ID: usize = 64;
+
+impl Products {
+    /// Check and keep `products`: ids are lowercase `[a-z0-9-]`, unique and not
+    /// `general`, and each product has at least one non-empty keyword.
+    pub fn new(products: Vec<Product>) -> Result<Self, String> {
+        let mut seen = std::collections::HashSet::new();
+        for p in &products {
+            let valid_id = !p.id.is_empty()
+                && p.id.len() <= MAX_PRODUCT_ID
+                && p.id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !valid_id {
+                return Err(format!(
+                    "product id `{}` must be 1–{MAX_PRODUCT_ID} lowercase letters, digits or `-`",
+                    p.id
+                ));
+            }
+            if p.id == GENERAL {
+                return Err("`general` is reserved for pages no product matches".into());
+            }
+            if !seen.insert(p.id.as_str()) {
+                return Err(format!("product id `{}` appears twice", p.id));
+            }
+            if p.keywords.is_empty() || p.keywords.iter().any(|k| words(k).trim().is_empty()) {
+                return Err(format!(
+                    "product `{}` needs at least one keyword, and no empty ones",
+                    p.id
+                ));
+            }
+        }
+        Ok(Self(products))
+    }
+
+    /// Parse a products file: `products:` with `id`, `name` and `keywords` for each.
+    pub fn parse(yaml: &str) -> Result<Self, String> {
+        let file: ProductsFile = serde_norway::from_str(yaml).map_err(|e| e.to_string())?;
+        Self::new(file.products)
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Product> {
+        self.0.iter()
+    }
+
+    /// Every id a search can filter by: the configured ones, then `general`.
+    pub fn ids(&self) -> Vec<&str> {
+        self.0
+            .iter()
+            .map(|p| p.id.as_str())
+            .chain([GENERAL])
+            .collect()
+    }
+
+    /// The display name for `id`: the configured name, else the id.
+    pub fn name_of<'a>(&'a self, id: &'a str) -> &'a str {
+        self.0
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| p.name.as_deref())
+            .unwrap_or(id)
+    }
+
+    /// The product a page belongs to, or [`GENERAL`]: the first product with a keyword
+    /// among the whole words of the title, the URL path or (for API pages) the OpenAPI
+    /// title, so "Vaulted" is not "Vault". `path` is the URL's path on the site.
+    pub fn product_of(&self, title: &str, path: &str, api_title: Option<&str>) -> &str {
+        let path = path.trim_end_matches(".md");
+        let haystacks = [
+            words(title),
+            words(path),
+            words(api_title.unwrap_or_default()),
+        ];
+        self.0
+            .iter()
+            .find(|p| {
+                p.keywords.iter().any(|k| {
+                    let needle = words(k);
+                    haystacks.iter().any(|h| h.contains(&needle))
+                })
+            })
+            .map_or(GENERAL, |p| p.id.as_str())
+    }
+}
 
 /// Lowercase words separated by single spaces, padded with a space at each end, so a
 /// whole-word match is a plain `contains(" word ")`.
@@ -256,80 +449,125 @@ fn words(text: &str) -> String {
     format!(" {joined} ")
 }
 
-/// The product a page belongs to, or `general`. Matches whole words in the title or the URL
-/// slug, so "Armored" is not "Armor". `api_title` is an API page's OpenAPI title, which
-/// names the product for pages whose own title doesn't.
-pub fn product_of(title: &str, url: &str, api_title: Option<&str>) -> &'static str {
-    let slug = url
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches(".md");
-    let haystacks = [
-        words(title),
-        words(slug),
-        words(api_title.unwrap_or_default()),
-    ];
-    for (product, needles) in PRODUCTS {
-        for needle in needles {
-            let needle = words(needle);
-            if haystacks.iter().any(|h| h.contains(&needle)) {
-                return product;
-            }
-        }
-    }
-    "general"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const BASE: &str = "https://support.fortanix.com";
+    const BASE: &str = "https://docs.example.com";
+
+    fn site() -> Site {
+        Site::new(BASE)
+            .with_prefixes(&["/docs/", "/apidocs/"])
+            .with_api_prefix("/apidocs/")
+    }
+
+    fn products() -> Products {
+        Products::parse(
+            "products:\n  - id: vault\n    name: Acme Vault\n    keywords: [vault, key vault]\n  - id: cloud\n    keywords: [cloud]\n",
+        )
+        .unwrap()
+    }
 
     #[test]
     fn index_sections_descriptions_and_filtering() {
-        let text = "# Fortanix\n\n> Knowledge base.\n\n## v1\n\n\
-            - [Getting Started](https://support.fortanix.com/docs/getting-started.md)\n\
-            - [Oracle TDE](https://support.fortanix.com/docs/oracle-tde.md): Fortanix DSM with Oracle TDE\n\
-            - [Dup](https://support.fortanix.com/docs/getting-started.md)\n\
+        let text = "# Acme\n\n> Knowledge base.\n\n## v1\n\n\
+            - [Getting Started](https://docs.example.com/docs/getting-started.md)\n\
+            - [Oracle TDE](https://docs.example.com/docs/oracle-tde.md): Acme Vault with Oracle TDE\n\
+            - [Dup](https://docs.example.com/docs/getting-started.md)\n\
             - [Elsewhere](https://docs.aws.amazon.com/x.md)\n\
-            - [Html](https://support.fortanix.com/docs/page)\n\
-            - [Nested](https://support.fortanix.com/docs/a/b.md)\n\
+            - [Html](https://docs.example.com/docs/page)\n\
+            - [Other path](https://docs.example.com/blog/post.md)\n\
+            - [Lookalike](https://docs.example.com.evil.test/docs/x.md)\n\
+            - [Climb](https://docs.example.com/docs/../admin.md)\n\
+            - [Nested](https://docs.example.com/docs/a/b.md)\n\
             ## v1-api (API Reference)\n\
-            - [Create key](https://support.fortanix.com/docs/create-key.md)\n";
-        let entries = parse_index(text, BASE);
+            - [Create key](https://docs.example.com/docs/create-key.md)\n";
+        let entries = parse_index(text, &site());
         let urls: Vec<_> = entries
             .iter()
-            .map(|e| e.url.rsplit('/').next().unwrap())
+            .map(|e| site().path_of(&e.url).to_string())
             .collect();
         assert_eq!(
             urls,
-            vec!["getting-started.md", "oracle-tde.md", "create-key.md"]
+            vec![
+                "/docs/getting-started.md",
+                "/docs/oracle-tde.md",
+                "/docs/a/b.md",
+                "/docs/create-key.md"
+            ]
         );
         assert_eq!(
             entries[1].description.as_deref(),
-            Some("Fortanix DSM with Oracle TDE")
+            Some("Acme Vault with Oracle TDE")
         );
         assert_eq!(entries[0].section, "docs");
-        assert_eq!(entries[2].section, "api");
+        assert_eq!(entries[3].section, "api", "the index's API heading");
+    }
+
+    #[test]
+    fn the_default_prefix_takes_every_page_nested_or_not() {
+        let all = Site::new(format!("{BASE}/"));
+        assert_eq!(all.base, BASE, "no trailing slash");
+        assert_eq!(all.prefixes, vec!["/"]);
+        for (url, ok) in [
+            ("https://docs.example.com/intro.md", true),
+            ("https://docs.example.com/guides/vault/sso.md", true),
+            ("https://docs.example.com/", false),
+            ("https://docs.example.com/a//b.md", false),
+            ("https://docs.example.com/a/../b.md", false),
+            ("https://docs.example.com/a.md?x=1", false),
+            ("https://docs.example.com/a.md#top", false),
+            ("https://docs.example.com.evil.test/a.md", false),
+            ("https://other.example.com/a.md", false),
+        ] {
+            assert_eq!(all.page_path(url).is_some(), ok, "{url}");
+        }
+        let text = "## Docs\n- [Intro](https://docs.example.com/intro.md)\n- [SSO](https://docs.example.com/guides/vault/sso.md)\n";
+        assert_eq!(parse_index(text, &all).len(), 2);
+        assert_eq!(all.describe(), BASE);
+        assert_eq!(
+            site().describe(),
+            "https://docs.example.com/docs/ and /apidocs/"
+        );
+    }
+
+    #[test]
+    fn prefixes_are_normalized() {
+        assert_eq!(normalize_prefix("docs").as_deref(), Some("/docs/"));
+        assert_eq!(
+            normalize_prefix("/help/center").as_deref(),
+            Some("/help/center/")
+        );
+        assert_eq!(normalize_prefix("/").as_deref(), Some("/"));
+        assert_eq!(normalize_prefix(""), None);
+        assert_eq!(normalize_prefix("/a/../b"), None);
+        assert_eq!(normalize_prefix("/a?b"), None);
+        // The longest prefix wins.
+        let s = Site::new(BASE).with_prefixes(&["/docs/", "/docs/api/"]);
+        assert_eq!(
+            s.page_path("https://docs.example.com/docs/api/x.md"),
+            Some(("/docs/api/", "x.md"))
+        );
     }
 
     #[test]
     fn api_reference_pages_are_indexed_without_their_openapi_documents() {
-        let text = "## v1-api (API Reference)\n- [Create account](https://support.fortanix.com/apidocs/create-a-new-account.md)\n";
-        let e = parse_index(text, BASE);
-        assert_eq!(e[0].section, "api");
-        let md = "> ## Documentation Index\n> Fetch it.\n\n# Create a new account\n\nCreates an account.\n\n## OpenAPI\n\n````json POST /sys/v1/accounts\n{\n  \"openapi\": \"3.0.0\",\n  \"info\": {\n    \"title\": \"Fortanix DSM REST API\",\n    \"description\": \"long\"\n  }\n}\n````\n\nAfter.";
+        let text = "## Guides\n- [Create account](https://docs.example.com/apidocs/create-a-new-account.md)\n";
+        let e = parse_index(text, &site());
+        assert_eq!(e[0].section, "api", "under the API prefix");
+        let md = "> ## Documentation Index\n> Fetch it.\n\n# Create a new account\n\nCreates an account.\n\n## OpenAPI\n\n````json POST /sys/v1/accounts\n{\n  \"openapi\": \"3.0.0\",\n  \"info\": {\n    \"title\": \"Acme Vault REST API\",\n    \"description\": \"long\"\n  }\n}\n````\n\nAfter.";
         let p = parse_page(md);
         assert!(p.body.contains("`POST /sys/v1/accounts`"));
         assert!(!p.body.contains("openapi"));
         assert!(p.body.ends_with("After."));
-        assert_eq!(p.api_title.as_deref(), Some("Fortanix DSM REST API"));
-        let url = format!("{BASE}/apidocs/create-a-new-account.md");
+        assert_eq!(p.api_title.as_deref(), Some("Acme Vault REST API"));
         assert_eq!(
-            product_of("Create a new account", &url, p.api_title.as_deref()),
-            "dsm"
+            products().product_of(
+                "Create a new account",
+                "/apidocs/create-a-new-account.md",
+                p.api_title.as_deref()
+            ),
+            "vault"
         );
         // Ordinary code blocks stay.
         let code = parse_page("# T\n\n```bash\ncurl x\n```\n");
@@ -338,16 +576,16 @@ mod tests {
 
     #[test]
     fn page_front_matter_and_index_note() {
-        let md = "---\ntitle: \"Fortanix Support\"\nslug: \"fortanix-support\"\nupdated: 2026-08-01T05:56:18Z\n---\n\n\
-            > ## Documentation Index\n> Fetch the complete documentation index at: https://support.fortanix.com/llms.txt\n> Use this file.\n\n\
-            # Fortanix Support\n\n### Fortanix 24/7 Support\n\nText.\n\n#### **Support program**\n\n- item\n";
+        let md = "---\ntitle: \"Acme Support\"\nslug: \"acme-support\"\nupdated: 2026-08-01T05:56:18Z\n---\n\n\
+            > ## Documentation Index\n> Fetch the complete documentation index at: https://docs.example.com/llms.txt\n> Use this file.\n\n\
+            # Acme Support\n\n### Acme 24/7 Support\n\nText.\n\n#### **Support program**\n\n- item\n";
         let p = parse_page(md);
-        assert_eq!(p.title.as_deref(), Some("Fortanix Support"));
-        assert_eq!(p.slug.as_deref(), Some("fortanix-support"));
+        assert_eq!(p.title.as_deref(), Some("Acme Support"));
+        assert_eq!(p.slug.as_deref(), Some("acme-support"));
         assert_eq!(p.updated.unwrap().to_rfc3339(), "2026-08-01T05:56:18+00:00");
-        assert!(p.body.starts_with("# Fortanix Support"));
+        assert!(p.body.starts_with("# Acme Support"));
         assert!(!p.body.contains("Documentation Index"));
-        assert_eq!(p.headings, "Fortanix 24/7 Support\nSupport program");
+        assert_eq!(p.headings, "Acme 24/7 Support\nSupport program");
 
         let plain = parse_page("# Just a body\n\ntext");
         assert!(plain.title.is_none());
@@ -355,41 +593,90 @@ mod tests {
     }
 
     #[test]
-    fn products() {
-        let u = |s: &str| format!("{BASE}/docs/{s}.md");
+    fn products_match_whole_words_in_order() {
+        let p = products();
         assert_eq!(
-            product_of("Fortanix DSM with Oracle TDE", &u("oracle-tde"), None),
-            "dsm"
+            p.product_of("Acme Vault with Oracle TDE", "/docs/oracle-tde.md", None),
+            "vault"
         );
         assert_eq!(
-            product_of(
+            p.product_of(
                 "Backup and Restore",
-                &u("fortanix-dsm-backup-and-restore"),
+                "/docs/acme-vault-backup-and-restore.md",
                 None
             ),
-            "dsm"
+            "vault"
         );
         assert_eq!(
-            product_of("Confidential AI Overview", &u("x"), None),
-            "confidential-ai"
+            p.product_of("Acme Cloud Overview", "/docs/x.md", None),
+            "cloud"
         );
         assert_eq!(
-            product_of("Fortanix Confidential Computing Manager", &u("x"), None),
-            "ccm"
+            p.product_of("Overview", "/cloud/setup/x.md", None),
+            "cloud",
+            "any path segment"
         );
         assert_eq!(
-            product_of("Key Insight Scans", &u("key-insight-scans"), None),
-            "key-insight"
+            p.product_of("A Key Vault primer", "/docs/x.md", None),
+            "vault"
         );
         assert_eq!(
-            product_of("Getting Started", &u("getting-started"), None),
-            "general"
+            p.product_of("Getting Started", "/docs/getting-started.md", None),
+            GENERAL
         );
-        // A word that merely contains a product name doesn't count.
+        // A word that merely contains a keyword doesn't count.
         assert_eq!(
-            product_of("Armored transport", &u("armored-transport"), None),
-            "general"
+            p.product_of("Vaulted ceilings", "/docs/vaulted.md", None),
+            GENERAL
         );
+        // The first product wins when several match.
+        assert_eq!(
+            p.product_of("Vault in the Cloud", "/docs/x.md", None),
+            "vault"
+        );
+        assert_eq!(p.ids(), vec!["vault", "cloud", "general"]);
+        assert_eq!(p.name_of("vault"), "Acme Vault");
+        assert_eq!(p.name_of("cloud"), "cloud");
+        // No products: everything is general.
+        assert_eq!(
+            Products::default().product_of("Acme Vault", "/vault.md", None),
+            GENERAL
+        );
+        assert_eq!(Products::default().ids(), vec!["general"]);
+    }
+
+    #[test]
+    fn a_products_file_is_checked() {
+        let bad = |yaml: &str| Products::parse(yaml).unwrap_err();
+        assert!(bad("products:\n  - id: Vault\n    keywords: [v]\n").contains("lowercase"));
+        assert!(bad("products:\n  - id: a b\n    keywords: [v]\n").contains("lowercase"));
+        assert!(bad("products:\n  - id: general\n    keywords: [v]\n").contains("reserved"));
+        assert!(
+            bad("products:\n  - id: v\n    keywords: [v]\n  - id: v\n    keywords: [w]\n")
+                .contains("twice")
+        );
+        assert!(bad("products:\n  - id: v\n    keywords: []\n").contains("keyword"));
+        assert!(bad("products:\n  - id: v\n    keywords: [\"--\"]\n").contains("keyword"));
+        assert!(bad("products:\n  - id: v\n").contains("keywords"));
+        assert!(
+            bad("products:\n  - id: v\n    keywords: [v]\n    colour: red\n").contains("colour")
+        );
+        assert!(bad(&format!(
+            "products:\n  - id: {}\n    keywords: [v]\n",
+            "a".repeat(65)
+        ))
+        .contains("lowercase"));
+        assert_eq!(
+            Products::parse("products: []\n").unwrap(),
+            Products::default()
+        );
+        // The example file that ships with the repository is valid.
+        let example = Products::load(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/docs-products.example.yaml"
+        )))
+        .unwrap();
+        assert_eq!(example.ids(), vec!["vault", "cloud", "general"]);
     }
 
     #[test]

@@ -148,6 +148,31 @@ async fn two_workers_never_claim_the_same_task(store: Arc<dyn BotsStore>) {
     }
 }
 
+/// A refused change must not hold the task's lock afterwards: a claim right after it has to
+/// find the task. (A Postgres transaction that is dropped rather than ended keeps its row lock
+/// until its connection is next used, and claims skip locked rows.)
+async fn a_refused_change_leaves_the_task_claimable(store: Arc<dyn BotsStore>) {
+    let now = at(2026, 11, 14, 10, 0);
+    let working = Transition::from(&[TaskStatus::Working]);
+    for round in 0..30 {
+        let t = task("docs", "ana", Source::Slack, round % 60);
+        store.create_task(&t, "queued").await.unwrap();
+        assert_eq!(
+            store.transition(&t.id, &working, now).await.unwrap(),
+            Err(Refused::Status(TaskStatus::Queued))
+        );
+        let claimed = store
+            .claim(None, "w1", now + Duration::seconds(120), now)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.map(|c| c.id),
+            Some(t.id.clone()),
+            "round {round}: the task is claimable straight after a refused change"
+        );
+    }
+}
+
 async fn transitions_check_their_guards(store: Arc<dyn BotsStore>) {
     let t = task("docs", "ana", Source::Slack, 1);
     store.create_task(&t, "queued").await.unwrap();
@@ -595,6 +620,7 @@ both_stores!(
     claims_go_interactive_first_then_oldest,
     two_workers_never_claim_the_same_task,
     transitions_check_their_guards,
+    a_refused_change_leaves_the_task_claimable,
     expired_leases_are_found,
     notifications_are_ordered_and_paged,
     concurrent_notifications_have_distinct_numbers,

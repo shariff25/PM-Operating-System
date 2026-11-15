@@ -1,0 +1,15 @@
+# Example task on the fake docs fixtures. Checked against the fixture page
+# https://docs.example.com/docs/vault-key-rotation: "Key rotation creates a new key version."
+id: vault-key-rotation
+ask: "What happens to a key when you rotate it in Acme Vault?"
+expect:
+  must_cite:
+    - https://docs.example.com/docs/vault-key-rotation
+  must_include:
+    - "new key version"
+  # Reasoning must not leak into the answer, even with the gateway's strip-think
+  # workaround off (D11).
+  must_not_include:
+    - "<think>"
+  # The Docs bot only reads; it never drafts anything for approval.
+  approvals: 0

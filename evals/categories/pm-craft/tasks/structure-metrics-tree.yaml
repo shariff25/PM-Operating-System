@@ -1,0 +1,21 @@
+# seed: replace with case cards
+# Fixture: epic PM-101. The metrics-tree skill titles its draft `Metrics: …` and follows content/templates/metrics-tree.md: North star, Input
+# metrics, Guardrail metrics, How each is measured, What we won't optimise.
+id: structure-metrics-tree
+ask: "Draft anyway, no questions: a metrics tree in the PM space for SAML SSO in the Acme Vault console (Jira epic PM-101)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Metrics:", "North star", "Input metrics", "Guardrail metrics", "How each is measured"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: metrics-tree
+tags:
+  - model/draft-content
+  - model/unmeasurable-outcome

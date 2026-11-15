@@ -1,0 +1,12 @@
+# seed: replace with case cards
+# Only the FYI (C0PMTEAM 1731600600.000400) and the bot reminder (…900.000500) are in scope here:
+# neither needs a reply, so there are no drafts.
+id: triage-skips-fyi-and-bots
+ask: "In #pm-team, cy posted an FYI about the Acme Cloud call notes and a bot reminded me about the status report. Draft replies to anything there that needs one from me."
+expect:
+  must_not_include:
+    - "<think>"
+  approvals: 0
+  drafts:
+    - tool: slack.post_reply
+      count: 0

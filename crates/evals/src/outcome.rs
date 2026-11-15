@@ -1,6 +1,6 @@
 //! What happened to one eval task: everything grading and tagging look at.
 
-use crate::client::{Event, TraceEntry};
+use crate::client::{Draft, Event, TraceEntry};
 
 #[derive(Debug, Clone, Default)]
 pub struct Outcome {
@@ -19,6 +19,11 @@ pub struct Outcome {
     pub events: Vec<Event>,
     /// `None` when the trace couldn't be read (see [`crate::client::Runtime::trace`]).
     pub trace: Option<Vec<TraceEntry>>,
+    /// The task's drafts. Empty when it ended with no approval items; read only for tasks
+    /// with `drafts` checks.
+    pub drafts: Vec<Draft>,
+    /// Why the drafts couldn't be read, when they couldn't.
+    pub drafts_error: Option<String>,
     /// From creation until a worker picked the task up, in seconds.
     pub queue_secs: Option<f64>,
     /// From creation until the task settled, in seconds.

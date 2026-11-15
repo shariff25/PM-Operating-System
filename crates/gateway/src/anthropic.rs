@@ -345,7 +345,7 @@ mod tests {
             "temperature": 0,
             "messages": [
                 {"role": "system", "content": "You are the Docs bot."},
-                {"role": "user", "content": "What ports does DSM need?"},
+                {"role": "user", "content": "What ports does Acme Vault need?"},
                 {"role": "assistant", "content": "", "tool_calls": [
                     {"id": "c1", "type": "function", "function": {"name": "docs_search", "arguments": "{\"query\":\"ports\"}"}},
                     {"id": "c2", "type": "function", "function": {"name": "docs_read", "arguments": "not json"}}

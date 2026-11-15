@@ -10,6 +10,11 @@ roles:
     upstream: qwen
     model: qwen3.6-35b-a3b
     workarounds: [strip-think]
+  # The PM assistant's drafting and critique. Point it at a larger model if the bake-off picks one.
+  reasoning:
+    upstream: qwen
+    model: qwen3.6-35b-a3b
+    workarounds: [strip-think]
   extraction:
     upstream: nemotron
     model: nemotron-3-nano-30b-a3b

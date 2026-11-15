@@ -2,15 +2,20 @@
 //! with a tap, and routines are set up and changed in plain language.
 //!
 //! **Which bot a DM goes to:**
-//! 1. a `<bot>:` prefix (`docs: what ports does DSM need?`);
+//! 1. a `<bot>:` prefix (`docs: what ports does Acme Vault need?`);
 //! 2. else the bot already working in that thread;
 //! 3. else the PM's personal bot `pm-<handle>`, if it exists;
 //! 4. else `docs`.
 //!
 //! **Commands first:** typed alone in a DM, `setup` (or `status`, `onboarding`), and for
 //! platform owners `requests` and `remove <handle>`, are handled before any of that
-//! (onboarding, in `members.rs`). `docs: setup` still goes to the `docs` bot. Someone not in
+//! (onboarding, in `members.rs`), and so are `reply assistant on`, `off` and status (the reply
+//! assistant, in `reply.rs`). `docs: setup` still goes to the `docs` bot. Someone not in
 //! `team.yaml` gets a note with **Request access**.
+//!
+//! A `slack.post_reply` draft gets the reply card (`docs/slack-reply-spec.md` §5): **Post as
+//! you**, **Edit**, **Snooze** and **Reject**, and the audience check's refusals each in
+//! their own words.
 //!
 //! Every envelope is acknowledged before any of this runs (Slack wants the ack within
 //! 3 seconds); the work happens in follow-ups. The one exception is the memory-repo modal,
@@ -35,9 +40,10 @@ use crate::cards::{self, action};
 use crate::commands::{load_team, FollowUp, NOT_A_MEMBER};
 use crate::member_cards::{self, action as member_action};
 use crate::members::{self, DmCommand, Onboarding};
+use crate::reply::{self, SnoozeStore};
 use crate::runtime::{display_name, BotInfo, Runtime, RuntimeError};
 use crate::slackapi::{Posted, SlackApi};
-use crate::toolserver::{CallError, ToolServer};
+use crate::toolserver::{ApiError, ToolServer};
 
 /// The bot a DM goes to when nothing else picks one.
 pub const DEFAULT_BOT: &str = "docs";
@@ -60,6 +66,8 @@ pub struct BotsConfig {
     /// Where an interaction's `response_url` may point. Slack's is always
     /// `https://hooks.slack.com/`; tests set a local mock.
     pub response_url_prefix: String,
+    /// `PMOS_SLACK_STATE_DIR`: the reply cards' snoozes are kept here (`snoozes.json`).
+    pub state_dir: PathBuf,
 }
 
 /// An acknowledgement that has to wait for an answer, and the work after it. It resolves
@@ -94,6 +102,11 @@ struct Inner {
     drafts: Mutex<Bounded<String, Draft>>,
     roster: Mutex<Option<(Instant, Vec<BotInfo>)>>,
     onboarding: Onboarding,
+    /// Snoozed reply cards, kept in the state directory.
+    snoozes: SnoozeStore,
+    /// Edited arguments a `needs_external_confirm` answer held back, by approval id, for
+    /// **Post to external channel**.
+    held_edits: Mutex<Bounded<String, Value>>,
 }
 
 #[derive(Clone)]
@@ -141,6 +154,15 @@ impl Click {
     }
 }
 
+/// Which way an approval card turns without deciding anything.
+#[derive(Clone, Copy)]
+enum Flip {
+    /// **Reject**: the six reasons and **Back**.
+    Reasons,
+    /// **Back**: the card's own buttons again.
+    Back,
+}
+
 #[derive(Clone, Copy)]
 enum Change {
     Pause,
@@ -151,9 +173,12 @@ enum Change {
 impl Bots {
     pub fn new(cfg: BotsConfig) -> Self {
         let onboarding = Onboarding::new(cfg.github_org.clone(), cfg.response_url_prefix.clone());
+        let snoozes = SnoozeStore::open(&cfg.state_dir);
         Self {
             inner: Arc::new(Inner {
                 cfg,
+                snoozes,
+                held_edits: Mutex::new(Bounded::new(500)),
                 onboarding,
                 threads: Mutex::new(Bounded::new(5000)),
                 seen: Mutex::new(Bounded::new(5000)),
@@ -182,6 +207,26 @@ impl Bots {
 
     pub(crate) fn onboarding(&self) -> &Onboarding {
         &self.inner.onboarding
+    }
+
+    /// The snoozed reply cards.
+    pub fn snoozes(&self) -> &SnoozeStore {
+        &self.inner.snoozes
+    }
+
+    /// `PMOS_DEFAULT_TZ`.
+    pub(crate) fn default_tz(&self) -> &str {
+        &self.inner.cfg.default_tz
+    }
+
+    /// The edit a `needs_external_confirm` answer held back for this item, if any.
+    pub(crate) fn pending_edit(&self, id: &str) -> Option<Value> {
+        self.inner
+            .held_edits
+            .lock()
+            .expect("held edits lock")
+            .get(&id.to_string())
+            .cloned()
     }
 
     /// Remember that `bot` works in this thread, so the PM's next message there goes to it.
@@ -288,9 +333,28 @@ impl Bots {
                     .as_str()
                     .unwrap_or_default()
                 {
-                    action::APPROVE => Box::pin(async move { this.decide(click, "approve").await }),
-                    action::REJECT => Box::pin(async move { this.decide(click, "reject").await }),
+                    action::APPROVE => {
+                        Box::pin(async move { this.decide(click, "approve", None).await })
+                    }
+                    action::REJECT => {
+                        Box::pin(async move { this.flip_card(click, Flip::Reasons).await })
+                    }
+                    action::BACK => {
+                        Box::pin(async move { this.flip_card(click, Flip::Back).await })
+                    }
+                    a if cards::reason_of_action(a).is_some() => {
+                        let reason = cards::reason_of_action(a);
+                        Box::pin(async move { this.decide(click, "reject", reason).await })
+                    }
                     action::EDIT => Box::pin(async move { this.open_editor(click).await }),
+                    action::SNOOZE => Box::pin(async move { this.snooze_menu(click).await }),
+                    a if reply::Choice::of_action(a).is_some() => {
+                        let choice = reply::Choice::of_action(a).expect("checked");
+                        Box::pin(async move { this.snooze_pick(click, choice).await })
+                    }
+                    action::POST_EXTERNAL => {
+                        Box::pin(async move { this.post_external(click).await })
+                    }
                     action::ROUTINE_CREATE => {
                         Box::pin(async move { this.confirm_routine(click, true).await })
                     }
@@ -412,6 +476,9 @@ impl Bots {
                 return self.confirm_remove(&dm, &handle, &who).await;
             }
             None => {}
+        }
+        if let Some(cmd) = reply::command(&text) {
+            return self.reply_assistant(&dm, &handle, cmd).await;
         }
         if is_routine_list(&text) {
             let message = self
@@ -591,7 +658,7 @@ impl Bots {
     // ---- Buttons ----
 
     /// The clicking PM's handle; anyone outside `team.yaml` gets the private note.
-    async fn clicker(&self, click: &Click) -> Option<String> {
+    pub(crate) async fn clicker(&self, click: &Click) -> Option<String> {
         let handle = self
             .team()
             .by_slack_id(&click.user)
@@ -610,7 +677,7 @@ impl Bots {
 
     /// Only the item's own PM may decide it. Anyone else gets a private note, and nothing
     /// is sent to the tool server.
-    async fn owns(&self, channel: &str, user: &str, handle: &str, item: &Value) -> bool {
+    pub(crate) async fn owns(&self, channel: &str, user: &str, handle: &str, item: &Value) -> bool {
         let owner = item["user"].as_str().unwrap_or_default();
         if owner == handle {
             return true;
@@ -629,7 +696,7 @@ impl Bots {
     }
 
     /// The approval item for a click, or a private note saying why not.
-    async fn load_item(&self, channel: &str, user: &str, id: &str) -> Option<Value> {
+    pub(crate) async fn load_item(&self, channel: &str, user: &str, id: &str) -> Option<Value> {
         match self.toolserver().approval(id).await {
             Ok(item) => Some(item),
             Err(e) => {
@@ -643,7 +710,35 @@ impl Bots {
         }
     }
 
-    async fn decide(&self, click: Click, decision: &'static str) {
+    /// **Reject** and **Back** change the card in place and decide nothing. Only the item's
+    /// own PM may turn it, and a card decided meanwhile shows its outcome instead.
+    async fn flip_card(&self, click: Click, flip: Flip) {
+        let Some(handle) = self.clicker(&click).await else {
+            return;
+        };
+        let Some(item) = self
+            .load_item(&click.channel, &click.user, &click.value)
+            .await
+        else {
+            return;
+        };
+        if !self.owns(&click.channel, &click.user, &handle, &item).await {
+            return;
+        }
+        let card = if item["status"] != "pending" {
+            let line = cards::decision_line(&item, &handle, false);
+            cards::approval_closed(&item, &line)
+        } else {
+            match flip {
+                Flip::Reasons => cards::approval_reasons(&item),
+                Flip::Back => cards::approval_card(&item),
+            }
+        };
+        self.update(&click.channel, &click.message_ts, card).await;
+    }
+
+    /// Approve, or reject with the reason chosen on the card.
+    async fn decide(&self, click: Click, decision: &'static str, reason: Option<&'static str>) {
         let Some(handle) = self.clicker(&click).await else {
             return;
         };
@@ -667,7 +762,9 @@ impl Bots {
             return;
         }
         // Take the buttons away at once, so a second tap can't decide twice.
-        let doing = if decision == "approve" {
+        let doing = if decision == "approve" && cards::is_reply(&item) {
+            ":hourglass_flowing_sand: Posting…"
+        } else if decision == "approve" {
             ":hourglass_flowing_sand: Approving…"
         } else {
             ":hourglass_flowing_sand: Rejecting…"
@@ -680,8 +777,15 @@ impl Bots {
         .await;
         let outcome = self
             .toolserver()
-            .decide(&click.value, &handle, decision, None)
-            .await;
+            .decide(&click.value, &handle, decision, None, reason, false)
+            .await
+            .map(|mut decided| {
+                // The card says why, whether or not the item echoes the reason back.
+                if let (Some(reason), true) = (reason, decided["reason"].is_null()) {
+                    decided["reason"] = json!(reason);
+                }
+                decided
+            });
         self.show_decision(
             &click.channel,
             &click.message_ts,
@@ -777,21 +881,22 @@ impl Bots {
         .await;
         let outcome = self
             .toolserver()
-            .decide(id, &handle, "edit", Some(args))
+            .decide(id, &handle, "edit", Some(args), None, false)
             .await;
         self.show_decision(channel, ts, &shown, &handle, outcome, true)
             .await;
     }
 
     /// Put a decision's outcome on the card: who decided and the link that was written, or
-    /// the buttons back with what went wrong.
-    async fn show_decision(
+    /// the buttons back with what went wrong. The Slack audience check's answers
+    /// (`docs/slack-reply-spec.md` §3) each get their own card.
+    pub(crate) async fn show_decision(
         &self,
         channel: &str,
         ts: &str,
         item: &Value,
         handle: &str,
-        outcome: Result<Value, CallError>,
+        outcome: Result<Value, ApiError>,
         edited: bool,
     ) {
         let card = match outcome {
@@ -799,11 +904,43 @@ impl Bots {
                 let line = cards::decision_line(&decided, handle, edited);
                 cards::approval_closed(&decided, &line)
             }
-            Err(CallError::Unavailable) => cards::approval_retry(
+            Err(ApiError::Unavailable) => cards::approval_retry(
                 item,
                 "PM OS couldn't reach the tool server, so nothing was decided. Try again.",
             ),
-            Err(CallError::Refused(why)) => {
+            Err(ApiError::Refused { code, body, .. }) if code == "audience_blocked" => {
+                tracing::info!(approval = %item["id"], "reply blocked by the audience check");
+                cards::reply_blocked(&with_audience(item, &body), body["outsiders"].as_u64())
+            }
+            Err(ApiError::Refused { code, body, .. }) if code == "needs_external_confirm" => {
+                if edited {
+                    let id = item["id"].as_str().unwrap_or_default().to_string();
+                    self.inner
+                        .held_edits
+                        .lock()
+                        .expect("held edits lock")
+                        .insert(id, item["args"].clone());
+                }
+                cards::reply_confirm_external(&with_audience(item, &body), edited)
+            }
+            Err(ApiError::Refused { code, .. }) if code == "expired" => {
+                let mut shown = item.clone();
+                shown["status"] = json!("expired");
+                cards::approval_closed(&shown, cards::EXPIRED_LINE)
+            }
+            Err(ApiError::Refused { code, .. }) if code == "audience_unavailable" => {
+                cards::approval_retry(
+                    item,
+                    "PM OS couldn't check who is in the channel (Slack didn't answer), so \
+                     nothing was posted. Try again in a minute.",
+                )
+            }
+            Err(ApiError::Refused { error, .. }) => {
+                let why = if error.is_empty() {
+                    "refused".to_string()
+                } else {
+                    error
+                };
                 let id = item["id"].as_str().unwrap_or_default();
                 match self.toolserver().approval(id).await {
                     Ok(now) if now["status"] != "pending" => {
@@ -973,6 +1110,18 @@ impl Bots {
             tracing::warn!(error = %e, "private note failed");
         }
     }
+}
+
+/// The item with what a refusal says of the audience (`audience: {members, external}`), so
+/// the card can show it.
+fn with_audience(item: &Value, body: &Value) -> Value {
+    let mut shown = item.clone();
+    if let Some(audience) = body["audience"].as_object() {
+        for (k, v) in audience {
+            shown["audience"][k] = v.clone();
+        }
+    }
+    shown
 }
 
 fn unavailable_or(e: &RuntimeError) -> String {
@@ -1181,9 +1330,9 @@ mod tests {
     fn routing_order() {
         let roster = vec![bot("docs"), bot("pm-ana")];
         // 1. the prefix wins over everything.
-        let (prefix, rest) = split_prefix("docs: what ports does DSM need?", &roster);
+        let (prefix, rest) = split_prefix("docs: what ports does Acme Vault need?", &roster);
         assert_eq!(prefix.as_deref(), Some("docs"));
-        assert_eq!(rest, "what ports does DSM need?");
+        assert_eq!(rest, "what ports does Acme Vault need?");
         assert_eq!(
             choose_bot(prefix.as_deref(), Some("pm-ana"), "ana", &roster),
             "docs"
@@ -1214,7 +1363,7 @@ mod tests {
             routine_request("routine: friday digest").as_deref(),
             Some("friday digest")
         );
-        assert!(routine_request("every ticket in DSM, what's the status?").is_none());
+        assert!(routine_request("every ticket in Acme Vault, what's the status?").is_none());
         assert!(routine_request("each of these").is_none());
         assert!(routine_request("routine:").is_none());
         assert!(is_routine_list("My routines?"));

@@ -1,4 +1,5 @@
-//! Failure tags (D10): every failed task gets exactly one bottleneck.
+//! Failure tags (D10): every failed task gets exactly one bottleneck, and a sub-tag from
+//! `evals/taxonomy.yaml` where the failure maps to one.
 //!
 //! The rules run in the order of [`RULES`]; the first that matches decides the tag, and
 //! `model` is what is left. "Error" means the task's `error` field, lowercased; "trace" is the
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::client::{status, TraceEntry};
-use crate::grade::{extract_urls, normalize_url, Grade};
+use crate::grade::{extract_urls, normalize_url, Check, Grade};
 use crate::outcome::Outcome;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -55,6 +56,10 @@ pub struct Tagged {
     pub tag: Tag,
     pub rule: String,
     pub reason: String,
+    /// The sub-tag in full (`model/missing-citation`), from `evals/taxonomy.yaml`. Reports
+    /// written before sub-tags have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
 }
 
 /// The rules in the order they run: (rule id, tag, what it matches). The documentation in
@@ -68,13 +73,72 @@ pub const RULES: &[(&str, Tag, &str)] = &[
     ("interrupted", Tag::Harness, "the task failed with an error naming the runtime or worker: `interrupted`, `restart`, `lease`, `heartbeat`, `worker`, `sandbox` or `gateway` (the model endpoint itself unreachable)"),
     ("silent-timeout", Tag::Harness, "timed out while `working` with no events: the worker never reported progress"),
     ("done-without-answer", Tag::Harness, "the task ended `done` with an empty result"),
+    ("drafts-unreadable", Tag::Harness, "the task has `drafts` checks and its drafts couldn't be read"),
+    ("duplicate-approvals", Tag::Harness, "more approval items than expected from a task that ran more than once (attempts > 1): the retry drafted them again"),
     ("memory-error", Tag::Memory, "the task failed with an error naming memory or the context window: `memory`, `context length`, `context window` or `maximum context`"),
     ("memory-tool-error", Tag::Memory, "the trace has a failed result from a `memory.*` tool"),
     ("tool-error", Tag::Tool, "the trace has a failed tool result (`isError`, `is_error` or `error` set, or a `status` of 400 or more)"),
     ("tool-failure", Tag::Tool, "the task failed with an error naming a tool: `tool`, `mcp`, `connector` or `unavailable`"),
     ("page-not-retrieved", Tag::Tool, "a page to cite is missing, the bot called tools, and no tool result held that page: retrieval didn't surface it"),
-    ("model", Tag::Model, "anything else: the bot had what it needed and answered wrong, timed out while working, failed with any other error, or drafted the wrong number of approvals"),
+    ("draft-wrong-target", Tag::Tool, "a draft goes to the wrong place: its Jira `project`, Confluence `space`, or Slack `channel` or `thread_ts` isn't one of the `allowed` values"),
+    ("model", Tag::Model, "anything else: the bot had what it needed and answered wrong, answered what it should have declined, timed out while working, failed with any other error, or drafted the wrong number or content"),
 ];
+
+/// Every sub-tag the rules emit. `evals/taxonomy.yaml` must list each of them.
+pub const SUB_TAGS: &[&str] = &[
+    "harness/runtime-unreachable",
+    "policy/denied-in-trace",
+    "policy/refused",
+    "harness/never-claimed",
+    "harness/cancelled",
+    "harness/interrupted",
+    "harness/silent-timeout",
+    "harness/empty-answer",
+    "harness/drafts-unreadable",
+    "harness/approval-count",
+    "memory/context-limit",
+    "memory/tool-failed",
+    "tool/call-failed",
+    "tool/unavailable",
+    "tool/page-not-retrieved",
+    "tool/wrong-jira-project",
+    "tool/wrong-confluence-space",
+    "tool/wrong-slack-channel",
+    "model/answered-beyond-sources",
+    "model/missing-citation",
+    "model/leaked-reasoning",
+    "model/missing-fact",
+    "model/forbidden-text",
+    "model/wrong-draft-count",
+    "model/incomplete-draft",
+    "model/wrong-draft-value",
+    "model/draft-content",
+    "model/failed",
+    "model/timed-out",
+    "model/no-answer",
+];
+
+/// The sub-tag each rule but `model` and `draft-wrong-target` gives.
+fn rule_sub(rule: &str) -> Option<&'static str> {
+    Some(match rule {
+        "runtime-unreachable" => "harness/runtime-unreachable",
+        "policy-denial" => "policy/denied-in-trace",
+        "policy-error" => "policy/refused",
+        "never-claimed" => "harness/never-claimed",
+        "cancelled" => "harness/cancelled",
+        "interrupted" => "harness/interrupted",
+        "silent-timeout" => "harness/silent-timeout",
+        "done-without-answer" => "harness/empty-answer",
+        "drafts-unreadable" => "harness/drafts-unreadable",
+        "duplicate-approvals" => "harness/approval-count",
+        "memory-error" => "memory/context-limit",
+        "memory-tool-error" => "memory/tool-failed",
+        "tool-error" => "tool/call-failed",
+        "tool-failure" => "tool/unavailable",
+        "page-not-retrieved" => "tool/page-not-retrieved",
+        _ => return None,
+    })
+}
 
 const POLICY_WORDS: &[&str] = &["policy", "denied", "forbidden", "not permitted", "403"];
 const HARNESS_WORDS: &[&str] = &[
@@ -106,6 +170,7 @@ fn tagged(id: &str, reason: impl Into<String>) -> Tagged {
     let (tag, rule) = rule(id);
     Tagged {
         tag,
+        sub: rule_sub(&rule).map(str::to_string),
         rule,
         reason: reason.into(),
     }
@@ -134,6 +199,56 @@ fn is_error_result(body: &Value) -> bool {
 
 fn of_kind<'a>(trace: &'a [TraceEntry], kind: &'a str) -> impl Iterator<Item = &'a TraceEntry> {
     trace.iter().filter(move |e| e.kind == kind)
+}
+
+/// The sub-tag for a draft sent to the wrong place, or `None` when the field isn't where
+/// the draft goes.
+fn wrong_target(tool: &str, field: &str) -> Option<&'static str> {
+    let system = tool.split('.').next().unwrap_or_default();
+    match (system, field) {
+        ("jira", "project") => Some("tool/wrong-jira-project"),
+        ("confluence", "space") => Some("tool/wrong-confluence-space"),
+        ("slack", "channel" | "thread_ts") => Some("tool/wrong-slack-channel"),
+        _ => None,
+    }
+}
+
+/// A failed check's `model` sub-tag and its rank: when several checks fail, the lowest rank
+/// decides (declining first, then citations, then facts, then drafts, then status).
+fn check_sub(c: &Check) -> Option<(u8, &'static str)> {
+    Some(match c {
+        Check::NotDeclined => (0, "model/answered-beyond-sources"),
+        Check::MissingCitation { .. } => (1, "model/missing-citation"),
+        Check::ForbiddenText { text } if text.contains("<think>") => (2, "model/leaked-reasoning"),
+        Check::MissingText { .. } => (3, "model/missing-fact"),
+        Check::ForbiddenText { .. } => (4, "model/forbidden-text"),
+        Check::DraftCount { .. } | Check::Approvals { .. } => (5, "model/wrong-draft-count"),
+        Check::DraftMissingField { .. } => (6, "model/incomplete-draft"),
+        Check::DraftNotAllowed { .. } => (7, "model/wrong-draft-value"),
+        Check::DraftMissingText { .. } | Check::DraftForbiddenText { .. } => {
+            (8, "model/draft-content")
+        }
+        Check::Status { .. } => (9, "model/failed"),
+        _ => return None,
+    })
+}
+
+/// The sub-tag a `model` failure gets: from how it failed, else its highest-ranked failed
+/// check ([`check_sub`]).
+fn model_sub(outcome: &Outcome, grade: &Grade) -> &'static str {
+    if outcome.status_is(status::FAILED) {
+        return "model/failed";
+    }
+    if outcome.timed_out {
+        return "model/timed-out";
+    }
+    grade
+        .failures
+        .iter()
+        .filter_map(check_sub)
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, sub)| sub)
+        .unwrap_or("model/no-answer")
 }
 
 /// Tag one failure. Call it only for a task that failed grading.
@@ -179,6 +294,30 @@ pub fn tag_failure(outcome: &Outcome, grade: &Grade) -> Tagged {
     if outcome.status_is(status::DONE) && outcome.result_text().trim().is_empty() {
         return tagged("done-without-answer", "done with an empty result");
     }
+    if let Some(Check::DraftsUnreadable { error }) = grade
+        .failures
+        .iter()
+        .find(|c| matches!(c, Check::DraftsUnreadable { .. }))
+    {
+        return tagged("drafts-unreadable", error.clone());
+    }
+    if outcome.attempts > 1 {
+        let extra = grade.failures.iter().find_map(|c| match c {
+            Check::Approvals { expected, got } if *got > *expected as usize => {
+                Some((*expected, *got))
+            }
+            _ => None,
+        });
+        if let Some((expected, got)) = extra {
+            return tagged(
+                "duplicate-approvals",
+                format!(
+                    "{got} approval items, expected {expected}, after {} attempts",
+                    outcome.attempts
+                ),
+            );
+        }
+    }
     if failed {
         if let Some(w) = mentions(&error, MEMORY_WORDS) {
             return tagged("memory-error", format!("error mentions `{w}`: {error}"));
@@ -223,6 +362,17 @@ pub fn tag_failure(outcome: &Outcome, grade: &Grade) -> Tagged {
             }
         }
     }
+    let target = grade.failures.iter().find_map(|c| match c {
+        Check::DraftNotAllowed { tool, field, .. } => {
+            wrong_target(tool, field).map(|sub| (sub, c.to_string()))
+        }
+        _ => None,
+    });
+    if let Some((sub, reason)) = target {
+        let mut t = tagged("draft-wrong-target", reason);
+        t.sub = Some(sub.to_string());
+        return t;
+    }
     let reason = grade
         .failures
         .iter()
@@ -234,7 +384,9 @@ pub fn tag_failure(outcome: &Outcome, grade: &Grade) -> Tagged {
         _ if reason.is_empty() => "failed grading".to_string(),
         _ => reason,
     };
-    tagged("model", reason)
+    let mut t = tagged("model", reason);
+    t.sub = Some(model_sub(outcome, grade).to_string());
+    t
 }
 
 /// A trace body, cut to one readable line.

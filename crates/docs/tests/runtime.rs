@@ -13,17 +13,10 @@ use common::{seed, start_portal};
 use pmos_docs::app::Runtime;
 use pmos_docs::page::DocPage;
 use pmos_docs::store::{DocsStore, Hit, MemoryStore, ProductCount, StoreResult};
-use pmos_docs::sync::{SyncConfig, Syncer};
+use pmos_docs::sync::Syncer;
 
 fn syncer(base: &str, store: Arc<dyn DocsStore>) -> Syncer {
-    Syncer::new(
-        SyncConfig {
-            base: base.into(),
-            delay: Duration::from_millis(1),
-            ..SyncConfig::default()
-        },
-        store,
-    )
+    Syncer::new(common::sync_config(base), store)
 }
 
 const DAY: Duration = Duration::from_secs(24 * 3600);
@@ -145,7 +138,9 @@ async fn readyz_fails_on_an_empty_or_stale_index() {
         runtime,
         pmos_docs::app::AppConfig {
             token: "t".repeat(32),
-            base: "https://support.fortanix.com".into(),
+            name: "the public docs".into(),
+            site: Some(pmos_docs::page::Site::new("https://docs.example.com")),
+            products: pmos_docs::page::Products::default(),
             allowed_hosts: vec!["127.0.0.1".into()],
             stale_after: Some(DAY * 2),
         },
@@ -169,7 +164,7 @@ async fn readyz_fails_on_an_empty_or_stale_index() {
     // Pages, but synced three days ago: stale.
     store
         .upsert(&DocPage {
-            url: "https://support.fortanix.com/docs/x.md".into(),
+            url: "https://docs.example.com/docs/x.md".into(),
             slug: "x".into(),
             title: "X".into(),
             section: "docs".into(),

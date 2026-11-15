@@ -1,5 +1,8 @@
 //! Reports: `evals/reports/<date>-<category>.md` for people and a `.json` next to it for
-//! `history`.
+//! `history`, `compare` and `gate`.
+//!
+//! A report has one line per attempt: with `repeats: 3` each task has three lines, numbered by
+//! `repeat`. Reports written before repeats have one line per task and read as `repeats: 1`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -9,17 +12,26 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::grade::Check;
+use crate::judge::{JudgeStatus, JudgeVerdict};
+use crate::stats::{compare, pass_hat_k, report_se, summaries, SeMethod};
 use crate::tag::{Tag, Tagged};
+
+fn one() -> u32 {
+    1
+}
 
 /// One run of one category.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Report {
     pub category: String,
+    /// The bot the tasks went to (for `bot: personal`, the resolved `pm-<handle>`).
     pub bot: String,
     pub date: NaiveDate,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
-    pub pass_bar: f64,
+    /// `None`: the category has no bar yet and reports only.
+    #[serde(default)]
+    pub pass_bar: Option<f64>,
     pub runtime_url: String,
     pub requested_by: String,
     /// `PMOS_GATEWAY_WORKAROUNDS` in the runner's environment, as the person running it
@@ -29,14 +41,33 @@ pub struct Report {
     /// Free text saying why this run happened ("weekly", "model swap to …").
     #[serde(default)]
     pub note: Option<String>,
+    /// How many times each task ran.
+    #[serde(default = "one")]
+    pub repeats: u32,
+    /// The judges that applied, and whether each was blocking in this run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judges: Vec<JudgeStatus>,
+    /// Why judges that apply weren't asked (no gateway configured, `--no-judges`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judges_skipped: Option<String>,
     pub tasks: Vec<TaskReport>,
 }
 
-/// One task's line in a report.
+/// One attempt's line in a report.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskReport {
     pub id: String,
     pub ask: String,
+    /// Which attempt this is, from 1.
+    #[serde(default = "one")]
+    pub repeat: u32,
+    /// The task's cluster for the standard error; reports from before clusters have none,
+    /// and the task id is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
+    /// The task is marked `regression: true`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub regression: bool,
     pub task_id: Option<String>,
     pub status: Option<String>,
     pub passed: bool,
@@ -47,6 +78,8 @@ pub struct TaskReport {
     pub attempts: u32,
     /// Whether the trace could be read for tagging.
     pub trace_read: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judges: Vec<JudgeVerdict>,
 }
 
 /// Whether `passed` of `total` meets `bar`.
@@ -55,10 +88,12 @@ pub fn meets(passed: usize, total: usize, bar: f64) -> bool {
 }
 
 impl Report {
+    /// Attempts that passed.
     pub fn passed(&self) -> usize {
         self.tasks.iter().filter(|t| t.passed).count()
     }
 
+    /// Attempts in all.
     pub fn total(&self) -> usize {
         self.tasks.len()
     }
@@ -71,8 +106,10 @@ impl Report {
         }
     }
 
-    pub fn met_bar(&self) -> bool {
-        meets(self.passed(), self.total(), self.pass_bar)
+    /// Whether the pass rate over every attempt meets the bar; `None` with no bar.
+    pub fn met_bar(&self) -> Option<bool> {
+        self.pass_bar
+            .map(|bar| meets(self.passed(), self.total(), bar))
     }
 
     /// Failures per tag, the biggest bottleneck first; ties in [`Tag::ALL`] order.
@@ -93,23 +130,75 @@ impl Report {
         v
     }
 
+    /// Failures per sub-tag, the most first, then by name.
+    pub fn failures_by_sub_tag(&self) -> Vec<(String, usize)> {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for t in &self.tasks {
+            if let Some(sub) = t.tag.as_ref().and_then(|x| x.sub.clone()) {
+                *counts.entry(sub).or_default() += 1;
+            }
+        }
+        let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
+    /// Task ids whose failures have `pred`'s tag, each once, in report order.
+    fn ids_where(&self, pred: impl Fn(&Tagged) -> bool) -> String {
+        let mut ids: Vec<&str> = Vec::new();
+        for t in &self.tasks {
+            if t.tag.as_ref().is_some_and(&pred) && !ids.contains(&t.id.as_str()) {
+                ids.push(&t.id);
+            }
+        }
+        ids.iter()
+            .map(|i| format!("`{i}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// The report as markdown.
     pub fn to_markdown(&self) -> String {
+        self.to_markdown_with(None)
+    }
+
+    /// The report as markdown, compared with `previous` (its file name and report) if given.
+    pub fn to_markdown_with(&self, previous: Option<(&str, &Report)>) -> String {
         let mut s = String::new();
         let passed = self.passed();
         let total = self.total();
-        let verdict = if self.met_bar() {
-            "**Met the bar.**"
+        let tasks = summaries(self);
+        let unit = if self.repeats > 1 {
+            format!(
+                "attempts passed ({}) over {} tasks run {} times each",
+                pct(self.pass_rate()),
+                tasks.len(),
+                self.repeats
+            )
         } else {
-            "**Below the bar.**"
+            format!("tasks passed ({})", pct(self.pass_rate()))
         };
         let _ = writeln!(s, "# Benchmark: {} ({})\n", self.category, self.date);
-        let _ = writeln!(
-            s,
-            "{verdict} {passed} of {total} tasks passed ({}), against a bar of {}.\n",
-            pct(self.pass_rate()),
-            pct(self.pass_bar)
-        );
+        match (self.met_bar(), self.pass_bar) {
+            (Some(met), Some(bar)) => {
+                let verdict = if met {
+                    "**Met the bar.**"
+                } else {
+                    "**Below the bar.**"
+                };
+                let _ = writeln!(
+                    s,
+                    "{verdict} {passed} of {total} {unit}, against a bar of {}.\n",
+                    pct(bar)
+                );
+            }
+            _ => {
+                let _ = writeln!(
+                    s,
+                    "**Reports only.** {passed} of {total} {unit}; the category has no pass bar yet.\n"
+                );
+            }
+        }
         let _ = writeln!(s, "| | |\n| --- | --- |");
         let _ = writeln!(s, "| Bot | `{}` |", self.bot);
         let _ = writeln!(s, "| Runtime | {} |", self.runtime_url);
@@ -131,6 +220,30 @@ impl Report {
             self.started_at.format("%Y-%m-%d %H:%M:%S"),
             self.finished_at.format("%H:%M:%S")
         );
+        if let Some(se) = report_se(self) {
+            let how = match se.method {
+                SeMethod::Clustered => format!("clustered over {} clusters", se.clusters),
+                SeMethod::Binomial => "binomial".to_string(),
+            };
+            let _ = writeln!(
+                s,
+                "| Pass rate | {} ± {} (standard error, {how}) |",
+                pct1(self.pass_rate()),
+                pct1(se.se)
+            );
+        }
+        if self.repeats > 1 {
+            if let Some(k) = pass_hat_k(&tasks) {
+                let all = tasks.iter().filter(|t| t.all_passed()).count();
+                let _ = writeln!(
+                    s,
+                    "| pass^{} | {} ({all} of {} tasks passed every run) |",
+                    self.repeats,
+                    pct(k),
+                    tasks.len()
+                );
+            }
+        }
         let unread = self
             .tasks
             .iter()
@@ -157,53 +270,131 @@ impl Report {
             );
             let _ = writeln!(s, "| Tag | Failures | Tasks |\n| --- | --- | --- |");
             for (tag, n) in &by_tag {
-                let ids: Vec<String> = self
-                    .tasks
-                    .iter()
-                    .filter(|t| t.tag.as_ref().map(|x| x.tag) == Some(*tag))
-                    .map(|t| format!("`{}`", t.id))
-                    .collect();
-                let _ = writeln!(s, "| {tag} | {n} | {} |", ids.join(", "));
+                let ids = self.ids_where(|x| x.tag == *tag);
+                let _ = writeln!(s, "| {tag} | {n} | {ids} |");
+            }
+            let subs = self.failures_by_sub_tag();
+            if !subs.is_empty() {
+                let _ = writeln!(s, "\n| Sub-tag | Failures | Tasks |\n| --- | --- | --- |");
+                for (sub, n) in &subs {
+                    let ids = self.ids_where(|x| x.sub.as_deref() == Some(sub.as_str()));
+                    let _ = writeln!(s, "| `{sub}` | {n} | {ids} |");
+                }
+            }
+        }
+
+        if !self.judges.is_empty() || self.judges_skipped.is_some() {
+            let _ = writeln!(s, "\n## Judges\n");
+            if let Some(why) = &self.judges_skipped {
+                let _ = writeln!(s, "Not asked: {}.\n", cell(why));
+            }
+            if !self.judges.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "| Judge | Status | Yes | No | No verdict |\n| --- | --- | --- | --- | --- |"
+                );
+                for j in &self.judges {
+                    let verdicts = self
+                        .tasks
+                        .iter()
+                        .flat_map(|t| t.judges.iter())
+                        .filter(|v| v.name == j.name);
+                    let (mut yes, mut no, mut none) = (0, 0, 0);
+                    for v in verdicts {
+                        match v.verdict {
+                            Some(true) => yes += 1,
+                            Some(false) => no += 1,
+                            None => none += 1,
+                        }
+                    }
+                    let _ = writeln!(
+                        s,
+                        "| `{}` | {} | {yes} | {no} | {none} |",
+                        j.name,
+                        cell(&j.reason)
+                    );
+                }
             }
         }
 
         let _ = writeln!(s, "\n## Tasks\n");
-        let _ = writeln!(
-            s,
-            "| Task | Result | Tag | Status | Queue (s) | Total (s) | Why |\n| --- | --- | --- | --- | --- | --- | --- |"
-        );
-        for t in &self.tasks {
-            let result = if t.passed { "pass" } else { "**FAIL**" };
-            let tag = t
-                .tag
-                .as_ref()
-                .map(|x| format!("{} (`{}`)", x.tag, x.rule))
-                .unwrap_or_default();
-            let why = if t.passed {
-                String::new()
-            } else {
-                t.failures
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            };
+        if self.repeats > 1 {
             let _ = writeln!(
                 s,
-                "| `{}` | {result} | {tag} | {} | {} | {} | {} |",
-                t.id,
-                t.status.as_deref().unwrap_or("-"),
-                secs(t.queue_secs),
-                secs(t.total_secs),
-                cell(&why)
+                "| Task | Passes | Failure tags | Why (latest failure) |\n| --- | --- | --- | --- |"
             );
+            for t in &tasks {
+                let mine: Vec<&TaskReport> = self.tasks.iter().filter(|l| l.id == t.id).collect();
+                let mut tags: BTreeMap<String, usize> = BTreeMap::new();
+                for l in &mine {
+                    if let Some(x) = &l.tag {
+                        *tags.entry(tag_label(x)).or_default() += 1;
+                    }
+                }
+                let tags = tags
+                    .iter()
+                    .map(|(k, n)| format!("{k} ×{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let why = mine
+                    .iter()
+                    .rev()
+                    .find(|l| !l.passed)
+                    .map(|l| why(l))
+                    .unwrap_or_default();
+                let passes = if t.all_passed() {
+                    format!("{}/{}", t.passes, t.runs)
+                } else {
+                    format!("**{}/{}**", t.passes, t.runs)
+                };
+                let _ = writeln!(
+                    s,
+                    "| `{}` | {passes} | {} | {} |",
+                    t.id,
+                    cell(&tags),
+                    cell(&why)
+                );
+            }
+        } else {
+            let _ = writeln!(
+                s,
+                "| Task | Result | Tag | Status | Queue (s) | Total (s) | Why |\n| --- | --- | --- | --- | --- | --- | --- |"
+            );
+            for t in &self.tasks {
+                let result = if t.passed { "pass" } else { "**FAIL**" };
+                let tag = t
+                    .tag
+                    .as_ref()
+                    .map(|x| format!("{} (`{}`)", tag_label(x), x.rule))
+                    .unwrap_or_default();
+                let why = if t.passed { String::new() } else { why(t) };
+                let _ = writeln!(
+                    s,
+                    "| `{}` | {result} | {tag} | {} | {} | {} | {} |",
+                    t.id,
+                    t.status.as_deref().unwrap_or("-"),
+                    secs(t.queue_secs),
+                    secs(t.total_secs),
+                    cell(&why)
+                );
+            }
+        }
+
+        if let Some((name, prev)) = previous {
+            let _ = writeln!(s, "\n## Compared with the previous run\n");
+            let _ = writeln!(s, "Previous run: `{name}` ({}).\n", prev.date);
+            s.push_str(&compare(prev, self).to_markdown());
         }
 
         let failures: Vec<&TaskReport> = self.tasks.iter().filter(|t| !t.passed).collect();
         if !failures.is_empty() {
             let _ = writeln!(s, "\n## Failure details\n");
             for t in failures {
-                let _ = writeln!(s, "### `{}`\n", t.id);
+                if self.repeats > 1 {
+                    let _ = writeln!(s, "### `{}`, run {} of {}\n", t.id, t.repeat, self.repeats);
+                } else {
+                    let _ = writeln!(s, "### `{}`\n", t.id);
+                }
                 let _ = writeln!(s, "- **Asked:** {}", t.ask);
                 if let Some(id) = &t.task_id {
                     let _ = writeln!(s, "- **Task:** `{id}` (attempts: {})", t.attempts);
@@ -212,7 +403,7 @@ impl Report {
                     let _ = writeln!(
                         s,
                         "- **Tag:** {} by rule `{}`: {}",
-                        tagged.tag,
+                        tag_label(tagged),
                         tagged.rule,
                         cell(&tagged.reason)
                     );
@@ -227,8 +418,25 @@ impl Report {
     }
 }
 
+/// A tag as a report shows it: the sub-tag when there is one, else the bottleneck.
+fn tag_label(t: &Tagged) -> String {
+    t.sub.clone().unwrap_or_else(|| t.tag.to_string())
+}
+
+fn why(t: &TaskReport) -> String {
+    t.failures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn pct(x: f64) -> String {
     format!("{:.0}%", x * 100.0)
+}
+
+fn pct1(x: f64) -> String {
+    format!("{:.1}%", x * 100.0)
 }
 
 fn secs(x: Option<f64>) -> String {
@@ -236,7 +444,7 @@ fn secs(x: Option<f64>) -> String {
 }
 
 /// Text that stays inside one markdown table cell.
-fn cell(s: &str) -> String {
+pub fn cell(s: &str) -> String {
     s.replace('|', "\\|").replace(['\n', '\r'], " ")
 }
 
@@ -244,6 +452,15 @@ fn cell(s: &str) -> String {
 /// A second run on the same day gets `-2`, then `-3`, so no run is overwritten. Returns the
 /// markdown path.
 pub fn write(dir: &Path, report: &Report) -> std::io::Result<PathBuf> {
+    write_with(dir, report, None)
+}
+
+/// [`write`], with the markdown compared against `previous` (its file name and report).
+pub fn write_with(
+    dir: &Path,
+    report: &Report,
+    previous: Option<(&str, &Report)>,
+) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let base = format!("{}-{}", report.date.format("%Y-%m-%d"), report.category);
     let mut n = 1;
@@ -262,6 +479,19 @@ pub fn write(dir: &Path, report: &Report) -> std::io::Result<PathBuf> {
     };
     let body = serde_json::to_string_pretty(report).map_err(std::io::Error::other)?;
     std::fs::write(&json, body + "\n")?;
-    std::fs::write(&md, report.to_markdown())?;
+    std::fs::write(&md, report.to_markdown_with(previous))?;
     Ok(md)
+}
+
+/// Read one report from its `.json`, or from the `.md` next to it.
+pub fn read(path: &Path) -> Result<Report, String> {
+    let json = if path.extension().and_then(|x| x.to_str()) == Some("md") {
+        path.with_extension("json")
+    } else {
+        path.to_path_buf()
+    };
+    let text = std::fs::read_to_string(&json)
+        .map_err(|e| format!("{}: can't read: {e}", json.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("{}: not a pmos-evals report: {e}", json.display()))
 }

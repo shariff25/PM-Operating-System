@@ -2,8 +2,8 @@
 
 Every bot reaches the language model through one OpenAI-compatible endpoint on the Spark.
 The gateway does four jobs:
-- **Picks the model:** callers name a *role* (`pmos/default`, `pmos/extraction`), never a
-  model, and the gateway knows which local model serves each role.
+- **Picks the model:** callers name a *role* (`pmos/default`, `pmos/extraction`,
+  `pmos/reasoning`), never a model, and the gateway knows which local model serves each role.
 - **Keeps prompts on the Spark:** it refuses to start with a model server that isn't local
   (ADM-3).
 - **Shares the GPU fairly** (MOD-4).
@@ -28,6 +28,9 @@ limits: {max-in-flight: 4, per-user: 2, max-queue: 64}
 - **`model`** is the vLLM server's `--served-model-name`.
 - **No caller changes:** the harness and the bots keep asking for `pmos/default`.
 - **Re-run the benchmark** (0g) after any swap, as D11 requires.
+- **The `reasoning` role** serves the PM-craft skills (`docs/pm-craft.md`). It ships pointing
+  at the same upstream and model as `default`. If the `pm-craft` benchmarks show that model
+  doesn't meet the bar, point `reasoning` at a larger one here; no skill changes.
 
 ## Workarounds (D11)
 Scaffolding for a model's weaknesses lives in the gateway behind a flag. Each one says when

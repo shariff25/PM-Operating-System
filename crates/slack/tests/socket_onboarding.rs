@@ -41,9 +41,9 @@ const TOOL_BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
 const TEAM: &str = "\
 # Who may use PM OS.
 members:
-  - {handle: ana, slack-id: U0ANA, email: ana@fortanix.com, roles: [pm, admin]}
-  - {handle: cal, slack-id: U0CAL, email: cal@fortanix.com, roles: [pm, admin]}
-  - {handle: bob, slack-id: U0BOB, email: bob@fortanix.com, roles: [pm]}
+  - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm, admin]}
+  - {handle: cal, slack-id: U0CAL, email: cal@example.com, roles: [pm, admin]}
+  - {handle: bob, slack-id: U0BOB, email: bob@example.com, roles: [pm]}
 ";
 
 fn bearer(headers: &HeaderMap) -> &str {
@@ -365,7 +365,7 @@ async fn ts_memory_repo(State(ts): Ts, headers: HeaderMap, Json(body): Json<Valu
         );
     }
     let (org, name) = repo.split_once('/').unwrap();
-    let code = if org != "fortanix" {
+    let code = if org != "example-org" {
         Some("not_in_org")
     } else if name.contains("public") {
         Some("not_private")
@@ -463,11 +463,11 @@ impl Stack {
         slack.users.lock().unwrap().extend([
             (
                 "U0BEN".to_string(),
-                json!({"name": "ben", "real_name": "Ben <Smith>", "profile": {"email": "ben.smith@fortanix.com", "real_name": "Ben <Smith>"}}),
+                json!({"name": "ben", "real_name": "Ben <Smith>", "profile": {"email": "ben.smith@example.com", "real_name": "Ben <Smith>"}}),
             ),
             (
                 "U0DEE".to_string(),
-                json!({"name": "dee", "real_name": "Dee", "profile": {"email": "dee@fortanix.com"}}),
+                json!({"name": "dee", "real_name": "Dee", "profile": {"email": "dee@example.com"}}),
             ),
             (
                 "U0NOMAIL".to_string(),
@@ -499,8 +499,9 @@ impl Stack {
             toolserver: ToolServer::new(ts_base.clone(), TOOL_BOT_TOKEN),
             team_file: team_file.clone(),
             default_tz: "UTC".into(),
-            github_org: Some("fortanix".into()),
+            github_org: Some("example-org".into()),
             response_url_prefix: format!("{slack_base}/hooks/"),
+            state_dir: team.path().join("state"),
         });
         let socket = Socket::new(
             slack_base.clone(),
@@ -726,7 +727,7 @@ async fn a_stranger_requests_access_and_an_admin_approves() {
     stack.dm("U0BEN", "hi").await;
     let notes = stack.calls("chat.postEphemeral", 1).await;
     assert_eq!(notes[0].body["user"], "U0BEN");
-    assert!(text_of(&notes[0]).contains("PM OS is for the Fortanix product team."));
+    assert!(text_of(&notes[0]).contains("PM OS is for the product team."));
     assert!(has_action(&notes[0].body, "pmos_request_access"));
     assert!(stack.runtime.tasks.lock().unwrap().is_empty());
 
@@ -748,9 +749,7 @@ async fn a_stranger_requests_access_and_an_admin_approves() {
     let filed = stack.tools.wrote("/internal/members/requests");
     assert_eq!(
         filed,
-        vec![
-            json!({"slack_id": "U0BEN", "email": "ben.smith@fortanix.com", "name": "Ben <Smith>"})
-        ]
+        vec![json!({"slack_id": "U0BEN", "email": "ben.smith@example.com", "name": "Ben <Smith>"})]
     );
     assert_eq!(stack.slack.calls("users.info").len(), 1);
     let opened: Vec<Value> = stack
@@ -768,7 +767,7 @@ async fn a_stranger_requests_access_and_an_admin_approves() {
     for card in &posts {
         let s = text_of(card);
         assert!(s.contains("Ben &lt;Smith&gt;"), "{s}");
-        assert!(s.contains("ben.smith@fortanix.com"));
+        assert!(s.contains("ben.smith@example.com"));
         assert!(s.contains("`ben-smith`"));
         for action in [
             "pmos_member_approve",
@@ -880,7 +879,7 @@ async fn a_stranger_requests_access_and_an_admin_approves() {
     assert_eq!(stack.slack.calls("chat.postMessage").len(), 4);
 
     // Ben is a member now (the tool server committed team.yaml): his DMs go to the bots.
-    stack.dm("U0BEN", "what ports does DSM need?").await;
+    stack.dm("U0BEN", "what ports does Acme Vault need?").await;
     until("Ben's task", || {
         let tasks = stack.runtime.tasks.lock().unwrap().clone();
         (!tasks.is_empty()).then_some(tasks)
@@ -1029,7 +1028,7 @@ async fn setup_renders_each_state_and_the_memory_modal_shows_field_errors() {
     assert_eq!(view["callback_id"], "pmos_memory_repo");
     assert_eq!(
         view["blocks"][1]["element"]["initial_value"],
-        "fortanix/pm-os-memory-bob"
+        "example-org/pm-os-memory-bob"
     );
     assert!(view.to_string().contains("as a *private* repo first"));
 
@@ -1041,19 +1040,22 @@ async fn setup_renders_each_state_and_the_memory_modal_shows_field_errors() {
             .to_string()
     };
     let ack = stack
-        .submit("U0BOB", &opened[0], "repo", "fortanix/pm-os-memory-bob")
+        .submit("U0BOB", &opened[0], "repo", "example-org/pm-os-memory-bob")
         .await;
     assert_eq!(ack["payload"]["response_action"], "errors");
     assert!(error_for(&ack).contains("Connect GitHub first"));
     stack.tools.link("bob", "github");
     for (repo, says) in [
-        ("acme/pm-os-memory-bob", "isn't in the fortanix GitHub org"),
-        ("fortanix/public-notes", "That repo is public"),
-        ("fortanix/readonly", "can't push to that repo"),
-        ("fortanix/missing", "GitHub can't find that repo"),
+        (
+            "other-org/pm-os-memory-bob",
+            "isn't in the example-org GitHub org",
+        ),
+        ("example-org/public-notes", "That repo is public"),
+        ("example-org/readonly", "can't push to that repo"),
+        ("example-org/missing", "GitHub can't find that repo"),
         (
             "not a repo",
-            "Use org/name, like fortanix/pm-os-memory-bob.",
+            "Use org/name, like example-org/pm-os-memory-bob.",
         ),
     ] {
         let ack = stack.submit("U0BOB", &opened[0], "repo", repo).await;
@@ -1062,20 +1064,20 @@ async fn setup_renders_each_state_and_the_memory_modal_shows_field_errors() {
     // A tool server too slow for the ack: still acked in time, with a field error.
     *stack.tools.memory_delay.lock().unwrap() = Duration::from_secs(4);
     let ack = stack
-        .submit("U0BOB", &opened[0], "repo", "fortanix/pm-os-memory-bob")
+        .submit("U0BOB", &opened[0], "repo", "example-org/pm-os-memory-bob")
         .await;
     assert!(error_for(&ack).contains("couldn't check that repo in time"));
     *stack.tools.memory_delay.lock().unwrap() = Duration::ZERO;
     // Accepted: the modal closes and the checklist updates in place.
     let ack = stack
-        .submit("U0BOB", &opened[0], "repo", "fortanix/pm-os-memory-bob")
+        .submit("U0BOB", &opened[0], "repo", "example-org/pm-os-memory-bob")
         .await;
     assert!(ack.get("payload").is_none(), "{ack}");
     let updates = stack.calls("chat.update", 1).await;
     assert_eq!(updates[0].body["channel"], at.0);
     assert_eq!(updates[0].body["ts"], at.1);
     assert!(text_of(&updates[0])
-        .contains("4. :white_check_mark: *Memory repo:* `fortanix/pm-os-memory-bob`"));
+        .contains("4. :white_check_mark: *Memory repo:* `example-org/pm-os-memory-bob`"));
     assert!(text_of(&updates[0]).contains("3. :white_check_mark: *GitHub*"));
     assert_eq!(link_urls(&updates[0].body).len(), 2);
     assert_eq!(
@@ -1086,7 +1088,7 @@ async fn setup_renders_each_state_and_the_memory_modal_shows_field_errors() {
             .unwrap()
             .get("bob")
             .map(String::as_str),
-        Some("fortanix/pm-os-memory-bob")
+        Some("example-org/pm-os-memory-bob")
     );
 
     // Everything done: Refresh shows it all ticked.

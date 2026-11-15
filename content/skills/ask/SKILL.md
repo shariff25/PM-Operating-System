@@ -1,6 +1,6 @@
 ---
 name: ask
-description: Answer a question about Fortanix products, customers, partners, competitors or past decisions from the team context library, Confluence and Jira, with a citation for every claim. Use for quick factual questions; use prd-draft or other skills to produce documents.
+description: Answer a question about the company's products, customers, partners, competitors or past decisions from the team context library, Confluence and Jira, with a citation for every claim. Use for quick factual questions; use prd-draft or other skills to produce documents.
 metadata:
   owner: "TODO"
   version: "0.1.0"
@@ -19,8 +19,8 @@ Answer the PM's question from the team's own sources.
 1. Restate the question to yourself in one line. If it is ambiguous in a way that changes the
    answer, ask one clarifying question and stop.
 2. Search the context library first (`context.search`), then Confluence and Jira if the
-   context library does not answer it. For how-to and configuration questions about Fortanix
-   products, also search the public support docs (`docs.search`). Read the most relevant two to five results in full.
+   context library does not answer it. For how-to and configuration questions about the
+   products, also search the company's public docs (`docs.search`). Read the most relevant two to five results in full.
 3. Answer in at most five sentences or one short table. Lead with the direct answer.
 4. Cite every factual claim inline as `[source](link)`. Claims you cannot cite get
    `[unverified]`.

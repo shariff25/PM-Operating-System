@@ -1,0 +1,22 @@
+# seed: replace with case cards
+# Fixture: the docs page vault-saml-sso, which the assistant under test answers from. The
+# eval-plan skill titles its draft `Eval plan: …` and follows content/templates/eval-plan.md:
+# What we are testing, Datasets, Graders, Thresholds, Slices, Regression set, Who reviews
+# failures.
+id: structure-eval-plan
+ask: "Draft anyway, no questions: an eval plan in the PM space for an assistant in the Acme Vault console that answers admins' questions about SAML SSO setup from the public docs (docs page vault-saml-sso)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Eval plan:", "What we are testing", "Graders", "Thresholds", "Regression set", "Who reviews failures"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: eval-plan
+tags:
+  - model/draft-content

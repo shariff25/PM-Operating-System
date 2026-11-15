@@ -1,0 +1,23 @@
+# seed: replace with case cards
+# Fixture: the docs page vault-saml-sso. The ai-feature-spec skill titles its draft
+# `AI spec: …` and follows content/templates/ai-feature-spec.md: Summary, Users and jobs,
+# Intended behaviour, Examples, Failure modes, Misuse and safety, Evaluation, Cost and
+# latency, Human oversight, Rollout and monitoring, Open questions. Failure modes and
+# Evaluation have their own task (ai-spec-failure-modes-and-evaluation).
+id: structure-ai-feature-spec
+ask: "Draft anyway, no questions: an AI feature spec in the PM space for an assistant in the Acme Vault console that answers admins' questions about SAML SSO setup from the public docs (docs page vault-saml-sso)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["AI spec:", "Users and jobs", "Misuse and safety", "Cost and latency", "Human oversight"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: ai-feature-spec
+tags:
+  - model/draft-content

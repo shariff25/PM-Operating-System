@@ -1,0 +1,31 @@
+# seed: replace with case cards
+# Numbers come from tools, never from the model's arithmetic. The experiment-design skill
+# calls stats.sample_size (docs/toolserver.md, "The stats tools") with metric proportion,
+# baseline 0.10, mde 0.10 relative, and the defaults (alpha 0.05, power 0.8, two-sided, two
+# arms), and writes the tool's per-arm number under "Sample size and duration".
+#
+# The expected number, from the spec's formula (docs/pm-craft-spec.md §5), with p1 = 0.10,
+# p2 = 0.11, z(0.975) = 1.959964 and z(0.8) = 0.841621:
+#   n = (1.959964 + 0.841621)² × (0.10 × 0.90 + 0.11 × 0.89) / 0.01²
+#     = 7.848879 × 0.1879 / 0.0001 = 14,748.04, rounded up: 14,749 per arm (29,498 in all).
+# Matching drops thousands separators, so "14749" matches "14,749" and "14749".
+id: numbers-sample-size-from-tool
+ask: "Draft anyway, no questions: an experiment plan in the PM space for a redesigned key export button in the Acme Vault console. The baseline conversion rate is 10%, and we want to detect a 10% relative lift, with the default significance level and power, in two arms."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include:
+        - "Experiment:"
+        - "Sample size and duration"
+        - "14749"  # value: confirm against stats.sample_size
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: experiment-design
+tags:
+  - model/draft-content

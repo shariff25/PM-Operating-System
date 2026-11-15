@@ -5,7 +5,7 @@
 # handle:    the PM OS handle; matches master/people/<handle>/ if that folder exists
 # slack-id:  the Slack member id (Profile → ⋯ → Copy member ID), such as U012AB3CD
 # email:     the PM's Atlassian account email; needed to connect Jira and Confluence
-# github:    optional GitHub login in the Fortanix org; else a verified GitHub email must match
+# github:    optional GitHub login in your GitHub org; else a verified GitHub email must match
 # roles:     pm, skill-author, admin (admin = platform owner)
 #
 # Linking an account checks it belongs to the PM listed here: the Slack member id for

@@ -1,0 +1,13 @@
+# Product ids for filtering docs search. A page belongs to the first product whose
+# keywords appear in its title or URL path; otherwise it is `general`.
+#
+# Copy this file (for example to config/docs-products.yaml), list your own products, and
+# point PMOS_DOCS_PRODUCTS at it. Ids are lowercase letters, digits and `-`, unique, and
+# not `general`. Keywords match whole words, ignoring case; put more specific products first.
+products:
+  - id: vault
+    name: Acme Vault
+    keywords: [vault]
+  - id: cloud
+    name: Acme Cloud
+    keywords: [cloud]

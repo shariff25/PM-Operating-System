@@ -1,0 +1,22 @@
+# seed: replace with case cards
+# Fixture: page 9001 (customers asked for audit export). No fixture holds customer counts or
+# prices, so the ask carries the assumptions. The opportunity-sizing skill titles its draft
+# `Sizing: …` and follows content/templates/opportunity-sizing.md: Estimate, Method,
+# Assumptions, Sensitivity, What would change it.
+id: structure-opportunity-sizing
+ask: "Draft anyway, no questions: an opportunity sizing in the PM space for audit log export in Acme Vault, from the October Acme Cloud call notes (Confluence page 9001). Assume 400 enterprise customers, a quarter of whom need audit export, at 6,000 dollars a year each."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Sizing:", "Method", "Assumptions", "Sensitivity", "What would change it"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: opportunity-sizing
+tags:
+  - model/draft-content

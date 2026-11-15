@@ -117,8 +117,8 @@ it may do. Anything else is `403`.
 | --- | --- |
 | `slack` | create tasks (source `slack` or `cli`), read its PM's own tasks and their events, the notification feed, and its PM's routines (parse, create, list, change, delete) |
 | `worker` | claim, heartbeat, events, trace, complete, fail |
-| `console` | read everything, including traces; pause, resume and delete routines; cancel tasks |
-| `evals` | create tasks with `source: "eval"`, and read eval tasks and their events |
+| `console` | read everything, including traces and drafts; pause, resume and delete routines; cancel tasks |
+| `evals` | create tasks with `source: "eval"`, and read eval tasks, their events and their drafts |
 
 - **The Slack client acts for one PM per call**, named in `X-Pmos-User` (a PM OS handle). The
   call is `400` without it. Another PM's task or routine answers `404`, the same as one that
@@ -183,10 +183,28 @@ sends a `needs_approval` notification with the ids.
   `approval_closed` notification says what happened, such as "jira.create_issue was approved
   by ana; slack.send_message was rejected by ana." Its `outcomes` lists each item's `tool`,
   `status` and `decided_by`.
+- **Closed states:** `approved`, `rejected`, `failed`, and `expired`: a Slack draft nobody
+  decided within `PMOS_SLACK_DRAFT_TTL_HOURS` (24 hours; `docs/toolserver.md`, **Slack
+  drafts**). An expired item reads "slack.post_reply expired undecided; nothing was sent",
+  with no `decided_by`.
 - **Lost items:** an id the tool server no longer knows counts as closed ("no longer in the
   approval queue"), so a task can't wait forever.
 - **Outages:** if the tool server can't answer, the check is simply tried again on the next
   tick.
+
+**Drafts** (`docs/improvement-loop-spec.md` §3). `GET /v1/tasks/{id}/drafts` returns
+`{drafts: [{id, tool, args, status}]}`, one per approval id the worker reported, in that order.
+- **Who may call it:** the `console` (any task) and `evals` (eval tasks only; another task is
+  `404`). Slack and workers get `403`.
+- **Where it comes from:** the runtime reads each item from the tool server
+  (`GET /internal/approvals/{id}`) with its own service token, so the evals client never holds
+  a tool-server token. `args` are the item's arguments as they stand (the edited ones once a
+  PM edited them); `status` is the item's (`pending`, `executing`, `approved`, `rejected`,
+  `failed`, `expired`). A Slack draft's text reads `"[expired]"` once it expired, or a day
+  after its decision.
+- **Lost items** read `{"id": …, "tool": null, "args": null, "status": "missing"}`.
+- **Outages:** if the tool server can't answer, the call is `503`, never a partial list.
+- A task that drafted nothing, or hasn't finished, has `{"drafts": []}`.
 
 ## Notifications
 `GET /v1/notifications?after=<cursor>&wait_ms=<ms>` (Slack only) returns

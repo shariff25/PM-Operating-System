@@ -16,8 +16,7 @@ use pmos_evals::spec::load_category;
 use pmos_evals::tag::Tag;
 use serde_json::json;
 
-const PAGE: &str =
-    "https://support.fortanix.com/docs/fortanix-data-security-manager-port-requirements";
+const PAGE: &str = "https://docs.example.com/docs/acme-vault-port-requirements";
 
 fn task(id: &str, ask: &str, extra: &str) -> (String, String) {
     (
@@ -35,7 +34,7 @@ fn scripted(mock: &Mock) -> Vec<(String, String)> {
     );
     let tool_call = entry(
         "tool_call",
-        json!({"tool": "docs.search", "args": {"query": "dsm ports"}}),
+        json!({"tool": "docs.search", "args": {"query": "vault ports"}}),
     );
     mock.script(
         "q-pass",
@@ -54,7 +53,7 @@ fn scripted(mock: &Mock) -> Vec<(String, String)> {
     );
     mock.script("q-tool", Script {
         result: Some("KMIP is on 5696.".into()),
-        trace: vec![tool_call.clone(), entry("tool_result", json!({"tool": "docs.search", "content": [{"url": "https://support.fortanix.com/docs/other"}]}))],
+        trace: vec![tool_call.clone(), entry("tool_result", json!({"tool": "docs.search", "content": [{"url": "https://docs.example.com/docs/other"}]}))],
         ..Script::default()
     });
     mock.script(
@@ -127,6 +126,10 @@ fn opts(timeout_ms: u64) -> RunOptions {
         note: Some("test run".into()),
         gateway_workarounds: Some("off".into()),
         only: Vec::new(),
+        repeats: 1,
+        decline_phrases: vec!["don't answer".into()],
+        judges: None,
+        judges_skipped: None,
     }
 }
 
@@ -176,7 +179,7 @@ async fn full_run_grades_tags_and_writes_reports() {
     sorted.sort();
     assert_eq!(ids, sorted);
     assert_eq!(report.passed(), 2);
-    assert!(!report.met_bar());
+    assert_eq!(report.met_bar(), Some(false));
     assert_eq!(report.failures_by_tag()[0], (Tag::Harness, 2));
 
     // Timings come from the runtime's clock: ~20 ms queued, ~50 ms in all.
@@ -195,7 +198,7 @@ async fn full_run_grades_tags_and_writes_reports() {
         "{text}"
     );
     assert!(
-        text.contains("| `t-tool` | **FAIL** | tool (`page-not-retrieved`)"),
+        text.contains("| `t-tool` | **FAIL** | tool/page-not-retrieved (`page-not-retrieved`)"),
         "{text}"
     );
     assert!(text.contains("`off` (declared by the runner's environment)"));
@@ -373,6 +376,7 @@ async fn cli_run_history_and_check() {
     let dir = tempfile::tempdir().unwrap();
     let (id, yaml) = task("t-pass", "q-pass", "  approvals: 0\n");
     write_category(dir.path(), "cat", "docs", 1.0, &[(id.as_str(), yaml)]);
+    common::write_taxonomy(dir.path());
     let root = dir.path().to_path_buf();
 
     let bin = env!("CARGO_BIN_EXE_pmos-evals");

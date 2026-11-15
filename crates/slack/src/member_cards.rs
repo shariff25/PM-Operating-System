@@ -35,7 +35,7 @@ pub const HANDLE_BLOCK: &str = "handle";
 pub const REPO_BLOCK: &str = "repo";
 
 /// What someone outside `team.yaml` is told, with the button.
-pub const NOT_A_MEMBER: &str = "PM OS is for the Fortanix product team.";
+pub const NOT_A_MEMBER: &str = "PM OS is for the product team.";
 
 const SECTION_MAX: usize = 2900;
 
@@ -343,6 +343,10 @@ pub fn valid_repo(repo: &str) -> bool {
 /// The memory-repo modal, prefilled with `<org>/pm-os-memory-<handle>` when the org is
 /// configured. `channel` and `ts` are the checklist's, to refresh it after.
 pub fn memory_modal(handle: &str, org: Option<&str>, channel: &str, ts: &str) -> Value {
+    let create_in = match org.filter(|o| valid_repo(&format!("{o}/x"))) {
+        Some(org) => format!("Create it in the `{org}` GitHub org as a *private* repo first."),
+        None => "Create it in your GitHub org as a *private* repo first.".into(),
+    };
     let suggested = format!("pm-os-memory-{handle}");
     let mut input = json!({
         "type": "plain_text_input",
@@ -370,16 +374,19 @@ pub fn memory_modal(handle: &str, org: Option<&str>, channel: &str, ts: &str) ->
                 "label": {"type": "plain_text", "text": "Repo (org/name)"},
                 "element": input,
             },
-            context("Create it in the Fortanix org as a *private* repo first."),
+            context(&create_in),
         ],
     })
 }
 
 /// A memory-repo refusal as a plain sentence, for the modal's field error.
 pub fn memory_error(code: Option<&str>, error: &str, org: Option<&str>) -> String {
-    let org = org.unwrap_or("Fortanix");
+    let org = org.map_or_else(
+        || "your GitHub org".to_string(),
+        |o| format!("the {o} GitHub org"),
+    );
     match code {
-        Some("not_in_org") => format!("That repo isn't in the {org} GitHub org. Create it there."),
+        Some("not_in_org") => format!("That repo isn't in {org}. Create it there."),
         Some("not_private") => {
             "That repo is public. Make it private, or create a private one.".into()
         }
@@ -476,7 +483,7 @@ mod tests {
     fn request() -> Value {
         json!({
             "id": "0d3f6c1e-0000-4000-8000-000000000001", "slack_id": "U0BEN",
-            "email": "ben<x>@fortanix.com", "name": "Ben *Bold* <script>",
+            "email": "ben<x>@example.com", "name": "Ben *Bold* <script>",
             "proposed_handle": "ben", "status": "pending",
         })
     }
@@ -486,7 +493,7 @@ mod tests {
         let (_, blocks) = request_card(&request());
         let s = blocks.to_string();
         assert!(s.contains("Ben *Bold* &lt;script&gt;"), "{s}");
-        assert!(s.contains("ben&lt;x&gt;@fortanix.com"));
+        assert!(s.contains("ben&lt;x&gt;@example.com"));
         assert!(s.contains("(<@U0BEN>)"));
         assert!(s.contains("`ben`"));
         for a in [action::APPROVE, action::EDIT, action::REJECT] {
@@ -548,10 +555,10 @@ mod tests {
         assert!(s.contains(action::SETUP_REFRESH));
         assert!(!s.contains("All set"));
         setup.links = PROVIDERS_LINKED.to_vec();
-        setup.memory_repo = Some("fortanix/pm-os-memory-ben".into());
+        setup.memory_repo = Some("example-org/pm-os-memory-ben".into());
         setup.bot_ready = true;
         let s = checklist(&setup).1.to_string();
-        assert!(s.contains("`fortanix/pm-os-memory-ben`"));
+        assert!(s.contains("`example-org/pm-os-memory-ben`"));
         assert!(s.contains("5. :white_check_mark: *Your bot* `pm-ben`"));
         assert!(s.contains("All set"));
         assert!(!s.contains(action::SETUP_MEMORY));
@@ -565,20 +572,22 @@ mod tests {
 
     #[test]
     fn memory_modal_and_errors() {
-        let m = memory_modal("ben", Some("fortanix"), "D1", "1.0");
+        let m = memory_modal("ben", Some("example-org"), "D1", "1.0");
         assert_eq!(
             m["blocks"][1]["element"]["initial_value"],
-            "fortanix/pm-os-memory-ben"
+            "example-org/pm-os-memory-ben"
         );
         assert!(m.to_string().contains("as a *private* repo first"));
         let m = memory_modal("ben", None, "D1", "1.0");
         assert!(m["blocks"][1]["element"]["initial_value"].is_null());
-        assert!(valid_repo("fortanix/pm-os-memory-ben"));
-        assert!(!valid_repo("fortanix"));
+        assert!(valid_repo("example-org/pm-os-memory-ben"));
+        assert!(!valid_repo("example-org"));
         assert!(!valid_repo("a/b/c"));
         assert!(!valid_repo("a/.."));
         assert!(memory_error(Some("not_private"), "", None).contains("public"));
-        assert!(memory_error(Some("not_in_org"), "", Some("acme")).contains("acme"));
+        assert!(memory_error(Some("not_in_org"), "", Some("other-org"))
+            .contains("the other-org GitHub org"));
+        assert!(memory_error(Some("not_in_org"), "", None).contains("isn't in your GitHub org"));
         assert_eq!(memory_error(None, "odd", None), "odd");
     }
 }

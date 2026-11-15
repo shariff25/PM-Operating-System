@@ -1,0 +1,24 @@
+# seed: replace with case cards
+# The review panel reads and answers in the thread; it never drafts or edits a page. Fixture:
+# page 9002 "PRD: Key export v2" in space PM, whose body is one line ("Past PRD used as an
+# exemplar."), so any honest review finds blockers. The review skill groups its findings
+# blocker, major, minor and ends with "The three changes that matter most"
+# (docs/pm-craft-spec.md §4).
+id: review-prd-by-severity
+ask: "Review the Key export v2 PRD (Confluence page 9002) with the review panel, and tell me what to fix first."
+expect:
+  approvals: 0
+  must_include:
+    - "blocker"
+    - "three changes"
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 0
+    - tool: confluence.update_page
+      count: 0
+cluster: review
+tags:
+  - model/missing-fact
+  - model/wrong-draft-count

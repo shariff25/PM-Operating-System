@@ -312,10 +312,15 @@ impl BotsStore for PgStore {
             .fetch_optional(&mut *tx)
             .await?;
         let Some(row) = row else {
+            tx.rollback().await?;
             return Ok(Err(Refused::NotFound));
         };
         let mut task = task_from_row(&row)?;
         if let Err(r) = apply(&mut task, change, now) {
+            // End the transaction now, so the row lock goes with it. A dropped transaction is
+            // rolled back only when its connection is next used, and until then a claim
+            // (`FOR UPDATE SKIP LOCKED`) would skip this task as if it weren't queued.
+            tx.rollback().await?;
             return Ok(Err(r));
         }
         sqlx::query(
@@ -587,11 +592,14 @@ impl BotsStore for PgStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         let Some(row) = row else {
+            tx.rollback().await?;
             return Ok(false);
         };
         let enabled: bool = row.try_get("enabled")?;
         let next: Option<DateTime<Utc>> = row.try_get("next_run_at")?;
         if !enabled || next != Some(run.due_at) {
+            // Release the routine's row lock at once (see `transition`).
+            tx.rollback().await?;
             return Ok(false);
         }
         sqlx::query(

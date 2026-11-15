@@ -58,6 +58,16 @@ services:
       PMOS_DOCS_BIND: 0.0.0.0:8730
       PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN:?}
       PMOS_DOCS_DATABASE_URL: postgresql://pmos_docs:${PMOS_DB_DOCS_PASSWORD}@postgres/pmos_docs
+      # Your docs site (docs/docs-server.md, "Pointing the Docs bot at your docs"). Blank
+      # PMOS_DOCS_BASE_URL: the server starts with an empty index and says no site is configured.
+      PMOS_DOCS_BASE_URL: ${PMOS_DOCS_BASE_URL:-}
+      PMOS_DOCS_NAME: ${PMOS_DOCS_NAME:-the public docs}
+      PMOS_DOCS_PAGE_PREFIXES: ${PMOS_DOCS_PAGE_PREFIXES:-/}
+      PMOS_DOCS_API_PREFIX: ${PMOS_DOCS_API_PREFIX:-}
+      # A path inside the container: the repo's config/ is mounted at /etc/pmos/config.
+      PMOS_DOCS_PRODUCTS: ${PMOS_DOCS_PRODUCTS:-}
+    volumes:
+      - ../config:/etc/pmos/config:ro
     depends_on: { postgres: { condition: service_healthy } }
     healthcheck: &health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8730/healthz"]
@@ -87,6 +97,7 @@ services:
       PMOS_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
       PMOS_DOCS_URL: http://docs.pmos.internal:8730/mcp
       PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN}
+      PMOS_LEDGER_EXPIRE_DAYS: ${PMOS_LEDGER_EXPIRE_DAYS:-7}
     volumes:
       # The content checkout: the tool server pulls it (content sync), the others read it.
       - ${PMOS_CONTENT_CHECKOUT:?}:/srv/content-repo
@@ -160,6 +171,10 @@ services:
       PMOS_SLACK_STATE_DIR: /var/lib/pmos/slack
       PMOS_DEFAULT_TZ: ${PMOS_DEFAULT_TZ:-America/Los_Angeles}
       PMOS_GITHUB_ORG: ${PMOS_GITHUB_ORG:-}
+      # The daily triage digest to each bot's quality owner (docs/runbooks/quality.md).
+      PMOS_TRIAGE_AT: ${PMOS_TRIAGE_AT:-09:00}
+      PMOS_TRIAGE_MIN_EDIT: ${PMOS_TRIAGE_MIN_EDIT:-0.3}
+      PMOS_CONSOLE_PUBLIC_URL: ${PMOS_CONSOLE_PUBLIC_URL:-}
     volumes:
       - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
       - ${PMOS_STATE_DIR}/slack:/var/lib/pmos/slack

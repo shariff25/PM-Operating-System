@@ -14,7 +14,10 @@ filesystem_policy:
     - /lib
     - /proc
     - /sandbox/master/AGENTS.md
+    - /sandbox/playbooks
+    - /sandbox/reviewers
     - /sandbox/skills/docs
+    - /sandbox/templates
     - /sandbox/tools.yaml
     - /usr
     - /var/log

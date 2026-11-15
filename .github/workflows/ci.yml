@@ -47,6 +47,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --locked -q -p pmos -- lint --root content
+      # The eval files: categories, tasks, the taxonomy, judges and every tag used
+      # (docs/evals.md). The benchmark runs themselves are the Spark's eval gate.
+      - run: cargo run --locked -q -p pmos-evals -- check --root evals --content content
       # Every bot's OpenShell policy is current and keeps the 0f rules (docs/sandbox-policies.md).
       - run: cargo run --locked -q -p pmos -- policy check --root content --policies policies
 

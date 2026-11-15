@@ -1,0 +1,25 @@
+# Does a pm-craft draft say how success will be measured? The bar's fourth check
+# (content/playbooks/bar.md): a metric with a number, a date and how it's measured, plus a
+# guardrail metric that must not get worse. The deterministic checks see that a "Success
+# metrics" or "Guardrail metrics" heading is there; this judge looks at what is under it.
+# The bar applies this check in a narrower form to documents that propose nothing to build
+# (its table "How the checks apply to narrower documents"); the judge doesn't grade those
+# forms and answers yes for such a draft.
+#
+# Advisory: it has no labels yet (metric-with-guardrail.labels.jsonl is empty), so it is
+# reported and never fails a run or the gate. It blocks only once calibrated on at least 100
+# labels with TPR and TNR of at least 0.8 (docs/runbooks/quality.md, "Calibrating a judge").
+name: metric-with-guardrail
+failure_mode: model/unmeasurable-outcome
+question: >-
+  Does the draft give a measurable outcome and a guardrail? Answer yes only if it names at
+  least one success metric with a target number, a date and how it is measured, and at least
+  one guardrail metric that must not get worse. Answer no if the outcome has no number, no
+  date or no way to measure it, or if there is no guardrail metric. A target the draft openly
+  lists as an open question still counts as missing. If the output contains no draft, or the
+  draft only describes or sizes a problem and proposes nothing to build, change or test (a
+  problem statement, a call synthesis, a competitive brief, an opportunity sizing), answer
+  yes.
+alias: pmos/extraction
+applies_to: [pm-craft]
+labels: metric-with-guardrail.labels.jsonl

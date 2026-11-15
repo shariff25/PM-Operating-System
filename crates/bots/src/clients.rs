@@ -1,9 +1,10 @@
-//! The two services the runtime calls: the tool server (bot sessions, approval status) and
+//! The two services the runtime calls: the tool server (bot sessions, approval items) and
 //! the gateway (the model, for parsing routines).
 
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -45,9 +46,35 @@ pub struct ApprovalState {
 }
 
 impl ApprovalState {
-    /// Still waiting for a PM, or approved and being written.
+    /// Still waiting for a PM, or approved and being written. Every other state is closed:
+    /// `approved`, `rejected`, `failed`, and `expired` (a Slack draft nobody decided within a
+    /// day).
     pub fn is_open(&self) -> bool {
         matches!(self.status.as_str(), "pending" | "executing")
+    }
+}
+
+/// One drafted outbound action, for `GET /v1/tasks/{id}/drafts`: the approval item's tool,
+/// arguments (as they stand: edited ones once a PM edited them) and status. An item the tool
+/// server no longer has reads `missing`, with no tool or arguments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskDraft {
+    pub id: String,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub args: Option<Value>,
+    pub status: String,
+}
+
+impl TaskDraft {
+    pub fn missing(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            tool: None,
+            args: None,
+            status: "missing".into(),
+        }
     }
 }
 
@@ -108,8 +135,18 @@ impl ToolServer {
         ))
     }
 
-    /// One approval item, or `None` if the tool server doesn't have it.
+    /// One approval item's state, or `None` if the tool server doesn't have it.
     pub async fn approval(&self, id: &str) -> Result<Option<ApprovalState>, CallError> {
+        self.approval_as(id).await
+    }
+
+    /// One approval item as a draft, or `None` if the tool server doesn't have it.
+    pub async fn draft(&self, id: &str) -> Result<Option<TaskDraft>, CallError> {
+        self.approval_as(id).await
+    }
+
+    /// `GET /internal/approvals/{id}`, read as `T`.
+    async fn approval_as<T: DeserializeOwned>(&self, id: &str) -> Result<Option<T>, CallError> {
         if !valid_approval_id(id) {
             return Ok(None);
         }
@@ -240,6 +277,20 @@ mod tests {
             .is_open()
         };
         assert!(open("pending") && open("executing"));
-        assert!(!open("approved") && !open("rejected") && !open("failed"));
+        assert!(!open("approved") && !open("rejected") && !open("failed") && !open("expired"));
+    }
+
+    #[test]
+    fn drafts_read_from_approval_items() {
+        let item = json!({"id": "apr_1", "user": "ana", "bot": "docs", "run_id": "tsk_1",
+            "tool": "jira.create_issue", "args": {"summary": "x"}, "args_hash": "h",
+            "status": "pending", "created_at": "2026-11-14T10:00:00Z"});
+        let draft: TaskDraft = serde_json::from_value(item).unwrap();
+        assert_eq!(draft.tool.as_deref(), Some("jira.create_issue"));
+        assert_eq!(draft.args, Some(json!({"summary": "x"})));
+        assert_eq!(
+            serde_json::to_value(TaskDraft::missing("apr_2")).unwrap(),
+            json!({"id": "apr_2", "tool": null, "args": null, "status": "missing"})
+        );
     }
 }

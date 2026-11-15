@@ -94,6 +94,11 @@ pub const CONTENT_MOUNT: &str = "/sandbox";
 /// The tool registry, uploaded with the content: the worker reads it at start-up to tell a
 /// bot's read tools from its writes. It holds only tool names, systems and kinds.
 pub const TOOL_REGISTRY: &str = "tools.yaml";
+
+/// Team-wide craft content the harness mounts read-only whenever the content repo has it:
+/// the templates skills draft from, the reviewer rubrics and the playbooks
+/// (`harness/src/agent.ts`, `READ_ONLY_CONTENT_DIRS`). None of it carries a data class.
+pub const SHARED_CONTENT_DIRS: [&str; 3] = ["templates", "reviewers", "playbooks"];
 /// The bot's own writable workspace, and the working directory its worker runs in.
 pub const WORKSPACE: &str = "/sandbox/workspace";
 

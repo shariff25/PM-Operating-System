@@ -347,23 +347,23 @@ mod tests {
     #[test]
     fn repo_checks_in_order() {
         assert_eq!(
-            check_repo(&info("Fortanix", true, false, true), "fortanix"),
+            check_repo(&info("Example-Org", true, false, true), "example-org"),
             Ok(())
         );
         assert_eq!(
-            check_repo(&info("other", true, false, true), "fortanix"),
+            check_repo(&info("other", true, false, true), "example-org"),
             Err(RepoProblem::NotInOrg)
         );
         assert_eq!(
-            check_repo(&info("fortanix", false, false, true), "fortanix"),
+            check_repo(&info("example-org", false, false, true), "example-org"),
             Err(RepoProblem::NotPrivate)
         );
         assert_eq!(
-            check_repo(&info("fortanix", true, true, true), "fortanix"),
+            check_repo(&info("example-org", true, true, true), "example-org"),
             Err(RepoProblem::Archived)
         );
         assert_eq!(
-            check_repo(&info("fortanix", true, false, false), "fortanix"),
+            check_repo(&info("example-org", true, false, false), "example-org"),
             Err(RepoProblem::NoPush)
         );
     }
@@ -371,12 +371,16 @@ mod tests {
     #[test]
     fn notes_round_trip_through_their_files() {
         let now: DateTime<Utc> = "2026-11-14T10:00:00Z".parse().unwrap();
-        let file = render_note("CCM, DSM\n---\nmore", "pm-ana, task \"7\"", now);
+        let file = render_note(
+            "Acme Cloud, Acme Vault\n---\nmore",
+            "pm-ana, task \"7\"",
+            now,
+        );
         assert!(file.starts_with(
             "---\nupdated: 2026-11-14T10:00:00Z\nsource: \"pm-ana, task \\\"7\\\"\"\n---\n"
         ));
         let note = parse_note("areas", &file);
-        assert_eq!(note.text, "CCM, DSM\n---\nmore");
+        assert_eq!(note.text, "Acme Cloud, Acme Vault\n---\nmore");
         assert_eq!(note.updated_at, now);
         let by_hand = parse_note("x", "just text");
         assert_eq!(by_hand.text, "just text");

@@ -13,57 +13,79 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::{json, Map, Value};
 
-use crate::page::PRODUCTS;
+use crate::page::{Products, Site};
 use crate::store::DocsStore;
 
-/// `get_doc` returns at most this many characters of markdown.
 /// The most of a page `get_doc` returns: enough for any guide's substance, small enough to
 /// share a local model's context with other sessions.
 pub const MAX_DOC_CHARS: usize = 12_000;
 pub const MAX_RESULTS: u64 = 10;
 
+/// What `search_docs` and `list_products` say, as a `note`, when no docs site is
+/// configured; `get_doc` fails with it (code `not_configured`).
+pub const NOT_CONFIGURED_NOTE: &str =
+    "No docs site is configured; ask a platform owner to set PMOS_DOCS_BASE_URL.";
+
 #[derive(Clone)]
 pub struct DocsMcp {
     store: Arc<dyn DocsStore>,
-    /// `https://support.fortanix.com`, to turn page links into indexed `.md` URLs.
-    base: String,
+    /// How tools name the site, such as "the public docs".
+    name: String,
+    /// The site, to turn page links into indexed `.md` URLs. `None`: no site configured.
+    site: Option<Site>,
+    products: Products,
 }
 
 impl DocsMcp {
-    pub fn new(store: Arc<dyn DocsStore>, base: impl Into<String>) -> Self {
+    pub fn new(
+        store: Arc<dyn DocsStore>,
+        name: impl Into<String>,
+        site: Option<Site>,
+        products: Products,
+    ) -> Self {
         Self {
             store,
-            base: base.into(),
+            name: name.into(),
+            site,
+            products,
         }
     }
 
-    fn products() -> Vec<&'static str> {
-        let mut p: Vec<&str> = PRODUCTS.iter().map(|(name, _)| *name).collect();
-        p.push("general");
-        p
+    /// "the public docs (https://docs.example.com)", or a note that there is no site.
+    fn named_site(&self) -> String {
+        match &self.site {
+            Some(site) => format!("{} ({})", self.name, site.base),
+            None => format!("{} (no docs site is configured yet)", self.name),
+        }
     }
 
-    pub fn tools() -> Vec<Tool> {
+    pub fn tools(&self) -> Vec<Tool> {
         let schema = |v: Value| Arc::new(v.as_object().cloned().unwrap_or_default());
         vec![
             Tool::new(
                 "search_docs",
-                "Search the Fortanix support documentation (support.fortanix.com). Returns titles, links, products and snippets.",
+                format!(
+                    "Search {}. Returns titles, links, products and snippets.",
+                    self.named_site()
+                ),
                 schema(json!({
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "What to look for"},
-                        "product": {"type": "string", "enum": Self::products()},
+                        "product": {"type": "string", "enum": self.products.ids()},
                         "limit": {"type": "integer", "minimum": 1, "maximum": MAX_RESULTS, "description": "Default 5"},
                     },
                     "required": ["query"],
                     "additionalProperties": false,
                 })),
             )
-            .annotate(ToolAnnotations::with_title("Search support docs").read_only(true).open_world(false)),
+            .annotate(ToolAnnotations::with_title("Search the docs").read_only(true).open_world(false)),
             Tool::new(
                 "get_doc",
-                "Read one indexed support page as markdown, by the url a search returned.",
+                format!(
+                    "Read one indexed page of {} as markdown, by the url a search returned.",
+                    self.name
+                ),
                 schema(json!({
                     "type": "object",
                     "properties": {"url": {"type": "string"}},
@@ -71,10 +93,10 @@ impl DocsMcp {
                     "additionalProperties": false,
                 })),
             )
-            .annotate(ToolAnnotations::with_title("Read a support page").read_only(true).open_world(false)),
+            .annotate(ToolAnnotations::with_title("Read a docs page").read_only(true).open_world(false)),
             Tool::new(
                 "list_products",
-                "List the product labels in the index, with page counts.",
+                "List the product labels in the index, with names and page counts.",
                 schema(json!({"type": "object", "properties": {}, "additionalProperties": false})),
             )
             .annotate(ToolAnnotations::with_title("List products").read_only(true).open_world(false)),
@@ -82,13 +104,10 @@ impl DocsMcp {
     }
 
     /// The indexed `.md` URL for a link people may paste: the page URL or its `.md` form.
-    fn index_url(&self, url: &str) -> Option<String> {
-        let (prefix, slug) = crate::page::page_path(url.trim(), &self.base)?;
+    fn index_url(site: &Site, url: &str) -> Option<String> {
+        let (prefix, slug) = site.page_path(url.trim())?;
         let slug = slug.strip_suffix(".md").unwrap_or(slug);
-        Some(format!(
-            "{}{prefix}{slug}.md",
-            self.base.trim_end_matches('/')
-        ))
+        Some(format!("{}{prefix}{slug}.md", site.base))
     }
 
     pub async fn call(&self, name: &str, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
@@ -112,15 +131,14 @@ impl DocsMcp {
                     .and_then(Value::as_str)
                     .filter(|q| !q.trim().is_empty())
                     .ok_or("`query` is required")?;
+                let ids = self.products.ids();
                 let product = match args.get("product") {
                     None | Some(Value::Null) => None,
-                    Some(Value::String(p)) if Self::products().contains(&p.as_str()) => {
-                        Some(p.as_str())
-                    }
+                    Some(Value::String(p)) if ids.contains(&p.as_str()) => Some(p.as_str()),
                     Some(_) => {
                         return Err(ToolFailure::bad_args(format!(
                             "`product` must be one of {}",
-                            Self::products().join(", ")
+                            ids.join(", ")
                         )))
                     }
                 };
@@ -131,6 +149,9 @@ impl DocsMcp {
                         .filter(|n| (1..=MAX_RESULTS).contains(n))
                         .ok_or(format!("`limit` must be 1–{MAX_RESULTS}"))?,
                 };
+                if self.site.is_none() {
+                    return Ok(json!({"count": 0, "results": [], "note": NOT_CONFIGURED_NOTE}));
+                }
                 let hits = self
                     .store
                     .search(query, product, limit as usize)
@@ -154,9 +175,16 @@ impl DocsMcp {
                     .get("url")
                     .and_then(Value::as_str)
                     .ok_or("`url` is required")?;
-                let url = self
-                    .index_url(given)
-                    .ok_or("only support.fortanix.com/docs and /apidocs pages can be read")?;
+                let Some(site) = &self.site else {
+                    return Err(ToolFailure::not_configured(NOT_CONFIGURED_NOTE));
+                };
+                let url = Self::index_url(site, given).ok_or_else(|| {
+                    ToolFailure::bad_args(format!(
+                        "only pages of {} under {} can be read",
+                        self.name,
+                        site.describe()
+                    ))
+                })?;
                 let page = self
                     .store
                     .get(&url)
@@ -179,14 +207,45 @@ impl DocsMcp {
                 }))
             }
             _ => {
-                let products = self.store.products().await.map_err(storage)?;
-                Ok(json!({ "products": products }))
+                // Every configured id (and `general`) with its page count, then any label
+                // still in the index from an earlier products file (until the next sync).
+                let counts = self.store.products().await.map_err(storage)?;
+                let pages = |id: &str| {
+                    counts
+                        .iter()
+                        .find(|c| c.product == id)
+                        .map_or(0, |c| c.pages)
+                };
+                let ids = self.products.ids();
+                let listed = ids
+                    .iter()
+                    .copied()
+                    .chain(
+                        counts
+                            .iter()
+                            .map(|c| c.product.as_str())
+                            .filter(|p| !ids.contains(p)),
+                    )
+                    .map(|id| {
+                        json!({
+                            "product": id,
+                            "name": self.products.name_of(id),
+                            "pages": pages(id),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut out = json!({ "products": listed });
+                if self.site.is_none() {
+                    out["note"] = json!(NOT_CONFIGURED_NOTE);
+                }
+                Ok(out)
             }
         }
     }
 }
 
-/// Why a tool call failed: `code` is one of `bad_args`, `not_found` or `unavailable`.
+/// Why a tool call failed: `code` is one of `bad_args`, `not_found`, `unavailable` or
+/// `not_configured` (no docs site is set up).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolFailure {
     pub code: &'static str,
@@ -212,6 +271,12 @@ impl ToolFailure {
             message: message.into(),
         }
     }
+    pub fn not_configured(message: impl Into<String>) -> Self {
+        Self {
+            code: "not_configured",
+            message: message.into(),
+        }
+    }
 }
 
 impl From<String> for ToolFailure {
@@ -230,10 +295,17 @@ impl ServerHandler for DocsMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("pmos-docs", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "Search and read the public Fortanix support documentation. Cite the url of \
-                 every page you use.",
-            )
+            .with_instructions(match &self.site {
+                Some(_) => format!(
+                    "Search and read {}. Cite the url of every page you use.",
+                    self.named_site()
+                ),
+                None => format!(
+                    "Search and read {}. No docs site is configured yet, so searches return \
+                     nothing; say so rather than answering from memory.",
+                    self.name
+                ),
+            })
     }
 
     async fn list_tools(
@@ -241,7 +313,7 @@ impl ServerHandler for DocsMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(Self::tools()))
+        Ok(ListToolsResult::with_all_items(self.tools()))
     }
 
     async fn call_tool(

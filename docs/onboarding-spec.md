@@ -5,7 +5,7 @@ the Slack bot. Decided 2026-11-14:
 - **The bot handles onboarding.** A platform owner (`admin` in `team.yaml`) approves each new
   member in Slack. The tool server then commits the new `team.yaml` to the content repo, so git
   stays the source of truth and the commit records who approved.
-- **Personal memory lives in each PM's own private repo in the Fortanix GitHub org.**
+- **Personal memory lives in each PM's own private repo in your GitHub org.**
 - **Latency is not a priority.** The load test reports numbers but doesn't gate Gate 1.
 
 Shared helpers are in `pmos_contract::onboarding`:
@@ -28,7 +28,7 @@ The tool server never uses an installation token.
   - Repository: Contents read/write and Metadata read.
   - Account: Email addresses read.
   - Organization: Members read.
-- **Installed on:** the Fortanix org, on all repositories or on the repos PM OS uses.
+- **Installed on:** your GitHub org, on all repositories or on the repos PM OS uses.
 - **Why user tokens are safe:** GitHub limits a user token to what that PM can already reach.
 
 **Configuration** (live mode):
@@ -36,7 +36,7 @@ The tool server never uses an installation token.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `PMOS_GITHUB_CLIENT_ID`, `PMOS_GITHUB_CLIENT_SECRET` | required for GitHub | From the GitHub App; without them, GitHub linking and `PMOS_MEMORY=github` are off |
-| `PMOS_GITHUB_ORG` | required with GitHub | The Fortanix org login. Memory repos and the content repo must be in it. |
+| `PMOS_GITHUB_ORG` | required with GitHub | Your GitHub org's login. Memory repos and the content repo must be in it. |
 | `PMOS_GITHUB_URL` | `https://api.github.com` | API base, for mocks |
 | `PMOS_GITHUB_AUTH_URL` | `https://github.com` | `/login/oauth/authorize` and `/login/oauth/access_token`, for mocks |
 | `PMOS_CONTENT_REPO` | none | `org/name` of the content repo. Required for approving members. |
@@ -186,7 +186,7 @@ source: "pm-ana, task 0d3f…"   # the bot (or skill) and the run id that wrote 
   ```json
   {"member": true, "handle": "ana", "admin": false,
    "linked": {"atlassian": true, "slack": false, "github": true},
-   "memory_repo": "fortanix/pm-os-memory-ana" | null,
+   "memory_repo": "example-org/pm-os-memory-ana" | null,
    "personal_bot": "pm-ana" | null,          // the bot exists in the loaded content
    "pending_request": null | {request}}       // only for a non-member, by slack_id
   ```
@@ -217,7 +217,7 @@ source: "pm-ana, task 0d3f…"   # the bot (or skill) and the run id that wrote 
 `users:read.email` and `im:write`.
 
 **Someone not in `team.yaml` DMs PM OS, or uses `/docs`:**
-- **The note:** "PM OS is for the Fortanix product team." with a **Request access** button
+- **The note:** "PM OS is for the product team." with a **Request access** button
   (`action_id: pmos_request_access`).
 - **Click:** call `users.info` for their `real_name` and `profile.email`. With no email, say so
   and stop. Otherwise `POST /internal/members/requests`, then reply "Sent to the platform owners.
@@ -251,7 +251,7 @@ source: "pm-ana, task 0d3f…"   # the bot (or skill) and the run id that wrote 
   2. **Slack** (so drafts post as you): ✅, or a **Connect** URL button (`slack`).
   3. **GitHub** (for your memory): ✅, or a **Connect** URL button (`github`).
   4. **Memory repo:** ✅ with `org/name`, or a **Set memory repo** button. It opens a modal
-     prefilled with `<org>/pm-os-memory-<handle>`, with help text: "Create it in the Fortanix
+     prefilled with `<org>/pm-os-memory-<handle>`, with help text: "Create it in your
      org as a **private** repo first." The org comes from `PMOS_GITHUB_ORG` in the Slack config,
      or is left for the PM to type. On submit, call `POST /internal/memory/repo`. Show its
      `422` and `409` codes as plain sentences in the modal's field error.

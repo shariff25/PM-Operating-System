@@ -2,31 +2,45 @@
  * Builds the PM OS team-service agent on Deep Agents.
  *
  * - Model: an open-weight model behind the PM OS gateway (OpenAI-compatible endpoint).
- * - Content: only what the agent needs is mounted, read-only: `/content/skills/` and
- *   `/content/master/` (the team `AGENTS.md` and this PM's own). The context library is NOT
+ * - Content: only what the agent needs is mounted, read-only: `/content/skills/`,
+ *   `/content/master/` (the team `AGENTS.md` and this PM's own), and the templates,
+ *   reviewer rubrics and playbooks the skills read. The context library is NOT
  *   mounted: it is reachable only through the tool server's `context_search`/`context_read`,
  *   which enforce the skill's data-class ceiling. Everything else the agent writes goes to
  *   per-run scratch state.
  * - Skills: `/content/skills/` (SKILL.md, loaded on demand).
  * - Master context: the team `AGENTS.md`, then the PM's personal one if present (CTX-3).
+ * - Review panel: a role with the `review` skill gets one sub-agent per reviewer rubric in
+ *   `content/reviewers/`, with the session's read tools only (`docs/pm-craft-spec.md` §4).
  * - Approvals: a pause before every write tool in `content/tools.yaml` (OUT-4), unless
  *   `interruptOnWrites` is off. The bot worker turns it off: its writes go to the tool server,
  *   which returns `pending_approval` and waits for the PM's Slack card instead.
  */
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync } from "node:fs";
+import {
+  copyFileSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import type { StructuredToolInterface } from "@langchain/core/tools";
+import type { StructuredTool, StructuredToolInterface } from "@langchain/core/tools";
 import type { BaseCheckpointSaver } from "@langchain/langgraph";
 import { ChatOpenAI } from "@langchain/openai";
 import {
   CompositeBackend,
   FilesystemBackend,
   StateBackend,
+  type SubAgent,
   createDeepAgent,
 } from "deepagents";
-import { buildInterruptOn, loadToolRegistry } from "./registry.js";
+import { parse as parseYaml } from "yaml";
+import { buildInterruptOn, harnessToolNames, loadToolRegistry } from "./registry.js";
 
 /** Virtual mount point of the content repo inside the agent's filesystem. */
 export const CONTENT_MOUNT = "/content/";
@@ -38,6 +52,8 @@ export const CONTENT_MOUNT = "/content/";
 export const MODEL_ALIASES = {
   default: "pmos/default",
   extraction: "pmos/extraction",
+  /** The PM assistant's drafting and critique. */
+  reasoning: "pmos/reasoning",
 } as const;
 export type ModelRole = keyof typeof MODEL_ALIASES;
 
@@ -163,6 +179,58 @@ export function stageSkills(
   return staged;
 }
 
+/**
+ * Content folders mounted read-only as they are, each only if it exists in the content repo:
+ * the templates skills draft from, the reviewer rubrics and the playbooks.
+ */
+export const READ_ONLY_CONTENT_DIRS = ["templates", "reviewers", "playbooks"] as const;
+
+/** The skill that runs the review panel; a role with it gets the reviewer sub-agents. */
+export const REVIEW_SKILL = "review";
+
+/** Split a markdown file into its YAML front matter and body. */
+function splitFrontMatter(text: string, path: string): { meta: unknown; body: string } {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(text);
+  if (!match) {
+    throw new Error(`${path} has no front matter`);
+  }
+  return { meta: parseYaml(match[1] ?? ""), body: text.slice(match[0].length) };
+}
+
+/**
+ * One review sub-agent per rubric in `content/reviewers/` (`README.md` aside): named by the
+ * file stem, described by its `lens`, prompted with the rubric body, and given only
+ * `readTools`, so no reviewer can write, draft or approve. Empty when there is no
+ * reviewers folder.
+ */
+export function reviewerSubagents(
+  contentRoot: string,
+  readTools: readonly StructuredToolInterface[],
+): SubAgent[] {
+  const dir = join(contentRoot, "reviewers");
+  if (!existsSync(dir)) {
+    return [];
+  }
+  return readdirSync(dir)
+    .filter((file) => file.endsWith(".md") && file !== "README.md")
+    .sort()
+    .map((file) => {
+      const path = join(dir, file);
+      const { meta, body } = splitFrontMatter(readFileSync(path, "utf8"), path);
+      const lens = (meta as { lens?: unknown } | null)?.lens;
+      if (typeof lens !== "string" || lens.trim() === "") {
+        throw new Error(`reviewer ${path} has no lens`);
+      }
+      return {
+        name: basename(file, ".md"),
+        description: lens.trim(),
+        systemPrompt: body.trim(),
+        // LangChain's tool interface and class are the same at runtime.
+        tools: [...readTools] as StructuredTool[],
+      };
+    });
+}
+
 export function createPmosAgent(options: PmosAgentOptions) {
   const contentRoot = resolve(options.contentRoot);
   const registry = loadToolRegistry(join(contentRoot, "tools.yaml"));
@@ -170,24 +238,37 @@ export function createPmosAgent(options: PmosAgentOptions) {
   const skillsRoot = options.skills
     ? stageSkills(contentRoot, options.skills, options.stagingRoot)
     : join(contentRoot, "skills");
+  const tools = options.tools ?? [];
+
+  const mounts: Record<string, FilesystemBackend> = {
+    [`${CONTENT_MOUNT}skills/`]: new FilesystemBackend({ rootDir: skillsRoot, virtualMode: true }),
+    [`${CONTENT_MOUNT}master/`]: new FilesystemBackend({ rootDir: masterRoot, virtualMode: true }),
+  };
+  for (const dir of READ_ONLY_CONTENT_DIRS) {
+    const rootDir = join(contentRoot, dir);
+    if (existsSync(rootDir) && statSync(rootDir).isDirectory()) {
+      mounts[`${CONTENT_MOUNT}${dir}/`] = new FilesystemBackend({ rootDir, virtualMode: true });
+    }
+  }
+
+  // The review panel: only for a role whose skills include `review`, and with the read
+  // tools only (kind `read` in tools.yaml).
+  const kinds = harnessToolNames(registry);
+  const readTools = tools.filter((t) => kinds.get(t.name)?.kind === "read");
+  // Without `options.skills` every skill is mounted, `review` included if the repo has it.
+  const hasReview = options.skills
+    ? options.skills.includes(REVIEW_SKILL)
+    : existsSync(join(contentRoot, "skills", REVIEW_SKILL, "SKILL.md"));
+  const subagents = hasReview ? reviewerSubagents(contentRoot, readTools) : [];
 
   return createDeepAgent({
     name: "pmos",
     model: options.model,
     systemPrompt: options.systemPrompt,
-    tools: options.tools ?? [],
+    tools,
+    subagents,
     checkpointer: options.checkpointer,
-    backend: (config) =>
-      new CompositeBackend(new StateBackend(config), {
-        [`${CONTENT_MOUNT}skills/`]: new FilesystemBackend({
-          rootDir: skillsRoot,
-          virtualMode: true,
-        }),
-        [`${CONTENT_MOUNT}master/`]: new FilesystemBackend({
-          rootDir: masterRoot,
-          virtualMode: true,
-        }),
-      }),
+    backend: (config) => new CompositeBackend(new StateBackend(config), mounts),
     // The content repo is read-only to the agent; OpenShell's Landlock policy enforces the
     // same thing again at the OS level.
     permissions: [

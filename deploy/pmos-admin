@@ -13,6 +13,8 @@
 #   pmos-admin reindex                reload content after a merge (lint-gated)
 #   pmos-admin revoke <handle> <atlassian|slack|github>
 #                                     remove a PM's linked account and its tokens
+#   pmos-admin ledger [--since 7d] [--export]
+#                                     what happened to the bots' drafts (feedback ledger)
 #   pmos-admin add-bot <bot>          give a new bot its own runtime and gateway tokens
 #   pmos-admin sandbox <bot>          create the bot's OpenShell sandbox and start its worker
 #   pmos-admin pause <bot> / resume <bot>
@@ -20,7 +22,14 @@
 #   pmos-admin lint                   pmos lint and pmos policy check on the content checkout
 #   pmos-admin pmos <args>            the pmos CLI on the checkout, e.g. `pmos member add …`
 #                                     (paths are relative to the checkout: --root content)
-#   pmos-admin evals <args>           pmos-evals (benchmarks, load test) against the stack
+#   pmos-admin evals <args>           pmos-evals against the live stack (the load test)
+#   pmos-admin evals-run --category <c> [--checkout <dir>] [--note <why>]
+#                                     a benchmark on the eval stack (fake systems, real docs and
+#                                     models); the report lands in <dir>/evals/reports to commit
+#   pmos-admin evals-stack [--checkout <dir>] <pmos-evals args>
+#                                     any pmos-evals command on the eval stack (judge calibrate …)
+#   pmos-admin evals-gate [--base origin/main]
+#                                     the eval gate for this checkout's changes (CI runs it)
 #   pmos-admin smoke <handle>         one Docs-bot question through the whole stack
 set -euo pipefail
 
@@ -66,6 +75,49 @@ pmos_cli() {
     -v "$PMOS_CONTENT_CHECKOUT:/srv/content-repo" -w /srv/content-repo \
     "pmos:${PMOS_VERSION:-local}" "$@"
 }
+
+# --- The eval stack (deploy/compose.evals.yaml) ---------------------------------------------
+# A separate, short-lived tool server, runtime and workers on a checkout's content, sharing only
+# the live gateway (models) and docs server. Fresh tokens every time; removed afterwards.
+EVAL_DIR=""
+evals_compose() {
+  docker compose --project-directory "$DEPLOY" -f "$DEPLOY/compose.evals.yaml" --env-file "$ENV" "$@"
+}
+eval_stack_up() { # checkout
+  local checkout
+  checkout=$(cd "$1" && pwd)
+  [ -f "$checkout/content/tools.yaml" ] || { say "$checkout has no content/tools.yaml" >&2; exit 2; }
+  if ! curl -fsS --noproxy '*' -m 5 http://127.0.0.1:8740/healthz >/dev/null 2>&1; then
+    say "the gateway isn't running: start the stack first (deploy/pmos-admin up --models)" >&2
+    exit 2
+  fi
+  EVAL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pmos-evals.XXXXXX")
+  chmod 755 "$EVAL_DIR"
+  # The checkout's content, plus the members the fake fixtures expect: `evals` (U0EVALS), whom
+  # the benchmark tasks are requested by, with their personal bot pm-evals, and their teammates
+  # ben (U0BEN) and cy (U0CY), so the fake channels' audiences mean what the tasks say
+  # (crates/toolserver/src/connectors/fake.rs). Only this copy is changed.
+  cp -r "$checkout/content" "$EVAL_DIR/content"
+  mkdir -p "$EVAL_DIR/baseline" "$EVAL_DIR/out"
+  local who
+  for who in evals:U0EVALS ben:U0BEN cy:U0CY; do
+    docker run --rm --user "${PMOS_UID:-10001}:${PMOS_GID:-10001}" -v "$EVAL_DIR/content:/srv/content" \
+      "pmos:${PMOS_VERSION:-local}" pmos member add --root /srv/content --handle "${who%%:*}" \
+      --slack-id "${who##*:}" --roles pm >/dev/null
+  done
+  chown -R "${PMOS_UID:-10001}:${PMOS_GID:-10001}" "$EVAL_DIR" 2>/dev/null || true
+  export PMOS_EVAL_CONTENT="$EVAL_DIR/content" PMOS_EVAL_CHECKOUT="$checkout" PMOS_EVAL_BASELINE="$EVAL_DIR/baseline" PMOS_EVAL_OUT="$EVAL_DIR/out"
+  for v in SERVICE_TOKEN BOT_TOKEN RT_EVALS RT_CONSOLE RT_DOCS RT_PERSONAL; do
+    export "PMOS_EVAL_$v=$(openssl rand -hex 24)"
+  done
+  trap eval_stack_down EXIT
+  evals_compose up -d --wait toolserver bots worker-docs worker-personal >/dev/null
+}
+eval_stack_down() {
+  evals_compose --profile runner down -v --remove-orphans >/dev/null 2>&1 || true
+  [ -n "$EVAL_DIR" ] && rm -rf "$EVAL_DIR"
+}
+evals_runner() { evals_compose --profile runner run --rm -T runner "$@"; }
 
 # Replace or append KEY=VALUE in deploy/.env.
 set_env() {
@@ -129,7 +181,7 @@ case "$cmd" in
     if compose exec -T docs curl -fsS -m 5 http://127.0.0.1:8730/readyz >/dev/null 2>&1; then
       row docs ok "ready"
     else
-      row docs "not" "ready (an empty index until the first sync finishes is normal)"
+      row docs "not" "ready (normal until the first sync finishes; or no docs site set in PMOS_DOCS_BASE_URL)"
     fi
     ;;
 
@@ -190,6 +242,41 @@ case "$cmd" in
   revoke)
     [ $# -eq 2 ] || { say "usage: pmos-admin revoke <handle> <atlassian|slack|github>" >&2; exit 2; }
     internal DELETE "/internal/credentials/$1/$2" && say "revoked $2 for $1"
+    ;;
+
+  ledger)
+    since=7d
+    export=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --since) since=$2; shift 2 ;;
+        --export) export=1; shift ;;
+        *) say "usage: pmos-admin ledger [--since 7d|24h|<date>] [--export]" >&2; exit 2 ;;
+      esac
+    done
+    case "$since" in
+      *d) from=$(date -u -d "-${since%d} days" +%Y-%m-%dT%H:%M:%SZ) ;;
+      *h) from=$(date -u -d "-${since%h} hours" +%Y-%m-%dT%H:%M:%SZ) ;;
+      *) from=$(date -u -d "$since" +%Y-%m-%dT%H:%M:%SZ) ;;
+    esac
+    if [ "$export" = 1 ]; then
+      # JSON lines, one ledger row each (labels and metadata only; no message text).
+      internal GET "/internal/ledger?since=$from&limit=1000" | python3 -c 'import json,sys
+for r in json.load(sys.stdin)["rows"]: print(json.dumps(r))'
+      exit 0
+    fi
+    internal GET "/internal/ledger/summary?since=$from" | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+print(f"drafts since {s.get("since", "?")}: {s["rows"]}, labelled {s["label_coverage"]:.0%} (phase 0 gate: 95%)")
+print(f"  {"bot/skill":<18} {"tool":<26} {"n":>4} {"ok":>4} {"edit":>4} {"rej":>4} {"exp":>4} {"med edit":>8}  reasons")
+for g in s["groups"]:
+    c = g["counts"]
+    med = g.get("median_edit_distance")
+    reasons = ", ".join(f"{k} {v}" for k, v in sorted(g.get("reasons", {}).items()) if v)
+    who = g.get("bot") or g.get("skill") or "?"
+    print(f"  {who:<18} {g["tool"]:<26} {g["rows"]:>4} {c.get("approved",0):>4} {c.get("edited",0):>4} {c.get("rejected",0):>4} {c.get("expired",0):>4} {(f"{med:.0%}" if med is not None else "-"):>8}  {reasons}")
+'
     ;;
 
   add-bot)
@@ -276,11 +363,57 @@ case "$cmd" in
       -e PMOS_EVALS_ROOT=evals "pmos:${PMOS_VERSION:-local}" pmos-evals "$@"
     ;;
 
+  evals-run|evals-stack)
+    # evals-run: `pmos-evals run <args>`; evals-stack: `pmos-evals <args>` (judge calibrate, …).
+    checkout=$PMOS_CONTENT_CHECKOUT
+    args=()
+    [ "$cmd" = evals-run ] && args+=(run)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --checkout) checkout=$2; shift 2 ;;
+        *) args+=("$1"); shift ;;
+      esac
+    done
+    eval_stack_up "$checkout"
+    evals_runner "${args[@]}"
+    if [ "$cmd" = evals-run ]; then
+      say "report written under $checkout/evals/reports; commit it so the gate can compare against it"
+    fi
+    ;;
+
+  evals-gate)
+    base=origin/main
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --base) base=$2; shift 2 ;;
+        *) say "usage: pmos-admin evals-gate [--base <ref>]" >&2; exit 2 ;;
+      esac
+    done
+    changed=$(git -C "$ROOT" diff --name-only "$base"...HEAD)
+    eval_stack_up "$ROOT"
+    mapfile -t categories < <(printf '%s\n' "$changed" | evals_runner affected --content content)
+    if [ ${#categories[@]} -eq 0 ]; then
+      say "The eval gate: no benchmark category is affected by this change."
+      exit 0
+    fi
+    # The baseline: the base branch's committed reports, unpacked where the runner can read them.
+    git -C "$ROOT" archive "$base" evals/reports | tar -x -C "$PMOS_EVAL_BASELINE"
+    worst=0
+    for c in "${categories[@]}"; do
+      code=0
+      evals_runner gate --category "$c" --baseline-reports /srv/baseline/evals/reports \
+        --reports-dir /srv/out || code=$?
+      echo
+      [ "$code" -gt "$worst" ] && worst=$code
+    done
+    exit "$worst"
+    ;;
+
   smoke)
     # One Docs-bot question through the whole stack, as the Slack bot would send it.
     [ $# -eq 1 ] || { say "usage: pmos-admin smoke <handle in team.yaml>" >&2; exit 2; }
     auth=(-H "Authorization: Bearer $PMOS_RT_SLACK_TOKEN" -H "X-Pmos-User: $1")
-    body=$(printf '{"bot":"docs","requested_by":"%s","text":"What does Fortanix DSM do?","source":"slack","slack":{"channel":"smoke","thread_ts":"0.0"}}' "$1")
+    body=$(printf '{"bot":"docs","requested_by":"%s","text":"What does the docs site say about getting started?","source":"slack","slack":{"channel":"smoke","thread_ts":"0.0"}}' "$1")
     task=$(curl -sS --noproxy '*' -X POST http://127.0.0.1:8750/v1/tasks "${auth[@]}" -H 'content-type: application/json' -d "$body")
     id=$(sed -n 's/.*"id":"\(tsk_[0-9a-f]*\)".*/\1/p' <<<"$task")
     [ -n "$id" ] || { say "the runtime refused the task: $task" >&2; exit 1; }
