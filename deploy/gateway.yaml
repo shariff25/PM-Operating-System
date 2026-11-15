@@ -1,0 +1,19 @@
+# PM OS gateway on the Spark: the roles served by the vLLM containers in deploy/compose.yaml.
+# Same roles as config/gateway.yaml; only the upstream addresses differ (compose service names).
+# Confirm the served model names on the Spark before first use; swapping a model is
+# docs/runbooks/model-swap.md.
+upstreams:
+  qwen: http://vllm-default:8000/v1
+  nemotron: http://vllm-extraction:8000/v1
+roles:
+  default:
+    upstream: qwen
+    model: qwen3.6-35b-a3b
+    workarounds: [strip-think]
+  extraction:
+    upstream: nemotron
+    model: nemotron-3-nano-30b-a3b
+limits:
+  max-in-flight: 4
+  per-user: 2
+  max-queue: 64

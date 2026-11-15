@@ -1,0 +1,9 @@
+# Keep the build context small: no build output, dependencies, local state or git history.
+target/
+**/node_modules/
+harness/dist/
+state/
+.git/
+.claude/
+deploy/.env
+deploy/backups/
