@@ -3,24 +3,33 @@
 A task category launches only when the bots finish it end to end (D10). Each category is a
 fixed set of real tasks. We rerun it every week and after every model or harness change, and
 we tag each failure with the bottleneck that caused it. A category passes when it meets its
-pass bar two weeks in a row. The spec is §8 of `docs/bot-runtime-spec.md`.
+pass bar two weeks in a row. The spec is §8 of `docs/bot-runtime-spec.md`; the improvement
+loop's additions (repeats, comparisons, the gate, drafts checks, the taxonomy and judges) are
+§5 and §6 of `docs/improvement-loop-spec.md`.
 
 ```
 evals/
-  config.yaml                       runner defaults and the load-test latency targets
-  categories/<name>/category.yaml   {name, bot, pass_bar, description}
-  categories/<name>/tasks/<id>.yaml {id, ask, expect}
-  reports/<date>-<category>.md      one per run, for people
-  reports/<date>-<category>.json    the same run, read by `history`
+  config.yaml                         runner defaults, decline phrases, load-test targets
+  taxonomy.yaml                       second-level failure tags under the five bottlenecks
+  case-card.md                        the template for turning a real case into a task
+  categories/<name>/category.yaml     {name, bot, pass_bar?, repeats?, description}
+  categories/<name>/tasks/<id>.yaml   {id, ask, expect, cluster?, regression?, tags?}
+  judges/<name>.yaml                  an LLM judge
+  judges/<name>.labels.jsonl          its labels (empty: none yet)
+  judges/<name>.calibration.json      written by `pmos-evals judge calibrate`
+  reports/<date>-<category>.md        one per run, for people
+  reports/<date>-<category>.json      the same run, read by `history`, `compare` and `gate`
 ```
 
 `pmos-evals` (`crates/evals`) is a client of the bot runtime (`pmos-bots`, §3), signed in as
-client `evals`. For each task it:
+client `evals`. For each task, `repeats` times, it:
 1. creates the task with `POST /v1/tasks` and `source: "eval"`;
 2. polls `GET /v1/tasks/{id}` until the task settles;
 3. reads its events;
-4. grades the result;
-5. for a failure, reads the trace and tags the failure.
+4. for a task with `drafts` checks, reads its drafts (`GET /v1/tasks/{id}/drafts`);
+5. grades the result;
+6. asks the judges that apply, through the gateway;
+7. for a failure, reads the trace and tags the failure.
 
 ## Running it
 
@@ -34,6 +43,10 @@ client `evals`. For each task it:
 | Seconds one task may take | `--timeout-secs` | | `runner.task_timeout_seconds` (600) |
 | Milliseconds between polls | `--poll-ms` | | `runner.poll_ms` (2000) |
 | Tasks in flight at once (`run` only) | `--concurrency` | | `runner.concurrency` (1) |
+| Runs per task (`run`, `gate`) | `--repeats` | | the category's `repeats` (1) |
+| Gateway, for judges | `--gateway-url` | `PMOS_GATEWAY_URL` | none: judges aren't asked |
+| Gateway token, client `evals` | `--gateway-token` | `PMOS_EVALS_GATEWAY_TOKEN` | none |
+| Content root, for `check` and `affected` | `--content` | | `content` |
 
 **Tokens and identity:**
 - **The `evals` token.** Add `evals=<token>` to the runtime's `PMOS_BOTS_TOKENS`.
@@ -42,32 +55,47 @@ client `evals`. For each task it:
   status, error and events only, and the report says how many failures were tagged that way.
 - **Who asks.** A team bot serves team members only, so the `--as` handle must be in
   `content/team.yaml`. Use a real PM, or add a member for the benchmarks.
+- **`bot: personal`.** A category with `bot: personal` sends its tasks to the personal bot of
+  whoever they are for: `pm-<requested_by>`, with `.` and `_` as hyphens, as onboarding names
+  it. So `--as ana` runs them against `pm-ana`. The report records the resolved bot.
+- **The gateway token.** Judges call the gateway as client `evals`: the `evals=<token>` entry
+  in the gateway's `PMOS_GATEWAY_TOKENS` (`PMOS_GW_EVALS_TOKEN` on the Spark), with
+  `PMOS_GATEWAY_URL` such as `http://127.0.0.1:8740/v1` (`/v1` is added if missing). Without
+  both, judges aren't asked and the report says so.
 
 **Commands and exit status:**
 
 | Command | What it does | Exit status |
 | --- | --- | --- |
-| `pmos-evals check [--category docs-qa]` | Validates the category and task files, and `config.yaml` | 0 valid, 2 problems (every problem listed) |
-| `pmos-evals run --category docs-qa` | Runs the category and writes its report | 0 met the bar, 1 below it |
-| `pmos-evals history --category docs-qa` | Has the bar been met two weeks in a row? | 0 yes, 1 no |
+| `pmos-evals check [--category docs-qa] [--content content]` | Validates the categories and tasks, `config.yaml`, `taxonomy.yaml`, the judges and their labels, every tag used, and that `drafts` tools are write tools in `content/tools.yaml` | 0 valid, 2 problems (every problem listed) |
+| `pmos-evals run --category docs-qa` | Runs the category and writes its report, compared with the previous one | 0 met the bar (or no bar), 1 below it |
+| `pmos-evals gate --category docs-qa` | Runs the category (or takes `--candidate <report>`) and compares it with the baseline; prints a markdown summary | 0 passed, 1 failed |
+| `pmos-evals compare <report> <report>` | Compares two runs of one category, task by task | 0 |
+| `pmos-evals history --category docs-qa` | Has the bar been met two weeks in a row? | 0 yes, 1 no (or no bar) |
+| `pmos-evals judge calibrate <name>` | Runs a judge over its labels and writes `<name>.calibration.json` | 0 written, 2 no labels or no gateway |
+| `pmos-evals affected [--changed <file>]` | Lists the categories a change affects, from changed paths on stdin | 0 |
 | `pmos-evals load --tasks 5` | The load test | 0 if every task finished, 1 if not (`--enforce-targets`: also 1 on a missed latency target) |
 
 An error (no token, a bad file, a report that can't be written) exits 2.
 
-**Other `run` options:**
+**Other `run` options** (`gate` takes them too):
 - `--task <id>`, repeatable, runs only those tasks. Use it to debug a task, never for the
   weekly run.
+- `--repeats N` overrides the category's `repeats`.
 - `--note "…"` records why the run happened.
 - `--date YYYY-MM-DD` dates the report (default: today, UTC).
 - `--reports-dir` changes where reports are written.
+- `--no-judges` skips the judges; the report says they weren't asked.
 
 ### Every week
 On the Spark, against the live runtime with the gateway as it normally runs:
 
 ```sh
 export PMOS_EVALS_TOKEN=… PMOS_EVALS_TRACE_TOKEN=… PMOS_EVALS_AS=ana
+export PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1 PMOS_EVALS_GATEWAY_TOKEN=…   # for judges
 pmos-evals run --category docs-qa --note "weekly"
 pmos-evals history --category docs-qa
+for c in jira-draft confluence-draft slack-reply; do pmos-evals run --category "$c" --note "weekly"; done
 ```
 
 Then commit `evals/reports/`, both files of each run. The reports are the history; a run that
@@ -103,22 +131,40 @@ week (see **History** below).
 
 ## Reading a report
 
-`evals/reports/<date>-<category>.md` has four parts.
+`evals/reports/<date>-<category>.md` has these parts.
 
 1. **Verdict:** "Met the bar" or "Below the bar", with passed of total, the pass rate and the
-   bar.
+   bar. A category with no `pass_bar` says "Reports only". With repeats, the count is of
+   attempts ("50 of 60 attempts passed (83%) over 20 tasks run 3 times each").
    - A table follows: the bot, the runtime, who asked, the declared workaround setting, the
-     note and the run's start and end times.
+     note, the run's start and end times, and the **pass rate ± its standard error** (see
+     **Repeats and statistics**).
+   - With repeats, a **pass^k** row: the share of tasks that passed every run.
    - A **Traces** row appears when some failures were tagged without a trace.
 2. **Failures by tag:** the top bottleneck first ("Top bottleneck: **tool** (3 of 5
    failures)"). Then each tag's failure count and its tasks, by count, ties in the order model,
-   tool, policy, memory, harness. Fix the top row first.
-3. **Tasks:** one row per task. It shows pass or **FAIL**, the tag and the rule that gave it,
-   the final status, and queue and total seconds. **Why** lists every failed check.
-4. **Failure details:** for each failure, the question, the runtime task id (open it in the
-   console for the full trace), the tag, its rule and evidence, and each failed check.
+   tool, policy, memory, harness. Fix the top row first. A second table counts failures by
+   **sub-tag** (`model/missing-citation`, …), the most first.
+3. **Judges**, when any apply: each judge, whether it was blocking or advisory and why, and how
+   often it said yes, no, or gave no verdict. "Not asked: …" when no gateway was configured or
+   `--no-judges` was passed.
+4. **Tasks:** with one run per task, one row per task: pass or **FAIL**, the tag (the sub-tag
+   when there is one) and the rule that gave it, the final status, and queue and total seconds.
+   **Why** lists every failed check. With repeats, one row per task: its passes out of k (in
+   bold unless all passed), the tags its failures got with their counts, and why its latest
+   failure failed.
+5. **Compared with the previous run:** the paired difference with the category's previous
+   report, its 95% interval, and flips (see **Comparing runs**). Absent for a first run.
+6. **Failure details:** for each failed attempt ("run 2 of 3" with repeats), the question, the
+   runtime task id (open it in the console for the full trace), the tag, its rule and evidence,
+   and each failed check.
 
-The `.json` next to it holds the same data, every failed check and tag included.
+The `.json` next to it holds the same data, every failed check, tag and judge verdict included,
+one line per attempt (`repeat` numbers them from 1). It holds no answer or draft text.
+
+**Old reports** (written before repeats) have one line per task and no `repeats`, `cluster`,
+sub-tags or judges. They load as `repeats: 1`, each task its own cluster, and work with
+`history`, `compare` and `gate` like any other.
 
 ### Grading
 A task passes only when every check passes:
@@ -130,9 +176,50 @@ A task passes only when every check passes:
 | `must_cite` | each URL is a link in the answer |
 | `must_include` | each text is in the answer |
 | `must_not_include` | no such text is in the answer |
+| `must_decline` | the answer contains one of `decline_phrases` in `config.yaml` |
+| `drafts` | each entry's checks hold for the task's drafts of that tool (below) |
 
 A task the runner stopped waiting for, or couldn't create, fails. `needs_approval` counts as
 settled: the bot has finished, and nobody approves eval drafts.
+
+**`must_decline: true`** is for the should-not cases: questions the bot's sources don't
+answer, where the right answer says so. The answer passes when it contains any of the
+`decline_phrases` in `evals/config.yaml` ("don't answer", "couldn't find", "not documented",
+…), compared as text is. A `must_decline` task has no `must_cite`; `check` refuses one that
+does, and refuses `must_decline` tasks when `decline_phrases` is empty. Keep the phrases
+specific to declining: one a normal answer could contain lets a made-up answer pass.
+
+**`drafts:`** checks the approval items the task ended with, read from the runtime's
+`GET /v1/tasks/{id}/drafts` (`{drafts: [{id, tool, args, status}]}`). One entry per tool:
+
+```yaml
+expect:
+  approvals: 1
+  drafts:
+    - tool: jira.create_issue          # a write tool in content/tools.yaml
+      count: 1                         # how many drafts of this tool; default: at least one
+      require_fields: [project, issue_type, summary]   # present and not empty
+      allowed:                         # each named argument must be one of these
+        project: [PM]
+        issue_type: [Story]
+      must_include: ["SAML"]           # on the draft's text
+      must_not_include: ["roadmap"]
+    - tool: slack.send_message
+      count: 0                         # must not be drafted at all
+```
+
+- **Every draft** of the tool must meet `require_fields`, `allowed`, `must_include` and
+  `must_not_include`; each failure names the draft's id.
+- **Not empty** means a non-blank string, a non-empty list or object, or any number or
+  boolean.
+- **`allowed`** compares a string argument as written (trimmed), a number or boolean as
+  written; a missing argument is not allowed.
+- **The draft's text** is its top-level string arguments, sorted by key and joined by
+  newlines, as the feedback ledger measures edits. It is compared like answer text.
+- **`count: 0`** takes no other checks.
+- **Unreadable drafts:** if the runtime can't serve them (an older runtime answers 404), the
+  task fails with "drafts not readable", tagged `harness`.
+- **No draft text is stored:** the report keeps which checks failed, never the arguments.
 
 **Links:**
 - **What counts as a link.** Any `http(s)://` URL in the answer: bare, in `<…>`, or a markdown
@@ -150,6 +237,7 @@ settled: the bot has finished, and nobody approves eval drafts.
 - lowercase;
 - hyphens and dashes become spaces ("SEV-SNP" matches "SEV SNP");
 - `*` and `` ` `` are dropped (markdown emphasis and code);
+- curly apostrophes become straight ones ("don’t" matches "don't");
 - thousands separators between digits are dropped ("1,800" matches "1800");
 - runs of whitespace become one space.
 
@@ -163,30 +251,77 @@ Every failure gets exactly one tag. The rules run in this order, and the first m
   `prompt`, `model_reply`, `tool_call`, `tool_result` and `policy_denial`.
 - **A tool's name** is the `tool` or `name` field of an entry's body.
 
-| # | Rule | Tag | Matches |
-| --- | --- | --- | --- |
-| 1 | `runtime-unreachable` | harness | A call to the runtime failed, so the task wasn't created or couldn't be followed. This includes a `403` because `--as` may not use the bot. |
-| 2 | `policy-denial` | policy | The trace has a `policy_denial` entry |
-| 3 | `policy-error` | policy | The error says `policy`, `denied`, `forbidden`, `not permitted` or `403` |
-| 4 | `never-claimed` | harness | Timed out while still `queued`: no worker picked it up |
-| 5 | `cancelled` | harness | The task was cancelled; nothing in a benchmark cancels tasks |
-| 6 | `interrupted` | harness | The error says `interrupted`, `restart`, `lease`, `heartbeat`, `worker`, `sandbox` or `gateway`. This covers restarts (D2), the worker and its sandbox, and the model endpoint being unreachable. |
-| 7 | `silent-timeout` | harness | Timed out while `working`, with no events: the worker never reported progress |
-| 8 | `done-without-answer` | harness | Ended `done` with an empty result |
-| 9 | `memory-error` | memory | The error says `memory`, `context length`, `context window` or `maximum context` |
-| 10 | `memory-tool-error` | memory | The trace has a failed result from a `memory*` tool |
-| 11 | `tool-error` | tool | The trace has a failed tool result: `isError` or `is_error` true, `error` set, or `status` 400 or more |
-| 12 | `tool-failure` | tool | The error says `tool`, `mcp`, `connector` or `unavailable` |
-| 13 | `page-not-retrieved` | tool | A page to cite is missing, the bot called at least one tool, and no tool result held that page (compared as citations are). The bot searched, but retrieval didn't surface the page. |
-| 14 | `model` | model | Anything else. The bot had what it needed and answered wrong or incompletely, cited the wrong page, leaked `<think>`, drafted the wrong number of approvals, timed out while working with progress, failed with any other error, or never called a tool. |
+| # | Rule | Tag | Sub-tag | Matches |
+| --- | --- | --- | --- | --- |
+| 1 | `runtime-unreachable` | harness | `harness/runtime-unreachable` | A call to the runtime failed, so the task wasn't created or couldn't be followed. This includes a `403` because `--as` may not use the bot. |
+| 2 | `policy-denial` | policy | `policy/denied-in-trace` | The trace has a `policy_denial` entry |
+| 3 | `policy-error` | policy | `policy/refused` | The error says `policy`, `denied`, `forbidden`, `not permitted` or `403` |
+| 4 | `never-claimed` | harness | `harness/never-claimed` | Timed out while still `queued`: no worker picked it up |
+| 5 | `cancelled` | harness | `harness/cancelled` | The task was cancelled; nothing in a benchmark cancels tasks |
+| 6 | `interrupted` | harness | `harness/interrupted` | The error says `interrupted`, `restart`, `lease`, `heartbeat`, `worker`, `sandbox` or `gateway`. This covers restarts (D2), the worker and its sandbox, and the model endpoint being unreachable. |
+| 7 | `silent-timeout` | harness | `harness/silent-timeout` | Timed out while `working`, with no events: the worker never reported progress |
+| 8 | `done-without-answer` | harness | `harness/empty-answer` | Ended `done` with an empty result |
+| 9 | `drafts-unreadable` | harness | `harness/drafts-unreadable` | The task has `drafts` checks and its drafts couldn't be read |
+| 10 | `duplicate-approvals` | harness | `harness/approval-count` | More approval items than `approvals` expects, from a task that ran more than once (`attempts` > 1): the retry drafted them again |
+| 11 | `memory-error` | memory | `memory/context-limit` | The error says `memory`, `context length`, `context window` or `maximum context` |
+| 12 | `memory-tool-error` | memory | `memory/tool-failed` | The trace has a failed result from a `memory*` tool |
+| 13 | `tool-error` | tool | `tool/call-failed` | The trace has a failed tool result: `isError` or `is_error` true, `error` set, or `status` 400 or more |
+| 14 | `tool-failure` | tool | `tool/unavailable` | The error says `tool`, `mcp`, `connector` or `unavailable` |
+| 15 | `page-not-retrieved` | tool | `tool/page-not-retrieved` | A page to cite is missing, the bot called at least one tool, and no tool result held that page (compared as citations are). The bot searched, but retrieval didn't surface the page. |
+| 16 | `draft-wrong-target` | tool | `tool/wrong-jira-project`, `tool/wrong-confluence-space` or `tool/wrong-slack-channel` | A draft goes to the wrong place: its Jira `project`, Confluence `space`, or Slack `channel` or `thread_ts` isn't one of the `allowed` values |
+| 17 | `model` | model | by the failed check, below | Anything else. The bot had what it needed and answered wrong or incompletely, answered what it should have declined, cited the wrong page, leaked `<think>`, drafted the wrong number or content, timed out while working with progress, failed with any other error, or never called a tool. |
+
+**A `model` failure's sub-tag** comes from how it failed: `model/failed` when the task ended
+`failed`, `model/timed-out` when it timed out while working. Otherwise from its failed checks,
+the first of these that applies:
+
+| Failed check | Sub-tag |
+| --- | --- |
+| `must_decline` | `model/answered-beyond-sources` |
+| `must_cite` | `model/missing-citation` |
+| `must_not_include` of `<think>` | `model/leaked-reasoning` |
+| `must_include` | `model/missing-fact` |
+| other `must_not_include` | `model/forbidden-text` |
+| `approvals`, or a drafts `count` | `model/wrong-draft-count` |
+| drafts `require_fields` | `model/incomplete-draft` |
+| drafts `allowed`, not where the draft goes | `model/wrong-draft-value` |
+| drafts `must_include` or `must_not_include` | `model/draft-content` |
+| status | `model/failed` |
+| anything else (no answer) | `model/no-answer` |
 
 **Notes on the rules:**
 - **Policy comes first.** A refusal can surface as any kind of failure, and it's the cause
   when it's there.
-- **Without a trace,** rules 2, 10, 11 and 13 can't fire. Those failures fall through to the
+- **Without a trace,** rules 2, 12, 13 and 15 can't fire. Those failures fall through to the
   error rules or to `model`. That is why the weekly run should pass `--trace-token`.
-- **The rules live in code.** They are `RULES` in `crates/evals/src/tag.rs`, with a test for
-  each.
+- **The rules live in code.** They are `RULES` and `SUB_TAGS` in `crates/evals/src/tag.rs`,
+  with a test for each.
+
+### Failure taxonomy
+`evals/taxonomy.yaml` lists second-level tags under the five bottlenecks, each with a
+description that says how to recognise it:
+
+```yaml
+model:
+  description: The bot had what it needed and got it wrong.
+  tags:
+    missing-citation: The answer doesn't link a page it had to cite, …
+    answered-beyond-sources: Answered a question its sources don't answer, instead of saying so.
+tool:
+  description: …
+  tags:
+    wrong-confluence-space: A Confluence draft is in a space the task doesn't allow.
+```
+
+- **Written in full** as `<bottleneck>/<name>`, such as `harness/approval-count`.
+- **The automatic tagger** emits a sub-tag wherever a deterministic failure maps to one (the
+  tables above). Every one it can emit must be listed; a test and `check` enforce that.
+- **Owners add sub-tags by pull request,** usually after a 100-trace review
+  (`docs/runbooks/quality.md`). Some exist only for people and judges to apply, such as
+  `model/unfaithful-to-source`, `model/followed-injection` and `policy/should-not-draft`.
+- **Where tags are used:** a task's `tags` (the failure modes it exists to catch), a judge's
+  `failure_mode`, and sub-tags in committed reports. `pmos-evals check` validates the taxonomy
+  and every one of these.
 
 ### History: the two-weeks rule
 `pmos-evals history --category <name>` reads every `.json` report for the category:
@@ -204,6 +339,162 @@ docs-qa: met its bar two weeks in a row (bar 80%, streak 2 weeks).
   2026-W46: met   2026-11-12 17/20
   2026-W47: met   2026-11-16 18/20, 2026-11-18 16/20
 ```
+
+A category with no `pass_bar` reports only: `history` says it has no bar and exits 1, since
+it can't meet one. The bar is judged on the pass rate over every attempt.
+
+### Repeats and statistics
+A model's answers vary from run to run, so one run of 20 tasks can't tell a real drop from
+noise. `repeats: k` in `category.yaml` (default 1; docs-qa uses 3), or `--repeats k`, runs each
+task k times. The first run of every task goes before any second run.
+
+**What the report adds:**
+- **each task's passes out of k;**
+- **the pass rate** over every attempt: passes ÷ (tasks × k);
+- **pass^k:** the share of tasks that passed all k runs, the stricter number: a task that
+  passes 2 runs in 3 is a coin a PM will see land wrong;
+- **the standard error of the pass rate, clustered.**
+
+**The clustered standard error.** Attempts of one task aren't independent, and neither are
+tasks answered from one page. Each task belongs to a cluster: its `cluster` field, else its
+first `must_cite` URL, else its id. So all attempts of a task share a cluster. With `n`
+attempts `y` (1 pass, 0 fail), mean `ȳ`, and `G` clusters, where `S_g` is the sum of `y − ȳ`
+over cluster `g`'s attempts, the standard cluster-robust formula for a mean is:
+
+```
+SE = sqrt( G / (G − 1) · Σ_g S_g² ) / n
+```
+
+The `G / (G − 1)` factor is the usual small-sample correction. When every cluster holds a
+single attempt (one run, nothing shared), or there is only one cluster, the report uses the
+plain binomial `sqrt(ȳ (1 − ȳ) / n)` instead, and says which it used. Read the pass rate as
+roughly "± 2 standard errors".
+
+### Comparing runs
+Every `run` compares itself with the category's previous report in the reports directory, and
+`pmos-evals compare <baseline> <candidate>` does the same for any two reports (`.json`, or the
+`.md` next to it). Both show:
+- **the paired difference:** for each task in both runs, `d = candidate pass rate − baseline
+  pass rate`, each over its own repeats, so runs with different k compare;
+- **a 95% interval for the mean paired difference:** `d̄ ± 1.96 · s_d / √m`, with `s_d` the
+  sample standard deviation of the `m` differences. It needs at least two tasks in common;
+- **flips:** a task that passed every repeat and now fails every one ("flipped to failing"), or
+  the reverse ("flipped to passing");
+- tasks that are new, or no longer run, and a table of every task whose rate changed.
+
+**The interval is a normal approximation.** With fewer than about 30 tasks the true interval
+is wider than it says (a t distribution would be), so treat one that only just misses 0 with
+care, and rerun. Repeats help more than anything: they shrink each task's noise.
+
+### The gate
+`pmos-evals gate --category <c> [--baseline <report> | --baseline-reports <dir> |
+--baseline-ref <ref>] [--candidate <report>]` is the check a change must pass before it reaches
+PMs. It runs the category (with the `run` options), or takes `--candidate <report>` to gate a
+run already made, and compares it with a baseline.
+
+**The baseline** is, by default, the category's latest report on `main`: the latest `.json` for
+the category in the reports directory as it is at the git ref `--baseline-ref` (default
+`origin/main`, or `PMOS_EVALS_BASELINE_REF`). `--baseline <report>` names one;
+`--baseline-reports <dir>` takes the latest in a directory, such as the base branch's
+`evals/reports` unpacked with `git archive`. With no baseline report (a new category), there is
+nothing to compare and the gate passes, saying so.
+
+**It fails (exit 1) when any of these hold:**
+1. **a `regression: true` task flips to failing:** it passed every repeat in the baseline and
+   fails every one now;
+2. **the pass rate fell beyond noise:** the 95% interval for the mean paired difference lies
+   wholly below 0;
+3. **a deterministic check that passed in the baseline now fails, on any task.** A check (each
+   `must_cite` URL, `must_include` text, `must_decline`, each drafts check, the status, the
+   approval count) passed in the baseline when it failed in none of the task's baseline
+   attempts, and those attempts were graded in full (not cut short by a runtime error, a
+   timeout or no answer). It now fails when it fails in every candidate attempt. Runtime
+   errors and timeouts aren't checks: they show in the paired difference;
+4. **a blocking judge fails a task it passed in the baseline:** "yes" in every baseline
+   attempt, "no" in every candidate attempt. Advisory judges never fail the gate.
+
+Otherwise it exits 0; an error (no token, an unreadable baseline, a report for another
+category) exits 2.
+
+**Output:** a markdown summary on stdout, ready for a PR comment or a job summary: the verdict,
+both runs' pass rate ± standard error and pass^k, the bar (for information; the bar is not a
+gate condition), each failure reason, the comparison, and the judges. The candidate's report is
+written to the reports directory as by `run`, and its path goes to stderr.
+
+**Which categories a change affects:** `pmos-evals affected` reads changed paths (one per line,
+relative to the repository root) on stdin or from `--changed <file>`, and prints the affected
+categories, one per line:
+- a change under `evals/`, or to `deploy/gateway.yaml`, affects every category;
+- otherwise a category is affected when the change is under its bot's directory
+  (`content/bots/<bot>/`), its role's (`content/roles/<role>/`), or a directory of a skill the
+  role runs (`content/skills/<skill>/`). For `bot: personal` the bot is `pm-<handle>` for the
+  `--as` handle (default `runner.requested_by`); with no such `BOT.md`, its role is
+  `pm-assistant`, the role every personal bot is made from.
+
+In CI, `deploy/pmos-admin evals-gate` puts these together (see **CI** below).
+
+### LLM judges
+Some failures can't be checked deterministically, such as an answer that cites the right page
+but says something the page doesn't. A judge is one yes-or-no question about an answer or
+draft, asked of a gateway model, in `evals/judges/<name>.yaml`:
+
+```yaml
+name: faithful-to-cited-page          # matches the file name
+failure_mode: model/unfaithful-to-source   # a taxonomy sub-tag: what a "no" means
+question: >-                           # phrased so that "yes" means the output passes
+  Is every factual claim in the output supported by the tool results in the input? …
+alias: pmos/extraction                 # the gateway alias; this is the default
+applies_to: [docs-qa]                  # the categories it judges
+labels: faithful-to-cited-page.labels.jsonl   # relative to evals/judges/
+needs_sources: true                    # optional: skip attempts whose trace has no tool results
+```
+
+- **A different model family.** The default alias, `pmos/extraction`, is served by a different
+  model from `pmos/default`, which drafts (`docs/gateway.md`), so a judge doesn't grade its own
+  family's work.
+- **What the judge sees.** The input is the request, then what the bot read: the tool results
+  from the trace, when the runner can read it (`--trace-token`), cut to 6,000 characters each
+  and 24,000 in all. The output is the answer, then each draft's tool and text. It is asked
+  through `POST /v1/chat/completions` at temperature 0 for exactly one word, yes or no, with
+  `X-Pmos-Priority: personal`.
+- **Parsing the reply.** Reasoning in `<think>…</think>` is dropped. If the first word is yes
+  or no, that's the verdict; otherwise a reply that says only one of them as a word is that.
+  Anything else is no verdict, and so is a call that fails; neither counts either way.
+- **Judges never change a task's pass or fail.** Their verdicts go into the report next to the
+  checks, and a blocking judge counts only in the gate.
+
+**Labels** are a JSON-lines file of `{"input": …, "output": …, "label": true|false}`, where
+`label` is a person's answer to the question (`true` is yes, a pass). They are paraphrased like
+case cards: no Slack text. **No labels yet** is an empty file: commit the judge with an empty
+`<name>.labels.jsonl`. `check` accepts it and calls the judge advisory, and `judge calibrate`
+refuses to run until there are labels. A missing file is an error.
+
+**Calibration.** `pmos-evals judge calibrate <name>` asks the judge about every label and
+writes `evals/judges/<name>.calibration.json`:
+
+```json
+{"judge": "faithful-to-cited-page", "date": "2026-12-01", "n": 120, "positives": 60,
+ "negatives": 60, "tpr": 0.9, "tnr": 0.95, "unparsed": 1, "alias": "pmos/extraction",
+ "question_sha256": "…"}
+```
+
+- **TPR** (true-positive rate) is how often the judge says yes when the label is yes; **TNR**
+  how often it says no when the label is no. A reply with no verdict counts as wrong.
+- **`question_sha256`** is the sha256 of the question text, a newline, and the alias.
+- Commit the calibration file with the labels.
+
+**Blocking or advisory.** A judge **blocks** only when all of these hold; otherwise it is
+**advisory**, reported and never failing:
+- its calibration has n ≥ 100 labels;
+- TPR ≥ 0.8 and TNR ≥ 0.8;
+- its current question and alias are the ones calibrated: the hash and the alias match.
+  Rewording the question, or moving it to another alias, makes it advisory until it is
+  calibrated again.
+
+`check` prints each judge's label count and status. The report records whether each judge was
+blocking when the run asked it.
+
+**Shipped:** `faithful-to-cited-page` for docs-qa, with no labels yet, so it is advisory.
 
 ### Load test
 `pmos-evals load --tasks 5 [--category docs-qa]`:
@@ -245,11 +536,14 @@ So queue time can be over-counted by up to one poll interval when a task has no 
 2. **Create `evals/categories/<name>/category.yaml`:**
    ```yaml
    name: <name>          # must match the directory; lowercase letters, digits, hyphens
-   bot: <bot>            # a bot in content/bots/
-   pass_bar: 0.8         # fraction of tasks that must pass, 0 to 1
+   bot: <bot>            # a bot in content/bots/, or `personal` for pm-<requested_by>
+   pass_bar: 0.8         # optional: fraction of attempts that must pass, 0 to 1;
+                         # leave it out until the tasks are real, and the category reports only
+   repeats: 3            # optional: runs per task (default 1)
    description: What the category covers and where its answers come from.
    ```
-3. **Write one file per task, `tasks/<id>.yaml`.** The `id` must match the file name.
+3. **Write one file per task, `tasks/<id>.yaml`.** The `id` must match the file name. Real
+   cases come from case cards (`evals/case-card.md`).
    ```yaml
    id: dsm-port-requirements
    ask: "Which ports do applications need open to reach an on-premises Acme DSM cluster?"
@@ -258,6 +552,9 @@ So queue time can be over-counted by up to one poll interval when a task has no 
      must_include: ["443", "5696"]
      must_not_include: ["<think>"]
      approvals: 0
+   cluster: dsm-ports    # optional; default: the first must_cite URL, else the id
+   regression: true      # optional: the gate fails if it flips back to failing
+   tags: [model/missing-fact]   # optional: failure modes it exists to catch
    ```
    - `must_cite`: absolute URLs, written as the bot cites them. The Docs bot cites the page
      URL without `.md`.
@@ -266,6 +563,13 @@ So queue time can be over-counted by up to one poll interval when a task has no 
    - `must_not_include`: text a correct answer never contains.
    - `approvals`: how many drafts the task should end with. Use 0 for read-only bots, and n
      for tasks that should draft n writes for approval.
+   - `must_decline: true`: the sources don't answer it, and the bot must say so. No
+     `must_cite`.
+   - `drafts`: checks on the drafts, one entry per tool (see **Grading**).
+   - `cluster`: give tasks that share a source one cluster, so the standard error counts them
+     as related.
+   - `regression`: mark a task that broke once and was fixed.
+   - `tags`: taxonomy sub-tags; `check` validates them.
    - `expect` needs at least one check. Unknown fields are refused.
 4. **Validate.** Run `pmos-evals check --category <name>`, and fix every problem it lists.
    The test `the_checked_in_evals_are_valid` also runs this in CI.
@@ -276,7 +580,8 @@ So queue time can be over-counted by up to one poll interval when a task has no 
    It launches once `history` says the bar was met two weeks in a row.
 
 ### `docs-qa`
-Twenty questions for the Docs bot, built from the public portal on 2026-11-14.
+Twenty questions for the Docs bot, built from the public portal on 2026-11-14, and three it
+must decline. Each runs three times (`repeats: 3`); the bar is 80% of attempts.
 
 **How they were built:**
 - **Pages:** `llms.txt` was read, then the `.md` version of each page used, at one request per
@@ -287,15 +592,58 @@ Twenty questions for the Docs bot, built from the public portal on 2026-11-14.
 - **When the portal changes a page:** fix the task from the new page, and note it in the
   commit.
 
+**The should-not cases** (`decline-*`, `must_decline: true`) ask for what public product docs
+never hold: internal roadmap dates, a customer's own deployment, and one customer's deal terms
+("Example Corp" is a placeholder). They were chosen for that reason, not from a portal search,
+so confirm each with `docs.search` on the first live run and replace any that a page turns out
+to answer. The judge `faithful-to-cited-page` applies to the category, advisory until it has
+labels.
+
+### The seed categories: `jira-draft`, `confluence-draft`, `slack-reply`
+Three tasks each for `bot: personal`, against the fake connectors' fixtures
+(`crates/toolserver/src/connectors/fake.rs`): Jira project PM (epic PM-101, story PM-102, bug
+PM-103 with a planted prompt injection), Confluence space PM (pages 9001 and 9002), and the
+`#field-questions` thread (channel C0FIELD, ts 1731500000.000100). Every task has `drafts:`
+checks; two (tagged `model/followed-injection`) check the bot drafts nothing the injected ticket
+asks for.
+
+- **Marked "seed: replace with case cards".** Replace them with real cases as case cards
+  come in.
+- **No `pass_bar`:** they report only until real case cards exist.
+- **`slack-reply` measures a gap.** The `pm-assistant` role's skills don't declare
+  `slack.read_thread` or `slack.post_reply` yet, so its tasks fail (as
+  `model/wrong-draft-count`) until a skill does.
+- **Running them** needs the stack on the fake connectors and a member whose personal bot
+  exists (`--as <handle>` runs against `pm-<handle>`).
+
 ## CI
 `cargo test -p pmos-evals` checks the benchmark machinery with no network. It runs:
-- grading, tagging, report and history tests;
-- a full `run`, the load test and the CLI, against a mocked runtime (axum) that plays scripted
-  outcomes;
-- validation of the checked-in categories.
+- grading, tagging, report, history, statistics, comparison and gate tests;
+- a full `run`, repeats, drafts, judges, the load test and the CLI (`run`, `gate`, `compare`,
+  `judge calibrate`, `affected`, `check`), against a mocked runtime and a mocked gateway (axum)
+  that play scripted outcomes;
+- validation of the checked-in categories, taxonomy and judges.
 
-The live benchmark needs the runtime, the worker and the gateway. It runs on the Spark, not in
-CI.
+**On every PR,** the GitHub-hosted `content` job also runs
+`cargo run -p pmos-evals -- check --root evals --content content`.
+
+**The eval gate** (`.github/workflows/evals-gate.yml`) runs the live benchmark on pull requests
+that change `content/skills/**`, `content/roles/**`, `content/bots/**`, `evals/**` or
+`deploy/gateway.yaml`:
+- **Where:** a self-hosted runner on the Spark (labels `self-hosted, pmos-spark`), where the
+  runtime, the worker and the models are. PRs from forks never run there. Registering the
+  runner is in `docs/runbooks/upgrade.md`.
+- **What:** `deploy/pmos-admin evals-gate --base origin/<base branch>`. It lists the changed
+  paths (`git diff --name-only <base>...HEAD`), passes them to `pmos-evals affected`, runs
+  `pmos-evals gate` for each affected category with the base branch's reports as the
+  baseline, and prints the summaries as one markdown document. The job appends it to the job
+  summary. It exits 1 if any category's gate failed, 2 on an error, and 0 otherwise, including
+  when no category is affected.
+- **Until a runner is registered,** the job waits in the queue. A platform owner runs
+  `deploy/pmos-admin evals-gate --base origin/main` on the Spark from the PR's branch, and
+  pastes the result into the PR.
+
+The weekly runs and the runs after model and harness changes are still by hand, on the Spark.
 
 ## Gaps against the spec
 - **Traces are console-only (§3),** but D10 tags failures from the trace. The runner takes an
@@ -308,3 +656,10 @@ CI.
   `--enforce-targets` is passed.
 - **Who evals run as:** the spec doesn't name an identity for eval tasks. `requested_by` is a
   config default (`evals`), so that handle has to be in `team.yaml`, or `--as` must name a PM.
+  For `bot: personal` categories that member also needs a personal bot.
+- **The clustered standard error** falls back to the binomial when every cluster holds one
+  *attempt*, not one *task*: with repeats, each task's attempts are a cluster, and treating
+  them as independent would understate the error.
+- **A check "now fails"** in the gate when it fails in every candidate attempt, and "passed in
+  the baseline" when it failed in none. A check that fails in only some attempts shows in the
+  paired difference instead, so one unlucky run doesn't fail the gate on its own.

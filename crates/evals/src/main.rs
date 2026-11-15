@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -7,18 +9,23 @@ use chrono::{NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
 use pmos_evals::client::Runtime;
 use pmos_evals::config::Config;
-use pmos_evals::history::{evaluate, load_reports};
+use pmos_evals::gate::{baseline_from_git, decide};
+use pmos_evals::history::{evaluate, latest_report, load_all, load_reports};
+use pmos_evals::judge::{self, load_calibration, load_judges, load_labels, Gateway};
 use pmos_evals::load::run_load;
-use pmos_evals::run::{run_category, Follow, RunOptions};
-use pmos_evals::spec::{category_names, load_category};
+use pmos_evals::report::Report;
+use pmos_evals::run::{run_category, Follow, JudgeRun, RunOptions};
+use pmos_evals::spec::{category_names, check_draft_tools, load_category, resolve_bot};
+use pmos_evals::stats::compare;
+use pmos_evals::taxonomy::Taxonomy;
 
 /// PM OS benchmarks: run a category through the bot runtime, grade it, and keep the history.
 ///
-/// Exit status: 0 when the bar (or target) is met, 1 when it isn't, 2 on an error.
+/// Exit status: 0 when the bar (or target, or gate) is met, 1 when it isn't, 2 on an error.
 #[derive(Parser)]
 #[command(name = "pmos-evals", version)]
 struct Cli {
-    /// The evals directory: categories, config.yaml and reports.
+    /// The evals directory: categories, config.yaml, taxonomy.yaml, judges and reports.
     #[arg(long, global = true, env = "PMOS_EVALS_ROOT", default_value = "evals")]
     root: PathBuf,
     #[command(subcommand)]
@@ -27,13 +34,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Validate the category and task files (every category when none is named).
+    /// Validate the categories and tasks, config.yaml, the taxonomy, the judges and every tag
+    /// used (every category when none is named).
     Check {
         #[arg(long)]
         category: Option<String>,
+        /// The content root, for checking `drafts` tools against its tools.yaml.
+        #[arg(long, default_value = "content")]
+        content: PathBuf,
     },
     /// Run a category against the bot runtime and write its report.
     Run(RunArgs),
+    /// Run a category (or take a run's report) and compare it with a baseline: the check a
+    /// change must pass. Prints a markdown summary.
+    Gate(GateArgs),
+    /// Compare two reports of one category, task by task.
+    Compare {
+        /// The earlier report (.json, or the .md next to it).
+        baseline: PathBuf,
+        /// The later report.
+        candidate: PathBuf,
+    },
     /// Say whether a category met its bar two weeks in a row, from its reports.
     History {
         #[arg(long)]
@@ -44,6 +65,59 @@ enum Command {
     },
     /// Send N tasks at once and report p50 and p90 queue and total time against the targets.
     Load(LoadArgs),
+    /// LLM judges.
+    Judge {
+        #[command(subcommand)]
+        command: JudgeCommand,
+    },
+    /// List the categories a change affects, one per line, from the changed paths (one per
+    /// line, relative to the repository root) on stdin or in --changed.
+    Affected {
+        /// A file of changed paths; `-` or none reads stdin.
+        #[arg(long)]
+        changed: Option<PathBuf>,
+        /// The content root.
+        #[arg(long, default_value = "content")]
+        content: PathBuf,
+        /// The content root's path in the repository, as changed paths name it.
+        #[arg(long, default_value = "content")]
+        content_prefix: String,
+        /// Who the tasks are for, for `bot: personal` (default: runner.requested_by).
+        #[arg(long = "as", env = "PMOS_EVALS_AS")]
+        requested_by: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum JudgeCommand {
+    /// Run a judge over its labels and write <name>.calibration.json.
+    Calibrate {
+        name: String,
+        #[command(flatten)]
+        gateway: GatewayArgs,
+        /// The calibration date (default: today, UTC).
+        #[arg(long)]
+        date: Option<NaiveDate>,
+    },
+}
+
+#[derive(Args)]
+struct GatewayArgs {
+    /// The gateway's OpenAI-compatible URL; `/v1` is added if missing.
+    #[arg(long, env = "PMOS_GATEWAY_URL")]
+    gateway_url: Option<String>,
+    /// The gateway token for client `evals` (in the gateway's PMOS_GATEWAY_TOKENS).
+    #[arg(long, env = "PMOS_EVALS_GATEWAY_TOKEN", hide_env_values = true)]
+    gateway_token: Option<String>,
+}
+
+impl GatewayArgs {
+    fn gateway(&self) -> Option<Gateway> {
+        match (self.gateway_url.as_deref(), self.gateway_token.as_deref()) {
+            (Some(u), Some(t)) if !u.is_empty() && !t.is_empty() => Some(Gateway::new(u, t)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -78,6 +152,9 @@ struct RunArgs {
     /// Tasks in flight at once (default: runner.concurrency).
     #[arg(long)]
     concurrency: Option<usize>,
+    /// Runs per task (default: the category's `repeats`, else 1).
+    #[arg(long)]
+    repeats: Option<u32>,
     /// Why this run happened, recorded in the report ("weekly", "model swap to …").
     #[arg(long)]
     note: Option<String>,
@@ -90,6 +167,30 @@ struct RunArgs {
     /// Where reports go (default: <root>/reports).
     #[arg(long)]
     reports_dir: Option<PathBuf>,
+    /// Don't ask the judges.
+    #[arg(long)]
+    no_judges: bool,
+    #[command(flatten)]
+    gateway: GatewayArgs,
+}
+
+#[derive(Args)]
+struct GateArgs {
+    #[command(flatten)]
+    run: RunArgs,
+    /// The baseline report (default: the category's latest report at --baseline-ref).
+    #[arg(long)]
+    baseline: Option<PathBuf>,
+    /// The git ref whose reports hold the baseline.
+    #[arg(long, env = "PMOS_EVALS_BASELINE_REF", default_value = "origin/main")]
+    baseline_ref: String,
+    /// Take the baseline from the latest report in this directory instead of a git ref (such
+    /// as the base branch's evals/reports, unpacked with `git archive`).
+    #[arg(long, conflicts_with = "baseline")]
+    baseline_reports: Option<PathBuf>,
+    /// Gate this report instead of running the category.
+    #[arg(long)]
+    candidate: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -142,88 +243,332 @@ fn resolve(conn: &Conn, config: &Config, trace_token: Option<&str>) -> Result<Re
     })
 }
 
-async fn real_main(cli: Cli) -> Result<bool> {
-    let root = cli.root;
-    match cli.command {
-        Command::Check { category } => {
-            let names = match category {
-                Some(c) => vec![c],
-                None => category_names(&root)?,
-            };
-            if names.is_empty() {
-                bail!("no categories under {}", root.join("categories").display());
-            }
-            let mut ok = true;
-            for name in names {
-                match load_category(&root, &name) {
-                    Ok(c) => println!(
-                        "{}: {} tasks for bot `{}`, bar {:.0}%",
-                        c.name,
-                        c.tasks.len(),
-                        c.bot,
-                        c.pass_bar * 100.0
-                    ),
-                    Err(e) => {
-                        eprint!("{name}: {e}");
-                        ok = false;
+/// Run a category as `run` and `gate` do, and write its report, compared with `previous`.
+/// Returns the report and its markdown path.
+async fn run_and_write(
+    root: &Path,
+    args: RunArgs,
+    previous: Option<(String, Report)>,
+) -> Result<(Report, PathBuf)> {
+    let config = Config::load(root).map_err(anyhow::Error::msg)?;
+    let category = load_category(root, &args.category)?;
+    for id in &args.tasks {
+        if !category.tasks.iter().any(|t| &t.id == id) {
+            bail!("--task {id}: no such task in {}", category.name);
+        }
+    }
+    if args.repeats == Some(0) {
+        bail!("--repeats must be at least 1");
+    }
+    let r = resolve(&args.conn, &config, args.trace_token.as_deref())?;
+    let applicable: Vec<_> = load_judges(root)
+        .map_err(|e| anyhow::anyhow!(e.join("\n")))?
+        .into_iter()
+        .filter(|j| j.applies_to(&category.name))
+        .collect();
+    let (judges, judges_skipped) = if applicable.is_empty() {
+        (None, None)
+    } else if args.no_judges {
+        (None, Some("--no-judges".to_string()))
+    } else if let Some(gateway) = args.gateway.gateway() {
+        let mut judges = Vec::new();
+        for j in applicable {
+            let cal = load_calibration(root, &j).map_err(anyhow::Error::msg)?;
+            let status = judge::status(&j, cal.as_ref());
+            judges.push((j, status));
+        }
+        (Some(JudgeRun { gateway, judges }), None)
+    } else {
+        eprintln!("warning: judges apply to {} but no gateway is configured (PMOS_GATEWAY_URL and PMOS_EVALS_GATEWAY_TOKEN); not asking them", category.name);
+        (
+            None,
+            Some("no gateway configured (PMOS_GATEWAY_URL and PMOS_EVALS_GATEWAY_TOKEN)".into()),
+        )
+    };
+    let opts = RunOptions {
+        requested_by: r.requested_by.clone(),
+        follow: r.follow.clone(),
+        concurrency: args.concurrency.unwrap_or(config.runner.concurrency).max(1),
+        date: args.date.unwrap_or_else(|| Utc::now().date_naive()),
+        note: args.note,
+        gateway_workarounds: std::env::var("PMOS_GATEWAY_WORKAROUNDS").ok(),
+        only: args.tasks,
+        repeats: args.repeats.unwrap_or(category.repeats),
+        decline_phrases: config.decline_phrases.clone(),
+        judges,
+        judges_skipped,
+    };
+    let dir = args.reports_dir.unwrap_or_else(|| root.join("reports"));
+    let previous = match previous {
+        Some(p) => Some(p),
+        None => latest_report(&dir, &category.name).map_err(anyhow::Error::msg)?,
+    };
+    let report = run_category(&r.rt, &r.url, &category, &opts).await;
+    let path = pmos_evals::report::write_with(
+        &dir,
+        &report,
+        previous.as_ref().map(|(n, r)| (n.as_str(), r)),
+    )
+    .with_context(|| format!("writing the report into {}", dir.display()))?;
+    Ok((report, path))
+}
+
+fn read_report(path: &Path) -> Result<Report> {
+    pmos_evals::report::read(path).map_err(anyhow::Error::msg)
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn check(root: &Path, category: Option<String>, content: &Path) -> Result<bool> {
+    let mut problems: Vec<String> = Vec::new();
+    let all = category_names(root)?;
+    let names = match category {
+        Some(c) => vec![c],
+        None => all.clone(),
+    };
+    if names.is_empty() {
+        bail!("no categories under {}", root.join("categories").display());
+    }
+    let config = Config::load(root);
+    if let Err(e) = &config {
+        problems.push(e.clone());
+    }
+    let registry = std::fs::read_to_string(content.join("tools.yaml"))
+        .ok()
+        .and_then(|t| pmos_contract::model::ToolRegistry::from_yaml(&t).ok());
+    if registry.is_none() {
+        eprintln!(
+            "note: no {}; drafts tools not checked against the registry",
+            content.join("tools.yaml").display()
+        );
+    }
+    let taxonomy = match Taxonomy::load(root) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            problems.extend(e);
+            None
+        }
+    };
+    let mut used: Vec<(String, String)> = Vec::new();
+    let mut declines = false;
+    for name in &names {
+        match load_category(root, name) {
+            Ok(c) => {
+                println!(
+                    "{}: {} tasks for bot `{}`, {}{}",
+                    c.name,
+                    c.tasks.len(),
+                    c.bot,
+                    match c.pass_bar {
+                        Some(b) => format!("bar {:.0}%", b * 100.0),
+                        None => "no bar (reports only)".into(),
+                    },
+                    if c.repeats > 1 {
+                        format!(", {} repeats", c.repeats)
+                    } else {
+                        String::new()
+                    }
+                );
+                if let Some(reg) = &registry {
+                    problems.extend(check_draft_tools(root, &c, reg));
+                }
+                for t in &c.tasks {
+                    declines |= t.expect.must_decline;
+                    for tag in &t.tags {
+                        used.push((format!("{}/tasks/{}.yaml", c.name, t.id), tag.clone()));
                     }
                 }
             }
-            Config::load(&root).map_err(anyhow::Error::msg)?;
-            if !ok {
-                bail!("the eval files have problems (above)");
-            }
-            Ok(true)
+            Err(e) => problems.extend(e.0),
         }
-        Command::Run(args) => {
-            let config = Config::load(&root).map_err(anyhow::Error::msg)?;
-            let category = load_category(&root, &args.category)?;
-            for id in &args.tasks {
-                if !category.tasks.iter().any(|t| &t.id == id) {
-                    bail!("--task {id}: no such task in {}", category.name);
+    }
+    if declines {
+        if let Ok(c) = &config {
+            if c.decline_phrases.is_empty() {
+                problems.push(format!(
+                    "{}: `must_decline` tasks need `decline_phrases`",
+                    root.join("config.yaml").display()
+                ));
+            }
+        }
+    }
+    match load_judges(root) {
+        Ok(judges) => {
+            for j in judges {
+                for c in &j.applies_to {
+                    if !all.contains(c) {
+                        problems.push(format!(
+                            "judges/{}.yaml: applies_to `{c}` is not a category",
+                            j.name
+                        ));
+                    }
+                }
+                used.push((format!("judges/{}.yaml", j.name), j.failure_mode.clone()));
+                let n = load_labels(root, &j).map(|l| l.len()).unwrap_or(0);
+                let cal = load_calibration(root, &j).ok().flatten();
+                println!(
+                    "judge {}: {n} labels, {}",
+                    j.name,
+                    judge::status(&j, cal.as_ref()).reason
+                );
+            }
+        }
+        Err(e) => problems.extend(e),
+    }
+    match load_all(&root.join("reports")) {
+        Ok(reports) => {
+            for (file, r) in reports {
+                let subs: BTreeSet<String> = r
+                    .tasks
+                    .iter()
+                    .filter_map(|t| t.tag.as_ref().and_then(|x| x.sub.clone()))
+                    .collect();
+                for s in subs {
+                    used.push((format!("reports/{file}"), s));
                 }
             }
-            let r = resolve(&args.conn, &config, args.trace_token.as_deref())?;
-            let opts = RunOptions {
-                requested_by: r.requested_by.clone(),
-                follow: r.follow.clone(),
-                concurrency: args.concurrency.unwrap_or(config.runner.concurrency).max(1),
-                date: args.date.unwrap_or_else(|| Utc::now().date_naive()),
-                note: args.note,
-                gateway_workarounds: std::env::var("PMOS_GATEWAY_WORKAROUNDS").ok(),
-                only: args.tasks,
-            };
-            let report = run_category(&r.rt, &r.url, &category, &opts).await;
-            let dir = args.reports_dir.unwrap_or_else(|| root.join("reports"));
-            let path = pmos_evals::report::write(&dir, &report)
-                .with_context(|| format!("writing the report into {}", dir.display()))?;
-            println!(
-                "{}: {} of {} passed ({:.0}%, bar {:.0}%): {}",
-                report.category,
+        }
+        Err(e) => problems.push(e),
+    }
+    if let Some(t) = &taxonomy {
+        for (place, tag) in used {
+            if !t.contains(&tag) {
+                problems.push(format!(
+                    "{place}: tag `{tag}` is not in {}",
+                    root.join("taxonomy.yaml").display()
+                ));
+            }
+        }
+    }
+    if !problems.is_empty() {
+        eprintln!(
+            "{} problem{} in the eval files:",
+            problems.len(),
+            if problems.len() == 1 { "" } else { "s" }
+        );
+        for p in &problems {
+            eprintln!("  - {p}");
+        }
+        bail!("the eval files have problems (above)");
+    }
+    Ok(true)
+}
+
+async fn real_main(cli: Cli) -> Result<bool> {
+    let root = cli.root;
+    match cli.command {
+        Command::Check { category, content } => check(&root, category, &content),
+        Command::Run(args) => {
+            let (report, path) = run_and_write(&root, args, None).await?;
+            let rate = format!(
+                "{} of {} passed ({:.0}%",
                 report.passed(),
                 report.total(),
-                report.pass_rate() * 100.0,
-                report.pass_bar * 100.0,
-                if report.met_bar() {
-                    "met"
-                } else {
-                    "below the bar"
-                }
+                report.pass_rate() * 100.0
             );
+            match (report.pass_bar, report.met_bar()) {
+                (Some(bar), Some(met)) => println!(
+                    "{}: {rate}, bar {:.0}%): {}",
+                    report.category,
+                    bar * 100.0,
+                    if met { "met" } else { "below the bar" }
+                ),
+                _ => println!("{}: {rate}): reports only, no pass bar", report.category),
+            }
             if let Some((tag, n)) = report.failures_by_tag().first() {
                 println!("top bottleneck: {tag} ({n})");
             }
             println!("report: {}", path.display());
-            Ok(report.met_bar())
+            Ok(report.met_bar().unwrap_or(true))
+        }
+        Command::Gate(args) => {
+            let category = args.run.category.clone();
+            let reports_dir = args
+                .run
+                .reports_dir
+                .clone()
+                .unwrap_or_else(|| root.join("reports"));
+            let (baseline, source) = match (&args.baseline, &args.baseline_reports) {
+                (Some(p), _) => (
+                    Some((file_name(p), read_report(p)?)),
+                    format!("`{}`", p.display()),
+                ),
+                (None, Some(dir)) => (
+                    latest_report(dir, &category).map_err(anyhow::Error::msg)?,
+                    format!("`{}`", dir.display()),
+                ),
+                (None, None) => (
+                    baseline_from_git(&reports_dir, &args.baseline_ref, &category)
+                        .map_err(anyhow::Error::msg)?,
+                    format!("`{}`", args.baseline_ref),
+                ),
+            };
+            if let Some((name, b)) = &baseline {
+                if b.category != category {
+                    bail!(
+                        "the baseline {name} is for `{}`, not `{category}`",
+                        b.category
+                    );
+                }
+            }
+            let (candidate, name) = match &args.candidate {
+                Some(p) => (read_report(p)?, file_name(p)),
+                None => {
+                    let (r, path) = run_and_write(&root, args.run, baseline.clone()).await?;
+                    eprintln!("report: {}", path.display());
+                    (r, file_name(&path.with_extension("json")))
+                }
+            };
+            if candidate.category != category {
+                bail!(
+                    "the candidate {name} is for `{}`, not `{category}`",
+                    candidate.category
+                );
+            }
+            let result = decide(baseline, &source, candidate, &name);
+            print!("{}", result.to_markdown());
+            Ok(result.passed())
+        }
+        Command::Compare {
+            baseline,
+            candidate,
+        } => {
+            let (a, b) = (read_report(&baseline)?, read_report(&candidate)?);
+            if a.category != b.category {
+                bail!(
+                    "{} is `{}` and {} is `{}`; compare runs of one category",
+                    file_name(&baseline),
+                    a.category,
+                    file_name(&candidate),
+                    b.category
+                );
+            }
+            println!(
+                "# Compare: {} ({}) → {} ({})\n",
+                file_name(&baseline),
+                a.date,
+                file_name(&candidate),
+                b.date
+            );
+            print!("{}", compare(&a, &b).to_markdown());
+            Ok(true)
         }
         Command::History {
             category,
             reports_dir,
         } => {
             let cat = load_category(&root, &category)?;
+            let Some(bar) = cat.pass_bar else {
+                println!("{category}: has no pass bar (reports only), so it can't meet one.");
+                return Ok(false);
+            };
             let dir = reports_dir.unwrap_or_else(|| root.join("reports"));
             let reports = load_reports(&dir, &category).map_err(anyhow::Error::msg)?;
-            let h = evaluate(&category, cat.pass_bar, &reports);
+            let h = evaluate(&category, bar, &reports);
             print!("{}", h.to_text());
             Ok(h.two_weeks_met)
         }
@@ -234,19 +579,105 @@ async fn real_main(cli: Cli) -> Result<bool> {
             let config = Config::load(&root).map_err(anyhow::Error::msg)?;
             let category = load_category(&root, &args.category)?;
             let r = resolve(&args.conn, &config, None)?;
+            let bot = resolve_bot(&category.bot, &r.requested_by);
             let asks: Vec<String> = category.tasks.iter().map(|t| t.ask.clone()).collect();
-            let result = run_load(
-                &r.rt,
-                &category.bot,
-                &r.requested_by,
-                &asks,
-                args.tasks,
-                &r.follow,
-            )
-            .await;
+            let result = run_load(&r.rt, &bot, &r.requested_by, &asks, args.tasks, &r.follow).await;
             let targets = &config.latency_targets;
-            print!("{}", result.to_markdown(&category.bot, targets));
+            print!("{}", result.to_markdown(&bot, targets));
             Ok(result.verdict(targets, args.enforce_targets))
+        }
+        Command::Judge {
+            command:
+                JudgeCommand::Calibrate {
+                    name,
+                    gateway,
+                    date,
+                },
+        } => {
+            let judges = load_judges(&root).map_err(|e| anyhow::anyhow!(e.join("\n")))?;
+            let Some(j) = judges.into_iter().find(|j| j.name == name) else {
+                bail!(
+                    "no judge `{name}` in {}",
+                    judge::judges_dir(&root).display()
+                );
+            };
+            let labels = load_labels(&root, &j).map_err(anyhow::Error::msg)?;
+            if labels.is_empty() {
+                bail!(
+                    "{}: no labels yet; add {{input, output, label}} lines first",
+                    j.labels_path(&root).display()
+                );
+            }
+            let Some(gw) = gateway.gateway() else {
+                bail!("no gateway: set PMOS_GATEWAY_URL and PMOS_EVALS_GATEWAY_TOKEN (the `evals` client's token in PMOS_GATEWAY_TOKENS)");
+            };
+            let mut verdicts = Vec::new();
+            for (i, l) in labels.iter().enumerate() {
+                let v = gw
+                    .ask(&j, &l.input, &l.output)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("label {}: {e}", i + 1))?;
+                verdicts.push(v);
+            }
+            let truth: Vec<bool> = labels.iter().map(|l| l.label).collect();
+            let date = date.unwrap_or_else(|| Utc::now().date_naive());
+            let cal = judge::calibrate(&j, date, &truth, &verdicts);
+            let path = j.calibration_path(&root);
+            std::fs::write(&path, serde_json::to_string_pretty(&cal)? + "\n")
+                .with_context(|| format!("writing {}", path.display()))?;
+            let rate =
+                |r: Option<f64>| r.map(|x| format!("{x:.2}")).unwrap_or_else(|| "n/a".into());
+            println!(
+                "{}: n {} ({} yes, {} no), TPR {}, TNR {}, {} unparsed",
+                j.name,
+                cal.n,
+                cal.positives,
+                cal.negatives,
+                rate(cal.tpr),
+                rate(cal.tnr),
+                cal.unparsed
+            );
+            println!("{}", judge::status(&j, Some(&cal)).reason);
+            println!("wrote {}", path.display());
+            Ok(true)
+        }
+        Command::Affected {
+            changed,
+            content,
+            content_prefix,
+            requested_by,
+        } => {
+            let text = match changed.as_deref() {
+                Some(p) if p != Path::new("-") => std::fs::read_to_string(p)
+                    .with_context(|| format!("reading {}", p.display()))?,
+                _ => {
+                    let mut s = String::new();
+                    std::io::stdin().read_to_string(&mut s)?;
+                    s
+                }
+            };
+            let paths: Vec<String> = text.lines().map(str::to_string).collect();
+            let requested_by = match requested_by {
+                Some(r) => r,
+                None => {
+                    Config::load(&root)
+                        .map_err(anyhow::Error::msg)?
+                        .runner
+                        .requested_by
+                }
+            };
+            let names = pmos_evals::affected::affected(
+                &root,
+                &content,
+                &content_prefix,
+                &requested_by,
+                &paths,
+            )
+            .map_err(anyhow::Error::msg)?;
+            for n in names {
+                println!("{n}");
+            }
+            Ok(true)
         }
     }
 }

@@ -1,0 +1,17 @@
+# seed: replace with case cards
+# Fixtures: the #field-questions thread (C0FIELD, 1731500000.000100) asking "Does DSM support
+# SAML SSO yet?", and the fake docs page dsm-saml-sso ("DSM supports SAML 2.0 single sign-on.").
+id: answer-sso-question
+ask: "Someone in #field-questions asked whether DSM supports SAML SSO yet (channel C0FIELD, thread 1731500000.000100). Check the support docs and draft my reply in that thread, with a link to the page."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: slack.post_reply
+      count: 1
+      require_fields: [channel, thread_ts, text]
+      allowed:
+        channel: [C0FIELD]
+        thread_ts: ["1731500000.000100"]
+      must_include: ["SAML", "support.acme.com"]

@@ -6,7 +6,7 @@ use chrono::Utc;
 use pmos_evals::client::{Event, TraceEntry};
 use pmos_evals::grade::{Check, Grade};
 use pmos_evals::outcome::Outcome;
-use pmos_evals::tag::{tag_failure, Tag, RULES};
+use pmos_evals::tag::{tag_failure, Tag, RULES, SUB_TAGS};
 use serde_json::{json, Value};
 
 fn ended(status: &str, error: Option<&str>) -> Outcome {
@@ -252,4 +252,204 @@ fn everything_else_is_the_model_with_a_reason() {
         (other.tag, other.reason.as_str()),
         (Tag::Model, "failed: i could not answer")
     );
+}
+
+fn sub_of(o: &Outcome, g: &Grade) -> String {
+    tag_failure(o, g).sub.expect("every failure gets a sub-tag")
+}
+
+#[test]
+fn model_failures_get_a_sub_tag_from_what_failed() {
+    let done = ended("done", None);
+    let cases: Vec<(Check, &str)> = vec![
+        (Check::NotDeclined, "model/answered-beyond-sources"),
+        (
+            Check::MissingCitation {
+                url: "https://support.acme.com/docs/x".into(),
+            },
+            "model/missing-citation",
+        ),
+        (
+            Check::ForbiddenText {
+                text: "<think>".into(),
+            },
+            "model/leaked-reasoning",
+        ),
+        (
+            Check::MissingText { text: "x".into() },
+            "model/missing-fact",
+        ),
+        (
+            Check::ForbiddenText { text: "x".into() },
+            "model/forbidden-text",
+        ),
+        (
+            Check::Approvals {
+                expected: 1,
+                got: 2,
+            },
+            "model/wrong-draft-count",
+        ),
+        (
+            Check::DraftCount {
+                tool: "jira.create_issue".into(),
+                expected: Some(1),
+                got: 0,
+            },
+            "model/wrong-draft-count",
+        ),
+        (
+            Check::DraftMissingField {
+                tool: "jira.create_issue".into(),
+                draft: "a".into(),
+                field: "summary".into(),
+            },
+            "model/incomplete-draft",
+        ),
+        (
+            Check::DraftNotAllowed {
+                tool: "jira.create_issue".into(),
+                draft: "a".into(),
+                field: "issue_type".into(),
+                value: Some("Saga".into()),
+                allowed: vec!["Story".into()],
+            },
+            "model/wrong-draft-value",
+        ),
+        (
+            Check::DraftMissingText {
+                tool: "jira.create_issue".into(),
+                draft: "a".into(),
+                text: "SAML".into(),
+            },
+            "model/draft-content",
+        ),
+        (Check::NoAnswer, "model/no-answer"),
+    ];
+    for (check, sub) in cases {
+        let g = failing(vec![check.clone()]);
+        assert_eq!(rule_of(&done, &g), is(Tag::Model, "model"), "{check:?}");
+        assert_eq!(sub_of(&done, &g), sub, "{check:?}");
+    }
+    // Declining comes first: it says most about what went wrong.
+    let both = failing(vec![
+        Check::MissingText { text: "x".into() },
+        Check::NotDeclined,
+    ]);
+    assert_eq!(sub_of(&done, &both), "model/answered-beyond-sources");
+    assert_eq!(
+        sub_of(&ended("failed", Some("no idea")), &wrong()),
+        "model/failed"
+    );
+    let slow = Outcome {
+        status: Some("working".into()),
+        timed_out: true,
+        events: vec![Event {
+            at: Utc::now(),
+            kind: "milestone".into(),
+            text: None,
+        }],
+        ..Outcome::default()
+    };
+    assert_eq!(sub_of(&slow, &wrong()), "model/timed-out");
+}
+
+#[test]
+fn a_draft_in_the_wrong_place_is_a_tool_failure() {
+    let wrong_place = |tool: &str, field: &str| {
+        failing(vec![Check::DraftNotAllowed {
+            tool: tool.into(),
+            draft: "apr_1".into(),
+            field: field.into(),
+            value: Some("ENG".into()),
+            allowed: vec!["PM".into()],
+        }])
+    };
+    let o = ended("needs_approval", None);
+    for (tool, field, sub) in [
+        (
+            "confluence.create_draft",
+            "space",
+            "tool/wrong-confluence-space",
+        ),
+        ("jira.create_issue", "project", "tool/wrong-jira-project"),
+        ("slack.post_reply", "channel", "tool/wrong-slack-channel"),
+        ("slack.post_reply", "thread_ts", "tool/wrong-slack-channel"),
+    ] {
+        let g = wrong_place(tool, field);
+        assert_eq!(rule_of(&o, &g), is(Tag::Tool, "draft-wrong-target"));
+        assert_eq!(sub_of(&o, &g), sub);
+    }
+    // A wrong value that isn't where the draft goes is the model's.
+    assert_eq!(
+        rule_of(&o, &wrong_place("jira.create_issue", "epic")),
+        is(Tag::Model, "model")
+    );
+}
+
+#[test]
+fn harness_rules_for_drafts_and_approvals() {
+    let unreadable = failing(vec![Check::DraftsUnreadable {
+        error: "404".into(),
+    }]);
+    let o = ended("needs_approval", None);
+    assert_eq!(
+        rule_of(&o, &unreadable),
+        is(Tag::Harness, "drafts-unreadable")
+    );
+    assert_eq!(sub_of(&o, &unreadable), "harness/drafts-unreadable");
+
+    // Extra approval items after a retry are the retry's, not the model's.
+    let extra = failing(vec![Check::Approvals {
+        expected: 1,
+        got: 2,
+    }]);
+    let mut retried = ended("needs_approval", None);
+    retried.attempts = 2;
+    assert_eq!(
+        rule_of(&retried, &extra),
+        is(Tag::Harness, "duplicate-approvals")
+    );
+    assert_eq!(sub_of(&retried, &extra), "harness/approval-count");
+    // One attempt, or too few items: the model drafted the wrong number.
+    assert_eq!(rule_of(&o, &extra).0, Tag::Model);
+    let fewer = failing(vec![Check::Approvals {
+        expected: 2,
+        got: 1,
+    }]);
+    assert_eq!(rule_of(&retried, &fewer).0, Tag::Model);
+}
+
+#[test]
+fn every_rule_but_model_and_wrong_target_gives_its_sub_tag() {
+    let queued = Outcome {
+        status: Some("queued".into()),
+        timed_out: true,
+        ..Outcome::default()
+    };
+    let t = tag_failure(&queued, &failing(vec![]));
+    assert_eq!(t.sub.as_deref(), Some("harness/never-claimed"));
+    let denied = with_trace(
+        ended("failed", Some("x")),
+        &[("policy_denial", json!({"tool": "slack.post"}))],
+    );
+    assert_eq!(
+        tag_failure(&denied, &wrong()).sub.as_deref(),
+        Some("policy/denied-in-trace")
+    );
+    let memory = ended("failed", Some("maximum context length exceeded"));
+    assert_eq!(
+        tag_failure(&memory, &wrong()).sub.as_deref(),
+        Some("memory/context-limit")
+    );
+}
+
+#[test]
+fn every_emitted_sub_tag_is_listed_and_under_its_rule_tag() {
+    let listed: HashSet<&str> = SUB_TAGS.iter().copied().collect();
+    assert_eq!(listed.len(), SUB_TAGS.len(), "a sub-tag listed twice");
+    for sub in SUB_TAGS {
+        let top = sub.split('/').next().unwrap();
+        assert!(Tag::ALL.iter().any(|t| t.as_str() == top), "{sub}");
+    }
 }
