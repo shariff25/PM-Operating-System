@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# The harness worker: the image each bot's OpenShell sandbox runs (docs/sandbox-policies.md).
+# Node is at /usr/local/bin/node, the path the sandbox policies allow.
+
+FROM node:22-bookworm-slim AS build
+ARG HTTPS_PROXY
+ARG NO_PROXY
+WORKDIR /src
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY harness/package.json harness/
+RUN --mount=type=secret,id=ca,required=false \
+    if [ -s /run/secrets/ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/ca; fi \
+ && npm_config_https_proxy="$HTTPS_PROXY" npm install -g pnpm@10.28.0 \
+ && pnpm config set https-proxy "${HTTPS_PROXY:-}" \
+ && pnpm install --frozen-lockfile
+COPY harness/ harness/
+RUN pnpm -C harness build
+
+FROM node:22-bookworm-slim
+COPY --from=build /src /opt/pmos
+# The sandbox uploads the bot's skills, master context and tools.yaml under /sandbox.
+ENV PMOS_CONTENT_ROOT=/sandbox NODE_ENV=production
+WORKDIR /sandbox/workspace
+USER node
+CMD ["/usr/local/bin/node", "/opt/pmos/harness/dist/main.js"]
