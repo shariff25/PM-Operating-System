@@ -70,6 +70,23 @@ pub struct TraceEntry {
     pub body: Value,
 }
 
+/// A draft: one of the task's approval items, from `GET /v1/tasks/{id}/drafts`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Draft {
+    pub id: String,
+    /// The registry name, such as `jira.create_issue`.
+    pub tool: String,
+    #[serde(default)]
+    pub args: Value,
+    #[serde(default)]
+    pub status: String,
+}
+
+#[derive(Deserialize)]
+struct Drafts {
+    drafts: Vec<Draft>,
+}
+
 /// A failed call to the runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -205,6 +222,13 @@ impl Runtime {
         let path = format!("/v1/tasks/{id}/events");
         let v = self.send("GET", &path, &self.token, None).await?;
         Self::decode("GET", &path, v)
+    }
+
+    /// `GET /v1/tasks/{id}/drafts`: the task's approval items with their tool and arguments.
+    pub async fn drafts(&self, id: &str) -> Result<Vec<Draft>, ApiError> {
+        let path = format!("/v1/tasks/{id}/drafts");
+        let v = self.send("GET", &path, &self.token, None).await?;
+        Self::decode::<Drafts>("GET", &path, v).map(|d| d.drafts)
     }
 
     /// `GET /v1/tasks/{id}/trace`, or `None` when this client may not read it (401, 403) or

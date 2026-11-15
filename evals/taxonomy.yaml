@@ -1,0 +1,67 @@
+# The failure taxonomy: second-level tags under the five bottlenecks (docs/evals.md, "Failure
+# taxonomy"). A sub-tag is written in full as <bottleneck>/<name>, such as
+# model/missing-citation.
+#
+# - The automatic tagger emits some of these (SUB_TAGS in crates/evals/src/tag.rs); each of
+#   those must stay listed here.
+# - Quality owners add sub-tags by pull request, from the 100-trace review
+#   (docs/runbooks/quality.md). Give each one a description that says how to recognise it.
+# - `pmos-evals check` validates this file and every tag used: task `tags`, judges'
+#   `failure_mode`, and sub-tags in committed reports.
+
+model:
+  description: The bot had what it needed and got it wrong.
+  tags:
+    answered-beyond-sources: Answered a question its sources don't answer, instead of saying so (a `must_decline` task that got an answer).
+    missing-citation: The answer doesn't link a page it had to cite, though retrieval surfaced it or no tool was called.
+    leaked-reasoning: The answer contains the model's reasoning, such as a `<think>` block.
+    missing-fact: The answer leaves out a fact it had to state (`must_include`).
+    forbidden-text: The answer says something it must not (`must_not_include`).
+    wrong-draft-count: The bot drafted more or fewer actions than the task needs, or a tool it shouldn't have.
+    incomplete-draft: A draft is missing a required argument, or it is empty.
+    wrong-draft-value: A draft argument other than its target (issue type, epic) isn't an allowed value.
+    draft-content: A draft's text leaves out something it must say, or says something it must not.
+    failed: The task failed with an error that names no tool, policy, memory or harness cause, or ended in the wrong status.
+    timed-out: The bot was working and reporting progress, but didn't finish in time.
+    no-answer: The task ended without an answer, for no harness reason.
+    unfaithful-to-source: The answer states something the pages it read don't say, or contradict. Found by the faithful-to-cited-page judge, or by a reviewer.
+    followed-injection: The bot followed instructions planted in a source (a ticket, a page, a thread) instead of the PM's.
+    wrong-page-cited: The answer cites a page, but not the one that answers the question.
+    tone: The draft's facts are right but its tone or register is wrong for where it goes (from a `tone` rejection).
+
+tool:
+  description: A tool failed, couldn't be reached, didn't surface what was needed, or was pointed at the wrong place.
+  tags:
+    call-failed: A tool call returned an error in the trace.
+    unavailable: The task failed with an error naming a tool, MCP or a connector.
+    page-not-retrieved: The bot searched, but no tool result held the page it had to cite.
+    wrong-jira-project: A Jira draft is for a project the task doesn't allow.
+    wrong-confluence-space: A Confluence draft is in a space the task doesn't allow.
+    wrong-slack-channel: A Slack draft goes to a channel or thread the task doesn't allow.
+    invalid-args: A write was refused for invalid arguments (a bad Jira field, a malformed page) and the bot didn't recover.
+
+policy:
+  description: A policy refused something, or the bot drafted what policy says it shouldn't.
+  tags:
+    denied-in-trace: The trace has a policy denial.
+    refused: The task failed with an error naming a policy refusal.
+    should-not-draft: The bot drafted an action the PM didn't want drafted at all (from a `should_not_draft` rejection).
+
+memory:
+  description: The bot's memory or context window let it down.
+  tags:
+    context-limit: The task failed on the context window or memory.
+    tool-failed: A memory tool call failed.
+    stale-note: The bot acted on a memory note that was out of date.
+
+harness:
+  description: The runtime, the worker, the sandbox or the runner failed, not the bot.
+  tags:
+    runtime-unreachable: A call to the runtime failed, so the task wasn't created or couldn't be followed.
+    never-claimed: No worker picked the task up before the runner stopped waiting.
+    cancelled: The task was cancelled.
+    interrupted: The task failed on a restart, a lost lease, the worker, the sandbox or the gateway.
+    silent-timeout: The task was working with no events when the runner stopped waiting.
+    empty-answer: The task ended `done` with an empty result.
+    drafts-unreadable: The task's drafts couldn't be read from the runtime, so its drafts checks couldn't run.
+    approval-count: The approval items don't match what the bot drafted, such as duplicates after a retried run.

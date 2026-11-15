@@ -127,6 +127,10 @@ fn opts(timeout_ms: u64) -> RunOptions {
         note: Some("test run".into()),
         gateway_workarounds: Some("off".into()),
         only: Vec::new(),
+        repeats: 1,
+        decline_phrases: vec!["don't answer".into()],
+        judges: None,
+        judges_skipped: None,
     }
 }
 
@@ -176,7 +180,7 @@ async fn full_run_grades_tags_and_writes_reports() {
     sorted.sort();
     assert_eq!(ids, sorted);
     assert_eq!(report.passed(), 2);
-    assert!(!report.met_bar());
+    assert_eq!(report.met_bar(), Some(false));
     assert_eq!(report.failures_by_tag()[0], (Tag::Harness, 2));
 
     // Timings come from the runtime's clock: ~20 ms queued, ~50 ms in all.
@@ -195,7 +199,7 @@ async fn full_run_grades_tags_and_writes_reports() {
         "{text}"
     );
     assert!(
-        text.contains("| `t-tool` | **FAIL** | tool (`page-not-retrieved`)"),
+        text.contains("| `t-tool` | **FAIL** | tool/page-not-retrieved (`page-not-retrieved`)"),
         "{text}"
     );
     assert!(text.contains("`off` (declared by the runner's environment)"));
@@ -373,6 +377,7 @@ async fn cli_run_history_and_check() {
     let dir = tempfile::tempdir().unwrap();
     let (id, yaml) = task("t-pass", "q-pass", "  approvals: 0\n");
     write_category(dir.path(), "cat", "docs", 1.0, &[(id.as_str(), yaml)]);
+    common::write_taxonomy(dir.path());
     let root = dir.path().to_path_buf();
 
     let bin = env!("CARGO_BIN_EXE_pmos-evals");
