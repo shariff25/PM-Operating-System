@@ -19,4 +19,6 @@ uploads:
     to: /sandbox/master/AGENTS.md
   - from: skills/docs
     to: /sandbox/skills/docs
+  - from: tools.yaml
+    to: /sandbox/tools.yaml
 workdir: /sandbox/workspace
