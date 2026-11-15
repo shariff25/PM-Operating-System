@@ -109,6 +109,26 @@ pub struct Catalog {
     tools: BTreeMap<String, ToolSpec>,
     skills: BTreeMap<String, Skill>,
     roster: Roster,
+    content_sha: Option<String>,
+}
+
+/// The commit the content checkout at `content_root` is on (`git rev-parse HEAD`), or
+/// `None` outside a git checkout. The ledger records it with every draft.
+pub fn content_head(content_root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(content_root)
+        .args(["rev-parse", "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let valid = out.status.success()
+        && (40..=64).contains(&head.len())
+        && head.chars().all(|c| c.is_ascii_hexdigit());
+    valid.then_some(head)
 }
 
 impl Catalog {
@@ -153,7 +173,14 @@ impl Catalog {
             tools,
             skills,
             roster,
+            content_sha: content_head(content_root),
         })
+    }
+
+    /// The content repo's `HEAD` when this catalog was loaded; `None` outside a git
+    /// checkout. [`crate::ToolService`] keeps the live value, which reindexing refreshes.
+    pub fn content_sha(&self) -> Option<&str> {
+        self.content_sha.as_deref()
     }
 
     /// The bots and roles as they were at start-up. [`crate::ToolService`] keeps the live
@@ -220,6 +247,21 @@ mod tests {
         assert_eq!(bot.role, "docs-helper");
         assert!(catalog.roster().bot("nobody").is_none());
         assert!(catalog.roster().roles().any(|r| r.name == "pm-assistant"));
+    }
+
+    #[test]
+    fn content_head_is_the_checkout_commit() {
+        // The repo's own content is in a git checkout (or a worktree of one).
+        let head = content_head(&repo_content()).expect("content is in a git checkout");
+        assert!(head.len() >= 40 && head.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            Catalog::load(&repo_content(), today())
+                .unwrap()
+                .content_sha(),
+            Some(head.as_str())
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(content_head(dir.path()), None);
     }
 
     #[test]

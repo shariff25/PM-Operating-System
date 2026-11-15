@@ -407,7 +407,100 @@ both_envs!(
     a_failed_task_says_why,
     routines_are_managed_by_their_owner,
     a_bots_own_worker_touches_only_that_bots_tasks,
+    drafts_are_read_from_the_tool_server_for_console_and_evals,
 );
+
+/// `GET /v1/tasks/{id}/drafts` (`docs/improvement-loop-spec.md` §3): the runtime reads each
+/// approval item from the tool server with its own service token.
+async fn drafts_are_read_from_the_tool_server_for_console_and_evals(env: &Env) {
+    let (status, task) = env
+        .post(
+            "/v1/tasks",
+            "evals",
+            None,
+            json!({"bot": "docs", "requested_by": "ben", "text": "File it", "source": "eval"}),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let tid = id(&task);
+    let path = format!("/v1/tasks/{tid}/drafts");
+
+    // Nothing drafted yet.
+    let (status, body) = env.get(&path, "evals", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({"drafts": []}));
+
+    let (status, _) = env.claim().await;
+    assert_eq!(status, 200);
+    env.post(
+        &format!("/v1/worker/tasks/{tid}/complete"),
+        "worker",
+        None,
+        json!({"result": "Drafted.", "approvals": ["apr_2", "apr_1", "apr_gone"]}),
+    )
+    .await;
+    env.ts.approvals.lock().unwrap().insert(
+        "apr_1".into(),
+        json!({"id": "apr_1", "user": "ben", "bot": "docs", "run_id": tid,
+            "tool": "jira.create_issue", "args": {"project": "PM", "summary": "SCIM"},
+            "args_hash": "h", "status": "pending", "created_at": "2026-11-14T10:00:00Z"}),
+    );
+    env.ts
+        .set_approval("apr_2", "slack.send_message", "rejected", Some("ben"));
+
+    let reads = *env.ts.approval_reads.lock().unwrap();
+    let (status, body) = env.get(&path, "evals", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({"drafts": [
+            {"id": "apr_2", "tool": "slack.send_message", "args": {}, "status": "rejected"},
+            {"id": "apr_1", "tool": "jira.create_issue",
+             "args": {"project": "PM", "summary": "SCIM"}, "status": "pending"},
+            {"id": "apr_gone", "tool": null, "args": null, "status": "missing"},
+        ]}),
+        "in the worker's order; an item the tool server lost reads missing"
+    );
+    assert_eq!(
+        *env.ts.approval_reads.lock().unwrap(),
+        reads + 3,
+        "fetched from the tool server with the service token"
+    );
+    let (status, console) = env.get(&path, "console", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(console, body);
+
+    // Slack and workers may not read drafts; evals sees only eval tasks.
+    let (status, _) = env.get(&path, "slack", Some("ben")).await;
+    assert_eq!(status, 403);
+    let (status, _) = env.get(&path, "worker", None).await;
+    assert_eq!(status, 403);
+    let slack_task = env.ask("Not an eval").await;
+    let (status, _) = env
+        .get(
+            &format!("/v1/tasks/{}/drafts", id(&slack_task)),
+            "evals",
+            None,
+        )
+        .await;
+    assert_eq!(status, 404);
+    let (status, _) = env
+        .get(
+            &format!("/v1/tasks/{}/drafts", id(&slack_task)),
+            "console",
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = env.get("/v1/tasks/tsk_nope/drafts", "console", None).await;
+    assert_eq!(status, 404);
+
+    // The tool server down: try again later, not an empty list.
+    *env.ts.approvals_down.lock().unwrap() = true;
+    let (status, body) = env.get(&path, "evals", None).await;
+    assert_eq!(status, 503, "{body}");
+    *env.ts.approvals_down.lock().unwrap() = false;
+}
 
 /// Each bot's sandbox holds its own worker token (`worker-docs`), so a compromised Docs-bot
 /// sandbox can't claim Ana's personal-bot task and receive its restricted session.
@@ -1114,6 +1207,12 @@ async fn every_endpoint_checks_the_client() {
             format!("/v1/tasks/{tid}/trace"),
             json!(null),
             &["console"],
+        ),
+        (
+            Method::GET,
+            format!("/v1/tasks/{tid}/drafts"),
+            json!(null),
+            &["console", "evals"],
         ),
         (
             Method::POST,
