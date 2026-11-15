@@ -38,7 +38,7 @@ reach PMs until the affected category still meets its bar (D10).
    ```
 7. **If the Slack app manifest changed** (`docs/slack-app-manifest.yaml`), update the app
    and reinstall it; see below.
-7. **Check:** run `deploy/pmos-admin smoke <your handle>`, then the benchmarks for any category
+8. **Check:** run `deploy/pmos-admin smoke <your handle>`, then the benchmarks for any category
    the change touches (`deploy/pmos-admin evals-run --category <c>`).
 
 ## Updating the Slack app
