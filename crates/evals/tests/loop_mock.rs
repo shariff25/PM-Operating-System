@@ -573,6 +573,50 @@ async fn cli_run_compare_and_gate() {
     )
     .await;
     assert_eq!(again.status.code(), Some(1), "{}", out(&again));
+    // Or with the baseline from a directory of reports, such as the base branch's: the
+    // latest there is the baseline.
+    let base_dir = root.join("base-reports");
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::copy(&baseline, base_dir.join("2026-11-09-cat.json")).unwrap();
+    let from_dir = cli_async(
+        root,
+        &[
+            "gate",
+            "--category",
+            "cat",
+            "--baseline-reports",
+            base_dir.to_str().unwrap(),
+            "--candidate",
+            failed.to_str().unwrap(),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(from_dir.status.code(), Some(1), "{}", out(&from_dir));
+    assert!(
+        String::from_utf8_lossy(&from_dir.stdout)
+            .contains("Baseline: `2026-11-09-cat.json` from `"),
+        "{}",
+        out(&from_dir)
+    );
+    let empty = root.join("no-reports");
+    std::fs::create_dir_all(&empty).unwrap();
+    let none = cli_async(
+        root,
+        &[
+            "gate",
+            "--category",
+            "cat",
+            "--baseline-reports",
+            empty.to_str().unwrap(),
+            "--candidate",
+            failed.to_str().unwrap(),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(none.status.code(), Some(0), "{}", out(&none));
+    assert!(String::from_utf8_lossy(&none.stdout).contains("No baseline"));
     let wrong = cli_async(
         root,
         &[

@@ -184,6 +184,10 @@ struct GateArgs {
     /// The git ref whose reports hold the baseline.
     #[arg(long, env = "PMOS_EVALS_BASELINE_REF", default_value = "origin/main")]
     baseline_ref: String,
+    /// Take the baseline from the latest report in this directory instead of a git ref (such
+    /// as the base branch's evals/reports, unpacked with `git archive`).
+    #[arg(long, conflicts_with = "baseline")]
+    baseline_reports: Option<PathBuf>,
     /// Gate this report instead of running the category.
     #[arg(long)]
     candidate: Option<PathBuf>,
@@ -488,12 +492,16 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 .reports_dir
                 .clone()
                 .unwrap_or_else(|| root.join("reports"));
-            let (baseline, source) = match &args.baseline {
-                Some(p) => (
+            let (baseline, source) = match (&args.baseline, &args.baseline_reports) {
+                (Some(p), _) => (
                     Some((file_name(p), read_report(p)?)),
                     format!("`{}`", p.display()),
                 ),
-                None => (
+                (None, Some(dir)) => (
+                    latest_report(dir, &category).map_err(anyhow::Error::msg)?,
+                    format!("`{}`", dir.display()),
+                ),
+                (None, None) => (
                     baseline_from_git(&reports_dir, &args.baseline_ref, &category)
                         .map_err(anyhow::Error::msg)?,
                     format!("`{}`", args.baseline_ref),
