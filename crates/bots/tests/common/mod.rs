@@ -63,6 +63,7 @@ fn skill(name: &str, tools: &[&str]) -> Skill {
         tools: tools.iter().map(|t| t.to_string()).collect(),
         surfaces: vec!["slack".into()],
         ships_in: None,
+        track: None,
     }
 }
 

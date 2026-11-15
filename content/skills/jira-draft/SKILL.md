@@ -9,6 +9,7 @@ metadata:
   tools: "context.search context.read jira.search jira.read jira.create_issue confluence.search confluence.read docs.search docs.read"
   surfaces: "slack web cli"
   ships-in: "team-launch"
+  track: "Delivery and launch"
 ---
 
 # /jira-draft

@@ -814,14 +814,17 @@ async fn the_bot_token_reads_and_decides_one_item() {
     let e = s.fixture.audit.events().last().cloned().unwrap();
     assert_eq!((e.outcome, e.client), (Outcome::Rejected, Client::Bot));
 
-    // Everything else about approvals stays orchestrator-only.
+    // It may list a member's pending items (the App Home; `tests/slack_reply.rs`): none are
+    // left. Everything else about approvals stays orchestrator-only.
     let res = http
         .get(format!("{}/internal/approvals?user=ana", s.base))
         .bearer_auth(BOT_TOKEN)
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 403);
+    assert_eq!(res.status(), 200);
+    let listed: Value = res.json().await.unwrap();
+    assert_eq!(listed, json!({"approvals": [], "total": 0}));
     let res = post(
         &s.base,
         BOT_TOKEN,

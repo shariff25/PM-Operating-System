@@ -68,7 +68,8 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | `DELETE /internal/session` + `X-Pmos-Session` | service or bot token | Revoke a session (sandbox ended) |
 | `POST /internal/call` + `X-Pmos-Session` `{tool, args}` | service or bot token | One tool call for the session, with the same rules as MCP: allowlist, argument checks, approvals for writes, audit (which records the caller). |
 | `POST /internal/grants` `{session_token, tool, args}` | service token | Record an approval given in the harness |
-| `GET /internal/approvals?user=&status=` | service token | A PM's inbox, newest first. `status` is `pending`, `executing`, `approved`, `rejected`, `failed` or `expired` |
+| `GET /internal/approvals?user=&status=` | service token | `{items: […]}`: a PM's inbox, newest first. `status` is `pending`, `executing`, `approved`, `rejected`, `failed` or `expired` (`400` for anything else) |
+| `GET /internal/approvals?user=` | bot token | The App Home Inbox: `{approvals: […], total}`, only `pending` items whatever `status` says, oldest first, at most 50. Each item reads as `GET /internal/approvals/{id}` returns it; `total` counts every pending item. `403` if `user` isn't a team member (live connectors) or is a team bot's identity; `400` without `user` |
 | `GET /internal/approvals/{id}` | service or bot token | One item: `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity` and `redacted_at` |
 | `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?}` | service or bot token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. |
 | `GET /internal/ledger?since=&until=&bot=&outcome=&min_edit=&limit=` | service or bot token | `{rows: […]}`, newest first. See **Feedback ledger**. `422` for a bad parameter |
@@ -77,7 +78,7 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | `GET /internal/oauth/{atlassian\|slack\|github}/start?user=` | service or bot token | The URL to send a PM to so they can link their account. The bot token gets URLs for team members only (`403` otherwise). `user=bots.<name>` (service token) gives the URL for a team bot's own account (`404` unless `<name>` is a team bot); GitHub links PMs only. |
 | `GET /oauth/{atlassian\|slack\|github}/callback` | none (the PM's browser) | Finishes linking; shows a short page |
 | `GET /internal/credentials?user=` | service token | A PM's linked accounts, without tokens |
-| `DELETE /internal/credentials/{user}/{provider}` | service token | Unlink (the PM disconnects, or a platform owner revokes) |
+| `DELETE /internal/credentials/{user}/{provider}` | service or bot token | Unlink (the PM disconnects, or a platform owner revokes): `204`, or `404` if nothing was linked. The bot token may unlink team members' accounts only (`403` otherwise, never a team bot's own), for the App Home's **Disconnect**. Audited as `credentials.unlink` with the client, `output_ref` the provider |
 | `POST /internal/memory/repo` `{user, repo}` | service or bot token | Check `repo` (`org/name`) with the PM's GitHub token and record it as their memory repo: `200 {repo, verified_at}`. `422 {error, code}` with `not_in_org`, `not_private`, `archived`, `no_push`, `not_found` or `bad_request`; `409 github_not_linked`; `504 github_unavailable` if GitHub doesn't answer within 1.8 s (it runs inside a Slack modal); `404 github_off` without GitHub |
 | `GET /internal/memory/repo?user=` | service or bot token | `{repo, verified_at}`, or `404` |
 | `POST /internal/members/requests` `{slack_id, email, name}` | service or bot token | A request to join: `201 {request}`, or `200 {request}` with the one already pending for that Slack id. `409 already_member`, `422 bad_request`, `429 too_many_pending` (past 20) |
@@ -88,7 +89,7 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 
 **Who holds which token:**
 - **Service token** (`PMOS_SERVICE_TOKEN`): the orchestrator, the bot runtime and platform-owner tools. Every route, and the only token that starts bot sessions.
-- **Bot token** (`PMOS_BOT_TOKEN`): the Slack bot. Only sessions for the skills in `PMOS_BOT_SKILLS` and calls within them, plus reading and deciding one approval item (`GET /internal/approvals/{id}` and its `decision`), for Slack approval cards, the onboarding routes, and `GET /internal/ledger` for the daily triage digest. A session started for another skill, or any bot session, looks to the bot like one that doesn't exist, and every other route (the ledger summary among them) returns `403`.
+- **Bot token** (`PMOS_BOT_TOKEN`): the Slack bot. Only sessions for the skills in `PMOS_BOT_SKILLS` and calls within them, plus reading and deciding one approval item (`GET /internal/approvals/{id}` and its `decision`), for Slack approval cards, the onboarding routes, `GET /internal/ledger` for the daily triage digest, and for the App Home (`docs/slack-home.md`) a team member's pending items (`GET /internal/approvals?user=`) and unlinking a team member's account (`DELETE /internal/credentials/{user}/{provider}`). A session started for another skill, or any bot session, looks to the bot like one that doesn't exist, and every other route (the ledger summary among them) returns `403`.
 - **Session token:** each sandbox gets only its own.
 
 Session tokens are sent in headers, never in a URL, so access logs and proxies don't record them. A tool error (refused, invalid arguments, not found) comes
@@ -164,6 +165,16 @@ thread is already waiting for <user> (or was posted); don't draft another."}`, a
 one. In Postgres a transaction-scoped advisory lock per user and thread makes concurrent
 drafts create one item.
 
+**One draft per tagged message.** When the PM tags PM OS in a thread
+(`docs/slack-mentions-and-home-spec.md`), the call also carries `message_ts`, the tagged
+message (optional; `^\d{1,12}\.\d{1,9}$`, checked with the other arguments). With it, only a
+reply with the same `channel`, `thread_ts` **and** `message_ts` blocks a new one, and the
+message says "A reply to this message …". Without it the rule is per thread, as above, and
+tagged replies in that thread count. `message_ts` is never sent to Slack (the connector
+posts only the channel, thread and text), is kept through expiry and the purge like
+`channel` and `thread_ts`, and isn't part of the ledger's edit-distance text. It is stored
+in `args`; no migration.
+
 **What a draft was built from.** Each session records the highest data class it has read
 (`sessions.sources_sensitivity`, which only rises):
 - `context_search` and `context_read`: each result's own `sensitivity`;
@@ -203,8 +214,8 @@ empty `team.yaml`, everyone is an outsider.
 
 **The 24-hour expiry (SLK-8).** A sweeper runs at start-up and every 10 minutes:
 - **Undecided drafts expire.** A `pending` Slack draft older than `PMOS_SLACK_DRAFT_TTL_HOURS`
-  (default 24) becomes `expired`. Every string argument except a top-level `channel` and
-  `thread_ts` becomes `"[expired]"`; the `args_hash` is kept, and `redacted_at` records when.
+  (default 24) becomes `expired`. Every string argument except a top-level `channel`,
+  `thread_ts` and `message_ts` becomes `"[expired]"`; the `args_hash` is kept, and `redacted_at` records when.
   The ledger row is stored as `expired`, and the item is audited with outcome `expired`.
 - **Decided drafts lose their text** the same way, the same time after their decision
   (`approved`, `rejected` or `failed`; the status stays). The posted copy lives in Slack, and

@@ -27,8 +27,8 @@ use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
 
 use crate::approvals::{
-    args_hash, redact_args, reply_thread, ApprovalItem, ApprovalRepo, DecideError, Decision,
-    Drafted, NewItem, Status, Verdict, GRANT_TTL_MINUTES, REPLY_TOOL,
+    args_hash, redact_args, reply_message, reply_thread, ApprovalItem, ApprovalRepo, DecideError,
+    Decision, Drafted, NewItem, Status, Verdict, GRANT_TTL_MINUTES, REPLY_TOOL,
 };
 use crate::audit::{AuditEvent, AuditSink};
 use crate::context::{
@@ -553,6 +553,7 @@ impl ApprovalRepo for PgStore {
             "SELECT {ITEM_COLUMNS} FROM approvals
              WHERE user_handle = $1 AND tool = $2 AND args ->> 'channel' = $3
                AND args ->> 'thread_ts' = $4 AND created_at >= $5
+               AND ($6::text IS NULL OR args ->> 'message_ts' = $6)
                AND status IN ('pending', 'executing', 'approved')
              ORDER BY created_at DESC, id LIMIT 1"
         );
@@ -562,6 +563,7 @@ impl ApprovalRepo for PgStore {
             .bind(channel)
             .bind(thread_ts)
             .bind(since)
+            .bind(reply_message(new.args))
             .fetch_optional(&mut *tx)
             .await?;
         if let Some(existing) = existing {

@@ -9,6 +9,7 @@ metadata:
   tools: "context.search context.read jira.search jira.read confluence.search confluence.read confluence.create_draft docs.search docs.read stats.sample_size"
   surfaces: "slack web cli"
   ships-in: "pilot"
+  track: "Metrics and experiments"
 ---
 
 # /experiment-design

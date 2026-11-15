@@ -33,8 +33,8 @@ use pmos_contract::{Sensitivity, ToolKind};
 use serde_json::{json, Value};
 
 use crate::approvals::{
-    args_hash, ApprovalItem, DecideError, Decision, Drafted, NewItem, Status, Verdict, REPLY_TOOL,
-    SLACK_DRAFT_TOOLS,
+    args_hash, reply_message, ApprovalItem, DecideError, Decision, Drafted, NewItem, Status,
+    Verdict, REPLY_TOOL, SLACK_DRAFT_TOOLS,
 };
 use crate::audit::{AuditEvent, Client, Outcome};
 use crate::catalog::{Catalog, Roster, ToolSpec};
@@ -1030,11 +1030,17 @@ impl ToolService {
                     event.outcome = Outcome::Ok;
                     event.detail = Some("already drafted".into());
                     event.output_ref = Some(existing.id.clone());
+                    // With `message_ts` (a tag), the rule is per message.
+                    let what = if reply_message(args).is_some() {
+                        "message"
+                    } else {
+                        "thread"
+                    };
                     return Ok(json!({
                         "status": "already_drafted",
                         "approval_id": existing.id,
                         "message": format!(
-                            "A reply to this thread is already waiting for {} (or was posted); don't draft another.",
+                            "A reply to this {what} is already waiting for {} (or was posted); don't draft another.",
                             session.user
                         ),
                     }));
@@ -1135,6 +1141,28 @@ impl ToolService {
         status: Option<Status>,
     ) -> Result<Vec<ApprovalItem>, StoreError> {
         self.stores.approvals.list(user, status).await
+    }
+
+    /// `user`'s pending items, oldest first (Slack drafts expire first), at most `limit`, and
+    /// how many are pending in all. For the Slack App Home's Inbox.
+    pub async fn pending_approvals(
+        &self,
+        user: &str,
+        limit: usize,
+    ) -> Result<(Vec<ApprovalItem>, usize), StoreError> {
+        let mut items = self
+            .stores
+            .approvals
+            .list(user, Some(Status::Pending))
+            .await?;
+        items.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let total = items.len();
+        items.truncate(limit);
+        Ok((items, total))
     }
 
     pub async fn approval(&self, id: &str) -> Result<Option<ApprovalItem>, StoreError> {
