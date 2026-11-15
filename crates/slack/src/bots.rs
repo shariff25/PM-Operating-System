@@ -141,6 +141,15 @@ impl Click {
     }
 }
 
+/// Which way an approval card turns without deciding anything.
+#[derive(Clone, Copy)]
+enum Flip {
+    /// **Reject**: the six reasons and **Back**.
+    Reasons,
+    /// **Back**: the card's own buttons again.
+    Back,
+}
+
 #[derive(Clone, Copy)]
 enum Change {
     Pause,
@@ -288,8 +297,19 @@ impl Bots {
                     .as_str()
                     .unwrap_or_default()
                 {
-                    action::APPROVE => Box::pin(async move { this.decide(click, "approve").await }),
-                    action::REJECT => Box::pin(async move { this.decide(click, "reject").await }),
+                    action::APPROVE => {
+                        Box::pin(async move { this.decide(click, "approve", None).await })
+                    }
+                    action::REJECT => {
+                        Box::pin(async move { this.flip_card(click, Flip::Reasons).await })
+                    }
+                    action::BACK => {
+                        Box::pin(async move { this.flip_card(click, Flip::Back).await })
+                    }
+                    a if cards::reason_of_action(a).is_some() => {
+                        let reason = cards::reason_of_action(a);
+                        Box::pin(async move { this.decide(click, "reject", reason).await })
+                    }
                     action::EDIT => Box::pin(async move { this.open_editor(click).await }),
                     action::ROUTINE_CREATE => {
                         Box::pin(async move { this.confirm_routine(click, true).await })
@@ -643,7 +663,35 @@ impl Bots {
         }
     }
 
-    async fn decide(&self, click: Click, decision: &'static str) {
+    /// **Reject** and **Back** change the card in place and decide nothing. Only the item's
+    /// own PM may turn it, and a card decided meanwhile shows its outcome instead.
+    async fn flip_card(&self, click: Click, flip: Flip) {
+        let Some(handle) = self.clicker(&click).await else {
+            return;
+        };
+        let Some(item) = self
+            .load_item(&click.channel, &click.user, &click.value)
+            .await
+        else {
+            return;
+        };
+        if !self.owns(&click.channel, &click.user, &handle, &item).await {
+            return;
+        }
+        let card = if item["status"] != "pending" {
+            let line = cards::decision_line(&item, &handle, false);
+            cards::approval_closed(&item, &line)
+        } else {
+            match flip {
+                Flip::Reasons => cards::approval_reasons(&item),
+                Flip::Back => cards::approval_card(&item),
+            }
+        };
+        self.update(&click.channel, &click.message_ts, card).await;
+    }
+
+    /// Approve, or reject with the reason chosen on the card.
+    async fn decide(&self, click: Click, decision: &'static str, reason: Option<&'static str>) {
         let Some(handle) = self.clicker(&click).await else {
             return;
         };
@@ -680,8 +728,15 @@ impl Bots {
         .await;
         let outcome = self
             .toolserver()
-            .decide(&click.value, &handle, decision, None)
-            .await;
+            .decide(&click.value, &handle, decision, None, reason)
+            .await
+            .map(|mut decided| {
+                // The card says why, whether or not the item echoes the reason back.
+                if let (Some(reason), true) = (reason, decided["reason"].is_null()) {
+                    decided["reason"] = json!(reason);
+                }
+                decided
+            });
         self.show_decision(
             &click.channel,
             &click.message_ts,
@@ -777,7 +832,7 @@ impl Bots {
         .await;
         let outcome = self
             .toolserver()
-            .decide(id, &handle, "edit", Some(args))
+            .decide(id, &handle, "edit", Some(args), None)
             .await;
         self.show_decision(channel, ts, &shown, &handle, outcome, true)
             .await;

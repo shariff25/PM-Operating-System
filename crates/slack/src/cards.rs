@@ -21,12 +21,38 @@ pub mod action {
     pub const APPROVE: &str = "apr_approve";
     pub const EDIT: &str = "apr_edit";
     pub const REJECT: &str = "apr_reject";
+    /// A reason button is this prefix and the reason's code: `apr_reason_tone`.
+    pub const REASON_PREFIX: &str = "apr_reason_";
+    /// Back from the reasons to the card's own buttons.
+    pub const BACK: &str = "apr_back";
     pub const EDIT_MODAL: &str = "apr_edit_modal";
     pub const ROUTINE_CREATE: &str = "rtn_create";
     pub const ROUTINE_CANCEL: &str = "rtn_cancel";
     pub const ROUTINE_PAUSE: &str = "rtn_pause";
     pub const ROUTINE_RESUME: &str = "rtn_resume";
     pub const ROUTINE_DELETE: &str = "rtn_delete";
+}
+
+/// Why a draft was rejected: the code the tool server's ledger stores, and the button's
+/// label (`docs/improvement-loop-spec.md` §1 and §4).
+pub const REASONS: [(&str, &str); 6] = [
+    ("wrong_facts", "Wrong facts"),
+    ("wrong_target", "Wrong place"),
+    ("tone", "Tone"),
+    ("incomplete", "Incomplete"),
+    ("should_not_draft", "Shouldn't have drafted"),
+    ("other", "Other"),
+];
+
+/// The reason code a button's action id carries, if it is one of [`REASONS`].
+pub fn reason_of_action(action_id: &str) -> Option<&'static str> {
+    let code = action_id.strip_prefix(action::REASON_PREFIX)?;
+    REASONS.iter().find(|(c, _)| *c == code).map(|(c, _)| *c)
+}
+
+/// The label of a reason code: `tone` → "Tone". `None` for anything else.
+pub fn reason_label(code: &str) -> Option<&'static str> {
+    REASONS.iter().find(|(c, _)| *c == code).map(|(_, l)| *l)
 }
 
 fn section(text: &str) -> Value {
@@ -308,6 +334,22 @@ pub fn approval_card(item: &Value) -> (String, Value) {
     )
 }
 
+/// The card after **Reject**: why, as six one-tap reasons, and **Back** to the card's own
+/// buttons. Nothing is decided until a reason is chosen.
+pub fn approval_reasons(item: &Value) -> (String, Value) {
+    let id = item["id"].as_str().unwrap_or_default();
+    let mut elements: Vec<Value> = REASONS
+        .iter()
+        .map(|(code, label)| button(label, &format!("{}{code}", action::REASON_PREFIX), id, None))
+        .collect();
+    elements.push(button("Back", action::BACK, id, None));
+    let mut blocks = approval_head(item);
+    blocks.push(section("*Why reject it?* Nothing is sent either way."));
+    blocks
+        .push(json!({"type": "actions", "block_id": format!("reject:{id}"), "elements": elements}));
+    ("Why reject it?".into(), Value::Array(blocks))
+}
+
 /// The card with a line under it instead of the buttons: decided, or being decided.
 pub fn approval_closed(item: &Value, line: &str) -> (String, Value) {
     let mut blocks = approval_head(item);
@@ -342,7 +384,10 @@ pub fn decision_line(item: &Value, decided_by: &str, edited: bool) -> String {
                 None => format!(":white_check_mark: {verb} by {who}"),
             }
         }
-        "rejected" => format!(":no_entry_sign: Rejected by {who}"),
+        "rejected" => match item["reason"].as_str().and_then(reason_label) {
+            Some(reason) => format!(":no_entry_sign: Rejected by {who}: {}", escape(reason)),
+            None => format!(":no_entry_sign: Rejected by {who}"),
+        },
         "failed" => format!(
             ":warning: {verb} by {who}, but the write failed: {}",
             escape(&truncate(
@@ -592,6 +637,48 @@ mod tests {
         );
         done["status"] = json!("rejected");
         assert!(decision_line(&done, "ana", false).contains("Rejected by Ana"));
+        done["reason"] = json!("should_not_draft");
+        assert_eq!(
+            decision_line(&done, "ana", false),
+            ":no_entry_sign: Rejected by Ana: Shouldn't have drafted"
+        );
+    }
+
+    #[test]
+    fn reject_reasons() {
+        let item = json!({
+            "id": "apr_1", "user": "ana", "tool": "jira.create_issue",
+            "args": {"summary": "Fix <login>"}, "status": "pending",
+        });
+        let (_, blocks) = approval_reasons(&item);
+        let actions = blocks.as_array().unwrap().last().unwrap();
+        let ids: Vec<&str> = actions["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["action_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "apr_reason_wrong_facts",
+                "apr_reason_wrong_target",
+                "apr_reason_tone",
+                "apr_reason_incomplete",
+                "apr_reason_should_not_draft",
+                "apr_reason_other",
+                action::BACK,
+            ]
+        );
+        assert!(actions["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["value"] == "apr_1"));
+        assert!(blocks.to_string().contains("*Summary:* Fix &lt;login&gt;"));
+        assert_eq!(reason_of_action("apr_reason_tone"), Some("tone"));
+        assert_eq!(reason_of_action("apr_reason_bogus"), None);
+        assert_eq!(reason_of_action("apr_reject"), None);
     }
 
     #[test]
