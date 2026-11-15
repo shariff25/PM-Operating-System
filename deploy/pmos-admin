@@ -93,13 +93,18 @@ eval_stack_up() { # checkout
   fi
   EVAL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pmos-evals.XXXXXX")
   chmod 755 "$EVAL_DIR"
-  # The checkout's content, plus the `evals` member and their personal bot pm-evals, whom the
-  # benchmark tasks are requested by. Only this copy is changed.
+  # The checkout's content, plus the members the fake fixtures expect: `evals` (U0EVALS), whom
+  # the benchmark tasks are requested by, with their personal bot pm-evals, and their teammates
+  # ben (U0BEN) and cy (U0CY), so the fake channels' audiences mean what the tasks say
+  # (crates/toolserver/src/connectors/fake.rs). Only this copy is changed.
   cp -r "$checkout/content" "$EVAL_DIR/content"
   mkdir -p "$EVAL_DIR/baseline" "$EVAL_DIR/out"
-  docker run --rm --user "${PMOS_UID:-10001}:${PMOS_GID:-10001}" -v "$EVAL_DIR/content:/srv/content" \
-    "pmos:${PMOS_VERSION:-local}" pmos member add --root /srv/content --handle evals \
-    --slack-id U0PMOSEVAL --roles pm >/dev/null
+  local who
+  for who in evals:U0EVALS ben:U0BEN cy:U0CY; do
+    docker run --rm --user "${PMOS_UID:-10001}:${PMOS_GID:-10001}" -v "$EVAL_DIR/content:/srv/content" \
+      "pmos:${PMOS_VERSION:-local}" pmos member add --root /srv/content --handle "${who%%:*}" \
+      --slack-id "${who##*:}" --roles pm >/dev/null
+  done
   chown -R "${PMOS_UID:-10001}:${PMOS_GID:-10001}" "$EVAL_DIR" 2>/dev/null || true
   export PMOS_EVAL_CONTENT="$EVAL_DIR/content" PMOS_EVAL_CHECKOUT="$checkout" PMOS_EVAL_BASELINE="$EVAL_DIR/baseline" PMOS_EVAL_OUT="$EVAL_DIR/out"
   for v in SERVICE_TOKEN BOT_TOKEN RT_EVALS RT_CONSOLE RT_DOCS RT_PERSONAL; do

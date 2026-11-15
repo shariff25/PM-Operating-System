@@ -704,7 +704,9 @@ pub fn reply_note(item: &Value, line: &str) -> (String, Value) {
     (truncate(line, 300), json!([section(&title), section(line)]))
 }
 
-/// The `audience_blocked` answer: why, in plain words, with only **Edit** and **Reject**.
+/// The `audience_blocked` answer: why, in plain words, with only **Reject**. Editing can't
+/// unblock it: the draft was built from restricted sources whatever its text now says, so
+/// the PM answers in the thread themselves if it still needs an answer.
 /// `outsiders` is how many members aren't in `team.yaml`; with none, the channel is
 /// externally shared.
 pub fn reply_blocked(item: &Value, outsiders: Option<u64>) -> (String, Value) {
@@ -716,14 +718,10 @@ pub fn reply_blocked(item: &Value, outsiders: Option<u64>) -> (String, Value) {
         _ => format!("{place} is shared outside Fortanix"),
     };
     let line = format!(
-        ":no_entry: This draft uses restricted sources and {why}, so nothing was posted. \
-         Edit it to leave the restricted details out, or reject it."
+        ":no_entry: This draft was built from restricted sources and {why}, so PM OS won't \
+         post it there. Reject it, and answer in the thread yourself if it still needs a reply."
     );
-    let mut elements = Vec::new();
-    if !editable_fields(item).is_empty() {
-        elements.push(button("Edit", action::EDIT, id, None));
-    }
-    elements.push(button("Reject", action::REJECT, id, Some("danger")));
+    let elements = vec![button("Reject", action::REJECT, id, Some("danger"))];
     let mut blocks = approval_head(item);
     blocks.push(section(&line));
     blocks.push(
@@ -998,9 +996,10 @@ mod tests {
         let (_, blocked) = reply_blocked(&item, Some(3));
         let s = blocked.to_string();
         assert!(s.contains(
-            "This draft uses restricted sources and 3 people in <#C0LAUNCH> aren't on the product team"
+            "This draft was built from restricted sources and 3 people in <#C0LAUNCH> aren't on the product team"
         ));
-        assert!(s.contains(action::EDIT) && s.contains(action::REJECT));
+        assert!(s.contains(action::REJECT));
+        assert!(!s.contains(action::EDIT), "an edit can't unblock it");
         assert!(!s.contains(action::APPROVE) && !s.contains(action::SNOOZE));
         let (_, shared) = reply_blocked(&item, None);
         assert!(shared
