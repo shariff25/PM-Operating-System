@@ -375,6 +375,121 @@ The p-value uses the pooled variance; the interval uses the unpooled variance.
 with `isError: true`):
 a rate outside 0 to 1, zero users, more conversions than users, or an `mde` of 0 or less.
 
+### `jira.rollup`: counts across teams
+
+`jira.rollup` (system `jira`, kind `read`) counts issues across projects, so a model never does.
+The `portfolio-review`, `roadmap-tradeoffs` and `business-review` skills declare it
+(`docs/levels.md`). It returns no descriptions or comments.
+
+| Argument | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `jql` | string, at most 2,000 characters | required | Which issues to count |
+| `group_by` | `project`, `epic`, `status`, `assignee` or `fix_version` | `project` | How to group them |
+| `max_issues` | integer, 1 to 1,000 | `500` | The most issues it reads |
+
+- **How it reads:** `GET /rest/api/3/search/jql` with the PM's own token, 100 issues a page,
+  following `nextPageToken`, asking only for `status`, `project`, `parent`, `fixVersions`,
+  `duedate`, `issuelinks`, `assignee` and `issuetype`. It stops at `max_issues` or after 45
+  seconds in all. A team bot's Jira scope applies as for search.
+- **It returns one item,** titled `Jira rollup: <n> issues by <group_by>`:
+
+```json
+{"counted": 6, "truncated": false, "reason": null, "group_by": "project",
+ "groups": [{"key": "PM", "name": "PM", "total": 3, "todo": 2, "in_progress": 1,
+             "done": 0, "overdue": 0, "unassigned": 0}],
+ "links": [{"from": "PM-102", "from_group": "PM", "relation": "blocks",
+            "to": "CLD-13", "to_group": "CLD", "to_state": "todo"}],
+ "links_truncated": false}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `truncated`, `reason` | `reason` is `"cap"` or `"time"` when it stopped early |
+| `groups[].todo`, `in_progress`, `done` | From Jira's status category: `new`, `indeterminate`, `done` |
+| `groups[].overdue` | A due date before today, and not done |
+| `groups[].unassigned` | No assignee |
+| `links` | Only links that cross groups, or leave the query (`to_group` is `null`), each pair once |
+
+**The limits:**
+- **Groups:** at most 50, largest first; the rest are summed into one group with key `other`.
+  An issue with no value for the grouping is in group `none`. With `fix_version`, an issue
+  counts in each of its versions.
+- **Links:** at most 200 (`links_truncated`). With `group_by: project`, the other issue's
+  project is its key's prefix.
+
+**The fake fixtures** (used only by the rollup, so search results don't change) hold six
+issues whatever the JQL says: the three `PM` issues (PM-101 in progress, PM-102 and PM-103 to
+do) and `CLD-11` (epic, in progress), `CLD-12` (story, done) and `CLD-13` (story, to do, due
+2026-10-01, unassigned). `PM-102` blocks `CLD-13`. By project: `PM` 3 (2 to do, 1 in
+progress, 0 done) and `CLD` 3 (1, 1, 1), with one overdue and one unassigned in `CLD`, and
+one link.
+
+### `stats.cashflow`: payback and net present value
+
+`stats.cashflow` (system `stats`, kind `read`) does the arithmetic of a business case. The
+`investment-case` and `pricing-proposal` skills declare it. Like the other stats tools it is
+deterministic, needs no linked account and has no read scope.
+
+| Argument | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `scenarios` | 1 to 5 of `{name, upfront, years}` | required | `upfront` is 0 or more; `years` is 1 to 10 of `{revenue, cost}`, each 0 or more |
+| `discount_rate` | number from 0 to 1 | `0.1` | The yearly rate for net present value |
+
+It returns `{scenarios, assumptions: {discount_rate}, note}`. Each scenario has:
+
+| Field | Meaning |
+| --- | --- |
+| `net_by_year` | Revenue minus cost, each year |
+| `cumulative_by_year` | Running total, starting from minus `upfront` |
+| `payback_years` | When the cumulative figure reaches zero, in years and fractions (straight-line within the year); `null` if it never does |
+| `npv` | Minus `upfront`, plus each year's net divided by `(1 + rate)^year` |
+| `total_revenue`, `total_cost` | The sums |
+
+Money is rounded to 2 decimals and `payback_years` to 1. Bad input is refused as invalid
+arguments. The `note` says the result is arithmetic on the inputs, not a forecast.
+
+**Check:** upfront 100; year 1 revenue 60, cost 10; year 2 revenue 80, cost 10; rate 0.1 gives
+net 50 and 70, cumulative -50 and 20, payback 1.7 and npv 3.31. The `principal-craft`
+benchmark and `docs/levels.md` quote these.
+
+### The bets register
+
+`bets.list`, `bets.read` and `bets.record` (system `bets`) keep a PM's bets across months
+(`docs/levels.md`). The `bets-register` skill declares them. A bet is one note in the PM's own
+memory, key `bet-<key>`, so it lives wherever their memory does (their private GitHub repo
+when memory is on GitHub). The tool server owns the note's format: it parses and renders it,
+and the model never writes the whole note.
+
+A bet has `key`, `title`, `status` (`open`, `confirmed`, `refuted`, `dropped`), `bet` (one
+sentence), `metric`, `riskiest_assumption`, `test`, `opened`, `review_by`, `evidence`
+(`[{date, text, source?}]`), `decisions` (the same shape) and `updated_at`.
+
+| Tool | Kind | Arguments | Returns |
+| --- | --- | --- | --- |
+| `bets.list` | read | `status?` | `{"bets": [{key, title, status, review_by, updated_at}]}`, soonest review first |
+| `bets.read` | read | `key` | `{"bet": {…}}`; an unknown key is not found |
+| `bets.record` | write | below | `{"bet": {…}, "created": true\|false}`, after approval |
+
+**`bets.record` arguments:**
+- `key`: 1 to 60 characters of `a-z`, `0-9` and `-`;
+- optional `title`, `status`, `bet`, `metric`, `riskiest_assumption` and `test` (each at most
+  500 characters), and `review_by` (`YYYY-MM-DD`);
+- optional `evidence`: up to 5 of `{date, text (at most 500), source?}`;
+- optional `decision`: `{date, text (at most 500), source?}`.
+
+**The rules:**
+- **A new bet** needs `title`, `bet`, `metric`, `riskiest_assumption` and `review_by`. Its
+  status starts `open` and `opened` is today.
+- **An existing bet:** the fields given replace the old ones; evidence and the decision are
+  appended.
+- **An approval, like every write.** Nothing is saved before approval. On approval the server
+  merges and saves.
+- **A full note** (over the memory limit of 4,000 characters) drops its oldest evidence until
+  it fits, and records how many it dropped.
+- **Who may use them:** a PM's own sessions and their personal bot, as with the memory tools.
+  Reading a bet raises the session to `internal`.
+- **Role:** `pm-assistant` has `bets.record: approve` in its `actions`.
+
 ## Connectors and account linking
 
 With `PMOS_CONNECTORS=live`, every Jira, Confluence and Slack call acts as the PM, with the

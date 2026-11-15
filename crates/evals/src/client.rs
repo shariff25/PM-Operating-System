@@ -195,15 +195,19 @@ impl Runtime {
         })
     }
 
-    /// `POST /v1/tasks` with `source: "eval"`.
+    /// `POST /v1/tasks` with `source: "eval"`, and the category's `level` when it has one.
     pub async fn create_task(
         &self,
         bot: &str,
         requested_by: &str,
         text: &str,
+        level: Option<&str>,
     ) -> Result<RuntimeTask, ApiError> {
-        let body =
+        let mut body =
             json!({"bot": bot, "requested_by": requested_by, "text": text, "source": "eval"});
+        if let Some(level) = level {
+            body["level"] = json!(level);
+        }
         let v = self
             .send("POST", "/v1/tasks", &self.token, Some(body))
             .await?;

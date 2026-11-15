@@ -25,6 +25,48 @@ fn is_slack_ts(s: &str) -> bool {
         .is_some_and(|(a, b)| digits(a, 12) && digits(b, 9))
 }
 
+/// A calendar date, such as `2026-11-15`.
+pub const DATE_PATTERN: &str = r"^\d{4}-\d{2}-\d{2}$";
+
+/// Is `s` a real calendar date written as [`DATE_PATTERN`]? Checked by hand, and then as a
+/// date (so `2026-02-30` is refused).
+pub fn is_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+        && chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+}
+
+/// A bet's key: 1 to 60 lowercase letters, digits and hyphens.
+pub const BET_KEY_PATTERN: &str = r"^[a-z0-9-]{1,60}$";
+
+/// Does `s` match [`BET_KEY_PATTERN`]?
+pub fn is_bet_key(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 60
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// One dated entry in a bet's evidence or decisions.
+fn dated_entry(what: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": format!("{what}: the date it happened, one or two sentences, and where it came from"),
+        "properties": {
+            "date": {"type": "string", "pattern": DATE_PATTERN, "description": "YYYY-MM-DD"},
+            "text": {"type": "string", "maxLength": crate::bets::MAX_FIELD_CHARS},
+            "source": {"type": "string", "maxLength": crate::bets::MAX_FIELD_CHARS, "description": "A link or a Jira or Confluence id"},
+        },
+        "required": ["date", "text"],
+        "additionalProperties": false,
+    })
+}
+
 fn limit() -> Value {
     json!({"type": "integer", "minimum": 1, "maximum": 20, "description": "Maximum results (default 5)"})
 }
@@ -58,6 +100,14 @@ pub fn input_schema(tool: &str) -> Option<Value> {
         "jira.read" => object(
             json!({"key": {"type": "string", "description": "Issue key, such as PM-101"}}),
             &["key"],
+        ),
+        "jira.rollup" => object(
+            json!({
+                "jql": {"type": "string", "description": "JQL query for the issues to count, such as project in (PM, CLD) AND sprint in openSprints()", "maxLength": 2000},
+                "group_by": {"type": "string", "enum": crate::connectors::rollup::GROUP_BY, "description": "How to group the counts (default project). With fix_version an issue counts in each of its versions"},
+                "max_issues": {"type": "integer", "minimum": 1, "maximum": crate::connectors::rollup::MAX_ISSUES, "description": "Most issues to read (default 500)"},
+            }),
+            &["jql"],
         ),
         "jira.create_issue" => object(
             json!({
@@ -161,19 +211,96 @@ pub fn input_schema(tool: &str) -> Option<Value> {
                 &["control", "treatment"],
             )
         }
+        "stats.cashflow" => object(
+            json!({
+                "scenarios": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": crate::stats::MAX_SCENARIOS,
+                    "description": "1 to 5 scenarios, such as low, base and high",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "maxLength": 100},
+                            "upfront": {"type": "number", "minimum": 0, "description": "Spent before year 1 (year 0)"},
+                            "years": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": crate::stats::MAX_YEARS,
+                                "description": "Year 1, year 2, …: 1 to 10 years",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "revenue": {"type": "number", "minimum": 0},
+                                        "cost": {"type": "number", "minimum": 0},
+                                    },
+                                    "required": ["revenue", "cost"],
+                                    "additionalProperties": false,
+                                },
+                            },
+                        },
+                        "required": ["name", "upfront", "years"],
+                        "additionalProperties": false,
+                    },
+                },
+                "discount_rate": {"type": "number", "minimum": 0, "maximum": 1, "description": "Yearly discount rate for the net present value (default 0.1)"},
+            }),
+            &["scenarios"],
+        ),
+        "bets.list" => object(
+            json!({"status": {"type": "string", "enum": crate::bets::STATUSES, "description": "Only bets with this status"}}),
+            &[],
+        ),
+        "bets.read" => object(
+            json!({"key": {"type": "string", "pattern": BET_KEY_PATTERN, "description": "The bet's key, from bets_list"}}),
+            &["key"],
+        ),
+        "bets.record" => {
+            let field = |d: &str| json!({"type": "string", "maxLength": crate::bets::MAX_FIELD_CHARS, "description": d});
+            object(
+                json!({
+                    "key": {"type": "string", "pattern": BET_KEY_PATTERN, "description": "Short slug for the bet, such as sso-enterprise-tier: 1 to 60 lowercase letters, digits and hyphens"},
+                    "title": field("A short name for the bet"),
+                    "status": {"type": "string", "enum": crate::bets::STATUSES, "description": "Change only when the metric or the test's result supports it, with that evidence in the same call"},
+                    "bet": field("The bet in one sentence: what we believe and what we are doing about it"),
+                    "metric": field("The number that shows whether the bet is paying off"),
+                    "riskiest_assumption": field("The assumption that, if wrong, sinks the bet"),
+                    "test": field("How and when the riskiest assumption is tested"),
+                    "review_by": {"type": "string", "pattern": DATE_PATTERN, "description": "YYYY-MM-DD: when to review the bet next"},
+                    "evidence": {"type": "array", "maxItems": crate::bets::MAX_EVIDENCE_PER_CALL, "items": dated_entry("Evidence"), "description": "New evidence, appended to what the bet has"},
+                    "decision": dated_entry("A decision taken on the bet, appended"),
+                }),
+                &["key"],
+            )
+        }
         _ => return None,
     };
     Some(schema)
 }
 
-/// Check the arguments' top level against a schema built by this module: required keys
-/// present, no unknown keys, and string, integer and enum types right, and a string's
-/// `pattern` when it is [`SLACK_TS_PATTERN`] (the only one used). Full JSON Schema
-/// validation is not needed for these flat objects.
+/// Check the arguments against a schema built by this module: required keys present, no
+/// unknown keys, string, integer, number, boolean, object and array types right, `enum`,
+/// `maxLength`, `minimum`/`maximum`, `minItems`/`maxItems`, and a string's `pattern` when it
+/// is one of the patterns defined here ([`SLACK_TS_PATTERN`], [`DATE_PATTERN`],
+/// [`BET_KEY_PATTERN`]), checked by hand. Nested objects and array items are checked the
+/// same way, and errors name the path, such as `scenarios[0].years[1].cost`. Full JSON
+/// Schema validation is not needed for these schemas.
 pub fn check_args(schema: &Value, args: &Value) -> Result<(), String> {
-    let obj = args
-        .as_object()
-        .ok_or_else(|| "arguments must be an object".to_string())?;
+    if !args.is_object() {
+        return Err("arguments must be an object".to_string());
+    }
+    check_object(schema, args, "")
+}
+
+fn check_object(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
+    let obj = value.as_object().ok_or_else(|| match path {
+        "" => "arguments must be an object".to_string(),
+        p => format!("argument `{p}` must be an object"),
+    })?;
+    let join = |key: &str| match path {
+        "" => key.to_string(),
+        p => format!("{p}.{key}"),
+    };
     let props = schema["properties"]
         .as_object()
         .cloned()
@@ -181,58 +308,120 @@ pub fn check_args(schema: &Value, args: &Value) -> Result<(), String> {
     for key in schema["required"].as_array().into_iter().flatten() {
         let key = key.as_str().unwrap_or_default();
         if !obj.contains_key(key) {
-            return Err(format!("missing required argument `{key}`"));
+            return Err(format!("missing required argument `{}`", join(key)));
         }
     }
     for (key, value) in obj {
         let Some(prop) = props.get(key) else {
-            return Err(format!("unknown argument `{key}`"));
+            return Err(format!("unknown argument `{}`", join(key)));
         };
-        match prop["type"].as_str() {
-            Some("string") => {
-                let s = value
-                    .as_str()
-                    .ok_or_else(|| format!("argument `{key}` must be a string"))?;
-                if let Some(max) = prop["maxLength"].as_u64() {
-                    if s.chars().count() as u64 > max {
-                        return Err(format!("argument `{key}` is longer than {max} characters"));
-                    }
+        check_value(prop, value, &join(key))?;
+    }
+    Ok(())
+}
+
+fn check_value(prop: &Value, value: &Value, key: &str) -> Result<(), String> {
+    match prop["type"].as_str() {
+        Some("string") => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| format!("argument `{key}` must be a string"))?;
+            if let Some(max) = prop["maxLength"].as_u64() {
+                if s.chars().count() as u64 > max {
+                    return Err(format!("argument `{key}` is longer than {max} characters"));
                 }
-                if prop["pattern"].as_str() == Some(SLACK_TS_PATTERN) && !is_slack_ts(s) {
+            }
+            match prop["pattern"].as_str() {
+                Some(SLACK_TS_PATTERN) if !is_slack_ts(s) => {
                     return Err(format!(
                         "argument `{key}` must be a Slack message timestamp, such as 1731600300.000200"
                     ));
                 }
-                if let Some(options) = prop["enum"].as_array() {
-                    if !options.iter().any(|o| o == value) {
-                        return Err(format!(
-                            "argument `{key}` must be one of {}",
-                            Value::Array(options.clone())
-                        ));
-                    }
+                Some(DATE_PATTERN) if !is_date(s) => {
+                    return Err(format!(
+                        "argument `{key}` must be a date written YYYY-MM-DD, such as 2026-11-15"
+                    ));
+                }
+                Some(BET_KEY_PATTERN) if !is_bet_key(s) => {
+                    return Err(format!(
+                        "argument `{key}` must be 1 to 60 lowercase letters, digits or hyphens"
+                    ));
+                }
+                _ => {}
+            }
+            if let Some(options) = prop["enum"].as_array() {
+                if !options.iter().any(|o| o == value) {
+                    return Err(format!(
+                        "argument `{key}` must be one of {}",
+                        Value::Array(options.clone())
+                    ));
                 }
             }
-            Some("integer") => {
-                let n = value
-                    .as_i64()
-                    .ok_or_else(|| format!("argument `{key}` must be an integer"))?;
-                let min = prop["minimum"].as_i64().unwrap_or(i64::MIN);
-                let max = prop["maximum"].as_i64().unwrap_or(i64::MAX);
-                if n < min || n > max {
+        }
+        Some("integer") => {
+            let n = value
+                .as_i64()
+                .ok_or_else(|| format!("argument `{key}` must be an integer"))?;
+            let min = prop["minimum"].as_i64().unwrap_or(i64::MIN);
+            let max = prop["maximum"].as_i64().unwrap_or(i64::MAX);
+            if n < min || n > max {
+                return Err(format!("argument `{key}` must be between {min} and {max}"));
+            }
+        }
+        Some("number") => {
+            let n = value
+                .as_f64()
+                .filter(|n| n.is_finite())
+                .ok_or_else(|| format!("argument `{key}` must be a number"))?;
+            match (prop["minimum"].as_f64(), prop["maximum"].as_f64()) {
+                (Some(min), Some(max)) if n < min || n > max => {
                     return Err(format!("argument `{key}` must be between {min} and {max}"));
                 }
+                (Some(min), None) if n < min => {
+                    return Err(format!("argument `{key}` must be {min} or more"));
+                }
+                (None, Some(max)) if n > max => {
+                    return Err(format!("argument `{key}` must be {max} or less"));
+                }
+                _ => {}
             }
-            Some("number") if !value.is_number() => {
-                return Err(format!("argument `{key}` must be a number"));
-            }
-            Some("boolean") if !value.is_boolean() => {
-                return Err(format!("argument `{key}` must be true or false"));
-            }
-            Some("object") if !value.is_object() => {
+        }
+        Some("boolean") if !value.is_boolean() => {
+            return Err(format!("argument `{key}` must be true or false"));
+        }
+        Some("object") => {
+            if !value.is_object() {
                 return Err(format!("argument `{key}` must be an object"));
             }
-            _ => {}
+            if prop.get("properties").is_some() {
+                check_object(prop, value, key)?;
+            }
         }
+        Some("array") => {
+            let items = value
+                .as_array()
+                .ok_or_else(|| format!("argument `{key}` must be a list"))?;
+            let min = prop["minItems"].as_u64().unwrap_or(0);
+            let max = prop["maxItems"].as_u64().unwrap_or(u64::MAX);
+            let n = items.len() as u64;
+            if n < min || n > max {
+                return Err(match (min, max) {
+                    (0, max) => format!("argument `{key}` has at most {max} entries (got {n})"),
+                    (min, u64::MAX) => {
+                        format!("argument `{key}` needs at least {min} entries (got {n})")
+                    }
+                    (min, max) => {
+                        format!("argument `{key}` must have {min} to {max} entries (got {n})")
+                    }
+                });
+            }
+            if let Some(item) = prop.get("items") {
+                for (i, v) in items.iter().enumerate() {
+                    check_value(item, v, &format!("{key}[{i}]"))?;
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }

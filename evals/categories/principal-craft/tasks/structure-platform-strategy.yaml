@@ -1,0 +1,20 @@
+# seed: replace with case cards
+# The platform-strategy skill titles its draft `Platform strategy:` and follows
+# content/templates/platform-strategy.md: build, buy or partner, and what becomes a platform.
+id: structure-platform-strategy
+ask: "Draft anyway, no questions: a platform strategy in the PM space for identity in Acme Vault and Acme Cloud: should we build, buy or partner for SSO and SCIM (Jira epic PM-101, story PM-102)?"
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Platform strategy:", "Diagnosis", "Build, buy or partner", "What becomes a platform", "What must be true"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: platform-strategy
+tags:
+  - model/draft-content

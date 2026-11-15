@@ -6,8 +6,9 @@
 //!   ticked ones, one at a time, through the same decision call as the cards; the view then
 //!   says how each one ended. Editing, Snooze and confirming an external channel stay on the
 //!   card in the DM.
-//! - **Skills:** the skills with the `slack` surface that the member's personal bot's role
-//!   lists (the Docs bot's without one), grouped by `track`.
+//! - **Skills:** the member's level ("You're set to the *Staff* level …", left out when the
+//!   runtime doesn't answer), then the skills with the `slack` surface that the member's
+//!   personal bot's role lists (the Docs bot's without one), grouped by `track`.
 //! - **Accounts:** Jira and Confluence, Slack and GitHub, each Connected (**Disconnect**) or
 //!   Not connected (**Connect**), and the memory repo.
 //!
@@ -73,7 +74,7 @@ const CATALOG_TTL: Duration = Duration::from_secs(60);
 
 /// The tracks in the order the Skills section shows them; any other track follows,
 /// alphabetically, then "Other".
-pub const TRACKS: [&str; 8] = [
+pub const TRACKS: [&str; 10] = [
     "Everyday",
     "Product sense",
     "Strategy and decisions",
@@ -82,6 +83,8 @@ pub const TRACKS: [&str; 8] = [
     "Customer and market",
     "AI products",
     "Delivery and launch",
+    "Leading across teams",
+    "Company bets",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,14 +520,19 @@ pub fn first_sentence(description: &str) -> String {
     truncate(&d[..end], SKILL_LINE_MAX)
 }
 
-/// The Skills section: how to use them, then one header per track and a line per skill.
-/// `allowed` is the role's skills; `None` when they couldn't be loaded (every Slack skill is
-/// shown, with a note).
+/// The Skills section: the PM's level (when the runtime said), how to use them, then one
+/// header per track and a line per skill. `allowed` is the role's skills; `None` when they
+/// couldn't be loaded (every Slack skill is shown, with a note).
 pub fn skills(
     catalog: &[(String, String, Option<String>)],
     allowed: Option<&[String]>,
+    level: Option<&str>,
 ) -> Vec<Value> {
-    let mut blocks = vec![section(SKILLS_HOW)];
+    let mut blocks = Vec::new();
+    if let Some(level) = level {
+        blocks.push(section(&crate::level::home_line(level)));
+    }
+    blocks.push(section(SKILLS_HOW));
     if allowed.is_none() {
         blocks.push(context(
             "PM OS couldn't load which skills your bot has, so this lists every skill for Slack.",
@@ -874,7 +882,14 @@ impl Bots {
                 None
             }
         };
-        skills(&catalog, allowed.as_deref())
+        let level = match self.runtime().level(handle).await {
+            Ok(level) => Some(level),
+            Err(e) => {
+                tracing::warn!(error = %e, "the PM's level is unavailable for the Home");
+                None
+            }
+        };
+        skills(&catalog, allowed.as_deref(), level.as_deref())
     }
 
     async fn accounts_body(&self, handle: &str) -> Vec<Value> {
@@ -1117,7 +1132,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let blocks = skills(&catalog, Some(&allowed));
+        let blocks = skills(&catalog, Some(&allowed), None);
         let headers: Vec<&str> = blocks
             .iter()
             .filter(|b| b["type"] == "header")
@@ -1138,6 +1153,40 @@ mod tests {
         assert!(!s.contains("And more"));
         assert!(!s.contains("hidden"));
         assert_eq!(first_sentence(&"word ".repeat(100)).chars().count(), 151);
+        assert!(
+            !s.contains("level"),
+            "no level line when the runtime didn't say"
+        );
+    }
+
+    #[test]
+    fn skills_show_the_level_first_and_the_new_tracks_last() {
+        let s = |n: &str, t: &str| (n.to_string(), format!("Does {n}."), Some(t.to_string()));
+        let catalog = vec![
+            s("vision-doc", "Company bets"),
+            s("portfolio-review", "Leading across teams"),
+            s("launch-plan", "Delivery and launch"),
+            s("ask", "Everyday"),
+        ];
+        let blocks = skills(&catalog, None, Some("staff"));
+        assert_eq!(
+            blocks[0]["text"]["text"],
+            "You're set to the *Staff* level. Change it by sending me `level …`."
+        );
+        let headers: Vec<&str> = blocks
+            .iter()
+            .filter(|b| b["type"] == "header")
+            .map(|b| b["text"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                "Everyday",
+                "Delivery and launch",
+                "Leading across teams",
+                "Company bets"
+            ]
+        );
     }
 
     #[test]

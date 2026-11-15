@@ -26,16 +26,18 @@ pub struct Follow {
 /// Polls in a row that may fail before the task is given up on.
 const POLL_RETRIES: u32 = 3;
 
-/// Create a task and poll it until it settles or `follow.timeout` passes. Fills the events
-/// and the timings; the trace is read later, only for failures and judges.
+/// Create a task (at `level`, when the category has one) and poll it until it settles or
+/// `follow.timeout` passes. Fills the events and the timings; the trace is read later, only
+/// for failures and judges.
 pub async fn follow_task(
     rt: &Runtime,
     bot: &str,
     requested_by: &str,
     text: &str,
+    level: Option<&str>,
     follow: &Follow,
 ) -> Outcome {
-    let created = match rt.create_task(bot, requested_by, text).await {
+    let created = match rt.create_task(bot, requested_by, text, level).await {
         Ok(t) => t,
         Err(e) => {
             return Outcome {
@@ -186,11 +188,13 @@ pub fn judge_output(outcome: &Outcome) -> String {
 async fn attempt(
     rt: &Runtime,
     bot: &str,
+    level: Option<&str>,
     task: &EvalTask,
     repeat: u32,
     opts: &RunOptions,
 ) -> TaskReport {
-    let mut outcome = follow_task(rt, bot, &opts.requested_by, &task.ask, &opts.follow).await;
+    let mut outcome =
+        follow_task(rt, bot, &opts.requested_by, &task.ask, level, &opts.follow).await;
     let settled = outcome.runtime_error.is_none() && !outcome.timed_out;
     let judging = opts.judges.as_ref().filter(|j| !j.judges.is_empty());
     let wants_drafts =
@@ -290,13 +294,14 @@ pub async fn run_category(
             let rt = rt.clone();
             let limit = limit.clone();
             let bot = bot.clone();
+            let level = category.level.clone();
             let opts = opts.clone();
             set.spawn(async move {
                 let _permit = limit
                     .acquire_owned()
                     .await
                     .expect("the semaphore is never closed");
-                let line = attempt(&rt, &bot, &task, repeat, &opts).await;
+                let line = attempt(&rt, &bot, level.as_deref(), &task, repeat, &opts).await;
                 (i * repeats as usize + (repeat as usize - 1), line)
             });
         }

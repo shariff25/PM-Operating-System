@@ -81,9 +81,9 @@ Instructions ...
 - `data-class` is the most sensitive data the skill may handle. The gateway routes everything
   to local models.
 - `track` groups skills into a catalog, such as the Slack App Home's **Skills** section
-  (`docs/slack-home.md`). It is free text, but the shipped skills use eight: Everyday,
+  (`docs/slack-home.md`). It is free text, but the shipped skills use ten: Everyday,
   Product sense, Strategy and decisions, Metrics and experiments, Spec and review, Customer
-  and market, AI products, Delivery and launch. A skill without one is listed under
+  and market, AI products, Delivery and launch, Leading across teams, Company bets. A skill without one is listed under
   "Other".
 
 Rules: `front-matter`, `skill-parse`, `skill-name`, `skill-description`, `skill-body-empty`,

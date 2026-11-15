@@ -8,7 +8,7 @@ Slack without the PM's approval.
 
 - Plan and phases: [`docs/implementation-plan.md`](docs/implementation-plan.md)
 - File formats: [`docs/contract.md`](docs/contract.md)
-- Working with it as a PM: [`docs/pm-craft.md`](docs/pm-craft.md)
+- Working with it as a PM: [`docs/pm-craft.md`](docs/pm-craft.md); at Staff or Principal level: [`docs/levels.md`](docs/levels.md)
 
 ## What it does
 
@@ -28,6 +28,14 @@ tools, not the model's arithmetic.
 | Customer and market | `call-synth`, `competitive-brief`, `opportunity-sizing`, `poc-plan`, `partner-brief` |
 | AI products | `ai-feature-spec`, `eval-plan` |
 | Delivery and launch | `release-notes`, `status-update`, `launch-checklist`, `jira-draft`, `advisory-draft` (drafts only; security and legal approve first) |
+| Leading across teams | `portfolio-review`, `roadmap-tradeoffs`, `okr-draft`, `business-review`, `alignment-plan`, `coach-feedback`, `bets-register` |
+| Company bets | `vision-doc`, `investment-case`, `pricing-proposal`, `platform-strategy`, `exec-brief` |
+
+**It works at your level.** Each PM sets `senior` (the default), `staff` or `principal`
+(`level staff` in a DM), which changes the scope, horizon and audience of what PM OS writes.
+Staff and Principal PMs also get a rollup of Jira issues across teams, cash-flow numbers for
+business cases, and a register of bets with a monthly review
+([`docs/levels.md`](docs/levels.md)).
 
 What each skill is for, with an example ask, is in [`docs/pm-craft.md`](docs/pm-craft.md). The
 tracks are each skill's `track` field, and the Slack App Home lists skills by them.

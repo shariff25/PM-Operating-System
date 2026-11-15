@@ -1,0 +1,28 @@
+# seed: replace with case cards
+# Numbers come from tools, never from the model's arithmetic. The investment-case skill calls
+# stats.cashflow (docs/toolserver.md, "The stats tools") with one scenario: upfront 100, year 1
+# revenue 60 and cost 10, year 2 revenue 80 and cost 10, discount rate 10%.
+# The expected numbers, from the spec's formulas (docs/staff-principal-spec.md §4):
+#   net by year: 50 and 70; cumulative: -50 and 20;
+#   payback: 1 + 50 / 70 = 1.714..., rounded to 1.7 years;
+#   net present value: -100 + 50 / 1.1 + 70 / 1.21 = 3.3057..., rounded to 3.31.
+id: investment-case-payback-from-tool
+ask: "Draft anyway, no questions: an investment case in the PM space for a key export service for Acme Vault. Use these inputs and no others: upfront cost 100, year 1 revenue 60 and cost 10, year 2 revenue 80 and cost 10, discount rate 10%."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include:
+        - "Investment case:"
+        - "Payback"
+        - "1.7"  # the value stats.cashflow returns for these inputs
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: investment-case
+tags:
+  - model/draft-content

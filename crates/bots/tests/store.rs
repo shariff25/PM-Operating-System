@@ -9,8 +9,8 @@ use std::sync::Arc;
 use chrono::Duration;
 use common::at;
 use pmos_bots::model::{
-    ChecklistItem, NewNotification, NotificationKind, Output, Routine, Schedule, SlackRef, Source,
-    Task, TaskStatus, TraceKind,
+    ChecklistItem, Level, MemberSettings, NewNotification, NotificationKind, Output, Routine,
+    Schedule, SlackRef, Source, Task, TaskStatus, TraceKind,
 };
 use pmos_bots::store::{
     BotsStore, Lease, Refused, RoutinePatch, RoutineRun, TaskFilter, Transition,
@@ -615,7 +615,55 @@ async fn routine_runs_happen_once(store: Arc<dyn BotsStore>) {
     assert_eq!(feed[0].task_id, last.task.id);
 }
 
+async fn member_settings_round_trip(store: Arc<dyn BotsStore>) {
+    assert_eq!(store.member_settings("ana").await.unwrap(), None);
+    let first = MemberSettings {
+        handle: "ana".into(),
+        level: Level::Staff,
+        updated_at: at(2026, 11, 14, 9, 0),
+    };
+    store.set_member_settings(&first).await.unwrap();
+    assert_eq!(store.member_settings("ana").await.unwrap(), Some(first));
+    let second = MemberSettings {
+        handle: "ana".into(),
+        level: Level::Principal,
+        updated_at: at(2026, 11, 14, 9, 5),
+    };
+    store.set_member_settings(&second).await.unwrap();
+    assert_eq!(
+        store.member_settings("ana").await.unwrap(),
+        Some(second),
+        "a second save replaces the first"
+    );
+    assert_eq!(store.member_settings("ben").await.unwrap(), None);
+
+    // A task keeps its own level; one without reads back without.
+    let mut t = task("docs", "ben", Source::Eval, 7);
+    t.level = Some(Level::Principal);
+    store.create_task(&t, "queued").await.unwrap();
+    assert_eq!(
+        store.task(&t.id).await.unwrap().unwrap().level,
+        Some(Level::Principal)
+    );
+    let plain = task("docs", "ben", Source::Eval, 8);
+    store.create_task(&plain, "queued").await.unwrap();
+    assert_eq!(store.task(&plain.id).await.unwrap().unwrap().level, None);
+    let now = at(2026, 11, 14, 10, 0);
+    let claimed = store
+        .claim(None, "w1", now + Duration::seconds(120), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, t.id);
+    assert_eq!(
+        claimed.level,
+        Some(Level::Principal),
+        "a claim keeps the level"
+    );
+}
+
 both_stores!(
+    member_settings_round_trip,
     tasks_round_trip_and_filter,
     claims_go_interactive_first_then_oldest,
     two_workers_never_claim_the_same_task,

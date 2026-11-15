@@ -11,6 +11,9 @@
 //! - **The reply assistant** (`docs/slack-reply-spec.md` §1 and §5): `reply assistant on`,
 //!   `off` and status manage a PM's `[reply-assistant]` routine; each reply it drafts is a
 //!   reply card with **Post as you**, **Edit**, **Snooze** and **Reject** (`reply.rs`).
+//! - **Levels and the bets review** (`docs/staff-principal-spec.md` §1 and §5): `level` shows
+//!   or sets the PM's level (`level.rs`); `bets review on`, `off` and status manage their
+//!   monthly `[bets-review]` routine (`bets_review.rs`).
 //! - **Triage digest:** on weekday mornings each bot's quality owner gets a DM of the drafts
 //!   that were rejected or heavily edited since the last one (`triage.rs`).
 //! - **Routines (D8):** "every weekday at 8am …" is read back for a one-tap confirm; "my
@@ -28,12 +31,14 @@
 //! It connects with Socket Mode (outbound only) and maps each Slack user to a PM OS handle
 //! through `content/team.yaml`.
 
+pub mod bets_review;
 pub mod blocks;
 pub mod bots;
 pub mod bounded;
 pub mod cards;
 pub mod commands;
 pub mod home;
+pub mod level;
 pub mod member_cards;
 pub mod members;
 pub mod mention;

@@ -1,0 +1,20 @@
+# seed: replace with case cards
+# The pricing-proposal skill titles its draft `Pricing:` and follows
+# content/templates/pricing-proposal.md. It never states a competitor's price without a source.
+id: structure-pricing-proposal
+ask: "Draft anyway, no questions: a pricing proposal in the PM space for packaging SAML SSO and SCIM in Acme Vault, given the October Acme Cloud call notes (Confluence page 9001). Our competitor is Initech; do not quote its prices."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Pricing:", "Value metric", "Packages", "Who pays more and who pays less", "Migration"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: pricing-proposal
+tags:
+  - model/draft-content

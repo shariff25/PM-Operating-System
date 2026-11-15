@@ -1,0 +1,21 @@
+# seed: replace with case cards
+# The investment-case skill titles its draft `Investment case:` and follows
+# content/templates/investment-case.md. It calls stats.cashflow; the exact-input task
+# investment-case-payback-from-tool checks the number.
+id: structure-investment-case
+ask: "Draft anyway, no questions: an investment case in the PM space for building SAML SSO and SCIM for the Acme Vault console (Jira epic PM-101 and story PM-102). Mark any input you cannot source as unverified."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Investment case:", "Scenarios", "Payback", "What would change the answer"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: investment-case
+tags:
+  - model/draft-content

@@ -1,0 +1,32 @@
+# seed: replace with case cards
+#
+# The Staff-PM bar (docs/levels.md; the spec is docs/staff-principal-spec.md §6). The runner
+# sends `level: staff` on each task, so the bot works across teams, 4 to 6 quarters ahead.
+# These tasks run against the fake connectors' fixtures
+# (crates/toolserver/src/connectors/fake.rs):
+# - Jira project PM: epic PM-101 "SSO for the Acme Vault console" (in progress), story PM-102
+#   "SCIM user provisioning" (to do) and bug PM-103 "export fails for large key sets" (to do);
+# - the rollup fixtures (docs/staff-principal-spec.md §3), used only by jira.rollup: the three PM
+#   issues and project CLD with CLD-11 (epic, in progress), CLD-12 (story, done) and CLD-13
+#   (story, to do, due 2026-10-01, unassigned); PM-102 blocks CLD-13. By project: PM 3, CLD 3,
+#   one overdue and one unassigned in CLD, one link;
+# - Confluence space PM: page 9001 "Acme Cloud customer call notes, October" ("Two customers
+#   asked for SSO and audit export.") and page 9002 "PRD: Key export v2";
+# - the docs pages vault-saml-sso and vault-key-rotation, at https://docs.example.com/docs/<slug>.
+#
+# What the tasks check is deterministic: a draft exists (or doesn't), it is in the right space,
+# its title has the skill's prefix, its body has the template's headings (spec §2), and the
+# rollup's numbers appear. Whether the thinking is good is for the advisory judge
+# says-what-stops (evals/judges/) and for people. Replace the tasks with case cards
+# (evals/case-card.md) as real ones come in. No pass_bar until then: the category reports only.
+name: staff-craft
+bot: personal
+level: staff
+description: >-
+  A Staff PM asks their personal bot for work across teams: a portfolio review from the
+  cross-team rollup, roadmap trade-offs, OKRs, a business review, an alignment plan, coaching
+  feedback on another PM's page, a strategy doc with its cross-team effects, and a bet for the
+  register. The bot must draft one Confluence page from the skill's template, say which teams
+  are affected, quote the rollup's counts and links exactly, answer coaching in the thread
+  without drafting, and record a bet as one approval. Seed tasks against the fake Jira,
+  Confluence and docs fixtures.

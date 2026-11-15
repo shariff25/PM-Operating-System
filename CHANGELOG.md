@@ -4,6 +4,13 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- PM OS now works at your level: Senior, Staff or Principal ([how to use it](docs/levels.md)).
+  - PM OS can now work at your level: DM `level staff` (or `senior`, or `principal`) and it changes the scope, horizon and audience of what it writes, adds a Cross-team effects section at Staff and a What must be true section at Principal, and brings in the executive, CFO, CTO or CEO reviewers.
+  - PM OS can now do 12 new kinds of work, in two tracks. **Leading across teams:** `portfolio-review`, `roadmap-tradeoffs`, `okr-draft`, `business-review`, `alignment-plan`, `coach-feedback`, `bets-register`. **Company bets:** `vision-doc`, `investment-case`, `pricing-proposal`, `platform-strategy`, `exec-brief`.
+  - PM OS can now count work across teams: a rollup of Jira issues by project, epic, status, assignee or fix version, with overdue and unassigned counts and the links that block one team on another. It reads with your own access and returns counts and links, not issue text.
+  - PM OS can now get business-case numbers right: payback and net present value come from a cash-flow tool, not from the model's arithmetic.
+  - PM OS can now keep a register of your bets for months: what each bet is, the metric, the riskiest assumption, the evidence and the decisions. Every change is an approval, and `bets review on` starts a monthly review that proposes updates for the bets that are due.
+  - PM OS can now be measured at these levels: the `staff-craft` and `principal-craft` benchmark categories have 8 seed tasks each and two advisory judges (says what stops, business effect as a range).
 - Tag PM OS in a thread, and a Home for your drafts, skills and accounts.
   - PM OS can now be tagged in any channel thread: write `@PM OS` and what you want, and a draft reply arrives in your DM to post as you, one per tag ([how](docs/slack-reply.md)).
   - PM OS can now show what's waiting for you in its Slack Home: tick drafts and approve or reject them together, browse the skills by track, and connect or disconnect your accounts ([how](docs/slack-home.md)).

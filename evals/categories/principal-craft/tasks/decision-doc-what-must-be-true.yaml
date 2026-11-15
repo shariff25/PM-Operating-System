@@ -1,0 +1,20 @@
+# seed: replace with case cards
+# At the Principal level a decision-doc also ends with `## What must be true`
+# (docs/staff-principal-spec.md §1). Fixtures: page 9001 and story PM-102.
+id: decision-doc-what-must-be-true
+ask: "Draft anyway, no questions: a decision doc in the PM space on whether the company should bet on enterprise identity (audit log export or SCIM user provisioning, Jira story PM-102) for Acme Vault, given the October Acme Cloud call notes (Confluence page 9001)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Decision:", "Recommendation", "Options", "What must be true"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: decision-doc
+tags:
+  - model/draft-content

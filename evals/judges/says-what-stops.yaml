@@ -1,0 +1,19 @@
+# Does a staff-craft draft say what stops? The Staff bar's first extra check
+# (content/playbooks/levels.md): the document says what stops or isn't funded, and names the
+# teams affected. A list of things to do passes the deterministic checks; this judge looks for
+# the trade-off a Staff PM exists to make.
+#
+# Advisory: it has no labels yet (says-what-stops.labels.jsonl is empty), so it is reported
+# and never fails a run or the gate. It blocks only once calibrated on at least 100 labels
+# with TPR and TNR of at least 0.8 (docs/runbooks/quality.md, "Calibrating a judge").
+name: says-what-stops
+failure_mode: model/no-tradeoff-named
+question: >-
+  Does the draft say what stops or isn't funded, and which teams that affects? Answer yes if it
+  names at least one thing that is stopped, delayed or left unfunded as a result of its
+  recommendation, and names the teams that give it up. Answer no if it only adds work, says
+  everything fits, names no team, or leaves the trade-off to the reader. If the output
+  contains no draft (the assistant asked a question or answered in the thread), answer yes.
+alias: pmos/extraction
+applies_to: [staff-craft]
+labels: says-what-stops.labels.jsonl

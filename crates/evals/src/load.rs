@@ -176,12 +176,14 @@ impl LoadResult {
     }
 }
 
-/// Send `n` tasks at once, the asks taken in turn from `asks`, and follow them all.
+/// Send `n` tasks at once, the asks taken in turn from `asks`, each at `level` (the
+/// category's, if any), and follow them all.
 pub async fn run_load(
     rt: &Runtime,
     bot: &str,
     requested_by: &str,
     asks: &[String],
+    level: Option<&str>,
     n: usize,
     follow: &Follow,
 ) -> LoadResult {
@@ -191,8 +193,11 @@ pub async fn run_load(
         let bot = bot.to_string();
         let who = requested_by.to_string();
         let ask = asks[i % asks.len()].clone();
+        let level = level.map(str::to_string);
         let follow = follow.clone();
-        set.spawn(async move { follow_task(&rt, &bot, &who, &ask, &follow).await });
+        set.spawn(
+            async move { follow_task(&rt, &bot, &who, &ask, level.as_deref(), &follow).await },
+        );
     }
     let mut outcomes = Vec::with_capacity(n);
     while let Some(o) = set.join_next().await {

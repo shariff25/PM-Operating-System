@@ -8,6 +8,9 @@ model's arithmetic. A panel of eleven reviewers reads any draft on request, and 
 covers AI features. You still own every output: each page is a draft until you approve it.
 The build spec is `docs/pm-craft-spec.md`.
 
+**Staff or Principal PM?** Set your level (`level staff` in a DM) and PM OS works across teams
+or on company bets, with 12 more skills. See `docs/levels.md`.
+
 **Why it is built from structure, not a clever prompt.** The models are local and mid-sized.
 The quality comes from what they work from and are checked against:
 - **a written bar** (`content/playbooks/bar.md`);

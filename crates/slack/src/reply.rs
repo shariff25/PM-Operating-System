@@ -43,7 +43,8 @@ pub const SNOOZES_FILE: &str = "snoozes.json";
 /// `PMOS_SLACK_DRAFT_TTL_HOURS`), unless the item says when.
 pub const DRAFT_TTL: chrono::Duration = chrono::Duration::hours(24);
 
-const UNAVAILABLE: &str = "PM OS couldn't reach its bots right now. Try again in a minute.";
+pub(crate) const UNAVAILABLE: &str =
+    "PM OS couldn't reach its bots right now. Try again in a minute.";
 
 // ---- The commands ----
 
@@ -54,36 +55,110 @@ pub enum Command {
     Status,
 }
 
-/// `reply assistant on`, `reply assistant off` and `reply assistant` (or `… status`), typed
-/// alone, in any case.
-pub fn command(text: &str) -> Option<Command> {
+/// `<words> on`, `<words> off` and `<words>` (or `… status`), typed alone, in any case.
+pub fn routine_command_of(text: &str, words: &str) -> Option<Command> {
     let t = text.trim().trim_end_matches(['?', '.', '!']).to_lowercase();
-    let words: Vec<&str> = t.split_whitespace().collect();
-    match words.as_slice() {
-        ["reply", "assistant", "on"] => Some(Command::On),
-        ["reply", "assistant", "off"] => Some(Command::Off),
-        ["reply", "assistant"] | ["reply", "assistant", "status"] => Some(Command::Status),
+    let typed: Vec<&str> = t.split_whitespace().collect();
+    let name: Vec<&str> = words.split_whitespace().collect();
+    let rest = typed.strip_prefix(name.as_slice())?;
+    match rest {
+        ["on"] => Some(Command::On),
+        ["off"] => Some(Command::Off),
+        [] | ["status"] => Some(Command::Status),
         _ => None,
     }
 }
 
+/// `reply assistant on`, `reply assistant off` and `reply assistant` (or `… status`), typed
+/// alone, in any case.
+pub fn command(text: &str) -> Option<Command> {
+    routine_command_of(text, REPLY_ASSISTANT.words)
+}
+
+/// A routine a DM command turns on and off on the PM's personal bot, found again by the tag
+/// its prompt starts with.
+pub struct RoutineKind {
+    /// The command's words: `reply assistant`.
+    pub words: &'static str,
+    /// How the answers name it: "the reply assistant".
+    pub the: &'static str,
+    pub tag: &'static str,
+    pub cron: &'static str,
+    pub prompt: &'static str,
+    /// The schedule for a person: "every 30 minutes from 08:00 to 17:30, Monday to Friday".
+    pub schedule_words: &'static str,
+    /// The answer when it is turned on: (the bot's name, the time zone, the next run).
+    pub on_text: fn(&str, &str, &str) -> String,
+    /// The answer when it is turned off.
+    pub off_text: &'static str,
+    /// The status answer while it is off: (the bot's name).
+    pub status_off_text: fn(&str) -> String,
+}
+
+impl RoutineKind {
+    /// The routine `<words> on` creates, exactly.
+    pub fn draft(&self, handle: &str, tz: &str) -> Value {
+        json!({
+            "bot": personal_bot_name(handle),
+            "owner": handle,
+            "schedule": {"cron": self.cron, "tz": tz},
+            "prompt": self.prompt,
+            "output": {"kind": "dm"},
+            "approval": "approve",
+        })
+    }
+
+    /// One of the PM's routines of this kind, by its prompt's tag.
+    pub fn is_routine(&self, routine: &Value) -> bool {
+        routine["prompt"]
+            .as_str()
+            .is_some_and(|p| p.trim_start().starts_with(self.tag))
+    }
+}
+
+pub const REPLY_ASSISTANT: RoutineKind = RoutineKind {
+    words: "reply assistant",
+    the: "the reply assistant",
+    tag: TAG,
+    cron: CRON,
+    prompt: PROMPT,
+    schedule_words: SCHEDULE_WORDS,
+    on_text: |shown, tz, next| {
+        format!(
+            "*The reply assistant is on.* {shown} checks Slack \
+             {SCHEDULE_WORDS} ({tz} time) for messages that ask you \
+             something, and drafts a reply to each here for you to post, \
+             edit, snooze or reject. Nothing posts without your tap.\n\
+             Next run: {next}."
+        )
+    },
+    off_text: "*The reply assistant is off.* Drafts already waiting stay until you \
+               decide them or they expire.",
+    status_off_text: |shown| {
+        format!(
+            "*The reply assistant is off.* Say `reply assistant on` and {shown} checks \
+             Slack {SCHEDULE_WORDS} for messages that need your answer, and drafts \
+             replies for you to post."
+        )
+    },
+};
+
 /// The routine `reply assistant on` creates (spec §1), exactly.
 pub fn draft(handle: &str, tz: &str) -> Value {
-    json!({
-        "bot": personal_bot_name(handle),
-        "owner": handle,
-        "schedule": {"cron": CRON, "tz": tz},
-        "prompt": PROMPT,
-        "output": {"kind": "dm"},
-        "approval": "approve",
-    })
+    REPLY_ASSISTANT.draft(handle, tz)
 }
 
 /// A PM's `[reply-assistant]` routine, by its prompt.
 pub fn is_reply_routine(routine: &Value) -> bool {
-    routine["prompt"]
-        .as_str()
-        .is_some_and(|p| p.trim_start().starts_with(TAG))
+    REPLY_ASSISTANT.is_routine(routine)
+}
+
+/// "the reply assistant" → "The reply assistant".
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+        .unwrap_or_default()
 }
 
 /// `name` as a time zone, else `fallback`, else UTC.
@@ -346,7 +421,7 @@ impl Snoozer {
 
 impl Bots {
     /// The PM's time zone from Slack, else `PMOS_DEFAULT_TZ`.
-    async fn pm_tz(&self, slack_id: &str) -> (String, Tz) {
+    pub(crate) async fn pm_tz(&self, slack_id: &str) -> (String, Tz) {
         let name = self
             .slack()
             .user_tz(slack_id)
@@ -359,10 +434,28 @@ impl Bots {
 
     /// `reply assistant on`, `off` and status.
     pub(crate) async fn reply_assistant(&self, dm: &Dm, handle: &str, cmd: Command) {
+        self.routine_command(dm, handle, cmd, &REPLY_ASSISTANT)
+            .await;
+    }
+
+    /// A routine command on the PM's personal bot (`reply assistant`, `bets review`): `on`
+    /// creates the routine from `kind`'s draft (or resumes a paused one), `off` deletes it,
+    /// and status says whether it is on and when it next runs. The routine is found by its
+    /// prompt's tag. A member with no personal bot is told so, and nothing changes.
+    pub(crate) async fn routine_command(
+        &self,
+        dm: &Dm,
+        handle: &str,
+        cmd: Command,
+        kind: &RoutineKind,
+    ) {
         let say = |text: String| async move {
             self.post(&dm.channel, Some(&dm.thread_ts), None, cards::note(&text))
                 .await;
         };
+        let the = kind.the;
+        let title = capitalized(the);
+        let words = kind.words;
         let bot = personal_bot_name(handle);
         let roster = match self.roster().await {
             Ok(roster) => roster,
@@ -370,7 +463,7 @@ impl Bots {
         };
         let Some(info) = roster.iter().find(|b| b.name == bot) else {
             return say(format!(
-                "The reply assistant runs on your personal bot, `{}`, and you don't have one \
+                "{title} runs on your personal bot, `{}`, and you don't have one \
                  yet, so nothing was changed. Say `setup` to see where it stands.",
                 escape(&bot)
             ))
@@ -381,22 +474,23 @@ impl Bots {
             Ok(r) => r,
             Err(e) => return say(runtime_note(&e)).await,
         };
-        let found: Vec<&Value> = routines.iter().filter(|r| is_reply_routine(r)).collect();
+        let found: Vec<&Value> = routines.iter().filter(|r| kind.is_routine(r)).collect();
         let default_tz = self.default_tz().to_string();
+        let schedule_words = kind.schedule_words;
         let text = match cmd {
             Command::On => match found.first() {
                 Some(r) if r["enabled"] == false => {
                     let id = r["id"].as_str().unwrap_or_default();
                     match self.runtime().set_routine_enabled(handle, id, true).await {
                         Ok(resumed) => format!(
-                            "*The reply assistant was paused; it's back on.* Next run: {}.",
+                            "*{title} was paused; it's back on.* Next run: {}.",
                             escape(&next_run(&resumed, &default_tz))
                         ),
                         Err(e) => runtime_note(&e),
                     }
                 }
                 Some(r) => format!(
-                    "*The reply assistant is already on.* Next run: {}. Say `reply assistant \
+                    "*{title} is already on.* Next run: {}. Say `{words} \
                      off` to stop it.",
                     escape(&next_run(r, &default_tz))
                 ),
@@ -404,30 +498,26 @@ impl Bots {
                     let (tz, _) = self.pm_tz(&dm.user).await;
                     match self
                         .runtime()
-                        .create_routine(handle, &draft(handle, &tz))
+                        .create_routine(handle, &kind.draft(handle, &tz))
                         .await
                     {
                         Ok(created) => {
-                            tracing::info!(routine = %created["id"], owner = handle, "reply assistant on");
-                            format!(
-                                "*The reply assistant is on.* {shown} checks Slack \
-                                 {SCHEDULE_WORDS} ({} time) for messages that ask you \
-                                 something, and drafts a reply to each here for you to post, \
-                                 edit, snooze or reject. Nothing posts without your tap.\n\
-                                 Next run: {}.",
-                                escape(&tz),
-                                escape(&next_run(&created, &default_tz))
+                            tracing::info!(routine = %created["id"], owner = handle, "{the} on");
+                            (kind.on_text)(
+                                &shown,
+                                &escape(&tz),
+                                &escape(&next_run(&created, &default_tz)),
                             )
                         }
                         Err(RuntimeError::Refused(why) | RuntimeError::Question(why)) => {
-                            format!("I couldn't turn the reply assistant on: {}", escape(&why))
+                            format!("I couldn't turn {the} on: {}", escape(&why))
                         }
                         Err(RuntimeError::Unavailable) => UNAVAILABLE.into(),
                     }
                 }
             },
             Command::Off if found.is_empty() => {
-                "The reply assistant is already off. Say `reply assistant on` to start it.".into()
+                format!("{title} is already off. Say `{words} on` to start it.")
             }
             Command::Off => {
                 let mut failed = None;
@@ -439,28 +529,21 @@ impl Bots {
                 }
                 match failed {
                     None => {
-                        tracing::info!(owner = handle, "reply assistant off");
-                        "*The reply assistant is off.* Drafts already waiting stay until you \
-                         decide them or they expire."
-                            .into()
+                        tracing::info!(owner = handle, "{the} off");
+                        kind.off_text.into()
                     }
                     Some(e) => format!("I couldn't turn it off: {}", runtime_note(&e)),
                 }
             }
             Command::Status => match found.first() {
-                None => format!(
-                    "*The reply assistant is off.* Say `reply assistant on` and {shown} checks \
-                     Slack {SCHEDULE_WORDS} for messages that need your answer, and drafts \
-                     replies for you to post."
+                None => (kind.status_off_text)(&shown),
+                Some(r) if r["enabled"] == false => format!(
+                    "*{title} is paused.* Say `{words} on` to resume it, \
+                     or `{words} off` to remove it."
                 ),
-                Some(r) if r["enabled"] == false => {
-                    "*The reply assistant is paused.* Say `reply assistant on` to resume it, \
-                     or `reply assistant off` to remove it."
-                        .into()
-                }
                 Some(r) => format!(
-                    "*The reply assistant is on:* {SCHEDULE_WORDS}, {} time.\nNext run: {}. \
-                     Say `reply assistant off` to stop it.",
+                    "*{title} is on:* {schedule_words}, {} time.\nNext run: {}. \
+                     Say `{words} off` to stop it.",
                     escape(r["schedule"]["tz"].as_str().unwrap_or("UTC")),
                     escape(&next_run(r, &default_tz))
                 ),
@@ -605,7 +688,7 @@ fn snooze_card(item: &Value, now: DateTime<Utc>, tz: Tz) -> (String, Value) {
     cards::snooze_choices(item, &choices, &expires)
 }
 
-fn runtime_note(e: &RuntimeError) -> String {
+pub(crate) fn runtime_note(e: &RuntimeError) -> String {
     match e {
         RuntimeError::Unavailable => UNAVAILABLE.into(),
         other => escape(&other.to_string()),

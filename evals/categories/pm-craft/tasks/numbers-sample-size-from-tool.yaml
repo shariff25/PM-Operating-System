@@ -24,7 +24,7 @@ expect:
       must_include:
         - "Experiment:"
         - "Sample size and duration"
-        - "14749"  # value: confirm against stats.sample_size
+        - "14749"  # the value stats.sample_size returns for these inputs
       must_not_include: ["<think>", "TODO", "<!--"]
 cluster: experiment-design
 tags:

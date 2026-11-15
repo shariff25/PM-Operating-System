@@ -80,6 +80,9 @@ async fn a_bot_session_gets_its_roles_tools_less_never() {
     assert_eq!(
         tool_names(&f, &mine),
         vec![
+            "bets_list",
+            "bets_read",
+            "bets_record",
             "confluence_create_draft",
             "confluence_read",
             "confluence_search",
@@ -89,10 +92,12 @@ async fn a_bot_session_gets_its_roles_tools_less_never() {
             "docs_search",
             "jira_create_issue",
             "jira_read",
+            "jira_rollup",
             "jira_search",
             "slack_post_reply",
             "slack_read_thread",
             "slack_search",
+            "stats_cashflow",
             "stats_compare",
             "stats_sample_size",
         ]
