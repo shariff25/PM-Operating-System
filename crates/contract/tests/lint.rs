@@ -554,13 +554,49 @@ fn team_file_parses_and_looks_up_by_slack_id() {
     assert!(team.by_slack_id("U0BO").is_none());
     assert_eq!(team.by_handle("ana").unwrap().slack_id, "U0ANA1");
     assert!(team.by_handle("ana").unwrap().email.is_none());
+    // A malformed role name is still a parse error.
     assert!(pmos_contract::model::TeamFile::from_yaml(
-        "members:\n  - {handle: a, slack-id: U1, roles: [owner]}\n"
+        "members:\n  - {handle: a, slack-id: U1, roles: [Owner]}\n"
     )
     .is_err());
     let dir = valid_tree();
     write(dir.path(), "team.yaml", "members: [\n");
     assert_code(&run(&dir), "team-parse", Severity::Error);
+}
+
+#[test]
+fn team_file_new_and_unknown_roles() {
+    use pmos_contract::model::Role;
+    let dir = valid_tree();
+    write(
+        dir.path(),
+        "team.yaml",
+        "members:\n  - {handle: ana, slack-id: U0ANA1, roles: [pm, reviewer]}\n  - {handle: bo, slack-id: U0BO, roles: [auditor]}\n",
+    );
+    let report = run(&dir);
+    assert!(
+        !report.codes().iter().any(|c| c.starts_with("team-")),
+        "{:?}",
+        report.codes()
+    );
+
+    // The rollout case: a role from a newer build parses, warns and grants nothing.
+    write(
+        dir.path(),
+        "team.yaml",
+        "members:\n  - {handle: ana, slack-id: U0ANA1, roles: [pm, owner]}\n  - {handle: bo, slack-id: U0BO, roles: [admin, auditor]}\n",
+    );
+    let report = run(&dir);
+    assert_code(&report, "team-role-unknown", Severity::Warning);
+    assert_code(&report, "team-role-separation", Severity::Warning);
+    assert!(!report.codes().contains(&"team-parse"));
+    let team = pmos_contract::model::TeamFile::load(dir.path()).unwrap();
+    let ana = team.by_handle("ana").unwrap();
+    assert_eq!(ana.roles, vec![Role::Pm, Role::Unknown("owner".into())]);
+    assert!(!pmos_contract::permissions::role_allows(
+        &ana.roles[1],
+        pmos_contract::permissions::Permission::ViewOwnTasks
+    ));
 }
 
 fn role(name: &str, extra: &str) -> String {
