@@ -1,0 +1,28 @@
+# A source that is not connected. The request simulates it (the eval stack can't yet run as a
+# member whose Slack is unlinked): Slack answers "connect Slack in PM OS first". The brief
+# still arrives, names Slack in one line, says "setup", does not call the day quiet and shows
+# nothing from Slack. The Jira and Confluence fixtures carry no dates, so nothing else shows.
+id: slack-not-connected-says-so
+ask: |-
+  [daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday
+  2024-11-15 and my name is Ana. For this run, treat every Slack call as failing with
+  "connect Slack in PM OS first", whatever the tool really answers, and do not use anything
+  you learn from Slack.
+expect:
+  approvals: 0
+  must_include:
+    - "Slack"
+    - "setup"
+  must_not_include:
+    - "<think>"
+    - "slack.com"
+    - "SAML"
+    - "Globex"
+    - "Enjoy it while it lasts"
+  drafts:
+    - tool: slack.post_reply
+      count: 0
+    - tool: slack.send_message
+      count: 0
+tags:
+  - model/forbidden-text

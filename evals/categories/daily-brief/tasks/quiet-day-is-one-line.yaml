@@ -1,0 +1,27 @@
+# A quiet Monday (2024-11-25). Every Slack ask in the fixtures is from 2024-11-14, more than
+# 7 days old, so each has expired, and the fake Jira and Confluence items carry no dates. All
+# three parts are empty, so the brief is the one quiet-day line: no headings, no "Nothing."
+# parts, no footer, no items.
+id: quiet-day-is-one-line
+ask: |-
+  [daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Monday
+  2024-11-25 and my name is Ana.
+expect:
+  approvals: 0
+  must_include:
+    - "Nothing moved overnight"
+  must_not_include:
+    - "<think>"
+    - "What changed"
+    - "Waiting on you"
+    - "You are waiting on"
+    - "slack.com"
+    - "SAML"
+    - "Globex"
+  drafts:
+    - tool: slack.post_reply
+      count: 0
+    - tool: slack.send_message
+      count: 0
+tags:
+  - model/forbidden-text
