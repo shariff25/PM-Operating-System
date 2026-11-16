@@ -152,9 +152,9 @@ seconds until the task settles.
 
 | Method and path | Body | Answer |
 | --- | --- | --- |
-| `GET /api/brief` | | `Brief`, or `501 {"code":"not_built"}` until the brief exists; the app then hides that part of the home page |
-| `POST /api/followups/{id}/dismiss` | | `204` ("Not mine") |
-| `POST /api/followups/{id}/draft` | | `201 Task`, a reply or nudge draft that arrives as a draft to approve |
+| `GET /api/brief` | | `Brief`: the PM's open follow-ups and `changed` items, with empty lists when nothing is stored; or `501 {"code":"not_built"}` while the server's `PMOS_WEB_BRIEF` is off, and the app then hides that part of the home page |
+| `POST /api/followups/{id}/dismiss` | | `204` ("Not mine"), the same again if repeated; `404` for an id that isn't the PM's, or is dismissed or expired |
+| `POST /api/followups/{id}/draft` | | `201 Task`, a reply (waiting on you) or gentle nudge (you wait on) draft that arrives as a draft to approve; `404` as above |
 
 ```json
 {"date": "2026-11-16",
@@ -165,3 +165,18 @@ seconds until the task settles.
 
 Every row has a `url` to its source. Nothing is posted from a follow-up without the PM
 approving the draft it produces.
+
+A follow-up is a one-line summary, never message text. Slack-derived ones expire after 24
+hours, all others after a week, and expired ones are deleted, not just hidden; `changed`
+items last 24 hours.
+
+**Producer route (server to server, not for the app).** `PUT /internal/brief/{handle}` with
+`Authorization: Bearer <PMOS_WEB_BRIEF_TOKEN>` replaces that member's follow-ups and `changed`
+items: `{"date"?: "2026-11-16", "changed": [{system, title, summary?, url}], "waiting_on_you":
+[{system, who, summary, url, created_at?}], "you_wait_on": [...]}`. At most 50 items per list,
+a 128 KiB body, one-line text (`summary` at most 200 characters, `who` 80), `system` made of
+`a-z`, digits, `-` and `_`, every `url` `http` or `https` without credentials; anything else
+is `422 bad_brief` (`413` for an oversize body, `401 bad_token`, `404` for a handle not on the
+team) and nothing is stored. A follow-up sent again keeps its age and a dismissal; one left
+out is removed. **Nothing calls this route yet**: the Slack brief routine (`docs/daily-brief.md`)
+or a later job is the intended caller.
