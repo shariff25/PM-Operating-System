@@ -419,6 +419,7 @@ impl Onboarding {
                 tool: tool.to_string(),
                 outcome,
                 sources: Vec::new(),
+                source_titles: Default::default(),
                 args_hash: None,
                 output_ref,
                 detail,

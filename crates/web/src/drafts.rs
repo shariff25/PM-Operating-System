@@ -406,14 +406,71 @@ pub fn summary(item: &Approval, state: &UserState) -> Option<DraftSummary> {
     })
 }
 
-/// The whole draft of an approval item, with the PM's saved edit if there is one.
+/// A body for display: if it has no real line break at all but does contain the two
+/// characters `\` `n`, the model wrote its line breaks as JSON escapes (a whole draft on one
+/// line reading "…launch.\n\nSource: PM-101"), so `\n` becomes a line break, `\t` a tab
+/// and `\r\n` one line break. `\\` is left as it is (an escaped backslash, so `\\n`
+/// stays as written). A body with any real line break is left alone: there the two
+/// characters are more likely meant (a path, a regex, a code sample).
+///
+/// **Display only.** This changes what the PM reads, never what an approve sends: the
+/// `version` and an approve without an edit use the item's own arguments, exactly as the
+/// bot drafted them and as the tool server hashed them, so nothing is published that the
+/// approval record doesn't hold. The trade-off is that an unedited approve publishes the
+/// escapes the PM did not see. Saving an edit (any `PUT`) sends the text the PM saw, which
+/// is then what they approve. Repairing on approve instead would publish text that differs
+/// from the stored, hashed arguments without the PM's own edit, which we don't do.
+pub fn display_body(body: &str) -> std::borrow::Cow<'_, str> {
+    if body.contains('\n') || !body.contains("\\n") {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('n') => {
+                chars.next();
+                out.push('\n');
+            }
+            Some('t') => {
+                chars.next();
+                out.push('\t');
+            }
+            Some('r') => {
+                // `\r\n` is one line break; a lone `\r` is left as written.
+                let mut ahead = chars.clone();
+                ahead.next();
+                if ahead.next() == Some('\\') && ahead.next() == Some('n') {
+                    chars.nth(2);
+                    out.push('\n');
+                } else {
+                    out.push(c);
+                }
+            }
+            Some('\\') => {
+                chars.next();
+                out.push_str("\\\\");
+            }
+            _ => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// The whole draft of an approval item, with the PM's saved edit if there is one. Without
+/// one, the body is the item's own, repaired for display only ([`display_body`]).
 pub fn draft(item: &Approval, state: &UserState) -> Option<Draft> {
     let summary = summary(item, state)?;
-    let (_, mut body) = title_and_body(&item.tool, &item.args);
+    let (_, body) = title_and_body(&item.tool, &item.args);
     let edit = state.edits.get(&item.id);
-    if let Some(e) = edit {
-        body = e.body.clone();
-    }
+    let body = match edit {
+        Some(e) => e.body.clone(),
+        None => display_body(&body).into_owned(),
+    };
     Some(Draft {
         summary,
         body,
@@ -716,6 +773,54 @@ mod tests {
         assert_eq!(out[1].url, None);
         assert_eq!(out[1].title, "https://docs.example.com/a.md");
         assert!(out.iter().all(|s| s.excerpt.is_none()));
+    }
+
+    #[test]
+    fn literal_line_breaks_are_repaired_for_display_only() {
+        // One line, with the escapes the model wrote: shown with real line breaks.
+        assert_eq!(
+            display_body("We launch.\\n\\nSource: PM-101\\tok"),
+            "We launch.\n\nSource: PM-101\tok"
+        );
+        assert_eq!(display_body("a\\r\\nb\\rc"), "a\nb\\rc");
+        // An escaped backslash stays as written.
+        assert_eq!(display_body("C:\\\\new \\n x"), "C:\\\\new \n x");
+        // Any real line break: left alone, escapes and all.
+        let mixed = "Use `\\n` to split.\nNext line";
+        assert_eq!(display_body(mixed), mixed);
+        assert_eq!(display_body("plain"), "plain");
+
+        let none = UserState::default();
+        let raw = "We launch.\\n\\nSource: PM-101";
+        let it = item(
+            "confluence.create_draft",
+            json!({"space": "PM", "title": "PRD", "body": raw}),
+        );
+        let d = draft(&it, &none).unwrap();
+        assert_eq!(d.body, "We launch.\n\nSource: PM-101");
+        // What an approve sends, and the version, are the item's own arguments.
+        assert_eq!(effective_args(&it, &none)["body"], raw);
+        assert_eq!(d.version, args_version(&it.tool, &it.args));
+
+        // Once the PM saves an edit, the edit is the body, and it is what is sent.
+        let mut edited = UserState::default();
+        edited.edits.insert(
+            "apr_1".into(),
+            DraftEdit {
+                title: None,
+                body: d.body.clone(),
+            },
+        );
+        let d2 = draft(&it, &edited).unwrap();
+        assert_eq!(d2.body, "We launch.\n\nSource: PM-101");
+        assert_eq!(
+            effective_args(&it, &edited)["body"],
+            "We launch.\n\nSource: PM-101"
+        );
+        assert_ne!(d2.version, d.version);
+        // An edit with literal escapes is the PM's own text: never rewritten.
+        edited.edits.get_mut("apr_1").unwrap().body = raw.into();
+        assert_eq!(draft(&it, &edited).unwrap().body, raw);
     }
 
     #[test]

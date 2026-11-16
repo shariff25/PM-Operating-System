@@ -1,9 +1,12 @@
 //! Audit log (ADM-2): one event per tool call and per approval decision.
 //!
 //! Events carry metadata only: who, which skill and run, which tool, what was read (paths
-//! and ids), a hash of the arguments, and a reference to what was written. They never carry
-//! message bodies, so nothing from Slack is retained here (SLK-8).
+//! and ids, and for Jira, Confluence, docs and context items a short title), a hash of the
+//! arguments, and a reference to what was written. They never carry message bodies, page
+//! bodies or snippets, and nothing from Slack but channel and message ids: no Slack title or
+//! text is ever recorded, because Slack text may be kept only 24 hours (SLK-8, D6).
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -14,6 +17,33 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::store::{StoreError, StoreResult};
+
+/// The longest source title recorded, in characters.
+pub const MAX_SOURCE_TITLE: usize = 120;
+
+/// The systems whose read items have their title recorded: an issue summary, a page title, a
+/// docs page title, a context file's title. Never Slack: its titles are built from message
+/// text, which may be kept only 24 hours.
+pub const TITLED_SYSTEMS: [&str; 4] = ["jira", "confluence", "docs", "context"];
+
+/// `raw` as a source title fit for the audit log: control characters (line breaks included)
+/// become spaces, runs of white space one space, at most [`MAX_SOURCE_TITLE`] characters.
+/// `None` when nothing is left.
+pub fn source_title(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let title: String = cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_SOURCE_TITLE)
+        .collect();
+    let title = title.trim_end().to_string();
+    (!title.is_empty()).then_some(title)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +111,10 @@ pub struct AuditEvent {
     /// Context paths and system ids read.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<String>,
+    /// A short title for some of `sources`, keyed by the entry (`jira:PAY-212` → its
+    /// summary): only for [`TITLED_SYSTEMS`], cleaned by [`source_title`]. Never for Slack.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_titles: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args_hash: Option<String>,
     /// What was written, such as a Jira key or page URL, or an approval id.
@@ -90,13 +124,16 @@ pub struct AuditEvent {
     pub detail: Option<String>,
 }
 
-/// A tool call that returned what it read, as the audit log has it: when, which tool, and
-/// the `sources` it recorded (context paths, `system:id`). Metadata only.
+/// A tool call that returned what it read, as the audit log has it: when, which tool, the
+/// `sources` it recorded (context paths, `system:id`) and their titles. Metadata only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadEvent {
     pub at: DateTime<Utc>,
     pub tool: String,
     pub sources: Vec<String>,
+    /// The titles the event recorded, by `sources` entry; empty for events recorded before
+    /// titles were.
+    pub titles: BTreeMap<String, String>,
 }
 
 impl ReadEvent {
@@ -105,6 +142,7 @@ impl ReadEvent {
             at: event.at,
             tool: event.tool.clone(),
             sources: event.sources.clone(),
+            titles: event.source_titles.clone(),
         }
     }
 }
@@ -250,6 +288,7 @@ mod tests {
             tool: "context.search".into(),
             outcome: Outcome::Ok,
             sources: vec!["context/products/cloud.md".into()],
+            source_titles: BTreeMap::new(),
             args_hash: None,
             output_ref: None,
             detail: None,
@@ -293,5 +332,41 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(parsed["outcome"], "ok");
         assert!(parsed.get("args_hash").is_none());
+        assert!(parsed.get("source_titles").is_none(), "left out when empty");
+    }
+
+    #[tokio::test]
+    async fn jsonl_keeps_source_titles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let sink = JsonlAudit::open(&path).unwrap();
+        let mut e = event();
+        e.source_titles.insert(
+            "context/products/cloud.md".into(),
+            "Acme Cloud overview".into(),
+        );
+        sink.record(e).await.unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(
+            parsed["source_titles"],
+            serde_json::json!({"context/products/cloud.md": "Acme Cloud overview"})
+        );
+    }
+
+    #[test]
+    fn source_titles_are_short_single_lines() {
+        assert_eq!(
+            source_title("  PRD:\tGrace\n\nperiod \u{7}  ").as_deref(),
+            Some("PRD: Grace period")
+        );
+        assert_eq!(source_title("a\nb\tc\u{0}d").as_deref(), Some("a b c d"));
+        assert_eq!(source_title(" \n\t "), None);
+        let long = "x".repeat(500);
+        assert_eq!(
+            source_title(&long).unwrap().chars().count(),
+            MAX_SOURCE_TITLE
+        );
+        assert_eq!(source_title("Café ✓").as_deref(), Some("Café ✓"));
     }
 }
