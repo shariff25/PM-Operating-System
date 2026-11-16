@@ -1,0 +1,302 @@
+# User assertion: who a service is acting for
+
+`crates/assertion` (`pmos-assertion`) is a small library. A calling service (the console,
+`pmos-web`) uses it to sign a short-lived statement of the person it is acting for. The
+receiving service (the bot runtime, the tool server) uses it to check that statement itself,
+instead of trusting a plain header. This document covers the library. Nothing is wired into
+any service yet; the checklist at the end says how each one adopts it.
+
+## The problem
+
+Today a service that acts for a signed-in person calls the bot runtime or the tool server
+with a powerful service token, and names the person in a plain field:
+
+- `X-Pmos-User: ana` on bot runtime calls (`docs/bot-runtime-spec.md` §3, Auth).
+- `user=` on tool-server routes, or `decided_by` in the body of
+  `POST /internal/approvals/{id}/decision` (`docs/toolserver.md`).
+
+The receiving service checks the token and then believes the name. Anyone who holds the token
+can claim to be anyone: a bug, an SSRF, or a leaked environment in one caller becomes "act as
+any PM, including an admin". This is a confused deputy.
+
+## The fix
+
+The caller adds an `X-Pmos-Assertion` header. The header carries a statement signed with a key
+that the caller and the receiver share, and that no other party holds. The statement says:
+
+- I am `web`.
+- This is for `bots`.
+- I act for `ana`, who has role `pm`.
+- It is valid for the next 60 seconds.
+- It covers only `POST /v1/tasks` with this body.
+
+The receiver checks the signature, the issuer, the audience, the time, the request and the
+nonce. Only then does it believe the name. The service token still says which client is
+calling, and the assertion says for whom.
+
+## Wire format (version 1)
+
+The value is one line of printable ASCII, with no spaces and no quotes. It is a list of
+`name=value` fields joined by `;`, always in this order (the values below are illustrative):
+
+```text
+v=1;kid=k2026a;iss=web;aud=bots;sub=ana;roles=pm,admin;sid=ses_9f2c;iat=1800000000;exp=1800000060;nonce=BwcHBwcHBwcHBwcHBwcHBw;req=6YkoG4-kWITz5ORbi2RvQCWbj7Jym5YmNORsUG4hfIA;sig=yJEk1jGoUQpzZCq5P1wekqL7Witr_iTo7Wa0APTx-7Y
+```
+
+| Field | Meaning | Rule |
+| --- | --- | --- |
+| `v` | Version | Exactly `1`. Any other value is refused as an unknown version. |
+| `kid` | Key id | 1 to 32 characters: a lowercase letter or digit, then lowercase letters, digits, `.`, `_` or `-`. |
+| `iss` | Issuer: the calling service's client name | Same rule as `kid`. |
+| `aud` | Audience: the service that must accept it | Same rule as `kid`. |
+| `sub` | Subject: the person's PM OS handle | `pmos_contract::model::valid_handle`, not empty. |
+| `roles` | Their roles | Known role names only (`Role::parse`), comma-separated, no duplicates. They appear in `Role::KNOWN` order: `pm`, `skill-author`, `admin`, `reviewer`, `auditor`. The value may be empty (`roles=`). |
+| `sid` | The caller's session id | Opaque. 1 to 64 characters of `A-Z a-z 0-9 _ -`. |
+| `iat`, `exp` | Issued at and expires at, in unix seconds | Decimal, with no sign and no leading zero. `0 < exp - iat <= 120`. |
+| `nonce` | 16 random bytes | Unpadded base64url, 22 characters. |
+| `req` | The request binding, or `-` for none | Unpadded base64url of 32 bytes (see below). |
+| `sig` | HMAC-SHA256 | Unpadded base64url, 43 characters. |
+
+**Signature.** `sig` is `HMAC-SHA256(key[kid], "pmos-assertion v1\0" || S)`, where `S` is the
+exact bytes before `;sig=`. The verifier compares it in constant time.
+
+**Request binding.** `req` is
+`SHA-256("pmos-assertion request v1\0" || METHOD || "\0" || TARGET || "\0" || SHA-256(body))`.
+
+- `METHOD` is uppercase, for example `POST`.
+- `TARGET` is the path and query exactly as the receiving service sees them, starting with
+  `/`, in printable ASCII.
+- `body` is the raw request body. Use an empty body when there is none.
+
+**Strict parsing.** Every assertion has exactly one valid encoding, so the parser refuses
+everything else:
+
+- input longer than 1024 bytes, or any byte outside printable ASCII;
+- an unknown version, judged before the other fields, so a later format reads as "unknown
+  version";
+- an unknown field, a duplicate field, a field out of order, or a missing field;
+- a value that breaks its rule;
+- a non-canonical spelling: a number with a leading zero, roles out of order, base64 with
+  padding or with stray trailing bits.
+
+As a final check, the parsed fields must re-encode to exactly the bytes that were signed.
+
+**No free text.** Every field has a small alphabet and a length limit. Error messages name at
+most a field and never repeat the input.
+
+A typical assertion is about 230 to 300 bytes. The largest possible one is under 600 bytes.
+
+## API
+
+```rust
+use pmos_assertion::*;
+
+// Keys: 32 to 64 bytes each. Debug shows the id and "<redacted>", never the key bytes.
+let ring = KeyRing::new(Key::from_base64("k2026b", &current_b64)?)
+    .with_previous(Key::from_base64("k2026a", &previous_b64)?)?;
+
+// Caller side: sign with the current key.
+let claims = Claims::new("web", "bots", "ana", &[Role::Pm], "ses_9f2c")?;
+let binding = RequestBinding::new("POST", "/v1/tasks", &body)?;
+let header = ring.sign(&claims, unix_now(), 60, Some(&binding))?;
+
+// Receiver side: verify with the current or the previous key.
+let policy = VerifyPolicy::new("bots", &["web", "console"])?; // default skew 5 s; binding required
+let cache = MemoryReplayCache::default();                    // or your own ReplayGuard
+let who: Assertion = ring.verify(&header, &policy, unix_now(), Some(&binding), &cache)?;
+```
+
+`verify` runs its checks in this order and stops at the first failure. Each failure has its
+own `VerifyError` variant:
+
+1. **Form:** the strict parser above. Fails with `Malformed(_)`.
+2. **Key id:** `kid` must name the current or the previous key. Fails with `UnknownKey`.
+3. **Signature:** checked in constant time. Fails with `BadSignature`. The signature is checked
+   before any claim, so a forged assertion learns nothing about which claim was wrong. The key
+   id is already public, and the result never says whether the current or the previous key
+   matched.
+4. **Issuer:** `iss` must be in the policy's issuers. Fails with `UnknownIssuer`.
+5. **Audience:** `aud` must equal the policy's audience. Fails with `WrongAudience`.
+6. **Time:**
+   - `iat > now + skew` fails with `NotYetValid`.
+   - `now >= exp + skew` fails with `Expired`.
+7. **Request binding:**
+   - If the assertion has a binding, it must equal the request passed in. Fails with
+     `RequestMismatch`.
+   - If the assertion has no binding, it is refused with `RequestMismatch` unless the policy
+     calls `allow_unbound()`.
+8. **Replay:** the nonce is recorded until `exp + skew`.
+   - A nonce already recorded fails with `Replay`.
+   - A full or unreachable store fails with `ReplayStoreUnavailable` (fail closed).
+   - Only assertions that pass every other check are recorded.
+
+**Answer every failure with the same `401`, and log the variant.** The difference between the
+variants is for operators. It is not for the sender.
+
+`sign` enforces a lifetime of 1 to 120 seconds and draws a fresh nonce from the operating
+system for each call (`getrandom`).
+
+## Replay protection and replicas
+
+`MemoryReplayCache` keeps nonces in one process.
+
+- **Its size is bounded.** It holds 100,000 nonces by default. When it is full, it refuses new
+  nonces until old ones expire. Only verified assertions are recorded, so only a holder of a
+  signing key can fill it.
+- **One replica.** A captured assertion cannot be replayed against the replica that already
+  accepted it.
+- **Several replicas.** Each replica has its own cache, so the same assertion can be accepted
+  once by each replica. A restart also empties the cache.
+- **What the binding limits.** With a request binding, such a replay can only repeat the
+  identical request: the same method, path and body, within at most 120 + skew seconds.
+  Without a binding, the replay can be any request.
+
+To close this gap, implement `ReplayGuard` over a store that every replica shares. It needs an
+atomic insert-if-absent that expires each entry at `retain_until`. Two examples:
+
+- a Postgres table with a unique `nonce` column and a periodic delete of expired rows;
+- Redis `SET nonce 1 NX EXAT retain_until`.
+
+If the store is down, the guard must return `Unavailable` and must not succeed.
+
+## Threats
+
+**Addressed:**
+
+- **Holder of a service token, without the assertion key:** cannot act as anyone. They cannot
+  mint an assertion, and the plain name header is no longer believed.
+- **Captured assertion** (from a log, a proxy, or a mistaken redirect):
+  - it works for at most 120 seconds plus the skew;
+  - it works only at its audience, and only for the request it was bound to;
+  - it works only once per replay store.
+- **Assertion sent to the wrong service:** a `bots` assertion is refused by the tool server
+  (`aud`).
+- **Caller outside its role:** a client that is not in the receiver's issuer list (for
+  example `slack` at a route only `web` may use) is refused (`iss`).
+- **Edited fields:** a change to any byte breaks the signature. The test suite tries every
+  single-byte change, deletion and insertion.
+- **Parser confusion** (duplicate fields, a second spelling of the same values, oversized
+  input): refused before any key is used.
+
+**Not addressed:**
+
+- **A compromised calling service can still mint assertions for its own users, within its
+  issuer scope.** It holds the key, so it can sign for any handle as its own `iss`. What it
+  can do is limited by what the receiver lets that issuer do. Receivers must still apply
+  per-issuer rules, for example `web` creates tasks only with `source: "web"`. Receivers must
+  also still check the subject against `team.yaml` and the roles against `team.yaml`, not
+  trust the assertion's roles for anything that matters more than display.
+- **Shared keys:** with a key shared between issuers, either issuer can sign as the other. Give
+  each caller-receiver pair its own key where you can (see rotation).
+- **Theft of the key itself.** Keep keys in the same secret store as the service tokens. Never
+  put them in config files, code or tests.
+- **Replay across replicas** with the in-memory cache. See the section above.
+- **Request smuggling between a proxy and the receiver,** if they disagree on the path or the
+  body. Bind to what the receiving application actually reads.
+- **Confidentiality.** The assertion is signed, not encrypted: the handle and roles are
+  readable. Send it only over TLS or a private network, which is already how service tokens
+  travel.
+
+## Key rotation
+
+A `KeyRing` holds one current key, which signs and verifies, and at most one previous key,
+which only verifies. Key ids must differ. To rotate without downtime:
+
+1. Generate a new key, for example `k2026b`: 32 random bytes, base64 encoded, kept in the
+   secret store.
+2. Add the new key to every **receiver** as the previous key, next to the current key
+   `k2026a`. Receivers now accept both.
+3. Make the new key current on every **caller**, with the old key as previous. Callers now sign
+   with `k2026b`.
+4. Make the new key current on every receiver as well.
+5. Wait at least 120 + skew seconds, then remove `k2026a` everywhere.
+
+The ring is symmetric: it does not matter whether a key sits in the current or the previous
+slot on the verifying side. Steps 2 and 4 can therefore be the same deploy, as long as every
+receiver accepts both keys before any caller signs with the new one. A key that has leaked is
+removed at once: assertions signed with it fail with `UnknownKey`.
+
+Suggested configuration: `PMOS_ASSERTION_KEYS=<kid>:<base64>[,<kid>:<base64>]` (current first),
+with one variable per caller-receiver pair where the keys differ.
+
+## Clocks
+
+- **Signing and verifying hosts must agree on the time within the skew.** The default skew is
+  5 seconds and the maximum is 30. Run NTP (chrony or systemd-timesyncd) everywhere; on the
+  Spark, all services share one clock.
+- **The clock is injected.** `sign` and `verify` take `now` in unix seconds, and `unix_now()`
+  reads the system clock. Tests pass fixed times.
+- **Choose a short lifetime.** A caller should sign each request just before sending it with a
+  lifetime of 30 to 60 seconds. 120 seconds is the ceiling, not the target. A retry signs a
+  fresh assertion, because the replay guard refuses the old one.
+
+## Adoption checklist
+
+Roll out in this order: shared pieces, then callers sending, then receivers enforcing.
+
+**Shared**
+
+- [ ] Generate one key per caller-receiver pair: `web→bots`, `web→toolserver`,
+      `console→bots` and `console→toolserver`. Store them like the service tokens. A single key
+      for all four pairs is acceptable to start with, but it widens what one compromised
+      service can sign as.
+- [ ] Add `pmos-assertion` to each adopting crate. Parse `PMOS_ASSERTION_KEYS` into a
+      `KeyRing` at start-up, and refuse to start if a key is under 32 bytes. Never log the
+      ring's contents (its `Debug` output is already redacted).
+
+**`pmos-web` (caller)**
+
+- [ ] For every runtime or tool-server call made for the signed-in PM, sign `Claims::new("web",
+      <aud>, handle, roles from team.yaml, session id)`. Use a 60-second lifetime and bind
+      `RequestBinding::new(method, path_and_query, body_bytes)`. Send the result as
+      `X-Pmos-Assertion`, next to the existing `X-Pmos-User` during the transition.
+- [ ] Sign after the body is serialised. Never reuse an assertion, including on a retry.
+
+**Console (caller)**
+
+- [ ] Do the same for calls made for the console viewer, with `iss=console`. This covers
+      routine pause, resume and delete, task cancel, and anything that names `decided_by`.
+- [ ] For reads that are "read everything" (no person), send no assertion. Those reads stay on
+      the console token alone.
+
+**Bot runtime (receiver, `aud=bots`)**
+
+- [ ] Build `VerifyPolicy::new("bots", &["web", "console"])` and keep one replay guard per
+      process; replace it with a shared store before running more than one replica.
+- [ ] In the auth layer, after the client token: for clients `web` and `console`, when the
+      route acts for a person, read `X-Pmos-Assertion` and compute the binding from the
+      request the handler will see (buffer the body, which is small). Verify it with
+      `iss` equal to the client name of the token that was presented, so `web` cannot present
+      `console`'s assertion.
+- [ ] Use `assertion.subject()` as the PM. During the transition, if `X-Pmos-User` is also
+      present it must equal the subject (`403` otherwise). After the transition, ignore it for
+      these clients.
+- [ ] Still check the subject against `team.yaml` and keep the existing per-client rules
+      (`source: "web"` only, own tasks only).
+- [ ] Answer every `VerifyError` with one `401 {"code":"bad_assertion"}`, and log the variant
+      and the issuer.
+- [ ] Add a setting that moves from "verify if present" to "required for `web` and `console`";
+      turn it on once both callers send assertions.
+- [ ] Leave out of scope for now: client `slack` (it acts on Slack-signed events and is a
+      separate question), and the `X-Pmos-User` that the runtime forwards to the gateway.
+
+**Tool server (receiver, `aud=toolserver`)**
+
+- [ ] Do the same with `VerifyPolicy::new("toolserver", &[...callers that act for people])`.
+- [ ] Routes that name a person: `user=` on `/internal/approvals`, `/internal/credentials`,
+      `/internal/memory/repo`, `/internal/onboarding` and `/internal/oauth/*/start`, and
+      `decided_by` on the approval and member decisions. The named person must equal
+      `assertion.subject()`.
+- [ ] Admin-only decisions still check `admin` in `team.yaml`, not the assertion's roles.
+- [ ] Service-token calls that act for no person (the orchestrator, the runtime's own session
+      creation and approval polling) send no assertion and are unchanged.
+- [ ] Record the assertion's `iss`, `sub` and `sid` in the audit next to the token's client
+      name.
+
+**Done when**
+
+- [ ] With the setting on, a call from `web` or `console` that names a person without a valid
+      assertion is `401`, and contract tests cover a forged one, an expired one, a replayed
+      one, the wrong audience and a request mismatch.
+- [ ] `docs/bot-runtime-spec.md` §3 and `docs/toolserver.md` describe the header, and
+      `X-Pmos-User` is documented as advisory for these clients.
