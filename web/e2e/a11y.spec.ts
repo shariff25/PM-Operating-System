@@ -41,6 +41,47 @@ async function scan(page: Page, what: string) {
 
 for (const theme of ['light', 'dark'] as const) {
   test.describe(`axe, ${theme} theme`, () => {
+    test('sign-in with each set of providers, and the signed-out page', async ({ page }) => {
+      await page.addInitScript((t) => {
+        try {
+          window.localStorage.setItem('pmos-theme', t);
+        } catch {
+          /* the page still loads */
+        }
+      }, theme);
+      const open = async (providers: string, hash = '') => {
+        await page.goto(`/?mock_providers=${providers}${hash ? `#${hash}` : ''}`);
+        await page.reload();
+        await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+      };
+      await open('dev');
+      await expect(page.getByLabel('Your handle')).toBeVisible();
+      await scan(page, 'sign-in, development only');
+      await open('entra');
+      await expect(page.getByRole('link', { name: 'Sign in with Microsoft' })).toBeVisible();
+      await scan(page, 'sign-in, Microsoft only');
+      await open('entra,dev');
+      await expect(page.getByLabel('Your handle')).toBeVisible();
+      await scan(page, 'sign-in, both');
+      await open('');
+      await expect(page.getByText("Sign-in isn't set up yet.")).toBeVisible();
+      await scan(page, 'sign-in, nothing set up');
+      for (const reason of ['not_a_member', 'cancelled', 'expired', 'unavailable', 'failed']) {
+        await open('entra', `/signed-out?reason=${reason}`);
+        await expect(page.getByRole('heading', { level: 1, name: 'You are signed out' })).toBeVisible();
+        await scan(page, `signed out, ${reason}`);
+      }
+      await page.setViewportSize({ width: 390, height: 844 });
+      await open('entra,dev');
+      await expect(page.getByRole('link', { name: 'Sign in with Microsoft' })).toBeVisible();
+      await scan(page, 'phone sign-in, both');
+      await open('entra', '/signed-out?reason=not_a_member');
+      await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
+      await scan(page, 'phone signed out');
+      await page.getByRole('button', { name: 'Try again' }).click();
+      await expect(page.getByRole('link', { name: 'Sign in with Microsoft' })).toBeVisible();
+    });
+
     test('home, drafts, follow-ups and activity', async ({ page }) => {
       await signIn(page, theme);
       await expect(page.getByRole('heading', { level: 1 })).toBeVisible();

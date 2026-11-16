@@ -154,7 +154,12 @@ export class ApiError extends Error {
   }
 }
 
+/** A way to sign in that the server has turned on. */
+export type AuthProvider = 'entra' | 'dev';
+
 export interface Api {
+  /** Public: which sign-in methods the server offers. Never needs a session. */
+  providers(): Promise<AuthProvider[]>;
   devLogin(handle: string): Promise<void>;
   logout(): Promise<void>;
   me(): Promise<Me>;
