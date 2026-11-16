@@ -5,7 +5,7 @@
  */
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createWorker, jsonLogger, type WorkerConfig } from "./worker.js";
+import { createWorker, isAbortRejection, jsonLogger, type WorkerConfig } from "./worker.js";
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
   const missing: string[] = [];
@@ -51,6 +51,17 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): WorkerConfi
 }
 
 async function main(): Promise<void> {
+  // An aborted model call (the task was cancelled, its lease was lost, or we are stopping)
+  // leaves one unawaited rejection inside LangChain. Node would exit on it; ignore exactly
+  // that one, and keep the default for everything else.
+  process.on("unhandledRejection", (reason) => {
+    if (isAbortRejection(reason)) {
+      jsonLogger("info", "ignored the rejection an aborted model call left behind");
+      return;
+    }
+    jsonLogger("error", "unhandled rejection", { error: reason instanceof Error ? reason.message : String(reason) });
+    process.exit(1);
+  });
   let config: WorkerConfig;
   try {
     config = configFromEnv();

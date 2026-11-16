@@ -14,6 +14,7 @@ import {
   gatewayBaseUrl,
   pmReason,
   taskMessages,
+  isAbortRejection,
 } from "../src/worker.js";
 import {
   type FakeMcp,
@@ -634,5 +635,16 @@ describe("worker helpers", () => {
     expect(config.bot).toBe("docs");
     expect(config.waitMs).toBe(1000);
     expect(config.contentRoot).toBe(CONTENT);
+  });
+});
+
+describe("isAbortRejection", () => {
+  it("matches only the rejection an aborted model call leaves behind", () => {
+    expect(isAbortRejection(new Error("lost"))).toBe(true);
+    expect(isAbortRejection(new Error("stopped"))).toBe(true);
+    expect(isAbortRejection(new Error("lost connection to the gateway"))).toBe(false);
+    expect(isAbortRejection(new Error("Aborted"))).toBe(false);
+    expect(isAbortRejection("lost")).toBe(false);
+    expect(isAbortRejection(undefined)).toBe(false);
   });
 });
