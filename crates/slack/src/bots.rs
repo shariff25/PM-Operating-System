@@ -382,6 +382,10 @@ impl Bots {
             // The App Home: its clicks have no message, which a `Click` needs.
             Some("block_actions") if payload["view"]["type"] == "home" => self.home_action(payload),
             Some("block_actions") => {
+                // A nudge's **Not now** button; a no-op while the nudge engine is off.
+                if let Some(work) = crate::nudges::action(payload) {
+                    return (None, Some(work));
+                }
                 let Some(click) = Click::from_payload(payload) else {
                     return (None, None);
                 };
@@ -538,6 +542,10 @@ impl Bots {
         }
         if let Some(cmd) = bets_review::command(&text) {
             return self.bets_review(&dm, &handle, cmd).await;
+        }
+        // `nudges off` and `nudges on`; false while the nudge engine is off.
+        if crate::nudges::handle_dm(&dm.channel, &dm.thread_ts, &handle, &text).await {
+            return;
         }
         if let Some(cmd) = level::command(&text) {
             return self.level_command(&dm, &handle, cmd).await;
