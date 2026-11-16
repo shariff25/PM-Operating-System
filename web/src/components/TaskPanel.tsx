@@ -1,7 +1,9 @@
+import { useMemo } from 'react';
 import type { Task } from '../api';
 import { useApp } from '../app-context';
 import { copy } from '../copy';
-import { Markdown } from './bits';
+import { renderMarkdown } from '../markdown';
+import { Markdown, StrippedNote } from './bits';
 
 export function isSettled(t: Task): boolean {
   return t.status !== 'queued' && t.status !== 'working';
@@ -10,6 +12,7 @@ export function isSettled(t: Task): boolean {
 export function TaskPanel({ task, onRetry, onClear }: { task: Task; onRetry: () => void; onClear: () => void }) {
   const { navigate } = useApp();
   const events = task.events ?? [];
+  const rendered = useMemo(() => renderMarkdown(task.result ?? ''), [task.result]);
   const busy = events.some((e) => e.kind === 'retry') && !isSettled(task);
   return (
     <section className="card task" aria-label="Your request" aria-live="polite">
@@ -30,7 +33,8 @@ export function TaskPanel({ task, onRetry, onClear }: { task: Task; onRetry: () 
       {task.result && (
         <div>
           <h3 className="sr-only">{copy.task.resultHeading}</h3>
-          <Markdown text={task.result} />
+          <Markdown rendered={rendered} />
+          <StrippedNote parts={rendered.stripped} what={copy.stripped.answer} />
         </div>
       )}
       {task.status === 'failed' && (
@@ -45,7 +49,7 @@ export function TaskPanel({ task, onRetry, onClear }: { task: Task; onRetry: () 
       )}
       <div className="row">
         {task.draft_ids.map((id) => (
-          <button key={id} type="button" className="btn btn-primary" onClick={() => navigate(`/d/${id}`)}>
+          <button key={id} type="button" className="btn btn-primary" onClick={() => navigate(`/d/${encodeURIComponent(id)}`)}>
             {copy.task.openDraft}
           </button>
         ))}

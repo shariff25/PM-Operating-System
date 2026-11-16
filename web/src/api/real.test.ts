@@ -76,4 +76,43 @@ describe('real client', () => {
     expect(await api.getSuggestion('a')).toBeNull();
     expect((await api.requestChange('a', 'x')).status).toBe('working');
   });
+
+  it('sends the version with approve when there is one, and not otherwise', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async () => json(200, {}));
+    const api = createRealClient({ fetchImpl });
+    await api.approve('a', { version: 'v7', confirmExternal: true });
+    await api.approve('a', { confirmExternal: true });
+    expect(JSON.parse(fetchImpl.mock.calls[0]![1]!.body as string)).toEqual({ confirm_external: true, version: 'v7' });
+    expect(JSON.parse(fetchImpl.mock.calls[1]![1]!.body as string)).toEqual({ confirm_external: true });
+  });
+
+  it('turns 409 stale into a typed error', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(json(409, { code: 'stale', error: 'Changed.' }));
+    const api = createRealClient({ fetchImpl });
+    await expect(api.approve('a', { version: 'v1' })).rejects.toMatchObject({ status: 409, code: 'stale' });
+  });
+
+  it('encodes ids placed in paths (review finding 4)', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async () => json(200, {}));
+    const api = createRealClient({ fetchImpl });
+    const evil = '../tasks?x=1#y';
+    await api.getDraft(evil);
+    await api.approve(evil);
+    await api.getTask(evil);
+    await api.dismissFollowup(evil);
+    for (const call of fetchImpl.mock.calls) {
+      const url = call[0] as string;
+      expect(url).not.toMatch(/[?#]/);
+      expect(url).not.toMatch(/\/\.\.(\/|$)/);
+      expect(url).toContain('..%2Ftasks%3Fx%3D1%23y');
+    }
+    expect(fetchImpl.mock.calls[0]![0]).toBe('/api/drafts/..%2Ftasks%3Fx%3D1%23y');
+  });
+
+  it('refuses an id that is only dots, which a browser would treat as a path step', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async () => json(404, { code: 'not_found' }));
+    const api = createRealClient({ fetchImpl });
+    await expect(api.getDraft('..')).rejects.toMatchObject({ code: 'not_found' });
+    expect(fetchImpl.mock.calls[0]![0]).toBe('/api/drafts/%00');
+  });
 });

@@ -2,14 +2,15 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import type { Brief, DraftSummary, FollowUp, Task } from '../api';
 import { messageOf, useApp } from '../app-context';
-import { ErrorNote } from '../components/bits';
+import { ErrorNote, ExtLink } from '../components/bits';
 import { TaskPanel, isSettled } from '../components/TaskPanel';
 import { copy } from '../copy';
+import { effectiveStatus, isExpired, sortDrafts } from '../drafts';
 
 function expiry(d: DraftSummary, now: number): string | null {
+  if (isExpired(d, now)) return copy.home.expiredRow;
   if (!d.expires_at || d.status !== 'pending') return null;
   const ms = Date.parse(d.expires_at) - now;
-  if (ms <= 0) return copy.home.expired;
   return copy.home.expiresIn(Math.floor(ms / 3600_000), Math.max(1, Math.floor(ms / 60_000)));
 }
 
@@ -29,7 +30,7 @@ export function Home() {
 
   const loadDrafts = useCallback(async () => {
     try {
-      setDrafts(await api.listDrafts());
+      setDrafts(sortDrafts(await api.listDrafts()));
       setDraftsError(null);
     } catch (e) {
       setDraftsError(messageOf(e, copy.errors.loadHomeFailed));
@@ -137,12 +138,12 @@ export function Home() {
       <ul className="list">
         {rows.map((f) => (
           <li key={f.id} className="row-item">
-            <div>
+            <div className="row-text">
               <strong>{f.who}</strong> <span className="muted">({copy.home.ageDays(f.age_days)})</span>
               <div>{f.summary}</div>
-              <a href={f.url} target="_blank" rel="noopener noreferrer">
-                {copy.home.openSource}<span className="sr-only"> for {f.who}: {f.summary}</span>
-              </a>
+              <ExtLink href={f.url} label={` for ${f.who}: ${f.summary}`}>
+                {copy.home.openSource}
+              </ExtLink>
             </div>
             <div className="row">
               <button type="button" className="btn" onClick={() => followupDraft(f)} disabled={asking}>
@@ -164,7 +165,7 @@ export function Home() {
         {firstVisit && drafts && drafts.length > 0 && <p className="lede">{copy.welcomeWithDrafts}</p>}
       </header>
 
-      <form onSubmit={ask} className="ask" aria-label="Ask">
+      <form onSubmit={ask} className="ask card ask-card" aria-label="Ask">
         <label htmlFor="ask-box" className="label-big">{copy.home.askLabel}</label>
         <div className="ask-row">
           <input
@@ -189,6 +190,38 @@ export function Home() {
         />
       )}
 
+      <section aria-label="Drafts" className="stack">
+        <h2>{copy.home.draftsHeading}</h2>
+        {draftsError && (
+          <ErrorNote actionLabel={copy.errors.retry} onAction={() => void loadDrafts()}>
+            {draftsError}
+          </ErrorNote>
+        )}
+        {!drafts && !draftsError && <p className="muted">{copy.home.loadingDrafts}</p>}
+        {drafts && drafts.length === 0 && !me.first_visit && <p className="muted">{copy.emptyDrafts}</p>}
+        {drafts && drafts.length > 0 && (
+          <ul className="list">
+            {drafts.map((d) => {
+              const exp = expiry(d, now);
+              const status = effectiveStatus(d, now);
+              return (
+                <li key={d.id}>
+                  <a className="draft-link" href={`#/d/${encodeURIComponent(d.id)}`}>
+                    <span className="draft-title">{d.title}</span>
+                    <span className={`badge badge-${status}`}>{copy.home.statusLabel(status)}</span>
+                    <span className="draft-meta">
+                      {d.practice && <span className="badge badge-practice">{copy.home.practiceBadge}</span>}
+                      <span className="muted">{copy.home.kindLabel(d.kind)}</span>
+                      {exp && <span className="muted">{exp}</span>}
+                    </span>
+                  </a>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+
       {brief && (
         <section aria-label="Follow-ups" className="stack">
           <div>
@@ -208,9 +241,9 @@ export function Home() {
                     <div>
                       <strong>{c.title}</strong>
                       <div>{c.summary}</div>
-                      <a href={c.url} target="_blank" rel="noopener noreferrer">
-                        {copy.home.openSource}<span className="sr-only">: {c.title}</span>
-                      </a>
+                      <ExtLink href={c.url} label={`: ${c.title}`}>
+                        {copy.home.openSource}
+                      </ExtLink>
                     </div>
                   </li>
                 ))}
@@ -220,37 +253,6 @@ export function Home() {
           {rowError && <ErrorNote>{rowError}</ErrorNote>}
         </section>
       )}
-
-      <section aria-label="Drafts" className="stack">
-        <h2>{copy.home.draftsHeading}</h2>
-        {draftsError && (
-          <ErrorNote actionLabel={copy.errors.retry} onAction={() => void loadDrafts()}>
-            {draftsError}
-          </ErrorNote>
-        )}
-        {!drafts && !draftsError && <p className="muted">{copy.home.loadingDrafts}</p>}
-        {drafts && drafts.length === 0 && !me.first_visit && <p className="muted">{copy.emptyDrafts}</p>}
-        {drafts && drafts.length > 0 && (
-          <ul className="list">
-            {drafts.map((d) => {
-              const exp = expiry(d, now);
-              return (
-                <li key={d.id}>
-                  <a className="draft-link" href={`#/d/${d.id}`}>
-                    <span className="draft-title">{d.title}</span>
-                    <span className="draft-meta">
-                      <span className={`badge badge-${d.status}`}>{copy.home.statusLabel(d.status)}</span>
-                      {d.practice && <span className="badge badge-practice">{copy.home.practiceBadge}</span>}
-                      <span className="muted">{copy.home.kindLabel(d.kind)}</span>
-                      {exp && <span className="muted">{exp}</span>}
-                    </span>
-                  </a>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </section>
     </div>
   );
 }
