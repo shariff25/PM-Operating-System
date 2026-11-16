@@ -102,7 +102,36 @@ pub struct Approval {
     #[serde(default)]
     pub decided_at: Option<String>,
     #[serde(default)]
+    pub decided_by: Option<String>,
+    #[serde(default)]
     pub result: Option<Value>,
+    /// When a Slack draft expires, as the tool server's own setting has it.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// A link to where the write goes, when the tool server could build one from ids.
+    #[serde(default)]
+    pub target_url: Option<String>,
+    /// For a Slack draft whose audience the tool server has checked: whether the channel is
+    /// shared outside the company.
+    #[serde(default)]
+    pub external: Option<bool>,
+}
+
+/// One source of `GET /internal/approvals/{id}/sources`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalSource {
+    pub system: String,
+    pub title: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(rename = "ref")]
+    pub reference: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SourcesReply {
+    #[serde(default)]
+    sources: Vec<ApprovalSource>,
 }
 
 /// A decision for `POST /internal/approvals/{id}/decision`.
@@ -285,6 +314,16 @@ impl ToolServer {
         let url = self.0.url(&["internal", "approvals", id])?;
         let res = self.0.send(self.0.http.get(url)).await?;
         self.0.read(res).await
+    }
+
+    /// What the run that drafted item `id` read, for its own `user` only.
+    pub async fn sources(&self, id: &str, user: &str) -> UpstreamResult<Vec<ApprovalSource>> {
+        let url = self.0.url(&["internal", "approvals", id, "sources"])?;
+        let res = self
+            .0
+            .send(self.0.http.get(url).query(&[("user", user)]))
+            .await?;
+        Ok(self.0.read::<SourcesReply>(res).await?.sources)
     }
 
     pub async fn decide(&self, id: &str, body: &DecisionBody) -> UpstreamResult<Approval> {

@@ -13,13 +13,30 @@
 //!
 //! Other write tools (such as `bets.record`) are not drafts in this contract and are left
 //! out. A PM's edit maps back onto the same fields ([`edited_args`]).
+//!
+//! **What the PM is told about the target comes from ids, never from free text the bot
+//! wrote.** The label is built from the target arguments only (space, page, project, issue
+//! type, epic, channel), and a value that isn't shaped like an id reads "an unrecognised …"
+//! so a bot can't put a sentence there. `target.url`, `expires_at` and `external` come
+//! from the tool server's own fields; `sources` from its audit log.
+//!
+//! **`version`** is the SHA-256 of the tool and the canonical JSON of the arguments an
+//! approve would send now (the item's arguments with the PM's saved edit applied). An
+//! approve that names another version is refused (`409 stale`), so what is published is
+//! what the PM saw.
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::settings::{DraftEdit, PracticeDraft, StoredSuggestion, UserState};
-use crate::upstream::Approval;
+use crate::upstream::{Approval, ApprovalSource};
+
+/// The most sources a draft shows.
+pub const MAX_SOURCES: usize = 20;
+/// The longest source title shown.
+pub const MAX_SOURCE_TITLE: usize = 200;
 
 /// Slack drafts expire this long after they are made (the tool server's default
 /// `PMOS_SLACK_DRAFT_TTL_HOURS`; it doesn't report its setting).
@@ -53,7 +70,10 @@ pub struct Source {
     pub id: String,
     pub system: String,
     pub title: String,
-    pub url: String,
+    /// `null` for a source with no link (a context library file, or Jira and Confluence
+    /// when the PM has no linked Atlassian site).
+    pub url: Option<String>,
+    /// Always `null`: no source text is kept anywhere to quote (see `crates/web/README.md`).
     pub excerpt: Option<String>,
 }
 
@@ -64,10 +84,13 @@ pub struct Draft {
     pub body: String,
     pub edited: bool,
     pub target: Target,
-    /// Always empty today: see `crates/web/README.md` ("Sources").
+    /// What the bot read for the run that made the draft (the tool server's
+    /// `GET /internal/approvals/{id}/sources`); empty when it can't say.
     pub sources: Vec<Source>,
     pub result_url: Option<String>,
     pub external: bool,
+    /// What an approve would publish now; see the module docs.
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -128,50 +151,185 @@ fn title_and_body(tool: &str, args: &Value) -> (String, String) {
     match tool {
         "confluence.create_draft" => (s(args, "title").into(), s(args, "body").into()),
         "confluence.update_page" => (
-            format!("Update to page {}", s(args, "page_id")),
+            format!("Update to page {}", ident(s(args, "page_id"), "page")),
             s(args, "body").into(),
         ),
         "jira.create_issue" => (s(args, "summary").into(), s(args, "description").into()),
         "slack.post_reply" => (
-            format!("Reply in {}", s(args, "channel")),
+            format!("Reply in {}", ident(s(args, "channel"), "channel")),
             s(args, "text").into(),
         ),
         _ => (
-            format!("Message to {}", s(args, "channel")),
+            format!("Message to {}", ident(s(args, "channel"), "channel")),
             s(args, "text").into(),
         ),
     }
 }
 
-fn target(tool: &str, args: &Value) -> Target {
+/// `value` if it is shaped like an id (letters, digits, `-`, `_`, `.`, `~`, at most 64),
+/// else "an unrecognised `what`": a target label never carries free text.
+fn ident(value: &str, what: &str) -> String {
+    let ok = !value.is_empty()
+        && value.chars().count() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'));
+    if ok {
+        value.to_string()
+    } else {
+        format!("an unrecognised {what}")
+    }
+}
+
+/// Issue types are words: letters, digits, spaces and `-`, at most 32.
+fn issue_type(value: &str) -> String {
+    let ok = !value.trim().is_empty()
+        && value.chars().count() <= 32
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-'));
+    if ok {
+        value.trim().to_string()
+    } else {
+        "issue".to_string()
+    }
+}
+
+/// An `https` link with nothing in it that could break out of an attribute.
+pub fn safe_url(url: &str) -> bool {
+    url.starts_with("https://")
+        && url.len() > "https://".len()
+        && url.len() <= 2048
+        && !url
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '<' | '>' | '\\'))
+}
+
+fn target(item: &Approval) -> Target {
+    let (tool, args) = (item.tool.as_str(), &item.args);
     let (system, label) = match tool {
         "confluence.create_draft" => {
-            let mut label = format!("Space {}", s(args, "space"));
+            let mut label = format!("Space {}", ident(s(args, "space"), "space"));
             if !s(args, "parent_id").is_empty() {
-                label.push_str(&format!(", under page {}", s(args, "parent_id")));
+                label.push_str(&format!(
+                    ", under page {}",
+                    ident(s(args, "parent_id"), "page")
+                ));
             }
             ("confluence", label)
         }
-        "confluence.update_page" => ("confluence", format!("Page {}", s(args, "page_id"))),
+        "confluence.update_page" => (
+            "confluence",
+            format!("Page {}", ident(s(args, "page_id"), "page")),
+        ),
         "jira.create_issue" => {
             let mut label = format!(
                 "Project {}, a new {}",
-                s(args, "project"),
-                s(args, "issue_type")
+                ident(s(args, "project"), "project"),
+                issue_type(s(args, "issue_type"))
             );
             if !s(args, "epic").is_empty() {
-                label.push_str(&format!(" under {}", s(args, "epic")));
+                label.push_str(&format!(" under {}", ident(s(args, "epic"), "epic")));
             }
             ("jira", label)
         }
-        "slack.post_reply" => ("slack", format!("A thread in {}", s(args, "channel"))),
-        _ => ("slack", s(args, "channel").to_string()),
+        "slack.post_reply" => (
+            "slack",
+            format!("A thread in {}", ident(s(args, "channel"), "channel")),
+        ),
+        _ => ("slack", ident(s(args, "channel"), "channel")),
     };
     Target {
         system,
         label,
-        url: None,
+        url: item.target_url.clone().filter(|u| safe_url(u)),
     }
+}
+
+/// The tool server's sources as the draft's: each with a link only if it is `https`, a
+/// plain title of bounded length, no excerpt (none is kept anywhere), at most
+/// [`MAX_SOURCES`].
+pub fn sources(found: Vec<ApprovalSource>) -> Vec<Source> {
+    found
+        .into_iter()
+        .filter(|s| !s.reference.is_empty())
+        .take(MAX_SOURCES)
+        .enumerate()
+        .map(|(i, s)| {
+            let title: String = s
+                .title
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_SOURCE_TITLE)
+                .collect();
+            Source {
+                id: format!("s{}", i + 1),
+                system: ident(&s.system, "system"),
+                title: if title.trim().is_empty() {
+                    s.reference.chars().take(MAX_SOURCE_TITLE).collect()
+                } else {
+                    title
+                },
+                url: s.url.filter(|u| safe_url(u)),
+                excerpt: None,
+            }
+        })
+        .collect()
+}
+
+/// `value` with object keys sorted at every level, as the tool server hashes arguments.
+fn canonical(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for k in keys {
+                out.insert(k.clone(), canonical(&map[k]));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
+        other => other.clone(),
+    }
+}
+
+fn hex_sha256(parts: &[&str]) -> String {
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update((p.len() as u64).to_be_bytes());
+        h.update(p.as_bytes());
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The version of a write: its tool and its arguments.
+pub fn args_version(tool: &str, args: &Value) -> String {
+    let canonical = serde_json::to_string(&canonical(args)).unwrap_or_default();
+    hex_sha256(&[tool, &canonical])
+}
+
+/// The arguments an approve of `item` would send now: with the PM's saved edit, if any.
+pub fn effective_args(item: &Approval, state: &UserState) -> Value {
+    match state.edits.get(&item.id) {
+        Some(edit) => edited_args(&item.tool, &item.args, edit),
+        None => item.args.clone(),
+    }
+}
+
+/// The version of `item` as the PM sees it now.
+pub fn version(item: &Approval, state: &UserState) -> String {
+    args_version(&item.tool, &effective_args(item, state))
+}
+
+/// The version of a practice draft as the PM sees it now.
+pub fn practice_version(p: &PracticeDraft, state: &UserState) -> String {
+    let edit = state.edits.get(&p.id);
+    let title = edit
+        .and_then(|e| e.title.as_deref())
+        .unwrap_or(PRACTICE_TITLE);
+    let body = edit.map(|e| e.body.as_str()).unwrap_or(PRACTICE_BODY);
+    hex_sha256(&["practice", &p.id, title, body])
 }
 
 /// The item's arguments with the PM's edit applied, for decision `edit`.
@@ -204,9 +362,18 @@ pub fn result_url(result: Option<&Value>) -> Option<String> {
     (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_string())
 }
 
+/// When a Slack draft expires: the tool server's own `expires_at`, or for a tool server that
+/// doesn't send it yet, its default of 24 hours after creation.
 fn expires_at(item: &Approval) -> Option<String> {
     if !is_slack(&item.tool) {
         return None;
+    }
+    if let Some(at) = item
+        .expires_at
+        .as_deref()
+        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+    {
+        return Some(rfc3339(at.with_timezone(&Utc)));
     }
     DateTime::parse_from_rfc3339(&item.created_at)
         .ok()
@@ -251,10 +418,15 @@ pub fn draft(item: &Approval, state: &UserState) -> Option<Draft> {
         summary,
         body,
         edited: edit.is_some(),
-        target: target(&item.tool, &item.args),
+        target: target(item),
         sources: Vec::new(),
         result_url: result_url(item.result.as_ref()),
-        external: state.external.contains(&item.id),
+        // The tool server's audience result when it has one; else what its last
+        // `needs_external_confirm` answer for this draft said.
+        external: item
+            .external
+            .unwrap_or_else(|| state.external.contains(&item.id)),
+        version: version(item, state),
     })
 }
 
@@ -319,14 +491,18 @@ pub fn practice_draft(p: &PracticeDraft, bot: &str, state: &UserState) -> Draft 
         edited: edit.is_some(),
         target: Target {
             system: "confluence",
-            label: "Practice only: nothing is sent".into(),
+            label: PRACTICE_LABEL.into(),
             url: None,
         },
         sources: Vec::new(),
         result_url: None,
         external: false,
+        version: practice_version(p, state),
     }
 }
+
+/// A practice draft's target: it never goes anywhere.
+pub const PRACTICE_LABEL: &str = "Practice only: nothing is sent";
 
 /// What the PM's bot is asked when they request a change. It must answer with the text only
 /// and write nothing: the backend reads the task's result as the revised body.
@@ -443,6 +619,103 @@ mod tests {
         assert_eq!(result_url(Some(&json!({"error": "no"}))), None);
         assert_eq!(status("executing"), "approved");
         assert_eq!(status("failed"), "failed");
+    }
+
+    #[test]
+    fn target_labels_never_carry_free_text() {
+        let none = UserState::default();
+        let d = draft(
+            &item(
+                "slack.send_message",
+                json!({"channel": "C01 (internal only, safe to post)", "text": "x"}),
+            ),
+            &none,
+        )
+        .unwrap();
+        assert_eq!(d.target.label, "an unrecognised channel");
+        assert_eq!(d.summary.title, "Message to an unrecognised channel");
+        let d = draft(
+            &item(
+                "jira.create_issue",
+                json!({"project": "PAY", "issue_type": "Story <b>", "summary": "x",
+                       "epic": "PAY-1, approved by legal"}),
+            ),
+            &none,
+        )
+        .unwrap();
+        assert_eq!(
+            d.target.label,
+            "Project PAY, a new issue under an unrecognised epic"
+        );
+        // The link is the tool server's, and only https.
+        let mut it = item("slack.send_message", json!({"channel": "C01", "text": "x"}));
+        it.target_url = Some("javascript:alert(1)".into());
+        assert_eq!(draft(&it, &none).unwrap().target.url, None);
+        it.target_url = Some("https://slack.com/archives/C01".into());
+        it.external = Some(true);
+        let d = draft(&it, &none).unwrap();
+        assert_eq!(
+            d.target.url.as_deref(),
+            Some("https://slack.com/archives/C01")
+        );
+        assert!(d.external, "the tool server's audience result");
+    }
+
+    #[test]
+    fn the_version_is_what_an_approve_would_publish() {
+        let mut state = UserState::default();
+        let it = item(
+            "confluence.create_draft",
+            json!({"space": "PM", "title": "PRD", "body": "Old"}),
+        );
+        let before = version(&it, &state);
+        assert_eq!(before, version(&it, &state), "stable");
+        state.edits.insert(
+            "apr_1".into(),
+            DraftEdit {
+                title: None,
+                body: "New".into(),
+            },
+        );
+        let edited = version(&it, &state);
+        assert_ne!(before, edited);
+        // Once approved with the edit, the item's own arguments have the same version, in
+        // any key order.
+        let mut approved = it.clone();
+        approved.args = json!({"body": "New", "title": "PRD", "space": "PM"});
+        assert_eq!(version(&approved, &UserState::default()), edited);
+        assert_ne!(
+            args_version("confluence.update_page", &approved.args),
+            edited,
+            "the tool is part of it"
+        );
+    }
+
+    #[test]
+    fn sources_keep_only_safe_links_and_no_text() {
+        let found = vec![
+            ApprovalSource {
+                system: "jira".into(),
+                title: "PAY-1".into(),
+                url: Some("https://acme.atlassian.net/browse/PAY-1".into()),
+                reference: "PAY-1".into(),
+            },
+            ApprovalSource {
+                system: "docs".into(),
+                title: "".into(),
+                url: Some("data:text/html,x".into()),
+                reference: "https://docs.example.com/a.md".into(),
+            },
+        ];
+        let out = sources(found);
+        assert_eq!(out[0].id, "s1");
+        assert_eq!(
+            out[0].url.as_deref(),
+            Some("https://acme.atlassian.net/browse/PAY-1")
+        );
+        assert_eq!(out[1].url, None);
+        assert_eq!(out[1].title, "https://docs.example.com/a.md");
+        assert!(out.iter().all(|s| s.excerpt.is_none()));
     }
 
     #[test]

@@ -56,6 +56,43 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 - **A timeout or 5xx on a write** is reported as "may or may not have happened", never as
   "unavailable", so neither the model nor the PM retries into a duplicate.
 
+### What an item is shown with
+
+For the web app (`crates/web`), each item as the internal API answers it carries three more
+fields, which older readers ignore. None needs a network call:
+
+- `expires_at`: for a Slack draft, `created_at` plus `PMOS_SLACK_DRAFT_TTL_HOURS`.
+- `target_url`: a link to where the write goes, built only from target ids that pass a
+  shape check (`sources.rs`): a Confluence parent page or space, the page being updated, a
+  Jira epic or project on the PM's linked Atlassian site (read from the stored
+  credential's site fields, never its token), a Slack thread or channel
+  (`https://slack.com/archives/…`). Left out when no link can be built.
+- `external`: for a Slack draft whose channel's audience has been checked (on an approve),
+  whether the channel is shared outside the company. Kept in memory per item and channel:
+  a restart forgets it, and it is left out until the next check.
+
+`GET /internal/approvals/{id}/sources?user=` lists what the drafting run read, from the
+audit log: `user`'s successful read-tool calls with the item's `run_id`, at or before the
+item's `created_at`. Each source appears once (its latest read), newest first, at most 20
+(`truncated` says more were read); at most 500 audit events are scanned. It is metadata
+only, as the audit log is: nothing new is recorded for it, and no message text, page body,
+snippet or excerpt is stored or returned.
+
+| Audit `sources` entry | `system` | `title` | `url` |
+| --- | --- | --- | --- |
+| a context path (context tools) | `context` | the file's title in the context index | `null` |
+| `jira:PAY-212` | `jira` | `PAY-212` (the key, not its summary) | `{site}/browse/PAY-212` |
+| `jira:rollup:status` | `jira` | `Jira rollup by status` | `null` |
+| `confluence:12345` | `confluence` | `Confluence page 12345` (no page title is recorded) | `{site}/wiki/pages/viewpage.action?pageId=12345` |
+| `slack:C01:1731.0001` | `slack` | `Slack thread in C01` or `Slack message in C01` (the channel id) | `https://slack.com/archives/C01/p17310001` |
+| `docs:https://…/page.md` | `docs` | the page's slug | the docs URL |
+
+Limits: Jira and Confluence links need a linked Atlassian site (else `url` is `null`); a
+read that found nothing, failed or was refused records no sources, so it isn't listed; a
+reference of an unknown shape is left out; memory, the bets register and the stats tools
+record no sources; and with only a JSON-lines audit file (no Postgres, no in-memory log)
+the log can't be read back, so the answer is `available: false` with no sources.
+
 ## Endpoints
 
 | Endpoint | Auth | Purpose |
@@ -70,7 +107,8 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | `POST /internal/grants` `{session_token, tool, args}` | service token | Record an approval given in the harness |
 | `GET /internal/approvals?user=&status=` | service token | `{items: […]}`: a PM's inbox, newest first. `status` is `pending`, `executing`, `approved`, `rejected`, `failed` or `expired` (`400` for anything else) |
 | `GET /internal/approvals?user=` | bot token | The App Home Inbox: `{approvals: […], total}`, only `pending` items whatever `status` says, oldest first, at most 50. Each item reads as `GET /internal/approvals/{id}` returns it; `total` counts every pending item. `403` if `user` isn't a team member (live connectors) or is a team bot's identity; `400` without `user` |
-| `GET /internal/approvals/{id}` | service or bot token | One item: `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity` and `redacted_at` |
+| `GET /internal/approvals/{id}` | service or bot token | One item: `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity` and `redacted_at`; plus, when known, `expires_at`, `target_url` and `external` (see **What an item is shown with**). Listings and decision answers carry the same fields |
+| `GET /internal/approvals/{id}/sources?user=` | service token | What the run that drafted the item read: `{sources: [{system, title, url, ref, tool, read_at}], available, truncated}`. `user` is required (`400`) and must be the item's user: anyone else's item, or a missing one, is `404`. See **What an item is shown with** |
 | `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?}` | service or bot token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. |
 | `GET /internal/ledger?since=&until=&bot=&outcome=&min_edit=&limit=` | service or bot token | `{rows: […]}`, newest first. See **Feedback ledger**. `422` for a bad parameter |
 | `GET /internal/ledger/summary?since=&bot=` | service token | Per bot (or skill) and tool: counts by outcome, label coverage, median edit distance, rejection reasons. `422` for a bad `since` |
