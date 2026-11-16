@@ -99,6 +99,19 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(15))
         .build()?;
 
+    // The daily brief's items to the web app's home page: on with both set.
+    let brief_feed = pmos_slack::brief_feed::Producer::from_lookup(optional, http.clone())
+        .map_err(|e| anyhow!(e))?;
+    match &brief_feed {
+        Some(p) => tracing::info!(url = p.base(), "daily briefs also go to the web app"),
+        None if optional("PMOS_WEB_URL").is_some()
+            || optional("PMOS_WEB_BRIEF_TOKEN").is_some() =>
+        {
+            tracing::warn!("set both PMOS_WEB_URL and PMOS_WEB_BRIEF_TOKEN to send daily briefs to the web app; it is off")
+        }
+        None => {}
+    }
+
     let default_tz = optional("PMOS_DEFAULT_TZ").unwrap_or_else(|| "UTC".into());
     let state_dir =
         PathBuf::from(optional("PMOS_SLACK_STATE_DIR").unwrap_or_else(|| "state/slack".into()));
@@ -176,7 +189,9 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow!(e))?;
         socket = socket.with_bots(bots.clone());
         notifier = Some(tokio::spawn(
-            Notifier::new(bots, state_dir).run(shutdown.child_token()),
+            Notifier::new(bots, state_dir)
+                .with_brief_feed(brief_feed)
+                .run(shutdown.child_token()),
         ));
     }
     tracing::info!("pmos-slack starting (Socket Mode)");

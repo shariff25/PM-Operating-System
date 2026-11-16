@@ -37,7 +37,9 @@
 #   PMOS_TEST_WEB=1       also build web/ and pmos-web, and serve the app at
 #                         http://127.0.0.1:8770 with DEVELOPMENT sign-in (anyone who can reach
 #                         the port signs in as any member of the test team; it binds to this
-#                         machine only). Unset: nothing about the web app runs.
+#                         machine only). Unset: nothing about the web app runs. With it, the
+#                         daily brief (`brief now` in a DM) also fills the app's home page:
+#                         Slack and pmos-web share a fresh brief token (docs/daily-brief.md).
 #
 # Stop with Ctrl-C; every service is stopped with it.
 set -euo pipefail
@@ -125,6 +127,11 @@ if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
   AK_BOTS="web:bots:k1:$(openssl rand -base64 32)"
   AK_TOOLS="web:toolserver:k1:$(openssl rand -base64 32)"
   ASSERTION_MODE=require
+  # The daily brief's feed from Slack to pmos-web (PUT /internal/brief/{handle}).
+  WEB_BRIEF_TOKEN=$(tok)
+  SLACK_WEB_FEED=(PMOS_WEB_URL=http://127.0.0.1:8770 PMOS_WEB_BRIEF_TOKEN="$WEB_BRIEF_TOKEN")
+else
+  SLACK_WEB_FEED=()
 fi
 
 PIDS=()
@@ -193,6 +200,7 @@ start slack env PMOS_SLACK_APP_TOKEN="$PMOS_SLACK_APP_TOKEN" \
   PMOS_TOOLSERVER_URL=http://127.0.0.1:8710 PMOS_BOT_TOKEN="$BOT_TOKEN" \
   PMOS_BOTS_URL=http://127.0.0.1:8750 PMOS_BOTS_TOKEN="$RT_SLACK" \
   PMOS_CONTENT_ROOT="$STATE/content" PMOS_SLACK_STATE_DIR="$STATE/slack" \
+  ${SLACK_WEB_FEED[@]+"${SLACK_WEB_FEED[@]}"} \
   "$BIN/pmos-slack"
 
 if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
@@ -200,6 +208,7 @@ if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
   start web env PMOS_WEB_BIND=127.0.0.1:8770 PMOS_WEB_DEV_LOGIN=1 \
     PMOS_WEB_BOTS_TOKEN="$RT_WEB" PMOS_WEB_TOOLSERVER_TOKEN="$TS_WEB" \
     PMOS_ASSERTION_KEYS="$AK_BOTS,$AK_TOOLS" \
+    PMOS_WEB_BRIEF=1 PMOS_WEB_BRIEF_TOKEN="$WEB_BRIEF_TOKEN" \
     PMOS_BOTS_URL=http://127.0.0.1:8750 PMOS_TOOLSERVER_URL=http://127.0.0.1:8710 \
     PMOS_CONTENT_ROOT="$STATE/content" PMOS_WEB_STATIC_DIR="$ROOT/web/dist" \
     "$BIN/pmos-web"
