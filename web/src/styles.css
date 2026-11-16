@@ -845,6 +845,11 @@ del.ba-word { background: var(--del-word); text-decoration: line-through; text-d
 .signin-form .btn { margin-top: 8px; }
 .signin-form label { font-weight: 500; font-size: 13.5px; }
 .signin-form .muted { font-size: 12.5px; }
+.signin-ms { min-height: 42px; font-size: 14.5px; }
+.signin-dev { border-top: 1px solid var(--border); padding-top: 18px; }
+.signin-dev-title { font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+.signin-none { display: flex; align-items: flex-start; gap: 8px; color: var(--muted); font-size: 13.5px; }
+.signin-none svg { flex: none; margin-top: 2px; }
 
 .back { display: inline-flex; align-items: center; gap: 6px; min-height: 36px; margin-bottom: 12px; font-weight: 500; text-decoration: none; }
 
