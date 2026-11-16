@@ -12,6 +12,7 @@ chrono.workspace = true
 serde.workspace = true
 serde_norway.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]

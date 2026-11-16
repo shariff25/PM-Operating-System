@@ -310,9 +310,12 @@ async fn toolserver(
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
                 }
                 Some(i) if i["user"] == json!(user) => {
-                    let sources = if *id == "apr_conf" {
+                    // Each with the ref its read gave the bot, except where a tool server
+                    // from before markers sent none (the docs and Slack ones here).
+                    let sources = if *id == "apr_conf" || *id == "apr_cited" {
                         json!([
                             {"system": "jira", "title": "PAY-212", "ref": "PAY-212",
+                             "cite": "src-a1b2c3",
                              "url": "https://acme.atlassian.net/browse/PAY-212",
                              "tool": "jira.read", "read_at": "2026-11-16T09:05:00Z"},
                             {"system": "docs", "title": "grace period", "ref": "https://docs.example.com/grace.md",
@@ -323,6 +326,7 @@ async fn toolserver(
                              "tool": "slack.read_thread", "read_at": "2026-11-16T09:03:00Z"},
                             {"system": "context", "title": "Pricing principles",
                              "ref": "context/products/pricing.md", "url": null,
+                             "cite": "src-d4e5f6",
                              "tool": "context.read", "read_at": "2026-11-16T09:02:00Z"},
                         ])
                     } else {
@@ -1361,7 +1365,9 @@ async fn asks_the_bot_for_a_change_and_offers_its_text() {
     w.runtime.set(
         task_id,
         "result",
-        json!("```markdown\n# PRD\nShort text\n```"),
+        // A marker the bot copied into its answer: a suggestion is the PM's text, so it has
+        // none.
+        json!("```markdown\n# PRD\nShort text [[src-a1b2c3]]\n```"),
     );
     let r = w.get(&b, "/api/drafts/apr_conf/suggestion").await;
     assert_eq!(r.body["suggestion"]["status"], "ready");
@@ -1874,14 +1880,15 @@ async fn a_draft_shows_the_sources_the_tool_server_found_for_its_own_pm() {
         d["sources"],
         json!([
             {"id": "s1", "system": "jira", "title": "PAY-212",
-             "url": "https://acme.atlassian.net/browse/PAY-212", "excerpt": null},
+             "url": "https://acme.atlassian.net/browse/PAY-212", "excerpt": null,
+             "cited": false},
             {"id": "s2", "system": "docs", "title": "grace period",
-             "url": "https://docs.example.com/grace.md", "excerpt": null},
+             "url": "https://docs.example.com/grace.md", "excerpt": null, "cited": false},
             // A link that isn't https is dropped; the source stays.
             {"id": "s3", "system": "slack", "title": "Slack thread in C01", "url": null,
-             "excerpt": null},
+             "excerpt": null, "cited": false},
             {"id": "s4", "system": "context", "title": "Pricing principles", "url": null,
-             "excerpt": null},
+             "excerpt": null, "cited": false},
         ])
     );
     // Asked for this PM's own item, with the service token, and only after the ownership
@@ -1914,6 +1921,71 @@ async fn a_draft_shows_the_sources_the_tool_server_found_for_its_own_pm() {
     let r = w.get(&b, "/api/drafts/apr_conf").await;
     assert_eq!((r.status, &r.body["sources"]), (StatusCode::OK, &json!([])));
     assert_eq!(r.body["body"], "x");
+}
+
+/// The bot's source markers, resolved to the sources its task read (`docs/web-api.md`,
+/// Citations): `[[sN]]` in the body and `cited` on each source; none after an edit.
+#[tokio::test]
+async fn a_drafts_source_markers_become_citations_until_the_pm_edits_it() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    let raw = "# Grace [[src-a1b2c3]]\n\nSeven days [[src-a1b2c3]] [[src-d4e5f6]], per \
+               pricing [[src-999999]].\n\nWrite `[[src-a1b2c3]]` to cite.";
+    w.tools.data.lock().unwrap().push(item(
+        "apr_cited",
+        "ana",
+        "confluence.create_draft",
+        json!({"space": "PM", "title": "Grace [[src-a1b2c3]]", "body": raw}),
+        "2026-11-16T09:07:00Z",
+    ));
+    let d = w.get(&b, "/api/drafts/apr_cited").await.body;
+    assert_eq!(
+        d["body"],
+        "# Grace[[s1]]\n\nSeven days[[s1]][[s4]], per pricing.\n\nWrite `[[src-a1b2c3]]` to cite."
+    );
+    assert_eq!(d["title"], "Grace");
+    let cited: Vec<(&str, bool)> = d["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["id"].as_str().unwrap(), s["cited"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(
+        cited,
+        [("s1", true), ("s2", false), ("s3", false), ("s4", true)]
+    );
+    assert_eq!(d["edited"], false);
+    let version = d["version"].as_str().unwrap().to_string();
+    // The summary in the list carries no marker either.
+    let list = w.get(&b, "/api/drafts").await.body;
+    assert_eq!(list["drafts"][0]["title"], "Grace");
+
+    // An edit is the PM's text: markers (either form) are removed and nothing is cited.
+    let r = w
+        .send(
+            &b,
+            Method::PUT,
+            "/api/drafts/apr_cited",
+            Some(json!({"body": "Seven days[[s1]], confirmed [[src-a1b2c3]]."})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.body["body"], "Seven days, confirmed.");
+    assert_eq!(r.body["edited"], true);
+    assert_ne!(r.body["version"], json!(version));
+    assert!(r.body["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|s| s["cited"] == json!(false)));
+    let r = w.post(&b, "/api/drafts/apr_cited/approve", json!({})).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let sent = &w.tools.writes()[0].body;
+    assert_eq!(sent["decision"], "edit");
+    assert_eq!(sent["args"]["body"], "Seven days, confirmed.");
+    // A field the PM didn't edit goes back as the bot wrote it; the tool server removes any
+    // marker from every field when it writes.
+    assert_eq!(sent["args"]["title"], "Grace [[src-a1b2c3]]");
 }
 
 #[tokio::test]
