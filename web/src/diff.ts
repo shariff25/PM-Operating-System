@@ -9,7 +9,20 @@ export interface DiffLine {
   text: string;
   /** Present on a removed or added line that pairs with a line on the other side: the words that differ. */
   parts?: DiffPart[];
+  /** On a removed line: it was paired with an added line and is shown once, inline, on that line. */
+  merged?: boolean;
+  /** On an added line paired with a removed one: the old and new words in one run of text. */
+  inline?: InlinePart[];
 }
+
+/** A run of words in a paragraph shown once: kept as is, struck through, or newly added. */
+export interface InlinePart {
+  text: string;
+  kind: 'same' | 'removed' | 'added';
+}
+
+/** A paired paragraph is shown inline only when at least this share of its words is kept. */
+export const INLINE_MIN_SHARED = 0.4;
 
 type Op = { kind: 'same' | 'added' | 'removed'; a?: number; b?: number };
 
@@ -85,6 +98,52 @@ export function diffWords(before: string, after: string): { before: DiffPart[]; 
   return { before: merge(bridge(left)), after: merge(bridge(right)), shared };
 }
 
+/** Old and new words in one sequence: removed words come right before the words that replace them. */
+export function diffInline(before: string, after: string): { parts: InlinePart[]; shared: number; most: number } {
+  const a = tokens(before);
+  const b = tokens(after);
+  const parts: InlinePart[] = [];
+  let shared = 0;
+  let gone = '';
+  let came = '';
+  const flush = () => {
+    // Spacing both sides share is not part of the change.
+    const tail = /\s*$/.exec(gone)![0];
+    const tailB = /\s*$/.exec(came)![0];
+    const keep = tail && tail === tailB && (gone.trim() || came.trim()) ? tail : '';
+    if (keep) {
+      gone = gone.slice(0, -keep.length);
+      came = came.slice(0, -keep.length);
+    }
+    if (gone.trim()) parts.push({ text: gone, kind: 'removed' });
+    if (came.trim()) parts.push({ text: came, kind: 'added' });
+    if (keep) parts.push({ text: keep, kind: 'same' });
+    gone = '';
+    came = '';
+  };
+  for (const op of lcsOps(a, b)) {
+    if (op.kind === 'removed') gone += a[op.a!]!;
+    else if (op.kind === 'added') came += b[op.b!]!;
+    else {
+      const t = a[op.a!]!;
+      // Whitespace between two changed runs stays inside the change, so a phrase reads as one.
+      if (!t.trim() && (gone || came)) {
+        gone += t;
+        came += t;
+        continue;
+      }
+      flush();
+      const last = parts[parts.length - 1];
+      if (last?.kind === 'same') last.text += t;
+      else parts.push({ text: t, kind: 'same' });
+      if (t.trim()) shared++;
+    }
+  }
+  flush();
+  const count = (t: string[]) => t.filter((x) => x.trim()).length;
+  return { parts, shared, most: Math.max(count(a), count(b)) };
+}
+
 /**
  * Line diff, with word-level differences inside lines that were rewritten rather than
  * replaced outright: in each run of removed lines followed by added lines, a removed line
@@ -117,11 +176,13 @@ export function diffLines(before: string, after: string): DiffLine[] {
     for (let k = 0; k < pairs; k++) {
       const r = removed[k]!;
       const ad = added[k]!;
-      const words = diffWords(r.text, ad.text);
-      const most = Math.max(tokens(r.text).filter((t) => t.trim()).length, tokens(ad.text).filter((t) => t.trim()).length);
-      if (most > 0 && words.shared / most >= 0.4) {
-        r.parts = words.before;
-        ad.parts = words.after;
+      const words = diffInline(r.text, ad.text);
+      if (words.most > 0 && words.shared / words.most >= INLINE_MIN_SHARED) {
+        const sides = diffWords(r.text, ad.text);
+        r.parts = sides.before;
+        ad.parts = sides.after;
+        r.merged = true;
+        ad.inline = words.parts;
       }
     }
     // Show each run as the old lines, then the new lines.
