@@ -6,6 +6,7 @@ import type { Page } from '@playwright/test';
 // A state is reached the way a person would reach it, then scanned.
 
 const EMPTY = 'http://127.0.0.1:5192';
+const BRIEF_OFF = 'http://127.0.0.1:5193';
 
 async function signIn(page: Page, theme: 'light' | 'dark', base?: string) {
   await page.addInitScript((t) => {
@@ -130,20 +131,14 @@ for (const theme of ['light', 'dark'] as const) {
         await scan(page, `draft with the ${hint} hint`);
         await page.locator('[data-hint]').getByRole('button', { name: 'Got it' }).click();
       }
-      await page.getByRole('tab', { name: /^Sources/ }).click();
       await page.getByRole('button', { name: /PAY-212/ }).click();
       await scan(page, 'draft, a source selected');
-      await page.getByRole('tab', { name: 'Details' }).click();
-      await scan(page, 'draft, details');
-      await page.getByRole('tab', { name: 'Ask for a change' }).click();
       await page.getByLabel('What should change?').fill('shorter');
       await page.getByRole('button', { name: 'Suggest a change' }).click();
       const region = page.getByRole('region', { name: 'Suggested change' });
       await expect(region).toBeVisible();
-      await scan(page, 'draft, before and after');
-      await region.getByRole('button', { name: /unchanged paragraph/ }).click();
-      await scan(page, 'draft, before and after with the fold open');
-      await region.getByRole('button', { name: 'Accept' }).click();
+      await scan(page, 'draft, a suggestion in the document');
+      await region.getByRole('button', { name: 'Accept change' }).click();
       await page.getByRole('button', { name: 'Reject draft' }).click();
       await scan(page, 'draft, reject reasons');
       await page.keyboard.press('Escape');
@@ -168,6 +163,23 @@ for (const theme of ['light', 'dark'] as const) {
       await go(page, '/d/apr_slack');
       await page.getByRole('button', { name: 'Approve to Slack' }).click();
       await scan(page, 'external approve dialog');
+    });
+
+    test('home with a running request, home without the brief, and the icon rail', async ({ page }) => {
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await signIn(page, theme);
+      await page.getByLabel('What do you need?').fill('this is busy, what changed?');
+      await page.getByLabel('What do you need?').press('Enter');
+      await expect(page.getByRole('region', { name: 'Conversation' })).toBeVisible();
+      await go(page, '/');
+      await expect(page.getByRole('region', { name: 'Needs your decision' }).getByRole('progressbar')).toBeVisible();
+      await scan(page, 'home, a request running');
+      await signIn(page, theme, BRIEF_OFF);
+      await expect(page.getByRole('region', { name: 'Today in numbers' })).toContainText('Running now');
+      await scan(page, 'home, brief not built');
+      await go(page, '/d/apr_prd');
+      await expect(page.locator('header.rail')).toHaveClass(/rail-compact/);
+      await scan(page, 'draft with the icon rail');
     });
 
     test('palette and user menu', async ({ page }) => {
@@ -203,6 +215,10 @@ for (const theme of ['light', 'dark'] as const) {
       await page.getByRole('button', { name: 'More' }).click();
       await scan(page, 'phone More menu');
       await page.keyboard.press('Escape');
+      await page.getByRole('tab', { name: 'Details' }).click();
+      await scan(page, 'phone draft details and checklist');
+      await page.getByRole('tab', { name: /^Sources/ }).click();
+      await scan(page, 'phone draft sources');
       await go(page, '/a/tsk_seed_week');
       await expect(page.getByRole('region', { name: 'Conversation' })).toBeVisible();
       await scan(page, 'phone thread');

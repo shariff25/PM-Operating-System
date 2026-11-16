@@ -15,6 +15,9 @@ const PATHS = {
   chevronUpDown: 'M8 9.5l4-4 4 4M8 14.5l4 4 4-4',
   arrowUp: 'M12 19V5M6 11l6-6 6 6',
   arrowLeft: 'M19 12H5M11 6l-6 6 6 6',
+  arrowRight: 'M5 12h14M13 6l6 6-6 6',
+  shield: 'M12 3.5 19 6v5.5c0 4.4-3 7.7-7 9-4-1.3-7-4.6-7-9V6zM9 12l2 2 4-4',
+  menu: 'M4 7h16M4 12h16M4 17h16',
   sun: 'M12 16.5a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9zM12 2.5v2M12 19.5v2M4.6 4.6l1.4 1.4M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4 6 18M18 6l1.4-1.4',
   moon: 'M19.5 14.5A7.5 7.5 0 0 1 9.5 4.5a7.5 7.5 0 1 0 10 10z',
   monitor: 'M4.5 5h15a1 1 0 0 1 1 1v9.5a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1zM9 20h6M12 16.5V20',
@@ -43,7 +46,18 @@ const PATHS = {
 
 export type IconName = keyof typeof PATHS;
 
-export function Icon({ name, size = 18, className }: { name: IconName; size?: number; className?: string }) {
+export function Icon({
+  name,
+  size = 18,
+  className,
+  weight = 1.75,
+}: {
+  name: IconName;
+  size?: number;
+  className?: string;
+  /** Stroke width; the checklist and approve marks use a heavier line. */
+  weight?: number;
+}) {
   return (
     <svg
       className={`icon ${className ?? ''}`}
@@ -52,7 +66,7 @@ export function Icon({ name, size = 18, className }: { name: IconName; size?: nu
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
-      strokeWidth={1.75}
+      strokeWidth={weight}
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"
@@ -63,14 +77,12 @@ export function Icon({ name, size = 18, className }: { name: IconName; size?: nu
   );
 }
 
-/** The product mark: a folded page with a spark, in the accent colour. */
-export function Mark({ size = 28 }: { size?: number }) {
+/** The product mark: a monogram tile in the accent colour. */
+export function Mark({ size = 28 }: { size?: 24 | 28 | 36 }) {
   return (
-    <svg className="mark" width={size} height={size} viewBox="0 0 32 32" aria-hidden="true" focusable="false">
-      <rect width="32" height="32" rx="8" className="mark-bg" />
-      <path d="M10 9.5h8.5l4 4V22a1.5 1.5 0 0 1-1.5 1.5H10A1.5 1.5 0 0 1 8.5 22V11A1.5 1.5 0 0 1 10 9.5z" className="mark-page" />
-      <path d="M15.5 13.5c.3 2 1 2.8 2.8 3.2-1.8.4-2.5 1.2-2.8 3.2-.3-2-1-2.8-2.8-3.2 1.8-.4 2.5-1.2 2.8-3.2z" className="mark-spark" />
-    </svg>
+    <span className={`mark mark-${size}`} aria-hidden="true">
+      P
+    </span>
   );
 }
 

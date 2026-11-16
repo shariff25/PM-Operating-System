@@ -24,8 +24,8 @@ export function UserMenu({
   collapsed = false,
 }: {
   onSignOut: () => void;
-  /** sidebar: avatar and name, opens upwards. compact: avatar only, opens downwards. */
-  variant: 'sidebar' | 'compact';
+  /** rail: avatar, name and handle in the dark rail, opens upwards. compact: avatar only, opens downwards (phone). */
+  variant: 'rail' | 'compact';
   collapsed?: boolean;
 }) {
   const { api, me, setMe, theme, setTheme } = useApp();
@@ -117,9 +117,12 @@ export function UserMenu({
         onKeyDown={onButtonKey}
       >
         <Avatar name={me.name} size={variant === 'compact' ? 'sm' : 'md'} />
-        {variant === 'sidebar' && !collapsed && (
+        {variant === 'rail' && !collapsed && (
           <>
-            <span className="user-name">{me.name}</span>
+            <span className="user-text">
+              <span className="user-name">{me.name}</span>
+              <span className="user-handle">@{me.handle}</span>
+            </span>
             <Icon name="chevronUpDown" size={16} className="user-caret" />
           </>
         )}
