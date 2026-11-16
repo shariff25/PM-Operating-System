@@ -62,8 +62,15 @@ pub fn resolve_bot(bot: &str, requested_by: &str) -> String {
 #[serde(deny_unknown_fields)]
 pub struct EvalTask {
     pub id: String,
+    /// The one request of a single-turn task. A task has `ask` and `expect`, or `thread`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ask: String,
+    #[serde(default, skip_serializing_if = "Expect::is_empty")]
     pub expect: Expect,
+    /// A conversation: the turns, in order, each its own runtime task in one conversation.
+    /// The task passes only if every turn that has an `expect` passes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thread: Vec<Turn>,
     /// Tasks in one cluster share a source, so they are not independent; the standard error
     /// is clustered by it. Default: the first `must_cite` URL, else the task id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -77,7 +84,27 @@ pub struct EvalTask {
     pub tags: Vec<String>,
 }
 
+/// One turn of a thread.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Turn {
+    pub ask: String,
+    /// What this turn's reply must be. A turn without one only has to settle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<Expect>,
+}
+
 impl EvalTask {
+    /// Whether this task is a conversation (`thread`) and not a single `ask`.
+    pub fn is_thread(&self) -> bool {
+        !self.thread.is_empty()
+    }
+
+    /// The first thing asked: `ask`, or the thread's first turn.
+    pub fn first_ask(&self) -> &str {
+        self.thread.first().map_or(self.ask.as_str(), |t| &t.ask)
+    }
+
     /// The task's cluster: `cluster`, else its first `must_cite` URL, else its id.
     pub fn cluster(&self) -> String {
         self.cluster
@@ -112,7 +139,7 @@ pub struct Expect {
 }
 
 impl Expect {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.must_cite.is_empty()
             && self.must_include.is_empty()
             && self.must_not_include.is_empty()
@@ -331,10 +358,51 @@ fn validate_task(task: &EvalTask, stem: &str, shown: &str, errors: &mut Vec<Stri
             task.id, task.id
         ));
     }
-    if task.ask.trim().is_empty() {
-        errors.push(format!("{shown}: `ask` is empty"));
+    if task.is_thread() {
+        if !task.ask.is_empty() {
+            errors.push(format!(
+                "{shown}: a task has either `ask` or `thread`, not both; move `ask` into the thread's first turn"
+            ));
+        }
+        if !task.expect.is_empty() {
+            errors.push(format!(
+                "{shown}: a thread task has no top-level `expect`; give each turn its own"
+            ));
+        }
+        if task.thread.len() < 2 {
+            errors.push(format!(
+                "{shown}: a `thread` has at least two turns; a single request is an `ask`"
+            ));
+        }
+        if task.thread.iter().all(|t| t.expect.is_none()) {
+            errors.push(format!(
+                "{shown}: no turn of the `thread` has an `expect`; nothing would be graded"
+            ));
+        }
+        for (i, turn) in task.thread.iter().enumerate() {
+            let at = format!("{shown}: thread turn {}", i + 1);
+            if turn.ask.trim().is_empty() {
+                errors.push(format!("{at}: `ask` is empty"));
+            }
+            if let Some(e) = &turn.expect {
+                validate_expect(e, &at, errors);
+            }
+        }
+    } else {
+        if task.ask.trim().is_empty() {
+            errors.push(format!(
+                "{shown}: `ask` is empty; a task has `ask` (one request) or `thread` (a conversation)"
+            ));
+        }
+        validate_expect(&task.expect, shown, errors);
     }
-    let e = &task.expect;
+    if task.cluster.as_deref().is_some_and(|c| c.trim().is_empty()) {
+        errors.push(format!("{shown}: `cluster` is empty"));
+    }
+}
+
+/// The checks of one `expect`, at `shown` (a file, or a file and a turn).
+fn validate_expect(e: &Expect, shown: &str, errors: &mut Vec<String>) {
     if e.is_empty() {
         errors.push(format!(
             "{shown}: `expect` has no checks; give at least one of must_cite, must_include, must_not_include, approvals, must_decline or drafts"
@@ -344,9 +412,6 @@ fn validate_task(task: &EvalTask, stem: &str, shown: &str, errors: &mut Vec<Stri
         errors.push(format!(
             "{shown}: a `must_decline` task has no `must_cite`: no page answers it"
         ));
-    }
-    if task.cluster.as_deref().is_some_and(|c| c.trim().is_empty()) {
-        errors.push(format!("{shown}: `cluster` is empty"));
     }
     for url in &e.must_cite {
         match reqwest::Url::parse(url) {
