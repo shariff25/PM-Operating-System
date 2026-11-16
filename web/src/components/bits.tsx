@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { DraftStatus, HintName, TaskStatus } from '../api';
 import { useApp, messageOf } from '../app-context';
 import { copy } from '../copy';
 import type { Rendered } from '../markdown';
+import { PHONE_QUERY, useMediaQuery } from '../theme';
 import { safeUrl } from '../url';
 import { Icon } from './icons';
 
@@ -101,20 +102,36 @@ export function ErrorNote({
  * A one-time hint, drawn as a small coach mark next to the thing it describes. Hints appear one
  * at a time: sources, then ask, then approve. The next one shows only after the one before it
  * was dismissed. Hidden when nudges are off.
+ *
+ * It sits in the page flow (never over content), with a small pointer toward the element named
+ * by `anchor` (an element id). On a phone it is a compact banner without a pointer.
  */
-export function Hint({
-  name,
-  side = 'below',
-  align = 'start',
-}: {
-  name: HintName;
-  side?: 'below' | 'above';
-  align?: 'start' | 'end';
-}) {
+export function Hint({ name, anchor }: { name: HintName; anchor?: string }) {
   const { api, me, setMe } = useApp();
+  const phone = useMediaQuery(PHONE_QUERY);
+  const box = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const active = copy.hintOrder.find((h) => !me.hints_seen.includes(h));
-  if (!me.nudges || active !== name) return null;
+  const show = me.nudges && active === name;
+
+  // The pointer is aimed at the middle of the anchor, set straight on the element.
+  useLayoutEffect(() => {
+    if (!show || phone || !anchor) return;
+    const aim = () => {
+      const target = document.getElementById(anchor);
+      const el = box.current;
+      if (!target || !el) return;
+      const t = target.getBoundingClientRect();
+      const h = el.getBoundingClientRect();
+      const x = Math.min(Math.max(t.left + t.width / 2 - h.left, 20), Math.max(h.width - 20, 20));
+      el.style.setProperty('--caret-x', `${Math.round(x)}px`);
+    };
+    aim();
+    window.addEventListener('resize', aim);
+    return () => window.removeEventListener('resize', aim);
+  }, [show, phone, anchor]);
+
+  if (!show) return null;
   const dismiss = async () => {
     try {
       setMe(await api.markHintSeen(name));
@@ -124,20 +141,23 @@ export function Hint({
   };
   const step = copy.hintOrder.indexOf(name) + 1;
   return (
-    <aside className={`coach coach-${side} coach-${align}`} aria-label="Hint" data-hint={name}>
-      <span className="coach-step">{copy.hintStep(step, copy.hintOrder.length)}</span>
-      <p>{copy.hints[name]}</p>
+    <div
+      ref={box}
+      role="note"
+      className={`coach ${phone ? 'coach-banner' : 'coach-inline'}`}
+      aria-label={copy.hintLabel}
+      data-hint={name}
+    >
+      <div className="coach-text">
+        {!phone && <span className="coach-step">{copy.hintStep(step, copy.hintOrder.length)}</span>}
+        <p>{phone ? copy.hintsShort[name] : copy.hints[name]}</p>
+        {error && <p className="coach-error" role="alert">{error}</p>}
+      </div>
       <button type="button" className="coach-btn" onClick={dismiss}>
         {copy.hintDismiss}
       </button>
-      {error && <p className="coach-error" role="alert">{error}</p>}
-    </aside>
+    </div>
   );
-}
-
-/** Wraps a control so a coach mark can sit next to it. */
-export function HintAnchor({ children, className }: { children: ReactNode; className?: string }) {
-  return <span className={`coach-anchor ${className ?? ''}`}>{children}</span>;
 }
 
 const DRAFT_TONE: Record<DraftStatus, string> = {
@@ -207,10 +227,20 @@ export function Skeleton({ rows = 3, label, variant = 'rows' }: { rows?: number;
 }
 
 /** A friendly empty state: an icon, one line of copy, and an optional action. */
-export function Empty({ icon, children, action }: { icon: Parameters<typeof Icon>[0]['name']; children: ReactNode; action?: ReactNode }) {
+export function Empty({
+  icon,
+  children,
+  action,
+  small,
+}: {
+  icon: Parameters<typeof Icon>[0]['name'];
+  children: ReactNode;
+  action?: ReactNode;
+  small?: boolean;
+}) {
   return (
-    <div className="empty">
-      <span className="empty-icon"><Icon name={icon} size={20} /></span>
+    <div className={`empty ${small ? 'empty-sm' : ''}`}>
+      <span className="empty-icon"><Icon name={icon} size={small ? 18 : 20} /></span>
       <p>{children}</p>
       {action}
     </div>

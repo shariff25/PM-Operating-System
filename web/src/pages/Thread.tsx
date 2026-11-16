@@ -2,13 +2,14 @@ import { useEffect, useMemo, useState } from 'react';
 import { ApiError } from '../api';
 import type { Draft, Task } from '../api';
 import { messageOf, useApp } from '../app-context';
-import { Avatar, ErrorNote, Markdown, Skeleton, StrippedNote } from '../components/bits';
+import { Avatar, Empty, ErrorNote, Markdown, Skeleton, StrippedNote } from '../components/bits';
 import { Icon, Mark, kindIcon } from '../components/icons';
 import { TopBarLead } from '../components/Shell';
 import { copy } from '../copy';
 import { useAsk, useData } from '../data';
 import { renderMarkdown } from '../markdown';
-import { isRetrying, isSettled, milestones } from '../tasks';
+import { usePoll } from '../polling';
+import { isRetrying, isSettled, milestones, usableProgress } from '../tasks';
 import { relTime } from '../time';
 import { draftHref } from '../url';
 
@@ -61,23 +62,18 @@ export function Thread({ id }: { id: string }) {
     };
   }, [api, id]);
 
-  // Poll a working task until it settles.
-  useEffect(() => {
-    if (!task || isSettled(task)) return;
-    let cancelled = false;
-    const timer = setTimeout(async () => {
+  // Poll a working task until it settles: quick at first, slower later, paused in a hidden tab.
+  usePoll(
+    task !== null && !isSettled(task),
+    async () => {
       try {
-        const next = await api.getTask(task.id);
-        if (!cancelled) setTask(next);
+        setTask(await api.getTask(id));
       } catch (e) {
-        if (!cancelled) setLoadError(messageOf(e, copy.errors.unknown));
+        setLoadError(messageOf(e, copy.errors.unknown));
       }
-    }, pollMs);
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [task, api, pollMs]);
+    },
+    pollMs,
+  );
 
   useEffect(() => {
     if (task) upsertTask(task);
@@ -119,10 +115,13 @@ export function Thread({ id }: { id: string }) {
   const latest = shown[shown.length - 1];
   const working = !settled;
   const liveLine = working ? (latest?.text ?? copy.task.status[task.status]) : copy.task.status[task.status];
+  const progress = working ? usableProgress(task) : null;
+  const nothingToShow = settled && !task.result && !task.error && task.draft_ids.length === 0 && task.status !== 'failed';
 
   return (
     <div className="page page-narrow thread">
       <TopBarLead>{crumb}</TopBarLead>
+      <h1 className="sr-only">{task.text}</h1>
       <section className="thread-list" aria-label={copy.activity.threadLabel}>
         <article className="msg msg-you" aria-label={copy.activity.you}>
           <div className="msg-head">
@@ -142,9 +141,26 @@ export function Thread({ id }: { id: string }) {
           <div className="msg-body">
             <p className={`live-line ${working ? 'live-line-on' : ''}`} role="status">
               {working ? <span className="live-dot" aria-hidden="true" /> : <Icon name={task.status === 'failed' ? 'alert' : 'check'} size={16} className="live-icon" />}
-              <span>{liveLine}</span>
+              <span className="live-text">{liveLine}</span>
+              {progress && <span className="live-count">{copy.task.progress(progress.done, progress.total)}</span>}
             </p>
-            {isRetrying(task) && <p className="muted small">{copy.modelBusy}</p>}
+            {working && (
+              <div className="live-sub">
+                <div
+                  className={`progress ${progress ? '' : 'progress-off'}`}
+                  role={progress ? 'progressbar' : undefined}
+                  aria-label={progress ? copy.task.progressLabel : undefined}
+                  aria-valuemin={progress ? 0 : undefined}
+                  aria-valuemax={progress?.total}
+                  aria-valuenow={progress?.done}
+                  aria-valuetext={progress ? copy.task.progress(progress.done, progress.total) : undefined}
+                  aria-hidden={progress ? undefined : true}
+                >
+                  <span className="progress-fill" style={{ width: progress ? `${(progress.done / progress.total) * 100}%` : '0%' }} />
+                </div>
+                <p className="live-note">{isRetrying(task) ? copy.modelBusy : ''}</p>
+              </div>
+            )}
 
             {shown.length > 0 && (
               <div className="steps">
@@ -168,7 +184,7 @@ export function Thread({ id }: { id: string }) {
 
             {task.result && (
               <div className="result">
-                <h3 className="sr-only">{copy.task.resultHeading}</h3>
+                <h2 className="sr-only">{copy.task.resultHeading}</h2>
                 <Markdown rendered={rendered} className="prose" />
                 <StrippedNote parts={rendered.stripped} what={copy.stripped.answer} />
               </div>
@@ -193,6 +209,18 @@ export function Thread({ id }: { id: string }) {
               </div>
             )}
             {retryError && <ErrorNote>{retryError}</ErrorNote>}
+            {nothingToShow && (
+              <Empty
+                icon="sparkle"
+                action={
+                  <button type="button" className="btn btn-sm" disabled={asking} onClick={() => void start(() => api.createTask(task.text), copy.errors.askFailed)}>
+                    {copy.task.tryAgain}
+                  </button>
+                }
+              >
+                {copy.task.noResult}
+              </Empty>
+            )}
 
             {task.draft_ids.map((d) => <DraftCard key={d} id={d} />)}
           </div>
