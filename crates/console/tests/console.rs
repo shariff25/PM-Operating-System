@@ -22,6 +22,8 @@ const TEAM: &str = "members:
   - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm]}
   - {handle: ben, slack-id: U0BEN, roles: [pm]}
   - {handle: root, slack-id: U0ROOT, email: root@example.com, roles: [pm, admin]}
+  - {handle: rae, slack-id: U0RAE, roles: [reviewer]}
+  - {handle: aud, slack-id: U0AUD, roles: [auditor]}
 ";
 
 /// Every call an upstream saw: method, path and query, the bearer token, and the body.
@@ -788,4 +790,30 @@ async fn pages_carry_a_strict_policy_and_both_themes() {
     assert!(!body.contains("<script"));
     let res = c.http.get(format!("{}/", c.base)).send().await.unwrap();
     assert_eq!(res.headers()["location"], "/bots");
+}
+
+#[tokio::test]
+async fn an_auditor_sees_no_bots_routines_or_tasks() {
+    let c = console(Options::default()).await;
+    let (status, body) = c.get(Some("aud"), "/bots").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("bot-docs") && !body.contains("bot-pm-ana"));
+    assert!(body.contains("aud · auditor"));
+    let (_, body) = c.get(Some("aud"), "/routines").await;
+    assert!(!body.contains("rtn_ana1") && !body.contains("rtn_ben1"));
+    let (_, body) = c.get(Some("aud"), "/activity").await;
+    assert!(!body.contains("/tasks/"));
+    let (_, body) = c.get(Some("aud"), "/approvals").await;
+    assert!(!body.contains("<table"));
+}
+
+#[tokio::test]
+async fn a_reviewer_is_a_pm_who_also_reads_others_approvals() {
+    let c = console(Options::default()).await;
+    let (_, body) = c.get(Some("rae"), "/bots").await;
+    assert!(body.contains("bot-docs") && !body.contains("bot-pm-ana"));
+    let (_, body) = c.get(Some("rae"), "/routines").await;
+    assert!(!body.contains("rtn_ana1") && !body.contains("rtn_ben1"));
+    let (_, body) = c.get(Some("rae"), "/activity").await;
+    assert!(!body.contains("/tasks/"));
 }

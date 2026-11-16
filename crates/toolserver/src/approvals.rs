@@ -208,6 +208,57 @@ impl Verdict {
     }
 }
 
+/// What a Reviewer recommends the item's owner do. A recommendation is advice: it never
+/// changes the item's status, and only the owner decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Recommend {
+    Approve,
+    Reject,
+}
+
+impl Recommend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Reject => "reject",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "approve" => Some(Self::Approve),
+            "reject" => Some(Self::Reject),
+            _ => None,
+        }
+    }
+}
+
+/// One reviewer's advice on one approval item. There is no free-text field: only a choice
+/// and, optionally, a reason from the fixed list. At most one per reviewer per item; a new
+/// one replaces the old.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Recommendation {
+    pub approval_id: String,
+    pub reviewer: String,
+    pub recommend: Recommend,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Reason>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RecommendError {
+    #[error("approval item not found")]
+    NotFound,
+    #[error("a reviewer can't recommend on their own approval item")]
+    OwnItem,
+    #[error("approval item is no longer pending")]
+    NotPending,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DecideError {
     #[error("approval item not found")]
@@ -395,6 +446,24 @@ pub trait ApprovalRepo: Send + Sync {
         result: Result<Value, String>,
     ) -> StoreResult<Option<ApprovalItem>>;
 
+    /// Record `reviewer`'s recommendation on a pending item, replacing their earlier one.
+    /// The reviewer must not be the item's user, and the item must be `pending` (checked
+    /// atomically with the write). It never changes the item or its ledger row.
+    async fn recommend(
+        &self,
+        id: &str,
+        reviewer: &str,
+        recommend: Recommend,
+        reason: Option<Reason>,
+        now: DateTime<Utc>,
+    ) -> Result<Recommendation, RecommendError>;
+
+    /// An item's recommendations, oldest first. Empty for an unknown item.
+    async fn recommendations(&self, id: &str) -> StoreResult<Vec<Recommendation>>;
+
+    /// How many recommendations each of `ids` has (items with none are left out).
+    async fn recommendation_counts(&self, ids: &[String]) -> StoreResult<BTreeMap<String, usize>>;
+
     /// Items still `executing` that were decided at or before `before`: writes interrupted
     /// by a crash or restart.
     async fn stuck(&self, before: DateTime<Utc>) -> StoreResult<Vec<ApprovalItem>>;
@@ -442,6 +511,8 @@ struct State {
     grants: Vec<Grant>,
     items: BTreeMap<String, ApprovalItem>,
     ledger: BTreeMap<String, Ledgered>,
+    /// By (approval id, reviewer).
+    recommendations: BTreeMap<(String, String), Recommendation>,
 }
 
 /// A stored ledger row, and whether the decision changed the item's arguments.
@@ -640,6 +711,62 @@ impl ApprovalRepo for MemoryApprovals {
             };
         }
         Ok(Some(item))
+    }
+
+    async fn recommend(
+        &self,
+        id: &str,
+        reviewer: &str,
+        recommend: Recommend,
+        reason: Option<Reason>,
+        now: DateTime<Utc>,
+    ) -> Result<Recommendation, RecommendError> {
+        let mut state = self.state.lock().expect("approvals lock");
+        let item = state.items.get(id).ok_or(RecommendError::NotFound)?;
+        if item.user == reviewer {
+            return Err(RecommendError::OwnItem);
+        }
+        if item.status != Status::Pending {
+            return Err(RecommendError::NotPending);
+        }
+        let rec = Recommendation {
+            approval_id: id.to_string(),
+            reviewer: reviewer.to_string(),
+            recommend,
+            reason,
+            created_at: now,
+        };
+        state
+            .recommendations
+            .insert((id.to_string(), reviewer.to_string()), rec.clone());
+        Ok(rec)
+    }
+
+    async fn recommendations(&self, id: &str) -> StoreResult<Vec<Recommendation>> {
+        let state = self.state.lock().expect("approvals lock");
+        let mut recs: Vec<_> = state
+            .recommendations
+            .values()
+            .filter(|r| r.approval_id == id)
+            .cloned()
+            .collect();
+        recs.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.reviewer.cmp(&b.reviewer))
+        });
+        Ok(recs)
+    }
+
+    async fn recommendation_counts(&self, ids: &[String]) -> StoreResult<BTreeMap<String, usize>> {
+        let state = self.state.lock().expect("approvals lock");
+        let mut counts = BTreeMap::new();
+        for rec in state.recommendations.values() {
+            if ids.contains(&rec.approval_id) {
+                *counts.entry(rec.approval_id.clone()).or_insert(0) += 1;
+            }
+        }
+        Ok(counts)
     }
 
     async fn stuck(&self, before: DateTime<Utc>) -> StoreResult<Vec<ApprovalItem>> {

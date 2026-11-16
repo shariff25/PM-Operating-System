@@ -30,7 +30,6 @@ use crate::approvals::{
     args_hash, redact_args, reply_message, reply_thread, ApprovalItem, ApprovalRepo, DecideError,
     Decision, Drafted, NewItem, Status, Verdict, GRANT_TTL_MINUTES, REPLY_TOOL,
 };
-use crate::audit::{AuditEvent, AuditSink};
 use crate::context::{
     query_terms, snippet, ContextDoc, ContextIndex, Hit, ReindexReport, SearchResults,
 };
@@ -43,6 +42,9 @@ use crate::memory_repo::{MemoryRepo, MemoryRepoStore};
 use crate::session::{token_hash, Session, SessionRepo};
 use crate::store::{StoreError, StoreResult, Stores};
 use crate::vault::{CredentialStore, Provider, SealedCredential};
+
+#[path = "pg_recommendations.rs"]
+mod recs;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -730,6 +732,31 @@ impl ApprovalRepo for PgStore {
         row.as_ref().map(item_from_row).transpose()
     }
 
+    async fn recommend(
+        &self,
+        id: &str,
+        reviewer: &str,
+        recommend: crate::approvals::Recommend,
+        reason: Option<Reason>,
+        now: DateTime<Utc>,
+    ) -> Result<crate::approvals::Recommendation, crate::approvals::RecommendError> {
+        recs::recommend(&self.pool, id, reviewer, recommend, reason, now).await
+    }
+
+    async fn recommendations(
+        &self,
+        id: &str,
+    ) -> StoreResult<Vec<crate::approvals::Recommendation>> {
+        recs::list(&self.pool, id).await
+    }
+
+    async fn recommendation_counts(
+        &self,
+        ids: &[String],
+    ) -> StoreResult<std::collections::BTreeMap<String, usize>> {
+        recs::counts(&self.pool, ids).await
+    }
+
     async fn stuck(&self, before: DateTime<Utc>) -> StoreResult<Vec<ApprovalItem>> {
         let sql = format!(
             "SELECT {ITEM_COLUMNS} FROM approvals
@@ -863,40 +890,7 @@ impl ApprovalRepo for PgStore {
     }
 }
 
-fn outcome_str(outcome: crate::audit::Outcome) -> String {
-    // The serde form, so the database and the JSON-lines log say the same thing.
-    serde_json::to_value(outcome)
-        .ok()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default()
-}
-
-#[async_trait]
-impl AuditSink for PgStore {
-    async fn record(&self, event: AuditEvent) -> StoreResult<()> {
-        sqlx::query(
-            "INSERT INTO audit_events
-                 (at, run_id, user_handle, skill, bot, tool, outcome, sources, args_hash,
-                  output_ref, detail, client)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-        )
-        .bind(event.at)
-        .bind(&event.run_id)
-        .bind(&event.user)
-        .bind(&event.skill)
-        .bind(&event.bot)
-        .bind(&event.tool)
-        .bind(outcome_str(event.outcome))
-        .bind(&event.sources)
-        .bind(&event.args_hash)
-        .bind(&event.output_ref)
-        .bind(&event.detail)
-        .bind(event.client.as_str())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-}
+// The audit sink (hash chain, verify, prune) is in `pg_audit.rs`.
 
 fn sealed_from_row(r: &PgRow) -> StoreResult<SealedCredential> {
     let provider: String = r.try_get("provider")?;

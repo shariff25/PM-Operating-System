@@ -33,14 +33,15 @@ use pmos_contract::{Sensitivity, ToolKind};
 use serde_json::{json, Value};
 
 use crate::approvals::{
-    args_hash, reply_message, ApprovalItem, DecideError, Decision, Drafted, NewItem, Status,
+    args_hash, reply_message, ApprovalItem, DecideError, Decision, Drafted, NewItem, Recommend,
+    RecommendError, Recommendation, Status,
     Verdict, REPLY_TOOL, SLACK_DRAFT_TOOLS,
 };
 use crate::audit::{AuditEvent, Client, Outcome};
 use crate::catalog::{Catalog, Roster, ToolSpec};
 use crate::connectors::{untrusted, Audience, Caller, Connector, ConnectorError, TeamBot};
 use crate::context::{load_docs, ContextDoc, ReindexReport};
-use crate::ledger::{summarize, LedgerQuery, LedgerRow, Summary, DEFAULT_EXPIRE_DAYS};
+use crate::ledger::{summarize, LedgerQuery, LedgerRow, Reason, Summary, DEFAULT_EXPIRE_DAYS};
 use crate::memory::{valid_key, MemoryError};
 use crate::schemas::check_args;
 use crate::session::{bot_identity, token_hash, valid_handle, Session};
@@ -177,6 +178,16 @@ pub enum DecisionError {
     /// Slack's channel calls failed, so the audience is unknown. Nothing was written.
     #[error("PM OS couldn't check who can see this channel ({0}), so nothing was posted; try again shortly")]
     AudienceUnavailable(String),
+}
+
+/// Why a recommendation was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum RecommendationError {
+    /// Only people in `team.yaml` recommend (when it is enforced).
+    #[error("`{0}` is not in team.yaml, so they can't recommend on approvals")]
+    NotAMember(String),
+    #[error(transparent)]
+    Recommend(#[from] RecommendError),
 }
 
 /// What the audience check found, for the decision's answer: how many can see the channel,
@@ -462,6 +473,11 @@ impl ToolService {
             .unwrap_or(None);
         *self.content_sha.write().expect("content sha lock") = head;
         Ok(self.stores.context.reindex(load_docs(content_root)).await?)
+    }
+
+    /// The audit sink, for `POST /internal/audit` (`audit_api`).
+    pub fn audit_sink(&self) -> Arc<dyn crate::audit::AuditSink> {
+        self.stores.audit.clone()
     }
 
     /// Record an audit event. A failure is logged at error level: the audit log is a
@@ -1312,6 +1328,70 @@ impl ToolService {
 
     pub async fn approval(&self, id: &str) -> Result<Option<ApprovalItem>, StoreError> {
         self.stores.approvals.get(id).await
+    }
+
+    /// An item's recommendations, oldest first.
+    pub async fn recommendations(&self, id: &str) -> Result<Vec<Recommendation>, StoreError> {
+        self.stores.approvals.recommendations(id).await
+    }
+
+    /// How many recommendations each of `ids` has.
+    pub async fn recommendation_counts(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::BTreeMap<String, usize>, StoreError> {
+        self.stores.approvals.recommendation_counts(ids).await
+    }
+
+    /// Record `reviewer`'s recommendation on someone else's pending item. It is advice: the
+    /// item's status, arguments and ledger row do not change, and only its own user decides
+    /// ([`ToolService::decide_verdict`]). `reviewer` must be in `team.yaml` when it is
+    /// enforced, like `decided_by`. Audited as `approvals.recommend` with outcome `ok`
+    /// (the audit types have no recommendation outcome), the choice and reason in `detail`.
+    pub async fn recommend(
+        &self,
+        client: Client,
+        id: &str,
+        reviewer: &str,
+        recommend: Recommend,
+        reason: Option<Reason>,
+        now: DateTime<Utc>,
+    ) -> Result<Recommendation, RecommendationError> {
+        if !self.team.allows(reviewer) {
+            return Err(RecommendationError::NotAMember(reviewer.to_string()));
+        }
+        let item = self
+            .stores
+            .approvals
+            .get(id)
+            .await
+            .map_err(RecommendError::from)?
+            .ok_or(RecommendError::NotFound)?;
+        let rec = self
+            .stores
+            .approvals
+            .recommend(id, reviewer, recommend, reason, now)
+            .await?;
+        let mut detail = format!("recommend: {}", recommend.as_str());
+        if let Some(reason) = reason {
+            detail.push_str(&format!(" reason: {reason}"));
+        }
+        self.audit(AuditEvent {
+            client,
+            at: now,
+            run_id: item.run_id,
+            user: reviewer.to_string(),
+            skill: item.skill,
+            bot: item.bot,
+            tool: "approvals.recommend".to_string(),
+            outcome: Outcome::Ok,
+            sources: Vec::new(),
+            args_hash: Some(item.args_hash),
+            output_ref: Some(item.id),
+            detail: Some(detail),
+        })
+        .await;
+        Ok(rec)
     }
 
     // ----- the feedback ledger ------------------------------------------------------------

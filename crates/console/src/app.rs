@@ -358,9 +358,9 @@ async fn visible_routines(
     state: &AppState,
     viewer: &Viewer,
 ) -> Result<Vec<Routine>, UpstreamError> {
-    let owner = (!viewer.admin).then_some(viewer.handle.as_str());
+    let owner = (!viewer.sees_everyone()).then_some(viewer.handle.as_str());
     let mut items = state.0.bots.routines(owner).await?;
-    items.retain(|r| viewer.sees_own(&r.owner));
+    items.retain(|r| viewer.sees_routine(&r.owner));
     Ok(items)
 }
 
@@ -490,7 +490,7 @@ async fn routine_action(
 // Approvals.
 
 async fn approvals(State(state): State<AppState>, Signed { viewer, team }: Signed) -> Response {
-    let users: Vec<String> = if viewer.admin {
+    let users: Vec<String> = if viewer.sees_others_approvals() {
         team.members.iter().map(|m| m.handle.clone()).collect()
     } else {
         vec![viewer.handle.clone()]
@@ -508,7 +508,7 @@ async fn approvals(State(state): State<AppState>, Signed { viewer, team }: Signe
             Err(e) => return upstream_failed(&viewer, Screen::Approvals, e),
         }
     }
-    items.retain(|a| viewer.sees_own(&a.user));
+    items.retain(|a| viewer.sees_approval(&a.user));
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
     let slack = match &state.0.slack_url {
@@ -557,12 +557,12 @@ async fn approvals(State(state): State<AppState>, Signed { viewer, team }: Signe
 // Activity.
 
 async fn activity(State(state): State<AppState>, Signed { viewer, .. }: Signed) -> Response {
-    let who = (!viewer.admin).then_some(viewer.handle.as_str());
+    let who = (!viewer.sees_everyone()).then_some(viewer.handle.as_str());
     let mut tasks = match state.0.bots.tasks(who, RECENT_TASKS).await {
         Ok(t) => t,
         Err(e) => return upstream_failed(&viewer, Screen::Activity, e),
     };
-    tasks.retain(|t| viewer.sees_own(&t.requested_by));
+    tasks.retain(|t| viewer.sees_task(&t.requested_by));
     let mut body = String::from(
         "<p class=\"muted\">Recent tasks, newest first. Open one for its progress, its full \
          trace and its audit events.</p>",
@@ -630,7 +630,7 @@ async fn task(
         return not_found();
     }
     let task = match state.0.bots.task(&id).await {
-        Ok(t) if viewer.sees_own(&t.requested_by) => t,
+        Ok(t) if viewer.sees_task(&t.requested_by) => t,
         Ok(_) | Err(UpstreamError::NotFound) => return not_found(),
         Err(e) => return upstream_failed(&viewer, Screen::Activity, e),
     };

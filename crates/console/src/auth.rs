@@ -11,6 +11,7 @@
 use axum::http::{header, HeaderMap};
 use hmac::{Hmac, Mac};
 use pmos_contract::model::{Role, TeamFile};
+use pmos_contract::permissions::{self, Permission};
 use sha2::Sha256;
 
 use crate::config::Identity;
@@ -21,19 +22,70 @@ pub const FORWARDED_USER: &str = "x-forwarded-user";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Viewer {
     pub handle: String,
-    /// Role `admin` in `team.yaml`: sees everything.
-    pub admin: bool,
+    /// Their roles in `team.yaml`; what they may do comes from the permission matrix.
+    pub roles: Vec<Role>,
 }
 
 impl Viewer {
-    /// A PM sees their own bots plus the team bots; an admin sees every bot.
-    pub fn sees_bot(&self, scope: &str, owner: &str) -> bool {
-        self.admin || scope == "team" || owner == self.handle
+    /// Whether the permission matrix lets this person do `permission`.
+    pub fn can(&self, permission: Permission) -> bool {
+        permissions::allows(&self.roles, permission)
     }
 
-    /// Routines and tasks: a PM sees their own; an admin sees everyone's.
-    pub fn sees_own(&self, handle: &str) -> bool {
-        self.admin || handle == self.handle
+    /// Whether they see other people's tasks and routines, not only their own (admins).
+    pub fn sees_everyone(&self) -> bool {
+        self.can(Permission::ViewOthersTasks)
+    }
+
+    /// Whether they see other PMs' approvals (admins and reviewers; read-only).
+    pub fn sees_others_approvals(&self) -> bool {
+        self.can(Permission::ViewOthersApprovals)
+    }
+
+    /// A PM sees their own bots plus the team bots; an admin sees every bot; an auditor none.
+    pub fn sees_bot(&self, scope: &str, owner: &str) -> bool {
+        self.can(Permission::AskBot)
+            && (self.sees_everyone() || scope == "team" || owner == self.handle)
+    }
+
+    /// Routines: a PM sees their own; an admin sees everyone's; an auditor none.
+    pub fn sees_routine(&self, owner: &str) -> bool {
+        if owner == self.handle {
+            self.can(Permission::ManageOwnRoutines)
+        } else {
+            self.sees_everyone() && self.can(Permission::ManageOwnRoutines)
+        }
+    }
+
+    /// Tasks: a PM sees their own; an admin sees everyone's; an auditor none.
+    pub fn sees_task(&self, requested_by: &str) -> bool {
+        if requested_by == self.handle {
+            self.can(Permission::ViewOwnTasks)
+        } else {
+            self.can(Permission::ViewOthersTasks)
+        }
+    }
+
+    /// Approvals: their own, or everyone's for an admin or reviewer; an auditor none.
+    pub fn sees_approval(&self, user: &str) -> bool {
+        if user == self.handle {
+            self.can(Permission::DecideOwnApproval)
+        } else {
+            self.sees_others_approvals()
+        }
+    }
+
+    /// The word after their name in the header: what sets them apart from a plain PM.
+    pub fn badge(&self) -> Option<String> {
+        if self.roles.contains(&Role::Admin) {
+            return Some("admin".into());
+        }
+        let extra: Vec<&str> = [Role::Reviewer, Role::Auditor]
+            .iter()
+            .filter(|r| self.roles.contains(r))
+            .map(Role::as_str)
+            .collect();
+        (!extra.is_empty()).then(|| extra.join(", "))
     }
 }
 
@@ -74,7 +126,7 @@ pub fn viewer(
         .ok_or(AuthError::NotMember(presented))?;
     Ok(Viewer {
         handle: member.handle.clone(),
-        admin: member.roles.contains(&Role::Admin),
+        roles: member.roles.clone(),
     })
 }
 
@@ -154,6 +206,56 @@ pub fn same_origin(headers: &HeaderMap, public_url: Option<&str>) -> bool {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    fn with(roles: &[Role]) -> Viewer {
+        Viewer {
+            handle: "ana".into(),
+            roles: roles.to_vec(),
+        }
+    }
+
+    #[test]
+    fn admins_see_everything() {
+        let v = with(&[Role::Admin]);
+        assert!(v.sees_bot("personal", "ben") && v.sees_routine("ben"));
+        assert!(v.sees_task("ben") && v.sees_approval("ben"));
+        assert_eq!(v.badge().as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn pms_see_their_own() {
+        let v = with(&[Role::Pm]);
+        assert!(v.sees_bot("team", "x") && v.sees_bot("personal", "ana"));
+        assert!(!v.sees_bot("personal", "ben"));
+        assert!(v.sees_routine("ana") && !v.sees_routine("ben"));
+        assert!(v.sees_task("ana") && !v.sees_task("ben"));
+        assert!(v.sees_approval("ana") && !v.sees_approval("ben"));
+        assert_eq!(v.badge(), None);
+    }
+
+    #[test]
+    fn reviewers_add_others_approvals_only() {
+        let v = with(&[Role::Reviewer]);
+        assert!(v.sees_approval("ben") && v.sees_approval("ana"));
+        assert!(!v.sees_task("ben") && !v.sees_routine("ben"));
+        assert!(!v.sees_bot("personal", "ben") && v.sees_bot("team", "x"));
+        assert_eq!(v.badge().as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn auditors_see_no_bots_routines_approvals_or_tasks() {
+        let v = with(&[Role::Auditor]);
+        assert!(!v.sees_bot("team", "x") && !v.sees_bot("personal", "ana"));
+        assert!(!v.sees_routine("ana") && !v.sees_task("ana") && !v.sees_approval("ana"));
+        assert_eq!(v.badge().as_deref(), Some("auditor"));
+    }
+
+    #[test]
+    fn unknown_and_no_roles_see_nothing() {
+        for v in [with(&[Role::Unknown("x".into())]), with(&[])] {
+            assert!(!v.sees_bot("team", "x") && !v.sees_task("ana") && !v.sees_approval("ana"));
+        }
+    }
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();

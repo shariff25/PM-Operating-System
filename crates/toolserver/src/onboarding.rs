@@ -531,7 +531,7 @@ impl Onboarding {
                         return Err(Refusal::new(
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "bad_request",
-                            "roles must be some of pm, skill-author and admin",
+                            "roles must be some of pm, skill-author, reviewer, auditor and admin",
                         ))
                     }
                 }

@@ -9,6 +9,8 @@
 pub mod app;
 pub mod approvals;
 pub mod audit;
+pub mod audit_api;
+pub mod audit_chain;
 pub mod bets;
 pub mod catalog;
 pub mod config;
@@ -25,6 +27,7 @@ pub mod memory_repo;
 pub mod oauth;
 pub mod onboarding;
 pub mod pg;
+pub mod pg_audit;
 pub mod schemas;
 pub mod service;
 pub mod session;

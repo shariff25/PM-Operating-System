@@ -163,7 +163,7 @@ pub fn page(title: &str, active: Option<Screen>, viewer: Option<&Viewer>, body: 
         Some(v) => format!(
             "<p class=\"who\">{}{}</p>",
             Esc(&v.handle),
-            if v.admin { " · admin" } else { "" }
+            v.badge().map(|b| format!(" · {b}")).unwrap_or_default()
         ),
         None => String::new(),
     };

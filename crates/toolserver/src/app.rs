@@ -32,7 +32,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::approvals::{DecideError, Decision, Status, Verdict};
+use crate::approvals::{DecideError, Decision, Recommend, RecommendError, Status, Verdict};
 use crate::audit::{AuditEvent, Client, Outcome};
 use crate::ledger::{LedgerOutcome, LedgerQuery, Reason, MAX_LIMIT};
 use crate::mcp::PmosMcp;
@@ -40,7 +40,7 @@ use crate::members::RequestStatus;
 use crate::oauth::{OAuth, OAuthError};
 use crate::onboarding::{DecisionInput, Onboarding, Refusal};
 use crate::service::{
-    DecisionError, ReindexError, SessionError, ToolError, ToolService, AUDIENCE_BLOCKED,
+    DecisionError, RecommendationError, ReindexError, SessionError, ToolError, ToolService, AUDIENCE_BLOCKED,
     AUDIENCE_UNAVAILABLE, NEEDS_EXTERNAL_CONFIRM,
 };
 use crate::session::BOT_IDENTITY_PREFIX;
@@ -153,6 +153,8 @@ pub fn router_with(
         .route("/call", post(call_tool))
         .route("/approvals/{id}", get(get_approval))
         .route("/approvals/{id}/decision", post(decide))
+        .route("/approvals/{id}/recommendation", post(recommend))
+        .route("/approvals/{id}/recommendations", get(list_recommendations))
         .route("/ledger", get(ledger))
         .route("/oauth/{provider}/start", get(oauth_start))
         .route("/memory/repo", post(set_memory_repo).get(get_memory_repo))
@@ -166,6 +168,7 @@ pub fn router_with(
         )
         .route("/members/{handle}/remove", post(remove_member))
         .route("/onboarding", get(onboarding_status))
+        .merge(crate::audit_api::router(svc.audit_sink()))
         .merge(admin)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -451,9 +454,12 @@ async fn list_approvals(
             );
         }
         return match state.svc.pending_approvals(&user, BOT_PENDING_LIMIT).await {
-            Ok((approvals, total)) => {
-                Json(json!({ "approvals": approvals, "total": total })).into_response()
-            }
+            Ok((approvals, total)) => match with_counts(&state, &approvals).await {
+                Ok(approvals) => {
+                    Json(json!({ "approvals": approvals, "total": total })).into_response()
+                }
+                Err(e) => unavailable(e),
+            },
             Err(e) => unavailable(e),
         };
     }
@@ -465,14 +471,106 @@ async fn list_approvals(
         },
     };
     match state.svc.approvals(&user, status).await {
-        Ok(items) => Json(json!({ "items": items })).into_response(),
+        Ok(items) => match with_counts(&state, &items).await {
+            Ok(items) => Json(json!({ "items": items })).into_response(),
+            Err(e) => unavailable(e),
+        },
         Err(e) => unavailable(e),
     }
 }
 
+/// Each item as its JSON, plus `recommendation_count` (additive: existing readers ignore it).
+async fn with_counts(
+    state: &AppState,
+    items: &[crate::approvals::ApprovalItem],
+) -> Result<Vec<Value>, crate::store::StoreError> {
+    let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    let counts = state.svc.recommendation_counts(&ids).await?;
+    Ok(items
+        .iter()
+        .map(|item| {
+            let mut v = serde_json::to_value(item).unwrap_or(Value::Null);
+            if let Some(map) = v.as_object_mut() {
+                let n = counts.get(&item.id).copied().unwrap_or(0);
+                map.insert("recommendation_count".into(), json!(n));
+            }
+            v
+        })
+        .collect())
+}
+
 async fn get_approval(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.svc.approval(&id).await {
-        Ok(Some(item)) => Json(item).into_response(),
+        Ok(Some(item)) => match state.svc.recommendations(&id).await {
+            Ok(recs) => {
+                let mut v = serde_json::to_value(&item).unwrap_or(Value::Null);
+                if let Some(map) = v.as_object_mut() {
+                    map.insert("recommendations".into(), json!(recs));
+                }
+                Json(v).into_response()
+            }
+            Err(e) => unavailable(e),
+        },
+        Ok(None) => error(StatusCode::NOT_FOUND, "no such approval item"),
+        Err(e) => unavailable(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecommendationBody {
+    reviewer: String,
+    recommend: Recommend,
+    /// One of the ledger's reasons. There is no free-text field.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// A reviewer recommends approving or rejecting someone else's pending item. Advice only:
+/// the item doesn't change, and only its own user decides.
+async fn recommend(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Path(id): Path<String>,
+    Json(body): Json<RecommendationBody>,
+) -> Response {
+    let reason = match body.reason.as_deref() {
+        None => None,
+        Some(r) => match Reason::parse(r) {
+            Some(reason) => Some(reason),
+            None => {
+                let known: Vec<&str> = Reason::ALL.iter().map(|r| r.as_str()).collect();
+                return error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("unknown reason `{r}`: use one of {}", known.join(", ")),
+                );
+            }
+        },
+    };
+    match state
+        .svc
+        .recommend(client, &id, &body.reviewer, body.recommend, reason, Utc::now())
+        .await
+    {
+        Ok(rec) => Json(rec).into_response(),
+        Err(e @ RecommendationError::NotAMember(_)) => {
+            error(StatusCode::FORBIDDEN, e.to_string())
+        }
+        Err(RecommendationError::Recommend(e)) => match e {
+            RecommendError::Store(e) => unavailable(e),
+            RecommendError::NotFound => error(StatusCode::NOT_FOUND, e.to_string()),
+            RecommendError::OwnItem => error(StatusCode::FORBIDDEN, e.to_string()),
+            RecommendError::NotPending => error(StatusCode::CONFLICT, e.to_string()),
+        },
+    }
+}
+
+async fn list_recommendations(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match state.svc.approval(&id).await {
+        Ok(Some(_)) => match state.svc.recommendations(&id).await {
+            Ok(recs) => Json(json!({ "recommendations": recs })).into_response(),
+            Err(e) => unavailable(e),
+        },
         Ok(None) => error(StatusCode::NOT_FOUND, "no such approval item"),
         Err(e) => unavailable(e),
     }

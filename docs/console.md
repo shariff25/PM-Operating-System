@@ -25,12 +25,15 @@ width.
 
 ## Who sees what
 
-| | Admin (`admin` in `team.yaml`) | PM |
-| --- | --- | --- |
-| Bots | every bot | team bots, and their own personal bots |
-| Routines | everyone's, and may pause, resume or delete any | their own |
-| Approvals | every member's pending items | their own |
-| Activity and task pages | every task | tasks they asked for (`requested_by`) |
+| | Admin (`admin` in `team.yaml`) | PM | Reviewer | Auditor |
+| --- | --- | --- | --- | --- |
+| Bots | every bot | team bots, and their own personal bots | as a PM | none |
+| Routines | everyone's, and may pause, resume or delete any | their own | as a PM | none |
+| Approvals | every member's pending items | their own | their own, and everyone else's (read-only) | none |
+| Activity and task pages | every task | tasks they asked for (`requested_by`) | as a PM | none |
+
+Roles combine: a person gets everything any of their roles allows (the matrix in
+`crates/contract/src/permissions.rs`). The auditor's audit search is not part of the console yet.
 
 Someone else's task or routine answers `404`, so the console doesn't confirm it exists. The
 console's runtime token may read and change everything, so these checks are made in the

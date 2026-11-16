@@ -67,7 +67,7 @@ enum MemberCommand {
         /// GitHub login in your GitHub org.
         #[arg(long)]
         github: Option<String>,
-        /// Roles, comma-separated: pm, skill-author, admin.
+        /// Roles, comma-separated: pm, skill-author, reviewer, auditor, admin.
         #[arg(long, default_value = "pm", value_delimiter = ',')]
         roles: Vec<String>,
     },
@@ -189,7 +189,7 @@ fn member_add(
         match serde_norway::from_str::<Role>(r.trim()) {
             Ok(role) if !parsed.contains(&role) => parsed.push(role),
             Ok(_) => {}
-            Err(_) => return fail(format!("unknown role `{r}`: use pm, skill-author or admin")),
+            Err(_) => return fail(format!("unknown role `{r}`: use pm, skill-author, reviewer, auditor or admin")),
         }
     }
     let path = root.join("team.yaml");

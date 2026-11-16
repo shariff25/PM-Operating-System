@@ -11,11 +11,14 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::audit_chain::{
+    unsupported, AuditEnvelope, ChainRecord, MemoryChain, PruneReport, Recorded, VerifyReport,
+};
 use crate::store::{StoreError, StoreResult};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// The call ran and returned.
@@ -42,7 +45,7 @@ pub enum Outcome {
 }
 
 /// Who made the call: a sandbox over MCP, or an internal service with its own token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Client {
     /// An agent sandbox, over `/mcp` with a session token.
@@ -62,6 +65,29 @@ impl Client {
             Self::Bot => "bot",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "mcp" => Some(Self::Mcp),
+            "orchestrator" => Some(Self::Orchestrator),
+            "bot" => Some(Self::Bot),
+            _ => None,
+        }
+    }
+}
+
+impl Outcome {
+    pub fn parse(s: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+    }
+}
+
+/// The serde form of an outcome, so the database and the JSON-lines log say the same thing.
+pub fn outcome_str(outcome: Outcome) -> String {
+    serde_json::to_value(outcome)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -94,25 +120,86 @@ pub struct AuditEvent {
 pub trait AuditSink: Send + Sync {
     /// Store one event. An error means the event was not recorded; callers log it loudly.
     async fn record(&self, event: AuditEvent) -> StoreResult<()>;
+
+    // The hash-chained log (`audit_chain`). Sinks that keep no chain, such as the JSON-lines
+    // file, use these defaults; `chained` says which sinks do.
+
+    /// Does this sink keep the hash chain?
+    fn chained(&self) -> bool {
+        false
+    }
+
+    /// Store one envelope in the chain and return its `seq` and hash. An error means it was
+    /// not recorded; callers that must fail closed refuse the action.
+    async fn record_envelope(&self, _envelope: AuditEnvelope) -> StoreResult<Recorded> {
+        Err(unsupported())
+    }
+
+    /// Walk the chain and report the first break.
+    async fn verify_chain(&self) -> StoreResult<VerifyReport> {
+        Err(unsupported())
+    }
+
+    /// Delete the oldest records, at most `batch`, that are all older than `cutoff`, after
+    /// writing a checkpoint. See `audit_chain::prune_retained`.
+    async fn prune_before(
+        &self,
+        _cutoff: DateTime<Utc>,
+        _batch: usize,
+    ) -> StoreResult<PruneReport> {
+        Err(unsupported())
+    }
+
+    /// Records with `seq` above `after_seq`, oldest first (keyset pagination).
+    async fn read_chain(&self, _after_seq: i64, _limit: usize) -> StoreResult<Vec<ChainRecord>> {
+        Err(unsupported())
+    }
 }
 
 /// Keeps events in memory. Used in tests and when no log file is configured.
 #[derive(Default)]
 pub struct MemoryAudit {
     events: Mutex<Vec<AuditEvent>>,
+    chain: MemoryChain,
 }
 
 impl MemoryAudit {
     pub fn events(&self) -> Vec<AuditEvent> {
         self.events.lock().expect("audit lock").clone()
     }
+
+    /// The hash chain behind `events()` (and any envelopes recorded directly).
+    pub fn chain(&self) -> &MemoryChain {
+        &self.chain
+    }
 }
 
 #[async_trait]
 impl AuditSink for MemoryAudit {
     async fn record(&self, event: AuditEvent) -> StoreResult<()> {
+        self.chain.append(AuditEnvelope::from(&event));
         self.events.lock().expect("audit lock").push(event);
         Ok(())
+    }
+
+    fn chained(&self) -> bool {
+        true
+    }
+
+    async fn record_envelope(&self, envelope: AuditEnvelope) -> StoreResult<Recorded> {
+        Ok(self.chain.append(envelope))
+    }
+
+    async fn verify_chain(&self) -> StoreResult<VerifyReport> {
+        Ok(self.chain.verify())
+    }
+
+    async fn prune_before(&self, cutoff: DateTime<Utc>, batch: usize) -> StoreResult<PruneReport> {
+        Ok(self.chain.prune(cutoff, batch, Utc::now()))
+    }
+
+    async fn read_chain(&self, after_seq: i64, limit: usize) -> StoreResult<Vec<ChainRecord>> {
+        Ok(self.chain.list(after_seq, limit))
     }
 }
 
@@ -130,6 +217,51 @@ impl AuditSink for TeeAudit {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    fn chained(&self) -> bool {
+        self.0.iter().any(|s| s.chained())
+    }
+
+    /// Every sink gets the envelope; the answer is the chained sink's.
+    async fn record_envelope(&self, envelope: AuditEnvelope) -> StoreResult<Recorded> {
+        let mut recorded = None;
+        let mut first_error = None;
+        for sink in &self.0 {
+            match sink.record_envelope(envelope.clone()).await {
+                Ok(r) if sink.chained() => recorded = Some(r),
+                Ok(_) => {}
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match (first_error, recorded) {
+            (Some(e), _) => Err(e),
+            (None, Some(r)) => Ok(r),
+            (None, None) => Err(unsupported()),
+        }
+    }
+
+    async fn verify_chain(&self) -> StoreResult<VerifyReport> {
+        match self.0.iter().find(|s| s.chained()) {
+            Some(s) => s.verify_chain().await,
+            None => Err(unsupported()),
+        }
+    }
+
+    async fn prune_before(&self, cutoff: DateTime<Utc>, batch: usize) -> StoreResult<PruneReport> {
+        match self.0.iter().find(|s| s.chained()) {
+            Some(s) => s.prune_before(cutoff, batch).await,
+            None => Err(unsupported()),
+        }
+    }
+
+    async fn read_chain(&self, after_seq: i64, limit: usize) -> StoreResult<Vec<ChainRecord>> {
+        match self.0.iter().find(|s| s.chained()) {
+            Some(s) => s.read_chain(after_seq, limit).await,
+            None => Err(unsupported()),
+        }
     }
 }
 
@@ -155,6 +287,19 @@ impl AuditSink for JsonlAudit {
         writeln!(file, "{line}")
             .and_then(|_| file.flush())
             .map_err(|e| StoreError(e.to_string()))
+    }
+
+    /// The envelope as one line. The file is a shipping spool: the chain lives in Postgres.
+    async fn record_envelope(&self, envelope: AuditEnvelope) -> StoreResult<Recorded> {
+        let line = serde_json::to_string(&envelope).map_err(|e| StoreError(e.to_string()))?;
+        let mut file = self.file.lock().expect("audit lock");
+        writeln!(file, "{line}")
+            .and_then(|_| file.flush())
+            .map_err(|e| StoreError(e.to_string()))?;
+        Ok(Recorded {
+            seq: 0,
+            hash: String::new(),
+        })
     }
 }
 
