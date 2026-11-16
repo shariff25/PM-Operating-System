@@ -74,7 +74,7 @@ test('a suggestion shows changed words inline and folds unchanged paragraphs', a
   await page.getByLabel('What should change?').fill('shorter');
   await page.getByRole('button', { name: 'Suggest a change' }).click();
   const region = page.getByRole('region', { name: 'Suggested change' });
-  await expect(region.locator('ins.ba-word').first()).toHaveText('only');
+  await expect(region.locator('ins.ba-word').first()).toContainText('only');
   await expect(region.locator('del.ba-word').first()).toBeVisible();
   const fold = region.getByRole('button', { name: /unchanged paragraphs?/ });
   await expect(fold).toHaveAttribute('aria-expanded', 'false');

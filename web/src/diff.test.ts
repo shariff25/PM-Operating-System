@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { diffBlocks, diffLines, diffWords } from './diff';
+import { INLINE_MIN_SHARED, diffBlocks, diffInline, diffLines, diffWords } from './diff';
 
 describe('diffWords', () => {
   it('marks only the words that changed, on each side', () => {
@@ -50,5 +50,41 @@ describe('diffBlocks', () => {
   it('drops blank lines instead of showing them as changes', () => {
     const blocks = diffBlocks(diffLines('a\n\nb', 'a\n\n\n\nb'));
     expect(blocks.every((b) => !b.changed)).toBe(true);
+  });
+});
+
+describe('diffInline', () => {
+  it('shows old and new words once, in order', () => {
+    const d = diffInline('The grace period is 14 days', 'The grace period is 7 days');
+    expect(d.parts).toEqual([
+      { text: 'The grace period is ', kind: 'same' },
+      { text: '14', kind: 'removed' },
+      { text: '7', kind: 'added' },
+      { text: ' days', kind: 'same' },
+    ]);
+    expect(d.shared).toBe(5);
+    expect(d.most).toBe(6);
+  });
+});
+
+describe('inline pairing', () => {
+  it('merges a lightly reworded paragraph into one inline line', () => {
+    const d = diffLines('keep\nThe grace period is 14 days\nend', 'keep\nThe grace period is 7 days\nend');
+    const removed = d.find((l) => l.kind === 'removed')!;
+    const added = d.find((l) => l.kind === 'added')!;
+    expect(removed.merged).toBe(true);
+    expect(added.inline?.some((p) => p.kind === 'removed' && p.text === '14')).toBe(true);
+    expect(added.inline?.some((p) => p.kind === 'added' && p.text === '7')).toBe(true);
+  });
+
+  it('keeps the threshold at about 40% shared words', () => {
+    expect(INLINE_MIN_SHARED).toBe(0.4);
+    // 2 of 5 words shared: inline.
+    const at = diffLines('a b c d e', 'a b x y z');
+    expect(at.find((l) => l.kind === 'added')?.inline).toBeDefined();
+    // 1 of 5 shared: old and new blocks.
+    const under = diffLines('a b c d e', 'a x y z w');
+    expect(under.find((l) => l.kind === 'added')?.inline).toBeUndefined();
+    expect(under.find((l) => l.kind === 'removed')?.merged).toBeUndefined();
   });
 });

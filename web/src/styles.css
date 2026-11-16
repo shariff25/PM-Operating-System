@@ -756,6 +756,8 @@ a.trow:hover { background: var(--bg); color: var(--ink); }
 .ba-same { color: var(--muted); }
 .ba-added { background: var(--good-bg); color: var(--good-ink); }
 .ba-added::before { content: '+'; }
+.ba-changed { background: var(--surface); color: var(--ink); }
+.ba-changed::before { content: '\223C'; color: var(--muted); }
 .ba-removed { background: var(--bad-bg); color: var(--bad-ink); }
 .ba-removed::before { content: '\2212'; }
 .ba-removed:not(:has(.ba-word)) .ba-text { text-decoration: line-through; text-decoration-thickness: 1px; }
@@ -919,3 +921,5 @@ del.ba-word { background: var(--del-word); text-decoration: line-through; text-d
   *, *::before, *::after { transition: none !important; animation: none !important; }
   .live-line-on .live-text { color: var(--muted); background: none; }
 }
+.task-ref { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 0 4px; font-size: 12px; color: var(--muted); }
+.task-ref .task-ref-btn { background: none; border: 0; padding: 2px 4px; font: inherit; color: var(--ink); text-decoration: underline; cursor: pointer; min-height: 24px; }
