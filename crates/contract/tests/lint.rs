@@ -479,6 +479,7 @@ fn repo_content_passes() {
             "call-synth",
             "coach-feedback",
             "competitive-brief",
+            "daily-brief",
             "decision-doc",
             "docs",
             "eval-plan",
