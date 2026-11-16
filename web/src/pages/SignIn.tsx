@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import type { Api } from '../api';
 import { messageOf } from '../app-context';
 import { ErrorNote } from '../components/bits';
+import { Mark } from '../components/icons';
 import { copy } from '../copy';
 
 interface ProviderProps {
@@ -31,7 +32,7 @@ function DevLogin({ api, onSignedIn }: ProviderProps) {
   };
 
   return (
-    <form onSubmit={submit} className="stack">
+    <form onSubmit={submit} className="signin-form">
       <label htmlFor="handle">{copy.signIn.handleLabel}</label>
       <p id="handle-hint" className="muted">{copy.signIn.handleHint}</p>
       <input
@@ -57,7 +58,7 @@ function DevLogin({ api, onSignedIn }: ProviderProps) {
  */
 function MicrosoftLogin() {
   return (
-    <button type="button" className="btn btn-primary" onClick={() => window.location.assign('/api/auth/entra/start')}>
+    <button type="button" className="btn btn-primary btn-block" onClick={() => window.location.assign('/api/auth/entra/start')}>
       {copy.signIn.microsoft}
     </button>
   );
@@ -71,9 +72,12 @@ const provider: keyof typeof PROVIDERS = import.meta.env.VITE_AUTH_PROVIDER === 
 export function SignIn(props: ProviderProps) {
   const Provider = PROVIDERS[provider];
   return (
-    <main className="signin card stack">
-      <h1>{copy.signIn.title}</h1>
-      <Provider {...props} />
-    </main>
+    <div className="signin-wrap">
+      <main className="signin">
+        <Mark size={36} />
+        <h1>{copy.signIn.title}</h1>
+        <Provider {...props} />
+      </main>
+    </div>
   );
 }

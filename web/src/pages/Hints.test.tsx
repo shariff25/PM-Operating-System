@@ -47,7 +47,7 @@ describe('hints', () => {
     expect((await first.api.me()).hints_seen).toEqual(['sources']);
 
     // leave and come back: the dismissed hint stays gone, the next one is still waiting
-    await user.click(screen.getByRole('link', { name: copy.draft.back }));
+    await user.click(screen.getByRole('link', { name: copy.nav.home }));
     await screen.findByLabelText(copy.home.askLabel);
     window.location.hash = '/d/apr_jira';
     await screen.findByText(copy.hints.ask);
@@ -97,12 +97,13 @@ describe('user menu keyboard', () => {
     expect(button).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByRole('menu')).toBeInTheDocument();
     const items = menuItems();
-    expect(items).toHaveLength(3);
+    // theme (system, light, dark), nudges, show hints again, sign out
+    expect(items).toHaveLength(6);
     expect(items[0]).toHaveFocus();
     await user.keyboard('{ArrowDown}');
     expect(items[1]).toHaveFocus();
     await user.keyboard('{End}');
-    expect(items[2]).toHaveFocus();
+    expect(items[5]).toHaveFocus();
     await user.keyboard('{ArrowDown}');
     expect(items[0]).toHaveFocus();
     await user.keyboard('{Escape}');
@@ -118,7 +119,7 @@ describe('user menu keyboard', () => {
     await user.keyboard('{Enter}');
     expect(menuItems()[0]).toHaveFocus();
     await user.keyboard('{ArrowUp}');
-    expect(menuItems()[2]).toHaveFocus();
+    expect(menuItems()[5]).toHaveFocus();
   });
 
   it('closes when you click elsewhere', async () => {
@@ -128,5 +129,40 @@ describe('user menu keyboard', () => {
     expect(screen.getByRole('menu')).toBeInTheDocument();
     await user.click(screen.getByRole('heading', { level: 1 }));
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+  });
+});
+
+describe('theme', () => {
+  it('switches between system, light and dark from the user menu, and remembers the choice', async () => {
+    const user = userEvent.setup();
+    window.localStorage.clear();
+    renderApp();
+    await user.click(await screen.findByRole('button', { name: /Menu for/ }));
+    expect(screen.getByRole('menuitemradio', { name: copy.theme.system })).toHaveAttribute('aria-checked', 'true');
+    expect(document.documentElement.dataset.theme).toBeUndefined();
+
+    await user.click(screen.getByRole('menuitemradio', { name: copy.theme.dark }));
+    expect(document.documentElement.dataset.theme).toBe('dark');
+    expect(window.localStorage.getItem('pmos-theme')).toBe('dark');
+    expect(screen.getByRole('menuitemradio', { name: copy.theme.dark })).toHaveAttribute('aria-checked', 'true');
+
+    await user.click(screen.getByRole('menuitemradio', { name: copy.theme.light }));
+    expect(document.documentElement.dataset.theme).toBe('light');
+
+    await user.click(screen.getByRole('menuitemradio', { name: copy.theme.system }));
+    expect(document.documentElement.dataset.theme).toBeUndefined();
+    expect(window.localStorage.getItem('pmos-theme')).toBeNull();
+  });
+
+  it('moves between the theme choices with the arrow keys', async () => {
+    const user = userEvent.setup();
+    renderApp();
+    const button = await screen.findByRole('button', { name: /Menu for/ });
+    button.focus();
+    await user.keyboard('{ArrowDown}');
+    await user.keyboard('{ArrowRight}');
+    expect(screen.getByRole('menuitemradio', { name: copy.theme.light })).toHaveFocus();
+    await user.keyboard('{ArrowLeft}');
+    expect(screen.getByRole('menuitemradio', { name: copy.theme.system })).toHaveFocus();
   });
 });

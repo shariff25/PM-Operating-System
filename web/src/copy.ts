@@ -28,6 +28,7 @@ export const copy = {
     approve: "This creates the page in Confluence under your name. I'll wait until you're sure.",
   } satisfies Record<HintName, string>,
   hintDismiss: 'Got it',
+  hintStep: (i: number, n: number) => `Tip ${i} of ${n}`,
   /** Hints come one at a time, in this order. */
   hintOrder: ['sources', 'ask', 'approve'] as const satisfies readonly HintName[],
 
@@ -245,6 +246,166 @@ export const copy = {
       should_not_draft: 'I did not want a draft at all',
       other: 'Something else',
     } satisfies Record<RejectReason, string>,
+  },
+
+  // ---- App shell and navigation ----
+  nav: {
+    label: 'Main',
+    home: 'Home',
+    drafts: 'Drafts',
+    followups: 'Follow-ups',
+    activity: 'Activity',
+    draftsCount: (n: number) => `${n} ${n === 1 ? 'draft needs' : 'drafts need'} a decision`,
+    followupsCount: (n: number) => `${n} waiting on you`,
+    activityCount: (n: number) => `${n} still working`,
+    collapse: 'Collapse sidebar',
+    expand: 'Expand sidebar',
+    skip: 'Skip to content',
+    askButton: 'Ask PM OS',
+    shortcutMac: '⌘K',
+    shortcutOther: 'Ctrl K',
+    back: 'Back',
+    groupInbox: 'Inbox',
+    groupHistory: 'History',
+    newRequest: 'New request',
+  },
+
+  theme: {
+    label: 'Theme',
+    system: 'System',
+    light: 'Light',
+    dark: 'Dark',
+  },
+
+  // ---- Command palette ----
+  palette: {
+    label: 'Ask PM OS or jump to a page',
+    inputLabel: 'Ask, or type a page or draft name',
+    placeholder: 'Ask anything, or jump to a page or draft…',
+    ask: (q: string) => `Ask: ${q}`,
+    askEmpty: 'Type a question and press Enter to ask',
+    pages: 'Go to',
+    drafts: 'Drafts',
+    nothing: 'Nothing matches. Press Enter to ask me instead.',
+    hintMove: 'to move',
+    hintPick: 'to choose',
+    hintClose: 'to close',
+  },
+
+  // ---- Toasts ----
+  toast: {
+    region: 'Notifications',
+    saved: 'Draft saved.',
+    approved: 'Approved and sent.',
+    practiceApproved: 'Practice approved. Nothing was sent.',
+    rejected: 'Draft rejected. Nothing was sent.',
+    accepted: 'Change accepted.',
+    dismissed: 'Removed from your follow-ups.',
+    close: 'Dismiss notification',
+  },
+
+  // ---- Relative time ----
+  time: {
+    justNow: 'just now',
+    minutes: (n: number) => `${n} min ago`,
+    hours: (n: number) => `${n} h ago`,
+    yesterday: 'yesterday',
+    days: (n: number) => `${n} days ago`,
+    left: (hours: number, minutes: number) => (hours >= 1 ? `${hours} h left` : `${minutes} min left`),
+  },
+
+  // ---- Home launchpad ----
+  launch: {
+    composerLabel: 'What do you need?',
+    send: 'Ask',
+    newLine: 'Shift + Enter for a new line',
+    suggestions: ['Summarize my week', 'Draft a status update', 'What is blocked?'],
+    suggestionsLabel: 'Suggestions',
+    draftsCard: 'Drafts need you',
+    waitingCard: 'Waiting on you',
+    waitedOnCard: 'You are waiting on',
+    viewDrafts: 'All drafts',
+    viewFollowups: 'All follow-ups',
+    noPendingDrafts: 'Nothing needs a decision. Inbox zero, draft edition.',
+    recent: 'Recent activity',
+    viewActivity: 'All activity',
+    noActivity: 'Nothing asked yet. The box above is very patient.',
+    summaryLabel: 'At a glance',
+  },
+
+  // ---- Drafts page ----
+  draftsPage: {
+    title: 'Drafts',
+    lede: 'Everything I wrote for you. Nothing is sent until you approve it.',
+    tabsLabel: 'Filter drafts',
+    tabs: { pending: 'Needs you', approved: 'Approved', expired: 'Expired', all: 'All' },
+    emptyPending: 'Nothing needs a decision. Suspiciously tidy.',
+    emptyApproved: 'Nothing approved yet. Your first one gets a small fanfare.',
+    emptyExpired: 'Nothing expired. Every draft got the attention it deserved.',
+    created: (when: string) => `Created ${when}`,
+    columns: { title: 'Draft', kind: 'Kind', status: 'Status', expires: 'Time left', created: 'Created' },
+  },
+
+  // ---- Follow-ups page ----
+  followups: {
+    title: 'Follow-ups',
+    lede: 'Who is waiting on you, and who you are waiting on, from the daily brief.',
+    from: (who: string) => `From ${who}`,
+    age: (n: number) => (n === 0 ? 'Today' : n === 1 ? '1 day' : `${n} days`),
+    columns: { who: 'Who', what: 'What', source: 'Source', age: 'Age' },
+  },
+
+  // ---- Activity and threads ----
+  activity: {
+    title: 'Activity',
+    lede: 'Your recent requests to PM OS.',
+    empty: 'Nothing asked yet. I am ready when you are.',
+    loading: 'Loading your requests…',
+    status: {
+      queued: 'Queued',
+      working: 'Working',
+      needs_approval: 'Draft ready',
+      done: 'Done',
+      failed: 'Failed',
+      cancelled: 'Cancelled',
+    },
+    you: 'You',
+    bot: 'PM OS',
+    showSteps: 'Show steps',
+    hideSteps: 'Hide steps',
+    stepsLabel: 'Steps',
+    draftCard: 'Draft',
+    openDraft: 'Open draft',
+    notFound: 'I could not find that request.',
+    threadLabel: 'Conversation',
+    columns: { request: 'Request', status: 'Status', created: 'Asked' },
+  },
+
+  // ---- Draft workspace panel ----
+  panel: {
+    label: 'About this draft',
+    tabsLabel: 'Draft panel',
+    doc: 'Draft',
+    unchanged: (n: number) => `${n} unchanged ${n === 1 ? 'line' : 'lines'}`,
+    edited: 'Edited by you',
+    external: 'Shared outside the company',
+    sources: 'Sources',
+    ask: 'Ask for a change',
+    details: 'Details',
+    before: 'Before',
+    after: 'After',
+    bot: 'Written by',
+    created: 'Created',
+    expires: 'Expires',
+    never: 'Does not expire',
+    task: 'Request',
+    id: 'Draft id',
+    openTask: 'Open the request',
+    noTask: 'Not linked to a request',
+    target: 'Goes to',
+    kind: 'Kind',
+    more: 'More actions',
+    breadcrumb: 'Breadcrumb',
   },
 
   // ---- Errors: plain, what happened, one next step ----
