@@ -187,6 +187,16 @@ services:
       bots: { condition: service_healthy }
     profiles: [slack]
 
+  # The console (profile `console`). It holds the tool server's service token and a runtime
+  # token that reads everything, and it believes X-Forwarded-User. So:
+  # - The port is published on the host's 127.0.0.1 only; the reverse proxy on the host reaches
+  #   it there. Never publish it on another address.
+  # - It still listens on 0.0.0.0 inside its container (published ports need that), so every
+  #   container on the shared `pmos` network can reach console:8760, including the bring-up
+  #   worker. That is why the user header counts only with PMOS_CONSOLE_PROXY_SECRET in
+  #   X-Pmos-Proxy-Secret, and why PMOS_CONSOLE_DEV_USER is refused here (it needs a loopback
+  #   bind). Fully separating it would take its own network shared only with `bots` and
+  #   `toolserver` (docs/console.md, "What this does not fix").
   console:
     <<: *service
     command: ["pmos-console"]
@@ -200,6 +210,9 @@ services:
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_CONSOLE_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
       PMOS_CONSOLE_TRUST_PROXY: ${PMOS_CONSOLE_TRUST_PROXY:-0}
+      # Required with TRUST_PROXY=1: the console refuses to start without it, naming it.
+      # deploy/setup.sh generates it; the reverse proxy sends it on every request.
+      PMOS_CONSOLE_PROXY_SECRET: ${PMOS_CONSOLE_PROXY_SECRET:-}
       PMOS_CONSOLE_DEV_USER: ${PMOS_CONSOLE_DEV_USER:-}
       PMOS_CONSOLE_PUBLIC_URL: ${PMOS_CONSOLE_PUBLIC_URL:-}
       PMOS_CONSOLE_SLACK_URL: ${PMOS_CONSOLE_SLACK_URL:-}

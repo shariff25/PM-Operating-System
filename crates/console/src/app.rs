@@ -176,6 +176,16 @@ impl FromRequestParts<AppState> for Signed {
                 "Not signed in",
                 "Open the console through the PM OS sign-in.",
             )),
+            Err(AuthError::NotFromProxy) => {
+                // Never log the secret or the forwarded user of a request that failed this.
+                tracing::warn!("refused: missing or wrong proxy secret");
+                Err(message(
+                    StatusCode::UNAUTHORIZED,
+                    None,
+                    "Not signed in",
+                    "Open the console through the PM OS sign-in.",
+                ))
+            }
             Err(AuthError::NotMember(who)) => {
                 tracing::info!(user = %who, "refused: not in team.yaml");
                 Err(message(

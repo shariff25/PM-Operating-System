@@ -41,13 +41,81 @@ console before any call: a PM's routine action is checked against their own rout
 - **Behind the Spark's SSO proxy:** with `PMOS_CONSOLE_TRUST_PROXY=1`, the proxy's
   `X-Forwarded-User` names the person. It may be a PM OS handle or the member's email.
   Without that setting the header is ignored.
-- **Development:** `PMOS_CONSOLE_DEV_USER=<handle>` makes every request that person.
+- **The proxy proves itself on every request.** With `PMOS_CONSOLE_TRUST_PROXY=1`, a request
+  counts only if it also carries `X-Pmos-Proxy-Secret` equal to `PMOS_CONSOLE_PROXY_SECRET`
+  (at least 32 characters, different from both tokens). The two are hashed and compared in
+  constant time. A request with the secret missing, wrong, or sent twice is `401`, and its
+  `X-Forwarded-User` isn't read at all. The console logs only that a request was refused,
+  never either header's value. The console won't start with proxy trust on and no secret,
+  and says which variable is missing.
+- **Development:** `PMOS_CONSOLE_DEV_USER=<handle>` makes every request that person. The
+  console won't start with it unless `PMOS_CONSOLE_BIND` is a loopback address (`127.0.0.1`
+  or `::1`; the default is `127.0.0.1:8760`). So it can't be used in the deploy kit, where
+  the container listens on `0.0.0.0`: run the console on your own machine for that.
 - Set exactly one of the two; the console won't start with both or neither.
 - **The person must be in `team.yaml`.** It's re-read on every request, so removing someone
   takes effect at once. Nobody signed in is `401`; someone not on the team is `403`.
 
-With `PMOS_CONSOLE_TRUST_PROXY=1`, anyone who can reach the console's port can claim to be
-anyone. Bind it where only the proxy can reach it (the default is `127.0.0.1:8760`).
+### What the reverse proxy must do
+
+The proxy is the only thing that may set these two headers. On every request to the console it
+must:
+
+1. **Sign the person in** (SSO, or until then something like basic auth for the platform
+   owners). Never forward an anonymous request with a user.
+2. **Strip** any `X-Forwarded-User` and `X-Pmos-Proxy-Secret` the browser sent.
+3. **Set both itself:** the signed-in person, and the secret from `deploy/.env`.
+
+For example, with Caddy on the Spark (put the secret in Caddy's environment, not in the
+Caddyfile; `forward_auth` stands for whatever does the sign-in):
+
+```
+console.<your domain> {
+  # Strip what the browser sent (this runs before the sign-in and the proxying).
+  request_header -X-Forwarded-User
+  request_header -X-Pmos-Proxy-Secret
+  # Sign in: the sign-in service's answer names the person.
+  forward_auth <your SSO> { copy_headers X-Forwarded-User }
+  # Add the secret.
+  reverse_proxy 127.0.0.1:8760 {
+    header_up X-Pmos-Proxy-Secret {env.PMOS_CONSOLE_PROXY_SECRET}
+  }
+}
+```
+
+Whatever proxy you use, check it with a request that sends its own `X-Forwarded-User` and
+`X-Pmos-Proxy-Secret`: neither may reach the console. Then set `PMOS_CONSOLE_PUBLIC_URL` to the
+proxy's origin.
+
+**Upgrading an existing install:** run `deploy/setup.sh` again (it only fills in what's
+missing, including `PMOS_CONSOLE_PROXY_SECRET`), give the secret to the reverse proxy as above,
+and clear `PMOS_CONSOLE_DEV_USER` if it was set. Until then, `pmos-admin up --console` and the
+console itself stop with an error naming the variable.
+
+### The network
+
+The deploy kit publishes the console on the host's `127.0.0.1:8760` only, for the reverse proxy
+on the same machine. Inside its container it listens on `0.0.0.0:8760` (a published port needs
+that), on the shared `pmos` network. Every container on that network, such as the bring-up
+worker, can reach it directly, and so can anything on the host that can reach its loopback.
+The proxy secret is what keeps them from naming a user. Keep it out of every bot's
+environment and sandbox.
+
+### What this does not fix
+
+- **The console still holds powerful tokens:** the tool server's full service token (which can
+  also decide approvals and link accounts) and a runtime token that may read and change
+  everything. Anyone who gets the proxy secret, or code running in the console, can act as any
+  member. The per-viewer checks are made in the console, not upstream.
+- **The console is not on its own network.** Separating it would take a network shared only
+  with `bots` and `toolserver` (and the console taken off `pmos`). That changes other
+  services' settings, so it's left for a stack change.
+- **The secret is shared, not per person.** It proves a request came through the proxy, not
+  who sent it; the proxy's sign-in decides that. Real per-user sign-in, and the signed user
+  assertion so that the runtime and tool server check the person themselves, are separate work
+  (`docs/user-assertion.md`).
+- **No rotation without a restart.** To change the secret, change it in `deploy/.env` and the
+  proxy, then restart both.
 
 ## Forms
 
@@ -105,7 +173,8 @@ cargo run -p pmos-console
 | --- | --- | --- |
 | `PMOS_CONSOLE_BIND` | `127.0.0.1:8760` | |
 | `PMOS_CONSOLE_TRUST_PROXY` | off | `1` to trust `X-Forwarded-User` from the SSO proxy |
-| `PMOS_CONSOLE_DEV_USER` | none | A handle in `team.yaml`; every request is that person. Development only |
+| `PMOS_CONSOLE_PROXY_SECRET` | none | Required with `PMOS_CONSOLE_TRUST_PROXY=1`: the secret the proxy sends in `X-Pmos-Proxy-Secret`. At least 32 characters, different from both tokens. `deploy/setup.sh` generates it |
+| `PMOS_CONSOLE_DEV_USER` | none | A handle in `team.yaml`; every request is that person. Development only, and only with a loopback `PMOS_CONSOLE_BIND` |
 | `PMOS_BOTS_URL` | `http://127.0.0.1:8750` | The bot runtime |
 | `PMOS_BOTS_TOKEN` | required | The `console` entry of the runtime's `PMOS_BOTS_TOKENS`. At least 32 characters |
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | |
