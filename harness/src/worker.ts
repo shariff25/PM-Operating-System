@@ -204,12 +204,26 @@ export function finalAnswer(messages: BaseMessage[]): string {
   return "";
 }
 
+/**
+ * How many tries the gateway made at the model server for a failed call, from its
+ * `X-Pmos-Upstream-Attempts` header (docs/gateway.md). 0 when the header is absent.
+ */
+export function upstreamAttempts(error: { headers?: unknown } | undefined): number {
+  const headers = error?.headers;
+  if (headers instanceof Headers) {
+    return Number(headers.get("x-pmos-upstream-attempts")) || 0;
+  }
+  return 0;
+}
+
 /** A reason for a failed task that a PM can read: no stack traces, no internals. */
 export function pmReason(error: unknown): string {
   if (error instanceof PmFacingError) {
     return error.message;
   }
-  const e = error as { name?: string; message?: string; status?: number } | undefined;
+  const e = error as
+    | { name?: string; message?: string; status?: number; headers?: unknown }
+    | undefined;
   const name = e?.name ?? "";
   const message = (e?.message ?? String(error)).replace(/\s+/g, " ").trim();
   if (name === "GraphRecursionError" || /recursion limit/i.test(message)) {
@@ -217,7 +231,10 @@ export function pmReason(error: unknown): string {
   }
   if (typeof e?.status === "number") {
     if (e.status === 503 || e.status === 429) {
-      return "The model is busy right now. Please try again in a few minutes.";
+      // The gateway already retried this call; say so when it did.
+      return upstreamAttempts(e) > 1
+        ? "The model is still busy after several tries. Please try again in a few minutes."
+        : "The model is busy right now. Please try again in a few minutes.";
     }
     if (e.status === 401 || e.status === 403) {
       return "PM OS couldn't sign in to the model gateway. A platform owner needs to check this bot's gateway token.";
