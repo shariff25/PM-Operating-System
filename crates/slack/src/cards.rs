@@ -6,6 +6,7 @@
 use serde_json::{json, Value};
 
 use crate::blocks::{escape, link, truncate};
+use crate::runtime::safe_id;
 
 /// Fields an approval card's **Edit** modal offers, when the item's arguments have them.
 pub const EDITABLE: [&str; 5] = ["summary", "description", "title", "body", "text"];
@@ -19,6 +20,9 @@ const INPUT_MAX: usize = 3000;
 /// Action ids the bot puts on buttons, and the modal's callback id.
 pub mod action {
     pub const APPROVE: &str = "apr_approve";
+    /// **Open in workspace**: a URL button to the web app's draft page. Slack sends no handler
+    /// for it, and a click is acknowledged with nothing.
+    pub const OPEN_WEB: &str = "apr_open_web";
     pub const EDIT: &str = "apr_edit";
     pub const REJECT: &str = "apr_reject";
     /// A reason button is this prefix and the reason's code: `apr_reason_tone`.
@@ -322,7 +326,26 @@ fn approval_head(item: &Value) -> Vec<Value> {
     ]
 }
 
-fn approval_buttons(item: &Value) -> Value {
+/// The Confluence and Jira drafts get **Open in workspace** when the web app's address is
+/// set (`PMOS_WEB_PUBLIC_URL`, an `https://` origin with no trailing `/`). Slack replies and
+/// messages do not, and neither does a card when the address is unset or the id is not safe
+/// to put in a URL.
+fn open_web_button(item: &Value, web: Option<&str>) -> Option<Value> {
+    let web = web?;
+    let tool = item["tool"].as_str().unwrap_or_default();
+    let id = item["id"].as_str().unwrap_or_default();
+    if !(tool.starts_with("confluence.") || tool.starts_with("jira.")) || !safe_id(id) {
+        return None;
+    }
+    Some(json!({
+        "type": "button",
+        "text": {"type": "plain_text", "text": "Open in workspace"},
+        "url": format!("{web}/drafts/{id}"),
+        "action_id": action::OPEN_WEB,
+    }))
+}
+
+fn approval_buttons(item: &Value, web: Option<&str>) -> Value {
     let id = item["id"].as_str().unwrap_or_default();
     let mut elements = if is_reply(item) {
         vec![button("Post as you", action::APPROVE, id, Some("primary"))]
@@ -336,16 +359,17 @@ fn approval_buttons(item: &Value) -> Value {
         elements.push(button("Snooze", action::SNOOZE, id, None));
     }
     elements.push(button("Reject", action::REJECT, id, Some("danger")));
+    elements.extend(open_web_button(item, web));
     json!({"type": "actions", "block_id": format!("approval:{id}"), "elements": elements})
 }
 
 /// A pending approval card: the tool, its arguments, and **Approve**, **Edit**, **Reject**.
 /// A reply draft gets the reply card instead: **Post as you**, **Edit**, **Snooze** and
 /// **Reject**.
-pub fn approval_card(item: &Value) -> (String, Value) {
+pub fn approval_card(item: &Value, web: Option<&str>) -> (String, Value) {
     let tool = item["tool"].as_str().unwrap_or("a write");
     let mut blocks = approval_head(item);
-    blocks.push(approval_buttons(item));
+    blocks.push(approval_buttons(item, web));
     let text = if is_reply(item) {
         format!("{}: approval needed", reply_title(item))
     } else {
@@ -356,13 +380,14 @@ pub fn approval_card(item: &Value) -> (String, Value) {
 
 /// The card after **Reject**: why, as six one-tap reasons, and **Back** to the card's own
 /// buttons. Nothing is decided until a reason is chosen.
-pub fn approval_reasons(item: &Value) -> (String, Value) {
+pub fn approval_reasons(item: &Value, web: Option<&str>) -> (String, Value) {
     let id = item["id"].as_str().unwrap_or_default();
     let mut elements: Vec<Value> = REASONS
         .iter()
         .map(|(code, label)| button(label, &format!("{}{code}", action::REASON_PREFIX), id, None))
         .collect();
     elements.push(button("Back", action::BACK, id, None));
+    elements.extend(open_web_button(item, web));
     let mut blocks = approval_head(item);
     blocks.push(section("*Why reject it?* Nothing is sent either way."));
     blocks
@@ -378,8 +403,8 @@ pub fn approval_closed(item: &Value, line: &str) -> (String, Value) {
 }
 
 /// The card with its buttons back and an error under them, to try again.
-pub fn approval_retry(item: &Value, error: &str) -> (String, Value) {
-    let (text, blocks) = approval_card(item);
+pub fn approval_retry(item: &Value, error: &str, web: Option<&str>) -> (String, Value) {
+    let (text, blocks) = approval_card(item, web);
     let mut blocks = blocks.as_array().cloned().unwrap_or_default();
     blocks.push(context(&format!(":warning: {}", escape(error))));
     (text, Value::Array(blocks))
@@ -909,7 +934,7 @@ mod tests {
             "args": {"space": "PM", "title": "Launch <plan>", "body": "line 1\nline 2"},
             "status": "pending",
         });
-        let (_, blocks) = approval_card(&item);
+        let (_, blocks) = approval_card(&item, None);
         let s = blocks.to_string();
         assert!(s.contains("Create a Confluence draft"));
         assert!(s.contains("*Title:* Launch &lt;plan&gt;"), "{s}");
@@ -962,7 +987,7 @@ mod tests {
     #[test]
     fn reply_cards() {
         let item = reply_item();
-        let (text, blocks) = approval_card(&item);
+        let (text, blocks) = approval_card(&item, None);
         assert_eq!(text, "Reply drafted for <#C0LAUNCH>: approval needed");
         let s = blocks.to_string();
         assert!(s.contains("*Reply drafted for <#C0LAUNCH>* · <https://slack.com/archives/C0LAUNCH/p1731500000000100|open the thread>"), "{s}");
@@ -1051,12 +1076,63 @@ mod tests {
     }
 
     #[test]
+    fn open_in_workspace_button_for_confluence_and_jira_drafts() {
+        const WEB: &str = "https://pm.example.com";
+        let confluence = json!({
+            "id": "apr_1", "user": "ana", "tool": "confluence.create_draft",
+            "args": {"space": "PM", "title": "Plan", "body": "x"}, "status": "pending",
+        });
+        let jira = json!({
+            "id": "apr_2", "user": "ana", "tool": "jira.create_issue",
+            "args": {"project": "PM", "summary": "s"}, "status": "pending",
+        });
+        let slack = json!({
+            "id": "apr_r1", "user": "ana", "tool": "slack.post_reply", "status": "pending",
+            "args": {"channel": "C0LAUNCH", "text": "hi"}, "bot": "pm-ana",
+        });
+        let button_of = |item: &Value, web: Option<&str>| -> Option<Value> {
+            let (_, blocks) = approval_card(item, web);
+            blocks
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|b| b["elements"].as_array().cloned().unwrap_or_default())
+                .find(|e| e["action_id"] == action::OPEN_WEB)
+        };
+        for (item, id) in [(&confluence, "apr_1"), (&jira, "apr_2")] {
+            let b = button_of(item, Some(WEB)).expect("button when configured");
+            assert_eq!(b["text"]["text"], "Open in workspace");
+            assert_eq!(b["url"], format!("{WEB}/drafts/{id}"));
+            assert!(
+                button_of(item, None).is_none(),
+                "absent when not configured"
+            );
+        }
+        assert!(
+            button_of(&slack, Some(WEB)).is_none(),
+            "no button for Slack drafts"
+        );
+        let (_, reasons) = approval_reasons(&confluence, Some(WEB));
+        assert!(reasons
+            .to_string()
+            .contains("https://pm.example.com/drafts/apr_1"));
+        let unsafe_id = json!({
+            "id": "../apr", "tool": "jira.create_issue", "args": {"summary": "s"},
+            "status": "pending",
+        });
+        assert!(
+            button_of(&unsafe_id, Some(WEB)).is_none(),
+            "unsafe id is never linked"
+        );
+    }
+
+    #[test]
     fn reject_reasons() {
         let item = json!({
             "id": "apr_1", "user": "ana", "tool": "jira.create_issue",
             "args": {"summary": "Fix <login>"}, "status": "pending",
         });
-        let (_, blocks) = approval_reasons(&item);
+        let (_, blocks) = approval_reasons(&item, None);
         let actions = blocks.as_array().unwrap().last().unwrap();
         let ids: Vec<&str> = actions["elements"]
             .as_array()

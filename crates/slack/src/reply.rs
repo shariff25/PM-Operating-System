@@ -379,7 +379,7 @@ impl Snoozer {
                 Ok(item)
                     if item["status"] == "pending" && expiry(&item).is_none_or(|e| e > now) =>
                 {
-                    let card = cards::approval_card(&item);
+                    let card = cards::approval_card(&item, self.bots.web_url());
                     if self.bots.post(&s.channel, None, None, card).await.is_some() {
                         let note =
                             cards::reply_note(&item, ":zzz: Snoozed; the card is back, below.");
