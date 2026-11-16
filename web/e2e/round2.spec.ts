@@ -101,9 +101,17 @@ test('a running request shows its progress and the retry line, and the status do
   // the steps toggle stays where it is while the status text, the count and the retry line change
   const toggle = page.getByRole('button', { name: /Show steps/ });
   const y = (await box(toggle)).y;
-  const done = page.getByRole('region', { name: 'Conversation' }).getByText('Done', { exact: true });
-  for (let i = 0; i < 8 && !(await done.isVisible()); i++) {
-    expect(Math.abs((await box(toggle)).y - y)).toBeLessThanOrEqual(1);
+  // Position and "still working" are read in one step: once the request settles the answer
+  // arrives above the toggle and may move it, and that must not be measured as a jump.
+  const sample = () =>
+    toggle.evaluate((el) => ({
+      y: el.getBoundingClientRect().y,
+      working: document.querySelector('.live-line')?.classList.contains('live-line-on') ?? false,
+    }));
+  for (let i = 0; i < 8; i++) {
+    const s = await sample();
+    if (!s.working) break;
+    expect(Math.abs(s.y - y)).toBeLessThanOrEqual(1);
     await page.waitForTimeout(80);
   }
 });
