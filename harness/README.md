@@ -22,6 +22,10 @@ One worker per bot sandbox, serving one bot. It loops:
 2. **Run:** it builds a fresh agent for the task:
    - **Model:** the gateway at `PMOS_GATEWAY_URL`, model `pmos/<role's model>`, with headers
      `X-Pmos-User` (the PM who asked), `X-Pmos-Run` (the task id) and `X-Pmos-Priority`.
+     The client sets `maxRetries: 0`: the gateway retries `429`, `503` and connection failures
+     (3 tries in a 20 s budget, `docs/gateway.md`), and a second layer would multiply them. A
+     final `429`/`503` fails the task as "still busy after several tries" when the gateway's
+     `X-Pmos-Upstream-Attempts` header shows it retried, and as "busy right now" otherwise.
    - **Tools:** the tool server's MCP tools for the claimed `session_token` (sent as
      `Authorization: Bearer`, never in a URL), through the official MCP TypeScript SDK client
      (`@modelcontextprotocol/sdk`), wrapped as LangChain tools.

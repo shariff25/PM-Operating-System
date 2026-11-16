@@ -83,6 +83,11 @@ export function gatewayModel({
     model: MODEL_ALIASES[role],
     apiKey,
     temperature: 0,
+    // No client-side retries. The gateway already retries 429, 503 and connection failures
+    // (3 tries inside a 20 s budget, honouring Retry-After; docs/gateway.md, "Retrying a busy
+    // model server"). A LangChain retry here would multiply with it, and a PM would wait far
+    // longer than intended. `maxRetries` is LangChain's own retry count, default 6.
+    maxRetries: 0,
     configuration: { baseURL: gatewayUrl, defaultHeaders: headers },
   });
 }

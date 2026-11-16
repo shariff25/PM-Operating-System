@@ -7,7 +7,7 @@ import { MemorySaver } from "@langchain/langgraph";
 import type { HITLRequest } from "langchain";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { createPmosAgent, memorySources } from "../src/agent.js";
+import { createPmosAgent, gatewayModel, memorySources } from "../src/agent.js";
 import { ScriptedModel, systemText } from "./scripted-model.js";
 
 const REPO_CONTENT = join(import.meta.dirname, "..", "..", "content");
@@ -21,6 +21,14 @@ beforeAll(() => {
 afterAll(() => rmSync(contentRoot, { recursive: true, force: true }));
 
 const thread = () => ({ configurable: { thread_id: crypto.randomUUID() } });
+
+describe("gatewayModel", () => {
+  it("never retries on its own: the gateway retries 429, 503 and connection failures", () => {
+    const model = gatewayModel({ gatewayUrl: "http://127.0.0.1:9/v1" });
+    // LangChain's per-model retry count (default 6) is what would multiply with the gateway's.
+    expect((model as unknown as { caller: { maxRetries: number } }).caller.maxRetries).toBe(0);
+  });
+});
 
 describe("createPmosAgent", () => {
   it("loads the team master context and the skill catalog", async () => {

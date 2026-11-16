@@ -377,6 +377,22 @@ describe("harness worker", () => {
     expect(request?.body.model).toBe("pmos/default");
   });
 
+  it("makes one gateway call per model turn when the gateway keeps answering busy", async () => {
+    // The gateway owns retries (docs/gateway.md). The worker's client must not add its own,
+    // or each model turn would be tried again on top of the gateway's own tries.
+    const gateway = await startFakeGateway("unused", { status: 503, upstreamAttempts: 3 });
+    cleanups.push(gateway.close);
+    const { runtime } = await setup({
+      claims: [claim("tsk_busy")],
+      config: { gatewayUrl: gateway.url },
+    });
+    const failed = await waitFor(() => finished(runtime, "tsk_busy"));
+    expect(failed.body.reason).toBe(
+      "The model is still busy after several tries. Please try again in a few minutes.",
+    );
+    expect(gateway.requests).toHaveLength(1);
+  });
+
   it("calls the reasoning model for a role pinned to it", async () => {
     const gateway = await startFakeGateway("A critique.");
     cleanups.push(gateway.close);
@@ -578,6 +594,22 @@ describe("worker helpers", () => {
 
   it("writes failure reasons for a PM", () => {
     expect(pmReason(Object.assign(new Error("busy"), { status: 503 }))).toContain("busy right now");
+    expect(
+      pmReason(
+        Object.assign(new Error("busy"), {
+          status: 429,
+          headers: new Headers({ "x-pmos-upstream-attempts": "3" }),
+        }),
+      ),
+    ).toBe("The model is still busy after several tries. Please try again in a few minutes.");
+    expect(
+      pmReason(
+        Object.assign(new Error("busy"), {
+          status: 503,
+          headers: new Headers({ "x-pmos-upstream-attempts": "1" }),
+        }),
+      ),
+    ).toBe("The model is busy right now. Please try again in a few minutes.");
     expect(pmReason(Object.assign(new Error("x"), { name: "GraphRecursionError" }))).toContain(
       "too many steps",
     );
