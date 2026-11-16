@@ -802,7 +802,9 @@ impl ToolService {
                         ) => ConnectorError::NotConnected(format!(
                             "the {} bot has no working {} account; ask a platform owner to link one for `{}`",
                             bot.name,
-                            if system == "slack" { "Slack" } else { "Atlassian (Jira and Confluence)" },
+                            crate::vault::Provider::for_system(system)
+                                .unwrap_or(crate::vault::Provider::Atlassian)
+                                .label(),
                             bot.identity
                         )),
                         (e, _) => e,
