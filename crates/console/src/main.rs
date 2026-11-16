@@ -19,8 +19,8 @@ async fn main() -> Result<()> {
         );
     }
     match &config.identity {
-        Identity::Proxy => {
-            tracing::info!("trusting X-Forwarded-User: only the SSO proxy may reach this port")
+        Identity::Proxy(_) => {
+            tracing::info!("trusting X-Forwarded-User only with the proxy's X-Pmos-Proxy-Secret")
         }
         Identity::Dev(user) => {
             tracing::warn!(user = %user, "PMOS_CONSOLE_DEV_USER: every request is this person")
