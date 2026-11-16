@@ -6,12 +6,57 @@ use std::path::PathBuf;
 /// Who the person in front of the browser is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
-    /// Behind the Spark's SSO proxy: `X-Forwarded-User` names the person
-    /// (`PMOS_CONSOLE_TRUST_PROXY=1`). Only safe when nothing but the proxy can reach the
-    /// console's port.
-    Proxy,
-    /// Development: every request is this handle (`PMOS_CONSOLE_DEV_USER`).
+    /// Behind the Spark's SSO proxy (`PMOS_CONSOLE_TRUST_PROXY=1`): `X-Forwarded-User` names
+    /// the person, believed only on a request that also carries the proxy's shared secret
+    /// (`PMOS_CONSOLE_PROXY_SECRET`) in `X-Pmos-Proxy-Secret`.
+    Proxy(ProxySecret),
+    /// Development: every request is this handle (`PMOS_CONSOLE_DEV_USER`). Only on a
+    /// loopback bind.
     Dev(String),
+}
+
+/// The secret the reverse proxy sends on every request (`PMOS_CONSOLE_PROXY_SECRET`). Its
+/// `Debug` never shows the value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProxySecret(String);
+
+impl ProxySecret {
+    pub const MIN_LEN: usize = 32;
+
+    pub fn new(secret: impl Into<String>) -> Result<Self, String> {
+        let secret = secret.into();
+        if secret.len() < Self::MIN_LEN {
+            return Err(format!(
+                "PMOS_CONSOLE_PROXY_SECRET must be at least {} characters",
+                Self::MIN_LEN
+            ));
+        }
+        Ok(Self(secret))
+    }
+
+    /// Whether `presented` is the secret, in constant time. Both sides are hashed first, so
+    /// neither the content nor the length of the secret shows in the timing.
+    pub fn matches(&self, presented: &[u8]) -> bool {
+        pmos_runtime::token_eq(&digest(presented), &digest(self.0.as_bytes()))
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+fn digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+impl std::fmt::Debug for ProxySecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProxySecret(<redacted>)")
+    }
 }
 
 #[derive(Clone)]
@@ -84,7 +129,15 @@ impl Config {
             }
         };
         let identity = match (trust_proxy, set("PMOS_CONSOLE_DEV_USER")) {
-            (true, None) => Identity::Proxy,
+            (true, None) => {
+                let secret = set("PMOS_CONSOLE_PROXY_SECRET").ok_or(
+                    "PMOS_CONSOLE_TRUST_PROXY=1 needs PMOS_CONSOLE_PROXY_SECRET: the shared \
+                     secret (at least 32 characters) the reverse proxy sends in \
+                     X-Pmos-Proxy-Secret on every request. Run deploy/setup.sh to generate it, \
+                     and set the proxy to send it (docs/console.md, Sign-in)",
+                )?;
+                Identity::Proxy(ProxySecret::new(secret)?)
+            }
             (false, Some(user)) => {
                 if !pmos_contract::model::valid_handle(&user) {
                     return Err(format!(
@@ -109,11 +162,27 @@ impl Config {
         if bots_token == toolserver_token {
             return Err("PMOS_BOTS_TOKEN and PMOS_TOOLSERVER_TOKEN must differ".into());
         }
+        if let Identity::Proxy(secret) = &identity {
+            if secret.expose() == bots_token || secret.expose() == toolserver_token {
+                return Err(
+                    "PMOS_CONSOLE_PROXY_SECRET must differ from PMOS_BOTS_TOKEN and \
+                     PMOS_TOOLSERVER_TOKEN"
+                        .into(),
+                );
+            }
+        }
+        let bind: SocketAddr = set("PMOS_CONSOLE_BIND")
+            .unwrap_or_else(|| "127.0.0.1:8760".into())
+            .parse()
+            .map_err(|e| format!("PMOS_CONSOLE_BIND: {e}"))?;
+        if matches!(identity, Identity::Dev(_)) && !bind.ip().is_loopback() {
+            return Err(format!(
+                "PMOS_CONSOLE_DEV_USER makes every request that person, so it needs a loopback \
+                 PMOS_CONSOLE_BIND (such as 127.0.0.1:8760), not {bind}"
+            ));
+        }
         Ok(Self {
-            bind: set("PMOS_CONSOLE_BIND")
-                .unwrap_or_else(|| "127.0.0.1:8760".into())
-                .parse()
-                .map_err(|e| format!("PMOS_CONSOLE_BIND: {e}"))?,
+            bind,
             identity,
             bots_url: http_url(
                 "PMOS_BOTS_URL",
@@ -175,6 +244,7 @@ mod tests {
 
     const BOTS: &str = "console-token-0123456789abcdef0123";
     const TOOLS: &str = "service-token-0123456789abcdef0123";
+    const SECRET: &str = "proxy-secret-0123456789abcdef01234";
 
     #[test]
     fn reads_defaults_and_redacts_tokens() {
@@ -208,10 +278,13 @@ mod tests {
             .unwrap_err()
             .contains("not both"));
         let mut proxy = base.to_vec();
-        proxy.push(("PMOS_CONSOLE_TRUST_PROXY", "1"));
+        proxy.extend([
+            ("PMOS_CONSOLE_TRUST_PROXY", "1"),
+            ("PMOS_CONSOLE_PROXY_SECRET", SECRET),
+        ]);
         assert_eq!(
             Config::from_lookup(lookup(&proxy)).unwrap().identity,
-            Identity::Proxy
+            Identity::Proxy(ProxySecret::new(SECRET).unwrap())
         );
         let mut yes = base.to_vec();
         yes.push(("PMOS_CONSOLE_TRUST_PROXY", "yes"));
@@ -281,5 +354,83 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.bots_url, "http://bots.pmos.internal:8750");
         assert_eq!(cfg.slack_url.as_deref(), Some("https://acme.slack.com"));
+    }
+
+    #[test]
+    fn proxy_trust_needs_a_strong_secret() {
+        let base = [
+            ("PMOS_BOTS_TOKEN", BOTS),
+            ("PMOS_TOOLSERVER_TOKEN", TOOLS),
+            ("PMOS_CONSOLE_TRUST_PROXY", "1"),
+        ];
+        // No secret at all, or a blank one: refuse to start, naming the variable.
+        let err = Config::from_lookup(lookup(&base)).unwrap_err();
+        assert!(err.contains("PMOS_CONSOLE_PROXY_SECRET"), "{err}");
+        let mut blank = base.to_vec();
+        blank.push(("PMOS_CONSOLE_PROXY_SECRET", "  "));
+        let err = Config::from_lookup(lookup(&blank)).unwrap_err();
+        assert!(err.contains("PMOS_CONSOLE_PROXY_SECRET"), "{err}");
+        // Too short.
+        let mut short = base.to_vec();
+        short.push((
+            "PMOS_CONSOLE_PROXY_SECRET",
+            "0123456789abcdef0123456789abcde",
+        ));
+        let err = Config::from_lookup(lookup(&short)).unwrap_err();
+        assert!(err.contains("at least 32"), "{err}");
+        // Reusing a token.
+        let mut reused = base.to_vec();
+        reused.push(("PMOS_CONSOLE_PROXY_SECRET", TOOLS));
+        let err = Config::from_lookup(lookup(&reused)).unwrap_err();
+        assert!(err.contains("must differ"), "{err}");
+        // A good one; the Debug output never shows it.
+        let mut good = base.to_vec();
+        good.push(("PMOS_CONSOLE_PROXY_SECRET", SECRET));
+        let cfg = Config::from_lookup(lookup(&good)).unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains(SECRET), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn the_proxy_secret_is_compared_whole() {
+        let secret = ProxySecret::new(SECRET).unwrap();
+        assert!(secret.matches(SECRET.as_bytes()));
+        assert!(!secret.matches(b""));
+        assert!(!secret.matches(&SECRET.as_bytes()[..SECRET.len() - 1]));
+        assert!(!secret.matches(format!("{SECRET}x").as_bytes()));
+        assert!(!secret.matches(SECRET.to_uppercase().as_bytes()));
+        // Hashing first gives both sides one fixed length, so the constant-time comparison
+        // never returns early on a length mismatch.
+        assert_eq!(digest(b"").len(), digest(SECRET.as_bytes()).len());
+    }
+
+    #[test]
+    fn the_dev_user_needs_a_loopback_bind() {
+        let base = [
+            ("PMOS_BOTS_TOKEN", BOTS),
+            ("PMOS_TOOLSERVER_TOKEN", TOOLS),
+            ("PMOS_CONSOLE_DEV_USER", "ana"),
+        ];
+        for bind in ["0.0.0.0:8760", "10.0.0.2:8760", "[::]:8760"] {
+            let mut pairs = base.to_vec();
+            pairs.push(("PMOS_CONSOLE_BIND", bind));
+            let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
+            assert!(err.contains("loopback"), "{bind}: {err}");
+        }
+        for bind in ["127.0.0.1:8760", "[::1]:8760"] {
+            let mut pairs = base.to_vec();
+            pairs.push(("PMOS_CONSOLE_BIND", bind));
+            assert!(Config::from_lookup(lookup(&pairs)).is_ok(), "{bind}");
+        }
+        // Behind the proxy, any bind is allowed: the secret guards it.
+        let pairs = [
+            ("PMOS_BOTS_TOKEN", BOTS),
+            ("PMOS_TOOLSERVER_TOKEN", TOOLS),
+            ("PMOS_CONSOLE_TRUST_PROXY", "1"),
+            ("PMOS_CONSOLE_PROXY_SECRET", SECRET),
+            ("PMOS_CONSOLE_BIND", "0.0.0.0:8760"),
+        ];
+        assert!(Config::from_lookup(lookup(&pairs)).is_ok());
     }
 }
