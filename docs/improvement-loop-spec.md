@@ -181,7 +181,7 @@ with `edit_distance ≥ PMOS_TRIAGE_MIN_EDIT` (default 0.3).
 - **Bot:** each runs against `bot: personal`, meaning `pm-<requested_by>`.
 - **Seed tasks:** 3 each, against the fake connectors' fixtures. They are marked "seed: replace
   with case cards", with `drafts:` checks.
-- **Launch bar:** none until real case cards exist (`pass_bar` unset means it reports only).
+- **Launch bar:** a starting bar of 80% over 3 repeats was set on 2026-11-16 (`docs/evals.md`, "Categories and bars"). It is measured on seed tasks, so tighten it once real case cards exist.
 
 **Case cards.** `evals/case-card.md` is the template.
 - **What a case card is:** a self-contained, paraphrased task (an `ask` plus `expect`), with no
