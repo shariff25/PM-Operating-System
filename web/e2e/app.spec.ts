@@ -19,16 +19,22 @@ test('signs in, asks, and sees a result', async ({ page }) => {
   await signIn(page);
   await page.getByLabel('What do you need?').fill('what changed in billing');
   await page.getByRole('button', { name: 'Ask', exact: true }).click();
-  const panel = page.getByRole('region', { name: 'Your request' });
-  await expect(panel.getByText('Done', { exact: true })).toBeVisible();
-  await expect(panel.locator('strong', { hasText: 'PAY-212' })).toBeVisible();
+  const thread = page.getByRole('region', { name: 'Conversation' });
+  await expect(thread.getByText('Done', { exact: true })).toBeVisible();
+  await expect(thread.locator('strong', { hasText: 'PAY-212' })).toBeVisible();
+  await expect(page).toHaveURL(/#\/a\/tsk_/);
+  // only milestones in the steps
+  await thread.getByRole('button', { name: /Show steps/ }).click();
+  await expect(thread.getByRole('list', { name: 'Steps' }).getByRole('listitem')).toHaveText(['Reading Jira', 'Reading Confluence', 'Putting the answer together']);
+  await expect(thread.getByText('Claimed by pm-ana')).toHaveCount(0);
+  await expect(thread.getByText('2 of 3 done')).toHaveCount(0);
 });
 
 test('asks for a draft and opens it as a formatted document', async ({ page }) => {
   await signIn(page);
   await page.getByLabel('What do you need?').fill('draft a PRD for retries');
-  await page.getByRole('button', { name: 'Ask', exact: true }).click();
-  await page.getByRole('button', { name: 'Open the draft' }).click();
+  await page.getByLabel('What do you need?').press('Enter');
+  await page.getByRole('button', { name: 'Open draft' }).click();
   const doc = page.getByRole('article', { name: 'Formatted draft' });
   await expect(doc.getByRole('heading', { level: 1 })).toContainText('PRD: retries');
   await expect(doc.getByRole('heading', { level: 2, name: 'Problem' })).toBeVisible();
@@ -54,6 +60,7 @@ test('edits, saves, and returns to the formatted view', async ({ page }) => {
 test('asks for a change and accepts it', async ({ page }) => {
   await signIn(page);
   await openDraft(page, 'apr_prd');
+  await page.getByRole('tab', { name: 'Ask for a change' }).click();
   await page.getByLabel('What should change?').fill('shorter');
   await page.getByRole('button', { name: 'Suggest a change' }).click();
   const region = page.getByRole('region', { name: 'Suggested change' });
@@ -95,7 +102,9 @@ test('an external channel needs a second, explicit yes', async ({ page }) => {
 
 test('an expired draft is labelled, sorted lower, and cannot be approved', async ({ page }) => {
   await signIn(page);
-  const rows = page.getByRole('region', { name: 'Drafts' }).getByRole('link');
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Drafts/ }).click();
+  await page.getByRole('tab', { name: /^All/ }).click();
+  const rows = page.getByRole('tabpanel').getByRole('link');
   const expired = rows.filter({ hasText: 'Reply to Dana in #migrations' });
   await expect(expired).toContainText('Expired');
   const texts = await rows.allInnerTexts();
@@ -122,7 +131,7 @@ test('hints come one at a time and do not return after they are dismissed', asyn
   await expect(hints).toHaveCount(0);
 
   // away and back inside the same session: none of them returns
-  await page.getByRole('link', { name: 'Back to home' }).click();
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Home', exact: true }).click();
   await expect(page.getByLabel('What do you need?')).toBeVisible();
   await openDraft(page, 'apr_jira');
   await expect(hints).toHaveCount(0);
@@ -162,20 +171,90 @@ test('a hostile draft renders none of style, hidden text, form or remote image, 
   await expect(dialog).toContainText('contains 3 hidden or stripped parts');
 });
 
-for (const [name, hash] of [['home', ''], ['workspace', '/d/apr_hostile'], ['workspace with a long draft', '/d/apr_prd']] as const) {
-  test(`no horizontal scroll at phone width: ${name}`, async ({ page }) => {
-    await page.setViewportSize({ width: 400, height: 800 });
-    await signIn(page);
-    if (hash) await openDraft(page, hash.replace('/d/', ''));
-    const [scrollWidth, clientWidth] = await page.evaluate(() => [
-      document.documentElement.scrollWidth,
-      document.documentElement.clientWidth,
-    ]);
-    expect(scrollWidth).toBeLessThanOrEqual(clientWidth);
-    if (hash) {
-      await page.getByRole('button', { name: /^Approve/ }).click();
-      const [sw, cw] = await page.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
-      expect(sw).toBeLessThanOrEqual(cw);
-    }
-  });
-}
+const noHScroll = async (page: Page, what: string) => {
+  const [sw, cw] = await page.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+  expect(sw, `horizontal scroll on ${what}`).toBeLessThanOrEqual(cw);
+};
+
+test('no horizontal scroll at 390px on every page, dialog and palette', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await signIn(page);
+  await noHScroll(page, 'home');
+  for (const hash of ['/drafts', '/followups', '/activity', '/a/tsk_seed_prd', '/a/tsk_seed_failed', '/d/apr_hostile', '/d/apr_slack', '/d/apr_slack_old', '/d/apr_prd']) {
+    await page.evaluate((h) => { window.location.hash = h; }, hash);
+    await page.waitForTimeout(150);
+    await noHScroll(page, hash);
+  }
+  for (const tab of ['Sources', 'Ask for a change', 'Details', 'Draft']) {
+    await page.getByRole('tab', { name: new RegExp(`^${tab}`) }).click();
+    await noHScroll(page, `draft tab ${tab}`);
+  }
+  await page.getByRole('button', { name: /^Approve/ }).click();
+  await noHScroll(page, 'approve dialog');
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: 'Ask PM OS' }).click();
+  await expect(page.getByRole('dialog', { name: 'Ask PM OS or jump to a page' })).toBeVisible();
+  await noHScroll(page, 'palette');
+});
+
+test('phone: a bottom tab bar replaces the sidebar, and the user menu sits behind the avatar', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await signIn(page);
+  const bar = page.getByRole('navigation', { name: 'Main' });
+  await expect(bar).toHaveClass(/tabbar/);
+  const box = await bar.boundingBox();
+  expect(box!.y + box!.height).toBeGreaterThan(830);
+  await expect(page.locator('.sidebar')).toHaveCount(0);
+  await bar.getByRole('link', { name: /^Activity/ }).click();
+  await expect(bar.getByRole('link', { name: /^Activity/ })).toHaveAttribute('aria-current', 'page');
+  await page.getByRole('button', { name: /Menu for/ }).click();
+  await expect(page.getByRole('menuitem', { name: 'Sign out' })).toBeVisible();
+});
+
+test('desktop: sidebar navigation marks the current page', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await signIn(page);
+  const nav = page.getByRole('navigation', { name: 'Main' });
+  await expect(nav.getByRole('link', { name: 'Home', exact: true })).toHaveAttribute('aria-current', 'page');
+  await nav.getByRole('link', { name: /^Follow-ups/ }).click();
+  await expect(page.getByRole('heading', { level: 1, name: 'Follow-ups' })).toBeVisible();
+  await expect(nav.getByRole('link', { name: /^Follow-ups/ })).toHaveAttribute('aria-current', 'page');
+  await expect(nav.getByRole('link', { name: 'Home', exact: true })).not.toHaveAttribute('aria-current', 'page');
+});
+
+test('command palette: Ctrl+K, jump to a draft, ask from anywhere, Escape', async ({ page }) => {
+  await signIn(page);
+  await page.keyboard.press('Control+k');
+  const dialog = page.getByRole('dialog', { name: 'Ask PM OS or jump to a page' });
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(dialog).toHaveCount(0);
+
+  await page.keyboard.press('Control+k');
+  await expect(dialog.getByRole('combobox')).toBeFocused();
+  await page.keyboard.type('show grace');
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(/#\/d\/apr_jira$/);
+
+  await expect(page.getByRole('article', { name: 'Formatted draft' })).toBeVisible();
+  await page.keyboard.press('Control+k');
+  await expect(dialog.getByRole('combobox')).toBeFocused();
+  await page.keyboard.type('what is blocked');
+  await expect(dialog.getByRole('option', { selected: true })).toHaveText(/Ask: what is blocked/);
+  await page.keyboard.press('Enter');
+  // the thread polls every two seconds in the dev app
+  await expect(page.getByRole('region', { name: 'Conversation' }).getByText('Done', { exact: true })).toBeVisible({ timeout: 10_000 });
+});
+
+test('theme: dark and light from the menu change the page colours and survive a reload', async ({ page }) => {
+  await signIn(page);
+  const bg = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+  const light = await bg();
+  await page.getByRole('button', { name: /Menu for/ }).click();
+  await page.getByRole('menuitemradio', { name: 'Dark' }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  const dark = await bg();
+  expect(dark).not.toBe(light);
+  await page.reload();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+});
