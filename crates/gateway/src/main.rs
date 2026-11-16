@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
         workarounds_on: config.workarounds_on,
         anthropic_key: config.anthropic_key.clone(),
         remote_key: config.remote_key.clone(),
+        retry: config.retry,
     });
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
