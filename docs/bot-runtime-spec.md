@@ -180,7 +180,7 @@ an answer to the bot's last question.
 | `POST /v1/worker/tasks/{id}/trace` `{entries: [{kind: "prompt"\|"model_reply"\|"tool_call"\|"tool_result"\|"policy_denial", body}]}` | worker | to the trace store |
 | `POST /v1/worker/tasks/{id}/complete` `{result, approvals: [..]}` | worker | `needs_approval` if `approvals` is non-empty, else `done` |
 | `POST /v1/worker/tasks/{id}/fail` `{reason}` | worker | |
-| `GET /v1/notifications?after=<cursor>&wait_ms=` | slack | Long-polls. Returns `{cursor, items: [{id, task_id, bot, requested_by, slack, kind: "milestone"\|"done"\|"failed"\|"needs_approval"\|"approval_closed", text, approvals?}]}` in order. |
+| `GET /v1/notifications?after=<cursor>&wait_ms=` | slack | Long-polls. Returns `{cursor, items: [{id, task_id, bot, requested_by, slack, kind: "milestone"\|"done"\|"failed"\|"needs_approval"\|"approval_closed", text, approvals?, routine_id?}]}` in order. `routine_id` is there only when a routine created the task. |
 | `POST /v1/routines/parse` `{bot, owner, text, tz}` | slack, web | Returns `{draft, summary}`, or `422` with `{question}` when the request is unclear. |
 | `POST /v1/routines` `{draft}` | slack, web | `201` with the Routine |
 | `GET /v1/routines?owner=` | slack, web (own), console | |
