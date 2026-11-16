@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Api, Me } from './api';
 import { AppContext } from './app-context';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { UserMenu } from './components/UserMenu';
 import { copy } from './copy';
 import { DraftPage } from './pages/DraftPage';
 import { Home } from './pages/Home';
 import { SignIn } from './pages/SignIn';
+import { draftIdFromPath } from './url';
 
 function useHashPath(): [string, (p: string) => void] {
   const read = () => window.location.hash.replace(/^#/, '') || '/';
@@ -56,7 +58,8 @@ export function App({ createApi, pollMs = 2000 }: AppProps) {
     return <SignIn api={api} onSignedIn={() => void refreshMe()} />;
   }
 
-  const draftId = /^\/d\/(.+)$/.exec(path)?.[1];
+  // A malformed or unsafe id shows the home page rather than crashing.
+  const draftId = draftIdFromPath(path);
 
   return (
     <AppContext.Provider value={ctx}>
@@ -65,7 +68,9 @@ export function App({ createApi, pollMs = 2000 }: AppProps) {
           <a href="#/" className="brand">{copy.appName}</a>
           <UserMenu onSignOut={() => setMe(null)} />
         </header>
-        <main>{draftId ? <DraftPage key={draftId} id={decodeURIComponent(draftId)} /> : <Home />}</main>
+        <main>
+          <ErrorBoundary resetKey={path}>{draftId ? <DraftPage key={draftId} id={draftId} /> : <Home />}</ErrorBoundary>
+        </main>
       </div>
     </AppContext.Provider>
   );
