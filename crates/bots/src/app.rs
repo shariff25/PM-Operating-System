@@ -290,6 +290,9 @@ struct CreateTask {
     /// The task's own level: the evals client only.
     #[serde(default)]
     level: Option<Level>,
+    /// The conversation this task continues: the web and Slack clients only.
+    #[serde(default)]
+    conversation: Option<String>,
 }
 
 async fn create_task(
@@ -306,6 +309,11 @@ async fn create_task(
     if req.level.is_some() && caller.kind != ClientKind::Evals {
         return Err(forbidden(
             "only the evals client sets a task's level; a PM's own level comes from their settings",
+        ));
+    }
+    if req.conversation.is_some() && !matches!(caller.kind, ClientKind::Slack | ClientKind::Web) {
+        return Err(forbidden(
+            "only the web and Slack clients name a task's conversation",
         ));
     }
     match caller.kind {
@@ -342,6 +350,7 @@ async fn create_task(
                 source: req.source,
                 slack: req.slack,
                 level: req.level,
+                conversation: req.conversation,
             },
             model::now(),
         )
