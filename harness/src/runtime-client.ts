@@ -33,6 +33,15 @@ const BotSchema = z.object({
   job: z.string().default(""),
 });
 
+/** One earlier turn of the task's conversation (docs/bot-runtime-spec.md §3, Conversations). */
+const TurnSchema = z.object({
+  text: z.string(),
+  result: z.string().nullish(),
+  error: z.string().nullish(),
+  status: z.string(),
+  at: z.string().optional(),
+});
+
 export const ClaimSchema = z.object({
   task: TaskSchema,
   bot: BotSchema,
@@ -42,9 +51,15 @@ export const ClaimSchema = z.object({
   lease_until: z.string().optional(),
   /** The level to work at (docs/staff-principal-spec.md §1); an older runtime sends none. */
   level: z.enum(["senior", "staff", "principal"]).default("senior"),
+  /**
+   * The earlier turns of this conversation (the same Slack thread or web conversation, the
+   * same PM and bot), oldest first. Empty for a first message; an older runtime sends none.
+   */
+  history: z.array(TurnSchema).default([]),
 });
 
 export type Claim = z.infer<typeof ClaimSchema>;
+export type Turn = Claim["history"][number];
 export type ClaimedTask = Claim["task"];
 
 export interface ChecklistItem {

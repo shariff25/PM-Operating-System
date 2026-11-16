@@ -23,7 +23,7 @@ use crate::clients::{valid_approval_id, ApprovalState, CallError, Gateway, TaskD
 use crate::model::{
     self, ApprovalOutcome, ChecklistItem, Draft, Level, MemberSettings, NewNotification,
     Notification, NotificationKind, Routine, Schedule, SlackRef, Source, Task, TaskStatus,
-    TraceKind, GAVE_UP_REASON, LEASE_SECONDS, MAX_ATTEMPTS, RETRY_EVENT,
+    TraceKind, Turn, GAVE_UP_REASON, LEASE_SECONDS, MAX_ATTEMPTS, REDACTED_MARKER, RETRY_EVENT,
 };
 use crate::routines::{self, Parsed};
 use crate::store::{
@@ -45,6 +45,15 @@ pub const MAX_TEXT_CHARS: usize = 20_000;
 pub const MAX_RESULT_CHARS: usize = 100_000;
 pub const MAX_TRACE_ENTRIES: usize = 500;
 pub const NOTIFICATION_PAGE: usize = 100;
+
+/// A claim carries at most this many earlier turns of the task's conversation.
+pub const HISTORY_TURNS: usize = 6;
+/// ... and at most this many bytes of their text, results and errors, the oldest dropped first.
+pub const HISTORY_BYTES: usize = 16_000;
+/// Each turn's text, result and error is cut to this many bytes, with [`TRUNCATED`] after.
+pub const TURN_FIELD_BYTES: usize = 4_000;
+/// What a cut field ends with.
+pub const TRUNCATED: &str = "… [truncated]";
 
 /// Errors as a PM or a calling service should read them. `app.rs` maps each to a status.
 #[derive(Debug, thiserror::Error)]
@@ -100,6 +109,8 @@ pub struct NewTask {
     pub slack: Option<SlackRef>,
     /// The task's own level (the evals client only; `app.rs` checks).
     pub level: Option<Level>,
+    /// The conversation it continues (the web and Slack clients only; `app.rs` checks).
+    pub conversation: Option<String>,
 }
 
 /// What the harness needs to call the gateway for this task: the bot's model role and the
@@ -122,6 +133,8 @@ pub struct Claim {
     pub gateway: GatewayHints,
     /// The level to work at: the task's own, else the requester's setting, else `senior`.
     pub level: Level,
+    /// The earlier turns of the task's conversation, oldest first; empty for a first message.
+    pub history: Vec<Turn>,
 }
 
 /// The session token never reaches a log through `Debug`.
@@ -133,6 +146,7 @@ impl std::fmt::Debug for Claim {
             .field("session_token", &"<redacted>")
             .field("lease_until", &self.lease_until)
             .field("level", &self.level)
+            .field("history", &self.history.len())
             .finish()
     }
 }
@@ -262,6 +276,13 @@ impl Runtime {
         if let Some(e) = too_long("the task text", &text, MAX_TEXT_CHARS) {
             return Err(e);
         }
+        if let Some(c) = &new.conversation {
+            if !model::valid_conversation(c) {
+                return Err(Error::BadRequest(
+                    "a conversation id is 1 to 128 letters, digits, `.`, `_`, `:` or `-`".into(),
+                ));
+            }
+        }
         let bot = self.bot(&new.bot)?;
         self.catalog()
             .may_use(&new.requested_by, &bot)
@@ -276,6 +297,7 @@ impl Runtime {
             now,
         );
         task.level = new.level;
+        task.conversation = new.conversation;
         self.store.create_task(&task, "queued").await?;
         tracing::info!(task = %task.id, bot = %task.bot, source = %task.source, "task queued");
         self.bump();
@@ -357,7 +379,8 @@ impl Runtime {
             {
                 Ok(session_token) => {
                     let level = self.claim_level(&task).await;
-                    tracing::info!(task = %task.id, bot = %bot.name, %worker, attempt = task.attempts, %level, "task claimed");
+                    let history = self.history(&task, now).await;
+                    tracing::info!(task = %task.id, bot = %bot.name, %worker, attempt = task.attempts, %level, turns = history.len(), "task claimed");
                     let mut headers = serde_json::Map::new();
                     headers.insert("X-Pmos-User".into(), json!(task.requested_by));
                     headers.insert("X-Pmos-Run".into(), json!(task.id));
@@ -377,6 +400,7 @@ impl Runtime {
                             headers,
                         },
                         level,
+                        history,
                         task,
                     }));
                 }
@@ -421,6 +445,22 @@ impl Runtime {
                 Level::default()
             }
         }
+    }
+
+    /// The earlier turns of a claimed task's conversation, oldest first (spec §3,
+    /// Conversations). Only the requester's own tasks for the same bot in the same thread,
+    /// asked within the last [`SLACK_TEXT_HOURS`] (the retention window for Slack text) and
+    /// never redacted. A read that fails gives no history rather than strand the task.
+    async fn history(&self, task: &Task, now: DateTime<Utc>) -> Vec<Turn> {
+        let since = now - chrono::Duration::hours(SLACK_TEXT_HOURS);
+        let earlier = match self.store.earlier_turns(task, since, HISTORY_TURNS).await {
+            Ok(earlier) => earlier,
+            Err(e) => {
+                tracing::warn!(error = %e, task = %task.id, "couldn't read the conversation; starting fresh");
+                return Vec::new();
+            }
+        };
+        bounded_history(earlier)
     }
 
     async fn fail_claimed(
@@ -1135,9 +1175,118 @@ pub fn describe_outcomes(outcomes: &[ApprovalOutcome]) -> String {
     }
 }
 
+/// `s` cut to at most [`TURN_FIELD_BYTES`] bytes on a character boundary, with [`TRUNCATED`]
+/// after when it was cut.
+pub fn truncate_field(s: &str) -> String {
+    if s.len() <= TURN_FIELD_BYTES {
+        return s.to_string();
+    }
+    let mut end = TURN_FIELD_BYTES;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{TRUNCATED}", &s[..end])
+}
+
+/// Earlier tasks (newest first, as the store returns them) as a claim's history, oldest
+/// first: redacted turns left out, long fields cut, and older turns dropped once the total
+/// passes [`HISTORY_BYTES`].
+pub fn bounded_history(newest_first: Vec<Task>) -> Vec<Turn> {
+    let redacted = |s: &Option<String>| s.as_deref().is_some_and(|s| s.contains(REDACTED_MARKER));
+    let mut turns = Vec::new();
+    let mut bytes = 0;
+    for t in newest_first.into_iter().take(HISTORY_TURNS) {
+        if t.text.contains(REDACTED_MARKER) || redacted(&t.result) || redacted(&t.error) {
+            continue;
+        }
+        let turn = Turn {
+            text: truncate_field(&t.text),
+            result: t.result.as_deref().map(truncate_field),
+            error: t.error.as_deref().map(truncate_field),
+            status: t.status,
+            at: t.created_at,
+        };
+        let size = turn.text.len()
+            + turn.result.as_ref().map_or(0, String::len)
+            + turn.error.as_ref().map_or(0, String::len);
+        if bytes + size > HISTORY_BYTES {
+            break;
+        }
+        bytes += size;
+        turns.push(turn);
+    }
+    turns.reverse();
+    turns
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn earlier(text: &str, result: Option<&str>, minute: u32) -> Task {
+        use chrono::TimeZone;
+        let mut t = Task::queued(
+            "docs",
+            "ana",
+            Source::Slack,
+            text,
+            None,
+            None,
+            Utc.with_ymd_and_hms(2026, 11, 14, 9, minute, 0).unwrap(),
+        );
+        t.status = TaskStatus::Done;
+        t.result = result.map(String::from);
+        t
+    }
+
+    #[test]
+    fn history_is_oldest_first_and_bounded() {
+        // Newest first, as the store returns them: eight turns, so the two oldest go.
+        let tasks: Vec<Task> = (0..8)
+            .rev()
+            .map(|m| earlier(&format!("q{m}"), Some(&format!("a{m}")), m))
+            .collect();
+        let turns = bounded_history(tasks);
+        assert_eq!(
+            turns.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(),
+            ["q2", "q3", "q4", "q5", "q6", "q7"]
+        );
+        assert_eq!(turns[5].result.as_deref(), Some("a7"));
+        assert!(bounded_history(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn long_results_are_cut_and_the_oldest_dropped_past_the_byte_cap() {
+        let long = "é".repeat(TURN_FIELD_BYTES); // two bytes each
+        let tasks: Vec<Task> = (0..6)
+            .rev()
+            .map(|m| earlier(&format!("q{m}"), Some(&long), m))
+            .collect();
+        let turns = bounded_history(tasks);
+        let cut = turns[0].result.as_deref().unwrap();
+        assert!(cut.ends_with(TRUNCATED));
+        assert!(cut.len() <= TURN_FIELD_BYTES + TRUNCATED.len());
+        let total: usize = turns
+            .iter()
+            .map(|t| t.text.len() + t.result.as_ref().map_or(0, String::len))
+            .sum();
+        assert!(total <= HISTORY_BYTES, "{total}");
+        assert_eq!(turns.len(), 3, "each turn is about 4 KB, so three fit");
+        assert_eq!(turns.last().unwrap().text, "q5", "the newest are kept");
+        assert_eq!(truncate_field("short"), "short");
+    }
+
+    #[test]
+    fn redacted_turns_are_left_out() {
+        let tasks = vec![
+            earlier("fine", Some("ok"), 3),
+            earlier(&format!("{{\"redacted\": \"{REDACTED_MARKER}\"}}"), None, 2),
+            earlier("asked", Some(REDACTED_MARKER), 1),
+        ];
+        let turns = bounded_history(tasks);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].text, "fine");
+    }
 
     #[test]
     fn outcomes_read_plainly() {
