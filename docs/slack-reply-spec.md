@@ -175,7 +175,7 @@ closed states.
 
   Use `drafts:` checks (tool, count, `channel`, `thread_ts`, `must_include`), and keep "seed:
   replace with case cards".
-- **Its launch bar:** still none, until real case cards exist.
+- **Its launch bar:** a starting bar of 80% over 3 repeats since 2026-11-16, on seed tasks; to be tightened once real case cards exist.
 
 ## 7. Docs
 
