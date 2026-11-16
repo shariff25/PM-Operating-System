@@ -2,6 +2,9 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::assertion::Assertions;
 
 use crate::github::{valid_login, valid_repo};
 use crate::oauth::{AppCredentials, Endpoints};
@@ -114,6 +117,15 @@ pub struct Config {
     /// `PMOS_BOT_TOKEN`: the Slack bot's own token, at least 32 characters and different from
     /// the service token. Optional; without it the bot can't connect.
     pub bot_token: Option<Secret>,
+    /// `PMOS_WEB_TOKEN`: `pmos-web`'s own token, for the approvals routes only. Optional; at
+    /// least 32 characters and different from every other token.
+    pub web_token: Option<Secret>,
+    /// `PMOS_CONSOLE_TOKEN`: the console's own token, for the approvals routes only. Optional;
+    /// at least 32 characters and different from every other token.
+    pub console_token: Option<Secret>,
+    /// `PMOS_ASSERTION_MODE` and `PMOS_ASSERTION_KEYS`: user assertions from `pmos-web` and
+    /// the console on the approvals routes (`crate::assertion`). Off unless set.
+    pub assertions: Arc<Assertions>,
     /// `PMOS_BOT_SKILLS`: space- or comma-separated skills the bot may start sessions for.
     /// Default `docs`.
     pub bot_skills: Vec<String>,
@@ -165,6 +177,28 @@ impl Config {
                 return Err("PMOS_BOT_TOKEN must differ from PMOS_SERVICE_TOKEN".into());
             }
         }
+        let mut seen: Vec<String> = std::iter::once(service_token.clone())
+            .chain(bot_token.clone())
+            .collect();
+        let mut person_token = |k: &str| -> Result<Option<String>, String> {
+            let Some(t) = get(k).filter(|t| !t.is_empty()) else {
+                return Ok(None);
+            };
+            if t.len() < 32 {
+                return Err(format!("{k} must be at least 32 characters"));
+            }
+            if seen.contains(&t) {
+                return Err(format!(
+                    "{k} must differ from PMOS_SERVICE_TOKEN, PMOS_BOT_TOKEN and the other \
+                     client tokens"
+                ));
+            }
+            seen.push(t.clone());
+            Ok(Some(t))
+        };
+        let web_token = person_token("PMOS_WEB_TOKEN")?;
+        let console_token = person_token("PMOS_CONSOLE_TOKEN")?;
+        let assertions = Arc::new(Assertions::from_lookup(&get)?);
         let bot_skills: Vec<String> = get("PMOS_BOT_SKILLS")
             .unwrap_or_else(|| "docs".into())
             .split([' ', ','])
@@ -264,6 +298,9 @@ impl Config {
             bind,
             service_token: Secret::new(service_token),
             bot_token: bot_token.map(Secret::new),
+            web_token: web_token.map(Secret::new),
+            console_token: console_token.map(Secret::new),
+            assertions,
             bot_skills,
             database_url,
             audit_log,
@@ -447,6 +484,55 @@ mod tests {
         assert!(!printed.contains(TOKEN), "{printed}");
         assert!(!printed.contains("bot-token"), "{printed}");
         assert_eq!(ok.bot_skills, vec!["docs"]);
+    }
+
+    #[test]
+    fn person_tokens_and_assertions() {
+        let web = "web-token-0123456789abcdef-01234567";
+        let console = "console-token-0123456789abcdef-0123";
+        let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let keys = format!("web:toolserver:k1:{key}");
+        let base = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        let with = |extra: &[(&str, &str)]| {
+            let mut pairs = base.to_vec();
+            pairs.extend_from_slice(extra);
+            cfg(&pairs)
+        };
+        let ok = with(&[
+            ("PMOS_WEB_TOKEN", web),
+            ("PMOS_CONSOLE_TOKEN", console),
+            ("PMOS_ASSERTION_MODE", "require"),
+            ("PMOS_ASSERTION_KEYS", &keys),
+        ])
+        .unwrap();
+        assert_eq!(ok.assertions.mode(), crate::assertion::Mode::Require);
+        let printed = format!("{ok:?}");
+        for secret in [web, console, key] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
+        // Off by default; on without keys refuses to start.
+        assert_eq!(
+            with(&[]).unwrap().assertions.mode(),
+            crate::assertion::Mode::Off
+        );
+        let err = with(&[("PMOS_ASSERTION_MODE", "verify")]).unwrap_err();
+        assert!(err.contains("PMOS_ASSERTION_KEYS"), "{err}");
+        // Tokens are long and distinct.
+        assert!(with(&[("PMOS_WEB_TOKEN", "short")])
+            .unwrap_err()
+            .contains("32"));
+        assert!(with(&[("PMOS_WEB_TOKEN", TOKEN)])
+            .unwrap_err()
+            .contains("differ"));
+        assert!(
+            with(&[("PMOS_WEB_TOKEN", web), ("PMOS_CONSOLE_TOKEN", web)])
+                .unwrap_err()
+                .contains("differ")
+        );
     }
 
     #[test]

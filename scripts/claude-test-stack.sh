@@ -115,9 +115,16 @@ GW_RUNTIME=$(tok) GW_WORKER=$(tok)
 RT_SLACK=$(tok) RT_DOCS=$(tok) RT_PERSONAL=$(tok)
 BOT_PERSONAL="pm-$HANDLE"
 BOTS_TOKENS="slack=$RT_SLACK,worker-docs=$RT_DOCS,worker-$BOT_PERSONAL=$RT_PERSONAL"
+# With the web app: its own tool server token, a user assertion key for each of its upstreams,
+# and both receivers requiring assertions on its calls (docs/user-assertion.md).
+ASSERTION_MODE=off TS_WEB="" AK_BOTS="" AK_TOOLS=""
 if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
   RT_WEB=$(tok)
   BOTS_TOKENS="$BOTS_TOKENS,web=$RT_WEB"
+  TS_WEB=$(tok)
+  AK_BOTS="web:bots:k1:$(openssl rand -base64 32)"
+  AK_TOOLS="web:toolserver:k1:$(openssl rand -base64 32)"
+  ASSERTION_MODE=require
 fi
 
 PIDS=()
@@ -151,6 +158,7 @@ wait_for http://127.0.0.1:8730/healthz docs
 
 start toolserver env PMOS_DEV=1 PMOS_CONNECTORS=fake \
   PMOS_SERVICE_TOKEN="$SERVICE_TOKEN" PMOS_BOT_TOKEN="$BOT_TOKEN" \
+  PMOS_WEB_TOKEN="$TS_WEB" PMOS_ASSERTION_MODE="$ASSERTION_MODE" PMOS_ASSERTION_KEYS="$AK_TOOLS" \
   PMOS_CONTENT_ROOT="$STATE/content" PMOS_AUDIT_LOG="$STATE/audit.jsonl" \
   PMOS_DOCS_URL=http://127.0.0.1:8730/mcp PMOS_DOCS_TOKEN="$DOCS_TOKEN" \
   "$BIN/pmos-toolserver"
@@ -164,6 +172,7 @@ wait_for http://127.0.0.1:8740/healthz gateway
 
 start bots env PMOS_DEV=1 PMOS_CONTENT_ROOT="$STATE/content" \
   PMOS_BOTS_TOKENS="$BOTS_TOKENS" \
+  PMOS_ASSERTION_MODE="$ASSERTION_MODE" PMOS_ASSERTION_KEYS="$AK_BOTS" \
   PMOS_TOOLSERVER_URL=http://127.0.0.1:8710 PMOS_SERVICE_TOKEN="$SERVICE_TOKEN" \
   PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1 PMOS_GATEWAY_TOKEN="$GW_RUNTIME" \
   "$BIN/pmos-bots"
@@ -189,7 +198,8 @@ start slack env PMOS_SLACK_APP_TOKEN="$PMOS_SLACK_APP_TOKEN" \
 if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
   # Development sign-in: closed to this machine (127.0.0.1) and never for a shared network.
   start web env PMOS_WEB_BIND=127.0.0.1:8770 PMOS_WEB_DEV_LOGIN=1 \
-    PMOS_WEB_BOTS_TOKEN="$RT_WEB" PMOS_WEB_TOOLSERVER_TOKEN="$SERVICE_TOKEN" \
+    PMOS_WEB_BOTS_TOKEN="$RT_WEB" PMOS_WEB_TOOLSERVER_TOKEN="$TS_WEB" \
+    PMOS_ASSERTION_KEYS="$AK_BOTS,$AK_TOOLS" \
     PMOS_BOTS_URL=http://127.0.0.1:8750 PMOS_TOOLSERVER_URL=http://127.0.0.1:8710 \
     PMOS_CONTENT_ROOT="$STATE/content" PMOS_WEB_STATIC_DIR="$ROOT/web/dist" \
     "$BIN/pmos-web"

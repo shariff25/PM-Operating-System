@@ -3,6 +3,9 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::assertion::Assertions;
 
 /// The runtime's callers. The name in `PMOS_BOTS_TOKENS` decides what each may do (spec §3,
 /// Auth).
@@ -97,6 +100,9 @@ pub struct Config {
     pub gateway_url: String,
     /// `PMOS_GATEWAY_TOKEN`: this service's gateway client token.
     pub gateway_token: Secret,
+    /// `PMOS_ASSERTION_MODE` and `PMOS_ASSERTION_KEYS`: user assertions from the `web` and
+    /// `console` clients (`crate::assertion`). Off unless set.
+    pub assertions: Arc<Assertions>,
 }
 
 impl Config {
@@ -138,6 +144,7 @@ impl Config {
             service_token: Secret(need("PMOS_SERVICE_TOKEN")?),
             gateway_url: url("PMOS_GATEWAY_URL")?,
             gateway_token: Secret(need("PMOS_GATEWAY_TOKEN")?),
+            assertions: Arc::new(Assertions::from_lookup(&get)?),
         })
     }
 }
