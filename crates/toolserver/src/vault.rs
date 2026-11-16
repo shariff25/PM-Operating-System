@@ -23,6 +23,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::connectors::registry::registry;
 use crate::store::{StoreError, StoreResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -34,39 +35,25 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// Every provider, in registry order.
+    pub const ALL: [Provider; 3] = [Self::Atlassian, Self::Slack, Self::Github];
+
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Atlassian => "atlassian",
-            Self::Slack => "slack",
-            Self::Github => "github",
-        }
+        registry().spec(self).id
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "atlassian" => Some(Self::Atlassian),
-            "slack" => Some(Self::Slack),
-            "github" => Some(Self::Github),
-            _ => None,
-        }
+        registry().by_id(s).map(|spec| spec.provider)
     }
 
     /// How the provider is named to people.
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Atlassian => "Atlassian (Jira and Confluence)",
-            Self::Slack => "Slack",
-            Self::Github => "GitHub",
-        }
+        registry().spec(self).label
     }
 
     /// The provider whose token a registry system uses.
     pub fn for_system(system: &str) -> Option<Self> {
-        match system {
-            "jira" | "confluence" => Some(Self::Atlassian),
-            "slack" => Some(Self::Slack),
-            _ => None,
-        }
+        registry().for_system(system).map(|spec| spec.provider)
     }
 }
 

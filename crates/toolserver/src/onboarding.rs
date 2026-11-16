@@ -789,7 +789,7 @@ impl Onboarding {
             }
         };
         // Their accounts and memory record go; the memory repo itself is theirs.
-        for provider in [Provider::Atlassian, Provider::Slack, Provider::Github] {
+        for provider in Provider::ALL {
             let unlinked = match &self.oauth {
                 Some(oauth) => oauth.unlink_account(handle, provider).await,
                 None => self.svc.stores().credentials.delete(handle, provider).await,
@@ -972,7 +972,10 @@ impl Onboarding {
                 "member": false,
                 "handle": null,
                 "admin": false,
-                "linked": {"atlassian": false, "slack": false, "github": false},
+                "linked": Provider::ALL
+                    .iter()
+                    .map(|p| (p.as_str().to_string(), json!(false)))
+                    .collect::<serde_json::Map<_, _>>(),
                 "memory_repo": null,
                 "personal_bot": null,
                 "pending_request": pending,
@@ -1007,11 +1010,10 @@ impl Onboarding {
             "member": true,
             "handle": handle,
             "admin": member.is_admin(),
-            "linked": {
-                "atlassian": linked.contains(&Provider::Atlassian),
-                "slack": linked.contains(&Provider::Slack),
-                "github": linked.contains(&Provider::Github),
-            },
+            "linked": Provider::ALL
+                .iter()
+                .map(|p| (p.as_str().to_string(), json!(linked.contains(p))))
+                .collect::<serde_json::Map<_, _>>(),
             "memory_repo": memory_repo,
             "personal_bot": personal_bot,
             "pending_request": null,

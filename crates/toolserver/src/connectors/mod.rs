@@ -16,6 +16,7 @@ pub mod docs;
 pub mod fake;
 pub mod format;
 pub mod http;
+pub mod registry;
 pub mod rollup;
 pub mod scope;
 pub mod slack;
