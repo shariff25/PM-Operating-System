@@ -26,7 +26,8 @@ pub struct Config {
     /// `PMOS_TOOLSERVER_URL`, default `http://127.0.0.1:8710`.
     pub toolserver_url: String,
     /// `PMOS_WEB_TOOLSERVER_TOKEN`: pmos-web's own tool server token (`PMOS_WEB_TOKEN`
-    /// there), which reaches only the approvals routes. Older deployments put the service
+    /// there), which reaches only the approvals routes and the read-only admin routes
+    /// (`GET /internal/admin/*`). Older deployments put the service
     /// token here. Required, at least 32 characters, and different from the runtime token.
     /// With a `web:toolserver` key in `PMOS_ASSERTION_KEYS`, calls for a PM also carry a
     /// signed user assertion.

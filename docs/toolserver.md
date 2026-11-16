@@ -149,13 +149,46 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `POST /internal/members/requests/{id}/decision` `{decision, decided_by, handle?, roles?}` | service or bot token | `approve` or `reject`, by an `admin` in `team.yaml` (`403 not_admin`). See **Members**. `200 {request}`; `409 already_decided` with `request`; `422 bad_handle`; `409 github_not_linked`, `no_push` or `not_configured` (still pending); `502 commit_failed` with `request` (now `failed`) |
 | `POST /internal/members/{handle}/remove` `{decided_by}` | service or bot token | Admin only; not oneself (`403 self_removal`). `200 {handle, commit}`, `404 not_a_member`, `409 owns_bots` if they still own a team bot |
 | `GET /internal/onboarding?user=` or `?slack_id=` | service or bot token | A PM's setup checklist: `member`, `handle`, `admin`, `linked` (`atlassian`, `slack`, `github`), `memory_repo`, `personal_bot` (in the loaded content), and for a non-member by Slack id, `pending_request` |
+| `GET /internal/admin/audit?user=&before=&limit=&actor=&action=&outcome=&from=&to=&purpose=` | service or web token | The whole audit log, newest first: `{events: [...], next}`. Needs the viewer `user` to have `view-audit-log` (`export-audit` with `purpose=export`). See **Admin reads** |
+| `GET /internal/admin/accounts?user=` | service or web token | `{linking, members: [{handle, accounts: {atlassian, slack, github}}]}`, booleans only. `view-audit-log` or `manage-members` |
+| `GET /internal/admin/connectors?user=` | service or web token | `{connectors: [{name, mode, health, error_class, checked_at}]}`, checked now. `manage-connectors` |
+| `GET /internal/admin/overview?user=` | service or web token | `{since, pending_drafts, approved, rejected, denied}`: pending items across the team now, audit outcomes over 7 days. `view-audit-log` or `manage-members` |
+
+### Admin reads
+
+`app/admin.rs`. The read-only routes behind `pmos-web`'s admin area and auditor view
+(`docs/web-api.md`, **Admin and auditor**). Only `GET`; only the service and web tokens (the
+bot and console tokens get `403`).
+
+- **The viewer is checked here.** Every call names its viewer as `user=` (else `400`), and the
+  viewer's roles in this server's `team.yaml` must grant the route's permission
+  (`pmos_contract::permissions`), else `403 {"code":"forbidden"}`, whatever the caller already
+  checked. With the web token, the user assertion must name that same person, as on the
+  approvals routes (`PMOS_ASSERTION_MODE`).
+- **Metadata only.** An event is served as `{id, at, actor, client, action, system, target,
+  skill, bot, task_id, outcome, detail, sources, titled_sources}`: `sources` and
+  `titled_sources` are counts (titles can carry content), `target` is `output_ref`, and
+  `detail` only when it is one of the fixed notes this server writes itself (`safe_detail`);
+  a rejection's free text, a refusal's or connector's message is `null`. `args_hash` and the
+  source list are never served.
+- **Paging:** `limit` 1 to 1000 (default 100); `next` is an opaque cursor (`c1.` and base64url
+  of the last event's time and id), passed back as `before`. `400 bad_request` for a bad
+  parameter. `501 not_available` when the audit log can't be read back.
+- **Audited:** each call records `admin.audit`, `admin.audit_export`, `admin.accounts`,
+  `admin.connectors` or `admin.overview` with the viewer, the client, `run_id` `admin`, and
+  `ok` or `denied`; no query values.
+- Migration 0010 widens `audit_events.client`'s check to `web` and `console` (Postgres refused
+  events from those clients before) and indexes `(at, id)` for the search.
 
 **Who holds which token:**
 - **Service token** (`PMOS_SERVICE_TOKEN`): the orchestrator, the bot runtime and platform-owner tools. Every route, and the only token that starts bot sessions.
 - **Bot token** (`PMOS_BOT_TOKEN`): the Slack bot. Only sessions for the skills in `PMOS_BOT_SKILLS` and calls within them, plus reading and deciding one approval item (`GET /internal/approvals/{id}` and its `decision`), for Slack approval cards, the onboarding routes, `GET /internal/ledger` for the daily triage digest, and for the App Home (`docs/slack-home.md`) a team member's pending items (`GET /internal/approvals?user=`) and unlinking a team member's account (`DELETE /internal/credentials/{user}/{provider}`). A session started for another skill, or any bot session, looks to the bot like one that doesn't exist, and every other route (the ledger summary among them) returns `403`.
 - **Web token** (`PMOS_WEB_TOKEN`) and **console token** (`PMOS_CONSOLE_TOKEN`): `pmos-web` and
   the console, which act for a signed-in person. Only the four approvals routes above (list,
-  one item, sources, decision); every other route is `403`. The audit records them as `web` and
+  one item, sources, decision), and for the web token also the four read-only
+  `GET /internal/admin/*` routes (which check the viewer's role themselves); every other
+  route (sessions, grants, calls, account linking, credentials, the ledger, reindexing,
+  onboarding) is `403`. The audit records them as `web` and
   `console`. Older deployments gave both the service token; `deploy/setup.sh` now generates
   their own.
 - **Session token:** each sandbox gets only its own.
@@ -832,7 +865,7 @@ cargo run -p pmos-toolserver
 | `PMOS_SERVICE_TOKEN` | required | The orchestrator's token. At least 32 characters |
 | `PMOS_BOT_TOKEN` | none | The Slack bot's own token: at least 32 characters and different from the service token |
 | `PMOS_BOT_SKILLS` | `docs` | Skills the bot may start sessions for |
-| `PMOS_WEB_TOKEN`, `PMOS_CONSOLE_TOKEN` | none | `pmos-web`'s and the console's own tokens, for the approvals routes only. At least 32 characters, each different from every other token |
+| `PMOS_WEB_TOKEN`, `PMOS_CONSOLE_TOKEN` | none | `pmos-web`'s and the console's own tokens, for the approvals routes only (and for `pmos-web`, the read-only admin routes). At least 32 characters, each different from every other token |
 | `PMOS_ASSERTION_MODE` | `off` | `off`, `verify` or `require`: see **Approvals auth: user assertions**. `verify` and `require` refuse to start without keys |
 | `PMOS_ASSERTION_KEYS` | none | `web:toolserver:<kid>:<base64>[:<kid>:<base64>],console:toolserver:…` (`docs/user-assertion.md`, Keys). A malformed list, a key under 32 bytes, or another service's pair refuses to start, in every mode |
 | `PMOS_CONNECTORS` | required | `live` for real Atlassian and Slack with each PM's own token, and only people in `team.yaml` may have sessions; `fake` for fixture data (dev, tests, and everything before Gate 1), with `team.yaml` not enforced |

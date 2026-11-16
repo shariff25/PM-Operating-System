@@ -31,7 +31,9 @@ use crate::approvals::{
     args_hash, redact_args, reply_message, reply_thread, ApprovalItem, ApprovalRepo, DecideError,
     Decision, Drafted, NewItem, Status, Verdict, GRANT_TTL_MINUTES, REPLY_TOOL,
 };
-use crate::audit::{AuditEvent, AuditSink, ReadEvent};
+use crate::audit::{
+    AuditEvent, AuditQuery, AuditSink, Client as AuditClient, Outcome, ReadEvent, StoredEvent,
+};
 use crate::context::{
     query_terms, snippet, ContextDoc, ContextIndex, Hit, ReindexReport, SearchResults,
 };
@@ -939,6 +941,85 @@ impl AuditSink for PgStore {
             });
         }
         Ok(Some(out))
+    }
+
+    async fn search(&self, query: &AuditQuery) -> StoreResult<Option<Vec<StoredEvent>>> {
+        // `audit_events_at` covers the order and the cursor.
+        let rows = sqlx::query(
+            "SELECT id, at, run_id, user_handle, skill, bot, tool, outcome, sources, args_hash,
+                    output_ref, detail, client, source_titles
+             FROM audit_events
+             WHERE ($1::timestamptz IS NULL OR (at, id) < ($1, $2))
+               AND ($3::text IS NULL OR user_handle = $3)
+               AND ($4::text IS NULL OR tool = $4)
+               AND ($5::text IS NULL OR outcome = $5)
+               AND ($6::timestamptz IS NULL OR at >= $6)
+               AND ($7::timestamptz IS NULL OR at < $7)
+             ORDER BY at DESC, id DESC
+             LIMIT $8",
+        )
+        .bind(query.before.map(|c| c.at))
+        .bind(query.before.map(|c| c.id).unwrap_or_default())
+        .bind(&query.actor)
+        .bind(&query.action)
+        .bind(query.outcome.map(Outcome::as_str))
+        .bind(query.from)
+        .bind(query.to)
+        .bind(i64::try_from(query.bounded_limit()).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let outcome: String = r.try_get("outcome")?;
+            let client: String = r.try_get("client")?;
+            out.push(StoredEvent {
+                id: r.try_get("id")?,
+                event: AuditEvent {
+                    at: r.try_get("at")?,
+                    client: AuditClient::parse(&client)
+                        .ok_or_else(|| bad_row("client", &client))?,
+                    run_id: r.try_get("run_id")?,
+                    user: r.try_get("user_handle")?,
+                    skill: r.try_get("skill")?,
+                    bot: r.try_get("bot")?,
+                    tool: r.try_get("tool")?,
+                    outcome: Outcome::parse(&outcome)
+                        .ok_or_else(|| bad_row("outcome", &outcome))?,
+                    sources: r.try_get("sources")?,
+                    source_titles: r
+                        .try_get::<Option<sqlx::types::Json<BTreeMap<String, String>>>, _>(
+                            "source_titles",
+                        )?
+                        .map(|j| j.0)
+                        .unwrap_or_default(),
+                    args_hash: r.try_get("args_hash")?,
+                    output_ref: r.try_get("output_ref")?,
+                    detail: r.try_get("detail")?,
+                },
+            });
+        }
+        Ok(Some(out))
+    }
+
+    async fn count_outcomes(
+        &self,
+        since: DateTime<Utc>,
+    ) -> StoreResult<Option<BTreeMap<Outcome, u64>>> {
+        let rows = sqlx::query(
+            "SELECT outcome, count(*) AS n FROM audit_events WHERE at >= $1 GROUP BY outcome",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut counts = BTreeMap::new();
+        for r in &rows {
+            let outcome: String = r.try_get("outcome")?;
+            let n: i64 = r.try_get("n")?;
+            if let Some(o) = Outcome::parse(&outcome) {
+                counts.insert(o, u64::try_from(n).unwrap_or_default());
+            }
+        }
+        Ok(Some(counts))
     }
 }
 
