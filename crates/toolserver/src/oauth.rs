@@ -37,6 +37,7 @@ fn linkable(user: &str) -> bool {
 }
 use crate::store::{StoreError, StoreResult};
 use crate::team::Team;
+use crate::connectors::registry::{link_statuses, registry, LinkStatus};
 use crate::vault::{Credential, CredentialInfo, Provider, Secret, Vault};
 
 /// How long a `state` value is accepted.
@@ -209,6 +210,29 @@ impl OAuth {
         .ok_or(OAuthError::NotConfigured(provider))
     }
 
+    /// The scopes PM OS requests from `provider` now (empty when it is not configured or has
+    /// no scope list, as for a GitHub App). Not secret.
+    pub fn requested_scopes(&self, provider: Provider) -> Vec<String> {
+        match provider {
+            Provider::Atlassian => self.config.atlassian.as_ref(),
+            Provider::Slack => self.config.slack.as_ref(),
+            Provider::Github => None,
+        }
+        .map(|a| a.scopes.clone())
+        .unwrap_or_default()
+    }
+
+    /// Where each registered provider stands for `user`, with granted scopes and any requested
+    /// scope that was not granted. Read-only; no tokens.
+    pub async fn link_statuses(
+        &self,
+        user: &str,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Vec<LinkStatus>> {
+        let linked = self.vault.list(user).await?;
+        Ok(link_statuses(&linked, now, |p| self.requested_scopes(p)))
+    }
+
     pub fn redirect_uri(&self, provider: Provider) -> String {
         format!(
             "{}/oauth/{provider}/callback",
@@ -276,7 +300,7 @@ impl OAuth {
         now: DateTime<Utc>,
     ) -> Result<String, OAuthError> {
         // GitHub serves PMs only: a team bot has no memory and commits nothing.
-        if !linkable(user) || (provider == Provider::Github && is_bot_identity(user)) {
+        if !linkable(user) || (!registry().spec(provider).team_bots && is_bot_identity(user)) {
             return Err(OAuthError::InvalidUser);
         }
         let app = self.app(provider)?;
