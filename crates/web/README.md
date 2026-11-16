@@ -29,7 +29,7 @@ cargo run -p pmos-web
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | |
 | `PMOS_WEB_TOOLSERVER_TOKEN` | required | The tool server's `PMOS_SERVICE_TOKEN`. At least 32 characters, different from the runtime token |
 | `PMOS_CONTENT_ROOT` | `content` | Where `team.yaml` is. The server won't start if it doesn't parse |
-| `PMOS_WEB_STATIC_DIR` | none | The built web app. Must contain `index.html`, served for any unknown non-`/api` path |
+| `PMOS_WEB_STATIC_DIR` | none | The built web app. Must contain `index.html`, served for any unknown non-`/api` path that isn't an asset; the icon is `favicon.svg` (or `favicon.ico`) here |
 | `PMOS_WEB_PUBLIC_URL` | none | The origin browsers use. Writes must come from it; without it, `Origin` must match `Host` |
 | `PMOS_WEB_SESSION_IDLE_MINUTES` | `480` | Idle expiry |
 | `PMOS_WEB_SESSION_MAX_MINUTES` | `1440` | Absolute expiry from sign-in |
@@ -68,7 +68,11 @@ answer, errors included, is `Cache-Control: no-store` with a CSP that loads noth
 app's files get `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self';
 font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self';
 frame-ancestors 'none'`: no inline script or style, no `data:` or remote images.
-`index.html` is `no-cache`.
+`index.html` is `no-cache`; `favicon.svg` and `favicon.ico` (the icon must be a file: the
+policy allows no `data:` image) are `public, max-age=604800`; other files five minutes. A
+missing file with an asset extension (`.svg`, `.js`, `.css`, …) is a `404`, not
+`index.html`. Under `/api`, an unknown path is always a JSON `404 not_found` and a known
+path with another method a JSON `405 method_not_allowed`.
 
 ## How the contract maps upstream
 
@@ -86,9 +90,28 @@ frame-ancestors 'none'`: no inline script or style, no `data:` or remote images.
   `GET /internal/approvals/{id}/sources?user=<handle>`, called only after the ownership
   check. Each becomes `{id: "s1"…, system, title, url, excerpt: null}`: `url` only if
   `https`, else `null` (context files have none; Jira and Confluence have none without a
-  linked Atlassian site); a title of at most 200 characters; at most 20. `excerpt` is always
-  `null`: nothing keeps source text to quote. If the call fails the draft still loads with
+  linked Atlassian site); a title of at most 200 characters; at most 20. The title is the
+  one the tool server recorded at the read (`PAY-212: Grace period`, a page title), or the
+  id for Slack and for reads before titles were recorded. `excerpt` is always `null`:
+  nothing keeps source text to quote. If the call fails the draft still loads with
   `sources: []`.
+- **Body repair, for display only.** A body with no real line break at all that contains
+  the two characters `\n` (a model that wrote its line breaks as JSON escapes: "…launch.\n\nSource:
+  PM-101") is shown with `\n` as a line break and `\t` as a tab (`drafts::display_body`).
+  What an approve sends is never changed by this: the `version` and an approve without an
+  edit use the item's own arguments, as the bot drafted them and as the tool server hashed
+  them. The trade-off: an unedited approve publishes the escapes the PM didn't see. We
+  accept that rather than send text that differs from the stored arguments without the
+  PM's edit; the app can offer "Save" (any `PUT`), after which the text the PM saw is the
+  text that is sent. A body with any real line break is left alone, since there `\n` is
+  more likely meant (a path, a regex, code).
+- **Task progress** (`src/progress.rs`): `events` are the runtime's `milestone` events only,
+  in order, each text once; `status` events (which name workers and hosts) and `checklist`
+  events never pass. `progress` is `{done, total}` from the task's `checklist`, else the
+  latest checklist event's "N of M done", else `null`. `retrying` is true while the task is
+  queued or working after a retry: `attempts` above 1, or the runtime's "interrupted by a
+  restart; retrying" event. The gateway's and the harness's own retries aren't reported to
+  the runtime, so they can't be shown.
 - **`version`** is the SHA-256 of the tool and the canonical JSON of what an approve would
   send now (the item's arguments with the saved edit applied; for a practice draft, its
   title and body). **Approve** takes an optional `version`: a different one is
@@ -119,19 +142,21 @@ frame-ancestors 'none'`: no inline script or style, no `data:` or remote images.
 
 ## Where the contract isn't met as written
 
-- **`name` in `Me`** is the handle: `team.yaml` has no display name. The user database will.
+- **`name` in `Me`** is the handle: a `team.yaml` member (`pmos_contract::model::TeamMember`)
+  has no display name field, and the name onboarding takes from Slack stays on the join
+  request and is not written to `team.yaml`. The user database will have one.
 - **Sources are what the audit log can identify** (`docs/toolserver.md`, **What an item is
-  shown with**): titles are ids for Jira, Confluence and Slack (`PAY-212`, `Confluence page
-  12345`, `Slack thread in C01`), not issue summaries or page titles, because the audit log
-  keeps ids only; `excerpt` is always `null`; `Source.url` can be `null`, which the contract
-  shows as a string.
+  shown with**): Jira, Confluence, docs and context titles are the ones recorded at the read;
+  Slack sources are always `Slack thread in C01` (no Slack text or title is recorded); reads
+  from before titles were recorded show ids (`PAY-212`, `Confluence page 12345`). `excerpt`
+  is always `null`; `Source.url` can be `null`, which the contract shows as a string.
 - **`external`** is known once the tool server has checked the channel's audience, which it
   does on an approve; it forgets that on restart. Before that a draft reads
   `external: false` and the approve answers `409 needs_external_confirm` as before.
 - **`target.url`** is `null` where no link can be built from ids: a Confluence or Jira
   target without a linked Atlassian site.
 - **Error codes added** beyond the contract: `bad_origin`, `bad_request`,
-  `bad_content_type` (`415`), `not_approvable`, `bad_edit`, `no_suggestion` (accepting
+  `bad_content_type` (`415`), `method_not_allowed` (`405`), `not_approvable`, `bad_edit`, `no_suggestion` (accepting
   before the text is ready), `audience_unavailable`, `task_refused`,
   `upstream_unavailable`, `team_unavailable`, `unavailable`. `stale` (`409`) is the
   contract's optional `version` check.
