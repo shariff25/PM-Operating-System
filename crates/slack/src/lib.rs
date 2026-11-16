@@ -35,6 +35,7 @@ pub mod bets_review;
 pub mod blocks;
 pub mod bots;
 pub mod bounded;
+pub mod brief;
 pub mod cards;
 pub mod commands;
 pub mod home;
