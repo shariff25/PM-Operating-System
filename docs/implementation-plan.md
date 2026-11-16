@@ -16,7 +16,7 @@ Decisions already made in this conversation:
   - memory as markdown in git (not Postgres);
   - a small PM-facing console (not admin pages only);
   - routines in Phase 1.
-- **The Slack bot is the interface** (decided 2026-11-14). PMs tag it in any thread, chat with it in Slack's assistant panel, run skills with slash commands, and approve in Slack. There is no web workspace. Platform-owner PMs get a few small admin pages (audit search, sandbox policies, usage) and the `pmos` CLI. See **Interface: the PM OS Slack bot** below.
+- **The Slack bot is the interface** (decided 2026-11-14; reopened 2026-11-16). PMs tag it in any thread, chat with it in Slack's assistant panel, run skills with slash commands, and approve in Slack. The 2026-11-14 line "There is no web workspace" is superseded: on 2026-11-16 the product owner decided to build a full web client (a TypeScript single-page app in the pnpm workspace). See [`web-client.md`](web-client.md) for the decisions, roles, phases (Web 1 to Web 4) and open questions. Platform-owner PMs get a few small admin pages (audit search, sandbox policies, usage) and the `pmos` CLI. See **Interface: the PM OS Slack bot** below.
 
 ## Architecture
 ```
@@ -76,13 +76,15 @@ when they click.
 - **Connection:** Socket Mode, so the Spark needs no inbound connection from Slack. The OAuth callback only needs to be reachable from PMs' browsers on the internal network.
 
 ### Where each web-workspace requirement now lives
+Reopened 2026-11-16: the web workspace is being built as the web client ([`web-client.md`](web-client.md)). The rows below are the record of what the Slack-side design covers, and the web client's own phases decide how the WEB and SUR rows are built.
+
 | PRD requirement | Now |
 | --- | --- |
 | WEB-1 chat home | Assistant panel and DM |
 | WEB-2 approval cards inline | Ephemeral answer with buttons; DM review cards; Inbox tab |
 | WEB-3 plain request suggests a skill | Suggested prompts and skill buttons on the answer |
 | WEB-4 chats per user, deletable, logged | Assistant threads are per user. `/pmos forget` deletes PM OS's own copy; Slack's copy follows the workspace retention policy. Every turn is still audited (ADM-2). |
-| SUR-3 web workspace | Replaced by the bot, App Home and the admin pages |
+| SUR-3 web workspace | Reopened 2026-11-16 (was "replaced by the bot, App Home and the admin pages"). Being built as the web client, Web 1 to Web 4, in [`web-client.md`](web-client.md). |
 | SLK-10 inbox view | App Home Inbox tab |
 | SKL-3 catalog | App Home Skills tab; publishing stays by pull request (SKL-4) |
 | REV-3 accept or dismiss reviewer comments | Buttons on each `/review` finding |
@@ -195,7 +197,7 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
 
 ### Phase 3: Expand (week 13 on)
 - Readers: PMM, SEs and engineering leads can tag the bot for context-library answers, read-only.
-- A web workspace, only if the pilot shows PMs want one.
+- The web client, now decided (2026-11-16) rather than waiting for the pilot. Its phases are Web 1 to Web 4 in [`web-client.md`](web-client.md), not these phases.
 - More connectors.
 - Context-update pull requests proposed from calls (CTX-5).
 - Skill chaining (SKL-6).
