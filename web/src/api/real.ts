@@ -1,6 +1,6 @@
 import { copy } from '../copy';
 import { ApiError } from './types';
-import type { Api, Brief, Draft, DraftSummary, HintName, Me, RejectReason, Suggestion, Task } from './types';
+import type { Api, AuthProvider, Brief, Draft, DraftSummary, HintName, Me, RejectReason, Suggestion, Task } from './types';
 
 export interface RealOptions {
   /** Called on any 401: the app goes back to sign-in. */
@@ -60,6 +60,7 @@ export function createRealClient(opts: RealOptions = {}): Api {
   const post = <T>(path: string, body?: unknown) => call<T>('POST', path, body ?? undefined);
 
   return {
+    providers: async () => (await call<{ providers: AuthProvider[] }>('GET', '/auth/providers')).providers,
     devLogin: (handle) => post<void>('/auth/dev-login', { handle }),
     logout: async () => {
       await post<void>('/auth/logout');
