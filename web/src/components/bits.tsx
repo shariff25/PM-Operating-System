@@ -196,6 +196,23 @@ export function TaskPill({ status }: { status: TaskStatus }) {
   );
 }
 
+/** Slack gets violet; every other system (Jira, Confluence, docs) gets the system blue. */
+export function systemTone(system: string): 'slack' | 'sys' {
+  return system.toLowerCase().includes('slack') ? 'slack' : 'sys';
+}
+
+/** A short mono label for the system a draft goes to or a source came from. */
+export function SystemTag({ system, label }: { system: string; label: string }) {
+  return <span className={`sys-tag sys-tag-${systemTone(system)}`}>{label}</span>;
+}
+
+/** The system a draft kind belongs to, for its tag. */
+export function kindSystem(kind: string): string {
+  if (kind === 'confluence_page') return 'Confluence';
+  if (kind === 'jira_issue') return 'Jira';
+  return 'Slack';
+}
+
 export function initials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   const first = parts[0]?.[0] ?? '?';
@@ -259,10 +276,11 @@ export function NewRequestButton() {
 }
 
 /** The page heading block every top-level page starts with. */
-export function PageHeader({ title, lede, children }: { title: string; lede?: string; children?: ReactNode }) {
+export function PageHeader({ title, lede, eyebrow, children }: { title: string; lede?: string; eyebrow?: string; children?: ReactNode }) {
   return (
     <header className="page-head">
-      <div>
+      <div className="page-head-text">
+        {eyebrow && <p className="eyebrow">{eyebrow}</p>}
         <h1>{title}</h1>
         {lede && <p className="lede">{lede}</p>}
       </div>
