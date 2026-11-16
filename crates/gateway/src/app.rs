@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 use crate::anthropic;
 use crate::config::{Client, Models, Role, UpstreamKind};
 use crate::remote::{StreamScanner, ToolCallExtras};
+use crate::retry::RetryPolicy;
 use crate::scheduler::{Permit, Priority, Scheduler};
 use crate::usage::{UsageEvent, UsageLog};
 use crate::{stub, workarounds};
@@ -47,9 +48,12 @@ pub struct GatewayConfig {
     pub anthropic_key: String,
     /// The bearer key for testing-only remote OpenAI-compatible roles; unused otherwise.
     pub remote_key: String,
+    /// How a `429`/`503` from an upstream is retried (`retry.rs`).
+    pub retry: RetryPolicy,
 }
 
 struct Inner {
+    retry: RetryPolicy,
     models: Models,
     clients: Vec<Client>,
     usage: Arc<UsageLog>,
@@ -112,6 +116,7 @@ pub fn router(cfg: GatewayConfig) -> Router {
         workarounds_on: cfg.workarounds_on,
         anthropic_key: cfg.anthropic_key,
         remote_key: cfg.remote_key,
+        retry: cfg.retry,
         extras: Arc::default(),
     }));
     let v1 = Router::new()
@@ -305,6 +310,20 @@ fn caller(headers: &HeaderMap) -> Result<Caller, String> {
     })
 }
 
+/// What one try at the upstream came to.
+enum Attempt {
+    /// An answer to use (success, or an error that retrying wouldn't change).
+    Live(reqwest::Response),
+    /// A `429`/`503`, read in full so its `Retry-After` and error body can be judged.
+    Failed {
+        status: u16,
+        headers: HeaderMap,
+        body: Bytes,
+    },
+    /// No answer at all.
+    Down(reqwest::Error),
+}
+
 /// Logs the event when a streamed answer ends (finished or the caller hung up), and holds the
 /// slot until then.
 struct StreamEnd {
@@ -389,6 +408,9 @@ async fn forward(
         stream,
         stub: inner.stub,
         status: 200,
+        attempt: 1,
+        attempts: 1,
+        retrying: false,
         queue_ms: started.elapsed().as_millis() as u64,
         latency_ms: 0,
         prompt_tokens: None,
@@ -428,30 +450,125 @@ async fn forward(
 
     let url = format!("{}/{}", role.upstream, endpoint.path());
     let remote = role.kind == UpstreamKind::RemoteOpenAi;
-    let upstream_req = if remote {
+    if remote {
         let restored = inner.extras.restore(&role.upstream, &mut req);
         if restored > 0 {
             tracing::debug!(role = %role.alias(), restored, "restored tool-call extra_content");
         }
+    }
+
+    // Try the upstream, retrying a 429/503 or a failed connection within the policy's limits
+    // (`retry.rs`). Each failed attempt that will be retried gets its own usage line, and the
+    // slot is given back while waiting so retries don't hold up the queue; the same priority
+    // takes it again afterwards. A streamed answer is only ever retried here, before any byte
+    // of it has gone to the caller.
+    let mut permit = Some(permit);
+    let first_attempt = Instant::now();
+    let mut attempt = 0u32;
+    let outcome = loop {
+        attempt += 1;
+        let post = inner.http.post(&url);
         // The client's own gateway token never goes upstream; the remote key does.
-        inner.http.post(&url).bearer_auth(&inner.remote_key)
-    } else {
-        inner.http.post(&url)
+        let post = if remote {
+            post.bearer_auth(&inner.remote_key)
+        } else {
+            post
+        };
+        let this = match post.json(&req).send().await {
+            Ok(r) if !crate::retry::is_retryable_status(r.status().as_u16()) => Attempt::Live(r),
+            Ok(r) => {
+                let status = r.status().as_u16();
+                let headers = r.headers().clone();
+                let body = r.bytes().await.unwrap_or_default();
+                Attempt::Failed {
+                    status,
+                    headers,
+                    body,
+                }
+            }
+            Err(e) => Attempt::Down(e),
+        };
+        let (status, headers, body) = match &this {
+            Attempt::Live(_) => break this,
+            Attempt::Failed {
+                status,
+                headers,
+                body,
+            } => (*status, headers.clone(), body.clone()),
+            Attempt::Down(e) if e.is_connect() => (0, HeaderMap::new(), Bytes::new()),
+            Attempt::Down(_) => break this,
+        };
+        let Some(wait) =
+            inner
+                .retry
+                .next_delay(attempt, status, &headers, &body, first_attempt.elapsed())
+        else {
+            break this;
+        };
+        tracing::warn!(
+            upstream = %role.upstream, status, attempt, wait_ms = wait.as_millis() as u64,
+            "model server refused or was unreachable; retrying"
+        );
+        let mut line = event.clone();
+        line.status = if status == 0 { 502 } else { status };
+        line.attempt = attempt;
+        line.attempts = attempt;
+        line.retrying = true;
+        line.latency_ms = first_attempt.elapsed().as_millis() as u64;
+        inner.usage.record(line);
+        drop(permit.take());
+        tokio::time::sleep(wait).await;
+        let waited = Instant::now();
+        match inner.sched.acquire(&queue_key, who.priority).await {
+            Ok(p) => permit = Some(p),
+            // No room to wait again: the caller gets what the upstream last said.
+            Err(_) => break this,
+        }
+        event.queue_ms += waited.elapsed().as_millis() as u64;
     };
-    let res = match upstream_req.json(&req).send().await {
-        Ok(r) => r,
-        Err(e) => {
+    event.attempt = attempt;
+    event.attempts = attempt;
+    let finish = |res: Response| {
+        let mut res = finish(res);
+        res.headers_mut()
+            .insert("x-pmos-upstream-attempts", HeaderValue::from(attempt));
+        res
+    };
+    let res = match outcome {
+        Attempt::Live(r) => r,
+        Attempt::Failed {
+            status,
+            headers,
+            body,
+        } => {
+            // Out of retries: the upstream's own answer, as it would have been without them.
+            event.status = status;
+            event.latency_ms = started.elapsed().as_millis() as u64;
+            inner.usage.record(event);
+            let mut res = (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response();
+            if let Some(v) = headers.get(header::RETRY_AFTER) {
+                res.headers_mut().insert(header::RETRY_AFTER, v.clone());
+            }
+            return finish(res);
+        }
+        Attempt::Down(e) => {
             tracing::warn!(upstream = %role.upstream, error = %e, "model server unreachable");
             event.status = 502;
             event.latency_ms = started.elapsed().as_millis() as u64;
             inner.usage.record(event);
-            return error(
+            return finish(error(
                 StatusCode::BAD_GATEWAY,
                 "upstream_error",
                 format!("the `{}` model server is unavailable", role.name),
-            );
+            ));
         }
     };
+    let permit = permit.expect("a live answer holds its slot");
     let status = res.status();
     event.status = status.as_u16();
 

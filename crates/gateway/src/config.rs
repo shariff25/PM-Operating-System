@@ -330,6 +330,8 @@ pub struct Config {
     /// `PMOS_GATEWAY_REMOTE_KEY`: the bearer key for remote OpenAI-compatible test upstreams
     /// (`openai+https://…`). Required when a role uses one; empty otherwise.
     pub remote_key: String,
+    /// `PMOS_GATEWAY_RETRY_*`: how a `429`/`503` from the upstream is retried (`retry.rs`).
+    pub retry: crate::retry::RetryPolicy,
 }
 
 impl std::fmt::Debug for Config {
@@ -345,6 +347,7 @@ impl std::fmt::Debug for Config {
             .field("cloud_test", &self.cloud_test)
             .field("anthropic_key", &redacted(&self.anthropic_key))
             .field("remote_key", &redacted(&self.remote_key))
+            .field("retry", &self.retry)
             .finish()
     }
 }
@@ -384,6 +387,7 @@ impl Config {
             cloud_test: get("PMOS_GATEWAY_CLOUD_TEST").as_deref() == Some("1"),
             anthropic_key: get("PMOS_GATEWAY_ANTHROPIC_KEY").unwrap_or_default(),
             remote_key: get("PMOS_GATEWAY_REMOTE_KEY").unwrap_or_default(),
+            retry: crate::retry::RetryPolicy::from_lookup(&get)?,
         })
     }
 
