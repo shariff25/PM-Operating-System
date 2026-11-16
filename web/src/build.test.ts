@@ -42,6 +42,12 @@ describe('production build (review finding 3)', () => {
       const text = readFileSync(f, 'utf8');
       for (const marker of MOCK_MARKERS) expect(text, `${marker} in ${f}`).not.toContain(marker);
     }
+    // Geist and Geist Mono ship as files on this origin: no font host, no data: fonts.
+    const css = all.filter((f) => f.endsWith('.css')).map((f) => readFileSync(f, 'utf8')).join('\n');
+    expect(css).toContain('Geist Variable');
+    expect(css).toContain('Geist Mono Variable');
+    expect(css).not.toMatch(/url\(\s*['"]?(https?:|\/\/|data:)/);
+    expect(all.filter((f) => f.endsWith('.woff2')).length).toBeGreaterThan(0);
   }, 120_000);
 
   it('refuses to build with VITE_API=mock', async () => {

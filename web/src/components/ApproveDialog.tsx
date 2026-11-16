@@ -105,7 +105,7 @@ export function ApproveDialog(p: Props) {
           </div>
         )}
         {p.note}
-        <div className="row">
+        <div className="modal-actions">
           <button
             type="button"
             className="btn btn-primary"

@@ -63,6 +63,13 @@ export const copy = {
   // ---- Sign-in ----
   signIn: {
     title: 'Sign in to PM OS',
+    lede: 'Use your work account. You only see your own drafts and requests.',
+    tagline: 'Your product work, drafted and waiting for your yes.',
+    points: [
+      'Reads Jira, Confluence and Slack the way you would',
+      'Drafts pages, issues and replies with their sources',
+      'Nothing is sent anywhere until you approve it',
+    ],
     handleLabel: 'Your handle',
     handleHint: 'Development sign-in. Use the handle from team.yaml, such as ana.',
     submit: 'Sign in',
@@ -103,8 +110,8 @@ export const copy = {
   home: {
     askLabel: 'What do you need?',
     askPlaceholder: 'For example: draft a PRD for the grace period setting',
-    askButton: 'Ask',
-    asking: 'Asking…',
+    askButton: 'Send',
+    asking: 'Sending…',
     waitingOnYou: 'Waiting on you',
     youWaitOn: "You're waiting on",
     changed: 'Changed since yesterday',
@@ -171,7 +178,30 @@ export const copy = {
     practiceLabel: 'Practice draft',
     practiceNote: 'Nothing here is sent anywhere. Approving it creates nothing.',
     practiceDelete: 'Delete practice draft',
-    sourcesHeading: 'Sources',
+    sourcesHeading: 'What the bot read',
+    sourcesCount: (n: number) => `${n} ${n === 1 ? 'source' : 'sources'}`,
+    sourceNumber: (n: number) => `Source ${n}: `,
+    publishedAs: (name: string) => `under your name, ${name}`,
+    changeShort: 'Change',
+    suggestionBar: (instruction: string) => `Suggested change from your request: "${instruction}"`,
+    checklistHeading: 'Before you approve',
+    checklist: {
+      sources: (n: number) => `Reads from ${n} ${n === 1 ? 'source' : 'sources'}, listed on the right`,
+      sourcesPhone: (n: number) => `Reads from ${n} ${n === 1 ? 'source' : 'sources'}`,
+      noSources: 'No sources recorded',
+      internal: 'Not shared outside the company',
+      external: 'Goes to a channel shared outside the company',
+      suggestion: 'A suggested change is still open',
+      unsaved: 'You have changes that are not saved',
+      edited: 'You edited this draft',
+      expires: (left: string) => `Expires soon: ${left}`,
+      noExpiry: 'Does not expire',
+      stripped: (n: number) => `${n} hidden or stripped ${n === 1 ? 'part' : 'parts'} to read`,
+      practice: 'Practice draft: nothing is sent',
+      ok: 'Looks fine',
+      check: 'Check this',
+      info: 'Note',
+    },
     sourceOpen: 'Open in source',
     sourceNoLink: 'No link was recorded for this one.',
     sourceUnsafe: 'This address is not a web link, so it is shown as text only:',
@@ -197,7 +227,7 @@ export const copy = {
     diffShowRemoved: 'Show what was removed',
     diffHideRemoved: 'Hide what was removed',
     diffNoChange: 'This suggestion changes nothing.',
-    accept: 'Accept',
+    accept: 'Accept change',
     rejectSuggestion: 'Reject',
     suggestionFailed: (error: string) => `I could not make that change. ${error}`,
     suggestionFailedNext: 'Try asking in other words.',
@@ -298,7 +328,7 @@ export const copy = {
   // ---- App shell and navigation ----
   nav: {
     label: 'Main',
-    home: 'Home',
+    home: 'Today',
     drafts: 'Drafts',
     followups: 'Follow-ups',
     activity: 'Activity',
@@ -308,7 +338,10 @@ export const copy = {
     collapse: 'Collapse sidebar',
     expand: 'Expand sidebar',
     skip: 'Skip to content',
-    askButton: 'Ask PM OS',
+    askButton: 'Ask or jump to…',
+    admin: 'Admin',
+    connected: 'Connected',
+    railLabel: 'App',
     shortcutMac: '⌘K',
     shortcutOther: 'Ctrl K',
     back: 'Back',
@@ -380,10 +413,59 @@ export const copy = {
     summaryLabel: 'At a glance',
   },
 
+  // ---- Today (the home page) ----
+  today: {
+    /** "Three things need you." Numbers are words up to ten. */
+    needs: (n: number) => {
+      const words = ['Nothing', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'];
+      if (n <= 0) return 'Nothing needs you right now.';
+      if (n === 1) return 'One thing needs you.';
+      return `${n <= 10 ? words[n] : n} things need you.`;
+    },
+    briefReady: 'Your daily brief is in',
+    composerLabel: 'Ask PM OS',
+    readsFrom: 'Reads from',
+    systems: ['Jira', 'Confluence', 'Slack'],
+    nothingSent: 'Nothing is sent anywhere until you approve it.',
+    statsLabel: 'Today in numbers',
+    stats: {
+      drafts: 'Drafts to decide',
+      waiting: 'Waiting on you',
+      waitedOn: "You're waiting on",
+      changed: 'Changed overnight',
+      running: 'Running now',
+      done: 'Done today',
+    },
+    statSub: {
+      nextExpiry: (left: string) => `Next one: ${left}`,
+      noExpiry: 'None of them expire',
+      allDecided: 'All decided',
+      oldest: (age: string) => `Oldest: ${age}`,
+      nobody: 'Nobody',
+      quiet: 'A quiet night',
+      bySystem: (parts: string[]) => parts.join(', '),
+      inSystem: (n: number, system: string) => `${n} in ${system}`,
+      running: 'Requests still working',
+      nothingRunning: 'Nothing running',
+      done: 'Answers and drafts',
+      noneDone: 'Nothing finished yet',
+    },
+    decideHeading: 'Needs your decision',
+    allDrafts: 'All drafts',
+    review: 'Review',
+    working: (text: string) => `Working: ${text}`,
+    waitingHeading: 'Waiting on you',
+    changedHeading: 'What changed',
+    recentHeading: 'Recent activity',
+    allActivity: 'All activity',
+    allFollowups: 'All follow-ups',
+  },
+
   // ---- Drafts page ----
   draftsPage: {
     title: 'Drafts',
     lede: 'Everything I wrote for you. Nothing is sent until you approve it.',
+    countLine: (n: number) => `${n} to decide`,
     tabsLabel: 'Filter drafts',
     tabs: { pending: 'Needs you', approved: 'Approved', expired: 'Expired', all: 'All' },
     emptyPending: 'Nothing needs a decision. Suspiciously tidy.',
@@ -398,6 +480,7 @@ export const copy = {
     title: 'Follow-ups',
     emptyAll: 'No follow-ups. Nobody is waiting on you, and you are not waiting on anyone. Enjoy it.',
     lede: 'Who is waiting on you, and who you are waiting on, from the daily brief.',
+    countLine: 'From today\'s brief',
     from: (who: string) => `From ${who}`,
     age: (n: number) => (n === 0 ? 'Today' : n === 1 ? '1 day' : `${n} days`),
     columns: { who: 'Who', what: 'What', source: 'Source', age: 'Age' },
@@ -407,6 +490,8 @@ export const copy = {
   activity: {
     title: 'Activity',
     lede: 'Your recent requests to PM OS.',
+    countLine: (n: number) => `${n} ${n === 1 ? 'request' : 'requests'}`,
+    askedAt: (when: string) => `Asked ${when}`,
     empty: 'Nothing asked yet. I am ready when you are.',
     loading: 'Loading your requests…',
     status: {
