@@ -313,7 +313,14 @@ pub struct ToolService {
     invalid_drafts: Mutex<HashMap<DraftKey, (u32, DateTime<Utc>)>>,
     /// How long an undecided Slack draft waits, and a decided one keeps its text.
     slack_draft_ttl: Duration,
+    /// What the last audience check of each Slack draft found: by item id, the channel
+    /// checked and whether it is shared outside the company. In memory: a restart forgets
+    /// it, and an item reads without `external` until it is checked again.
+    audiences: Mutex<HashMap<String, (String, bool)>>,
 }
+
+/// The most audience results kept in memory; past it the oldest are forgotten all at once.
+const MAX_AUDIENCES: usize = 10_000;
 
 /// What one sweep of Slack drafts did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -359,6 +366,7 @@ impl ToolService {
             ledger_expire_days: DEFAULT_EXPIRE_DAYS,
             invalid_drafts: Mutex::default(),
             slack_draft_ttl: Duration::hours(DEFAULT_SLACK_DRAFT_TTL_HOURS),
+            audiences: Mutex::default(),
         })
     }
 
@@ -1314,6 +1322,196 @@ impl ToolService {
         self.stores.approvals.get(id).await
     }
 
+    // ----- what an approval item is shown with ------------------------------------------
+
+    /// The Atlassian site `user` (or, for a team bot's reads, its identity) linked, from the
+    /// stored credential's site fields: no token is unsealed and nothing is called.
+    async fn atlassian_site(&self, user: &str, bot: Option<&str>) -> Option<String> {
+        let mut who = vec![user.to_string()];
+        let team_bot = bot
+            .and_then(|b| self.roster().bot(b))
+            .filter(|(b, _)| b.scope == BotScope::Team);
+        if let Some((b, _)) = team_bot {
+            who.insert(0, bot_identity(&b.name));
+        }
+        for handle in who {
+            match self
+                .stores
+                .credentials
+                .get(&handle, crate::vault::Provider::Atlassian)
+                .await
+            {
+                Ok(Some(c)) => {
+                    if let Some(site) =
+                        crate::sources::site_url(c.site_url.as_deref(), c.cloud_id.as_deref())
+                    {
+                        return Some(site);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "credential store unavailable for a link"),
+            }
+        }
+        None
+    }
+
+    /// Remember what the audience check of `item` found for `channel`.
+    fn remember_audience(&self, item: &ApprovalItem, channel: &str, external: bool) {
+        let mut seen = self.audiences.lock().expect("audiences lock");
+        if seen.len() >= MAX_AUDIENCES && !seen.contains_key(&item.id) {
+            seen.clear();
+        }
+        seen.insert(item.id.clone(), (channel.to_string(), external));
+    }
+
+    /// Whether `item`'s channel is shared outside the company, if its audience has been
+    /// checked for the channel it now names.
+    pub fn external(&self, item: &ApprovalItem) -> Option<bool> {
+        let seen = self.audiences.lock().expect("audiences lock");
+        let (channel, external) = seen.get(&item.id)?;
+        (item.args["channel"].as_str() == Some(channel.as_str())).then_some(*external)
+    }
+
+    /// When a Slack draft expires (or expired), as `PMOS_SLACK_DRAFT_TTL_HOURS` sets it;
+    /// `None` for other items.
+    pub fn expires_at(&self, item: &ApprovalItem) -> Option<DateTime<Utc>> {
+        SLACK_DRAFT_TOOLS
+            .contains(&item.tool.as_str())
+            .then(|| item.created_at + self.slack_draft_ttl)
+    }
+
+    fn view(&self, item: &ApprovalItem, site: Option<&str>) -> Value {
+        let mut v = serde_json::to_value(item).unwrap_or_else(|_| json!({}));
+        if let Some(at) = self.expires_at(item) {
+            v["expires_at"] = json!(at);
+        }
+        if let Some(url) = crate::sources::target_url(&item.tool, &item.args, site) {
+            v["target_url"] = json!(url);
+        }
+        if let Some(external) = self.external(item) {
+            v["external"] = json!(external);
+        }
+        v
+    }
+
+    /// An approval item as the internal API answers it: the item, plus `expires_at` for a
+    /// Slack draft, `target_url` when a link can be built from its target ids, and
+    /// `external` once its Slack audience has been checked. Readers that don't know these
+    /// fields ignore them.
+    pub async fn approval_json(&self, item: &ApprovalItem) -> Value {
+        let site = if crate::sources::needs_site(&item.tool) {
+            self.atlassian_site(&item.user, None).await
+        } else {
+            None
+        };
+        self.view(item, site.as_deref())
+    }
+
+    /// [`ToolService::approval_json`] for a list, looking each user's site up once.
+    pub async fn approvals_json(&self, items: &[ApprovalItem]) -> Vec<Value> {
+        let mut sites: HashMap<String, Option<String>> = HashMap::new();
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let site = if crate::sources::needs_site(&item.tool) {
+                if !sites.contains_key(&item.user) {
+                    let site = self.atlassian_site(&item.user, None).await;
+                    sites.insert(item.user.clone(), site);
+                }
+                sites.get(&item.user).cloned().flatten()
+            } else {
+                None
+            };
+            out.push(self.view(item, site.as_deref()));
+        }
+        out
+    }
+
+    /// What the run that drafted `item` read before drafting it, from the audit log: each
+    /// source once, newest read first, at most [`crate::sources::MAX_SOURCES`]. Metadata
+    /// only (see `sources.rs`): no text, snippet or body is stored or returned.
+    pub async fn approval_sources(
+        &self,
+        item: &ApprovalItem,
+    ) -> Result<crate::sources::SourcesReport, StoreError> {
+        use crate::sources::{
+            describe, ApprovalSource, SourcesReport, MAX_READ_EVENTS, MAX_SOURCES,
+        };
+        let Some(events) = self
+            .stores
+            .audit
+            .reads(&item.user, &item.run_id, item.created_at, MAX_READ_EVENTS)
+            .await?
+        else {
+            return Ok(SourcesReport {
+                sources: Vec::new(),
+                available: false,
+                truncated: false,
+            });
+        };
+        let mut truncated = events.len() >= MAX_READ_EVENTS;
+        let mut site: Option<Option<String>> = None;
+        let mut seen = BTreeSet::new();
+        let mut sources = Vec::new();
+        'events: for event in &events {
+            let Some(spec) = self
+                .catalog
+                .tools()
+                .find(|t| t.name == event.tool && t.kind == ToolKind::Read)
+            else {
+                continue;
+            };
+            for entry in &event.sources {
+                let found = if spec.system == "context" {
+                    if !entry.starts_with("context/") || entry.contains("..") {
+                        continue;
+                    }
+                    let title = match self.stores.context.get(entry).await {
+                        Ok(Some(doc)) if !doc.title.trim().is_empty() => doc.title,
+                        _ => entry.clone(),
+                    };
+                    Some(("context".to_string(), entry.clone(), title, None))
+                } else {
+                    let Some(id) = entry.strip_prefix(&format!("{}:", spec.system)) else {
+                        continue;
+                    };
+                    if site.is_none() && matches!(spec.system.as_str(), "jira" | "confluence") {
+                        site = Some(self.atlassian_site(&item.user, item.bot.as_deref()).await);
+                    }
+                    describe(
+                        &spec.system,
+                        spec.action(),
+                        id,
+                        site.as_ref().and_then(|s| s.as_deref()),
+                    )
+                    .map(|(r, title, url)| (spec.system.clone(), r, title, url))
+                };
+                let Some((system, reference, title, url)) = found else {
+                    continue;
+                };
+                if !seen.insert((system.clone(), reference.clone())) {
+                    continue;
+                }
+                if sources.len() == MAX_SOURCES {
+                    truncated = true;
+                    break 'events;
+                }
+                sources.push(ApprovalSource {
+                    system,
+                    title,
+                    url,
+                    reference,
+                    tool: spec.name.clone(),
+                    read_at: event.at,
+                });
+            }
+        }
+        Ok(SourcesReport {
+            sources,
+            available: true,
+            truncated,
+        })
+    }
+
     // ----- the feedback ledger ------------------------------------------------------------
 
     /// Pending rows created before this are reported as expired.
@@ -1572,7 +1770,10 @@ impl ToolService {
             Err(e) => Err(e.to_string()),
         };
         let audience: Audience = match found {
-            Ok(audience) => audience,
+            Ok(audience) => {
+                self.remember_audience(item, channel, audience.external);
+                audience
+            }
             Err(why) => {
                 self.audit(event(
                     Outcome::Error,

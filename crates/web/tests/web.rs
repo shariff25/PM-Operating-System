@@ -289,6 +289,42 @@ async fn toolserver(
             list.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
             Json(json!({ "items": list })).into_response()
         }
+        // Like the tool server: only for the item's own user.
+        ("GET", ["internal", "approvals", id, "sources"]) => {
+            let user = query(&uri, "user").unwrap_or_default();
+            match up.find(id) {
+                Some(i) if i["sources_down"] == json!(true) => {
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+                Some(i) if i["user"] == json!(user) => {
+                    let sources = if *id == "apr_conf" {
+                        json!([
+                            {"system": "jira", "title": "PAY-212", "ref": "PAY-212",
+                             "url": "https://acme.atlassian.net/browse/PAY-212",
+                             "tool": "jira.read", "read_at": "2026-11-16T09:05:00Z"},
+                            {"system": "docs", "title": "grace period", "ref": "https://docs.example.com/grace.md",
+                             "url": "https://docs.example.com/grace.md",
+                             "tool": "docs.read", "read_at": "2026-11-16T09:04:00Z"},
+                            {"system": "slack", "title": "Slack thread in C01", "ref": "C01:1731.0002",
+                             "url": "javascript:alert(1)",
+                             "tool": "slack.read_thread", "read_at": "2026-11-16T09:03:00Z"},
+                            {"system": "context", "title": "Pricing principles",
+                             "ref": "context/products/pricing.md", "url": null,
+                             "tool": "context.read", "read_at": "2026-11-16T09:02:00Z"},
+                        ])
+                    } else {
+                        json!([])
+                    };
+                    Json(json!({"sources": sources, "available": true, "truncated": false}))
+                        .into_response()
+                }
+                _ => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "no such approval item"})),
+                )
+                    .into_response(),
+            }
+        }
         ("GET", ["internal", "approvals", id]) => match up.find(id) {
             Some(i) => Json(i).into_response(),
             None => (
@@ -323,6 +359,16 @@ async fn toolserver(
                     "apr_race" => {
                         // Decided in Slack a moment ago.
                         up.set(id, "status", json!("approved"));
+                        return (StatusCode::CONFLICT, Json(json!({"error": "not pending"})))
+                            .into_response();
+                    }
+                    "apr_dbl" => {
+                        // The same PM's other approve won a moment ago, with these args.
+                        up.set(id, "status", json!("approved"));
+                        up.set(id, "decided_by", req["decided_by"].clone());
+                        if decision == "edit" {
+                            up.set(id, "args", req["args"].clone());
+                        }
                         return (StatusCode::CONFLICT, Json(json!({"error": "not pending"})))
                             .into_response();
                     }
@@ -953,7 +999,11 @@ async fn reads_a_draft_and_hides_everyone_elses() {
         d["target"],
         json!({"system": "confluence", "label": "Space PM, under page 77", "url": null})
     );
-    assert_eq!(d["sources"], json!([]));
+    assert_eq!(d["sources"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        w.get(&b, "/api/drafts/apr_jira").await.body["sources"],
+        json!([])
+    );
     assert_eq!(d["result_url"], Value::Null);
     assert_eq!(d["external"], false);
     let done = w.get(&b, "/api/drafts/apr_done").await.body;
@@ -1011,13 +1061,12 @@ async fn approve_without_an_edit_sends_approve() {
         writes[0].body,
         json!({"decided_by": "ana", "decision": "approve"})
     );
-    // Once decided: approving again, or editing, is not_pending, and nothing more is sent.
-    assert_eq!(
-        w.post(&b, "/api/drafts/apr_jira/approve", json!({}))
-            .await
-            .code(),
-        "not_pending"
-    );
+    // Once approved: approving again is a retry that answers the approved draft and sends
+    // nothing; editing is not_pending.
+    let again = w.post(&b, "/api/drafts/apr_jira/approve", json!({})).await;
+    assert_eq!(again.status, StatusCode::OK, "{:?}", again.body);
+    assert_eq!(again.body["status"], "approved");
+    assert_eq!(w.tools.writes().len(), 1);
     let r = w
         .send(
             &b,
@@ -1343,14 +1392,21 @@ async fn practice_drafts_create_nothing_upstream() {
         .await;
     assert_eq!(r.body["status"], "approved");
     assert_eq!(r.body["result_url"], Value::Null);
+    assert_eq!(r.body["target"]["label"], "Practice only: nothing is sent");
+    // Approving again is a retry; rejecting once approved is not.
+    let again = w
+        .post(&b, &format!("/api/drafts/{id}/approve"), json!({}))
+        .await;
+    assert_eq!(again.body["status"], "approved");
     assert_eq!(
-        w.post(&b, &format!("/api/drafts/{id}/approve"), json!({}))
+        w.post(&b, &format!("/api/drafts/{id}/reject"), json!({}))
             .await
             .code(),
         "not_pending"
     );
-    // Nothing was written anywhere.
+    // Nothing was written anywhere, and the tool server never heard of it.
     assert!(w.tools.writes().is_empty() && w.runtime.writes().is_empty());
+    assert!(w.tools.calls().iter().all(|c| !c.uri.contains(&id)));
 
     // Another PM can't see it.
     let ben = w.login("ben").await;
@@ -1563,4 +1619,395 @@ async fn an_upstream_that_is_down_is_a_plain_502() {
     assert_eq!(r.status, StatusCode::BAD_GATEWAY);
     assert!(r.body["error"].as_str().unwrap().contains("bot runtime"));
     w.assert_no_tokens();
+}
+
+// What the draft was built from, and what the tool server knows about its target.
+
+#[tokio::test]
+async fn a_draft_shows_the_sources_the_tool_server_found_for_its_own_pm() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    let d = w.get(&b, "/api/drafts/apr_conf").await.body;
+    assert_eq!(
+        d["sources"],
+        json!([
+            {"id": "s1", "system": "jira", "title": "PAY-212",
+             "url": "https://acme.atlassian.net/browse/PAY-212", "excerpt": null},
+            {"id": "s2", "system": "docs", "title": "grace period",
+             "url": "https://docs.example.com/grace.md", "excerpt": null},
+            // A link that isn't https is dropped; the source stays.
+            {"id": "s3", "system": "slack", "title": "Slack thread in C01", "url": null,
+             "excerpt": null},
+            {"id": "s4", "system": "context", "title": "Pricing principles", "url": null,
+             "excerpt": null},
+        ])
+    );
+    // Asked for this PM's own item, with the service token, and only after the ownership
+    // check: someone else's draft never reaches the sources route.
+    let calls = w.tools.calls();
+    assert!(calls
+        .iter()
+        .any(|c| c.uri == "/internal/approvals/apr_conf/sources?user=ana"
+            && c.auth == format!("Bearer {TOOLS_TOKEN}")));
+    w.get(&b, "/api/drafts/apr_ben").await;
+    assert!(w
+        .tools
+        .calls()
+        .iter()
+        .all(|c| !c.uri.starts_with("/internal/approvals/apr_ben/sources")));
+    // Edits and approvals answer with the sources too.
+    let r = w
+        .send(
+            &b,
+            Method::PUT,
+            "/api/drafts/apr_conf",
+            Some(json!({"body": "x"})),
+        )
+        .await;
+    assert_eq!(r.body["sources"].as_array().unwrap().len(), 4);
+    w.assert_no_tokens();
+
+    // A tool server that can't say: the draft still loads, with no sources.
+    w.tools.set("apr_conf", "sources_down", json!(true));
+    let r = w.get(&b, "/api/drafts/apr_conf").await;
+    assert_eq!((r.status, &r.body["sources"]), (StatusCode::OK, &json!([])));
+    assert_eq!(r.body["body"], "x");
+}
+
+#[tokio::test]
+async fn expiry_links_and_the_audience_come_from_the_tool_server() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    // The tool server's own TTL (here 12 hours), link and audience result.
+    w.tools
+        .set("apr_slack", "expires_at", json!("2026-11-16T21:04:00Z"));
+    w.tools.set(
+        "apr_slack",
+        "target_url",
+        json!("https://slack.com/archives/C01/p17310002"),
+    );
+    w.tools.set("apr_ext", "external", json!(true));
+    let d = w.get(&b, "/api/drafts/apr_slack").await.body;
+    assert_eq!(d["expires_at"], "2026-11-16T21:04:00Z");
+    assert_eq!(
+        d["target"]["url"],
+        "https://slack.com/archives/C01/p17310002"
+    );
+    assert_eq!(d["external"], false);
+    let list = w.get(&b, "/api/drafts").await.body;
+    assert_eq!(list["drafts"][2]["expires_at"], "2026-11-16T21:04:00Z");
+    // Known before any approve: the app asks first.
+    assert_eq!(
+        w.get(&b, "/api/drafts/apr_ext").await.body["external"],
+        true
+    );
+    assert!(w.tools.writes().is_empty());
+    // A link that isn't https is never shown; a label is never the bot's text.
+    w.tools
+        .set("apr_jira", "target_url", json!("javascript:alert(1)"));
+    w.tools.set(
+        "apr_jira",
+        "args",
+        json!({"project": "PAY (approved by legal)", "issue_type": "Story", "summary": "x"}),
+    );
+    let d = w.get(&b, "/api/drafts/apr_jira").await.body;
+    assert_eq!(d["target"]["url"], Value::Null);
+    assert_eq!(
+        d["target"]["label"],
+        "Project an unrecognised project, a new Story"
+    );
+}
+
+#[tokio::test]
+async fn an_approve_of_a_changed_draft_is_stale() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    let seen = w.get(&b, "/api/drafts/apr_conf").await.body["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(seen.len(), 64);
+    // An edit in another tab changes the version.
+    let other_tab = w
+        .send(
+            &b,
+            Method::PUT,
+            "/api/drafts/apr_conf",
+            Some(json!({"body": "# PRD\nChanged elsewhere"})),
+        )
+        .await
+        .body;
+    let now = other_tab["version"].as_str().unwrap().to_string();
+    assert_ne!(seen, now);
+    let r = w
+        .post(&b, "/api/drafts/apr_conf/approve", json!({"version": seen}))
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    assert_eq!(r.code(), "stale");
+    assert!(w.tools.writes().is_empty(), "nothing was sent");
+    // So does a change at the tool server (the item's arguments).
+    let jira = w.get(&b, "/api/drafts/apr_jira").await.body["version"].clone();
+    w.tools.set(
+        "apr_jira",
+        "args",
+        json!({"project": "PAY", "issue_type": "Story", "summary": "Grace period",
+               "description": "Changed"}),
+    );
+    let r = w
+        .post(&b, "/api/drafts/apr_jira/approve", json!({"version": jira}))
+        .await;
+    assert_eq!(r.code(), "stale");
+    assert!(w.tools.writes().is_empty());
+    // With the version shown now, it goes, with the text that version is of.
+    let r = w
+        .post(&b, "/api/drafts/apr_conf/approve", json!({"version": now}))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(
+        w.tools.writes()[0].body["args"]["body"],
+        "# PRD\nChanged elsewhere"
+    );
+    // The approved draft keeps that version: what was published is what was seen.
+    assert_eq!(r.body["version"], json!(now));
+    // A practice draft checks it too.
+    let p = w.post(&b, "/api/drafts/practice", json!(null)).await.body;
+    let pid = p["id"].as_str().unwrap();
+    let r = w
+        .post(
+            &b,
+            &format!("/api/drafts/{pid}/approve"),
+            json!({"version": "0".repeat(64)}),
+        )
+        .await;
+    assert_eq!(r.code(), "stale");
+    let r = w
+        .post(
+            &b,
+            &format!("/api/drafts/{pid}/approve"),
+            json!({"version": p["version"]}),
+        )
+        .await;
+    assert_eq!(r.body["status"], "approved");
+}
+
+#[tokio::test]
+async fn approving_again_is_safe() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    let v = w.get(&b, "/api/drafts/apr_jira").await.body["version"].clone();
+    let first = w
+        .post(&b, "/api/drafts/apr_jira/approve", json!({"version": v}))
+        .await;
+    assert_eq!(first.body["status"], "approved");
+    // A retry after a lost answer: the approved draft, and no second write.
+    for _ in 0..2 {
+        let r = w
+            .post(&b, "/api/drafts/apr_jira/approve", json!({"version": v}))
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        assert_eq!(r.body["status"], "approved");
+        assert_eq!(r.body["result_url"], first.body["result_url"]);
+    }
+    assert_eq!(w.tools.writes().len(), 1);
+    // A retry naming other text than was published is not the same approval.
+    let r = w
+        .post(
+            &b,
+            "/api/drafts/apr_jira/approve",
+            json!({"version": "f".repeat(64)}),
+        )
+        .await;
+    assert_eq!(r.code(), "not_pending");
+
+    // Two approves at once: the other one won with the same text, so this one answers the
+    // approved draft too.
+    w.tools.data.lock().unwrap().push(item(
+        "apr_dbl",
+        "ana",
+        "jira.create_issue",
+        json!({"project": "PAY", "issue_type": "Task", "summary": "Twice"}),
+        "2026-11-16T09:07:00Z",
+    ));
+    w.send(
+        &b,
+        Method::PUT,
+        "/api/drafts/apr_dbl",
+        Some(json!({"title": "Twice, edited", "body": "Body"})),
+    )
+    .await;
+    let r = w.post(&b, "/api/drafts/apr_dbl/approve", json!({})).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.body["status"], "approved");
+    assert_eq!(r.body["title"], "Twice, edited");
+    // Decided by someone else's hand (in Slack, by another approver): not ours to answer.
+    let r = w.post(&b, "/api/drafts/apr_race/approve", json!({})).await;
+    assert_eq!(r.code(), "not_pending");
+}
+
+#[tokio::test]
+async fn every_response_carries_the_security_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("dist")).unwrap();
+    std::fs::write(dir.path().join("dist/index.html"), "<!doctype html>app").unwrap();
+    let w = web_with(|c| c.static_dir = Some(dir.path().join("dist"))).await;
+    let b = w.login("ana").await;
+    let api = [
+        w.get(&b, "/api/me").await,
+        w.get(&b, "/api/drafts/apr_conf").await,
+        w.get(&b, "/api/drafts/apr_ben").await,
+        w.get(&Browser::default(), "/api/me").await,
+        w.get(&b, "/api/nope").await,
+        w.post(&b, "/api/tasks", json!({"text": "hi"})).await,
+    ];
+    for r in &api {
+        assert_eq!(r.headers["x-content-type-options"], "nosniff");
+        assert_eq!(r.headers["referrer-policy"], "no-referrer");
+        assert_eq!(r.headers["x-frame-options"], "DENY");
+        assert_eq!(r.headers["cache-control"], "no-store", "{:?}", r.body);
+        assert_eq!(
+            r.headers["content-security-policy"],
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+        );
+    }
+    let html = w.get(&Browser::default(), "/drafts/apr_conf").await;
+    assert_eq!(html.status, StatusCode::OK);
+    assert_eq!(html.headers["content-type"], "text/html; charset=utf-8");
+    assert_eq!(html.headers["x-content-type-options"], "nosniff");
+    assert_eq!(html.headers["referrer-policy"], "no-referrer");
+    assert_eq!(html.headers["cache-control"], "no-cache");
+    let csp = html.headers["content-security-policy"].to_str().unwrap();
+    let directives: Vec<&str> = csp.split(';').map(str::trim).collect();
+    for d in [
+        "default-src 'self'",
+        "img-src 'self'",
+        "style-src 'self'",
+        "script-src 'self'",
+        "connect-src 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+        "base-uri 'none'",
+    ] {
+        assert!(directives.contains(&d), "{d} missing from {csp}");
+    }
+    assert!(!csp.contains("unsafe") && !csp.contains("data:") && !csp.contains("https:"));
+}
+
+#[tokio::test]
+async fn writes_must_be_json_including_sign_in() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    let raw = |path: &str, content_type: Option<&str>, body: &str, b: &Browser| {
+        let mut req = w
+            .http
+            .post(format!("{}{path}", w.base))
+            .body(body.to_string());
+        if let Some(c) = &b.cookie {
+            req = req.header("cookie", format!("__Host-pmos={c}"));
+        }
+        if let Some(t) = &b.csrf {
+            req = req.header("x-pmos-csrf", t);
+        }
+        if let Some(ct) = content_type {
+            req = req.header("content-type", ct);
+        }
+        req
+    };
+    // A cross-site form can send these without a preflight; none gets in.
+    for ct in [
+        Some("text/plain"),
+        Some("application/x-www-form-urlencoded"),
+        Some("multipart/form-data; boundary=x"),
+        None,
+    ] {
+        let res = raw("/api/tasks", ct, r#"{"text": "hi"}"#, &b)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct:?}");
+        assert_eq!(
+            res.headers()["cache-control"],
+            "no-store",
+            "an error is an /api answer too"
+        );
+        assert_eq!(
+            res.json::<Value>().await.unwrap()["code"],
+            "bad_content_type"
+        );
+        let res = raw(
+            "/api/auth/dev-login",
+            ct,
+            r#"{"handle": "ana"}"#,
+            &Browser::default(),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct:?}");
+        assert!(res.headers().get("set-cookie").is_none());
+    }
+    // Sign-in with no body at all still needs JSON.
+    let res = raw("/api/auth/dev-login", None, "", &Browser::default())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(w.runtime.writes().is_empty() && w.tools.writes().is_empty());
+    // JSON with a charset is JSON; a write with no body needs no type.
+    let res = raw(
+        "/api/tasks",
+        Some("application/json; charset=utf-8"),
+        r#"{"text": "hi"}"#,
+        &b,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let r = w.send(&b, Method::DELETE, "/api/me/hints", None).await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn practice_drafts_never_reach_the_tool_server() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    let p = w.post(&b, "/api/drafts/practice", json!(null)).await.body;
+    let id = p["id"].as_str().unwrap().to_string();
+    assert_eq!(p["target"]["label"], "Practice only: nothing is sent");
+    assert_eq!(p["sources"], json!([]));
+    assert_eq!(p["external"], false);
+    w.send(
+        &b,
+        Method::PUT,
+        &format!("/api/drafts/{id}"),
+        Some(json!({"body": "Edited practice"})),
+    )
+    .await;
+    let r = w
+        .post(
+            &b,
+            &format!("/api/drafts/{id}/approve"),
+            json!({"confirm_external": true}),
+        )
+        .await;
+    assert_eq!(r.body["status"], "approved");
+    assert_eq!(r.body["result_url"], Value::Null);
+    w.get(&b, &format!("/api/drafts/{id}")).await;
+    w.get(&b, &format!("/api/drafts/{id}/suggestion")).await;
+    // Not a single call upstream, read or write, for any of it.
+    assert!(w.tools.calls().is_empty(), "{:?}", w.tools.calls());
+    assert!(w.runtime.calls().is_empty());
+    // An item the tool server sends with a practice-looking id is never decided either.
+    w.tools.data.lock().unwrap().push(item(
+        "prc_fromupstream",
+        "ana",
+        "slack.send_message",
+        json!({"channel": "C01", "text": "x"}),
+        "2026-11-16T09:08:00Z",
+    ));
+    let r = w
+        .post(&b, "/api/drafts/prc_fromupstream/approve", json!({}))
+        .await;
+    assert_eq!(r.code(), "not_found");
+    assert!(w.tools.writes().is_empty());
 }

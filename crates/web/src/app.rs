@@ -59,10 +59,15 @@ pub const PASSED_THROUGH: [&str; 3] = ["needs_external_confirm", "audience_block
 
 /// The policy for `/api` responses: nothing to load, never framed.
 pub const API_CSP: &str = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'";
-/// The policy for the web app's own files.
+/// The policy for the web app's own files: only this origin's scripts, styles, images and
+/// fonts (no inline script or style, no `data:` images, no remote pixels), forms post only
+/// here, never framed, no `<base>`.
 pub const APP_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
-     img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; \
+     img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; \
      base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// What a state-changing request with a body must say it is.
+pub const JSON: &str = "application/json";
 
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
@@ -171,18 +176,26 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
         .route("/brief", get(brief))
         .route("/followups/{id}/dismiss", post(followup))
         .route("/followups/{id}/draft", post(followup))
-        .fallback(|| async { ApiError::not_found() });
+        .fallback(|| async { ApiError::not_found() })
+        .layer(axum::middleware::from_fn(require_json));
     Ok(Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .nest("/api", api)
         .fallback(static_files)
-        .layer(axum::middleware::map_response(security_headers))
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state))
 }
 
-/// Every response: no sniffing, no framing, no referrer to other sites; `/api` is never
-/// cached and has a policy that loads nothing.
-async fn security_headers(mut res: Response) -> Response {
+fn is_api(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/")
+}
+
+/// Every response: no sniffing, no framing, no referrer at all, its own browsing context.
+/// Every `/api` answer is `no-store` with a policy that loads nothing, whatever the handler
+/// set; the app's files keep the policy and caching `static_files` gives them.
+async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let api = is_api(req.uri().path());
+    let mut res = next.run(req).await;
     let h = res.headers_mut();
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -191,18 +204,67 @@ async fn security_headers(mut res: Response) -> Response {
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(
         header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(
+        "cross-origin-opener-policy",
         HeaderValue::from_static("same-origin"),
     );
-    if !h.contains_key(header::CACHE_CONTROL) {
+    if api {
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    }
-    if !h.contains_key(header::CONTENT_SECURITY_POLICY) {
         h.insert(
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_static(API_CSP),
         );
+    } else {
+        if !h.contains_key(header::CACHE_CONTROL) {
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
+        if !h.contains_key(header::CONTENT_SECURITY_POLICY) {
+            h.insert(
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static(API_CSP),
+            );
+        }
     }
     res
+}
+
+/// Is the request's `Content-Type` JSON (`application/json`, with any parameters)?
+fn is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case(JSON))
+}
+
+/// Does the request carry a body?
+fn has_body(headers: &HeaderMap) -> bool {
+    let length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    length.is_some_and(|n| n > 0) || headers.contains_key(header::TRANSFER_ENCODING)
+}
+
+fn bad_content_type() -> ApiError {
+    ApiError::new(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "bad_content_type",
+        "Send this as JSON (Content-Type: application/json).",
+    )
+}
+
+/// A state-changing request with a body must say it is JSON, so a cross-site HTML form
+/// (which can only send `text/plain`, form or multipart bodies without a preflight) can't
+/// reach a route. Checked before anything else, sign-in included.
+async fn require_json(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if is_write(req.method()) && has_body(req.headers()) && !is_json(req.headers()) {
+        tracing::warn!(path = %req.uri().path(), "refused a write that isn't JSON");
+        return bad_content_type().into_response();
+    }
+    next.run(req).await
 }
 
 // Errors.
@@ -472,6 +534,10 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
             "That request didn't come from PM OS.",
         ));
     }
+    // Login CSRF: a cross-site form can't send JSON, so sign-in always needs it.
+    if !is_json(&headers) {
+        return Err(bad_content_type());
+    }
     let req: DevLogin = parse(&body)?;
     let claimed = match provider
         .authenticate(&SignInInput::Dev { handle: req.handle })
@@ -636,7 +702,7 @@ async fn delete_hints(State(state): State<AppState>, signed: Signed) -> ApiResul
 /// A draft the PM may see: their practice draft or one of their approval items.
 enum Found {
     Practice(crate::settings::PracticeDraft),
-    Item(Approval),
+    Item(Box<Approval>),
 }
 
 async fn settings_of(state: &AppState, handle: &str) -> Result<UserState, ApiError> {
@@ -664,14 +730,47 @@ async fn find(state: &AppState, signed: &Signed, id: &str) -> Result<Found, ApiE
     if item.user != signed.handle() || drafts::kind(&item.tool).is_none() {
         return Err(ApiError::not_found());
     }
-    Ok(Found::Item(item))
+    Ok(Found::Item(Box::new(item)))
 }
 
-fn render(found: &Found, signed: &Signed, st: &UserState) -> Result<Draft, ApiError> {
+/// The draft without its sources (no upstream call).
+fn base_draft(found: &Found, signed: &Signed, st: &UserState) -> Result<Draft, ApiError> {
     match found {
         Found::Practice(p) => Ok(drafts::practice_draft(p, &signed.bot(), st)),
         Found::Item(item) => drafts::draft(item, st).ok_or_else(ApiError::not_found),
     }
+}
+
+/// The whole draft, with what the bot read for it. A practice draft has no sources and
+/// never reaches the tool server.
+async fn render(
+    state: &AppState,
+    found: &Found,
+    signed: &Signed,
+    st: &UserState,
+) -> Result<Draft, ApiError> {
+    match found {
+        Found::Practice(_) => base_draft(found, signed, st),
+        Found::Item(item) => item_draft(state, signed, item, st).await,
+    }
+}
+
+async fn item_draft(
+    state: &AppState,
+    signed: &Signed,
+    item: &Approval,
+    st: &UserState,
+) -> Result<Draft, ApiError> {
+    let mut draft = drafts::draft(item, st).ok_or_else(ApiError::not_found)?;
+    draft.sources = match state.0.toolserver.sources(&item.id, signed.handle()).await {
+        Ok(found) => drafts::sources(found),
+        // The draft is still shown; the app says it can't tell what the bot read.
+        Err(e) => {
+            tracing::warn!(error = ?e, draft = %item.id, "sources unavailable");
+            Vec::new()
+        }
+    };
+    Ok(draft)
 }
 
 fn is_pending(found: &Found) -> bool {
@@ -761,7 +860,7 @@ async fn get_draft(
         .update(signed.handle(), Box::new(|s| s.opened_a_draft = true))
         .await
         .map_err(ApiError::store)?;
-    Ok(draft_response(&render(&found, &signed, &st)?))
+    Ok(draft_response(&render(&state, &found, &signed, &st).await?))
 }
 
 #[derive(Deserialize)]
@@ -824,7 +923,7 @@ async fn put_draft(
         )
         .await
         .map_err(ApiError::store)?;
-    Ok(draft_response(&render(&found, &signed, &st)?))
+    Ok(draft_response(&render(&state, &found, &signed, &st).await?))
 }
 
 #[derive(Deserialize)]
@@ -852,7 +951,7 @@ async fn post_changes(
         return Err(ApiError::not_pending());
     }
     let st = settings_of(&state, signed.handle()).await?;
-    let current = render(&found, &signed, &st)?;
+    let current = base_draft(&found, &signed, &st)?;
 
     // Reserve the slot first, so two requests can't both start a change.
     let practice = matches!(found, Found::Practice(_));
@@ -1079,7 +1178,7 @@ async fn accept_suggestion(
         )
         .await
         .map_err(ApiError::store)?;
-    Ok(draft_response(&render(&found, &signed, &st)?))
+    Ok(draft_response(&render(&state, &found, &signed, &st).await?))
 }
 
 async fn reject_suggestion(
@@ -1101,22 +1200,48 @@ async fn reject_suggestion(
         )
         .await
         .map_err(ApiError::store)?;
-    Ok(draft_response(&render(&found, &signed, &st)?))
+    Ok(draft_response(&render(&state, &found, &signed, &st).await?))
 }
 
 #[derive(Deserialize, Default)]
 struct ApproveBody {
     #[serde(default)]
     confirm_external: bool,
+    /// The draft's `version` as the PM saw it. Optional; when sent, it must still be the
+    /// draft's version (`409 stale` otherwise).
+    #[serde(default)]
+    version: Option<String>,
 }
 
-/// Decide a practice draft: only here, nothing upstream.
+fn stale() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "stale",
+        "This draft changed since you opened it. Reload it and check the text before \
+         approving.",
+    )
+}
+
+/// Decide a practice draft: only here, nothing upstream. Approving one already approved
+/// answers it as it is (a retry), as for a real draft.
 async fn decide_practice(
     state: &AppState,
     signed: &Signed,
     p: &crate::settings::PracticeDraft,
     to: &'static str,
+    version: Option<&str>,
 ) -> ApiResult {
+    let st = settings_of(state, signed.handle()).await?;
+    if version.is_some_and(|v| v != drafts::practice_version(p, &st)) {
+        return Err(stale());
+    }
+    if p.status == to && to == "approved" {
+        return Ok(draft_response(&drafts::practice_draft(
+            p,
+            &signed.bot(),
+            &st,
+        )));
+    }
     if p.status != "pending" {
         return Err(ApiError::not_pending());
     }
@@ -1155,8 +1280,17 @@ async fn decided(state: &AppState, signed: &Signed, item: Approval) -> ApiResult
         .await
         .map_err(ApiError::store)?;
     Ok(draft_response(
-        &drafts::draft(&item, &st).ok_or_else(ApiError::not_found)?,
+        &item_draft(state, signed, &item, &st).await?,
     ))
+}
+
+/// Is `item` already approved by this PM with exactly the arguments of `version` (when
+/// given)? Then an approve is a retry: it answers the draft as it is and sends nothing.
+/// `executing` counts: the write is running.
+fn approved_as(item: &Approval, handle: &str, version: Option<&str>) -> bool {
+    matches!(item.status.as_str(), "executing" | "approved")
+        && item.decided_by.as_deref() == Some(handle)
+        && version.is_none_or(|v| v == drafts::args_version(&item.tool, &item.args))
 }
 
 /// A refused decision as the web app's error. The tool server's own `409` codes pass
@@ -1219,19 +1353,36 @@ async fn approve(
 ) -> ApiResult {
     signed.drafts()?;
     let req: ApproveBody = parse_optional(&body)?;
+    let version = req.version.as_deref();
     let item = match find(&state, &signed, &id).await? {
-        Found::Practice(p) => return decide_practice(&state, &signed, &p, "approved").await,
-        Found::Item(item) => item,
+        // Practice drafts are decided here and never reach the tool server.
+        Found::Practice(p) => {
+            return decide_practice(&state, &signed, &p, "approved", version).await
+        }
+        Found::Item(item) => *item,
     };
+    if drafts::is_practice_id(&item.id) {
+        // Never: practice ids are this server's own. Refused rather than sent upstream.
+        return Err(ApiError::not_found());
+    }
     if item.status != "pending" {
+        if approved_as(&item, signed.handle(), version) {
+            return decided(&state, &signed, item).await;
+        }
         return Err(ApiError::not_pending());
     }
     let st = settings_of(&state, signed.handle()).await?;
-    let edit = st.edits.get(&id);
+    // Exactly what the PM saw: the version is computed from the same arguments sent below.
+    let args = drafts::effective_args(&item, &st);
+    let current = drafts::args_version(&item.tool, &args);
+    if version.is_some_and(|v| v != current) {
+        return Err(stale());
+    }
+    let edited = st.edits.contains_key(&id);
     let decision = DecisionBody {
         decided_by: signed.handle().to_string(),
-        decision: if edit.is_some() { "edit" } else { "approve" },
-        args: edit.map(|e| drafts::edited_args(&item.tool, &item.args, e)),
+        decision: if edited { "edit" } else { "approve" },
+        args: edited.then_some(args),
         reason: None,
         confirm_external: req.confirm_external,
     };
@@ -1241,6 +1392,25 @@ async fn approve(
             decided(&state, &signed, item).await
         }
         Err(e) => {
+            // Two approves at once (a double click, a retry after a lost answer): the tool
+            // server lets exactly one decide. If that one approved what this one would have,
+            // this is the same approval, not a failure.
+            if matches!(
+                e,
+                UpstreamError::Refused {
+                    status: 409,
+                    code: None,
+                    ..
+                }
+            ) {
+                if let Ok(now_item) = state.0.toolserver.approval(&id).await {
+                    if now_item.user == signed.handle()
+                        && approved_as(&now_item, signed.handle(), Some(&current))
+                    {
+                        return decided(&state, &signed, now_item).await;
+                    }
+                }
+            }
             let err = refused_decision(&state, &id, e).await;
             if err.code == "needs_external_confirm" {
                 let key = id.clone();
@@ -1284,9 +1454,12 @@ async fn reject(
         }
     }
     let item = match find(&state, &signed, &id).await? {
-        Found::Practice(p) => return decide_practice(&state, &signed, &p, "rejected").await,
-        Found::Item(item) => item,
+        Found::Practice(p) => return decide_practice(&state, &signed, &p, "rejected", None).await,
+        Found::Item(item) => *item,
     };
+    if drafts::is_practice_id(&item.id) {
+        return Err(ApiError::not_found());
+    }
     if item.status != "pending" {
         return Err(ApiError::not_pending());
     }
