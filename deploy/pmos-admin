@@ -2,7 +2,7 @@
 # PM OS operations on the Spark, for platform-owner PMs (docs/runbooks/README.md).
 #
 #   pmos-admin build                  build the service and worker images on this machine
-#   pmos-admin up [--models] [--console] [--bringup]
+#   pmos-admin up [--models] [--console] [--web] [--bringup]
 #                                     start the stack (Slack joins when its tokens are set)
 #   pmos-admin down                   stop everything (data is kept)
 #   pmos-admin status                 is every service up and ready?
@@ -55,6 +55,17 @@ profiles() {
     case "$arg" in
       --models) p+=(--profile models) ;;
       --console) p+=(--profile console) ;;
+      --web)
+        if [ "${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}" != 1 ]; then
+          {
+            echo "the web app is off: it has only DEVELOPMENT sign-in (anyone who can reach it"
+            echo "signs in as any team member) until Entra sign-in is built. On a closed test"
+            echo "network only, set PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1 in"
+            echo "deploy/.env, then run this again (docs/web-app-running.md)."
+          } >&2
+          exit 2
+        fi
+        p+=(--profile web) ;;
       --bringup) p+=(--profile bringup) ;;
       *) say "unknown option $arg" >&2; exit 2 ;;
     esac
@@ -157,12 +168,12 @@ case "$cmd" in
     ;;
 
   down)
-    compose --profile slack --profile console --profile models --profile bringup down
+    compose --profile slack --profile console --profile web --profile models --profile bringup down
     ;;
 
   status)
     say "== containers"
-    compose --profile slack --profile console --profile models --profile bringup ps \
+    compose --profile slack --profile console --profile web --profile models --profile bringup ps \
       --format 'table {{.Service}}\t{{.Status}}'
     say "== readiness"
     check() { # name url
@@ -178,6 +189,9 @@ case "$cmd" in
     if compose --profile console ps --status running --services 2>/dev/null | grep -qx console; then
       check console http://127.0.0.1:8760/healthz
     fi
+    if compose --profile web ps --status running --services 2>/dev/null | grep -qx web; then
+      check web http://127.0.0.1:8770/healthz
+    fi
     if compose exec -T docs curl -fsS -m 5 http://127.0.0.1:8730/readyz >/dev/null 2>&1; then
       row docs ok "ready"
     else
@@ -189,12 +203,12 @@ case "$cmd" in
     [ $# -ge 1 ] || { say "usage: pmos-admin logs <service> [-f]" >&2; exit 2; }
     svc=$1
     shift
-    compose --profile slack --profile console --profile models --profile bringup logs --tail 200 "$@" "$svc"
+    compose --profile slack --profile console --profile web --profile models --profile bringup logs --tail 200 "$@" "$svc"
     ;;
 
   restart)
     [ $# -eq 1 ] || { say "usage: pmos-admin restart <service>" >&2; exit 2; }
-    compose --profile slack --profile console --profile models --profile bringup restart "$1"
+    compose --profile slack --profile console --profile web --profile models --profile bringup restart "$1"
     ;;
 
   backup)
@@ -220,7 +234,7 @@ case "$cmd" in
     say "This replaces every PM OS database with the backup in $dir."
     read -r -p "Type RESTORE to go on: " answer
     [ "$answer" = RESTORE ] || { say "stopped; nothing changed"; exit 1; }
-    compose --profile slack --profile console --profile bringup stop docs toolserver gateway bots slack console worker-docs 2>/dev/null || true
+    compose --profile slack --profile console --profile web --profile bringup stop docs toolserver gateway bots slack console web worker-docs 2>/dev/null || true
     compose up -d postgres
     until compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
     for db in toolserver bots docs; do
