@@ -14,6 +14,7 @@ pub mod anthropic;
 pub mod app;
 pub mod config;
 pub mod remote;
+pub mod retry;
 pub mod scheduler;
 pub mod stub;
 pub mod usage;

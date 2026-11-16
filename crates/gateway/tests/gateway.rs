@@ -132,6 +132,7 @@ async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_o
         workarounds_on,
         anthropic_key: "test-key".into(),
         remote_key: String::new(),
+        retry: Default::default(),
     });
     let (base, stop) = serve(app).await;
     Gw { base, usage, stop }
@@ -682,6 +683,7 @@ async fn the_claude_test_upstream_needs_its_switch_and_translates_both_ways() {
         workarounds_on: true,
         anthropic_key: "sk-test-placeholder".into(),
         remote_key: String::new(),
+        retry: Default::default(),
     }))
     .await;
     let http = reqwest::Client::new();
@@ -903,6 +905,7 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
         workarounds_on: true,
         anthropic_key: String::new(),
         remote_key: REMOTE_KEY.into(),
+        retry: Default::default(),
     }))
     .await;
     let http = reqwest::Client::new();
@@ -1149,4 +1152,284 @@ async fn the_gateway_binary_needs_the_remote_key_and_never_logs_it() {
     assert!(log.contains("model server unreachable"), "{log}");
     assert!(!log.contains(REMOTE_KEY), "{log}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- Retry of 429 / 503 (`retry.rs`) ----
+
+use pmos_gateway::retry::RetryPolicy;
+
+/// One scripted answer of the mock upstream.
+#[derive(Clone)]
+enum Step {
+    Refuse(u16, Option<&'static str>, &'static str),
+    Answer,
+    /// A 200 stream that sends one event and then breaks.
+    BrokenStream,
+}
+
+#[derive(Default)]
+struct Scripted {
+    steps: Vec<Step>,
+    calls: Mutex<Vec<std::time::Instant>>,
+}
+
+async fn mock_scripted(State(s): State<Arc<Scripted>>, _body: Bytes) -> Response {
+    let n = {
+        let mut c = s.calls.lock().unwrap();
+        c.push(std::time::Instant::now());
+        c.len()
+    };
+    // Past the script, the last step repeats.
+    match s.steps[(n - 1).min(s.steps.len() - 1)].clone() {
+        Step::Refuse(status, retry_after, body) => {
+            let mut res = (
+                StatusCode::from_u16(status).unwrap(),
+                [("content-type", "application/json")],
+                body,
+            )
+                .into_response();
+            if let Some(v) = retry_after {
+                res.headers_mut().insert("retry-after", v.parse().unwrap());
+            }
+            res
+        }
+        Step::Answer => Json(json!({
+            "id": "x", "object": "chat.completion", "model": "qwen-test",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "Done."}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1},
+        }))
+        .into_response(),
+        Step::BrokenStream => {
+            use futures_util::StreamExt;
+            let first = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            ))]);
+            // The break comes after the first event has had time to reach the caller.
+            let broken = futures_util::stream::once(async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Err(std::io::Error::other("upstream died"))
+            });
+            (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(first.chain(broken)),
+            )
+                .into_response()
+        }
+    }
+}
+
+const RATE: &str = r#"{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached"}}"#;
+
+/// A gateway with one slot in front of a scripted upstream.
+async fn retry_gateway(steps: Vec<Step>, retry: RetryPolicy) -> (Gw, Arc<Scripted>) {
+    let s = Arc::new(Scripted {
+        steps,
+        calls: Mutex::default(),
+    });
+    let app = Router::new()
+        .route("/v1/chat/completions", post(mock_scripted))
+        .with_state(s.clone());
+    let (base, _stop) = serve(app).await;
+    let models = Models::from_yaml(&format!(
+        "upstreams: {{a: '{base}/v1'}}\nroles:\n  default: {{upstream: a, model: qwen-test}}\n\
+         limits: {{max-in-flight: 1, per-user: 1, max-queue: 8}}\n"
+    ))
+    .unwrap();
+    let usage = Arc::new(UsageLog::new(None).unwrap());
+    let (gw, stop) = serve(router(GatewayConfig {
+        models,
+        clients: vec![Client {
+            name: "runtime".into(),
+            token: TOKEN.into(),
+        }],
+        usage: usage.clone(),
+        stub: false,
+        workarounds_on: true,
+        anthropic_key: String::new(),
+        remote_key: String::new(),
+        retry,
+    }))
+    .await;
+    (
+        Gw {
+            base: gw,
+            usage,
+            stop,
+        },
+        s,
+    )
+}
+
+fn quick(max_attempts: u32, budget_ms: u64) -> RetryPolicy {
+    RetryPolicy {
+        max_attempts,
+        budget: Duration::from_millis(budget_ms),
+        base: Duration::from_millis(20),
+    }
+}
+
+fn streamed(gw: &Gw) -> reqwest::RequestBuilder {
+    reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gw.base))
+        .bearer_auth(TOKEN)
+        .json(&json!({"model": "pmos/default", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]}))
+}
+
+#[tokio::test]
+async fn a_429_is_retried_and_the_second_attempt_answers() {
+    let (gw, up) = retry_gateway(
+        vec![Step::Refuse(429, None, RATE), Step::Answer],
+        quick(3, 5000),
+    )
+    .await;
+    let res = chat(&gw, "pmos/default", "secret prompt text")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "2");
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "Done.");
+    assert_eq!(up.calls.lock().unwrap().len(), 2);
+
+    // One usage line per attempt, the failed one marked, never any text.
+    let events = gw.usage.recent();
+    assert_eq!(events.len(), 2);
+    let seen: Vec<_> = events
+        .iter()
+        .map(|e| (e.status, e.attempt, e.retrying))
+        .collect();
+    assert_eq!(seen, vec![(429, 1, true), (200, 2, false)]);
+    assert_eq!(events[1].attempts, 2);
+    assert_eq!(events[1].completion_tokens, Some(1));
+    let logged = serde_json::to_string(&events).unwrap();
+    assert!(!logged.contains("secret prompt") && !logged.contains("Done."));
+    gw.stop.cancel();
+}
+
+#[tokio::test]
+async fn retry_after_is_honoured() {
+    let (gw, up) = retry_gateway(
+        vec![Step::Refuse(503, Some("1"), "{}"), Step::Answer],
+        quick(3, 5000),
+    )
+    .await;
+    let res = chat(&gw, "pmos/default", "hi").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let calls = up.calls.lock().unwrap();
+    let gap = calls[1] - calls[0];
+    assert!(gap >= Duration::from_millis(990), "waited only {gap:?}");
+    gw.stop.cancel();
+}
+
+#[tokio::test]
+async fn it_gives_up_within_the_budget_and_returns_the_upstreams_answer() {
+    // Retry-After (2 s) is beyond the 1 s budget: no wait is started at all.
+    let (gw, up) = retry_gateway(vec![Step::Refuse(429, Some("2"), RATE)], quick(3, 1000)).await;
+    let t = std::time::Instant::now();
+    let res = chat(&gw, "pmos/default", "hi").send().await.unwrap();
+    assert!(t.elapsed() < Duration::from_millis(900));
+    assert_eq!(res.status(), 429);
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "1");
+    assert_eq!(res.headers()["retry-after"], "2");
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(up.calls.lock().unwrap().len(), 1);
+    gw.stop.cancel();
+
+    // With backoff only, it uses every attempt and then returns the upstream's status.
+    let (gw, up) = retry_gateway(vec![Step::Refuse(503, None, RATE)], quick(3, 1000)).await;
+    let t = std::time::Instant::now();
+    let res = chat(&gw, "pmos/default", "hi").send().await.unwrap();
+    assert!(t.elapsed() < Duration::from_millis(1000));
+    assert_eq!(res.status(), 503);
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "3");
+    assert_eq!(up.calls.lock().unwrap().len(), 3);
+    let events = gw.usage.recent();
+    assert_eq!(
+        events.iter().map(|e| e.retrying).collect::<Vec<_>>(),
+        vec![true, true, false]
+    );
+    assert!(events.iter().all(|e| e.status == 503));
+    gw.stop.cancel();
+}
+
+#[tokio::test]
+async fn a_daily_quota_fails_fast() {
+    let daily = r#"[{"error":{"status":"RESOURCE_EXHAUSTED","details":[{"violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}}]"#;
+    let (gw, up) = retry_gateway(vec![Step::Refuse(429, None, daily)], quick(3, 5000)).await;
+    let res = chat(&gw, "pmos/default", "hi").send().await.unwrap();
+    assert_eq!(res.status(), 429);
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "1");
+    assert_eq!(res.text().await.unwrap(), daily);
+    assert_eq!(up.calls.lock().unwrap().len(), 1);
+    gw.stop.cancel();
+}
+
+#[tokio::test]
+async fn a_400_is_never_retried() {
+    let bad = r#"{"error":{"message":"maximum context length exceeded"}}"#;
+    for status in [400, 401, 404, 422] {
+        let (gw, up) = retry_gateway(
+            vec![Step::Refuse(status, None, bad), Step::Answer],
+            quick(3, 5000),
+        )
+        .await;
+        let res = chat(&gw, "pmos/default", "hi").send().await.unwrap();
+        assert_eq!(res.status(), status);
+        assert_eq!(res.headers()["x-pmos-upstream-attempts"], "1");
+        assert_eq!(up.calls.lock().unwrap().len(), 1, "{status}");
+        gw.stop.cancel();
+    }
+}
+
+#[tokio::test]
+async fn nothing_is_retried_once_streaming_has_begun() {
+    let (gw, up) = retry_gateway(vec![Step::BrokenStream, Step::Answer], quick(3, 5000)).await;
+    let res = streamed(&gw).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "1");
+    // The stream breaks after its first event; the caller sees that, not a second try.
+    let _ = res.bytes().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(up.calls.lock().unwrap().len(), 1);
+    let events = gw.usage.recent();
+    assert_eq!(events.len(), 1);
+    assert_eq!((events[0].attempts, events[0].retrying), (1, false));
+    gw.stop.cancel();
+
+    // A streamed request refused before its first byte is retried like any other.
+    let (gw, up) = retry_gateway(
+        vec![Step::Refuse(429, None, RATE), Step::BrokenStream],
+        quick(3, 5000),
+    )
+    .await;
+    let res = streamed(&gw).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "2");
+    assert_eq!(up.calls.lock().unwrap().len(), 2);
+    gw.stop.cancel();
+}
+
+#[tokio::test]
+async fn a_waiting_retry_gives_its_slot_to_the_queue() {
+    // One slot. The first call is refused and waits a second to retry; a second call must
+    // not be stuck behind that wait.
+    let (gw, up) = retry_gateway(
+        vec![Step::Refuse(429, Some("1"), RATE), Step::Answer],
+        quick(3, 5000),
+    )
+    .await;
+    let first = chat(&gw, "pmos/default", "first").send();
+    let first = tokio::spawn(async move { first.await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let t = std::time::Instant::now();
+    let second = chat(&gw, "pmos/default", "second").send().await.unwrap();
+    assert_eq!(second.status(), 200);
+    assert!(t.elapsed() < Duration::from_millis(500));
+    assert_eq!(first.await.unwrap().status(), 200);
+    assert_eq!(up.calls.lock().unwrap().len(), 3);
+    gw.stop.cancel();
 }

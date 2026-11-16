@@ -29,6 +29,14 @@ pub struct UsageEvent {
     pub stream: bool,
     pub stub: bool,
     pub status: u16,
+    /// Which upstream attempt this line describes (1 for the first).
+    pub attempt: u32,
+    /// Attempts made in all by this line; on the call's final line, the total.
+    pub attempts: u32,
+    /// True on a line for an attempt that failed and will be retried; the call's final line
+    /// is the one without it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub retrying: bool,
     pub queue_ms: u64,
     pub latency_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,6 +75,8 @@ impl UsageLog {
             user = event.user.as_deref().unwrap_or("-"),
             role = %event.role,
             status = event.status,
+            attempt = event.attempt,
+            retrying = event.retrying,
             queue_ms = event.queue_ms,
             latency_ms = event.latency_ms,
             "model call"
