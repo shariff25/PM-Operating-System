@@ -189,6 +189,11 @@ pub struct Task {
     /// Without one, the claim uses the requester's setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<Level>,
+    /// The conversation a task belongs to, when its client names one (the web app). Scoped to
+    /// the requester and the bot: a task only ever sees its own requester's earlier tasks for
+    /// the same bot (spec §3, Conversations).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
     pub attempts: i32,
     /// The worker holding the current claim, while `working`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,6 +231,7 @@ impl Task {
             slack,
             routine_id,
             level: None,
+            conversation: None,
             attempts: 0,
             worker: None,
             lease_until: None,
@@ -234,6 +240,53 @@ impl Task {
         }
     }
 }
+
+impl Task {
+    /// The thread this task continues, if it can have earlier turns: its explicit
+    /// `conversation`, else its Slack thread. Only interactive tasks (Slack, the web app, the
+    /// CLI) have one; routines and evals always start fresh. The prefixes keep a client's
+    /// conversation id from ever matching a Slack thread.
+    pub fn thread_key(&self) -> Option<String> {
+        if self.source.priority() != Priority::Interactive {
+            return None;
+        }
+        if let Some(c) = &self.conversation {
+            return Some(format!("c:{c}"));
+        }
+        self.slack
+            .as_ref()
+            .map(|s| format!("s:{}:{}", s.channel, s.thread_ts))
+    }
+}
+
+/// Is a client's conversation id well formed? 1 to 128 of `A-Z a-z 0-9 . _ : -`.
+pub fn valid_conversation(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+}
+
+/// One earlier turn of a task's conversation, as the claim carries it (oldest first).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Turn {
+    /// What the PM asked.
+    pub text: String,
+    /// The bot's answer, if it gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// Why it failed, if it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub status: TaskStatus,
+    /// When it was asked.
+    pub at: DateTime<Utc>,
+}
+
+/// What a redacted text carries (`redacted_body`). A turn with it anywhere is left out of a
+/// conversation's history.
+pub const REDACTED_MARKER: &str = "slack content removed after 24 h";
 
 /// One line of a task's progress (`GET /v1/tasks/{id}/events`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,7 +316,7 @@ pub struct TraceEntry {
 
 /// The body a Slack tool result is left with after 24 hours (SLK-8).
 pub fn redacted_body() -> Value {
-    serde_json::json!({"redacted": "slack content removed after 24 h"})
+    serde_json::json!({"redacted": REDACTED_MARKER})
 }
 
 /// The tool a trace body is about, from its `tool` (or `name`) field, so a Slack result can

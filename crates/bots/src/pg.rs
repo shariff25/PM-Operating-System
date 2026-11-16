@@ -57,8 +57,8 @@ impl PgStore {
 }
 
 const TASK_COLUMNS: &str = "id, bot, requested_by, source, priority, text, status, checklist, \
-     result, error, approvals, slack, routine_id, level, attempts, worker, lease_until, \
-     created_at, updated_at";
+     result, error, approvals, slack, routine_id, level, conversation, attempts, worker, \
+     lease_until, created_at, updated_at";
 
 fn bad(what: &str, value: &str) -> StoreError {
     StoreError(format!("unexpected {what} `{value}` in storage"))
@@ -91,6 +91,7 @@ fn task_from_row(r: &PgRow) -> StoreResult<Task> {
         slack: slack.map(|s| s.0),
         routine_id: r.try_get("routine_id")?,
         level,
+        conversation: r.try_get("conversation")?,
         attempts: r.try_get("attempts")?,
         worker: r.try_get("worker")?,
         lease_until: r.try_get("lease_until")?,
@@ -127,9 +128,9 @@ async fn insert_task(conn: &mut PgConnection, t: &Task) -> StoreResult<()> {
     sqlx::query(
         "INSERT INTO bots_tasks (id, bot, requested_by, source, priority, priority_rank, text,
              status, checklist, result, error, approvals, slack, routine_id, attempts, worker,
-             lease_until, created_at, updated_at, level)
+             lease_until, created_at, updated_at, level, conversation, thread_key)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-             $18, $19, $20)",
+             $18, $19, $20, $21, $22)",
     )
     .bind(&t.id)
     .bind(&t.bot)
@@ -151,6 +152,8 @@ async fn insert_task(conn: &mut PgConnection, t: &Task) -> StoreResult<()> {
     .bind(t.created_at)
     .bind(t.updated_at)
     .bind(t.level.map(Level::as_str))
+    .bind(&t.conversation)
+    .bind(t.thread_key())
     .execute(conn)
     .await?;
     Ok(())
@@ -359,6 +362,38 @@ impl BotsStore for PgStore {
         }
         tx.commit().await?;
         Ok(Ok(task))
+    }
+
+    async fn earlier_turns(
+        &self,
+        task: &Task,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> StoreResult<Vec<Task>> {
+        let Some(key) = task.thread_key() else {
+            return Ok(Vec::new());
+        };
+        // Ids compare bytewise (`COLLATE "C"`), as the memory store compares them.
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM bots_tasks
+             WHERE bot = $1 AND requested_by = $2 AND thread_key = $3
+               AND created_at >= $4
+               AND (created_at < $5 OR (created_at = $5 AND id COLLATE \"C\" < $6))
+               AND status NOT IN ('queued', 'working')
+             ORDER BY created_at DESC, id COLLATE \"C\" DESC
+             LIMIT $7"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&task.bot)
+            .bind(&task.requested_by)
+            .bind(key)
+            .bind(since)
+            .bind(task.created_at)
+            .bind(&task.id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(task_from_row).collect()
     }
 
     async fn expired_leases(&self, now: DateTime<Utc>) -> StoreResult<Vec<Task>> {

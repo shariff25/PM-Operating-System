@@ -152,6 +152,16 @@ pub trait BotsStore: Send + Sync {
         change: &Transition,
         now: DateTime<Utc>,
     ) -> StoreResult<Result<Task, Refused>>;
+    /// The earlier turns of `task`'s conversation, newest first, at most `limit`: tasks of the
+    /// same bot, the same requester and the same thread (`Task::thread_key`), created at or
+    /// after `since` and before `task`, and no longer queued or working. Empty for a task
+    /// with no thread.
+    async fn earlier_turns(
+        &self,
+        task: &Task,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> StoreResult<Vec<Task>>;
     /// `working` tasks whose lease lapsed before `now`.
     async fn expired_leases(&self, now: DateTime<Utc>) -> StoreResult<Vec<Task>>;
     async fn events(&self, task_id: &str) -> StoreResult<Vec<Event>>;
@@ -409,6 +419,38 @@ impl BotsStore for MemoryStore {
             s.notify(&updated, n, now);
         }
         Ok(Ok(updated))
+    }
+
+    async fn earlier_turns(
+        &self,
+        task: &Task,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> StoreResult<Vec<Task>> {
+        let Some(key) = task.thread_key() else {
+            return Ok(Vec::new());
+        };
+        let s = self.state();
+        let mut out: Vec<Task> = s
+            .tasks
+            .values()
+            .filter(|t| {
+                t.bot == task.bot
+                    && t.requested_by == task.requested_by
+                    && t.thread_key().as_ref() == Some(&key)
+                    && t.created_at >= since
+                    && (&t.created_at, &t.id) < (&task.created_at, &task.id)
+                    && !matches!(t.status, TaskStatus::Queued | TaskStatus::Working)
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        out.truncate(limit);
+        Ok(out)
     }
 
     async fn expired_leases(&self, now: DateTime<Utc>) -> StoreResult<Vec<Task>> {

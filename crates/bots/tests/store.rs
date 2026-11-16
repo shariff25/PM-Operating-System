@@ -693,7 +693,142 @@ async fn member_settings_round_trip(store: Arc<dyn BotsStore>) {
     );
 }
 
+fn in_thread(bot: &str, user: &str, thread: &str, minute: u32, status: TaskStatus) -> Task {
+    let mut t = Task::queued(
+        bot,
+        user,
+        Source::Slack,
+        &format!("{user} asks {bot} at {minute}"),
+        Some(SlackRef {
+            channel: "D0ANA".into(),
+            thread_ts: thread.into(),
+        }),
+        None,
+        at(2026, 11, 14, 9, minute),
+    );
+    t.status = status;
+    t.result = (status == TaskStatus::Done).then(|| format!("answer at {minute}"));
+    t
+}
+
+async fn earlier_turns_follow_the_thread(store: Arc<dyn BotsStore>) {
+    use TaskStatus::*;
+    let first = in_thread("docs", "ana", "1731.1", 1, Done);
+    let failed = in_thread("docs", "ana", "1731.1", 2, Failed);
+    let other_thread = in_thread("docs", "ana", "1731.9", 3, Done);
+    let other_user = in_thread("docs", "ben", "1731.1", 4, Done);
+    let other_bot = in_thread("pm-ana", "ana", "1731.1", 5, Done);
+    let still_working = in_thread("docs", "ana", "1731.1", 6, Working);
+    let mut routine = in_thread("docs", "ana", "1731.1", 7, Done);
+    routine.source = Source::Routine;
+    routine.priority = Source::Routine.priority();
+    let now = in_thread("docs", "ana", "1731.1", 10, Working);
+    let later = in_thread("docs", "ana", "1731.1", 12, Done);
+    for t in [
+        &first,
+        &failed,
+        &other_thread,
+        &other_user,
+        &other_bot,
+        &still_working,
+        &routine,
+        &now,
+        &later,
+    ] {
+        store.create_task(t, "queued").await.unwrap();
+    }
+    let since = at(2026, 11, 13, 9, 30);
+    let ids = |v: Vec<Task>| v.into_iter().map(|t| t.id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(store.earlier_turns(&now, since, 10).await.unwrap()),
+        vec![failed.id.clone(), first.id.clone()],
+        "only this requester's finished tasks for this bot in this thread, before it, newest first"
+    );
+    let got = store.earlier_turns(&now, since, 10).await.unwrap();
+    assert_eq!(got[1].result.as_deref(), Some("answer at 1"));
+    assert_eq!(
+        ids(store.earlier_turns(&now, since, 1).await.unwrap()),
+        vec![failed.id.clone()],
+        "the limit keeps the newest"
+    );
+    assert!(
+        store
+            .earlier_turns(&now, at(2026, 11, 14, 9, 2), 10)
+            .await
+            .unwrap()
+            .len()
+            == 1,
+        "nothing before `since`"
+    );
+    assert!(store
+        .earlier_turns(&first, since, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        store
+            .earlier_turns(&other_user, since, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "Ben never sees Ana's turns"
+    );
+    assert!(
+        store
+            .earlier_turns(&routine, since, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a routine run starts fresh"
+    );
+
+    // A web conversation is matched by its id, and never by a Slack thread.
+    let web = |minute: u32, conversation: Option<&str>| {
+        let mut t = Task::queued(
+            "docs",
+            "ana",
+            Source::Web,
+            &format!("web at {minute}"),
+            None,
+            None,
+            at(2026, 11, 14, 11, minute),
+        );
+        t.conversation = conversation.map(String::from);
+        t.status = Done;
+        t
+    };
+    let w1 = web(1, Some("cnv_1"));
+    let w2 = web(2, Some("cnv_2"));
+    let w0 = web(3, None);
+    let mut w3 = web(4, Some("cnv_1"));
+    w3.status = Working;
+    for t in [&w1, &w2, &w0, &w3] {
+        store.create_task(t, "queued").await.unwrap();
+    }
+    assert_eq!(
+        store
+            .task(&w1.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .conversation
+            .as_deref(),
+        Some("cnv_1"),
+        "the conversation id round-trips"
+    );
+    assert_eq!(
+        ids(store.earlier_turns(&w3, since, 10).await.unwrap()),
+        vec![w1.id.clone()]
+    );
+    assert!(store
+        .earlier_turns(&w0, since, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 both_stores!(
+    earlier_turns_follow_the_thread,
     member_settings_round_trip,
     tasks_round_trip_and_filter,
     claims_go_interactive_first_then_oldest,

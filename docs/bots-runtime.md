@@ -143,9 +143,11 @@ queued ──claim──► working ──complete──► done
   (at most 25 seconds; none if absent). It answers `204` if nothing came in time. The
   runtime then creates the task's tool-server session:
   `POST /internal/sessions {user, bot, run_id: <task id>}`.
-  - **Answer:** `{task, bot, role, tools, session_token, lease_until, gateway}`. `gateway` is
+  - **Answer:** `{task, bot, role, tools, session_token, lease_until, gateway, level,
+    history}`. `gateway` is
     `{model: "pmos/<role model>", headers: {X-Pmos-User, X-Pmos-Run, X-Pmos-Priority}}`,
-    ready for the harness's gateway client.
+    ready for the harness's gateway client. `history` is the conversation's earlier turns
+    (below), `[]` for a first message.
   - **Tool server refuses the session** (for example, the PM may not use the bot): the
     task fails with that reason, and the next task is tried.
   - **Tool server unavailable:** the task goes back to the queue without using up an
@@ -159,6 +161,27 @@ queued ──claim──► working ──complete──► done
   - Trace entries are accepted for any claimed task, even after it finished.
 - **Events** (`status`, `checklist`, `milestone`): all are kept, and each milestone is also a
   notification.
+
+## Conversations
+A follow-up in a thread is claimed with the thread's earlier turns, so "customer" in reply to
+"Who is the user?" reads as an answer, not a new request.
+- **The thread:** a Slack task's `slack {channel, thread_ts}`, or a `conversation` id the web
+  (or Slack) client names on `POST /v1/tasks` (1 to 128 of `A-Z a-z 0-9 . _ : -`; `403` from
+  any other client, `400` if malformed). The id is only a label: it is matched within the
+  same requester and bot, so naming another PM's id finds nothing. Only interactive tasks
+  (`slack`, `web`, `cli`) have a thread; routines and evals always start fresh.
+- **The turns:** earlier tasks with the same bot, the same `requested_by` and the same
+  thread, created before this one and no longer `queued` or `working`. Each is
+  `{text, result?, error?, status, at}`, oldest first, in the claim's `history`.
+- **Bounds:** the newest 6 turns; each `text`, `result` and `error` cut to 4,000 bytes with
+  `… [truncated]` after; at most 16,000 bytes in all, the oldest dropped first.
+- **Retention:** only turns asked in the last 24 hours, the window Slack text is kept in
+  traces (D6), and never one whose text, result or error carries the redaction marker
+  (`slack content removed after 24 h`). A history read that fails gives `[]` rather than
+  stranding the task.
+- **Storage:** `bots_tasks.conversation` (the client's id) and `bots_tasks.thread_key`
+  (`c:<conversation>` or `s:<channel>:<thread_ts>`, interactive tasks only), indexed by bot,
+  requester and key (migration `0004_conversations.sql`).
 
 ## Durability (D2)
 - **Leases:** a claim holds the task for 120 seconds, and each heartbeat extends that. The
@@ -278,7 +301,7 @@ call. The console reads them with `GET /v1/tasks/{id}/trace`.
 ## Storage
 | Table | Holds |
 | --- | --- |
-| `bots_tasks` | Tasks, with their lease (`worker`, `lease_until`) |
+| `bots_tasks` | Tasks, with their lease (`worker`, `lease_until`) and thread (`conversation`, `thread_key`) |
 | `bots_task_events` | Each task's events, in order |
 | `bots_traces` | Trace entries, with the tool each is about and whether it was redacted |
 | `bots_notifications` | The Slack feed, numbered from `bots_counters` |
