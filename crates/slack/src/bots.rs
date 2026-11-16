@@ -46,6 +46,7 @@ use crate::commands::{load_team, FollowUp, NOT_A_MEMBER};
 use crate::home::Home;
 use crate::member_cards::{self, action as member_action};
 use crate::members::{self, DmCommand, Onboarding};
+use crate::onboard_flow::{self, Flow};
 use crate::reply::{self, SnoozeStore};
 use crate::runtime::{display_name, BotInfo, Runtime, RuntimeError};
 use crate::slackapi::{Posted, SlackApi};
@@ -55,7 +56,8 @@ use crate::{bets_review, level};
 /// The bot a DM goes to when nothing else picks one.
 pub const DEFAULT_BOT: &str = "docs";
 
-const UNAVAILABLE: &str = "PM OS couldn't reach its bots right now. Try again in a minute.";
+pub(crate) const UNAVAILABLE: &str =
+    "PM OS couldn't reach its bots right now. Try again in a minute.";
 /// How long the bot roster from `GET /v1/bots` is reused.
 const ROSTER_TTL: Duration = Duration::from_secs(60);
 
@@ -119,6 +121,8 @@ struct Inner {
     held_edits: Mutex<Bounded<String, Value>>,
     /// Who has opened the App Home, and the skills catalog.
     home: Home,
+    /// The new first-time flow (`PMOS_ONBOARDING_V2=1`) and what each PM has seen of it.
+    flow: Flow,
 }
 
 #[derive(Clone)]
@@ -184,6 +188,13 @@ enum Change {
 
 impl Bots {
     pub fn new(cfg: BotsConfig) -> Self {
+        let on = onboard_flow::enabled(std::env::var(onboard_flow::FLAG).ok().as_deref());
+        Self::with_onboarding_v2(cfg, on)
+    }
+
+    /// As [`Bots::new`], with the new first-time flow (`PMOS_ONBOARDING_V2`) set explicitly.
+    pub fn with_onboarding_v2(cfg: BotsConfig, onboarding_v2: bool) -> Self {
+        let flow = Flow::open(&cfg.state_dir, onboarding_v2);
         let onboarding = Onboarding::new(cfg.github_org.clone(), cfg.response_url_prefix.clone());
         let snoozes = SnoozeStore::open(&cfg.state_dir);
         Self {
@@ -192,6 +203,7 @@ impl Bots {
                 snoozes,
                 held_edits: Mutex::new(Bounded::new(500)),
                 home: Home::default(),
+                flow,
                 onboarding,
                 threads: Mutex::new(Bounded::new(5000)),
                 seen: Mutex::new(Bounded::new(5000)),
@@ -221,6 +233,10 @@ impl Bots {
 
     pub fn team(&self) -> TeamFile {
         load_team(&self.inner.cfg.team_file)
+    }
+
+    pub(crate) fn flow(&self) -> &Flow {
+        &self.inner.flow
     }
 
     pub(crate) fn onboarding(&self) -> &Onboarding {
@@ -454,6 +470,9 @@ impl Bots {
                     member_action::SETUP_MEMORY => {
                         Box::pin(async move { this.open_memory_modal(click).await })
                     }
+                    a if a.starts_with(cards::ONBOARD_START_PREFIX) => {
+                        Box::pin(async move { this.onboarding_start(click).await })
+                    }
                     _ => return (None, None),
                 };
                 (None, Some(work))
@@ -537,6 +556,8 @@ impl Bots {
             }
             None => {}
         }
+        // The first-time offer, once the PM has linked their account (flag off: no-op).
+        self.onboarding_offer(&dm.channel, &handle).await;
         if let Some(cmd) = reply::command(&text) {
             return self.reply_assistant(&dm, &handle, cmd).await;
         }
@@ -607,7 +628,15 @@ impl Bots {
             .await;
     }
 
-    async fn start_task(&self, dm: &Dm, handle: &str, bot: &str, shown: &str, text: &str) {
+    /// Creates the task for a DM; `false` when it was refused or failed (the PM was told).
+    pub(crate) async fn start_task(
+        &self,
+        dm: &Dm,
+        handle: &str,
+        bot: &str,
+        shown: &str,
+        text: &str,
+    ) -> bool {
         // Remembered first, so a second message sent quickly in the thread goes to the same
         // bot; put back if the task isn't created.
         let previous = self.thread_bot(&dm.channel, &dm.thread_ts);
@@ -626,6 +655,7 @@ impl Bots {
                 }
             }
         }
+        let ok = created.is_ok();
         match created {
             Ok(task) => {
                 tracing::info!(task = %task["id"], bot, user = handle, "task created from a DM");
@@ -651,6 +681,7 @@ impl Bots {
                 .await;
             }
         }
+        ok
     }
 
     async fn start_routine(&self, dm: &Dm, handle: &str, bot: &str, text: &str) {
@@ -1208,7 +1239,7 @@ fn unavailable_or(e: &RuntimeError) -> String {
 }
 
 /// The display name of `bot` from the roster, or one made from its name.
-fn named(roster: &[BotInfo], bot: &str) -> String {
+pub(crate) fn named(roster: &[BotInfo], bot: &str) -> String {
     roster
         .iter()
         .find(|b| b.name == bot)

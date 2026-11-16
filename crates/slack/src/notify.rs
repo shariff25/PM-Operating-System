@@ -174,6 +174,17 @@ impl Notifier {
                 if !text.trim().is_empty() {
                     self.say(&task_id, &bot, &username, cards::answer(&text))
                         .await;
+                    // The first answer a new member gets: one closing line, once.
+                    if let (Some(handle), Some((channel, thread))) = (
+                        item["requested_by"].as_str(),
+                        self.tasks
+                            .get(&task_id)
+                            .map(|t| (t.channel.clone(), t.thread_ts.clone())),
+                    ) {
+                        self.bots
+                            .onboarding_closing(handle, &channel, thread.as_deref())
+                            .await;
+                    }
                 }
                 self.tasks.remove(&task_id);
             }

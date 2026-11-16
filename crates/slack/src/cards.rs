@@ -898,6 +898,73 @@ pub fn routine_list(routines: &[Value], display: impl Fn(&str) -> String) -> (St
     )
 }
 
+// ---- The first-time flow (`PMOS_ONBOARDING_V2=1`, `onboard_copy.rs`) ----
+
+/// A starter button's action id is this prefix and the starter's id.
+pub const ONBOARD_START_PREFIX: &str = "pmos_onboard_start_";
+/// The welcome's one button: a link, so Slack sends no handler for a click.
+pub const ONBOARD_CONNECT: &str = "pmos_onboard_connect";
+
+/// The welcome: two short lines and one **Connect Jira and Confluence** button. Without a
+/// link, the lines and a plain sentence say what to do instead.
+pub fn onboard_hello(first_name: &str, url: Option<&str>) -> (String, Value) {
+    let first = truncate(first_name.trim(), 60);
+    let greeting = if first.is_empty() {
+        crate::onboard_copy::HELLO_NO_NAME.to_string()
+    } else {
+        crate::onboard_copy::HELLO.replace("{name}", &escape(&first))
+    };
+    match url.filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
+        Some(url) => (
+            truncate(&greeting, 300),
+            json!([
+                section(&greeting),
+                {"type": "actions", "block_id": "onboard_hello", "elements": [{
+                    "type": "button", "style": "primary",
+                    "text": {"type": "plain_text", "text": crate::onboard_copy::CONNECT_BUTTON},
+                    "action_id": ONBOARD_CONNECT, "url": url,
+                }]},
+            ]),
+        ),
+        None => {
+            let text = format!("{greeting}\n{}", crate::onboard_copy::NO_LINK);
+            (truncate(&text, 300), json!([section(&text)]))
+        }
+    }
+}
+
+/// The offer after the account is linked: three buttons, each starting a task.
+pub fn onboard_offer() -> (String, Value) {
+    let elements: Vec<Value> = crate::onboard_copy::STARTERS
+        .iter()
+        .map(|s| {
+            button(
+                s.label,
+                &format!("{ONBOARD_START_PREFIX}{}", s.id),
+                s.id,
+                None,
+            )
+        })
+        .collect();
+    (
+        crate::onboard_copy::OFFER.to_string(),
+        json!([
+            section(crate::onboard_copy::OFFER),
+            {"type": "actions", "block_id": "onboard_offer", "elements": elements},
+        ]),
+    )
+}
+
+/// The offer after a starter was tapped: no buttons left.
+pub fn onboard_started(label: &str) -> (String, Value) {
+    note(&crate::onboard_copy::STARTED.replace("{label}", &escape(label)))
+}
+
+/// The one closing line.
+pub fn onboard_closing() -> (String, Value) {
+    note(crate::onboard_copy::CLOSING)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
