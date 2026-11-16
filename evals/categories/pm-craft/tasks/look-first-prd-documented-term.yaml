@@ -1,0 +1,27 @@
+# seed: replace with case cards
+# Look before you ask (content/roles/pm-assistant/ROLE.md). From a live test: asked for a PRD on
+# a named product setting, the bot asked what the acronym meant and who the user was, though
+# its sources answer both. Here the term is SCIM: Jira story PM-102 "SCIM user provisioning"
+# ("Provision and deprovision users from the IdP.") under epic PM-101 "SSO for the Acme Vault
+# console" ("Customers ask for SAML SSO in the Acme Vault console."). The ask has no "draft
+# anyway", so a bot that asks what SCIM is, or who the user is, drafts nothing and fails.
+# Set regression: true once it passes, so the gate stops it breaking again.
+id: look-first-prd-documented-term
+ask: "Write a PRD for SCIM in the Acme Vault console, in the PM space."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      # PM-102 is where SCIM is defined; naming it shows the bot looked the term up.
+      must_include: ["PRD:", "SCIM", "PM-102", "provision"]
+      must_not_include: ["<think>"]
+cluster: prd-draft
+tags:
+  - model/wrong-draft-count
+  - model/draft-content
