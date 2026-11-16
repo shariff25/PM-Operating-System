@@ -33,6 +33,12 @@
 #                         PMOS_DOCS_PRODUCTS; see docs/docs-server.md). Unset: the Docs bot
 #                         says no docs site is configured.
 #
+# Optional web app (docs/web-app-running.md):
+#   PMOS_TEST_WEB=1       also build web/ and pmos-web, and serve the app at
+#                         http://127.0.0.1:8770 with DEVELOPMENT sign-in (anyone who can reach
+#                         the port signs in as any member of the test team; it binds to this
+#                         machine only). Unset: nothing about the web app runs.
+#
 # Stop with Ctrl-C; every service is stopped with it.
 set -euo pipefail
 
@@ -67,6 +73,11 @@ rm -f "$STATE/slack/notifications.cursor"
 echo "== building"
 cargo build -q -p pmos -p pmos-docs -p pmos-toolserver -p pmos-gateway -p pmos-bots -p pmos-slack
 (cd harness && pnpm -s install --frozen-lockfile >/dev/null && pnpm -s build)
+if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
+  echo "== building the web app"
+  cargo build -q -p pmos-web
+  pnpm -s -C web build >/dev/null
+fi
 BIN="$ROOT/target/debug"
 
 echo "== test content in $STATE/content (you as admin, plus your bot pm-$HANDLE)"
@@ -103,6 +114,11 @@ DOCS_TOKEN=$(tok) SERVICE_TOKEN=$(tok) BOT_TOKEN=$(tok)
 GW_RUNTIME=$(tok) GW_WORKER=$(tok)
 RT_SLACK=$(tok) RT_DOCS=$(tok) RT_PERSONAL=$(tok)
 BOT_PERSONAL="pm-$HANDLE"
+BOTS_TOKENS="slack=$RT_SLACK,worker-docs=$RT_DOCS,worker-$BOT_PERSONAL=$RT_PERSONAL"
+if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
+  RT_WEB=$(tok)
+  BOTS_TOKENS="$BOTS_TOKENS,web=$RT_WEB"
+fi
 
 PIDS=()
 start() { # name, then the command; logs go to $STATE/logs/<name>.log
@@ -147,7 +163,7 @@ start gateway env PMOS_GATEWAY_CLOUD_TEST=1 PMOS_GATEWAY_CONFIG="$GATEWAY_CONFIG
 wait_for http://127.0.0.1:8740/healthz gateway
 
 start bots env PMOS_DEV=1 PMOS_CONTENT_ROOT="$STATE/content" \
-  PMOS_BOTS_TOKENS="slack=$RT_SLACK,worker-docs=$RT_DOCS,worker-$BOT_PERSONAL=$RT_PERSONAL" \
+  PMOS_BOTS_TOKENS="$BOTS_TOKENS" \
   PMOS_TOOLSERVER_URL=http://127.0.0.1:8710 PMOS_SERVICE_TOKEN="$SERVICE_TOKEN" \
   PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1 PMOS_GATEWAY_TOKEN="$GW_RUNTIME" \
   "$BIN/pmos-bots"
@@ -170,12 +186,25 @@ start slack env PMOS_SLACK_APP_TOKEN="$PMOS_SLACK_APP_TOKEN" \
   PMOS_CONTENT_ROOT="$STATE/content" PMOS_SLACK_STATE_DIR="$STATE/slack" \
   "$BIN/pmos-slack"
 
+if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
+  # Development sign-in: closed to this machine (127.0.0.1) and never for a shared network.
+  start web env PMOS_WEB_BIND=127.0.0.1:8770 PMOS_WEB_DEV_LOGIN=1 \
+    PMOS_WEB_BOTS_TOKEN="$RT_WEB" PMOS_WEB_TOOLSERVER_TOKEN="$SERVICE_TOKEN" \
+    PMOS_BOTS_URL=http://127.0.0.1:8750 PMOS_TOOLSERVER_URL=http://127.0.0.1:8710 \
+    PMOS_CONTENT_ROOT="$STATE/content" PMOS_WEB_STATIC_DIR="$ROOT/web/dist" \
+    "$BIN/pmos-web"
+  wait_for http://127.0.0.1:8770/healthz web
+fi
+
 echo
 echo "== PM OS test stack is up, with $MODEL_DESC behind the gateway."
 echo "   In the test Slack workspace, DM the PM OS app:"
 echo "   docs: how do I get started?         (the Docs bot, your docs site)"
 echo "   summarize the open launch issues    (your bot $BOT_PERSONAL, fake Jira)"
 echo "   setup                               (the onboarding checklist)"
+if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
+  echo "   Web app: http://127.0.0.1:8770 (sign in as $HANDLE; development sign-in, this machine only)"
+fi
 echo "   Logs: $STATE/logs; model calls (who, role, tokens; never text): $STATE/usage.jsonl."
 echo "   Prompts go to the test model off this machine: fake data only. Ctrl-C stops everything."
 wait -n "${PIDS[@]}" || true
