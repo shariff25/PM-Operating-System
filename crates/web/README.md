@@ -33,6 +33,9 @@ cargo run -p pmos-web
 | `PMOS_WEB_PUBLIC_URL` | none | The origin browsers use. Writes must come from it; without it, `Origin` must match `Host` |
 | `PMOS_WEB_SESSION_IDLE_MINUTES` | `480` | Idle expiry |
 | `PMOS_WEB_SESSION_MAX_MINUTES` | `1440` | Absolute expiry from sign-in |
+| `PMOS_WEB_DATABASE_URL` | none | Postgres for sessions, settings and follow-ups (`src/store_config.rs`). Without it everything is in memory and a start-up warning says a restart signs everyone out |
+| `PMOS_WEB_BRIEF` | off | `1` turns on `GET /api/brief` and the follow-up routes; off, they answer `501 not_built` and the app hides the section |
+| `PMOS_WEB_BRIEF_TOKEN` | none | The bearer token `PUT /internal/brief/{handle}` needs, at least 32 characters. Without it that route answers `501` |
 
 `GET /healthz` answers `ok` with no sign-in. SIGTERM or Ctrl-C lets in-flight requests finish.
 
@@ -138,7 +141,26 @@ path with another method a JSON `405 method_not_allowed`.
   a canned note. An upstream item with a `prc_` id is never decided.
 - **Tasks:** `POST /v1/tasks {bot: "pm-<handle>", requested_by, text, source: "web"}`, and
   reads of the PM's own tasks and their events, each with `X-Pmos-User: <handle>`.
-- **Brief and follow-ups:** `501 not_built`.
+- **Brief and follow-ups** (`src/app/brief.rs`, `src/followups.rs`), on with `PMOS_WEB_BRIEF=1`
+  and `501 not_built` otherwise. `GET /api/brief` answers `200` with the PM's open follow-ups
+  (not dismissed, not expired) and the day's `changed` items, empty lists when nothing is
+  stored. A follow-up holds a one-line summary (at most 200 characters, no message text), who,
+  system and url; Slack ones expire after 24 hours and every other after a week, both purged.
+  Its id is derived from the handle, kind, system and url, so a producer sending the same one
+  again refreshes it (keeping its age and a dismissal) rather than copying it. `POST
+  /api/followups/{id}/dismiss` is `204` and idempotent; `POST /api/followups/{id}/draft`
+  makes a task for `pm-<handle>` (`source: "web"`) asking for a reply (waiting on you) or a
+  gentle nudge (you wait on), written through the bot's normal write tool so it arrives as an
+  ordinary approval; it needs `ask-bot`. Someone else's, a dismissed, an expired or an
+  unknown id is `404`.
+- **`PUT /internal/brief/{handle}`** is the producer's route and **nothing calls it yet**:
+  the Slack brief routine or a later job will. It needs `Authorization: Bearer
+  <PMOS_WEB_BRIEF_TOKEN>` (`401 bad_token`, constant-time compare), a member's handle, JSON,
+  at most 128 KiB (`413`), and replaces that PM's follow-ups and `changed` items:
+  `{date?, changed: [{system, title, summary?, url}], waiting_on_you: [{system, who, summary,
+  url, created_at?}], you_wait_on: [...]}`. At most 50 per list, `system` lower-case
+  `[a-z0-9_-]`, one-line text, `url` an `http` or `https` URL without credentials, unknown
+  fields refused (`422 bad_brief`); nothing is stored if anything fails.
 
 ## Where the contract isn't met as written
 
@@ -171,8 +193,8 @@ path with another method a JSON `405 method_not_allowed`.
   preamble puts it in the suggestion; the PM sees it before accepting.
 - The draft's text is put in the prompt. It is the PM's own draft, but its content came from
   sources the bot read, so it is untrusted input to the model like any other.
-- A suggestion lives in memory: a restart forgets it, and the task's result is then only on
-  the task.
+- A suggestion lives in memory without `PMOS_WEB_DATABASE_URL`: a restart forgets it, and
+  the task's result is then only on the task. With Postgres it is kept.
 
 ## Security
 
@@ -197,9 +219,24 @@ every call; a bug or a compromise of `pmos-web` lets it act for anyone. The plan
 minutes' expiry, signed by a key only the web server holds), sent with each call and checked by
 the runtime and the tool server, so a request can only act for the person who signed in.
 
+## Persistence
+
+With `PMOS_WEB_DATABASE_URL`, `src/pg.rs` keeps sessions, per-PM settings and follow-ups in
+Postgres, migrating `migrations/` at start-up into its own table (`_pmos_web_migrations`).
+Tables: `web_sessions` (the SHA-256 of the id only, never the cookie), `web_user_settings`,
+`web_draft_edits`, `web_suggestions`, `web_practice_drafts`, `web_draft_flags`,
+`web_revision_tasks`, `web_followups`, `web_brief_days`. Every row is keyed by handle and every
+query filters on it. Idle and absolute session expiry are in the `UPDATE … WHERE` that reads a
+session, so an expired one can't be used before a purge; the purge (sessions past either
+limit, expired follow-ups and `changed` items, edits and suggestions untouched for 7 days,
+flags older than 30) runs at sign-in, so no scheduler is needed. `SettingsStore::update` is one
+transaction holding `FOR UPDATE` on the PM's settings row. Without a URL the stores are in
+memory, a warning is logged, and a restart signs everyone out and forgets edits, suggestions,
+practice drafts and follow-ups. The session's CSRF token is stored (it is not the cookie).
+An edit of a Slack draft is Slack text: the tool server drops the draft's own text after 24
+hours and the edit is unreachable by then, but the row itself waits for the 7-day purge.
+
 **Not built:** Entra ID sign-in (`auth::EntraProvider` documents the seam and is deliberately
-not an `AuthProvider`); persistence (sessions and settings are in memory: a restart signs
-everyone out and forgets edits, suggestions and practice drafts; `src/session.rs` and
-`src/settings.rs` say what a Postgres store needs); rate limiting (on sign-in, on asks and on
+not an `AuthProvider`); rate limiting (on sign-in, on asks and on
 change requests); an audit record of web actions (the tool server audits decisions, with the
 service token as the decider); and a per-PM limit on running tasks.
