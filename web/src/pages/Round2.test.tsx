@@ -135,8 +135,14 @@ describe('before and after', () => {
     const ins = [...list.querySelectorAll('ins.ba-word')].map((e) => e.textContent);
     expect(del.join(' ')).toMatch(/failure/);
     expect(ins.join(' ')).toMatch(/only/);
-    // the rest of the changed line is plain, not struck through
-    expect(list.querySelector('.ba-removed .ba-text')?.textContent).toContain('Customers on annual plans');
+    // a reworded paragraph is shown once, with the old and new words in the same line
+    const line = list.querySelector('.ba-changed .ba-text');
+    expect(line?.querySelector('del')).not.toBeNull();
+    expect(line?.querySelector('ins')).not.toBeNull();
+    expect(line?.textContent).toContain('Customers on annual plans');
+    // not by colour alone: the words carry a spoken cue
+    expect(line?.querySelector('del .sr-only')?.textContent).toMatch(/removed/);
+    expect(line?.querySelector('ins .sr-only')?.textContent).toMatch(/added/);
 
     // unchanged paragraphs are one folded row that opens
     const fold = within(list).getByRole('button', { name: /unchanged paragraph/ });
