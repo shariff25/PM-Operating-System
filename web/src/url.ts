@@ -60,3 +60,17 @@ export function parseRoute(path: string): Route {
 
 export const draftHref = (id: string) => `#/d/${encodeURIComponent(id)}`;
 export const taskHref = (id: string) => `#/a/${encodeURIComponent(id)}`;
+
+/** `/signed-out?reason=…` is where the server sends someone whose sign-in did not finish. */
+export function signedOutReason(path: string): string | null {
+  const m = /^\/signed-out(?:\?(.*))?$/.exec(path);
+  if (!m) return null;
+  return new URLSearchParams(m[1] ?? '').get('reason') ?? '';
+}
+
+/** The sign-in link for the page the PM was trying to reach, or plain `/api/auth/login`. */
+export function loginHref(path: string): string {
+  const base = '/api/auth/login';
+  if (path === '/' || path === '' || signedOutReason(path) !== null || !path.startsWith('/')) return base;
+  return `${base}?return_to=${encodeURIComponent(`/#${path}`)}`;
+}

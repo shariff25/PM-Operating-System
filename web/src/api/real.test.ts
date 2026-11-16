@@ -32,6 +32,14 @@ describe('real client', () => {
     expect((delCall![1]!.headers as Record<string, string>)['X-Pmos-Csrf']).toBe('tok-1');
   });
 
+  it('asks for the sign-in providers without a session or a CSRF header', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(json(200, { providers: ['entra', 'dev'] }));
+    const api = createRealClient({ fetchImpl });
+    expect(await api.providers()).toEqual(['entra', 'dev']);
+    expect(fetchImpl.mock.calls[0]![0]).toBe('/api/auth/providers');
+    expect(fetchImpl.mock.calls[0]![1]!.method).toBe('GET');
+  });
+
   it('turns an error body into a typed ApiError with the server sentence', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       json(409, { code: 'needs_external_confirm', error: 'This channel is shared outside the company.' }),

@@ -1,6 +1,7 @@
 import { ApiError, REJECT_REASONS } from './types';
 import type {
   Api,
+  AuthProvider,
   Brief,
   Draft,
   DraftSummary,
@@ -29,6 +30,8 @@ export interface MockOptions {
   hostile?: boolean;
   /** The brief is built but has nothing in it. */
   emptyBrief?: boolean;
+  /** Which sign-in methods GET /api/auth/providers lists. Default: development sign-in only. */
+  providers?: AuthProvider[];
   /** Start with this first_visit value. */
   firstVisit?: boolean;
 }
@@ -457,6 +460,10 @@ export function createMockClient(options: MockOptions = {}): Api {
   }
 
   return {
+    async providers() {
+      await wait();
+      return [...(options.providers ?? ['dev'])];
+    },
     async devLogin(handle) {
       await wait();
       if (!handle.trim()) throw new ApiError(403, 'not_a_member', 'That handle is not on the team.');
