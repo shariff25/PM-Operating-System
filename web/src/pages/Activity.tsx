@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import type { Task } from '../api';
+import { useApp } from '../app-context';
 import { Empty, NewRequestButton, PageHeader, Skeleton, TaskPill } from '../components/bits';
 import { Icon } from '../components/icons';
 import { copy } from '../copy';
@@ -40,6 +41,7 @@ export function TaskTable({ tasks, label }: { tasks: Task[]; label: string }) {
 
 /** The PM's recent requests, newest first. Each opens as its thread. */
 export function Activity() {
+  const { openPalette } = useApp();
   const { tasks, reloadTasks } = useData();
   useEffect(() => {
     void reloadTasks();
@@ -51,7 +53,14 @@ export function Activity() {
         <NewRequestButton />
       </PageHeader>
       {!tasks && <Skeleton rows={4} label={copy.activity.loading} />}
-      {tasks && tasks.length === 0 && <Empty icon="activity">{copy.activity.empty}</Empty>}
+      {tasks && tasks.length === 0 && (
+        <Empty
+          icon="activity"
+          action={<button type="button" className="btn btn-sm" onClick={() => openPalette()}>{copy.emptyActions.askFirst}</button>}
+        >
+          {copy.activity.empty}
+        </Empty>
+      )}
       {tasks && tasks.length > 0 && <TaskTable tasks={tasks} label={copy.activity.title} />}
     </div>
   );

@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { DraftStatus, DraftSummary } from '../api';
+import { useApp } from '../app-context';
 import { DraftPill, Empty, ErrorNote, NewRequestButton, PageHeader, Skeleton } from '../components/bits';
 import { Icon, kindIcon } from '../components/icons';
 import { copy } from '../copy';
 import { useData } from '../data';
-import { effectiveStatus } from '../drafts';
+import { draftWhere, effectiveStatus } from '../drafts';
 import { relTime, timeLeft } from '../time';
 import { draftHref } from '../url';
 
@@ -30,15 +31,20 @@ export function tabKeys<T>(e: KeyboardEvent, list: readonly T[], current: T, pic
 function DraftRow({ d, now }: { d: DraftSummary; now: number }) {
   const status = effectiveStatus(d, now);
   const left = status === 'pending' ? timeLeft(d.expires_at, now) : null;
+  const where = draftWhere(d);
+  const whereText = [copy.home.kindLabel(where.kind), where.channel].filter(Boolean).join(' · ');
   return (
     <li>
       <a className="trow drafts-grid" href={draftHref(d.id)}>
         <span className="tcell tcell-title">
           <span className="row-icon"><Icon name={kindIcon(d.kind)} size={15} /></span>
-          <span className="row-title">{d.title}</span>
+          <span className="row-main">
+            <span className="row-title">{d.title}</span>
+            <span className="row-meta row-where">{whereText}</span>
+          </span>
           {d.practice && <span className="tag">{copy.home.practiceBadge}</span>}
         </span>
-        <span className="tcell tcell-kind">{copy.home.kindLabel(d.kind)}</span>
+        <span className="tcell tcell-kind"><span className="cell-clip">{whereText}</span></span>
         <span className="tcell tcell-status"><DraftPill status={status} /></span>
         <span className="tcell tcell-left">
           {left ? (
@@ -55,6 +61,7 @@ function DraftRow({ d, now }: { d: DraftSummary; now: number }) {
 
 /** Every draft, filtered by what it needs: Needs you, Approved, Expired, All. */
 export function Drafts() {
+  const { openPalette } = useApp();
   const { drafts, draftsError, reloadDrafts } = useData();
   const [filter, setFilter] = useState<Filter>('pending');
   const tabs = useRef<Record<string, HTMLButtonElement | null>>({});
@@ -111,7 +118,24 @@ export function Drafts() {
           </ErrorNote>
         )}
         {!drafts && !draftsError && <Skeleton rows={4} label={copy.home.loadingDrafts} />}
-        {drafts && shown.length === 0 && <Empty icon="drafts">{empty}</Empty>}
+        {drafts && shown.length === 0 && (
+          <Empty
+            icon="drafts"
+            action={
+              drafts.length === 0 ? (
+                <button type="button" className="btn btn-sm" onClick={() => openPalette(copy.emptyActions.askDraftText)}>
+                  {copy.emptyActions.askDraft}
+                </button>
+              ) : filter !== 'all' ? (
+                <button type="button" className="btn btn-sm" onClick={() => pick('all')}>
+                  {copy.emptyActions.showAll}
+                </button>
+              ) : undefined
+            }
+          >
+            {empty}
+          </Empty>
+        )}
         {shown.length > 0 && (
           <div className="table">
             <div className="thead drafts-grid" aria-hidden="true">

@@ -9,7 +9,7 @@ import { useAsk, useData } from '../data';
 
 /** Who is waiting on the PM, who the PM waits on, and what changed, from the daily brief. */
 export function FollowUps() {
-  const { api } = useApp();
+  const { api, openPalette } = useApp();
   const { brief, setBrief } = useData();
   const { start, asking, error } = useAsk();
   const toast = useToast();
@@ -83,6 +83,17 @@ export function FollowUps() {
       {rowError && <ErrorNote>{rowError}</ErrorNote>}
       {!brief ? (
         <Skeleton rows={3} label={copy.activity.loading} />
+      ) : brief.waiting_on_you.length === 0 && brief.you_wait_on.length === 0 && brief.changed.length === 0 ? (
+        <Empty
+          icon="inbox"
+          action={
+            <button type="button" className="btn btn-sm" onClick={() => openPalette(copy.emptyActions.askOpenText)}>
+              {copy.emptyActions.askOpen}
+            </button>
+          }
+        >
+          {copy.followups.emptyAll}
+        </Empty>
       ) : (
         <>
           <section className="section" aria-labelledby="fu-you">

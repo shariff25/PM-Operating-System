@@ -27,6 +27,8 @@ export interface MockOptions {
   noDrafts?: boolean;
   /** Seed one draft whose text tries every trick (style, hidden text, form, remote image). */
   hostile?: boolean;
+  /** The brief is built but has nothing in it. */
+  emptyBrief?: boolean;
   /** Start with this first_visit value. */
   firstVisit?: boolean;
 }
@@ -95,50 +97,22 @@ Anecdotal, but vivid.
 Lifts exist.
 `;
 
+/** Sources as the real backend sends them: real titles or ids, no excerpt, and sometimes no link. */
 function sources(): Draft['sources'] {
   return [
-    {
-      id: 's1',
-      system: 'docs',
-      title: 'TCB grace period',
-      url: 'https://example.com/docs/tcb-grace',
-      excerpt: 'Access stays on for the grace period after a failed payment, then moves to read-only.',
-    },
-    {
-      id: 's2',
-      system: 'jira',
-      title: 'PAY-212 Payment failure handling',
-      url: 'https://example.com/jira/PAY-212',
-      excerpt: 'Support handled 140 tickets about sudden lock-outs last quarter.',
-    },
-    {
-      id: 's3',
-      system: 'confluence',
-      title: 'Billing roadmap 2027',
-      url: 'https://example.com/wiki/billing-roadmap',
-      excerpt: 'Involuntary churn is the top billing goal for H1.',
-    },
-    {
-      id: 's4',
-      system: 'slack',
-      title: '#billing thread, 12 November',
-      url: 'https://example.com/slack/billing/p1',
-      excerpt: 'Legal wants to review the terms of service wording before anything ships.',
-    },
-    {
-      id: 's5',
-      system: 'drive',
-      title: 'Churn analysis Q3.xlsx',
-      url: 'https://example.com/drive/churn-q3',
-      excerpt: null,
-    },
+    { id: 's1', system: 'docs', title: 'TCB grace period', url: 'https://example.com/docs/tcb-grace', excerpt: null },
+    { id: 's2', system: 'jira', title: 'PAY-212: Payment failure handling', url: 'https://example.com/jira/PAY-212', excerpt: null },
+    { id: 's3', system: 'confluence', title: 'Confluence page 12345', url: null, excerpt: null },
+    { id: 's4', system: 'slack', title: 'Slack thread in C01', url: 'https://example.com/slack/billing/p1', excerpt: null },
+    { id: 's5', system: 'drive', title: 'Churn analysis Q3.xlsx', url: 'https://example.com/drive/churn-q3', excerpt: null },
   ];
 }
 
 interface MockTask {
   task: Task;
   startedAt: number;
-  plan: { at: number; text: string; kind?: string }[];
+  plan: { at: number; text: string }[];
+  busy: boolean;
   outcome: 'done' | 'failed' | 'draft';
   draftId: string | null;
   settledAfter: number;
@@ -288,7 +262,7 @@ export function createMockClient(options: MockOptions = {}): Api {
   if (!options.noDrafts) {
     const seed = (id: string, text: string, ago: number, rest: Partial<Task>) => {
       const at = now0 - ago;
-      const ev = (kind: string, t: string, dt: number): TaskEvent => ({ at: iso(at + dt), kind, text: t });
+      const ev = (t: string, dt: number): TaskEvent => ({ at: iso(at + dt), kind: 'milestone', text: t });
       const task: Task = {
         id,
         bot: 'pm-ana',
@@ -299,17 +273,16 @@ export function createMockClient(options: MockOptions = {}): Api {
         draft_ids: [],
         created_at: iso(at),
         updated_at: iso(at + 40_000),
+        progress: null,
+        retrying: false,
         events: [
-          ev('queued', 'Queued', 0),
-          ev('claimed', 'Claimed by pm-ana', 1000),
-          ev('milestone', 'Reading Jira', 2000),
-          ev('progress', '1 of 2 done', 9000),
-          ev('milestone', 'Reading Confluence', 10_000),
-          ev('milestone', 'Putting the answer together', 30_000),
+          ev('Reading Jira', 2000),
+          ev('Reading Confluence', 10_000),
+          ev('Putting the answer together', 30_000),
         ],
         ...rest,
       };
-      tasks.set(id, { task, startedAt: at, plan: [], outcome: 'done', draftId: null, settledAfter: 0 });
+      tasks.set(id, { task, startedAt: at, plan: [], busy: false, outcome: 'done', draftId: null, settledAfter: 0 });
     };
     seed('tsk_seed_failed', 'Summarize the DPA thread with Legal', 3 * 24 * HOUR, {
       status: 'failed',
@@ -413,17 +386,10 @@ export function createMockClient(options: MockOptions = {}): Api {
     const wantsDraft = /draft|prd|write|reply|nudge/i.test(text);
     const failing = /fail|break/i.test(text) && !failedOnce.has(text);
     if (failing) failedOnce.add(text);
-    // The runtime also sends bookkeeping events (queued, claimed, started, counts). The app must
-    // show only the milestones, so the sample data sends both.
+    // The backend sends milestones only, plus a checklist count and a retry flag.
     const plan = [
-      { at: 0, text: 'Queued', kind: 'queued' },
-      { at: 0, text: 'Claimed by pm-ana', kind: 'claimed' },
-      { at: 0, text: 'Started', kind: 'started' },
       { at: 0, text: 'Reading Jira' },
-      { at: 0.5, text: '1 of 3 done', kind: 'progress' },
       { at: 1, text: 'Reading Confluence' },
-      ...(/busy/i.test(text) ? [{ at: 1.5, text: 'The model is busy, retrying', kind: 'retry' }] : []),
-      { at: 1.2, text: '2 of 3 done', kind: 'progress' },
       { at: 2, text: wantsDraft ? 'Writing the draft' : 'Putting the answer together' },
     ];
     const task: Task = {
@@ -436,15 +402,18 @@ export function createMockClient(options: MockOptions = {}): Api {
       draft_ids: [],
       created_at: iso(t0),
       updated_at: iso(t0),
+      progress: null,
+      retrying: false,
       events: [],
     };
     tasks.set(id, {
       task,
       startedAt: t0,
       plan: plan.map((p) => ({ ...p, at: p.at * stepMs })),
+      busy: /busy/i.test(text),
       outcome: failing ? 'failed' : wantsDraft ? 'draft' : 'done',
       draftId: null,
-      settledAfter: 3 * stepMs,
+      settledAfter: (/busy/i.test(text) ? 12 : 3) * stepMs,
     });
     return clone(task);
   }
@@ -452,16 +421,24 @@ export function createMockClient(options: MockOptions = {}): Api {
   function advance(m: MockTask): Task {
     const elapsed = Date.now() - m.startedAt;
     const t = m.task;
-    if (t.status === 'done' || t.status === 'failed' || t.status === 'needs_approval') return t;
+    if (t.status === 'done' || t.status === 'failed' || t.status === 'needs_approval') {
+      t.retrying = false;
+      return t;
+    }
     const events: TaskEvent[] = [];
     for (const p of m.plan) {
       if (elapsed >= p.at) {
-        events.push({ at: iso(m.startedAt + p.at), kind: p.kind ?? 'milestone', text: p.text });
+        events.push({ at: iso(m.startedAt + p.at), kind: 'milestone', text: p.text });
       }
     }
     t.events = events;
+    // A checklist of the three steps appears once the first one is under way.
+    t.progress = events.length > 0 ? { done: Math.max(events.length - 1, 0), total: m.plan.length } : null;
+    t.retrying = m.busy && elapsed >= 1.3 * stepMs && elapsed < 11 * stepMs;
     t.status = elapsed > 0 || stepMs === 0 ? 'working' : 'queued';
     if (elapsed >= m.settledAfter) {
+      t.progress = t.progress ? { done: t.progress.total, total: t.progress.total } : null;
+      t.retrying = false;
       t.updated_at = iso(Date.now());
       if (m.outcome === 'failed') {
         t.status = 'failed';
@@ -557,6 +534,8 @@ export function createMockClient(options: MockOptions = {}): Api {
         // drop the last paragraph block
         const blocks = d.body.trimEnd().split(/\n\n/);
         next = (blocks.length > 1 ? blocks.slice(0, -1) : blocks).join('\n\n') + '\n';
+        // and tighten a sentence, so the before and after shows changed words too
+        next = next.replace('lose access the moment a payment fails, even when the failure is a card that expired yesterday', 'lose access the moment a payment fails, even when the card only expired yesterday');
       } else {
         next = [...lines.filter((l, i) => !(i === lines.length - 1 && l === '')), '', `_Revised: ${instruction}_`, ''].join('\n');
       }
@@ -692,6 +671,9 @@ export function createMockClient(options: MockOptions = {}): Api {
       await wait();
       guard();
       if (!briefBuilt) throw new ApiError(501, 'not_built', 'The daily brief is not built yet.');
+      if (options.emptyBrief) {
+        return { date: iso(Date.now()).slice(0, 10), changed: [], waiting_on_you: [], you_wait_on: [] };
+      }
       return {
         date: iso(Date.now()).slice(0, 10),
         changed: [
