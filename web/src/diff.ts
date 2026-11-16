@@ -13,6 +13,8 @@ export interface DiffLine {
   merged?: boolean;
   /** On an added line paired with a removed one: the old and new words in one run of text. */
   inline?: InlinePart[];
+  /** On an unchanged line: only its list marker differs ("1." became "-"). Shown as the new line, not as a change. */
+  markerOnly?: boolean;
 }
 
 /** A run of words in a paragraph shown once: kept as is, struck through, or newly added. */
@@ -23,6 +25,17 @@ export interface InlinePart {
 
 /** A paired paragraph is shown inline only when at least this share of its words is kept. */
 export const INLINE_MIN_SHARED = 0.4;
+
+const MARKER = /^(\s*)((?:[-*+]|\d+[.)])\s+)/;
+
+/** A list item's marker, apart from its words. Lines that are not list items have no marker. */
+function splitMarker(line: string): { marker: string; rest: string } {
+  const m = MARKER.exec(line);
+  return m ? { marker: m[0], rest: line.slice(m[0].length) } : { marker: '', rest: line };
+}
+
+/** The line with its list marker (but not its indent) taken out, so two markers compare equal. */
+const markerKey = (line: string) => line.replace(MARKER, '$1');
 
 type Op = { kind: 'same' | 'added' | 'removed'; a?: number; b?: number };
 
@@ -152,9 +165,12 @@ export function diffInline(before: string, after: string): { parts: InlinePart[]
 export function diffLines(before: string, after: string): DiffLine[] {
   const a = before.split('\n');
   const b = after.split('\n');
-  const lines: DiffLine[] = lcsOps(a, b).map((op) =>
+  // Lines are matched without their list markers, so a changed marker alone is not a change.
+  const lines: DiffLine[] = lcsOps(a.map(markerKey), b.map(markerKey)).map((op) =>
     op.kind === 'same'
-      ? { kind: 'same', text: a[op.a!]! }
+      ? a[op.a!] === b[op.b!]
+        ? { kind: 'same', text: b[op.b!]! }
+        : { kind: 'same', text: b[op.b!]!, markerOnly: true }
       : op.kind === 'removed'
         ? { kind: 'removed', text: a[op.a!]! }
         : { kind: 'added', text: b[op.b!]! },
@@ -176,13 +192,17 @@ export function diffLines(before: string, after: string): DiffLine[] {
     for (let k = 0; k < pairs; k++) {
       const r = removed[k]!;
       const ad = added[k]!;
-      const words = diffInline(r.text, ad.text);
+      // Compare the words only; a list marker that changed is carried over unchanged from the new line.
+      const old = splitMarker(r.text);
+      const now = splitMarker(ad.text);
+      const words = diffInline(old.rest, now.rest);
       if (words.most > 0 && words.shared / words.most >= INLINE_MIN_SHARED) {
-        const sides = diffWords(r.text, ad.text);
-        r.parts = sides.before;
-        ad.parts = sides.after;
+        const sides = diffWords(old.rest, now.rest);
+        const lead = now.marker ? [{ text: now.marker, changed: false }] : [];
+        r.parts = [...(old.marker ? [{ text: old.marker, changed: false }] : []), ...sides.before];
+        ad.parts = [...lead, ...sides.after];
         r.merged = true;
-        ad.inline = words.parts;
+        ad.inline = [...(now.marker ? [{ text: now.marker, kind: 'same' as const }] : []), ...words.parts];
       }
     }
     // Show each run as the old lines, then the new lines.
@@ -196,6 +216,8 @@ export function diffLines(before: string, after: string): DiffLine[] {
 export interface DiffBlock {
   lines: DiffLine[];
   changed: boolean;
+  /** Nothing in the paragraph changed except its list markers. */
+  styleOnly: boolean;
 }
 
 /**
@@ -206,7 +228,10 @@ export function diffBlocks(diff: DiffLine[]): DiffBlock[] {
   const blocks: DiffBlock[] = [];
   let current: DiffLine[] = [];
   const close = () => {
-    if (current.length > 0) blocks.push({ lines: current, changed: current.some((l) => l.kind !== 'same') });
+    if (current.length > 0) {
+      const changed = current.some((l) => l.kind !== 'same');
+      blocks.push({ lines: current, changed, styleOnly: !changed && current.some((l) => l.markerOnly) });
+    }
     current = [];
   };
   for (const l of diff) {
