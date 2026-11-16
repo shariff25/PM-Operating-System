@@ -1,0 +1,7 @@
+{
+  "name": "@pmos/web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PM OS web app",
+  "type": "module"
+}
