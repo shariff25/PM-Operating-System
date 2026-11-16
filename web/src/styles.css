@@ -764,6 +764,13 @@ a.trow:hover { background: var(--bg); color: var(--ink); }
 .ba-word { text-decoration: none; border-radius: 3px; padding: 0 1px; font-weight: 600; }
 ins.ba-word { background: var(--add-word); }
 del.ba-word { background: var(--del-word); text-decoration: line-through; text-decoration-thickness: 1px; }
+.ba-soft { background: transparent; color: var(--muted); }
+.ba-soft .ba-text { text-decoration: line-through; text-decoration-thickness: 1px; }
+.ba-clamp { max-height: 3.3em; overflow: hidden; }
+.ba-removed-group { padding-bottom: 2px; }
+.ba-more { display: inline-flex; align-items: center; gap: 4px; min-height: 28px; margin: 0 0 2px 22px; padding: 2px 6px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer; }
+.ba-more:hover { color: var(--ink); background: var(--surface-2); }
+.ba-note { display: flex; align-items: center; gap: 6px; padding: 5px 10px; background: var(--bg); color: var(--muted); font-size: 12px; }
 .ba-fold { background: var(--bg); }
 .ba-fold-btn { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 30px; padding: 4px 10px; border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer; text-align: left; }
 .ba-fold-btn:hover { color: var(--ink); background: var(--surface-2); }
