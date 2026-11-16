@@ -131,6 +131,7 @@ pub fn router_with(
     // Orchestrator only.
     let admin = Router::new()
         .route("/grants", post(create_grant))
+        .route("/approvals/{id}/sources", get(approval_sources))
         .route("/reindex", post(reindex))
         .route("/ledger/summary", get(ledger_summary))
         .route("/credentials", get(list_credentials))
@@ -452,6 +453,7 @@ async fn list_approvals(
         }
         return match state.svc.pending_approvals(&user, BOT_PENDING_LIMIT).await {
             Ok((approvals, total)) => {
+                let approvals = state.svc.approvals_json(&approvals).await;
                 Json(json!({ "approvals": approvals, "total": total })).into_response()
             }
             Err(e) => unavailable(e),
@@ -465,15 +467,45 @@ async fn list_approvals(
         },
     };
     match state.svc.approvals(&user, status).await {
-        Ok(items) => Json(json!({ "items": items })).into_response(),
+        Ok(items) => {
+            let items = state.svc.approvals_json(&items).await;
+            Json(json!({ "items": items })).into_response()
+        }
         Err(e) => unavailable(e),
     }
 }
 
 async fn get_approval(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.svc.approval(&id).await {
-        Ok(Some(item)) => Json(item).into_response(),
+        Ok(Some(item)) => Json(state.svc.approval_json(&item).await).into_response(),
         Ok(None) => error(StatusCode::NOT_FOUND, "no such approval item"),
+        Err(e) => unavailable(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SourcesQuery {
+    user: Option<String>,
+}
+
+/// What the run that drafted an item read (`sources.rs`), for its own user only: `user`
+/// must be the item's user, and anything else answers `404` as a missing item does, so the
+/// answer never confirms that someone else's item exists. Service token only.
+async fn approval_sources(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SourcesQuery>,
+) -> Response {
+    let Some(user) = q.user.filter(|u| !u.trim().is_empty()) else {
+        return error(StatusCode::BAD_REQUEST, "`user` is required");
+    };
+    let item = match state.svc.approval(&id).await {
+        Ok(Some(item)) if item.user == user => item,
+        Ok(_) => return error(StatusCode::NOT_FOUND, "no such approval item"),
+        Err(e) => return unavailable(e),
+    };
+    match state.svc.approval_sources(&item).await {
+        Ok(report) => Json(report).into_response(),
         Err(e) => unavailable(e),
     }
 }
@@ -530,7 +562,7 @@ async fn decide(
         .decide_verdict(client, &id, &body.decided_by, verdict, Utc::now())
         .await
     {
-        Ok(item) => Json(item).into_response(),
+        Ok(item) => Json(state.svc.approval_json(&item).await).into_response(),
         Err(DecisionError::Decide(DecideError::Store(e))) => unavailable(e),
         Err(e @ DecisionError::Decide(DecideError::Expired)) => {
             coded(StatusCode::CONFLICT, "expired", e.to_string(), json!({}))

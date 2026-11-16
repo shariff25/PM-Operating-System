@@ -30,7 +30,7 @@ use crate::approvals::{
     args_hash, redact_args, reply_message, reply_thread, ApprovalItem, ApprovalRepo, DecideError,
     Decision, Drafted, NewItem, Status, Verdict, GRANT_TTL_MINUTES, REPLY_TOOL,
 };
-use crate::audit::{AuditEvent, AuditSink};
+use crate::audit::{AuditEvent, AuditSink, ReadEvent};
 use crate::context::{
     query_terms, snippet, ContextDoc, ContextIndex, Hit, ReindexReport, SearchResults,
 };
@@ -895,6 +895,38 @@ impl AuditSink for PgStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn reads(
+        &self,
+        user: &str,
+        run_id: &str,
+        until: DateTime<Utc>,
+        limit: usize,
+    ) -> StoreResult<Option<Vec<ReadEvent>>> {
+        // `audit_events_run` covers `run_id`.
+        let rows = sqlx::query(
+            "SELECT at, tool, sources FROM audit_events
+             WHERE run_id = $1 AND user_handle = $2 AND outcome = 'ok'
+               AND cardinality(sources) > 0 AND at <= $3
+             ORDER BY at DESC, id DESC
+             LIMIT $4",
+        )
+        .bind(run_id)
+        .bind(user)
+        .bind(until)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(ReadEvent {
+                at: r.try_get("at")?,
+                tool: r.try_get("tool")?,
+                sources: r.try_get("sources")?,
+            });
+        }
+        Ok(Some(out))
     }
 }
 

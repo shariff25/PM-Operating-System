@@ -63,7 +63,8 @@ fn slack_ts(value: &str) -> Result<&str, ConnectorError> {
     }
 }
 
-fn archive_url(channel: &str, ts: &str) -> String {
+/// A link to a Slack message or thread that works for anyone in the workspace who can see it.
+pub fn archive_url(channel: &str, ts: &str) -> String {
     format!(
         "https://slack.com/archives/{channel}/p{}",
         ts.replace('.', "")

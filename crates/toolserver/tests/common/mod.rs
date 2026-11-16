@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use pmos_toolserver::audit::{AuditEvent, AuditSink, MemoryAudit};
+use pmos_toolserver::audit::{AuditEvent, AuditSink, MemoryAudit, ReadEvent};
 use pmos_toolserver::catalog::Catalog;
 use pmos_toolserver::connectors::fake::FakeConnector;
 use pmos_toolserver::connectors::Connector;
@@ -93,6 +93,16 @@ impl AuditSink for SwitchAudit {
             return Err(StoreError("audit log unreachable".into()));
         }
         self.inner.record(event).await
+    }
+
+    async fn reads(
+        &self,
+        user: &str,
+        run_id: &str,
+        until: DateTime<Utc>,
+        limit: usize,
+    ) -> StoreResult<Option<Vec<ReadEvent>>> {
+        self.inner.reads(user, run_id, until, limit).await
     }
 }
 
