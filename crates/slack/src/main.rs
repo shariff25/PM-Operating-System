@@ -152,6 +152,7 @@ async fn main() -> Result<()> {
     let mut notifier = None;
     let mut digest = None;
     let mut snoozer = None;
+    let mut nudge_engine = None;
     if let Some(bots) = bots {
         tracing::info!(state_dir = %state_dir.display(), "notification cursor and snoozes kept here");
         snoozer = Some(tokio::spawn(
@@ -165,6 +166,14 @@ async fn main() -> Result<()> {
         } else {
             tracing::info!("PMOS_TRIAGE_AT is off: no triage digest");
         }
+        nudge_engine = pmos_slack::nudges::spawn(
+            &bots,
+            &default_tz,
+            &state_dir,
+            optional,
+            shutdown.child_token(),
+        )
+        .map_err(|e| anyhow!(e))?;
         socket = socket.with_bots(bots.clone());
         notifier = Some(tokio::spawn(
             Notifier::new(bots, state_dir).run(shutdown.child_token()),
@@ -184,6 +193,9 @@ async fn main() -> Result<()> {
     }
     if let Some(digest) = digest {
         let _ = tokio::time::timeout(Duration::from_secs(5), digest).await;
+    }
+    if let Some(nudge_engine) = nudge_engine {
+        let _ = tokio::time::timeout(Duration::from_secs(5), nudge_engine).await;
     }
     if let Some(snoozer) = snoozer {
         let _ = tokio::time::timeout(Duration::from_secs(5), snoozer).await;
