@@ -40,17 +40,25 @@ describe('home', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('lists drafts newest first with pending ones marked and Slack expiry shown', async () => {
+  it('lists drafts that need a decision first, then expired ones, then decided ones', async () => {
     renderApp();
     const list = await screen.findByRole('region', { name: 'Drafts' });
     await within(list).findByText('PRD: TCB grace period setting');
     const links = within(list).getAllByRole('link');
     expect(links.length).toBeGreaterThanOrEqual(5);
-    // pending first, the decided draft last
-    expect(links[links.length - 1]).toHaveTextContent('Weekly update');
-    expect(within(links[links.length - 1]!).getByText('Approved')).toBeInTheDocument();
-    expect(within(list).getAllByText(copy.home.statusLabel('pending')).length).toBe(4);
+    const badges = links.map((l) => within(l).getAllByText(/^(Needs you|Expired|Approved|Rejected|Failed)$/)[0]!.textContent);
+    expect(badges).toEqual(['Needs you', 'Needs you', 'Needs you', 'Expired', 'Approved']);
+    expect(links[3]).toHaveTextContent('Reply to Dana in #migrations');
+    expect(links[4]).toHaveTextContent('Weekly update');
     expect(within(list).getByText(/Expires in \d+ h/)).toBeInTheDocument();
+  });
+
+  it('labels a draft whose time has passed as Expired even while the server still says pending', async () => {
+    renderApp();
+    const list = await screen.findByRole('region', { name: 'Drafts' });
+    const row = (await within(list).findByText('Reply to Dana in #migrations')).closest('a')!;
+    expect(within(row).getByText('Expired')).toHaveClass('badge-expired');
+    expect(within(row).queryByText('Needs you')).not.toBeInTheDocument();
   });
 
   it('shows waiting-on lists from the brief and drafts a reply into the same panel', async () => {
@@ -87,6 +95,26 @@ describe('home', () => {
   it('shows the empty state when there are no drafts and it is not a first visit', async () => {
     renderApp({ noDrafts: true, firstVisit: false });
     await screen.findByText(copy.emptyDrafts);
+  });
+
+  it('shows only http and https follow-up links, and plain text for anything else', async () => {
+    const user = userEvent.setup();
+    renderApp({
+      wrap: (api) => {
+        const orig = api.brief.bind(api);
+        api.brief = async () => {
+          const b = await orig();
+          b.waiting_on_you[0]!.url = 'javascript:alert(1)';
+          b.changed[0]!.url = 'data:text/html,x';
+          return b;
+        };
+        return api;
+      },
+    });
+    await screen.findByText('asked about the pricing page');
+    expect(document.querySelector('a[href^="javascript:"], a[href^="data:"]')).toBeNull();
+    expect(screen.getAllByText(/not a web link/).length).toBe(2);
+    await user.click(screen.getAllByRole('button', { name: /Not mine/ })[0]!);
   });
 
   it('shows the sign-in page when signed out, and signs in with a handle', async () => {

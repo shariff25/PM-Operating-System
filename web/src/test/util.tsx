@@ -1,6 +1,7 @@
 import { render } from '@testing-library/react';
-import { createMockClient } from '../api';
-import type { Api, MockOptions } from '../api';
+import type { Api } from '../api';
+import { createMockClient } from '../api/mock';
+import type { MockOptions } from '../api/mock';
 import { App } from '../App';
 
 export function renderApp(opts: MockOptions & { hash?: string; wrap?: (api: Api) => Api } = {}) {
