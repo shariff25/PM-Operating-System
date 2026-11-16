@@ -1,7 +1,7 @@
 ---
 title: Product sense
 owner: "TODO"
-version: "0.1.0"
+version: "0.2.0"
 ---
 
 # Product sense
@@ -68,7 +68,8 @@ solves it. Work through the steps in order. Most weak proposals skip the first f
 
 ## Traps
 - **Solution first.** The request names a feature; the problem is "users lack the feature".
-  Ask who has the problem and what they do today before anything else.
+  Find who has the problem and what they do today in the sources before anything else; ask
+  the PM only if the sources don't say, as one question with a default.
 - **Averages hiding segments.** One number for everyone, when the segments move differently.
 - **Building for the loudest customer.** One large account asking four times is one account.
   Check the ask against the segment you chose.

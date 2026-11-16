@@ -1,0 +1,26 @@
+# seed: replace with case cards
+# Look before you ask (content/roles/pm-assistant/ROLE.md): when the sources are thin, draft
+# with labelled assumptions rather than refuse to start, and never invent. No fixture covers
+# on-premises hardware appliances, so each fact about them in the draft is an assumption
+# marked `[unverified]` and listed under Open questions (content/templates/prd.md), and the
+# reply says what it couldn't find.
+# Set regression: true once it passes, so the gate stops it breaking again.
+id: look-first-thin-sources-drafts-flagged
+ask: "Go ahead without questions: a PRD in the PM space for running Acme Vault on on-premises hardware appliances."
+expect:
+  approvals: 1
+  must_decline: true
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["PRD:", "[unverified]", "Open questions"]
+      must_not_include: ["<think>"]
+cluster: prd-draft
+tags:
+  - model/answered-beyond-sources
+  - model/draft-content
