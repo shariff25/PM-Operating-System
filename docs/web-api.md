@@ -58,7 +58,7 @@ document.
 | `GET /api/drafts/{id}/suggestion` | | `{suggestion: Suggestion \| null}` |
 | `POST /api/drafts/{id}/suggestion/accept` | | `Draft`, with the suggested text as its body |
 | `POST /api/drafts/{id}/suggestion/reject` | | `Draft`, unchanged |
-| `POST /api/drafts/{id}/approve` | `{confirm_external?: bool}` | `Draft` with `status: "approved"` and `result_url`. `409 needs_external_confirm`, `409 audience_blocked`, `409 expired`, `409 not_pending`. |
+| `POST /api/drafts/{id}/approve` | `{confirm_external?: bool, version?: string}` | `Draft` with `status: "approved"` and `result_url`. `409 needs_external_confirm`, `409 audience_blocked`, `409 expired`, `409 not_pending`, `409 stale`. |
 | `POST /api/drafts/{id}/reject` | `{reason?}` | `Draft` with `status: "rejected"`. `reason` is one of `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft`, `other`. |
 | `POST /api/drafts/practice` | | `Draft`, a practice draft for this PM. Idempotent while one exists. |
 | `DELETE /api/drafts/{id}` | | `204`, practice drafts only; `409 not_practice` otherwise. |
@@ -72,7 +72,7 @@ document.
 // Draft = DraftSummary plus
 {"body": "markdown", "edited": false,
  "target": {"system": "confluence", "label": "Space PM, under Specs", "url": null},
- "sources": [Source], "result_url": null, "external": false}
+ "sources": [Source], "result_url": null, "external": false, "version": "7"}
 
 // Source
 {"id": "s1", "system": "docs", "title": "TCB grace period", "url": "https://…",
@@ -87,6 +87,12 @@ document.
 - `Suggestion.status` is `working`, `ready` or `failed`. `body` is set when `ready`, `error`
   (a plain sentence) when `failed`.
 - `expires_at` is set for Slack drafts, which expire after 24 hours.
+- `version` is optional and opaque: it changes whenever the draft text or title changes (an edit,
+  an accepted suggestion). The app sends back the `version` of the draft the PM was looking at in
+  the approve body. When it is sent and does not match the stored draft, the server answers
+  `409 stale` and publishes nothing; the app reloads the draft and tells the PM to read it again.
+  A server that does not set `version` ignores the field, and an approve without it skips the
+  check.
 - `external` is true when approving would post to a channel shared outside the company; the
   app must then ask before sending `confirm_external: true`.
 - **A practice draft** (`practice: true`) lives only in `pmos-web`. Approving it creates

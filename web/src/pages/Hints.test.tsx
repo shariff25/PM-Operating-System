@@ -1,59 +1,132 @@
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import type { Api } from '../api';
 import { copy } from '../copy';
 import { renderApp } from '../test/util';
 
+const menuItems = () => [...document.querySelectorAll<HTMLElement>('[role="menu"] [role^="menuitem"]')];
+const visible = () => [...document.querySelectorAll('[data-hint]')].map((e) => e.getAttribute('data-hint'));
+const dismiss = async (user: ReturnType<typeof userEvent.setup>, name: string) =>
+  user.click((document.querySelector(`[data-hint="${name}"]`) as HTMLElement).querySelector('button')!);
+
 describe('hints', () => {
-  it('shows each hint in place once, and records the dismissal', async () => {
+  it('shows one hint at a time, in the order sources, ask, approve', async () => {
     const user = userEvent.setup();
     renderApp({ hash: '/d/apr_prd' });
     await screen.findByText(copy.hints.sources);
-    expect(screen.getByText(copy.hints.ask)).toBeInTheDocument();
-    expect(screen.getByText(copy.hints.approve)).toBeInTheDocument();
+    expect(visible()).toEqual(['sources']);
 
-    const sources = document.querySelector('[data-hint="sources"]') as HTMLElement;
-    await user.click(sources.querySelector('button')!);
-    await waitFor(() => expect(screen.queryByText(copy.hints.sources)).not.toBeInTheDocument());
-    expect(screen.getByText(copy.hints.ask)).toBeInTheDocument();
+    await dismiss(user, 'sources');
+    await screen.findByText(copy.hints.ask);
+    expect(visible()).toEqual(['ask']);
+
+    await dismiss(user, 'ask');
+    await screen.findByText(copy.hints.approve);
+    expect(visible()).toEqual(['approve']);
+
+    await dismiss(user, 'approve');
+    await waitFor(() => expect(visible()).toEqual([]));
   });
 
-  it('does not bring a dismissed hint back on the next visit', async () => {
+  it('records each dismissal with the server and never brings a dismissed hint back', async () => {
     const user = userEvent.setup();
-    const first = renderApp({ hash: '/d/apr_prd' });
+    const seen = vi.fn();
+    const first = renderApp({
+      hash: '/d/apr_prd',
+      wrap: (a: Api) => {
+        const orig = a.markHintSeen.bind(a);
+        a.markHintSeen = (n) => { seen(n); return orig(n); };
+        return a;
+      },
+    });
+    await screen.findByText(copy.hints.sources);
+    await dismiss(user, 'sources');
     await screen.findByText(copy.hints.ask);
-    await user.click((document.querySelector('[data-hint="ask"]') as HTMLElement).querySelector('button')!);
-    await waitFor(() => expect(screen.queryByText(copy.hints.ask)).not.toBeInTheDocument());
-    const me = await first.api.me();
-    expect(me.hints_seen).toEqual(['ask']);
+    expect(seen).toHaveBeenCalledWith('sources');
+    expect((await first.api.me()).hints_seen).toEqual(['sources']);
+
+    // leave and come back: the dismissed hint stays gone, the next one is still waiting
+    await user.click(screen.getByRole('link', { name: copy.draft.back }));
+    await screen.findByLabelText(copy.home.askLabel);
+    window.location.hash = '/d/apr_jira';
+    await screen.findByText(copy.hints.ask);
+    expect(screen.queryByText(copy.hints.sources)).not.toBeInTheDocument();
+    expect(visible()).toEqual(['ask']);
   });
 
   it('hides hints when nudges are off and brings them back with Show hints again', async () => {
     const user = userEvent.setup();
     renderApp({ hash: '/d/apr_prd' });
-    await screen.findByText(copy.hints.approve);
+    await screen.findByText(copy.hints.sources);
 
     await user.click(screen.getByRole('button', { name: /Menu for/ }));
-    await user.click(screen.getByRole('switch', { name: copy.menu.nudges }));
-    await waitFor(() => expect(screen.queryByText(copy.hints.approve)).not.toBeInTheDocument());
-    expect(screen.queryByText(copy.hints.ask)).not.toBeInTheDocument();
-    expect(screen.queryByText(copy.hints.sources)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('menuitemcheckbox', { name: /Hints and nudges/ }));
+    await waitFor(() => expect(visible()).toEqual([]));
 
-    await user.click(screen.getByRole('switch', { name: copy.menu.nudges }));
-    await screen.findByText(copy.hints.approve);
+    await user.click(screen.getByRole('menuitemcheckbox', { name: /Hints and nudges/ }));
+    await screen.findByText(copy.hints.sources);
 
-    // dismiss one, then reset
-    await user.click((document.querySelector('[data-hint="approve"]') as HTMLElement).querySelector('button')!);
-    await waitFor(() => expect(screen.queryByText(copy.hints.approve)).not.toBeInTheDocument());
-    await user.click(screen.getByRole('button', { name: copy.menu.showHints }));
+    // dismiss two, then reset: the order starts again at the first
+    await dismiss(user, 'sources');
+    await dismiss(user, 'ask');
     await screen.findByText(copy.hints.approve);
+    await user.click(screen.getByRole('button', { name: /Menu for/ }));
+    await user.click(screen.getByRole('menuitem', { name: copy.menu.showHints }));
+    await screen.findByText(copy.hints.sources);
+    expect(visible()).toEqual(['sources']);
   });
 
   it('signs out from the menu', async () => {
     const user = userEvent.setup();
     renderApp();
     await user.click(await screen.findByRole('button', { name: /Menu for/ }));
-    await user.click(screen.getByRole('button', { name: copy.menu.signOut }));
+    await user.click(screen.getByRole('menuitem', { name: copy.menu.signOut }));
     await screen.findByLabelText(copy.signIn.handleLabel);
+  });
+});
+
+describe('user menu keyboard', () => {
+  it('opens with ArrowDown, moves with the arrows, and Escape returns focus to the button', async () => {
+    const user = userEvent.setup();
+    renderApp();
+    const button = await screen.findByRole('button', { name: /Menu for/ });
+    expect(button).toHaveAttribute('aria-haspopup', 'menu');
+    button.focus();
+    await user.keyboard('{ArrowDown}');
+    expect(button).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+    const items = menuItems();
+    expect(items).toHaveLength(3);
+    expect(items[0]).toHaveFocus();
+    await user.keyboard('{ArrowDown}');
+    expect(items[1]).toHaveFocus();
+    await user.keyboard('{End}');
+    expect(items[2]).toHaveFocus();
+    await user.keyboard('{ArrowDown}');
+    expect(items[0]).toHaveFocus();
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(button).toHaveFocus();
+  });
+
+  it('opens with Enter, and ArrowUp goes to the last item', async () => {
+    const user = userEvent.setup();
+    renderApp();
+    const button = await screen.findByRole('button', { name: /Menu for/ });
+    button.focus();
+    await user.keyboard('{Enter}');
+    expect(menuItems()[0]).toHaveFocus();
+    await user.keyboard('{ArrowUp}');
+    expect(menuItems()[2]).toHaveFocus();
+  });
+
+  it('closes when you click elsewhere', async () => {
+    const user = userEvent.setup();
+    renderApp();
+    await user.click(await screen.findByRole('button', { name: /Menu for/ }));
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+    await user.click(screen.getByRole('heading', { level: 1 }));
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
   });
 });

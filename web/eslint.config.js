@@ -4,7 +4,7 @@ import tseslint from 'typescript-eslint';
 import reactHooks from 'eslint-plugin-react-hooks';
 
 export default tseslint.config(
-  { ignores: ['dist'] },
+  { ignores: ['dist', 'test-results', 'playwright-report'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
@@ -16,5 +16,5 @@ export default tseslint.config(
       'react-hooks/exhaustive-deps': 'warn',
     },
   },
-  { files: ['*.config.{js,ts}'], languageOptions: { globals: { ...globals.node } } },
+  { files: ['*.config.{js,ts}', 'e2e/**'], languageOptions: { globals: { ...globals.node } } },
 );
