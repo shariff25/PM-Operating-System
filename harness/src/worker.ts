@@ -265,6 +265,16 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 
 type AbortReason = "stopped" | "lost";
 
+/**
+ * Is this the rejection LangChain leaves behind when we abort a model call? Aborting the
+ * signal we pass to `agent.invoke` makes `@langchain/core` reject an internal promise with
+ * `new Error(<our abort reason>)` that nothing awaits. The task itself is handled (see
+ * `raceAbort`); this stray rejection must not take the worker down with it.
+ */
+export function isAbortRejection(reason: unknown): boolean {
+  return reason instanceof Error && (reason.message === "lost" || reason.message === "stopped");
+}
+
 class TaskAborted extends Error {
   constructor(readonly reason: AbortReason) {
     super(`task aborted: ${reason}`);
