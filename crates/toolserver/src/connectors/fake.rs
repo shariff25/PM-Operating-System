@@ -502,6 +502,10 @@ impl Connector for FakeConnector {
         &self.system
     }
 
+    fn mode(&self) -> &'static str {
+        "fake"
+    }
+
     async fn read(
         &self,
         caller: Caller<'_>,

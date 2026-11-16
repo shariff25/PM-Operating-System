@@ -64,11 +64,20 @@ The callback's `reason`s, for the app's signed-out page:
 | `DELETE /api/me/hints` | | `Me`, with `hints_seen` empty ("Show hints again") |
 
 ```json
-{"handle": "ana", "name": "Ana Silva", "roles": ["pm"], "csrf_token": "…",
- "first_visit": true, "hints_seen": ["sources"], "nudges": true}
+{"handle": "ana", "name": "Ana Silva", "roles": ["pm"],
+ "permissions": ["ask-bot", "view-own-tasks", "manage-own-routines", "decide-own-approval",
+                 "view-own-traces", "link-own-accounts"],
+ "csrf_token": "…", "first_visit": true, "hints_seen": ["sources"], "nudges": true}
 ```
 
 `first_visit` is true until the PM first opens a draft. `nudges: false` also hides hints.
+
+`permissions` lists what the person's roles allow (the permission matrix,
+`crates/contract/src/permissions.rs`), kebab-case, in a fixed order; an unknown role adds
+nothing. It is for showing and hiding parts of the app; the server checks every request
+itself. Show the Admin area when it contains `view-audit-log` or `manage-connectors` (see
+**Admin and auditor**). An older server leaves `permissions` out: treat that as `[]`. An
+auditor's is `["view-audit-log", "export-audit"]`; an admin's has all 18.
 
 ## Drafts
 
@@ -204,3 +213,206 @@ when a PM's daily brief finishes, it sends the items of the brief's machine-read
 (`docs/daily-brief.md`, "The web app's panels") here, with `PMOS_WEB_URL` and
 `PMOS_WEB_BRIEF_TOKEN` set on it. It sends nothing until a brief runs, so a PM with no brief
 routine has empty lists.
+
+## Admin and auditor
+
+Read-only views for the two roles beyond PM. Every route is `GET`; any other method is
+`405 method_not_allowed`. Roles come from `team.yaml`:
+
+| Route | `admin` | `auditor` | anyone else (`pm`, `reviewer`, `skill-author`) |
+| --- | --- | --- | --- |
+| `GET /api/admin/audit` | yes | yes | `403 forbidden` |
+| `GET /api/admin/audit/export` | yes | yes | `403 forbidden` |
+| `GET /api/admin/team` | yes | yes | `403 forbidden` |
+| `GET /api/admin/overview` | yes | yes | `403 forbidden` |
+| `GET /api/admin/connectors` | yes | `403 forbidden` | `403 forbidden` |
+
+The checks are the permission matrix: `audit` needs `view-audit-log`, `audit/export`
+`export-audit`, `team` and `overview` `view-audit-log` or `manage-members`, `connectors`
+`manage-connectors`. A person with several roles gets the union.
+
+**Errors** (always `{"code", "error"}`):
+
+| Status and code | When |
+| --- | --- |
+| `401 signed_out` | No live session. |
+| `403 not_a_member` | The handle is no longer in `team.yaml` (every session is ended). |
+| `403 forbidden` | The role doesn't allow this route. Also when the tool server, which checks the role again on its side, refuses. |
+| `400 bad_request` | A query parameter is malformed (see each route). Nothing is sent upstream. |
+| `502 upstream_unavailable` | The tool server didn't answer, or answered something unreadable. |
+| `503 team_unavailable` | `team.yaml` can't be read. |
+
+**What the auditor sees, and doesn't.** Metadata only: who did what, when, through which
+client, to which system and target id, with what outcome. Never a draft body, Slack text, a
+prompt, a model reply, a task result, a source title, an argument hash or a token. Audit
+events are kept (the table is append-only); nothing here deletes them. The auditor does not
+see connectors at all, and sees no PM's drafts or tasks (those routes need PM permissions an
+auditor doesn't have).
+
+**Every admin read is itself audited.** The tool server records each call as an event of its
+own (`action` `admin.audit`, `admin.audit_export`, `admin.accounts` for the team page,
+`admin.connectors`, `admin.overview`), with the viewer as `actor`, `client` `web`, `task_id`
+`admin`, and `outcome` `ok` or `denied`; no query values are recorded. These events show up in
+the audit log like any other. `pmos-web` also logs each read (handle, route and the names of
+the filters used, never their values).
+
+### `GET /api/admin/audit`
+
+Audit events, newest first, one page at a time.
+
+| Parameter | Format | Meaning |
+| --- | --- | --- |
+| `limit` | integer 1–100, default 50 | Page size. |
+| `before` | the `next_cursor` of the previous page | The next (older) page. **Opaque**: don't parse, build or keep it; send it back with the same filters. At most 128 characters of `A–Z a–z 0–9 . _ -`. |
+| `actor` | a handle (`A–Z a–z 0–9 . _ -`, at most 64) | Only this person's events (a team bot's service identity is `bots.<name>`). |
+| `action` | a tool name such as `jira.create_issue` (`A–Z a–z 0–9 . _ -`, at most 100) | Only this action. |
+| `outcome` | one of the outcomes below | Only this outcome. |
+| `from` | RFC 3339 time | Events at or after it. |
+| `to` | RFC 3339 time | Events strictly before it. |
+
+Unknown parameters are ignored; an empty value counts as absent. `400 bad_request` for a
+`limit` outside 1–100 or not a number, an unknown `outcome`, a malformed time, `from` after
+`to`, or an `actor`, `action` or `before` with other characters. A `before` the tool server
+doesn't recognise is also `400 bad_request`.
+
+```json
+{"events": [
+  {"id": "ev_8812", "at": "2026-11-16T09:05:12.481Z", "actor": "ana", "client": "web",
+   "action": "jira.create_issue", "system": "jira",
+   "target": "https://acme.atlassian.net/browse/PAY-301", "outcome": "approved",
+   "detail": "edited before approval", "sources": 3, "titled_sources": 2,
+   "skill": null, "bot": "pm-ana", "task_id": "tsk_01JD…"},
+  {"id": "ev_8809", "at": "2026-11-16T09:04:58Z", "actor": "ben", "client": "mcp",
+   "action": "slack.post_reply", "system": "slack", "target": null, "outcome": "denied",
+   "detail": null, "sources": 0, "titled_sources": 0,
+   "skill": "reply", "bot": null, "task_id": "run_7c1…"}
+ ],
+ "next_cursor": "c1.MTc2MzI4MzQ5ODAwMDAwMDAwMDo4ODA5"}
+```
+
+`next_cursor` is `null` on the last page; a page is shorter than `limit` only when it is the
+last. Every field below is always present.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | Unique and stable; use it as a list key. Not an input anywhere. |
+| `at` | string, RFC 3339 UTC | When it happened. |
+| `actor` | string | The handle the event is about: the PM whose session or approval it was, the admin who read the log. |
+| `client` | string | Who made the call: `mcp` (a bot or skill run, from its sandbox), `orchestrator` (the bot runtime or a platform-owner tool), `bot` (the Slack app), `web` (this web app), `console` (the operator console). |
+| `action` | string | What was done: a tool name (`jira.search`, `confluence.create_draft`, `slack.post_reply`, `memory.write`, …), `credentials.unlink`, or `admin.*` for these reads. |
+| `system` | string | The part of `action` before the first dot (`jira`, `confluence`, `slack`, `docs`, `context`, `memory`, `credentials`, `admin`, …). |
+| `target` | string or `null` | What was written or decided: a page or issue URL, an approval id (`apr_…`), a memory note (`memory:…`), the provider of an unlink. `null` for reads and most refusals. |
+| `outcome` | string | `ok` (ran), `denied` (refused: not allowed, above the data ceiling, wrong person), `pending` (a write queued for approval), `approved` (approved and written), `rejected`, `granted` (approved in the bot's own flow), `started` (an approved write about to run), `error` (failed), `failed` (an approved member couldn't be committed), `expired` (a Slack draft nobody decided; its text was removed). |
+| `detail` | string or `null` | A short note, only when it is one of the fixed notes the tool server writes itself: `edited before approval`, `reason: <wrong_facts\|wrong_target\|tone\|incomplete\|should_not_draft\|other>`, `invalid draft (1 of 2)`, `approved in the inbox; writing`, `undecided after 24 h: …` and a few more. Otherwise `null`: a refusal's or a connector's message can quote arguments or content, so it is never served. |
+| `sources` | integer ≥ 0 | How many items the call read (context files, Jira issues, pages, Slack messages). The items are not served. |
+| `titled_sources` | integer ≥ 0 | How many of those had a title recorded. **Only the count:** a title is a Jira issue's summary or a page's title, which can carry content, so titles are never served. |
+| `skill` | string or `null` | The run's skill, for a skill session. |
+| `bot` | string or `null` | The run's bot, for a bot session. |
+| `task_id` | string | The run: a task id (`tsk_…`) for bot tasks, a run id otherwise, `admin` for admin reads. Not a link: an auditor can't open tasks. |
+
+### `GET /api/admin/audit/export`
+
+The same events as CSV, newest first. Takes the same filters as `GET /api/admin/audit`
+(`from`, `to`, `actor`, `action`, `outcome`, with the same `400`s), not `limit` or `before`.
+Needs `export-audit`.
+
+- `200`, `Content-Type: text/csv; charset=utf-8`,
+  `Content-Disposition: attachment; filename="pmos-audit.csv"`.
+- At most **10,000 rows**. `X-Pmos-Truncated: true` when more matched and were left out (narrow
+  `from` and `to` and export again), `false` otherwise. `X-Pmos-Row-Count` is the number of
+  rows, the header row not counted.
+- A header row, then one row per event, every line ending `\r\n`. Columns, in order: `at`,
+  `actor`, `client`, `action`, `system`, `target`, `outcome`, `detail`, `sources`,
+  `titled_sources`, `skill`, `bot`, `task_id`, `id` (the fields above; `null` is an empty cell).
+- Every cell is quoted, with `"` doubled. **Formula-safe:** a cell starting with `=`, `+`, `-`,
+  `@`, a tab or a carriage return gets a leading `'`, so a spreadsheet shows it as text.
+- Errors are JSON, as above.
+
+```
+"at","actor","client","action","system","target","outcome","detail","sources","titled_sources","skill","bot","task_id","id"
+"2026-11-16T09:05:12.481Z","ana","web","jira.create_issue","jira","https://acme.atlassian.net/browse/PAY-301","approved","edited before approval","3","2","","pm-ana","tsk_01JD…","ev_8812"
+```
+
+The app downloads it with `fetch` (the session cookie goes along) and saves the blob, or links
+to it directly.
+
+### `GET /api/admin/team`
+
+Every member in `team.yaml`, in file order (team bots' service identities, `bots.<name>`, left
+out). Read-only: members change through Slack onboarding or a pull request to `team.yaml`.
+
+```json
+{"members": [
+  {"handle": "ana", "name": "ana", "roles": ["pm"], "has_email": true, "bot": "pm-ana",
+   "accounts": {"atlassian": true, "slack": true, "github": false}},
+  {"handle": "audrey", "name": "audrey", "roles": ["auditor"], "has_email": false,
+   "bot": "pm-audrey", "accounts": {"atlassian": false, "slack": false, "github": false}}
+ ],
+ "accounts_available": true,
+ "linking": true}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `handle` | string | The member's handle. |
+| `name` | string | The handle again: `team.yaml` has no display name yet. |
+| `roles` | string[] | As written in `team.yaml`, including roles this server doesn't know. |
+| `has_email` | boolean | Whether `team.yaml` has an email for them (Microsoft sign-in needs one). The address is not served. |
+| `bot` | string | Their personal bot's name. It may not exist yet if they haven't finished onboarding. |
+| `accounts` | object or `null` | Whether each account is linked, as booleans: `atlassian` (Jira and Confluence share one Atlassian link), `slack`, `github`. Never a token, scope, site or account id. `null` when the tool server couldn't be asked. |
+| `accounts_available` | boolean | `false` when the tool server didn't answer: the list still shows, with every `accounts` `null`. |
+| `linking` | boolean or `null` | Whether account linking is on (live connectors). With fake connectors nothing can be linked and every account is `false`. `null` when the tool server didn't answer. |
+
+### `GET /api/admin/connectors`
+
+Admins only. Each connector, checked now.
+
+```json
+{"connectors": [
+  {"name": "confluence", "mode": "live", "health": "ok", "error_class": null,
+   "checked_at": "2026-11-16T09:10:00.120Z"},
+  {"name": "docs", "mode": "live", "health": "down", "error_class": "timeout",
+   "checked_at": "2026-11-16T09:10:00.120Z"}
+ ]}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `name` | string | The system: `confluence`, `docs`, `jira`, `slack`, sorted. |
+| `mode` | string | `live` (the real system) or `fake` (fixtures, `PMOS_CONNECTORS=fake`). |
+| `health` | string | `ok` or `down`. Jira, Confluence and Slack act only with each PM's own token, so they have no shared dependency to check and read `ok`; a PM's broken link shows in their own onboarding status, not here. The support docs server is really checked. |
+| `error_class` | string or `null` | When `down`: `timeout`, `auth`, `unreachable` or `error`. Never the error's text (that goes to the tool server's log). `null` when `ok`. |
+| `checked_at` | string, RFC 3339 UTC | When the check ran. Every request checks afresh, at most 2 seconds per connector; there is no stored "last error". |
+
+### `GET /api/admin/overview`
+
+Counts for the admin home.
+
+```json
+{"since": "2026-11-09T09:10:00.120Z", "pending_drafts": 4,
+ "approved": 37, "rejected": 5, "denied": 2}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `since` | string, RFC 3339 UTC | Seven days before now: the window of the three counts below. |
+| `pending_drafts` | integer | Drafts waiting for a decision now, across every member of the team. |
+| `approved` | integer or `null` | Approved writes that ran since `since` (audit outcome `approved`). |
+| `rejected` | integer or `null` | Drafts rejected since `since`. |
+| `denied` | integer or `null` | Actions refused since `since` (audit outcome `denied`, admin reads refused included). |
+
+The three counts are `null` when the tool server's audit log can't be read back. **Tasks by
+status are not here:** the bot runtime gives the `web` client only the signed-in PM's own
+tasks, with no team-wide read, so `pmos-web` can't count them.
+
+### Known limits
+
+- **The tool server's own role check believes the named viewer only as far as
+  `PMOS_ASSERTION_MODE` does.** Each admin call names the viewer (`user=`) and carries a user
+  assertion for them, and the tool server checks that viewer's role in its own `team.yaml`.
+  With `require`, a call without a valid assertion for that viewer is refused. With `off` or
+  `verify`, a call with no assertion is believed, so a stolen `PMOS_WEB_TOKEN` could read the
+  audit log by naming an admin. Run `require` in production.
+- **A read refused by `pmos-web` itself** (a `400`, or its own `403`) never reaches the tool
+  server, so it is only in `pmos-web`'s log, not the audit log.
+- **No free-text search**; `actor` and `action` match exactly.

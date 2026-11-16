@@ -154,6 +154,12 @@ pub trait Connector: Send + Sync {
     /// The registry system this connector serves, such as `jira`.
     fn system(&self) -> &str;
 
+    /// `live` for a connector that calls the real system, `fake` for fixtures. Shown to
+    /// admins (`GET /internal/admin/connectors`).
+    fn mode(&self) -> &'static str {
+        "live"
+    }
+
     /// Run a read action (the part of the tool name after the system).
     async fn read(
         &self,
