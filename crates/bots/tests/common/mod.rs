@@ -13,12 +13,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, TimeZone, Utc};
+use pmos_bots::assertion::Assertions;
 use pmos_bots::catalog::Catalog;
 use pmos_bots::clients::{Gateway, ToolServer};
 use pmos_bots::config::{parse_clients, Client};
 use pmos_bots::pg::PgStore;
 use pmos_bots::store::{BotsStore, MemoryStore};
-use pmos_bots::{router, Runtime};
+use pmos_bots::{router, router_with, Runtime};
 use pmos_contract::bots::{ActionSetting, Bot, BotScope, Reads, Role};
 use pmos_contract::model::{
     ModelRole, Role as TeamRole, Sensitivity, Skill, TeamFile, TeamMember, ToolDef, ToolKind,
@@ -28,6 +29,8 @@ use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::Connection;
 use tokio_util::sync::CancellationToken;
+
+pub mod signing;
 
 pub const SLACK: &str = "slack-token-0123456789abcdef0123456789";
 pub const WEB: &str = "web-token-0123456789abcdef0123456789abc";
@@ -377,10 +380,15 @@ pub struct Env {
 
 impl Env {
     async fn with_store(store: Arc<dyn BotsStore>, pg: Option<TestPg>) -> Self {
-        Self::with_parts(store, pg, catalog()).await
+        Self::with_parts(store, pg, catalog(), None).await
     }
 
-    async fn with_parts(store: Arc<dyn BotsStore>, pg: Option<TestPg>, catalog: Catalog) -> Self {
+    async fn with_parts(
+        store: Arc<dyn BotsStore>,
+        pg: Option<TestPg>,
+        catalog: Catalog,
+        assertions: Option<Assertions>,
+    ) -> Self {
         let stop = CancellationToken::new();
         let ts = Arc::new(MockToolServer::default());
         let gw = Arc::new(MockGateway::default());
@@ -408,7 +416,11 @@ impl Env {
             Gateway::new(&format!("{gw_base}/v1"), GATEWAY),
             stop.child_token(),
         ));
-        let base = serve(router(rt.clone(), clients()), &stop).await;
+        let app = match assertions {
+            None => router(rt.clone(), clients()),
+            Some(a) => router_with(rt.clone(), clients(), Arc::new(a)),
+        };
+        let base = serve(app, &stop).await;
         Self {
             base,
             rt,
@@ -427,7 +439,18 @@ impl Env {
 
     /// In memory, with the bots of `catalog` (such as one loaded from a content tree).
     pub async fn memory_with(catalog: Catalog) -> Self {
-        Self::with_parts(Arc::new(MemoryStore::default()), None, catalog).await
+        Self::with_parts(Arc::new(MemoryStore::default()), None, catalog, None).await
+    }
+
+    /// In memory, checking user assertions from `web` and `console` as `assertions` says.
+    pub async fn memory_with_assertions(assertions: Assertions) -> Self {
+        Self::with_parts(
+            Arc::new(MemoryStore::default()),
+            None,
+            catalog(),
+            Some(assertions),
+        )
+        .await
     }
 
     pub async fn postgres() -> Option<Self> {

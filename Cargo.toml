@@ -35,6 +35,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
+pmos-assertion = { path = "crates/assertion" }
 pmos-contract = { path = "crates/contract" }
 pmos-policy = { path = "crates/policy" }
 pmos-runtime = { path = "crates/runtime" }

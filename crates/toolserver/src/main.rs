@@ -21,7 +21,7 @@ use pmos_toolserver::onboarding::{GitHubSetup, Onboarding};
 use pmos_toolserver::pg::PgStore;
 use pmos_toolserver::team::Team;
 use pmos_toolserver::vault::Vault;
-use pmos_toolserver::{router_with, AppConfig, Stores, ToolService};
+use pmos_toolserver::{router_full, AppConfig, PersonClients, Stores, ToolService};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -199,7 +199,14 @@ async fn main() -> Result<()> {
         onboarding = onboarding.with_sync(sync);
         tracing::info!(every_secs = config.content_sync_secs, "content sync on");
     }
-    let app = router_with(
+    tracing::info!(
+        web = config.web_token.is_some(),
+        console = config.console_token.is_some(),
+        mode = config.assertions.mode().as_str(),
+        keys = ?config.assertions.key_ids(),
+        "approvals clients that act for a person, and their user assertions"
+    );
+    let app = router_full(
         svc,
         AppConfig {
             service_token: config.service_token.expose().to_string(),
@@ -212,6 +219,14 @@ async fn main() -> Result<()> {
             oauth,
         },
         Some(Arc::new(onboarding)),
+        PersonClients {
+            web_token: config.web_token.as_ref().map(|t| t.expose().to_string()),
+            console_token: config
+                .console_token
+                .as_ref()
+                .map(|t| t.expose().to_string()),
+            assertions: config.assertions.clone(),
+        },
         cancel.clone(),
     );
     let listener = tokio::net::TcpListener::bind(config.bind)

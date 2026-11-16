@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use pmos_console::config::{Config, Identity, ProxySecret};
+use pmos_console::upstream::{Credentials, Signer};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -27,9 +28,13 @@ const TEAM: &str = "members:
 ";
 
 /// Every call an upstream saw: method, path and query, the bearer token, and the body.
+/// Method, path and query, raw body, and the user assertion if any, of one call.
+type Asserted = (String, String, Vec<u8>, Option<String>);
+
 #[derive(Default)]
 struct Seen {
     calls: Mutex<Vec<(String, String, String, String)>>,
+    asserted: Mutex<Vec<Asserted>>,
 }
 
 impl Seen {
@@ -44,6 +49,15 @@ impl Seen {
             uri.to_string(),
             auth,
             String::from_utf8_lossy(body).into_owned(),
+        ));
+        self.asserted.lock().unwrap().push((
+            method.to_string(),
+            uri.to_string(),
+            body.to_vec(),
+            headers
+                .get("x-pmos-assertion")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from),
         ));
     }
 
@@ -254,6 +268,8 @@ struct Options {
     runtime_up: bool,
     audit: bool,
     slack: bool,
+    /// Keys for both upstreams, as `PMOS_ASSERTION_KEYS` would give them.
+    sign: bool,
 }
 
 impl Default for Options {
@@ -263,6 +279,7 @@ impl Default for Options {
             runtime_up: true,
             audit: true,
             slack: true,
+            sign: false,
         }
     }
 }
@@ -312,13 +329,30 @@ async fn console(opts: Options) -> Console {
     if matches!(opts.identity, Identity::Proxy(_)) {
         proxy_headers.insert("x-pmos-proxy-secret", PROXY_SECRET.parse().unwrap());
     }
+    let (mut bots_token, mut toolserver_token): (Credentials, Credentials) =
+        (BOTS_TOKEN.into(), TOOLS_TOKEN.into());
+    if opts.sign {
+        let root = dir.path().to_path_buf();
+        bots_token = bots_token.with_signer(Signer::new(
+            "console",
+            "bots",
+            ring("cb1", CONSOLE_BOTS_KEY),
+            root.clone(),
+        ));
+        toolserver_token = toolserver_token.with_signer(Signer::new(
+            "console",
+            "toolserver",
+            ring("ct1", CONSOLE_TOOLS_KEY),
+            root,
+        ));
+    }
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         identity: opts.identity,
         bots_url,
-        bots_token: BOTS_TOKEN.into(),
+        bots_token,
         toolserver_url: tools_url,
-        toolserver_token: TOOLS_TOKEN.into(),
+        toolserver_token,
         content_root: dir.path().to_path_buf(),
         audit_log: opts.audit.then_some(audit_path),
         slack_url: opts.slack.then(|| "https://acme.slack.com".to_string()),
@@ -910,4 +944,102 @@ async fn pages_carry_a_strict_policy_and_both_themes() {
     assert!(!body.contains("<script"));
     let res = c.http.get(format!("{}/", c.base)).send().await.unwrap();
     assert_eq!(res.headers()["location"], "/bots");
+}
+
+// User assertions (docs/user-assertion.md).
+
+// Test keys only: fixed bytes, never used anywhere real.
+const CONSOLE_BOTS_KEY: &str = "Y29uc29sZS1ib3RzLXRlc3Qta2V5LTAxMjM0NTY3ODk=";
+const CONSOLE_TOOLS_KEY: &str = "Y29uc29sZS10b29sc2VydmVyLXRlc3Qta2V5LTAxMjM=";
+
+fn ring(id: &str, key: &str) -> pmos_assertion::KeyRing {
+    pmos_assertion::KeyRing::new(pmos_assertion::Key::from_base64(id, key).unwrap())
+}
+
+/// The person a console call names (`requested_by`, `owner` or `user`), if any.
+fn named(uri: &str) -> Option<String> {
+    let query = uri.split_once('?')?.1;
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| matches!(*k, "requested_by" | "owner" | "user"))
+        .map(|(_, v)| v.to_string())
+}
+
+/// Every call that names a person carries a valid assertion for exactly that person, issued
+/// by `console` for `audience`; every other call carries none.
+fn check_calls(seen: &Seen, audience: &str, key: (&str, &str)) -> usize {
+    let cache = pmos_assertion::MemoryReplayCache::default();
+    let policy = pmos_assertion::VerifyPolicy::new(audience, &["console"]).unwrap();
+    let mut signed = 0;
+    for (method, uri, body, assertion) in seen.asserted.lock().unwrap().iter() {
+        match named(uri) {
+            None => assert!(assertion.is_none(), "{method} {uri} names nobody"),
+            Some(person) => {
+                let header = assertion
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("{uri} unsigned"));
+                let binding = pmos_assertion::RequestBinding::new(method, uri, body).unwrap();
+                let a = ring(key.0, key.1)
+                    .verify(
+                        header,
+                        &policy,
+                        pmos_assertion::unix_now(),
+                        Some(&binding),
+                        &cache,
+                    )
+                    .unwrap_or_else(|e| panic!("{method} {uri}: {e}"));
+                assert_eq!(a.subject(), person);
+                assert!(a.expires_at() - a.issued_at() <= 60);
+                signed += 1;
+            }
+        }
+    }
+    signed
+}
+
+#[tokio::test]
+async fn calls_that_name_a_person_carry_a_valid_assertion_for_them() {
+    let c = console(Options {
+        sign: true,
+        ..Options::default()
+    })
+    .await;
+    for user in ["ana", "root"] {
+        for page in ["/routines", "/activity", "/approvals", "/bots"] {
+            assert_eq!(
+                c.get(Some(user), page).await.0,
+                StatusCode::OK,
+                "{user} {page}"
+            );
+        }
+    }
+    let token = c.csrf("ana").await;
+    let res = c
+        .post(
+            "ana",
+            "/routines/rtn_ana1/pause",
+            &token,
+            Some(c.base.as_str()),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    // Ana's own tasks and routines, and every member's inbox for root.
+    assert!(check_calls(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY)) >= 2);
+    assert!(check_calls(&c.tools, "toolserver", ("ct1", CONSOLE_TOOLS_KEY)) >= 4);
+}
+
+#[tokio::test]
+async fn without_keys_the_console_sends_no_assertion() {
+    let c = console(Options::default()).await;
+    c.get(Some("ana"), "/activity").await;
+    c.get(Some("ana"), "/approvals").await;
+    for seen in [&c.runtime, &c.tools] {
+        assert!(seen
+            .asserted
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(.., a)| a.is_none()));
+    }
 }

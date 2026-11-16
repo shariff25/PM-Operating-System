@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use pmos_web::session::MemorySessionStore;
 use pmos_web::settings::MemorySettingsStore;
+use pmos_web::upstream::{Credentials, Signer};
 use pmos_web::{Config, Deps};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -34,6 +35,9 @@ struct Call {
     auth: String,
     user: Option<String>,
     body: Value,
+    /// The body exactly as sent, and the user assertion, if any.
+    raw: Vec<u8>,
+    assertion: Option<String>,
 }
 
 #[derive(Default)]
@@ -58,6 +62,8 @@ impl Upstream {
             auth: header("authorization").unwrap_or_default(),
             user: header("x-pmos-user"),
             body: serde_json::from_slice(body).unwrap_or(Value::Null),
+            raw: body.to_vec(),
+            assertion: header("x-pmos-assertion"),
         });
     }
 
@@ -2238,4 +2244,150 @@ async fn practice_drafts_never_reach_the_tool_server() {
         .await;
     assert_eq!(r.code(), "not_found");
     assert!(w.tools.writes().is_empty());
+}
+
+// User assertions (docs/user-assertion.md).
+
+// Test keys only: fixed bytes, never used anywhere real.
+const WEB_BOTS_KEY: &str = "d2ViLWJvdHMtdGVzdC1rZXktMDEyMzQ1Njc4OWFiY2Q=";
+const WEB_TOOLS_KEY: &str = "d2ViLXRvb2xzZXJ2ZXItdGVzdC1rZXktMDEyMzQ1Njc=";
+
+fn ring(id: &str, key: &str) -> pmos_assertion::KeyRing {
+    pmos_assertion::KeyRing::new(pmos_assertion::Key::from_base64(id, key).unwrap())
+}
+
+/// pmos-web with a key for each upstream, as `PMOS_ASSERTION_KEYS` would give it.
+async fn signing_web() -> Web {
+    web_with(|cfg| {
+        let root = cfg.content_root.clone();
+        cfg.bots_token = Credentials::new(BOTS_TOKEN).with_signer(Signer::new(
+            "web",
+            "bots",
+            ring("wb1", WEB_BOTS_KEY),
+            root.clone(),
+        ));
+        cfg.toolserver_token = Credentials::new(TOOLS_TOKEN).with_signer(Signer::new(
+            "web",
+            "toolserver",
+            ring("wt1", WEB_TOOLS_KEY),
+            root,
+        ));
+    })
+    .await
+}
+
+/// Verify `call`'s assertion as `audience` would: the web key, issuer `web`, this exact
+/// request, once. Returns the subject.
+fn verify(
+    call: &Call,
+    audience: &str,
+    key: (&str, &str),
+    cache: &pmos_assertion::MemoryReplayCache,
+) -> Result<String, pmos_assertion::VerifyError> {
+    let header = call.assertion.as_deref().expect("an assertion");
+    let policy = pmos_assertion::VerifyPolicy::new(audience, &["web"]).unwrap();
+    let binding = pmos_assertion::RequestBinding::new(&call.method, &call.uri, &call.raw).unwrap();
+    let now = pmos_assertion::unix_now();
+    let a = ring(key.0, key.1).verify(header, &policy, now, Some(&binding), cache)?;
+    assert!(a.expires_at() - a.issued_at() <= 60, "lifetime");
+    assert_eq!(a.roles(), &[pmos_contract::model::Role::Pm]);
+    Ok(a.subject().to_string())
+}
+
+#[tokio::test]
+async fn every_upstream_call_for_a_pm_carries_a_valid_assertion() {
+    let w = signing_web().await;
+    let b = w.login("ana").await;
+    // The runtime: a task, the list, one task and its events.
+    let r = w
+        .post(&b, "/api/tasks", json!({"text": "What did PAY ship?"}))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    assert_eq!(w.get(&b, "/api/tasks").await.status, StatusCode::OK);
+    assert_eq!(
+        w.get(&b, "/api/tasks/tsk_ana1").await.status,
+        StatusCode::OK
+    );
+    // The tool server: the inbox, one draft with its sources, a decision each way.
+    assert_eq!(w.get(&b, "/api/drafts").await.status, StatusCode::OK);
+    assert_eq!(
+        w.get(&b, "/api/drafts/apr_conf").await.status,
+        StatusCode::OK
+    );
+    let r = w.post(&b, "/api/drafts/apr_jira/approve", json!({})).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let r = w
+        .post(
+            &b,
+            "/api/drafts/apr_slack/reject",
+            json!({"reason": "tone"}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+
+    let cache = pmos_assertion::MemoryReplayCache::default();
+    let runtime = w.runtime.calls();
+    assert!(runtime.len() >= 4, "{runtime:?}");
+    for call in &runtime {
+        assert_eq!(
+            verify(call, "bots", ("wb1", WEB_BOTS_KEY), &cache).as_deref(),
+            Ok("ana"),
+            "{} {}",
+            call.method,
+            call.uri
+        );
+        // X-Pmos-User is still sent, and agrees.
+        assert_eq!(call.user.as_deref(), Some("ana"));
+    }
+    let tools = w.tools.calls();
+    assert!(tools.iter().any(|c| c.method == "POST"), "{tools:?}");
+    for call in &tools {
+        if call.uri.starts_with("/internal/approvals/")
+            && !call.uri.contains('?')
+            && call.method == "GET"
+        {
+            // A single item names nobody: no assertion (pmos-web checks the owner itself).
+            assert!(call.assertion.is_none(), "{}", call.uri);
+            continue;
+        }
+        assert_eq!(
+            verify(call, "toolserver", ("wt1", WEB_TOOLS_KEY), &cache).as_deref(),
+            Ok("ana"),
+            "{} {}",
+            call.method,
+            call.uri
+        );
+    }
+    // Each assertion is fresh: verifying them all again finds every one a replay.
+    for call in runtime.iter().take(1) {
+        assert_eq!(
+            verify(call, "bots", ("wb1", WEB_BOTS_KEY), &cache),
+            Err(pmos_assertion::VerifyError::Replay)
+        );
+    }
+    // A runtime assertion is no good at the tool server, and the reverse.
+    let fresh = pmos_assertion::MemoryReplayCache::default();
+    assert_eq!(
+        verify(&runtime[0], "toolserver", ("wb1", WEB_BOTS_KEY), &fresh),
+        Err(pmos_assertion::VerifyError::WrongAudience)
+    );
+    // Assertions never reach the browser, and neither do keys.
+    for s in w.seen.lock().unwrap().iter() {
+        assert!(!s.contains("sig=") && !s.contains(WEB_BOTS_KEY) && !s.contains(WEB_TOOLS_KEY));
+    }
+    w.assert_no_tokens();
+}
+
+#[tokio::test]
+async fn without_keys_no_assertion_is_sent() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    w.post(&b, "/api/tasks", json!({"text": "x"})).await;
+    w.get(&b, "/api/drafts").await;
+    assert!(w
+        .runtime
+        .calls()
+        .iter()
+        .chain(w.tools.calls().iter())
+        .all(|c| c.assertion.is_none()));
 }

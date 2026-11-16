@@ -13,13 +13,19 @@
 //!     ledger (the triage digest); never other inbox listings, grants, revoking sessions,
 //!     listing credentials, reindexing or the ledger summary.
 //!
+//!   - `PMOS_WEB_TOKEN`, `PMOS_CONSOLE_TOKEN`: `pmos-web` and the console, which act for a
+//!     signed-in person. Only the approvals routes (list, read, sources, decision), and
+//!     with `PMOS_ASSERTION_MODE` the person they name must match a signed user assertion
+//!     (`crate::assertion`, `docs/user-assertion.md`).
+//!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
 //!   `/internal`), never in URLs, so access logs and proxies don't record them.
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, Request, State};
+use axum::body::Body;
+use axum::extract::{OriginalUri, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -33,6 +39,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::approvals::{DecideError, Decision, Status, Verdict};
+use crate::assertion::{self, Assertions, Mode};
 use crate::audit::{AuditEvent, Client, Outcome};
 use crate::ledger::{LedgerOutcome, LedgerQuery, Reason, MAX_LIMIT};
 use crate::mcp::PmosMcp;
@@ -72,11 +79,39 @@ pub struct AppConfig {
     pub oauth: Option<Arc<OAuth>>,
 }
 
+/// The services that act for a signed-in person, each with its own token that reaches only
+/// the approvals routes, and how their user assertions are checked.
+#[derive(Clone, Default)]
+pub struct PersonClients {
+    /// `PMOS_WEB_TOKEN`: `pmos-web`.
+    pub web_token: Option<String>,
+    /// `PMOS_CONSOLE_TOKEN`: the console.
+    pub console_token: Option<String>,
+    /// `PMOS_ASSERTION_MODE` and `PMOS_ASSERTION_KEYS`.
+    pub assertions: Arc<Assertions>,
+}
+
+impl std::fmt::Debug for PersonClients {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersonClients")
+            .field("web", &self.web_token.is_some())
+            .field("console", &self.console_token.is_some())
+            .field("assertions", &self.assertions)
+            .finish()
+    }
+}
+
+/// The verified subject of a call's user assertion, if it carried one. Set on every approvals
+/// route.
+#[derive(Clone, Debug, Default)]
+struct Acting(Option<String>);
+
 #[derive(Clone)]
 struct AppState {
     svc: Arc<ToolService>,
     service_token: Arc<str>,
     bot: Option<Arc<BotAccess>>,
+    people: Arc<PersonClients>,
     content_root: Arc<std::path::Path>,
     oauth: Option<Arc<OAuth>>,
     onboarding: Arc<Onboarding>,
@@ -96,12 +131,25 @@ pub fn router_with(
     onboarding: Option<Arc<Onboarding>>,
     cancel: CancellationToken,
 ) -> Router {
+    router_full(svc, config, onboarding, PersonClients::default(), cancel)
+}
+
+/// [`router_with`], plus the tokens of the services that act for a person (`pmos-web`, the
+/// console) and how their user assertions are checked.
+pub fn router_full(
+    svc: Arc<ToolService>,
+    config: AppConfig,
+    onboarding: Option<Arc<Onboarding>>,
+    people: PersonClients,
+    cancel: CancellationToken,
+) -> Router {
     let onboarding = onboarding
         .unwrap_or_else(|| Arc::new(Onboarding::new(svc.clone(), config.oauth.clone(), None)));
     let state = AppState {
         svc: svc.clone(),
         service_token: config.service_token.into(),
         bot: config.bot.map(Arc::new),
+        people: Arc::new(people),
         content_root: config.content_root.into(),
         oauth: config.oauth.clone(),
         onboarding,
@@ -131,7 +179,6 @@ pub fn router_with(
     // Orchestrator only.
     let admin = Router::new()
         .route("/grants", post(create_grant))
-        .route("/approvals/{id}/sources", get(approval_sources))
         .route("/reindex", post(reindex))
         .route("/ledger/summary", get(ledger_summary))
         .route("/credentials", get(list_credentials))
@@ -144,7 +191,6 @@ pub fn router_with(
     // member's pending approvals and unlink a team member's account, for the App Home
     // (`docs/slack-mentions-and-home-spec.md` §3); each handler limits it.
     let internal = Router::new()
-        .route("/approvals", get(list_approvals))
         .route(
             "/credentials/{user}/{provider}",
             axum::routing::delete(revoke_credential),
@@ -152,8 +198,6 @@ pub fn router_with(
         .route("/sessions", post(create_session))
         .route("/session", axum::routing::delete(revoke_session))
         .route("/call", post(call_tool))
-        .route("/approvals/{id}", get(get_approval))
-        .route("/approvals/{id}/decision", post(decide))
         .route("/ledger", get(ledger))
         .route("/oauth/{provider}/start", get(oauth_start))
         .route("/memory/repo", post(set_memory_repo).get(get_memory_repo))
@@ -172,6 +216,19 @@ pub fn router_with(
             state.clone(),
             identify_client,
         ));
+
+    // The approvals inbox: the orchestrator, the Slack bot (not `sources`), and the services
+    // that act for a person (`pmos-web`, the console), whose user assertions are checked.
+    let approvals = Router::new()
+        .route("/approvals", get(list_approvals))
+        .route("/approvals/{id}", get(get_approval))
+        .route("/approvals/{id}/decision", post(decide))
+        .route("/approvals/{id}/sources", get(approval_sources))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            identify_approvals_client,
+        ));
+    let internal = internal.merge(approvals);
 
     Router::new()
         // Liveness: the process answers. Readiness: its dependencies do too.
@@ -236,22 +293,161 @@ async fn require_session(State(state): State<AppState>, mut req: Request, next: 
     next.run(req).await
 }
 
-/// Which internal client is calling, from its token.
+/// The internal client a token belongs to.
+fn client_for(state: &AppState, token: Option<&str>) -> Option<Client> {
+    let t = token?;
+    let is = |known: Option<&str>| known.is_some_and(|k| pmos_runtime::token_eq(t, k));
+    if is(Some(&state.service_token)) {
+        Some(Client::Orchestrator)
+    } else if is(state.bot.as_ref().map(|b| b.token.as_str())) {
+        Some(Client::Bot)
+    } else if is(state.people.web_token.as_deref()) {
+        Some(Client::Web)
+    } else if is(state.people.console_token.as_deref()) {
+        Some(Client::Console)
+    } else {
+        None
+    }
+}
+
+/// Which internal client is calling, from its token. The tokens of services that act for a
+/// person reach only the approvals routes.
 async fn identify_client(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
-    let client = match bearer(&req) {
-        Some(t) if pmos_runtime::token_eq(t, &state.service_token) => Client::Orchestrator,
-        Some(t)
-            if state
-                .bot
-                .as_ref()
-                .is_some_and(|b| pmos_runtime::token_eq(t, &b.token)) =>
-        {
-            Client::Bot
+    let client = match client_for(&state, bearer(&req)) {
+        Some(c @ (Client::Orchestrator | Client::Bot)) => c,
+        Some(Client::Web | Client::Console) => {
+            return error(
+                StatusCode::FORBIDDEN,
+                "this token may use only the approvals routes",
+            )
         }
         _ => return error(StatusCode::UNAUTHORIZED, "service token required"),
     };
     req.extensions_mut().insert(client);
     next.run(req).await
+}
+
+/// The approvals routes: any internal client. For `pmos-web` and the console, the user
+/// assertion is checked as `PMOS_ASSERTION_MODE` says.
+async fn identify_approvals_client(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(client) = client_for(&state, bearer(&req)) else {
+        return error(StatusCode::UNAUTHORIZED, "service token required");
+    };
+    let mut req = req;
+    let mut acting = Acting(None);
+    let assertions = &state.people.assertions;
+    if matches!(client, Client::Web | Client::Console) && assertions.mode() != Mode::Off {
+        match check_assertion(assertions, client, req).await {
+            Ok((checked, subject)) => {
+                req = checked;
+                acting = Acting(subject);
+            }
+            Err(refused) => return refused,
+        }
+    }
+    req.extensions_mut().insert(client);
+    req.extensions_mut().insert(acting);
+    next.run(req).await
+}
+
+/// The largest approvals request body read for a request binding (a decision with edited
+/// arguments).
+const MAX_ASSERTED_BODY: usize = 2 * 1024 * 1024;
+
+/// The one answer to every assertion failure. The log says why, by kind only: never the
+/// assertion, a key, or a handle.
+fn refuse_assertion(client: Client, why: assertion::Refusal) -> Response {
+    tracing::warn!(client = client.as_str(), reason = %why, "refused a user assertion");
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "code": "bad_assertion",
+            "error": "this call needs a valid X-Pmos-Assertion for the person it acts for",
+        })),
+    )
+        .into_response()
+}
+
+/// The `user=` an approvals call names, if any. A query that doesn't parse counts as naming
+/// someone no assertion can match.
+fn named_user(uri: &axum::http::Uri) -> Option<String> {
+    match Query::<Vec<(String, String)>>::try_from_uri(uri) {
+        Ok(Query(pairs)) => pairs
+            .into_iter()
+            .find(|(k, v)| k == "user" && !v.is_empty())
+            .map(|(_, v)| v),
+        Err(_) => Some(String::new()),
+    }
+}
+
+/// Check a `pmos-web` or console call's assertion, with the mode not `off`. Returns the request
+/// (its body read and put back) and the verified subject, if it carried an assertion.
+async fn check_assertion(
+    assertions: &Assertions,
+    client: Client,
+    req: Request,
+) -> Result<(Request, Option<String>), Response> {
+    let uri = req
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|u| u.0.clone())
+        .unwrap_or_else(|| req.uri().clone());
+    let is_decision = req.method() == axum::http::Method::POST && uri.path().ends_with("/decision");
+    let user = named_user(&uri);
+    let Some(header) = req.headers().get(pmos_assertion::HEADER).cloned() else {
+        // A decision always names `decided_by`.
+        if assertions.mode() == Mode::Require && (user.is_some() || is_decision) {
+            return Err(refuse_assertion(client, assertion::Refusal::Missing));
+        }
+        return Ok((req, None));
+    };
+    let Ok(header) = header.to_str() else {
+        return Err(refuse_assertion(client, assertion::Refusal::Header));
+    };
+    let (parts, body) = req.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_ASSERTED_BODY).await else {
+        return Err(refuse_assertion(client, assertion::Refusal::Body));
+    };
+    let target = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let who = assertions
+        .verify(
+            client.as_str(),
+            header,
+            parts.method.as_str(),
+            target,
+            &bytes,
+            pmos_assertion::unix_now(),
+        )
+        .map_err(|why| refuse_assertion(client, why))?;
+    let mut named: Vec<String> = user.into_iter().collect();
+    if is_decision {
+        // The handler reads `decided_by` from this same body; one that doesn't parse is
+        // refused there.
+        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(by) = v.get("decided_by") {
+                named.push(by.as_str().unwrap_or_default().to_string());
+            }
+        }
+    }
+    if named.iter().any(|n| n != who.subject()) {
+        return Err(refuse_assertion(
+            client,
+            assertion::Refusal::SubjectMismatch,
+        ));
+    }
+    tracing::debug!(
+        client = client.as_str(),
+        session = who.session(),
+        "user assertion accepted"
+    );
+    Ok((
+        Request::from_parts(parts, Body::from(bytes)),
+        Some(who.subject().to_string()),
+    ))
 }
 
 async fn orchestrator_only(req: Request, next: Next) -> Response {
@@ -273,7 +469,7 @@ fn client_may_use(state: &AppState, client: Client, skill: Option<&str>) -> bool
             .bot
             .as_ref()
             .is_some_and(|b| b.skills.iter().any(|s| s == skill)),
-        (Client::Bot, None) | (Client::Mcp, _) => false,
+        (Client::Bot, None) | (Client::Mcp | Client::Web | Client::Console, _) => false,
     }
 }
 
@@ -475,9 +671,18 @@ async fn list_approvals(
     }
 }
 
-async fn get_approval(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+/// One item. With a user assertion, only the subject's own: anyone else's answers `404`, as a
+/// missing one does.
+async fn get_approval(
+    State(state): State<AppState>,
+    Extension(acting): Extension<Acting>,
+    Path(id): Path<String>,
+) -> Response {
     match state.svc.approval(&id).await {
-        Ok(Some(item)) => Json(state.svc.approval_json(&item).await).into_response(),
+        Ok(Some(item)) if acting.0.as_ref().is_none_or(|who| *who == item.user) => {
+            Json(state.svc.approval_json(&item).await).into_response()
+        }
+        Ok(Some(_)) => error(StatusCode::NOT_FOUND, "no such approval item"),
         Ok(None) => error(StatusCode::NOT_FOUND, "no such approval item"),
         Err(e) => unavailable(e),
     }
@@ -490,12 +695,20 @@ struct SourcesQuery {
 
 /// What the run that drafted an item read (`sources.rs`), for its own user only: `user`
 /// must be the item's user, and anything else answers `404` as a missing item does, so the
-/// answer never confirms that someone else's item exists. Service token only.
+/// answer never confirms that someone else's item exists. The service token, `pmos-web` and
+/// the console; not the Slack bot.
 async fn approval_sources(
     State(state): State<AppState>,
+    Extension(client): Extension<Client>,
     Path(id): Path<String>,
     Query(q): Query<SourcesQuery>,
 ) -> Response {
+    if client == Client::Bot {
+        return error(
+            StatusCode::FORBIDDEN,
+            "this token may not use this endpoint",
+        );
+    }
     let Some(user) = q.user.filter(|u| !u.trim().is_empty()) else {
         return error(StatusCode::BAD_REQUEST, "`user` is required");
     };
