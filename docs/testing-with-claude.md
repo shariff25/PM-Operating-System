@@ -74,6 +74,8 @@ scripts/claude-test-stack.sh
 - copies `content/` to `state/claude-test/content` and adds you there as `pm` and `admin`, with
   your bot `pm-<handle>` (`pmos member add`);
 - starts the services with fresh tokens between them;
+- deletes the Slack service's `notifications.cursor` from the last run, since the in-memory
+  runtime restarts its notification ids at 1 and a stale cursor would make the bot skip replies;
 - prints what to try.
 
 **Logs** are in `state/claude-test/logs`. The gateway's usage log

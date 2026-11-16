@@ -591,12 +591,26 @@ So queue time can be over-counted by up to one poll interval when a task has no 
 6. **Launch it.** Add it to the weekly run, and to the runs after model and harness changes.
    It launches once `history` says the bar was met two weeks in a row.
 
+### Categories and bars
+Every category has a `pass_bar` and `repeats`. Each bar is a starting value: the docs give a
+number only as the 80% example, so tighten each one after the category's first valid run.
+
+| Category | Bot | Tasks | `pass_bar` | `repeats` | Source of the numbers |
+| --- | --- | --- | --- | --- | --- |
+| `docs-qa` | `docs` | 4 | 0.8 | 3 | 80% example (`docs/evals.md`, "Adding a category" and `docs-qa`); pass^3 at the Phase 1 gate (`docs/research/self-improvement-loops.md`) |
+| `confluence-draft` | `personal` | 3 | 0.8 | 3 | Starting value; pass^3 as above |
+| `jira-draft` | `personal` | 4 | 0.8 | 3 | Starting value; pass^3 as above |
+| `slack-reply` | `personal` | 9 | 0.8 | 3 | Starting value; reads below the bar until a skill declares `slack.read_thread` and `slack.post_reply` |
+| `pm-craft` | `personal` | 23 | 0.8 | 3 | Starting value; pass^3 as above |
+| `staff-craft` | `personal` (`level: staff`) | 8 | 0.8 | 3 | Starting value; pass^3 as above |
+| `principal-craft` | `personal` (`level: principal`) | 8 | 0.8 | 3 | Starting value; pass^3 as above |
+
 ### `docs-qa`
 A template category for the Docs bot. PM OS can't ship real questions, because every team's
 docs site is different (`PMOS_DOCS_BASE_URL`, `docs/docs-server.md`). So a team writes its own
 questions against its own docs; `evals/categories/docs-qa/README.md` walks through it. Each
-task runs three times (`repeats: 3`). It has no bar (`pass_bar` unset, so it only reports)
-until your team writes its own questions; then set one, such as 80% of attempts.
+task runs three times (`repeats: 3`). Its bar is 80% of attempts (`pass_bar: 0.8`), a starting value to tighten once your team
+writes its own questions and has a first valid run.
 
 **The example tasks** ask about Acme Vault, a fictional product, and are answered by the fake
 docs fixtures (`https://docs.example.com/docs/vault-saml-sso` and `…/vault-key-rotation`), so
@@ -621,8 +635,8 @@ to answer. The judge `faithful-to-cited-page` applies to the category, advisory 
 labels.
 
 ### The seed categories: `jira-draft`, `confluence-draft`, `slack-reply`
-Three tasks each (four for `jira-draft`, which also checks that an issue already in Jira is
-not recreated) for `bot: personal`, against the fake connectors' fixtures
+Three tasks for `confluence-draft`, four for `jira-draft` (which also checks that an issue already in Jira is
+not recreated) and nine for `slack-reply` (the seed thread plus the triage and tagged tasks) for `bot: personal`, against the fake connectors' fixtures
 (`crates/toolserver/src/connectors/fake.rs`): Jira project PM (epic PM-101, story PM-102, bug
 PM-103 with a planted prompt injection), Confluence space PM (pages 9001 and 9002), and the
 `#field-questions` thread (channel C0FIELD, ts 1731500000.000100). Every task has `drafts:`
@@ -631,7 +645,8 @@ asks for.
 
 - **Marked "seed: replace with case cards".** Replace them with real cases as case cards
   come in.
-- **No `pass_bar`:** they report only until real case cards exist.
+- **`pass_bar: 0.8` and `repeats: 3`:** starting values. The docs give no launch number for
+  these categories, so tighten each bar after the first valid run against real case cards.
 - **`slack-reply` measures a gap.** The `pm-assistant` role's skills don't declare
   `slack.read_thread` or `slack.post_reply` yet, so its tasks fail (as
   `model/wrong-draft-count`) until a skill does.
@@ -641,8 +656,8 @@ asks for.
 ### `pm-craft`
 The senior-PM bar (`docs/pm-craft.md`; the spec is §6 of `docs/pm-craft-spec.md`). Twenty-three
 seed tasks for `bot: personal`, on the same fake fixtures as the seed categories plus the fake
-docs pages. Like them, it is marked "seed: replace with case cards", has no `pass_bar` and
-runs each task once.
+docs pages. Like them, it is marked "seed: replace with case cards", has the starting bar
+(`pass_bar: 0.8`) and runs each task three times (`repeats: 3`).
 
 | Tasks | The ask | What is checked |
 | --- | --- | --- |
@@ -682,7 +697,7 @@ runs each task once.
 The Staff and Principal bars (`docs/levels.md`; the spec is §6 of
 `docs/staff-principal-spec.md`). Eight seed tasks each, for `bot: personal`, on the same fake
 fixtures as `pm-craft` plus the rollup's. Like the others they are marked "seed: replace with
-case cards", have no `pass_bar` and run each task once.
+case cards", have the starting bar (`pass_bar: 0.8`) and run each task three times (`repeats: 3`).
 
 - **`level` in `category.yaml`** is optional: `senior`, `staff` or `principal`. The runner
   sends it as the `level` of each task it creates (`POST /v1/tasks`, client `evals` only), so
