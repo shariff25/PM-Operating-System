@@ -100,6 +100,33 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 | `console` | read everything; pause, resume and delete routines; cancel tasks |
 | `evals` | create tasks with `source: "eval"` (and a task `level`), and read them |
 
+**User assertions (`web`, `console`).** A call from `web` or `console` may carry
+`X-Pmos-Assertion`, a short-lived statement of the person it acts for, signed with a key that
+only that client and the runtime hold (`docs/user-assertion.md`). `PMOS_ASSERTION_MODE` sets
+what the runtime does with it:
+
+| Mode | A valid assertion | A bad one | None |
+| --- | --- | --- | --- |
+| `off` (default) | ignored | ignored | as before |
+| `verify` | its subject is the PM | `401` | as before |
+| `require` | its subject is the PM | `401` | `401` when the call names a person |
+
+- **Checked:** the signature with the `web:bots` or `console:bots` key from
+  `PMOS_ASSERTION_KEYS`, the issuer (it must be the client whose token was presented), the
+  audience `bots`, the time (60 seconds plus 5 of skew), the request (method, path and query as
+  received, and the raw body), and the nonce (once per process).
+- **Names:** the subject must equal every person the request names: `X-Pmos-User`, the
+  `requested_by` and `owner` filters, and `{handle}` in `/v1/members/{handle}/settings`. A body
+  that names someone else (`requested_by`, a routine's `owner`) is still refused by the `web`
+  client's own rules (`403`).
+- **Answer:** every failure is `401 {"code": "bad_assertion"}`. The log has the client and the
+  kind of failure, never the assertion, a key or a handle.
+- **`X-Pmos-User`** is advisory for `web` once the assertion is required: the subject is the PM,
+  and the header, if sent, must agree.
+- **The console** names a person only on its per-PM reads (`?requested_by=`, `?owner=`); its
+  reads of everything and its routine changes name no one and stay on its token.
+- **Not checked:** `slack`, `worker` and `evals`, in every mode.
+
 ### Task
 ```json
 {"id": "tsk_<32 hex>", "bot": "docs", "requested_by": "ana", "source": "slack|web|routine|cli|eval",

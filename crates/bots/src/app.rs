@@ -12,6 +12,11 @@
 //! runtime reads them from the tool server with its own service token, so the evals client
 //! never holds one.
 //!
+//! The `web` and `console` clients may also prove who they act for with a signed
+//! `X-Pmos-Assertion` (`crate::assertion`, `PMOS_ASSERTION_MODE`): with `verify` a bad one is
+//! refused, and with `require` a call that names a person without a valid one is refused, both
+//! with `401 {"code":"bad_assertion"}`.
+//!
 //! A task or routine another PM owns answers `404` to the Slack client, the same as one that
 //! doesn't exist. Request bodies that don't parse are `400`; `422` is kept for "the routine
 //! request is unclear", with the question to ask.
@@ -19,8 +24,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -31,6 +36,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::assertion::{Assertions, Mode, Refusal};
 use crate::config::{Client, ClientKind};
 use crate::model::{
     self, ChecklistItem, Draft, Level, MemberSettings, Schedule, SlackRef, Source, Task,
@@ -48,6 +54,7 @@ pub const USER_HEADER: &str = "x-pmos-user";
 struct AppState {
     rt: Arc<Runtime>,
     clients: Arc<[Client]>,
+    assertions: Arc<Assertions>,
 }
 
 /// Who is calling: the client, and for Slack the PM it acts for.
@@ -65,10 +72,18 @@ impl Caller {
     }
 }
 
+/// The API with assertions off (`PMOS_ASSERTION_MODE=off`).
 pub fn router(rt: Arc<Runtime>, clients: Vec<Client>) -> Router {
+    router_with(rt, clients, Arc::new(Assertions::off()))
+}
+
+/// The API, checking user assertions from the `web` and `console` clients as `assertions`
+/// says.
+pub fn router_with(rt: Arc<Runtime>, clients: Vec<Client>, assertions: Arc<Assertions>) -> Router {
     let state = AppState {
         rt,
         clients: clients.into(),
+        assertions,
     };
     let v1 = Router::new()
         .route("/bots", get(list_bots))
@@ -230,12 +245,119 @@ async fn authenticate(State(state): State<AppState>, mut req: Request, next: Nex
         },
         _ => None,
     };
-    req.extensions_mut().insert(Caller {
-        kind: client.kind,
-        user,
-        bot: client.bot.clone(),
-    });
+    let (kind, bot) = (client.kind, client.bot.clone());
+    let mut user = user;
+    if matches!(kind, ClientKind::Web | ClientKind::Console) && state.assertions.mode() != Mode::Off
+    {
+        match check_assertion(&state.assertions, kind, req).await {
+            Ok((checked, subject)) => {
+                req = checked;
+                // The verified subject is the PM; any X-Pmos-User already equals it.
+                if kind == ClientKind::Web && subject.is_some() {
+                    user = subject;
+                }
+            }
+            Err(refused) => return refused,
+        }
+    }
+    req.extensions_mut().insert(Caller { kind, user, bot });
     next.run(req).await
+}
+
+/// The one answer to every assertion failure. The log says why, by kind only: never the
+/// assertion, a key, or a handle.
+fn refuse_assertion(kind: ClientKind, why: Refusal) -> Response {
+    tracing::warn!(client = kind.as_str(), reason = %why, "refused a user assertion");
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "code": "bad_assertion",
+            "error": "this call needs a valid X-Pmos-Assertion for the person it acts for",
+        })),
+    )
+        .into_response()
+}
+
+/// Every person `req` names: `X-Pmos-User`, the `requested_by` and `owner` filters, and the
+/// handle in `/v1/members/{handle}/…`. A query that doesn't parse counts as naming someone no
+/// assertion can match.
+fn named_people(req: &Request) -> Vec<String> {
+    let mut named = Vec::new();
+    if let Some(v) = req.headers().get(USER_HEADER) {
+        named.push(v.to_str().map(str::trim).unwrap_or_default().to_string());
+    }
+    let uri = req
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|u| &u.0)
+        .unwrap_or(req.uri());
+    match Query::<Vec<(String, String)>>::try_from_uri(uri) {
+        Ok(Query(pairs)) => named.extend(
+            pairs
+                .into_iter()
+                .filter(|(k, v)| (k == "requested_by" || k == "owner") && !v.is_empty())
+                .map(|(_, v)| v),
+        ),
+        Err(_) => named.push(String::new()),
+    }
+    let segments: Vec<&str> = uri.path().trim_start_matches('/').split('/').collect();
+    if let ["v1", "members", handle, ..] = segments.as_slice() {
+        named.push(handle.to_string());
+    }
+    named
+}
+
+/// Check a `web` or `console` call's assertion, with the mode not `off`. Returns the request
+/// (its body read and put back) and the verified subject, if the call carried an assertion.
+async fn check_assertion(
+    assertions: &Assertions,
+    kind: ClientKind,
+    req: Request,
+) -> Result<(Request, Option<String>), Response> {
+    let named = named_people(&req);
+    let Some(header) = req.headers().get(pmos_assertion::HEADER).cloned() else {
+        if assertions.mode() == Mode::Require && !named.is_empty() {
+            return Err(refuse_assertion(kind, Refusal::Missing));
+        }
+        return Ok((req, None));
+    };
+    let Ok(header) = header.to_str() else {
+        return Err(refuse_assertion(kind, Refusal::Header));
+    };
+    // The binding covers the request as this service reads it: method, the target as it
+    // arrived (before `/v1` is stripped for the nested routes), and the raw body.
+    let (parts, body) = req.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY_BYTES).await else {
+        return Err(refuse_assertion(kind, Refusal::Body));
+    };
+    let uri = parts
+        .extensions
+        .get::<OriginalUri>()
+        .map(|u| u.0.clone())
+        .unwrap_or_else(|| parts.uri.clone());
+    let target = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let who = assertions
+        .verify(
+            kind.as_str(),
+            header,
+            parts.method.as_str(),
+            target,
+            &bytes,
+            pmos_assertion::unix_now(),
+        )
+        .map_err(|why| refuse_assertion(kind, why))?;
+    if named.iter().any(|n| n != who.subject()) {
+        return Err(refuse_assertion(kind, Refusal::SubjectMismatch));
+    }
+    tracing::debug!(
+        client = kind.as_str(),
+        session = who.session(),
+        "user assertion accepted"
+    );
+    Ok((
+        Request::from_parts(parts, Body::from(bytes)),
+        Some(who.subject().to_string()),
+    ))
 }
 
 async fn readyz(State(state): State<AppState>) -> Response {

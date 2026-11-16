@@ -1,9 +1,16 @@
 //! Configuration from environment variables, checked at start-up.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use chrono::Duration;
+use pmos_assertion::{Key, KeyRing, VerifyPolicy};
+
+use crate::upstream::{Credentials, Signer};
+
+/// pmos-web's client name: the issuer of its user assertions.
+pub const ISSUER: &str = "web";
 
 #[derive(Clone)]
 pub struct Config {
@@ -12,14 +19,17 @@ pub struct Config {
     /// `PMOS_BOTS_URL`, default `http://127.0.0.1:8750`.
     pub bots_url: String,
     /// `PMOS_WEB_BOTS_TOKEN`: the runtime's `web` client token (an entry of its
-    /// `PMOS_BOTS_TOKENS`). Required, at least 32 characters.
-    pub bots_token: String,
+    /// `PMOS_BOTS_TOKENS`). Required, at least 32 characters. With a `web:bots` key in
+    /// `PMOS_ASSERTION_KEYS`, calls for a PM also carry a signed user assertion.
+    pub bots_token: Credentials,
     /// `PMOS_TOOLSERVER_URL`, default `http://127.0.0.1:8710`.
     pub toolserver_url: String,
-    /// `PMOS_WEB_TOOLSERVER_TOKEN`: the tool server's service token (`PMOS_SERVICE_TOKEN`
-    /// there). Listing a PM's decided items and deciding them need it. Required, at least
-    /// 32 characters, and different from the runtime token.
-    pub toolserver_token: String,
+    /// `PMOS_WEB_TOOLSERVER_TOKEN`: pmos-web's own tool server token (`PMOS_WEB_TOKEN`
+    /// there), which reaches only the approvals routes. Older deployments put the service
+    /// token here. Required, at least 32 characters, and different from the runtime token.
+    /// With a `web:toolserver` key in `PMOS_ASSERTION_KEYS`, calls for a PM also carry a
+    /// signed user assertion.
+    pub toolserver_token: Credentials,
     /// `PMOS_CONTENT_ROOT`, default `content`: where `team.yaml` is.
     pub content_root: PathBuf,
     /// `PMOS_WEB_STATIC_DIR`: the built web app (`web/dist`). Optional; without it only
@@ -42,9 +52,9 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("bind", &self.bind)
             .field("bots_url", &self.bots_url)
-            .field("bots_token", &"<redacted>")
+            .field("bots_token", &self.bots_token)
             .field("toolserver_url", &self.toolserver_url)
-            .field("toolserver_token", &"<redacted>")
+            .field("toolserver_token", &self.toolserver_token)
             .field("content_root", &self.content_root)
             .field("static_dir", &self.static_dir)
             .field("public_url", &self.public_url)
@@ -90,6 +100,26 @@ impl Config {
         if bots_token == toolserver_token {
             return Err("PMOS_WEB_BOTS_TOKEN and PMOS_WEB_TOOLSERVER_TOKEN must differ".into());
         }
+        let content_root: PathBuf = set("PMOS_CONTENT_ROOT")
+            .unwrap_or_else(|| "content".into())
+            .into();
+        let mut keys = match set("PMOS_ASSERTION_KEYS") {
+            None => BTreeMap::new(),
+            Some(spec) => parse_assertion_keys(&spec, "pmos-web", |iss, aud| {
+                iss == ISSUER && (aud == "bots" || aud == "toolserver")
+            })?,
+        };
+        let mut credentials = |token: String, audience: &str| {
+            let c = Credentials::new(token);
+            match keys.remove(&(ISSUER.to_string(), audience.to_string())) {
+                Some(ring) => {
+                    c.with_signer(Signer::new(ISSUER, audience, ring, content_root.clone()))
+                }
+                None => c,
+            }
+        };
+        let bots_token = credentials(bots_token, "bots");
+        let toolserver_token = credentials(toolserver_token, "toolserver");
         let minutes = |k: &str, default: i64| -> Result<Duration, String> {
             match set(k) {
                 None => Ok(Duration::minutes(default)),
@@ -122,9 +152,7 @@ impl Config {
                 set("PMOS_TOOLSERVER_URL").unwrap_or_else(|| "http://127.0.0.1:8710".into()),
             )?,
             toolserver_token,
-            content_root: set("PMOS_CONTENT_ROOT")
-                .unwrap_or_else(|| "content".into())
-                .into(),
+            content_root,
             static_dir: set("PMOS_WEB_STATIC_DIR").map(PathBuf::from),
             public_url: set("PMOS_WEB_PUBLIC_URL")
                 .map(|u| origin("PMOS_WEB_PUBLIC_URL", u))
@@ -134,6 +162,66 @@ impl Config {
             session_max,
         })
     }
+}
+
+/// `PMOS_ASSERTION_KEYS`: the keys this service signs user assertions with
+/// (`docs/user-assertion.md`), comma-separated entries, one per caller→receiver pair:
+///
+/// ```text
+/// <issuer>:<audience>:<key id>:<base64 key>[:<key id>:<base64 key>]
+/// ```
+///
+/// the current key first, then optionally the previous one. Keys are 32 to 64 bytes in
+/// standard base64. Only pairs `wanted` accepts may appear, so a service never holds a key it
+/// has no use for. Errors name the entry and the pair, never a key.
+pub fn parse_assertion_keys(
+    spec: &str,
+    service: &str,
+    wanted: impl Fn(&str, &str) -> bool,
+) -> Result<BTreeMap<(String, String), KeyRing>, String> {
+    const VAR: &str = "PMOS_ASSERTION_KEYS";
+    let mut out = BTreeMap::new();
+    let entries = spec.split(',').map(str::trim).filter(|e| !e.is_empty());
+    for (i, entry) in entries.enumerate() {
+        let bad = |why: &str| format!("{VAR} entry {}: {why}", i + 1);
+        let parts: Vec<&str> = entry.split(':').map(str::trim).collect();
+        if parts.len() != 4 && parts.len() != 6 {
+            return Err(bad(
+                "expected issuer:audience:key-id:base64-key, optionally followed by \
+                 :key-id:base64-key for the previous key",
+            ));
+        }
+        let (issuer, audience) = (parts[0], parts[1]);
+        if VerifyPolicy::new(audience, &[issuer]).is_err() {
+            return Err(bad(
+                "the issuer and audience must be client names such as `web` and `bots`",
+            ));
+        }
+        if !wanted(issuer, audience) {
+            return Err(bad(&format!(
+                "{issuer}→{audience} is not a pair {service} signs; give each service only \
+                 its own keys"
+            )));
+        }
+        let key = |id: &str, b64: &str, which: &str| {
+            Key::from_base64(id, b64).map_err(|e| bad(&format!("the {which} key: {e}")))
+        };
+        let mut ring = KeyRing::new(key(parts[2], parts[3], "current")?);
+        if parts.len() == 6 {
+            ring = ring
+                .with_previous(key(parts[4], parts[5], "previous")?)
+                .map_err(|e| bad(&e.to_string()))?;
+        }
+        if out
+            .insert((issuer.to_string(), audience.to_string()), ring)
+            .is_some()
+        {
+            return Err(bad(&format!(
+                "{issuer}→{audience} is listed twice; list each pair once, current key first"
+            )));
+        }
+    }
+    Ok(out)
 }
 
 /// An `http` or `https` base URL, without a trailing slash.
@@ -272,6 +360,37 @@ mod tests {
             let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
             assert!(err.contains(want), "{want}: {err}");
             assert!(!err.contains(BOTS) && !err.contains(TOOLS));
+        }
+    }
+
+    #[test]
+    fn assertion_keys_attach_a_signer_per_upstream() {
+        let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let keys = format!("web:bots:k1:{key}");
+        let cfg = Config::from_lookup(lookup(
+            &[base(), vec![("PMOS_ASSERTION_KEYS", keys.as_str())]].concat(),
+        ))
+        .unwrap();
+        assert!(cfg.bots_token.signs() && !cfg.toolserver_token.signs());
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains(key) && !debug.contains(BOTS), "{debug}");
+        assert!(debug.contains("k1"), "{debug}");
+        // Without keys nothing is signed.
+        let plain = Config::from_lookup(lookup(&base())).unwrap();
+        assert!(!plain.bots_token.signs() && !plain.toolserver_token.signs());
+        // Another service's pair, or a short key, refuses to start without showing the key.
+        let short = "AQEBAQEBAQEBAQEBAQEBAQ==";
+        for (spec, want) in [
+            (format!("console:bots:k1:{key}"), "not a pair"),
+            (format!("web:bots:k1:{short}"), "32 to 64 bytes"),
+            (format!("web:bots:{key}"), "expected issuer:audience"),
+        ] {
+            let err = Config::from_lookup(lookup(
+                &[base(), vec![("PMOS_ASSERTION_KEYS", spec.as_str())]].concat(),
+            ))
+            .unwrap_err();
+            assert!(err.contains(want), "{err}");
+            assert!(!err.contains(key) && !err.contains(short), "{err}");
         }
     }
 

@@ -82,6 +82,10 @@ pub enum Client {
     Orchestrator,
     /// The Slack bot, with `PMOS_BOT_TOKEN`.
     Bot,
+    /// `pmos-web`, with `PMOS_WEB_TOKEN`: the approvals routes only.
+    Web,
+    /// The console, with `PMOS_CONSOLE_TOKEN`: the approvals routes only.
+    Console,
 }
 
 impl Client {
@@ -90,6 +94,8 @@ impl Client {
             Self::Mcp => "mcp",
             Self::Orchestrator => "orchestrator",
             Self::Bot => "bot",
+            Self::Web => "web",
+            Self::Console => "console",
         }
     }
 }

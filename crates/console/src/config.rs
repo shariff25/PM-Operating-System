@@ -1,7 +1,15 @@
 //! Configuration from environment variables.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+
+use pmos_assertion::{Key, KeyRing, VerifyPolicy};
+
+use crate::upstream::{Credentials, Signer};
+
+/// The console's client name: the issuer of its user assertions.
+pub const ISSUER: &str = "console";
 
 /// Who the person in front of the browser is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,13 +75,16 @@ pub struct Config {
     /// `PMOS_BOTS_URL`, default `http://127.0.0.1:8750`.
     pub bots_url: String,
     /// `PMOS_BOTS_TOKEN`: the runtime's `console` client token. Required, at least 32
-    /// characters.
-    pub bots_token: String,
+    /// characters. With a `console:bots` key in `PMOS_ASSERTION_KEYS`, calls that name a
+    /// person also carry a signed user assertion.
+    pub bots_token: Credentials,
     /// `PMOS_TOOLSERVER_URL`, default `http://127.0.0.1:8710`.
     pub toolserver_url: String,
-    /// `PMOS_TOOLSERVER_TOKEN`: the tool server's service token (`PMOS_SERVICE_TOKEN`
-    /// there), which the approvals list needs. Required, at least 32 characters.
-    pub toolserver_token: String,
+    /// `PMOS_TOOLSERVER_TOKEN`: the console's own tool server token (`PMOS_CONSOLE_TOKEN`
+    /// there), which reaches only the approvals routes. Older deployments put the service
+    /// token here. Required, at least 32 characters. With a `console:toolserver` key in
+    /// `PMOS_ASSERTION_KEYS`, calls that name a person also carry a signed user assertion.
+    pub toolserver_token: Credentials,
     /// `PMOS_CONTENT_ROOT`, default `content`: where `team.yaml` is.
     pub content_root: PathBuf,
     /// `PMOS_CONSOLE_AUDIT_LOG`: the tool server's JSON-lines audit file (its
@@ -94,9 +105,9 @@ impl std::fmt::Debug for Config {
             .field("bind", &self.bind)
             .field("identity", &self.identity)
             .field("bots_url", &self.bots_url)
-            .field("bots_token", &"<redacted>")
+            .field("bots_token", &self.bots_token)
             .field("toolserver_url", &self.toolserver_url)
-            .field("toolserver_token", &"<redacted>")
+            .field("toolserver_token", &self.toolserver_token)
             .field("content_root", &self.content_root)
             .field("audit_log", &self.audit_log)
             .field("slack_url", &self.slack_url)
@@ -171,6 +182,26 @@ impl Config {
                 );
             }
         }
+        let content_root: PathBuf = set("PMOS_CONTENT_ROOT")
+            .unwrap_or_else(|| "content".into())
+            .into();
+        let mut keys = match set("PMOS_ASSERTION_KEYS") {
+            None => BTreeMap::new(),
+            Some(spec) => parse_assertion_keys(&spec, "the console", |iss, aud| {
+                iss == ISSUER && (aud == "bots" || aud == "toolserver")
+            })?,
+        };
+        let mut credentials = |token: String, audience: &str| {
+            let c = Credentials::new(token);
+            match keys.remove(&(ISSUER.to_string(), audience.to_string())) {
+                Some(ring) => {
+                    c.with_signer(Signer::new(ISSUER, audience, ring, content_root.clone()))
+                }
+                None => c,
+            }
+        };
+        let bots_token = credentials(bots_token, "bots");
+        let toolserver_token = credentials(toolserver_token, "toolserver");
         let bind: SocketAddr = set("PMOS_CONSOLE_BIND")
             .unwrap_or_else(|| "127.0.0.1:8760".into())
             .parse()
@@ -194,9 +225,7 @@ impl Config {
                 set("PMOS_TOOLSERVER_URL").unwrap_or_else(|| "http://127.0.0.1:8710".into()),
             )?,
             toolserver_token,
-            content_root: set("PMOS_CONTENT_ROOT")
-                .unwrap_or_else(|| "content".into())
-                .into(),
+            content_root,
             audit_log: set("PMOS_CONSOLE_AUDIT_LOG").map(PathBuf::from),
             slack_url: set("PMOS_CONSOLE_SLACK_URL")
                 .map(|u| https_origin("PMOS_CONSOLE_SLACK_URL", u))
@@ -206,6 +235,66 @@ impl Config {
                 .transpose()?,
         })
     }
+}
+
+/// `PMOS_ASSERTION_KEYS`: the keys this service signs user assertions with
+/// (`docs/user-assertion.md`), comma-separated entries, one per caller→receiver pair:
+///
+/// ```text
+/// <issuer>:<audience>:<key id>:<base64 key>[:<key id>:<base64 key>]
+/// ```
+///
+/// the current key first, then optionally the previous one. Keys are 32 to 64 bytes in
+/// standard base64. Only pairs `wanted` accepts may appear, so a service never holds a key it
+/// has no use for. Errors name the entry and the pair, never a key.
+pub fn parse_assertion_keys(
+    spec: &str,
+    service: &str,
+    wanted: impl Fn(&str, &str) -> bool,
+) -> Result<BTreeMap<(String, String), KeyRing>, String> {
+    const VAR: &str = "PMOS_ASSERTION_KEYS";
+    let mut out = BTreeMap::new();
+    let entries = spec.split(',').map(str::trim).filter(|e| !e.is_empty());
+    for (i, entry) in entries.enumerate() {
+        let bad = |why: &str| format!("{VAR} entry {}: {why}", i + 1);
+        let parts: Vec<&str> = entry.split(':').map(str::trim).collect();
+        if parts.len() != 4 && parts.len() != 6 {
+            return Err(bad(
+                "expected issuer:audience:key-id:base64-key, optionally followed by \
+                 :key-id:base64-key for the previous key",
+            ));
+        }
+        let (issuer, audience) = (parts[0], parts[1]);
+        if VerifyPolicy::new(audience, &[issuer]).is_err() {
+            return Err(bad(
+                "the issuer and audience must be client names such as `web` and `bots`",
+            ));
+        }
+        if !wanted(issuer, audience) {
+            return Err(bad(&format!(
+                "{issuer}→{audience} is not a pair {service} signs; give each service only \
+                 its own keys"
+            )));
+        }
+        let key = |id: &str, b64: &str, which: &str| {
+            Key::from_base64(id, b64).map_err(|e| bad(&format!("the {which} key: {e}")))
+        };
+        let mut ring = KeyRing::new(key(parts[2], parts[3], "current")?);
+        if parts.len() == 6 {
+            ring = ring
+                .with_previous(key(parts[4], parts[5], "previous")?)
+                .map_err(|e| bad(&e.to_string()))?;
+        }
+        if out
+            .insert((issuer.to_string(), audience.to_string()), ring)
+            .is_some()
+        {
+            return Err(bad(&format!(
+                "{issuer}→{audience} is listed twice; list each pair once, current key first"
+            )));
+        }
+    }
+    Ok(out)
 }
 
 /// An `http` or `https` base URL, without a trailing slash.
@@ -245,6 +334,38 @@ mod tests {
     const BOTS: &str = "console-token-0123456789abcdef0123";
     const TOOLS: &str = "service-token-0123456789abcdef0123";
     const SECRET: &str = "proxy-secret-0123456789abcdef01234";
+
+    #[test]
+    fn assertion_keys_attach_a_signer_per_upstream() {
+        let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let base = [
+            ("PMOS_BOTS_TOKEN", BOTS),
+            ("PMOS_TOOLSERVER_TOKEN", TOOLS),
+            ("PMOS_CONSOLE_DEV_USER", "ana"),
+        ];
+        let with = |keys: &str| {
+            let mut pairs = base.to_vec();
+            pairs.push(("PMOS_ASSERTION_KEYS", keys));
+            Config::from_lookup(lookup(&pairs))
+        };
+        let cfg = with(&format!(
+            "console:bots:c1:{key},console:toolserver:c2:{key}"
+        ))
+        .unwrap();
+        assert!(cfg.bots_token.signs() && cfg.toolserver_token.signs());
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains(key) && !debug.contains(BOTS) && !debug.contains(TOOLS));
+        let plain = Config::from_lookup(lookup(&base)).unwrap();
+        assert!(!plain.bots_token.signs() && !plain.toolserver_token.signs());
+        // The web app's pair is not the console's to hold; a bad key never shows.
+        for (spec, want) in [
+            (format!("web:bots:k1:{key}"), "not a pair"),
+            ("console:bots:k1:not base64!".to_string(), "base64"),
+        ] {
+            let err = with(&spec).unwrap_err();
+            assert!(err.contains(want) && !err.contains(key), "{err}");
+        }
+    }
 
     #[test]
     fn reads_defaults_and_redacts_tokens() {

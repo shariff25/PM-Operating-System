@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use pmos_contract::model::TeamFile;
-use pmos_web::{app, Config, Deps};
+use pmos_web::{app, Config};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -28,6 +28,12 @@ async fn main() -> Result<()> {
             );
         }
     }
+    // Which upstreams get a signed user assertion on calls for a PM (PMOS_ASSERTION_KEYS).
+    tracing::info!(
+        bots = config.bots_token.signs(),
+        toolserver = config.toolserver_token.signs(),
+        "user assertions signed for"
+    );
     if config.public_url.is_none() {
         tracing::info!("no PMOS_WEB_PUBLIC_URL: writes must come from the request's own Host");
     }
@@ -35,7 +41,13 @@ async fn main() -> Result<()> {
         tracing::info!("no PMOS_WEB_STATIC_DIR: serving /api only");
     }
     let bind = config.bind;
-    let router = pmos_web::build(config, Deps::in_memory()).map_err(anyhow::Error::msg)?;
+    let router = pmos_web::build(
+        config,
+        pmos_web::store_config::deps_from_env()
+            .await
+            .map_err(anyhow::Error::msg)?,
+    )
+    .map_err(anyhow::Error::msg)?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;

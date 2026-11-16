@@ -1,10 +1,22 @@
 //! The console's two upstreams: the bot runtime (`pmos-bots`, as client `console`) and the
-//! tool server (approvals, with the service token). Shapes follow
+//! tool server (approvals, with the console's own tool server token). Shapes follow
 //! `docs/bot-runtime-spec.md` §3 and `docs/toolserver.md`; fields the console doesn't show
 //! are ignored, and lists may come bare (`[…]`) or wrapped (`{"items": […]}`).
+//!
+//! With a key for an upstream (`PMOS_ASSERTION_KEYS`), every call that names a person (one
+//! PM's tasks, routines or approvals) also carries a signed user assertion for that person
+//! (`X-Pmos-Assertion`, `docs/user-assertion.md`): issuer `console`, valid for 60 seconds,
+//! bound to the method, path, query and body sent, signed afresh for every call. Reads of
+//! everything, and routine changes (which name no one), carry none.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+
+use pmos_assertion::{Claims, KeyRing, RequestBinding};
+use pmos_contract::model::TeamFile;
+use reqwest::header::{HeaderName, HeaderValue};
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -226,21 +238,168 @@ pub struct Approval {
     pub created_at: String,
 }
 
+/// How long an assertion lives. The receiver allows a few seconds of clock skew on top.
+pub const ASSERTION_LIFETIME_SECS: u64 = 60;
+
+/// The `sid` claim. The console's upstream calls are made with a handle only, not the
+/// viewer's session, so every assertion carries this fixed value.
+pub const ASSERTION_SESSION: &str = "unknown";
+
+/// Signs user assertions for one upstream (an audience) with that pair's key ring.
+pub struct Signer {
+    issuer: &'static str,
+    audience: String,
+    ring: KeyRing,
+    /// Where `team.yaml` is: the subject's roles are read from it at each call.
+    content_root: PathBuf,
+}
+
+impl std::fmt::Debug for Signer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Signer")
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("key_id", &self.ring.current_id())
+            .finish()
+    }
+}
+
+impl Signer {
+    /// As `issuer` (the console is `console`) for `audience` (`bots` or `toolserver`).
+    pub fn new(issuer: &'static str, audience: &str, ring: KeyRing, content_root: PathBuf) -> Self {
+        Self {
+            issuer,
+            audience: audience.to_string(),
+            ring,
+            content_root,
+        }
+    }
+
+    /// The subject's known roles in `team.yaml`; none if the file or the member is missing.
+    /// Receivers check roles against `team.yaml` themselves: these are informational.
+    fn roles(&self, subject: &str) -> Vec<pmos_contract::model::Role> {
+        TeamFile::load(&self.content_root)
+            .ok()
+            .and_then(|t| t.by_handle(subject).map(|m| m.roles.clone()))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.is_known())
+            .collect()
+    }
+
+    /// An assertion that `subject` is the person `request` is for, bound to it exactly as it
+    /// will be sent.
+    pub fn sign(
+        &self,
+        subject: &str,
+        request: &reqwest::Request,
+    ) -> Result<HeaderValue, &'static str> {
+        let url = request.url();
+        let target = match url.query() {
+            Some(q) => format!("{}?{q}", url.path()),
+            None => url.path().to_string(),
+        };
+        let body: &[u8] = match request.body() {
+            None => b"",
+            Some(b) => b.as_bytes().ok_or("can't sign a streamed body")?,
+        };
+        let binding = RequestBinding::new(request.method().as_str(), &target, body)
+            .map_err(|_| "can't bind this request")?;
+        let claims = Claims::new(
+            self.issuer,
+            &self.audience,
+            subject,
+            &self.roles(subject),
+            ASSERTION_SESSION,
+        )
+        .map_err(|_| "can't sign for this person")?;
+        let value = self
+            .ring
+            .sign(
+                &claims,
+                pmos_assertion::unix_now(),
+                ASSERTION_LIFETIME_SECS,
+                Some(&binding),
+            )
+            .map_err(|_| "couldn't sign the user assertion")?;
+        HeaderValue::from_str(&value).map_err(|_| "couldn't sign the user assertion")
+    }
+}
+
+/// What the console presents to one upstream: its client token and, when it has a key for
+/// that upstream, the [`Signer`] for its user assertions. `Debug` never shows the token.
+#[derive(Clone)]
+pub struct Credentials {
+    token: String,
+    signer: Option<Arc<Signer>>,
+}
+
+impl Credentials {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+            signer: None,
+        }
+    }
+
+    /// Also sign a user assertion on every call that names a person.
+    pub fn with_signer(mut self, signer: Signer) -> Self {
+        self.signer = Some(Arc::new(signer));
+        self
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub fn signs(&self) -> bool {
+        self.signer.is_some()
+    }
+}
+
+impl From<&str> for Credentials {
+    fn from(token: &str) -> Self {
+        Self::new(token)
+    }
+}
+
+impl From<String> for Credentials {
+    fn from(token: String) -> Self {
+        Self::new(token)
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("token", &"<redacted>")
+            .field("signer", &self.signer)
+            .finish()
+    }
+}
+
 /// An HTTP client for one upstream.
 #[derive(Clone)]
 pub struct Upstream {
     http: reqwest::Client,
     base: String,
     token: String,
+    signer: Option<Arc<Signer>>,
     service: &'static str,
 }
 
 impl Upstream {
-    pub fn new(http: reqwest::Client, base: &str, token: &str, service: &'static str) -> Self {
+    pub fn new(
+        http: reqwest::Client,
+        base: &str,
+        credentials: &Credentials,
+        service: &'static str,
+    ) -> Self {
         Self {
             http,
             base: base.trim_end_matches('/').to_string(),
-            token: token.to_string(),
+            token: credentials.token.clone(),
+            signer: credentials.signer.clone(),
             service,
         }
     }
@@ -262,19 +421,33 @@ impl Upstream {
         }
     }
 
-    async fn send(&self, req: reqwest::RequestBuilder) -> UpstreamResult<reqwest::Response> {
-        let res = req
+    /// Send `req`. When it names a person (`subject`) and there is a key for this upstream, a
+    /// fresh user assertion is signed over the request as built, and added to it.
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+        subject: Option<&str>,
+    ) -> UpstreamResult<reqwest::Response> {
+        let mut request = req
             .bearer_auth(&self.token)
             .timeout(TIMEOUT)
-            .send()
-            .await
-            .map_err(|e| {
-                self.failed(if e.is_timeout() {
-                    "timed out".to_string()
-                } else {
-                    "didn't answer".to_string()
-                })
-            })?;
+            .build()
+            .map_err(|_| self.failed("couldn't build the request"))?;
+        if let (Some(signer), Some(subject)) = (&self.signer, subject) {
+            let value = signer
+                .sign(subject, &request)
+                .map_err(|why| self.failed(why))?;
+            request
+                .headers_mut()
+                .insert(HeaderName::from_static(pmos_assertion::HEADER), value);
+        }
+        let res = self.http.execute(request).await.map_err(|e| {
+            self.failed(if e.is_timeout() {
+                "timed out".to_string()
+            } else {
+                "didn't answer".to_string()
+            })
+        })?;
         match res.status() {
             s if s.is_success() => Ok(res),
             reqwest::StatusCode::NOT_FOUND => Err(UpstreamError::NotFound),
@@ -282,13 +455,15 @@ impl Upstream {
         }
     }
 
+    /// `GET`, with an assertion for `subject` when the query names that person.
     async fn get<T: DeserializeOwned>(
         &self,
         segments: &[&str],
         query: &[(&str, &str)],
+        subject: Option<&str>,
     ) -> UpstreamResult<T> {
         let url = self.url(segments)?;
-        let res = self.send(self.http.get(url).query(query)).await?;
+        let res = self.send(self.http.get(url).query(query), subject).await?;
         res.json::<T>()
             .await
             .map_err(|e| self.failed(format!("sent a reply the console can't read: {e}")))
@@ -298,19 +473,23 @@ impl Upstream {
         &self,
         segments: &[&str],
         query: &[(&str, &str)],
+        subject: Option<&str>,
     ) -> UpstreamResult<Vec<T>> {
-        Ok(self.get::<List<T>>(segments, query).await?.into_vec())
+        Ok(self
+            .get::<List<T>>(segments, query, subject)
+            .await?
+            .into_vec())
     }
 
     // The bot runtime.
 
     pub async fn bots(&self) -> UpstreamResult<Vec<BotSummary>> {
-        self.list(&["v1", "bots"], &[]).await
+        self.list(&["v1", "bots"], &[], None).await
     }
 
     pub async fn bot(&self, name: &str) -> UpstreamResult<BotDetail> {
         Ok(self
-            .get::<BotDetailWire>(&["v1", "bots", name], &[])
+            .get::<BotDetailWire>(&["v1", "bots", name], &[], None)
             .await?
             .into())
     }
@@ -321,32 +500,35 @@ impl Upstream {
         if let Some(who) = requested_by {
             query.push(("requested_by", who));
         }
-        self.list(&["v1", "tasks"], &query).await
+        // One PM's tasks name them; all tasks name no one.
+        self.list(&["v1", "tasks"], &query, requested_by).await
     }
 
     pub async fn task(&self, id: &str) -> UpstreamResult<Task> {
-        self.get(&["v1", "tasks", id], &[]).await
+        self.get(&["v1", "tasks", id], &[], None).await
     }
 
     pub async fn task_events(&self, id: &str) -> UpstreamResult<Vec<TaskEvent>> {
-        self.list(&["v1", "tasks", id, "events"], &[]).await
+        self.list(&["v1", "tasks", id, "events"], &[], None).await
     }
 
     pub async fn task_trace(&self, id: &str) -> UpstreamResult<Vec<TraceEntry>> {
-        self.list(&["v1", "tasks", id, "trace"], &[]).await
+        self.list(&["v1", "tasks", id, "trace"], &[], None).await
     }
 
     pub async fn routines(&self, owner: Option<&str>) -> UpstreamResult<Vec<Routine>> {
         let query: Vec<(&str, &str)> = owner.map(|o| ("owner", o)).into_iter().collect();
-        self.list(&["v1", "routines"], &query).await
+        self.list(&["v1", "routines"], &query, owner).await
     }
 
     pub async fn set_routine_enabled(&self, id: &str, enabled: bool) -> UpstreamResult<()> {
         let url = self.url(&["v1", "routines", id])?;
+        // Names no one: the console's own power (docs/console.md).
         self.send(
             self.http
                 .patch(url)
                 .json(&serde_json::json!({ "enabled": enabled })),
+            None,
         )
         .await
         .map(drop)
@@ -354,16 +536,17 @@ impl Upstream {
 
     pub async fn delete_routine(&self, id: &str) -> UpstreamResult<()> {
         let url = self.url(&["v1", "routines", id])?;
-        self.send(self.http.delete(url)).await.map(drop)
+        self.send(self.http.delete(url), None).await.map(drop)
     }
 
     // The tool server.
 
-    /// A PM's pending approvals, newest first.
+    /// A PM's pending approvals, newest first, with an assertion for that PM.
     pub async fn pending_approvals(&self, user: &str) -> UpstreamResult<Vec<Approval>> {
         self.list(
             &["internal", "approvals"],
             &[("user", user), ("status", "pending")],
+            Some(user),
         )
         .await
     }

@@ -8,6 +8,7 @@
 
 pub mod app;
 pub mod approvals;
+pub mod assertion;
 pub mod audit;
 pub mod bets;
 pub mod catalog;
@@ -34,6 +35,6 @@ pub mod store;
 pub mod team;
 pub mod vault;
 
-pub use app::{router, router_with, AppConfig};
+pub use app::{router, router_full, router_with, AppConfig, PersonClients};
 pub use service::ToolService;
 pub use store::Stores;
