@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { Draft } from '../api';
+import type { Api, Draft } from '../api';
 import { copy } from '../copy';
 import { renderApp } from '../test/util';
 
@@ -259,5 +259,63 @@ describe('sources as the backend sends them', () => {
       },
     });
     expect(await screen.findByText(/The passage itself/)).toBeInTheDocument();
+  });
+});
+
+describe('before and after: lighter fallbacks', () => {
+  const OLD = 'Customers on annual plans lose access the moment a payment fails, even when the failure is a card that expired yesterday. Support handled 140 tickets about this last quarter.';
+  const withBody = (body: (old: string) => string) => (a: Api) => {
+    const orig = a.getDraft.bind(a);
+    let old = '';
+    a.getDraft = async (id) => {
+      const d = await orig(id);
+      old = d.body;
+      return d;
+    };
+    a.getSuggestion = async () => ({ status: 'ready', instruction: 'x', body: body(old), error: null });
+    return a;
+  };
+  const ask = async (user: ReturnType<typeof userEvent.setup>) => {
+    await user.click(await screen.findByRole('tab', { name: copy.panel.ask }));
+    await user.type(screen.getByLabelText(copy.draft.askLabel), 'rewrite');
+    await user.click(screen.getByRole('button', { name: copy.draft.askButton }));
+    const region = await screen.findByRole('region', { name: copy.draft.suggestionHeading });
+    return within(region).getByRole('list', { name: copy.draft.beforeAfter });
+  };
+
+  it('collapses a wholly rewritten paragraph to a toggle, with the new text in full', async () => {
+    const user = userEvent.setup();
+    const fresh = 'Billing failures should never end a workspace sudden shutdown for anyone, so we are rethinking how access ends.';
+    renderApp({ hash: '/d/apr_prd', wrap: withBody((old) => old.replace(OLD, fresh)) });
+    const list = await ask(user);
+    const toggle = within(list).getByRole('button', { name: copy.draft.diffShowRemoved });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    const group = document.getElementById(toggle.getAttribute('aria-controls')!)!;
+    expect(group).toHaveClass('ba-clamp');
+    // the semantics stay: old text in del, new text in ins, each with a spoken label
+    expect(group.querySelector('del')?.textContent).toContain('Customers on annual plans');
+    expect(group).toHaveTextContent(copy.draft.diffRemoved);
+    const added = within(list).getByText(fresh);
+    expect(added.tagName).toBe('INS');
+    expect(added.closest('p')).toHaveTextContent(copy.draft.diffAdded);
+
+    // keyboard: the toggle is a real button that opens and closes
+    toggle.focus();
+    await user.keyboard('{Enter}');
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(toggle).toHaveTextContent(copy.draft.diffHideRemoved);
+    expect(group).not.toHaveClass('ba-clamp');
+    await user.keyboard(' ');
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveTextContent(copy.draft.diffShowRemoved);
+  });
+
+  it('shows one note instead of every item when only the list marker changed', async () => {
+    const user = userEvent.setup();
+    renderApp({ hash: '/d/apr_prd', wrap: withBody((old) => old.replace('- Involuntary churn', '* Involuntary churn').replace('- Payment-failure', '* Payment-failure')) });
+    const list = await ask(user);
+    expect(within(list).getByText(copy.draft.diffListStyle)).toBeInTheDocument();
+    expect(list.querySelectorAll('del, ins')).toHaveLength(0);
+    expect(within(list).queryByText(copy.draft.diffNoChange)).not.toBeInTheDocument();
   });
 });
