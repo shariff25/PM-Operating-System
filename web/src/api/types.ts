@@ -48,6 +48,8 @@ export interface Draft extends DraftSummary {
   sources: Source[];
   result_url: string | null;
   external: boolean;
+  /** Opaque. Sent back with approve so the server can refuse a draft that changed after it was shown. */
+  version?: string;
 }
 
 export type SuggestionStatus = 'working' | 'ready' | 'failed';
@@ -124,6 +126,7 @@ export type ErrorCode =
   | 'needs_external_confirm'
   | 'audience_blocked'
   | 'expired'
+  | 'stale'
   | 'not_practice'
   | 'not_built'
   | 'network'
@@ -155,7 +158,7 @@ export interface Api {
   getSuggestion(id: string): Promise<Suggestion | null>;
   acceptSuggestion(id: string): Promise<Draft>;
   rejectSuggestion(id: string): Promise<Draft>;
-  approve(id: string, opts?: { confirmExternal?: boolean }): Promise<Draft>;
+  approve(id: string, opts?: { confirmExternal?: boolean; version?: string }): Promise<Draft>;
   reject(id: string, reason?: RejectReason): Promise<Draft>;
   createPractice(): Promise<Draft>;
   deleteDraft(id: string): Promise<void>;
