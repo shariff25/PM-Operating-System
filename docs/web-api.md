@@ -75,7 +75,7 @@ document.
  "sources": [Source], "result_url": null, "external": false, "version": "7"}
 
 // Source
-{"id": "s1", "system": "docs", "title": "TCB grace period", "url": "https://…",
+{"id": "s1", "system": "docs", "title": "TCB grace period", "url": "https://… or null",
  "excerpt": "one or two sentences, or null"}
 
 // Suggestion
