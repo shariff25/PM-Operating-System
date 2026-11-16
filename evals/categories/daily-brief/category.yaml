@@ -1,0 +1,41 @@
+# The daily brief (docs/daily-brief.md): one short DM with what changed, what is waiting on
+# the PM and what the PM is waiting on, every line linked to its source.
+#
+# These tasks run against the fake connectors' fixtures (crates/toolserver/src/connectors/
+# fake.rs) for the PM `evals` (Slack id U0EVALS):
+# - Slack, all sent on 2024-11-14 (UTC): Ben in #pm-team asks about SAML SSO (C0PMTEAM
+#   1731600000.000100, unanswered); Ben asks about SCIM and the PM answers (…300.000200, so it
+#   is answered); Cy's FYI (…600.000400) and a bot reminder (…900.000500), neither a question;
+#   Sam in #field-questions asks about enterprise pricing (C0FIELD 1731601200.000600,
+#   unanswered); Alex at Globex asks about key rotation and bumps it (C0GLOBEXCX
+#   1731601500.000700 and 1731601800.000800, unanswered). Links are
+#   https://slack.com/archives/<channel>/p<ts without the dot>.
+# - Jira PM-101, PM-102 and PM-103 and Confluence pages 9001 and 9002 carry no dates in the
+#   fakes, so under the skill's "dated" rule none of them can be a line in the brief.
+# - Nothing the PM asked is waiting on a reply: the fixtures hold no question from the PM.
+# The fixtures are from 2024, so each task names the date to act as (the request's date
+# overrides the system prompt's, as the skill says): Friday 2024-11-15 is a normal day, and
+# Monday 2024-11-25 is a quiet one, because every open ask is then more than 7 days old and
+# has expired.
+#
+# The checks are deterministic: the three parts, a link to each real thread, none to a thread
+# that should not appear, nothing invented, nothing drafted. Whether the opening line is
+# friendly and the brief is short enough to read in a glance is for people (and, later, a
+# judge): the line limit has no deterministic check yet.
+#
+# The not-connected task simulates the condition in its request, because the eval stack can't
+# yet run as a member whose Slack is unlinked (docs/daily-brief.md, gap 9).
+#
+# pass_bar is a conservative STARTING value, not a measured one: set it from the first few
+# weekly runs, then raise it. With repeats 3 it is judged over every attempt.
+name: daily-brief
+bot: personal
+repeats: 3
+pass_bar: 0.7
+description: >-
+  The daily brief: a PM's personal bot reads Jira, Confluence and Slack with the PM's own
+  access and writes one short DM, with what changed, what is waiting on the PM and what the
+  PM is waiting on. Every line links to its source and a line without one is not shown; a quiet
+  day is one line; a source that is not connected is named in one line and left out; nothing is
+  invented and nothing is drafted or posted. Seed tasks against the fake Slack, Jira and
+  Confluence fixtures.
