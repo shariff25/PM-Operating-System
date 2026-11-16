@@ -62,6 +62,38 @@ The routine draft:
   `content/roles/pm-assistant/ROLE.md`); Slack gets the three DM commands; the claim passes the
   PM's name to the prompt (see gap 8).
 
+### Slack commands
+
+Built in `crates/slack/src/brief.rs` (wording as data in `brief_copy.rs`), for team members,
+typed alone in a DM, in any case:
+
+| Say | What happens |
+| --- | --- |
+| `brief me at 8`, `brief me at 8:30`, `brief me at 7am`, `daily brief at 09:00` | Turns the brief on at that time on weekdays (cron `M H * * 1-5`) in the PM's Slack time zone, else `PMOS_DEFAULT_TZ`. One plain line confirms the time and zone and says `brief off` stops it |
+| `brief on` | The same at the default, 08:30 |
+| `brief off` | Deletes the brief routine only; the PM's other routines are untouched |
+| `brief`, `brief status` | Says whether it is on and when it next runs |
+| `brief now`, `brief me now` | Starts one task for the personal bot with the same prompt, answered in the thread; the routine is unchanged |
+
+- **One routine.** The draft is the one in part 1, built directly (the model is not
+  involved). Asking again for the same time says it is already set; a new time creates the
+  new routine and then deletes the old one, so there is never more than one; a paused one at
+  the same time is resumed.
+- **Identifying it.** The prompt starts with `[daily-brief]` (`brief::TAG`);
+  `brief::is_brief_routine(routine)` tests it. The runtime is unchanged.
+- **Times** are 00:00 to 23:59 (`7am`, `7:30 pm` also work). Anything else, such as `25` or
+  `8:75`, gets one line with examples, and nothing changes. Weekdays only. A time zone in
+  the message (`brief me at 8 London`) is not read; it gets the same line.
+- **Hooks to wire** (the module does not edit these files):
+  - `bots.rs`, `on_dm`, after the `nudges::handle_dm` call and before `level::command`:
+    `if crate::brief::handle_dm(self, &dm.channel, &dm.thread_ts, &dm.user, &text).await { return; }`
+  - `notify.rs`, the `"done"` arm of `handle`, first line, so a delivered brief counts as the
+    PM's one message that day for the nudge engine (`docs/nudges.md`; a no-op when the engine
+    is off, and when the finished task is not from a brief routine):
+    `crate::brief::note_delivery(&self.bots, item).await;`
+    It reads the notification's `requested_by` and `routine_id` and checks the routine with
+    `is_brief_routine`, then calls `nudges::record_daily_message`.
+
 ## 2. What the skill can do today
 
 With the tools that exist (`content/tools.yaml`): `jira.search`, `jira.read`,
