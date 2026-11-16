@@ -8,7 +8,9 @@
 //!   card in the DM.
 //! - **Skills:** the member's level ("You're set to the *Staff* level …", left out when the
 //!   runtime doesn't answer), then the skills with the `slack` surface that the member's
-//!   personal bot's role lists (the Docs bot's without one), grouped by `track`.
+//!   personal bot's role lists (the Docs bot's without one): "Start here" with three suggested
+//!   skills, then the rest grouped by the job they do (`GROUPS`; a group over six skills has
+//!   **Show all in …**).
 //! - **Accounts:** Jira and Confluence, Slack and GitHub, each Connected (**Disconnect**) or
 //!   Not connected (**Connect**), and the memory repo.
 //!
@@ -43,6 +45,8 @@ pub mod action {
     pub const TAB_INBOX: &str = "home_tab_inbox";
     pub const TAB_SKILLS: &str = "home_tab_skills";
     pub const TAB_ACCOUNTS: &str = "home_tab_accounts";
+    /// "Show all in <group>": the value is the group's name.
+    pub const SKILLS_GROUP: &str = "home_skills_group";
     pub const APPROVE: &str = "home_approve";
     pub const REJECT: &str = "home_reject";
     pub const REFRESH: &str = "home_refresh";
@@ -72,19 +76,85 @@ const SKILL_LINE_MAX: usize = 150;
 /// How long the skills catalog is reused.
 const CATALOG_TTL: Duration = Duration::from_secs(60);
 
-/// The tracks in the order the Skills section shows them; any other track follows,
-/// alphabetically, then "Other".
-pub const TRACKS: [&str; 10] = [
-    "Everyday",
-    "Product sense",
-    "Strategy and decisions",
-    "Metrics and experiments",
-    "Spec and review",
-    "Customer and market",
-    "AI products",
-    "Delivery and launch",
-    "Leading across teams",
-    "Company bets",
+/// The groups the Skills section shows, in order, and the `track`s that land in each. A skill
+/// goes to the group of its `track`, unless `GROUP_OVERRIDES` names it. A skill with neither
+/// goes to `MORE`.
+pub const GROUPS: [(&str, &[&str]); 7] = [
+    ("Everyday", &["Everyday"]),
+    (
+        "Understand and decide",
+        &[
+            "Product sense",
+            "Customer and market",
+            "Strategy and decisions",
+        ],
+    ),
+    (
+        "Write a document",
+        &["Spec and review", "AI products", "Company bets"],
+    ),
+    (
+        "Plan and prioritise",
+        &["Metrics and experiments", "Leading across teams"],
+    ),
+    ("Launch", &["Delivery and launch"]),
+    ("Review and coach", &[]),
+    ("Communicate", &[]),
+];
+/// The group for skills that fit none of the above.
+pub const MORE: &str = "More";
+/// Skills whose job differs from their track's usual one.
+const GROUP_OVERRIDES: [(&str, &str); 11] = [
+    ("prioritize", "Plan and prioritise"),
+    ("pre-mortem", "Review and coach"),
+    ("review", "Review and coach"),
+    ("experiment-readout", "Review and coach"),
+    ("business-review", "Review and coach"),
+    ("coach-feedback", "Review and coach"),
+    ("status-update", "Communicate"),
+    ("exec-brief", "Communicate"),
+    ("alignment-plan", "Communicate"),
+    ("partner-brief", "Communicate"),
+    ("platform-strategy", "Plan and prioritise"),
+];
+/// How many skills a group lists before "Show all in <group>".
+const GROUP_PREVIEW: usize = 6;
+
+/// "Start here": the skills a new PM gets the most from, in the order they are offered, with
+/// what you get and what to type. The first three that are in the PM's catalog are shown, so
+/// the later ones are stand-ins when an earlier one is missing. The rule: work almost every
+/// PM does in their first week. Edit this list to change the suggestions.
+pub const START_HERE: [(&str, &str, &str); 6] = [
+    (
+        "ask",
+        "A sourced answer to a question about our products, customers or past decisions.",
+        "ask: what did we decide about pricing for small teams?",
+    ),
+    (
+        "meeting-notes",
+        "Decisions, owners and follow-ups from a call, ready for you to approve.",
+        "meeting-notes: the notes from today's customer call",
+    ),
+    (
+        "status-update",
+        "A one-page update for stakeholders, drawn from Jira and Confluence.",
+        "status-update: this week for the checkout project",
+    ),
+    (
+        "prd-draft",
+        "A first draft of a PRD from your brief, with sources.",
+        "prd-draft: bulk export for admins",
+    ),
+    (
+        "problem-framing",
+        "A clear problem statement before anyone picks a solution.",
+        "problem-framing: customers keep asking for dark mode",
+    ),
+    (
+        "slack-reply",
+        "Draft replies to the questions waiting for you in Slack.",
+        "slack-reply: catch me up on what I missed",
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +196,8 @@ impl Tab {
 pub struct Home {
     viewers: Mutex<Bounded<String, Tab>>,
     catalog: Mutex<Option<(Instant, Vec<Skill>)>>,
+    /// The Skills group a viewer opened with "Show all in …", by Slack user id.
+    expanded: Mutex<Bounded<String, String>>,
 }
 
 impl Default for Home {
@@ -133,6 +205,7 @@ impl Default for Home {
         Self {
             viewers: Mutex::new(Bounded::new(2000)),
             catalog: Mutex::new(None),
+            expanded: Mutex::new(Bounded::new(2000)),
         }
     }
 }
@@ -497,16 +570,21 @@ impl Tally {
 
 // ---- Skills ----
 
-/// Where a track goes in the list: the known ones in order, then the rest alphabetically,
-/// then skills with none.
-fn track_rank(track: Option<&str>) -> (usize, String) {
-    match track.map(str::trim).filter(|t| !t.is_empty()) {
-        Some(t) => match TRACKS.iter().position(|k| k.eq_ignore_ascii_case(t)) {
-            Some(i) => (i, String::new()),
-            None => (TRACKS.len(), t.to_lowercase()),
-        },
-        None => (TRACKS.len() + 1, String::new()),
+/// The group a skill belongs to: its override, else its track's group, else "More".
+pub fn group_of(name: &str, track: Option<&str>) -> &'static str {
+    if let Some((_, g)) = GROUP_OVERRIDES.iter().find(|(n, _)| *n == name) {
+        return g;
     }
+    let track = track.map(str::trim).unwrap_or_default();
+    GROUPS
+        .iter()
+        .find(|(_, tracks)| tracks.iter().any(|t| t.eq_ignore_ascii_case(track)))
+        .map_or(MORE, |(g, _)| g)
+}
+
+/// Whether `group` is one the Skills section can show.
+fn known_group(group: &str) -> bool {
+    group == MORE || GROUPS.iter().any(|(g, _)| *g == group)
 }
 
 /// A description's first sentence, cut to 150 characters.
@@ -520,13 +598,16 @@ pub fn first_sentence(description: &str) -> String {
     truncate(&d[..end], SKILL_LINE_MAX)
 }
 
-/// The Skills section: the PM's level (when the runtime said), how to use them, then one
-/// header per track and a line per skill. `allowed` is the role's skills; `None` when they
-/// couldn't be loaded (every Slack skill is shown, with a note).
+/// The Skills section: the PM's level (when the runtime said), how to use them, "Start here"
+/// with three suggestions, then the rest by the job they do. A group over `GROUP_PREVIEW`
+/// skills lists the first few and a **Show all in <group>** button, unless it is `expanded`.
+/// `allowed` is the role's skills; `None` when they couldn't be loaded (every Slack skill is
+/// shown, with a note).
 pub fn skills(
     catalog: &[(String, String, Option<String>)],
     allowed: Option<&[String]>,
     level: Option<&str>,
+    expanded: Option<&str>,
 ) -> Vec<Value> {
     let mut blocks = Vec::new();
     if let Some(level) = level {
@@ -546,36 +627,54 @@ pub fn skills(
         blocks.push(section("No skills are available to your bot in Slack yet."));
         return blocks;
     }
-    shown.sort_by(|a, b| {
-        (track_rank(a.2.as_deref()), &a.0).cmp(&(track_rank(b.2.as_deref()), &b.0))
-    });
-    let mut current: Option<(usize, String)> = None;
-    let mut lines: Vec<String> = Vec::new();
-    let flush = |blocks: &mut Vec<Value>, lines: &mut Vec<String>| {
-        if !lines.is_empty() {
-            blocks.extend(cards::sections(&lines.join("\n")));
-            lines.clear();
-        }
-    };
-    for (name, description, track) in shown {
-        let rank = track_rank(track.as_deref());
-        if current.as_ref() != Some(&rank) {
-            flush(&mut blocks, &mut lines);
-            let title = match rank.0 {
-                i if i < TRACKS.len() => TRACKS[i].to_string(),
-                i if i == TRACKS.len() => track.as_deref().unwrap_or_default().trim().to_string(),
-                _ => "Other".to_string(),
-            };
-            blocks.push(header(&title));
-            current = Some(rank);
-        }
-        lines.push(format!(
-            "*{}* {}",
-            escape(name),
-            escape(&first_sentence(description))
-        ));
+    shown.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let start: Vec<String> = START_HERE
+        .iter()
+        .filter(|(name, _, _)| shown.iter().any(|(n, _, _)| n == name))
+        .take(3)
+        .map(|(name, gets, example)| format!("*{name}*: {gets} Try `{example}`"))
+        .collect();
+    if !start.is_empty() {
+        blocks.push(header("Start here"));
+        blocks.extend(cards::sections(&start.join("\n")));
     }
-    flush(&mut blocks, &mut lines);
+
+    let group_names = GROUPS.iter().map(|(g, _)| *g).chain([MORE]);
+    for group in group_names {
+        let members: Vec<&&(String, String, Option<String>)> = shown
+            .iter()
+            .filter(|(name, _, track)| group_of(name, track.as_deref()) == group)
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let open = expanded == Some(group);
+        let limit = if open { members.len() } else { GROUP_PREVIEW };
+        let lines: Vec<String> = members
+            .iter()
+            .take(limit)
+            .map(|(name, description, _)| {
+                format!(
+                    "*{}* {}",
+                    escape(name),
+                    escape(&first_sentence(description))
+                )
+            })
+            .collect();
+        blocks.push(header(group));
+        blocks.extend(cards::sections(&lines.join("\n")));
+        if members.len() > limit {
+            blocks.push(json!({"type": "actions", "elements": [
+                button(
+                    &format!("Show all in {group} ({})", members.len()),
+                    action::SKILLS_GROUP,
+                    group,
+                    None,
+                ),
+            ]}));
+        }
+    }
     blocks
 }
 
@@ -742,8 +841,26 @@ impl Bots {
             action::TAB_SKILLS => Some(Tab::Skills),
             action::TAB_ACCOUNTS => Some(Tab::Accounts),
             action::REFRESH => Some(current),
+            action::SKILLS_GROUP => Some(Tab::Skills),
             _ => None,
         };
+        let group = (action_id == action::SKILLS_GROUP)
+            .then(|| payload["actions"][0]["value"].as_str())
+            .flatten()
+            .filter(|g| known_group(g))
+            .map(String::from);
+        {
+            let mut expanded = self
+                .home_state()
+                .expanded
+                .lock()
+                .expect("home expanded lock");
+            if let Some(group) = &group {
+                expanded.insert(user.clone(), group.clone());
+            } else if tab.is_some() && action_id != action::REFRESH {
+                expanded.remove(&user);
+            }
+        }
         let work: FollowUp = if let Some(tab) = tab {
             Box::pin(async move { this.publish_home(&user, tab, None).await })
         } else if action_id == action::APPROVE || action_id == action::REJECT {
@@ -797,7 +914,16 @@ impl Bots {
                     .insert(user.to_string(), tab);
                 let body = match tab {
                     Tab::Inbox => self.inbox_body(&handle).await,
-                    Tab::Skills => self.skills_body(&handle).await,
+                    Tab::Skills => {
+                        let open = self
+                            .home_state()
+                            .expanded
+                            .lock()
+                            .expect("home expanded lock")
+                            .get(&user.to_string())
+                            .cloned();
+                        self.skills_body(&handle, open.as_deref()).await
+                    }
                     Tab::Accounts => self.accounts_body(&handle).await,
                 };
                 view(tab, notice.as_deref(), body)
@@ -860,7 +986,7 @@ impl Bots {
         }
     }
 
-    async fn skills_body(&self, handle: &str) -> Vec<Value> {
+    async fn skills_body(&self, handle: &str, expanded: Option<&str>) -> Vec<Value> {
         let catalog: Vec<(String, String, Option<String>)> = self
             .catalog()
             .await
@@ -889,7 +1015,7 @@ impl Bots {
                 None
             }
         };
-        skills(&catalog, allowed.as_deref(), level.as_deref())
+        skills(&catalog, allowed.as_deref(), level.as_deref(), expanded)
     }
 
     async fn accounts_body(&self, handle: &str) -> Vec<Value> {
@@ -1111,82 +1237,205 @@ mod tests {
         assert!(!n.contains("rejected"));
     }
 
-    #[test]
-    fn skills_group_by_track() {
-        let s = |n: &str, t: Option<&str>| {
-            (
-                n.to_string(),
-                format!("Does {n} <well>. And more."),
-                t.map(String::from),
-            )
-        };
-        let catalog = vec![
-            s("review", Some("Spec and review")),
-            s("ask", Some("Everyday")),
-            s("zeta", Some("Zany")),
-            s("misc", None),
-            s("alpha", Some("Alpha things")),
-            s("hidden", Some("Everyday")),
-        ];
-        let allowed: Vec<String> = ["review", "ask", "zeta", "misc", "alpha"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let blocks = skills(&catalog, Some(&allowed), None);
-        let headers: Vec<&str> = blocks
+    fn entry(n: &str, t: Option<&str>) -> (String, String, Option<String>) {
+        (
+            n.to_string(),
+            format!("Does {n} <well>. And more."),
+            t.map(String::from),
+        )
+    }
+
+    fn texts(blocks: &[Value]) -> String {
+        Value::Array(blocks.to_vec()).to_string()
+    }
+
+    fn headers(blocks: &[Value]) -> Vec<&str> {
+        blocks
             .iter()
             .filter(|b| b["type"] == "header")
             .map(|b| b["text"]["text"].as_str().unwrap())
+            .collect()
+    }
+
+    /// The real skills' names and tracks, plus invented ones to reach 47.
+    fn full_catalog() -> Vec<(String, String, Option<String>)> {
+        let mut out = Vec::new();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/skills");
+        for dir in std::fs::read_dir(root).unwrap() {
+            let file = dir.unwrap().path().join("SKILL.md");
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let name = file
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let track = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("track:"))
+                .map(|t| t.trim().trim_matches('"').to_string());
+            out.push(entry(&name, track.as_deref()));
+        }
+        let mut i = 0;
+        while out.len() < 47 {
+            out.push(entry(&format!("extra-{i}"), (i % 2 == 0).then_some("Odd")));
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn skills_start_here_shows_three_suggestions() {
+        let catalog = full_catalog();
+        let blocks = skills(&catalog, None, None, None);
+        assert_eq!(headers(&blocks)[0], "Start here");
+        let s = texts(&blocks);
+        for (name, _, example) in START_HERE.iter().take(3) {
+            assert!(s.contains(&format!("*{name}*: ")), "{name}");
+            assert!(s.contains(&format!("Try `{example}`")), "{name}");
+        }
+        assert!(!s.contains("*prd-draft*: "), "only three are suggested");
+        let at = blocks.iter().position(|b| b["type"] == "header").unwrap();
+        let start = blocks[at + 1]["text"]["text"].as_str().unwrap();
+        assert_eq!(start.lines().count(), 3);
+    }
+
+    #[test]
+    fn skills_start_here_falls_back_when_one_is_missing() {
+        let catalog = full_catalog();
+        let allowed: Vec<String> = catalog
+            .iter()
+            .map(|c| c.0.clone())
+            .filter(|n| n != "meeting-notes")
             .collect();
+        let s = texts(&skills(&catalog, Some(&allowed), None, None));
+        assert!(s.contains("*ask*: ") && s.contains("*status-update*: "));
+        assert!(s.contains("*prd-draft*: "), "the next one steps in");
+        assert!(!s.contains("*meeting-notes*"));
+        // Nothing suggested is available: no "Start here" at all.
+        let only = vec!["decision-doc".to_string()];
+        let blocks = skills(&catalog, Some(&only), None, None);
+        assert!(!headers(&blocks).contains(&"Start here"));
+    }
+
+    #[test]
+    fn skills_groups_cover_every_skill_once() {
+        let catalog = full_catalog();
+        assert_eq!(catalog.len(), 47);
+        let all_open = |blocks: &[Value]| {
+            let mut seen: Vec<String> = Vec::new();
+            let mut in_group = false;
+            for b in blocks {
+                if b["type"] == "header" {
+                    in_group = b["text"]["text"] != "Start here";
+                } else if in_group && b["type"] == "section" {
+                    for line in b["text"]["text"].as_str().unwrap().lines() {
+                        seen.push(
+                            line.trim_start_matches('*')
+                                .split('*')
+                                .next()
+                                .unwrap()
+                                .into(),
+                        );
+                    }
+                }
+            }
+            seen
+        };
+        // Collapsed: nothing is listed twice and the block count is well under the limit.
+        let collapsed = skills(&catalog, None, None, None);
+        assert!(collapsed.len() + 4 <= MAX_BLOCKS, "{}", collapsed.len());
+        let seen = all_open(&collapsed);
+        let mut dup = seen.clone();
+        dup.sort();
+        dup.dedup();
+        assert_eq!(dup.len(), seen.len(), "a skill appears twice");
+        // Opening each group in turn lists every skill, exactly once across the groups.
+        let mut listed: Vec<String> = Vec::new();
+        for group in GROUPS.iter().map(|(g, _)| *g).chain([MORE]) {
+            let blocks = skills(&catalog, None, None, Some(group));
+            assert!(blocks.len() + 4 <= MAX_BLOCKS);
+            let in_group: Vec<String> = all_open(&blocks)
+                .into_iter()
+                .filter(|n| {
+                    let (_, _, t) = catalog.iter().find(|c| &c.0 == n).unwrap();
+                    group_of(n, t.as_deref()) == group
+                })
+                .collect();
+            listed.extend(in_group);
+        }
+        listed.sort();
+        let mut names: Vec<String> = catalog.iter().map(|c| c.0.clone()).collect();
+        names.sort();
+        assert_eq!(listed, names);
+        // The rules.
+        assert_eq!(group_of("no-such-skill", None), "More");
+        assert_eq!(group_of("x", Some("Odd")), "More");
+        assert_eq!(group_of("x", Some("everyday")), "Everyday");
         assert_eq!(
-            headers,
-            [
-                "Everyday",
-                "Spec and review",
-                "Alpha things",
-                "Zany",
-                "Other"
-            ]
+            group_of("status-update", Some("Delivery and launch")),
+            "Communicate"
         );
-        let s = Value::Array(blocks).to_string();
-        assert!(s.contains("*ask* Does ask &lt;well&gt;."));
-        assert!(!s.contains("And more"));
-        assert!(!s.contains("hidden"));
-        assert_eq!(first_sentence(&"word ".repeat(100)).chars().count(), 151);
-        assert!(
-            !s.contains("level"),
-            "no level line when the runtime didn't say"
+        for (_, g) in GROUP_OVERRIDES {
+            assert!(GROUPS.iter().any(|(n, _)| *n == g), "{g}");
+        }
+    }
+
+    #[test]
+    fn skills_long_groups_show_a_button_and_open() {
+        let catalog = full_catalog();
+        let blocks = skills(&catalog, None, None, None);
+        let buttons: Vec<&Value> = blocks
+            .iter()
+            .filter(|b| b["type"] == "actions")
+            .map(|b| &b["elements"][0])
+            .collect();
+        assert!(!buttons.is_empty());
+        for b in &buttons {
+            assert_eq!(b["action_id"], action::SKILLS_GROUP);
+            let label = b["text"]["text"].as_str().unwrap();
+            assert!(label.starts_with("Show all in "));
+            assert!(known_group(b["value"].as_str().unwrap()));
+        }
+        let first = buttons[0]["value"].as_str().unwrap();
+        let open = skills(&catalog, None, None, Some(first));
+        assert_eq!(
+            open.iter().filter(|b| b["type"] == "actions").count(),
+            buttons.len() - 1,
+            "the opened group has no button"
         );
     }
 
     #[test]
-    fn skills_show_the_level_first_and_the_new_tracks_last() {
-        let s = |n: &str, t: &str| (n.to_string(), format!("Does {n}."), Some(t.to_string()));
-        let catalog = vec![
-            s("vision-doc", "Company bets"),
-            s("portfolio-review", "Leading across teams"),
-            s("launch-plan", "Delivery and launch"),
-            s("ask", "Everyday"),
-        ];
-        let blocks = skills(&catalog, None, Some("staff"));
+    fn skills_keep_level_note_and_empty_cases() {
+        let catalog = vec![entry("ask", Some("Everyday")), entry("zeta", Some("Zany"))];
+        let allowed = vec!["ask".to_string(), "zeta".to_string()];
+        let blocks = skills(&catalog, Some(&allowed), Some("staff"), None);
         assert_eq!(
             blocks[0]["text"]["text"],
             "You're set to the *Staff* level. Change it by sending me `level …`."
         );
-        let headers: Vec<&str> = blocks
-            .iter()
-            .filter(|b| b["type"] == "header")
-            .map(|b| b["text"]["text"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            headers,
-            [
-                "Everyday",
-                "Delivery and launch",
-                "Leading across teams",
-                "Company bets"
-            ]
-        );
+        assert_eq!(headers(&blocks), ["Start here", "Everyday", "More"]);
+        let s = texts(&blocks);
+        assert!(s.contains("*zeta* Does zeta &lt;well&gt;."));
+        assert!(!s.contains("And more"));
+        assert_eq!(first_sentence(&"word ".repeat(100)).chars().count(), 151);
+        let none = skills(&catalog, Some(&[]), None, None);
+        assert!(texts(&none).contains("No skills are available to your bot in Slack yet."));
+        let note = skills(&catalog, None, None, None);
+        assert!(texts(&note).contains("couldn't load which skills"));
+        assert!(!texts(&note).contains("level"));
+    }
+
+    #[test]
+    fn inbox_and_accounts_do_not_get_skills_blocks() {
+        let s = texts(&inbox(&[], 0, &|b| b.to_string(), Utc::now()));
+        assert!(!s.contains("Start here") && !s.contains(action::SKILLS_GROUP));
+        let state = json!({"linked": {"slack": true}});
+        assert!(!texts(&accounts(&state, &[])).contains("Start here"));
     }
 
     #[test]

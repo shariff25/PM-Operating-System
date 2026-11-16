@@ -56,24 +56,38 @@ Slack replies and messages, which have no web page.
 
 ## Skills
 
-**What PM OS can do for you in Slack,** grouped by track:
+**What PM OS can do for you in Slack.** The level line comes first, then how to ask, then:
 
-| Track | For |
+**Start here** suggests three skills to try first, each with what you get and something to
+type. They are the work almost every PM does in their first week: `ask` (a sourced answer to a
+question), `meeting-notes` (decisions and follow-ups from a call) and `status-update` (a
+stakeholder update). The list lives in `START_HERE` in `crates/slack/src/home.rs`, in the
+order it is offered. If one isn't in your bot's skills, the next in the list takes its place
+(`prd-draft`, `problem-framing`, `slack-reply`); if none is, Start here is left out.
+
+**Then the rest, grouped by the job they do:**
+
+| Group | For |
 | --- | --- |
 | Everyday | Questions, docs, meeting notes, Slack replies |
-| Product sense | Critiques and problem framing |
-| Strategy and decisions | Strategy and decision docs, prioritizing, pre-mortems |
-| Metrics and experiments | Metric trees, experiment design and readouts |
-| Spec and review | PRDs and the review panel |
-| Customer and market | Call synthesis, competitive briefs, sizing, PoC plans, partner briefs |
-| AI products | AI feature specs and eval plans |
-| Delivery and launch | Release notes, status updates, launch checklists, Jira drafts, advisories |
-| Leading across teams | Portfolio reviews, roadmap trade-offs, OKRs, business reviews, alignment plans, coaching, the bets register |
-| Company bets | Vision docs, investment cases, pricing proposals, platform strategy, exec briefs |
+| Understand and decide | Critiques, problem framing, call synthesis, competitive briefs, sizing, strategy and decision docs |
+| Write a document | PRDs, AI feature specs and eval plans, vision docs, investment cases, pricing proposals |
+| Plan and prioritise | Prioritising, roadmap trade-offs, OKRs, the bets register, portfolio reviews, metric trees, experiment design, platform strategy |
+| Launch | Release notes, launch checklists, Jira drafts, advisories |
+| Review and coach | The review panel, pre-mortems, experiment readouts, business reviews, coaching |
+| Communicate | Status updates, exec briefs, alignment plans, partner briefs |
+| More | Any skill that fits none of the above |
 
-Each line is a skill's name and what it's for. You see the skills your personal bot can run;
-without a personal bot, the Docs bot's. If PM OS can't load the bot's details, it lists every
-Slack skill, with a note saying so.
+**How a skill gets its group:** from its `track` in the skill's front matter, through a table
+in `GROUPS`; a few skills whose job differs from their track's (such as `pre-mortem`) are
+named in `GROUP_OVERRIDES`. A skill with a new or missing track goes to **More**, so every
+skill appears exactly once and nothing needs changing in the skill files.
+
+Each group lists a skill's name and what it's for. A group with more than six skills shows
+the first six and a **Show all in <group>** button; tapping it opens that group in full (one
+group at a time, until you open another section). You see the skills your personal bot can
+run; without a personal bot, the Docs bot's. If PM OS can't load the bot's details, it lists
+every Slack skill, with a note saying so.
 
 **To use one:** DM PM OS and ask in your own words, or name the skill first:
 `strategy-doc: our plan for small teams`. What each skill needs from you is in
