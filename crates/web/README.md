@@ -5,8 +5,8 @@
 PM. The browser never sees a service token, a connector token or another PM's data.
 
 ```
-browser ──HTTPS──► pmos-web :8770 ──► pmos-bots :8750        (client "web", X-Pmos-User: <handle>)
-                               └──► pmos-toolserver :8710  (approvals, service token)
+browser ──HTTPS──► pmos-web :8770 ──► pmos-bots :8750        (client "web", X-Pmos-User + X-Pmos-Assertion)
+                               └──► pmos-toolserver :8710  (approvals only, web token + X-Pmos-Assertion)
                                └──► content/team.yaml      (re-read on every request)
 ```
 
@@ -15,7 +15,8 @@ browser ──HTTPS──► pmos-web :8770 ──► pmos-bots :8750        (cl
 ```sh
 PMOS_WEB_DEV_LOGIN=1 \
 PMOS_WEB_BOTS_TOKEN=<the runtime's "web" client token> \
-PMOS_WEB_TOOLSERVER_TOKEN=<the tool server's service token> \
+PMOS_WEB_TOOLSERVER_TOKEN=<the tool server's PMOS_WEB_TOKEN> \
+PMOS_ASSERTION_KEYS=web:bots:<kid>:<base64>,web:toolserver:<kid>:<base64> \
 PMOS_WEB_STATIC_DIR=web/dist \
 cargo run -p pmos-web
 ```
@@ -27,7 +28,8 @@ cargo run -p pmos-web
 | `PMOS_BOTS_URL` | `http://127.0.0.1:8750` | |
 | `PMOS_WEB_BOTS_TOKEN` | required | The `web` entry of the runtime's `PMOS_BOTS_TOKENS`. At least 32 characters |
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | |
-| `PMOS_WEB_TOOLSERVER_TOKEN` | required | The tool server's `PMOS_SERVICE_TOKEN`. At least 32 characters, different from the runtime token |
+| `PMOS_WEB_TOOLSERVER_TOKEN` | required | The tool server's `PMOS_WEB_TOKEN`, which reaches only the approvals routes (older deployments used `PMOS_SERVICE_TOKEN`). At least 32 characters, different from the runtime token |
+| `PMOS_ASSERTION_KEYS` | none | The keys pmos-web signs user assertions with: `web:bots:<kid>:<base64>` and `web:toolserver:<kid>:<base64>`, each optionally followed by `:<kid>:<base64>` for the previous key (`docs/user-assertion.md`, Keys). Without a key for an upstream, its calls carry no assertion. A malformed entry, a key under 32 bytes, or another service's pair refuses to start |
 | `PMOS_CONTENT_ROOT` | `content` | Where `team.yaml` is. The server won't start if it doesn't parse |
 | `PMOS_WEB_STATIC_DIR` | none | The built web app. Must contain `index.html`, served for any unknown non-`/api` path that isn't an asset; the icon is `favicon.svg` (or `favicon.ico`) here |
 | `PMOS_WEB_PUBLIC_URL` | none | The origin browsers use. Writes must come from it; without it, `Origin` must match `Host` |
@@ -138,6 +140,14 @@ path with another method a JSON `405 method_not_allowed`.
   a canned note. An upstream item with a `prc_` id is never decided.
 - **Tasks:** `POST /v1/tasks {bot: "pm-<handle>", requested_by, text, source: "web"}`, and
   reads of the PM's own tasks and their events, each with `X-Pmos-User: <handle>`.
+- **User assertions** (`src/upstream.rs`): with a key for the upstream, every runtime call and
+  every tool-server call that names the PM (the inbox, sources, decisions) also carries
+  `X-Pmos-Assertion`: issuer `web`, the upstream as audience, the PM as subject, roles from
+  `team.yaml`, 60 seconds, bound to the method, path, query and body sent, signed afresh for
+  each call. The re-read of one item after a conflicting decision (`approval(id)`) names no
+  one and is sent without one; `ToolServer::approval_for(user, id)` signs it, once `app.rs`
+  passes the handle there. `sid` is the fixed `unknown`: the upstream layer is given the
+  handle, not the session id.
 - **Brief and follow-ups:** `501 not_built`.
 
 ## Where the contract isn't met as written
@@ -189,17 +199,20 @@ in as any member, admins included, and can approve their drafts as them. The ser
 warning at start-up. Bind it to `127.0.0.1` (the default) and never put it behind a public
 proxy.
 
-**This backend is a confused deputy, like the console.** It holds the tool server's
-service token, which may decide any user's approvals (and link accounts), and a runtime token
-that may create tasks for any PM it names in `X-Pmos-User`. Ownership is checked here, before
-every call; a bug or a compromise of `pmos-web` lets it act for anyone. The planned fix (Web 1,
-`docs/web-client.md`): a short-lived signed user assertion (the handle, an audience, a few
-minutes' expiry, signed by a key only the web server holds), sent with each call and checked by
-the runtime and the tool server, so a request can only act for the person who signed in.
+**This backend is still a deputy, now a narrower one.** It holds its own tool server token,
+which reaches only the approvals routes (no sessions, grants, account linking or credentials),
+a runtime token for the `web` client, and the two keys that sign its user assertions. With the
+runtime and the tool server in `PMOS_ASSERTION_MODE=require`, the tokens alone no longer act
+for anyone: a call that names a PM needs an assertion for that PM, bound to that request and
+good for 60 seconds, once. But the keys sit in this process: **a compromised `pmos-web` can
+still sign for any team member**, not only those signed in. That stops only when the key is
+held by something that checks the session itself (a separate signer, or an identity-provider
+token the receivers verify), which is not built. See `docs/user-assertion.md`, "What this does
+and does not fix".
 
 **Not built:** Entra ID sign-in (`auth::EntraProvider` documents the seam and is deliberately
 not an `AuthProvider`); persistence (sessions and settings are in memory: a restart signs
 everyone out and forgets edits, suggestions and practice drafts; `src/session.rs` and
 `src/settings.rs` say what a Postgres store needs); rate limiting (on sign-in, on asks and on
-change requests); an audit record of web actions (the tool server audits decisions, with the
-service token as the decider); and a per-PM limit on running tasks.
+change requests); an audit record of web actions (the tool server audits decisions, with
+`web` as the client); and a per-PM limit on running tasks.

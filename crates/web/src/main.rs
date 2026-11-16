@@ -28,6 +28,12 @@ async fn main() -> Result<()> {
             );
         }
     }
+    // Which upstreams get a signed user assertion on calls for a PM (PMOS_ASSERTION_KEYS).
+    tracing::info!(
+        bots = config.bots_token.signs(),
+        toolserver = config.toolserver_token.signs(),
+        "user assertions signed for"
+    );
     if config.public_url.is_none() {
         tracing::info!("no PMOS_WEB_PUBLIC_URL: writes must come from the request's own Host");
     }

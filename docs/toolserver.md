@@ -130,11 +130,11 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `DELETE /internal/session` + `X-Pmos-Session` | service or bot token | Revoke a session (sandbox ended) |
 | `POST /internal/call` + `X-Pmos-Session` `{tool, args}` | service or bot token | One tool call for the session, with the same rules as MCP: allowlist, argument checks, approvals for writes, audit (which records the caller). |
 | `POST /internal/grants` `{session_token, tool, args}` | service token | Record an approval given in the harness |
-| `GET /internal/approvals?user=&status=` | service token | `{items: […]}`: a PM's inbox, newest first. `status` is `pending`, `executing`, `approved`, `rejected`, `failed` or `expired` (`400` for anything else) |
+| `GET /internal/approvals?user=&status=` | service, web or console token | `{items: […]}`: a PM's inbox, newest first. `status` is `pending`, `executing`, `approved`, `rejected`, `failed` or `expired` (`400` for anything else) |
 | `GET /internal/approvals?user=` | bot token | The App Home Inbox: `{approvals: […], total}`, only `pending` items whatever `status` says, oldest first, at most 50. Each item reads as `GET /internal/approvals/{id}` returns it; `total` counts every pending item. `403` if `user` isn't a team member (live connectors) or is a team bot's identity; `400` without `user` |
-| `GET /internal/approvals/{id}` | service or bot token | One item: `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity` and `redacted_at`; plus, when known, `expires_at`, `target_url` and `external` (see **What an item is shown with**). Listings and decision answers carry the same fields |
-| `GET /internal/approvals/{id}/sources?user=` | service token | What the run that drafted the item read: `{sources: [{system, title, url, ref, tool, read_at}], available, truncated}`. `user` is required (`400`) and must be the item's user: anyone else's item, or a missing one, is `404`. See **What an item is shown with** |
-| `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?}` | service or bot token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. |
+| `GET /internal/approvals/{id}` | service, bot, web or console token | One item (with a user assertion, only the subject's own: anyone else's is `404`): `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity` and `redacted_at`; plus, when known, `expires_at`, `target_url` and `external` (see **What an item is shown with**). Listings and decision answers carry the same fields |
+| `GET /internal/approvals/{id}/sources?user=` | service, web or console token | What the run that drafted the item read: `{sources: [{system, title, url, ref, tool, read_at}], available, truncated}`. `user` is required (`400`) and must be the item's user: anyone else's item, or a missing one, is `404`. See **What an item is shown with** |
+| `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?}` | service, bot, web or console token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. |
 | `GET /internal/ledger?since=&until=&bot=&outcome=&min_edit=&limit=` | service or bot token | `{rows: […]}`, newest first. See **Feedback ledger**. `422` for a bad parameter |
 | `GET /internal/ledger/summary?since=&bot=` | service token | Per bot (or skill) and tool: counts by outcome, label coverage, median edit distance, rejection reasons. `422` for a bad `since` |
 | `POST /internal/reindex` | service token | Rebuild the context index from the content checkout and re-read `team.yaml`, the bots and their roles; `422` if it fails `pmos lint` |
@@ -153,7 +153,34 @@ the log can't be read back, so the answer is `available: false` with no sources.
 **Who holds which token:**
 - **Service token** (`PMOS_SERVICE_TOKEN`): the orchestrator, the bot runtime and platform-owner tools. Every route, and the only token that starts bot sessions.
 - **Bot token** (`PMOS_BOT_TOKEN`): the Slack bot. Only sessions for the skills in `PMOS_BOT_SKILLS` and calls within them, plus reading and deciding one approval item (`GET /internal/approvals/{id}` and its `decision`), for Slack approval cards, the onboarding routes, `GET /internal/ledger` for the daily triage digest, and for the App Home (`docs/slack-home.md`) a team member's pending items (`GET /internal/approvals?user=`) and unlinking a team member's account (`DELETE /internal/credentials/{user}/{provider}`). A session started for another skill, or any bot session, looks to the bot like one that doesn't exist, and every other route (the ledger summary among them) returns `403`.
+- **Web token** (`PMOS_WEB_TOKEN`) and **console token** (`PMOS_CONSOLE_TOKEN`): `pmos-web` and
+  the console, which act for a signed-in person. Only the four approvals routes above (list,
+  one item, sources, decision); every other route is `403`. The audit records them as `web` and
+  `console`. Older deployments gave both the service token; `deploy/setup.sh` now generates
+  their own.
 - **Session token:** each sandbox gets only its own.
+
+### Approvals auth: user assertions
+
+With the web or console token, the person a call names (`user=`, `decided_by`) is believed
+only as `PMOS_ASSERTION_MODE` allows (`docs/user-assertion.md`):
+
+| Mode | A valid `X-Pmos-Assertion` | A bad one | None |
+| --- | --- | --- | --- |
+| `off` (default) | ignored | ignored | `user=` and `decided_by` believed, as before |
+| `verify` | checked | `401` | believed, as before |
+| `require` | checked | `401` | `401` for a list, sources or decision (each names a person) |
+
+- **Checked:** the signature with the `web:toolserver` or `console:toolserver` key from
+  `PMOS_ASSERTION_KEYS`, the issuer (the client whose token was presented: the web token
+  cannot use the console's assertion), the audience `toolserver`, the time, the request
+  (method, path and query as received, raw body) and the nonce (once per process).
+- **Names:** the subject must equal `user=` and `decided_by`. `GET /internal/approvals/{id}`
+  names no one, so it needs no assertion; with one, an item that isn't the subject's is `404`.
+- **Answer:** every failure is `401 {"code": "bad_assertion"}`; the log has the client and the
+  kind of failure, never the assertion, a key or a handle.
+- **Not checked:** the service token and the bot token, in every mode. The runtime's approval
+  polling and the Slack approval cards are unchanged.
 
 Session tokens are sent in headers, never in a URL, so access logs and proxies don't record them. A tool error (refused, invalid arguments, not found) comes
 back as an MCP tool result with `isError: true`, so the model can read why.
@@ -805,6 +832,9 @@ cargo run -p pmos-toolserver
 | `PMOS_SERVICE_TOKEN` | required | The orchestrator's token. At least 32 characters |
 | `PMOS_BOT_TOKEN` | none | The Slack bot's own token: at least 32 characters and different from the service token |
 | `PMOS_BOT_SKILLS` | `docs` | Skills the bot may start sessions for |
+| `PMOS_WEB_TOKEN`, `PMOS_CONSOLE_TOKEN` | none | `pmos-web`'s and the console's own tokens, for the approvals routes only. At least 32 characters, each different from every other token |
+| `PMOS_ASSERTION_MODE` | `off` | `off`, `verify` or `require`: see **Approvals auth: user assertions**. `verify` and `require` refuse to start without keys |
+| `PMOS_ASSERTION_KEYS` | none | `web:toolserver:<kid>:<base64>[:<kid>:<base64>],console:toolserver:…` (`docs/user-assertion.md`, Keys). A malformed list, a key under 32 bytes, or another service's pair refuses to start, in every mode |
 | `PMOS_CONNECTORS` | required | `live` for real Atlassian and Slack with each PM's own token, and only people in `team.yaml` may have sessions; `fake` for fixture data (dev, tests, and everything before Gate 1), with `team.yaml` not enforced |
 | `PMOS_DATABASE_URL` | required | Postgres for every store. `PMOS_DEV=1` without it keeps everything in memory. |
 | `PMOS_AUDIT_LOG` | none | Also writes audit events to this JSON-lines file, for shipping off-box |

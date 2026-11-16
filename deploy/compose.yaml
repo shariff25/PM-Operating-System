@@ -94,6 +94,13 @@ services:
       PMOS_DATABASE_URL: postgresql://pmos_toolserver:${PMOS_DB_TOOLSERVER_PASSWORD}@postgres/pmos_toolserver
       PMOS_SERVICE_TOKEN: ${PMOS_SERVICE_TOKEN:?}
       PMOS_BOT_TOKEN: ${PMOS_BOT_TOKEN:?}
+      # The web app's and the console's own tokens: the approvals routes only.
+      PMOS_WEB_TOKEN: ${PMOS_TS_WEB_TOKEN:?run deploy/setup.sh again}
+      PMOS_CONSOLE_TOKEN: ${PMOS_TS_CONSOLE_TOKEN:?run deploy/setup.sh again}
+      # User assertions from the web app and the console (docs/user-assertion.md). `off` unless
+      # set; `pmos-admin up --web` makes it `require`.
+      PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-off}
+      PMOS_ASSERTION_KEYS: web:toolserver:${PMOS_AK_WEB_TOOLSERVER:?run deploy/setup.sh again},console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER:?run deploy/setup.sh again}
       PMOS_VAULT_KEY: ${PMOS_VAULT_KEY:?}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
@@ -148,6 +155,10 @@ services:
       PMOS_SERVICE_TOKEN: ${PMOS_SERVICE_TOKEN}
       PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
       PMOS_GATEWAY_TOKEN: ${PMOS_GW_RUNTIME_TOKEN}
+      # User assertions from the web app and the console (docs/user-assertion.md). `off` unless
+      # set; `pmos-admin up --web` makes it `require`.
+      PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-off}
+      PMOS_ASSERTION_KEYS: web:bots:${PMOS_AK_WEB_BOTS:?run deploy/setup.sh again},console:bots:${PMOS_AK_CONSOLE_BOTS:?run deploy/setup.sh again}
     volumes:
       - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
     depends_on:
@@ -187,8 +198,9 @@ services:
       bots: { condition: service_healthy }
     profiles: [slack]
 
-  # The console (profile `console`). It holds the tool server's service token and a runtime
-  # token that reads everything, and it believes X-Forwarded-User. So:
+  # The console (profile `console`). It holds its own tool server token (the approvals routes
+  # only), a runtime token that reads everything, and the keys that sign its user assertions,
+  # and it believes X-Forwarded-User. So:
   # - The port is published on the host's 127.0.0.1 only; the reverse proxy on the host reaches
   #   it there. Never publish it on another address.
   # - It still listens on 0.0.0.0 inside its container (published ports need that), so every
@@ -206,7 +218,8 @@ services:
       PMOS_BOTS_URL: http://bots.pmos.internal:8750
       PMOS_BOTS_TOKEN: ${PMOS_RT_CONSOLE_TOKEN}
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
-      PMOS_TOOLSERVER_TOKEN: ${PMOS_SERVICE_TOKEN}
+      PMOS_TOOLSERVER_TOKEN: ${PMOS_TS_CONSOLE_TOKEN}
+      PMOS_ASSERTION_KEYS: console:bots:${PMOS_AK_CONSOLE_BOTS},console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_CONSOLE_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
       PMOS_CONSOLE_TRUST_PROXY: ${PMOS_CONSOLE_TRUST_PROXY:-0}
@@ -227,8 +240,9 @@ services:
     profiles: [console]
 
   # The web app (profile `web`), OFF by default. Its only sign-in today is DEVELOPMENT sign-in,
-  # where anyone who can reach the port signs in as any team member, and it holds a tool server
-  # token able to decide approvals for any user. So it starts only with the loudly named opt-in
+  # where anyone who can reach the port signs in as any team member, and it holds the keys that
+  # sign user assertions for any team member (docs/user-assertion.md, "What this does and does
+  # not fix"). So it starts only with the loudly named opt-in
   # PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1 (docs/web-app-running.md), and only on
   # a closed test network. The port is published on 127.0.0.1 only: reach it through the
   # reverse proxy (TLS; the session cookie is Secure) and never expose it directly.
@@ -243,7 +257,9 @@ services:
       PMOS_BOTS_URL: http://bots.pmos.internal:8750
       PMOS_WEB_BOTS_TOKEN: ${PMOS_RT_WEB_TOKEN}
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
-      PMOS_WEB_TOOLSERVER_TOKEN: ${PMOS_SERVICE_TOKEN}
+      # Its own tool server token (the approvals routes only), not the service token.
+      PMOS_WEB_TOOLSERVER_TOKEN: ${PMOS_TS_WEB_TOKEN}
+      PMOS_ASSERTION_KEYS: web:bots:${PMOS_AK_WEB_BOTS},web:toolserver:${PMOS_AK_WEB_TOOLSERVER}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       # The built app, baked into the image (deploy/Dockerfile).
       PMOS_WEB_STATIC_DIR: /usr/share/pmos/web
