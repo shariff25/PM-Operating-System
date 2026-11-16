@@ -284,6 +284,50 @@ export function createMockClient(options: MockOptions = {}): Api {
   const tasks = new Map<string, MockTask>();
   const failedOnce = new Set<string>();
 
+  // Earlier requests, so Activity and the home page have a history to show.
+  if (!options.noDrafts) {
+    const seed = (id: string, text: string, ago: number, rest: Partial<Task>) => {
+      const at = now0 - ago;
+      const ev = (kind: string, t: string, dt: number): TaskEvent => ({ at: iso(at + dt), kind, text: t });
+      const task: Task = {
+        id,
+        bot: 'pm-ana',
+        text,
+        status: 'done',
+        result: null,
+        error: null,
+        draft_ids: [],
+        created_at: iso(at),
+        updated_at: iso(at + 40_000),
+        events: [
+          ev('queued', 'Queued', 0),
+          ev('claimed', 'Claimed by pm-ana', 1000),
+          ev('milestone', 'Reading Jira', 2000),
+          ev('progress', '1 of 2 done', 9000),
+          ev('milestone', 'Reading Confluence', 10_000),
+          ev('milestone', 'Putting the answer together', 30_000),
+        ],
+        ...rest,
+      };
+      tasks.set(id, { task, startedAt: at, plan: [], outcome: 'done', draftId: null, settledAfter: 0 });
+    };
+    seed('tsk_seed_failed', 'Summarize the DPA thread with Legal', 3 * 24 * HOUR, {
+      status: 'failed',
+      error: 'I could not reach Slack just now, so I stopped before guessing. Try again in a moment.',
+    });
+    seed('tsk_seed_week', 'What changed in billing this week?', 26 * HOUR, {
+      result:
+        '## Billing this week\n\n- **PAY-212** moved to *Blocked*, waiting on Finance sign-off\n- The grace period spec got two new comments from Legal\n- Support tickets about lock-outs are down 12% on last week\n\nNothing needs you right now, but Finance is the one to watch.',
+    });
+    seed('tsk_seed_prd', 'Draft a PRD for the TCB grace period setting', 2 * HOUR + 5 * 60_000, {
+      status: 'needs_approval',
+      draft_ids: ['apr_prd'],
+      result: 'The draft is ready, with the sources I read alongside it.',
+    });
+    const prd = drafts.get('apr_prd');
+    if (prd) prd.task_id = 'tsk_seed_prd';
+  }
+
   const followUps = {
     waiting_on_you: [
       { id: 'fu_1', system: 'slack', who: 'Ben', summary: 'asked about the pricing page', url: 'https://example.com/slack/ben', age_days: 2 },
@@ -369,10 +413,17 @@ export function createMockClient(options: MockOptions = {}): Api {
     const wantsDraft = /draft|prd|write|reply|nudge/i.test(text);
     const failing = /fail|break/i.test(text) && !failedOnce.has(text);
     if (failing) failedOnce.add(text);
+    // The runtime also sends bookkeeping events (queued, claimed, started, counts). The app must
+    // show only the milestones, so the sample data sends both.
     const plan = [
+      { at: 0, text: 'Queued', kind: 'queued' },
+      { at: 0, text: 'Claimed by pm-ana', kind: 'claimed' },
+      { at: 0, text: 'Started', kind: 'started' },
       { at: 0, text: 'Reading Jira' },
+      { at: 0.5, text: '1 of 3 done', kind: 'progress' },
       { at: 1, text: 'Reading Confluence' },
       ...(/busy/i.test(text) ? [{ at: 1.5, text: 'The model is busy, retrying', kind: 'retry' }] : []),
+      { at: 1.2, text: '2 of 3 done', kind: 'progress' },
       { at: 2, text: wantsDraft ? 'Writing the draft' : 'Putting the answer together' },
     ];
     const task: Task = {

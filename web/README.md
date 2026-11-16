@@ -57,8 +57,15 @@ when that exists, or the one in `PW_CHROMIUM`; otherwise run `pnpm exec playwrig
 
 - `src/copy.ts`: every user-facing word, in one file. Edit the wording there.
 - `src/api/`: `types.ts` (the contract), `real.ts` (fetch, CSRF, typed errors), `mock.ts`.
-- `src/pages/`: sign-in, home, draft workspace.
-- `src/components/`: task progress, hints, user menu.
+- `src/pages/`: sign-in, home (launchpad), drafts, draft workspace, follow-ups, activity, thread.
+- `src/components/`: the app shell (sidebar, top bar, phone tab bar), command palette, user menu,
+  toasts, coach-mark hints, approve dialog, icons (drawn here and inlined).
+- `src/data.tsx`: the drafts, brief and task lists the navigation counts and pages share.
+- Routes are hashes, checked in `src/url.ts`: `#/`, `#/drafts`, `#/d/<id>`, `#/followups`,
+  `#/activity`, `#/a/<task id>`. Anything else is the home page.
+- Ctrl or Cmd + K opens the palette. The theme (system, light, dark) is in the user menu and is
+  kept in `localStorage`; `public/favicon.svg` is the icon (the content security policy blocks
+  `data:` icons).
 
 ## Notes
 

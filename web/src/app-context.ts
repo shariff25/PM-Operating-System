@@ -1,5 +1,6 @@
 import { createContext, useContext } from 'react';
 import type { Api, Me } from './api';
+import type { Theme } from './theme';
 
 export interface AppContextValue {
   api: Api;
@@ -9,6 +10,10 @@ export interface AppContextValue {
   /** How often to poll a working task, in ms. */
   pollMs: number;
   navigate: (path: string) => void;
+  theme: Theme;
+  setTheme: (t: Theme) => void;
+  /** Open the command palette, optionally with text already typed. */
+  openPalette: (text?: string) => void;
 }
 
 export const AppContext = createContext<AppContextValue | null>(null);
