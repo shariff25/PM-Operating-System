@@ -28,6 +28,20 @@ export const copy = {
     approve: "This creates the page in Confluence under your name. I'll wait until you're sure.",
   } satisfies Record<HintName, string>,
   hintDismiss: 'Got it',
+  /** Hints come one at a time, in this order. */
+  hintOrder: ['sources', 'ask', 'approve'] as const satisfies readonly HintName[],
+
+  // ---- Text that was left out of the formatted view ----
+  stripped: {
+    warning: (n: number, what: string) =>
+      `This ${what} contains ${n} hidden or stripped ${n === 1 ? 'part' : 'parts'}.`,
+    why: 'These are not shown in the formatted text. Whatever is in the text is published under your name, so read them too.',
+    show: 'Show them as text',
+    hide: 'Hide them',
+    listLabel: 'Hidden or stripped parts, as plain text',
+    draft: 'draft',
+    answer: 'answer',
+  },
 
   // ---- Sign-in ----
   signIn: {
@@ -71,6 +85,7 @@ export const copy = {
     expiresIn: (hours: number, minutes: number) =>
       hours >= 1 ? `Expires in ${hours} h` : `Expires in ${minutes} min`,
     expired: 'Expired',
+    expiredRow: 'Needs a fresh draft',
     openDraft: 'Open draft',
     statusLabel: (s: DraftStatus) =>
       ({ pending: 'Needs you', approved: 'Approved', rejected: 'Rejected', expired: 'Expired', failed: 'Failed' })[s],
@@ -103,9 +118,11 @@ export const copy = {
     loading: 'Opening the draft…',
     titleLabel: 'Title',
     bodyLabel: 'Draft text',
-    editTab: 'Edit',
-    previewTab: 'Preview',
+    edit: 'Edit',
+    discard: 'Discard changes',
     save: 'Save',
+    formattedLabel: 'Formatted draft',
+    editingNote: 'Editing. Save to see the formatted text again.',
     saving: 'Saving…',
     saved: 'Saved',
     unsaved: 'Unsaved changes',
@@ -119,6 +136,7 @@ export const copy = {
     practiceDelete: 'Delete practice draft',
     sourcesHeading: 'Sources',
     sourceOpen: 'Open in source',
+    sourceUnsafe: 'This address is not a web link, so it is shown as text only:',
     sourceSelected: 'Selected',
     askHeading: 'Ask for a change',
     askLabel: 'What should change?',
@@ -135,6 +153,9 @@ export const copy = {
     rejectSuggestion: 'Reject',
     suggestionFailed: (error: string) => `I could not make that change. ${error}`,
     suggestionFailedNext: 'Try asking in other words.',
+    saveFirst: 'Save or discard your edit before you approve.',
+    resolveFirst: 'Accept or reject the suggested change before you approve.',
+    expired: 'This draft expired, so it cannot be approved. Ask me for a fresh draft.',
     changeInProgress: 'I am still working on your last change. Wait for it to finish, then ask again.',
   },
 
@@ -148,6 +169,12 @@ export const copy = {
         slack_message: 'Approve to Slack',
       })[kind],
     confirmHeading: 'Check before you approve',
+    confirmTitle: 'Title',
+    confirmWhere: 'Goes to',
+    confirmWho: 'Published under the name',
+    confirmLinks: 'Links in this draft',
+    confirmNoLinks: 'This draft has no links.',
+    confirmLinkLine: (text: string) => `Link text: ${text}`,
     confirmText: (kind: DraftKind, where: string, who: string) => {
       const what = {
         confluence_page: 'create a Confluence page',
@@ -175,6 +202,10 @@ export const copy = {
         text: 'The company rules do not allow posting this to that audience.',
         next: 'Reject this draft, or ask me for a version meant for a different place.',
       },
+      stale: {
+        text: 'This draft changed after you opened it, so nothing was sent. I reloaded it.',
+        next: 'Read it again, then approve if it is still right.',
+      },
       expired: {
         text: 'This draft expired, so it was not sent.',
         next: 'Go home and ask me for a fresh one.',
@@ -197,7 +228,7 @@ export const copy = {
     resultLink: 'Open it',
     approvedNoLink: 'Approved.',
     rejectedNote: 'You rejected this draft. Nothing was sent.',
-    expiredNote: 'This draft expired. Nothing was sent.',
+    expiredNote: 'This draft expired, so nothing was sent. Ask me for a fresh draft.',
     failedNote: 'This draft failed. Nothing was sent.',
   },
 
@@ -229,5 +260,6 @@ export const copy = {
     followupFailed: 'I could not start that draft, and nothing was sent.',
     dismissFailed: 'I could not remove that item.',
     settingFailed: 'I could not save that setting.',
+    screenBroke: 'Something on this page broke, and nothing was changed.',
   },
 } as const;

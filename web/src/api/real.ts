@@ -9,6 +9,11 @@ export interface RealOptions {
   fetchImpl?: typeof fetch;
 }
 
+/** An id placed in a path. Dots alone would be read as a path step, so they become an id no server has. */
+function seg(id: string): string {
+  return /^\.+$/.test(id) ? '%00' : encodeURIComponent(id);
+}
+
 export function createRealClient(opts: RealOptions = {}): Api {
   const base = opts.baseUrl ?? '/api';
   let csrf: string | null = null;
@@ -70,26 +75,29 @@ export function createRealClient(opts: RealOptions = {}): Api {
     resetHints: () => call<Me>('DELETE', '/me/hints'),
 
     listDrafts: async () => (await call<{ drafts: DraftSummary[] }>('GET', '/drafts')).drafts,
-    getDraft: (id) => call<Draft>('GET', `/drafts/${id}`),
-    saveDraft: (id, input) => call<Draft>('PUT', `/drafts/${id}`, input),
+    getDraft: (id) => call<Draft>('GET', `/drafts/${seg(id)}`),
+    saveDraft: (id, input) => call<Draft>('PUT', `/drafts/${seg(id)}`, input),
     requestChange: async (id, instruction) =>
-      (await post<{ suggestion: Suggestion }>(`/drafts/${id}/changes`, { instruction })).suggestion,
+      (await post<{ suggestion: Suggestion }>(`/drafts/${seg(id)}/changes`, { instruction })).suggestion,
     getSuggestion: async (id) =>
-      (await call<{ suggestion: Suggestion | null }>('GET', `/drafts/${id}/suggestion`)).suggestion,
-    acceptSuggestion: (id) => post<Draft>(`/drafts/${id}/suggestion/accept`),
-    rejectSuggestion: (id) => post<Draft>(`/drafts/${id}/suggestion/reject`),
+      (await call<{ suggestion: Suggestion | null }>('GET', `/drafts/${seg(id)}/suggestion`)).suggestion,
+    acceptSuggestion: (id) => post<Draft>(`/drafts/${seg(id)}/suggestion/accept`),
+    rejectSuggestion: (id) => post<Draft>(`/drafts/${seg(id)}/suggestion/reject`),
     approve: (id, o) =>
-      post<Draft>(`/drafts/${id}/approve`, o?.confirmExternal ? { confirm_external: true } : {}),
-    reject: (id, reason?: RejectReason) => post<Draft>(`/drafts/${id}/reject`, reason ? { reason } : {}),
+      post<Draft>(`/drafts/${seg(id)}/approve`, {
+        ...(o?.confirmExternal ? { confirm_external: true } : {}),
+        ...(o?.version !== undefined ? { version: o.version } : {}),
+      }),
+    reject: (id, reason?: RejectReason) => post<Draft>(`/drafts/${seg(id)}/reject`, reason ? { reason } : {}),
     createPractice: () => post<Draft>('/drafts/practice'),
-    deleteDraft: (id) => call<void>('DELETE', `/drafts/${id}`),
+    deleteDraft: (id) => call<void>('DELETE', `/drafts/${seg(id)}`),
 
     createTask: (text) => post<Task>('/tasks', { text }),
-    getTask: (id) => call<Task>('GET', `/tasks/${id}`),
+    getTask: (id) => call<Task>('GET', `/tasks/${seg(id)}`),
     listTasks: async () => (await call<{ tasks: Task[] }>('GET', '/tasks')).tasks,
 
     brief: () => call<Brief>('GET', '/brief'),
-    dismissFollowup: (id) => post<void>(`/followups/${id}/dismiss`),
-    draftFollowup: (id) => post<Task>(`/followups/${id}/draft`),
+    dismissFollowup: (id) => post<void>(`/followups/${seg(id)}/dismiss`),
+    draftFollowup: (id) => post<Task>(`/followups/${seg(id)}/draft`),
   };
 }
