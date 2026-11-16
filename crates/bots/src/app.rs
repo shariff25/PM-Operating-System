@@ -161,10 +161,10 @@ fn optional_body<T: DeserializeOwned + Default>(bytes: &Bytes) -> Result<T, Erro
     }
 }
 
-/// A Slack call made for one PM must name them in `X-Pmos-User`. (The shared feed and the
+/// A Slack or web call made for one PM must name them in `X-Pmos-User`. (The shared feed and the
 /// bot list don't call this.)
 fn pm(caller: &Caller) -> Result<(), Error> {
-    if caller.kind == ClientKind::Slack && caller.user.is_none() {
+    if caller.kind.is_pm() && caller.user.is_none() {
         return Err(forbidden(
             "say which PM this is for in X-Pmos-User (a PM OS handle)",
         ));
@@ -215,7 +215,7 @@ async fn authenticate(State(state): State<AppState>, mut req: Request, next: Nex
         // The Slack client names the PM it acts for on per-PM calls (tasks, routines). The
         // shared notification feed and the bot list need no PM. Without the header, every
         // per-PM check compares against an empty handle and refuses.
-        ClientKind::Slack => match req.headers().get(USER_HEADER) {
+        ClientKind::Slack | ClientKind::Web => match req.headers().get(USER_HEADER) {
             None => None,
             Some(v) => {
                 let user = v.to_str().map(str::trim).unwrap_or_default();
@@ -299,7 +299,7 @@ async fn create_task(
 ) -> Reply {
     allow(
         &caller,
-        &[ClientKind::Slack, ClientKind::Evals],
+        &[ClientKind::Slack, ClientKind::Web, ClientKind::Evals],
         "create tasks",
     )?;
     let req: CreateTask = body(&bytes)?;
@@ -309,16 +309,22 @@ async fn create_task(
         ));
     }
     match caller.kind {
-        ClientKind::Slack => {
+        ClientKind::Slack | ClientKind::Web => {
             if req.requested_by != caller.user() {
                 return Err(forbidden(
-                    "the Slack client creates tasks only for the PM in X-Pmos-User",
+                    "the client creates tasks only for the PM in X-Pmos-User",
                 ));
             }
-            if !matches!(req.source, Source::Slack | Source::Cli) {
-                return Err(forbidden(
-                    "the Slack client creates `slack` or `cli` tasks only",
-                ));
+            let allowed = match caller.kind {
+                ClientKind::Web => req.source == Source::Web,
+                _ => matches!(req.source, Source::Slack | Source::Cli),
+            };
+            if !allowed {
+                return Err(forbidden(if caller.kind == ClientKind::Web {
+                    "the web client creates `web` tasks only"
+                } else {
+                    "the Slack client creates `slack` or `cli` tasks only"
+                }));
             }
         }
         _ if req.source != Source::Eval => {
@@ -347,7 +353,7 @@ async fn create_task(
 fn visible(caller: &Caller, task: &Task) -> bool {
     match caller.kind {
         ClientKind::Console => true,
-        ClientKind::Slack => task.requested_by == caller.user(),
+        ClientKind::Slack | ClientKind::Web => task.requested_by == caller.user(),
         ClientKind::Evals => task.source == Source::Eval,
         ClientKind::Worker => false,
     }
@@ -361,7 +367,12 @@ async fn visible_task(state: &AppState, caller: &Caller, id: &str) -> Result<Tas
     }
 }
 
-const READERS: &[ClientKind] = &[ClientKind::Slack, ClientKind::Console, ClientKind::Evals];
+const READERS: &[ClientKind] = &[
+    ClientKind::Slack,
+    ClientKind::Web,
+    ClientKind::Console,
+    ClientKind::Evals,
+];
 
 async fn get_task(
     State(state): State<AppState>,
@@ -400,7 +411,7 @@ async fn list_tasks(
         limit: q.limit.unwrap_or(50).clamp(1, 200),
     };
     match caller.kind {
-        ClientKind::Slack => {
+        ClientKind::Slack | ClientKind::Web => {
             pm(&caller)?;
             if filter
                 .requested_by
@@ -425,12 +436,12 @@ async fn cancel_task(
 ) -> Reply {
     allow(
         &caller,
-        &[ClientKind::Slack, ClientKind::Console],
+        &[ClientKind::Slack, ClientKind::Web, ClientKind::Console],
         "cancel tasks",
     )?;
     visible_task(&state, &caller, &id).await?;
     let by = match caller.kind {
-        ClientKind::Slack => caller.user().to_string(),
+        ClientKind::Slack | ClientKind::Web => caller.user().to_string(),
         _ => "the console".into(),
     };
     let task = state.rt.cancel(&id, &by, model::now()).await?;
@@ -726,7 +737,7 @@ fn settings_reply(s: &MemberSettings) -> Response {
 /// The Slack client reads and sets only the settings of the PM in `X-Pmos-User`.
 fn own_settings(caller: &Caller, handle: &str) -> Result<(), Error> {
     pm(caller)?;
-    if caller.kind == ClientKind::Slack && handle != caller.user() {
+    if caller.kind.is_pm() && handle != caller.user() {
         return Err(forbidden(
             "the Slack client reads and sets only the settings of the PM in X-Pmos-User",
         ));
@@ -741,7 +752,7 @@ async fn get_member_settings(
 ) -> Reply {
     allow(
         &caller,
-        &[ClientKind::Slack, ClientKind::Console],
+        &[ClientKind::Slack, ClientKind::Web, ClientKind::Console],
         "read member settings",
     )?;
     own_settings(&caller, &handle)?;
@@ -760,7 +771,11 @@ async fn put_member_settings(
     Path(handle): Path<String>,
     bytes: Bytes,
 ) -> Reply {
-    allow(&caller, &[ClientKind::Slack], "change member settings")?;
+    allow(
+        &caller,
+        &[ClientKind::Slack, ClientKind::Web],
+        "change member settings",
+    )?;
     own_settings(&caller, &handle)?;
     let req: PutSettings = body(&bytes)?;
     let level = Level::parse_or_explain(&req.level).map_err(bad)?;
@@ -784,7 +799,7 @@ struct ParseBody {
 
 fn own(caller: &Caller, owner: &str) -> Result<(), Error> {
     pm(caller)?;
-    if caller.kind == ClientKind::Slack && owner != caller.user() {
+    if caller.kind.is_pm() && owner != caller.user() {
         return Err(forbidden(
             "the Slack client manages only the routines of the PM in X-Pmos-User",
         ));
@@ -797,7 +812,11 @@ async fn parse_routine(
     Extension(caller): Extension<Caller>,
     bytes: Bytes,
 ) -> Reply {
-    allow(&caller, &[ClientKind::Slack], "parse routines")?;
+    allow(
+        &caller,
+        &[ClientKind::Slack, ClientKind::Web],
+        "parse routines",
+    )?;
     let req: ParseBody = body(&bytes)?;
     own(&caller, &req.owner)?;
     let (draft, summary) = state
@@ -818,7 +837,11 @@ async fn create_routine(
     Extension(caller): Extension<Caller>,
     bytes: Bytes,
 ) -> Reply {
-    allow(&caller, &[ClientKind::Slack], "create routines")?;
+    allow(
+        &caller,
+        &[ClientKind::Slack, ClientKind::Web],
+        "create routines",
+    )?;
     let req: CreateRoutine = body(&bytes)?;
     own(&caller, &req.draft.owner)?;
     let routine = state.rt.create_routine(req.draft, model::now()).await?;
@@ -837,11 +860,11 @@ async fn list_routines(
 ) -> Reply {
     allow(
         &caller,
-        &[ClientKind::Slack, ClientKind::Console],
+        &[ClientKind::Slack, ClientKind::Web, ClientKind::Console],
         "read routines",
     )?;
     let mut owner = q.owner.filter(|o| !o.is_empty());
-    if caller.kind == ClientKind::Slack {
+    if caller.kind.is_pm() {
         own(&caller, owner.as_deref().unwrap_or(caller.user()))?;
         owner = Some(caller.user().to_string());
     }
@@ -852,7 +875,7 @@ async fn list_routines(
 /// The routine, if `caller` may manage it (else `404`, as if it didn't exist).
 async fn managed_routine(state: &AppState, caller: &Caller, id: &str) -> Result<(), Error> {
     let routine = state.rt.routine(id).await?;
-    if caller.kind == ClientKind::Slack && routine.owner != caller.user() {
+    if caller.kind.is_pm() && routine.owner != caller.user() {
         return Err(Error::NotFound(format!("no routine {id}")));
     }
     Ok(())
@@ -877,7 +900,7 @@ async fn update_routine(
 ) -> Reply {
     allow(
         &caller,
-        &[ClientKind::Slack, ClientKind::Console],
+        &[ClientKind::Slack, ClientKind::Web, ClientKind::Console],
         "change routines",
     )?;
     let req: PatchRoutine = body(&bytes)?;
@@ -908,7 +931,7 @@ async fn delete_routine(
 ) -> Reply {
     allow(
         &caller,
-        &[ClientKind::Slack, ClientKind::Console],
+        &[ClientKind::Slack, ClientKind::Web, ClientKind::Console],
         "delete routines",
     )?;
     managed_routine(&state, &caller, &id).await?;

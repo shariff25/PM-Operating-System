@@ -282,6 +282,10 @@ struct State {
 
 impl State {
     fn notify(&mut self, task: &Task, n: &NewNotification, now: DateTime<Utc>) {
+        // A web task has no Slack thread to post in; its caller reads the task and its events.
+        if task.source == crate::model::Source::Web {
+            return;
+        }
         self.notification_seq += 1;
         let item = notification_for(task, self.notification_seq, n, now);
         self.notifications.push(item);
