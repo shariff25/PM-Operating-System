@@ -156,6 +156,18 @@ pub fn hash_id(cookie_value: &str) -> IdHash {
     Sha256::digest(cookie_value.as_bytes()).into()
 }
 
+/// The session's reference in a user assertion's `sid` claim (`docs/user-assertion.md`):
+/// 16 hex characters of a SHA-256 over the session's stored hash, under a label of its own.
+/// It tells one sign-in from another in an upstream's logs, and can't be turned back into the
+/// session id, the cookie, or the key `web_sessions` stores the session under.
+pub fn assertion_ref(id: &IdHash) -> String {
+    let digest = Sha256::new()
+        .chain_update(b"pmos-web assertion sid\0")
+        .chain_update(id)
+        .finalize();
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The session id the browser sent in `Cookie`, if any.
 pub fn cookie_value(headers: &HeaderMap) -> Option<String> {
     headers
@@ -210,6 +222,24 @@ mod tests {
             .decode(&a)
             .unwrap();
         assert_eq!(bytes.len(), 32);
+    }
+
+    #[test]
+    fn the_assertion_reference_is_short_stable_and_not_the_id() {
+        let cookie = random_token();
+        let id = hash_id(&cookie);
+        let r = assertion_ref(&id);
+        assert_eq!(r.len(), 16);
+        assert!(r
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(r, assertion_ref(&hash_id(&cookie)));
+        assert_ne!(r, assertion_ref(&hash_id(&random_token())));
+        // Not the cookie, and not a prefix of the key the store keeps.
+        let stored: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!stored.starts_with(&r) && !cookie.contains(&r));
+        // A valid `sid`.
+        assert!(pmos_assertion::Claims::new("web", "bots", "ana", &[], &r).is_ok());
     }
 
     #[tokio::test]

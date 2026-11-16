@@ -2817,6 +2817,16 @@ fn verify(
     key: (&str, &str),
     cache: &pmos_assertion::MemoryReplayCache,
 ) -> Result<String, pmos_assertion::VerifyError> {
+    verified(call, audience, key, cache).map(|a| a.subject().to_string())
+}
+
+/// As [`verify`], returning the whole assertion.
+fn verified(
+    call: &Call,
+    audience: &str,
+    key: (&str, &str),
+    cache: &pmos_assertion::MemoryReplayCache,
+) -> Result<pmos_assertion::Assertion, pmos_assertion::VerifyError> {
     let header = call.assertion.as_deref().expect("an assertion");
     let policy = pmos_assertion::VerifyPolicy::new(audience, &["web"]).unwrap();
     let binding = pmos_assertion::RequestBinding::new(&call.method, &call.uri, &call.raw).unwrap();
@@ -2824,7 +2834,82 @@ fn verify(
     let a = ring(key.0, key.1).verify(header, &policy, now, Some(&binding), cache)?;
     assert!(a.expires_at() - a.issued_at() <= 60, "lifetime");
     assert_eq!(a.roles(), &[pmos_contract::model::Role::Pm]);
-    Ok(a.subject().to_string())
+    Ok(a)
+}
+
+/// The `sid` pmos-web signs for the browser `b`'s session.
+fn session_ref(b: &Browser) -> String {
+    let cookie = b.cookie.as_deref().expect("signed in");
+    pmos_web::session::assertion_ref(&pmos_web::session::hash_id(cookie))
+}
+
+#[tokio::test]
+async fn assertions_carry_a_session_reference_never_the_session() {
+    let w = signing_web().await;
+    let ana = w.login("ana").await;
+    let again = w.login("ana").await;
+    assert_ne!(session_ref(&ana), session_ref(&again));
+    assert_eq!(w.get(&ana, "/api/tasks").await.status, StatusCode::OK);
+    assert_eq!(w.get(&again, "/api/drafts").await.status, StatusCode::OK);
+    let cache = pmos_assertion::MemoryReplayCache::default();
+    let runtime = w.runtime.calls();
+    let tools = w.tools.calls();
+    let a = verified(&runtime[0], "bots", ("wb1", WEB_BOTS_KEY), &cache).unwrap();
+    assert_eq!(a.session(), session_ref(&ana));
+    let t = verified(&tools[0], "toolserver", ("wt1", WEB_TOOLS_KEY), &cache).unwrap();
+    assert_eq!(t.session(), session_ref(&again));
+    for (sid, b) in [(a.session(), &ana), (t.session(), &again)] {
+        assert_eq!(sid.len(), 16);
+        assert_ne!(sid, "unknown");
+        let cookie = b.cookie.as_deref().unwrap();
+        assert!(!cookie.contains(sid) && !sid.contains(cookie));
+    }
+    // The reference stays between pmos-web and its upstreams.
+    for s in w.seen.lock().unwrap().iter() {
+        assert!(!s.contains(&session_ref(&ana)) && !s.contains(&session_ref(&again)));
+    }
+}
+
+#[tokio::test]
+async fn a_conflicting_decision_is_read_again_with_an_assertion() {
+    let w = signing_web().await;
+    let b = w.login("ana").await;
+    // Decided in Slack a moment ago, and the same PM's other approve winning: both read the
+    // item again after the tool server's `409`.
+    let r = w.post(&b, "/api/drafts/apr_race/approve", json!({})).await;
+    assert_eq!(r.code(), "not_pending");
+    w.tools.data.lock().unwrap().push(item(
+        "apr_dbl",
+        "ana",
+        "jira.create_issue",
+        json!({"project": "PAY", "issue_type": "Task", "summary": "Twice"}),
+        "2026-11-16T09:07:00Z",
+    ));
+    let r = w.post(&b, "/api/drafts/apr_dbl/approve", json!({})).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.body["status"], "approved");
+    let cache = pmos_assertion::MemoryReplayCache::default();
+    let calls = w.tools.calls();
+    for id in ["apr_race", "apr_dbl"] {
+        let path = format!("/internal/approvals/{id}");
+        // The first read (finding the draft) names nobody; every read after the decision
+        // carries an assertion for the PM.
+        let decision = calls
+            .iter()
+            .position(|c| c.method == "POST" && c.uri == format!("{path}/decision"))
+            .expect("a decision");
+        let after: Vec<&Call> = calls[decision..]
+            .iter()
+            .filter(|c| c.method == "GET" && c.uri == path)
+            .collect();
+        assert!(!after.is_empty(), "{id}: no read after the conflict");
+        for call in after {
+            let a = verified(call, "toolserver", ("wt1", WEB_TOOLS_KEY), &cache)
+                .unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert_eq!(a.subject(), "ana");
+            assert_eq!(a.session(), session_ref(&b));
+        }
+    }
 }
 
 #[tokio::test]

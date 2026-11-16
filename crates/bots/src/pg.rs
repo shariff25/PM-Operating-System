@@ -195,8 +195,8 @@ async fn insert_notification(
     .await?;
     sqlx::query(
         "INSERT INTO bots_notifications (seq, task_id, bot, requested_by, slack, kind, text,
-             approvals, outcomes, at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             approvals, outcomes, routine_id, at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(seq)
     .bind(&task.id)
@@ -207,6 +207,7 @@ async fn insert_notification(
     .bind(&n.text)
     .bind(Json(&n.approvals))
     .bind(Json(&n.outcomes))
+    .bind(&task.routine_id)
     .bind(now)
     .execute(conn)
     .await?;
@@ -492,7 +493,8 @@ impl BotsStore for PgStore {
 
     async fn notifications(&self, after: i64, limit: usize) -> StoreResult<Vec<Notification>> {
         let rows = sqlx::query(
-            "SELECT seq, task_id, bot, requested_by, slack, kind, text, approvals, outcomes, at
+            "SELECT seq, task_id, bot, requested_by, slack, kind, text, approvals, outcomes,
+                    routine_id, at
              FROM bots_notifications WHERE seq > $1 ORDER BY seq LIMIT $2",
         )
         .bind(after)
@@ -518,6 +520,7 @@ impl BotsStore for PgStore {
                     text: r.try_get("text")?,
                     approvals: approvals.0,
                     outcomes: outcomes.0,
+                    routine_id: r.try_get("routine_id")?,
                     at: r.try_get("at")?,
                 })
             })

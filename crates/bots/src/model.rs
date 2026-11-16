@@ -397,6 +397,10 @@ pub struct Notification {
     /// For `approval_closed`: how each item ended.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub outcomes: Vec<ApprovalOutcome>,
+    /// The routine that created the task, when one did. Left out otherwise, and on items
+    /// stored before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routine_id: Option<String>,
     pub at: DateTime<Utc>,
 }
 
@@ -478,6 +482,37 @@ mod tests {
             "needs_approval"
         );
         assert_eq!(TaskStatus::parse("working"), Some(TaskStatus::Working));
+    }
+
+    #[test]
+    fn a_notification_names_its_routine_only_when_it_has_one() {
+        let n = Notification {
+            id: "ntf_1".into(),
+            seq: 1,
+            task_id: "tsk_1".into(),
+            bot: "pm-ana".into(),
+            requested_by: "ana".into(),
+            slack: None,
+            kind: NotificationKind::Done,
+            text: "Brief".into(),
+            approvals: Vec::new(),
+            outcomes: Vec::new(),
+            routine_id: None,
+            at: now(),
+        };
+        let plain = serde_json::to_value(&n).unwrap();
+        assert!(plain.get("routine_id").is_none());
+        // An item written before the field existed still reads.
+        let old: Notification = serde_json::from_value(plain).unwrap();
+        assert_eq!(old.routine_id, None);
+        let from_routine = Notification {
+            routine_id: Some("rtn_1".into()),
+            ..n
+        };
+        let v = serde_json::to_value(&from_routine).unwrap();
+        assert_eq!(v["routine_id"], "rtn_1");
+        let back: Notification = serde_json::from_value(v).unwrap();
+        assert_eq!(back.routine_id.as_deref(), Some("rtn_1"));
     }
 
     #[test]

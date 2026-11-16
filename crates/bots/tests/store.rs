@@ -255,6 +255,8 @@ async fn transitions_check_their_guards(store: Arc<dyn BotsStore>) {
     assert_eq!(feed[0].requested_by, "ana");
     assert_eq!(feed[0].slack, t.slack);
     assert_eq!(feed[0].approvals, vec!["apr_1", "apr_2"]);
+    // A task no routine created names none.
+    assert_eq!(feed[0].routine_id, None);
     assert_eq!(feed[0].at, later);
     // A refused change writes nothing.
     assert!(store
@@ -644,6 +646,9 @@ async fn routine_runs_happen_once(store: Arc<dyn BotsStore>) {
     let feed = store.notifications(0, 10).await.unwrap();
     assert_eq!(feed.len(), 1);
     assert_eq!(feed[0].task_id, last.task.id);
+    // The notification names the routine that created the task (the Slack service counts a
+    // delivered brief by it).
+    assert_eq!(feed[0].routine_id.as_deref(), Some(r.id.as_str()));
 }
 
 async fn member_settings_round_trip(store: Arc<dyn BotsStore>) {

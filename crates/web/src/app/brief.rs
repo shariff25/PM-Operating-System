@@ -183,9 +183,8 @@ async fn draft(State(state): State<AppState>, signed: Signed, Path(id): Path<Str
     else {
         return Err(ApiError::not_found());
     };
-    let task = state
-        .0
-        .runtime
+    let task = signed
+        .runtime(&state)
         .create_task(signed.handle(), &signed.bot(), &draft_prompt(&f))
         .await
         .map_err(|e| match e {
