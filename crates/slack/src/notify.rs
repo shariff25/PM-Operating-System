@@ -170,6 +170,8 @@ impl Notifier {
         match item["kind"].as_str().unwrap_or_default() {
             "milestone" => self.milestone(&task_id, &bot, &username, &text).await,
             "done" => {
+                // A delivered daily brief is that day's one message from PM OS.
+                crate::brief::note_delivery(&self.bots, item).await;
                 self.finish_progress(&task_id, Stage::Done).await;
                 if !text.trim().is_empty() {
                     self.say(&task_id, &bot, &username, cards::answer(&text))

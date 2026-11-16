@@ -155,7 +155,8 @@ async fn web_conversations_are_named_by_the_client(env: &Env) {
     assert_eq!(claim["history"].as_array().unwrap().len(), 1);
     assert_eq!(claim["history"][0]["text"], "first");
 
-    // Only the web and Slack clients name one, and only a well-formed id.
+    // The evals client may name one too, for a benchmark thread (docs/evals.md); the id
+    // must be well formed whoever sends it.
     let (status, _) = env
         .post(
             "/v1/tasks",
@@ -165,7 +166,7 @@ async fn web_conversations_are_named_by_the_client(env: &Env) {
                    "conversation": "cnv_42"}),
         )
         .await;
-    assert_eq!(status, 403);
+    assert_eq!(status, 201);
     for bad in ["", "has space", &"x".repeat(129)] {
         let (status, body) = env
             .post("/v1/tasks", "web", Some("ana"), web("x", Some(bad)))

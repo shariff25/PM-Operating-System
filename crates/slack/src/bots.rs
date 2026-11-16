@@ -568,6 +568,10 @@ impl Bots {
         if crate::nudges::handle_dm(&dm.channel, &dm.thread_ts, &handle, &text).await {
             return;
         }
+        // `brief me at 8`, `brief off`, `brief`, `brief now`: the daily brief routine.
+        if crate::brief::handle_dm(self, &dm.channel, &dm.thread_ts, &dm.user, &text).await {
+            return;
+        }
         if let Some(cmd) = level::command(&text) {
             return self.level_command(&dm, &handle, cmd).await;
         }
