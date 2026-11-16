@@ -97,7 +97,7 @@ providers, regenerate the policies (the old files are `policy-orphan`), and rest
 ## Configuration
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `PMOS_BOTS_TOKENS` | required | `name=token,…` with names `slack`, `worker-<bot>` (one per bot sandbox: it claims and reports only that bot's tasks), `console` and `evals`. A plain `worker` serves every bot and is for development only. Each token is at least 32 characters, and all are distinct. |
+| `PMOS_BOTS_TOKENS` | required | `name=token,…` with names `slack`, `web`, `worker-<bot>` (one per bot sandbox: it claims and reports only that bot's tasks), `console` and `evals`. A plain `worker` serves every bot and is for development only. Each token is at least 32 characters, and all are distinct. |
 | `PMOS_BOTS_DATABASE_URL` | required | Postgres. Not needed with `PMOS_DEV=1`, which keeps everything in memory. |
 | `PMOS_DEV` | off | `1`: the memory store |
 | `PMOS_BOTS_BIND` | `127.0.0.1:8750` | |
@@ -116,11 +116,12 @@ it may do. Anything else is `403`.
 | Client | May |
 | --- | --- |
 | `slack` | create tasks (source `slack` or `cli`), read its PM's own tasks and their events, the notification feed, and its PM's routines (parse, create, list, change, delete) |
+| `web` | the web app's backend: what `slack` may do for its PM except the notification feed. It creates tasks with source `web` only, and reads its PM's own tasks and events, cancels them, manages their routines, reads the bot list, and reads and sets their member settings. A `web` task has no Slack thread and writes no notifications |
 | `worker` | claim, heartbeat, events, trace, complete, fail |
 | `console` | read everything, including traces and drafts; pause, resume and delete routines; cancel tasks |
 | `evals` | create tasks with `source: "eval"`, and read eval tasks, their events and their drafts |
 
-- **The Slack client acts for one PM per call**, named in `X-Pmos-User` (a PM OS handle). The
+- **The Slack and web clients act for one PM per call**, named in `X-Pmos-User` (a PM OS handle). The
   call is `400` without it. Another PM's task or routine answers `404`, the same as one that
   doesn't exist.
 - **Who may use a bot:** a personal bot serves its owner only; a team bot serves the members
@@ -136,7 +137,7 @@ queued ──claim──► working ──complete──► done
      (first time)    ├──fail, or a second lapse──► failed
                      └──cancel (also from queued)──► cancelled
 ```
-- **Priority** comes from the source: `slack` and `cli` are `interactive`, routines are
+- **Priority** comes from the source: `slack`, `web` and `cli` are `interactive`, routines are
   `scheduled`, evals are `personal`. Claims take interactive work first, then the oldest.
 - **Claim** (`POST /v1/worker/claim {worker, bots?, wait_ms?}`): long-polls up to `wait_ms`
   (at most 25 seconds; none if absent). It answers `204` if nothing came in time. The

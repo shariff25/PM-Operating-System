@@ -94,14 +94,15 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 
 | Client | May |
 | --- | --- |
-| `slack` | create tasks (as `X-Pmos-User`), read their own tasks, notifications, and routines for `X-Pmos-User` |
+| `slack` | create tasks (`source` `slack` or `cli`, as `X-Pmos-User`), read their own tasks, notifications, and routines for `X-Pmos-User` |
+| `web` | the same as `slack` for the PM in `X-Pmos-User`, with source `web`, except the notification feed: create tasks (`source: "web"` only), read their own tasks and events, cancel them, manage their routines, read `GET /v1/bots`, read and set their own member settings. No notifications, worker, console or evals calls |
 | `worker` | claim, heartbeat, events, trace, complete, fail |
 | `console` | read everything; pause, resume and delete routines; cancel tasks |
 | `evals` | create tasks with `source: "eval"` (and a task `level`), and read them |
 
 ### Task
 ```json
-{"id": "tsk_<32 hex>", "bot": "docs", "requested_by": "ana", "source": "slack|routine|cli|eval",
+{"id": "tsk_<32 hex>", "bot": "docs", "requested_by": "ana", "source": "slack|web|routine|cli|eval",
  "priority": "interactive|scheduled|personal", "text": "Does Acme Vault support SAML SSO?",
  "status": "queued|working|needs_approval|done|failed|cancelled",
  "checklist": [{"item": "Search the docs", "done": true}], "result": "markdown or null",
@@ -109,7 +110,8 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
  "slack": {"channel": "D0…", "thread_ts": "1731…"} , "routine_id": "rtn_… or null",
  "attempts": 1, "created_at": "…", "updated_at": "…"}
 ```
-- **Priority:** `interactive` for Slack and the CLI, `scheduled` for routines, `personal` for evals and background work. It is passed to the gateway as `X-Pmos-Priority`.
+- **Web tasks:** only client `web` sets `source: "web"`, and `web` sets nothing else. A web task has no `slack` field and writes no notifications (the Slack feed would have nowhere to post them); the web app reads the task and its events instead.
+- **Priority:** `interactive` for Slack, the web app and the CLI, `scheduled` for routines, `personal` for evals and background work. It is passed to the gateway as `X-Pmos-Priority`.
 - **Status flow:** `queued`, then `working`, then `done` or `failed`, or `needs_approval` when the result has pending approvals. A queued or working task can become `cancelled`.
 - **Leaving `needs_approval`:** the runtime polls `GET /internal/approvals/{id}` every 30 seconds with the service token. When none is still `pending` or `executing`, the task becomes `done`, and the notification says what was approved or rejected.
 - **Durability (D2):**
@@ -121,14 +123,14 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 ### API
 | Method and path | Client | Notes |
 | --- | --- | --- |
-| `GET /v1/members/{handle}/settings` | slack (own handle, from `X-Pmos-User`), console | `{"handle": "ana", "level": "senior"}`. An unset level reads as `senior`. |
-| `PUT /v1/members/{handle}/settings` `{level}` | slack (own handle only) | The same shape. The handle must be a member. An unknown level is `400`; another member's handle is `403`. |
+| `GET /v1/members/{handle}/settings` | slack, web (own handle, from `X-Pmos-User`), console | `{"handle": "ana", "level": "senior"}`. An unset level reads as `senior`. |
+| `PUT /v1/members/{handle}/settings` `{level}` | slack, web (own handle only) | The same shape. The handle must be a member. An unknown level is `400`; another member's handle is `403`. |
 | `GET /v1/bots` | all | `[{name, role, scope, owner, description}]` |
 | `GET /v1/bots/{name}` | all | the bot, its role, its tools, and each write tool's setting |
-| `POST /v1/tasks` `{bot, requested_by, text, source, slack?, level?}` | slack, evals | `201` with the Task. `403` if `requested_by` may not use the bot: personal bots serve their owner only, and team bots serve team members. |
-| `GET /v1/tasks/{id}`, `GET /v1/tasks?bot=&requested_by=&status=&limit=` | slack (own), console, evals | |
-| `POST /v1/tasks/{id}/cancel` | slack (own), console | |
-| `GET /v1/tasks/{id}/events` | slack (own), console, evals | `[{at, kind, text}]` |
+| `POST /v1/tasks` `{bot, requested_by, text, source, slack?, level?}` | slack (`slack`/`cli`), web (`web`), evals (`eval`) | `201` with the Task. `403` if `requested_by` may not use the bot: personal bots serve their owner only, and team bots serve team members. |
+| `GET /v1/tasks/{id}`, `GET /v1/tasks?bot=&requested_by=&status=&limit=` | slack, web (own), console, evals | |
+| `POST /v1/tasks/{id}/cancel` | slack, web (own), console | |
+| `GET /v1/tasks/{id}/events` | slack, web (own), console, evals | `[{at, kind, text}]` |
 | `GET /v1/tasks/{id}/trace` | console | `[{at, kind, body}]` |
 | `POST /v1/worker/claim` `{worker, bots?: [..], wait_ms?}` | worker | Long-polls up to `wait_ms` (at most 25,000). Returns `200` with `{task, bot, role, tools, session_token, lease_until}`, or `204` if nothing is queued. The runtime creates the tool-server session (§2) for the task. |
 | `POST /v1/worker/tasks/{id}/heartbeat` | worker | extends the lease |
@@ -137,11 +139,11 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 | `POST /v1/worker/tasks/{id}/complete` `{result, approvals: [..]}` | worker | `needs_approval` if `approvals` is non-empty, else `done` |
 | `POST /v1/worker/tasks/{id}/fail` `{reason}` | worker | |
 | `GET /v1/notifications?after=<cursor>&wait_ms=` | slack | Long-polls. Returns `{cursor, items: [{id, task_id, bot, requested_by, slack, kind: "milestone"\|"done"\|"failed"\|"needs_approval"\|"approval_closed", text, approvals?}]}` in order. |
-| `POST /v1/routines/parse` `{bot, owner, text, tz}` | slack | Returns `{draft, summary}`, or `422` with `{question}` when the request is unclear. |
-| `POST /v1/routines` `{draft}` | slack | `201` with the Routine |
-| `GET /v1/routines?owner=` | slack (own), console | |
-| `PATCH /v1/routines/{id}` `{enabled?, schedule?, prompt?}` | slack (own), console | |
-| `DELETE /v1/routines/{id}` | slack (own), console | |
+| `POST /v1/routines/parse` `{bot, owner, text, tz}` | slack, web | Returns `{draft, summary}`, or `422` with `{question}` when the request is unclear. |
+| `POST /v1/routines` `{draft}` | slack, web | `201` with the Routine |
+| `GET /v1/routines?owner=` | slack, web (own), console | |
+| `PATCH /v1/routines/{id}` `{enabled?, schedule?, prompt?}` | slack, web (own), console | |
+| `DELETE /v1/routines/{id}` | slack, web (own), console | |
 | `GET /healthz`, `GET /readyz` | none | readiness covers storage plus the tool server and the gateway |
 
 ### Levels and member settings
