@@ -966,14 +966,26 @@ fn named(uri: &str) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-/// Every call that names a person carries a valid assertion for exactly that person, issued
-/// by `console` for `audience`; every other call carries none.
-fn check_calls(seen: &Seen, audience: &str, key: (&str, &str)) -> usize {
+/// Is this a routine change (pause, resume, delete)? It names no one, and is signed for the
+/// viewer who made it.
+fn routine_change(method: &str, uri: &str) -> bool {
+    matches!(method, "PATCH" | "DELETE") && uri.starts_with("/v1/routines/")
+}
+
+/// Every call that names a person carries a valid assertion for exactly that person, and
+/// every routine change one for `actor`, issued by `console` for `audience`; every other call
+/// carries none.
+fn check_calls(seen: &Seen, audience: &str, key: (&str, &str), actor: Option<&str>) -> usize {
     let cache = pmos_assertion::MemoryReplayCache::default();
     let policy = pmos_assertion::VerifyPolicy::new(audience, &["console"]).unwrap();
     let mut signed = 0;
     for (method, uri, body, assertion) in seen.asserted.lock().unwrap().iter() {
-        match named(uri) {
+        let expected = if routine_change(method, uri) {
+            Some(actor.expect("a routine change needs an actor").to_string())
+        } else {
+            named(uri)
+        };
+        match expected {
             None => assert!(assertion.is_none(), "{method} {uri} names nobody"),
             Some(person) => {
                 let header = assertion
@@ -1025,8 +1037,58 @@ async fn calls_that_name_a_person_carry_a_valid_assertion_for_them() {
         .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
     // Ana's own tasks and routines, and every member's inbox for root.
-    assert!(check_calls(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY)) >= 2);
-    assert!(check_calls(&c.tools, "toolserver", ("ct1", CONSOLE_TOOLS_KEY)) >= 4);
+    assert!(check_calls(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY), Some("ana")) >= 3);
+    assert!(check_calls(&c.tools, "toolserver", ("ct1", CONSOLE_TOOLS_KEY), None) >= 4);
+}
+
+#[tokio::test]
+async fn routine_changes_are_signed_for_the_viewer_who_made_them() {
+    let c = console(Options {
+        sign: true,
+        ..Options::default()
+    })
+    .await;
+    let origin = Some(c.base.as_str());
+    // An admin resumes and deletes someone else's routine: signed as the admin, not the owner.
+    let token = c.csrf("root").await;
+    for action in ["resume", "delete"] {
+        let res = c
+            .post(
+                "root",
+                &format!("/routines/rtn_ben1/{action}"),
+                &token,
+                origin,
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER, "{action}");
+    }
+    let changes: Vec<_> = c
+        .runtime
+        .asserted
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, u, ..)| routine_change(m, u))
+        .cloned()
+        .collect();
+    assert_eq!(changes.len(), 2, "{changes:?}");
+    assert_eq!(
+        check_calls(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY), Some("root")),
+        2
+    );
+    // The assertion is bound to the change itself: it doesn't verify for another routine.
+    let (method, _, body, assertion) = &changes[0];
+    let other = pmos_assertion::RequestBinding::new(method, "/v1/routines/rtn_ana1", body).unwrap();
+    let policy = pmos_assertion::VerifyPolicy::new("bots", &["console"]).unwrap();
+    assert!(ring("cb1", CONSOLE_BOTS_KEY)
+        .verify(
+            assertion.as_deref().unwrap(),
+            &policy,
+            pmos_assertion::unix_now(),
+            Some(&other),
+            &pmos_assertion::MemoryReplayCache::default(),
+        )
+        .is_err());
 }
 
 #[tokio::test]

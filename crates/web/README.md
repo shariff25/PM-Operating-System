@@ -170,10 +170,12 @@ path with another method a JSON `405 method_not_allowed`.
   every tool-server call that names the PM (the inbox, sources, decisions) also carries
   `X-Pmos-Assertion`: issuer `web`, the upstream as audience, the PM as subject, roles from
   `team.yaml`, 60 seconds, bound to the method, path, query and body sent, signed afresh for
-  each call. The re-read of one item after a conflicting decision (`approval(id)`) names no
-  one and is sent without one; `ToolServer::approval_for(user, id)` signs it, once `app.rs`
-  passes the handle there. `sid` is the fixed `unknown`: the upstream layer is given the
-  handle, not the session id.
+  each call. The re-read of one item after a conflicting decision uses
+  `ToolServer::approval_for(user, id)` and carries one too; only the first read of a draft
+  (`approval(id)`, owner checked here) names no one and is sent without. `sid` is the PM's
+  session reference, `session::assertion_ref` (16 hex characters of a labelled SHA-256 over
+  the session's stored hash): `app.rs` binds each upstream to it with `for_session`. Never
+  the session id or the cookie.
 - **Brief and follow-ups** (`src/app/brief.rs`, `src/followups.rs`), on with `PMOS_WEB_BRIEF=1`
   and `501 not_built` otherwise. `GET /api/brief` answers `200` with the PM's open follow-ups
   (not dismissed, not expired) and the day's `changed` items, empty lists when nothing is

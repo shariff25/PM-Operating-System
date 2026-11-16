@@ -256,7 +256,8 @@ entries, one per caller→receiver pair.
 
 - A malformed entry, a key under 32 bytes, an unknown pair or a pair listed twice refuses to
   start, with the entry's number and pair in the message and never a key. Keys are never
-  logged: start-up logs the key ids only.
+  logged: start-up logs the key ids only. All four services read the list with the same
+  parser, `pmos_assertion::parse_key_list`.
 
 ### Modes (receivers)
 
@@ -278,14 +279,18 @@ mode.
   names the PM (the inbox, sources, decisions), when it has a key for that upstream: lifetime
   60 seconds, audience `bots` or `toolserver`, bound to the method, path, query and body as
   sent, a fresh assertion per call, next to the existing `X-Pmos-User` and `decided_by`. Roles
-  come from `team.yaml` and `sid` is the fixed `unknown` (its upstream layer gets the handle,
-  not the session). It calls the tool server with its own token (`PMOS_WEB_TOKEN` there), which
+  come from `team.yaml`. `sid` is a reference to the PM's session: 16 hex characters of a
+  SHA-256 over the session's stored hash under a label of its own (`session::assertion_ref`),
+  never the session id or the cookie. Re-reading one item after a conflicting decision carries
+  an assertion too. It calls the tool server with its own token (`PMOS_WEB_TOKEN` there), which
   reaches only the approvals routes.
 - **The console** signs every call that names a person, as that person: one PM's tasks
-  (`requested_by=`), routines (`owner=`) and pending approvals (`user=`). Reads of everything
-  and routine pause, resume and delete name no one and carry none. Its upstream layer doesn't
-  know the viewer, so for an admin's view of every inbox it signs as each member whose inbox it
-  reads. It calls the tool server with its own token (`PMOS_CONSOLE_TOKEN` there).
+  (`requested_by=`), routines (`owner=`) and pending approvals (`user=`). Routine pause, resume
+  and delete name no one and are signed as the viewer who made them (an admin acting on
+  someone else's routine signs as the admin). Reads of everything carry none. For an admin's
+  view of every inbox it signs as each member whose inbox it reads. Its `sid` is the fixed
+  `unknown`: the SSO proxy's session isn't visible to it. It calls the tool server with its own
+  token (`PMOS_CONSOLE_TOKEN` there).
 - **The runtime** checks calls from `web` and `console`: the policy for each allows exactly one
   issuer, the client whose token was presented. The subject must equal every person the request
   names (`X-Pmos-User`, `requested_by=`, `owner=`, `/v1/members/{handle}`), and becomes the PM.
@@ -381,11 +386,10 @@ Roll out in this order: shared pieces, then callers sending, then receivers enfo
 
 **Console (caller)**
 
-- [ ] Do the same for calls made for the console viewer, with `iss=console`. This covers
+- [x] Do the same for calls made for the console viewer, with `iss=console`. This covers
       routine pause, resume and delete, task cancel, and anything that names `decided_by`.
-      *Partly:* the console signs every call that names a person, as that person. Routine
-      changes name no one and its upstream layer isn't given the viewer, so they carry none;
-      the console decides nothing and cancels nothing today.
+      The console signs every call that names a person, as that person, and routine changes
+      as the viewer; it decides nothing and cancels nothing today.
 - [x] For reads that are "read everything" (no person), send no assertion. Those reads stay on
       the console token alone.
 

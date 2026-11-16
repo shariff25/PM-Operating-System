@@ -478,9 +478,21 @@ async fn routine_action(
         Err(e) => return upstream_failed(&viewer, Screen::Routines, e),
     }
     let done = match action.as_str() {
-        "pause" => state.0.bots.set_routine_enabled(&id, false).await,
-        "resume" => state.0.bots.set_routine_enabled(&id, true).await,
-        _ => state.0.bots.delete_routine(&id).await,
+        "pause" => {
+            state
+                .0
+                .bots
+                .set_routine_enabled(&viewer.handle, &id, false)
+                .await
+        }
+        "resume" => {
+            state
+                .0
+                .bots
+                .set_routine_enabled(&viewer.handle, &id, true)
+                .await
+        }
+        _ => state.0.bots.delete_routine(&viewer.handle, &id).await,
     };
     match done {
         Ok(()) => {

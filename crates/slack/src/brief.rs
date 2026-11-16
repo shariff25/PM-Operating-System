@@ -305,22 +305,33 @@ async fn routine_command(bots: &Bots, handle: &str, slack_user: &str, cmd: Comma
 /// task came from the PM's brief routine, today counts as their nudge day
 /// (`nudges::record_daily_message`). Anything else does nothing.
 ///
+/// The runtime's notification carries `routine_id` only for a task a routine created
+/// (`docs/bot-runtime-spec.md` §5), so a notification without one costs no call. `brief now`
+/// is a plain task the PM asked for, not the day's unprompted message, and is not counted.
+///
 /// In `notify.rs`, at the top of the `"done"` arm:
 /// `crate::brief::note_delivery(&self.bots, item).await;`
 pub async fn note_delivery(bots: &Bots, item: &Value) {
-    let (Some(requester), Some(routine_id)) =
-        (item["requested_by"].as_str(), item["routine_id"].as_str())
+    let (Some(requester), Some(_)) = (item["requested_by"].as_str(), item["routine_id"].as_str())
     else {
         return;
     };
     if let Ok(routines) = bots.runtime().routines(requester).await {
-        if routines
-            .iter()
-            .any(|r| r["id"] == routine_id && is_brief_routine(r))
-        {
-            crate::nudges::record_daily_message(requester);
+        if let Some(handle) = delivered_brief_owner(item, &routines) {
+            crate::nudges::record_daily_message(handle);
         }
     }
+}
+
+/// The PM whose brief this `done` notification delivered, given their routines: the
+/// notification names a routine, and that routine is one of theirs with the brief's tag.
+fn delivered_brief_owner<'a>(item: &'a Value, routines: &[Value]) -> Option<&'a str> {
+    let requester = item["requested_by"].as_str()?;
+    let routine_id = item["routine_id"].as_str()?;
+    routines
+        .iter()
+        .any(|r| r["id"] == routine_id && r["owner"] == requester && is_brief_routine(r))
+        .then_some(requester)
 }
 
 #[cfg(test)]
@@ -369,5 +380,36 @@ mod tests {
         assert!(is_brief_routine(&d));
         assert!(!is_brief_routine(&crate::reply::draft("ana", "UTC")));
         assert_eq!(time_of(&d), Some((8, 30)));
+    }
+
+    #[test]
+    fn a_delivered_brief_is_found_by_its_routine() {
+        let brief = json!({"id": "rtn_b", "owner": "ana", "prompt": PROMPT});
+        let other = json!({"id": "rtn_o", "owner": "ana", "prompt": "[reply-assistant] x"});
+        let routines = [brief, other];
+        let done = |routine: Value| {
+            json!({"kind": "done", "requested_by": "ana", "task_id": "tsk_1",
+                   "routine_id": routine})
+        };
+        assert_eq!(
+            delivered_brief_owner(&done(json!("rtn_b")), &routines),
+            Some("ana")
+        );
+        // Another routine, an unknown one, or none at all (an older runtime, `brief now`).
+        assert_eq!(
+            delivered_brief_owner(&done(json!("rtn_o")), &routines),
+            None
+        );
+        assert_eq!(
+            delivered_brief_owner(&done(json!("rtn_x")), &routines),
+            None
+        );
+        assert_eq!(delivered_brief_owner(&done(Value::Null), &routines), None);
+        let mut no_field = done(Value::Null);
+        no_field.as_object_mut().unwrap().remove("routine_id");
+        assert_eq!(delivered_brief_owner(&no_field, &routines), None);
+        // Someone else's brief routine never counts for this PM.
+        let theirs = [json!({"id": "rtn_b", "owner": "ben", "prompt": PROMPT})];
+        assert_eq!(delivered_brief_owner(&done(json!("rtn_b")), &theirs), None);
     }
 }

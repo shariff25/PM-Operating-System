@@ -6,7 +6,10 @@
 //! With a key for an upstream (`PMOS_ASSERTION_KEYS`), every call made for a PM also carries a
 //! signed user assertion (`X-Pmos-Assertion`, `docs/user-assertion.md`): issuer `web`, that
 //! upstream as audience, the PM as subject, valid for 60 seconds, bound to the method, path,
-//! query and body actually sent, and signed afresh for every call.
+//! query and body actually sent, and signed afresh for every call. Its `sid` is the PM's
+//! session reference (`session::assertion_ref`, never the session id itself) when the call is
+//! made through [`Runtime::for_session`] or [`ToolServer::for_session`], else
+//! [`ASSERTION_SESSION`].
 //!
 //! Tokens are only ever sent as `Authorization` headers to the configured base URLs. Error
 //! values carry a plain reason, never a token, a key or an upstream body.
@@ -169,8 +172,8 @@ pub struct DecisionBody {
 /// How long an assertion lives. The receiver allows a few seconds of clock skew on top.
 pub const ASSERTION_LIFETIME_SECS: u64 = 60;
 
-/// The `sid` claim. pmos-web's upstream calls are made with the PM's handle only, not their
-/// session id, so every assertion carries this fixed value.
+/// The `sid` claim of a call made without a session reference (none is made by a request
+/// handler: each passes the PM's, see [`Runtime::for_session`]).
 pub const ASSERTION_SESSION: &str = "unknown";
 
 /// Signs user assertions for one upstream (an audience) with that pair's key ring.
@@ -215,11 +218,12 @@ impl Signer {
             .collect()
     }
 
-    /// An assertion that `subject` is the person `request` is for, bound to it exactly as it
-    /// will be sent.
+    /// An assertion that `subject` is the person `request` is for, in the session `session`
+    /// refers to (the `sid` claim), bound to the request exactly as it will be sent.
     pub fn sign(
         &self,
         subject: &str,
+        session: &str,
         request: &reqwest::Request,
     ) -> Result<HeaderValue, &'static str> {
         let url = request.url();
@@ -238,7 +242,7 @@ impl Signer {
             &self.audience,
             subject,
             &self.roles(subject),
-            ASSERTION_SESSION,
+            session,
         )
         .map_err(|_| "can't sign for this person")?;
         let value = self
@@ -313,6 +317,8 @@ struct Client {
     base: String,
     token: String,
     signer: Option<Arc<Signer>>,
+    /// The `sid` for assertions: the PM's session reference, when the call is for one.
+    session: Option<String>,
     service: &'static str,
 }
 
@@ -347,8 +353,9 @@ impl Client {
             .build()
             .map_err(|_| self.failed("couldn't build the request"))?;
         if let (Some(signer), Some(subject)) = (&self.signer, subject) {
+            let session = self.session.as_deref().unwrap_or(ASSERTION_SESSION);
             let value = signer
-                .sign(subject, &request)
+                .sign(subject, session, &request)
                 .map_err(|why| self.failed(why))?;
             request
                 .headers_mut()
@@ -399,8 +406,17 @@ impl Runtime {
             base: base.trim_end_matches('/').to_string(),
             token: credentials.token.clone(),
             signer: credentials.signer.clone(),
+            session: None,
             service: "bot runtime",
         })
+    }
+
+    /// The same upstream, with `session_ref` (`session::assertion_ref`, never the session id)
+    /// as the `sid` of every assertion it signs.
+    pub fn for_session(&self, session_ref: &str) -> Self {
+        let mut c = self.0.clone();
+        c.session = Some(session_ref.to_string());
+        Self(c)
     }
 
     async fn get<T: DeserializeOwned>(
@@ -475,8 +491,17 @@ impl ToolServer {
             base: base.trim_end_matches('/').to_string(),
             token: credentials.token.clone(),
             signer: credentials.signer.clone(),
+            session: None,
             service: "tool server",
         })
+    }
+
+    /// The same upstream, with `session_ref` (`session::assertion_ref`, never the session id)
+    /// as the `sid` of every assertion it signs.
+    pub fn for_session(&self, session_ref: &str) -> Self {
+        let mut c = self.0.clone();
+        c.session = Some(session_ref.to_string());
+        Self(c)
     }
 
     /// Every item in `user`'s inbox, newest first.

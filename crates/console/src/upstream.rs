@@ -6,8 +6,9 @@
 //! With a key for an upstream (`PMOS_ASSERTION_KEYS`), every call that names a person (one
 //! PM's tasks, routines or approvals) also carries a signed user assertion for that person
 //! (`X-Pmos-Assertion`, `docs/user-assertion.md`): issuer `console`, valid for 60 seconds,
-//! bound to the method, path, query and body sent, signed afresh for every call. Reads of
-//! everything, and routine changes (which name no one), carry none.
+//! bound to the method, path, query and body sent, signed afresh for every call. Routine
+//! changes (pause, resume, delete) carry one for the viewer who made them. Reads of
+//! everything carry none.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -521,22 +522,31 @@ impl Upstream {
         self.list(&["v1", "routines"], &query, owner).await
     }
 
-    pub async fn set_routine_enabled(&self, id: &str, enabled: bool) -> UpstreamResult<()> {
+    /// Pause or resume a routine, with an assertion for `viewer`, the person who asked. The
+    /// console has checked they may (their own routine, or any for an admin).
+    pub async fn set_routine_enabled(
+        &self,
+        viewer: &str,
+        id: &str,
+        enabled: bool,
+    ) -> UpstreamResult<()> {
         let url = self.url(&["v1", "routines", id])?;
-        // Names no one: the console's own power (docs/console.md).
         self.send(
             self.http
                 .patch(url)
                 .json(&serde_json::json!({ "enabled": enabled })),
-            None,
+            Some(viewer),
         )
         .await
         .map(drop)
     }
 
-    pub async fn delete_routine(&self, id: &str) -> UpstreamResult<()> {
+    /// Delete a routine, with an assertion for `viewer`, as [`Self::set_routine_enabled`].
+    pub async fn delete_routine(&self, viewer: &str, id: &str) -> UpstreamResult<()> {
         let url = self.url(&["v1", "routines", id])?;
-        self.send(self.http.delete(url), None).await.map(drop)
+        self.send(self.http.delete(url), Some(viewer))
+            .await
+            .map(drop)
     }
 
     // The tool server.
