@@ -179,41 +179,43 @@ pub fn link_statuses(
     registry()
         .list()
         .iter()
-        .map(|spec| match linked.iter().find(|c| c.provider == spec.provider) {
-            Some(c) => {
-                let scopes = split_scopes(&c.scopes);
-                let missing_scopes = requested(spec.provider)
-                    .into_iter()
-                    .filter(|s| !scopes.contains(s))
-                    .collect();
-                LinkStatus {
+        .map(
+            |spec| match linked.iter().find(|c| c.provider == spec.provider) {
+                Some(c) => {
+                    let scopes = split_scopes(&c.scopes);
+                    let missing_scopes = requested(spec.provider)
+                        .into_iter()
+                        .filter(|s| !scopes.contains(s))
+                        .collect();
+                    LinkStatus {
+                        provider: spec.provider,
+                        label: spec.label,
+                        state: if c.expires_at.is_some_and(|e| e <= now) {
+                            LinkState::AccessExpired
+                        } else {
+                            LinkState::Connected
+                        },
+                        scopes,
+                        missing_scopes,
+                        external_id: c.external_id.clone(),
+                        site_url: c.site_url.clone(),
+                        expires_at: c.expires_at,
+                        updated_at: Some(c.updated_at),
+                    }
+                }
+                None => LinkStatus {
                     provider: spec.provider,
                     label: spec.label,
-                    state: if c.expires_at.is_some_and(|e| e <= now) {
-                        LinkState::AccessExpired
-                    } else {
-                        LinkState::Connected
-                    },
-                    scopes,
-                    missing_scopes,
-                    external_id: c.external_id.clone(),
-                    site_url: c.site_url.clone(),
-                    expires_at: c.expires_at,
-                    updated_at: Some(c.updated_at),
-                }
-            }
-            None => LinkStatus {
-                provider: spec.provider,
-                label: spec.label,
-                state: LinkState::NotConnected,
-                scopes: Vec::new(),
-                missing_scopes: Vec::new(),
-                external_id: None,
-                site_url: None,
-                expires_at: None,
-                updated_at: None,
+                    state: LinkState::NotConnected,
+                    scopes: Vec::new(),
+                    missing_scopes: Vec::new(),
+                    external_id: None,
+                    site_url: None,
+                    expires_at: None,
+                    updated_at: None,
+                },
             },
-        })
+        )
         .collect()
 }
 
@@ -274,9 +276,18 @@ mod tests {
         assert_eq!(registry().by_id("slack").unwrap().label, "Slack");
         assert!(registry().by_id("gitlab").is_none());
         assert!(registry().by_id("Slack").is_none());
-        assert_eq!(registry().for_system("jira").unwrap().provider, Provider::Atlassian);
-        assert_eq!(registry().for_system("confluence").unwrap().provider, Provider::Atlassian);
-        assert_eq!(registry().for_system("slack").unwrap().provider, Provider::Slack);
+        assert_eq!(
+            registry().for_system("jira").unwrap().provider,
+            Provider::Atlassian
+        );
+        assert_eq!(
+            registry().for_system("confluence").unwrap().provider,
+            Provider::Atlassian
+        );
+        assert_eq!(
+            registry().for_system("slack").unwrap().provider,
+            Provider::Slack
+        );
         assert!(registry().for_system("docs").is_none());
         assert!(registry().for_system("github").is_none());
     }
@@ -296,7 +307,11 @@ mod tests {
         let now = Utc::now();
         let linked = vec![
             info(Provider::Slack, "chat:write search:read.public", None),
-            info(Provider::Atlassian, "read:jira-work", Some(now - chrono::Duration::hours(1))),
+            info(
+                Provider::Atlassian,
+                "read:jira-work",
+                Some(now - chrono::Duration::hours(1)),
+            ),
         ];
         let rows = link_statuses(&linked, now, |p| match p {
             Provider::Slack => vec!["chat:write".into(), "im:history".into()],

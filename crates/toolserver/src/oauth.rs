@@ -35,9 +35,9 @@ use crate::session::{is_bot_identity, valid_handle};
 fn linkable(user: &str) -> bool {
     valid_handle(user) || is_bot_identity(user)
 }
+use crate::connectors::registry::{link_statuses, registry, LinkStatus};
 use crate::store::{StoreError, StoreResult};
 use crate::team::Team;
-use crate::connectors::registry::{link_statuses, registry, LinkStatus};
 use crate::vault::{Credential, CredentialInfo, Provider, Secret, Vault};
 
 /// How long a `state` value is accepted.
