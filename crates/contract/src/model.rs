@@ -379,7 +379,9 @@ pub struct TeamMember {
     /// Slack member id, such as `U012AB3CD`.
     pub slack_id: String,
     /// Atlassian account email. Linking Jira and Confluence checks the signed-in account
-    /// has this email, so a forwarded link can't attach someone else's account.
+    /// has this email, so a forwarded link can't attach someone else's account. The web app's
+    /// Entra ID sign-in also finds the member by it (`docs/entra-sign-in.md`), so it must be
+    /// unique across members, ignoring case (`pmos lint`: `team-duplicate`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     /// GitHub login in your GitHub org. Optional: linking GitHub checks this login when it is
