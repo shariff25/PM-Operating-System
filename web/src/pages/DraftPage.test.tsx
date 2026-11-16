@@ -420,3 +420,24 @@ describe('untrusted draft text (review findings 1, 2 and 5)', () => {
     expect(screen.getByText(/not a web link/)).toBeInTheDocument();
   });
 });
+
+describe('the outcome banner after approving', () => {
+  it('has no Open it button when the draft has no result link', async () => {
+    renderApp({
+      hash: '/d/apr_done',
+      wrap: (a: Api) => {
+        const orig = a.getDraft.bind(a);
+        a.getDraft = async (id) => ({ ...(await orig(id)), result_url: null });
+        return a;
+      },
+    });
+    await screen.findByText(copy.approve.approvedNoLink);
+    expect(screen.queryByRole('link', { name: copy.approve.resultLink })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: copy.approve.resultLink })).not.toBeInTheDocument();
+  });
+
+  it('has the Open it link when the draft has one', async () => {
+    open('apr_done');
+    expect(await screen.findByRole('link', { name: copy.approve.resultLink })).toHaveAttribute('href', 'https://example.com/wiki/weekly-9-nov');
+  });
+});
