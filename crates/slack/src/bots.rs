@@ -75,6 +75,9 @@ pub struct BotsConfig {
     pub response_url_prefix: String,
     /// `PMOS_SLACK_STATE_DIR`: the reply cards' snoozes are kept here (`snoozes.json`).
     pub state_dir: PathBuf,
+    /// `PMOS_WEB_PUBLIC_URL`: the web app's `https://` origin, without a trailing `/`. Set,
+    /// the Confluence and Jira approval cards get an **Open in workspace** button.
+    pub web_url: Option<String>,
 }
 
 /// An acknowledgement that has to wait for an answer, and the work after it. It resolves
@@ -209,6 +212,11 @@ impl Bots {
 
     pub fn toolserver(&self) -> &ToolServer {
         &self.inner.cfg.toolserver
+    }
+
+    /// The web app's origin (`PMOS_WEB_PUBLIC_URL`), for the **Open in workspace** button.
+    pub fn web_url(&self) -> Option<&str> {
+        self.inner.cfg.web_url.as_deref()
     }
 
     pub fn team(&self) -> TeamFile {
@@ -784,8 +792,8 @@ impl Bots {
             cards::approval_closed(&item, &line)
         } else {
             match flip {
-                Flip::Reasons => cards::approval_reasons(&item),
-                Flip::Back => cards::approval_card(&item),
+                Flip::Reasons => cards::approval_reasons(&item, self.web_url()),
+                Flip::Back => cards::approval_card(&item, self.web_url()),
             }
         };
         self.update(&click.channel, &click.message_ts, card).await;
@@ -961,6 +969,7 @@ impl Bots {
             Err(ApiError::Unavailable) => cards::approval_retry(
                 item,
                 "PM OS couldn't reach the tool server, so nothing was decided. Try again.",
+                self.web_url(),
             ),
             Err(ApiError::Refused { code, body, .. }) if code == "audience_blocked" => {
                 tracing::info!(approval = %item["id"], "reply blocked by the audience check");
@@ -987,6 +996,7 @@ impl Bots {
                     item,
                     "PM OS couldn't check who is in the channel (Slack didn't answer), so \
                      nothing was posted. Try again in a minute.",
+                    self.web_url(),
                 )
             }
             Err(ApiError::Refused { error, .. }) => {
@@ -1005,7 +1015,11 @@ impl Bots {
                         );
                         cards::approval_closed(&now, &line)
                     }
-                    _ => cards::approval_retry(item, &format!("That didn't go through: {why}")),
+                    _ => cards::approval_retry(
+                        item,
+                        &format!("That didn't go through: {why}"),
+                        self.web_url(),
+                    ),
                 }
             }
         };

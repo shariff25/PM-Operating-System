@@ -55,6 +55,21 @@ fn triage_config(default_tz: &str) -> Result<Option<TriageConfig>> {
     }))
 }
 
+/// `PMOS_WEB_PUBLIC_URL`, the web app's origin: unset is `None`; otherwise it must be an
+/// `https://` URL with no spaces or Slack markup characters. A trailing `/` is dropped.
+fn web_public_url(raw: Option<String>) -> Result<Option<String>> {
+    let Some(url) = raw.map(|u| u.trim().trim_end_matches('/').to_string()) else {
+        return Ok(None);
+    };
+    let rest = url.strip_prefix("https://").unwrap_or_default();
+    if rest.is_empty() || url.chars().any(|c| c.is_whitespace() || "<>|".contains(c)) {
+        return Err(anyhow!(
+            "PMOS_WEB_PUBLIC_URL must be the web app's https:// address, such as https://pm.example.com"
+        ));
+    }
+    Ok(Some(url))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -77,6 +92,7 @@ async fn main() -> Result<()> {
     if !team_file.is_file() {
         return Err(anyhow!("{} not found", team_file.display()));
     }
+    let web_url = web_public_url(optional("PMOS_WEB_PUBLIC_URL"))?;
     let slack_url = optional("PMOS_SLACK_URL").unwrap_or_else(|| "https://slack.com".into());
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -104,6 +120,7 @@ async fn main() -> Result<()> {
                 github_org: optional("PMOS_GITHUB_ORG"),
                 response_url_prefix: SLACK_RESPONSE_URL_PREFIX.into(),
                 state_dir: state_dir.clone(),
+                web_url: web_url.clone(),
             }))
         }
         None => {
@@ -177,5 +194,31 @@ async fn main() -> Result<()> {
             "Socket Mode is turned off for this Slack app; turn it on in the app's settings"
         )),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::web_public_url;
+
+    #[test]
+    fn web_url_is_optional_and_must_be_https() {
+        assert_eq!(web_public_url(None).unwrap(), None);
+        assert_eq!(
+            web_public_url(Some("https://pm.example.com/".into())).unwrap(),
+            Some("https://pm.example.com".into())
+        );
+        for bad in [
+            "http://pm.example.com",
+            "pm.example.com",
+            "https://",
+            "https://a b.com",
+            "https://x.com|y",
+        ] {
+            assert!(
+                web_public_url(Some(bad.into())).is_err(),
+                "{bad} is refused"
+            );
+        }
     }
 }
