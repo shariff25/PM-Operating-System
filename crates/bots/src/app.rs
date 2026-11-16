@@ -311,9 +311,14 @@ async fn create_task(
             "only the evals client sets a task's level; a PM's own level comes from their settings",
         ));
     }
-    if req.conversation.is_some() && !matches!(caller.kind, ClientKind::Slack | ClientKind::Web) {
+    if req.conversation.is_some()
+        && !matches!(
+            caller.kind,
+            ClientKind::Slack | ClientKind::Web | ClientKind::Evals
+        )
+    {
         return Err(forbidden(
-            "only the web and Slack clients name a task's conversation",
+            "only the web, Slack and evals clients name a task's conversation",
         ));
     }
     match caller.kind {
