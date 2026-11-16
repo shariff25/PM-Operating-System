@@ -53,7 +53,43 @@ pub struct Report {
     pub tasks: Vec<TaskReport>,
 }
 
-/// One attempt's line in a report.
+/// One turn of a thread attempt. The report keeps no answer text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TurnReport {
+    /// The turn's place in the thread, from 1.
+    pub turn: u32,
+    pub ask: String,
+    /// The turn has an `expect`, so it was graded.
+    pub graded: bool,
+    /// The turn was never asked, because an earlier turn didn't settle.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
+    pub passed: bool,
+    pub task_id: Option<String>,
+    pub status: Option<String>,
+    pub failures: Vec<Check>,
+    pub tag: Option<Tagged>,
+    pub queue_secs: Option<f64>,
+    pub total_secs: Option<f64>,
+}
+
+impl TurnReport {
+    /// `pass`, `FAIL`, `not graded` or `not run`.
+    pub fn verdict(&self) -> &'static str {
+        if self.skipped {
+            "not run"
+        } else if !self.graded && self.passed {
+            "not graded"
+        } else if self.passed {
+            "pass"
+        } else {
+            "FAIL"
+        }
+    }
+}
+
+/// One attempt's line in a report. For a thread task, it is the whole thread: `failures` and
+/// `tag` are those of the first failed turn, `failed_turn` says which, and `turns` has each.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskReport {
     pub id: String,
@@ -80,6 +116,12 @@ pub struct TaskReport {
     pub trace_read: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub judges: Vec<JudgeVerdict>,
+    /// A thread task: each turn's result, in order. Empty for a single `ask`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<TurnReport>,
+    /// A thread task that failed: the first turn that failed, from 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_turn: Option<u32>,
 }
 
 /// Whether `passed` of `total` meets `bar`.
@@ -380,6 +422,26 @@ impl Report {
             }
         }
 
+        let threads: Vec<&TaskReport> = self.tasks.iter().filter(|t| !t.turns.is_empty()).collect();
+        if !threads.is_empty() {
+            let _ = writeln!(s, "\n## Threads\n");
+            let _ = writeln!(
+                s,
+                "Each turn is its own runtime task in one conversation. A thread passes only if every graded turn does.\n"
+            );
+            for t in threads {
+                let result = if t.passed { "pass" } else { "**FAIL**" };
+                if self.repeats > 1 {
+                    let _ = writeln!(s, "- `{}`, run {}: {result}", t.id, t.repeat);
+                } else {
+                    let _ = writeln!(s, "- `{}`: {result}", t.id);
+                }
+                for line in turn_lines(t) {
+                    let _ = writeln!(s, "  - {}", cell(&line));
+                }
+            }
+        }
+
         if let Some((name, prev)) = previous {
             let _ = writeln!(s, "\n## Compared with the previous run\n");
             let _ = writeln!(s, "Previous run: `{name}` ({}).\n", prev.date);
@@ -408,6 +470,9 @@ impl Report {
                         cell(&tagged.reason)
                     );
                 }
+                if let Some(n) = t.failed_turn {
+                    let _ = writeln!(s, "- **Failed at:** turn {n} of {}", t.turns.len());
+                }
                 for f in &t.failures {
                     let _ = writeln!(s, "- {}", cell(&f.to_string()));
                 }
@@ -424,11 +489,45 @@ fn tag_label(t: &Tagged) -> String {
 }
 
 fn why(t: &TaskReport) -> String {
-    t.failures
+    let checks = t
+        .failures
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
-        .join("; ")
+        .join("; ");
+    match t.failed_turn {
+        Some(n) => format!("turn {n}: {checks}"),
+        None => checks,
+    }
+}
+
+/// One line per turn of a thread attempt.
+fn turn_lines(t: &TaskReport) -> Vec<String> {
+    t.turns
+        .iter()
+        .map(|u| {
+            let mut line = format!("turn {}: {}", u.turn, u.verdict());
+            if let Some(x) = &u.tag {
+                line.push_str(&format!(" ({})", tag_label(x)));
+            }
+            if let Some(st) = &u.status {
+                line.push_str(&format!(", {st}"));
+            }
+            if let Some(n) = &u.total_secs {
+                line.push_str(&format!(", {n:.1} s"));
+            }
+            if !u.failures.is_empty() {
+                let f = u
+                    .failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                line.push_str(&format!(": {f}"));
+            }
+            line
+        })
+        .collect()
 }
 
 fn pct(x: f64) -> String {
