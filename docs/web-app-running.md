@@ -82,6 +82,7 @@ Related settings on other services:
 | --- | --- | --- |
 | Runtime (`pmos-bots`) | `PMOS_BOTS_TOKENS` | Must list `web=<token>`. |
 | Slack service | `PMOS_WEB_PUBLIC_URL` | An `https://` address. Set, the Slack cards link to the app; unset, they don't. |
+| Slack service | `PMOS_WEB_URL`, `PMOS_WEB_BRIEF_TOKEN` | pmos-web's address as the Slack service reaches it, and the same token as pmos-web's `PMOS_WEB_BRIEF_TOKEN`. Both set: each daily brief fills the home page's brief panels (`docs/daily-brief.md`, "The web app's panels"); pmos-web also needs `PMOS_WEB_BRIEF=1`. In `deploy/.env`: `PMOS_WEB_BRIEF=1` and `PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8770`. |
 
 ## Deploy it (the Spark)
 

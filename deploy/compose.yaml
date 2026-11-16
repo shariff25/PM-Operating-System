@@ -179,6 +179,9 @@ services:
       PMOS_CONSOLE_PUBLIC_URL: ${PMOS_CONSOLE_PUBLIC_URL:-}
       # The web app's https:// address, for the "Open in workspace" button. Blank: no button.
       PMOS_WEB_PUBLIC_URL: ${PMOS_WEB_PUBLIC_URL:-}
+      # Each daily brief also goes to the web app's home page; blank URL: off.
+      PMOS_WEB_URL: ${PMOS_WEB_BRIEF_URL:-}
+      PMOS_WEB_BRIEF_TOKEN: ${PMOS_WEB_BRIEF_TOKEN:-}
     volumes:
       - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
       - ${PMOS_STATE_DIR}/slack:/var/lib/pmos/slack
@@ -235,6 +238,8 @@ services:
   web:
     <<: *service
     command: ["pmos-web"]
+    networks:
+      pmos: { aliases: [web.pmos.internal] }
     ports: ["127.0.0.1:8770:8770"]
     environment:
       PMOS_WEB_BIND: 0.0.0.0:8770
@@ -248,6 +253,9 @@ services:
       # The built app, baked into the image (deploy/Dockerfile).
       PMOS_WEB_STATIC_DIR: /usr/share/pmos/web
       PMOS_WEB_PUBLIC_URL: ${PMOS_WEB_PUBLIC_URL:-}
+      # The daily brief panels, filled by the Slack service with the shared token.
+      PMOS_WEB_BRIEF: ${PMOS_WEB_BRIEF:-0}
+      PMOS_WEB_BRIEF_TOKEN: ${PMOS_WEB_BRIEF_TOKEN:-}
     volumes:
       - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
     depends_on:

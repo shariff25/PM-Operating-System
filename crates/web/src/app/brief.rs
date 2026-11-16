@@ -6,10 +6,10 @@
 //! `404 not_found`. Drafting makes a task for the PM's personal bot; its draft then arrives
 //! as an ordinary approval, and nothing is posted without the PM approving it.
 //!
-//! **Nothing calls the internal route yet.** It is the seam for the Slack brief routine (or a
-//! later job) to fill a PM's day: it needs `PMOS_WEB_BRIEF_TOKEN` as a bearer token, replaces
-//! that PM's follow-ups and `changed` items, and checks every field (counts, lengths, one-line
-//! text, `http`/`https` urls) before anything is stored.
+//! **The internal route** is how the Slack service fills a PM's day when their daily brief
+//! finishes (`crates/slack/src/brief_feed.rs`): it needs `PMOS_WEB_BRIEF_TOKEN` as a bearer
+//! token, replaces that PM's follow-ups and `changed` items, and checks every field (counts,
+//! lengths, one-line text, `http`/`https` urls) before anything is stored.
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};

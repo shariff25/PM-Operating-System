@@ -6,8 +6,9 @@ links to its source, and a line with no source is not shown. A quiet day gets on
 
 This is the design for the whole feature. Part 1 is built from the tools that exist today (the
 `daily-brief` skill, `content/skills/daily-brief/SKILL.md`, and its benchmark, `evals/categories/
-daily-brief/`). The follow-up tracker, the web endpoint and the Slack buttons are a later slice
-(part 4). The gaps that stop today's version being fully reliable are in part 3.
+daily-brief/`). Each brief also fills the web app's home page ("The web app's panels",
+below). The follow-up tracker's reconciliation and the Slack buttons are a later slice (part 4).
+The gaps that stop today's version being fully reliable are in part 3.
 
 ```
 Morning, Ana. Four things moved overnight, two people are waiting on you, and one question of
@@ -93,6 +94,64 @@ typed alone in a DM, in any case:
     `crate::brief::note_delivery(&self.bots, item).await;`
     It reads the notification's `requested_by` and `routine_id` and checks the routine with
     `is_brief_routine`, then calls `nudges::record_daily_message`.
+
+### The web app's panels
+
+The web app's home page shows the same day in three panels, "What changed", "Waiting on you"
+and "You're waiting on", from pmos-web's `GET /api/brief` (`docs/web-api.md`, "The daily brief
+and follow-ups"). The Slack service fills them:
+
+1. **The skill ends every brief with one block** (`content/skills/daily-brief/SKILL.md`, "The
+   block for the web app"): a fenced block with the info string `pmos-brief` holding one JSON
+   object, on a quiet day too (empty lists).
+
+   ```pmos-brief
+   {"version": 1, "date": "2026-11-16",
+    "changed": [{"system": "jira", "title": "PAY-212 moved to Blocked", "summary": "waiting on the vendor sandbox", "url": "https://…"}],
+    "waiting_on_you": [{"system": "slack", "who": "Ben", "summary": "asked about SAML SSO for the console", "url": "https://…", "asked_on": "2026-11-14"}],
+    "you_wait_on": [{"system": "slack", "who": "Legal", "summary": "your question about the DPA", "url": "https://…"}]}
+   ```
+
+   `version` is required and is `1`; every other key is optional, and no other key is allowed.
+   `summary` is optional for `changed` items. `asked_on` (`YYYY-MM-DD`) becomes the
+   follow-up's `created_at` (that day's start in UTC, or now if that is later), so the web app
+   shows its age.
+2. **Slack takes it out** (`crates/slack/src/notify.rs`, through `brief_feed::split`): every
+   answer from the notification feed loses its `pmos-brief` block before it is posted, so the
+   PM never sees JSON in Slack, whether or not the feed to the web app is on.
+3. **Slack checks it, all or nothing** (`brief_feed::parse`): valid JSON with only the keys
+   above; at most 50 items a list; `title` and `summary` one line of at most 200 characters,
+   `who` at most 80; no control characters and no Slack markup (`<@…>`, `<#…>`, `<!…>`, a sign
+   of pasted message text); `system` lower-case letters, digits, `-` and `_`, at most 32;
+   every `url` `http` or `https` with a host and no credentials, at most 2,000 characters; the
+   body at most 128 KiB. These are pmos-web's own limits. A second block, a block with no
+   closing fence, or any broken rule means nothing is sent, and a warning is logged with the
+   rule (never the content). The brief is delivered in Slack as usual.
+4. **Slack sends it** when the brief's task is `done`, its bot is the requester's own
+   personal bot (`pm-<handle>`) and the requester is on the team: `PUT
+   /internal/brief/{handle}` with `Authorization: Bearer <PMOS_WEB_BRIEF_TOKEN>` and the body
+   `{date?, changed: [{system, title, summary, url}], waiting_on_you: [{system, who, summary,
+   url, created_at?}], you_wait_on: [...]}`. That replaces the PM's panels, so a quiet day
+   empties them. It runs in the background with a 10-second limit: a failure (pmos-web down,
+   a `4xx` or `5xx`) is logged at warn with the handle and the reason and never delays or fails
+   the Slack brief. A success logs the handle and the three counts. The token, the text and the
+   urls are never logged.
+
+`brief now` and a brief the PM asks for in a DM are sent the same way as the routine's.
+
+**Configuration** (the Slack service): `PMOS_WEB_URL`, pmos-web's base URL as the Slack
+service reaches it (`http://127.0.0.1:8770`), and `PMOS_WEB_BRIEF_TOKEN`, the same token
+pmos-web has. With either unset the feed is off: the block is still taken out, nothing is sent.
+pmos-web needs `PMOS_WEB_BRIEF=1` and the same `PMOS_WEB_BRIEF_TOKEN`
+(`crates/web/README.md`). `scripts/claude-test-stack.sh` with `PMOS_TEST_WEB=1` sets all of it;
+on the server, `deploy/setup.sh` generates the token, and `PMOS_WEB_BRIEF=1` with
+`PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8770` in `deploy/.env` turns it on.
+
+**Privacy.** A `summary` is a paraphrase the skill wrote, never Slack message text; the skill
+says so, and Slack refuses one with Slack markup. pmos-web keeps Slack follow-ups for 24 hours
+and the others for a week, and the day's `changed` items for 24 hours, and deletes them after
+(`crates/web/src/followups.rs`). The block is part of the task's `result` in the runtime, like
+the brief itself (gap 10).
 
 ## 2. What the skill can do today
 
@@ -187,7 +246,9 @@ rows, so "stays until answered" does not depend on search recall (gap 1).
 **The web app.** `GET /api/brief` returns `Brief` exactly as `docs/web-api.md` already fixes it:
 `{date, changed, waiting_on_you, you_wait_on}`, where each follow-up row has `id`, `system`,
 `who`, `summary`, `url` and `age_days`. Every row has a `url`. It answers `501 {"code":"not_built"}`
-until the tracker exists, and the app then hides that part of the home page. `POST
+while pmos-web's `PMOS_WEB_BRIEF` is off, and the app then hides that part of the home page.
+Today pmos-web keeps the rows itself, filled from each brief (part 1, "The web app's panels");
+a follow-up sent again keeps its age and a dismissal. `POST
 /api/followups/{id}/dismiss` ("Not mine") answers `204`. `POST /api/followups/{id}/draft` answers
 `201 Task`: a task that runs the skill's draft step for that follow-up and ends as an approval
 draft.
