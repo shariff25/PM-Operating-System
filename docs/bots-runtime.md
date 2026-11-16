@@ -169,7 +169,7 @@ A follow-up in a thread is claimed with the thread's earlier turns, so "customer
   (or Slack) client names on `POST /v1/tasks` (1 to 128 of `A-Z a-z 0-9 . _ : -`; `403` from
   any other client, `400` if malformed). The id is only a label: it is matched within the
   same requester and bot, so naming another PM's id finds nothing. Only interactive tasks
-  (`slack`, `web`, `cli`) have a thread; routines and evals always start fresh.
+  (`slack`, `web`, `cli`) have a thread; routines always start fresh, and so does an eval task unless it names a `conversation` (a benchmark thread).
 - **The turns:** earlier tasks with the same bot, the same `requested_by` and the same
   thread, created before this one and no longer `queued` or `working`. Each is
   `{text, result?, error?, status, at}`, oldest first, in the claim's `history`.

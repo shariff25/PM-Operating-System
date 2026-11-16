@@ -247,7 +247,10 @@ impl Task {
     /// CLI) have one; routines and evals always start fresh. The prefixes keep a client's
     /// conversation id from ever matching a Slack thread.
     pub fn thread_key(&self) -> Option<String> {
-        if self.source.priority() != Priority::Interactive {
+        // A benchmark thread (docs/evals.md) names its conversation, so its turns carry
+        // history like a PM's; every other eval task, and every routine, starts fresh.
+        let eval_thread = self.source == Source::Eval && self.conversation.is_some();
+        if self.source.priority() != Priority::Interactive && !eval_thread {
             return None;
         }
         if let Some(c) = &self.conversation {

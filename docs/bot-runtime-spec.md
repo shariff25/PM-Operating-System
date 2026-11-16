@@ -126,7 +126,7 @@ an answer to the bot's last question.
 - **The thread:** for a Slack task, its `slack {channel, thread_ts}`; for a web task, the
   optional `conversation` id (1 to 128 of `A-Z a-z 0-9 . _ : -`) on `POST /v1/tasks`. Only
   clients `web` and `slack` may set it (`403` otherwise). Only interactive tasks have a
-  thread; routines and evals start fresh.
+  thread; routines start fresh, and so does an eval task unless it names a `conversation` (a benchmark thread, `docs/evals.md`).
 - **Whose turns:** earlier tasks of the same bot, the same `requested_by` and the same
   thread, no longer `queued` or `working`. Never another PM's, never another bot's.
 - **In the claim:** `history: [{text, result?, error?, status, at}]`, oldest first: the
