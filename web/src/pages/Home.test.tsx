@@ -116,7 +116,7 @@ describe('thread', () => {
     }
   });
 
-  it('shows one live status line with the latest milestone while working', async () => {
+  it('shows one live status line with the latest milestone and the progress while working', async () => {
     const working: Task = {
       id: 'tsk_live',
       bot: 'pm-ana',
@@ -127,11 +127,11 @@ describe('thread', () => {
       draft_ids: [],
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
+      progress: { done: 2, total: 3 },
+      retrying: false,
       events: [
-        { at: '2026-11-16T09:00:00Z', kind: 'queued', text: 'Queued' },
         { at: '2026-11-16T09:00:01Z', kind: 'milestone', text: 'Reading Jira' },
-        { at: '2026-11-16T09:00:02Z', kind: 'progress', text: '1 of 3 done' },
-        { at: '2026-11-16T09:00:03Z', kind: 'claimed', text: 'Claimed by pm-ana' },
+        { at: '2026-11-16T09:00:03Z', kind: 'milestone', text: 'Drafting in Confluence' },
       ],
     };
     renderApp({
@@ -141,11 +141,65 @@ describe('thread', () => {
         return api;
       },
     });
-    await waitFor(() => expect(document.querySelector('.live-line')).toHaveTextContent('Reading Jira'));
+    await waitFor(() => expect(document.querySelector('.live-line')).toHaveTextContent('Drafting in Confluence'));
     expect(document.querySelector('.live-line')).toHaveAttribute('role', 'status');
     expect(screen.getAllByRole('status').filter((s) => s.classList.contains('live-line'))).toHaveLength(1);
-    expect(screen.queryByText('1 of 3 done')).not.toBeInTheDocument();
-    expect(screen.queryByText('Claimed by pm-ana')).not.toBeInTheDocument();
+    expect(document.querySelector('.live-line')).toHaveTextContent('2 of 3');
+    const bar = screen.getByRole('progressbar', { name: copy.task.progressLabel });
+    expect(bar).toHaveAttribute('aria-valuenow', '2');
+    expect(bar).toHaveAttribute('aria-valuemax', '3');
+    expect(screen.queryByText(copy.modelBusy)).not.toBeInTheDocument();
+  });
+
+  it('shows no bar and no count when the task has no progress, and never "0 of 0"', async () => {
+    const base: Task = {
+      id: 'tsk_live', bot: 'pm-ana', text: 'what is blocked', status: 'working', result: null, error: null, draft_ids: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(), progress: { done: 0, total: 0 }, events: [],
+    };
+    renderApp({ hash: '/a/tsk_live', wrap: (api) => { api.getTask = async () => structuredClone(base); return api; } });
+    await waitFor(() => expect(document.querySelector('.live-line')).toHaveTextContent(copy.task.status.working));
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
+    expect(screen.queryByText('0 of 0')).not.toBeInTheDocument();
+  });
+
+  it('says the model is catching its breath only while retrying is true', async () => {
+    let retrying = true;
+    const base: Task = {
+      id: 'tsk_live', bot: 'pm-ana', text: 'what is blocked', status: 'working', result: null, error: null, draft_ids: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(), progress: null, events: [],
+    };
+    renderApp({
+      hash: '/a/tsk_live',
+      wrap: (api) => {
+        api.getTask = async () => structuredClone({ ...base, retrying });
+        return api;
+      },
+    });
+    await screen.findByText(copy.modelBusy);
+    retrying = false;
+    await waitFor(() => expect(screen.queryByText(copy.modelBusy)).not.toBeInTheDocument());
+  });
+
+  it('keeps the same space for the status block when a bar and a retry note appear', async () => {
+    // The note and the bar live in reserved rows, so they exist before they have content.
+    const base: Task = {
+      id: 'tsk_live', bot: 'pm-ana', text: 'q', status: 'working', result: null, error: null, draft_ids: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(), progress: null, events: [],
+    };
+    renderApp({ hash: '/a/tsk_live', wrap: (api) => { api.getTask = async () => structuredClone(base); return api; } });
+    await waitFor(() => expect(document.querySelector('.live-sub')).not.toBeNull());
+    expect(document.querySelector('.live-sub .progress')).not.toBeNull();
+    expect(document.querySelector('.live-sub .live-note')).not.toBeNull();
+  });
+
+  it('shows an empty state with Try again when a task finished with nothing to show', async () => {
+    const done: Task = {
+      id: 'tsk_none', bot: 'pm-ana', text: 'q', status: 'done', result: null, error: null, draft_ids: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(), progress: null, events: [],
+    };
+    renderApp({ hash: '/a/tsk_none', wrap: (api) => { api.getTask = async () => structuredClone(done); return api; } });
+    await screen.findByText(copy.task.noResult);
+    expect(screen.getByRole('button', { name: copy.task.tryAgain })).toBeInTheDocument();
   });
 
   it('shows a produced draft as a card with its title, kind and Open draft', async () => {

@@ -1,18 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import { ApiError, REJECT_REASONS } from '../api';
-import type { Draft, RejectReason, Suggestion } from '../api';
+import type { Draft, HintName, RejectReason, Suggestion } from '../api';
 import { messageOf, useApp } from '../app-context';
 import { ApproveDialog } from '../components/ApproveDialog';
-import { ErrorNote, ExtLink, Hint, HintAnchor, Markdown, Skeleton, StrippedNote } from '../components/bits';
+import { Empty, ErrorNote, ExtLink, Hint, Markdown, Skeleton, StrippedNote } from '../components/bits';
 import { Icon, kindIcon, systemIcon } from '../components/icons';
 import { TopBarActions, TopBarLead, useShell } from '../components/Shell';
 import { useToast } from '../components/Toasts';
 import { copy } from '../copy';
 import { useData } from '../data';
-import { diffLines } from '../diff';
+import { diffBlocks, diffLines } from '../diff';
 import type { DiffLine } from '../diff';
 import { isExpired } from '../drafts';
+import { usePoll } from '../polling';
 import { renderMarkdown } from '../markdown';
 import { longTime, relTime, timeLeft } from '../time';
 import { taskHref } from '../url';
@@ -22,37 +23,78 @@ type SaveState = 'saved' | 'saving' | 'error';
 type ApproveErrorKey = keyof typeof copy.approve.errors;
 type PanelTab = 'doc' | 'sources' | 'ask' | 'details';
 
-/** Changed lines with one line of context; long unchanged runs fold into a count. */
+/** The words of a line; the ones that changed get an inline highlight. */
+function LineText({ line }: { line: DiffLine }) {
+  if (!line.parts) return <span className="ba-text">{line.text}</span>;
+  return (
+    <span className="ba-text">
+      {line.parts.map((p, i) =>
+        p.changed ? (
+          line.kind === 'added' ? <ins key={i} className="ba-word">{p.text}</ins> : <del key={i} className="ba-word">{p.text}</del>
+        ) : (
+          <span key={i}>{p.text}</span>
+        ),
+      )}
+    </span>
+  );
+}
+
+/**
+ * Before and after, by paragraph. Changed paragraphs show the old line and the new line with
+ * the changed words highlighted; a run of unchanged paragraphs folds into one row that opens.
+ */
 function BeforeAfter({ diff }: { diff: DiffLine[] }) {
-  const changedAt = (i: number) => diff[i] !== undefined && diff[i]!.kind !== 'same';
-  const keep = diff.map((_, i) => changedAt(i) || changedAt(i - 1) || changedAt(i + 1));
-  const out: ReactNode[] = [];
-  let folded = 0;
-  const flush = (key: string) => {
-    if (folded > 0) out.push(<li key={key} className="ba-fold">{copy.panel.unchanged(folded)}</li>);
-    folded = 0;
-  };
-  diff.forEach((l, i) => {
-    if (!keep[i]) {
-      folded++;
-      return;
+  const blocks = useMemo(() => diffBlocks(diff), [diff]);
+  const [open, setOpen] = useState<Set<number>>(new Set());
+  const items: ReactNode[] = [];
+  let i = 0;
+  while (i < blocks.length) {
+    const block = blocks[i]!;
+    if (block.changed) {
+      items.push(
+        <li key={i} className="ba-block">
+          {block.lines.map((l, k) => (
+            <p key={k} className={`ba-line ba-${l.kind}`}>
+              <span className="sr-only">
+                {l.kind === 'added' ? copy.draft.diffAdded : l.kind === 'removed' ? copy.draft.diffRemoved : copy.draft.diffSame}
+              </span>
+              <LineText line={l} />
+            </p>
+          ))}
+        </li>,
+      );
+      i++;
+      continue;
     }
-    flush(`f${i}`);
-    // Blank lines carry no words to read; the lines around them show the change.
-    if (!l.text.trim()) return;
-    out.push(
-      <li key={i} className={`ba-line ba-${l.kind}`}>
-        <span className={l.kind === 'same' ? 'sr-only' : 'ba-tag'}>
-          {l.kind === 'added' ? copy.draft.diffAdded : l.kind === 'removed' ? copy.draft.diffRemoved : copy.draft.diffSame}
-        </span>
-        <span className="ba-text">{l.text || ' '}</span>
+    const start = i;
+    while (i < blocks.length && !blocks[i]!.changed) i++;
+    const run = blocks.slice(start, i);
+    const isOpen = open.has(start);
+    items.push(
+      <li key={`f${start}`} className="ba-fold">
+        <button
+          type="button"
+          className="ba-fold-btn"
+          aria-expanded={isOpen}
+          onClick={() =>
+            setOpen((o) => {
+              const n = new Set(o);
+              if (n.has(start)) n.delete(start);
+              else n.add(start);
+              return n;
+            })
+          }
+        >
+          <Icon name={isOpen ? 'chevronDown' : 'chevronRight'} size={13} />
+          {copy.panel.unchanged(run.length)}
+        </button>
+        {isOpen && run.map((b, k) => b.lines.map((l, m) => <p key={`${k}-${m}`} className="ba-line ba-same">{l.text}</p>))}
       </li>,
     );
-  });
-  flush('f-end');
+  }
   return (
-    <ol className="before-after" aria-label="Before and after">
-      {out}
+    <ol className="before-after" aria-label={copy.draft.beforeAfter}>
+      {items}
     </ol>
   );
 }
@@ -90,6 +132,9 @@ export function DraftPage({ id }: { id: string }) {
   const [rejectError, setRejectError] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const rejectBox = useRef<HTMLDivElement>(null);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreBtn = useRef<HTMLButtonElement>(null);
+  const moreItems = useRef<(HTMLButtonElement | null)[]>([]);
 
   // What the PM reads is the saved text. Links and stripped parts come from the same rendering.
   const rendered = useMemo(() => renderMarkdown(draft?.body ?? ''), [draft?.body]);
@@ -129,32 +174,34 @@ export function DraftPage({ id }: { id: string }) {
   }, [load]);
 
   // Poll a working suggestion.
-  useEffect(() => {
-    if (suggestion?.status !== 'working') return;
-    let cancelled = false;
-    const timer = setTimeout(async () => {
+  usePoll(
+    suggestion?.status === 'working',
+    async () => {
       try {
-        const next = await api.getSuggestion(id);
-        if (!cancelled) setSuggestion(next);
+        setSuggestion(await api.getSuggestion(id));
       } catch (e) {
-        if (!cancelled) setChangeError(messageOf(e, copy.errors.unknown));
+        setChangeError(messageOf(e, copy.errors.unknown));
       }
-    }, pollMs);
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [suggestion, api, id, pollMs]);
+    },
+    pollMs,
+  );
 
-  // The reject popover closes on Escape and on a click outside it.
+  // The reject popover and the phone's More menu close on a click outside them.
   useEffect(() => {
-    if (!rejecting) return;
+    if (!rejecting && !moreOpen) return;
     const away = (e: MouseEvent) => {
-      if (rejectBox.current && !rejectBox.current.contains(e.target as Node)) setRejecting(false);
+      if (rejectBox.current && !rejectBox.current.contains(e.target as Node)) {
+        setRejecting(false);
+        setMoreOpen(false);
+      }
     };
     document.addEventListener('mousedown', away);
     return () => document.removeEventListener('mousedown', away);
-  }, [rejecting]);
+  }, [rejecting, moreOpen]);
+
+  useEffect(() => {
+    if (moreOpen) moreItems.current[0]?.focus();
+  }, [moreOpen]);
 
   // On phone the document is a tab; on desktop it is always shown.
   useEffect(() => {
@@ -371,81 +418,153 @@ export function DraftPage({ id }: { id: string }) {
   const left = pending ? timeLeft(draft.expires_at) : null;
 
   // ---- The header actions: save state, Edit, Reject, and the one primary action. ----
-  const actions = pending ? (
-    <div className="draft-actions">
-      <span role="status" className={`save-state save-${chipTone}`}>
-        <span className="save-dot" aria-hidden="true" />
-        {saveChip}
-      </span>
-      {!editing && (
-        <button type="button" className="btn" onClick={startEdit}>
-          <Icon name="edit" size={16} />
-          {copy.draft.edit}
+  const rejectPopover = rejecting && (
+    <div
+      id="reject-pop"
+      className="popover"
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setRejecting(false);
+        }
+      }}
+    >
+      <fieldset className="reject">
+        <legend>{copy.reject.heading}</legend>
+        {REJECT_REASONS.map((r) => (
+          <label key={r} className="radio">
+            <input type="radio" name="reject-reason" checked={reason === r} onChange={() => setReason(r)} />
+            {copy.reject.reasons[r]}
+          </label>
+        ))}
+      </fieldset>
+      {rejectError && <ErrorNote>{rejectError}</ErrorNote>}
+      <div className="popover-foot">
+        <button type="button" className="btn btn-ghost" onClick={() => setRejecting(false)}>
+          {copy.reject.cancel}
         </button>
-      )}
-      <div className="popover-anchor" ref={rejectBox}>
-        <button
-          type="button"
-          className="btn"
-          onClick={() => setRejecting((r) => !r)}
-          aria-expanded={rejecting}
-          aria-controls={rejecting ? 'reject-pop' : undefined}
-        >
-          {isPhone ? (
-            <>
-              <Icon name="x" size={18} />
-              <span className="sr-only">{copy.reject.button}</span>
-            </>
-          ) : (
-            copy.reject.button
-          )}
+        <button type="button" className="btn btn-danger" onClick={() => void reject()}>
+          {copy.reject.confirm}
         </button>
-        {rejecting && (
-          <div
-            id="reject-pop"
-            className="popover"
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                e.preventDefault();
-                setRejecting(false);
-              }
-            }}
-          >
-            <fieldset className="reject">
-              <legend>{copy.reject.heading}</legend>
-              {REJECT_REASONS.map((r) => (
-                <label key={r} className="radio">
-                  <input type="radio" name="reject-reason" checked={reason === r} onChange={() => setReason(r)} />
-                  {copy.reject.reasons[r]}
-                </label>
-              ))}
-            </fieldset>
-            {rejectError && <ErrorNote>{rejectError}</ErrorNote>}
-            <div className="popover-foot">
-              <button type="button" className="btn btn-ghost" onClick={() => setRejecting(false)}>
-                {copy.reject.cancel}
-              </button>
-              <button type="button" className="btn btn-danger" onClick={() => void reject()}>
-                {copy.reject.confirm}
-              </button>
-            </div>
-          </div>
-        )}
       </div>
-      <HintAnchor>
-        <button
-          type="button"
-          className="btn btn-primary"
-          onClick={openConfirm}
-          disabled={blocked !== null}
-          aria-describedby={blocked ? 'approve-blocked' : undefined}
-        >
-          <Icon name="check" size={16} />
-          {copy.approve.button(draft.kind)}
-        </button>
-        <Hint name="approve" align="end" />
-      </HintAnchor>
     </div>
+  );
+
+  const saveStatus = (
+    <span role="status" className={`save-state save-${chipTone}`}>
+      <span className="save-dot" aria-hidden="true" />
+      {saveChip}
+    </span>
+  );
+  const approveButton = (
+    <button
+      type="button"
+      id="approve-btn"
+      className="btn btn-primary"
+      onClick={openConfirm}
+      disabled={blocked !== null}
+      aria-describedby={blocked ? 'approve-blocked' : undefined}
+    >
+      <Icon name="check" size={16} />
+      {copy.approve.button(draft.kind)}
+    </button>
+  );
+
+  // On a phone the header holds the primary button and one More menu (Edit, Reject).
+  const moreEntries = [
+    ...(!editing ? [{ key: 'edit', label: copy.draft.edit, icon: 'edit' as const, run: startEdit }] : []),
+    { key: 'reject', label: copy.reject.button, icon: 'x' as const, run: () => setRejecting(true) },
+  ];
+  const moreMenu = (
+    <div className="popover-anchor" ref={rejectBox}>
+      <button
+        ref={moreBtn}
+        type="button"
+        className="btn"
+        aria-haspopup="menu"
+        aria-expanded={moreOpen}
+        aria-controls={moreOpen ? 'more-menu' : undefined}
+        onClick={() => {
+          setRejecting(false);
+          setMoreOpen((o) => !o);
+        }}
+      >
+        <Icon name="more" size={18} />
+        {copy.panel.moreShort}
+      </button>
+      {moreOpen && (
+        <div
+          id="more-menu"
+          className="menu-panel more-panel"
+          role="menu"
+          aria-label={copy.panel.more}
+          onKeyDown={(e) => {
+            const cur = moreItems.current.findIndex((el) => el === document.activeElement);
+            const n = moreEntries.length;
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+              e.preventDefault();
+              moreItems.current[(cur + (e.key === 'ArrowDown' ? 1 : -1) + n) % n]?.focus();
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              setMoreOpen(false);
+              moreBtn.current?.focus();
+            } else if (e.key === 'Tab') setMoreOpen(false);
+          }}
+        >
+          {moreEntries.map((m, i) => (
+            <button
+              key={m.key}
+              ref={(el) => { moreItems.current[i] = el; }}
+              type="button"
+              role="menuitem"
+              tabIndex={-1}
+              className="menu-item"
+              onClick={() => {
+                setMoreOpen(false);
+                m.run();
+              }}
+            >
+              <Icon name={m.icon} size={16} />
+              <span className="menu-item-label">{m.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {rejectPopover}
+    </div>
+  );
+
+  const actions = pending ? (
+    isPhone ? (
+      <div className="draft-actions">
+        {saveStatus}
+        {approveButton}
+        {moreMenu}
+      </div>
+    ) : (
+      <div className="draft-actions">
+        {saveStatus}
+        {!editing && (
+          <button type="button" className="btn" onClick={startEdit}>
+            <Icon name="edit" size={16} />
+            {copy.draft.edit}
+          </button>
+        )}
+        <div className="popover-anchor" ref={rejectBox}>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => setRejecting((r) => !r)}
+            aria-expanded={rejecting}
+            aria-controls={rejecting ? 'reject-pop' : undefined}
+          >
+            {copy.reject.button}
+          </button>
+          {rejectPopover}
+        </div>
+        {approveButton}
+      </div>
+    )
   ) : null;
 
   // ---- The panel: sources, ask for a change, details. ----
@@ -486,24 +605,32 @@ export function DraftPage({ id }: { id: string }) {
             {t.count !== undefined && <span className="tab-count">{t.count}</span>}
           </button>
         );
-        if (t.key === 'sources' || t.key === 'ask') {
-          return (
-            <HintAnchor key={t.key}>
-              {button}
-              <Hint name={t.key} align={isPhone || t.key === 'sources' ? 'start' : 'end'} />
-            </HintAnchor>
-          );
-        }
         return button;
       })}
     </div>
   );
 
   const sourcesPanel = draft.sources.length === 0 ? (
-    <div className="empty empty-sm">
-      <span className="empty-icon"><Icon name="link" size={18} /></span>
-      <p>{copy.noSources}</p>
-    </div>
+    <Empty
+      icon="link"
+      small
+      action={
+        pending ? (
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => {
+              setInstruction((t) => t || copy.draft.askSourcesPrefill);
+              setTab('ask');
+            }}
+          >
+            {copy.draft.askSources}
+          </button>
+        ) : undefined
+      }
+    >
+      {copy.noSources}
+    </Empty>
   ) : (
     <ul className="sources">
       {draft.sources.map((s) => (
@@ -521,12 +648,14 @@ export function DraftPage({ id }: { id: string }) {
               {s.excerpt && <span className="source-excerpt">“{s.excerpt}”</span>}
             </span>
           </button>
-          {selected === s.id && (
+          {selected === s.id && (s.url ? (
             <ExtLink href={s.url} className="source-link" label={`: ${s.title}`}>
               {copy.draft.sourceOpen}
               <Icon name="external" size={13} />
             </ExtLink>
-          )}
+          ) : (
+            <p className="source-link source-nolink">{copy.draft.sourceNoLink}</p>
+          ))}
         </li>
       ))}
     </ul>
@@ -609,6 +738,9 @@ export function DraftPage({ id }: { id: string }) {
     </dl>
   );
 
+  // Hints that apply to this draft: the approve and ask hints need a draft that can still be decided.
+  const hintNames = (pending ? ['sources', 'ask', 'approve'] : ['sources']) as HintName[];
+
   const panelBody = { doc: null, sources: sourcesPanel, ask: askPanel, details: detailsPanel }[activeTab];
 
   // ---- The document column ----
@@ -671,6 +803,7 @@ export function DraftPage({ id }: { id: string }) {
         </div>
         {editing ? (
           <div className="editor">
+            <h1 className="sr-only">{draft.title}</h1>
             <label htmlFor="draft-title" className="sr-only">{copy.draft.titleLabel}</label>
             <input
               id="draft-title"
@@ -732,6 +865,8 @@ export function DraftPage({ id }: { id: string }) {
       <>
         <TopBarLead>{crumb}</TopBarLead>
         <div className="workspace workspace-phone">
+          {activeTab !== 'doc' && <h1 className="sr-only">{draft.title}</h1>}
+          {hintNames.map((n) => <Hint key={n} name={n} />)}
           {actions && <div className="phone-actions">{actions}</div>}
           {tabList}
           {activeTab === 'doc' ? (
@@ -754,7 +889,10 @@ export function DraftPage({ id }: { id: string }) {
       <div className="workspace">
         {docColumn}
         <aside className="panel" aria-label={copy.panel.label}>
+          {pending && <Hint name="approve" anchor="approve-btn" />}
           {tabList}
+          <Hint name="sources" anchor="ptab-sources" />
+          {pending && <Hint name="ask" anchor="ptab-ask" />}
           <div role="tabpanel" id={`ppanel-${activeTab}`} aria-labelledby={`ptab-${activeTab}`} className="panel-body">
             {panelBody}
           </div>
