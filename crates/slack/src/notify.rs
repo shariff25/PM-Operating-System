@@ -292,7 +292,9 @@ impl Notifier {
     async fn card(&self, id: &str) -> (String, Value) {
         for attempt in 0..3 {
             match self.bots.toolserver().approval(id).await {
-                Ok(item) if item["status"] == "pending" => return cards::approval_card(&item),
+                Ok(item) if item["status"] == "pending" => {
+                    return cards::approval_card(&item, self.bots.web_url());
+                }
                 Ok(item) => {
                     let line = cards::decision_line(&item, "", false);
                     return cards::approval_closed(&item, &line);
