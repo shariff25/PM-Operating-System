@@ -16,11 +16,11 @@
 use std::collections::BTreeMap;
 
 use pmos_assertion::{
-    Assertion, Key, KeyRing, MemoryReplayCache, RequestBinding, VerifyError, VerifyPolicy,
+    Assertion, KeyRing, KeyUse, MemoryReplayCache, RequestBinding, VerifyError, VerifyPolicy,
 };
 
 /// `PMOS_ASSERTION_KEYS`: the keys, one entry per caller→receiver pair.
-pub const KEYS_VAR: &str = "PMOS_ASSERTION_KEYS";
+pub use pmos_assertion::KEYS_VAR;
 /// `PMOS_ASSERTION_MODE`: `off` (default), `verify` or `require`.
 pub const MODE_VAR: &str = "PMOS_ASSERTION_MODE";
 /// This service's name as an assertion audience.
@@ -61,63 +61,16 @@ impl Mode {
     }
 }
 
-/// Parse `PMOS_ASSERTION_KEYS`: comma-separated entries, one per caller→receiver pair,
-///
-/// ```text
-/// <issuer>:<audience>:<key id>:<base64 key>[:<key id>:<base64 key>]
-/// ```
-///
-/// the current key first, then optionally the previous one (still accepted while a rotation
-/// finishes). Keys are 32 to 64 bytes in standard base64. `wanted` says which pairs this
-/// service uses; an entry for any other pair is refused, so a service never holds a key it
-/// has no use for. Errors name the entry and the pair, never a key.
+/// Parse `PMOS_ASSERTION_KEYS` (`pmos_assertion::parse_key_list`, shared by every service
+/// that signs or checks): comma-separated `<issuer>:<audience>:<key id>:<base64 key>` entries,
+/// optionally followed by the previous key. `wanted` says which pairs this service uses; an
+/// entry for any other pair is refused. Errors name the entry and the pair, never a key.
 pub fn parse_keys(
     spec: &str,
     service: &str,
     wanted: impl Fn(&str, &str) -> bool,
 ) -> Result<BTreeMap<(String, String), KeyRing>, String> {
-    let mut out = BTreeMap::new();
-    let entries = spec.split(',').map(str::trim).filter(|e| !e.is_empty());
-    for (i, entry) in entries.enumerate() {
-        let bad = |why: &str| format!("{KEYS_VAR} entry {}: {why}", i + 1);
-        let parts: Vec<&str> = entry.split(':').map(str::trim).collect();
-        if parts.len() != 4 && parts.len() != 6 {
-            return Err(bad(
-                "expected issuer:audience:key-id:base64-key, optionally followed by \
-                 :key-id:base64-key for the previous key",
-            ));
-        }
-        let (issuer, audience) = (parts[0], parts[1]);
-        if VerifyPolicy::new(audience, &[issuer]).is_err() {
-            return Err(bad(
-                "the issuer and audience must be client names such as `web` and `bots`",
-            ));
-        }
-        if !wanted(issuer, audience) {
-            return Err(bad(&format!(
-                "{issuer}→{audience} is not a pair {service} signs or checks; give each \
-                 service only its own keys"
-            )));
-        }
-        let key = |id: &str, b64: &str, which: &str| {
-            Key::from_base64(id, b64).map_err(|e| bad(&format!("the {which} key: {e}")))
-        };
-        let mut ring = KeyRing::new(key(parts[2], parts[3], "current")?);
-        if parts.len() == 6 {
-            ring = ring
-                .with_previous(key(parts[4], parts[5], "previous")?)
-                .map_err(|e| bad(&e.to_string()))?;
-        }
-        if out
-            .insert((issuer.to_string(), audience.to_string()), ring)
-            .is_some()
-        {
-            return Err(bad(&format!(
-                "{issuer}→{audience} is listed twice; list each pair once, current key first"
-            )));
-        }
-    }
-    Ok(out)
+    pmos_assertion::parse_key_list(spec, service, KeyUse::Checks(AUDIENCE), wanted)
 }
 
 /// Why a call's assertion was refused. Logged; the caller only ever sees one `401`.
@@ -262,7 +215,7 @@ impl Assertions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmos_assertion::Claims;
+    use pmos_assertion::{Claims, Key};
 
     const K1: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
     const K2: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";

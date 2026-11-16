@@ -476,11 +476,24 @@ fn now(state: &AppState) -> DateTime<Utc> {
 pub struct Signed {
     pub member: TeamMember,
     pub session: Session,
+    /// The session's reference for user assertions (`session::assertion_ref`): never the
+    /// session id, and never logged.
+    session_ref: String,
 }
 
 impl Signed {
     fn handle(&self) -> &str {
         &self.member.handle
+    }
+
+    /// The bot runtime, signing as this PM's session.
+    fn runtime(&self, state: &AppState) -> Runtime {
+        state.0.runtime.for_session(&self.session_ref)
+    }
+
+    /// The tool server, signing as this PM's session.
+    fn toolserver(&self, state: &AppState) -> ToolServer {
+        state.0.toolserver.for_session(&self.session_ref)
     }
 
     fn need(&self, permission: Permission) -> Result<(), ApiError> {
@@ -533,7 +546,7 @@ impl FromRequestParts<AppState> for Signed {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
-        let Some((_, session)) = live_session(state, &parts.headers).await? else {
+        let Some((id, session)) = live_session(state, &parts.headers).await? else {
             return Err(ApiError::signed_out());
         };
         let team = load_team(state)?;
@@ -555,7 +568,11 @@ impl FromRequestParts<AppState> for Signed {
         if is_write(&parts.method) {
             check_write(state, &parts.headers, &session)?;
         }
-        Ok(Self { member, session })
+        Ok(Self {
+            member,
+            session,
+            session_ref: session::assertion_ref(&id),
+        })
     }
 }
 
@@ -903,9 +920,8 @@ async fn find(state: &AppState, signed: &Signed, id: &str) -> Result<Found, ApiE
             _ => Err(ApiError::not_found()),
         };
     }
-    let item = state
-        .0
-        .toolserver
+    let item = signed
+        .toolserver(state)
         .approval(id)
         .await
         .map_err(ApiError::upstream)?;
@@ -944,7 +960,11 @@ async fn item_draft(
     st: &UserState,
 ) -> Result<Draft, ApiError> {
     let mut draft = drafts::draft(item, st).ok_or_else(ApiError::not_found)?;
-    draft.sources = match state.0.toolserver.sources(&item.id, signed.handle()).await {
+    draft.sources = match signed
+        .toolserver(state)
+        .sources(&item.id, signed.handle())
+        .await
+    {
         Ok(found) => drafts::sources(found),
         // The draft is still shown; the app says it can't tell what the bot read.
         Err(e) => {
@@ -968,9 +988,8 @@ fn draft_response(draft: &Draft) -> Response {
 
 async fn list_drafts(State(state): State<AppState>, signed: Signed) -> ApiResult {
     signed.drafts()?;
-    let items = state
-        .0
-        .toolserver
+    let items = signed
+        .toolserver(&state)
         .approvals(signed.handle())
         .await
         .map_err(ApiError::upstream)?;
@@ -1187,9 +1206,8 @@ async fn post_changes(
         &current.body,
         &instruction,
     );
-    let created = state
-        .0
-        .runtime
+    let created = signed
+        .runtime(&state)
         .create_task(signed.handle(), &signed.bot(), &prompt)
         .await;
     let key = id.clone();
@@ -1281,7 +1299,7 @@ async fn current_suggestion(
     let (true, Some(task_id)) = (sug.status == "working", sug.task_id.clone()) else {
         return Ok(Some(sug));
     };
-    let task = match state.0.runtime.task(signed.handle(), &task_id).await {
+    let task = match signed.runtime(state).task(signed.handle(), &task_id).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = ?e, task = %task_id, "revision task unavailable");
@@ -1478,7 +1496,12 @@ fn approved_as(item: &Approval, handle: &str, version: Option<&str>) -> bool {
 /// A refused decision as the web app's error. The tool server's own `409` codes pass
 /// through; a `409` without one means the item is no longer pending, or can't be decided
 /// as it stands.
-async fn refused_decision(state: &AppState, id: &str, e: UpstreamError) -> ApiError {
+async fn refused_decision(
+    state: &AppState,
+    signed: &Signed,
+    id: &str,
+    e: UpstreamError,
+) -> ApiError {
     let UpstreamError::Refused {
         status,
         code,
@@ -1500,7 +1523,11 @@ async fn refused_decision(state: &AppState, id: &str, e: UpstreamError) -> ApiEr
             "audience_unavailable",
             say("PM OS couldn't check who can see that channel. Nothing was sent; try again."),
         ),
-        (409, _) => match state.0.toolserver.approval(id).await {
+        (409, _) => match signed
+            .toolserver(state)
+            .approval_for(signed.handle(), id)
+            .await
+        {
             Ok(item) if item.status != "pending" => ApiError::not_pending(),
             _ => ApiError::new(
                 StatusCode::CONFLICT,
@@ -1568,7 +1595,7 @@ async fn approve(
         reason: None,
         confirm_external: req.confirm_external,
     };
-    match state.0.toolserver.decide(&id, &decision).await {
+    match signed.toolserver(&state).decide(&id, &decision).await {
         Ok(item) => {
             tracing::info!(user = %signed.handle(), draft = %id, decision = decision.decision, "draft approved");
             decided(&state, &signed, item).await
@@ -1585,7 +1612,11 @@ async fn approve(
                     ..
                 }
             ) {
-                if let Ok(now_item) = state.0.toolserver.approval(&id).await {
+                if let Ok(now_item) = signed
+                    .toolserver(&state)
+                    .approval_for(signed.handle(), &id)
+                    .await
+                {
                     if now_item.user == signed.handle()
                         && approved_as(&now_item, signed.handle(), Some(&current))
                     {
@@ -1593,7 +1624,7 @@ async fn approve(
                     }
                 }
             }
-            let err = refused_decision(&state, &id, e).await;
+            let err = refused_decision(&state, &signed, &id, e).await;
             if err.code == "needs_external_confirm" {
                 let key = id.clone();
                 state
@@ -1652,12 +1683,12 @@ async fn reject(
         reason: req.reason,
         confirm_external: false,
     };
-    match state.0.toolserver.decide(&id, &decision).await {
+    match signed.toolserver(&state).decide(&id, &decision).await {
         Ok(item) => {
             tracing::info!(user = %signed.handle(), draft = %id, "draft rejected");
             decided(&state, &signed, item).await
         }
-        Err(e) => Err(refused_decision(&state, &id, e).await),
+        Err(e) => Err(refused_decision(&state, &signed, &id, e).await),
     }
 }
 
@@ -1771,9 +1802,8 @@ async fn create_task(State(state): State<AppState>, signed: Signed, body: Bytes)
             "Say what you need, in at most 8,000 characters.",
         ));
     }
-    let task = state
-        .0
-        .runtime
+    let task = signed
+        .runtime(&state)
         .create_task(signed.handle(), &signed.bot(), text)
         .await
         .map_err(|e| match e {
@@ -1807,9 +1837,8 @@ async fn get_task(
     if !valid_id(&id) {
         return Err(ApiError::not_found());
     }
-    let task = state
-        .0
-        .runtime
+    let task = signed
+        .runtime(&state)
         .task(signed.handle(), &id)
         .await
         .map_err(|e| match e {
@@ -1819,7 +1848,11 @@ async fn get_task(
     if task.requested_by != signed.handle() {
         return Err(ApiError::not_found());
     }
-    let events = match state.0.runtime.task_events(signed.handle(), &id).await {
+    let events = match signed
+        .runtime(&state)
+        .task_events(signed.handle(), &id)
+        .await
+    {
         Ok(ev) => ev,
         Err(e) => {
             tracing::warn!(error = ?e, task = %id, "task events unavailable");
@@ -1832,9 +1865,8 @@ async fn get_task(
 async fn list_tasks(State(state): State<AppState>, signed: Signed) -> ApiResult {
     signed.need(Permission::ViewOwnTasks)?;
     let st = settings_of(&state, signed.handle()).await?;
-    let tasks = state
-        .0
-        .runtime
+    let tasks = signed
+        .runtime(&state)
         .tasks(
             signed.handle(),
             RECENT_TASKS + st.revision_tasks.len().min(30),

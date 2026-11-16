@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use chrono::Duration;
-use pmos_assertion::{Key, KeyRing, VerifyPolicy};
+use pmos_assertion::{KeyRing, KeyUse};
 
 use crate::entra::EntraConfig;
 use crate::upstream::{Credentials, Signer};
@@ -174,63 +174,15 @@ impl Config {
 }
 
 /// `PMOS_ASSERTION_KEYS`: the keys this service signs user assertions with
-/// (`docs/user-assertion.md`), comma-separated entries, one per caller→receiver pair:
-///
-/// ```text
-/// <issuer>:<audience>:<key id>:<base64 key>[:<key id>:<base64 key>]
-/// ```
-///
-/// the current key first, then optionally the previous one. Keys are 32 to 64 bytes in
-/// standard base64. Only pairs `wanted` accepts may appear, so a service never holds a key it
+/// (`docs/user-assertion.md`; `pmos_assertion::parse_key_list`, shared by every service that
+/// signs or checks). Only pairs `wanted` accepts may appear, so a service never holds a key it
 /// has no use for. Errors name the entry and the pair, never a key.
 pub fn parse_assertion_keys(
     spec: &str,
     service: &str,
     wanted: impl Fn(&str, &str) -> bool,
 ) -> Result<BTreeMap<(String, String), KeyRing>, String> {
-    const VAR: &str = "PMOS_ASSERTION_KEYS";
-    let mut out = BTreeMap::new();
-    let entries = spec.split(',').map(str::trim).filter(|e| !e.is_empty());
-    for (i, entry) in entries.enumerate() {
-        let bad = |why: &str| format!("{VAR} entry {}: {why}", i + 1);
-        let parts: Vec<&str> = entry.split(':').map(str::trim).collect();
-        if parts.len() != 4 && parts.len() != 6 {
-            return Err(bad(
-                "expected issuer:audience:key-id:base64-key, optionally followed by \
-                 :key-id:base64-key for the previous key",
-            ));
-        }
-        let (issuer, audience) = (parts[0], parts[1]);
-        if VerifyPolicy::new(audience, &[issuer]).is_err() {
-            return Err(bad(
-                "the issuer and audience must be client names such as `web` and `bots`",
-            ));
-        }
-        if !wanted(issuer, audience) {
-            return Err(bad(&format!(
-                "{issuer}→{audience} is not a pair {service} signs; give each service only \
-                 its own keys"
-            )));
-        }
-        let key = |id: &str, b64: &str, which: &str| {
-            Key::from_base64(id, b64).map_err(|e| bad(&format!("the {which} key: {e}")))
-        };
-        let mut ring = KeyRing::new(key(parts[2], parts[3], "current")?);
-        if parts.len() == 6 {
-            ring = ring
-                .with_previous(key(parts[4], parts[5], "previous")?)
-                .map_err(|e| bad(&e.to_string()))?;
-        }
-        if out
-            .insert((issuer.to_string(), audience.to_string()), ring)
-            .is_some()
-        {
-            return Err(bad(&format!(
-                "{issuer}→{audience} is listed twice; list each pair once, current key first"
-            )));
-        }
-    }
-    Ok(out)
+    pmos_assertion::parse_key_list(spec, service, KeyUse::Signs, wanted)
 }
 
 /// An `http` or `https` base URL, without a trailing slash.

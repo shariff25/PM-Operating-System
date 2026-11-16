@@ -66,7 +66,8 @@ where `crates/web` is only a stub): confirm them against `crates/web/src/config.
 | --- | --- | --- |
 | `PMOS_WEB_BIND` | `127.0.0.1:8770` | Address to listen on. The container uses `0.0.0.0:8770` and publishes the port on `127.0.0.1` only. |
 | `PMOS_WEB_DEV_LOGIN` | off | `1` turns on development sign-in. The server needs it or Entra ID sign-in; with neither it refuses to start. |
-| `PMOS_WEB_ENTRA_TENANT_ID`, `PMOS_WEB_ENTRA_CLIENT_ID`, `PMOS_WEB_ENTRA_CLIENT_SECRET` | none | Entra ID sign-in, with `PMOS_WEB_PUBLIC_URL` (`docs/entra-sign-in.md`). The deploy kit doesn't pass these yet. |
+| `PMOS_WEB_ENTRA_TENANT_ID`, `PMOS_WEB_ENTRA_CLIENT_ID`, `PMOS_WEB_ENTRA_CLIENT_SECRET` | none | Entra ID sign-in, with `PMOS_WEB_PUBLIC_URL` (`docs/entra-sign-in.md`). `PMOS_WEB_ENTRA_AUTHORITY` is optional. The deploy kit passes all four from `deploy/.env`. |
+| `PMOS_WEB_DATABASE_URL` | none | Postgres for sessions, settings and follow-ups. Without it they are in memory and a restart signs everyone out. In the deploy kit: the kit's Postgres, a `pmos_web` database and role the operator creates (`deploy/env.example`). |
 | `PMOS_BOTS_URL` | `http://127.0.0.1:8750` | The bot runtime. |
 | `PMOS_WEB_BOTS_TOKEN` | required | The runtime token for client `web`: at least 32 characters, and the same value as the `web=<token>` entry in the runtime's `PMOS_BOTS_TOKENS`. |
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | The tool server, for approvals. |
@@ -91,10 +92,16 @@ The deploy kit (`deploy/`) knows the web app, **off by default**:
 
 - **A Compose profile.** `web` is in the `web` profile, so `deploy/pmos-admin up` does not start
   it. `deploy/pmos-admin up --web` does, and `down`, `status`, `logs` and `restart` know it.
-- **A loudly named opt-in.** `up --web` refuses unless `deploy/.env` has
-  `PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1`. That setting is for a **closed test
-  network only**: while development sign-in is the only provider, anyone who can reach the port
-  signs in as any team member. Leave it `0` anywhere else.
+- **Entra sign-in, or a loudly named opt-in.** `up --web` refuses unless `deploy/.env` has
+  Entra sign-in set (`PMOS_WEB_ENTRA_TENANT_ID`, `PMOS_WEB_ENTRA_CLIENT_ID`,
+  `PMOS_WEB_ENTRA_CLIENT_SECRET` and `PMOS_WEB_PUBLIC_URL`; `docs/entra-sign-in.md`) or
+  `PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1`. That second setting is for a **closed
+  test network only**: with development sign-in, anyone who can reach the port signs in as any
+  team member. Leave it `0` anywhere else.
+- **Sessions in Postgres, if you create the database.** Blank `PMOS_WEB_DATABASE_URL` keeps
+  them in memory. `deploy/env.example` has the commands that make a `pmos_web` database and role
+  in the kit's Postgres (its init script runs only when the volume is first made); `pmos-admin
+  backup` doesn't dump it.
 - **A token like the others.** `deploy/setup.sh` generates `PMOS_RT_WEB_TOKEN` (`openssl rand
   -hex 24`, so 48 characters), and Compose lists it in the runtime's `PMOS_BOTS_TOKENS` as
   `web=…`. Run `deploy/setup.sh` again on an existing install to fill it in, then restart the
@@ -113,12 +120,13 @@ The deploy kit (`deploy/`) knows the web app, **off by default**:
 
 ## Not ready for production
 
-- **Development sign-in only, in the deploy kit.** `pmos-web` has Entra ID sign-in
-  (`docs/entra-sign-in.md`), but `deploy/` doesn't pass its variables yet. With development
-  sign-in anyone who can reach the port signs in as any member, so it is for a closed test
-  network behind the proxy, never for the company network or the internet.
-- **Sessions and settings are in memory.** A restart signs everyone out and resets what the app
-  keeps for people.
+- **Development sign-in is still there.** With
+  `PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1` anyone who can reach the port signs in
+  as any member, so it is for a closed test network behind the proxy, never for the company
+  network or the internet. Use Entra sign-in anywhere else.
+- **Sessions and settings are in memory unless the database is set up.** Without
+  `PMOS_WEB_DATABASE_URL`, a restart signs everyone out and resets what the app keeps for
+  people.
 - **No real identity in the deploy kit.** With development sign-in nothing ties a browser to a
   person but the handle chosen at sign-in.
 - **A powerful token.** The backend holds a tool server token (`PMOS_SERVICE_TOKEN`) that can

@@ -264,6 +264,7 @@ fn notification_for(
         text: n.text.clone(),
         approvals: n.approvals.clone(),
         outcomes: n.outcomes.clone(),
+        routine_id: task.routine_id.clone(),
         at: now,
     }
 }
