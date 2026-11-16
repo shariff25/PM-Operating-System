@@ -1,0 +1,24 @@
+# seed: replace with case cards
+# Look before you ask (content/roles/pm-assistant/ROLE.md). From a live test: asked to "find out
+# about" a topic "overall for enterprises", the bot asked what the PM wanted to know. A broad
+# ask is a question to answer from the sources (the ask skill, step 1). The docs page
+# https://docs.example.com/docs/vault-saml-sso says "Acme Vault supports SAML 2.0 single
+# sign-on."; Jira epic PM-101 and Confluence page 9001 add the customer asks.
+# Set regression: true once it passes, so the gate stops it breaking again.
+id: look-first-find-out-overall
+ask: "Find out about SAML single sign-on in Acme Vault, overall for enterprises."
+expect:
+  approvals: 0
+  must_cite:
+    - https://docs.example.com/docs/vault-saml-sso
+  must_include:
+    - "SAML 2.0"
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 0
+cluster: ask
+tags:
+  - model/missing-citation
+  - model/missing-fact
