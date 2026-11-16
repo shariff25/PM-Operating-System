@@ -301,7 +301,7 @@ async fn nothing_ticked_asks_to_tick_first() {
 }
 
 #[tokio::test]
-async fn skills_group_by_track_and_show_only_the_roles_slack_skills() {
+async fn skills_group_by_job_and_show_only_the_roles_slack_skills() {
     let stack = Stack::new().await;
     stack.skill(
         "ask",
@@ -341,7 +341,11 @@ async fn skills_group_by_track_and_show_only_the_roles_slack_skills() {
         .filter(|b| b["type"] == "header")
         .map(|b| b["text"]["text"].as_str().unwrap())
         .collect();
-    assert_eq!(headers, ["Everyday", "Strategy and decisions", "Other"]);
+    assert_eq!(
+        headers,
+        ["Start here", "Everyday", "Understand and decide", "More"],
+        "two suggestions: only two of the six are in this role"
+    );
     let s = view_text(&published);
     assert!(s.contains("DM me and ask in your own words, or name a skill: `strategy-doc: our plan for small teams`"));
     assert!(s.contains("*ask* Answer a question from the context library."));
@@ -362,7 +366,7 @@ async fn skills_group_by_track_and_show_only_the_roles_slack_skills() {
 }
 
 #[tokio::test]
-async fn skills_show_the_level_and_the_tracks_for_staff_and_principal_work() {
+async fn skills_show_the_level_and_the_groups_for_staff_and_principal_work() {
     let stack = Stack::new().await;
     stack.skill("ask", "Answer a question.", "slack", Some("Everyday"));
     stack.skill(
@@ -418,10 +422,11 @@ async fn skills_show_the_level_and_the_tracks_for_staff_and_principal_work() {
     assert_eq!(
         headers,
         [
+            "Start here",
             "Everyday",
-            "Delivery and launch",
-            "Leading across teams",
-            "Company bets"
+            "Plan and prioritise",
+            "Launch",
+            "Communicate"
         ]
     );
 
