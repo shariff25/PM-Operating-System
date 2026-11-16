@@ -115,7 +115,15 @@ Microsoft too, the person signs out at Microsoft.
   `state` check; Entra still refuses the second use of the code.
 - **The fallback when Entra is down.** Sign-in answers `reason=unavailable`; existing sessions
   keep working. Not decided beyond that (`docs/web-client.md`).
-- **The deploy kit.** `deploy/compose.yaml` doesn't pass the `PMOS_WEB_ENTRA_*` variables yet.
+
+## In the deploy kit
+
+`deploy/compose.yaml` passes the four `PMOS_WEB_ENTRA_*` variables from `deploy/.env` (blank by
+default, so off) to the web app, with the Spark's outbound proxy. `deploy/pmos-admin up --web`
+starts the web app when the tenant, client id, secret and `PMOS_WEB_PUBLIC_URL` are all set, or
+with the development opt-in (`docs/web-app-running.md`). `deploy/setup.sh` doesn't make the
+secret: it comes from the app registration, and goes in `deploy/.env` and the team password
+manager.
 
 ## Tests
 

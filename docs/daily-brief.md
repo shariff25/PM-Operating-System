@@ -92,8 +92,10 @@ typed alone in a DM, in any case:
     PM's one message that day for the nudge engine (`docs/nudges.md`; a no-op when the engine
     is off, and when the finished task is not from a brief routine):
     `crate::brief::note_delivery(&self.bots, item).await;`
-    It reads the notification's `requested_by` and `routine_id` and checks the routine with
-    `is_brief_routine`, then calls `nudges::record_daily_message`.
+    It reads the notification's `requested_by` and `routine_id` (the runtime sets
+    `routine_id` only on notifications for a task a routine created) and checks that routine
+    is the PM's own with `is_brief_routine`, then calls `nudges::record_daily_message`.
+    `brief now` has no routine and is not counted.
 
 ### The web app's panels
 

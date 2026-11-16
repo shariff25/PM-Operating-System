@@ -6,7 +6,7 @@ things up. It has four screens and nothing else, so there's never a screen for o
 
 ```
 browser ──SSO proxy──► pmos-console :8760 ──► pmos-bots :8750 (client "console")
-                                         └──► pmos-toolserver :8710 (approvals, service token)
+                                         └──► pmos-toolserver :8710 (approvals, console token)
                                          └──► tool server audit file (read-only, optional)
 ```
 
@@ -35,6 +35,9 @@ width.
 Someone else's task or routine answers `404`, so the console doesn't confirm it exists. The
 console's runtime token may read and change everything, so these checks are made in the
 console before any call: a PM's routine action is checked against their own routines first.
+With assertion keys (`PMOS_ASSERTION_KEYS`, `docs/user-assertion.md`), every call that names
+a person, and every routine pause, resume and delete, also carries a signed user assertion
+for that person or for the viewer who acted.
 
 ## Sign-in
 
@@ -103,17 +106,18 @@ environment and sandbox.
 
 ### What this does not fix
 
-- **The console still holds powerful tokens:** the tool server's full service token (which can
-  also decide approvals and link accounts) and a runtime token that may read and change
-  everything. Anyone who gets the proxy secret, or code running in the console, can act as any
-  member. The per-viewer checks are made in the console, not upstream.
+- **The console still holds powerful credentials:** a runtime token that may read and change
+  everything, its own tool server token (`PMOS_CONSOLE_TOKEN` there: the approvals routes
+  only), and its assertion keys, with which it can sign for any member. Anyone who gets the
+  proxy secret, or code running in the console, can act as any member. The per-viewer checks
+  are made in the console, not upstream.
 - **The console is not on its own network.** Separating it would take a network shared only
   with `bots` and `toolserver` (and the console taken off `pmos`). That changes other
   services' settings, so it's left for a stack change.
 - **The secret is shared, not per person.** It proves a request came through the proxy, not
-  who sent it; the proxy's sign-in decides that. Real per-user sign-in, and the signed user
-  assertion so that the runtime and tool server check the person themselves, are separate work
-  (`docs/user-assertion.md`).
+  who sent it; the proxy's sign-in decides that. Real per-user sign-in is separate work. The
+  signed user assertion (`docs/user-assertion.md`) lets the runtime and tool server check who
+  a call is for, but the console signs it, so it is only as good as the console's sign-in.
 - **No rotation without a restart.** To change the secret, change it in `deploy/.env` and the
   proxy, then restart both.
 
@@ -148,7 +152,10 @@ results.
 | Tool server `GET /internal/approvals?user=<handle>&status=pending` | Approvals: once for a PM, once per `team.yaml` member for an admin |
 | The tool server's audit file | A task's audit events: lines whose `run_id` is the task id, at most 500 |
 
-All runtime calls carry the `console` client token, and tool server calls the service token.
+All runtime calls carry the `console` client token, and tool server calls the console's own
+tool server token. With assertion keys, a call that names a person (`requested_by=`,
+`owner=`, `user=`) carries an assertion for that person, and a routine `PATCH` or `DELETE` one
+for the viewer who pressed the button; reads of everything carry none.
 Each call times out after 10 seconds. If an upstream is down, the screen says which one, with
 `502`. On a task page, a missing events list, trace or audit file only blanks that section.
 
@@ -165,7 +172,7 @@ show. Where the spec leaves a shape open, it accepts either form:
 ```sh
 PMOS_CONSOLE_DEV_USER=ana \
 PMOS_BOTS_TOKEN=<the runtime's console token> \
-PMOS_TOOLSERVER_TOKEN=<the tool server's service token> \
+PMOS_TOOLSERVER_TOKEN=<the tool server's console token> \
 cargo run -p pmos-console
 ```
 
@@ -178,7 +185,8 @@ cargo run -p pmos-console
 | `PMOS_BOTS_URL` | `http://127.0.0.1:8750` | The bot runtime |
 | `PMOS_BOTS_TOKEN` | required | The `console` entry of the runtime's `PMOS_BOTS_TOKENS`. At least 32 characters |
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | |
-| `PMOS_TOOLSERVER_TOKEN` | required | The tool server's `PMOS_SERVICE_TOKEN`, which the approvals list needs. At least 32 characters, and different from `PMOS_BOTS_TOKEN` |
+| `PMOS_TOOLSERVER_TOKEN` | required | The tool server's `PMOS_CONSOLE_TOKEN`, which reaches only the approvals routes (older deployments gave the service token). At least 32 characters, and different from `PMOS_BOTS_TOKEN` |
+| `PMOS_ASSERTION_KEYS` | none | `console:bots:<key id>:<base64>` and `console:toolserver:<key id>:<base64>`, comma-separated: sign user assertions for that upstream (`docs/user-assertion.md`). No other pair is accepted |
 | `PMOS_CONTENT_ROOT` | `content` | Where `team.yaml` is. The console won't start if it doesn't parse |
 | `PMOS_CONSOLE_AUDIT_LOG` | none | The tool server's `PMOS_AUDIT_LOG` file, mounted read-only. Without it, task pages say audit events aren't available |
 | `PMOS_CONSOLE_SLACK_URL` | none | The workspace, such as `https://acme.slack.com`, for links to Slack and to a task's thread |
@@ -194,8 +202,8 @@ cargo run -p pmos-console
   back, so the console reads the JSON-lines file the tool server already writes. Each task
   page scans the whole file. A `GET /internal/audit?run_id=` on the tool server would replace
   both the mount and the scan.
-- **The console holds the tool server's service token,** which may also decide approvals and
-  link accounts, only to list approvals. A read-only token for `GET /internal/approvals`
+- **The console's tool server token reaches every approvals route,** deciding included,
+  though the console only lists approvals. A read-only token for `GET /internal/approvals`
   would narrow that.
 - **An admin's approvals queue** makes one call per `team.yaml` member, because the tool
   server lists one PM's inbox at a time.

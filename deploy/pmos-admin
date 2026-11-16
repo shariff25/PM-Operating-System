@@ -63,6 +63,13 @@ console_checks() {
   fi
 }
 
+# Is the web app's Entra sign-in fully set in deploy/.env? (pmos-web itself refuses a partial
+# one at start-up, naming what is missing.)
+entra_configured() {
+  [ -n "${PMOS_WEB_ENTRA_TENANT_ID:-}" ] && [ -n "${PMOS_WEB_ENTRA_CLIENT_ID:-}" ] &&
+    [ -n "${PMOS_WEB_ENTRA_CLIENT_SECRET:-}" ] && [ -n "${PMOS_WEB_PUBLIC_URL:-}" ]
+}
+
 profiles() {
   local p=()
   if [ -n "${PMOS_SLACK_APP_TOKEN:-}" ] && [ -n "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
@@ -73,12 +80,13 @@ profiles() {
       --models) p+=(--profile models) ;;
       --console) p+=(--profile console) ;;
       --web)
-        if [ "${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}" != 1 ]; then
+        if [ "${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}" != 1 ] && ! entra_configured; then
           {
-            echo "the web app is off: it has only DEVELOPMENT sign-in (anyone who can reach it"
-            echo "signs in as any team member) until Entra sign-in is built. On a closed test"
-            echo "network only, set PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1 in"
-            echo "deploy/.env, then run this again (docs/web-app-running.md)."
+            echo "the web app is off: it needs Entra sign-in (PMOS_WEB_ENTRA_TENANT_ID,"
+            echo "PMOS_WEB_ENTRA_CLIENT_ID, PMOS_WEB_ENTRA_CLIENT_SECRET and PMOS_WEB_PUBLIC_URL in"
+            echo "deploy/.env; docs/entra-sign-in.md). Or, on a closed test network only, set"
+            echo "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1 for DEVELOPMENT sign-in"
+            echo "(anyone who can reach it signs in as any team member; docs/web-app-running.md)."
           } >&2
           exit 2
         fi
