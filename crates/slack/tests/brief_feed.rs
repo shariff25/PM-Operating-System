@@ -1,0 +1,277 @@
+//! The daily brief's feed to the web app (`brief_feed.rs`), end to end through the
+//! notification loop: the fake Slack (`common`), the mock bots runtime (`support`) and a mock
+//! pmos-web that records each `PUT /internal/brief/{handle}`.
+
+mod common;
+mod support;
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::routing::put;
+use axum::Router;
+use common::{serve, until};
+use pmos_slack::brief_feed::Producer;
+use pmos_slack::notify::Notifier;
+use serde_json::{json, Value};
+use support::{call_text, Stack};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+const WEB_TOKEN: &str = "test-web-brief-token-0123456789abcdef";
+
+/// One request the mock pmos-web got: (handle, Authorization, Content-Type, body).
+type Put = (String, String, String, Value);
+
+#[derive(Default)]
+struct MockWeb {
+    puts: Mutex<Vec<Put>>,
+    /// The status to answer with; `200` when unset.
+    status: Mutex<Option<StatusCode>>,
+}
+
+async fn web_put(
+    State(web): State<Arc<MockWeb>>,
+    Path(handle): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, &'static str) {
+    let header = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    web.puts.lock().unwrap().push((
+        handle,
+        header("authorization"),
+        header("content-type"),
+        serde_json::from_slice(&body).unwrap_or(Value::Null),
+    ));
+    let status = web.status.lock().unwrap().unwrap_or(StatusCode::OK);
+    (status, "{}")
+}
+
+async fn mock_web() -> (Arc<MockWeb>, String, CancellationToken) {
+    let web = Arc::new(MockWeb::default());
+    let (base, stop) = serve(
+        Router::new()
+            .route("/internal/brief/{handle}", put(web_put))
+            .with_state(web.clone()),
+    )
+    .await;
+    (web, base, stop)
+}
+
+fn producer(base: &str) -> Producer {
+    Producer::new(base, WEB_TOKEN, reqwest::Client::new()).unwrap()
+}
+
+fn start(stack: &Stack, producer: Option<Producer>) -> (CancellationToken, JoinHandle<()>) {
+    let shutdown = CancellationToken::new();
+    let mut notifier =
+        Notifier::new(stack.bots.clone(), stack.state.path()).with_brief_feed(producer);
+    notifier.wait = Duration::from_millis(200);
+    (shutdown.clone(), tokio::spawn(notifier.run(shutdown)))
+}
+
+const BRIEF: &str = "Morning, Ana. One person is waiting on you.\n\n**Waiting on you**\n- Ben in #pm-team asked about SAML SSO, 2 days ago. ([Slack](https://slack.com/archives/C0PMTEAM/p1731600000000100))";
+
+fn block() -> String {
+    let today = chrono::Utc::now().date_naive();
+    let asked = today - chrono::Days::new(2);
+    format!(
+        "```pmos-brief\n{}\n```",
+        json!({
+            "version": 1, "date": today.to_string(),
+            "changed": [{"system": "jira", "title": "PAY-212 moved to Blocked",
+                         "summary": "waiting on the vendor sandbox",
+                         "url": "https://jira.example.com/browse/PAY-212"}],
+            "waiting_on_you": [{"system": "slack", "who": "Ben",
+                                "summary": "asked about SAML SSO for the console",
+                                "url": "https://slack.com/archives/C0PMTEAM/p1731600000000100",
+                                "asked_on": asked.to_string()}],
+        })
+    )
+}
+
+/// A finished routine run for `handle` by `bot`, with `text` as its answer.
+fn done(id: &str, bot: &str, handle: &str, text: &str) -> Value {
+    json!({"id": id, "task_id": format!("tsk_{id}"), "bot": bot, "requested_by": handle,
+           "kind": "done", "text": text})
+}
+
+fn push(stack: &Stack, items: &[Value]) {
+    stack
+        .runtime
+        .feed
+        .lock()
+        .unwrap()
+        .extend(items.iter().cloned());
+}
+
+/// The text of the `n`th `chat.postMessage`, once it has arrived.
+async fn posted(stack: &Stack, n: usize) -> String {
+    call_text(&stack.calls("chat.postMessage", n).await[n - 1])
+}
+
+#[tokio::test]
+async fn a_brief_is_put_with_the_token_and_shown_without_its_block() {
+    let stack = Stack::new().await;
+    let (web, base, stop_web) = mock_web().await;
+    let (stop, notifier) = start(&stack, Some(producer(&base)));
+    push(
+        &stack,
+        &[done(
+            "ntf_1",
+            "pm-ana",
+            "ana",
+            &format!("{BRIEF}\n\n{}", block()),
+        )],
+    );
+
+    let shown = posted(&stack, 1).await;
+    assert!(shown.contains("SAML SSO"), "{shown}");
+    assert!(
+        !shown.contains("pmos-brief") && !shown.contains("\\\"version\\\""),
+        "{shown}"
+    );
+    let calls = stack.slack.calls("chat.postMessage");
+    assert_eq!(
+        calls[0].body["channel"], "U0ANA",
+        "the brief goes to Ana's DM"
+    );
+
+    let (handle, auth, content_type, body) =
+        until("the PUT", || web.puts.lock().unwrap().first().cloned()).await;
+    assert_eq!(handle, "ana");
+    assert_eq!(auth, format!("Bearer {WEB_TOKEN}"));
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+    let today = chrono::Utc::now().date_naive();
+    let asked = (today - chrono::Days::new(2)).to_string();
+    assert_eq!(
+        body,
+        json!({
+            "date": today.to_string(),
+            "changed": [{"system": "jira", "title": "PAY-212 moved to Blocked",
+                         "summary": "waiting on the vendor sandbox",
+                         "url": "https://jira.example.com/browse/PAY-212"}],
+            "waiting_on_you": [{"system": "slack", "who": "Ben",
+                                "summary": "asked about SAML SSO for the console",
+                                "url": "https://slack.com/archives/C0PMTEAM/p1731600000000100",
+                                "created_at": format!("{asked}T00:00:00Z")}],
+            "you_wait_on": [],
+        })
+    );
+    stop.cancel();
+    let _ = notifier.await;
+    stop_web.cancel();
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_failing_web_app_never_holds_up_the_brief() {
+    let stack = Stack::new().await;
+    let (web, base, stop_web) = mock_web().await;
+    *web.status.lock().unwrap() = Some(StatusCode::INTERNAL_SERVER_ERROR);
+    // Nothing listens here: bind a port, then let it go.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+
+    // A 500: the brief is posted and the loop goes on to the next item.
+    let (stop, notifier) = start(&stack, Some(producer(&base)));
+    push(
+        &stack,
+        &[
+            done("ntf_1", "pm-ana", "ana", &format!("{BRIEF}\n\n{}", block())),
+            done("ntf_2", "pm-ana", "ana", "Second answer."),
+        ],
+    );
+    assert!(posted(&stack, 1).await.contains("SAML SSO"));
+    assert!(posted(&stack, 2).await.contains("Second answer."));
+    until("the PUT", || web.puts.lock().unwrap().first().cloned()).await;
+    stop.cancel();
+    let _ = notifier.await;
+
+    // Connection refused: the same.
+    let (stop, notifier) = start(&stack, Some(producer(&closed)));
+    push(
+        &stack,
+        &[
+            done("ntf_3", "pm-ana", "ana", &format!("{BRIEF}\n\n{}", block())),
+            done("ntf_4", "pm-ana", "ana", "Fourth answer."),
+        ],
+    );
+    let third = posted(&stack, 3).await;
+    assert!(third.contains("SAML SSO") && !third.contains("pmos-brief"));
+    assert!(posted(&stack, 4).await.contains("Fourth answer."));
+    stop.cancel();
+    let _ = notifier.await;
+    stop_web.cancel();
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_bad_block_or_someone_elses_bot_sends_nothing() {
+    let stack = Stack::new().await;
+    let (web, base, stop_web) = mock_web().await;
+    let (stop, notifier) = start(&stack, Some(producer(&base)));
+    let bad = "```pmos-brief\n{\"version\": 1, \"waiting_on_you\": [{\"system\": \"slack\", \"who\": \"Ben\", \"summary\": \"line one\\nline two\", \"url\": \"https://slack.com/x\"}]}\n```";
+    push(
+        &stack,
+        &[
+            // Malformed: a two-line summary.
+            done("ntf_1", "pm-ana", "ana", &format!("{BRIEF}\n\n{bad}")),
+            // Well formed, but not Ana's own bot.
+            done("ntf_2", "docs", "ana", &format!("{BRIEF}\n\n{}", block())),
+            done("ntf_3", "pm-bob", "ana", &format!("{BRIEF}\n\n{}", block())),
+            // Someone not on the team.
+            done("ntf_4", "pm-zed", "zed", &format!("{BRIEF}\n\n{}", block())),
+        ],
+    );
+    for n in 1..=3 {
+        let shown = posted(&stack, n).await;
+        assert!(
+            shown.contains("SAML SSO") && !shown.contains("pmos-brief"),
+            "{shown}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(web.puts.lock().unwrap().is_empty());
+    stop.cancel();
+    let _ = notifier.await;
+    stop_web.cancel();
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn with_the_feed_off_the_block_is_still_hidden() {
+    let stack = Stack::new().await;
+    let (stop, notifier) = start(&stack, None);
+    push(
+        &stack,
+        &[done(
+            "ntf_1",
+            "pm-ana",
+            "ana",
+            &format!("{BRIEF}\n\n{}", block()),
+        )],
+    );
+    let shown = posted(&stack, 1).await;
+    assert!(
+        shown.contains("SAML SSO") && !shown.contains("pmos-brief"),
+        "{shown}"
+    );
+    stop.cancel();
+    let _ = notifier.await;
+    stack.stop().await;
+}

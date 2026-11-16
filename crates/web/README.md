@@ -153,8 +153,9 @@ path with another method a JSON `405 method_not_allowed`.
   gentle nudge (you wait on), written through the bot's normal write tool so it arrives as an
   ordinary approval; it needs `ask-bot`. Someone else's, a dismissed, an expired or an
   unknown id is `404`.
-- **`PUT /internal/brief/{handle}`** is the producer's route and **nothing calls it yet**:
-  the Slack brief routine or a later job will. It needs `Authorization: Bearer
+- **`PUT /internal/brief/{handle}`** is the producer's route. The Slack service calls it
+  when a PM's daily brief finishes (`crates/slack/src/brief_feed.rs`, on with `PMOS_WEB_URL`
+  and `PMOS_WEB_BRIEF_TOKEN` set there; `docs/daily-brief.md`). It needs `Authorization: Bearer
   <PMOS_WEB_BRIEF_TOKEN>` (`401 bad_token`, constant-time compare), a member's handle, JSON,
   at most 128 KiB (`413`), and replaces that PM's follow-ups and `changed` items:
   `{date?, changed: [{system, title, summary?, url}], waiting_on_you: [{system, who, summary,
