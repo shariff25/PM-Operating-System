@@ -51,10 +51,10 @@ impl std::fmt::Display for StoreError {
     }
 }
 
-/// Where sessions live. [`MemorySessionStore`] is the only one today: a restart signs
-/// everyone out, and two `pmos-web` processes don't share sessions. A Postgres store would
-/// need a `web_sessions (id_hash bytea primary key, handle, csrf_token, created_at,
-/// last_seen)` table, an index on `handle`, and a periodic delete of expired rows.
+/// Where sessions live. [`MemorySessionStore`] loses them on restart (everyone signs in
+/// again) and two `pmos-web` processes don't share them; [`crate::pg::PgStore`] keeps them in
+/// `web_sessions` by the SHA-256 of the id only, enforces idle and absolute expiry in the
+/// query, and deletes expired rows in [`SessionStore::purge`].
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn insert(&self, id: IdHash, session: Session) -> Result<(), StoreError>;
@@ -73,6 +73,17 @@ pub trait SessionStore: Send + Sync {
 
     /// End every session of `handle` (they left the team).
     async fn remove_user(&self, handle: &str) -> Result<(), StoreError>;
+
+    /// Delete every expired session; the number removed. Called on a cheap path (sign-in),
+    /// so no scheduler is needed. The in-memory store sweeps on every `touch` instead.
+    async fn purge(
+        &self,
+        _now: DateTime<Utc>,
+        _idle: Duration,
+        _max: Duration,
+    ) -> Result<u64, StoreError> {
+        Ok(0)
+    }
 }
 
 #[derive(Default)]
