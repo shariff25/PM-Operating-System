@@ -203,10 +203,27 @@ impl Runtime {
         text: &str,
         level: Option<&str>,
     ) -> Result<RuntimeTask, ApiError> {
+        self.create_task_in(bot, requested_by, text, level, None)
+            .await
+    }
+
+    /// [`Self::create_task`] as a turn of `conversation`: tasks with the same conversation id,
+    /// from the same requester for the same bot, are given earlier turns as `history`.
+    pub async fn create_task_in(
+        &self,
+        bot: &str,
+        requested_by: &str,
+        text: &str,
+        level: Option<&str>,
+        conversation: Option<&str>,
+    ) -> Result<RuntimeTask, ApiError> {
         let mut body =
             json!({"bot": bot, "requested_by": requested_by, "text": text, "source": "eval"});
         if let Some(level) = level {
             body["level"] = json!(level);
+        }
+        if let Some(conversation) = conversation {
+            body["conversation"] = json!(conversation);
         }
         let v = self
             .send("POST", "/v1/tasks", &self.token, Some(body))
