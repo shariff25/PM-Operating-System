@@ -1,31 +1,28 @@
 //! What the web app keeps per PM: hints seen, nudges, whether they have opened a draft yet,
 //! pending draft edits, change suggestions and the practice draft.
 //!
-//! **In memory for now.** [`MemorySettingsStore`] loses everything on restart: a PM's
-//! unsaved edits, suggestions and practice draft go, and hints show again. That is
-//! acceptable while the web app is in development and nothing sent upstream depends on it;
-//! an edit only reaches the target system when the PM approves.
+//! [`MemorySettingsStore`] loses everything on restart. [`crate::pg::PgStore`] keeps it in
+//! `web_user_settings`, `web_draft_edits`, `web_suggestions`, `web_practice_drafts`,
+//! `web_draft_flags` and `web_revision_tasks`, every row keyed by handle, with
+//! [`SettingsStore::update`] one transaction holding a `FOR UPDATE` lock on the PM's settings
+//! row, so two tabs can't both start a change.
 //!
-//! A Postgres store needs:
-//! - a `web_user_settings (handle primary key, hints_seen text[], nudges bool,
-//!   opened_a_draft bool, updated_at)` table;
-//! - `web_draft_edits (handle, draft_id, title, body, updated_at, primary key (handle,
-//!   draft_id))`, deleted when the draft is decided;
-//! - `web_suggestions (handle, draft_id, task_id, instruction, status, body, error, …)`;
-//! - `web_practice_drafts (handle primary key, id, status, created_at, decided_at)`;
-//! - `web_draft_flags (handle, draft_id, external bool)` and `web_revision_tasks (handle,
-//!   task_id)`;
-//! - [`SettingsStore::update`] as one transaction with `SELECT … FOR UPDATE` on the
-//!   settings row, so two tabs can't both start a change (the in-memory store holds a lock);
-//! - the same retention as the tool server for Slack draft text: an edit of a Slack draft is
-//!   Slack text and must be deleted with it (24 hours).
+//! Retention: an edit or a suggestion is deleted when its draft is decided, and by
+//! [`SettingsStore::purge`] once untouched for [`EDIT_RETENTION_DAYS`] (an edit may hold Slack
+//! text, and the tool server drops a Slack draft's own text after 24 hours; the edit is
+//! unreachable once its draft is gone, so this is a backstop, not the 24-hour rule).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use chrono::{DateTime, Utc};
+
 pub use crate::session::StoreError;
+
+/// How long an untouched edit or suggestion is kept in Postgres.
+pub const EDIT_RETENTION_DAYS: i64 = 7;
 
 /// A PM's saved edit of a draft. Nothing is sent until they approve.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +108,12 @@ pub trait SettingsStore: Send + Sync {
         handle: &'a str,
         change: Update<'a>,
     ) -> Result<UserState, StoreError>;
+
+    /// Delete edits and suggestions untouched for [`EDIT_RETENTION_DAYS`], and flags and
+    /// revision-task marks older than 30 days; the number removed. A no-op in memory.
+    async fn purge(&self, _now: DateTime<Utc>) -> Result<u64, StoreError> {
+        Ok(0)
+    }
 }
 
 #[derive(Default)]

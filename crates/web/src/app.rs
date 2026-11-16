@@ -27,6 +27,7 @@ use serde_json::json;
 use crate::auth::{self, AuthProvider, DevLoginProvider, SignInError, SignInInput};
 use crate::config::{Config, NO_PROVIDER};
 use crate::drafts::{self, Draft, Suggestion};
+use crate::followups::{BriefConfig, FollowUpStore, MemoryFollowUpStore};
 use crate::progress::{self, EventOut, Progress};
 use crate::session::{
     self, IdHash, MemorySessionStore, Session, SessionStore, StoreError, CSRF_HEADER,
@@ -35,6 +36,8 @@ use crate::settings::{DraftEdit, MemorySettingsStore, SettingsStore, StoredSugge
 use crate::upstream::{
     Approval, DecisionBody, Runtime, Task, TaskEvent, ToolServer, UpstreamError,
 };
+
+mod brief;
 
 /// How many tasks `GET /api/tasks` lists.
 pub const RECENT_TASKS: usize = 20;
@@ -74,10 +77,13 @@ pub const JSON: &str = "application/json";
 
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
-/// What the server keeps state in, and its clock. [`Deps::in_memory`] is the only set today.
+/// What the server keeps state in, and its clock. [`Deps::in_memory`] is for tests and
+/// development; `store_config::deps_from_env` picks Postgres when `PMOS_WEB_DATABASE_URL` is set.
 pub struct Deps {
     pub sessions: Arc<dyn SessionStore>,
     pub settings: Arc<dyn SettingsStore>,
+    pub followups: Arc<dyn FollowUpStore>,
+    pub brief: BriefConfig,
     pub clock: Clock,
 }
 
@@ -86,6 +92,8 @@ impl Deps {
         Self {
             sessions: Arc::new(MemorySessionStore::new()),
             settings: Arc::new(MemorySettingsStore::new()),
+            followups: Arc::new(MemoryFollowUpStore::new()),
+            brief: BriefConfig::default(),
             clock: Arc::new(Utc::now),
         }
     }
@@ -102,6 +110,8 @@ struct Inner {
     providers: Vec<Arc<dyn AuthProvider>>,
     sessions: Arc<dyn SessionStore>,
     settings: Arc<dyn SettingsStore>,
+    followups: Arc<dyn FollowUpStore>,
+    brief: BriefConfig,
     clock: Clock,
 }
 
@@ -154,6 +164,8 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
         providers,
         sessions: deps.sessions,
         settings: deps.settings,
+        followups: deps.followups,
+        brief: deps.brief,
         clock: deps.clock,
     }));
     let api = Router::new()
@@ -176,9 +188,7 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
         .route("/drafts/{id}/reject", post(reject))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{id}", get(get_task))
-        .route("/brief", get(brief))
-        .route("/followups/{id}/dismiss", post(followup))
-        .route("/followups/{id}/draft", post(followup))
+        .merge(brief::routes())
         .fallback(|| async { ApiError::not_found() })
         // A known path with another method: JSON too, never an empty body or the app.
         .method_not_allowed_fallback(|| async {
@@ -192,6 +202,7 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
     Ok(Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .nest("/api", api)
+        .route("/internal/brief/{handle}", brief::internal())
         .fallback(static_files)
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state))
@@ -579,6 +590,7 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
             .await
             .map_err(ApiError::store)?;
     }
+    brief::housekeeping(&state).await;
     let id = session::random_token();
     let at = now(&state);
     state
@@ -1679,24 +1691,6 @@ async fn list_tasks(State(state): State<AppState>, signed: Signed) -> ApiResult 
         .map(|t| task_out(t, None))
         .collect();
     Ok(Json(json!({ "tasks": tasks })).into_response())
-}
-
-// Not built yet.
-
-async fn brief(_signed: Signed) -> ApiError {
-    ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_built",
-        "The daily brief isn't built yet.",
-    )
-}
-
-async fn followup(_signed: Signed) -> ApiError {
-    ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_built",
-        "Follow-ups aren't built yet.",
-    )
 }
 
 // The web app's own files.
