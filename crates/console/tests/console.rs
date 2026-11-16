@@ -10,13 +10,15 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use pmos_console::config::{Config, Identity};
+use pmos_console::config::{Config, Identity, ProxySecret};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 const BOTS_TOKEN: &str = "console-client-token-0123456789abcdef";
 const TOOLS_TOKEN: &str = "toolserver-service-token-0123456789ab";
 const HOSTILE: &str = "<script>alert('x')</script>";
+/// What the reverse proxy sends in `X-Pmos-Proxy-Secret`.
+const PROXY_SECRET: &str = "reverse-proxy-shared-secret-0123456789";
 
 const TEAM: &str = "members:
   - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm]}
@@ -257,7 +259,7 @@ struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            identity: Identity::Proxy,
+            identity: Identity::Proxy(ProxySecret::new(PROXY_SECRET).unwrap()),
             runtime_up: true,
             audit: true,
             slack: true,
@@ -305,6 +307,11 @@ async fn console(opts: Options) -> Console {
         )
         .unwrap();
     }
+    // Behind the proxy, the test client is the proxy: it sends the secret on every request.
+    let mut proxy_headers = reqwest::header::HeaderMap::new();
+    if matches!(opts.identity, Identity::Proxy(_)) {
+        proxy_headers.insert("x-pmos-proxy-secret", PROXY_SECRET.parse().unwrap());
+    }
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         identity: opts.identity,
@@ -324,6 +331,7 @@ async fn console(opts: Options) -> Console {
         tools: tools_seen,
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .default_headers(proxy_headers)
             .build()
             .unwrap(),
         _dir: dir,
@@ -400,6 +408,120 @@ async fn auth_needs_a_team_member() {
         .calls()
         .iter()
         .all(|(_, _, auth, _)| auth == &format!("Bearer {BOTS_TOKEN}")));
+}
+
+/// Everything any test logs, at every level: the log-secrecy test reads it.
+fn captured_logs() -> Arc<Mutex<Vec<u8>>> {
+    static LOGS: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    LOGS.get_or_init(|| {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || Sink(sink.clone()))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+        logs
+    })
+    .clone()
+}
+
+struct Sink(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A request straight to the console's port, not through the proxy: no secret, or a wrong one.
+async fn bypass(c: &Console, secrets: &[&str], user: &str, path: &str) -> (StatusCode, String) {
+    let mut req = reqwest::Client::new()
+        .get(format!("{}{path}", c.base))
+        .header("x-forwarded-user", user);
+    for secret in secrets {
+        req = req.header("x-pmos-proxy-secret", *secret);
+    }
+    let res = req.send().await.unwrap();
+    let status = res.status();
+    (status, res.text().await.unwrap())
+}
+
+#[tokio::test]
+async fn without_the_proxy_secret_the_forwarded_user_is_ignored() {
+    let logs = captured_logs();
+    let c = console(Options::default()).await;
+    let wrong = "not-the-proxy-secret-0123456789abcdef";
+    let short = &PROXY_SECRET[..PROXY_SECRET.len() - 1];
+    let longer = format!("{PROXY_SECRET}0");
+    // A member, an admin, and a name only an attacker would send.
+    for user in ["ana", "root", "bypass-mallory-7f3a"] {
+        for secrets in [
+            vec![],
+            vec![""],
+            vec![wrong],
+            vec![short],
+            vec![longer.as_str()],
+            // A client's own copy next to the real one.
+            vec![wrong, PROXY_SECRET],
+            vec![PROXY_SECRET, PROXY_SECRET],
+        ] {
+            for path in ["/bots", "/routines", "/activity", "/approvals"] {
+                let (status, body) = bypass(&c, &secrets, user, path).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{user} {secrets:?} {path}"
+                );
+                assert!(body.contains("Not signed in"), "{body}");
+                // Nobody is named on the page: the user header was never read.
+                assert!(!body.contains("class=\"who\""), "{body}");
+                assert!(!body.contains("bypass-mallory"), "{body}");
+            }
+        }
+    }
+    // A form post without the secret changes nothing, even with a good form token.
+    let ana = c.csrf("ana").await;
+    let res = reqwest::Client::new()
+        .post(format!("{}/routines/rtn_ana1/pause", c.base))
+        .header("x-forwarded-user", "ana")
+        .form(&[("csrf", ana.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    // Refused requests never reach an upstream (the csrf fetch above read /routines).
+    assert!(c.runtime.writes().is_empty());
+    assert!(c.tools.calls().is_empty());
+    // With the secret, everything works as before.
+    let (status, body) = bypass(&c, &[PROXY_SECRET], "root", "/bots").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("root · admin"));
+    assert_eq!(
+        bypass(&c, &[PROXY_SECRET], "mallory", "/bots").await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bypass(&c, &[PROXY_SECRET], "", "/bots").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // Liveness needs nobody.
+    assert_eq!(bypass(&c, &[], "", "/healthz").await.0, StatusCode::OK);
+
+    // Nothing logged, by any test so far, holds the secret, a wrong secret, or the user named
+    // by a request that failed the check.
+    tracing::info!("log capture is working");
+    let logs = String::from_utf8_lossy(&logs.lock().unwrap()).to_string();
+    assert!(logs.contains("log capture is working"), "{logs}");
+    assert!(logs.contains("missing or wrong proxy secret"), "{logs}");
+    for needle in [PROXY_SECRET, wrong, short, "bypass-mallory-7f3a"] {
+        assert!(!logs.contains(needle), "logs contain {needle}:\n{logs}");
+    }
 }
 
 #[tokio::test]

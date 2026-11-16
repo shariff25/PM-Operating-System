@@ -1,8 +1,10 @@
 //! Who is looking, what they may see, and form (CSRF) protection.
 //!
 //! - **Identity:** `X-Forwarded-User` from the Spark's SSO proxy, trusted only with
-//!   `PMOS_CONSOLE_TRUST_PROXY=1`; otherwise `PMOS_CONSOLE_DEV_USER`. The header may carry a
-//!   PM OS handle or the member's email.
+//!   `PMOS_CONSOLE_TRUST_PROXY=1` and only on a request that also carries the proxy's shared
+//!   secret in `X-Pmos-Proxy-Secret`; otherwise `PMOS_CONSOLE_DEV_USER`. The user header may
+//!   carry a PM OS handle or the member's email. When the secret check fails, the user header
+//!   is not read, and neither header's value is ever logged.
 //! - **Membership:** the person must be in `team.yaml`, re-read on every request so removing
 //!   someone takes effect at once.
 //! - **Forms:** every POST carries a token bound to the person (an HMAC under a key made at
@@ -16,6 +18,8 @@ use sha2::Sha256;
 use crate::config::Identity;
 
 pub const FORWARDED_USER: &str = "x-forwarded-user";
+/// The reverse proxy's shared secret (`PMOS_CONSOLE_PROXY_SECRET`), on every request.
+pub const PROXY_SECRET: &str = "x-pmos-proxy-secret";
 
 /// The person using the console.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +45,9 @@ impl Viewer {
 pub enum AuthError {
     /// Nobody is signed in (401).
     NoUser,
+    /// The request didn't come through the proxy: its shared secret is missing or wrong
+    /// (401). The forwarded user is not read.
+    NotFromProxy,
     /// Signed in, but not on the team (403).
     NotMember(String),
 }
@@ -52,13 +59,25 @@ pub fn viewer(
     team: &TeamFile,
 ) -> Result<Viewer, AuthError> {
     let presented = match identity {
-        Identity::Proxy => headers
-            .get(FORWARDED_USER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or(AuthError::NoUser)?
-            .to_string(),
+        Identity::Proxy(secret) => {
+            // The secret first: without it the user header isn't even read. Exactly one
+            // secret header, so a client's own copy next to the proxy's is refused too.
+            let mut presented = headers.get_all(PROXY_SECRET).iter();
+            let from_proxy = match (presented.next(), presented.next()) {
+                (Some(value), None) => secret.matches(value.as_bytes()),
+                _ => false,
+            };
+            if !from_proxy {
+                return Err(AuthError::NotFromProxy);
+            }
+            headers
+                .get(FORWARDED_USER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or(AuthError::NoUser)?
+                .to_string()
+        }
         Identity::Dev(handle) => handle.clone(),
     };
     let member = team
