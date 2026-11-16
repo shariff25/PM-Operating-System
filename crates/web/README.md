@@ -21,10 +21,18 @@ PMOS_WEB_STATIC_DIR=web/dist \
 cargo run -p pmos-web
 ```
 
+For Entra ID sign-in instead of `PMOS_WEB_DEV_LOGIN=1`, set `PMOS_WEB_ENTRA_TENANT_ID`,
+`PMOS_WEB_ENTRA_CLIENT_ID`, `PMOS_WEB_ENTRA_CLIENT_SECRET` and `PMOS_WEB_PUBLIC_URL`
+(`docs/entra-sign-in.md` says what to register in Entra).
+
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `PMOS_WEB_BIND` | `127.0.0.1:8770` | |
-| `PMOS_WEB_DEV_LOGIN` | off | `1` turns on development sign-in. **Required today**: with no provider the server refuses to start |
+| `PMOS_WEB_DEV_LOGIN` | off | `1` turns on development sign-in. The server starts with Entra ID, development sign-in, or both (a loud warning); with neither it refuses to start |
+| `PMOS_WEB_ENTRA_TENANT_ID` | none | Entra ID sign-in (`docs/entra-sign-in.md`): the directory (tenant) id, a GUID. `common`, `organizations` and `consumers` are refused |
+| `PMOS_WEB_ENTRA_CLIENT_ID` | none | The application (client) id, a GUID |
+| `PMOS_WEB_ENTRA_CLIENT_SECRET` | none | The client secret, from the secret store. Never logged or shown in errors. Entra is on only with all three and `PMOS_WEB_PUBLIC_URL`; any of them alone refuses to start |
+| `PMOS_WEB_ENTRA_AUTHORITY` | `https://login.microsoftonline.com` | For tests (a mock identity provider) and sovereign clouds: an origin, `https` unless loopback |
 | `PMOS_BOTS_URL` | `http://127.0.0.1:8750` | |
 | `PMOS_WEB_BOTS_TOKEN` | required | The `web` entry of the runtime's `PMOS_BOTS_TOKENS`. At least 32 characters |
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | |
@@ -32,7 +40,7 @@ cargo run -p pmos-web
 | `PMOS_ASSERTION_KEYS` | none | The keys pmos-web signs user assertions with: `web:bots:<kid>:<base64>` and `web:toolserver:<kid>:<base64>`, each optionally followed by `:<kid>:<base64>` for the previous key (`docs/user-assertion.md`, Keys). Without a key for an upstream, its calls carry no assertion. A malformed entry, a key under 32 bytes, or another service's pair refuses to start |
 | `PMOS_CONTENT_ROOT` | `content` | Where `team.yaml` is. The server won't start if it doesn't parse |
 | `PMOS_WEB_STATIC_DIR` | none | The built web app. Must contain `index.html`, served for any unknown non-`/api` path that isn't an asset; the icon is `favicon.svg` (or `favicon.ico`) here |
-| `PMOS_WEB_PUBLIC_URL` | none | The origin browsers use. Writes must come from it; without it, `Origin` must match `Host` |
+| `PMOS_WEB_PUBLIC_URL` | none | The origin browsers use. Writes must come from it; without it, `Origin` must match `Host`. Required with Entra ID (`https` unless loopback): the redirect URI is `<PMOS_WEB_PUBLIC_URL>/api/auth/callback` |
 | `PMOS_WEB_SESSION_IDLE_MINUTES` | `480` | Idle expiry |
 | `PMOS_WEB_SESSION_MAX_MINUTES` | `1440` | Absolute expiry from sign-in |
 | `PMOS_WEB_DATABASE_URL` | none | Postgres for sessions, settings and follow-ups (`src/store_config.rs`). Without it everything is in memory and a start-up warning says a restart signs everyone out |
@@ -63,9 +71,24 @@ The `__Host-pmos` cookie is `Secure`, so browsers only keep it over HTTPS (or on
    any decision is sent, because the tokens this backend holds could act for anyone.
 
 6. **JSON only:** a `POST`, `PUT` or `DELETE` with a body must be `Content-Type:
-   application/json` (`415 bad_content_type`), and sign-in always must, so a cross-site
-   form can't reach a route or sign a victim in as someone else (login CSRF). A write with
-   no body (logout, `DELETE /api/me/hints`) needs no type; it still needs the CSRF token.
+   application/json` (`415 bad_content_type`), and development sign-in always must, so a
+   cross-site form can't reach a route or sign a victim in as someone else (login CSRF). A
+   write with no body (logout, `DELETE /api/me/hints`) needs no type; it still needs the CSRF
+   token.
+7. **Entra ID sign-in** (`src/entra.rs`, `docs/entra-sign-in.md`) is two `GET`s, so rules 3
+   and 6 don't apply to it. `/api/auth/login` sets a signed `__Host-pmos-entra` cookie
+   (HMAC-SHA256 under a key derived from the client secret; `SameSite=Lax` so Microsoft's
+   top-level redirect back carries it; ten minutes) holding `state`, `nonce`, the PKCE
+   verifier and the return path. `/api/auth/callback` requires that cookie and its `state`,
+   compared in constant time and accepted once (a used `state` is remembered until its flow
+   expires), so a forged or replayed callback, and login CSRF with an attacker's own code,
+   fail. The code goes to Microsoft with the client secret and the verifier; the ID token must
+   be RS256, signed by a key from the tenant's JWKS (fetched from the discovery document,
+   cached a day, refetched on an unknown `kid` at most once a minute), with `iss` exactly
+   `<authority>/<tenant>/v2.0`, `aud` the client id, `tid` the tenant, the flow's `nonce`, and
+   `exp`, `nbf` and `iat` within 60 seconds. Every redirect after it is a same-origin path.
+   Tokens, codes, verifiers, `state`, `nonce` and the client secret are never logged; a
+   refused sign-in logs a fixed reason and, for a refused code, only Microsoft's error code.
 
 Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
 `Referrer-Policy: no-referrer` and `Cross-Origin-Opener-Policy: same-origin`. Every `/api`
@@ -219,7 +242,14 @@ who can reach the port while development sign-in is on (they are anyone), and a 
 `POST /api/auth/dev-login {handle}` believes the handle: anyone who reaches the port signs
 in as any member, admins included, and can approve their drafts as them. The server logs a
 warning at start-up. Bind it to `127.0.0.1` (the default) and never put it behind a public
-proxy.
+proxy. Turning Entra ID on does not make it safe: with both on, development sign-in still
+bypasses Entra entirely, and the server logs a louder warning.
+
+**Entra ID sign-in proves who the browser is, not what they may do.** Membership and roles
+still come only from `team.yaml`; group and role claims are ignored. A member is matched by
+`preferred_username` (or else `email`) against their `team.yaml` email, which the tenant's
+admins control; a guest account's `preferred_username` is its home address. Logout ends only
+the PM OS session.
 
 **This backend is still a deputy, now a narrower one.** It holds its own tool server token,
 which reaches only the approvals routes (no sessions, grants, account linking or credentials),
@@ -249,7 +279,9 @@ practice drafts and follow-ups. The session's CSRF token is stored (it is not th
 An edit of a Slack draft is Slack text: the tool server drops the draft's own text after 24
 hours and the edit is unreachable by then, but the row itself waits for the 7-day purge.
 
-**Not built:** Entra ID sign-in (`auth::EntraProvider` documents the seam and is deliberately
-not an `AuthProvider`); rate limiting (on sign-in, on asks and on
-change requests); an audit record of web actions (the tool server audits decisions, with the
-`web` as the client); and a per-PM limit on running tasks.
+**Not built:** rate limiting (on sign-in, on asks and on change requests); an audit record of
+web actions (the tool server audits decisions, with the `web` as the client); a per-PM limit
+on running tasks; and, for Entra ID sign-in (`docs/entra-sign-in.md`, "Not built"): roles from
+group or app-role claims, matching by the token's `oid`, conditional access awareness, single
+logout, and token refresh (only the ID token is used, once). The deploy kit (`deploy/`) does
+not pass the `PMOS_WEB_ENTRA_*` variables to the `web` service yet.
