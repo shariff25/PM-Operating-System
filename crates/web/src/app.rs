@@ -27,11 +27,14 @@ use serde_json::json;
 use crate::auth::{self, AuthProvider, DevLoginProvider, SignInError, SignInInput};
 use crate::config::{Config, NO_PROVIDER};
 use crate::drafts::{self, Draft, Suggestion};
+use crate::progress::{self, EventOut, Progress};
 use crate::session::{
     self, IdHash, MemorySessionStore, Session, SessionStore, StoreError, CSRF_HEADER,
 };
 use crate::settings::{DraftEdit, MemorySettingsStore, SettingsStore, StoredSuggestion, UserState};
-use crate::upstream::{Approval, DecisionBody, Runtime, Task, ToolServer, UpstreamError};
+use crate::upstream::{
+    Approval, DecisionBody, Runtime, Task, TaskEvent, ToolServer, UpstreamError,
+};
 
 /// How many tasks `GET /api/tasks` lists.
 pub const RECENT_TASKS: usize = 20;
@@ -177,6 +180,14 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
         .route("/followups/{id}/dismiss", post(followup))
         .route("/followups/{id}/draft", post(followup))
         .fallback(|| async { ApiError::not_found() })
+        // A known path with another method: JSON too, never an empty body or the app.
+        .method_not_allowed_fallback(|| async {
+            ApiError::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "This route doesn't take that method.",
+            )
+        })
         .layer(axum::middleware::from_fn(require_json));
     Ok(Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -615,7 +626,9 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult 
 fn me_json(signed: &Signed, st: &UserState) -> Response {
     Json(json!({
         "handle": signed.member.handle,
-        // team.yaml has no display name yet; the user database will.
+        // The handle: a team.yaml member (`pmos_contract::model::TeamMember`) has no display
+        // name, and the name onboarding takes from Slack stays on the join request, which
+        // is not written to team.yaml. The user database will have one.
         "name": signed.member.handle,
         "roles": signed.member.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
         "csrf_token": signed.session.csrf_token,
@@ -1535,13 +1548,8 @@ async fn delete_draft(
 
 // Tasks.
 
-#[derive(Serialize)]
-struct EventOut {
-    at: String,
-    kind: String,
-    text: String,
-}
-
+/// A task as the app shows it. `events` (only on `GET /api/tasks/{id}`), `progress` and
+/// `retrying` are worked out in `progress.rs`: no worker or host name ever reaches the app.
 #[derive(Serialize)]
 struct TaskOut {
     id: String,
@@ -1553,12 +1561,21 @@ struct TaskOut {
     draft_ids: Vec<String>,
     created_at: String,
     updated_at: String,
+    progress: Option<Progress>,
+    retrying: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     events: Option<Vec<EventOut>>,
 }
 
-fn task_out(t: Task, events: Option<Vec<EventOut>>) -> TaskOut {
+/// `events` is `None` for a list (no events are read) and `Some` for a single task.
+fn task_out(t: Task, events: Option<&[TaskEvent]>) -> TaskOut {
+    let seen = events.unwrap_or_default();
+    let progress = progress::progress(&t, seen);
+    let retrying = progress::retrying(&t, seen);
     TaskOut {
+        progress,
+        retrying,
+        events: events.map(progress::milestones),
         id: t.id,
         bot: t.bot,
         text: t.text,
@@ -1568,7 +1585,6 @@ fn task_out(t: Task, events: Option<Vec<EventOut>>) -> TaskOut {
         draft_ids: t.approvals,
         created_at: t.created_at,
         updated_at: t.updated_at,
-        events,
     }
 }
 
@@ -1610,7 +1626,7 @@ async fn create_task(State(state): State<AppState>, signed: Signed, body: Bytes)
         }));
     }
     tracing::info!(user = %signed.handle(), task = %task.id, "task created");
-    Ok((StatusCode::CREATED, Json(task_out(task, Some(Vec::new())))).into_response())
+    Ok((StatusCode::CREATED, Json(task_out(task, Some(&[])))).into_response())
 }
 
 async fn get_task(
@@ -1635,23 +1651,13 @@ async fn get_task(
         return Err(ApiError::not_found());
     }
     let events = match state.0.runtime.task_events(signed.handle(), &id).await {
-        Ok(ev) => ev
-            .into_iter()
-            .filter_map(|e| {
-                let text = e.text.filter(|t| !t.is_empty())?;
-                Some(EventOut {
-                    at: e.at,
-                    kind: e.kind,
-                    text,
-                })
-            })
-            .collect(),
+        Ok(ev) => ev,
         Err(e) => {
             tracing::warn!(error = ?e, task = %id, "task events unavailable");
             Vec::new()
         }
     };
-    Ok(Json(task_out(task, Some(events))).into_response())
+    Ok(Json(task_out(task, Some(&events))).into_response())
 }
 
 async fn list_tasks(State(state): State<AppState>, signed: Signed) -> ApiResult {
@@ -1719,6 +1725,38 @@ fn content_type(path: &FsPath) -> &'static str {
     }
 }
 
+/// How long a browser may keep one of the app's files: `index.html` is checked every time
+/// (it names the current build's scripts); the icon, whose name never changes and which
+/// browsers fetch on every page, a week; anything else five minutes.
+fn cache_control(file: &FsPath) -> &'static str {
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if file.extension().is_some_and(|e| e == "html") {
+        "no-cache"
+    } else if FAVICONS.contains(&name) {
+        "public, max-age=604800"
+    } else {
+        "public, max-age=300"
+    }
+}
+
+/// The app's icon files, served from the static directory: the CSP allows no `data:` image,
+/// so the icon must be a file of this origin.
+pub const FAVICONS: [&str; 2] = ["favicon.svg", "favicon.ico"];
+
+/// Does this URL path name a file of a type the app serves (anything but a page)?
+fn is_asset_path(path: &str) -> bool {
+    let last = path.rsplit('/').next().unwrap_or_default();
+    match last.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => {
+            content_type(FsPath::new(last)) != "application/octet-stream" && ext != "html"
+        }
+        _ => false,
+    }
+}
+
 /// A file under `root` for this URL path, or `None`: no `..`, no hidden names, and after
 /// resolving links still inside `root`.
 fn resolve(root: &FsPath, url_path: &str) -> Option<PathBuf> {
@@ -1747,15 +1785,17 @@ async fn static_files(State(state): State<AppState>, method: Method, uri: Uri) -
     if !matches!(method, Method::GET | Method::HEAD) {
         return ApiError::not_found().into_response();
     }
-    // A real file, or else the app's index.html, which routes on the client.
-    let file = resolve(root, path).unwrap_or_else(|| root.join("index.html"));
+    // A real file, or else the app's index.html, which routes on the client. A missing
+    // file that is plainly not a page (`/favicon.svg`, `/assets/x.js`) is a 404: the app's
+    // HTML served as an image or script helps nobody.
+    let file = match resolve(root, path) {
+        Some(file) => file,
+        None if is_asset_path(path) => return ApiError::not_found().into_response(),
+        None => root.join("index.html"),
+    };
     match tokio::fs::read(&file).await {
         Ok(bytes) => {
-            let cache = if file.extension().is_some_and(|e| e == "html") {
-                "no-cache"
-            } else {
-                "public, max-age=300"
-            };
+            let cache = cache_control(&file);
             (
                 [
                     (header::CONTENT_TYPE, content_type(&file)),
@@ -1776,6 +1816,7 @@ async fn static_files(State(state): State<AppState>, method: Method, uri: Uri) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn strips_a_fence_around_the_revised_text() {
@@ -1800,6 +1841,27 @@ mod tests {
     }
 
     #[test]
+    fn icons_cache_long_and_missing_assets_are_not_the_app() {
+        assert_eq!(
+            cache_control(FsPath::new("/d/favicon.svg")),
+            "public, max-age=604800"
+        );
+        assert_eq!(cache_control(FsPath::new("/d/index.html")), "no-cache");
+        assert_eq!(
+            cache_control(FsPath::new("/d/assets/app.js")),
+            "public, max-age=300"
+        );
+        assert_eq!(content_type(FsPath::new("favicon.svg")), "image/svg+xml");
+        assert_eq!(content_type(FsPath::new("favicon.ico")), "image/x-icon");
+        assert!(is_asset_path("/favicon.svg"));
+        assert!(is_asset_path("/assets/app.js"));
+        assert!(!is_asset_path("/drafts/apr_1"));
+        assert!(!is_asset_path("/drafts/apr_1.2"));
+        assert!(!is_asset_path("/index.html"));
+        assert!(!is_asset_path("/.env"));
+    }
+
+    #[test]
     fn settles_revision_tasks() {
         let task = |status: &str, result: Option<&str>| Task {
             id: "tsk_1".into(),
@@ -1811,6 +1873,8 @@ mod tests {
             result: result.map(String::from),
             error: None,
             approvals: vec![],
+            checklist: Value::Null,
+            attempts: 1,
             created_at: String::new(),
             updated_at: String::new(),
         };

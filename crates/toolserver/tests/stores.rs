@@ -1353,6 +1353,9 @@ fn event(outcome: Outcome) -> AuditEvent {
         tool: "confluence.create_draft".into(),
         outcome,
         sources: vec!["context/products/cloud.md".into(), "jira:PM-101".into()],
+        source_titles: [("jira:PM-101".to_string(), "SSO for the console".to_string())]
+            .into_iter()
+            .collect(),
         args_hash: Some("abc".into()),
         output_ref: Some("apr_1".into()),
         detail: None,
@@ -1383,6 +1386,15 @@ async fn audit_records_events(b: &Backend) {
         assert_eq!(outcomes, vec!["pending", "approved"]);
         let sources: Vec<String> = rows[0].get("sources");
         assert_eq!(sources, vec!["context/products/cloud.md", "jira:PM-101"]);
+        // An event recorded before titles were (the column is null) reads with none.
+        sqlx::query(
+            "INSERT INTO audit_events (at, run_id, user_handle, skill, tool, outcome, sources)
+             VALUES ($1, 'run-a', 'ana', 'prd-draft', 'jira.read', 'ok', ARRAY['jira:PM-7'])",
+        )
+        .bind(now() - Duration::seconds(5))
+        .execute(pg.pool())
+        .await
+        .unwrap();
 
         // Append-only: no update, delete or truncate, even by the table's owner.
         for sql in [
@@ -1397,7 +1409,30 @@ async fn audit_records_events(b: &Backend) {
             .fetch_one(pg.pool())
             .await
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
+    }
+    // A read is read back with its titles, in both stores.
+    let mut read = event(Outcome::Ok);
+    read.tool = "jira.read".into();
+    b.stores.audit.record(read).await.unwrap();
+    let reads = b
+        .stores
+        .audit
+        .reads("ana", "run-a", now() + Duration::seconds(1), 10)
+        .await
+        .unwrap()
+        .unwrap();
+    // Only `ok` events with sources are reads: not the pending and approved ones above.
+    assert!(reads.iter().all(|r| r.tool == "jira.read"));
+    assert_eq!(
+        reads[0].titles.get("jira:PM-101").map(String::as_str),
+        Some("SSO for the console")
+    );
+    if b.pg.is_some() {
+        assert_eq!(reads.len(), 2);
+        assert!(reads[1].titles.is_empty(), "an older event has no titles");
+    } else {
+        assert_eq!(reads.len(), 1);
     }
 }
 

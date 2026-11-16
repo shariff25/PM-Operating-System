@@ -1,16 +1,19 @@
 //! What a draft was built from, and links to where it will go, worked out from metadata the
 //! tool server already keeps: the audit log's `sources` (context paths and `system:id`
-//! references) and an approval item's target arguments. Nothing here stores or returns
-//! message text, page bodies or snippets, and nothing makes a network call.
+//! references) and `source_titles` (a short title per item, recorded at the read), and an
+//! approval item's target arguments. Nothing here stores or returns message text, page
+//! bodies or snippets, and nothing makes a network call.
 //!
 //! | `sources` entry | `system` | `title` | `url` |
 //! | --- | --- | --- | --- |
-//! | `context/…/x.md` (context tools) | `context` | the file's title in the context index | none (an internal file) |
-//! | `jira:PAY-212` | `jira` | the issue key | `{site}/browse/PAY-212` |
+//! | `context/…/x.md` (context tools) | `context` | the file's title in the context index, else the recorded one | none (an internal file) |
+//! | `jira:PAY-212` | `jira` | "PAY-212: {recorded summary}", else the issue key | `{site}/browse/PAY-212` |
 //! | `jira:rollup:status` | `jira` | "Jira rollup by status" | none |
-//! | `confluence:12345` | `confluence` | "Confluence page 12345" | `{site}/wiki/pages/viewpage.action?pageId=12345` |
-//! | `slack:C01:1731.0001` | `slack` | "Slack thread in C01" (`read_thread`) or "Slack message in C01" | `https://slack.com/archives/C01/p17310001` |
-//! | `docs:https://…/page.md` | `docs` | the page's slug ("page") | the docs URL itself |
+//! | `confluence:12345` | `confluence` | the recorded page title, else "Confluence page 12345" | `{site}/wiki/pages/viewpage.action?pageId=12345` |
+//! | `slack:C01:1731.0001` | `slack` | "Slack thread in C01" (`read_thread`) or "Slack message in C01"; never a recorded title | `https://slack.com/archives/C01/p17310001` |
+//! | `docs:https://…/page.md` | `docs` | the recorded page title, else the page's slug ("page") | the docs URL itself |
+//!
+//! Events recorded before titles were have none, so their sources read as ids, as before.
 //!
 //! `{site}` is the PM's linked Atlassian site, read from the stored credential (never the
 //! token); with no linked site, Jira and Confluence sources have no `url`. A reference whose
@@ -20,6 +23,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::audit::source_title;
 use crate::connectors::slack::archive_url;
 
 /// The most sources one approval item lists.
@@ -135,13 +139,16 @@ pub fn site_url(site_url: Option<&str>, cloud_id: Option<&str>) -> Option<String
 }
 
 /// What a connector read's `system:id` audit entry says, or `None` for a shape this doesn't
-/// recognise. Returns `(ref, title, url)`.
+/// recognise. `recorded` is the title the audit event recorded for it, if any; it is cleaned
+/// again here and never used for Slack. Returns `(ref, title, url)`.
 pub fn describe(
     system: &str,
     action: &str,
     id: &str,
     site: Option<&str>,
+    recorded: Option<&str>,
 ) -> Option<(String, String, Option<String>)> {
+    let recorded = recorded.and_then(source_title);
     match system {
         "jira" => {
             if let Some(group) = id.strip_prefix("rollup:") {
@@ -150,12 +157,17 @@ pub fn describe(
             }
             jira_key(id).then(|| {
                 let url = site.map(|s| format!("{s}/browse/{id}"));
-                (id.to_string(), id.to_string(), url)
+                let title = match recorded {
+                    Some(summary) => format!("{id}: {summary}"),
+                    None => id.to_string(),
+                };
+                (id.to_string(), title, url)
             })
         }
         "confluence" => page_id(id).then(|| {
             let url = site.map(|s| format!("{s}/wiki/pages/viewpage.action?pageId={id}"));
-            (id.to_string(), format!("Confluence page {id}"), url)
+            let title = recorded.unwrap_or_else(|| format!("Confluence page {id}"));
+            (id.to_string(), title, url)
         }),
         "slack" => {
             let (channel, ts) = id.split_once(':')?;
@@ -187,10 +199,10 @@ pub fn describe(
                 .unwrap_or_default();
             let slug = slug.strip_suffix(".md").unwrap_or(slug);
             let title = slug.replace(['-', '_'], " ");
-            let title = if title.trim().is_empty() {
-                "Docs page".to_string()
-            } else {
-                title
+            let title = match recorded {
+                Some(t) => t,
+                None if title.trim().is_empty() => "Docs page".to_string(),
+                None => title,
             };
             Some((id.to_string(), title, Some(id.to_string())))
         }
@@ -253,7 +265,7 @@ mod tests {
     #[test]
     fn describes_each_system_from_ids_only() {
         assert_eq!(
-            describe("jira", "read", "PAY-212", SITE),
+            describe("jira", "read", "PAY-212", SITE, None),
             Some((
                 "PAY-212".into(),
                 "PAY-212".into(),
@@ -261,23 +273,31 @@ mod tests {
             ))
         );
         assert_eq!(
-            describe("jira", "read", "PAY-212", None).unwrap().2,
+            describe("jira", "read", "PAY-212", None, None).unwrap().2,
             None,
             "no site, no link"
         );
         assert_eq!(
-            describe("jira", "rollup", "rollup:status", SITE).unwrap().1,
+            describe("jira", "rollup", "rollup:status", SITE, None)
+                .unwrap()
+                .1,
             "Jira rollup by status"
         );
         assert_eq!(
-            describe("confluence", "read", "9001", SITE)
+            describe("confluence", "read", "9001", SITE, None)
                 .unwrap()
                 .2
                 .as_deref(),
             Some("https://acme.atlassian.net/wiki/pages/viewpage.action?pageId=9001")
         );
         assert_eq!(
-            describe("slack", "read_thread", "C0FIELD:1731500000.000100", None),
+            describe(
+                "slack",
+                "read_thread",
+                "C0FIELD:1731500000.000100",
+                None,
+                None
+            ),
             Some((
                 "C0FIELD:1731500000.000100".into(),
                 "Slack thread in C0FIELD".into(),
@@ -289,6 +309,7 @@ mod tests {
                 "docs",
                 "read",
                 "https://docs.example.com/docs/vault-saml-sso.md",
+                None,
                 None
             )
             .unwrap()
@@ -306,8 +327,84 @@ mod tests {
             ("docs", "https://docs.example.com/\"onclick"),
             ("github", "x"),
         ] {
-            assert_eq!(describe(system, "read", id, SITE), None, "{system}:{id}");
+            assert_eq!(
+                describe(system, "read", id, SITE, Some("A title")),
+                None,
+                "{system}:{id}"
+            );
         }
+    }
+
+    #[test]
+    fn recorded_titles_name_items_but_never_slack() {
+        assert_eq!(
+            describe(
+                "jira",
+                "read",
+                "PAY-212",
+                SITE,
+                Some("Grace period setting")
+            )
+            .unwrap()
+            .1,
+            "PAY-212: Grace period setting"
+        );
+        assert_eq!(
+            describe(
+                "confluence",
+                "read",
+                "9001",
+                None,
+                Some("PRD: Key export v2")
+            )
+            .unwrap()
+            .1,
+            "PRD: Key export v2"
+        );
+        assert_eq!(
+            describe(
+                "docs",
+                "read",
+                "https://docs.example.com/docs/vault-saml-sso.md",
+                None,
+                Some("Configure SAML SSO")
+            )
+            .unwrap()
+            .1,
+            "Configure SAML SSO"
+        );
+        // Cleaned again on the way out, and blank reads as none.
+        assert_eq!(
+            describe("confluence", "read", "9001", None, Some("A\n<b>B</b>"))
+                .unwrap()
+                .1,
+            "A <b>B</b>"
+        );
+        assert_eq!(
+            describe("confluence", "read", "9001", None, Some(" \t"))
+                .unwrap()
+                .1,
+            "Confluence page 9001"
+        );
+        // Slack stays channel and message ids, whatever was recorded.
+        assert_eq!(
+            describe(
+                "slack",
+                "read_thread",
+                "C0FIELD:1731500000.000100",
+                None,
+                Some("the launch slipped")
+            )
+            .unwrap()
+            .1,
+            "Slack thread in C0FIELD"
+        );
+        assert_eq!(
+            describe("jira", "rollup", "rollup:status", SITE, Some("x"))
+                .unwrap()
+                .1,
+            "Jira rollup by status"
+        );
     }
 
     #[test]

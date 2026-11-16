@@ -16,7 +16,7 @@ service and personal agents go through the same server, so they follow the same 
 | A team bot reads only what its owner chose | Its Jira, Confluence and Slack reads use its own account and stay inside its `reads` list; anything else is `403`, audited as `denied` | Decision 26 |
 | External content is data, not instructions | Every Jira, Confluence and Slack item comes back wrapped as `{"untrusted": true, "source": …, "content": …}` | Untrusted content |
 | Nothing is written outside PM OS without approval | A write runs only with a matching grant or an inbox approval by its own user; otherwise it returns `pending_approval` and does nothing | OUT-4 |
-| Everything is audited | One event per call and per decision: user, skill, run, tool, outcome, sources read, argument hash, output reference. Never message bodies | ADM-2, SLK-8 |
+| Everything is audited | One event per call and per decision: user, skill, run, tool, outcome, sources read (with a short title for Jira, Confluence, docs and context items, never Slack), argument hash, output reference. Never message bodies | ADM-2, SLK-8 |
 | Arguments match the tool's schema | Required keys, no unknown keys, types and enums checked before any handler runs | — |
 | A bad draft gets one correction | A write tool refused twice for invalid arguments in a session is refused for the rest of it, without reaching the connector (see **Invalid drafts**) | — |
 | Every draft is labelled | Each approval item has a row in the feedback ledger: what became of it, never its text (see **Feedback ledger**) | — |
@@ -75,17 +75,42 @@ fields, which older readers ignore. None needs a network call:
 audit log: `user`'s successful read-tool calls with the item's `run_id`, at or before the
 item's `created_at`. Each source appears once (its latest read), newest first, at most 20
 (`truncated` says more were read); at most 500 audit events are scanned. It is metadata
-only, as the audit log is: nothing new is recorded for it, and no message text, page body,
-snippet or excerpt is stored or returned.
+only, as the audit log is: no message text, page body, snippet or excerpt is stored or
+returned.
 
 | Audit `sources` entry | `system` | `title` | `url` |
 | --- | --- | --- | --- |
-| a context path (context tools) | `context` | the file's title in the context index | `null` |
-| `jira:PAY-212` | `jira` | `PAY-212` (the key, not its summary) | `{site}/browse/PAY-212` |
+| a context path (context tools) | `context` | the file's title in the context index, else the title recorded at the read, else the path | `null` |
+| `jira:PAY-212` | `jira` | `PAY-212: {summary}` with the recorded summary, else `PAY-212` | `{site}/browse/PAY-212` |
 | `jira:rollup:status` | `jira` | `Jira rollup by status` | `null` |
-| `confluence:12345` | `confluence` | `Confluence page 12345` (no page title is recorded) | `{site}/wiki/pages/viewpage.action?pageId=12345` |
-| `slack:C01:1731.0001` | `slack` | `Slack thread in C01` or `Slack message in C01` (the channel id) | `https://slack.com/archives/C01/p17310001` |
-| `docs:https://…/page.md` | `docs` | the page's slug | the docs URL |
+| `confluence:12345` | `confluence` | the recorded page title, else `Confluence page 12345` | `{site}/wiki/pages/viewpage.action?pageId=12345` |
+| `slack:C01:1731.0001` | `slack` | `Slack thread in C01` or `Slack message in C01` (the channel id); never a recorded title | `https://slack.com/archives/C01/p17310001` |
+| `docs:https://…/page.md` | `docs` | the recorded page title, else the page's slug | the docs URL |
+
+**Source titles in the audit log.** So that a PM sees "PAY-212: Grace period setting" rather
+than "PAY-212", each successful read records, next to its `sources`, a short title for each
+item it returned, in `source_titles`: a map from the `sources` entry to the title.
+
+- **What:** a Jira issue's summary (without the key, which the entry already has), a
+  Confluence page's title, a docs page's title, a context file's title from the index. Only
+  for these four systems (`audit::TITLED_SYSTEMS`); not for a Jira rollup.
+- **How much:** control characters (line breaks included) become spaces, runs of white
+  space one space, at most 120 characters (`audit::source_title`). Never a body, a
+  description, a comment, a snippet or an excerpt.
+- **Never Slack.** A Slack read records only `slack:{channel}:{ts}`, as before: no title,
+  channel name or text, because Slack text may be kept at most 24 hours (SLK-8, D6) and the
+  audit log is kept for good. The connector's Slack "titles" are built from the channel
+  and the message, so none is recorded, and the sources endpoint ignores any it finds.
+- **Why it is metadata:** a title names the thing that was read, like the key or page id
+  already in `sources`; it is what the PM sees as a link in Jira or Confluence anyway. It
+  is as sensitive as the item's existence, and the audit log is already readable only by
+  platform owners (the Postgres table, the JSON-lines file) and, for one item, by the item's
+  own user through this endpoint.
+- **Where:** a nullable `jsonb` column `audit_events.source_titles` (migration 0009, which
+  adds the column without a default, so no row is rewritten and the append-only triggers
+  stand), the in-memory log, and a `source_titles` object in each JSON-lines line, left out
+  when empty. Events recorded before 0009 have none, and their sources read as ids, as
+  before.
 
 Limits: Jira and Confluence links need a linked Atlassian site (else `url` is `null`); a
 read that found nothing, failed or was refused records no sources, so it isn't listed; a
@@ -744,7 +769,7 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 | Grants | `grants` | Taken with `DELETE … RETURNING` on a row locked `FOR UPDATE SKIP LOCKED`: one grant, one call, even under concurrency |
 | Approvals | `approvals` | A decision locks the item (`SELECT … FOR UPDATE`) and changes it only while it is `pending`: exactly one of several concurrent decisions wins. A Slack reply is created under an advisory lock per user and thread. The Slack draft sweep takes items `FOR UPDATE SKIP LOCKED`, leaving one a decision holds to the decision |
 | Feedback ledger | `ledger` | One row per approval item, written in the same transaction as the item on create, decide, complete and expire. `expired` is stored for Slack drafts and worked out on read for the rest |
-| Audit | `audit_events` | Append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Each event records the caller (`mcp`, `orchestrator` or `bot`) and the session's skill or bot. |
+| Audit | `audit_events` | Append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Each event records the caller (`mcp`, `orchestrator` or `bot`) and the session's skill or bot, and for a read the titles of its non-Slack sources (`source_titles`, null before migration 0009; see **What an item is shown with**). |
 | Credentials | `credentials` | Tokens sealed by the vault; the database never sees plaintext. Providers `atlassian`, `slack`, `github` |
 | Memory repos | `memory_repos` | One row per PM: `repo` (`org/name`) and `verified_at` |
 | Member requests | `member_requests` | A partial unique index keeps one `pending` request per Slack id; a decision is a conditional `UPDATE … WHERE status = 'pending'`, so exactly one wins |

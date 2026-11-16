@@ -36,9 +36,9 @@ use crate::approvals::{
     args_hash, reply_message, ApprovalItem, DecideError, Decision, Drafted, NewItem, Status,
     Verdict, REPLY_TOOL, SLACK_DRAFT_TOOLS,
 };
-use crate::audit::{AuditEvent, Client, Outcome};
+use crate::audit::{source_title, AuditEvent, Client, Outcome, TITLED_SYSTEMS};
 use crate::catalog::{Catalog, Roster, ToolSpec};
-use crate::connectors::{untrusted, Audience, Caller, Connector, ConnectorError, TeamBot};
+use crate::connectors::{untrusted, Audience, Caller, Connector, ConnectorError, Item, TeamBot};
 use crate::context::{load_docs, ContextDoc, ReindexReport};
 use crate::ledger::{summarize, LedgerQuery, LedgerRow, Summary, DEFAULT_EXPIRE_DAYS};
 use crate::memory::{valid_key, MemoryError};
@@ -226,6 +226,30 @@ pub const LOCAL_SYSTEMS: [&str; 4] = ["context", "memory", "stats", "bets"];
 /// Why a team bot can't use the bets register.
 const BETS_PERSONAL: &str =
     "the bets register is a PM's own memory: only the PM's own sessions and personal bot can use it, never a team bot";
+
+/// The title the audit log keeps for a connector read's item, keyed by its `sources` entry:
+/// a Jira issue's summary (without the key the connector puts first), a Confluence page's
+/// title, a docs page's title; cleaned and capped by [`source_title`]. `None` for Slack (its
+/// text may be kept only 24 hours, so nothing of it is recorded), for a Jira rollup (not an
+/// item) and for any other system.
+fn recorded_title(item: &Item) -> Option<(String, String)> {
+    let (system, id) = (item.source.system.as_str(), item.source.id.as_str());
+    if !TITLED_SYSTEMS.contains(&system) || system == "slack" {
+        return None;
+    }
+    if system == "jira" && id.starts_with("rollup:") {
+        return None;
+    }
+    let raw = match system {
+        "jira" => item
+            .title
+            .strip_prefix(id)
+            .and_then(|t| t.strip_prefix(':'))
+            .unwrap_or(&item.title),
+        _ => &item.title,
+    };
+    Some((format!("{system}:{id}"), source_title(raw)?))
+}
 
 /// The data class a connector read counts as: the public support docs are `public`;
 /// Jira, Confluence, Slack and anything else are `internal`.
@@ -652,6 +676,7 @@ impl ToolService {
             tool: harness_name.to_string(),
             outcome: Outcome::Ok,
             sources: Vec::new(),
+            source_titles: Default::default(),
             args_hash: Some(args_hash(&args)),
             output_ref: None,
             detail: None,
@@ -821,6 +846,7 @@ impl ToolService {
                     .iter()
                     .map(|i| format!("{}:{}", i.source.system, i.source.id))
                     .collect();
+                event.source_titles = items.iter().filter_map(recorded_title).collect();
                 if !items.is_empty() {
                     self.note_read(session, Some(connector_class(system)))
                         .await?;
@@ -910,6 +936,10 @@ impl ToolService {
                     .await?;
                 let allowed = found.hits;
                 event.sources = allowed.iter().map(|h| h.doc.path.clone()).collect();
+                event.source_titles = allowed
+                    .iter()
+                    .filter_map(|h| Some((h.doc.path.clone(), source_title(&h.doc.title)?)))
+                    .collect();
                 if found.withheld > 0 {
                     // Audited, not shown to the model: the result list simply omits them.
                     event.detail = Some(format!(
@@ -947,6 +977,10 @@ impl ToolService {
                     )));
                 }
                 event.sources = vec![doc.path.clone()];
+                event.source_titles = source_title(&doc.title)
+                    .map(|t| (doc.path.clone(), t))
+                    .into_iter()
+                    .collect();
                 let mut v = self.doc_meta(&doc, today);
                 v["body"] = json!(doc.body);
                 Ok((v, Some(doc.sensitivity)))
@@ -1280,6 +1314,7 @@ impl ToolService {
             tool: spec.name.clone(),
             outcome: Outcome::Granted,
             sources: Vec::new(),
+            source_titles: Default::default(),
             args_hash: Some(args_hash(args)),
             output_ref: None,
             detail: None,
@@ -1465,9 +1500,14 @@ impl ToolService {
                     if !entry.starts_with("context/") || entry.contains("..") {
                         continue;
                     }
+                    // The index's title now, else the one recorded at the read, else the path.
                     let title = match self.stores.context.get(entry).await {
                         Ok(Some(doc)) if !doc.title.trim().is_empty() => doc.title,
-                        _ => entry.clone(),
+                        _ => event
+                            .titles
+                            .get(entry)
+                            .cloned()
+                            .unwrap_or_else(|| entry.clone()),
                     };
                     Some(("context".to_string(), entry.clone(), title, None))
                 } else {
@@ -1482,6 +1522,7 @@ impl ToolService {
                         spec.action(),
                         id,
                         site.as_ref().and_then(|s| s.as_deref()),
+                        event.titles.get(entry).map(String::as_str),
                     )
                     .map(|(r, title, url)| (spec.system.clone(), r, title, url))
                 };
@@ -1624,6 +1665,7 @@ impl ToolService {
             tool: item.tool,
             outcome: Outcome::Denied,
             sources: Vec::new(),
+            source_titles: Default::default(),
             args_hash: Some(item.args_hash),
             output_ref: Some(item.id),
             detail: Some(why.to_string()),
@@ -1711,6 +1753,7 @@ impl ToolService {
             tool: item.tool.clone(),
             outcome: Outcome::Rejected,
             sources: Vec::new(),
+            source_titles: Default::default(),
             args_hash: Some(item.args_hash.clone()),
             output_ref: Some(item.id.clone()),
             detail: match (decision, reason) {
@@ -1757,6 +1800,7 @@ impl ToolService {
             tool: item.tool.clone(),
             outcome,
             sources: Vec::new(),
+            source_titles: Default::default(),
             args_hash: Some(item.args_hash.clone()),
             output_ref: Some(item.id.clone()),
             detail: Some(detail),
@@ -1843,6 +1887,7 @@ impl ToolService {
                 tool: item.tool.clone(),
                 outcome: Outcome::Expired,
                 sources: Vec::new(),
+                source_titles: Default::default(),
                 args_hash: Some(item.args_hash.clone()),
                 output_ref: Some(item.id.clone()),
                 detail: Some(format!(
@@ -1990,6 +2035,7 @@ impl ToolService {
                     tool: item.tool.clone(),
                     outcome: Outcome::Error,
                     sources: Vec::new(),
+                    source_titles: Default::default(),
                     args_hash: Some(item.args_hash.clone()),
                     output_ref: Some(item.id.clone()),
                     detail: Some(format!("outcome unknown: {message}")),

@@ -17,6 +17,7 @@
 //! - The Slack draft sweep picks items `FOR UPDATE SKIP LOCKED`: one a decision holds is
 //!   left to the decision.
 
+use std::collections::BTreeMap;
 use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
@@ -877,8 +878,8 @@ impl AuditSink for PgStore {
         sqlx::query(
             "INSERT INTO audit_events
                  (at, run_id, user_handle, skill, bot, tool, outcome, sources, args_hash,
-                  output_ref, detail, client)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                  output_ref, detail, client, source_titles)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(event.at)
         .bind(&event.run_id)
@@ -892,6 +893,11 @@ impl AuditSink for PgStore {
         .bind(&event.output_ref)
         .bind(&event.detail)
         .bind(event.client.as_str())
+        // Null rather than `{}` when there are none, as for events before the column.
+        .bind(
+            (!event.source_titles.is_empty())
+                .then(|| sqlx::types::Json(event.source_titles.clone())),
+        )
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -906,7 +912,7 @@ impl AuditSink for PgStore {
     ) -> StoreResult<Option<Vec<ReadEvent>>> {
         // `audit_events_run` covers `run_id`.
         let rows = sqlx::query(
-            "SELECT at, tool, sources FROM audit_events
+            "SELECT at, tool, sources, source_titles FROM audit_events
              WHERE run_id = $1 AND user_handle = $2 AND outcome = 'ok'
                AND cardinality(sources) > 0 AND at <= $3
              ORDER BY at DESC, id DESC
@@ -924,6 +930,12 @@ impl AuditSink for PgStore {
                 at: r.try_get("at")?,
                 tool: r.try_get("tool")?,
                 sources: r.try_get("sources")?,
+                titles: r
+                    .try_get::<Option<sqlx::types::Json<BTreeMap<String, String>>>, _>(
+                        "source_titles",
+                    )?
+                    .map(|j| j.0)
+                    .unwrap_or_default(),
             });
         }
         Ok(Some(out))

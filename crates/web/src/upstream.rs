@@ -68,6 +68,13 @@ pub struct Task {
     pub error: Option<String>,
     #[serde(default)]
     pub approvals: Vec<String>,
+    /// The worker's latest checklist (spec §3, `[{item, done}]`), for `progress`. Kept as
+    /// JSON so a shape this build doesn't know can't make the task unreadable.
+    #[serde(default)]
+    pub checklist: Value,
+    /// How many times a worker has claimed the task; above 1 it was retried.
+    #[serde(default)]
+    pub attempts: u32,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
