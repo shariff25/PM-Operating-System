@@ -1,12 +1,23 @@
 //! The two upstreams: the bot runtime (`pmos-bots`, as client `web`, every call naming the
-//! PM in `X-Pmos-User`) and the tool server (approvals, with the service token). Shapes
-//! follow `docs/bot-runtime-spec.md` §3 and `docs/toolserver.md`; fields not used here are
-//! ignored, and lists may come bare (`[…]`) or wrapped (`{"items": […]}`).
+//! PM in `X-Pmos-User`) and the tool server (approvals, with pmos-web's own tool server
+//! token). Shapes follow `docs/bot-runtime-spec.md` §3 and `docs/toolserver.md`; fields not
+//! used here are ignored, and lists may come bare (`[…]`) or wrapped (`{"items": […]}`).
+//!
+//! With a key for an upstream (`PMOS_ASSERTION_KEYS`), every call made for a PM also carries a
+//! signed user assertion (`X-Pmos-Assertion`, `docs/user-assertion.md`): issuer `web`, that
+//! upstream as audience, the PM as subject, valid for 60 seconds, bound to the method, path,
+//! query and body actually sent, and signed afresh for every call.
 //!
 //! Tokens are only ever sent as `Authorization` headers to the configured base URLs. Error
-//! values carry a plain reason, never a token or an upstream body.
+//! values carry a plain reason, never a token, a key or an upstream body.
 
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+
+use pmos_assertion::{Claims, KeyRing, RequestBinding};
+use pmos_contract::model::TeamFile;
+use reqwest::header::{HeaderName, HeaderValue};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -155,12 +166,153 @@ pub struct DecisionBody {
     pub confirm_external: bool,
 }
 
+/// How long an assertion lives. The receiver allows a few seconds of clock skew on top.
+pub const ASSERTION_LIFETIME_SECS: u64 = 60;
+
+/// The `sid` claim. pmos-web's upstream calls are made with the PM's handle only, not their
+/// session id, so every assertion carries this fixed value.
+pub const ASSERTION_SESSION: &str = "unknown";
+
+/// Signs user assertions for one upstream (an audience) with that pair's key ring.
+pub struct Signer {
+    issuer: &'static str,
+    audience: String,
+    ring: KeyRing,
+    /// Where `team.yaml` is: the subject's roles are read from it at each call.
+    content_root: PathBuf,
+}
+
+impl std::fmt::Debug for Signer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Signer")
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("key_id", &self.ring.current_id())
+            .finish()
+    }
+}
+
+impl Signer {
+    /// As `issuer` (pmos-web is `web`) for `audience` (`bots` or `toolserver`).
+    pub fn new(issuer: &'static str, audience: &str, ring: KeyRing, content_root: PathBuf) -> Self {
+        Self {
+            issuer,
+            audience: audience.to_string(),
+            ring,
+            content_root,
+        }
+    }
+
+    /// The subject's known roles in `team.yaml`; none if the file or the member is missing.
+    /// Receivers check roles against `team.yaml` themselves: these are informational.
+    fn roles(&self, subject: &str) -> Vec<pmos_contract::model::Role> {
+        TeamFile::load(&self.content_root)
+            .ok()
+            .and_then(|t| t.by_handle(subject).map(|m| m.roles.clone()))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.is_known())
+            .collect()
+    }
+
+    /// An assertion that `subject` is the person `request` is for, bound to it exactly as it
+    /// will be sent.
+    pub fn sign(
+        &self,
+        subject: &str,
+        request: &reqwest::Request,
+    ) -> Result<HeaderValue, &'static str> {
+        let url = request.url();
+        let target = match url.query() {
+            Some(q) => format!("{}?{q}", url.path()),
+            None => url.path().to_string(),
+        };
+        let body: &[u8] = match request.body() {
+            None => b"",
+            Some(b) => b.as_bytes().ok_or("can't sign a streamed body")?,
+        };
+        let binding = RequestBinding::new(request.method().as_str(), &target, body)
+            .map_err(|_| "can't bind this request")?;
+        let claims = Claims::new(
+            self.issuer,
+            &self.audience,
+            subject,
+            &self.roles(subject),
+            ASSERTION_SESSION,
+        )
+        .map_err(|_| "can't sign for this person")?;
+        let value = self
+            .ring
+            .sign(
+                &claims,
+                pmos_assertion::unix_now(),
+                ASSERTION_LIFETIME_SECS,
+                Some(&binding),
+            )
+            .map_err(|_| "couldn't sign the user assertion")?;
+        HeaderValue::from_str(&value).map_err(|_| "couldn't sign the user assertion")
+    }
+}
+
+/// What pmos-web presents to one upstream: its client token and, when it has a key for that
+/// upstream, the [`Signer`] for its user assertions. `Debug` never shows the token.
+#[derive(Clone)]
+pub struct Credentials {
+    token: String,
+    signer: Option<Arc<Signer>>,
+}
+
+impl Credentials {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+            signer: None,
+        }
+    }
+
+    /// Also sign a user assertion on every call made for a PM.
+    pub fn with_signer(mut self, signer: Signer) -> Self {
+        self.signer = Some(Arc::new(signer));
+        self
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub fn signs(&self) -> bool {
+        self.signer.is_some()
+    }
+}
+
+impl From<&str> for Credentials {
+    fn from(token: &str) -> Self {
+        Self::new(token)
+    }
+}
+
+impl From<String> for Credentials {
+    fn from(token: String) -> Self {
+        Self::new(token)
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("token", &"<redacted>")
+            .field("signer", &self.signer)
+            .finish()
+    }
+}
+
 /// An HTTP client for one upstream.
 #[derive(Clone)]
 struct Client {
     http: reqwest::Client,
     base: String,
     token: String,
+    signer: Option<Arc<Signer>>,
     service: &'static str,
 }
 
@@ -182,19 +334,33 @@ impl Client {
         }
     }
 
-    async fn send(&self, req: reqwest::RequestBuilder) -> UpstreamResult<reqwest::Response> {
-        let res = req
+    /// Send `req`. When the call is for a PM (`subject`) and there is a key for this upstream,
+    /// a fresh user assertion is signed over the request as built, and added to it.
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+        subject: Option<&str>,
+    ) -> UpstreamResult<reqwest::Response> {
+        let mut request = req
             .bearer_auth(&self.token)
             .timeout(TIMEOUT)
-            .send()
-            .await
-            .map_err(|e| {
-                self.failed(if e.is_timeout() {
-                    "timed out"
-                } else {
-                    "didn't answer"
-                })
-            })?;
+            .build()
+            .map_err(|_| self.failed("couldn't build the request"))?;
+        if let (Some(signer), Some(subject)) = (&self.signer, subject) {
+            let value = signer
+                .sign(subject, &request)
+                .map_err(|why| self.failed(why))?;
+            request
+                .headers_mut()
+                .insert(HeaderName::from_static(pmos_assertion::HEADER), value);
+        }
+        let res = self.http.execute(request).await.map_err(|e| {
+            self.failed(if e.is_timeout() {
+                "timed out"
+            } else {
+                "didn't answer"
+            })
+        })?;
         let status = res.status();
         if status.is_success() {
             return Ok(res);
@@ -227,11 +393,12 @@ impl Client {
 pub struct Runtime(Client);
 
 impl Runtime {
-    pub fn new(http: reqwest::Client, base: &str, token: &str) -> Self {
+    pub fn new(http: reqwest::Client, base: &str, credentials: &Credentials) -> Self {
         Self(Client {
             http,
             base: base.trim_end_matches('/').to_string(),
-            token: token.to_string(),
+            token: credentials.token.clone(),
+            signer: credentials.signer.clone(),
             service: "bot runtime",
         })
     }
@@ -245,7 +412,10 @@ impl Runtime {
         let url = self.0.url(segments)?;
         let res = self
             .0
-            .send(self.0.http.get(url).query(query).header(USER_HEADER, user))
+            .send(
+                self.0.http.get(url).query(query).header(USER_HEADER, user),
+                Some(user),
+            )
             .await?;
         self.0.read(res).await
     }
@@ -263,6 +433,7 @@ impl Runtime {
                     .json(&json!({
                         "bot": bot, "requested_by": user, "text": text, "source": "web",
                     })),
+                Some(user),
             )
             .await?;
         self.0.read(res).await
@@ -293,16 +464,17 @@ impl Runtime {
     }
 }
 
-/// The tool server, with the service token.
+/// The tool server's approvals routes, with pmos-web's own token (`PMOS_WEB_TOKEN` there).
 #[derive(Clone)]
 pub struct ToolServer(Client);
 
 impl ToolServer {
-    pub fn new(http: reqwest::Client, base: &str, token: &str) -> Self {
+    pub fn new(http: reqwest::Client, base: &str, credentials: &Credentials) -> Self {
         Self(Client {
             http,
             base: base.trim_end_matches('/').to_string(),
-            token: token.to_string(),
+            token: credentials.token.clone(),
+            signer: credentials.signer.clone(),
             service: "tool server",
         })
     }
@@ -312,14 +484,23 @@ impl ToolServer {
         let url = self.0.url(&["internal", "approvals"])?;
         let res = self
             .0
-            .send(self.0.http.get(url).query(&[("user", user)]))
+            .send(self.0.http.get(url).query(&[("user", user)]), Some(user))
             .await?;
         Ok(self.0.read::<List<Approval>>(res).await?.into_vec())
     }
 
+    /// One item. It names nobody, so it carries no assertion; the caller checks the owner.
     pub async fn approval(&self, id: &str) -> UpstreamResult<Approval> {
         let url = self.0.url(&["internal", "approvals", id])?;
-        let res = self.0.send(self.0.http.get(url)).await?;
+        let res = self.0.send(self.0.http.get(url), None).await?;
+        self.0.read(res).await
+    }
+
+    /// One item of `user`'s, with an assertion for them: the tool server answers `404` for
+    /// anyone else's.
+    pub async fn approval_for(&self, user: &str, id: &str) -> UpstreamResult<Approval> {
+        let url = self.0.url(&["internal", "approvals", id])?;
+        let res = self.0.send(self.0.http.get(url), Some(user)).await?;
         self.0.read(res).await
     }
 
@@ -328,14 +509,18 @@ impl ToolServer {
         let url = self.0.url(&["internal", "approvals", id, "sources"])?;
         let res = self
             .0
-            .send(self.0.http.get(url).query(&[("user", user)]))
+            .send(self.0.http.get(url).query(&[("user", user)]), Some(user))
             .await?;
         Ok(self.0.read::<SourcesReply>(res).await?.sources)
     }
 
+    /// A decision, with an assertion for the PM in `decided_by`.
     pub async fn decide(&self, id: &str, body: &DecisionBody) -> UpstreamResult<Approval> {
         let url = self.0.url(&["internal", "approvals", id, "decision"])?;
-        let res = self.0.send(self.0.http.post(url).json(body)).await?;
+        let res = self
+            .0
+            .send(self.0.http.post(url).json(body), Some(&body.decided_by))
+            .await?;
         self.0.read(res).await
     }
 }

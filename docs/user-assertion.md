@@ -3,8 +3,8 @@
 `crates/assertion` (`pmos-assertion`) is a small library. A calling service (the console,
 `pmos-web`) uses it to sign a short-lived statement of the person it is acting for. The
 receiving service (the bot runtime, the tool server) uses it to check that statement itself,
-instead of trusting a plain header. This document covers the library. Nothing is wired into
-any service yet; the checklist at the end says how each one adopts it.
+instead of trusting a plain header. This document covers the library, and how the four
+services use it (**In the services**, below). The checklist at the end records what is done.
 
 ## The problem
 
@@ -216,8 +216,9 @@ slot on the verifying side. Steps 2 and 4 can therefore be the same deploy, as l
 receiver accepts both keys before any caller signs with the new one. A key that has leaked is
 removed at once: assertions signed with it fail with `UnknownKey`.
 
-Suggested configuration: `PMOS_ASSERTION_KEYS=<kid>:<base64>[,<kid>:<base64>]` (current first),
-with one variable per caller-receiver pair where the keys differ.
+In the services, `PMOS_ASSERTION_KEYS` names each key's pair, so one variable holds all of a
+service's keys (see **Keys** below). A previous key is the optional second half of its pair's
+entry.
 
 ## Clocks
 
@@ -230,73 +231,203 @@ with one variable per caller-receiver pair where the keys differ.
   lifetime of 30 to 60 seconds. 120 seconds is the ceiling, not the target. A retry signs a
   fresh assertion, because the replay guard refuses the old one.
 
+## In the services
+
+### Keys
+
+Every service that signs or checks assertions reads `PMOS_ASSERTION_KEYS`: comma-separated
+entries, one per caller→receiver pair.
+
+```text
+<issuer>:<audience>:<key id>:<base64 key>[:<key id>:<base64 key>]
+```
+
+- The first key is current; the optional second is the previous one, accepted while a rotation
+  finishes. Keys are 32 to 64 bytes in standard base64 (`openssl rand -base64 32`).
+- Each service accepts only its own pairs, and refuses to start on any other, so a key never
+  ends up where it has no use:
+
+  | Service | Its pairs |
+  | --- | --- |
+  | `pmos-web` (signs) | `web:bots`, `web:toolserver` |
+  | `pmos-console` (signs) | `console:bots`, `console:toolserver` |
+  | `pmos-bots` (checks) | `web:bots`, `console:bots` |
+  | `pmos-toolserver` (checks) | `web:toolserver`, `console:toolserver` |
+
+- A malformed entry, a key under 32 bytes, an unknown pair or a pair listed twice refuses to
+  start, with the entry's number and pair in the message and never a key. Keys are never
+  logged: start-up logs the key ids only.
+
+### Modes (receivers)
+
+`PMOS_ASSERTION_MODE` on the runtime and on the tool server:
+
+| Mode | Valid assertion | Bad assertion | No assertion |
+| --- | --- | --- | --- |
+| `off` (default) | ignored | ignored | as before: the named person is believed |
+| `verify` | believed | `401` | as before |
+| `require` | believed | `401` | `401` if the call names a person |
+
+`verify` and `require` refuse to start without at least one key. The Slack client, workers,
+evals, the orchestrator's service token and the Slack bot's token are never checked, in any
+mode.
+
+### What each service does
+
+- **`pmos-web`** signs every runtime call (each names the PM) and every tool-server call that
+  names the PM (the inbox, sources, decisions), when it has a key for that upstream: lifetime
+  60 seconds, audience `bots` or `toolserver`, bound to the method, path, query and body as
+  sent, a fresh assertion per call, next to the existing `X-Pmos-User` and `decided_by`. Roles
+  come from `team.yaml` and `sid` is the fixed `unknown` (its upstream layer gets the handle,
+  not the session). It calls the tool server with its own token (`PMOS_WEB_TOKEN` there), which
+  reaches only the approvals routes.
+- **The console** signs every call that names a person, as that person: one PM's tasks
+  (`requested_by=`), routines (`owner=`) and pending approvals (`user=`). Reads of everything
+  and routine pause, resume and delete name no one and carry none. Its upstream layer doesn't
+  know the viewer, so for an admin's view of every inbox it signs as each member whose inbox it
+  reads. It calls the tool server with its own token (`PMOS_CONSOLE_TOKEN` there).
+- **The runtime** checks calls from `web` and `console`: the policy for each allows exactly one
+  issuer, the client whose token was presented. The subject must equal every person the request
+  names (`X-Pmos-User`, `requested_by=`, `owner=`, `/v1/members/{handle}`), and becomes the PM.
+  The `web` client's own rules (`source: "web"` only, its PM's own tasks, routines and settings)
+  still apply on top, so a body naming someone else is `403`.
+- **The tool server** checks calls with the web and console tokens on the approvals routes. The
+  subject must equal `user=` and `decided_by`; one item read with an assertion must be the
+  subject's (`404` otherwise). Decisions still check the item's user and `team.yaml`.
+- **Every failure** is the same `401 {"code": "bad_assertion"}`. The log has the client and the
+  kind of failure (`missing`, `bad signature`, `expired`, `replayed`, `subject is not the person
+  the request names`, …), never the assertion, a key or a handle.
+- **Replay:** one `MemoryReplayCache` per receiving process.
+
+### What this does and does not fix
+
+**Fixed, with both receivers in `require`:**
+
+- A stolen or leaked runtime or tool-server token, without the key, acts for no one: every call
+  that names a person needs an assertion.
+- `pmos-web` and the console no longer hold the tool server's service token. Their own tokens
+  reach only the four approvals routes, so they cannot start sessions, record grants, link or
+  list accounts, or reindex, whatever happens to them.
+- A captured assertion (a log, a proxy) is good for one identical request, once, within about
+  65 seconds, at one audience.
+- One caller cannot speak for the other: the web key does not verify as `console`, and the
+  web token cannot present the console's assertion.
+
+**Not fixed:**
+
+- **A compromised `pmos-web` can still act for any team member, not only those signed in.** It
+  holds the `web:bots` and `web:toolserver` keys, and can sign for any handle. The same holds
+  for the console and its keys. To limit a compromised `pmos-web` to the people who actually
+  signed in, the key must live outside its process, with something that checks the sign-in
+  (a separate signer, or identity-provider tokens the receivers verify). That is not built.
+- **On the single-box deployment** (the Spark, `deploy/compose.yaml`), every key and token is
+  in one `deploy/.env` on one host. Each container is given only its own keys, so a compromise
+  of one container's process (say, `pmos-web`) does not hand over the console's keys or the
+  service token. A compromise of the host, or of anything that can read `deploy/.env` or
+  another container's environment, has every key, and the assertion stops nothing.
+- **Within its scope, a caller still acts as freely as before:** `web` creates `web` tasks
+  and decides approvals for the person it signs for, and the console still reads everything
+  with its runtime token and pauses any routine (those name no one).
+- **One item read without an assertion:** `GET /internal/approvals/{id}` names no one, so the
+  web token reads any item by id without one. `pmos-web` re-reads an item this way after a
+  conflicting decision; `ToolServer::approval_for` is ready for when `app.rs` passes the
+  handle.
+- **Replicas and restarts:** the replay cache is per process (see **Replay protection**).
+- **Audit:** the tool server's audit records the client (`web`, `console`), not yet the
+  assertion's `iss`, `sub` and `sid`.
+
+### Turning it on (upgrade)
+
+1. Run `deploy/setup.sh` again. It keeps every existing value and adds the web and console
+   tool-server tokens (`PMOS_TS_WEB_TOKEN`, `PMOS_TS_CONSOLE_TOKEN`) and one key per pair
+   (`PMOS_AK_WEB_BOTS`, `PMOS_AK_WEB_TOOLSERVER`, `PMOS_AK_CONSOLE_BOTS`,
+   `PMOS_AK_CONSOLE_TOOLSERVER`, each `<key id>:<base64>`). `compose.yaml` refuses to start
+   until they exist. Keep the new `deploy/.env` in the password manager.
+2. `deploy/pmos-admin up …` as before. The web app and the console now use their own
+   tool-server tokens, and sign with their keys. Without `--web`, `PMOS_ASSERTION_MODE` stays
+   `off` unless `deploy/.env` sets it.
+3. With `--web`, `pmos-admin up` sets `PMOS_ASSERTION_MODE=require` for the runtime and the tool
+   server (unless `deploy/.env` sets another mode), and says so. To roll out in steps, set
+   `PMOS_ASSERTION_MODE=verify` in `deploy/.env` first, watch for `refused a user assertion` in
+   `pmos-admin logs bots` and `logs toolserver`, then clear it (or set `require`).
+4. To rotate a key: give the receivers `<new id>:<new>:<old id>:<old>` for that pair, then the
+   caller `<new id>:<new>`, then drop the old half everywhere after two minutes.
+
+`scripts/claude-test-stack.sh` with `PMOS_TEST_WEB=1` does the same for the test stack: fresh
+keys for `web:bots` and `web:toolserver`, pmos-web's own tool-server token, and `require` on
+both receivers.
+
 ## Adoption checklist
 
 Roll out in this order: shared pieces, then callers sending, then receivers enforcing.
 
 **Shared**
 
-- [ ] Generate one key per caller-receiver pair: `web→bots`, `web→toolserver`,
+- [x] Generate one key per caller-receiver pair: `web→bots`, `web→toolserver`,
       `console→bots` and `console→toolserver`. Store them like the service tokens. A single key
       for all four pairs is acceptable to start with, but it widens what one compromised
       service can sign as.
-- [ ] Add `pmos-assertion` to each adopting crate. Parse `PMOS_ASSERTION_KEYS` into a
+- [x] Add `pmos-assertion` to each adopting crate. Parse `PMOS_ASSERTION_KEYS` into a
       `KeyRing` at start-up, and refuse to start if a key is under 32 bytes. Never log the
       ring's contents (its `Debug` output is already redacted).
 
 **`pmos-web` (caller)**
 
-- [ ] For every runtime or tool-server call made for the signed-in PM, sign `Claims::new("web",
+- [x] For every runtime or tool-server call made for the signed-in PM, sign `Claims::new("web",
       <aud>, handle, roles from team.yaml, session id)`. Use a 60-second lifetime and bind
       `RequestBinding::new(method, path_and_query, body_bytes)`. Send the result as
       `X-Pmos-Assertion`, next to the existing `X-Pmos-User` during the transition.
-- [ ] Sign after the body is serialised. Never reuse an assertion, including on a retry.
+- [x] Sign after the body is serialised. Never reuse an assertion, including on a retry.
 
 **Console (caller)**
 
 - [ ] Do the same for calls made for the console viewer, with `iss=console`. This covers
       routine pause, resume and delete, task cancel, and anything that names `decided_by`.
-- [ ] For reads that are "read everything" (no person), send no assertion. Those reads stay on
+      *Partly:* the console signs every call that names a person, as that person. Routine
+      changes name no one and its upstream layer isn't given the viewer, so they carry none;
+      the console decides nothing and cancels nothing today.
+- [x] For reads that are "read everything" (no person), send no assertion. Those reads stay on
       the console token alone.
 
 **Bot runtime (receiver, `aud=bots`)**
 
-- [ ] Build `VerifyPolicy::new("bots", &["web", "console"])` and keep one replay guard per
+- [x] Build `VerifyPolicy::new("bots", &["web", "console"])` and keep one replay guard per
       process; replace it with a shared store before running more than one replica.
-- [ ] In the auth layer, after the client token: for clients `web` and `console`, when the
+- [x] In the auth layer, after the client token: for clients `web` and `console`, when the
       route acts for a person, read `X-Pmos-Assertion` and compute the binding from the
       request the handler will see (buffer the body, which is small). Verify it with
       `iss` equal to the client name of the token that was presented, so `web` cannot present
       `console`'s assertion.
-- [ ] Use `assertion.subject()` as the PM. During the transition, if `X-Pmos-User` is also
-      present it must equal the subject (`403` otherwise). After the transition, ignore it for
-      these clients.
-- [ ] Still check the subject against `team.yaml` and keep the existing per-client rules
+- [x] Use `assertion.subject()` as the PM. If `X-Pmos-User` is also present it must equal
+      the subject (built as the same `401` as every other assertion failure).
+- [x] Still check the subject against `team.yaml` and keep the existing per-client rules
       (`source: "web"` only, own tasks only).
-- [ ] Answer every `VerifyError` with one `401 {"code":"bad_assertion"}`, and log the variant
+- [x] Answer every `VerifyError` with one `401 {"code":"bad_assertion"}`, and log the variant
       and the issuer.
-- [ ] Add a setting that moves from "verify if present" to "required for `web` and `console`";
+- [x] Add a setting that moves from "verify if present" to "required for `web` and `console`";
       turn it on once both callers send assertions.
-- [ ] Leave out of scope for now: client `slack` (it acts on Slack-signed events and is a
+- [x] Leave out of scope for now: client `slack` (it acts on Slack-signed events and is a
       separate question), and the `X-Pmos-User` that the runtime forwards to the gateway.
 
 **Tool server (receiver, `aud=toolserver`)**
 
-- [ ] Do the same with `VerifyPolicy::new("toolserver", &[...callers that act for people])`.
+- [x] Do the same with `VerifyPolicy::new("toolserver", &[...callers that act for people])`.
 - [ ] Routes that name a person: `user=` on `/internal/approvals`, `/internal/credentials`,
       `/internal/memory/repo`, `/internal/onboarding` and `/internal/oauth/*/start`, and
       `decided_by` on the approval and member decisions. The named person must equal
-      `assertion.subject()`.
-- [ ] Admin-only decisions still check `admin` in `team.yaml`, not the assertion's roles.
-- [ ] Service-token calls that act for no person (the orchestrator, the runtime's own session
+      `assertion.subject()`. *Done for the approvals routes,* the only ones `pmos-web` and the
+      console call; their tokens reach no other route. The rest stay on the service and bot
+      tokens.
+- [x] Admin-only decisions still check `admin` in `team.yaml`, not the assertion's roles.
+- [x] Service-token calls that act for no person (the orchestrator, the runtime's own session
       creation and approval polling) send no assertion and are unchanged.
 - [ ] Record the assertion's `iss`, `sub` and `sid` in the audit next to the token's client
-      name.
+      name. *Not yet:* the audit records the client (`web`, `console`).
 
 **Done when**
 
-- [ ] With the setting on, a call from `web` or `console` that names a person without a valid
+- [x] With the setting on, a call from `web` or `console` that names a person without a valid
       assertion is `401`, and contract tests cover a forged one, an expired one, a replayed
       one, the wrong audience and a request mismatch.
-- [ ] `docs/bot-runtime-spec.md` §3 and `docs/toolserver.md` describe the header, and
+- [x] `docs/bot-runtime-spec.md` §3 and `docs/toolserver.md` describe the header, and
       `X-Pmos-User` is documented as advisory for these clients.

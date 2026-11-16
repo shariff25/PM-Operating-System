@@ -180,6 +180,12 @@ case "$cmd" in
       if [ "$arg" = --console ]; then console_checks || exit 2; fi
     done
     mapfile -t prof < <(profiles "$@")
+    for arg in "$@"; do
+      # With the web app on, the runtime and the tool server refuse its calls (and the
+      # console's) that name a person without a valid user assertion (docs/user-assertion.md).
+      if [ "$arg" = --web ]; then export PMOS_ASSERTION_MODE="${PMOS_ASSERTION_MODE:-require}"; fi
+    done
+    say "user assertions: ${PMOS_ASSERTION_MODE:-off}"
     if [ -z "${PMOS_SLACK_APP_TOKEN:-}" ] || [ -z "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
       say "note: the Slack bot is off until PMOS_SLACK_APP_TOKEN and PMOS_SLACK_BOT_TOKEN are set"
     fi
