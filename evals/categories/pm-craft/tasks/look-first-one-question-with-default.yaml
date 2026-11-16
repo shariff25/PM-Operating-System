@@ -1,0 +1,26 @@
+# seed: replace with case cards
+# Look before you ask (content/roles/pm-assistant/ROLE.md): ask at most one question, only when
+# the sources leave a choice that changes the output, and give a default. "The export
+# improvements" is ambiguous in the sources: Confluence page 9002 "PRD: Key export v2" and Jira
+# bug PM-103 "Export fails for large key sets" are key export; page 9001 ("Two customers asked
+# for SSO and audit export.") is audit log export. The right reply names both from the sources,
+# asks which, with a default, and drafts nothing yet. "Exactly one question" and "a default"
+# aren't checked deterministically; a reviewer or a judge reads them.
+# Set regression: true once it passes, so the gate stops it breaking again.
+id: look-first-one-question-with-default
+ask: "Write a PRD for the export improvements in Acme Vault."
+expect:
+  approvals: 0
+  must_include:
+    - "?"
+    - "key export"
+    - "audit"
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 0
+cluster: prd-draft
+tags:
+  - model/missing-fact
+  - model/wrong-draft-count
