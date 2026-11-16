@@ -84,9 +84,26 @@ jobs:
         run: pnpm lint
       - working-directory: web
         run: pnpm test
-      # Browser end-to-end tests go here once they land (not yet written).
       - working-directory: web
         run: pnpm build
+      # Browser end-to-end tests (web/e2e). The browser is installed for the pinned
+      # @playwright/test version; pnpm e2e starts its own dev server on port 5191.
+      - name: Install Chromium for Playwright
+        working-directory: web
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Browser tests
+        working-directory: web
+        run: pnpm e2e
+      - name: Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-playwright-report
+          path: |
+            web/playwright-report/
+            web/test-results/
+          if-no-files-found: ignore
+          retention-days: 14
 
   deploy:
     name: Deploy kit (images, stack, smoke test)
