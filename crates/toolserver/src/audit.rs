@@ -90,10 +90,51 @@ pub struct AuditEvent {
     pub detail: Option<String>,
 }
 
+/// A tool call that returned what it read, as the audit log has it: when, which tool, and
+/// the `sources` it recorded (context paths, `system:id`). Metadata only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadEvent {
+    pub at: DateTime<Utc>,
+    pub tool: String,
+    pub sources: Vec<String>,
+}
+
+impl ReadEvent {
+    fn of(event: &AuditEvent) -> Self {
+        Self {
+            at: event.at,
+            tool: event.tool.clone(),
+            sources: event.sources.clone(),
+        }
+    }
+}
+
+/// Does `event` belong in [`AuditSink::reads`]?
+pub fn is_read_of(event: &AuditEvent, user: &str, run_id: &str, until: DateTime<Utc>) -> bool {
+    event.user == user
+        && event.run_id == run_id
+        && event.outcome == Outcome::Ok
+        && !event.sources.is_empty()
+        && event.at <= until
+}
+
 #[async_trait]
 pub trait AuditSink: Send + Sync {
     /// Store one event. An error means the event was not recorded; callers log it loudly.
     async fn record(&self, event: AuditEvent) -> StoreResult<()>;
+
+    /// `user`'s calls in run `run_id` at or before `until` that succeeded and recorded
+    /// sources, newest first, at most `limit`. `None` when this sink can't be read back
+    /// (a JSON-lines file is write-only).
+    async fn reads(
+        &self,
+        _user: &str,
+        _run_id: &str,
+        _until: DateTime<Utc>,
+        _limit: usize,
+    ) -> StoreResult<Option<Vec<ReadEvent>>> {
+        Ok(None)
+    }
 }
 
 /// Keeps events in memory. Used in tests and when no log file is configured.
@@ -114,6 +155,26 @@ impl AuditSink for MemoryAudit {
         self.events.lock().expect("audit lock").push(event);
         Ok(())
     }
+
+    async fn reads(
+        &self,
+        user: &str,
+        run_id: &str,
+        until: DateTime<Utc>,
+        limit: usize,
+    ) -> StoreResult<Option<Vec<ReadEvent>>> {
+        let events = self.events.lock().expect("audit lock");
+        let mut found: Vec<ReadEvent> = events
+            .iter()
+            .filter(|e| is_read_of(e, user, run_id, until))
+            .map(ReadEvent::of)
+            .collect();
+        // Stable: of two events at the same time, the later recorded comes first.
+        found.reverse();
+        found.sort_by_key(|e| std::cmp::Reverse(e.at));
+        found.truncate(limit);
+        Ok(Some(found))
+    }
 }
 
 /// Records every event in several sinks, such as Postgres plus a JSON-lines file that is
@@ -130,6 +191,22 @@ impl AuditSink for TeeAudit {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// From the first sink that can be read back.
+    async fn reads(
+        &self,
+        user: &str,
+        run_id: &str,
+        until: DateTime<Utc>,
+        limit: usize,
+    ) -> StoreResult<Option<Vec<ReadEvent>>> {
+        for sink in &self.0 {
+            if let Some(found) = sink.reads(user, run_id, until, limit).await? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
     }
 }
 

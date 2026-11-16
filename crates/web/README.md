@@ -57,29 +57,62 @@ The `__Host-pmos` cookie is `Secure`, so browsers only keep it over HTTPS (or on
    task when its `requested_by` is. Anything else is `404 not_found`, checked here before
    any decision is sent, because the tokens this backend holds could act for anyone.
 
+6. **JSON only:** a `POST`, `PUT` or `DELETE` with a body must be `Content-Type:
+   application/json` (`415 bad_content_type`), and sign-in always must, so a cross-site
+   form can't reach a route or sign a victim in as someone else (login CSRF). A write with
+   no body (logout, `DELETE /api/me/hints`) needs no type; it still needs the CSRF token.
+
 Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
-`Referrer-Policy: same-origin`; `/api` answers are `Cache-Control: no-store` with a CSP that
-loads nothing, and the app's files get `default-src 'self'` (no inline script or style).
+`Referrer-Policy: no-referrer` and `Cross-Origin-Opener-Policy: same-origin`. Every `/api`
+answer, errors included, is `Cache-Control: no-store` with a CSP that loads nothing. The
+app's files get `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self';
+font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self';
+frame-ancestors 'none'`: no inline script or style, no `data:` or remote images.
+`index.html` is `no-cache`.
 
 ## How the contract maps upstream
 
 - **Drafts** are the PM's tool server approval items (`GET /internal/approvals?user=`).
-  `kind`, `title`, `body` and `target` come from the write tool's arguments (the table in
-  `src/drafts.rs`). Items of other write tools (`bets.record`) are not drafts and are left
-  out. `executing` reads as `approved` with no `result_url` yet; `result_url` is the
-  `url` of the item's `result`.
+  `kind`, `title`, `body` and `target.label` come from the write tool's arguments (the table
+  in `src/drafts.rs`); the label uses only id-shaped values, and anything else reads "an
+  unrecognised channel" (or space, page, project, epic), so it is never text the bot wrote.
+  `target.url`, `expires_at` and `external` are the item's own `target_url`, `expires_at`
+  and `external` from the tool server (`target.url` only if `https`; `expires_at` falls back
+  to 24 hours for a tool server that doesn't send it; `external` to the last
+  `needs_external_confirm` for this draft). Items of other write tools (`bets.record`) are
+  not drafts and are left out. `executing` reads as `approved` with no `result_url` yet;
+  `result_url` is the `url` of the item's `result`.
+- **Sources** of every single-draft answer come from the tool server's
+  `GET /internal/approvals/{id}/sources?user=<handle>`, called only after the ownership
+  check. Each becomes `{id: "s1"…, system, title, url, excerpt: null}`: `url` only if
+  `https`, else `null` (context files have none; Jira and Confluence have none without a
+  linked Atlassian site); a title of at most 200 characters; at most 20. `excerpt` is always
+  `null`: nothing keeps source text to quote. If the call fails the draft still loads with
+  `sources: []`.
+- **`version`** is the SHA-256 of the tool and the canonical JSON of what an approve would
+  send now (the item's arguments with the saved edit applied; for a practice draft, its
+  title and body). **Approve** takes an optional `version`: a different one is
+  `409 stale` and nothing is sent.
 - **Edit** (`PUT`) is kept here. **Approve** sends `edit` with the edited arguments when
   there is a saved edit and `approve` otherwise, always with `decided_by` = the signed-in
-  handle. The tool server's `409 needs_external_confirm`, `audience_blocked` and `expired`
-  pass through; its `503 audience_unavailable` too. A `409` without a code is
-  `not_pending` when the item has since been decided (in Slack, say), else
-  `not_approvable`; a `400` on edited arguments is `422 bad_edit`.
+  handle; the version is checked against the same arguments it sends. The tool server's
+  `409 needs_external_confirm`, `audience_blocked` and `expired` pass through; its
+  `503 audience_unavailable` too. A `409` without a code is `not_pending` when the item has
+  since been decided (in Slack, say), else `not_approvable`; a `400` on edited arguments is
+  `422 bad_edit`.
+- **Approve is safe to retry.** An approve of an item already `executing` or `approved`
+  whose `decided_by` is this PM, with the same version (or none), answers the approved draft
+  and sends nothing. So does an approve that loses a race with the PM's own other approve
+  of the same text (the tool server's plain `409`, then a re-read). Anything else already
+  decided is `not_pending`. The same holds for a practice draft.
 - **Ask for a change** creates a task for `pm-<handle>` (`source: "web"`) whose prompt holds
   the instruction and the current text and says to call no write tool, make no draft or
   approval, and answer with the revised text only. The task's `result` (without a code fence)
   becomes the suggestion's `body`. These tasks are hidden from `GET /api/tasks`.
-- **Practice drafts** live only here; nothing is sent upstream for them, and asking for a
-  change to one answers at once with a canned note.
+- **Practice drafts** live only here (ids `prc_…`, looked up in this PM's own state and
+  never at the tool server): no call of any kind goes upstream for them, their target label
+  is "Practice only: nothing is sent", and asking for a change to one answers at once with
+  a canned note. An upstream item with a `prc_` id is never decided.
 - **Tasks:** `POST /v1/tasks {bot: "pm-<handle>", requested_by, text, source: "web"}`, and
   reads of the PM's own tasks and their events, each with `X-Pmos-User: <handle>`.
 - **Brief and follow-ups:** `501 not_built`.
@@ -87,26 +120,21 @@ loads nothing, and the app's files get `default-src 'self'` (no inline script or
 ## Where the contract isn't met as written
 
 - **`name` in `Me`** is the handle: `team.yaml` has no display name. The user database will.
-- **`sources` is always `[]`.** Neither upstream says what the bot read for a draft: the
-  approval item has no sources, the runtime's task events are free-text milestones, and the
-  trace (which has the tool calls) is the console client's only. Needed, one of:
-  - tool server: `GET /internal/approvals/{id}/sources` → `{sources: [{system, id, title,
-    url, excerpt?}]}`, from the audit events of the item's `run_id` (they already record
-    `sources`), with the same token rules as `GET /internal/approvals/{id}`; or
-  - runtime: `GET /v1/tasks/{id}/sources` for clients `slack` and `web` (own tasks), from the
-    trace's `tool_result` entries of read tools.
-- **`external`** is only known after the tool server answered `needs_external_confirm` once
-  (it is remembered for that draft). To know it up front the tool server would need an
-  `audience` field on the item, or `GET /internal/approvals/{id}/audience` →
-  `{external, members, outsiders}`.
-- **`target.url`** is always `null`: the item holds a space key, project key or channel id,
-  not a link. The tool server would need to add `target_url` to items it can link (a parent
-  page, a Slack thread permalink).
-- **`expires_at`** assumes the tool server's default 24 hours (`PMOS_SLACK_DRAFT_TTL_HOURS`);
-  the item should carry its own `expires_at`.
-- **Error codes added** beyond the contract: `bad_origin`, `bad_request`, `not_approvable`,
-  `bad_edit`, `no_suggestion` (accepting before the text is ready), `audience_unavailable`,
-  `task_refused`, `upstream_unavailable`, `team_unavailable`, `unavailable`.
+- **Sources are what the audit log can identify** (`docs/toolserver.md`, **What an item is
+  shown with**): titles are ids for Jira, Confluence and Slack (`PAY-212`, `Confluence page
+  12345`, `Slack thread in C01`), not issue summaries or page titles, because the audit log
+  keeps ids only; `excerpt` is always `null`; `Source.url` can be `null`, which the contract
+  shows as a string.
+- **`external`** is known once the tool server has checked the channel's audience, which it
+  does on an approve; it forgets that on restart. Before that a draft reads
+  `external: false` and the approve answers `409 needs_external_confirm` as before.
+- **`target.url`** is `null` where no link can be built from ids: a Confluence or Jira
+  target without a linked Atlassian site.
+- **Error codes added** beyond the contract: `bad_origin`, `bad_request`,
+  `bad_content_type` (`415`), `not_approvable`, `bad_edit`, `no_suggestion` (accepting
+  before the text is ready), `audience_unavailable`, `task_refused`,
+  `upstream_unavailable`, `team_unavailable`, `unavailable`. `stale` (`409`) is the
+  contract's optional `version` check.
 
 ## Limits of "ask for a change"
 
