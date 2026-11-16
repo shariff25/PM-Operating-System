@@ -7,4 +7,28 @@ license.workspace = true
 publish.workspace = true
 rust-version = "1.88"
 
+[[bin]]
+name = "pmos-web"
+path = "src/main.rs"
+
 [dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+# Session ids and CSRF tokens: 256 bits from the operating system's generator.
+getrandom = "0.3"
+pmos-contract.workspace = true
+pmos-runtime.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-util.workspace = true
