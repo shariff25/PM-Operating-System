@@ -19,12 +19,29 @@ async fn main() -> Result<()> {
             "team.yaml lists nobody: every sign-in will be refused"
         );
     }
-    for provider in app::providers(&config) {
+    let providers = app::providers(&config).map_err(anyhow::Error::msg)?;
+    for provider in &providers {
         if provider.is_insecure() {
             tracing::warn!(
                 provider = provider.name(),
                 "DEVELOPMENT SIGN-IN IS ON (PMOS_WEB_DEV_LOGIN=1): anyone who can reach this \
                  port can sign in as any member, admins included. Never expose it."
+            );
+        }
+    }
+    if let Some(entra) = &config.entra {
+        // Ids and URLs only: never the client secret.
+        tracing::info!(
+            tenant = %entra.tenant_id,
+            client = %entra.client_id,
+            redirect_uri = %entra.redirect_uri,
+            "Entra ID sign-in is on"
+        );
+        if config.dev_login {
+            tracing::warn!(
+                "BOTH ENTRA ID AND DEVELOPMENT SIGN-IN ARE ON: development sign-in bypasses \
+                 Entra ID entirely, so anyone who can reach this port can still sign in as any \
+                 member. Unset PMOS_WEB_DEV_LOGIN on any server people use."
             );
         }
     }

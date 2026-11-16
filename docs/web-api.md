@@ -10,14 +10,22 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
 ## Sign-in and safety
 
 - **Session:** a `__Host-pmos` cookie (`Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`), set by
-  sign-in. Every route except the two sign-in routes answers `401 {"code":"signed_out"}`
+  sign-in. Every route except the sign-in routes below answers `401 {"code":"signed_out"}`
   without one.
 - **CSRF:** `GET /api/me` returns `csrf_token`. Every `POST`, `PUT` and `DELETE` sends it as
-  `X-Pmos-Csrf`; a missing or wrong token is `403 {"code":"bad_csrf"}`.
-- **Providers:** sign-in sits behind one interface. Entra ID is the production provider and is
-  not built yet. Until it is, `pmos-web` starts only with `PMOS_WEB_DEV_LOGIN=1`, which enables
-  the development route below and logs a warning. It must refuse to start otherwise.
+  `X-Pmos-Csrf`; a missing or wrong token is `403 {"code":"bad_csrf"}`. The Entra callback is
+  a cross-site `GET` from Microsoft, so no origin check applies to it: its CSRF defence is
+  `state`, matched once against a signed `__Host-pmos-entra` cookie set at `/api/auth/login`.
+- **Providers:** sign-in sits behind one interface. **Entra ID** (`docs/entra-sign-in.md`) is
+  the production provider, on when `PMOS_WEB_ENTRA_TENANT_ID`, `PMOS_WEB_ENTRA_CLIENT_ID`,
+  `PMOS_WEB_ENTRA_CLIENT_SECRET` and `PMOS_WEB_PUBLIC_URL` are all set. **Development
+  sign-in** (`PMOS_WEB_DEV_LOGIN=1`) enables the development route below and logs a warning.
+  `pmos-web` starts with either or both (both logs a loud warning) and refuses to start with
+  neither, or with Entra half-configured. `GET /api/auth/providers` tells the app which buttons
+  to show.
 - **Who you are:** the signed-in handle must be a member in `team.yaml`. Roles come from there.
+  Entra ID finds the member by email: the token's `preferred_username` (or else `email`),
+  lower-cased, against members' `email` field; never by handle.
 - **Errors:** `{"code": "<snake_case>", "error": "<plain sentence for the person>"}`.
   `404 not_found` is also the answer for someone else's draft or task, so the app never
   confirms that it exists. Any unknown path under `/api` is a JSON `404 not_found`, never
@@ -30,8 +38,21 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
 
 | Method and path | Body | Answer |
 | --- | --- | --- |
+| `GET /api/auth/providers` | | `{providers: ["entra", "dev"]}`: the providers that are on, Entra first. No session needed. |
+| `GET /api/auth/login[?return_to=/path]` | | `303` to Microsoft's authorize endpoint, setting the `__Host-pmos-entra` flow cookie (ten minutes). `return_to` is kept only if it is a same-origin path (`/…`, not `//…`); else `/`. `404` unless Entra is on. If Microsoft's metadata can't be fetched: `303` to `/#/signed-out?reason=unavailable`. |
+| `GET /api/auth/callback?code&state` | | Microsoft's redirect back. `303` to the `return_to` path (default `/`) with the session cookie, or `303` to `/#/signed-out?reason=<reason>` with no session. Always clears the flow cookie. `404` unless Entra is on. |
 | `POST /api/auth/dev-login` | `{handle}` | `204` and the cookie. `404` unless development sign-in is on. `403 not_a_member` for a handle not in `team.yaml`. |
-| `POST /api/auth/logout` | none | `204`; the session ends. |
+| `POST /api/auth/logout` | none | `204`; the session ends. Only PM OS's session: Microsoft's own sign-in session is untouched, so "Sign in with Microsoft" may then sign straight back in without a prompt. |
+
+The callback's `reason`s, for the app's signed-out page:
+
+| `reason` | Meaning | Suggested text |
+| --- | --- | --- |
+| `not_a_member` | Microsoft signed them in, but no `team.yaml` member has that email. | "You're not on the team list yet. Ask a platform owner to add you." |
+| `cancelled` | They cancelled at Microsoft (`access_denied`). | "Sign-in was cancelled." |
+| `expired` | No sign-in in progress in this browser, or it took over ten minutes. | "That sign-in expired. Try again." |
+| `unavailable` | Microsoft couldn't be reached. | "Microsoft sign-in isn't answering. Try again in a minute." |
+| `failed` | Anything else (a wrong or reused `state`, a refused code, a token that failed a check). | "Sign-in didn't work. Try again." |
 
 ## Me
 
