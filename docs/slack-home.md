@@ -49,6 +49,11 @@ says "and N more; they appear as you clear these."
 and rejects; the footer says so: "To edit or snooze a draft, use its card in our DM."
 Rejecting from the Home records no reason; to say why, reject on the card.
 
+A Confluence or Jira draft's card in our DM also has **Open in workspace** when the web app is
+set up (`PMOS_WEB_PUBLIC_URL`). It opens the same draft at `/drafts/<id>` in the web app, where
+the PM can read, edit and decide it. The button is absent when that setting is unset, and on
+Slack replies and messages, which have no web page.
+
 ## Skills
 
 **What PM OS can do for you in Slack,** grouped by track:

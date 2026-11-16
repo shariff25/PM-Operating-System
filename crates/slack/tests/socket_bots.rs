@@ -384,6 +384,7 @@ impl Stack {
             github_org: None,
             response_url_prefix: "https://hooks.slack.com/".into(),
             state_dir: state.path().to_path_buf(),
+            web_url: None,
         });
         Self {
             slack,

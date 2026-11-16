@@ -502,6 +502,7 @@ impl Stack {
             github_org: Some("example-org".into()),
             response_url_prefix: format!("{slack_base}/hooks/"),
             state_dir: team.path().join("state"),
+            web_url: None,
         });
         let socket = Socket::new(
             slack_base.clone(),
