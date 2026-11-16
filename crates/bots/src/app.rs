@@ -257,7 +257,7 @@ async fn authenticate(State(state): State<AppState>, mut req: Request, next: Nex
                     user = subject;
                 }
             }
-            Err(refused) => return refused,
+            Err(refused) => return *refused,
         }
     }
     req.extensions_mut().insert(Caller { kind, user, bot });
@@ -266,16 +266,19 @@ async fn authenticate(State(state): State<AppState>, mut req: Request, next: Nex
 
 /// The one answer to every assertion failure. The log says why, by kind only: never the
 /// assertion, a key, or a handle.
-fn refuse_assertion(kind: ClientKind, why: Refusal) -> Response {
+fn refuse_assertion(kind: ClientKind, why: Refusal) -> Box<Response> {
     tracing::warn!(client = kind.as_str(), reason = %why, "refused a user assertion");
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({
-            "code": "bad_assertion",
-            "error": "this call needs a valid X-Pmos-Assertion for the person it acts for",
-        })),
+    // Boxed: a `Response` is a large error to carry in a `Result`.
+    Box::new(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "code": "bad_assertion",
+                "error": "this call needs a valid X-Pmos-Assertion for the person it acts for",
+            })),
+        )
+            .into_response(),
     )
-        .into_response()
 }
 
 /// Every person `req` names: `X-Pmos-User`, the `requested_by` and `owner` filters, and the
@@ -313,7 +316,7 @@ async fn check_assertion(
     assertions: &Assertions,
     kind: ClientKind,
     req: Request,
-) -> Result<(Request, Option<String>), Response> {
+) -> Result<(Request, Option<String>), Box<Response>> {
     let named = named_people(&req);
     let Some(header) = req.headers().get(pmos_assertion::HEADER).cloned() else {
         if assertions.mode() == Mode::Require && !named.is_empty() {

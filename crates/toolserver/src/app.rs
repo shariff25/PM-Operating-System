@@ -346,7 +346,7 @@ async fn identify_approvals_client(
                 req = checked;
                 acting = Acting(subject);
             }
-            Err(refused) => return refused,
+            Err(refused) => return *refused,
         }
     }
     req.extensions_mut().insert(client);
@@ -360,16 +360,19 @@ const MAX_ASSERTED_BODY: usize = 2 * 1024 * 1024;
 
 /// The one answer to every assertion failure. The log says why, by kind only: never the
 /// assertion, a key, or a handle.
-fn refuse_assertion(client: Client, why: assertion::Refusal) -> Response {
+fn refuse_assertion(client: Client, why: assertion::Refusal) -> Box<Response> {
     tracing::warn!(client = client.as_str(), reason = %why, "refused a user assertion");
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({
-            "code": "bad_assertion",
-            "error": "this call needs a valid X-Pmos-Assertion for the person it acts for",
-        })),
+    // Boxed: a `Response` is a large error to carry in a `Result`.
+    Box::new(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "code": "bad_assertion",
+                "error": "this call needs a valid X-Pmos-Assertion for the person it acts for",
+            })),
+        )
+            .into_response(),
     )
-        .into_response()
 }
 
 /// The `user=` an approvals call names, if any. A query that doesn't parse counts as naming
@@ -390,7 +393,7 @@ async fn check_assertion(
     assertions: &Assertions,
     client: Client,
     req: Request,
-) -> Result<(Request, Option<String>), Response> {
+) -> Result<(Request, Option<String>), Box<Response>> {
     let uri = req
         .extensions()
         .get::<OriginalUri>()
