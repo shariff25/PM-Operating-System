@@ -178,5 +178,8 @@ a 128 KiB body, one-line text (`summary` at most 200 characters, `who` 80), `sys
 `a-z`, digits, `-` and `_`, every `url` `http` or `https` without credentials; anything else
 is `422 bad_brief` (`413` for an oversize body, `401 bad_token`, `404` for a handle not on the
 team) and nothing is stored. A follow-up sent again keeps its age and a dismissal; one left
-out is removed. **Nothing calls this route yet**: the Slack brief routine (`docs/daily-brief.md`)
-or a later job is the intended caller.
+out is removed. **The caller is the Slack service** (`pmos-slack`, `crates/slack/src/brief_feed.rs`):
+when a PM's daily brief finishes, it sends the items of the brief's machine-readable block
+(`docs/daily-brief.md`, "The web app's panels") here, with `PMOS_WEB_URL` and
+`PMOS_WEB_BRIEF_TOKEN` set on it. It sends nothing until a brief runs, so a PM with no brief
+routine has empty lists.
