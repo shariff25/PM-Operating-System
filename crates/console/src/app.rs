@@ -548,7 +548,9 @@ async fn approvals(State(state): State<AppState>, Signed { viewer, team }: Signe
         let rows: Vec<Vec<String>> = items
             .iter()
             .map(|a| {
-                let args = serde_json::to_string(&a.args).unwrap_or_default();
+                // As it will be written: without the draft's source markers (`[[src-…]]`).
+                let args = serde_json::to_string(&pmos_contract::cite::strip_json(&a.args))
+                    .unwrap_or_default();
                 let task = if valid_id(&a.run_id) {
                     format!("<a href=\"/tasks/{id}\">{id}</a>", id = Esc(&a.run_id))
                 } else {
@@ -718,7 +720,8 @@ async fn task(
         body.push_str("</ul>");
     }
     if let Some(result) = &task.result {
-        let _ = write!(body, "<h2>Result</h2><pre>{}</pre>", Esc(result));
+        let result = pmos_contract::cite::strip(result);
+        let _ = write!(body, "<h2>Result</h2><pre>{}</pre>", Esc(&result));
     }
     if let Some(error) = &task.error {
         let _ = write!(

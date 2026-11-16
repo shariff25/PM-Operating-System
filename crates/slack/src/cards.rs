@@ -200,11 +200,13 @@ pub fn sections(text: &str) -> Vec<Value> {
     blocks
 }
 
-/// A bot's answer or message, from markdown.
+/// A bot's answer or message, from markdown. Source markers (`[[src-…]]`, for drafts in the
+/// web app) are removed.
 pub fn answer(markdown: &str) -> (String, Value) {
+    let markdown = pmos_contract::cite::strip(markdown);
     (
-        fallback(markdown),
-        Value::Array(sections(&mrkdwn(markdown))),
+        fallback(&markdown),
+        Value::Array(sections(&mrkdwn(&markdown))),
     )
 }
 
@@ -265,8 +267,11 @@ pub fn tool_label(tool: &str) -> String {
     }
 }
 
-/// The arguments of a write, one line per field: the editable ones first.
+/// The arguments of a write, one line per field: the editable ones first. Text is shown as
+/// it will be written: without source markers (`[[src-…]]`), which the tool server removes
+/// when it writes.
 pub fn args_summary(args: &Value) -> String {
+    let args = &pmos_contract::cite::strip_json(args);
     let Some(obj) = args.as_object() else {
         return escape(&truncate(&args.to_string(), 500));
     };
@@ -459,11 +464,16 @@ pub fn decision_line(item: &Value, decided_by: &str, edited: bool) -> String {
     }
 }
 
-/// The editable string fields this item has, with their values.
+/// The editable string fields this item has, with their values, without source markers: the
+/// PM edits the text as it will be written.
 pub fn editable_fields(item: &Value) -> Vec<(&'static str, String)> {
     EDITABLE
         .iter()
-        .filter_map(|f| item["args"][*f].as_str().map(|v| (*f, v.to_string())))
+        .filter_map(|f| {
+            item["args"][*f]
+                .as_str()
+                .map(|v| (*f, pmos_contract::cite::strip(v)))
+        })
         .collect()
 }
 
@@ -688,9 +698,9 @@ fn reply_head(item: &Value) -> Vec<Value> {
         title.push_str(&link(&url, "open the thread"));
     }
     let mut blocks = vec![section(&title)];
-    let text = args["text"].as_str().unwrap_or_default();
+    let text = pmos_contract::cite::strip(args["text"].as_str().unwrap_or_default());
     if item["status"] != "expired" && !text.trim().is_empty() && text != "[expired]" {
-        let quoted: Vec<String> = reply_text(&truncate(text, 2500))
+        let quoted: Vec<String> = reply_text(&truncate(&text, 2500))
             .lines()
             .map(|l| format!("> {l}"))
             .collect();
@@ -1126,6 +1136,45 @@ mod tests {
         // The editor posts.
         let modal = edit_modal(&item, "D0ANA", "1.0").unwrap();
         assert_eq!(modal["submit"]["text"], "Post as you");
+    }
+
+    /// Source markers are for the web app's draft view: a card shows, and its Edit modal
+    /// offers, the text as it will be written, without them.
+    #[test]
+    fn cards_show_drafts_without_source_markers() {
+        let page = json!({
+            "id": "apr_1", "user": "ana", "tool": "confluence.create_draft",
+            "args": {"space": "PM", "title": "Plan [[src-3f9a1c]]",
+                     "body": "Grace is 7 days [[src-3f9a1c]][[src-0b77d2]].\nUse `[[src-3f9a1c]]`."},
+            "status": "pending"
+        });
+        let mut reply = reply_item();
+        reply["args"]["text"] = json!("Yes, SSO ships in 4.2 [[src-3f9a1c]]. Ask <@U0BOB> [[s2]].");
+        for item in [&page, &reply] {
+            let (_, blocks) = approval_card(item, None);
+            let shown = blocks.to_string();
+            assert!(!shown.contains("[[src-3f9a1c]]."), "{shown}");
+            assert!(!shown.contains("[[src-0b77d2]]") && !shown.contains("[[s2]]"));
+            let modal = edit_modal(item, "C1", "1.2").unwrap().to_string();
+            assert!(!modal.contains("[[src-0b77d2]]") && !modal.contains("[[s2]]"));
+        }
+        let (_, blocks) = approval_card(&page, None);
+        let shown = blocks.to_string();
+        assert!(shown.contains("Grace is 7 days."), "{shown}");
+        assert!(shown.contains("Plan"));
+        // Code keeps what it says.
+        assert!(shown.contains("`[[src-3f9a1c]]`"), "{shown}");
+        let (_, blocks) = approval_card(&reply, None);
+        assert!(blocks
+            .to_string()
+            .contains("Yes, SSO ships in 4.2. Ask <@U0BOB>."));
+        assert_eq!(
+            editable_fields(&reply),
+            vec![("text", "Yes, SSO ships in 4.2. Ask <@U0BOB>.".to_string())]
+        );
+        let (text, blocks) = answer("Done [[src-3f9a1c]].");
+        assert_eq!(text, "Done.");
+        assert!(!blocks.to_string().contains("src-"));
     }
 
     #[test]

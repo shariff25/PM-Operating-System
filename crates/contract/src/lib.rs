@@ -7,6 +7,7 @@
 //! The formats are documented in `docs/contract.md`.
 
 pub mod bots;
+pub mod cite;
 pub mod frontmatter;
 pub mod lint;
 pub mod model;
