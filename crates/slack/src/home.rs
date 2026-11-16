@@ -816,6 +816,8 @@ impl Bots {
         let tab = Tab::of_metadata(event["view"]["private_metadata"].as_str());
         let (this, user) = (self.clone(), user.to_string());
         Some(Box::pin(async move {
+            // The first-time offer, if their account is now linked (flag off: no-op).
+            this.onboarding_offer_for_slack_user(&user).await;
             this.publish_home(&user, tab, None).await
         }))
     }

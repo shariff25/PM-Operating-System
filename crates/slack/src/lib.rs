@@ -45,6 +45,8 @@ pub mod mention;
 pub mod notify;
 pub mod nudge_copy;
 pub mod nudges;
+pub mod onboard_copy;
+pub mod onboard_flow;
 pub mod proxy;
 pub mod reply;
 pub mod runtime;

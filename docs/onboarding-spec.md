@@ -345,3 +345,14 @@ Differences from the text above, and codes added while building:
   - the catalog reload also watches `tools.yaml` and `skills/**`;
   - admin cards are tracked in memory, so after a restart a decision updates only the tapped
     card.
+
+### Slack first-time flow (`PMOS_ONBOARDING_V2=1`)
+
+Off by default; with it off the Slack welcome and checklist (§4) are unchanged. On, a newly
+approved member's welcome is two lines and one **Connect Jira and Confluence** button, with no
+checklist. Once the onboarding state shows Atlassian linked (read on their next DM or Home open),
+PM OS posts one offer with three starter buttons that each create a task for their personal bot
+through the normal DM path. Slack and the memory repo are offered when a request first needs them.
+After the first finished task, one closing line (Skills view, `nudges off`). Each step is shown
+once, kept in `<state dir>/onboarding.json`. `setup` is unchanged. See `docs/slack-home.md`
+("First time").
