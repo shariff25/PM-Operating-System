@@ -73,10 +73,16 @@ export type RejectReason = (typeof REJECT_REASONS)[number];
 
 export type TaskStatus = 'queued' | 'working' | 'needs_approval' | 'done' | 'failed' | 'cancelled';
 
+/** A human-readable step. The backend sends milestones only, in order, each text once. */
 export interface TaskEvent {
   at: string;
-  kind: string;
+  kind: 'milestone';
   text: string;
+}
+
+export interface TaskProgress {
+  done: number;
+  total: number;
 }
 
 export interface Task {
@@ -89,6 +95,11 @@ export interface Task {
   draft_ids: string[];
   created_at: string;
   updated_at: string;
+  /** From the bot's latest checklist, or null when it has none. */
+  progress: TaskProgress | null;
+  /** True while the task runs again after the runtime retried it. Optional. */
+  retrying?: boolean;
+  /** Absent in the list answer. */
   events?: TaskEvent[];
 }
 

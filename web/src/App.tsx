@@ -52,7 +52,7 @@ function Page({ route }: { route: Route }) {
   }
 }
 
-export function App({ createApi, pollMs = 2000 }: AppProps) {
+export function App({ createApi, pollMs }: AppProps) {
   const [me, setMe] = useState<Me | null>(null);
   const [ready, setReady] = useState(false);
   const signedOut = useRef<() => void>(() => {});
