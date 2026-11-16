@@ -108,9 +108,9 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
  "checklist": [{"item": "Search the docs", "done": true}], "result": "markdown or null",
  "error": "stated reason or null", "approvals": ["apr_…"],
  "slack": {"channel": "D0…", "thread_ts": "1731…"} , "routine_id": "rtn_… or null",
- "attempts": 1, "created_at": "…", "updated_at": "…"}
+ "conversation": "cnv_… (optional)", "attempts": 1, "created_at": "…", "updated_at": "…"}
 ```
-- **Web tasks:** only client `web` sets `source: "web"`, and `web` sets nothing else. A web task has no `slack` field and writes no notifications (the Slack feed would have nowhere to post them); the web app reads the task and its events instead.
+- **Web tasks:** only client `web` sets `source: "web"`, and `web` sets nothing else (apart from an optional `conversation`; see Conversations). A web task has no `slack` field and writes no notifications (the Slack feed would have nowhere to post them); the web app reads the task and its events instead.
 - **Priority:** `interactive` for Slack, the web app and the CLI, `scheduled` for routines, `personal` for evals and background work. It is passed to the gateway as `X-Pmos-Priority`.
 - **Status flow:** `queued`, then `working`, then `done` or `failed`, or `needs_approval` when the result has pending approvals. A queued or working task can become `cancelled`.
 - **Leaving `needs_approval`:** the runtime polls `GET /internal/approvals/{id}` every 30 seconds with the service token. When none is still `pending` or `executing`, the task becomes `done`, and the notification says what was approved or rejected.
@@ -120,6 +120,21 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
   - Otherwise it becomes `failed`, with the reason "interrupted twice by restarts; ask again".
   - Nothing is lost silently.
 
+### Conversations
+A follow-up in the same thread carries the thread's earlier turns, so a short reply is read as
+an answer to the bot's last question.
+- **The thread:** for a Slack task, its `slack {channel, thread_ts}`; for a web task, the
+  optional `conversation` id (1 to 128 of `A-Z a-z 0-9 . _ : -`) on `POST /v1/tasks`. Only
+  clients `web` and `slack` may set it (`403` otherwise). Only interactive tasks have a
+  thread; routines and evals start fresh.
+- **Whose turns:** earlier tasks of the same bot, the same `requested_by` and the same
+  thread, no longer `queued` or `working`. Never another PM's, never another bot's.
+- **In the claim:** `history: [{text, result?, error?, status, at}]`, oldest first: the
+  newest 6 turns, each field cut to 4,000 bytes with `… [truncated]`, at most 16,000 bytes in
+  all (the oldest dropped first). `[]` for a first message.
+- **Retention:** only turns from the last 24 hours (the Slack-text window, D6), and none whose
+  text has been redacted.
+
 ### API
 | Method and path | Client | Notes |
 | --- | --- | --- |
@@ -127,12 +142,12 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 | `PUT /v1/members/{handle}/settings` `{level}` | slack, web (own handle only) | The same shape. The handle must be a member. An unknown level is `400`; another member's handle is `403`. |
 | `GET /v1/bots` | all | `[{name, role, scope, owner, description}]` |
 | `GET /v1/bots/{name}` | all | the bot, its role, its tools, and each write tool's setting |
-| `POST /v1/tasks` `{bot, requested_by, text, source, slack?, level?}` | slack (`slack`/`cli`), web (`web`), evals (`eval`) | `201` with the Task. `403` if `requested_by` may not use the bot: personal bots serve their owner only, and team bots serve team members. |
+| `POST /v1/tasks` `{bot, requested_by, text, source, slack?, level?, conversation?}` | slack (`slack`/`cli`), web (`web`), evals (`eval`) | `201` with the Task. `403` if `requested_by` may not use the bot: personal bots serve their owner only, and team bots serve team members. |
 | `GET /v1/tasks/{id}`, `GET /v1/tasks?bot=&requested_by=&status=&limit=` | slack, web (own), console, evals | |
 | `POST /v1/tasks/{id}/cancel` | slack, web (own), console | |
 | `GET /v1/tasks/{id}/events` | slack, web (own), console, evals | `[{at, kind, text}]` |
 | `GET /v1/tasks/{id}/trace` | console | `[{at, kind, body}]` |
-| `POST /v1/worker/claim` `{worker, bots?: [..], wait_ms?}` | worker | Long-polls up to `wait_ms` (at most 25,000). Returns `200` with `{task, bot, role, tools, session_token, lease_until}`, or `204` if nothing is queued. The runtime creates the tool-server session (§2) for the task. |
+| `POST /v1/worker/claim` `{worker, bots?: [..], wait_ms?}` | worker | Long-polls up to `wait_ms` (at most 25,000). Returns `200` with `{task, bot, role, tools, session_token, lease_until, gateway, level, history}` (history: see Conversations), or `204` if nothing is queued. The runtime creates the tool-server session (§2) for the task. |
 | `POST /v1/worker/tasks/{id}/heartbeat` | worker | extends the lease |
 | `POST /v1/worker/tasks/{id}/events` `{kind: "status"\|"checklist"\|"milestone", text?, checklist?}` | worker | Milestones are what Slack shows. The runtime keeps them all and notifies each one. |
 | `POST /v1/worker/tasks/{id}/trace` `{entries: [{kind: "prompt"\|"model_reply"\|"tool_call"\|"tool_result"\|"policy_denial", body}]}` | worker | to the trace store |
@@ -192,6 +207,12 @@ preference, so it lives in the runtime, which builds each task's claim, and not 
   - the tool server's MCP tools for the claimed `session_token`;
   - only the role's skills;
   - the role's instructions plus the bot's job as system context.
+- **Messages:** each turn of the claim's `history` becomes the PM's message and the bot's reply
+  (its result; for a failed or cancelled turn, a short note saying so), oldest first, then the
+  new request as the last message. With any history, the system prompt adds: "The messages
+  before the last one are this conversation's earlier turns, oldest first; the last message is
+  the new request. A short reply is an answer to your last question." A first message is sent
+  alone, as before. A replayed reply is never taken as the final answer.
 - **Writes:** no harness interrupt. Writes go to the tool server, which returns `pending_approval` items; the worker collects their `approval_id`s.
 - **Progress:** checklist and milestones as the run goes. At least "Working on it" and one milestone per distinct tool family used ("Searching the support docs", "Reading Jira", "Drafting in Confluence"), each sent once. Every model turn and tool call goes to the trace endpoint.
 - **Heartbeat:** every 30 seconds while running.

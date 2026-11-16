@@ -10,8 +10,10 @@ import {
   type WorkerConfig,
   botSystemPrompt,
   createWorker,
+  finalAnswer,
   gatewayBaseUrl,
   pmReason,
+  taskMessages,
 } from "../src/worker.js";
 import {
   type FakeMcp,
@@ -467,6 +469,80 @@ describe("the bot's system prompt", () => {
   it("uses the UTC date", () => {
     const late = new Date("2026-12-31T23:59:59-05:00");
     expect(botSystemPrompt(personal("staff"), late)).toContain("Today is 2027-01-01.");
+  });
+});
+
+describe("a conversation's earlier turns", () => {
+  const SHORT_REPLY = "A short reply is an answer to your last question.";
+  const followUp = (history: unknown[]) =>
+    ClaimSchema.parse({ ...claim("tsk_f", { text: "customer" }), history });
+  const turns = [
+    {
+      text: "Draft a PRD for SSO",
+      result: "Who is the user of this feature?",
+      status: "done",
+      at: "2026-11-15T10:00:00Z",
+    },
+    {
+      text: "generate the content",
+      error: "The model is busy right now.",
+      status: "failed",
+      at: "2026-11-15T10:05:00Z",
+    },
+    { text: "never mind", status: "cancelled", at: "2026-11-15T10:06:00Z" },
+  ];
+
+  it("puts earlier turns first as PM and bot messages, oldest first, then the new request", () => {
+    const messages = taskMessages(followUp(turns));
+    expect(messages.map((m) => [m.getType(), m.content])).toEqual([
+      ["human", "Draft a PRD for SSO"],
+      ["ai", "Who is the user of this feature?"],
+      ["human", "generate the content"],
+      ["ai", "(This request failed: The model is busy right now.)"],
+      ["human", "never mind"],
+      ["ai", "(This request was cancelled before I answered.)"],
+      ["human", "customer"],
+    ]);
+  });
+
+  it("says in the system prompt that a short reply answers the last question", () => {
+    const text = botSystemPrompt(followUp(turns));
+    expect(text).toContain(SHORT_REPLY);
+    expect(text.indexOf("## This conversation")).toBeGreaterThan(text.indexOf("## Writes need approval"));
+  });
+
+  it("leaves a first message as it was: the request alone, and no conversation section", () => {
+    const first = ClaimSchema.parse(claim("tsk_first"));
+    expect(first.history).toEqual([]);
+    const messages = taskMessages(first);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.getType()).toBe("human");
+    expect(messages[0]?.content).toBe("What ports does Acme Vault need?");
+    expect(botSystemPrompt(first)).not.toContain("This conversation");
+  });
+
+  it("never takes a replayed reply as the final answer", () => {
+    const messages = taskMessages(followUp(turns));
+    expect(finalAnswer(messages)).toBe("");
+    expect(finalAnswer([...messages, new AIMessage("Here is the PRD.")])).toBe("Here is the PRD.");
+  });
+
+  it("sends the turns to the model ahead of the new request", async () => {
+    const model = new ScriptedModel([new AIMessage("Here is the PRD for customers.")]);
+    const { runtime } = await setup({
+      claims: [{ ...claim("tsk_conv", { text: "customer" }), history: turns.slice(0, 1) }],
+      models: { tsk_conv: model },
+    });
+    const done = await waitFor(() => runtime.forTask("tsk_conv", "complete")[0]);
+    expect(done.body.result).toBe("Here is the PRD for customers.");
+    const prompt = model.prompts[0] ?? [];
+    expect(prompt.map((m) => m.getType())).toEqual(["system", "human", "ai", "human"]);
+    expect(prompt.slice(1).map((m) => m.content)).toEqual([
+      "Draft a PRD for SSO",
+      "Who is the user of this feature?",
+      "customer",
+    ]);
+    expect(systemText(prompt)).toContain(SHORT_REPLY);
   });
 });
 
