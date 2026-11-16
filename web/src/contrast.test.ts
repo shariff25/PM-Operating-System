@@ -6,7 +6,7 @@ const css = readFileSync(new URL('./styles.css', import.meta.url), 'utf8');
 
 function tokens(block: string): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const m of block.matchAll(/--([a-z-]+):\s*(#[0-9a-fA-F]{6})\s*;/g)) out[m[1]!] = m[2]!;
+  for (const m of block.matchAll(/--([a-z0-9-]+):\s*(#[0-9a-fA-F]{6})\s*;/g)) out[m[1]!] = m[2]!;
   return out;
 }
 
@@ -30,7 +30,20 @@ const PAIRS: [string, string][] = [
   ['accent', 'surface'], ['accent', 'bg'], ['accent', 'accent-soft'], ['accent-ink', 'accent'],
   ['warn-ink', 'warn-bg'], ['good-ink', 'good-bg'], ['bad-ink', 'bad-bg'],
   ['disabled-ink', 'disabled-bg'], ['ink', 'accent-soft'], ['warn-ink', 'surface'], ['bad-ink', 'surface'],
+  // The redesign: primary buttons, the sidebar, selected rows, hints, toasts and quiet pills.
+  ['primary-ink', 'primary'], ['ink', 'nav-active'], ['muted', 'nav-active'], ['ink', 'surface-2'],
+  ['muted', 'surface-2'], ['coach-ink', 'coach-bg'], ['inverse-ink', 'inverse-bg'], ['warn-ink', 'bg'],
+  ['good-ink', 'surface'], ['good-ink', 'bg'], ['bad-ink', 'bg'], ['accent', 'nav-active'], ['surface', 'bad-ink'],
 ];
+
+describe('dark tokens', () => {
+  it('are the same for the system preference and for the menu choice', () => {
+    const media = tokens(css.slice(darkStart, css.indexOf(":root[data-theme='dark']")));
+    const chosen = tokens(css.slice(css.indexOf(":root[data-theme='dark']"), css.indexOf('* { box-sizing')));
+    expect(Object.keys(media).length).toBeGreaterThan(20);
+    expect(chosen).toEqual(media);
+  });
+});
 
 describe.each([['light', light], ['dark', dark]] as const)('%s theme contrast', (_name, t) => {
   it.each(PAIRS)('%s on %s is at least 4.5:1', (fg, bg) => {
