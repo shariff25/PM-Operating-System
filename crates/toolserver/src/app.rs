@@ -907,6 +907,7 @@ async fn revoke_credential(
                 tool: UNLINK_TOOL.to_string(),
                 outcome,
                 sources: Vec::new(),
+                source_titles: Default::default(),
                 args_hash: None,
                 output_ref: Some(provider),
                 detail: Some(detail),

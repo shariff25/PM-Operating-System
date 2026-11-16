@@ -261,18 +261,21 @@ async fn lists_what_the_run_read_newest_first_once_each_without_text() {
             ("context", "context/partners/globex-nda.md"),
         ]
     );
+    // Titles recorded at the read: the issue's summary after its key, the docs page's title.
     assert_eq!(
         sources[2],
-        json!({"system": "jira", "title": "PM-101", "url": format!("{SITE}/browse/PM-101"),
+        json!({"system": "jira", "title": "PM-101: Epic: SSO for the Acme Vault console",
+               "url": format!("{SITE}/browse/PM-101"),
                "ref": "PM-101", "tool": "jira.read",
                "read_at": serde_json::to_value(t0 + Duration::seconds(3)).unwrap()})
     );
+    // Slack stays channel and message ids.
     assert_eq!(sources[3]["title"], "Slack thread in C0FIELD");
     assert_eq!(
         sources[3]["url"],
         "https://slack.com/archives/C0FIELD/p1731500000000100"
     );
-    assert_eq!(sources[1]["title"], "vault saml sso");
+    assert_eq!(sources[1]["title"], "Configure SAML SSO for Acme Vault");
     assert_eq!(
         sources[1]["url"],
         "https://docs.example.com/docs/vault-saml-sso.md"
@@ -280,11 +283,10 @@ async fn lists_what_the_run_read_newest_first_once_each_without_text() {
     assert_eq!(sources[4]["url"], Value::Null, "a context file has no link");
     assert!(!sources[4]["title"].as_str().unwrap().is_empty());
 
-    // Metadata only: no message text, issue text, page snippet or token.
+    // Metadata only: titles, but no message text, issue description, page snippet or token.
     for text_seen in [
         "Does Acme Vault support SAML SSO",
         "Customers ask for SAML SSO",
-        "Epic: SSO",
         "Key rotation creates",
         "single sign-on",
         "SSO ships in 4.2",
@@ -294,6 +296,46 @@ async fn lists_what_the_run_read_newest_first_once_each_without_text() {
         "excerpt",
     ] {
         assert!(!text.contains(text_seen), "{text_seen} in {text}");
+    }
+
+    // What the audit log recorded: a title per Jira, docs and context item, cleaned and
+    // capped, and nothing at all for the Slack thread (its text may be kept only 24 hours).
+    let reads: Vec<AuditEvent> = f
+        .audit
+        .events()
+        .into_iter()
+        .filter(|e| e.run_id == "tsk_src1" && e.outcome == Outcome::Ok)
+        .collect();
+    let titled = |tool: &str| {
+        reads
+            .iter()
+            .find(|e| e.tool == tool)
+            .unwrap()
+            .source_titles
+            .clone()
+    };
+    assert_eq!(
+        titled("jira.read").get("jira:PM-101").map(String::as_str),
+        Some("Epic: SSO for the Acme Vault console")
+    );
+    assert!(!titled("context.read").is_empty());
+    assert_eq!(
+        titled("docs.search").len(),
+        2,
+        "{:?}",
+        titled("docs.search")
+    );
+    assert!(
+        titled("slack.read_thread").is_empty(),
+        "no Slack title is recorded"
+    );
+    for e in &reads {
+        for t in e.source_titles.values() {
+            assert!(t.chars().count() <= pmos_toolserver::audit::MAX_SOURCE_TITLE);
+            assert!(!t.chars().any(char::is_control));
+        }
+        assert!(e.source_titles.keys().all(|k| e.sources.contains(k)));
+        assert!(!e.source_titles.keys().any(|k| k.starts_with("slack:")));
     }
 }
 
@@ -380,6 +422,7 @@ async fn caps_the_list_and_skips_what_it_cannot_identify() {
         tool: tool.into(),
         outcome,
         sources,
+        source_titles: Default::default(),
         args_hash: None,
         output_ref: None,
         detail: None,
@@ -434,6 +477,10 @@ async fn caps_the_list_and_skips_what_it_cannot_identify() {
         .map(|s| s.reference.as_str())
         .collect();
     assert_eq!(refs[0], "PM-229", "newest first");
+    assert_eq!(
+        report.sources[0].title, "PM-229",
+        "an event with no recorded title (as before titles were kept) reads as its id"
+    );
     assert_eq!(refs[MAX_SOURCES - 1], "PM-210");
     assert!(!refs
         .iter()
