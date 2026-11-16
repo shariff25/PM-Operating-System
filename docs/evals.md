@@ -13,7 +13,7 @@ evals/
   taxonomy.yaml                       second-level failure tags under the five bottlenecks
   case-card.md                        the template for turning a real case into a task
   categories/<name>/category.yaml     {name, bot, level?, pass_bar?, repeats?, description}
-  categories/<name>/tasks/<id>.yaml   {id, ask, expect, cluster?, regression?, tags?}
+  categories/<name>/tasks/<id>.yaml   {id, ask, expect | thread, cluster?, regression?, tags?}
   judges/<name>.yaml                  an LLM judge
   judges/<name>.labels.jsonl          its labels (empty: none yet)
   judges/<name>.calibration.json      written by `pmos-evals judge calibrate`
@@ -240,6 +240,59 @@ expect:
 - curly apostrophes become straight ones ("don’t" matches "don't");
 - thousands separators between digits are dropped ("1,800" matches "1800");
 - runs of whitespace become one space.
+
+### Threads
+A real PM talks to the bot in a conversation: the bot asks "Who is the user?", the PM answers
+"customer", and the bot must read that as the answer. A task with a `thread` tests this. It has
+`thread`, an ordered list of turns, in place of `ask` and `expect`:
+
+```yaml
+id: thread-one-word-answer-is-an-answer
+thread:
+  - ask: "Write a PRD for adding a dark mode to the Acme Vault console."
+    expect: {approvals: 0, must_include: ["?"]}      # the bot asks first
+  - ask: "customer"
+    expect: {must_not_include: ["who is the user"]}  # and takes this as the answer
+  - ask: "Now draft it."                             # no expect: it only has to settle
+```
+
+- **One or the other.** A task has `ask` and `expect`, or `thread`, never both; `check` says
+  so. A thread has at least two turns, at least one with an `expect`, and no top-level
+  `expect`. Each turn's `expect` is the same as a single task's (every check in **Grading**,
+  drafts included) and is validated the same way, with the turn's number in the message.
+- **What the runner does.** For each attempt it makes a fresh conversation id
+  (`eval-<task id>-r<run>-<time>-<n>`) and creates each turn as its own runtime task with that
+  `conversation`, starting a turn when the one before has settled. It polls, reads drafts and
+  grades each turn with an `expect`, exactly as it does a single task. The thread passes only
+  if every graded turn passes. A turn without an `expect` has to settle and nothing more. A
+  graded turn that fails doesn't stop the thread: the turns after it are still informative.
+- **Timeouts are per turn:** `--timeout-secs` is how long each turn may take, not the thread.
+  A turn that doesn't settle (a timeout, or the runtime failing) ends the thread there: the
+  turns after it would be asked without their context, so they are recorded as "not run".
+- **Repeats** re-run the whole thread, each with a new conversation id, so one run's answers
+  never become the next run's history.
+- **Judges** are asked about the last turn only, shown the earlier asks (not the replies) and
+  the last ask and answer.
+- **The load test** uses a thread task's first turn.
+- **In the report,** a thread attempt is one line, so the pass rate, pass^k and the gate count
+  it once. Its Why column and its failure details start "turn 2:", and the failure's tag
+  reason starts "turn 2 of 3:". A **Threads** section lists every turn of every thread
+  attempt as pass, FAIL, not graded or not run, with its status, time and failed checks. In
+  the `.json`, each thread line has `turns` and `failed_turn`; single tasks have neither.
+- **Tags:** the tag is that of the first failed turn, by the rules in **Failure tags**. A bot
+  that loses the thread usually answers the follow-up as a new request, which is a `model`
+  failure (`model/forbidden-text` or `model/missing-fact`, from the failed check). Tag the
+  task `memory/lost-the-thread` to say what it is there to catch.
+
+**What the runtime must allow.** The runner sends `conversation` on `POST /v1/tasks` and
+expects the runtime to give each turn the earlier turns of that conversation as `history`
+(`docs/bot-runtime-spec.md`, Conversations). Until the runtime does that for eval tasks, a
+thread's first turn is refused (`403`, "only the web and Slack clients name a task's
+conversation"), the thread fails at turn 1 tagged `harness/runtime-unreachable`, and the
+report's reason says why. The runner needs no change when it does. The thread tasks in
+`pm-craft` are not `regression: true` for this reason: the gate doesn't fail a change that
+leaves them failing, and they count in the category's pass rate like any task. Mark them once
+they pass.
 
 ### Failure tags
 Every failure gets exactly one tag. The rules run in this order, and the first match wins.
@@ -578,6 +631,8 @@ So queue time can be over-counted by up to one poll interval when a task has no 
    - `must_decline: true`: the sources don't answer it, and the bot must say so. No
      `must_cite`.
    - `drafts`: checks on the drafts, one entry per tool (see **Grading**).
+   - `thread`: in place of `ask` and `expect`, a conversation of turns, each `{ask, expect?}`
+     (see **Threads**).
    - `cluster`: give tasks that share a source one cluster, so the standard error counts them
      as related.
    - `regression`: mark a task that broke once and was fixed.
@@ -667,6 +722,7 @@ docs pages. Like them, it is marked "seed: replace with case cards", has the sta
 | `numbers-sample-size-from-tool` | An experiment plan for a 10% baseline and a 10% relative lift, with the defaults | The draft has the per-arm sample size `stats.sample_size` returns |
 | `ai-spec-failure-modes-and-evaluation` | An AI feature spec | The draft has "Failure modes" and "Evaluation" |
 | `review-prd-by-severity` | A review of fixture page 9002 | No draft or page update; the answer names a "blocker" and ends with the "three changes" that matter most |
+| `thread-*` (3) | A conversation of two turns (see **Threads**): a one-word answer to the bot's own question; "generate the content" after a request about page 9001; a follow-up that changes one detail of a Jira story | The second turn continues the first: no repeated question, the draft is of page 9001, the story is a Task and keeps project, epic and subject. Not `regression: true` until the runtime carries history for eval tasks |
 
 - **The headings are the contract.** Each `must_include` heading is written exactly as §1 of
   `docs/pm-craft-spec.md` lists it, and as the template in `content/templates/` has it. Change

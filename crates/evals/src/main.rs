@@ -590,7 +590,11 @@ async fn real_main(cli: Cli) -> Result<bool> {
             let category = load_category(&root, &args.category)?;
             let r = resolve(&args.conn, &config, None)?;
             let bot = resolve_bot(&category.bot, &r.requested_by);
-            let asks: Vec<String> = category.tasks.iter().map(|t| t.ask.clone()).collect();
+            let asks: Vec<String> = category
+                .tasks
+                .iter()
+                .map(|t| t.first_ask().to_string())
+                .collect();
             let result = run_load(
                 &r.rt,
                 &bot,

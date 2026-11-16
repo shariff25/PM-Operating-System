@@ -90,6 +90,9 @@ pub struct Mock {
     pub serial: bool,
     /// `GET /v1/tasks/{id}/drafts` answers 404, as a runtime without it would.
     pub no_drafts: bool,
+    /// `POST /v1/tasks` with a `conversation` answers 403, as the runtime does for client
+    /// `evals` until it may name one.
+    pub reject_conversation: bool,
     pub(crate) tasks: Mutex<HashMap<String, Stored>>,
     pub(crate) order: Mutex<Vec<String>>,
     pub(crate) last_finish: Mutex<Option<DateTime<Utc>>>,
@@ -178,6 +181,13 @@ async fn create(
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"error": "stranger may not use docs"})),
+        )
+            .into_response();
+    }
+    if m.reject_conversation && body.get("conversation").is_some() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "only the web and Slack clients name a task's conversation"})),
         )
             .into_response();
     }
