@@ -7,8 +7,33 @@ use serde_json::{json, Value};
 
 use crate::blocks::{escape, link, truncate};
 
-/// Fields an approval card's **Edit** modal offers, when the item's arguments have them.
+/// Fields an approval card's **Edit** modal offers, when the item's arguments have them:
+/// what a draft says, never where it goes.
 pub const EDITABLE: [&str; 5] = ["summary", "description", "title", "body", "text"];
+
+/// The arguments that say where a draft goes. An edit from the bot must leave them as drafted
+/// (the tool server refuses one that changes them with `422`), so the Edit modal never offers
+/// them and [`edited_args`] never changes them.
+pub const TARGETS: [&str; 13] = [
+    "channel",
+    "thread_ts",
+    "message_ts",
+    "space",
+    "parent_id",
+    "page_id",
+    "version",
+    "project",
+    "issue_type",
+    "epic",
+    "parent",
+    "key",
+    "repo",
+];
+
+/// What the card says when the tool server refuses an edit with `422`: it changed where the
+/// draft goes.
+pub const TARGET_CHANGED: &str = "An edit can change what a draft says, not where it goes, so \
+     nothing was sent. Approve the draft as it is, or reject it and ask again.";
 
 /// Slack caps section text at 3,000 characters and a message at 50 blocks.
 const SECTION_MAX: usize = 2900;
@@ -434,10 +459,12 @@ pub fn decision_line(item: &Value, decided_by: &str, edited: bool) -> String {
     }
 }
 
-/// The editable string fields this item has, with their values.
+/// The editable string fields this item has, with their values. Never a target
+/// ([`TARGETS`]).
 pub fn editable_fields(item: &Value) -> Vec<(&'static str, String)> {
     EDITABLE
         .iter()
+        .filter(|f| !TARGETS.contains(f))
         .filter_map(|f| item["args"][*f].as_str().map(|v| (*f, v.to_string())))
         .collect()
 }
@@ -497,10 +524,12 @@ pub fn edit_modal(item: &Value, channel: &str, message_ts: &str) -> Option<Value
 }
 
 /// The item's arguments with the modal's edited fields put in. Only editable string fields
-/// the item already had can change.
+/// the item already had can change; a target ([`TARGETS`]) is always kept as drafted, even if
+/// a submitted view names it.
 pub fn edited_args(args: &Value, state_values: &Value) -> Value {
     let mut out = args.clone();
-    for field in EDITABLE {
+    for field in EDITABLE.iter().filter(|f| !TARGETS.contains(f)) {
+        let field = *field;
         if out[field].is_string() {
             if let Some(v) = state_values[format!("field:{field}")]["value"]["value"].as_str() {
                 out[field] = json!(v);
@@ -946,6 +975,55 @@ mod tests {
             decision_line(&done, "ana", false),
             ":no_entry_sign: Rejected by Ana: Shouldn't have drafted"
         );
+    }
+
+    /// S2: the Edit modal never offers where a draft goes, for any write tool, and a forged
+    /// submission naming a target doesn't change it.
+    #[test]
+    fn edits_never_change_where_a_draft_goes() {
+        assert!(
+            EDITABLE.iter().all(|f| !TARGETS.contains(f)),
+            "no field is both editable and a target"
+        );
+        let drafts = [
+            json!({"id": "apr_1", "tool": "slack.post_reply", "status": "pending",
+                   "args": {"channel": "C0A", "thread_ts": "1.1", "text": "hi"}}),
+            json!({"id": "apr_2", "tool": "slack.send_message", "status": "pending",
+                   "args": {"channel": "C0A", "message_ts": "2.2", "text": "hi"}}),
+            json!({"id": "apr_3", "tool": "confluence.create_draft", "status": "pending",
+                   "args": {"space": "PM", "parent_id": "12", "title": "T", "body": "B"}}),
+            json!({"id": "apr_4", "tool": "confluence.update_page", "status": "pending",
+                   "args": {"page_id": "34", "version": 3, "title": "T", "body": "B"}}),
+            json!({"id": "apr_5", "tool": "jira.create_issue", "status": "pending",
+                   "args": {"project": "PM", "issue_type": "Task", "epic": "PM-1",
+                            "summary": "S", "description": "D"}}),
+            json!({"id": "apr_6", "tool": "bets.record", "status": "pending",
+                   "args": {"key": "bet-1", "text": "We bet"}}),
+        ];
+        for item in &drafts {
+            let offered: Vec<&str> = editable_fields(item).iter().map(|(f, _)| *f).collect();
+            assert!(!offered.is_empty(), "{item}");
+            for f in &offered {
+                assert!(!TARGETS.contains(f), "{f} offered for {}", item["tool"]);
+            }
+            let modal = edit_modal(item, "D1", "1.0").unwrap().to_string();
+            for t in TARGETS {
+                assert!(
+                    !modal.contains(&format!("field:{t}\"")),
+                    "{t} in the modal for {}",
+                    item["tool"]
+                );
+            }
+            let mut forged = json!({});
+            for (k, v) in item["args"].as_object().unwrap() {
+                let value = if v.is_string() { "CHANGED" } else { "9" };
+                forged[format!("field:{k}")] = json!({"value": {"value": value}});
+            }
+            let edited = edited_args(&item["args"], &forged);
+            for t in TARGETS {
+                assert_eq!(edited[t], item["args"][t], "{t} kept for {}", item["tool"]);
+            }
+        }
     }
 
     fn reply_item() -> Value {

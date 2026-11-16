@@ -18,8 +18,9 @@ pub const DEFAULT_EXPIRE_DAYS: i64 = 7;
 /// The most rows one `GET /internal/ledger` returns.
 pub const MAX_LIMIT: usize = 1000;
 /// Each side of an edit distance is cut to this many characters first, so one decision
-/// never costs more than a bounded amount of work.
-pub const EDIT_TEXT_CAP: usize = 20_000;
+/// never costs more than a bounded amount of work: a longer text is compared on its first
+/// this many characters. The Postgres store computes it outside its transaction.
+pub const EDIT_TEXT_CAP: usize = 10_000;
 
 /// What became of a draft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -405,6 +406,13 @@ mod tests {
         // Past the cap, differences don't count.
         let c = format!("{}{}", "x".repeat(EDIT_TEXT_CAP), "tail");
         assert_eq!(edit_distance(&"x".repeat(EDIT_TEXT_CAP), &c), 0.0);
+        // The cap is 10,000 characters of each text, and the result stays from 0 to 1.
+        let ten_k = "a".repeat(10_000);
+        assert_eq!(
+            edit_distance(&ten_k, &format!("{ten_k}{}", "b".repeat(50_000))),
+            0.0
+        );
+        assert_eq!(edit_distance(&ten_k, &"b".repeat(60_000)), 1.0);
     }
 
     #[test]

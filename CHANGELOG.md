@@ -4,6 +4,34 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- Security fixes from the November review: each token can do only what its service needs, and
+  text from a pull request, a model or a connected system never chooses what runs or who sees it.
+  - **The eval gate no longer runs a pull request's code on the Spark.** A pull request could
+    have changed `pmos-admin` and run it beside the Spark's secrets. The gate now runs the
+    Spark's own installed script, and the pull request is only read as data.
+  - **The Slack bot's token can't make an admin or redirect a draft.** Someone holding it could
+    have granted themselves admin, or edited a draft to post in another channel or page. Admins
+    are now added by a pull request to `team.yaml`, and an edit can change a draft's text but
+    not where it goes.
+  - **The Slack bot reads a draft only for the PM it belongs to.** Its token could read any
+    PM's drafts by id. Now a read names the PM, and anyone else's draft isn't found; the
+    ledger no longer shows it draft ids.
+  - **The benchmark token runs tasks only as the benchmark member.** It could have run a PM's
+    bots as them and posted the results to Slack. Now its tasks must be for a handle in
+    `PMOS_EVALS_AS` (default `evals`), and they never reach Slack.
+  - **The console has its own read-only token, and checks its sign-in proxy.** It held the
+    tool server's master token, and anyone who reached its port could claim to be anyone.
+    Now its token only reads approvals, the proxy must send a shared secret
+    (`PMOS_CONSOLE_PROXY_SECRET`), and a form must come from the console's own pages.
+  - **A note keeps the sensitivity of what it was built from.** A summary of restricted
+    material could have been saved to memory and then posted where outsiders read it. Notes
+    and bets now carry that sensitivity, and reading one raises the session to it.
+  - **A Confluence update can't overwrite a newer page.** A draft approved after someone else
+    edited the page would have replaced their edit. Now the update is refused, with "the page
+    changed since PM OS read it; read it again".
+  - **Settings files stay out of the images.** `deploy/*.env` is no longer sent to the Docker
+    build.
+- PM OS can now be tried with another provider's model standing in for the local models: any OpenAI-compatible API, such as Gemini, set with `PMOS_TEST_MODEL_URL` and `PMOS_TEST_MODEL` (testing only, fake data only; [how](docs/testing-with-claude.md#another-provider)).
 - PM OS now works at your level: Senior, Staff or Principal ([how to use it](docs/levels.md)).
   - PM OS can now work at your level: DM `level staff` (or `senior`, or `principal`) and it changes the scope, horizon and audience of what it writes, adds a Cross-team effects section at Staff and a What must be true section at Principal, and brings in the executive, CFO, CTO or CEO reviewers.
   - PM OS can now do 12 new kinds of work, in two tracks. **Leading across teams:** `portfolio-review`, `roadmap-tradeoffs`, `okr-draft`, `business-review`, `alignment-plan`, `coach-feedback`, `bets-register`. **Company bets:** `vision-doc`, `investment-case`, `pricing-proposal`, `platform-strategy`, `exec-brief`.

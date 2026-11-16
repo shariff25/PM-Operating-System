@@ -114,6 +114,10 @@ pub struct Config {
     /// `PMOS_BOT_TOKEN`: the Slack bot's own token, at least 32 characters and different from
     /// the service token. Optional; without it the bot can't connect.
     pub bot_token: Option<Secret>,
+    /// `PMOS_CONSOLE_TS_TOKEN`: the web console's own token, at least 32 characters and
+    /// different from the other two. Optional. It may only read approvals
+    /// (`GET /internal/approvals` and `GET /internal/approvals/{id}`).
+    pub console_token: Option<Secret>,
     /// `PMOS_BOT_SKILLS`: space- or comma-separated skills the bot may start sessions for.
     /// Default `docs`.
     pub bot_skills: Vec<String>,
@@ -163,6 +167,18 @@ impl Config {
             }
             if t == &service_token {
                 return Err("PMOS_BOT_TOKEN must differ from PMOS_SERVICE_TOKEN".into());
+            }
+        }
+        let console_token = get("PMOS_CONSOLE_TS_TOKEN").filter(|t| !t.is_empty());
+        if let Some(t) = &console_token {
+            if t.len() < 32 {
+                return Err("PMOS_CONSOLE_TS_TOKEN must be at least 32 characters".into());
+            }
+            if t == &service_token || bot_token.as_ref() == Some(t) {
+                return Err(
+                    "PMOS_CONSOLE_TS_TOKEN must differ from PMOS_SERVICE_TOKEN and PMOS_BOT_TOKEN"
+                        .into(),
+                );
             }
         }
         let bot_skills: Vec<String> = get("PMOS_BOT_SKILLS")
@@ -264,6 +280,7 @@ impl Config {
             bind,
             service_token: Secret::new(service_token),
             bot_token: bot_token.map(Secret::new),
+            console_token: console_token.map(Secret::new),
             bot_skills,
             database_url,
             audit_log,
@@ -447,6 +464,33 @@ mod tests {
         assert!(!printed.contains(TOKEN), "{printed}");
         assert!(!printed.contains("bot-token"), "{printed}");
         assert_eq!(ok.bot_skills, vec!["docs"]);
+    }
+
+    #[test]
+    fn the_console_token_is_optional_long_and_its_own() {
+        let base = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_BOT_TOKEN", "bot-token-0123456789abcdef-0123456"),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert!(cfg(&base).unwrap().console_token.is_none());
+        let with = |token: &'static str| {
+            let mut vars = base.to_vec();
+            vars.push(("PMOS_CONSOLE_TS_TOKEN", token));
+            cfg(&vars)
+        };
+        let ok = with("console-token-0123456789abcdef-012").unwrap();
+        assert_eq!(
+            ok.console_token.as_ref().map(Secret::expose),
+            Some("console-token-0123456789abcdef-012")
+        );
+        assert!(!format!("{ok:?}").contains("console-token"));
+        assert!(with("short").unwrap_err().contains("at least 32"));
+        assert!(with(TOKEN).unwrap_err().contains("must differ"));
+        assert!(with("bot-token-0123456789abcdef-0123456")
+            .unwrap_err()
+            .contains("must differ"));
     }
 
     #[test]

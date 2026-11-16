@@ -14,7 +14,9 @@ service and personal agents go through the same server, so they follow the same 
 | A bot calls only its role's tools, and never a `never` action | A bot session's `tools/list` is its role's tools less any write set to `never`; anything else is refused and audited as `denied` (see **Bot sessions**) | D7 |
 | A skill reads nothing above its data class | `context_search` drops results above the skill's `data-class` (a bot session's role's); `context_read` refuses them | Data classes |
 | A team bot reads only what its owner chose | Its Jira, Confluence and Slack reads use its own account and stay inside its `reads` list; anything else is `403`, audited as `denied` | Decision 26 |
-| External content is data, not instructions | Every Jira, Confluence and Slack item comes back wrapped as `{"untrusted": true, "source": …, "content": …}` | Untrusted content |
+| External content is data, not instructions | Every Jira, Confluence and Slack item comes back wrapped as `{"untrusted": true, "source": …, "content": …}`; `bets_list` and `bets_read` results carry `"untrusted": true` and a note too | Untrusted content |
+| A note is as sensitive as what it was built from | A memory note stores the highest data class its writing session had read, and reading it raises the reader to that (see **Memory**) | Data classes |
+| The Slack bot's token can't act as everyone | It names the PM it acts for unsigned, so it reads one approval item only for that PM, sees no approval ids in the ledger, can't edit where a draft goes, and can't make an admin (see **Who holds which token**) | — |
 | Nothing is written outside PM OS without approval | A write runs only with a matching grant or an inbox approval by its own user; otherwise it returns `pending_approval` and does nothing | OUT-4 |
 | Everything is audited | One event per call and per decision: user, skill, run, tool, outcome, sources read, argument hash, output reference. Never message bodies | ADM-2, SLK-8 |
 | Arguments match the tool's schema | Required keys, no unknown keys, types and enums checked before any handler runs | — |
@@ -44,6 +46,16 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 - **Edits are checked before anything changes.** Edited arguments are checked against the
   tool's schema like any call (`400` if they fail), and the item's skill must still declare
   the tool (`409` if not). A refused decision leaves the item pending.
+- **An edit from the Slack bot can't change where a draft goes.** Its edited arguments must
+  keep these as drafted, or the decision is `422 {code: "target_changed", error}`, audited as
+  `denied` with detail `target_changed: …`, the item still pending:
+  `slack.post_reply`: `channel`, `thread_ts`, `message_ts`; `slack.send_message`: `channel`;
+  `confluence.create_draft`: `space`, `parent_id`; `confluence.update_page`: `page_id`,
+  `version`; `jira.create_issue`: `project`, `issue_type`, `epic`; `bets.record`: `key`. An
+  optional one absent from both is unchanged; adding one is a change. The list is
+  `EDIT_IMMUTABLE_ARGS` in `src/schemas.rs`. The orchestrator's edits are not limited.
+- **An internal failure** (PM OS itself failed running an approved write, not the target
+  system) answers `500` with a generic message; the detail goes to the tool server's log.
 - **An item moves through states:** `pending`, then `executing` while the write runs, then
   `approved` (with the result) or `failed`. A pending Slack draft nobody decides becomes
   `expired` (see **Slack drafts**). `approved`, `rejected`, `failed` and `expired` are closed.
@@ -68,11 +80,12 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | `DELETE /internal/session` + `X-Pmos-Session` | service or bot token | Revoke a session (sandbox ended) |
 | `POST /internal/call` + `X-Pmos-Session` `{tool, args}` | service or bot token | One tool call for the session, with the same rules as MCP: allowlist, argument checks, approvals for writes, audit (which records the caller). |
 | `POST /internal/grants` `{session_token, tool, args}` | service token | Record an approval given in the harness |
-| `GET /internal/approvals?user=&status=` | service token | `{items: […]}`: a PM's inbox, newest first. `status` is `pending`, `executing`, `approved`, `rejected`, `failed` or `expired` (`400` for anything else) |
+| `GET /internal/approvals?user=&status=` | service or console token | `{items: […]}`: a PM's inbox, newest first. `status` is `pending`, `executing`, `approved`, `rejected`, `failed` or `expired` (`400` for anything else) |
 | `GET /internal/approvals?user=` | bot token | The App Home Inbox: `{approvals: […], total}`, only `pending` items whatever `status` says, oldest first, at most 50. Each item reads as `GET /internal/approvals/{id}` returns it; `total` counts every pending item. `403` if `user` isn't a team member (live connectors) or is a team bot's identity; `400` without `user` |
-| `GET /internal/approvals/{id}` | service or bot token | One item: `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity` and `redacted_at` |
-| `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?}` | service or bot token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. |
-| `GET /internal/ledger?since=&until=&bot=&outcome=&min_edit=&limit=` | service or bot token | `{rows: […]}`, newest first. See **Feedback ledger**. `422` for a bad parameter |
+| `GET /internal/approvals/{id}` | service or console token | One item: `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity` and `redacted_at` |
+| `GET /internal/approvals/{id}?user=<handle>` | bot token | The same item, for the PM the bot acts for. `404 {error: "no such approval item"}` without `user`, when `user` isn't a team member, when the item isn't `user`'s, or when there is no such item: the bot can't tell which ids exist |
+| `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?}` | service or bot token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. From the bot token, an `edit` that changes where the draft goes is `422 target_changed` (see **How a write gets approved**). An internal failure is `500` with a generic `error`. |
+| `GET /internal/ledger?since=&until=&bot=&outcome=&min_edit=&limit=` | service or bot token | `{rows: […]}`, newest first; for the bot token, rows have no `id` (use `run_id`). See **Feedback ledger**. `422` for a bad parameter |
 | `GET /internal/ledger/summary?since=&bot=` | service token | Per bot (or skill) and tool: counts by outcome, label coverage, median edit distance, rejection reasons. `422` for a bad `since` |
 | `POST /internal/reindex` | service token | Rebuild the context index from the content checkout and re-read `team.yaml`, the bots and their roles; `422` if it fails `pmos lint` |
 | `GET /internal/oauth/{atlassian\|slack\|github}/start?user=` | service or bot token | The URL to send a PM to so they can link their account. The bot token gets URLs for team members only (`403` otherwise). `user=bots.<name>` (service token) gives the URL for a team bot's own account (`404` unless `<name>` is a team bot); GitHub links PMs only. |
@@ -83,13 +96,23 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 | `GET /internal/memory/repo?user=` | service or bot token | `{repo, verified_at}`, or `404` |
 | `POST /internal/members/requests` `{slack_id, email, name}` | service or bot token | A request to join: `201 {request}`, or `200 {request}` with the one already pending for that Slack id. `409 already_member`, `422 bad_request`, `429 too_many_pending` (past 20) |
 | `GET /internal/members/requests?status=` | service or bot token | `{requests: […]}`, oldest first; `status` is `pending`, `approved`, `rejected` or `failed` |
-| `POST /internal/members/requests/{id}/decision` `{decision, decided_by, handle?, roles?}` | service or bot token | `approve` or `reject`, by an `admin` in `team.yaml` (`403 not_admin`). See **Members**. `200 {request}`; `409 already_decided` with `request`; `422 bad_handle`; `409 github_not_linked`, `no_push` or `not_configured` (still pending); `502 commit_failed` with `request` (now `failed`) |
+| `POST /internal/members/requests/{id}/decision` `{decision, decided_by, handle?, roles?}` | service or bot token | `approve` or `reject`, by an `admin` in `team.yaml` (`403 not_admin`). From the bot token, `roles` may be `pm` and `skill-author` only: one with `admin` is `403 admin_by_pull_request`, audited as `denied`, the request still pending. See **Members**. `200 {request}`; `409 already_decided` with `request`; `422 bad_handle`; `409 github_not_linked`, `no_push` or `not_configured` (still pending); `502 commit_failed` with `request` (now `failed`) |
 | `POST /internal/members/{handle}/remove` `{decided_by}` | service or bot token | Admin only; not oneself (`403 self_removal`). `200 {handle, commit}`, `404 not_a_member`, `409 owns_bots` if they still own a team bot |
 | `GET /internal/onboarding?user=` or `?slack_id=` | service or bot token | A PM's setup checklist: `member`, `handle`, `admin`, `linked` (`atlassian`, `slack`, `github`), `memory_repo`, `personal_bot` (in the loaded content), and for a non-member by Slack id, `pending_request` |
 
 **Who holds which token:**
 - **Service token** (`PMOS_SERVICE_TOKEN`): the orchestrator, the bot runtime and platform-owner tools. Every route, and the only token that starts bot sessions.
-- **Bot token** (`PMOS_BOT_TOKEN`): the Slack bot. Only sessions for the skills in `PMOS_BOT_SKILLS` and calls within them, plus reading and deciding one approval item (`GET /internal/approvals/{id}` and its `decision`), for Slack approval cards, the onboarding routes, `GET /internal/ledger` for the daily triage digest, and for the App Home (`docs/slack-home.md`) a team member's pending items (`GET /internal/approvals?user=`) and unlinking a team member's account (`DELETE /internal/credentials/{user}/{provider}`). A session started for another skill, or any bot session, looks to the bot like one that doesn't exist, and every other route (the ledger summary among them) returns `403`.
+- **Bot token** (`PMOS_BOT_TOKEN`): the Slack bot. Only sessions for the skills in `PMOS_BOT_SKILLS` and calls within them, plus reading and deciding one approval item (`GET /internal/approvals/{id}?user=<handle>` and its `decision`), for Slack approval cards, the onboarding routes, `GET /internal/ledger` for the daily triage digest, and for the App Home (`docs/slack-home.md`) a team member's pending items (`GET /internal/approvals?user=`) and unlinking a team member's account (`DELETE /internal/credentials/{user}/{provider}`). A session started for another skill, or any bot session, looks to the bot like one that doesn't exist, and every other route (the ledger summary among them) returns `403`.
+  Socket Mode gives the tool server nothing signed to check which PM the bot names, so what
+  that trust allows is kept small: a read of one item must name its PM (`?user=`, else
+  `404`); ledger rows come without `id`; an edit may change a draft's text but not where it
+  goes (`422 target_changed`); and a member decision may grant `pm` and `skill-author` only
+  (`403 admin_by_pull_request`: a new admin is made by a pull request to `team.yaml`).
+- **Console token** (`PMOS_CONSOLE_TS_TOKEN`, optional): the web console, read-only.
+  `GET /internal/approvals?user=` and `GET /internal/approvals/{id}`, answered as for the
+  service token (`{items: […]}` and the item; no `user` needed for one item); every other
+  route is `403`, and an unknown token `401`. The console is given it as its
+  `PMOS_TOOLSERVER_TOKEN`.
 - **Session token:** each sandbox gets only its own.
 
 Session tokens are sent in headers, never in a URL, so access logs and proxies don't record them. A tool error (refused, invalid arguments, not found) comes
@@ -118,7 +141,8 @@ makes no item, so no row.
 | `created_at`, `decided_at`, `decided_by` | |
 
 - **No text.** Rows hold labels and metadata only: never the draft's arguments, never Slack
-  text. Every field may go to the Slack bot.
+  text. Every field but `id` goes to the Slack bot: the bot token's rows have no `id`, so
+  it never learns approval ids it wasn't shown on a card (the triage digest uses `run_id`).
 - **`expired`** is stored for a Slack draft that expired (see **Slack drafts**), with no
   `decided_at`. For every other tool it is worked out on read: a row still `pending` and
   never decided is reported as `expired` once it is older than `PMOS_LEDGER_EXPIRE_DAYS`
@@ -127,9 +151,10 @@ makes no item, so no row.
   `edit` decision that sends back the same arguments is `approved`.
 - **The edit distance** is the normalized character-level Levenshtein distance between the
   original and the final text, divided by the longer one's length. The text is the item's
-  string arguments, at any depth, in key order, joined with newlines. Each side is cut to its
-  first 20,000 characters, and a shared prefix and suffix are skipped first, so small edits to
-  long drafts stay cheap.
+  string arguments, at any depth, in key order, joined with newlines. A text longer than
+  10,000 characters is compared on its first 10,000 (each side), and a shared prefix and
+  suffix are skipped first, so small edits to long drafts stay cheap. The Postgres store
+  computes it before its decision transaction, so no row lock is held while it runs.
 - **Items from before the ledger** (migration `0007_ledger.sql`) get a row each, with
   `content_sha`, `model_alias` and `edit_distance` `null`.
 
@@ -178,7 +203,10 @@ in `args`; no migration.
 **What a draft was built from.** Each session records the highest data class it has read
 (`sessions.sources_sensitivity`, which only rises):
 - `context_search` and `context_read`: each result's own `sensitivity`;
-- Jira, Confluence, Slack and memory reads: `internal`;
+- Jira, Confluence and Slack reads: `internal`;
+- `memory_read`: the highest `sensitivity` among the notes returned (all of them), at least
+  `internal`; `bets_read`: that bet's note's, `bets_list`: the highest among the bets
+  listed, each at least `internal` (see **Memory**);
 - the public docs: `public`.
 
 A read that finds nothing counts for nothing. Every new approval item stores the session's
@@ -306,6 +334,34 @@ uses. The registry is `content/tools.yaml`; each tool's input schema is in
 `crates/toolserver/src/schemas.rs`. The server refuses to start if a registry tool has no
 schema or no connector.
 
+**Write arguments are bounded** (`maxLength` in the schemas, refused as invalid arguments):
+Slack `text` 40,000 characters; Confluence `body` 200,000, `title` 255 and
+`version_comment` 500; Jira `summary` 255 and `description` 32,000; a memory note's `text`
+4,000.
+
+### Memory
+
+`memory.read` returns all of the session user's notes, `{"notes": [{key, text, updated_at,
+sensitivity}]}`; `memory.update {key, text}` creates or replaces one. Where they are kept:
+in Postgres (`memory_notes`) or in memory by default, or in the PM's own GitHub repo (see
+**Personal memory in GitHub**).
+- **A note carries the sensitivity of what it was built from.** `memory.update` stores the
+  writing session's highest data class read so far (`public`, `internal` or `restricted`);
+  `bets.record` stores its approval item's `sources_sensitivity` (an item from before
+  migration 0008, with none, counts as `restricted`), or the bet note's own if that is
+  higher, since the merge keeps the bet's earlier text. A note with none (written before
+  migration 0009, or a GitHub note without a known `sensitivity:`) reads as `internal`.
+- **Reading raises the session to it.** `memory_read` raises the session to the highest
+  among the notes returned; `bets_read` to that bet's; `bets_list` to the highest among the
+  bets listed. Never below `internal`, and nothing for a read that returns nothing.
+- **So:** once a PM's memory holds a restricted note, a Slack reply drafted in a session
+  that read it is blocked in channels with people outside the team (`409 audience_blocked`,
+  see **Slack drafts**), until the note is rewritten from less sensitive sources.
+- **Only the PM's own.** A team bot is refused both memory tools (`403`, audited as
+  `denied`), at the call and when an item is decided, as with the bets tools.
+- **Bets are the register's.** `memory.update` refuses keys that start `bet-` (invalid
+  arguments): only an approved `bets.record` writes a bet.
+
 ### The stats tools
 
 `stats.sample_size` and `stats.compare` (system `stats`, kind `read`) do the arithmetic of an
@@ -341,6 +397,10 @@ It returns:
 | `days` | `ceil(total / daily_users)`; only when `daily_users` is given |
 | `assumptions` | The values it used, defaults included |
 | `note` | Says to run whole weeks |
+
+A result that isn't a finite number, or is more than 10^12 users per arm, is refused as
+invalid arguments (the effect is too small to detect), and the totals are multiplied with
+overflow checks.
 
 The formulas, with `z_{α/2}` and `z_β` the normal quantiles for `alpha` and `power`:
 - **Proportion:** the two-proportion z-test with unpooled variance, where `p1` is the
@@ -466,8 +526,8 @@ sentence), `metric`, `riskiest_assumption`, `test`, `opened`, `review_by`, `evid
 
 | Tool | Kind | Arguments | Returns |
 | --- | --- | --- | --- |
-| `bets.list` | read | `status?` | `{"bets": [{key, title, status, review_by, updated_at}]}`, soonest review first |
-| `bets.read` | read | `key` | `{"bet": {…}}`; an unknown key is not found |
+| `bets.list` | read | `status?` | `{"untrusted": true, "note": …, "bets": [{key, title, status, review_by, updated_at}]}`, soonest review first |
+| `bets.read` | read | `key` | `{"untrusted": true, "note": …, "bet": {…}}`; an unknown key is not found |
 | `bets.record` | write | below | `{"bet": {…}, "created": true\|false}`, after approval |
 
 **`bets.record` arguments:**
@@ -487,7 +547,11 @@ sentence), `metric`, `riskiest_assumption`, `test`, `opened`, `review_by`, `evid
 - **A full note** (over the memory limit of 4,000 characters) drops its oldest evidence until
   it fits, and records how many it dropped.
 - **Who may use them:** a PM's own sessions and their personal bot, as with the memory tools.
-  Reading a bet raises the session to `internal`.
+  Reading a bet raises the session to its note's sensitivity, at least `internal` (see
+  **Memory**).
+- **Untrusted:** a bet's text came from earlier sessions and the sources they read, so
+  `bets_list` and `bets_read` results carry `"untrusted": true` and a note to treat them as
+  data, like connector results.
 - **Role:** `pm-assistant` has `bets.record: approve` in its `actions`.
 
 ## Connectors and account linking
@@ -554,8 +618,14 @@ new one, which replaces the old.
 - Raw HTML in a Confluence draft's markdown is escaped, so a draft can't add macros the PM
   didn't see in the approval card.
 - **Updating a Confluence page keeps its status**, so updating a draft doesn't publish it.
-  If someone saved a newer version first, the update fails with "page changed since PM OS
-  read it". MCP marks `confluence_update_page` as destructive, because it replaces the body.
+- **A Confluence update names the version it read.** `confluence_read` returns the page's
+  `version` number in its content, and `confluence_update_page` requires it (`version`, an
+  integer, 1 or more). If the page's current version differs, the update is refused before
+  any request that changes the page, with "the page changed since PM OS read it; read it
+  again"; otherwise it sends `version + 1`, and a `409` from Confluence (someone saved in
+  between) gives the same message. The fake connector keeps a version per page and behaves
+  the same way. An edit from the Slack bot can't change `page_id` or `version`. MCP marks
+  `confluence_update_page` as destructive, because it replaces the body.
 - Caller-supplied ids (issue keys, page ids, Slack channels and timestamps) are validated
   before they reach a URL.
 
@@ -614,8 +684,10 @@ session's user, a private repo of their own in the org (`src/github_memory.rs`).
 record of which repo (`memory_repos`) is set with `POST /internal/memory/repo` (the Slack
 `setup` checklist does this).
 - **Layout:** one file per note, `notes/<key>.md`, on the repo's default branch, with front
-  matter: `updated:` (RFC 3339) and `source:` (the bot or skill and the run id, such as
-  `"pm-ana, task 0d3f…"`). The rest of the file is the note.
+  matter: `updated:` (RFC 3339), `source:` (the bot or skill and the run id, such as
+  `"pm-ana, task 0d3f…"`) and `sensitivity:` (`public`, `internal` or `restricted`; see
+  **Memory**). The rest of the file is the note. A note edited by hand stays readable: no
+  front matter, or a missing or unknown `sensitivity:`, reads as `internal`.
 - **Reads** list the tree recursively and fetch only the blobs whose sha changed since the last
   read (a per-repo cache in memory); an unchanged tree fetches no blob.
 - **Writes** commit only that file, with the message `memory: <key> (<source>)`. The first
@@ -637,7 +709,10 @@ handle comes from `propose_handle`, avoiding `team.yaml` and pending requests.
 **Approving** commits, in **one commit** on `PMOS_CONTENT_BRANCH` with the approving admin's
 own GitHub token:
 - `{PMOS_CONTENT_DIR}/team.yaml`: the file at the branch head plus the new member
-  (`handle`, `slack-id`, `email`, `roles`, default `[pm]`), written with `render_team_yaml`;
+  (`handle`, `slack-id`, `email`, `roles`, default `[pm]`), written with `render_team_yaml`.
+  From Slack (the bot token), `roles` may be `pm` and `skill-author` only: `admin` is
+  refused with `403 admin_by_pull_request` and nothing is committed; a new admin is made by a
+  pull request to `team.yaml` (or with the service token);
 - `{PMOS_CONTENT_DIR}/bots/pm-<handle>/BOT.md` from `render_personal_bot`;
 - `{PMOS_POLICIES_DIR}/bots/pm-<handle>.yaml` and `pm-<handle>.sandbox.yaml`, the bot's sandbox
   policy and launch spec from `pmos_policy`, so `pmos policy check` has nothing missing.
@@ -690,7 +765,8 @@ Tokens are sealed with AES-256-GCM before any store sees them (`src/vault.rs`, t
   seals; every listed key can unseal.
 - **To rotate:** put the new key first and keep the old one listed. Rows are re-sealed under the
   new key on their next read, and the old key can be dropped once nothing uses it.
-- Tokens never appear in logs, audit events, API responses or `Debug` output.
+- Tokens never appear in logs, audit events, API responses or `Debug` output (sessions and
+  the bot's access print `<redacted>` for theirs).
 
 ## Storage
 
@@ -701,12 +777,12 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 | Store | Postgres table | Notes |
 | --- | --- | --- |
 | Context index | `context_docs` | Full-text search (title weighted over body), rebuilt from the content repo on start-up and on `POST /internal/reindex`. Embeddings are added once the gateway serves the embedding model. |
-| Memory | `memory_notes` | One row per user and key |
+| Memory | `memory_notes` | One row per user and key, with the note's `sensitivity` (migration 0009; null for older notes, read as `internal`) |
 | Sessions | `sessions` | Only the SHA-256 of each token is stored. Each names a `skill` or a `bot` (a check constraint keeps it to one) |
 | Grants | `grants` | Taken with `DELETE … RETURNING` on a row locked `FOR UPDATE SKIP LOCKED`: one grant, one call, even under concurrency |
 | Approvals | `approvals` | A decision locks the item (`SELECT … FOR UPDATE`) and changes it only while it is `pending`: exactly one of several concurrent decisions wins. A Slack reply is created under an advisory lock per user and thread. The Slack draft sweep takes items `FOR UPDATE SKIP LOCKED`, leaving one a decision holds to the decision |
 | Feedback ledger | `ledger` | One row per approval item, written in the same transaction as the item on create, decide, complete and expire. `expired` is stored for Slack drafts and worked out on read for the rest |
-| Audit | `audit_events` | Append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Each event records the caller (`mcp`, `orchestrator` or `bot`) and the session's skill or bot. |
+| Audit | `audit_events` | Append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Each event records the caller (`mcp`, `orchestrator`, `bot` or `console`) and the session's skill or bot. |
 | Credentials | `credentials` | Tokens sealed by the vault; the database never sees plaintext. Providers `atlassian`, `slack`, `github` |
 | Memory repos | `memory_repos` | One row per PM: `repo` (`org/name`) and `verified_at` |
 | Member requests | `member_requests` | A partial unique index keeps one `pending` request per Slack id; a decision is a conditional `UPDATE … WHERE status = 'pending'`, so exactly one wins |
@@ -741,6 +817,7 @@ cargo run -p pmos-toolserver
 | --- | --- | --- |
 | `PMOS_SERVICE_TOKEN` | required | The orchestrator's token. At least 32 characters |
 | `PMOS_BOT_TOKEN` | none | The Slack bot's own token: at least 32 characters and different from the service token |
+| `PMOS_CONSOLE_TS_TOKEN` | none | The web console's own read-only token (approvals only): at least 32 characters and different from the service and bot tokens. The console gets it as `PMOS_TOOLSERVER_TOKEN` |
 | `PMOS_BOT_SKILLS` | `docs` | Skills the bot may start sessions for |
 | `PMOS_CONNECTORS` | required | `live` for real Atlassian and Slack with each PM's own token, and only people in `team.yaml` may have sessions; `fake` for fixture data (dev, tests, and everything before Gate 1), with `team.yaml` not enforced |
 | `PMOS_DATABASE_URL` | required | Postgres for every store. `PMOS_DEV=1` without it keeps everything in memory. |

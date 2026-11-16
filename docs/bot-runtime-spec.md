@@ -97,7 +97,7 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 | `slack` | create tasks (as `X-Pmos-User`), read their own tasks, notifications, and routines for `X-Pmos-User` |
 | `worker` | claim, heartbeat, events, trace, complete, fail |
 | `console` | read everything; pause, resume and delete routines; cancel tasks |
-| `evals` | create tasks with `source: "eval"` (and a task `level`), and read them |
+| `evals` | create tasks with `source: "eval"` (and a task `level`) as a handle in `PMOS_EVALS_AS` only, with no Slack target, and read them |
 
 ### Task
 ```json
@@ -125,7 +125,7 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 | `PUT /v1/members/{handle}/settings` `{level}` | slack (own handle only) | The same shape. The handle must be a member. An unknown level is `400`; another member's handle is `403`. |
 | `GET /v1/bots` | all | `[{name, role, scope, owner, description}]` |
 | `GET /v1/bots/{name}` | all | the bot, its role, its tools, and each write tool's setting |
-| `POST /v1/tasks` `{bot, requested_by, text, source, slack?, level?}` | slack, evals | `201` with the Task. `403` if `requested_by` may not use the bot: personal bots serve their owner only, and team bots serve team members. |
+| `POST /v1/tasks` `{bot, requested_by, text, source, slack?, level?}` | slack, evals | `201` with the Task. `403` if `requested_by` may not use the bot: personal bots serve their owner only, and team bots serve team members. From `evals`: `403` unless `requested_by` is in `PMOS_EVALS_AS`, and `400` with a `slack` field (see **Eval tasks**). |
 | `GET /v1/tasks/{id}`, `GET /v1/tasks?bot=&requested_by=&status=&limit=` | slack (own), console, evals | |
 | `POST /v1/tasks/{id}/cancel` | slack (own), console | |
 | `GET /v1/tasks/{id}/events` | slack (own), console, evals | `[{at, kind, text}]` |
@@ -143,6 +143,16 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 | `PATCH /v1/routines/{id}` `{enabled?, schedule?, prompt?}` | slack (own), console | |
 | `DELETE /v1/routines/{id}` | slack (own), console | |
 | `GET /healthz`, `GET /readyz` | none | readiness covers storage plus the tool server and the gateway |
+
+### Eval tasks
+The benchmark runner's token must not be able to act as a PM or reach Slack:
+- **`PMOS_EVALS_AS`:** a comma-separated list of handles, default `evals` (the benchmark
+  member). A task from the `evals` client must have `requested_by` in it, else `403`. Listing a
+  real PM lets that token run their bots as them, so do it only for a run, then remove it.
+- **No Slack target:** a task with `source: "eval"` and a `slack` field is `400`.
+- **No Slack delivery:** the runtime writes no notifications for an `eval` task, on either
+  store: its milestones, result, failure and approvals stay in its events and status, where
+  the runner reads them.
 
 ### Levels and member settings
 A PM's level (`senior`, `staff` or `principal`; `docs/levels.md`) is their own working
@@ -210,7 +220,8 @@ preference, so it lives in the runtime, which builds each task's claim, and not 
   - **Edit** opens a modal with the editable fields (summary, body, title, text).
   - A decision calls the tool server's decision endpoint with the bot token; `decided_by` is the clicker's handle.
   - The card updates to "Approved by Ana", with the link that was written.
-  - Only the item's own PM can decide; anyone else gets a private note.
+  - Only the item's own PM can decide; anyone else gets a private note. The bot reads an item with `?user=<the PM it acts for>` (the clicker, or the task's `requested_by` for a card the notifier posts), and the tool server answers `404` for anyone else's.
+  - **Edit** offers what a draft says (text, title, summary, description, body), never where it goes; the tool server refuses an edit that changes a target with `422`, which the card shows as a plain message.
 - **Routines in Slack (D8):**
   - **Create:** a DM such as "every weekday at 8am …" (or `routine: …`) is parsed, then read back with **Create** and **Cancel** buttons.
   - **List:** "my routines" lists them, with **Pause**, **Resume** and **Delete** buttons.
@@ -225,8 +236,10 @@ preference, so it lives in the runtime, which builds each task's claim, and not 
 4. **Activity:** recent tasks; a task opens its events, its full trace (D6) and its audit events.
 
 **Auth:**
-- behind the Spark's SSO proxy: `X-Forwarded-User` is trusted only with `PMOS_CONSOLE_TRUST_PROXY=1`;
-- else `PMOS_CONSOLE_DEV_USER` for development.
+- behind the Spark's SSO proxy: `X-Forwarded-User` is trusted only with `PMOS_CONSOLE_TRUST_PROXY=1`, and only on a request carrying `X-Pmos-Proxy-Secret` equal to `PMOS_CONSOLE_PROXY_SECRET` (at least 32 characters; required to start; compared in constant time before the user is read; else `401`);
+- else `PMOS_CONSOLE_DEV_USER` for development;
+- a state-changing request must carry `Origin` or `Referer` from the console's own origin;
+- the console's tool-server token is its own (`PMOS_CONSOLE_TS_TOKEN` there): it may read approvals and nothing else.
 
 Admins (role `admin` in `team.yaml`) see everything; a PM sees their own bots, routines and tasks plus the team bots.
 

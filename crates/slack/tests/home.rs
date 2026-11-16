@@ -241,7 +241,7 @@ async fn mixed_outcomes_each_show_their_line() {
             (409, "needs_external_confirm".to_string()),
         ),
         ("apr_expired".to_string(), (409, "expired".to_string())),
-        ("apr_down".to_string(), (500, String::new())),
+        ("apr_down".to_string(), (503, String::new())),
     ]);
     stack.send(home_opened("e1", "Ev1", "U0ANA", None)).await;
     let inbox = stack.published(1).await;

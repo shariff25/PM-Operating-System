@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use pmos_gateway::config::{Client, Limits, Models};
+use pmos_gateway::config::{Client, Config, Limits, Models, UpstreamKind};
 use pmos_gateway::scheduler::Priority;
 use pmos_gateway::usage::UsageLog;
 use pmos_gateway::{router, GatewayConfig};
@@ -131,6 +131,7 @@ async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_o
         stub,
         workarounds_on,
         anthropic_key: "test-key".into(),
+        remote_key: String::new(),
     });
     let (base, stop) = serve(app).await;
     Gw { base, usage, stop }
@@ -680,6 +681,7 @@ async fn the_claude_test_upstream_needs_its_switch_and_translates_both_ways() {
         stub: false,
         workarounds_on: true,
         anthropic_key: "sk-test-placeholder".into(),
+        remote_key: String::new(),
     }))
     .await;
     let http = reqwest::Client::new();
@@ -770,4 +772,381 @@ async fn the_claude_test_upstream_needs_its_switch_and_translates_both_ways() {
     assert_eq!(res.status(), 400);
     stop_gw.cancel();
     stop_up.cancel();
+}
+
+/// What a mock OpenAI-compatible server saw: path, headers and body of each request.
+#[derive(Default)]
+struct Recorder {
+    seen: Mutex<Vec<(String, axum::http::HeaderMap, Value)>>,
+}
+
+async fn record_chat(
+    State(r): State<Arc<Recorder>>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let stream = body["stream"] == json!(true);
+    r.seen
+        .lock()
+        .unwrap()
+        .push((uri.path().to_string(), headers, body));
+    if stream {
+        // The tool call's id comes first; its extra_content in a later delta.
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"docs_search\"}}]}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"extra_content\":{\"google\":{\"thought_signature\":\"sig-2\"}},\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2}}\n\n\
+                   data: [DONE]\n\n";
+        return ([("content-type", "text/event-stream")], sse).into_response();
+    }
+    Json(json!({
+        "id": "x", "object": "chat.completion", "model": "remote-model",
+        "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {"role": "assistant",
+            "content": null, "tool_calls": [{"id": "call_1", "type": "function",
+            "extra_content": {"google": {"thought_signature": "sig-1"}},
+            "function": {"name": "docs_search", "arguments": "{\"query\":\"ports\"}"}}]}}],
+        "usage": {"prompt_tokens": 21, "completion_tokens": 5, "total_tokens": 26},
+    }))
+    .into_response()
+}
+
+async fn record_models(State(r): State<Arc<Recorder>>, headers: axum::http::HeaderMap) -> Response {
+    r.seen
+        .lock()
+        .unwrap()
+        .push(("models".into(), headers, Value::Null));
+    Json(json!({"data": []})).into_response()
+}
+
+async fn start_recorder(prefix: &str) -> (String, Arc<Recorder>, CancellationToken) {
+    let r = Arc::new(Recorder::default());
+    let app = Router::new()
+        .route(&format!("{prefix}/chat/completions"), post(record_chat))
+        .route(&format!("{prefix}/models"), get(record_models))
+        .with_state(r.clone());
+    let (base, stop) = serve(app).await;
+    (format!("{base}{prefix}"), r, stop)
+}
+
+const REMOTE_KEY: &str = "remote-test-key-must-never-be-logged-42";
+
+#[tokio::test]
+async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key() {
+    let (remote, seen_remote, stop_remote) = start_recorder("/v1beta/openai").await;
+    let (local, seen_local, stop_local) = start_recorder("/v1").await;
+    let yaml = format!(
+        "upstreams: {{remote: 'openai+{remote}', local: '{local}'}}\n\
+         roles:\n  default: {{upstream: remote, model: remote-model}}\n  \
+         extraction: {{upstream: local, model: local-model}}\n"
+    );
+
+    // Off by default: prompts would leave the machine.
+    let err = Models::from_yaml(&yaml).unwrap_err();
+    assert!(
+        err.contains("PMOS_GATEWAY_CLOUD_TEST=1")
+            && err.contains("leave this machine")
+            && err.contains("testing only"),
+        "{err}"
+    );
+    // A real remote API must be https.
+    let err = Models::parse(
+        "upstreams: {r: 'openai+http://api.example.com/v1'}\nroles: {default: {upstream: r, model: m}}\n",
+        true,
+    )
+    .unwrap_err();
+    assert!(err.contains("https"), "{err}");
+    let https = Models::parse(
+        "upstreams: {r: 'openai+https://api.example.com/v1beta/openai/'}\nroles: {default: {upstream: r, model: m}}\n",
+        true,
+    )
+    .unwrap();
+    let role = https.role("pmos/default").unwrap();
+    assert_eq!(role.kind, UpstreamKind::RemoteOpenAi);
+    assert_eq!(role.upstream, "https://api.example.com/v1beta/openai");
+    // `effort` is only for the Claude upstream.
+    let err = Models::parse(
+        "upstreams: {r: 'openai+https://api.example.com/v1'}\nroles: {default: {upstream: r, model: m, effort: low}}\n",
+        true,
+    )
+    .unwrap_err();
+    assert!(err.contains("only the Claude test upstream"), "{err}");
+
+    // Without the key the gateway won't start.
+    let models = Models::parse(&yaml, true).unwrap();
+    let token = "t".repeat(32);
+    let env = |key: Option<&'static str>| {
+        let token = token.clone();
+        Config::from_lookup(move |k| match k {
+            "PMOS_GATEWAY_TOKENS" => Some(format!("runtime={token}")),
+            "PMOS_GATEWAY_CLOUD_TEST" => Some("1".into()),
+            "PMOS_GATEWAY_REMOTE_KEY" => key.map(String::from),
+            _ => None,
+        })
+        .unwrap()
+    };
+    let err = env(None).check_keys(&models).unwrap_err();
+    assert!(err.contains("PMOS_GATEWAY_REMOTE_KEY"), "{err}");
+    let cfg = env(Some(REMOTE_KEY));
+    cfg.check_keys(&models).unwrap();
+    assert!(!format!("{cfg:?}").contains(REMOTE_KEY));
+
+    let usage = Arc::new(UsageLog::new(None).unwrap());
+    let (gw, stop_gw) = serve(router(GatewayConfig {
+        models,
+        clients: vec![Client {
+            name: "worker".into(),
+            token: TOKEN.into(),
+        }],
+        usage: usage.clone(),
+        stub: false,
+        workarounds_on: true,
+        anthropic_key: String::new(),
+        remote_key: REMOTE_KEY.into(),
+    }))
+    .await;
+    let http = reqwest::Client::new();
+    let ask = json!({
+        "model": "pmos/default",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "What ports?"}],
+        "tools": [{"type": "function", "function": {"name": "docs_search",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}}]
+    });
+    let post = |body: &Value| {
+        http.post(format!("{gw}/v1/chat/completions"))
+            .bearer_auth(TOKEN)
+            .header("X-Pmos-User", "ana")
+            .header("X-Pmos-Run", "run-remote")
+            .header("X-Pmos-Priority", "interactive")
+            .json(body)
+    };
+
+    // Forwarded to <base>/chat/completions with the remote key and the role's model; the
+    // answer (a tool call) comes back as the upstream sent it.
+    let res = post(&ask).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["x-pmos-model"], "remote-model");
+    let answer: Value = res.json().await.unwrap();
+    assert_eq!(answer["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        answer["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "docs_search"
+    );
+    {
+        let seen = seen_remote.seen.lock().unwrap();
+        let (path, headers, body) = &seen[0];
+        assert_eq!(path, "/v1beta/openai/chat/completions");
+        assert_eq!(headers["authorization"], format!("Bearer {REMOTE_KEY}"));
+        assert!(headers.get("x-pmos-user").is_none());
+        assert_eq!(body["model"], "remote-model");
+        assert_eq!(body["temperature"], 0);
+        assert_eq!(body["tools"], ask["tools"]);
+        assert_eq!(body["messages"], ask["messages"]);
+    }
+
+    // Streaming passes through.
+    let mut streamed = ask.clone();
+    streamed["stream"] = json!(true);
+    streamed["stream_options"] = json!({"include_usage": true});
+    let res = post(&streamed).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["content-type"], "text/event-stream");
+    let text = res.text().await.unwrap();
+    assert!(
+        text.contains("call_2") && text.ends_with("data: [DONE]\n\n"),
+        "{text}"
+    );
+    assert_eq!(seen_remote.seen.lock().unwrap()[1].2["stream"], true);
+
+    // The usage log records both calls against the remote host, never the text or the key.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let events: Vec<_> = usage
+        .recent()
+        .into_iter()
+        .filter(|e| e.run.as_deref() == Some("run-remote"))
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        (events[0].role.as_str(), events[0].model.as_str()),
+        ("default", "remote-model")
+    );
+    assert_eq!(events[0].upstream, "127.0.0.1");
+    assert_eq!(
+        (events[0].prompt_tokens, events[0].completion_tokens),
+        (Some(21), Some(5))
+    );
+    assert!(!events[0].stream && events[1].stream);
+    assert_eq!(events[1].status, 200);
+    for e in &events {
+        let line = serde_json::to_string(e).unwrap();
+        assert!(!line.contains(REMOTE_KEY) && !line.contains("What ports"));
+    }
+
+    // The caller's client drops each tool call's extra_content when it sends the history
+    // back; the gateway gives it back to the remote upstream, from both answers above.
+    let mut follow_up = ask.clone();
+    follow_up["messages"] = json!([
+        {"role": "user", "content": "What ports?"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "docs_search", "arguments": "{}"}},
+            {"id": "call_2", "type": "function", "function": {"name": "docs_search", "arguments": "{}"}},
+            {"id": "call_x", "type": "function", "function": {"name": "docs_search", "arguments": "{}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "443"},
+        {"role": "tool", "tool_call_id": "call_2", "content": "443"},
+        {"role": "tool", "tool_call_id": "call_x", "content": "443"}
+    ]);
+    assert_eq!(post(&follow_up).send().await.unwrap().status(), 200);
+    {
+        let seen = seen_remote.seen.lock().unwrap();
+        let calls = &seen[2].2["messages"][1]["tool_calls"];
+        assert_eq!(
+            calls[0]["extra_content"]["google"]["thought_signature"],
+            "sig-1"
+        );
+        assert_eq!(
+            calls[1]["extra_content"]["google"]["thought_signature"],
+            "sig-2"
+        );
+        assert!(calls[2].get("extra_content").is_none());
+        let mut want = follow_up["messages"].clone();
+        want[1]["tool_calls"][0]["extra_content"] = calls[0]["extra_content"].clone();
+        want[1]["tool_calls"][1]["extra_content"] = calls[1]["extra_content"].clone();
+        assert_eq!(seen[2].2["messages"], want, "nothing else changes");
+    }
+
+    // A local upstream gets the request unchanged and never sees the remote key.
+    let mut local_ask = follow_up.clone();
+    local_ask["model"] = json!("pmos/extraction");
+    local_ask["stream"] = json!(true);
+    local_ask["stream_options"] = json!({"include_usage": true});
+    local_ask["parallel_tool_calls"] = json!(true);
+    let res = post(&local_ask).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    res.text().await.unwrap();
+    {
+        let seen = seen_local.seen.lock().unwrap();
+        let (path, headers, body) = &seen[0];
+        assert_eq!(path, "/v1/chat/completions");
+        assert!(headers.get("authorization").is_none());
+        let mut want = local_ask.clone();
+        want["model"] = json!("local-model");
+        assert_eq!(body, &want);
+    }
+
+    // Readiness asks the remote API with its key, and says a testing-only upstream is on.
+    let ready: Value = reqwest::get(format!("{gw}/readyz"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ready["ready"], true);
+    assert_eq!(ready["cloud_test"], true);
+    {
+        let seen = seen_remote.seen.lock().unwrap();
+        let (_, headers, _) = seen.iter().find(|s| s.0 == "models").unwrap();
+        assert_eq!(headers["authorization"], format!("Bearer {REMOTE_KEY}"));
+        let seen = seen_local.seen.lock().unwrap();
+        let (_, headers, _) = seen.iter().find(|s| s.0 == "models").unwrap();
+        assert!(headers.get("authorization").is_none());
+    }
+
+    // An outage is reported without the key.
+    stop_remote.cancel();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let res = post(&ask).send().await.unwrap();
+    assert_eq!(res.status(), 502);
+    assert!(!res.text().await.unwrap().contains(REMOTE_KEY));
+
+    stop_gw.cancel();
+    stop_local.cancel();
+}
+
+/// The real binary: it won't start without the remote key, says at start-up that a remote
+/// test upstream is on, and never prints the key, even when the upstream is down.
+#[tokio::test]
+async fn the_gateway_binary_needs_the_remote_key_and_never_logs_it() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let dir = std::env::temp_dir().join(format!("pmos-gateway-remote-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Nothing listens on the upstream's port.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind = free.local_addr().unwrap();
+    drop(free);
+    let config = dir.join("gateway.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "upstreams: {{r: 'openai+http://127.0.0.1:{dead_port}/v1'}}\n\
+             roles: {{default: {{upstream: r, model: remote-model}}}}\n"
+        ),
+    )
+    .unwrap();
+    let gateway = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_pmos-gateway"));
+        c.env_clear()
+            .env("PMOS_GATEWAY_TOKENS", format!("worker={TOKEN}"))
+            .env("PMOS_GATEWAY_CONFIG", &config)
+            .env("PMOS_GATEWAY_BIND", bind.to_string())
+            .env("PMOS_GATEWAY_CLOUD_TEST", "1")
+            .env("RUST_BACKTRACE", "0")
+            .env("RUST_LOG", "debug")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        c
+    };
+
+    let out = gateway().output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("PMOS_GATEWAY_REMOTE_KEY"), "{stderr}");
+
+    let mut child = gateway()
+        .env("PMOS_GATEWAY_REMOTE_KEY", REMOTE_KEY)
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let lines = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = lines.clone();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            sink.lock().unwrap().push(line);
+        }
+    });
+    let base = format!("http://{bind}");
+    let mut up = false;
+    for _ in 0..100 {
+        if reqwest::get(format!("{base}/healthz")).await.is_ok() {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(up, "the gateway didn't start: {:?}", lines.lock().unwrap());
+    let res = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"model": "pmos/default", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 502);
+    assert!(!res.text().await.unwrap().contains(REMOTE_KEY));
+    child.kill().unwrap();
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    child.wait().unwrap();
+    reader.join().unwrap();
+    let log = lines.lock().unwrap().join("\n") + &stderr;
+    assert!(log.contains("a remote test upstream is on"), "{log}");
+    assert!(log.contains("model server unreachable"), "{log}");
+    assert!(!log.contains(REMOTE_KEY), "{log}");
+    std::fs::remove_dir_all(&dir).ok();
 }

@@ -110,6 +110,11 @@ pub fn request_access_ack() -> Value {
     json!({"response_type": "ephemeral", "text": text, "blocks": blocks})
 }
 
+/// What approving grants. The card never offers `admin`: the tool server refuses an admin
+/// grant from the Slack bot, and a new admin is made by a pull request to `team.yaml`.
+pub const ROLE_LINE: &str = "Approving adds them to `team.yaml` as a PM and gives them a \
+     personal bot. Admins are added by a pull request to `team.yaml`.";
+
 /// Who asked: name, email, Slack mention and the proposed handle.
 fn request_head(request: &Value) -> Vec<Value> {
     let name = str_of(request, "name");
@@ -131,7 +136,7 @@ fn request_head(request: &Value) -> Vec<Value> {
             escape(&truncate(str_of(request, "email"), 200)),
             code(handle, valid_handle(handle), "_none proposed_"),
         )),
-        context("Approving adds them to `team.yaml` and gives them a personal bot."),
+        context(ROLE_LINE),
     ]
 }
 
