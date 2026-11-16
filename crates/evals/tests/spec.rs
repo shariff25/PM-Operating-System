@@ -206,8 +206,9 @@ fn docs_qa_is_a_template_on_the_fake_docs() {
     assert_eq!(c.bot, "docs");
     assert_eq!(c.repeats, 3);
     assert_eq!(
-        c.pass_bar, None,
-        "reports only until a team's own tasks are in"
+        c.pass_bar,
+        Some(0.8),
+        "a starting bar since 2026-11-16, to be tightened once a team's own tasks are in"
     );
     assert!(root.join("categories/docs-qa/README.md").is_file());
     let (declines, answerable): (Vec<_>, Vec<_>) =
@@ -318,7 +319,7 @@ fn the_seed_categories_are_ready_to_report() {
     for name in ["jira-draft", "confluence-draft", "slack-reply"] {
         let c = load_category(&root, name).unwrap();
         assert_eq!(c.bot, "personal", "{name}");
-        assert_eq!(c.pass_bar, None, "{name}");
+        assert_eq!(c.pass_bar, Some(0.8), "{name}: the starting bar");
         assert!(c.tasks.len() >= 3, "{name}: {} tasks", c.tasks.len());
         let header =
             std::fs::read_to_string(root.join("categories").join(name).join("category.yaml"))
@@ -487,6 +488,7 @@ fn affected_categories_follow_bot_role_and_skills() {
     // Personal bots: pm-<requested_by>, made from pm-assistant and its skills.
     let personal = [
         "confluence-draft",
+        "daily-brief",
         "jira-draft",
         "pm-craft",
         "principal-craft",
