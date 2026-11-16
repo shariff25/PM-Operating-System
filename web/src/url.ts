@@ -25,3 +25,38 @@ export function draftIdFromPath(path: string): string | null {
     return null;
   }
 }
+
+/** Read the id out of a `/a/<task id>` hash path. Returns null when it is malformed or unsafe. */
+export function taskIdFromPath(path: string): string | null {
+  const raw = /^\/a\/([^/]+)$/.exec(path)?.[1];
+  if (!raw) return null;
+  try {
+    const id = decodeURIComponent(raw);
+    return isSafeId(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+export type Route =
+  | { name: 'home' }
+  | { name: 'drafts' }
+  | { name: 'draft'; id: string }
+  | { name: 'followups' }
+  | { name: 'activity' }
+  | { name: 'task'; id: string };
+
+/** Every hash the app understands. Anything unknown, malformed or unsafe is the home page. */
+export function parseRoute(path: string): Route {
+  if (path === '/drafts') return { name: 'drafts' };
+  if (path === '/followups') return { name: 'followups' };
+  if (path === '/activity') return { name: 'activity' };
+  const draft = draftIdFromPath(path);
+  if (draft) return { name: 'draft', id: draft };
+  const task = taskIdFromPath(path);
+  if (task) return { name: 'task', id: task };
+  return { name: 'home' };
+}
+
+export const draftHref = (id: string) => `#/d/${encodeURIComponent(id)}`;
+export const taskHref = (id: string) => `#/a/${encodeURIComponent(id)}`;
