@@ -176,7 +176,8 @@ linked account must match the member (the Slack member id for Slack, the email f
 Atlassian).
 
 Rules: `team-parse`, `team-handle`, `team-slack-id`, `team-email`, `team-duplicate` (a
-handle or Slack id listed twice), `team-roles` (no roles), `team-role-unknown` (warning: a
+handle, Slack id, GitHub login or email listed twice; emails ignoring case, since the web app's
+Entra ID sign-in finds members by email), `team-roles` (no roles), `team-role-unknown` (warning: a
 role this version doesn't know), `team-role-separation` (warning: admin and auditor together),
 `people-unknown` (warning: a `master/people/` folder
 for someone not on the team).

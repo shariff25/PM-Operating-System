@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use chrono::Duration;
 use pmos_assertion::{Key, KeyRing, VerifyPolicy};
 
+use crate::entra::EntraConfig;
 use crate::upstream::{Credentials, Signer};
 
 /// pmos-web's client name: the issuer of its user assertions.
@@ -39,8 +40,11 @@ pub struct Config {
     /// Writes must come from it. Without it, `Origin` must match the request's `Host`.
     pub public_url: Option<String>,
     /// `PMOS_WEB_DEV_LOGIN=1`: development sign-in (`POST /api/auth/dev-login`), where
-    /// anyone who can reach the port signs in as any member. The only provider today.
+    /// anyone who can reach the port signs in as any member.
     pub dev_login: bool,
+    /// Entra ID sign-in (`PMOS_WEB_ENTRA_*`, with `PMOS_WEB_PUBLIC_URL`): on when fully
+    /// configured. The server starts with Entra, development sign-in, or both.
+    pub entra: Option<EntraConfig>,
     /// `PMOS_WEB_SESSION_IDLE_MINUTES`, default 480 (8 hours).
     pub session_idle: Duration,
     /// `PMOS_WEB_SESSION_MAX_MINUTES`, default 1440 (24 hours), from sign-in.
@@ -59,6 +63,7 @@ impl std::fmt::Debug for Config {
             .field("static_dir", &self.static_dir)
             .field("public_url", &self.public_url)
             .field("dev_login", &self.dev_login)
+            .field("entra", &self.entra)
             .field("session_idle", &self.session_idle)
             .field("session_max", &self.session_max)
             .finish()
@@ -66,8 +71,9 @@ impl std::fmt::Debug for Config {
 }
 
 /// Why the server won't start without a provider.
-pub const NO_PROVIDER: &str = "no sign-in provider: Entra ID is not built yet, so pmos-web \
-     starts only with PMOS_WEB_DEV_LOGIN=1 (development sign-in; never expose it)";
+pub const NO_PROVIDER: &str = "no sign-in provider: set PMOS_WEB_ENTRA_TENANT_ID, \
+     PMOS_WEB_ENTRA_CLIENT_ID, PMOS_WEB_ENTRA_CLIENT_SECRET and PMOS_WEB_PUBLIC_URL for Entra \
+     ID sign-in, or PMOS_WEB_DEV_LOGIN=1 for development sign-in (never expose it)";
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
@@ -92,7 +98,11 @@ impl Config {
                 ))
             }
         };
-        if !dev_login {
+        let public_url = set("PMOS_WEB_PUBLIC_URL")
+            .map(|u| origin("PMOS_WEB_PUBLIC_URL", u))
+            .transpose()?;
+        let entra = EntraConfig::from_lookup(set, public_url.as_deref())?;
+        if !dev_login && entra.is_none() {
             return Err(NO_PROVIDER.into());
         }
         let bots_token = token("PMOS_WEB_BOTS_TOKEN")?;
@@ -154,10 +164,9 @@ impl Config {
             toolserver_token,
             content_root,
             static_dir: set("PMOS_WEB_STATIC_DIR").map(PathBuf::from),
-            public_url: set("PMOS_WEB_PUBLIC_URL")
-                .map(|u| origin("PMOS_WEB_PUBLIC_URL", u))
-                .transpose()?,
+            public_url,
             dev_login,
+            entra,
             session_idle,
             session_max,
         })
@@ -300,6 +309,42 @@ mod tests {
         assert!(Config::from_lookup(lookup(&yes))
             .unwrap_err()
             .contains("`1` or `0`"));
+    }
+
+    #[test]
+    fn starts_with_entra_dev_or_both_but_never_half_configured() {
+        const SECRET: &str = "entra-client-secret-value";
+        let entra = vec![
+            (
+                "PMOS_WEB_ENTRA_TENANT_ID",
+                "11111111-2222-3333-4444-555555555555",
+            ),
+            (
+                "PMOS_WEB_ENTRA_CLIENT_ID",
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            ),
+            ("PMOS_WEB_ENTRA_CLIENT_SECRET", SECRET),
+            ("PMOS_WEB_PUBLIC_URL", "https://pmos.example.com"),
+        ];
+        let mut pairs = base();
+        pairs.retain(|(k, _)| *k != "PMOS_WEB_DEV_LOGIN");
+        let only_entra =
+            Config::from_lookup(lookup(&[pairs.clone(), entra.clone()].concat())).unwrap();
+        assert!(only_entra.entra.is_some() && !only_entra.dev_login);
+        assert!(!format!("{only_entra:?}").contains(SECRET));
+        let both = Config::from_lookup(lookup(&[base(), entra.clone()].concat())).unwrap();
+        assert!(both.entra.is_some() && both.dev_login);
+        // Half-configured refuses even with development sign-in on.
+        for drop in 0..entra.len() {
+            let mut half = entra.clone();
+            half.remove(drop);
+            let err = Config::from_lookup(lookup(&[base(), half].concat())).unwrap_err();
+            assert!(
+                err.contains("half-configured") || err.contains("PMOS_WEB_PUBLIC_URL is required"),
+                "{err}"
+            );
+            assert!(!err.contains(SECRET), "{err}");
+        }
     }
 
     #[test]

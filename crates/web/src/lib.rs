@@ -3,6 +3,7 @@
 //!
 //! - [`config`]: settings from the environment, checked at start-up.
 //! - [`auth`]: the sign-in providers ([`auth::AuthProvider`]) and the origin check.
+//! - [`entra`]: Entra ID sign-in (OpenID Connect, authorization code with PKCE).
 //! - [`session`]: sessions (random 256-bit ids, stored hashed) and the `__Host-pmos` cookie.
 //! - [`settings`]: per-PM state the web app keeps (hints, nudges, edits, suggestions,
 //!   practice drafts).
@@ -21,6 +22,7 @@ pub mod app;
 pub mod auth;
 pub mod config;
 pub mod drafts;
+pub mod entra;
 pub mod followups;
 pub mod pg;
 pub mod progress;

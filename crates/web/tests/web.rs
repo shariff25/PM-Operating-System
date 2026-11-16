@@ -453,6 +453,7 @@ fn config(bots_url: &str, tools_url: &str, root: &std::path::Path) -> Config {
         static_dir: None,
         public_url: None,
         dev_login: true,
+        entra: None,
         session_idle: Duration::hours(8),
         session_max: Duration::hours(24),
     }

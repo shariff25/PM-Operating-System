@@ -546,6 +546,26 @@ fn team_file_rules() {
 }
 
 #[test]
+fn team_emails_are_unique_ignoring_case() {
+    let dir = valid_tree();
+    write(
+        dir.path(),
+        "team.yaml",
+        "members:\n  - {handle: ana, slack-id: U0ANA1, email: ana@example.com, roles: [pm]}\n  - {handle: bo, slack-id: U0BO, email: ANA@Example.com, roles: [pm]}\n  - {handle: cy, slack-id: U0CY, roles: [pm]}\n  - {handle: dee, slack-id: U0DEE, roles: [pm]}\n",
+    );
+    let report = run(&dir);
+    assert_code(&report, "team-duplicate", Severity::Error);
+    assert_eq!(
+        report
+            .codes()
+            .iter()
+            .filter(|c| **c == "team-duplicate")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn team_file_parses_and_looks_up_by_slack_id() {
     let team = pmos_contract::model::TeamFile::from_yaml(
         "members:\n  - {handle: ana, slack-id: U0ANA1, roles: [pm]}\n",

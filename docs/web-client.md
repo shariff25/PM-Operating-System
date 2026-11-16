@@ -82,7 +82,7 @@ Each gate needs written pass criteria before its phase starts.
 - **The gateway config file.** Its format and where it lives are not decided.
 - **Whether the context library is editable in the web client.** The decision was written with `context/` as the name. The repo's context tree is `content/`. Confirm which one is meant before deciding.
 - **Pass bars** for each phase gate.
-- **Entra ID requirements:** tenant setup, which claims are used, group-to-role mapping, and the sign-in fallback when Entra is down. Not yet written.
+- **Entra ID requirements:** group-to-role mapping, and the sign-in fallback when Entra is down. Not yet written. `pmos-web` now has single-tenant Entra sign-in that maps people by email to `team.yaml` and takes roles only from there (`docs/entra-sign-in.md`).
 - **The full permission matrix** and the audit chain design (see above).
 
 ## Links

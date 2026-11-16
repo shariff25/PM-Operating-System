@@ -823,6 +823,7 @@ impl Cx {
         let mut handles = BTreeSet::new();
         let mut slack_ids = BTreeSet::new();
         let mut github_logins = BTreeSet::new();
+        let mut emails = BTreeSet::new();
         for m in &team.members {
             if !crate::model::valid_handle(&m.handle) {
                 self.error(
@@ -861,6 +862,14 @@ impl Cx {
                         "team-email",
                         &path,
                         format!("`{email}` is not an email address"),
+                    );
+                } else if !emails.insert(email.trim().to_ascii_lowercase()) {
+                    // Entra ID sign-in finds people by email: two members with one email
+                    // would be ambiguous, so pmos-web signs in neither.
+                    self.error(
+                        "team-duplicate",
+                        &path,
+                        format!("email `{email}` is listed twice"),
                     );
                 }
             }
