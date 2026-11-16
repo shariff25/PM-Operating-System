@@ -24,8 +24,15 @@
 //! approve would send now (the item's arguments with the PM's saved edit applied). An
 //! approve that names another version is refused (`409 stale`), so what is published is
 //! what the PM saw.
+//!
+//! **Citations.** The bot's source markers (`[[src-3f9a1c]]`, `crates/contract/src/cite.rs`)
+//! are resolved against the sources the tool server lists for the item ([`with_sources`]):
+//! each one naming a listed source becomes `[[sN]]` and the source is `cited`; any other is
+//! removed. An edited draft has none. The tool server removes markers when it writes, so
+//! the `version` (the arguments as stored) is unaffected.
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use pmos_contract::cite;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -75,6 +82,9 @@ pub struct Source {
     pub url: Option<String>,
     /// Always `null`: no source text is kept anywhere to quote (see `crates/web/README.md`).
     pub excerpt: Option<String>,
+    /// The draft's body marks at least one sentence with this source (`[[s3]]`); see
+    /// [`with_sources`]. False for a source the bot read but didn't cite.
+    pub cited: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -106,7 +116,8 @@ impl From<&StoredSuggestion> for Suggestion {
         Self {
             status: s.status.clone(),
             instruction: s.instruction.clone(),
-            body: s.body.clone(),
+            // A suggestion is the PM's to accept as their own text: no source markers.
+            body: s.body.as_deref().map(cite::strip),
             error: s.error.clone(),
         }
     }
@@ -248,21 +259,31 @@ fn target(item: &Approval) -> Target {
 
 /// The tool server's sources as the draft's: each with a link only if it is `https`, a
 /// plain title of bounded length, no excerpt (none is kept anywhere), at most
-/// [`MAX_SOURCES`].
+/// [`MAX_SOURCES`], none cited (see [`with_sources`]).
 pub fn sources(found: Vec<ApprovalSource>) -> Vec<Source> {
+    listed(found).into_iter().map(|(s, _)| s).collect()
+}
+
+/// [`sources`], each with the ref the bot's markers name it by, if it is one.
+fn listed(found: Vec<ApprovalSource>) -> Vec<(Source, Option<String>)> {
     found
         .into_iter()
         .filter(|s| !s.reference.is_empty())
         .take(MAX_SOURCES)
         .enumerate()
         .map(|(i, s)| {
+            let cite = s
+                .cite
+                .as_deref()
+                .filter(|c| cite::is_ref(c))
+                .map(str::to_ascii_lowercase);
             let title: String = s
                 .title
                 .chars()
                 .filter(|c| !c.is_control())
                 .take(MAX_SOURCE_TITLE)
                 .collect();
-            Source {
+            let source = Source {
                 id: format!("s{}", i + 1),
                 system: ident(&s.system, "system"),
                 title: if title.trim().is_empty() {
@@ -272,9 +293,58 @@ pub fn sources(found: Vec<ApprovalSource>) -> Vec<Source> {
                 },
                 url: s.url.filter(|u| safe_url(u)),
                 excerpt: None,
-            }
+                cited: false,
+            };
+            (source, cite)
         })
         .collect()
+}
+
+/// What resolving a draft's source markers did, for a log line (counts only, no text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Citations {
+    /// Markers that name a listed source.
+    pub kept: usize,
+    /// Markers that name a source the run didn't read (or that isn't listed), and malformed
+    /// ones.
+    pub dropped: usize,
+}
+
+/// The draft with what the bot read for it (the tool server's sources), and its body's
+/// source markers resolved against them (`docs/web-api.md`, Citations):
+///
+/// - Only a draft shown as the bot wrote it has citations. Each `[[src-…]]` marker that
+///   names a listed source becomes `[[sN]]`, `sN` being that source's `id`, and the source
+///   is `cited`. Any other marker is removed, cleanly ([`cite::render`]).
+/// - A draft with the PM's saved edit (an edit, or an accepted suggestion) has none: its body
+///   is the PM's text, which has no markers ([`draft`] removes any), and no source is
+///   `cited`.
+///
+/// The `version` is untouched: it is what an approve would send, markers and all (the tool
+/// server removes them when it writes).
+pub fn with_sources(
+    mut draft: Draft,
+    item: &Approval,
+    state: &UserState,
+    found: Vec<ApprovalSource>,
+) -> (Draft, Citations) {
+    let mut listed = listed(found);
+    let mut citations = Citations::default();
+    if !state.edits.contains_key(&item.id) {
+        let (_, raw) = title_and_body(&item.tool, &item.args);
+        let rendered = cite::render(&display_body(&raw), |r| {
+            let (source, _) = listed.iter_mut().find(|(_, c)| c.as_deref() == Some(r))?;
+            source.cited = true;
+            Some(format!("[[{}]]", source.id))
+        });
+        citations = Citations {
+            kept: rendered.kept,
+            dropped: rendered.dropped,
+        };
+        draft.body = rendered.text;
+    }
+    draft.sources = listed.into_iter().map(|(s, _)| s).collect();
+    (draft, citations)
 }
 
 /// `value` with object keys sorted at every level, as the tool server hashes arguments.
@@ -389,6 +459,8 @@ pub fn summary(item: &Approval, state: &UserState) -> Option<DraftSummary> {
             title = t.clone();
         }
     }
+    // A title is never cited: a marker in it is removed.
+    let title = cite::strip(&title);
     Some(DraftSummary {
         id: item.id.clone(),
         kind,
@@ -462,14 +534,15 @@ pub fn display_body(body: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// The whole draft of an approval item, with the PM's saved edit if there is one. Without
-/// one, the body is the item's own, repaired for display only ([`display_body`]).
+/// one, the body is the item's own, repaired for display only ([`display_body`]). Either
+/// way it has no source markers and no sources: [`with_sources`] adds both.
 pub fn draft(item: &Approval, state: &UserState) -> Option<Draft> {
     let summary = summary(item, state)?;
     let (_, body) = title_and_body(&item.tool, &item.args);
     let edit = state.edits.get(&item.id);
     let body = match edit {
-        Some(e) => e.body.clone(),
-        None => display_body(&body).into_owned(),
+        Some(e) => cite::strip(&e.body),
+        None => cite::strip(&display_body(&body)),
     };
     Some(Draft {
         summary,
@@ -543,7 +616,7 @@ pub fn practice_draft(p: &PracticeDraft, bot: &str, state: &UserState) -> Draft 
             practice: true,
         },
         body: edit
-            .map(|e| e.body.clone())
+            .map(|e| cite::strip(&e.body))
             .unwrap_or_else(|| PRACTICE_BODY.into()),
         edited: edit.is_some(),
         target: Target {
@@ -756,12 +829,14 @@ mod tests {
                 title: "PAY-1".into(),
                 url: Some("https://acme.atlassian.net/browse/PAY-1".into()),
                 reference: "PAY-1".into(),
+                cite: Some("src-aaaaaa".into()),
             },
             ApprovalSource {
                 system: "docs".into(),
                 title: "".into(),
                 url: Some("data:text/html,x".into()),
                 reference: "https://docs.example.com/a.md".into(),
+                cite: None,
             },
         ];
         let out = sources(found);
@@ -772,7 +847,106 @@ mod tests {
         );
         assert_eq!(out[1].url, None);
         assert_eq!(out[1].title, "https://docs.example.com/a.md");
-        assert!(out.iter().all(|s| s.excerpt.is_none()));
+        assert!(out.iter().all(|s| s.excerpt.is_none() && !s.cited));
+    }
+
+    fn src(reference: &str, cite: Option<&str>) -> ApprovalSource {
+        ApprovalSource {
+            system: "jira".into(),
+            title: reference.into(),
+            url: None,
+            reference: reference.into(),
+            cite: cite.map(String::from),
+        }
+    }
+
+    fn read_three() -> Vec<ApprovalSource> {
+        vec![
+            src("PAY-1", Some("src-aaaaaa")),
+            src("PAY-2", Some("src-bbbbbb")),
+            src("PAY-3", Some("src-cccccc")),
+        ]
+    }
+
+    #[test]
+    fn markers_become_citations_of_sources_the_task_read() {
+        let none = UserState::default();
+        let body = "# Plan [[src-aaaaaa]]\n\nGrace is 7 days [[src-cccccc]][[SRC-AAAAAA]].\n\
+                    - Churn [[src-ffffff]] rises.\n\nUse `[[src-bbbbbb]]` in code.\n";
+        let it = item(
+            "confluence.create_draft",
+            json!({"space": "PM", "title": "Plan [[src-aaaaaa]]", "body": body}),
+        );
+        let (d, c) = with_sources(draft(&it, &none).unwrap(), &it, &none, read_three());
+        assert_eq!(
+            d.body,
+            "# Plan[[s1]]\n\nGrace is 7 days[[s3]][[s1]].\n- Churn rises.\n\nUse `[[src-bbbbbb]]` in code.\n"
+        );
+        assert_eq!(d.summary.title, "Plan", "titles are never cited");
+        assert_eq!((c.kept, c.dropped), (3, 1));
+        let cited: Vec<(&str, bool)> = d.sources.iter().map(|s| (s.id.as_str(), s.cited)).collect();
+        assert_eq!(cited, [("s1", true), ("s2", false), ("s3", true)]);
+        // The version is still what an approve sends: the item's own arguments.
+        assert_eq!(d.version, args_version(&it.tool, &it.args));
+        // The body without sources (as `draft` gives it, and as a change request sends it to
+        // the bot) has no markers at all.
+        assert_eq!(
+            draft(&it, &none).unwrap().body,
+            "# Plan\n\nGrace is 7 days.\n- Churn rises.\n\nUse `[[src-bbbbbb]]` in code.\n"
+        );
+    }
+
+    #[test]
+    fn a_draft_without_markers_or_refs_is_as_before() {
+        let none = UserState::default();
+        let it = item(
+            "jira.create_issue",
+            json!({"project": "PAY", "issue_type": "Story", "summary": "S", "description": "Plain."}),
+        );
+        let before = draft(&it, &none).unwrap();
+        let (d, c) = with_sources(before.clone(), &it, &none, read_three());
+        assert_eq!(d.body, "Plain.");
+        assert_eq!(c, Citations::default());
+        assert!(d.sources.iter().all(|s| !s.cited));
+        assert_eq!(d.version, before.version);
+        // An older tool server sends no refs: markers name nothing and are removed, and
+        // the bot's own `[[s1]]` is never taken for a citation.
+        let it = item(
+            "slack.post_reply",
+            json!({"channel": "C01", "thread_ts": "1.2", "text": "Yes [[src-aaaaaa]] and [[s1]]."}),
+        );
+        let old = vec![src("PAY-1", None), src("PAY-2", Some("not a ref"))];
+        let (d, c) = with_sources(draft(&it, &none).unwrap(), &it, &none, old);
+        assert_eq!(d.body, "Yes and.");
+        assert_eq!((c.kept, c.dropped), (0, 2));
+        assert!(d.sources.iter().all(|s| !s.cited));
+        // No sources at all (the tool server couldn't say).
+        let (d, _) = with_sources(draft(&it, &none).unwrap(), &it, &none, Vec::new());
+        assert_eq!(d.body, "Yes and.");
+        assert!(d.sources.is_empty());
+    }
+
+    #[test]
+    fn an_edited_draft_has_no_citations() {
+        let it = item(
+            "confluence.create_draft",
+            json!({"space": "PM", "title": "T", "body": "Claim [[src-aaaaaa]]."}),
+        );
+        let mut edited = UserState::default();
+        edited.edits.insert(
+            "apr_1".into(),
+            DraftEdit {
+                title: None,
+                // Saved before markers were removed on save, or typed by the PM.
+                body: "Claim, edited [[s1]] [[src-aaaaaa]].".into(),
+            },
+        );
+        let (d, c) = with_sources(draft(&it, &edited).unwrap(), &it, &edited, read_three());
+        assert_eq!(d.body, "Claim, edited.");
+        assert!(d.edited);
+        assert_eq!(c, Citations::default());
+        assert!(d.sources.iter().all(|s| !s.cited));
+        assert_eq!(d.sources.len(), 3, "still listed as read");
     }
 
     #[test]

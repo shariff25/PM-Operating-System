@@ -266,7 +266,8 @@ async fn lists_what_the_run_read_newest_first_once_each_without_text() {
         sources[2],
         json!({"system": "jira", "title": "PM-101: Epic: SSO for the Acme Vault console",
                "url": format!("{SITE}/browse/PM-101"),
-               "ref": "PM-101", "tool": "jira.read",
+               "ref": "PM-101", "cite": pmos_toolserver::sources::cite_ref("jira:PM-101"),
+               "tool": "jira.read",
                "read_at": serde_json::to_value(t0 + Duration::seconds(3)).unwrap()})
     );
     // Slack stays channel and message ids.
@@ -281,6 +282,19 @@ async fn lists_what_the_run_read_newest_first_once_each_without_text() {
         "https://docs.example.com/docs/vault-saml-sso.md"
     );
     assert_eq!(sources[4]["url"], Value::Null, "a context file has no link");
+    // Each source's `cite` is the ref its read gave the bot, so a marker can name it.
+    assert_eq!(
+        sources[4]["cite"],
+        json!(pmos_toolserver::sources::cite_ref(
+            "context/partners/globex-nda.md"
+        ))
+    );
+    assert_eq!(
+        sources[3]["cite"],
+        json!(pmos_toolserver::sources::cite_ref(
+            "slack:C0FIELD:1731500000.000100"
+        ))
+    );
     assert!(!sources[4]["title"].as_str().unwrap().is_empty());
 
     // Metadata only: titles, but no message text, issue description, page snippet or token.

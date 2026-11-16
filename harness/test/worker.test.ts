@@ -17,6 +17,7 @@ import {
   isAbortRejection,
 } from "../src/worker.js";
 import {
+  FAKE_DOCS_REF,
   type FakeMcp,
   type FakeRuntime,
   WORKER_TOKEN,
@@ -221,6 +222,26 @@ describe("harness worker", () => {
     expect(system).toContain("Backs the /docs Slack command"); // the docs skill is listed
     expect(system).not.toContain("prd-draft");
     expect(system).not.toContain("meeting-notes");
+  });
+
+  it("shows the model each read's ref and passes source markers to the tool server as written", async () => {
+    const body = `Acme Vault needs port 4443 [[${FAKE_DOCS_REF}]].`;
+    const model = new ScriptedModel([
+      call("docs_search", { query: "vault ports" }),
+      call("confluence_create_draft", { space: "PM", title: "Ports", body }),
+      new AIMessage("A Confluence draft is waiting for your approval."),
+    ]);
+    const { runtime, mcp } = await setup({ claims: [claim("tsk_ref")], models: { tsk_ref: model } });
+    await waitFor(() => finished(runtime, "tsk_ref"));
+
+    // The read's result, as the model saw it on its next turn, carries the ref.
+    const seen = (model.prompts[1] ?? []).filter((m) => m.getType() === "tool");
+    expect(seen).toHaveLength(1);
+    expect(JSON.parse(String(seen[0]?.content)).ref).toBe(FAKE_DOCS_REF);
+    // The harness changes nothing in a write: the tool server keeps the marker for the PM's
+    // review and removes it when it writes.
+    const write = mcp.calls.find((c) => c.name === "confluence_create_draft");
+    expect(write?.args).toEqual({ space: "PM", title: "Ports", body });
   });
 
   it("tells a team bot today's date from the worker's clock, and no level", async () => {
