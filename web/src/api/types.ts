@@ -31,7 +31,7 @@ export interface Source {
   id: string;
   system: string;
   title: string;
-  url: string;
+  url: string | null;
   excerpt: string | null;
 }
 
