@@ -409,6 +409,8 @@ fn tools_routes(ts: Arc<MockTools>) -> Router {
 struct MockRuntime {
     roster: Mutex<Vec<Value>>,
     tasks: Mutex<Vec<Value>>,
+    /// The notification feed; the cursor is an index into it.
+    feed: Mutex<Vec<Value>>,
 }
 
 type Rt = State<Arc<MockRuntime>>;
@@ -425,6 +427,25 @@ async fn rt_create_task(State(rt): Rt, Json(body): Json<Value>) -> Response {
     let mut task = body;
     task["id"] = json!("tsk_00000000000000000000000000000001");
     answer(StatusCode::CREATED, task)
+}
+
+async fn rt_notifications(
+    State(rt): Rt,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if bearer(&headers) != BOTS_TOKEN {
+        return answer(StatusCode::UNAUTHORIZED, json!({"error": "bad token"}));
+    }
+    let from: usize = q.get("after").and_then(|a| a.parse().ok()).unwrap_or(0);
+    let items: Vec<Value> = rt.feed.lock().unwrap().iter().skip(from).cloned().collect();
+    if items.is_empty() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    answer(
+        StatusCode::OK,
+        json!({"cursor": (from + items.len()).to_string(), "items": items}),
+    )
 }
 
 fn bot(name: &str) -> Value {
@@ -444,7 +465,8 @@ struct Stack {
     live: mpsc::UnboundedSender<Value>,
     runtime: Arc<MockRuntime>,
     tools: Arc<MockTools>,
-    _team: tempfile::TempDir,
+    bots: Bots,
+    team: tempfile::TempDir,
     stop: Vec<CancellationToken>,
     socket: Option<(CancellationToken, JoinHandle<Ended>)>,
     next: Mutex<u32>,
@@ -452,6 +474,27 @@ struct Stack {
 
 impl Stack {
     async fn new() -> Self {
+        Self::build(false, None).await
+    }
+
+    /// The new first-time flow on (`PMOS_ONBOARDING_V2=1`).
+    async fn new_v2() -> Self {
+        Self::build(true, None).await
+    }
+
+    /// Stop everything and keep the directory (team file and Slack state), to start again.
+    async fn stop_keep(mut self) -> tempfile::TempDir {
+        if let Some((shutdown, handle)) = self.socket.take() {
+            shutdown.cancel();
+            assert_eq!(handle.await.unwrap(), Ended::Shutdown);
+        }
+        for s in &self.stop {
+            s.cancel();
+        }
+        self.team
+    }
+
+    async fn build(v2: bool, dir: Option<tempfile::TempDir>) -> Self {
         let slack = Arc::new(FakeSlack::default());
         let app = common::routes()
             .route("/hooks/bots", post(hook))
@@ -475,9 +518,12 @@ impl Stack {
             ),
         ]);
 
-        let team = tempfile::tempdir().unwrap();
+        let fresh = dir.is_none();
+        let team = dir.unwrap_or_else(|| tempfile::tempdir().unwrap());
         let team_file = team.path().join("team.yaml");
-        std::fs::write(&team_file, TEAM).unwrap();
+        if fresh {
+            std::fs::write(&team_file, TEAM).unwrap();
+        }
         let tools = Arc::new(MockTools::default());
         *tools.team_file.lock().unwrap() = team_file.clone();
         tools.github.lock().unwrap().insert("ana".into(), "push");
@@ -488,22 +534,26 @@ impl Stack {
             Router::new()
                 .route("/v1/bots", get(rt_bots))
                 .route("/v1/tasks", post(rt_create_task))
+                .route("/v1/notifications", get(rt_notifications))
                 .with_state(runtime.clone()),
         )
         .await;
 
         let http = reqwest::Client::new();
-        let bots = Bots::new(BotsConfig {
-            slack: SlackApi::new(slack_base.clone(), SLACK_BOT_TOKEN, http.clone()),
-            runtime: Runtime::new(rt_base, BOTS_TOKEN, http.clone()),
-            toolserver: ToolServer::new(ts_base.clone(), TOOL_BOT_TOKEN),
-            team_file: team_file.clone(),
-            default_tz: "UTC".into(),
-            github_org: Some("example-org".into()),
-            response_url_prefix: format!("{slack_base}/hooks/"),
-            state_dir: team.path().join("state"),
-            web_url: None,
-        });
+        let bots = Bots::with_onboarding_v2(
+            BotsConfig {
+                slack: SlackApi::new(slack_base.clone(), SLACK_BOT_TOKEN, http.clone()),
+                runtime: Runtime::new(rt_base, BOTS_TOKEN, http.clone()),
+                toolserver: ToolServer::new(ts_base.clone(), TOOL_BOT_TOKEN),
+                team_file: team_file.clone(),
+                default_tz: "UTC".into(),
+                github_org: Some("example-org".into()),
+                response_url_prefix: format!("{slack_base}/hooks/"),
+                state_dir: team.path().join("state"),
+                web_url: None,
+            },
+            v2,
+        );
         let socket = Socket::new(
             slack_base.clone(),
             APP_TOKEN,
@@ -516,7 +566,7 @@ impl Stack {
             },
             http,
         )
-        .with_bots(bots);
+        .with_bots(bots.clone());
         let shutdown = CancellationToken::new();
         let token = shutdown.clone();
         let handle = tokio::spawn(async move { socket.run(token).await });
@@ -526,7 +576,8 @@ impl Stack {
             live: tx,
             runtime,
             tools,
-            _team: team,
+            bots,
+            team,
             stop: vec![stop_slack, stop_ts, stop_rt],
             socket: Some((shutdown, handle)),
             next: Mutex::new(0),
@@ -1193,5 +1244,283 @@ async fn remove_works_with_its_confirmation_and_requests_lists_cards() {
     stack.dm("U0BOB", "hi").await;
     let notes = stack.calls("chat.postEphemeral", 2).await;
     assert!(has_action(&notes[1].body, "pmos_request_access"));
+    stack.stop().await;
+}
+
+// ---- The new first-time flow (`PMOS_ONBOARDING_V2=1`) ----
+
+/// Ben asks, Ana approves; returns once the approval is done (the DMs to Ben may follow).
+async fn approve_ben(stack: &Stack) {
+    let (id, cards) = stack.ben_requests().await;
+    let (channel, ts) = &cards[0];
+    stack
+        .click("U0ANA", "pmos_member_approve", &id, (channel, ts))
+        .await;
+    stack.calls("chat.update", 2).await;
+}
+
+/// What the bot has posted to Ben's DM so far.
+fn to_ben(stack: &Stack) -> Vec<Call> {
+    stack
+        .slack
+        .calls("chat.postMessage")
+        .into_iter()
+        .filter(|c| c.body["channel"] == "D0BEN")
+        .collect()
+}
+
+async fn ben_posts(stack: &Stack, n: usize) -> Vec<Call> {
+    until(&format!("{n} posts to Ben"), || {
+        let posts = to_ben(stack);
+        (posts.len() >= n).then_some(posts)
+    })
+    .await
+}
+
+/// Nothing the bot posted went to a channel: every post is in someone's DM.
+fn assert_only_dms(stack: &Stack) {
+    for c in stack.slack.calls("chat.postMessage") {
+        let channel = c.body["channel"].as_str().unwrap();
+        assert!(channel.starts_with('D'), "posted to {channel}");
+    }
+}
+
+fn app_home_opened(user: &str, n: u32) -> Value {
+    json!({"type": "event_callback", "event_id": format!("EvHome{n}"), "event": {
+        "type": "app_home_opened", "tab": "home", "user": user, "event_ts": format!("9{n}.1"),
+    }})
+}
+
+async fn quiet() {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// Run the notifications loop on this stack's state directory.
+fn run_notifier(stack: &Stack) -> (CancellationToken, JoinHandle<()>) {
+    let mut notifier =
+        pmos_slack::notify::Notifier::new(stack.bots.clone(), stack.team.path().join("state"));
+    notifier.wait = Duration::from_millis(100);
+    let stop = CancellationToken::new();
+    (stop.clone(), tokio::spawn(notifier.run(stop)))
+}
+
+fn done(id: &str, thread: &str) -> Value {
+    json!({
+        "id": format!("n-{id}"), "task_id": format!("tsk_{id}"), "kind": "done",
+        "text": "Here is your answer.", "bot": "docs", "requested_by": "ben-smith",
+        "slack": {"channel": "D0BEN", "thread_ts": thread},
+    })
+}
+
+#[tokio::test]
+async fn flag_off_the_welcome_and_checklist_are_unchanged() {
+    let stack = Stack::new().await;
+    approve_ben(&stack).await;
+    let posts = ben_posts(&stack, 2).await;
+    assert!(text_of(&posts[0]).contains("Welcome to PM OS, Ben!"));
+    assert!(has_action(&posts[1].body, "pmos_setup_memory"));
+    assert_eq!(link_urls(&posts[1].body).len(), 3);
+
+    // Linked, then a DM: no offer. A finished task: no closing line.
+    stack.tools.link("ben-smith", "atlassian");
+    stack.dm("U0BEN", "hi").await;
+    stack.runtime.feed.lock().unwrap().push(done("a", "200.9"));
+    let (stop, run) = run_notifier(&stack);
+    ben_posts(&stack, 3).await;
+    quiet().await;
+    assert_eq!(to_ben(&stack).len(), 3, "the answer only");
+    assert!(!stack.team.path().join("state/onboarding.json").exists());
+    stop.cancel();
+    run.await.unwrap();
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn hello_is_two_lines_and_one_button_and_no_checklist() {
+    let stack = Stack::new_v2().await;
+    approve_ben(&stack).await;
+    let posts = ben_posts(&stack, 1).await;
+    quiet().await;
+    assert_eq!(to_ben(&stack).len(), 1, "no checklist after the welcome");
+    let hello = &posts[0].body;
+    assert_eq!(
+        hello["text"],
+        "Hi Ben, I'm PM OS. I read Jira so you don't have to.\nConnect it and I'll prove it."
+    );
+    let buttons = elements(hello);
+    assert_eq!(buttons.len(), 1);
+    assert_eq!(buttons[0]["text"]["text"], "Connect Jira and Confluence");
+    assert_eq!(
+        buttons[0]["url"],
+        "https://pmos.example.com/oauth/atlassian/start?state=s-ben-smith"
+    );
+    assert!(!text_of(&posts[0]).contains("Slack"));
+    assert!(!text_of(&posts[0]).contains("memory"));
+    assert_only_dms(&stack);
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn the_offer_comes_after_linking_once_and_each_button_starts_a_task() {
+    let stack = Stack::new_v2().await;
+    stack
+        .runtime
+        .roster
+        .lock()
+        .unwrap()
+        .push(bot("pm-ben-smith"));
+    approve_ben(&stack).await;
+    ben_posts(&stack, 1).await;
+
+    // Not linked yet: a DM and a Home open bring no offer; the DM still becomes a task.
+    stack.dm("U0BEN", "what ports does Acme Vault need?").await;
+    until("the task", || {
+        (!stack.runtime.tasks.lock().unwrap().is_empty()).then_some(())
+    })
+    .await;
+    stack.send("events_api", app_home_opened("U0BEN", 1)).await;
+    quiet().await;
+    assert_eq!(to_ben(&stack).len(), 1);
+
+    // Linked: the next DM brings the offer, once.
+    stack.tools.link("ben-smith", "atlassian");
+    stack.dm("U0BEN", "hello again").await;
+    let posts = ben_posts(&stack, 2).await;
+    let offer = &posts[1];
+    assert_eq!(
+        offer.body["text"],
+        "Found your account. Want the short version of your week, or shall I start on something?"
+    );
+    let labels: Vec<String> = elements(&offer.body)
+        .iter()
+        .map(|e| e["text"]["text"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "Summarize my week",
+            "Draft a status update",
+            "What's blocked?"
+        ]
+    );
+    stack.dm("U0BEN", "and again").await;
+    stack.send("events_api", app_home_opened("U0BEN", 2)).await;
+    quiet().await;
+    assert_eq!(to_ben(&stack).len(), 2, "the offer is shown once");
+
+    // Each button creates a task for Ben's own bot, in the thread under the offer.
+    let ts = posted_ts(&stack.slack, offer);
+    let before = stack.runtime.tasks.lock().unwrap().len();
+    for (n, (id, expect)) in [
+        ("week", "Summarize my week"),
+        ("status", "Draft a status update"),
+        ("blocked", "What is blocked"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        stack
+            .click(
+                "U0BEN",
+                &format!("pmos_onboard_start_{id}"),
+                id,
+                ("D0BEN", &ts),
+            )
+            .await;
+        let tasks = until("the starter task", || {
+            let t = stack.runtime.tasks.lock().unwrap().clone();
+            (t.len() > before + n).then_some(t)
+        })
+        .await;
+        let task = &tasks[before + n];
+        assert_eq!(task["bot"], "pm-ben-smith");
+        assert_eq!(task["requested_by"], "ben-smith");
+        assert_eq!(task["source"], "slack");
+        assert_eq!(task["slack"], json!({"channel": "D0BEN", "thread_ts": ts}));
+        assert!(task["text"].as_str().unwrap().contains(expect), "{task}");
+    }
+    let updates = stack.calls("chat.update", 3).await;
+    let last = updates.last().unwrap();
+    assert!(text_of(last).contains("On it:"));
+    assert!(elements(&last.body).is_empty());
+
+    // Someone outside team.yaml tapping it gets the usual refusal and no task.
+    let tasks = stack.runtime.tasks.lock().unwrap().len();
+    stack
+        .click("U0ZED", "pmos_onboard_start_week", "week", ("D0ZED", "1.0"))
+        .await;
+    stack.calls("chat.postEphemeral", 1).await;
+    assert_eq!(stack.runtime.tasks.lock().unwrap().len(), tasks);
+    assert_only_dms(&stack);
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn each_step_is_shown_once_across_restarts() {
+    let stack = Stack::new_v2().await;
+    approve_ben(&stack).await;
+    ben_posts(&stack, 1).await;
+    stack.tools.link("ben-smith", "atlassian");
+    // The offer on a Home open this time.
+    stack.send("events_api", app_home_opened("U0BEN", 1)).await;
+    ben_posts(&stack, 2).await;
+    let dir = stack.stop_keep().await;
+    let saved = std::fs::read_to_string(dir.path().join("state/onboarding.json")).unwrap();
+    assert!(saved.contains("\"hello\": true") && saved.contains("\"offer\": true"));
+
+    let stack = Stack::build(true, Some(dir)).await;
+    stack.tools.link("ben-smith", "atlassian");
+    stack.dm("U0BEN", "hi").await;
+    stack.send("events_api", app_home_opened("U0BEN", 2)).await;
+    // The closing line comes with the first finished task, and only once.
+    stack.runtime.feed.lock().unwrap().push(done("a", "200.0"));
+    stack.runtime.feed.lock().unwrap().push(done("b", "200.1"));
+    let (stop, run) = run_notifier(&stack);
+    ben_posts(&stack, 3).await;
+    quiet().await;
+    let posts = to_ben(&stack);
+    assert_eq!(posts.len(), 3, "two answers and one closing line");
+    let closing: Vec<&Call> = posts
+        .iter()
+        .filter(|c| text_of(c).contains("`nudges off` stops my occasional nudges"))
+        .collect();
+    assert_eq!(closing.len(), 1);
+    assert_eq!(closing[0].body["thread_ts"], "200.0");
+    assert!(text_of(closing[0]).contains("Skills section of my Home tab"));
+    stop.cancel();
+    run.await.unwrap();
+    let dir = stack.stop_keep().await;
+
+    // And after another restart: still nothing new.
+    let stack = Stack::build(true, Some(dir)).await;
+    stack.tools.link("ben-smith", "atlassian");
+    stack.dm("U0BEN", "hi").await;
+    stack.send("events_api", app_home_opened("U0BEN", 3)).await;
+    quiet().await;
+    assert!(to_ben(&stack).is_empty());
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn setup_still_works_and_a_stranger_still_gets_the_access_note() {
+    let stack = Stack::new_v2().await;
+    approve_ben(&stack).await;
+    ben_posts(&stack, 1).await;
+    stack.dm("U0BEN", "setup").await;
+    let posts = ben_posts(&stack, 2).await;
+    assert_eq!(
+        link_urls(&posts[1].body),
+        ["atlassian", "slack", "github"]
+            .map(|p| format!("https://pmos.example.com/oauth/{p}/start?state=s-ben-smith"))
+    );
+    assert!(has_action(&posts[1].body, "pmos_setup_memory"));
+    assert!(has_action(&posts[1].body, "pmos_setup_refresh"));
+
+    stack.dm("U0ZED", "hi").await;
+    let notes = stack.calls("chat.postEphemeral", 1).await;
+    assert_eq!(notes[0].body["user"], "U0ZED");
+    assert!(text_of(&notes[0]).contains("PM OS is for the product team."));
+    assert!(has_action(&notes[0].body, "pmos_request_access"));
+    assert_only_dms(&stack);
     stack.stop().await;
 }

@@ -120,3 +120,25 @@ Drafts already waiting stay in your Inbox, but one that needs the account fails 
 approve it.
 
 **Memory:** your memory repo's name, when you have set one (`docs/onboarding-spec.md`).
+
+## First time (`PMOS_ONBOARDING_V2=1`)
+
+**Something useful about your own work comes before anything about PM OS.** With the setting
+off (the default) a new member gets the welcome and the setup checklist, as before. With it on:
+
+1. **Hello:** two short lines by first name and one button, **Connect Jira and Confluence**
+   (the Atlassian link). No checklist.
+2. **The offer:** after you have linked the account, the next time you message PM OS or open the
+   Home it posts one message, "Found your account. Want the short version of your week, or shall
+   I start on something?", with **Summarize my week**, **Draft a status update** and **What's
+   blocked?**. Each starts a task for your own bot, as if you had typed it; the answer, with its
+   sources, arrives in the thread under the offer. Nothing polls for the link.
+3. **Slack and your memory repo are not asked for up front.** They are offered, with their
+   connect link and one plain sentence, the first time a request needs them.
+4. **One closing line,** after your first finished task: the Skills section of the Home tab, and
+   `nudges off`. Then no more onboarding messages.
+
+`setup` in the DM still shows the full checklist. Each step is shown once; what you have seen is
+kept in `onboarding.json` in the Slack state directory (`PMOS_SLACK_STATE_DIR`), so a restart
+repeats nothing. When nudges are on, an onboarding message counts as that day's message. The
+wording is in `crates/slack/src/onboard_copy.rs`.
