@@ -126,6 +126,7 @@ mod tests {
             tool: "docs.search".into(),
             outcome: Outcome::Ok,
             sources: vec![],
+            source_titles: Default::default(),
             args_hash: None,
             output_ref: None,
             detail: None,
