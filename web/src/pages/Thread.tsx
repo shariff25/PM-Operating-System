@@ -13,6 +13,23 @@ import { isRetrying, isSettled, milestones, usableProgress } from '../tasks';
 import { relTime } from '../time';
 import { draftHref } from '../url';
 
+/** The request's reference, for when someone asks support about it. Only shown with the steps. */
+function TaskReference({ id }: { id: string }) {
+  const [copied, setCopied] = useState(false);
+  const copyIt = () => {
+    navigator.clipboard?.writeText(id).then(() => setCopied(true), () => {});
+  };
+  return (
+    <p className="task-ref">
+      <span>{copy.activity.reference}</span>
+      <code className="mono-id">{id}</code>
+      <button type="button" className="task-ref-btn" onClick={copyIt}>
+        {copied ? copy.activity.copiedReference : copy.activity.copyReference}
+      </button>
+    </p>
+  );
+}
+
 /** A draft the request produced, as a card with its title, kind and an Open draft button. */
 function DraftCard({ id }: { id: string }) {
   const { api, navigate } = useApp();
@@ -136,7 +153,6 @@ export function Thread({ id }: { id: string }) {
           <div className="msg-head">
             <Mark size={24} />
             <span className="msg-who">{copy.activity.bot}</span>
-            <code className="mono-id">{task.id}</code>
           </div>
           <div className="msg-body">
             <p className={`live-line ${working ? 'live-line-on' : ''}`} role="status">
@@ -179,6 +195,7 @@ export function Thread({ id }: { id: string }) {
                     ))}
                   </ol>
                 )}
+                {steps && <TaskReference id={task.id} />}
               </div>
             )}
 
