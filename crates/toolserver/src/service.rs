@@ -449,6 +449,25 @@ impl ToolService {
         checks
     }
 
+    /// Each connector's system, mode (`live` or `fake`) and readiness check, by name; each
+    /// check gets at most 2 seconds. For `GET /internal/admin/connectors`.
+    pub async fn connector_status(&self) -> Vec<(String, &'static str, Result<(), String>)> {
+        let mut systems: Vec<_> = self.connectors.iter().collect();
+        systems.sort_by_key(|(name, _)| name.as_str());
+        let mut out = Vec::with_capacity(systems.len());
+        for (name, connector) in systems {
+            let check =
+                match tokio::time::timeout(std::time::Duration::from_secs(2), connector.ready())
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err("timed out".to_string()),
+                };
+            out.push((name.clone(), connector.mode(), check));
+        }
+        out
+    }
+
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
