@@ -36,7 +36,7 @@ For Entra ID sign-in instead of `PMOS_WEB_DEV_LOGIN=1`, set `PMOS_WEB_ENTRA_TENA
 | `PMOS_BOTS_URL` | `http://127.0.0.1:8750` | |
 | `PMOS_WEB_BOTS_TOKEN` | required | The `web` entry of the runtime's `PMOS_BOTS_TOKENS`. At least 32 characters |
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | |
-| `PMOS_WEB_TOOLSERVER_TOKEN` | required | The tool server's `PMOS_WEB_TOKEN`, which reaches only the approvals routes (older deployments used `PMOS_SERVICE_TOKEN`). At least 32 characters, different from the runtime token |
+| `PMOS_WEB_TOOLSERVER_TOKEN` | required | The tool server's `PMOS_WEB_TOKEN`, which reaches only the approvals routes and the read-only admin routes (older deployments used `PMOS_SERVICE_TOKEN`). At least 32 characters, different from the runtime token |
 | `PMOS_ASSERTION_KEYS` | none | The keys pmos-web signs user assertions with: `web:bots:<kid>:<base64>` and `web:toolserver:<kid>:<base64>`, each optionally followed by `:<kid>:<base64>` for the previous key (`docs/user-assertion.md`, Keys). Without a key for an upstream, its calls carry no assertion. A malformed entry, a key under 32 bytes, or another service's pair refuses to start |
 | `PMOS_CONTENT_ROOT` | `content` | Where `team.yaml` is. The server won't start if it doesn't parse |
 | `PMOS_WEB_STATIC_DIR` | none | The built web app. Must contain `index.html`, served for any unknown non-`/api` path that isn't an asset; the icon is `favicon.svg` (or `favicon.ico`) here |
@@ -197,6 +197,21 @@ path with another method a JSON `405 method_not_allowed`.
   url, created_at?}], you_wait_on: [...]}`. At most 50 per list, `system` lower-case
   `[a-z0-9_-]`, one-line text, `url` an `http` or `https` URL without credentials, unknown
   fields refused (`422 bad_brief`); nothing is stored if anything fails.
+- **Admin and auditor** (`src/app/admin.rs`; `docs/web-api.md`, **Admin and auditor**):
+  `GET /api/admin/{audit, audit/export, team, connectors, overview}`, all read-only. pmos-web
+  checks the permission matrix first (`admin` everything; `auditor` all but connectors; else
+  `403 forbidden`, with no upstream call), then calls the tool server's
+  `GET /internal/admin/{audit, accounts, connectors, overview}?user=<viewer>`, signed for the
+  viewer, where the role is checked again and the read is audited. The audit list and export
+  re-pick each event field by field, so only metadata can reach the browser (counts of
+  sources and titles, never the titles, Slack text, drafts, prompts, results or hashes). The
+  export reads the tool server in pages of 1,000 (`purpose=export`, needing `export-audit`
+  there too), up to 10,000 rows, with `X-Pmos-Truncated` saying when more were left out, and
+  every cell quoted and formula-guarded. The team list comes from this server's `team.yaml`
+  and still shows, with `accounts: null`, when the tool server is down. Every admin read is
+  logged here (handle, route, filter names only). `GET /api/me` also gives `permissions`
+  (from `pmos_contract::permissions::granted`), so the app knows whether to show the Admin
+  area; an older client ignores it.
 
 ## Where the contract isn't met as written
 
@@ -255,7 +270,8 @@ admins control; a guest account's `preferred_username` is its home address. Logo
 the PM OS session.
 
 **This backend is still a deputy, now a narrower one.** It holds its own tool server token,
-which reaches only the approvals routes (no sessions, grants, account linking or credentials),
+which reaches only the approvals routes and the read-only admin routes (no sessions, grants,
+account linking or credentials; the admin routes check the viewer's role themselves),
 a runtime token for the `web` client, and the two keys that sign its user assertions. With the
 runtime and the tool server in `PMOS_ASSERTION_MODE=require`, the tokens alone no longer act
 for anyone: a call that names a PM needs an assertion for that PM, bound to that request and
@@ -283,8 +299,9 @@ An edit of a Slack draft is Slack text: the tool server drops the draft's own te
 hours and the edit is unreachable by then, but the row itself waits for the 7-day purge.
 
 **Not built:** rate limiting (on sign-in, on asks and on change requests); an audit record of
-web actions (the tool server audits decisions, with the `web` as the client); a per-PM limit
-on running tasks; and, for Entra ID sign-in (`docs/entra-sign-in.md`, "Not built"): roles from
+web actions (the tool server audits decisions and admin reads, with `web` as the client); a
+per-PM limit on running tasks; admin tasks-by-status counts (the runtime has no team-wide read
+for the `web` client); and, for Entra ID sign-in (`docs/entra-sign-in.md`, "Not built"): roles from
 group or app-role claims, matching by the token's `oid`, conditional access awareness, single
 logout, and token refresh (only the ID token is used, once). The deploy kit (`deploy/`) does
 not pass the `PMOS_WEB_ENTRA_*` variables to the `web` service yet.
