@@ -764,6 +764,73 @@ async fn tasks_are_listed_by_who_may_see_them() {
     env.finish().await;
 }
 
+#[tokio::test]
+async fn web_tasks_belong_to_their_pm_and_stay_off_the_slack_feed() {
+    let env = Env::memory().await;
+    let new =
+        |text: &str| json!({"bot": "docs", "requested_by": "ana", "text": text, "source": "web"});
+    let (status, task) = env
+        .post("/v1/tasks", "web", Some("ana"), new("from web"))
+        .await;
+    assert_eq!(status, 201);
+    assert_eq!(task["source"], "web");
+    assert_eq!(task["priority"], "interactive");
+    assert!(task["slack"].is_null());
+    let tid = id(&task);
+    let (_, ben) = env
+        .post(
+            "/v1/tasks",
+            "web",
+            Some("ben"),
+            json!({"bot": "docs", "requested_by": "ben", "text": "ben's", "source": "web"}),
+        )
+        .await;
+    let (_, list) = env.get("/v1/tasks", "web", Some("ana")).await;
+    let ids: Vec<String> = list.as_array().unwrap().iter().map(id).collect();
+    assert_eq!(ids, vec![tid.clone()]);
+    let (status, got) = env
+        .get(&format!("/v1/tasks/{tid}"), "web", Some("ana"))
+        .await;
+    assert_eq!((status, got["source"].clone()), (200, json!("web")));
+    // Slack's PM view of the same handle sees it too; another PM's task is a 404.
+    let (status, _) = env
+        .get(&format!("/v1/tasks/{tid}"), "slack", Some("ana"))
+        .await;
+    assert_eq!(status, 200);
+    for path in [
+        format!("/v1/tasks/{}", id(&ben)),
+        format!("/v1/tasks/{}/events", id(&ben)),
+    ] {
+        let (status, _) = env.get(&path, "web", Some("ana")).await;
+        assert_eq!(status, 404, "{path}");
+    }
+    let (status, _) = env
+        .post(
+            &format!("/v1/tasks/{}/cancel", id(&ben)),
+            "web",
+            Some("ana"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 404);
+    let (status, _) = env
+        .get(&format!("/v1/tasks/{tid}/events"), "web", Some("ana"))
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = env
+        .post(
+            &format!("/v1/tasks/{tid}/cancel"),
+            "web",
+            Some("ana"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    // Cancelling and creating a web task wrote nothing to the Slack feed.
+    assert!(env.feed().await.is_empty());
+    env.finish().await;
+}
+
 // ----- claims and the tool server ----------------------------------------------------------
 
 #[tokio::test]
@@ -1210,13 +1277,13 @@ async fn every_endpoint_checks_the_client() {
             Method::GET,
             "/v1/bots".into(),
             json!(null),
-            &["slack", "worker", "console", "evals"],
+            &["slack", "web", "worker", "console", "evals"],
         ),
         (
             Method::GET,
             "/v1/bots/docs".into(),
             json!(null),
-            &["slack", "worker", "console", "evals"],
+            &["slack", "web", "worker", "console", "evals"],
         ),
         (
             Method::POST,
@@ -1228,20 +1295,20 @@ async fn every_endpoint_checks_the_client() {
             Method::GET,
             "/v1/tasks".into(),
             json!(null),
-            &["slack", "console", "evals"],
+            &["slack", "web", "console", "evals"],
         ),
         // Evals may read tasks, but only eval tasks: this Slack one is a 404 for it.
         (
             Method::GET,
             format!("/v1/tasks/{tid}"),
             json!(null),
-            &["slack", "console", "evals"],
+            &["slack", "web", "console", "evals"],
         ),
         (
             Method::GET,
             format!("/v1/tasks/{tid}/events"),
             json!(null),
-            &["slack", "console", "evals"],
+            &["slack", "web", "console", "evals"],
         ),
         (
             Method::GET,
@@ -1301,42 +1368,42 @@ async fn every_endpoint_checks_the_client() {
             Method::POST,
             "/v1/routines/parse".into(),
             json!({"bot": "docs", "owner": "ana", "text": "t", "tz": "UTC"}),
-            &["slack"],
+            &["slack", "web"],
         ),
         (
             Method::POST,
             "/v1/routines".into(),
             json!({"draft": {}}),
-            &["slack"],
+            &["slack", "web"],
         ),
         (
             Method::GET,
             "/v1/routines".into(),
             json!(null),
-            &["slack", "console"],
+            &["slack", "web", "console"],
         ),
         (
             Method::PATCH,
             format!("/v1/routines/{rid}"),
             json!({"enabled": true}),
-            &["slack", "console"],
+            &["slack", "web", "console"],
         ),
         (
             Method::DELETE,
             format!("/v1/routines/{rid}"),
             json!(null),
-            &["slack", "console"],
+            &["slack", "web", "console"],
         ),
         (
             Method::POST,
             format!("/v1/tasks/{tid}/cancel"),
             json!({}),
-            &["slack", "console"],
+            &["slack", "web", "console"],
         ),
     ];
     for (method, path, body, allowed) in &rows {
-        for client in ["slack", "worker", "console", "evals", "none"] {
-            let user = (client == "slack").then_some("ana");
+        for client in ["slack", "web", "worker", "console", "evals", "none"] {
+            let user = matches!(client, "slack" | "web").then_some("ana");
             let mut req = env.req(method.clone(), path, client, user);
             if !body.is_null() {
                 req = req.json(body);
@@ -1403,6 +1470,29 @@ async fn every_endpoint_checks_the_client() {
         )
         .await;
     assert_eq!(status, 403, "evals creates eval tasks only");
+    // Web acts only for its PM too, and creates only `web` tasks; Slack cannot set `web`.
+    let (status, _) = env
+        .post(
+            "/v1/tasks",
+            "web",
+            Some("ben"),
+            json!({"bot": "docs", "requested_by": "ana", "text": "t", "source": "web"}),
+        )
+        .await;
+    assert_eq!(status, 403);
+    let (status, _) = env.get("/v1/tasks", "web", None).await;
+    assert_eq!(status, 403);
+    for (client, source) in [("web", "slack"), ("web", "cli"), ("slack", "web")] {
+        let (status, _) = env
+            .post(
+                "/v1/tasks",
+                client,
+                Some("ana"),
+                json!({"bot": "docs", "requested_by": "ana", "text": "t", "source": source}),
+            )
+            .await;
+        assert_eq!(status, 403, "{client} may not set source {source}");
+    }
     // Health needs no token.
     let (status, _) = env.get("/healthz", "none", None).await;
     assert_eq!(status, 200);

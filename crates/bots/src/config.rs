@@ -10,6 +10,8 @@ use std::path::PathBuf;
 pub enum ClientKind {
     /// The Slack app: acts for the PM in `X-Pmos-User`.
     Slack,
+    /// The web app's backend: the same per-PM abilities as Slack, but no notification feed.
+    Web,
     /// Harness workers, one per bot sandbox.
     Worker,
     /// The web console: reads everything, pauses routines, cancels tasks.
@@ -22,6 +24,7 @@ impl ClientKind {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "slack" => Some(Self::Slack),
+            "web" => Some(Self::Web),
             "worker" => Some(Self::Worker),
             "console" => Some(Self::Console),
             "evals" => Some(Self::Evals),
@@ -29,9 +32,15 @@ impl ClientKind {
         }
     }
 
+    /// Clients that act for the one PM named in `X-Pmos-User`.
+    pub fn is_pm(self) -> bool {
+        matches!(self, Self::Slack | Self::Web)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Slack => "slack",
+            Self::Web => "web",
             Self::Worker => "worker",
             Self::Console => "console",
             Self::Evals => "evals",
@@ -72,7 +81,7 @@ impl std::fmt::Debug for Secret {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// `PMOS_BOTS_TOKENS`: `name=token,…` with names `slack`, `worker`, `console`, `evals`.
+    /// `PMOS_BOTS_TOKENS`: `name=token,…` with names `slack`, `web`, `worker`, `console`, `evals`.
     pub clients: Vec<Client>,
     /// `PMOS_BOTS_DATABASE_URL`: required unless `PMOS_DEV=1` (in memory).
     pub database_url: Option<Secret>,
@@ -150,7 +159,7 @@ pub fn parse_clients(spec: &str) -> Result<Vec<Client>, String> {
             _ => (
                 ClientKind::parse(name).ok_or_else(|| {
                     format!(
-                        "PMOS_BOTS_TOKENS: unknown client `{name}`; the clients are slack, worker-<bot>, worker, console and evals"
+                        "PMOS_BOTS_TOKENS: unknown client `{name}`; the clients are slack, web, worker-<bot>, worker, console and evals"
                     )
                 })?,
                 None,

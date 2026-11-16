@@ -30,6 +30,7 @@ use sqlx::Connection;
 use tokio_util::sync::CancellationToken;
 
 pub const SLACK: &str = "slack-token-0123456789abcdef0123456789";
+pub const WEB: &str = "web-token-0123456789abcdef0123456789abc";
 pub const WORKER: &str = "worker-token-0123456789abcdef012345678";
 /// The Docs bot's own worker token (`worker-docs`): it serves only `docs`.
 pub const DOCS_WORKER: &str = "docs-worker-token-0123456789abcdef0123";
@@ -40,7 +41,7 @@ pub const GATEWAY: &str = "gateway-token-0123456789abcdef0123456";
 
 pub fn clients() -> Vec<Client> {
     parse_clients(&format!(
-        "slack={SLACK},worker={WORKER},worker-docs={DOCS_WORKER},console={CONSOLE},evals={EVALS}"
+        "slack={SLACK},web={WEB},worker={WORKER},worker-docs={DOCS_WORKER},console={CONSOLE},evals={EVALS}"
     ))
     .unwrap()
 }
@@ -466,7 +467,7 @@ impl Env {
         }
     }
 
-    /// A request as `client` (`slack`, `worker`, `console`, `evals`, or anything else for
+    /// A request as `client` (`slack`, `web`, `worker`, `console`, `evals`, or anything else for
     /// no token), with `X-Pmos-User` for Slack.
     pub fn req(
         &self,
@@ -478,6 +479,7 @@ impl Env {
         let mut r = self.http.request(method, format!("{}{path}", self.base));
         let token = match client {
             "slack" => Some(SLACK),
+            "web" => Some(WEB),
             "worker" => Some(WORKER),
             "worker-docs" => Some(DOCS_WORKER),
             "console" => Some(CONSOLE),
