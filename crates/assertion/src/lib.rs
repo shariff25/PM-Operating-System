@@ -22,6 +22,7 @@
 //! ```
 
 mod fields;
+mod key_list;
 mod keys;
 mod replay;
 mod wire;
@@ -32,6 +33,7 @@ mod tests;
 pub use fields::{
     Claims, FieldError, RequestBinding, MAX_METHOD_LEN, MAX_NAME_LEN, MAX_PATH_LEN, MAX_SESSION_LEN,
 };
+pub use key_list::{parse_key_list, KeyList, KeyUse, KEYS_VAR};
 pub use keys::{
     unix_now, Key, KeyError, KeyRing, PolicyError, SignError, VerifyError, VerifyPolicy,
     DEFAULT_CLOCK_SKEW_SECS, MAX_CLOCK_SKEW_SECS, MAX_KEY_LEN, MIN_KEY_LEN,
