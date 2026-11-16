@@ -15,7 +15,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { type BaseMessage, HumanMessage } from "@langchain/core/messages";
+import { AIMessage, type BaseMessage, HumanMessage } from "@langchain/core/messages";
 import { MODEL_ALIASES, type ModelRole, createPmosAgent, gatewayModel } from "./agent.js";
 import { connectMcpTools, type McpToolSet } from "./mcp-tools.js";
 import { FIRST_MILESTONE, Progress, TaskTracer } from "./progress.js";
@@ -27,6 +27,7 @@ import {
   RuntimeError,
   type TaskEvent,
   type TraceEntry,
+  type Turn,
 } from "./runtime-client.js";
 
 export type LogLevel = "info" | "warn" | "error";
@@ -134,7 +135,46 @@ export function botSystemPrompt(claim: Claim, now: Date = new Date()): string {
       'answers `"status": "pending_approval"`: that means it has not happened yet. Do not ' +
       "retry it, and in your answer say plainly what is waiting for approval.",
   );
+  if (claim.history.length > 0) {
+    parts.push(
+      "## This conversation\n\n" +
+        "The messages before the last one are this conversation's earlier turns, oldest first; " +
+        "the last message is the new request. A short reply is an answer to your last question.",
+    );
+  }
   return parts.filter(Boolean).join("\n\n");
+}
+
+/** Ids of the messages that replay earlier turns, so the final answer is never one of them. */
+const HISTORY_ID = "pmos-history-";
+
+/** What the bot said in an earlier turn: its answer, or what became of the request. */
+function turnReply(turn: Turn): string {
+  if (turn.result?.trim()) {
+    return turn.result;
+  }
+  if (turn.status === "failed") {
+    const why = turn.error?.trim().replace(/\.$/, "");
+    return `(This request failed${why ? `: ${why}` : ""}.)`;
+  }
+  if (turn.status === "cancelled") {
+    return "(This request was cancelled before I answered.)";
+  }
+  return "(No answer was recorded.)";
+}
+
+/**
+ * The model's messages for a task: each earlier turn of the conversation as the PM's message
+ * and the bot's reply, oldest first, then the new request last.
+ */
+export function taskMessages(claim: Claim): BaseMessage[] {
+  const messages: BaseMessage[] = [];
+  claim.history.forEach((turn, i) => {
+    messages.push(new HumanMessage({ content: turn.text, id: `${HISTORY_ID}${i}-user` }));
+    messages.push(new AIMessage({ content: turnReply(turn), id: `${HISTORY_ID}${i}-bot` }));
+  });
+  messages.push(new HumanMessage(claim.task.text));
+  return messages;
 }
 
 function textOf(content: BaseMessage["content"]): string {
@@ -150,11 +190,11 @@ function textOf(content: BaseMessage["content"]): string {
     .join("");
 }
 
-/** The final answer: the last AI message with text. */
+/** The final answer: the last AI message with text, never a replayed earlier turn. */
 export function finalAnswer(messages: BaseMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
-    if (message?.getType() === "ai") {
+    if (message?.getType() === "ai" && !message.id?.startsWith(HISTORY_ID)) {
       const text = textOf(message.content).trim();
       if (text) {
         return text;
@@ -401,7 +441,7 @@ export function createWorker(config: WorkerConfig): Worker {
       });
       const tracer = new TaskTracer((entry) => reporter.trace(entry), progress, toolKind);
       const result = await raceAbort(
-        agent.invoke({ messages: [new HumanMessage(task.text)] }, { signal, callbacks: [tracer], recursionLimit: maxSteps }),
+        agent.invoke({ messages: taskMessages(claim) }, { signal, callbacks: [tracer], recursionLimit: maxSteps }),
         signal,
       );
       const answer = finalAnswer(result.messages);
