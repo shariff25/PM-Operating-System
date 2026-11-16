@@ -6,7 +6,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use pmos_toolserver::audit::{AuditEvent, AuditSink, MemoryAudit, ReadEvent};
+use pmos_toolserver::audit::{
+    AuditEvent, AuditQuery, AuditSink, MemoryAudit, Outcome, ReadEvent, StoredEvent,
+};
 use pmos_toolserver::catalog::Catalog;
 use pmos_toolserver::connectors::fake::FakeConnector;
 use pmos_toolserver::connectors::Connector;
@@ -103,6 +105,17 @@ impl AuditSink for SwitchAudit {
         limit: usize,
     ) -> StoreResult<Option<Vec<ReadEvent>>> {
         self.inner.reads(user, run_id, until, limit).await
+    }
+
+    async fn search(&self, query: &AuditQuery) -> StoreResult<Option<Vec<StoredEvent>>> {
+        self.inner.search(query).await
+    }
+
+    async fn count_outcomes(
+        &self,
+        since: DateTime<Utc>,
+    ) -> StoreResult<Option<std::collections::BTreeMap<Outcome, u64>>> {
+        self.inner.count_outcomes(since).await
     }
 }
 
@@ -213,6 +226,43 @@ pub async fn reply_fixture(postgres: bool) -> Option<(Fixture, Option<TestPg>)> 
             audit.clone(),
         ]));
         let f = build_with(dir, root, stores, audit, Some(team));
+        Some((f, Some(pg)))
+    } else {
+        let (stores, audit) = Stores::in_memory(&root);
+        Some((build_with(dir, root, stores, audit, Some(team)), None))
+    }
+}
+
+/// `team.yaml` enforced with `members` and their roles; every store in memory, or with
+/// `postgres` in Postgres (`None` when no test database is set). The audit log is read back
+/// from the backend under test.
+pub async fn roles_fixture(
+    members: &[(&str, pmos_contract::model::Role)],
+    postgres: bool,
+) -> Option<(Fixture, Option<TestPg>)> {
+    let (dir, root) = content_tree();
+    let team = pmos_toolserver::team::Team::of(
+        members
+            .iter()
+            .map(|(handle, role)| pmos_contract::model::TeamMember {
+                handle: handle.to_string(),
+                slack_id: "U0TEST".into(),
+                email: None,
+                github: None,
+                roles: vec![role.clone()],
+            })
+            .collect(),
+    );
+    if postgres {
+        let pg = TestPg::new().await?;
+        pg.store.reindex(&load_docs(&root)).await.expect("reindex");
+        let f = build_with(
+            dir,
+            root,
+            pg.store.stores(),
+            Arc::new(MemoryAudit::default()),
+            Some(team),
+        );
         Some((f, Some(pg)))
     } else {
         let (stores, audit) = Stores::in_memory(&root);

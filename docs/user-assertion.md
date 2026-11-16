@@ -280,7 +280,9 @@ mode.
   sent, a fresh assertion per call, next to the existing `X-Pmos-User` and `decided_by`. Roles
   come from `team.yaml` and `sid` is the fixed `unknown` (its upstream layer gets the handle,
   not the session). It calls the tool server with its own token (`PMOS_WEB_TOKEN` there), which
-  reaches only the approvals routes.
+  reaches only the approvals routes and the read-only admin routes (`GET /internal/admin/*`:
+  the audit log, which accounts members have linked as booleans, connector status, overview
+  counts). Each admin call names the viewer (`user=`) and is signed as them.
 - **The console** signs every call that names a person, as that person: one PM's tasks
   (`requested_by=`), routines (`owner=`) and pending approvals (`user=`). Reads of everything
   and routine pause, resume and delete name no one and carry none. Its upstream layer doesn't
@@ -293,7 +295,9 @@ mode.
   still apply on top, so a body naming someone else is `403`.
 - **The tool server** checks calls with the web and console tokens on the approvals routes. The
   subject must equal `user=` and `decided_by`; one item read with an assertion must be the
-  subject's (`404` otherwise). Decisions still check the item's user and `team.yaml`.
+  subject's (`404` otherwise). Decisions still check the item's user and `team.yaml`. On the
+  admin routes (web token only) the subject must equal `user=`, the viewer, whose role the tool
+  server then checks in its own `team.yaml` (`403 forbidden` without it).
 - **Every failure** is the same `401 {"code": "bad_assertion"}`. The log has the client and the
   kind of failure (`missing`, `bad signature`, `expired`, `replayed`, `subject is not the person
   the request names`, …), never the assertion, a key or a handle.
@@ -306,8 +310,11 @@ mode.
 - A stolen or leaked runtime or tool-server token, without the key, acts for no one: every call
   that names a person needs an assertion.
 - `pmos-web` and the console no longer hold the tool server's service token. Their own tokens
-  reach only the four approvals routes, so they cannot start sessions, record grants, link or
-  list accounts, or reindex, whatever happens to them.
+  reach only the four approvals routes (and, for `pmos-web`, the four read-only admin routes,
+  which serve audit metadata and booleans, never a credential), so they cannot start sessions,
+  record grants, link or list accounts' credentials, or reindex, whatever happens to them.
+  `crates/toolserver/tests/admin_routes.rs` checks that the web token still gets `403` on every
+  other route.
 - A captured assertion (a log, a proxy) is good for one identical request, once, within about
   65 seconds, at one audience.
 - One caller cannot speak for the other: the web key does not verify as `console`, and the
@@ -415,9 +422,9 @@ Roll out in this order: shared pieces, then callers sending, then receivers enfo
 - [ ] Routes that name a person: `user=` on `/internal/approvals`, `/internal/credentials`,
       `/internal/memory/repo`, `/internal/onboarding` and `/internal/oauth/*/start`, and
       `decided_by` on the approval and member decisions. The named person must equal
-      `assertion.subject()`. *Done for the approvals routes,* the only ones `pmos-web` and the
-      console call; their tokens reach no other route. The rest stay on the service and bot
-      tokens.
+      `assertion.subject()`. *Done for the approvals routes and the read-only admin routes
+      (`/internal/admin/*`, web token only),* the only ones `pmos-web` and the console call;
+      their tokens reach no other route. The rest stay on the service and bot tokens.
 - [x] Admin-only decisions still check `admin` in `team.yaml`, not the assertion's roles.
 - [x] Service-token calls that act for no person (the orchestrator, the runtime's own session
       creation and approval polling) send no assertion and are unchanged.

@@ -16,7 +16,10 @@
 //!   - `PMOS_WEB_TOKEN`, `PMOS_CONSOLE_TOKEN`: `pmos-web` and the console, which act for a
 //!     signed-in person. Only the approvals routes (list, read, sources, decision), and
 //!     with `PMOS_ASSERTION_MODE` the person they name must match a signed user assertion
-//!     (`crate::assertion`, `docs/user-assertion.md`).
+//!     (`crate::assertion`, `docs/user-assertion.md`). `PMOS_WEB_TOKEN` also reaches the
+//!     read-only admin and auditor routes (`GET /internal/admin/*`, `app/admin.rs`), which
+//!     check the named viewer's role themselves; never sessions, grants, calls, account
+//!     linking or credentials.
 //!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
@@ -54,6 +57,8 @@ use crate::session::BOT_IDENTITY_PREFIX;
 use crate::store::StoreError;
 use crate::vault::Provider;
 use pmos_contract::bots::BotScope;
+
+mod admin;
 
 /// What the Slack bot's token may do.
 #[derive(Clone, Debug)]
@@ -228,7 +233,10 @@ pub fn router_full(
             state.clone(),
             identify_approvals_client,
         ));
-    let internal = internal.merge(approvals);
+    // The admin and auditor reads (`admin.rs`): the orchestrator and pmos-web only.
+    let internal = internal
+        .merge(approvals)
+        .merge(admin::routes(state.clone()));
 
     Router::new()
         // Liveness: the process answers. Readiness: its dependencies do too.
