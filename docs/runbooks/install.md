@@ -44,8 +44,21 @@ deploy/setup.sh --content /srv/pmos/content-repo --clone <the content repo> --st
    `PMOS_DOCS_PRODUCTS`) in `deploy/.env`. The site must publish `llms.txt` and markdown
    pages: see "Pointing the Docs bot at your docs" in `docs/docs-server.md`. You can leave it
    blank and add it later; until then the Docs bot says no docs site is configured.
-5. **Save the settings.** Copy `deploy/.env` into the team password manager now. It holds the
-   vault key; without it, stored tokens can't be read.
+5. **The console (optional).** `deploy/setup.sh` generates `PMOS_CONSOLE_PROXY_SECRET` in
+   `deploy/.env`. Its only use is the proxy, so if the console sits behind the Spark's sign-in
+   proxy, do both of these:
+   - set `PMOS_CONSOLE_TRUST_PROXY=1` in `deploy/.env`, after the secret is there (the console
+     won't start with trust on and no secret);
+   - configure the proxy to strip `X-Forwarded-User` and `X-Pmos-Proxy-Secret` from the
+     browser's request, then set `X-Pmos-Proxy-Secret` itself to the same value. The Caddy
+     example is in `docs/console.md`, under "Sign-in". Check it with a request that sends its
+     own headers: neither may reach the console.
+
+   **Existing installs:** run `deploy/setup.sh` again with the same arguments as above. It only
+   fills in missing values, so it adds the secret and leaves the rest alone. Then restart with
+   `deploy/pmos-admin up --models`, and set up the proxy as above before you turn trust on.
+6. **Save the settings.** Copy `deploy/.env` into the team password manager now. It holds the
+   vault key and the console proxy secret; without the vault key, stored tokens can't be read.
 
 ## Stage 2: First start, without models or Slack
 
@@ -184,3 +197,9 @@ Gate 1 is passed when:
 - the benchmarks have met their bar two weeks in a row;
 - every task in the load test finishes;
 - a restore has been done from this runbook.
+
+## Optional: the web app
+
+The web app is **off by default**. Turn it on only for a closed test network: development
+sign-in lets anyone who can reach its port sign in as any member. See
+[docs/web-app-running.md](../web-app-running.md) before you start it.
