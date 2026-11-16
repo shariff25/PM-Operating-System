@@ -20,7 +20,13 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
 - **Who you are:** the signed-in handle must be a member in `team.yaml`. Roles come from there.
 - **Errors:** `{"code": "<snake_case>", "error": "<plain sentence for the person>"}`.
   `404 not_found` is also the answer for someone else's draft or task, so the app never
-  confirms that it exists.
+  confirms that it exists. Any unknown path under `/api` is a JSON `404 not_found`, never
+  the app's `index.html`; a known path with a method it doesn't take is
+  `405 method_not_allowed`.
+- **The app's icon** is a file, `/favicon.svg` (or `/favicon.ico`) in the built app's
+  directory, linked with `<link rel="icon" href="/favicon.svg" type="image/svg+xml">`: the
+  content security policy allows no `data:` images. It is served as `image/svg+xml` with a
+  week's cache. A missing file with an asset extension is a `404`, not the app's page.
 
 | Method and path | Body | Answer |
 | --- | --- | --- |
@@ -75,8 +81,8 @@ document.
  "sources": [Source], "result_url": null, "external": false, "version": "7"}
 
 // Source
-{"id": "s1", "system": "docs", "title": "TCB grace period", "url": "https://… or null",
- "excerpt": "one or two sentences, or null"}
+{"id": "s1", "system": "jira", "title": "PAY-212: TCB grace period", "url": "https://… or null",
+ "excerpt": null}
 
 // Suggestion
 {"status": "working", "instruction": "shorten the risks section", "body": null, "error": null}
@@ -98,7 +104,17 @@ document.
 - **A practice draft** (`practice: true`) lives only in `pmos-web`. Approving it creates
   nothing anywhere: it becomes `approved` with `result_url: null`.
 - **Sources** are what the bot read for the task that made the draft. When the runtime cannot
-  say, `sources` is empty and the app says so.
+  say, `sources` is empty and the app says so. `title` is the item's own title where PM OS
+  recorded one at the read: `PAY-212: TCB grace period` for a Jira issue, the page title for
+  Confluence and the docs, the file's title for the context library. Slack sources are
+  always `Slack thread in C01` or `Slack message in C01` (Slack text is kept at most 24
+  hours, so no title is recorded), and reads from before titles were recorded show the id
+  (`PAY-212`, `Confluence page 12345`). `excerpt` is always `null`: no source text is kept.
+  `url` may be `null`.
+- **`body`** is shown as the bot wrote it, except that a body written entirely on one line
+  with the characters `\n` where line breaks belong is shown with real line breaks (and
+  `\t` as tabs). That repair is for display only: approving without an edit sends the bot's
+  own text. Saving an edit (`PUT`) makes what the PM saw the text that is sent.
 
 ## Asking
 
@@ -111,12 +127,26 @@ document.
 ```json
 {"id": "tsk_…", "bot": "pm-ana", "text": "…", "status": "working",
  "result": null, "error": null, "draft_ids": [], "created_at": "…", "updated_at": "…",
- "events": [{"at": "…", "kind": "milestone", "text": "Reading Jira"}]}
+ "progress": {"done": 2, "total": 3}, "retrying": false,
+ "events": [{"at": "…", "kind": "milestone", "text": "Reading Jira"},
+            {"at": "…", "kind": "milestone", "text": "Drafting in Confluence"}]}
 ```
 
 `status` is `queued`, `working`, `needs_approval`, `done`, `failed` or `cancelled`. A failed
 task carries a plain sentence in `error`. The app polls `GET /api/tasks/{id}` every two
 seconds until the task settles.
+
+- `events` are the human-readable steps only: every event is `kind: "milestone"`, in order,
+  each text once (its first time). The runtime's bookkeeping ("queued", "claimed by worker
+  …", "started on …", "2 of 3 done") is never passed on, so no worker or host name reaches
+  the app. Show them as a list of steps; there is nothing else to filter.
+- `progress` is `{done, total}` from the bot's latest checklist, or `null` when it has none
+  (most short tasks). Show it as "2 of 3 done" or a bar; don't show `0 of 0`.
+- `retrying` is true while the task is queued or working again after the runtime retried it
+  (a restart interrupted it). The app may say "Retrying after an interruption". Nothing
+  else is signalled today: the model gateway's own short retries are invisible here.
+- In `GET /api/tasks`, each task has `progress` and `retrying` (from the task alone) but no
+  `events`.
 
 ## The daily brief and follow-ups
 

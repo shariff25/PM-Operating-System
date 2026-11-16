@@ -157,11 +157,17 @@ async fn runtime(
             Some(t) => Json(t).into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
         },
-        ("GET", ["v1", "tasks", _, "events"]) => Json(json!([
-            {"at": "2026-11-14T09:00:01Z", "kind": "milestone", "text": "Reading Jira"},
-            {"at": "2026-11-14T09:00:02Z", "kind": "checklist", "text": ""},
-        ]))
-        .into_response(),
+        // A task's own `_events` when a test set them, else two.
+        ("GET", ["v1", "tasks", id, "events"]) => {
+            match up.find(id).and_then(|t| t.get("_events").cloned()) {
+                Some(events) => Json(events).into_response(),
+                None => Json(json!([
+                    {"at": "2026-11-14T09:00:01Z", "kind": "milestone", "text": "Reading Jira"},
+                    {"at": "2026-11-14T09:00:02Z", "kind": "checklist", "text": ""},
+                ]))
+                .into_response(),
+            }
+        }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -660,6 +666,85 @@ async fn serves_the_app_and_its_index_for_unknown_paths() {
     assert_eq!(res.json::<Value>().await.unwrap()["code"], "not_found");
     let res = http.get(format!("{base}/healthz")).send().await.unwrap();
     assert_eq!(res.text().await.unwrap(), "ok");
+}
+
+#[tokio::test]
+async fn serves_the_icon_and_never_the_app_for_api_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config("http://127.0.0.1:1", "http://127.0.0.1:2", dir.path());
+    cfg.static_dir = Some(dir.path().join("dist"));
+    std::fs::create_dir_all(dir.path().join("dist/assets")).unwrap();
+    std::fs::write(dir.path().join("dist/index.html"), "<!doctype html>app").unwrap();
+    let icon = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"/>"#;
+    std::fs::write(dir.path().join("dist/favicon.svg"), icon).unwrap();
+    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
+    let (base, _stop) = serve(pmos_web::build(cfg, Deps::in_memory()).unwrap()).await;
+    let http = reqwest::Client::new();
+
+    let res = http
+        .get(format!("{base}/favicon.svg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "image/svg+xml");
+    assert_eq!(res.headers()["cache-control"], "public, max-age=604800");
+    assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+    assert!(res.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("img-src 'self'"));
+    assert_eq!(res.text().await.unwrap(), icon);
+    // A missing icon or script is a 404, not the app's page.
+    for path in ["/favicon.ico", "/assets/missing.js"] {
+        let res = http.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_ne!(res.text().await.unwrap(), "<!doctype html>app", "{path}");
+    }
+    // A client route still gets the app.
+    let res = http
+        .get(format!("{base}/tasks/tsk_1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.text().await.unwrap(), "<!doctype html>app");
+
+    // Under /api, anything unknown is JSON, never index.html, whatever the method.
+    for (method, path) in [
+        (Method::GET, "/api"),
+        (Method::GET, "/api/"),
+        (Method::GET, "/api/nope/deeper"),
+        (Method::GET, "/api/favicon.svg"),
+        (Method::GET, "/api/index.html"),
+        (Method::POST, "/api/nope"),
+        (Method::DELETE, "/api/drafts/apr_1/nope"),
+    ] {
+        let res = http
+            .request(method.clone(), format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        assert_eq!(res.headers()["content-type"], "application/json");
+        assert_eq!(res.headers()["cache-control"], "no-store");
+        assert_eq!(
+            res.json::<Value>().await.unwrap()["code"],
+            "not_found",
+            "{method} {path}"
+        );
+    }
+    // A known route with a method it doesn't take: JSON too.
+    let res = http
+        .request(Method::PATCH, format!("{base}/api/me"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(res.headers()["content-type"], "application/json");
+    assert_eq!(
+        res.json::<Value>().await.unwrap()["code"],
+        "method_not_allowed"
+    );
 }
 
 // Sessions.
@@ -1493,6 +1578,149 @@ async fn tasks_go_to_the_personal_bot_as_the_pm() {
     assert_eq!(r.status, StatusCode::NOT_FOUND);
     assert_eq!(r.code(), "not_found");
     assert_eq!(w.get(&b, "/api/tasks/tsk_nope").await.code(), "not_found");
+}
+
+#[tokio::test]
+async fn a_task_shows_its_milestones_progress_and_retry_but_no_worker() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    let t = w.get(&b, "/api/tasks/tsk_ana1").await.body;
+    assert_eq!(t["progress"], Value::Null, "no checklist");
+    assert_eq!(t["retrying"], false);
+
+    // What the real run sent: bookkeeping, checklists and milestones, some twice.
+    w.runtime.set("tsk_ana1", "status", json!("working"));
+    w.runtime.set(
+        "tsk_ana1",
+        "_events",
+        json!([
+            {"at": "2026-11-16T10:00:00Z", "kind": "status", "text": "queued"},
+            {"at": "2026-11-16T10:00:01Z", "kind": "status", "text": "claimed by worker vm-16344"},
+            {"at": "2026-11-16T10:00:02Z", "kind": "status", "text": "started on vm-16344"},
+            {"at": "2026-11-16T10:00:03Z", "kind": "milestone", "text": "Working on it"},
+            {"at": "2026-11-16T10:00:04Z", "kind": "checklist", "text": "0 of 1 done"},
+            {"at": "2026-11-16T10:00:05Z", "kind": "milestone", "text": "Reading Jira"},
+            {"at": "2026-11-16T10:00:06Z", "kind": "milestone", "text": "Reading Jira"},
+            {"at": "2026-11-16T10:00:07Z", "kind": "checklist", "text": "2 of 3 done"},
+            {"at": "2026-11-16T10:00:08Z", "kind": "milestone", "text": "Drafting in Confluence"},
+        ]),
+    );
+    let r = w.get(&b, "/api/tasks/tsk_ana1").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(
+        r.body["events"],
+        json!([
+            {"at": "2026-11-16T10:00:03Z", "kind": "milestone", "text": "Working on it"},
+            {"at": "2026-11-16T10:00:05Z", "kind": "milestone", "text": "Reading Jira"},
+            {"at": "2026-11-16T10:00:08Z", "kind": "milestone", "text": "Drafting in Confluence"},
+        ])
+    );
+    assert_eq!(r.body["progress"], json!({"done": 2, "total": 3}));
+    assert_eq!(r.body["retrying"], false);
+    let text = r.body.to_string();
+    assert!(
+        !text.contains("vm-16344") && !text.contains("claimed"),
+        "{text}"
+    );
+
+    // The task's own checklist wins over the event text; a retried task says so while it
+    // runs, in the list too.
+    w.runtime.set(
+        "tsk_ana1",
+        "checklist",
+        json!([{"item": "Search", "done": true}, {"item": "Draft", "done": false}]),
+    );
+    w.runtime.set("tsk_ana1", "attempts", json!(2));
+    let r = w.get(&b, "/api/tasks/tsk_ana1").await;
+    assert_eq!(r.body["progress"], json!({"done": 1, "total": 2}));
+    assert_eq!(r.body["retrying"], true);
+    let list = w.get(&b, "/api/tasks").await.body;
+    let listed = list["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "tsk_ana1")
+        .unwrap();
+    assert_eq!(listed["progress"], json!({"done": 1, "total": 2}));
+    assert_eq!(listed["retrying"], true);
+    assert!(listed.get("events").is_none());
+
+    // Requeued after a restart, before a worker claims it again: the runtime's event says so.
+    w.runtime.set("tsk_ana1", "status", json!("queued"));
+    w.runtime.set("tsk_ana1", "attempts", json!(1));
+    w.runtime.set(
+        "tsk_ana1",
+        "_events",
+        json!([{"at": "2026-11-16T10:00:09Z", "kind": "status",
+                "text": "interrupted by a restart; retrying"}]),
+    );
+    let r = w.get(&b, "/api/tasks/tsk_ana1").await;
+    assert_eq!(r.body["retrying"], true);
+    assert_eq!(r.body["events"], json!([]));
+    // Settled: no longer retrying.
+    w.runtime.set("tsk_ana1", "status", json!("done"));
+    assert_eq!(
+        w.get(&b, "/api/tasks/tsk_ana1").await.body["retrying"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn a_one_line_body_with_escaped_line_breaks_reads_as_lines_but_sends_as_drafted() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    let raw = r"We ship the grace period in 4.2 after the launch.\n\nSource: PM-101";
+    let args = json!({"space": "PM", "title": "PRD", "body": raw, "parent_id": "77"});
+    w.tools.set("apr_conf", "args", args.clone());
+    let d = w.get(&b, "/api/drafts/apr_conf").await.body;
+    assert_eq!(
+        d["body"],
+        "We ship the grace period in 4.2 after the launch.\n\nSource: PM-101"
+    );
+    assert_eq!(d["edited"], false);
+    // An approve of what the PM saw, without an edit, sends the bot's own text.
+    let r = w
+        .post(
+            &b,
+            "/api/drafts/apr_conf/approve",
+            json!({"version": d["version"]}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(
+        w.tools.writes()[0].body,
+        json!({"decided_by": "ana", "decision": "approve"})
+    );
+
+    // With an edit saved, the edit (the text the PM saw) is what is sent.
+    w.tools.set(
+        "apr_jira",
+        "args",
+        json!({"project": "PAY", "issue_type": "Story", "summary": "Grace", "description": raw}),
+    );
+    let d = w.get(&b, "/api/drafts/apr_jira").await.body;
+    let shown = d["body"].as_str().unwrap().to_string();
+    assert!(shown.contains("\n\nSource") && !shown.contains(r"\n"));
+    let r = w
+        .send(
+            &b,
+            Method::PUT,
+            "/api/drafts/apr_jira",
+            Some(json!({ "body": shown })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let r = w
+        .post(
+            &b,
+            "/api/drafts/apr_jira/approve",
+            json!({"version": r.body["version"]}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let sent = &w.tools.writes()[1].body;
+    assert_eq!(sent["decision"], "edit");
+    assert_eq!(sent["args"]["description"], json!(shown));
 }
 
 #[tokio::test]

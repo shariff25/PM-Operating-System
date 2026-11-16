@@ -8,6 +8,8 @@
 //!   practice drafts). In memory for now.
 //! - [`upstream`]: the bot runtime (client `web`) and the tool server (approvals).
 //! - [`drafts`]: approval items shown as drafts.
+//! - [`progress`]: a task's runtime events as the app shows them (milestones, progress,
+//!   retrying).
 //! - [`app`]: the router and the `/api` handlers.
 //!
 //! Security notes, and what is not built, are in `crates/web/README.md`.
@@ -16,6 +18,7 @@ pub mod app;
 pub mod auth;
 pub mod config;
 pub mod drafts;
+pub mod progress;
 pub mod session;
 pub mod settings;
 pub mod upstream;
