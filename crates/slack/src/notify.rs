@@ -8,6 +8,9 @@
 //! - **Failure:** the stated reason, as a new message.
 //! - **Approvals (D7):** a card per pending item, from the tool server. A new or closed
 //!   approval also refreshes the PM's App Home if they have opened it (`home.rs`).
+//! - **The daily brief's block:** a ` ```pmos-brief ` block is taken out of every answer
+//!   before it is posted, and on `"done"`, when it came from the requester's own personal bot,
+//!   it is sent to pmos-web in the background (`brief_feed.rs`), if that is configured.
 //! - **Restarts:** the cursor is saved to `<state dir>/notifications.cursor` after each batch,
 //!   so a restart doesn't post anything twice. With no saved cursor (the first start), items
 //!   older than an hour are skipped rather than flooding the PMs' DMs.
@@ -21,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::blocks::escape;
 use crate::bots::{Bots, DEFAULT_BOT};
 use crate::bounded::Bounded;
+use crate::brief_feed::{self, Producer};
 use crate::cards::{self, Stage};
 use crate::slackapi::Posted;
 use crate::toolserver::CallError;
@@ -46,6 +50,7 @@ pub struct Notifier {
     pub max_age_on_first_start: Duration,
     tasks: Bounded<String, TaskThread>,
     seen: Bounded<String, ()>,
+    brief_feed: Option<Producer>,
 }
 
 impl Notifier {
@@ -57,7 +62,15 @@ impl Notifier {
             max_age_on_first_start: Duration::from_secs(3600),
             tasks: Bounded::new(1000),
             seen: Bounded::new(5000),
+            brief_feed: None,
         }
+    }
+
+    /// Send each brief's block to pmos-web (`brief_feed.rs`). `None`, the default: the block
+    /// is still taken out of the brief, and nothing is sent.
+    pub fn with_brief_feed(mut self, producer: Option<Producer>) -> Self {
+        self.brief_feed = producer;
+        self
     }
 
     /// Poll until `shutdown`. Errors back off (1 s doubling to 30 s) and never end the loop.
@@ -166,12 +179,20 @@ impl Notifier {
             self.tasks.insert(task_id.clone(), place);
         }
         let username = self.bots.display_name(&bot).await;
-        let text = item["text"].as_str().unwrap_or_default().to_string();
+        // The brief's machine-readable block is for the web app, never for the PM to read.
+        let split = brief_feed::split(
+            item["text"].as_str().unwrap_or_default(),
+            chrono::Utc::now(),
+        );
+        let text = split.text;
         match item["kind"].as_str().unwrap_or_default() {
             "milestone" => self.milestone(&task_id, &bot, &username, &text).await,
             "done" => {
                 // A delivered daily brief is that day's one message from PM OS.
                 crate::brief::note_delivery(&self.bots, item).await;
+                if let Some(block) = split.block {
+                    self.feed_brief(item, &bot, block);
+                }
                 self.finish_progress(&task_id, Stage::Done).await;
                 if !text.trim().is_empty() {
                     self.say(&task_id, &bot, &username, cards::answer(&text))
@@ -229,6 +250,35 @@ impl Notifier {
             }
             other => tracing::warn!(kind = other, "unknown notification kind; ignored"),
         }
+    }
+
+    /// A finished brief's block, to pmos-web, in the background: only for a team member's
+    /// own personal bot, and only when it is well formed. Never holds up the brief.
+    fn feed_brief(&self, item: &Value, bot: &str, block: Result<brief_feed::Payload, String>) {
+        let handle = item["requested_by"].as_str().unwrap_or_default();
+        if handle.is_empty()
+            || bot != pmos_contract::onboarding::personal_bot_name(handle)
+            || self.bots.team().by_handle(handle).is_none()
+        {
+            tracing::warn!(bot, "a brief block not from a member's own bot; not sent");
+            return;
+        }
+        let payload = match block {
+            Ok(p) => p,
+            Err(why) => {
+                tracing::warn!(
+                    user = handle,
+                    why,
+                    "the brief's block is malformed; not sent"
+                );
+                return;
+            }
+        };
+        let Some(producer) = self.brief_feed.clone() else {
+            return;
+        };
+        let handle = handle.to_string();
+        tokio::spawn(async move { producer.deliver(&handle, &payload).await });
     }
 
     /// Republish the requester's App Home, if they have it open; best effort.

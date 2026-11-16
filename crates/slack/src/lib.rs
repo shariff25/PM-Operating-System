@@ -24,6 +24,8 @@
 //! - **Tagging PM OS in a channel** (`docs/slack-mentions-and-home-spec.md` §2): `@PM OS …`
 //!   in a thread starts a task for the PM's personal bot, answered in their DM; the thread
 //!   gets one line only they see (`mention.rs`).
+//! - **The daily brief** (`docs/daily-brief.md`): `brief me at 8` and friends (`brief.rs`);
+//!   each brief's items also go to the web app's home page (`brief_feed.rs`).
 //! - **The App Home** (same spec, §4): Inbox, Skills and Accounts (`home.rs`).
 //! - **`/docs`:** search the company's public docs from any conversation, with results only
 //!   the asker can see, through the tool server's `docs` skill.
@@ -36,6 +38,7 @@ pub mod blocks;
 pub mod bots;
 pub mod bounded;
 pub mod brief;
+pub mod brief_feed;
 pub mod cards;
 pub mod commands;
 pub mod home;
