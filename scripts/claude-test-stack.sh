@@ -58,6 +58,11 @@ cd "$ROOT"
 STATE="${PMOS_TEST_STATE:-state/claude-test}"
 mkdir -p "$STATE/logs" "$STATE/slack"
 STATE="$(cd "$STATE" && pwd)"
+# The runtime keeps its notification ids in memory, so every start numbers them from 1 again. A
+# cursor left by the previous run would then sit ahead of every new id, and the Slack service
+# would skip each reply until the ids passed it. This script always runs the in-memory stores,
+# so the cursor is dropped at each start.
+rm -f "$STATE/slack/notifications.cursor"
 
 echo "== building"
 cargo build -q -p pmos -p pmos-docs -p pmos-toolserver -p pmos-gateway -p pmos-bots -p pmos-slack

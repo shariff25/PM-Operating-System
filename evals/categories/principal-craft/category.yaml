@@ -19,10 +19,16 @@
 # sections are there, and the investment case carries the payback stats.cashflow returns.
 # Whether the thinking is good is for the advisory judge business-effect-as-range
 # (evals/judges/) and for people. Replace the tasks with case cards (evals/case-card.md) as
-# real ones come in. No pass_bar until then: the category reports only.
+# real ones come in. The bar and repeats below are starting values (docs/evals.md, "Categories and bars").
 name: principal-craft
 bot: personal
 level: principal
+# pass_bar 0.8 is a starting value: the docs give no launch number for this category, only the
+# 80% example in docs/evals.md. Tighten it after the first valid run against case cards.
+pass_bar: 0.8
+# repeats 3: the Phase 1 exit gate reports pass^3 for every bot category
+# (docs/research/self-improvement-loops.md, "Exit gate").
+repeats: 3
 description: >-
   A Principal PM asks their personal bot for work on company bets: a vision, an investment
   case with cash-flow numbers, a pricing proposal, a platform strategy, an exec brief, and
