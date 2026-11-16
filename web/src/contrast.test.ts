@@ -34,6 +34,8 @@ const PAIRS: [string, string][] = [
   ['primary-ink', 'primary'], ['ink', 'nav-active'], ['muted', 'nav-active'], ['ink', 'surface-2'],
   ['muted', 'surface-2'], ['coach-ink', 'coach-bg'], ['inverse-ink', 'inverse-bg'], ['warn-ink', 'bg'],
   ['good-ink', 'surface'], ['good-ink', 'bg'], ['bad-ink', 'bg'], ['accent', 'nav-active'], ['surface', 'bad-ink'],
+  // Changed words inside a before and after line.
+  ['good-ink', 'add-word'], ['bad-ink', 'del-word'],
 ];
 
 describe('dark tokens', () => {

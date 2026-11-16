@@ -7,8 +7,8 @@ export interface AppContextValue {
   me: Me;
   setMe: (me: Me) => void;
   refreshMe: () => Promise<void>;
-  /** How often to poll a working task, in ms. */
-  pollMs: number;
+  /** A fixed poll interval in ms (tests). Left out, polling follows the schedule in polling.ts. */
+  pollMs: number | undefined;
   navigate: (path: string) => void;
   theme: Theme;
   setTheme: (t: Theme) => void;

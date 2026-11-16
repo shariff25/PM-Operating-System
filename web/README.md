@@ -23,10 +23,11 @@ Mock switches, set in `web/.env.local` or the shell:
 | `VITE_API=real` | Use the real client in `dev`. Default in `dev`: the sample data. A build always uses the real client, and `pnpm build` fails if `VITE_API=mock` is set. |
 | `VITE_MOCK_BRIEF=off` | The mock answers `501 not_built` for the brief, so the home page hides it. |
 | `VITE_MOCK_HOSTILE=on` | Adds a draft ("Vendor call notes") that tries a style block, hidden text, a form and a remote image. |
+| `VITE_MOCK_EMPTY=on` | A brand-new account: no drafts, no requests, an empty brief (for the empty states). |
 | `VITE_MOCK_FAST=on` | No pretend network delay (the browser tests use it). |
 | `VITE_AUTH_PROVIDER=dev` or `entra` | Sign-in provider. The switch is in one place, `src/pages/SignIn.tsx`. |
 
-Words to try in the ask box: anything for a plain answer; "draft a PRD ..." for a draft; "this will
+Words to try in the ask box: anything for a plain answer; "busy" for a longer run with a progress bar and the retry line; "draft a PRD ..." for a draft; "this will
 fail" for a failed task (Try again then works); "busy" for the model-busy line. In the change box,
 "shorter" removes a paragraph and "make it fail" shows a failed suggestion.
 
@@ -50,7 +51,7 @@ pnpm -C web build       # typecheck, then vite build into web/dist
 pnpm -C web e2e         # browser tests (Playwright) against the sample data
 ```
 
-`pnpm e2e` starts its own dev server on port 5191. It uses the browser at `/opt/pw-browsers/chromium`
+`pnpm e2e` starts its own dev servers on ports 5191 and 5192 (the second is the empty account). It also runs axe (`@axe-core/playwright`, every rule on) on every page in both themes (`e2e/a11y.spec.ts`). It uses the browser at `/opt/pw-browsers/chromium`
 when that exists, or the one in `PW_CHROMIUM`; otherwise run `pnpm exec playwright install chromium` once.
 
 ## Layout
@@ -63,6 +64,7 @@ when that exists, or the one in `PW_CHROMIUM`; otherwise run `pnpm exec playwrig
 - `src/data.tsx`: the drafts, brief and task lists the navigation counts and pages share.
 - Routes are hashes, checked in `src/url.ts`: `#/`, `#/drafts`, `#/d/<id>`, `#/followups`,
   `#/activity`, `#/a/<task id>`. Anything else is the home page.
+- A running request is polled every 600 ms for six seconds, then every 2 s, then every 5 s after a minute (`src/polling.ts`); polling pauses in a hidden tab and resumes on focus.
 - Ctrl or Cmd + K opens the palette. The theme (system, light, dark) is in the user menu and is
   kept in `localStorage`; `public/favicon.svg` is the icon (the content security policy blocks
   `data:` icons).
