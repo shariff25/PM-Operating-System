@@ -11,6 +11,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
+use pmos_web::followups::BriefConfig;
 use pmos_web::session::MemorySessionStore;
 use pmos_web::settings::MemorySettingsStore;
 use pmos_web::{Config, Deps};
@@ -456,6 +457,10 @@ async fn web() -> Web {
 }
 
 async fn web_with(change: impl FnOnce(&mut Config)) -> Web {
+    web_full(change, BriefConfig::default()).await
+}
+
+async fn web_full(change: impl FnOnce(&mut Config), brief: BriefConfig) -> Web {
     let runtime_up = Arc::new(Upstream::default());
     runtime_up.data.lock().unwrap().extend([
         task_json("tsk_ana1", "ana", "What did PAY ship?"),
@@ -484,7 +489,9 @@ async fn web_with(change: impl FnOnce(&mut Config)) -> Web {
     let deps = Deps {
         sessions: Arc::new(MemorySessionStore::new()),
         settings: Arc::new(MemorySettingsStore::new()),
+        brief,
         clock: Arc::new(move || *c.lock().unwrap()),
+        ..Deps::in_memory()
     };
     let (base, stop_web) = serve(pmos_web::build(cfg, deps).unwrap()).await;
     Web {
@@ -2238,4 +2245,529 @@ async fn practice_drafts_never_reach_the_tool_server() {
         .await;
     assert_eq!(r.code(), "not_found");
     assert!(w.tools.writes().is_empty());
+}
+
+// The daily brief and follow-ups.
+
+const BRIEF_TOKEN: &str = "brief-producer-token-0123456789abcdef";
+
+async fn web_brief() -> Web {
+    web_full(
+        |_| {},
+        BriefConfig {
+            enabled: true,
+            token: Some(BRIEF_TOKEN.into()),
+        },
+    )
+    .await
+}
+
+impl Web {
+    /// The producer's call, with `token` as its bearer token.
+    async fn fill_with(&self, handle: &str, token: Option<&str>, body: Value) -> Reply {
+        let mut req = self
+            .http
+            .put(format!("{}/internal/brief/{handle}", self.base))
+            .json(&body);
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        self.reply(req).await
+    }
+
+    async fn fill(&self, handle: &str, body: Value) -> Reply {
+        self.fill_with(handle, Some(BRIEF_TOKEN), body).await
+    }
+
+    async fn reply(&self, req: reqwest::RequestBuilder) -> Reply {
+        let res = req.send().await.unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let text = res.text().await.unwrap();
+        Reply {
+            status,
+            headers,
+            body: serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        }
+    }
+}
+
+fn follow(system: &str, who: &str, summary: &str, n: u32) -> Value {
+    json!({
+        "system": system, "who": who, "summary": summary,
+        "url": format!("https://example.com/{system}/{n}"),
+    })
+}
+
+fn ids(r: &Reply, list: &str) -> Vec<String> {
+    r.body[list]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_empty_brief_is_200_with_empty_lists() {
+    let w = web_brief().await;
+    let b = w.login("ana").await;
+    let r = w.get(&b, "/api/brief").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.body["date"], json!("2026-11-16"));
+    for list in ["changed", "waiting_on_you", "you_wait_on"] {
+        assert_eq!(r.body[list], json!([]), "{list}");
+    }
+}
+
+#[tokio::test]
+async fn the_producer_fills_a_brief_and_the_pm_reads_it() {
+    let w = web_brief().await;
+    let b = w.login("ana").await;
+    let r = w
+        .fill(
+            "ana",
+            json!({
+                "date": "2026-11-16",
+                "changed": [{"system": "jira", "title": "PAY-212 moved to Blocked",
+                             "summary": "by Ben", "url": "https://jira.example.com/PAY-212"}],
+                "waiting_on_you": [follow("slack", "Ben", "asked about the pricing page", 1)],
+                "you_wait_on": [follow("jira", "Legal", "the DPA question", 2)],
+            }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.body, json!({"changed": 1, "followups": 2}));
+    let r = w.get(&b, "/api/brief").await;
+    assert_eq!(r.body["date"], json!("2026-11-16"));
+    assert_eq!(
+        r.body["changed"][0]["title"],
+        json!("PAY-212 moved to Blocked")
+    );
+    assert_eq!(r.body["changed"][0]["summary"], json!("by Ben"));
+    assert_eq!(r.body["waiting_on_you"][0]["age_days"], json!(0));
+    assert_eq!(
+        r.body["waiting_on_you"][0]["url"],
+        json!("https://example.com/slack/1")
+    );
+    assert!(r.body["you_wait_on"][0]["id"]
+        .as_str()
+        .unwrap()
+        .starts_with("fu_"));
+    // Two days on: the Slack one expired after a day, and so did the day's changed items.
+    w.advance(Duration::hours(30));
+    let b = w.login("ana").await;
+    let r = w.get(&b, "/api/brief").await;
+    assert_eq!(r.body["waiting_on_you"], json!([]));
+    assert_eq!(r.body["changed"], json!([]));
+    assert_eq!(r.body["you_wait_on"][0]["who"], json!("Legal"));
+    assert_eq!(r.body["you_wait_on"][0]["age_days"], json!(1));
+    // No token of any kind reaches the browser.
+    w.assert_no_tokens();
+    assert!(!r.body.to_string().contains(BRIEF_TOKEN));
+}
+
+#[tokio::test]
+async fn another_users_follow_up_is_404() {
+    let w = web_brief().await;
+    w.fill(
+        "ana",
+        json!({"waiting_on_you": [follow("jira", "Ben", "needs a decision", 1)]}),
+    )
+    .await;
+    let ana = w.login("ana").await;
+    let id = ids(&w.get(&ana, "/api/brief").await, "waiting_on_you")[0].clone();
+    let ben = w.login("ben").await;
+    // Ben's own brief has nothing of Ana's.
+    let r = w.get(&ben, "/api/brief").await;
+    assert_eq!(r.body["waiting_on_you"], json!([]));
+    for action in ["dismiss", "draft"] {
+        let r = w
+            .post(&ben, &format!("/api/followups/{id}/{action}"), json!(null))
+            .await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{action}");
+        assert_eq!(r.code(), "not_found");
+    }
+    // Nothing was asked of any bot, and Ana's follow-up is still open.
+    assert!(w.runtime.writes().is_empty());
+    assert_eq!(
+        ids(&w.get(&ana, "/api/brief").await, "waiting_on_you"),
+        [id]
+    );
+    // An id that doesn't exist, or isn't shaped like one, is the same answer.
+    for path in [
+        "/api/followups/fu_nope/dismiss",
+        "/api/followups/a.b/dismiss",
+    ] {
+        assert_eq!(w.post(&ben, path, json!(null)).await.code(), "not_found");
+    }
+}
+
+#[tokio::test]
+async fn dismiss_is_idempotent_and_dismissed_ones_are_not_listed() {
+    let w = web_brief().await;
+    w.fill(
+        "ana",
+        json!({"you_wait_on": [follow("jira", "Legal", "a", 1), follow("jira", "Ops", "b", 2)]}),
+    )
+    .await;
+    let b = w.login("ana").await;
+    let r = w.get(&b, "/api/brief").await;
+    let legal = r.body["you_wait_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["who"] == json!("Legal"))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id = legal.clone();
+    for _ in 0..2 {
+        let r = w
+            .post(&b, &format!("/api/followups/{id}/dismiss"), json!(null))
+            .await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT);
+    }
+    let left = ids(&w.get(&b, "/api/brief").await, "you_wait_on");
+    assert_eq!(left.len(), 1);
+    assert!(!left.contains(&id));
+    // A dismissed one can't be drafted for.
+    let r = w
+        .post(&b, &format!("/api/followups/{id}/draft"), json!(null))
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // The producer sending it again doesn't bring it back, and the other keeps its place.
+    w.fill(
+        "ana",
+        json!({"you_wait_on": [follow("jira", "Legal", "a, updated", 1), follow("jira", "Ops", "b", 2)]}),
+    )
+    .await;
+    assert_eq!(ids(&w.get(&b, "/api/brief").await, "you_wait_on"), left);
+    // A follow-up the producer stopped listing is gone, for good.
+    w.fill(
+        "ana",
+        json!({"you_wait_on": [follow("jira", "Legal", "a", 1)]}),
+    )
+    .await;
+    assert_eq!(w.get(&b, "/api/brief").await.body["you_wait_on"], json!([]));
+}
+
+#[tokio::test]
+async fn expired_follow_ups_are_not_listed_and_cannot_be_acted_on() {
+    let w = web_brief().await;
+    w.fill(
+        "ana",
+        json!({"waiting_on_you": [follow("slack", "Ben", "slack one", 1),
+                                  follow("jira", "Ben", "jira one", 2)]}),
+    )
+    .await;
+    let b = w.login("ana").await;
+    let both = ids(&w.get(&b, "/api/brief").await, "waiting_on_you");
+    assert_eq!(both.len(), 2);
+    w.advance(Duration::hours(7));
+    let b = w.login("ana").await;
+    // Kept signed in by use (8 idle hours), so the follow-ups are 28 hours old at the end.
+    for _ in 0..2 {
+        w.advance(Duration::hours(7));
+        assert_eq!(w.get(&b, "/api/brief").await.status, StatusCode::OK);
+    }
+    w.advance(Duration::hours(7));
+    let r = w.get(&b, "/api/brief").await;
+    let left = ids(&r, "waiting_on_you");
+    assert_eq!(left.len(), 1);
+    assert_eq!(r.body["waiting_on_you"][0]["summary"], json!("jira one"));
+    let gone = both.iter().find(|i| !left.contains(i)).unwrap();
+    for action in ["dismiss", "draft"] {
+        let r = w
+            .post(&b, &format!("/api/followups/{gone}/{action}"), json!(null))
+            .await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{action}");
+    }
+    // The rest goes after a week.
+    w.advance(Duration::days(7));
+    let b = w.login("ana").await;
+    assert_eq!(
+        w.get(&b, "/api/brief").await.body["waiting_on_you"],
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn a_draft_asks_the_pms_personal_bot() {
+    let w = web_brief().await;
+    w.fill(
+        "ana",
+        json!({"waiting_on_you": [follow("slack", "Ben", "asked about the pricing page", 1)],
+               "you_wait_on": [follow("jira", "Legal", "the DPA question", 2)]}),
+    )
+    .await;
+    let b = w.login("ana").await;
+    let r = w.get(&b, "/api/brief").await;
+    let reply = ids(&r, "waiting_on_you")[0].clone();
+    let nudge = ids(&r, "you_wait_on")[0].clone();
+    let r = w
+        .post(&b, &format!("/api/followups/{reply}/draft"), json!(null))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    assert_eq!(r.body["bot"], json!("pm-ana"));
+    let r2 = w
+        .post(&b, &format!("/api/followups/{nudge}/draft"), json!(null))
+        .await;
+    assert_eq!(r2.status, StatusCode::CREATED);
+    let writes = w.runtime.writes();
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].user.as_deref(), Some("ana"));
+    assert_eq!(writes[0].body["source"], json!("web"));
+    assert_eq!(writes[0].body["requested_by"], json!("ana"));
+    let text = writes[0].body["text"].as_str().unwrap();
+    assert!(text.contains("reply to Ben") && text.contains("asked about the pricing page"));
+    assert!(text.contains("https://example.com/slack/1"));
+    let text = writes[1].body["text"].as_str().unwrap();
+    assert!(text.contains("nudge to Legal") && text.contains("the DPA question"));
+    // The tool server hears nothing: the draft arrives later, as an ordinary approval.
+    assert!(w.tools.calls().is_empty());
+    // Asking is not dismissing.
+    assert_eq!(
+        ids(&w.get(&b, "/api/brief").await, "waiting_on_you"),
+        [reply]
+    );
+}
+
+#[tokio::test]
+async fn follow_up_routes_need_sign_in_the_write_checks_and_the_right_role() {
+    let w = web_brief().await;
+    w.fill(
+        "ana",
+        json!({"waiting_on_you": [follow("jira", "Ben", "x", 1)]}),
+    )
+    .await;
+    let ana = w.login("ana").await;
+    let id = ids(&w.get(&ana, "/api/brief").await, "waiting_on_you")[0].clone();
+    let nobody = Browser::default();
+    for action in ["dismiss", "draft"] {
+        let r = w
+            .post(
+                &nobody,
+                &format!("/api/followups/{id}/{action}"),
+                json!(null),
+            )
+            .await;
+        assert_eq!(r.code(), "signed_out");
+        let no_csrf = Browser {
+            csrf: None,
+            ..ana.clone()
+        };
+        let r = w
+            .post(
+                &no_csrf,
+                &format!("/api/followups/{id}/{action}"),
+                json!(null),
+            )
+            .await;
+        assert_eq!(r.code(), "bad_csrf");
+    }
+    let audrey = w.login("audrey").await;
+    let r = w
+        .post(&audrey, &format!("/api/followups/{id}/draft"), json!(null))
+        .await;
+    assert_eq!(r.code(), "not_allowed");
+    assert!(w.runtime.writes().is_empty());
+    assert_eq!(
+        ids(&w.get(&ana, "/api/brief").await, "waiting_on_you").len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn the_internal_route_wants_the_service_token() {
+    let w = web_brief().await;
+    let body = json!({"waiting_on_you": [follow("jira", "Ben", "x", 1)]});
+    for token in [
+        None,
+        Some(""),
+        Some("wrong"),
+        // Other services' tokens are not it, nor is a token one character short.
+        Some(BOTS_TOKEN),
+        Some(TOOLS_TOKEN),
+        Some(&BRIEF_TOKEN[..BRIEF_TOKEN.len() - 1]),
+    ] {
+        let r = w.fill_with("ana", token, body.clone()).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{token:?}");
+        assert_eq!(r.code(), "bad_token");
+    }
+    // A signed-in PM's cookie doesn't open it either.
+    let b = w.login("ana").await;
+    let r = w
+        .reply(
+            w.http
+                .put(format!("{}/internal/brief/ana", w.base))
+                .header(
+                    "cookie",
+                    format!("__Host-pmos={}", b.cookie.clone().unwrap()),
+                )
+                .header("x-pmos-csrf", b.csrf.clone().unwrap())
+                .json(&body),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        w.get(&b, "/api/brief").await.body["waiting_on_you"],
+        json!([])
+    );
+    // The right one works, only for a member, and only as JSON.
+    assert_eq!(w.fill("ana", body.clone()).await.status, StatusCode::OK);
+    assert_eq!(
+        w.fill("nobody", body.clone()).await.status,
+        StatusCode::NOT_FOUND
+    );
+    let r = w
+        .reply(
+            w.http
+                .put(format!("{}/internal/brief/ana", w.base))
+                .header("authorization", format!("Bearer {BRIEF_TOKEN}"))
+                .header("content-type", "text/plain")
+                .body("{}"),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn the_internal_route_refuses_oversize_and_bad_input_and_stores_nothing() {
+    let w = web_brief().await;
+    let b = w.login("ana").await;
+    let ok = follow("jira", "Ben", "fine", 1);
+    // A body over the cap.
+    let r = w
+        .fill(
+            "ana",
+            json!({"waiting_on_you": [follow("jira", "Ben", &"x".repeat(200_000), 1)]}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    let many: Vec<Value> = (0..51).map(|n| follow("jira", "Ben", "x", n)).collect();
+    let mut bad: Vec<(&str, Value)> = vec![
+        ("too many", json!({"waiting_on_you": many})),
+        (
+            "long summary",
+            json!({"waiting_on_you": [follow("jira", "Ben", &"x".repeat(201), 1)]}),
+        ),
+        (
+            "empty summary",
+            json!({"waiting_on_you": [follow("jira", "Ben", "  ", 1)]}),
+        ),
+        (
+            "two lines",
+            json!({"waiting_on_you": [follow("jira", "Ben", "one\ntwo", 1)]}),
+        ),
+        (
+            "long who",
+            json!({"waiting_on_you": [follow("jira", &"w".repeat(81), "x", 1)]}),
+        ),
+        (
+            "bad system",
+            json!({"waiting_on_you": [follow("Jira!", "Ben", "x", 1)]}),
+        ),
+        (
+            "unknown field",
+            json!({"waiting_on_you": [ok.clone()], "extra": 1}),
+        ),
+        ("bad date", json!({"date": "16/11/2026"})),
+        (
+            "future",
+            json!({"you_wait_on": [{"system": "jira", "who": "B", "summary": "x",
+            "url": "https://e.com/1", "created_at": "2026-11-17T09:00:00Z"}]}),
+        ),
+        (
+            "changed url",
+            json!({"changed": [{"system": "jira", "title": "t", "url": "javascript:alert(1)"}]}),
+        ),
+    ];
+    for url in [
+        "javascript:alert(1)",
+        "ftp://example.com/a",
+        "file:///etc/passwd",
+        "data:text/html,hi",
+        "//example.com/a",
+        "/relative",
+        "example.com/a",
+        "https://user:pw@example.com/a",
+        "https://",
+        "https://exa mple.com",
+        "",
+    ] {
+        bad.push((
+            "bad url",
+            json!({"waiting_on_you": [ok.clone(), {"system": "jira", "who": "B", "summary": "x", "url": url}]}),
+        ));
+    }
+    for (what, body) in bad {
+        let r = w.fill("ana", body).await;
+        assert!(
+            r.status == StatusCode::UNPROCESSABLE_ENTITY || r.status == StatusCode::BAD_REQUEST,
+            "{what}: {} {:?}",
+            r.status,
+            r.body
+        );
+    }
+    // Every refusal stored nothing, even next to a good item.
+    let r = w.get(&b, "/api/brief").await;
+    assert_eq!(r.body["waiting_on_you"], json!([]));
+    assert_eq!(r.body["changed"], json!([]));
+    // A url with a query string and port is fine.
+    let r = w
+        .fill(
+            "ana",
+            json!({"waiting_on_you": [{"system": "slack", "who": "B", "summary": "x",
+                "url": "http://localhost:8080/a?b=c#d"}]}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+}
+
+#[tokio::test]
+async fn with_the_brief_off_everything_is_501_not_built() {
+    // Flag off (no token either): the app hides the section.
+    let w = web().await;
+    let b = w.login("ana").await;
+    assert_eq!(
+        w.get(&b, "/api/brief").await.status,
+        StatusCode::NOT_IMPLEMENTED
+    );
+    let r = w.fill_with("ana", Some(BRIEF_TOKEN), json!({})).await;
+    assert_eq!(
+        (r.status, r.code()),
+        (StatusCode::NOT_IMPLEMENTED, "not_built")
+    );
+    // Flag on but no token configured: nothing can fill it, and the route says so the same.
+    let w = web_full(
+        |_| {},
+        BriefConfig {
+            enabled: true,
+            token: None,
+        },
+    )
+    .await;
+    let b = w.login("ana").await;
+    assert_eq!(w.get(&b, "/api/brief").await.status, StatusCode::OK);
+    let r = w.fill_with("ana", Some(BRIEF_TOKEN), json!({})).await;
+    assert_eq!(
+        (r.status, r.code()),
+        (StatusCode::NOT_IMPLEMENTED, "not_built")
+    );
+    // Token set but flag off.
+    let w = web_full(
+        |_| {},
+        BriefConfig {
+            enabled: false,
+            token: Some(BRIEF_TOKEN.into()),
+        },
+    )
+    .await;
+    let r = w.fill("ana", json!({})).await;
+    assert_eq!(
+        (r.status, r.code()),
+        (StatusCode::NOT_IMPLEMENTED, "not_built")
+    );
 }
