@@ -27,6 +27,7 @@ use serde_json::json;
 use crate::auth::{self, AuthProvider, DevLoginProvider, SignInError, SignInInput};
 use crate::config::{Config, NO_PROVIDER};
 use crate::drafts::{self, Draft, Suggestion};
+use crate::entra::{self, Entra, Failure};
 use crate::followups::{BriefConfig, FollowUpStore, MemoryFollowUpStore};
 use crate::progress::{self, EventOut, Progress};
 use crate::session::{
@@ -107,7 +108,9 @@ struct Inner {
     max: chrono::Duration,
     runtime: Runtime,
     toolserver: ToolServer,
+    /// Entra first, then development sign-in.
     providers: Vec<Arc<dyn AuthProvider>>,
+    entra: Option<Arc<Entra>>,
     sessions: Arc<dyn SessionStore>,
     settings: Arc<dyn SettingsStore>,
     followups: Arc<dyn FollowUpStore>,
@@ -118,19 +121,33 @@ struct Inner {
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
 
-/// The sign-in providers `config` turns on. Never empty for a config that loaded.
-pub fn providers(config: &Config) -> Vec<Arc<dyn AuthProvider>> {
+type Providers = (Vec<Arc<dyn AuthProvider>>, Option<Arc<Entra>>);
+
+fn make_providers(config: &Config) -> Result<Providers, String> {
     let mut out: Vec<Arc<dyn AuthProvider>> = Vec::new();
+    let entra = match &config.entra {
+        Some(c) => Some(Arc::new(Entra::new(c.clone())?)),
+        None => None,
+    };
+    if let Some(e) = &entra {
+        out.push(e.clone());
+    }
     if config.dev_login {
         out.push(Arc::new(DevLoginProvider));
     }
-    out
+    Ok((out, entra))
+}
+
+/// The sign-in providers `config` turns on, Entra first. Never empty for a config that
+/// loaded.
+pub fn providers(config: &Config) -> Result<Vec<Arc<dyn AuthProvider>>, String> {
+    Ok(make_providers(config)?.0)
 }
 
 /// The app. Refuses (`Err`) with no sign-in provider, or a static directory without an
 /// `index.html`.
 pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
-    let providers = providers(&config);
+    let (providers, entra) = make_providers(&config)?;
     if providers.is_empty() {
         return Err(NO_PROVIDER.into());
     }
@@ -162,6 +179,7 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
         idle: config.session_idle,
         max: config.session_max,
         providers,
+        entra,
         sessions: deps.sessions,
         settings: deps.settings,
         followups: deps.followups,
@@ -169,6 +187,9 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
         clock: deps.clock,
     }));
     let api = Router::new()
+        .route("/auth/providers", get(auth_providers))
+        .route("/auth/login", get(entra_login))
+        .route("/auth/callback", get(entra_callback))
         .route("/auth/dev-login", post(dev_login))
         .route("/auth/logout", post(logout))
         .route("/me", get(me))
@@ -567,7 +588,9 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
     {
         Ok(c) => c,
         Err(SignInError::Invalid(why)) => return Err(ApiError::bad_request(why)),
-        Err(SignInError::Unsupported) => return Err(ApiError::not_found()),
+        Err(SignInError::Unsupported | SignInError::Rejected(_)) => {
+            return Err(ApiError::not_found())
+        }
     };
     let team = load_team(&state)?;
     let Some(member) = auth::find_member(&team, &claimed.0) else {
@@ -581,8 +604,23 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
             "That person isn't on the PM OS team.",
         ));
     };
-    // Rotation: whatever session this browser had ends; the new one has a fresh id.
-    if let Some(old) = session::cookie_value(&headers) {
+    let id = start_session(&state, &headers, member, provider.name()).await?;
+    Ok((
+        StatusCode::NO_CONTENT,
+        [(header::SET_COOKIE, session::set_cookie(&id))],
+    )
+        .into_response())
+}
+
+/// A new session for `member`, whichever provider signed them in: the cookie value. Ends
+/// whatever session this browser had (rotation).
+async fn start_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    member: &TeamMember,
+    provider: &str,
+) -> Result<String, ApiError> {
+    if let Some(old) = session::cookie_value(headers) {
         state
             .0
             .sessions
@@ -590,9 +628,9 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
             .await
             .map_err(ApiError::store)?;
     }
-    brief::housekeeping(&state).await;
+    brief::housekeeping(state).await;
     let id = session::random_token();
-    let at = now(&state);
+    let at = now(state);
     state
         .0
         .sessions
@@ -607,12 +645,131 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
         )
         .await
         .map_err(ApiError::store)?;
-    tracing::info!(user = %member.handle, provider = provider.name(), "signed in");
-    Ok((
-        StatusCode::NO_CONTENT,
-        [(header::SET_COOKIE, session::set_cookie(&id))],
-    )
-        .into_response())
+    tracing::info!(user = %member.handle, provider, "signed in");
+    Ok(id)
+}
+
+/// `GET /api/auth/providers` (no session): which sign-in buttons the app shows.
+async fn auth_providers(State(state): State<AppState>) -> ApiResult {
+    let names: Vec<&str> = state.0.providers.iter().map(|p| p.name()).collect();
+    Ok(Json(json!({ "providers": names })).into_response())
+}
+
+/// Where the app explains why sign-in didn't finish.
+fn signed_out_at(reason: &str) -> String {
+    format!("/#/signed-out?reason={reason}")
+}
+
+/// A `303` to `location`, setting `cookies`. Only the authorize URL is absolute; every other
+/// location is a same-origin path.
+fn redirect(location: &str, cookies: &[String]) -> Response {
+    let mut res = StatusCode::SEE_OTHER.into_response();
+    let h = res.headers_mut();
+    h.insert(
+        header::LOCATION,
+        HeaderValue::from_str(location).unwrap_or(HeaderValue::from_static("/")),
+    );
+    for c in cookies {
+        if let Ok(v) = HeaderValue::from_str(c) {
+            h.append(header::SET_COOKIE, v);
+        }
+    }
+    res
+}
+
+#[derive(Deserialize)]
+struct LoginQuery {
+    return_to: Option<String>,
+}
+
+/// `GET /api/auth/login[?return_to=/path]`: off to Entra ID. A top-level navigation, so a
+/// failure redirects to the app's signed-out page rather than answering JSON.
+async fn entra_login(
+    State(state): State<AppState>,
+    query: Result<axum::extract::Query<LoginQuery>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult {
+    let Some(entra) = state.0.entra.clone() else {
+        return Err(ApiError::not_found());
+    };
+    let return_to = query.ok().and_then(|q| q.0.return_to);
+    match entra.begin(now(&state), return_to.as_deref()).await {
+        Ok((authorize, cookie)) => Ok(redirect(&authorize, &[cookie])),
+        Err(f) => {
+            tracing::warn!(provider = "entra", why = f.why(), "sign-in couldn't start");
+            Ok(redirect(&signed_out_at(f.reason()), &[]))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+/// `GET /api/auth/callback?code&state`: Microsoft sends the browser back here. A cross-site
+/// GET: no origin check applies, and `state`, matched once against the signed flow cookie
+/// this browser got at `/api/auth/login`, is its CSRF defence. Always clears that cookie;
+/// always redirects within this origin.
+async fn entra_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Result<axum::extract::Query<CallbackQuery>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult {
+    let Some(entra) = state.0.entra.clone() else {
+        return Err(ApiError::not_found());
+    };
+    let clear = entra::clear_flow_cookie();
+    let fail = |f: Failure| {
+        tracing::warn!(provider = "entra", why = f.why(), "sign-in refused");
+        Ok(redirect(
+            &signed_out_at(f.reason()),
+            std::slice::from_ref(&clear),
+        ))
+    };
+    let Ok(axum::extract::Query(q)) = query else {
+        return fail(Failure::Failed("malformed callback"));
+    };
+    if let Some(error) = q.error.as_deref() {
+        return fail(if error == "access_denied" {
+            Failure::Cancelled
+        } else {
+            Failure::Failed("the identity provider answered an error")
+        });
+    }
+    let (Some(code), Some(flow_state)) = (q.code, q.state) else {
+        return fail(Failure::Failed("callback without code or state"));
+    };
+    let at = now(&state);
+    let started = match entra.finish(&headers, &flow_state, at) {
+        Ok(s) => s,
+        Err(f) => return fail(f),
+    };
+    let input = SignInInput::Entra {
+        code,
+        nonce: started.nonce,
+        verifier: started.verifier,
+        now: at,
+    };
+    let email = match entra.authenticate(&input).await {
+        Ok(claimed) => claimed.0,
+        Err(SignInError::Rejected(f)) => return fail(f),
+        Err(_) => return fail(Failure::Failed("unsupported input")),
+    };
+    let team = load_team(&state)?;
+    let Some(member) = auth::find_member_by_email(&team, &email) else {
+        tracing::info!(provider = "entra", "sign-in refused: not in team.yaml");
+        return Ok(redirect(
+            &signed_out_at("not_a_member"),
+            std::slice::from_ref(&clear),
+        ));
+    };
+    let id = start_session(&state, &headers, member, entra.name()).await?;
+    Ok(redirect(
+        &entra::safe_return(Some(&started.return_to)),
+        &[clear, session::set_cookie(&id)],
+    ))
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {

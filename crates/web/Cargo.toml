@@ -19,6 +19,9 @@ base64.workspace = true
 chrono.workspace = true
 # Session ids and CSRF tokens: 256 bits from the operating system's generator.
 getrandom = "0.3"
+hmac.workspace = true
+# Entra ID tokens (RS256) through aws-lc-rs, which rustls already uses: no OpenSSL.
+jsonwebtoken ={ version = "10", default-features = false, features = ["aws_lc_rs"] }
 pmos-assertion.workspace = true
 pmos-contract.workspace = true
 pmos-runtime.workspace = true

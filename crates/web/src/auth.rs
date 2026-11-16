@@ -6,13 +6,38 @@
 
 use async_trait::async_trait;
 use axum::http::{header, HeaderMap};
+use chrono::{DateTime, Utc};
 use pmos_contract::model::{valid_email, valid_handle, TeamFile, TeamMember};
 
+use crate::entra::Failure;
+
 /// What the browser sent to sign in.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum SignInInput {
     /// `POST /api/auth/dev-login {handle}`: a handle, or a member's email.
     Dev { handle: String },
+    /// `GET /api/auth/callback`: the authorization code, with the `nonce` and PKCE verifier
+    /// of the flow its `state` matched, and the time to check the ID token against.
+    Entra {
+        code: String,
+        nonce: String,
+        verifier: String,
+        now: DateTime<Utc>,
+    },
+}
+
+/// Never shows a code, nonce or verifier.
+impl std::fmt::Debug for SignInInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignInInput::Dev { handle } => f.debug_struct("Dev").field("handle", handle).finish(),
+            SignInInput::Entra { now, .. } => f
+                .debug_struct("Entra")
+                .field("code", &"<redacted>")
+                .field("now", now)
+                .finish(),
+        }
+    }
 }
 
 /// Who a provider says the person is: a PM OS handle or an email, to find in `team.yaml`.
@@ -25,9 +50,11 @@ pub enum SignInError {
     Unsupported,
     /// The input is malformed (`400`).
     Invalid(String),
+    /// The identity provider's answer didn't check out, or it couldn't be reached.
+    Rejected(Failure),
 }
 
-/// One way to sign in. Entra ID will be the production provider (see [`EntraProvider`]).
+/// One way to sign in: [`crate::entra::Entra`] (production) or [`DevLoginProvider`].
 #[async_trait]
 pub trait AuthProvider: Send + Sync {
     /// A short name for logs, such as `dev`.
@@ -57,7 +84,9 @@ impl AuthProvider for DevLoginProvider {
     }
 
     async fn authenticate(&self, input: &SignInInput) -> Result<Claimed, SignInError> {
-        let SignInInput::Dev { handle } = input;
+        let SignInInput::Dev { handle } = input else {
+            return Err(SignInError::Unsupported);
+        };
         let handle = handle.trim();
         if !valid_handle(handle) && !valid_email(handle) {
             return Err(SignInError::Invalid(
@@ -66,28 +95,6 @@ impl AuthProvider for DevLoginProvider {
         }
         Ok(Claimed(handle.to_string()))
     }
-}
-
-/// **Not built.** The seam for Entra ID (Azure AD) sign-in, the production provider in
-/// `docs/web-client.md`. It deliberately does not implement [`AuthProvider`] yet, and nothing
-/// constructs it, so a server can't start believing it works.
-///
-/// What it will need:
-/// - **Config:** tenant id, client id, a client secret or certificate (from the secret
-///   store, never the environment file in git), and the redirect URL
-///   (`<PMOS_WEB_PUBLIC_URL>/api/auth/entra/callback`).
-/// - **Routes:** `GET /api/auth/entra/start` (authorization code flow with PKCE, a `state`
-///   and `nonce` kept in a short-lived `__Host-` cookie) and `GET /api/auth/entra/callback`.
-///   Both would add a [`SignInInput`] variant.
-/// - **Checks:** the ID token's signature against the tenant's published keys, `iss`, `aud`,
-///   `exp`, `nonce`; then map `preferred_username` or `email` (or better, the `oid` once the
-///   user database stores it) to a member.
-/// - **Not decided** (`docs/web-client.md`): which claims, group-to-role mapping, and the
-///   fallback when Entra is down.
-pub struct EntraProvider {
-    pub tenant_id: String,
-    pub client_id: String,
-    pub redirect_url: String,
 }
 
 /// The member a claim names: by handle, or by email (case-insensitive) when it has an `@`.
@@ -100,6 +107,21 @@ pub fn find_member<'a>(team: &'a TeamFile, claimed: &str) -> Option<&'a TeamMemb
                     .is_some_and(|e| e.eq_ignore_ascii_case(claimed))
         })
     })
+}
+
+/// The one member whose `email` is `email` (case-insensitive), as Entra ID sign-in finds
+/// people: never by handle. Two members with the same email (which `pmos lint` refuses)
+/// match no one.
+pub fn find_member_by_email<'a>(team: &'a TeamFile, email: &str) -> Option<&'a TeamMember> {
+    let mut found = team.members.iter().filter(|m| {
+        m.email
+            .as_deref()
+            .is_some_and(|e| e.trim().eq_ignore_ascii_case(email.trim()))
+    });
+    match (found.next(), found.next()) {
+        (Some(m), None) => Some(m),
+        _ => None,
+    }
 }
 
 /// Whether a write came from the web app's own pages: never from another site, and with an
@@ -179,6 +201,24 @@ mod tests {
         assert!(find_member(&team, "ana").is_some());
         assert!(find_member(&team, "ANA@example.com").is_some());
         assert!(find_member(&team, "ben").is_none());
+    }
+
+    #[test]
+    fn finds_members_by_email_only_and_unambiguously() {
+        let team = TeamFile::from_yaml(
+            "members:\n  - {handle: ana, slack-id: U0ANA, email: Ana@Example.com, roles: [pm]}\n  \
+             - {handle: ben, slack-id: U0BEN, roles: [pm]}\n  \
+             - {handle: cy, slack-id: U0CY, email: twin@example.com, roles: [pm]}\n  \
+             - {handle: dee, slack-id: U0DEE, email: TWIN@example.com, roles: [pm]}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_member_by_email(&team, "ana@example.com").map(|m| m.handle.as_str()),
+            Some("ana")
+        );
+        assert!(find_member_by_email(&team, "ana").is_none());
+        assert!(find_member_by_email(&team, "ben").is_none());
+        assert!(find_member_by_email(&team, "twin@example.com").is_none());
     }
 
     #[test]
