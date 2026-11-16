@@ -16,12 +16,14 @@ export default defineConfig({
   fullyParallel: true,
   workers: 2,
   retries: 0,
-  reporter: 'list',
+  reporter: [['list'], ['html', { open: 'never' }]],
   timeout: 30_000,
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,
     launchOptions: executablePath ? { executablePath } : {},
     deviceScaleFactor: 1,
+    trace: 'retain-on-failure',
+    screenshot: 'only-on-failure',
   },
   webServer: [
     {

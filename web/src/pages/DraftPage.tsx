@@ -25,6 +25,29 @@ type PanelTab = 'doc' | 'sources' | 'ask' | 'details';
 
 /** The words of a line; the ones that changed get an inline highlight. */
 function LineText({ line }: { line: DiffLine }) {
+  if (line.inline) {
+    return (
+      <span className="ba-text">
+        {line.inline.map((p, i) =>
+          p.kind === 'added' ? (
+            <ins key={i} className="ba-word">
+              <span className="sr-only">{copy.draft.diffAddedCue}</span>
+              {p.text}
+              <span className="sr-only">{copy.draft.diffEndCue}</span>
+            </ins>
+          ) : p.kind === 'removed' ? (
+            <del key={i} className="ba-word">
+              <span className="sr-only">{copy.draft.diffRemovedCue}</span>
+              {p.text}
+              <span className="sr-only">{copy.draft.diffEndCue}</span>
+            </del>
+          ) : (
+            <span key={i}>{p.text}</span>
+          ),
+        )}
+      </span>
+    );
+  }
   if (!line.parts) return <span className="ba-text">{line.text}</span>;
   return (
     <span className="ba-text">
@@ -53,10 +76,10 @@ function BeforeAfter({ diff }: { diff: DiffLine[] }) {
     if (block.changed) {
       items.push(
         <li key={i} className="ba-block">
-          {block.lines.map((l, k) => (
-            <p key={k} className={`ba-line ba-${l.kind}`}>
+          {block.lines.filter((l) => !l.merged).map((l, k) => (
+            <p key={k} className={`ba-line ba-${l.inline ? 'changed' : l.kind}`}>
               <span className="sr-only">
-                {l.kind === 'added' ? copy.draft.diffAdded : l.kind === 'removed' ? copy.draft.diffRemoved : copy.draft.diffSame}
+                {l.inline ? copy.draft.diffChanged : l.kind === 'added' ? copy.draft.diffAdded : l.kind === 'removed' ? copy.draft.diffRemoved : copy.draft.diffSame}
               </span>
               <LineText line={l} />
             </p>

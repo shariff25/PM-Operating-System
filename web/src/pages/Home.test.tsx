@@ -74,6 +74,16 @@ describe('home launchpad', () => {
     expect(window.location.hash).toBe('#/a/tsk_seed_week');
   });
 
+  it('keeps the task id out of the thread header and shows it only under the steps', async () => {
+    const user = userEvent.setup();
+    renderApp({ hash: '/a/tsk_seed_week' });
+    await screen.findByText('Billing this week');
+    expect(screen.queryByText('tsk_seed_week')).not.toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: new RegExp(copy.activity.showSteps) }));
+    expect(screen.getByText('tsk_seed_week')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: copy.activity.copyReference })).toBeInTheDocument();
+  });
+
   it('greets a first sign-in that already has drafts', async () => {
     renderApp({ firstVisit: true });
     await screen.findByText(copy.welcomeWithDrafts);
