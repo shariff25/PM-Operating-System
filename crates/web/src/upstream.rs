@@ -549,3 +549,25 @@ impl ToolServer {
         self.0.read(res).await
     }
 }
+
+/// The tool server's read-only admin and auditor routes (`GET /internal/admin/{route}`), for
+/// `viewer`: the call names them as `user=` and carries an assertion for them, and the tool
+/// server checks their role itself and records the read. The reply is left as JSON; the
+/// caller keeps only the fields it serves (`app/admin.rs`).
+impl ToolServer {
+    pub async fn admin(
+        &self,
+        viewer: &str,
+        route: &str,
+        query: &[(&str, &str)],
+    ) -> UpstreamResult<Value> {
+        let url = self.0.url(&["internal", "admin", route])?;
+        let mut q = vec![("user", viewer)];
+        q.extend_from_slice(query);
+        let res = self
+            .0
+            .send(self.0.http.get(url).query(&q), Some(viewer))
+            .await?;
+        self.0.read(res).await
+    }
+}

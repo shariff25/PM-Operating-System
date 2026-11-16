@@ -38,6 +38,7 @@ use crate::upstream::{
     Approval, DecisionBody, Runtime, Task, TaskEvent, ToolServer, UpstreamError,
 };
 
+mod admin;
 mod brief;
 
 /// How many tasks `GET /api/tasks` lists.
@@ -210,6 +211,7 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{id}", get(get_task))
         .merge(brief::routes())
+        .merge(admin::routes())
         .fallback(|| async { ApiError::not_found() })
         // A known path with another method: JSON too, never an empty body or the app.
         .method_not_allowed_fallback(|| async {
@@ -817,6 +819,7 @@ fn me_json(signed: &Signed, st: &UserState) -> Response {
         // is not written to team.yaml. The user database will have one.
         "name": signed.member.handle,
         "roles": signed.member.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+        "permissions": pmos_contract::permissions::granted(&signed.member.roles),
         "csrf_token": signed.session.csrf_token,
         "first_visit": !st.opened_a_draft,
         "hints_seen": st.hints_seen.iter().collect::<Vec<_>>(),

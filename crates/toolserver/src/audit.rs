@@ -45,7 +45,7 @@ pub fn source_title(raw: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// The call ran and returned.
@@ -71,6 +71,41 @@ pub enum Outcome {
     Expired,
 }
 
+impl Outcome {
+    pub const ALL: [Outcome; 10] = [
+        Outcome::Ok,
+        Outcome::Denied,
+        Outcome::Pending,
+        Outcome::Approved,
+        Outcome::Rejected,
+        Outcome::Granted,
+        Outcome::Started,
+        Outcome::Error,
+        Outcome::Failed,
+        Outcome::Expired,
+    ];
+
+    /// The serialized name, as the database and the JSON-lines log store it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Ok => "ok",
+            Outcome::Denied => "denied",
+            Outcome::Pending => "pending",
+            Outcome::Approved => "approved",
+            Outcome::Rejected => "rejected",
+            Outcome::Granted => "granted",
+            Outcome::Started => "started",
+            Outcome::Error => "error",
+            Outcome::Failed => "failed",
+            Outcome::Expired => "expired",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|o| o.as_str() == s)
+    }
+}
+
 /// Who made the call: a sandbox over MCP, or an internal service with its own token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -82,7 +117,7 @@ pub enum Client {
     Orchestrator,
     /// The Slack bot, with `PMOS_BOT_TOKEN`.
     Bot,
-    /// `pmos-web`, with `PMOS_WEB_TOKEN`: the approvals routes only.
+    /// `pmos-web`, with `PMOS_WEB_TOKEN`: the approvals routes and the read-only admin routes.
     Web,
     /// The console, with `PMOS_CONSOLE_TOKEN`: the approvals routes only.
     Console,
@@ -97,6 +132,18 @@ impl Client {
             Self::Web => "web",
             Self::Console => "console",
         }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [
+            Self::Mcp,
+            Self::Orchestrator,
+            Self::Bot,
+            Self::Web,
+            Self::Console,
+        ]
+        .into_iter()
+        .find(|c| c.as_str() == s)
     }
 }
 
@@ -153,6 +200,103 @@ impl ReadEvent {
     }
 }
 
+/// The largest page `GET /internal/admin/audit` serves.
+pub const MAX_PAGE: usize = 1000;
+
+/// The most events one [`AuditSink::search`] returns: a full page plus one, which tells the
+/// caller whether more follow.
+pub const MAX_SEARCH: usize = MAX_PAGE + 1;
+
+/// Where a page of [`AuditSink::search`] ends: the last event's time and store id. Events are
+/// ordered newest first by `(at, id)`, so the next page is everything strictly before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cursor {
+    pub at: DateTime<Utc>,
+    pub id: i64,
+}
+
+impl Cursor {
+    /// An opaque token: `c1.` and base64url of `<unix nanos>:<id>`. Callers must not parse it.
+    pub fn encode(&self) -> String {
+        use base64::Engine;
+        let nanos = self.at.timestamp_nanos_opt().unwrap_or_default();
+        format!(
+            "c1.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{nanos}:{}", self.id))
+        )
+    }
+
+    /// The cursor `token` encodes, or `None` if it isn't one.
+    pub fn decode(token: &str) -> Option<Self> {
+        use base64::Engine;
+        let raw = token.strip_prefix("c1.")?;
+        if raw.len() > 64 {
+            return None;
+        }
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw)
+            .ok()?;
+        let text = String::from_utf8(bytes).ok()?;
+        let (nanos, id) = text.split_once(':')?;
+        Some(Self {
+            at: DateTime::from_timestamp_nanos(nanos.parse().ok()?),
+            id: id.parse().ok()?,
+        })
+    }
+}
+
+/// A search of the whole audit log (`GET /internal/admin/audit`), newest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditQuery {
+    /// Only events strictly before this position.
+    pub before: Option<Cursor>,
+    /// At most this many, from 1 to [`MAX_SEARCH`].
+    pub limit: usize,
+    /// Only this `user`.
+    pub actor: Option<String>,
+    /// Only this `tool` (the registry name, such as `jira.create_issue`).
+    pub action: Option<String>,
+    pub outcome: Option<Outcome>,
+    /// At or after this time.
+    pub from: Option<DateTime<Utc>>,
+    /// Strictly before this time.
+    pub to: Option<DateTime<Utc>>,
+}
+
+impl AuditQuery {
+    /// Does `event`, stored as `id`, match? The in-memory sink filters with this; Postgres
+    /// filters in SQL to the same rules.
+    pub fn matches(&self, id: i64, event: &AuditEvent) -> bool {
+        self.before.is_none_or(|c| (event.at, id) < (c.at, c.id))
+            && self.actor.as_ref().is_none_or(|a| *a == event.user)
+            && self.action.as_ref().is_none_or(|a| *a == event.tool)
+            && self.outcome.is_none_or(|o| o == event.outcome)
+            && self.from.is_none_or(|f| event.at >= f)
+            && self.to.is_none_or(|t| event.at < t)
+    }
+
+    /// The limit, clamped to 1 to [`MAX_SEARCH`].
+    pub fn bounded_limit(&self) -> usize {
+        self.limit.clamp(1, MAX_SEARCH)
+    }
+}
+
+/// An event as stored, with its store id (the order of recording).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEvent {
+    pub id: i64,
+    pub event: AuditEvent,
+}
+
+impl StoredEvent {
+    pub fn cursor(&self) -> Cursor {
+        Cursor {
+            at: self.event.at,
+            id: self.id,
+        }
+    }
+}
+
 /// Does `event` belong in [`AuditSink::reads`]?
 pub fn is_read_of(event: &AuditEvent, user: &str, run_id: &str, until: DateTime<Utc>) -> bool {
     event.user == user
@@ -177,6 +321,21 @@ pub trait AuditSink: Send + Sync {
         _until: DateTime<Utc>,
         _limit: usize,
     ) -> StoreResult<Option<Vec<ReadEvent>>> {
+        Ok(None)
+    }
+
+    /// Events matching `query`, newest first by `(at, id)`, at most `query.limit` (clamped
+    /// to 1 to [`MAX_SEARCH`]). `None` when this sink can't be read back.
+    async fn search(&self, _query: &AuditQuery) -> StoreResult<Option<Vec<StoredEvent>>> {
+        Ok(None)
+    }
+
+    /// How many events at or after `since` each outcome has (outcomes with none are left
+    /// out). `None` when this sink can't be read back.
+    async fn count_outcomes(
+        &self,
+        _since: DateTime<Utc>,
+    ) -> StoreResult<Option<BTreeMap<Outcome, u64>>> {
         Ok(None)
     }
 }
@@ -219,6 +378,36 @@ impl AuditSink for MemoryAudit {
         found.truncate(limit);
         Ok(Some(found))
     }
+
+    async fn search(&self, query: &AuditQuery) -> StoreResult<Option<Vec<StoredEvent>>> {
+        let events = self.events.lock().expect("audit lock");
+        let mut found: Vec<StoredEvent> = events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i as i64 + 1, e))
+            .filter(|(id, e)| query.matches(*id, e))
+            .map(|(id, e)| StoredEvent {
+                id,
+                event: e.clone(),
+            })
+            .collect();
+        found.sort_by_key(|s| std::cmp::Reverse((s.event.at, s.id)));
+        found.truncate(query.bounded_limit());
+        Ok(Some(found))
+    }
+
+    async fn count_outcomes(
+        &self,
+        since: DateTime<Utc>,
+    ) -> StoreResult<Option<BTreeMap<Outcome, u64>>> {
+        let mut counts = BTreeMap::new();
+        for e in self.events.lock().expect("audit lock").iter() {
+            if e.at >= since {
+                *counts.entry(e.outcome).or_insert(0) += 1;
+            }
+        }
+        Ok(Some(counts))
+    }
 }
 
 /// Records every event in several sinks, such as Postgres plus a JSON-lines file that is
@@ -247,6 +436,29 @@ impl AuditSink for TeeAudit {
     ) -> StoreResult<Option<Vec<ReadEvent>>> {
         for sink in &self.0 {
             if let Some(found) = sink.reads(user, run_id, until, limit).await? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// From the first sink that can be read back.
+    async fn search(&self, query: &AuditQuery) -> StoreResult<Option<Vec<StoredEvent>>> {
+        for sink in &self.0 {
+            if let Some(found) = sink.search(query).await? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// From the first sink that can be read back.
+    async fn count_outcomes(
+        &self,
+        since: DateTime<Utc>,
+    ) -> StoreResult<Option<BTreeMap<Outcome, u64>>> {
+        for sink in &self.0 {
+            if let Some(found) = sink.count_outcomes(since).await? {
                 return Ok(Some(found));
             }
         }
