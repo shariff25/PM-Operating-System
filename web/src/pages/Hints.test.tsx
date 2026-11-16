@@ -166,3 +166,59 @@ describe('theme', () => {
     expect(screen.getByRole('menuitemradio', { name: copy.theme.system })).toHaveFocus();
   });
 });
+
+describe('hints on a decided draft', () => {
+  const none = async () => {
+    await waitFor(() => expect(document.querySelector('[data-hint]')).toBeNull());
+    expect(screen.queryByText(copy.hints.sources)).not.toBeInTheDocument();
+    expect(screen.queryByText(copy.hintDismiss)).not.toBeInTheDocument();
+  };
+  const withStatus = (status: 'rejected' | 'failed') => (a: Api) => {
+    const orig = a.getDraft.bind(a);
+    a.getDraft = async (id) => ({ ...(await orig(id)), status });
+    return a;
+  };
+
+  it('shows none on an approved draft', async () => {
+    renderApp({ hash: '/d/apr_done' });
+    await screen.findByLabelText('Outcome');
+    await none();
+  });
+
+  it('shows none on an expired draft', async () => {
+    renderApp({ hash: '/d/apr_slack_old' });
+    await screen.findByText(copy.approve.expiredNote);
+    await none();
+  });
+
+  it('shows none on a rejected or failed draft', async () => {
+    const first = renderApp({ hash: '/d/apr_jira', wrap: withStatus('rejected') });
+    await screen.findByText(copy.approve.rejectedNote);
+    await none();
+    first.unmount();
+    renderApp({ hash: '/d/apr_jira', wrap: withStatus('failed') });
+    await screen.findByText(copy.approve.failedNote);
+    await none();
+  });
+
+  it('shows none on the phone layout either', async () => {
+    window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+      matches: query.includes('max-width'),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+    try {
+      renderApp({ hash: '/d/apr_done' });
+      await screen.findByRole('tablist');
+      await none();
+    } finally {
+      delete (window as { matchMedia?: unknown }).matchMedia;
+    }
+  });
+
+  it('still shows the first hint on a pending draft', async () => {
+    renderApp({ hash: '/d/apr_jira' });
+    await screen.findByText(copy.hints.sources);
+  });
+});

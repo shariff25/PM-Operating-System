@@ -88,3 +88,43 @@ describe('inline pairing', () => {
     expect(under.find((l) => l.kind === 'removed')?.merged).toBeUndefined();
   });
 });
+
+describe('list markers', () => {
+  it('does not show a change when only the list marker changed', () => {
+    const d = diffLines('Intro\n1. First thing\n2. Second thing', 'Intro\n- First thing\n- Second thing');
+    expect(d.map((l) => l.kind)).toEqual(['same', 'same', 'same']);
+    expect(d.map((l) => l.text)).toEqual(['Intro', '- First thing', '- Second thing']);
+    expect(d.map((l) => !!l.markerOnly)).toEqual([false, true, true]);
+  });
+
+  it('treats an unchanged marker as plain unchanged', () => {
+    const d = diffLines('- a\n- b', '- a\n- b');
+    expect(d.some((l) => l.markerOnly)).toBe(false);
+  });
+
+  it('shows a reworded item without a struck marker', () => {
+    const d = diffLines('1. The grace period is 14 days', '- The grace period is 7 days');
+    expect(d.map((l) => l.kind)).toEqual(['removed', 'added']);
+    const added = d[1]!;
+    expect(added.inline?.[0]).toEqual({ text: '- ', kind: 'same' });
+    expect(added.inline?.filter((p) => p.kind !== 'same').map((p) => p.text)).toEqual(['14', '7']);
+    expect(added.parts?.filter((p) => p.changed).map((p) => p.text)).toEqual(['7']);
+  });
+
+  it('still reports real added items when markers changed too', () => {
+    const d = diffLines('- a\n- b', '* a\n* b\n* c');
+    expect(d.map((l) => l.kind)).toEqual(['same', 'same', 'added']);
+  });
+
+  it('marks a paragraph whose list only changed style', () => {
+    const blocks = diffBlocks(diffLines('Intro\n\n1. a\n2. b\n\nEnd', 'Intro\n\n- a\n- b\n\nEnd'));
+    expect(blocks.map((b) => b.styleOnly)).toEqual([false, true, false]);
+    expect(blocks.every((b) => !b.changed)).toBe(true);
+  });
+
+  it('does not call a list style-only when its words changed too', () => {
+    const blocks = diffBlocks(diffLines('1. a\n2. b', '- a\n- c'));
+    expect(blocks[0]!.changed).toBe(true);
+    expect(blocks[0]!.styleOnly).toBe(false);
+  });
+});

@@ -48,7 +48,11 @@ function LineText({ line }: { line: DiffLine }) {
       </span>
     );
   }
-  if (!line.parts) return <span className="ba-text">{line.text}</span>;
+  if (!line.parts) {
+    if (line.kind === 'added') return <ins className="ba-text">{line.text}</ins>;
+    if (line.kind === 'removed') return <del className="ba-text">{line.text}</del>;
+    return <span className="ba-text">{line.text}</span>;
+  }
   return (
     <span className="ba-text">
       {line.parts.map((p, i) =>
@@ -69,28 +73,84 @@ function LineText({ line }: { line: DiffLine }) {
 function BeforeAfter({ diff }: { diff: DiffLine[] }) {
   const blocks = useMemo(() => diffBlocks(diff), [diff]);
   const [open, setOpen] = useState<Set<number>>(new Set());
+  const [openRemoved, setOpenRemoved] = useState<Set<number>>(new Set());
   const items: ReactNode[] = [];
   let i = 0;
   while (i < blocks.length) {
     const block = blocks[i]!;
+    if (block.styleOnly) {
+      items.push(
+        <li key={i} className="ba-note">
+          <Icon name="info" size={13} />
+          {copy.draft.diffListStyle}
+        </li>,
+      );
+      i++;
+      continue;
+    }
     if (block.changed) {
+      const shown = block.lines.filter((l) => !l.merged);
+      // A paragraph rewritten from scratch: the old text is shown lighter, cut to its first lines.
+      const replaced = shown.some((l) => l.kind === 'removed') && shown.some((l) => l.kind === 'added');
+      const removedLines = shown.filter((l) => l.kind === 'removed');
+      const collapsible = replaced && (removedLines.length > 1 || removedLines.map((l) => l.text).join('').length > 100);
+      const at = i;
+      const expanded = !collapsible || openRemoved.has(at);
+      const groupId = `ba-removed-${at}`;
+      const row = (l: DiffLine, k: number) => (
+        <p key={k} className={`ba-line ba-${l.inline ? 'changed' : l.kind}${replaced && l.kind === 'removed' ? ' ba-soft' : ''}`}>
+          <span className="sr-only">
+            {l.inline ? copy.draft.diffChanged : l.kind === 'added' ? copy.draft.diffAdded : l.kind === 'removed' ? copy.draft.diffRemoved : copy.draft.diffSame}
+          </span>
+          <LineText line={l} />
+        </p>
+      );
+      const out: ReactNode[] = [];
+      let k = 0;
+      while (k < shown.length) {
+        if (collapsible && shown[k]!.kind === 'removed') {
+          const group: ReactNode[] = [];
+          while (k < shown.length && shown[k]!.kind === 'removed') {
+            group.push(row(shown[k]!, k));
+            k++;
+          }
+          out.push(
+            <div key={`g${k}`} className="ba-removed-group">
+              <div id={groupId} className={expanded ? undefined : 'ba-clamp'}>{group}</div>
+              <button
+                type="button"
+                className="ba-more"
+                aria-expanded={expanded}
+                aria-controls={groupId}
+                onClick={() =>
+                  setOpenRemoved((o) => {
+                    const n = new Set(o);
+                    if (n.has(at)) n.delete(at);
+                    else n.add(at);
+                    return n;
+                  })
+                }
+              >
+                <Icon name={expanded ? 'chevronDown' : 'chevronRight'} size={13} />
+                {expanded ? copy.draft.diffHideRemoved : copy.draft.diffShowRemoved}
+              </button>
+            </div>,
+          );
+        } else {
+          out.push(row(shown[k]!, k));
+          k++;
+        }
+      }
       items.push(
         <li key={i} className="ba-block">
-          {block.lines.filter((l) => !l.merged).map((l, k) => (
-            <p key={k} className={`ba-line ba-${l.inline ? 'changed' : l.kind}`}>
-              <span className="sr-only">
-                {l.inline ? copy.draft.diffChanged : l.kind === 'added' ? copy.draft.diffAdded : l.kind === 'removed' ? copy.draft.diffRemoved : copy.draft.diffSame}
-              </span>
-              <LineText line={l} />
-            </p>
-          ))}
+          {out}
         </li>,
       );
       i++;
       continue;
     }
     const start = i;
-    while (i < blocks.length && !blocks[i]!.changed) i++;
+    while (i < blocks.length && !blocks[i]!.changed && !blocks[i]!.styleOnly) i++;
     const run = blocks.slice(start, i);
     const isOpen = open.has(start);
     items.push(
@@ -409,7 +469,7 @@ export function DraftPage({ id }: { id: string }) {
       ? copy.approve.confirmSlack
       : copy.approve.confirm;
   const diff = suggestion?.status === 'ready' && suggestion.body !== null ? diffLines(draft.body, suggestion.body) : null;
-  const changed = diff?.some((l) => l.kind !== 'same') ?? false;
+  const changed = diff?.some((l) => l.kind !== 'same' || l.markerOnly) ?? false;
   const nextHelp = approveError ? copy.approve.errors[approveError.key] : null;
 
   const approveNote =
@@ -761,8 +821,8 @@ export function DraftPage({ id }: { id: string }) {
     </dl>
   );
 
-  // Hints that apply to this draft: the approve and ask hints need a draft that can still be decided.
-  const hintNames = (pending ? ['sources', 'ask', 'approve'] : ['sources']) as HintName[];
+  // Hints only appear on a pending draft: once it is decided there is nothing left to coach.
+  const hintNames = (pending ? ['sources', 'ask', 'approve'] : []) as HintName[];
 
   const panelBody = { doc: null, sources: sourcesPanel, ask: askPanel, details: detailsPanel }[activeTab];
 
@@ -914,7 +974,7 @@ export function DraftPage({ id }: { id: string }) {
         <aside className="panel" aria-label={copy.panel.label}>
           {pending && <Hint name="approve" anchor="approve-btn" />}
           {tabList}
-          <Hint name="sources" anchor="ptab-sources" />
+          {pending && <Hint name="sources" anchor="ptab-sources" />}
           {pending && <Hint name="ask" anchor="ptab-ask" />}
           <div role="tabpanel" id={`ppanel-${activeTab}`} aria-labelledby={`ptab-${activeTab}`} className="panel-body">
             {panelBody}
