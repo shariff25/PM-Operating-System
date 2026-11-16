@@ -10,11 +10,8 @@ const open = (id: string, extra = {}) => renderApp({ hash: `/d/${id}`, ...extra 
 const edit = async (user: ReturnType<typeof userEvent.setup>) =>
   user.click(await screen.findByRole('button', { name: copy.draft.edit }));
 const formatted = () => screen.getByRole('article', { name: copy.draft.formattedLabel });
-// The change box lives in the panel's "Ask for a change" tab.
-const changeBox = async (user: ReturnType<typeof userEvent.setup>) => {
-  await user.click(await screen.findByRole('tab', { name: copy.panel.ask }));
-  return screen.getByLabelText(copy.draft.askLabel);
-};
+// The change box is docked under the document.
+const changeBox = async () => screen.findByLabelText(copy.draft.askLabel);
 
 describe('draft workspace', () => {
   it('opens as the formatted document with an Edit button, and no editor', async () => {
@@ -56,7 +53,10 @@ describe('draft workspace', () => {
   it('shows five sources, highlights the selected one, and an honest empty state', async () => {
     const user = userEvent.setup();
     const { unmount } = open('apr_prd');
-    const panel = await screen.findByRole('tabpanel', { name: new RegExp(copy.panel.sources) });
+    const panel = await screen.findByRole('region', { name: copy.draft.sourcesHeading });
+    // numbered cards, with the count beside the heading
+    expect(panel).toHaveTextContent(copy.draft.sourcesCount(5));
+    expect(within(panel).getByRole('button', { name: /PAY-212/ })).toHaveAccessibleName(/^Source 2: ?PAY-212: Payment failure handling, ?Jira$/);
     const buttons = within(panel).getAllByRole('button', { pressed: false });
     expect(buttons.filter((b) => b.className.includes('source'))).toHaveLength(5);
     await user.click(within(panel).getByRole('button', { name: /PAY-212/ }));
@@ -71,10 +71,15 @@ describe('draft workspace', () => {
   it('accepts a suggestion after showing a before and after', async () => {
     const user = userEvent.setup();
     open('apr_prd');
-    await user.type(await changeBox(user), 'shorter');
+    await user.type(await changeBox(), 'shorter');
     await user.click(screen.getByRole('button', { name: copy.draft.askButton }));
     const region = await screen.findByRole('region', { name: copy.draft.suggestionHeading });
     expect(within(region).getAllByText(copy.draft.diffRemoved).length).toBeGreaterThan(0);
+    // the change is shown in the document itself, with the title and the unchanged text around it
+    expect(screen.queryByRole('article', { name: copy.draft.formattedLabel })).not.toBeInTheDocument();
+    expect(within(region).getByRole('heading', { level: 1, name: 'PRD: TCB grace period setting' })).toBeInTheDocument();
+    expect(within(region).getByRole('heading', { level: 2, name: 'Proposal' })).toBeInTheDocument();
+    expect(within(region).getByText(copy.draft.suggestionBar('shorter'))).toBeInTheDocument();
     await user.click(within(region).getByRole('button', { name: copy.draft.accept }));
     await waitFor(() => expect(screen.queryByRole('region', { name: copy.draft.suggestionHeading })).not.toBeInTheDocument());
     expect(formatted()).not.toHaveTextContent('Who gets the banner');
@@ -85,7 +90,7 @@ describe('draft workspace', () => {
     const user = userEvent.setup();
     open('apr_prd');
     const before = (await screen.findByRole('article', { name: copy.draft.formattedLabel })).textContent;
-    await user.type(await changeBox(user), 'add a legal risk');
+    await user.type(await changeBox(), 'add a legal risk');
     await user.click(screen.getByRole('button', { name: copy.draft.askButton }));
     const region = await screen.findByRole('region', { name: copy.draft.suggestionHeading });
     expect(within(region).getAllByText(copy.draft.diffAdded).length).toBeGreaterThan(0);
@@ -97,31 +102,40 @@ describe('draft workspace', () => {
   it('explains a failed suggestion plainly', async () => {
     const user = userEvent.setup();
     open('apr_prd');
-    await user.type(await changeBox(user), 'make it fail');
+    await user.type(await changeBox(), 'make it fail');
     await user.click(screen.getByRole('button', { name: copy.draft.askButton }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/I could not make that change/);
   });
 });
 
-describe('draft panel tabs', () => {
-  it('has Sources, Ask for a change and Details tabs, driven by click and arrow keys', async () => {
+describe('draft side panel', () => {
+  it('shows what the bot read, a checklist from the real state, and the details beside the document', async () => {
     const user = userEvent.setup();
     open('apr_prd');
-    const tabs = await screen.findByRole('tablist', { name: copy.panel.tabsLabel });
-    const names = within(tabs).getAllByRole('tab').map((t) => t.textContent);
-    expect(names).toEqual([`${copy.panel.sources}5`, copy.panel.ask, copy.panel.details]);
-    const sources = within(tabs).getByRole('tab', { name: new RegExp(copy.panel.sources) });
-    expect(sources).toHaveAttribute('aria-selected', 'true');
-    sources.focus();
-    await user.keyboard('{ArrowRight}');
-    expect(within(tabs).getByRole('tab', { name: copy.panel.ask })).toHaveFocus();
-    expect(screen.getByLabelText(copy.draft.askLabel)).toBeInTheDocument();
-    await user.keyboard('{End}');
-    const details = screen.getByRole('tabpanel', { name: copy.panel.details });
+    await screen.findByRole('article', { name: copy.draft.formattedLabel });
+    expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
+    const check = screen.getByRole('region', { name: copy.draft.checklistHeading });
+    expect(check).toHaveTextContent(copy.draft.checklist.sources(5));
+    expect(check).toHaveTextContent(copy.draft.checklist.internal);
+    expect(check).toHaveTextContent(copy.draft.checklist.noExpiry);
+    expect(check).not.toHaveTextContent(copy.draft.checklist.suggestion);
+    const details = screen.getByRole('region', { name: copy.panel.details });
     expect(details).toHaveTextContent('pm-ana');
     expect(details).toHaveTextContent(copy.panel.never);
     expect(within(details).getByRole('link', { name: copy.panel.openTask })).toHaveAttribute('href', '#/a/tsk_seed_prd');
     expect(within(details).getByText('apr_prd')).toBeInTheDocument();
+    // editing shows up in the checklist
+    await edit(user);
+    expect(check).toHaveTextContent(copy.draft.checklist.unsaved);
+  });
+
+  it('says so in the checklist when a draft has no sources and goes outside the company', async () => {
+    open('apr_slack');
+    await screen.findByRole('article', { name: copy.draft.formattedLabel });
+    const check = screen.getByRole('region', { name: copy.draft.checklistHeading });
+    expect(check).toHaveTextContent(copy.draft.checklist.noSources);
+    expect(check).toHaveTextContent(copy.draft.checklist.external);
+    expect(check).toHaveTextContent(/Expires soon: \d+ h left/);
   });
 
   it('shows the breadcrumb, and a toast when the draft is saved', async () => {
@@ -137,14 +151,15 @@ describe('draft panel tabs', () => {
     await screen.findByText(copy.toast.saved);
   });
 
-  it('a Slack draft shows the time left, and the expired one offers no Ask tab', async () => {
+  it('a Slack draft shows the time left, and the expired one offers no change box and no checklist', async () => {
     const { unmount } = open('apr_slack');
     await screen.findByRole('article', { name: copy.draft.formattedLabel });
     expect(screen.getAllByText(/\d+ h left/).length).toBeGreaterThan(0);
     unmount();
     open('apr_slack_old');
-    const tabs = await screen.findByRole('tablist', { name: copy.panel.tabsLabel });
-    expect(within(tabs).queryByRole('tab', { name: copy.panel.ask })).not.toBeInTheDocument();
+    await screen.findByRole('article', { name: copy.draft.formattedLabel });
+    expect(screen.queryByLabelText(copy.draft.askLabel)).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: copy.draft.checklistHeading })).not.toBeInTheDocument();
   });
 });
 
@@ -211,7 +226,7 @@ describe('approving', () => {
         return a;
       },
     });
-    await user.type(await changeBox(user), 'shorter');
+    await user.type(await changeBox(), 'shorter');
     await user.click(screen.getByRole('button', { name: copy.draft.askButton }));
     const region = await screen.findByRole('region', { name: copy.draft.suggestionHeading });
     expect(screen.getByRole('button', { name: 'Approve to Confluence' })).toBeDisabled();

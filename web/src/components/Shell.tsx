@@ -1,6 +1,7 @@
 import { createContext, useContext, useState } from 'react';
 import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
+import type { Me } from '../api';
 import { useApp } from '../app-context';
 import { copy } from '../copy';
 import { useData } from '../data';
@@ -10,29 +11,36 @@ import { Icon, Mark } from './icons';
 import type { IconName } from './icons';
 import { UserMenu } from './UserMenu';
 
-type NavKey = 'home' | 'drafts' | 'followups' | 'activity';
+type NavKey = 'home' | 'drafts' | 'followups' | 'activity' | 'admin';
 
 interface Slots {
-  /** Where a page puts its breadcrumb in the top bar. */
+  /** Where a page puts its title in the phone top bar. Null on desktop, where pages carry their own header. */
   lead: HTMLElement | null;
-  /** Where a page puts its actions in the top bar (desktop only). */
-  actions: HTMLElement | null;
   isPhone: boolean;
 }
 
-const SlotContext = createContext<Slots>({ lead: null, actions: null, isPhone: false });
+const SlotContext = createContext<Slots>({ lead: null, isPhone: false });
 export const useShell = () => useContext(SlotContext);
 
-/** Render into the top bar's breadcrumb slot. */
+/** Render into the phone top bar's title slot. On desktop the page shows its own header instead. */
 export function TopBarLead({ children }: { children: ReactNode }) {
   const { lead } = useShell();
   return lead ? createPortal(children, lead) : null;
 }
 
-/** Render into the top bar's action slot; null on phone, where pages show actions in place. */
-export function TopBarActions({ children }: { children: ReactNode }) {
-  const { actions, isPhone } = useShell();
-  return actions && !isPhone ? createPortal(children, actions) : null;
+/**
+ * The white bar at the top of a detail page: the breadcrumb, then whatever the page adds
+ * (a status, actions). On a phone the breadcrumb goes into the top bar instead.
+ */
+export function PageBar({ crumb, children }: { crumb: ReactNode; children?: ReactNode }) {
+  const { isPhone } = useShell();
+  if (isPhone) return <TopBarLead>{crumb}</TopBarLead>;
+  return (
+    <div className="pagebar">
+      {crumb}
+      {children}
+    </div>
+  );
 }
 
 export function navKey(route: Route): NavKey {
@@ -50,17 +58,45 @@ export function navKey(route: Route): NavKey {
   }
 }
 
-const SIDEBAR_KEY = 'pmos-sidebar';
-function readCollapsed(): boolean {
-  try {
-    return window.localStorage.getItem(SIDEBAR_KEY) === 'collapsed';
-  } catch {
-    return false;
-  }
-}
-
 export function isMac(): boolean {
   return typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+}
+
+/** Where the Admin entry goes. The web app has no admin page of its own; this is the server's. */
+export const ADMIN_HREF = '/admin/';
+
+/** True when the server says this person may administer or audit. The field may be absent. */
+export function canAdminister(me: Me): boolean {
+  return (me.permissions ?? []).some((p) => /admin|audit/i.test(p));
+}
+
+/** A connected system and how it is doing, for the rail's Connected block. */
+export interface ConnectedSystem {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+/**
+ * The rail's "Connected" block. The API has no connector status for a PM yet, so today this
+ * is given nothing and renders nothing. It never shows made-up statuses.
+ */
+export function ConnectedSystems({ systems }: { systems?: ConnectedSystem[] | null }) {
+  if (!systems || systems.length === 0) return null;
+  return (
+    <section className="rail-connected" aria-label={copy.nav.connected}>
+      <h2 className="rail-label">{copy.nav.connected}</h2>
+      <ul>
+        {systems.map((s) => (
+          <li key={s.name}>
+            <span className={`rail-dot ${s.ok ? 'rail-dot-ok' : 'rail-dot-warn'}`} aria-hidden="true" />
+            <span className="rail-connected-name">{s.name}</span>
+            <span className={`rail-connected-detail ${s.ok ? '' : 'rail-connected-warn'}`}>{s.detail}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
 }
 
 interface NavItem {
@@ -70,30 +106,22 @@ interface NavItem {
   icon: IconName;
   count: number;
   countLabel: (n: number) => string;
+  /** The accent badge is for drafts only: the one count that asks for a decision. */
+  accent?: boolean;
 }
 
 export function Shell({ route, children, onSignOut }: { route: Route; children: ReactNode; onSignOut: () => void }) {
-  const { openPalette } = useApp();
+  const { openPalette, me } = useApp();
   const { pendingCount, brief, briefState, runningCount } = useData();
   const isPhone = useMediaQuery(PHONE_QUERY);
-  const [collapsed, setCollapsed] = useState(readCollapsed);
   const [lead, setLead] = useState<HTMLElement | null>(null);
-  const [actions, setActions] = useState<HTMLElement | null>(null);
   const current = navKey(route);
-
-  const toggle = () => {
-    const next = !collapsed;
-    setCollapsed(next);
-    try {
-      window.localStorage.setItem(SIDEBAR_KEY, next ? 'collapsed' : 'open');
-    } catch {
-      /* it still collapses for this visit */
-    }
-  };
+  // The draft workspace needs the width: there the rail is icons only.
+  const compact = !isPhone && route.name === 'draft';
 
   const items: NavItem[] = [
     { key: 'home', href: '#/', label: copy.nav.home, icon: 'home', count: 0, countLabel: () => '' },
-    { key: 'drafts', href: '#/drafts', label: copy.nav.drafts, icon: 'drafts', count: pendingCount, countLabel: copy.nav.draftsCount },
+    { key: 'drafts', href: '#/drafts', label: copy.nav.drafts, icon: 'drafts', count: pendingCount, countLabel: copy.nav.draftsCount, accent: true },
     ...(briefState === 'ready'
       ? [{
           key: 'followups' as const,
@@ -105,30 +133,36 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
         }]
       : []),
     { key: 'activity', href: '#/activity', label: copy.nav.activity, icon: 'activity', count: runningCount, countLabel: copy.nav.activityCount },
+    ...(canAdminister(me)
+      ? [{ key: 'admin' as const, href: ADMIN_HREF, label: copy.nav.admin, icon: 'shield' as const, count: 0, countLabel: () => '' }]
+      : []),
   ];
 
-  const pageTitle = { home: copy.nav.home, drafts: copy.nav.drafts, followups: copy.nav.followups, activity: copy.nav.activity }[current];
   const detail = route.name === 'draft' || route.name === 'task';
   const shortcut = isMac() ? copy.nav.shortcutMac : copy.nav.shortcutOther;
+  const pageTitle = { home: copy.nav.home, drafts: copy.nav.drafts, followups: copy.nav.followups, activity: copy.nav.activity, admin: copy.nav.admin }[current];
 
-  const link = (it: NavItem, variant: 'side' | 'tabs') => {
+  const link = (it: NavItem, variant: 'rail' | 'tabs') => {
     const on = it.key === current;
+    const iconOnly = variant === 'rail' && compact;
     return (
       <li key={it.key}>
         <a
           href={it.href}
-          className={variant === 'side' ? 'nav-item' : 'tabbar-item'}
+          className={variant === 'rail' ? 'rail-item' : 'tabbar-item'}
           aria-current={on ? 'page' : undefined}
-          title={variant === 'side' && collapsed ? it.label : undefined}
+          title={iconOnly ? it.label : undefined}
         >
           <span className="nav-icon">
-            <Icon name={it.icon} size={variant === 'side' ? 16 : 22} />
-            {it.count > 0 && (variant === 'tabs' || collapsed) && <span className="nav-dot" aria-hidden="true" />}
+            <Icon name={it.icon} size={variant === 'rail' ? (iconOnly ? 18 : 16) : 22} />
+            {it.count > 0 && (variant === 'tabs' || iconOnly) && (
+              <span className={`nav-dot ${it.accent ? 'nav-dot-accent' : ''}`} aria-hidden="true" />
+            )}
           </span>
-          <span className={variant === 'side' && collapsed ? 'sr-only' : 'nav-label'}>{it.label}</span>
+          <span className={iconOnly ? 'sr-only' : 'nav-label'}>{it.label}</span>
           {it.count > 0 && (
-            <span className="nav-count">
-              {variant === 'side' && !collapsed && <span aria-hidden="true">{it.count}</span>}
+            <span className={`nav-count ${it.accent && variant === 'rail' && !iconOnly ? 'nav-count-accent' : ''}`}>
+              {variant === 'rail' && !iconOnly && <span aria-hidden="true">{it.count}</span>}
               <span className="sr-only">, {it.countLabel(it.count)}</span>
             </span>
           )}
@@ -137,94 +171,71 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
     );
   };
 
-  // The sidebar groups its items like a console: Home, then Inbox, then History.
-  const groups: { label: string | null; keys: NavKey[] }[] = [
-    { label: null, keys: ['home'] },
-    { label: copy.nav.groupInbox, keys: ['drafts', 'followups'] },
-    { label: copy.nav.groupHistory, keys: ['activity'] },
-  ];
-  const sideNav = (
-    <div className="nav-groups">
-      {groups.map((g) => {
-        const list = items.filter((it) => g.keys.includes(it.key));
-        if (list.length === 0) return null;
-        return (
-          <div key={g.keys[0]} className="nav-group">
-            {g.label && !collapsed && <span className="nav-group-label" aria-hidden="true">{g.label}</span>}
-            <ul className="nav-list">{list.map((it) => link(it, 'side'))}</ul>
-          </div>
-        );
-      })}
-    </div>
-  );
-  const tabNav = <ul className="tabbar-list">{items.map((it) => link(it, 'tabs'))}</ul>;
-
   return (
-    <SlotContext.Provider value={{ lead, actions, isPhone }}>
+    <SlotContext.Provider value={{ lead, isPhone }}>
       <a href="#main" className="skip-link" onClick={(e) => { e.preventDefault(); document.getElementById('main')?.focus(); }}>
         {copy.nav.skip}
       </a>
-      <div className={`app ${collapsed && !isPhone ? 'app-collapsed' : ''} ${isPhone ? 'app-phone' : ''}`}>
+      <div className={`app ${compact ? 'app-compact' : ''} ${isPhone ? 'app-phone' : ''}`}>
         {!isPhone && (
-          <aside className="sidebar">
-            <div className="sidebar-head">
-              <a href="#/" className="brand" aria-label={`${copy.appName}, ${copy.nav.home}`}>
-                <Mark size={24} />
-                {!collapsed && <span className="brand-name">{copy.appName}</span>}
-              </a>
-              <button
-                type="button"
-                className="icon-btn sidebar-toggle"
-                aria-label={collapsed ? copy.nav.expand : copy.nav.collapse}
-                aria-expanded={!collapsed}
-                onClick={toggle}
-              >
-                <Icon name="sidebar" size={18} />
-              </button>
-            </div>
-            <nav aria-label={copy.nav.label} className="sidebar-nav">
-              {sideNav}
+          <header className={`rail ${compact ? 'rail-compact' : ''}`}>
+            <a href="#/" className="rail-brand" aria-label={`${copy.appName}, ${copy.nav.home}`}>
+              <Mark size={compact ? 28 : 24} />
+              {!compact && <span className="rail-brand-name">{copy.appName}</span>}
+            </a>
+            <button
+              type="button"
+              className="rail-ask"
+              onClick={() => openPalette()}
+              aria-label={compact ? copy.nav.askButton : undefined}
+              title={compact ? `${copy.nav.askButton} (${shortcut})` : undefined}
+              aria-keyshortcuts={isMac() ? 'Meta+K' : 'Control+K'}
+            >
+              <Icon name="search" size={compact ? 18 : 15} />
+              {!compact && (
+                <>
+                  <span className="rail-ask-text">{copy.nav.askButton}</span>
+                  <kbd className="kbd kbd-rail">{shortcut}</kbd>
+                </>
+              )}
+            </button>
+            <nav aria-label={copy.nav.label} className="rail-nav">
+              <ul className="rail-list">{items.map((it) => link(it, 'rail'))}</ul>
             </nav>
-            <div className="sidebar-foot">
-              <UserMenu variant="sidebar" collapsed={collapsed} onSignOut={onSignOut} />
+            <ConnectedSystems />
+            <div className="rail-foot">
+              <UserMenu variant="rail" collapsed={compact} onSignOut={onSignOut} />
             </div>
-          </aside>
+          </header>
         )}
 
         <div className="content">
-          <header className="topbar">
-            {isPhone && (detail ? (
-              <a href={route.name === 'draft' ? '#/drafts' : '#/activity'} className="icon-btn" aria-label={copy.nav.back}>
-                <Icon name="chevronLeft" size={20} />
-              </a>
-            ) : (
-              <a href="#/" className="brand brand-phone" aria-label={`${copy.appName}, ${copy.nav.home}`}>
-                <Mark size={26} />
-              </a>
-            ))}
-            <div className="topbar-lead" ref={setLead}>
-              {!detail && <span className="topbar-title">{pageTitle}</span>}
-            </div>
-            <div className="topbar-right">
+          {isPhone && (
+            <header className="topbar">
+              {detail ? (
+                <a href={route.name === 'draft' ? '#/drafts' : '#/activity'} className="icon-btn topbar-btn" aria-label={copy.nav.back}>
+                  <Icon name="chevronLeft" size={20} />
+                </a>
+              ) : (
+                <a href="#/" className="topbar-brand" aria-label={`${copy.appName}, ${copy.nav.home}`}>
+                  <Mark size={28} />
+                </a>
+              )}
+              <div className="topbar-lead" ref={setLead}>
+                {!detail && <span className="topbar-title">{pageTitle}</span>}
+              </div>
               <button
                 type="button"
-                className={isPhone ? 'icon-btn' : 'ask-trigger'}
+                className="icon-btn topbar-btn"
                 onClick={() => openPalette()}
-                aria-label={isPhone ? copy.nav.askButton : undefined}
+                aria-label={copy.nav.askButton}
                 aria-keyshortcuts={isMac() ? 'Meta+K' : 'Control+K'}
               >
-                <Icon name={isPhone ? 'search' : 'sparkle'} size={isPhone ? 20 : 16} />
-                {!isPhone && (
-                  <>
-                    <span>{copy.nav.askButton}</span>
-                    <kbd className="kbd">{shortcut}</kbd>
-                  </>
-                )}
+                <Icon name="search" size={20} />
               </button>
-              <div className="topbar-actions" ref={setActions} />
-              {isPhone && <UserMenu variant="compact" onSignOut={onSignOut} />}
-            </div>
-          </header>
+              <UserMenu variant="compact" onSignOut={onSignOut} />
+            </header>
+          )}
           <main id="main" tabIndex={-1} className={`main main-${route.name}`}>
             {children}
           </main>
@@ -232,7 +243,7 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
 
         {isPhone && (
           <nav aria-label={copy.nav.label} className="tabbar">
-            {tabNav}
+            <ul className="tabbar-list">{items.filter((it) => it.key !== 'admin').map((it) => link(it, 'tabs'))}</ul>
           </nav>
         )}
       </div>

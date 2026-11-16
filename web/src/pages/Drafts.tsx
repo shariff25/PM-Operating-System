@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { DraftStatus, DraftSummary } from '../api';
 import { useApp } from '../app-context';
-import { DraftPill, Empty, ErrorNote, NewRequestButton, PageHeader, Skeleton } from '../components/bits';
-import { Icon, kindIcon } from '../components/icons';
+import { DraftPill, Empty, ErrorNote, NewRequestButton, PageHeader, Skeleton, SystemTag, kindSystem } from '../components/bits';
+import { Icon } from '../components/icons';
 import { copy } from '../copy';
 import { useData } from '../data';
 import { draftWhere, effectiveStatus } from '../drafts';
@@ -37,20 +37,19 @@ function DraftRow({ d, now }: { d: DraftSummary; now: number }) {
     <li>
       <a className="trow drafts-grid" href={draftHref(d.id)}>
         <span className="tcell tcell-title">
-          <span className="row-icon"><Icon name={kindIcon(d.kind)} size={15} /></span>
+          <SystemTag system={kindSystem(d.kind)} label={kindSystem(d.kind)} />
           <span className="row-main">
             <span className="row-title">{d.title}</span>
-            <span className="row-meta row-where">{whereText}</span>
+            <span className="row-meta">{whereText}</span>
           </span>
           {d.practice && <span className="tag">{copy.home.practiceBadge}</span>}
         </span>
-        <span className="tcell tcell-kind"><span className="cell-clip">{whereText}</span></span>
         <span className="tcell tcell-status"><DraftPill status={status} /></span>
         <span className="tcell tcell-left">
           {left ? (
-            <span className="row-left"><Icon name="clock" size={13} />{left}</span>
+            <span className="row-when row-when-warn"><Icon name="clock" size={13} />{left}</span>
           ) : (
-            <span className="tcell-none" aria-hidden="true">—</span>
+            <span className="tcell-none" aria-hidden="true">–</span>
           )}
         </span>
         <span className="tcell tcell-time">{relTime(d.created_at, now)}</span>
@@ -89,68 +88,69 @@ export function Drafts() {
 
   return (
     <div className="page">
-      <PageHeader title={copy.draftsPage.title} lede={copy.draftsPage.lede}>
+      <PageHeader title={copy.draftsPage.title} lede={copy.draftsPage.lede} eyebrow={drafts ? copy.draftsPage.countLine(count('pending')) : undefined}>
         <NewRequestButton />
       </PageHeader>
-      <div className="tabs tabs-scroll" role="tablist" aria-label={copy.draftsPage.tabsLabel} onKeyDown={(e) => tabKeys(e, FILTERS, filter, pick)}>
-        {FILTERS.map((f) => (
-          <button
-            key={f}
-            ref={(el) => { tabs.current[f] = el; }}
-            type="button"
-            role="tab"
-            id={`tab-${f}`}
-            aria-selected={filter === f}
-            aria-controls="drafts-panel"
-            tabIndex={filter === f ? 0 : -1}
-            className="tab"
-            onClick={() => setFilter(f)}
-          >
-            {copy.draftsPage.tabs[f]}
-            {drafts && <span className="tab-count">{count(f)}</span>}
-          </button>
-        ))}
-      </div>
-      <section id="drafts-panel" role="tabpanel" aria-labelledby={`tab-${filter}`} className="tabpanel">
-        {draftsError && (
-          <ErrorNote actionLabel={copy.errors.retry} onAction={() => void reloadDrafts()}>
-            {draftsError}
-          </ErrorNote>
-        )}
-        {!drafts && !draftsError && <Skeleton rows={4} label={copy.home.loadingDrafts} />}
-        {drafts && shown.length === 0 && (
-          <Empty
-            icon="drafts"
-            action={
-              drafts.length === 0 ? (
-                <button type="button" className="btn btn-sm" onClick={() => openPalette(copy.emptyActions.askDraftText)}>
-                  {copy.emptyActions.askDraft}
-                </button>
-              ) : filter !== 'all' ? (
-                <button type="button" className="btn btn-sm" onClick={() => pick('all')}>
-                  {copy.emptyActions.showAll}
-                </button>
-              ) : undefined
-            }
-          >
-            {empty}
-          </Empty>
-        )}
-        {shown.length > 0 && (
-          <div className="table">
-            <div className="thead drafts-grid" aria-hidden="true">
-              <span>{copy.draftsPage.columns.title}</span>
-              <span className="tcell-kind">{copy.draftsPage.columns.kind}</span>
-              <span>{copy.draftsPage.columns.status}</span>
-              <span className="tcell-left">{copy.draftsPage.columns.expires}</span>
-              <span className="tcell-time">{copy.draftsPage.columns.created}</span>
+      <div className="card card-table">
+        <div className="tabs tabs-scroll card-tabs" role="tablist" aria-label={copy.draftsPage.tabsLabel} onKeyDown={(e) => tabKeys(e, FILTERS, filter, pick)}>
+          {FILTERS.map((f) => (
+            <button
+              key={f}
+              ref={(el) => { tabs.current[f] = el; }}
+              type="button"
+              role="tab"
+              id={`tab-${f}`}
+              aria-selected={filter === f}
+              aria-controls="drafts-panel"
+              tabIndex={filter === f ? 0 : -1}
+              className="tab"
+              onClick={() => setFilter(f)}
+            >
+              {copy.draftsPage.tabs[f]}
+              {drafts && <span className="tab-count">{count(f)}</span>}
+            </button>
+          ))}
+        </div>
+        <section id="drafts-panel" role="tabpanel" aria-labelledby={`tab-${filter}`} className="tabpanel">
+          {draftsError && (
+            <ErrorNote actionLabel={copy.errors.retry} onAction={() => void reloadDrafts()}>
+              {draftsError}
+            </ErrorNote>
+          )}
+          {!drafts && !draftsError && <Skeleton rows={4} label={copy.home.loadingDrafts} />}
+          {drafts && shown.length === 0 && (
+            <Empty
+              icon="drafts"
+              action={
+                drafts.length === 0 ? (
+                  <button type="button" className="btn btn-sm" onClick={() => openPalette(copy.emptyActions.askDraftText)}>
+                    {copy.emptyActions.askDraft}
+                  </button>
+                ) : filter !== 'all' ? (
+                  <button type="button" className="btn btn-sm" onClick={() => pick('all')}>
+                    {copy.emptyActions.showAll}
+                  </button>
+                ) : undefined
+              }
+            >
+              {empty}
+            </Empty>
+          )}
+          {shown.length > 0 && (
+            <div className="table">
+              <div className="thead drafts-grid" aria-hidden="true">
+                <span>{copy.draftsPage.columns.title}</span>
+                <span>{copy.draftsPage.columns.status}</span>
+                <span className="tcell-left">{copy.draftsPage.columns.expires}</span>
+                <span className="tcell-time">{copy.draftsPage.columns.created}</span>
+              </div>
+              <ul className="tbody">
+                {shown.map((d) => <DraftRow key={d.id} d={d} now={now} />)}
+              </ul>
             </div>
-            <ul className="tbody">
-              {shown.map((d) => <DraftRow key={d.id} d={d} now={now} />)}
-            </ul>
-          </div>
-        )}
-      </section>
+          )}
+        </section>
+      </div>
     </div>
   );
 }

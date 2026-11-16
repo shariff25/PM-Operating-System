@@ -21,23 +21,25 @@ const dismissHint = async (user: ReturnType<typeof userEvent.setup>) =>
   user.click(within(document.querySelector('[data-hint]') as HTMLElement).getByRole('button', { name: copy.hintDismiss }));
 
 describe('coach marks stay out of the way', () => {
-  it('desktop: the sources and ask hints sit between the tabs and the panel, never inside a tab', async () => {
+  it('desktop: each hint sits in the flow next to what it describes, never over it', async () => {
     const user = userEvent.setup();
     renderApp({ hash: '/d/apr_prd' });
-    const tabs = await screen.findByRole('tablist', { name: copy.panel.tabsLabel });
+    const sources = await screen.findByRole('region', { name: copy.draft.sourcesHeading });
     const hint = await screen.findByRole('note', { name: copy.hintLabel });
     expect(hint).toHaveAttribute('data-hint', 'sources');
-    expect(tabs.contains(hint)).toBe(false);
-    expect(tabs.nextElementSibling).toBe(hint);
-    expect(hint.nextElementSibling).toHaveAttribute('role', 'tabpanel');
+    // under the sources heading, above the first source card
+    expect(sources.contains(hint)).toBe(true);
+    expect(hint.nextElementSibling).toHaveClass('sources');
     expect(hint).not.toHaveClass('coach-banner');
 
     await dismissHint(user);
     await waitFor(() => expect(document.querySelector('[data-hint]')).toHaveAttribute('data-hint', 'ask'));
-    expect(tabs.contains(document.querySelector('[data-hint]'))).toBe(false);
+    // right above the change box under the document
+    const ask = document.querySelector('[data-hint]') as HTMLElement;
+    expect(ask.nextElementSibling).toBe(screen.getByRole('form', { name: copy.draft.askHeading }));
   });
 
-  it('desktop: the approve hint is above the tabs, not on the approve button', async () => {
+  it('desktop: the approve hint tops the side panel, not on the approve button', async () => {
     const user = userEvent.setup();
     renderApp({ hash: '/d/apr_prd' });
     await screen.findByRole('note');
@@ -48,7 +50,8 @@ describe('coach marks stay out of the way', () => {
     const approve = screen.getByRole('button', { name: /^Approve to/ });
     expect(hint.contains(approve)).toBe(false);
     expect(approve.contains(hint)).toBe(false);
-    expect(hint.nextElementSibling).toBe(screen.getByRole('tablist', { name: copy.panel.tabsLabel }));
+    expect(hint.parentElement).toBe(screen.getByRole('complementary', { name: copy.panel.label }));
+    expect(hint.previousElementSibling).toBeNull();
     expect(approve).toBeEnabled();
     await dismissHint(user);
     await waitFor(() => expect(document.querySelector('[data-hint]')).toBeNull());
@@ -121,11 +124,10 @@ describe('phone header actions', () => {
 });
 
 describe('before and after', () => {
-  it('highlights changed words inside a line and folds unchanged paragraphs', async () => {
+  it('highlights changed words inside a line and shows unchanged paragraphs as the formatted document', async () => {
     const user = userEvent.setup();
     renderApp({ hash: '/d/apr_prd' });
-    await user.click(await screen.findByRole('tab', { name: copy.panel.ask }));
-    await user.type(screen.getByLabelText(copy.draft.askLabel), 'shorter');
+    await user.type(await screen.findByLabelText(copy.draft.askLabel), 'shorter');
     await user.click(screen.getByRole('button', { name: copy.draft.askButton }));
     const region = await screen.findByRole('region', { name: copy.draft.suggestionHeading });
     const list = within(region).getByRole('list', { name: copy.draft.beforeAfter });
@@ -144,14 +146,13 @@ describe('before and after', () => {
     expect(line?.querySelector('del .sr-only')?.textContent).toMatch(/removed/);
     expect(line?.querySelector('ins .sr-only')?.textContent).toMatch(/added/);
 
-    // unchanged paragraphs are one folded row that opens
-    const fold = within(list).getByRole('button', { name: /unchanged paragraph/ });
-    expect(fold).toHaveAttribute('aria-expanded', 'false');
-    expect(within(list).queryByText('Is 14 days too generous', { exact: false })).not.toBeNull(); // removed, so shown
-    expect(list.querySelectorAll('.ba-fold .ba-same')).toHaveLength(0);
-    await user.click(fold);
-    expect(fold).toHaveAttribute('aria-expanded', 'true');
-    expect(list.querySelectorAll('.ba-fold .ba-same').length).toBeGreaterThan(0);
+    // a removed line drops its markdown marker but keeps its words
+    expect(within(list).queryByText('Is 14 days too generous', { exact: false })).not.toBeNull();
+    // unchanged paragraphs read as the formatted document, not as raw markdown lines
+    const same = [...list.querySelectorAll('.dd-same')];
+    expect(same.length).toBeGreaterThan(0);
+    expect(same.some((b) => b.querySelector('h2, li, strong'))).toBe(true);
+    expect(same.some((b) => b.textContent?.includes('## '))).toBe(false);
   });
 });
 
@@ -166,7 +167,7 @@ describe('the drafts table says where each draft goes', () => {
     const prd = screen.getByRole('link', { name: /PRD: TCB grace period/ });
     expect(prd).toHaveTextContent(copy.home.kindLabel('confluence_page'));
     expect(prd.textContent).not.toContain('#');
-    expect(screen.getByText(copy.draftsPage.columns.kind)).toBeInTheDocument();
+    expect(within(rows[0]!).getByText('Slack', { selector: '.sys-tag' })).toBeInTheDocument();
   });
 });
 
@@ -218,7 +219,7 @@ describe('empty and first-run states', () => {
     expect(await screen.findByRole('dialog', { name: copy.palette.label })).toBeInTheDocument();
   });
 
-  it('a pending draft with no sources offers Ask me to add sources, which opens the ask tab with the words filled in', async () => {
+  it('a pending draft with no sources offers Ask me to add sources, which fills in the change box and puts the cursor there', async () => {
     const user = userEvent.setup();
     renderApp({
       hash: '/d/apr_jira',
@@ -230,7 +231,9 @@ describe('empty and first-run states', () => {
     });
     const box = (await screen.findByText(copy.noSources)).closest('.empty') as HTMLElement;
     await user.click(within(box).getByRole('button', { name: copy.draft.askSources }));
-    expect(await screen.findByLabelText(copy.draft.askLabel)).toHaveValue(copy.draft.askSourcesPrefill);
+    const change = await screen.findByLabelText(copy.draft.askLabel);
+    expect(change).toHaveValue(copy.draft.askSourcesPrefill);
+    await waitFor(() => expect(change).toHaveFocus());
   });
 });
 
@@ -238,7 +241,7 @@ describe('sources as the backend sends them', () => {
   it('shows an id title as it is, and a source without a link has no Open link', async () => {
     const user = userEvent.setup();
     renderApp({ hash: '/d/apr_prd' });
-    const panel = await screen.findByRole('tabpanel');
+    const panel = await screen.findByRole('region', { name: copy.draft.sourcesHeading });
     await user.click(within(panel).getByRole('button', { name: /Confluence page 12345/ }));
     expect(within(panel).queryByRole('link', { name: /Open in source/ })).not.toBeInTheDocument();
     expect(within(panel).getByText(copy.draft.sourceNoLink)).toBeInTheDocument();
@@ -276,8 +279,7 @@ describe('before and after: lighter fallbacks', () => {
     return a;
   };
   const ask = async (user: ReturnType<typeof userEvent.setup>) => {
-    await user.click(await screen.findByRole('tab', { name: copy.panel.ask }));
-    await user.type(screen.getByLabelText(copy.draft.askLabel), 'rewrite');
+    await user.type(await screen.findByLabelText(copy.draft.askLabel), 'rewrite');
     await user.click(screen.getByRole('button', { name: copy.draft.askButton }));
     const region = await screen.findByRole('region', { name: copy.draft.suggestionHeading });
     return within(region).getByRole('list', { name: copy.draft.beforeAfter });

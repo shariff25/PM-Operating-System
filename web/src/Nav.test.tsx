@@ -42,16 +42,32 @@ describe('navigation', () => {
     await waitFor(() => expect(navLink(copy.nav.followups)).toHaveAccessibleName(`${copy.nav.followups}, ${copy.nav.followupsCount(2)}`));
   });
 
-  it('collapses the sidebar to icons and back', async () => {
-    const user = userEvent.setup();
-    renderApp();
-    const toggle = await screen.findByRole('button', { name: copy.nav.collapse });
-    expect(toggle).toHaveAttribute('aria-expanded', 'true');
-    await user.click(toggle);
-    expect(screen.getByRole('button', { name: copy.nav.expand })).toHaveAttribute('aria-expanded', 'false');
-    // labels are still there for screen readers
-    expect(navLink(copy.nav.drafts)).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: copy.nav.expand }));
+  it('shows the rail as icons on the draft workspace, with the labels kept for screen readers', async () => {
+    renderApp({ hash: '/d/apr_prd' });
+    await screen.findByRole('article', { name: copy.draft.formattedLabel });
+    expect(document.querySelector('.rail')).toHaveClass('rail-compact');
+    await waitFor(() => expect(navLink(copy.nav.drafts)).toHaveAccessibleName(`${copy.nav.drafts}, ${copy.nav.draftsCount(3)}`));
+    expect(screen.getByRole('button', { name: copy.nav.askButton })).toBeInTheDocument();
+    window.location.hash = '/drafts';
+    await screen.findByRole('heading', { level: 1, name: copy.draftsPage.title });
+    expect(document.querySelector('.rail')).not.toHaveClass('rail-compact');
+  });
+
+  it('shows Admin only to someone with an admin or auditor permission, and no Connected block without data', async () => {
+    const first = renderApp();
+    await screen.findByLabelText(copy.home.askLabel);
+    expect(within(nav()).queryByRole('link', { name: copy.nav.admin })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: copy.nav.connected })).not.toBeInTheDocument();
+    first.unmount();
+    renderApp({
+      wrap: (api) => {
+        const me = api.me.bind(api);
+        api.me = async () => ({ ...(await me()), permissions: ['audit:read'] });
+        return api;
+      },
+    });
+    await screen.findByLabelText(copy.home.askLabel);
+    await waitFor(() => expect(within(nav()).getByRole('link', { name: copy.nav.admin })).toBeInTheDocument());
   });
 
   it('sends unknown and malformed routes home', async () => {
@@ -158,7 +174,7 @@ describe('phone layout', () => {
       copy.nav.followups,
       copy.nav.activity,
     ]);
-    expect(document.querySelector('.sidebar')).toBeNull();
+    expect(document.querySelector('.rail')).toBeNull();
     await user.click(within(bar).getByRole('link', { name: new RegExp(`^${copy.nav.drafts}`) }));
     expect(within(nav()).getByRole('link', { name: new RegExp(`^${copy.nav.drafts}`) })).toHaveAttribute('aria-current', 'page');
     await user.click(screen.getByRole('button', { name: /Menu for/ }));
@@ -175,7 +191,9 @@ describe('phone layout', () => {
     const user = userEvent.setup();
     renderApp({ hash: '/d/apr_prd' });
     const tabs = await screen.findByRole('tablist', { name: copy.panel.tabsLabel });
-    expect(within(tabs).getAllByRole('tab').map((t) => t.textContent)).toEqual([copy.panel.doc, `${copy.panel.sources}5`, copy.panel.ask, copy.panel.details]);
+    expect(within(tabs).getAllByRole('tab').map((t) => t.textContent)).toEqual([copy.panel.doc, `${copy.panel.sources}5`, copy.panel.details]);
+    // the change box is docked under the document, not in a tab of its own
+    expect(screen.getByLabelText(copy.draft.askLabel)).toBeInTheDocument();
     await user.click(within(tabs).getByRole('tab', { name: copy.panel.doc }));
     expect(screen.getByRole('article', { name: copy.draft.formattedLabel })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Approve to Confluence' })).toBeInTheDocument();
