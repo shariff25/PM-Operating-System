@@ -67,6 +67,52 @@ fn dated_entry(what: &str) -> Value {
     })
 }
 
+/// The most characters of a Slack message's text.
+pub const MAX_SLACK_TEXT: u64 = 40_000;
+/// The most characters of a Confluence page body (markdown) and title.
+pub const MAX_CONFLUENCE_BODY: u64 = 200_000;
+pub const MAX_CONFLUENCE_TITLE: u64 = 255;
+/// The most characters of a Confluence version comment.
+pub const MAX_VERSION_COMMENT: u64 = 500;
+/// The most characters of a Jira summary and description.
+pub const MAX_JIRA_SUMMARY: u64 = 255;
+pub const MAX_JIRA_DESCRIPTION: u64 = 32_000;
+
+/// Arguments that say where a write goes, by tool: a decision of `edit` from the Slack bot
+/// must leave each one as drafted, or it is refused (`422 target_changed`). The Slack bot
+/// names the deciding PM without anything signed, so its edits may change what a draft
+/// says, never where it goes. The orchestrator's edits are not limited.
+///
+/// The names are the schemas' own (below); a unit test checks each one is in its tool's
+/// schema. An optional one missing from both the draft and the edit is unchanged. Keep
+/// this in step with the Slack edit window (`editable_fields` in `crates/slack/src/cards.rs`),
+/// which must not offer these fields.
+pub const EDIT_IMMUTABLE_ARGS: &[(&str, &[&str])] = &[
+    ("slack.post_reply", &["channel", "thread_ts", "message_ts"]),
+    ("slack.send_message", &["channel"]),
+    ("confluence.create_draft", &["space", "parent_id"]),
+    ("confluence.update_page", &["page_id", "version"]),
+    ("jira.create_issue", &["project", "issue_type", "epic"]),
+    ("bets.record", &["key"]),
+];
+
+/// The arguments of `tool` that an edit from the Slack bot can't change.
+pub fn edit_immutable_args(tool: &str) -> &'static [&'static str] {
+    EDIT_IMMUTABLE_ARGS
+        .iter()
+        .find(|(t, _)| *t == tool)
+        .map_or(&[], |(_, args)| args)
+}
+
+/// The first of `tool`'s [`edit_immutable_args`] whose value differs between the drafted
+/// and the edited arguments, if any. Absent in both counts as equal.
+pub fn changed_target(tool: &str, drafted: &Value, edited: &Value) -> Option<&'static str> {
+    edit_immutable_args(tool)
+        .iter()
+        .copied()
+        .find(|arg| drafted.get(arg) != edited.get(arg))
+}
+
 fn limit() -> Value {
     json!({"type": "integer", "minimum": 1, "maximum": 20, "description": "Maximum results (default 5)"})
 }
@@ -113,8 +159,8 @@ pub fn input_schema(tool: &str) -> Option<Value> {
             json!({
                 "project": {"type": "string"},
                 "issue_type": {"type": "string", "enum": ["Epic", "Story", "Task", "Bug"]},
-                "summary": {"type": "string"},
-                "description": {"type": "string"},
+                "summary": {"type": "string", "maxLength": MAX_JIRA_SUMMARY},
+                "description": {"type": "string", "maxLength": MAX_JIRA_DESCRIPTION},
                 "epic": {"type": "string", "description": "Parent epic key"},
             }),
             &["project", "issue_type", "summary"],
@@ -127,8 +173,8 @@ pub fn input_schema(tool: &str) -> Option<Value> {
         "confluence.create_draft" => object(
             json!({
                 "space": {"type": "string", "description": "Space key"},
-                "title": {"type": "string"},
-                "body": {"type": "string", "description": "Page body in markdown"},
+                "title": {"type": "string", "maxLength": MAX_CONFLUENCE_TITLE},
+                "body": {"type": "string", "description": "Page body in markdown", "maxLength": MAX_CONFLUENCE_BODY},
                 "parent_id": {"type": "string"},
             }),
             &["space", "title", "body"],
@@ -136,10 +182,11 @@ pub fn input_schema(tool: &str) -> Option<Value> {
         "confluence.update_page" => object(
             json!({
                 "page_id": {"type": "string"},
-                "body": {"type": "string", "description": "New page body in markdown"},
-                "version_comment": {"type": "string"},
+                "version": {"type": "integer", "minimum": 1, "description": "The page's version number as confluence_read returned it: the update is refused if the page changed since"},
+                "body": {"type": "string", "description": "New page body in markdown", "maxLength": MAX_CONFLUENCE_BODY},
+                "version_comment": {"type": "string", "maxLength": MAX_VERSION_COMMENT},
             }),
-            &["page_id", "body"],
+            &["page_id", "version", "body"],
         ),
         "slack.search" => object(
             json!({"query": {"type": "string", "maxLength": 500}, "limit": limit()}),
@@ -154,12 +201,12 @@ pub fn input_schema(tool: &str) -> Option<Value> {
                 "channel": {"type": "string"},
                 "thread_ts": {"type": "string"},
                 "message_ts": {"type": "string", "pattern": SLACK_TS_PATTERN, "description": "The message the reply answers, when PM OS was tagged in it: one draft per message instead of per thread"},
-                "text": {"type": "string"},
+                "text": {"type": "string", "maxLength": MAX_SLACK_TEXT},
             }),
             &["channel", "thread_ts", "text"],
         ),
         "slack.send_message" => object(
-            json!({"channel": {"type": "string", "description": "Channel or user id"}, "text": {"type": "string"}}),
+            json!({"channel": {"type": "string", "description": "Channel or user id"}, "text": {"type": "string", "maxLength": MAX_SLACK_TEXT}}),
             &["channel", "text"],
         ),
         "docs.search" => object(
@@ -472,6 +519,63 @@ mod tests {
         assert!(check_args(&s, &bad).is_err());
         let c = input_schema("stats.compare").unwrap();
         assert!(check_args(&c, &json!({"control": 1, "treatment": {}})).is_err());
+    }
+
+    #[test]
+    fn immutable_targets_are_real_schema_arguments() {
+        for (tool, args) in EDIT_IMMUTABLE_ARGS {
+            let schema = input_schema(tool).unwrap_or_else(|| panic!("{tool} has a schema"));
+            for arg in *args {
+                assert!(
+                    schema["properties"].get(arg).is_some(),
+                    "{tool} has no argument `{arg}`"
+                );
+            }
+        }
+        let drafted = json!({"channel": "C1", "thread_ts": "1.1", "text": "a"});
+        let text_only = json!({"channel": "C1", "thread_ts": "1.1", "text": "b"});
+        assert_eq!(
+            changed_target("slack.post_reply", &drafted, &text_only),
+            None
+        );
+        let moved = json!({"channel": "C2", "thread_ts": "1.1", "text": "a"});
+        assert_eq!(
+            changed_target("slack.post_reply", &drafted, &moved),
+            Some("channel")
+        );
+        let tagged = json!({"channel": "C1", "thread_ts": "1.1", "message_ts": "1.2", "text": "a"});
+        assert_eq!(
+            changed_target("slack.post_reply", &drafted, &tagged),
+            Some("message_ts"),
+            "adding an optional target changes it"
+        );
+        assert_eq!(changed_target("stats.compare", &drafted, &moved), None);
+    }
+
+    #[test]
+    fn write_text_is_bounded() {
+        let reply = input_schema("slack.post_reply").unwrap();
+        let ok = json!({"channel": "C1", "thread_ts": "1.1", "text": "x".repeat(40_000)});
+        assert!(check_args(&reply, &ok).is_ok());
+        let long = json!({"channel": "C1", "thread_ts": "1.1", "text": "x".repeat(40_001)});
+        assert!(check_args(&reply, &long).unwrap_err().contains("40000"));
+        let page = input_schema("confluence.create_draft").unwrap();
+        let title = json!({"space": "PM", "title": "t".repeat(256), "body": "b"});
+        assert!(check_args(&page, &title).is_err());
+        let issue = input_schema("jira.create_issue").unwrap();
+        let summary = json!({"project": "PM", "issue_type": "Task", "summary": "s".repeat(256)});
+        assert!(check_args(&issue, &summary).is_err());
+        let update = input_schema("confluence.update_page").unwrap();
+        let comment =
+            json!({"page_id": "1", "version": 2, "body": "b", "version_comment": "c".repeat(501)});
+        assert!(check_args(&update, &comment).is_err());
+        assert!(
+            check_args(&update, &json!({"page_id": "1", "body": "b"}))
+                .unwrap_err()
+                .contains("version"),
+            "version is required"
+        );
+        assert!(check_args(&update, &json!({"page_id": "1", "version": 0, "body": "b"})).is_err());
     }
 
     #[test]

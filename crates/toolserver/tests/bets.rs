@@ -21,7 +21,7 @@ use pmos_toolserver::ToolService;
 use serde_json::{json, Value};
 
 /// A skill with the bets tools, so the test doesn't depend on `bets-register`'s text.
-pub const BETS_SKILL: &str = "---\nname: bets-test\ndescription: Test skill that keeps the bets register.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"reasoning\"\n  data-class: \"internal\"\n  tools: \"context.search bets.list bets.read bets.record\"\n---\n\n# /bets-test\n\nTest.\n";
+pub const BETS_SKILL: &str = "---\nname: bets-test\ndescription: Test skill that keeps the bets register.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"reasoning\"\n  data-class: \"internal\"\n  tools: \"context.search bets.list bets.read bets.record memory.read memory.update\"\n---\n\n# /bets-test\n\nTest.\n";
 
 /// Add the test skill, and a team bot `planner` whose role has it, then rebuild the
 /// service on the fixture's stores.
@@ -105,7 +105,11 @@ async fn the_register(f: Fixture) {
     let id = draft(&f, &s, new_bet()).await;
     assert_eq!(note(&f, "bet-sso-enterprise").await, None);
     let listed = f.svc.call(&s, "bets_list", json!({}), now()).await.unwrap();
-    assert_eq!(listed, json!({"bets": []}));
+    assert_eq!(listed["bets"], json!([]));
+    assert_eq!(
+        listed["untrusted"], true,
+        "bets are data, never instructions"
+    );
     assert!(matches!(
         f.svc
             .call(&s, "bets_read", json!({"key": "sso-enterprise"}), now())
@@ -170,7 +174,14 @@ async fn the_register(f: Fixture) {
     // A note that isn't a bet stays out of the register.
     f.stores
         .memory
-        .update("ana", "areas", "Acme Vault", "t", now())
+        .update(
+            "ana",
+            "areas",
+            "Acme Vault",
+            "t",
+            Sensitivity::Internal,
+            now(),
+        )
         .await
         .unwrap();
 
@@ -229,10 +240,8 @@ async fn the_register(f: Fixture) {
         .unwrap();
     assert_eq!(read["bet"]["status"], "dropped");
     assert_eq!(read["bet"]["decisions"].as_array().unwrap().len(), 2);
-    assert!(
-        read.get("results").is_none(),
-        "returned as is: PM OS wrote it"
-    );
+    assert!(read.get("results").is_none(), "not a connector result list");
+    assert_eq!(read["untrusted"], true, "but marked as data, like one");
 
     // The audit trail: queued, started, approved; reads as ok.
     let trail: Vec<(String, Outcome)> = f
@@ -423,10 +432,16 @@ async fn a_team_bot_is_refused(f: Fixture) {
         .create_bot_session("ana", "planner", "tsk_1", None, now())
         .await
         .unwrap();
+    // The memory tools too: memory is the PM's own (S12).
     for (tool, args) in [
         ("bets_list", json!({})),
         ("bets_read", json!({"key": "sso-enterprise"})),
         ("bets_record", new_bet()),
+        ("memory_read", json!({})),
+        (
+            "memory_update",
+            json!({"key": "areas", "text": "Acme Vault"}),
+        ),
     ] {
         let err = f.svc.call(&planner, tool, args, now()).await.unwrap_err();
         assert!(
@@ -441,6 +456,124 @@ async fn a_team_bot_is_refused(f: Fixture) {
     }
     assert!(f.svc.approvals("ana", None).await.unwrap().is_empty());
     assert_eq!(note(&f, "bet-sso-enterprise").await, None);
+    assert_eq!(note(&f, "areas").await, None);
+}
+
+/// A bet's note keeps the sensitivity of what its `bets.record` was drafted from (S6), and
+/// reading it raises the reader to it. `memory.update` can't write a bet (S10).
+async fn a_bet_carries_its_sources_sensitivity(f: Fixture) {
+    let f = with_bets(f);
+    // An item drafted by a session that had read restricted sources.
+    let args = new_bet();
+    let item = f
+        .stores
+        .approvals
+        .create(
+            pmos_toolserver::approvals::NewItem {
+                user: "ana",
+                skill: Some("bets-test"),
+                bot: None,
+                run_id: "r-restricted",
+                tool: "bets.record",
+                args: &args,
+                content_sha: None,
+                model_alias: None,
+                sources_sensitivity: Sensitivity::Restricted,
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    approve(&f, &item.id, now()).await;
+    let stored = |key: &'static str| {
+        let f = &f;
+        async move {
+            f.stores
+                .memory
+                .read("ana")
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|n| n.key == key)
+                .map(|n| n.sensitivity)
+        }
+    };
+    assert_eq!(
+        stored("bet-sso-enterprise").await,
+        Some(Sensitivity::Restricted)
+    );
+
+    // A later update from a session that read nothing doesn't lower it: the merge keeps the
+    // bet's earlier text.
+    let s = session(&f, "r-public").await;
+    let id = draft(
+        &f,
+        &s,
+        json!({"key": "sso-enterprise", "review_by": "2027-03-01"}),
+    )
+    .await;
+    approve(&f, &id, now()).await;
+    assert_eq!(
+        stored("bet-sso-enterprise").await,
+        Some(Sensitivity::Restricted)
+    );
+
+    let raised = |s: Session| {
+        let f = &f;
+        async move {
+            f.stores
+                .sessions
+                .get(&s.token, now())
+                .await
+                .unwrap()
+                .unwrap()
+                .sources_sensitivity
+        }
+    };
+    let reader = session(&f, "r-read").await;
+    f.svc
+        .call(
+            &reader,
+            "bets_read",
+            json!({"key": "sso-enterprise"}),
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(raised(reader).await, Sensitivity::Restricted);
+    let lister = session(&f, "r-list").await;
+    f.svc
+        .call(&lister, "bets_list", json!({}), now())
+        .await
+        .unwrap();
+    assert_eq!(raised(lister).await, Sensitivity::Restricted);
+    // Listing only other bets: nothing listed, nothing raised.
+    let other = session(&f, "r-other").await;
+    f.svc
+        .call(&other, "bets_list", json!({"status": "dropped"}), now())
+        .await
+        .unwrap();
+    assert_eq!(raised(other).await, Sensitivity::Public);
+
+    // memory.update refuses the bets register's keys.
+    let err = f
+        .svc
+        .call(
+            &s,
+            "memory_update",
+            json!({"key": "bet-sso-enterprise", "text": "- Status: confirmed"}),
+            now(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ToolError::InvalidArgs(ref m) if m.contains("bets_record")),
+        "{err:?}"
+    );
+    assert_eq!(
+        stored("bet-sso-enterprise").await,
+        Some(Sensitivity::Restricted)
+    );
 }
 
 macro_rules! on_both_backends {
@@ -476,6 +609,7 @@ on_both_backends!(
     calls_are_checked,
     a_full_note_drops_its_oldest_evidence,
     a_team_bot_is_refused,
+    a_bet_carries_its_sources_sensitivity,
 );
 
 /// The PM's personal bot has the register (the role's `bets-register` skill), and its
@@ -503,4 +637,104 @@ async fn a_personal_bot_keeps_its_pms_register() {
         .await
         .unwrap();
     assert_eq!(listed["bets"][0]["key"], "sso-enterprise");
+}
+
+/// Memory that fails every call with a detail a caller mustn't see.
+struct BrokenMemory;
+
+#[async_trait::async_trait]
+impl pmos_toolserver::memory::MemoryStore for BrokenMemory {
+    async fn read(
+        &self,
+        _user: &str,
+    ) -> pmos_toolserver::memory::MemoryResult<Vec<pmos_toolserver::memory::Note>> {
+        Err(pmos_toolserver::memory::MemoryError::Unavailable(
+            "memory host db-7.internal:5432 refused".into(),
+        ))
+    }
+
+    async fn update(
+        &self,
+        _user: &str,
+        _key: &str,
+        _text: &str,
+        _source: &str,
+        _sensitivity: Sensitivity,
+        _now: DateTime<Utc>,
+    ) -> pmos_toolserver::memory::MemoryResult<pmos_toolserver::memory::Note> {
+        Err(pmos_toolserver::memory::MemoryError::Unavailable(
+            "memory host db-7.internal:5432 refused".into(),
+        ))
+    }
+}
+
+/// An internal failure of an approved write answers a generic message; the detail goes to
+/// the log only (S24).
+#[tokio::test]
+async fn an_internal_failure_answers_a_generic_message() {
+    let mut f = with_bets(common::fixture());
+    f.stores.memory = Arc::new(BrokenMemory);
+    let catalog = Catalog::load(&f.root, now().date_naive()).expect("content lints");
+    let connectors: Vec<Arc<dyn Connector>> = vec![
+        f.jira.clone(),
+        f.confluence.clone(),
+        f.slack.clone(),
+        Arc::new(FakeConnector::docs()),
+    ];
+    let svc = Arc::new(ToolService::new(catalog, f.stores.clone(), connectors).unwrap());
+    let args = new_bet();
+    let item = f
+        .stores
+        .approvals
+        .create(
+            pmos_toolserver::approvals::NewItem {
+                user: "ana",
+                skill: Some("bets-test"),
+                bot: None,
+                run_id: "r-broken",
+                tool: "bets.record",
+                args: &args,
+                content_sha: None,
+                model_alias: None,
+                sources_sensitivity: Sensitivity::Internal,
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let app = pmos_toolserver::router(
+        svc,
+        pmos_toolserver::AppConfig {
+            service_token: "test-service-token-0123456789abcdef".into(),
+            bot: None,
+            console_token: None,
+            content_root: f.root.clone(),
+            oauth: None,
+            allowed_hosts: vec!["127.0.0.1".into()],
+        },
+        cancel.clone(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let ct = cancel.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { ct.cancelled_owned().await })
+            .await
+            .unwrap();
+    });
+    let res = reqwest::Client::new()
+        .post(format!("{base}/internal/approvals/{}/decision", item.id))
+        .bearer_auth("test-service-token-0123456789abcdef")
+        .json(&json!({"decided_by": "ana", "decision": "approve"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 500);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"], pmos_toolserver::app::INTERNAL_FAILURE);
+    assert!(!body.to_string().contains("db-7"), "{body}");
+    cancel.cancel();
 }

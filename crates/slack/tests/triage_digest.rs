@@ -98,6 +98,11 @@ async fn ts_ledger(
             since.is_none_or(|s| created >= s) && until.is_none_or(|u| created <= u)
         })
         .cloned()
+        // As the tool server answers the bot's token (S2): no approval ids.
+        .map(|mut r| {
+            r.as_object_mut().unwrap().remove("id");
+            r
+        })
         .collect();
     Json(json!({ "rows": rows })).into_response()
 }

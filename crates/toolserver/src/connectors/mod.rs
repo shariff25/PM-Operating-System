@@ -202,6 +202,10 @@ pub fn clip(text: &str, max: usize) -> (String, bool) {
     (out, cut)
 }
 
+/// What `confluence.update_page` answers when the page's version isn't the one the call
+/// names (someone saved after PM OS read it), live or fake. Nothing was written.
+pub const PAGE_CHANGED: &str = "the page changed since PM OS read it; read it again";
+
 /// Wrap a connector item as untrusted data for the model.
 pub fn untrusted(item: &Item) -> Value {
     serde_json::json!({

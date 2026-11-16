@@ -4,15 +4,31 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Who the person in front of the browser is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Identity {
     /// Behind the Spark's SSO proxy: `X-Forwarded-User` names the person
-    /// (`PMOS_CONSOLE_TRUST_PROXY=1`). Only safe when nothing but the proxy can reach the
-    /// console's port.
-    Proxy,
+    /// (`PMOS_CONSOLE_TRUST_PROXY=1`). Every request must also carry `X-Pmos-Proxy-Secret`
+    /// equal to `secret` (`PMOS_CONSOLE_PROXY_SECRET`), which only the proxy holds, so a
+    /// caller that reaches the console's port some other way can't name a user.
+    Proxy { secret: String },
     /// Development: every request is this handle (`PMOS_CONSOLE_DEV_USER`).
     Dev(String),
 }
+
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proxy { .. } => f
+                .debug_struct("Proxy")
+                .field("secret", &"<redacted>")
+                .finish(),
+            Self::Dev(user) => f.debug_tuple("Dev").field(user).finish(),
+        }
+    }
+}
+
+/// The shortest `PMOS_CONSOLE_PROXY_SECRET` the console accepts.
+pub const MIN_PROXY_SECRET: usize = 32;
 
 #[derive(Clone)]
 pub struct Config {
@@ -26,8 +42,9 @@ pub struct Config {
     pub bots_token: String,
     /// `PMOS_TOOLSERVER_URL`, default `http://127.0.0.1:8710`.
     pub toolserver_url: String,
-    /// `PMOS_TOOLSERVER_TOKEN`: the tool server's service token (`PMOS_SERVICE_TOKEN`
-    /// there), which the approvals list needs. Required, at least 32 characters.
+    /// `PMOS_TOOLSERVER_TOKEN`: the tool server's read-only `console` client token
+    /// (`PMOS_CONSOLE_TS_TOKEN` there), which may only read approvals. Required, at least 32
+    /// characters.
     pub toolserver_token: String,
     /// `PMOS_CONTENT_ROOT`, default `content`: where `team.yaml` is.
     pub content_root: PathBuf,
@@ -84,7 +101,18 @@ impl Config {
             }
         };
         let identity = match (trust_proxy, set("PMOS_CONSOLE_DEV_USER")) {
-            (true, None) => Identity::Proxy,
+            (true, None) => {
+                let secret = set("PMOS_CONSOLE_PROXY_SECRET").ok_or(
+                    "PMOS_CONSOLE_TRUST_PROXY=1 needs PMOS_CONSOLE_PROXY_SECRET: the secret the \
+                     sign-in proxy sends in X-Pmos-Proxy-Secret",
+                )?;
+                if secret.len() < MIN_PROXY_SECRET {
+                    return Err(format!(
+                        "PMOS_CONSOLE_PROXY_SECRET must be at least {MIN_PROXY_SECRET} characters"
+                    ));
+                }
+                Identity::Proxy { secret }
+            }
             (false, Some(user)) => {
                 if !pmos_contract::model::valid_handle(&user) {
                     return Err(format!(
@@ -175,6 +203,7 @@ mod tests {
 
     const BOTS: &str = "console-token-0123456789abcdef0123";
     const TOOLS: &str = "service-token-0123456789abcdef0123";
+    const SECRET: &str = "proxy-secret-0123456789abcdef01234";
 
     #[test]
     fn reads_defaults_and_redacts_tokens() {
@@ -209,9 +238,27 @@ mod tests {
             .contains("not both"));
         let mut proxy = base.to_vec();
         proxy.push(("PMOS_CONSOLE_TRUST_PROXY", "1"));
+        let err = Config::from_lookup(lookup(&proxy)).unwrap_err();
+        assert!(
+            err.contains("PMOS_CONSOLE_PROXY_SECRET"),
+            "trusting the proxy needs its secret: {err}"
+        );
+        let mut short = proxy.clone();
+        short.push(("PMOS_CONSOLE_PROXY_SECRET", "too-short"));
+        assert!(Config::from_lookup(lookup(&short))
+            .unwrap_err()
+            .contains("at least 32"));
+        proxy.push(("PMOS_CONSOLE_PROXY_SECRET", SECRET));
+        let cfg = Config::from_lookup(lookup(&proxy)).unwrap();
         assert_eq!(
-            Config::from_lookup(lookup(&proxy)).unwrap().identity,
-            Identity::Proxy
+            cfg.identity,
+            Identity::Proxy {
+                secret: SECRET.into()
+            }
+        );
+        assert!(
+            !format!("{cfg:?}").contains(SECRET),
+            "the proxy secret never prints"
         );
         let mut yes = base.to_vec();
         yes.push(("PMOS_CONSOLE_TRUST_PROXY", "yes"));

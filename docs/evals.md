@@ -54,7 +54,12 @@ client `evals`. For each task, `repeats` times, it:
   `--trace-token` so failures are tagged from the trace. Without one, tagging uses the task's
   status, error and events only, and the report says how many failures were tagged that way.
 - **Who asks.** A team bot serves team members only, so the `--as` handle must be in
-  `content/team.yaml`. Use a real PM, or add a member for the benchmarks.
+  `content/team.yaml`. The runtime also lets the `evals` token request tasks only as the
+  handles in its own `PMOS_EVALS_AS` (default `evals`; anything else is `403`), so a leaked
+  benchmark token can't run a PM's bots as them. Add a member for the benchmarks (`evals`,
+  as the eval stack does), or, for a run as a real PM, list their handle in the runtime's
+  `PMOS_EVALS_AS` for that run only. Eval tasks never name a Slack target (`400`) and send
+  no Slack notifications.
 - **`bot: personal`.** A category with `bot: personal` sends its tasks to the personal bot of
   whoever they are for: `pm-<requested_by>`, with `.` and `_` as hyphens, as onboarding names
   it. So `--as ana` runs them against `pm-ana`. The report records the resolved bot.
@@ -753,15 +758,18 @@ case cards", have no `pass_bar` and run each task once.
 - **Where:** a self-hosted runner on the Spark (labels `self-hosted, pmos-spark`), where the
   runtime, the worker and the models are. PRs from forks never run there. Registering the
   runner is in `docs/runbooks/upgrade.md`.
-- **What:** `deploy/pmos-admin evals-gate --base origin/<base branch>`. It lists the changed
-  paths (`git diff --name-only <base>...HEAD`), passes them to `pmos-evals affected`, starts
+- **What:** the Spark's own `/opt/pmos/deploy/pmos-admin evals-gate --checkout pr --base
+  origin/<base branch>`. The workflow runs on `pull_request_target` and checks the PR's head
+  out into `pr/` as data: nothing in it is run, and the stack uses the Spark's installed
+  images. It lists the changed
+  paths (`git -C pr diff --name-only <base>...HEAD`), passes them to `pmos-evals affected`, starts
   the eval stack on the PR's checkout, runs `pmos-evals gate` for each affected category with
   the base branch's committed reports as the baseline, and prints the summaries as one markdown document. The job appends it to the job
   summary. It exits 1 if any category's gate failed, 2 on an error, and 0 otherwise, including
   when no category is affected.
 - **Until a runner is registered,** the job waits in the queue. A platform owner runs
-  `deploy/pmos-admin evals-gate --base origin/main` on the Spark from the PR's branch, and
-  pastes the result into the PR.
+  `deploy/pmos-admin evals-gate --checkout <a checkout of the PR's branch> --base origin/main`
+  on the Spark, and pastes the result into the PR.
 
 **Weekly runs, and runs after a model or harness change,** are by hand on the Spark, on the
 eval stack and the content checkout (`main`):

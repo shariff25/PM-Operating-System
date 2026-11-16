@@ -375,7 +375,24 @@ impl Snoozer {
         let store = self.bots.snoozes();
         let mut posted = 0;
         for s in store.due(now) {
-            match self.bots.toolserver().approval(&s.approval_id).await {
+            // The item is read for the PM who snoozed it; one who has left the team is
+            // dropped.
+            let Some(handle) = self
+                .bots
+                .team()
+                .by_slack_id(&s.user)
+                .map(|m| m.handle.clone())
+            else {
+                tracing::info!(approval = %s.approval_id, "snoozed by someone no longer in team.yaml; dropped");
+                store.remove(&s.approval_id);
+                continue;
+            };
+            match self
+                .bots
+                .toolserver()
+                .approval(&s.approval_id, &handle)
+                .await
+            {
                 Ok(item)
                     if item["status"] == "pending" && expiry(&item).is_none_or(|e| e > now) =>
                 {
@@ -556,7 +573,9 @@ impl Bots {
     /// waiting; otherwise the card shows why and `None`.
     async fn pending_reply(&self, click: &Click, id: &str) -> Option<(String, Value)> {
         let handle = self.clicker(click).await?;
-        let item = self.load_item(&click.channel, &click.user, id).await?;
+        let item = self
+            .load_item(&click.channel, &click.user, &handle, id)
+            .await?;
         if !self.owns(&click.channel, &click.user, &handle, &item).await {
             return None;
         }

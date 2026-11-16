@@ -11,6 +11,9 @@ Never use it with real PM tokens or company data. The production rule (local ope
 models only) is unchanged: the gateway refuses the Claude upstream unless
 `PMOS_GATEWAY_CLOUD_TEST=1` is set.
 
+The same stack can use another provider's model instead of Claude: see
+[Another provider](#another-provider).
+
 ## What you can test
 
 | Try | What happens |
@@ -89,3 +92,47 @@ fallbacks are on, and a refusal reaches the bot as `finish_reason: "content_filt
 
 **Cost:** Claude Opus 5.5 costs $4 per million input tokens and $20 per million output tokens.
 A Docs-bot answer is usually a few thousand tokens. The usage log shows the totals.
+
+## Another provider
+
+The stack can use any OpenAI-compatible API instead of Claude. The gateway forwards the
+callers' requests to it as they are, with no translation (`docs/gateway.md`, "Remote test
+upstreams"). The same testing-only rules apply: prompts leave the machine, so use the test
+Slack workspace, the fake fixtures and your public docs site only, never real PM tokens or
+company data.
+
+**Set these** instead of `PMOS_GATEWAY_ANTHROPIC_KEY`, outside the repo like the others:
+
+| Variable | What it is |
+| --- | --- |
+| `PMOS_TEST_MODEL_URL` | The provider's OpenAI-compatible base URL, `https` only. The gateway calls `<url>/chat/completions`. |
+| `PMOS_TEST_MODEL` | The model name for the `default`, `reasoning` and `extraction` roles. It must support tool calling. |
+| `PMOS_GATEWAY_REMOTE_KEY` | The provider's API key, sent as `Authorization: Bearer`. It is never logged. |
+| `PMOS_TEST_MODEL_FAST` | Optional: a different model for `extraction` (routine parsing) |
+
+Then run the same script:
+
+```sh
+scripts/claude-test-stack.sh
+```
+
+With `PMOS_TEST_MODEL_URL` set, the script writes `state/claude-test/gateway.yaml` with one
+upstream, `openai+<url>`, and every role on `PMOS_TEST_MODEL`, and starts the gateway with it.
+The usage log (`state/claude-test/usage.jsonl`) names the provider's host on every call.
+
+**Worked example: Gemini.** Create an API key in Google AI Studio, then:
+
+```sh
+export PMOS_TEST_MODEL_URL=https://generativelanguage.googleapis.com/v1beta/openai
+export PMOS_TEST_MODEL=gemini-flash-latest
+export PMOS_GATEWAY_REMOTE_KEY=...   # the AI Studio key, from your shell or the environment's settings
+scripts/claude-test-stack.sh
+```
+
+In a Claude Code cloud session, the network must also allow
+`generativelanguage.googleapis.com`. Gemini returns a signature with each tool call and needs
+it back on the next turn; the gateway keeps it for the bots, so nothing else changes.
+
+**If calls fail:** the provider's own error reaches the bot and the gateway log with its
+status. A 429 means the key's limits were reached; wait and try again. A 503 means the model is
+busy; try again, or pick another model.

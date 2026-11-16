@@ -1,12 +1,15 @@
 //! Who is looking, what they may see, and form (CSRF) protection.
 //!
 //! - **Identity:** `X-Forwarded-User` from the Spark's SSO proxy, trusted only with
-//!   `PMOS_CONSOLE_TRUST_PROXY=1`; otherwise `PMOS_CONSOLE_DEV_USER`. The header may carry a
-//!   PM OS handle or the member's email.
+//!   `PMOS_CONSOLE_TRUST_PROXY=1`, and only on a request that also carries
+//!   `X-Pmos-Proxy-Secret` equal to `PMOS_CONSOLE_PROXY_SECRET` (compared in constant time,
+//!   before the user header is read); otherwise `PMOS_CONSOLE_DEV_USER`. The header may carry
+//!   a PM OS handle or the member's email.
 //! - **Membership:** the person must be in `team.yaml`, re-read on every request so removing
 //!   someone takes effect at once.
 //! - **Forms:** every POST carries a token bound to the person (an HMAC under a key made at
-//!   start-up) and must come from the console's own origin.
+//!   start-up) and must come from the console's own origin: `Origin`, or else `Referer`,
+//!   must be present and match.
 
 use axum::http::{header, HeaderMap};
 use hmac::{Hmac, Mac};
@@ -16,6 +19,21 @@ use sha2::Sha256;
 use crate::config::Identity;
 
 pub const FORWARDED_USER: &str = "x-forwarded-user";
+/// The header the sign-in proxy sets to `PMOS_CONSOLE_PROXY_SECRET` on every request.
+pub const PROXY_SECRET: &str = "x-pmos-proxy-secret";
+
+/// Whether the request came through the sign-in proxy: with `PMOS_CONSOLE_TRUST_PROXY=1`, it
+/// carries `X-Pmos-Proxy-Secret` equal to the configured secret (constant-time compare). In
+/// development there is no proxy, so every request passes.
+pub fn from_proxy(identity: &Identity, headers: &HeaderMap) -> bool {
+    match identity {
+        Identity::Proxy { secret } => headers
+            .get(PROXY_SECRET)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|presented| pmos_runtime::token_eq(presented, secret)),
+        Identity::Dev(_) => true,
+    }
+}
 
 /// The person using the console.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +57,9 @@ impl Viewer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
+    /// The request didn't come through the sign-in proxy: no or a wrong
+    /// `X-Pmos-Proxy-Secret` (401).
+    NotFromProxy,
     /// Nobody is signed in (401).
     NoUser,
     /// Signed in, but not on the team (403).
@@ -51,8 +72,12 @@ pub fn viewer(
     headers: &HeaderMap,
     team: &TeamFile,
 ) -> Result<Viewer, AuthError> {
+    // The proxy's secret first: until it checks out, X-Forwarded-User is not read at all.
+    if !from_proxy(identity, headers) {
+        return Err(AuthError::NotFromProxy);
+    }
     let presented = match identity {
-        Identity::Proxy => headers
+        Identity::Proxy { .. } => headers
             .get(FORWARDED_USER)
             .and_then(|v| v.to_str().ok())
             .map(str::trim)
@@ -118,7 +143,7 @@ impl Default for Csrf {
 
 /// Whether a form post came from the console's own pages: never from another site, and with
 /// an `Origin` (or else `Referer`) matching `public_url`, or the request's `Host` without it.
-/// A post with neither header relies on the form token alone.
+/// A post with neither header is refused: browsers send one on every form post.
 pub fn same_origin(headers: &HeaderMap, public_url: Option<&str>) -> bool {
     let get = |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
@@ -130,7 +155,7 @@ pub fn same_origin(headers: &HeaderMap, public_url: Option<&str>) -> bool {
         Some(o) => o.to_string(),
         None => match get(header::REFERER).and_then(|r| reqwest::Url::parse(r).ok()) {
             Some(url) => url.origin().ascii_serialization(),
-            None => return true,
+            None => return false,
         },
     };
     if origin == "null" {
@@ -161,6 +186,52 @@ mod tests {
             h.insert(*k, HeaderValue::from_str(v).unwrap());
         }
         h
+    }
+
+    fn team() -> TeamFile {
+        TeamFile::from_yaml(
+            "members:\n  - handle: ana\n    slack-id: U0ANA\n    email: ana@example.com\n    roles: [pm]\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_forwarded_user_counts_only_with_the_proxy_secret() {
+        let secret = "proxy-secret-0123456789abcdef01234";
+        let proxy = Identity::Proxy {
+            secret: secret.into(),
+        };
+        let team = team();
+        let user = ("x-forwarded-user", "ana");
+        assert_eq!(
+            viewer(&proxy, &headers(&[user]), &team),
+            Err(AuthError::NotFromProxy),
+            "no secret"
+        );
+        assert_eq!(
+            viewer(
+                &proxy,
+                &headers(&[
+                    user,
+                    ("x-pmos-proxy-secret", "proxy-secret-0123456789abcdef01235")
+                ]),
+                &team
+            ),
+            Err(AuthError::NotFromProxy),
+            "a wrong secret"
+        );
+        assert_eq!(
+            viewer(&proxy, &headers(&[("x-pmos-proxy-secret", secret)]), &team),
+            Err(AuthError::NoUser)
+        );
+        let ok = viewer(
+            &proxy,
+            &headers(&[user, ("x-pmos-proxy-secret", secret)]),
+            &team,
+        )
+        .unwrap();
+        assert_eq!(ok.handle, "ana");
+        assert!(from_proxy(&Identity::Dev("ana".into()), &headers(&[])));
     }
 
     #[test]
@@ -201,7 +272,14 @@ mod tests {
             &headers(&[host, ("sec-fetch-site", "cross-site")]),
             None
         ));
-        assert!(same_origin(&headers(&[host]), None));
+        assert!(
+            !same_origin(&headers(&[host]), None),
+            "neither Origin nor Referer: refused"
+        );
+        assert!(!same_origin(
+            &headers(&[host, ("referer", "not a url")]),
+            None
+        ));
         let public = Some("https://console.pmos.internal");
         assert!(same_origin(
             &headers(&[

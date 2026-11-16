@@ -92,6 +92,8 @@ services:
       PMOS_DATABASE_URL: postgresql://pmos_toolserver:${PMOS_DB_TOOLSERVER_PASSWORD}@postgres/pmos_toolserver
       PMOS_SERVICE_TOKEN: ${PMOS_SERVICE_TOKEN:?}
       PMOS_BOT_TOKEN: ${PMOS_BOT_TOKEN:?}
+      # The console's read-only token: it may read approvals and nothing else.
+      PMOS_CONSOLE_TS_TOKEN: ${PMOS_CONSOLE_TS_TOKEN:-}
       PMOS_VAULT_KEY: ${PMOS_VAULT_KEY:?}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
@@ -146,6 +148,8 @@ services:
       PMOS_SERVICE_TOKEN: ${PMOS_SERVICE_TOKEN}
       PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
       PMOS_GATEWAY_TOKEN: ${PMOS_GW_RUNTIME_TOKEN}
+      # The handles the evals client may request tasks as (empty: `evals`).
+      PMOS_EVALS_AS: ${PMOS_EVALS_AS:-}
     volumes:
       - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
     depends_on:
@@ -192,10 +196,12 @@ services:
       PMOS_BOTS_URL: http://bots.pmos.internal:8750
       PMOS_BOTS_TOKEN: ${PMOS_RT_CONSOLE_TOKEN}
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
-      PMOS_TOOLSERVER_TOKEN: ${PMOS_SERVICE_TOKEN}
+      # Its own read-only tool-server token, never the service token.
+      PMOS_TOOLSERVER_TOKEN: ${PMOS_CONSOLE_TS_TOKEN:-}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_CONSOLE_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
       PMOS_CONSOLE_TRUST_PROXY: ${PMOS_CONSOLE_TRUST_PROXY:-0}
+      PMOS_CONSOLE_PROXY_SECRET: ${PMOS_CONSOLE_PROXY_SECRET:-}
       PMOS_CONSOLE_DEV_USER: ${PMOS_CONSOLE_DEV_USER:-}
       PMOS_CONSOLE_PUBLIC_URL: ${PMOS_CONSOLE_PUBLIC_URL:-}
       PMOS_CONSOLE_SLACK_URL: ${PMOS_CONSOLE_SLACK_URL:-}

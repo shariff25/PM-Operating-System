@@ -7,7 +7,8 @@
 //!   all their bots. A bot with no owner, or whose owner isn't in `team.yaml`, is logged and
 //!   skipped.
 //! - **The rows:** from the tool server's feedback ledger (`GET /internal/ledger`), which holds
-//!   labels and metadata only, never message text. Each shows the tool, who it was for, the
+//!   labels and metadata only, never message text, and for the bot's token no approval
+//!   ids (a row names its task by `run_id`). Each shows the tool, who it was for, the
 //!   outcome and reason, the edit distance, and a link to the console's task page when
 //!   `PMOS_CONSOLE_PUBLIC_URL` is set. The digest ends with the case-card prompt.
 //! - **The window:** the drafts decided since the previous digest's time, so Monday's covers
@@ -425,14 +426,15 @@ impl Triage {
         if rejected.len() >= LEDGER_LIMIT || edited.len() >= LEDGER_LIMIT {
             tracing::warn!("the ledger returned its limit; the digest may miss older rows");
         }
-        let mut ids = HashSet::new();
+        // The two reads ask for different outcomes, so no row is in both. Rows carry no
+        // approval id for this client (the tool server leaves it out); a row links to its
+        // task by `run_id`.
         let mut rows: Vec<(DateTime<Utc>, Value)> = rejected
             .into_iter()
             .chain(edited)
             .filter(|r| qualifies(r, self.cfg.min_edit))
             .filter_map(|r| decided_at(&r).map(|t| (t, r)))
             .filter(|(t, _)| *t > since && *t <= until)
-            .filter(|(_, r)| ids.insert(r["id"].to_string()))
             .collect();
         rows.sort_by_key(|(t, _)| Reverse(*t));
         Ok(rows.into_iter().map(|(_, r)| r).collect())

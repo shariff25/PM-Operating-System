@@ -15,7 +15,10 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 const BOTS_TOKEN: &str = "console-client-token-0123456789abcdef";
-const TOOLS_TOKEN: &str = "toolserver-service-token-0123456789ab";
+/// The tool server's read-only `console` client token (`PMOS_CONSOLE_TS_TOKEN`).
+const TOOLS_TOKEN: &str = "toolserver-console-token-0123456789ab";
+/// What the sign-in proxy sends in `X-Pmos-Proxy-Secret`.
+const PROXY_SECRET: &str = "proxy-secret-0123456789abcdef0123456";
 const HOSTILE: &str = "<script>alert('x')</script>";
 
 const TEAM: &str = "members:
@@ -240,6 +243,8 @@ async fn serve(app: Router) -> (String, CancellationToken) {
 
 struct Console {
     base: String,
+    /// The proxy's secret, sent on every request when the console trusts the proxy.
+    secret: Option<String>,
     runtime: Arc<Seen>,
     tools: Arc<Seen>,
     http: reqwest::Client,
@@ -257,7 +262,9 @@ struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            identity: Identity::Proxy,
+            identity: Identity::Proxy {
+                secret: PROXY_SECRET.into(),
+            },
             runtime_up: true,
             audit: true,
             slack: true,
@@ -305,6 +312,10 @@ async fn console(opts: Options) -> Console {
         )
         .unwrap();
     }
+    let secret = match &opts.identity {
+        Identity::Proxy { secret } => Some(secret.clone()),
+        Identity::Dev(_) => None,
+    };
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         identity: opts.identity,
@@ -320,6 +331,7 @@ async fn console(opts: Options) -> Console {
     let (base, stop_console) = serve(pmos_console::router(config)).await;
     Console {
         base,
+        secret,
         runtime: runtime_seen,
         tools: tools_seen,
         http: reqwest::Client::builder()
@@ -332,8 +344,17 @@ async fn console(opts: Options) -> Console {
 }
 
 impl Console {
+    /// A request as the sign-in proxy sends it: with its secret, and no user yet.
+    fn raw(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        let mut req = self.http.request(method, format!("{}{path}", self.base));
+        if let Some(s) = &self.secret {
+            req = req.header("x-pmos-proxy-secret", s);
+        }
+        req
+    }
+
     async fn get(&self, user: Option<&str>, path: &str) -> (StatusCode, String) {
-        let mut req = self.http.get(format!("{}{path}", self.base));
+        let mut req = self.raw(Method::GET, path);
         if let Some(u) = user {
             req = req.header("x-forwarded-user", u);
         }
@@ -350,8 +371,7 @@ impl Console {
         origin: Option<&str>,
     ) -> reqwest::Response {
         let mut req = self
-            .http
-            .post(format!("{}{path}", self.base))
+            .raw(Method::POST, path)
             .header("x-forwarded-user", user)
             .form(&[("csrf", csrf)]);
         if let Some(o) = origin {
@@ -400,6 +420,47 @@ async fn auth_needs_a_team_member() {
         .calls()
         .iter()
         .all(|(_, _, auth, _)| auth == &format!("Bearer {BOTS_TOKEN}")));
+}
+
+#[tokio::test]
+async fn the_forwarded_user_needs_the_proxy_secret() {
+    let c = console(Options::default()).await;
+    let ask = |secret: Option<&str>, path: &str| {
+        let mut req = c
+            .http
+            .get(format!("{}{path}", c.base))
+            .header("x-forwarded-user", "root");
+        if let Some(s) = secret {
+            req = req.header("x-pmos-proxy-secret", s);
+        }
+        req.send()
+    };
+    // Without the secret, or with a wrong one, nobody is signed in, whatever the user header
+    // says, on every page, and no upstream is called.
+    for secret in [None, Some(""), Some("proxy-secret-0123456789abcdef0123457")] {
+        for path in ["/bots", "/approvals", "/", "/no-such-page"] {
+            let res = ask(secret, path).await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path} {secret:?}");
+            assert!(res.text().await.unwrap().contains("Not signed in"));
+        }
+    }
+    let res = c
+        .http
+        .post(format!("{}/routines/rtn_ana1/pause", c.base))
+        .header("x-forwarded-user", "ana")
+        .header("origin", c.base.as_str())
+        .form(&[("csrf", "x")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert!(c.runtime.calls().is_empty() && c.tools.calls().is_empty());
+    // The container's health check needs no secret.
+    let res = ask(None, "/healthz").await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    // With it, the user header counts.
+    let res = ask(Some(PROXY_SECRET), "/bots").await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -513,7 +574,7 @@ async fn routine_actions_call_the_runtime() {
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
     assert_eq!(res.headers()["location"], "/routines?done=pause");
     let res = c
-        .post("ana", "/routines/rtn_ana1/resume", &token, None)
+        .post("ana", "/routines/rtn_ana1/resume", &token, origin)
         .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
     let res = c
@@ -583,9 +644,23 @@ async fn forms_without_a_valid_token_or_from_elsewhere_are_refused() {
         .post("ana", path, &ana, Some("https://evil.example"))
         .await;
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    // The right token with neither Origin nor Referer.
+    let res = c.post("ana", path, &ana, None).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "no Origin or Referer");
+    // A Referer from the console itself is enough.
     let res = c
-        .http
-        .post(format!("{}{path}", c.base))
+        .raw(Method::POST, path)
+        .header("x-forwarded-user", "ana")
+        .header("referer", format!("{}/routines", c.base))
+        .form(&[("csrf", ana.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SEE_OTHER, "a same-origin Referer");
+    assert_eq!(c.runtime.writes().len(), 1);
+    c.runtime.calls.lock().unwrap().clear();
+    let res = c
+        .raw(Method::POST, path)
         .header("x-forwarded-user", "ana")
         .header("sec-fetch-site", "cross-site")
         .form(&[("csrf", ana.as_str())])
@@ -595,8 +670,7 @@ async fn forms_without_a_valid_token_or_from_elsewhere_are_refused() {
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
     // No body at all.
     let res = c
-        .http
-        .post(format!("{}{path}", c.base))
+        .raw(Method::POST, path)
         .header("x-forwarded-user", "ana")
         .send()
         .await
@@ -769,8 +843,7 @@ async fn a_runtime_outage_is_a_readable_page() {
 async fn pages_carry_a_strict_policy_and_both_themes() {
     let c = console(Options::default()).await;
     let res = c
-        .http
-        .get(format!("{}/bots", c.base))
+        .raw(Method::GET, "/bots")
         .header("x-forwarded-user", "ana")
         .send()
         .await
@@ -786,6 +859,6 @@ async fn pages_carry_a_strict_policy_and_both_themes() {
     assert!(body.contains("max-width:640px"));
     assert!(body.contains("name=\"viewport\""));
     assert!(!body.contains("<script"));
-    let res = c.http.get(format!("{}/", c.base)).send().await.unwrap();
+    let res = c.raw(Method::GET, "/").send().await.unwrap();
     assert_eq!(res.headers()["location"], "/bots");
 }

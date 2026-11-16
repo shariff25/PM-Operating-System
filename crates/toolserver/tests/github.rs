@@ -19,6 +19,7 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use pmos_contract::model::{Role, TeamFile, TeamMember};
 use pmos_contract::onboarding::{render_personal_bot, render_team_yaml};
+use pmos_contract::Sensitivity;
 use pmos_toolserver::app::BotAccess;
 use pmos_toolserver::audit::{Client, MemoryAudit, Outcome};
 use pmos_toolserver::catalog::Catalog;
@@ -32,6 +33,7 @@ use pmos_toolserver::oauth::{
 };
 use pmos_toolserver::onboarding::{personal_policies, GitHubSetup, Onboarding};
 use pmos_toolserver::service::ToolError;
+use pmos_toolserver::session::Session;
 use pmos_toolserver::team::Team;
 use pmos_toolserver::vault::{Credential, KeyRing, Provider, Secret, Vault};
 use pmos_toolserver::{router_with, AppConfig, Stores, ToolService};
@@ -750,6 +752,7 @@ async fn env() -> Env {
                 token: BOT_TOKEN.into(),
                 skills: vec!["docs".into()],
             }),
+            console_token: None,
             content_root: root.clone(),
             allowed_hosts: vec!["127.0.0.1".into()],
             oauth: Some(oauth.clone()),
@@ -1214,7 +1217,9 @@ async fn notes_are_written_and_read_in_the_pms_repo() {
     let file = &e.mock.files(MEMORY_REPO)["notes/areas.md"];
     assert!(file.starts_with("---\nupdated: "), "{file}");
     assert!(
-        file.contains("source: \"internal-brief, task run-1\"\n---\nAcme Cloud, Acme Vault"),
+        file.contains(
+            "source: \"internal-brief, task run-1\"\nsensitivity: public\n---\nAcme Cloud, Acme Vault"
+        ),
         "{file}"
     );
     for r in e.mock.requests("POST", "/repos/") {
@@ -1239,7 +1244,14 @@ async fn notes_are_written_and_read_in_the_pms_repo() {
     // A note written by a bot names the bot.
     e.stores
         .memory
-        .update("ana", "areas", "Acme Cloud only", "pm-ana, task t-9", now)
+        .update(
+            "ana",
+            "areas",
+            "Acme Cloud only",
+            "pm-ana, task t-9",
+            Sensitivity::Internal,
+            now,
+        )
         .await
         .unwrap();
     let head = e.mock.head(MEMORY_REPO);
@@ -1247,6 +1259,79 @@ async fn notes_are_written_and_read_in_the_pms_repo() {
         e.mock.commit(&head).message,
         "memory: areas (pm-ana, task t-9)"
     );
+}
+
+/// A note on GitHub keeps the sensitivity of what its session had read, in its front matter
+/// (S6): a restricted read then a write stores `restricted`, a later session reading it is
+/// raised to `restricted`, and a note edited by hand without it reads as `internal`.
+#[tokio::test]
+async fn notes_carry_their_sensitivity_in_the_pms_repo() {
+    let e = env().await;
+    let now = Utc::now();
+    set_up_memory(
+        &e,
+        &[(
+            "notes/old.md",
+            "---\nupdated: 2026-10-01T10:00:00Z\nsource: \"by hand\"\n---\nWritten before S6\n",
+        )],
+    )
+    .await;
+    let session = |run: &'static str| {
+        let svc = e.svc.clone();
+        async move {
+            svc.create_session("ana", "internal-brief", run, None, now)
+                .await
+                .unwrap()
+        }
+    };
+    let stored = |s: Session| {
+        let sessions = e.stores.sessions.clone();
+        async move {
+            sessions
+                .get(&s.token, now)
+                .await
+                .unwrap()
+                .unwrap()
+                .sources_sensitivity
+        }
+    };
+
+    // An old note reads as internal.
+    let reader = session("run-old").await;
+    let read = e
+        .svc
+        .call(&reader, "memory_read", json!({}), now)
+        .await
+        .unwrap();
+    assert_eq!(read["notes"][0]["sensitivity"], "internal", "{read}");
+    assert_eq!(stored(reader).await, Sensitivity::Internal);
+
+    // A session that had read restricted data writes a note: stored `restricted`.
+    let writer = session("run-w").await;
+    e.stores
+        .sessions
+        .raise_sensitivity(&writer.token, Sensitivity::Restricted)
+        .await
+        .unwrap();
+    e.svc
+        .call(
+            &writer,
+            "memory_update",
+            json!({"key": "partners", "text": "Globex joint roadmap"}),
+            now,
+        )
+        .await
+        .unwrap();
+    let file = &e.mock.files(MEMORY_REPO)["notes/partners.md"];
+    assert!(file.contains("\nsensitivity: restricted\n---\n"), "{file}");
+
+    // A later session that reads memory is raised to it.
+    let later = session("run-later").await;
+    e.svc
+        .call(&later, "memory_read", json!({}), now)
+        .await
+        .unwrap();
+    assert_eq!(stored(later).await, Sensitivity::Restricted);
 }
 
 /// The bets register on GitHub memory (`docs/staff-principal-spec.md` §5): nothing is
@@ -1373,13 +1458,27 @@ async fn the_cache_fetches_only_blobs_that_changed() {
     let now = Utc::now();
     // An empty repo: the first note goes in through the contents API.
     assert!(m.read("ana").await.unwrap().is_empty());
-    m.update("ana", "areas", "Acme Cloud", "t, task 1", now)
-        .await
-        .unwrap();
+    m.update(
+        "ana",
+        "areas",
+        "Acme Cloud",
+        "t, task 1",
+        Sensitivity::Internal,
+        now,
+    )
+    .await
+    .unwrap();
     assert_eq!(e.mock.requests("PUT", "/contents/notes/areas.md").len(), 1);
-    m.update("ana", "style", "short", "t, task 1", now)
-        .await
-        .unwrap();
+    m.update(
+        "ana",
+        "style",
+        "short",
+        "t, task 1",
+        Sensitivity::Internal,
+        now,
+    )
+    .await
+    .unwrap();
 
     e.mock.clear_log();
     assert_eq!(m.read("ana").await.unwrap().len(), 2);
@@ -1408,9 +1507,16 @@ async fn the_cache_fetches_only_blobs_that_changed() {
         .iter()
         .all(|r| r.path.contains("/git/trees/")));
 
-    m.update("ana", "style", "longer", "t, task 2", now)
-        .await
-        .unwrap();
+    m.update(
+        "ana",
+        "style",
+        "longer",
+        "t, task 2",
+        Sensitivity::Internal,
+        now,
+    )
+    .await
+    .unwrap();
     e.mock.clear_log();
     let notes = m.read("ana").await.unwrap();
     assert_eq!(notes[1].text, "longer");
@@ -1426,9 +1532,16 @@ async fn a_repo_that_turns_public_is_refused() {
     let e = env().await;
     set_up_memory(&e, &[("README.md", "x\n")]).await;
     let m = e.stores.memory.as_ref();
-    m.update("ana", "areas", "Acme Cloud", "t, task 1", Utc::now())
-        .await
-        .unwrap();
+    m.update(
+        "ana",
+        "areas",
+        "Acme Cloud",
+        "t, task 1",
+        Sensitivity::Internal,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
     e.mock.edit_repo(MEMORY_REPO, |r| r.private = false);
     // Within ten minutes of the last check the record is trusted…
     assert!(m.read("ana").await.is_ok());
@@ -1446,7 +1559,14 @@ async fn a_repo_that_turns_public_is_refused() {
     let err = m.read("ana").await.unwrap_err();
     assert!(err.to_string().contains("is not private"), "{err}");
     let err = m
-        .update("ana", "areas", "x", "t, task 2", Utc::now())
+        .update(
+            "ana",
+            "areas",
+            "x",
+            "t, task 2",
+            Sensitivity::Internal,
+            Utc::now(),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("is not private"), "{err}");
@@ -1745,6 +1865,60 @@ async fn only_an_admin_with_github_and_push_access_can_approve() {
         .unwrap();
     assert_eq!(rejected.outcome, Outcome::Rejected);
     assert_eq!(rejected.user, "kim");
+}
+
+/// The Slack bot may grant `pm` and `skill-author` only: an `admin` grant from it is
+/// refused (S2), audited, and leaves the request pending. The service token may still.
+#[tokio::test]
+async fn an_admin_grant_from_slack_is_refused() {
+    let e = env().await;
+    link(&e, "raj", "raj-gh").await;
+    let (_, body) = request(&e, "U0NIA", "nia@example.com", "Nia").await;
+    let id = body["request"]["id"].as_str().unwrap().to_string();
+    let head = e.mock.head(CONTENT_REPO);
+    for roles in [json!(["admin"]), json!(["pm", "admin"])] {
+        let (status, body) = decide(
+            &e,
+            &id,
+            json!({"decision": "approve", "decided_by": "raj", "handle": "nia", "roles": roles}),
+        )
+        .await;
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(body["code"], "admin_by_pull_request");
+        let ev = e
+            .audit
+            .events()
+            .into_iter()
+            .rev()
+            .find(|ev| ev.tool == "members.add")
+            .unwrap();
+        assert_eq!((ev.outcome, ev.client), (Outcome::Denied, Client::Bot));
+    }
+    assert_eq!(e.mock.head(CONTENT_REPO), head, "nothing committed");
+    let (_, pending) = bot(
+        &e,
+        Method::GET,
+        "/internal/members/requests?status=pending",
+        None,
+    )
+    .await;
+    assert_eq!(pending["requests"][0]["id"], id.as_str());
+
+    // The orchestrator's token isn't limited.
+    let (status, body) = call(
+        &e,
+        Method::POST,
+        &format!("/internal/members/requests/{id}/decision"),
+        Some(json!({"decision": "approve", "decided_by": "raj", "handle": "nia", "roles": ["pm", "admin"]})),
+        SERVICE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let team = TeamFile::from_yaml(&e.mock.files(CONTENT_REPO)["content/team.yaml"]).unwrap();
+    assert_eq!(
+        team.by_handle("nia").unwrap().roles,
+        vec![Role::Pm, Role::Admin]
+    );
 }
 
 #[tokio::test]
