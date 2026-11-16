@@ -882,6 +882,30 @@ impl Cx {
             if m.roles.is_empty() {
                 self.error("team-roles", &path, format!("`{}` has no roles", m.handle));
             }
+            // A role newer than this build (or a typo): it parses, so older and newer
+            // services agree on the file, but it grants nothing here.
+            for role in m.roles.iter().filter(|r| !r.is_known()) {
+                self.warn(
+                    "team-role-unknown",
+                    &path,
+                    format!(
+                        "`{}` has role `{role}`, which this version doesn't know and grants nothing (known: {})",
+                        m.handle,
+                        crate::model::Role::KNOWN.join(", ")
+                    ),
+                );
+            }
+            // Separation of duties: an auditor reviews what admins do.
+            if m.roles.contains(&crate::model::Role::Auditor) && m.is_admin() {
+                self.warn(
+                    "team-role-separation",
+                    &path,
+                    format!(
+                        "`{}` is both admin and auditor; an auditor should not audit their own actions",
+                        m.handle
+                    ),
+                );
+            }
         }
         // A personal master-context folder should belong to someone on the team.
         if let Some(people) = sorted_entries(&self.root.join("master").join("people")) {

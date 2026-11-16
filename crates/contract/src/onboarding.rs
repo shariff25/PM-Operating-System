@@ -253,6 +253,23 @@ mod tests {
     }
 
     #[test]
+    fn a_rewrite_keeps_new_and_unknown_roles() {
+        // Onboarding rewrites team.yaml; a role this build doesn't know must survive it.
+        let mut ana = member("ana", "U012AB3CD");
+        ana.roles = vec![
+            Role::Reviewer,
+            Role::Auditor,
+            Role::Unknown("steward".into()),
+        ];
+        let text = render_team_yaml("members: []\n", std::slice::from_ref(&ana));
+        assert!(
+            text.contains("roles: [reviewer, auditor, steward]"),
+            "{text}"
+        );
+        assert_eq!(TeamFile::from_yaml(&text).unwrap().members, vec![ana]);
+    }
+
+    #[test]
     fn the_personal_bot_parses_as_a_personal_bot() {
         let text = render_personal_bot("ana");
         let doc = crate::frontmatter::split(&text).expect("front matter");

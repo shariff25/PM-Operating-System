@@ -152,15 +152,33 @@ members:
   - handle: ana            # PM OS handle; matches master/people/<handle>/ if present
     slack-id: U012AB3CD    # Slack member id (U… or W…)
     email: ana@example.com # optional; Atlassian account email, needed to link Jira/Confluence
-    roles: [pm, skill-author]   # pm | skill-author | admin (admin = platform owner)
+    roles: [pm, skill-author]   # pm | skill-author | admin | reviewer | auditor
 ```
+
+Roles (what each may do is `pmos_contract::permissions`, the one matrix every service checks):
+- **`pm`**, Product Manager: asks bots; sees and decides their own tasks, approvals, routines
+  and traces; links their own accounts.
+- **`skill-author`**: as `pm`, and proposes skill and bot changes by pull request.
+- **`reviewer`**: as `pm`, and sees other PMs' approvals and recommends a decision. The
+  draft's owner confirms; a reviewer never decides someone else's approval.
+- **`auditor`**: searches and exports audit metadata only (no trace bodies, prompts or Slack
+  text). Nothing else.
+- **`admin`**, platform owner: everything, except approving a policy change they authored
+  (POL-2; the caller enforces it).
+
+Several roles take the union. A well-formed role name this version doesn't know (one added by
+a newer version) still parses but grants nothing, so a new role doesn't break services that
+aren't upgraded yet; versions before `reviewer` and `auditor` existed reject them, so upgrade
+every service before using them.
 
 With live connectors the tool server enforces this file: only members get sessions, and a
 linked account must match the member (the Slack member id for Slack, the email for
 Atlassian).
 
 Rules: `team-parse`, `team-handle`, `team-slack-id`, `team-email`, `team-duplicate` (a
-handle or Slack id listed twice), `team-roles` (no roles), `people-unknown` (warning: a `master/people/` folder
+handle or Slack id listed twice), `team-roles` (no roles), `team-role-unknown` (warning: a
+role this version doesn't know), `team-role-separation` (warning: admin and auditor together),
+`people-unknown` (warning: a `master/people/` folder
 for someone not on the team).
 
 ## Roles and bots: `roles/<role>/ROLE.md`, `bots/<name>/BOT.md`

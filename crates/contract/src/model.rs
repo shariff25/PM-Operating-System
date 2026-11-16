@@ -233,30 +233,140 @@ pub struct PlaybookFrontMatter {
     pub version: String,
 }
 
-/// A role in PM OS (ADM-1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+/// A role in PM OS (ADM-1). What each role may do is [`crate::permissions`].
+///
+/// # Rolling out a new role
+///
+/// `team.yaml` is read by every service (tool server, runtime, console, Slack bot, CLI), and
+/// they are not always upgraded together. A closed enum would make one new role name in
+/// `team.yaml` a parse error in every binary that predates it: the console stops serving and
+/// the tool server keeps a stale member list. So `team.yaml` parsing is tolerant: a
+/// well-formed role name this build doesn't know becomes [`Role::Unknown`], which grants no
+/// permission, keeps its name (so a binary that rewrites `team.yaml`, such as onboarding,
+/// writes it back unchanged) and draws the `team-role-unknown` lint warning. A malformed name
+/// (not lowercase letters, digits and hyphens) is still a parse error.
+///
+/// Tolerance applies only to `team.yaml` (the `roles` field of [`TeamMember`]). Deserializing
+/// a `Role` on its own, as an API body or a CLI argument does, stays strict: an unknown name
+/// is an error there, because it is a typo, not a newer file. Use [`Role::parse`] for input.
+///
+/// This only helps builds that have it: binaries older than this tolerance still reject
+/// `reviewer` and `auditor`, so upgrade every service before a `team.yaml` uses them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Role {
+    /// Product Manager: asks bots and decides their own approvals.
     Pm,
+    /// Edits skills and bots by pull request; otherwise as `pm`.
     SkillAuthor,
     /// Platform owner: runs the Spark, reviews sandbox policies, approves new members.
     Admin,
+    /// A PM who also sees other PMs' approvals and recommends a decision. The draft's owner
+    /// still decides; a reviewer never decides someone else's approval.
+    Reviewer,
+    /// Reads audit metadata and exports it. Nothing else: no trace bodies, no prompt or
+    /// Slack text, no asking bots.
+    Auditor,
+    /// A role name from a newer `team.yaml` than this build knows. Grants nothing.
+    Unknown(String),
 }
 
 impl Role {
+    /// Every role this build knows, in `team.yaml` spelling.
+    pub const KNOWN: [&'static str; 5] = ["pm", "skill-author", "admin", "reviewer", "auditor"];
+
     /// The name as written in `team.yaml`.
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Role::Pm => "pm",
             Role::SkillAuthor => "skill-author",
             Role::Admin => "admin",
+            Role::Reviewer => "reviewer",
+            Role::Auditor => "auditor",
+            Role::Unknown(name) => name,
         }
     }
+
+    /// A known role by its `team.yaml` name. Strict: anything else is `None`.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "pm" => Some(Role::Pm),
+            "skill-author" => Some(Role::SkillAuthor),
+            "admin" => Some(Role::Admin),
+            "reviewer" => Some(Role::Reviewer),
+            "auditor" => Some(Role::Auditor),
+            _ => None,
+        }
+    }
+
+    /// A role as read from `team.yaml`: a known role, else [`Role::Unknown`] if the name is
+    /// well formed (lowercase letters, digits and single hyphens, at most 32), else `None`.
+    pub fn parse_tolerant(name: &str) -> Option<Self> {
+        Self::parse(name).or_else(|| {
+            let well_formed = name.len() <= 32
+                && name.starts_with(|c: char| c.is_ascii_lowercase())
+                && !name.ends_with('-')
+                && !name.contains("--")
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            well_formed.then(|| Role::Unknown(name.to_string()))
+        })
+    }
+
+    /// Whether this build knows the role.
+    pub fn is_known(&self) -> bool {
+        !matches!(self, Role::Unknown(_))
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Role {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+/// Strict: only a known role name.
+impl<'de> Deserialize<'de> for Role {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(d)?;
+        Role::parse(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown role `{name}`, expected one of {}",
+                Role::KNOWN.join(", ")
+            ))
+        })
+    }
+}
+
+/// `TeamMember.roles`: tolerant of well-formed role names this build doesn't know (see
+/// [`Role`]).
+fn tolerant_roles<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Role>, D::Error> {
+    Vec::<String>::deserialize(d)?
+        .into_iter()
+        .map(|name| {
+            Role::parse_tolerant(&name).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "`{name}` is not a role name (lowercase letters, digits and hyphens)"
+                ))
+            })
+        })
+        .collect()
 }
 
 impl TeamMember {
     pub fn is_admin(&self) -> bool {
         self.roles.contains(&Role::Admin)
+    }
+
+    /// Whether this member's roles allow `permission` ([`crate::permissions::allows`]).
+    pub fn allows(&self, permission: crate::permissions::Permission) -> bool {
+        crate::permissions::allows(&self.roles, permission)
     }
 }
 
@@ -276,6 +386,8 @@ pub struct TeamMember {
     /// set, and otherwise a verified email on the GitHub account matching `email`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<String>,
+    /// Tolerant of role names newer than this build (see [`Role`]).
+    #[serde(deserialize_with = "tolerant_roles")]
     pub roles: Vec<Role>,
 }
 
@@ -366,5 +478,76 @@ mod tests {
         assert_eq!(ModelRole::parse("reasoning"), Some(ModelRole::Reasoning));
         assert_eq!(ModelRole::parse("Reasoning"), None);
         assert_eq!(ModelRole::parse("large"), None);
+    }
+
+    fn member_yaml(roles: &str) -> String {
+        format!("members:\n  - handle: ana\n    slack-id: U0ANA\n    roles: {roles}\n")
+    }
+
+    #[test]
+    fn every_known_role_parses_and_round_trips() {
+        for name in Role::KNOWN {
+            let role = Role::parse(name).expect(name);
+            assert!(role.is_known());
+            assert_eq!(role.as_str(), name);
+            assert_eq!(serde_norway::to_string(&role).unwrap().trim(), name);
+            let strict: Role = serde_norway::from_str(name).unwrap();
+            assert_eq!(strict, role);
+        }
+    }
+
+    #[test]
+    fn team_yaml_reads_reviewer_and_auditor() {
+        let team = TeamFile::from_yaml(&member_yaml("[pm, reviewer]")).unwrap();
+        assert_eq!(team.members[0].roles, vec![Role::Pm, Role::Reviewer]);
+        let team = TeamFile::from_yaml(&member_yaml("[auditor]")).unwrap();
+        assert_eq!(team.members[0].roles, vec![Role::Auditor]);
+        assert!(!team.members[0].is_admin());
+    }
+
+    #[test]
+    fn team_yaml_tolerates_a_role_from_a_newer_build() {
+        // The rollout case: a newer team.yaml names a role this build doesn't know. The
+        // file still parses, the role grants nothing and keeps its name for a rewrite.
+        let team = TeamFile::from_yaml(&member_yaml("[pm, policy-steward]")).unwrap();
+        let roles = &team.members[0].roles;
+        assert_eq!(
+            roles,
+            &vec![Role::Pm, Role::Unknown("policy-steward".into())]
+        );
+        assert!(!roles[1].is_known());
+        assert_eq!(roles[1].as_str(), "policy-steward");
+        let yaml = serde_norway::to_string(&team).unwrap();
+        assert_eq!(TeamFile::from_yaml(&yaml).unwrap(), team);
+    }
+
+    #[test]
+    fn team_yaml_still_refuses_malformed_role_names() {
+        for bad in [
+            "[Admin]",
+            "[\"pm, admin\"]",
+            "[\"a b\"]",
+            "[\"-x\"]",
+            "[\"\"]",
+        ] {
+            assert!(TeamFile::from_yaml(&member_yaml(bad)).is_err(), "{bad}");
+        }
+        // Unknown fields are still refused.
+        let extra =
+            "members:\n  - handle: ana\n    slack-id: U0ANA\n    roles: [pm]\n    rank: 1\n";
+        assert!(TeamFile::from_yaml(extra).is_err());
+    }
+
+    #[test]
+    fn a_role_on_its_own_parses_strictly() {
+        // API bodies and CLI arguments: an unknown name is a typo, not a newer file.
+        assert!(serde_norway::from_str::<Role>("policy-steward").is_err());
+        assert!(serde_norway::from_str::<Role>("admn").is_err());
+        assert_eq!(Role::parse("admn"), None);
+        assert_eq!(
+            Role::parse_tolerant("admn"),
+            Some(Role::Unknown("admn".into()))
+        );
+        assert_eq!(Role::parse_tolerant("Admin"), None);
     }
 }
