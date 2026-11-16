@@ -4,12 +4,16 @@
 # (crates/toolserver/src/connectors/fake.rs): the pages vault-saml-sso ("Acme Vault supports
 # SAML 2.0 single sign-on.") and vault-key-rotation ("Key rotation creates a new key
 # version."), both at https://docs.example.com/docs/<slug>. Replace them with questions about
-# your own docs. No pass_bar until then: the category reports only.
+# your own docs. The bar is a starting value (docs/evals.md, "Categories and bars"): tighten
+# it after the first valid run on your questions.
 name: docs-qa
 bot: docs
 # Each task runs three times, so the report shows pass^3 and a standard error, and the gate
 # can tell a real drop from noise.
 repeats: 3
+# 80% is the example bar in docs/evals.md ("Adding a category", and the docs-qa section).
+# A starting value, not a launch number.
+pass_bar: 0.8
 description: >-
   Questions a PM asks about the company's products, each answered by one page of the public
   docs site. The Docs bot must cite that page and state the facts on it. Should-decline tasks
