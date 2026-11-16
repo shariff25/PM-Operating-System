@@ -70,6 +70,23 @@ export const copy = {
     microsoft: 'Sign in with Microsoft',
     notAMember: (message: string) => message,
     retry: 'Check the handle and try again.',
+    loading: 'Checking how you can sign in…',
+    notSetUp: "Sign-in isn't set up yet.",
+    devHeading: 'For development',
+    devNote: 'Only on development setups. Use the handle from team.yaml.',
+  },
+
+  // ---- Signed out (where Microsoft sends people back to) ----
+  signedOut: {
+    title: 'You are signed out',
+    tryAgain: 'Try again',
+    reasons: {
+      not_a_member: "You're not on the team list yet. Ask a platform owner to add you.",
+      cancelled: 'Sign-in was cancelled.',
+      expired: 'That sign-in expired. Try again.',
+      unavailable: "Microsoft sign-in isn't answering. Try again in a minute.",
+    } as Record<string, string>,
+    failed: "Sign-in didn't work. Try again.",
   },
 
   // ---- Menu ----

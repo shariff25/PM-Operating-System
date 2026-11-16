@@ -1,10 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
-import type { Api } from '../api';
+import type { Api, AuthProvider } from '../api';
 import { messageOf } from '../app-context';
 import { ErrorNote } from '../components/bits';
-import { Mark } from '../components/icons';
+import { Icon, Mark } from '../components/icons';
 import { copy } from '../copy';
+import { loginHref } from '../url';
 
 interface ProviderProps {
   api: Api;
@@ -12,7 +13,7 @@ interface ProviderProps {
 }
 
 /** Development sign-in: a handle from team.yaml. Needs PMOS_WEB_DEV_LOGIN=1 on the server. */
-function DevLogin({ api, onSignedIn }: ProviderProps) {
+function DevLogin({ api, onSignedIn, secondary }: ProviderProps & { secondary: boolean }) {
   const [handle, setHandle] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -32,9 +33,10 @@ function DevLogin({ api, onSignedIn }: ProviderProps) {
   };
 
   return (
-    <form onSubmit={submit} className="signin-form">
+    <form onSubmit={submit} className={`signin-form ${secondary ? 'signin-dev' : ''}`}>
+      {secondary && <p className="signin-dev-title">{copy.signIn.devHeading}</p>}
       <label htmlFor="handle">{copy.signIn.handleLabel}</label>
-      <p id="handle-hint" className="muted">{copy.signIn.handleHint}</p>
+      <p id="handle-hint" className="muted">{secondary ? copy.signIn.devNote : copy.signIn.handleHint}</p>
       <input
         id="handle"
         value={handle}
@@ -45,38 +47,59 @@ function DevLogin({ api, onSignedIn }: ProviderProps) {
         spellCheck={false}
       />
       {error && <ErrorNote next={copy.signIn.retry}>{error}</ErrorNote>}
-      <button type="submit" className="btn btn-primary" disabled={busy || !handle.trim()}>
+      <button type="submit" className={`btn ${secondary ? '' : 'btn-primary'}`} disabled={busy || !handle.trim()}>
         {busy ? copy.signIn.working : copy.signIn.submit}
       </button>
     </form>
   );
 }
 
-/**
- * Entra ID sign-in, not built yet. The redirect path below is a placeholder until the
- * contract names the route.
- */
-function MicrosoftLogin() {
+/** Microsoft sign-in is a full-page trip, so it is a link and not a fetch. */
+function MicrosoftLogin({ path }: { path: string }) {
   return (
-    <button type="button" className="btn btn-primary btn-block" onClick={() => window.location.assign('/api/auth/entra/start')}>
+    <a className="btn btn-primary signin-ms" href={loginHref(path)}>
       {copy.signIn.microsoft}
-    </button>
+    </a>
   );
 }
 
-// The one place that picks the sign-in provider. To switch to Entra, set VITE_AUTH_PROVIDER=entra
-// (or change the default here).
-const PROVIDERS = { dev: DevLogin, entra: MicrosoftLogin } as const;
-const provider: keyof typeof PROVIDERS = import.meta.env.VITE_AUTH_PROVIDER === 'entra' ? 'entra' : 'dev';
+type Providers = { state: 'loading' } | { state: 'ready'; list: AuthProvider[] };
 
-export function SignIn(props: ProviderProps) {
-  const Provider = PROVIDERS[provider];
+/** What the server offers. A failed call is the same as nothing offered. */
+function useProviders(api: Api): Providers {
+  const [providers, setProviders] = useState<Providers>({ state: 'loading' });
+  useEffect(() => {
+    let live = true;
+    api.providers().then(
+      (list) => live && setProviders({ state: 'ready', list }),
+      () => live && setProviders({ state: 'ready', list: [] }),
+    );
+    return () => {
+      live = false;
+    };
+  }, [api]);
+  return providers;
+}
+
+/** `path` is the page the PM was trying to reach, so Microsoft can send them back to it. */
+export function SignIn(props: ProviderProps & { path?: string }) {
+  const providers = useProviders(props.api);
+  const entra = providers.state === 'ready' && providers.list.includes('entra');
+  const dev = providers.state === 'ready' && providers.list.includes('dev');
   return (
     <div className="signin-wrap">
       <main className="signin">
         <Mark size={36} />
         <h1>{copy.signIn.title}</h1>
-        <Provider {...props} />
+        {providers.state === 'loading' && <p className="muted" role="status">{copy.signIn.loading}</p>}
+        {providers.state === 'ready' && !entra && !dev && (
+          <p className="signin-none">
+            <Icon name="alert" size={16} />
+            <span>{copy.signIn.notSetUp}</span>
+          </p>
+        )}
+        {entra && <MicrosoftLogin path={props.path ?? '/'} />}
+        {dev && <DevLogin api={props.api} onSignedIn={props.onSignedIn} secondary={entra} />}
       </main>
     </div>
   );

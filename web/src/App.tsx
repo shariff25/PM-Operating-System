@@ -11,10 +11,12 @@ import { DraftPage } from './pages/DraftPage';
 import { Drafts } from './pages/Drafts';
 import { FollowUps } from './pages/FollowUps';
 import { Home } from './pages/Home';
+import { SignedOut } from './pages/SignedOut';
 import { SignIn } from './pages/SignIn';
 import { Thread } from './pages/Thread';
 import { useTheme } from './theme';
-import { parseRoute } from './url';
+import { withCleanTasks } from './briefBlock';
+import { parseRoute, signedOutReason } from './url';
 import type { Route } from './url';
 
 function useHashPath(): [string, (p: string) => void] {
@@ -56,7 +58,7 @@ export function App({ createApi, pollMs }: AppProps) {
   const [me, setMe] = useState<Me | null>(null);
   const [ready, setReady] = useState(false);
   const signedOut = useRef<() => void>(() => {});
-  const [api] = useState(() => createApi(() => signedOut.current()));
+  const [api] = useState(() => withCleanTasks(createApi(() => signedOut.current())));
   const [path, navigate] = useHashPath();
   const [theme, setTheme] = useTheme();
   const [palette, setPalette] = useState<{ text: string } | null>(null);
@@ -104,7 +106,9 @@ export function App({ createApi, pollMs }: AppProps) {
 
   if (!ready) return null;
   if (!ctx) {
-    return <SignIn api={api} onSignedIn={() => void refreshMe()} />;
+    const reason = signedOutReason(path);
+    if (reason !== null) return <SignedOut reason={reason} onTryAgain={() => navigate('/')} />;
+    return <SignIn api={api} path={path} onSignedIn={() => void refreshMe()} />;
   }
 
   // A malformed or unsafe id, or an unknown path, shows the home page rather than crashing.
