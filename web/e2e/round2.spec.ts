@@ -14,19 +14,20 @@ type Box = { x: number; y: number; width: number; height: number };
 const overlaps = (a: Box, b: Box) => a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
 const box = async (loc: ReturnType<Page['locator']>) => (await loc.boundingBox()) as Box;
 
-test('desktop: no hint covers the tabs, the first source or the approve button', async ({ page }) => {
+test('desktop: no hint covers the sources heading, the first source, the change box or the approve button', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await signIn(page);
   await go(page, '/d/apr_prd');
   const hint = page.locator('[data-hint]');
-  const tabs = page.getByRole('tablist', { name: 'Draft panel' });
+  const heading = page.getByRole('heading', { name: 'What the bot read' });
   const firstSource = page.getByRole('button', { name: /TCB grace period/ }).first();
+  const change = page.getByRole('form', { name: 'Ask for a change' });
   const approve = page.getByRole('button', { name: 'Approve to Confluence' });
   for (const name of ['sources', 'ask', 'approve']) {
     await expect(hint).toHaveAttribute('data-hint', name);
     await page.waitForTimeout(300);
     const h = await box(hint);
-    for (const [what, target] of [['tabs', tabs], ['first source', firstSource], ['approve', approve]] as const) {
+    for (const [what, target] of [['sources heading', heading], ['first source', firstSource], ['change box', change], ['approve', approve]] as const) {
       expect(overlaps(h, await box(target)), `the ${name} hint overlaps the ${what}`).toBe(false);
     }
     await hint.getByRole('button', { name: 'Got it' }).click();
@@ -67,19 +68,22 @@ test('phone: the draft header is the primary button and one More menu', async ({
   expect(sw).toBeLessThanOrEqual(cw);
 });
 
-test('a suggestion shows changed words inline and folds unchanged paragraphs', async ({ page }) => {
+test('a suggestion shows changed words inline, in the document, with the decision bar kept in reach', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
   await signIn(page);
   await go(page, '/d/apr_prd');
-  await page.getByRole('tab', { name: 'Ask for a change' }).click();
   await page.getByLabel('What should change?').fill('shorter');
   await page.getByRole('button', { name: 'Suggest a change' }).click();
   const region = page.getByRole('region', { name: 'Suggested change' });
   await expect(region.locator('ins.ba-word').first()).toContainText('only');
   await expect(region.locator('del.ba-word').first()).toBeVisible();
-  const fold = region.getByRole('button', { name: /unchanged paragraphs?/ });
-  await expect(fold).toHaveAttribute('aria-expanded', 'false');
-  await fold.click();
-  await expect(fold).toHaveAttribute('aria-expanded', 'true');
+  // unchanged paragraphs read as the formatted document
+  await expect(region.locator('.dd-same h2').first()).toBeVisible();
+  // the bar stays in reach while the document scrolls
+  const accept = region.getByRole('button', { name: 'Accept change' });
+  await page.mouse.wheel(0, 600);
+  await page.waitForTimeout(200);
+  await expect(accept).toBeInViewport();
 });
 
 test('the drafts table says where each draft goes', async ({ page }) => {

@@ -1,4 +1,4 @@
-import { Mark } from '../components/icons';
+import { SignInBrand } from './SignIn';
 import { copy } from '../copy';
 
 /** The message for a reason. The raw value is only ever a lookup key, never shown. */
@@ -10,8 +10,8 @@ export function signedOutMessage(reason: string): string {
 export function SignedOut({ reason, onTryAgain }: { reason: string; onTryAgain: () => void }) {
   return (
     <div className="signin-wrap">
+      <SignInBrand />
       <main className="signin">
-        <Mark size={36} />
         <h1>{copy.signedOut.title}</h1>
         <p role="status">{signedOutMessage(reason)}</p>
         <button type="button" className="btn btn-primary" onClick={onTryAgain}>

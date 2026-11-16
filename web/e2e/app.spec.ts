@@ -18,7 +18,7 @@ async function openDraft(page: Page, id: string) {
 test('signs in, asks, and sees a result', async ({ page }) => {
   await signIn(page);
   await page.getByLabel('What do you need?').fill('what changed in billing');
-  await page.getByRole('button', { name: 'Ask', exact: true }).click();
+  await page.getByRole('button', { name: 'Send', exact: true }).click();
   const thread = page.getByRole('region', { name: 'Conversation' });
   await expect(thread.getByText('Done', { exact: true })).toBeVisible();
   await expect(thread.locator('strong', { hasText: 'PAY-212' })).toBeVisible();
@@ -39,7 +39,8 @@ test('asks for a draft and opens it as a formatted document', async ({ page }) =
   await expect(doc.getByRole('heading', { level: 1 })).toContainText('PRD: retries');
   await expect(doc.getByRole('heading', { level: 2, name: 'Problem' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Edit' })).toBeVisible();
-  await expect(page.locator('textarea')).toHaveCount(0);
+  // no editor: the only text box is the change request docked under the document
+  await expect(page.getByLabel('Draft text')).toHaveCount(0);
 });
 
 test('edits, saves, and returns to the formatted view', async ({ page }) => {
@@ -53,22 +54,24 @@ test('edits, saves, and returns to the formatted view', async ({ page }) => {
   await page.getByRole('button', { name: 'Save', exact: true }).click();
   const doc = page.getByRole('article', { name: 'Formatted draft' });
   await expect(doc).toContainText('A brand new problem statement.');
-  await expect(page.locator('textarea')).toHaveCount(0);
+  // no editor: the only text box is the change request docked under the document
+  await expect(page.getByLabel('Draft text')).toHaveCount(0);
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
 });
 
 test('asks for a change and accepts it', async ({ page }) => {
   await signIn(page);
   await openDraft(page, 'apr_prd');
-  await page.getByRole('tab', { name: 'Ask for a change' }).click();
   await page.getByLabel('What should change?').fill('shorter');
   await page.getByRole('button', { name: 'Suggest a change' }).click();
   const region = page.getByRole('region', { name: 'Suggested change' });
   await expect(region).toBeVisible();
   await expect(page.getByRole('button', { name: 'Approve to Confluence' })).toBeDisabled();
-  await region.getByRole('button', { name: 'Accept' }).click();
+  await expect(page.getByRole('region', { name: 'Before you approve' })).toContainText('A suggested change is still open');
+  await region.getByRole('button', { name: 'Accept change' }).click();
   await expect(region).toHaveCount(0);
   await expect(page.getByRole('article', { name: 'Formatted draft' })).not.toContainText('Who gets the banner');
+  await expect(page.getByRole('region', { name: 'Before you approve' })).not.toContainText('A suggested change is still open');
   await expect(page.getByRole('button', { name: 'Approve to Confluence' })).toBeEnabled();
 });
 
@@ -131,7 +134,7 @@ test('hints come one at a time and do not return after they are dismissed', asyn
   await expect(hints).toHaveCount(0);
 
   // away and back inside the same session: none of them returns
-  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Home', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Today', exact: true }).click();
   await expect(page.getByLabel('What do you need?')).toBeVisible();
   await openDraft(page, 'apr_jira');
   await expect(hints).toHaveCount(0);
@@ -185,41 +188,57 @@ test('no horizontal scroll at 390px on every page, dialog and palette', async ({
     await page.waitForTimeout(150);
     await noHScroll(page, hash);
   }
-  for (const tab of ['Sources', 'Ask for a change', 'Details', 'Draft']) {
+  for (const tab of ['Sources', 'Details', 'Draft']) {
     await page.getByRole('tab', { name: new RegExp(`^${tab}`) }).click();
     await noHScroll(page, `draft tab ${tab}`);
   }
   await page.getByRole('button', { name: /^Approve/ }).click();
   await noHScroll(page, 'approve dialog');
   await page.keyboard.press('Escape');
-  await page.getByRole('button', { name: 'Ask PM OS' }).click();
+  await page.getByRole('button', { name: 'Ask or jump to…' }).click();
   await expect(page.getByRole('dialog', { name: 'Ask PM OS or jump to a page' })).toBeVisible();
   await noHScroll(page, 'palette');
 });
 
-test('phone: a bottom tab bar replaces the sidebar, and the user menu sits behind the avatar', async ({ page }) => {
+test('phone: a bottom tab bar replaces the rail, and the user menu sits behind the avatar', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await signIn(page);
   const bar = page.getByRole('navigation', { name: 'Main' });
   await expect(bar).toHaveClass(/tabbar/);
   const box = await bar.boundingBox();
   expect(box!.y + box!.height).toBeGreaterThan(830);
-  await expect(page.locator('.sidebar')).toHaveCount(0);
+  await expect(page.locator('.rail')).toHaveCount(0);
   await bar.getByRole('link', { name: /^Activity/ }).click();
   await expect(bar.getByRole('link', { name: /^Activity/ })).toHaveAttribute('aria-current', 'page');
   await page.getByRole('button', { name: /Menu for/ }).click();
   await expect(page.getByRole('menuitem', { name: 'Sign out' })).toBeVisible();
 });
 
-test('desktop: sidebar navigation marks the current page', async ({ page }) => {
+test('desktop: the rail marks the current page, and turns to icons on a draft', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await signIn(page);
   const nav = page.getByRole('navigation', { name: 'Main' });
-  await expect(nav.getByRole('link', { name: 'Home', exact: true })).toHaveAttribute('aria-current', 'page');
+  await expect(nav.getByRole('link', { name: 'Today', exact: true })).toHaveAttribute('aria-current', 'page');
   await nav.getByRole('link', { name: /^Follow-ups/ }).click();
   await expect(page.getByRole('heading', { level: 1, name: 'Follow-ups' })).toBeVisible();
   await expect(nav.getByRole('link', { name: /^Follow-ups/ })).toHaveAttribute('aria-current', 'page');
-  await expect(nav.getByRole('link', { name: 'Home', exact: true })).not.toHaveAttribute('aria-current', 'page');
+  await expect(nav.getByRole('link', { name: 'Today', exact: true })).not.toHaveAttribute('aria-current', 'page');
+  const rail = page.locator('header.rail');
+  expect((await rail.boundingBox())!.width).toBeGreaterThan(200);
+  await openDraft(page, 'apr_prd');
+  await expect(rail).toHaveClass(/rail-compact/);
+  expect((await rail.boundingBox())!.width).toBeLessThanOrEqual(65);
+  await expect(nav.getByRole('link', { name: /^Drafts/ })).toHaveAttribute('aria-current', 'page');
+});
+
+test('fonts come from this origin only', async ({ page }) => {
+  const fonts: string[] = [];
+  page.on('request', (r) => { if (r.resourceType() === 'font') fonts.push(r.url()); });
+  await signIn(page);
+  await page.evaluate(() => document.fonts.ready);
+  expect(await page.evaluate(() => document.fonts.check('16px "Geist Variable"'))).toBe(true);
+  expect(fonts.length).toBeGreaterThan(0);
+  for (const u of fonts) expect(new URL(u).origin).toBe(new URL(page.url()).origin);
 });
 
 test('command palette: Ctrl+K, jump to a draft, ask from anywhere, Escape', async ({ page }) => {

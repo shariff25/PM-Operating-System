@@ -51,7 +51,7 @@ pnpm -C web build       # typecheck, then vite build into web/dist
 pnpm -C web e2e         # browser tests (Playwright) against the sample data
 ```
 
-`pnpm e2e` starts its own dev servers on ports 5191 and 5192 (the second is the empty account). It also runs axe (`@axe-core/playwright`, every rule on) on every page in both themes (`e2e/a11y.spec.ts`). It uses the browser at `/opt/pw-browsers/chromium`
+`pnpm e2e` starts its own dev servers on ports 5191, 5192 and 5193 (the second is the empty account, the third has the brief switched off). It also runs axe (`@axe-core/playwright`, every rule on) on every page in both themes (`e2e/a11y.spec.ts`). It uses the browser at `/opt/pw-browsers/chromium`
 when that exists, or the one in `PW_CHROMIUM`; otherwise run `pnpm exec playwright install chromium` once.
 
 ## Layout
@@ -59,7 +59,7 @@ when that exists, or the one in `PW_CHROMIUM`; otherwise run `pnpm exec playwrig
 - `src/copy.ts`: every user-facing word, in one file. Edit the wording there.
 - `src/api/`: `types.ts` (the contract), `real.ts` (fetch, CSRF, typed errors), `mock.ts`.
 - `src/pages/`: sign-in, home (launchpad), drafts, draft workspace, follow-ups, activity, thread.
-- `src/components/`: the app shell (sidebar, top bar, phone tab bar), command palette, user menu,
+- `src/components/`: the app shell (the dark rail, icons only on the draft workspace; on a phone a top bar and a bottom tab bar), command palette, user menu,
   toasts, coach-mark hints, approve dialog, icons (drawn here and inlined).
 - `src/data.tsx`: the drafts, brief and task lists the navigation counts and pages share.
 - Routes are hashes, checked in `src/url.ts`: `#/`, `#/drafts`, `#/d/<id>`, `#/followups`,
@@ -84,5 +84,8 @@ when that exists, or the one in `PW_CHROMIUM`; otherwise run `pnpm exec playwrig
 - Approve sends the draft `version` it showed, so the server can refuse a draft that changed
   (`409 stale`). Approving is blocked while there are unsaved edits or an open suggestion.
 - The sample-data client is imported only when `import.meta.env.DEV` is true, so it is not in a
-  production bundle (`src/build.test.ts` checks `dist`). There are no web fonts: the app uses the
-  system font stack and makes no third-party requests.
+  production bundle (`src/build.test.ts` checks `dist`). The fonts, Geist and Geist Mono, come from
+  the `@fontsource-variable/*` packages and are bundled as files on the app's own origin (never
+  inlined as `data:`), so the app makes no third-party requests.
+- `src/styles.css` holds the design tokens (light first, then the two identical dark blocks) and
+  every component style; `src/contrast.test.ts` checks text pairs against 4.5:1 in both themes.
