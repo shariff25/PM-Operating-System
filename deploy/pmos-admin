@@ -46,6 +46,23 @@ compose() { docker compose --project-directory "$DEPLOY" -f "$DEPLOY/compose.yam
 say() { printf '%s\n' "$*"; }
 row() { printf '  %-12s %-6s %s\n' "$1" "$2" "$3"; }
 
+# The console's sign-in settings. The console checks them too; this says so before anything
+# starts (docs/console.md, Sign-in).
+console_checks() {
+  local proxy_secret="${PMOS_CONSOLE_PROXY_SECRET:-}"
+  if [ "${PMOS_CONSOLE_TRUST_PROXY:-0}" = 1 ] && [ ${#proxy_secret} -lt 32 ]; then
+    echo "PMOS_CONSOLE_TRUST_PROXY=1 needs PMOS_CONSOLE_PROXY_SECRET (at least 32 characters) in" >&2
+    echo "deploy/.env: run deploy/setup.sh to generate it, and set the reverse proxy to send it in" >&2
+    echo "X-Pmos-Proxy-Secret (docs/console.md, Sign-in)." >&2
+    return 1
+  fi
+  if [ -n "${PMOS_CONSOLE_DEV_USER:-}" ]; then
+    echo "PMOS_CONSOLE_DEV_USER needs a loopback bind, and the console container listens on" >&2
+    echo "0.0.0.0: clear it and use PMOS_CONSOLE_TRUST_PROXY=1 (docs/console.md, Sign-in)." >&2
+    return 1
+  fi
+}
+
 profiles() {
   local p=()
   if [ -n "${PMOS_SLACK_APP_TOKEN:-}" ] && [ -n "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
@@ -159,6 +176,9 @@ case "$cmd" in
     ;;
 
   up)
+    for arg in "$@"; do
+      if [ "$arg" = --console ]; then console_checks || exit 2; fi
+    done
     mapfile -t prof < <(profiles "$@")
     if [ -z "${PMOS_SLACK_APP_TOKEN:-}" ] || [ -z "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
       say "note: the Slack bot is off until PMOS_SLACK_APP_TOKEN and PMOS_SLACK_BOT_TOKEN are set"
