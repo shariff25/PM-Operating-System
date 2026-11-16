@@ -62,6 +62,7 @@ text_enum!(
     /// Where a task came from.
     Source {
         Slack = "slack",
+        Web = "web",
         Routine = "routine",
         Cli = "cli",
         Eval = "eval",
@@ -71,7 +72,7 @@ text_enum!(
 text_enum!(
     /// The gateway queue a task's model calls join (`X-Pmos-Priority`).
     Priority {
-        /// Someone is waiting: Slack and the CLI.
+        /// Someone is waiting: Slack, the web app and the CLI.
         Interactive = "interactive",
         /// Routines.
         Scheduled = "scheduled",
@@ -95,7 +96,7 @@ impl Source {
     /// Each source has one priority (spec §3, Task).
     pub fn priority(self) -> Priority {
         match self {
-            Self::Slack | Self::Cli => Priority::Interactive,
+            Self::Slack | Self::Web | Self::Cli => Priority::Interactive,
             Self::Routine => Priority::Scheduled,
             Self::Eval => Priority::Personal,
         }
@@ -412,6 +413,7 @@ mod tests {
     #[test]
     fn sources_set_the_priority() {
         assert_eq!(Source::Slack.priority(), Priority::Interactive);
+        assert_eq!(Source::Web.priority(), Priority::Interactive);
         assert_eq!(Source::Cli.priority(), Priority::Interactive);
         assert_eq!(Source::Routine.priority(), Priority::Scheduled);
         assert_eq!(Source::Eval.priority(), Priority::Personal);

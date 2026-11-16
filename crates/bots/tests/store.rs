@@ -266,6 +266,37 @@ async fn transitions_check_their_guards(store: Arc<dyn BotsStore>) {
     assert_eq!(store.events(&t.id).await.unwrap().len(), 3);
 }
 
+async fn web_tasks_round_trip_and_write_no_notifications(store: Arc<dyn BotsStore>) {
+    let mut t = task("docs", "ana", Source::Web, 1);
+    t.slack = None;
+    assert_eq!(t.priority, pmos_bots::model::Priority::Interactive);
+    store.create_task(&t, "queued").await.unwrap();
+    assert_eq!(store.task(&t.id).await.unwrap().as_ref(), Some(&t));
+    let f = TaskFilter {
+        source: Some(Source::Web),
+        ..all()
+    };
+    assert_eq!(store.tasks(&f).await.unwrap().len(), 1);
+    let now = at(2026, 11, 14, 10, 0);
+    store
+        .claim(None, "w1", now + Duration::seconds(120), now)
+        .await
+        .unwrap()
+        .unwrap();
+    let done = Transition {
+        worker: Some("w1".into()),
+        to: Some(TaskStatus::Done),
+        lease: Lease::Clear,
+        result: Some("Answer.".into()),
+        event: Some(("status".into(), "done".into())),
+        notify: Some(NewNotification::new(NotificationKind::Done, "Answer.")),
+        ..Transition::from(&[TaskStatus::Working])
+    };
+    store.transition(&t.id, &done, now).await.unwrap().unwrap();
+    assert!(store.notifications(0, 10).await.unwrap().is_empty());
+    assert_eq!(store.events(&t.id).await.unwrap().len(), 3);
+}
+
 async fn expired_leases_are_found(store: Arc<dyn BotsStore>) {
     let now = at(2026, 11, 14, 10, 0);
     let a = task("docs", "ana", Source::Slack, 1);
@@ -669,6 +700,7 @@ both_stores!(
     two_workers_never_claim_the_same_task,
     transitions_check_their_guards,
     a_refused_change_leaves_the_task_claimable,
+    web_tasks_round_trip_and_write_no_notifications,
     expired_leases_are_found,
     notifications_are_ordered_and_paged,
     concurrent_notifications_have_distinct_numbers,
