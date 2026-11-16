@@ -65,7 +65,8 @@ where `crates/web` is only a stub): confirm them against `crates/web/src/config.
 | Variable | Default | What it is |
 | --- | --- | --- |
 | `PMOS_WEB_BIND` | `127.0.0.1:8770` | Address to listen on. The container uses `0.0.0.0:8770` and publishes the port on `127.0.0.1` only. |
-| `PMOS_WEB_DEV_LOGIN` | off | `1` turns on development sign-in. **Required today**: with no sign-in provider the server refuses to start. |
+| `PMOS_WEB_DEV_LOGIN` | off | `1` turns on development sign-in. The server needs it or Entra ID sign-in; with neither it refuses to start. |
+| `PMOS_WEB_ENTRA_TENANT_ID`, `PMOS_WEB_ENTRA_CLIENT_ID`, `PMOS_WEB_ENTRA_CLIENT_SECRET` | none | Entra ID sign-in, with `PMOS_WEB_PUBLIC_URL` (`docs/entra-sign-in.md`). The deploy kit doesn't pass these yet. |
 | `PMOS_BOTS_URL` | `http://127.0.0.1:8750` | The bot runtime. |
 | `PMOS_WEB_BOTS_TOKEN` | required | The runtime token for client `web`: at least 32 characters, and the same value as the `web=<token>` entry in the runtime's `PMOS_BOTS_TOKENS`. |
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | The tool server, for approvals. |
@@ -112,13 +113,14 @@ The deploy kit (`deploy/`) knows the web app, **off by default**:
 
 ## Not ready for production
 
-- **Development sign-in only.** Entra ID sign-in is not built. With development sign-in anyone
-  who can reach the port signs in as any member, so it is for a closed test network behind the
-  proxy, never for the company network or the internet.
+- **Development sign-in only, in the deploy kit.** `pmos-web` has Entra ID sign-in
+  (`docs/entra-sign-in.md`), but `deploy/` doesn't pass its variables yet. With development
+  sign-in anyone who can reach the port signs in as any member, so it is for a closed test
+  network behind the proxy, never for the company network or the internet.
 - **Sessions and settings are in memory.** A restart signs everyone out and resets what the app
   keeps for people.
-- **No Entra, so no real identity.** Nothing ties a browser to a person but the handle chosen at
-  sign-in.
+- **No real identity in the deploy kit.** With development sign-in nothing ties a browser to a
+  person but the handle chosen at sign-in.
 - **A powerful token.** The backend holds a tool server token (`PMOS_SERVICE_TOKEN`) that can
   decide approvals for any user. It checks ownership itself before deciding, but the token is
   not limited to one person, so anyone who can run code in or reach the container can act for
