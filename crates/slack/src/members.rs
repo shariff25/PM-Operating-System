@@ -518,6 +518,11 @@ impl Bots {
         match status {
             "approved" => {
                 let handle = str_of(request, "handle");
+                if self.onboarding_v2() {
+                    self.onboarding_hello(&channel, str_of(request, "name"), handle)
+                        .await;
+                    return;
+                }
                 self.post(
                     &channel,
                     None,
