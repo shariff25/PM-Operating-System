@@ -82,6 +82,14 @@ scripts/claude-test-stack.sh
 (`state/claude-test/usage.jsonl`) records each Claude call: who made it, the role and the
 tokens, never the text. **Ctrl-C** stops everything.
 
+## The web app (optional)
+
+To try the web app (`web/` and its backend `pmos-web`) against this stack, run
+`PMOS_TEST_WEB=1 scripts/claude-test-stack.sh`. It builds the app and the backend, starts
+`pmos-web` on `127.0.0.1:8770` with development sign-in (this machine only) and prints the
+address. Without the variable nothing changes. See [Running the web app](web-app-running.md),
+including why it isn't ready for production.
+
 ## The model
 
 `config/gateway.claude-test.yaml` maps both roles to `claude-opus-5-5`:
