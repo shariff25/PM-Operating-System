@@ -51,6 +51,38 @@ it can be deleted.
 - **Queue full:** a call that would have to wait gets `503` with `Retry-After: 5` when `max-queue` calls are already waiting. A call that can start at once always starts.
 - **Hang-ups:** a caller that hangs up while waiting gives its place back.
 
+## Retrying a busy model server
+A model provider can answer `429` ("quota exceeded", a per-minute limit) or `503` for a
+moment. The gateway retries these itself, so a brief limit doesn't lose a PM's request
+(`crates/gateway/src/retry.rs`).
+
+- **What is retried:** `429`, `503`, and a failure to connect (nothing was sent). A streamed
+  request is retried only before its first byte has gone to the caller, which is when such a
+  status arrives; a stream that has begun is never repeated. Any other error, `400`-class
+  included, is returned at once.
+- **How long it waits:** the upstream's `Retry-After` (seconds or an HTTP date) when it sent
+  one, otherwise an exponential backoff with jitter (about 1 s, then 2 s).
+- **Limits:** `PMOS_GATEWAY_RETRY_MAX_ATTEMPTS` (default `3`, the first try included; `1` turns
+  retrying off), `PMOS_GATEWAY_RETRY_BUDGET_SECS` (default `20`, counted from the first try;
+  a wait that would pass it is not started, so a `Retry-After` longer than the time left
+  gives up at once) and `PMOS_GATEWAY_RETRY_BASE_MS` (default `1000`).
+- **Giving up:** the caller gets the upstream's last status, body and `Retry-After`, exactly
+  as it would have without retries.
+- **Quotas that won't recover:** if the error body says so, it fails at once with the same
+  error. Detected: OpenAI's `insufficient_quota` and `billing_not_active`, and any body naming
+  a per-day or daily quota (Gemini's `...PerDay...` quota ids). Anything unclear is left to
+  the budget.
+- **Queue:** a call waiting to retry gives its slot back, so retries never hold up other
+  callers. It takes a slot again at the same priority, so an interactive call still goes
+  before scheduled and personal ones. If the queue is full then, it returns the upstream's
+  last answer.
+- **Caller header:** every call to a model server carries `X-Pmos-Upstream-Attempts`, the
+  number of tries made.
+- **Not covered:** the Claude test upstream, and a stream that breaks after it has begun.
+- **Two layers:** the harness worker doesn't retry model calls itself. It shows a `429`/`503`
+  as "The model is busy" (`harness/src/worker.ts`). An SDK retry in the harness would
+  multiply with this one, so keep it off or small.
+
 ## API
 | Endpoint | Auth | Purpose |
 | --- | --- | --- |
@@ -65,7 +97,8 @@ it can be deleted.
 - `X-Pmos-User`: a handle;
 - `X-Pmos-Priority`;
 - `X-Pmos-Run`: logged with the call;
-- each response carries `X-Pmos-Model`, the model that answered.
+- each response carries `X-Pmos-Model`, the model that answered, and (for model-server
+  calls) `X-Pmos-Upstream-Attempts`.
 
 **Errors:** in OpenAI's shape. A model server's own refusal, such as "context length exceeded", is passed through; an unreachable server is `502`.
 
@@ -73,7 +106,9 @@ it can be deleted.
 One event per call:
 - client, user, run, role, model, upstream host;
 - priority, stream or not, status;
-- queue and total time, token counts, workarounds applied.
+- queue and total time, token counts, workarounds applied;
+- `attempt` and `attempts`: every try at the model server gets a line, with `retrying: true`
+  on those that failed and will be retried. The last line of a call is its final outcome.
 
 It never holds prompts or answers. Events go to the service log, and with `PMOS_GATEWAY_USAGE_LOG` also to a JSON-lines file for shipping off-box. Because every upstream must be local outside testing, "restricted data sent off the Spark" is zero by construction; the upstream host on each event lets anyone check (a testing-only upstream shows its remote host).
 
@@ -86,6 +121,9 @@ It never holds prompts or answers. Events go to the service log, and with `PMOS_
 | `PMOS_GATEWAY_USAGE_LOG` | none | JSON-lines usage file |
 | `PMOS_GATEWAY_STUB` | off | `1` answers with a deterministic stub model and no model server, for CI and development |
 | `PMOS_GATEWAY_WORKAROUNDS` | `on` | `off` for the benchmark run |
+| `PMOS_GATEWAY_RETRY_MAX_ATTEMPTS` | `3` | Tries per call, first included (1 to 10) |
+| `PMOS_GATEWAY_RETRY_BUDGET_SECS` | `20` | Total time a call may spend retrying (0 to 300) |
+| `PMOS_GATEWAY_RETRY_BASE_MS` | `1000` | First backoff when there is no `Retry-After`; doubles each try |
 | `PMOS_GATEWAY_CLOUD_TEST` | off | **Testing only.** `1` accepts the Claude test upstream and remote test upstreams (below) |
 | `PMOS_GATEWAY_ANTHROPIC_KEY` | none | **Testing only.** The Claude API key for the Claude test upstream |
 | `PMOS_GATEWAY_REMOTE_KEY` | none | **Testing only.** The API key for remote test upstreams (`openai+https://…`), sent as `Authorization: Bearer`. Never logged. |
