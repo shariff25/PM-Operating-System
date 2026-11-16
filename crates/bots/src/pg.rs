@@ -179,6 +179,10 @@ async fn insert_notification(
     n: &NewNotification,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // A web task has no Slack thread to post in; its caller reads the task and its events.
+    if task.source == Source::Web {
+        return Ok(());
+    }
     // The counter row stays locked until this transaction commits, so a later number can't
     // become visible before an earlier one and a reader's cursor never skips an item.
     let seq: i64 = sqlx::query_scalar(
