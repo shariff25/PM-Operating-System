@@ -226,8 +226,14 @@ export interface FakeGateway {
   close(): Promise<void>;
 }
 
-/** An OpenAI-compatible `/v1/chat/completions` that always answers `answer`. */
-export async function startFakeGateway(answer: string): Promise<FakeGateway> {
+/**
+ * An OpenAI-compatible `/v1/chat/completions` that always answers `answer`, or, with `fail`,
+ * always answers that status with the gateway's `X-Pmos-Upstream-Attempts` header.
+ */
+export async function startFakeGateway(
+  answer: string,
+  fail?: { status: number; upstreamAttempts: number },
+): Promise<FakeGateway> {
   const requests: Recorded[] = [];
   const server = createServer(async (req, res) => {
     const recorded: Recorded = {
@@ -237,6 +243,15 @@ export async function startFakeGateway(answer: string): Promise<FakeGateway> {
       body: await readBody(req),
     };
     requests.push(recorded);
+    if (fail) {
+      res
+        .writeHead(fail.status, {
+          "content-type": "application/json",
+          "x-pmos-upstream-attempts": String(fail.upstreamAttempts),
+        })
+        .end(JSON.stringify({ error: { message: "busy", type: "server_error" } }));
+      return;
+    }
     if (recorded.path !== "/v1/chat/completions") {
       json(res, 404, { error: { message: "not found" } });
       return;
