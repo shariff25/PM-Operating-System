@@ -547,7 +547,16 @@ pub trait ApprovalRepo: Send + Sync {
         before: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> StoreResult<usize>;
+
+    /// Close `user`'s pending items as the system ([`SYSTEM_DECIDER`]): each becomes
+    /// `rejected` with the ledger reason [`crate::ledger::Reason::OwnerDeactivated`], and no
+    /// write runs. The user was deactivated and not reactivated within the grace
+    /// (`docs/user-database-spec.md` §6). Returns the ids closed.
+    async fn close_for_owner(&self, user: &str, now: DateTime<Utc>) -> StoreResult<Vec<String>>;
 }
+
+/// Who closes a deactivated owner's held drafts, in `decided_by`.
+pub const SYSTEM_DECIDER: &str = "system";
 
 /// A PM's inbox as [`ApprovalRepo::inbox`] reads it.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -960,6 +969,30 @@ impl ApprovalRepo for MemoryApprovals {
             n += 1;
         }
         Ok(n)
+    }
+
+    async fn close_for_owner(&self, user: &str, now: DateTime<Utc>) -> StoreResult<Vec<String>> {
+        let mut state = self.state.lock().expect("approvals lock");
+        let mut ids = Vec::new();
+        for item in state
+            .items
+            .values_mut()
+            .filter(|i| i.user == user && i.status == Status::Pending)
+        {
+            item.status = Status::Rejected;
+            item.decided_at = Some(now);
+            item.decided_by = Some(SYSTEM_DECIDER.to_string());
+            ids.push(item.id.clone());
+        }
+        for id in &ids {
+            if let Some(entry) = state.ledger.get_mut(id) {
+                entry.row.outcome = LedgerOutcome::Rejected;
+                entry.row.reason = Some(crate::ledger::Reason::OwnerDeactivated);
+                entry.row.decided_at = Some(now);
+                entry.row.decided_by = Some(SYSTEM_DECIDER.to_string());
+            }
+        }
+        Ok(ids)
     }
 }
 

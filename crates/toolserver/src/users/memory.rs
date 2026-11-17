@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 
 use super::import::ImportRequest;
 use super::link::{self, EntraLink, LinkError, LinkRefusal, LinkResult, Linked, Planned};
-use super::rules::{self, denied_event, Rules};
+use super::rules::{self, denied_event, Effect, Rules};
 use super::{
     audit_event, Actor, Applied, ChangeKind, Directory, Op, RoleChange, UserResult, UserStore,
     ROLE_CHANGES_RETENTION_DAYS,
@@ -48,6 +48,17 @@ pub struct MemoryUsers {
     state: Mutex<State>,
     rules: Rules,
     audit: Option<Arc<dyn AuditSink>>,
+    linked: Option<LinkedStores>,
+}
+
+/// The stores a deactivation and a reactivation reach beyond the users tables (§6). In
+/// Postgres they are the same database and change in the same transaction; here they change
+/// right after the directory, under the same lock.
+#[derive(Clone)]
+pub struct LinkedStores {
+    pub sessions: Arc<dyn crate::session::SessionRepo>,
+    pub credentials: Arc<dyn crate::vault::CredentialStore>,
+    pub approvals: Arc<dyn crate::approvals::ApprovalRepo>,
 }
 
 impl Default for MemoryUsers {
@@ -65,7 +76,40 @@ impl MemoryUsers {
             state: Mutex::new(state),
             rules,
             audit: None,
+            linked: None,
         }
+    }
+
+    /// Run deactivations' and reactivations' effects on these stores.
+    pub fn with_linked(mut self, linked: LinkedStores) -> Self {
+        self.linked = Some(linked);
+        self
+    }
+
+    async fn run(&self, effects: &[Effect], now: DateTime<Utc>) -> StoreResult<()> {
+        let Some(l) = &self.linked else {
+            return Ok(());
+        };
+        for effect in effects {
+            match effect {
+                Effect::RevokeSessions(h) => {
+                    l.sessions.revoke_user(h).await?;
+                }
+                Effect::SuspendCredentials(h) => {
+                    l.credentials.suspend(h, now).await?;
+                }
+                Effect::RestoreCredentials(h) => {
+                    l.credentials.restore(h).await?;
+                }
+                Effect::DeleteSuspendedCredentials(h) => {
+                    l.credentials.delete_suspended(h).await?;
+                }
+                Effect::CloseHeldDrafts(h) => {
+                    l.approvals.close_for_owner(h, now).await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Record each write's audit events here too.
@@ -125,6 +169,9 @@ impl UserStore for MemoryUsers {
                         .collect(),
                 )
                 .await?;
+                // The effects next, still under the lock: a failure leaves the directory as
+                // it was (an effect already run is idempotent on a retry).
+                self.run(&plan.effects, now).await?;
                 let mut next = plan.next;
                 next.capped_deactivations.clear();
                 state.dir = next;

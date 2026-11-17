@@ -70,7 +70,12 @@ async fn start_toolserver() -> (
         Arc::new(FakeConnector::slack()),
         Arc::new(FakeConnector::docs()),
     ];
-    let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
+    // An open user directory, as with fake connectors before the user database (slice U3).
+    let svc = Arc::new(
+        ToolService::new(catalog, stores, connectors)
+            .unwrap()
+            .with_open_directory(),
+    );
     let ts_cancel = CancellationToken::new();
     let (ts_base, stop_ts) = serve(router(
         svc,

@@ -132,7 +132,7 @@ async fn a_personal_bot_serves_only_its_owner() {
 
 #[tokio::test]
 async fn a_team_bot_serves_team_members_only_when_the_team_is_enforced() {
-    let f = common::team_fixture(&["ana", "bo"]);
+    let f = common::team_fixture(&["ana", "bo"]).await;
     for user in ["ana", "bo"] {
         assert!(f
             .svc
@@ -501,7 +501,7 @@ async fn reindex_reloads_bots_and_settings_for_live_sessions() {
 
 #[tokio::test]
 async fn deciders_must_be_in_team_yaml_when_it_is_enforced() {
-    let f = common::team_fixture(&["ana"]);
+    let f = common::team_fixture(&["ana"]).await;
     let s = bot_session(&f, "ana", "scout").await;
     let out = f
         .svc
@@ -824,7 +824,7 @@ async fn mcp_lists_and_calls_only_what_the_bot_may() {
 
 #[tokio::test]
 async fn the_bot_token_reads_and_decides_one_item() {
-    let s = start(common::team_fixture(&["ana", "bo"])).await;
+    let s = start(common::team_fixture(&["ana", "bo"]).await).await;
     let session = s
         .fixture
         .svc
@@ -968,7 +968,7 @@ async fn the_bot_token_reads_and_decides_one_item() {
 
 #[tokio::test]
 async fn an_edit_from_the_bot_cant_change_where_a_draft_goes() {
-    let s = start(common::team_fixture(&["ana", "bo"])).await;
+    let s = start(common::team_fixture(&["ana", "bo"]).await).await;
     let session = s
         .fixture
         .svc
@@ -1041,7 +1041,7 @@ async fn an_edit_from_the_bot_cant_change_where_a_draft_goes() {
 
 #[tokio::test]
 async fn the_console_token_reads_approvals_and_nothing_else() {
-    let s = start(common::team_fixture(&["ana", "bo"])).await;
+    let s = start(common::team_fixture(&["ana", "bo"]).await).await;
     let session = s
         .fixture
         .svc

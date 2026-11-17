@@ -416,6 +416,7 @@ async fn start(opts: Opts) -> Server {
             },
         },
         vault.clone(),
+        f.svc.people().clone(),
     ));
     vault
         .put(&Credential {

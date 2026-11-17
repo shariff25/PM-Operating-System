@@ -40,7 +40,14 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
 
+[features]
+# An open user directory (any valid handle may use PM OS) for tests only: never in a release
+# binary (docs/user-database-spec.md §3, "Test stacks").
+test-support = []
+
 [dev-dependencies]
+# Itself, with the open directory for the integration tests.
+pmos-toolserver = { path = ".", features = ["test-support"] }
 # The runtime, for the end-to-end conversation test (tests/history_e2e.rs).
 pmos-bots = { path = "../bots" }
 pmos-docs = { path = "../docs" }

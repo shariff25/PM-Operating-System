@@ -1911,6 +1911,7 @@ dependencies = [
  "pmos-docs",
  "pmos-policy",
  "pmos-runtime",
+ "pmos-toolserver",
  "pulldown-cmark",
  "reqwest",
  "rmcp",

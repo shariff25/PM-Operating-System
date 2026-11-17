@@ -11,9 +11,15 @@
 //! GitHub token (rotating refresh tokens: each refresh returns a new refresh token) under a
 //! per-user lock, so concurrent calls make one refresh.
 //!
-//! A GitHub link is checked before anything is stored: the account must be an active member
-//! of `PMOS_GITHUB_ORG`, and its login must be the member's `github` in `team.yaml` or, if
-//! that isn't set, one of its verified emails must be their `email`. The login is kept as the
+//! Every link is checked against the user database before anything is stored
+//! (`docs/user-database-spec.md` §6): the person must be an active PM OS user, and the account
+//! must be theirs. Slack: the member id is their Slack identity. Atlassian and GitHub: **after
+//! the first link the account id decides** (the Atlassian `account_id`, the GitHub numeric user
+//! id, stored as an identity); a later link with another account is refused `409
+//! different_account` until an admin unlinks. Before the first link, the Atlassian email must be
+//! their `atlassian_email`, and a GitHub account (an active member of `PMOS_GITHUB_ORG`) must
+//! have their `github_login`, or, with none recorded, a verified email equal to their
+//! `atlassian_email`. The GitHub login and the Atlassian account id are kept as the
 //! credential's `external_id`.
 
 use std::collections::HashMap;
@@ -37,7 +43,8 @@ fn linkable(user: &str) -> bool {
 }
 use crate::connectors::registry::{link_statuses, registry, LinkStatus};
 use crate::store::{StoreError, StoreResult};
-use crate::team::Team;
+use crate::users::access::{may_use, People};
+use crate::users::{Actor, IdentityKind, Op, Refusal, UserError};
 use crate::vault::{Credential, CredentialInfo, Provider, Secret, Vault};
 
 /// How long a `state` value is accepted.
@@ -117,6 +124,10 @@ pub enum OAuthError {
     /// forwarded to someone else can't attach their account to the sender.
     #[error("the {label} account that signed in doesn't belong to this PM: {detail}", label = .0.label(), detail = .1)]
     WrongAccount(Provider, String),
+    /// The PM linked another account of this kind first: its account id decides. An admin
+    /// unlinks it before another can be linked (`409 different_account`).
+    #[error("this PM linked a different {label} account first; ask a platform owner to unlink it before linking another", label = .0.label())]
+    DifferentAccount(Provider),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -162,7 +173,8 @@ pub struct OAuth {
     http: reqwest::Client,
     used_states: Mutex<HashMap<String, DateTime<Utc>>>,
     refresh_locks: Mutex<HashMap<(String, Provider), RefreshLock>>,
-    team: Arc<Team>,
+    /// Whose accounts may be linked, and which accounts are theirs.
+    people: Arc<People>,
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -171,7 +183,9 @@ type HmacSha256 = Hmac<Sha256>;
 type RefreshLock = Arc<tokio::sync::Mutex<()>>;
 
 impl OAuth {
-    pub fn new(config: OAuthConfig, vault: Vault) -> Self {
+    /// `people`: the user directory every link is checked against (an open one, in tests,
+    /// checks nothing).
+    pub fn new(config: OAuthConfig, vault: Vault, people: Arc<People>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(StdDuration::from_secs(20))
             .build()
@@ -182,14 +196,8 @@ impl OAuth {
             http,
             used_states: Mutex::new(HashMap::new()),
             refresh_locks: Mutex::new(HashMap::new()),
-            team: Team::open(),
+            people,
         }
-    }
-
-    /// Check every linked account against `team` (Slack member id, Atlassian email).
-    pub fn with_team(mut self, team: Arc<Team>) -> Self {
-        self.team = team;
-        self
     }
 
     pub fn vault(&self) -> &Vault {
@@ -367,10 +375,22 @@ impl OAuth {
             Provider::Slack => self.exchange_slack(&user, code, now).await?,
             Provider::Github => self.exchange_github(&user, code, now).await?,
         };
-        if provider == Provider::Github {
-            credential.external_id = Some(self.check_github(&credential).await?);
+        let key = if provider == Provider::Github {
+            let (login, id) = self.check_github(&credential).await?;
+            credential.external_id = Some(login);
+            id.map(|id| (IdentityKind::Github, id))
         } else {
-            self.check_identity(&credential).await?;
+            let account = self.check_identity(&credential).await?;
+            if let Some(account) = &account {
+                credential.external_id = Some(account.clone());
+            }
+            account.map(|a| (IdentityKind::Atlassian, a))
+        };
+        // The first link stores the account id; a later one with another account is refused
+        // here, before anything is stored, even if a concurrent link got there first.
+        if let Some((kind, subject)) = key {
+            self.record_link(&user, provider, kind, subject, now)
+                .await?;
         }
         self.vault.put(&credential).await?;
         tracing::info!(user = %user, provider = %provider, "account linked");
@@ -384,34 +404,74 @@ impl OAuth {
         })
     }
 
-    /// The account that signed in must be the one `team.yaml` lists for this PM. Nothing is
-    /// stored otherwise.
+    /// Store the account id of `user`'s first Atlassian or GitHub link; a later link must
+    /// present the same one.
+    async fn record_link(
+        &self,
+        user: &str,
+        provider: Provider,
+        kind: IdentityKind,
+        subject: String,
+        now: DateTime<Utc>,
+    ) -> Result<(), OAuthError> {
+        let op = Op::LinkAccount {
+            handle: user.to_string(),
+            kind,
+            subject,
+        };
+        match self.people.apply(&Actor::link(user), op, now).await {
+            Ok(_) => {
+                tracing::info!(user, provider = %provider, "first link: account id recorded");
+                Ok(())
+            }
+            Err(e) => match e.refusal() {
+                Some(Refusal::Unchanged) => Ok(()),
+                Some(Refusal::DifferentAccount) => Err(OAuthError::DifferentAccount(provider)),
+                Some(Refusal::Taken) => Err(OAuthError::WrongAccount(
+                    provider,
+                    "that account is linked to another PM OS user".into(),
+                )),
+                Some(_) => Err(OAuthError::WrongAccount(
+                    provider,
+                    "not an active PM OS user".into(),
+                )),
+                None => match e {
+                    UserError::Store(e) => Err(OAuthError::Store(e)),
+                    UserError::Refused { .. } => unreachable!("a refusal has a code"),
+                },
+            },
+        }
+    }
+
+    /// The account that signed in must belong to this PM in the user database. Nothing is
+    /// stored otherwise. Returns the Atlassian account id to record (Slack: none).
     ///
-    /// A team bot's identity (`bots.<name>`) isn't a PM, so `team.yaml` has nothing to check
-    /// it against: its link URL comes only from a platform owner's service-token call.
-    async fn check_identity(&self, credential: &Credential) -> Result<(), OAuthError> {
+    /// A team bot's identity (`bots.<name>`) isn't a PM, so there is nothing to check it
+    /// against: its link URL comes only from a platform owner's service-token call.
+    async fn check_identity(&self, credential: &Credential) -> Result<Option<String>, OAuthError> {
         if is_bot_identity(&credential.user) {
             tracing::info!(identity = %credential.user, provider = %credential.provider, "linking a team bot's own account");
-            return Ok(());
+            return Ok(None);
         }
-        if !self.team.enforced() {
-            return Ok(());
+        if !self.people.enforced() {
+            return Ok(None);
         }
         let provider = credential.provider;
         let wrong = |why: &str| Err(OAuthError::WrongAccount(provider, why.to_string()));
-        let Some(member) = self.team.member(&credential.user) else {
-            return wrong("not in team.yaml");
+        let Some(member) = self.people.user(&credential.user).await?.filter(may_use) else {
+            return wrong("not an active PM OS user");
         };
         match provider {
             Provider::Slack => {
-                if credential.external_id.as_deref() != Some(member.slack_id.as_str()) {
-                    return wrong("the Slack user isn't the slack-id in team.yaml");
+                let slack = member
+                    .identity(IdentityKind::Slack)
+                    .map(|i| i.subject.as_str());
+                if slack.is_none() || credential.external_id.as_deref() != slack {
+                    return wrong("the Slack user isn't this PM's Slack account");
                 }
+                Ok(None)
             }
             Provider::Atlassian => {
-                let Some(expected) = member.email.as_deref() else {
-                    return wrong("team.yaml has no email for this PM");
-                };
                 let me = self
                     .http
                     .get(format!("{}/me", self.config.endpoints.atlassian_api))
@@ -429,14 +489,35 @@ impl OAuth {
                     .json()
                     .await
                     .map_err(|e| OAuthError::Exchange(provider, e.to_string()))?;
+                let Some(account) = me["account_id"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(String::from)
+                else {
+                    return Err(OAuthError::Exchange(
+                        provider,
+                        "the profile has no account id".into(),
+                    ));
+                };
+                // After the first link the account id decides; the email is ignored.
+                if let Some(linked) = member.identity(IdentityKind::Atlassian) {
+                    if linked.subject != account {
+                        return Err(OAuthError::DifferentAccount(provider));
+                    }
+                    return Ok(Some(account));
+                }
+                let Some(expected) = member.atlassian_email.as_deref() else {
+                    return wrong("no Atlassian email is recorded for this PM");
+                };
                 let email = me["email"].as_str().unwrap_or_default();
                 if !email.eq_ignore_ascii_case(expected) {
-                    return wrong("the Atlassian email isn't the email in team.yaml");
+                    return wrong("the Atlassian email isn't this PM's");
                 }
+                Ok(Some(account))
             }
             Provider::Github => unreachable!("GitHub links are checked by check_github"),
         }
-        Ok(())
     }
 
     /// A GET to the GitHub API with a just-issued user token.
@@ -459,9 +540,13 @@ impl OAuth {
     }
 
     /// The GitHub account that signed in must be an active member of the org, and the PM's:
-    /// their `github` login in `team.yaml`, else a verified email equal to their `email`.
-    /// Returns the login. Nothing is stored otherwise.
-    async fn check_github(&self, credential: &Credential) -> Result<String, OAuthError> {
+    /// the numeric id of their first link, else their `github_login`, else a verified email
+    /// equal to their `atlassian_email`. Returns the login and, when checked, the numeric id
+    /// to record. Nothing is stored otherwise.
+    async fn check_github(
+        &self,
+        credential: &Credential,
+    ) -> Result<(String, Option<String>), OAuthError> {
         let provider = Provider::Github;
         let wrong = |why: String| Err(OAuthError::WrongAccount(provider, why));
         let failed = |what: &str, status: u16| {
@@ -473,6 +558,7 @@ impl OAuth {
             Some(login) if status == 200 => login.to_string(),
             _ => return Err(failed("the profile lookup", status)),
         };
+        let id = me["id"].as_u64().map(|id| id.to_string());
         let org = self
             .config
             .github_org
@@ -490,20 +576,32 @@ impl OAuth {
             }
             s => return Err(failed("the org membership lookup", s)),
         }
-        if !self.team.enforced() {
-            return Ok(login);
+        if !self.people.enforced() {
+            return Ok((login, None));
         }
-        let Some(member) = self.team.member(&credential.user) else {
-            return wrong("not in team.yaml".into());
+        let Some(member) = self.people.user(&credential.user).await?.filter(may_use) else {
+            return wrong("not an active PM OS user".into());
         };
-        if let Some(expected) = member.github.as_deref() {
-            if !login.eq_ignore_ascii_case(expected) {
-                return wrong("the GitHub login isn't the github login in team.yaml".into());
+        let Some(id) = id else {
+            return Err(failed("the profile lookup (no user id)", status));
+        };
+        // After the first link the numeric id decides; the login is ignored.
+        if let Some(linked) = member.identity(IdentityKind::Github) {
+            if linked.subject != id {
+                return Err(OAuthError::DifferentAccount(provider));
             }
-            return Ok(login);
+            return Ok((login, Some(id)));
         }
-        let Some(expected) = member.email.as_deref() else {
-            return wrong("team.yaml has no github login or email for this PM".into());
+        if let Some(expected) = member.github_login.as_deref() {
+            if !login.eq_ignore_ascii_case(expected) {
+                return wrong(
+                    "the GitHub login isn't the github login recorded for this PM".into(),
+                );
+            }
+            return Ok((login, Some(id)));
+        }
+        let Some(expected) = member.atlassian_email.as_deref() else {
+            return wrong("no GitHub login or email is recorded for this PM".into());
         };
         let (status, emails) = self.github_get(token, "/user/emails").await?;
         if status != 200 {
@@ -516,9 +614,9 @@ impl OAuth {
                     .is_some_and(|a| a.eq_ignore_ascii_case(expected))
         });
         if !verified {
-            return wrong("no verified GitHub email is the email in team.yaml".into());
+            return wrong("no verified GitHub email is this PM's email".into());
         }
-        Ok(login)
+        Ok((login, Some(id)))
     }
 
     /// POST to GitHub's token endpoint. GitHub answers some errors as `200` with
@@ -986,6 +1084,7 @@ mod tests {
                 endpoints: Endpoints::default(),
             },
             vault,
+            Arc::new(People::open(Arc::new(crate::users::MemoryUsers::default()))),
         )
     }
 

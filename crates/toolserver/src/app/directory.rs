@@ -378,12 +378,16 @@ async fn resolve(
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             res
         }
-        None => miss(
-            &limiter,
-            client,
-            lookup.kind(),
-            coded(StatusCode::NOT_FOUND, "not_found", "no such user"),
-        ),
+        None => {
+            // For the admin overview's warning (slice U3).
+            state.svc.people().resolve_misses().record(client.as_str());
+            miss(
+                &limiter,
+                client,
+                lookup.kind(),
+                coded(StatusCode::NOT_FOUND, "not_found", "no such user"),
+            )
+        }
     }
 }
 
@@ -447,6 +451,7 @@ async fn first_link(
         Err(LinkError::Refused(why)) => {
             let res = coded(link_status(why), why.code(), why.message());
             if why == LinkRefusal::NotFound {
+                state.svc.people().resolve_misses().record(client.as_str());
                 miss(&limiter, client, "first_link", res)
             } else {
                 tracing::info!(code = why.code(), "first Entra link refused");

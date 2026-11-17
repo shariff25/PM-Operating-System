@@ -453,6 +453,8 @@ async fn search_pages_filters_and_hides_content(srv: &Server) {
     assert_eq!(
         seen,
         [
+            // The fixture's user database, seeded (and audited) at the fixture's `now`.
+            "users.import",
             "confluence.read",
             "jira.create_issue",
             "slack.post_reply",

@@ -128,6 +128,10 @@ pub struct SealedCredential {
     pub site_url: Option<String>,
     pub external_id: Option<String>,
     pub updated_at: DateTime<Utc>,
+    /// Set while the user is deactivated (`docs/user-database-spec.md` §6): the vault never
+    /// unseals a suspended credential. Only the user store's deactivation and reactivation
+    /// change it; `put` and `replace` keep it as it is.
+    pub suspended_at: Option<DateTime<Utc>>,
 }
 
 /// Storage for sealed credentials. Implementations never see plaintext tokens.
@@ -146,6 +150,12 @@ pub trait CredentialStore: Send + Sync {
     ) -> StoreResult<bool>;
     async fn delete(&self, user: &str, provider: Provider) -> StoreResult<bool>;
     async fn list(&self, user: &str) -> StoreResult<Vec<SealedCredential>>;
+    /// Suspend every credential of `user` that isn't already (deactivation). Returns how many.
+    async fn suspend(&self, user: &str, at: DateTime<Utc>) -> StoreResult<u64>;
+    /// Make `user`'s suspended credentials usable again (reactivation within the grace).
+    async fn restore(&self, user: &str) -> StoreResult<u64>;
+    /// Delete `user`'s suspended credentials (the grace is over). Returns how many.
+    async fn delete_suspended(&self, user: &str) -> StoreResult<u64>;
 }
 
 #[derive(Default)]
@@ -165,9 +175,15 @@ impl CredentialStore for MemoryCredentials {
     }
 
     async fn put(&self, credential: &SealedCredential) -> StoreResult<()> {
-        self.rows.lock().expect("credentials lock").insert(
-            (credential.user.clone(), credential.provider),
-            credential.clone(),
+        let mut rows = self.rows.lock().expect("credentials lock");
+        let key = (credential.user.clone(), credential.provider);
+        let suspended_at = rows.get(&key).and_then(|c| c.suspended_at);
+        rows.insert(
+            key,
+            SealedCredential {
+                suspended_at,
+                ..credential.clone()
+            },
         );
         Ok(())
     }
@@ -180,7 +196,10 @@ impl CredentialStore for MemoryCredentials {
         let mut rows = self.rows.lock().expect("credentials lock");
         match rows.get_mut(&(credential.user.clone(), credential.provider)) {
             Some(row) if row.updated_at == expected => {
-                *row = credential.clone();
+                *row = SealedCredential {
+                    suspended_at: row.suspended_at,
+                    ..credential.clone()
+                };
                 Ok(true)
             }
             _ => Ok(false),
@@ -201,6 +220,39 @@ impl CredentialStore for MemoryCredentials {
         let mut out: Vec<_> = rows.values().filter(|c| c.user == user).cloned().collect();
         out.sort_by_key(|c| c.provider);
         Ok(out)
+    }
+
+    async fn suspend(&self, user: &str, at: DateTime<Utc>) -> StoreResult<u64> {
+        let mut rows = self.rows.lock().expect("credentials lock");
+        let mut n = 0;
+        for c in rows
+            .values_mut()
+            .filter(|c| c.user == user && c.suspended_at.is_none())
+        {
+            c.suspended_at = Some(at);
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    async fn restore(&self, user: &str) -> StoreResult<u64> {
+        let mut rows = self.rows.lock().expect("credentials lock");
+        let mut n = 0;
+        for c in rows
+            .values_mut()
+            .filter(|c| c.user == user && c.suspended_at.is_some())
+        {
+            c.suspended_at = None;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    async fn delete_suspended(&self, user: &str) -> StoreResult<u64> {
+        let mut rows = self.rows.lock().expect("credentials lock");
+        let before = rows.len();
+        rows.retain(|_, c| !(c.user == user && c.suspended_at.is_some()));
+        Ok((before - rows.len()) as u64)
     }
 }
 
@@ -370,10 +422,16 @@ impl Vault {
             site_url: c.site_url.clone(),
             external_id: c.external_id.clone(),
             updated_at: c.updated_at,
+            suspended_at: None,
         })
     }
 
     fn unseal(&self, s: &SealedCredential) -> StoreResult<Credential> {
+        if s.suspended_at.is_some() {
+            return Err(StoreError(
+                "a suspended credential is never unsealed".into(),
+            ));
+        }
         Ok(Credential {
             user: s.user.clone(),
             provider: s.provider,
@@ -408,6 +466,11 @@ impl Vault {
         let Some(sealed) = self.store.get(user, provider).await? else {
             return Ok(None);
         };
+        // A deactivated person's accounts: never unsealed, so no connector call can use them.
+        if sealed.suspended_at.is_some() {
+            tracing::info!(user, provider = %provider, "credential suspended: not used");
+            return Ok(None);
+        }
         let credential = self.unseal(&sealed)?;
         if sealed.key_id != self.keys.active_id() {
             // Re-seal under the active key, unless someone wrote a newer credential meanwhile.
