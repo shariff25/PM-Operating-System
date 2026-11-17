@@ -1,9 +1,14 @@
-//! The admin and auditor reads: `GET /internal/admin/{audit,accounts,connectors,overview}`.
+//! The admin and auditor reads: `GET /internal/admin/{audit,accounts,connectors,overview}`,
+//! and the admin proposals (`crate::proposals`): `POST /internal/admin/proposals/open`,
+//! `GET /internal/admin/proposals`, `GET /internal/admin/protection`, plus
+//! `POST /internal/admin/events`, where `pmos-web` records what it refused or showed.
 //!
 //! **Who may call:** the orchestrator (`PMOS_SERVICE_TOKEN`) and `pmos-web` (`PMOS_WEB_TOKEN`).
-//! Never the Slack bot or the console. These routes only read, but one: `POST
-//! /internal/admin/proposals` records (only records: it writes nothing anywhere else) a change
-//! proposal `pmos-web` opens as a GitHub pull request, so proposals are in the audit log.
+//! Never the Slack bot or the console. The proposal and event routes are `pmos-web`'s only,
+//! and need its signed user assertion in **every** assertion mode, `off` included: a call
+//! without one is `401 bad_assertion`, and so is one whose subject isn't the `user=` it names
+//! or whose body isn't the one signed. Opening a proposal is the only call here that writes
+//! anywhere but the audit log: a new branch and a pull request in GitHub, as the admin.
 //!
 //! **Whose view:** every call names its viewer as `user=`. The tool server checks that viewer's
 //! roles in its own `team.yaml` against the permission matrix (`pmos_contract::permissions`),
@@ -21,7 +26,7 @@
 //! `admin.audit_export`, `admin.accounts`, `admin.connectors`, `admin.overview`) naming the
 //! viewer and the client, with no query values.
 
-use axum::extract::{Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -52,8 +57,69 @@ pub(super) fn routes(state: AppState) -> Router<AppState> {
         .route("/admin/accounts", get(accounts))
         .route("/admin/connectors", get(connectors))
         .route("/admin/overview", get(overview))
-        .route("/admin/proposals", axum::routing::post(proposal))
+        .route("/admin/proposals", get(list_proposals))
+        .route(
+            "/admin/proposals/open",
+            axum::routing::post(open_proposal).layer(DefaultBodyLimit::max(MAX_PROPOSAL_BODY)),
+        )
+        .route("/admin/protection", get(protection))
+        .route("/admin/events", axum::routing::post(record_event))
         .layer(middleware::from_fn_with_state(state, identify_admin_client))
+}
+
+/// The largest proposal the tool server takes: 50 content files of 256 KiB and the policy
+/// files they regenerate, as JSON.
+pub const MAX_PROPOSAL_BODY: usize = 24 * 1024 * 1024;
+
+/// The routes that need `pmos-web`'s signed user assertion in every mode.
+fn needs_assertion(path: &str) -> bool {
+    let path = path.strip_prefix("/internal").unwrap_or(path);
+    let path = path.strip_suffix('/').unwrap_or(path);
+    matches!(
+        path,
+        "/admin/proposals" | "/admin/proposals/open" | "/admin/protection" | "/admin/events"
+    )
+}
+
+/// `pmos-web`'s assertion on a [`needs_assertion`] route, whatever the mode: present, valid,
+/// bound to this exact request (body included, up to [`MAX_PROPOSAL_BODY`]), and its subject
+/// the `user=` the call names. Returns the request with its body put back.
+async fn require_assertion(
+    assertions: &crate::assertion::Assertions,
+    client: Client,
+    req: Request,
+) -> Result<Request, Box<Response>> {
+    use crate::assertion::Refusal;
+    let uri = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|u| u.0.clone())
+        .unwrap_or_else(|| req.uri().clone());
+    let Some(header) = req.headers().get(pmos_assertion::HEADER).cloned() else {
+        return Err(super::refuse_assertion(client, Refusal::Missing));
+    };
+    let Ok(header) = header.to_str() else {
+        return Err(super::refuse_assertion(client, Refusal::Header));
+    };
+    let (parts, body) = req.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_PROPOSAL_BODY).await else {
+        return Err(super::refuse_assertion(client, Refusal::Body));
+    };
+    let target = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let who = assertions
+        .verify(
+            client.as_str(),
+            header,
+            parts.method.as_str(),
+            target,
+            &bytes,
+            pmos_assertion::unix_now(),
+        )
+        .map_err(|why| super::refuse_assertion(client, why))?;
+    if super::named_user(&uri).as_deref() != Some(who.subject()) {
+        return Err(super::refuse_assertion(client, Refusal::SubjectMismatch));
+    }
+    Ok(Request::from_parts(parts, axum::body::Body::from(bytes)))
 }
 
 /// The orchestrator and `pmos-web` only; `pmos-web`'s user assertion is checked as on the
@@ -75,7 +141,18 @@ async fn identify_admin_client(
     };
     let mut req = req;
     let assertions = &state.people.assertions;
-    if client == Client::Web && assertions.mode() != Mode::Off {
+    if needs_assertion(req.uri().path()) {
+        if client != Client::Web {
+            return error(
+                StatusCode::FORBIDDEN,
+                "only pmos-web, acting for a signed-in person, may use this route",
+            );
+        }
+        match require_assertion(assertions, client, req).await {
+            Ok(checked) => req = checked,
+            Err(refused) => return *refused,
+        }
+    } else if client == Client::Web && assertions.mode() != Mode::Off {
         match check_assertion(assertions, client, req).await {
             Ok((checked, _)) => req = checked,
             Err(refused) => return *refused,
@@ -206,7 +283,7 @@ fn audit_query(q: &AuditParams) -> Result<AuditQuery, String> {
 
 /// The notes the tool server writes itself in `detail`, which carry no content. Anything else
 /// (a rejection's free text, a connector's or a refusal's message, which can quote arguments)
-/// is never served.
+/// is never served. The admin proposal and event notes are [`ADMIN_NOTES`].
 const FIXED_DETAILS: [&str; 10] = [
     "edited before approval",
     "approved in the harness",
@@ -220,11 +297,26 @@ const FIXED_DETAILS: [&str; 10] = [
     "decision by someone not in team.yaml",
 ];
 
-/// `detail` if it is metadata only: one of [`FIXED_DETAILS`], an invalid-draft count, a
-/// ledger rejection reason (a fixed label, not free text), or a Slack draft's expiry note.
+/// The fixed notes of admin refusals and reads (`crate::proposals`, [`record_event`]).
+pub const ADMIN_NOTES: [&str; 9] = [
+    "role",
+    "invalid",
+    "stale base",
+    "policy mismatch",
+    "rate limited",
+    "github not linked",
+    "not configured",
+    "personal file",
+    "restricted context",
+];
+
+/// `detail` if it is metadata only: one of [`FIXED_DETAILS`] or [`ADMIN_NOTES`], an
+/// invalid-draft count, a ledger rejection reason (a fixed label, not free text), or a Slack
+/// draft's expiry note.
 pub fn safe_detail(detail: &str) -> Option<String> {
     let digits = |s: &str| !s.is_empty() && s.len() <= 6 && s.bytes().all(|b| b.is_ascii_digit());
     let ok = FIXED_DETAILS.contains(&detail)
+        || ADMIN_NOTES.contains(&detail)
         || detail
             .strip_prefix("reason: ")
             .is_some_and(|r| Reason::parse(r).is_some())
@@ -465,64 +557,68 @@ async fn overview(
     .into_response()
 }
 
-// Proposals.
-
-/// The most paths one proposal record names.
-pub const MAX_PROPOSAL_PATHS: usize = 200;
+// Proposals (`crate::proposals`).
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProposalRecord {
-    /// `policy` or `content`.
-    kind: String,
-    /// `started` (before anything is written to GitHub), `opened` or `failed`.
-    stage: String,
-    /// Repository paths the proposal changes. Recorded as the event's `sources` (served as a
-    /// count only); never file text.
-    #[serde(default)]
-    paths: Vec<String>,
-    /// `owner/name`.
-    repo: String,
-    /// The base commit sha.
-    base: String,
-    /// The pull request's number, once opened.
-    #[serde(default)]
-    pr: Option<u64>,
+struct ProposalParams {
+    user: Option<String>,
+    kind: Option<String>,
 }
 
-fn plain_path(p: &str) -> bool {
-    !p.is_empty()
-        && p.len() <= 200
-        && !p.starts_with('/')
-        && p.split('/').all(|c| {
-            !c.is_empty()
-                && !c.starts_with('.')
-                && c.chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+/// The `user=` the call names: on these routes always the assertion's verified subject.
+fn named(user: Option<&str>) -> Result<&str, Box<Response>> {
+    user.map(str::trim)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| {
+            Box::new(coded(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "`user` (the admin) is required",
+            ))
         })
 }
 
-/// `POST /internal/admin/proposals?user=<admin>`: record a change proposal `pmos-web` is
-/// opening as a pull request (`admin.policy_proposal`, `admin.content_proposal`). The viewer
-/// must be allowed to propose that kind (`edit-policies`, `edit-content`); the record holds
-/// the paths (as `sources`), the pull request (`github:<repo>#<n>` as the target) and the
-/// stage as the outcome (`started`, `ok`, `error`). Never file text.
-async fn proposal(
+/// `POST /internal/admin/proposals/open?user=<admin>`: check a change set again and open it as
+/// a pull request with the admin's own GitHub account (`crate::proposals::open`).
+async fn open_proposal(
     State(state): State<AppState>,
     Extension(client): Extension<Client>,
     Query(q): Query<ViewerParams>,
     body: axum::body::Bytes,
 ) -> Response {
-    let Ok(r) = serde_json::from_slice::<ProposalRecord>(&body) else {
-        return coded(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "the body isn't a proposal record",
-        );
+    let user = match named(q.user.as_deref()) {
+        Ok(u) => u,
+        Err(r) => return *r,
     };
-    let (tool, need) = match r.kind.as_str() {
-        "policy" => ("admin.policy_proposal", Permission::EditPolicies),
-        "content" => ("admin.content_proposal", Permission::EditContent),
+    crate::proposals::open(
+        &state.svc,
+        state.onboarding.oauth(),
+        state.onboarding.proposals(),
+        client,
+        user,
+        &body,
+    )
+    .await
+}
+
+/// `GET /internal/admin/proposals?user=<viewer>&kind=policy|content`: open proposals, read
+/// with the viewer's own GitHub account. Needs `view-policies` or `view-content`, by kind.
+async fn list_proposals(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Query(q): Query<ProposalParams>,
+) -> Response {
+    let (kind, tool, need) = match q.kind.as_deref() {
+        Some("policy") => (
+            pmos_policy::admin::proposals::Kind::Policy,
+            "admin.policy_proposals",
+            Permission::ViewPolicies,
+        ),
+        Some("content") => (
+            pmos_policy::admin::proposals::Kind::Content,
+            "admin.content_proposals",
+            Permission::ViewContent,
+        ),
         _ => {
             return coded(
                 StatusCode::BAD_REQUEST,
@@ -531,73 +627,165 @@ async fn proposal(
             )
         }
     };
-    let outcome = match r.stage.as_str() {
-        "started" => Outcome::Started,
-        "opened" => Outcome::Ok,
-        "failed" => Outcome::Error,
-        _ => {
-            return coded(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                "`stage` is `started`, `opened` or `failed`",
-            )
-        }
+    let user = match viewer(&state, client, q.user.as_deref(), tool, &[need]).await {
+        Ok(u) => u,
+        Err(r) => return *r,
     };
-    let repo_ok = r.repo.split_once('/').is_some_and(|(o, n)| {
-        !o.is_empty() && !n.is_empty() && plain_path(o) && plain_path(n) && !n.contains('/')
-    });
-    let base_ok = (7..=64).contains(&r.base.len()) && r.base.bytes().all(|b| b.is_ascii_hexdigit());
-    if !repo_ok
-        || !base_ok
-        || r.paths.len() > MAX_PROPOSAL_PATHS
-        || !r.paths.iter().all(|p| plain_path(p))
-        || (outcome == Outcome::Ok && r.pr.is_none())
-    {
-        return coded(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "the proposal record has a bad repo, base, path or pull request",
-        );
-    }
-    let Some(user) = q.user.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
-        return coded(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "`user` (the admin) is required",
-        );
+    crate::proposals::list(
+        state.onboarding.oauth(),
+        state.onboarding.proposals(),
+        &user,
+        kind,
+    )
+    .await
+}
+
+/// `GET /internal/admin/protection?user=<viewer>`: whether the content branch requires
+/// reviews, as the viewer's GitHub account reads it. Not recorded when allowed (the policy and
+/// content screens ask on every load); a refusal is.
+async fn protection(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Query(q): Query<ViewerParams>,
+) -> Response {
+    let user = match named(q.user.as_deref()) {
+        Ok(u) => u,
+        Err(r) => return *r,
     };
-    let allowed = state
-        .svc
-        .team()
-        .member(user)
-        .is_some_and(|m| m.allows(need));
-    let target = r.pr.map(|n| format!("github:{}#{n}", r.repo));
-    let event = |outcome| AuditEvent {
-        at: Utc::now(),
-        client,
-        run_id: ADMIN_RUN.to_string(),
-        user: user.to_string(),
-        skill: None,
-        bot: None,
-        tool: tool.to_string(),
-        outcome,
-        sources: r.paths.clone(),
-        source_titles: Default::default(),
-        args_hash: None,
-        output_ref: target.clone(),
-        detail: None,
-    };
+    let allowed =
+        state.svc.team().member(user).is_some_and(|m| {
+            m.allows(Permission::ViewPolicies) || m.allows(Permission::ViewContent)
+        });
     if !allowed {
-        state.svc.audit(event(Outcome::Denied)).await;
-        tracing::info!(viewer = %user, tool, "proposal refused: role");
+        record(&state, client, user, "admin.protection", Outcome::Denied).await;
         return coded(
             StatusCode::FORBIDDEN,
             "forbidden",
             "this person's role doesn't allow this",
         );
     }
-    state.svc.audit(event(outcome)).await;
-    tracing::info!(viewer = %user, tool, stage = %r.stage, paths = r.paths.len(), pr = ?r.pr, "proposal recorded");
+    crate::proposals::protection(state.onboarding.oauth(), state.onboarding.proposals(), user).await
+}
+
+/// The actions `pmos-web` may record ([`record_event`]).
+pub const EVENT_ACTIONS: [&str; 11] = [
+    "admin.policy_read",
+    "admin.policy_validate",
+    "admin.policy_proposals",
+    "admin.policy_proposal",
+    "admin.content_read",
+    "admin.content_file",
+    "admin.content_validate",
+    "admin.content_proposals",
+    "admin.content_proposal",
+    "admin.harness",
+    SENSITIVE_READ,
+];
+
+/// An admin reading a PM's personal master file or restricted context.
+pub const SENSITIVE_READ: &str = "admin.content_sensitive_read";
+
+/// The most files one event counts.
+pub const MAX_EVENT_COUNT: usize = 500;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventRecord {
+    /// One of [`EVENT_ACTIONS`].
+    action: String,
+    /// `denied` (a refusal `pmos-web` made) or `ok` (only [`SENSITIVE_READ`]).
+    outcome: String,
+    /// One of [`ADMIN_NOTES`].
+    detail: String,
+    /// How many files it was about; recorded as that many `content` entries in `sources`,
+    /// served as a count. Never a path.
+    #[serde(default)]
+    count: usize,
+    /// `content:personal:<handle>` for a personal master file; otherwise none.
+    #[serde(default)]
+    target: Option<String>,
+}
+
+/// `POST /internal/admin/events?user=<viewer>`: record what `pmos-web` refused the viewer
+/// (a role refusal on an admin route, a proposal its own checks refused) or an admin's read
+/// of a personal or restricted file, which `pmos-web` records **before** it shows the text.
+/// The viewer must be a team member; a sensitive read needs `edit-content`. Never file text,
+/// and a path only as `content:personal:<handle>` (a restricted file's name can itself be
+/// sensitive, so it is never sent).
+async fn record_event(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Query(q): Query<ViewerParams>,
+    body: axum::body::Bytes,
+) -> Response {
+    let user = match named(q.user.as_deref()) {
+        Ok(u) => u,
+        Err(r) => return *r,
+    };
+    let Ok(r) = serde_json::from_slice::<EventRecord>(&body) else {
+        return coded(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "the body isn't an admin event",
+        );
+    };
+    let outcome = match r.outcome.as_str() {
+        "denied" => Outcome::Denied,
+        "ok" if r.action == SENSITIVE_READ => Outcome::Ok,
+        _ => {
+            return coded(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "`outcome` is `denied`, or `ok` for a sensitive read",
+            )
+        }
+    };
+    let target_ok = match &r.target {
+        None => true,
+        Some(t) => t
+            .strip_prefix("content:personal:")
+            .is_some_and(crate::session::valid_handle),
+    };
+    if !EVENT_ACTIONS.contains(&r.action.as_str())
+        || !ADMIN_NOTES.contains(&r.detail.as_str())
+        || r.count > MAX_EVENT_COUNT
+        || !target_ok
+    {
+        return coded(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "the event has an unknown action or note, too many files, or a bad target",
+        );
+    }
+    let member = state.svc.team().member(user);
+    let allowed = match outcome {
+        Outcome::Ok => member.is_some_and(|m| m.allows(Permission::EditContent)),
+        _ => member.is_some(),
+    };
+    let mut event = crate::proposals::event(client, user, &r.action, outcome);
+    if !allowed {
+        event.outcome = Outcome::Denied;
+        event.detail = Some("role".into());
+        state.svc.audit(event).await;
+        return coded(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "this person's role doesn't allow this",
+        );
+    }
+    event.detail = Some(r.detail.clone());
+    event.sources = vec!["content".to_string(); r.count];
+    event.output_ref = r.target.clone();
+    // A sensitive read is shown only once recorded: say so when it can't be.
+    if let Err(e) = state.svc.stores().audit.record(event).await {
+        tracing::error!(error = %e, action = %r.action, "AUDIT EVENT NOT RECORDED");
+        return coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_unavailable",
+            "the event couldn't be recorded",
+        );
+    }
+    tracing::info!(viewer = %user, action = %r.action, outcome = outcome.as_str(), "admin event recorded");
     Json(json!({ "recorded": true })).into_response()
 }
 

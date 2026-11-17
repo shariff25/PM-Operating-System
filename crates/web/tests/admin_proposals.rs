@@ -1,10 +1,15 @@
 //! The admin Policy Admin and content screens (`/api/admin/policy/*`, `/api/admin/content/*`,
 //! `/api/admin/harness`; docs/web-api.md, Admin: policy and Admin: content and harness) against
-//! a copy of the real content tree, a mock tool server, a mock runtime and a mock GitHub: the
-//! role matrix for every route, validation errors and widening detection, path traversal and
-//! symlinks, size and type caps, `501` without GitHub, the pull request's calls (branch,
-//! commit, pull request, labels) with the token in the `Authorization` header only, a stale
-//! base, audit records, the rate limit, and logs that hold no token and no file text.
+//! a copy of the real content tree, a mock tool server and a mock runtime: the role matrix for
+//! every route (validation is admins' only: A1), what an auditor and a PM can't read through
+//! validation (a restricted context file, a PM's own `AGENTS.md`), the audit events pmos-web
+//! sends (role refusals, invalid and stale proposals, an admin's sensitive reads, recorded
+//! before the text is served: A4), validation errors and widening detection, path traversal
+//! and symlinks, size and type caps, the change set sent to the tool server (pmos-web holds no
+//! GitHub token: A2/A3) and how its answers are relayed (`github_not_linked`, stale base, rate
+//! limit, audit down, not configured), the branch-protection field, and logs that hold no file
+//! text. The tool server's own checks and the pull request are tested in
+//! `crates/toolserver/tests/admin_open.rs`.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -18,7 +23,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use chrono::Duration;
-use pmos_web::admin_config::{AdminConfig, GitHubConfig};
+use pmos_web::admin_config::AdminConfig;
 use pmos_web::proposals::git_blob_sha;
 use pmos_web::upstream::{Credentials, Signer};
 use pmos_web::{Config, Deps};
@@ -27,13 +32,14 @@ use tokio_util::sync::CancellationToken;
 
 const BOTS_TOKEN: &str = "web-client-token-0123456789abcdef0123";
 const TOOLS_TOKEN: &str = "toolserver-service-token-0123456789ab";
-const GITHUB_TOKEN: &str = "github_pat_TESTONLY_9f8e7d6c5b4a39281706";
 // Test key only: fixed bytes, never used anywhere real.
 const WEB_TOOLS_KEY: &str = "d2ViLXRvb2xzZXJ2ZXItdGVzdC1rZXktMDEyMzQ1Njc=";
 const BASE: &str = "1111111111111111111111111111111111111111";
-const TREE: &str = "2222222222222222222222222222222222222222";
 /// A marker put in proposed file text: it must never reach a log.
 const SECRET_TEXT: &str = "MARKER-proposed-file-text-7c41";
+/// The restricted file's and Ana's master file's bodies: never served to an auditor or a PM.
+const RESTRICTED_BODY: &str = "Restricted body.";
+const ANA_BODY: &str = "Ana's own";
 
 const TEAM: &str = "members:
   - {handle: adam, slack-id: U0ADM, email: adam@example.com, roles: [admin]}
@@ -70,7 +76,7 @@ impl std::io::Write for LogWriter {
     }
 }
 
-// Mocks.
+// The mock tool server.
 
 #[derive(Debug, Clone)]
 struct Call {
@@ -102,116 +108,51 @@ fn call(method: &Method, uri: &Uri, headers: &HeaderMap, body: &Bytes) -> Call {
 #[derive(Default)]
 struct Mock {
     calls: Mutex<Vec<Call>>,
-    /// Blob ids on the base, by repository path.
-    blobs: Mutex<BTreeMap<String, String>>,
-    /// The tool server's audit route fails.
-    down: AtomicBool,
-    pulls: Mutex<Vec<Value>>,
+    /// What `POST …/proposals/open` answers; `None`: `201` with a pull request.
+    open_reply: Mutex<Option<(u16, Value)>>,
+    /// The event route fails.
+    events_down: AtomicBool,
+    /// The viewer has no linked GitHub account.
+    not_linked: AtomicBool,
+    /// Proposals are off on the tool server.
+    unconfigured: AtomicBool,
 }
 
 impl Mock {
     fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
     }
-    fn writes(&self) -> Vec<Call> {
+    fn to(&self, path: &str) -> Vec<Call> {
         self.calls()
             .into_iter()
-            .filter(|c| c.method == "POST")
+            .filter(|c| c.path == path)
             .collect()
+    }
+    fn opened(&self) -> Vec<Call> {
+        self.to("/internal/admin/proposals/open")
+    }
+    fn events(&self) -> Vec<Call> {
+        self.to("/internal/admin/events")
+    }
+    fn reply(&self, status: u16, body: Value) {
+        *self.open_reply.lock().unwrap() = Some((status, body));
     }
 }
 
-async fn github(
-    State(m): State<Arc<Mock>>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let c = call(&method, &uri, &headers, &body);
-    m.calls.lock().unwrap().push(c.clone());
-    if c.auth.as_deref() != Some(&format!("Bearer {GITHUB_TOKEN}")) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"message": "Bad credentials"})),
-        )
-            .into_response();
-    }
-    let p = c.path.strip_prefix("/repos/acme/pmos").unwrap_or("?");
-    match (c.method.as_str(), p) {
-        ("GET", "") => Json(json!({"default_branch": "main"})).into_response(),
-        ("GET", "/git/ref/heads/main") => {
-            Json(json!({"object": {"sha": BASE, "type": "commit"}})).into_response()
-        }
-        ("GET", p) if p == format!("/git/commits/{BASE}") => {
-            Json(json!({"sha": BASE, "tree": {"sha": TREE}})).into_response()
-        }
-        ("GET", p) if p == format!("/git/trees/{TREE}") => {
-            let tree: Vec<Value> = m
-                .blobs
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(path, sha)| json!({"path": path, "type": "blob", "sha": sha, "mode": "100644"}))
-                .collect();
-            Json(json!({"sha": TREE, "tree": tree, "truncated": false})).into_response()
-        }
-        ("POST", "/git/trees") => {
-            Json(json!({"sha": "3333333333333333333333333333333333333333"})).into_response()
-        }
-        ("POST", "/git/commits") => {
-            Json(json!({"sha": "4444444444444444444444444444444444444444"})).into_response()
-        }
-        ("POST", "/git/refs") => {
-            (StatusCode::CREATED, Json(json!({"ref": c.body["ref"]}))).into_response()
-        }
-        ("POST", "/pulls") => {
-            let n = 42 + m.pulls.lock().unwrap().len() as u64;
-            let pr = json!({
-                "number": n,
-                "html_url": format!("https://github.example/acme/pmos/pull/{n}"),
-                "title": c.body["title"],
-                "head": {"ref": c.body["head"]},
-                "base": {"ref": c.body["base"]},
-                "draft": false,
-                "user": {"login": "pmos-bot"},
-                "created_at": "2026-11-17T10:00:00Z",
-                "updated_at": "2026-11-17T10:00:00Z",
-                "labels": [],
-                "body": c.body["body"],
-            });
-            m.pulls.lock().unwrap().push(pr.clone());
-            (StatusCode::CREATED, Json(pr)).into_response()
-        }
-        ("POST", p) if p.starts_with("/issues/") && p.ends_with("/labels") => {
-            let n: u64 = p
-                .trim_start_matches("/issues/")
-                .trim_end_matches("/labels")
-                .parse()
-                .unwrap();
-            for pr in m.pulls.lock().unwrap().iter_mut() {
-                if pr["number"] == n {
-                    pr["labels"] = json!(c.body["labels"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|l| json!({"name": l}))
-                        .collect::<Vec<_>>());
-                }
-            }
-            Json(json!([])).into_response()
-        }
-        ("GET", "/pulls") => {
-            let mut all = m.pulls.lock().unwrap().clone();
-            // Someone else's pull request: not a proposal.
-            all.push(json!({"number": 7, "html_url": "x", "title": "Fix typo",
-                "head": {"ref": "fix-typo"}, "base": {"ref": "main"}, "draft": false,
-                "user": {"login": "someone"}, "labels": [], "body": "hi"}));
-            all.reverse();
-            Json(all).into_response()
-        }
-        _ => (StatusCode::NOT_FOUND, Json(json!({"message": "Not Found"}))).into_response(),
-    }
+fn pull_request(open: &Value) -> Value {
+    let kind = open["kind"].as_str().unwrap_or_default();
+    json!({
+        "number": 42,
+        "url": "https://github.example/acme/pmos/pull/42",
+        "author": "adam-gh",
+        "branch": format!("pmos/proposal/{kind}/adam-20261117-101509-d2aabc50"),
+        "base": {"branch": "main", "commit": BASE},
+        "files": open["changes"].as_array().map(|c| c.iter().map(|f| f["path"].clone()).collect::<Vec<_>>()),
+        "widening": false,
+        "allowance_changes": [],
+        "stale_check": "passed",
+        "labels_added": true,
+    })
 }
 
 async fn toolserver(
@@ -226,11 +167,71 @@ async fn toolserver(
     if c.auth.as_deref() != Some(&format!("Bearer {TOOLS_TOKEN}")) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if m.down.load(Ordering::SeqCst) {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    let unconfigured = m.unconfigured.load(Ordering::SeqCst);
+    let not_linked = m.not_linked.load(Ordering::SeqCst);
+    let coded = |status: u16, code: &str| {
+        (
+            StatusCode::from_u16(status).unwrap(),
+            Json(json!({"code": code, "error": "the tool server's own words"})),
+        )
+            .into_response()
+    };
     match (c.method.as_str(), c.path.as_str()) {
-        ("POST", "/internal/admin/proposals") => Json(json!({"recorded": true})).into_response(),
+        ("POST", "/internal/admin/events") => {
+            if m.events_down.load(Ordering::SeqCst) {
+                return coded(503, "audit_unavailable");
+            }
+            Json(json!({"recorded": true})).into_response()
+        }
+        ("POST", "/internal/admin/proposals/open") => {
+            if unconfigured {
+                return coded(501, "not_configured");
+            }
+            if not_linked {
+                return coded(409, "github_not_linked");
+            }
+            match m.open_reply.lock().unwrap().clone() {
+                Some((status, body)) => {
+                    let mut res =
+                        (StatusCode::from_u16(status).unwrap(), Json(body.clone())).into_response();
+                    if let Some(s) = body.get("retry_after").and_then(Value::as_u64) {
+                        res.headers_mut()
+                            .insert("retry-after", s.to_string().parse().unwrap());
+                    }
+                    res
+                }
+                None => (StatusCode::CREATED, Json(pull_request(&c.body))).into_response(),
+            }
+        }
+        ("GET", "/internal/admin/proposals") => {
+            if unconfigured {
+                return coded(501, "not_configured");
+            }
+            if not_linked {
+                return Json(json!({"repo": "acme/pmos", "github": "not_linked", "proposals": []}))
+                    .into_response();
+            }
+            let kind = if c.query.contains("kind=policy") {
+                "policy"
+            } else {
+                "content"
+            };
+            Json(json!({"repo": "acme/pmos", "github": "linked", "proposals": [
+                {"number": 42, "url": "https://github.example/acme/pmos/pull/42",
+                 "title": format!("PM OS {kind}: x"), "branch": format!("pmos/proposal/{kind}/adam-1"),
+                 "base": "main", "status": "open", "proposed_by": "adam", "base_commit": BASE,
+                 "author": "adam-gh", "labels": ["pmos-proposal"], "created_at": null, "updated_at": null}
+            ]}))
+            .into_response()
+        }
+        ("GET", "/internal/admin/protection") => {
+            if not_linked {
+                return Json(json!({"configured": !unconfigured, "branch": "main", "required_reviews": null, "verified": false, "github": "not_linked"}))
+                    .into_response();
+            }
+            Json(json!({"configured": !unconfigured, "branch": "main", "required_reviews": 1, "verified": true, "source": "branch_protection", "github": "linked"}))
+                .into_response()
+        }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -326,7 +327,6 @@ fn blobs_of(root: &Path) -> BTreeMap<String, String> {
 
 struct Web {
     base: String,
-    gh: Arc<Mock>,
     tools: Arc<Mock>,
     http: reqwest::Client,
     dir: tempfile::TempDir,
@@ -345,34 +345,13 @@ impl Reply {
     }
 }
 
-struct Opts {
-    github: bool,
-    per_hour: u32,
-}
-
-impl Default for Opts {
-    fn default() -> Self {
-        Self {
-            github: true,
-            per_hour: 10,
-        }
-    }
-}
-
 async fn web() -> Web {
-    web_with(Opts::default()).await
-}
-
-async fn web_with(opts: Opts) -> Web {
     logs();
-    let gh = Arc::new(Mock::default());
     let tools = Arc::new(Mock::default());
-    let (gh_url, stop_gh) = serve(Router::new().fallback(github).with_state(gh.clone())).await;
     let (tools_url, stop_tools) =
         serve(Router::new().fallback(toolserver).with_state(tools.clone())).await;
     let (bots_url, stop_bots) = serve(Router::new().fallback(runtime)).await;
     let dir = fixture();
-    *gh.blobs.lock().unwrap() = blobs_of(dir.path());
     let content = dir.path().join("content");
     let ring = pmos_assertion::KeyRing::new(
         pmos_assertion::Key::from_base64("wt1", WEB_TOOLS_KEY).unwrap(),
@@ -400,18 +379,7 @@ async fn web_with(opts: Opts) -> Web {
     let admin = AdminConfig {
         policies_root: Some(dir.path().join("policies")),
         gateway_config: Some(dir.path().join("gateway.yaml")),
-        content_revision: None,
-        github: opts.github.then(|| GitHubConfig {
-            repo: "acme/pmos".into(),
-            token: GITHUB_TOKEN.into(),
-            api: gh_url.clone(),
-            base: None,
-            content_dir: "content".into(),
-            policies_dir: "policies".into(),
-        }),
-        proposals_per_hour: opts.per_hour,
-        content_dir: "content".into(),
-        policies_dir: "policies".into(),
+        ..AdminConfig::default()
     };
     let deps = Deps {
         admin,
@@ -420,15 +388,13 @@ async fn web_with(opts: Opts) -> Web {
     let (base, stop_web) = serve(pmos_web::build(cfg, deps).unwrap()).await;
     Web {
         base,
-        gh,
         tools,
         http: reqwest::Client::new(),
         dir,
-        _stop: vec![stop_gh, stop_tools, stop_bots, stop_web],
+        _stop: vec![stop_tools, stop_bots, stop_web],
     }
 }
 
-/// A signed-in browser: cookie and CSRF token.
 #[derive(Clone)]
 struct Who {
     cookie: String,
@@ -526,6 +492,9 @@ fn proposal(spec: Value) -> Value {
     json!({"spec": spec, "title": "Let the Docs bot search Jira", "reason": "PMs asked for it @everyone ``` fence"})
 }
 
+const RESTRICTED: &str = "content/context/products/secret-roadmap.md";
+const ANA_MASTER: &str = "content/master/people/ana/AGENTS.md";
+
 // The role matrix.
 
 #[tokio::test]
@@ -537,11 +506,12 @@ async fn role_matrix_for_every_route() {
     // (method, path, body, auditor allowed)
     let routes: Vec<(Method, &str, Option<Value>, bool)> = vec![
         (Method::GET, "/api/admin/policy", None, true),
+        // Validation shows the current text of the files it names: admins only (A1).
         (
             Method::POST,
             "/api/admin/policy/validate",
             Some(validate_spec.clone()),
-            true,
+            false,
         ),
         (Method::GET, "/api/admin/policy/proposals", None, true),
         (
@@ -556,7 +526,7 @@ async fn role_matrix_for_every_route() {
             Method::POST,
             "/api/admin/content/validate",
             Some(validate_content.clone()),
-            true,
+            false,
         ),
         (Method::GET, "/api/admin/content/proposals", None, true),
         (
@@ -585,6 +555,19 @@ async fn role_matrix_for_every_route() {
             assert_eq!(r.status, StatusCode::FORBIDDEN, "{name} {path}");
             assert_eq!(r.code(), "forbidden", "{name} {path}");
         }
+        // Every refusal is recorded at the tool server, as theirs, with no file text (A4).
+        let refusals: Vec<Call> = w
+            .tools
+            .events()
+            .into_iter()
+            .filter(|c| c.query == format!("user={name}"))
+            .collect();
+        assert_eq!(refusals.len(), routes.len(), "{name}: {refusals:?}");
+        for c in &refusals {
+            assert_eq!(c.body["outcome"], "denied");
+            assert_eq!(c.body["detail"], "role");
+            assert!(c.assertion.is_some(), "signed for them");
+        }
     }
     for (method, path, body, auditor) in &routes {
         let r = w
@@ -602,11 +585,26 @@ async fn role_matrix_for_every_route() {
             assert_eq!(r.code(), "forbidden");
         }
     }
-    assert!(
-        w.gh.writes().is_empty(),
-        "nobody but an admin reached GitHub writes"
+    let actions: Vec<String> = w
+        .tools
+        .events()
+        .iter()
+        .filter(|c| c.query == "user=audrey")
+        .map(|c| c.body["action"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            "admin.policy_validate",
+            "admin.policy_proposal",
+            "admin.content_validate",
+            "admin.content_proposal"
+        ]
     );
-    assert!(w.tools.calls().is_empty(), "nor the audit route");
+    assert!(
+        w.tools.opened().is_empty(),
+        "nobody but an admin reached the proposal route"
+    );
     for (method, path, body, _) in &routes {
         if method == Method::POST && path.ends_with("/proposals") {
             continue; // Opened below, in their own tests.
@@ -681,6 +679,174 @@ async fn me_lists_the_new_permissions() {
         .any(|p| p.contains("content") || p.contains("polic")));
 }
 
+// A1: restricted context and a PM's own master file, through validation.
+
+#[tokio::test]
+async fn an_auditor_or_a_pm_cant_read_restricted_or_personal_files_through_validation() {
+    let w = web().await;
+    for who in ["audrey", "ana"] {
+        let s = w.login(who).await;
+        for path in [RESTRICTED, ANA_MASTER] {
+            // The reviewer's scenario: propose to delete it, read the diff.
+            for (route, body) in [
+                (
+                    "/api/admin/content/validate",
+                    json!({"changes": [{"path": path, "delete": true}]}),
+                ),
+                (
+                    "/api/admin/content/validate",
+                    json!({"changes": [{"path": path, "text": "x"}]}),
+                ),
+                (
+                    "/api/admin/content/proposals",
+                    json!({"changes": [{"path": path, "delete": true}], "title": "t", "reason": "r"}),
+                ),
+            ] {
+                let r = w.post(&s, route, body).await;
+                assert_eq!(r.status, StatusCode::FORBIDDEN, "{who} {route} {path}");
+                assert_eq!(r.code(), "forbidden");
+                let text = r.body.to_string();
+                assert!(
+                    !text.contains(RESTRICTED_BODY) && !text.contains(ANA_BODY),
+                    "{who} {path}: {text}"
+                );
+            }
+            let r = w
+                .get(&s, &format!("/api/admin/content/file?path={path}"))
+                .await;
+            assert_eq!(r.status, StatusCode::FORBIDDEN, "{who} {path}");
+            assert!(!r.body.to_string().contains(RESTRICTED_BODY));
+        }
+        // The policy validation is closed to them too.
+        let r = w
+            .post(
+                &s,
+                "/api/admin/policy/validate",
+                json!({"spec": tools_spec(&["docs.search"])}),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{who}");
+    }
+    // Each refusal is in the audit log as `denied`, `role`.
+    let events = w.tools.events();
+    assert!(!events.is_empty());
+    assert!(events
+        .iter()
+        .all(|e| e.body["outcome"] == "denied" && e.body["detail"] == "role"));
+    assert!(events
+        .iter()
+        .all(|e| !e.body.to_string().contains("secret-roadmap")));
+    assert!(w.tools.opened().is_empty());
+}
+
+#[tokio::test]
+async fn an_admins_sensitive_reads_are_recorded_before_the_text_is_served() {
+    let w = web().await;
+    let adam = w.login("adam").await;
+    // Validating the deletion of the restricted file: allowed, and recorded first.
+    let r = w
+        .post(
+            &adam,
+            "/api/admin/content/validate",
+            json!({"changes": [{"path": RESTRICTED, "delete": true}]}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.body["content_changes"][0]["diff"]
+        .as_str()
+        .unwrap()
+        .contains(RESTRICTED_BODY));
+    let e = w.tools.events();
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert_eq!(e[0].query, "user=adam");
+    assert_eq!(e[0].body["action"], "admin.content_sensitive_read");
+    assert_eq!(e[0].body["outcome"], "ok");
+    assert_eq!(e[0].body["detail"], "restricted context");
+    assert_eq!(e[0].body["count"], 1);
+    // The restricted file's name is never sent: it can itself be sensitive.
+    assert_eq!(e[0].body["target"], Value::Null);
+    assert!(!e[0].body.to_string().contains("secret-roadmap"));
+
+    // A PM's own master file, opened: the target says whose.
+    let r = w
+        .get(&adam, &format!("/api/admin/content/file?path={ANA_MASTER}"))
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let e = w.tools.events();
+    assert_eq!(e.len(), 2);
+    assert_eq!(e[1].body["detail"], "personal file");
+    assert_eq!(e[1].body["target"], "content:personal:ana");
+    assert!(!e[1].body.to_string().contains(ANA_BODY));
+
+    // A file that isn't sensitive: nothing recorded.
+    let r = w
+        .get(
+            &adam,
+            "/api/admin/content/file?path=content/skills/docs/SKILL.md",
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(w.tools.events().len(), 2);
+
+    // The audit log down: the text isn't served.
+    w.tools.events_down.store(true, Ordering::SeqCst);
+    for r in [
+        w.get(&adam, &format!("/api/admin/content/file?path={RESTRICTED}"))
+            .await,
+        w.post(
+            &adam,
+            "/api/admin/content/validate",
+            json!({"changes": [{"path": ANA_MASTER, "text": "x"}]}),
+        )
+        .await,
+    ] {
+        assert_eq!(r.status, StatusCode::BAD_GATEWAY, "{}", r.body);
+        assert_eq!(r.code(), "audit_unavailable");
+        let text = r.body.to_string();
+        assert!(!text.contains(RESTRICTED_BODY) && !text.contains(ANA_BODY));
+    }
+}
+
+#[tokio::test]
+async fn an_auditor_never_sees_lint_messages_of_files_they_cant_open() {
+    let w = web().await;
+    // A restricted file with a warning that quotes its front matter (its review date).
+    std::fs::write(
+        w.content().join("context/products/secret-roadmap.md"),
+        "---\ntitle: Secret roadmap\nowner: \"adam\"\nlast-reviewed: 2001-02-03\nsensitivity: restricted\n---\n\nRestricted body.\n",
+    )
+    .unwrap();
+    let issues = |r: &Reply| -> Vec<Value> {
+        r.body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == RESTRICTED)
+            .unwrap()["lint"]["issues"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let adam = w.login("adam").await;
+    let seen = issues(&w.get(&adam, "/api/admin/content").await);
+    assert!(
+        seen.iter()
+            .any(|i| i["message"].as_str().unwrap().contains("2001-02-03")),
+        "{seen:?}"
+    );
+    let audrey = w.login("audrey").await;
+    let r = w.get(&audrey, "/api/admin/content").await;
+    let hidden = issues(&r);
+    assert_eq!(hidden.len(), seen.len());
+    for i in &hidden {
+        assert_eq!(i["message"], "A finding on a file your role can't open.");
+        assert_eq!(i["code"], "context-stale", "the code stays");
+    }
+    assert!(!serde_json::to_string(&hidden)
+        .unwrap()
+        .contains("2001-02-03"));
+}
+
 // Policy: reading.
 
 #[tokio::test]
@@ -726,6 +892,13 @@ async fn policy_read_shows_the_spec_the_files_drift_and_allowances() {
     assert!(f[0]["generated"].is_string() && f[0]["checked_in"].is_string());
     assert_eq!(b["fixed"]["services"].as_array().unwrap().len(), 3);
     assert_eq!(b["proposals_configured"], true);
+    // Branch protection, as the tool server read it with adam's own account.
+    assert_eq!(b["protection"]["required_reviews"], 1);
+    assert_eq!(b["protection"]["verified"], true);
+    assert_eq!(b["protection"]["branch"], "main");
+    let p = w.tools.to("/internal/admin/protection");
+    assert_eq!(p[0].query, "user=adam");
+    assert!(p[0].assertion.is_some());
 
     // A hand edit that adds egress: drift, and the rule it breaks.
     let p = w.dir.path().join("policies/bots/docs.yaml");
@@ -898,7 +1071,8 @@ async fn policy_validation_errors_have_paths() {
         )
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
-    // A proposal that doesn't validate: 422, nothing sent anywhere.
+    assert!(w.tools.calls().is_empty(), "validating sends nothing");
+    // A proposal that doesn't validate: 422, never sent to the tool server, and recorded.
     let r = w
         .post(
             &adam,
@@ -909,13 +1083,28 @@ async fn policy_validation_errors_have_paths() {
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(r.code(), "invalid");
     assert!(!r.body["errors"].as_array().unwrap().is_empty());
-    assert!(w.gh.calls().is_empty() && w.tools.calls().is_empty());
+    assert!(w.tools.opened().is_empty());
+    let e = w.tools.events();
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert_eq!(e[0].body["action"], "admin.policy_proposal");
+    assert_eq!(e[0].body["outcome"], "denied");
+    assert_eq!(e[0].body["detail"], "invalid");
+    // A spec error is recorded the same way.
+    let r = w
+        .post(
+            &adam,
+            "/api/admin/policy/proposals",
+            proposal(json!({"bots": {"nope": {"role": "x"}}})),
+        )
+        .await;
+    assert_eq!(r.code(), "invalid");
+    assert_eq!(w.tools.events().len(), 2);
 }
 
-// Proposals.
+// Proposals: what goes to the tool server, and what comes back.
 
 #[tokio::test]
-async fn a_policy_proposal_opens_a_pull_request() {
+async fn a_policy_proposal_goes_to_the_tool_server_as_a_checked_change_set() {
     let w = web().await;
     let adam = w.login("adam").await;
     let tools = ["docs.search", "docs.read", "jira.search"];
@@ -928,137 +1117,63 @@ async fn a_policy_proposal_opens_a_pull_request() {
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
     assert_eq!(r.body["number"], 42);
-    assert_eq!(r.body["url"], "https://github.example/acme/pmos/pull/42");
-    assert_eq!(r.body["base"]["branch"], "main");
+    assert_eq!(r.body["author"], "adam-gh", "opened as the admin");
     assert_eq!(r.body["base"]["commit"], BASE);
-    assert_eq!(r.body["widening"], true);
-    assert_eq!(r.body["stale_check"], "passed");
-    let branch = r.body["branch"].as_str().unwrap();
-    assert!(branch.starts_with("pmos/proposal/policy/adam-"), "{branch}");
-    assert_eq!(
-        r.body["files"],
-        json!(["content/skills/docs/SKILL.md", "policies/bots/docs.yaml"])
-    );
 
-    // GitHub: every call with the token in Authorization only.
-    let calls = w.gh.calls();
-    for c in &calls {
-        assert_eq!(
-            c.auth.as_deref(),
-            Some(format!("Bearer {GITHUB_TOKEN}").as_str())
-        );
-        assert!(!c.query.contains(GITHUB_TOKEN) && !c.path.contains(GITHUB_TOKEN));
-        assert!(!c.body.to_string().contains(GITHUB_TOKEN));
-    }
-    let sequence: Vec<String> = calls
+    let open = w.tools.opened();
+    assert_eq!(open.len(), 1);
+    let c = &open[0];
+    assert_eq!(c.method, "POST");
+    assert_eq!(c.query, "user=adam");
+    assert!(
+        c.assertion.is_some(),
+        "signed for the admin, bound to the body"
+    );
+    assert_eq!(
+        c.auth.as_deref(),
+        Some(format!("Bearer {TOOLS_TOKEN}").as_str())
+    );
+    assert_eq!(c.body["kind"], "policy");
+    assert_eq!(c.body["title"], "Let the Docs bot search Jira");
+    assert_eq!(c.body["reason"], "PMs asked for it @everyone ``` fence");
+    let changes = c.body["changes"].as_array().unwrap();
+    let paths: Vec<&str> = changes
         .iter()
-        .map(|c| {
-            format!(
-                "{} {}",
-                c.method,
-                c.path.trim_start_matches("/repos/acme/pmos")
-            )
-        })
+        .map(|f| f["path"].as_str().unwrap())
         .collect();
     assert_eq!(
-        sequence,
-        [
-            "GET ".to_string(),
-            "GET /git/ref/heads/main".into(),
-            format!("GET /git/commits/{BASE}"),
-            format!("GET /git/trees/{TREE}"),
-            "POST /git/trees".into(),
-            "POST /git/commits".into(),
-            "POST /git/refs".into(),
-            "POST /pulls".into(),
-            "POST /issues/42/labels".into(),
-        ]
+        paths,
+        ["content/skills/docs/SKILL.md", "policies/bots/docs.yaml"]
     );
-    let tree = &calls[4].body;
-    assert_eq!(tree["base_tree"], TREE);
-    let entries = tree["tree"].as_array().unwrap();
-    let skill = entries
-        .iter()
-        .find(|e| e["path"] == "content/skills/docs/SKILL.md")
-        .unwrap();
-    assert!(skill["content"]
+    // Each file with the blob id it was computed from: the deployed copy's.
+    let blobs = blobs_of(w.dir.path());
+    for f in changes {
+        let path = f["path"].as_str().unwrap();
+        assert_eq!(f["base_blob_sha"], blobs[path], "{path}");
+    }
+    assert!(changes[0]["text"]
         .as_str()
         .unwrap()
         .contains("tools: \"docs.search docs.read jira.search\""));
-    let policy = entries
-        .iter()
-        .find(|e| e["path"] == "policies/bots/docs.yaml")
-        .unwrap();
-    assert!(policy["content"]
+    assert!(changes[1]["text"]
         .as_str()
         .unwrap()
         .contains("- jira_search"));
-    assert_eq!(calls[5].body["parents"], json!([BASE]));
-    // A new ref, never an update to an existing one, and never the default branch.
-    assert_eq!(calls[6].body["ref"], format!("refs/heads/{branch}"));
-    assert!(!calls
-        .iter()
-        .any(|c| c.method == "PATCH" || c.path.contains("/merge")));
-    let pr = &calls[7].body;
-    assert_eq!(pr["base"], "main");
-    assert_eq!(pr["head"], branch);
-    assert_eq!(pr["title"], "PM OS policy: Let the Docs bot search Jira");
-    let body = pr["body"].as_str().unwrap();
-    assert!(body.contains("by `adam`"), "{body}");
-    assert!(
-        body.contains("**WIDER**") && body.contains("jira_search"),
-        "{body}"
-    );
-    // The reason is fenced: no mentions, no breaking out of the fence.
-    assert!(
-        body.contains("```text\nPMs asked for it @everyone ''' fence\n```"),
-        "{body}"
-    );
-    assert!(body.contains(BASE));
-    assert_eq!(
-        calls[8].body["labels"],
-        json!(["pmos-proposal", "pmos-proposal:policy"])
-    );
-    // Nothing on disk changed.
+    // Nothing on disk changed, and pmos-web reached no GitHub.
     assert!(!w.read("skills/docs/SKILL.md").contains("jira.search"));
 
-    // Audit: started, then opened with the pull request, each signed for adam.
-    let audit = w.tools.calls();
-    assert_eq!(audit.len(), 2, "{audit:?}");
-    for (c, stage) in audit.iter().zip(["started", "opened"]) {
-        assert_eq!(c.path, "/internal/admin/proposals");
-        assert_eq!(c.query, "user=adam");
-        assert!(c.assertion.is_some(), "signed for the admin");
-        assert_eq!(c.body["kind"], "policy");
-        assert_eq!(c.body["stage"], stage);
-        assert_eq!(c.body["repo"], "acme/pmos");
-        assert_eq!(c.body["base"], BASE);
-        assert_eq!(
-            c.body["paths"],
-            json!(["content/skills/docs/SKILL.md", "policies/bots/docs.yaml"])
-        );
-        let text = c.body.to_string();
-        assert!(
-            !text.contains("jira.search") && !text.contains("tools:"),
-            "no file text: {text}"
-        );
-    }
-    assert_eq!(audit[0].body["pr"], Value::Null);
-    assert_eq!(audit[1].body["pr"], 42);
-
-    // Listed as an open proposal; someone else's pull request isn't.
+    // Listed through the tool server, with adam's own account.
     let r = w.get(&adam, "/api/admin/policy/proposals").await;
     assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.body["github"], "linked");
+    assert_eq!(r.body["repo"], "acme/pmos");
     let list = r.body["proposals"].as_array().unwrap();
-    assert_eq!(list.len(), 1, "{list:?}");
-    assert_eq!(list[0]["number"], 42);
     assert_eq!(list[0]["proposed_by"], "adam");
-    assert_eq!(list[0]["base_commit"], BASE);
-    assert_eq!(list[0]["status"], "open");
-    let r = w.get(&adam, "/api/admin/content/proposals").await;
-    assert!(r.body["proposals"].as_array().unwrap().is_empty());
+    let l = w.tools.to("/internal/admin/proposals");
+    assert_eq!(l[0].query, "user=adam&kind=policy");
+    assert!(l[0].assertion.is_some());
 
-    // The same spec as deployed: nothing to propose.
+    // The same spec as deployed: nothing to propose, nothing sent.
     let r = w
         .post(
             &adam,
@@ -1068,7 +1183,6 @@ async fn a_policy_proposal_opens_a_pull_request() {
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert_eq!(r.code(), "no_change");
-
     // No title or reason.
     let r = w
         .post(
@@ -1078,10 +1192,11 @@ async fn a_policy_proposal_opens_a_pull_request() {
         )
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(w.tools.opened().len(), 1);
 }
 
 #[tokio::test]
-async fn a_content_proposal_opens_a_pull_request_and_logs_hold_no_token_or_text() {
+async fn a_content_proposal_is_sent_and_logs_hold_no_file_text() {
     let w = web().await;
     let adam = w.login("adam").await;
     let opened = w
@@ -1111,147 +1226,129 @@ async fn a_content_proposal_opens_a_pull_request_and_logs_hold_no_token_or_text(
         )
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
-    assert_eq!(r.body["widening"], false);
-    let branch = r.body["branch"].as_str().unwrap();
-    assert!(branch.starts_with("pmos/proposal/content/adam-"));
-    assert_eq!(
-        r.body["files"],
-        json!(["content/playbooks/bar.md", "content/playbooks/new-one.md"])
+    let c = &w.tools.opened()[0];
+    assert_eq!(c.body["kind"], "content");
+    let changes = c.body["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[1]["path"], "content/playbooks/new-one.md");
+    assert_eq!(changes[1]["base_blob_sha"], Value::Null, "a new file");
+    assert!(
+        w.tools.events().is_empty(),
+        "nothing refused, nothing sensitive"
     );
-    let labels = w.gh.calls().last().unwrap().body["labels"].clone();
-    assert_eq!(labels, json!(["pmos-proposal", "pmos-proposal:content"]));
-    let audit = w.tools.calls();
-    assert_eq!(audit[0].body["kind"], "content");
-    assert!(!audit
-        .iter()
-        .any(|c| c.body.to_string().contains(SECRET_TEXT)));
 
     let r = w.get(&adam, "/api/admin/content/proposals").await;
     assert_eq!(r.body["proposals"].as_array().unwrap().len(), 1);
-    assert_eq!(r.body["repo"], "acme/pmos");
 
-    // Logs: the handle and the pull request, never the token or the file's text.
+    // Logs: the handle and the outcome, never the file's text or a token.
     let logs = String::from_utf8_lossy(&logs().lock().unwrap()).into_owned();
-    assert!(logs.contains("proposal opened"), "the proposal is logged");
-    assert!(!logs.contains(GITHUB_TOKEN), "no token in the logs");
-    assert!(!logs.contains("TESTONLY"), "no token in the logs");
+    assert!(logs.contains("proposal sent to the tool server"));
     assert!(!logs.contains(SECRET_TEXT), "no file text in the logs");
     assert!(!logs.contains(TOOLS_TOKEN));
 }
 
 #[tokio::test]
-async fn a_stale_base_is_refused_before_anything_is_written() {
+async fn the_tool_servers_refusals_are_relayed_with_pmos_webs_own_words() {
     let w = web().await;
     let adam = w.login("adam").await;
-    // The default branch has moved on: the skill differs there.
-    w.gh.blobs.lock().unwrap().insert(
-        "content/skills/docs/SKILL.md".into(),
-        git_blob_sha(b"someone else's edit"),
-    );
-    let r = w
-        .post(
-            &adam,
-            "/api/admin/policy/proposals",
-            proposal(tools_spec(&["docs.search"])),
-        )
-        .await;
+    let propose = || {
+        let w = &w;
+        let adam = adam.clone();
+        async move {
+            w.post(
+                &adam,
+                "/api/admin/policy/proposals",
+                proposal(tools_spec(&["docs.search"])),
+            )
+            .await
+        }
+    };
+    // Not linked: a plain sentence saying how to link.
+    w.tools.not_linked.store(true, Ordering::SeqCst);
+    let r = propose().await;
     assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.body);
+    assert_eq!(r.code(), "github_not_linked");
+    assert!(r.body["error"]
+        .as_str()
+        .unwrap()
+        .contains("Link your GitHub"));
+    // ... and the list is an explanatory empty state, not an error.
+    let r = w.get(&adam, "/api/admin/policy/proposals").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.body["github"], "not_linked");
+    assert_eq!(r.body["proposals"], json!([]));
+    assert!(r.body["message"]
+        .as_str()
+        .unwrap()
+        .contains("Link your GitHub"));
+    let r = w.get(&adam, "/api/admin/policy").await;
+    assert_eq!(r.body["protection"]["verified"], false);
+    assert_eq!(r.body["protection"]["github"], "not_linked");
+    w.tools.not_linked.store(false, Ordering::SeqCst);
+
+    // A stale base: the paths and the base come through.
+    w.tools.reply(
+        409,
+        json!({"code": "stale_base", "error": "x", "paths": ["content/skills/docs/SKILL.md"],
+               "base": {"branch": "main", "commit": BASE}, "junk": "not relayed"}),
+    );
+    let r = propose().await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
     assert_eq!(r.code(), "stale_base");
     assert_eq!(r.body["paths"], json!(["content/skills/docs/SKILL.md"]));
     assert_eq!(r.body["base"]["commit"], BASE);
-    assert!(w.gh.writes().is_empty());
-    assert!(
-        w.tools.calls().is_empty(),
-        "nothing recorded: nothing was attempted"
+    assert!(r.body.get("junk").is_none());
+    assert_ne!(r.body["error"], "x", "pmos-web's own sentence");
+
+    // The rate limit, with Retry-After.
+    w.tools.reply(
+        429,
+        json!({"code": "rate_limited", "error": "x", "retry_after": 1200}),
     );
-
-    // A content change made from a copy the server has since redeployed.
-    let r = w
-        .post(
-            &adam,
-            "/api/admin/content/validate",
-            json!({"changes": [{"path": "content/playbooks/bar.md", "text": "x", "base_sha256": "00"}]}),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::CONFLICT);
-    assert_eq!(r.code(), "stale_base");
-}
-
-#[tokio::test]
-async fn no_audit_record_means_no_pull_request() {
-    let w = web().await;
-    let adam = w.login("adam").await;
-    w.tools.down.store(true, Ordering::SeqCst);
-    let r = w
-        .post(
-            &adam,
-            "/api/admin/policy/proposals",
-            proposal(tools_spec(&["docs.search"])),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::BAD_GATEWAY);
-    assert_eq!(r.code(), "audit_unavailable");
-    assert!(w.gh.writes().is_empty(), "nothing written to GitHub");
-}
-
-#[tokio::test]
-async fn proposals_are_rate_limited_per_admin() {
-    let w = web_with(Opts {
-        per_hour: 1,
-        ..Opts::default()
-    })
-    .await;
-    let adam = w.login("adam").await;
-    let r = w
-        .post(
-            &adam,
-            "/api/admin/policy/proposals",
-            proposal(tools_spec(&["docs.search"])),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::CREATED);
-    let r = w
-        .post(
-            &adam,
-            "/api/admin/policy/proposals",
-            proposal(tools_spec(&["docs.read"])),
-        )
-        .await;
+    let r = propose().await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(r.code(), "rate_limited");
-    assert!(r.headers.get("retry-after").is_some());
-}
+    assert_eq!(r.headers["retry-after"], "1200");
 
-#[tokio::test]
-async fn without_github_proposals_are_not_configured_and_reads_still_work() {
-    let w = web_with(Opts {
-        github: false,
-        ..Opts::default()
-    })
-    .await;
-    let adam = w.login("adam").await;
-    for (method, path, body) in [
-        (
-            Method::POST,
-            "/api/admin/policy/proposals",
-            Some(proposal(tools_spec(&["docs.search"]))),
-        ),
-        (Method::GET, "/api/admin/policy/proposals", None),
-        (
-            Method::POST,
-            "/api/admin/content/proposals",
-            Some(
-                json!({"changes": [{"path": "content/playbooks/bar.md", "text": "x"}], "title": "t", "reason": "r"}),
-            ),
-        ),
-        (Method::GET, "/api/admin/content/proposals", None),
-    ] {
-        let r = w.send(Some(&adam), method, path, body).await;
-        assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED, "{path}");
-        assert_eq!(r.code(), "not_configured");
-    }
+    // The audit log down at the tool server: nothing was opened.
+    w.tools
+        .reply(502, json!({"code": "audit_unavailable", "error": "x"}));
+    let r = propose().await;
+    assert_eq!(r.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(r.code(), "audit_unavailable");
+
+    // Its own re-validation found errors.
+    w.tools.reply(
+        422,
+        json!({"code": "invalid", "error": "x", "errors": [{"severity": "error", "code": "net-egress", "path": "policies/bots/docs.yaml", "line": null, "message": "m"}], "warnings": []}),
+    );
+    let r = propose().await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.body["errors"][0]["code"], "net-egress");
+
+    // A code pmos-web doesn't know, or a bad assertion: an upstream failure, never its text.
+    w.tools.reply(
+        401,
+        json!({"code": "bad_assertion", "error": "secret detail"}),
+    );
+    let r = propose().await;
+    assert_eq!(r.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(r.code(), "upstream_unavailable");
+    assert!(!r.body.to_string().contains("secret detail"));
+
+    // Proposals off at the tool server: reads and validation still work.
+    *w.tools.open_reply.lock().unwrap() = None;
+    w.tools.unconfigured.store(true, Ordering::SeqCst);
+    let r = propose().await;
+    assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(r.code(), "not_configured");
+    let r = w.get(&adam, "/api/admin/content/proposals").await;
+    assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(r.code(), "not_configured");
     let r = w.get(&adam, "/api/admin/policy").await;
     assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.body["proposals_configured"], false);
+    let r = w.get(&adam, "/api/admin/content").await;
     assert_eq!(r.body["proposals_configured"], false);
     let r = w
         .post(
@@ -1261,18 +1358,50 @@ async fn without_github_proposals_are_not_configured_and_reads_still_work() {
         )
         .await;
     assert_eq!(r.body["valid"], true);
-    let r = w.get(&adam, "/api/admin/content").await;
-    assert_eq!(r.status, StatusCode::OK);
-    // An auditor still gets 403 first, not 501.
-    let audrey = w.login("audrey").await;
-    let r = w
-        .post(
-            &audrey,
-            "/api/admin/policy/proposals",
-            proposal(tools_spec(&["docs.search"])),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_stale_copy_is_refused_here_and_recorded() {
+    let w = web().await;
+    let adam = w.login("adam").await;
+    // A content change made from a copy the server has since redeployed.
+    for route in [
+        "/api/admin/content/validate",
+        "/api/admin/content/proposals",
+    ] {
+        let r = w
+            .post(
+                &adam,
+                route,
+                json!({"changes": [{"path": "content/playbooks/bar.md", "text": "x", "base_sha256": "00"}],
+                       "title": "t", "reason": "r"}),
+            )
+            .await;
+        // Validate takes no title: its body is refused first.
+        if route.ends_with("validate") {
+            assert_eq!(r.status, StatusCode::BAD_REQUEST);
+            let r = w
+                .post(
+                    &adam,
+                    route,
+                    json!({"changes": [{"path": "content/playbooks/bar.md", "text": "x", "base_sha256": "00"}]}),
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::CONFLICT);
+            assert_eq!(r.code(), "stale_base");
+        } else {
+            assert_eq!(r.status, StatusCode::CONFLICT);
+            assert_eq!(r.code(), "stale_base");
+        }
+    }
+    let e = w.tools.events();
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert_eq!(e[0].body["action"], "admin.content_validate");
+    assert_eq!(e[1].body["action"], "admin.content_proposal");
+    assert!(e
+        .iter()
+        .all(|e| e.body["detail"] == "stale base" && e.body["count"] == 1));
+    assert!(w.tools.opened().is_empty());
 }
 
 // Content: reading.
@@ -1303,10 +1432,7 @@ async fn the_content_tree_has_metadata_and_lint_status() {
         .find(|f| f["path"] == "content/team.yaml")
         .unwrap();
     assert_eq!(team["editable"], false);
-    let secret = files
-        .iter()
-        .find(|f| f["path"] == "content/context/products/secret-roadmap.md")
-        .unwrap();
+    let secret = files.iter().find(|f| f["path"] == RESTRICTED).unwrap();
     assert_eq!(secret["sensitivity"], "restricted");
     assert_eq!(secret["readable"], false, "an auditor doesn't open it");
     let skills = r.body["skills"].as_array().unwrap();
@@ -1316,13 +1442,14 @@ async fn the_content_tree_has_metadata_and_lint_status() {
     let helper = roles.iter().find(|r| r["name"] == "docs-helper").unwrap();
     assert_eq!(helper["bots"], json!(["docs"]));
     assert_eq!(r.body["lint"]["errors"], 0);
+    assert_eq!(r.body["protection"]["verified"], true);
     let adam = w.login("adam").await;
     let r = w.get(&adam, "/api/admin/content").await;
     let secret = r.body["files"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["path"] == "content/context/products/secret-roadmap.md")
+        .find(|f| f["path"] == RESTRICTED)
         .unwrap()
         .clone();
     assert_eq!(secret["readable"], true);
@@ -1414,17 +1541,13 @@ async fn file_reads_are_confined_to_the_content_tree() {
         )
         .await;
     assert_eq!(r.status, StatusCode::OK);
-    for path in [
-        "content/context/products/secret-roadmap.md",
-        "content/master/people/ana/AGENTS.md",
-    ] {
+    for path in [RESTRICTED, ANA_MASTER] {
         let r = w
             .get(&audrey, &format!("/api/admin/content/file?path={path}"))
             .await;
         assert_eq!(r.status, StatusCode::FORBIDDEN, "{path}");
         assert!(
-            !r.body.to_string().contains("Restricted body")
-                && !r.body.to_string().contains("Ana's own")
+            !r.body.to_string().contains(RESTRICTED_BODY) && !r.body.to_string().contains(ANA_BODY)
         );
         let r = w
             .get(&adam, &format!("/api/admin/content/file?path={path}"))
@@ -1611,7 +1734,7 @@ async fn content_validation_runs_the_lint_and_enforces_the_caps() {
     }
     // Nothing on disk changed, and nothing was sent anywhere.
     assert!(!w.content().join("playbooks/new.md").exists());
-    assert!(w.gh.calls().is_empty() && w.tools.calls().is_empty());
+    assert!(w.tools.calls().is_empty());
 }
 
 // The harness.

@@ -4,9 +4,13 @@
 //! `GET /api/admin/harness` (`docs/web-api.md`, Admin: content and harness;
 //! `docs/content-admin.md`).
 //!
-//! Read-and-propose: nothing here writes a content file. Reading and validating need
-//! `view-content` (admins and auditors; an auditor can't open a PM's personal master file or
-//! restricted context); proposing needs `edit-content` (admins).
+//! Read-and-propose: nothing here writes a content file. Reading needs `view-content`
+//! (admins and auditors; an auditor can't open a PM's personal master file or restricted
+//! context, and the tree hides the lint messages of those files from them). Validating and
+//! proposing need `edit-content` (admins): a validation's diff shows the current text of every
+//! file it names. An admin opening a personal or restricted file, or naming one in a
+//! validation or proposal, is recorded first (`proposal::guard_reads`). Role refusals are
+//! recorded too.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -21,7 +25,7 @@ use pmos_contract::permissions::Permission;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::proposal::{self, blocking, need, read_log, refused, MAX_REQUEST};
+use super::proposal::{self, blocking, need, read_log, refused, Action, MAX_REQUEST};
 use super::{now, parse, ApiError, ApiResult, AppState, Signed};
 use crate::content_admin;
 use crate::policy_admin::{self, Evaluation, Roots};
@@ -38,35 +42,46 @@ pub(super) fn routes() -> Router<AppState> {
 }
 
 fn content_dir(state: &AppState) -> String {
-    state.0.proposals.config.content_dir.clone()
+    state.0.proposals.config.layout.content_dir().to_string()
 }
 
 /// `GET /api/admin/content`.
 async fn tree(State(state): State<AppState>, signed: Signed) -> ApiResult {
-    need(&signed, Permission::ViewContent)?;
+    need(
+        &state,
+        &signed,
+        Permission::ViewContent,
+        Action::ContentRead,
+    )
+    .await?;
     read_log(&signed, "/api/admin/content");
     let root = state.0.content_root.clone();
     let dir = content_dir(&state);
     let today = now(&state).date_naive();
     let revision = state.0.proposals.config.content_revision.clone();
     let admin = signed.member.allows(Permission::EditContent);
-    let configured = state.0.proposals.github.is_some();
     let checked_at = now(&state);
-    let body = blocking(move || {
-        let report = policy_admin::today_report(&root, today);
-        let (files, other) = content_admin::tree(&root, &report, &dir, admin);
-        let mut lint = content_admin::lint_summary(&report);
-        lint["checked_at"] = json!(checked_at);
-        lint["other"] = json!(other);
-        let mut out = content_admin::catalog(&report);
-        out["revision"] = content_admin::revision(&root, revision.as_deref());
-        out["root"] = json!(dir);
-        out["lint"] = lint;
-        out["files"] = json!(files);
-        out["proposals_configured"] = json!(configured);
-        out
-    })
-    .await?;
+    // The branch-protection check (a tool server call) runs beside the file-system work.
+    let (protection, body) = tokio::join!(
+        proposal::protection(&state, &signed),
+        blocking(move || {
+            let report = policy_admin::today_report(&root, today);
+            let (files, other) = content_admin::tree(&root, &report, &dir, admin);
+            let mut lint = content_admin::lint_summary(&report);
+            lint["checked_at"] = json!(checked_at);
+            lint["other"] = json!(other);
+            let mut out = content_admin::catalog(&report);
+            out["revision"] = content_admin::revision(&root, revision.as_deref());
+            out["root"] = json!(dir);
+            out["lint"] = lint;
+            out["files"] = json!(files);
+            out
+        })
+    );
+    let (protection, configured) = protection;
+    let mut body = body?;
+    body["proposals_configured"] = json!(configured);
+    body["protection"] = protection;
     Ok(Json(body).into_response())
 }
 
@@ -81,7 +96,13 @@ async fn file(
     signed: Signed,
     q: Result<Query<FileQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult {
-    need(&signed, Permission::ViewContent)?;
+    need(
+        &state,
+        &signed,
+        Permission::ViewContent,
+        Action::ContentFile,
+    )
+    .await?;
     let Ok(Query(q)) = q else {
         return Err(ApiError::bad_request("These query parameters don't parse."));
     };
@@ -104,6 +125,7 @@ async fn file(
             .and_then(|f| f.get("sensitivity"))
             .and_then(Value::as_str);
         if !content_admin::auditor_may_read(view.kind, sensitivity) {
+            proposal::record_refusal(&state, &signed, Action::ContentFile, "role", 1).await;
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
                 "forbidden",
@@ -111,6 +133,15 @@ async fn file(
             ));
         }
     }
+    // An admin: a sensitive file is recorded before its text is served.
+    proposal::guard_reads(
+        &state,
+        &signed,
+        Permission::EditContent,
+        Action::ContentFile,
+        &[(rel.clone(), Some(view.text.clone()))],
+    )
+    .await?;
     Ok(Json(view).into_response())
 }
 
@@ -142,8 +173,12 @@ struct ProposeBody {
     reason: String,
 }
 
-/// The changes, checked: count, paths, kind of file, text. `Err` is the answer.
-fn check_changes(state: &AppState, input: Vec<ChangeIn>) -> Result<Vec<Change>, ApiError> {
+/// Each named file's content-relative path and current text, for the read rule.
+type Named = Vec<(String, Option<String>)>;
+
+/// The changes, checked: count, paths, kind of file, text. `Ok` also has every named file's
+/// current text. `Err` is the answer.
+fn check_changes(state: &AppState, input: Vec<ChangeIn>) -> Result<(Vec<Change>, Named), ApiError> {
     if input.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -162,6 +197,7 @@ fn check_changes(state: &AppState, input: Vec<ChangeIn>) -> Result<Vec<Change>, 
     let root = &state.0.content_root;
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
+    let mut named = Vec::new();
     let mut stale = Vec::new();
     for c in input {
         let rel = proposals::content_rel(&c.path, &dir).map_err(|r| refused(r, &c.path))?;
@@ -199,6 +235,7 @@ fn check_changes(state: &AppState, input: Vec<ChangeIn>) -> Result<Vec<Change>, 
                 format!("{}: doesn't exist, so it can't be deleted.", c.path),
             ));
         }
+        named.push((rel.clone(), current.clone()));
         if current.as_ref() == text.as_ref() {
             continue;
         }
@@ -221,7 +258,7 @@ fn check_changes(state: &AppState, input: Vec<ChangeIn>) -> Result<Vec<Change>, 
             "Every file is the same as the deployed one: there's nothing to propose.",
         ));
     }
-    Ok(out)
+    Ok((out, named))
 }
 
 async fn evaluate(
@@ -231,8 +268,8 @@ async fn evaluate(
     let cfg = &state.0.proposals.config;
     let content: PathBuf = state.0.content_root.clone();
     let policies = cfg.policies_root.clone();
-    let content_dir = cfg.content_dir.clone();
-    let policies_dir = cfg.policies_dir.clone();
+    let content_dir = cfg.layout.content_dir().to_string();
+    let policies_dir = cfg.layout.policies_dir().to_string();
     let today = now(state).date_naive();
     blocking(move || {
         let roots = Roots {
@@ -248,11 +285,40 @@ async fn evaluate(
     .await?
 }
 
-/// `POST /api/admin/content/validate`.
+/// The changes, checked, with the read rule applied to every file they name; a refusal of
+/// this server's own (a stale base) is recorded for `action`.
+async fn checked(
+    state: &AppState,
+    signed: &Signed,
+    action: Action,
+    input: Vec<ChangeIn>,
+) -> Result<Vec<Change>, ApiError> {
+    let count = input.len();
+    let (changes, named) = match check_changes(state, input) {
+        Ok(v) => v,
+        Err(e) => {
+            if e.code() == "stale_base" {
+                proposal::record_refusal(state, signed, action, "stale base", count).await;
+            }
+            return Err(e);
+        }
+    };
+    proposal::guard_reads(state, signed, Permission::EditContent, action, &named).await?;
+    Ok(changes)
+}
+
+/// `POST /api/admin/content/validate`: admins only, since the diffs show the current text of
+/// every file named.
 async fn validate(State(state): State<AppState>, signed: Signed, body: Bytes) -> ApiResult {
-    need(&signed, Permission::ViewContent)?;
+    need(
+        &state,
+        &signed,
+        Permission::EditContent,
+        Action::ContentValidate,
+    )
+    .await?;
     let b: ValidateBody = parse(&body)?;
-    let changes = check_changes(&state, b.changes)?;
+    let changes = checked(&state, &signed, Action::ContentValidate, b.changes).await?;
     read_log(&signed, "/api/admin/content/validate");
     let (_, e) = evaluate(&state, changes).await?;
     Ok(Json(proposal::evaluation_json(&e)).into_response())
@@ -260,16 +326,29 @@ async fn validate(State(state): State<AppState>, signed: Signed, body: Bytes) ->
 
 /// `POST /api/admin/content/proposals`.
 async fn propose(State(state): State<AppState>, signed: Signed, body: Bytes) -> ApiResult {
-    need(&signed, Permission::EditContent)?;
-    proposal::github(&state)?;
+    need(
+        &state,
+        &signed,
+        Permission::EditContent,
+        Action::ContentProposal,
+    )
+    .await?;
     let b: ProposeBody = parse(&body)?;
     let (title, reason) = proposal::check_meta(&proposal::Meta {
         title: b.title,
         reason: b.reason,
     })?;
-    let changes = check_changes(&state, b.changes)?;
+    let changes = checked(&state, &signed, Action::ContentProposal, b.changes).await?;
     let (changes, e) = evaluate(&state, changes).await?;
     if !e.valid {
+        proposal::record_refusal(
+            &state,
+            &signed,
+            Action::ContentProposal,
+            "invalid",
+            changes.len(),
+        )
+        .await;
         return Ok(proposal::invalid(&e));
     }
     proposal::open(
@@ -286,13 +365,19 @@ async fn propose(State(state): State<AppState>, signed: Signed, body: Bytes) -> 
 
 /// `GET /api/admin/content/proposals`.
 async fn list(State(state): State<AppState>, signed: Signed) -> ApiResult {
-    need(&signed, Permission::ViewContent)?;
+    need(
+        &state,
+        &signed,
+        Permission::ViewContent,
+        Action::ContentProposals,
+    )
+    .await?;
     proposal::list(&state, &signed, Kind::Content).await
 }
 
 /// `GET /api/admin/harness`.
 async fn harness(State(state): State<AppState>, signed: Signed) -> ApiResult {
-    need(&signed, Permission::ViewContent)?;
+    need(&state, &signed, Permission::ViewContent, Action::Harness).await?;
     read_log(&signed, "/api/admin/harness");
     let root = state.0.content_root.clone();
     let today = now(&state).date_naive();

@@ -325,7 +325,11 @@ The mode, the start-up rule, the refusals and the verifier are shared code
   one item needs an assertion, from the console too. The console's token never decides,
   whatever it carries (the route and the service both refuse it). Decisions still check the item's user and `team.yaml`. On the
   admin routes (web token only) the subject must equal `user=`, the viewer, whose role the tool
-  server then checks in its own `team.yaml` (`403 forbidden` without it).
+  server then checks in its own `team.yaml` (`403 forbidden` without it). The admin proposal
+  and event routes (`POST /internal/admin/proposals/open`, `GET /internal/admin/proposals`,
+  `GET /internal/admin/protection`, `POST /internal/admin/events`) need the assertion **in
+  every mode, `off` included**, bound to the body (up to 24 MiB for a proposal): opening a pull
+  request with an admin's own GitHub token is never done on a token's word alone.
 - **Every failure** is the same `401 {"code": "bad_assertion"}`. The log has the client and the
   kind of failure (`missing`, `bad signature`, `expired`, `replayed`, `subject is not the person
   the request names`, …), never the assertion, a key or a handle.

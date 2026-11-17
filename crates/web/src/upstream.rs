@@ -381,32 +381,7 @@ impl Client {
         req: reqwest::RequestBuilder,
         subject: Option<&str>,
     ) -> UpstreamResult<reqwest::Response> {
-        let mut request = req
-            .bearer_auth(&self.token)
-            .timeout(TIMEOUT)
-            .build()
-            .map_err(|_| self.failed("couldn't build the request"))?;
-        if let (Some(signer), Some(subject)) = (&self.signer, subject) {
-            let session = self.session.as_deref().unwrap_or(ASSERTION_SESSION);
-            let value = signer
-                .sign(subject, session, &request)
-                .map_err(|why| self.failed(why))?;
-            request
-                .headers_mut()
-                .insert(HeaderName::from_static(pmos_assertion::HEADER), value);
-        }
-        let res = self.http.execute(request).await.map_err(|e| {
-            // Refused or unreachable before anything was sent: nothing was done there.
-            // Anything later (a timeout waiting for the answer, a dropped connection) may
-            // have been acted on.
-            if e.is_connect() || e.is_builder() {
-                self.failed("didn't answer")
-            } else if e.is_timeout() {
-                self.unknown("timed out")
-            } else {
-                self.unknown("dropped the connection")
-            }
-        })?;
+        let res = self.execute(req, subject, TIMEOUT).await?;
         let status = res.status();
         if status.is_success() {
             return Ok(res);
@@ -434,6 +409,43 @@ impl Client {
             });
         }
         Err(self.unknown(format!("answered {status}")))
+    }
+
+    /// Build, sign (as in [`Self::send`]) and send `req` with `timeout`, and give back the
+    /// response whatever its status. Only a request that couldn't be sent, or whose answer
+    /// was lost, is an error.
+    async fn execute(
+        &self,
+        req: reqwest::RequestBuilder,
+        subject: Option<&str>,
+        timeout: Duration,
+    ) -> UpstreamResult<reqwest::Response> {
+        let mut request = req
+            .bearer_auth(&self.token)
+            .timeout(timeout)
+            .build()
+            .map_err(|_| self.failed("couldn't build the request"))?;
+        if let (Some(signer), Some(subject)) = (&self.signer, subject) {
+            let session = self.session.as_deref().unwrap_or(ASSERTION_SESSION);
+            let value = signer
+                .sign(subject, session, &request)
+                .map_err(|why| self.failed(why))?;
+            request
+                .headers_mut()
+                .insert(HeaderName::from_static(pmos_assertion::HEADER), value);
+        }
+        self.http.execute(request).await.map_err(|e| {
+            // Refused or unreachable before anything was sent: nothing was done there.
+            // Anything later (a timeout waiting for the answer, a dropped connection) may
+            // have been acted on.
+            if e.is_connect() || e.is_builder() {
+                self.failed("didn't answer")
+            } else if e.is_timeout() {
+                self.unknown("timed out")
+            } else {
+                self.unknown("dropped the connection")
+            }
+        })
     }
 
     fn unknown(&self, why: impl std::fmt::Display) -> UpstreamError {
@@ -683,6 +695,52 @@ impl ToolServer {
             )
             .await?;
         self.0.read(res).await
+    }
+}
+
+/// How long opening a proposal may take: the tool server checks the change again and makes
+/// several GitHub calls.
+pub const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(90);
+
+impl ToolServer {
+    /// Ask the tool server to open a proposal for `admin` (`POST /internal/admin/proposals/open
+    /// ?user=<admin>`, JSON `body`, an assertion for them bound to that body). The tool server
+    /// checks everything again and opens the pull request with the admin's own linked GitHub
+    /// account. Gives back its status and JSON body, whatever the status (`Value::Null` if the
+    /// body isn't JSON): the route relays the outcome.
+    pub async fn open_proposal(&self, admin: &str, body: &Value) -> UpstreamResult<(u16, Value)> {
+        let url = self.0.url(&["internal", "admin", "proposals", "open"])?;
+        let res = self
+            .0
+            .execute(
+                self.0.http.post(url).query(&[("user", admin)]).json(body),
+                Some(admin),
+                PROPOSAL_TIMEOUT,
+            )
+            .await?;
+        let status = res.status().as_u16();
+        let body = res.json::<Value>().await.unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
+    /// `GET /internal/admin/{route}?user=<viewer>&…`, as [`Self::admin`], but giving back the
+    /// tool server's status and JSON body whatever the status.
+    pub async fn admin_raw(
+        &self,
+        viewer: &str,
+        route: &str,
+        query: &[(&str, &str)],
+    ) -> UpstreamResult<(u16, Value)> {
+        let url = self.0.url(&["internal", "admin", route])?;
+        let mut q = vec![("user", viewer)];
+        q.extend_from_slice(query);
+        let res = self
+            .0
+            .execute(self.0.http.get(url).query(&q), Some(viewer), TIMEOUT)
+            .await?;
+        let status = res.status().as_u16();
+        let body = res.json::<Value>().await.unwrap_or(Value::Null);
+        Ok((status, body))
     }
 }
 

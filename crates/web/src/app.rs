@@ -500,6 +500,11 @@ impl ApiError {
         }
     }
 
+    /// The answer's `code`.
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
     fn signed_out() -> Self {
         Self::new(
             StatusCode::UNAUTHORIZED,

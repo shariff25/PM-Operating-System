@@ -204,6 +204,10 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/admin/accounts?user=` | service or web token | `{linking, members: [{handle, accounts: {atlassian, slack, github}}]}`, booleans only. `view-audit-log` or `manage-members` |
 | `GET /internal/admin/connectors?user=` | service or web token | `{connectors: [{name, mode, health, error_class, checked_at}]}`, checked now. `manage-connectors` |
 | `GET /internal/admin/overview?user=` | service or web token | `{since, pending_drafts, approved, rejected, denied}`: pending items across the team now, audit outcomes over 7 days. `view-audit-log` or `manage-members` |
+| `POST /internal/admin/proposals/open?user=` `{kind, title, reason, base_sha, changes}` | web token **and** a signed assertion for `user`, in every mode | Check an admin's policy or content change again and open it as a pull request with their own linked GitHub token. `201 {number, url, author, branch, base, files, widening, allowance_changes, stale_check, labels_added}`. See **Admin proposals** |
+| `GET /internal/admin/proposals?user=&kind=policy\|content` | the same | Open proposals, read with the viewer's own GitHub token: `{repo, github: "linked", proposals: [...]}`, or `{repo, github: "not_linked", proposals: []}`. `view-policies` / `view-content` |
+| `GET /internal/admin/protection?user=` | the same | `{configured, branch, required_reviews, verified, source?, github}`: whether `PMOS_CONTENT_BRANCH` requires reviews, as the viewer's token can read it. Best effort, never an error. `view-policies` or `view-content` |
+| `POST /internal/admin/events?user=` `{action, outcome, detail, count, target?}` | the same | `pmos-web` records an admin refusal or an admin's sensitive read: `200 {recorded: true}`; `503 audit_unavailable` if it can't be recorded (pmos-web then serves nothing) |
 
 ### Admin reads
 
@@ -231,6 +235,54 @@ bot and console tokens get `403`).
 - Migration 0011 widens `audit_events.client`'s check to `web` and `console` (Postgres refused
   events from those clients before) and indexes `(at, id)` for the search.
 
+### Admin proposals
+
+`src/proposals.rs`, routes in `app/admin.rs`; the shared checks in `pmos_policy::admin`
+(`docs/policy-admin.md`, **How a proposal is opened**). `pmos-web` holds no GitHub token: it
+validates a policy or content change for the admin and sends the change set here; this server
+checks it again from nothing and opens the pull request **as the admin**.
+
+- **Who may call:** the web token only (the service, bot and console tokens get `403`), with
+  `pmos-web`'s signed user assertion for the `user=` it names, bound to the exact request and
+  body, **in every assertion mode, `off` included** (`401 bad_assertion` otherwise). The
+  subject must be an admin in this server's `team.yaml` (`edit-policies` or `edit-content` by
+  kind), else `403 forbidden`.
+- **The checks** (`changeset::recheck`): the path allow-list (content files under
+  `PMOS_CONTENT_DIR`, and only the generated `bots/<bot>.yaml`, `bots/<bot>.sandbox.yaml` and
+  `providers/<profile>.yaml` under `PMOS_POLICIES_DIR`; never `.github/`, `deploy/`, code,
+  `team.yaml`, a hidden file or the repository root); 50 content and 150 policy files, 256 KiB
+  each, text only; a policy proposal touches only bot, role and skill files; each file's
+  `base_blob_sha` against this server's own content checkout (`409 stale_base`); the content
+  lint and the policy rules on the changed tree (`422 invalid`); the policy files exactly as
+  this server regenerates them (`422 policy_mismatch`); then each file against the head of
+  `PMOS_CONTENT_BRANCH` (`409 stale_base` with `paths` and `base`).
+- **As whom:** the admin's GitHub user token from the vault; `409 github_not_linked` without
+  one. Every GitHub call (`GET git/ref`, `git/commits`, `git/trees`; `POST git/blobs`,
+  `git/trees`, `git/commits`, `git/refs` for a new `pmos/proposal/<kind>/…` branch only,
+  `pulls`, `issues/{n}/labels`) carries it. The default branch is never written, nothing is
+  merged.
+- **Rate limit:** `PMOS_PROPOSALS_PER_HOUR` (default 10) per admin, in memory (one replica;
+  a restart forgets): `429 rate_limited`, `retry_after` and `Retry-After`.
+- **Audit:** `admin.policy_proposal` / `admin.content_proposal`: `started` first (no record, no
+  pull request: `502 audit_unavailable`), then `ok` with `github:<repo>#<n>` or `error`; paths
+  as `sources` (served as a count), never file text or the token. Every refusal is `denied`
+  with a fixed note (`role`, `invalid`, `stale base`, `policy mismatch`, `rate limited`,
+  `github not linked`, `not configured`), served as `detail`.
+- **Configuration:** on with `PMOS_CONTENT_REPO` and the GitHub App; `PMOS_PROPOSALS=off`
+  turns it off. With it on, start-up refuses a `PMOS_CONTENT_DIR` or `PMOS_POLICIES_DIR` that is
+  the repository root or nested in the other, and a proposal is refused (`501
+  not_configured`) if such a layout reaches it anyway. `PMOS_POLICIES_ROOT` (default: the
+  policies folder of the checkout `PMOS_CONTENT_ROOT` is in) is what the re-check compares
+  regenerated policies with.
+- **Events** (`POST /internal/admin/events`): what `pmos-web` refused (a role refusal on an
+  admin policy or content route; a proposal its own checks refused, `invalid` or `stale base`)
+  as `denied`, and an admin's read of a PM's personal master file or restricted context
+  (`admin.content_sensitive_read`, `ok`, note `personal file` or `restricted context`), which
+  `pmos-web` records before it serves the text. A fixed list of actions and notes; `count` is
+  how many files (kept as that many `content` entries in `sources`, served as a count); the
+  only target allowed is `content:personal:<handle>`. A sensitive read needs `edit-content`
+  (else `403`, recorded as `denied`); a refusal record needs a team member.
+
 **Who holds which token:**
 - **Service token** (`PMOS_SERVICE_TOKEN`): the orchestrator, the bot runtime and platform-owner tools. Every route, and the only token that starts bot sessions.
 - **Bot token** (`PMOS_BOT_TOKEN`): the Slack bot. Only sessions for the skills in `PMOS_BOT_SKILLS` and calls within them, plus reading and deciding one approval item (`GET /internal/approvals/{id}?user=<handle>` and its `decision`), for Slack approval cards, the onboarding routes, `GET /internal/ledger` for the daily triage digest, and for the App Home (`docs/slack-home.md`) a team member's pending items (`GET /internal/approvals?user=`) and unlinking a team member's account (`DELETE /internal/credentials/{user}/{provider}`). A session started for another skill, or any bot session, looks to the bot like one that doesn't exist, and every other route (the ledger summary among them) returns `403`.
@@ -240,9 +292,10 @@ bot and console tokens get `403`).
   goes (`422 target_changed`); and a member decision may grant `pm` and `skill-author` only
   (`403 admin_by_pull_request`: a new admin is made by a pull request to `team.yaml`).
 - **Web token** (`PMOS_WEB_TOKEN`): `pmos-web`, which acts for a signed-in person. Only the
-  five approvals routes above (list, one item, sources, decision, saved edit), and the four
-  read-only
-  `GET /internal/admin/*` routes (which check the viewer's role themselves); every other
+  five approvals routes above (list, one item, sources, decision, saved edit), the four
+  read-only `GET /internal/admin/*` reads, and the admin proposal and event routes (all of
+  which check the viewer's role themselves; the proposal and event routes need a signed
+  assertion in every mode); every other
   route (sessions, grants, calls, account linking, credentials, the ledger, reindexing,
   onboarding) is `403`. It has at least the bot token's limits: a read of one item must name
   its PM (`?user=`, else `404`); it never reaches the ledger (so sees no ledger ids) or the
@@ -859,8 +912,10 @@ rebuilt on the new head, up to 3 more times.
 1. In your GitHub org: Settings → Developer settings → GitHub Apps → New GitHub App.
 2. **Callback URL:** `{PMOS_PUBLIC_URL}/oauth/github/callback`. Turn on **Expire user
    authorization tokens**. No webhook.
-3. **Permissions:** Repository: Contents read and write, Metadata read. Account: Email
-   addresses read. Organization: Members read. Nothing else.
+3. **Permissions:** Repository: Contents read and write, Pull requests read and write (admin
+   proposals), Metadata read, and optionally Administration read (only so the admin screens
+   can verify branch protection; `docs/policy-admin.md`). Account: Email addresses read.
+   Organization: Members read. Nothing else.
 4. **Where it can be installed:** only on this account. Install it on your org, on
    all repositories or on the repos PM OS uses: the content repo and the PMs' memory repos.
    With "only select repositories", add each new memory repo to the installation, or its PM
@@ -870,7 +925,10 @@ rebuilt on the new head, up to 3 more times.
    approving members. The App's private key isn't needed: PM OS never acts as the App.
 6. Each platform owner who approves members links GitHub (`setup` in a Slack DM) and needs
    push access to the content repo. If `main` is protected, allow these commits (the
-   platform owners, or the App) to push to it.
+   platform owners, or the App) to push to it. Each admin who proposes policy or content
+   changes links GitHub too: the pull request is opened as them, and branch protection on
+   `main` must require someone else's review (`docs/policy-admin.md`, **Nobody approves
+   their own change**).
 
 ### Personal memory in GitHub
 
@@ -1044,10 +1102,13 @@ With `PMOS_CONNECTORS=live`:
 | `PMOS_GITHUB_ORG` | required with GitHub | Your GitHub org's login. Memory repos and the content repo must be in it |
 | `PMOS_GITHUB_URL` | `https://api.github.com` | API base, for mocks |
 | `PMOS_GITHUB_AUTH_URL` | `https://github.com` | `/login/oauth/authorize` and `/login/oauth/access_token`, for mocks |
-| `PMOS_CONTENT_REPO` | none | `org/name` of the content repo, in `PMOS_GITHUB_ORG`. Required for approving and removing members |
-| `PMOS_CONTENT_BRANCH` | `main` | |
-| `PMOS_CONTENT_DIR` | `content` | Where the content root sits in that repo (`.` for its root) |
+| `PMOS_CONTENT_REPO` | none | `org/name` of the content repo, in `PMOS_GITHUB_ORG`. Required for approving and removing members, and for admin proposals |
+| `PMOS_CONTENT_BRANCH` | `main` | The branch member commits go to, and admin proposals are made on |
+| `PMOS_CONTENT_DIR` | `content` | Where the content root sits in that repo (`.` for its root, only with `PMOS_PROPOSALS=off`) |
 | `PMOS_POLICIES_DIR` | `policies` | Where the sandbox policies sit in that repo, from its root |
+| `PMOS_PROPOSALS` | `on` with `PMOS_CONTENT_REPO` | Admin policy and content proposals (**Admin proposals**). `on` refuses to start when the content or policies folder is the repo root or one is inside the other; `off` turns proposals off |
+| `PMOS_PROPOSALS_PER_HOUR` | `10` | Proposals per admin per hour, 1 to 100, in memory |
+| `PMOS_POLICIES_ROOT` | the checkout's policies folder | The checked-in policy files the proposal re-check compares with |
 | `PMOS_MEMORY` | `store` | `store` keeps memory in Postgres (or in memory). `github` puts each PM's memory in their own repo and needs the GitHub settings; it is a start-up error without them |
 | `PMOS_DOCS_URL` | required | The `pmos-docs` MCP endpoint, such as `http://docs.pmos.internal:8730/mcp` |
 | `PMOS_DOCS_TOKEN` | required | The bearer token `pmos-docs` expects |
