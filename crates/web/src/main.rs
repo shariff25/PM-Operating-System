@@ -63,15 +63,15 @@ async fn main() -> Result<()> {
     let mut deps = pmos_web::store_config::deps_from_env()
         .await
         .map_err(anyhow::Error::msg)?;
-    // The admin policy and content screens. Never logs the GitHub token.
+    // The admin policy and content screens. pmos-web holds no GitHub token: the tool server
+    // opens proposals with the admin's own linked GitHub account.
     deps.admin = pmos_web::admin_config::AdminConfig::from_env(&config.content_root)
         .map_err(anyhow::Error::msg)?;
-    match &deps.admin.github {
-        Some(g) => {
-            tracing::info!(repo = %g.repo, base = ?g.base, "admin proposals open pull requests")
-        }
-        None => tracing::info!("no PMOS_WEB_GITHUB_REPO: admin proposals answer not_configured"),
-    }
+    tracing::info!(
+        content_dir = deps.admin.layout.content_dir(),
+        policies_dir = deps.admin.layout.policies_dir(),
+        "admin proposals go to the tool server"
+    );
     if deps.admin.policies_root.is_none() {
         tracing::info!("no policies root: the policy screen can't compare with checked-in files");
     }

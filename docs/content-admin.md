@@ -3,10 +3,11 @@
 The web app's screens for the harness's content layer (scope item e): the roles, bots, skills,
 playbooks, context library, templates, reviewer rubrics and master context the harness worker
 loads, with their lint status; one file's text; a proposed change validated with the content
-lint; and the change opened as a GitHub pull request. Plus a read-only view of what the running
-harness uses. The API is `docs/web-api.md`, **Admin: content and harness**; the code is
-`crates/web/src/app/content.rs` and `crates/web/src/content_admin.rs`, sharing the proposal
-machinery with the Policy Admin (`docs/policy-admin.md`).
+lint; and the change opened as a GitHub pull request, by the tool server, with the admin's own
+linked GitHub account. Plus a read-only view of what the running harness uses. The API is
+`docs/web-api.md`, **Admin: content and harness**; the code is `crates/web/src/app/content.rs`
+and `crates/web/src/content_admin.rs`, sharing the proposal machinery with the Policy Admin
+(`docs/policy-admin.md`; `crates/policy/src/admin/`, `crates/toolserver/src/proposals.rs`).
 
 ## What it shows
 
@@ -41,9 +42,16 @@ Errors are every error in the changed tree (a deleted skill also breaks the role
 Warnings are those on a changed file and any that are new, so the content's existing warnings
 elsewhere don't drown the change. A parser's line number is given when it has one.
 
+Validating is for admins only: a validation's diff shows the current text of every file it
+names, so an auditor validating a change to (or the deletion of) a restricted file would read
+it.
+
 A proposal is opened as described in `docs/policy-admin.md`, **How a proposal is opened**, with
-kind `content`: audit action `admin.content_proposal`, branch `pmos/proposal/content/…`, labels
-`pmos-proposal` and `pmos-proposal:content`.
+kind `content`: the tool server checks it again (paths, caps, its own copy, the lint, the
+regenerated policies), opens it as the admin, and records `admin.content_proposal`; branch
+`pmos/proposal/content/…`, labels `pmos-proposal` and `pmos-proposal:content`. The same branch
+protection is a deployment requirement (`docs/policy-admin.md`, **Nobody approves their own
+change**).
 
 ### Safety
 
@@ -51,27 +59,47 @@ kind `content`: audit action `admin.content_proposal`, branch `pmos/proposal/con
   digits, `.`, `_` and `-`, no `..`, no empty or hidden components, at most 200 bytes and 8 deep.
   Each component on disk is checked with `symlink_metadata` and any symlink is refused, and the
   resolved path must be inside the resolved content root. Never `policies/` (the server
-  regenerates those itself), `deploy/`, `.github/`, code, or anything outside.
+  regenerates those itself), `deploy/`, `.github/`, code, or anything outside. The tool server
+  applies the same allow-list again before it opens anything, and neither server accepts the
+  repository root as the content folder.
 - **Files:** text only: `.md`, `.yaml`, `.yml`, `.txt`, valid UTF-8 (JSON strings always are),
   no NUL, at most 256 KiB. `content/team.yaml` can't be changed here: members and roles are
   managed through onboarding and `team.yaml`'s own review.
 - **Requests:** at most 50 files per proposal and 16 MiB per request; the title (120 characters)
   and reason (4,000) are cleaned of control characters; branch names are made by the server;
   every `POST` needs the session and its CSRF token, like every other.
-- **Audit:** every proposal is recorded at the tool server before anything is written to GitHub
-  (who, which paths as a count, the pull request), never file text; refusals by role are recorded
-  as `denied`. pmos-web's own log has the handle, kind, file count and pull request number,
-  never the token or file text.
+- **Audit** (all at the tool server, never file text):
+  - every proposal, before anything is written to GitHub (`started`, then `ok` with the pull
+    request or `error`; the paths as a count);
+  - every refusal, as `denied` with a fixed note: a role refusal on any admin content route
+    (`admin.content_read`, `admin.content_file`, `admin.content_validate`,
+    `admin.content_proposals`, `admin.content_proposal`, `admin.harness`; note `role`), a
+    proposal `pmos-web` refused (`invalid`, `stale base`, with how many files), and the tool
+    server's own refusals (`invalid`, `stale base`, `policy mismatch`, `rate limited`,
+    `github not linked`, `not configured`);
+  - an **admin reading a PM's personal master file or restricted context**, through the file
+    route or by naming it in a validation or proposal (whose diff shows its text):
+    `admin.content_sensitive_read`, outcome `ok`, note `personal file` or `restricted context`.
+    It is recorded **before** the text is served; if it can't be, nothing is served (`502
+    audit_unavailable`). The target is `content:personal:<handle>` for a personal file (whose
+    it is matters to an auditor, and handles aren't secret); a restricted file's path is never
+    recorded, since a file name can itself be sensitive (`Q3-acquisition-of-x.md`): only that
+    one was read, and when, by whom.
+  pmos-web's own log has the handle, kind, file count and pull request number, never a token or
+  file text.
 - **Auditors** read everything in the tree except a PM's own master file
   (`master/people/<handle>/AGENTS.md`) and context marked `sensitivity: restricted`, which they
-  see listed but can't open. They never propose.
+  see listed but can't open, and whose lint messages they see replaced by "A finding on a file
+  your role can't open." (a parser's message can quote the file). They never validate or
+  propose. The same read rule (`pmos_policy::admin::access`) is applied to every path a
+  validation or proposal names, whoever asks.
 
 ## Who may do what
 
 | Permission | Roles | Allows |
 | --- | --- | --- |
-| `view-content` | admin, auditor | the tree, a file (with the auditor limit above), validate, list proposals, the harness view |
-| `edit-content` | admin | open a proposal |
+| `view-content` | admin, auditor | the tree, a file (with the auditor limit above), list proposals, the harness view |
+| `edit-content` | admin | validate, open a proposal |
 
 `edit-bots-and-skills` (admins and skill authors) is unchanged and not used here: a skill
 author still changes skills through their own pull requests, and only an admin proposes from the
@@ -79,11 +107,14 @@ web app.
 
 ## Configuration
 
-As in `docs/policy-admin.md` (`PMOS_CONTENT_ROOT`, `PMOS_WEB_GITHUB_*`,
-`PMOS_WEB_CONTENT_REVISION`, `PMOS_WEB_PROPOSALS_PER_HOUR`, and `PMOS_WEB_POLICIES_ROOT` for the
-policy files a content change regenerates), plus `PMOS_WEB_GATEWAY_CONFIG` (the gateway's model
-config, `deploy/gateway.yaml` in the deploy kit) for the harness view. The GitHub token needs
-the same least privilege: contents and pull requests write on the one repository, nothing else.
+As in `docs/policy-admin.md`, **Configuration**: for `pmos-web` `PMOS_CONTENT_ROOT`,
+`PMOS_WEB_CONTENT_DIR`, `PMOS_WEB_POLICIES_DIR`, `PMOS_WEB_CONTENT_REVISION` and
+`PMOS_WEB_POLICIES_ROOT` (the policy files a content change regenerates), plus
+`PMOS_WEB_GATEWAY_CONFIG` (the gateway's model config, `deploy/gateway.yaml` in the deploy kit)
+for the harness view; `pmos-web` holds no GitHub token, and the old `PMOS_WEB_GITHUB_*` settings
+refuse start-up. The tool server opens proposals with each admin's linked GitHub account (the
+GitHub App's contents and pull requests write), `PMOS_CONTENT_REPO`, `PMOS_CONTENT_BRANCH`,
+`PMOS_PROPOSALS` and `PMOS_PROPOSALS_PER_HOUR`.
 
 ## What it is not
 
@@ -93,5 +124,5 @@ the same least privilege: contents and pull requests write on the one repository
 - **Not built:** an in-app editor beyond whole-file text (the front end sends whole files);
   renaming (a delete and an add); binary files; changing `team.yaml`; worker health and the
   workers' loaded revision (nothing exposes them to `pmos-web`); review status and CI results of
-  a proposal (link to the pull request); updating or closing a proposal from the app; a shared
-  rate limit across `pmos-web` processes.
+  a proposal (link to the pull request); updating or closing a proposal from the app; a
+  persisted rate limit (the tool server's is in memory).

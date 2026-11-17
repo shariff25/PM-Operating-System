@@ -382,13 +382,22 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `409` | `no_suggestion` | Accepting a suggestion that isn't ready. | Yes |
 | `409` | `not_practice` | Deleting a draft that isn't the practice draft. | Yes |
 | `409` | `task_refused` | The runtime won't take the PM's task (not onboarded, no bot). | Yes |
+| `409` | `github_not_linked` | An admin proposal: the admin hasn't linked GitHub in PM OS. Pull requests are opened as them; `error` says how to link. | Yes |
+| `409` | `stale_base` | An admin proposal or validation made from a copy that differs from the server's or the default branch's (**Admin: policy**). | Yes |
+| `422` | `invalid` | An admin proposal that doesn't pass validation (`errors`, `warnings`). | Yes |
+| `422` | `policy_mismatch` | An admin proposal: the tool server regenerates different policy files from it (`paths`). | Yes |
+| `429` | `rate_limited` | Too many admin proposals this hour; `Retry-After`. | Yes |
+| `501` | `not_configured` | Admin proposals are off at the tool server. | Yes |
+| `502` | `audit_unavailable` | The audit log couldn't record an admin proposal, or an admin's read of a personal or restricted file, so it wasn't done or shown. | Yes |
+| `502` | `github_refused`, `github_unavailable` | GitHub refused the admin's account, or didn't take the proposal. | Yes |
+| `503` | `github_rate_limited` | GitHub's own rate limit. | Yes |
 | `413` | (no body) | The producer route's body is over 128 KiB. | Yes |
 | `415` | `bad_content_type` | A write with a body that isn't JSON. | Yes |
 | `422` | `bad_edit` | The edited text isn't valid for where the draft goes. | Yes |
 | `422` | `bad_brief` | The producer route's body failed a check. | Yes |
 | `501` | `not_built` | The daily brief is off on this server. | Yes |
 | `502` | `upstream_unavailable` | The runtime or tool server couldn't be reached, refused, or answered something unreadable. On a decision, only when the request never reached the tool server, or it refused it. | Yes on a decision; for a task (`POST /api/tasks`), the task may have been made: reload the list |
-| `502` | `unknown_outcome` | A decision was sent, but the answer was lost (the connection dropped, or the tool server failed with a `5xx`), and reading the draft again didn't show it decided. | **Unknown** |
+| `502` | `unknown_outcome` | A decision was sent, but the answer was lost (the connection dropped, or the tool server failed with a `5xx`), and reading the draft again didn't show it decided. Also an admin proposal whose answer was lost: reload the proposals list. | **Unknown** |
 | `504` | `unknown_outcome` | The same, when the tool server didn't answer in time (10 seconds). | **Unknown** |
 | `503` | `audience_unavailable` | Slack couldn't say who is in the channel. | Yes |
 | `503` | `unavailable` | `pmos-web`'s own store, or the tool server's, is down. | Yes |
@@ -605,19 +614,47 @@ tasks, with no team-wide read, so `pmos-web` can't count them.
 
 The Policy Admin for the NVIDIA OpenShell sandbox every bot runs in (`docs/policy-admin.md`
 says what it does and how it's set up). **Read-and-propose:** nothing here writes a file. A
-change is opened as a GitHub pull request; a person reviews and merges it in GitHub.
+change is opened as a GitHub pull request **by the tool server, with the admin's own linked
+GitHub account** (so the admin is its author and GitHub refuses their own approval); another
+person reviews and merges it in GitHub. `pmos-web` holds no GitHub token.
 
 | Route | `admin` | `auditor` | anyone else |
 | --- | --- | --- | --- |
 | `GET /api/admin/policy` | yes | yes | `403 forbidden` |
-| `POST /api/admin/policy/validate` | yes | yes | `403 forbidden` |
+| `POST /api/admin/policy/validate` | yes | `403 forbidden` | `403 forbidden` |
 | `GET /api/admin/policy/proposals` | yes | yes | `403 forbidden` |
 | `POST /api/admin/policy/proposals` | yes | `403 forbidden` | `403 forbidden` |
 
-Reading and validating need `view-policies`; proposing needs `edit-policies`. Signed out is
-`401 signed_out`; every `POST` needs the CSRF token (`403 bad_csrf`) and JSON
-(`415 bad_content_type`), as everywhere. The role check comes before anything else, so an
-auditor proposing gets `403`, never `501`.
+Reading needs `view-policies`; validating and proposing need `edit-policies` (a validation's
+diffs show the current text of the files it changes). Every `403 forbidden` on these routes is
+recorded in the audit log. Signed out is `401 signed_out`; every `POST` needs the CSRF token
+(`403 bad_csrf`) and JSON (`415 bad_content_type`), as everywhere. The role check comes before
+anything else, so an auditor proposing gets `403`, never `501`.
+
+**Changed on 2026-11-17** (security gate findings A1 to A4, A6), for the front end:
+
+- `POST /api/admin/policy/validate` and `POST /api/admin/content/validate` are **admins only**
+  now: an auditor gets `403 forbidden`. Hide the validate controls for viewers without
+  `edit-policies` / `edit-content` in `GET /api/me`'s `permissions`.
+- `GET /api/admin/policy` and `GET /api/admin/content` have a new field `protection`
+  (below); warn when it isn't `verified` or `required_reviews` is `0`.
+- `proposals_configured` now means "the tool server has proposals on" (it was "pmos-web has a
+  GitHub token").
+- The proposal routes' `201` has a new field `author` (the admin's GitHub login). New error
+  codes: `409 github_not_linked`, `422 policy_mismatch`, `502 unknown_outcome`, and
+  `502 upstream_unavailable` when the tool server can't be reached; `501 not_configured` and
+  `429 rate_limited` now come from the tool server (same shapes).
+- The proposals lists have new fields `github` (`"linked"` or `"not_linked"`) and `message`;
+  without a linked account they answer `200` with an empty list, not an error. `author` is
+  now the admin's own login.
+- `GET /api/admin/content/file` and the content validate and proposal routes can answer
+  `502 audit_unavailable` for an admin's read of a PM's personal master file or restricted
+  context: such a read is recorded before the text is served.
+- In `GET /api/admin/content` (and `generate_errors` in `GET /api/admin/policy`), an
+  auditor sees findings on files they can't open with the message replaced by "A finding on a
+  file your role can't open." (`code`, `path` and `line` stay).
+- Removed server settings: `PMOS_WEB_GITHUB_*` and `PMOS_WEB_PROPOSALS_PER_HOUR`
+  (`docs/policy-admin.md`, **Configuration**).
 
 **What the server shows is its deployed revision.** The spec, the files and every validation
 are computed from the content tree `pmos-web` is running with (`PMOS_CONTENT_ROOT`) and the
@@ -724,7 +761,8 @@ workspace, the non-root identity and Landlock. They change only with code
     "checked_in": "…"}],
  "drift": {"checked_in_available": true, "in_sync": true, "violations": []},
  "generate_errors": [],
- "proposals_configured": true}
+ "proposals_configured": true,
+ "protection": {"branch": "main", "required_reviews": 1, "verified": true, "github": "linked"}}
 ```
 
 (Shortened where `…` appears; the real answer lists every item, every runtime route and every
@@ -748,8 +786,13 @@ summary line.)
 | `drift.checked_in_available` | boolean | Whether the server has a policies root to compare with. |
 | `drift.in_sync` | boolean or `null` | Every file `same` and no rule broken. `null` without a policies root. |
 | `drift.violations[]` | `Issue[]` | Every PM OS rule a checked-in file breaks (`pmos policy check`'s rules: `net-egress`, `net-tools`, `fs-writable`, `cred-binding`, `proc-identity`, …), at its path. |
-| `generate_errors[]` | `Issue[]` | Content lint errors that stop generation (then `bots` is empty). |
-| `proposals_configured` | boolean | Whether GitHub is set up. When `false`, hide the propose button: proposals answer `501`. |
+| `generate_errors[]` | `Issue[]` | Content lint errors that stop generation (then `bots` is empty). For an auditor, a finding on a PM's personal master file or restricted context has the message "A finding on a file your role can't open." |
+| `proposals_configured` | boolean | Whether the tool server has proposals on (the GitHub App and the content repository). When `false`, hide the propose button: proposals answer `501`. `false` also when the tool server didn't answer. |
+| `protection` | object | Whether the default branch makes GitHub require someone else's review, as the tool server could read it with **this viewer's** GitHub account. Best effort: never an error, never blocks a proposal. |
+| `protection.branch` | string or `null` | The branch proposals target (`null` when proposals are off). |
+| `protection.required_reviews` | integer or `null` | Approving reviews the branch requires; `0`: none (warn: the author could merge without anyone's review). `null`: unknown. |
+| `protection.verified` | boolean | `true` when it could be read (classic branch protection, or a ruleset that requires reviews). `false`: unknown (warn that it couldn't be checked; the admin's GitHub account may lack the read permission, or isn't linked). |
+| `protection.github` | `"linked"`, `"not_linked"`, `"unavailable"` or `null` | Whether this viewer has linked GitHub (`null` when proposals are off or the tool server didn't answer). |
 
 **Allowances** (one object per bot):
 
@@ -875,11 +918,12 @@ Admins only. Request: `{"spec": SpecPatch, "title": "…", "reason": "…"}`.
   dropped; at most 4,000 characters kept. Required. It goes into the pull request body in a
   fenced block, so it can't format the page or mention anyone.
 
-It validates again, then opens the pull request (`docs/policy-admin.md`, How a proposal is
+It validates again and sends the change to the tool server, which checks it again and opens the
+pull request with the admin's own GitHub account (`docs/policy-admin.md`, How a proposal is
 opened). `201`:
 
 ```json
-{"number": 42, "url": "https://github.com/acme/pmos/pull/42",
+{"number": 42, "url": "https://github.com/acme/pmos/pull/42", "author": "adam-gh",
  "branch": "pmos/proposal/policy/adam-20261117-101509-d2aabc50",
  "base": {"branch": "main", "commit": "1111111111111111111111111111111111111111"},
  "files": ["content/skills/docs/SKILL.md", "policies/bots/docs.yaml"],
@@ -894,6 +938,7 @@ opened). `201`:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `number`, `url` | integer, string | The pull request. Link to it: review and merge happen there. |
+| `author` | string or `null` | The GitHub login that opened it: the admin's own. Someone else must approve it. |
 | `branch` | string | Made by the server: `pmos/proposal/<kind>/<handle>-<yyyymmdd-hhmmss>-<random>`. |
 | `base.branch`, `base.commit` | strings | What it was made on. |
 | `files` | string[] | Every file the commit writes: the content files, then the regenerated policy files. |
@@ -907,39 +952,51 @@ Errors, besides those above:
 | --- | --- |
 | `400 bad_request` | The body doesn't parse, or the title or reason is empty after cleaning. |
 | `400 no_change` | The spec changes nothing. |
-| `422 invalid` | Validation found errors. The body also has `errors` and `warnings` (`Issue[]`). Nothing was sent anywhere. |
-| `409 stale_base` | A file the pull request would write differs on the base branch from the server's copy. The body also has `paths` (string[]) and `base` (`{branch, commit}`). Nothing was written or recorded. Wait for the deployment to catch up, or make the change in GitHub. |
-| `429 rate_limited` | Over this admin's proposals per hour (default 10). `Retry-After` gives the seconds. |
-| `501 not_configured` | GitHub isn't set up on this server. |
+| `422 invalid` | Validation found errors (here, or in the tool server's own re-check). The body also has `errors` and `warnings` (`Issue[]`). Nothing was written; the refusal is recorded. |
+| `409 github_not_linked` | The admin hasn't linked GitHub in PM OS. `error` says how (in Slack: the PM OS app's Home tab, **Accounts**). Show it as a call to action, not a failure. Nothing was written. |
+| `409 stale_base` | A file the pull request would write differs on the base branch (or in the tool server's copy) from the copy this change was made from. The body also has `paths` (string[]) and, when it was the base branch, `base` (`{branch, commit}`). Nothing was written; the refusal is recorded. Wait for the deployment to catch up, or make the change in GitHub. |
+| `422 policy_mismatch` | The tool server regenerates different policy files from the change (`paths`): the web app and the tool server run different content or code. Nothing was written. |
+| `429 rate_limited` | Over this admin's proposals per hour (the tool server's `PMOS_PROPOSALS_PER_HOUR`, default 10). `Retry-After` gives the seconds. |
+| `501 not_configured` | Proposals are off at the tool server. |
 | `502 audit_unavailable` | The tool server couldn't record the proposal, so nothing was written to GitHub. |
-| `502 github_refused` | GitHub refused the token (it needs contents and pull requests write on the repository). |
-| `502 github_unavailable` | GitHub didn't answer, couldn't find the repository or base branch, or refused the request (for example, the branch already exists). |
+| `502 github_refused` | GitHub refused the admin's account for the repository (it needs write access: contents and pull requests). |
+| `502 github_unavailable` | GitHub didn't answer, couldn't find the repository or base branch, or refused the request. |
+| `502 unknown_outcome` | Sent, but the answer was lost: reload the proposals list. |
+| `502 upstream_unavailable` | The tool server couldn't be reached or answered something else. Nothing was written if it wasn't reached. |
 | `503 github_rate_limited` | GitHub's own rate limit. |
+
+Every error's `error` is `pmos-web`'s own sentence, never the tool server's or GitHub's.
 
 ### `GET /api/admin/policy/proposals`
 
 Open pull requests this feature made for policy: a branch under `pmos/proposal/policy/` or the
-label `pmos-proposal:policy`. Read from GitHub on each request (the newest 300 open pull
-requests). `501 not_configured` without GitHub.
+label `pmos-proposal:policy`. Read from GitHub by the tool server with **the viewer's own linked
+GitHub account** on each request (the newest 300 open pull requests). `501 not_configured` when
+proposals are off. A viewer who hasn't linked GitHub gets `200` with an empty list,
+`github: "not_linked"` and a `message` to show as the empty state (not an error page).
 
 ```json
 {"repo": "acme/pmos",
+ "github": "linked",
+ "message": null,
  "proposals": [
    {"number": 42, "url": "https://github.com/acme/pmos/pull/42",
     "title": "PM OS policy: Let the Docs bot search Jira",
     "branch": "pmos/proposal/policy/adam-20261117-101509-d2aabc50", "base": "main",
     "status": "open", "proposed_by": "adam",
-    "base_commit": "1111111111111111111111111111111111111111", "author": "pmos-bot",
+    "base_commit": "1111111111111111111111111111111111111111", "author": "adam-gh",
     "labels": ["pmos-proposal", "pmos-proposal:policy"],
     "created_at": "2026-11-17T10:00:00Z", "updated_at": "2026-11-17T10:00:00Z"}]}
 ```
 
 | Field | Type | Meaning |
 | --- | --- | --- |
+| `github` | `"linked"` or `"not_linked"` | Whether the viewer's GitHub account was used. `not_linked`: `proposals` is empty and `message` says how to link. |
+| `message` | string or `null` | The empty state's sentence when `not_linked`. |
 | `status` | `"open"` or `"draft"` | Only open pull requests are listed; merged and closed ones are in GitHub. Review state and checks are not read: link to the pull request. |
 | `proposed_by` | string or `null` | The PM OS handle, read from the marker on the pull request body's first line; `null` if the body was edited. It is what the body says, not a verified fact: the audit log has the verified record. |
 | `base_commit` | string or `null` | The base it was made on, from the same marker. |
-| `author` | string or `null` | The GitHub login that opened it: the PM OS token's identity, not the admin. |
+| `author` | string or `null` | The GitHub login that opened it: the proposing admin's own account (pull requests opened before 2026-11-17 show the old shared token's identity). |
 | `created_at`, `updated_at` | string or `null` | As GitHub gives them. |
 
 ## Admin: content and harness
@@ -951,13 +1008,18 @@ read-and-propose rules and deployed-revision caveat as **Admin: policy**.
 | Route | `admin` | `auditor` | anyone else |
 | --- | --- | --- | --- |
 | `GET /api/admin/content` | yes | yes | `403 forbidden` |
-| `GET /api/admin/content/file?path=` | yes | yes, but not a PM's own master file or `restricted` context (`403 forbidden`) | `403 forbidden` |
-| `POST /api/admin/content/validate` | yes | yes | `403 forbidden` |
+| `GET /api/admin/content/file?path=` | yes (a PM's own master file or `restricted` context is recorded first) | yes, but not a PM's own master file or `restricted` context (`403 forbidden`) | `403 forbidden` |
+| `POST /api/admin/content/validate` | yes | `403 forbidden` | `403 forbidden` |
 | `GET /api/admin/content/proposals` | yes | yes | `403 forbidden` |
 | `POST /api/admin/content/proposals` | yes | `403 forbidden` | `403 forbidden` |
 | `GET /api/admin/harness` | yes | yes | `403 forbidden` |
 
-Reading and validating need `view-content`; proposing needs `edit-content`.
+Reading needs `view-content`; validating and proposing need `edit-content`. Every
+`403 forbidden` is recorded in the audit log. **Sensitive files:** every path named in a file
+read, a validation or a proposal goes through one read rule: a PM's own master file
+(`master/people/<handle>/AGENTS.md`) and context with `sensitivity: restricted` are for admins
+only, and an admin's read of one is recorded in the audit log **before** its text is served;
+if it can't be recorded, the answer is `502 audit_unavailable` and nothing is shown.
 
 **Paths** are repository paths inside the content tree, such as `content/skills/docs/SKILL.md`.
 A path is relative, `/`-separated, made of letters, digits, `.`, `_` and `-`, with no empty,
@@ -992,7 +1054,8 @@ lists one.
    {"name": "docs", "version": "0.1.0", "owner": "TODO", "model": "extraction",
     "data_class": "public", "tools": ["docs.search", "docs.read"], "used_by": ["docs-helper"]}],
  "bots": [{"name": "docs", "role": "docs-helper", "scope": "team", "owner": "TODO"}],
- "proposals_configured": true}
+ "proposals_configured": true,
+ "protection": {"branch": "main", "required_reviews": 1, "verified": true, "github": "linked"}}
 ```
 
 | Field | Type | Meaning |
@@ -1006,11 +1069,11 @@ lists one.
 | `files[].size` | integer | Bytes. |
 | `files[].editable` | boolean | Whether a proposal may change it: text (`.md`, `.yaml`, `.yml`, `.txt`) and not `team.yaml` (members are managed through onboarding). |
 | `files[].readable` | boolean | Whether this viewer may open it (`GET …/file`). An auditor sees personal master files and `restricted` context listed, not opened. |
-| `files[].lint` | object | `status` (`ok`, `warning` or `error`), counts, and that file's `Issue[]`. |
+| `files[].lint` | object | `status` (`ok`, `warning` or `error`), counts, and that file's `Issue[]`. When `readable` is `false`, each issue's `message` is "A finding on a file your role can't open." (a parser's message can quote the file). |
 | `roles[]` | array | Each role: its skills, model role, data class, and the bots made from it. |
 | `skills[]` | array | Each skill: its tools and `used_by` (the roles that list it). A skill that doesn't lint isn't here (its file shows the error). |
 | `bots[]` | array | Each bot: role, scope, owner. |
-| `proposals_configured` | boolean | As in **Admin: policy**. |
+| `proposals_configured`, `protection` | | As in **Admin: policy**. |
 
 ### `GET /api/admin/content/file?path=content/…`
 
@@ -1032,7 +1095,8 @@ lists one.
 | `front_matter_error` | string or `null` | Why it's `null` for a `.md` file. |
 
 Errors: `400 bad_path`, `400 path_not_allowed`, `400 not_a_file` (a folder), `404 not_found`,
-`403 forbidden` (an auditor and a personal or restricted file).
+`403 forbidden` (an auditor and a personal or restricted file), `502 audit_unavailable` (an
+admin's read of a personal or restricted file couldn't be recorded, so it isn't shown).
 
 ### `POST /api/admin/content/validate`
 
@@ -1081,27 +1145,29 @@ Refusals, before anything is linted:
 | `400 not_text` | Not `.md`, `.yaml`, `.yml` or `.txt`, or text with a NUL byte. |
 | `400 not_found` | Deleting a file that doesn't exist. |
 | `400 no_change` | No changes, or every change equals the deployed file. |
-| `409 stale_base` | A `base_sha256` doesn't match the server's copy now. |
+| `409 stale_base` | A `base_sha256` doesn't match the server's copy now (recorded). |
 | `413 too_large` | A file over 256 KiB. |
 | `413 too_many_files` | More than 50 changes. |
+| `502 audit_unavailable` | A change names a PM's personal master file or restricted context, and the admin's read of it couldn't be recorded. |
 
 The whole request may be up to 16 MiB.
 
 ### `POST /api/admin/content/proposals`
 
 Admins only. Request: `{"changes": [Change], "title": "…", "reason": "…"}` (title and reason as
-in **Admin: policy**). Validates again and opens a pull request with the changed content files
-and any regenerated policy files. The `201` answer and the errors are those of
+in **Admin: policy**). Validates again and sends the changed content files and any regenerated
+policy files to the tool server, which checks them again and opens the pull request with the
+admin's own GitHub account. The `201` answer and the errors are those of
 `POST /api/admin/policy/proposals`, for kind `content`: the branch is
 `pmos/proposal/content/…`, the labels `pmos-proposal` and `pmos-proposal:content`, the title
-`PM OS content: <title>`. A `409 stale_base` comes from either check: the admin's
-`base_sha256` against the server's copy (message only), or the server's copy against the base
-branch (with `paths` and `base`).
+`PM OS content: <title>`. A `409 stale_base` comes from any of three checks: the admin's
+`base_sha256` against this server's copy (message only), this server's copy against the tool
+server's (`paths`), or against the base branch (`paths` and `base`).
 
 ### `GET /api/admin/content/proposals`
 
-As `GET /api/admin/policy/proposals`, for branches under `pmos/proposal/content/` or the label
-`pmos-proposal:content`.
+As `GET /api/admin/policy/proposals` (with `github` and `message`), for branches under
+`pmos/proposal/content/` or the label `pmos-proposal:content`.
 
 ### `GET /api/admin/harness`
 

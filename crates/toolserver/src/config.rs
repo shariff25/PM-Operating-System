@@ -66,7 +66,24 @@ pub struct GitHubConfig {
     /// `PMOS_POLICIES_DIR`: where the sandbox policies sit in that repo, from its root.
     /// Default `policies`. A new member's two policy files are committed under it.
     pub policies_dir: String,
+    /// Admin policy and content proposals (`docs/policy-admin.md`): on by default with
+    /// `PMOS_CONTENT_REPO`; `PMOS_PROPOSALS=off` turns them off. `None` when off.
+    pub proposals: Option<ProposalsConfig>,
 }
+
+/// Admin proposals: the tool server opens each as a pull request with the acting admin's own
+/// linked GitHub account, after checking it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalsConfig {
+    /// `PMOS_PROPOSALS_PER_HOUR`, default 10, 1 to 100: per admin, in memory.
+    pub per_hour: u32,
+    /// `PMOS_POLICIES_ROOT`: the checked-in policy files in the local checkout. Default: the
+    /// policies directory of the checkout `PMOS_CONTENT_ROOT` is in, when it exists.
+    pub policies_root: Option<std::path::PathBuf>,
+}
+
+/// The proposals one admin may open per hour, by default.
+pub const DEFAULT_PROPOSALS_PER_HOUR: u32 = 10;
 
 /// A folder in the content repo, from its root: `.` or empty for the root itself.
 fn repo_dir(var: &str, value: &str) -> Result<String, String> {
@@ -378,6 +395,43 @@ fn github_config(
         "PMOS_POLICIES_DIR",
         &get("PMOS_POLICIES_DIR").unwrap_or_else(|| "policies".into()),
     )?;
+    let proposals_on = match set("PMOS_PROPOSALS").as_deref() {
+        None => content_repo.is_some(),
+        Some("on") => true,
+        Some("off") => false,
+        Some(other) => {
+            return Err(format!(
+                "PMOS_PROPOSALS must be `on` or `off`, not `{other}`"
+            ))
+        }
+    };
+    let proposals = if proposals_on {
+        if content_repo.is_none() {
+            return Err("PMOS_PROPOSALS=on needs PMOS_CONTENT_REPO".into());
+        }
+        // Never the repository root (A6): a proposal could then write anywhere in it.
+        pmos_policy::admin::changeset::Layout::new(&content_dir, &policies_dir).map_err(|why| {
+            format!(
+                "PMOS_CONTENT_DIR, PMOS_POLICIES_DIR: {why}. Admin proposals need both as \
+                     separate folders; set PMOS_PROPOSALS=off to keep this layout for \
+                     onboarding only"
+            )
+        })?;
+        let per_hour = match set("PMOS_PROPOSALS_PER_HOUR") {
+            None => DEFAULT_PROPOSALS_PER_HOUR,
+            Some(v) => v
+                .parse::<u32>()
+                .ok()
+                .filter(|n| (1..=100).contains(n))
+                .ok_or("PMOS_PROPOSALS_PER_HOUR must be a whole number from 1 to 100")?,
+        };
+        Some(ProposalsConfig {
+            per_hour,
+            policies_root: set("PMOS_POLICIES_ROOT").map(std::path::PathBuf::from),
+        })
+    } else {
+        None
+    };
     Ok(GitHubConfig {
         app: AppCredentials {
             client_id,
@@ -389,6 +443,7 @@ fn github_config(
         content_branch,
         content_dir,
         policies_dir,
+        proposals,
     })
 }
 
@@ -777,6 +832,8 @@ mod tests {
             &[
                 ("PMOS_CONTENT_REPO", "Example-Org/pm-os"),
                 ("PMOS_CONTENT_DIR", "./"),
+                // A content repo whose root is the content: onboarding only (A6).
+                ("PMOS_PROPOSALS", "off"),
                 ("PMOS_MEMORY", "github"),
                 ("PMOS_CONTENT_SYNC_SECS", "0"),
                 ("PMOS_GITHUB_URL", "http://127.0.0.1:9"),
@@ -791,6 +848,7 @@ mod tests {
         let gh = live.github.as_ref().unwrap();
         assert_eq!(gh.content_repo.as_deref(), Some("Example-Org/pm-os"));
         assert_eq!(gh.content_dir, "", "`./` is the repo root");
+        assert!(gh.proposals.is_none());
         assert_eq!(live.endpoints.github_api, "http://127.0.0.1:9");
 
         let refused = |extra: &[(&str, &str)], needle: &str| {
@@ -850,6 +908,61 @@ mod tests {
         assert!(cfg(&with(&fake, &[("PMOS_MEMORY", "github")]))
             .unwrap_err()
             .contains("PMOS_MEMORY=github needs"));
+    }
+
+    #[test]
+    fn proposals_never_make_the_repository_root_writable() {
+        let key = KeyRing::generate_spec("k1");
+        let base = live_base(&key);
+        let app = [
+            ("PMOS_GITHUB_CLIENT_ID", "Iv1.gh"),
+            ("PMOS_GITHUB_CLIENT_SECRET", "gh-secret"),
+            ("PMOS_GITHUB_ORG", "example-org"),
+        ];
+        let gh = |extra: &[(&str, &str)]| {
+            cfg(&with(&with(&base, &app), extra)).map(|c| match c.connectors {
+                Connectors::Live(live) => live.github.unwrap(),
+                _ => panic!("expected live"),
+            })
+        };
+        // On by default with a content repo, off without one.
+        let on = gh(&[("PMOS_CONTENT_REPO", "example-org/pm-os")]).unwrap();
+        let p = on.proposals.unwrap();
+        assert_eq!(p.per_hour, DEFAULT_PROPOSALS_PER_HOUR);
+        assert!(p.policies_root.is_none());
+        assert!(gh(&[]).unwrap().proposals.is_none());
+        assert!(gh(&[("PMOS_PROPOSALS", "on")])
+            .unwrap_err()
+            .contains("needs PMOS_CONTENT_REPO"));
+        // The repository root as the content or policies folder: refused at start-up.
+        for (k, v) in [
+            ("PMOS_CONTENT_DIR", ""),
+            ("PMOS_CONTENT_DIR", "./"),
+            ("PMOS_CONTENT_DIR", "/"),
+            ("PMOS_POLICIES_DIR", ""),
+            ("PMOS_POLICIES_DIR", "content/policies"),
+        ] {
+            let err = gh(&[("PMOS_CONTENT_REPO", "example-org/pm-os"), (k, v)]).unwrap_err();
+            assert!(err.contains("PMOS_PROPOSALS=off"), "{k}={v:?}: {err}");
+        }
+        // ... unless proposals are off.
+        assert!(gh(&[
+            ("PMOS_CONTENT_REPO", "example-org/pm-os"),
+            ("PMOS_CONTENT_DIR", ""),
+            ("PMOS_PROPOSALS", "off"),
+        ])
+        .unwrap()
+        .proposals
+        .is_none());
+        for bad in ["0", "101", "x"] {
+            assert!(gh(&[
+                ("PMOS_CONTENT_REPO", "example-org/pm-os"),
+                ("PMOS_PROPOSALS_PER_HOUR", bad)
+            ])
+            .unwrap_err()
+            .contains("PMOS_PROPOSALS_PER_HOUR"));
+        }
+        assert!(gh(&[("PMOS_PROPOSALS", "maybe")]).is_err());
     }
 
     #[test]
