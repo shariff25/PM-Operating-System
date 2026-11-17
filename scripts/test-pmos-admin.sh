@@ -161,6 +161,56 @@ run_stack restore "$WORK/backup" </dev/null >/dev/null 2>&1 || code=$?
 [ "$code" = 2 ] || fail "restore with PMOS_ASSERTION_MODE=off exits $code, not 2"
 [ ! -s "$DOCKER_LOG" ] || fail "a refused restore called docker"
 
+# --- users: thin wrappers over `pmos-toolserver users …` (docs/runbooks/users.md) ----------
+# Without a database: the arguments the wrapper checks, the OS user it passes as
+# PMOS_HOST_USER (refused before docker when it can't be recorded), the import file's
+# read-only mount. The tool server's own refusals are tested in crates/toolserver.
+stack_env require
+for args in "" "drop-table" "import --apply" "import --from"; do
+  code=0
+  # shellcheck disable=SC2086
+  run_stack users $args </dev/null >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "users $args exits $code, not 2"
+done
+code=0
+run_stack users import --from "$WORK/missing.yaml" </dev/null >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "users import of a missing file exits $code, not 2"
+[ ! -s "$DOCKER_LOG" ] || fail "a refused users command called docker: $(cat "$DOCKER_LOG")"
+# The OS user who ran it: SUDO_USER first, else id -un.
+me=$(id -un)
+run_stack users list </dev/null >/dev/null
+grep -qF -- "run --rm --no-deps -e PMOS_HOST_USER=$me -T toolserver pmos-toolserver users list" "$DOCKER_LOG" ||
+  fail "users list didn't pass PMOS_HOST_USER=$me: $(cat "$DOCKER_LOG")"
+: >"$DOCKER_LOG"
+SUDO_USER=alice run_stack users deactivate ana </dev/null >/dev/null
+grep -qF -- "-e PMOS_HOST_USER=alice -T toolserver pmos-toolserver users deactivate ana" "$DOCKER_LOG" ||
+  fail "users deactivate didn't pass SUDO_USER as PMOS_HOST_USER: $(cat "$DOCKER_LOG")"
+# A name that can't be recorded: refused, docker never called.
+for bad in "Bad User" "ROOT" "x;y"; do
+  : >"$DOCKER_LOG"
+  code=0
+  SUDO_USER=$bad run_stack users list </dev/null >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "users with the OS user '$bad' exits $code, not 2"
+  [ ! -s "$DOCKER_LOG" ] || fail "users with the OS user '$bad' called docker"
+done
+# import: the named file, mounted read-only; the other arguments passed through.
+printf 'members: []\n' >"$WORK/team.yaml"
+: >"$DOCKER_LOG"
+run_stack users import --commit abc1234 --from "$WORK/team.yaml" --bootstrap --apply </dev/null >/dev/null
+grep -qF -- "-v $WORK/team.yaml:/run/pmos-import/team.yaml:ro toolserver pmos-toolserver users import --commit abc1234 --bootstrap --apply --from /run/pmos-import/team.yaml" "$DOCKER_LOG" ||
+  fail "users import didn't mount the file read-only: $(cat "$DOCKER_LOG")"
+# The tenant for --oid comes from the web app's Entra settings.
+stack_env require PMOS_WEB_ENTRA_TENANT_ID=11111111-2222-3333-4444-555555555555
+run_stack users set-entra raj --oid aaaaaaaa-0000-0000-0000-000000000001 </dev/null >/dev/null
+grep -qF -- "-e PMOS_ENTRA_TENANT_ID=11111111-2222-3333-4444-555555555555" "$DOCKER_LOG" ||
+  fail "users set-entra didn't pass the tenant: $(cat "$DOCKER_LOG")"
+# Break glass works whatever the assertion mode: a one-off container starts no service.
+stack_env off
+run_stack users grant-admin ana --keep-entra </dev/null >/dev/null ||
+  fail "users grant-admin was refused over the assertion mode"
+grep -qF -- "pmos-toolserver users grant-admin ana --keep-entra" "$DOCKER_LOG" ||
+  fail "users grant-admin didn't run: $(cat "$DOCKER_LOG")"
+
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
 if docker compose version >/dev/null 2>&1; then
   mkdir -p "$WORK/checkout" "$WORK/state"

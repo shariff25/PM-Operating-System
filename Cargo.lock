@@ -1676,6 +1676,7 @@ dependencies = [
  "pmos-policy",
  "serde_json",
  "serde_norway",
+ "tempfile",
 ]
 
 [[package]]
@@ -1902,6 +1903,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "clap",
  "hmac 0.12.1",
  "pmos-assertion",
  "pmos-bots",

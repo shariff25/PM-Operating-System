@@ -45,6 +45,27 @@ enum Command {
         #[command(subcommand)]
         command: MemberCommand,
     },
+    /// Bots in the content.
+    Bot {
+        #[command(subcommand)]
+        command: BotCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum BotCommand {
+    /// Write the personal bot `pm-<handle>` (`bots/pm-<handle>/BOT.md`) and nothing else: the
+    /// person themselves is added to the PM OS user database on the host
+    /// (`pmos-admin users …`, docs/runbooks/users.md). Review and commit it like any other
+    /// content change, then run `pmos policy generate` for its sandbox policy.
+    AddPersonal {
+        /// Path to the content root.
+        #[arg(long, default_value = "content")]
+        root: PathBuf,
+        /// The person's PM OS handle: lowercase letters, digits and single hyphens.
+        #[arg(long)]
+        handle: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -150,7 +171,39 @@ fn main() -> Result<ExitCode> {
                     roles,
                 },
         } => member_add(&root, handle, slack_id, email, github, &roles),
+        Command::Bot {
+            command: BotCommand::AddPersonal { root, handle },
+        } => bot_add_personal(&root, &handle),
     }
+}
+
+/// `pmos bot add-personal`: the personal bot half of `pmos member add`, with no `team.yaml`.
+fn bot_add_personal(root: &Path, handle: &str) -> Result<ExitCode> {
+    use pmos_contract::onboarding::{
+        bot_path, personal_bot_name, render_personal_bot, valid_new_handle, MAX_PROPOSED_HANDLE,
+    };
+    if !valid_new_handle(handle) {
+        eprintln!(
+            "error: `{handle}` is not a usable handle: lowercase letters, digits and single hyphens, at most {MAX_PROPOSED_HANDLE}"
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+    if !root.is_dir() {
+        eprintln!("error: no content root at {}", root.display());
+        return Ok(ExitCode::FAILURE);
+    }
+    let bot = root.join(bot_path(&personal_bot_name(handle)));
+    if bot.exists() {
+        println!("{} is already there; nothing changed", bot.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+    std::fs::create_dir_all(bot.parent().expect("bot path has a folder"))?;
+    std::fs::write(&bot, render_personal_bot(handle))?;
+    println!(
+        "wrote {}; run `pmos policy generate` for its sandbox policy",
+        bot.display()
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn member_add(

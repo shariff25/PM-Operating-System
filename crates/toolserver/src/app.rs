@@ -539,9 +539,8 @@ fn client_may_use(state: &AppState, client: Client, skill: Option<&str>) -> bool
             .bot
             .as_ref()
             .is_some_and(|b| b.skills.iter().any(|s| s == skill)),
-        (Client::Bot, None) | (Client::Mcp | Client::Web | Client::Console | Client::System, _) => {
-            false
-        }
+        (Client::Bot, None)
+        | (Client::Mcp | Client::Web | Client::Console | Client::System | Client::Host, _) => false,
     }
 }
 

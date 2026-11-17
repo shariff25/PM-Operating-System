@@ -1081,6 +1081,79 @@ The in-memory team drops them at once. Someone who still owns a team bot can't b
 `members.remove`, `user` the admin, the caller (`bot` from Slack), outcome `approved`,
 `rejected`, `failed`, `ok` or `denied`, and `output_ref` the commit sha.
 
+### The user database (slice U1: the store only)
+
+The source of users and roles is moving from `team.yaml` to the tool server's own tables
+(`docs/user-database-spec.md`). Slice U1 builds the store, its database guarantees and the
+host commands. **Nothing decides from it yet:** every service still reads `team.yaml` until
+slices U3-U7 cut them over, and no route reads or writes it (the read API is U2).
+
+**Tables** (migration 0015): `users` (handle, display name, `sign_in_name` for Entra and
+`atlassian_email` as separate columns, GitHub login, status), `user_roles` (`admin`, `pm`,
+`reviewer`, `auditor`), `user_identities` (Slack, Entra `(tid, oid)`, Atlassian and GitHub
+ids; one person per key, one key of each kind per person; Entra links carry
+`host_confirmed`), `role_changes` (the authoritative history), `pilot_exceptions` and
+`directory_version` (the directory's ETag for U2). Handles are never reused, users are never
+deleted, and addresses are unique across every user, active or not.
+
+**The database is the guarantee.** A deferred constraint trigger, `users_invariants()`, runs
+at commit for any change to `users`, `user_roles`, `user_identities` or `pilot_exceptions`.
+It takes a transaction-scoped advisory lock first, refuses any isolation level but READ
+COMMITTED (so the checks read a fresh snapshot after the lock), and then refuses:
+- a commit that leaves users but no active admin (`last_admin`), so two concurrent demotions
+  can't both commit, whatever the application does;
+- an active person holding `admin` and `auditor` unless a pilot exception is open and not past
+  `expires_at` (`dual_role`); checked for the people the change touched, so a lapsed exception
+  blocks other changes to such a person but never the ones that resolve it (revoking either
+  role, deactivating them, `off --revoke-auditor`);
+- the `evals` account holding any role but `pm`, or any identity (`evals_account`).
+
+`role_changes` is append-only by its own trigger, which never reads the audit purge's
+`pmos.audit_purge` setting: `UPDATE` and `TRUNCATE` are always refused, and `DELETE` only from
+inside `purge_role_changes()` (which sets `pmos.role_changes_retention`), only for a row about
+a user deactivated more than 90 days ago, never a `*` row. The retention job runs daily with
+the audit purge and records its own run (`users.role_changes_purge`, client `system`).
+
+**`UserStore`** (`src/users/`) has a Postgres and an in-memory implementation that behave the
+same: every write is planned against the current directory under the same lock, the planned
+result is checked against the same invariants (the trigger's, written again in Rust), and the
+write, its `role_changes` rows and its audit events go in one transaction. In Postgres the
+plan's check only gives a clear refusal first; the trigger is what holds. A refused write
+changes nothing and records a `denied` audit event with the refusal's code. The rules for the
+later web and Slack routes are already in the planner and tested: admin is granted on the host
+only; from Slack, `pm`-only joins with an unconfirmed sign-in name, and never an Admin's or
+Auditor's deactivation; no one changes their own roles, status or addresses; deactivation
+revokes `admin` and reactivation never restores it; at most 3 deactivations an hour from web
+and Slack together, counted from `role_changes` (a refused attempt writes no row, so it never
+counts; a reactivation deletes none, so it never resets the window).
+
+**Host commands:** `pmos-toolserver users …`, run by `deploy/pmos-admin users …` in a one-off
+container (`docs/runbooks/users.md`):
+
+| Command | Does |
+| --- | --- |
+| `bootstrap-admin --handle --sign-in-name --atlassian-email --slack-id (--oid \| --no-entra) [--name] [--github]` | The first admin (`pm`, `admin`); exit 3 once any active admin exists |
+| `grant-admin <h> (--oid \| --keep-entra)` | The only way to make an admin; sets or confirms the host-confirmed Entra link in the same transaction |
+| `revoke-admin <h>` | Break glass; refused for the last admin |
+| `set-entra <h> --oid` / `unset-entra <h>` | A host-confirmed Entra link (`tid` from `PMOS_ENTRA_TENANT_ID`) |
+| `set-sign-in-name <h> <name>` / `set-atlassian-email <h> <email>` | Setting the sign-in name also confirms it |
+| `deactivate <h>` / `reactivate <h>` | Not capped; deactivation revokes `admin` |
+| `pilot-exception admin-and-auditor on --until <date> \| off [--revoke-auditor] \| status` | At most 90 days; `off` refused while anyone holds both unless `--revoke-auditor` |
+| `import --from <file> [--commit <sha>] [--allow-admins \| --bootstrap] [--apply]` | A dry run unless `--apply`; idempotent; conflicts reported, never overwritten; admins only with `--allow-admins` (confirmed on a terminal) or `--bootstrap` (an empty table only, deactivated rows included); the file's SHA-256 and commit recorded |
+| `export --format team-yaml` | The database as a `team.yaml`, for a rollback |
+| `list` | Handles, status, roles, flags |
+
+Every command needs `PMOS_HOST_USER` (the OS user; `pmos-admin` passes
+`${SUDO_USER:-$(id -un)}`) matching `^[a-z_][a-z0-9_.-]{0,31}$`, and exits 2 without it. Writes
+record it in `role_changes.host_user` and the audit event's detail (`host_user <name>; …`,
+client `host`). Exit codes: 0 done, 1 failed, 2 usage, 3 refused by a rule. No command prints a
+token; `list`, `export` and the import's dry run show addresses, which the host already holds.
+
+**The dev seed:** `PMOS_USERS_SEED=<file>` (the `team.yaml` shape, loaded by the import's code
+as a bootstrap) fills the in-memory store at start-up. It is refused with `PMOS_DATABASE_URL`
+or live connectors. With fake connectors only, it may give `evals` its fake Slack id. A seed
+needs an active admin like any import.
+
 ### Content sync
 
 Every `PMOS_CONTENT_SYNC_SECS`, and right after a member commit, the tool server runs
@@ -1124,6 +1197,7 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 | Credentials | `credentials` | Tokens sealed by the vault; the database never sees plaintext. Providers `atlassian`, `slack`, `github` |
 | Memory repos | `memory_repos` | One row per PM: `repo` (`org/name`) and `verified_at` |
 | Member requests | `member_requests` | A partial unique index keeps one `pending` request per Slack id; a decision is a conditional `UPDATE … WHERE status = 'pending'`, so exactly one wins |
+| Users | `users`, `user_roles`, `user_identities`, `role_changes`, `pilot_exceptions`, `directory_version` | Migration 0015; see **The user database**. The invariants are a deferred trigger that takes an advisory lock; `role_changes` is append-only with its own retention rule. Audit events of host commands have client `host`. |
 
 - **Migrations** run on start-up.
 - **Pruning:** expired sessions and grants are deleted every 10 minutes.
