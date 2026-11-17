@@ -1,6 +1,6 @@
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { Api } from '../../api';
 import { copy } from '../../copy';
 import { renderApp } from '../../test/util';
@@ -10,9 +10,12 @@ const P = A.propose;
 const nav = () => screen.getByRole('navigation', { name: copy.nav.label });
 const BOTS_H = new RegExp(`^${A.policy.bots.heading}`);
 
-async function openPolicy(opts: Parameters<typeof renderApp>[0] = {}) {
-  const view = renderApp({ role: 'admin', hash: '/admin/policy', ...opts });
-  await screen.findByRole('heading', { name: BOTS_H });
+/** The policy page on one of its parts. The form to propose a change is on `propose`, the default. */
+async function openPolicy(opts: Parameters<typeof renderApp>[0] = {}, part: 'overview' | 'propose' | 'proposals' = 'propose') {
+  const view = renderApp({ role: 'admin', hash: part === 'overview' ? '/admin/policy' : `/admin/policy/${part}`, ...opts });
+  if (part === 'overview') await screen.findByRole('heading', { name: BOTS_H });
+  else if (part === 'propose') await screen.findByRole('heading', { name: A.policy.editor.heading });
+  else await screen.findByRole('heading', { name: new RegExp(`^${A.proposals.heading}`) });
   return view;
 }
 
@@ -50,8 +53,8 @@ describe('who sees policy and content', () => {
     await screen.findByRole('heading', { level: 1, name: A.sections.overview });
     const sub = within(nav()).getByRole('list', { name: A.subnavLabel });
     expect(within(sub).getAllByRole('link').map((a) => a.textContent)).toEqual(['Overview', 'Audit log', 'Team', 'Connectors', 'Policy', 'Content and harness']);
-    expect(screen.getByRole('link', { name: new RegExp(A.overview.links.policy.body) })).toHaveAttribute('href', '#/admin/policy');
-    expect(screen.getByRole('link', { name: new RegExp(A.overview.links.content.body) })).toHaveAttribute('href', '#/admin/content');
+    expect(await screen.findByRole('link', { name: new RegExp(A.overview.links.policy.body) })).toHaveAttribute('href', '#/admin/policy');
+    expect(await screen.findByRole('link', { name: new RegExp(A.overview.links.content.body) })).toHaveAttribute('href', '#/admin/content');
   });
 
   it('gives a PM neither, and a calm page on a direct visit that never asks the server', async () => {
@@ -151,7 +154,8 @@ describe('a policy change', () => {
     expect(screen.getByRole('link', { name: /Open in GitHub/ })).toHaveAttribute('href', 'https://github.com/acme/pmos/pull/42');
     expect(screen.getByText('ada-gh')).toBeInTheDocument();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
-    // The new pull request is listed.
+    // The new pull request is listed, on the Proposals part.
+    window.location.hash = '/admin/policy/proposals';
     const list = await screen.findByRole('list', { name: A.proposals.tableLabel('policy') });
     await waitFor(() => expect(within(list).getByText('PM OS policy: Let the docs bot search Jira')).toBeInTheDocument());
   });
@@ -159,13 +163,12 @@ describe('a policy change', () => {
   it('shows check errors with their spec path, and never allows proposing them', async () => {
     const user = userEvent.setup();
     await openPolicy();
-    await user.click(screen.getByRole('tab', { name: A.policy.editor.tabs.skills }));
-    const input = screen.getByLabelText(A.policy.editor.toolsOf('docs'));
-    await user.clear(input);
-    await user.type(input, 'Not A Tool');
+    await user.click(screen.getByRole('tab', { name: A.policy.editor.tabs.raw }));
+    const raw = screen.getByLabelText(A.policy.editor.rawLabel);
+    fireEvent.change(raw, { target: { value: '{"bots": {"docs": {"role": "no-such-role"}}}' } });
     await user.click(screen.getByRole('button', { name: P.check }));
     const errors = await screen.findByRole('list', { name: P.result.errors });
-    expect(within(errors).getAllByText(/spec\.skills\.docs\.tools\[\d\]/).length).toBeGreaterThan(0);
+    expect(within(errors).getAllByText(/spec\.bots\.docs\.role/).length).toBeGreaterThan(0);
     expect(screen.getByRole('button', { name: P.open })).toBeDisabled();
     expect(screen.getByText(P.fixFirst)).toBeInTheDocument();
   });
@@ -191,18 +194,36 @@ describe('a policy change', () => {
     if (code === 'invalid') expect(screen.getByRole('button', { name: P.open })).toBeDisabled();
   });
 
+  it('tells an admin who has not linked GitHub exactly how to link it, with the command to copy', async () => {
+    const user = userEvent.setup();
+    await openPolicy({ proposalError: 'github_not_linked' });
+    await addJiraTool(user);
+    const dialog = await checkAndOpenDialog(user);
+    await fillAndSubmit(user, dialog);
+    const alert = await within(dialog).findByRole('alert');
+    expect(alert).toHaveTextContent(P.problems.github_not_linked.next);
+    const chip = within(alert).getByRole('group', { name: P.linkCommandLabel });
+    expect(within(chip).getByText(P.linkCommand).tagName).toBe('CODE');
+    expect(within(alert).queryByRole('link')).not.toBeInTheDocument();
+    const write = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: write }, configurable: true });
+    await user.click(within(chip).getByRole('button', { name: P.copyCommand }));
+    expect(write).toHaveBeenCalledWith(P.linkCommand);
+    expect(await within(chip).findByRole('button', { name: P.copiedCommand })).toBeInTheDocument();
+  });
+
   it('turns GitHub not linked into a call to action and an empty proposals list', async () => {
-    await openPolicy({ protection: 'not_linked' });
+    await openPolicy({ protection: 'not_linked' }, 'proposals');
     expect(screen.getByText(A.repo.notLinkedTitle)).toBeInTheDocument();
     expect(await screen.findByText(/Link your GitHub account to see proposals/)).toBeInTheDocument();
   });
 
   it('warns when the branch requires no review, or protection could not be read', async () => {
-    const first = await openPolicy({ protection: 'no_reviews' });
+    const first = await openPolicy({ protection: 'no_reviews' }, 'overview');
     expect(screen.getByText(A.repo.unprotectedTitle)).toBeInTheDocument();
     expect(screen.getByText(A.repo.zeroReviews('main'))).toBeInTheDocument();
     first.unmount();
-    await openPolicy({ protection: 'unverified' });
+    await openPolicy({ protection: 'unverified' }, 'overview');
     expect(screen.getByText(A.repo.unverified('main'))).toBeInTheDocument();
   });
 
@@ -229,8 +250,8 @@ describe('a policy change', () => {
     expect(leave.defaultPrevented).toBe(true);
     window.location.hash = '/admin/team';
     await screen.findByRole('heading', { level: 1, name: A.sections.team });
-    window.location.hash = '/admin/policy';
-    await screen.findByRole('heading', { name: BOTS_H });
+    window.location.hash = '/admin/policy/propose';
+    await screen.findByRole('heading', { name: A.policy.editor.heading });
     expect(screen.getByText('skills.docs.tools')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: A.policy.editor.discard }));
     expect(screen.getByText(A.policy.editor.noChanges)).toBeInTheDocument();

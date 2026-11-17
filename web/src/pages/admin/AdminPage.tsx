@@ -1,6 +1,7 @@
 import { canSee, sectionsFor } from '../../admin/access';
 import type { AdminSection } from '../../admin/access';
 import { useApp } from '../../app-context';
+import type { PolicyPart } from '../../url';
 import { AuditLog } from './AuditLog';
 import { Connectors } from './Connectors';
 import { Content } from './Content';
@@ -13,7 +14,7 @@ import { Team } from './Team';
  * The page for `#/admin` and the parts below it. A part this person's role does not include is a
  * calm "no access" page, never a broken one: the server checks every request again anyway.
  */
-export function AdminPage({ section, search }: { section: AdminSection; search: string }) {
+export function AdminPage({ section, search, sub }: { section: AdminSection; search: string; sub?: PolicyPart }) {
   const { me } = useApp();
   // Someone who may open the Admin area but not its home (a connectors-only role) lands on their first part.
   const target = section === 'overview' && !canSee(me, 'overview') ? sectionsFor(me)[0] ?? section : section;
@@ -26,7 +27,7 @@ export function AdminPage({ section, search }: { section: AdminSection; search: 
     case 'connectors':
       return <Connectors />;
     case 'policy':
-      return <Policy />;
+      return <Policy part={sub} />;
     case 'content':
       return <Content search={search} />;
     default:

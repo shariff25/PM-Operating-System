@@ -323,12 +323,17 @@ for (const theme of ['light', 'dark'] as const) {
       await signIn(page, theme, undefined, 'ada', '?mock_proposal=stale_base');
       await go(page, '/admin/policy');
       await expect(page.getByRole('heading', { name: /^What each bot may do/ })).toBeVisible();
-      await expect(page.getByRole('list', { name: 'Open policy proposals' })).toBeVisible();
+      await scan(page, 'policy overview, cards collapsed');
+      await page.getByRole('button', { name: 'Expand all' }).click();
       await page.getByText('Fixed in code').click();
       await page.getByText('Policy files').click();
       await page.getByText('Show how policies/bots/pm-ben.yaml differs').click();
       await page.getByText('Read it as sentences').first().click();
       await scan(page, 'policy, everything open');
+      await go(page, '/admin/policy/proposals');
+      await expect(page.getByRole('list', { name: 'Open policy proposals' })).toBeVisible();
+      await scan(page, 'policy, proposals');
+      await go(page, '/admin/policy/propose');
       await page.getByRole('tab', { name: 'Roles' }).click();
       await scan(page, 'policy editor, roles');
       await page.getByRole('tab', { name: 'JSON' }).click();
@@ -352,7 +357,7 @@ for (const theme of ['light', 'dark'] as const) {
 
     test('admin: a pull request opened, and GitHub not linked', async ({ page }) => {
       await signIn(page, theme, undefined, 'ada');
-      await go(page, '/admin/policy');
+      await go(page, '/admin/policy/propose');
       await page.getByRole('tab', { name: 'Bots' }).click();
       await page.getByLabel('Owner of docs').fill('ana');
       await page.getByRole('button', { name: 'Check this change' }).click();
@@ -364,7 +369,7 @@ for (const theme of ['light', 'dark'] as const) {
       await expect(page.getByRole('heading', { name: 'Pull request #42 is open' })).toBeVisible();
       await scan(page, 'pull request opened');
       await signIn(page, theme, undefined, 'ada', '?mock_protection=not_linked');
-      await go(page, '/admin/policy');
+      await go(page, '/admin/policy/proposals');
       await expect(page.getByText('Link GitHub to propose changes')).toBeVisible();
       await expect(page.getByText(/Link your GitHub account to see proposals/)).toBeVisible();
       await scan(page, 'policy, GitHub not linked');
