@@ -33,6 +33,7 @@ pub struct TestPg {
     pub store: PgStore,
     base: PgConnectOptions,
     schema: String,
+    url: String,
 }
 
 impl TestPg {
@@ -66,7 +67,17 @@ impl TestPg {
             store,
             base,
             schema,
+            url,
         })
+    }
+
+    /// A connection URL for this test's schema, for a child process (the host commands).
+    pub fn schema_url(&self) -> String {
+        let sep = if self.url.contains('?') { '&' } else { '?' };
+        format!(
+            "{}{sep}options=-c%20search_path%3D{}",
+            self.url, self.schema
+        )
     }
 
     pub async fn drop_schema(self) {

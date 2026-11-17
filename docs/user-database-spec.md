@@ -975,6 +975,17 @@ Each slice is one agent, one worktree, one branch. All need the workspace checks
 | U6 | **Reviewer** | Assignments, recommendation route and store bound to revision and hash, reviewer inbox, owner view (stale marking), Slack card line, decision detail | U3, U5, **B1** | Recommendation never changes status or calls a connector; unassigned `404`; restricted metadata-only, incl. a W6 follow-up; `409 draft_changed` on an old revision; owner edit after a recommendation shows "earlier version" in web and Slack and the decision's detail says so; note removed with Slack text; note and name render as plain text |
 | U7 | **Retire the file** | `team-file-retired` lint; remove `TeamFile` use from every service (parser stays only in the import/seed module); remove `pmos member add` (CI smoke and stacks keep only the import/seed and `pmos bot add-personal`); docs (`entra-sign-in.md`, `web-api.md`, `onboarding-spec.md`, `user-assertion.md`, upgrade runbook, `content/team.yaml` deleted) | U3–U6 | **The proof** (below); CI smoke green on `--bootstrap` alone |
 
+**Status (2026-11-17): U1 is built** on `claude/u1-user-store` (migration `0015_users.sql`,
+`crates/toolserver/src/users/`, `docs/runbooks/users.md`). Where it differs from the text above:
+the advisory lock is keyed `(hashtext('pmos.users'), hashtext(current_schema()))`, the audit
+purge's pattern, and every trigger function has a fixed `search_path`; the directory version is
+bumped inside `users_invariants()`, after the lock; a `role_changes` DELETE needs the setting
+**and** must run inside `purge_role_changes()` (the audit purge's call-stack check), which the
+daily retention job calls; the handles `host`, `import` and `system` are reserved; a
+`users.deactivated_at` check keeps it set exactly while deactivated; `reviewer_assignments` and
+`approval_recommendations` are left to U6. A seed, like any import, needs an active admin, so
+the eval stack's seed (U3) must name one besides `evals`, `ben` and `cy`.
+
 U4a–U4d run in parallel (U4b after U3, since `remove` calls U3's deactivation). U5 and U6 can
 overlap once the routes in U5 are merged.
 

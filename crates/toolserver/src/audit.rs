@@ -124,6 +124,9 @@ pub enum Client {
     /// The tool server itself, with no caller: the audit retention purge records its runs
     /// as this (`docs/audit-retention.md`). Never a token's client.
     System,
+    /// A host command, `pmos-admin users …` (`docs/user-database-spec.md` §5): the event's
+    /// detail names the OS user who ran it. Never a token's client.
+    Host,
 }
 
 impl Client {
@@ -135,6 +138,7 @@ impl Client {
             Self::Web => "web",
             Self::Console => "console",
             Self::System => "system",
+            Self::Host => "host",
         }
     }
 
@@ -146,6 +150,7 @@ impl Client {
             Self::Web,
             Self::Console,
             Self::System,
+            Self::Host,
         ]
         .into_iter()
         .find(|c| c.as_str() == s)

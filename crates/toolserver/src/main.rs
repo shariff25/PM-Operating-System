@@ -30,6 +30,12 @@ const PRUNE_EVERY: Duration = Duration::from_secs(600);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `pmos-toolserver users …`: a host command (docs/runbooks/users.md), not the server.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("users") {
+        std::process::exit(pmos_toolserver::users::host::main(args[1..].to_vec()).await);
+    }
+
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -67,6 +73,23 @@ async fn main() -> Result<()> {
         let file: Arc<dyn AuditSink> =
             Arc::new(JsonlAudit::open(path).context("opening audit log")?);
         stores.audit = Arc::new(TeeAudit(vec![stores.audit.clone(), file]));
+    }
+    // The user database (docs/user-database-spec.md, slice U1). Nothing decides from it yet:
+    // team.yaml stays what every service reads until slices U3-U7. In development the
+    // in-memory store can be seeded (config.rs refuses a seed with a database or live
+    // connectors).
+    if let Some(path) = &config.users_seed {
+        let req = pmos_toolserver::users::import::seed_request(path).map_err(anyhow::Error::msg)?;
+        let rules = pmos_toolserver::users::Rules {
+            evals_slack_allowed: matches!(config.connectors, Connectors::Fake),
+            ..Default::default()
+        };
+        let seeded =
+            pmos_toolserver::users::MemoryUsers::seeded(req, rules, Some(stores.audit.clone()))
+                .await
+                .map_err(anyhow::Error::msg)?;
+        stores.users = Arc::new(seeded);
+        tracing::info!("user store seeded from PMOS_USERS_SEED (development only)");
     }
 
     let live = matches!(config.connectors, Connectors::Live(_));
@@ -192,6 +215,9 @@ async fn main() -> Result<()> {
         retention_days = config.audit_retention_days,
         "audit retention on: events older than this are deleted daily"
     );
+    if config.database_url.is_some() {
+        pmos_toolserver::retention::spawn_role_changes(svc.stores().users.clone(), cancel.clone());
+    }
     // One replica: anything still `executing` from a previous process was interrupted.
     match svc.reconcile(chrono::Duration::zero(), Utc::now()).await {
         Ok(0) => {}

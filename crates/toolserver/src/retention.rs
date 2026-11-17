@@ -125,6 +125,38 @@ pub fn spawn(
     })
 }
 
+/// The `role_changes` retention (owner Q5, `docs/user-database-spec.md` §10), on the same
+/// schedule as the audit purge: the rows about people deactivated more than 90 days ago go.
+/// The database decides what may be deleted (migration 0015); this only asks.
+pub fn spawn_role_changes(
+    users: Arc<dyn crate::users::UserStore>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let first = FIRST_AFTER + jitter(JITTER);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(first) => {}
+        }
+        let mut tick = tokio::time::interval(EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            let result = tokio::select! {
+                _ = cancel.cancelled() => return,
+                r = users.purge_role_changes(Utc::now()) => r,
+            };
+            match result {
+                Ok(deleted) => tracing::info!(deleted, "role_changes retention"),
+                Err(e) => tracing::error!(error = %e, "role_changes retention failed"),
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
