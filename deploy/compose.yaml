@@ -113,6 +113,9 @@ services:
       PMOS_DOCS_URL: http://docs.pmos.internal:8730/mcp
       PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN}
       PMOS_LEDGER_EXPIRE_DAYS: ${PMOS_LEDGER_EXPIRE_DAYS:-7}
+      # Audit events older than this are deleted daily (docs/audit-retention.md). 90 or more;
+      # the tool server refuses to start with less.
+      PMOS_AUDIT_RETENTION_DAYS: ${PMOS_AUDIT_RETENTION_DAYS:-90}
     volumes:
       # The content checkout: the tool server pulls it (content sync), the others read it.
       - ${PMOS_CONTENT_CHECKOUT:?}:/srv/content-repo

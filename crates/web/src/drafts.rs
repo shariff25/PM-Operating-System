@@ -8,13 +8,18 @@
 //! | `confluence.create_draft` `{space, title, body, parent_id?}` | `confluence_page` | `title` | `body` | Space `space`, under page `parent_id` |
 //! | `confluence.update_page` `{page_id, version, body, version_comment?}` | `confluence_page` | "Update to page `page_id`" (the item has no title) | `body` | Page `page_id` |
 //! | `jira.create_issue` `{project, issue_type, summary, description?, epic?}` | `jira_issue` | `summary` | `description` | Project `project`, a `issue_type`, under `epic` |
-//! | `slack.post_reply` `{channel, thread_ts, text, message_ts?}` | `slack_reply` | "Reply in a Slack thread" | `text` | "A Slack thread" |
-//! | `slack.send_message` `{channel, text}` | `slack_message` | "Message to a Slack channel" | `text` | "A Slack channel" |
+//! | `slack.post_reply` `{channel, thread_ts, text, message_ts?}` | `slack_reply` | "Reply in a Slack thread" | `text` | "A thread in #launch-acme" |
+//! | `slack.send_message` `{channel, text}` | `slack_message` | "Message to a Slack channel" | `text` | "#launch-acme" |
 //!
-//! (A `D…` channel is "a direct message thread" or "Direct message": a Slack label never shows
-//! a channel id, since PM OS keeps no channel names; `target.url` opens it in Slack. Where the
-//! run read a Confluence page or a Jira epic the target names, [`with_sources`] names it with
-//! the title the tool server recorded at the read.)
+//! (A Slack label never shows a channel id. Its name, kind and DM partner come from the tool
+//! server's `target_channel`, which it reads from Slack when the draft is made and at each
+//! audience check ([`slack_label`]): "#launch-acme", "A private channel" (no usable name),
+//! "Direct message with ben" (a team member) or "Direct message", "A group direct message".
+//! Until the tool server has read the channel, the label is built from the id's kind: a `D…`
+//! channel is "a direct message thread" or "Direct message", a `C…` one "A Slack thread" or
+//! "A Slack channel". `target.url` opens it in Slack. Where the run read a Confluence page or
+//! a Jira epic the target names, [`with_sources`] names it with the title the tool server
+//! recorded at the read.)
 //!
 //! Other write tools (such as `bets.record`) are not drafts in this contract and are left
 //! out. A PM's edit maps back onto the same fields ([`edited_args`]) and leaves every other
@@ -42,6 +47,7 @@
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use pmos_contract::cite;
+use pmos_contract::model::valid_handle;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -234,6 +240,46 @@ fn slack_place(channel: &str, thread: bool) -> &'static str {
     }
 }
 
+/// A Slack channel name fit for a label: letters, digits, `-`, `_` and `.`, at most 80
+/// characters, as Slack names channels. It came from Slack by way of the tool server, so
+/// anything else (spaces, markup, mentions) is not shown.
+fn channel_name(name: &str) -> Option<&str> {
+    let ok = !name.is_empty()
+        && name.chars().count() <= 80
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    ok.then_some(name)
+}
+
+/// A Slack draft's label from the channel the tool server read (`target_channel`):
+/// "#launch-acme" (or "A thread in #launch-acme"), "A private channel" when a private one has
+/// no usable name, "Direct message with ben" when the DM's other person is a team member,
+/// "A group direct message". `None` when the tool server hasn't read the channel (or sent a
+/// kind this server doesn't know): the label is then built from the id ([`slack_place`]).
+/// The owner is a member of every channel their own draft goes to, so a private channel's
+/// name is shown to them.
+fn slack_label(target: Option<&crate::upstream::TargetChannel>, thread: bool) -> Option<String> {
+    let t = target?;
+    let name = t.name.as_deref().and_then(channel_name);
+    let with = t.with.as_deref().filter(|h| valid_handle(h));
+    let label = match (t.kind.as_str(), name, with, thread) {
+        ("channel" | "private_channel", Some(n), _, false) => format!("#{n}"),
+        ("channel" | "private_channel", Some(n), _, true) => format!("A thread in #{n}"),
+        ("private_channel", None, _, false) => "A private channel".into(),
+        ("private_channel", None, _, true) => "A thread in a private channel".into(),
+        ("channel", None, _, _) => return None,
+        ("im", _, Some(h), false) => format!("Direct message with {h}"),
+        ("im", _, Some(h), true) => format!("A direct message thread with {h}"),
+        ("im", _, None, false) => "Direct message".into(),
+        ("im", _, None, true) => "A direct message thread".into(),
+        ("mpim", _, _, false) => "A group direct message".into(),
+        ("mpim", _, _, true) => "A group direct message thread".into(),
+        _ => return None,
+    };
+    Some(label)
+}
+
 /// `text` with its first letter capitalised.
 fn sentence(text: &str) -> String {
     let mut chars = text.chars();
@@ -310,8 +356,16 @@ fn target(item: &Approval) -> Target {
             }
             ("jira", label)
         }
-        "slack.post_reply" => ("slack", sentence(slack_place(s(args, "channel"), true))),
-        _ => ("slack", sentence(slack_place(s(args, "channel"), false))),
+        "slack.post_reply" => (
+            "slack",
+            slack_label(item.target_channel.as_ref(), true)
+                .unwrap_or_else(|| sentence(slack_place(s(args, "channel"), true))),
+        ),
+        _ => (
+            "slack",
+            slack_label(item.target_channel.as_ref(), false)
+                .unwrap_or_else(|| sentence(slack_place(s(args, "channel"), false))),
+        ),
     };
     Target {
         system,
@@ -338,7 +392,7 @@ fn read_title(
 /// The target label with the names the run read for its ids (`docs/web-api.md`, Drafts): a
 /// Confluence parent page's or updated page's title, a Jira epic's "KEY: summary". These are
 /// the titles the tool server recorded at the read, not text the bot wrote, and an id the run
-/// didn't read stays an id. Slack labels never name a channel (see [`slack_place`]).
+/// didn't read stays an id. Slack labels come from `target_channel` (see [`slack_label`]).
 fn named_target(
     mut target: Target,
     item: &Approval,
@@ -949,6 +1003,131 @@ mod tests {
             assert_eq!(d.target.label, label, "{tool} {channel}");
             assert_eq!(d.summary.title, title, "{tool} {channel}");
             assert!(!d.target.label.contains(channel) && !d.summary.title.contains(channel));
+        }
+    }
+
+    #[test]
+    fn slack_targets_use_the_channel_the_tool_server_read() {
+        let none = UserState::default();
+        let with_target = |tool: &str, channel: &str, target: Value| {
+            let mut v = json!({
+                "id": "apr_1", "user": "ana", "bot": "pm-ana", "run_id": "tsk_1", "tool": tool,
+                "args": {"channel": channel, "thread_ts": "1731600000.000100", "text": "x"},
+                "status": "pending", "created_at": "2026-11-16T09:00:00Z"
+            });
+            if !target.is_null() {
+                v["target_channel"] = target;
+            }
+            let it: Approval = serde_json::from_value(v).unwrap();
+            draft(&it, &none).unwrap().target.label
+        };
+        let cases = [
+            (
+                "slack.send_message",
+                "C024BE91L",
+                json!({"kind": "channel", "name": "launch-acme"}),
+                "#launch-acme",
+            ),
+            (
+                "slack.post_reply",
+                "C024BE91L",
+                json!({"kind": "channel", "name": "launch-acme"}),
+                "A thread in #launch-acme",
+            ),
+            // The owner is a member: a private channel's name is shown to them.
+            (
+                "slack.send_message",
+                "C0PRIVATE1",
+                json!({"kind": "private_channel", "name": "deal-room"}),
+                "#deal-room",
+            ),
+            (
+                "slack.send_message",
+                "G024BE91L",
+                json!({"kind": "private_channel", "name": null}),
+                "A private channel",
+            ),
+            (
+                "slack.post_reply",
+                "G024BE91L",
+                json!({"kind": "private_channel"}),
+                "A thread in a private channel",
+            ),
+            (
+                "slack.send_message",
+                "D024BE91L",
+                json!({"kind": "im", "with": "ben"}),
+                "Direct message with ben",
+            ),
+            (
+                "slack.post_reply",
+                "D024BE91L",
+                json!({"kind": "im", "with": "ben"}),
+                "A direct message thread with ben",
+            ),
+            (
+                "slack.send_message",
+                "D024BE91L",
+                json!({"kind": "im", "with": null}),
+                "Direct message",
+            ),
+            (
+                "slack.send_message",
+                "C0MPIM0001",
+                json!({"kind": "mpim"}),
+                "A group direct message",
+            ),
+            // No usable name for a public channel, or not read yet: from the id, as before.
+            (
+                "slack.send_message",
+                "C024BE91L",
+                json!({"kind": "channel", "name": null}),
+                "A Slack channel",
+            ),
+            (
+                "slack.post_reply",
+                "C024BE91L",
+                Value::Null,
+                "A Slack thread",
+            ),
+            (
+                "slack.send_message",
+                "D024BE91L",
+                Value::Null,
+                "A direct message",
+            ),
+            // Untrusted text never reaches the label.
+            (
+                "slack.send_message",
+                "C024BE91L",
+                json!({"kind": "channel", "name": "<!channel> click here"}),
+                "A Slack channel",
+            ),
+            (
+                "slack.send_message",
+                "G024BE91L",
+                json!({"kind": "private_channel", "name": "a b"}),
+                "A private channel",
+            ),
+            (
+                "slack.send_message",
+                "D024BE91L",
+                json!({"kind": "im", "with": "Ben <script>"}),
+                "Direct message",
+            ),
+            (
+                "slack.send_message",
+                "C024BE91L",
+                json!({"kind": "huddle", "name": "x"}),
+                "A Slack channel",
+            ),
+        ];
+        for (tool, channel, target, want) in cases {
+            assert_eq!(
+                with_target(tool, channel, target.clone()),
+                want,
+                "{tool} {target}"
+            );
         }
     }
 
