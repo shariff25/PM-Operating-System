@@ -121,6 +121,12 @@ pub struct NewTask {
     pub level: Option<Level>,
     /// The conversation it continues (the web and Slack clients only; `app.rs` checks).
     pub conversation: Option<String>,
+    /// The lowest level the task's session starts at, because its text already carries data
+    /// of that class: the web app's revision of a draft, whose prompt holds the draft's text
+    /// (R2, the W6 carry-forward for revision tasks). Kept as the task's
+    /// `sources_sensitivity` until it finishes, when what its sessions reached (never lower,
+    /// since they started here) replaces it. Only raises; the web client only (`app.rs`).
+    pub sensitivity_floor: Option<Sensitivity>,
 }
 
 /// What the harness needs to call the gateway for this task: the bot's model role and the
@@ -313,6 +319,7 @@ impl Runtime {
         );
         task.level = new.level;
         task.conversation = new.conversation;
+        task.sources_sensitivity = new.sensitivity_floor;
         self.store.create_task(&task, "queued").await?;
         tracing::info!(task = %task.id, bot = %task.bot, source = %task.source, "task queued");
         self.bump();
@@ -389,9 +396,12 @@ impl Runtime {
             };
             // The history first: its level is where the session starts (W6).
             let (history, history_sensitivity) = self.history(&task, now).await;
+            // A task not yet finished carries in `sources_sensitivity` only its own floor
+            // (`NewTask::sensitivity_floor`): the session starts at the higher of the two.
+            let floor = history_sensitivity.max(task.sources_sensitivity);
             match self
                 .toolserver
-                .create_session(&task.requested_by, &bot.name, &task.id, history_sensitivity)
+                .create_session(&task.requested_by, &bot.name, &task.id, floor)
                 .await
             {
                 Ok(session_token) => {
@@ -516,8 +526,8 @@ impl Runtime {
             event: Some(("status".into(), format!("failed: {reason}"))),
             notify: Some(NewNotification::new(NotificationKind::Failed, reason)),
             // No session ran for this claim: what a follow-up replays is the PM's text and
-            // this reason.
-            sensitivity: Some(Sensitivity::Public),
+            // this reason, at the task's own floor if its text carries one.
+            sensitivity: Some(task.sources_sensitivity.unwrap_or(Sensitivity::Public)),
             ..Transition::from(&[TaskStatus::Working])
         };
         let _ = self.store.transition(&task.id, &change, now).await?;

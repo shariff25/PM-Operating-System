@@ -447,6 +447,22 @@ async fn ts_decide(
     if item["status"] != "pending" {
         return answer(StatusCode::CONFLICT, json!({"error": "already decided"}));
     }
+    // As the tool server (R4): an approve names what the PM was shown.
+    match body["expected_args_hash"].as_str() {
+        None if body["decision"] == "approve" => {
+            return answer(
+                StatusCode::BAD_REQUEST,
+                json!({"code": "expected_args_hash_required", "error": "required"}),
+            )
+        }
+        Some(h) if !item["args_hash"].as_str().unwrap_or("").starts_with(h) => {
+            return answer(
+                StatusCode::CONFLICT,
+                json!({"code": "stale", "error": "changed"}),
+            )
+        }
+        _ => {}
+    }
     item["decided_by"] = body["decided_by"].clone();
     item["status"] = match body["decision"].as_str() {
         Some("approve") => json!("approved"),
@@ -475,10 +491,14 @@ async fn ts_unlink(
 pub fn approval(id: &str, user: &str, tool: &str, args: Value, created_at: &str) -> Value {
     json!({
         "id": id, "user": user, "skill": null, "bot": format!("pm-{user}"), "run_id": "tsk_1",
-        "tool": tool, "args": args, "args_hash": "x", "status": "pending",
+        "tool": tool, "args": args, "args_hash": ARGS_HASH, "status": "pending",
         "created_at": created_at,
     })
 }
+
+/// Every fixture item's args hash; a card or App Home row carries its first 16 characters.
+pub const ARGS_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+pub const SHOWN: &str = "0123456789abcdef";
 
 // ---- The stack ----
 
@@ -715,9 +735,21 @@ pub fn home_click(
     ticked: &[&str],
 ) -> Value {
     let mut values = serde_json::Map::new();
+    // Each ticked row's block id as the view showed it (`pick_<id>:<hash>`), else `pick_<id>`.
+    let shown = |id: &str| -> String {
+        let plain = format!("pick_{id}");
+        published["view"]["blocks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|b| b["block_id"].as_str())
+            .find(|b| *b == plain || b.starts_with(&format!("{plain}:")))
+            .map(String::from)
+            .unwrap_or(plain)
+    };
     for id in ticked {
         values.insert(
-            format!("pick_{id}"),
+            shown(id),
             json!({"home_pick": {"type": "checkboxes", "selected_options": [{"text": {"type": "plain_text", "text": "Select"}, "value": id}]}}),
         );
     }

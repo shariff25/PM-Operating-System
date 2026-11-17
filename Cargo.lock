@@ -1872,6 +1872,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmos-stack-tests"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "pmos-assertion",
+ "pmos-bots",
+ "pmos-toolserver",
+ "pmos-web",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "walkdir",
+]
+
+[[package]]
 name = "pmos-toolserver"
 version = "0.1.0"
 dependencies = [

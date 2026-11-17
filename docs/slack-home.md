@@ -41,6 +41,7 @@ says "and N more; they appear as you clear these."
 | **rejected** | Discarded; nothing was sent | Nothing |
 | **blocked** | Built from restricted sources, and people in the channel aren't on the product team | Reject it, or answer in the thread yourself |
 | **needs your confirmation** | It goes to a channel shared outside the company | Confirm on its card in our DM |
+| **changed since you looked** | Its text changed after the Home showed it (an edit in the web app), so it wasn't approved | Open it, read it, and approve again |
 | **expired**, or **already decided** | Past its 24 hours, or decided elsewhere (on its card, or by another tap) | Nothing |
 | **failed** | PM OS couldn't reach the tool server, or the write failed (the line gives the error) | Try again, or ask a platform owner |
 | "Tick the drafts first." | You tapped a button with nothing ticked | Tick at least one |
@@ -58,7 +59,18 @@ messages, which have no web page.
 **An edit saved in the web app** is saved on the draft itself, so the card approves it: the
 card says "edited by <PM>", and an **Approve** on a card posted before the edit approves
 nothing, but shows the card again with the text as it is now (its buttons carry the start of
-the text's hash, `approval:<id>:<hash>`), to read and approve again.
+the text's hash, `approval:<id>:<hash>`), to read and approve again. Every approve sends that
+hash to the tool server (`expected_args_hash`), which refuses the approve as `stale` if the
+draft changed in between, and the card is shown again then too. A card from before cards
+carried the hash approves nothing either: it is shown again as the draft is now, saying it is
+from an older version. The same goes for **Post to external channel**: its buttons carry the
+hash of the text it confirmed.
+
+**Approve selected** works the same way: each row carries the hash of what it showed
+(`pick_<id>:<hash>`). A draft that changed since the Home was published is refused as `stale`,
+and a row from a Home published before rows carried the hash is skipped without a call; the
+notice counts both, as "N changed since you looked, so they were not approved. Open each to
+review."
 
 **What the Slack bot can see and change.** The bot is the approval screen, so the tool server
 limits what its token can do:

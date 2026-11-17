@@ -3,12 +3,12 @@
 //! `docs/bot-runtime-spec.md` §3 and `docs/toolserver.md`; fields the console doesn't show
 //! are ignored, and lists may come bare (`[…]`) or wrapped (`{"items": […]}`).
 //!
-//! With a key for an upstream (`PMOS_ASSERTION_KEYS`), every call that names a person (one
-//! PM's tasks, routines or approvals) also carries a signed user assertion for that person
-//! (`X-Pmos-Assertion`, `docs/user-assertion.md`): issuer `console`, valid for 60 seconds,
-//! bound to the method, path, query and body sent, signed afresh for every call. Routine
-//! changes (pause, resume, delete) carry one for the viewer who made them. Reads of
-//! everything carry none.
+//! With a key for an upstream (`PMOS_ASSERTION_KEYS`), every call to the bot runtime carries
+//! a signed user assertion for the viewer (`X-Pmos-Assertion`, `docs/user-assertion.md`):
+//! issuer `console`, valid for 60 seconds, bound to the method, path, query and body sent,
+//! signed afresh for every call. The runtime decides from it what the viewer sees: their own
+//! tasks and routines, or for an admin everyone's with the ask, result and prompt of anyone
+//! else's left out. Tool-server calls carry one for the PM whose inbox is read.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -176,6 +176,10 @@ pub struct Task {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+    /// The runtime left the ask, the result and the error out: someone else's task in the
+    /// list, which the console gets as metadata only.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -218,6 +222,31 @@ pub struct Routine {
     pub next_run_at: Option<String>,
     #[serde(default)]
     pub last_run_at: Option<String>,
+    /// The runtime left the prompt out: someone else's routine.
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// One PM's pending approvals as the tool server listed them: `truncated` when it left some
+/// out past its safety cap, with how many are pending in all.
+#[derive(Debug, Clone, Default)]
+pub struct PendingPage {
+    pub items: Vec<Approval>,
+    pub truncated: bool,
+    pub total_pending: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ApprovalList {
+    Paged {
+        items: Vec<Approval>,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        total_pending: Option<usize>,
+    },
+    Bare(Vec<Approval>),
 }
 
 /// A pending write in a PM's inbox (`GET /internal/approvals`).
@@ -484,25 +513,34 @@ impl Upstream {
 
     // The bot runtime.
 
-    pub async fn bots(&self) -> UpstreamResult<Vec<BotSummary>> {
-        self.list(&["v1", "bots"], &[], None).await
+    /// The bot roster, signed for `viewer`: under `require` every console call to the runtime
+    /// carries the viewer's assertion.
+    pub async fn bots(&self, viewer: &str) -> UpstreamResult<Vec<BotSummary>> {
+        self.list(&["v1", "bots"], &[], Some(viewer)).await
     }
 
-    pub async fn bot(&self, name: &str) -> UpstreamResult<BotDetail> {
+    pub async fn bot(&self, viewer: &str, name: &str) -> UpstreamResult<BotDetail> {
         Ok(self
-            .get::<BotDetailWire>(&["v1", "bots", name], &[], None)
+            .get::<BotDetailWire>(&["v1", "bots", name], &[], Some(viewer))
             .await?
             .into())
     }
 
-    pub async fn tasks(&self, requested_by: Option<&str>, limit: u32) -> UpstreamResult<Vec<Task>> {
+    /// Recent tasks, signed for `viewer`. The runtime answers a non-admin only their own, and
+    /// an admin everyone's with the ask and result of anyone else's left out (`hidden`).
+    /// `requested_by`, when set, must be the viewer.
+    pub async fn tasks(
+        &self,
+        viewer: &str,
+        requested_by: Option<&str>,
+        limit: u32,
+    ) -> UpstreamResult<Vec<Task>> {
         let limit = limit.to_string();
         let mut query = vec![("limit", limit.as_str())];
         if let Some(who) = requested_by {
             query.push(("requested_by", who));
         }
-        // One PM's tasks name them; all tasks name no one.
-        self.list(&["v1", "tasks"], &query, requested_by).await
+        self.list(&["v1", "tasks"], &query, Some(viewer)).await
     }
 
     /// One task, with an assertion for `viewer`: under `require` the runtime answers only the
@@ -523,9 +561,15 @@ impl Upstream {
             .await
     }
 
-    pub async fn routines(&self, owner: Option<&str>) -> UpstreamResult<Vec<Routine>> {
+    /// Routines, signed for `viewer`, as [`Self::tasks`]: someone else's come without their
+    /// prompt (`hidden`). `owner`, when set, must be the viewer.
+    pub async fn routines(
+        &self,
+        viewer: &str,
+        owner: Option<&str>,
+    ) -> UpstreamResult<Vec<Routine>> {
         let query: Vec<(&str, &str)> = owner.map(|o| ("owner", o)).into_iter().collect();
-        self.list(&["v1", "routines"], &query, owner).await
+        self.list(&["v1", "routines"], &query, Some(viewer)).await
     }
 
     /// Pause or resume a routine, with an assertion for `viewer`, the person who asked. The
@@ -558,12 +602,31 @@ impl Upstream {
     // The tool server.
 
     /// A PM's pending approvals, newest first, with an assertion for that PM.
-    pub async fn pending_approvals(&self, user: &str) -> UpstreamResult<Vec<Approval>> {
-        self.list(
-            &["internal", "approvals"],
-            &[("user", user), ("status", "pending")],
-            Some(user),
-        )
-        .await
+    /// Every pending item: the tool server never cuts them at its cap on decided items, and
+    /// says `truncated` if it ever left some out past its much higher safety cap.
+    pub async fn pending_approvals(&self, user: &str) -> UpstreamResult<PendingPage> {
+        let page = self
+            .get::<ApprovalList>(
+                &["internal", "approvals"],
+                &[("user", user), ("status", "pending")],
+                Some(user),
+            )
+            .await?;
+        Ok(match page {
+            ApprovalList::Bare(items) => PendingPage {
+                total_pending: items.len(),
+                items,
+                truncated: false,
+            },
+            ApprovalList::Paged {
+                items,
+                truncated,
+                total_pending,
+            } => PendingPage {
+                total_pending: total_pending.unwrap_or(items.len()).max(items.len()),
+                items,
+                truncated,
+            },
+        })
     }
 }

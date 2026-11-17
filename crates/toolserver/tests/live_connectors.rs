@@ -1319,8 +1319,15 @@ async fn slack_writes_check_their_audience_before_posting() {
     let decide = |id: String, confirm_external: bool| {
         let svc = svc.clone();
         async move {
+            // As the Slack bot sends it: what its card showed.
+            let shown = svc
+                .approval(&id)
+                .await
+                .unwrap()
+                .map(|i| i.args_hash[..16].to_string());
             let verdict = Verdict {
                 confirm_external,
+                expected_args_hash: shown,
                 ..Verdict::new(Decision::Approve, None)
             };
             svc.decide_verdict(Client::Bot, &id, "ana", verdict, Utc::now())

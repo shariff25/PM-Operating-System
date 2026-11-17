@@ -5,7 +5,7 @@
 //! | --- | --- |
 //! | `slack` | create tasks as `X-Pmos-User`; read that PM's tasks and routines; read and set that PM's settings; read the shared notification feed and the bot list (no PM needed) |
 //! | `worker` | claim, heartbeat, events, trace, complete, fail |
-//! | `console` | read everything, settings included; pause, resume and delete routines; cancel tasks |
+//! | `console` | for the viewer its assertion names (every call under `require`): their own tasks and routines in full, or for an admin everyone's with the ask, result and prompt of others left out; one task's detail for its PM or an admin; settings; pause, resume, delete and cancel their own (any for an admin) |
 //! | `evals` | create tasks with `source: "eval"` (and a task's own `level`) as a handle in `PMOS_EVALS_AS` only, with no Slack target; read them and their drafts |
 //!
 //! A task's drafts (`GET /v1/tasks/{id}/drafts`) are for the console and evals only: the
@@ -367,7 +367,10 @@ async fn check_assertion(
                 .unwrap_or(req.uri().path()),
         );
     let Some(header) = req.headers().get(pmos_assertion::HEADER).cloned() else {
-        if assertions.mode() == Mode::Require && (!named.is_empty() || one_task_read) {
+        // Under `require` every console call is signed for its viewer (R1): what it may see
+        // and do depends on who that is. A `web` call needs one when it names a person.
+        let console = kind == ClientKind::Console;
+        if assertions.mode() == Mode::Require && (console || !named.is_empty() || one_task_read) {
             return Err(refuse_assertion(kind, Refusal::Missing));
         }
         return Ok((req, None));
@@ -466,6 +469,10 @@ struct CreateTask {
     /// The conversation this task continues: the web and Slack clients only.
     #[serde(default)]
     conversation: Option<String>,
+    /// The lowest level the task's session starts at (`NewTask::sensitivity_floor`): the web
+    /// client only, for a task outside any conversation (a draft's revision).
+    #[serde(default)]
+    sensitivity_floor: Option<model::Sensitivity>,
 }
 
 async fn create_task(
@@ -492,6 +499,13 @@ async fn create_task(
     {
         return Err(forbidden(
             "only the web, Slack and evals clients name a task's conversation",
+        ));
+    }
+    if req.sensitivity_floor.is_some()
+        && (caller.kind != ClientKind::Web || req.conversation.is_some() || req.slack.is_some())
+    {
+        return Err(forbidden(
+            "only the web client sets a task's sensitivity floor, on a task outside any conversation",
         ));
     }
     match caller.kind {
@@ -545,6 +559,7 @@ async fn create_task(
                 slack: req.slack,
                 level: req.level,
                 conversation: req.conversation,
+                sensitivity_floor: req.sensitivity_floor,
             },
             model::now(),
         )
@@ -632,10 +647,67 @@ async fn list_tasks(
             filter.requested_by = Some(caller.user().to_string());
         }
         ClientKind::Evals => filter.source = Some(Source::Eval),
-        _ => {}
+        ClientKind::Console => {
+            // A non-admin viewer lists only their own tasks (a `requested_by` naming anyone
+            // else was already refused: it must equal the assertion's subject).
+            if let Some(viewer) = caller.acting.as_deref() {
+                if !state.rt.catalog().is_admin(viewer) {
+                    filter.requested_by = Some(viewer.to_string());
+                }
+            }
+        }
+        ClientKind::Worker => {}
     }
     let tasks = state.rt.store.tasks(&filter).await?;
-    Ok(Json(tasks).into_response())
+    if caller.kind != ClientKind::Console {
+        return Ok(Json(tasks).into_response());
+    }
+    // The console sees the full record of the viewer's own tasks only; anyone else's (an
+    // admin's team view, or every task on an unsigned call in `off`/`verify`) is metadata.
+    let viewer = caller.acting.as_deref();
+    let listed: Vec<Value> = tasks
+        .into_iter()
+        .map(|t| {
+            if viewer == Some(t.requested_by.as_str()) {
+                serde_json::to_value(&t).unwrap_or(Value::Null)
+            } else {
+                task_metadata(&t)
+            }
+        })
+        .collect();
+    Ok(Json(listed).into_response())
+}
+
+/// A task as metadata only (R1): its ids, bot, who asked, source, status and times, with the
+/// ask's text, the result, the error, the checklist and any Slack reference removed, and
+/// `hidden: true` so a reader can say why.
+fn task_metadata(task: &Task) -> Value {
+    json!({
+        "id": task.id,
+        "bot": task.bot,
+        "requested_by": task.requested_by,
+        "source": task.source,
+        "priority": task.priority,
+        "status": task.status,
+        "text": "",
+        "result": null,
+        "error": null,
+        "checklist": [],
+        "approvals": task.approvals,
+        "routine_id": task.routine_id,
+        "attempts": task.attempts,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+        "hidden": true,
+    })
+}
+
+/// A routine as metadata only (R1): everything but its prompt, with `hidden: true`.
+fn routine_metadata(routine: &model::Routine) -> Value {
+    let mut v = serde_json::to_value(routine).unwrap_or(Value::Null);
+    v["prompt"] = json!("");
+    v["hidden"] = json!(true);
+    v
 }
 
 async fn cancel_task(
@@ -648,10 +720,17 @@ async fn cancel_task(
         &[ClientKind::Slack, ClientKind::Web, ClientKind::Console],
         "cancel tasks",
     )?;
+    // The console cancels only signed for a viewer, in every mode (R1): the task's own PM
+    // or an admin in this runtime's team.yaml (`visible`), and the cancel is recorded as them.
+    if caller.kind == ClientKind::Console && caller.acting.is_none() {
+        return Err(forbidden(
+            "the console cancels a task only with a user assertion for the viewer",
+        ));
+    }
     visible_task(&state, &caller, &id).await?;
     let by = match caller.kind {
         ClientKind::Slack | ClientKind::Web => caller.user().to_string(),
-        _ => "the console".into(),
+        _ => caller.acting.clone().unwrap_or_default(),
     };
     let task = state.rt.cancel(&id, &by, model::now()).await?;
     Ok(Json(task).into_response())
@@ -1080,14 +1159,44 @@ async fn list_routines(
         own(&caller, owner.as_deref().unwrap_or(caller.user()))?;
         owner = Some(caller.user().to_string());
     }
+    let viewer = caller
+        .acting
+        .as_deref()
+        .filter(|_| caller.kind == ClientKind::Console);
+    if let Some(v) = viewer.filter(|v| !state.rt.catalog().is_admin(v)) {
+        // A non-admin console viewer lists only their own routines.
+        owner = Some(v.to_string());
+    }
     let routines = state.rt.store.routines(owner.as_deref()).await?;
-    Ok(Json(routines).into_response())
+    if caller.kind != ClientKind::Console {
+        return Ok(Json(routines).into_response());
+    }
+    // As for tasks: the console gets the prompts of the viewer's own routines only.
+    let listed: Vec<Value> = routines
+        .iter()
+        .map(|r| {
+            if viewer == Some(r.owner.as_str()) {
+                serde_json::to_value(r).unwrap_or(Value::Null)
+            } else {
+                routine_metadata(r)
+            }
+        })
+        .collect();
+    Ok(Json(listed).into_response())
 }
 
-/// The routine, if `caller` may manage it (else `404`, as if it didn't exist).
+/// The routine, if `caller` may manage it (else `404`, as if it didn't exist). A console call
+/// signed for a viewer manages only the viewer's own routines, or any for an admin in this
+/// runtime's team.yaml.
 async fn managed_routine(state: &AppState, caller: &Caller, id: &str) -> Result<(), Error> {
     let routine = state.rt.routine(id).await?;
-    if caller.kind.is_pm() && routine.owner != caller.user() {
+    let others = routine.owner != caller.user();
+    let console_refused = caller.kind == ClientKind::Console
+        && caller
+            .acting
+            .as_deref()
+            .is_some_and(|v| v != routine.owner && !state.rt.catalog().is_admin(v));
+    if (caller.kind.is_pm() && others) || console_refused {
         return Err(Error::NotFound(format!("no routine {id}")));
     }
     Ok(())

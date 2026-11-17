@@ -71,8 +71,9 @@ is_set() { [ -n "${!1:-}" ] && [ "${!1}" != generated ]; }
 # runtime or the tool server: `up`, `add-bot`, and the `up` after a `restore`. The mode lives in
 # deploy/.env (setup.sh writes `require`), never in one command's environment, so every path
 # starts them the same way. With a web or console token set, the services themselves refuse to
-# start in `off` or `verify` (unless PMOS_ASSERTION_INSECURE_OFF=1); this says so first, and
-# that each set client has its keys, so nothing is half-configured.
+# start in `off` or `verify`; this says so first, and that each set client has its keys, so
+# nothing is half-configured. The development override (PMOS_ASSERTION_INSECURE_OFF) is for
+# fake-data development stacks only: compose.yaml doesn't pass it, so it is refused here too.
 assertion_checks() {
   local mode="${PMOS_ASSERTION_MODE:-}" person=() k
   for k in PMOS_RT_WEB_TOKEN PMOS_TS_WEB_TOKEN PMOS_RT_CONSOLE_TOKEN PMOS_CONSOLE_TS_TOKEN; do
@@ -83,16 +84,14 @@ assertion_checks() {
     *) say "PMOS_ASSERTION_MODE=$mode in deploy/.env: use require (docs/user-assertion.md)" >&2; return 1 ;;
   esac
   if [ ${#person[@]} -gt 0 ] && [ -n "$mode" ] && [ "$mode" != require ]; then
-    if [ "${PMOS_ASSERTION_INSECURE_OFF:-}" = 1 ]; then
-      say "WARNING, INSECURE: PMOS_ASSERTION_MODE=$mode with ${person[*]} set and" >&2
-      say "PMOS_ASSERTION_INSECURE_OFF=1. Anyone holding those tokens can act as any PM." >&2
-      say "Development only, never production." >&2
-    else
-      say "PMOS_ASSERTION_MODE=$mode in deploy/.env, with ${person[*]} set: the runtime and the" >&2
-      say "tool server refuse to start like this. Set PMOS_ASSERTION_MODE=require in deploy/.env" >&2
-      say "(docs/user-assertion.md, Modes)." >&2
-      return 1
+    if [ -n "${PMOS_ASSERTION_INSECURE_OFF:-}" ]; then
+      say "PMOS_ASSERTION_INSECURE_OFF is set in deploy/.env: that override is for fake-data" >&2
+      say "development stacks only, and this deployment doesn't pass it to the services." >&2
     fi
+    say "PMOS_ASSERTION_MODE=$mode in deploy/.env, with ${person[*]} set: the runtime and the" >&2
+    say "tool server refuse to start like this. Set PMOS_ASSERTION_MODE=require in deploy/.env" >&2
+    say "(docs/user-assertion.md, Modes)." >&2
+    return 1
   fi
   local pair effective
   for pair in PMOS_RT_WEB_TOKEN:PMOS_AK_WEB_BOTS PMOS_TS_WEB_TOKEN:PMOS_AK_WEB_TOOLSERVER \

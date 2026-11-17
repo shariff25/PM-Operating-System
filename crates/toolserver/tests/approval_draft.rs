@@ -13,11 +13,12 @@ use common::Fixture;
 use pmos_assertion::{unix_now, Claims, Key, KeyRing, RequestBinding};
 use pmos_contract::model::Role;
 use pmos_toolserver::app::BotAccess;
-use pmos_toolserver::approvals::Decision;
+use pmos_toolserver::approvals::{Decision, Verdict};
 use pmos_toolserver::assertion::{parse_keys, Assertions, Mode, AUDIENCE, ISSUERS};
 use pmos_toolserver::audit::{Client, Outcome};
 use pmos_toolserver::connectors::fake::{SLACK_ALL_TEAM, SLACK_PM, SLACK_WITH_OUTSIDER};
 use pmos_toolserver::ledger::{LedgerOutcome, LedgerQuery};
+use pmos_toolserver::service::DecisionError;
 use pmos_toolserver::{router_full, AppConfig, PersonClients};
 use reqwest::Method;
 use serde_json::{json, Value};
@@ -211,10 +212,50 @@ async fn an_edit_saved_in_the_web_app_is_what_slack_approves_and_writes() {
     assert_eq!(card["args"]["text"], EDITED);
     assert_eq!(card["edited"], true);
 
-    // The PM approves on the Slack card (the bot's token, decision `approve`): the edit is
-    // what is posted.
+    // R4: approving on the card posted before the edit (its args hash) is refused as stale,
+    // and an approve that says nothing about what was shown is refused too. Nothing is posted.
     let decide = format!("/internal/approvals/{}/decision", srv.mine);
-    let body = serde_json::to_vec(&json!({"decided_by": SLACK_PM, "decision": "approve"})).unwrap();
+    let old = &before["args_hash"].as_str().unwrap()[..16];
+    for (body, want, code) in [
+        (
+            json!({"decided_by": SLACK_PM, "decision": "approve", "expected_args_hash": old}),
+            409,
+            "stale",
+        ),
+        (
+            json!({"decided_by": SLACK_PM, "decision": "approve"}),
+            400,
+            "expected_args_hash_required",
+        ),
+        (
+            json!({"decided_by": SLACK_PM, "decision": "approve", "expected_args_hash": "XYZ"}),
+            400,
+            "bad_expected_args_hash",
+        ),
+    ] {
+        let body = serde_json::to_vec(&body).unwrap();
+        let (s, v) = srv
+            .send(Method::POST, &decide, BOT_TOKEN, Some(&body), None)
+            .await;
+        assert_eq!((s, v["code"].as_str()), (want, Some(code)), "{v}");
+    }
+    assert!(srv.f.slack.writes().is_empty());
+    assert_eq!(srv.item(&srv.mine).await["status"], "pending");
+    let stale = srv.f.audit.events();
+    assert!(
+        stale
+            .iter()
+            .any(|e| e.detail.as_deref().is_some_and(|d| d.starts_with("stale:"))),
+        "the stale refusal is audited"
+    );
+
+    // The PM approves on the refreshed Slack card (the bot's token, decision `approve`, the
+    // hash it shows): the edit is what is posted.
+    let shown = &card["args_hash"].as_str().unwrap()[..16];
+    let body = serde_json::to_vec(
+        &json!({"decided_by": SLACK_PM, "decision": "approve", "expected_args_hash": shown}),
+    )
+    .unwrap();
     let (s, v) = srv
         .send(Method::POST, &decide, BOT_TOKEN, Some(&body), None)
         .await;
@@ -336,7 +377,7 @@ async fn a_saved_edit_in_postgres() {
     let now = Utc::now();
     let saved = f
         .svc
-        .save_draft(Client::Web, &id, SLACK_PM, reply(EDITED), now)
+        .save_draft(Client::Web, &id, SLACK_PM, reply(EDITED), None, now)
         .await
         .unwrap();
     assert!(saved.edited() && saved.edited_at.is_some());
@@ -347,12 +388,34 @@ async fn a_saved_edit_in_postgres() {
     // Someone else can't.
     assert!(f
         .svc
-        .save_draft(Client::Web, &id, OTHER, reply("x"), now)
+        .save_draft(Client::Web, &id, OTHER, reply("x"), None, now)
         .await
         .is_err());
+    let shown = read.args_hash[..16].to_string();
+    // A card from before the save: stale, in Postgres too.
+    let before_save = pmos_toolserver::approvals::args_hash(&reply("Yes."));
+    assert_eq!(
+        f.svc
+            .decide_verdict(
+                Client::Bot,
+                &id,
+                SLACK_PM,
+                Verdict::new(Decision::Approve, None).shown(Some(before_save[..16].into())),
+                now,
+            )
+            .await
+            .unwrap_err(),
+        DecisionError::Decide(pmos_toolserver::approvals::DecideError::Stale)
+    );
     let done = f
         .svc
-        .decide_as(Client::Bot, &id, SLACK_PM, Decision::Approve, None, now)
+        .decide_verdict(
+            Client::Bot,
+            &id,
+            SLACK_PM,
+            Verdict::new(Decision::Approve, None).shown(Some(shown)),
+            now,
+        )
         .await
         .unwrap();
     assert_eq!(done.status.as_str(), "approved");
@@ -365,7 +428,7 @@ async fn a_saved_edit_in_postgres() {
     let other = draft_in(&f, SLACK_PM, "tsk_pg2", OTHER_THREAD).await;
     let edit = json!({"channel": SLACK_ALL_TEAM, "thread_ts": OTHER_THREAD, "text": EDITED});
     f.svc
-        .save_draft(Client::Web, &other, SLACK_PM, edit, now)
+        .save_draft(Client::Web, &other, SLACK_PM, edit, None, now)
         .await
         .unwrap();
     f.svc
