@@ -255,6 +255,7 @@ pub fn router_full(
         .route("/approvals", get(list_approvals))
         .route("/approvals/{id}", get(get_approval))
         .route("/approvals/{id}/decision", post(decide))
+        .route("/approvals/{id}/draft", axum::routing::put(save_draft))
         .route("/approvals/{id}/sources", get(approval_sources))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -904,6 +905,69 @@ async fn decide(
             tracing::error!(error = %e, id = %id, "approved write task failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_FAILURE)
         }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftBody {
+    args: Value,
+}
+
+/// `PUT /internal/approvals/{id}/draft?user=<handle>` `{"args": {...}}`: the item's own PM
+/// saves an edit of a pending draft (the web app's **Save**), which every surface then shows
+/// and an approve anywhere writes. `pmos-web` (with a user assertion for `user`, as
+/// `PMOS_ASSERTION_MODE` says) and the orchestrator; never the Slack bot (its edit is a
+/// decision) or the console (read-only). Someone else's item, or a call that names nobody, is
+/// `404` like a missing one. Refusals: `409 not_pending` or `expired`, `400` arguments that
+/// don't fit the tool, `422 target_changed`, `403` not a team member. Answers the item.
+async fn save_draft(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Extension(acting): Extension<Acting>,
+    Path(id): Path<String>,
+    Query(q): Query<OneApprovalQuery>,
+    Json(body): Json<DraftBody>,
+) -> Response {
+    if !matches!(client, Client::Web | Client::Orchestrator) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "this token may not use this endpoint",
+        );
+    }
+    let not_found = || error(StatusCode::NOT_FOUND, "no such approval item");
+    let Some(user) = q.user.filter(|u| !u.trim().is_empty()) else {
+        return not_found();
+    };
+    if acting.0.as_ref().is_some_and(|who| *who != user) {
+        return not_found();
+    }
+    match state
+        .svc
+        .save_draft(client, &id, &user, body.args, Utc::now())
+        .await
+    {
+        Ok(item) => Json(state.svc.approval_json(&item).await).into_response(),
+        Err(DecisionError::Decide(DecideError::NotFound | DecideError::Forbidden)) => not_found(),
+        Err(DecisionError::Decide(DecideError::Store(e))) => unavailable(e),
+        Err(e @ DecisionError::Decide(DecideError::Expired)) => {
+            coded(StatusCode::CONFLICT, "expired", e.to_string(), json!({}))
+        }
+        Err(e @ DecisionError::Decide(_)) => coded(
+            StatusCode::CONFLICT,
+            "not_pending",
+            e.to_string(),
+            json!({}),
+        ),
+        Err(e @ DecisionError::InvalidArgs(_)) => error(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e @ DecisionError::TargetChanged(_)) => coded(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            TARGET_CHANGED,
+            e.to_string(),
+            json!({}),
+        ),
+        Err(e @ DecisionError::NotAMember(_)) => error(StatusCode::FORBIDDEN, e.to_string()),
+        Err(e) => error(StatusCode::CONFLICT, e.to_string()),
     }
 }
 

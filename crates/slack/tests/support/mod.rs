@@ -280,6 +280,16 @@ async fn rt_create_task(State(rt): Rt, headers: HeaderMap, Json(body): Json<Valu
 
 async fn rt_notifications(State(rt): Rt, Query(q): Query<HashMap<String, String>>) -> Response {
     let from: usize = q.get("after").and_then(|a| a.parse().ok()).unwrap_or(0);
+    // A cursor past the feed (as after a runtime's database was reset): `409 cursor_ahead`,
+    // with the feed's present.
+    let len = rt.feed.lock().unwrap().len();
+    if from > len {
+        return answer(
+            StatusCode::CONFLICT,
+            json!({"code": "cursor_ahead", "error": "cursor is ahead of the feed",
+                   "cursor": len.to_string()}),
+        );
+    }
     let items: Vec<Value> = rt.feed.lock().unwrap().iter().skip(from).cloned().collect();
     if items.is_empty() {
         tokio::time::sleep(Duration::from_millis(100)).await;

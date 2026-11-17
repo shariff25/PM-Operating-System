@@ -256,6 +256,7 @@ async fn harness_with(change: impl FnOnce(&mut Config)) -> Harness {
         entra: Some(entra_config(&web_base, &idp_base)),
         session_idle: Duration::hours(8),
         session_max: Duration::hours(24),
+        internal_bind: None,
     };
     change(&mut config);
     let clock = Arc::new(Mutex::new(Utc::now()));
@@ -1019,9 +1020,19 @@ fn start_up_needs_entra_fully_configured_or_development_sign_in() {
         .map(|p| p.name())
         .collect();
     assert_eq!(providers, ["entra"]);
-    // Both (main logs a loud warning).
-    let cfg = Config::from_lookup(lookup(env(true, &FULL))).unwrap();
+    // Both: refused, unless the explicit development override is set (and main then logs a
+    // loud warning).
+    let err = Config::from_lookup(lookup(env(true, &FULL))).unwrap_err();
+    assert!(err.contains("PMOS_WEB_DEV_LOGIN_WITH_ENTRA"), "{err}");
+    assert!(!err.contains(SECRET), "{err}");
+    let mut overridden = env(true, &FULL);
+    overridden.push(("PMOS_WEB_DEV_LOGIN_WITH_ENTRA", "1".into()));
+    let cfg = Config::from_lookup(lookup(overridden.clone())).unwrap();
     assert!(cfg.dev_login && cfg.entra.is_some());
+    // And never on an address others can reach.
+    overridden.push(("PMOS_WEB_BIND", "0.0.0.0:8770".into()));
+    let err = Config::from_lookup(lookup(overridden)).unwrap_err();
+    assert!(err.contains("loopback"), "{err}");
     // A sovereign cloud's authority.
     let mut with_authority = FULL.to_vec();
     with_authority.push("PMOS_WEB_ENTRA_AUTHORITY");
@@ -1173,4 +1184,55 @@ async fn logs_never_contain_a_secret_code_or_token() {
     // The hash of nothing logged either (sanity: the secret's digest isn't a log key).
     let digest = b64(&sha2::Sha256::digest(SECRET.as_bytes()));
     assert!(!logs.contains(&digest));
+}
+
+// Matching by object id.
+
+#[tokio::test]
+async fn a_member_with_an_object_id_signs_in_only_as_that_account() {
+    let h = harness().await;
+    let team = |oid: &str| {
+        format!(
+            "members:\n  - {{handle: ana, slack-id: U0ANA, email: ana@contoso.example, \
+             entra-oid: {oid}, roles: [pm]}}\n"
+        )
+    };
+    // The token's `oid` is ...a0a0: the member's matches, in any case.
+    std::fs::write(
+        h._dir.path().join("team.yaml"),
+        team("00000000-0000-0000-0000-00000000A0A0"),
+    )
+    .unwrap();
+    let landed = h.sign_in_with(good).await;
+    let session = landed.session().expect("signed in");
+    assert_eq!(h.me(&session).await.0, StatusCode::OK);
+    // Someone else now holds the email address in the tenant: another account, another
+    // `oid`. They don't sign in as ana.
+    let other = |_: &Begun, mut c: Value| {
+        c["oid"] = json!("11111111-2222-3333-4444-555555555555");
+        sign(&c, keys::KEY_A_DER, "key-a")
+    };
+    h.sign_in_with(other).await.assert_refused("wrong_account");
+    // Nor does a token without an `oid`.
+    let none = |_: &Begun, mut c: Value| {
+        c.as_object_mut().unwrap().remove("oid");
+        sign(&c, keys::KEY_A_DER, "key-a")
+    };
+    h.sign_in_with(none).await.assert_refused("wrong_account");
+    // team.yaml now names another account for ana (and is a different size, so the cached
+    // copy is read again at once): her existing session ends.
+    std::fs::write(
+        h._dir.path().join("team.yaml"),
+        format!(
+            "{}# changed\n",
+            team("99999999-0000-0000-0000-000000000001")
+        ),
+    )
+    .unwrap();
+    let (status, body) = h.me(&session).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "signed_out");
+    // Without `entra-oid`, the email alone still matches (as before).
+    std::fs::write(h._dir.path().join("team.yaml"), TEAM).unwrap();
+    assert!(h.sign_in_with(other).await.session().is_some());
 }

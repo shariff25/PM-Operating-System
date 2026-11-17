@@ -50,9 +50,15 @@ and rejects; the footer says so: "To edit or snooze a draft, use its card in our
 Rejecting from the Home records no reason; to say why, reject on the card.
 
 A Confluence or Jira draft's card in our DM also has **Open in workspace** when the web app is
-set up (`PMOS_WEB_PUBLIC_URL`). It opens the same draft at `/drafts/<id>` in the web app, where
-the PM can read, edit and decide it. The button is absent when that setting is unset, and on
-Slack replies and messages, which have no web page.
+set up (`PMOS_WEB_PUBLIC_URL`). It opens the same draft at `/#/d/<id>` in the web app, where
+the PM can read, edit and decide it (cards posted earlier link to `/drafts/<id>`, which the web
+app redirects there). The button is absent when that setting is unset, and on Slack replies and
+messages, which have no web page.
+
+**An edit saved in the web app** is saved on the draft itself, so the card approves it: the
+card says "edited by <PM>", and an **Approve** on a card posted before the edit approves
+nothing, but shows the card again with the text as it is now (its buttons carry the start of
+the text's hash, `approval:<id>:<hash>`), to read and approve again.
 
 **What the Slack bot can see and change.** The bot is the approval screen, so the tool server
 limits what its token can do:

@@ -9,11 +9,18 @@
 //! - **Approvals (D7):** a card per pending item, from the tool server. A new or closed
 //!   approval also refreshes the PM's App Home if they have opened it (`home.rs`).
 //! - **The daily brief's block:** a ` ```pmos-brief ` block is taken out of every answer
-//!   before it is posted, and on `"done"`, when it came from the requester's own personal bot,
-//!   it is sent to pmos-web in the background (`brief_feed.rs`), if that is configured.
+//!   before it is posted. On `"done"` it is sent to pmos-web in the background
+//!   (`brief_feed.rs`), if that is configured, only when the task really is a brief: its
+//!   `routine_id` names the requester's own brief routine, or it is a `brief now` task this
+//!   service started (`brief::is_brief_task`), and it came from the requester's own personal
+//!   bot. A block in any other answer is dropped, never sent: the block alone proves nothing.
 //! - **Restarts:** the cursor is saved to `<state dir>/notifications.cursor` after each batch,
 //!   so a restart doesn't post anything twice. With no saved cursor (the first start), items
 //!   older than an hour are skipped rather than flooding the PMs' DMs.
+//! - **A cursor the runtime can't continue from** (its database was reset or restored, so the
+//!   saved cursor is ahead of it): the notifier starts again from the feed's present and logs
+//!   a warning, rather than waiting forever for a cursor that will never come. See
+//!   [`cursor_reset`] for the answers it recognises; each is optional.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -81,7 +88,9 @@ impl Notifier {
             }
         }
         let mut cursor = read_cursor(&self.cursor_file);
-        let first_start = cursor.is_none();
+        let mut first_start = cursor.is_none();
+        let epoch_file = self.cursor_file.with_file_name(EPOCH_FILE);
+        let mut epoch = read_cursor(&epoch_file);
         if first_start {
             tracing::info!("no saved notification cursor; skipping anything older than an hour");
         }
@@ -106,6 +115,31 @@ impl Notifier {
                     continue;
                 }
             };
+            if let Some(reset) = cursor_reset(&batch, cursor.as_deref(), epoch.as_deref()) {
+                // Ids only, never message text.
+                tracing::warn!(
+                    saved = cursor.as_deref().unwrap_or("none"),
+                    restart_from = reset.as_deref().unwrap_or("the start, skipping old items"),
+                    "the runtime can't continue from the saved notification cursor; starting \
+                     again from now"
+                );
+                cursor = reset;
+                match &cursor {
+                    Some(c) => {
+                        if let Err(e) = write_cursor(&self.cursor_file, c) {
+                            tracing::error!(error = %e, "saving the notification cursor failed");
+                        }
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&self.cursor_file);
+                        // From the feed's start: nothing older than an hour is posted.
+                        first_start = true;
+                    }
+                }
+                epoch = remember_epoch(&epoch_file, &batch, epoch);
+                continue;
+            }
+            epoch = remember_epoch(&epoch_file, &batch, epoch);
             let items = batch["items"].as_array().cloned().unwrap_or_default();
             for item in &items {
                 if first_start && older_than(item, self.max_age_on_first_start) {
@@ -191,7 +225,14 @@ impl Notifier {
                 // A delivered daily brief is that day's one message from PM OS.
                 crate::brief::note_delivery(&self.bots, item).await;
                 if let Some(block) = split.block {
-                    self.feed_brief(item, &bot, block);
+                    if crate::brief::is_brief_task(&self.bots, item).await {
+                        self.feed_brief(item, &bot, block);
+                    } else {
+                        tracing::warn!(
+                            task = %task_id,
+                            "a brief block in a task that isn't a brief; not sent"
+                        );
+                    }
                 }
                 self.finish_progress(&task_id, Stage::Done).await;
                 if !text.trim().is_empty() {
@@ -396,6 +437,54 @@ fn older_than(item: &Value, max_age: Duration) -> bool {
     age.to_std().is_ok_and(|age| age > max_age)
 }
 
+/// Where the feed's `epoch` is kept beside the cursor, when the runtime sends one.
+pub const EPOCH_FILE: &str = "notifications.epoch";
+
+/// Should the notifier start again, and from where? `Some(Some(head))`: from `head`, the
+/// feed's present; `Some(None)`: from the feed's start, skipping old items; `None`: carry on.
+///
+/// The runtime's notification feed may say its position can't be continued from in any of
+/// these ways, each optional (an answer with none of them changes nothing):
+/// - **Explicitly:** `{"code": "cursor_ahead" | "cursor_unknown", "cursor"?: <head>}`, as a
+///   `4xx` (`runtime.rs` passes it on as a batch with no items) or in a `200` batch; or
+///   `{"cursor_reset": true, "cursor"?: <head>}`. `head` may also come as `head`.
+/// - **By epoch:** a batch's `epoch` (any string or number naming the feed's lifetime) that
+///   differs from the one the notifier saw before: from the batch's `cursor`, if it has one.
+/// - **By position (fallback):** a batch's `head` (the feed's latest cursor), when the saved
+///   cursor and `head` are both whole numbers and the saved one is greater: from `head`.
+pub fn cursor_reset(
+    batch: &Value,
+    saved: Option<&str>,
+    epoch: Option<&str>,
+) -> Option<Option<String>> {
+    let head = cursor_of(&batch["head"]).or_else(|| cursor_of(&batch["cursor"]));
+    let code = batch["code"].as_str().unwrap_or_default();
+    if crate::runtime::CURSOR_CODES.contains(&code) || batch["cursor_reset"] == true {
+        return Some(head);
+    }
+    if let (Some(seen), Some(now)) = (epoch, cursor_of(&batch["epoch"])) {
+        if seen != now {
+            return Some(cursor_of(&batch["cursor"]));
+        }
+    }
+    let saved: u128 = saved?.parse().ok()?;
+    let head_n: u128 = cursor_of(&batch["head"])?.parse().ok()?;
+    (saved > head_n).then(|| Some(head_n.to_string()))
+}
+
+/// Keep the batch's `epoch`, if it sends one and it is new.
+fn remember_epoch(path: &Path, batch: &Value, seen: Option<String>) -> Option<String> {
+    match cursor_of(&batch["epoch"]) {
+        Some(now) if seen.as_deref() != Some(now.as_str()) => {
+            if let Err(e) = write_cursor(path, &now) {
+                tracing::error!(error = %e, "saving the notification epoch failed");
+            }
+            Some(now)
+        }
+        _ => seen,
+    }
+}
+
 fn read_cursor(path: &Path) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -440,5 +529,62 @@ mod tests {
         assert_eq!(read_cursor(&path), None);
         write_cursor(&path, "c-3").unwrap();
         assert_eq!(read_cursor(&path).as_deref(), Some("c-3"));
+    }
+
+    #[test]
+    fn a_cursor_the_runtime_cant_continue_from_starts_again_from_now() {
+        // An ordinary batch, with or without the optional fields: carry on.
+        let plain = json!({"cursor": "12", "items": []});
+        assert_eq!(cursor_reset(&plain, Some("10"), None), None);
+        assert_eq!(cursor_reset(&plain, None, None), None);
+        assert_eq!(
+            cursor_reset(&json!({"cursor": "12", "head": "12"}), Some("12"), None),
+            None
+        );
+        // Explicit: from the head it names, or from the start when it names none.
+        for code in ["cursor_ahead", "cursor_unknown"] {
+            assert_eq!(
+                cursor_reset(&json!({"code": code, "cursor": "40"}), Some("900"), None),
+                Some(Some("40".into()))
+            );
+            assert_eq!(
+                cursor_reset(&json!({"code": code, "head": 40}), Some("900"), None),
+                Some(Some("40".into()))
+            );
+            assert_eq!(
+                cursor_reset(&json!({"code": code}), Some("900"), None),
+                Some(None)
+            );
+        }
+        assert_eq!(
+            cursor_reset(
+                &json!({"cursor_reset": true, "cursor": "3"}),
+                Some("9"),
+                None
+            ),
+            Some(Some("3".into()))
+        );
+        // A new epoch: from the batch's cursor.
+        let fresh = json!({"epoch": "e2", "cursor": "5", "items": []});
+        assert_eq!(
+            cursor_reset(&fresh, Some("900"), Some("e1")),
+            Some(Some("5".into()))
+        );
+        assert_eq!(cursor_reset(&fresh, Some("900"), Some("e2")), None);
+        assert_eq!(
+            cursor_reset(&fresh, Some("900"), None),
+            None,
+            "the first sight of an epoch"
+        );
+        // Fallback: the saved cursor is past the feed's head.
+        let behind = json!({"cursor": "900", "head": "41", "items": []});
+        assert_eq!(
+            cursor_reset(&behind, Some("900"), None),
+            Some(Some("41".into()))
+        );
+        assert_eq!(cursor_reset(&behind, Some("41"), None), None);
+        // Cursors that aren't numbers are never compared.
+        let opaque = json!({"cursor": "c-9", "head": "c-1"});
+        assert_eq!(cursor_reset(&opaque, Some("c-9"), None), None);
     }
 }

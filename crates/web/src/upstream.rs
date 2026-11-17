@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pmos_assertion::{Claims, KeyRing, RequestBinding};
-use pmos_contract::model::TeamFile;
 use reqwest::header::{HeaderName, HeaderValue};
 
 use serde::de::DeserializeOwned;
@@ -36,16 +35,34 @@ pub const USER_HEADER: &str = "X-Pmos-User";
 pub enum UpstreamError {
     /// The upstream answered `404`.
     NotFound,
-    /// The upstream answered with another client error, and what it said: `code` and
-    /// `error` when the body had them.
+    /// The upstream answered with another client error (or `503`), and what it said: `code`
+    /// and `error` when the body had them, and for a Slack audience refusal what it counted.
+    /// `error` is the upstream's own sentence: it is never shown to the browser for a
+    /// decision (`app.rs`, `refused_decision`).
     Refused {
         service: &'static str,
         status: u16,
         code: Option<String>,
         error: Option<String>,
+        /// `members`, `outsiders` and `external` of a `needs_external_confirm` or
+        /// `audience_blocked` refusal; `None` otherwise.
+        audience: Option<RefusedAudience>,
     },
-    /// Connection failure, timeout, a server error, or a body that didn't parse.
+    /// The request never reached the upstream (it couldn't be built, signed or connected),
+    /// so nothing was done there.
     Failed { service: &'static str, why: String },
+    /// The request was sent and may have been acted on, but no usable answer came back: it
+    /// timed out, the connection dropped, the upstream failed with a `5xx` other than `503`,
+    /// or its success answer couldn't be read. For a decision, the outcome is unknown.
+    Unknown { service: &'static str, why: String },
+}
+
+/// What a tool server refusal said of a Slack channel's audience.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefusedAudience {
+    pub members: Option<u64>,
+    pub outsiders: Option<u64>,
+    pub external: Option<bool>,
 }
 
 pub type UpstreamResult<T> = Result<T, UpstreamError>;
@@ -136,6 +153,17 @@ pub struct Approval {
     /// shared outside the company.
     #[serde(default)]
     pub external: Option<bool>,
+    /// Whether a person changed the bot's text: a saved edit (`PUT .../draft`) or an edit
+    /// decision. `args` are then theirs. An older tool server doesn't send it.
+    #[serde(default)]
+    pub edited: bool,
+    /// When the PM last saved an edit of this pending draft.
+    #[serde(default)]
+    pub edited_at: Option<String>,
+    /// The highest data class the drafting session had read: `public`, `internal` or
+    /// `restricted`. Absent for items made before it was recorded, which count as restricted.
+    #[serde(default)]
+    pub sources_sensitivity: Option<String>,
 }
 
 /// One source of `GET /internal/approvals/{id}/sources`.
@@ -185,8 +213,9 @@ pub struct Signer {
     issuer: &'static str,
     audience: String,
     ring: KeyRing,
-    /// Where `team.yaml` is: the subject's roles are read from it at each call.
-    content_root: PathBuf,
+    /// `team.yaml`: the subject's roles at each call, from the parsed file (re-read when it
+    /// changes, `team.rs`).
+    team: crate::team::TeamCache,
 }
 
 impl std::fmt::Debug for Signer {
@@ -206,14 +235,15 @@ impl Signer {
             issuer,
             audience: audience.to_string(),
             ring,
-            content_root,
+            team: crate::team::TeamCache::new(content_root),
         }
     }
 
     /// The subject's known roles in `team.yaml`; none if the file or the member is missing.
     /// Receivers check roles against `team.yaml` themselves: these are informational.
     fn roles(&self, subject: &str) -> Vec<pmos_contract::model::Role> {
-        TeamFile::load(&self.content_root)
+        self.team
+            .load()
             .ok()
             .and_then(|t| t.by_handle(subject).map(|m| m.roles.clone()))
             .unwrap_or_default()
@@ -366,11 +396,16 @@ impl Client {
                 .insert(HeaderName::from_static(pmos_assertion::HEADER), value);
         }
         let res = self.http.execute(request).await.map_err(|e| {
-            self.failed(if e.is_timeout() {
-                "timed out"
+            // Refused or unreachable before anything was sent: nothing was done there.
+            // Anything later (a timeout waiting for the answer, a dropped connection) may
+            // have been acted on.
+            if e.is_connect() || e.is_builder() {
+                self.failed("didn't answer")
+            } else if e.is_timeout() {
+                self.unknown("timed out")
             } else {
-                "didn't answer"
-            })
+                self.unknown("dropped the connection")
+            }
         })?;
         let status = res.status();
         if status.is_success() {
@@ -382,20 +417,51 @@ impl Client {
         if status.is_client_error() || status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             let body: Value = res.json().await.unwrap_or(Value::Null);
             let text = |k: &str| body.get(k).and_then(Value::as_str).map(String::from);
+            let counted = ["members", "outsiders", "external"]
+                .iter()
+                .any(|k| body.get(k).is_some());
+            let audience = counted.then(|| RefusedAudience {
+                members: body.get("members").and_then(Value::as_u64),
+                outsiders: body.get("outsiders").and_then(Value::as_u64),
+                external: body.get("external").and_then(Value::as_bool),
+            });
             return Err(UpstreamError::Refused {
                 service: self.service,
                 status: status.as_u16(),
                 code: text("code"),
                 error: text("error"),
+                audience,
             });
         }
-        Err(self.failed(format!("answered {status}")))
+        Err(self.unknown(format!("answered {status}")))
     }
 
+    fn unknown(&self, why: impl std::fmt::Display) -> UpstreamError {
+        UpstreamError::Unknown {
+            service: self.service,
+            why: why.to_string(),
+        }
+    }
+
+    /// `GET <base>/healthz` answers `2xx` within two seconds. No token or person is sent.
+    async fn healthy(&self) -> bool {
+        let Ok(url) = self.url(&["healthz"]) else {
+            return false;
+        };
+        self.http
+            .get(url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+    }
+
+    /// A success answer's body. One that can't be read is [`UpstreamError::Unknown`]: the
+    /// upstream did what was asked, but what it answered isn't known here.
     async fn read<T: DeserializeOwned>(&self, res: reqwest::Response) -> UpstreamResult<T> {
         res.json::<T>()
             .await
-            .map_err(|_| self.failed("sent a reply pmos-web can't read"))
+            .map_err(|_| self.unknown("sent a reply pmos-web can't read"))
     }
 }
 
@@ -438,6 +504,11 @@ impl Runtime {
             )
             .await?;
         self.0.read(res).await
+    }
+
+    /// Is the runtime up (`GET /healthz`, no token, no person)? For `/readyz`.
+    pub async fn healthy(&self) -> bool {
+        self.0.healthy().await
     }
 
     /// `POST /v1/tasks` for `user`, with `source: "web"`.
@@ -537,6 +608,30 @@ impl ToolServer {
             .send(self.0.http.get(url).query(&[("user", user)]), Some(user))
             .await?;
         Ok(self.0.read::<SourcesReply>(res).await?.sources)
+    }
+
+    /// Save `user`'s edit of their pending item `id`: `PUT /internal/approvals/{id}/draft
+    /// ?user=<handle>` `{"args": …}`, with an assertion for them. The tool server keeps it on
+    /// the item, so the Slack card and the console show it and an approve anywhere writes it.
+    pub async fn save_draft(&self, user: &str, id: &str, args: &Value) -> UpstreamResult<Approval> {
+        let url = self.0.url(&["internal", "approvals", id, "draft"])?;
+        let res = self
+            .0
+            .send(
+                self.0
+                    .http
+                    .put(url)
+                    .query(&[("user", user)])
+                    .json(&json!({ "args": args })),
+                Some(user),
+            )
+            .await?;
+        self.0.read(res).await
+    }
+
+    /// Is the tool server up (`GET /healthz`, no token, no person)? For `/readyz`.
+    pub async fn healthy(&self) -> bool {
+        self.0.healthy().await
     }
 
     /// A decision, with an assertion for the PM in `decided_by`.

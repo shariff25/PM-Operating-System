@@ -206,6 +206,7 @@ fn member_add(
         slack_id,
         email,
         github,
+        entra_oid: None,
         roles: parsed,
     });
     std::fs::write(&path, render_team_yaml(&original, &team.members))?;

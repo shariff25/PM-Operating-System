@@ -158,7 +158,12 @@ pub trait FollowUpStore: Send + Sync {
     /// The day's `changed` items, `None` when nothing is stored or it has expired.
     async fn day(&self, handle: &str, now: DateTime<Utc>) -> Result<Option<Day>, StoreError>;
 
-    /// Delete everything expired; the number of rows removed.
+    /// When the producer last filled this PM's brief ([`FollowUpStore::replace`]), however
+    /// long ago; `None` if it never has. Kept after the day's items expire: a time, no text.
+    async fn delivered(&self, handle: &str) -> Result<Option<DateTime<Utc>>, StoreError>;
+
+    /// Delete everything expired; the number of rows removed. The time of the last delivery
+    /// is kept ([`FollowUpStore::delivered`]).
     async fn purge(&self, now: DateTime<Utc>) -> Result<u64, StoreError>;
 }
 
@@ -166,6 +171,7 @@ pub trait FollowUpStore: Send + Sync {
 struct PmRows {
     followups: Vec<FollowUp>,
     day: Option<Day>,
+    delivered: Option<DateTime<Utc>>,
 }
 
 #[derive(Default)]
@@ -271,7 +277,17 @@ impl FollowUpStore for MemoryFollowUpStore {
             changed,
             updated: now,
         });
+        pm.delivered = Some(now);
         Ok(())
+    }
+
+    async fn delivered(&self, handle: &str) -> Result<Option<DateTime<Utc>>, StoreError> {
+        Ok(self
+            .pms
+            .lock()
+            .expect("followups lock")
+            .get(handle)
+            .and_then(|p| p.delivered))
     }
 
     async fn day(&self, handle: &str, now: DateTime<Utc>) -> Result<Option<Day>, StoreError> {

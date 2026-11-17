@@ -54,6 +54,21 @@ harness ──same call (edited args if edited)──► tool server: grant matc
   `version`; `jira.create_issue`: `project`, `issue_type`, `epic`; `bets.record`: `key`. An
   optional one absent from both is unchanged; adding one is a change. The list is
   `EDIT_IMMUTABLE_ARGS` in `src/schemas.rs`. The orchestrator's edits are not limited.
+- **A saved edit** (`PUT /internal/approvals/{id}/draft`, the web app's **Save**): the item's
+  own PM changes a pending draft's text without deciding it. Its arguments become the edited
+  ones (with a new `args_hash`), so the Slack card, the console and the web app all show the
+  edit, and an `approve` from any of them writes it. The same rules as an edit decision: the
+  owner only, pending only (a Slack draft past its time expires first), arguments checked
+  against the tool's schema, and no change to where the draft goes (`422 target_changed`,
+  audited `denied`) from any client but the orchestrator. Source markers may stay in the saved
+  text; they are removed when it is written. It is audited as `approval.draft_saved`, outcome
+  `ok`, with the new args hash and the item id, never the text. The bot's own arguments are
+  kept as `drafted_args` (never served) for the ledger: an approval of a saved edit counts as
+  `edited`, with the edit distance from the bot's text, and its audit `detail` is `edited
+  before approval`. Saving the bot's own text back clears the edit. When a Slack draft expires
+  or loses its text, the saved edit and the bot's text go with it. The item answers `edited`
+  (`true` once a person changed the bot's arguments, by a saved edit or an edit decision) and
+  `edited_at` (the last save).
 - **An internal failure** (PM OS itself failed running an approved write, not the target
   system) answers `500` with a generic message; the detail goes to the tool server's log.
 - **An item moves through states:** `pending`, then `executing` while the write runs, then
@@ -165,8 +180,9 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `POST /internal/grants` `{session_token, tool, args}` | service token | Record an approval given in the harness |
 | `GET /internal/approvals?user=&status=` | service, web or console token | `{items: […]}`: a PM's inbox, newest first. `status` is `pending`, `executing`, `approved`, `rejected`, `failed` or `expired` (`400` for anything else) |
 | `GET /internal/approvals?user=` | bot token | The App Home Inbox: `{approvals: […], total}`, only `pending` items whatever `status` says, oldest first, at most 50. Each item reads as `GET /internal/approvals/{id}` returns it; `total` counts every pending item. `403` if `user` isn't a team member (live connectors) or is a team bot's identity; `400` without `user` |
-| `GET /internal/approvals/{id}` | service or console token | One item (with a console user assertion, only the subject's own: anyone else's is `404`): `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity` and `redacted_at`; plus, when known, `expires_at`, `target_url` and `external` (see **What an item is shown with**). Listings and decision answers carry the same fields |
+| `GET /internal/approvals/{id}` | service or console token | One item (with a console user assertion, only the subject's own: anyone else's is `404`): `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity`, `redacted_at` and `edited_at`; always `edited` (whether a person changed the bot's arguments); plus, when known, `expires_at`, `target_url` and `external` (see **What an item is shown with**). Listings and decision answers carry the same fields |
 | `GET /internal/approvals/{id}?user=<handle>` | bot or web token | The same item, for the PM the client acts for. `404 {error: "no such approval item"}` without `user`, when `user` isn't a team member, when the item isn't `user`'s, or when there is no such item: the client can't tell which ids exist. With the web token, the user assertion must name `user` |
+| `PUT /internal/approvals/{id}/draft?user=<handle>` `{args}` | service or web token | Save `user`'s edit of their pending item (see **How a write gets approved**, "A saved edit"); answers the item as `GET /internal/approvals/{id}` does, with `edited` and `edited_at`. With the web token the user assertion must name `user` (as for the other approvals routes); the bot and console tokens get `403`. `404` without `user`, for someone else's item or a missing one; `409 {code: "not_pending"}` once decided, `409 {code: "expired"}` for an expired Slack draft; `400` for arguments that don't fit the tool; `422 {code: "target_changed"}` for a change of where it goes; `403` when `user` isn't in `team.yaml` (enforced) |
 | `GET /internal/approvals/{id}/sources?user=` | service or web token | What the run that drafted the item read: `{sources: [{system, title, url, ref, cite, tool, read_at}], available, truncated}`. `user` is required (`400`) and must be the item's user: anyone else's item, or a missing one, is `404`. See **What an item is shown with** |
 | `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?}` | service, bot or web token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. From the bot or web token, an `edit` that changes where the draft goes is `422 target_changed` (see **How a write gets approved**). An internal failure is `500` with a generic `error`. |
 | `GET /internal/ledger?since=&until=&bot=&outcome=&min_edit=&limit=` | service or bot token | `{rows: […]}`, newest first; for the bot token, rows have no `id` (use `run_id`). See **Feedback ledger**. `422` for a bad parameter |
@@ -223,7 +239,8 @@ bot and console tokens get `403`).
   goes (`422 target_changed`); and a member decision may grant `pm` and `skill-author` only
   (`403 admin_by_pull_request`: a new admin is made by a pull request to `team.yaml`).
 - **Web token** (`PMOS_WEB_TOKEN`): `pmos-web`, which acts for a signed-in person. Only the
-  four approvals routes above (list, one item, sources, decision), and the four read-only
+  five approvals routes above (list, one item, sources, decision, saved edit), and the four
+  read-only
   `GET /internal/admin/*` routes (which check the viewer's role themselves); every other
   route (sessions, grants, calls, account linking, credentials, the ledger, reindexing,
   onboarding) is `403`. It has at least the bot token's limits: a read of one item must name
@@ -929,7 +946,7 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 | Memory | `memory_notes` | One row per user and key, with the note's `sensitivity` (migration 0009; null for older notes, read as `internal`) |
 | Sessions | `sessions` | Only the SHA-256 of each token is stored. Each names a `skill` or a `bot` (a check constraint keeps it to one) |
 | Grants | `grants` | Taken with `DELETE … RETURNING` on a row locked `FOR UPDATE SKIP LOCKED`: one grant, one call, even under concurrency |
-| Approvals | `approvals` | A decision locks the item (`SELECT … FOR UPDATE`) and changes it only while it is `pending`: exactly one of several concurrent decisions wins. A Slack reply is created under an advisory lock per user and thread. The Slack draft sweep takes items `FOR UPDATE SKIP LOCKED`, leaving one a decision holds to the decision |
+| Approvals | `approvals` | A decision locks the item (`SELECT … FOR UPDATE`) and changes it only while it is `pending`: exactly one of several concurrent decisions wins. A Slack reply is created under an advisory lock per user and thread. The Slack draft sweep takes items `FOR UPDATE SKIP LOCKED`, leaving one a decision holds to the decision. A saved edit takes the same lock. `drafted_args` and `edited_at` (migration 0012) keep the bot's own arguments and the last save, once a person changed them |
 | Feedback ledger | `ledger` | One row per approval item, written in the same transaction as the item on create, decide, complete and expire. `expired` is stored for Slack drafts and worked out on read for the rest |
 | Audit | `audit_events` | Append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Each event records the caller (`mcp`, `orchestrator`, `bot`, `web` or `console`; migration 0011) and the session's skill or bot, and for a read the titles of its non-Slack sources (`source_titles`, null before migration 0010; see **What an item is shown with**). |
 | Credentials | `credentials` | Tokens sealed by the vault; the database never sees plaintext. Providers `atlassian`, `slack`, `github` |
