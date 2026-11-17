@@ -42,6 +42,10 @@ async function scan(page: Page, what: string) {
 
 for (const theme of ['light', 'dark'] as const) {
   test.describe(`axe, ${theme} theme`, () => {
+    // Each of these walks a whole screen through many states and scans every one. On a
+    // slow runner that takes longer than the default 30 s, so they get three times as long.
+    test.slow();
+
     test('sign-in with each set of providers, and the signed-out page', async ({ page }) => {
       await page.addInitScript((t) => {
         try {
