@@ -19,7 +19,7 @@ use pmos_toolserver::approvals::{
 };
 use pmos_toolserver::audit::{AuditEvent, Client, Outcome};
 use pmos_toolserver::connectors::fake::{
-    SLACK_ALL_TEAM, SLACK_CONNECT, SLACK_PM, SLACK_WITH_OUTSIDER,
+    SLACK_ALL_TEAM, SLACK_CONNECT, SLACK_DM, SLACK_PM, SLACK_WITH_OUTSIDER,
 };
 use pmos_toolserver::ledger::{LedgerOutcome, LedgerQuery};
 use pmos_toolserver::service::{AudienceSummary, DecisionError, Swept};
@@ -72,7 +72,79 @@ both!(
     the_pending_list_is_oldest_first_and_capped,
     a_restricted_note_keeps_later_drafts_from_outsiders,
     a_follow_up_starts_at_its_historys_level,
+    a_drafts_target_names_its_channel,
 );
+
+/// A Slack draft's `target_channel`: read from `conversations.info` when it is drafted,
+/// refreshed at each audience check (a rename shows after the next one), never more than a
+/// name shaped like a channel name, and for a DM the team member it is with.
+async fn a_drafts_target_names_its_channel(f: &Fixture) {
+    let target = |id: String| async move {
+        let item = f.svc.approval(&id).await.unwrap().unwrap();
+        f.svc.approval_json(&item).await["target_channel"].clone()
+    };
+    let id = internal_draft(
+        f,
+        "tsk_name_1",
+        reply(SLACK_ALL_TEAM, "1731602000.000100", "Yes: SAML 2.0."),
+    )
+    .await;
+    let t = target(id.clone()).await;
+    assert_eq!(t["kind"], "channel", "{t}");
+    assert_eq!(t["name"], "pm-team");
+    assert_eq!(t["with"], Value::Null);
+    // Renamed in Slack: the stored name stands until the next audience check ...
+    f.slack.rename_channel(SLACK_ALL_TEAM, Some("pm-team-2026"));
+    assert_eq!(target(id.clone()).await["name"], "pm-team");
+    // ... which an approve makes, and from then on it reads the new name.
+    decide(f, &id, Decision::Approve, None, false, now())
+        .await
+        .unwrap();
+    assert_eq!(target(id.clone()).await["name"], "pm-team-2026");
+
+    // A direct message with a team member: who, from team.yaml, with no lookup.
+    let dm = internal_draft(
+        f,
+        "tsk_name_2",
+        reply(SLACK_DM, "1731602100.000100", "Sure."),
+    )
+    .await;
+    let t = target(dm).await;
+    assert_eq!(t["kind"], "im", "{t}");
+    assert_eq!(t["name"], Value::Null);
+    assert_eq!(t["with"], "ben");
+
+    // A channel whose name isn't usable (missing, or not shaped like a channel name): the
+    // kind only.
+    for (i, name) in [None, Some("launch <@U0BEN> now"), Some("")]
+        .into_iter()
+        .enumerate()
+    {
+        f.slack.rename_channel(SLACK_WITH_OUTSIDER, name);
+        let id = internal_draft(
+            f,
+            &format!("tsk_name_3_{i}"),
+            reply(
+                SLACK_WITH_OUTSIDER,
+                &format!("173160220{i}.000100"),
+                "Maybe.",
+            ),
+        )
+        .await;
+        let t = target(id).await;
+        assert_eq!(t["kind"], "channel", "{name:?}: {t}");
+        assert_eq!(t["name"], Value::Null, "{name:?}");
+    }
+
+    // A channel Slack can't describe: no `target_channel` at all, and the draft is made.
+    let unknown = internal_draft(
+        f,
+        "tsk_name_4",
+        reply("C0NOWHERE1", "1731602300.000100", "Hello."),
+    )
+    .await;
+    assert_eq!(target(unknown).await, Value::Null);
+}
 
 /// A follow-up in the same conversation replays earlier answers into a fresh session (W6).
 /// The runtime reads the level the first task's sessions reached, and starts the follow-up's

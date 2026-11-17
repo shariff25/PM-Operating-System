@@ -1195,6 +1195,11 @@ async fn slack_audience_is_read_with_the_pms_token() {
             im: false,
             members: vec!["U0ANA".into(), "U0BEN".into(), "U0CY".into()],
             truncated: false,
+            conversation: pmos_toolserver::connectors::Conversation {
+                kind: pmos_toolserver::connectors::ConversationKind::Channel,
+                name: Some("a-channel".into()),
+                peer: None,
+            },
         }
     );
     let info = &l.mock.exact("/api/conversations.info")[0];

@@ -102,6 +102,9 @@ fn call(method: &Method, uri: &Uri, headers: &HeaderMap, body: &Bytes) -> Call {
 #[derive(Default)]
 struct Mock {
     calls: Mutex<Vec<Call>>,
+    /// Sign-in events (`POST /internal/admin/events`), kept apart from the proposal records
+    /// these tests count.
+    sign_ins: Mutex<Vec<Call>>,
     /// Blob ids on the base, by repository path.
     blobs: Mutex<BTreeMap<String, String>>,
     /// The tool server's audit route fails.
@@ -222,6 +225,10 @@ async fn toolserver(
     body: Bytes,
 ) -> Response {
     let c = call(&method, &uri, &headers, &body);
+    if c.path == "/internal/admin/events" {
+        m.sign_ins.lock().unwrap().push(c);
+        return Json(json!({"recorded": true})).into_response();
+    }
     m.calls.lock().unwrap().push(c.clone());
     if c.auth.as_deref() != Some(&format!("Bearer {TOOLS_TOKEN}")) {
         return StatusCode::UNAUTHORIZED.into_response();

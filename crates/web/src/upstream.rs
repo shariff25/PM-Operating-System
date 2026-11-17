@@ -28,6 +28,10 @@ use serde_json::{json, Value};
 /// How long to wait for an upstream.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The length of a refused sign-in's `attempt` hash, in hex characters (the tool server's
+/// `ATTEMPT_HEX`).
+pub const ATTEMPT_HEX: usize = 12;
+
 /// The header naming the PM a runtime call is for.
 pub const USER_HEADER: &str = "X-Pmos-User";
 
@@ -164,6 +168,24 @@ pub struct Approval {
     /// `restricted`. Absent for items made before it was recorded, which count as restricted.
     #[serde(default)]
     pub sources_sensitivity: Option<String>,
+    /// For a Slack draft, its channel as the tool server last read it from Slack: kind,
+    /// name, and for a DM the team member it is with. An older tool server doesn't send it.
+    #[serde(default)]
+    pub target_channel: Option<TargetChannel>,
+}
+
+/// The tool server's `target_channel` (`docs/web-api.md`, Drafts). Untrusted text from
+/// Slack by way of the tool server: `drafts.rs` shows a name only if it is shaped like one.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct TargetChannel {
+    /// `channel`, `private_channel`, `im` or `mpim`.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// A DM's other person, as a team handle.
+    #[serde(default)]
+    pub with: Option<String>,
 }
 
 /// One source of `GET /internal/approvals/{id}/sources`.
@@ -664,6 +686,40 @@ impl ToolServer {
             .send(self.0.http.get(url).query(&q), Some(viewer))
             .await?;
         self.0.read(res).await
+    }
+
+    /// Record a sign-in event (`POST /internal/admin/events`, `docs/web-api.md`, "Sign-in
+    /// events"): for `member` (named as `user=`, with an assertion for them) on a sign-in or
+    /// sign-out, for no one on a refusal. `body` holds fixed action names and codes only.
+    pub async fn record_sign_in(&self, member: Option<&str>, body: &Value) -> UpstreamResult<()> {
+        let url = self.0.url(&["internal", "admin", "events"])?;
+        let mut req = self.0.http.post(url).json(body);
+        if let Some(m) = member {
+            req = req.query(&[("user", m)]);
+        }
+        let res = self.0.send(req, member).await?;
+        self.0.read::<Value>(res).await.map(drop)
+    }
+
+    /// A short keyed hash of a name someone tried to sign in with: [`ATTEMPT_HEX`] hex
+    /// characters of HMAC-SHA256 under a key derived from this server's tool server token, of
+    /// the name trimmed and lowercased. Repeated attempts with one name match; the name can't
+    /// be read back, or guessed from a list of emails without the token.
+    pub fn attempt_hash(&self, name: &str) -> String {
+        use hmac::{Hmac, Mac};
+        let mut key = Hmac::<sha2::Sha256>::new_from_slice(self.0.token.as_bytes())
+            .expect("HMAC takes any key length");
+        key.update(b"pmos-web-sign-in-attempt-v1");
+        let derived = key.finalize().into_bytes();
+        let mut mac =
+            Hmac::<sha2::Sha256>::new_from_slice(&derived).expect("HMAC takes any key length");
+        mac.update(name.trim().to_lowercase().as_bytes());
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .take(ATTEMPT_HEX / 2)
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     /// Record an admin action (`POST /internal/admin/{route}?user=<viewer>`, JSON `body`), with
