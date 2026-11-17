@@ -118,6 +118,13 @@ impl Catalog {
         self.team.by_handle(handle).is_some()
     }
 
+    /// Is `handle` an admin in `team.yaml`?
+    pub fn is_admin(&self, handle: &str) -> bool {
+        self.team
+            .by_handle(handle)
+            .is_some_and(|m| m.roles.contains(&pmos_contract::model::Role::Admin))
+    }
+
     pub fn summaries(&self) -> Vec<BotSummary> {
         self.bots
             .values()

@@ -563,6 +563,21 @@ impl ToolService {
         ttl: Option<Duration>,
         now: DateTime<Utc>,
     ) -> Result<Session, SessionError> {
+        self.create_session_from(user, skill, run_id, ttl, Sensitivity::Public, now)
+            .await
+    }
+
+    /// [`ToolService::create_session`] for a run that already carries content read at
+    /// `floor`: the session starts there, as if it had read it (W6).
+    pub async fn create_session_from(
+        &self,
+        user: &str,
+        skill: &str,
+        run_id: &str,
+        ttl: Option<Duration>,
+        floor: Sensitivity,
+        now: DateTime<Utc>,
+    ) -> Result<Session, SessionError> {
         if !valid_handle(user) {
             return Err(SessionError::InvalidUser(user.to_string()));
         }
@@ -576,7 +591,8 @@ impl ToolService {
             return Err(SessionError::InvalidRun);
         }
         let ttl = ttl.unwrap_or_else(|| Duration::minutes(DEFAULT_SESSION_TTL_MINUTES));
-        let session = Session::new(user, skill, run_id, ttl, now);
+        let mut session = Session::new(user, skill, run_id, ttl, now);
+        session.sources_sensitivity = floor;
         self.stores.sessions.insert(&session, now).await?;
         Ok(session)
     }
@@ -590,6 +606,23 @@ impl ToolService {
         bot: &str,
         run_id: &str,
         ttl: Option<Duration>,
+        now: DateTime<Utc>,
+    ) -> Result<Session, SessionError> {
+        self.create_bot_session_from(user, bot, run_id, ttl, Sensitivity::Public, now)
+            .await
+    }
+
+    /// [`ToolService::create_bot_session`] for a task whose conversation history already
+    /// carries content read at `floor` (the highest level its earlier tasks reached, which
+    /// the runtime records per task): the session starts there, so a reply built on it is
+    /// checked as if this session had read it itself (W6). A floor only ever raises.
+    pub async fn create_bot_session_from(
+        &self,
+        user: &str,
+        bot: &str,
+        run_id: &str,
+        ttl: Option<Duration>,
+        floor: Sensitivity,
         now: DateTime<Utc>,
     ) -> Result<Session, SessionError> {
         if !valid_handle(user) {
@@ -612,9 +645,16 @@ impl ToolService {
             return Err(SessionError::InvalidRun);
         }
         let ttl = ttl.unwrap_or_else(|| Duration::minutes(DEFAULT_SESSION_TTL_MINUTES));
-        let session = Session::for_bot(user, bot, run_id, ttl, now);
+        let mut session = Session::for_bot(user, bot, run_id, ttl, now);
+        session.sources_sensitivity = floor;
         self.stores.sessions.insert(&session, now).await?;
         Ok(session)
+    }
+
+    /// The highest level any stored session of run `run_id` reached, or `None` when none is
+    /// stored (never created, or purged after it expired).
+    pub async fn run_sensitivity(&self, run_id: &str) -> Result<Option<Sensitivity>, StoreError> {
+        self.stores.sessions.run_sensitivity(run_id).await
     }
 
     /// The live session for `token`. A session whose skill or bot is no longer in the content
@@ -1742,6 +1782,11 @@ impl ToolService {
         verdict: Verdict,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecisionError> {
+        // The console's token only reads (W1). Its route layer already refuses it; this keeps
+        // a future route from widening it.
+        if client == Client::Console {
+            return Err(DecisionError::Decide(DecideError::Forbidden));
+        }
         if verdict.reason.is_some() && verdict.decision != Decision::Reject {
             return Err(DecisionError::ReasonNotAllowed);
         }

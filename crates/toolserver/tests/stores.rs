@@ -447,6 +447,26 @@ async fn approvals_list_newest_first_and_filter(b: &Backend) {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, second.id);
     assert!(a.list("cy", None).await.unwrap().is_empty());
+
+    // A listing is capped at the newest LIST_LIMIT, in a fixed order.
+    let limit = pmos_toolserver::approvals::LIST_LIMIT;
+    for i in 0..=limit {
+        a.create(new_item("dee", &args), now() + Duration::seconds(i as i64))
+            .await
+            .unwrap();
+    }
+    let listed = a.list("dee", None).await.unwrap();
+    assert_eq!(listed.len(), limit);
+    assert_eq!(
+        listed[0].created_at,
+        now() + Duration::seconds(limit as i64)
+    );
+    assert!(listed.windows(2).all(|w| w[0].created_at > w[1].created_at));
+    assert_eq!(
+        listed.last().unwrap().created_at,
+        now() + Duration::seconds(1),
+        "the oldest is the one left out"
+    );
 }
 
 async fn decisions_follow_the_rules(b: &Backend) {

@@ -22,8 +22,9 @@ use crate::catalog::Catalog;
 use crate::clients::{valid_approval_id, ApprovalState, CallError, Gateway, TaskDraft, ToolServer};
 use crate::model::{
     self, ApprovalOutcome, ChecklistItem, Draft, Level, MemberSettings, NewNotification,
-    Notification, NotificationKind, Routine, Schedule, SlackRef, Source, Task, TaskStatus,
-    TraceKind, Turn, GAVE_UP_REASON, LEASE_SECONDS, MAX_ATTEMPTS, REDACTED_MARKER, RETRY_EVENT,
+    Notification, NotificationKind, Routine, Schedule, Sensitivity, SlackRef, Source, Task,
+    TaskStatus, TraceKind, Turn, GAVE_UP_REASON, LEASE_SECONDS, MAX_ATTEMPTS, REDACTED_MARKER,
+    RETRY_EVENT,
 };
 use crate::routines::{self, Parsed};
 use crate::store::{
@@ -75,9 +76,18 @@ pub enum Error {
     Unclear(String),
     #[error("{0}")]
     Unavailable(String),
+    /// A notification cursor this feed never issued: it is past the feed's head, so it came
+    /// from another epoch of the feed (an in-memory runtime that restarted, or a database
+    /// that was reset). `409 {"code": "cursor_ahead", "head"}`; the client should start
+    /// again from `0`.
+    #[error("{CURSOR_AHEAD}: the notification cursor {after} is past this feed's head {head}; it is from an earlier runtime or database. Start again from 0 (the Slack service: delete its notifications.cursor)")]
+    CursorAhead { after: i64, head: i64 },
     #[error(transparent)]
     Store(#[from] StoreError),
 }
+
+/// The code and the start of the message of [`Error::CursorAhead`].
+pub const CURSOR_AHEAD: &str = "cursor_ahead";
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -135,6 +145,10 @@ pub struct Claim {
     pub level: Level,
     /// The earlier turns of the task's conversation, oldest first; empty for a first message.
     pub history: Vec<Turn>,
+    /// The highest data class those turns were built from, when there are any. The tool
+    /// server already started the session at it (the worker can't lower it); it is here so
+    /// the worker can tell the model the earlier answers drew on restricted sources.
+    pub history_sensitivity: Option<Sensitivity>,
 }
 
 /// The session token never reaches a log through `Debug`.
@@ -147,6 +161,7 @@ impl std::fmt::Debug for Claim {
             .field("lease_until", &self.lease_until)
             .field("level", &self.level)
             .field("history", &self.history.len())
+            .field("history_sensitivity", &self.history_sensitivity)
             .finish()
     }
 }
@@ -372,14 +387,15 @@ impl Runtime {
                 self.fail_claimed(&task, worker, &reason, now).await?;
                 continue;
             };
+            // The history first: its level is where the session starts (W6).
+            let (history, history_sensitivity) = self.history(&task, now).await;
             match self
                 .toolserver
-                .create_session(&task.requested_by, &bot.name, &task.id)
+                .create_session(&task.requested_by, &bot.name, &task.id, history_sensitivity)
                 .await
             {
                 Ok(session_token) => {
                     let level = self.claim_level(&task).await;
-                    let history = self.history(&task, now).await;
                     tracing::info!(task = %task.id, bot = %bot.name, %worker, attempt = task.attempts, %level, turns = history.len(), "task claimed");
                     let mut headers = serde_json::Map::new();
                     headers.insert("X-Pmos-User".into(), json!(task.requested_by));
@@ -401,6 +417,7 @@ impl Runtime {
                         },
                         level,
                         history,
+                        history_sensitivity,
                         task,
                     }));
                 }
@@ -451,16 +468,36 @@ impl Runtime {
     /// Conversations). Only the requester's own tasks for the same bot in the same thread,
     /// asked within the last [`SLACK_TEXT_HOURS`] (the retention window for Slack text) and
     /// never redacted. A read that fails gives no history rather than strand the task.
-    async fn history(&self, task: &Task, now: DateTime<Utc>) -> Vec<Turn> {
+    ///
+    /// Also the highest data class those turns were built from (`None` without history):
+    /// each turn's recorded level, an unrecorded one counting as `restricted` (W6).
+    async fn history(&self, task: &Task, now: DateTime<Utc>) -> (Vec<Turn>, Option<Sensitivity>) {
         let since = now - chrono::Duration::hours(SLACK_TEXT_HOURS);
         let earlier = match self.store.earlier_turns(task, since, HISTORY_TURNS).await {
             Ok(earlier) => earlier,
             Err(e) => {
                 tracing::warn!(error = %e, task = %task.id, "couldn't read the conversation; starting fresh");
-                return Vec::new();
+                return (Vec::new(), None);
             }
         };
-        bounded_history(earlier)
+        bounded_history_with_level(earlier)
+    }
+
+    /// The level a finished task's sessions reached, as the tool server reports it. When it
+    /// can't say (no session stored, or unreachable), `restricted`: a follow-up is then
+    /// checked as if the answer drew on restricted sources, never the other way round.
+    async fn finished_level(&self, id: &str) -> Sensitivity {
+        match self.toolserver.run_sensitivity(id).await {
+            Ok(Some(level)) => level,
+            Ok(None) => {
+                tracing::warn!(task = %id, "the tool server has no session for this task; recording it as restricted");
+                Sensitivity::Restricted
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, task = %id, "couldn't read the task's level; recording it as restricted");
+                Sensitivity::Restricted
+            }
+        }
     }
 
     async fn fail_claimed(
@@ -478,6 +515,9 @@ impl Runtime {
             error: Some(reason.to_string()),
             event: Some(("status".into(), format!("failed: {reason}"))),
             notify: Some(NewNotification::new(NotificationKind::Failed, reason)),
+            // No session ran for this claim: what a follow-up replays is the PM's text and
+            // this reason.
+            sensitivity: Some(Sensitivity::Public),
             ..Transition::from(&[TaskStatus::Working])
         };
         let _ = self.store.transition(&task.id, &change, now).await?;
@@ -597,6 +637,7 @@ impl Runtime {
         let mut change = Self::working(worker);
         change.lease = Lease::Clear;
         change.result = Some(result.to_string());
+        change.sensitivity = Some(self.finished_level(id).await);
         if approvals.is_empty() {
             change.to = Some(TaskStatus::Done);
             change.event = Some(("status".into(), "done".into()));
@@ -640,6 +681,7 @@ impl Runtime {
         change.to = Some(TaskStatus::Failed);
         change.lease = Lease::Clear;
         change.error = Some(reason.clone());
+        change.sensitivity = Some(self.finished_level(id).await);
         change.event = Some(("status".into(), format!("failed: {reason}")));
         change.notify = Some(NewNotification::new(NotificationKind::Failed, &reason));
         let task = self.worker_change(id, change, now).await?;
@@ -776,22 +818,37 @@ impl Runtime {
     // ----- notifications -------------------------------------------------------------------
 
     /// Notifications after `after`, waiting up to `wait` for the first. Returns the new
-    /// cursor (the last item's, or `after` if none) and the items in order.
+    /// cursor (the last item's, or `after` if none), the items in order, and the feed's head
+    /// (the last sequence number it has issued, pruned or not).
+    ///
+    /// A cursor past the head was never issued by this feed: it is refused with
+    /// [`Error::CursorAhead`] instead of answering "nothing new" forever, which is how replies
+    /// used to vanish after an in-memory runtime restarted (its sequence starts again at 1
+    /// while the Slack service kept its saved cursor).
     pub async fn notifications(
         &self,
         after: i64,
         wait: Duration,
-    ) -> Result<(i64, Vec<Notification>)> {
+    ) -> Result<(i64, Vec<Notification>, i64)> {
         let until = Instant::now() + wait.min(MAX_WAIT);
         let mut rx = self.changed.subscribe();
         loop {
             rx.borrow_and_update();
+            let head = self.store.feed_head().await?;
+            if after > head {
+                tracing::warn!(
+                    after,
+                    head,
+                    "a notification cursor from another epoch of the feed was refused"
+                );
+                return Err(Error::CursorAhead { after, head });
+            }
             let items = self.store.notifications(after, NOTIFICATION_PAGE).await?;
-            if let Some(last) = items.last() {
-                return Ok((last.seq, items));
+            if let Some(last) = items.last().map(|n| n.seq) {
+                return Ok((last, items, head.max(last)));
             }
             if !self.wait_for_change(&mut rx, until).await {
-                return Ok((after, items));
+                return Ok((after, items, head));
             }
         }
     }
@@ -1192,8 +1249,15 @@ pub fn truncate_field(s: &str) -> String {
 /// first: redacted turns left out, long fields cut, and older turns dropped once the total
 /// passes [`HISTORY_BYTES`].
 pub fn bounded_history(newest_first: Vec<Task>) -> Vec<Turn> {
+    bounded_history_with_level(newest_first).0
+}
+
+/// [`bounded_history`], and the highest data class among the turns it kept (`None` when it
+/// kept none). A turn with no recorded level counts as `restricted` (W6).
+pub fn bounded_history_with_level(newest_first: Vec<Task>) -> (Vec<Turn>, Option<Sensitivity>) {
     let redacted = |s: &Option<String>| s.as_deref().is_some_and(|s| s.contains(REDACTED_MARKER));
     let mut turns = Vec::new();
+    let mut level: Option<Sensitivity> = None;
     let mut bytes = 0;
     for t in newest_first.into_iter().take(HISTORY_TURNS) {
         if t.text.contains(REDACTED_MARKER) || redacted(&t.result) || redacted(&t.error) {
@@ -1213,10 +1277,13 @@ pub fn bounded_history(newest_first: Vec<Task>) -> Vec<Turn> {
             break;
         }
         bytes += size;
+        level = level.max(Some(
+            t.sources_sensitivity.unwrap_or(Sensitivity::Restricted),
+        ));
         turns.push(turn);
     }
     turns.reverse();
-    turns
+    (turns, level)
 }
 
 #[cfg(test)]

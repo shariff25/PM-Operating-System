@@ -66,6 +66,8 @@ struct Caller {
     user: Option<String>,
     /// A per-bot worker's bot (`worker-<bot>`).
     bot: Option<String>,
+    /// The verified subject of a `web` or `console` call's user assertion, if it carried one.
+    acting: Option<String>,
 }
 
 impl Caller {
@@ -151,6 +153,15 @@ impl IntoResponse for Error {
             )
                 .into_response(),
             Error::Unavailable(m) => error(StatusCode::SERVICE_UNAVAILABLE, m),
+            ref e @ Error::CursorAhead { head, .. } => (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "code": crate::runtime::CURSOR_AHEAD,
+                    "error": e.to_string(),
+                    "head": head.to_string(),
+                })),
+            )
+                .into_response(),
             Error::Store(e) => {
                 tracing::error!(error = %e, "bots storage error");
                 error(
@@ -257,6 +268,7 @@ async fn authenticate(State(state): State<AppState>, mut req: Request, next: Nex
     };
     let (kind, bot) = (client.kind, client.bot.clone());
     let mut user = user;
+    let mut acting = None;
     if matches!(kind, ClientKind::Web | ClientKind::Console) && state.assertions.mode() != Mode::Off
     {
         match check_assertion(&state.assertions, kind, req).await {
@@ -264,13 +276,19 @@ async fn authenticate(State(state): State<AppState>, mut req: Request, next: Nex
                 req = checked;
                 // The verified subject is the PM; any X-Pmos-User already equals it.
                 if kind == ClientKind::Web && subject.is_some() {
-                    user = subject;
+                    user = subject.clone();
                 }
+                acting = subject;
             }
             Err(refused) => return *refused,
         }
     }
-    req.extensions_mut().insert(Caller { kind, user, bot });
+    req.extensions_mut().insert(Caller {
+        kind,
+        user,
+        bot,
+        acting,
+    });
     next.run(req).await
 }
 
@@ -320,6 +338,16 @@ fn named_people(req: &Request) -> Vec<String> {
     named
 }
 
+/// `/v1/tasks/{id}` or `/v1/tasks/{id}/{events,trace,drafts}`: one task's detail.
+fn is_one_task_path(path: &str) -> bool {
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match segments.as_slice() {
+        ["v1", "tasks", id] => !id.is_empty(),
+        ["v1", "tasks", id, "events" | "trace" | "drafts"] => !id.is_empty(),
+        _ => false,
+    }
+}
+
 /// Check a `web` or `console` call's assertion, with the mode not `off`. Returns the request
 /// (its body read and put back) and the verified subject, if the call carried an assertion.
 async fn check_assertion(
@@ -328,8 +356,18 @@ async fn check_assertion(
     req: Request,
 ) -> Result<(Request, Option<String>), Box<Response>> {
     let named = named_people(&req);
+    // One task's detail, events, trace or drafts is one PM's: under `require` the console
+    // reads it only signed for a viewer (W3 for the runtime).
+    let one_task_read = kind == ClientKind::Console
+        && req.method() == axum::http::Method::GET
+        && is_one_task_path(
+            req.extensions()
+                .get::<OriginalUri>()
+                .map(|u| u.0.path())
+                .unwrap_or(req.uri().path()),
+        );
     let Some(header) = req.headers().get(pmos_assertion::HEADER).cloned() else {
-        if assertions.mode() == Mode::Require && !named.is_empty() {
+        if assertions.mode() == Mode::Require && (!named.is_empty() || one_task_read) {
             return Err(refuse_assertion(kind, Refusal::Missing));
         }
         return Ok((req, None));
@@ -514,10 +552,16 @@ async fn create_task(
     Ok((StatusCode::CREATED, Json(task)).into_response())
 }
 
-/// Can `caller` see `task`? Slack sees its PM's own, evals sees eval tasks, the console all.
-fn visible(caller: &Caller, task: &Task) -> bool {
+/// Can `caller` see `task`? Slack sees its PM's own, evals sees eval tasks. The console sees
+/// all, except that a call signed for a viewer (always so under `require` for one task's
+/// detail, events, trace and drafts) sees only the viewer's own tasks, or any task when the
+/// viewer is an admin in the runtime's own `team.yaml` (not the assertion's roles).
+fn visible(state: &AppState, caller: &Caller, task: &Task) -> bool {
     match caller.kind {
-        ClientKind::Console => true,
+        ClientKind::Console => match caller.acting.as_deref() {
+            None => true,
+            Some(who) => who == task.requested_by || state.rt.catalog().is_admin(who),
+        },
         ClientKind::Slack | ClientKind::Web => task.requested_by == caller.user(),
         ClientKind::Evals => task.source == Source::Eval,
         ClientKind::Worker => false,
@@ -526,7 +570,7 @@ fn visible(caller: &Caller, task: &Task) -> bool {
 
 async fn visible_task(state: &AppState, caller: &Caller, id: &str) -> Result<Task, Error> {
     match state.rt.task(id).await {
-        Ok(task) if visible(caller, &task) => Ok(task),
+        Ok(task) if visible(state, caller, &task) => Ok(task),
         Ok(_) => Err(Error::NotFound(format!("no task {id}"))),
         Err(e) => Err(e),
     }
@@ -885,11 +929,14 @@ async fn notifications(
             .filter(|n| *n >= 0)
             .ok_or_else(|| bad("`after` must be a cursor from this feed"))?,
     };
-    let (cursor, items) = state
+    let (cursor, items, head) = state
         .rt
         .notifications(after, Duration::from_millis(q.wait_ms.unwrap_or(0)))
         .await?;
-    Ok(Json(json!({"cursor": cursor.to_string(), "items": items})).into_response())
+    Ok(
+        Json(json!({"cursor": cursor.to_string(), "items": items, "head": head.to_string()}))
+            .into_response(),
+    )
 }
 
 // ----- member settings --------------------------------------------------------------------

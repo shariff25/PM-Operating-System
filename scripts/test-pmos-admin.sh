@@ -68,4 +68,132 @@ compose="$(dirname "$SRC")/compose.evals.yaml"
 ! grep -nE '^\s+build:' "$compose" || fail "compose.evals.yaml builds an image"
 [ "$(grep -c 'PMOS_EVAL_CHECKOUT' "$compose")" = 1 ] || fail "compose.evals.yaml uses the checkout more than once"
 
+# --- User assertions stay `require` on every path that (re)creates the runtime (W2) ---------
+# A stand-in `docker` records the command and the assertion mode, the worker tokens and the
+# env file that compose would read; nothing runs.
+DEPLOY_SRC="$(dirname "$SRC")"
+mkdir -p "$WORK/bin" "$WORK/stack/deploy"
+cp "$SRC" "$WORK/stack/deploy/pmos-admin"
+cat >"$WORK/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+envfile=""
+prev=""
+for a in "$@"; do [ "$prev" = --env-file ] && envfile=$a; prev=$a; done
+filemode=$(grep -E '^PMOS_ASSERTION_MODE=' "$envfile" 2>/dev/null | cut -d= -f2-)
+printf 'mode=%s file=%s workers=%s args=%s\n' "${PMOS_ASSERTION_MODE:-}" "$filemode" \
+  "${PMOS_RT_WORKER_TOKENS:-}" "$*" >>"$DOCKER_LOG"
+EOF
+chmod +x "$WORK/bin/docker"
+export DOCKER_LOG="$WORK/docker.log"
+stack_env() { # mode [extra lines...]
+  {
+    echo "PMOS_ASSERTION_MODE=$1"
+    shift
+    echo "PMOS_RT_WEB_TOKEN=rt-web-0123456789abcdef0123456789abcdef"
+    echo "PMOS_TS_WEB_TOKEN=ts-web-0123456789abcdef0123456789abcdef"
+    echo "PMOS_RT_CONSOLE_TOKEN=rt-console-0123456789abcdef0123456789ab"
+    echo "PMOS_CONSOLE_TS_TOKEN=ts-console-0123456789abcdef0123456789ab"
+    echo "PMOS_AK_WEB_BOTS=k1:d2ViLWJvdHM="
+    echo "PMOS_AK_WEB_TOOLSERVER=k1:d2ViLXRz"
+    echo "PMOS_AK_CONSOLE_BOTS=k1:Y29uc29sZS1ib3Rz"
+    echo "PMOS_AK_CONSOLE_TOOLSERVER=k1:Y29uc29sZS10cw=="
+    echo "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1"
+    echo "PMOS_RT_WORKER_TOKENS="
+    echo "PMOS_GW_BOT_TOKENS="
+    printf '%s\n' "$@"
+  } >"$WORK/stack/deploy/.env"
+  : >"$DOCKER_LOG"
+}
+stack=("$WORK/stack/deploy/pmos-admin")
+run_stack() { PATH="$WORK/bin:$PATH" "${stack[@]}" "$@"; }
+
+# `up --web`, then `add-bot`: both start the runtime with `require`, from deploy/.env.
+stack_env require
+run_stack up --web >/dev/null
+grep -q 'args=compose .*--profile web up -d' "$DOCKER_LOG" || fail "up --web didn't start the web profile: $(cat "$DOCKER_LOG")"
+grep -q '^mode=require file=require ' "$DOCKER_LOG" || fail "up --web without require: $(cat "$DOCKER_LOG")"
+: >"$DOCKER_LOG"
+run_stack add-bot scout >/dev/null
+line=$(grep 'up -d bots gateway' "$DOCKER_LOG") || fail "add-bot didn't recreate the runtime"
+[[ "$line" == mode=require\ file=require\ * ]] || fail "add-bot recreated the runtime without require: $line"
+[[ "$line" == *"workers=worker-scout="* ]] || fail "add-bot recreated the runtime without the new worker token: $line"
+grep -q '^PMOS_ASSERTION_MODE=require$' "$WORK/stack/deploy/.env" || fail "add-bot changed the mode in deploy/.env"
+# A blank mode means `require` once a web or console token is set (the services' default).
+stack_env ""
+out=$(run_stack up 2>&1)
+[[ "$out" == *"user assertions: require"* ]] || fail "a blank mode with web tokens isn't reported as require: $out"
+
+# `off` or `verify` with a web or console token refuses before anything starts or is written.
+for mode in off verify; do
+  stack_env "$mode"
+  for cmd in "up" "up --web" "add-bot scout"; do
+    code=0
+    # shellcheck disable=SC2086
+    run_stack $cmd >/dev/null 2>&1 || code=$?
+    [ "$code" = 2 ] || fail "$cmd with PMOS_ASSERTION_MODE=$mode exits $code, not 2"
+    [ ! -s "$DOCKER_LOG" ] || fail "$cmd with PMOS_ASSERTION_MODE=$mode called docker: $(cat "$DOCKER_LOG")"
+  done
+  grep -q '^PMOS_RT_WORKER_TOKENS=$' "$WORK/stack/deploy/.env" || fail "a refused add-bot wrote tokens"
+done
+# ... unless the development override is set, and then it says so.
+stack_env off PMOS_ASSERTION_INSECURE_OFF=1
+out=$(run_stack up 2>&1)
+[[ "$out" == *"INSECURE"* ]] || fail "the insecure override isn't announced: $out"
+# A client set up without its keys is refused (nothing half-configured).
+stack_env require
+sed -i '/^PMOS_AK_WEB_BOTS=/d' "$WORK/stack/deploy/.env"
+code=0
+run_stack up >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "a web token without its key exits $code, not 2"
+code=0
+run_stack up --web >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "up --web without its key exits $code, not 2"
+# The restore path checks before it stops anything.
+stack_env off
+mkdir -p "$WORK/backup"
+(cd "$WORK/backup" && echo dump >pmos_bots.dump && sha256sum pmos_bots.dump >SHA256SUMS)
+code=0
+run_stack restore "$WORK/backup" </dev/null >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "restore with PMOS_ASSERTION_MODE=off exits $code, not 2"
+[ ! -s "$DOCKER_LOG" ] || fail "a refused restore called docker"
+
+# --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
+if docker compose version >/dev/null 2>&1; then
+  mkdir -p "$WORK/checkout" "$WORK/state"
+  render() { # env file, profiles...
+    local env=$1
+    shift
+    docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" --env-file "$env" "$@" config
+  }
+  # A filled deploy/.env, as setup.sh makes it (every `generated` value replaced).
+  sed -e "s|=generated\$|=test-$RANDOM-0123456789abcdef0123456789abcdef|" \
+    -e "s|^PMOS_CONTENT_CHECKOUT=.*|PMOS_CONTENT_CHECKOUT=$WORK/checkout|" \
+    -e "s|^PMOS_STATE_DIR=.*|PMOS_STATE_DIR=$WORK/state|" \
+    -e "s|^PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=.*|PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1|" \
+    "$DEPLOY_SRC/env.example" >"$WORK/full.env"
+  # `up --web --console`, with Slack: a valid configuration.
+  full=$(render "$WORK/full.env" --profile web --profile console --profile slack) ||
+    fail "compose doesn't render up --web --console with a filled deploy/.env"
+  docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" \
+    --env-file "$WORK/full.env" --profile web --profile console --profile slack config -q ||
+    fail "compose config -q refused up --web"
+  for want in 'PMOS_ASSERTION_MODE: require' 'web:bots:' 'console:bots:' 'web:toolserver:' \
+    'console:toolserver:' 'PMOS_ONBOARDING_V2: "1"' 'PMOS_NUDGES: "1"'; do
+    [[ "$full" == *"$want"* ]] || fail "the rendered up --web has no $want"
+  done
+  [[ "$full" == *'console=test-'* && "$full" == *'web=test-'* ]] ||
+    fail "the runtime's tokens lack web= or console="
+  # The default profile with only the core settings: no web, console or assertion settings
+  # are needed, and none is half there (C9).
+  grep -vE '^PMOS_(RT_WEB_TOKEN|TS_WEB_TOKEN|RT_CONSOLE_TOKEN|CONSOLE_TS_TOKEN|AK_[A-Z_]+|ASSERTION_MODE|WEB_BRIEF_TOKEN|CONSOLE_PROXY_SECRET)=' \
+    "$WORK/full.env" >"$WORK/core.env"
+  core=$(render "$WORK/core.env") || fail "the default profile needs web or assertion settings"
+  for unwanted in 'web=' 'console=' 'web:bots:' 'console:bots:' 'web:toolserver:' 'console:toolserver:'; do
+    [[ "$core" != *"$unwanted"* ]] || fail "the default profile without web settings still has $unwanted"
+  done
+  echo "compose renders checked"
+else
+  echo "compose renders skipped: no docker compose here (CI's deploy job has it)"
+fi
+
 echo "pmos-admin checks passed"

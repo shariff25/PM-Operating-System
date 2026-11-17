@@ -144,6 +144,7 @@ impl Config {
                 .ok_or_else(|| format!("{k} is required"))
         };
         let clients = parse_clients(&need("PMOS_BOTS_TOKENS")?)?;
+        let assertions = Arc::new(Assertions::from_lookup(&get, &person_clients(&clients))?);
         let dev = get("PMOS_DEV").as_deref() == Some("1");
         let database_url = get("PMOS_BOTS_DATABASE_URL").filter(|u| !u.is_empty());
         if database_url.is_none() && !dev {
@@ -171,10 +172,27 @@ impl Config {
             service_token: Secret(need("PMOS_SERVICE_TOKEN")?),
             gateway_url: url("PMOS_GATEWAY_URL")?,
             gateway_token: Secret(need("PMOS_GATEWAY_TOKEN")?),
-            assertions: Arc::new(Assertions::from_lookup(&get)?),
+            assertions,
             evals_as: parse_evals_as(get("PMOS_EVALS_AS").as_deref())?,
         })
     }
+}
+
+/// The configured clients that act for a person and must sign user assertions (`web`,
+/// `console`), as they appear in `PMOS_BOTS_TOKENS`. Any of them makes `require` the default
+/// assertion mode, and `off` or `verify` refuse to start without the development override
+/// (`pmos_assertion::receiver::secure_mode`).
+fn person_clients(clients: &[Client]) -> Vec<(&'static str, &'static str)> {
+    let mut out = Vec::new();
+    for (kind, name) in [
+        (ClientKind::Web, "PMOS_BOTS_TOKENS web="),
+        (ClientKind::Console, "PMOS_BOTS_TOKENS console="),
+    ] {
+        if clients.iter().any(|c| c.kind == kind) {
+            out.push((kind.as_str(), name));
+        }
+    }
+    out
 }
 
 /// `name=token,…`. Each name is a known client and appears once; tokens are at least 32
@@ -334,6 +352,62 @@ mod tests {
         assert!(!shown.contains("hunter2"));
         assert!(!shown.contains("service-token"));
         assert!(!shown.contains("gateway-token"));
+    }
+
+    #[test]
+    fn web_or_console_make_assertions_required() {
+        use crate::assertion::Mode;
+        let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let keys = format!("web:bots:k1:{key},console:bots:c1:{key}");
+        let run = |tokens: String, extra: &[(&str, &str)]| {
+            let owned = base(&tokens);
+            let mut pairs: Vec<(&str, &str)> =
+                owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            pairs.push(("PMOS_DEV", "1"));
+            pairs.extend_from_slice(extra);
+            cfg(&pairs)
+        };
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        // Slack and workers only: off by default, as before.
+        let ok = run(format!("slack={a},worker={b}"), &[]).unwrap();
+        assert_eq!(ok.assertions.mode(), Mode::Off);
+        for client in ["web", "console"] {
+            let tokens = format!("slack={a},{client}={b}");
+            // Required by default ...
+            let ok = run(tokens.clone(), &[("PMOS_ASSERTION_KEYS", &keys)]).unwrap();
+            assert_eq!(ok.assertions.mode(), Mode::Require);
+            // ... which needs keys ...
+            assert!(run(tokens.clone(), &[])
+                .unwrap_err()
+                .contains("PMOS_ASSERTION_KEYS"));
+            // ... and off or verify refuse to start, naming the client and the fix.
+            for mode in ["off", "verify"] {
+                let err = run(
+                    tokens.clone(),
+                    &[
+                        ("PMOS_ASSERTION_MODE", mode),
+                        ("PMOS_ASSERTION_KEYS", &keys),
+                    ],
+                )
+                .unwrap_err();
+                assert!(
+                    err.contains(&format!("{client}=")) && err.contains("INSECURE_OFF"),
+                    "{err}"
+                );
+                assert!(!err.contains(&b) && !err.contains(key), "{err}");
+            }
+            // Only the development override starts it insecurely, with a warning.
+            let dev = run(
+                tokens,
+                &[
+                    ("PMOS_ASSERTION_MODE", "off"),
+                    ("PMOS_ASSERTION_INSECURE_OFF", "1"),
+                ],
+            )
+            .unwrap();
+            assert_eq!(dev.assertions.mode(), Mode::Off);
+            assert!(dev.assertions.insecure_warning().is_some());
+        }
     }
 
     #[test]

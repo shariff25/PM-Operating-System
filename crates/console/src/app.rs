@@ -97,7 +97,8 @@ async fn through_the_proxy(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if req.uri().path() == "/healthz" || auth::from_proxy(&state.0.identity, req.headers()) {
+    let health_check = req.method() == axum::http::Method::GET && req.uri().path() == "/healthz";
+    if health_check || auth::from_proxy(&state.0.identity, req.headers()) {
         return next.run(req).await;
     }
     tracing::warn!(path = %req.uri().path(), "refused: no valid X-Pmos-Proxy-Secret");
@@ -672,7 +673,7 @@ async fn task(
     if !valid_id(&id) {
         return not_found();
     }
-    let task = match state.0.bots.task(&id).await {
+    let task = match state.0.bots.task(&viewer.handle, &id).await {
         Ok(t) if viewer.sees_own(&t.requested_by) => t,
         Ok(_) | Err(UpstreamError::NotFound) => return not_found(),
         Err(e) => return upstream_failed(&viewer, Screen::Activity, e),
@@ -684,8 +685,8 @@ async fn task(
         }
     };
     let (events, trace, audit) = tokio::join!(
-        state.0.bots.task_events(&task.id),
-        state.0.bots.task_trace(&task.id),
+        state.0.bots.task_events(&viewer.handle, &task.id),
+        state.0.bots.task_trace(&viewer.handle, &task.id),
         audit
     );
 

@@ -57,7 +57,15 @@ deploy/setup.sh --content /srv/pmos/content-repo --clone <the content repo> --st
    **Existing installs:** run `deploy/setup.sh` again with the same arguments as above. It only
    fills in missing values, so it adds the secret and leaves the rest alone. Then restart with
    `deploy/pmos-admin up --models`, and set up the proxy as above before you turn trust on.
-6. **Save the settings.** Copy `deploy/.env` into the team password manager now. It holds the
+6. **User assertions.** `setup.sh` writes `PMOS_ASSERTION_MODE=require` into `deploy/.env` and
+   generates the web app's and the console's tokens and signing keys. Keep it `require`: the
+   runtime and the tool server refuse to start in `off` or `verify` while those tokens are
+   set, and every `pmos-admin up` (with any options, including the `up --models` restarts in
+   these runbooks), `add-bot` and `restore` checks it before it starts anything
+   (`docs/user-assertion.md`, Modes). `PMOS_ASSERTION_INSECURE_OFF=1` overrides that for
+   development only; never set it on the Spark. `PMOS_ONBOARDING_V2` and `PMOS_NUDGES` (the
+   Slack first-time flow and nudges) are written as `1`; set either to `0` to turn it off.
+7. **Save the settings.** Copy `deploy/.env` into the team password manager now. It holds the
    vault key and the console proxy secret; without the vault key, stored tokens can't be read.
 
 ## Stage 2: First start, without models or Slack

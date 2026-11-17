@@ -570,6 +570,52 @@ async fn without_the_proxy_secret_the_forwarded_user_is_ignored() {
     }
 }
 
+/// W8: the proxy secret is checked on every route and method but `GET /healthz`, including
+/// the task page, form posts and paths no route has; and nothing near `/healthz` slips past.
+#[tokio::test]
+async fn every_route_but_healthz_needs_the_proxy_secret() {
+    let c = console(Options::default()).await;
+    let ana = c.csrf("ana").await;
+    c.runtime.calls.lock().unwrap().clear();
+    for (method, path) in [
+        (Method::GET, "/"),
+        (Method::GET, "/bots"),
+        (Method::GET, "/routines"),
+        (Method::GET, "/approvals"),
+        (Method::GET, "/activity"),
+        (Method::GET, "/tasks/tsk_1"),
+        (Method::GET, "/no-such-page"),
+        (Method::GET, "/healthz/"),
+        (Method::GET, "//healthz"),
+        (Method::GET, "/healthz/../bots"),
+        (Method::POST, "/routines/rtn_ana1/pause"),
+        (Method::POST, "/healthz"),
+        (Method::PUT, "/bots"),
+        (Method::DELETE, "/routines/rtn_ana1/delete"),
+    ] {
+        let res = reqwest::Client::new()
+            .request(method.clone(), format!("{}{path}", c.base))
+            .header("x-forwarded-user", "root")
+            .header("origin", c.base.as_str())
+            .form(&[("csrf", ana.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+    }
+    assert!(
+        c.runtime.calls().is_empty(),
+        "no refused request reached the runtime"
+    );
+    assert!(c.tools.calls().is_empty());
+    let res = reqwest::Client::new()
+        .get(format!("{}/healthz", c.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn the_forwarded_user_needs_the_proxy_secret() {
     let c = console(Options::default()).await;
@@ -1034,7 +1080,17 @@ fn named(uri: &str) -> Option<String> {
 /// Is this a routine change (pause, resume, delete)? It names no one, and is signed for the
 /// viewer who made it.
 fn routine_change(method: &str, uri: &str) -> bool {
-    matches!(method, "PATCH" | "DELETE") && uri.starts_with("/v1/routines/")
+    (matches!(method, "PATCH" | "DELETE") && uri.starts_with("/v1/routines/"))
+        || one_task_read(method, uri)
+}
+
+/// Is this one task's detail, events or trace? It names no one in its query, and is signed
+/// for the viewer (under `require` the runtime answers only the task's PM or an admin).
+fn one_task_read(method: &str, uri: &str) -> bool {
+    method == "GET"
+        && uri
+            .strip_prefix("/v1/tasks/")
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains('?'))
 }
 
 /// Every call that names a person carries a valid assertion for exactly that person, and
@@ -1104,6 +1160,35 @@ async fn calls_that_name_a_person_carry_a_valid_assertion_for_them() {
     // Ana's own tasks and routines, and every member's inbox for root.
     assert!(check_calls(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY), Some("ana")) >= 3);
     assert!(check_calls(&c.tools, "toolserver", ("ct1", CONSOLE_TOOLS_KEY), None) >= 4);
+}
+
+/// The task page reads one task's detail, events and trace signed for the viewer, who is the
+/// task's PM or an admin (the runtime checks again under `require`).
+#[tokio::test]
+async fn task_pages_are_read_signed_for_the_viewer() {
+    let c = console(Options {
+        sign: true,
+        ..Options::default()
+    })
+    .await;
+    for viewer in ["ana", "root"] {
+        c.runtime.asserted.lock().unwrap().clear();
+        let (status, _) = c.get(Some(viewer), "/tasks/tsk_ana1").await;
+        assert_eq!(status, StatusCode::OK, "{viewer}");
+        let reads = c
+            .runtime
+            .asserted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, u, ..)| one_task_read(m, u))
+            .count();
+        assert_eq!(reads, 3, "detail, events and trace");
+        assert_eq!(
+            check_calls(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY), Some(viewer)),
+            3
+        );
+    }
 }
 
 #[tokio::test]

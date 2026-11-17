@@ -71,7 +71,89 @@ both!(
     a_tagged_message_id_is_kept_and_never_sent,
     the_pending_list_is_oldest_first_and_capped,
     a_restricted_note_keeps_later_drafts_from_outsiders,
+    a_follow_up_starts_at_its_historys_level,
 );
+
+/// A follow-up in the same conversation replays earlier answers into a fresh session (W6).
+/// The runtime reads the level the first task's sessions reached, and starts the follow-up's
+/// session at it: a draft that reads nothing new is still checked as restricted.
+async fn a_follow_up_starts_at_its_historys_level(f: &Fixture) {
+    // Task 1 reads a restricted source.
+    let s1 = session(f, "tsk_hist_1").await;
+    f.svc
+        .call(
+            &s1,
+            "context_read",
+            json!({"path": "context/partners/globex-nda.md"}),
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.svc.run_sensitivity("tsk_hist_1").await.unwrap(),
+        Some(Sensitivity::Restricted)
+    );
+    assert_eq!(f.svc.run_sensitivity("tsk_never").await.unwrap(), None);
+    // Task 2 starts at that level and drafts, reading nothing itself, to a channel with an
+    // outsider: blocked.
+    let s2 = f
+        .svc
+        .create_session_from(
+            SLACK_PM,
+            "reply-test",
+            "tsk_hist_2",
+            None,
+            Sensitivity::Restricted,
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(s2.sources_sensitivity, Sensitivity::Restricted);
+    let res = draft_at(
+        f,
+        &s2,
+        reply(
+            SLACK_WITH_OUTSIDER,
+            "1731601200.000600",
+            "As I said above: ...",
+        ),
+        now(),
+    )
+    .await;
+    let id = res["approval_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        item(f, &id).await.sources_sensitivity,
+        Some(Sensitivity::Restricted)
+    );
+    assert!(matches!(
+        decide(f, &id, Decision::Approve, None, true, now()).await,
+        Err(DecisionError::AudienceBlocked(_))
+    ));
+    assert!(f.slack.writes().is_empty());
+    // A public read later never lowers it.
+    f.svc
+        .call(&s2, "context_search", json!({"query": "pricing"}), now())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.svc.run_sensitivity("tsk_hist_2").await.unwrap(),
+        Some(Sensitivity::Restricted)
+    );
+    // Without a floor, the same draft is not blocked for its history (control).
+    let s3 = session(f, "tsk_hist_3").await;
+    let res = draft_at(
+        f,
+        &s3,
+        reply(SLACK_WITH_OUTSIDER, "1731601300.000700", "Fresh answer."),
+        now(),
+    )
+    .await;
+    let id = res["approval_id"].as_str().unwrap().to_string();
+    let done = decide(f, &id, Decision::Approve, None, false, now())
+        .await
+        .unwrap();
+    assert_eq!(done.status, Status::Approved);
+}
 
 async fn session(f: &Fixture, run: &str) -> Session {
     f.svc
