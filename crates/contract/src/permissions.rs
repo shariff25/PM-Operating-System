@@ -16,7 +16,9 @@
 //!   platform owner (POL-2): the caller must refuse an approval by the change's author, even
 //!   an admin.
 //! - **Auditor** sees audit metadata only: [`Permission::ViewAuditLog`] and
-//!   [`Permission::ExportAudit`] never include trace bodies, prompts or Slack text.
+//!   [`Permission::ExportAudit`] never include trace bodies, prompts or Slack text. An auditor
+//!   also reads the platform's configuration ([`Permission::ViewContent`],
+//!   [`Permission::ViewPolicies`]) but never proposes a change to it.
 
 use std::fmt;
 
@@ -52,6 +54,14 @@ pub enum Permission {
     ExportAudit,
     /// Propose changes to bots and skills (as a pull request).
     EditBotsAndSkills,
+    /// See the harness content (roles, bots, skills, playbooks, context, templates), its lint
+    /// status and the running harness's facts, read-only (the web app's content admin).
+    ViewContent,
+    /// Propose changes to the harness content from the web app, as a pull request. Admins
+    /// only: a skill author changes skills through their own pull requests.
+    EditContent,
+    /// See the sandbox policies: their inputs, the generated files and drift, read-only.
+    ViewPolicies,
     /// Propose changes to sandbox and provider policies (as a pull request).
     EditPolicies,
     /// Approve a policy change. The caller refuses the change's own author (POL-2).
@@ -68,7 +78,7 @@ pub enum Permission {
 
 impl Permission {
     /// Every permission, in declaration order.
-    pub const ALL: [Permission; 18] = [
+    pub const ALL: [Permission; 21] = [
         Permission::AskBot,
         Permission::ViewOwnTasks,
         Permission::ViewOthersTasks,
@@ -81,6 +91,9 @@ impl Permission {
         Permission::ViewAuditLog,
         Permission::ExportAudit,
         Permission::EditBotsAndSkills,
+        Permission::ViewContent,
+        Permission::EditContent,
+        Permission::ViewPolicies,
         Permission::EditPolicies,
         Permission::ApprovePolicyChange,
         Permission::LinkOwnAccounts,
@@ -104,6 +117,9 @@ impl Permission {
             Permission::ViewAuditLog => "view-audit-log",
             Permission::ExportAudit => "export-audit",
             Permission::EditBotsAndSkills => "edit-bots-and-skills",
+            Permission::ViewContent => "view-content",
+            Permission::EditContent => "edit-content",
+            Permission::ViewPolicies => "view-policies",
             Permission::EditPolicies => "edit-policies",
             Permission::ApprovePolicyChange => "approve-policy-change",
             Permission::LinkOwnAccounts => "link-own-accounts",
@@ -142,8 +158,13 @@ pub fn role_allows(role: &Role, permission: Permission) -> bool {
             PM.contains(&permission)
                 || matches!(permission, P::ViewOthersApprovals | P::RecommendOnApproval)
         }
-        // Audit metadata only.
-        Role::Auditor => matches!(permission, P::ViewAuditLog | P::ExportAudit),
+        // Audit metadata, and the platform's configuration read-only: the content and the
+        // sandbox policies (never a PM's restricted context or personal master file; the web
+        // app enforces that per file). Never proposes a change.
+        Role::Auditor => matches!(
+            permission,
+            P::ViewAuditLog | P::ExportAudit | P::ViewContent | P::ViewPolicies
+        ),
         // As before: a member who uses PM OS like a PM, and who changes skills and bots by
         // pull request (reviewed under CODEOWNERS).
         Role::SkillAuthor => PM.contains(&permission) || permission == P::EditBotsAndSkills,
@@ -193,7 +214,12 @@ mod tests {
                 P::ViewOwnTraces,
                 P::LinkOwnAccounts,
             ],
-            Role::Auditor => vec![P::ViewAuditLog, P::ExportAudit],
+            Role::Auditor => vec![
+                P::ViewAuditLog,
+                P::ExportAudit,
+                P::ViewContent,
+                P::ViewPolicies,
+            ],
             Role::SkillAuthor => vec![
                 P::AskBot,
                 P::ViewOwnTasks,
@@ -245,6 +271,7 @@ mod tests {
             P::ViewOthersTasks,
             P::ViewTraces,
             P::EditPolicies,
+            P::EditContent,
             P::ApprovePolicyChange,
             P::ManageConnectors,
             P::ManageMembers,
@@ -258,9 +285,19 @@ mod tests {
     }
 
     #[test]
-    fn auditor_reads_audit_metadata_and_nothing_else() {
+    fn auditor_reads_audit_metadata_and_configuration_and_nothing_else() {
         let auditor = [Role::Auditor];
-        assert_eq!(granted(&auditor), vec![P::ViewAuditLog, P::ExportAudit]);
+        assert_eq!(
+            granted(&auditor),
+            vec![
+                P::ViewAuditLog,
+                P::ExportAudit,
+                P::ViewContent,
+                P::ViewPolicies
+            ]
+        );
+        assert!(!allows(&auditor, P::EditContent));
+        assert!(!allows(&auditor, P::EditPolicies));
         assert!(!allows(&auditor, P::ViewOwnTraces));
         assert!(!allows(&auditor, P::ViewTraces));
         assert!(!allows(&auditor, P::AskBot));

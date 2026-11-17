@@ -40,6 +40,9 @@ use crate::upstream::{
 
 mod admin;
 mod brief;
+mod content;
+mod policy;
+mod proposal;
 
 /// How many tasks `GET /api/tasks` lists.
 pub const RECENT_TASKS: usize = 20;
@@ -87,6 +90,8 @@ pub struct Deps {
     pub followups: Arc<dyn FollowUpStore>,
     pub brief: BriefConfig,
     pub clock: Clock,
+    /// The admin policy and content screens: policies root, gateway config, GitHub.
+    pub admin: crate::admin_config::AdminConfig,
 }
 
 impl Deps {
@@ -97,6 +102,7 @@ impl Deps {
             followups: Arc::new(MemoryFollowUpStore::new()),
             brief: BriefConfig::default(),
             clock: Arc::new(Utc::now),
+            admin: crate::admin_config::AdminConfig::default(),
         }
     }
 }
@@ -117,6 +123,7 @@ struct Inner {
     followups: Arc<dyn FollowUpStore>,
     brief: BriefConfig,
     clock: Clock,
+    proposals: proposal::Proposals,
 }
 
 #[derive(Clone)]
@@ -186,6 +193,7 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
         followups: deps.followups,
         brief: deps.brief,
         clock: deps.clock,
+        proposals: proposal::Proposals::new(deps.admin)?,
     }));
     let api = Router::new()
         .route("/auth/providers", get(auth_providers))
@@ -212,6 +220,8 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
         .route("/tasks/{id}", get(get_task))
         .merge(brief::routes())
         .merge(admin::routes())
+        .merge(policy::routes())
+        .merge(content::routes())
         .fallback(|| async { ApiError::not_found() })
         // A known path with another method: JSON too, never an empty body or the app.
         .method_not_allowed_fallback(|| async {

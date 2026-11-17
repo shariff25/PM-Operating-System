@@ -102,6 +102,8 @@ impl StoreConfig {
             followups,
             brief: self.brief.clone(),
             clock: Arc::new(Utc::now),
+            // Set by `main` from the environment (`admin_config`).
+            admin: Default::default(),
         })
     }
 }
