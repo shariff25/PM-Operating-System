@@ -23,6 +23,7 @@
 pub mod detail;
 pub mod host;
 pub mod import;
+pub mod link;
 pub mod memory;
 pub mod pg;
 pub mod rules;
@@ -811,6 +812,18 @@ pub trait UserStore: Send + Sync {
         let dir = self.directory(now).await?;
         Ok(u32::try_from(dir.capped_deactivations.len()).unwrap_or(u32::MAX))
     }
+
+    /// The directory as one consistent snapshot, for the read API (slice U2): its users and
+    /// its `version` are read together, so a caller that caches by version never caches rows
+    /// older or newer than the version it was given.
+    async fn snapshot(&self, now: DateTime<Utc>) -> StoreResult<Directory> {
+        self.directory(now).await
+    }
+
+    /// The first Entra link (§7 step 2; [`link`]): every condition re-checked under the users
+    /// lock in the transaction that writes the identity, its `role_changes` row and its audit
+    /// event. A refusal records a `denied` event (a conflict as `users.identity_conflict`).
+    async fn link_entra(&self, link: &link::EntraLink, now: DateTime<Utc>) -> link::LinkResult;
 }
 
 /// The audit event for one of a write's [`rules::UserEvent`]s: the actor, the client (host

@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
 
+use super::link::{self, EntraLink, LinkError, LinkRefusal, LinkResult, Linked, Planned};
 use super::rules::{self, denied_event, Rules, Write};
 use super::{
     audit_event, Actor, Applied, ChangeKind, Directory, Identity, IdentityKind, Op, PilotException,
@@ -446,5 +447,105 @@ impl UserStore for PgStore {
             }
         }
         Ok(total)
+    }
+
+    async fn snapshot(&self, now: DateTime<Utc>) -> StoreResult<Directory> {
+        self.directory_snapshot(now).await
+    }
+
+    async fn link_entra(&self, link: &EntraLink, now: DateTime<Utc>) -> LinkResult {
+        self.first_entra_link(link, now).await
+    }
+}
+
+// --- The read API and the first Entra link (slice U2) ----------------------------------------
+
+/// A unique key the identity insert hit, as a link refusal: one person per key
+/// (`(kind, issuer, subject)`: another user won the race for this `(tid, oid)`), one key of
+/// each kind per person (`(handle, kind)`: this user was linked to another one meanwhile).
+fn link_refusal(e: &sqlx::Error) -> Option<LinkRefusal> {
+    let sqlx::Error::Database(db) = e else {
+        return None;
+    };
+    match (db.code().as_deref(), db.constraint()) {
+        (Some("23505"), Some("user_identities_kind_issuer_subject_key")) => {
+            Some(LinkRefusal::Taken)
+        }
+        (Some("23505"), Some("user_identities_handle_kind_key")) => Some(LinkRefusal::Linked),
+        (Some("23514"), _) if db.message().starts_with("evals_account:") => {
+            Some(LinkRefusal::EvalsAccount)
+        }
+        _ => None,
+    }
+}
+
+impl PgStore {
+    /// The directory in one REPEATABLE READ, READ ONLY transaction: every table and the
+    /// version from the same snapshot.
+    async fn directory_snapshot(&self, now: DateTime<Utc>) -> StoreResult<Directory> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let dir = load_directory(&mut tx, now).await?;
+        tx.commit().await?;
+        Ok(dir)
+    }
+
+    async fn first_entra_link(&self, link: &EntraLink, now: DateTime<Utc>) -> LinkResult {
+        let mut seen: Option<Directory> = None;
+        match self.link_in_tx(link, now, &mut seen).await {
+            Err(LinkError::Refused(why)) => {
+                let (actor, event) = link::refused_event(seen.as_ref(), &link.handle, why);
+                let mut conn = self.pool().acquire().await.map_err(StoreError::from)?;
+                insert_event(&mut conn, &link::audit(&actor, &event, now))
+                    .await
+                    .map_err(StoreError::from)?;
+                Err(LinkError::Refused(why))
+            }
+            other => other,
+        }
+    }
+
+    async fn link_in_tx(
+        &self,
+        link: &EntraLink,
+        now: DateTime<Utc>,
+        seen: &mut Option<Directory>,
+    ) -> LinkResult {
+        let mut tx = self.pool().begin().await.map_err(StoreError::from)?;
+        sqlx::query(LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(StoreError::from)?;
+        let dir = load_directory(&mut tx, now).await?;
+        let planned = link::plan(&dir, link, now);
+        *seen = Some(dir);
+        let plan = match planned.map_err(LinkError::Refused)? {
+            Planned::Same(user) => {
+                return Ok(Linked {
+                    user: *user,
+                    first_link: false,
+                })
+            }
+            Planned::Link(plan) => plan,
+        };
+        let refuse = |e: sqlx::Error| match link_refusal(&e) {
+            Some(why) => LinkError::Refused(why),
+            None => LinkError::Store(e.into()),
+        };
+        execute(&mut tx, std::slice::from_ref(&plan.write))
+            .await
+            .map_err(refuse)?;
+        insert_change(&mut tx, &plan.change).await.map_err(refuse)?;
+        insert_event(&mut tx, &audit_event(&plan.actor, &plan.event, now))
+            .await
+            .map_err(refuse)?;
+        // The trigger runs here (and bumps the directory's version).
+        tx.commit().await.map_err(refuse)?;
+        Ok(Linked {
+            user: plan.user,
+            first_link: true,
+        })
     }
 }

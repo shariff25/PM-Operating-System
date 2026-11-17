@@ -13,6 +13,7 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::Mutex;
 
 use super::import::ImportRequest;
+use super::link::{self, EntraLink, LinkError, LinkRefusal, LinkResult, Linked, Planned};
 use super::rules::{self, denied_event, Rules};
 use super::{
     audit_event, Actor, Applied, ChangeKind, Directory, Op, RoleChange, UserResult, UserStore,
@@ -198,5 +199,72 @@ impl UserStore for MemoryUsers {
         }])
         .await?;
         Ok(deleted)
+    }
+
+    async fn link_entra(&self, link: &EntraLink, now: DateTime<Utc>) -> LinkResult {
+        self.first_entra_link(link, now).await
+    }
+}
+
+// --- The first Entra link (slice U2) ---------------------------------------------------------
+
+impl MemoryUsers {
+    /// As in Postgres: planned under the one lock, the write checked against the tables' keys
+    /// (`rules::apply_writes`: one person per key, one key of each kind per person) and the
+    /// invariants, the audit event recorded first, then committed with the version bumped.
+    async fn first_entra_link(&self, link: &EntraLink, now: DateTime<Utc>) -> LinkResult {
+        let mut state = self.state.lock().await;
+        let dir = state.directory(now);
+        let refuse = |why: LinkRefusal, dir: &Directory| {
+            let (actor, event) = link::refused_event(Some(dir), &link.handle, why);
+            link::audit(&actor, &event, now)
+        };
+        let plan = match link::plan(&dir, link, now) {
+            Ok(Planned::Same(user)) => {
+                return Ok(Linked {
+                    user: *user,
+                    first_link: false,
+                })
+            }
+            Ok(Planned::Link(plan)) => plan,
+            Err(why) => {
+                drop(state);
+                self.record(vec![refuse(why, &dir)]).await?;
+                return Err(LinkError::Refused(why));
+            }
+        };
+        let mut next = dir.clone();
+        let checked =
+            rules::apply_writes(&mut next, std::slice::from_ref(&plan.write)).and_then(|()| {
+                rules::check_invariants(
+                    &next,
+                    &rules::Touched::People([plan.user.handle.clone()].into()),
+                    now,
+                    &self.rules,
+                )
+            });
+        if let Err(e) = checked {
+            drop(state);
+            let why = match e.refusal() {
+                Some(super::Refusal::EvalsAccount) => LinkRefusal::EvalsAccount,
+                Some(_) => LinkRefusal::Taken,
+                None => return Err(LinkError::Store(crate::store::StoreError(e.to_string()))),
+            };
+            self.record(vec![refuse(why, &dir)]).await?;
+            return Err(LinkError::Refused(why));
+        }
+        self.record(vec![audit_event(&plan.actor, &plan.event, now)])
+            .await?;
+        next.capped_deactivations.clear();
+        next.version += 1;
+        state.dir = next;
+        let mut change = plan.change.clone();
+        state.next_id += 1;
+        change.id = state.next_id;
+        state.changes.push(change);
+        Ok(Linked {
+            user: plan.user.clone(),
+            first_link: true,
+        })
     }
 }
