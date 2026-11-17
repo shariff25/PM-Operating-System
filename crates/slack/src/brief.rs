@@ -214,6 +214,10 @@ pub async fn handle_dm(
             {
                 Ok(task) => {
                     tracing::info!(task = %task["id"], user = handle, "brief now");
+                    // So its answer's block is known for a brief's (`is_brief_task`).
+                    if let Some(id) = task["id"].as_str() {
+                        mark_brief_now(id);
+                    }
                     copy::NOW_STARTED.into()
                 }
                 Err(e) => failure(&e),
@@ -323,6 +327,57 @@ pub async fn note_delivery(bots: &Bots, item: &Value) {
     }
 }
 
+/// How many `brief now` tasks are remembered (each until its answer arrives).
+const BRIEF_NOW_KEPT: usize = 1_000;
+
+/// The `brief now` tasks this process started and hasn't seen finish, oldest first.
+static BRIEF_NOW: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Remember a `brief now` task at creation, so its answer is known for a brief's.
+pub fn mark_brief_now(task_id: &str) {
+    let mut kept = BRIEF_NOW.lock().expect("brief now lock");
+    if kept.len() >= BRIEF_NOW_KEPT {
+        kept.pop_front();
+    }
+    kept.push_back(task_id.to_string());
+}
+
+/// Was this task a `brief now` this process started? Forgets it: an answer comes once.
+fn take_brief_now(task_id: &str) -> bool {
+    let mut kept = BRIEF_NOW.lock().expect("brief now lock");
+    match kept.iter().position(|t| t == task_id) {
+        Some(i) => {
+            kept.remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Is the finished task of this `done` notification a daily brief, so its ` ```pmos-brief `
+/// block may go to the web app (`notify.rs`)? Only when this service knows it is one: a
+/// `brief now` it started (marked at creation; a restart in between forgets the mark, and
+/// that one brief's block isn't sent), or a task its `routine_id` says came from the
+/// requester's own brief routine (one runtime call, only for a notification that has both a
+/// block and a `routine_id`). The block alone proves nothing: any answer can contain one.
+pub async fn is_brief_task(bots: &Bots, item: &Value) -> bool {
+    if item["task_id"].as_str().is_some_and(take_brief_now) {
+        return true;
+    }
+    let (Some(requester), Some(_)) = (item["requested_by"].as_str(), item["routine_id"].as_str())
+    else {
+        return false;
+    };
+    match bots.runtime().routines(requester).await {
+        Ok(routines) => delivered_brief_owner(item, &routines).is_some(),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't check the task's routine; its brief block isn't sent");
+            false
+        }
+    }
+}
+
 /// The PM whose brief this `done` notification delivered, given their routines: the
 /// notification names a routine, and that routine is one of theirs with the brief's tag.
 fn delivered_brief_owner<'a>(item: &'a Value, routines: &[Value]) -> Option<&'a str> {
@@ -380,6 +435,14 @@ mod tests {
         assert!(is_brief_routine(&d));
         assert!(!is_brief_routine(&crate::reply::draft("ana", "UTC")));
         assert_eq!(time_of(&d), Some((8, 30)));
+    }
+
+    #[test]
+    fn brief_now_tasks_are_known_once() {
+        mark_brief_now("tsk_brief_now_1");
+        assert!(take_brief_now("tsk_brief_now_1"));
+        assert!(!take_brief_now("tsk_brief_now_1"), "once only");
+        assert!(!take_brief_now("tsk_some_other_task"));
     }
 
     #[test]

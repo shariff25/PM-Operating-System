@@ -78,19 +78,31 @@ impl PgStore {
 
 #[async_trait]
 impl SessionStore for PgStore {
+    async fn ping(&self) -> Result<(), StoreError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
     async fn insert(&self, id: IdHash, session: Session) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO web_sessions (id_hash, handle, csrf_token, created_at, last_seen)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO web_sessions
+                 (id_hash, handle, csrf_token, created_at, last_seen, entra_oid, entra_tid)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (id_hash) DO UPDATE SET handle = EXCLUDED.handle,
                  csrf_token = EXCLUDED.csrf_token, created_at = EXCLUDED.created_at,
-                 last_seen = EXCLUDED.last_seen",
+                 last_seen = EXCLUDED.last_seen, entra_oid = EXCLUDED.entra_oid,
+                 entra_tid = EXCLUDED.entra_tid",
         )
         .bind(&id[..])
         .bind(&session.handle)
         .bind(&session.csrf_token)
         .bind(session.created_at)
         .bind(session.last_seen)
+        .bind(&session.entra_oid)
+        .bind(&session.entra_tid)
         .execute(&self.pool)
         .await
         .map_err(err)?;
@@ -109,7 +121,7 @@ impl SessionStore for PgStore {
              WHERE id_hash = $1
                AND last_seen + make_interval(secs => $3) > $2
                AND created_at + make_interval(secs => $4) > $2
-             RETURNING handle, csrf_token, created_at, last_seen",
+             RETURNING handle, csrf_token, created_at, last_seen, entra_oid, entra_tid",
         )
         .bind(&id[..])
         .bind(now)
@@ -124,6 +136,8 @@ impl SessionStore for PgStore {
                 csrf_token: r.try_get("csrf_token").map_err(err)?,
                 created_at: r.try_get("created_at").map_err(err)?,
                 last_seen: r.try_get("last_seen").map_err(err)?,
+                entra_oid: r.try_get("entra_oid").map_err(err)?,
+                entra_tid: r.try_get("entra_tid").map_err(err)?,
             })),
             None => {
                 // Expired (or never there): make sure nothing is left of it.
@@ -653,6 +667,16 @@ impl FollowUpStore for PgStore {
         }))
     }
 
+    async fn delivered(&self, handle: &str) -> Result<Option<DateTime<Utc>>, StoreError> {
+        let row = sqlx::query("SELECT updated_at FROM web_brief_days WHERE handle = $1")
+            .bind(handle)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(err)?;
+        row.map(|r| r.try_get("updated_at").map_err(err))
+            .transpose()
+    }
+
     async fn purge(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
         let a = sqlx::query("DELETE FROM web_followups WHERE expires <= $1")
             .bind(now)
@@ -660,8 +684,11 @@ impl FollowUpStore for PgStore {
             .await
             .map_err(err)?
             .rows_affected();
+        // The day's items go; the row stays with its `updated_at`, which is only when the
+        // last brief was delivered (`GET /api/brief`'s `delivered_at`), no text.
         let b = sqlx::query(
-            "DELETE FROM web_brief_days WHERE updated_at + make_interval(secs => $2) <= $1",
+            "UPDATE web_brief_days SET changed = '[]'::jsonb
+             WHERE updated_at + make_interval(secs => $2) <= $1 AND changed <> '[]'::jsonb",
         )
         .bind(now)
         .bind(secs(Duration::hours(CHANGED_TTL_HOURS)))

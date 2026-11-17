@@ -34,6 +34,11 @@ pub struct Session {
     pub csrf_token: String,
     pub created_at: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
+    /// For an Entra ID sign-in, the token's `oid` (the person's object id in the tenant) and
+    /// `tid` (the tenant): checked against a member's `entra-oid` on every request. `None`
+    /// for development sign-in.
+    pub entra_oid: Option<String>,
+    pub entra_tid: Option<String>,
 }
 
 impl Session {
@@ -74,8 +79,13 @@ pub trait SessionStore: Send + Sync {
     /// End every session of `handle` (they left the team).
     async fn remove_user(&self, handle: &str) -> Result<(), StoreError>;
 
-    /// Delete every expired session; the number removed. Called on a cheap path (sign-in),
-    /// so no scheduler is needed. The in-memory store sweeps on every `touch` instead.
+    /// Does the store answer? For `GET /readyz`. Memory always does.
+    async fn ping(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Delete every expired session; the number removed. Called by the periodic purge
+    /// (`app::Housekeeping`) and at sign-in. The in-memory store sweeps on every `touch` too.
     async fn purge(
         &self,
         _now: DateTime<Utc>,
@@ -210,6 +220,8 @@ mod tests {
             csrf_token: random_token(),
             created_at: at(0),
             last_seen: at(0),
+            entra_oid: None,
+            entra_tid: None,
         }
     }
 

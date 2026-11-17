@@ -771,6 +771,7 @@ fn member(handle: &str, slack_id: &str, email: Option<&str>) -> pmos_contract::m
         slack_id: slack_id.into(),
         email: email.map(String::from),
         github: None,
+        entra_oid: None,
         roles: vec![pmos_contract::model::Role::Pm],
     }
 }
@@ -1283,6 +1284,7 @@ async fn slack_writes_check_their_audience_before_posting() {
         slack_id: slack_id.into(),
         email: None,
         github: None,
+        entra_oid: None,
         roles: vec![pmos_contract::model::Role::Pm],
     };
     let svc = Arc::new(

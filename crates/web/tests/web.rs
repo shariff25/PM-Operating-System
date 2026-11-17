@@ -11,7 +11,10 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
-use pmos_web::followups::BriefConfig;
+use pmos_web::followups::{
+    BriefConfig, Changed, Day, FollowUp, FollowUpStore, MemoryFollowUpStore, NewFollowUp,
+    StoreError,
+};
 use pmos_web::session::MemorySessionStore;
 use pmos_web::settings::MemorySettingsStore;
 use pmos_web::upstream::{Credentials, Signer};
@@ -72,10 +75,28 @@ impl Upstream {
         self.calls.lock().unwrap().clone()
     }
 
+    /// Calls that change something upstream: tasks made, decisions sent. A saved edit
+    /// (`PUT …/draft`, see [`Upstream::saves`]) is not one: it decides and writes nothing.
     fn writes(&self) -> Vec<Call> {
         self.calls()
             .into_iter()
-            .filter(|c| c.method != "GET")
+            .filter(|c| c.method != "GET" && !c.uri.contains("/draft?"))
+            .collect()
+    }
+
+    /// Decisions sent (`POST …/decision`).
+    fn decisions(&self) -> Vec<Call> {
+        self.calls()
+            .into_iter()
+            .filter(|c| c.method == "POST" && c.uri.ends_with("/decision"))
+            .collect()
+    }
+
+    /// Saved edits sent (`PUT …/draft`).
+    fn saves(&self) -> Vec<Call> {
+        self.calls()
+            .into_iter()
+            .filter(|c| c.method == "PUT" && c.uri.contains("/draft?"))
             .collect()
     }
 
@@ -118,6 +139,9 @@ async fn runtime(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if uri.path() == "/healthz" {
+        return "ok".into_response();
+    }
     up.record(&method, &uri, &headers, &body);
     if headers.get("authorization").and_then(|v| v.to_str().ok())
         != Some(&format!("Bearer {BOTS_TOKEN}"))
@@ -281,6 +305,9 @@ async fn toolserver(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if uri.path() == "/healthz" {
+        return "ok".into_response();
+    }
     up.record(&method, &uri, &headers, &body);
     if headers.get("authorization").and_then(|v| v.to_str().ok())
         != Some(&format!("Bearer {TOOLS_TOKEN}"))
@@ -353,6 +380,46 @@ async fn toolserver(
             )
                 .into_response(),
         },
+        // Like the tool server: the owner saves an edit of a pending item; where it goes
+        // can't change.
+        ("PUT", ["internal", "approvals", id, "draft"]) => {
+            let Some(it) = up.find(id) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            if query(&uri, "user").is_none_or(|u| it["user"] != json!(u)) {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            if it["status"] != json!("pending") {
+                return coded(StatusCode::CONFLICT, "not_pending");
+            }
+            if it["_refuse_save"] == json!(true) {
+                return coded(StatusCode::UNPROCESSABLE_ENTITY, "target_changed");
+            }
+            let req: Value = serde_json::from_slice(&body).unwrap();
+            let args = req["args"].clone();
+            for key in [
+                "channel",
+                "thread_ts",
+                "space",
+                "parent_id",
+                "project",
+                "epic",
+                "page_id",
+                "version",
+            ] {
+                if args.get(key) != it["args"].get(key) {
+                    return coded(StatusCode::UNPROCESSABLE_ENTITY, "target_changed");
+                }
+            }
+            if it.get("_original").is_none() {
+                up.set(id, "_original", it["args"].clone());
+            }
+            let original = up.find(id).unwrap()["_original"].clone();
+            up.set(id, "args", args.clone());
+            up.set(id, "edited", json!(args != original));
+            up.set(id, "edited_at", json!("2026-11-16T09:30:00Z"));
+            Json(up.find(id).unwrap()).into_response()
+        }
         ("POST", ["internal", "approvals", id, "decision"]) => {
             let Some(it) = up.find(id) else {
                 return StatusCode::NOT_FOUND.into_response();
@@ -369,10 +436,34 @@ async fn toolserver(
                 return StatusCode::FORBIDDEN.into_response();
             }
             let decision = req["decision"].as_str().unwrap_or_default();
+            // The answer is lost: a `500` before deciding anything, or after deciding.
+            match it["_lose_answer"].as_str() {
+                Some("before") => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                Some("after") => {
+                    up.set(
+                        id,
+                        "status",
+                        json!(if decision == "reject" {
+                            "rejected"
+                        } else {
+                            "approved"
+                        }),
+                    );
+                    up.set(id, "decided_by", req["decided_by"].clone());
+                    return StatusCode::BAD_GATEWAY.into_response();
+                }
+                _ => {}
+            }
             if decision != "reject" {
                 match *id {
                     "apr_ext" if req["confirm_external"] != json!(true) => {
-                        return coded(StatusCode::CONFLICT, "needs_external_confirm")
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(json!({"code": "needs_external_confirm",
+                                        "error": "needs_external_confirm from the tool server: the text was 'Hello partners'",
+                                        "members": 14, "external": true})),
+                        )
+                            .into_response();
                     }
                     "apr_blocked" => return coded(StatusCode::CONFLICT, "audience_blocked"),
                     "apr_expired" => return coded(StatusCode::CONFLICT, "expired"),
@@ -463,6 +554,7 @@ fn config(bots_url: &str, tools_url: &str, root: &std::path::Path) -> Config {
         entra: None,
         session_idle: Duration::hours(8),
         session_max: Duration::hours(24),
+        internal_bind: None,
     }
 }
 
@@ -541,6 +633,8 @@ struct Browser {
     cookie: Option<String>,
     csrf: Option<String>,
     extra: Vec<(&'static str, String)>,
+    /// Send a write with neither `Origin` nor `Referer` (not something a browser does).
+    no_origin: bool,
 }
 
 impl Web {
@@ -554,6 +648,15 @@ impl Web {
         if method != Method::GET {
             if let Some(t) = &b.csrf {
                 req = req.header("x-pmos-csrf", t);
+            }
+            // As every browser does on a `fetch` write: the page's own origin, unless the test
+            // sends its own `Origin` or `Referer`, or none at all.
+            let own = b
+                .extra
+                .iter()
+                .any(|(k, _)| matches!(*k, "origin" | "referer"));
+            if !own && !b.no_origin {
+                req = req.header("origin", self.base.clone());
             }
         }
         for (k, v) in &b.extra {
@@ -953,6 +1056,36 @@ async fn writes_need_the_csrf_token_and_the_apps_origin() {
         let r = w.send(&b, Method::DELETE, "/api/me/hints", None).await;
         assert_eq!(r.code(), "bad_origin");
     }
+    // A write with neither `Origin` nor `Referer` is refused, even with the token, and so
+    // is a sign-in.
+    let bare = Browser {
+        no_origin: true,
+        ..ana.clone()
+    };
+    for (method, path, body) in [
+        (Method::POST, "/api/tasks", Some(ask.clone())),
+        (
+            Method::PUT,
+            "/api/drafts/apr_conf",
+            Some(json!({"body": "x"})),
+        ),
+        (Method::DELETE, "/api/me/hints", None),
+        (Method::POST, "/api/auth/logout", None),
+    ] {
+        let r = w.send(&bare, method, path, body).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(r.code(), "bad_origin", "{path}");
+    }
+    let bare_login = Browser {
+        no_origin: true,
+        ..Browser::default()
+    };
+    assert_eq!(
+        w.post(&bare_login, "/api/auth/dev-login", json!({"handle": "ana"}))
+            .await
+            .code(),
+        "bad_origin"
+    );
     // Signing in from another site is refused too.
     let evil = Browser {
         extra: vec![("origin", "https://evil.example".to_string())],
@@ -1200,26 +1333,50 @@ async fn approve_with_a_stored_edit_sends_edit() {
         .await;
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.body["edited"], true);
+    assert_eq!(r.body["edited_at"], "2026-11-16T09:30:00Z");
     assert_eq!(r.body["body"], "# PRD\nNew text");
     assert_eq!(r.body["title"], "PRD: grace period v2");
-    // Saving sends nothing.
-    assert!(w.tools.writes().is_empty());
+    let edited = json!({"space": "PM", "title": "PRD: grace period v2",
+                        "body": "# PRD\nNew text", "parent_id": "77"});
+    // Saving stores the edit on the item at the tool server, for the PM, with an assertion
+    // for them; no decision is made and nothing goes to Confluence.
+    let saves = w.tools.saves();
+    assert_eq!(saves.len(), 1);
+    assert_eq!(saves[0].uri, "/internal/approvals/apr_conf/draft?user=ana");
+    assert_eq!(saves[0].body, json!({ "args": edited }));
+    assert!(w.tools.decisions().is_empty());
+    assert_eq!(w.tools.find("apr_conf").unwrap()["args"], edited);
     // The edit shows in the list and on reload.
     let list = w.get(&b, "/api/drafts").await.body;
     assert_eq!(list["drafts"][0]["title"], "PRD: grace period v2");
-    assert_eq!(w.get(&b, "/api/drafts/apr_conf").await.body["edited"], true);
+    let shown = w.get(&b, "/api/drafts/apr_conf").await.body;
+    assert_eq!(shown["edited"], true);
+    // A body-only edit keeps the saved title.
+    let r = w
+        .send(
+            &b,
+            Method::PUT,
+            "/api/drafts/apr_conf",
+            Some(json!({"body": "# PRD\nNewer text"})),
+        )
+        .await;
+    assert_eq!(r.body["title"], "PRD: grace period v2");
+    assert_ne!(
+        r.body["version"], shown["version"],
+        "a new edit, a new version"
+    );
+    let edited = json!({"space": "PM", "title": "PRD: grace period v2",
+                        "body": "# PRD\nNewer text", "parent_id": "77"});
 
     let r = w.post(&b, "/api/drafts/apr_conf/approve", json!({})).await;
     assert_eq!(r.status, StatusCode::OK);
-    assert_eq!(r.body["edited"], false, "the edit is now the draft");
-    assert_eq!(r.body["body"], "# PRD\nNew text");
-    let writes = w.tools.writes();
-    assert_eq!(writes.len(), 1);
+    assert_eq!(r.body["body"], "# PRD\nNewer text");
+    let decisions = w.tools.decisions();
+    assert_eq!(decisions.len(), 1);
+    // Exactly the arguments the PM saw.
     assert_eq!(
-        writes[0].body,
-        json!({"decided_by": "ana", "decision": "edit",
-               "args": {"space": "PM", "title": "PRD: grace period v2",
-                        "body": "# PRD\nNew text", "parent_id": "77"}})
+        decisions[0].body,
+        json!({"decided_by": "ana", "decision": "edit", "args": edited})
     );
 
     // A Slack edit changes `text` and never the channel.
@@ -1233,9 +1390,95 @@ async fn approve_with_a_stored_edit_sends_edit() {
     w.post(&b, "/api/drafts/apr_slack/approve", json!(null))
         .await;
     assert_eq!(
-        w.tools.writes()[1].body["args"],
+        w.tools.decisions()[1].body["args"],
         json!({"channel": "C01", "thread_ts": "1731.0002", "text": "On it, today"})
     );
+}
+
+#[tokio::test]
+async fn an_edit_saved_in_the_web_app_is_what_slack_shows_and_approves() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    let opened = w.get(&b, "/api/drafts/apr_slack").await.body;
+    let r = w
+        .send(
+            &b,
+            Method::PUT,
+            "/api/drafts/apr_slack",
+            Some(json!({"body": "On it, edited in the web app"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let version = r.body["version"].clone();
+    assert_ne!(version, opened["version"]);
+    // What the Slack card reads from the tool server is now the edit.
+    let stored = w.tools.find("apr_slack").unwrap();
+    assert_eq!(stored["args"]["text"], "On it, edited in the web app");
+    assert_eq!(stored["edited"], true);
+    // The PM approves it on the Slack card: the tool server writes the stored arguments.
+    w.tools.set("apr_slack", "status", json!("approved"));
+    w.tools.set("apr_slack", "decided_by", json!("ana"));
+    w.tools.set(
+        "apr_slack",
+        "result",
+        json!({"url": "https://slack.com/archives/C01/p17310002"}),
+    );
+    // The web app shows it decided, with the edited text.
+    let d = w.get(&b, "/api/drafts/apr_slack").await.body;
+    assert_eq!(d["status"], "approved");
+    assert_eq!(d["body"], "On it, edited in the web app");
+    // An approve of the version the web app showed is the same approval: nothing is sent.
+    let r = w
+        .post(
+            &b,
+            "/api/drafts/apr_slack/approve",
+            json!({"version": version}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.body["status"], "approved");
+    // The version shown before the edit is stale.
+    let r = w
+        .post(
+            &b,
+            "/api/drafts/apr_slack/approve",
+            json!({"version": opened["version"]}),
+        )
+        .await;
+    assert_eq!(r.code(), "not_pending");
+    assert!(w.tools.decisions().is_empty());
+    // Saving once decided is not_pending; the tool server refused it.
+    let r = w
+        .send(
+            &b,
+            Method::PUT,
+            "/api/drafts/apr_slack",
+            Some(json!({"body": "Too late"})),
+        )
+        .await;
+    assert_eq!(r.code(), "not_pending");
+}
+
+#[tokio::test]
+async fn an_edit_that_moves_the_draft_is_refused_and_no_edit_is_kept_here() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    // The tool server refuses (here: as if it had moved); the app gets `bad_edit`.
+    w.tools.set("apr_jira", "_refuse_save", json!(true));
+    let r = w
+        .send(
+            &b,
+            Method::PUT,
+            "/api/drafts/apr_jira",
+            Some(json!({"body": "x"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.code(), "bad_edit");
+    assert!(!r.body["error"].as_str().unwrap().contains("tool server"));
+    let d = w.get(&b, "/api/drafts/apr_jira").await.body;
+    assert_eq!(d["edited"], false, "nothing saved anywhere");
+    assert_eq!(d["body"], "As a PM…");
 }
 
 #[tokio::test]
@@ -1245,10 +1488,15 @@ async fn passes_through_the_tool_servers_conflicts() {
     let r = w.post(&b, "/api/drafts/apr_ext/approve", json!({})).await;
     assert_eq!(r.status, StatusCode::CONFLICT);
     assert_eq!(r.code(), "needs_external_confirm");
-    assert_eq!(
-        r.body["error"],
-        "needs_external_confirm from the tool server"
-    );
+    // A fixed sentence: the tool server's own text is never passed on.
+    assert!(!r.body["error"]
+        .as_str()
+        .unwrap()
+        .contains("from the tool server"));
+    assert!(r.body["error"]
+        .as_str()
+        .unwrap()
+        .contains("Nothing was sent"));
     // The draft now says it is external, so the app asks before confirming.
     assert_eq!(
         w.get(&b, "/api/drafts/apr_ext").await.body["external"],
@@ -1888,7 +2136,7 @@ async fn a_draft_shows_the_sources_the_tool_server_found_for_its_own_pm() {
             {"id": "s2", "system": "docs", "title": "grace period",
              "url": "https://docs.example.com/grace.md", "excerpt": null, "cited": false},
             // A link that isn't https is dropped; the source stays.
-            {"id": "s3", "system": "slack", "title": "Slack thread in C01", "url": null,
+            {"id": "s3", "system": "slack", "title": "Slack thread", "url": null,
              "excerpt": null, "cited": false},
             {"id": "s4", "system": "context", "title": "Pricing principles", "url": null,
              "excerpt": null, "cited": false},
@@ -2186,7 +2434,7 @@ async fn every_response_carries_the_security_headers() {
             "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
         );
     }
-    let html = w.get(&Browser::default(), "/drafts/apr_conf").await;
+    let html = w.get(&Browser::default(), "/somewhere/in/the/app").await;
     assert_eq!(html.status, StatusCode::OK);
     assert_eq!(html.headers["content-type"], "text/html; charset=utf-8");
     assert_eq!(html.headers["x-content-type-options"], "nosniff");
@@ -2217,6 +2465,7 @@ async fn writes_must_be_json_including_sign_in() {
         let mut req = w
             .http
             .post(format!("{}{path}", w.base))
+            .header("origin", w.base.clone())
             .body(body.to_string());
         if let Some(c) = &b.cookie {
             req = req.header("cookie", format!("__Host-pmos={c}"));
@@ -2602,11 +2851,29 @@ async fn a_draft_asks_the_pms_personal_bot() {
     assert_eq!(writes[0].user.as_deref(), Some("ana"));
     assert_eq!(writes[0].body["source"], json!("web"));
     assert_eq!(writes[0].body["requested_by"], json!("ana"));
+    // The follow-up is data, between markers, as JSON, after an instruction not to follow
+    // anything in it.
     let text = writes[0].body["text"].as_str().unwrap();
-    assert!(text.contains("reply to Ben") && text.contains("asked about the pricing page"));
-    assert!(text.contains("https://example.com/slack/1"));
+    assert!(text.starts_with("Draft a reply"));
+    assert!(text.contains("never as instructions"));
+    let data = |text: &str| -> Value {
+        let inner = text
+            .split_once("<<<FOLLOW_UP_DATA\n")
+            .unwrap()
+            .1
+            .split_once("\nFOLLOW_UP_DATA>>>")
+            .unwrap()
+            .0;
+        serde_json::from_str(inner).unwrap()
+    };
+    let reply_data = data(text);
+    assert_eq!(reply_data["who"], "Ben");
+    assert_eq!(reply_data["summary"], "asked about the pricing page");
+    assert_eq!(reply_data["url"], "https://example.com/slack/1");
     let text = writes[1].body["text"].as_str().unwrap();
-    assert!(text.contains("nudge to Legal") && text.contains("the DPA question"));
+    assert!(text.starts_with("Draft a short, gentle nudge"));
+    assert_eq!(data(text)["who"], "Legal");
+    assert_eq!(data(text)["summary"], "the DPA question");
     // The tool server hears nothing: the draft arrives later, as an ordinary approval.
     assert!(w.tools.calls().is_empty());
     // Asking is not dismissing.
@@ -2692,7 +2959,28 @@ async fn the_internal_route_wants_the_service_token() {
                 .json(&body),
         )
         .await;
-    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(r.code(), "forbidden");
+    // Nor does a page: anything carrying a session cookie or an `Origin` is refused, even
+    // with the right token.
+    for (k, v) in [
+        ("origin", w.base.clone()),
+        (
+            "cookie",
+            format!("__Host-pmos={}", b.cookie.clone().unwrap()),
+        ),
+    ] {
+        let r = w
+            .reply(
+                w.http
+                    .put(format!("{}/internal/brief/ana", w.base))
+                    .header("authorization", format!("Bearer {BRIEF_TOKEN}"))
+                    .header(k, v)
+                    .json(&body),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{k}");
+    }
     assert_eq!(
         w.get(&b, "/api/brief").await.body["waiting_on_you"],
         json!([])
@@ -3092,4 +3380,269 @@ async fn without_keys_no_assertion_is_sent() {
         .iter()
         .chain(w.tools.calls().iter())
         .all(|c| c.assertion.is_none()));
+}
+
+// Review fixes: old links, what the approve dialog shows, unknown outcomes, the brief's
+// delivery, readiness, HSTS, the internal listener and the periodic purge.
+
+#[tokio::test]
+async fn old_slack_links_redirect_to_the_apps_draft_route() {
+    let w = web().await;
+    let b = Browser::default();
+    for (path, to) in [
+        ("/drafts/apr_0123abcdef", "/#/d/apr_0123abcdef"),
+        ("/d/apr_0123abcdef", "/#/d/apr_0123abcdef"),
+        // Not an approval id: the app's home, never somewhere else.
+        ("/drafts/prc_1", "/"),
+        ("/drafts/apr_", "/"),
+        ("/d/apr_x%2F..%2Fevil", "/"),
+        ("/d/https:%2F%2Fevil.example", "/"),
+    ] {
+        let r = w.get(&b, path).await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{path}");
+        assert_eq!(r.headers["location"], to, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn the_approve_dialog_has_what_the_slack_card_shows() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    w.tools
+        .set("apr_conf", "sources_sensitivity", json!("internal"));
+    let d = w.get(&b, "/api/drafts/apr_conf").await.body;
+    assert_eq!(d["restricted_sources"], false);
+    assert_eq!(d["audience"], Value::Null, "not a Slack draft");
+    assert_eq!(d["marker"], "Drafted with PM OS · run tsk_ana1");
+    assert_eq!(d["edited_at"], Value::Null);
+    // A Slack draft: restricted when unrecorded; audience unknown until checked.
+    let d = w.get(&b, "/api/drafts/apr_ext").await.body;
+    assert_eq!(d["restricted_sources"], true);
+    assert_eq!(d["marker"], "Drafted with PM OS");
+    assert_eq!(d["audience"], json!({"members": null, "external": null}));
+    assert_eq!(d["title"], "Message to a Slack channel");
+    assert_eq!(d["target"]["label"], "A Slack channel");
+    // The tool server's audience check counted 14 members, outside the company.
+    let r = w.post(&b, "/api/drafts/apr_ext/approve", json!({})).await;
+    assert_eq!(r.code(), "needs_external_confirm");
+    assert!(!r.body["error"].as_str().unwrap().contains("Hello partners"));
+    let d = w.get(&b, "/api/drafts/apr_ext").await.body;
+    assert_eq!(d["audience"], json!({"members": 14, "external": true}));
+    assert_eq!(d["external"], true);
+}
+
+#[tokio::test]
+async fn a_lost_answer_says_the_outcome_is_unknown_unless_the_draft_shows_it() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    // Lost before anything was decided: the app can't say nothing was sent.
+    w.tools.set("apr_jira", "_lose_answer", json!("before"));
+    let r = w.post(&b, "/api/drafts/apr_jira/approve", json!({})).await;
+    assert_eq!(r.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(r.code(), "unknown_outcome");
+    assert!(!r.body["error"].as_str().unwrap().contains("Nothing was"));
+    // Lost after the tool server approved it: the draft read again shows the approval.
+    w.tools.set("apr_conf", "_lose_answer", json!("after"));
+    let r = w.post(&b, "/api/drafts/apr_conf/approve", json!({})).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.body["status"], "approved");
+    // The same for a rejection.
+    w.tools.set("apr_slack", "_lose_answer", json!("after"));
+    let r = w.post(&b, "/api/drafts/apr_slack/reject", json!({})).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.body["status"], "rejected");
+}
+
+#[tokio::test]
+async fn the_brief_says_whether_one_was_ever_delivered() {
+    let w = web_brief().await;
+    let b = w.login("ana").await;
+    let r = w.get(&b, "/api/brief").await.body;
+    assert_eq!(r["status"], "never");
+    assert_eq!(r["delivered_at"], Value::Null);
+    // One that found nothing is still a delivery.
+    assert_eq!(w.fill("ana", json!({})).await.status, StatusCode::OK);
+    let r = w.get(&b, "/api/brief").await.body;
+    assert_eq!(r["status"], "today");
+    assert_eq!(r["delivered_at"], "2026-11-16T09:00:00Z");
+    assert_eq!(r["changed"], json!([]));
+    // A day later, with the day's items gone (and purged), it is stale, not "never".
+    w.advance(Duration::hours(25));
+    let b = w.login("ana").await;
+    let r = w.get(&b, "/api/brief").await.body;
+    assert_eq!(r["status"], "stale");
+    assert_eq!(r["delivered_at"], "2026-11-16T09:00:00Z");
+    // Another PM's is their own.
+    let ben = w.login("ben").await;
+    assert_eq!(w.get(&ben, "/api/brief").await.body["status"], "never");
+}
+
+#[tokio::test]
+async fn readyz_checks_the_store_the_team_and_both_upstreams() {
+    let w = web().await;
+    let r = w.get(&Browser::default(), "/readyz").await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(
+        r.body,
+        json!({"ready": true, "checks": {"store": "ok", "team": "ok",
+                                         "bot_runtime": "ok", "tool_server": "ok"}})
+    );
+    std::fs::write(w.dir.path().join("team.yaml"), "members: [").unwrap();
+    let r = w.get(&Browser::default(), "/readyz").await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.body["checks"]["team"], "down");
+    // Upstreams that don't answer.
+    let w = web_with(|c| {
+        c.bots_url = "http://127.0.0.1:9".into();
+        c.toolserver_url = "http://127.0.0.1:9".into();
+    })
+    .await;
+    let r = w.get(&Browser::default(), "/readyz").await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.body["checks"]["bot_runtime"], "down");
+    assert_eq!(r.body["checks"]["tool_server"], "down");
+    w.assert_no_tokens();
+}
+
+#[tokio::test]
+async fn hsts_only_with_an_https_public_url() {
+    let w = web_with(|c| c.public_url = Some("https://pmos.example.com".into())).await;
+    let r = w.get(&Browser::default(), "/api/auth/providers").await;
+    assert_eq!(r.headers["strict-transport-security"], "max-age=31536000");
+    let w = web().await;
+    let r = w.get(&Browser::default(), "/api/auth/providers").await;
+    assert!(r.headers.get("strict-transport-security").is_none());
+}
+
+#[tokio::test]
+async fn the_internal_route_can_have_its_own_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
+    let mut cfg = config("http://127.0.0.1:9", "http://127.0.0.1:9", dir.path());
+    cfg.internal_bind = Some("127.0.0.1:0".parse().unwrap());
+    let deps = Deps {
+        brief: BriefConfig {
+            enabled: true,
+            token: Some(BRIEF_TOKEN.into()),
+        },
+        ..Deps::in_memory()
+    };
+    let server = pmos_web::app::build_server(cfg, deps).unwrap();
+    let (public, _a) = serve(server.public).await;
+    let (internal, _b) = serve(server.internal.expect("an internal router")).await;
+    let http = reqwest::Client::new();
+    let put = |base: &str| {
+        http.put(format!("{base}/internal/brief/ana"))
+            .header("authorization", format!("Bearer {BRIEF_TOKEN}"))
+            .json(&json!({}))
+            .send()
+    };
+    // Not on the browser-facing listener at all.
+    let res = put(&public).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    // On its own.
+    let res = put(&internal).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    // Which serves nothing else of the app.
+    let res = http
+        .get(format!("{internal}/api/auth/providers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn development_sign_in_never_builds_on_a_reachable_address() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
+    let mut cfg = config("http://127.0.0.1:9", "http://127.0.0.1:9", dir.path());
+    cfg.bind = "0.0.0.0:8770".parse().unwrap();
+    let err = pmos_web::build(cfg, Deps::in_memory()).unwrap_err();
+    assert!(err.contains("loopback"), "{err}");
+}
+
+/// Counts the purges it is asked for; otherwise memory.
+#[derive(Default)]
+struct CountingFollowUps {
+    inner: MemoryFollowUpStore,
+    purges: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl FollowUpStore for CountingFollowUps {
+    async fn list(&self, handle: &str, now: DateTime<Utc>) -> Result<Vec<FollowUp>, StoreError> {
+        self.inner.list(handle, now).await
+    }
+    async fn open(
+        &self,
+        handle: &str,
+        id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<FollowUp>, StoreError> {
+        self.inner.open(handle, id, now).await
+    }
+    async fn dismiss(
+        &self,
+        handle: &str,
+        id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        self.inner.dismiss(handle, id, now).await
+    }
+    async fn replace(
+        &self,
+        handle: &str,
+        date: chrono::NaiveDate,
+        changed: Vec<Changed>,
+        followups: Vec<NewFollowUp>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .replace(handle, date, changed, followups, now)
+            .await
+    }
+    async fn day(&self, handle: &str, now: DateTime<Utc>) -> Result<Option<Day>, StoreError> {
+        self.inner.day(handle, now).await
+    }
+    async fn delivered(&self, handle: &str) -> Result<Option<DateTime<Utc>>, StoreError> {
+        self.inner.delivered(handle).await
+    }
+    async fn purge(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
+        self.purges.fetch_add(1, Ordering::SeqCst);
+        self.inner.purge(now).await
+    }
+}
+
+#[tokio::test]
+async fn expired_things_are_purged_on_a_timer_until_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
+    let cfg = config("http://127.0.0.1:9", "http://127.0.0.1:9", dir.path());
+    let followups = Arc::new(CountingFollowUps::default());
+    let deps = Deps {
+        followups: followups.clone(),
+        ..Deps::in_memory()
+    };
+    let server = pmos_web::app::build_server(cfg, deps).unwrap();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(
+        server
+            .housekeeping
+            .run(std::time::Duration::from_millis(20), stop.clone()),
+    );
+    // Nobody signs in; the purge runs anyway, at once and then on each tick.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while followups.purges.load(Ordering::SeqCst) < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the purge never ran"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    stop.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("it stops on shutdown")
+        .unwrap();
 }

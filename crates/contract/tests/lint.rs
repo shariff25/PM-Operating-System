@@ -566,6 +566,27 @@ fn team_emails_are_unique_ignoring_case() {
 }
 
 #[test]
+fn team_entra_object_ids_are_guids_and_unique() {
+    let dir = valid_tree();
+    write(
+        dir.path(),
+        "team.yaml",
+        "members:\n  - {handle: ana, slack-id: U0ANA1, entra-oid: 00000000-0000-0000-0000-0000000000a1, roles: [pm]}\n  - {handle: bo, slack-id: U0BO, entra-oid: 00000000-0000-0000-0000-0000000000A1, roles: [pm]}\n  - {handle: cy, slack-id: U0CY, entra-oid: not-a-guid, roles: [pm]}\n  - {handle: dee, slack-id: U0DEE, roles: [pm]}\n",
+    );
+    let report = run(&dir);
+    assert_code(&report, "team-duplicate", Severity::Error);
+    assert_code(&report, "team-entra-oid", Severity::Error);
+    let team = pmos_contract::model::TeamFile::from_yaml(
+        "members:\n  - {handle: ana, slack-id: U0ANA1, entra-oid: 00000000-0000-0000-0000-0000000000a1, roles: [pm]}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        team.members[0].entra_oid.as_deref(),
+        Some("00000000-0000-0000-0000-0000000000a1")
+    );
+}
+
+#[test]
 fn team_file_parses_and_looks_up_by_slack_id() {
     let team = pmos_contract::model::TeamFile::from_yaml(
         "members:\n  - {handle: ana, slack-id: U0ANA1, roles: [pm]}\n",

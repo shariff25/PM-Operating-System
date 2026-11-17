@@ -198,6 +198,7 @@ async fn web() -> Web {
         entra: None,
         session_idle: Duration::hours(8),
         session_max: Duration::hours(24),
+        internal_bind: None,
     };
     let (base, stop_web) = serve(pmos_web::build(cfg, Deps::in_memory()).unwrap()).await;
     Web {
@@ -237,6 +238,7 @@ impl Web {
         let res = self
             .http
             .post(format!("{}/api/auth/dev-login", self.base))
+            .header("origin", self.base.clone())
             .json(&json!({ "handle": handle }))
             .send()
             .await

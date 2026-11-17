@@ -171,6 +171,33 @@ pub struct ApprovalItem {
     /// When a Slack draft's text was removed: on expiry, or a day after its decision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redacted_at: Option<DateTime<Utc>>,
+    /// The arguments as the bot drafted them, kept once a person changed `args` (a saved
+    /// edit, [`ApprovalRepo::save_draft`], or an edit decision) so the ledger can measure the
+    /// edit. Never served; `None` while `args` are the bot's own. Removed with the text.
+    #[serde(skip)]
+    pub drafted_args: Option<Value>,
+    /// When a person last saved an edit of this pending draft ([`ApprovalRepo::save_draft`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<DateTime<Utc>>,
+}
+
+impl ApprovalItem {
+    /// Has a person changed the arguments the bot drafted?
+    pub fn edited(&self) -> bool {
+        self.drafted_args.is_some()
+    }
+
+    /// The arguments as the bot drafted them.
+    pub fn drafted(&self) -> &Value {
+        self.drafted_args.as_ref().unwrap_or(&self.args)
+    }
+}
+
+/// What a person's change of `item`'s arguments to `args` keeps of the bot's own: the
+/// drafted arguments, or `None` when `args` are exactly those again.
+pub fn drafted_after(item: &ApprovalItem, args: &Value) -> Option<Value> {
+    let drafted = item.drafted();
+    (args_hash(drafted) != args_hash(args)).then(|| drafted.clone())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -280,6 +307,8 @@ impl NewItem<'_> {
             result: None,
             sources_sensitivity: Some(self.sources_sensitivity),
             redacted_at: None,
+            drafted_args: None,
+            edited_at: None,
         }
     }
 }
@@ -383,6 +412,19 @@ pub trait ApprovalRepo: Send + Sync {
         id: &str,
         decided_by: &str,
         verdict: Verdict,
+        now: DateTime<Utc>,
+    ) -> Result<ApprovalItem, DecideError>;
+
+    /// Save a person's edit of a pending item: `args` replace its arguments (and their hash),
+    /// so every surface shows them and an approve anywhere writes them. The bot's own
+    /// arguments are kept in `drafted_args` (saving them back clears it, and `edited_at`);
+    /// `edited_at` is `now`. Only the item's own user, only while it is pending: the same
+    /// refusals as a decision. The ledger row is unchanged until the decision.
+    async fn save_draft(
+        &self,
+        id: &str,
+        user: &str,
+        args: Value,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError>;
 
@@ -571,6 +613,8 @@ impl ApprovalRepo for MemoryApprovals {
             return Err(DecideError::NotPending);
         }
         let reason = verdict.stored_reason();
+        // Measured from the bot's own arguments, so a saved edit approved as it stands
+        // counts as edited.
         let (distance, edited) = match verdict.decision {
             Decision::Reject => {
                 item.status = Status::Rejected;
@@ -578,15 +622,19 @@ impl ApprovalRepo for MemoryApprovals {
             }
             Decision::Approve => {
                 item.status = Status::Executing;
-                (Some(0.0), false)
+                match &item.drafted_args {
+                    Some(drafted) => (Some(args_edit_distance(drafted, &item.args)), true),
+                    None => (Some(0.0), false),
+                }
             }
             Decision::Edit => {
                 let args = verdict.args.ok_or(DecideError::MissingArgs)?;
-                let distance = args_edit_distance(&item.args, &args);
-                let new_hash = args_hash(&args);
-                let edited = new_hash != item.args_hash;
-                item.args_hash = new_hash;
+                let distance = args_edit_distance(item.drafted(), &args);
+                let drafted = drafted_after(item, &args);
+                let edited = drafted.is_some();
+                item.args_hash = args_hash(&args);
                 item.args = args;
+                item.drafted_args = drafted;
                 item.status = Status::Executing;
                 (Some(distance), edited)
             }
@@ -605,6 +653,32 @@ impl ApprovalRepo for MemoryApprovals {
             entry.edited = edited;
         }
         Ok(item)
+    }
+
+    async fn save_draft(
+        &self,
+        id: &str,
+        user: &str,
+        args: Value,
+        now: DateTime<Utc>,
+    ) -> Result<ApprovalItem, DecideError> {
+        let mut state = self.state.lock().expect("approvals lock");
+        let item = state.items.get_mut(id).ok_or(DecideError::NotFound)?;
+        if item.user != user {
+            return Err(DecideError::Forbidden);
+        }
+        if item.status == Status::Expired {
+            return Err(DecideError::Expired);
+        }
+        if item.status != Status::Pending {
+            return Err(DecideError::NotPending);
+        }
+        let drafted = drafted_after(item, &args);
+        item.edited_at = drafted.as_ref().map(|_| now);
+        item.drafted_args = drafted;
+        item.args_hash = args_hash(&args);
+        item.args = args;
+        Ok(item.clone())
     }
 
     async fn complete(
@@ -686,6 +760,7 @@ impl ApprovalRepo for MemoryApprovals {
         }) {
             item.status = Status::Expired;
             item.args = redact_args(&item.args);
+            item.drafted_args = None;
             item.redacted_at = Some(now);
             expired.push(item.clone());
         }
@@ -715,6 +790,7 @@ impl ApprovalRepo for MemoryApprovals {
                 && i.decided_at.is_some_and(|d| d <= before)
         }) {
             item.args = redact_args(&item.args);
+            item.drafted_args = None;
             item.redacted_at = Some(now);
             n += 1;
         }

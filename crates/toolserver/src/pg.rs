@@ -411,12 +411,14 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
             .map(|s| Sensitivity::parse(&s).ok_or_else(|| bad_row("sensitivity", &s)))
             .transpose()?,
         redacted_at: r.try_get("redacted_at")?,
+        drafted_args: r.try_get("drafted_args")?,
+        edited_at: r.try_get("edited_at")?,
     })
 }
 
 const ITEM_COLUMNS: &str = "id, user_handle, skill, bot, run_id, tool, args, args_hash, status, \
                             created_at, decided_at, decided_by, result, sources_sensitivity, \
-                            redacted_at";
+                            redacted_at, drafted_args, edited_at";
 
 /// Insert a new item and its ledger row, inside `tx`.
 async fn insert_item(
@@ -627,11 +629,17 @@ impl ApprovalRepo for PgStore {
         // differs), it is computed again there.
         let early = match (&verdict.decision, &verdict.args) {
             (Decision::Edit, Some(edited)) => {
-                let row = sqlx::query("SELECT args, args_hash FROM approvals WHERE id = $1")
-                    .bind(id)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(StoreError::from)?;
+                // Measured from the bot's own arguments (`drafted_args` once a person saved an
+                // edit). Under the lock, the same `args_hash` means the same drafted
+                // arguments.
+                let row = sqlx::query(
+                    "SELECT COALESCE(drafted_args, args) AS args, args_hash FROM approvals \
+                     WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(StoreError::from)?;
                 match row {
                     Some(r) => {
                         let args: Value = r.try_get("args").map_err(StoreError::from)?;
@@ -676,25 +684,53 @@ impl ApprovalRepo for PgStore {
         let reason = verdict
             .reason
             .filter(|_| verdict.decision == Decision::Reject);
-        let (status, args, distance) = match verdict.decision {
-            Decision::Reject => (Status::Rejected, None, None),
-            Decision::Approve => (Status::Executing, None, Some(0.0)),
+        // As in memory: an edit is measured from the bot's own arguments, so a saved edit
+        // approved as it stands counts as edited.
+        let (status, args, distance, drafted, edited) = match verdict.decision {
+            Decision::Reject => (
+                Status::Rejected,
+                None,
+                None,
+                current.drafted_args.clone(),
+                false,
+            ),
+            Decision::Approve => {
+                let distance = current
+                    .drafted_args
+                    .as_ref()
+                    .map_or(0.0, |d| args_edit_distance(d, &current.args));
+                let edited = current.edited();
+                (
+                    Status::Executing,
+                    None,
+                    Some(distance),
+                    current.drafted_args.clone(),
+                    edited,
+                )
+            }
             Decision::Edit => {
                 // Checked above, before anything changed.
                 let args = verdict.args.ok_or(DecideError::MissingArgs)?;
                 let distance = match early {
                     Some((hash, distance)) if hash == current.args_hash => distance,
-                    _ => args_edit_distance(&current.args, &args),
+                    _ => args_edit_distance(current.drafted(), &args),
                 };
-                (Status::Executing, Some(args), Some(distance))
+                let drafted = crate::approvals::drafted_after(&current, &args);
+                let edited = drafted.is_some();
+                (
+                    Status::Executing,
+                    Some(args),
+                    Some(distance),
+                    drafted,
+                    edited,
+                )
             }
         };
         let new_hash = args.as_ref().map(args_hash);
-        let edited = new_hash.as_ref().is_some_and(|h| h != &current.args_hash);
         let sql = format!(
             "UPDATE approvals
              SET status = $3, args = COALESCE($4, args), args_hash = COALESCE($5, args_hash),
-                 decided_at = $6, decided_by = $2
+                 decided_at = $6, decided_by = $2, drafted_args = $7
              WHERE id = $1 AND user_handle = $2 AND status = 'pending'
              RETURNING {ITEM_COLUMNS}"
         );
@@ -705,6 +741,7 @@ impl ApprovalRepo for PgStore {
             .bind(&args)
             .bind(&new_hash)
             .bind(now)
+            .bind(&drafted)
             .fetch_optional(&mut *tx)
             .await
             .map_err(StoreError::from)?
@@ -727,6 +764,61 @@ impl ApprovalRepo for PgStore {
         .execute(&mut *tx)
         .await
         .map_err(StoreError::from)?;
+        tx.commit().await.map_err(StoreError::from)?;
+        Ok(item)
+    }
+
+    async fn save_draft(
+        &self,
+        id: &str,
+        user: &str,
+        args: Value,
+        now: DateTime<Utc>,
+    ) -> Result<ApprovalItem, DecideError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::from)?;
+        // The same lock a decision takes: a save and a decision of one item never interleave.
+        let sql = format!("SELECT {ITEM_COLUMNS} FROM approvals WHERE id = $1 FOR UPDATE");
+        let current = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(StoreError::from)?
+            .as_ref()
+            .map(item_from_row)
+            .transpose()?
+            .ok_or(DecideError::NotFound)?;
+        let refused = if current.user != user {
+            Some(DecideError::Forbidden)
+        } else if current.status == Status::Expired {
+            Some(DecideError::Expired)
+        } else if current.status != Status::Pending {
+            Some(DecideError::NotPending)
+        } else {
+            None
+        };
+        if let Some(e) = refused {
+            tx.rollback().await.map_err(StoreError::from)?;
+            return Err(e);
+        }
+        let drafted = crate::approvals::drafted_after(&current, &args);
+        let edited_at = drafted.as_ref().map(|_| now);
+        let sql = format!(
+            "UPDATE approvals
+             SET args = $2, args_hash = $3, drafted_args = $4, edited_at = $5
+             WHERE id = $1 AND status = 'pending'
+             RETURNING {ITEM_COLUMNS}"
+        );
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .bind(&args)
+            .bind(args_hash(&args))
+            .bind(&drafted)
+            .bind(edited_at)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(StoreError::from)?
+            .ok_or(DecideError::NotPending)?;
+        let item = item_from_row(&row)?;
         tx.commit().await.map_err(StoreError::from)?;
         Ok(item)
     }
@@ -846,7 +938,8 @@ impl ApprovalRepo for PgStore {
         let mut expired = Vec::with_capacity(due.len());
         for item in due {
             let sql = format!(
-                "UPDATE approvals SET status = 'expired', args = $2, redacted_at = $3
+                "UPDATE approvals
+                 SET status = 'expired', args = $2, redacted_at = $3, drafted_args = NULL
                  WHERE id = $1 AND status = 'pending'
                  RETURNING {ITEM_COLUMNS}"
             );
@@ -891,12 +984,15 @@ impl ApprovalRepo for PgStore {
         for row in &due {
             let id: String = row.try_get("id")?;
             let args: Value = row.try_get("args")?;
-            sqlx::query("UPDATE approvals SET args = $2, redacted_at = $3 WHERE id = $1")
-                .bind(&id)
-                .bind(redact_args(&args))
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE approvals SET args = $2, redacted_at = $3, drafted_args = NULL \
+                 WHERE id = $1",
+            )
+            .bind(&id)
+            .bind(redact_args(&args))
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(due.len())

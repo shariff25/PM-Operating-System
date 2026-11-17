@@ -126,6 +126,8 @@ fn session(handle: &str, minutes: i64) -> Session {
         csrf_token: random_token(),
         created_at: at(minutes),
         last_seen: at(minutes),
+        entra_oid: None,
+        entra_tid: None,
     }
 }
 
@@ -540,6 +542,54 @@ async fn followups_dismiss_and_replace(s: &Stores) {
     assert_ne!(c.id("ana"), c.id("ben"));
 }
 
+async fn sessions_keep_the_entra_account(s: &Stores) {
+    let (idle, max) = (Duration::hours(8), Duration::hours(24));
+    let id = hash_id(&random_token());
+    let mut entra = session("ana", 0);
+    entra.entra_oid = Some("00000000-0000-0000-0000-00000000a0a0".into());
+    entra.entra_tid = Some("11111111-2222-3333-4444-555555555555".into());
+    s.sessions.insert(id, entra.clone()).await.unwrap();
+    let back = s
+        .sessions
+        .touch(&id, at(1), idle, max)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.entra_oid, entra.entra_oid);
+    assert_eq!(back.entra_tid, entra.entra_tid);
+    let dev = hash_id(&random_token());
+    s.sessions.insert(dev, session("ben", 0)).await.unwrap();
+    let back = s
+        .sessions
+        .touch(&dev, at(1), idle, max)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((back.entra_oid, back.entra_tid), (None, None));
+    s.sessions.ping().await.unwrap();
+}
+
+async fn a_delivery_is_remembered_after_its_items_go(s: &Stores) {
+    assert_eq!(s.followups.delivered("ana").await.unwrap(), None);
+    s.followups
+        .replace("ana", day(), vec![changed("t")], vec![], at(0))
+        .await
+        .unwrap();
+    assert_eq!(s.followups.delivered("ana").await.unwrap(), Some(at(0)));
+    // A day and more later the items are purged; when it was delivered is not.
+    let later = at(25 * 60);
+    s.followups.purge(later).await.unwrap();
+    assert!(s.followups.day("ana", later).await.unwrap().is_none());
+    assert_eq!(s.followups.delivered("ana").await.unwrap(), Some(at(0)));
+    assert_eq!(s.followups.delivered("ben").await.unwrap(), None);
+    // A new delivery moves it on.
+    s.followups
+        .replace("ana", day(), vec![], vec![], later)
+        .await
+        .unwrap();
+    assert_eq!(s.followups.delivered("ana").await.unwrap(), Some(later));
+}
+
 // Running the contract.
 
 macro_rules! contract {
@@ -575,6 +625,8 @@ contract!(
     settings_updates_take_turns,
     followups_are_listed_per_pm_and_expire,
     followups_dismiss_and_replace,
+    sessions_keep_the_entra_account,
+    a_delivery_is_remembered_after_its_items_go,
 );
 
 /// A restart: what one store handle wrote, a new connection pool reads back.

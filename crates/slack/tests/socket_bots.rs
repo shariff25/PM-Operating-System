@@ -1070,6 +1070,136 @@ async fn approval_cards_are_decided_by_their_own_pm() {
     stack.stop().await;
 }
 
+/// A click on an approval card's button, as Slack sends it: with the clicked block's id.
+fn click_in(
+    envelope_id: &str,
+    user: &str,
+    action_id: &str,
+    value: &str,
+    ts: &str,
+    block_id: &str,
+) -> Value {
+    let mut c = click(envelope_id, user, action_id, value, "D0ANA", ts);
+    c["payload"]["actions"][0]["block_id"] = json!(block_id);
+    c
+}
+
+/// The approval actions block's id in a card's blocks.
+fn approval_block_id(blocks: &Value) -> String {
+    blocks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| {
+            b["type"] == "actions"
+                && b["block_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("approval:"))
+        })
+        .and_then(|b| b["block_id"].as_str())
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn an_edit_saved_in_the_web_app_is_what_the_card_approves() {
+    let mut stack = Stack::new().await;
+    let hash = |c: char| c.to_string().repeat(64);
+    let mut item = approval(
+        "apr_w1",
+        "ana",
+        "confluence.create_draft",
+        json!({"space": "PM", "title": "Launch plan", "body": "As the bot drafted it"}),
+    );
+    item["args_hash"] = json!(hash('a'));
+    stack
+        .tools
+        .items
+        .lock()
+        .unwrap()
+        .insert("apr_w1".into(), item);
+    stack.feed(vec![json!({
+        "id": "n1", "task_id": "tsk_1", "bot": "docs", "requested_by": "ana",
+        "slack": {"channel": "D0ANA", "thread_ts": "100.2"}, "kind": "needs_approval",
+        "text": "", "approvals": ["apr_w1"],
+    })]);
+    stack.connect();
+    let (stop, handle) = stack.notifier();
+    let posts = stack.calls("chat.postMessage", 1).await;
+    let card = posts
+        .iter()
+        .find(|p| p.body["blocks"].to_string().contains("approval:apr_w1"))
+        .unwrap()
+        .clone();
+    assert!(text_of(&card).contains("As the bot drafted it"));
+    let posted_block = approval_block_id(&card.body["blocks"]);
+    assert_eq!(
+        posted_block,
+        format!("approval:apr_w1:{}", &hash('a')[..16])
+    );
+    let ts = card.body["ts"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| "1700000000.000001".into());
+
+    // The PM saves an edit in the web app: the tool server's item now holds it.
+    {
+        let mut items = stack.tools.items.lock().unwrap();
+        let it = items.get_mut("apr_w1").unwrap();
+        it["args"]["body"] = json!("Edited in the web app");
+        it["args_hash"] = json!(hash('b'));
+        it["edited"] = json!(true);
+    }
+    // Approve on the card posted before the edit: nothing is decided; the card shows the
+    // text as it is now, says why, and its buttons carry the new text's hash.
+    stack
+        .send(click_in(
+            "w1",
+            "U0ANA",
+            "apr_approve",
+            "apr_w1",
+            &ts,
+            &posted_block,
+        ))
+        .await;
+    let fresh = card_update(&stack, &ts, "the refreshed card", |t| {
+        t.contains("edited after this card was posted")
+    })
+    .await;
+    assert!(text_of(&fresh).contains("Edited in the web app"));
+    assert!(text_of(&fresh).contains("edited by Ana"));
+    assert!(stack.tools.decisions.lock().unwrap().is_empty());
+    let fresh_block = approval_block_id(&fresh.body["blocks"]);
+    assert_eq!(fresh_block, format!("approval:apr_w1:{}", &hash('b')[..16]));
+
+    // Approve again on the refreshed card: an `approve`, so the tool server writes the
+    // arguments it holds, the edit; the closed card shows that text.
+    stack
+        .send(click_in(
+            "w2",
+            "U0ANA",
+            "apr_approve",
+            "apr_w1",
+            &ts,
+            &fresh_block,
+        ))
+        .await;
+    let approved = card_update(&stack, &ts, "the approved card", |t| {
+        t.contains("Approved by Ana")
+    })
+    .await;
+    assert!(text_of(&approved).contains("Edited in the web app"));
+    let decisions = stack.tools.decisions.lock().unwrap().clone();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(
+        decisions[0].2,
+        json!({"decided_by": "ana", "decision": "approve"})
+    );
+    stop.cancel();
+    handle.await.unwrap();
+    stack.stop().await;
+}
+
 /// The blocks of the latest `chat.update` of the message at `ts`, once one matches `want`.
 async fn card_update(stack: &Stack, ts: &str, what: &str, want: impl Fn(&str) -> bool) -> Call {
     until(what, || {
