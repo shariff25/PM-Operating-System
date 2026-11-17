@@ -127,6 +127,9 @@ export async function startFakeRuntime(options: {
   };
 }
 
+/** The `ref` the fake `docs_search` gives its result. */
+export const FAKE_DOCS_REF = "src-3f9a1c";
+
 export interface FakeMcp {
   url: string;
   calls: { name: string; args: unknown; authorization?: string }[];
@@ -161,6 +164,8 @@ export async function startFakeMcp(options: { searchDelayMs?: number } = {}): Pr
         }
         return structured({
           untrusted: true,
+          // Like the tool server: the ref a draft's source marker names this item by.
+          ref: FAKE_DOCS_REF,
           source: "docs",
           content: [{ url: "https://docs.example.com/docs/ports", title: `Ports (${query})` }],
         });

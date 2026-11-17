@@ -343,6 +343,11 @@ pub fn content_tree() -> (TempDir, PathBuf) {
     );
     write(
         &root,
+        "skills/page-update/SKILL.md",
+        "---\nname: page-update\ndescription: Test skill that updates Confluence pages.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"internal\"\n  tools: \"confluence.read confluence.create_draft confluence.update_page\"\n---\n\n# /page-update\n\nTest.\n",
+    );
+    write(
+        &root,
         "skills/field-watch/SKILL.md",
         "---\nname: field-watch\ndescription: Test skill that watches field questions.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"internal\"\n  tools: \"context.search context.read jira.search jira.read jira.create_issue confluence.search confluence.read slack.search slack.read_thread slack.post_reply\"\n---\n\n# /field-watch\n\nTest.\n",
     );

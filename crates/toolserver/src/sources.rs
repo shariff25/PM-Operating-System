@@ -15,6 +15,12 @@
 //!
 //! Events recorded before titles were have none, so their sources read as ids, as before.
 //!
+//! Each source also has a **`cite`** ref, [`cite_ref`] of its `sources` entry, such as
+//! `src-3f9a1c`. Read tools give every item they return the same ref (`ref` in the result),
+//! so a bot can mark a sentence of its draft with the source it came from (`[[src-3f9a1c]]`,
+//! `crates/contract/src/cite.rs`), and the ref is matched here to what the run really read.
+//! It is a hash of ids only, the same for an item in every task, and needs nothing stored.
+//!
 //! `{site}` is the PM's linked Atlassian site, read from the stored credential (never the
 //! token); with no linked site, Jira and Confluence sources have no `url`. A reference whose
 //! shape isn't recognised is left out rather than guessed at.
@@ -22,6 +28,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::audit::source_title;
 use crate::connectors::slack::archive_url;
@@ -30,6 +37,22 @@ use crate::connectors::slack::archive_url;
 pub const MAX_SOURCES: usize = 20;
 /// The most audit events read for one item.
 pub const MAX_READ_EVENTS: usize = 500;
+
+/// The hex characters of a ref after `src-`.
+pub const CITE_REF_HEX: usize = 6;
+
+/// The ref a draft's source marker names an item by: `src-` and the first
+/// [`CITE_REF_HEX`] hex characters of the SHA-256 of its audit `sources` entry
+/// (`jira:PAY-212`, `context/product/x.md`). Only ids go in, so it carries no text.
+pub fn cite_ref(entry: &str) -> String {
+    let digest = Sha256::digest(entry.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}{}",
+        pmos_contract::cite::REF_PREFIX,
+        &hex[..CITE_REF_HEX]
+    )
+}
 
 /// One thing the drafting run read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -42,6 +65,8 @@ pub struct ApprovalSource {
     /// a docs URL.
     #[serde(rename = "ref")]
     pub reference: String,
+    /// The ref the bot was given for it ([`cite_ref`]), which its draft's markers name.
+    pub cite: String,
     /// The read tool, such as `jira.read`.
     pub tool: String,
     /// The latest read of it in the run.
@@ -450,6 +475,16 @@ mod tests {
             None
         );
         assert_eq!(target_url("bets.record", &json!({}), SITE), None);
+    }
+
+    #[test]
+    fn cite_refs_are_short_stable_and_made_from_ids() {
+        let r = cite_ref("jira:PAY-212");
+        assert_eq!(r, cite_ref("jira:PAY-212"), "stable");
+        assert!(pmos_contract::cite::is_ref(&r), "{r}");
+        assert_eq!(r.len(), "src-".len() + CITE_REF_HEX);
+        assert_ne!(r, cite_ref("jira:PAY-213"));
+        assert_ne!(cite_ref("context/a.md"), cite_ref("context/b.md"));
     }
 
     #[test]
