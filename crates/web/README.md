@@ -167,12 +167,13 @@ path with another method a JSON `405 method_not_allowed`.
 - **Tasks:** `POST /v1/tasks {bot: "pm-<handle>", requested_by, text, source: "web"}`, and
   reads of the PM's own tasks and their events, each with `X-Pmos-User: <handle>`.
 - **User assertions** (`src/upstream.rs`): with a key for the upstream, every runtime call and
-  every tool-server call that names the PM (the inbox, sources, decisions) also carries
-  `X-Pmos-Assertion`: issuer `web`, the upstream as audience, the PM as subject, roles from
-  `team.yaml`, 60 seconds, bound to the method, path, query and body sent, signed afresh for
-  each call. The re-read of one item after a conflicting decision uses
-  `ToolServer::approval_for(user, id)` and carries one too; only the first read of a draft
-  (`approval(id)`, owner checked here) names no one and is sent without. `sid` is the PM's
+  every tool-server call that names the PM (the inbox, one item, sources, decisions) also
+  carries `X-Pmos-Assertion`: issuer `web`, the upstream as audience, the PM as subject, roles
+  from `team.yaml`, 60 seconds, bound to the method, path, query and body sent, signed afresh
+  for each call. Every read of one item (the first read of a draft and the re-read after a
+  conflicting decision) is `ToolServer::approval_for(user, id)`: it names the PM
+  (`?user=<handle>`, which the tool server requires from the web token, answering `404`
+  otherwise) and carries an assertion for them; the owner is also checked here. `sid` is the PM's
   session reference, `session::assertion_ref` (16 hex characters of a labelled SHA-256 over
   the session's stored hash): `app.rs` binds each upstream to it with `for_session`. Never
   the session id or the cookie.

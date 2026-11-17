@@ -17,8 +17,8 @@ use crate::model::{
     Source, Task, TaskStatus, TraceEntry, TraceKind,
 };
 use crate::store::{
-    apply, BotsStore, Refused, RoutinePatch, RoutineRun, StoreError, StoreResult, TaskFilter,
-    Transition,
+    apply, notifies, BotsStore, Refused, RoutinePatch, RoutineRun, StoreError, StoreResult,
+    TaskFilter, Transition,
 };
 
 #[derive(Clone)]
@@ -358,7 +358,7 @@ impl BotsStore for PgStore {
         if let Some((kind, text)) = &change.event {
             insert_event(&mut tx, id, kind, text, now).await?;
         }
-        if let Some(n) = &change.notify {
+        if let Some(n) = change.notify.as_ref().filter(|_| notifies(&task)) {
             insert_notification(&mut tx, &task, n, now).await?;
         }
         tx.commit().await?;
@@ -664,7 +664,7 @@ impl BotsStore for PgStore {
         .await?;
         insert_task(&mut tx, &run.task).await?;
         insert_event(&mut tx, &run.task.id, "status", &run.event, now).await?;
-        if let Some(n) = &run.notify {
+        if let Some(n) = run.notify.as_ref().filter(|_| notifies(&run.task)) {
             insert_notification(&mut tx, &run.task, n, now).await?;
         }
         tx.commit().await?;
