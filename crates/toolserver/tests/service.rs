@@ -514,6 +514,191 @@ async fn only_the_items_user_can_approve() {
     assert_eq!(f.jira.writes().len(), 1, "never runs twice");
 }
 
+/// Reads give each item the ref a draft's source marker names it by, and no marker ever
+/// reaches the target system: not on approve, not on an edit, not through a grant. Code keeps
+/// what it says.
+#[tokio::test]
+async fn source_markers_are_given_on_reads_and_never_written() {
+    use pmos_toolserver::sources::cite_ref;
+    let f = fixture();
+    let s = f
+        .svc
+        .create_session("ana", "prd-draft", "r1", None, now())
+        .await
+        .unwrap();
+    let read = f
+        .svc
+        .call(&s, "confluence_read", json!({"page_id": "9001"}), now())
+        .await
+        .unwrap();
+    let r = cite_ref("confluence:9001");
+    assert_eq!(read["results"][0]["ref"], json!(r));
+    let found = f
+        .svc
+        .call(
+            &s,
+            "context_search",
+            json!({"query": "key management"}),
+            now(),
+        )
+        .await
+        .unwrap();
+    let hit = &found["results"][0];
+    assert_eq!(
+        hit["ref"],
+        json!(cite_ref(hit["path"].as_str().unwrap())),
+        "{found}"
+    );
+
+    let marked = json!({
+        "space": "PM",
+        "title": "PRD: SSO [[src-ffffff]]",
+        "body": format!("Two customers asked for SSO [[{r}]].\n\n- Audit export [[{r}]][[s2]]\n\nCite with `[[{r}]]`.\n"),
+    });
+    let clean = json!({
+        "space": "PM",
+        "title": "PRD: SSO",
+        "body": format!("Two customers asked for SSO.\n\n- Audit export\n\nCite with `[[{r}]]`.\n"),
+    });
+    let queued = f
+        .svc
+        .call(&s, "confluence_create_draft", marked.clone(), now())
+        .await
+        .unwrap();
+    let id = queued["approval_id"].as_str().unwrap();
+    let item = f
+        .svc
+        .decide(id, "ana", Decision::Approve, None, now())
+        .await
+        .unwrap();
+    assert_eq!(item.status, Status::Approved);
+    assert_eq!(f.confluence.writes()[0].args, clean, "approve");
+    // The stored draft keeps its markers: they are what the PM reviewed.
+    assert_eq!(item.args, marked);
+
+    // An edit that still has markers.
+    let queued = f
+        .svc
+        .call(&s, "confluence_create_draft", draft(), now())
+        .await
+        .unwrap();
+    f.svc
+        .decide(
+            queued["approval_id"].as_str().unwrap(),
+            "ana",
+            Decision::Edit,
+            Some(marked.clone()),
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.confluence.writes()[1].args, clean, "edit");
+
+    // Approved in the harness.
+    f.svc
+        .grant(&s, "confluence_create_draft", &marked, now())
+        .await
+        .unwrap();
+    let done = f
+        .svc
+        .call(&s, "confluence_create_draft", marked, now())
+        .await
+        .unwrap();
+    assert_eq!(done["status"], "done");
+    assert_eq!(f.confluence.writes()[2].args, clean, "grant");
+    for w in f.confluence.writes() {
+        let text = w.args.to_string();
+        assert!(!text.contains("[[src-ffffff]]") && !text.contains("[[s2]]"));
+    }
+}
+
+/// The clients that act for a PM (the Slack bot, `pmos-web`) may edit only what a draft says,
+/// keeping every target argument, `version` included, as drafted. Those edits still send no
+/// marker: a page update names the version it read and its body arrives without markers,
+/// and an edit that moves the write is still refused.
+#[tokio::test]
+async fn edits_that_keep_the_target_send_no_markers() {
+    use pmos_toolserver::audit::Client;
+    use pmos_toolserver::sources::cite_ref;
+    let f = fixture();
+    let s = f
+        .svc
+        .create_session("ana", "page-update", "r1", None, now())
+        .await
+        .unwrap();
+    let read = f
+        .svc
+        .call(&s, "confluence_read", json!({"page_id": "9002"}), now())
+        .await
+        .unwrap();
+    let r = cite_ref("confluence:9002");
+    assert_eq!(read["results"][0]["ref"], json!(r), "{read}");
+
+    // A page update, edited from the Slack bot: same page, same version, new text.
+    let drafted =
+        json!({"page_id": "9002", "version": 1, "body": format!("Grace is 7 days [[{r}]].")});
+    let queued = f
+        .svc
+        .call(&s, "confluence_update_page", drafted, now())
+        .await
+        .unwrap();
+    let id = queued["approval_id"].as_str().unwrap().to_string();
+    let moved = json!({"page_id": "9002", "version": 2, "body": "Grace is 7 days."});
+    assert_eq!(
+        f.svc
+            .decide_as(Client::Bot, &id, "ana", Decision::Edit, Some(moved), now())
+            .await
+            .map(|_| ()),
+        Err(DecisionError::TargetChanged("version".into())),
+        "an edit can't change the version"
+    );
+    assert!(f.confluence.writes().is_empty());
+    let edited = json!({
+        "page_id": "9002", "version": 1,
+        "body": format!("Grace is 7 days [[{r}]], retries stop [[src-ffffff]][[s2]].\n\n`[[{r}]]`"),
+    });
+    let item = f
+        .svc
+        .decide_as(Client::Bot, &id, "ana", Decision::Edit, Some(edited), now())
+        .await
+        .unwrap();
+    assert_eq!(item.status, Status::Approved);
+    assert_eq!(
+        f.confluence.writes()[0].args,
+        json!({"page_id": "9002", "version": 1,
+               "body": format!("Grace is 7 days, retries stop.\n\n`[[{r}]]`")}),
+        "markers removed, page and version kept, code as written"
+    );
+
+    // A new page, edited from `pmos-web`: same space, the title and body changed.
+    let queued = f
+        .svc
+        .call(
+            &s,
+            "confluence_create_draft",
+            json!({"space": "PM", "title": "Plan [[src-ffffff]]", "body": "Draft."}),
+            now(),
+        )
+        .await
+        .unwrap();
+    let id = queued["approval_id"].as_str().unwrap().to_string();
+    f.svc
+        .decide_as(
+            Client::Web,
+            &id,
+            "ana",
+            Decision::Edit,
+            Some(json!({"space": "PM", "title": "Plan [[src-ffffff]]", "body": format!("Grace is 7 days [[{r}]].")})),
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.confluence.writes()[1].args,
+        json!({"space": "PM", "title": "Plan", "body": "Grace is 7 days."})
+    );
+}
+
 #[tokio::test]
 async fn edit_runs_the_edited_arguments_and_reject_runs_nothing() {
     let f = fixture();

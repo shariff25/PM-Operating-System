@@ -58,7 +58,8 @@ And the cheapest way to test it.
 Cite or flag, without exception.
 - **Passes when:** every customer, number, date, quote and competitor claim links to a source
   or carries `[unverified]`, and each flagged item is listed under the open questions or
-  unknowns heading.
+  unknowns heading. In a draft, a sourced sentence also ends with its source marker
+  (`[[src-…]]`, the read's `ref`; see your role's instructions).
 - **Fails when:** any figure or claim has neither a source nor a flag, or a sample size,
   interval or p-value was worked out by hand instead of with the stats tools.
 
