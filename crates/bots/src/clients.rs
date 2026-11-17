@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use pmos_contract::Sensitivity;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -98,17 +99,25 @@ impl ToolServer {
     /// A bot session for one task (spec §2): the tool server applies the bot's role
     /// allowlist, data class and write settings to every call made with it. Returns the
     /// session token.
+    ///
+    /// `history` is the highest data class the task's conversation history was built from,
+    /// for a task that carries earlier turns: the session starts there (W6).
     pub async fn create_session(
         &self,
         user: &str,
         bot: &str,
         run_id: &str,
+        history: Option<Sensitivity>,
     ) -> Result<String, CallError> {
+        let mut body = json!({"user": user, "bot": bot, "run_id": run_id});
+        if let Some(level) = history {
+            body["history_sensitivity"] = json!(level);
+        }
         let res = self
             .http
             .post(format!("{}/internal/sessions", self.base))
             .bearer_auth(&self.token)
-            .json(&json!({"user": user, "bot": bot, "run_id": run_id}))
+            .json(&body)
             .send()
             .await
             .map_err(|e| {
@@ -133,6 +142,33 @@ impl ToolServer {
                 .unwrap_or("the tool server refused the session")
                 .to_string(),
         ))
+    }
+
+    /// The highest data class the run's sessions read (`GET /internal/runs/{id}/sensitivity`),
+    /// or `None` when the tool server has no session of it stored.
+    pub async fn run_sensitivity(&self, run_id: &str) -> Result<Option<Sensitivity>, CallError> {
+        let res = self
+            .http
+            .get(format!("{}/internal/runs/{run_id}/sensitivity", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| CallError::Unavailable("the tool server"))?;
+        if !res.status().is_success() {
+            tracing::warn!(status = %res.status(), "tool server error reading a run's level");
+            return Err(CallError::Unavailable("the tool server"));
+        }
+        let body: Value = res
+            .json()
+            .await
+            .map_err(|_| CallError::Unavailable("the tool server"))?;
+        match &body["sensitivity"] {
+            Value::Null => Ok(None),
+            Value::String(s) => Sensitivity::parse(s)
+                .map(Some)
+                .ok_or(CallError::Unavailable("the tool server")),
+            _ => Err(CallError::Unavailable("the tool server")),
+        }
     }
 
     /// One approval item's state, or `None` if the tool server doesn't have it.

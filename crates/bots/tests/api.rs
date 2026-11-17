@@ -439,6 +439,7 @@ async fn a_failed_task_says_why(env: &Env) {
 }
 
 both_envs!(
+    a_cursor_from_another_epoch_is_refused,
     a_task_runs_from_slack_to_a_result,
     results_with_approvals_wait_until_every_item_is_decided,
     a_task_settles_when_its_last_approval_expires,
@@ -997,7 +998,7 @@ async fn the_feed_long_polls_and_resumes_from_a_cursor() {
     let env = Env::memory().await;
     let (status, empty) = env.get("/v1/notifications", "slack", Some("ana")).await;
     assert_eq!(status, 200);
-    assert_eq!(empty, json!({"cursor": "0", "items": []}));
+    assert_eq!(empty, json!({"cursor": "0", "items": [], "head": "0"}));
 
     let task = env.ask("Q").await;
     env.claim().await;
@@ -1058,6 +1059,71 @@ async fn the_feed_long_polls_and_resumes_from_a_cursor() {
         .await;
     assert_eq!(status, 400);
     env.finish().await;
+}
+
+/// A cursor past the feed's head came from another epoch of the feed (an in-memory runtime
+/// that restarted, or a reset database). It is refused with `409 cursor_ahead` and the head,
+/// instead of answering "nothing new" until the sequence catches up, which silently lost
+/// every reply in between. Every case runs on both stores.
+async fn a_cursor_from_another_epoch_is_refused(env: &Env) {
+    let (_, empty) = env.get("/v1/notifications", "slack", Some("ana")).await;
+    assert_eq!(empty["head"], "0");
+    // A cursor the Slack service saved from the runtime before it restarted.
+    let (status, body) = env
+        .get("/v1/notifications?after=57", "slack", Some("ana"))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["code"], "cursor_ahead");
+    assert_eq!(body["head"], "0");
+    assert!(body["error"].as_str().unwrap().starts_with("cursor_ahead"));
+
+    // New notifications arrive: the head moves, and a cursor at or below it is fine.
+    let task = env.ask("Q").await;
+    env.claim().await;
+    env.post(
+        &format!("/v1/worker/tasks/{}/events", id(&task)),
+        "worker",
+        None,
+        json!({"kind": "milestone", "text": "Reading Jira"}),
+    )
+    .await;
+    let (status, page) = env
+        .get("/v1/notifications?after=0", "slack", Some("ana"))
+        .await;
+    assert_eq!(status, 200);
+    let head: i64 = page["head"].as_str().unwrap().parse().unwrap();
+    assert!(head >= 1);
+    assert_eq!(page["cursor"], page["head"]);
+    let (status, _) = env
+        .get(
+            &format!("/v1/notifications?after={head}"),
+            "slack",
+            Some("ana"),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, body) = env
+        .get(
+            &format!("/v1/notifications?after={}", head + 1),
+            "slack",
+            Some("ana"),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    // Pruning never lowers the head: a cursor from before a prune is still this feed's.
+    env.rt
+        .housekeeping(chrono::Utc::now() + chrono::Duration::days(60))
+        .await
+        .unwrap();
+    let (status, page) = env
+        .get(
+            &format!("/v1/notifications?after={head}"),
+            "slack",
+            Some("ana"),
+        )
+        .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["head"], head.to_string());
 }
 
 // ----- routines ---------------------------------------------------------------------------

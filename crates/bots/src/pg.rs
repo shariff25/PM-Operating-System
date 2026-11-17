@@ -13,8 +13,8 @@ use sqlx::{PgConnection, Row};
 
 use crate::model::{
     redacted_body, trace_tool, ApprovalOutcome, ChecklistItem, Event, Level, MemberSettings,
-    NewNotification, Notification, NotificationKind, Output, Priority, Routine, Schedule, SlackRef,
-    Source, Task, TaskStatus, TraceEntry, TraceKind,
+    NewNotification, Notification, NotificationKind, Output, Priority, Routine, Schedule,
+    Sensitivity, SlackRef, Source, Task, TaskStatus, TraceEntry, TraceKind,
 };
 use crate::store::{
     apply, notifies, BotsStore, Refused, RoutinePatch, RoutineRun, StoreError, StoreResult,
@@ -57,8 +57,8 @@ impl PgStore {
 }
 
 const TASK_COLUMNS: &str = "id, bot, requested_by, source, priority, text, status, checklist, \
-     result, error, approvals, slack, routine_id, level, conversation, attempts, worker, \
-     lease_until, created_at, updated_at";
+     result, error, approvals, slack, routine_id, level, conversation, sources_sensitivity, \
+     attempts, worker, lease_until, created_at, updated_at";
 
 fn bad(what: &str, value: &str) -> StoreError {
     StoreError(format!("unexpected {what} `{value}` in storage"))
@@ -74,6 +74,11 @@ fn task_from_row(r: &PgRow) -> StoreResult<Task> {
     let level: Option<String> = r.try_get("level")?;
     let level = match level {
         Some(l) => Some(Level::parse(&l).ok_or_else(|| bad("level", &l))?),
+        None => None,
+    };
+    let read: Option<String> = r.try_get("sources_sensitivity")?;
+    let sources_sensitivity = match read {
+        Some(s) => Some(Sensitivity::parse(&s).ok_or_else(|| bad("sensitivity", &s))?),
         None => None,
     };
     Ok(Task {
@@ -92,6 +97,7 @@ fn task_from_row(r: &PgRow) -> StoreResult<Task> {
         routine_id: r.try_get("routine_id")?,
         level,
         conversation: r.try_get("conversation")?,
+        sources_sensitivity,
         attempts: r.try_get("attempts")?,
         worker: r.try_get("worker")?,
         lease_until: r.try_get("lease_until")?,
@@ -128,9 +134,10 @@ async fn insert_task(conn: &mut PgConnection, t: &Task) -> StoreResult<()> {
     sqlx::query(
         "INSERT INTO bots_tasks (id, bot, requested_by, source, priority, priority_rank, text,
              status, checklist, result, error, approvals, slack, routine_id, attempts, worker,
-             lease_until, created_at, updated_at, level, conversation, thread_key)
+             lease_until, created_at, updated_at, level, conversation, thread_key,
+             sources_sensitivity)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-             $18, $19, $20, $21, $22)",
+             $18, $19, $20, $21, $22, $23)",
     )
     .bind(&t.id)
     .bind(&t.bot)
@@ -154,6 +161,7 @@ async fn insert_task(conn: &mut PgConnection, t: &Task) -> StoreResult<()> {
     .bind(t.level.map(Level::as_str))
     .bind(&t.conversation)
     .bind(t.thread_key())
+    .bind(t.sources_sensitivity.map(|s| s.to_string()))
     .execute(conn)
     .await?;
     Ok(())
@@ -340,7 +348,8 @@ impl BotsStore for PgStore {
         }
         sqlx::query(
             "UPDATE bots_tasks SET status = $2, checklist = $3, result = $4, error = $5,
-                 approvals = $6, attempts = $7, worker = $8, lease_until = $9, updated_at = $10
+                 approvals = $6, attempts = $7, worker = $8, lease_until = $9, updated_at = $10,
+                 sources_sensitivity = $11
              WHERE id = $1",
         )
         .bind(id)
@@ -353,6 +362,7 @@ impl BotsStore for PgStore {
         .bind(&task.worker)
         .bind(task.lease_until)
         .bind(now)
+        .bind(task.sources_sensitivity.map(|s| s.to_string()))
         .execute(&mut *tx)
         .await?;
         if let Some((kind, text)) = &change.event {
@@ -525,6 +535,16 @@ impl BotsStore for PgStore {
                 })
             })
             .collect()
+    }
+
+    async fn feed_head(&self) -> StoreResult<i64> {
+        // The counter the sequence numbers come from: committed values only, and pruning
+        // never lowers it.
+        let head: Option<i64> =
+            sqlx::query_scalar("SELECT value FROM bots_counters WHERE name = 'notifications'")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(head.unwrap_or(0))
     }
 
     async fn prune_notifications(&self, before: DateTime<Utc>) -> StoreResult<u64> {

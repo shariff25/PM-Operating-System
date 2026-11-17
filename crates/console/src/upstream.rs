@@ -505,16 +505,22 @@ impl Upstream {
         self.list(&["v1", "tasks"], &query, requested_by).await
     }
 
-    pub async fn task(&self, id: &str) -> UpstreamResult<Task> {
-        self.get(&["v1", "tasks", id], &[], None).await
+    /// One task, with an assertion for `viewer`: under `require` the runtime answers only the
+    /// task's own PM or an admin (`docs/user-assertion.md`, What each service does).
+    pub async fn task(&self, viewer: &str, id: &str) -> UpstreamResult<Task> {
+        self.get(&["v1", "tasks", id], &[], Some(viewer)).await
     }
 
-    pub async fn task_events(&self, id: &str) -> UpstreamResult<Vec<TaskEvent>> {
-        self.list(&["v1", "tasks", id, "events"], &[], None).await
+    /// A task's events, signed for `viewer` as [`Self::task`].
+    pub async fn task_events(&self, viewer: &str, id: &str) -> UpstreamResult<Vec<TaskEvent>> {
+        self.list(&["v1", "tasks", id, "events"], &[], Some(viewer))
+            .await
     }
 
-    pub async fn task_trace(&self, id: &str) -> UpstreamResult<Vec<TraceEntry>> {
-        self.list(&["v1", "tasks", id, "trace"], &[], None).await
+    /// A task's trace, signed for `viewer` as [`Self::task`].
+    pub async fn task_trace(&self, viewer: &str, id: &str) -> UpstreamResult<Vec<TraceEntry>> {
+        self.list(&["v1", "tasks", id, "trace"], &[], Some(viewer))
+            .await
     }
 
     pub async fn routines(&self, owner: Option<&str>) -> UpstreamResult<Vec<Routine>> {

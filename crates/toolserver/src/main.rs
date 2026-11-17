@@ -206,6 +206,9 @@ async fn main() -> Result<()> {
         keys = ?config.assertions.key_ids(),
         "approvals clients that act for a person, and their user assertions"
     );
+    if let Some(warning) = config.assertions.insecure_warning() {
+        tracing::error!("{warning}");
+    }
     let app = router_full(
         svc,
         AppConfig {

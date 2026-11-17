@@ -381,6 +381,21 @@ impl SessionRepo for PgStore {
         Ok(())
     }
 
+    async fn run_sensitivity(&self, run_id: &str) -> StoreResult<Option<Sensitivity>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT sources_sensitivity FROM sessions WHERE run_id = $1",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut highest = None;
+        for read in rows {
+            let s = Sensitivity::parse(&read).ok_or_else(|| bad_row("sensitivity", &read))?;
+            highest = highest.max(Some(s));
+        }
+        Ok(highest)
+    }
+
     async fn revoke(&self, token: &str) -> StoreResult<bool> {
         let done = sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
             .bind(token_hash(token))
@@ -604,11 +619,13 @@ impl ApprovalRepo for PgStore {
         let sql = format!(
             "SELECT {ITEM_COLUMNS} FROM approvals
              WHERE user_handle = $1 AND ($2::text IS NULL OR status = $2)
-             ORDER BY created_at DESC, id"
+             ORDER BY created_at DESC, id COLLATE \"C\"
+             LIMIT $3"
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(user)
             .bind(status.map(Status::as_str))
+            .bind(crate::approvals::LIST_LIMIT as i64)
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(item_from_row).collect()
