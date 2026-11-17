@@ -10,7 +10,7 @@ export interface Me {
   first_visit: boolean;
   hints_seen: HintName[];
   nudges: boolean;
-  /** Not in the contract yet. When the server adds it, an admin or auditor sees the Admin entry. */
+  /** What the person's roles allow, kebab-case. An older server leaves it out: treat that as none. */
   permissions?: string[];
 }
 
@@ -142,8 +142,110 @@ export type ErrorCode =
   | 'stale'
   | 'not_practice'
   | 'not_built'
+  | 'forbidden'
+  | 'bad_request'
+  | 'upstream_unavailable'
   | 'network'
   | 'unknown';
+
+// ---- Admin and auditor (docs/web-api.md, "Admin and auditor") ----
+
+export const AUDIT_OUTCOMES = [
+  'ok',
+  'denied',
+  'pending',
+  'approved',
+  'rejected',
+  'granted',
+  'started',
+  'error',
+  'failed',
+  'expired',
+] as const;
+export type AuditOutcome = (typeof AUDIT_OUTCOMES)[number];
+
+/** One audit event. Every field is always present; metadata only, never draft or Slack text. */
+export interface AuditEvent {
+  id: string;
+  at: string;
+  actor: string;
+  client: string;
+  action: string;
+  system: string;
+  target: string | null;
+  outcome: AuditOutcome | string;
+  detail: string | null;
+  sources: number;
+  titled_sources: number;
+  skill: string | null;
+  bot: string | null;
+  task_id: string;
+}
+
+/** The query the audit routes take. `before` is the opaque cursor from the page before. */
+export interface AuditQuery {
+  actor?: string;
+  action?: string;
+  outcome?: string;
+  /** RFC 3339, events at or after it. */
+  from?: string;
+  /** RFC 3339, events strictly before it. */
+  to?: string;
+  limit?: number;
+  before?: string;
+}
+
+export interface AuditPage {
+  events: AuditEvent[];
+  next_cursor: string | null;
+}
+
+export interface AuditExport {
+  blob: Blob;
+  filename: string;
+  /** True when more events matched than the export holds. */
+  truncated: boolean;
+  rowCount: number;
+}
+
+export interface TeamAccounts {
+  atlassian: boolean;
+  slack: boolean;
+  github: boolean;
+}
+
+export interface TeamMember {
+  handle: string;
+  name: string;
+  roles: string[];
+  has_email: boolean;
+  bot: string;
+  /** Null when the tool server could not be asked. */
+  accounts: TeamAccounts | null;
+}
+
+export interface TeamList {
+  members: TeamMember[];
+  accounts_available: boolean;
+  /** Whether account linking is on. Null when the tool server could not be asked. */
+  linking: boolean | null;
+}
+
+export interface Connector {
+  name: string;
+  mode: 'live' | 'fake' | string;
+  health: 'ok' | 'down' | string;
+  error_class: string | null;
+  checked_at: string;
+}
+
+export interface AdminOverview {
+  since: string;
+  pending_drafts: number;
+  approved: number | null;
+  rejected: number | null;
+  denied: number | null;
+}
 
 export class ApiError extends Error {
   readonly status: number;
@@ -188,4 +290,10 @@ export interface Api {
   brief(): Promise<Brief>;
   dismissFollowup(id: string): Promise<void>;
   draftFollowup(id: string): Promise<Task>;
+
+  adminOverview(): Promise<AdminOverview>;
+  adminAudit(query: AuditQuery): Promise<AuditPage>;
+  adminAuditExport(query: AuditQuery): Promise<AuditExport>;
+  adminTeam(): Promise<TeamList>;
+  adminConnectors(): Promise<Connector[]>;
 }

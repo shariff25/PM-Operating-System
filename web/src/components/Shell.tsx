@@ -1,7 +1,7 @@
 import { createContext, useContext, useState } from 'react';
 import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import type { Me } from '../api';
+import { ADMIN_SECTIONS, canAdminister, canSee, sectionHref } from '../admin/access';
 import { useApp } from '../app-context';
 import { copy } from '../copy';
 import { useData } from '../data';
@@ -53,6 +53,8 @@ export function navKey(route: Route): NavKey {
     case 'activity':
     case 'task':
       return 'activity';
+    case 'admin':
+      return 'admin';
     default:
       return 'home';
   }
@@ -60,14 +62,6 @@ export function navKey(route: Route): NavKey {
 
 export function isMac(): boolean {
   return typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
-}
-
-/** Where the Admin entry goes. The web app has no admin page of its own; this is the server's. */
-export const ADMIN_HREF = '/admin/';
-
-/** True when the server says this person may administer or audit. The field may be absent. */
-export function canAdminister(me: Me): boolean {
-  return (me.permissions ?? []).some((p) => /admin|audit/i.test(p));
 }
 
 /** A connected system and how it is doing, for the rail's Connected block. */
@@ -110,6 +104,7 @@ interface NavItem {
   accent?: boolean;
 }
 
+
 export function Shell({ route, children, onSignOut }: { route: Route; children: ReactNode; onSignOut: () => void }) {
   const { openPalette, me } = useApp();
   const { pendingCount, brief, briefState, runningCount } = useData();
@@ -134,13 +129,29 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
       : []),
     { key: 'activity', href: '#/activity', label: copy.nav.activity, icon: 'activity', count: runningCount, countLabel: copy.nav.activityCount },
     ...(canAdminister(me)
-      ? [{ key: 'admin' as const, href: ADMIN_HREF, label: copy.nav.admin, icon: 'shield' as const, count: 0, countLabel: () => '' }]
+      ? [{ key: 'admin' as const, href: '#/admin', label: copy.nav.admin, icon: 'shield' as const, count: 0, countLabel: () => '' }]
       : []),
   ];
 
   const detail = route.name === 'draft' || route.name === 'task';
   const shortcut = isMac() ? copy.nav.shortcutMac : copy.nav.shortcutOther;
   const pageTitle = { home: copy.nav.home, drafts: copy.nav.drafts, followups: copy.nav.followups, activity: copy.nav.activity, admin: copy.nav.admin }[current];
+
+  /** The second level under Admin: its parts, for the ones this person may open. */
+  const adminSub = () => {
+    const here = route.name === 'admin' ? (route.section === 'overview' && !canSee(me, 'overview') ? ADMIN_SECTIONS.find((s) => canSee(me, s)) : route.section) : null;
+    return (
+      <ul className="rail-sub" aria-label={copy.admin.subnavLabel}>
+        {ADMIN_SECTIONS.filter((s) => canSee(me, s)).map((s) => (
+          <li key={s}>
+            <a href={sectionHref(s)} className="rail-subitem" aria-current={s === here ? 'page' : undefined}>
+              {copy.admin.sections[s]}
+            </a>
+          </li>
+        ))}
+      </ul>
+    );
+  };
 
   const link = (it: NavItem, variant: 'rail' | 'tabs') => {
     const on = it.key === current;
@@ -150,7 +161,8 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
         <a
           href={it.href}
           className={variant === 'rail' ? 'rail-item' : 'tabbar-item'}
-          aria-current={on ? 'page' : undefined}
+          aria-current={on && !(it.key === 'admin' && variant === 'rail' && !compact) ? 'page' : undefined}
+          data-active={on ? 'true' : undefined}
           title={iconOnly ? it.label : undefined}
         >
           <span className="nav-icon">
@@ -167,6 +179,7 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
             </span>
           )}
         </a>
+        {variant === 'rail' && !compact && it.key === 'admin' && current === 'admin' && adminSub()}
       </li>
     );
   };
@@ -243,7 +256,7 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
 
         {isPhone && (
           <nav aria-label={copy.nav.label} className="tabbar">
-            <ul className="tabbar-list">{items.filter((it) => it.key !== 'admin').map((it) => link(it, 'tabs'))}</ul>
+            <ul className="tabbar-list">{items.map((it) => link(it, 'tabs'))}</ul>
           </nav>
         )}
       </div>
