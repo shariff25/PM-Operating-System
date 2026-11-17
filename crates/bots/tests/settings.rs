@@ -123,14 +123,20 @@ async fn the_claim_carries_the_requesters_level(env: &Env) {
 }
 
 async fn a_tasks_own_level_wins(env: &Env) {
-    env.put(ANA, "slack", Some("ana"), json!({"level": "staff"}))
-        .await;
+    // ben is the benchmark member (PMOS_EVALS_AS) in these tests.
+    env.put(
+        "/v1/members/ben/settings",
+        "slack",
+        Some("ben"),
+        json!({"level": "staff"}),
+    )
+    .await;
     let (status, task) = env
         .post(
             "/v1/tasks",
             "evals",
             None,
-            json!({"bot": "docs", "requested_by": "ana", "text": "Write the vision",
+            json!({"bot": "docs", "requested_by": "ben", "text": "Write the vision",
                    "source": "eval", "level": "principal"}),
         )
         .await;
@@ -153,7 +159,7 @@ async fn a_tasks_own_level_wins(env: &Env) {
             "/v1/tasks",
             "evals",
             None,
-            json!({"bot": "docs", "requested_by": "ana", "text": "t",
+            json!({"bot": "docs", "requested_by": "ben", "text": "t",
                    "source": "eval", "level": "vp"}),
         )
         .await;

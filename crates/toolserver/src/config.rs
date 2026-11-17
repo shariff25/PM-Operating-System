@@ -120,8 +120,9 @@ pub struct Config {
     /// `PMOS_WEB_TOKEN`: `pmos-web`'s own token, for the approvals routes only. Optional; at
     /// least 32 characters and different from every other token.
     pub web_token: Option<Secret>,
-    /// `PMOS_CONSOLE_TOKEN`: the console's own token, for the approvals routes only. Optional;
-    /// at least 32 characters and different from every other token.
+    /// `PMOS_CONSOLE_TS_TOKEN`: the web console's own token, at least 32 characters and
+    /// different from every other token. Optional. It may only read approvals
+    /// (`GET /internal/approvals` and `GET /internal/approvals/{id}`).
     pub console_token: Option<Secret>,
     /// `PMOS_ASSERTION_MODE` and `PMOS_ASSERTION_KEYS`: user assertions from `pmos-web` and
     /// the console on the approvals routes (`crate::assertion`). Off unless set.
@@ -197,7 +198,7 @@ impl Config {
             Ok(Some(t))
         };
         let web_token = person_token("PMOS_WEB_TOKEN")?;
-        let console_token = person_token("PMOS_CONSOLE_TOKEN")?;
+        let console_token = person_token("PMOS_CONSOLE_TS_TOKEN")?;
         let assertions = Arc::new(Assertions::from_lookup(&get)?);
         let bot_skills: Vec<String> = get("PMOS_BOT_SKILLS")
             .unwrap_or_else(|| "docs".into())
@@ -504,7 +505,7 @@ mod tests {
         };
         let ok = with(&[
             ("PMOS_WEB_TOKEN", web),
-            ("PMOS_CONSOLE_TOKEN", console),
+            ("PMOS_CONSOLE_TS_TOKEN", console),
             ("PMOS_ASSERTION_MODE", "require"),
             ("PMOS_ASSERTION_KEYS", &keys),
         ])
@@ -529,10 +530,37 @@ mod tests {
             .unwrap_err()
             .contains("differ"));
         assert!(
-            with(&[("PMOS_WEB_TOKEN", web), ("PMOS_CONSOLE_TOKEN", web)])
+            with(&[("PMOS_WEB_TOKEN", web), ("PMOS_CONSOLE_TS_TOKEN", web)])
                 .unwrap_err()
                 .contains("differ")
         );
+    }
+
+    #[test]
+    fn the_console_token_is_optional_long_and_its_own() {
+        let base = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_BOT_TOKEN", "bot-token-0123456789abcdef-0123456"),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert!(cfg(&base).unwrap().console_token.is_none());
+        let with = |token: &'static str| {
+            let mut vars = base.to_vec();
+            vars.push(("PMOS_CONSOLE_TS_TOKEN", token));
+            cfg(&vars)
+        };
+        let ok = with("console-token-0123456789abcdef-012").unwrap();
+        assert_eq!(
+            ok.console_token.as_ref().map(Secret::expose),
+            Some("console-token-0123456789abcdef-012")
+        );
+        assert!(!format!("{ok:?}").contains("console-token"));
+        assert!(with("short").unwrap_err().contains("at least 32"));
+        assert!(with(TOKEN).unwrap_err().contains("must differ"));
+        assert!(with("bot-token-0123456789abcdef-0123456")
+            .unwrap_err()
+            .contains("must differ"));
     }
 
     #[test]

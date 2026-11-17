@@ -119,7 +119,7 @@ pub enum Client {
     Bot,
     /// `pmos-web`, with `PMOS_WEB_TOKEN`: the approvals routes and the read-only admin routes.
     Web,
-    /// The console, with `PMOS_CONSOLE_TOKEN`: the approvals routes only.
+    /// The web console, with `PMOS_CONSOLE_TS_TOKEN`: reads approvals only.
     Console,
 }
 

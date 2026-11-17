@@ -146,7 +146,9 @@ source: "pm-ana, task 0d3f…"   # the bot (or skill) and the run id that wrote 
   - **`approve`:**
     1. **Check the handle.** `handle` defaults to `proposed_handle` and must pass
        `valid_new_handle` and be unused; otherwise `422 {code: "bad_handle"}`. `roles`
-       defaults to `[pm]`.
+       defaults to `[pm]`. From the Slack bot's token, `roles` may hold `pm` and
+       `skill-author` only: `admin` is `403`, and a new admin is added by a pull request to
+       `team.yaml`. The bot never sends `roles`, and its card says so.
     2. **Check the approver's GitHub.** The admin needs a linked GitHub account with push
        access to `PMOS_CONTENT_REPO`. If not, the answer is
        `409 {code: "github_not_linked"}` or `{code: "no_push"}`, and the request stays pending.

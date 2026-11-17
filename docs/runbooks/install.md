@@ -186,9 +186,15 @@ Only after the red-team checklist passes.
 6. **Run the benchmarks** (`docs/evals.md`):
    ```sh
    deploy/pmos-admin evals-run --category docs-qa --note "gate 1"
-   deploy/pmos-admin evals load --tasks 5 --as <your handle>
+   deploy/pmos-admin evals load --tasks 5
    ```
-   Commit the reports in `/srv/pmos/content-repo/evals/reports`.
+   Commit the reports in `/srv/pmos/content-repo/evals/reports`. The load test runs on the
+   live stack as the benchmark member `evals`, the only handle the benchmark token may use
+   (`PMOS_EVALS_AS`). Add that member once, with no real Slack account, and merge it:
+   `deploy/pmos-admin pmos member add --root content --handle evals --slack-id U0EVALS --roles pm`.
+   To run it as yourself instead, set `PMOS_EVALS_AS=<your handle>` in `deploy/.env`,
+   `deploy/pmos-admin restart bots`, pass `--as <your handle>`, then empty it and restart
+   again.
 7. **Test a restore** by following [backup-restore.md](backup-restore.md). Gate 1 asks that a
    platform owner can do it from the runbook alone.
 
@@ -197,6 +203,43 @@ Gate 1 is passed when:
 - the benchmarks have met their bar two weeks in a row;
 - every task in the load test finishes;
 - a restore has been done from this runbook.
+
+## The console behind a sign-in proxy (optional)
+
+The console (`docs/console.md`) starts with `deploy/pmos-admin up --models --console`, and only
+behind a sign-in proxy on the Spark. `PMOS_CONSOLE_DEV_USER` is for running the console on your
+own machine: it needs a loopback bind, and the kit's container listens on `0.0.0.0`, so the
+console refuses it here. Step 5 above made the secret; to put the proxy in front:
+
+1. **The settings.** In `deploy/.env`, set `PMOS_CONSOLE_TRUST_PROXY=1`, empty
+   `PMOS_CONSOLE_DEV_USER`, and set `PMOS_CONSOLE_PUBLIC_URL` to the address browsers use.
+   `setup.sh` has already made `PMOS_CONSOLE_PROXY_SECRET`; the console refuses to start
+   without it (or with one under 32 characters).
+2. **The proxy** signs the person in, strips any `X-Forwarded-User` and `X-Pmos-Proxy-Secret`
+   the browser sent, then forwards every request with both set itself: their handle or email
+   in `X-Forwarded-User`, and `X-Pmos-Proxy-Secret` set to `PMOS_CONSOLE_PROXY_SECRET`. For
+   example, with Caddy and an SSO add-on that sets `{http.auth.user.id}` (a fuller example is
+   in `docs/console.md`, under "Sign-in"):
+   ```
+   console.pmos.<your domain> {
+     request_header -X-Forwarded-User
+     request_header -X-Pmos-Proxy-Secret
+     # your SSO plugin's directive here
+     reverse_proxy 127.0.0.1:8760 {
+       header_up X-Forwarded-User {http.auth.user.id}
+       header_up X-Pmos-Proxy-Secret {env.PMOS_CONSOLE_PROXY_SECRET}
+     }
+   }
+   ```
+   Give the proxy the secret through its environment or secret store, never in a file in git.
+3. **Check:** `curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Forwarded-User: <your handle>'
+   http://127.0.0.1:8760/bots` on the Spark answers `401`: without the proxy's secret, the
+   user header counts for nothing. A request through the proxy that sends its own
+   `X-Forwarded-User` and `X-Pmos-Proxy-Secret` must not get them through. Through the proxy,
+   the Bots screen opens.
+
+The console's tool-server token (`PMOS_CONSOLE_TS_TOKEN`) may only read approvals, so even a
+compromised console can't decide one or call a tool.
 
 ## Optional: the web app
 

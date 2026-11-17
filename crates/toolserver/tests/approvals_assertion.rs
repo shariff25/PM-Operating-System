@@ -12,7 +12,7 @@ use pmos_assertion::{unix_now, Claims, Key, KeyRing, RequestBinding};
 use pmos_contract::model::Role;
 use pmos_toolserver::app::BotAccess;
 use pmos_toolserver::assertion::{parse_keys, Assertions, Mode, AUDIENCE, ISSUERS};
-use pmos_toolserver::connectors::fake::{SLACK_ALL_TEAM, SLACK_PM};
+use pmos_toolserver::connectors::fake::{SLACK_ALL_TEAM, SLACK_PM, SLACK_WITH_OUTSIDER};
 use pmos_toolserver::{router_full, AppConfig, PersonClients};
 use reqwest::Method;
 use serde_json::{json, Value};
@@ -86,6 +86,7 @@ async fn start(mode: Mode) -> Server {
                 token: BOT_TOKEN.into(),
                 skills: vec!["docs".into()],
             }),
+            console_token: Some(CONSOLE_TOKEN.into()),
             content_root: f.root.clone(),
             oauth: None,
             allowed_hosts: vec!["127.0.0.1".into(), "localhost".into()],
@@ -93,7 +94,6 @@ async fn start(mode: Mode) -> Server {
         None,
         PersonClients {
             web_token: Some(WEB_TOKEN.into()),
-            console_token: Some(CONSOLE_TOKEN.into()),
             assertions: Arc::new(assertions(mode)),
         },
         cancel.clone(),
@@ -204,12 +204,12 @@ async fn a_valid_assertion_is_accepted_on_every_approvals_route() {
         let (s, v) = srv.get(&list, WEB_TOKEN, Some(&a)).await;
         assert_eq!(s, 200, "{mode:?}: {v}");
         assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
-        // One item: only the subject's own.
-        let read = format!("/internal/approvals/{}", srv.mine);
+        // One item: only the subject's own, named with `?user=`.
+        let read = format!("/internal/approvals/{}?user={SLACK_PM}", srv.mine);
         let a = web.sign(SLACK_PM, "GET", &read, b"");
         let (s, v) = srv.get(&read, WEB_TOKEN, Some(&a)).await;
         assert_eq!(s, 200, "{v}");
-        let other = format!("/internal/approvals/{}", srv.theirs);
+        let other = format!("/internal/approvals/{}?user={SLACK_PM}", srv.theirs);
         let a = web.sign(SLACK_PM, "GET", &other, b"");
         let (s, _) = srv.get(&other, WEB_TOKEN, Some(&a)).await;
         assert_eq!(s, 404);
@@ -254,11 +254,16 @@ async fn a_missing_assertion_is_refused_in_require_and_accepted_in_verify_and_of
             )
             .await;
         assert_eq!(s, want, "{mode:?}: {v}");
+        // A single item from the web token names its PM, so it needs one too.
+        let read = format!("/internal/approvals/{}?user={SLACK_PM}", srv.mine);
+        let (s, v) = srv.get(&read, WEB_TOKEN, None).await;
+        assert_eq!(s, want, "{mode:?}: {v}");
         if want == 401 {
             refused(s, &v);
-            // A single item names nobody: it reads without one.
+            // From the console's read-only token a single item may name nobody: it reads
+            // without one.
             let read = format!("/internal/approvals/{}", srv.mine);
-            let (s, _) = srv.get(&read, WEB_TOKEN, None).await;
+            let (s, _) = srv.get(&read, CONSOLE_TOKEN, None).await;
             assert_eq!(s, 200);
         }
     }
@@ -357,9 +362,13 @@ async fn the_orchestrator_and_the_slack_bot_are_unaffected_in_every_mode() {
             assert_eq!(s, 200, "{mode:?}: {v}");
             let (s, v) = srv.get(&list, BOT_TOKEN, a).await;
             assert_eq!(s, 200, "{mode:?}: {v}");
-            let read = format!("/internal/approvals/{}", srv.theirs);
+            // The Slack bot names the item's PM (S2); without it, `404`.
+            let read = format!("/internal/approvals/{}?user={OTHER}", srv.theirs);
             let (s, _) = srv.get(&read, BOT_TOKEN, a).await;
             assert_eq!(s, 200);
+            let read = format!("/internal/approvals/{}", srv.theirs);
+            let (s, _) = srv.get(&read, BOT_TOKEN, a).await;
+            assert_eq!(s, 404);
         }
         // Sources stay closed to the Slack bot.
         let sources = format!("/internal/approvals/{}/sources?user={SLACK_PM}", srv.mine);
@@ -414,4 +423,117 @@ async fn person_tokens_reach_only_the_approvals_routes() {
         )
         .await;
     assert_eq!(s, 401);
+}
+
+#[tokio::test]
+async fn the_web_token_has_at_least_the_slack_bots_limits() {
+    let srv = start(Mode::Off).await;
+    // A read of one item must name the item's PM (S2): without `user`, or with another
+    // member, it is `404`, as a missing item is.
+    for read in [
+        format!("/internal/approvals/{}", srv.mine),
+        format!("/internal/approvals/{}?user=", srv.mine),
+        format!("/internal/approvals/{}?user={OTHER}", srv.mine),
+        format!("/internal/approvals/{}?user={SLACK_PM}", srv.theirs),
+        format!("/internal/approvals/apr_nope?user={SLACK_PM}"),
+    ] {
+        let (s, v) = srv.get(&read, WEB_TOKEN, None).await;
+        assert_eq!(s, 404, "{read}: {v}");
+    }
+    let (s, v) = srv
+        .get(
+            &format!("/internal/approvals/{}?user={SLACK_PM}", srv.mine),
+            WEB_TOKEN,
+            None,
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["user"], SLACK_PM);
+    // No ledger (so no approval ids from it), and no member decisions (so no `admin` grant).
+    let (s, _) = srv.get("/internal/ledger", WEB_TOKEN, None).await;
+    assert_eq!(s, 403);
+    let (s, _) = srv.get("/internal/members/requests", WEB_TOKEN, None).await;
+    assert_eq!(s, 403);
+    let grant = serde_json::to_vec(&json!({
+        "decision": "approve", "decided_by": SLACK_PM, "handle": "newbie", "roles": ["admin"]
+    }))
+    .unwrap();
+    let (s, _) = srv
+        .send(
+            Method::POST,
+            "/internal/members/requests/req_1/decision",
+            WEB_TOKEN,
+            Some(&grant),
+            None,
+        )
+        .await;
+    assert_eq!(s, 403);
+    // An edit may change what a draft says, never where it goes (S2).
+    let decide = format!("/internal/approvals/{}/decision", srv.mine);
+    let edit = |args: Value| {
+        serde_json::to_vec(&json!({"decided_by": SLACK_PM, "decision": "edit", "args": args}))
+            .unwrap()
+    };
+    for moved in [
+        json!({"channel": SLACK_WITH_OUTSIDER, "thread_ts": "1731600000.000100", "text": "Yes."}),
+        json!({"channel": SLACK_ALL_TEAM, "thread_ts": "1731600000.000999", "text": "Yes."}),
+    ] {
+        let (s, v) = srv
+            .send(Method::POST, &decide, WEB_TOKEN, Some(&edit(moved)), None)
+            .await;
+        assert_eq!(s, 422, "{v}");
+        assert_eq!(v["code"], "target_changed", "{v}");
+    }
+    let read = format!("/internal/approvals/{}", srv.mine);
+    let (_, item) = srv.get(&read, SERVICE_TOKEN, None).await;
+    assert_eq!(item["status"], "pending");
+    // A text-only edit goes ahead.
+    let text_only = json!({"channel": SLACK_ALL_TEAM, "thread_ts": "1731600000.000100", "text": "Yes, it does."});
+    let (s, v) = srv
+        .send(
+            Method::POST,
+            &decide,
+            WEB_TOKEN,
+            Some(&edit(text_only)),
+            None,
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["status"], "approved", "{v}");
+    assert_eq!(v["args"]["text"], "Yes, it does.");
+}
+
+#[tokio::test]
+async fn the_console_token_only_reads_even_with_an_assertion() {
+    let srv = start(Mode::Require).await;
+    let console = Signer::console();
+    // Its two reads work, signed.
+    let list = list_target(OTHER);
+    let a = console.sign(OTHER, "GET", &list, b"");
+    let (s, v) = srv.get(&list, CONSOLE_TOKEN, Some(&a)).await;
+    assert_eq!(s, 200, "{v}");
+    // Sources and decisions are `403`, whatever it carries (S4).
+    let sources = format!("/internal/approvals/{}/sources?user={OTHER}", srv.theirs);
+    let a = console.sign(OTHER, "GET", &sources, b"");
+    let (s, _) = srv.get(&sources, CONSOLE_TOKEN, Some(&a)).await;
+    assert_eq!(s, 403);
+    let decide = format!("/internal/approvals/{}/decision", srv.theirs);
+    let body = reject(OTHER);
+    let a = console.sign(OTHER, "POST", &decide, &body);
+    let (s, _) = srv
+        .send(Method::POST, &decide, CONSOLE_TOKEN, Some(&body), Some(&a))
+        .await;
+    assert_eq!(s, 403);
+    let read = format!("/internal/approvals/{}", srv.theirs);
+    let (_, item) = srv.get(&read, SERVICE_TOKEN, None).await;
+    assert_eq!(item["status"], "pending");
+    // The admin reads are `pmos-web`'s and the orchestrator's only.
+    let (s, _) = srv
+        .get(
+            &format!("/internal/admin/overview?user={OTHER}"),
+            CONSOLE_TOKEN,
+            None,
+        )
+        .await;
+    assert_eq!(s, 403);
 }

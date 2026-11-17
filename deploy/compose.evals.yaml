@@ -2,7 +2,8 @@
 # the benchmarks and the eval gate run against (docs/evals.md, docs/runbooks/quality.md).
 #
 #   deploy/pmos-admin evals-run --category docs-qa    the weekly benchmark, on main
-#   deploy/pmos-admin evals-gate --base origin/main   the gate, on a PR's checkout
+#   deploy/pmos-admin evals-gate --checkout <dir> --base origin/main
+#                                                     the gate, on a PR's checkout (read as data)
 #
 # Why a separate stack:
 # - **The evaluator is separate.** The gate measures a pull request's roles, skills and bots,
@@ -66,6 +67,9 @@ services:
       PMOS_DEV: "1"
       PMOS_BOTS_BIND: 0.0.0.0:8750
       PMOS_BOTS_TOKENS: evals=${PMOS_EVAL_RT_EVALS:?},console=${PMOS_EVAL_RT_CONSOLE:?},worker-docs=${PMOS_EVAL_RT_DOCS:?},worker-pm-evals=${PMOS_EVAL_RT_PERSONAL:?}
+      # The only handle the `evals` client may request tasks as: the benchmark member that
+      # pmos-admin adds to this stack's content.
+      PMOS_EVALS_AS: evals
       PMOS_CONTENT_ROOT: /srv/content
       PMOS_TOOLSERVER_URL: http://toolserver:8710
       PMOS_SERVICE_TOKEN: ${PMOS_EVAL_SERVICE_TOKEN}
