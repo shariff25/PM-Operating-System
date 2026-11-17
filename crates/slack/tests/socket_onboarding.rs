@@ -263,6 +263,7 @@ async fn ts_decide(
         slack_id: request["slack_id"].as_str().unwrap().into(),
         email: request["email"].as_str().map(String::from),
         github: None,
+        entra_oid: None,
         roles: vec![Role::Pm],
     });
     let commit = ts.write_team(&original, &members);

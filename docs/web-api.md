@@ -16,16 +16,38 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
   `X-Pmos-Csrf`; a missing or wrong token is `403 {"code":"bad_csrf"}`. The Entra callback is
   a cross-site `GET` from Microsoft, so no origin check applies to it: its CSRF defence is
   `state`, matched once against a signed `__Host-pmos-entra` cookie set at `/api/auth/login`.
+- **Origin:** every `POST`, `PUT` and `DELETE` (development sign-in and logout included) must
+  carry an `Origin` (or else a `Referer`) that is the app's own origin, and no
+  `Sec-Fetch-Site` other than `same-origin` or `none`; otherwise `403 {"code":"bad_origin"}`.
+  **A write with neither `Origin` nor `Referer` is refused.** Browsers send `Origin` on every
+  `fetch` with these methods, so the app needs to do nothing; a script or test that calls the
+  API must send it. Both checks apply: origin, then the CSRF token.
 - **Providers:** sign-in sits behind one interface. **Entra ID** (`docs/entra-sign-in.md`) is
   the production provider, on when `PMOS_WEB_ENTRA_TENANT_ID`, `PMOS_WEB_ENTRA_CLIENT_ID`,
   `PMOS_WEB_ENTRA_CLIENT_SECRET` and `PMOS_WEB_PUBLIC_URL` are all set. **Development
-  sign-in** (`PMOS_WEB_DEV_LOGIN=1`) enables the development route below and logs a warning.
-  `pmos-web` starts with either or both (both logs a loud warning) and refuses to start with
-  neither, or with Entra half-configured. `GET /api/auth/providers` tells the app which buttons
-  to show.
+  sign-in** (`PMOS_WEB_DEV_LOGIN=1`) enables the development route below and logs a warning;
+  it starts only on a loopback `PMOS_WEB_BIND` (`127.0.0.1`, `::1`). `pmos-web` refuses to
+  start with neither provider, with Entra half-configured, or with both unless
+  `PMOS_WEB_DEV_LOGIN_WITH_ENTRA=1` is also set (a development override; it then logs a loud
+  warning). `GET /api/auth/providers` tells the app which buttons to show.
 - **Who you are:** the signed-in handle must be a member in `team.yaml`. Roles come from there.
   Entra ID finds the member by email: the token's `preferred_username` (or else `email`),
-  lower-cased, against members' `email` field; never by handle.
+  lower-cased, against members' `email` field; never by handle. A member with `entra-oid` in
+  `team.yaml` must also be that Entra account (the token's `oid`); otherwise sign-in ends at
+  `reason=wrong_account`, and a session of the wrong account ends (`401 signed_out`) on its
+  next request after `entra-oid` is added or changed.
+- **HTTPS:** with an `https` `PMOS_WEB_PUBLIC_URL`, every response carries
+  `Strict-Transport-Security: max-age=31536000`.
+- **Health:** `GET /healthz` (outside `/api`, no session) answers `ok` while the process runs.
+  `GET /readyz` answers `200` when it can serve and `503` when it can't, with
+  `{"ready": bool, "checks": {"store": "ok"|"down", "team": …, "bot_runtime": …,
+  "tool_server": …}}`: its own store answers, `team.yaml` reads, and the bot runtime and the
+  tool server answer their `/healthz` within two seconds. No detail and no secrets; the
+  reason goes to the server's log.
+- **Old links:** `GET /drafts/{id}` and `GET /d/{id}` (outside `/api`) answer `303` to the
+  app's own route for that draft, `/#/d/{id}`, when `id` is shaped like an approval id (`apr_`
+  and 1 to 64 letters or digits), and `303` to `/` otherwise. They are for links Slack cards
+  posted before the cards used `/#/d/{id}`; the redirect is always a same-origin path.
 - **Errors:** `{"code": "<snake_case>", "error": "<plain sentence for the person>"}`.
   `404 not_found` is also the answer for someone else's draft or task, so the app never
   confirms that it exists. Any unknown path under `/api` is a JSON `404 not_found`, never
@@ -52,7 +74,10 @@ The callback's `reason`s, for the app's signed-out page:
 | `cancelled` | They cancelled at Microsoft (`access_denied`). | "Sign-in was cancelled." |
 | `expired` | No sign-in in progress in this browser, or it took over ten minutes. | "That sign-in expired. Try again." |
 | `unavailable` | Microsoft couldn't be reached. | "Microsoft sign-in isn't answering. Try again in a minute." |
+| `wrong_account` | Microsoft signed in an account with the right email, but `team.yaml` names another Entra account (`entra-oid`) for that member: the address was reassigned, or it is a second account. | "That Microsoft account isn't the one on the team list. Sign in with your own work account, or ask a platform owner." |
 | `failed` | Anything else (a wrong or reused `state`, a refused code, a token that failed a check). | "Sign-in didn't work. Try again." |
+
+An unknown `reason` should read as `failed`.
 
 ## Me
 
@@ -92,13 +117,13 @@ document.
 | --- | --- | --- |
 | `GET /api/drafts` | | `{drafts: [DraftSummary]}`, newest first; pending ones, then the 20 most recently decided |
 | `GET /api/drafts/{id}` | | `Draft` |
-| `PUT /api/drafts/{id}` | `{title?, body}` | `Draft`. Saves the PM's edit; nothing is sent to the target system. Citation markers in `title` or `body` are removed before it is saved (see **Citations**). `409 not_pending` once decided. |
+| `PUT /api/drafts/{id}` | `{title?, body}` | `Draft`, with `edited: true` and a new `version`. Saves the PM's edit **on the draft itself, at the tool server**: the Slack card and the console show it from then on, and approving anywhere (here, the Slack card, the console) writes it. Nothing is sent to the target system. A `title` is kept only for drafts that have one (Confluence pages, Jira issues); without one the saved title stays. Citation markers in `title` or `body` are removed before it is saved (see **Citations**). `409 not_pending` once decided, `409 expired` for an expired Slack draft, `422 bad_edit` if the tool server refuses the edited text for its target. A practice draft's edit stays in `pmos-web`. |
 | `POST /api/drafts/{id}/changes` | `{instruction}` | `202 {suggestion: Suggestion}`. Asks the bot to revise the draft. One at a time: `409 change_in_progress`. |
 | `GET /api/drafts/{id}/suggestion` | | `{suggestion: Suggestion \| null}` |
-| `POST /api/drafts/{id}/suggestion/accept` | | `Draft`, with the suggested text as its body |
+| `POST /api/drafts/{id}/suggestion/accept` | | `Draft`, with the suggested text as its body, saved as an edit is (`PUT` above): at the tool server, so every surface shows it |
 | `POST /api/drafts/{id}/suggestion/reject` | | `Draft`, unchanged |
-| `POST /api/drafts/{id}/approve` | `{confirm_external?: bool, version?: string}` | `Draft` with `status: "approved"` and `result_url`. `409 needs_external_confirm`, `409 audience_blocked`, `409 expired`, `409 not_pending`, `409 stale`. |
-| `POST /api/drafts/{id}/reject` | `{reason?}` | `Draft` with `status: "rejected"`. `reason` is one of `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft`, `other`. |
+| `POST /api/drafts/{id}/approve` | `{confirm_external?: bool, version?: string}` | `Draft` with `status: "approved"` and `result_url`. Refusals (nothing was sent): `409 needs_external_confirm`, `409 audience_blocked`, `409 expired`, `409 not_pending`, `409 stale`, `409 not_approvable`, `422 bad_edit`, `503 audience_unavailable`, `503 unavailable`, `403 not_a_member`. **Outcome unknown:** `502` or `504 unknown_outcome` (see **Error codes**). |
+| `POST /api/drafts/{id}/reject` | `{reason?}` | `Draft` with `status: "rejected"`. `reason` is one of `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft`, `other`. The same refusals and `unknown_outcome` as approve, where they apply. |
 | `POST /api/drafts/practice` | | `Draft`, a practice draft for this PM. Idempotent while one exists. |
 | `DELETE /api/drafts/{id}` | | `204`, practice drafts only; `409 not_practice` otherwise. |
 
@@ -109,9 +134,14 @@ document.
  "task_id": "tsk_…", "practice": false}
 
 // Draft = DraftSummary plus
-{"body": "markdown", "edited": false,
- "target": {"system": "confluence", "label": "Space PM, under Specs", "url": null},
- "sources": [Source], "result_url": null, "external": false, "version": "7"}
+{"body": "markdown", "edited": false, "edited_at": null,
+ "target": {"system": "confluence", "label": "Space PM, under “Specs”", "url": null},
+ "sources": [Source], "result_url": null, "external": false, "version": "7",
+ "restricted_sources": true, "audience": null,
+ "marker": "Drafted with PM OS · run tsk_01JD…"}
+
+// A Slack draft's audience, once PM OS has checked the channel (both null before)
+{"audience": {"members": 14, "external": true}}
 
 // Source
 {"id": "s1", "system": "jira", "title": "PAY-212: TCB grace period", "url": "https://… or null",
@@ -127,22 +157,52 @@ document.
   (a plain sentence) when `failed`.
 - `expires_at` is set for Slack drafts, which expire after 24 hours.
 - `version` is optional and opaque: it changes whenever the draft text or title changes (an edit,
-  an accepted suggestion). The app sends back the `version` of the draft the PM was looking at in
-  the approve body. When it is sent and does not match the stored draft, the server answers
-  `409 stale` and publishes nothing; the app reloads the draft and tells the PM to read it again.
-  A server that does not set `version` ignores the field, and an approve without it skips the
-  check.
+  an accepted suggestion, from this app or another tab). The app sends back the `version` of the
+  draft the PM was looking at in the approve body. When it is sent and does not match the stored
+  draft, the server answers `409 stale` and publishes nothing; the app reloads the draft and
+  tells the PM to read it again. A server that does not set `version` ignores the field, and an
+  approve without it skips the check. If the draft was approved elsewhere (the Slack card) with
+  the very text of that `version`, by the same PM, the approve answers the approved draft (`200`,
+  `status: "approved"`) and sends nothing; approved elsewhere with other text, or rejected, it is
+  `409 not_pending`. Either way the app should show the draft as decided.
+- `edited` is true when a person changed the bot's text: an edit saved here (`PUT`), an accepted
+  suggestion, or an edit made on the Slack card. `edited_at` is when the PM last saved an edit
+  here, else `null`. An edited draft is the PM's text: it has no citations.
 - `external` is true when approving would post to a channel shared outside the company; the
   app must then ask before sending `confirm_external: true`.
+- **What the approve dialog shows** (the Slack card shows the same):
+  - `restricted_sources`: the run that drafted it read restricted sources (or it predates that
+    record, which counts the same). A Slack post of it is refused (`409 audience_blocked`)
+    where anyone outside the product team can see the channel. Show "Built from restricted
+    sources".
+  - `audience`: for a Slack draft (`slack_reply`, `slack_message`), `{members, external}`;
+    `null` for Confluence and Jira. `members` (how many people are in the channel) and
+    `external` (shared outside the company) are `null` until PM OS has checked the channel,
+    which it does when an approve is tried; after a `needs_external_confirm` or
+    `audience_blocked` they are filled in. Show "Visible to 14 people", "External channel".
+  - `marker`: the line PM OS adds to what it writes, so readers can tell: a Slack post ends with
+    "_Drafted with PM OS_"; a Jira issue's description and a Confluence page end with "Drafted
+    with PM OS · run <run id>". `null` for a practice draft. Show "Posts as you, marked
+    “Drafted with PM OS”" (Slack) or "Ends with “Drafted with PM OS”" (Jira, Confluence).
+- **`target.label`** names where the draft goes in words. Confluence and Jira labels use ids
+  (space and project keys) and, when the run read them, the names the tool server recorded:
+  "Space PM, under “Specs”", "Page “PRD: Billing retries”", "Project PAY, a new Story under
+  PAY-212: TCB grace period"; an id the run didn't read stays an id ("under page 163841").
+  **Slack labels never show a channel id**: PM OS keeps no channel names, so they read "A
+  Slack thread", "A Slack channel", "A direct message thread" or "A direct message" (and the
+  titles "Reply in a Slack thread", "Message to a Slack channel", "Direct message"). The
+  channel's name is one tap away: `target.url` opens it in Slack, which shows the name to
+  whoever can see it. Anything that isn't shaped like an id reads "An unrecognised channel"
+  (or space, page, project, epic).
 - **A practice draft** (`practice: true`) lives only in `pmos-web`. Approving it creates
   nothing anywhere: it becomes `approved` with `result_url: null`.
 - **Sources** are what the bot read for the task that made the draft. When the runtime cannot
   say, `sources` is empty and the app says so. `title` is the item's own title where PM OS
   recorded one at the read: `PAY-212: TCB grace period` for a Jira issue, the page title for
   Confluence and the docs, the file's title for the context library. Slack sources are
-  always `Slack thread in C01` or `Slack message in C01` (Slack text is kept at most 24
-  hours, so no title is recorded), and reads from before titles were recorded show the id
-  (`PAY-212`, `Confluence page 12345`). `excerpt` is always `null`: no source text is kept.
+  always `Slack thread` or `Slack message`, never with a channel id (Slack text is kept at
+  most 24 hours, so no title is recorded; the `url` opens it in Slack), and reads from before
+  titles were recorded show the id (`PAY-212`, `Confluence page 12345`). `excerpt` is always `null`: no source text is kept.
   `url` may be `null`. `cited` is true when the body has a citation marker for this source
   (see **Citations**): the draft relies on it, rather than merely having read it.
 - **`body`** is shown as the bot wrote it, except that a body written entirely on one line
@@ -150,7 +210,7 @@ document.
   `\t` as tabs), and that the bot's source markers are shown as citation markers (see
   **Citations**). Both are for display only: approving without an edit sends the bot's own
   text, from which the tool server removes every marker as it writes. Saving an edit
-  (`PUT`) makes what the PM saw the text that is sent.
+  (`PUT`) makes what the PM saw the text that is sent, from every surface.
 
 ### Citations
 
@@ -164,7 +224,7 @@ with no space before them, and several in a row (`[[s1]][[s4]]`) mean several so
  "sources": [
    {"id": "s1", "system": "jira", "title": "PAY-212: TCB grace period", "url": "https://…", "excerpt": null, "cited": true},
    {"id": "s2", "system": "confluence", "title": "PRD: Billing retries", "url": "https://…", "excerpt": null, "cited": true},
-   {"id": "s3", "system": "slack", "title": "Slack thread in C01", "url": "https://…", "excerpt": null, "cited": false},
+   {"id": "s3", "system": "slack", "title": "Slack thread", "url": "https://…", "excerpt": null, "cited": false},
    {"id": "s4", "system": "context", "title": "Pricing principles", "url": null, "excerpt": null, "cited": true}]}
 ```
 
@@ -239,19 +299,35 @@ drafts, and any the bot put in its answer are removed.
 
 | Method and path | Body | Answer |
 | --- | --- | --- |
-| `GET /api/brief` | | `Brief`: the PM's open follow-ups and `changed` items, with empty lists when nothing is stored; or `501 {"code":"not_built"}` while the server's `PMOS_WEB_BRIEF` is off, and the app then hides that part of the home page |
+| `GET /api/brief` | | `Brief`: whether a brief has been delivered, and the PM's open follow-ups and `changed` items, with empty lists when nothing is stored; or `501 {"code":"not_built"}` while the server's `PMOS_WEB_BRIEF` is off, and the app then hides that part of the home page |
 | `POST /api/followups/{id}/dismiss` | | `204` ("Not mine"), the same again if repeated; `404` for an id that isn't the PM's, or is dismissed or expired |
 | `POST /api/followups/{id}/draft` | | `201 Task`, a reply (waiting on you) or gentle nudge (you wait on) draft that arrives as a draft to approve; `404` as above |
 
 ```json
-{"date": "2026-11-16",
+{"date": "2026-11-16", "delivered_at": "2026-11-16T08:31:02Z", "status": "today",
  "changed": [{"system": "jira", "title": "PAY-212 moved to Blocked", "summary": "…", "url": "…"}],
  "waiting_on_you": [{"id": "fu_…", "system": "slack", "who": "Ben", "summary": "asked about the pricing page", "url": "…", "age_days": 2}],
  "you_wait_on": [{"id": "fu_…", "system": "slack", "who": "Legal", "summary": "the DPA question", "url": "…", "age_days": 3}]}
 ```
 
+- `delivered_at` is when a daily brief last filled this PM's day (the producer route below),
+  however long ago, or `null` if none ever has.
+- `status` says what to say about it:
+
+  | `status` | Meaning | What the home page says |
+  | --- | --- | --- |
+  | `never` | No brief has ever been delivered for this PM (`delivered_at: null`). The lists are empty. | Nothing about "your brief is in". Offer to set one up ("brief me at 8" in Slack). |
+  | `today` | The last brief came within the last 24 hours; `changed` is its list. Empty lists mean it found nothing. | "Your daily brief is in", and if all lists are empty, that it found nothing ("Suspiciously calm"). |
+  | `stale` | A brief came before, more than 24 hours ago. `changed` is empty; the follow-ups still listed are the ones not yet expired (non-Slack ones last a week). | "No brief yet today" with the time of the last one. |
+
+  An older server sends neither field: treat that as `never`.
+- `date` is the date the last brief was for while `status` is `today`, else today's date.
+
 Every row has a `url` to its source. Nothing is posted from a follow-up without the PM
-approving the draft it produces.
+approving the draft it produces. **Draft** (`POST /api/followups/{id}/draft`) asks the PM's
+bot for a reply or a nudge with fixed wording; the follow-up's own fields (who, summary,
+link), which the brief wrote from other people's messages, go to the bot as quoted data
+between markers, with an instruction never to follow anything in them.
 
 A follow-up is a one-line summary, never message text. Slack-derived ones expire after 24
 hours, all others after a week, and expired ones are deleted, not just hidden; `changed`
@@ -265,11 +341,62 @@ a 128 KiB body, one-line text (`summary` at most 200 characters, `who` 80), `sys
 `a-z`, digits, `-` and `_`, every `url` `http` or `https` without credentials; anything else
 is `422 bad_brief` (`413` for an oversize body, `401 bad_token`, `404` for a handle not on the
 team) and nothing is stored. A follow-up sent again keeps its age and a dismissal; one left
-out is removed. **The caller is the Slack service** (`pmos-slack`, `crates/slack/src/brief_feed.rs`):
-when a PM's daily brief finishes, it sends the items of the brief's machine-readable block
+out is removed. A call that looks like a browser's (it carries a `__Host-pmos` session cookie
+or an `Origin` header) is `403 forbidden`, whatever its token. With `PMOS_WEB_INTERNAL_BIND`
+set, the route is served only on that second listener (and `404` on the browser-facing one).
+**The caller is the Slack service** (`pmos-slack`, `crates/slack/src/brief_feed.rs`): when a
+PM's daily brief finishes (a run of their brief routine, or a `brief now`; never any other
+task, whatever its answer contains), it sends the items of the brief's machine-readable block
 (`docs/daily-brief.md`, "The web app's panels") here, with `PMOS_WEB_URL` and
 `PMOS_WEB_BRIEF_TOKEN` set on it. It sends nothing until a brief runs, so a PM with no brief
-routine has empty lists.
+routine has empty lists and `status: "never"`. A brief that found nothing still calls it, with
+empty lists, so the home page can tell "nothing found" (`today`) from "never ran" (`never`).
+
+## Error codes
+
+Every error is `{"code", "error"}`: `code` is one of these, and `error` a plain sentence for
+the person, fixed by `pmos-web` (never another service's text). **"Nothing changed"** means
+the request was refused before anything was written anywhere, so the app may say so (and
+"Nothing was sent" for a draft). **"Unknown"** means it may have happened: the app must not
+say nothing was sent, and should reload the draft to see where it stands.
+
+| Status | `code` | When | Nothing changed? |
+| --- | --- | --- | --- |
+| `400` | `bad_request` | A body or query parameter isn't what the route takes. | Yes |
+| `401` | `signed_out` | No live session. | Yes |
+| `401` | `bad_token` | The producer route's token is wrong (server to server only). | Yes |
+| `403` | `bad_origin` | A write from another origin, or with neither `Origin` nor `Referer`. | Yes |
+| `403` | `bad_csrf` | A write without the session's CSRF token. | Yes |
+| `403` | `not_a_member` | Not (or no longer) in `team.yaml`; every session of theirs ends. Also when the tool server doesn't count them a member on a decision. | Yes |
+| `403` | `not_allowed` | Their role doesn't allow drafts, tasks or asking. | Yes |
+| `403` | `forbidden` | Admin and auditor routes their role doesn't allow; the producer route called like a browser. | Yes |
+| `404` | `not_found` | Unknown path or id, or someone else's draft, task or follow-up. | Yes |
+| `405` | `method_not_allowed` | A known path with another method. | Yes |
+| `409` | `not_pending` | The draft was already decided (perhaps in Slack). Read it again to show how. | Yes |
+| `409` | `stale` | The draft changed since the `version` the PM approved. | Yes |
+| `409` | `expired` | A Slack draft past its 24 hours. | Yes |
+| `409` | `needs_external_confirm` | The channel is shared outside the company; ask, then approve with `confirm_external: true`. `audience` is now filled in. | Yes |
+| `409` | `audience_blocked` | Built from restricted sources, and people outside the product team can see the channel. Only rejecting is left. | Yes |
+| `409` | `not_approvable` | The tool server won't approve it as it stands (its tool or bot is no longer allowed). | Yes |
+| `409` | `change_in_progress` | A change to this draft is already being written. | Yes |
+| `409` | `no_suggestion` | Accepting a suggestion that isn't ready. | Yes |
+| `409` | `not_practice` | Deleting a draft that isn't the practice draft. | Yes |
+| `409` | `task_refused` | The runtime won't take the PM's task (not onboarded, no bot). | Yes |
+| `413` | (no body) | The producer route's body is over 128 KiB. | Yes |
+| `415` | `bad_content_type` | A write with a body that isn't JSON. | Yes |
+| `422` | `bad_edit` | The edited text isn't valid for where the draft goes. | Yes |
+| `422` | `bad_brief` | The producer route's body failed a check. | Yes |
+| `501` | `not_built` | The daily brief is off on this server. | Yes |
+| `502` | `upstream_unavailable` | The runtime or tool server couldn't be reached, refused, or answered something unreadable. On a decision, only when the request never reached the tool server, or it refused it. | Yes on a decision; for a task (`POST /api/tasks`), the task may have been made: reload the list |
+| `502` | `unknown_outcome` | A decision was sent, but the answer was lost (the connection dropped, or the tool server failed with a `5xx`), and reading the draft again didn't show it decided. | **Unknown** |
+| `504` | `unknown_outcome` | The same, when the tool server didn't answer in time (10 seconds). | **Unknown** |
+| `503` | `audience_unavailable` | Slack couldn't say who is in the channel. | Yes |
+| `503` | `unavailable` | `pmos-web`'s own store, or the tool server's, is down. | Yes |
+| `503` | `team_unavailable` | `team.yaml` can't be read. | Yes |
+
+After an `unknown_outcome` the server has already read the draft once: if it showed this PM's
+approval (or rejection), the answer would have been that draft, `200`. Approving again is safe:
+if the first approve went through, the second answers the approved draft and sends nothing.
 
 ## Admin and auditor
 

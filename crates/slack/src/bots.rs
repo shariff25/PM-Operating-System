@@ -155,6 +155,9 @@ pub(crate) struct Click {
     pub(crate) value: String,
     /// Where to answer a click on an ephemeral message, which `chat.update` can't change.
     pub(crate) response_url: Option<String>,
+    /// The clicked block's id: an approval card's carries the start of the arguments' hash
+    /// it was posted with (`cards::clicked_hash`).
+    pub(crate) block_id: Option<String>,
 }
 
 impl Click {
@@ -170,6 +173,7 @@ impl Click {
             trigger_id: s(&payload["trigger_id"]).unwrap_or_default(),
             value: s(&payload["actions"][0]["value"]).unwrap_or_default(),
             response_url: s(&payload["response_url"]),
+            block_id: s(&payload["actions"][0]["block_id"]),
         })
     }
 }
@@ -883,6 +887,18 @@ impl Bots {
                 &click.channel,
                 &click.message_ts,
                 cards::approval_closed(&item, &line),
+            )
+            .await;
+            return;
+        }
+        // The card shows other text than the item now has (the PM saved an edit in the web
+        // app since it was posted): approve nothing; show the text as it is, to approve again.
+        if decision == "approve" && cards::card_is_stale(click.block_id.as_deref(), &item) {
+            tracing::info!(approval = %click.value, "approval card was stale; shown again");
+            self.update(
+                &click.channel,
+                &click.message_ts,
+                cards::approval_changed(&item, self.web_url()),
             )
             .await;
             return;

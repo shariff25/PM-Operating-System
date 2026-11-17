@@ -180,6 +180,7 @@ mod tests {
             slack_id: slack.into(),
             email: Some(format!("{handle}+x@example.com")),
             github: Some("Ana-F".into()),
+            entra_oid: None,
             roles: vec![Role::Pm, Role::SkillAuthor],
         }
     }
@@ -238,6 +239,7 @@ mod tests {
                 slack_id: "W99".into(),
                 email: Some("we\"ird\\@x.com".into()),
                 github: None,
+                entra_oid: None,
                 roles: vec![Role::Admin],
             },
         ];
