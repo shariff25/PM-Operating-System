@@ -132,7 +132,11 @@ async fn start_toolserver(
         Arc::new(FakeConnector::slack()),
         Arc::new(docs),
     ];
-    let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
+    let svc = Arc::new(
+        ToolService::new(catalog, stores, connectors)
+            .unwrap()
+            .with_open_directory(),
+    );
     let cancel = CancellationToken::new();
     let app = router(
         svc,

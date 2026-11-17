@@ -34,7 +34,6 @@ pub mod session;
 pub mod sources;
 pub mod stats;
 pub mod store;
-pub mod team;
 pub mod users;
 pub mod vault;
 

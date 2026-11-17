@@ -114,7 +114,12 @@ async fn start() -> Stack {
         slack.clone(),
         Arc::new(FakeConnector::docs()),
     ];
-    let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
+    // An open user directory, as with fake connectors before the user database (slice U3).
+    let svc = Arc::new(
+        ToolService::new(catalog, stores, connectors)
+            .unwrap()
+            .with_open_directory(),
+    );
     let ts_keys = pmos_toolserver::assertion::parse_keys(
         &format!("web:toolserver:wt1:{WEB_TOOLS_KEY}"),
         "the tool server",

@@ -17,7 +17,7 @@ axum.workspace = true
 chrono.workspace = true
 pmos-assertion.workspace = true
 pmos-bots = { path = "../bots" }
-pmos-toolserver = { path = "../toolserver" }
+pmos-toolserver = { path = "../toolserver", features = ["test-support"] }
 pmos-web = { path = "../web" }
 reqwest.workspace = true
 serde_json.workspace = true

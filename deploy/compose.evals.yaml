@@ -48,6 +48,10 @@ services:
       PMOS_SERVICE_TOKEN: ${PMOS_EVAL_SERVICE_TOKEN:?}
       PMOS_BOT_TOKEN: ${PMOS_EVAL_BOT_TOKEN:?}
       PMOS_CONTENT_ROOT: /srv/content
+      # The user database, in memory, seeded from the stack's own team.yaml (evals, ben, cy and
+      # eval-admin; deploy/pmos-admin eval_stack_up), so it agrees with the services that still
+      # read the file until slice U7.
+      PMOS_USERS_SEED: /srv/content/team.yaml
       # Empty: the fake docs fixtures. Set PMOS_EVAL_DOCS_URL for your own docs index.
       PMOS_DOCS_URL: ${PMOS_EVAL_DOCS_URL:-}
       PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN:-}

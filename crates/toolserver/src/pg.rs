@@ -421,6 +421,11 @@ impl SessionRepo for PgStore {
             .await?;
         Ok(done.rows_affected() > 0)
     }
+
+    async fn revoke_user(&self, user: &str) -> StoreResult<u64> {
+        let mut conn = self.pool.acquire().await?;
+        Ok(revoke_user_sessions(&mut conn, user).await?)
+    }
 }
 
 fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
@@ -1097,6 +1102,13 @@ impl ApprovalRepo for PgStore {
         tx.commit().await?;
         Ok(due.len())
     }
+
+    async fn close_for_owner(&self, user: &str, now: DateTime<Utc>) -> StoreResult<Vec<String>> {
+        let mut tx = self.pool.begin().await?;
+        let ids = close_owner_drafts(&mut tx, user, now).await?;
+        tx.commit().await?;
+        Ok(ids)
+    }
 }
 
 fn outcome_str(outcome: crate::audit::Outcome) -> String {
@@ -1339,11 +1351,104 @@ fn sealed_from_row(r: &PgRow) -> StoreResult<SealedCredential> {
         site_url: r.try_get("site_url")?,
         external_id: r.try_get("external_id")?,
         updated_at: r.try_get("updated_at")?,
+        suspended_at: r.try_get("suspended_at")?,
     })
 }
 
 const CREDENTIAL_COLUMNS: &str = "user_handle, provider, key_id, access_token, refresh_token, \
-                                  expires_at, scopes, cloud_id, site_url, external_id, updated_at";
+                                  expires_at, scopes, cloud_id, site_url, external_id, updated_at, \
+                                  suspended_at";
+
+/// Suspend `user`'s credentials (deactivation), on `conn`: the user store runs it inside the
+/// deactivation's own transaction.
+pub(crate) async fn suspend_credentials(
+    conn: &mut sqlx::PgConnection,
+    user: &str,
+    at: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE credentials SET suspended_at = $2 WHERE user_handle = $1 AND suspended_at IS NULL",
+    )
+    .bind(user)
+    .bind(at)
+    .execute(conn)
+    .await?
+    .rows_affected())
+}
+
+/// Make `user`'s suspended credentials usable again (reactivation within the grace).
+pub(crate) async fn restore_credentials(
+    conn: &mut sqlx::PgConnection,
+    user: &str,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE credentials SET suspended_at = NULL
+         WHERE user_handle = $1 AND suspended_at IS NOT NULL",
+    )
+    .bind(user)
+    .execute(conn)
+    .await?
+    .rows_affected())
+}
+
+/// Delete `user`'s suspended credentials (the grace is over).
+pub(crate) async fn delete_suspended_credentials(
+    conn: &mut sqlx::PgConnection,
+    user: &str,
+) -> Result<u64, sqlx::Error> {
+    Ok(
+        sqlx::query("DELETE FROM credentials WHERE user_handle = $1 AND suspended_at IS NOT NULL")
+            .bind(user)
+            .execute(conn)
+            .await?
+            .rows_affected(),
+    )
+}
+
+/// End every MCP session of `user` (deactivation).
+pub(crate) async fn revoke_user_sessions(
+    conn: &mut sqlx::PgConnection,
+    user: &str,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query("DELETE FROM sessions WHERE user_handle = $1")
+        .bind(user)
+        .execute(conn)
+        .await?
+        .rows_affected())
+}
+
+/// Close `user`'s pending drafts as the system: `rejected`, ledger reason
+/// `owner_deactivated`. Returns their ids.
+pub(crate) async fn close_owner_drafts(
+    conn: &mut sqlx::PgConnection,
+    user: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "UPDATE approvals SET status = 'rejected', decided_at = $2, decided_by = $3
+         WHERE user_handle = $1 AND status = 'pending'
+         RETURNING id",
+    )
+    .bind(user)
+    .bind(now)
+    .bind(crate::approvals::SYSTEM_DECIDER)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !ids.is_empty() {
+        sqlx::query(
+            "UPDATE ledger
+             SET outcome = 'rejected', reason = 'owner_deactivated', decided_at = $2,
+                 decided_by = $3
+             WHERE id = ANY($1)",
+        )
+        .bind(&ids)
+        .bind(now)
+        .bind(crate::approvals::SYSTEM_DECIDER)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(ids)
+}
 
 #[async_trait]
 impl CredentialStore for PgStore {
@@ -1430,6 +1535,21 @@ impl CredentialStore for PgStore {
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(sealed_from_row).collect()
+    }
+
+    async fn suspend(&self, user: &str, at: DateTime<Utc>) -> StoreResult<u64> {
+        let mut conn = self.pool.acquire().await?;
+        Ok(suspend_credentials(&mut conn, user, at).await?)
+    }
+
+    async fn restore(&self, user: &str) -> StoreResult<u64> {
+        let mut conn = self.pool.acquire().await?;
+        Ok(restore_credentials(&mut conn, user).await?)
+    }
+
+    async fn delete_suspended(&self, user: &str) -> StoreResult<u64> {
+        let mut conn = self.pool.acquire().await?;
+        Ok(delete_suspended_credentials(&mut conn, user).await?)
     }
 }
 

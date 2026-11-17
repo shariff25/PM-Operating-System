@@ -24,7 +24,7 @@ use pmos_toolserver::oauth::{
     AppCredentials, Endpoints, OAuth, OAuthConfig, OAuthError, TokenError, TokenSource,
 };
 use pmos_toolserver::service::ToolError;
-use pmos_toolserver::team::Team;
+use pmos_toolserver::users::access::People;
 use pmos_toolserver::vault::{Credential, KeyRing, MemoryCredentials, Provider, Secret, Vault};
 use pmos_toolserver::{router, AppConfig, Stores, ToolService};
 use serde_json::{json, Value};
@@ -399,14 +399,31 @@ struct Live {
     confluence: Confluence,
     slack: Slack,
     cancel: CancellationToken,
+    /// The user directory links are checked against.
+    people: Arc<People>,
 }
 
 async fn live() -> Live {
     live_with(None).await
 }
 
-/// Live connectors with `team.yaml` enforced, as in production.
-async fn live_with(team: Option<Arc<Team>>) -> Live {
+/// Live connectors with the user database enforced, as in production, holding `members`
+/// (and the fixture admin); `None`: an open directory (tests only).
+async fn live_with(members: Option<Vec<pmos_contract::model::TeamMember>>) -> Live {
+    let people = match members {
+        Some(members) => Arc::new(People::new(Arc::new(
+            pmos_toolserver::users::MemoryUsers::seeded(
+                common::seed_request(members),
+                Default::default(),
+                None,
+            )
+            .await
+            .unwrap(),
+        ))),
+        None => Arc::new(People::open(Arc::new(
+            pmos_toolserver::users::MemoryUsers::default(),
+        ))),
+    };
     let (base, mock, cancel) = start_mock().await;
     let vault = Vault::new(
         KeyRing::from_spec(&KeyRing::generate_spec("k1")).unwrap(),
@@ -437,11 +454,9 @@ async fn live_with(team: Option<Arc<Team>>) -> Live {
             },
         },
         vault.clone(),
+        people.clone(),
     );
-    let oauth = Arc::new(match team {
-        Some(team) => oauth.with_team(team),
-        None => oauth,
-    });
+    let oauth = Arc::new(oauth);
     let tokens: Arc<dyn TokenSource> = oauth.clone();
     Live {
         jira: Jira::new(tokens.clone(), base.clone()),
@@ -452,6 +467,7 @@ async fn live_with(team: Option<Arc<Team>>) -> Live {
         oauth,
         vault,
         cancel,
+        people,
     }
 }
 
@@ -779,11 +795,11 @@ fn member(handle: &str, slack_id: &str, email: Option<&str>) -> pmos_contract::m
 #[tokio::test]
 async fn a_linked_account_must_belong_to_the_pm_it_is_linked_for() {
     // The mock signs in Slack user U0ANA and Atlassian user Ana@Example.com.
-    let team = Team::of(vec![
+    let team = vec![
         member("ana", "U0ANA", Some("ana@example.com")),
         member("bo", "U0BO", Some("bo@example.com")),
         member("cy", "U0CY", None),
-    ]);
+    ];
     let l = live_with(Some(team)).await;
     let try_link = |user: &'static str, provider| {
         let url = l.oauth.authorize_url(user, provider, Utc::now()).unwrap();
@@ -795,8 +811,25 @@ async fn a_linked_account_must_belong_to_the_pm_it_is_linked_for() {
         }
     };
 
-    // Ana's own accounts link.
+    // Ana's own accounts link; the first Atlassian link records the account id.
     try_link("ana", Provider::Slack).await.unwrap();
+    try_link("ana", Provider::Atlassian).await.unwrap();
+    let ana = l.people.user("ana").await.unwrap().unwrap();
+    let account = ana
+        .identity(pmos_toolserver::users::IdentityKind::Atlassian)
+        .unwrap();
+    assert_eq!(account.subject, "acc-ana");
+    assert_eq!(
+        l.vault
+            .get("ana", Provider::Atlassian)
+            .await
+            .unwrap()
+            .unwrap()
+            .external_id
+            .as_deref(),
+        Some("acc-ana")
+    );
+    // The same account again: fine (a re-link after an expiry).
     try_link("ana", Provider::Atlassian).await.unwrap();
 
     // Bo's link, opened by Ana (a forwarded link), attaches nothing to Bo.
@@ -808,7 +841,8 @@ async fn a_linked_account_must_belong_to_the_pm_it_is_linked_for() {
         );
         assert!(l.vault.get("bo", provider).await.unwrap().is_none());
     }
-    // Atlassian needs an email in team.yaml to check against; nobody outside the team links.
+    // Atlassian needs an email in the user database to check against; nobody outside the
+    // team links.
     assert!(matches!(
         try_link("cy", Provider::Atlassian).await.unwrap_err(),
         OAuthError::WrongAccount(..)
@@ -817,6 +851,49 @@ async fn a_linked_account_must_belong_to_the_pm_it_is_linked_for() {
         try_link("eve", Provider::Slack).await.unwrap_err(),
         OAuthError::WrongAccount(..)
     ));
+    l.cancel.cancel();
+}
+
+/// After the first Atlassian link the account id decides: a re-link that signs in with
+/// another account is `different_account` (the callback answers `409`), whatever its email,
+/// and nothing is stored.
+#[tokio::test]
+async fn a_relink_with_another_atlassian_account_is_refused() {
+    let l = live_with(Some(vec![member("ana", "U0ANA", Some("ana@example.com"))])).await;
+    // Ana first linked another Atlassian account (its id recorded).
+    l.people
+        .apply(
+            &pmos_toolserver::users::Actor::link("ana"),
+            pmos_toolserver::users::Op::LinkAccount {
+                handle: "ana".into(),
+                kind: pmos_toolserver::users::IdentityKind::Atlassian,
+                subject: "acc-earlier".into(),
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let url = l
+        .oauth
+        .authorize_url("ana", Provider::Atlassian, Utc::now())
+        .unwrap();
+    let err = l
+        .oauth
+        .complete(
+            Provider::Atlassian,
+            "good-code",
+            &state_of(&url),
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, OAuthError::DifferentAccount(Provider::Atlassian));
+    assert!(l
+        .vault
+        .get("ana", Provider::Atlassian)
+        .await
+        .unwrap()
+        .is_none());
     l.cancel.cancel();
 }
 
@@ -1292,15 +1369,16 @@ async fn slack_writes_check_their_audience_before_posting() {
         entra_oid: None,
         roles: vec![pmos_contract::model::Role::Pm],
     };
-    let svc = Arc::new(
-        ToolService::new(catalog, stores, connectors)
-            .unwrap()
-            .with_team(Team::of(vec![
-                member("ana", "U0ANA"),
-                member("ben", "U0BEN"),
-                member("cy", "U0CY"),
-            ])),
-    );
+    common::seed_users(
+        &stores,
+        vec![
+            member("ana", "U0ANA"),
+            member("ben", "U0BEN"),
+            member("cy", "U0CY"),
+        ],
+    )
+    .await;
+    let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
     let s = svc
         .create_session("ana", "meeting-notes", "run-a", None, Utc::now())
         .await
@@ -1389,7 +1467,11 @@ async fn link_over_http_then_call_through_the_tool_server() {
         Arc::new(Slack::new(tokens, l.base.clone())),
         Arc::new(pmos_toolserver::connectors::fake::FakeConnector::docs()),
     ];
-    let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
+    let svc = Arc::new(
+        ToolService::new(catalog, stores, connectors)
+            .unwrap()
+            .with_open_directory(),
+    );
     let cancel = CancellationToken::new();
     let app = router(
         svc.clone(),
@@ -1691,7 +1773,7 @@ async fn a_team_bot_reads_with_its_own_account_inside_its_scope() {
 #[tokio::test]
 async fn a_team_bots_own_account_links_without_the_team_yaml_check() {
     // team.yaml is enforced and lists only Ana; the mock signs in as Ana's accounts.
-    let team = Team::of(vec![member("ana", "U0ANA", Some("ana@example.com"))]);
+    let team = vec![member("ana", "U0ANA", Some("ana@example.com"))];
     let l = live_with(Some(team)).await;
     link(&l, "bots.scout", Provider::Atlassian).await;
     link(&l, "bots.scout", Provider::Slack).await;
@@ -1732,7 +1814,11 @@ async fn a_team_bot_session_reads_as_the_bot_and_writes_as_the_pm() {
         Arc::new(Slack::new(tokens, l.base.clone())),
         Arc::new(pmos_toolserver::connectors::fake::FakeConnector::docs()),
     ];
-    let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
+    let svc = Arc::new(
+        ToolService::new(catalog, stores, connectors)
+            .unwrap()
+            .with_open_directory(),
+    );
     put_atlassian(&l, "ana", "at-ana", "rt", 3600).await;
     put_atlassian(&l, "bots.scout", "at-bot", "rt", 3600).await;
     put_slack(&l, "ana", "xoxp-ana").await;

@@ -19,7 +19,6 @@ use pmos_toolserver::github_memory::GitHubMemory;
 use pmos_toolserver::oauth::{OAuth, OAuthConfig, TokenSource};
 use pmos_toolserver::onboarding::{GitHubSetup, Onboarding};
 use pmos_toolserver::pg::PgStore;
-use pmos_toolserver::team::Team;
 use pmos_toolserver::vault::Vault;
 use pmos_toolserver::{router_full, AppConfig, PersonClients, Stores, ToolService};
 use tokio_util::sync::CancellationToken;
@@ -62,7 +61,8 @@ async fn main() -> Result<()> {
                 "context indexed"
             );
             spawn_pruner(pg.clone(), cancel.clone());
-            pg.stores()
+            pg.with_deactivation_cap(config.users_deactivations_per_hour)
+                .stores()
         }
         None => {
             tracing::warn!("PMOS_DEV=1 and no PMOS_DATABASE_URL: every store is in memory");
@@ -74,28 +74,43 @@ async fn main() -> Result<()> {
             Arc::new(JsonlAudit::open(path).context("opening audit log")?);
         stores.audit = Arc::new(TeeAudit(vec![stores.audit.clone(), file]));
     }
-    // The user database (docs/user-database-spec.md, slice U1). Nothing decides from it yet:
-    // team.yaml stays what every service reads until slices U3-U7. In development the
-    // in-memory store can be seeded (config.rs refuses a seed with a database or live
-    // connectors).
+    // The user database (docs/user-database-spec.md): since slice U3 the tool server decides
+    // from it who may use PM OS. In development the in-memory store is seeded (config.rs
+    // refuses a seed with a database or live connectors); with no seed and no database
+    // nobody may use PM OS. The runtime, Slack, pmos-web and the console still read
+    // team.yaml until slices U4a-d, so the stacks keep both equal.
+    let rules = pmos_toolserver::users::Rules {
+        evals_slack_allowed: config.database_url.is_none()
+            && matches!(config.connectors, Connectors::Fake),
+        deactivations_per_hour: config.users_deactivations_per_hour,
+    };
     if let Some(path) = &config.users_seed {
         let req = pmos_toolserver::users::import::seed_request(path).map_err(anyhow::Error::msg)?;
-        let rules = pmos_toolserver::users::Rules {
-            evals_slack_allowed: matches!(config.connectors, Connectors::Fake),
-            ..Default::default()
-        };
         let seeded =
             pmos_toolserver::users::MemoryUsers::seeded(req, rules, Some(stores.audit.clone()))
                 .await
-                .map_err(anyhow::Error::msg)?;
+                .map_err(anyhow::Error::msg)?
+                .with_linked(stores.linked());
         stores.users = Arc::new(seeded);
         tracing::info!("user store seeded from PMOS_USERS_SEED (development only)");
+    } else if config.database_url.is_none() {
+        stores.users = Arc::new(
+            pmos_toolserver::users::MemoryUsers::new(rules)
+                .with_audit(stores.audit.clone())
+                .with_linked(stores.linked()),
+        );
     }
-
-    let live = matches!(config.connectors, Connectors::Live(_));
-    // With live connectors only people in team.yaml may use PM OS, and a linked account must
-    // be theirs.
-    let team = Team::load(&config.content_root, live).map_err(anyhow::Error::msg)?;
+    match stores.users.directory(Utc::now()).await {
+        Ok(dir) if dir.users.is_empty() => tracing::warn!(
+            "the user database is empty: nobody can use PM OS until `pmos-admin users import` \
+             (or bootstrap-admin) runs, or a dev stack sets PMOS_USERS_SEED"
+        ),
+        Ok(dir) => tracing::info!(users = dir.users.len(), "user database loaded"),
+        Err(e) => tracing::error!(error = %e, "the user database can't be read"),
+    }
+    let people = Arc::new(pmos_toolserver::users::access::People::new(
+        stores.users.clone(),
+    ));
 
     let mut github_setup = None;
     let mut proposals = None;
@@ -123,22 +138,20 @@ async fn main() -> Result<()> {
         }
         Connectors::Live(live) => {
             let vault = Vault::new(live.vault_keys.clone(), stores.credentials.clone());
-            let oauth = Arc::new(
-                OAuth::new(
-                    OAuthConfig {
-                        public_base_url: live.public_url.clone(),
-                        atlassian: Some(live.atlassian.clone()),
-                        atlassian_site: live.atlassian_site.clone(),
-                        slack: Some(live.slack.clone()),
-                        github: live.github.as_ref().map(|g| g.app.clone()),
-                        github_org: live.github.as_ref().map(|g| g.org.clone()),
-                        state_key: state_key(config.service_token.expose()),
-                        endpoints: live.endpoints.clone(),
-                    },
-                    vault,
-                )
-                .with_team(team.clone()),
-            );
+            let oauth = Arc::new(OAuth::new(
+                OAuthConfig {
+                    public_base_url: live.public_url.clone(),
+                    atlassian: Some(live.atlassian.clone()),
+                    atlassian_site: live.atlassian_site.clone(),
+                    slack: Some(live.slack.clone()),
+                    github: live.github.as_ref().map(|g| g.app.clone()),
+                    github_org: live.github.as_ref().map(|g| g.org.clone()),
+                    state_key: state_key(config.service_token.expose()),
+                    endpoints: live.endpoints.clone(),
+                },
+                vault,
+                people.clone(),
+            ));
             let tokens: Arc<dyn TokenSource> = oauth.clone();
             tracing::info!(
                 public_url = %live.public_url,
@@ -199,7 +212,7 @@ async fn main() -> Result<()> {
     let bots = catalog.roster().bots().count();
     let svc = ToolService::new(catalog, stores, connectors)
         .map_err(anyhow::Error::msg)?
-        .with_team(team.clone())
+        .with_people(people)
         .with_ledger_expire_days(config.ledger_expire_days)
         .with_slack_draft_ttl_hours(config.slack_draft_ttl_hours)
         .with_audit_retention_days(config.audit_retention_days);
@@ -229,6 +242,7 @@ async fn main() -> Result<()> {
     }
     spawn_reconciler(svc.clone(), cancel.clone());
     spawn_draft_sweeper(svc.clone(), cancel.clone());
+    spawn_deactivation_sweeper(svc.clone(), cancel.clone());
     let mut onboarding = Onboarding::new(svc.clone(), oauth.clone(), github_setup);
     match &proposals {
         Some(p) => {
@@ -352,6 +366,25 @@ fn spawn_draft_sweeper(svc: Arc<ToolService>, cancel: CancellationToken) {
                     ),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "sweeping Slack drafts failed"),
+                },
+            }
+        }
+    });
+}
+
+/// Every 10 minutes, from start-up: people deactivated more than 24 hours ago (and not
+/// reactivated) lose their suspended linked accounts, and their held drafts are closed
+/// (`docs/user-database-spec.md` §6). With the database unavailable it does nothing.
+fn spawn_deactivation_sweeper(svc: Arc<ToolService>, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(PRUNE_EVERY);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick.tick() => match svc.sweep_deactivated(Utc::now()).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(people = n, "deactivation grace over: accounts deleted, drafts closed"),
+                    Err(e) => tracing::warn!(error = %e, "the deactivation sweeper failed"),
                 },
             }
         }
