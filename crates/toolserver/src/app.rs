@@ -33,6 +33,10 @@
 //!     sign-in events (`POST /internal/admin/events`); never sessions, grants, calls, account
 //!     linking or credentials.
 //!
+//!   The user database's read API (`app/directory.rs`) has its own allow-list per route: the
+//!   directory for the orchestrator and the Slack bot, `resolve` for `pmos-web` and the
+//!   console, the first Entra link for `pmos-web`.
+//!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
 //!   `/internal`), never in URLs, so access logs and proxies don't record them.
@@ -72,6 +76,7 @@ use pmos_contract::bots::BotScope;
 use pmos_contract::Sensitivity;
 
 mod admin;
+pub mod directory;
 
 /// What the Slack bot's token may do.
 #[derive(Clone)]
@@ -269,7 +274,9 @@ pub fn router_full(
     // The admin and auditor reads (`admin.rs`): the orchestrator and pmos-web only.
     let internal = internal
         .merge(approvals)
-        .merge(admin::routes(state.clone()));
+        .merge(admin::routes(state.clone()))
+        // The user database's read API (`directory.rs`): each route its own clients.
+        .merge(directory::routes(state.clone()));
 
     Router::new()
         // Liveness: the process answers. Readiness: its dependencies do too.

@@ -986,6 +986,19 @@ daily retention job calls; the handles `host`, `import` and `system` are reserve
 `approval_recommendations` are left to U6. A seed, like any import, needs an active admin, so
 the eval stack's seed (U3) must name one besides `evals`, `ben` and `cy`.
 
+**U2 is built** on `claude/u2-user-read-api` (`crates/toolserver/src/app/directory.rs`,
+`crates/toolserver/src/users/link.rs`, `tests/directory_routes.rs`; no migration;
+`docs/toolserver.md` "The user database's read API"). Where it differs from the text above:
+the miss limit is a rolling minute per client (at most 20 `404`s in any 60 seconds) rather
+than a refilling token bucket, so "the 21st miss in a minute" holds exactly; the first-link
+route's `404`s count against `pmos-web`'s same window; the first link takes no assertion
+(like `resolve`, there is no subject yet) and its refusals are `404 not_found`,
+`403 not_active`, `403 sign_in_unconfirmed`, `403 host_only`, `403 evals_account`,
+`409 linked`, `409 taken`; the same key again answers `200` with `first_link: false`. The
+tool server doesn't check `tid` against a configured tenant (it has none outside the host
+commands); `pmos-web` validates it (U4c). The more-than-100-misses-an-hour count is kept in
+process and logged; U5 puts it on the overview.
+
 U4a–U4d run in parallel (U4b after U3, since `remove` calls U3's deactivation). U5 and U6 can
 overlap once the routes in U5 are merged.
 
