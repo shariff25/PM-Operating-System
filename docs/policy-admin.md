@@ -2,11 +2,13 @@
 
 The web app's screens for the NVIDIA OpenShell sandbox every bot runs in (scope item c). An
 admin sees what each bot's sandbox is allowed, whether the checked-in policy files are current,
-and what a proposed change would widen or narrow, then proposes it as a GitHub pull request. The
-merge happens in GitHub, by a person. The API is `docs/web-api.md`, **Admin: policy**; the code is
-`crates/web/src/app/policy.rs` and `crates/web/src/policy_admin.rs`, with the shared proposal
-machinery in `crates/web/src/app/proposal.rs`, `crates/web/src/proposals.rs` and
-`crates/web/src/github.rs`.
+and what a proposed change would widen or narrow, then proposes it as a GitHub pull request,
+**opened with the admin's own linked GitHub account**. The merge happens in GitHub, by another
+person. The API is `docs/web-api.md`, **Admin: policy**; the routes are
+`crates/web/src/app/policy.rs` and `crates/web/src/app/proposal.rs`; the logic both servers
+share (evaluation, the change set and its re-check, the read rule) is
+`crates/policy/src/admin/`; the tool server opens the pull request in
+`crates/toolserver/src/proposals.rs`. `pmos-web` holds no GitHub token.
 
 ## What it shows
 
@@ -47,7 +49,8 @@ files.
 
 ## Validating and proposing
 
-`POST /api/admin/policy/validate` takes any part of the spec. The server:
+`POST /api/admin/policy/validate` (admins only: its diffs show the current text of the files it
+changes) takes any part of the spec. The server:
 
 1. turns it into edits of the bot, role and skill files' front matter, changing only the value
    lines it was given (`role: "…"`, `skills: "…"`, `tools: "…"`) and refusing a layout it can't
@@ -60,83 +63,164 @@ files.
    changed setting (enforcement, protocol, credential binding, Landlock, identity) `changed`;
    `wider` and `changed` are both marked `widening`.
 
-Nothing is saved. `POST /api/admin/policy/proposals` does the same again and then opens the pull
-request.
+Nothing is saved. `POST /api/admin/policy/proposals` does the same again and sends the change to
+the tool server, which opens the pull request.
 
 ### How a proposal is opened
 
-1. **Validate again.** Errors are `422 invalid`; nothing is sent anywhere.
-2. **The base:** `PMOS_WEB_GITHUB_BASE`, or the repository's default branch, at its head now.
-3. **Stale base.** Each file the pull request writes (the content files and the regenerated
-   policy files) must be on that commit exactly as the server had it when it computed the change
-   (compared by git blob id). If not, `409 stale_base` with the paths: the deployed content is
-   behind (or ahead of) the branch, and the change would be made on the wrong text. If GitHub
+`pmos-web` does the interactive part; the **tool server** decides, from nothing:
+
+1. **`pmos-web` validates** (the steps above). Errors are `422 invalid` (recorded as a refusal);
+   nothing is sent anywhere.
+2. **`pmos-web` sends the change set** to the tool server, `POST
+   /internal/admin/proposals/open?user=<admin>`, with its token and the admin's signed user
+   assertion bound to the exact body (`docs/user-assertion.md`): `{kind, title, reason,
+   base_sha, changes: [{path, text | delete, base_blob_sha}]}`, every file the pull request
+   would write (the content files, then the regenerated policy files), each with the git blob
+   id it was computed from (`null`: the file didn't exist). The tool server refuses the call
+   without that assertion **in every assertion mode, `off` included**, and refuses any other
+   client (`403`).
+3. **Who.** The assertion's subject must be the `user=` named, and an admin by the tool
+   server's own `team.yaml` (`edit-policies` for a policy proposal, `edit-content` for a content
+   one), else `403 forbidden`.
+4. **Where** (A6). The tool server's `PMOS_CONTENT_DIR` and `PMOS_POLICIES_DIR` must be separate
+   folders, neither the repository root nor inside the other: refused at start-up
+   (`PMOS_PROPOSALS=off` keeps a root content folder for onboarding only), and again on every
+   proposal (`501 not_configured`).
+5. **What, checked again** (`pmos_policy::admin::changeset::recheck`), never trusting `pmos-web`:
+   the path allow-list (content files under the content folder, and only the generated policy
+   files `policies/bots/<bot>.yaml`, `policies/bots/<bot>.sandbox.yaml`,
+   `policies/providers/<profile>.yaml`; never `.github/`, `deploy/`, code, `team.yaml`, a
+   hidden file or anything at the repository root: `400 path_not_allowed` or `bad_path`); the
+   caps (50 content files, 150 policy files, 256 KiB a file, text types, no NUL: `413` or
+   `400`); a policy proposal changes only bot, role and skill definitions; each content file's
+   `base_blob_sha` must match **the tool server's own** deployed copy (`409 stale_base`); the
+   content lint and every policy rule on the changed tree (`422 invalid` with `errors`); and the
+   policy files must be **exactly** what the tool server regenerates from the change, no more,
+   no fewer, from the same base (`422 policy_mismatch` with `paths`).
+6. **As whom.** The admin's own GitHub user token from the tool server's vault (linked like
+   Atlassian and Slack, `docs/toolserver.md`, **GitHub**). Without one: `409
+   github_not_linked`. So **the pull request's author is the admin.**
+7. **Stale base.** Each file must be on the head of `PMOS_CONTENT_BRANCH` exactly as the tool
+   server had it (by git blob id), else `409 stale_base` with `paths` and `base`. If GitHub
    truncates the file list (a very large repository), the check is skipped and the answer says
    `stale_check: "skipped"`.
-4. **Rate limit:** at most `PMOS_WEB_PROPOSALS_PER_HOUR` (default 10) per admin per hour.
-5. **Audit first.** The tool server records `admin.policy_proposal` with outcome `started`, the
-   admin, client `web` and the paths (`POST /internal/admin/proposals`, signed for the admin;
-   the tool server checks their role itself). If it can't, nothing is written to GitHub
+8. **Rate limit:** at most `PMOS_PROPOSALS_PER_HOUR` (default 10) per admin per hour, in the
+   tool server's memory (it runs as one replica; a restart forgets): `429 rate_limited` with
+   `Retry-After`.
+9. **Audit first.** The tool server records `admin.policy_proposal` `started`, with the admin,
+   client `web` and the paths (served as a count). If it can't, nothing is written to GitHub
    (`502 audit_unavailable`).
-6. **One commit** on the base (git data API: a tree with `base_tree`, then a commit with the base
-   as its only parent), **a new branch** `pmos/proposal/policy/<handle>-<time>-<random>` made by
-   the server (`POST git/refs`, which can only create a ref: the default branch is never
-   written), **the pull request**, and **the labels** `pmos-proposal` and
-   `pmos-proposal:policy`.
-7. **Audit again:** `opened` with the pull request (`github:<repo>#<n>` as the target), or
-   `failed`.
+10. **One commit** on the head (git data API: blobs, a tree with `base_tree`, a commit with the
+    head as its only parent), **a new branch** `pmos/proposal/policy/<handle>-<time>-<random>`
+    made by the tool server (`POST git/refs`, which can only create a ref: the default branch
+    is never written), **the pull request** and **the labels** `pmos-proposal` and
+    `pmos-proposal:policy`, every call with the admin's token.
+11. **Audit again:** `ok` with the pull request (`github:<repo>#<n>` as the target), or `error`.
+
+Every refusal from step 3 on is recorded as `denied`, with a fixed note (`role`, `invalid`,
+`stale base`, `policy mismatch`, `rate limited`, `github not linked`, `not configured`).
 
 The pull request's body says who proposed it (their PM OS handle, in code, so GitHub notifies
-nobody: the GitHub author is the token's identity), the reason (in a fenced block, so it can't
-format the page or mention anyone), the base branch and commit, the server's content revision
-when known, every allowance change with widenings marked **WIDER** and a reminder that network
-changes need a second platform owner's review (POL-2), and the files. The first line is a marker
-(`<!-- pmos-proposal kind=policy by=<handle> base=<sha> -->`) the proposals list reads back.
+nobody) and that it was opened with their own account, the reason (in a fenced block, so it
+can't format the page or mention anyone), the base branch and commit, the web app's content
+revision when known, every allowance change with widenings marked **WIDER** and a reminder that
+network changes need a second platform owner's review (POL-2), and the files. The first line is
+a marker (`<!-- pmos-proposal kind=policy by=<handle> base=<sha> -->`) the proposals list reads
+back.
 
 PM OS never merges, never approves, never enables auto-merge and never pushes to the default
 branch. CI's `pmos policy check` runs on the pull request like on any other.
+
+### Nobody approves their own change: a deployment requirement
+
+Because the admin is the pull request's author, **GitHub itself refuses their approval** once
+the default branch requires a review. That is what enforces POL-2 ("a second platform owner,
+never the author"), so it is a deployment requirement, not an option. On `PMOS_CONTENT_BRANCH`
+(classic branch protection or a ruleset):
+
+- **Require a pull request before merging, with at least one approving review.**
+- **Dismiss stale approvals when new commits are pushed.**
+- **Restrict who can push to the branch** (no direct pushes; nobody may bypass the rules,
+  administrators included: "Do not allow bypassing the above settings" / no bypass list).
+  Onboarding's member commits (`docs/toolserver.md`, **Members**) go straight to this branch
+  as the approving platform owner: give those platform owners a bypass for `content/team.yaml`
+  changes only through a ruleset, or approve members by pull request instead.
+- **Require status checks:** the content lint and `pmos policy check` (the `ci` workflow).
+- Optionally **require review from Code Owners**, with CODEOWNERS on `policies/**` and
+  `crates/policy/**` naming the platform owners.
+
+`GET /api/admin/policy` and `GET /api/admin/content` carry `protection: {required_reviews,
+verified}`: what the tool server could read of this with the viewing admin's own account
+(classic protection needs the GitHub App's **Administration: read** permission; rulesets are
+read with **Metadata: read**). It is best effort and never blocks anything; the front end
+warns when `verified` is `false` or `required_reviews` is `0`.
 
 ## Who may do what
 
 | Permission | Roles | Allows |
 | --- | --- | --- |
-| `view-policies` | admin, auditor | `GET /api/admin/policy`, validate, list proposals |
-| `edit-policies` | admin | open a proposal |
+| `view-policies` | admin, auditor | `GET /api/admin/policy`, list proposals |
+| `edit-policies` | admin | validate, open a proposal |
+
+Every role refusal on these routes is recorded at the tool server (`admin.policy_read`,
+`admin.policy_validate`, `admin.policy_proposals`, `admin.policy_proposal`, outcome `denied`,
+note `role`). An auditor never sees a lint message on a file they can't open
+(`generate_errors` on a PM's personal master file or restricted context say only "A finding on a
+file your role can't open.").
 
 `approve-policy-change` (POL-2: a second platform owner, never the author) stays in GitHub:
-the reviewer approves the pull request there, and branch protection on `policies/**` and
-`crates/policy/**` should require it (`policies/README.md`).
+the reviewer approves the pull request there, and branch protection makes GitHub refuse the
+author's own approval (above).
 
 ## Configuration
+
+**`pmos-web`** (it reads and validates; it holds no GitHub token):
 
 | Variable | Default | |
 | --- | --- | --- |
 | `PMOS_CONTENT_ROOT` | `content` | The deployed content tree. |
 | `PMOS_WEB_POLICIES_ROOT` | `policies` beside the content root, if it exists | The checked-in policy files. Without one, drift is `null` and allowances come from generation. |
 | `PMOS_WEB_CONTENT_REVISION` | none | The deployed content's commit, when the content root has no `.git` (a container image). |
-| `PMOS_WEB_GITHUB_REPO` | none | `owner/name`. With the token, turns proposals on; without both, proposals answer `501 not_configured` and everything else works. |
-| `PMOS_WEB_GITHUB_TOKEN` | none | See below. Never logged; `Debug` prints `<redacted>`; sent only in `Authorization` to the API base; redirects are not followed. |
-| `PMOS_WEB_GITHUB_API` | `https://api.github.com` | GitHub Enterprise, or a mock in tests. `https` unless the host is loopback. |
-| `PMOS_WEB_GITHUB_BASE` | the default branch | The branch proposals target. |
-| `PMOS_WEB_GITHUB_CONTENT_DIR`, `PMOS_WEB_GITHUB_POLICIES_DIR` | `content`, `policies` | Where those trees are in the repository. |
-| `PMOS_WEB_PROPOSALS_PER_HOUR` | `10` | Per admin, 1 to 100. |
+| `PMOS_WEB_CONTENT_DIR`, `PMOS_WEB_POLICIES_DIR` | `content`, `policies` | Where those trees are in the repository. Neither may be the repository root (set but empty is refused) nor inside the other; match the tool server's. |
 
-### The GitHub token: least privilege
+**Removed** (each refuses start-up if set, so none lingers): `PMOS_WEB_GITHUB_TOKEN`,
+`PMOS_WEB_GITHUB_REPO`, `PMOS_WEB_GITHUB_API`, `PMOS_WEB_GITHUB_BASE`,
+`PMOS_WEB_PROPOSALS_PER_HOUR`, and `PMOS_WEB_GITHUB_CONTENT_DIR` /
+`PMOS_WEB_GITHUB_POLICIES_DIR` (renamed as above). Revoke the token they used.
 
-Use a **fine-grained personal access token or a GitHub App installation token restricted to the
-one repository**, with exactly:
+**The tool server** (it opens the pull request):
 
-- **Contents: read and write** (create blobs, trees, commits and the proposal branch);
-- **Pull requests: read and write** (open and list pull requests, and label them: the labels
-  endpoint is the issues one, which GitHub documents as accepting issues or pull requests write.
-  If a GitHub version refuses it, the pull request still opens, with `labels_added: false`, and
-  the list still finds it by its branch);
-- **Metadata: read** (always granted).
+| Variable | Default | |
+| --- | --- | --- |
+| `PMOS_GITHUB_CLIENT_ID`, `PMOS_GITHUB_CLIENT_SECRET`, `PMOS_GITHUB_ORG` | none | The GitHub App each PM links (`docs/toolserver.md`, **GitHub**). |
+| `PMOS_CONTENT_REPO` | none | `org/name`: where proposals go. With it, proposals are on. |
+| `PMOS_CONTENT_BRANCH` | `main` | The base every proposal is made on and checked against. |
+| `PMOS_CONTENT_DIR`, `PMOS_POLICIES_DIR` | `content`, `policies` | Separate folders, neither the repository root (A6). |
+| `PMOS_PROPOSALS` | `on` with `PMOS_CONTENT_REPO` | `off` turns proposals off (and allows a root content folder for onboarding). |
+| `PMOS_PROPOSALS_PER_HOUR` | `10` | Per admin, 1 to 100, in memory. |
+| `PMOS_POLICIES_ROOT` | the policies folder of the checkout `PMOS_CONTENT_ROOT` is in | The checked-in policy files the re-check compares with. |
+| `PMOS_WEB_TOKEN`, `PMOS_ASSERTION_KEYS` (`web:toolserver`) | none | `pmos-web`'s token and assertion key: proposals need both. |
 
-Nothing else: no administration, workflows, actions, secrets or organization access. Protect
-the default branch (required reviews, no direct pushes, CODEOWNERS on `policies/**` and
-`crates/policy/**`) so that even this token can't bypass review. A classic token with `repo`
-scope works but reaches every repository its user can; don't.
+### The admin's GitHub account: what it needs
+
+Proposals act with the admin's own **GitHub App user token** (never an installation token, and
+never a shared one), so GitHub limits it to what that admin can already do, and GitHub's own
+rules apply to them as the author. The GitHub App (`docs/toolserver.md`, **Setting up the GitHub
+App**) needs these repository permissions:
+
+- **Contents: read and write** (blobs, trees, the commit and the proposal branch);
+- **Pull requests: read and write** (open, list and label pull requests; the labels endpoint is
+  the issues one, which GitHub accepts for a pull request with pull requests write. If refused,
+  the pull request still opens, with `labels_added: false`, and the list still finds it by its
+  branch);
+- **Metadata: read** (always granted; also reads rulesets for the protection check);
+- **Administration: read**, optional: only to read classic branch protection for the
+  `protection` field. Without it, `verified` is `false` unless a ruleset requires reviews.
+
+Each admin who proposes links GitHub (`setup` in a Slack DM, the App Home's **Accounts**) and
+needs write access to the content repository. Branch protection (above) stops that access from
+reaching the default branch without someone else's review.
 
 ## What it is not
 
@@ -148,6 +232,6 @@ scope works but reaches every repository its user can; don't.
 - **Not built:** editing the fixed parts (hosts, routes, binaries: those are code); creating or
   removing bots, roles or skills from the policy screen (use a content proposal); review status
   and CI results in the proposals list (link to the pull request); closing or updating a
-  proposal from the app (do it in GitHub); a rate limit shared across `pmos-web` processes (it is
-  in memory, per process, and a restart resets it); checking that the token has exactly the
-  scopes above (GitHub doesn't report fine-grained permissions to the token itself).
+  proposal from the app (do it in GitHub); a persisted rate limit (it is in the tool server's
+  memory, and a restart resets it); enforcing branch protection from PM OS (it is read and
+  reported, best effort; GitHub enforces it).
