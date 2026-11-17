@@ -94,6 +94,7 @@ describe('signed-out page', () => {
     ['cancelled', copy.signedOut.reasons.cancelled!],
     ['expired', copy.signedOut.reasons.expired!],
     ['unavailable', copy.signedOut.reasons.unavailable!],
+    ['wrong_account', copy.signedOut.reasons.wrong_account!],
     ['failed', copy.signedOut.failed],
     ['whatever', copy.signedOut.failed],
   ];

@@ -305,7 +305,7 @@ describe('drafts page', () => {
     expect(within(panel()).getAllByRole('link')).toHaveLength(3);
     await user.click(tab(copy.draftsPage.tabs.expired));
     expect(within(panel()).getAllByRole('link')).toHaveLength(1);
-    expect(panel()).toHaveTextContent('Reply to Dana in #migrations');
+    expect(panel()).toHaveTextContent('Direct message');
 
     // arrow keys move between the tabs and select them
     tab(copy.draftsPage.tabs.expired).focus();
@@ -324,7 +324,7 @@ describe('drafts page', () => {
     const links = within(screen.getByRole('tabpanel')).getAllByRole('link');
     const badges = links.map((l) => l.querySelector('.pill')!.textContent);
     expect(badges).toEqual(['Needs you', 'Needs you', 'Needs you', 'Expired', 'Approved']);
-    expect(links[3]).toHaveTextContent('Reply to Dana in #migrations');
+    expect(links[3]).toHaveTextContent('Direct message');
     expect(links[4]).toHaveTextContent('Weekly update');
     expect(within(screen.getByRole('tabpanel')).getByText(/\d+ h left/)).toBeInTheDocument();
   });
@@ -333,9 +333,9 @@ describe('drafts page', () => {
     const user = userEvent.setup();
     renderApp({ hash: '/drafts' });
     await screen.findByText('PRD: TCB grace period setting');
-    expect(screen.queryByText('Reply to Dana in #migrations')).not.toBeInTheDocument();
+    expect(screen.queryByText('Direct message')).not.toBeInTheDocument();
     await user.click(tab(copy.draftsPage.tabs.expired));
-    const row = screen.getByText('Reply to Dana in #migrations').closest('a')!;
+    const row = screen.getByText('Direct message').closest('a')!;
     expect(within(row).getByText('Expired')).toHaveClass('pill-expired');
     expect(within(row).queryByText('Needs you')).not.toBeInTheDocument();
   });

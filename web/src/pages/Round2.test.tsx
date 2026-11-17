@@ -158,13 +158,14 @@ describe('before and after', () => {
 });
 
 describe('the drafts table says where each draft goes', () => {
-  it('shows the kind, and the channel for Slack drafts that carry one in the title', async () => {
+  it('shows the kind, and no channel id or name for Slack drafts', async () => {
     const user = userEvent.setup();
     renderApp({ hash: '/drafts' });
     await screen.findByRole('heading', { level: 1, name: copy.draftsPage.title });
     await user.click(screen.getByRole('tab', { name: /^All/ }));
-    const rows = await screen.findAllByRole('link', { name: /Reply to Ben/ });
-    expect(rows[0]).toHaveTextContent(`${copy.home.kindLabel('slack_reply')} · #partner-pricing`);
+    const rows = await screen.findAllByRole('link', { name: /Reply in a Slack thread/ });
+    expect(rows[0]).toHaveTextContent(copy.home.kindLabel('slack_reply'));
+    expect(rows[0]!.textContent).not.toContain('#');
     const prd = screen.getByRole('link', { name: /PRD: TCB grace period/ });
     expect(prd).toHaveTextContent(copy.home.kindLabel('confluence_page'));
     expect(prd.textContent).not.toContain('#');

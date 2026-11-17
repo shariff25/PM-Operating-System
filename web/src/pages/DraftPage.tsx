@@ -2,9 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import { ApiError, REJECT_REASONS } from '../api';
 import type { Draft, HintName, RejectReason, Suggestion } from '../api';
-import { messageOf, useApp } from '../app-context';
+import { useApp } from '../app-context';
 import { ApproveDialog } from '../components/ApproveDialog';
-import { DraftPill, Empty, ErrorNote, ExtLink, Hint, Markdown, Skeleton, StrippedNote, SystemTag, kindSystem } from '../components/bits';
+import { DraftPill, Empty, ErrorNote, ExtLink, Hint, Markdown, Skeleton, StrippedNote, SystemTag, TargetLink, kindSystem } from '../components/bits';
 import { Icon } from '../components/icons';
 import { PageBar, useShell } from '../components/Shell';
 import { useToast } from '../components/Toasts';
@@ -14,7 +14,7 @@ import { diffBlocks, diffLines } from '../diff';
 import type { DiffLine, DiffPart, InlinePart } from '../diff';
 import { isExpired } from '../drafts';
 import { stripMarkers } from '../citations';
-import { isDefiniteRefusal } from '../errors';
+import { errorText, isDefiniteRefusal } from '../errors';
 import { usePoll } from '../polling';
 import { renderMarkdown } from '../markdown';
 import { longTime, relTime, timeLeft } from '../time';
@@ -294,7 +294,7 @@ export function DraftPage({ id }: { id: string }) {
       if (s && (s.status === 'working' || s.status === 'ready')) setTab('doc');
     } catch (e) {
       setLoadError(
-        e instanceof ApiError && e.code === 'not_found' ? copy.errors.notFound : messageOf(e, copy.errors.loadDraftFailed),
+        e instanceof ApiError && e.code === 'not_found' ? copy.errors.notFound : errorText(e, copy.errors.loadDraftFailed),
       );
     }
   }, [api, id, adopt, refreshMe]);
@@ -316,7 +316,7 @@ export function DraftPage({ id }: { id: string }) {
       try {
         setSuggestion(await api.getSuggestion(id));
       } catch (e) {
-        setChangeError({ text: messageOf(e, copy.errors.unknown) });
+        setChangeError({ text: errorText(e, copy.errors.unknown) });
       }
     },
     pollMs,
@@ -448,7 +448,7 @@ export function DraftPage({ id }: { id: string }) {
         err instanceof ApiError && err.code === 'change_in_progress'
           ? { text: copy.draft.changeInProgress }
           : isDefiniteRefusal(err)
-            ? { text: messageOf(err, copy.errors.unknown) }
+            ? { text: errorText(err, copy.errors.unknown) }
             : { text: `${copy.errors.unsure(copy.errors.unsureWhat.asked)} ${copy.errors.unsureNext}`, check: 'suggestion' },
       );
     } finally {
@@ -467,7 +467,7 @@ export function DraftPage({ id }: { id: string }) {
     } catch (err) {
       setChangeError(
         isDefiniteRefusal(err)
-          ? { text: messageOf(err, copy.errors.unknown) }
+          ? { text: errorText(err, copy.errors.unknown) }
           : {
               text: `${copy.errors.unsure(accept ? copy.errors.unsureWhat.accepted : copy.errors.unsureWhat.declined)} ${copy.errors.unsureNext}`,
               check: 'draft',
@@ -522,7 +522,7 @@ export function DraftPage({ id }: { id: string }) {
       void refreshMe();
       void reloadDrafts();
     } catch (err) {
-      if (!isDefiniteRefusal(err)) {
+      if (!isDefiniteRefusal(err, 'decision')) {
         // A dropped connection, a timeout, a 5xx or unknown_outcome: it is not known whether it was
         // sent. Say so, offer to look, and do not offer a blind second try.
         setConfirming(false);
@@ -533,18 +533,35 @@ export function DraftPage({ id }: { id: string }) {
         const known: ApproveErrorKey[] = ['needs_external_confirm', 'audience_blocked', 'expired', 'not_pending', 'stale'];
         const key = known.find((k) => k === err.code) ?? 'other';
         if (key === 'needs_external_confirm') setForceExternal(true);
-        if (key === 'expired' || key === 'not_pending' || key === 'stale') {
-          // The draft changed under us: show what is really there, and read it again.
+        if (key === 'expired' || key === 'not_pending' || key === 'stale' || key === 'needs_external_confirm' || key === 'audience_blocked') {
+          // The draft changed under us (or the server has now looked at the channel): show what is
+          // really there, and read it again. A decided draft shows as decided.
           try {
-            adopt(await api.getDraft(id));
-            setSuggestion(await api.getSuggestion(id));
+            const fresh = await api.getDraft(id);
+            if (key === 'needs_external_confirm' || key === 'audience_blocked') {
+              // Only the facts the server has just learned: nothing the PM may be typing is touched.
+              setDraft((d) => (d ? { ...d, audience: fresh.audience, external: fresh.external, restricted_sources: fresh.restricted_sources } : fresh));
+            } else {
+              adopt(fresh);
+              setSuggestion(await api.getSuggestion(id));
+              if (key === 'not_pending' && fresh.status !== 'pending') {
+                // Decided somewhere else, perhaps in Slack: show where it stands, not an error.
+                setConfirming(false);
+                setApproveError(null);
+                setJustApproved(false);
+                toast(copy.approve.decidedElsewhere);
+                void reloadDrafts();
+                void refreshMe();
+                return;
+              }
+            }
           } catch {
             /* keep what we have */
           }
         }
         if (key === 'stale') setConfirming(false);
         if (isPhone) setTab('doc');
-        setApproveError({ key, message: key === 'stale' ? '' : err.message });
+        setApproveError({ key, message: key === 'other' ? errorText(err, copy.errors.unknown) : '' });
       }
     } finally {
       setApproving(false);
@@ -579,9 +596,18 @@ export function DraftPage({ id }: { id: string }) {
       toast(copy.toast.rejected);
       void reloadDrafts();
     } catch (err) {
+      if (err instanceof ApiError && (err.code === 'not_pending' || err.code === 'expired')) {
+        // Decided somewhere else (perhaps in Slack): show where it stands.
+        const d = await checkNow();
+        if (d && d.status !== 'pending') {
+          setRejecting(false);
+          toast(copy.approve.decidedElsewhere);
+          return;
+        }
+      }
       setRejectError(
-        isDefiniteRefusal(err)
-          ? { text: messageOf(err, copy.errors.unknown), unsure: false }
+        isDefiniteRefusal(err, 'decision')
+          ? { text: errorText(err, copy.errors.unknown), unsure: false }
           : { text: `${copy.errors.unsure(copy.errors.unsureWhat.rejected)} ${copy.errors.unsureNext}`, unsure: true },
       );
     }
@@ -601,7 +627,7 @@ export function DraftPage({ id }: { id: string }) {
       void reloadDrafts();
       navigate('/');
     } catch (err) {
-      setDeleteError(messageOf(err, copy.errors.unknown));
+      setDeleteError(errorText(err, copy.errors.unknown));
     }
   };
 
@@ -918,7 +944,9 @@ export function DraftPage({ id }: { id: string }) {
             ? { tone: 'warn', text: copy.draft.checklist.noneCited }
             : null;
   if (linkCheck) checks.push(linkCheck);
+  if (draft.restricted_sources) checks.push({ tone: 'warn', text: copy.approve.restricted });
   checks.push(showExternal ? { tone: 'warn', text: copy.draft.checklist.external } : { tone: 'ok', text: copy.draft.checklist.internal });
+  if (draft.audience?.members != null) checks.push({ tone: 'info', text: copy.approve.audienceVisible(draft.audience.members) });
   if (unresolved) checks.push({ tone: 'warn', text: copy.draft.checklist.suggestion });
   if (editing || dirty) checks.push({ tone: 'warn', text: copy.draft.checklist.unsaved });
   if (rendered.stripped.length > 0) checks.push({ tone: 'warn', text: copy.draft.checklist.stripped(rendered.stripped.length) });
@@ -941,11 +969,17 @@ export function DraftPage({ id }: { id: string }) {
         <dt>{copy.panel.kind}</dt>
         <dd>{copy.home.kindLabel(draft.kind)}</dd>
         <dt>{copy.panel.target}</dt>
-        <dd>{draft.target.label}</dd>
+        <dd>{draft.target.label} <TargetLink target={draft.target} /></dd>
         <dt>{copy.panel.bot}</dt>
         <dd><code className="mono-id">{draft.bot}</code></dd>
         <dt>{copy.panel.created}</dt>
         <dd>{longTime(draft.created_at)} <span className="muted">· {relTime(draft.created_at)}</span></dd>
+        {draft.edited_at && (
+          <>
+            <dt>{copy.panel.editedAt}</dt>
+            <dd>{longTime(draft.edited_at)} <span className="muted">· {relTime(draft.edited_at)}</span></dd>
+          </>
+        )}
         <dt>{copy.panel.expires}</dt>
         <dd>{draft.expires_at ? <>{longTime(draft.expires_at)}{left && <span className="muted"> · {left}</span>}</> : copy.panel.never}</dd>
         <dt>{copy.panel.task}</dt>
@@ -964,10 +998,14 @@ export function DraftPage({ id }: { id: string }) {
     <div className="doc-meta">
       <SystemTag system={kindSystem(draft.kind)} label={copy.home.kindLabel(draft.kind)} />
       <span className="doc-target">{draft.target.label}</span>
+      <TargetLink target={draft.target} />
       {!draft.practice && <span className="doc-who">{copy.draft.publishedAs(me.name)}</span>}
       {draft.external && <span className="tag tag-warn">{copy.panel.external}</span>}
       {left && <span className="doc-left"><Icon name="clock" size={14} />{left}</span>}
-      {draft.edited && <span className="doc-edited">{copy.panel.edited}</span>}
+      {draft.edited && (
+        <span className="doc-edited">{draft.edited_at ? copy.draft.editedWhen(relTime(draft.edited_at)) : copy.panel.edited}</span>
+      )}
+      {draft.restricted_sources && <span className="tag tag-warn">{copy.approve.restricted}</span>}
     </div>
   );
 
@@ -994,7 +1032,10 @@ export function DraftPage({ id }: { id: string }) {
             rows={18}
           />
           <div className="editor-foot">
-            <p className="muted small">{copy.draft.editingNote}</p>
+            <p className="muted small">
+              {copy.draft.editingNote}
+              {!draft.practice && <> {copy.draft.editSavedNote}</>}
+            </p>
             <div className="editor-buttons">
               <button type="button" className="btn btn-ghost" onClick={discard}>
                 {copy.draft.discard}
@@ -1159,6 +1200,7 @@ export function DraftPage({ id }: { id: string }) {
         approving={approving}
         confirmLabel={confirmLabel}
         note={approveNote}
+        blocked={approveError?.key === 'audience_blocked'}
         onConfirm={() => void approve()}
         onCancel={() => setConfirming(false)}
       />

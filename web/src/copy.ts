@@ -2,7 +2,7 @@
 // Tone: light and gently funny in greetings, empty states and hints. Errors, approvals and
 // anything about security are plain.
 
-import type { DraftKind, DraftStatus, HintName, RejectReason } from './api/types';
+import type { DraftKind, DraftStatus, HintName, RejectReason, ServerErrorCode } from './api/types';
 
 /**
  * What approving means for each kind of draft, in one place: the button, the hint, the dialog,
@@ -160,6 +160,8 @@ export const copy = {
       cancelled: 'Sign-in was cancelled.',
       expired: 'That sign-in expired. Try again.',
       unavailable: "Microsoft sign-in isn't answering. Try again in a minute.",
+      wrong_account:
+        "That Microsoft account isn't the one on the team list. Sign in with your own work account, or ask a platform owner.",
     } as Record<string, string>,
     failed: "Sign-in didn't work. Try again.",
   },
@@ -235,6 +237,12 @@ export const copy = {
     save: 'Save',
     formattedLabel: 'Formatted draft',
     editingNote: 'Editing. Save to see the formatted text again.',
+    editSavedNote: 'Your edit is saved on the draft, so approving in Slack sends it too.',
+    editedWhen: (when: string) => `Edited ${when}`,
+    openTarget: (system: string) => {
+      const s = system.toLowerCase();
+      return s === 'slack' ? 'Open in Slack' : s === 'jira' ? 'Open in Jira' : s === 'confluence' ? 'Open in Confluence' : 'Open';
+    },
     saving: 'Saving…',
     saved: 'Saved',
     unsaved: 'Unsaved changes',
@@ -327,6 +335,19 @@ export const copy = {
     confirmText: (kind: DraftKind, where: string, who: string) => APPROVE_WORDS[kind].confirmText(where, who),
     confirmNothing: (kind: DraftKind) => APPROVE_WORDS[kind].nothingYet,
     confirmPractice: 'This is a practice draft. Confirming creates nothing anywhere.',
+    restricted: 'Built from restricted sources',
+    restrictedNote: 'Check that everyone who can see where this goes is meant to read it.',
+    /** Slack only: who will see it. The numbers are filled in once I have checked the channel. */
+    audienceHeading: 'Who will see it',
+    audienceVisible: (n: number) => `Visible to ${n} ${n === 1 ? 'person' : 'people'}`,
+    audienceExternal: 'External channel, shared outside the company',
+    audienceInternal: 'Not shared outside the company',
+    audienceUnchecked: 'I check who can see the channel when you confirm.',
+    /** What the target will carry so readers can tell PM OS helped. */
+    markerHeading: 'Marked as',
+    markerSlack: (marker: string) => `Posts as you, marked “${marker}”`,
+    markerPage: (marker: string) => `Ends with “${marker}”`,
+    decidedElsewhere: 'This draft was already decided, perhaps in Slack, so nothing more was sent. Here is where it stands.',
     externalWarning: 'This channel is shared outside the company. People at other companies will read this.',
     externalCheckbox: 'I understand, and I want to post it there.',
     confirm: (kind: DraftKind) => APPROVE_WORDS[kind].confirmButton,
@@ -356,7 +377,7 @@ export const copy = {
       },
       // Only for a definite refusal (a 4xx the server meant): then it is known nothing was sent.
       other: {
-        text: 'The server refused the approval, so nothing was sent.',
+        text: 'This was refused, so nothing was sent.',
         next: 'Try again.',
       },
       // A dropped connection, a timeout, a 5xx or unknown_outcome: whether it was sent is not known.
@@ -495,9 +516,9 @@ export const copy = {
     },
     briefReady: 'Your daily brief is in',
     /** No brief has ever run. Briefs come on weekday mornings, at the time the PM sets in Slack. */
-    briefNever: "Your first brief hasn't arrived yet. It comes on weekday mornings, at the time you set in Slack.",
-    briefStale: (when: string) => `Your last brief was ${when}.`,
-    briefNeverCard: 'Nothing here yet. This fills in when your first brief arrives.',
+    briefNever: 'No brief yet. Want a morning brief? Say "brief me at 8" to the bot in Slack.',
+    briefStale: (when: string) => `No brief yet today. Your last one was ${when}.`,
+    briefNeverCard: 'Nothing here yet. Say "brief me at 8" to the bot in Slack, and this fills in.',
     briefNeverSub: 'No brief yet',
     briefStaleCard: 'Nothing in your last brief.',
     composerLabel: 'Ask PM OS',
@@ -606,6 +627,7 @@ export const copy = {
     doc: 'Draft',
     unchanged: (n: number) => `${n} unchanged ${n === 1 ? 'paragraph' : 'paragraphs'}`,
     edited: 'Edited by you',
+    editedAt: 'Last edited',
     external: 'Shared outside the company',
     sources: 'Sources',
     ask: 'Ask for a change',
@@ -824,6 +846,46 @@ export const copy = {
     checkAgain: 'Check again',
     retry: 'Try again',
     signedOut: 'You were signed out. Sign in again to continue.',
+    /**
+     * One plain sentence per code in docs/web-api.md. "Nothing changed" (or "Nothing was sent") is
+     * said only where the table's "Nothing changed?" column says Yes. `upstream_unavailable` is
+     * Yes for a decision on a draft only, so it says that and no more. `unknown_outcome` says it is
+     * not known. A test reads the table and fails if a code is missing here.
+     */
+    codes: {
+      bad_request: "That request wasn't in a shape I could use. Nothing changed.",
+      signed_out: 'You were signed out. Sign in again to continue. Nothing changed.',
+      bad_token: 'The brief feed used a token I do not accept. Nothing changed.',
+      bad_origin: 'That request did not come from this app, so I refused it. Nothing changed. Reload the page and try again.',
+      bad_csrf: 'This page was out of date, so I refused the request. Nothing changed. Reload the page and try again.',
+      not_a_member: "You're not on the team list, so I can't do that. Nothing changed. Ask a platform owner to add you.",
+      not_allowed: "Your role doesn't allow that. Nothing changed.",
+      forbidden: "Your role doesn't allow that. Nothing changed.",
+      not_found: 'I could not find that, or it is not yours. Nothing changed.',
+      method_not_allowed: "That isn't something this page can do. Nothing changed.",
+      not_pending: 'This draft was already decided, perhaps in Slack. Nothing more was sent.',
+      stale: 'This draft changed after you opened it, so nothing was sent.',
+      expired: 'This Slack draft passed its 24 hours, so nothing was sent.',
+      needs_external_confirm: 'This channel is shared outside the company, so I need your explicit yes. Nothing was sent.',
+      audience_blocked:
+        'This was built from restricted sources, and people outside the product team can see that channel. Nothing was sent. Rejecting is all that is left.',
+      not_approvable: "The tool server won't approve this draft as it stands. Nothing was sent.",
+      change_in_progress: 'I am still writing the last change to this draft. Wait for it to finish, then ask again.',
+      no_suggestion: 'There is no suggested change ready to accept. Nothing changed.',
+      not_practice: 'Only the practice draft can be deleted. Nothing changed.',
+      task_refused: "I can't take that request yet: you may not be set up, or have no bot. Nothing was started.",
+      bad_content_type: "That request wasn't sent the way I need it. Nothing changed.",
+      bad_edit: "That text isn't valid for where this draft goes, so nothing was saved or sent.",
+      bad_brief: 'The brief feed sent something I could not read. Nothing was stored.',
+      not_built: "The daily brief isn't switched on here yet.",
+      upstream_unavailable:
+        "I couldn't get an answer from the service behind this. If you were deciding a draft, nothing was sent. If you were asking for something, check Activity before you ask again.",
+      unknown_outcome:
+        "I can't tell whether this went through. Check where the draft stands before you try again, so it is not done twice.",
+      audience_unavailable: "Slack couldn't tell me who is in that channel, so nothing was sent. Try again in a minute.",
+      unavailable: 'Something PM OS relies on is not answering. Nothing changed. Try again in a minute.',
+      team_unavailable: "I can't read the team list right now. Nothing changed. Try again in a minute.",
+    } satisfies Record<ServerErrorCode, string>,
     loadDraftFailed: 'I could not open that draft.',
     notFound: 'That draft does not exist, or it is not yours.',
     loadHomeFailed: 'I could not load your drafts.',
