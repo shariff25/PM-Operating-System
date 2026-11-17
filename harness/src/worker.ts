@@ -141,6 +141,13 @@ export function botSystemPrompt(claim: Claim, now: Date = new Date()): string {
         "The messages before the last one are this conversation's earlier turns, oldest first; " +
         "the last message is the new request. A short reply is an answer to your last question.",
     );
+    if (claim.history_sensitivity === "restricted") {
+      parts.push(
+        "Earlier answers in this conversation drew on restricted sources. Treat them as " +
+          "restricted: PM OS blocks a Slack draft built on them in a channel with anyone " +
+          "outside the product team, so say so instead of drafting one there.",
+      );
+    }
   }
   return parts.filter(Boolean).join("\n\n");
 }

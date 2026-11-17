@@ -26,6 +26,10 @@ use crate::store::{StoreError, StoreResult};
 
 /// How long a grant stays valid after the PM approves.
 pub const GRANT_TTL_MINUTES: i64 = 15;
+/// The most items one listing of a PM's approvals returns (`GET /internal/approvals`): the
+/// newest. Every caller shows a PM's inbox and recent history, which is far below this; an
+/// older item is still read by its id.
+pub const LIST_LIMIT: usize = 200;
 
 /// The Slack drafts that expire and lose their text after `PMOS_SLACK_DRAFT_TTL_HOURS`
 /// (`docs/slack-reply-spec.md` §3).
@@ -356,6 +360,8 @@ pub trait ApprovalRepo: Send + Sync {
     async fn get(&self, id: &str) -> StoreResult<Option<ApprovalItem>>;
 
     /// Items for one user, newest first, optionally filtered by status.
+    /// `user`'s items, optionally only those with `status`: newest first (ties by id), at
+    /// most [`LIST_LIMIT`].
     async fn list(&self, user: &str, status: Option<Status>) -> StoreResult<Vec<ApprovalItem>>;
 
     /// Record a decision with no reason. See [`ApprovalRepo::decide_with`].
@@ -548,7 +554,12 @@ impl ApprovalRepo for MemoryApprovals {
             .filter(|i| i.user == user && status.is_none_or(|s| i.status == s))
             .cloned()
             .collect();
-        items.sort_by_key(|item| std::cmp::Reverse(item.created_at));
+        items.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        items.truncate(LIST_LIMIT);
         Ok(items)
     }
 

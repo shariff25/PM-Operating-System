@@ -28,6 +28,9 @@
 # Optional:
 #   PMOS_TEST_HANDLE      your PM OS handle in the test (default: tester)
 #   PMOS_TEST_STATE       where state and logs go (default: state/claude-test)
+#   PMOS_TEST_SKIP_SLACK_PREFLIGHT=1
+#                         skip the Slack app check at start (both tokens valid and from the
+#                         same app, the bot scopes the manifest lists); for offline runs only
 #   PMOS_DOCS_BASE_URL    your public docs site for the Docs bot, e.g. https://docs.example.com
 #                         (also PMOS_DOCS_NAME, PMOS_DOCS_PAGE_PREFIXES, PMOS_DOCS_API_PREFIX and
 #                         PMOS_DOCS_PRODUCTS; see docs/docs-server.md). Unset: the Docs bot
@@ -60,6 +63,75 @@ else
   MODEL_DESC="Claude (config/gateway.claude-test.yaml)"
 fi
 HANDLE="${PMOS_TEST_HANDLE:-tester}"
+
+# --- Slack app preflight -------------------------------------------------------------------
+# Before anything starts: both tokens are valid and belong to the same Slack app, and the bot
+# token has every bot scope docs/slack-app-manifest.yaml asks for. Tokens go to curl through a
+# here-file, never on a command line, and nothing printed here contains one (`mask` blanks
+# anything token-shaped all the same). PMOS_TEST_SKIP_SLACK_PREFLIGHT=1 skips it (offline).
+# CI never runs this script, so it never calls Slack.
+SLACK_BOT_SCOPES="commands app_mentions:read chat:write chat:write.customize im:history im:write users:read users:read.email"
+mask() { sed -E 's/xox[a-z]-[A-Za-z0-9-]+/xox?-****/g; s/xapp-[A-Za-z0-9-]+/xapp-****/g'; }
+preflight_fail() { printf 'Slack preflight: %s\n' "$*" | mask >&2; exit 1; }
+slack_call() { # token method [query] -> headers and body in $SLACK_HEADERS and $SLACK_BODY
+  local token=$1 method=$2 query=${3:-} headers
+  headers=$(mktemp)
+  SLACK_BODY=$(curl -sS -m 15 -D "$headers" -X POST "https://slack.com/api/$method${query:+?$query}" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$token") 2>/dev/null) || {
+    rm -f "$headers"
+    preflight_fail "couldn't reach slack.com for $method (network or proxy). Set PMOS_TEST_SKIP_SLACK_PREFLIGHT=1 to skip this check."
+  }
+  SLACK_HEADERS=$(cat "$headers")
+  rm -f "$headers"
+}
+json_field() { # name -> the string or bare value of "name" in $SLACK_BODY
+  printf '%s' "$SLACK_BODY" | grep -oE "\"$1\":(\"[^\"]*\"|[a-z]+)" | head -1 | cut -d: -f2- | tr -d '"'
+}
+slack_preflight() {
+  case "$PMOS_SLACK_BOT_TOKEN" in
+    xoxb-*) ;;
+    *) preflight_fail "PMOS_SLACK_BOT_TOKEN isn't a bot token (it should start with xoxb-): copy the Bot User OAuth Token from OAuth & Permissions." ;;
+  esac
+  case "$PMOS_SLACK_APP_TOKEN" in
+    xapp-*) ;;
+    *) preflight_fail "PMOS_SLACK_APP_TOKEN isn't an app-level token (it should start with xapp-): Basic Information → App-Level Tokens, scope connections:write." ;;
+  esac
+  slack_call "$PMOS_SLACK_BOT_TOKEN" auth.test
+  [ "$(json_field ok)" = true ] ||
+    preflight_fail "the bot token was refused ($(json_field error)): reinstall the app and copy the Bot User OAuth Token again."
+  local team bot_id granted missing=() s
+  team=$(json_field team_id)
+  bot_id=$(json_field bot_id)
+  granted=$(printf '%s\n' "$SLACK_HEADERS" | tr -d '\r' | grep -i '^x-oauth-scopes:' | cut -d: -f2- | tr -d ' ')
+  for s in $SLACK_BOT_SCOPES; do
+    [[ ",$granted," == *",$s,"* ]] || missing+=("$s")
+  done
+  [ ${#missing[@]} -eq 0 ] ||
+    preflight_fail "the bot token lacks these scopes: ${missing[*]}. Paste docs/slack-app-manifest.yaml over the app's manifest and reinstall it."
+  slack_call "$PMOS_SLACK_APP_TOKEN" apps.connections.open
+  [ "$(json_field ok)" = true ] ||
+    preflight_fail "the app-level token was refused ($(json_field error)): generate one with the connections:write scope under Basic Information → App-Level Tokens, and turn Socket Mode on."
+  # The app id is the second part of an app-level token (xapp-1-A0123…-…); the bot token's
+  # app comes from bots.info. Both must be the same app.
+  local app_of_app app_of_bot
+  app_of_app=$(printf '%s' "$PMOS_SLACK_APP_TOKEN" | cut -d- -f3)
+  slack_call "$PMOS_SLACK_BOT_TOKEN" bots.info "bot=$bot_id"
+  app_of_bot=$(json_field app_id)
+  if [ -z "$app_of_bot" ] || [ -z "$app_of_app" ]; then
+    preflight_fail "couldn't tell which app the tokens belong to ($(json_field error)); check both come from the same app's pages."
+  fi
+  [ "$app_of_app" = "$app_of_bot" ] ||
+    preflight_fail "the two tokens are from different Slack apps ($app_of_app and $app_of_bot): take both from the same app."
+  echo "== Slack preflight: both tokens are app $app_of_bot in workspace $team; bot scopes ok"
+  echo "   warning: Slack has no API to check the App Home's Messages tab. If DMs to the app say"
+  echo "   \"Sending messages to this app has been turned off\", turn on App Home → Show Tabs →"
+  echo "   Messages Tab and \"Allow users to send Slash commands and messages from the messages tab\"."
+}
+if [ "${PMOS_TEST_SKIP_SLACK_PREFLIGHT:-}" = 1 ]; then
+  echo "== Slack preflight skipped (PMOS_TEST_SKIP_SLACK_PREFLIGHT=1)"
+else
+  slack_preflight
+fi
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"

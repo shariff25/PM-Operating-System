@@ -694,6 +694,73 @@ async fn bot_sessions_over_http() {
     s.cancel.cancel();
 }
 
+/// A follow-up's session starts at the level its history was built from, and the runtime
+/// reads a run's level back, with the service token only (W6).
+#[tokio::test]
+async fn a_session_starts_at_its_historys_level_over_http() {
+    let s = start(fixture()).await;
+    let get = |token: &'static str, path: String| {
+        let base = s.base.clone();
+        async move {
+            reqwest::Client::new()
+                .get(format!("{base}{path}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let res = post(
+        &s.base,
+        SERVICE_TOKEN,
+        "/internal/sessions",
+        json!({"user": "ana", "bot": "scout", "run_id": "tsk_follow", "history_sensitivity": "restricted"}),
+    )
+    .await;
+    assert_eq!(res.status(), 201);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["session"]["sources_sensitivity"], "restricted");
+    // A level that isn't one is refused, not read as public.
+    let res = post(
+        &s.base,
+        SERVICE_TOKEN,
+        "/internal/sessions",
+        json!({"user": "ana", "bot": "scout", "run_id": "r", "history_sensitivity": "secret"}),
+    )
+    .await;
+    assert!(res.status().is_client_error(), "{}", res.status());
+    // Without one: public, as before.
+    let res = post(
+        &s.base,
+        SERVICE_TOKEN,
+        "/internal/sessions",
+        json!({"user": "ana", "bot": "scout", "run_id": "tsk_fresh"}),
+    )
+    .await;
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["session"]["sources_sensitivity"], "public");
+
+    let res = get(
+        SERVICE_TOKEN,
+        "/internal/runs/tsk_follow/sensitivity".into(),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({"run_id": "tsk_follow", "sensitivity": "restricted"})
+    );
+    let res = get(SERVICE_TOKEN, "/internal/runs/tsk_none/sensitivity".into()).await;
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["sensitivity"], Value::Null);
+    for token in [BOT_TOKEN, CONSOLE_TOKEN] {
+        let res = get(token, "/internal/runs/tsk_follow/sensitivity".into()).await;
+        assert_eq!(res.status(), 403);
+    }
+    s.cancel.cancel();
+}
+
 #[tokio::test]
 async fn mcp_lists_and_calls_only_what_the_bot_may() {
     let s = start(fixture()).await;

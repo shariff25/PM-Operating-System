@@ -67,6 +67,13 @@ services:
       PMOS_DEV: "1"
       PMOS_BOTS_BIND: 0.0.0.0:8750
       PMOS_BOTS_TOKENS: evals=${PMOS_EVAL_RT_EVALS:?},console=${PMOS_EVAL_RT_CONSOLE:?},worker-docs=${PMOS_EVAL_RT_DOCS:?},worker-pm-evals=${PMOS_EVAL_RT_PERSONAL:?}
+      # The `console` token here is only the benchmark runner's trace reader (PMOS_EVALS_TRACE_TOKEN):
+      # no console runs, nothing names a real PM, and the stack holds fake data in memory with
+      # fresh tokens per run on its own network. So user assertions stay off, with the
+      # development override the runtime requires for that (docs/user-assertion.md, Modes).
+      # Never copy these two lines to deploy/compose.yaml.
+      PMOS_ASSERTION_MODE: "off"
+      PMOS_ASSERTION_INSECURE_OFF: "1"
       # The only handle the `evals` client may request tasks as: the benchmark member that
       # pmos-admin adds to this stack's content.
       PMOS_EVALS_AS: evals

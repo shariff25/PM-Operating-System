@@ -1839,6 +1839,7 @@ dependencies = [
 name = "pmos-runtime"
 version = "0.1.0"
 dependencies = [
+ "sha2 0.10.9",
  "subtle",
  "tokio",
 ]
@@ -1882,6 +1883,7 @@ dependencies = [
  "chrono",
  "hmac 0.12.1",
  "pmos-assertion",
+ "pmos-bots",
  "pmos-contract",
  "pmos-docs",
  "pmos-policy",

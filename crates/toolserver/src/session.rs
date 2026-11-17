@@ -83,6 +83,10 @@ pub trait SessionRepo: Send + Sync {
     /// Record that the session read data of class `read`: its `sources_sensitivity` becomes
     /// `read` if that is higher, and never goes down.
     async fn raise_sensitivity(&self, token: &str, read: Sensitivity) -> StoreResult<()>;
+    /// The highest `sources_sensitivity` among the sessions of run `run_id` still stored
+    /// (live, or expired but not yet purged), or `None` if there are none. A task claimed
+    /// more than once has a session per claim.
+    async fn run_sensitivity(&self, run_id: &str) -> StoreResult<Option<Sensitivity>>;
 }
 
 #[derive(Default)]
@@ -118,6 +122,17 @@ impl SessionRepo for MemorySessions {
             s.sources_sensitivity = s.sources_sensitivity.max(read);
         }
         Ok(())
+    }
+
+    async fn run_sensitivity(&self, run_id: &str) -> StoreResult<Option<Sensitivity>> {
+        Ok(self
+            .sessions
+            .lock()
+            .expect("session lock")
+            .values()
+            .filter(|s| s.run_id == run_id)
+            .map(|s| s.sources_sensitivity)
+            .max())
     }
 }
 

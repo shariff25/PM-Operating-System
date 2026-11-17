@@ -157,7 +157,12 @@ server's own `console` token (`PMOS_CONSOLE_TS_TOKEN` there), which may read app
 (`GET /internal/approvals`, `GET /internal/approvals/{id}`) and nothing else. With assertion
 keys, a call that names a person (`requested_by=`,
 `owner=`, `user=`) carries an assertion for that person, and a routine `PATCH` or `DELETE` one
-for the viewer who pressed the button; reads of everything carry none.
+for the viewer who pressed the button. A task page's three reads (the task, its events, its
+trace) carry one for the viewer: under `require` the runtime answers them only for the task's
+PM or an admin in its `team.yaml`. Reads of everything (bots, the task list, routines) carry
+none. Every route but `GET /healthz` needs the proxy secret when the console trusts the proxy,
+whatever the method; a state-changing form needs `Origin` or `Referer` from the console's
+own origin, and one with neither is refused.
 Each call times out after 10 seconds. If an upstream is down, the screen says which one, with
 `502`. On a task page, a missing events list, trace or audit file only blanks that section.
 
