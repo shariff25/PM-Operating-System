@@ -14,6 +14,11 @@
 #   pmos-admin audit purge --dry-run  how many audit events the next daily purge deletes
 #   pmos-admin revoke <handle> <atlassian|slack|github>
 #                                     remove a PM's linked account and its tokens
+#   pmos-admin users <command> …      the user database, on the host (docs/runbooks/users.md):
+#                                     bootstrap-admin, grant-admin, revoke-admin, set-entra,
+#                                     unset-entra, set-sign-in-name, set-atlassian-email,
+#                                     deactivate, reactivate, pilot-exception, import, export,
+#                                     list; each records the OS user who ran it
 #   pmos-admin ledger [--since 7d] [--export]
 #                                     what happened to the bots' drafts (feedback ledger)
 #   pmos-admin add-bot <bot>          give a new bot its own runtime and gateway tokens
@@ -365,6 +370,58 @@ case "$cmd" in
   revoke)
     [ $# -eq 2 ] || { say "usage: pmos-admin revoke <handle> <atlassian|slack|github>" >&2; exit 2; }
     internal DELETE "/internal/credentials/$1/$2" && say "revoked $2 for $1"
+    ;;
+
+  users)
+    # The user database's host commands (docs/runbooks/users.md): `pmos-toolserver users …` in a
+    # one-off tool server container, with the database's own access. The OS user who ran it is
+    # passed as PMOS_HOST_USER and recorded with every change; the tool server refuses to run
+    # without it. A one-off container starts no service, so this needs no assertion check
+    # (that is for `up`, `add-bot` and `restore`), and break glass works whatever the mode.
+    users_usage() {
+      say "usage: pmos-admin users <bootstrap-admin|grant-admin|revoke-admin|set-entra|unset-entra|set-sign-in-name|set-atlassian-email|deactivate|reactivate|pilot-exception|import|export|list> …" >&2
+      exit 2
+    }
+    [ $# -ge 1 ] || users_usage
+    case "$1" in
+      bootstrap-admin | grant-admin | revoke-admin | set-entra | unset-entra | set-sign-in-name | \
+        set-atlassian-email | deactivate | reactivate | pilot-exception | import | export | list) ;;
+      *) users_usage ;;
+    esac
+    host_user=${SUDO_USER:-$(id -un)}
+    if ! [[ "$host_user" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; then
+      say "the OS user \"$host_user\" can't be recorded (it must match ^[a-z_][a-z0-9_.-]{0,31}\$): run this as a named user" >&2
+      exit 2
+    fi
+    run=(run --rm --no-deps -e "PMOS_HOST_USER=$host_user")
+    # --oid needs the tenant: the web app's.
+    if [ -n "${PMOS_WEB_ENTRA_TENANT_ID:-}" ]; then
+      run+=(-e "PMOS_ENTRA_TENANT_ID=$PMOS_WEB_ENTRA_TENANT_ID")
+    fi
+    # A terminal only when there is one (`import --allow-admins` asks on it; `export > f` has none).
+    if ! [ -t 0 ] || ! [ -t 1 ]; then run+=(-T); fi
+    if [ "$1" = import ]; then
+      # The file the operator names, normally the content checkout at a reviewed commit, is
+      # mounted read-only into the one-off container; never a URL.
+      shift
+      from=""
+      args=(import)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --from) [ $# -ge 2 ] || users_usage; from=$2; shift 2 ;;
+          *) args+=("$1"); shift ;;
+        esac
+      done
+      [ -n "$from" ] || { say "usage: pmos-admin users import --from <team.yaml> [--commit <sha>] [--allow-admins | --bootstrap] [--apply]" >&2; exit 2; }
+      [ -f "$from" ] || { say "no file $from" >&2; exit 2; }
+      from="$(cd "$(dirname "$from")" && pwd)/$(basename "$from")"
+      case "$from" in *:*) say "the path to import can't contain ':'" >&2; exit 2 ;; esac
+      run+=(-v "$from:/run/pmos-import/team.yaml:ro")
+      args+=(--from /run/pmos-import/team.yaml)
+    else
+      args=("$@")
+    fi
+    compose "${run[@]}" toolserver pmos-toolserver users "${args[@]}"
     ;;
 
   ledger)

@@ -16,6 +16,7 @@ commands.
 | [quality.md](quality.md) | For each bot's quality owner: the triage digest, trace reviews, case cards, judges and the eval gate |
 | [model-swap.md](model-swap.md) | Changing which model serves a role (D11) |
 | [bots-and-members.md](bots-and-members.md) | A new member's bot, pausing a bot, revoking someone's tokens |
+| [users.md](users.md) | The user database on the host: the first admin, importing `team.yaml`, the pilot exception, break glass |
 | [incidents.md](incidents.md) | Something went wrong: a bot misbehaves, a token leaks, a service won't start |
 
 ## The pieces

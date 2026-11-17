@@ -89,6 +89,7 @@ impl Backend {
                 credentials: Arc::new(MemoryCredentials::default()),
                 memory_repos: Arc::new(MemoryRepos::default()),
                 member_requests: Arc::new(MemoryRequests::default()),
+                users: Arc::new(pmos_toolserver::users::MemoryUsers::default()),
             },
             memory_audit: Some(audit),
             pg: None,

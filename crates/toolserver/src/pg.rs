@@ -66,6 +66,8 @@ impl From<sqlx::migrate::MigrateError> for StoreError {
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
+    /// What the user store plans with (`users/pg.rs`).
+    users_rules: crate::users::Rules,
 }
 
 impl PgStore {
@@ -75,11 +77,25 @@ impl PgStore {
             .acquire_timeout(StdDuration::from_secs(5))
             .connect(url)
             .await?;
-        Ok(Self { pool })
+        Ok(Self::from_pool(pool))
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            users_rules: crate::users::Rules::default(),
+        }
+    }
+
+    /// The deactivation cap for the web and Slack clients (`users::Rules`); 1 to 10.
+    pub fn with_deactivation_cap(mut self, per_hour: u32) -> Self {
+        self.users_rules.deactivations_per_hour = per_hour.clamp(1, 10);
+        self
+    }
+
+    /// What the user store plans with.
+    pub fn users_rules(&self) -> crate::users::Rules {
+        self.users_rules
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -103,7 +119,8 @@ impl PgStore {
             audit: s.clone(),
             credentials: s.clone(),
             memory_repos: s.clone(),
-            member_requests: s,
+            member_requests: s.clone(),
+            users: s,
         }
     }
 
