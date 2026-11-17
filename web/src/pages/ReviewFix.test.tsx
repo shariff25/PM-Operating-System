@@ -24,7 +24,8 @@ describe('the approve dialog tells what the server knows about the draft', () =>
     const user = userEvent.setup();
     renderApp({ hash: '/d/apr_prd', wrap: seenHints });
     const d = await openDialog(user, 'confluence_page');
-    expect(within(d).getByText(copy.approve.restricted).closest('.note-warn')).not.toBeNull();
+    expect(within(d).getByText(copy.approve.restricted).closest('.fact-warn')).not.toBeNull();
+    expect(d.querySelector('.note-restricted')).toBeNull();
     expect(within(d).getByText(/^Ends with “Drafted with PM OS · run /)).toBeInTheDocument();
     // not a Slack draft: no audience row
     expect(within(d).queryByText(copy.approve.audienceHeading)).not.toBeInTheDocument();
@@ -71,7 +72,7 @@ describe('the approve dialog tells what the server knows about the draft', () =>
     expect(within(d).getByText(copy.approve.audienceExternal)).toBeInTheDocument();
     await user.click(within(d).getByRole('checkbox'));
     await user.click(within(d).getByRole('button', { name: copy.approve.confirmExternalButton }));
-    expect(await screen.findByRole('status', { name: 'Outcome' })).toHaveTextContent('Posted in A Slack channel');
+    expect(await screen.findByRole('status', { name: 'Outcome' })).toHaveTextContent('Posted in a Slack channel');
   });
 
   it('Slack: audience_blocked fills in the audience and leaves only rejecting', async () => {
@@ -82,7 +83,35 @@ describe('the approve dialog tells what the server knows about the draft', () =>
     await user.click(within(d).getByRole('button', { name: copy.approve.confirm('slack_reply') }));
     expect(await within(d).findByText(copy.approve.audienceVisible(14))).toBeInTheDocument();
     expect(within(d).getByText(copy.approve.errors.audience_blocked.text)).toBeInTheDocument();
-    expect(within(d).getByRole('button', { name: /^Confirm and post/ })).toBeDisabled();
+    // blocked: no way to confirm, no external box to tick, only the two real options
+    expect(within(d).queryByRole('button', { name: /^Confirm and post/ })).not.toBeInTheDocument();
+    expect(within(d).queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(within(d).queryByText(copy.approve.externalCheckbox)).not.toBeInTheDocument();
+    expect(within(d).getByRole('button', { name: copy.approve.blockedReject })).toBeInTheDocument();
+    // the buttons live in a footer outside the scrolling body
+    const footer = d.querySelector('.modal-actions')!;
+    expect(d.querySelector('.modal-scroll')!.contains(footer)).toBe(false);
+    expect(within(footer as HTMLElement).getByRole('button', { name: copy.approve.blockedAsk })).toBeInTheDocument();
+  });
+
+  it('Slack: blocked, "reject" leaves the dialog and opens the reject choices', async () => {
+    const user = userEvent.setup();
+    renderApp({ hash: '/d/apr_slack_blocked', audienceDrafts: true, wrap: seenHints });
+    const d = await openDialog(user, 'slack_reply');
+    await user.click(within(d).getByRole('button', { name: copy.approve.confirm('slack_reply') }));
+    await user.click(await within(d).findByRole('button', { name: copy.approve.blockedReject }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(await screen.findByText(copy.reject.heading)).toBeInTheDocument();
+  });
+
+  it('Slack: blocked, "ask for another version" leaves the dialog and fills the change box', async () => {
+    const user = userEvent.setup();
+    renderApp({ hash: '/d/apr_slack_blocked', audienceDrafts: true, wrap: seenHints });
+    const d = await openDialog(user, 'slack_reply');
+    await user.click(within(d).getByRole('button', { name: copy.approve.confirm('slack_reply') }));
+    await user.click(await within(d).findByRole('button', { name: copy.approve.blockedAsk }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(await screen.findByDisplayValue(copy.approve.blockedAskPrefill)).toBeInTheDocument();
   });
 
   it('names the audience of a Slack draft the server already knows to be external, with a link to it', async () => {

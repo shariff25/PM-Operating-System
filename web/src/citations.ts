@@ -77,7 +77,10 @@ export function withCleanDrafts(api: Api): Api {
   const { listDrafts, getDraft, saveDraft, acceptSuggestion, rejectSuggestion, approve, reject, createPractice } = api;
   const { requestChange, getSuggestion } = api;
   const one = (d: Draft): Draft => cleanSummary(d);
-  api.listDrafts = async () => (await listDrafts.call(api)).map(cleanSummary);
+  api.listDrafts = async () => {
+    const l = await listDrafts.call(api);
+    return { ...l, drafts: l.drafts.map(cleanSummary) };
+  };
   api.getDraft = async (id) => one(await getDraft.call(api, id));
   api.saveDraft = async (id, input) => one(await saveDraft.call(api, id, input));
   api.acceptSuggestion = async (id) => one(await acceptSuggestion.call(api, id));

@@ -191,7 +191,10 @@ describe('empty and first-run states', () => {
       hash: '/drafts',
       wrap: (api) => {
         const list = api.listDrafts.bind(api);
-        api.listDrafts = async () => (await list()).filter((d) => d.status === 'pending');
+        api.listDrafts = async () => {
+          const l = await list();
+          return { ...l, drafts: l.drafts.filter((d) => d.status === 'pending') };
+        };
         return api;
       },
     });

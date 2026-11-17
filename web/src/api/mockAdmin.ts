@@ -200,6 +200,9 @@ export function createMockAdmin(now: number, options: MockAdminOptions, pendingD
         approved: down ? null : count('approved'),
         rejected: down ? null : count('rejected'),
         denied: down ? null : count('denied'),
+        retention_days: 90,
+        oldest_event_at: events.length ? events.reduce((m, e) => (e.at < m ? e.at : m), events[0]!.at) : null,
+        last_purge: { at: new Date(now - 9 * 60 * MIN).toISOString(), deleted: 1200 },
       };
     },
     audit(q) {

@@ -4,6 +4,7 @@ import type { AdminSection } from '../../admin/access';
 import { NO_FILTERS, auditHash, dayOf } from '../../admin/filters';
 import { auditTime, shortDay } from '../../admin/format';
 import { useLoad } from '../../admin/useLoad';
+import type { AdminOverview as AdminOverviewData } from '../../api';
 import { useApp } from '../../app-context';
 import { Empty, ErrorNote, Skeleton, SystemTag } from '../../components/bits';
 import { Icon } from '../../components/icons';
@@ -89,6 +90,39 @@ function RecentEvents({ outcome, title, empty }: { outcome: 'denied' | 'approved
   );
 }
 
+/** What the audit log keeps, and when it was last cleaned. Any field may be missing from an older server. */
+function Retention({ data }: { data: AdminOverviewData }) {
+  const r = copy.admin.overview.retention;
+  const days = data.retention_days ?? null;
+  const oldest = data.oldest_event_at ?? null;
+  const purge = data.last_purge ?? null;
+  return (
+    <section className="card" aria-labelledby="admin-retention">
+      <div className="card-head">
+        <h2 id="admin-retention">{r.title}</h2>
+      </div>
+      <ul className="rows retention-rows">
+        <li className="row">
+          <Icon name="clock" size={16} />
+          <span className="row-main"><span className="row-title">{days !== null ? r.kept(days) : r.keptUnknown}</span></span>
+        </li>
+        <li className="row">
+          <Icon name="activity" size={16} />
+          <span className="row-main">
+            <span className="row-meta">{oldest ? r.oldest(shortDay(oldest)) : r.oldestNone}</span>
+          </span>
+        </li>
+        <li className="row">
+          <Icon name="check" size={16} />
+          <span className="row-main">
+            <span className="row-meta">{purge ? r.purge(shortDay(purge.at), purge.deleted) : r.purgeNone}</span>
+          </span>
+        </li>
+      </ul>
+    </section>
+  );
+}
+
 /** The admin home: the week's counts, the latest denials and approvals, and a way into each part. */
 export function AdminOverview() {
   const { api, me } = useApp();
@@ -132,6 +166,7 @@ export function AdminOverview() {
             </div>
             {missing && <p className="admin-hint">{t.partial}</p>}
           </section>
+          <Retention data={data} />
           {canSee(me, 'audit') && (
             <div className="recent-grid">
               <RecentEvents outcome="denied" title={R.denied} empty={R.noDenied} />

@@ -1199,8 +1199,20 @@ export function DraftPage({ id }: { id: string }) {
         onExternalOk={setExternalOk}
         approving={approving}
         confirmLabel={confirmLabel}
-        note={approveNote}
+        // the dialog's own external notice carries the needs_external_confirm answer: no second box
+        externalAsked={approveError?.key === 'needs_external_confirm'}
+        note={approveError?.key === 'needs_external_confirm' ? null : approveNote}
         blocked={approveError?.key === 'audience_blocked'}
+        onReject={() => {
+          setConfirming(false);
+          setRejecting(true);
+        }}
+        onAskElsewhere={() => {
+          setConfirming(false);
+          setInstruction((t) => t || copy.approve.blockedAskPrefill);
+          setTab('doc');
+          setTimeout(() => changeBox.current?.focus(), 0);
+        }}
         onConfirm={() => void approve()}
         onCancel={() => setConfirming(false)}
       />
