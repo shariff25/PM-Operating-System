@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom';
 import type { DraftKind, DraftStatus, HintName, TaskStatus } from '../api';
 import { useApp, messageOf } from '../app-context';
 import { copy } from '../copy';
+import { useModalOpen } from '../modalOpen';
 import type { Rendered } from '../markdown';
 import { PHONE_QUERY, useMediaQuery } from '../theme';
 import { safeUrl } from '../url';
@@ -196,7 +197,9 @@ export function Hint({ name, anchor, kind = 'confluence_page' }: { name: HintNam
   const box = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const active = copy.hintOrder.find((h) => !me.hints_seen.includes(h));
-  const show = me.nudges && active === name;
+  const covered = useModalOpen();
+  // A hint waits while a dialog, menu or the palette is open, and comes back when it closes.
+  const show = me.nudges && active === name && !covered;
 
   // The pointer is aimed at the middle of the anchor, set straight on the element.
   useLayoutEffect(() => {

@@ -51,10 +51,15 @@ export type Route =
   | { name: 'activity' }
   | { name: 'task'; id: string }
   /** `search` is the query part of the hash (the audit filters), without the `?`. */
-  | { name: 'admin'; section: AdminSection; search: string };
+  | { name: 'admin'; section: AdminSection; search: string; sub?: PolicyPart };
+
+/** The parts of the policy page: `#/admin/policy`, `#/admin/policy/propose`, `#/admin/policy/proposals`. */
+export type PolicyPart = 'propose' | 'proposals';
 
 /** `/admin`, `/admin/audit`, `/admin/team`, `/admin/connectors`, each with an optional `?query`. */
 function adminRoute(path: string): Route | null {
+  const part = /^\/admin\/policy\/(propose|proposals)\/?(?:\?(.*))?$/.exec(path);
+  if (part) return { name: 'admin', section: 'policy', search: part[2] ?? '', sub: part[1] as PolicyPart };
   const m = /^\/admin(?:\/(audit|team|connectors|policy|content))?\/?(?:\?(.*))?$/.exec(path);
   if (!m) return null;
   return { name: 'admin', section: (m[1] as AdminSection | undefined) ?? 'overview', search: m[2] ?? '' };
