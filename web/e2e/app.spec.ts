@@ -81,11 +81,11 @@ test('approve shows the title, place, name and link destinations before anything
   await page.getByRole('button', { name: 'Approve to Confluence' }).click();
   const dialog = page.getByRole('dialog', { name: 'Check before you approve' });
   await expect(dialog).toContainText('PRD: TCB grace period setting');
-  await expect(dialog).toContainText('Space PM, under Specs');
+  await expect(dialog).toContainText('Space PM, under “Specs”');
   await expect(dialog).toContainText('Ana Silva');
   await expect(dialog.getByRole('list', { name: 'Links in this draft' })).toContainText('https://example.com/wiki/billing-roadmap');
   await dialog.getByRole('button', { name: 'Confirm and create' }).click();
-  await expect(page.getByText('Created in Space PM, under Specs.')).toBeVisible();
+  await expect(page.getByText('Created in Space PM, under “Specs”.')).toBeVisible();
   await expect(page.getByRole('link', { name: 'Open it' })).toBeVisible();
 });
 
@@ -100,7 +100,7 @@ test('an external channel needs a second, explicit yes', async ({ page }) => {
   await dialog.getByRole('checkbox').check();
   await expect(send).toBeEnabled();
   await send.click();
-  await expect(page.getByText(/Posted in #partner-pricing/)).toBeVisible();
+  await expect(page.getByText(/Posted in A Slack thread/)).toBeVisible();
 });
 
 test('an expired draft is labelled, sorted lower, and cannot be approved', async ({ page }) => {
@@ -108,10 +108,10 @@ test('an expired draft is labelled, sorted lower, and cannot be approved', async
   await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Drafts/ }).click();
   await page.getByRole('tab', { name: /^All/ }).click();
   const rows = page.getByRole('tabpanel').getByRole('link');
-  const expired = rows.filter({ hasText: 'Reply to Dana in #migrations' });
+  const expired = rows.filter({ hasText: 'Direct message' });
   await expect(expired).toContainText('Expired');
   const texts = await rows.allInnerTexts();
-  const iExpired = texts.findIndex((t) => t.includes('Reply to Dana'));
+  const iExpired = texts.findIndex((t) => t.includes('Direct message'));
   const lastNeedsYou = texts.map((t, i) => (t.includes('Needs you') ? i : -1)).reduce((a, b) => Math.max(a, b));
   expect(iExpired).toBeGreaterThan(lastNeedsYou);
   await expired.click();

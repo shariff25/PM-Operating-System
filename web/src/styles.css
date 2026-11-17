@@ -1521,3 +1521,16 @@ select:focus, input[type='date']:focus { border-color: var(--focus); box-shadow:
 /* Lists inside the suggestion view sit inside the diff list; keep their own markers. */
 .doc-diff .prose ul { list-style-type: disc; }
 .doc-diff .prose ol { list-style-type: decimal; }
+
+/* Where a draft goes: a quiet link to the thing itself, and the facts the approve dialog adds. */
+.target-link { display: inline-flex; align-items: center; gap: 4px; font-size: 12.5px; font-weight: 500; white-space: nowrap; }
+.facts dd .target-link { margin-left: 6px; }
+.fact-lines { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+
+/* A selected source card: the focus ring sits inside the card, so the lines under the button are never crossed by it. */
+.source:focus-visible { outline-offset: -3px; border-radius: 10px; }
+.source-item-on { padding-bottom: 4px; }
+.source-item-on .source-cites { margin-top: 4px; }
+.cite-group { margin-left: 1px; }
+.modal .note.note-restricted { flex-direction: row; gap: 10px; }
+.cite-group { margin-right: 0.12em; }

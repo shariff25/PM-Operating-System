@@ -45,6 +45,11 @@ export interface DraftTarget {
   url: string | null;
 }
 
+export interface DraftAudience {
+  members: number | null;
+  external: boolean | null;
+}
+
 export interface Draft extends DraftSummary {
   body: string;
   edited: boolean;
@@ -52,6 +57,17 @@ export interface Draft extends DraftSummary {
   sources: Source[];
   result_url: string | null;
   external: boolean;
+  /** When the PM last saved an edit here, else null. */
+  edited_at: string | null;
+  /** The run that drafted it read restricted sources (or predates that record, which counts the same). */
+  restricted_sources: boolean;
+  /**
+   * For a Slack draft, who can see the channel. Null for Confluence and Jira. `members` and
+   * `external` are null until PM OS has checked the channel, which it does when an approve is tried.
+   */
+  audience: DraftAudience | null;
+  /** The line PM OS adds to what it writes so readers can tell. Null for a practice draft. */
+  marker: string | null;
   /** Opaque. Sent back with approve so the server can refuse a draft that changed after it was shown. */
   version?: string;
 }
@@ -133,31 +149,59 @@ export interface Brief {
    * which the app reads the same way as null.
    */
   delivered_at?: string | null;
-  /** Optional summary of the same fact. */
+  /** What to say about it: never delivered, delivered within the last day, or older. A missing field reads as `never`. */
   status?: 'never' | 'today' | 'stale';
 }
 
-/** Error codes named in the contract; the server may add others. */
-export type ErrorCode =
-  | 'signed_out'
-  | 'bad_csrf'
-  | 'not_a_member'
-  | 'not_found'
-  | 'not_pending'
-  | 'change_in_progress'
-  | 'needs_external_confirm'
-  | 'audience_blocked'
-  | 'expired'
-  | 'stale'
-  | 'not_practice'
-  | 'not_built'
-  | 'forbidden'
-  | 'bad_request'
-  | 'upstream_unavailable'
-  /** The server could not tell whether a write went through. */
-  | 'unknown_outcome'
-  | 'network'
-  | 'unknown';
+/**
+ * Every error code in the table in docs/web-api.md ("Error codes"), with what the table says about
+ * whether anything changed:
+ * - `yes`: refused before anything was written, so the app may say nothing changed.
+ * - `decision`: the same, but only on a decision on a draft. A task may have been made.
+ * - `unknown`: it may have happened, so the app must not say either way.
+ * A unit test reads the table and fails if this list and the table drift apart.
+ */
+export const SERVER_ERROR_CODES = {
+  bad_request: 'yes',
+  signed_out: 'yes',
+  bad_token: 'yes',
+  bad_origin: 'yes',
+  bad_csrf: 'yes',
+  not_a_member: 'yes',
+  not_allowed: 'yes',
+  forbidden: 'yes',
+  not_found: 'yes',
+  method_not_allowed: 'yes',
+  not_pending: 'yes',
+  stale: 'yes',
+  expired: 'yes',
+  needs_external_confirm: 'yes',
+  audience_blocked: 'yes',
+  not_approvable: 'yes',
+  change_in_progress: 'yes',
+  no_suggestion: 'yes',
+  not_practice: 'yes',
+  task_refused: 'yes',
+  bad_content_type: 'yes',
+  bad_edit: 'yes',
+  bad_brief: 'yes',
+  not_built: 'yes',
+  upstream_unavailable: 'decision',
+  unknown_outcome: 'unknown',
+  audience_unavailable: 'yes',
+  unavailable: 'yes',
+  team_unavailable: 'yes',
+} as const satisfies Record<string, 'yes' | 'decision' | 'unknown'>;
+
+/** Codes the server sends. */
+export type ServerErrorCode = keyof typeof SERVER_ERROR_CODES;
+
+/** Codes the server sends, plus the two the client makes up: no answer at all, and one it cannot read. */
+export type ErrorCode = ServerErrorCode | 'network' | 'unknown';
+
+export function isServerErrorCode(code: string): code is ServerErrorCode {
+  return Object.hasOwn(SERVER_ERROR_CODES, code);
+}
 
 // ---- Admin and auditor (docs/web-api.md, "Admin and auditor") ----
 
