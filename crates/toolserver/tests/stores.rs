@@ -159,6 +159,7 @@ contract!(
     ledger_reads_filter_and_order,
     ledger_rows_follow_concurrent_decisions,
     memory_is_per_user,
+    notes_keep_their_sensitivity,
     context_search_and_get,
     context_search_applies_the_ceiling_in_the_store,
     reindex_tracks_the_content_repo,
@@ -1171,30 +1172,122 @@ async fn ledger_rows_follow_concurrent_decisions(b: &Backend) {
 
 async fn memory_is_per_user(b: &Backend) {
     let m = b.stores.memory.as_ref();
-    m.update("ana", "areas", "Acme Cloud", "ask, task r1", now())
-        .await
-        .unwrap();
+    m.update(
+        "ana",
+        "areas",
+        "Acme Cloud",
+        "ask, task r1",
+        Sensitivity::Internal,
+        now(),
+    )
+    .await
+    .unwrap();
     m.update(
         "ana",
         "areas",
         "Acme Cloud, Acme Vault",
         "ask, task r2",
+        Sensitivity::Internal,
         now() + Duration::minutes(1),
     )
     .await
     .unwrap();
-    m.update("ana", "style", "short", "ask, task r1", now())
-        .await
-        .unwrap();
-    m.update("bo", "areas", "Acme Vault", "ask, task r3", now())
-        .await
-        .unwrap();
+    m.update(
+        "ana",
+        "style",
+        "short",
+        "ask, task r1",
+        Sensitivity::Internal,
+        now(),
+    )
+    .await
+    .unwrap();
+    m.update(
+        "bo",
+        "areas",
+        "Acme Vault",
+        "ask, task r3",
+        Sensitivity::Internal,
+        now(),
+    )
+    .await
+    .unwrap();
     let ana = m.read("ana").await.unwrap();
     let keys: Vec<_> = ana.iter().map(|n| n.key.as_str()).collect();
     assert_eq!(keys, vec!["areas", "style"]);
     assert_eq!(ana[0].text, "Acme Cloud, Acme Vault");
     assert_eq!(ana[0].updated_at, now() + Duration::minutes(1));
     assert!(m.read("cy").await.unwrap().is_empty());
+}
+
+/// A note keeps the sensitivity it was written with, and a rewrite replaces it (S6). In
+/// Postgres, a note from before the column (null) reads as `internal`.
+async fn notes_keep_their_sensitivity(b: &Backend) {
+    let m = b.stores.memory.as_ref();
+    let written = m
+        .update(
+            "ana",
+            "partners",
+            "Globex roadmap",
+            "ask, task r1",
+            Sensitivity::Restricted,
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(written.sensitivity, Sensitivity::Restricted);
+    m.update(
+        "ana",
+        "style",
+        "short",
+        "ask, task r1",
+        Sensitivity::Public,
+        now(),
+    )
+    .await
+    .unwrap();
+    let read = m.read("ana").await.unwrap();
+    let by_key: Vec<_> = read
+        .iter()
+        .map(|n| (n.key.as_str(), n.sensitivity))
+        .collect();
+    assert_eq!(
+        by_key,
+        vec![
+            ("partners", Sensitivity::Restricted),
+            ("style", Sensitivity::Public)
+        ]
+    );
+    m.update(
+        "ana",
+        "partners",
+        "Public summary",
+        "ask, task r2",
+        Sensitivity::Internal,
+        now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        m.read("ana").await.unwrap()[0].sensitivity,
+        Sensitivity::Internal
+    );
+    if let Some(pg) = &b.pg {
+        sqlx::query(
+            "INSERT INTO memory_notes (user_handle, key, text, updated_at) VALUES ('ana', 'old', 'x', now())",
+        )
+        .execute(pg.pool())
+        .await
+        .unwrap();
+        let old = m
+            .read("ana")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|n| n.key == "old")
+            .unwrap();
+        assert_eq!(old.sensitivity, Sensitivity::Internal);
+    }
 }
 
 // ----- context ----------------------------------------------------------------------------

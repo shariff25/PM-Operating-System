@@ -79,8 +79,20 @@ The eval gate (`.github/workflows/evals-gate.yml`, `docs/evals.md` "CI") runs on
 that change roles, skills, bots, the evals or `deploy/gateway.yaml`. It needs the stack and the
 models, so it runs on a GitHub Actions self-hosted runner on the Spark with the labels
 `self-hosted` and `pmos-spark`. Until one is registered the job waits in the queue; a platform
-owner runs `deploy/pmos-admin evals-gate --base origin/main` on the Spark from the PR's branch
+owner checks out the PR's branch somewhere on the Spark (not in `/opt/pmos`), runs
+`deploy/pmos-admin evals-gate --checkout <that checkout> --base origin/main` from `/opt/pmos`,
 and pastes the output into the PR.
+
+**What the runner runs.** The workflow runs on `pull_request_target`, so its own file always
+comes from the base branch. It checks out the PR's head into `pr/` without credentials and
+runs the Spark's installed script, `/opt/pmos/deploy/pmos-admin evals-gate --checkout pr`. The
+PR is only read as data (its `content/`, `evals/` and `deploy/gateway.yaml`); nothing in it is
+run, and no secret file is linked into it. So:
+- **A change to `pmos-admin` or the eval stack's compose file takes effect only after an
+  upgrade on the Spark** (the steps above). A PR that changes them is measured with the
+  Spark's current copies.
+- **The images are the Spark's,** built by the last `deploy/pmos-admin build`. A PR's code
+  changes are not benchmarked by the gate until they are merged and the Spark is upgraded.
 
 **Once, to register it** (a GitHub repo admin and a Spark platform owner together):
 1. **On GitHub:** the repo's Settings → Actions → Runners → New self-hosted runner, Linux,
@@ -94,7 +106,8 @@ and pastes the output into the PR.
    sudo setfacl -m u:gh-runner:r /opt/pmos/deploy/.env
    ```
    If PM OS isn't in `/opt/pmos`, set `PMOS_SPARK_DIR=<that path>` in the runner's `.env`
-   file (in its install directory) after step 3; the workflow links `deploy/.env` from there.
+   file (in its install directory) after step 3; the workflow runs that copy's
+   `deploy/pmos-admin`, which reads its own `deploy/.env`.
 3. **Install and configure it** as that user, with the commands from step 1 and these
    options:
    ```sh
@@ -111,7 +124,15 @@ and pastes the output into the PR.
    cd ~gh-runner/actions-runner
    sudo ./svc.sh install gh-runner && sudo ./svc.sh start
    ```
-5. **Check:** Settings → Actions → Runners shows `spark-1` as Idle. Re-run a waiting "Eval
+5. **Restrict who can use it,** on GitHub:
+   - **The runner serves this repository only.** Register it on the repository, as in step 1,
+     not on the organization. If it must be an organization runner, put it in a runner group
+     whose repository access is this repository only (organization Settings → Actions →
+     Runner groups).
+   - **Outside collaborators need an approval.** The repo's Settings → Actions → General →
+     "Approval for running fork pull request workflows from contributors": choose "Require
+     approval for all outside collaborators".
+6. **Check:** Settings → Actions → Runners shows `spark-1` as Idle. Re-run a waiting "Eval
    gate" job, and read its summary.
 
 **Day to day:** the runner updates itself. One job runs at a time, and a new push to the PR

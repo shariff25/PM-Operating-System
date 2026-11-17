@@ -8,9 +8,14 @@
 //! ---
 //! updated: 2026-11-14T10:00:00Z
 //! source: "pm-ana, task 0d3f…"
+//! sensitivity: internal
 //! ---
 //! <note text>
 //! ```
+//!
+//! `sensitivity` is the highest data class the writing session had read. A note edited by
+//! hand without it, or with a value other than `public`, `internal` or `restricted`, reads as
+//! `internal`.
 //!
 //! - **Reads** list the tree and fetch only the blobs whose sha changed since the last read
 //!   (a per-repo cache). An unchanged tree sha means no blob is fetched at all.
@@ -24,9 +29,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use pmos_contract::Sensitivity;
 
 use crate::github::{Change, GitHub, GitHubError, RepoInfo};
-use crate::memory::{valid_key, MemoryError, MemoryResult, MemoryStore, Note};
+use crate::memory::{
+    valid_key, MemoryError, MemoryResult, MemoryStore, Note, DEFAULT_NOTE_SENSITIVITY,
+};
 use crate::memory_repo::{MemoryRepo, MemoryRepoStore};
 use crate::oauth::{TokenError, TokenSource};
 use crate::vault::{Provider, Secret};
@@ -212,34 +220,45 @@ fn note_key(path: &str) -> Option<&str> {
 }
 
 /// A note file's text. `source` is quoted as a JSON string, which is also valid YAML.
-pub fn render_note(text: &str, source: &str, now: DateTime<Utc>) -> String {
+pub fn render_note(
+    text: &str,
+    source: &str,
+    sensitivity: Sensitivity,
+    now: DateTime<Utc>,
+) -> String {
     format!(
-        "---\nupdated: {}\nsource: {}\n---\n{text}",
+        "---\nupdated: {}\nsource: {}\nsensitivity: {sensitivity}\n---\n{text}",
         now.to_rfc3339_opts(SecondsFormat::Secs, true),
         serde_json::to_string(source).expect("a string serializes"),
     )
 }
 
 /// A note from its file. A file someone edited by hand without front matter is read whole,
-/// with no update time.
+/// with no update time. A missing or unknown `sensitivity` is
+/// [`DEFAULT_NOTE_SENSITIVITY`].
 pub fn parse_note(key: &str, file: &str) -> Note {
-    let (updated, text) = match pmos_contract::frontmatter::split(file) {
+    let (updated, sensitivity, text) = match pmos_contract::frontmatter::split(file) {
         Ok(doc) => {
-            let updated = doc
-                .yaml
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("updated:"))
-                .map(|v| v.trim().trim_matches(['"', '\'']))
-                .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
+            let field = |name: &str| {
+                doc.yaml
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix(name))
+                    .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
+            };
+            let updated = field("updated:")
+                .and_then(|v| DateTime::parse_from_rfc3339(&v).ok())
                 .map(|d| d.with_timezone(&Utc));
-            (updated, doc.body)
+            let sensitivity =
+                field("sensitivity:").and_then(|v| Sensitivity::parse(&v.to_ascii_lowercase()));
+            (updated, sensitivity, doc.body)
         }
-        Err(_) => (None, file),
+        Err(_) => (None, None, file),
     };
     Note {
         key: key.to_string(),
         text: text.to_string(),
         updated_at: updated.unwrap_or(DateTime::UNIX_EPOCH),
+        sensitivity: sensitivity.unwrap_or(DEFAULT_NOTE_SENSITIVITY),
     }
 }
 
@@ -291,6 +310,7 @@ impl MemoryStore for GitHubMemory {
         key: &str,
         text: &str,
         source: &str,
+        sensitivity: Sensitivity,
         now: DateTime<Utc>,
     ) -> MemoryResult<Note> {
         if !valid_key(key) {
@@ -298,7 +318,7 @@ impl MemoryStore for GitHubMemory {
         }
         let (token, repo, branch) = self.open(user, now).await?;
         let path = note_path(key);
-        let file = render_note(text, source, now);
+        let file = render_note(text, source, sensitivity, now);
         let message = format!("memory: {key} ({source})");
         let written = match self
             .github
@@ -325,6 +345,7 @@ impl MemoryStore for GitHubMemory {
             key: key.to_string(),
             text: text.to_string(),
             updated_at: now,
+            sensitivity,
         })
     }
 }
@@ -374,17 +395,30 @@ mod tests {
         let file = render_note(
             "Acme Cloud, Acme Vault\n---\nmore",
             "pm-ana, task \"7\"",
+            Sensitivity::Restricted,
             now,
         );
         assert!(file.starts_with(
-            "---\nupdated: 2026-11-14T10:00:00Z\nsource: \"pm-ana, task \\\"7\\\"\"\n---\n"
+            "---\nupdated: 2026-11-14T10:00:00Z\nsource: \"pm-ana, task \\\"7\\\"\"\nsensitivity: restricted\n---\n"
         ));
         let note = parse_note("areas", &file);
         assert_eq!(note.text, "Acme Cloud, Acme Vault\n---\nmore");
         assert_eq!(note.updated_at, now);
+        assert_eq!(note.sensitivity, Sensitivity::Restricted);
         let by_hand = parse_note("x", "just text");
         assert_eq!(by_hand.text, "just text");
         assert_eq!(by_hand.updated_at, DateTime::UNIX_EPOCH);
+        assert_eq!(by_hand.sensitivity, Sensitivity::Internal);
+        // Written before notes carried a sensitivity, or edited by hand: internal.
+        let older = parse_note("x", "---\nupdated: 2026-11-14T10:00:00Z\n---\nold");
+        assert_eq!(
+            (older.text.as_str(), older.sensitivity),
+            ("old", Sensitivity::Internal)
+        );
+        let odd = parse_note("x", "---\nsensitivity: secret\n---\nodd");
+        assert_eq!(odd.sensitivity, Sensitivity::Internal);
+        let quoted = parse_note("x", "---\nsensitivity: \"Public\"\n---\np");
+        assert_eq!(quoted.sensitivity, Sensitivity::Public);
         assert_eq!(note_key("notes/areas.md"), Some("areas"));
         assert_eq!(note_key("notes/sub/areas.md"), None);
         assert_eq!(note_key("README.md"), None);

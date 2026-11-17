@@ -6,7 +6,7 @@
 //! | `slack` | create tasks as `X-Pmos-User`; read that PM's tasks and routines; read and set that PM's settings; read the shared notification feed and the bot list (no PM needed) |
 //! | `worker` | claim, heartbeat, events, trace, complete, fail |
 //! | `console` | read everything, settings included; pause, resume and delete routines; cancel tasks |
-//! | `evals` | create tasks with `source: "eval"` (and a task's own `level`), and read them and their drafts |
+//! | `evals` | create tasks with `source: "eval"` (and a task's own `level`) as a handle in `PMOS_EVALS_AS` only, with no Slack target; read them and their drafts |
 //!
 //! A task's drafts (`GET /v1/tasks/{id}/drafts`) are for the console and evals only: the
 //! runtime reads them from the tool server with its own service token, so the evals client
@@ -55,6 +55,8 @@ struct AppState {
     rt: Arc<Runtime>,
     clients: Arc<[Client]>,
     assertions: Arc<Assertions>,
+    /// `PMOS_EVALS_AS`: the handles the evals client may request tasks as.
+    evals_as: Arc<[String]>,
 }
 
 /// Who is calling: the client, and for Slack the PM it acts for.
@@ -72,18 +74,26 @@ impl Caller {
     }
 }
 
-/// The API with assertions off (`PMOS_ASSERTION_MODE=off`).
-pub fn router(rt: Arc<Runtime>, clients: Vec<Client>) -> Router {
-    router_with(rt, clients, Arc::new(Assertions::off()))
+/// The API with assertions off (`PMOS_ASSERTION_MODE=off`). `evals_as` is `PMOS_EVALS_AS`
+/// ([`crate::config::parse_evals_as`]): the only handles the `evals` client may create tasks
+/// for.
+pub fn router(rt: Arc<Runtime>, clients: Vec<Client>, evals_as: Vec<String>) -> Router {
+    router_with(rt, clients, evals_as, Arc::new(Assertions::off()))
 }
 
-/// The API, checking user assertions from the `web` and `console` clients as `assertions`
+/// [`router`], checking user assertions from the `web` and `console` clients as `assertions`
 /// says.
-pub fn router_with(rt: Arc<Runtime>, clients: Vec<Client>, assertions: Arc<Assertions>) -> Router {
+pub fn router_with(
+    rt: Arc<Runtime>,
+    clients: Vec<Client>,
+    evals_as: Vec<String>,
+    assertions: Arc<Assertions>,
+) -> Router {
     let state = AppState {
         rt,
         clients: clients.into(),
         assertions,
+        evals_as: evals_as.into(),
     };
     let v1 = Router::new()
         .route("/bots", get(list_bots))
@@ -465,10 +475,26 @@ async fn create_task(
                 }));
             }
         }
-        _ if req.source != Source::Eval => {
-            return Err(forbidden("the evals client creates `eval` tasks only"))
+        _ => {
+            if req.source != Source::Eval {
+                return Err(forbidden("the evals client creates `eval` tasks only"));
+            }
+            // A benchmark task runs as the benchmark member, never as a PM: the evals token
+            // must not be able to run a PM's personal bot with their accounts.
+            if !state.evals_as.contains(&req.requested_by) {
+                return Err(forbidden(format!(
+                    "the evals client creates tasks only as {} (PMOS_EVALS_AS)",
+                    state.evals_as.join(", ")
+                )));
+            }
         }
-        _ => {}
+    }
+    // An eval task never reaches Slack: it may not name a Slack target, and the runtime sends
+    // no notifications for it.
+    if req.source == Source::Eval && req.slack.is_some() {
+        return Err(Error::BadRequest(
+            "an eval task has no Slack target (`slack`)".into(),
+        ));
     }
     let task = state
         .rt
