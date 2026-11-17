@@ -23,6 +23,15 @@ export interface ApproveWords {
   toast: string;
 }
 
+/**
+ * A target label ("A thread in #launch-acme", "Space PM, under “Specs”") begins with a capital
+ * because it is shown alone. Used inside a sentence, its first word is lower-cased, but a channel
+ * ("#launch-acme"), a handle or an acronym ("PRD: …") is left as it is.
+ */
+export function midSentence(label: string): string {
+  return /^[A-Z][a-z ]/.test(label) ? label.charAt(0).toLowerCase() + label.slice(1) : label;
+}
+
 const APPROVE_WORDS: Record<DraftKind, ApproveWords> = {
   confluence_page: {
     button: 'Approve to Confluence',
@@ -50,22 +59,22 @@ const APPROVE_WORDS: Record<DraftKind, ApproveWords> = {
     button: 'Approve to Slack',
     hint: "This posts the reply in Slack under your name. I'll wait until you're sure.",
     hintShort: 'Nothing posts until you approve.',
-    confirmText: (where, who) => `This will post a Slack reply in ${where}, under your name (${who}).`,
+    confirmText: (where, who) => `This will post a Slack reply in ${midSentence(where)}, under your name (${who}).`,
     confirmButton: 'Confirm and post',
     confirming: 'Posting…',
     nothingYet: 'Nothing has been posted until you press Confirm.',
-    done: (where) => `Posted in ${where}.`,
+    done: (where) => `Posted in ${midSentence(where)}.`,
     toast: 'Approved. The reply is posted in Slack.',
   },
   slack_message: {
     button: 'Approve to Slack',
     hint: "This posts the message in Slack under your name. I'll wait until you're sure.",
     hintShort: 'Nothing posts until you approve.',
-    confirmText: (where, who) => `This will post a Slack message in ${where}, under your name (${who}).`,
+    confirmText: (where, who) => `This will post a Slack message in ${midSentence(where)}, under your name (${who}).`,
     confirmButton: 'Confirm and post',
     confirming: 'Posting…',
     nothingYet: 'Nothing has been posted until you press Confirm.',
-    done: (where) => `Posted in ${where}.`,
+    done: (where) => `Posted in ${midSentence(where)}.`,
     toast: 'Approved. The message is posted in Slack.',
   },
 };
@@ -337,6 +346,11 @@ export const copy = {
     confirmPractice: 'This is a practice draft. Confirming creates nothing anywhere.',
     restricted: 'Built from restricted sources',
     restrictedNote: 'Check that everyone who can see where this goes is meant to read it.',
+    restrictedFact: 'Sources',
+    /** When posting is blocked: the two real options, as buttons. */
+    blockedReject: 'Reject this draft',
+    blockedAsk: 'Ask for a version for a different place',
+    blockedAskPrefill: 'Make a version of this that is safe to share somewhere else, without anything from the restricted sources.',
     /** Slack only: who will see it. The numbers are filled in once I have checked the channel. */
     audienceHeading: 'Who will see it',
     audienceVisible: (n: number) => `Visible to ${n} ${n === 1 ? 'person' : 'people'}`,
@@ -564,6 +578,11 @@ export const copy = {
     title: 'Drafts',
     lede: 'Everything I wrote for you. Nothing is sent until you approve it.',
     countLine: (n: number) => `${n} to decide`,
+    /** Shown when the server left some pending drafts out of the list. `total` may be unknown. */
+    truncated: (total: number | null, shown: number) =>
+      total !== null
+        ? `${total} drafts are waiting in total. Only the newest ${shown} are listed here.`
+        : 'More drafts are waiting than are listed here. Only the newest are shown.',
     tabsLabel: 'Filter drafts',
     tabs: { pending: 'Needs you', approved: 'Approved', expired: 'Expired', all: 'All' },
     emptyPending: 'Nothing needs a decision. Suspiciously tidy.',
@@ -674,6 +693,15 @@ export const copy = {
         rejected: 'Drafts turned down',
         denied: (n: number) => (n > 0 ? 'Refused. Worth a look' : 'None. A calm week'),
         unavailable: 'Not available right now',
+      },
+      retention: {
+        title: 'Audit retention',
+        kept: (days: number) => `Events are kept for ${days} days`,
+        keptUnknown: 'How long events are kept is not known yet',
+        oldest: (date: string) => `Oldest event: ${date}`,
+        oldestNone: 'The log is empty, or I could not read it back.',
+        purge: (date: string, n: number) => `Last clean-up: ${date}, removed ${n} ${n === 1 ? 'event' : 'events'}`,
+        purgeNone: 'No clean-up has run yet',
       },
       partial: "The tool server didn't answer, so some counts are missing. Try again in a moment.",
       linksLabel: 'Where to next',
@@ -885,6 +913,20 @@ export const copy = {
       audience_unavailable: "Slack couldn't tell me who is in that channel, so nothing was sent. Try again in a minute.",
       unavailable: 'Something PM OS relies on is not answering. Nothing changed. Try again in a minute.',
       team_unavailable: "I can't read the team list right now. Nothing changed. Try again in a minute.",
+      github_not_linked:
+        'Link your GitHub account in PM OS first. Pull requests are opened as you, so I need to know who you are there. Nothing changed.',
+      stale_base:
+        'The copy you started from is out of date, so I did not use it. Nothing changed. Reload the page to get the latest, then make your change again.',
+      invalid: "That change didn't pass the checks, so nothing was proposed. The page lists what to fix.",
+      policy_mismatch:
+        'The tool server would write different policy files from that change, so nothing was proposed. Nothing changed. Check the change and try again.',
+      rate_limited: "You've proposed a lot of changes this hour, so I'm pausing. Nothing changed. Try again a little later.",
+      not_configured: 'Proposing changes is not switched on here yet. Nothing changed.',
+      audit_unavailable:
+        "I couldn't write this to the audit log, so I did not do it, and nothing was shown. Nothing changed. Try again in a minute.",
+      github_refused: 'GitHub did not accept your account for this, so no pull request was opened. Nothing changed.',
+      github_unavailable: "GitHub didn't take the proposal, so no pull request was opened. Nothing changed. Try again in a minute.",
+      github_rate_limited: 'GitHub is limiting requests right now, so no pull request was opened. Nothing changed. Try again in a minute.',
     } satisfies Record<ServerErrorCode, string>,
     loadDraftFailed: 'I could not open that draft.',
     notFound: 'That draft does not exist, or it is not yours.',

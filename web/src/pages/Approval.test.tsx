@@ -19,12 +19,12 @@ describe('approve wording, per kind of draft', () => {
   it.each(KINDS)('%s: every line names the right system and the right thing', (kind) => {
     const w = approveWords(kind);
     const noun = { confluence_page: 'page', jira_issue: 'issue', slack_reply: 'reply', slack_message: 'message' }[kind];
-    const all = [w.button, w.hint, w.hintShort, w.confirmText('Somewhere', 'Ana'), w.confirmButton, w.confirming, w.nothingYet, w.done('Somewhere'), w.toast].join('\n');
+    const all = [w.button, w.hint, w.hintShort, w.confirmText('#somewhere', 'Ana'), w.confirmButton, w.confirming, w.nothingYet, w.done('#somewhere'), w.toast].join('\n');
     expect(w.button).toContain(SYSTEM[kind]);
     expect(w.hint).toContain(noun);
     expect(w.hint).toContain(SYSTEM[kind]);
-    expect(w.confirmText('Somewhere', 'Ana')).toContain(noun);
-    expect(w.confirmText('Somewhere', 'Ana')).toContain('Somewhere');
+    expect(w.confirmText('#somewhere', 'Ana')).toContain(noun);
+    expect(w.confirmText('#somewhere', 'Ana')).toContain('#somewhere');
     expect(w.toast).toContain(noun);
     // the other systems and their nouns never leak into this kind's lines
     for (const other of KINDS.filter((k) => SYSTEM[k] !== SYSTEM[kind])) expect(all).not.toContain(SYSTEM[other]);

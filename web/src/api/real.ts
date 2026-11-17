@@ -112,7 +112,10 @@ export function createRealClient(opts: RealOptions = {}): Api {
     markHintSeen: (seen: HintName) => post<Me>('/me/hints', { seen }),
     resetHints: () => call<Me>('DELETE', '/me/hints'),
 
-    listDrafts: async () => (await call<{ drafts: DraftSummary[] }>('GET', '/drafts')).drafts,
+    listDrafts: async () => {
+      const r = await call<{ drafts: DraftSummary[]; truncated?: boolean; total_pending?: number }>('GET', '/drafts');
+      return { drafts: r.drafts, truncated: r.truncated === true, total_pending: typeof r.total_pending === 'number' ? r.total_pending : null };
+    },
     getDraft: (id) => call<Draft>('GET', `/drafts/${seg(id)}`),
     saveDraft: (id, input) => call<Draft>('PUT', `/drafts/${seg(id)}`, input),
     requestChange: async (id, instruction) =>

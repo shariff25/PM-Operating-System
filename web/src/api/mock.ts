@@ -52,6 +52,8 @@ export interface MockOptions extends MockAdminOptions {
   origin?: string | null;
   /** Add two Slack drafts whose channel is only checked when an approve is tried (external, and restricted). */
   audienceDrafts?: boolean;
+  /** List at most this many pending drafts, as the tool server does past its safety cap: the list then says it is truncated. */
+  listCap?: number;
 }
 
 /** A draft as the sample data writes it: the fields every draft gets the same way are filled in by `add`. */
@@ -154,6 +156,7 @@ export function createMockClient(options: MockOptions = {}): Api {
   const latency = options.latency ?? 250;
   const stepMs = options.stepMs ?? 1200;
   const briefBuilt = options.briefBuilt ?? true;
+  const listCap = options.listCap;
   const now0 = Date.now();
   let seq = 100;
   const nextId = (p: string) => `${p}_${++seq}`;
@@ -621,7 +624,14 @@ export function createMockClient(options: MockOptions = {}): Api {
       const all = [...drafts.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
       const pending = all.filter((d) => d.status === 'pending');
       const decided = all.filter((d) => d.status !== 'pending').slice(0, 20);
-      return [...pending, ...decided].map(summary);
+      const cap = listCap ?? Infinity;
+      const kept = pending.slice(0, cap);
+      const cut = pending.length > kept.length;
+      return {
+        drafts: [...kept, ...decided].map(summary),
+        truncated: cut,
+        total_pending: cut ? pending.length : null,
+      };
     },
     async getDraft(id) {
       await wait();
