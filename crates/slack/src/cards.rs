@@ -348,18 +348,27 @@ fn approval_head(item: &Value) -> Vec<Value> {
             escape(&tool_label(tool)),
             args_summary(&item["args"])
         )),
-        context(&format!(
-            "`{}` · for {} · nothing is sent until you approve",
-            escape(tool),
-            escape(&person(item["user"].as_str().unwrap_or("you")))
-        )),
+        context(&{
+            let mut line = format!(
+                "`{}` · for {}",
+                escape(tool),
+                escape(&person(item["user"].as_str().unwrap_or("you")))
+            );
+            if let Some(edited) = edited_note(item) {
+                line.push_str(" · ");
+                line.push_str(&edited);
+            }
+            line.push_str(" · nothing is sent until you approve");
+            line
+        }),
     ]
 }
 
 /// The Confluence and Jira drafts get **Open in workspace** when the web app's address is
-/// set (`PMOS_WEB_PUBLIC_URL`, an `https://` origin with no trailing `/`). Slack replies and
-/// messages do not, and neither does a card when the address is unset or the id is not safe
-/// to put in a URL.
+/// set (`PMOS_WEB_PUBLIC_URL`, an `https://` origin with no trailing `/`): the web app's own
+/// route for the draft, `{web}/#/d/{id}` (`web/src/url.ts`). Slack replies and messages do
+/// not, and neither does a card when the address is unset or the id is not safe to put in a
+/// URL. (Cards posted before this used `{web}/drafts/{id}`, which pmos-web now redirects.)
 fn open_web_button(item: &Value, web: Option<&str>) -> Option<Value> {
     let web = web?;
     let tool = item["tool"].as_str().unwrap_or_default();
@@ -370,7 +379,7 @@ fn open_web_button(item: &Value, web: Option<&str>) -> Option<Value> {
     Some(json!({
         "type": "button",
         "text": {"type": "plain_text", "text": "Open in workspace"},
-        "url": format!("{web}/drafts/{id}"),
+        "url": format!("{web}/#/d/{id}"),
         "action_id": action::OPEN_WEB,
     }))
 }
@@ -390,7 +399,63 @@ fn approval_buttons(item: &Value, web: Option<&str>) -> Value {
     }
     elements.push(button("Reject", action::REJECT, id, Some("danger")));
     elements.extend(open_web_button(item, web));
-    json!({"type": "actions", "block_id": format!("approval:{id}"), "elements": elements})
+    let block_id = match shown_hash(item) {
+        Some(hash) => format!("approval:{id}:{hash}"),
+        None => format!("approval:{id}"),
+    };
+    json!({"type": "actions", "block_id": block_id, "elements": elements})
+}
+
+/// How many hex characters of the item's `args_hash` a card's buttons carry.
+pub const SHOWN_HASH_LEN: usize = 16;
+
+/// The start of `item`'s `args_hash` (the text the card shows), if the item has one.
+pub fn shown_hash(item: &Value) -> Option<&str> {
+    item["args_hash"]
+        .as_str()
+        .filter(|h| h.len() >= SHOWN_HASH_LEN && h.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|h| &h[..SHOWN_HASH_LEN])
+}
+
+/// The `args_hash` start an approval card's buttons were posted with (`approval:<id>:<hash>`),
+/// from the clicked block's id; `None` for a card from before cards carried it.
+pub fn clicked_hash(block_id: &str) -> Option<&str> {
+    let rest = block_id.strip_prefix("approval:")?;
+    let (_, hash) = rest.split_once(':')?;
+    (hash.len() == SHOWN_HASH_LEN && hash.chars().all(|c| c.is_ascii_hexdigit())).then_some(hash)
+}
+
+/// Was the card clicked showing other text than the item has now? It was posted before the
+/// PM saved an edit (in the web app): the card's buttons carry the start of the arguments'
+/// hash they were posted with, and it differs from the item's.
+pub fn card_is_stale(block_id: Option<&str>, item: &Value) -> bool {
+    match (block_id.and_then(clicked_hash), shown_hash(item)) {
+        (Some(clicked), Some(now)) => clicked != now,
+        _ => false,
+    }
+}
+
+/// The card again, with what the item holds now and a line saying why nothing was decided:
+/// the text changed since the card was posted (an edit saved in the web app).
+pub fn approval_changed(item: &Value, web: Option<&str>) -> (String, Value) {
+    let (text, blocks) = approval_card(item, web);
+    let mut blocks = blocks.as_array().cloned().unwrap_or_default();
+    blocks.push(context(
+        ":pencil2: This draft was edited after this card was posted, so nothing was approved. \
+         Here is the text as it is now: read it, then approve.",
+    ));
+    (text, Value::Array(blocks))
+}
+
+/// "edited by Ana", when a person changed the bot's text (a saved edit or an edit), for the
+/// card's context line.
+fn edited_note(item: &Value) -> Option<String> {
+    (item["edited"] == true).then(|| {
+        format!(
+            "edited by {}",
+            escape(&person(item["user"].as_str().unwrap_or("you")))
+        )
+    })
 }
 
 /// A pending approval card: the tool, its arguments, and **Approve**, **Edit**, **Reject**.
@@ -741,6 +806,7 @@ fn reply_head(item: &Value) -> Vec<Value> {
         ),
         "posts as you, marked “Drafted with PM OS”".to_string(),
     ];
+    meta.extend(edited_note(item));
     if let Some(s) = item["sources_sensitivity"]
         .as_str()
         .filter(|s| matches!(*s, "public" | "internal" | "restricted"))
@@ -1295,7 +1361,7 @@ mod tests {
         for (item, id) in [(&confluence, "apr_1"), (&jira, "apr_2")] {
             let b = button_of(item, Some(WEB)).expect("button when configured");
             assert_eq!(b["text"]["text"], "Open in workspace");
-            assert_eq!(b["url"], format!("{WEB}/drafts/{id}"));
+            assert_eq!(b["url"], format!("{WEB}/#/d/{id}"));
             assert!(
                 button_of(item, None).is_none(),
                 "absent when not configured"
@@ -1308,7 +1374,7 @@ mod tests {
         let (_, reasons) = approval_reasons(&confluence, Some(WEB));
         assert!(reasons
             .to_string()
-            .contains("https://pm.example.com/drafts/apr_1"));
+            .contains("https://pm.example.com/#/d/apr_1"));
         let unsafe_id = json!({
             "id": "../apr", "tool": "jira.create_issue", "args": {"summary": "s"},
             "status": "pending",
@@ -1317,6 +1383,54 @@ mod tests {
             button_of(&unsafe_id, Some(WEB)).is_none(),
             "unsafe id is never linked"
         );
+    }
+
+    #[test]
+    fn a_card_shows_a_saved_edit_and_knows_when_it_is_stale() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut item = json!({
+            "id": "apr_1", "user": "ana", "tool": "confluence.create_draft",
+            "args": {"space": "PM", "title": "Plan", "body": "Edited in the web app."},
+            "args_hash": hash, "status": "pending", "edited": true,
+        });
+        // The card shows the saved edit, says it was edited, and carries the text's hash.
+        let (_, blocks) = approval_card(&item, None);
+        let s = blocks.to_string();
+        assert!(s.contains("Edited in the web app."));
+        assert!(s.contains("edited by Ana"));
+        let actions = blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "actions")
+            .unwrap();
+        let block_id = actions["block_id"].as_str().unwrap();
+        assert_eq!(block_id, "approval:apr_1:0123456789abcdef");
+        assert_eq!(clicked_hash(block_id), Some("0123456789abcdef"));
+        assert!(!card_is_stale(Some(block_id), &item));
+        // The PM saves another edit in the web app: that card is stale now.
+        item["args_hash"] = json!("f".repeat(64));
+        assert!(card_is_stale(Some(block_id), &item));
+        let (_, again) = approval_changed(&item, None);
+        assert!(again
+            .to_string()
+            .contains("edited after this card was posted"));
+        // Cards posted before they carried a hash, and items without one, aren't stale.
+        assert!(!card_is_stale(Some("approval:apr_1"), &item));
+        assert!(!card_is_stale(None, &item));
+        item.as_object_mut().unwrap().remove("args_hash");
+        assert!(!card_is_stale(Some(block_id), &item));
+        // A reply card says so too; an unedited one doesn't.
+        let mut reply = json!({
+            "id": "apr_r", "user": "ana", "tool": "slack.post_reply", "status": "pending",
+            "args": {"channel": "C0LAUNCH", "thread_ts": "1731600000.000100", "text": "Yes."},
+            "edited": true,
+        });
+        let (_, blocks) = approval_card(&reply, None);
+        assert!(blocks.to_string().contains("edited by Ana"));
+        reply["edited"] = json!(false);
+        let (_, blocks) = approval_card(&reply, None);
+        assert!(!blocks.to_string().contains("edited by"));
     }
 
     #[test]

@@ -388,6 +388,12 @@ pub struct TeamMember {
     /// set, and otherwise a verified email on the GitHub account matching `email`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<String>,
+    /// Optional: the person's Entra ID object id (`oid`, a GUID). When it is set, the web
+    /// app's Entra ID sign-in also requires the token's `oid` to be this one, so an email
+    /// address reassigned to someone else in the tenant can't sign in as this member
+    /// (`docs/entra-sign-in.md`). Unique across members (`pmos lint`: `team-duplicate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entra_oid: Option<String>,
     /// Tolerant of role names newer than this build (see [`Role`]).
     #[serde(deserialize_with = "tolerant_roles")]
     pub roles: Vec<Role>,
@@ -447,6 +453,16 @@ pub fn valid_email(email: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// An Entra ID object id: a GUID, 8-4-4-4-12 hex digits, in either case.
+pub fn valid_entra_oid(oid: &str) -> bool {
+    let parts: Vec<&str> = oid.trim().split('-').collect();
+    parts.len() == 5
+        && parts
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(p, n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// A valid PM OS handle (the tool server and harness apply the same rule).

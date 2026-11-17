@@ -185,6 +185,7 @@ pub fn team_fixture(members: &[&str]) -> Fixture {
                 slack_id: "U0TEST".into(),
                 email: None,
                 github: None,
+                entra_oid: None,
                 roles: vec![pmos_contract::model::Role::Pm],
             })
             .collect(),
@@ -211,6 +212,7 @@ pub async fn reply_fixture(postgres: bool) -> Option<(Fixture, Option<TestPg>)> 
                 slack_id: slack_id.to_string(),
                 email: None,
                 github: None,
+                entra_oid: None,
                 roles: vec![pmos_contract::model::Role::Pm],
             })
             .collect(),
@@ -249,6 +251,7 @@ pub async fn roles_fixture(
                 slack_id: "U0TEST".into(),
                 email: None,
                 github: None,
+                entra_oid: None,
                 roles: vec![role.clone()],
             })
             .collect(),

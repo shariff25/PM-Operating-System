@@ -8,14 +8,20 @@
 //! | `confluence.create_draft` `{space, title, body, parent_id?}` | `confluence_page` | `title` | `body` | Space `space`, under page `parent_id` |
 //! | `confluence.update_page` `{page_id, version, body, version_comment?}` | `confluence_page` | "Update to page `page_id`" (the item has no title) | `body` | Page `page_id` |
 //! | `jira.create_issue` `{project, issue_type, summary, description?, epic?}` | `jira_issue` | `summary` | `description` | Project `project`, a `issue_type`, under `epic` |
-//! | `slack.post_reply` `{channel, thread_ts, text, message_ts?}` | `slack_reply` | "Reply in `channel`" | `text` | A thread in `channel` |
-//! | `slack.send_message` `{channel, text}` | `slack_message` | "Message to `channel`" | `text` | `channel` |
+//! | `slack.post_reply` `{channel, thread_ts, text, message_ts?}` | `slack_reply` | "Reply in a Slack thread" | `text` | "A Slack thread" |
+//! | `slack.send_message` `{channel, text}` | `slack_message` | "Message to a Slack channel" | `text` | "A Slack channel" |
+//!
+//! (A `D…` channel is "a direct message thread" or "Direct message": a Slack label never shows
+//! a channel id, since PM OS keeps no channel names; `target.url` opens it in Slack. Where the
+//! run read a Confluence page or a Jira epic the target names, [`with_sources`] names it with
+//! the title the tool server recorded at the read.)
 //!
 //! Other write tools (such as `bets.record`) are not drafts in this contract and are left
 //! out. A PM's edit maps back onto the same fields ([`edited_args`]) and leaves every other
-//! argument as drafted: the tool server refuses an edit from `pmos-web` that changes where a
-//! write goes (`422 target_changed`; for `confluence.update_page`, `page_id` and the page
-//! `version` the bot read).
+//! argument as drafted; `pmos-web` saves it on the item at the tool server, which refuses one
+//! that changes where a write goes (`422 target_changed`; for `confluence.update_page`,
+//! `page_id` and the page `version` the bot read). The item's `args` then are the edit and
+//! its `edited` is true.
 //!
 //! **What the PM is told about the target comes from ids, never from free text the bot
 //! wrote.** The label is built from the target arguments only (space, page, project, issue
@@ -24,7 +30,7 @@
 //! from the tool server's own fields; `sources` from its audit log.
 //!
 //! **`version`** is the SHA-256 of the tool and the canonical JSON of the arguments an
-//! approve would send now (the item's arguments with the PM's saved edit applied). An
+//! approve would send now (the item's arguments, which hold the PM's saved edit). An
 //! approve that names another version is refused (`409 stale`), so what is published is
 //! what the PM saw.
 //!
@@ -96,6 +102,9 @@ pub struct Draft {
     pub summary: DraftSummary,
     pub body: String,
     pub edited: bool,
+    /// When the PM last saved an edit of this draft (the tool server's `edited_at`); `null`
+    /// when it is the bot's text, or the edit was an edit decision.
+    pub edited_at: Option<String>,
     pub target: Target,
     /// What the bot read for the run that made the draft (the tool server's
     /// `GET /internal/approvals/{id}/sources`); empty when it can't say.
@@ -104,7 +113,30 @@ pub struct Draft {
     pub external: bool,
     /// What an approve would publish now; see the module docs.
     pub version: String,
+    /// The drafting run read restricted sources (or the item predates that record, which
+    /// counts the same): a Slack post of it is blocked where anyone outside the product team
+    /// can see it. What the Slack card shows as "built from restricted sources".
+    pub restricted_sources: bool,
+    /// For a Slack draft, who will see it, as far as PM OS has checked; `null` for other
+    /// drafts.
+    pub audience: Option<Audience>,
+    /// The line PM OS adds to what it writes, so readers know it was drafted with PM OS;
+    /// `null` for a practice draft.
+    pub marker: Option<String>,
 }
+
+/// Who can see a Slack draft's channel. Both are `null` until PM OS has checked the channel,
+/// which it does on an approve (the tool server's audience check).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+pub struct Audience {
+    /// How many members the channel has.
+    pub members: Option<u64>,
+    /// Shared with people outside the company (Slack Connect).
+    pub external: Option<bool>,
+}
+
+/// What PM OS appends to every write it makes (the tool server's connectors).
+pub const MARKER: &str = "Drafted with PM OS";
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Suggestion {
@@ -170,13 +202,44 @@ fn title_and_body(tool: &str, args: &Value) -> (String, String) {
         ),
         "jira.create_issue" => (s(args, "summary").into(), s(args, "description").into()),
         "slack.post_reply" => (
-            format!("Reply in {}", ident(s(args, "channel"), "channel")),
+            format!("Reply in {}", slack_place(s(args, "channel"), true)),
             s(args, "text").into(),
         ),
         _ => (
-            format!("Message to {}", ident(s(args, "channel"), "channel")),
+            match slack_place(s(args, "channel"), false) {
+                "a direct message" => "Direct message".to_string(),
+                place => format!("Message to {place}"),
+            },
             s(args, "text").into(),
         ),
+    }
+}
+
+/// Where a Slack draft goes, in words, never as a raw id: PM OS keeps no channel names
+/// (Slack shows the name to whoever opens `target.url`). A `D…` id is a direct message; a
+/// `C…` or `G…` id a channel; a `U…` or `W…` id a person's DMs; anything else is
+/// unrecognised.
+fn slack_place(channel: &str, thread: bool) -> &'static str {
+    let id_ok = !channel.is_empty()
+        && channel.len() <= 32
+        && channel
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+    match (id_ok, channel.chars().next(), thread) {
+        (true, Some('D'), true) => "a direct message thread",
+        (true, Some('D' | 'U' | 'W'), _) => "a direct message",
+        (true, Some('C' | 'G'), true) => "a Slack thread",
+        (true, Some('C' | 'G'), false) => "a Slack channel",
+        _ => "an unrecognised channel",
+    }
+}
+
+/// `text` with its first letter capitalised.
+fn sentence(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -247,11 +310,8 @@ fn target(item: &Approval) -> Target {
             }
             ("jira", label)
         }
-        "slack.post_reply" => (
-            "slack",
-            format!("A thread in {}", ident(s(args, "channel"), "channel")),
-        ),
-        _ => ("slack", ident(s(args, "channel"), "channel")),
+        "slack.post_reply" => ("slack", sentence(slack_place(s(args, "channel"), true))),
+        _ => ("slack", sentence(slack_place(s(args, "channel"), false))),
     };
     Target {
         system,
@@ -260,15 +320,85 @@ fn target(item: &Approval) -> Target {
     }
 }
 
+/// The title the tool server recorded when the run read `reference` in `system` (a Jira
+/// issue's "KEY: summary", a Confluence page's title), if it read it and the title is more
+/// than the id. Quoted for a label.
+fn read_title(
+    listed: &[(Source, Option<String>, String)],
+    system: &str,
+    reference: &str,
+) -> Option<String> {
+    listed
+        .iter()
+        .find(|(s, _, r)| s.system == system && r == reference)
+        .map(|(s, _, _)| s.title.trim().to_string())
+        .filter(|t| !t.is_empty() && t != reference)
+}
+
+/// The target label with the names the run read for its ids (`docs/web-api.md`, Drafts): a
+/// Confluence parent page's or updated page's title, a Jira epic's "KEY: summary". These are
+/// the titles the tool server recorded at the read, not text the bot wrote, and an id the run
+/// didn't read stays an id. Slack labels never name a channel (see [`slack_place`]).
+fn named_target(
+    mut target: Target,
+    item: &Approval,
+    listed: &[(Source, Option<String>, String)],
+) -> Target {
+    let args = &item.args;
+    match item.tool.as_str() {
+        "confluence.create_draft" => {
+            let parent = s(args, "parent_id");
+            if let Some(title) = read_title(listed, "confluence", parent) {
+                target.label = format!(
+                    "Space {}, under “{title}”",
+                    ident(s(args, "space"), "space")
+                );
+            }
+        }
+        "confluence.update_page" => {
+            if let Some(title) = read_title(listed, "confluence", s(args, "page_id")) {
+                target.label = format!("Page “{title}”");
+            }
+        }
+        "jira.create_issue" => {
+            if let Some(title) = read_title(listed, "jira", s(args, "epic")) {
+                target.label = format!(
+                    "Project {}, a new {} under {title}",
+                    ident(s(args, "project"), "project"),
+                    issue_type(s(args, "issue_type"))
+                );
+            }
+        }
+        _ => {}
+    }
+    target
+}
+
 /// The tool server's sources as the draft's: each with a link only if it is `https`, a
 /// plain title of bounded length, no excerpt (none is kept anywhere), at most
 /// [`MAX_SOURCES`], none cited (see [`with_sources`]).
 pub fn sources(found: Vec<ApprovalSource>) -> Vec<Source> {
-    listed(found).into_iter().map(|(s, _)| s).collect()
+    listed(found).into_iter().map(|(s, _, _)| s).collect()
 }
 
-/// [`sources`], each with the ref the bot's markers name it by, if it is one.
-fn listed(found: Vec<ApprovalSource>) -> Vec<(Source, Option<String>)> {
+/// A Slack source's title without its channel id: the tool server records no Slack title,
+/// so it sends "Slack thread in C01" or "Slack message in C01", and a raw id helps no one
+/// (the source's `url` opens it in Slack, which shows the channel's name).
+fn slack_title(title: String) -> String {
+    for (prefix, plain) in [
+        ("Slack thread in ", "Slack thread"),
+        ("Slack message in ", "Slack message"),
+    ] {
+        if title.starts_with(prefix) {
+            return plain.to_string();
+        }
+    }
+    title
+}
+
+/// [`sources`], each with the ref the bot's markers name it by, if it is one, and its id in
+/// its system (the tool server's `ref`).
+fn listed(found: Vec<ApprovalSource>) -> Vec<(Source, Option<String>, String)> {
     found
         .into_iter()
         .filter(|s| !s.reference.is_empty())
@@ -286,19 +416,25 @@ fn listed(found: Vec<ApprovalSource>) -> Vec<(Source, Option<String>)> {
                 .filter(|c| !c.is_control())
                 .take(MAX_SOURCE_TITLE)
                 .collect();
+            let system = ident(&s.system, "system");
+            let title = if title.trim().is_empty() {
+                s.reference.chars().take(MAX_SOURCE_TITLE).collect()
+            } else {
+                title
+            };
             let source = Source {
                 id: format!("s{}", i + 1),
-                system: ident(&s.system, "system"),
-                title: if title.trim().is_empty() {
-                    s.reference.chars().take(MAX_SOURCE_TITLE).collect()
+                title: if system == "slack" {
+                    slack_title(title)
                 } else {
                     title
                 },
+                system,
                 url: s.url.filter(|u| safe_url(u)),
                 excerpt: None,
                 cited: false,
             };
-            (source, cite)
+            (source, cite, s.reference)
         })
         .collect()
 }
@@ -328,15 +464,16 @@ pub struct Citations {
 pub fn with_sources(
     mut draft: Draft,
     item: &Approval,
-    state: &UserState,
     found: Vec<ApprovalSource>,
 ) -> (Draft, Citations) {
     let mut listed = listed(found);
     let mut citations = Citations::default();
-    if !state.edits.contains_key(&item.id) {
+    if !item.edited {
         let (_, raw) = title_and_body(&item.tool, &item.args);
         let rendered = cite::render(&display_body(&raw), |r| {
-            let (source, _) = listed.iter_mut().find(|(_, c)| c.as_deref() == Some(r))?;
+            let (source, _, _) = listed
+                .iter_mut()
+                .find(|(_, c, _)| c.as_deref() == Some(r))?;
             source.cited = true;
             Some(format!("[[{}]]", source.id))
         });
@@ -346,7 +483,8 @@ pub fn with_sources(
         };
         draft.body = rendered.text;
     }
-    draft.sources = listed.into_iter().map(|(s, _)| s).collect();
+    draft.target = named_target(draft.target, item, &listed);
+    draft.sources = listed.into_iter().map(|(s, _, _)| s).collect();
     (draft, citations)
 }
 
@@ -382,17 +520,10 @@ pub fn args_version(tool: &str, args: &Value) -> String {
     hex_sha256(&[tool, &canonical])
 }
 
-/// The arguments an approve of `item` would send now: with the PM's saved edit, if any.
-pub fn effective_args(item: &Approval, state: &UserState) -> Value {
-    match state.edits.get(&item.id) {
-        Some(edit) => edited_args(&item.tool, &item.args, edit),
-        None => item.args.clone(),
-    }
-}
-
-/// The version of `item` as the PM sees it now.
-pub fn version(item: &Approval, state: &UserState) -> String {
-    args_version(&item.tool, &effective_args(item, state))
+/// The version of `item` as the PM sees it now: its arguments, which hold the PM's saved
+/// edit when there is one (the tool server keeps it, `PUT /internal/approvals/{id}/draft`).
+pub fn version(item: &Approval) -> String {
+    args_version(&item.tool, &item.args)
 }
 
 /// The version of a practice draft as the PM sees it now.
@@ -405,7 +536,9 @@ pub fn practice_version(p: &PracticeDraft, state: &UserState) -> String {
     hex_sha256(&["practice", &p.id, title, body])
 }
 
-/// The item's arguments with the PM's edit applied, for decision `edit`.
+/// The item's arguments with the PM's edit applied: what `PUT /api/drafts/{id}` saves on the
+/// item at the tool server. Only the text fields change; a title the edit doesn't name keeps
+/// the item's own.
 pub fn edited_args(tool: &str, args: &Value, edit: &DraftEdit) -> Value {
     let mut args = args.clone();
     if !args.is_object() {
@@ -454,14 +587,9 @@ fn expires_at(item: &Approval) -> Option<String> {
 }
 
 /// The summary of an approval item, or `None` for a tool that isn't a draft.
-pub fn summary(item: &Approval, state: &UserState) -> Option<DraftSummary> {
+pub fn summary(item: &Approval) -> Option<DraftSummary> {
     let kind = kind(&item.tool)?;
-    let (mut title, _) = title_and_body(&item.tool, &item.args);
-    if let Some(t) = state.edits.get(&item.id).and_then(|e| e.title.as_ref()) {
-        if has_title(&item.tool) {
-            title = t.clone();
-        }
-    }
+    let (title, _) = title_and_body(&item.tool, &item.args);
     // A title is never cited: a marker in it is removed.
     let title = cite::strip(&title);
     Some(DraftSummary {
@@ -536,31 +664,59 @@ pub fn display_body(body: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-/// The whole draft of an approval item, with the PM's saved edit if there is one. Without
-/// one, the body is the item's own, repaired for display only ([`display_body`]). Either
-/// way it has no source markers and no sources: [`with_sources`] adds both.
+/// The whole draft of an approval item. Its arguments hold the PM's saved edit, if there is
+/// one (`item.edited`): that text is the PM's, shown as it is. Otherwise the body is the
+/// bot's, repaired for display only ([`display_body`]). Either way it has no source markers
+/// and no sources: [`with_sources`] adds both. `state.external` is what this server last
+/// heard of the channel's audience when the tool server's own answer is missing.
 pub fn draft(item: &Approval, state: &UserState) -> Option<Draft> {
-    let summary = summary(item, state)?;
+    let summary = summary(item)?;
     let (_, body) = title_and_body(&item.tool, &item.args);
-    let edit = state.edits.get(&item.id);
-    let body = match edit {
-        Some(e) => cite::strip(&e.body),
-        None => cite::strip(&display_body(&body)),
+    let body = if item.edited {
+        cite::strip(&body)
+    } else {
+        cite::strip(&display_body(&body))
     };
+    // The tool server's audience result when it has one; else what its last
+    // `needs_external_confirm` answer for this draft said.
+    let external = item
+        .external
+        .or_else(|| state.external.contains(&item.id).then_some(true));
     Some(Draft {
         summary,
         body,
-        edited: edit.is_some(),
+        edited: item.edited,
+        edited_at: item
+            .edited_at
+            .as_deref()
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| rfc3339(t.with_timezone(&Utc))),
         target: target(item),
         sources: Vec::new(),
         result_url: result_url(item.result.as_ref()),
-        // The tool server's audience result when it has one; else what its last
-        // `needs_external_confirm` answer for this draft said.
-        external: item
-            .external
-            .unwrap_or_else(|| state.external.contains(&item.id)),
-        version: version(item, state),
+        external: external.unwrap_or(false),
+        version: version(item),
+        restricted_sources: item
+            .sources_sensitivity
+            .as_deref()
+            .is_none_or(|s| s == "restricted"),
+        audience: is_slack(&item.tool).then_some(Audience {
+            members: None,
+            external,
+        }),
+        marker: Some(marker(item)),
     })
+}
+
+/// The line PM OS adds to what it writes for `item` (the tool server's connectors): a Slack
+/// post ends with "_Drafted with PM OS_"; a Jira description and a Confluence page end with
+/// "Drafted with PM OS · run <run id>".
+pub fn marker(item: &Approval) -> String {
+    if is_slack(&item.tool) {
+        MARKER.to_string()
+    } else {
+        format!("{MARKER} · run {}", ident(&item.run_id, "run"))
+    }
 }
 
 // The practice draft.
@@ -622,6 +778,7 @@ pub fn practice_draft(p: &PracticeDraft, bot: &str, state: &UserState) -> Draft 
             .map(|e| cite::strip(&e.body))
             .unwrap_or_else(|| PRACTICE_BODY.into()),
         edited: edit.is_some(),
+        edited_at: None,
         target: Target {
             system: "confluence",
             label: PRACTICE_LABEL.into(),
@@ -631,6 +788,9 @@ pub fn practice_draft(p: &PracticeDraft, bot: &str, state: &UserState) -> Draft 
         result_url: None,
         external: false,
         version: practice_version(p, state),
+        restricted_sources: false,
+        audience: None,
+        marker: None,
     }
 }
 
@@ -662,6 +822,15 @@ mod tests {
         .unwrap()
     }
 
+    /// `it` as the tool server answers it once the PM saved an edit: the edited arguments,
+    /// `edited: true`.
+    fn edited(mut it: Approval, args: Value) -> Approval {
+        it.args = args;
+        it.edited = true;
+        it.edited_at = Some("2026-11-16T09:30:00Z".into());
+        it
+    }
+
     #[test]
     fn maps_each_write_tool() {
         let none = UserState::default();
@@ -680,6 +849,9 @@ mod tests {
         assert_eq!(d.target.label, "Space PM, under page 42");
         assert_eq!(d.summary.expires_at, None);
         assert_eq!(d.summary.task_id.as_deref(), Some("tsk_1"));
+        assert_eq!(d.marker.as_deref(), Some("Drafted with PM OS · run tsk_1"));
+        assert_eq!(d.audience, None, "not a Slack draft");
+        assert!(d.restricted_sources, "unrecorded counts as restricted");
 
         let d = draft(
             &item(
@@ -692,18 +864,25 @@ mod tests {
         assert_eq!((d.summary.kind, d.target.system), ("jira_issue", "jira"));
         assert_eq!(d.body, "Text");
 
-        let d = draft(
-            &item(
-                "slack.post_reply",
-                json!({"channel": "C01", "thread_ts": "1.2", "text": "Hello"}),
-            ),
-            &none,
-        )
-        .unwrap();
+        let mut reply = item(
+            "slack.post_reply",
+            json!({"channel": "C01", "thread_ts": "1.2", "text": "Hello"}),
+        );
+        reply.sources_sensitivity = Some("internal".into());
+        let d = draft(&reply, &none).unwrap();
         assert_eq!(d.summary.kind, "slack_reply");
         assert_eq!(
             d.summary.expires_at.as_deref(),
             Some("2026-11-17T09:00:00Z")
+        );
+        assert_eq!(d.marker.as_deref(), Some("Drafted with PM OS"));
+        assert!(!d.restricted_sources);
+        assert_eq!(
+            d.audience,
+            Some(Audience {
+                members: None,
+                external: None
+            })
         );
         let d = draft(
             &item(
@@ -715,6 +894,128 @@ mod tests {
         .unwrap();
         assert_eq!((d.summary.kind, d.body.as_str()), ("slack_message", "Hi"));
         assert!(draft(&item("bets.record", json!({})), &none).is_none());
+    }
+
+    #[test]
+    fn slack_destinations_never_show_a_raw_channel_id() {
+        let none = UserState::default();
+        let cases = [
+            (
+                "slack.post_reply",
+                "C0LAUNCH",
+                "A Slack thread",
+                "Reply in a Slack thread",
+            ),
+            (
+                "slack.post_reply",
+                "G0PRIVATE1",
+                "A Slack thread",
+                "Reply in a Slack thread",
+            ),
+            (
+                "slack.post_reply",
+                "D0DIRECT1",
+                "A direct message thread",
+                "Reply in a direct message thread",
+            ),
+            (
+                "slack.send_message",
+                "C0LAUNCH",
+                "A Slack channel",
+                "Message to a Slack channel",
+            ),
+            (
+                "slack.send_message",
+                "D0DIRECT1",
+                "A direct message",
+                "Direct message",
+            ),
+            (
+                "slack.send_message",
+                "U0BEN",
+                "A direct message",
+                "Direct message",
+            ),
+        ];
+        for (tool, channel, label, title) in cases {
+            let d = draft(
+                &item(
+                    tool,
+                    json!({"channel": channel, "thread_ts": "1731600000.000100", "text": "x"}),
+                ),
+                &none,
+            )
+            .unwrap();
+            assert_eq!(d.target.label, label, "{tool} {channel}");
+            assert_eq!(d.summary.title, title, "{tool} {channel}");
+            assert!(!d.target.label.contains(channel) && !d.summary.title.contains(channel));
+        }
+    }
+
+    #[test]
+    fn real_destinations_are_named_from_what_the_run_read() {
+        // Realistic ids, as a live tool server sends them: a Confluence page id, a Jira epic
+        // key, a Slack channel. The titles are the ones the tool server recorded at the read.
+        let read = |system: &str, reference: &str, title: &str| ApprovalSource {
+            system: system.into(),
+            title: title.into(),
+            url: None,
+            reference: reference.into(),
+            cite: None,
+        };
+        let found = vec![
+            read("confluence", "163841", "Specs"),
+            read("confluence", "229377", "PRD: Billing retries"),
+            read("jira", "PAY-212", "PAY-212: TCB grace period"),
+            read(
+                "slack",
+                "C0LAUNCH:1731600000.000100",
+                "Slack thread in C0LAUNCH",
+            ),
+        ];
+        let none = UserState::default();
+        let it = item(
+            "confluence.create_draft",
+            json!({"space": "PAYMENTS", "title": "PRD", "body": "x", "parent_id": "163841"}),
+        );
+        let (d, _) = with_sources(draft(&it, &none).unwrap(), &it, found.clone());
+        assert_eq!(d.target.label, "Space PAYMENTS, under “Specs”");
+        assert_eq!(
+            d.sources[3].title, "Slack thread",
+            "no channel id in a source title"
+        );
+        let it = item(
+            "confluence.update_page",
+            json!({"page_id": "229377", "version": 4, "body": "x"}),
+        );
+        let (d, _) = with_sources(draft(&it, &none).unwrap(), &it, found.clone());
+        assert_eq!(d.target.label, "Page “PRD: Billing retries”");
+        let it = item(
+            "jira.create_issue",
+            json!({"project": "PAY", "issue_type": "Story", "summary": "S", "epic": "PAY-212"}),
+        );
+        let (d, _) = with_sources(draft(&it, &none).unwrap(), &it, found.clone());
+        assert_eq!(
+            d.target.label,
+            "Project PAY, a new Story under PAY-212: TCB grace period"
+        );
+        // An id the run didn't read stays an id; one read without a title too.
+        let it = item(
+            "jira.create_issue",
+            json!({"project": "PAY", "issue_type": "Story", "summary": "S", "epic": "PAY-9"}),
+        );
+        let (d, _) = with_sources(draft(&it, &none).unwrap(), &it, found);
+        assert_eq!(d.target.label, "Project PAY, a new Story under PAY-9");
+        let it = item(
+            "confluence.update_page",
+            json!({"page_id": "5", "version": 1, "body": "x"}),
+        );
+        let (d, _) = with_sources(
+            draft(&it, &none).unwrap(),
+            &it,
+            vec![read("confluence", "5", "")],
+        );
+        assert_eq!(d.target.label, "Page 5");
     }
 
     #[test]
@@ -766,7 +1067,7 @@ mod tests {
             &none,
         )
         .unwrap();
-        assert_eq!(d.target.label, "an unrecognised channel");
+        assert_eq!(d.target.label, "An unrecognised channel");
         assert_eq!(d.summary.title, "Message to an unrecognised channel");
         let d = draft(
             &item(
@@ -793,36 +1094,37 @@ mod tests {
             Some("https://slack.com/archives/C01")
         );
         assert!(d.external, "the tool server's audience result");
+        assert_eq!(d.audience.unwrap().external, Some(true));
     }
 
     #[test]
     fn the_version_is_what_an_approve_would_publish() {
-        let mut state = UserState::default();
         let it = item(
             "confluence.create_draft",
             json!({"space": "PM", "title": "PRD", "body": "Old"}),
         );
-        let before = version(&it, &state);
-        assert_eq!(before, version(&it, &state), "stable");
-        state.edits.insert(
-            "apr_1".into(),
-            DraftEdit {
-                title: None,
-                body: "New".into(),
-            },
+        let before = version(&it);
+        assert_eq!(before, version(&it), "stable");
+        // The PM saved an edit: the tool server's arguments are theirs now.
+        let saved = edited(
+            it.clone(),
+            json!({"body": "New", "title": "PRD", "space": "PM"}),
         );
-        let edited = version(&it, &state);
-        assert_ne!(before, edited);
-        // Once approved with the edit, the item's own arguments have the same version, in
-        // any key order.
-        let mut approved = it.clone();
-        approved.args = json!({"body": "New", "title": "PRD", "space": "PM"});
-        assert_eq!(version(&approved, &UserState::default()), edited);
+        let after = version(&saved);
+        assert_ne!(before, after);
+        // In any key order.
+        let mut same = saved.clone();
+        same.args = json!({"space": "PM", "title": "PRD", "body": "New"});
+        assert_eq!(version(&same), after);
         assert_ne!(
-            args_version("confluence.update_page", &approved.args),
-            edited,
+            args_version("confluence.update_page", &saved.args),
+            after,
             "the tool is part of it"
         );
+        let d = draft(&saved, &UserState::default()).unwrap();
+        assert!(d.edited);
+        assert_eq!(d.edited_at.as_deref(), Some("2026-11-16T09:30:00Z"));
+        assert_eq!(d.body, "New");
     }
 
     #[test]
@@ -881,7 +1183,7 @@ mod tests {
             "confluence.create_draft",
             json!({"space": "PM", "title": "Plan [[src-aaaaaa]]", "body": body}),
         );
-        let (d, c) = with_sources(draft(&it, &none).unwrap(), &it, &none, read_three());
+        let (d, c) = with_sources(draft(&it, &none).unwrap(), &it, read_three());
         assert_eq!(
             d.body,
             "# Plan[[s1]]\n\nGrace is 7 days[[s3]][[s1]].\n- Churn rises.\n\nUse `[[src-bbbbbb]]` in code.\n"
@@ -908,7 +1210,7 @@ mod tests {
             json!({"project": "PAY", "issue_type": "Story", "summary": "S", "description": "Plain."}),
         );
         let before = draft(&it, &none).unwrap();
-        let (d, c) = with_sources(before.clone(), &it, &none, read_three());
+        let (d, c) = with_sources(before.clone(), &it, read_three());
         assert_eq!(d.body, "Plain.");
         assert_eq!(c, Citations::default());
         assert!(d.sources.iter().all(|s| !s.cited));
@@ -920,32 +1222,28 @@ mod tests {
             json!({"channel": "C01", "thread_ts": "1.2", "text": "Yes [[src-aaaaaa]] and [[s1]]."}),
         );
         let old = vec![src("PAY-1", None), src("PAY-2", Some("not a ref"))];
-        let (d, c) = with_sources(draft(&it, &none).unwrap(), &it, &none, old);
+        let (d, c) = with_sources(draft(&it, &none).unwrap(), &it, old);
         assert_eq!(d.body, "Yes and.");
         assert_eq!((c.kept, c.dropped), (0, 2));
         assert!(d.sources.iter().all(|s| !s.cited));
         // No sources at all (the tool server couldn't say).
-        let (d, _) = with_sources(draft(&it, &none).unwrap(), &it, &none, Vec::new());
+        let (d, _) = with_sources(draft(&it, &none).unwrap(), &it, Vec::new());
         assert_eq!(d.body, "Yes and.");
         assert!(d.sources.is_empty());
     }
 
     #[test]
     fn an_edited_draft_has_no_citations() {
-        let it = item(
-            "confluence.create_draft",
-            json!({"space": "PM", "title": "T", "body": "Claim [[src-aaaaaa]]."}),
+        let it = edited(
+            item(
+                "confluence.create_draft",
+                json!({"space": "PM", "title": "T", "body": "Claim [[src-aaaaaa]]."}),
+            ),
+            // Saved through Slack's editor, which keeps markers, or typed by the PM.
+            json!({"space": "PM", "title": "T", "body": "Claim, edited [[s1]] [[src-aaaaaa]]."}),
         );
-        let mut edited = UserState::default();
-        edited.edits.insert(
-            "apr_1".into(),
-            DraftEdit {
-                title: None,
-                // Saved before markers were removed on save, or typed by the PM.
-                body: "Claim, edited [[s1]] [[src-aaaaaa]].".into(),
-            },
-        );
-        let (d, c) = with_sources(draft(&it, &edited).unwrap(), &it, &edited, read_three());
+        let none = UserState::default();
+        let (d, c) = with_sources(draft(&it, &none).unwrap(), &it, read_three());
         assert_eq!(d.body, "Claim, edited.");
         assert!(d.edited);
         assert_eq!(c, Citations::default());
@@ -976,29 +1274,22 @@ mod tests {
         );
         let d = draft(&it, &none).unwrap();
         assert_eq!(d.body, "We launch.\n\nSource: PM-101");
-        // What an approve sends, and the version, are the item's own arguments.
-        assert_eq!(effective_args(&it, &none)["body"], raw);
+        // The version is the item's own arguments, escapes and all.
         assert_eq!(d.version, args_version(&it.tool, &it.args));
 
-        // Once the PM saves an edit, the edit is the body, and it is what is sent.
-        let mut edited = UserState::default();
-        edited.edits.insert(
-            "apr_1".into(),
-            DraftEdit {
-                title: None,
-                body: d.body.clone(),
-            },
-        );
-        let d2 = draft(&it, &edited).unwrap();
+        // Once the PM saves the text they saw, it is the item's text, and what is sent.
+        let shown = DraftEdit {
+            title: None,
+            body: d.body.clone(),
+        };
+        let saved = edited(it.clone(), edited_args(&it.tool, &it.args, &shown));
+        let d2 = draft(&saved, &none).unwrap();
         assert_eq!(d2.body, "We launch.\n\nSource: PM-101");
-        assert_eq!(
-            effective_args(&it, &edited)["body"],
-            "We launch.\n\nSource: PM-101"
-        );
+        assert_eq!(saved.args["body"], "We launch.\n\nSource: PM-101");
         assert_ne!(d2.version, d.version);
         // An edit with literal escapes is the PM's own text: never rewritten.
-        edited.edits.get_mut("apr_1").unwrap().body = raw.into();
-        assert_eq!(draft(&it, &edited).unwrap().body, raw);
+        let literal = edited(it, json!({"space": "PM", "title": "PRD", "body": raw}));
+        assert_eq!(draft(&literal, &none).unwrap().body, raw);
     }
 
     #[test]
@@ -1006,5 +1297,10 @@ mod tests {
         let p = new_practice(Utc::now());
         assert!(is_practice_id(&p.id));
         assert!(p.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        let d = practice_draft(&p, "pm-ana", &UserState::default());
+        assert_eq!(
+            (d.marker, d.audience, d.restricted_sources),
+            (None, None, false)
+        );
     }
 }

@@ -824,6 +824,7 @@ impl Cx {
         let mut slack_ids = BTreeSet::new();
         let mut github_logins = BTreeSet::new();
         let mut emails = BTreeSet::new();
+        let mut entra_oids = BTreeSet::new();
         for m in &team.members {
             if !crate::model::valid_handle(&m.handle) {
                 self.error(
@@ -885,6 +886,21 @@ impl Cx {
                         "team-duplicate",
                         &path,
                         format!("GitHub login `{login}` is listed twice"),
+                    );
+                }
+            }
+            if let Some(oid) = &m.entra_oid {
+                if !crate::model::valid_entra_oid(oid) {
+                    self.error(
+                        "team-entra-oid",
+                        &path,
+                        format!("`{oid}` is not an Entra ID object id (a GUID)"),
+                    );
+                } else if !entra_oids.insert(oid.trim().to_ascii_lowercase()) {
+                    self.error(
+                        "team-duplicate",
+                        &path,
+                        format!("Entra ID object id `{oid}` is listed twice"),
                     );
                 }
             }

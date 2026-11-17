@@ -1,13 +1,15 @@
 //! The router and every `/api` route in `docs/web-api.md`.
 //!
 //! Every request but sign-in, `/healthz` and the static app needs a live session; the
-//! session's handle must still be a member in `team.yaml` (re-read on each request), and
+//! session's handle must still be a member in `team.yaml` (re-read when it changes), and
 //! every `POST`, `PUT` and `DELETE` must come from the app's own origin and carry the
 //! session's CSRF token. Drafts and tasks also need the PM abilities of the permission
 //! matrix; someone else's draft or task answers `404 not_found`.
 
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
+
+use tokio_util::sync::CancellationToken;
 
 use axum::body::Bytes;
 use axum::extract::{FromRequestParts, Path, State};
@@ -34,8 +36,9 @@ use crate::session::{
     self, IdHash, MemorySessionStore, Session, SessionStore, StoreError, CSRF_HEADER,
 };
 use crate::settings::{DraftEdit, MemorySettingsStore, SettingsStore, StoredSuggestion, UserState};
+use crate::team::TeamCache;
 use crate::upstream::{
-    Approval, DecisionBody, Runtime, Task, TaskEvent, ToolServer, UpstreamError,
+    Approval, DecisionBody, RefusedAudience, Runtime, Task, TaskEvent, ToolServer, UpstreamError,
 };
 
 mod admin;
@@ -108,6 +111,9 @@ impl Deps {
 }
 
 struct Inner {
+    /// `team.yaml`, parsed once and re-read when it changes (`team.rs`).
+    team: TeamCache,
+    /// The deployed content tree the admin content and policy screens read.
     content_root: PathBuf,
     public_url: Option<String>,
     static_root: Option<PathBuf>,
@@ -124,10 +130,52 @@ struct Inner {
     brief: BriefConfig,
     clock: Clock,
     proposals: proposal::Proposals,
+    /// What refusals said of drafts' Slack audiences, by draft id ([`remember_audience`]).
+    audiences: std::sync::Mutex<std::collections::HashMap<String, RefusedAudience>>,
 }
 
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
+
+/// What `pmos-web` serves ([`build_server`]): the browser-facing router; the
+/// server-to-server router when `PMOS_WEB_INTERNAL_BIND` gives it its own listener; and the
+/// periodic purge.
+pub struct Server {
+    pub public: Router,
+    /// `Some` only with `internal_bind`: `PUT /internal/brief/{handle}`, `/healthz` and
+    /// `/readyz`. Without it, the internal route is on `public`.
+    pub internal: Option<Router>,
+    pub housekeeping: Housekeeping,
+}
+
+/// How often expired sessions, follow-ups, `changed` items, edits and suggestions are
+/// deleted ([`Housekeeping::run`]).
+pub const HOUSEKEEPING_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The periodic purge: what has expired is deleted every [`HOUSEKEEPING_EVERY`] whether or
+/// not anyone signs in (it also runs at each sign-in). Expired rows are never served before
+/// it runs: every read filters on expiry.
+#[derive(Clone)]
+pub struct Housekeeping(AppState);
+
+impl Housekeeping {
+    /// One purge now. A failure is logged, never fatal.
+    pub async fn run_once(&self) {
+        brief::housekeeping(&self.0).await;
+    }
+
+    /// Purge at once and then every `every`, until `shutdown`.
+    pub async fn run(self, every: std::time::Duration, shutdown: CancellationToken) {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tick.tick() => self.run_once().await,
+            }
+        }
+    }
+}
 
 type Providers = (Vec<Arc<dyn AuthProvider>>, Option<Arc<Entra>>);
 
@@ -152,13 +200,24 @@ pub fn providers(config: &Config) -> Result<Vec<Arc<dyn AuthProvider>>, String> 
     Ok(make_providers(config)?.0)
 }
 
-/// The app. Refuses (`Err`) with no sign-in provider, or a static directory without an
-/// `index.html`.
+/// The browser-facing app ([`build_server`]'s `public`). Without `internal_bind`, the
+/// server-to-server route is on it too.
 pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
+    Ok(build_server(config, deps)?.public)
+}
+
+/// The app. Refuses (`Err`) with no sign-in provider, development sign-in on an address
+/// that isn't loopback, or a static directory without an `index.html`.
+pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
     let (providers, entra) = make_providers(&config)?;
     if providers.is_empty() {
         return Err(NO_PROVIDER.into());
     }
+    crate::config::check_dev_bind(config.dev_login, config.bind)?;
+    let hsts = config
+        .public_url
+        .as_deref()
+        .is_some_and(|u| u.starts_with("https://"));
     let static_root = match &config.static_dir {
         None => None,
         Some(dir) => {
@@ -181,6 +240,7 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
     let state = AppState(Arc::new(Inner {
         runtime: Runtime::new(http.clone(), &config.bots_url, &config.bots_token),
         toolserver: ToolServer::new(http, &config.toolserver_url, &config.toolserver_token),
+        team: TeamCache::new(config.content_root.clone()),
         content_root: config.content_root,
         public_url: config.public_url,
         static_root,
@@ -194,6 +254,7 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
         brief: deps.brief,
         clock: deps.clock,
         proposals: proposal::Proposals::new(deps.admin)?,
+        audiences: Default::default(),
     }));
     let api = Router::new()
         .route("/auth/providers", get(auth_providers))
@@ -232,26 +293,124 @@ pub fn build(config: Config, deps: Deps) -> Result<Router, String> {
             )
         })
         .layer(axum::middleware::from_fn(require_json));
-    Ok(Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+    let health = || {
+        Router::new()
+            .route("/healthz", get(|| async { "ok" }))
+            .route("/readyz", get(readyz))
+    };
+    let mut public = health()
         .nest("/api", api)
-        .route("/internal/brief/{handle}", brief::internal())
+        // Links from before the app's own routes (Slack cards in history): to the app's
+        // route for the draft.
+        .route("/drafts/{id}", get(old_draft_link))
+        .route("/d/{id}", get(old_draft_link));
+    let internal = match config.internal_bind {
+        None => {
+            public = public.route("/internal/brief/{handle}", brief::internal());
+            None
+        }
+        Some(_) => Some(
+            health()
+                .route("/internal/brief/{handle}", brief::internal())
+                .fallback(|| async { ApiError::not_found() })
+                .layer(axum::middleware::from_fn_with_state(hsts, security_headers))
+                .with_state(state.clone()),
+        ),
+    };
+    let public = public
         .fallback(static_files)
-        .layer(axum::middleware::from_fn(security_headers))
-        .with_state(state))
+        .layer(axum::middleware::from_fn_with_state(hsts, security_headers))
+        .with_state(state.clone());
+    Ok(Server {
+        public,
+        internal,
+        housekeeping: Housekeeping(state),
+    })
+}
+
+/// `GET /drafts/{id}` and `GET /d/{id}`: a `303` to the app's own route for the draft,
+/// `/#/d/{id}`, so links Slack posted before cards used that route still open the draft.
+/// The id must be shaped like an approval id (`apr_` and up to 64 letters or digits);
+/// anything else goes to the app's home. Only ever a same-origin path: never an open
+/// redirect.
+async fn old_draft_link(Path(id): Path<String>) -> Response {
+    let ok = id.strip_prefix("apr_").is_some_and(|rest| {
+        !rest.is_empty() && rest.len() <= 64 && rest.chars().all(|c| c.is_ascii_alphanumeric())
+    });
+    if ok {
+        redirect(&format!("/#/d/{id}"), &[])
+    } else {
+        redirect("/", &[])
+    }
+}
+
+/// `GET /readyz`: `200` when this server can serve, `503` otherwise, with each check's
+/// result (`ok` or `down`) and no detail: its store answers, `team.yaml` reads, and the bot
+/// runtime and the tool server answer their own `/healthz` within two seconds. No sign-in
+/// and no secrets: the details go to the log.
+async fn readyz(State(state): State<AppState>) -> Response {
+    let (store, runtime, toolserver) = tokio::join!(
+        state.0.sessions.ping(),
+        state.0.runtime.healthy(),
+        state.0.toolserver.healthy(),
+    );
+    if let Err(e) = &store {
+        tracing::warn!(error = %e, "not ready: store");
+    }
+    let team = state.0.team.load();
+    if let Err(e) = &team {
+        tracing::warn!(error = %e, "not ready: team.yaml");
+    }
+    let checks = [
+        ("store", store.is_ok()),
+        ("team", team.is_ok()),
+        ("bot_runtime", runtime),
+        ("tool_server", toolserver),
+    ];
+    let ready = checks.iter().all(|(_, ok)| *ok);
+    let body: serde_json::Map<String, serde_json::Value> = checks
+        .iter()
+        .map(|(name, ok)| (name.to_string(), json!(if *ok { "ok" } else { "down" })))
+        .collect();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "ready": ready, "checks": body })),
+    )
+        .into_response()
 }
 
 fn is_api(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/")
 }
 
-/// Every response: no sniffing, no framing, no referrer at all, its own browsing context.
-/// Every `/api` answer is `no-store` with a policy that loads nothing, whatever the handler
-/// set; the app's files keep the policy and caching `static_files` gives them.
-async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+/// What browsers are told to use HTTPS for, once they reach an `https` `PMOS_WEB_PUBLIC_URL`:
+/// a year, this host only (another host under the same domain may not serve HTTPS).
+pub const HSTS: &str = "max-age=31536000";
+
+/// Every response: no sniffing, no framing, no referrer at all, its own browsing context,
+/// and with an `https` public URL, `Strict-Transport-Security`. Every `/api` answer is
+/// `no-store` with a policy that loads nothing, whatever the handler set; the app's files
+/// keep the policy and caching `static_files` gives them.
+async fn security_headers(
+    State(hsts): State<bool>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
     let api = is_api(req.uri().path());
     let mut res = next.run(req).await;
     let h = res.headers_mut();
+    if hsts {
+        h.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static(HSTS),
+        );
+    }
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -399,7 +558,7 @@ impl ApiError {
                     ),
                 )
             }
-            UpstreamError::Failed { service, why } => {
+            UpstreamError::Failed { service, why } | UpstreamError::Unknown { service, why } => {
                 tracing::warn!(service, why = %why, "upstream call failed");
                 Self::new(
                     StatusCode::BAD_GATEWAY,
@@ -543,8 +702,8 @@ async fn live_session(
     Ok(found.map(|s| (id, s)))
 }
 
-fn load_team(state: &AppState) -> Result<TeamFile, ApiError> {
-    TeamFile::load(&state.0.content_root).map_err(|e| {
+fn load_team(state: &AppState) -> Result<Arc<TeamFile>, ApiError> {
+    state.0.team.load().map_err(|e| {
         tracing::error!(error = %e, "team.yaml can't be read");
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -577,6 +736,18 @@ impl FromRequestParts<AppState> for Signed {
                 "You're not on the PM OS team any more. Ask a platform owner.",
             ));
         };
+        // An Entra session of a member whose `entra-oid` (added or changed since) isn't the
+        // account that signed in: this session ends.
+        if session.entra_tid.is_some() && !oid_matches(&member, session.entra_oid.as_deref()) {
+            tracing::warn!(user = %session.handle, "session's Entra account no longer matches team.yaml: signed out");
+            state
+                .0
+                .sessions
+                .remove(&id)
+                .await
+                .map_err(ApiError::store)?;
+            return Err(ApiError::signed_out());
+        }
         if is_write(&parts.method) {
             check_write(state, &parts.headers, &session)?;
         }
@@ -633,7 +804,7 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
             "That person isn't on the PM OS team.",
         ));
     };
-    let id = start_session(&state, &headers, member, provider.name()).await?;
+    let id = start_session(&state, &headers, member, provider.name(), None).await?;
     Ok((
         StatusCode::NO_CONTENT,
         [(header::SET_COOKIE, session::set_cookie(&id))],
@@ -641,13 +812,24 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
         .into_response())
 }
 
+/// Does an Entra sign-in's `oid` fit `member`? A member without `entra-oid` in `team.yaml`
+/// is matched by email alone; one with it only by a token carrying that `oid`.
+fn oid_matches(member: &TeamMember, oid: Option<&str>) -> bool {
+    match member.entra_oid.as_deref() {
+        None => true,
+        Some(want) => oid.is_some_and(|got| got.eq_ignore_ascii_case(want.trim())),
+    }
+}
+
 /// A new session for `member`, whichever provider signed them in: the cookie value. Ends
-/// whatever session this browser had (rotation).
+/// whatever session this browser had (rotation). `entra` is the token's `(oid, tid)` for an
+/// Entra ID sign-in.
 async fn start_session(
     state: &AppState,
     headers: &HeaderMap,
     member: &TeamMember,
     provider: &str,
+    entra: Option<(Option<String>, String)>,
 ) -> Result<String, ApiError> {
     if let Some(old) = session::cookie_value(headers) {
         state
@@ -670,6 +852,8 @@ async fn start_session(
                 csrf_token: session::random_token(),
                 created_at: at,
                 last_seen: at,
+                entra_oid: entra.as_ref().and_then(|(oid, _)| oid.clone()),
+                entra_tid: entra.map(|(_, tid)| tid),
             },
         )
         .await
@@ -781,20 +965,38 @@ async fn entra_callback(
         verifier: started.verifier,
         now: at,
     };
-    let email = match entra.authenticate(&input).await {
-        Ok(claimed) => claimed.0,
-        Err(SignInError::Rejected(f)) => return fail(f),
-        Err(_) => return fail(Failure::Failed("unsupported input")),
+    let SignInInput::Entra {
+        code,
+        nonce,
+        verifier,
+        now,
+    } = &input
+    else {
+        return fail(Failure::Failed("unsupported input"));
+    };
+    let identity = match entra.sign_in_identity(code, nonce, verifier, *now).await {
+        Ok(identity) => identity,
+        Err(f) => return fail(f),
     };
     let team = load_team(&state)?;
-    let Some(member) = auth::find_member_by_email(&team, &email) else {
+    let Some(member) = auth::find_member_by_email(&team, &identity.email) else {
         tracing::info!(provider = "entra", "sign-in refused: not in team.yaml");
         return Ok(redirect(
             &signed_out_at("not_a_member"),
             std::slice::from_ref(&clear),
         ));
     };
-    let id = start_session(&state, &headers, member, entra.name()).await?;
+    // A member with `entra-oid` must be that very account: an email address reassigned to
+    // someone else in the tenant doesn't sign in as them.
+    if !oid_matches(member, identity.oid.as_deref()) {
+        tracing::warn!(provider = "entra", user = %member.handle, "sign-in refused: object id doesn't match team.yaml");
+        return Ok(redirect(
+            &signed_out_at("wrong_account"),
+            std::slice::from_ref(&clear),
+        ));
+    }
+    let entra_id = (identity.oid.clone(), identity.tid.clone());
+    let id = start_session(&state, &headers, member, entra.name(), Some(entra_id)).await?;
     Ok(redirect(
         &entra::safe_return(Some(&started.return_to)),
         &[clear, session::set_cookie(&id)],
@@ -952,6 +1154,40 @@ fn base_draft(found: &Found, signed: &Signed, st: &UserState) -> Result<Draft, A
     }
 }
 
+/// The most Slack audiences remembered from refusals (`needs_external_confirm`,
+/// `audience_blocked`). Past it the memory starts again: it is only for showing.
+const MAX_AUDIENCES: usize = 5_000;
+
+/// Remember what a tool server refusal said of a draft's Slack audience, for the draft's
+/// `audience` (the tool server keeps only `external`). In memory: a restart forgets it, as
+/// the tool server forgets its own audience checks.
+fn remember_audience(state: &AppState, id: &str, seen: RefusedAudience) {
+    let mut all = state.0.audiences.lock().expect("audiences lock");
+    if all.len() >= MAX_AUDIENCES && !all.contains_key(id) {
+        all.clear();
+    }
+    all.insert(id.to_string(), seen);
+}
+
+/// A Slack draft's `audience` with what the last refusal for it counted.
+fn with_audience(state: &AppState, mut draft: Draft) -> Draft {
+    if let Some(audience) = draft.audience.as_mut() {
+        let seen = state
+            .0
+            .audiences
+            .lock()
+            .expect("audiences lock")
+            .get(&draft.summary.id)
+            .copied();
+        if let Some(seen) = seen {
+            audience.members = audience.members.or(seen.members);
+            audience.external = audience.external.or(seen.external);
+            draft.external = audience.external.unwrap_or(draft.external);
+        }
+    }
+    draft
+}
+
 /// The whole draft, with what the bot read for it. A practice draft has no sources and
 /// never reaches the tool server.
 async fn render(
@@ -986,7 +1222,8 @@ async fn item_draft(
             Vec::new()
         }
     };
-    let (draft, citations) = drafts::with_sources(draft, item, st, found);
+    let (draft, citations) = drafts::with_sources(draft, item, found);
+    let draft = with_audience(state, draft);
     if citations.dropped > 0 {
         // Counts only: never the draft's text or the refs.
         tracing::info!(
@@ -1021,7 +1258,7 @@ async fn list_drafts(State(state): State<AppState>, signed: Signed) -> ApiResult
     let mut pending = Vec::new();
     let mut decided = Vec::new();
     for item in items.iter().filter(|i| i.user == signed.handle()) {
-        let Some(summary) = drafts::summary(item, &st) else {
+        let Some(summary) = drafts::summary(item) else {
             continue;
         };
         if item.status == "pending" {
@@ -1046,7 +1283,8 @@ async fn list_drafts(State(state): State<AppState>, signed: Signed) -> ApiResult
     pending.sort_by(|a, b| b.0.cmp(&a.0));
     decided.sort_by(|a, b| b.0.cmp(&a.0));
     decided.truncate(drafts::RECENT_DECIDED);
-    // Edits and suggestions of drafts decided elsewhere (in Slack) are no longer needed.
+    // Suggestions (and any edit kept from before edits were saved at the tool server) of
+    // drafts decided elsewhere, in Slack say, are no longer needed.
     let stale: Vec<String> = items
         .iter()
         .filter(|i| i.status != "pending")
@@ -1126,10 +1364,15 @@ async fn put_draft(
     if !is_pending(&found) {
         return Err(ApiError::not_pending());
     }
-    let titled = match &found {
-        Found::Practice(_) => true,
-        Found::Item(item) => drafts::has_title(&item.tool),
-    };
+    // A real draft's edit is saved on the item at the tool server, so the Slack card and the
+    // console show it, and an approve anywhere writes it. Only a practice draft's stays here.
+    if let Found::Item(item) = &found {
+        let title = req.title.filter(|_| drafts::has_title(&item.tool));
+        let saved = save_edit(&state, &signed, item, title, req.body).await?;
+        let st = settings_of(&state, signed.handle()).await?;
+        let found = Found::Item(Box::new(saved));
+        return Ok(draft_response(&render(&state, &found, &signed, &st).await?));
+    }
     let key = id.clone();
     let st = state
         .0
@@ -1137,12 +1380,9 @@ async fn put_draft(
         .update(
             signed.handle(),
             Box::new(move |s| {
-                let title = if titled {
-                    req.title
-                        .or_else(|| s.edits.get(&key).and_then(|e| e.title.clone()))
-                } else {
-                    None
-                };
+                let title = req
+                    .title
+                    .or_else(|| s.edits.get(&key).and_then(|e| e.title.clone()));
                 s.edits.insert(
                     key,
                     DraftEdit {
@@ -1155,6 +1395,56 @@ async fn put_draft(
         .await
         .map_err(ApiError::store)?;
     Ok(draft_response(&render(&state, &found, &signed, &st).await?))
+}
+
+/// Save the PM's edit of `item` at the tool server (`PUT /internal/approvals/{id}/draft`):
+/// the item's arguments with the new body (and title, for a draft that has one), where it
+/// goes unchanged. Answers the item as the tool server now has it.
+async fn save_edit(
+    state: &AppState,
+    signed: &Signed,
+    item: &Approval,
+    title: Option<String>,
+    body: String,
+) -> Result<Approval, ApiError> {
+    let args = drafts::edited_args(&item.tool, &item.args, &DraftEdit { title, body });
+    let saved = signed
+        .toolserver(state)
+        .save_draft(signed.handle(), &item.id, &args)
+        .await
+        .map_err(|e| match e {
+            UpstreamError::Refused {
+                status: 409,
+                code: Some(code),
+                ..
+            } if code == "expired" => ApiError::new(
+                StatusCode::CONFLICT,
+                "expired",
+                "This draft expired before it was decided. Nothing was sent.",
+            ),
+            UpstreamError::Refused { status: 409, .. } => ApiError::not_pending(),
+            UpstreamError::Refused {
+                status: 400 | 422,
+                code,
+                ..
+            } => {
+                tracing::warn!(user = %signed.handle(), draft = %item.id, code = ?code, "edit refused");
+                ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "bad_edit",
+                    "This edit isn't valid for where the draft goes. Nothing was saved.",
+                )
+            }
+            e => ApiError::upstream(e),
+        })?;
+    if saved.user != signed.handle() || saved.id != item.id {
+        return Err(ApiError::upstream(UpstreamError::Failed {
+            service: "tool server",
+            why: "answered with another item".into(),
+        }));
+    }
+    tracing::info!(user = %signed.handle(), draft = %item.id, "edit saved");
+    Ok(saved)
 }
 
 #[derive(Deserialize)]
@@ -1394,6 +1684,21 @@ async fn accept_suggestion(
             "There's no suggested text to accept yet.",
         ));
     };
+    let body = pmos_contract::cite::strip(&body);
+    // A real draft: the accepted text is saved at the tool server, as an edit is, and then
+    // the suggestion (which stays here) is gone.
+    let found = match found {
+        Found::Item(item) => {
+            if body.chars().count() > MAX_BODY {
+                return Err(ApiError::bad_request("The text is too long."));
+            }
+            Found::Item(Box::new(
+                save_edit(&state, &signed, &item, None, body.clone()).await?,
+            ))
+        }
+        practice => practice,
+    };
+    let practice = matches!(found, Found::Practice(_));
     let key = id.clone();
     let st = state
         .0
@@ -1402,9 +1707,10 @@ async fn accept_suggestion(
             signed.handle(),
             Box::new(move |s| {
                 s.suggestions.remove(&key);
-                let title = s.edits.get(&key).and_then(|e| e.title.clone());
-                let body = pmos_contract::cite::strip(&body);
-                s.edits.insert(key, DraftEdit { title, body });
+                if practice {
+                    let title = s.edits.get(&key).and_then(|e| e.title.clone());
+                    s.edits.insert(key, DraftEdit { title, body });
+                }
             }),
         )
         .await
@@ -1536,23 +1842,49 @@ async fn refused_decision(
     let UpstreamError::Refused {
         status,
         code,
-        error,
+        audience,
         ..
     } = e
     else {
         return ApiError::upstream(e);
     };
-    let say = |fallback: &str| error.clone().unwrap_or_else(|| fallback.to_string());
+    // The tool server's own sentence can quote the draft's arguments, so it is never passed
+    // on, nor logged: the browser gets a fixed code and sentence, the log the status and
+    // code.
+    tracing::warn!(
+        user = %signed.handle(),
+        draft = %id,
+        status,
+        code = code.as_deref().unwrap_or("none"),
+        "decision refused by the tool server"
+    );
+    if let (Some(seen), Some("needs_external_confirm" | "audience_blocked")) =
+        (audience, code.as_deref())
+    {
+        remember_audience(state, id, seen);
+    }
     match (status, code.as_deref()) {
-        (409, Some(c)) if PASSED_THROUGH.contains(&c) => ApiError::new(
+        (409, Some("needs_external_confirm")) => ApiError::new(
             StatusCode::CONFLICT,
-            c,
-            say("The tool server refused this decision."),
+            "needs_external_confirm",
+            "This channel is shared with people outside the company. Confirm to post there. \
+             Nothing was sent.",
+        ),
+        (409, Some("audience_blocked")) => ApiError::new(
+            StatusCode::CONFLICT,
+            "audience_blocked",
+            "This draft was built from restricted sources, and people outside the product team \
+             can see that channel, so PM OS won't post it there. Nothing was sent.",
+        ),
+        (409, Some("expired")) => ApiError::new(
+            StatusCode::CONFLICT,
+            "expired",
+            "This draft expired before it was decided. Nothing was sent.",
         ),
         (503, Some("audience_unavailable")) => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "audience_unavailable",
-            say("PM OS couldn't check who can see that channel. Nothing was sent; try again."),
+            "PM OS couldn't check who can see that channel. Nothing was sent; try again.",
         ),
         (409, _) => match signed
             .toolserver(state)
@@ -1563,32 +1895,71 @@ async fn refused_decision(
             _ => ApiError::new(
                 StatusCode::CONFLICT,
                 "not_approvable",
-                say("This draft can't be approved as it stands. Reject it and ask again."),
+                "This draft can't be approved as it stands. Nothing was sent. Reject it and \
+                 ask again.",
             ),
         },
-        (400, _) => ApiError::new(
+        // An edit that doesn't fit the tool, or (never from `edited_args`) one that changes
+        // where the write goes.
+        (400 | 422, _) => ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "bad_edit",
-            say("The edited draft isn't valid for its target."),
-        ),
-        // The tool server refuses an edit from `pmos-web` that changes where a write goes.
-        // `edited_args` never does, so this is a guard, not a path the app takes.
-        (422, Some("target_changed")) => ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "bad_edit",
-            "An edit can change what a draft says, not where it goes. Nothing was sent.",
+            "The edited draft isn't valid for where it goes. Nothing was sent.",
         ),
         (403, _) => ApiError::new(
             StatusCode::FORBIDDEN,
             "not_a_member",
-            say("The tool server doesn't count you as a team member."),
+            "The tool server doesn't count you as a team member. Nothing was sent.",
         ),
-        _ => ApiError::upstream(UpstreamError::Refused {
-            service: "tool server",
-            status,
-            code,
-            error,
-        }),
+        (503, _) => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "PM OS can't decide this right now. Nothing was sent; try again in a minute.",
+        ),
+        _ => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "upstream_unavailable",
+            "The tool server refused this. Nothing was sent. If it keeps happening, tell a \
+             platform owner.",
+        ),
+    }
+}
+
+/// A decision whose outcome isn't known: the call was sent, but no usable answer came back.
+/// `504` when it timed out, else `502`; the app must not say nothing was sent.
+fn unknown_outcome(why: &str) -> ApiError {
+    let status = if why == "timed out" {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    ApiError::new(
+        status,
+        "unknown_outcome",
+        "PM OS lost touch with the tool server during this decision, so it may or may not \
+         have gone through. Reload the draft to see where it stands before trying again.",
+    )
+}
+
+/// After a decision call whose answer was lost: read the item again. If it now shows this
+/// PM's decision (`settled`), that is the answer; otherwise the outcome is unknown.
+async fn after_lost_answer(
+    state: &AppState,
+    signed: &Signed,
+    id: &str,
+    why: &str,
+    settled: impl Fn(&Approval) -> bool,
+) -> ApiResult {
+    tracing::warn!(user = %signed.handle(), draft = %id, why, "decision answer lost; reading the draft again");
+    match signed
+        .toolserver(state)
+        .approval_for(signed.handle(), id)
+        .await
+    {
+        Ok(item) if item.user == signed.handle() && settled(&item) => {
+            decided(state, signed, item).await
+        }
+        _ => Err(unknown_outcome(why)),
     }
 }
 
@@ -1618,18 +1989,17 @@ async fn approve(
         }
         return Err(ApiError::not_pending());
     }
-    let st = settings_of(&state, signed.handle()).await?;
-    // Exactly what the PM saw: the version is computed from the same arguments sent below.
-    let args = drafts::effective_args(&item, &st);
-    let current = drafts::args_version(&item.tool, &args);
+    // Exactly what the PM saw: the version is computed from the item's arguments, which hold
+    // their saved edit. An edited draft is approved with those arguments (`edit`), so a save
+    // from another tab a moment later can't change what this approve writes.
+    let current = drafts::version(&item);
     if version.is_some_and(|v| v != current) {
         return Err(stale());
     }
-    let edited = st.edits.contains_key(&id);
     let decision = DecisionBody {
         decided_by: signed.handle().to_string(),
-        decision: if edited { "edit" } else { "approve" },
-        args: edited.then_some(args),
+        decision: if item.edited { "edit" } else { "approve" },
+        args: item.edited.then(|| item.args.clone()),
         reason: None,
         confirm_external: req.confirm_external,
     };
@@ -1637,6 +2007,14 @@ async fn approve(
         Ok(item) => {
             tracing::info!(user = %signed.handle(), draft = %id, decision = decision.decision, "draft approved");
             decided(&state, &signed, item).await
+        }
+        Err(UpstreamError::Unknown { why, .. }) => {
+            let handle = signed.handle().to_string();
+            after_lost_answer(&state, &signed, &id, &why, |now| {
+                approved_as(now, &handle, Some(&current))
+                    || (now.status == "failed" && now.decided_by.as_deref() == Some(&handle))
+            })
+            .await
         }
         Err(e) => {
             // Two approves at once (a double click, a retry after a lost answer): the tool
@@ -1725,6 +2103,13 @@ async fn reject(
         Ok(item) => {
             tracing::info!(user = %signed.handle(), draft = %id, "draft rejected");
             decided(&state, &signed, item).await
+        }
+        Err(UpstreamError::Unknown { why, .. }) => {
+            let handle = signed.handle().to_string();
+            after_lost_answer(&state, &signed, &id, &why, |now| {
+                now.status == "rejected" && now.decided_by.as_deref() == Some(&handle)
+            })
+            .await
         }
         Err(e) => Err(refused_decision(&state, &signed, &id, e).await),
     }

@@ -50,6 +50,10 @@ pub struct Config {
     pub session_idle: Duration,
     /// `PMOS_WEB_SESSION_MAX_MINUTES`, default 1440 (24 hours), from sign-in.
     pub session_max: Duration,
+    /// `PMOS_WEB_INTERNAL_BIND`: a second listener for the server-to-server route
+    /// (`PUT /internal/brief/{handle}`), which the browser-facing `bind` then doesn't serve.
+    /// Without it, that route is on `bind`, refusing anything that looks like a browser.
+    pub internal_bind: Option<SocketAddr>,
 }
 
 impl std::fmt::Debug for Config {
@@ -67,8 +71,27 @@ impl std::fmt::Debug for Config {
             .field("entra", &self.entra)
             .field("session_idle", &self.session_idle)
             .field("session_max", &self.session_max)
+            .field("internal_bind", &self.internal_bind)
             .finish()
     }
+}
+
+/// Why development sign-in won't start beside Entra ID without the override.
+pub const DEV_WITH_ENTRA: &str = "PMOS_WEB_DEV_LOGIN=1 with Entra ID sign-in configured: \
+     development sign-in bypasses Entra entirely. Unset PMOS_WEB_DEV_LOGIN, or set \
+     PMOS_WEB_DEV_LOGIN_WITH_ENTRA=1 on a development machine that nobody else can reach";
+
+/// Why development sign-in won't start on a reachable address.
+pub const DEV_NOT_LOOPBACK: &str = "PMOS_WEB_DEV_LOGIN=1 needs PMOS_WEB_BIND on a loopback \
+     address (127.0.0.1 or ::1): with development sign-in anyone who reaches the port signs \
+     in as any member";
+
+/// Development sign-in only on a loopback address, the listener's and the internal one's.
+pub fn check_dev_bind(dev_login: bool, bind: SocketAddr) -> Result<(), String> {
+    if dev_login && !bind.ip().is_loopback() {
+        return Err(DEV_NOT_LOOPBACK.into());
+    }
+    Ok(())
 }
 
 /// Why the server won't start without a provider.
@@ -105,6 +128,21 @@ impl Config {
         let entra = EntraConfig::from_lookup(set, public_url.as_deref())?;
         if !dev_login && entra.is_none() {
             return Err(NO_PROVIDER.into());
+        }
+        let dev_with_entra = match get("PMOS_WEB_DEV_LOGIN_WITH_ENTRA")
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("") | Some("0") => false,
+            Some("1") => true,
+            Some(other) => {
+                return Err(format!(
+                    "PMOS_WEB_DEV_LOGIN_WITH_ENTRA must be `1` or `0`, not `{other}`"
+                ))
+            }
+        };
+        if dev_login && entra.is_some() && !dev_with_entra {
+            return Err(DEV_WITH_ENTRA.into());
         }
         let bots_token = token("PMOS_WEB_BOTS_TOKEN")?;
         let toolserver_token = token("PMOS_WEB_TOOLSERVER_TOKEN")?;
@@ -148,11 +186,21 @@ impl Config {
                     .into(),
             );
         }
+        let bind: SocketAddr = set("PMOS_WEB_BIND")
+            .unwrap_or_else(|| "127.0.0.1:8770".into())
+            .parse()
+            .map_err(|e| format!("PMOS_WEB_BIND: {e}"))?;
+        check_dev_bind(dev_login, bind)?;
+        let internal_bind: Option<SocketAddr> = set("PMOS_WEB_INTERNAL_BIND")
+            .map(|v| v.parse())
+            .transpose()
+            .map_err(|e| format!("PMOS_WEB_INTERNAL_BIND: {e}"))?;
+        if internal_bind.is_some_and(|i| i == bind) {
+            return Err("PMOS_WEB_INTERNAL_BIND must differ from PMOS_WEB_BIND".into());
+        }
         Ok(Self {
-            bind: set("PMOS_WEB_BIND")
-                .unwrap_or_else(|| "127.0.0.1:8770".into())
-                .parse()
-                .map_err(|e| format!("PMOS_WEB_BIND: {e}"))?,
+            bind,
+            internal_bind,
             bots_url: http_url(
                 "PMOS_BOTS_URL",
                 set("PMOS_BOTS_URL").unwrap_or_else(|| "http://127.0.0.1:8750".into()),
@@ -285,7 +333,19 @@ mod tests {
             Config::from_lookup(lookup(&[pairs.clone(), entra.clone()].concat())).unwrap();
         assert!(only_entra.entra.is_some() && !only_entra.dev_login);
         assert!(!format!("{only_entra:?}").contains(SECRET));
-        let both = Config::from_lookup(lookup(&[base(), entra.clone()].concat())).unwrap();
+        // Both only with the explicit development override.
+        let err = Config::from_lookup(lookup(&[base(), entra.clone()].concat())).unwrap_err();
+        assert!(err.contains("PMOS_WEB_DEV_LOGIN_WITH_ENTRA"), "{err}");
+        assert!(!err.contains(SECRET));
+        let both = Config::from_lookup(lookup(
+            &[
+                base(),
+                entra.clone(),
+                vec![("PMOS_WEB_DEV_LOGIN_WITH_ENTRA", "1")],
+            ]
+            .concat(),
+        ))
+        .unwrap();
         assert!(both.entra.is_some() && both.dev_login);
         // Half-configured refuses even with development sign-in on.
         for drop in 0..entra.len() {
@@ -390,6 +450,33 @@ mod tests {
             assert!(err.contains(want), "{err}");
             assert!(!err.contains(key) && !err.contains(short), "{err}");
         }
+    }
+
+    #[test]
+    fn development_sign_in_only_on_a_loopback_bind() {
+        for bind in ["0.0.0.0:8770", "10.0.0.2:8770", "[::]:8770"] {
+            let err =
+                Config::from_lookup(lookup(&[base(), vec![("PMOS_WEB_BIND", bind)]].concat()))
+                    .unwrap_err();
+            assert!(err.contains("loopback"), "{bind}: {err}");
+        }
+        for bind in ["127.0.0.1:8770", "[::1]:8770"] {
+            assert!(
+                Config::from_lookup(lookup(&[base(), vec![("PMOS_WEB_BIND", bind)]].concat()))
+                    .is_ok()
+            );
+        }
+        // The internal listener: its own address.
+        let cfg = Config::from_lookup(lookup(
+            &[base(), vec![("PMOS_WEB_INTERNAL_BIND", "127.0.0.1:8771")]].concat(),
+        ))
+        .unwrap();
+        assert_eq!(cfg.internal_bind.unwrap().to_string(), "127.0.0.1:8771");
+        assert!(Config::from_lookup(lookup(
+            &[base(), vec![("PMOS_WEB_INTERNAL_BIND", "127.0.0.1:8770")]].concat()
+        ))
+        .unwrap_err()
+        .contains("differ"));
     }
 
     #[test]

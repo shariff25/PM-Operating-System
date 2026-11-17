@@ -11,6 +11,10 @@ use serde_json::{json, Value};
 
 const USER_HEADER: &str = "x-pmos-user";
 
+/// The notification feed's codes for a saved cursor it can't continue from: ahead of the
+/// feed (the runtime's database was reset or restored), or unknown to it.
+pub const CURSOR_CODES: [&str; 2] = ["cursor_ahead", "cursor_unknown"];
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RuntimeError {
     #[error("PM OS bots are unavailable right now")]
@@ -195,12 +199,39 @@ impl Runtime {
         if let Some(after) = after {
             query.push(("after", after));
         }
-        self.send(
-            self.request(Method::GET, "/v1/notifications", None)
-                .query(&query)
-                .timeout(wait + Duration::from_secs(10)),
-        )
-        .await
+        let res = self
+            .request(Method::GET, "/v1/notifications", None)
+            .query(&query)
+            .timeout(wait + Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "bots runtime unreachable");
+                RuntimeError::Unavailable
+            })?;
+        let status = res.status();
+        let json: Value = res.json().await.unwrap_or(Value::Null);
+        // The runtime saying the saved cursor is ahead of it, or one it doesn't know (a reset
+        // database): passed on as a batch with that `code`, for the notifier to start again
+        // from now (`notify.rs`, `cursor_reset`).
+        if status.is_client_error() && CURSOR_CODES.contains(&json["code"].as_str().unwrap_or("")) {
+            let mut batch = json;
+            batch["items"] = json!([]);
+            return Ok(batch);
+        }
+        if status.is_success() {
+            return Ok(json);
+        }
+        if status.is_server_error() {
+            tracing::warn!(%status, "bots runtime error");
+            return Err(RuntimeError::Unavailable);
+        }
+        Err(RuntimeError::Refused(
+            json["error"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| format!("refused ({status})")),
+        ))
     }
 
     /// `POST /v1/routines/parse`: `{draft, summary}`, or [`RuntimeError::Question`].

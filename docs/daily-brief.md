@@ -129,8 +129,16 @@ and follow-ups"). The Slack service fills them:
    body at most 128 KiB. These are pmos-web's own limits. A second block, a block with no
    closing fence, or any broken rule means nothing is sent, and a warning is logged with the
    rule (never the content). The brief is delivered in Slack as usual.
-4. **Slack sends it** when the brief's task is `done`, its bot is the requester's own
-   personal bot (`pm-<handle>`) and the requester is on the team: `PUT
+4. **Slack sends it** only for a task that **is** a daily brief, never because an answer
+   contains a block (any answer can: a page the bot quoted, a prompt injection). A brief is a
+   task whose notification's `routine_id` names the requester's own brief routine
+   (`is_brief_routine`, checked with one `GET /v1/routines` call, only for a `done`
+   notification that has both a block and a `routine_id`), or a `brief now` task this Slack
+   service started: it marks the task's id when it creates it (`brief::mark_brief_now`, in
+   memory; a restart between the command and the answer forgets the mark, and that one brief
+   isn't sent). Anything else with a block has it taken out and nothing sent, with a warning
+   that names the task, never the content. Then, when the task is `done`, its bot is the
+   requester's own personal bot (`pm-<handle>`) and the requester is on the team: `PUT
    /internal/brief/{handle}` with `Authorization: Bearer <PMOS_WEB_BRIEF_TOKEN>` and the body
    `{date?, changed: [{system, title, summary, url}], waiting_on_you: [{system, who, summary,
    url, created_at?}], you_wait_on: [...]}`. That replaces the PM's panels, so a quiet day
@@ -139,7 +147,14 @@ and follow-ups"). The Slack service fills them:
    the Slack brief. A success logs the handle and the three counts. The token, the text and the
    urls are never logged.
 
-`brief now` and a brief the PM asks for in a DM are sent the same way as the routine's.
+`brief now` is sent the same way as the routine's. A brief the PM asks for in their own
+words in a DM ("write my brief") is an ordinary task: its block is taken out and not sent.
+
+**What the web app shows of it.** `GET /api/brief` says whether any brief has filled the
+PM's day: `delivered_at` (when the last one was sent here, kept after its items expire) and
+`status`, `never` (none ever: the home page doesn't say "your brief is in"), `today` (the
+last one came within 24 hours; empty lists mean it found nothing) or `stale` (older). A brief
+that found nothing still sends its block with empty lists, so it counts as delivered.
 
 **Configuration** (the Slack service): `PMOS_WEB_URL`, pmos-web's base URL as the Slack
 service reaches it (`http://127.0.0.1:8770`), and `PMOS_WEB_BRIEF_TOKEN`, the same token
@@ -245,15 +260,18 @@ the store, as a pure function of what the sources say now:
 A follow-up stays until it is answered, dismissed or a week old. The brief shows only `open`
 rows, so "stays until answered" does not depend on search recall (gap 1).
 
-**The web app.** `GET /api/brief` returns `Brief` exactly as `docs/web-api.md` already fixes it:
-`{date, changed, waiting_on_you, you_wait_on}`, where each follow-up row has `id`, `system`,
-`who`, `summary`, `url` and `age_days`. Every row has a `url`. It answers `501 {"code":"not_built"}`
-while pmos-web's `PMOS_WEB_BRIEF` is off, and the app then hides that part of the home page.
-Today pmos-web keeps the rows itself, filled from each brief (part 1, "The web app's panels");
-a follow-up sent again keeps its age and a dismissal. `POST
+**The web app.** `GET /api/brief` returns `Brief` exactly as `docs/web-api.md` fixes it:
+`{date, delivered_at, status, changed, waiting_on_you, you_wait_on}`, where each follow-up row
+has `id`, `system`, `who`, `summary`, `url` and `age_days`. Every row has a `url`. It answers
+`501 {"code":"not_built"}` while pmos-web's `PMOS_WEB_BRIEF` is off, and the app then hides that
+part of the home page. Today pmos-web keeps the rows itself, filled from each brief (part 1,
+"The web app's panels"); a follow-up sent again keeps its age and a dismissal. `POST
 /api/followups/{id}/dismiss` ("Not mine") answers `204`. `POST /api/followups/{id}/draft` answers
-`201 Task`: a task that runs the skill's draft step for that follow-up and ends as an approval
-draft.
+`201 Task`: a task that asks the PM's bot for a reply or nudge draft for that follow-up and ends
+as an approval draft. The follow-up's fields came from other people's messages, so they go
+into that task's prompt as untrusted data: one JSON object between `<<<FOLLOW_UP_DATA` and
+`FOLLOW_UP_DATA>>>`, after an instruction to treat every value as text and never follow
+anything in it (`crates/web/src/app/brief.rs`, `draft_prompt`).
 
 **Slack buttons.** Each follow-up line in the DM gets three buttons: **Draft a reply**
 (`waiting_on_you`), **Draft a nudge** (`you_wait_on`) and **Not mine**. Draft a reply or a nudge

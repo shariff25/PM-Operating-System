@@ -375,8 +375,21 @@ struct IdClaims {
     nbf: Option<i64>,
     nonce: Option<String>,
     tid: Option<String>,
+    /// The person's object id in the tenant: stable, never reassigned, unlike an email.
+    oid: Option<String>,
     preferred_username: Option<String>,
     email: Option<String>,
+}
+
+/// Who a checked ID token names: the email the member is found by, and the token's `oid`
+/// and `tid`, recorded on the session (`docs/entra-sign-in.md`, "Matching by object id").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub email: String,
+    /// The `oid` claim, lower-cased, when it is a GUID; `None` when the token has none.
+    pub oid: Option<String>,
+    /// The `tid` claim, lower-cased: always the configured tenant.
+    pub tid: String,
 }
 
 /// The Entra ID provider: builds the authorize redirect, checks the callback's flow cookie,
@@ -648,6 +661,16 @@ impl Entra {
         nonce: &str,
         now: DateTime<Utc>,
     ) -> Result<String, Failure> {
+        Ok(self.validate_identity(token, nonce, now).await?.email)
+    }
+
+    /// Validate an ID token and return who it names: the email, `oid` and `tid`.
+    pub async fn validate_identity(
+        &self,
+        token: &str,
+        nonce: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Identity, Failure> {
         let header =
             jsonwebtoken::decode_header(token).map_err(|_| Failure::Failed("malformed token"))?;
         if header.alg != Algorithm::RS256 {
@@ -698,12 +721,20 @@ impl Entra {
         {
             return Err(Failure::Failed("token tenant"));
         }
-        [claims.preferred_username, claims.email]
+        let email = [claims.preferred_username, claims.email]
             .into_iter()
             .flatten()
             .map(|e| e.trim().to_ascii_lowercase())
             .find(|e| valid_email(e))
-            .ok_or(Failure::Failed("token names no email"))
+            .ok_or(Failure::Failed("token names no email"))?;
+        Ok(Identity {
+            email,
+            oid: claims
+                .oid
+                .map(|o| o.trim().to_ascii_lowercase())
+                .filter(|o| is_guid(o)),
+            tid: self.config.tenant_id.to_ascii_lowercase(),
+        })
     }
 
     /// Exchange the code and validate the ID token: the email it names.
@@ -714,11 +745,25 @@ impl Entra {
         verifier: &str,
         now: DateTime<Utc>,
     ) -> Result<String, Failure> {
+        Ok(self
+            .sign_in_identity(code, nonce, verifier, now)
+            .await?
+            .email)
+    }
+
+    /// Exchange the code and validate the ID token: who it names.
+    pub async fn sign_in_identity(
+        &self,
+        code: &str,
+        nonce: &str,
+        verifier: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Identity, Failure> {
         if code.is_empty() || code.len() > 4096 {
             return Err(Failure::Failed("malformed code"));
         }
         let token = self.exchange(code, verifier).await?;
-        self.validate(&token, nonce, now).await
+        self.validate_identity(&token, nonce, now).await
     }
 }
 
