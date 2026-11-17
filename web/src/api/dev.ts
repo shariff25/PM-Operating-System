@@ -20,6 +20,7 @@ export function devApiFactory(): (onSignedOut: () => void) => Api {
       providers: mockProviders(),
       briefBuilt: import.meta.env.VITE_MOCK_BRIEF !== 'off',
       hostile: import.meta.env.VITE_MOCK_HOSTILE === 'on',
+      toolServerDown: new URLSearchParams(window.location.search).get('mock_admin') === 'degraded',
       ...(import.meta.env.VITE_MOCK_EMPTY === 'on' ? { noDrafts: true, firstVisit: false, emptyBrief: true } : {}),
       ...(import.meta.env.VITE_MOCK_FAST === 'on' ? { latency: 0, stepMs: 150 } : {}),
     });
