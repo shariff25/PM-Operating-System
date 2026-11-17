@@ -1,3 +1,4 @@
+import { stripMarkers } from '../citations';
 import { MOCK_PERMISSIONS, MOCK_PROFILES, createMockAdmin, roleOfHandle } from './mockAdmin';
 import type { MockAdminOptions, MockRole } from './mockAdmin';
 import { ApiError, REJECT_REASONS } from './types';
@@ -34,6 +35,11 @@ export interface MockOptions extends MockAdminOptions {
   hostile?: boolean;
   /** The brief is built but has nothing in it. */
   emptyBrief?: boolean;
+  /**
+   * When the brief was last delivered: today (the default), a few days ago, or never. "never"
+   * also leaves the brief empty, as for a PM who has not asked for one yet.
+   */
+  briefDelivery?: 'today' | 'stale' | 'never';
   /** Which sign-in methods GET /api/auth/providers lists. Default: development sign-in only. */
   providers?: AuthProvider[];
   /** Start with this first_visit value. */
@@ -43,18 +49,19 @@ export interface MockOptions extends MockAdminOptions {
 const HOUR = 3600_000;
 const iso = (t: number) => new Date(t).toISOString();
 
+// Source markers as the server writes them: `[[sN]]` right after the text a source supports.
 const PRD_BODY = `## Problem
-Customers on annual plans lose access the moment a payment fails, even when the failure is a card that expired yesterday. Support handled 140 tickets about this last quarter.
+Customers on annual plans lose access the moment a payment fails, even when the failure is a card that expired yesterday[[s2]]. Support handled 140 tickets about this last quarter[[s4]].
 
 ## Proposal
-Add a **grace period** setting per workspace: 0, 3, 7 or 14 days. During the grace period the workspace keeps full access and admins see a banner. Background is in the [billing roadmap](https://example.com/wiki/billing-roadmap).
+Add a **grace period** setting per workspace: 0, 3, 7 or 14 days[[s1]]. During the grace period the workspace keeps full access and admins see a banner. Background is in the [billing roadmap](https://example.com/wiki/billing-roadmap).
 
 ## Success metrics
-- Involuntary churn down by 20% within two quarters
+- Involuntary churn down by 20% within two quarters[[s1]][[s4]]
 - Payment-failure tickets down by 50%
 
 ## Risks
-- Revenue recognition for the grace days needs Finance sign-off
+- Revenue recognition for the grace days needs Finance sign-off[[s2]]
 - Abuse by workspaces that never pay
 - Legal wants the terms of service wording reviewed
 
@@ -63,6 +70,7 @@ Add a **grace period** setting per workspace: 0, 3, 7 or 14 days. During the gra
 - Who gets the banner, admins only or everyone?
 `;
 
+// No markers: the bot linked nothing, though it read two sources.
 const JIRA_BODY = `**Summary:** Show grace period banner to workspace admins
 
 **Description**
@@ -107,12 +115,17 @@ Lifts exist.
 /** Sources as the real backend sends them: real titles or ids, no excerpt, and sometimes no link. */
 function sources(): Draft['sources'] {
   return [
-    { id: 's1', system: 'docs', title: 'TCB grace period', url: 'https://example.com/docs/tcb-grace', excerpt: null },
-    { id: 's2', system: 'jira', title: 'PAY-212: Payment failure handling', url: 'https://example.com/jira/PAY-212', excerpt: null },
-    { id: 's3', system: 'confluence', title: 'Confluence page 12345', url: null, excerpt: null },
-    { id: 's4', system: 'slack', title: 'Slack thread in C01', url: 'https://example.com/slack/billing/p1', excerpt: null },
-    { id: 's5', system: 'drive', title: 'Churn analysis Q3.xlsx', url: 'https://example.com/drive/churn-q3', excerpt: null },
+    { id: 's1', system: 'docs', title: 'TCB grace period', url: 'https://example.com/docs/tcb-grace', excerpt: null, cited: false },
+    { id: 's2', system: 'jira', title: 'PAY-212: Payment failure handling', url: 'https://example.com/jira/PAY-212', excerpt: null, cited: false },
+    { id: 's3', system: 'confluence', title: 'Confluence page 12345', url: null, excerpt: null, cited: false },
+    { id: 's4', system: 'slack', title: 'Slack thread in C01', url: 'https://example.com/slack/billing/p1', excerpt: null, cited: false },
+    { id: 's5', system: 'drive', title: 'Churn analysis Q3.xlsx', url: 'https://example.com/drive/churn-q3', excerpt: null, cited: false },
   ];
+}
+
+/** The sources of a body: each one is cited when the body has a marker for it. */
+function citedBy(body: string, list: Draft['sources']): Draft['sources'] {
+  return list.map((s) => ({ ...s, cited: body.includes(`[[${s.id}]]`) }));
 }
 
 interface MockTask {
@@ -170,7 +183,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       body: PRD_BODY,
       edited: false,
       target: { system: 'confluence', label: 'Space PM, under Specs', url: null },
-      sources: sources(),
+      sources: citedBy(PRD_BODY, sources()),
       result_url: null,
       external: false,
     });
@@ -238,7 +251,8 @@ export function createMockClient(options: MockOptions = {}): Api {
       body: DECIDED_BODY,
       edited: true,
       target: { system: 'confluence', label: 'Space PM, under Updates', url: null },
-      sources: [],
+      // Edited by the PM, so its source links were removed and nothing counts as cited.
+      sources: sources().slice(0, 2),
       result_url: 'https://example.com/wiki/weekly-9-nov',
       external: false,
     });
@@ -258,7 +272,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       body: HOSTILE_BODY,
       edited: false,
       target: { system: 'confluence', label: 'Space PM, under Notes', url: null },
-      sources: [{ id: 'h1', system: 'docs', title: 'Odd link source', url: 'javascript:alert(1)', excerpt: null }],
+      sources: [{ id: 'h1', system: 'docs', title: 'Odd link source', url: 'javascript:alert(1)', excerpt: null, cited: false }],
       result_url: null,
       external: false,
     });
@@ -382,7 +396,7 @@ export function createMockClient(options: MockOptions = {}): Api {
           body: PRD_BODY,
           edited: false,
           target: { system: 'confluence', label: 'Space PM, under Specs', url: null },
-          sources: sources(),
+          sources: citedBy(PRD_BODY, sources()),
           result_url: null,
           external: false,
         };
@@ -545,9 +559,11 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       const d = find(id);
       pendingOnly(d);
-      d.body = input.body;
-      if (input.title !== undefined) d.title = input.title;
+      // The server removes any marker it is sent, and an edited draft cites nothing.
+      d.body = stripMarkers(input.body);
+      if (input.title !== undefined) d.title = stripMarkers(input.title);
       d.edited = true;
+      d.sources = d.sources.map((s) => ({ ...s, cited: false }));
       bump(d);
       return clone(d);
     },
@@ -559,11 +575,12 @@ export function createMockClient(options: MockOptions = {}): Api {
       if (suggestions.get(id)?.s.status === 'working') {
         throw new ApiError(409, 'change_in_progress', 'I am still working on your last change.');
       }
-      const lines = d.body.split('\n');
+      const current = stripMarkers(d.body);
+      const lines = current.split('\n');
       let next: string;
       if (/short|trim|cut/i.test(instruction)) {
         // drop the last paragraph block
-        const blocks = d.body.trimEnd().split(/\n\n/);
+        const blocks = current.trimEnd().split(/\n\n/);
         next = (blocks.length > 1 ? blocks.slice(0, -1) : blocks).join('\n\n') + '\n';
         // and tighten a sentence, so the before and after shows changed words too
         next = next.replace('lose access the moment a payment fails, even when the failure is a card that expired yesterday', 'lose access the moment a payment fails, even when the card only expired yesterday');
@@ -600,8 +617,9 @@ export function createMockClient(options: MockOptions = {}): Api {
       if (!entry || entry.s.status !== 'ready' || entry.s.body === null) {
         throw new ApiError(404, 'not_found', 'There is no suggestion to accept.');
       }
-      d.body = entry.s.body;
+      d.body = stripMarkers(entry.s.body);
       d.edited = true;
+      d.sources = d.sources.map((s) => ({ ...s, cited: false }));
       bump(d);
       suggestions.delete(id);
       return clone(d);
@@ -702,10 +720,16 @@ export function createMockClient(options: MockOptions = {}): Api {
       await wait();
       guard();
       if (!briefBuilt) throw new ApiError(501, 'not_built', 'The daily brief is not built yet.');
-      if (options.emptyBrief) {
-        return { date: iso(Date.now()).slice(0, 10), changed: [], waiting_on_you: [], you_wait_on: [] };
+      const delivery = options.briefDelivery ?? 'today';
+      const delivered_at =
+        delivery === 'never' ? null : delivery === 'stale' ? iso(Date.now() - 3 * 24 * HOUR) : iso(Date.now() - 1000);
+      const status = delivery;
+      if (options.emptyBrief || delivery === 'never') {
+        return { date: iso(Date.now()).slice(0, 10), changed: [], waiting_on_you: [], you_wait_on: [], delivered_at, status };
       }
       return {
+        delivered_at,
+        status,
         date: iso(Date.now()).slice(0, 10),
         changed: [
           { system: 'jira', title: 'PAY-212 moved to Blocked', summary: 'Waiting on Finance sign-off.', url: 'https://example.com/jira/PAY-212' },

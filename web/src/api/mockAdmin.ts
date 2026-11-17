@@ -129,7 +129,7 @@ function buildEvents(now: number, count: number): AuditEvent[] {
 }
 
 const MEMBERS: TeamMember[] = [
-  { handle: 'ana', name: 'ana', roles: ['pm'], has_email: true, bot: 'pm-ana', accounts: { atlassian: true, slack: true, github: false } },
+  { handle: 'ana', name: 'Ana Silva', roles: ['pm'], has_email: true, bot: 'pm-ana', accounts: { atlassian: true, slack: true, github: false } },
   { handle: 'ben', name: 'ben', roles: ['pm', 'reviewer'], has_email: true, bot: 'pm-ben', accounts: { atlassian: true, slack: true, github: true } },
   { handle: 'dana', name: 'dana', roles: ['pm'], has_email: true, bot: 'pm-dana', accounts: { atlassian: true, slack: false, github: false } },
   { handle: 'priya', name: 'priya', roles: ['reviewer'], has_email: true, bot: 'pm-priya', accounts: { atlassian: false, slack: true, github: false } },

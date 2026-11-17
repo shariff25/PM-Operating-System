@@ -5,7 +5,9 @@ import { Empty, ErrorNote, ExtLink, NewRequestButton, PageHeader, Skeleton, init
 import { Icon, systemIcon } from '../components/icons';
 import { useToast } from '../components/Toasts';
 import { copy } from '../copy';
+import { briefTiming } from '../brief';
 import { useAsk, useData } from '../data';
+import { relTime } from '../time';
 
 /** Who is waiting on the PM, who the PM waits on, and what changed, from the daily brief. */
 export function FollowUps() {
@@ -29,6 +31,16 @@ export function FollowUps() {
       setRowError(messageOf(e, copy.errors.dismissFailed));
     }
   };
+
+  const timing = brief ? briefTiming(brief) : null;
+  const eyebrow =
+    timing === 'never'
+      ? copy.followups.countLineNever
+      : timing === 'stale' && brief
+        ? copy.followups.countLineStale(relTime(brief.delivered_at ?? brief.date))
+        : copy.followups.countLine;
+  // The calm one-liners are only true of a brief that came today.
+  const calm = (joke: string) => (timing === 'today' || timing === 'unknown' ? joke : copy.today.briefStaleCard);
 
   const rows = (list: FollowUp[], empty: string, action: string) =>
     list.length === 0 ? (
@@ -76,7 +88,7 @@ export function FollowUps() {
 
   return (
     <div className="page">
-      <PageHeader title={copy.followups.title} lede={copy.followups.lede} eyebrow={copy.followups.countLine}>
+      <PageHeader title={copy.followups.title} lede={copy.followups.lede} eyebrow={eyebrow}>
         <NewRequestButton />
       </PageHeader>
       {error && <ErrorNote>{error}</ErrorNote>}
@@ -92,7 +104,7 @@ export function FollowUps() {
             </button>
           }
         >
-          {copy.followups.emptyAll}
+          {timing === 'never' ? copy.followups.emptyNever : timing === 'stale' ? copy.followups.emptyStale : copy.followups.emptyAll}
         </Empty>
       ) : (
         <div className="stack">
@@ -103,7 +115,7 @@ export function FollowUps() {
                 <span className="card-count" aria-hidden="true">{brief.waiting_on_you.length}</span>
               </h2>
             </div>
-            {rows(brief.waiting_on_you, copy.nothingWaiting, copy.home.draftReply)}
+            {rows(brief.waiting_on_you, calm(copy.nothingWaiting), copy.home.draftReply)}
           </section>
           <section className="card card-table" aria-labelledby="fu-them">
             <div className="card-head">
@@ -112,7 +124,7 @@ export function FollowUps() {
                 <span className="card-count" aria-hidden="true">{brief.you_wait_on.length}</span>
               </h2>
             </div>
-            {rows(brief.you_wait_on, copy.nothingWaitedOn, copy.home.draftNudge)}
+            {rows(brief.you_wait_on, calm(copy.nothingWaitedOn), copy.home.draftNudge)}
           </section>
           {brief.changed.length > 0 && (
             <section className="card card-table" aria-labelledby="fu-changed">

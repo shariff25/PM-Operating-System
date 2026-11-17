@@ -86,6 +86,73 @@ describe('overview', () => {
   });
 });
 
+describe('overview: recent denials and approvals', () => {
+  const recent = (title: string) => screen.getByRole('region', { name: title });
+
+  it('lists the five newest denied actions and approvals from the audit log, each with a way into the filtered log', async () => {
+    const seen: unknown[] = [];
+    renderApp({
+      role: 'admin',
+      hash: '/admin',
+      wrap: (api) => {
+        const f = api.adminAudit.bind(api);
+        api.adminAudit = async (q) => { seen.push(q); return f(q); };
+        return api;
+      },
+    });
+    const denied = await screen.findByRole('region', { name: A.overview.recent.denied });
+    await waitFor(() => expect(within(denied).getAllByRole('listitem').length).toBeGreaterThan(0));
+    expect(within(denied).getAllByRole('listitem').length).toBeLessThanOrEqual(5);
+    expect(seen).toEqual(expect.arrayContaining([{ outcome: 'denied', limit: 5 }, { outcome: 'approved', limit: 5 }]));
+    expect(within(denied).getByRole('link', { name: /See all/ })).toHaveAttribute('href', '#/admin/audit?outcome=denied');
+    const approved = recent(A.overview.recent.approved);
+    await waitFor(() => expect(within(approved).getAllByRole('listitem').length).toBeGreaterThan(0));
+    expect(within(approved).getByRole('link', { name: /See all/ })).toHaveAttribute('href', '#/admin/audit?outcome=approved');
+    // Metadata only: who, which client, when. No draft text.
+    const first = within(denied).getAllByRole('listitem')[0]!;
+    expect(first.querySelector('time')).not.toBeNull();
+  });
+
+  it('shows the same to an auditor, and nothing it could not fetch to someone without the audit log', async () => {
+    const first = renderApp({ role: 'auditor', hash: '/admin' });
+    expect(await screen.findByRole('region', { name: A.overview.recent.denied })).toBeInTheDocument();
+    first.unmount();
+    const calls: unknown[] = [];
+    renderApp({
+      role: 'admin',
+      hash: '/admin',
+      wrap: (api) => {
+        const me = api.me.bind(api);
+        api.me = async () => ({ ...(await me()), permissions: ['manage-members'] });
+        const f = api.adminAudit.bind(api);
+        api.adminAudit = async (q) => { calls.push(q); return f(q); };
+        return api;
+      },
+    });
+    await screen.findByRole('group', { name: A.overview.statsLabel });
+    expect(screen.queryByRole('region', { name: A.overview.recent.denied })).not.toBeInTheDocument();
+    expect(calls).toEqual([]);
+  });
+
+  it('says plainly when there is nothing to list, and when the list cannot be loaded', async () => {
+    renderApp({
+      role: 'admin',
+      hash: '/admin',
+      wrap: (api) => {
+        const f = api.adminAudit.bind(api);
+        api.adminAudit = async (q) => {
+          if (q.outcome === 'denied') return { events: [], next_cursor: null };
+          if (q.outcome === 'approved') throw new ApiError(502, 'upstream_unavailable', 'The tool server did not answer.');
+          return f(q);
+        };
+        return api;
+      },
+    });
+    expect(await screen.findByText(A.overview.recent.noDenied)).toBeInTheDocument();
+    expect(await screen.findByText('The tool server did not answer.')).toBeInTheDocument();
+  });
+});
+
 describe('audit log', () => {
   it('lists events in a real table with headers, and states that it is metadata only', async () => {
     renderApp({ role: 'auditor', hash: '/admin/audit' });
@@ -122,6 +189,28 @@ describe('audit log', () => {
     }
     expect(screen.getByText(A.audit.endLine)).toBeInTheDocument();
     expect(new Set(rows().map((r) => r.textContent)).size).toBe(rows().length);
+  });
+
+  it('sends the same filters with the cursor when "Load more" is used on a filtered list', async () => {
+    const seen: { from?: string; to?: string; limit?: number; before?: string }[] = [];
+    renderApp({
+      role: 'auditor',
+      hash: '/admin/audit?from=2020-01-01&to=2099-12-31',
+      wrap: (api) => {
+        const f = api.adminAudit.bind(api);
+        api.adminAudit = async (q) => { seen.push(q); return f(q); };
+        return api;
+      },
+    });
+    await screen.findByRole('table', { name: A.audit.tableLabel });
+    const first = rows().length;
+    await userEvent.click(screen.getByRole('button', { name: A.audit.loadMore }));
+    await waitFor(() => expect(rows().length).toBeGreaterThan(first));
+    const [one, two] = seen;
+    expect(one).toMatchObject({ from: '2020-01-01T00:00:00.000Z', to: '2100-01-01T00:00:00.000Z', limit: 50 });
+    expect(one!.before).toBeUndefined();
+    expect(two).toMatchObject({ from: '2020-01-01T00:00:00.000Z', to: '2100-01-01T00:00:00.000Z', limit: 50 });
+    expect(two!.before).toMatch(/^c1\./);
   });
 
   it('keeps the events shown when the next page fails, and says so', async () => {
@@ -287,6 +376,16 @@ describe('team', () => {
     const ben = within(table).getByRole('row', { name: /ben/ });
     expect(within(ben).getAllByText(A.team.linked)).toHaveLength(3);
     expect(within(ben).getByText(A.team.emailYes)).toBeInTheDocument();
+  });
+
+  it('shows a member once when the name is the handle, and both when they differ', async () => {
+    renderApp({ role: 'auditor', hash: '/admin/team' });
+    const table = await screen.findByRole('table', { name: A.team.tableLabel });
+    const ben = within(table).getByRole('row', { name: /ben/ });
+    expect(within(ben).getAllByText('ben')).toHaveLength(1);
+    const ana = within(table).getByRole('row', { name: /Ana Silva/ });
+    expect(within(ana).getByText('Ana Silva')).toBeInTheDocument();
+    expect(within(ana).getByText('ana')).toBeInTheDocument();
   });
 
   it('copes with the tool server being down: blanks, not breakage', async () => {
