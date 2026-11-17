@@ -4,6 +4,74 @@
 
 import type { DraftKind, DraftStatus, HintName, RejectReason } from './api/types';
 
+/**
+ * What approving means for each kind of draft, in one place: the button, the hint, the dialog,
+ * the success line. A Jira draft never says "page", and a Slack one never says "created".
+ */
+export interface ApproveWords {
+  button: string;
+  hint: string;
+  hintShort: string;
+  /** "This will create a Confluence page in Space PM, under your name (Ana)." */
+  confirmText: (where: string, who: string) => string;
+  confirmButton: string;
+  confirming: string;
+  /** "Nothing has been created until you press Confirm." */
+  nothingYet: string;
+  /** "Created in Space PM." or "Posted in #billing." */
+  done: (where: string) => string;
+  toast: string;
+}
+
+const APPROVE_WORDS: Record<DraftKind, ApproveWords> = {
+  confluence_page: {
+    button: 'Approve to Confluence',
+    hint: "This creates the page in Confluence under your name. I'll wait until you're sure.",
+    hintShort: 'Nothing is created until you approve.',
+    confirmText: (where, who) => `This will create a Confluence page in ${where}, under your name (${who}).`,
+    confirmButton: 'Confirm and create',
+    confirming: 'Creating…',
+    nothingYet: 'Nothing has been created until you press Confirm.',
+    done: (where) => `Created in ${where}.`,
+    toast: 'Approved. The page is in Confluence.',
+  },
+  jira_issue: {
+    button: 'Approve to Jira',
+    hint: "This creates the issue in Jira under your name. I'll wait until you're sure.",
+    hintShort: 'Nothing is created until you approve.',
+    confirmText: (where, who) => `This will create a Jira issue in ${where}, under your name (${who}).`,
+    confirmButton: 'Confirm and create',
+    confirming: 'Creating…',
+    nothingYet: 'Nothing has been created until you press Confirm.',
+    done: (where) => `Created in ${where}.`,
+    toast: 'Approved. The issue is in Jira.',
+  },
+  slack_reply: {
+    button: 'Approve to Slack',
+    hint: "This posts the reply in Slack under your name. I'll wait until you're sure.",
+    hintShort: 'Nothing posts until you approve.',
+    confirmText: (where, who) => `This will post a Slack reply in ${where}, under your name (${who}).`,
+    confirmButton: 'Confirm and post',
+    confirming: 'Posting…',
+    nothingYet: 'Nothing has been posted until you press Confirm.',
+    done: (where) => `Posted in ${where}.`,
+    toast: 'Approved. The reply is posted in Slack.',
+  },
+  slack_message: {
+    button: 'Approve to Slack',
+    hint: "This posts the message in Slack under your name. I'll wait until you're sure.",
+    hintShort: 'Nothing posts until you approve.',
+    confirmText: (where, who) => `This will post a Slack message in ${where}, under your name (${who}).`,
+    confirmButton: 'Confirm and post',
+    confirming: 'Posting…',
+    nothingYet: 'Nothing has been posted until you press Confirm.',
+    done: (where) => `Posted in ${where}.`,
+    toast: 'Approved. The message is posted in Slack.',
+  },
+};
+
+export const approveWords = (kind: DraftKind): ApproveWords => APPROVE_WORDS[kind];
+
 export const copy = {
   appName: 'PM OS',
 
@@ -34,14 +102,14 @@ export const copy = {
   hints: {
     sources: 'Everything I claimed, and where I got it. Click a source to open it.',
     ask: 'Tell me what to fix, the way you\'d tell a colleague. "Shorter" works.',
-    approve: "This creates the page in Confluence under your name. I'll wait until you're sure.",
-  } satisfies Record<HintName, string>,
+    approve: (kind: DraftKind) => APPROVE_WORDS[kind].hint,
+  } satisfies Record<HintName, string | ((kind: DraftKind) => string)>,
   /** One short line each, for the banner on a phone. */
   hintsShort: {
     sources: 'Sources shows where I got each claim.',
     ask: 'Ask for changes in plain words.',
-    approve: 'Nothing posts until you approve.',
-  } satisfies Record<HintName, string>,
+    approve: (kind: DraftKind) => APPROVE_WORDS[kind].hintShort,
+  } satisfies Record<HintName, string | ((kind: DraftKind) => string)>,
   hintLabel: 'Hint',
   hintDismiss: 'Got it',
   hintStep: (i: number, n: number) => `Tip ${i} of ${n}`,
@@ -181,6 +249,10 @@ export const copy = {
     sourcesHeading: 'What the bot read',
     sourcesCount: (n: number) => `${n} ${n === 1 ? 'source' : 'sources'}`,
     sourceNumber: (n: number) => `Source ${n}: `,
+    citeLabel: (n: number, title: string) => `Source ${n}: ${title}`,
+    citedPlaces: (n: number) => (n === 1 ? 'Cited in 1 place in the text' : `Cited in ${n} places in the text`),
+    notCited: 'Read, not cited',
+    showInDraft: 'Show in the draft',
     publishedAs: (name: string) => `under your name, ${name}`,
     changeShort: 'Change',
     suggestionBar: (instruction: string) => `Suggested change from your request: "${instruction}"`,
@@ -189,6 +261,9 @@ export const copy = {
       sources: (n: number) => `Reads from ${n} ${n === 1 ? 'source' : 'sources'}, listed on the right`,
       sourcesPhone: (n: number) => `Reads from ${n} ${n === 1 ? 'source' : 'sources'}`,
       noSources: 'No sources recorded',
+      cited: (n: number, m: number) => `${n} of ${m} ${m === 1 ? 'source is' : 'sources are'} cited in the text`,
+      noneCited: 'No sentence is linked to a source',
+      editedNoLinks: 'You edited this draft, so source links were removed',
       internal: 'Not shared outside the company',
       external: 'Goes to a channel shared outside the company',
       suggestion: 'A suggested change is still open',
@@ -234,18 +309,14 @@ export const copy = {
     saveFirst: 'Save or discard your edit before you approve.',
     resolveFirst: 'Accept or reject the suggested change before you approve.',
     expired: 'This draft expired, so it cannot be approved. Ask me for a fresh draft.',
+    checkedNoChange: 'I checked: that request did not reach me, so you can ask again.',
+    checkFirst: 'Check where this draft stands before you approve it again.',
     changeInProgress: 'I am still working on your last change. Wait for it to finish, then ask again.',
   },
 
   // ---- Approval ----
   approve: {
-    button: (kind: DraftKind) =>
-      ({
-        confluence_page: 'Approve to Confluence',
-        jira_issue: 'Approve to Jira',
-        slack_reply: 'Approve to Slack',
-        slack_message: 'Approve to Slack',
-      })[kind],
+    button: (kind: DraftKind) => APPROVE_WORDS[kind].button,
     confirmHeading: 'Check before you approve',
     confirmTitle: 'Title',
     confirmWhere: 'Goes to',
@@ -253,23 +324,14 @@ export const copy = {
     confirmLinks: 'Links in this draft',
     confirmNoLinks: 'This draft has no links.',
     confirmLinkLine: (text: string) => `Link text: ${text}`,
-    confirmText: (kind: DraftKind, where: string, who: string) => {
-      const what = {
-        confluence_page: 'create a Confluence page',
-        jira_issue: 'create a Jira issue',
-        slack_reply: 'post a Slack reply',
-        slack_message: 'post a Slack message',
-      }[kind];
-      return `This will ${what} in ${where}, under your name (${who}).`;
-    },
-    confirmNothing: 'Nothing has been written until you press Confirm.',
+    confirmText: (kind: DraftKind, where: string, who: string) => APPROVE_WORDS[kind].confirmText(where, who),
+    confirmNothing: (kind: DraftKind) => APPROVE_WORDS[kind].nothingYet,
     confirmPractice: 'This is a practice draft. Confirming creates nothing anywhere.',
     externalWarning: 'This channel is shared outside the company. People at other companies will read this.',
     externalCheckbox: 'I understand, and I want to post it there.',
-    confirm: 'Confirm and create',
-    confirmSlack: 'Confirm and post',
+    confirm: (kind: DraftKind) => APPROVE_WORDS[kind].confirmButton,
     confirmExternalButton: 'Confirm and post outside the company',
-    confirming: 'Sending…',
+    confirming: (kind: DraftKind) => APPROVE_WORDS[kind].confirming,
     cancel: 'Not yet',
     errors: {
       needs_external_confirm: {
@@ -292,16 +354,25 @@ export const copy = {
         text: 'This draft has already been decided, so nothing more was sent.',
         next: 'Reload to see the current state.',
       },
+      // Only for a definite refusal (a 4xx the server meant): then it is known nothing was sent.
       other: {
-        text: 'The approval did not go through, and nothing was created.',
+        text: 'The server refused the approval, so nothing was sent.',
         next: 'Try again.',
       },
+      // A dropped connection, a timeout, a 5xx or unknown_outcome: whether it was sent is not known.
+      unknown_outcome: {
+        text: "I can't tell whether this was sent. The connection dropped or the server did not answer in time.",
+        next: 'Check where the draft stands before you try again, so it is not sent twice.',
+      },
     },
+    checkAgain: 'Check again',
+    checkFailed: "I still can't tell whether this was sent. I could not reach the server to check.",
+    checkedPending: 'I checked: the draft is still waiting for you, so it was not sent. You can approve it again.',
     goHome: 'Go home',
     reload: 'Reload the draft',
     tryAgain: 'Try again',
     approvedHeading: 'Approved',
-    approvedWhere: (label: string) => `Created in ${label}.`,
+    approvedWhere: (kind: DraftKind, label: string) => APPROVE_WORDS[kind].done(label),
     practiceApproved: 'Practice approved. Nothing was created, because this was practice.',
     resultLink: 'Open it',
     approvedNoLink: 'Approved.',
@@ -376,7 +447,7 @@ export const copy = {
   toast: {
     region: 'Notifications',
     saved: 'Draft saved.',
-    approved: 'Approved and sent.',
+    approved: (kind: DraftKind) => APPROVE_WORDS[kind].toast,
     practiceApproved: 'Practice approved. Nothing was sent.',
     rejected: 'Draft rejected. Nothing was sent.',
     accepted: 'Change accepted.',
@@ -423,6 +494,12 @@ export const copy = {
       return `${n <= 10 ? words[n] : n} things need you.`;
     },
     briefReady: 'Your daily brief is in',
+    /** No brief has ever run. Briefs come on weekday mornings, at the time the PM sets in Slack. */
+    briefNever: "Your first brief hasn't arrived yet. It comes on weekday mornings, at the time you set in Slack.",
+    briefStale: (when: string) => `Your last brief was ${when}.`,
+    briefNeverCard: 'Nothing here yet. This fills in when your first brief arrives.',
+    briefNeverSub: 'No brief yet',
+    briefStaleCard: 'Nothing in your last brief.',
     composerLabel: 'Ask PM OS',
     readsFrom: 'Reads from',
     systems: ['Jira', 'Confluence', 'Slack'],
@@ -481,6 +558,11 @@ export const copy = {
     emptyAll: 'No follow-ups. Nobody is waiting on you, and you are not waiting on anyone. Enjoy it.',
     lede: 'Who is waiting on you, and who you are waiting on, from the daily brief.',
     countLine: 'From today\'s brief',
+    countLineNever: 'No brief yet',
+    emptyStale: 'Nothing in your last brief, so there is nothing to follow up on.',
+    countLineStale: (when: string) => `From the brief of ${when}`,
+    emptyNever:
+      'No follow-ups yet. They come from your daily brief, and your first one has not arrived. Say "brief me at 8" to the bot in Slack to start.',
     from: (who: string) => `From ${who}`,
     age: (n: number) => (n === 0 ? 'Today' : n === 1 ? '1 day' : `${n} days`),
     columns: { who: 'Who', what: 'What', source: 'Source', age: 'Age' },
@@ -579,6 +661,14 @@ export const copy = {
         connectors: { title: 'Connectors', body: 'Whether the systems the bots read and write are reachable.' },
       },
       error: 'I could not load the overview.',
+      recent: {
+        denied: 'Recent denied actions',
+        approved: 'Recent approvals',
+        seeAll: 'See all',
+        noDenied: 'No denied actions. A calm stretch.',
+        noApproved: 'No approvals recorded yet.',
+        failed: 'I could not load these.',
+      },
     },
 
     audit: {
@@ -719,17 +809,28 @@ export const copy = {
 
   // ---- Errors: plain, what happened, one next step ----
   errors: {
-    network: 'I could not reach the server, so nothing was changed.',
-    unknown: 'Something went wrong on my side, and nothing was changed.',
+    network: 'I could not reach the server.',
+    unknown: 'Something went wrong on my side.',
+    /** For an action whose outcome is not known: it never says the thing did or did not happen. */
+    unsure: (what: string) => `I can't tell whether ${what}.`,
+    unsureWhat: {
+      rejected: 'the rejection went through',
+      accepted: 'the change was accepted',
+      declined: 'the change was set aside',
+      asked: 'that request reached me',
+    },
+    unsureNext: 'Check where things stand before you try again.',
+    unsureStarted: "I can't tell whether that was started. Check Activity before you ask again, so it does not run twice.",
+    checkAgain: 'Check again',
     retry: 'Try again',
     signedOut: 'You were signed out. Sign in again to continue.',
     loadDraftFailed: 'I could not open that draft.',
     notFound: 'That draft does not exist, or it is not yours.',
     loadHomeFailed: 'I could not load your drafts.',
-    askFailed: 'I could not send that to the bot, and nothing was started.',
-    followupFailed: 'I could not start that draft, and nothing was sent.',
+    askFailed: 'I could not send that to the bot.',
+    followupFailed: 'I could not start that draft.',
     dismissFailed: 'I could not remove that item.',
     settingFailed: 'I could not save that setting.',
-    screenBroke: 'Something on this page broke, and nothing was changed.',
+    screenBroke: 'Something on this page broke. Go back home, or reload the page.',
   },
 } as const;

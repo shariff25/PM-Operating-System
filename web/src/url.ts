@@ -16,9 +16,12 @@ export function isSafeId(id: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id);
 }
 
-/** Read the id out of a `/d/<id>` hash path. Returns null when it is malformed or unsafe. */
+/**
+ * Read the id out of a `/d/<id>` hash path. `/drafts/<id>` means the same: older Slack messages
+ * link to it. Returns null when it is malformed or unsafe.
+ */
 export function draftIdFromPath(path: string): string | null {
-  const raw = /^\/d\/([^/]+)$/.exec(path)?.[1];
+  const raw = /^\/(?:d|drafts)\/([^/]+)$/.exec(path)?.[1];
   if (!raw) return null;
   try {
     const id = decodeURIComponent(raw);

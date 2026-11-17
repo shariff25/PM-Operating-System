@@ -8,7 +8,7 @@ import type { Page } from '@playwright/test';
 const EMPTY = 'http://127.0.0.1:5192';
 const BRIEF_OFF = 'http://127.0.0.1:5193';
 
-async function signIn(page: Page, theme: 'light' | 'dark', base?: string, handle = 'ana') {
+async function signIn(page: Page, theme: 'light' | 'dark', base?: string, handle = 'ana', search = '') {
   await page.addInitScript((t) => {
     try {
       window.localStorage.setItem('pmos-theme', t);
@@ -16,7 +16,7 @@ async function signIn(page: Page, theme: 'light' | 'dark', base?: string, handle
       /* the page still loads */
     }
   }, theme);
-  await page.goto((base ?? '') + '/');
+  await page.goto((base ?? '') + '/' + search);
   await page.getByLabel('Your handle').fill(handle);
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await expect(page.getByLabel('What do you need?')).toBeVisible();
@@ -131,7 +131,21 @@ for (const theme of ['light', 'dark'] as const) {
         await scan(page, `draft with the ${hint} hint`);
         await page.locator('[data-hint]').getByRole('button', { name: 'Got it' }).click();
       }
-      await page.getByRole('button', { name: /PAY-212/ }).click();
+      // The numbered markers: at rest, with a title on hover and on focus, and with a source lit up.
+      const doc = page.getByRole('article', { name: 'Formatted draft' });
+      await expect(doc.getByRole('button', { name: 'Source 2: PAY-212: Payment failure handling' }).first()).toBeVisible();
+      await scan(page, 'draft with source markers');
+      await doc.getByRole('button', { name: /^Source 1:/ }).first().hover();
+      await expect(page.locator('.cite-tip')).toHaveText('TCB grace period');
+      await scan(page, 'draft, a marker hovered');
+      await doc.getByRole('button', { name: /^Source 4:/ }).first().focus();
+      await expect(page.locator('.cite-tip')).toHaveText('Slack thread in C01');
+      await scan(page, 'draft, a marker focused');
+      await page.keyboard.press('Enter');
+      await expect(page.getByRole('button', { name: /^Source 4:/ }).and(page.locator('.source'))).toBeFocused();
+      await expect(doc.locator('button.cite-on')).toHaveCount(2);
+      await scan(page, 'draft, a source lit up from its marker');
+      await page.getByRole('button', { name: /PAY-212/ }).and(page.locator('.source')).click();
       await scan(page, 'draft, a source selected');
       await page.getByLabel('What should change?').fill('shorter');
       await page.getByRole('button', { name: 'Suggest a change' }).click();
@@ -151,6 +165,37 @@ for (const theme of ['light', 'dark'] as const) {
       await page.getByRole('button', { name: 'Confirm and create' }).click();
       await expect(page.getByText('Created in Space PM, under Specs.')).toBeVisible();
       await scan(page, 'draft, approved');
+    });
+
+    test('drafts without markers: sources not linked, and one the PM edited', async ({ page }) => {
+      await signIn(page, theme);
+      await go(page, '/d/apr_jira');
+      await expect(page.getByText('No sentence is linked to a source')).toBeVisible();
+      await scan(page, 'draft with sources and no markers');
+      await go(page, '/d/apr_prd');
+      await page.getByRole('button', { name: 'Edit', exact: true }).click();
+      await page.getByLabel('Title').fill('PRD: grace period, second pass');
+      await page.getByRole('button', { name: 'Save', exact: true }).click();
+      await expect(page.getByText('You edited this draft, so source links were removed')).toBeVisible();
+      await expect(page.locator('button.cite')).toHaveCount(0);
+      await scan(page, 'draft the PM edited');
+    });
+
+    test('approve dialogs for a Jira issue and a Slack reply', async ({ page }) => {
+      await signIn(page, theme);
+      await go(page, '/d/apr_jira');
+      await page.getByRole('button', { name: 'Approve to Jira' }).click();
+      await expect(page.getByRole('dialog').getByText(/^This will create a Jira issue in /)).toBeVisible();
+      await scan(page, 'approve dialog, Jira');
+    });
+
+    test('home before any brief has run', async ({ page }) => {
+      await signIn(page, theme, undefined, 'ana', '?mock_brief=never');
+      await expect(page.getByText(/first brief hasn't arrived yet/)).toBeVisible();
+      await scan(page, 'home, no brief yet');
+      await go(page, '/followups');
+      await expect(page.getByText(/your first one has not arrived/)).toBeVisible();
+      await scan(page, 'follow-ups, no brief yet');
     });
 
     test('other drafts: external Slack, expired, practice, hostile, no sources', async ({ page }) => {
@@ -212,6 +257,11 @@ for (const theme of ['light', 'dark'] as const) {
       await go(page, '/d/apr_prd');
       await expect(page.locator('[data-hint]')).toHaveClass(/coach-banner/);
       await scan(page, 'phone draft with the hint banner');
+      await page.locator('[data-hint]').getByRole('button', { name: 'Got it' }).click();
+      await scan(page, 'phone draft with source markers');
+      await page.locator('.sheet button.cite').first().click();
+      await expect(page.getByRole('tab', { name: /^Sources/ })).toHaveAttribute('aria-selected', 'true');
+      await scan(page, 'phone draft, a marker opened its source');
       await page.getByRole('button', { name: 'More' }).click();
       await scan(page, 'phone More menu');
       await page.keyboard.press('Escape');
@@ -228,6 +278,8 @@ for (const theme of ['light', 'dark'] as const) {
       await signIn(page, theme, undefined, 'ada');
       await go(page, '/admin');
       await expect(page.getByRole('heading', { level: 1, name: 'Overview' })).toBeVisible();
+      await expect(page.getByRole('region', { name: 'Recent denied actions' }).getByRole('listitem').first()).toBeVisible();
+      await expect(page.getByRole('region', { name: 'Recent approvals' }).getByRole('listitem').first()).toBeVisible();
       await scan(page, 'admin overview');
       await go(page, '/admin/audit');
       await expect(page.getByRole('table', { name: 'Audit events' })).toBeVisible();
@@ -253,6 +305,7 @@ for (const theme of ['light', 'dark'] as const) {
       await signIn(page, theme, undefined, 'audrey');
       await go(page, '/admin');
       await expect(page.getByRole('heading', { level: 1, name: 'Overview' })).toBeVisible();
+      await expect(page.getByRole('region', { name: 'Recent denied actions' }).getByRole('listitem').first()).toBeVisible();
       await scan(page, 'auditor overview');
       await go(page, '/admin/audit');
       await expect(page.getByRole('table', { name: 'Audit events' })).toBeVisible();
@@ -268,6 +321,7 @@ for (const theme of ['light', 'dark'] as const) {
       for (const [hash, heading] of [['/admin', 'Overview'], ['/admin/audit', 'Audit log'], ['/admin/team', 'Team'], ['/admin/connectors', 'Connectors']] as const) {
         await go(page, hash);
         await expect(page.getByRole('heading', { level: 1, name: heading })).toBeVisible();
+        if (heading === 'Overview') await expect(page.getByRole('region', { name: 'Recent approvals' }).getByRole('listitem').first()).toBeVisible();
         await scan(page, `phone admin ${heading}`);
       }
       await go(page, '/admin/audit');
