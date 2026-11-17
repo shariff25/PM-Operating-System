@@ -925,7 +925,7 @@ async fn find(state: &AppState, signed: &Signed, id: &str) -> Result<Found, ApiE
     }
     let item = signed
         .toolserver(state)
-        .approval(id)
+        .approval_for(signed.handle(), id)
         .await
         .map_err(ApiError::upstream)?;
     if item.user != signed.handle() || drafts::kind(&item.tool).is_none() {
@@ -1542,6 +1542,13 @@ async fn refused_decision(
             StatusCode::UNPROCESSABLE_ENTITY,
             "bad_edit",
             say("The edited draft isn't valid for its target."),
+        ),
+        // The tool server refuses an edit from `pmos-web` that changes where a write goes.
+        // `edited_args` never does, so this is a guard, not a path the app takes.
+        (422, Some("target_changed")) => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "bad_edit",
+            "An edit can change what a draft says, not where it goes. Nothing was sent.",
         ),
         (403, _) => ApiError::new(
             StatusCode::FORBIDDEN,

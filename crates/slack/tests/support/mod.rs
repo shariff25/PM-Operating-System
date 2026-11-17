@@ -383,14 +383,21 @@ async fn ts_list(
     )
 }
 
-async fn ts_get(State(ts): Ts, Path(id): Path<String>, headers: HeaderMap) -> Response {
+/// `GET /internal/approvals/{id}?user=`: `404` unless the item is `user`'s (S2).
+async fn ts_get(
+    State(ts): Ts,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
     authed!(headers);
+    let user = q.get("user").cloned().unwrap_or_default();
     match ts
         .items
         .lock()
         .unwrap()
         .iter()
-        .find(|i| i["id"] == id.as_str())
+        .find(|i| i["id"] == id.as_str() && i["user"] == user.as_str())
     {
         Some(item) => answer(StatusCode::OK, item.clone()),
         None => answer(

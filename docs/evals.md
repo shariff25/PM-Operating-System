@@ -54,7 +54,12 @@ client `evals`. For each task, `repeats` times, it:
   `--trace-token` so failures are tagged from the trace. Without one, tagging uses the task's
   status, error and events only, and the report says how many failures were tagged that way.
 - **Who asks.** A team bot serves team members only, so the `--as` handle must be in
-  `content/team.yaml`. Use a real PM, or add a member for the benchmarks.
+  `content/team.yaml`. The runtime also lets the `evals` token request tasks only as the
+  handles in its own `PMOS_EVALS_AS` (default `evals`; anything else is `403`), so a leaked
+  benchmark token can't run a PM's bots as them. Add a member for the benchmarks (`evals`,
+  as the eval stack does), or, for a run as a real PM, list their handle in the runtime's
+  `PMOS_EVALS_AS` for that run only. Eval tasks never name a Slack target (`400`) and send
+  no Slack notifications.
 - **`bot: personal`.** A category with `bot: personal` sends its tasks to the personal bot of
   whoever they are for: `pm-<requested_by>`, with `.` and `_` as hyphens, as onboarding names
   it. So `--as ana` runs them against `pm-ana`. The report records the resolved bot.
@@ -286,13 +291,15 @@ thread:
 
 **What the runtime must allow.** The runner sends `conversation` on `POST /v1/tasks` and
 expects the runtime to give each turn the earlier turns of that conversation as `history`
-(`docs/bot-runtime-spec.md`, Conversations). Until the runtime does that for eval tasks, a
-thread's first turn is refused (`403`, "only the web and Slack clients name a task's
-conversation"), the thread fails at turn 1 tagged `harness/runtime-unreachable`, and the
-report's reason says why. The runner needs no change when it does. The thread tasks in
-`pm-craft` are not `regression: true` for this reason: the gate doesn't fail a change that
-leaves them failing, and they count in the category's pass rate like any task. Mark them once
-they pass.
+(`docs/bot-runtime-spec.md`, Conversations). The runtime does: the `evals` client may name a
+task's `conversation`, and an eval task that names one gets its earlier turns as history (an
+eval task without one starts fresh). The `evals` client's other limits still hold: the task is
+for a handle in `PMOS_EVALS_AS`, names no Slack target, and sends no notifications. A runtime
+from before this refuses a thread's first turn (`403`, "only the web and Slack clients name a
+task's conversation"); the thread then fails at turn 1 tagged `harness/runtime-unreachable`,
+and the report's reason says why. The thread tasks in `pm-craft` are not `regression: true`
+yet: the gate doesn't fail a change that leaves them failing, and they count in the category's
+pass rate like any task. Mark them once they pass.
 
 ### Failure tags
 Every failure gets exactly one tag. The rules run in this order, and the first match wins.
@@ -722,7 +729,7 @@ docs pages. Like them, it is marked "seed: replace with case cards", has the sta
 | `numbers-sample-size-from-tool` | An experiment plan for a 10% baseline and a 10% relative lift, with the defaults | The draft has the per-arm sample size `stats.sample_size` returns |
 | `ai-spec-failure-modes-and-evaluation` | An AI feature spec | The draft has "Failure modes" and "Evaluation" |
 | `review-prd-by-severity` | A review of fixture page 9002 | No draft or page update; the answer names a "blocker" and ends with the "three changes" that matter most |
-| `thread-*` (3) | A conversation of two turns (see **Threads**): a one-word answer to the bot's own question; "generate the content" after a request about page 9001; a follow-up that changes one detail of a Jira story | The second turn continues the first: no repeated question, the draft is of page 9001, the story is a Task and keeps project, epic and subject. Not `regression: true` until the runtime carries history for eval tasks |
+| `thread-*` (3) | A conversation of two turns (see **Threads**): a one-word answer to the bot's own question; "generate the content" after a request about page 9001; a follow-up that changes one detail of a Jira story | The second turn continues the first: no repeated question, the draft is of page 9001, the story is a Task and keeps project, epic and subject. Not `regression: true` until they pass |
 
 - **The headings are the contract.** Each `must_include` heading is written exactly as §1 of
   `docs/pm-craft-spec.md` lists it, and as the template in `content/templates/` has it. Change
@@ -824,15 +831,18 @@ case cards", have the starting bar (`pass_bar: 0.8`) and run each task three tim
 - **Where:** a self-hosted runner on the Spark (labels `self-hosted, pmos-spark`), where the
   runtime, the worker and the models are. PRs from forks never run there. Registering the
   runner is in `docs/runbooks/upgrade.md`.
-- **What:** `deploy/pmos-admin evals-gate --base origin/<base branch>`. It lists the changed
-  paths (`git diff --name-only <base>...HEAD`), passes them to `pmos-evals affected`, starts
+- **What:** the Spark's own `/opt/pmos/deploy/pmos-admin evals-gate --checkout pr --base
+  origin/<base branch>`. The workflow runs on `pull_request_target` and checks the PR's head
+  out into `pr/` as data: nothing in it is run, and the stack uses the Spark's installed
+  images. It lists the changed
+  paths (`git -C pr diff --name-only <base>...HEAD`), passes them to `pmos-evals affected`, starts
   the eval stack on the PR's checkout, runs `pmos-evals gate` for each affected category with
   the base branch's committed reports as the baseline, and prints the summaries as one markdown document. The job appends it to the job
   summary. It exits 1 if any category's gate failed, 2 on an error, and 0 otherwise, including
   when no category is affected.
 - **Until a runner is registered,** the job waits in the queue. A platform owner runs
-  `deploy/pmos-admin evals-gate --base origin/main` on the Spark from the PR's branch, and
-  pastes the result into the PR.
+  `deploy/pmos-admin evals-gate --checkout <a checkout of the PR's branch> --base origin/main`
+  on the Spark, and pastes the result into the PR.
 
 **Weekly runs, and runs after a model or harness change,** are by hand on the Spark, on the
 eval stack and the content checkout (`main`):

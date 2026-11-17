@@ -31,11 +31,21 @@ pub async fn send_json(
     system: &str,
     what: &str,
 ) -> Result<Value, ConnectorError> {
-    let res = req
-        .header(reqwest::header::ACCEPT, "application/json")
+    let res = send(req, system).await?;
+    decode_json(res, system, what).await
+}
+
+/// Send a request to a REST API, asking for JSON. Only a failure to get any answer is an
+/// error here.
+pub async fn send(req: RequestBuilder, system: &str) -> Result<Response, ConnectorError> {
+    req.header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|e| ConnectorError::Unavailable(format!("{system}: {e}")))?;
+        .map_err(|e| ConnectorError::Unavailable(format!("{system}: {e}")))
+}
+
+/// Decode an answer from [`send`], mapping failures as [`send_json`] does.
+pub async fn decode_json(res: Response, system: &str, what: &str) -> Result<Value, ConnectorError> {
     let status = res.status();
     match status {
         s if s.is_success() => {

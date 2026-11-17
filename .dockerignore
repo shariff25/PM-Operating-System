@@ -5,5 +5,9 @@ harness/dist/
 state/
 .git/
 .claude/
+# Every settings file with secrets (deploy/.env, deploy/live.env, …); the examples stay.
+deploy/*.env
 deploy/.env
+!deploy/env.example
+!deploy/live.env.example
 deploy/backups/

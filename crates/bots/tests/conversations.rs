@@ -155,8 +155,21 @@ async fn web_conversations_are_named_by_the_client(env: &Env) {
     assert_eq!(claim["history"].as_array().unwrap().len(), 1);
     assert_eq!(claim["history"][0]["text"], "first");
 
-    // The evals client may name one too, for a benchmark thread (docs/evals.md); the id
-    // must be well formed whoever sends it.
+    // The evals client may name one too, for a benchmark thread (docs/evals.md), as the
+    // benchmark member only (`PMOS_EVALS_AS`, here ben); the id must be well formed whoever
+    // sends it.
+    let (status, _) = env
+        .post(
+            "/v1/tasks",
+            "evals",
+            None,
+            json!({"bot": "docs", "requested_by": "ben", "text": "x", "source": "eval",
+                   "conversation": "cnv_eval_1"}),
+        )
+        .await;
+    assert_eq!(status, 201);
+    // Naming a conversation doesn't lift the evals client's other limits: a PM's handle is
+    // still `403`, and a Slack target `400`.
     let (status, _) = env
         .post(
             "/v1/tasks",
@@ -166,7 +179,18 @@ async fn web_conversations_are_named_by_the_client(env: &Env) {
                    "conversation": "cnv_42"}),
         )
         .await;
-    assert_eq!(status, 201);
+    assert_eq!(status, 403);
+    let (status, _) = env
+        .post(
+            "/v1/tasks",
+            "evals",
+            None,
+            json!({"bot": "docs", "requested_by": "ben", "text": "x", "source": "eval",
+                   "conversation": "cnv_eval_2",
+                   "slack": {"channel": "C01", "thread_ts": "1.2"}}),
+        )
+        .await;
+    assert_eq!(status, 400);
     for bad in ["", "has space", &"x".repeat(129)] {
         let (status, body) = env
             .post("/v1/tasks", "web", Some("ana"), web("x", Some(bad)))
