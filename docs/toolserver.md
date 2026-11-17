@@ -246,7 +246,7 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/admin/proposals?user=&kind=policy\|content` | the same | Open proposals, read with the viewer's own GitHub token: `{repo, github: "linked", proposals: [...]}`, or `{repo, github: "not_linked", proposals: []}`. `view-policies` / `view-content` |
 | `GET /internal/admin/protection?user=` | the same | `{configured, branch, required_reviews, verified, source?, github}`: whether `PMOS_CONTENT_BRANCH` requires reviews, as the viewer's token can read it. Best effort, never an error. `view-policies` or `view-content` |
 | `POST /internal/admin/actions?user=` `{action, outcome, detail, count, target?}` | the same | `pmos-web` records an admin refusal or an admin's sensitive read: `200 {recorded: true}`; `503 audit_unavailable` if it can't be recorded (pmos-web then serves nothing) |
-| `POST /internal/admin/events[?user=]` `{action, provider, reason?, attempt?, member?}` | web token only | A sign-in event from `pmos-web`: `web.sign_in` or `web.sign_out` (for the member named as `user=`, with a user assertion for them) or `web.sign_in_refused` (no `user=`). Fixed values only. See **Sign-in events** |
+| `POST /internal/admin/events[?user=]` `{action, provider, reason?, attempt?, member?}` | web token only | A sign-in event from `pmos-web`: `web.sign_in` or `web.sign_out` (for the member named as `user=`, with a user assertion for them), `web.sign_in_refused` or `users.identity_conflict` (no `user=`). Fixed values only. See **Sign-in events** |
 | `GET /internal/directory` (+ `If-None-Match`) | service or bot token | Every user in the user database, `{version, users: [...]}`, with `ETag: "<version>"`; `304` when it matches. See **The user database's read API** |
 | `GET /internal/users/resolve?by=entra&tid=&oid=` / `?by=sign_in_name&name=` / `?by=handle&handle=` | web or console token, no assertion | One user, or `404`; `429 resolve_misses` past 20 misses a minute. See **The user database's read API** |
 | `POST /internal/users/{handle}/identities/entra` `{tid, oid, sign_in_name}` | web token, no assertion | The first Entra link. See **The user database's read API** |
@@ -332,11 +332,21 @@ checks it again from nothing and opens the pull request **as the admin**.
 sign-ins, sign-outs and refused sign-ins, so they are in the same audit log as everything
 else and in the admin audit list with the usual fields.
 - **Only `pmos-web`'s token** (the orchestrator, bot and console get `403`).
-- **Only fixed values:** `action` is `web.sign_in`, `web.sign_out` or `web.sign_in_refused`;
-  `provider` is `entra` or `dev`; `reason` (refusals only) is `not_a_member`,
-  `wrong_account`, `expired`, `cancelled`, `unavailable` or `failed`; `attempt` (refusals
+- **Only fixed values:** `action` is `web.sign_in`, `web.sign_out`, `web.sign_in_refused` or
+  `users.identity_conflict`; `provider` is `entra` or `dev`; `reason` (refusals only) is
+  `not_a_member`, `wrong_account` (no longer sent by `pmos-web`), `expired`, `cancelled`,
+  `unavailable`, `failed`, or, since slice U4c, `deactivated`, `sign_in_unconfirmed`,
+  `entra_needs_host`, `entra_misconfigured` or `users_unavailable`; `attempt` (refusals
   only) is 12 lowercase hex characters; `member` (with `wrong_account` only) is a team handle.
   Unknown fields, other values and free text are `400 bad_request`.
+- **An identity conflict** (slice U4c; spec §7 step 3): `pmos-web` flags a known Microsoft
+  account that signed in with a `preferred_username` that is another user's sign-in name
+  (the person signs in as their own `oid` says). `provider` `entra`, `member` (required) the
+  user whose sign-in name it was, nothing else, no `user=`. Recorded as the first-link route
+  records a conflict: `users.identity_conflict`, actor `anonymous`, outcome `denied`, target
+  that handle, detail `entra`, so the overview's `identity_conflicts` counts it. A first
+  sign-in whose name is already linked to another account is recorded by the first-link
+  route itself (`409 linked`/`taken`).
 - **Sign-in and sign-out** name the member as `user=` (a team member, else `403`), with a user
   assertion for them as on every admin route. Recorded as actor = the member, client `web`,
   run `web-auth`, outcome `ok`, `detail` `provider: entra`.
@@ -1257,8 +1267,10 @@ needs an active admin like any import.
 ### The user database's read API (slice U2)
 
 Three routes read the user database for the other services (`src/app/directory.rs`). The
-runtime polls `directory` since slice U4a (`docs/bots-runtime.md` "Who may ask"); Slack, web
-sign-in and the console move to them in slices U4b-d.
+runtime polls `directory` since slice U4a (`docs/bots-runtime.md` "Who may ask"); `pmos-web`
+calls `resolve` and the first link since slice U4c (sign-in and every request, through
+`crates/directory`'s `resolve` client, cached 10 seconds per lookup); Slack and the console
+move to them in slices U4b and U4d.
 Each route has its own allow-list, checked before anything reads the request; any other
 token is `403`, none is `401`.
 

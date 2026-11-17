@@ -76,6 +76,24 @@ describe('what the home page says about the daily brief', () => {
     expect(screen.queryByText(copy.followups.emptyAll)).not.toBeInTheDocument();
   });
 
+  it('says Slack items are hidden when the server withheld them, and only then', async () => {
+    const withheld: Brief = { ...empty, changed: [item], delivered_at: iso(Date.now() - 1000), status: 'today', slack_withheld: true };
+    renderApp({ wrap: briefOf(withheld) });
+    expect(await screen.findByText(copy.today.slackWithheld)).toBeInTheDocument();
+    expect(copy.today.slackWithheld).toBe('Slack items are hidden until PM OS can check your access.');
+  });
+
+  it('follow-ups page: says Slack items are hidden when the server withheld them', async () => {
+    renderApp({ hash: '/followups', wrap: briefOf({ ...empty, status: 'today', slack_withheld: true }) });
+    expect(await screen.findByText(copy.today.slackWithheld)).toBeInTheDocument();
+  });
+
+  it('says nothing about Slack when nothing was withheld', async () => {
+    renderApp();
+    expect(await screen.findByText(copy.today.briefReady)).toBeInTheDocument();
+    expect(screen.queryByText(copy.today.slackWithheld)).not.toBeInTheDocument();
+  });
+
   it('follow-ups page: a stale brief gets no calm joke', async () => {
     renderApp({ hash: '/followups', briefDelivery: 'stale', emptyBrief: true });
     expect(await screen.findByText(copy.followups.emptyStale)).toBeInTheDocument();

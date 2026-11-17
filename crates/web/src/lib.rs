@@ -10,7 +10,9 @@
 //! - [`pg`]: the Postgres stores (sessions, settings, follow-ups), chosen by
 //!   `PMOS_WEB_DATABASE_URL` ([`store_config`]); memory without it.
 //! - [`followups`]: the follow-up store and the daily brief's data (`app::brief` has its routes).
-//! - [`team`]: `team.yaml`, parsed once and re-read when it changes.
+//! - [`team`]: `team.yaml`, parsed once and re-read when it changes: only the admin Team
+//!   page's member list reads it (until slice U5). Who may sign in, and their roles, come from
+//!   the user database (`pmos_directory::resolve`).
 //! - [`upstream`]: the bot runtime (client `web`) and the tool server (approvals).
 //! - [`drafts`]: approval items shown as drafts.
 //! - [`progress`]: a task's runtime events as the app shows them (milestones, progress,

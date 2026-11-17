@@ -12,7 +12,7 @@ interface ProviderProps {
   onSignedIn: () => void;
 }
 
-/** Development sign-in: a handle from team.yaml. Needs PMOS_WEB_DEV_LOGIN=1 on the server. */
+/** Development sign-in: a PM OS handle, looked up in the user database. Needs PMOS_WEB_DEV_LOGIN=1 on the server. */
 function DevLogin({ api, onSignedIn, secondary }: ProviderProps & { secondary: boolean }) {
   const [handle, setHandle] = useState('');
   const [busy, setBusy] = useState(false);

@@ -169,6 +169,7 @@ export function createMockClient(options: MockOptions = {}): Api {
   const me: Me = {
     handle: profile.handle,
     name: profile.name,
+    display_name: profile.name,
     roles: [...profile.roles],
     permissions: [...MOCK_PERMISSIONS[role]],
     csrf_token: 'mock-csrf-token',
@@ -587,6 +588,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       if (named) {
         role = named;
         me.name = MOCK_PROFILES[named].name;
+        me.display_name = MOCK_PROFILES[named].name;
         me.roles = [...MOCK_PROFILES[named].roles];
         me.permissions = [...MOCK_PERMISSIONS[named]];
       }

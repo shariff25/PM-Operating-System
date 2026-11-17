@@ -6,8 +6,9 @@ PM. The browser never sees a service token, a connector token or another PM's da
 
 ```
 browser ──HTTPS──► pmos-web :8770 ──► pmos-bots :8750        (client "web", X-Pmos-User + X-Pmos-Assertion)
-                               └──► pmos-toolserver :8710  (approvals only, web token + X-Pmos-Assertion)
-                               └──► content/team.yaml      (parsed once, re-read when it changes)
+                               └──► pmos-toolserver :8710  (approvals and admin reads: web token + X-Pmos-Assertion;
+                               │                            users: GET /internal/users/resolve, cached 10 s)
+                               └──► content/team.yaml      (the admin Team page's list only, until U5)
 pmos-slack ───────► pmos-web :8770, or :8771 with PMOS_WEB_INTERNAL_BIND  (PUT /internal/brief/{handle})
 ```
 
@@ -41,7 +42,7 @@ For Entra ID sign-in instead of `PMOS_WEB_DEV_LOGIN=1`, set `PMOS_WEB_ENTRA_TENA
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | |
 | `PMOS_WEB_TOOLSERVER_TOKEN` | required | The tool server's `PMOS_WEB_TOKEN`, which reaches only the approvals routes and the read-only admin routes (older deployments used `PMOS_SERVICE_TOKEN`). At least 32 characters, different from the runtime token |
 | `PMOS_ASSERTION_KEYS` | none | The keys pmos-web signs user assertions with: `web:bots:<kid>:<base64>` and `web:toolserver:<kid>:<base64>`, each optionally followed by `:<kid>:<base64>` for the previous key (`docs/user-assertion.md`, Keys). Without a key for an upstream, its calls carry no assertion. A malformed entry, a key under 32 bytes, or another service's pair refuses to start |
-| `PMOS_CONTENT_ROOT` | `content` | Where `team.yaml` is. The server won't start if it doesn't parse |
+| `PMOS_CONTENT_ROOT` | `content` | The deployed content tree the admin screens read. Its `team.yaml` feeds only the admin Team page's member list (until slice U5); who may sign in, and their roles, come from the user database at the tool server |
 | `PMOS_WEB_STATIC_DIR` | none | The built web app. Must contain `index.html`, served for any unknown non-`/api` path that isn't an asset; the icon is `favicon.svg` (or `favicon.ico`) here |
 | `PMOS_WEB_PUBLIC_URL` | none | The origin browsers use. Writes must come from it; without it, `Origin` must match `Host`. Required with Entra ID (`https` unless loopback): the redirect URI is `<PMOS_WEB_PUBLIC_URL>/api/auth/callback`. When it is `https`, every response carries `Strict-Transport-Security: max-age=31536000` |
 | `PMOS_WEB_SESSION_IDLE_MINUTES` | `480` | Idle expiry |
@@ -61,8 +62,8 @@ pmos-web holds no GitHub token, and the tool server opens proposals with the adm
 GitHub account (`docs/policy-admin.md`, **Configuration**).
 
 `GET /healthz` answers `ok` with no sign-in while the process runs. `GET /readyz` answers `200`
-or `503` with each check `ok` or `down` (its store, `team.yaml`, and the runtime's and the tool
-server's own `/healthz` within two seconds); the reason goes to the log, never the answer.
+or `503` with each check `ok` or `down` (its store, and the runtime's and the tool server's own
+`/healthz` within two seconds); the reason goes to the log, never the answer.
 Every ten minutes (`app::HOUSEKEEPING_EVERY`, and at each sign-in) expired sessions,
 follow-ups, `changed` items and old edits and suggestions are deleted, whether or not anyone
 signs in. SIGTERM or Ctrl-C stops that task and lets in-flight requests finish on both
@@ -77,14 +78,18 @@ The `__Host-pmos` cookie is `Secure`, so browsers only keep it over HTTPS (or on
    `Domain`). The id is 256 random bits from the OS; the store keeps only its SHA-256. A
    session ends after 8 idle hours or 24 hours from sign-in, at logout, or when the person
    leaves the team. Signing in always makes a new id and ends the browser's old one.
-2. **Membership:** the session's handle must be a member in `team.yaml`. The parsed file is
-   kept (`src/team.rs`) and read again when its modification time or size changes (one
-   `stat` per request), and at least every 5 seconds: so someone removed loses access on
-   their first request after the file changes, and never more than 5 seconds after it. They
-   get `403 not_a_member` once and every session they have ends. A file that doesn't parse is
-   `503 team_unavailable` at once, never an old copy. An Entra session also ends (`401
-   signed_out`) if the member's `entra-oid` (added or changed since) isn't the account that
-   signed in.
+2. **Membership:** the session's person must be an **active** user in the user database,
+   asked at the tool server (`GET /internal/users/resolve`, through `pmos_directory::resolve`)
+   and cached 10 seconds per person: someone deactivated or removed loses access within 10
+   seconds (`403 not_a_member` once, and every session they have ends), and a removed role is
+   gone within 10 seconds. Roles are looked up per request; a session holds none. An Entra
+   session is looked up by its `(tid, oid)`: unlinked or re-linked, it ends (`401
+   signed_out`); an Admin's or Auditor's link the host hasn't confirmed ends it with `403
+   entra_needs_host`. **The tool server unreachable:** `GET /api/me` and `GET /api/brief`
+   (pmos-web's own store) may use the person's last-known-good answer for at most 5 minutes
+   (`app::LAST_KNOWN_GOOD`), the brief with every Slack item withheld; every other route and
+   every write is `503 users_unavailable` (`app::SignedRead` vs `app::Signed`). `team.yaml`
+   decides nothing.
 3. **Writes** (`POST`, `PUT`, `DELETE`): `Sec-Fetch-Site` must not be another site, `Origin`
    (or else `Referer`) must be the app, **and one of them must be there** (`403 bad_origin`;
    browsers always send `Origin` on these), and `X-Pmos-Csrf` must equal the session's own
@@ -221,7 +226,7 @@ path with another method a JSON `405 method_not_allowed`.
 - **User assertions** (`src/upstream.rs`): with a key for the upstream, every runtime call and
   every tool-server call that names the PM (the inbox, one item, sources, decisions) also
   carries `X-Pmos-Assertion`: issuer `web`, the upstream as audience, the PM as subject, roles
-  from `team.yaml`, 60 seconds, bound to the method, path, query and body sent, signed afresh
+  as the user database answered for that request (informational), 60 seconds, bound to the method, path, query and body sent, signed afresh
   for each call. Every read of one item (the first read of a draft and the re-read after a
   conflicting decision) is `ToolServer::approval_for(user, id)`: it names the PM
   (`?user=<handle>`, which the tool server requires from the web token, answering `404`
@@ -271,8 +276,9 @@ path with another method a JSON `405 method_not_allowed`.
   sources and titles, never the titles, Slack text, drafts, prompts, results or hashes). The
   export reads the tool server in pages of 1,000 (`purpose=export`, needing `export-audit`
   there too), up to 10,000 rows, with `X-Pmos-Truncated` saying when more were left out, and
-  every cell quoted and formula-guarded. The team list comes from this server's `team.yaml`
-  and still shows, with `accounts: null`, when the tool server is down. Every admin read is
+  every cell quoted and formula-guarded. The team list still comes from this server's
+  `team.yaml` (until slice U5; it decides nothing) and shows, with `accounts: null`, when the
+  tool server's accounts read fails. Every admin read is
   logged here (handle, route, filter names only). `GET /api/me` also gives `permissions`
   (from `pmos_contract::permissions::granted`), so the app knows whether to show the Admin
   area; an older client ignores it.
@@ -296,9 +302,8 @@ path with another method a JSON `405 method_not_allowed`.
 
 ## Where the contract isn't met as written
 
-- **`name` in `Me`** is the handle: a `team.yaml` member (`pmos_contract::model::TeamMember`)
-  has no display name field, and the name onboarding takes from Slack stays on the join
-  request and is not written to `team.yaml`. The user database will have one.
+- **`name` in `Me`** is the user database's display name, or the handle when it has none
+  (`display_name` is served too, as untrusted text).
 - **Sources are what the audit log can identify** (`docs/toolserver.md`, **What an item is
   shown with**): Jira, Confluence, docs and context titles are the ones recorded at the read;
   Slack sources are always `Slack thread in C01` (no Slack text or title is recorded); reads
@@ -346,14 +351,13 @@ start on a `PMOS_WEB_BIND` that isn't loopback, and refuses to start beside Entr
 `PMOS_WEB_DEV_LOGIN_WITH_ENTRA=1` says that is meant (a developer's machine).
 
 **Entra ID sign-in proves who the browser is, not what they may do.** Membership and roles
-still come only from `team.yaml`; group and role claims are ignored. A member is matched by
-`preferred_username` (or else `email`) against their `team.yaml` email, which the tenant's
-admins control; a guest account's `preferred_username` is its home address. The token's `oid`
-and `tid` are recorded on the session; a member with `entra-oid` in `team.yaml` signs in only
-as that account (`reason=wrong_account` otherwise), so an email address reassigned to someone
-else can't take their place, and a session ends if `entra-oid` changes under it. Members
-without `entra-oid` are matched by email alone, as before. Logout ends only the PM OS
-session.
+come only from the user database; group and role claims are ignored. A person is found by
+the token's `(tid, oid)`; a first sign-in links that key by `preferred_username` only (never
+`email`), to an active user whose sign-in name an admin confirmed and who holds neither Admin
+nor Auditor, and the tool server re-checks and audits it. Guests (`acct`), other identity
+providers (`idp`) and a registration without the `acct` claim are refused before any
+lookup; a name already linked to another account is refused, audited and flagged
+(`docs/entra-sign-in.md`). Logout ends only the PM OS session.
 
 **This backend is still a deputy, now a narrower one.** It holds its own tool server token,
 which reaches only the approvals routes, the read-only admin routes, the admin proposal and
@@ -399,7 +403,6 @@ audits decisions, admin reads, admin proposals, admin refusals and sensitive rea
 as the client); a
 per-PM limit on running tasks; admin tasks-by-status counts (the runtime has no team-wide read
 for the `web` client); and, for Entra ID sign-in (`docs/entra-sign-in.md`, "Not built"): roles from
-group or app-role claims, matching by `oid` alone (it is checked only where `team.yaml` has
-`entra-oid`), conditional access awareness, single logout, and token refresh (only the ID
+group or app-role claims, conditional access awareness, single logout, and token refresh (only the ID
 token is used, once). The deploy kit (`deploy/`) does
 not pass the `PMOS_WEB_ENTRA_*` variables to the `web` service yet.

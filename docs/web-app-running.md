@@ -7,8 +7,8 @@ plan is `docs/web-client.md`.
 
 ```
 browser ──HTTPS──► reverse proxy ──► pmos-web :8770 ──► pmos-bots :8750        (client "web")
-                                                   └──► pmos-toolserver :8710  (approvals)
-                                                   └──► content/team.yaml
+                                                   └──► pmos-toolserver :8710  (approvals, users)
+                                                   └──► content/team.yaml      (Team page list only)
 ```
 
 **Not ready for production.** See [Not ready for production](#not-ready-for-production). It is
@@ -72,7 +72,7 @@ where `crates/web` is only a stub): confirm them against `crates/web/src/config.
 | `PMOS_WEB_BOTS_TOKEN` | required | The runtime token for client `web`: at least 32 characters, and the same value as the `web=<token>` entry in the runtime's `PMOS_BOTS_TOKENS`. |
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | The tool server, for approvals. |
 | `PMOS_WEB_TOOLSERVER_TOKEN` | required | The tool server's service token (its `PMOS_SERVICE_TOKEN`): at least 32 characters, different from `PMOS_WEB_BOTS_TOKEN`. |
-| `PMOS_CONTENT_ROOT` | `content` | Where `team.yaml` is; re-read on every request. |
+| `PMOS_CONTENT_ROOT` | `content` | The deployed content tree the admin screens read. Who may sign in, and their roles, come from the user database at the tool server (`PMOS_TOOLSERVER_URL`), not `team.yaml`. |
 | `PMOS_WEB_STATIC_DIR` | none | The built app (`web/dist`). Without it only `/api` and `/healthz` answer. |
 | `PMOS_WEB_PUBLIC_URL` | none | The origin browsers use, such as `https://pmos.example.com` (no path). Writes must come from it. Without it, `Origin` must match `Host`. |
 | `PMOS_WEB_SESSION_IDLE_MINUTES` | `480` | Idle expiry. |

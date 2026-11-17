@@ -22,6 +22,9 @@ use pmos_web::{Config, Deps};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+mod support;
+use support::FakeDirectory;
+
 const BOTS_TOKEN: &str = "web-client-token-0123456789abcdef0123";
 const TOOLS_TOKEN: &str = "toolserver-service-token-0123456789ab";
 
@@ -54,6 +57,8 @@ struct Upstream {
     /// Tasks (runtime) or approval items (tool server).
     data: Mutex<Vec<Value>>,
     next: AtomicUsize,
+    /// The tool server's user database routes (tool server only).
+    directory: FakeDirectory,
 }
 
 impl Upstream {
@@ -311,6 +316,11 @@ async fn toolserver(
 ) -> Response {
     if uri.path() == "/healthz" {
         return "ok".into_response();
+    }
+    // The user database: answered apart, so the tests that count calls count what they
+    // always did.
+    if let Some(res) = up.directory.handle(&method, &uri, &body) {
+        return res;
     }
     if uri.path() == "/internal/admin/events" {
         // Recorded apart, so the tests that count calls count what they always did.
@@ -608,6 +618,7 @@ async fn web_full(change: impl FnOnce(&mut Config), brief: BriefConfig) -> Web {
     ]);
     let tools_up = Arc::new(Upstream::default());
     tools_up.data.lock().unwrap().extend(items());
+    tools_up.directory.seed_team(TEAM);
     let (bots_url, stop_bots) = serve(
         Router::new()
             .fallback(runtime)
@@ -962,11 +973,7 @@ async fn sign_ins_and_sign_outs_are_audited() {
     let b = w.login("ana").await;
     let r = w.post(&b, "/api/auth/logout", json!(null)).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
-    for tried in [
-        "mallory@example.com",
-        " Mallory@Example.com ",
-        "eve@example.com",
-    ] {
+    for tried in ["mallory", " mallory ", "eve"] {
         let r = w
             .post(
                 &Browser::default(),
@@ -1110,30 +1117,280 @@ async fn non_members_cannot_sign_in() {
         )
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
-    // By email works too.
-    w.login("ANA@example.com").await;
+    // Development sign-in is by handle only (it resolves in the user database by handle);
+    // an email is malformed.
+    let r = w
+        .post(
+            &Browser::default(),
+            "/api/auth/dev-login",
+            json!({"handle": "ana@example.com"}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    w.login("ana").await;
 }
 
 #[tokio::test]
 async fn removing_a_member_ends_their_access_at_once() {
     let w = web().await;
     let b = w.login("ana").await;
-    let team = w.dir.path().join("team.yaml");
-    std::fs::write(
-        &team,
-        TEAM.replace(
-            "  - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm]}\n",
-            "",
-        ),
-    )
-    .unwrap();
+    let other = w.login("ana").await;
+    let ana = w.tools.directory.get("ana").unwrap();
+    w.tools.directory.remove("ana");
+    // Within the 10 seconds an answer is cached for, at the latest.
+    w.advance(Duration::seconds(10));
     let r = w.get(&b, "/api/drafts").await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert_eq!(r.code(), "not_a_member");
-    // The session is gone for good, even if they are added back.
-    std::fs::write(&team, TEAM).unwrap();
+    // Every session of theirs is gone for good, even if they are added back.
+    w.tools.directory.add(ana);
+    w.advance(Duration::seconds(10));
     assert_eq!(w.get(&b, "/api/me").await.code(), "signed_out");
+    assert_eq!(w.get(&other, "/api/me").await.code(), "signed_out");
     assert!(w.tools.calls().is_empty());
+    // `team.yaml` decides nothing: someone only in the file can't sign in.
+    std::fs::write(
+        w.dir.path().join("team.yaml"),
+        "members:\n  - {handle: mallory, slack-id: U0MAL, roles: [pm, admin]}\n",
+    )
+    .unwrap();
+    let r = w
+        .post(
+            &Browser::default(),
+            "/api/auth/dev-login",
+            json!({"handle": "mallory"}),
+        )
+        .await;
+    assert_eq!(r.code(), "not_a_member");
+}
+
+#[tokio::test]
+async fn a_deactivated_user_loses_access_within_ten_seconds() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    w.tools
+        .directory
+        .update("ana", |u| u.status = "deactivated".into());
+    // Still the cached answer for up to 10 seconds...
+    w.advance(Duration::seconds(9));
+    assert_eq!(w.get(&b, "/api/me").await.status, StatusCode::OK);
+    // ...and not a moment longer.
+    w.advance(Duration::seconds(1));
+    let r = w.get(&b, "/api/drafts").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(r.code(), "not_a_member");
+    // A new sign-in is refused, and recorded as `deactivated`.
+    let r = w
+        .post(
+            &Browser::default(),
+            "/api/auth/dev-login",
+            json!({"handle": "ana"}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert!(r.headers.get("set-cookie").is_none());
+    let last = w.tools.sign_ins.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(last.body["reason"], "deactivated");
+    assert!(last.body.get("attempt").is_none());
+    // Reactivated: they sign in again (their old session stays ended).
+    w.tools
+        .directory
+        .update("ana", |u| u.status = "active".into());
+    assert_eq!(w.get(&b, "/api/me").await.code(), "signed_out");
+    w.advance(Duration::seconds(10));
+    w.login("ana").await;
+}
+
+#[tokio::test]
+async fn me_and_roles_come_from_the_user_database() {
+    let w = web().await;
+    w.tools
+        .directory
+        .update("ana", |u| u.display_name = "Ana <b>Silva</b>".into());
+    let b = w.login("ana").await;
+    let me = w.get(&b, "/api/me").await.body;
+    assert_eq!(me["handle"], "ana");
+    // Untrusted text, passed on as text: the app renders it plainly.
+    assert_eq!(me["display_name"], "Ana <b>Silva</b>");
+    assert_eq!(me["name"], "Ana <b>Silva</b>");
+    assert_eq!(me["roles"], json!(["pm"]));
+    // A role granted in the database is seen within 10 seconds; the file is never read.
+    w.tools
+        .directory
+        .update("ana", |u| u.roles = vec!["pm".into(), "admin".into()]);
+    w.advance(Duration::seconds(10));
+    let me = w.get(&b, "/api/me").await.body;
+    assert_eq!(me["roles"], json!(["pm", "admin"]));
+    assert!(me["permissions"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("manage-connectors")));
+    // With no display name, `name` is the handle.
+    let ben = w.login("ben").await;
+    let me = w.get(&ben, "/api/me").await.body;
+    assert_eq!(me["display_name"], "");
+    assert_eq!(me["name"], "ben");
+}
+
+#[tokio::test]
+async fn sign_in_fails_closed_when_the_tool_server_is_unreachable() {
+    let w = web().await;
+    w.tools.directory.set_down(true);
+    let r = w
+        .post(
+            &Browser::default(),
+            "/api/auth/dev-login",
+            json!({"handle": "ana"}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.code(), "users_unavailable");
+    assert!(r.headers.get("set-cookie").is_none());
+    let last = w.tools.sign_ins.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(last.body["reason"], "users_unavailable");
+    w.tools.directory.set_down(false);
+    w.login("ana").await;
+}
+
+/// Spec §2, "When the store is unavailable": an existing session may read pmos-web's own
+/// store on its last-known-good answer for at most 5 minutes, with Slack items withheld;
+/// every write, and every route that goes to the tool server or the runtime, fails closed.
+#[tokio::test]
+async fn on_the_last_known_good_path_slack_is_withheld_and_writes_fail() {
+    let w = web_brief().await;
+    let b = w.login("ana").await;
+    let r = w
+        .fill(
+            "ana",
+            json!({
+                "date": "2026-11-16",
+                "changed": [
+                    {"system": "jira", "title": "PAY-212 moved to Blocked", "summary": "by Ben",
+                     "url": "https://jira.example.com/PAY-212"},
+                    {"system": "slack", "title": "A thread in #pricing", "summary": "3 replies",
+                     "url": "https://slack.example.com/t/1"},
+                ],
+                "waiting_on_you": [follow("slack", "Ben", "asked about the pricing page", 1),
+                                   follow("jira", "Cy", "a review", 3)],
+                "you_wait_on": [follow("slack", "Legal", "the DPA question", 2)],
+            }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let fresh = w.get(&b, "/api/brief").await.body;
+    assert_eq!(fresh["slack_withheld"], false);
+    assert!(fresh.get("note").is_none());
+    assert_eq!(fresh["changed"].as_array().unwrap().len(), 2);
+    let slack_id = fresh["waiting_on_you"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    w.tools.directory.set_down(true);
+    w.advance(Duration::seconds(30));
+    // Reads from pmos-web's own store: on the last-known-good answer.
+    let me = w.get(&b, "/api/me").await;
+    assert_eq!(me.status, StatusCode::OK, "{:?}", me.body);
+    assert_eq!(me.body["roles"], json!(["pm"]));
+    let r = w.get(&b, "/api/brief").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.body["slack_withheld"], true);
+    assert_eq!(
+        r.body["note"],
+        "Slack items are hidden until PM OS can check your access"
+    );
+    let systems = |list: &str| -> Vec<String> {
+        r.body[list]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["system"].as_str().unwrap().to_lowercase())
+            .collect()
+    };
+    assert_eq!(systems("changed"), ["jira"]);
+    assert_eq!(systems("waiting_on_you"), ["jira"]);
+    assert!(systems("you_wait_on").is_empty());
+    assert!(!r.body.to_string().contains("pricing"));
+    assert!(!r.body.to_string().contains("DPA"));
+    // Everything that reaches another service, and every write, fails closed.
+    let calls = w.tools.calls().len();
+    for path in ["/api/drafts", "/api/tasks", "/api/admin/audit"] {
+        let r = w.get(&b, path).await;
+        assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(r.code(), "users_unavailable", "{path}");
+    }
+    for (method, path, body) in [
+        (
+            Method::PUT,
+            "/api/me/settings".to_string(),
+            json!({"nudges": false}),
+        ),
+        (
+            Method::POST,
+            "/api/me/hints".to_string(),
+            json!({"seen": "ask"}),
+        ),
+        (
+            Method::POST,
+            format!("/api/followups/{slack_id}/dismiss"),
+            json!(null),
+        ),
+        (
+            Method::POST,
+            "/api/tasks".to_string(),
+            json!({"text": "hi"}),
+        ),
+        (
+            Method::POST,
+            "/api/drafts/practice".to_string(),
+            json!(null),
+        ),
+    ] {
+        let r = w.send(&b, method, &path, Some(body)).await;
+        assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(r.code(), "users_unavailable", "{path}");
+    }
+    assert_eq!(
+        w.tools.calls().len(),
+        calls,
+        "nothing reached the tool server"
+    );
+    assert!(w.runtime.calls().is_empty(), "nothing reached the runtime");
+    // At five minutes the last-known-good answer still reads...
+    w.advance(Duration::seconds(270));
+    assert_eq!(w.get(&b, "/api/me").await.status, StatusCode::OK);
+    // ...and past them, reads fail too.
+    w.advance(Duration::seconds(1));
+    for path in ["/api/me", "/api/brief"] {
+        let r = w.get(&b, path).await;
+        assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(r.code(), "users_unavailable");
+    }
+    // Back: everything again, Slack items included.
+    w.tools.directory.set_down(false);
+    let r = w.get(&b, "/api/brief").await;
+    assert_eq!(r.body["slack_withheld"], false);
+    assert_eq!(r.body["changed"].as_array().unwrap().len(), 2);
+    let r = w.post(&b, "/api/me/hints", json!({"seen": "ask"})).await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
+/// A user deactivated while the tool server can't be reached keeps, at worst, the
+/// last-known-good reads (spec §2's stated bound); one whose last answer said deactivated
+/// gets nothing.
+#[tokio::test]
+async fn a_deactivated_last_known_answer_reads_nothing() {
+    let w = web_brief().await;
+    let b = w.login("ana").await;
+    w.tools
+        .directory
+        .update("ana", |u| u.status = "deactivated".into());
+    w.advance(Duration::seconds(10));
+    // This answer says deactivated...
+    assert_eq!(w.get(&b, "/api/me").await.code(), "not_a_member");
+    // ...and the session is gone, so an outage after it serves nothing.
+    w.tools.directory.set_down(true);
+    assert_eq!(w.get(&b, "/api/brief").await.code(), "signed_out");
 }
 
 #[tokio::test]
@@ -2275,31 +2532,31 @@ async fn no_token_ever_reaches_the_browser() {
 
 #[tokio::test]
 async fn an_upstream_that_is_down_is_a_plain_502() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
-    // Nothing listens on these ports.
-    let cfg = config("http://127.0.0.1:9", "http://127.0.0.1:9", dir.path());
-    let (base, _stop) = serve(pmos_web::build(cfg, Deps::in_memory()).unwrap()).await;
-    let w = Web {
-        base,
-        runtime: Arc::default(),
-        tools: Arc::default(),
-        http: reqwest::Client::new(),
-        clock: Arc::new(Mutex::new(start_time())),
-        dir,
-        seen: Mutex::new(Vec::new()),
-        _stop: vec![],
-    };
+    // Nothing listens on the runtime's port; the tool server answers who is signed in.
+    let w = web_with(|c| c.bots_url = "http://127.0.0.1:9".into()).await;
     let b = w.login("ana").await;
-    for path in ["/api/drafts", "/api/tasks"] {
-        let r = w.get(&b, path).await;
-        assert_eq!(r.status, StatusCode::BAD_GATEWAY);
-        assert_eq!(r.code(), "upstream_unavailable");
-    }
+    let r = w.get(&b, "/api/tasks").await;
+    assert_eq!(r.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(r.code(), "upstream_unavailable");
     let r = w.post(&b, "/api/tasks", json!({"text": "hi"})).await;
     assert_eq!(r.status, StatusCode::BAD_GATEWAY);
     assert!(r.body["error"].as_str().unwrap().contains("bot runtime"));
     w.assert_no_tokens();
+    // Nothing listens on the tool server's either: nobody can be signed in at all.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config("http://127.0.0.1:9", "http://127.0.0.1:9", dir.path());
+    let (base, _stop) = serve(pmos_web::build(cfg, Deps::in_memory()).unwrap()).await;
+    let r = reqwest::Client::new()
+        .post(format!("{base}/api/auth/dev-login"))
+        .header("origin", base.clone())
+        .json(&json!({"handle": "ana"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["code"], "users_unavailable");
+    assert!(!body.to_string().contains(TOOLS_TOKEN));
 }
 
 // What the draft was built from, and what the tool server knows about its target.
@@ -3339,18 +3596,15 @@ fn ring(id: &str, key: &str) -> pmos_assertion::KeyRing {
 /// pmos-web with a key for each upstream, as `PMOS_ASSERTION_KEYS` would give it.
 async fn signing_web() -> Web {
     web_with(|cfg| {
-        let root = cfg.content_root.clone();
         cfg.bots_token = Credentials::new(BOTS_TOKEN).with_signer(Signer::new(
             "web",
             "bots",
             ring("wb1", WEB_BOTS_KEY),
-            root.clone(),
         ));
         cfg.toolserver_token = Credentials::new(TOOLS_TOKEN).with_signer(Signer::new(
             "web",
             "toolserver",
             ring("wt1", WEB_TOOLS_KEY),
-            root,
         ));
     })
     .await
@@ -3689,20 +3943,20 @@ async fn the_brief_says_whether_one_was_ever_delivered() {
 }
 
 #[tokio::test]
-async fn readyz_checks_the_store_the_team_and_both_upstreams() {
+async fn readyz_checks_the_store_and_both_upstreams() {
     let w = web().await;
     let r = w.get(&Browser::default(), "/readyz").await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     assert_eq!(
         r.body,
-        json!({"ready": true, "checks": {"store": "ok", "team": "ok",
+        json!({"ready": true, "checks": {"store": "ok",
                                          "bot_runtime": "ok", "tool_server": "ok"},
                "unrecorded_sign_in_events": 0})
     );
+    // `team.yaml` isn't what readiness depends on any more.
     std::fs::write(w.dir.path().join("team.yaml"), "members: [").unwrap();
     let r = w.get(&Browser::default(), "/readyz").await;
-    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(r.body["checks"]["team"], "down");
+    assert_eq!(r.status, StatusCode::OK);
     // Upstreams that don't answer.
     let w = web_with(|c| {
         c.bots_url = "http://127.0.0.1:9".into();
@@ -3729,8 +3983,11 @@ async fn hsts_only_with_an_https_public_url() {
 #[tokio::test]
 async fn the_internal_route_can_have_its_own_listener() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
-    let mut cfg = config("http://127.0.0.1:9", "http://127.0.0.1:9", dir.path());
+    // A tool server that answers who is a user.
+    let tools_up = Arc::new(Upstream::default());
+    tools_up.directory.seed_team(TEAM);
+    let (tools_url, _t) = serve(Router::new().fallback(toolserver).with_state(tools_up)).await;
+    let mut cfg = config("http://127.0.0.1:9", &tools_url, dir.path());
     cfg.internal_bind = Some("127.0.0.1:0".parse().unwrap());
     let deps = Deps {
         brief: BriefConfig {
