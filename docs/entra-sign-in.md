@@ -40,8 +40,11 @@ Start-up rules:
   all set. Setting only some of them (or only `PMOS_WEB_ENTRA_AUTHORITY`) refuses to start and
   names what is missing: a half-configured provider never runs.
 - The server starts if Entra is fully configured **or** `PMOS_WEB_DEV_LOGIN=1`, and refuses with
-  neither. With both, it starts and logs a loud warning: development sign-in still lets anyone
-  who reaches the port sign in as anyone. Never run both on a server people use.
+  neither. **With both it refuses to start**, unless `PMOS_WEB_DEV_LOGIN_WITH_ENTRA=1` is also
+  set: development sign-in lets anyone who reaches the port sign in as anyone, bypassing
+  Entra, so running both has to be meant (a developer's own machine). With the override it
+  starts and logs a loud warning. Development sign-in also refuses to start unless
+  `PMOS_WEB_BIND` is a loopback address.
 - The start-up log names the tenant, client id and redirect URI (never the secret).
 
 ## People in `team.yaml`
@@ -64,8 +67,37 @@ members:
   if it happens anyway, Entra sign-in matches neither.
 - Someone Entra signs in who is not on the list lands on `/#/signed-out?reason=not_a_member`
   with no session. A platform owner adds them the usual way (onboarding or a pull request).
-- Removing someone from `team.yaml` ends their sessions on their next request, as with any
-  provider.
+- Removing someone from `team.yaml` ends their sessions on their next request after the file
+  changes (at most 5 seconds later), as with any provider.
+
+### Matching by object id
+
+An email address can be reassigned: someone leaves, and their address is given to someone
+else in the tenant. Matching by email alone would then sign the new person in as the member.
+To prevent that for a member, give them their Entra **object id** (`oid`, a GUID: Entra admin
+center → Users → the person → Object ID):
+
+```yaml
+members:
+  - handle: ana
+    slack-id: U012AB3CD
+    email: ana@contoso.com
+    entra-oid: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
+    roles: [pm]
+```
+
+- Every Entra sign-in records the ID token's `oid` and `tid` on the session (never shown to
+  the browser or logged).
+- A member with `entra-oid` signs in only with a token whose `oid` is that one (any case).
+  Another account with the same email, or a token without `oid`, lands on
+  `/#/signed-out?reason=wrong_account` with no session, and the refusal is logged with the
+  handle (not the ids).
+- If `entra-oid` is added or changed while the member has a session from another account,
+  that session ends (`401 signed_out`) on its next request.
+- A member without `entra-oid` is matched by email alone, as before. Development sign-in
+  doesn't check it.
+- `pmos lint` refuses an `entra-oid` that isn't a GUID (`team-entra-oid`) and the same one on
+  two members (`team-duplicate`).
 
 ## The flow
 
@@ -87,7 +119,8 @@ members:
    flow's, and `exp`, `nbf` and `iat` within 60 seconds of the server's clock.
 5. On success the browser gets the same session as development sign-in creates and is
    redirected to the return path (default `/`). On any failure it is redirected to
-   `/#/signed-out?reason=<not_a_member|cancelled|expired|unavailable|failed>` with no session.
+   `/#/signed-out?reason=<not_a_member|wrong_account|cancelled|expired|unavailable|failed>`
+   with no session.
    The flow cookie is always cleared.
 
 **Logout** (`POST /api/auth/logout`) ends the PM OS session only. Microsoft's own session is
@@ -98,8 +131,10 @@ Microsoft too, the person signs out at Microsoft.
 
 - **Roles from Entra.** Group claims and app roles are ignored; roles come only from
   `team.yaml`. Group-to-role mapping is not decided (`docs/web-client.md`).
-- **Matching by `oid`.** People are matched by email, which an admin can rename. The stable
-  object id (`oid`) is better once the user database stores it.
+- **Matching by `oid` alone.** People are matched by email, which an admin can rename;
+  `oid` is checked only for members whose `team.yaml` entry has `entra-oid`, which a platform
+  owner adds by hand. Filling it in automatically at a member's first sign-in, or matching by
+  `oid` alone, waits for the user database.
 - **Conditional access awareness.** Whatever Entra's policies require happens at Microsoft;
   `pmos-web` doesn't read `amr`, `acr` or device claims, and a session lasts its own idle and
   absolute limits regardless of Entra's sign-in frequency.
@@ -132,4 +167,6 @@ JWKS and a token endpoint that checks the client secret and PKCE) with RSA keys 
 the tests only: the happy path, wrong or reused `state`, an expired flow, a tampered flow
 cookie, a code for another PKCE challenge, every ID token check (nonce, audience, issuer,
 tenant, expiry, `alg: none`, HS256, an unknown `kid`, a tampered payload), key rotation,
-non-members, the start-up rules, and that no secret, code, token or verifier is ever logged.
+non-members, matching by object id (`entra-oid`), the start-up rules (development sign-in
+beside Entra only with the override, and only on loopback), and that no secret, code, token or
+verifier is ever logged.

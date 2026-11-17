@@ -395,6 +395,7 @@ async fn web_with(opts: Opts) -> Web {
         entra: None,
         session_idle: Duration::hours(8),
         session_max: Duration::hours(24),
+        internal_bind: None,
     };
     let admin = AdminConfig {
         policies_root: Some(dir.path().join("policies")),
@@ -442,7 +443,11 @@ impl Web {
         path: &str,
         body: Option<Value>,
     ) -> Reply {
-        let mut req = self.http.request(method, format!("{}{path}", self.base));
+        // A browser sends Origin on every write; without it the server refuses the request.
+        let mut req = self
+            .http
+            .request(method, format!("{}{path}", self.base))
+            .header("origin", self.base.clone());
         if let Some(w) = who {
             req = req
                 .header("cookie", format!("__Host-pmos={}", w.cookie))
@@ -474,6 +479,7 @@ impl Web {
         let res = self
             .http
             .post(format!("{}/api/auth/dev-login", self.base))
+            .header("origin", self.base.clone())
             .json(&json!({ "handle": handle }))
             .send()
             .await
@@ -619,6 +625,7 @@ async fn role_matrix_for_every_route() {
     let r = w
         .http
         .post(format!("{}/api/admin/policy/validate", w.base))
+        .header("origin", w.base.clone())
         .header("cookie", format!("__Host-pmos={}", adam.cookie))
         .json(&validate_spec)
         .send()

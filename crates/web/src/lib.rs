@@ -10,6 +10,7 @@
 //! - [`pg`]: the Postgres stores (sessions, settings, follow-ups), chosen by
 //!   `PMOS_WEB_DATABASE_URL` ([`store_config`]); memory without it.
 //! - [`followups`]: the follow-up store and the daily brief's data (`app::brief` has its routes).
+//! - [`team`]: `team.yaml`, parsed once and re-read when it changes.
 //! - [`upstream`]: the bot runtime (client `web`) and the tool server (approvals).
 //! - [`drafts`]: approval items shown as drafts.
 //! - [`progress`]: a task's runtime events as the app shows them (milestones, progress,
@@ -37,6 +38,7 @@ pub mod proposals;
 pub mod session;
 pub mod settings;
 pub mod store_config;
+pub mod team;
 pub mod upstream;
 
 pub use app::{build, Deps};

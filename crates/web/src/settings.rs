@@ -1,5 +1,6 @@
 //! What the web app keeps per PM: hints seen, nudges, whether they have opened a draft yet,
-//! pending draft edits, change suggestions and the practice draft.
+//! the practice draft and its edit, and change suggestions. (A real draft's edit is saved on
+//! the item at the tool server, so every surface shows it: `app.rs`, `save_edit`.)
 //!
 //! [`MemorySettingsStore`] loses everything on restart. [`crate::pg::PgStore`] keeps it in
 //! `web_user_settings`, `web_draft_edits`, `web_suggestions`, `web_practice_drafts`,
@@ -59,7 +60,8 @@ pub struct UserState {
     pub nudges: bool,
     /// `first_visit` is `!opened_a_draft`.
     pub opened_a_draft: bool,
-    /// By draft id.
+    /// The practice draft's edit, by its id. Real drafts' edits live at the tool server; an
+    /// entry kept from before that is ignored, and deleted with the draft's suggestion.
     pub edits: BTreeMap<String, DraftEdit>,
     /// By draft id.
     pub suggestions: BTreeMap<String, StoredSuggestion>,

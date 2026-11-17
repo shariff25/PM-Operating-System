@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use pmos_contract::model::TeamFile;
 use pmos_web::{app, Config};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -11,7 +12,7 @@ async fn main() -> Result<()> {
         .init();
     // Refuses to start without a sign-in provider, weak tokens or bad URLs.
     let config = Config::from_env().map_err(anyhow::Error::msg)?;
-    // Refuse to start on a team file that doesn't parse; it's re-read on every request.
+    // Refuse to start on a team file that doesn't parse; it's re-read when it changes.
     let team = TeamFile::load(&config.content_root).map_err(anyhow::Error::msg)?;
     if team.members.is_empty() {
         tracing::warn!(
@@ -38,10 +39,11 @@ async fn main() -> Result<()> {
             "Entra ID sign-in is on"
         );
         if config.dev_login {
+            // Only with PMOS_WEB_DEV_LOGIN_WITH_ENTRA=1 and a loopback bind (config.rs).
             tracing::warn!(
-                "BOTH ENTRA ID AND DEVELOPMENT SIGN-IN ARE ON: development sign-in bypasses \
-                 Entra ID entirely, so anyone who can reach this port can still sign in as any \
-                 member. Unset PMOS_WEB_DEV_LOGIN on any server people use."
+                "BOTH ENTRA ID AND DEVELOPMENT SIGN-IN ARE ON (PMOS_WEB_DEV_LOGIN_WITH_ENTRA=1): \
+                 development sign-in bypasses Entra ID entirely, so anyone who can reach this \
+                 port can still sign in as any member. Never on a server people use."
             );
         }
     }
@@ -57,7 +59,7 @@ async fn main() -> Result<()> {
     if config.static_dir.is_none() {
         tracing::info!("no PMOS_WEB_STATIC_DIR: serving /api only");
     }
-    let bind = config.bind;
+    let (bind, internal_bind) = (config.bind, config.internal_bind);
     let mut deps = pmos_web::store_config::deps_from_env()
         .await
         .map_err(anyhow::Error::msg)?;
@@ -73,16 +75,50 @@ async fn main() -> Result<()> {
     if deps.admin.policies_root.is_none() {
         tracing::info!("no policies root: the policy screen can't compare with checked-in files");
     }
-    let router = pmos_web::build(config, deps).map_err(anyhow::Error::msg)?;
+    let server = app::build_server(config, deps).map_err(anyhow::Error::msg)?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
     tracing::info!(bind = %bind, "pmos-web listening");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            pmos_runtime::shutdown_signal().await;
-            tracing::info!("shutting down: finishing in-flight requests");
-        })
+    let shutdown = CancellationToken::new();
+    // The periodic purge: expired sessions, follow-ups, `changed` items, edits and
+    // suggestions go whether or not anyone signs in.
+    let purge = tokio::spawn(
+        server
+            .housekeeping
+            .clone()
+            .run(app::HOUSEKEEPING_EVERY, shutdown.clone()),
+    );
+    // The server-to-server route on its own listener, when PMOS_WEB_INTERNAL_BIND is set.
+    let internal = match (internal_bind, server.internal) {
+        (Some(at), Some(router)) => {
+            let listener = tokio::net::TcpListener::bind(at)
+                .await
+                .with_context(|| format!("binding {at}"))?;
+            tracing::info!(bind = %at, "pmos-web internal route listening");
+            let stop = shutdown.clone();
+            Some(tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async move { stop.cancelled_owned().await })
+                    .await
+            }))
+        }
+        _ => None,
+    };
+    let stop = shutdown.clone();
+    tokio::spawn(async move {
+        pmos_runtime::shutdown_signal().await;
+        tracing::info!("shutting down: finishing in-flight requests");
+        stop.cancel();
+    });
+    let stop = shutdown.clone();
+    axum::serve(listener, server.public)
+        .with_graceful_shutdown(async move { stop.cancelled_owned().await })
         .await?;
+    shutdown.cancel();
+    if let Some(internal) = internal {
+        internal.await??;
+    }
+    purge.await?;
     Ok(())
 }

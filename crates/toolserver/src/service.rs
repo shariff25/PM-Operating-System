@@ -68,8 +68,10 @@ pub const AUDIENCE_BLOCKED: &str = "audience_blocked";
 pub const NEEDS_EXTERNAL_CONFIRM: &str = "needs_external_confirm";
 /// As a `503` code: Slack's channel calls failed, so nothing was posted.
 pub const AUDIENCE_UNAVAILABLE: &str = "audience_unavailable";
-/// As a `422` code: an edit from the Slack bot changed where the draft goes.
+/// As a `422` code: an edit from a client that acts for a PM changed where the draft goes.
 pub const TARGET_CHANGED: &str = "target_changed";
+/// The audit action of a saved edit ([`ToolService::save_draft`]).
+pub const DRAFT_SAVED: &str = "approval.draft_saved";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ToolError {
@@ -1557,6 +1559,9 @@ impl ToolService {
         if let Some(external) = self.external(item) {
             v["external"] = json!(external);
         }
+        // A person changed the bot's text (a saved edit, or an edit decision): `args` are
+        // theirs. The bot's own arguments are never served.
+        v["edited"] = json!(item.edited());
         v
     }
 
@@ -1911,6 +1916,10 @@ impl ToolService {
             output_ref: Some(item.id.clone()),
             detail: match (decision, reason) {
                 (Decision::Edit, _) => Some("edited before approval".to_string()),
+                // A saved edit (`save_draft`), approved as it stands.
+                (Decision::Approve, _) if item.edited() => {
+                    Some("edited before approval".to_string())
+                }
                 (Decision::Reject, Some(reason)) => Some(format!("reason: {reason}")),
                 _ => None,
             },
@@ -1924,6 +1933,87 @@ impl ToolService {
         tokio::spawn(async move { this.run_approved(item, event).await })
             .await
             .map_err(|e| DecisionError::Internal(e.to_string()))?
+    }
+
+    /// Save `user`'s edit of their pending item `id` (`PUT /internal/approvals/{id}/draft`,
+    /// the web app's **Save**): `args` replace the item's arguments, so the Slack card, the
+    /// console and the web app all show them and an approve anywhere writes them. The same
+    /// rules as an edit decision: only the item's own user (in `team.yaml` when enforced),
+    /// only while pending (a Slack draft past its time expires now), arguments checked against
+    /// the tool's schema, and from any client but the orchestrator no change to where the write
+    /// goes (`target_changed`, audited). Source markers may stay in the text: they are removed
+    /// when the write runs. Nothing is written to the target system. Audited as
+    /// `approval.draft_saved`, outcome `ok`, with the new args hash and never the text.
+    pub async fn save_draft(
+        self: &Arc<Self>,
+        client: Client,
+        id: &str,
+        user: &str,
+        args: Value,
+        now: DateTime<Utc>,
+    ) -> Result<ApprovalItem, DecisionError> {
+        let event =
+            |item: &ApprovalItem, outcome, hash: String, detail: Option<String>| AuditEvent {
+                client,
+                at: now,
+                run_id: item.run_id.clone(),
+                user: user.to_string(),
+                skill: item.skill.clone(),
+                bot: item.bot.clone(),
+                tool: DRAFT_SAVED.to_string(),
+                outcome,
+                sources: Vec::new(),
+                source_titles: Default::default(),
+                args_hash: Some(hash),
+                output_ref: Some(item.id.clone()),
+                detail,
+            };
+        if !self.team.allows(user) {
+            return Err(DecisionError::NotAMember(user.to_string()));
+        }
+        let Some(current) = self.stores.approvals.get(id).await? else {
+            return Err(DecideError::NotFound.into());
+        };
+        if current.user != user {
+            self.audit(event(
+                &current,
+                Outcome::Denied,
+                current.args_hash.clone(),
+                Some("draft save by someone other than the item's user".into()),
+            ))
+            .await;
+            return Err(DecideError::Forbidden.into());
+        }
+        if self.overdue(&current, now) {
+            self.expire_drafts(now).await?;
+        }
+        if current.status == Status::Pending {
+            let spec = self.write_spec(&current)?;
+            check_args(&spec.input_schema, &args).map_err(DecisionError::InvalidArgs)?;
+            if client != Client::Orchestrator {
+                if let Some(arg) = changed_target(&current.tool, &current.args, &args) {
+                    self.audit(event(
+                        &current,
+                        Outcome::Denied,
+                        current.args_hash.clone(),
+                        Some(format!(
+                            "{TARGET_CHANGED}: a saved edit from the {} client changed `{arg}`",
+                            client.as_str()
+                        )),
+                    ))
+                    .await;
+                    return Err(DecisionError::TargetChanged(arg.to_string()));
+                }
+            }
+        }
+        let item = self
+            .stores
+            .approvals
+            .save_draft(id, user, args, now)
+            .await?;
+        self.audit(event(&item, Outcome::Ok, item.args_hash.clone(), None))
+            .await;
+        Ok(item)
     }
 
     /// Who can see the channel a Slack write is for, checked with the PM's own token before
