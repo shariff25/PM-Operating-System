@@ -109,7 +109,7 @@ mode=$(grep -E "^PMOS_ASSERTION_MODE=" "$ENV" | head -1 | cut -d= -f2-)
 if [ "$mode" = require ]; then
   ok "user assertions: require"
 else
-  warn "PMOS_ASSERTION_MODE=$mode in deploy/.env: the runtime and the tool server will refuse to start with it unless PMOS_ASSERTION_INSECURE_OFF=1 (development only)"
+  warn "PMOS_ASSERTION_MODE=$mode in deploy/.env: with the web app or the console configured, the runtime and the tool server refuse to start with it; set it to require"
 fi
 
 missing=()

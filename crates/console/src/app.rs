@@ -25,6 +25,10 @@ use crate::upstream::{BotDetail, BotSummary, Routine, Task, Upstream, UpstreamEr
 /// How many recent tasks the Activity screen lists.
 pub const RECENT_TASKS: u32 = 50;
 
+/// What a list shows in place of the text of someone else's task or routine: the runtime sends
+/// the console only its metadata.
+pub const HIDDEN_TEXT: &str = "<span class=\"muted\">text hidden</span>";
+
 struct Inner {
     identity: Identity,
     content_root: PathBuf,
@@ -245,13 +249,18 @@ fn list(items: &[String]) -> String {
 // Bots.
 
 async fn bots(State(state): State<AppState>, Signed { viewer, .. }: Signed) -> Response {
-    let mut roster: Vec<BotSummary> = match state.0.bots.bots().await {
+    let mut roster: Vec<BotSummary> = match state.0.bots.bots(&viewer.handle).await {
         Ok(b) => b,
         Err(e) => return upstream_failed(&viewer, Screen::Bots, e),
     };
     roster.retain(|b| viewer.sees_bot(&b.scope, &b.owner));
     roster.sort_by(|a, b| (a.scope != "team", &a.name).cmp(&(b.scope != "team", &b.name)));
-    let details = join_all(roster.iter().map(|b| state.0.bots.bot(&b.name))).await;
+    let details = join_all(
+        roster
+            .iter()
+            .map(|b| state.0.bots.bot(&viewer.handle, &b.name)),
+    )
+    .await;
 
     let mut body = String::from(
         "<p class=\"muted\">Each bot's job, what it may read, and what happens when it \
@@ -389,7 +398,7 @@ async fn visible_routines(
     viewer: &Viewer,
 ) -> Result<Vec<Routine>, UpstreamError> {
     let owner = (!viewer.admin).then_some(viewer.handle.as_str());
-    let mut items = state.0.bots.routines(owner).await?;
+    let mut items = state.0.bots.routines(&viewer.handle, owner).await?;
     items.retain(|r| viewer.sees_own(&r.owner));
     Ok(items)
 }
@@ -420,10 +429,14 @@ fn routine_row(r: &Routine, token: &str) -> Vec<String> {
             " class=\"danger\""
         )
     );
+    let prompt = if r.hidden {
+        HIDDEN_TEXT.to_string()
+    } else {
+        esc(&clip(&r.prompt, 160))
+    };
     vec![
         format!(
-            "{}<br><span class=\"muted\"><code>{}</code></span>",
-            esc(&clip(&r.prompt, 160)),
+            "{prompt}<br><span class=\"muted\"><code>{}</code></span>",
             Esc(&r.id)
         ),
         esc(&r.bot),
@@ -538,18 +551,27 @@ async fn approvals(State(state): State<AppState>, Signed { viewer, team }: Signe
         vec![viewer.handle.clone()]
     };
     let mut items = Vec::new();
-    for result in join_all(
-        users
-            .iter()
-            .map(|u| state.0.toolserver.pending_approvals(u)),
-    )
-    .await
-    {
+    // Inboxes the tool server cut at its safety cap: (PM, how many are pending in all).
+    let mut cut: Vec<(String, usize)> = Vec::new();
+    for (user, result) in users.iter().zip(
+        join_all(
+            users
+                .iter()
+                .map(|u| state.0.toolserver.pending_approvals(u)),
+        )
+        .await,
+    ) {
         match result {
-            Ok(mut found) => items.append(&mut found),
+            Ok(mut page) => {
+                if page.truncated {
+                    cut.push((user.clone(), page.total_pending));
+                }
+                items.append(&mut page.items);
+            }
             Err(e) => return upstream_failed(&viewer, Screen::Approvals, e),
         }
     }
+    cut.retain(|(u, _)| viewer.sees_own(u));
     items.retain(|a| viewer.sees_own(&a.user));
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
@@ -562,6 +584,14 @@ async fn approvals(State(state): State<AppState>, Signed { viewer, team }: Signe
          <strong>Approve</strong>, <strong>Edit</strong> and <strong>Reject</strong> in its \
          task's thread, and only its own PM can decide it. This queue is read-only.{slack}</p>"
     );
+    for (user, total) in &cut {
+        let _ = write!(
+            body,
+            "<p class=\"error\" role=\"status\">{}'s inbox has {total} pending drafts; the tool \
+             server listed only the newest. The rest are still pending.</p>",
+            Esc(user)
+        );
+    }
     if items.is_empty() {
         body.push_str(&empty("Nothing is waiting for approval."));
     } else {
@@ -602,7 +632,7 @@ async fn approvals(State(state): State<AppState>, Signed { viewer, team }: Signe
 
 async fn activity(State(state): State<AppState>, Signed { viewer, .. }: Signed) -> Response {
     let who = (!viewer.admin).then_some(viewer.handle.as_str());
-    let mut tasks = match state.0.bots.tasks(who, RECENT_TASKS).await {
+    let mut tasks = match state.0.bots.tasks(&viewer.handle, who, RECENT_TASKS).await {
         Ok(t) => t,
         Err(e) => return upstream_failed(&viewer, Screen::Activity, e),
     };
@@ -617,7 +647,13 @@ async fn activity(State(state): State<AppState>, Signed { viewer, .. }: Signed) 
         let rows: Vec<Vec<String>> = tasks
             .iter()
             .map(|t| {
-                let ask = esc(&clip(&t.text, 140));
+                // Someone else's task comes as metadata only: its ask isn't shown here, and
+                // its page answers only its own PM or an admin.
+                let ask = if t.hidden {
+                    HIDDEN_TEXT.to_string()
+                } else {
+                    esc(&clip(&t.text, 140))
+                };
                 vec![
                     when(&t.created_at),
                     esc(&t.bot),

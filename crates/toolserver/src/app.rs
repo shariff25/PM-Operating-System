@@ -60,8 +60,8 @@ use crate::members::RequestStatus;
 use crate::oauth::{OAuth, OAuthError};
 use crate::onboarding::{DecisionInput, Onboarding, Refusal};
 use crate::service::{
-    DecisionError, ReindexError, SessionError, ToolError, ToolService, AUDIENCE_BLOCKED,
-    AUDIENCE_UNAVAILABLE, NEEDS_EXTERNAL_CONFIRM, TARGET_CHANGED,
+    DecisionError, ReindexError, Revision, SessionError, ToolError, ToolService, AUDIENCE_BLOCKED,
+    AUDIENCE_UNAVAILABLE, NEEDS_EXTERNAL_CONFIRM, STALE, TARGET_CHANGED,
 };
 use crate::session::BOT_IDENTITY_PREFIX;
 use crate::store::StoreError;
@@ -713,8 +713,11 @@ pub const BOT_PENDING_LIMIT: usize = 50;
 
 /// A PM's approval items.
 ///
-/// - **The orchestrator:** `{"items": [...]}`, every item of `user`'s, newest first,
-///   optionally only those with `status`.
+/// - **The orchestrator, `pmos-web` and the console:** `{"items": [...], "truncated",
+///   "total_pending"}`, `user`'s inbox newest first: every pending item (up to
+///   [`crate::approvals::PENDING_CAP`], `truncated` past it) and the newest
+///   [`crate::approvals::LIST_LIMIT`] decided ones; with `status=pending` the pending ones only.
+///   With another `status`, `{"items": [...]}`, at most `LIST_LIMIT`.
 /// - **The Slack bot** (the App Home Inbox): `{"approvals": [...], "total": n}`, only
 ///   `pending` items whatever `status` says, oldest first, at most [`BOT_PENDING_LIMIT`];
 ///   `total` counts them all. `user` must be a team member.
@@ -749,6 +752,40 @@ async fn list_approvals(
             None => return error(StatusCode::BAD_REQUEST, format!("unknown status `{s}`")),
         },
     };
+    // The inbox (every status, or only `pending`): pending items are never hidden behind the
+    // cap on decided ones (R12).
+    if matches!(status, None | Some(Status::Pending)) {
+        return match state.svc.inbox(&user).await {
+            Ok(inbox) => {
+                let truncated = inbox.truncated();
+                let total_pending = inbox.total_pending;
+                let mut items = inbox.pending;
+                if status.is_none() {
+                    items.extend(inbox.decided);
+                    items.sort_by(|a, b| {
+                        b.created_at
+                            .cmp(&a.created_at)
+                            .then_with(|| a.id.cmp(&b.id))
+                    });
+                }
+                if truncated {
+                    tracing::warn!(
+                        total_pending,
+                        cap = crate::approvals::PENDING_CAP,
+                        "an inbox listing was truncated"
+                    );
+                }
+                let items = state.svc.approvals_json(&items).await;
+                Json(json!({
+                    "items": items,
+                    "truncated": truncated,
+                    "total_pending": total_pending,
+                }))
+                .into_response()
+            }
+            Err(e) => unavailable(e),
+        };
+    }
     match state.svc.approvals(&user, status).await {
         Ok(items) => {
             let items = state.svc.approvals_json(&items).await;
@@ -852,6 +889,11 @@ struct DecisionBody {
     /// For a Slack write to an externally shared channel: the PM confirmed posting there.
     #[serde(default)]
     confirm_external: bool,
+    /// The start (16 to 64 hex characters) of the `args_hash` the person deciding was shown.
+    /// When it no longer matches the item: `409 {code: "stale"}` and nothing is decided.
+    /// Required on `approve` from the Slack bot and `pmos-web`; optional for the orchestrator.
+    #[serde(default)]
+    expected_args_hash: Option<String>,
 }
 
 /// An error with a machine-readable `code`, and any extra fields.
@@ -887,6 +929,7 @@ async fn decide(
         args: body.args,
         reason,
         confirm_external: body.confirm_external,
+        expected_args_hash: body.expected_args_hash,
     };
     match state
         .svc
@@ -895,6 +938,21 @@ async fn decide(
     {
         Ok(item) => Json(state.svc.approval_json(&item).await).into_response(),
         Err(DecisionError::Decide(DecideError::Store(e))) => unavailable(e),
+        Err(e @ DecisionError::Decide(DecideError::Stale)) => {
+            coded(StatusCode::CONFLICT, STALE, e.to_string(), json!({}))
+        }
+        Err(e @ DecisionError::ShownHashMissing) => coded(
+            StatusCode::BAD_REQUEST,
+            "expected_args_hash_required",
+            e.to_string(),
+            json!({}),
+        ),
+        Err(e @ DecisionError::ShownHashMalformed) => coded(
+            StatusCode::BAD_REQUEST,
+            "bad_expected_args_hash",
+            e.to_string(),
+            json!({}),
+        ),
         Err(e @ DecisionError::Decide(DecideError::Expired)) => {
             coded(StatusCode::CONFLICT, "expired", e.to_string(), json!({}))
         }
@@ -920,7 +978,9 @@ async fn decide(
             let status = match e {
                 DecideError::NotFound => StatusCode::NOT_FOUND,
                 DecideError::Forbidden => StatusCode::FORBIDDEN,
-                DecideError::NotPending | DecideError::Expired => StatusCode::CONFLICT,
+                DecideError::NotPending | DecideError::Expired | DecideError::Stale => {
+                    StatusCode::CONFLICT
+                }
                 DecideError::MissingArgs => StatusCode::BAD_REQUEST,
                 DecideError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
             };
@@ -954,6 +1014,15 @@ async fn decide(
 #[serde(deny_unknown_fields)]
 struct DraftBody {
     args: Value,
+    /// The revision run whose answer this text is (the web app's accepted suggestion): its
+    /// runtime task id. The item's level is raised to what the tool server's own sessions for
+    /// that run reached (`restricted` when it has none). Absent for text a person typed.
+    #[serde(default)]
+    revision_run: Option<String>,
+    /// The level the caller recorded for that run: only ever a floor, never trusted to lower
+    /// anything. Ignored without `revision_run`.
+    #[serde(default)]
+    revision_sensitivity: Option<Sensitivity>,
 }
 
 /// `PUT /internal/approvals/{id}/draft?user=<handle>` `{"args": {...}}`: the item's own PM
@@ -984,9 +1053,22 @@ async fn save_draft(
     if acting.0.as_ref().is_some_and(|who| *who != user) {
         return not_found();
     }
+    let revision = match body.revision_run {
+        None => None,
+        Some(run_id) if run_id.is_empty() || run_id.len() > 128 => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "`revision_run` must be a run id of 1 to 128 characters",
+            )
+        }
+        Some(run_id) => Some(Revision {
+            run_id,
+            sensitivity: body.revision_sensitivity,
+        }),
+    };
     match state
         .svc
-        .save_draft(client, &id, &user, body.args, Utc::now())
+        .save_draft(client, &id, &user, body.args, revision, Utc::now())
         .await
     {
         Ok(item) => Json(state.svc.approval_json(&item).await).into_response(),

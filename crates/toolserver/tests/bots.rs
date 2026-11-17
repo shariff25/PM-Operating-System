@@ -529,9 +529,17 @@ async fn deciders_must_be_in_team_yaml_when_it_is_enforced() {
     }
     assert!(f.jira.writes().is_empty());
 
+    let shown = f.svc.approval(&id).await.unwrap().unwrap().args_hash;
     let done = f
         .svc
-        .decide_as(Client::Bot, &id, "ana", Decision::Approve, None, now())
+        .decide_verdict(
+            Client::Bot,
+            &id,
+            "ana",
+            pmos_toolserver::approvals::Verdict::new(Decision::Approve, None)
+                .shown(Some(shown[..16].to_string())),
+            now(),
+        )
         .await
         .unwrap();
     assert_eq!(done.status, Status::Approved);
@@ -883,12 +891,20 @@ async fn the_bot_token_reads_and_decides_one_item() {
 
     let decide = |id: String, who: &'static str, decision: &'static str| {
         let base = s.base.clone();
+        let svc = s.fixture.svc.clone();
         async move {
+            // As the Slack bot sends it: an approve names what its card showed.
+            let mut body = json!({"decided_by": who, "decision": decision});
+            if decision == "approve" {
+                if let Some(item) = svc.approval(&id).await.unwrap() {
+                    body["expected_args_hash"] = json!(item.args_hash[..16]);
+                }
+            }
             post(
                 &base,
                 BOT_TOKEN,
                 &format!("/internal/approvals/{id}/decision"),
-                json!({"decided_by": who, "decision": decision}),
+                body,
             )
             .await
         }

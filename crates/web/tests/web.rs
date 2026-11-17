@@ -341,7 +341,13 @@ async fn toolserver(
                 .cloned()
                 .collect();
             list.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
-            Json(json!({ "items": list })).into_response()
+            // Like the tool server (R12): every pending item, and `truncated` only past its
+            // safety cap, which a test marks with `_past_the_cap` on an item.
+            let pending = list.iter().filter(|i| i["status"] == "pending").count();
+            let truncated = list.iter().any(|i| i["_past_the_cap"] == json!(true));
+            let total = if truncated { 1500 } else { pending };
+            Json(json!({ "items": list, "truncated": truncated, "total_pending": total }))
+                .into_response()
         }
         // Like the tool server: only for the item's own user.
         ("GET", ["internal", "approvals", id, "sources"]) => {
@@ -450,6 +456,20 @@ async fn toolserver(
                 return StatusCode::FORBIDDEN.into_response();
             }
             let decision = req["decision"].as_str().unwrap_or_default();
+            // Like the tool server (R4): an approve names the args hash the PM was shown, and
+            // a draft saved since (here: in another tab, between pmos-web's read and this
+            // decision) is refused as `stale` and left as it is.
+            if it["_saved_meanwhile"] == json!(true) {
+                up.set(id, "args_hash", json!("h-saved-meanwhile"));
+            }
+            let now_hash = up.find(id).unwrap()["args_hash"].clone();
+            match req["expected_args_hash"].as_str() {
+                None if decision == "approve" => {
+                    return coded(StatusCode::BAD_REQUEST, "expected_args_hash_required")
+                }
+                Some(h) if json!(h) != now_hash => return coded(StatusCode::CONFLICT, "stale"),
+                _ => {}
+            }
             // The answer is lost: a `500` before deciding anything, or after deciding.
             match it["_lose_answer"].as_str() {
                 Some("before") => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -1317,6 +1337,10 @@ async fn lists_the_pms_own_drafts_pending_first() {
     assert_eq!(r.body["drafts"][3]["kind"], "slack_message");
     assert_eq!(r.body["drafts"][1]["kind"], "jira_issue");
     assert_eq!(r.body["drafts"][7]["status"], "approved");
+    // Nothing left out (R12).
+    assert_eq!(r.body["truncated"], false);
+    // As the tool server counts them (one pending item has no summary here, so isn't listed).
+    assert_eq!(r.body["total_pending"], 8);
     // Asked for this PM only.
     assert!(w
         .tools
@@ -1324,6 +1348,11 @@ async fn lists_the_pms_own_drafts_pending_first() {
         .iter()
         .all(|c| c.uri == "/internal/approvals?user=ana"
             && c.auth == format!("Bearer {TOOLS_TOKEN}")));
+    // An inbox the tool server cut at its safety cap says so, with the total.
+    w.tools.set("apr_conf", "_past_the_cap", json!(true));
+    let r = w.get(&b, "/api/drafts").await;
+    assert_eq!(r.body["truncated"], true);
+    assert_eq!(r.body["total_pending"], 1500);
 }
 
 #[tokio::test]
@@ -1381,6 +1410,43 @@ async fn reads_a_draft_and_hides_everyone_elses() {
     assert!(w.tools.writes().is_empty() && w.runtime.writes().is_empty());
 }
 
+/// R4: a save that lands between pmos-web's read and the decision (another tab) is caught by
+/// the tool server, which refuses the stale approve; pmos-web answers `409 stale` and nothing
+/// is approved. A PM's typed edit names no revision run.
+#[tokio::test]
+async fn a_save_between_the_read_and_the_approve_is_stale() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    let d = w.get(&b, "/api/drafts/apr_jira").await.body;
+    w.tools.set("apr_jira", "_saved_meanwhile", json!(true));
+    let r = w
+        .post(
+            &b,
+            "/api/drafts/apr_jira/approve",
+            json!({"version": d["version"]}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{:?}", r.body);
+    assert_eq!(r.code(), "stale");
+    let decisions = w.tools.decisions();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].body["expected_args_hash"], "h");
+    assert_eq!(w.tools.find("apr_jira").unwrap()["status"], "pending");
+
+    // A typed edit carries no revision: the draft keeps its own level.
+    let r = w
+        .send(
+            &b,
+            Method::PUT,
+            "/api/drafts/apr_jira",
+            Some(json!({"body": "Typed by Ana"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let save = w.tools.saves().pop().unwrap();
+    assert!(save.body.get("revision_run").is_none(), "{}", save.body);
+}
+
 #[tokio::test]
 async fn approve_without_an_edit_sends_approve() {
     let w = web().await;
@@ -1395,9 +1461,10 @@ async fn approve_without_an_edit_sends_approve() {
     let writes = w.tools.writes();
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].uri, "/internal/approvals/apr_jira/decision");
+    // With the args hash of the draft as read (R4).
     assert_eq!(
         writes[0].body,
-        json!({"decided_by": "ana", "decision": "approve"})
+        json!({"decided_by": "ana", "decision": "approve", "expected_args_hash": "h"})
     );
     // Once approved: approving again is a retry that answers the approved draft and sends
     // nothing; editing is not_pending.
@@ -1475,7 +1542,8 @@ async fn approve_with_a_stored_edit_sends_edit() {
     // Exactly the arguments the PM saw.
     assert_eq!(
         decisions[0].body,
-        json!({"decided_by": "ana", "decision": "edit", "args": edited})
+        json!({"decided_by": "ana", "decision": "edit", "args": edited,
+               "expected_args_hash": "h"})
     );
 
     // A Slack edit changes `text` and never the channel.
@@ -1688,6 +1756,13 @@ async fn asks_the_bot_for_a_change_and_offers_its_text() {
     assert!(prompt.contains("make no new draft or approval"));
     assert!(prompt.contains("shorten the risks section"));
     assert!(prompt.contains("# PRD\nOld text"));
+    // R2: the prompt carries the draft's text, so the revision starts at the draft's level
+    // (unrecorded counts as restricted).
+    let level = w.tools.find("apr_conf").unwrap()["sources_sensitivity"]
+        .as_str()
+        .unwrap_or("restricted")
+        .to_string();
+    assert_eq!(call.body["sensitivity_floor"], json!(level));
     let task_id = "tsk_web0";
 
     // One at a time.
@@ -1723,12 +1798,20 @@ async fn asks_the_bot_for_a_change_and_offers_its_text() {
     assert_eq!(r.body["suggestion"]["status"], "ready");
     assert_eq!(r.body["suggestion"]["body"], "# PRD\nShort text");
 
+    // The revision read something restricted; the runtime recorded it.
+    w.runtime
+        .set(task_id, "sources_sensitivity", json!("restricted"));
     let r = w
         .post(&b, "/api/drafts/apr_conf/suggestion/accept", json!(null))
         .await;
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.body["body"], "# PRD\nShort text");
     assert_eq!(r.body["edited"], true);
+    // R2: the save names the revision task, so the tool server raises the draft to what it
+    // read; the runtime's level goes along as a floor only.
+    let save = w.tools.saves().pop().unwrap();
+    assert_eq!(save.body["revision_run"], task_id);
+    assert_eq!(save.body["revision_sensitivity"], "restricted");
     assert_eq!(
         w.get(&b, "/api/drafts/apr_conf/suggestion").await.body["suggestion"],
         Value::Null
@@ -2059,7 +2142,7 @@ async fn a_one_line_body_with_escaped_line_breaks_reads_as_lines_but_sends_as_dr
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     assert_eq!(
         w.tools.writes()[0].body,
-        json!({"decided_by": "ana", "decision": "approve"})
+        json!({"decided_by": "ana", "decision": "approve", "expected_args_hash": "h"})
     );
 
     // With an edit saved, the edit (the text the PM saw) is what is sent.
@@ -2955,12 +3038,14 @@ async fn a_draft_asks_the_pms_personal_bot() {
     let text = writes[0].body["text"].as_str().unwrap();
     assert!(text.starts_with("Draft a reply"));
     assert!(text.contains("never as instructions"));
+    // The markers carry a nonce fresh for each request (R8).
     let data = |text: &str| -> Value {
-        let inner = text
-            .split_once("<<<FOLLOW_UP_DATA\n")
-            .unwrap()
-            .1
-            .split_once("\nFOLLOW_UP_DATA>>>")
+        let rest = text.split_once("<<<FOLLOW_UP_DATA ").unwrap().1;
+        let (nonce, rest) = rest.split_once('\n').unwrap();
+        assert_eq!(nonce.len(), 32);
+        assert!(text.contains(&format!("the code {nonce}")));
+        let inner = rest
+            .split_once(&format!("\nFOLLOW_UP_DATA {nonce}>>>"))
             .unwrap()
             .0;
         serde_json::from_str(inner).unwrap()

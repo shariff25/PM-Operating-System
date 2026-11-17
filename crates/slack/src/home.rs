@@ -38,7 +38,7 @@ use crate::cards;
 use crate::commands::FollowUp;
 use crate::member_cards::valid_repo;
 use crate::runtime::Runtime;
-use crate::toolserver::{approval_id_ok, ApiError, PROVIDERS};
+use crate::toolserver::{approval_id_ok, ApiError, Seen, PROVIDERS};
 
 /// Action ids in the Home, and the tick boxes' block-id prefix.
 pub mod action {
@@ -381,7 +381,12 @@ pub fn inbox_row(item: &Value, display: &dyn Fn(&str) -> String, now: DateTime<U
         text.push_str(&p);
     }
     let mut row = section(&text);
-    row["block_id"] = json!(format!("{}{id}", action::PICK_BLOCK));
+    // The block id carries the start of the args hash of what this row showed, so **Approve
+    // selected** approves exactly that (R5): `pick_<id>:<hash>`.
+    row["block_id"] = json!(match crate::cards::shown_hash(item) {
+        Some(hash) => format!("{}{id}:{hash}", action::PICK_BLOCK),
+        None => format!("{}{id}", action::PICK_BLOCK),
+    });
     row["accessory"] = json!({
         "type": "checkboxes",
         "action_id": action::PICK,
@@ -447,25 +452,47 @@ pub fn inbox(
     blocks
 }
 
-/// The approval ids ticked in a Home view's `state.values`, each checked.
-pub fn ticked(state_values: &Value) -> Vec<String> {
-    let mut ids = Vec::new();
+/// One ticked draft: its approval id and the start of the args hash its row showed (`None`
+/// for a row from before rows carried it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ticked {
+    pub id: String,
+    pub shown: Option<String>,
+}
+
+/// The approval ids ticked in a Home view's `state.values`, each checked, with what each row
+/// showed.
+pub fn ticked(state_values: &Value) -> Vec<Ticked> {
+    let mut out: Vec<Ticked> = Vec::new();
     let Some(blocks) = state_values.as_object() else {
-        return ids;
+        return out;
     };
     for (block_id, actions) in blocks {
-        let Some(id) = block_id.strip_prefix(action::PICK_BLOCK) else {
+        let Some(rest) = block_id.strip_prefix(action::PICK_BLOCK) else {
             continue;
+        };
+        let (id, shown) = match rest.split_once(':') {
+            Some((id, hash))
+                if hash.len() == crate::cards::SHOWN_HASH_LEN
+                    && hash.chars().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                (id, Some(hash.to_string()))
+            }
+            Some(_) => continue,
+            None => (rest, None),
         };
         let picked = actions[action::PICK]["selected_options"]
             .as_array()
             .is_some_and(|o| o.iter().any(|o| o["value"] == id));
-        if picked && approval_id_ok(id) && !ids.iter().any(|i| i == id) {
-            ids.push(id.to_string());
+        if picked && approval_id_ok(id) && !out.iter().any(|t| t.id == id) {
+            out.push(Ticked {
+                id: id.to_string(),
+                shown,
+            });
         }
     }
-    ids.sort();
-    ids
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
 }
 
 /// How each decided draft ended, counted for the notice.
@@ -476,6 +503,9 @@ pub struct Tally {
     pub blocked: usize,
     pub confirm: usize,
     pub closed: usize,
+    /// Drafts whose text changed since the Home showed them (or whose row didn't say what it
+    /// showed): skipped, nothing approved.
+    pub changed: usize,
     /// One reason per failed draft.
     pub failed: Vec<String>,
 }
@@ -502,6 +532,7 @@ impl Tally {
             Err(ApiError::Refused { code, .. }) if code == "needs_external_confirm" => {
                 self.confirm += 1
             }
+            Err(ApiError::Refused { code, .. }) if code == "stale" => self.changed += 1,
             Err(ApiError::Refused { code, status, .. }) if code == "expired" || *status == 409 => {
                 self.closed += 1
             }
@@ -541,6 +572,18 @@ impl Tally {
                 ":warning: {} {verb} your confirmation: it goes to a channel shared outside the \
                  company. Confirm on its card in our DM.",
                 self.confirm
+            ));
+        }
+        if self.changed > 0 {
+            lines.push(format!(
+                ":pencil2: {} changed since you looked, so {} not approved. Open {} to review.",
+                self.changed,
+                if self.changed == 1 {
+                    "it was"
+                } else {
+                    "they were"
+                },
+                if self.changed == 1 { "it" } else { "each" },
             ));
         }
         if self.closed > 0 {
@@ -1055,7 +1098,7 @@ impl Bots {
 
     /// **Approve selected** / **Reject selected**: decide each ticked draft, then republish
     /// the Inbox with how each one ended.
-    async fn decide_ticked(&self, user: &str, decision: &str, ids: Vec<String>) {
+    async fn decide_ticked(&self, user: &str, decision: &str, ids: Vec<Ticked>) {
         let Some(handle) = self.team().by_slack_id(user).map(|m| m.handle.clone()) else {
             return self.publish_home(user, Tab::Inbox, None).await;
         };
@@ -1065,10 +1108,22 @@ impl Bots {
                 .await;
         }
         let mut tally = Tally::default();
-        for id in &ids {
+        for Ticked { id, shown } in &ids {
+            // An approve sends what the row showed (R5); the tool server refuses it as
+            // `stale` if the draft changed since. A row that doesn't say (an App Home view
+            // from before this release) is skipped: nothing is approved unseen.
+            let seen = match (decision, shown.as_deref()) {
+                ("approve", None) => {
+                    tracing::info!(approval = %id, "an App Home row without its args hash; skipped");
+                    tally.changed += 1;
+                    continue;
+                }
+                ("approve", Some(hash)) => Seen::hash(hash),
+                _ => Seen::default(),
+            };
             let outcome = self
                 .toolserver()
-                .decide(id, &handle, decision, None, None, false)
+                .decide(id, &handle, decision, None, None, seen)
                 .await;
             if let Err(e) = &outcome {
                 tracing::info!(approval = %id, error = %e, "a Home decision didn't go through");
@@ -1203,9 +1258,49 @@ mod tests {
             "pick_apr_2": {"home_pick": {"type": "checkboxes", "selected_options": []}},
             "pick_../x": {"home_pick": {"type": "checkboxes", "selected_options": [{"value": "../x"}]}},
             "pick_apr_3": {"home_pick": {"type": "checkboxes", "selected_options": [{"value": "apr_9"}]}},
+            "pick_apr_4:0123456789abcdef": {"home_pick": {"type": "checkboxes", "selected_options": [{"value": "apr_4"}]}},
+            "pick_apr_5:nothex": {"home_pick": {"type": "checkboxes", "selected_options": [{"value": "apr_5"}]}},
         });
-        assert_eq!(ticked(&values), ["apr_1"]);
+        assert_eq!(
+            ticked(&values),
+            [
+                Ticked {
+                    id: "apr_1".into(),
+                    shown: None
+                },
+                Ticked {
+                    id: "apr_4".into(),
+                    shown: Some("0123456789abcdef".into())
+                },
+            ]
+        );
         assert!(ticked(&json!(null)).is_empty());
+    }
+
+    /// R5: a row carries the start of the args hash it showed, and a stale or unversioned
+    /// draft is counted as changed, not approved.
+    #[test]
+    fn rows_carry_what_they_showed_and_changes_are_counted() {
+        let item = json!({"id": "apr_1", "tool": "jira.create_issue", "status": "pending",
+                          "args": {"summary": "x"}, "args_hash": "0123456789abcdef".repeat(4)});
+        let row = inbox_row(&item, &|b: &str| b.to_string(), Utc::now());
+        assert_eq!(row["block_id"], "pick_apr_1:0123456789abcdef");
+        let mut t = Tally::default();
+        t.add(&Ok(json!({"status": "approved"})));
+        t.add(&Ok(json!({"status": "approved"})));
+        t.add(&Err(ApiError::Refused {
+            status: 409,
+            code: "stale".into(),
+            error: "changed".into(),
+            body: Value::Null,
+        }));
+        let n = t.notice();
+        assert!(n.contains("2 approved or posted."), "{n}");
+        assert!(
+            n.contains("1 changed since you looked, so it was not approved. Open it to review."),
+            "{n}"
+        );
+        assert!(!n.contains("expired"));
     }
 
     #[test]

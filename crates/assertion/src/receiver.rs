@@ -18,8 +18,29 @@ pub const MODE_VAR: &str = "PMOS_ASSERTION_MODE";
 /// `PMOS_ASSERTION_INSECURE_OFF=1`: a development override that lets a receiver start with a
 /// mode other than `require` while a client that acts for a person (`web`, `console`) is
 /// configured. Never for production: with it, anyone holding that client's token can act as
-/// any PM. Every start-up with it logs a warning at error level.
+/// any PM. Every start-up with it logs a warning at error level. It is refused outright on
+/// anything that looks like real data ([`real_data`]): live connectors, or a database without
+/// `PMOS_DEV=1`.
 pub const INSECURE_OFF_VAR: &str = "PMOS_ASSERTION_INSECURE_OFF";
+
+/// The settings that say a receiver holds real data, where the development override is
+/// refused: `PMOS_CONNECTORS=live` (the tool server), or one of these database URLs set
+/// without `PMOS_DEV=1` (the tool server's and the runtime's).
+pub const DATABASE_VARS: [&str; 2] = ["PMOS_DATABASE_URL", "PMOS_BOTS_DATABASE_URL"];
+
+/// Why this receiver holds real data, if it does: `PMOS_CONNECTORS=live`, or a database URL
+/// ([`DATABASE_VARS`]) without `PMOS_DEV=1`. `None` for a fake-data development stack.
+pub fn real_data(get: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    let set = |k: &str| get(k).is_some_and(|v| !v.trim().is_empty());
+    if get("PMOS_CONNECTORS").as_deref().map(str::trim) == Some("live") {
+        return Some("PMOS_CONNECTORS=live".into());
+    }
+    let dev = get("PMOS_DEV").as_deref().map(str::trim) == Some("1");
+    DATABASE_VARS
+        .iter()
+        .find(|k| set(k) && !dev)
+        .map(|k| format!("{k} is set without PMOS_DEV=1"))
+}
 
 /// The roll-out switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -66,7 +87,9 @@ impl Mode {
 ///
 /// - No such client: `PMOS_ASSERTION_MODE` as set, `off` when unset.
 /// - Any such client: `require` when unset. `off` or `verify` refuses to start, unless
-///   [`INSECURE_OFF_VAR`] is `1`; then it starts, and the second value is the warning to log.
+///   [`INSECURE_OFF_VAR`] is `1` on a fake-data development stack; then it starts, and the
+///   second value is the warning to log. With real data ([`real_data`]) the override itself
+///   refuses to start.
 pub fn secure_mode(
     get: &impl Fn(&str) -> Option<String>,
     person_clients: &[&str],
@@ -82,15 +105,22 @@ pub fn secure_mode(
     }
     match set {
         None | Some(Mode::Require) => Ok((Mode::Require, None)),
-        Some(mode) if insecure => Ok((
-            mode,
-            Some(format!(
-                "INSECURE: {MODE_VAR}={} with {} set and {INSECURE_OFF_VAR}=1. Anyone holding \
-                 that token can act as any PM. Development only, never production.",
-                mode.as_str(),
+        Some(mode) if insecure => match real_data(get) {
+            Some(why) => Err(format!(
+                "{INSECURE_OFF_VAR}=1 is for fake-data development stacks only, and {why}: \
+                 with {} set, set {MODE_VAR}=require (docs/user-assertion.md, Modes)",
                 person_clients.join(", ")
             )),
-        )),
+            None => Ok((
+                mode,
+                Some(format!(
+                    "INSECURE: {MODE_VAR}={} with {} set and {INSECURE_OFF_VAR}=1. Anyone holding \
+                 that token can act as any PM. Development only, never production.",
+                    mode.as_str(),
+                    person_clients.join(", ")
+                )),
+            )),
+        },
         Some(mode) => Err(format!(
             "{MODE_VAR}={} is not allowed while {} is set: a client that acts for a person \
              needs signed user assertions. Set {MODE_VAR}=require (or leave it unset), or, for \
@@ -382,6 +412,53 @@ mod tests {
             (Mode::Require, None)
         );
         assert!(secure_mode(&lookup(&[(INSECURE_OFF_VAR, "yes")]), web).is_err());
+    }
+
+    /// R3: the development override is refused on real data: live connectors, or a database
+    /// without `PMOS_DEV=1`. A fake-data development stack (no database, or `PMOS_DEV=1`, and
+    /// fake connectors) still gets it.
+    #[test]
+    fn the_override_is_refused_with_real_data() {
+        let web = &["PMOS_WEB_TOKEN"][..];
+        const OFF: (&str, &str) = (MODE_VAR, "off");
+        const OV: (&str, &str) = (INSECURE_OFF_VAR, "1");
+        let refused: [&'static [(&str, &str)]; 4] = [
+            &[OFF, OV, ("PMOS_CONNECTORS", "live")],
+            &[OFF, OV, ("PMOS_CONNECTORS", "live"), ("PMOS_DEV", "1")],
+            &[OFF, OV, ("PMOS_DATABASE_URL", "postgresql://db/pmos")],
+            &[OFF, OV, ("PMOS_BOTS_DATABASE_URL", "postgresql://db/bots")],
+        ];
+        for pairs in refused {
+            let err = secure_mode(&lookup(pairs), web).unwrap_err();
+            assert!(
+                err.contains(INSECURE_OFF_VAR)
+                    && err.contains("fake-data development")
+                    && !err.contains("postgresql://"),
+                "{err}"
+            );
+        }
+        let allowed: [&'static [(&str, &str)]; 3] = [
+            &[OFF, OV],
+            &[OFF, OV, ("PMOS_CONNECTORS", "fake"), ("PMOS_DEV", "1")],
+            &[
+                OFF,
+                OV,
+                ("PMOS_DEV", "1"),
+                ("PMOS_BOTS_DATABASE_URL", "postgresql://x"),
+            ],
+        ];
+        for pairs in allowed {
+            let (mode, warning) = secure_mode(&lookup(pairs), web).unwrap();
+            assert_eq!(mode, Mode::Off);
+            assert!(warning.is_some());
+        }
+        // Without a person client, nothing changes: the override isn't in play.
+        assert_eq!(
+            secure_mode(&lookup(&[OFF, OV, ("PMOS_CONNECTORS", "live")]), &[])
+                .unwrap()
+                .0,
+            Mode::Off
+        );
     }
 
     #[test]

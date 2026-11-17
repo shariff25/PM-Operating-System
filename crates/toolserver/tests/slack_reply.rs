@@ -286,8 +286,16 @@ async fn decide(
     confirm_external: bool,
     at: DateTime<Utc>,
 ) -> Result<ApprovalItem, DecisionError> {
+    // As the Slack bot sends it: what its card showed, the item's args hash now.
+    let shown = f
+        .svc
+        .approval(id)
+        .await
+        .unwrap()
+        .map(|i| i.args_hash[..16].to_string());
     let verdict = Verdict {
         confirm_external,
+        expected_args_hash: shown,
         ..Verdict::new(decision, args)
     };
     f.svc
@@ -1437,7 +1445,14 @@ async fn start() -> Server {
 }
 
 impl Server {
-    async fn decide(&self, id: &str, body: Value) -> (u16, Value) {
+    /// A decision with the Slack bot's token. An approve carries what the card showed: the
+    /// item's args hash as it is now, unless `body` names one.
+    async fn decide(&self, id: &str, mut body: Value) -> (u16, Value) {
+        if body["decision"] == "approve" && body.get("expected_args_hash").is_none() {
+            if let Some(item) = self.f.svc.approval(id).await.unwrap() {
+                body["expected_args_hash"] = json!(item.args_hash[..16]);
+            }
+        }
         let res = reqwest::Client::new()
             .post(format!("{}/internal/approvals/{id}/decision", self.base))
             .bearer_auth(BOT_TOKEN)

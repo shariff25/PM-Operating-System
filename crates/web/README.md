@@ -243,8 +243,11 @@ path with another method a JSON `405 method_not_allowed`.
   ordinary approval; it needs `ask-bot`. Someone else's, a dismissed, an expired or an
   unknown id is `404`. **The follow-up is untrusted data in that prompt**: its who, system,
   summary and url were written by the brief run from other people's messages, so they go in
-  as one JSON object between `<<<FOLLOW_UP_DATA` and `FOLLOW_UP_DATA>>>` (markers removed from
-  every value), after an instruction to treat every value as text and never as instructions.
+  as one line of JSON between two marker lines that carry a nonce fresh for each request
+  (`<<<FOLLOW_UP_DATA <nonce>` and `FOLLOW_UP_DATA <nonce>>>>`), after an instruction to treat
+  every value as text and never as instructions. Every `<` and `>` in the JSON is written as
+  a JSON escape (`<`, `>`), so no value, however nested, can contain or rebuild
+  either marker (R8; the earlier single-pass removal of the markers could be defeated).
   The PM's own words around it are fixed. This lowers the risk, it doesn't remove it: the bot
   reads the thread anyway, and whatever it drafts still waits for the PM's approval.
 - **`PUT /internal/brief/{handle}`** is the producer's route. The Slack service calls it

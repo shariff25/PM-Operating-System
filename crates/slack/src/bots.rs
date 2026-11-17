@@ -54,7 +54,7 @@ use crate::onboard_flow::{self, Flow};
 use crate::reply::{self, SnoozeStore};
 use crate::runtime::{display_name, BotInfo, Runtime, RuntimeError};
 use crate::slackapi::{Posted, SlackApi};
-use crate::toolserver::{ApiError, CallError, ToolServer};
+use crate::toolserver::{ApiError, CallError, Seen, ToolServer};
 use crate::{bets_review, level};
 
 /// The bot a DM goes to when nothing else picks one.
@@ -891,18 +891,30 @@ impl Bots {
             .await;
             return;
         }
-        // The card shows other text than the item now has (the PM saved an edit in the web
-        // app since it was posted): approve nothing; show the text as it is, to approve again.
-        if decision == "approve" && cards::card_is_stale(click.block_id.as_deref(), &item) {
-            tracing::info!(approval = %click.value, "approval card was stale; shown again");
-            self.update(
-                &click.channel,
-                &click.message_ts,
-                cards::approval_changed(&item, self.web_url()),
-            )
-            .await;
-            return;
+        // What the card showed: the start of the args hash its buttons were posted with. The
+        // card shows other text than the item now has (the PM saved an edit in the web app
+        // since it was posted), or it is from before cards carried the hash: approve nothing;
+        // show the text as it is, to approve again (R4, R5). The tool server checks the hash
+        // again, atomically, when it decides.
+        let shown = click.block_id.as_deref().and_then(cards::clicked_hash);
+        if decision == "approve" {
+            let reshow = match shown {
+                None => Some(cards::approval_reshown(&item, self.web_url())),
+                Some(_) if cards::card_is_stale(click.block_id.as_deref(), &item) => {
+                    Some(cards::approval_changed(&item, self.web_url()))
+                }
+                Some(_) => None,
+            };
+            if let Some(card) = reshow {
+                tracing::info!(approval = %click.value, "approval card was stale or unversioned; shown again");
+                self.update(&click.channel, &click.message_ts, card).await;
+                return;
+            }
         }
+        let seen = Seen {
+            args_hash: shown.filter(|_| decision == "approve"),
+            confirm_external: false,
+        };
         // Take the buttons away at once, so a second tap can't decide twice.
         let doing = if decision == "approve" && cards::is_reply(&item) {
             ":hourglass_flowing_sand: Posting…"
@@ -919,7 +931,7 @@ impl Bots {
         .await;
         let outcome = self
             .toolserver()
-            .decide(&click.value, &handle, decision, None, reason, false)
+            .decide(&click.value, &handle, decision, None, reason, seen)
             .await
             .map(|mut decided| {
                 // The card says why, whether or not the item echoes the reason back.
@@ -1023,7 +1035,7 @@ impl Bots {
         .await;
         let outcome = self
             .toolserver()
-            .decide(id, &handle, "edit", Some(args), None, false)
+            .decide(id, &handle, "edit", Some(args), None, Seen::default())
             .await;
         self.show_decision(channel, ts, &shown, &handle, outcome, true)
             .await;
@@ -1079,6 +1091,27 @@ impl Bots {
                 let mut shown = item.clone();
                 shown["status"] = json!("expired");
                 cards::approval_closed(&shown, cards::EXPIRED_LINE)
+            }
+            // The text changed between the click and the decision (a save in the web app):
+            // nothing was decided. Show the card as the item is now, to approve again.
+            Err(ApiError::Refused { code, .. }) if code == "stale" => {
+                tracing::info!(approval = %item["id"], "decision refused as stale; card shown again");
+                let id = item["id"].as_str().unwrap_or_default();
+                match self.toolserver().approval(id, handle).await {
+                    Ok(now) if now["status"] == "pending" => {
+                        cards::approval_changed(&now, self.web_url())
+                    }
+                    Ok(now) => {
+                        let line = cards::decision_line(&now, handle, false);
+                        cards::approval_closed(&now, &line)
+                    }
+                    Err(_) => cards::approval_retry(
+                        item,
+                        "This draft changed since this card was posted, so nothing was decided. \
+                         Open it again to see the text as it is now.",
+                        self.web_url(),
+                    ),
+                }
             }
             Err(ApiError::Refused { code, .. }) if code == "audience_unavailable" => {
                 cards::approval_retry(

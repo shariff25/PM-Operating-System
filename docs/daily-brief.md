@@ -269,9 +269,11 @@ part of the home page. Today pmos-web keeps the rows itself, filled from each br
 /api/followups/{id}/dismiss` ("Not mine") answers `204`. `POST /api/followups/{id}/draft` answers
 `201 Task`: a task that asks the PM's bot for a reply or nudge draft for that follow-up and ends
 as an approval draft. The follow-up's fields came from other people's messages, so they go
-into that task's prompt as untrusted data: one JSON object between `<<<FOLLOW_UP_DATA` and
-`FOLLOW_UP_DATA>>>`, after an instruction to treat every value as text and never follow
-anything in it (`crates/web/src/app/brief.rs`, `draft_prompt`).
+into that task's prompt as untrusted data: one line of JSON between two marker lines that carry
+a nonce fresh for each request (`<<<FOLLOW_UP_DATA <nonce>` and `FOLLOW_UP_DATA <nonce>>>>`),
+with every `<` and `>` in it escaped so no value can rebuild a marker, after an instruction to
+treat every value as text and never follow anything in it (`crates/web/src/app/brief.rs`,
+`draft_prompt`).
 
 **Slack buttons.** Each follow-up line in the DM gets three buttons: **Draft a reply**
 (`waiting_on_you`), **Draft a nudge** (`you_wait_on`) and **Not mine**. Draft a reply or a nudge

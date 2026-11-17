@@ -253,9 +253,9 @@ async fn the_console_reads_one_task_only_for_its_pm_or_an_admin() {
         let (s, _) = send(&env, Method::GET, &target, "console", None, None, Some(&a)).await;
         assert_eq!(s, 404, "{target}");
     }
-    // The list of every task is metadata and names no one.
+    // Under `require` the list needs a viewer too (R1): unsigned, it is refused.
     let (s, v) = send(&env, Method::GET, "/v1/tasks", "console", None, None, None).await;
-    assert_eq!(s, 200, "{v}");
+    refused(s, &v);
     env.finish().await;
 
     let env = Env::memory_with_assertions(assertions(Mode::Verify)).await;
@@ -274,44 +274,409 @@ async fn the_console_reads_one_task_only_for_its_pm_or_an_admin() {
     env.finish().await;
 }
 
+/// Under `require`, every console call to the runtime is signed for its viewer (R1): the bot
+/// list, the task and routine lists included.
 #[tokio::test]
-async fn the_console_signs_only_what_names_a_person() {
+async fn the_console_signs_every_call_under_require() {
     let env = Env::memory_with_assertions(assertions(Mode::Require)).await;
     let console = Signer::console();
-    // Read everything: no person, no assertion needed.
-    let (s, v) = send(
-        &env,
-        Method::GET,
+    for target in [
+        "/v1/bots",
+        "/v1/bots/docs",
         "/v1/tasks?limit=5",
-        "console",
-        None,
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(s, 200, "{v}");
-    let (s, v) = send(
-        &env,
-        Method::GET,
         "/v1/routines",
-        "console",
-        None,
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(s, 200, "{v}");
-    // One person's tasks: needs an assertion for them.
-    let target = "/v1/tasks?limit=5&requested_by=ana";
-    let (s, v) = send(&env, Method::GET, target, "console", None, None, None).await;
-    refused(s, &v);
+    ] {
+        let (s, v) = send(&env, Method::GET, target, "console", None, None, None).await;
+        refused(s, &v);
+        let a = console.sign("ana", "GET", target, b"");
+        let (s, v) = send(&env, Method::GET, target, "console", None, None, Some(&a)).await;
+        assert_eq!(s, 200, "{target}: {v}");
+        // The web key does not speak for the console.
+        let a = Signer::web().sign("ana", "GET", target, b"");
+        let (s, v) = send(&env, Method::GET, target, "console", None, None, Some(&a)).await;
+        refused(s, &v);
+    }
+    // One person's tasks name them: the viewer may name only themselves.
+    let target = "/v1/tasks?limit=5&requested_by=ben";
     let a = console.sign("ana", "GET", target, b"");
     let (s, v) = send(&env, Method::GET, target, "console", None, None, Some(&a)).await;
-    assert_eq!(s, 200, "{v}");
-    // The web key does not speak for the console.
-    let a = Signer::web().sign("ana", "GET", target, b"");
-    let (s, v) = send(&env, Method::GET, target, "console", None, None, Some(&a)).await;
     refused(s, &v);
+    env.finish().await;
+}
+
+fn routine_draft(owner: &str, prompt: &str) -> Value {
+    json!({"draft": {"bot": "docs", "owner": owner,
+        "schedule": {"cron": "0 8 * * *", "tz": "UTC"}, "prompt": prompt,
+        "output": {"kind": "dm"}, "approval": "approve"}})
+}
+
+/// R1: a non-admin viewer lists only their own tasks and routines, in full; an admin (in the
+/// runtime's own team.yaml) lists everyone's, with the ask, the result and the prompt of
+/// anyone else's left out. Cancel and routine changes: the owner or an admin, signed, and
+/// recorded as that person.
+#[tokio::test]
+async fn console_lists_are_the_viewers_own_or_metadata_for_an_admin() {
+    let env = Env::memory_with_catalog_and_assertions(
+        catalog_with_admin(Some("cy")),
+        assertions(Mode::Require),
+    )
+    .await;
+    let console = Signer::console();
+    let ana_task = env.ask("Ana's private question").await;
+    let (s, ben_task) = env
+        .post(
+            "/v1/tasks",
+            "slack",
+            Some("ben"),
+            json!({"bot": "docs", "requested_by": "ben", "text": "Ben's private question",
+                   "source": "slack", "slack": {"channel": "D0BEN", "thread_ts": "1731.0002"}}),
+        )
+        .await;
+    assert_eq!(s, 201, "{ben_task}");
+    for owner in ["ana", "ben"] {
+        let (s, r) = env
+            .post(
+                "/v1/routines",
+                "slack",
+                Some(owner),
+                routine_draft(owner, &format!("{owner}'s secret prompt")),
+            )
+            .await;
+        assert_eq!(s, 201, "{r}");
+    }
+    let get = |viewer: &'static str, target: &'static str| {
+        let env = &env;
+        let console = &console;
+        async move {
+            let a = console.sign(viewer, "GET", target, b"");
+            let (s, v) = send(env, Method::GET, target, "console", None, None, Some(&a)).await;
+            assert_eq!(s, 200, "{viewer} {target}: {v}");
+            v.as_array().unwrap().clone()
+        }
+    };
+
+    // ana: her own task only, in full.
+    let tasks = get("ana", "/v1/tasks").await;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["requested_by"], "ana");
+    assert_eq!(tasks[0]["text"], "Ana's private question");
+    assert!(tasks[0].get("hidden").is_none());
+    // cy, an admin: both, ben's and ana's as metadata (not cy's own).
+    let tasks = get("cy", "/v1/tasks").await;
+    assert_eq!(tasks.len(), 2);
+    for t in &tasks {
+        assert_eq!(t["text"], "", "{t}");
+        assert_eq!(t["result"], Value::Null);
+        assert_eq!(t["hidden"], true);
+        assert!(t["id"].is_string() && t["bot"] == "docs" && t["status"] == "queued");
+        assert!(t["created_at"].is_string() && t["requested_by"].is_string());
+        assert!(t.get("slack").is_none(), "{t}");
+    }
+    // ben, not an admin, sees only his own.
+    let tasks = get("ben", "/v1/tasks").await;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["requested_by"], "ben");
+
+    // Routines alike.
+    let routines = get("ana", "/v1/routines").await;
+    assert_eq!(routines.len(), 1);
+    assert_eq!(routines[0]["prompt"], "ana's secret prompt");
+    let routines = get("cy", "/v1/routines").await;
+    assert_eq!(routines.len(), 2);
+    assert!(routines
+        .iter()
+        .all(|r| r["prompt"] == "" && r["hidden"] == true));
+    let ana_routine = routines.iter().find(|r| r["owner"] == "ana").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Routine changes: not ben on ana's; cy, an admin, may.
+    let path = format!("/v1/routines/{ana_routine}");
+    let body = serde_json::to_vec(&json!({"enabled": false})).unwrap();
+    for (viewer, want) in [("ben", 404), ("cy", 200), ("ana", 200)] {
+        let a = console.sign(viewer, "PATCH", &path, &body);
+        let (s, v) = send(
+            &env,
+            Method::PATCH,
+            &path,
+            "console",
+            None,
+            Some(&body),
+            Some(&a),
+        )
+        .await;
+        assert_eq!(s, want, "{viewer}: {v}");
+    }
+
+    // Cancel: ben can't cancel ana's task; ana can, and it is recorded as her.
+    let ana_id = ana_task["id"].as_str().unwrap();
+    let path = format!("/v1/tasks/{ana_id}/cancel");
+    let (s, v) = send(&env, Method::POST, &path, "console", None, None, None).await;
+    refused(s, &v);
+    let a = console.sign("ben", "POST", &path, b"");
+    let (s, _) = send(&env, Method::POST, &path, "console", None, None, Some(&a)).await;
+    assert_eq!(s, 404);
+    let a = console.sign("ana", "POST", &path, b"");
+    let (s, v) = send(&env, Method::POST, &path, "console", None, None, Some(&a)).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["status"], "cancelled");
+    let events = format!("/v1/tasks/{ana_id}/events");
+    let a = console.sign("ana", "GET", &events, b"");
+    let (_, ev) = send(&env, Method::GET, &events, "console", None, None, Some(&a)).await;
+    assert!(
+        ev.as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["text"] == "cancelled by ana"),
+        "{ev}"
+    );
+    // cy, an admin, cancels ben's, recorded as cy.
+    let ben_id = ben_task["id"].as_str().unwrap();
+    let path = format!("/v1/tasks/{ben_id}/cancel");
+    let a = console.sign("cy", "POST", &path, b"");
+    let (s, _) = send(&env, Method::POST, &path, "console", None, None, Some(&a)).await;
+    assert_eq!(s, 200);
+    let events = format!("/v1/tasks/{ben_id}/events");
+    let a = console.sign("cy", "GET", &events, b"");
+    let (_, ev) = send(&env, Method::GET, &events, "console", None, None, Some(&a)).await;
+    assert!(ev
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["text"] == "cancelled by cy"));
+    env.finish().await;
+}
+
+/// Without a viewer (`off`, or an unsigned call in `verify`), the console's lists are
+/// metadata for everyone: no ask, result or prompt reaches it on its token alone.
+#[tokio::test]
+async fn an_unsigned_console_list_is_metadata_in_every_mode() {
+    for mode in [Mode::Off, Mode::Verify] {
+        let env = Env::memory_with_assertions(assertions(mode)).await;
+        env.ask("Ana's private question").await;
+        let (s, r) = env
+            .post(
+                "/v1/routines",
+                "slack",
+                Some("ana"),
+                routine_draft("ana", "secret"),
+            )
+            .await;
+        assert_eq!(s, 201, "{r}");
+        let (_, tasks) = env.get("/v1/tasks", "console", None).await;
+        assert_eq!(tasks.as_array().unwrap().len(), 1);
+        assert_eq!(tasks[0]["text"], "", "{mode:?}");
+        assert_eq!(tasks[0]["hidden"], true);
+        let (_, routines) = env.get("/v1/routines", "console", None).await;
+        assert_eq!(routines[0]["prompt"], "", "{mode:?}");
+        env.finish().await;
+    }
+}
+
+/// R14: every runtime route × method × client token, without and with a user assertion,
+/// under `require`: exactly the allowed set gets past auth (not `401`/`403`); a `web` call
+/// that names its PM and every console call need the assertion (`401` without); the Slack,
+/// worker and evals clients are never checked.
+#[tokio::test]
+async fn every_route_client_and_assertion_under_require() {
+    let env = Env::memory_with_assertions(assertions(Mode::Require)).await;
+    let tid = env.ask("Q").await["id"].as_str().unwrap().to_string();
+    let (_, r) = env
+        .post(
+            "/v1/routines",
+            "slack",
+            Some("ana"),
+            routine_draft("ana", "p"),
+        )
+        .await;
+    let rid = r["id"].as_str().unwrap().to_string();
+
+    // (method, path, body, clients allowed once past the assertion check)
+    let rows: Vec<(Method, String, Value, &[&str])> = vec![
+        (
+            Method::GET,
+            "/v1/bots".into(),
+            json!(null),
+            &["slack", "web", "worker", "console", "evals"],
+        ),
+        (
+            Method::GET,
+            "/v1/bots/docs".into(),
+            json!(null),
+            &["slack", "web", "worker", "console", "evals"],
+        ),
+        (
+            Method::POST,
+            "/v1/tasks".into(),
+            json!({"bot": "docs", "requested_by": "ben", "text": "t", "source": "eval"}),
+            &["evals"],
+        ),
+        (
+            Method::GET,
+            "/v1/tasks".into(),
+            json!(null),
+            &["slack", "web", "console", "evals"],
+        ),
+        (
+            Method::GET,
+            format!("/v1/tasks/{tid}"),
+            json!(null),
+            &["slack", "web", "console", "evals"],
+        ),
+        (
+            Method::GET,
+            format!("/v1/tasks/{tid}/events"),
+            json!(null),
+            &["slack", "web", "console", "evals"],
+        ),
+        (
+            Method::GET,
+            format!("/v1/tasks/{tid}/trace"),
+            json!(null),
+            &["console"],
+        ),
+        (
+            Method::GET,
+            format!("/v1/tasks/{tid}/drafts"),
+            json!(null),
+            &["console", "evals"],
+        ),
+        (
+            Method::POST,
+            "/v1/worker/claim".into(),
+            json!({"worker": "w1"}),
+            &["worker"],
+        ),
+        (
+            Method::POST,
+            format!("/v1/worker/tasks/{tid}/heartbeat"),
+            json!({}),
+            &["worker"],
+        ),
+        (
+            Method::POST,
+            format!("/v1/worker/tasks/{tid}/events"),
+            json!({"kind": "status", "text": "x"}),
+            &["worker"],
+        ),
+        (
+            Method::POST,
+            format!("/v1/worker/tasks/{tid}/trace"),
+            json!({"entries": []}),
+            &["worker"],
+        ),
+        (
+            Method::POST,
+            format!("/v1/worker/tasks/{tid}/complete"),
+            json!({"result": "r"}),
+            &["worker"],
+        ),
+        (
+            Method::POST,
+            format!("/v1/worker/tasks/{tid}/fail"),
+            json!({"reason": "r"}),
+            &["worker"],
+        ),
+        (
+            Method::GET,
+            "/v1/notifications".into(),
+            json!(null),
+            &["slack"],
+        ),
+        (
+            Method::GET,
+            "/v1/members/ana/settings".into(),
+            json!(null),
+            &["slack", "web", "console"],
+        ),
+        (
+            Method::PUT,
+            "/v1/members/ana/settings".into(),
+            json!({"level": "senior"}),
+            &["slack", "web"],
+        ),
+        (
+            Method::POST,
+            "/v1/routines/parse".into(),
+            json!({"bot": "docs", "owner": "ana", "text": "t", "tz": "UTC"}),
+            &["slack", "web"],
+        ),
+        (
+            Method::POST,
+            "/v1/routines".into(),
+            json!({"draft": {}}),
+            &["slack", "web"],
+        ),
+        (
+            Method::GET,
+            "/v1/routines".into(),
+            json!(null),
+            &["slack", "web", "console"],
+        ),
+        (
+            Method::PATCH,
+            format!("/v1/routines/{rid}"),
+            json!({"enabled": true}),
+            &["slack", "web", "console"],
+        ),
+        (
+            Method::DELETE,
+            format!("/v1/routines/{rid}"),
+            json!(null),
+            &["slack", "web", "console"],
+        ),
+        // Signed, the console cancels (its viewer's own task, or any for an admin).
+        (
+            Method::POST,
+            format!("/v1/tasks/{tid}/cancel"),
+            json!({}),
+            &["slack", "web", "console"],
+        ),
+    ];
+    for (method, path, body, allowed) in &rows {
+        let bytes: Vec<u8> = if body.is_null() {
+            Vec::new()
+        } else {
+            serde_json::to_vec(body).unwrap()
+        };
+        for client in ["slack", "web", "worker", "console", "evals", "none"] {
+            for signed in [false, true] {
+                let user = matches!(client, "slack" | "web").then_some("ana");
+                let assertion = match (signed, client) {
+                    (true, "console") => {
+                        Some(Signer::console().sign("ana", method.as_str(), path, &bytes))
+                    }
+                    (true, "web") => Some(Signer::web().sign("ana", method.as_str(), path, &bytes)),
+                    // Every other client's assertion is ignored: send one anyway.
+                    (true, _) => Some(Signer::web().sign("ana", method.as_str(), path, &bytes)),
+                    (false, _) => None,
+                };
+                let (status, v) = send(
+                    &env,
+                    method.clone(),
+                    path,
+                    client,
+                    user,
+                    (!bytes.is_empty()).then_some(bytes.as_slice()),
+                    assertion.as_deref(),
+                )
+                .await;
+                let what = format!("{method} {path} as {client}, signed: {signed}: {v}");
+                match client {
+                    "none" => assert_eq!(status, 401, "{what}"),
+                    "web" | "console" if !signed => {
+                        assert_eq!(status, 401, "{what}");
+                        assert_eq!(v["code"], "bad_assertion", "{what}");
+                    }
+                    _ if allowed.contains(&client) => {
+                        assert!(status != 401 && status != 403, "{what}")
+                    }
+                    _ => assert_eq!(status, 403, "{what}"),
+                }
+            }
+        }
+    }
     env.finish().await;
 }
 
