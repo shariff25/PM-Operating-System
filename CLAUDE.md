@@ -1,21 +1,25 @@
 # PM OS: standing requirements for Claude sessions
 
 The owner's requirements for the PM OS build. Read this before planning or building. Stated by
-the owner on 2026-11-16 and 2026-11-17; update it when they change something.
+the owner on 2026-11-16 and 2026-11-17 (three decisions of 2026-11-17 reached this session through
+the reviewer session: the user database, the required assertion, 90-day purge); update it when they change something.
 
 ## Scope (the owner's list, a to h)
 
 - **a. Authentication:** primarily Azure AD (Entra ID) single sign-on.
 - **b. Authorization:** role-based access with four roles: Admin, Product Manager, Reviewer,
   Auditor. A Reviewer recommends and the draft's owner confirms. An Auditor sees metadata only.
-  The PM OS user database is the source of users and roles.
+  The PM OS user database is the source of users and roles, not `team.yaml`; the design is
+  written as a spec and reviewed before it is built (`docs/user-database-spec.md`).
 - **c. Policy Admin** for NVIDIA OpenShell. The app opens a pull request; the merge happens in
   GitHub.
 - **d. Front end:** a web app PMs love. The owner holds the design to the standard of the
   Baseten and WorkOS dashboards and will keep challenging it. Design approved for the MVP on
   2026-11-16: `web/` as rebuilt in `claude/web-redesign-v3`.
 - **e. Harness management and context-layer management.**
-- **f. Audit logging.** Retention target: 90 days (not yet confirmed as final).
+- **f. Audit logging.** Retention: purge at 90 days, no archive. One controlled job deletes
+  older events and records its own run; nothing else can delete, and it cannot delete newer
+  events.
 - **g. Connectors.**
 - **h. A review of how the Grok bot was built,** with pointers for PM OS.
 
@@ -40,10 +44,15 @@ follow-up tracking.
   build and the browser tests; in `harness/`: typecheck, lint, test.
 - **Secrets:** never print, log or send a token. The test stack uses fake data only, and Slack
   message text never goes into a report.
+- **The signed user assertion is required whenever the web app or console is deployed.** The
+  runtime and tool server refuse to start otherwise, and the mode is saved in `deploy/.env` so
+  no later command can leave it off.
+- **An independent reviewer session is the security gate.** Send it the commit for each batch;
+  the gate passes only with no open finding of High or Critical severity.
 - **Report honestly:** say what was verified and what was not. Nothing counts as measured
   against a model until an eval run has happened.
 
 ## Waiting on the owner
 
 An Entra app registration; a model key with enough quota for an eval run; pilot PM names and
-live connector accounts; confirmation of 90-day audit retention; edits to the nudge wording.
+live connector accounts; edits to the nudge wording.
