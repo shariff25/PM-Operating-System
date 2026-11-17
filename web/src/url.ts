@@ -1,3 +1,5 @@
+import type { AdminSection } from './admin/access';
+
 /** Only http and https addresses are ever turned into links. Anything else is shown as text. */
 export function safeUrl(value: string | null | undefined): string | null {
   if (!value) return null;
@@ -44,13 +46,24 @@ export type Route =
   | { name: 'draft'; id: string }
   | { name: 'followups' }
   | { name: 'activity' }
-  | { name: 'task'; id: string };
+  | { name: 'task'; id: string }
+  /** `search` is the query part of the hash (the audit filters), without the `?`. */
+  | { name: 'admin'; section: AdminSection; search: string };
+
+/** `/admin`, `/admin/audit`, `/admin/team`, `/admin/connectors`, each with an optional `?query`. */
+function adminRoute(path: string): Route | null {
+  const m = /^\/admin(?:\/(audit|team|connectors))?\/?(?:\?(.*))?$/.exec(path);
+  if (!m) return null;
+  return { name: 'admin', section: (m[1] as AdminSection | undefined) ?? 'overview', search: m[2] ?? '' };
+}
 
 /** Every hash the app understands. Anything unknown, malformed or unsafe is the home page. */
 export function parseRoute(path: string): Route {
   if (path === '/drafts') return { name: 'drafts' };
   if (path === '/followups') return { name: 'followups' };
   if (path === '/activity') return { name: 'activity' };
+  const admin = adminRoute(path);
+  if (admin) return admin;
   const draft = draftIdFromPath(path);
   if (draft) return { name: 'draft', id: draft };
   const task = taskIdFromPath(path);

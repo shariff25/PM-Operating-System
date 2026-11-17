@@ -1,3 +1,5 @@
+import { MOCK_PERMISSIONS, MOCK_PROFILES, createMockAdmin, roleOfHandle } from './mockAdmin';
+import type { MockAdminOptions, MockRole } from './mockAdmin';
 import { ApiError, REJECT_REASONS } from './types';
 import type {
   Api,
@@ -14,7 +16,9 @@ import type {
   TaskEvent,
 } from './types';
 
-export interface MockOptions {
+export interface MockOptions extends MockAdminOptions {
+  /** Who is signed in: a PM (default), an admin or an auditor. Signing in by handle (ada, audrey) also picks it. */
+  role?: MockRole;
   /** Pretend network delay in ms. Tests use 0. */
   latency?: number;
   /** How long each task step and each suggestion takes, in ms. */
@@ -130,10 +134,13 @@ export function createMockClient(options: MockOptions = {}): Api {
   const nextId = (p: string) => `${p}_${++seq}`;
 
   let signedIn = options.signedIn ?? false;
+  const profile = MOCK_PROFILES[options.role ?? 'pm'];
+  let role: MockRole = options.role ?? 'pm';
   const me: Me = {
-    handle: 'ana',
-    name: 'Ana Silva',
-    roles: ['pm'],
+    handle: profile.handle,
+    name: profile.name,
+    roles: [...profile.roles],
+    permissions: [...MOCK_PERMISSIONS[role]],
     csrf_token: 'mock-csrf-token',
     first_visit: options.firstVisit ?? !!options.noDrafts,
     hints_seen: [],
@@ -459,6 +466,15 @@ export function createMockClient(options: MockOptions = {}): Api {
     return t;
   }
 
+  const admin = createMockAdmin(now0, options, () => [...drafts.values()].filter((d) => d.status === 'pending' && !d.practice).length);
+  /** The server's matrix: a role without the permission gets 403 forbidden. */
+  const need = (...wanted: string[]) => {
+    guard();
+    if (!wanted.some((w) => (me.permissions ?? []).includes(w))) {
+      throw new ApiError(403, 'forbidden', 'Your role does not allow this.');
+    }
+  };
+
   return {
     async providers() {
       await wait();
@@ -472,6 +488,14 @@ export function createMockClient(options: MockOptions = {}): Api {
       }
       signedIn = true;
       me.handle = handle.trim().toLowerCase();
+      // A handle that names a role signs in as that role; any other keeps the role the client started with.
+      const named = roleOfHandle(me.handle);
+      if (named) {
+        role = named;
+        me.name = MOCK_PROFILES[named].name;
+        me.roles = [...MOCK_PROFILES[named].roles];
+        me.permissions = [...MOCK_PERMISSIONS[named]];
+      }
     },
     async logout() {
       await wait();
@@ -704,6 +728,32 @@ export function createMockClient(options: MockOptions = {}): Api {
       if (!f) throw new ApiError(404, 'not_found', 'I could not find that follow-up.');
       const mine = followUps.waiting_on_you.some((x) => x.id === id);
       return startTask(mine ? `Draft a reply to ${f.who}` : `Draft a nudge to ${f.who}`);
+    },
+
+    async adminOverview() {
+      await wait();
+      need('view-audit-log', 'manage-members');
+      return admin.overview();
+    },
+    async adminAudit(q) {
+      await wait();
+      need('view-audit-log');
+      return admin.audit(q);
+    },
+    async adminAuditExport(q) {
+      await wait();
+      need('export-audit');
+      return admin.auditExport(q);
+    },
+    async adminTeam() {
+      await wait();
+      need('view-audit-log', 'manage-members');
+      return admin.team();
+    },
+    async adminConnectors() {
+      await wait();
+      need('manage-connectors');
+      return admin.connectors();
     },
   };
 }
