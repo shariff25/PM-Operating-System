@@ -44,7 +44,19 @@ export interface MockOptions extends MockAdminOptions {
   providers?: AuthProvider[];
   /** Start with this first_visit value. */
   firstVisit?: boolean;
+  /**
+   * The Origin a browser sends with every write. By default the page's own origin, as a browser
+   * would. `null` models a script that sends none: the mock then refuses every write with
+   * `403 bad_origin`, as the real server does.
+   */
+  origin?: string | null;
+  /** Add two Slack drafts whose channel is only checked when an approve is tried (external, and restricted). */
+  audienceDrafts?: boolean;
 }
+
+/** A draft as the sample data writes it: the fields every draft gets the same way are filled in by `add`. */
+type DraftInit = Omit<Draft, 'edited_at' | 'restricted_sources' | 'audience' | 'marker'> &
+  Partial<Pick<Draft, 'edited_at' | 'restricted_sources' | 'audience' | 'marker'>>;
 
 const HOUR = 3600_000;
 const iso = (t: number) => new Date(t).toISOString();
@@ -118,7 +130,7 @@ function sources(): Draft['sources'] {
     { id: 's1', system: 'docs', title: 'TCB grace period', url: 'https://example.com/docs/tcb-grace', excerpt: null, cited: false },
     { id: 's2', system: 'jira', title: 'PAY-212: Payment failure handling', url: 'https://example.com/jira/PAY-212', excerpt: null, cited: false },
     { id: 's3', system: 'confluence', title: 'Confluence page 12345', url: null, excerpt: null, cited: false },
-    { id: 's4', system: 'slack', title: 'Slack thread in C01', url: 'https://example.com/slack/billing/p1', excerpt: null, cited: false },
+    { id: 's4', system: 'slack', title: 'Slack thread', url: 'https://example.com/slack/billing/p1', excerpt: null, cited: false },
     { id: 's5', system: 'drive', title: 'Churn analysis Q3.xlsx', url: 'https://example.com/drive/churn-q3', excerpt: null, cited: false },
   ];
 }
@@ -161,9 +173,18 @@ export function createMockClient(options: MockOptions = {}): Api {
   };
 
   const drafts = new Map<string, Draft>();
-  const add = (d: Draft) => {
+  /** Slack channels that turn out to be shared outside the company only once an approve checks them. */
+  const hiddenExternal = new Set<string>();
+  const add = (init: DraftInit): Draft => {
+    const d = init as Draft;
     d.version ??= '1';
+    d.edited_at ??= null;
+    d.restricted_sources ??= false;
+    // Only a Slack draft has an audience, and its numbers are null until an approve checks the channel.
+    d.audience ??= d.kind.startsWith('slack') ? { members: null, external: null } : null;
+    d.marker ??= d.practice ? null : d.kind.startsWith('slack') ? '_Drafted with PM OS_' : `Drafted with PM OS · run ${d.task_id ?? 'tsk_01JD7Q'}`;
     drafts.set(d.id, d);
+    return d;
   };
   const bump = (d: Draft) => {
     d.version = String(Number(d.version ?? '1') + 1);
@@ -182,10 +203,11 @@ export function createMockClient(options: MockOptions = {}): Api {
       practice: false,
       body: PRD_BODY,
       edited: false,
-      target: { system: 'confluence', label: 'Space PM, under Specs', url: null },
+      target: { system: 'confluence', label: 'Space PM, under “Specs”', url: null },
       sources: citedBy(PRD_BODY, sources()),
       result_url: null,
       external: false,
+      restricted_sources: true,
     });
     add({
       id: 'apr_jira',
@@ -199,7 +221,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       practice: false,
       body: JIRA_BODY,
       edited: false,
-      target: { system: 'jira', label: 'Project PAY, as a Story', url: null },
+      target: { system: 'jira', label: 'Project PAY, a new Story under PAY-212: TCB grace period', url: null },
       sources: sources().slice(0, 2),
       result_url: null,
       external: false,
@@ -207,7 +229,7 @@ export function createMockClient(options: MockOptions = {}): Api {
     add({
       id: 'apr_slack',
       kind: 'slack_reply',
-      title: 'Reply to Ben in #partner-pricing',
+      title: 'Reply in a Slack thread',
       bot: 'pm-ana',
       status: 'pending',
       created_at: iso(now0 - 1 * HOUR),
@@ -216,15 +238,56 @@ export function createMockClient(options: MockOptions = {}): Api {
       practice: false,
       body: SLACK_BODY,
       edited: false,
-      target: { system: 'slack', label: '#partner-pricing, a channel shared with Acme Corp', url: null },
+      target: { system: 'slack', label: 'A Slack thread', url: 'https://example.com/slack/partner-pricing/p1' },
       sources: [],
       result_url: null,
       external: true,
     });
+    if (options.audienceDrafts) {
+    // Its channel is shared outside the company, which PM OS finds out only when an approve is tried.
+      add({
+        id: 'apr_slack_ext',
+        kind: 'slack_message',
+        title: 'Message to a Slack channel',
+        bot: 'pm-ana',
+        status: 'pending',
+        created_at: iso(now0 - 90 * 60_000),
+        expires_at: iso(now0 + 22 * HOUR),
+        task_id: null,
+        practice: false,
+        body: 'Heads up, the grace period setting ships behind a flag next week. Shout if your workspace needs it earlier.',
+        edited: false,
+        target: { system: 'slack', label: 'A Slack channel', url: 'https://example.com/slack/launch-news' },
+        sources: [],
+        result_url: null,
+        external: false,
+      });
+      hiddenExternal.add('apr_slack_ext');
+      // Built from restricted sources, and its channel turns out to be visible outside the product team.
+      add({
+        id: 'apr_slack_blocked',
+        kind: 'slack_reply',
+        title: 'Reply in a Slack thread',
+        bot: 'pm-ana',
+        status: 'pending',
+        created_at: iso(now0 - 100 * 60_000),
+        expires_at: iso(now0 + 21 * HOUR),
+        task_id: null,
+        practice: false,
+        body: 'Churn on annual plans fell 4 points after the retry change[[s1]]. I can share the breakdown once Finance has checked it.',
+        edited: false,
+        target: { system: 'slack', label: 'A Slack thread', url: 'https://example.com/slack/partner-pricing/p2' },
+        sources: citedBy('[[s1]]', sources().slice(0, 1)),
+        result_url: null,
+        external: false,
+        restricted_sources: true,
+      });
+      hiddenExternal.add('apr_slack_blocked');
+    }
     add({
       id: 'apr_slack_old',
-      kind: 'slack_reply',
-      title: 'Reply to Dana in #migrations',
+      kind: 'slack_message',
+      title: 'Direct message',
       bot: 'pm-ana',
       status: 'pending',
       created_at: iso(now0 - 30 * HOUR),
@@ -233,7 +296,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       practice: false,
       body: SLACK_EXPIRED_BODY,
       edited: false,
-      target: { system: 'slack', label: '#migrations', url: null },
+      target: { system: 'slack', label: 'A direct message', url: 'https://example.com/slack/dm/p3' },
       sources: [],
       result_url: null,
       external: false,
@@ -250,7 +313,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       practice: false,
       body: DECIDED_BODY,
       edited: true,
-      target: { system: 'confluence', label: 'Space PM, under Updates', url: null },
+      target: { system: 'confluence', label: 'Space PM, under “Updates”', url: null },
       // Edited by the PM, so its source links were removed and nothing counts as cited.
       sources: sources().slice(0, 2),
       result_url: 'https://example.com/wiki/weekly-9-nov',
@@ -271,7 +334,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       practice: false,
       body: HOSTILE_BODY,
       edited: false,
-      target: { system: 'confluence', label: 'Space PM, under Notes', url: null },
+      target: { system: 'confluence', label: 'Space PM, under “Notes”', url: null },
       sources: [{ id: 'h1', system: 'docs', title: 'Odd link source', url: 'javascript:alert(1)', excerpt: null, cited: false }],
       result_url: null,
       external: false,
@@ -338,6 +401,15 @@ export function createMockClient(options: MockOptions = {}): Api {
   const wait = async () => {
     if (latency > 0) await new Promise((r) => setTimeout(r, latency));
   };
+  // A browser sends Origin with every write; a script that sends none is refused, as the real server does.
+  const origin = options.origin === undefined ? (globalThis.location?.origin ?? null) : options.origin;
+  const hasOrigin = origin !== null && origin !== 'null' && origin !== '';
+  /** Every POST, PUT and DELETE: checked before the session, as on the real server. */
+  const write = () => {
+    if (!hasOrigin) {
+      throw new ApiError(403, 'bad_origin', 'That request did not come from this app, so I refused it.');
+    }
+  };
   const guard = () => {
     if (!signedIn) {
       options.onSignedOut?.();
@@ -363,11 +435,11 @@ export function createMockClient(options: MockOptions = {}): Api {
   function makeDraftFromTask(text: string, taskId: string): Draft {
     const slack = /reply|nudge/i.test(text);
     const id = nextId('apr');
-    const d: Draft = slack
+    const init: DraftInit = slack
       ? {
           id,
           kind: 'slack_reply',
-          title: /nudge/i.test(text) ? 'Nudge to Legal about the DPA' : 'Reply to Ben about the pricing page',
+          title: 'Reply in a Slack thread',
           bot: 'pm-ana',
           status: 'pending',
           created_at: iso(Date.now()),
@@ -378,7 +450,7 @@ export function createMockClient(options: MockOptions = {}): Api {
             ? 'Hi Legal, a gentle nudge on the DPA question from Thursday. Even a rough ETA would help me plan the launch.'
             : SLACK_BODY,
           edited: false,
-          target: { system: 'slack', label: '#billing', url: null },
+          target: { system: 'slack', label: 'A Slack thread', url: 'https://example.com/slack/billing/p9' },
           sources: [],
           result_url: null,
           external: false,
@@ -395,13 +467,12 @@ export function createMockClient(options: MockOptions = {}): Api {
           practice: false,
           body: PRD_BODY,
           edited: false,
-          target: { system: 'confluence', label: 'Space PM, under Specs', url: null },
+          target: { system: 'confluence', label: 'Space PM, under “Specs”', url: null },
           sources: citedBy(PRD_BODY, sources()),
           result_url: null,
           external: false,
         };
-    add(d);
-    return d;
+    return add(init);
   }
 
   function startTask(text: string): Task {
@@ -496,6 +567,7 @@ export function createMockClient(options: MockOptions = {}): Api {
     },
     async devLogin(handle) {
       await wait();
+      write();
       if (!handle.trim()) throw new ApiError(403, 'not_a_member', 'That handle is not on the team.');
       if (handle.trim().toLowerCase() === 'nobody') {
         throw new ApiError(403, 'not_a_member', 'That handle is not on the team list, so I can not sign you in.');
@@ -513,6 +585,7 @@ export function createMockClient(options: MockOptions = {}): Api {
     },
     async logout() {
       await wait();
+      write();
       signedIn = false;
     },
     async me() {
@@ -522,18 +595,21 @@ export function createMockClient(options: MockOptions = {}): Api {
     },
     async setNudges(nudges) {
       await wait();
+      write();
       guard();
       me.nudges = nudges;
       return clone(me);
     },
     async markHintSeen(seen: HintName) {
       await wait();
+      write();
       guard();
       if (!me.hints_seen.includes(seen)) me.hints_seen.push(seen);
       return clone(me);
     },
     async resetHints() {
       await wait();
+      write();
       guard();
       me.hints_seen = [];
       return clone(me);
@@ -556,6 +632,7 @@ export function createMockClient(options: MockOptions = {}): Api {
     },
     async saveDraft(id, input) {
       await wait();
+      write();
       guard();
       const d = find(id);
       pendingOnly(d);
@@ -563,12 +640,14 @@ export function createMockClient(options: MockOptions = {}): Api {
       d.body = stripMarkers(input.body);
       if (input.title !== undefined) d.title = stripMarkers(input.title);
       d.edited = true;
+      d.edited_at = iso(Date.now());
       d.sources = d.sources.map((s) => ({ ...s, cited: false }));
       bump(d);
       return clone(d);
     },
     async requestChange(id, instruction) {
       await wait();
+      write();
       guard();
       const d = find(id);
       pendingOnly(d);
@@ -610,12 +689,13 @@ export function createMockClient(options: MockOptions = {}): Api {
     },
     async acceptSuggestion(id) {
       await wait();
+      write();
       guard();
       const d = find(id);
       pendingOnly(d);
       const entry = suggestions.get(id);
       if (!entry || entry.s.status !== 'ready' || entry.s.body === null) {
-        throw new ApiError(404, 'not_found', 'There is no suggestion to accept.');
+        throw new ApiError(409, 'no_suggestion', 'There is no suggestion to accept.');
       }
       d.body = stripMarkers(entry.s.body);
       d.edited = true;
@@ -626,6 +706,7 @@ export function createMockClient(options: MockOptions = {}): Api {
     },
     async rejectSuggestion(id) {
       await wait();
+      write();
       guard();
       const d = find(id);
       suggestions.delete(id);
@@ -633,6 +714,7 @@ export function createMockClient(options: MockOptions = {}): Api {
     },
     async approve(id, o) {
       await wait();
+      write();
       guard();
       const d = find(id);
       pendingOnly(d);
@@ -643,30 +725,43 @@ export function createMockClient(options: MockOptions = {}): Api {
       if (o?.version !== undefined && o.version !== d.version) {
         throw new ApiError(409, 'stale', 'This draft changed after you opened it.');
       }
-      if (d.external && !o?.confirmExternal) {
+      // An approve is when PM OS looks at the channel: from then on the audience is known.
+      if (hiddenExternal.has(d.id)) {
+        d.audience = { members: 14, external: true };
+        d.external = true;
+        if (d.restricted_sources) {
+          throw new ApiError(409, 'audience_blocked', 'This was built from restricted sources, and people outside the product team can see that channel.');
+        }
+        if (!o?.confirmExternal) {
+          throw new ApiError(409, 'needs_external_confirm', 'This channel is shared outside the company. Confirm to send it there.');
+        }
+      } else if (d.external && !o?.confirmExternal) {
         throw new ApiError(409, 'needs_external_confirm', 'This channel is shared outside the company. Confirm to send it there.');
       }
+      if (d.audience && d.audience.members === null) d.audience = { members: d.external ? 14 : 6, external: d.external };
       d.status = 'approved';
       d.result_url = d.practice ? null : `https://example.com/${d.target.system}/${d.id}`;
       return clone(d);
     },
     async reject(id, reason?: RejectReason) {
       await wait();
+      write();
       guard();
       const d = find(id);
       pendingOnly(d);
       if (reason && !REJECT_REASONS.includes(reason)) {
-        throw new ApiError(400, 'bad_reason', 'That is not a reason I know.');
+        throw new ApiError(400, 'bad_request', 'That is not a reason I know.');
       }
       d.status = 'rejected';
       return clone(d);
     },
     async createPractice() {
       await wait();
+      write();
       guard();
       const existing = [...drafts.values()].find((d) => d.practice && d.status === 'pending');
       if (existing) return clone(existing);
-      const d: Draft = {
+      const d = add({
         id: nextId('prc'),
         kind: 'confluence_page',
         title: 'Practice: why PMs should take the stairs',
@@ -682,12 +777,12 @@ export function createMockClient(options: MockOptions = {}): Api {
         sources: sources().slice(0, 3),
         result_url: null,
         external: false,
-      };
-      add(d);
+      });
       return clone(d);
     },
     async deleteDraft(id) {
       await wait();
+      write();
       guard();
       const d = find(id);
       if (!d.practice) throw new ApiError(409, 'not_practice', 'Only practice drafts can be deleted.');
@@ -696,6 +791,7 @@ export function createMockClient(options: MockOptions = {}): Api {
 
     async createTask(text) {
       await wait();
+      write();
       guard();
       return startTask(text);
     },
@@ -731,21 +827,25 @@ export function createMockClient(options: MockOptions = {}): Api {
         delivered_at,
         status,
         date: iso(Date.now()).slice(0, 10),
-        changed: [
-          { system: 'jira', title: 'PAY-212 moved to Blocked', summary: 'Waiting on Finance sign-off.', url: 'https://example.com/jira/PAY-212' },
-        ],
+        // A brief that came before today has no `changed` items; its follow-ups are the ones not yet expired.
+        changed:
+          delivery === 'stale'
+            ? []
+            : [{ system: 'jira', title: 'PAY-212 moved to Blocked', summary: 'Waiting on Finance sign-off.', url: 'https://example.com/jira/PAY-212' }],
         waiting_on_you: clone(followUps.waiting_on_you),
         you_wait_on: clone(followUps.you_wait_on),
       };
     },
     async dismissFollowup(id) {
       await wait();
+      write();
       guard();
       followUps.waiting_on_you = followUps.waiting_on_you.filter((f) => f.id !== id);
       followUps.you_wait_on = followUps.you_wait_on.filter((f) => f.id !== id);
     },
     async draftFollowup(id) {
       await wait();
+      write();
       guard();
       const all = [...followUps.waiting_on_you, ...followUps.you_wait_on];
       const f = all.find((x) => x.id === id);

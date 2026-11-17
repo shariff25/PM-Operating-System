@@ -63,6 +63,9 @@ const bare = (s: string) => s.trim().toLowerCase().replace(/^https?:\/\//, '').r
 
 const GROUP = /(?:\[\[s\d{1,3}\]\])+/g;
 
+/** Punctuation that closes a sentence or a clause, straight after a marker. */
+const CLOSING = /^[.,;:)]+/;
+
 /**
  * Turn the markers in the sanitised HTML into numbered links. Only text nodes are touched, and
  * never one inside code, so a marker written as code stays as written. The markers are built here
@@ -88,8 +91,19 @@ function placeMarkers(html: string, sources: readonly CiteSource[], cites: Recor
     const out = document.createDocumentFragment();
     let at = 0;
     for (const run of text.matchAll(GROUP)) {
-      out.append(text.slice(at, run.index));
+      let before = text.slice(at, run.index);
       at = run.index + run[0].length;
+      // A marker hugs the word it follows and sits after closing punctuation: `yesterday[[s1]].`
+      // reads as `yesterday.¹`. Only what is drawn moves; the stored text is never changed. A marker
+      // placed after a link goes after the link as it is, so it is left alone.
+      let punct = '';
+      if (!anchor) {
+        punct = CLOSING.exec(text.slice(at))?.[0] ?? '';
+        at += punct.length;
+        const hug = before.replace(/[ \t]+$/, '');
+        if (hug !== '') before = hug;
+      }
+      out.append(before + punct);
       const ids = [...new Set([...run[0].matchAll(MARKER)].map((m) => `s${m[1]}`))].filter((id) => position.has(id));
       if (ids.length === 0) continue;
       ids.sort((a, b) => position.get(a)! - position.get(b)!);

@@ -4,7 +4,8 @@ import { createPortal } from 'react-dom';
 import type { Draft } from '../api';
 import { copy } from '../copy';
 import type { Rendered } from '../markdown';
-import { StrippedNote } from './bits';
+import { Icon } from './icons';
+import { StrippedNote, TargetLink } from './bits';
 
 interface Props {
   draft: Draft;
@@ -16,6 +17,8 @@ interface Props {
   approving: boolean;
   confirmLabel: string;
   note: ReactNode;
+  /** The server will not post this where it goes (audience_blocked): only rejecting is left. */
+  blocked?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -58,6 +61,17 @@ export function ApproveDialog(p: Props) {
   const seen = new Set<string>();
   const links = p.rendered.links.filter((l) => (seen.has(l.href) ? false : (seen.add(l.href), true)));
   const { draft } = p;
+  const slack = draft.kind === 'slack_reply' || draft.kind === 'slack_message';
+  const aud = draft.audience;
+  // Who will see a Slack post. The numbers are null until the server has looked at the channel.
+  const audience = [
+    aud?.members != null ? copy.approve.audienceVisible(aud.members) : null,
+    aud?.external === true ? copy.approve.audienceExternal : aud?.external === false ? copy.approve.audienceInternal : null,
+  ].filter((l): l is string => l !== null);
+  if (audience.length === 0) audience.push(draft.external ? copy.approve.audienceExternal : copy.approve.audienceUnchecked);
+  // The line the target will carry. Slack writes it in italics; here it is shown as plain words.
+  const marker = draft.marker?.replace(/^[_*]+|[_*]+$/g, '').trim();
+  const markerLine = marker ? (slack ? copy.approve.markerSlack(marker) : copy.approve.markerPage(marker)) : null;
 
   return createPortal(
     <div className="modal-backdrop">
@@ -76,10 +90,39 @@ export function ApproveDialog(p: Props) {
           <dt>{copy.approve.confirmTitle}</dt>
           <dd>{draft.title}</dd>
           <dt>{copy.approve.confirmWhere}</dt>
-          <dd>{draft.target.label}</dd>
+          <dd>
+            {draft.target.label} <TargetLink target={draft.target} />
+          </dd>
           <dt>{copy.approve.confirmWho}</dt>
           <dd>{p.name}</dd>
+          {slack && (
+            <>
+              <dt>{copy.approve.audienceHeading}</dt>
+              <dd>
+                <ul className="fact-lines">
+                  {audience.map((line) => (
+                    <li key={line}>{line}</li>
+                  ))}
+                </ul>
+              </dd>
+            </>
+          )}
+          {markerLine && (
+            <>
+              <dt>{copy.approve.markerHeading}</dt>
+              <dd>{markerLine}</dd>
+            </>
+          )}
         </dl>
+        {draft.restricted_sources && (
+          <div className="note note-warn note-restricted">
+            <Icon name="alert" className="note-icon" />
+            <div className="note-body">
+              <p><strong>{copy.approve.restricted}</strong></p>
+              <p>{copy.approve.restrictedNote}</p>
+            </div>
+          </div>
+        )}
         <h3>{copy.approve.confirmLinks}</h3>
         {links.length === 0 ? (
           <p className="muted">{copy.approve.confirmNoLinks}</p>
@@ -110,7 +153,7 @@ export function ApproveDialog(p: Props) {
             type="button"
             className="btn btn-primary"
             onClick={p.onConfirm}
-            disabled={p.approving || (p.showExternal && !p.externalOk)}
+            disabled={p.approving || p.blocked || (p.showExternal && !p.externalOk)}
           >
             {p.approving ? copy.approve.confirming(draft.kind) : p.confirmLabel}
           </button>

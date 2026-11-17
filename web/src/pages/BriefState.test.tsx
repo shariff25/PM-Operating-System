@@ -27,7 +27,8 @@ describe('what the home page says about the daily brief', () => {
   it('says the first brief has not arrived, and when to expect it, when none ever ran', async () => {
     renderApp({ briefDelivery: 'never' });
     expect(await screen.findByText(copy.today.briefNever)).toBeInTheDocument();
-    expect(copy.today.briefNever).toMatch(/weekday mornings/);
+    // it offers the Slack command that sets one up (docs/daily-brief.md)
+    expect(copy.today.briefNever).toContain('brief me at 8');
     expect(screen.queryByText(copy.today.briefReady)).not.toBeInTheDocument();
     // no calm joke, and the counts are not zeros but missing
     expect(screen.queryByText(copy.nothingWaiting)).not.toBeInTheDocument();
@@ -98,7 +99,12 @@ describe('briefTiming', () => {
     expect(briefTiming({ ...empty, changed: [item] }, now)).toBe('unknown');
     expect(briefTiming({ ...empty, delivered_at: 'not a date' }, now)).toBe('never');
   });
-  it('trusts delivered_at over status', () => {
-    expect(briefTiming({ ...empty, status: 'never', delivered_at: iso(now - 1000) }, now)).toBe('today');
+  it("trusts the server's status over its own reading of delivered_at", () => {
+    expect(briefTiming({ ...empty, status: 'stale', delivered_at: iso(now - 1000) }, now)).toBe('stale');
+    expect(briefTiming({ ...empty, status: 'never', delivered_at: null }, now)).toBe('never');
+  });
+  it('reads delivered_at as within 24 hours, as the server does', () => {
+    expect(briefTiming({ ...empty, delivered_at: iso(now - 23 * 3600_000) }, now)).toBe('today');
+    expect(briefTiming({ ...empty, delivered_at: iso(now - 25 * 3600_000) }, now)).toBe('stale');
   });
 });

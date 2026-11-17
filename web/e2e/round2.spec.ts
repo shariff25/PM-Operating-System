@@ -91,7 +91,7 @@ test('the drafts table says where each draft goes', async ({ page }) => {
   await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Drafts/ }).click();
   await page.getByRole('tab', { name: /^All/ }).click();
   const rows = page.getByRole('tabpanel').getByRole('link');
-  await expect(rows.filter({ hasText: 'Reply to Ben' })).toContainText('Slack reply · #partner-pricing');
+  await expect(rows.filter({ hasText: 'Reply in a Slack thread' }).first()).toContainText('Slack reply');
   await expect(rows.filter({ hasText: 'PRD: TCB grace period' })).toContainText('Confluence page');
 });
 

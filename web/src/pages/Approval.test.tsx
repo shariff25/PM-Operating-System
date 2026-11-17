@@ -108,7 +108,6 @@ describe('what the app says when an approval did not come back clearly', () => {
     ['a network failure', () => new ApiError(0, 'network', copy.errors.network)],
     ['a timeout (408)', () => new ApiError(408, 'unknown', copy.errors.unknown)],
     ['a server error (500)', () => new ApiError(500, 'unknown', copy.errors.unknown)],
-    ['a bad gateway (502)', () => new ApiError(502, 'upstream_unavailable', 'The tool server did not answer.')],
     ['the server saying unknown_outcome', () => new ApiError(502, 'unknown_outcome', 'The write may or may not have happened.')],
     ['unknown_outcome on a 409', () => new ApiError(409, 'unknown_outcome', 'Unclear.')],
     ['something that is not an api error at all', () => new TypeError('boom')],
@@ -156,7 +155,7 @@ describe('what the app says when an approval did not come back clearly', () => {
     await approve(user);
     await user.click(await screen.findByRole('button', { name: copy.approve.checkAgain }));
     const outcome = await screen.findByRole('status', { name: 'Outcome' });
-    expect(outcome).toHaveTextContent('Created in Space PM, under Specs.');
+    expect(outcome).toHaveTextContent('Created in Space PM, under “Specs”.');
     expect(sends).toBe(1);
   });
 
@@ -187,7 +186,21 @@ describe('what the app says when an approval did not come back clearly', () => {
     renderApp({ hash: '/d/apr_prd', wrap: failing(() => new ApiError(403, 'forbidden', 'You cannot approve this one.')) });
     await approve(user);
     const note = await screen.findByRole('alert');
-    expect(note).toHaveTextContent('You cannot approve this one.');
+    expect(note).toHaveTextContent(copy.errors.codes.forbidden);
+    expect(screen.queryByRole('button', { name: copy.approve.checkAgain })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: copy.approve.button('confluence_page') })).toBeEnabled();
+  });
+
+  it.each([
+    [502, 'upstream_unavailable'],
+    [503, 'audience_unavailable'],
+    [503, 'unavailable'],
+  ] as const)('%s %s on a decision is a refusal the table says changed nothing: it says so and offers a retry', async (status, code) => {
+    const user = userEvent.setup();
+    renderApp({ hash: '/d/apr_prd', wrap: failing(() => new ApiError(status, code, 'x')) });
+    await approve(user);
+    const note = await screen.findByRole('alert');
+    expect(note).toHaveTextContent(copy.errors.codes[code]);
     expect(screen.queryByRole('button', { name: copy.approve.checkAgain })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: copy.approve.button('confluence_page') })).toBeEnabled();
   });
@@ -196,7 +209,7 @@ describe('what the app says when an approval did not come back clearly', () => {
     const user = userEvent.setup();
     renderApp({ hash: '/d/apr_prd', wrap: failing(() => new ApiError(400, 'bad_request', '')) });
     await approve(user);
-    expect(await screen.findByRole('alert')).toHaveTextContent(copy.approve.errors.other.text);
+    expect(await screen.findByRole('alert')).toHaveTextContent(copy.errors.codes.bad_request);
   });
 });
 
@@ -220,12 +233,12 @@ describe('the other actions never claim "nothing happened" when they cannot know
     await waitFor(() => expect(screen.queryByText(/I can't tell whether the rejection/)).not.toBeInTheDocument());
   });
 
-  it('reject: a 4xx shows the server\'s own sentence, with no Check again', async () => {
+  it('reject: a 4xx shows the app\'s sentence for its code, with no Check again', async () => {
     const user = userEvent.setup();
     renderApp({ hash: '/d/apr_prd', wrap: unsureOn('reject', new ApiError(409, 'not_pending', 'This draft has already been decided.')) });
     await user.click(await screen.findByRole('button', { name: copy.reject.button }));
     await user.click(screen.getByRole('button', { name: copy.reject.confirm }));
-    expect(await screen.findByText('This draft has already been decided.')).toBeInTheDocument();
+    expect(await screen.findByText(copy.errors.codes.not_pending)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: copy.errors.checkAgain })).not.toBeInTheDocument();
   });
 
@@ -264,12 +277,12 @@ describe('the other actions never claim "nothing happened" when they cannot know
     expect(note).not.toHaveTextContent(/nothing was/i);
   });
 
-  it('a request refused with a 4xx shows the server\'s sentence', async () => {
+  it('a request refused with a 4xx shows the app\'s sentence for its code', async () => {
     const user = userEvent.setup();
     renderApp({ wrap: unsureOn('createTask', new ApiError(403, 'forbidden', 'Your role does not allow this.')) });
     await user.type(await screen.findByLabelText(copy.home.askLabel), 'Draft a PRD');
     await user.click(screen.getByRole('button', { name: new RegExp(`^${copy.home.askButton}`) }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('Your role does not allow this.');
+    expect(await screen.findByRole('alert')).toHaveTextContent(copy.errors.codes.forbidden);
   });
 
   it('a follow-up draft that may or may not have started points to Activity', async () => {
@@ -287,7 +300,9 @@ describe('error wording', () => {
       if (typeof v === 'string') lines.push(v);
       else if (v && typeof v === 'object') Object.values(v).forEach(walk);
     };
-    walk(copy.errors);
+    const { codes: _codes, ...general } = copy.errors; // the per-code sentences follow the table instead (errorCodes.test.ts)
+    void _codes;
+    walk(general);
     lines.push(copy.errors.unsure('x'));
     for (const l of lines) expect(l, l).not.toMatch(/nothing was (changed|sent|created|started)/i);
   });
@@ -300,6 +315,9 @@ describe('error wording', () => {
     expect(isDefiniteRefusal(new ApiError(409, 'unknown_outcome', ''))).toBe(false);
     expect(isDefiniteRefusal(new ApiError(500, 'unknown', ''))).toBe(false);
     expect(isDefiniteRefusal(new ApiError(502, 'upstream_unavailable', ''))).toBe(false);
+    expect(isDefiniteRefusal(new ApiError(502, 'upstream_unavailable', ''), 'decision')).toBe(true);
+    expect(isDefiniteRefusal(new ApiError(503, 'unavailable', ''))).toBe(true);
+    expect(isDefiniteRefusal(new ApiError(502, 'unknown_outcome', ''), 'decision')).toBe(false);
     expect(isDefiniteRefusal(new ApiError(0, 'network', ''))).toBe(false);
     expect(isDefiniteRefusal(new Error('x'))).toBe(false);
     expect(isDefiniteRefusal(undefined)).toBe(false);

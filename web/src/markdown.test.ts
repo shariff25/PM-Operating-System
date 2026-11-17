@@ -145,8 +145,21 @@ describe('renderMarkdown: source markers', () => {
   it('turns a marker in a paragraph into a numbered button named after its source', () => {
     const r = renderMarkdown('Seven days[[s2]], as agreed.', { sources });
     expect(cites(dom(r.html))).toEqual([['2', 'Source 2: PAY-212: Grace period']]);
-    expect(dom(r.html).textContent?.trim()).toBe('Seven days2, as agreed.');
+    expect(dom(r.html).textContent?.trim()).toBe('Seven days,2 as agreed.');
     expect(r.cites).toEqual({ s2: 1 });
+  });
+
+  it('moves a marker that directly precedes closing punctuation to after it, and hugs the word', () => {
+    const r = renderMarkdown('Seven days[[s2]]. Then more [[s1]], and (see this[[s2]]); ok[[s1]]: yes.', { sources });
+    const text = dom(r.html).textContent!.trim();
+    expect(text).toBe('Seven days.2 Then more,1 and (see this);2 ok:1 yes.');
+    // the stored text is not touched, and each marker still counts
+    expect(r.cites).toEqual({ s2: 2, s1: 2 });
+  });
+
+  it('leaves a marker alone when no punctuation follows, and never moves one out of code', () => {
+    const r = renderMarkdown('Churn fell[[s1]] last quarter. `a[[s1]].`', { sources });
+    expect(dom(r.html).textContent?.trim()).toBe('Churn fell1 last quarter. a[[s1]].');
   });
 
   it('numbers by the card position, not by the digits in the marker', () => {
