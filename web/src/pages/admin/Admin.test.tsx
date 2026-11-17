@@ -21,7 +21,7 @@ describe('admin navigation and access', () => {
     renderApp({ role: 'admin', hash: '/admin' });
     await screen.findByRole('heading', { level: 1, name: A.sections.overview });
     const sub = within(nav()).getByRole('list', { name: A.subnavLabel });
-    expect(within(sub).getAllByRole('link').map((a) => a.textContent)).toEqual(['Overview', 'Audit log', 'Team', 'Connectors']);
+    expect(within(sub).getAllByRole('link').map((a) => a.textContent)).toEqual(['Overview', 'Audit log', 'Team', 'Connectors', 'Policy', 'Content and harness']);
     expect(within(sub).getByRole('link', { name: 'Overview' })).toHaveAttribute('aria-current', 'page');
   });
 

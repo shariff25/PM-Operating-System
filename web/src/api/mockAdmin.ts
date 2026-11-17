@@ -33,7 +33,10 @@ const ADMIN_PERMISSIONS = [
   'view-audit-log',
   'export-audit',
   'edit-bots-and-skills',
+  'view-policies',
   'edit-policies',
+  'view-content',
+  'edit-content',
   'approve-policy-change',
   'link-own-accounts',
   'manage-connectors',
@@ -44,7 +47,7 @@ const ADMIN_PERMISSIONS = [
 export const MOCK_PERMISSIONS: Record<MockRole, string[]> = {
   pm: PM_PERMISSIONS,
   admin: ADMIN_PERMISSIONS,
-  auditor: ['view-audit-log', 'export-audit'],
+  auditor: ['view-audit-log', 'export-audit', 'view-policies', 'view-content'],
 };
 
 /** The role a development handle signs in as. Any other handle is a plain PM. */

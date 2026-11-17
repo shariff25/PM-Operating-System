@@ -3,12 +3,14 @@ import type { AdminSection } from '../../admin/access';
 import { useApp } from '../../app-context';
 import { AuditLog } from './AuditLog';
 import { Connectors } from './Connectors';
+import { Content } from './Content';
 import { AdminOverview } from './Overview';
 import { NoAccess } from './parts';
+import { Policy } from './Policy';
 import { Team } from './Team';
 
 /**
- * The page for `#/admin` and the three below it. A part this person's role does not include is a
+ * The page for `#/admin` and the parts below it. A part this person's role does not include is a
  * calm "no access" page, never a broken one: the server checks every request again anyway.
  */
 export function AdminPage({ section, search }: { section: AdminSection; search: string }) {
@@ -23,6 +25,10 @@ export function AdminPage({ section, search }: { section: AdminSection; search: 
       return <Team />;
     case 'connectors':
       return <Connectors />;
+    case 'policy':
+      return <Policy />;
+    case 'content':
+      return <Content search={search} />;
     default:
       return <AdminOverview />;
   }
