@@ -9,12 +9,13 @@
 //! query and body actually sent, and signed afresh for every call. Its `sid` is the PM's
 //! session reference (`session::assertion_ref`, never the session id itself) when the call is
 //! made through [`Runtime::for_session`] or [`ToolServer::for_session`], else
-//! [`ASSERTION_SESSION`].
+//! [`ASSERTION_SESSION`]. Its `roles` are the PM's roles as the user database answered them
+//! for this request (`Runtime::for_user`, `ToolServer::for_user`; spec §9): informational,
+//! since receivers check roles in their own data.
 //!
 //! Tokens are only ever sent as `Authorization` headers to the configured base URLs. Error
 //! values carry a plain reason, never a token, a key or an upstream body.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -278,9 +279,6 @@ pub struct Signer {
     issuer: &'static str,
     audience: String,
     ring: KeyRing,
-    /// `team.yaml`: the subject's roles at each call, from the parsed file (re-read when it
-    /// changes, `team.rs`).
-    team: crate::team::TeamCache,
 }
 
 impl std::fmt::Debug for Signer {
@@ -295,33 +293,22 @@ impl std::fmt::Debug for Signer {
 
 impl Signer {
     /// As `issuer` (pmos-web is `web`) for `audience` (`bots` or `toolserver`).
-    pub fn new(issuer: &'static str, audience: &str, ring: KeyRing, content_root: PathBuf) -> Self {
+    pub fn new(issuer: &'static str, audience: &str, ring: KeyRing) -> Self {
         Self {
             issuer,
             audience: audience.to_string(),
             ring,
-            team: crate::team::TeamCache::new(content_root),
         }
     }
 
-    /// The subject's known roles in `team.yaml`; none if the file or the member is missing.
-    /// Receivers check roles against `team.yaml` themselves: these are informational.
-    fn roles(&self, subject: &str) -> Vec<pmos_contract::model::Role> {
-        self.team
-            .load()
-            .ok()
-            .and_then(|t| t.by_handle(subject).map(|m| m.roles.clone()))
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| r.is_known())
-            .collect()
-    }
-
-    /// An assertion that `subject` is the person `request` is for, in the session `session`
-    /// refers to (the `sid` claim), bound to the request exactly as it will be sent.
+    /// An assertion that `subject`, holding `roles` (as the user database answered for this
+    /// request; informational: receivers check roles themselves), is the person `request` is
+    /// for, in the session `session` refers to (the `sid` claim), bound to the request
+    /// exactly as it will be sent.
     pub fn sign(
         &self,
         subject: &str,
+        roles: &[pmos_contract::model::Role],
         session: &str,
         request: &reqwest::Request,
     ) -> Result<HeaderValue, &'static str> {
@@ -340,7 +327,11 @@ impl Signer {
             self.issuer,
             &self.audience,
             subject,
-            &self.roles(subject),
+            &roles
+                .iter()
+                .filter(|r| r.is_known())
+                .cloned()
+                .collect::<Vec<_>>(),
             session,
         )
         .map_err(|_| "can't sign for this person")?;
@@ -418,6 +409,8 @@ struct Client {
     signer: Option<Arc<Signer>>,
     /// The `sid` for assertions: the PM's session reference, when the call is for one.
     session: Option<String>,
+    /// The PM's roles for assertions, as the user database answered for this request.
+    roles: Arc<Vec<pmos_contract::model::Role>>,
     service: &'static str,
 }
 
@@ -493,7 +486,7 @@ impl Client {
         if let (Some(signer), Some(subject)) = (&self.signer, subject) {
             let session = self.session.as_deref().unwrap_or(ASSERTION_SESSION);
             let value = signer
-                .sign(subject, session, &request)
+                .sign(subject, &self.roles, session, &request)
                 .map_err(|why| self.failed(why))?;
             request
                 .headers_mut()
@@ -554,6 +547,7 @@ impl Runtime {
             token: credentials.token.clone(),
             signer: credentials.signer.clone(),
             session: None,
+            roles: Arc::default(),
             service: "bot runtime",
         })
     }
@@ -563,6 +557,15 @@ impl Runtime {
     pub fn for_session(&self, session_ref: &str) -> Self {
         let mut c = self.0.clone();
         c.session = Some(session_ref.to_string());
+        Self(c)
+    }
+
+    /// [`Self::for_session`], with `roles` (the PM's, from the user database for this
+    /// request) in every assertion it signs.
+    pub fn for_user(&self, session_ref: &str, roles: &[pmos_contract::model::Role]) -> Self {
+        let mut c = self.0.clone();
+        c.session = Some(session_ref.to_string());
+        c.roles = Arc::new(roles.to_vec());
         Self(c)
     }
 
@@ -657,6 +660,7 @@ impl ToolServer {
             token: credentials.token.clone(),
             signer: credentials.signer.clone(),
             session: None,
+            roles: Arc::default(),
             service: "tool server",
         })
     }
@@ -666,6 +670,15 @@ impl ToolServer {
     pub fn for_session(&self, session_ref: &str) -> Self {
         let mut c = self.0.clone();
         c.session = Some(session_ref.to_string());
+        Self(c)
+    }
+
+    /// [`Self::for_session`], with `roles` (the PM's, from the user database for this
+    /// request) in every assertion it signs.
+    pub fn for_user(&self, session_ref: &str, roles: &[pmos_contract::model::Role]) -> Self {
+        let mut c = self.0.clone();
+        c.session = Some(session_ref.to_string());
+        c.roles = Arc::new(roles.to_vec());
         Self(c)
     }
 

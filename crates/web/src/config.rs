@@ -32,7 +32,8 @@ pub struct Config {
     /// With a `web:toolserver` key in `PMOS_ASSERTION_KEYS`, calls for a PM also carry a
     /// signed user assertion.
     pub toolserver_token: Credentials,
-    /// `PMOS_CONTENT_ROOT`, default `content`: where `team.yaml` is.
+    /// `PMOS_CONTENT_ROOT`, default `content`: the deployed content tree the admin screens
+    /// read (and, until slice U5, the Team page's member list in `team.yaml`).
     pub content_root: PathBuf,
     /// `PMOS_WEB_STATIC_DIR`: the built web app (`web/dist`). Optional; without it only
     /// `/api` and `/healthz` answer.
@@ -161,9 +162,7 @@ impl Config {
         let mut credentials = |token: String, audience: &str| {
             let c = Credentials::new(token);
             match keys.remove(&(ISSUER.to_string(), audience.to_string())) {
-                Some(ring) => {
-                    c.with_signer(Signer::new(ISSUER, audience, ring, content_root.clone()))
-                }
+                Some(ring) => c.with_signer(Signer::new(ISSUER, audience, ring)),
                 None => c,
             }
         };

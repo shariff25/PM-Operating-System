@@ -30,19 +30,36 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
   start with neither provider, with Entra half-configured, or with both unless
   `PMOS_WEB_DEV_LOGIN_WITH_ENTRA=1` is also set (a development override; it then logs a loud
   warning). `GET /api/auth/providers` tells the app which buttons to show.
-- **Who you are:** the signed-in handle must be a member in `team.yaml`. Roles come from there.
-  Entra ID finds the member by email: the token's `preferred_username` (or else `email`),
-  lower-cased, against members' `email` field; never by handle. A member with `entra-oid` in
-  `team.yaml` must also be that Entra account (the token's `oid`); otherwise sign-in ends at
-  `reason=wrong_account`, and a session of the wrong account ends (`401 signed_out`) on its
-  next request after `entra-oid` is added or changed.
+- **Who you are:** the user database (`docs/user-database-spec.md`), which the tool server
+  owns; `pmos-web` asks it with `GET /internal/users/resolve` (`docs/toolserver.md`, "The user
+  database's read API") and keeps each answer 10 seconds. `team.yaml` decides nothing. The
+  signed-in person must be an **active** user; roles come from there and are looked up on
+  every request (sessions hold no roles), so a deactivation or a removed role reaches the
+  app within 10 seconds. **Entra ID** signs people in by the token's `(tid, oid)`; a person's
+  first Microsoft sign-in links that key to them by the token's `preferred_username` only
+  (never `email`), and only when an admin confirmed that sign-in name and they hold neither
+  Admin nor Auditor (those are linked on the host). Guests, other identity providers and a
+  registration without the `acct` claim are refused before any lookup. The rules, and what
+  Microsoft's documentation says about each claim, are in `docs/entra-sign-in.md`. An Entra
+  session is checked by its `(tid, oid)` on every request: if that key is unlinked, or now
+  names someone else, it ends (`401 signed_out`); if the person holds Admin or Auditor and
+  the host hasn't confirmed the link, it ends with `403 entra_needs_host`. **Development
+  sign-in** resolves by handle.
+- **When the tool server can't be reached** (spec §2, "When the store is unavailable"):
+  sign-in fails closed (`503 users_unavailable`, or the callback's
+  `reason=users_unavailable`). An existing session may keep using the person's
+  last-known-good answer **for at most 5 minutes, for `GET /api/me` and `GET /api/brief`
+  only** (pmos-web's own store); the brief then leaves out every item whose `system` is
+  `slack` and says so (`slack_withheld: true`, see **The daily brief and follow-ups**).
+  Every other route, every write, and anything that reaches the tool server or the runtime
+  answers `503 users_unavailable`. Past the 5 minutes, reads do too.
 - **HTTPS:** with an `https` `PMOS_WEB_PUBLIC_URL`, every response carries
   `Strict-Transport-Security: max-age=31536000`.
 - **Health:** `GET /healthz` (outside `/api`, no session) answers `ok` while the process runs.
   `GET /readyz` answers `200` when it can serve and `503` when it can't, with
-  `{"ready": bool, "checks": {"store": "ok"|"down", "team": …, "bot_runtime": …,
-  "tool_server": …}, "unrecorded_sign_in_events": n}`: its own store answers, `team.yaml`
-  reads, and the bot runtime and the tool server answer their `/healthz` within two seconds.
+  `{"ready": bool, "checks": {"store": "ok"|"down", "bot_runtime": …, "tool_server": …},
+  "unrecorded_sign_in_events": n}`: its own store answers, and the bot runtime and the tool
+  server (which answers who may sign in) answer their `/healthz` within two seconds.
   `unrecorded_sign_in_events` counts, since start-up, sign-in events the audit log didn't take
   (see **Sign-in events**); it never makes the server unready. No detail and no secrets; the
   reason goes to the server's log.
@@ -54,14 +71,21 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
   | --- | --- | --- | --- | --- |
   | `web.sign_in` | the member | `ok` | `null` | `provider: entra` (or `dev`) |
   | `web.sign_out` | the member | `ok` | `null` | `provider: entra` (or `dev`) |
-  | `web.sign_in_refused` | `anonymous` | `denied` | `member:<handle>` for `wrong_account`, else `null` | `provider: entra; reason: not_a_member; attempt: 3f9a1c2b4d5e` |
+  | `web.sign_in_refused` | `anonymous` | `denied` | `null` | `provider: entra; reason: not_a_member; attempt: 3f9a1c2b4d5e` |
+  | `users.identity_conflict` | `anonymous` | `denied` | the user whose sign-in name was presented | `entra` |
 
   `client` is `web` and `task_id` `web-auth`. `reason` is the signed-out page's code
-  (`not_a_member`, `wrong_account`, `failed`, `unavailable`, …). `attempt` (on
+  (`not_a_member`, `deactivated`, `sign_in_unconfirmed`, `entra_needs_host`,
+  `entra_misconfigured`, `users_unavailable`, `failed`, `unavailable`, …). `attempt` (on
   `not_a_member` only) is the first 12 hex characters of an HMAC-SHA256, under a key derived
   from `pmos-web`'s tool server token, of the name tried (trimmed, lowercased): repeated
   attempts with one name share it, and the name itself (an email or handle) is never sent or
-  stored. No IP address (PM OS records none), no token. An Entra refusal is recorded only once
+  stored. No IP address (PM OS records none), no token, no `oid`. `users.identity_conflict`
+  is `pmos-web` flagging a known Microsoft account that signed in with another user's
+  sign-in name (it signs in as itself; spec §7 step 3); a first sign-in whose name is
+  already linked to a different account is refused (`not_a_member`), and the tool server's
+  first-link route records that conflict itself. Both count on the admin overview. An Entra
+  refusal is recorded only once
   the browser's `state` matched a sign-in this server started; a callback with no flow behind
   it (which anyone can send) is only logged. **If the event can't be recorded, sign-in and
   sign-out go ahead** (after at most 3 seconds): the failure is logged as an error and counted
@@ -88,18 +112,23 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
 | `GET /api/auth/providers` | | `{providers: ["entra", "dev"]}`: the providers that are on, Entra first. No session needed. |
 | `GET /api/auth/login[?return_to=/path]` | | `303` to Microsoft's authorize endpoint, setting the `__Host-pmos-entra` flow cookie (ten minutes). `return_to` is kept only if it is a same-origin path (`/…`, not `//…`); else `/`. `404` unless Entra is on. If Microsoft's metadata can't be fetched: `303` to `/#/signed-out?reason=unavailable`. |
 | `GET /api/auth/callback?code&state` | | Microsoft's redirect back. `303` to the `return_to` path (default `/`) with the session cookie, or `303` to `/#/signed-out?reason=<reason>` with no session. Always clears the flow cookie. `404` unless Entra is on. |
-| `POST /api/auth/dev-login` | `{handle}` | `204` and the cookie. `404` unless development sign-in is on. `403 not_a_member` for a handle not in `team.yaml`. |
+| `POST /api/auth/dev-login` | `{handle}` | `204` and the cookie. `404` unless development sign-in is on. `400 bad_request` for anything but a handle. `403 not_a_member` for a handle that isn't an active user in the user database. `503 users_unavailable` when the tool server can't be asked. |
 | `POST /api/auth/logout` | none | `204`; the session ends. Only PM OS's session: Microsoft's own sign-in session is untouched, so "Sign in with Microsoft" may then sign straight back in without a prompt. |
 
 The callback's `reason`s, for the app's signed-out page:
 
 | `reason` | Meaning | Suggested text |
 | --- | --- | --- |
-| `not_a_member` | Microsoft signed them in, but no `team.yaml` member has that email. | "You're not on the team list yet. Ask a platform owner to add you." |
+| `not_a_member` | Microsoft signed them in, but they aren't a user: no user has that Microsoft account or (for a first sign-in) that confirmed sign-in name; a guest of the tenant; another identity provider; or a sign-in name already linked to a different Microsoft account (audited and flagged). | "You're not on the team list yet. Ask a platform owner to add you." |
+| `deactivated` | Their user is deactivated. | "Your access to PM OS is turned off. A platform owner can turn it back on." |
+| `sign_in_unconfirmed` | A first sign-in whose sign-in name came through Slack and no admin has confirmed it yet. | "An admin needs to confirm your Microsoft sign-in name in PM OS first." |
+| `entra_needs_host` | They hold Admin or Auditor, and the host hasn't set or confirmed their Microsoft account (`pmos-admin users set-entra`). | "Someone with host access needs to confirm your Microsoft account." |
+| `entra_misconfigured` | The ID token has no `acct` claim: the app registration lacks the optional claim (`docs/entra-sign-in.md`). Nobody can sign in until it is added. | "Microsoft sign-in isn't set up quite right yet. Tell a platform owner." |
+| `users_unavailable` | The tool server (the user database) couldn't be asked. | "PM OS can't check who you are right now. Try again in a minute." |
 | `cancelled` | They cancelled at Microsoft (`access_denied`). | "Sign-in was cancelled." |
 | `expired` | No sign-in in progress in this browser, or it took over ten minutes. | "That sign-in expired. Try again." |
 | `unavailable` | Microsoft couldn't be reached. | "Microsoft sign-in isn't answering. Try again in a minute." |
-| `wrong_account` | Microsoft signed in an account with the right email, but `team.yaml` names another Entra account (`entra-oid`) for that member: the address was reassigned, or it is a second account. | "That Microsoft account isn't the one on the team list. Sign in with your own work account, or ask a platform owner." |
+| `wrong_account` | From before the user database (`team.yaml`'s `entra-oid`); no longer sent. An app may keep the text. | "That Microsoft account isn't the one on the team list. Sign in with your own work account, or ask a platform owner." |
 | `failed` | Anything else (a wrong or reused `state`, a refused code, a token that failed a check). | "Sign-in didn't work. Try again." |
 
 An unknown `reason` should read as `failed`.
@@ -114,13 +143,19 @@ An unknown `reason` should read as `failed`.
 | `DELETE /api/me/hints` | | `Me`, with `hints_seen` empty ("Show hints again") |
 
 ```json
-{"handle": "ana", "name": "Ana Silva", "roles": ["pm"],
+{"handle": "ana", "display_name": "Ana Silva", "name": "Ana Silva", "roles": ["pm"],
  "permissions": ["ask-bot", "view-own-tasks", "manage-own-routines", "decide-own-approval",
                  "view-own-traces", "link-own-accounts"],
  "csrf_token": "…", "first_visit": true, "hints_seen": ["sources"], "nudges": true}
 ```
 
 `first_visit` is true until the PM first opens a draft. `nudges: false` also hides hints.
+
+`display_name` is the person's display name in the user database (`""` when none is set),
+**untrusted text**: render it as plain text, never as HTML or Markdown. `name` is what to
+call them: the display name, or the handle when there is none. `roles` and `display_name`
+come from the user database for this request (at most 10 seconds old; on the
+last-known-good path, see **Sign-in and safety**, at most 5 minutes old).
 
 `permissions` lists what the person's roles allow (the permission matrix,
 `crates/contract/src/permissions.rs`), kebab-case, in a fixed order; an unknown role adds
@@ -349,8 +384,16 @@ drafts, and any the bot put in its answer are removed.
 {"date": "2026-11-16", "delivered_at": "2026-11-16T08:31:02Z", "status": "today",
  "changed": [{"system": "jira", "title": "PAY-212 moved to Blocked", "summary": "…", "url": "…"}],
  "waiting_on_you": [{"id": "fu_…", "system": "slack", "who": "Ben", "summary": "asked about the pricing page", "url": "…", "age_days": 2}],
- "you_wait_on": [{"id": "fu_…", "system": "slack", "who": "Legal", "summary": "the DPA question", "url": "…", "age_days": 3}]}
+ "you_wait_on": [{"id": "fu_…", "system": "slack", "who": "Legal", "summary": "the DPA question", "url": "…", "age_days": 3}],
+ "slack_withheld": false}
 ```
+
+- `slack_withheld` is `true` when the tool server couldn't be reached and the brief was
+  served on the PM's last-known-good answer (**Sign-in and safety**): every item whose
+  `system` is `slack`, in all three lists, is left out, and `note` says
+  `"Slack items are hidden until PM OS can check your access"`. The app shows its own
+  sentence for it. Dismissing and drafting are writes, so they answer
+  `503 users_unavailable` then. An older server leaves the field out: read it as `false`.
 
 - `delivered_at` is when a daily brief last filled this PM's day (the producer route below),
   however long ago, or `null` if none ever has.
@@ -381,8 +424,9 @@ items: `{"date"?: "2026-11-16", "changed": [{system, title, summary?, url}], "wa
 [{system, who, summary, url, created_at?}], "you_wait_on": [...]}`. At most 50 items per list,
 a 128 KiB body, one-line text (`summary` at most 200 characters, `who` 80), `system` made of
 `a-z`, digits, `-` and `_`, every `url` `http` or `https` without credentials; anything else
-is `422 bad_brief` (`413` for an oversize body, `401 bad_token`, `404` for a handle not on the
-team) and nothing is stored. A follow-up sent again keeps its age and a dismissal; one left
+is `422 bad_brief` (`413` for an oversize body, `401 bad_token`, `404` for a handle that isn't
+an active user in the user database, `503 users_unavailable` when that can't be asked) and
+nothing is stored. A follow-up sent again keeps its age and a dismissal; one left
 out is removed. A call that looks like a browser's (it carries a `__Host-pmos` session cookie
 or an `Origin` header) is `403 forbidden`, whatever its token. With `PMOS_WEB_INTERNAL_BIND`
 set, the route is served only on that second listener (and `404` on the browser-facing one).
@@ -409,7 +453,7 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `401` | `bad_token` | The producer route's token is wrong (server to server only). | Yes |
 | `403` | `bad_origin` | A write from another origin, or with neither `Origin` nor `Referer`. | Yes |
 | `403` | `bad_csrf` | A write without the session's CSRF token. | Yes |
-| `403` | `not_a_member` | Not (or no longer) in `team.yaml`; every session of theirs ends. Also when the tool server doesn't count them a member on a decision. | Yes |
+| `403` | `not_a_member` | Not (or no longer) an active user in the user database; every session of theirs ends. Also when the tool server doesn't count them a member on a decision. | Yes |
 | `403` | `not_allowed` | Their role doesn't allow drafts, tasks or asking. | Yes |
 | `403` | `forbidden` | Admin and auditor routes their role doesn't allow; the producer route called like a browser. | Yes |
 | `404` | `not_found` | Unknown path or id, or someone else's draft, task or follow-up. | Yes |
@@ -443,7 +487,9 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `504` | `unknown_outcome` | The same, when the tool server didn't answer in time (10 seconds). | **Unknown** |
 | `503` | `audience_unavailable` | Slack couldn't say who is in the channel. | Yes |
 | `503` | `unavailable` | `pmos-web`'s own store, or the tool server's, is down. | Yes |
-| `503` | `team_unavailable` | `team.yaml` can't be read. | Yes |
+| `503` | `team_unavailable` | The admin Team page's member list: `team.yaml` can't be read (until that page moves to the user database). | Yes |
+| `503` | `users_unavailable` | The tool server (the user database) can't be asked who the person is: sign-in, and every route but the last-known-good reads (**Sign-in and safety**). | Yes |
+| `403` | `entra_needs_host` | A Microsoft session of someone holding Admin or Auditor whose link the host hasn't confirmed: the session ends. | Yes |
 
 After an `unknown_outcome` the server has already read the draft once: if it showed this PM's
 approval (or rejection), the answer would have been that draft, `200`. Approving again is safe:
@@ -452,7 +498,8 @@ if the first approve went through, the second answers the approved draft and sen
 ## Admin and auditor
 
 Read-only views for the two roles beyond PM. Every route is `GET`; any other method is
-`405 method_not_allowed`. Roles come from `team.yaml`:
+`405 method_not_allowed`. Roles come from the user database (at most 10 seconds old), and the
+tool server checks them again in its own tables:
 
 | Route | `admin` | `auditor` | anyone else (`pm`, `reviewer`, `skill-author`) |
 | --- | --- | --- | --- |
@@ -471,11 +518,12 @@ The checks are the permission matrix: `audit` needs `view-audit-log`, `audit/exp
 | Status and code | When |
 | --- | --- |
 | `401 signed_out` | No live session. |
-| `403 not_a_member` | The handle is no longer in `team.yaml` (every session is ended). |
+| `403 not_a_member` | The person is no longer an active user (every session is ended). |
 | `403 forbidden` | The role doesn't allow this route. Also when the tool server, which checks the role again on its side, refuses. |
 | `400 bad_request` | A query parameter is malformed (see each route). Nothing is sent upstream. |
 | `502 upstream_unavailable` | The tool server didn't answer, or answered something unreadable. |
-| `503 team_unavailable` | `team.yaml` can't be read. |
+| `503 team_unavailable` | `GET /api/admin/team` only: `team.yaml` can't be read. |
+| `503 users_unavailable` | The tool server can't be asked who the viewer is. |
 
 **What the auditor sees, and doesn't.** Metadata only: who did what, when, through which
 client, to which system and target id, with what outcome. Never a draft body, Slack text, a
@@ -574,7 +622,10 @@ to it directly.
 ### `GET /api/admin/team`
 
 Every member in `team.yaml`, in file order (team bots' service identities, `bots.<name>`, left
-out). Read-only: members change through Slack onboarding or a pull request to `team.yaml`.
+out). Read-only. **This list still comes from `team.yaml` until slice U5** replaces it with the
+user database's admin list (`GET /internal/admin/users`); it decides nothing (who may open
+the page is the viewer's roles from the user database), and a person listed here may not be
+a user.
 
 ```json
 {"members": [
@@ -653,7 +704,7 @@ tasks, with no team-wide read, so `pmos-web` can't count them.
 
 - **The tool server's own role check believes the named viewer only as far as
   `PMOS_ASSERTION_MODE` does.** Each admin call names the viewer (`user=`) and carries a user
-  assertion for them, and the tool server checks that viewer's role in its own `team.yaml`.
+  assertion for them, and the tool server checks that viewer's role in its own user database.
   With `require`, a call without a valid assertion for that viewer is refused. With `off` or
   `verify`, a call with no assertion is believed, so a stolen `PMOS_WEB_TOKEN` could read the
   audit log by naming an admin. Run `require` in production.

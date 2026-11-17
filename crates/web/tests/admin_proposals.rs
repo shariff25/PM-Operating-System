@@ -30,6 +30,8 @@ use pmos_web::{Config, Deps};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+mod support;
+
 const BOTS_TOKEN: &str = "web-client-token-0123456789abcdef0123";
 const TOOLS_TOKEN: &str = "toolserver-service-token-0123456789ab";
 // Test key only: fixed bytes, never used anywhere real.
@@ -119,6 +121,8 @@ struct Mock {
     /// Sign-in events (`POST /internal/admin/events`), kept apart from the admin actions
     /// these tests count.
     sign_ins: Mutex<Vec<Call>>,
+    /// The user database's routes (who is signed in, with which roles).
+    directory: support::FakeDirectory,
 }
 
 impl Mock {
@@ -165,6 +169,9 @@ async fn toolserver(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Some(res) = m.directory.handle(&method, &uri, &body) {
+        return res;
+    }
     let c = call(&method, &uri, &headers, &body);
     if c.path == "/internal/admin/events" {
         m.sign_ins.lock().unwrap().push(c);
@@ -355,6 +362,7 @@ impl Reply {
 async fn web() -> Web {
     logs();
     let tools = Arc::new(Mock::default());
+    tools.directory.seed_team(TEAM);
     let (tools_url, stop_tools) =
         serve(Router::new().fallback(toolserver).with_state(tools.clone())).await;
     let (bots_url, stop_bots) = serve(Router::new().fallback(runtime)).await;
@@ -372,7 +380,6 @@ async fn web() -> Web {
             "web",
             "toolserver",
             ring,
-            content.clone(),
         )),
         content_root: content.clone(),
         static_dir: None,
