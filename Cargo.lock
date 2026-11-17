@@ -1827,10 +1827,13 @@ name = "pmos-policy"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "getrandom 0.3.4",
  "pmos-contract",
  "serde",
  "serde_json",
  "serde_norway",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
  "tempfile",
  "walkdir",
 ]

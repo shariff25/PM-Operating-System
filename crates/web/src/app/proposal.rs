@@ -1,36 +1,36 @@
-//! What the policy and content admin routes share: role checks, the GitHub set-up, running
-//! the file-system work off the async threads, and opening and listing proposals.
+//! What the policy and content admin routes share: audited role checks, the read rule for
+//! sensitive files, running the file-system work off the async threads, and sending a
+//! proposal to the tool server.
 //!
-//! **Opening a proposal**, after the route has validated it:
-//! 1. The base: `PMOS_WEB_GITHUB_BASE`, or the repository's default branch, at its head now.
-//! 2. **Stale base:** each file the pull request writes must be on that commit exactly as the
-//!    server had it when it computed the change (by git blob id), or the proposal is refused
-//!    `409 stale_base` with the paths. Skipped (and said so) when GitHub truncates the tree.
-//! 3. The rate limit (per admin, per hour, in memory).
-//! 4. **Audit first:** the tool server records `admin.<kind>_proposal` `started` with the
-//!    paths. If it can't, nothing is written to GitHub.
-//! 5. One commit on the base, a new branch `pmos/proposal/<kind>/<handle>-<time>-<random>`
-//!    (a new ref only: the default branch is never written), the pull request, and the labels
-//!    `pmos-proposal` and `pmos-proposal:<kind>`. Never merged here.
-//! 6. The tool server records `opened` with the pull request, or `failed`.
+//! **`pmos-web` opens nothing in GitHub and holds no GitHub token.** After its own
+//! (interactive) validation, a proposal goes to the tool server as a change set
+//! (`POST /internal/admin/proposals/open`, signed for the admin and bound to the body): every
+//! file it would write, with the git blob id each was computed from. The tool server checks
+//! the admin's role itself, applies the path allow-list and caps again, re-runs the content
+//! lint and policy generation on its own deployed copy, checks the base against the default
+//! branch, rate-limits, audits, and opens the pull request with the admin's own linked GitHub
+//! account (`docs/policy-admin.md`, How a proposal is opened). This module relays its answer
+//! with `pmos-web`'s own sentences.
 //!
-//! The log has the handle, the kind, how many files and the pull request number; never the
-//! token or a file's text.
-
-use std::collections::BTreeMap;
+//! **Audited here** (`POST /internal/admin/actions`): a role refusal on any admin policy or
+//! content route, a proposal refused by this server's own checks (invalid, stale against the
+//! deployed copy), and an admin reading a PM's personal master file or restricted context
+//! (through the file route, or named in a validation or proposal, whose diff shows the current
+//! text). A sensitive read is recorded **before** the text is served; if it can't be, nothing
+//! is served (`502 audit_unavailable`). Never file text; see [`record`] for what is.
 
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use pmos_contract::permissions::Permission;
+use pmos_policy::admin::access::{self, Sensitive};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{now, ApiError, ApiResult, AppState, Signed};
+use super::{ApiError, ApiResult, AppState, Signed};
 use crate::admin_config::AdminConfig;
-use crate::github::{FileWrite, GitHub, GitHubError};
 use crate::policy_admin::Evaluation;
-use crate::proposals::{self, Change, Issue, Kind, RateLimiter};
+use crate::proposals::{self, Change, Issue, Kind};
 use crate::upstream::UpstreamError;
 
 /// The largest request body the admin write routes take: 50 files of 256 KiB, as JSON.
@@ -38,18 +38,11 @@ pub const MAX_REQUEST: usize = 16 * 1024 * 1024;
 
 pub struct Proposals {
     pub config: AdminConfig,
-    pub github: Option<GitHub>,
-    pub limiter: RateLimiter,
 }
 
 impl Proposals {
     pub fn new(config: AdminConfig) -> Result<Self, String> {
-        let github = config.github.as_ref().map(GitHub::new).transpose()?;
-        Ok(Self {
-            limiter: RateLimiter::new(config.proposals_per_hour),
-            github,
-            config,
-        })
+        Ok(Self { config })
     }
 }
 
@@ -61,26 +54,187 @@ pub(super) fn forbidden() -> ApiError {
     )
 }
 
-/// The viewer has `p`, else `403 forbidden`.
-pub(super) fn need(signed: &Signed, p: Permission) -> Result<(), ApiError> {
-    if signed.member.allows(p) {
-        Ok(())
-    } else {
-        Err(forbidden())
+/// What a viewer did, for the audit log: one of the tool server's fixed admin actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Action {
+    PolicyRead,
+    PolicyValidate,
+    PolicyProposals,
+    PolicyProposal,
+    ContentRead,
+    ContentFile,
+    ContentValidate,
+    ContentProposals,
+    ContentProposal,
+    Harness,
+}
+
+impl Action {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyRead => "admin.policy_read",
+            Self::PolicyValidate => "admin.policy_validate",
+            Self::PolicyProposals => "admin.policy_proposals",
+            Self::PolicyProposal => "admin.policy_proposal",
+            Self::ContentRead => "admin.content_read",
+            Self::ContentFile => "admin.content_file",
+            Self::ContentValidate => "admin.content_validate",
+            Self::ContentProposals => "admin.content_proposals",
+            Self::ContentProposal => "admin.content_proposal",
+            Self::Harness => "admin.harness",
+        }
     }
 }
 
-pub(super) fn not_configured() -> ApiError {
+/// The audit action for reading a sensitive file.
+pub const SENSITIVE_READ: &str = "admin.content_sensitive_read";
+
+/// Record an event at the tool server (`POST /internal/admin/actions?user=<viewer>`, signed
+/// for the viewer and bound to the body): the action, the outcome (`denied` or `ok`), a fixed
+/// note, how many files, and a target that names no content (`content:personal:<handle>`
+/// for a personal master file; a restricted file's path is never sent, as its name can be
+/// sensitive). Never file text or a path otherwise.
+pub(super) async fn record(
+    state: &AppState,
+    signed: &Signed,
+    action: &str,
+    outcome: &str,
+    detail: &str,
+    count: usize,
+    target: Option<String>,
+) -> Result<(), UpstreamError> {
+    signed
+        .toolserver(state)
+        .admin_record(
+            &signed.member.handle,
+            "actions",
+            &json!({
+                "action": action,
+                "outcome": outcome,
+                "detail": detail,
+                "count": count,
+                "target": target,
+            }),
+        )
+        .await
+        .map(|_| ())
+}
+
+/// Record a refusal; a failure to record is logged, and the refusal stands.
+pub(super) async fn record_refusal(
+    state: &AppState,
+    signed: &Signed,
+    action: Action,
+    detail: &str,
+    count: usize,
+) {
+    if let Err(e) = record(
+        state,
+        signed,
+        action.as_str(),
+        "denied",
+        detail,
+        count,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = ?e, action = action.as_str(), "admin refusal not recorded");
+    }
+}
+
+/// The viewer has `p`, else `403 forbidden`, recorded at the tool server.
+pub(super) async fn need(
+    state: &AppState,
+    signed: &Signed,
+    p: Permission,
+    action: Action,
+) -> Result<(), ApiError> {
+    if signed.member.allows(p) {
+        return Ok(());
+    }
+    tracing::info!(user = %signed.member.handle, action = action.as_str(), "admin route refused: role");
+    record_refusal(state, signed, action, "role", 0).await;
+    Err(forbidden())
+}
+
+fn audit_unavailable() -> ApiError {
     ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_configured",
-        "Proposals need a GitHub repository and token (PMOS_WEB_GITHUB_REPO, PMOS_WEB_GITHUB_TOKEN). Reading and validating still work.",
+        StatusCode::BAD_GATEWAY,
+        "audit_unavailable",
+        "PM OS couldn't record this in the audit log, so it wasn't done. Try again in a minute.",
     )
 }
 
-/// The GitHub client, or `501 not_configured`.
-pub(super) fn github(state: &AppState) -> Result<&GitHub, ApiError> {
-    state.0.proposals.github.as_ref().ok_or_else(not_configured)
+/// The read rule for files whose current text a route would show: `files` are
+/// `(content-relative path, current text)`. A viewer without `edit` may read none that are
+/// sensitive (`403 forbidden`, recorded). An admin may, and each sensitive one is recorded
+/// first (`admin.content_sensitive_read`); if that can't be recorded, `502
+/// audit_unavailable` and nothing is shown.
+pub(super) async fn guard_reads(
+    state: &AppState,
+    signed: &Signed,
+    edit: Permission,
+    action: Action,
+    files: &[(String, Option<String>)],
+) -> Result<(), ApiError> {
+    let sensitive: Vec<(&str, Sensitive)> = files
+        .iter()
+        .filter_map(|(rel, text)| {
+            access::sensitive(rel, text.as_deref()).map(|s| (rel.as_str(), s))
+        })
+        .collect();
+    if sensitive.is_empty() {
+        return Ok(());
+    }
+    if !signed.member.allows(edit) {
+        tracing::info!(user = %signed.member.handle, action = action.as_str(), files = sensitive.len(), "sensitive read refused");
+        record_refusal(state, signed, action, "role", sensitive.len()).await;
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "This includes a PM's own file or restricted context: only an admin can open it.",
+        ));
+    }
+    for (rel, why) in sensitive {
+        let target = match why {
+            Sensitive::Personal => rel
+                .split('/')
+                .nth(2)
+                .map(|handle| format!("content:personal:{handle}")),
+            Sensitive::Restricted => None,
+        };
+        if let Err(e) = record(state, signed, SENSITIVE_READ, "ok", why.note(), 1, target).await {
+            tracing::warn!(error = ?e, "sensitive read not recorded: not served");
+            return Err(audit_unavailable());
+        }
+    }
+    Ok(())
+}
+
+/// Findings on files the viewer may not read lose their message (lint and parser messages can
+/// quote a file's values). An admin (`edit`) keeps every message.
+pub(super) fn redact(
+    issues: &mut [Issue],
+    content_root: &std::path::Path,
+    content_dir: &str,
+    edit: bool,
+) {
+    if edit {
+        return;
+    }
+    for i in issues.iter_mut() {
+        let Some(rel) = i
+            .path
+            .strip_prefix(content_dir)
+            .and_then(|r| r.strip_prefix('/'))
+        else {
+            continue;
+        };
+        if !access::may_read_on_disk(false, content_root, rel) {
+            i.message = access::REDACTED_MESSAGE.to_string();
+        }
+    }
 }
 
 /// Run file-system work (lint, generation, a scratch copy) off the async threads.
@@ -183,131 +337,109 @@ pub(super) fn check_meta(m: &Meta) -> Result<(String, String), ApiError> {
     Ok((title, reason))
 }
 
-fn github_error(e: GitHubError) -> ApiError {
-    tracing::warn!(error = %e, "GitHub call failed");
-    match e {
-        GitHubError::Unauthorized | GitHubError::Forbidden(_) => ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "github_refused",
-            "GitHub refused PM OS's token for this repository. Tell a platform owner: it needs contents and pull requests write.",
+/// `pmos-web`'s own sentence for a code the tool server answers a proposal with, and the
+/// extra fields of that answer the browser gets. `None`: not a code relayed as it is.
+fn relayed(code: &str) -> Option<(&'static str, &'static [&'static str])> {
+    Some(match code {
+        "forbidden" => ("Your role in PM OS doesn't allow this.", &[]),
+        "github_not_linked" => (
+            "Link your GitHub account to PM OS first (in Slack: the PM OS app's Home tab, Accounts). Pull requests are opened as you, so GitHub can require someone else's review.",
+            &[],
         ),
-        GitHubError::RateLimited(s) => ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "github_rate_limited",
-            format!("GitHub's rate limit was reached. Try again in {s} seconds."),
+        "stale_base" => (
+            "These files on the base branch differ from the deployed copy this change was made from. Wait for the deployment to catch up, or make the change in GitHub.",
+            &["paths", "base"],
         ),
-        GitHubError::NotFound(_) => ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "github_unavailable",
-            "GitHub couldn't find the repository or its base branch. Tell a platform owner.",
+        "invalid" => (
+            "This change doesn't pass validation; nothing was proposed.",
+            &["errors", "warnings"],
         ),
-        GitHubError::Invalid(_) | GitHubError::Unavailable(_) => ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "github_unavailable",
+        "policy_mismatch" => (
+            "The tool server regenerates different policy files from this change: the web app and the tool server run different content or code. Wait for both to deploy the same revision.",
+            &["paths"],
+        ),
+        "rate_limited" => (
+            "That's this hour's proposals for you. Try again later.",
+            &["retry_after"],
+        ),
+        "not_configured" => (
+            "Proposals aren't set up on the tool server (the GitHub App and the content repository). Reading and validating still work.",
+            &[],
+        ),
+        "no_change" => (
+            "Every file is the same as the deployed one: there's nothing to propose.",
+            &[],
+        ),
+        "bad_request" | "bad_path" | "path_not_allowed" | "not_text" | "not_found" => (
+            "The tool server refused a file in this change; nothing was proposed.",
+            &[],
+        ),
+        "too_large" => ("A file is over 256 KiB.", &[]),
+        "too_many_files" => ("This change has too many files.", &[]),
+        "audit_unavailable" => (
+            "PM OS couldn't record this proposal in the audit log, so it wasn't opened. Try again in a minute.",
+            &[],
+        ),
+        "github_refused" => (
+            "GitHub refused your account for this repository: it needs write access to it (contents and pull requests). Nothing was opened.",
+            &[],
+        ),
+        "github_unavailable" => (
             "GitHub didn't take this proposal. Try again in a minute.",
+            &[],
         ),
+        "github_rate_limited" => (
+            "GitHub's rate limit was reached. Try again in a few minutes.",
+            &["retry_after"],
+        ),
+        _ => return None,
+    })
+}
+
+/// The tool server's answer to a proposal, as the browser gets it.
+fn relay(status: u16, body: Value) -> ApiResult {
+    if status == 201 {
+        return Ok((StatusCode::CREATED, Json(body)).into_response());
     }
-}
-
-/// Record a proposal stage at the tool server, for `signed`.
-async fn record(
-    state: &AppState,
-    signed: &Signed,
-    kind: Kind,
-    stage: &str,
-    paths: &[String],
-    base: &str,
-    pr: Option<u64>,
-) -> Result<(), UpstreamError> {
-    let repo = state
-        .0
-        .proposals
-        .github
-        .as_ref()
-        .map(|g| g.repo().to_string())
-        .unwrap_or_default();
-    signed
-        .toolserver(state)
-        .admin_record(
-            &signed.member.handle,
-            "proposals",
-            &json!({
-                "kind": kind.as_str(),
-                "stage": stage,
-                "paths": paths,
-                "repo": repo,
-                "base": base,
-                "pr": pr,
-            }),
-        )
-        .await
-        .map(|_| ())
-}
-
-/// The pull request's body: who proposed it (their PM OS handle, in code so GitHub notifies
-/// nobody), the reason (fenced, so it can't format or mention), the base, what the sandboxes
-/// gain and lose, and the files.
-/// The base a proposal is made on: the branch, its head commit, and the server's own
-/// content revision when known.
-struct Base<'a> {
-    branch: &'a str,
-    commit: &'a str,
-    revision: Option<&'a str>,
-}
-
-fn body(
-    kind: Kind,
-    handle: &str,
-    reason: &str,
-    base: &Base,
-    e: &Evaluation,
-    files: &[String],
-) -> String {
-    let (base_branch, base_commit, revision) = (base.branch, base.commit, base.revision);
-    let mut b = format!(
-        "<!-- pmos-proposal kind={} by={handle} base={base_commit} -->\n\
-         **Proposed in PM OS by `{handle}`** (their PM OS handle; this pull request's GitHub author is the PM OS token).\n\n\
-         ### Reason\n\n```text\n{}\n```\n\n\
-         ### Base\n\n`{base_branch}` at `{base_commit}`. The PM OS server computed this change from its deployed content{}.\n\n",
-        kind.as_str(),
-        reason.replace("```", "'''"),
-        match revision {
-            Some(r) => format!(" at `{r}`"),
-            None => " (revision unknown)".into(),
-        },
-    );
-    b.push_str("### What changes in the sandboxes\n\n");
-    if e.allowance_changes.is_empty() {
-        b.push_str("No sandbox policy allowance changes.\n");
-    } else {
-        if e.widening {
-            b.push_str("**This widens what a sandbox may do.** A network change needs a second platform owner's review (POL-2, `policies/README.md`).\n\n");
-        }
-        for c in &e.allowance_changes {
-            let mark = match c.direction {
-                "wider" => "WIDER",
-                "narrower" => "narrower",
-                _ => "CHANGED",
-            };
-            b.push_str(&format!(
-                "- **{mark}**: {}\n",
-                proposals::clean_line(&c.description, 300).replace('`', "'")
-            ));
+    let code = body.get("code").and_then(Value::as_str).unwrap_or_default();
+    let Some((sentence, extras)) = relayed(code) else {
+        tracing::warn!(status, code, "the tool server refused a proposal");
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "upstream_unavailable",
+            "The tool server refused this. If it keeps happening, tell a platform owner.",
+        ));
+    };
+    let status = StatusCode::from_u16(status)
+        .ok()
+        .filter(|s| s.is_client_error() || s.is_server_error())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let extra: serde_json::Map<String, Value> = extras
+        .iter()
+        .filter_map(|k| body.get(*k).map(|v| (k.to_string(), v.clone())))
+        .collect();
+    let retry = body.get("retry_after").and_then(Value::as_u64);
+    let mut res = coded(status, code, sentence, Value::Object(extra));
+    if let Some(secs) = retry {
+        if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+            res.headers_mut().insert(header::RETRY_AFTER, v);
         }
     }
-    b.push_str("\n### Files\n\n");
-    for f in files {
-        b.push_str(&format!("- `{f}`\n"));
-    }
-    b.push_str(
-        "\nGenerated policy files are regenerated by PM OS with the same code as `pmos policy generate`; CI's `pmos policy check` runs on this pull request as on any other.\n\n\
-         PM OS never merges: a person reviews and merges this in GitHub.\n",
-    );
-    proposals::clean_text(&b, proposals::MAX_BODY)
+    Ok(res)
 }
 
-/// Open a pull request for a validated change (see the module docs). `content` is what the
-/// admin changed (content-relative); the regenerated policy files come from `e`.
+/// The deployed content's commit, when known: what the change was computed from.
+fn content_revision(state: &AppState) -> Value {
+    crate::content_admin::revision(
+        &state.0.content_root,
+        state.0.proposals.config.content_revision.as_deref(),
+    )["commit"]
+        .clone()
+}
+
+/// Send a validated change to the tool server to open as a pull request (see the module
+/// docs). `content` is what the admin changed (content-relative); the regenerated policy
+/// files come from `e`.
 pub(super) async fn open(
     state: &AppState,
     signed: &Signed,
@@ -317,222 +449,94 @@ pub(super) async fn open(
     content: &[Change],
     e: &Evaluation,
 ) -> ApiResult {
-    let gh = github(state)?;
     let cfg = &state.0.proposals.config;
+    let files = pmos_policy::admin::changeset::proposed_files(&cfg.layout, content, e);
+    let body = json!({
+        "kind": kind.as_str(),
+        "title": title,
+        "reason": reason,
+        "base_sha": content_revision(state),
+        "changes": files,
+    });
     let handle = signed.member.handle.as_str();
-    let mut files: Vec<FileWrite> = content
-        .iter()
-        .map(|c| FileWrite {
-            path: proposals::repo_path(&cfg.content_dir, &c.rel),
-            text: c.text.clone(),
-        })
-        .collect();
-    files.extend(e.policy_writes.iter().map(|(rel, text)| FileWrite {
-        path: proposals::repo_path(&cfg.policies_dir, rel),
-        text: text.clone(),
-    }));
-    let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
-
-    let base_branch = match &cfg.github.as_ref().and_then(|g| g.base.clone()) {
-        Some(b) => b.clone(),
-        None => gh.default_branch().await.map_err(github_error)?,
-    };
-    let head = gh.head(&base_branch).await.map_err(github_error)?;
-    let blobs = gh.blobs(&head.tree).await.map_err(github_error)?;
-    let stale_check = if blobs.truncated {
-        tracing::warn!(user = %handle, "GitHub truncated the base tree: stale-base check skipped");
-        "skipped"
-    } else {
-        let stale: Vec<&String> = e
-            .base_texts
-            .iter()
-            .filter(|(path, old)| {
-                blobs.by_path.get(*path).map(String::as_str)
-                    != old
-                        .as_ref()
-                        .map(|t| proposals::git_blob_sha(t.as_bytes()))
-                        .as_deref()
-            })
-            .map(|(p, _)| p)
-            .collect();
-        if !stale.is_empty() {
-            tracing::info!(user = %handle, kind = kind.as_str(), files = stale.len(), "proposal refused: stale base");
-            return Ok(coded(
-                StatusCode::CONFLICT,
-                "stale_base",
-                "These files on the base branch differ from the server's deployed copy this change was made from. Wait for the deployment to catch up, or make the change in GitHub.",
-                json!({"paths": stale, "base": {"branch": base_branch, "commit": head.commit}}),
+    let (status, answer) = match signed.toolserver(state).open_proposal(handle, &body).await {
+        Ok(v) => v,
+        Err(UpstreamError::Unknown { why, .. }) => {
+            tracing::warn!(why = %why, "proposal sent; the answer was lost");
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "unknown_outcome",
+                "The proposal was sent, but the answer was lost. Reload the proposals list to see whether it opened.",
             ));
         }
-        "passed"
+        Err(e) => return Err(ApiError::upstream(e)),
     };
+    let pr = answer.get("number").and_then(|n| n.as_u64());
+    tracing::info!(user = %handle, kind = kind.as_str(), files = files.len(), status, pr = ?pr, "proposal sent to the tool server");
+    relay(status, answer)
+}
 
-    if let Err(wait) = state.0.proposals.limiter.take(handle, now(state)) {
-        tracing::info!(user = %handle, "proposal refused: rate limit");
-        let mut res = ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
-            format!(
-                "That's {} proposals this hour. Try again in {} minutes.",
-                cfg.proposals_per_hour,
-                wait.div_ceil(60)
-            ),
-        )
-        .into_response();
-        if let Ok(v) = HeaderValue::from_str(&wait.to_string()) {
-            res.headers_mut().insert(header::RETRY_AFTER, v);
+/// `GET …/proposals`: open pull requests this feature made for `kind`, read by the tool server
+/// with the viewer's own linked GitHub account. Without one, an empty list that says so.
+pub(super) async fn list(state: &AppState, signed: &Signed, kind: Kind) -> ApiResult {
+    let handle = signed.member.handle.as_str();
+    let (status, v) = signed
+        .toolserver(state)
+        .admin_raw(handle, "proposals", &[("kind", kind.as_str())])
+        .await
+        .map_err(ApiError::upstream)?;
+    match status {
+        200 => {
+            let linked = v.get("github").and_then(Value::as_str) != Some("not_linked");
+            tracing::info!(user = %handle, kind = kind.as_str(), linked, "admin read proposals");
+            Ok(Json(json!({
+                "repo": v.get("repo"),
+                "github": if linked { "linked" } else { "not_linked" },
+                "message": (!linked).then_some(
+                    "Link your GitHub account to PM OS to see open proposals (in Slack: the PM OS app's Home tab, Accounts). They are read from GitHub as you."
+                ),
+                "proposals": v.get("proposals").cloned().unwrap_or(json!([])),
+            }))
+            .into_response())
         }
-        return Ok(res);
-    }
-
-    if let Err(e) = record(state, signed, kind, "started", &paths, &head.commit, None).await {
-        tracing::warn!(error = ?e, "proposal not recorded: nothing was written to GitHub");
-        return Err(match e {
-            UpstreamError::Refused { status: 403, .. } => forbidden(),
-            _ => ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                "audit_unavailable",
-                "PM OS couldn't record this proposal in the audit log, so it wasn't opened. Try again in a minute.",
-            ),
-        });
-    }
-
-    let branch = proposals::branch_name(kind, handle, now(state));
-    let full_title = format!("PM OS {}: {title}", kind.as_str());
-    let message = format!("{full_title}\n\nProposed in PM OS by {handle}.");
-    let pr_body = body(
-        kind,
-        handle,
-        reason,
-        &Base {
-            branch: &base_branch,
-            commit: &head.commit,
-            revision: cfg.content_revision.as_deref(),
-        },
-        e,
-        &paths,
-    );
-    let opened = async {
-        let commit = gh.commit(&head, &message, &files).await?;
-        gh.create_branch(&branch, &commit).await?;
-        gh.open_pull(&full_title, &branch, &base_branch, &pr_body)
-            .await
-    }
-    .await;
-    let (number, url) = match opened {
-        Ok(v) => v,
-        Err(err) => {
-            if let Err(e) = record(state, signed, kind, "failed", &paths, &head.commit, None).await
-            {
-                tracing::warn!(error = ?e, "proposal failure not recorded");
-            }
-            return Err(github_error(err));
+        403 => Err(forbidden()),
+        _ => {
+            // Not configured, or GitHub refused or failed: the same codes as a proposal.
+            relay(status, v)
         }
-    };
-    let labels_added = match gh
-        .add_labels(number, &[proposals::LABEL, kind.label()])
+    }
+}
+
+/// Whether the tool server could verify branch protection on the base branch with the
+/// viewer's own account, and whether proposals are set up there. Best effort: anything that
+/// goes wrong is `verified: false`, never an error.
+pub(super) async fn protection(state: &AppState, signed: &Signed) -> (Value, bool) {
+    let unknown = json!({"required_reviews": null, "verified": false});
+    match signed
+        .toolserver(state)
+        .admin(&signed.member.handle, "protection", &[])
         .await
     {
-        Ok(()) => true,
-        Err(err) => {
-            tracing::warn!(error = %err, pr = number, "labels not added");
-            false
+        Ok(v) => {
+            let configured = v
+                .get("configured")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let reviews = v.get("required_reviews").and_then(Value::as_u64);
+            let verified = v.get("verified").and_then(Value::as_bool).unwrap_or(false);
+            (
+                json!({
+                    "branch": v.get("branch"),
+                    "required_reviews": reviews,
+                    "verified": verified,
+                    "github": v.get("github"),
+                }),
+                configured,
+            )
         }
-    };
-    if let Err(e) = record(
-        state,
-        signed,
-        kind,
-        "opened",
-        &paths,
-        &head.commit,
-        Some(number),
-    )
-    .await
-    {
-        tracing::warn!(error = ?e, pr = number, "proposal opening not recorded");
-    }
-    tracing::info!(user = %handle, kind = kind.as_str(), files = paths.len(), pr = number, "proposal opened");
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({
-            "number": number,
-            "url": url,
-            "branch": branch,
-            "base": {"branch": base_branch, "commit": head.commit},
-            "files": paths,
-            "widening": e.widening,
-            "allowance_changes": e.allowance_changes,
-            "stale_check": stale_check,
-            "labels_added": labels_added,
-        })),
-    )
-        .into_response())
-}
-
-/// The `key=value` pairs of a body's first-line marker.
-fn marker(body: &str) -> BTreeMap<String, String> {
-    let Some(rest) = body
-        .lines()
-        .next()
-        .and_then(|l| l.trim().strip_prefix("<!-- pmos-proposal "))
-        .and_then(|l| l.strip_suffix("-->"))
-    else {
-        return BTreeMap::new();
-    };
-    rest.split_whitespace()
-        .filter_map(|kv| kv.split_once('='))
-        .filter(|(_, v)| {
-            v.len() <= 64
-                && v.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        })
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-}
-
-/// `GET …/proposals`: open pull requests this feature made for `kind` (by branch prefix or
-/// label).
-pub(super) async fn list(state: &AppState, signed: &Signed, kind: Kind) -> ApiResult {
-    let gh = github(state)?;
-    let pulls = gh.open_pulls().await.map_err(github_error)?;
-    let prefix = format!("{}{}/", proposals::BRANCH_PREFIX, kind.as_str());
-    let items: Vec<Value> = pulls
-        .into_iter()
-        .filter(|p| p.branch.starts_with(&prefix) || p.labels.iter().any(|l| l == kind.label()))
-        .map(|p| {
-            let m = marker(&p.body);
-            json!({
-                "number": p.number,
-                "url": p.url,
-                "title": p.title,
-                "branch": p.branch,
-                "base": p.base,
-                "status": if p.draft { "draft" } else { "open" },
-                "proposed_by": m.get("by"),
-                "base_commit": m.get("base"),
-                "author": p.author,
-                "labels": p.labels,
-                "created_at": p.created_at,
-                "updated_at": p.updated_at,
-            })
-        })
-        .collect();
-    tracing::info!(user = %signed.member.handle, kind = kind.as_str(), open = items.len(), "admin read proposals");
-    Ok(Json(json!({ "repo": gh.repo(), "proposals": items })).into_response())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn markers_are_read_strictly() {
-        let m = marker("<!-- pmos-proposal kind=policy by=adam base=abc123 -->\n**x**");
-        assert_eq!(m["by"], "adam");
-        assert_eq!(m["base"], "abc123");
-        let m = marker("<!-- pmos-proposal by=<script> -->");
-        assert!(m.is_empty());
-        assert!(marker("hello").is_empty());
+        Err(e) => {
+            tracing::warn!(error = ?e, "branch protection unknown");
+            (unknown, false)
+        }
     }
 }

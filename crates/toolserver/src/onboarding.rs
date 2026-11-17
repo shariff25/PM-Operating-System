@@ -170,6 +170,8 @@ pub struct Onboarding {
     oauth: Option<Arc<OAuth>>,
     github: Option<GitHubSetup>,
     sync: Option<Arc<ContentSync>>,
+    /// Admin policy and content proposals (`crate::proposals`), when turned on.
+    proposals: Option<crate::proposals::ProposalsSetup>,
     /// Held for each decision and removal.
     lock: tokio::sync::Mutex<()>,
 }
@@ -185,8 +187,31 @@ impl Onboarding {
             oauth,
             github,
             sync: None,
+            proposals: None,
             lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Turn admin proposals on: opened as pull requests in the content repository with the
+    /// acting admin's own GitHub token. Needs the GitHub setup with a content repository;
+    /// without one this changes nothing. `policies_root`: the checked-in policy files
+    /// (`None`: found beside the content checkout).
+    pub fn with_proposals(mut self, per_hour: u32, policies_root: Option<PathBuf>) -> Self {
+        self.proposals = self
+            .github
+            .as_ref()
+            .and_then(|gh| crate::proposals::ProposalsSetup::new(gh, per_hour, policies_root));
+        self
+    }
+
+    /// The proposals set-up, when proposals are on.
+    pub fn proposals(&self) -> Option<&crate::proposals::ProposalsSetup> {
+        self.proposals.as_ref()
+    }
+
+    /// Account linking, when live connectors are on.
+    pub fn oauth(&self) -> Option<&Arc<OAuth>> {
+        self.oauth.as_ref()
     }
 
     /// Pull and reload the content checkout right after each member commit.

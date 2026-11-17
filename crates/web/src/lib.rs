@@ -16,9 +16,11 @@
 //! - [`progress`]: a task's runtime events as the app shows them (milestones, progress,
 //!   retrying).
 //! - [`app`]: the router and the `/api` handlers.
-//! - [`admin_config`], [`policy_admin`], [`content_admin`], [`proposals`], [`github`]: the
-//!   admin policy and content screens, read-and-propose: a change is opened as a GitHub pull
-//!   request, never written in place (`docs/policy-admin.md`, `docs/content-admin.md`).
+//! - [`admin_config`], [`policy_admin`], [`content_admin`], [`proposals`]: the admin policy
+//!   and content screens, read-and-propose: a change is validated here and sent to the tool
+//!   server, which checks it again and opens a GitHub pull request with the admin's own linked
+//!   GitHub account. `pmos-web` holds no GitHub token (`docs/policy-admin.md`,
+//!   `docs/content-admin.md`).
 //!
 //! Security notes, and what is not built, are in `crates/web/README.md`.
 
@@ -30,7 +32,6 @@ pub mod content_admin;
 pub mod drafts;
 pub mod entra;
 pub mod followups;
-pub mod github;
 pub mod pg;
 pub mod policy_admin;
 pub mod progress;

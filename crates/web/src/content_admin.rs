@@ -13,26 +13,9 @@ use serde_json::{json, Value};
 
 use crate::proposals::{self, repo_path, Issue};
 
-/// What a file in the content tree is.
-pub fn kind(rel: &str) -> &'static str {
-    let parts: Vec<&str> = rel.split('/').collect();
-    match parts.as_slice() {
-        ["team.yaml"] => "team",
-        ["tools.yaml"] => "tools",
-        ["master", "AGENTS.md"] => "master",
-        ["master", "people", _, "AGENTS.md"] => "personal_master",
-        ["roles", _, "ROLE.md"] => "role",
-        ["bots", _, "BOT.md"] => "bot",
-        ["skills", _, "SKILL.md"] => "skill",
-        ["skills", _, ..] => "skill_file",
-        [.., "README.md"] => "readme",
-        ["playbooks", _] => "playbook",
-        ["templates", _] => "template",
-        ["reviewers", _] => "reviewer",
-        ["context", ..] => "context",
-        _ => "other",
-    }
-}
+/// What a file is, and who may open it: the one rule the tool server shares
+/// (`pmos_policy::admin::access`).
+pub use pmos_policy::admin::access::{auditor_may_read, kind};
 
 /// Loose front matter, for metadata: `None` if the file has none or it doesn't parse.
 fn front_matter(text: &str) -> Option<serde_norway::Value> {
@@ -51,12 +34,6 @@ fn fm_str(fm: Option<&serde_norway::Value>, keys: &[&str]) -> Option<String> {
         serde_norway::Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }
-}
-
-/// Files an auditor sees listed but may not open: a PM's personal master file, and context
-/// marked `restricted`. An admin opens everything.
-pub fn auditor_may_read(kind: &str, sensitivity: Option<&str>) -> bool {
-    kind != "personal_master" && sensitivity != Some("restricted")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,6 +134,14 @@ pub fn tree(
         } else {
             (fm_str(fm, &["version"]), fm_str(fm, &["owner"]))
         };
+        let readable = admin || auditor_may_read(k, sensitivity.as_deref());
+        let mut issues = by_path.remove(&rel).unwrap_or_default();
+        if !readable {
+            // Lint and parser messages can quote a file's values.
+            for i in &mut issues {
+                i.message = pmos_policy::admin::access::REDACTED_MESSAGE.to_string();
+            }
+        }
         out.push(Entry {
             path: repo_path(content_dir, &rel),
             kind: k,
@@ -166,10 +151,10 @@ pub fn tree(
             owner: owner.map(|o| o.trim_start_matches('@').to_string()),
             last_reviewed: fm_str(fm, &["last-reviewed"]),
             editable: proposals::writable(&rel).is_ok(),
-            readable: admin || auditor_may_read(k, sensitivity.as_deref()),
+            readable,
             sensitivity,
             size,
-            lint: status(by_path.remove(&rel).unwrap_or_default()),
+            lint: status(issues),
         });
     }
     let other = by_path.into_values().flatten().collect();
@@ -389,27 +374,6 @@ pub fn lint_summary(report: &Report) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn kinds() {
-        assert_eq!(kind("skills/docs/SKILL.md"), "skill");
-        assert_eq!(kind("skills/docs/examples.md"), "skill_file");
-        assert_eq!(kind("roles/docs-helper/ROLE.md"), "role");
-        assert_eq!(kind("bots/docs/BOT.md"), "bot");
-        assert_eq!(kind("context/products/x.md"), "context");
-        assert_eq!(kind("context/products/README.md"), "readme");
-        assert_eq!(kind("master/people/ana/AGENTS.md"), "personal_master");
-        assert_eq!(kind("playbooks/bar.md"), "playbook");
-        assert_eq!(kind("team.yaml"), "team");
-    }
-
-    #[test]
-    fn auditors_dont_open_personal_or_restricted_files() {
-        assert!(auditor_may_read("skill", None));
-        assert!(auditor_may_read("context", Some("internal")));
-        assert!(!auditor_may_read("context", Some("restricted")));
-        assert!(!auditor_may_read("personal_master", None));
-    }
 
     #[test]
     fn the_gateway_config_gives_names_only() {

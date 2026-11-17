@@ -1,50 +1,48 @@
 //! Configuration for the admin policy and content screens (`docs/policy-admin.md`,
 //! `docs/content-admin.md`), from environment variables, checked at start-up.
 //!
-//! Everything is optional. Without GitHub (`PMOS_WEB_GITHUB_REPO` and `PMOS_WEB_GITHUB_TOKEN`)
-//! the screens still read and validate; only the proposal routes answer
-//! `501 {"code":"not_configured"}`.
+//! `pmos-web` holds **no GitHub token**. It reads the deployed content and policies from disk,
+//! validates a proposed change interactively, and sends the change set to the tool server,
+//! which checks it again and opens the pull request with the acting admin's own linked GitHub
+//! account (`docs/policy-admin.md`, How a proposal is opened). The settings that configured a
+//! token here are refused at start-up, so a forgotten one can't linger.
 
 use std::path::{Path, PathBuf};
 
-/// The proposals one admin may open per hour, by default.
-pub const DEFAULT_PROPOSALS_PER_HOUR: u32 = 10;
-/// GitHub's public API.
-pub const DEFAULT_GITHUB_API: &str = "https://api.github.com";
+use pmos_policy::admin::changeset::Layout;
 
-/// Where pull requests go, and as whom.
-#[derive(Clone)]
-pub struct GitHubConfig {
-    /// `PMOS_WEB_GITHUB_REPO`: `owner/name`.
-    pub repo: String,
-    /// `PMOS_WEB_GITHUB_TOKEN`: contents write and pull requests write on that one repository.
-    /// Never logged; `Debug` redacts it.
-    pub token: String,
-    /// `PMOS_WEB_GITHUB_API`, default `https://api.github.com`, no trailing slash. `https`
-    /// unless the host is loopback (tests).
-    pub api: String,
-    /// `PMOS_WEB_GITHUB_BASE`: the branch proposals target. `None`: the repository's default
-    /// branch, asked for on each proposal.
-    pub base: Option<String>,
-    /// `PMOS_WEB_GITHUB_CONTENT_DIR`, default `content`: where the content tree is in the
-    /// repository (empty for the repository root).
-    pub content_dir: String,
-    /// `PMOS_WEB_GITHUB_POLICIES_DIR`, default `policies`: where `pmos policy generate` writes.
-    pub policies_dir: String,
-}
-
-impl std::fmt::Debug for GitHubConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GitHubConfig")
-            .field("repo", &self.repo)
-            .field("token", &"<redacted>")
-            .field("api", &self.api)
-            .field("base", &self.base)
-            .field("content_dir", &self.content_dir)
-            .field("policies_dir", &self.policies_dir)
-            .finish()
-    }
-}
+/// Settings that existed when `pmos-web` opened pull requests itself, and where each went.
+/// Any of them set refuses start-up.
+pub const REMOVED: [(&str, &str); 7] = [
+    (
+        "PMOS_WEB_GITHUB_TOKEN",
+        "pmos-web holds no GitHub token: the tool server opens proposals with the admin's own linked GitHub account; delete the token",
+    ),
+    (
+        "PMOS_WEB_GITHUB_REPO",
+        "the tool server's PMOS_CONTENT_REPO is the repository proposals go to",
+    ),
+    (
+        "PMOS_WEB_GITHUB_API",
+        "the tool server's PMOS_GITHUB_URL is the GitHub API it calls",
+    ),
+    (
+        "PMOS_WEB_GITHUB_BASE",
+        "the tool server's PMOS_CONTENT_BRANCH is the branch proposals target",
+    ),
+    (
+        "PMOS_WEB_PROPOSALS_PER_HOUR",
+        "the tool server's PMOS_PROPOSALS_PER_HOUR limits proposals now",
+    ),
+    (
+        "PMOS_WEB_GITHUB_CONTENT_DIR",
+        "renamed PMOS_WEB_CONTENT_DIR",
+    ),
+    (
+        "PMOS_WEB_GITHUB_POLICIES_DIR",
+        "renamed PMOS_WEB_POLICIES_DIR",
+    ),
+];
 
 #[derive(Clone, Debug)]
 pub struct AdminConfig {
@@ -57,13 +55,11 @@ pub struct AdminConfig {
     /// `PMOS_WEB_CONTENT_REVISION`: the commit the deployed content is from, when the content
     /// root has no `.git` to read it from (a container image).
     pub content_revision: Option<String>,
-    /// The repository proposals go to. `None`: proposals answer `501 not_configured`.
-    pub github: Option<GitHubConfig>,
-    /// `PMOS_WEB_PROPOSALS_PER_HOUR`, default 10, 1 to 100: per admin, in memory.
-    pub proposals_per_hour: u32,
-    /// The repository paths, for showing files even when GitHub isn't configured.
-    pub content_dir: String,
-    pub policies_dir: String,
+    /// `PMOS_WEB_CONTENT_DIR` (default `content`) and `PMOS_WEB_POLICIES_DIR` (default
+    /// `policies`): where those trees are in the repository. Neither may be the repository
+    /// root, nor inside the other ([`Layout::new`]); they must match the tool server's
+    /// `PMOS_CONTENT_DIR` and `PMOS_POLICIES_DIR`, which it checks again.
+    pub layout: Layout,
 }
 
 impl Default for AdminConfig {
@@ -72,10 +68,7 @@ impl Default for AdminConfig {
             policies_root: None,
             gateway_config: None,
             content_revision: None,
-            github: None,
-            proposals_per_hour: DEFAULT_PROPOSALS_PER_HOUR,
-            content_dir: "content".into(),
-            policies_dir: "policies".into(),
+            layout: Layout::new("content", "policies").expect("the default layout is valid"),
         }
     }
 }
@@ -94,17 +87,15 @@ impl AdminConfig {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
+        for (name, why) in REMOVED {
+            // The value is never echoed.
+            if set(name).is_some() {
+                return Err(format!("{name} is no longer used: {why}."));
+            }
+        }
         let policies_root = match set("PMOS_WEB_POLICIES_ROOT") {
             Some(p) => Some(PathBuf::from(p)),
             None => default_policies_root(content_root),
-        };
-        let proposals_per_hour = match set("PMOS_WEB_PROPOSALS_PER_HOUR") {
-            None => DEFAULT_PROPOSALS_PER_HOUR,
-            Some(v) => v
-                .parse::<u32>()
-                .ok()
-                .filter(|n| (1..=100).contains(n))
-                .ok_or("PMOS_WEB_PROPOSALS_PER_HOUR must be a whole number from 1 to 100")?,
         };
         let content_revision = set("PMOS_WEB_CONTENT_REVISION")
             .map(|r| {
@@ -115,72 +106,18 @@ impl AdminConfig {
                 }
             })
             .transpose()?;
-        let repo_dir = |k: &str, default: &str| -> Result<String, String> {
-            let v = get(k)
-                .map(|v| v.trim().trim_matches('/').to_string())
-                .unwrap_or_else(|| default.to_string());
-            if v.is_empty() || crate::proposals::safe_repo_path(&v) {
-                Ok(v)
-            } else {
-                Err(format!(
-                    "{k} must be a relative folder in the repository, such as `{default}`"
-                ))
-            }
-        };
-        let content_dir = repo_dir("PMOS_WEB_GITHUB_CONTENT_DIR", "content")?;
-        let policies_dir = repo_dir("PMOS_WEB_GITHUB_POLICIES_DIR", "policies")?;
-        if policies_dir.is_empty() {
-            return Err("PMOS_WEB_GITHUB_POLICIES_DIR can't be the repository root".into());
-        }
-        let repo = set("PMOS_WEB_GITHUB_REPO");
-        let token = set("PMOS_WEB_GITHUB_TOKEN");
-        let github = match (repo, token) {
-            (None, None) => None,
-            (Some(_), None) | (None, Some(_)) => {
-                return Err(
-                    "PMOS_WEB_GITHUB_REPO and PMOS_WEB_GITHUB_TOKEN must be set together".into(),
-                )
-            }
-            (Some(repo), Some(token)) => {
-                if !valid_repo(&repo) {
-                    return Err(format!(
-                        "PMOS_WEB_GITHUB_REPO must be `owner/name`, not `{repo}`"
-                    ));
-                }
-                if token.len() < 20 || token.chars().any(|c| c.is_whitespace() || c.is_control()) {
-                    // Never echo the value.
-                    return Err("PMOS_WEB_GITHUB_TOKEN doesn't look like a GitHub token".into());
-                }
-                let api = api_url(
-                    &set("PMOS_WEB_GITHUB_API").unwrap_or_else(|| DEFAULT_GITHUB_API.into()),
-                )?;
-                let base = set("PMOS_WEB_GITHUB_BASE")
-                    .map(|b| {
-                        if valid_branch(&b) {
-                            Ok(b)
-                        } else {
-                            Err(format!("PMOS_WEB_GITHUB_BASE: `{b}` is not a branch name"))
-                        }
-                    })
-                    .transpose()?;
-                Some(GitHubConfig {
-                    repo,
-                    token,
-                    api,
-                    base,
-                    content_dir: content_dir.clone(),
-                    policies_dir: policies_dir.clone(),
-                })
-            }
-        };
+        // Set but empty is the repository root, which is refused: not the default.
+        let dir = |k: &str, default: &str| get(k).unwrap_or_else(|| default.to_string());
+        let layout = Layout::new(
+            &dir("PMOS_WEB_CONTENT_DIR", "content"),
+            &dir("PMOS_WEB_POLICIES_DIR", "policies"),
+        )
+        .map_err(|why| format!("PMOS_WEB_CONTENT_DIR, PMOS_WEB_POLICIES_DIR: {why}"))?;
         Ok(Self {
             policies_root,
             gateway_config: set("PMOS_WEB_GATEWAY_CONFIG").map(PathBuf::from),
             content_revision,
-            github,
-            proposals_per_hour,
-            content_dir,
-            policies_dir,
+            layout,
         })
     }
 }
@@ -198,65 +135,6 @@ pub fn default_policies_root(content_root: &Path) -> Option<PathBuf> {
 
 pub fn is_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-/// `owner/name`: an owner of letters, digits and single hyphens (at most 39), and a name of
-/// letters, digits, `.`, `_` and `-` (at most 100, not `.` or `..`).
-pub fn valid_repo(full: &str) -> bool {
-    let Some((owner, name)) = full.split_once('/') else {
-        return false;
-    };
-    let owner_ok = !owner.is_empty()
-        && owner.len() <= 39
-        && !owner.starts_with('-')
-        && !owner.ends_with('-')
-        && !owner.contains("--")
-        && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-    owner_ok
-        && !name.is_empty()
-        && name.len() <= 100
-        && name != "."
-        && name != ".."
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
-/// A branch name PM OS is willing to use: letters, digits, `-_./`, no `..`, no leading or
-/// trailing `/`, at most 200.
-pub fn valid_branch(b: &str) -> bool {
-    !b.is_empty()
-        && b.len() <= 200
-        && b.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
-        && !b.contains("..")
-        && !b.contains("//")
-        && !b.starts_with('/')
-        && !b.ends_with('/')
-        && !b.ends_with(".lock")
-}
-
-/// An API base: `https`, or `http` to a loopback host only (tests), with no query.
-fn api_url(value: &str) -> Result<String, String> {
-    let url = reqwest::Url::parse(value).map_err(|e| format!("PMOS_WEB_GITHUB_API: {e}"))?;
-    let host = url.host_str().unwrap_or_default();
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
-    let ok = match url.scheme() {
-        "https" => !host.is_empty(),
-        "http" => loopback,
-        _ => false,
-    };
-    if !ok || url.query().is_some() || !url.username().is_empty() || url.password().is_some() {
-        return Err(
-            "PMOS_WEB_GITHUB_API must be an https URL (http only to a loopback host)".into(),
-        );
-    }
-    Ok(value.trim_end_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -281,88 +159,55 @@ mod tests {
     #[test]
     fn everything_is_optional() {
         let c = AdminConfig::from_lookup(lookup(&[]), Path::new("/nonexistent")).unwrap();
-        assert!(c.github.is_none() && c.policies_root.is_none());
-        assert_eq!(c.proposals_per_hour, DEFAULT_PROPOSALS_PER_HOUR);
+        assert!(c.policies_root.is_none() && c.gateway_config.is_none());
         assert_eq!(
-            (c.content_dir.as_str(), c.policies_dir.as_str()),
+            (c.layout.content_dir(), c.layout.policies_dir()),
             ("content", "policies")
         );
     }
 
     #[test]
-    fn github_needs_both_and_redacts_the_token() {
+    fn the_github_token_and_its_settings_are_refused() {
         let root = Path::new("/nonexistent");
-        assert!(
-            AdminConfig::from_lookup(lookup(&[("PMOS_WEB_GITHUB_REPO", "acme/pmos")]), root)
-                .is_err()
-        );
-        let err = AdminConfig::from_lookup(lookup(&[("PMOS_WEB_GITHUB_TOKEN", TOKEN)]), root)
-            .unwrap_err();
-        assert!(!err.contains(TOKEN));
+        for (name, _) in REMOVED {
+            let value = if name == "PMOS_WEB_GITHUB_TOKEN" {
+                TOKEN
+            } else {
+                "x"
+            };
+            let err = AdminConfig::from_lookup(lookup(&[(name, value)]), root).unwrap_err();
+            assert!(err.contains(name), "{err}");
+            assert!(!err.contains(TOKEN), "the token is never echoed");
+        }
+    }
+
+    #[test]
+    fn the_repository_root_is_never_the_content_or_policies_folder() {
+        let root = Path::new("/nonexistent");
+        for (k, v) in [
+            ("PMOS_WEB_CONTENT_DIR", ""),
+            ("PMOS_WEB_CONTENT_DIR", "/"),
+            ("PMOS_WEB_CONTENT_DIR", "."),
+            ("PMOS_WEB_POLICIES_DIR", ""),
+            ("PMOS_WEB_CONTENT_DIR", "../x"),
+            ("PMOS_WEB_POLICIES_DIR", "content/policies"),
+        ] {
+            assert!(
+                AdminConfig::from_lookup(lookup(&[(k, v)]), root).is_err(),
+                "{k}={v:?}"
+            );
+        }
         let c = AdminConfig::from_lookup(
             lookup(&[
-                ("PMOS_WEB_GITHUB_REPO", "acme/pmos"),
-                ("PMOS_WEB_GITHUB_TOKEN", TOKEN),
-                ("PMOS_WEB_GITHUB_BASE", "main"),
+                ("PMOS_WEB_CONTENT_DIR", "pmos/content"),
+                ("PMOS_WEB_POLICIES_DIR", "pmos/policies"),
             ]),
             root,
         )
         .unwrap();
-        let g = c.github.as_ref().unwrap();
-        assert_eq!(g.api, DEFAULT_GITHUB_API);
-        assert_eq!(g.base.as_deref(), Some("main"));
-        let debug = format!("{c:?}");
-        assert!(!debug.contains(TOKEN) && debug.contains("<redacted>"));
-        let err = AdminConfig::from_lookup(
-            lookup(&[
-                ("PMOS_WEB_GITHUB_REPO", "acme/pmos"),
-                ("PMOS_WEB_GITHUB_TOKEN", "short"),
-            ]),
-            root,
-        )
-        .unwrap_err();
-        assert!(!err.contains("short"));
-    }
-
-    #[test]
-    fn the_api_is_https_unless_loopback() {
-        let root = Path::new("/nonexistent");
-        let with = |api: &str| {
-            AdminConfig::from_lookup(
-                lookup(&[
-                    ("PMOS_WEB_GITHUB_REPO", "acme/pmos"),
-                    ("PMOS_WEB_GITHUB_TOKEN", TOKEN),
-                    ("PMOS_WEB_GITHUB_API", api),
-                ]),
-                root,
-            )
-        };
-        assert!(with("http://127.0.0.1:9999/").is_ok());
-        assert!(with("http://localhost:9999").is_ok());
-        assert!(with("https://github.example.com/api/v3").is_ok());
-        assert!(with("http://github.example.com").is_err());
-        assert!(with("ftp://127.0.0.1").is_err());
-        assert!(with("https://user:pw@github.example.com").is_err());
-    }
-
-    #[test]
-    fn names_are_checked() {
-        assert!(valid_repo("acme/pm-os.content"));
-        assert!(!valid_repo("acme"));
-        assert!(!valid_repo("acme/.."));
-        assert!(!valid_repo("-acme/x"));
-        assert!(!valid_repo("acme/a b"));
-        assert!(valid_branch("main") && valid_branch("release/2026-11"));
-        for bad in ["", "/main", "main/", "a..b", "a b", "x.lock", "a//b"] {
-            assert!(!valid_branch(bad), "{bad}");
-        }
-        let root = Path::new("/nonexistent");
+        assert_eq!(c.layout.content_dir(), "pmos/content");
         assert!(
-            AdminConfig::from_lookup(lookup(&[("PMOS_WEB_GITHUB_CONTENT_DIR", "../x")]), root)
-                .is_err()
-        );
-        assert!(
-            AdminConfig::from_lookup(lookup(&[("PMOS_WEB_PROPOSALS_PER_HOUR", "0")]), root)
+            AdminConfig::from_lookup(lookup(&[("PMOS_WEB_CONTENT_REVISION", "abc")]), root)
                 .is_err()
         );
     }

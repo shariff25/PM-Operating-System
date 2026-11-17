@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
     let team = Team::load(&config.content_root, live).map_err(anyhow::Error::msg)?;
 
     let mut github_setup = None;
+    let mut proposals = None;
     let (connectors, oauth): (Vec<Arc<dyn Connector>>, Option<Arc<OAuth>>) = match &config
         .connectors
     {
@@ -137,6 +138,7 @@ async fn main() -> Result<()> {
                     content_repo = gh.content_repo.as_deref().unwrap_or("none"),
                     "GitHub linking on"
                 );
+                proposals = gh.proposals.clone();
                 github_setup = Some(GitHubSetup {
                     github,
                     org: gh.org.clone(),
@@ -202,6 +204,16 @@ async fn main() -> Result<()> {
     spawn_reconciler(svc.clone(), cancel.clone());
     spawn_draft_sweeper(svc.clone(), cancel.clone());
     let mut onboarding = Onboarding::new(svc.clone(), oauth.clone(), github_setup);
+    match &proposals {
+        Some(p) => {
+            onboarding = onboarding.with_proposals(p.per_hour, p.policies_root.clone());
+            tracing::info!(
+                per_hour = p.per_hour,
+                "admin proposals on: opened as the acting admin, with their linked GitHub account"
+            );
+        }
+        None => tracing::info!("admin proposals off (PMOS_PROPOSALS, PMOS_CONTENT_REPO)"),
+    }
     if config.content_sync_secs > 0 {
         let sync = ContentSync::new(&config.content_root, svc.clone());
         sync.clone().spawn(
