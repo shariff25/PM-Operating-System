@@ -2,9 +2,14 @@
 //! lint CI runs (`pmos_contract::lint`). A tree with lint errors stops the runtime from
 //! starting, so a bad bot definition is caught before any task uses it.
 //!
+//! **Who may use a bot is not here.** Whether a person may ask bots at all comes from the user
+//! directory (`crate::people`, the tool server's `/internal/directory`), never from
+//! `team.yaml`; the catalog only knows each bot's scope ([`Catalog::may_use`]).
+//!
 //! **Reloading** (onboarding spec §5): every 30 seconds, [`Reloader`] checks a fingerprint of
-//! the files the catalog is built from (`team.yaml`, `tools.yaml`, `bots/**`, `roles/**` and
-//! `skills/**`: paths, sizes and modification times). If it changed, the tree is linted and
+//! the files the lint reads (`team.yaml`, which the lint's bot-owner check still reads until
+//! slice U7, `tools.yaml`, `bots/**`, `roles/**` and `skills/**`: paths, sizes and
+//! modification times). If it changed, the tree is linted and
 //! loaded again and the new catalog replaces the old one whole. A tree that fails the lint
 //! leaves the old catalog in place and logs the errors. A task already claimed keeps the bot,
 //! role and tools it was claimed with.
@@ -17,7 +22,7 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use pmos_contract::bots::{role_tools, ActionSetting, Bot, BotScope, Role};
-use pmos_contract::model::{TeamFile, ToolKind, ToolRegistry};
+use pmos_contract::model::{ToolKind, ToolRegistry};
 use pmos_contract::{lint, LintOptions, Skill};
 use serde::Serialize;
 
@@ -26,7 +31,6 @@ pub struct Catalog {
     roles: BTreeMap<String, Role>,
     skills: Vec<Skill>,
     registry: ToolRegistry,
-    team: TeamFile,
 }
 
 /// A bot as `GET /v1/bots` lists it.
@@ -76,16 +80,11 @@ impl Catalog {
             .map_err(|e| format!("{}: {e}", tools_path.display()))?;
         let registry =
             ToolRegistry::from_yaml(&text).map_err(|e| format!("{}: {e}", tools_path.display()))?;
-        let team = TeamFile::load(root)?;
-        if team.members.is_empty() {
-            tracing::warn!("team.yaml lists nobody: no one can use the team bots until it does");
-        }
         Ok(Self::from_parts(
             report.bots,
             report.roles,
             report.skills,
             registry,
-            team,
         ))
     }
 
@@ -95,14 +94,12 @@ impl Catalog {
         roles: Vec<Role>,
         skills: Vec<Skill>,
         registry: ToolRegistry,
-        team: TeamFile,
     ) -> Self {
         Self {
             bots: bots.into_iter().map(|b| (b.name.clone(), b)).collect(),
             roles: roles.into_iter().map(|r| (r.name.clone(), r)).collect(),
             skills,
             registry,
-            team,
         }
     }
 
@@ -112,17 +109,6 @@ impl Catalog {
 
     pub fn role(&self, bot: &Bot) -> Option<&Role> {
         self.roles.get(&bot.role)
-    }
-
-    pub fn is_member(&self, handle: &str) -> bool {
-        self.team.by_handle(handle).is_some()
-    }
-
-    /// Is `handle` an admin in `team.yaml`?
-    pub fn is_admin(&self, handle: &str) -> bool {
-        self.team
-            .by_handle(handle)
-            .is_some_and(|m| m.roles.contains(&pmos_contract::model::Role::Admin))
     }
 
     pub fn summaries(&self) -> Vec<BotSummary> {
@@ -167,8 +153,10 @@ impl Catalog {
         })
     }
 
-    /// May `handle` use `bot`? A personal bot serves its owner only; a team bot serves the
-    /// members of `team.yaml`. The error says why not, for the PM.
+    /// Does `bot`'s scope let `handle` use it? A personal bot serves its owner only; a team
+    /// bot serves anyone who may ask bots. Whether `handle` may ask bots at all is the
+    /// directory's ([`crate::people::may_ask`], which calls this after its own check). The
+    /// error says why not, for the PM.
     pub fn may_use(&self, handle: &str, bot: &Bot) -> Result<(), String> {
         match bot.scope {
             BotScope::Personal if bot.owner == handle => Ok(()),
@@ -176,11 +164,7 @@ impl Catalog {
                 "`{}` is {}'s personal bot; only they can use it",
                 bot.name, bot.owner
             )),
-            BotScope::Team if self.is_member(handle) => Ok(()),
-            BotScope::Team => Err(format!(
-                "`{handle}` isn't listed in team.yaml, so can't use the team bot `{}`",
-                bot.name
-            )),
+            BotScope::Team => Ok(()),
         }
     }
 }
@@ -188,7 +172,7 @@ impl Catalog {
 /// How often [`Reloader`] looks for a content change.
 pub const RELOAD_EVERY: Duration = Duration::from_secs(30);
 
-/// The files and folders under the content root the catalog is built from.
+/// The files and folders under the content root the lint reads to build the catalog.
 const WATCHED: [&str; 5] = ["team.yaml", "tools.yaml", "bots", "roles", "skills"];
 
 /// A fingerprint of the watched files: their paths, sizes and modification times. A file

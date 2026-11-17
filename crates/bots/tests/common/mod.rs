@@ -21,9 +21,9 @@ use pmos_bots::pg::PgStore;
 use pmos_bots::store::{BotsStore, MemoryStore};
 use pmos_bots::{router, router_with, Runtime};
 use pmos_contract::bots::{ActionSetting, Bot, BotScope, Reads, Role};
-use pmos_contract::model::{
-    ModelRole, Role as TeamRole, Sensitivity, Skill, TeamFile, TeamMember, ToolDef, ToolKind,
-    ToolRegistry,
+use pmos_contract::model::{ModelRole, Sensitivity, Skill, ToolDef, ToolKind, ToolRegistry};
+use pmos_directory::snapshot::{
+    user, DirectoryUser, FakeClock, SnapshotClient, StaticFetcher, UserStatus,
 };
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -86,26 +86,28 @@ fn tool(name: &str, kind: ToolKind) -> ToolDef {
     }
 }
 
-fn member(handle: &str, slack_id: &str) -> TeamMember {
-    TeamMember {
-        handle: handle.into(),
-        slack_id: slack_id.into(),
-        email: None,
-        github: None,
-        entra_oid: None,
-        roles: vec![TeamRole::Pm],
+/// The user directory every test runtime starts with (the tool server's
+/// `/internal/directory`): `ana` and `ben` hold `pm`, `cy` holds `pm` and `admin`. `eve` is
+/// nobody.
+pub fn directory() -> Vec<DirectoryUser> {
+    vec![
+        user("ana", &["pm"]),
+        user("ben", &["pm"]),
+        user("cy", &["pm", "admin"]),
+    ]
+}
+
+/// `handle`, deactivated, with the roles they held kept (they grant nothing).
+pub fn deactivated(handle: &str, roles: &[&str]) -> DirectoryUser {
+    DirectoryUser {
+        status: UserStatus::Deactivated,
+        ..user(handle, roles)
     }
 }
 
-/// Two bots: the team bot `docs` (members `ana` and `ben`) and `pm-ana`, Ana's personal
-/// bot, whose role may draft Jira issues (approve) but never send Slack messages. `eve` is
-/// not on the team.
+/// Two bots: the team bot `docs` and `pm-ana`, Ana's personal bot, whose role may draft Jira
+/// issues (approve) but never send Slack messages. Who may use them is the directory's.
 pub fn catalog() -> Catalog {
-    catalog_with_admin(None)
-}
-
-/// [`catalog`], with `cy` on the team as an admin when `admin` is set.
-pub fn catalog_with_admin(admin: Option<&str>) -> Catalog {
     let roles = vec![
         Role {
             name: "docs-helper".into(),
@@ -168,14 +170,7 @@ pub fn catalog_with_admin(admin: Option<&str>) -> Catalog {
             tool("slack.send_message", ToolKind::Write),
         ],
     };
-    let mut members = vec![member("ana", "U0ANA"), member("ben", "U0BEN")];
-    if let Some(handle) = admin {
-        let mut m = member(handle, "U0ADMIN");
-        m.roles.push(TeamRole::Admin);
-        members.push(m);
-    }
-    let team = TeamFile { members };
-    Catalog::from_parts(bots, roles, skills, registry, team)
+    Catalog::from_parts(bots, roles, skills, registry)
 }
 
 // ----- mock tool server -------------------------------------------------------------------
@@ -418,6 +413,10 @@ pub struct Env {
     pub ts: Arc<MockToolServer>,
     pub gw: Arc<MockGateway>,
     pub http: reqwest::Client,
+    /// The user directory as the tool server answers it: change it, then [`Env::refresh`].
+    pub people: Arc<StaticFetcher>,
+    /// The directory's clock: frozen unless a test moves it, so the snapshot stays fresh.
+    pub clock: Arc<FakeClock>,
     stop: CancellationToken,
     pg: Option<TestPg>,
 }
@@ -454,9 +453,17 @@ impl Env {
             &stop,
         )
         .await;
+        let people = Arc::new(StaticFetcher::new(directory()));
+        let clock = Arc::new(FakeClock::default());
+        let snapshots = Arc::new(SnapshotClient::new(people.clone(), clock.clone()));
+        snapshots
+            .refresh()
+            .await
+            .expect("the test directory answers");
         let rt = Arc::new(Runtime::new(
             store.clone(),
             Arc::new(catalog),
+            snapshots,
             ToolServer::new(&ts_base, SERVICE),
             Gateway::new(&format!("{gw_base}/v1"), GATEWAY),
             stop.child_token(),
@@ -473,9 +480,26 @@ impl Env {
             ts,
             gw,
             http: reqwest::Client::new(),
+            people,
+            clock,
             stop,
             pg,
         }
+    }
+
+    /// Poll the directory now, as the runtime's 10-second loop would.
+    pub async fn refresh(&self) {
+        self.rt
+            .people()
+            .refresh()
+            .await
+            .expect("the test directory answers");
+    }
+
+    /// Change one user in the directory and poll it.
+    pub async fn set_user(&self, u: DirectoryUser) {
+        self.people.upsert(u);
+        self.refresh().await;
     }
 
     pub async fn memory() -> Self {

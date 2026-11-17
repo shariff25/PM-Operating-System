@@ -19,6 +19,7 @@ pub mod catalog;
 pub mod clients;
 pub mod config;
 pub mod model;
+pub mod people;
 pub mod pg;
 pub mod routines;
 pub mod runtime;

@@ -26,6 +26,7 @@ use crate::model::{
     TaskStatus, TraceKind, Turn, GAVE_UP_REASON, LEASE_SECONDS, MAX_ATTEMPTS, REDACTED_MARKER,
     RETRY_EVENT,
 };
+use crate::people::{self, SnapshotClient};
 use crate::routines::{self, Parsed};
 use crate::store::{
     BotsStore, Lease, Refused, RoutinePatch, RoutineRun, StoreError, TaskFilter, Transition,
@@ -205,9 +206,12 @@ pub struct RoutineChange {
 
 pub struct Runtime {
     pub store: Arc<dyn BotsStore>,
-    /// The bots, roles and team, swapped whole when the content changes (`catalog::Reloader`).
-    /// Each use takes its own snapshot, so a reload never changes a catalog mid-call.
+    /// The bots, roles and tools, swapped whole when the content changes
+    /// (`catalog::Reloader`). Each use takes its own snapshot, so a reload never changes a
+    /// catalog mid-call.
     catalog: RwLock<Arc<Catalog>>,
+    /// Who may ask: the user directory from the tool server (`crate::people`).
+    people: Arc<SnapshotClient>,
     toolserver: ToolServer,
     gateway: Gateway,
     /// Bumped on every change a long-poll may be waiting for (a new task, a notification).
@@ -229,6 +233,7 @@ impl Runtime {
     pub fn new(
         store: Arc<dyn BotsStore>,
         catalog: Arc<Catalog>,
+        people: Arc<SnapshotClient>,
         toolserver: ToolServer,
         gateway: Gateway,
         stop: CancellationToken,
@@ -236,6 +241,7 @@ impl Runtime {
         Self {
             store,
             catalog: RwLock::new(catalog),
+            people,
             toolserver,
             gateway,
             changed: watch::channel(0).0,
@@ -252,6 +258,28 @@ impl Runtime {
     /// claimed with; new claims, tasks and routines use the new one.
     pub fn set_catalog(&self, catalog: Arc<Catalog>) {
         *self.catalog.write().expect("catalog lock") = catalog;
+    }
+
+    /// The user directory this runtime decides from.
+    pub fn people(&self) -> &Arc<SnapshotClient> {
+        &self.people
+    }
+
+    /// Is `handle` an active admin, on a snapshot at most 30 seconds old? Without one,
+    /// nobody is (the console then shows a viewer their own tasks only).
+    pub fn is_admin(&self, handle: &str) -> bool {
+        self.people.fresh().is_some_and(|p| p.is_admin(handle))
+    }
+
+    /// May `handle` use `bot`, on `people` (`None`: no snapshot recent enough, `503`)?
+    fn may_ask(
+        &self,
+        people: Option<Arc<people::Snapshot>>,
+        handle: &str,
+        bot: &Bot,
+    ) -> Result<()> {
+        let people = people.ok_or_else(|| Error::Unavailable(people::UNAVAILABLE.into()))?;
+        people::may_ask(&people, &self.catalog(), handle, bot).map_err(Error::Forbidden)
     }
 
     fn bump(&self) {
@@ -305,9 +333,9 @@ impl Runtime {
             }
         }
         let bot = self.bot(&new.bot)?;
-        self.catalog()
-            .may_use(&new.requested_by, &bot)
-            .map_err(Error::Forbidden)?;
+        // Queued on a snapshot up to 5 minutes old (spec §2): the task can't run without a
+        // tool server session, which decides afresh and fails closed.
+        self.may_ask(self.people.for_queueing_ask(), &new.requested_by, &bot)?;
         let mut task = Task::queued(
             &bot.name,
             &new.requested_by,
@@ -912,7 +940,8 @@ impl Runtime {
             }))
     }
 
-    /// Set a PM's level. Only members of `team.yaml` have settings.
+    /// Set a PM's level. Only people who may ask bots have settings (on a snapshot at most
+    /// 30 seconds old).
     pub async fn set_member_level(
         &self,
         handle: &str,
@@ -924,11 +953,12 @@ impl Runtime {
                 "`{handle}` isn't a PM OS handle"
             )));
         }
-        if !self.catalog().is_member(handle) {
-            return Err(Error::Forbidden(format!(
-                "`{handle}` isn't listed in team.yaml, so has no settings to change"
-            )));
-        }
+        let people = self
+            .people
+            .fresh()
+            .ok_or_else(|| Error::Unavailable(people::UNAVAILABLE.into()))?;
+        people::may_ask_bots(&people, handle)
+            .map_err(|why| Error::Forbidden(format!("{why}, so has no settings to change")))?;
         let settings = MemberSettings {
             handle: handle.to_string(),
             level,
@@ -941,11 +971,11 @@ impl Runtime {
 
     // ----- routines (D8) -------------------------------------------------------------------
 
+    /// The bot, if `owner` may use it now (a snapshot at most 30 seconds old: parsing calls
+    /// the model as them, and a routine runs as them).
     fn bot_for(&self, name: &str, owner: &str) -> Result<Bot> {
         let bot = self.bot(name)?;
-        self.catalog()
-            .may_use(owner, &bot)
-            .map_err(Error::Forbidden)?;
+        self.may_ask(self.people.fresh(), owner, &bot)?;
         Ok(bot)
     }
 
@@ -1093,9 +1123,23 @@ impl Runtime {
 
     /// Enqueue every due routine once, and schedule its next run from now. A routine that
     /// was due several times while the runtime was down runs once, not once per missed slot.
+    ///
+    /// Who may run it comes from a directory snapshot at most 5 minutes old. Without one,
+    /// each due run is skipped (the routine stays enabled, its next run is scheduled) and
+    /// logged: nothing runs, and nothing is paused, on data that old (spec §2).
     pub async fn run_due_routines(&self, now: DateTime<Utc>) -> Result<usize> {
+        let due = self.store.due_routines(now).await?;
+        if due.is_empty() {
+            return Ok(0);
+        }
+        let Some(people) = self.people.for_due_routine() else {
+            for r in due {
+                self.skip_routine_run(&r, now).await?;
+            }
+            return Ok(0);
+        };
         let mut queued = 0;
-        for r in self.store.due_routines(now).await? {
+        for r in due {
             let Some(due_at) = r.next_run_at else {
                 continue;
             };
@@ -1103,41 +1147,28 @@ impl Runtime {
             let catalog = self.catalog();
             let problem = match catalog.bot(&r.bot) {
                 None => Some(format!("its bot `{}` no longer exists", r.bot)),
-                Some(bot) => catalog.may_use(&r.owner, bot).err(),
+                Some(bot) => people::may_ask(&people, &catalog, &r.owner, bot).err(),
             };
             let next = routines::next_run(&r.schedule, now);
             let problem = problem.or_else(|| next.as_ref().err().cloned());
-            let mut task = Task::queued(
-                &r.bot,
-                &r.owner,
-                Source::Routine,
-                &r.prompt,
-                None,
-                Some(r.id.clone()),
-                now,
-            );
             let run = match problem {
                 None => RoutineRun {
                     routine_id: r.id.clone(),
                     due_at,
                     next_run_at: next.ok(),
-                    task,
+                    task: Task::queued(
+                        &r.bot,
+                        &r.owner,
+                        Source::Routine,
+                        &r.prompt,
+                        None,
+                        Some(r.id.clone()),
+                        now,
+                    ),
                     event: "queued by its routine".into(),
                     notify: None,
                 },
-                Some(problem) => {
-                    let reason = format!("Your routine is paused: {problem}.");
-                    task.status = TaskStatus::Failed;
-                    task.error = Some(reason.clone());
-                    RoutineRun {
-                        routine_id: r.id.clone(),
-                        due_at,
-                        next_run_at: None,
-                        task,
-                        event: format!("failed: {reason}"),
-                        notify: Some(NewNotification::new(NotificationKind::Failed, reason)),
-                    }
-                }
+                Some(problem) => paused_run(&r, due_at, &problem, now),
             };
             if self.store.run_routine(&run, now).await? {
                 tracing::info!(routine = %r.id, task = %run.task.id, status = %run.task.status, "routine ran");
@@ -1150,23 +1181,88 @@ impl Runtime {
         Ok(queued)
     }
 
+    /// Skip one due run of `r` because the directory is too old to decide on: schedule the
+    /// next run, keep the routine enabled, queue nothing, and log it.
+    async fn skip_routine_run(&self, r: &Routine, now: DateTime<Utc>) -> Result<()> {
+        let Some(due_at) = r.next_run_at else {
+            return Ok(());
+        };
+        let age = self.people.age().map(|a| a.as_secs());
+        match routines::next_run(&r.schedule, now) {
+            Ok(next) => {
+                if self
+                    .store
+                    .skip_routine_run(&r.id, due_at, next, now)
+                    .await?
+                {
+                    tracing::warn!(routine = %r.id, ?age, next = %next, "routine run skipped: the user directory is more than 5 minutes old, so PM OS can't check its owner");
+                }
+            }
+            // A schedule that no longer parses pauses it when the directory is back.
+            Err(e) => {
+                tracing::warn!(routine = %r.id, ?age, error = %e, "routine run skipped: the user directory is more than 5 minutes old")
+            }
+        }
+        Ok(())
+    }
+
+    /// Pause the enabled routines whose owner may no longer ask bots (deactivated, removed,
+    /// or holding no role that may ask), with the usual "paused" note, as soon as a snapshot
+    /// at most 30 seconds old shows it. A routine whose bot is gone is left to its next due
+    /// run. Returns how many were paused.
+    pub async fn pause_routines_of_inactive_owners(&self, now: DateTime<Utc>) -> Result<usize> {
+        let Some(people) = self.people.fresh() else {
+            return Ok(0);
+        };
+        let mut paused = 0;
+        for r in self.store.routines(None).await? {
+            let (true, Some(due_at)) = (r.enabled, r.next_run_at) else {
+                continue;
+            };
+            let Err(problem) = people::may_ask_bots(&people, &r.owner) else {
+                continue;
+            };
+            let run = paused_run(&r, due_at, &problem, now);
+            // Guarded like a due run: a routine changed meanwhile is left for the next pass.
+            if self.store.run_routine(&run, now).await? {
+                tracing::info!(routine = %r.id, owner = %r.owner, "routine paused: its owner may no longer ask bots");
+                paused += 1;
+            }
+        }
+        if paused > 0 {
+            self.bump();
+        }
+        Ok(paused)
+    }
+
     // ----- readiness and loops -------------------------------------------------------------
 
-    /// `(storage, tool server, gateway)`, each up or not.
-    pub async fn readiness(&self) -> (bool, bool, bool) {
+    /// Each of storage, the tool server, the gateway and the user directory (a snapshot at
+    /// most 30 seconds old) is up or not.
+    pub async fn readiness(&self) -> Readiness {
         let storage = async {
             matches!(
                 tokio::time::timeout(Duration::from_secs(2), self.store.ping()).await,
                 Ok(Ok(()))
             )
         };
-        tokio::join!(storage, self.toolserver.ready(), self.gateway.ready())
+        let (storage, toolserver, gateway) =
+            tokio::join!(storage, self.toolserver.ready(), self.gateway.ready());
+        Readiness {
+            storage,
+            toolserver,
+            gateway,
+            directory: self.people.fresh().is_some(),
+        }
     }
 
     /// One pass of the 30-second loop.
     pub async fn tick(&self, now: DateTime<Utc>) {
         if let Err(e) = self.recover_leases(now).await {
             tracing::error!(error = %e, "lease recovery failed");
+        }
+        if let Err(e) = self.pause_routines_of_inactive_owners(now).await {
+            tracing::error!(error = %e, "pausing routines of inactive owners failed");
         }
         if let Err(e) = self.run_due_routines(now).await {
             tracing::error!(error = %e, "routine scheduling failed");
@@ -1176,10 +1272,34 @@ impl Runtime {
         }
     }
 
-    /// The background loops: every 30 seconds recover leases, run due routines and close
-    /// approvals; every hour redact and prune traces. Both run once straight away, which is
-    /// the start-up recovery and the one catch-up run of a missed routine.
+    /// The background loops: every 10 seconds poll the user directory, and pause the
+    /// routines of anyone it newly shows may no longer ask; every 30 seconds recover leases,
+    /// run due routines and close approvals; every hour redact and prune traces. They run
+    /// once straight away, which is the start-up recovery and the one catch-up run of a
+    /// missed routine.
     pub fn spawn_loops(self: &Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
+        let poller = self
+            .people
+            .spawn(pmos_directory::snapshot::POLL_EVERY, self.stop.clone());
+        let pauser = {
+            let rt = self.clone();
+            let mut changes = self.people.changes();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = rt.stop.cancelled() => break,
+                        changed = changes.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            if let Err(e) = rt.pause_routines_of_inactive_owners(model::now()).await {
+                                tracing::error!(error = %e, "pausing routines of inactive owners failed");
+                            }
+                        }
+                    }
+                }
+            })
+        };
         let ticker = {
             let rt = self.clone();
             tokio::spawn(async move {
@@ -1210,7 +1330,48 @@ impl Runtime {
                 }
             })
         };
-        vec![ticker, housekeeper]
+        vec![poller, pauser, ticker, housekeeper]
+    }
+}
+
+/// [`Runtime::readiness`]: each dependency up or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Readiness {
+    pub storage: bool,
+    pub toolserver: bool,
+    pub gateway: bool,
+    /// A directory snapshot at most 30 seconds old.
+    pub directory: bool,
+}
+
+impl Readiness {
+    pub fn ok(&self) -> bool {
+        self.storage && self.toolserver && self.gateway && self.directory
+    }
+}
+
+/// The run that pauses `r` with the reason: a failed task saying "Your routine is paused: …"
+/// and a notification to its owner; the routine stops (no next run).
+fn paused_run(r: &Routine, due_at: DateTime<Utc>, problem: &str, now: DateTime<Utc>) -> RoutineRun {
+    let reason = format!("Your routine is paused: {problem}.");
+    let mut task = Task::queued(
+        &r.bot,
+        &r.owner,
+        Source::Routine,
+        &r.prompt,
+        None,
+        Some(r.id.clone()),
+        now,
+    );
+    task.status = TaskStatus::Failed;
+    task.error = Some(reason.clone());
+    RoutineRun {
+        routine_id: r.id.clone(),
+        due_at,
+        next_run_at: None,
+        task,
+        event: format!("failed: {reason}"),
+        notify: Some(NewNotification::new(NotificationKind::Failed, reason)),
     }
 }
 

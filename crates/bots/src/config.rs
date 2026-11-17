@@ -90,11 +90,13 @@ pub struct Config {
     pub database_url: Option<Secret>,
     /// `PMOS_BOTS_BIND`, default `127.0.0.1:8750`.
     pub bind: SocketAddr,
-    /// `PMOS_CONTENT_ROOT`, default `content`: bots, roles, skills, tools and `team.yaml`.
+    /// `PMOS_CONTENT_ROOT`, default `content`: bots, roles, skills and tools. Who may use
+    /// them comes from the tool server's user directory, not the content.
     pub content_root: PathBuf,
     /// `PMOS_TOOLSERVER_URL`, such as `http://127.0.0.1:8710`.
     pub toolserver_url: String,
-    /// `PMOS_SERVICE_TOKEN`: the tool server's orchestrator token.
+    /// `PMOS_SERVICE_TOKEN`: the tool server's orchestrator token (bot sessions, approval
+    /// items, and the user directory, `GET /internal/directory`).
     pub service_token: Secret,
     /// `PMOS_GATEWAY_URL`: the gateway's OpenAI base, such as `http://127.0.0.1:8740/v1`.
     pub gateway_url: String,

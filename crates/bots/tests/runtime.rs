@@ -310,8 +310,8 @@ async fn paused_routines_do_not_run(env: &Env) {
     assert!(routine_tasks(env).await.is_empty());
 }
 
-/// A routine whose owner may no longer use its bot (team.yaml changed, the bot was removed)
-/// is paused, and the owner is told why, rather than silently skipped.
+/// A routine whose owner may no longer use its bot (not in the user directory, the bot was
+/// removed) is paused, and the owner is told why, rather than silently skipped.
 async fn a_routine_that_can_no_longer_run_is_paused_with_a_reason(env: &Env) {
     let now = at(2026, 11, 16, 8, 0);
     let mut stale = Routine {
@@ -347,9 +347,9 @@ async fn a_routine_that_can_no_longer_run_is_paused_with_a_reason(env: &Env) {
     assert!(tasks.iter().all(|t| t.status == TaskStatus::Failed));
     let feed = env.feed().await;
     let texts: Vec<&str> = feed.iter().map(|n| n["text"].as_str().unwrap()).collect();
-    assert!(texts
-        .iter()
-        .any(|t| t.starts_with("Your routine is paused:") && t.contains("team.yaml")));
+    assert!(texts.iter().any(
+        |t| t.starts_with("Your routine is paused:") && t.contains("`eve` isn't a PM OS user")
+    ));
     assert!(texts
         .iter()
         .any(|t| t.contains("its bot `retired` no longer exists")));

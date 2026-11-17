@@ -687,7 +687,7 @@ async fn a_bots_own_worker_touches_only_that_bots_tasks(env: &Env) {
 async fn only_people_who_may_use_a_bot_can_ask_it() {
     let env = Env::memory().await;
     let new = |bot: &str, user: &str, source: &str| json!({"bot": bot, "requested_by": user, "text": "hello", "source": source});
-    // A team bot serves team members; eve isn't one.
+    // A team bot serves the users who may ask; eve isn't in the directory.
     let (status, body) = env
         .post(
             "/v1/tasks",
@@ -698,7 +698,10 @@ async fn only_people_who_may_use_a_bot_can_ask_it() {
         .await;
     assert_eq!(status, 403);
     assert!(
-        body["error"].as_str().unwrap().contains("team.yaml"),
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("`eve` isn't a PM OS user"),
         "{body}"
     );
     // A personal bot serves its owner only.
@@ -1679,18 +1682,28 @@ async fn a_revision_task_starts_its_session_at_its_floor() {
 }
 
 #[tokio::test]
-async fn readiness_covers_storage_the_tool_server_and_the_gateway() {
+async fn readiness_covers_storage_the_tool_server_the_gateway_and_the_directory() {
     let env = Env::memory().await;
     let (status, body) = env.get("/readyz", "none", None).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body,
-        json!({"ready": true, "checks": {"storage": "ok", "toolserver": "ok", "gateway": "ok"}})
+        json!({"ready": true, "checks": {"storage": "ok", "toolserver": "ok", "gateway": "ok", "directory": "ok"}})
     );
     *env.ts.ready.lock().unwrap() = false;
     let (status, body) = env.get("/readyz", "none", None).await;
     assert_eq!(status, 503);
     assert_eq!(body["checks"]["toolserver"], "down");
     assert_eq!(body["checks"]["gateway"], "ok");
+    // A directory snapshot more than 30 seconds old is not ready either.
+    *env.ts.ready.lock().unwrap() = true;
+    env.clock
+        .advance(pmos_directory::snapshot::ALLOW_AGE + std::time::Duration::from_secs(1));
+    let (status, body) = env.get("/readyz", "none", None).await;
+    assert_eq!(status, 503);
+    assert_eq!(body["checks"]["directory"], "down");
+    env.refresh().await;
+    let (status, _) = env.get("/readyz", "none", None).await;
+    assert_eq!(status, 200);
     env.finish().await;
 }

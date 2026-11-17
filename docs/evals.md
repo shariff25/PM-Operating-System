@@ -53,8 +53,10 @@ client `evals`. For each task, `repeats` times, it:
 - **The trace token.** Only client `console` may read traces (§3). Pass a console token as
   `--trace-token` so failures are tagged from the trace. Without one, tagging uses the task's
   status, error and events only, and the report says how many failures were tagged that way.
-- **Who asks.** A team bot serves team members only, so the `--as` handle must be in
-  `content/team.yaml`. The runtime also lets the `evals` token request tasks only as the
+- **Who asks.** The runtime lets only active users who may ask bots (`pm`, `reviewer` or
+  `admin`) ask, from the tool server's user database (slice U4a), so the `--as` handle must
+  be a user there; the eval stack seeds `evals` into it from its `team.yaml`
+  (`PMOS_USERS_SEED`). The runtime also lets the `evals` token request tasks only as the
   handles in its own `PMOS_EVALS_AS` (default `evals`; anything else is `403`), so a leaked
   benchmark token can't run a PM's bots as them. Add a member for the benchmarks (`evals`,
   as the eval stack does), or, for a run as a real PM, list their handle in the runtime's
