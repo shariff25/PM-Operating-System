@@ -26,6 +26,7 @@ export function devApiFactory(): (onSignedOut: () => void) => Api {
       providers: mockProviders(),
       briefDelivery: mockBrief(),
       audienceDrafts: new URLSearchParams(window.location.search).get('mock_slack') === 'audience',
+      listCap: new URLSearchParams(window.location.search).get('mock_drafts') === 'truncated' ? 3 : undefined,
       briefBuilt: import.meta.env.VITE_MOCK_BRIEF !== 'off',
       hostile: import.meta.env.VITE_MOCK_HOSTILE === 'on',
       toolServerDown: new URLSearchParams(window.location.search).get('mock_admin') === 'degraded',

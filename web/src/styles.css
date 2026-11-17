@@ -1117,6 +1117,11 @@ del.ba-word, .ba-removed del.ba-text {
   display: flex; flex-direction: column; gap: 14px; animation: pop-in 180ms var(--ease);
 }
 .modal:focus { outline: none; }
+.modal.confirm { padding: 0; margin: 4vh 0; max-height: 92vh; max-height: calc(100dvh - 32px); display: flex; flex-direction: column; gap: 0; overflow: hidden; }
+.modal-scroll { display: flex; flex-direction: column; gap: 14px; padding: 22px 24px 18px; overflow-y: auto; min-height: 0; flex: 1 1 auto; }
+.modal.confirm .modal-actions { margin: 0; flex: 0 0 auto; }
+.fact-warn { display: flex; gap: 8px; align-items: flex-start; }
+.fact-warn-icon { color: var(--warn-ink, currentColor); margin-top: 3px; flex: 0 0 auto; }
 .modal h2 { font-size: 19px; letter-spacing: -0.02em; }
 .modal h3 { font-size: 11px; margin-top: 2px; }
 .modal-actions { display: flex; flex-direction: row-reverse; flex-wrap: wrap; gap: 8px; margin: 6px -24px -20px; padding: 14px 24px; border-top: 1px solid var(--border); background: var(--surface-2); border-radius: 0 0 var(--r-card) var(--r-card); min-height: 0; }
@@ -1430,6 +1435,9 @@ select:focus, input[type='date']:focus { border-color: var(--focus); box-shadow:
   .facts dd { border-top: 0 !important; }
   .modal { padding: 18px 16px; margin: 2vh 0; }
   .modal-actions { margin: 6px -16px -18px; padding: 12px 16px; }
+  .modal.confirm { padding: 0; margin: 2vh 0; }
+  .modal-scroll { padding: 18px 16px 14px; }
+  .modal.confirm .modal-actions { margin: 0; }
   .modal-actions .btn { flex: 1 1 100%; }
   .palette-backdrop { padding-top: 8px; }
   .palette { max-height: 88vh; }
@@ -1532,5 +1540,6 @@ select:focus, input[type='date']:focus { border-color: var(--focus); box-shadow:
 .source-item-on { padding-bottom: 4px; }
 .source-item-on .source-cites { margin-top: 4px; }
 .cite-group { margin-left: 1px; }
-.modal .note.note-restricted { flex-direction: row; gap: 10px; }
+.modal .note.note-restricted, .modal .note.note-error { flex-direction: row; gap: 10px; }
 .cite-group { margin-right: 0.12em; }
+.drafts-cut { margin: 0; padding: 10px 18px; border-bottom: 1px solid var(--border); font-size: 13px; color: var(--muted); }
