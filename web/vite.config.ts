@@ -12,6 +12,10 @@ export default defineConfig(({ mode, command }) => {
   }
   return {
     plugins: [react()],
+    build: {
+      // Fonts are always separate files on this origin: the content security policy blocks data: fonts.
+      assetsInlineLimit: (file: string) => (/\.(woff2?|ttf|otf)$/.test(file) ? false : undefined),
+    },
     server: {
       // With VITE_API=real the app talks to pmos-web; override with PMOS_WEB_URL.
       proxy: { '/api': process.env.PMOS_WEB_URL ?? 'http://127.0.0.1:8787' },

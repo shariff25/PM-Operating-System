@@ -518,18 +518,14 @@ impl ToolServer {
         Ok(self.0.read::<List<Approval>>(res).await?.into_vec())
     }
 
-    /// One item. It names nobody, so it carries no assertion; the caller checks the owner.
-    pub async fn approval(&self, id: &str) -> UpstreamResult<Approval> {
-        let url = self.0.url(&["internal", "approvals", id])?;
-        let res = self.0.send(self.0.http.get(url), None).await?;
-        self.0.read(res).await
-    }
-
-    /// One item of `user`'s, with an assertion for them: the tool server answers `404` for
-    /// anyone else's.
+    /// One item of `user`'s, `?user=<handle>`, with an assertion for them: the tool server
+    /// answers `404` for anyone else's item, or for a read that names nobody.
     pub async fn approval_for(&self, user: &str, id: &str) -> UpstreamResult<Approval> {
         let url = self.0.url(&["internal", "approvals", id])?;
-        let res = self.0.send(self.0.http.get(url), Some(user)).await?;
+        let res = self
+            .0
+            .send(self.0.http.get(url).query(&[("user", user)]), Some(user))
+            .await?;
         self.0.read(res).await
     }
 

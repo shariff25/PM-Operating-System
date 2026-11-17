@@ -2,9 +2,9 @@ import { useEffect, useMemo, useState } from 'react';
 import { ApiError } from '../api';
 import type { Draft, Task } from '../api';
 import { messageOf, useApp } from '../app-context';
-import { Avatar, Empty, ErrorNote, Markdown, Skeleton, StrippedNote } from '../components/bits';
+import { Avatar, Empty, ErrorNote, Markdown, Skeleton, StrippedNote, SystemTag, kindSystem } from '../components/bits';
 import { Icon, Mark, kindIcon } from '../components/icons';
-import { TopBarLead } from '../components/Shell';
+import { PageBar } from '../components/Shell';
 import { copy } from '../copy';
 import { useAsk, useData } from '../data';
 import { renderMarkdown } from '../markdown';
@@ -45,12 +45,16 @@ function DraftCard({ id }: { id: string }) {
     <div className="draft-card">
       <span className="draft-card-icon"><Icon name={draft ? kindIcon(draft.kind) : 'drafts'} size={18} /></span>
       <span className="draft-card-text">
-        <span className="draft-card-eyebrow">{draft ? copy.home.kindLabel(draft.kind) : copy.activity.draftCard}</span>
+        <span className="draft-card-eyebrow">
+          {draft && <SystemTag system={kindSystem(draft.kind)} label={kindSystem(draft.kind)} />}
+          {draft ? copy.home.kindLabel(draft.kind) : copy.activity.draftCard}
+        </span>
         <a className="draft-card-title" href={draftHref(id)}>{draft?.title ?? copy.activity.draftCard}</a>
         {draft && <span className="draft-card-meta">{draft.target.label}</span>}
       </span>
       <button type="button" className="btn btn-primary" onClick={() => navigate(`/d/${encodeURIComponent(id)}`)}>
         {copy.activity.openDraft}
+        <Icon name="arrowRight" size={15} weight={2.2} />
       </button>
     </div>
   );
@@ -106,7 +110,7 @@ export function Thread({ id }: { id: string }) {
   const crumb = (
     <nav aria-label={copy.panel.breadcrumb} className="crumbs">
       <a href="#/activity">{copy.nav.activity}</a>
-      <Icon name="chevronRight" size={14} className="crumb-sep" />
+      <span className="crumb-sep" aria-hidden="true">/</span>
       <span className="crumb-current" aria-current="page">{task?.text ?? '…'}</span>
     </nav>
   );
@@ -114,17 +118,19 @@ export function Thread({ id }: { id: string }) {
   if (loadError && !task) {
     return (
       <div className="page page-narrow">
-        <TopBarLead>{crumb}</TopBarLead>
+        <PageBar crumb={crumb} />
         <ErrorNote>{loadError}</ErrorNote>
       </div>
     );
   }
   if (!task) {
     return (
-      <div className="page page-narrow">
-        <TopBarLead>{crumb}</TopBarLead>
-        <Skeleton rows={3} label={copy.activity.loading} variant="doc" />
-      </div>
+      <>
+        <PageBar crumb={crumb} />
+        <div className="page page-narrow">
+          <Skeleton rows={3} label={copy.activity.loading} variant="doc" />
+        </div>
+      </>
     );
   }
 
@@ -136,8 +142,12 @@ export function Thread({ id }: { id: string }) {
   const nothingToShow = settled && !task.result && !task.error && task.draft_ids.length === 0 && task.status !== 'failed';
 
   return (
+    <>
+    <PageBar crumb={crumb}>
+      <span className="pagebar-spacer" />
+      <span className="pagebar-meta">{copy.activity.askedAt(relTime(task.created_at))}</span>
+    </PageBar>
     <div className="page page-narrow thread">
-      <TopBarLead>{crumb}</TopBarLead>
       <h1 className="sr-only">{task.text}</h1>
       <section className="thread-list" aria-label={copy.activity.threadLabel}>
         <article className="msg msg-you" aria-label={copy.activity.you}>
@@ -153,6 +163,7 @@ export function Thread({ id }: { id: string }) {
           <div className="msg-head">
             <Mark size={24} />
             <span className="msg-who">{copy.activity.bot}</span>
+            <span className="msg-time">{relTime(task.updated_at)}</span>
           </div>
           <div className="msg-body">
             <p className={`live-line ${working ? 'live-line-on' : ''}`} role="status">
@@ -244,5 +255,6 @@ export function Thread({ id }: { id: string }) {
         </article>
       </section>
     </div>
+    </>
   );
 }

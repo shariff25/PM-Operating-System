@@ -480,6 +480,7 @@ async fn start() -> Server {
                 token: BOT_TOKEN.into(),
                 skills: vec!["docs".into()],
             }),
+            console_token: None,
             content_root: fixture.root.clone(),
             oauth: None,
             allowed_hosts: vec!["127.0.0.1".into(), "localhost".into()],
@@ -555,8 +556,11 @@ async fn reasons_over_http() {
         .await;
     assert_eq!(status, 200, "{item}");
     assert_eq!(item["status"], "rejected");
-    let (_, ledger) = s.get(BOT_TOKEN, "/internal/ledger").await;
+    let (_, ledger) = s.get(SERVICE_TOKEN, "/internal/ledger").await;
     assert_eq!(ledger["rows"][0]["id"], id.as_str());
+    let (_, ledger) = s.get(BOT_TOKEN, "/internal/ledger").await;
+    assert!(ledger["rows"][0].get("id").is_none(), "no ids for the bot");
+    assert_eq!(ledger["rows"][0]["run_id"], session.run_id.as_str());
     assert_eq!(ledger["rows"][0]["outcome"], "rejected");
     assert_eq!(ledger["rows"][0]["reason"], "should_not_draft");
 
@@ -614,10 +618,17 @@ async fn who_may_read_the_ledger() {
     assert_eq!(row["outcome"], "pending");
     assert_eq!(row["model_alias"], "pmos/extraction");
 
-    // The Slack bot reads the rows for the triage digest, but not the summary.
+    // The Slack bot reads the rows for the triage digest, without approval ids (it uses
+    // `run_id`), but not the summary.
     let (status, bot_body) = s.get(BOT_TOKEN, "/internal/ledger").await;
     assert_eq!(status, 200);
-    assert_eq!(bot_body, body);
+    let mut without_ids = body.clone();
+    for row in without_ids["rows"].as_array_mut().unwrap() {
+        row.as_object_mut().unwrap().remove("id");
+    }
+    assert_eq!(bot_body, without_ids);
+    assert!(bot_body["rows"][0].get("id").is_none());
+    assert!(bot_body["rows"][0]["run_id"].is_string());
     assert_eq!(s.get(BOT_TOKEN, "/internal/ledger/summary").await.0, 403);
     let (status, summary) = s.get(SERVICE_TOKEN, "/internal/ledger/summary").await;
     assert_eq!(status, 200);
@@ -677,14 +688,17 @@ async fn ledger_queries_over_http() {
         v.sort();
         v
     };
-    let (status, body) = s
-        .get(
-            BOT_TOKEN,
-            "/internal/ledger?outcome=rejected,edited&min_edit=0.3&since=2026-11-14T00:00:00Z",
-        )
-        .await;
+    let filtered =
+        "/internal/ledger?outcome=rejected,edited&min_edit=0.3&since=2026-11-14T00:00:00Z";
+    let (status, body) = s.get(SERVICE_TOKEN, filtered).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(ids(&body), sorted(vec![rejected.clone(), edited.clone()]));
+    // The bot gets the same rows, without their ids.
+    let (status, bot_body) = s.get(BOT_TOKEN, filtered).await;
+    assert_eq!(status, 200, "{bot_body}");
+    let bot_rows = bot_body["rows"].as_array().unwrap();
+    assert_eq!(bot_rows.len(), 2);
+    assert!(bot_rows.iter().all(|r| r.get("id").is_none()));
     let (_, body) = s
         .get(SERVICE_TOKEN, "/internal/ledger?outcome=approved&limit=1")
         .await;

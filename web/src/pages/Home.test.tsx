@@ -42,24 +42,59 @@ describe('home launchpad', () => {
     expect(screen.getByLabelText(copy.home.askLabel)).toHaveFocus();
   });
 
-  it('shows three summary cards with counts, the top items and links', async () => {
+  it('says what needs the PM, then shows the numbers, the decisions and who is waiting', async () => {
     renderApp();
-    const drafts = await screen.findByRole('region', { name: copy.launch.draftsCard });
-    await within(drafts).findByText('3');
-    expect(within(drafts).getAllByRole('link').filter((l) => l.getAttribute('href')?.startsWith('#/d/'))).toHaveLength(2);
-    expect(within(drafts).getByRole('link', { name: copy.launch.viewDrafts })).toHaveAttribute('href', '#/drafts');
-    const waiting = await screen.findByRole('region', { name: copy.launch.waitingCard });
+    // three drafts to decide and two people waiting
+    await screen.findByRole('heading', { level: 1, name: /Five things need you\.$/ });
+    const stats = screen.getByRole('region', { name: copy.today.statsLabel });
+    for (const label of Object.values(copy.today.stats).slice(0, 4)) expect(stats).toHaveTextContent(label);
+    const decide = screen.getByRole('region', { name: copy.today.decideHeading });
+    const links = within(decide).getAllByRole('link').filter((l) => l.getAttribute('href')?.startsWith('#/d/'));
+    expect(links).toHaveLength(3);
+    expect(links.some((l) => l.textContent?.includes('PRD: TCB grace period setting'))).toBe(true);
+    expect(within(decide).getByRole('link', { name: new RegExp(copy.today.allDrafts) })).toHaveAttribute('href', '#/drafts');
+    const waiting = screen.getByRole('region', { name: copy.today.waitingHeading });
     await within(waiting).findByText('asked about the pricing page', { exact: false });
-    expect(screen.getByRole('region', { name: copy.launch.waitedOnCard })).toBeInTheDocument();
+    expect(within(waiting).getAllByRole('button', { name: /Draft a reply/ })).toHaveLength(2);
+    expect(screen.getByRole('region', { name: copy.today.changedHeading })).toHaveTextContent('PAY-212 moved to Blocked');
+  });
+
+  it('counts in words up to ten', () => {
+    expect(copy.today.needs(0)).toBe('Nothing needs you right now.');
+    expect(copy.today.needs(1)).toBe('One thing needs you.');
+    expect(copy.today.needs(3)).toBe('Three things need you.');
+    expect(copy.today.needs(10)).toBe('Ten things need you.');
+    expect(copy.today.needs(12)).toBe('12 things need you.');
+  });
+
+  it('shows a running request with its progress at the foot of the decisions', async () => {
+    const running: Task = {
+      id: 'tsk_run', bot: 'pm-ana', text: 'weekly launch summary', status: 'working', result: null, error: null, draft_ids: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(), progress: { done: 2, total: 3 },
+    };
+    renderApp({
+      wrap: (api) => {
+        const list = api.listTasks.bind(api);
+        api.listTasks = async () => [running, ...(await list())];
+        return api;
+      },
+    });
+    const decide = await screen.findByRole('region', { name: copy.today.decideHeading });
+    const row = await within(decide).findByRole('link', { name: new RegExp(copy.today.working('weekly launch summary')) });
+    expect(row).toHaveAttribute('href', '#/a/tsk_run');
+    expect(within(row).getByRole('progressbar', { name: copy.task.progressLabel })).toHaveAttribute('aria-valuenow', '2');
   });
 
   it('drops the follow-up cards and the Follow-ups page when the brief answers 501 not_built', async () => {
     renderApp({ briefBuilt: false });
-    const drafts = await screen.findByRole('region', { name: copy.launch.draftsCard });
-    await within(drafts).findByText('PRD: TCB grace period setting');
-    expect(screen.queryByRole('region', { name: copy.launch.waitingCard })).not.toBeInTheDocument();
-    expect(screen.queryByRole('region', { name: copy.launch.waitedOnCard })).not.toBeInTheDocument();
-    expect(screen.queryByText(copy.home.waitingOnYou)).not.toBeInTheDocument();
+    const decide = await screen.findByRole('region', { name: copy.today.decideHeading });
+    await within(decide).findByText('PRD: TCB grace period setting');
+    expect(screen.queryByRole('region', { name: copy.today.waitingHeading })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: copy.today.changedHeading })).not.toBeInTheDocument();
+    const stats = screen.getByRole('region', { name: copy.today.statsLabel });
+    expect(stats).toHaveTextContent(copy.today.stats.running);
+    expect(stats).not.toHaveTextContent(copy.today.stats.waiting);
+    await screen.findByRole('heading', { level: 1, name: /Three things need you\.$/ });
     expect(screen.queryByRole('link', { name: new RegExp(`^${copy.nav.followups}`) })).not.toBeInTheDocument();
   });
 
@@ -93,6 +128,7 @@ describe('home launchpad', () => {
     renderApp({ noDrafts: true, firstVisit: false });
     await screen.findByText(copy.emptyDrafts);
     await screen.findByText(copy.launch.noActivity);
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(copy.today.needs(2)); // two people still wait in the brief
   });
 
   it('shows the sign-in page when signed out, and signs in with a handle', async () => {

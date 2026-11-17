@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 const SERVICE_TOKEN: &str = "test-service-token-0123456789abcdef";
 const BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
+const CONSOLE_TOKEN: &str = "test-console-token-0123456789abcdef";
 
 async fn bot_session(f: &common::Fixture, user: &str, bot: &str) -> Session {
     f.svc
@@ -557,6 +558,7 @@ async fn start(fixture: common::Fixture) -> Server {
                 token: BOT_TOKEN.into(),
                 skills: vec!["docs".into()],
             }),
+            console_token: Some(CONSOLE_TOKEN.into()),
             content_root: fixture.root.clone(),
             oauth: None,
             allowed_hosts: vec!["127.0.0.1".into(), "localhost".into()],
@@ -772,19 +774,45 @@ async fn the_bot_token_reads_and_decides_one_item() {
     };
     let id = pending("one").await;
     let http = reqwest::Client::new();
+    let read = |token: &'static str, path: String| {
+        let http = http.clone();
+        let base = s.base.clone();
+        async move {
+            http.get(format!("{base}{path}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
 
-    let res = http
-        .get(format!("{}/internal/approvals/{id}", s.base))
-        .bearer_auth(BOT_TOKEN)
-        .send()
-        .await
-        .unwrap();
+    // The bot reads an item only by naming its PM.
+    let res = read(BOT_TOKEN, format!("/internal/approvals/{id}?user=ana")).await;
     assert_eq!(res.status(), 200);
     let item: Value = res.json().await.unwrap();
     assert_eq!(
         (item["bot"].as_str(), item["status"].as_str()),
         (Some("scout"), Some("pending"))
     );
+    // Without `user`, with another member, with someone outside team.yaml, or for an id
+    // that doesn't exist: the same 404.
+    for path in [
+        format!("/internal/approvals/{id}"),
+        format!("/internal/approvals/{id}?user="),
+        format!("/internal/approvals/{id}?user=bo"),
+        format!("/internal/approvals/{id}?user=eve"),
+        "/internal/approvals/apr_nope?user=ana".to_string(),
+    ] {
+        let res = read(BOT_TOKEN, path.clone()).await;
+        assert_eq!(res.status(), 404, "{path}");
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"], "no such approval item", "{path}");
+    }
+    // The orchestrator and the console read it without naming anyone.
+    for token in [SERVICE_TOKEN, CONSOLE_TOKEN] {
+        let res = read(token, format!("/internal/approvals/{id}")).await;
+        assert_eq!(res.status(), 200);
+    }
 
     let decide = |id: String, who: &'static str, decision: &'static str| {
         let base = s.base.clone();
@@ -852,5 +880,185 @@ async fn the_bot_token_reads_and_decides_one_item() {
         s.fixture.audit.events().last().unwrap().client,
         Client::Orchestrator
     );
+    s.cancel.cancel();
+}
+
+#[tokio::test]
+async fn an_edit_from_the_bot_cant_change_where_a_draft_goes() {
+    let s = start(common::team_fixture(&["ana", "bo"])).await;
+    let session = s
+        .fixture
+        .svc
+        .create_bot_session("ana", "scout", "tsk_edit", None, now())
+        .await
+        .unwrap();
+    let drafted = json!({"project": "PM", "issue_type": "Task", "summary": "Fix export"});
+    let pending = || {
+        let svc = s.fixture.svc.clone();
+        let session = session.clone();
+        let args = drafted.clone();
+        async move {
+            let out = svc
+                .call(&session, "jira_create_issue", args, now())
+                .await
+                .unwrap();
+            out["approval_id"].as_str().unwrap().to_string()
+        }
+    };
+    let edit = |token: &'static str, id: String, args: Value| {
+        let base = s.base.clone();
+        async move {
+            let res = post(
+                &base,
+                token,
+                &format!("/internal/approvals/{id}/decision"),
+                json!({"decided_by": "ana", "decision": "edit", "args": args}),
+            )
+            .await;
+            let status = res.status().as_u16();
+            (status, res.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+
+    // Each target argument, changed or added: 422, still pending, nothing written.
+    let id = pending().await;
+    for args in [
+        json!({"project": "OPS", "issue_type": "Task", "summary": "Fix export"}),
+        json!({"project": "PM", "issue_type": "Bug", "summary": "Fix export"}),
+        json!({"project": "PM", "issue_type": "Task", "summary": "Fix export", "epic": "PM-101"}),
+    ] {
+        let (status, body) = edit(BOT_TOKEN, id.clone(), args.clone()).await;
+        assert_eq!(status, 422, "{args}: {body}");
+        assert_eq!(body["code"], "target_changed");
+        assert!(body["error"].as_str().unwrap().contains("can't change"));
+        let e = s.fixture.audit.events().last().cloned().unwrap();
+        assert_eq!((e.outcome, e.client), (Outcome::Denied, Client::Bot));
+        assert!(e.detail.unwrap().starts_with("target_changed"));
+    }
+    let item = s.fixture.svc.approval(&id).await.unwrap().unwrap();
+    assert_eq!(item.status, Status::Pending);
+    assert_eq!(item.args, drafted);
+    assert!(s.fixture.jira.writes().is_empty());
+
+    // A text-only edit goes ahead.
+    let text_only = json!({"project": "PM", "issue_type": "Task", "summary": "Fix the export timeout", "description": "Large key sets time out."});
+    let (status, body) = edit(BOT_TOKEN, id.clone(), text_only.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "approved");
+    assert_eq!(s.fixture.jira.writes()[0].args, text_only);
+
+    // The orchestrator's edits are not limited.
+    let other = pending().await;
+    let moved = json!({"project": "OPS", "issue_type": "Bug", "summary": "Fix export"});
+    let (status, body) = edit(SERVICE_TOKEN, other, moved.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(s.fixture.jira.writes()[1].args, moved);
+    s.cancel.cancel();
+}
+
+#[tokio::test]
+async fn the_console_token_reads_approvals_and_nothing_else() {
+    let s = start(common::team_fixture(&["ana", "bo"])).await;
+    let session = s
+        .fixture
+        .svc
+        .create_bot_session("ana", "scout", "tsk_console", None, now())
+        .await
+        .unwrap();
+    let out = s
+        .fixture
+        .svc
+        .call(
+            &session,
+            "jira_create_issue",
+            json!({"project": "PM", "issue_type": "Task", "summary": "x"}),
+            now(),
+        )
+        .await
+        .unwrap();
+    let id = out["approval_id"].as_str().unwrap().to_string();
+    let http = reqwest::Client::new();
+    let get = |path: String| {
+        let http = http.clone();
+        let base = s.base.clone();
+        async move {
+            http.get(format!("{base}{path}"))
+                .bearer_auth(CONSOLE_TOKEN)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // As the orchestrator reads them.
+    let res = get("/internal/approvals?user=ana".into()).await;
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["items"][0]["id"], json!(id));
+    let res = get(format!("/internal/approvals/{id}")).await;
+    assert_eq!(res.status(), 200);
+    let item: Value = res.json().await.unwrap();
+    assert_eq!(item["id"], json!(id));
+
+    // Everything else: 403.
+    for path in [
+        "/internal/ledger",
+        "/internal/ledger/summary",
+        "/internal/credentials?user=ana",
+        "/internal/onboarding?user=ana",
+        "/internal/members/requests",
+        "/internal/memory/repo?user=ana",
+        "/internal/oauth/jira/start?user=ana",
+    ] {
+        let res = get(path.into()).await;
+        assert_eq!(res.status(), 403, "GET {path}");
+    }
+    for (path, body) in [
+        (
+            format!("/internal/approvals/{id}/decision"),
+            json!({"decided_by": "ana", "decision": "approve"}),
+        ),
+        (
+            "/internal/sessions".to_string(),
+            json!({"user": "ana", "skill": "docs", "run_id": "r"}),
+        ),
+        (
+            "/internal/call".to_string(),
+            json!({"tool": "jira_read", "args": {"key": "PM-101"}}),
+        ),
+        (
+            "/internal/grants".to_string(),
+            json!({"session_token": session.token, "tool": "jira_create_issue", "args": {}}),
+        ),
+        ("/internal/reindex".to_string(), json!({})),
+        (
+            "/internal/members/requests".to_string(),
+            json!({"slack_id": "U0NEW", "email": "new@example.com", "name": "New"}),
+        ),
+    ] {
+        let res = post(&s.base, CONSOLE_TOKEN, &path, body).await;
+        assert_eq!(res.status(), 403, "POST {path}");
+    }
+    let res = http
+        .delete(format!("{}/internal/session", s.base))
+        .bearer_auth(CONSOLE_TOKEN)
+        .header("x-pmos-session", session.token.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
+    assert_eq!(
+        s.fixture.svc.approval(&id).await.unwrap().unwrap().status,
+        Status::Pending
+    );
+    assert!(s.fixture.jira.writes().is_empty());
+    // A wrong token is still 401.
+    let res = http
+        .get(format!("{}/internal/approvals?user=ana", s.base))
+        .bearer_auth("not-the-console-token-0123456789abcdef")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
     s.cancel.cancel();
 }

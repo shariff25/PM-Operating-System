@@ -2,28 +2,28 @@ import { useEffect } from 'react';
 import type { Task } from '../api';
 import { useApp } from '../app-context';
 import { Empty, NewRequestButton, PageHeader, Skeleton, TaskPill } from '../components/bits';
-import { Icon } from '../components/icons';
 import { copy } from '../copy';
 import { useData } from '../data';
 import { relTime } from '../time';
 import { taskHref } from '../url';
 
-/** Requests as an aligned table: what was asked, its status, and when. */
-export function TaskTable({ tasks, label }: { tasks: Task[]; label: string }) {
+/** Requests as dense rows: what was asked, its status, and when. `compact` drops the column heads. */
+export function TaskTable({ tasks, label, compact }: { tasks: Task[]; label: string; compact?: boolean }) {
   const now = Date.now();
   return (
     <div className="table">
-      <div className="thead tasks-grid" aria-hidden="true">
-        <span>{copy.activity.columns.request}</span>
-        <span>{copy.activity.columns.status}</span>
-        <span className="tcell-time">{copy.activity.columns.created}</span>
-      </div>
+      {!compact && (
+        <div className="thead tasks-grid" aria-hidden="true">
+          <span>{copy.activity.columns.request}</span>
+          <span>{copy.activity.columns.status}</span>
+          <span className="tcell-time">{copy.activity.columns.created}</span>
+        </div>
+      )}
       <ul className="tbody" aria-label={label}>
         {tasks.map((t) => (
           <li key={t.id}>
-            <a className="trow tasks-grid" href={taskHref(t.id)}>
+            <a className={`trow tasks-grid ${compact ? 'trow-compact' : ''}`} href={taskHref(t.id)}>
               <span className="tcell tcell-title">
-                <span className="row-icon"><Icon name="sparkle" size={15} /></span>
                 <span className="row-main">
                   <span className="row-title">{t.text}</span>
                   {t.status === 'failed' && t.error && <span className="row-meta">{t.error}</span>}
@@ -49,19 +49,21 @@ export function Activity() {
 
   return (
     <div className="page">
-      <PageHeader title={copy.activity.title} lede={copy.activity.lede}>
+      <PageHeader title={copy.activity.title} lede={copy.activity.lede} eyebrow={tasks ? copy.activity.countLine(tasks.length) : undefined}>
         <NewRequestButton />
       </PageHeader>
-      {!tasks && <Skeleton rows={4} label={copy.activity.loading} />}
-      {tasks && tasks.length === 0 && (
-        <Empty
-          icon="activity"
-          action={<button type="button" className="btn btn-sm" onClick={() => openPalette()}>{copy.emptyActions.askFirst}</button>}
-        >
-          {copy.activity.empty}
-        </Empty>
-      )}
-      {tasks && tasks.length > 0 && <TaskTable tasks={tasks} label={copy.activity.title} />}
+      <section className="card card-table" aria-label={copy.activity.title}>
+        {!tasks && <div className="card-body"><Skeleton rows={4} label={copy.activity.loading} /></div>}
+        {tasks && tasks.length === 0 && (
+          <Empty
+            icon="activity"
+            action={<button type="button" className="btn btn-sm" onClick={() => openPalette()}>{copy.emptyActions.askFirst}</button>}
+          >
+            {copy.activity.empty}
+          </Empty>
+        )}
+        {tasks && tasks.length > 0 && <TaskTable tasks={tasks} label={copy.activity.title} />}
+      </section>
     </div>
   );
 }

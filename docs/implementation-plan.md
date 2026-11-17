@@ -289,6 +289,55 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
 From the staff-engineer review (2026-11-14). Fixed before any real token: every blocker and
 the pilot list. Still open, roughly in priority order:
 
+**Security and code-practices review (2026-11-15).** Fixed in batch 1
+([spec](security-fixes-spec.md)), before the Spark's CI runner is registered or any real PM
+token is used:
+- ~~S1: the eval gate ran a pull request's own `pmos-admin` beside the Spark's secrets.~~ Fixed:
+  `pull_request_target`, the Spark's installed script, the PR checked out as data.
+- ~~S2: the Slack bot's token could grant admin, redirect a draft by editing it, read any PM's
+  approvals by id, and see approval ids in the ledger.~~ Fixed.
+- ~~S3: the benchmark token could run tasks as any PM and reach Slack.~~ Fixed:
+  `PMOS_EVALS_AS`, no Slack target, no notifications.
+- ~~S4: the console held the tool server's service token.~~ Fixed: its own read-only token.
+- ~~S5: the console believed any `X-Forwarded-User`, and a form with no `Origin` or
+  `Referer`.~~ Fixed: `PMOS_CONSOLE_PROXY_SECRET`, and both headers required.
+- ~~S6: notes and bets didn't carry the sensitivity of what they were built from.~~ Fixed.
+- ~~S7: a Confluence update could overwrite a newer version of the page.~~ Fixed.
+- ~~S10–S14, S17 and S24: untrusted bets output, `bet-` memory keys, the sample-size
+  overflow, memory tools for team bots, write-argument limits, tokens in debug output,
+  `deploy/*.env` in the build context, internal detail in write errors.~~ Fixed.
+
+Still open from that review:
+- **S8:** the gateway trusts the caller's user and priority headers (`X-Pmos-User`,
+  `X-Pmos-Priority`), so one bot token can spend another PM's share or jump the queue.
+- **S9:** a team bot's Jira rollup shows links and epics outside its scope.
+- **S15:** a refused token refresh can delete a newly re-linked account (the delete isn't
+  conditioned on the row the refresh read).
+- **S16:** routines have no minimum interval or per-owner cap.
+- **S18:** the worker lives at `/opt/pmos`, but the sandbox policy allows `/app`.
+- **S19:** a task's approval ids aren't checked against its session, so a worker can attach
+  another run's approvals to its task.
+- **S20:** the remote test upstream's signature cache isn't keyed by caller.
+- **S21:** the local model servers have no API key on the shared network.
+- **S22:** a worker call without its worker id isn't checked against the claim.
+- **S23:** GitHub Actions are pinned to tags, not commit SHAs.
+- **Code practices:**
+  - P1: no request ids, traces or metrics across services;
+  - P2: the tool server crate's size (one crate does MCP, connectors, OAuth, onboarding,
+    memory and the ledger);
+  - P3: loose error bodies on `/internal`, and three copies of the store error type;
+  - P4: duplicated plumbing across services (config, bearer auth, Postgres setup);
+  - P5: lock-poison panics (`.lock().unwrap()` / `expect` on the request path);
+  - P6: no inbound request timeouts;
+  - P7: file writes on the request path (audit file, Slack state);
+  - P8: no TypeScript or shell lint in CI;
+  - P9: Docker images aren't reproducible (unpinned base images and packages);
+  - P10: `pmos-admin` has only a dry-parse test, and `deploy/.env` is parsed two ways (sourced
+    by the shell, read by Compose);
+  - P11: no task deadline in the worker;
+  - P12: no CI job timeouts, and a compiler mismatch between CI and the images;
+  - no LICENSE file.
+
 **Before a second replica or Phase 3:**
 - Move these to Postgres:
   - OAuth used states, as a table with a unique key;

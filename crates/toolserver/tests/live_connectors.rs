@@ -19,7 +19,7 @@ use pmos_toolserver::audit::Outcome;
 use pmos_toolserver::catalog::Catalog;
 use pmos_toolserver::connectors::atlassian::{Confluence, Jira};
 use pmos_toolserver::connectors::slack::Slack;
-use pmos_toolserver::connectors::{Caller, Connector, ConnectorError};
+use pmos_toolserver::connectors::{Caller, Connector, ConnectorError, PAGE_CHANGED};
 use pmos_toolserver::oauth::{
     AppCredentials, Endpoints, OAuth, OAuthConfig, OAuthError, TokenError, TokenSource,
 };
@@ -987,11 +987,43 @@ async fn confluence_update_bumps_the_version_and_read_returns_text() {
     assert_eq!(page.content["body"], "PRD\nHello & welcome");
     assert_eq!(page.content["version"], 3);
 
+    // A version other than the page's: refused before anything is sent that changes it.
+    for stale in [2, 4] {
+        let err = l
+            .confluence
+            .write(
+                ana(),
+                "update_page",
+                &json!({"page_id": "555", "version": stale, "body": "New body"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, ConnectorError::BadArgs(PAGE_CHANGED.into()), "{stale}");
+    }
+    assert!(
+        l.mock
+            .requests("pages/555")
+            .iter()
+            .all(|r| r.method == "GET"),
+        "no PUT for a stale version"
+    );
+    // No version at all: refused too.
+    assert!(matches!(
+        l.confluence
+            .write(
+                ana(),
+                "update_page",
+                &json!({"page_id": "555", "body": "New body"})
+            )
+            .await,
+        Err(ConnectorError::BadArgs(_))
+    ));
+
     l.confluence
         .write(
             ana(),
             "update_page",
-            &json!({"page_id": "555", "body": "New body"}),
+            &json!({"page_id": "555", "version": 3, "body": "New body"}),
         )
         .await
         .unwrap();
@@ -1006,13 +1038,13 @@ async fn confluence_update_bumps_the_version_and_read_returns_text() {
     assert_eq!(put["title"], "PRD: SSO", "title kept");
     assert_eq!(put["status"], "current", "a published page stays published");
 
-    // A draft stays a draft, and a version clash says what to do.
+    // A draft stays a draft, and a 409 (someone saved in between) says what to do.
     let err = l
         .confluence
         .write(
             ana(),
             "update_page",
-            &json!({"page_id": "556", "body": "New draft"}),
+            &json!({"page_id": "556", "version": 1, "body": "New draft"}),
         )
         .await
         .unwrap_err();
@@ -1027,10 +1059,8 @@ async fn confluence_update_bumps_the_version_and_read_returns_text() {
         put["status"], "draft",
         "updating a draft must not publish it"
     );
-    assert!(
-        matches!(&err, ConnectorError::BadArgs(m) if m.contains("changed since PM OS read it")),
-        "{err:?}"
-    );
+    assert_eq!(err, ConnectorError::BadArgs(PAGE_CHANGED.into()));
+    assert_eq!(put["version"]["number"], 2, "version + 1");
 
     let hits = l
         .confluence
@@ -1352,6 +1382,7 @@ async fn link_over_http_then_call_through_the_tool_server() {
         AppConfig {
             service_token: SERVICE_TOKEN.into(),
             bot: None,
+            console_token: None,
             content_root: content.clone(),
             allowed_hosts: vec!["127.0.0.1".into()],
             oauth: Some(l.oauth.clone()),
@@ -1777,6 +1808,7 @@ async fn a_team_bot_session_reads_as_the_bot_and_writes_as_the_pm() {
                 token: BOT_TOKEN.into(),
                 skills: vec!["docs".into()],
             }),
+            console_token: None,
             content_root: content.clone(),
             allowed_hosts: vec!["127.0.0.1".into()],
             oauth: Some(l.oauth.clone()),

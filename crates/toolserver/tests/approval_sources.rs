@@ -45,6 +45,7 @@ async fn serve(f: Fixture) -> Server {
                 token: BOT_TOKEN.into(),
                 skills: vec!["docs".into()],
             }),
+            console_token: None,
             content_root: f.root.clone(),
             oauth: None,
             allowed_hosts: vec!["127.0.0.1".into(), "localhost".into()],

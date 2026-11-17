@@ -5,6 +5,8 @@ import { defineConfig } from '@playwright/test';
 const PORT = 5191;
 // A second server with a brand-new account: no drafts, no requests, an empty brief.
 const EMPTY_PORT = 5192;
+// A third with the brief not built (501), so the home page lays out without it.
+const BRIEF_OFF_PORT = 5193;
 
 // Use a browser that is already installed when there is one (PW_CHROMIUM, or the shared path);
 // otherwise Playwright uses the browser it downloaded itself.
@@ -39,6 +41,13 @@ export default defineConfig({
       reuseExistingServer: false,
       timeout: 60_000,
       env: { VITE_API: 'mock', VITE_MOCK_FAST: 'on', VITE_MOCK_EMPTY: 'on' },
+    },
+    {
+      command: `pnpm exec vite --host 127.0.0.1 --port ${BRIEF_OFF_PORT} --strictPort`,
+      url: `http://127.0.0.1:${BRIEF_OFF_PORT}`,
+      reuseExistingServer: false,
+      timeout: 60_000,
+      env: { VITE_API: 'mock', VITE_MOCK_FAST: 'on', VITE_MOCK_BRIEF: 'off' },
     },
   ],
 });
