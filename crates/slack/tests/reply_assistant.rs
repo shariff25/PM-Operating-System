@@ -186,13 +186,21 @@ struct MockTools {
 
 type Ts = State<Arc<MockTools>>;
 
-async fn ts_get(State(ts): Ts, Path(id): Path<String>, headers: HeaderMap) -> Response {
+/// `GET /internal/approvals/{id}?user=`: `404` unless the item is `user`'s (S2).
+async fn ts_get(
+    State(ts): Ts,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
     if bearer(&headers) != TOOL_BOT_TOKEN {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match ts.items.lock().unwrap().get(&id) {
-        Some(item) => Json(item.clone()).into_response(),
-        None => refuse(
+        Some(item) if q.get("user").is_some_and(|u| item["user"] == u.as_str()) => {
+            Json(item.clone()).into_response()
+        }
+        _ => refuse(
             StatusCode::NOT_FOUND,
             json!({"error": "no such approval item"}),
         ),
@@ -596,7 +604,7 @@ async fn the_reply_card_shows_the_draft_never_the_question_and_posts_as_you() {
     .await;
     assert!(notes
         .iter()
-        .all(|n| text_of(n).contains("Only Ana can decide this one")));
+        .all(|n| text_of(n).contains("Only the PM this approval is for can decide it")));
 
     // Post as you.
     stack

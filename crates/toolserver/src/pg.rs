@@ -41,7 +41,7 @@ use crate::ledger::{args_edit_distance, LedgerOutcome, LedgerQuery, LedgerRow, R
 use crate::members::{
     Created, Decided, MemberRequest, MemberRequestStore, NewRequest, RequestStatus, MAX_PENDING,
 };
-use crate::memory::{MemoryResult, MemoryStore, Note};
+use crate::memory::{MemoryResult, MemoryStore, Note, DEFAULT_NOTE_SENSITIVITY};
 use crate::memory_repo::{MemoryRepo, MemoryRepoStore};
 use crate::session::{token_hash, Session, SessionRepo};
 use crate::store::{StoreError, StoreResult, Stores};
@@ -258,7 +258,8 @@ impl ContextIndex for PgStore {
 impl MemoryStore for PgStore {
     async fn read(&self, user: &str) -> MemoryResult<Vec<Note>> {
         let rows = sqlx::query(
-            "SELECT key, text, updated_at FROM memory_notes WHERE user_handle = $1 ORDER BY key",
+            "SELECT key, text, updated_at, sensitivity FROM memory_notes
+             WHERE user_handle = $1 ORDER BY key",
         )
         .bind(user)
         .fetch_all(&self.pool)
@@ -267,10 +268,18 @@ impl MemoryStore for PgStore {
         let notes = rows
             .iter()
             .map(|r| {
+                // Null for notes from before notes carried one.
+                let sensitivity: Option<String> = r.try_get("sensitivity")?;
                 Ok(Note {
                     key: r.try_get("key")?,
                     text: r.try_get("text")?,
                     updated_at: r.try_get("updated_at")?,
+                    sensitivity: match sensitivity {
+                        None => DEFAULT_NOTE_SENSITIVITY,
+                        Some(s) => {
+                            Sensitivity::parse(&s).ok_or_else(|| bad_row("sensitivity", &s))?
+                        }
+                    },
                 })
             })
             .collect::<StoreResult<Vec<_>>>()?;
@@ -283,18 +292,20 @@ impl MemoryStore for PgStore {
         key: &str,
         text: &str,
         _source: &str,
+        sensitivity: Sensitivity,
         now: DateTime<Utc>,
     ) -> MemoryResult<Note> {
         sqlx::query(
-            "INSERT INTO memory_notes (user_handle, key, text, updated_at)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO memory_notes (user_handle, key, text, updated_at, sensitivity)
+             VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (user_handle, key) DO UPDATE SET text = EXCLUDED.text,
-                 updated_at = EXCLUDED.updated_at",
+                 updated_at = EXCLUDED.updated_at, sensitivity = EXCLUDED.sensitivity",
         )
         .bind(user)
         .bind(key)
         .bind(text)
         .bind(now)
+        .bind(sensitivity.to_string())
         .execute(&self.pool)
         .await
         .map_err(StoreError::from)?;
@@ -302,6 +313,7 @@ impl MemoryStore for PgStore {
             key: key.to_string(),
             text: text.to_string(),
             updated_at: now,
+            sensitivity,
         })
     }
 }
@@ -609,6 +621,28 @@ impl ApprovalRepo for PgStore {
         verdict: Verdict,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError> {
+        // An edit's distance is computed before the transaction, from the item as it is
+        // now, so no row lock is held while it runs. A pending item's arguments change only
+        // when it is decided, so under the lock they are the same; if they aren't (the hash
+        // differs), it is computed again there.
+        let early = match (&verdict.decision, &verdict.args) {
+            (Decision::Edit, Some(edited)) => {
+                let row = sqlx::query("SELECT args, args_hash FROM approvals WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(StoreError::from)?;
+                match row {
+                    Some(r) => {
+                        let args: Value = r.try_get("args").map_err(StoreError::from)?;
+                        let hash: String = r.try_get("args_hash").map_err(StoreError::from)?;
+                        Some((hash, args_edit_distance(&args, edited)))
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
         let mut tx = self.pool.begin().await.map_err(StoreError::from)?;
         // The lock makes a concurrent decision wait, then see this one's result.
         let sql = format!("SELECT {ITEM_COLUMNS} FROM approvals WHERE id = $1 FOR UPDATE");
@@ -648,7 +682,10 @@ impl ApprovalRepo for PgStore {
             Decision::Edit => {
                 // Checked above, before anything changed.
                 let args = verdict.args.ok_or(DecideError::MissingArgs)?;
-                let distance = args_edit_distance(&current.args, &args);
+                let distance = match early {
+                    Some((hash, distance)) if hash == current.args_hash => distance,
+                    _ => args_edit_distance(&current.args, &args),
+                };
                 (Status::Executing, Some(args), Some(distance))
             }
         };

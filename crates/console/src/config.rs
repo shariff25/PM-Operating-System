@@ -12,60 +12,31 @@ use crate::upstream::{Credentials, Signer};
 pub const ISSUER: &str = "console";
 
 /// Who the person in front of the browser is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Identity {
-    /// Behind the Spark's SSO proxy (`PMOS_CONSOLE_TRUST_PROXY=1`): `X-Forwarded-User` names
-    /// the person, believed only on a request that also carries the proxy's shared secret
-    /// (`PMOS_CONSOLE_PROXY_SECRET`) in `X-Pmos-Proxy-Secret`.
-    Proxy(ProxySecret),
-    /// Development: every request is this handle (`PMOS_CONSOLE_DEV_USER`). Only on a
-    /// loopback bind.
+    /// Behind the Spark's SSO proxy: `X-Forwarded-User` names the person
+    /// (`PMOS_CONSOLE_TRUST_PROXY=1`). Every request must also carry `X-Pmos-Proxy-Secret`
+    /// equal to `secret` (`PMOS_CONSOLE_PROXY_SECRET`), which only the proxy holds, so a
+    /// caller that reaches the console's port some other way can't name a user.
+    Proxy { secret: String },
+    /// Development: every request is this handle (`PMOS_CONSOLE_DEV_USER`).
     Dev(String),
 }
 
-/// The secret the reverse proxy sends on every request (`PMOS_CONSOLE_PROXY_SECRET`). Its
-/// `Debug` never shows the value.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ProxySecret(String);
-
-impl ProxySecret {
-    pub const MIN_LEN: usize = 32;
-
-    pub fn new(secret: impl Into<String>) -> Result<Self, String> {
-        let secret = secret.into();
-        if secret.len() < Self::MIN_LEN {
-            return Err(format!(
-                "PMOS_CONSOLE_PROXY_SECRET must be at least {} characters",
-                Self::MIN_LEN
-            ));
-        }
-        Ok(Self(secret))
-    }
-
-    /// Whether `presented` is the secret, in constant time. Both sides are hashed first, so
-    /// neither the content nor the length of the secret shows in the timing.
-    pub fn matches(&self, presented: &[u8]) -> bool {
-        pmos_runtime::token_eq(&digest(presented), &digest(self.0.as_bytes()))
-    }
-
-    fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-fn digest(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-impl std::fmt::Debug for ProxySecret {
+impl std::fmt::Debug for Identity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ProxySecret(<redacted>)")
+        match self {
+            Self::Proxy { .. } => f
+                .debug_struct("Proxy")
+                .field("secret", &"<redacted>")
+                .finish(),
+            Self::Dev(user) => f.debug_tuple("Dev").field(user).finish(),
+        }
     }
 }
+
+/// The shortest `PMOS_CONSOLE_PROXY_SECRET` the console accepts.
+pub const MIN_PROXY_SECRET: usize = 32;
 
 #[derive(Clone)]
 pub struct Config {
@@ -80,10 +51,10 @@ pub struct Config {
     pub bots_token: Credentials,
     /// `PMOS_TOOLSERVER_URL`, default `http://127.0.0.1:8710`.
     pub toolserver_url: String,
-    /// `PMOS_TOOLSERVER_TOKEN`: the console's own tool server token (`PMOS_CONSOLE_TOKEN`
-    /// there), which reaches only the approvals routes. Older deployments put the service
-    /// token here. Required, at least 32 characters. With a `console:toolserver` key in
-    /// `PMOS_ASSERTION_KEYS`, calls that name a person also carry a signed user assertion.
+    /// `PMOS_TOOLSERVER_TOKEN`: the tool server's read-only `console` client token
+    /// (`PMOS_CONSOLE_TS_TOKEN` there), which may only read approvals. Required, at least 32
+    /// characters. With a `console:toolserver` key in `PMOS_ASSERTION_KEYS`, calls that name a
+    /// person also carry a signed user assertion.
     pub toolserver_token: Credentials,
     /// `PMOS_CONTENT_ROOT`, default `content`: where `team.yaml` is.
     pub content_root: PathBuf,
@@ -143,11 +114,16 @@ impl Config {
             (true, None) => {
                 let secret = set("PMOS_CONSOLE_PROXY_SECRET").ok_or(
                     "PMOS_CONSOLE_TRUST_PROXY=1 needs PMOS_CONSOLE_PROXY_SECRET: the shared \
-                     secret (at least 32 characters) the reverse proxy sends in \
+                     secret (at least 32 characters) the sign-in proxy sends in \
                      X-Pmos-Proxy-Secret on every request. Run deploy/setup.sh to generate it, \
                      and set the proxy to send it (docs/console.md, Sign-in)",
                 )?;
-                Identity::Proxy(ProxySecret::new(secret)?)
+                if secret.len() < MIN_PROXY_SECRET {
+                    return Err(format!(
+                        "PMOS_CONSOLE_PROXY_SECRET must be at least {MIN_PROXY_SECRET} characters"
+                    ));
+                }
+                Identity::Proxy { secret }
             }
             (false, Some(user)) => {
                 if !pmos_contract::model::valid_handle(&user) {
@@ -173,8 +149,8 @@ impl Config {
         if bots_token == toolserver_token {
             return Err("PMOS_BOTS_TOKEN and PMOS_TOOLSERVER_TOKEN must differ".into());
         }
-        if let Identity::Proxy(secret) = &identity {
-            if secret.expose() == bots_token || secret.expose() == toolserver_token {
+        if let Identity::Proxy { secret } = &identity {
+            if *secret == bots_token || *secret == toolserver_token {
                 return Err(
                     "PMOS_CONSOLE_PROXY_SECRET must differ from PMOS_BOTS_TOKEN and \
                      PMOS_TOOLSERVER_TOKEN"
@@ -351,13 +327,28 @@ mod tests {
             .unwrap_err()
             .contains("not both"));
         let mut proxy = base.to_vec();
-        proxy.extend([
-            ("PMOS_CONSOLE_TRUST_PROXY", "1"),
-            ("PMOS_CONSOLE_PROXY_SECRET", SECRET),
-        ]);
+        proxy.push(("PMOS_CONSOLE_TRUST_PROXY", "1"));
+        let err = Config::from_lookup(lookup(&proxy)).unwrap_err();
+        assert!(
+            err.contains("PMOS_CONSOLE_PROXY_SECRET"),
+            "trusting the proxy needs its secret: {err}"
+        );
+        let mut short = proxy.clone();
+        short.push(("PMOS_CONSOLE_PROXY_SECRET", "too-short"));
+        assert!(Config::from_lookup(lookup(&short))
+            .unwrap_err()
+            .contains("at least 32"));
+        proxy.push(("PMOS_CONSOLE_PROXY_SECRET", SECRET));
+        let cfg = Config::from_lookup(lookup(&proxy)).unwrap();
         assert_eq!(
-            Config::from_lookup(lookup(&proxy)).unwrap().identity,
-            Identity::Proxy(ProxySecret::new(SECRET).unwrap())
+            cfg.identity,
+            Identity::Proxy {
+                secret: SECRET.into()
+            }
+        );
+        assert!(
+            !format!("{cfg:?}").contains(SECRET),
+            "the proxy secret never prints"
         );
         let mut yes = base.to_vec();
         yes.push(("PMOS_CONSOLE_TRUST_PROXY", "yes"));
@@ -467,15 +458,27 @@ mod tests {
 
     #[test]
     fn the_proxy_secret_is_compared_whole() {
-        let secret = ProxySecret::new(SECRET).unwrap();
-        assert!(secret.matches(SECRET.as_bytes()));
-        assert!(!secret.matches(b""));
-        assert!(!secret.matches(&SECRET.as_bytes()[..SECRET.len() - 1]));
-        assert!(!secret.matches(format!("{SECRET}x").as_bytes()));
-        assert!(!secret.matches(SECRET.to_uppercase().as_bytes()));
-        // Hashing first gives both sides one fixed length, so the constant-time comparison
-        // never returns early on a length mismatch.
-        assert_eq!(digest(b"").len(), digest(SECRET.as_bytes()).len());
+        use axum::http::{HeaderMap, HeaderValue};
+        let identity = Identity::Proxy {
+            secret: SECRET.into(),
+        };
+        let with = |values: &[&str]| {
+            let mut h = HeaderMap::new();
+            for v in values {
+                h.append(crate::auth::PROXY_SECRET, HeaderValue::from_str(v).unwrap());
+            }
+            crate::auth::from_proxy(&identity, &h)
+        };
+        assert!(with(&[SECRET]));
+        assert!(!with(&[]));
+        assert!(!with(&[""]));
+        assert!(!with(&[&SECRET[..SECRET.len() - 1]]));
+        assert!(!with(&[&format!("{SECRET}x")]));
+        assert!(!with(&[&SECRET.to_uppercase()]));
+        // Exactly one: a client's own copy next to the proxy's is refused, whichever comes
+        // first.
+        assert!(!with(&[SECRET, SECRET]));
+        assert!(!with(&["guess", SECRET]));
     }
 
     #[test]

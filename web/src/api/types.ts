@@ -10,6 +10,8 @@ export interface Me {
   first_visit: boolean;
   hints_seen: HintName[];
   nudges: boolean;
+  /** Not in the contract yet. When the server adds it, an admin or auditor sees the Admin entry. */
+  permissions?: string[];
 }
 
 export type DraftKind = 'confluence_page' | 'jira_issue' | 'slack_reply' | 'slack_message';

@@ -276,7 +276,7 @@ mode.
 ### What each service does
 
 - **`pmos-web`** signs every runtime call (each names the PM) and every tool-server call that
-  names the PM (the inbox, sources, decisions), when it has a key for that upstream: lifetime
+  names the PM (the inbox, one item, sources, decisions), when it has a key for that upstream: lifetime
   60 seconds, audience `bots` or `toolserver`, bound to the method, path, query and body as
   sent, a fresh assertion per call, next to the existing `X-Pmos-User` and `decided_by`. Roles
   come from `team.yaml`. `sid` is a reference to the PM's session: 16 hex characters of a
@@ -292,7 +292,7 @@ mode.
   someone else's routine signs as the admin). Reads of everything carry none. For an admin's
   view of every inbox it signs as each member whose inbox it reads. Its `sid` is the fixed
   `unknown`: the SSO proxy's session isn't visible to it. It calls the tool server with its own
-  token (`PMOS_CONSOLE_TOKEN` there).
+  token (`PMOS_CONSOLE_TS_TOKEN` there), which may only read approvals.
 - **The runtime** checks calls from `web` and `console`: the policy for each allows exactly one
   issuer, the client whose token was presented. The subject must equal every person the request
   names (`X-Pmos-User`, `requested_by=`, `owner=`, `/v1/members/{handle}`), and becomes the PM.
@@ -338,12 +338,14 @@ mode.
   service token. A compromise of the host, or of anything that can read `deploy/.env` or
   another container's environment, has every key, and the assertion stops nothing.
 - **Within its scope, a caller still acts as freely as before:** `web` creates `web` tasks
-  and decides approvals for the person it signs for, and the console still reads everything
+  and decides approvals for the person it signs for (an edit may change a draft's text, never
+  where it goes: `422 target_changed`), and the console still reads everything
   with its runtime token and pauses any routine (those name no one).
-- **One item read without an assertion:** `GET /internal/approvals/{id}` names no one, so the
-  web token reads any item by id without one. `pmos-web` re-reads an item this way after a
-  conflicting decision; `ToolServer::approval_for` is ready for when `app.rs` passes the
-  handle.
+- **One item read by the console without an assertion:** from the console's read-only token,
+  `GET /internal/approvals/{id}` may name no one, so it reads any item by id without one. From
+  the web token it must name the PM (`?user=`, else `404`), so every `pmos-web` read of one
+  item (`ToolServer::approval_for`: the first read when a draft is opened and the re-read
+  after a conflicting decision) names the PM and is signed for them.
 - **Replicas and restarts:** the replay cache is per process (see **Replay protection**).
 - **Audit:** the tool server's audit records the client (`web`, `console`), not yet the
   assertion's `iss`, `sub` and `sid`.
@@ -351,7 +353,7 @@ mode.
 ### Turning it on (upgrade)
 
 1. Run `deploy/setup.sh` again. It keeps every existing value and adds the web and console
-   tool-server tokens (`PMOS_TS_WEB_TOKEN`, `PMOS_TS_CONSOLE_TOKEN`) and one key per pair
+   tool-server tokens (`PMOS_TS_WEB_TOKEN`, `PMOS_CONSOLE_TS_TOKEN`) and one key per pair
    (`PMOS_AK_WEB_BOTS`, `PMOS_AK_WEB_TOOLSERVER`, `PMOS_AK_CONSOLE_BOTS`,
    `PMOS_AK_CONSOLE_TOOLSERVER`, each `<key id>:<base64>`). `compose.yaml` refuses to start
    until they exist. Keep the new `deploy/.env` in the password manager.

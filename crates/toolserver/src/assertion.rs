@@ -2,7 +2,8 @@
 //! `docs/toolserver.md`, Approvals auth).
 //!
 //! `pmos-web` and the console act for people with their own tokens (`PMOS_WEB_TOKEN`,
-//! `PMOS_CONSOLE_TOKEN`), which reach only `/internal/approvals*`. With `PMOS_ASSERTION_MODE`
+//! `PMOS_CONSOLE_TS_TOKEN`), which reach only `/internal/approvals*` (the console only its two
+//! reads; `pmos-web` also the admin reads). With `PMOS_ASSERTION_MODE`
 //! at `verify` or `require`, a call from either that carries `X-Pmos-Assertion` is believed
 //! only if the assertion verifies: signed with that client's key for `toolserver`, issued by
 //! the client whose token was presented, current, bound to this exact request, and not seen

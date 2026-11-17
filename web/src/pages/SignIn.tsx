@@ -81,6 +81,29 @@ function useProviders(api: Api): Providers {
   return providers;
 }
 
+/** The dark brand panel beside the sign-in and signed-out forms. */
+export function SignInBrand() {
+  return (
+    <header className="signin-brand">
+      <div className="signin-brand-mark">
+        <Mark size={28} />
+        <span className="signin-brand-name">{copy.appName}</span>
+      </div>
+      <div className="signin-brand-body">
+        <p className="signin-tagline">{copy.signIn.tagline}</p>
+        <ul className="signin-points">
+          {copy.signIn.points.map((p) => (
+            <li key={p}>
+              <Icon name="check" size={16} weight={2.4} />
+              {p}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </header>
+  );
+}
+
 /** `path` is the page the PM was trying to reach, so Microsoft can send them back to it. */
 export function SignIn(props: ProviderProps & { path?: string }) {
   const providers = useProviders(props.api);
@@ -88,9 +111,12 @@ export function SignIn(props: ProviderProps & { path?: string }) {
   const dev = providers.state === 'ready' && providers.list.includes('dev');
   return (
     <div className="signin-wrap">
+      <SignInBrand />
       <main className="signin">
-        <Mark size={36} />
-        <h1>{copy.signIn.title}</h1>
+        <div className="signin-head">
+          <h1>{copy.signIn.title}</h1>
+          <p className="muted">{copy.signIn.lede}</p>
+        </div>
         {providers.state === 'loading' && <p className="muted" role="status">{copy.signIn.loading}</p>}
         {providers.state === 'ready' && !entra && !dev && (
           <p className="signin-none">

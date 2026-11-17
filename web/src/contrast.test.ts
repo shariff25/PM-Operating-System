@@ -36,6 +36,12 @@ const PAIRS: [string, string][] = [
   ['good-ink', 'surface'], ['good-ink', 'bg'], ['bad-ink', 'bg'], ['accent', 'nav-active'], ['surface', 'bad-ink'],
   // Changed words inside a before and after line.
   ['good-ink', 'add-word'], ['bad-ink', 'del-word'],
+  // The redesign: the dark rail, system tags, the accent mark, soft accent text, the paper ground.
+  ['rail-ink', 'rail'], ['rail-muted', 'rail'], ['rail-muted', 'rail-2'], ['rail-strong', 'rail-active'],
+  ['rail-ink', 'rail-active'], ['rail-sub', 'rail'], ['rail-muted', 'rail-active'], ['mark-ink', 'mark'],
+  ['sys-ink', 'sys-bg'], ['slack-ink', 'slack-bg'], ['accent-text', 'accent-soft'], ['accent-text', 'surface'],
+  ['ink-2', 'surface'], ['muted', 'surface-3'], ['ink', 'surface-3'], ['muted', 'warn-bg'], ['primary-ink', 'primary-hover'],
+  ['accent-ink', 'accent-hover'], ['warn-ink', 'surface-2'],
 ];
 
 describe('dark tokens', () => {
@@ -57,5 +63,8 @@ describe.each([['light', light], ['dark', dark]] as const)('%s theme contrast', 
   it('input borders and focus rings are at least 3:1 against the surface', () => {
     expect(ratio(t['border-strong']!, t['surface']!)).toBeGreaterThanOrEqual(3);
     expect(ratio(t['focus']!, t['bg']!)).toBeGreaterThanOrEqual(3);
+    expect(ratio(t['focus']!, t['surface']!)).toBeGreaterThanOrEqual(3);
+    expect(ratio(t['rail-focus']!, t['rail']!)).toBeGreaterThanOrEqual(3);
+    expect(ratio(t['accent']!, t['surface']!)).toBeGreaterThanOrEqual(3);
   });
 });

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { FollowUp } from '../api';
 import { messageOf, useApp } from '../app-context';
-import { Avatar, Empty, ErrorNote, ExtLink, NewRequestButton, PageHeader, Skeleton } from '../components/bits';
+import { Empty, ErrorNote, ExtLink, NewRequestButton, PageHeader, Skeleton, initials, systemTone } from '../components/bits';
 import { Icon, systemIcon } from '../components/icons';
 import { useToast } from '../components/Toasts';
 import { copy } from '../copy';
@@ -32,7 +32,7 @@ export function FollowUps() {
 
   const rows = (list: FollowUp[], empty: string, action: string) =>
     list.length === 0 ? (
-      <Empty icon="inbox">{empty}</Empty>
+      <Empty icon="inbox" small>{empty}</Empty>
     ) : (
       <div className="table">
         <div className="thead follow-grid" aria-hidden="true">
@@ -45,7 +45,7 @@ export function FollowUps() {
           {list.map((f) => (
             <li key={f.id} className="trow follow-grid">
               <span className="tcell follow-who">
-                <Avatar name={f.who} size="sm" />
+                <span className={`wait-avatar wait-avatar-${systemTone(f.system)}`} aria-hidden="true">{initials(f.who).slice(0, 1)}</span>
                 <strong>{f.who}</strong>
               </span>
               <div className="tcell follow-main">
@@ -76,7 +76,7 @@ export function FollowUps() {
 
   return (
     <div className="page">
-      <PageHeader title={copy.followups.title} lede={copy.followups.lede}>
+      <PageHeader title={copy.followups.title} lede={copy.followups.lede} eyebrow={copy.followups.countLine}>
         <NewRequestButton />
       </PageHeader>
       {error && <ErrorNote>{error}</ErrorNote>}
@@ -95,30 +95,34 @@ export function FollowUps() {
           {copy.followups.emptyAll}
         </Empty>
       ) : (
-        <>
-          <section className="section" aria-labelledby="fu-you">
-            <div className="section-head">
-              <h2 id="fu-you">{copy.home.waitingOnYou}</h2>
-              <span className="section-count">{brief.waiting_on_you.length}</span>
+        <div className="stack">
+          <section className="card card-table" aria-labelledby="fu-you">
+            <div className="card-head">
+              <h2 id="fu-you">
+                {copy.home.waitingOnYou}
+                <span className="card-count" aria-hidden="true">{brief.waiting_on_you.length}</span>
+              </h2>
             </div>
             {rows(brief.waiting_on_you, copy.nothingWaiting, copy.home.draftReply)}
           </section>
-          <section className="section" aria-labelledby="fu-them">
-            <div className="section-head">
-              <h2 id="fu-them">{copy.home.youWaitOn}</h2>
-              <span className="section-count">{brief.you_wait_on.length}</span>
+          <section className="card card-table" aria-labelledby="fu-them">
+            <div className="card-head">
+              <h2 id="fu-them">
+                {copy.home.youWaitOn}
+                <span className="card-count" aria-hidden="true">{brief.you_wait_on.length}</span>
+              </h2>
             </div>
             {rows(brief.you_wait_on, copy.nothingWaitedOn, copy.home.draftNudge)}
           </section>
           {brief.changed.length > 0 && (
-            <section className="section" aria-labelledby="fu-changed">
-              <div className="section-head">
+            <section className="card card-table" aria-labelledby="fu-changed">
+              <div className="card-head">
                 <h2 id="fu-changed">{copy.home.changed}</h2>
               </div>
-              <ul className="tbody tbody-top">
+              <ul className="tbody">
                 {brief.changed.map((c) => (
                   <li key={c.url} className="trow change-row">
-                    <span className="row-icon"><Icon name={systemIcon(c.system)} size={16} /></span>
+                    <span className="timeline-when">{c.system}</span>
                     <div className="follow-main">
                       <p className="follow-line"><strong>{c.title}</strong></p>
                       <p className="follow-meta">
@@ -135,7 +139,7 @@ export function FollowUps() {
               </ul>
             </section>
           )}
-        </>
+        </div>
       )}
     </div>
   );
