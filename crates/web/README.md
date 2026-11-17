@@ -46,6 +46,15 @@ For Entra ID sign-in instead of `PMOS_WEB_DEV_LOGIN=1`, set `PMOS_WEB_ENTRA_TENA
 | `PMOS_WEB_DATABASE_URL` | none | Postgres for sessions, settings and follow-ups (`src/store_config.rs`). Without it everything is in memory and a start-up warning says a restart signs everyone out |
 | `PMOS_WEB_BRIEF` | off | `1` turns on `GET /api/brief` and the follow-up routes; off, they answer `501 not_built` and the app hides the section |
 | `PMOS_WEB_BRIEF_TOKEN` | none | The bearer token `PUT /internal/brief/{handle}` needs, at least 32 characters. Without it that route answers `501` |
+| `PMOS_WEB_GITHUB_REPO` | none | `owner/name`: where admin policy and content proposals open pull requests (`docs/policy-admin.md`, `docs/content-admin.md`). Set with `PMOS_WEB_GITHUB_TOKEN` or neither; without them the proposal routes answer `501 not_configured` and reading and validating still work |
+| `PMOS_WEB_GITHUB_TOKEN` | none | A token with **contents: write** and **pull requests: write** on that one repository, nothing else. Sent only as `Authorization` to `PMOS_WEB_GITHUB_API`; never logged (`Debug` redacts it) |
+| `PMOS_WEB_GITHUB_API` | `https://api.github.com` | For tests and GitHub Enterprise: `https`, or `http` only to a loopback host |
+| `PMOS_WEB_GITHUB_BASE` | the default branch | The branch proposals target |
+| `PMOS_WEB_GITHUB_CONTENT_DIR`, `PMOS_WEB_GITHUB_POLICIES_DIR` | `content`, `policies` | Where the content tree and the generated policies are in that repository |
+| `PMOS_WEB_POLICIES_ROOT` | `policies` beside the content root, if there | The checked-in policy files the Policy Admin compares with (drift) |
+| `PMOS_WEB_GATEWAY_CONFIG` | none | The gateway's model config (`deploy/gateway.yaml`), read for model and upstream names only, for `GET /api/admin/harness` |
+| `PMOS_WEB_CONTENT_REVISION` | none | The deployed content's commit, when the content root has no `.git` to read it from |
+| `PMOS_WEB_PROPOSALS_PER_HOUR` | `10` | Proposals per admin per hour, 1 to 100, in memory (per process; a restart resets it) |
 
 `GET /healthz` answers `ok` with no sign-in. SIGTERM or Ctrl-C lets in-flight requests finish.
 
@@ -213,6 +222,18 @@ path with another method a JSON `405 method_not_allowed`.
   logged here (handle, route, filter names only). `GET /api/me` also gives `permissions`
   (from `pmos_contract::permissions::granted`), so the app knows whether to show the Admin
   area; an older client ignores it.
+- **Policy Admin and content admin** (`src/app/{policy, content, proposal}.rs`, logic in
+  `src/{policy_admin, content_admin, proposals, github}.rs`; `docs/web-api.md`, **Admin:
+  policy** and **Admin: content and harness**; `docs/policy-admin.md`,
+  `docs/content-admin.md`): read-and-propose. Reading and validating need `view-policies` /
+  `view-content` (admins and auditors), proposing `edit-policies` / `edit-content` (admins).
+  Validation copies the deployed content tree to a scratch directory, applies the change, and
+  runs the contract crate's lint and the policy crate's generation and rule checks there;
+  nothing on disk changes. A proposal is validated again, checked against the base branch
+  (`409 stale_base`), rate-limited, recorded at the tool server
+  (`POST /internal/admin/proposals`, signed for the admin; no record, no pull request), and
+  opened as one commit on a new `pmos/proposal/…` branch with a pull request labelled
+  `pmos-proposal`. pmos-web never writes the default branch and never merges.
 
 ## Where the contract isn't met as written
 
@@ -271,8 +292,11 @@ admins control; a guest account's `preferred_username` is its home address. Logo
 the PM OS session.
 
 **This backend is still a deputy, now a narrower one.** It holds its own tool server token,
-which reaches only the approvals routes and the read-only admin routes (no sessions, grants,
-account linking or credentials; the admin routes check the viewer's role themselves),
+which reaches only the approvals routes, the read-only admin routes and the record of an
+admin's proposal (no sessions, grants, account linking or credentials; the admin routes check
+the viewer's role themselves), a GitHub token for proposals (contents and pull requests write
+on one repository: a compromised `pmos-web` can open branches and pull requests there, never
+merge them past branch protection),
 a runtime token for the `web` client, and the two keys that sign its user assertions. With the
 runtime and the tool server in `PMOS_ASSERTION_MODE=require`, the tokens alone no longer act
 for anyone: a call that names a PM needs an assertion for that PM, bound to that request and
@@ -299,8 +323,9 @@ practice drafts and follow-ups. The session's CSRF token is stored (it is not th
 An edit of a Slack draft is Slack text: the tool server drops the draft's own text after 24
 hours and the edit is unreachable by then, but the row itself waits for the 7-day purge.
 
-**Not built:** rate limiting (on sign-in, on asks and on change requests); an audit record of
-web actions (the tool server audits decisions and admin reads, with `web` as the client); a
+**Not built:** rate limiting (on sign-in, on asks and on change requests; admin proposals have
+an in-memory limit per admin); an audit record of web actions (the tool server audits
+decisions, admin reads and admin proposals, with `web` as the client); a
 per-PM limit on running tasks; admin tasks-by-status counts (the runtime has no team-wide read
 for the `web` client); and, for Entra ID sign-in (`docs/entra-sign-in.md`, "Not built"): roles from
 group or app-role claims, matching by the token's `oid`, conditional access awareness, single

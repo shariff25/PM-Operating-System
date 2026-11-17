@@ -27,8 +27,9 @@
 //!     only with `?user=` naming the item's PM and can't change where a draft goes when it
 //!     edits one; it reaches neither the ledger nor onboarding (so no `admin` grants). It
 //!     also reaches the read-only admin and auditor routes (`GET /internal/admin/*`,
-//!     `app/admin.rs`), which check the named viewer's role themselves; never sessions,
-//!     grants, calls, account linking or credentials.
+//!     `app/admin.rs`) and the audit record of an admin's change proposal
+//!     (`POST /internal/admin/proposals`), which check the named viewer's role themselves;
+//!     never sessions, grants, calls, account linking or credentials.
 //!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
