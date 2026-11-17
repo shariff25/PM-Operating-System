@@ -76,8 +76,11 @@ The callback's `reason`s, for the app's signed-out page:
 `crates/contract/src/permissions.rs`), kebab-case, in a fixed order; an unknown role adds
 nothing. It is for showing and hiding parts of the app; the server checks every request
 itself. Show the Admin area when it contains `view-audit-log` or `manage-connectors` (see
-**Admin and auditor**). An older server leaves `permissions` out: treat that as `[]`. An
-auditor's is `["view-audit-log", "export-audit"]`; an admin's has all 18.
+**Admin and auditor**); show the policy screens with `view-policies` and their propose
+buttons with `edit-policies` (**Admin: policy**); show the content and harness screens with
+`view-content` and their propose buttons with `edit-content` (**Admin: content and
+harness**). An older server leaves `permissions` out: treat that as `[]`. An auditor's is
+`["view-audit-log", "export-audit", "view-content", "view-policies"]`; an admin's has all 21.
 
 ## Drafts
 
@@ -416,3 +419,544 @@ tasks, with no team-wide read, so `pmos-web` can't count them.
 - **A read refused by `pmos-web` itself** (a `400`, or its own `403`) never reaches the tool
   server, so it is only in `pmos-web`'s log, not the audit log.
 - **No free-text search**; `actor` and `action` match exactly.
+
+## Admin: policy
+
+The Policy Admin for the NVIDIA OpenShell sandbox every bot runs in (`docs/policy-admin.md`
+says what it does and how it's set up). **Read-and-propose:** nothing here writes a file. A
+change is opened as a GitHub pull request; a person reviews and merges it in GitHub.
+
+| Route | `admin` | `auditor` | anyone else |
+| --- | --- | --- | --- |
+| `GET /api/admin/policy` | yes | yes | `403 forbidden` |
+| `POST /api/admin/policy/validate` | yes | yes | `403 forbidden` |
+| `GET /api/admin/policy/proposals` | yes | yes | `403 forbidden` |
+| `POST /api/admin/policy/proposals` | yes | `403 forbidden` | `403 forbidden` |
+
+Reading and validating need `view-policies`; proposing needs `edit-policies`. Signed out is
+`401 signed_out`; every `POST` needs the CSRF token (`403 bad_csrf`) and JSON
+(`415 bad_content_type`), as everywhere. The role check comes before anything else, so an
+auditor proposing gets `403`, never `501`.
+
+**What the server shows is its deployed revision.** The spec, the files and every validation
+are computed from the content tree `pmos-web` is running with (`PMOS_CONTENT_ROOT`) and the
+policy files beside it (`PMOS_WEB_POLICIES_ROOT`). That can be behind the repository's default
+branch. A proposal is made on the default branch's head and is refused `409 stale_base` when a
+file it writes differs there from the server's copy; `revision.commit` says which commit the
+server has, when it can tell.
+
+**What a policy is made from.** Policies are generated, never hand-written: `pmos policy
+generate` derives each bot's policy from three inputs in the content tree, and those inputs are
+the `spec` the admin edits:
+
+- `bots.<bot>`: `role`, `scope` (`team` or `personal`) and `owner` (a handle), from
+  `content/bots/<bot>/BOT.md`. A personal bot also reads its owner's
+  `master/people/<owner>/AGENTS.md`, when there is one.
+- `roles.<role>.skills`: from `content/roles/<role>/ROLE.md`. Each skill is uploaded read-only.
+- `skills.<skill>.tools`: registry names (`docs.search`) from `content/skills/<skill>/SKILL.md`
+  `metadata.tools`. They become the only tools `tools/call` may name (as MCP names,
+  `docs_search`).
+
+Everything else is `fixed`: the three destinations (tool server, gateway, runtime) and their
+ports, REST routes, MCP methods and revisions, the worker binary, the system paths, the
+workspace, the non-root identity and Landlock. They change only with code
+(`crates/policy/src/lib.rs`), never here. New bots, roles and skills are content proposals
+(**Admin: content and harness**), which regenerate the policies the same way.
+
+### `GET /api/admin/policy`
+
+```json
+{"revision": {"commit": "5bb6de4c…", "source": "git"},
+ "spec": {
+   "bots": {"docs": {"role": "docs-helper", "scope": "team", "owner": "TODO"}},
+   "roles": {"docs-helper": {"skills": ["docs"]},
+             "pm-assistant": {"skills": ["ask", "meeting-notes", "…"]}},
+   "skills": {"docs": {"tools": ["docs.search", "docs.read"]}, "…": {"tools": []}}},
+ "spec_sources": {"bots": "content/bots/<bot>/BOT.md", "roles": "content/roles/<role>/ROLE.md",
+                  "skills": "content/skills/<skill>/SKILL.md"},
+ "fixed": {
+   "services": [
+     {"service": "toolserver", "rule": "pmos_toolserver", "host": "toolserver.pmos.internal",
+      "port": 8710, "protocol": "mcp", "routes": null, "credential_profile": null},
+     {"service": "gateway", "rule": "pmos_gateway", "host": "gateway.pmos.internal",
+      "port": 8740, "protocol": "rest", "routes": ["POST /v1/chat/completions"],
+      "credential_profile": "pmos-gateway"},
+     {"service": "runtime", "rule": "pmos_runtime", "host": "bots.pmos.internal", "port": 8750,
+      "protocol": "rest", "routes": ["POST /v1/worker/claim", "POST /v1/worker/tasks/*/complete",
+      "POST /v1/worker/tasks/*/events", "POST /v1/worker/tasks/*/fail",
+      "POST /v1/worker/tasks/*/heartbeat", "POST /v1/worker/tasks/*/trace"],
+      "credential_profile": "pmos-worker"}],
+   "mcp_path": "/mcp",
+   "mcp_methods": ["initialize", "notifications/initialized", "tools/list", "tools/call"],
+   "mcp_versions": ["2025-03-26", "2025-06-18", "2025-11-25"],
+   "worker_binary": "/usr/local/bin/node", "workspace": "/sandbox/workspace",
+   "content_mount": "/sandbox", "shared_content": ["templates", "reviewers", "playbooks"],
+   "system_read_only": ["/app", "/dev/urandom", "/etc", "/lib", "/proc", "/usr", "/var/log"],
+   "system_read_write": ["/dev/null", "/tmp"], "run_as": "sandbox",
+   "landlock": "hard_requirement", "source": "crates/policy/src/lib.rs"},
+ "bots": [
+   {"bot": "docs", "role": "docs-helper", "scope": "team", "sandbox": "pmos-docs",
+    "skills": ["docs"], "tools": ["docs_read", "docs_search"], "master": ["master/AGENTS.md"],
+    "policy_file": "policies/bots/docs.yaml",
+    "launch_spec_file": "policies/bots/docs.sandbox.yaml",
+    "allowances_from": "checked_in",
+    "allowances": {
+      "network": [
+        {"rule": "pmos_gateway", "service": "gateway", "host": "gateway.pmos.internal",
+         "port": 8740, "ports": [], "allowed_ips": [], "protocol": "rest",
+         "enforcement": "enforce", "tls": null, "access": null,
+         "binaries": ["/usr/local/bin/node"], "credential": "pmos-docs-gateway",
+         "routes": ["POST /v1/chat/completions"], "mcp_methods": [], "mcp_tools": [],
+         "mcp_versions": []},
+        {"rule": "pmos_toolserver", "service": "toolserver", "host": "toolserver.pmos.internal",
+         "port": 8710, "ports": [], "allowed_ips": [], "protocol": "mcp",
+         "enforcement": "enforce", "tls": null, "access": null,
+         "binaries": ["/usr/local/bin/node"], "credential": null, "routes": [],
+         "mcp_methods": ["initialize", "notifications/initialized", "tools/list", "tools/call"],
+         "mcp_tools": ["docs_read", "docs_search"],
+         "mcp_versions": ["2025-03-26", "2025-06-18", "2025-11-25"]}],
+      "network_middlewares": [],
+      "filesystem": {"include_workdir": false,
+        "read_only": ["/app", "/dev/urandom", "/etc", "/lib", "/proc", "/sandbox/master/AGENTS.md",
+                      "/sandbox/playbooks", "/sandbox/reviewers", "/sandbox/skills/docs",
+                      "/sandbox/templates", "/sandbox/tools.yaml", "/usr", "/var/log"],
+        "read_write": ["/dev/null", "/sandbox/workspace", "/tmp"]},
+      "landlock": "hard_requirement",
+      "process": {"run_as_user": "sandbox", "run_as_group": "sandbox"},
+      "providers": ["pmos-docs-gateway", "pmos-docs-worker"],
+      "uploads": ["master/AGENTS.md -> /sandbox/master/AGENTS.md",
+                  "skills/docs -> /sandbox/skills/docs", "tools.yaml -> /sandbox/tools.yaml"],
+      "summary": [
+        "May connect to the model gateway at gateway.pmos.internal:8740 (rest, enforce) from /usr/local/bin/node: POST /v1/chat/completions.",
+        "Uses the credential pmos-docs-gateway on gateway.pmos.internal:8740.",
+        "May call these tools: docs_read, docs_search.",
+        "May read this content: /sandbox/master/AGENTS.md, /sandbox/skills/docs, /sandbox/tools.yaml.",
+        "May write only: /dev/null, /sandbox/workspace, /tmp.",
+        "Runs as sandbox:sandbox; Landlock hard_requirement."]}}],
+ "files": [
+   {"path": "policies/bots/docs.sandbox.yaml", "state": "same",
+    "generated": "# Generated by `pmos policy generate` …", "checked_in": "# Generated by …"},
+   {"path": "policies/bots/docs.yaml", "state": "same", "generated": "…", "checked_in": "…"},
+   {"path": "policies/providers/pmos-gateway.yaml", "state": "same", "generated": "…",
+    "checked_in": "…"},
+   {"path": "policies/providers/pmos-worker.yaml", "state": "same", "generated": "…",
+    "checked_in": "…"}],
+ "drift": {"checked_in_available": true, "in_sync": true, "violations": []},
+ "generate_errors": [],
+ "proposals_configured": true}
+```
+
+(Shortened where `…` appears; the real answer lists every item, every runtime route and every
+summary line.)
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `revision.commit` | string or `null` | The commit the server's content is from: `PMOS_WEB_CONTENT_REVISION`, else read from the git files beside the content root. `null` when neither says. |
+| `revision.source` | `"config"`, `"git"` or `null` | Where `commit` came from. |
+| `spec` | object | The policy inputs, as above: every bot, role and skill the content defines (a file that doesn't lint is left out; see `generate_errors`). `owner` is a handle without `@`, `TODO` while unassigned. Lists are in file order. |
+| `spec_sources` | object | Where each part of the spec lives in the repository. |
+| `fixed` | object | What no spec can change (above). `routes` is `null` for the MCP endpoint; `credential_profile` is `null` for the tool server, which binds no provider (its session token is per task). |
+| `bots[]` | array | One per bot the content generates a policy for, by name. Empty when `generate_errors` isn't. |
+| `bots[].tools` | string[] | MCP tool names `tools/call` may name, sorted. |
+| `bots[].master` | string[] | Master context files the bot reads, content-relative. |
+| `bots[].allowances` | object or `null` | What the policy file allows, read field by field from it (below). `null` when the file is missing or doesn't parse. |
+| `bots[].allowances_from` | `"checked_in"` or `"generated"` | `checked_in`: the file in the policies root (what OpenShell is given). `generated`: the server has no policies root, so this is what the content generates. |
+| `files[]` | array | Every generated file, and every checked-in `.yaml` in `bots/` and `providers/`, by path. |
+| `files[].state` | string | `same`, `differs` (drift: regenerate, or a hand edit), `missing` (generated, not checked in), `orphan` (checked in, not generated any more; a hand-written file there is also `orphan`) or `unknown` (no policies root). |
+| `files[].generated`, `files[].checked_in` | string or `null` | The file's text: what generation writes, and what is checked in. `null` where there is none. |
+| `drift.checked_in_available` | boolean | Whether the server has a policies root to compare with. |
+| `drift.in_sync` | boolean or `null` | Every file `same` and no rule broken. `null` without a policies root. |
+| `drift.violations[]` | `Issue[]` | Every PM OS rule a checked-in file breaks (`pmos policy check`'s rules: `net-egress`, `net-tools`, `fs-writable`, `cred-binding`, `proc-identity`, …), at its path. |
+| `generate_errors[]` | `Issue[]` | Content lint errors that stop generation (then `bots` is empty). |
+| `proposals_configured` | boolean | Whether GitHub is set up. When `false`, hide the propose button: proposals answer `501`. |
+
+**Allowances** (one object per bot):
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `network[]` | array | One per endpoint, rule by rule. Anything not listed is denied. |
+| `network[].rule` | string | The `network_policies` key, as OpenShell logs it. |
+| `network[].service` | `"toolserver"`, `"gateway"`, `"runtime"` or `null` | Which PM OS service `host:port` is. **`null` is a destination PM OS doesn't know**: show it as a red flag (a hand edit). |
+| `network[].host`, `network[].port` | string or `null`, integer or `null` | The destination. |
+| `network[].ports`, `network[].allowed_ips` | arrays | Extra ports and IP ranges. Always empty in a generated policy; anything here is a hand edit. |
+| `network[].protocol` | string or `null` | `rest` or `mcp` when inspected; `null` is not inspected. |
+| `network[].enforcement` | string or `null` | `enforce`; anything else (`audit`, `null`) only logs. |
+| `network[].tls`, `network[].access` | string or `null` | Always `null` in a generated policy (`skip` would relay TLS uninspected; an access preset is broad). |
+| `network[].binaries` | string[] | The executables that may open these connections. |
+| `network[].credential` | string or `null` | The provider instance bound to this endpoint. |
+| `network[].routes` | string[] | REST: `METHOD path` allowed (in OpenShell's globs, `*` is one path segment). |
+| `network[].mcp_methods`, `network[].mcp_tools`, `network[].mcp_versions` | string[] | MCP: the methods, the tools `tools/call` may name, and the protocol revisions. |
+| `network_middlewares` | string[] | Always empty in a generated policy. |
+| `filesystem.read_only`, `filesystem.read_write` | string[] | Paths inside the sandbox. Content is under `/sandbox/`. |
+| `filesystem.include_workdir` | boolean | `true` would make the working directory writable too. |
+| `landlock` | string or `null` | `hard_requirement`: the sandbox doesn't start without its filesystem rules. |
+| `process.run_as_user`, `process.run_as_group` | string or `null` | The workload identity. |
+| `providers` | string[] or `null` | The launch spec's `--provider` attachments; `null` without a launch spec. |
+| `uploads` | string[] or `null` | The launch spec's read-only uploads, `from -> to` (`from` content-relative). |
+| `summary` | string[] | The same, in sentences. |
+
+**`Issue`** (here and in every validation below):
+
+```json
+{"severity": "error", "code": "role-skill-unknown", "path": "content/roles/docs-helper/ROLE.md",
+ "line": null, "message": "skill `no-such-skill` is not in skills/"}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `severity` | `"error"` or `"warning"` | An error stops a proposal; a warning doesn't. |
+| `code` | string | Stable: a content lint code (`docs/contract.md`; such as `skill-parse`, `role-skill-unknown`, `owner-unassigned`), a policy rule (`net-egress`, …), or a spec code (below). |
+| `path` | string | A repository path (`content/…`, `policies/…`), or for a spec error a spec path (`spec.bots.docs.scope`, `spec.skills.docs.tools[2]`). |
+| `line` | integer or `null` | 1-based line in the file, when the parser gave a position (front matter that doesn't parse). Usually `null`: most rules are about the whole file. |
+| `message` | string | One sentence for the admin. |
+
+### `POST /api/admin/policy/validate`
+
+Runs the change on a scratch copy of the deployed content: applies the spec to the bot, role
+and skill files, runs the content lint, regenerates every policy, checks each against the PM
+OS rules, and compares with what's checked in. Nothing is saved.
+
+Request: `{"spec": SpecPatch}`. A `SpecPatch` is any part of `spec`: leave out what doesn't
+change. A field equal to the current value changes nothing.
+
+```json
+{"spec": {"skills": {"docs": {"tools": ["docs.search", "docs.read", "jira.search"]}},
+          "bots": {"docs": {"owner": "ana"}},
+          "roles": {"docs-helper": {"skills": ["docs"]}}}}
+```
+
+Unknown fields anywhere (`{"bots": {"docs": {"hosts": []}}}`) are `400 bad_request`: only
+`role`, `scope`, `owner`, `skills` and `tools` exist.
+
+Response, always `200` once the body parses (check `valid`):
+
+```json
+{"valid": true,
+ "errors": [],
+ "warnings": [
+   {"severity": "warning", "code": "bot-reads-empty", "path": "content/bots/docs/BOT.md",
+    "line": null, "message": "this team bot can read Jira, Confluence or Slack but lists nothing under `reads`, so it will read nothing there"}],
+ "content_changes": [
+   {"path": "content/skills/docs/SKILL.md", "change": "modified",
+    "diff": "--- a/content/skills/docs/SKILL.md\n+++ b/content/skills/docs/SKILL.md\n@@ -6,7 +6,7 @@\n   version: \"0.1.0\"\n   model: \"extraction\"\n   data-class: \"public\"\n-  tools: \"docs.search docs.read\"\n+  tools: \"docs.search docs.read jira.search\"\n   surfaces: \"slack cli\"\n   ships-in: \"phase-0\"\n   track: \"Everyday\"\n"}],
+ "policy_changes": [
+   {"path": "policies/bots/docs.yaml", "change": "modified",
+    "diff": "--- a/policies/bots/docs.yaml\n+++ b/policies/bots/docs.yaml\n@@ -100,6 +100,7 @@\n                 any:\n                   - docs_read\n                   - docs_search\n+                  - jira_search\n     name: pmos_toolserver\n process:\n   run_as_group: sandbox\n"}],
+ "allowance_changes": [
+   {"bot": "docs", "kind": "network.mcp_tool", "item": "jira_search", "before": null,
+    "after": "jira_search", "direction": "wider", "widening": true,
+    "description": "docs may now call the tool jira_search"}],
+ "widening": true,
+ "summary": {"wider": 1, "narrower": 0, "changed": 0}}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `valid` | boolean | No errors: it can be proposed. |
+| `errors`, `warnings` | `Issue[]` | Every error in the changed tree, and the warnings that are new or on a changed file (the content's existing warnings elsewhere, such as unassigned owners, are left out). |
+| `content_changes[]` | `FileDiff[]` | The content files the spec changes. |
+| `policy_changes[]` | `FileDiff[]` | The generated files that change, compared with the checked-in ones (or, without a policies root, with what the deployed content generates). Empty when the changed tree doesn't lint. |
+| `allowance_changes[]` | array | Each difference in what a bot may do (below). Empty: no sandbox changes. |
+| `widening` | boolean | Any allowance change is `widening`. Show it loudly. |
+| `summary` | object | Counts of `allowance_changes` by `direction`. |
+
+`FileDiff`: `{path, change: "added" | "modified" | "deleted", diff}`, where `diff` is a unified
+diff with three lines of context (`--- a/<path>`, `+++ b/<path>`, `/dev/null` for an added or
+deleted side). Show it monospaced.
+
+**Allowance changes:**
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `bot` | string | The bot (empty for `provider_profile`). |
+| `kind` | string | `network.destination` (`host:port`, and extra ports or IP ranges), `network.binary`, `network.route`, `network.mcp_method`, `network.mcp_tool`, `network.mcp_version`, `network.middleware`, `network.protocol`, `network.enforcement`, `network.tls`, `network.access`, `network.credential`, `filesystem.read_only`, `filesystem.read_write`, `filesystem.include_workdir`, `landlock`, `process`, `credential.provider`, `upload`, or `provider_profile` (a shared provider profile file changes). |
+| `item` | string | What it is about: a destination, a route, a tool, a path. Empty for bot-wide settings. |
+| `before`, `after` | string or `null` | The old and new value (`null` on the side where it doesn't exist). |
+| `direction` | `"wider"`, `"narrower"` or `"changed"` | Something added, something removed, or a setting changed. A new bot is all `wider`; a removed bot all `narrower`. |
+| `widening` | boolean | `true` for `wider` and `changed`: **every widening is marked**, and a changed setting is treated as one for review. |
+| `description` | string | One sentence (`docs may now call the tool jira_search`). |
+
+**Spec error codes** (`path` is the spec path): `spec-unknown-bot`, `spec-unknown-role`,
+`spec-unknown-skill` (it isn't in the content: add it as a content proposal), `spec-bad-name`
+(a role, skill or tool name that isn't valid), `spec-bad-value` (a `scope` other than `team` or
+`personal`, an `owner` that isn't a handle), `spec-duplicate`, `spec-too-long` (over 100 in a
+list), `spec-file-missing`, `spec-unsupported-format` (the file's front matter has a layout the
+editor can't change line by line, such as a folded multi-line value: change it as a content
+proposal). With a spec error, the other arrays are empty.
+
+### `POST /api/admin/policy/proposals`
+
+Admins only. Request: `{"spec": SpecPatch, "title": "…", "reason": "…"}`.
+
+- `title`: one line; control characters are dropped and whitespace collapsed; at most 120
+  characters kept. Required. The pull request's title is `PM OS policy: <title>`.
+- `reason`: free text for the reviewers; control characters other than newlines and tabs
+  dropped; at most 4,000 characters kept. Required. It goes into the pull request body in a
+  fenced block, so it can't format the page or mention anyone.
+
+It validates again, then opens the pull request (`docs/policy-admin.md`, How a proposal is
+opened). `201`:
+
+```json
+{"number": 42, "url": "https://github.com/acme/pmos/pull/42",
+ "branch": "pmos/proposal/policy/adam-20261117-101509-d2aabc50",
+ "base": {"branch": "main", "commit": "1111111111111111111111111111111111111111"},
+ "files": ["content/skills/docs/SKILL.md", "policies/bots/docs.yaml"],
+ "widening": true,
+ "allowance_changes": [{"bot": "docs", "kind": "network.mcp_tool", "item": "jira_search",
+   "before": null, "after": "jira_search", "direction": "wider", "widening": true,
+   "description": "docs may now call the tool jira_search"}],
+ "stale_check": "passed",
+ "labels_added": true}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `number`, `url` | integer, string | The pull request. Link to it: review and merge happen there. |
+| `branch` | string | Made by the server: `pmos/proposal/<kind>/<handle>-<yyyymmdd-hhmmss>-<random>`. |
+| `base.branch`, `base.commit` | strings | What it was made on. |
+| `files` | string[] | Every file the commit writes: the content files, then the regenerated policy files. |
+| `widening`, `allowance_changes` | | As in validate. |
+| `stale_check` | `"passed"` or `"skipped"` | `skipped` when GitHub cut the base's file list short (a very large repository): the base wasn't compared. |
+| `labels_added` | boolean | `false` if GitHub refused the labels. The pull request is open regardless, and still listed below (by its branch). |
+
+Errors, besides those above:
+
+| Status and code | When |
+| --- | --- |
+| `400 bad_request` | The body doesn't parse, or the title or reason is empty after cleaning. |
+| `400 no_change` | The spec changes nothing. |
+| `422 invalid` | Validation found errors. The body also has `errors` and `warnings` (`Issue[]`). Nothing was sent anywhere. |
+| `409 stale_base` | A file the pull request would write differs on the base branch from the server's copy. The body also has `paths` (string[]) and `base` (`{branch, commit}`). Nothing was written or recorded. Wait for the deployment to catch up, or make the change in GitHub. |
+| `429 rate_limited` | Over this admin's proposals per hour (default 10). `Retry-After` gives the seconds. |
+| `501 not_configured` | GitHub isn't set up on this server. |
+| `502 audit_unavailable` | The tool server couldn't record the proposal, so nothing was written to GitHub. |
+| `502 github_refused` | GitHub refused the token (it needs contents and pull requests write on the repository). |
+| `502 github_unavailable` | GitHub didn't answer, couldn't find the repository or base branch, or refused the request (for example, the branch already exists). |
+| `503 github_rate_limited` | GitHub's own rate limit. |
+
+### `GET /api/admin/policy/proposals`
+
+Open pull requests this feature made for policy: a branch under `pmos/proposal/policy/` or the
+label `pmos-proposal:policy`. Read from GitHub on each request (the newest 300 open pull
+requests). `501 not_configured` without GitHub.
+
+```json
+{"repo": "acme/pmos",
+ "proposals": [
+   {"number": 42, "url": "https://github.com/acme/pmos/pull/42",
+    "title": "PM OS policy: Let the Docs bot search Jira",
+    "branch": "pmos/proposal/policy/adam-20261117-101509-d2aabc50", "base": "main",
+    "status": "open", "proposed_by": "adam",
+    "base_commit": "1111111111111111111111111111111111111111", "author": "pmos-bot",
+    "labels": ["pmos-proposal", "pmos-proposal:policy"],
+    "created_at": "2026-11-17T10:00:00Z", "updated_at": "2026-11-17T10:00:00Z"}]}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `status` | `"open"` or `"draft"` | Only open pull requests are listed; merged and closed ones are in GitHub. Review state and checks are not read: link to the pull request. |
+| `proposed_by` | string or `null` | The PM OS handle, read from the marker on the pull request body's first line; `null` if the body was edited. It is what the body says, not a verified fact: the audit log has the verified record. |
+| `base_commit` | string or `null` | The base it was made on, from the same marker. |
+| `author` | string or `null` | The GitHub login that opened it: the PM OS token's identity, not the admin. |
+| `created_at`, `updated_at` | string or `null` | As GitHub gives them. |
+
+## Admin: content and harness
+
+The harness content (roles, bots, skills, playbooks, the context library, templates, reviewers,
+master context) and what the running harness uses (`docs/content-admin.md`). The same
+read-and-propose rules and deployed-revision caveat as **Admin: policy**.
+
+| Route | `admin` | `auditor` | anyone else |
+| --- | --- | --- | --- |
+| `GET /api/admin/content` | yes | yes | `403 forbidden` |
+| `GET /api/admin/content/file?path=` | yes | yes, but not a PM's own master file or `restricted` context (`403 forbidden`) | `403 forbidden` |
+| `POST /api/admin/content/validate` | yes | yes | `403 forbidden` |
+| `GET /api/admin/content/proposals` | yes | yes | `403 forbidden` |
+| `POST /api/admin/content/proposals` | yes | `403 forbidden` | `403 forbidden` |
+| `GET /api/admin/harness` | yes | yes | `403 forbidden` |
+
+Reading and validating need `view-content`; proposing needs `edit-content`.
+
+**Paths** are repository paths inside the content tree, such as `content/skills/docs/SKILL.md`.
+A path is relative, `/`-separated, made of letters, digits, `.`, `_` and `-`, with no empty,
+`.`, `..` or hidden (`.`-prefixed) component, at most 200 bytes and 8 deep. Anything else is
+`400 bad_path`; anything outside `content/` (`policies/`, `deploy/`, `.github/`, code) is
+`400 path_not_allowed`. Symbolic links are never followed (`400 bad_path`), and the tree never
+lists one.
+
+### `GET /api/admin/content`
+
+```json
+{"revision": {"commit": null, "source": null},
+ "root": "content",
+ "lint": {"errors": 0, "warnings": 93, "files_checked": 111,
+          "checked_at": "2026-11-17T10:15:09.841Z", "other": []},
+ "files": [
+   {"path": "content/skills/docs/SKILL.md", "kind": "skill", "name": "docs", "title": null,
+    "version": "0.1.0", "owner": "TODO", "sensitivity": null, "last_reviewed": null,
+    "size": 1170, "editable": true, "readable": true,
+    "lint": {"status": "warning", "errors": 0, "warnings": 1,
+             "issues": [{"severity": "warning", "code": "owner-unassigned",
+                         "path": "content/skills/docs/SKILL.md", "line": null,
+                         "message": "owner is not assigned yet"}]}},
+   {"path": "content/context/products/roadmap.md", "kind": "context", "name": null,
+    "title": "Roadmap", "version": null, "owner": "adam", "sensitivity": "restricted",
+    "last_reviewed": "2026-11-14", "size": 112, "editable": true, "readable": false,
+    "lint": {"status": "ok", "errors": 0, "warnings": 0, "issues": []}}],
+ "roles": [
+   {"name": "docs-helper", "version": "0.1.0", "owner": "TODO", "model": "default",
+    "data_class": "public", "skills": ["docs"], "bots": ["docs"]}],
+ "skills": [
+   {"name": "docs", "version": "0.1.0", "owner": "TODO", "model": "extraction",
+    "data_class": "public", "tools": ["docs.search", "docs.read"], "used_by": ["docs-helper"]}],
+ "bots": [{"name": "docs", "role": "docs-helper", "scope": "team", "owner": "TODO"}],
+ "proposals_configured": true}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `revision` | object | As in **Admin: policy**. |
+| `root` | string | The content tree's folder in the repository (`content`; empty if the content is the repository root). |
+| `lint` | object | The content lint, run now on the deployed tree: counts, when, and `other` (`Issue[]` about a folder rather than a file, such as a skill folder with no `SKILL.md`). |
+| `files[]` | array | Every regular file in the tree, sorted by path (no symlinks, nothing hidden). |
+| `files[].kind` | string | `role`, `bot`, `skill`, `skill_file` (another file in a skill's folder), `playbook`, `template`, `reviewer`, `context`, `readme`, `master` (`master/AGENTS.md`), `personal_master` (`master/people/<handle>/AGENTS.md`), `team`, `tools` or `other`. |
+| `files[].name`, `title`, `version`, `owner`, `sensitivity`, `last_reviewed` | string or `null` | From the file's front matter, where it has them (a skill's `version` and `owner` come from `metadata`). `null` when absent or unparsable. |
+| `files[].size` | integer | Bytes. |
+| `files[].editable` | boolean | Whether a proposal may change it: text (`.md`, `.yaml`, `.yml`, `.txt`) and not `team.yaml` (members are managed through onboarding). |
+| `files[].readable` | boolean | Whether this viewer may open it (`GET …/file`). An auditor sees personal master files and `restricted` context listed, not opened. |
+| `files[].lint` | object | `status` (`ok`, `warning` or `error`), counts, and that file's `Issue[]`. |
+| `roles[]` | array | Each role: its skills, model role, data class, and the bots made from it. |
+| `skills[]` | array | Each skill: its tools and `used_by` (the roles that list it). A skill that doesn't lint isn't here (its file shows the error). |
+| `bots[]` | array | Each bot: role, scope, owner. |
+| `proposals_configured` | boolean | As in **Admin: policy**. |
+
+### `GET /api/admin/content/file?path=content/…`
+
+```json
+{"path": "content/skills/docs/SKILL.md", "kind": "skill", "size": 1170,
+ "sha256": "7937723eb58e838aa8dbafc2e758c1163a2151b27d894414c04f47a34c45efa9",
+ "text": "---\nname: docs\n…",
+ "front_matter": {"name": "docs", "description": "…",
+                  "metadata": {"owner": "TODO", "version": "0.1.0", "tools": "docs.search docs.read"}},
+ "front_matter_error": null,
+ "editable": true}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `sha256` | string | Of `text`, hex. Send it back as `base_sha256` with a change to this file. |
+| `text` | string | The whole file, UTF-8. Files over 256 KiB, not UTF-8, or with NUL bytes are refused (`413 too_large`, `400 not_text`). |
+| `front_matter` | object or `null` | A `.md` file's YAML front matter, parsed. `null` for other files, or when it's missing or doesn't parse. |
+| `front_matter_error` | string or `null` | Why it's `null` for a `.md` file. |
+
+Errors: `400 bad_path`, `400 path_not_allowed`, `400 not_a_file` (a folder), `404 not_found`,
+`403 forbidden` (an auditor and a personal or restricted file).
+
+### `POST /api/admin/content/validate`
+
+Request: `{"changes": [Change]}`, 1 to 50 changes, each path once:
+
+```json
+{"changes": [
+  {"path": "content/playbooks/bar.md", "text": "---\ntitle: The bar\n…", "base_sha256": "7937…"},
+  {"path": "content/playbooks/new.md", "text": "---\ntitle: New\nowner: \"adam\"\nversion: \"0.1.0\"\n---\n\nBody\n"},
+  {"path": "content/templates/old.md", "delete": true}]}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `path` | string | Required. An editable path (above). |
+| `text` | string | The whole new file. At most 256 KiB, no NUL. Give either `text` or `delete: true`. |
+| `delete` | boolean | Remove the file (it must exist). Folders left empty go too. |
+| `base_sha256` | string, optional | The `sha256` from `GET …/file` when the admin opened it. If the server's copy has changed since, `409 stale_base`. Leave it out for a new file. |
+
+A change identical to the deployed file is dropped. The response has the same shape as
+`POST /api/admin/policy/validate` (`valid`, `errors`, `warnings`, `content_changes`,
+`policy_changes`, `allowance_changes`, `widening`, `summary`): a content change that alters a
+sandbox (a skill's tools, a role's skills, a bot's role, a new or removed bot) regenerates the
+policies, and its widenings are marked the same way.
+
+```json
+{"valid": false,
+ "errors": [
+   {"severity": "error", "code": "role-skill-unknown", "path": "content/roles/docs-helper/ROLE.md",
+    "line": null, "message": "skill `docs` is not in skills/"},
+   {"severity": "error", "code": "skill-parse", "path": "content/skills/docs/SKILL.md", "line": 6,
+    "message": "invalid front matter: did not find expected ',' or ']' at line 5 column 1, while parsing a flow sequence at line 4 column 10"}],
+ "warnings": [],
+ "content_changes": [{"path": "content/skills/docs/SKILL.md", "change": "modified", "diff": "…"}],
+ "policy_changes": [], "allowance_changes": [], "widening": false,
+ "summary": {"wider": 0, "narrower": 0, "changed": 0}}
+```
+
+Refusals, before anything is linted:
+
+| Status and code | When |
+| --- | --- |
+| `400 bad_request` | The body doesn't parse (unknown fields included), a path is listed twice, or a change has both or neither of `text` and `delete`. |
+| `400 bad_path` | A path that isn't plain (above), or one that goes through a symlink. |
+| `400 path_not_allowed` | Outside the content tree, or `content/team.yaml`. |
+| `400 not_text` | Not `.md`, `.yaml`, `.yml` or `.txt`, or text with a NUL byte. |
+| `400 not_found` | Deleting a file that doesn't exist. |
+| `400 no_change` | No changes, or every change equals the deployed file. |
+| `409 stale_base` | A `base_sha256` doesn't match the server's copy now. |
+| `413 too_large` | A file over 256 KiB. |
+| `413 too_many_files` | More than 50 changes. |
+
+The whole request may be up to 16 MiB.
+
+### `POST /api/admin/content/proposals`
+
+Admins only. Request: `{"changes": [Change], "title": "…", "reason": "…"}` (title and reason as
+in **Admin: policy**). Validates again and opens a pull request with the changed content files
+and any regenerated policy files. The `201` answer and the errors are those of
+`POST /api/admin/policy/proposals`, for kind `content`: the branch is
+`pmos/proposal/content/…`, the labels `pmos-proposal` and `pmos-proposal:content`, the title
+`PM OS content: <title>`. A `409 stale_base` comes from either check: the admin's
+`base_sha256` against the server's copy (message only), or the server's copy against the base
+branch (with `paths` and `base`).
+
+### `GET /api/admin/content/proposals`
+
+As `GET /api/admin/policy/proposals`, for branches under `pmos/proposal/content/` or the label
+`pmos-proposal:content`.
+
+### `GET /api/admin/harness`
+
+What the running harness uses, read-only.
+
+```json
+{"bots": [
+   {"name": "docs", "role": "docs-helper", "scope": "team", "owner": "TODO",
+    "model_role": "default", "gateway_alias": "pmos/default", "gateway_model": "qwen3.6-35b-a3b",
+    "skills": ["docs"], "tools": ["docs.read", "docs.search"], "loaded_by_runtime": true}],
+ "model_roles": [
+   {"role": "default", "alias": "pmos/default", "model": "qwen3.6-35b-a3b", "upstream": "qwen",
+    "workarounds": ["strip-think"]},
+   {"role": "extraction", "alias": "pmos/extraction", "model": "nemotron-3-nano-30b-a3b",
+    "upstream": "nemotron", "workarounds": []},
+   {"role": "reasoning", "alias": "pmos/reasoning", "model": "qwen3.6-35b-a3b", "upstream": "qwen",
+    "workarounds": ["strip-think"]}],
+ "gateway_config": "ok",
+ "runtime": {"reachable": true, "bots": ["docs"]},
+ "content_revision": {"commit": null, "source": null}}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `bots[]` | array | Every bot in the deployed content. |
+| `bots[].model_role` | string or `null` | Its role's model role (`default`, `extraction`, `reasoning`); `null` if its role doesn't lint. |
+| `bots[].gateway_alias` | string or `null` | What the harness asks the gateway for (`pmos/<model_role>`). |
+| `bots[].gateway_model` | string or `null` | The served model name that alias maps to in the gateway config; `null` without the config, or when it has no such role. |
+| `bots[].tools` | string[] | Registry names the bot may call (its role's skills' tools), sorted. |
+| `bots[].loaded_by_runtime` | boolean or `null` | Whether the bot runtime lists it (`GET /v1/bots`); `null` when the runtime didn't answer. `false` means the runtime is running other content. |
+| `model_roles` | array or `null` | Each gateway model role: the alias, the served model name, the upstream's **name** (never its address or a key) and its workarounds. `null` when `gateway_config` isn't `ok`. |
+| `gateway_config` | `"ok"`, `"not_configured"` or `"unreadable"` | Whether `PMOS_WEB_GATEWAY_CONFIG` is set and parses. This is the server's copy of the gateway config, not what the running gateway loaded. |
+| `runtime.reachable` | boolean | Whether the bot runtime answered. |
+| `runtime.bots` | string[] or `null` | The bot names the runtime has loaded, sorted. |
+| `content_revision` | object | As `revision` above: the server's, not the workers'. |
+
+**Not here, because nothing exposes it to `pmos-web`:** worker health (the runtime has no
+worker-status read for the `web` client) and the content revision each worker loaded (workers
+don't report one).

@@ -1,7 +1,9 @@
 //! The admin and auditor reads: `GET /internal/admin/{audit,accounts,connectors,overview}`.
 //!
 //! **Who may call:** the orchestrator (`PMOS_SERVICE_TOKEN`) and `pmos-web` (`PMOS_WEB_TOKEN`).
-//! Never the Slack bot or the console. These routes only read; there is no write here.
+//! Never the Slack bot or the console. These routes only read, but one: `POST
+//! /internal/admin/proposals` records (only records: it writes nothing anywhere else) a change
+//! proposal `pmos-web` opens as a GitHub pull request, so proposals are in the audit log.
 //!
 //! **Whose view:** every call names its viewer as `user=`. The tool server checks that viewer's
 //! roles in its own `team.yaml` against the permission matrix (`pmos_contract::permissions`),
@@ -50,6 +52,7 @@ pub(super) fn routes(state: AppState) -> Router<AppState> {
         .route("/admin/accounts", get(accounts))
         .route("/admin/connectors", get(connectors))
         .route("/admin/overview", get(overview))
+        .route("/admin/proposals", axum::routing::post(proposal))
         .layer(middleware::from_fn_with_state(state, identify_admin_client))
 }
 
@@ -460,6 +463,142 @@ async fn overview(
         "denied": count(Outcome::Denied),
     }))
     .into_response()
+}
+
+// Proposals.
+
+/// The most paths one proposal record names.
+pub const MAX_PROPOSAL_PATHS: usize = 200;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalRecord {
+    /// `policy` or `content`.
+    kind: String,
+    /// `started` (before anything is written to GitHub), `opened` or `failed`.
+    stage: String,
+    /// Repository paths the proposal changes. Recorded as the event's `sources` (served as a
+    /// count only); never file text.
+    #[serde(default)]
+    paths: Vec<String>,
+    /// `owner/name`.
+    repo: String,
+    /// The base commit sha.
+    base: String,
+    /// The pull request's number, once opened.
+    #[serde(default)]
+    pr: Option<u64>,
+}
+
+fn plain_path(p: &str) -> bool {
+    !p.is_empty()
+        && p.len() <= 200
+        && !p.starts_with('/')
+        && p.split('/').all(|c| {
+            !c.is_empty()
+                && !c.starts_with('.')
+                && c.chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        })
+}
+
+/// `POST /internal/admin/proposals?user=<admin>`: record a change proposal `pmos-web` is
+/// opening as a pull request (`admin.policy_proposal`, `admin.content_proposal`). The viewer
+/// must be allowed to propose that kind (`edit-policies`, `edit-content`); the record holds
+/// the paths (as `sources`), the pull request (`github:<repo>#<n>` as the target) and the
+/// stage as the outcome (`started`, `ok`, `error`). Never file text.
+async fn proposal(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Query(q): Query<ViewerParams>,
+    body: axum::body::Bytes,
+) -> Response {
+    let Ok(r) = serde_json::from_slice::<ProposalRecord>(&body) else {
+        return coded(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "the body isn't a proposal record",
+        );
+    };
+    let (tool, need) = match r.kind.as_str() {
+        "policy" => ("admin.policy_proposal", Permission::EditPolicies),
+        "content" => ("admin.content_proposal", Permission::EditContent),
+        _ => {
+            return coded(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "`kind` is `policy` or `content`",
+            )
+        }
+    };
+    let outcome = match r.stage.as_str() {
+        "started" => Outcome::Started,
+        "opened" => Outcome::Ok,
+        "failed" => Outcome::Error,
+        _ => {
+            return coded(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "`stage` is `started`, `opened` or `failed`",
+            )
+        }
+    };
+    let repo_ok = r.repo.split_once('/').is_some_and(|(o, n)| {
+        !o.is_empty() && !n.is_empty() && plain_path(o) && plain_path(n) && !n.contains('/')
+    });
+    let base_ok = (7..=64).contains(&r.base.len()) && r.base.bytes().all(|b| b.is_ascii_hexdigit());
+    if !repo_ok
+        || !base_ok
+        || r.paths.len() > MAX_PROPOSAL_PATHS
+        || !r.paths.iter().all(|p| plain_path(p))
+        || (outcome == Outcome::Ok && r.pr.is_none())
+    {
+        return coded(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "the proposal record has a bad repo, base, path or pull request",
+        );
+    }
+    let Some(user) = q.user.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
+        return coded(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "`user` (the admin) is required",
+        );
+    };
+    let allowed = state
+        .svc
+        .team()
+        .member(user)
+        .is_some_and(|m| m.allows(need));
+    let target = r.pr.map(|n| format!("github:{}#{n}", r.repo));
+    let event = |outcome| AuditEvent {
+        at: Utc::now(),
+        client,
+        run_id: ADMIN_RUN.to_string(),
+        user: user.to_string(),
+        skill: None,
+        bot: None,
+        tool: tool.to_string(),
+        outcome,
+        sources: r.paths.clone(),
+        source_titles: Default::default(),
+        args_hash: None,
+        output_ref: target.clone(),
+        detail: None,
+    };
+    if !allowed {
+        state.svc.audit(event(Outcome::Denied)).await;
+        tracing::info!(viewer = %user, tool, "proposal refused: role");
+        return coded(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "this person's role doesn't allow this",
+        );
+    }
+    state.svc.audit(event(outcome)).await;
+    tracing::info!(viewer = %user, tool, stage = %r.stage, paths = r.paths.len(), pr = ?r.pr, "proposal recorded");
+    Json(json!({ "recorded": true })).into_response()
 }
 
 #[cfg(test)]

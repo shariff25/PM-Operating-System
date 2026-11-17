@@ -566,4 +566,34 @@ impl ToolServer {
             .await?;
         self.0.read(res).await
     }
+
+    /// Record an admin action (`POST /internal/admin/{route}?user=<viewer>`, JSON `body`), with
+    /// an assertion for `viewer` bound to that body. The tool server checks their role itself.
+    pub async fn admin_record(
+        &self,
+        viewer: &str,
+        route: &str,
+        body: &Value,
+    ) -> UpstreamResult<Value> {
+        let url = self.0.url(&["internal", "admin", route])?;
+        let res = self
+            .0
+            .send(
+                self.0.http.post(url).query(&[("user", viewer)]).json(body),
+                Some(viewer),
+            )
+            .await?;
+        self.0.read(res).await
+    }
+}
+
+impl Runtime {
+    /// The bots the runtime has loaded (`GET /v1/bots`), as it lists them: names, roles and
+    /// scopes. For the admin's harness view.
+    pub async fn bots(&self, user: &str) -> UpstreamResult<Vec<Value>> {
+        Ok(self
+            .get::<List<Value>>(user, &["v1", "bots"], &[])
+            .await?
+            .into_vec())
+    }
 }

@@ -15,17 +15,25 @@
 //! - [`progress`]: a task's runtime events as the app shows them (milestones, progress,
 //!   retrying).
 //! - [`app`]: the router and the `/api` handlers.
+//! - [`admin_config`], [`policy_admin`], [`content_admin`], [`proposals`], [`github`]: the
+//!   admin policy and content screens, read-and-propose: a change is opened as a GitHub pull
+//!   request, never written in place (`docs/policy-admin.md`, `docs/content-admin.md`).
 //!
 //! Security notes, and what is not built, are in `crates/web/README.md`.
 
+pub mod admin_config;
 pub mod app;
 pub mod auth;
 pub mod config;
+pub mod content_admin;
 pub mod drafts;
 pub mod entra;
 pub mod followups;
+pub mod github;
 pub mod pg;
+pub mod policy_admin;
 pub mod progress;
+pub mod proposals;
 pub mod session;
 pub mod settings;
 pub mod store_config;
