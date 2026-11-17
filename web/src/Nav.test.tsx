@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { copy } from './copy';
 import { renderApp } from './test/util';
-import { parseRoute, taskIdFromPath } from './url';
+import { draftIdFromPath, parseRoute, taskIdFromPath } from './url';
 
 const nav = () => screen.getByRole('navigation', { name: copy.nav.label });
 const navLink = (name: string) => within(nav()).getByRole('link', { name: new RegExp(`^${name}`) });
@@ -75,10 +75,21 @@ describe('navigation', () => {
     await screen.findByLabelText(copy.home.askLabel);
     expect(parseRoute('/a/..')).toEqual({ name: 'home' });
     expect(parseRoute('/a/%E0')).toEqual({ name: 'home' });
-    expect(parseRoute('/drafts/x')).toEqual({ name: 'home' });
+    expect(parseRoute('/draftz/x')).toEqual({ name: 'home' });
+    expect(parseRoute('/drafts/a/b')).toEqual({ name: 'home' });
+    expect(parseRoute('/drafts/%E0')).toEqual({ name: 'home' });
     expect(parseRoute('/a/tsk_1')).toEqual({ name: 'task', id: 'tsk_1' });
     expect(parseRoute('/followups')).toEqual({ name: 'followups' });
     expect(taskIdFromPath('/a/a%2Fb')).toBeNull();
+  });
+
+  it('accepts #/drafts/<id> as another way to write #/d/<id>, as old Slack links use it', async () => {
+    expect(parseRoute('/drafts/apr_prd')).toEqual({ name: 'draft', id: 'apr_prd' });
+    expect(parseRoute('/d/apr_prd')).toEqual({ name: 'draft', id: 'apr_prd' });
+    expect(parseRoute('/drafts')).toEqual({ name: 'drafts' });
+    expect(draftIdFromPath('/drafts/apr%2Fx')).toBeNull();
+    renderApp({ hash: '/drafts/apr_prd' });
+    expect(await screen.findByRole('heading', { level: 1, name: 'PRD: TCB grace period setting' })).toBeInTheDocument();
   });
 
   it('shows home for #/followups when the brief is not built', async () => {

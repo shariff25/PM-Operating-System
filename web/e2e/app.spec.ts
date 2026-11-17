@@ -100,7 +100,7 @@ test('an external channel needs a second, explicit yes', async ({ page }) => {
   await dialog.getByRole('checkbox').check();
   await expect(send).toBeEnabled();
   await send.click();
-  await expect(page.getByText(/Created in #partner-pricing/)).toBeVisible();
+  await expect(page.getByText(/Posted in #partner-pricing/)).toBeVisible();
 });
 
 test('an expired draft is labelled, sorted lower, and cannot be approved', async ({ page }) => {

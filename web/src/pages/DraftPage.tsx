@@ -13,6 +13,8 @@ import { useData } from '../data';
 import { diffBlocks, diffLines } from '../diff';
 import type { DiffLine, DiffPart, InlinePart } from '../diff';
 import { isExpired } from '../drafts';
+import { stripMarkers } from '../citations';
+import { isDefiniteRefusal } from '../errors';
 import { usePoll } from '../polling';
 import { renderMarkdown } from '../markdown';
 import { longTime, relTime, timeLeft } from '../time';
@@ -21,6 +23,15 @@ import { tabKeys } from './Drafts';
 
 type SaveState = 'saved' | 'saving' | 'error';
 type ApproveErrorKey = keyof typeof copy.approve.errors;
+/** A problem under the change box. `check` is the "Check again" action, when the outcome is not known. */
+interface ChangeError {
+  text: string;
+  check?: 'draft' | 'suggestion';
+}
+interface RejectError {
+  text: string;
+  unsure: boolean;
+}
 /** Phone only: the document, the sources, and the checklist with details. */
 type PanelTab = 'doc' | 'sources' | 'details';
 
@@ -210,6 +221,7 @@ function CheckItem({ c }: { c: Check }) {
 }
 
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+const reducedMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
 
 export function DraftPage({ id }: { id: string }) {
   const { api, me, refreshMe, pollMs, navigate } = useApp();
@@ -230,7 +242,10 @@ export function DraftPage({ id }: { id: string }) {
 
   const [instruction, setInstruction] = useState('');
   const [suggestion, setSuggestion] = useState<Suggestion | null>(null);
-  const [changeError, setChangeError] = useState<string | null>(null);
+  const [changeError, setChangeError] = useState<ChangeError | null>(null);
+  // Which source card to bring into view, and when to show its markers in the text (a phone has one at a time).
+  const [jump, setJump] = useState<{ to: 'source' | 'text'; id: string; n: number } | null>(null);
+  const [flash, setFlash] = useState<string | null>(null);
   const [changeBusy, setChangeBusy] = useState(false);
 
   const [confirming, setConfirming] = useState(false);
@@ -239,10 +254,12 @@ export function DraftPage({ id }: { id: string }) {
   const [approving, setApproving] = useState(false);
   const [approveError, setApproveError] = useState<{ key: ApproveErrorKey; message: string } | null>(null);
   const [justApproved, setJustApproved] = useState(false);
+  // An approval whose outcome is not known: no second try until the PM has checked where it stands.
+  const [uncertain, setUncertain] = useState(false);
 
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState<RejectReason | ''>('');
-  const [rejectError, setRejectError] = useState<string | null>(null);
+  const [rejectError, setRejectError] = useState<RejectError | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const rejectBox = useRef<HTMLDivElement>(null);
   const [moreOpen, setMoreOpen] = useState(false);
@@ -250,12 +267,17 @@ export function DraftPage({ id }: { id: string }) {
   const moreItems = useRef<(HTMLButtonElement | null)[]>([]);
 
   // What the PM reads is the saved text. Links and stripped parts come from the same rendering.
-  const rendered = useMemo(() => renderMarkdown(draft?.body ?? ''), [draft?.body]);
+  const rendered = useMemo(
+    () => renderMarkdown(draft?.body ?? '', { sources: draft?.sources ?? [] }),
+    [draft?.body, draft?.sources],
+  );
+  // The edit box, the suggestion diff and the "unsaved" check all work on the text without markers.
+  const plainBody = useMemo(() => stripMarkers(draft?.body ?? ''), [draft?.body]);
 
   const adopt = useCallback((d: Draft) => {
     setDraft(d);
     setTitle(d.title);
-    setBody(d.body);
+    setBody(stripMarkers(d.body));
     setSaveState('saved');
     setEditing(false);
   }, []);
@@ -283,6 +305,7 @@ export function DraftPage({ id }: { id: string }) {
     setRejecting(false);
     setApproveError(null);
     setJustApproved(false);
+    setUncertain(false);
     void load();
   }, [load]);
 
@@ -293,11 +316,29 @@ export function DraftPage({ id }: { id: string }) {
       try {
         setSuggestion(await api.getSuggestion(id));
       } catch (e) {
-        setChangeError(messageOf(e, copy.errors.unknown));
+        setChangeError({ text: messageOf(e, copy.errors.unknown) });
       }
     },
     pollMs,
   );
+
+  // A marker or a card asked to be shown: bring it into view and move focus there. On a phone the
+  // other tab is opened first, and this runs once it is on screen.
+  useEffect(() => {
+    if (!jump) return;
+    if (jump.to === 'source') {
+      const card = document.getElementById(`src-${jump.id}`);
+      if (!card) return;
+      card.querySelector<HTMLElement>('button.source')?.focus({ preventScroll: true });
+      card.scrollIntoView?.({ block: 'center', behavior: reducedMotion() ? 'auto' : 'smooth' });
+      setFlash(jump.id);
+      const t = setTimeout(() => setFlash((f) => (f === jump.id ? null : f)), 1800);
+      return () => clearTimeout(t);
+    }
+    const mark = document.querySelector<HTMLElement>('.sheet button.cite-on');
+    mark?.focus({ preventScroll: true });
+    mark?.scrollIntoView?.({ block: 'center', behavior: reducedMotion() ? 'auto' : 'smooth' });
+  }, [jump, tab]);
 
   // The reject popover and the phone's More menu close on a click outside them.
   useEffect(() => {
@@ -357,21 +398,23 @@ export function DraftPage({ id }: { id: string }) {
 
   const expired = isExpired(draft);
   const pending = draft.status === 'pending' && !expired;
-  const dirty = title !== draft.title || body !== draft.body;
+  const dirty = title !== draft.title || body !== plainBody;
   const unresolved = suggestion?.status === 'working' || suggestion?.status === 'ready';
-  // The PM must have seen the formatted, saved text, with no suggestion left hanging.
-  const blocked = editing || dirty ? copy.draft.saveFirst : unresolved ? copy.draft.resolveFirst : null;
+  // The PM must have seen the formatted, saved text, with no suggestion left hanging, and know
+  // whether an approval that may or may not have gone through did.
+  const blocked =
+    editing || dirty ? copy.draft.saveFirst : unresolved ? copy.draft.resolveFirst : uncertain ? copy.draft.checkFirst : null;
 
   const startEdit = () => {
     setTitle(draft.title);
-    setBody(draft.body);
+    setBody(plainBody);
     setEditing(true);
     if (isPhone) setTab('doc');
   };
 
   const discard = () => {
     setTitle(draft.title);
-    setBody(draft.body);
+    setBody(plainBody);
     setSaveState('saved');
     setEditing(false);
   };
@@ -403,8 +446,10 @@ export function DraftPage({ id }: { id: string }) {
     } catch (err) {
       setChangeError(
         err instanceof ApiError && err.code === 'change_in_progress'
-          ? copy.draft.changeInProgress
-          : messageOf(err, copy.errors.unknown),
+          ? { text: copy.draft.changeInProgress }
+          : isDefiniteRefusal(err)
+            ? { text: messageOf(err, copy.errors.unknown) }
+            : { text: `${copy.errors.unsure(copy.errors.unsureWhat.asked)} ${copy.errors.unsureNext}`, check: 'suggestion' },
       );
     } finally {
       setChangeBusy(false);
@@ -420,7 +465,40 @@ export function DraftPage({ id }: { id: string }) {
       setSuggestion(null);
       if (accept) toast(copy.toast.accepted, 'good');
     } catch (err) {
-      setChangeError(messageOf(err, copy.errors.unknown));
+      setChangeError(
+        isDefiniteRefusal(err)
+          ? { text: messageOf(err, copy.errors.unknown) }
+          : {
+              text: `${copy.errors.unsure(accept ? copy.errors.unsureWhat.accepted : copy.errors.unsureWhat.declined)} ${copy.errors.unsureNext}`,
+              check: 'draft',
+            },
+      );
+    }
+  };
+
+  /** "Check again" under the change box: look at what the server holds now. */
+  const checkChange = async (what: 'draft' | 'suggestion') => {
+    try {
+      if (what === 'draft') adopt(await api.getDraft(id));
+      const s = await api.getSuggestion(id);
+      setSuggestion(s);
+      setChangeError(null);
+      if (what === 'suggestion' && !s) toast(copy.draft.checkedNoChange);
+      void reloadDrafts();
+    } catch {
+      /* keep the note: it is still not known */
+    }
+  };
+
+  /** Look at the draft as the server has it now, without touching the text being edited. */
+  const checkNow = async (): Promise<Draft | null> => {
+    try {
+      const d = await api.getDraft(id);
+      setDraft(d);
+      void reloadDrafts();
+      return d;
+    } catch {
+      return null;
     }
   };
 
@@ -440,11 +518,18 @@ export function DraftPage({ id }: { id: string }) {
       setDraft(d);
       setConfirming(false);
       setJustApproved(true);
-      toast(d.practice ? copy.toast.practiceApproved : copy.toast.approved, 'good');
+      toast(d.practice ? copy.toast.practiceApproved : copy.toast.approved(d.kind), 'good');
       void refreshMe();
       void reloadDrafts();
     } catch (err) {
-      if (err instanceof ApiError) {
+      if (!isDefiniteRefusal(err)) {
+        // A dropped connection, a timeout, a 5xx or unknown_outcome: it is not known whether it was
+        // sent. Say so, offer to look, and do not offer a blind second try.
+        setConfirming(false);
+        setUncertain(true);
+        if (isPhone) setTab('doc');
+        setApproveError({ key: 'unknown_outcome', message: '' });
+      } else {
         const known: ApproveErrorKey[] = ['needs_external_confirm', 'audience_blocked', 'expired', 'not_pending', 'stale'];
         const key = known.find((k) => k === err.code) ?? 'other';
         if (key === 'needs_external_confirm') setForceExternal(true);
@@ -460,11 +545,29 @@ export function DraftPage({ id }: { id: string }) {
         if (key === 'stale') setConfirming(false);
         if (isPhone) setTab('doc');
         setApproveError({ key, message: key === 'stale' ? '' : err.message });
-      } else {
-        setApproveError({ key: 'other', message: copy.errors.unknown });
       }
     } finally {
       setApproving(false);
+    }
+  };
+
+  /** "Check again" after an approval whose outcome was not known. */
+  const checkApproval = async () => {
+    try {
+      const d = await api.getDraft(id);
+      adopt(d);
+      setSuggestion(await api.getSuggestion(id));
+      setUncertain(false);
+      setApproveError(null);
+      void reloadDrafts();
+      if (d.status === 'pending') toast(copy.approve.checkedPending);
+      else if (d.status === 'approved') {
+        setJustApproved(true);
+        toast(d.practice ? copy.toast.practiceApproved : copy.toast.approved(d.kind), 'good');
+        void refreshMe();
+      }
+    } catch {
+      setApproveError({ key: 'unknown_outcome', message: copy.approve.checkFailed });
     }
   };
 
@@ -476,8 +579,19 @@ export function DraftPage({ id }: { id: string }) {
       toast(copy.toast.rejected);
       void reloadDrafts();
     } catch (err) {
-      setRejectError(messageOf(err, copy.errors.unknown));
+      setRejectError(
+        isDefiniteRefusal(err)
+          ? { text: messageOf(err, copy.errors.unknown), unsure: false }
+          : { text: `${copy.errors.unsure(copy.errors.unsureWhat.rejected)} ${copy.errors.unsureNext}`, unsure: true },
+      );
     }
+  };
+
+  const checkReject = async () => {
+    const d = await checkNow();
+    if (!d) return;
+    setRejectError(null);
+    if (d.status !== 'pending') setRejecting(false);
   };
 
   const remove = async () => {
@@ -499,12 +613,9 @@ export function DraftPage({ id }: { id: string }) {
   };
 
   const showExternal = draft.external || forceExternal;
-  const confirmLabel = showExternal
-    ? copy.approve.confirmExternalButton
-    : draft.kind.startsWith('slack')
-      ? copy.approve.confirmSlack
-      : copy.approve.confirm;
-  const diff = suggestion?.status === 'ready' && suggestion.body !== null ? diffLines(draft.body, suggestion.body) : null;
+  const confirmLabel = showExternal ? copy.approve.confirmExternalButton : copy.approve.confirm(draft.kind);
+  const diff =
+    suggestion?.status === 'ready' && suggestion.body !== null ? diffLines(plainBody, stripMarkers(suggestion.body)) : null;
   const changed = diff?.some((l) => l.kind !== 'same' || l.markerOnly) ?? false;
   const nextHelp = approveError ? copy.approve.errors[approveError.key] : null;
 
@@ -517,9 +628,17 @@ export function DraftPage({ id }: { id: string }) {
             ? copy.approve.goHome
             : approveError.key === 'not_pending'
               ? copy.approve.reload
-              : undefined
+              : approveError.key === 'unknown_outcome'
+                ? copy.approve.checkAgain
+                : undefined
         }
-        onAction={() => (approveError.key === 'expired' ? navigate('/') : void load())}
+        onAction={() =>
+          approveError.key === 'expired'
+            ? navigate('/')
+            : approveError.key === 'unknown_outcome'
+              ? void checkApproval()
+              : void load()
+        }
       >
         {approveError.message || nextHelp.text}
       </ErrorNote>
@@ -557,7 +676,11 @@ export function DraftPage({ id }: { id: string }) {
           </label>
         ))}
       </fieldset>
-      {rejectError && <ErrorNote>{rejectError}</ErrorNote>}
+      {rejectError && (
+        <ErrorNote actionLabel={rejectError.unsure ? copy.errors.checkAgain : undefined} onAction={() => void checkReject()}>
+          {rejectError.text}
+        </ErrorNote>
+      )}
       <div className="popover-foot">
         <button type="button" className="btn btn-ghost" onClick={() => setRejecting(false)}>
           {copy.reject.cancel}
@@ -686,6 +809,20 @@ export function DraftPage({ id }: { id: string }) {
   ) : null;
 
   // ---- The side panel: what the bot read, the checklist, and the details. ----
+  // Markers in the text, per source. Cards tell which sources the draft relies on, once any does.
+  const places = rendered.cites;
+  const anyCited = draft.sources.some((s) => s.cited);
+  const pickSource = (sid: string) => setSelected(selected === sid ? null : sid);
+  const onCite = (sid: string) => {
+    setSelected(sid);
+    if (isPhone) setTab('sources');
+    setJump((j) => ({ to: 'source', id: sid, n: (j?.n ?? 0) + 1 }));
+  };
+  const showInText = (sid: string) => {
+    setTab('doc');
+    setJump((j) => ({ to: 'text', id: sid, n: (j?.n ?? 0) + 1 }));
+  };
+
   const sourcesList = draft.sources.length === 0 ? (
     <Empty
       icon="link"
@@ -703,20 +840,39 @@ export function DraftPage({ id }: { id: string }) {
   ) : (
     <ol className="sources">
       {draft.sources.map((s, i) => (
-        <li key={s.id} className={`source-item ${selected === s.id ? 'source-item-on' : ''}`}>
-          <button
-            type="button"
-            className="source"
-            aria-pressed={selected === s.id}
-            onClick={() => setSelected(selected === s.id ? null : s.id)}
-          >
+        <li
+          key={s.id}
+          id={`src-${s.id}`}
+          className={`source-item ${selected === s.id ? 'source-item-on' : ''} ${anyCited ? (s.cited ? 'source-item-cited' : 'source-item-uncited') : ''} ${flash === s.id ? 'source-item-flash' : ''}`}
+        >
+          <button type="button" className="source" aria-pressed={selected === s.id} onClick={() => pickSource(s.id)}>
             <span className="source-num"><span className="sr-only">{copy.draft.sourceNumber(i + 1)}</span><span aria-hidden="true">{i + 1}</span></span>
             <span className="source-text">
               <span className="source-title">{s.title}</span>
-              <span className="source-sys"><span className="sr-only">, </span>{capital(s.system)}</span>
+              <span className="source-sys">
+                <span className="sr-only">, </span>
+                {capital(s.system)}
+                {anyCited && !s.cited && (
+                  <>
+                    <span aria-hidden="true"> · </span>
+                    <span className="sr-only">, </span>
+                    <span className="source-uncited">{copy.draft.notCited}</span>
+                  </>
+                )}
+              </span>
               {s.excerpt && <span className="source-excerpt">“{s.excerpt}”</span>}
             </span>
           </button>
+          {selected === s.id && (places[s.id] ?? 0) > 0 && (
+            <p className="source-cites">
+              <span>{copy.draft.citedPlaces(places[s.id]!)}</span>
+              {isPhone && (
+                <button type="button" className="source-show" onClick={() => showInText(s.id)}>
+                  {copy.draft.showInDraft}
+                </button>
+              )}
+            </p>
+          )}
           {selected === s.id && (s.url ? (
             <ExtLink href={s.url} className="source-link" label={`: ${s.title}`}>
               {copy.draft.sourceOpen}
@@ -749,12 +905,25 @@ export function DraftPage({ id }: { id: string }) {
       ? { tone: 'ok', text: isPhone ? copy.draft.checklist.sourcesPhone(draft.sources.length) : copy.draft.checklist.sources(draft.sources.length) }
       : { tone: 'warn', text: copy.draft.checklist.noSources },
   );
+  // The links between the text and its sources, from what the text really holds.
+  const citedCount = draft.sources.filter((s) => s.cited).length;
+  const linkCheck: Check | null =
+    draft.practice || draft.sources.length === 0
+      ? null
+      : draft.edited
+        ? { tone: 'info', text: copy.draft.checklist.editedNoLinks }
+        : citedCount > 0
+          ? { tone: 'ok', text: copy.draft.checklist.cited(citedCount, draft.sources.length) }
+          : Object.keys(rendered.cites).length === 0
+            ? { tone: 'warn', text: copy.draft.checklist.noneCited }
+            : null;
+  if (linkCheck) checks.push(linkCheck);
   checks.push(showExternal ? { tone: 'warn', text: copy.draft.checklist.external } : { tone: 'ok', text: copy.draft.checklist.internal });
   if (unresolved) checks.push({ tone: 'warn', text: copy.draft.checklist.suggestion });
   if (editing || dirty) checks.push({ tone: 'warn', text: copy.draft.checklist.unsaved });
   if (rendered.stripped.length > 0) checks.push({ tone: 'warn', text: copy.draft.checklist.stripped(rendered.stripped.length) });
   checks.push(left ? { tone: 'warn', text: copy.draft.checklist.expires(left) } : draft.expires_at ? { tone: 'info', text: longTime(draft.expires_at) } : { tone: 'ok', text: copy.draft.checklist.noExpiry });
-  if (draft.edited) checks.push({ tone: 'info', text: copy.draft.checklist.edited });
+  if (draft.edited && linkCheck?.text !== copy.draft.checklist.editedNoLinks) checks.push({ tone: 'info', text: copy.draft.checklist.edited });
 
   const checklist = pending ? (
     <section className="side-section" aria-labelledby="h-check">
@@ -865,7 +1034,7 @@ export function DraftPage({ id }: { id: string }) {
       <article className="sheet" aria-label={copy.draft.formattedLabel}>
         {meta}
         <h1 className="doc-title">{draft.title}</h1>
-        <Markdown rendered={rendered} className="prose" />
+        <Markdown rendered={rendered} className="prose" onCite={onCite} highlight={selected} />
         <StrippedNote parts={rendered.stripped} what={copy.stripped.draft} />
       </article>
     );
@@ -901,7 +1070,14 @@ export function DraftPage({ id }: { id: string }) {
           {copy.draft.askButton}
         </button>
       </form>
-      {changeError && <ErrorNote>{changeError}</ErrorNote>}
+      {changeError && (
+        <ErrorNote
+          actionLabel={changeError.check ? copy.errors.checkAgain : undefined}
+          onAction={changeError.check ? () => void checkChange(changeError.check!) : undefined}
+        >
+          {changeError.text}
+        </ErrorNote>
+      )}
       {suggestion?.status === 'working' && (
         <p role="status" className="live-line live-line-on dock-status">
           <span className="live-dot" aria-hidden="true" />
@@ -946,7 +1122,7 @@ export function DraftPage({ id }: { id: string }) {
             {draft.status === 'approved' && !draft.practice && (
               <>
                 {justApproved && draft.kind === 'confluence_page' && <p><strong>{copy.doneFirstApproval}</strong></p>}
-                <p>{copy.approve.approvedWhere(draft.target.label)}</p>
+                <p>{copy.approve.approvedWhere(draft.kind, draft.target.label)}</p>
                 {draft.result_url ? (
                   <ExtLink href={draft.result_url} className="btn btn-sm btn-primary">
                     {copy.approve.resultLink}
@@ -1008,7 +1184,7 @@ export function DraftPage({ id }: { id: string }) {
         <PageBar crumb={crumb} />
         <div className="workspace workspace-phone">
           {tab !== 'doc' && <h1 className="sr-only">{draft.title}</h1>}
-          {hintNames.map((n) => <Hint key={n} name={n} />)}
+          {hintNames.map((n) => <Hint key={n} name={n} kind={draft.kind} />)}
           <div className="phone-actions">
             <DraftPill status={expired ? 'expired' : draft.status} />
             {actions}
@@ -1061,7 +1237,7 @@ export function DraftPage({ id }: { id: string }) {
       <div className="workspace">
         {docColumn}
         <aside className="panel" aria-label={copy.panel.label}>
-          {pending && <Hint name="approve" anchor="approve-btn" />}
+          {pending && <Hint name="approve" anchor="approve-btn" kind={draft.kind} />}
           {sourcesSection}
           {checklist}
           {detailsSection}
