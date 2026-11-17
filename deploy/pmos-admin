@@ -11,6 +11,7 @@
 #   pmos-admin backup                 databases and logs to deploy/backups/<time>/
 #   pmos-admin restore <dir>          put a backup back (stops the services while it runs)
 #   pmos-admin reindex                reload content after a merge (lint-gated)
+#   pmos-admin audit purge --dry-run  how many audit events the next daily purge deletes
 #   pmos-admin revoke <handle> <atlassian|slack|github>
 #                                     remove a PM's linked account and its tokens
 #   pmos-admin ledger [--since 7d] [--export]
@@ -349,6 +350,17 @@ case "$cmd" in
 
   reindex)
     internal POST /internal/reindex && echo
+    ;;
+
+  audit)
+    # Read-only: what the tool server's next daily purge would delete (docs/audit-retention.md).
+    [ "$*" = "purge --dry-run" ] || { say "usage: pmos-admin audit purge --dry-run (the tool server purges daily itself)" >&2; exit 2; }
+    days=${PMOS_AUDIT_RETENTION_DAYS:-90}
+    case "$days" in '' | *[!0-9]*) say "PMOS_AUDIT_RETENTION_DAYS=$days isn't a number of days" >&2; exit 2 ;; esac
+    [ "$days" -ge 90 ] || { say "PMOS_AUDIT_RETENTION_DAYS=$days is under the 90-day minimum" >&2; exit 2; }
+    compose exec -T postgres psql -U postgres -d pmos_toolserver -v ON_ERROR_STOP=1 -At -F ' ' \
+      -c "SELECT count(*), coalesce(min(at)::text, '-') FROM audit_events WHERE at < now() - make_interval(days => $days)" |
+      { read -r n oldest; say "retention $days days: $n events would be deleted (oldest: $oldest); nothing was deleted"; }
     ;;
 
   revoke)

@@ -29,10 +29,11 @@ use sqlx::Row;
 
 use crate::approvals::{
     args_hash, redact_args, reply_message, reply_thread, ApprovalItem, ApprovalRepo, DecideError,
-    Decision, Drafted, NewItem, Status, Verdict, GRANT_TTL_MINUTES, REPLY_TOOL,
+    Decision, Drafted, NewItem, Status, TargetConversation, Verdict, GRANT_TTL_MINUTES, REPLY_TOOL,
 };
 use crate::audit::{
-    AuditEvent, AuditQuery, AuditSink, Client as AuditClient, Outcome, ReadEvent, StoredEvent,
+    check_purge, parse_purge_detail, AuditEvent, AuditQuery, AuditSink, Client as AuditClient,
+    LastPurge, Outcome, PurgeBatch, Purged, ReadEvent, RetentionFacts, StoredEvent, PURGE_TOOL,
 };
 use crate::context::{
     query_terms, snippet, ContextDoc, ContextIndex, Hit, ReindexReport, SearchResults,
@@ -428,12 +429,16 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
         redacted_at: r.try_get("redacted_at")?,
         drafted_args: r.try_get("drafted_args")?,
         edited_at: r.try_get("edited_at")?,
+        // Unreadable (written by a newer server): as if never checked.
+        target_conversation: r
+            .try_get::<Option<Value>, _>("target_conversation")?
+            .and_then(|v| serde_json::from_value::<TargetConversation>(v).ok()),
     })
 }
 
 const ITEM_COLUMNS: &str = "id, user_handle, skill, bot, run_id, tool, args, args_hash, status, \
                             created_at, decided_at, decided_by, result, sources_sensitivity, \
-                            redacted_at, drafted_args, edited_at";
+                            redacted_at, drafted_args, edited_at, target_conversation";
 
 /// Insert a new item and its ledger row, inside `tx`.
 async fn insert_item(
@@ -840,6 +845,19 @@ impl ApprovalRepo for PgStore {
         Ok(item)
     }
 
+    async fn set_target_conversation(
+        &self,
+        id: &str,
+        target: &TargetConversation,
+    ) -> StoreResult<bool> {
+        let done = sqlx::query("UPDATE approvals SET target_conversation = $2 WHERE id = $1")
+            .bind(id)
+            .bind(sqlx::types::Json(target))
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     async fn complete(
         &self,
         id: &str,
@@ -1027,6 +1045,13 @@ fn outcome_str(outcome: crate::audit::Outcome) -> String {
 #[async_trait]
 impl AuditSink for PgStore {
     async fn record(&self, event: AuditEvent) -> StoreResult<()> {
+        // Only the database's purge function records as `system`, so the overview's last
+        // purge can't be one the application wrote.
+        if event.client == AuditClient::System {
+            return Err(StoreError(
+                "`system` events are recorded by the database's purge function only".into(),
+            ));
+        }
         sqlx::query(
             "INSERT INTO audit_events
                  (at, run_id, user_handle, skill, bot, tool, outcome, sources, args_hash,
@@ -1170,6 +1195,68 @@ impl AuditSink for PgStore {
             }
         }
         Ok(Some(counts))
+    }
+
+    /// Through `purge_audit_events` (migration 0013), the one way the database lets an
+    /// audit event be deleted: the floor, the cutoff, the batch's own event and the lock
+    /// are all the function's. `now` is unused: the database's clock decides.
+    async fn purge(
+        &self,
+        retention_days: u32,
+        batch: u32,
+        _now: DateTime<Utc>,
+    ) -> StoreResult<Option<Purged>> {
+        check_purge(retention_days, batch)?;
+        let row = sqlx::query(
+            "SELECT deleted, cutoff, more, ran
+             FROM purge_audit_events(make_interval(days => $1), $2)",
+        )
+        .bind(i32::try_from(retention_days).unwrap_or(i32::MAX))
+        .bind(i32::try_from(batch).unwrap_or(i32::MAX))
+        .fetch_one(&self.pool)
+        .await?;
+        if !row.try_get::<bool, _>("ran")? {
+            return Ok(Some(Purged::Busy));
+        }
+        Ok(Some(Purged::Ran(PurgeBatch {
+            deleted: u64::try_from(row.try_get::<i64, _>("deleted")?).unwrap_or_default(),
+            cutoff: row.try_get("cutoff")?,
+            more: row.try_get("more")?,
+        })))
+    }
+
+    async fn retention(&self) -> StoreResult<Option<RetentionFacts>> {
+        // `audit_events_at` gives the oldest; `audit_events_purges` the last purge.
+        let oldest_event_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT min(at) FROM audit_events")
+                .fetch_one(&self.pool)
+                .await?;
+        let last = sqlx::query(
+            "SELECT at, detail FROM audit_events
+             WHERE tool = $1 AND client = 'system'
+             ORDER BY at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(PURGE_TOOL)
+        .fetch_optional(&self.pool)
+        .await?;
+        let last_purge = match last {
+            None => None,
+            Some(r) => {
+                let detail: Option<String> = r.try_get("detail")?;
+                match detail.as_deref().and_then(parse_purge_detail) {
+                    Some((deleted, _)) => Some(LastPurge {
+                        at: r.try_get("at")?,
+                        deleted,
+                    }),
+                    None => None,
+                }
+            }
+        };
+        Ok(Some(RetentionFacts {
+            oldest_event_at,
+            last_purge,
+        }))
     }
 }
 

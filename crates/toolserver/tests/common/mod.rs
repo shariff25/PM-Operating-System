@@ -117,6 +117,19 @@ impl AuditSink for SwitchAudit {
     ) -> StoreResult<Option<std::collections::BTreeMap<Outcome, u64>>> {
         self.inner.count_outcomes(since).await
     }
+
+    async fn purge(
+        &self,
+        retention_days: u32,
+        batch: u32,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Option<pmos_toolserver::audit::Purged>> {
+        self.inner.purge(retention_days, batch, now).await
+    }
+
+    async fn retention(&self) -> StoreResult<Option<pmos_toolserver::audit::RetentionFacts>> {
+        self.inner.retention().await
+    }
 }
 
 pub struct Fixture {

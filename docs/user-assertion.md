@@ -327,7 +327,7 @@ The mode, the start-up rule, the refusals and the verifier are shared code
   admin routes (web token only) the subject must equal `user=`, the viewer, whose role the tool
   server then checks in its own `team.yaml` (`403 forbidden` without it). The admin proposal
   and event routes (`POST /internal/admin/proposals/open`, `GET /internal/admin/proposals`,
-  `GET /internal/admin/protection`, `POST /internal/admin/events`) need the assertion **in
+  `GET /internal/admin/protection`, `POST /internal/admin/actions`) need the assertion **in
   every mode, `off` included**, bound to the body (up to 24 MiB for a proposal): opening a pull
   request with an admin's own GitHub token is never done on a token's word alone.
 - **Every failure** is the same `401 {"code": "bad_assertion"}`. The log has the client and the

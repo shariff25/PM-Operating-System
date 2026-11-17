@@ -116,6 +116,9 @@ struct Mock {
     not_linked: AtomicBool,
     /// Proposals are off on the tool server.
     unconfigured: AtomicBool,
+    /// Sign-in events (`POST /internal/admin/events`), kept apart from the admin actions
+    /// these tests count.
+    sign_ins: Mutex<Vec<Call>>,
 }
 
 impl Mock {
@@ -132,7 +135,7 @@ impl Mock {
         self.to("/internal/admin/proposals/open")
     }
     fn events(&self) -> Vec<Call> {
-        self.to("/internal/admin/events")
+        self.to("/internal/admin/actions")
     }
     fn reply(&self, status: u16, body: Value) {
         *self.open_reply.lock().unwrap() = Some((status, body));
@@ -163,6 +166,10 @@ async fn toolserver(
     body: Bytes,
 ) -> Response {
     let c = call(&method, &uri, &headers, &body);
+    if c.path == "/internal/admin/events" {
+        m.sign_ins.lock().unwrap().push(c);
+        return Json(json!({"recorded": true})).into_response();
+    }
     m.calls.lock().unwrap().push(c.clone());
     if c.auth.as_deref() != Some(&format!("Bearer {TOOLS_TOKEN}")) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -177,7 +184,7 @@ async fn toolserver(
             .into_response()
     };
     match (c.method.as_str(), c.path.as_str()) {
-        ("POST", "/internal/admin/events") => {
+        ("POST", "/internal/admin/actions") => {
             if m.events_down.load(Ordering::SeqCst) {
                 return coded(503, "audit_unavailable");
             }

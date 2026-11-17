@@ -16,7 +16,7 @@
 //!   with a fixed note, never file text (A4).
 //! - An empty content folder never makes the repository root writable (A6).
 //! - The proposals list and the branch-protection check use the viewer's own account.
-//! - `POST /internal/admin/events`: what `pmos-web` refused, and an admin's sensitive reads.
+//! - `POST /internal/admin/actions`: what `pmos-web` refused, and an admin's sensitive reads.
 
 mod common;
 
@@ -978,9 +978,9 @@ async fn a_signed_assertion_is_needed_in_every_mode() {
         target,
         "/internal/admin/proposals?user=ada&kind=policy",
         "/internal/admin/protection?user=ada",
-        "/internal/admin/events?user=ada",
+        "/internal/admin/actions?user=ada",
     ] {
-        let method = if t.contains("open") || t.contains("events") {
+        let method = if t.contains("open") || t.contains("actions") {
             reqwest::Method::POST
         } else {
             reqwest::Method::GET
@@ -1192,7 +1192,7 @@ async fn event(srv: &Server, user: &str, body: Value) -> (u16, Value) {
     srv.web(
         reqwest::Method::POST,
         user,
-        &format!("/internal/admin/events?user={user}"),
+        &format!("/internal/admin/actions?user={user}"),
         Some(&body),
     )
     .await

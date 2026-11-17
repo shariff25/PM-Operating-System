@@ -27,10 +27,11 @@
 //!     only with `?user=` naming the item's PM and can't change where a draft goes when it
 //!     edits one; it reaches neither the ledger nor onboarding (so no `admin` grants). It
 //!     also reaches the read-only admin and auditor routes (`GET /internal/admin/*`,
-//!     `app/admin.rs`), and the admin proposal and event routes (`POST
-//!     /internal/admin/proposals/open`, `POST /internal/admin/events`), which check the named
-//!     viewer's role themselves and need a signed user assertion in every mode; never
-//!     sessions, grants, calls, account linking or credentials.
+//!     `app/admin.rs`), the admin proposal and action routes (`POST
+//!     /internal/admin/proposals/open`, `POST /internal/admin/actions`), which check the named
+//!     viewer's role themselves and need a signed user assertion in every mode, and its
+//!     sign-in events (`POST /internal/admin/events`); never sessions, grants, calls, account
+//!     linking or credentials.
 //!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
@@ -538,7 +539,9 @@ fn client_may_use(state: &AppState, client: Client, skill: Option<&str>) -> bool
             .bot
             .as_ref()
             .is_some_and(|b| b.skills.iter().any(|s| s == skill)),
-        (Client::Bot, None) | (Client::Mcp | Client::Web | Client::Console, _) => false,
+        (Client::Bot, None) | (Client::Mcp | Client::Web | Client::Console | Client::System, _) => {
+            false
+        }
     }
 }
 

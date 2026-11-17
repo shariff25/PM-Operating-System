@@ -867,6 +867,76 @@ async fn unknown_kids_are_rate_limited() {
 
 // Membership.
 
+/// Entra sign-ins and refusals reach the tool server's audit log (`POST
+/// /internal/admin/events`): a sign-in for the member, a refusal for no one with its code,
+/// and never the email tried, only a short keyed hash of it. A callback no flow started is
+/// not recorded (anyone can send one).
+#[tokio::test]
+async fn entra_sign_ins_and_refusals_are_audited() {
+    let seen: Arc<Mutex<Vec<(String, Value, String)>>> = Arc::default();
+    let s = seen.clone();
+    let (l, tools) = listener().await;
+    let _stop_tools = serve(
+        l,
+        Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+            let s = s.clone();
+            async move {
+                s.lock().unwrap().push((
+                    uri.to_string(),
+                    serde_json::from_slice(&body).unwrap_or(Value::Null),
+                    String::from_utf8_lossy(&body).into_owned(),
+                ));
+                Json(json!({"recorded": true}))
+            }
+        }),
+    )
+    .await;
+    let h = harness_with(|c| c.toolserver_url = tools.clone()).await;
+    h.sign_in_with(good).await.session().expect("signed in");
+    let zoe = |_: &Begun, mut c: Value| {
+        c["preferred_username"] = json!("zoe@contoso.example");
+        sign(&c, keys::KEY_A_DER, "key-a")
+    };
+    h.sign_in_with(zoe).await.assert_refused("not_a_member");
+    std::fs::write(
+        h._dir.path().join("team.yaml"),
+        "members:\n  - {handle: ana, slack-id: U0ANA, email: ana@contoso.example, \
+         entra-oid: 99999999-0000-0000-0000-000000000001, roles: [pm]}\n",
+    )
+    .unwrap();
+    h.sign_in_with(good).await.assert_refused("wrong_account");
+    // A callback with no flow behind it: refused, not recorded.
+    let res = h
+        .http
+        .get(format!("{}/api/auth/callback?code=x&state=y", h.web))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+
+    let events = seen.lock().unwrap().clone();
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(events[0].0, "/internal/admin/events?user=ana");
+    assert_eq!(
+        events[0].1,
+        json!({"action": "web.sign_in", "provider": "entra"})
+    );
+    assert_eq!(events[1].0, "/internal/admin/events");
+    assert_eq!(events[1].1["action"], "web.sign_in_refused");
+    assert_eq!(events[1].1["reason"], "not_a_member");
+    let attempt = events[1].1["attempt"].as_str().unwrap();
+    assert!(attempt.len() == 12 && attempt.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(!events[1].2.contains("zoe") && !events[1].2.contains("contoso"));
+    assert_eq!(
+        events[2].1,
+        json!({"action": "web.sign_in_refused", "provider": "entra",
+               "reason": "wrong_account", "member": "ana"})
+    );
+    for (_, _, raw) in &events {
+        assert!(!raw.contains(SECRET) && !raw.contains(TOOLS_TOKEN));
+    }
+}
+
 #[tokio::test]
 async fn someone_not_on_the_team_gets_no_session() {
     let h = harness().await;

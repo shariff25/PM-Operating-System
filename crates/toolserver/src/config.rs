@@ -174,6 +174,9 @@ pub struct Config {
     /// `PMOS_SLACK_DRAFT_TTL_HOURS`: an undecided Slack draft expires after this many hours,
     /// and a decided one loses its text this long after its decision. 1 to 24; default 24.
     pub slack_draft_ttl_hours: i64,
+    /// `PMOS_AUDIT_RETENTION_DAYS`: audit events older than this many days are deleted once
+    /// a day (`docs/audit-retention.md`). From 90 (the floor, and the default) to 3650.
+    pub audit_retention_days: u32,
 }
 
 impl Config {
@@ -310,6 +313,28 @@ impl Config {
                 })?,
             None => max_ttl,
         };
+        let (min_days, max_days) = (
+            crate::audit::MIN_RETENTION_DAYS,
+            crate::audit::MAX_RETENTION_DAYS,
+        );
+        let audit_retention_days = match get("PMOS_AUDIT_RETENTION_DAYS").filter(|s| !s.is_empty()) {
+            Some(s) => match s.trim().parse::<u32>() {
+                Ok(d) if d < min_days => {
+                    return Err(format!(
+                        "PMOS_AUDIT_RETENTION_DAYS={d} is shorter than the {min_days}-day minimum: \
+                         audit events are kept at least {min_days} days (docs/audit-retention.md). \
+                         Set {min_days} or more, or leave it out for {min_days}."
+                    ))
+                }
+                Ok(d) if d <= max_days => d,
+                _ => {
+                    return Err(format!(
+                        "PMOS_AUDIT_RETENTION_DAYS must be a whole number of days from {min_days} to {max_days}, not `{s}`"
+                    ))
+                }
+            },
+            None => min_days,
+        };
         let bind = get("PMOS_BIND")
             .unwrap_or_else(|| "127.0.0.1:8710".into())
             .parse()
@@ -340,6 +365,7 @@ impl Config {
             content_sync_secs,
             ledger_expire_days,
             slack_draft_ttl_hours,
+            audit_retention_days,
         })
     }
 }
@@ -1005,6 +1031,33 @@ mod tests {
             assert!(cfg(&with(&fake, &[("PMOS_SLACK_DRAFT_TTL_HOURS", bad)]))
                 .unwrap_err()
                 .contains("PMOS_SLACK_DRAFT_TTL_HOURS"));
+        }
+    }
+
+    #[test]
+    fn audit_retention_is_90_days_or_longer() {
+        let fake = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert_eq!(cfg(&fake).unwrap().audit_retention_days, 90);
+        for (set, want) in [("90", 90), ("365", 365), (" 120 ", 120), ("3650", 3650)] {
+            assert_eq!(
+                cfg(&with(&fake, &[("PMOS_AUDIT_RETENTION_DAYS", set)]))
+                    .unwrap()
+                    .audit_retention_days,
+                want
+            );
+        }
+        // Below the floor: refused at start-up, with what to do.
+        for short in ["0", "30", "89"] {
+            let err = cfg(&with(&fake, &[("PMOS_AUDIT_RETENTION_DAYS", short)])).unwrap_err();
+            assert!(err.contains("shorter than the 90-day minimum"), "{err}");
+        }
+        for bad in ["-1", "ninety", "90.5", "3651"] {
+            let err = cfg(&with(&fake, &[("PMOS_AUDIT_RETENTION_DAYS", bad)])).unwrap_err();
+            assert!(err.contains("from 90 to 3650"), "{err}");
         }
     }
 }

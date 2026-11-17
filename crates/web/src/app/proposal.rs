@@ -12,7 +12,7 @@
 //! account (`docs/policy-admin.md`, How a proposal is opened). This module relays its answer
 //! with `pmos-web`'s own sentences.
 //!
-//! **Audited here** (`POST /internal/admin/events`): a role refusal on any admin policy or
+//! **Audited here** (`POST /internal/admin/actions`): a role refusal on any admin policy or
 //! content route, a proposal refused by this server's own checks (invalid, stale against the
 //! deployed copy), and an admin reading a PM's personal master file or restricted context
 //! (through the file route, or named in a validation or proposal, whose diff shows the current
@@ -89,7 +89,7 @@ impl Action {
 /// The audit action for reading a sensitive file.
 pub const SENSITIVE_READ: &str = "admin.content_sensitive_read";
 
-/// Record an event at the tool server (`POST /internal/admin/events?user=<viewer>`, signed
+/// Record an event at the tool server (`POST /internal/admin/actions?user=<viewer>`, signed
 /// for the viewer and bound to the body): the action, the outcome (`denied` or `ok`), a fixed
 /// note, how many files, and a target that names no content (`content:personal:<handle>`
 /// for a personal master file; a restricted file's path is never sent, as its name can be
@@ -107,7 +107,7 @@ pub(super) async fn record(
         .toolserver(state)
         .admin_record(
             &signed.member.handle,
-            "events",
+            "actions",
             &json!({
                 "action": action,
                 "outcome": outcome,

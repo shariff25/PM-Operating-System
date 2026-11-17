@@ -518,6 +518,22 @@ struct OverviewReply {
     rejected: Option<u64>,
     #[serde(default)]
     denied: Option<u64>,
+    /// How many days audit events are kept (`PMOS_AUDIT_RETENTION_DAYS`); `null` from a tool
+    /// server older than retention.
+    #[serde(default)]
+    retention_days: Option<u32>,
+    /// The oldest event still in the audit log; `null` when it is empty or can't be read back.
+    #[serde(default)]
+    oldest_event_at: Option<String>,
+    /// The newest purge batch; `null` before the first.
+    #[serde(default)]
+    last_purge: Option<LastPurge>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct LastPurge {
+    at: String,
+    deleted: u64,
 }
 
 /// `GET /api/admin/overview`: counts for the admin dashboard.

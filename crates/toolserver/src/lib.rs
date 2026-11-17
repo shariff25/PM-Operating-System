@@ -27,6 +27,7 @@ pub mod oauth;
 pub mod onboarding;
 pub mod pg;
 pub mod proposals;
+pub mod retention;
 pub mod schemas;
 pub mod service;
 pub mod session;
