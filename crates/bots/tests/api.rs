@@ -449,7 +449,58 @@ both_envs!(
     routines_are_managed_by_their_owner,
     a_bots_own_worker_touches_only_that_bots_tasks,
     drafts_are_read_from_the_tool_server_for_console_and_evals,
+    eval_tasks_run_as_the_benchmark_member_and_never_reach_slack,
 );
+
+/// The evals client (spec §3, S3): only as a handle in `PMOS_EVALS_AS` (ben, in these
+/// tests), with no Slack target, and nothing it does reaches the Slack feed.
+async fn eval_tasks_run_as_the_benchmark_member_and_never_reach_slack(env: &Env) {
+    let new =
+        |user: &str| json!({"bot": "docs", "requested_by": user, "text": "Q", "source": "eval"});
+    let (status, body) = env.post("/v1/tasks", "evals", None, new("ana")).await;
+    assert_eq!(status, 403, "ana is a PM, not the benchmark member: {body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("PMOS_EVALS_AS"),
+        "{body}"
+    );
+    let mut with_slack = new("ben");
+    with_slack["slack"] = json!({"channel": "C0TEAM", "thread_ts": "1731.1"});
+    let (status, body) = env.post("/v1/tasks", "evals", None, with_slack).await;
+    assert_eq!(status, 400, "an eval task has no Slack target: {body}");
+
+    let (status, task) = env.post("/v1/tasks", "evals", None, new("ben")).await;
+    assert_eq!(status, 201, "{task}");
+    let tid = id(&task);
+    let (status, _) = env.claim().await;
+    assert_eq!(status, 200);
+    let (status, _) = env
+        .post(
+            &format!("/v1/worker/tasks/{tid}/events"),
+            "worker",
+            None,
+            json!({"kind": "milestone", "text": "Reading"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, done) = env
+        .post(
+            &format!("/v1/worker/tasks/{tid}/complete"),
+            "worker",
+            None,
+            json!({"result": "The answer."}),
+        )
+        .await;
+    assert_eq!(status, 200, "{done}");
+    let (_, task) = env.get(&format!("/v1/tasks/{tid}"), "evals", None).await;
+    assert_eq!(task["status"], "done");
+    assert!(
+        env.feed()
+            .await
+            .iter()
+            .all(|n| n["task_id"] != tid.as_str()),
+        "no milestone or done notification for an eval task"
+    );
+}
 
 /// `GET /v1/tasks/{id}/drafts` (`docs/improvement-loop-spec.md` §3): the runtime reads each
 /// approval item from the tool server with its own service token.
@@ -1288,7 +1339,8 @@ async fn every_endpoint_checks_the_client() {
         (
             Method::POST,
             "/v1/tasks".into(),
-            json!({"bot": "docs", "requested_by": "ana", "text": "t", "source": "eval"}),
+            // ben is the benchmark member (PMOS_EVALS_AS) in these tests.
+            json!({"bot": "docs", "requested_by": "ben", "text": "t", "source": "eval"}),
             &["evals"],
         ),
         (

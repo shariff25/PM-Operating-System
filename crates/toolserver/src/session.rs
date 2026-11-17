@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::store::StoreResult;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct Session {
     #[serde(skip_serializing)]
     pub token: String,
@@ -29,6 +29,22 @@ pub struct Session {
     /// The highest data class the session has read so far (`docs/slack-reply-spec.md` §3).
     /// Each approval item it drafts records it.
     pub sources_sensitivity: Sensitivity,
+}
+
+/// Never prints the token.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("token", &"<redacted>")
+            .field("user", &self.user)
+            .field("skill", &self.skill)
+            .field("bot", &self.bot)
+            .field("run_id", &self.run_id)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("sources_sensitivity", &self.sources_sensitivity)
+            .finish()
+    }
 }
 
 impl Session {
@@ -161,6 +177,9 @@ mod tests {
         assert_eq!(token_hash(&a.token).len(), 64);
         assert_ne!(token_hash(&a.token), a.token);
         assert_eq!(a.expires_at, now + Duration::minutes(30));
+        let printed = format!("{a:?}");
+        assert!(!printed.contains(&a.token), "{printed}");
+        assert!(printed.contains("<redacted>") && printed.contains("ana"));
     }
 
     #[test]

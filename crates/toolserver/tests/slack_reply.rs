@@ -70,6 +70,7 @@ both!(
     a_tagged_reply_is_one_draft_per_message,
     a_tagged_message_id_is_kept_and_never_sent,
     the_pending_list_is_oldest_first_and_capped,
+    a_restricted_note_keeps_later_drafts_from_outsiders,
 );
 
 async fn session(f: &Fixture, run: &str) -> Session {
@@ -433,23 +434,53 @@ async fn restricted_drafts_never_reach_outsiders(f: &Fixture) {
     assert_eq!(f.slack.writes().len(), 1);
     assert_eq!(f.slack.writes()[0].user, SLACK_PM, "as the PM");
 
-    // An edit that moves the reply to a channel with an outsider is checked there.
+    // An edit from Slack can't move the reply to another channel or thread at all (S2).
     let moved = restricted_draft(
         f,
         "tsk_r3",
         reply(SLACK_ALL_TEAM, "1731600300.000200", "Yes."),
     )
     .await;
+    for (field, edited) in [
+        (
+            "channel",
+            reply(SLACK_WITH_OUTSIDER, "1731600300.000200", "Yes."),
+        ),
+        (
+            "thread_ts",
+            reply(SLACK_ALL_TEAM, "1731601200.000600", "Yes."),
+        ),
+        (
+            "message_ts",
+            tagged(
+                SLACK_ALL_TEAM,
+                "1731600300.000200",
+                "1731600300.000300",
+                "Yes.",
+            ),
+        ),
+    ] {
+        assert_eq!(
+            decide(f, &moved, Decision::Edit, Some(edited), false, now()).await,
+            Err(DecisionError::TargetChanged(field.into())),
+            "{field}"
+        );
+    }
+    assert_eq!(item(f, &moved).await.status, Status::Pending);
+    // The orchestrator may move it, and the audience check runs on the new channel.
     assert!(matches!(
-        decide(
-            f,
-            &moved,
-            Decision::Edit,
-            Some(reply(SLACK_WITH_OUTSIDER, "1731601200.000600", "Yes.")),
-            false,
-            now()
-        )
-        .await,
+        f.svc
+            .decide_verdict(
+                Client::Orchestrator,
+                &moved,
+                SLACK_PM,
+                Verdict::new(
+                    Decision::Edit,
+                    Some(reply(SLACK_WITH_OUTSIDER, "1731601200.000600", "Yes."))
+                ),
+                now()
+            )
+            .await,
         Err(DecisionError::AudienceBlocked(_))
     ));
 
@@ -517,6 +548,105 @@ async fn restricted_drafts_never_reach_outsiders(f: &Fixture) {
         Err(DecisionError::AudienceBlocked(_))
     ));
     assert_eq!(f.slack.writes().len(), 2, "only the two allowed posts");
+}
+
+/// Once a PM's memory holds a restricted note, a reply drafted in a session that read it is
+/// blocked where people outside the team can see it (S6), on each memory backend.
+async fn a_restricted_note_keeps_later_drafts_from_outsiders(f: &Fixture) {
+    // A session reads restricted context, then writes a note: stored restricted.
+    let writer = session(f, "tsk_m1").await;
+    f.svc
+        .call(
+            &writer,
+            "context_read",
+            json!({"path": "context/partners/globex-nda.md"}),
+            now(),
+        )
+        .await
+        .unwrap();
+    let written = f
+        .svc
+        .call(
+            &writer,
+            "memory_update",
+            json!({"key": "partners", "text": "Globex: joint key-management roadmap"}),
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(written["note"]["sensitivity"], "restricted", "{written}");
+
+    // A later session reads memory, and nothing else: raised to restricted.
+    let reader = session(f, "tsk_m2").await;
+    let read = f
+        .svc
+        .call(&reader, "memory_read", json!({}), now())
+        .await
+        .unwrap();
+    assert_eq!(read["notes"][0]["sensitivity"], "restricted");
+    let res = draft_at(
+        f,
+        &reader,
+        reply(SLACK_WITH_OUTSIDER, "1731601200.000600", "On partners: ..."),
+        now(),
+    )
+    .await;
+    let id = res["approval_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        item(f, &id).await.sources_sensitivity,
+        Some(Sensitivity::Restricted)
+    );
+    assert!(matches!(
+        decide(f, &id, Decision::Approve, None, false, now()).await,
+        Err(DecisionError::AudienceBlocked(_))
+    ));
+    assert!(f.slack.writes().is_empty());
+
+    // A note written by a session that read only internal data reads as internal, and its
+    // reader may still reach the outsider's channel.
+    let other = session(f, "tsk_m3").await;
+    f.svc
+        .call(&other, "jira_read", json!({"key": "PM-101"}), now())
+        .await
+        .unwrap();
+    f.svc
+        .call(
+            &other,
+            "memory_update",
+            json!({"key": "partners", "text": "Tracked in PM-101"}),
+            now(),
+        )
+        .await
+        .unwrap();
+    let fresh = session(f, "tsk_m4").await;
+    f.svc
+        .call(&fresh, "memory_read", json!({}), now())
+        .await
+        .unwrap();
+    let res = draft_at(
+        f,
+        &fresh,
+        reply(
+            SLACK_WITH_OUTSIDER,
+            "1731601300.000900",
+            "PM-101 tracks it.",
+        ),
+        now(),
+    )
+    .await;
+    assert_eq!(res["status"], "pending_approval", "{res}");
+    let ok = res["approval_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        item(f, &ok).await.sources_sensitivity,
+        Some(Sensitivity::Internal)
+    );
+    assert_eq!(
+        decide(f, &ok, Decision::Approve, None, false, now())
+            .await
+            .unwrap()
+            .status,
+        Status::Approved
+    );
 }
 
 async fn external_channels_need_a_second_confirmation(f: &Fixture) {
@@ -1133,6 +1263,7 @@ async fn start() -> Server {
                 token: BOT_TOKEN.into(),
                 skills: vec!["docs".into()],
             }),
+            console_token: None,
             content_root: f.root.clone(),
             oauth: None,
             allowed_hosts: vec!["127.0.0.1".into(), "localhost".into()],
@@ -1278,7 +1409,10 @@ async fn decision_answers_over_http() {
 
     // The item reads `expired`, without its text.
     let res = reqwest::Client::new()
-        .get(format!("{}/internal/approvals/{old}", s.base))
+        .get(format!(
+            "{}/internal/approvals/{old}?user={SLACK_PM}",
+            s.base
+        ))
         .bearer_auth(BOT_TOKEN)
         .send()
         .await
@@ -1312,7 +1446,9 @@ async fn decision_answers_over_http() {
     let ledger: Value = res.json().await.unwrap();
     let rows = ledger["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["id"], json!(old));
+    // No approval ids for the bot: the digest goes by `run_id`.
+    assert!(rows[0].get("id").is_none());
+    assert_eq!(rows[0]["run_id"], "tsk_h4");
     assert!(
         !ledger.to_string().contains("[expired]"),
         "no args in the ledger"
@@ -1403,7 +1539,7 @@ async fn the_bot_lists_a_members_pending_approvals_over_http() {
         assert!(body.get("items").is_none());
     }
     // Each item reads as `GET /internal/approvals/{id}` returns it.
-    let (_, one) = get(BOT_TOKEN, format!("/{}", ids[0])).await;
+    let (_, one) = get(BOT_TOKEN, format!("/{}?user={SLACK_PM}", ids[0])).await;
     let (_, body) = get(BOT_TOKEN, format!("?user={SLACK_PM}")).await;
     assert_eq!(body["approvals"][0], one);
 

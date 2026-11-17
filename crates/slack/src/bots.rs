@@ -43,6 +43,10 @@ use crate::blocks::escape;
 use crate::bounded::Bounded;
 use crate::cards::{self, action};
 use crate::commands::{load_team, FollowUp, NOT_A_MEMBER};
+
+/// A click on an approval that isn't the clicker's (the tool server doesn't find it for
+/// them).
+pub const NOT_YOURS: &str = "Only the PM this approval is for can decide it. Nothing was changed.";
 use crate::home::Home;
 use crate::member_cards::{self, action as member_action};
 use crate::members::{self, DmCommand, Onboarding};
@@ -50,7 +54,7 @@ use crate::onboard_flow::{self, Flow};
 use crate::reply::{self, SnoozeStore};
 use crate::runtime::{display_name, BotInfo, Runtime, RuntimeError};
 use crate::slackapi::{Posted, SlackApi};
-use crate::toolserver::{ApiError, ToolServer};
+use crate::toolserver::{ApiError, CallError, ToolServer};
 use crate::{bets_review, level};
 
 /// The bot a DM goes to when nothing else picks one.
@@ -800,10 +804,27 @@ impl Bots {
         false
     }
 
-    /// The approval item for a click, or a private note saying why not.
-    pub(crate) async fn load_item(&self, channel: &str, user: &str, id: &str) -> Option<Value> {
-        match self.toolserver().approval(id).await {
+    /// The approval item for a click by `handle`, or a private note saying why not. The item
+    /// is read for the clicker (`?user=`), so another PM's item is not found at all: the
+    /// tool server answers `404`, and nothing is shown or changed.
+    pub(crate) async fn load_item(
+        &self,
+        channel: &str,
+        user: &str,
+        handle: &str,
+        id: &str,
+    ) -> Option<Value> {
+        match self.toolserver().approval(id, handle).await {
             Ok(item) => Some(item),
+            Err(CallError::NotFound) => {
+                tracing::info!(
+                    clicker = handle,
+                    approval = id,
+                    "approval click on an item that isn't the clicker's; refused"
+                );
+                self.private(channel, user, None, NOT_YOURS).await;
+                None
+            }
             Err(e) => {
                 let note = format!(
                     "PM OS couldn't load this approval ({}). Try again in a minute.",
@@ -822,7 +843,7 @@ impl Bots {
             return;
         };
         let Some(item) = self
-            .load_item(&click.channel, &click.user, &click.value)
+            .load_item(&click.channel, &click.user, &handle, &click.value)
             .await
         else {
             return;
@@ -848,7 +869,7 @@ impl Bots {
             return;
         };
         let Some(item) = self
-            .load_item(&click.channel, &click.user, &click.value)
+            .load_item(&click.channel, &click.user, &handle, &click.value)
             .await
         else {
             return;
@@ -907,7 +928,7 @@ impl Bots {
             return;
         };
         let Some(item) = self
-            .load_item(&click.channel, &click.user, &click.value)
+            .load_item(&click.channel, &click.user, &handle, &click.value)
             .await
         else {
             return;
@@ -963,7 +984,7 @@ impl Bots {
             self.private(channel, &user, None, NOT_A_MEMBER).await;
             return;
         };
-        let Some(item) = self.load_item(channel, &user, id).await else {
+        let Some(item) = self.load_item(channel, &user, &handle, id).await else {
             return;
         };
         if !self.owns(channel, &user, &handle, &item).await {
@@ -1029,6 +1050,15 @@ impl Bots {
                 }
                 cards::reply_confirm_external(&with_audience(item, &body), edited)
             }
+            // An edit that changed where the draft goes (a channel, page or project): the
+            // tool server refuses it with `422` (`code: "target_changed"`). Say so plainly;
+            // the card keeps its buttons.
+            Err(ApiError::Refused {
+                status: 422, code, ..
+            }) if edited || code == "target_changed" => {
+                tracing::info!(approval = %item["id"], "edit refused: it changed a target");
+                cards::approval_retry(item, cards::TARGET_CHANGED, self.web_url())
+            }
             Err(ApiError::Refused { code, .. }) if code == "expired" => {
                 let mut shown = item.clone();
                 shown["status"] = json!("expired");
@@ -1049,7 +1079,7 @@ impl Bots {
                     error
                 };
                 let id = item["id"].as_str().unwrap_or_default();
-                match self.toolserver().approval(id).await {
+                match self.toolserver().approval(id, handle).await {
                     Ok(now) if now["status"] != "pending" => {
                         let line = format!(
                             "{}\n_{}_",

@@ -103,6 +103,33 @@ pub struct Config {
     /// `PMOS_ASSERTION_MODE` and `PMOS_ASSERTION_KEYS`: user assertions from the `web` and
     /// `console` clients (`crate::assertion`). Off unless set.
     pub assertions: Arc<Assertions>,
+    /// `PMOS_EVALS_AS`: the handles the `evals` client may request tasks as, comma-separated.
+    /// Empty or unset means [`DEFAULT_EVALS_AS`]: the benchmark member only.
+    pub evals_as: Vec<String>,
+}
+
+/// The benchmark member the `evals` client runs tasks as when `PMOS_EVALS_AS` is unset.
+pub const DEFAULT_EVALS_AS: &str = "evals";
+
+/// `PMOS_EVALS_AS`: comma-separated handles. Each must be a valid handle; none means the
+/// default.
+pub fn parse_evals_as(spec: Option<&str>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for h in spec.unwrap_or_default().split(',').map(str::trim) {
+        if h.is_empty() {
+            continue;
+        }
+        if !pmos_contract::model::valid_handle(h) {
+            return Err(format!("PMOS_EVALS_AS: `{h}` is not a valid handle"));
+        }
+        if !out.iter().any(|o| o == h) {
+            out.push(h.to_string());
+        }
+    }
+    if out.is_empty() {
+        out.push(DEFAULT_EVALS_AS.to_string());
+    }
+    Ok(out)
 }
 
 impl Config {
@@ -145,6 +172,7 @@ impl Config {
             gateway_url: url("PMOS_GATEWAY_URL")?,
             gateway_token: Secret(need("PMOS_GATEWAY_TOKEN")?),
             assertions: Arc::new(Assertions::from_lookup(&get)?),
+            evals_as: parse_evals_as(get("PMOS_EVALS_AS").as_deref())?,
         })
     }
 }
@@ -267,6 +295,27 @@ mod tests {
         assert!(cfg(&without_gateway)
             .unwrap_err()
             .contains("PMOS_GATEWAY_URL"));
+    }
+
+    #[test]
+    fn evals_as_defaults_to_the_benchmark_member() {
+        assert_eq!(parse_evals_as(None).unwrap(), vec!["evals"]);
+        assert_eq!(parse_evals_as(Some(" ")).unwrap(), vec!["evals"]);
+        assert_eq!(
+            parse_evals_as(Some("evals, ana,ana")).unwrap(),
+            vec!["evals", "ana"]
+        );
+        assert!(parse_evals_as(Some("ana,Not A Handle"))
+            .unwrap_err()
+            .contains("PMOS_EVALS_AS"));
+        let t = "a".repeat(32);
+        let tokens = format!("evals={t}");
+        let owned = base(&tokens);
+        let mut pairs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        pairs.push(("PMOS_DEV", "1"));
+        assert_eq!(cfg(&pairs).unwrap().evals_as, vec!["evals"]);
+        pairs.push(("PMOS_EVALS_AS", "ana,bo"));
+        assert_eq!(cfg(&pairs).unwrap().evals_as, vec!["ana", "bo"]);
     }
 
     #[test]

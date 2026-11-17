@@ -8,7 +8,8 @@
 //!   `GET /rest/api/3/issue/{key}`, `POST /rest/api/3/issue` (description in ADF).
 //! - Confluence: `GET /wiki/rest/api/search?cql=` (v1 CQL search),
 //!   `GET /wiki/api/v2/pages/{id}?body-format=storage`, `GET /wiki/api/v2/spaces?keys=`,
-//!   `POST /wiki/api/v2/pages` (`status: draft`), `PUT /wiki/api/v2/pages/{id}` (version + 1).
+//!   `POST /wiki/api/v2/pages` (`status: draft`), `PUT /wiki/api/v2/pages/{id}` (version + 1,
+//!   only when the page is still at the `version` the call names; a `409` means the same).
 
 use std::sync::Arc;
 
@@ -17,11 +18,13 @@ use chrono::NaiveDate;
 use serde_json::{json, Value};
 
 use super::format::{adf_to_text, markdown_to_adf, markdown_to_storage, storage_to_text};
-use super::http::{arg, client, issue_key, key_like, limit, numeric_id, send_json};
+use super::http::{
+    arg, client, decode_json, issue_key, key_like, limit, numeric_id, send, send_json,
+};
 use super::rollup;
 use super::{
     clip, Caller, Connector, ConnectorError, Item, SourceRef, TeamBot, DRAFTED_MARKER,
-    MAX_BODY_CHARS,
+    MAX_BODY_CHARS, PAGE_CHANGED,
 };
 
 /// Each Jira comment returned to the model, at most.
@@ -595,14 +598,28 @@ impl Connector for Confluence {
             }
             "update_page" => {
                 let id = numeric_id(arg(args, "page_id")?, "Confluence page id")?;
+                let read = args["version"]
+                    .as_u64()
+                    .filter(|v| *v >= 1)
+                    .ok_or_else(|| {
+                        ConnectorError::BadArgs(
+                        "`version` is required: the page's version as confluence_read returned it"
+                            .into(),
+                    )
+                    })?;
                 let current = self.page(&site, id, false).await?;
                 let version = current["version"]["number"].as_u64().ok_or_else(|| {
                     ConnectorError::Unavailable(format!("Confluence page {id} has no version"))
                 })?;
+                // Someone saved a newer version after PM OS read it: refused before anything
+                // that changes the page is sent.
+                if version != read {
+                    return Err(ConnectorError::BadArgs(PAGE_CHANGED.into()));
+                }
                 let message = args["version_comment"]
                     .as_str()
                     .unwrap_or("Updated with PM OS");
-                let updated = send_json(
+                let res = send(
                     self.http
                         .put(format!("{}/wiki/api/v2/pages/{id}", site.base))
                         .bearer_auth(site.token.token.expose())
@@ -616,19 +633,16 @@ impl Connector for Confluence {
                                 "representation": "storage",
                                 "value": format!("{}{}", markdown_to_storage(arg(args, "body")?), Self::footer(caller)),
                             },
-                            "version": {"number": version + 1, "message": message},
+                            "version": {"number": read + 1, "message": message},
                         })),
                     "Confluence",
-                    &format!("page {id}"),
                 )
-                .await
-                .map_err(|e| match e {
-                    // Someone saved a newer version after PM OS read it.
-                    ConnectorError::BadArgs(m) if m.to_lowercase().contains("version") => ConnectorError::BadArgs(format!(
-                        "page {id} changed since PM OS read it; read it again and redo the update ({m})"
-                    )),
-                    other => other,
-                })?;
+                .await?;
+                // Someone saved in between the check and the write.
+                if res.status() == reqwest::StatusCode::CONFLICT {
+                    return Err(ConnectorError::BadArgs(PAGE_CHANGED.into()));
+                }
+                let updated = decode_json(res, "Confluence", &format!("page {id}")).await?;
                 Ok(SourceRef {
                     system: "confluence".into(),
                     id: id.to_string(),

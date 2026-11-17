@@ -44,11 +44,11 @@ for that person or for the viewer who acted.
 - **Behind the Spark's SSO proxy:** with `PMOS_CONSOLE_TRUST_PROXY=1`, the proxy's
   `X-Forwarded-User` names the person. It may be a PM OS handle or the member's email.
   Without that setting the header is ignored.
-- **The proxy proves itself on every request.** With `PMOS_CONSOLE_TRUST_PROXY=1`, a request
-  counts only if it also carries `X-Pmos-Proxy-Secret` equal to `PMOS_CONSOLE_PROXY_SECRET`
-  (at least 32 characters, different from both tokens). The two are hashed and compared in
-  constant time. A request with the secret missing, wrong, or sent twice is `401`, and its
-  `X-Forwarded-User` isn't read at all. The console logs only that a request was refused,
+- **The proxy proves itself on every request.** With `PMOS_CONSOLE_TRUST_PROXY=1`, every
+  request but `/healthz` must also carry `X-Pmos-Proxy-Secret` equal to
+  `PMOS_CONSOLE_PROXY_SECRET` (at least 32 characters, different from both tokens), compared
+  in constant time. A request with the secret missing, wrong, or sent twice is `401` before
+  any page handler runs, and its `X-Forwarded-User` isn't read at all. The console logs only that a request was refused,
   never either header's value. The console won't start with proxy trust on and no secret,
   and says which variable is missing.
 - **Development:** `PMOS_CONSOLE_DEV_USER=<handle>` makes every request that person. The
@@ -107,8 +107,8 @@ environment and sandbox.
 ### What this does not fix
 
 - **The console still holds powerful credentials:** a runtime token that may read and change
-  everything, its own tool server token (`PMOS_CONSOLE_TOKEN` there: the approvals routes
-  only), and its assertion keys, with which it can sign for any member. Anyone who gets the
+  everything, its own tool server token (`PMOS_CONSOLE_TS_TOKEN` there: it may only read
+  approvals), and its assertion keys, with which it can sign for any member. Anyone who gets the
   proxy secret, or code running in the console, can act as any member. The per-viewer checks
   are made in the console, not upstream.
 - **The console is not on its own network.** Separating it would take a network shared only
@@ -127,7 +127,7 @@ Pause, resume and delete are `POST` forms. Each one is checked twice before anyt
 - **A form token** bound to the person: an HMAC of their handle under a key made at start-up.
   A restart invalidates open forms; reloading the page gives a fresh one.
 - **Its origin:** `Sec-Fetch-Site` must not be another site, and `Origin` (or else `Referer`)
-  must be the console. That's `PMOS_CONSOLE_PUBLIC_URL` when set, or else the request's
+  must be present and be the console; a post with neither is refused. That's `PMOS_CONSOLE_PUBLIC_URL` when set, or else the request's
   `Host`. Behind a proxy that rewrites `Host`, set `PMOS_CONSOLE_PUBLIC_URL`.
 
 A refused form is `403` and changes nothing. A done action redirects back to Routines with a
@@ -152,8 +152,10 @@ results.
 | Tool server `GET /internal/approvals?user=<handle>&status=pending` | Approvals: once for a PM, once per `team.yaml` member for an admin |
 | The tool server's audit file | A task's audit events: lines whose `run_id` is the task id, at most 500 |
 
-All runtime calls carry the `console` client token, and tool server calls the console's own
-tool server token. With assertion keys, a call that names a person (`requested_by=`,
+All runtime calls carry the `console` client token. Tool server calls carry the tool
+server's own `console` token (`PMOS_CONSOLE_TS_TOKEN` there), which may read approvals
+(`GET /internal/approvals`, `GET /internal/approvals/{id}`) and nothing else. With assertion
+keys, a call that names a person (`requested_by=`,
 `owner=`, `user=`) carries an assertion for that person, and a routine `PATCH` or `DELETE` one
 for the viewer who pressed the button; reads of everything carry none.
 Each call times out after 10 seconds. If an upstream is down, the screen says which one, with
@@ -172,7 +174,7 @@ show. Where the spec leaves a shape open, it accepts either form:
 ```sh
 PMOS_CONSOLE_DEV_USER=ana \
 PMOS_BOTS_TOKEN=<the runtime's console token> \
-PMOS_TOOLSERVER_TOKEN=<the tool server's console token> \
+PMOS_TOOLSERVER_TOKEN=<the tool server's PMOS_CONSOLE_TS_TOKEN> \
 cargo run -p pmos-console
 ```
 
@@ -185,7 +187,7 @@ cargo run -p pmos-console
 | `PMOS_BOTS_URL` | `http://127.0.0.1:8750` | The bot runtime |
 | `PMOS_BOTS_TOKEN` | required | The `console` entry of the runtime's `PMOS_BOTS_TOKENS`. At least 32 characters |
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | |
-| `PMOS_TOOLSERVER_TOKEN` | required | The tool server's `PMOS_CONSOLE_TOKEN`, which reaches only the approvals routes (older deployments gave the service token). At least 32 characters, and different from `PMOS_BOTS_TOKEN` |
+| `PMOS_TOOLSERVER_TOKEN` | required | The tool server's read-only console token (`PMOS_CONSOLE_TS_TOKEN` there; never the service token). At least 32 characters, and different from `PMOS_BOTS_TOKEN` |
 | `PMOS_ASSERTION_KEYS` | none | `console:bots:<key id>:<base64>` and `console:toolserver:<key id>:<base64>`, comma-separated: sign user assertions for that upstream (`docs/user-assertion.md`). No other pair is accepted |
 | `PMOS_CONTENT_ROOT` | `content` | Where `team.yaml` is. The console won't start if it doesn't parse |
 | `PMOS_CONSOLE_AUDIT_LOG` | none | The tool server's `PMOS_AUDIT_LOG` file, mounted read-only. Without it, task pages say audit events aren't available |

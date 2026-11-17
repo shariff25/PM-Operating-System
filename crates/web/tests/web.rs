@@ -245,7 +245,7 @@ fn items() -> Vec<Value> {
             "apr_race",
             "ana",
             "confluence.update_page",
-            json!({"page_id": "9", "body": "Race"}),
+            json!({"page_id": "9", "version": 3, "body": "Race"}),
             "2026-11-16T09:00:30Z",
         ),
         item(
@@ -338,9 +338,12 @@ async fn toolserver(
                     .into_response(),
             }
         }
+        // Like the tool server: `pmos-web` must name the item's own user (S2), else `404`.
         ("GET", ["internal", "approvals", id]) => match up.find(id) {
-            Some(i) => Json(i).into_response(),
-            None => (
+            Some(i) if query(&uri, "user").is_some_and(|u| i["user"] == json!(u)) => {
+                Json(i).into_response()
+            }
+            _ => (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "no such approval item"})),
             )
@@ -2891,12 +2894,24 @@ async fn a_conflicting_decision_is_read_again_with_an_assertion() {
     let cache = pmos_assertion::MemoryReplayCache::default();
     let calls = w.tools.calls();
     for id in ["apr_race", "apr_dbl"] {
-        let path = format!("/internal/approvals/{id}");
-        // The first read (finding the draft) names nobody; every read after the decision
-        // carries an assertion for the PM.
+        let path = format!("/internal/approvals/{id}?user=ana");
+        // Every read names the PM and carries an assertion for them: the first (finding the
+        // draft) and every read after the decision.
+        let reads: Vec<&Call> = calls
+            .iter()
+            .filter(|c| c.method == "GET" && c.uri == path)
+            .collect();
+        assert!(reads.len() >= 2, "{id}: {reads:?}");
+        for call in &reads[..1] {
+            let a = verified(call, "toolserver", ("wt1", WEB_TOOLS_KEY), &cache)
+                .unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert_eq!(a.subject(), "ana");
+        }
         let decision = calls
             .iter()
-            .position(|c| c.method == "POST" && c.uri == format!("{path}/decision"))
+            .position(|c| {
+                c.method == "POST" && c.uri == format!("/internal/approvals/{id}/decision")
+            })
             .expect("a decision");
         let after: Vec<&Call> = calls[decision..]
             .iter()
@@ -2960,13 +2975,10 @@ async fn every_upstream_call_for_a_pm_carries_a_valid_assertion() {
     let tools = w.tools.calls();
     assert!(tools.iter().any(|c| c.method == "POST"), "{tools:?}");
     for call in &tools {
-        if call.uri.starts_with("/internal/approvals/")
-            && !call.uri.contains('?')
-            && call.method == "GET"
-        {
-            // A single item names nobody: no assertion (pmos-web checks the owner itself).
-            assert!(call.assertion.is_none(), "{}", call.uri);
-            continue;
+        // Every call names the PM, a single item's read included (`?user=`), and carries an
+        // assertion for them.
+        if call.uri.starts_with("/internal/approvals/") && call.method == "GET" {
+            assert!(call.uri.contains("user=ana"), "{}", call.uri);
         }
         assert_eq!(
             verify(call, "toolserver", ("wt1", WEB_TOOLS_KEY), &cache).as_deref(),

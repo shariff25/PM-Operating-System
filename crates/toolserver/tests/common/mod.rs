@@ -194,14 +194,14 @@ pub fn team_fixture(members: &[&str]) -> Fixture {
 
 /// For the Slack reply assistant: `team.yaml` enforced with the Slack fixtures' team
 /// ([`pmos_toolserver::connectors::fake::SLACK_TEAM`]: evals, ben and cy), and a `reply-test`
-/// skill whose data class is `restricted`, with the context, Jira, docs and Slack tools. In
+/// skill whose data class is `restricted`, with the context, Jira, docs, Slack and memory tools. In
 /// memory, or with `postgres` every store in Postgres (`None` when no test database is set).
 pub async fn reply_fixture(postgres: bool) -> Option<(Fixture, Option<TestPg>)> {
     let (dir, root) = content_tree();
     write(
         &root,
         "skills/reply-test/SKILL.md",
-        "---\nname: reply-test\ndescription: Test skill that drafts Slack replies.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"restricted\"\n  tools: \"context.search context.read jira.search jira.read docs.search docs.read slack.search slack.read_thread slack.post_reply slack.send_message jira.create_issue\"\n---\n\n# /reply-test\n\nTest.\n",
+        "---\nname: reply-test\ndescription: Test skill that drafts Slack replies.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"restricted\"\n  tools: \"context.search context.read jira.search jira.read docs.search docs.read slack.search slack.read_thread slack.post_reply slack.send_message jira.create_issue memory.read memory.update\"\n---\n\n# /reply-test\n\nTest.\n",
     );
     let team = pmos_toolserver::team::Team::of(
         pmos_toolserver::connectors::fake::SLACK_TEAM
