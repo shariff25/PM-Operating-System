@@ -48,6 +48,20 @@ describe('production build (review finding 3)', () => {
     expect(css).toContain('Geist Mono Variable');
     expect(css).not.toMatch(/url\(\s*['"]?(https?:|\/\/|data:)/);
     expect(all.filter((f) => f.endsWith('.woff2')).length).toBeGreaterThan(0);
+
+    // The Admin area is its own chunk: the page that loads first does not carry it, and does not
+    // pull it in ahead of time. Nothing in the page runs as an inline script (the content security policy).
+    const html = readFileSync(join(outDir, 'index.html'), 'utf8');
+    const entry = /<script[^>]+src="([^"]+\.js)"/.exec(html)?.[1];
+    expect(entry).toBeTruthy();
+    const entryFile = join(outDir, entry!.replace(/^\//, ''));
+    const adminMarker = 'tools-field';
+    const withAdmin = all.filter((f) => f.endsWith('.js') && readFileSync(f, 'utf8').includes(adminMarker));
+    expect(withAdmin.length).toBe(1);
+    expect(withAdmin[0]).not.toBe(entryFile);
+    expect(html).not.toContain(withAdmin[0]!.split('/').pop()!);
+    expect(readFileSync(entryFile, 'utf8')).not.toContain(adminMarker);
+    expect(html).not.toMatch(/<script(?![^>]*\bsrc=)[^>]*>\s*\S/);
   }, 120_000);
 
   it('refuses to build with VITE_API=mock', async () => {

@@ -671,6 +671,8 @@ export const copy = {
   // ---- Admin area (admins and auditors) ----
   admin: {
     area: 'Admin',
+    opening: 'Opening Admin',
+    openingNote: 'Getting the admin tools ready. This only happens the first time.',
     subnavLabel: 'Admin sections',
     sections: { overview: 'Overview', audit: 'Audit log', team: 'Team', connectors: 'Connectors', policy: 'Policy', content: 'Content and harness' },
     noAccess: {
@@ -987,7 +989,7 @@ export const copy = {
       problems: {
         github_not_linked: {
           text: 'Pull requests are opened with your own GitHub account, and PM OS does not know yours yet. Nothing changed.',
-          next: 'In Slack, open the PM OS app, go to Home, then Accounts, and link GitHub. Then open the pull request again.',
+          next: 'To link it today, send PM OS the word below in a Slack direct message, or use Accounts on the PM OS app\'s Home tab, then open the pull request again.',
         },
         stale_base: {
           text: "Some files changed since this server's copy was made, so I did not open a pull request. Nothing changed.",
@@ -1035,6 +1037,10 @@ export const copy = {
         too_many_files: { text: 'That is more than 50 files in one change. Nothing changed.', next: 'Propose them in smaller groups.' },
       },
       pathsLabel: 'Files involved',
+      linkCommand: 'setup',
+      linkCommandLabel: 'What to send in Slack',
+      copyCommand: 'Copy',
+      copiedCommand: 'Copied',
       baseLine: (branch: string, commit: string) => `Base branch ${branch} at ${commit.slice(0, 7)}`,
     },
 
@@ -1115,6 +1121,18 @@ export const copy = {
         protocolNone: 'not inspected',
         noBots: 'There are no bots in the content.',
         policyFile: 'Policy file',
+        showDetails: 'Show details',
+        hideDetails: 'Hide details',
+        expandAll: 'Expand all',
+        collapseAll: 'Collapse all',
+        ruleBroken: 'A rule is broken',
+        ruleBrokenBody: 'The checked-in policy breaks a PM OS rule.',
+      },
+      parts: {
+        label: 'Parts of the policy page',
+        overview: 'Overview',
+        propose: 'Propose a change',
+        proposals: 'Proposals',
       },
       fixed: {
         heading: 'Fixed in code',
@@ -1163,6 +1181,10 @@ export const copy = {
         skillsOf: (role: string) => `Skills for ${role}`,
         toolsOf: (skill: string) => `Tools for ${skill}`,
         toolsHint: 'Registry names separated by spaces, such as docs.search jira.search',
+        toolUnknown: (name: string) => `${name} isn't a tool PM OS knows`,
+        toolTwice: (name: string) => `${name} is listed twice`,
+        toolSuggestions: 'Tools that match',
+        toolsBlocked: "A tool name isn't one PM OS knows, so this change can't be checked yet. Fix the underlined name first.",
         usedBy: (roles: string) => `Used by ${roles}`,
         unused: 'No role uses it',
         rawLabel: 'The change as JSON',

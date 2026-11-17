@@ -19,6 +19,8 @@ test('an admin changes a policy, checks it, sees the widening, and opens a pull 
   await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Admin' }).click();
   await page.getByRole('list', { name: 'Admin sections' }).getByRole('link', { name: 'Policy' }).click();
   await expect(page.getByRole('heading', { name: /^What each bot may do/ })).toBeVisible();
+  await page.getByRole('navigation', { name: 'Parts of the policy page' }).getByRole('link', { name: 'Propose a change' }).click();
+  await expect(page).toHaveURL(/#\/admin\/policy\/propose$/);
   const open = page.getByRole('button', { name: 'Open a pull request' });
   await expect(open).toBeDisabled();
 
@@ -41,12 +43,14 @@ test('an admin changes a policy, checks it, sees the widening, and opens a pull 
   await dialog.getByRole('button', { name: 'Open the pull request' }).click();
   await expect(page.getByRole('heading', { name: 'Pull request #42 is open' })).toBeVisible();
   await expect(page.getByRole('link', { name: /Open in GitHub/ })).toHaveAttribute('href', 'https://github.com/acme/pmos/pull/42');
+  await page.getByRole('navigation', { name: 'Parts of the policy page' }).getByRole('link', { name: 'Proposals' }).click();
+  await expect(page).toHaveURL(/#\/admin\/policy\/proposals$/);
   await expect(page.getByRole('list', { name: 'Open policy proposals' })).toContainText('PM OS policy: Let the docs bot search Jira');
 });
 
 test('a refused proposal reads as its own sentence, and an unknown outcome sends the admin to the list', async ({ page }) => {
   await signIn(page, 'ada', '?mock_proposal=unknown_outcome');
-  await go(page, '/admin/policy');
+  await go(page, '/admin/policy/propose');
   await page.getByRole('tab', { name: 'Bots' }).click();
   await page.getByLabel('Owner of docs').fill('ana');
   await page.getByRole('button', { name: 'Check this change' }).click();
