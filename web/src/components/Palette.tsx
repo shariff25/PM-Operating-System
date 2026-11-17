@@ -9,6 +9,17 @@ import { relTime } from '../time';
 import { DraftPill } from './bits';
 import { Icon, kindIcon } from './icons';
 import type { IconName } from './icons';
+import { sectionHref, sectionsFor } from '../admin/access';
+import type { AdminSection } from '../admin/access';
+
+const ADMIN_ICONS: Record<AdminSection, IconName> = {
+  overview: 'shield',
+  audit: 'activity',
+  team: 'followups',
+  connectors: 'globe',
+  policy: 'shield',
+  content: 'layers',
+};
 
 interface Option {
   id: string;
@@ -26,7 +37,7 @@ interface Option {
  * focus goes back to where it was.
  */
 export function Palette({ initial, onClose }: { initial: string; onClose: () => void }) {
-  const { api, navigate } = useApp();
+  const { api, me, navigate } = useApp();
   const { drafts, briefState } = useData();
   const { start, asking, error } = useAsk();
   const [query, setQuery] = useState(initial);
@@ -55,6 +66,15 @@ export function Palette({ initial, onClose }: { initial: string; onClose: () => 
         ? [{ id: 'p-followups', group: 'pages' as const, label: copy.nav.followups, icon: 'followups' as const, run: go('/followups') }]
         : []),
       { id: 'p-activity', group: 'pages', label: copy.nav.activity, icon: 'activity', run: go('/activity') },
+      // The Admin parts this person may open; the server checks each again.
+      ...sectionsFor(me).map((s): Option => ({
+        id: `p-admin-${s}`,
+        group: 'pages',
+        label: s === 'overview' ? copy.nav.admin : copy.admin.sections[s],
+        meta: s === 'overview' ? undefined : copy.admin.area,
+        icon: ADMIN_ICONS[s],
+        run: go(sectionHref(s).slice(1)),
+      })),
     ];
     const now = Date.now();
     const draftOpts: Option[] = (drafts ?? []).map((d) => ({
@@ -81,7 +101,7 @@ export function Palette({ initial, onClose }: { initial: string; onClose: () => 
     // A query that is the start of a page or draft name jumps first; anything else asks first.
     const prefix = [...matchPages, ...matchDrafts].some((o) => o.label.toLowerCase().startsWith(ql));
     return prefix ? [...matchPages, ...matchDrafts, askOpt] : [askOpt, ...matchPages, ...matchDrafts];
-  }, [q, ql, drafts, briefState, navigate, onClose, start, api]);
+  }, [q, ql, drafts, briefState, navigate, onClose, start, api, me]);
 
   useEffect(() => setActive(0), [q]);
 

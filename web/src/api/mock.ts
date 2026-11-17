@@ -1,6 +1,8 @@
 import { stripMarkers } from '../citations';
 import { MOCK_PERMISSIONS, MOCK_PROFILES, createMockAdmin, roleOfHandle } from './mockAdmin';
 import type { MockAdminOptions, MockRole } from './mockAdmin';
+import { createMockPolicy } from './mockPolicy';
+import type { MockPolicyOptions } from './mockPolicy';
 import { ApiError, REJECT_REASONS } from './types';
 import type {
   Api,
@@ -17,7 +19,7 @@ import type {
   TaskEvent,
 } from './types';
 
-export interface MockOptions extends MockAdminOptions {
+export interface MockOptions extends MockAdminOptions, MockPolicyOptions {
   /** Who is signed in: a PM (default), an admin or an auditor. Signing in by handle (ada, audrey) also picks it. */
   role?: MockRole;
   /** Pretend network delay in ms. Tests use 0. */
@@ -555,6 +557,9 @@ export function createMockClient(options: MockOptions = {}): Api {
   }
 
   const admin = createMockAdmin(now0, options, () => [...drafts.values()].filter((d) => d.status === 'pending' && !d.practice).length);
+  const policy = createMockPolicy(now0, options);
+  /** Personal master files and restricted context are for admins only (they may edit content). */
+  const mayOpenPrivate = () => (me.permissions ?? []).includes('edit-content');
   /** The server's matrix: a role without the permission gets 403 forbidden. */
   const need = (...wanted: string[]) => {
     guard();
@@ -888,6 +893,61 @@ export function createMockClient(options: MockOptions = {}): Api {
       await wait();
       need('manage-connectors');
       return admin.connectors();
+    },
+
+    async adminPolicy() {
+      await wait();
+      need('view-policies');
+      return policy.policy(mayOpenPrivate());
+    },
+    async adminPolicyValidate(spec) {
+      await wait();
+      write();
+      need('edit-policies');
+      return clone(policy.validate(clone(spec)));
+    },
+    async adminPolicyPropose(input) {
+      await wait();
+      write();
+      need('edit-policies');
+      return clone(policy.propose(me.handle, clone(input)));
+    },
+    async adminPolicyProposals() {
+      await wait();
+      need('view-policies');
+      return policy.proposals('policy');
+    },
+    async adminContent() {
+      await wait();
+      need('view-content');
+      return policy.content(mayOpenPrivate());
+    },
+    async adminContentFile(path) {
+      await wait();
+      need('view-content');
+      return policy.file(path, mayOpenPrivate());
+    },
+    async adminContentValidate(changes) {
+      await wait();
+      write();
+      need('edit-content');
+      return clone(policy.validateContent(clone(changes)));
+    },
+    async adminContentPropose(input) {
+      await wait();
+      write();
+      need('edit-content');
+      return clone(policy.proposeContent(me.handle, clone(input)));
+    },
+    async adminContentProposals() {
+      await wait();
+      need('view-content');
+      return policy.proposals('content');
+    },
+    async adminHarness() {
+      await wait();
+      need('view-content');
+      return policy.harness();
     },
   };
 }

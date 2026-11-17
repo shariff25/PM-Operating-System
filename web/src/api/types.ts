@@ -326,11 +326,17 @@ export interface AdminOverview {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: ErrorCode | string;
-  constructor(status: number, code: string, message: string) {
+  /** The rest of the error body, for the codes that carry more (`paths`, `base`, `errors`, `warnings`). */
+  readonly details: Readonly<Record<string, unknown>>;
+  /** Seconds from `Retry-After`, when the server sent one. */
+  readonly retryAfter: number | null;
+  constructor(status: number, code: string, message: string, details: Record<string, unknown> = {}, retryAfter: number | null = null) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
+    this.details = details;
+    this.retryAfter = retryAfter;
   }
 }
 
@@ -372,4 +378,28 @@ export interface Api {
   adminAuditExport(query: AuditQuery): Promise<AuditExport>;
   adminTeam(): Promise<TeamList>;
   adminConnectors(): Promise<Connector[]>;
+
+  adminPolicy(): Promise<PolicyView>;
+  adminPolicyValidate(spec: SpecPatch): Promise<Validation>;
+  adminPolicyPropose(input: { spec: SpecPatch; title: string; reason: string }): Promise<ProposalResult>;
+  adminPolicyProposals(): Promise<ProposalList>;
+  adminContent(): Promise<ContentView>;
+  adminContentFile(path: string): Promise<ContentFileText>;
+  adminContentValidate(changes: ContentChange[]): Promise<Validation>;
+  adminContentPropose(input: { changes: ContentChange[]; title: string; reason: string }): Promise<ProposalResult>;
+  adminContentProposals(): Promise<ProposalList>;
+  adminHarness(): Promise<Harness>;
 }
+
+export type * from './policyTypes';
+import type {
+  ContentChange,
+  ContentFileText,
+  ContentView,
+  Harness,
+  PolicyView,
+  ProposalList,
+  ProposalResult,
+  SpecPatch,
+  Validation,
+} from './policyTypes';
