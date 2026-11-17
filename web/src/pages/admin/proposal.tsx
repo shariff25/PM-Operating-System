@@ -257,6 +257,22 @@ export function FileDiffs({ content, policy }: { content: readonly FileDiff[]; p
 
 // ---------- Problems ----------
 
+/** A short command to copy, shown in a chip with its own Copy button. */
+export function CommandChip({ command, label }: { command: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  const copyIt = () => {
+    navigator.clipboard?.writeText(command).then(() => setCopied(true), () => {});
+  };
+  return (
+    <div className="cmd-chip" role="group" aria-label={label}>
+      <code className="mono-val">{command}</code>
+      <button type="button" className="cmd-chip-btn" onClick={copyIt}>
+        {copied ? P.copiedCommand : P.copyCommand}
+      </button>
+    </div>
+  );
+}
+
 export function ProblemNote({ problem, onCheckProposals }: { problem: Problem; onCheckProposals?: () => void }) {
   const cls = problem.callToAction ? 'note-cta' : problem.checkProposals ? 'note-warn' : 'note-error';
   return (
@@ -265,6 +281,7 @@ export function ProblemNote({ problem, onCheckProposals }: { problem: Problem; o
       <div className="note-body">
         <p>{problem.text}</p>
         {problem.next && <p className="note-next">{problem.next}</p>}
+        {problem.code === 'github_not_linked' && <CommandChip command={P.linkCommand} label={P.linkCommandLabel} />}
         {problem.paths.length > 0 && (
           <div className="note-paths">
             <span className="micro-label">{P.pathsLabel}</span>
@@ -597,10 +614,16 @@ export function useCheckProposals(id: string, bump: () => void, close: () => voi
   return useCallback(() => {
     close();
     bump();
-    requestAnimationFrame(() => {
+    // The list may be on a part of the page that is only now being shown: wait a few frames for it.
+    const go = (tries: number) => requestAnimationFrame(() => {
       const el = document.getElementById(id);
+      if ((!el || el.closest('[hidden]')) && tries > 0) {
+        go(tries - 1);
+        return;
+      }
       el?.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
       el?.focus({ preventScroll: true });
     });
+    go(20);
   }, [id, bump, close]);
 }

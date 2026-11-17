@@ -1,4 +1,5 @@
 import { useCallback, useId, useMemo, useState } from 'react';
+import type { KeyboardEvent } from 'react';
 import { canEditPolicy } from '../../admin/access';
 import { usePending, useLeaveGuard } from '../../admin/pending';
 import { destinationOf, handEdits, readsOf, toolSystem } from '../../admin/policyView';
@@ -6,11 +7,12 @@ import { applySpecPatch, parseRawPatch, patchSize, specPatch, splitTools, stable
 import { unifiedDiff } from '../../admin/unified';
 import { useLoad } from '../../admin/useLoad';
 import { useProposalFlow } from '../../admin/useProposalFlow';
-import type { PolicyBot, PolicySpec, PolicyView, SpecPatch } from '../../api';
+import type { Issue, PolicyBot, PolicySpec, PolicyView, SpecPatch } from '../../api';
 import { useApp } from '../../app-context';
 import { Empty, ErrorNote, Skeleton, systemTone } from '../../components/bits';
 import { Icon } from '../../components/icons';
 import { copy } from '../../copy';
+import type { PolicyPart } from '../../url';
 import { AdminHead, NoAccess } from './parts';
 import {
   CheckResult,
@@ -44,14 +46,27 @@ function Chips({ items, mono, tone, label }: { items: string[]; mono?: boolean; 
   );
 }
 
-function BotCard({ bot, owner }: { bot: PolicyBot; owner: string | null }) {
+function BotCard({
+  bot,
+  owner,
+  violations,
+  open,
+  onToggle,
+}: {
+  bot: PolicyBot;
+  owner: string | null;
+  violations: Issue[];
+  open: boolean;
+  onToggle: () => void;
+}) {
   const id = useId();
   const a = bot.allowances;
   const edits = a ? handEdits(a) : [];
   const reads = a ? readsOf(a) : null;
   const unassigned = owner === null || owner === 'TODO';
+  const flagged = edits.length > 0 || violations.length > 0;
   return (
-    <article className={`bot-card ${edits.length ? 'bot-card-flag' : ''}`} aria-labelledby={`${id}-h`}>
+    <article className={`bot-card ${flagged ? 'bot-card-flag' : ''}`} aria-labelledby={`${id}-h`}>
       <header className="bot-head">
         <span className="bot-mark" aria-hidden="true"><Icon name="cpu" size={16} /></span>
         <div className="bot-title">
@@ -72,6 +87,15 @@ function BotCard({ bot, owner }: { bot: PolicyBot; owner: string | null }) {
           </ul>
         </div>
       )}
+      {violations.length > 0 && (
+        <div className="bot-flag" role="note">
+          <span className="flag-tag"><Icon name="alert" size={12} weight={2.25} />{B.ruleBroken}</span>
+          <p>{B.ruleBrokenBody}</p>
+          <ul>
+            {violations.map((v) => <li key={`${v.code}-${v.message}`}>{v.message}</li>)}
+          </ul>
+        </div>
+      )}
       <dl className="bot-grid">
         <div className="bot-fact">
           <dt>{B.role}</dt>
@@ -89,8 +113,20 @@ function BotCard({ bot, owner }: { bot: PolicyBot; owner: string | null }) {
           <dt>{B.tools}</dt>
           <dd>{bot.tools.length ? <Chips items={bot.tools} mono tone label={`${B.tools}, ${bot.bot}`} /> : <span className="fact-quiet">{B.toolsNone}</span>}</dd>
         </div>
-        {a && (
-          <>
+      </dl>
+      {!a && <p className="bot-missing"><Icon name="alert" size={14} /> {B.noAllowances}</p>}
+      {a && (
+        <div className="bot-more">
+          <button type="button" className="bot-toggle" aria-expanded={open} aria-controls={`${id}-more`} onClick={onToggle}>
+            <Icon name="chevronRight" size={14} className="disclose-icon" />
+            {open ? B.hideDetails : B.showDetails}
+            <span className="sr-only"> {bot.bot}</span>
+          </button>
+        </div>
+      )}
+      {a && (
+        <div id={`${id}-more`} className="bot-details" hidden={!open}>
+          <dl className="bot-grid">
             <div className="bot-fact bot-fact-wide">
               <dt>{B.talksTo}</dt>
               <dd>
@@ -125,31 +161,40 @@ function BotCard({ bot, owner }: { bot: PolicyBot; owner: string | null }) {
                 </ul>
               </dd>
             </div>
-          </>
-        )}
-      </dl>
-      {!a && <p className="bot-missing"><Icon name="alert" size={14} /> {B.noAllowances}</p>}
+          </dl>
+          {a.summary.length > 0 && (
+            <details className="bot-sentences">
+              <summary>
+                <Icon name="chevronRight" size={14} className="disclose-icon" />
+                {B.sentences}
+              </summary>
+              <ul>
+                {a.summary.map((s) => <li key={s}>{s}</li>)}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
       <footer className="bot-foot">
-        {a && a.summary.length > 0 && (
-          <details className="bot-sentences">
-            <summary>
-              <Icon name="chevronRight" size={14} className="disclose-icon" />
-              {B.sentences}
-            </summary>
-            <ul>
-              {a.summary.map((s) => <li key={s}>{s}</li>)}
-            </ul>
-          </details>
-        )}
         <span className="bot-file mono-val" title={bot.allowances_from === 'generated' ? B.fromGenerated : undefined}>{bot.policy_file}</span>
       </footer>
     </article>
   );
 }
 
+/** A bot's own rule violations: the ones whose file is this bot's policy file. */
+const violationsOf = (bot: PolicyBot, all: Issue[]) => all.filter((v) => v.path === bot.policy_file || v.path === bot.launch_spec_file);
+
+/** A card opens by itself when it carries a hand edit or a broken rule. */
+const opensByDefault = (bot: PolicyBot, all: Issue[]) => (bot.allowances ? handEdits(bot.allowances).length > 0 : false) || violationsOf(bot, all).length > 0;
+
 function BotsSection({ data }: { data: PolicyView }) {
   const [only, setOnly] = useState<string | null>(null);
+  // What the person chose per card; a card they have not touched follows its default.
+  const [chosen, setChosen] = useState<Record<string, boolean>>({});
   const shown = only ? data.bots.filter((b) => b.bot === only) : data.bots;
+  const isOpen = (b: PolicyBot) => chosen[b.bot] ?? opensByDefault(b, data.drift.violations);
+  const setAll = (value: boolean) => setChosen(Object.fromEntries(data.bots.map((b) => [b.bot, value])));
   return (
     <section className="card" aria-labelledby="policy-bots">
       <div className="card-head card-head-sub">
@@ -157,22 +202,39 @@ function BotsSection({ data }: { data: PolicyView }) {
           {B.heading}
           <span className="card-count">{data.bots.length}</span>
         </h2>
-        {data.bots.length > 1 && (
-          <div className="seg-filter" role="group" aria-label={B.filterLabel}>
-            <button type="button" className="seg-btn" aria-pressed={only === null} onClick={() => setOnly(null)}>{B.all}</button>
-            {data.bots.map((b) => (
-              <button key={b.bot} type="button" className="seg-btn mono-val" aria-pressed={only === b.bot} onClick={() => setOnly(only === b.bot ? null : b.bot)}>
-                {b.bot}
-              </button>
-            ))}
-          </div>
-        )}
+        <div className="bot-tools">
+          {data.bots.length > 1 && (
+            <div className="seg-filter" role="group" aria-label={B.filterLabel}>
+              <button type="button" className="seg-btn" aria-pressed={only === null} onClick={() => setOnly(null)}>{B.all}</button>
+              {data.bots.map((b) => (
+                <button key={b.bot} type="button" className="seg-btn mono-val" aria-pressed={only === b.bot} onClick={() => setOnly(only === b.bot ? null : b.bot)}>
+                  {b.bot}
+                </button>
+              ))}
+            </div>
+          )}
+          {data.bots.length > 0 && (
+            <div className="bot-all">
+              <button type="button" className="btn btn-sm btn-ghost" onClick={() => setAll(true)}>{B.expandAll}</button>
+              <button type="button" className="btn btn-sm btn-ghost" onClick={() => setAll(false)}>{B.collapseAll}</button>
+            </div>
+          )}
+        </div>
       </div>
       {data.bots.length === 0 ? (
         <Empty icon="cpu" small>{B.noBots}</Empty>
       ) : (
         <div className="bot-cards">
-          {shown.map((b) => <BotCard key={b.bot} bot={b} owner={data.spec.bots[b.bot]?.owner ?? null} />)}
+          {shown.map((b) => (
+            <BotCard
+              key={b.bot}
+              bot={b}
+              owner={data.spec.bots[b.bot]?.owner ?? null}
+              violations={violationsOf(b, data.drift.violations)}
+              open={isOpen(b)}
+              onToggle={() => setChosen((c) => ({ ...c, [b.bot]: !isOpen(b) }))}
+            />
+          ))}
         </div>
       )}
     </section>
@@ -284,22 +346,132 @@ function changedPaths(patch: SpecPatch): string[] {
   return out;
 }
 
-function ToolsInput({ skill, tools, changed, onChange }: { skill: string; tools: string[]; changed: boolean; onChange: (tools: string[]) => void }) {
+/** What is wrong with the tool names in a list: names PM OS does not know, and names listed twice. */
+export function toolIssues(tools: string[], known: ReadonlySet<string>): { unknown: string[]; twice: string[] } {
+  const seen = new Set<string>();
+  const unknown: string[] = [];
+  const twice: string[] = [];
+  for (const t of tools) {
+    if (known.size > 0 && !known.has(t) && !unknown.includes(t)) unknown.push(t);
+    if (seen.has(t) && !twice.includes(t)) twice.push(t);
+    seen.add(t);
+  }
+  return { unknown, twice };
+}
+
+/** Known tools that complete the word being typed, never ones already in the list. */
+export function suggestTools(text: string, known: readonly string[], limit = 6): string[] {
+  if (/\s$|,$/.test(text) || text.trim() === '') return [];
+  const words = splitTools(text);
+  const word = words[words.length - 1]!;
+  if (known.includes(word)) return [];
+  const last = word.toLowerCase();
+  const have = new Set(words.slice(0, -1));
+  return known
+    .filter((k) => !have.has(k) && k.toLowerCase().includes(last))
+    .sort((x, y) => Number(y.toLowerCase().startsWith(last)) - Number(x.toLowerCase().startsWith(last)))
+    .slice(0, limit);
+}
+
+function ToolsInput({
+  skill,
+  tools,
+  known,
+  changed,
+  onChange,
+}: {
+  skill: string;
+  tools: string[];
+  known: readonly string[];
+  changed: boolean;
+  onChange: (tools: string[]) => void;
+}) {
   // The words as typed, so a space at the end survives until the next word.
   const [text, setText] = useState(tools.join(' '));
+  const [active, setActive] = useState(-1);
+  const [closed, setClosed] = useState(false);
   const E = T.editor;
+  const id = useId();
+  const knownSet = useMemo(() => new Set(known), [known]);
+  const { unknown, twice } = toolIssues(splitTools(text), knownSet);
+  const options = closed ? [] : suggestTools(text, known);
+  const listId = `${id}-list`;
+  const change = (value: string) => {
+    setText(value);
+    setActive(-1);
+    setClosed(false);
+    onChange(splitTools(value));
+  };
+  const accept = (name: string) => change(`${[...splitTools(text).slice(0, -1), name].join(' ')} `);
+  const onKey = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (options.length === 0) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setActive((i) => (i + 1) % options.length);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setActive((i) => (i <= 0 ? options.length - 1 : i - 1));
+    } else if ((e.key === 'Enter' || e.key === 'Tab') && active >= 0) {
+      e.preventDefault();
+      accept(options[active]!);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      setClosed(true);
+      setActive(-1);
+    }
+  };
+  const problems = [...unknown.map((t) => ({ t, kind: 'unknown' as const })), ...twice.map((t) => ({ t, kind: 'twice' as const }))];
   return (
-    <input
-      type="text"
-      className={`mono-input ${changed ? 'is-edited' : ''}`}
-      aria-label={E.toolsOf(skill)}
-      value={text}
-      spellCheck={false}
-      onChange={(e) => {
-        setText(e.target.value);
-        onChange(splitTools(e.target.value));
-      }}
-    />
+    <div className="tools-field">
+      <input
+        type="text"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-expanded={options.length > 0}
+        aria-controls={options.length > 0 ? listId : undefined}
+        aria-activedescendant={active >= 0 && options[active] ? `${id}-o${active}` : undefined}
+        aria-invalid={unknown.length > 0 || undefined}
+        aria-describedby={problems.length > 0 ? `${id}-problems` : undefined}
+        className={`mono-input ${changed ? 'is-edited' : ''} ${unknown.length > 0 ? 'is-unknown' : ''}`}
+        aria-label={E.toolsOf(skill)}
+        value={text}
+        spellCheck={false}
+        autoComplete="off"
+        onChange={(e) => change(e.target.value)}
+        onKeyDown={onKey}
+      />
+      {options.length > 0 && (
+        <ul id={listId} role="listbox" className="tool-options" aria-label={E.toolSuggestions}>
+          {options.map((o, i) => (
+            <li
+              key={o}
+              id={`${id}-o${i}`}
+              role="option"
+              aria-selected={i === active}
+              className={`tool-option mono-val ${i === active ? 'on' : ''}`}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                accept(o);
+              }}
+            >
+              {o}
+            </li>
+          ))}
+        </ul>
+      )}
+      {problems.length > 0 && (
+        <ul id={`${id}-problems`} className="tool-problems">
+          {problems.map((p) => (
+            <li key={`${p.kind}-${p.t}`} className="field-error small">
+              <span className="tool-bad mono-val">{p.t}</span>
+              {' '}
+              {(p.kind === 'unknown' ? E.toolUnknown(p.t) : E.toolTwice(p.t)).slice(p.t.length).trim()}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -315,7 +487,13 @@ function Editor({ data, onOpened, proposalsVersion }: { data: PolicyView; onOpen
   const edited = useMemo(() => applySpecPatch(base, patch), [base, patch]);
   const size = patchSize(patch);
   const key = stableKey(patch);
-  const empty = size === 0 || rawError !== null;
+  // The tool names PM OS knows: every one the spec's skills use today.
+  const known = useMemo(() => [...new Set(Object.values(base.skills).flatMap((k) => k.tools))].sort(), [base]);
+  const blocked = useMemo(() => {
+    const set = new Set(known);
+    return Object.keys(patch.skills ?? {}).some((sk) => toolIssues(edited.skills[sk]?.tools ?? [], set).unknown.length > 0);
+  }, [known, patch, edited]);
+  const empty = size === 0 || rawError !== null || blocked;
   useLeaveGuard(size > 0);
 
   const validate = useCallback(() => api.adminPolicyValidate(patch), [api, patch]);
@@ -332,7 +510,11 @@ function Editor({ data, onOpened, proposalsVersion }: { data: PolicyView; onOpen
       onOpened();
     },
   });
-  const checkProposals = useCheckProposals(PROPOSALS_ID, proposalsVersion, flow.closeDialog);
+  const closeAndShowList = useCallback(() => {
+    flow.closeDialog();
+    window.location.hash = '/admin/policy/proposals';
+  }, [flow]);
+  const checkProposals = useCheckProposals(PROPOSALS_ID, proposalsVersion, closeAndShowList);
 
   const update = (next: PolicySpec) => {
     setPatch(specPatch(base, next));
@@ -464,6 +646,7 @@ function Editor({ data, onOpened, proposalsVersion }: { data: PolicyView; onOpen
                         <ToolsInput
                           skill={s}
                           tools={edited.skills[s]!.tools}
+                          known={known}
                           changed={patch.skills?.[s] !== undefined}
                           onChange={(tools) => update({ ...edited, skills: { ...edited.skills, [s]: { tools } } })}
                         />
@@ -516,6 +699,7 @@ function Editor({ data, onOpened, proposalsVersion }: { data: PolicyView; onOpen
           )}
         </div>
         {!(flow.done && size === 0) && <ProposeBar flow={flow} empty={empty} configured={data.proposals_configured} />}
+        {blocked && <p className="propose-hint field-error" role="status">{E.toolsBlocked}</p>}
         {flow.checkProblem && <ProblemNote problem={flow.checkProblem} onCheckProposals={checkProposals} />}
         <CheckResult flow={flow} headingId="policy-check" />
         {flow.done && <ProposalDone result={flow.done} onAnother={flow.reset} />}
@@ -527,7 +711,23 @@ function Editor({ data, onOpened, proposalsVersion }: { data: PolicyView; onOpen
 
 // ---------- The page ----------
 
-function PolicyBody({ data }: { data: PolicyView }) {
+function PartSwitch({ part, parts }: { part: PolicyPart | 'overview'; parts: (PolicyPart | 'overview')[] }) {
+  const C = T.parts;
+  const href = (p: PolicyPart | 'overview') => (p === 'overview' ? '#/admin/policy' : `#/admin/policy/${p}`);
+  return (
+    <nav className="card-tabs part-switch" aria-label={C.label}>
+      <div className="tabs">
+        {parts.map((p) => (
+          <a key={p} href={href(p)} className="tab" aria-current={part === p ? 'page' : undefined}>
+            {C[p]}
+          </a>
+        ))}
+      </div>
+    </nav>
+  );
+}
+
+function PolicyBody({ data, part }: { data: PolicyView; part: PolicyPart | undefined }) {
   const { api, me } = useApp();
   const [version, setVersion] = useState(0);
   const bump = useCallback(() => setVersion((v) => v + 1), []);
@@ -537,6 +737,9 @@ function PolicyBody({ data }: { data: PolicyView }) {
   const tools = new Set(data.bots.flatMap((b) => b.tools)).size;
   const editable = canEditPolicy(me);
   const loadProposals = useCallback(() => api.adminPolicyProposals(), [api]);
+  // Someone who cannot propose has no form to land on: that address shows the overview.
+  const current: PolicyPart | 'overview' = part === 'propose' && !editable ? 'overview' : (part ?? 'overview');
+  const parts: (PolicyPart | 'overview')[] = editable ? ['overview', 'propose', 'proposals'] : ['overview', 'proposals'];
 
   return (
     <>
@@ -557,41 +760,48 @@ function PolicyBody({ data }: { data: PolicyView }) {
         <StatusTile label={S.bots} value={data.bots.length} sub={S.botsSub(tools)} />
       </div>
       <ProtectionNotes protection={data.protection} configured={data.proposals_configured} />
-      {data.generate_errors.length > 0 && (
-        <section className="card" aria-labelledby="policy-gen">
-          <div className="card-head"><h2 id="policy-gen">{T.generateHeading}</h2></div>
-          <div className="card-body stack stack-tight">
-            <p className="muted small">{T.generateBody}</p>
-            <IssueList issues={data.generate_errors} label={T.generateHeading} />
-          </div>
-        </section>
-      )}
-      {violations > 0 && (
-        <section className="card card-alert" aria-labelledby="policy-violations">
-          <div className="card-head"><h2 id="policy-violations"><Icon name="alert" size={15} />{T.violationsHeading}<span className="card-count">{violations}</span></h2></div>
-          <IssueList issues={data.drift.violations} label={T.violationsHeading} compact />
-        </section>
-      )}
-      <BotsSection data={data} />
-      {editable ? (
+      <PartSwitch part={current} parts={parts} />
+      {current === 'overview' && (
         <>
+          {data.generate_errors.length > 0 && (
+            <section className="card" aria-labelledby="policy-gen">
+              <div className="card-head"><h2 id="policy-gen">{T.generateHeading}</h2></div>
+              <div className="card-body stack stack-tight">
+                <p className="muted small">{T.generateBody}</p>
+                <IssueList issues={data.generate_errors} label={T.generateHeading} />
+              </div>
+            </section>
+          )}
+          {violations > 0 && (
+            <section className="card card-alert" aria-labelledby="policy-violations">
+              <div className="card-head"><h2 id="policy-violations"><Icon name="alert" size={15} />{T.violationsHeading}<span className="card-count">{violations}</span></h2></div>
+              <IssueList issues={data.drift.violations} label={T.violationsHeading} compact />
+            </section>
+          )}
+          <BotsSection data={data} />
+          {!editable && <p className="meta-line"><Icon name="lock" size={15} /><span>{copy.admin.repo.readOnly}</span></p>}
+          <FixedSection data={data} />
+          <FilesSection data={data} />
+        </>
+      )}
+      {editable && (
+        // Kept on the page while another part shows, so a half-made change and its check are not lost.
+        <div hidden={current !== 'propose'}>
           {!data.proposals_configured && (
             <p className="meta-line"><Icon name="info" size={15} /><span>{copy.admin.repo.proposalsOff}</span></p>
           )}
           <Editor data={data} onOpened={bump} proposalsVersion={bump} />
-        </>
-      ) : (
-        <p className="meta-line"><Icon name="lock" size={15} /><span>{copy.admin.repo.readOnly}</span></p>
+        </div>
       )}
-      <ProposalsCard kind="policy" id={PROPOSALS_ID} load={loadProposals} version={version} />
-      <FixedSection data={data} />
-      <FilesSection data={data} />
+      <div hidden={current !== 'proposals'}>
+        <ProposalsCard kind="policy" id={PROPOSALS_ID} load={loadProposals} version={version} />
+      </div>
     </>
   );
 }
 
 /** Admins and auditors: what each bot may do, what is fixed, and (admins) a way to propose a change. */
-export function Policy() {
+export function Policy({ part }: { part?: PolicyPart }) {
   const { api } = useApp();
   const load = useCallback(() => api.adminPolicy(), [api]);
   const { data, error, forbidden, reload } = useLoad(load, T.loadFailed);
@@ -603,7 +813,7 @@ export function Policy() {
       </AdminHead>
       {error && <ErrorNote actionLabel={copy.errors.retry} onAction={reload}>{error}</ErrorNote>}
       {!data && !error && <Skeleton rows={4} label={T.loading} variant="cards" />}
-      {data && <PolicyBody data={data} />}
+      {data && <PolicyBody data={data} part={part} />}
     </div>
   );
 }

@@ -65,6 +65,8 @@ describe('hints', () => {
     await waitFor(() => expect(visible()).toEqual([]));
 
     await user.click(screen.getByRole('menuitemcheckbox', { name: /Hints and nudges/ }));
+    // the menu is still open, and hints wait behind it
+    await user.keyboard('{Escape}');
     await screen.findByText(copy.hints.sources);
 
     // dismiss two, then reset: the order starts again at the first
@@ -73,6 +75,7 @@ describe('hints', () => {
     await screen.findByText(copy.hints.approve('confluence_page'));
     await user.click(screen.getByRole('button', { name: /Menu for/ }));
     await user.click(screen.getByRole('menuitem', { name: copy.menu.showHints }));
+    await user.keyboard('{Escape}');
     await screen.findByText(copy.hints.sources);
     expect(visible()).toEqual(['sources']);
   });

@@ -1977,3 +1977,31 @@ button.tree-row:focus-visible { outline-offset: -2px; border-radius: 0; }
   .propose-foot { padding: 12px 14px 14px; }
   .seg-filter { width: 100%; }
 }
+
+.cmd-chip { display: inline-flex; align-items: center; gap: 8px; margin-top: 8px; padding: 3px 4px 3px 10px; background: var(--surface); border: 1px solid var(--control-line); border-radius: var(--r-control); }
+.cmd-chip code { color: var(--ink); }
+.cmd-chip-btn { background: none; border: 0; padding: 2px 8px; font: inherit; font-size: 12.5px; font-weight: 500; color: var(--ink); text-decoration: underline; cursor: pointer; min-height: 24px; }
+.bot-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.bot-all { display: flex; gap: 2px; }
+.bot-more { border-top: 1px solid var(--border); padding: 2px 8px; }
+.bot-toggle { display: inline-flex; align-items: center; gap: 6px; min-height: 36px; padding: 0 8px; background: none; border: 0; border-radius: var(--r-control); font: inherit; font-size: 13px; font-weight: 500; color: var(--ink-2); cursor: pointer; }
+.bot-toggle:hover { color: var(--ink); background: var(--surface-3); }
+.bot-toggle[aria-expanded='true'] .disclose-icon { transform: rotate(90deg); }
+.bot-details { border-top: 1px solid var(--border); }
+.bot-details[hidden] { display: none; }
+.bot-details .bot-sentences { display: block; padding: 6px 14px 10px; }
+.part-switch { margin: 0 0 4px; padding: 0; }
+.tools-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.tools-field input.is-unknown { border-color: var(--bad-dot) !important; }
+.tool-options { list-style: none; margin: 0; padding: 4px; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--control-line); border-radius: var(--r-control); }
+.tool-option { padding: 5px 8px; border-radius: 6px; cursor: pointer; color: var(--ink-2); }
+.tool-option.on, .tool-option:hover { background: var(--accent-soft); color: var(--ink); }
+.tool-problems { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.tool-bad { text-decoration: underline wavy var(--bad-dot); text-underline-offset: 3px; }
+
+/* Admin area loading */
+.admin-loading-head { display: flex; flex-direction: column; gap: 8px; margin-bottom: 4px; }
+.admin-loading-head .skeleton-bar-a { height: 26px; width: min(260px, 60%); }
+.admin-loading-head .skeleton-bar-b { height: 14px; width: min(420px, 90%); }
+.admin-loading-note { margin: 8px 0 12px; }
+.bot-cards { align-items: start; }
