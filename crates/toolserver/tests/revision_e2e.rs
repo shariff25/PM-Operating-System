@@ -77,10 +77,26 @@ async fn start() -> Stack {
             .await
             .unwrap();
     });
+    // The runtime reads who may ask from this tool server's user directory (slice U4a).
+    common::seed_users(
+        &f.stores,
+        vec![common::member(
+            "ana",
+            "U0ANA",
+            vec![pmos_contract::model::Role::Pm],
+        )],
+    )
+    .await;
+    let people = Arc::new(pmos_bots::people::SnapshotClient::http(
+        &base,
+        SERVICE_TOKEN,
+    ));
+    people.refresh().await.expect("the directory answers");
     let catalog = pmos_bots::catalog::Catalog::load(&f.root, Utc::now().date_naive()).unwrap();
     let rt = Runtime::new(
         Arc::new(MemoryStore::default()),
         Arc::new(catalog),
+        people,
         ToolServer::new(&base, SERVICE_TOKEN),
         // Never called here.
         Gateway::new("http://127.0.0.1:9/v1", "test-gateway-token-0123456789abcd"),

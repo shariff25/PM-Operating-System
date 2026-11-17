@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/contract", "crates/cli", "crates/runtime", "crates/toolserver", "crates/docs", "crates/slack", "crates/gateway", "crates/bots", "crates/console", "crates/evals", "crates/policy", "crates/web", "crates/assertion", "crates/stack-tests"]
+members = ["crates/contract", "crates/cli", "crates/runtime", "crates/toolserver", "crates/docs", "crates/slack", "crates/gateway", "crates/bots", "crates/console", "crates/evals", "crates/policy", "crates/web", "crates/assertion", "crates/stack-tests", "crates/directory"]
 
 [workspace.package]
 edition = "2021"
@@ -37,6 +37,7 @@ uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 pmos-assertion = { path = "crates/assertion" }
 pmos-contract = { path = "crates/contract" }
+pmos-directory = { path = "crates/directory" }
 pmos-policy = { path = "crates/policy" }
 pmos-runtime = { path = "crates/runtime" }
 

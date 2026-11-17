@@ -97,7 +97,10 @@ async fn a_non_member_is_refused(env: &Env) {
         .await;
     assert_eq!(status, 403, "{body}");
     assert!(
-        body["error"].as_str().unwrap().contains("team.yaml"),
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("isn't a PM OS user"),
         "{body}"
     );
     let (_, body) = env.get(eve, "console", None).await;

@@ -161,7 +161,8 @@ source: "pm-ana, task 0d3f…"   # the bot (or skill) and the run id that wrote 
     3. **Commit the personal bot in one commit, with the admin's token, on
        `PMOS_CONTENT_BRANCH`** (the admin needs a linked GitHub account with push access to
        `PMOS_CONTENT_REPO`). Until slice U7 retires it, the commit also adds the member to
-       `team.yaml`, which the runtime, Slack, the web app and the lint still read:
+       `team.yaml`, which Slack, the web app and the lint still read (the runtime reads the user
+       database since slice U4a):
        - `{dir}/team.yaml`: the current file at the branch head, rendered with
          `render_team_yaml` and the new member (`handle`, `slack-id`, `email`, `roles`);
        - `{dir}/bots/pm-<handle>/BOT.md` from `render_personal_bot`.

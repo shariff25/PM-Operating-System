@@ -691,6 +691,27 @@ impl BotsStore for PgStore {
         Ok(true)
     }
 
+    async fn skip_routine_run(
+        &self,
+        id: &str,
+        due_at: DateTime<Utc>,
+        next_run_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        // One statement: the guard and the change can't be split by another tick.
+        let done = sqlx::query(
+            "UPDATE bots_routines SET next_run_at = $3, updated_at = $4
+             WHERE id = $1 AND enabled AND next_run_at = $2",
+        )
+        .bind(id)
+        .bind(due_at)
+        .bind(next_run_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
     async fn member_settings(&self, handle: &str) -> StoreResult<Option<MemberSettings>> {
         let row = sqlx::query(
             "SELECT handle, level, updated_at FROM bots_member_settings WHERE handle = $1",

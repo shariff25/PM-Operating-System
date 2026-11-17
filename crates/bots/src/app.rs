@@ -415,8 +415,8 @@ async fn check_assertion(
 }
 
 async fn readyz(State(state): State<AppState>) -> Response {
-    let (storage, toolserver, gateway) = state.rt.readiness().await;
-    let ok = storage && toolserver && gateway;
+    let r = state.rt.readiness().await;
+    let ok = r.ok();
     let mark = |b: bool| if b { "ok" } else { "down" };
     (
         if ok {
@@ -427,9 +427,10 @@ async fn readyz(State(state): State<AppState>) -> Response {
         Json(json!({
             "ready": ok,
             "checks": {
-                "storage": mark(storage),
-                "toolserver": mark(toolserver),
-                "gateway": mark(gateway),
+                "storage": mark(r.storage),
+                "toolserver": mark(r.toolserver),
+                "gateway": mark(r.gateway),
+                "directory": mark(r.directory),
             },
         })),
     )
@@ -570,12 +571,14 @@ async fn create_task(
 /// Can `caller` see `task`? Slack sees its PM's own, evals sees eval tasks. The console sees
 /// all, except that a call signed for a viewer (always so under `require` for one task's
 /// detail, events, trace and drafts) sees only the viewer's own tasks, or any task when the
-/// viewer is an admin in the runtime's own `team.yaml` (not the assertion's roles).
+/// viewer is an active admin in the user directory on a snapshot at most 30 seconds old
+/// ([`Runtime::is_admin`]; not the assertion's roles). Without such a snapshot the viewer
+/// is not an admin: their own tasks only.
 fn visible(state: &AppState, caller: &Caller, task: &Task) -> bool {
     match caller.kind {
         ClientKind::Console => match caller.acting.as_deref() {
             None => true,
-            Some(who) => who == task.requested_by || state.rt.catalog().is_admin(who),
+            Some(who) => who == task.requested_by || state.rt.is_admin(who),
         },
         ClientKind::Slack | ClientKind::Web => task.requested_by == caller.user(),
         ClientKind::Evals => task.source == Source::Eval,
@@ -651,7 +654,7 @@ async fn list_tasks(
             // A non-admin viewer lists only their own tasks (a `requested_by` naming anyone
             // else was already refused: it must equal the assertion's subject).
             if let Some(viewer) = caller.acting.as_deref() {
-                if !state.rt.catalog().is_admin(viewer) {
+                if !state.rt.is_admin(viewer) {
                     filter.requested_by = Some(viewer.to_string());
                 }
             }
@@ -721,7 +724,7 @@ async fn cancel_task(
         "cancel tasks",
     )?;
     // The console cancels only signed for a viewer, in every mode (R1): the task's own PM
-    // or an admin in this runtime's team.yaml (`visible`), and the cancel is recorded as them.
+    // or an admin in the user directory (`visible`), and the cancel is recorded as them.
     if caller.kind == ClientKind::Console && caller.acting.is_none() {
         return Err(forbidden(
             "the console cancels a task only with a user assertion for the viewer",
@@ -1163,7 +1166,7 @@ async fn list_routines(
         .acting
         .as_deref()
         .filter(|_| caller.kind == ClientKind::Console);
-    if let Some(v) = viewer.filter(|v| !state.rt.catalog().is_admin(v)) {
+    if let Some(v) = viewer.filter(|v| !state.rt.is_admin(v)) {
         // A non-admin console viewer lists only their own routines.
         owner = Some(v.to_string());
     }
@@ -1186,8 +1189,8 @@ async fn list_routines(
 }
 
 /// The routine, if `caller` may manage it (else `404`, as if it didn't exist). A console call
-/// signed for a viewer manages only the viewer's own routines, or any for an admin in this
-/// runtime's team.yaml.
+/// signed for a viewer manages only the viewer's own routines, or any for an admin in the
+/// user directory on a snapshot at most 30 seconds old ([`Runtime::is_admin`]).
 async fn managed_routine(state: &AppState, caller: &Caller, id: &str) -> Result<(), Error> {
     let routine = state.rt.routine(id).await?;
     let others = routine.owner != caller.user();
@@ -1195,7 +1198,7 @@ async fn managed_routine(state: &AppState, caller: &Caller, id: &str) -> Result<
         && caller
             .acting
             .as_deref()
-            .is_some_and(|v| v != routine.owner && !state.rt.catalog().is_admin(v));
+            .is_some_and(|v| v != routine.owner && !state.rt.is_admin(v));
     if (caller.kind.is_pm() && others) || console_refused {
         return Err(Error::NotFound(format!("no routine {id}")));
     }

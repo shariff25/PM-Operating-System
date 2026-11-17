@@ -313,7 +313,7 @@ The mode, the start-up rule, the refusals and the verifier are shared code
   lists, one task's detail, events and trace, and routine pause, resume and delete (an admin
   acting on someone else's routine signs as the admin). Under `require` the runtime refuses an
   unsigned console call. From the viewer it decides what they see (R1): a non-admin gets only
-  their own tasks and routines; an admin (in the runtime's own `team.yaml`) gets everyone's,
+  their own tasks and routines; an admin (in the user directory, on a snapshot at most 30 seconds old) gets everyone's,
   with the ask, result, error, checklist and prompt of anyone else's left out (`hidden: true`;
   the console shows "text hidden"); one task's page answers its PM or an admin; a cancel is the
   task's PM's or an admin's, recorded as them. To the tool server it signs as the PM whose

@@ -35,6 +35,12 @@ const TEAM: &str = "members:
   - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm]}
   - {handle: ben, slack-id: U0BEN, email: ben@example.com, roles: [pm]}
 ";
+/// The user database's seed: the same two PMs, and the admin every user database has.
+const USERS: &str = "members:
+  - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm]}
+  - {handle: ben, slack-id: U0BEN, email: ben@example.com, roles: [pm]}
+  - {handle: stack-admin, slack-id: U0STACKADM, roles: [pm, admin]}
+";
 const THREAD: &str = "1731600000.000100";
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -104,8 +110,26 @@ async fn start() -> Stack {
     let cancel = CancellationToken::new();
     let (dir, root) = content();
 
-    // The tool server: memory stores, fake connectors, `require` for pmos-web.
-    let (stores, _audit) = Stores::in_memory(&root);
+    // The tool server: memory stores, fake connectors, `require` for pmos-web. Its user
+    // database is seeded as a dev stack's is (PMOS_USERS_SEED): the tool server and the
+    // runtime (slice U4a, through `/internal/directory`) decide from it.
+    let (mut stores, _audit) = Stores::in_memory(&root);
+    let seed = pmos_toolserver::users::ImportRequest::parse(
+        USERS.as_bytes(),
+        None,
+        pmos_toolserver::users::ImportMode::Bootstrap,
+    )
+    .unwrap();
+    stores.users = Arc::new(
+        pmos_toolserver::users::MemoryUsers::seeded(
+            seed,
+            pmos_toolserver::users::Rules::default(),
+            Some(stores.audit.clone()),
+        )
+        .await
+        .unwrap()
+        .with_linked(stores.linked()),
+    );
     let catalog = Catalog::load(&root, Utc::now().date_naive()).unwrap();
     let slack = Arc::new(FakeConnector::slack());
     let connectors: Vec<Arc<dyn Connector>> = vec![
@@ -114,12 +138,7 @@ async fn start() -> Stack {
         slack.clone(),
         Arc::new(FakeConnector::docs()),
     ];
-    // An open user directory, as with fake connectors before the user database (slice U3).
-    let svc = Arc::new(
-        ToolService::new(catalog, stores, connectors)
-            .unwrap()
-            .with_open_directory(),
-    );
+    let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
     let ts_keys = pmos_toolserver::assertion::parse_keys(
         &format!("web:toolserver:wt1:{WEB_TOOLS_KEY}"),
         "the tool server",
@@ -161,9 +180,19 @@ async fn start() -> Stack {
         |iss, aud| aud == "bots" && iss == "web",
     )
     .unwrap();
+    // Who may ask: the tool server's directory, with the orchestrator token, as in deploy.
+    let people = Arc::new(pmos_bots::people::SnapshotClient::http(
+        &toolserver,
+        SERVICE_TOKEN,
+    ));
+    people
+        .refresh()
+        .await
+        .expect("the tool server's directory answers");
     let rt = Arc::new(pmos_bots::Runtime::new(
         Arc::new(pmos_bots::store::MemoryStore::default()),
         Arc::new(pmos_bots::catalog::Catalog::load(&root, Utc::now().date_naive()).unwrap()),
+        people,
         pmos_bots::clients::ToolServer::new(&toolserver, SERVICE_TOKEN),
         // Never called: the stand-in worker answers without a model.
         pmos_bots::clients::Gateway::new("http://127.0.0.1:9/v1", GATEWAY_TOKEN),
