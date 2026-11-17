@@ -323,6 +323,8 @@ pub fn safe_detail(detail: &str) -> Option<String> {
     let ok = FIXED_DETAILS.contains(&detail)
         || ADMIN_NOTES.contains(&detail)
         || crate::audit::parse_purge_detail(detail).is_some()
+        || crate::users::detail::is_safe(detail)
+        || crate::users::detail::is_purge_detail(detail)
         || is_sign_in_detail(detail)
         || detail
             .strip_prefix("reason: ")

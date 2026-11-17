@@ -11,6 +11,7 @@ use crate::members::{MemberRequestStore, MemoryRequests};
 use crate::memory::{InMemoryStore, MemoryStore};
 use crate::memory_repo::{MemoryRepoStore, MemoryRepos};
 use crate::session::{MemorySessions, SessionRepo};
+use crate::users::{MemoryUsers, UserStore};
 use crate::vault::{CredentialStore, MemoryCredentials};
 
 /// A storage failure: the database is down, a query failed, or a row didn't decode.
@@ -34,6 +35,9 @@ pub struct Stores {
     pub memory_repos: Arc<dyn MemoryRepoStore>,
     /// Requests to join PM OS; see `members.rs`.
     pub member_requests: Arc<dyn MemberRequestStore>,
+    /// The user database (`users/`). Nothing decides from it yet (slice U1): the services
+    /// read `team.yaml` until slices U3-U7 cut them over.
+    pub users: Arc<dyn UserStore>,
 }
 
 impl Stores {
@@ -50,6 +54,7 @@ impl Stores {
             credentials: Arc::new(MemoryCredentials::default()),
             memory_repos: Arc::new(MemoryRepos::default()),
             member_requests: Arc::new(MemoryRequests::default()),
+            users: Arc::new(MemoryUsers::default().with_audit(audit.clone())),
         };
         (stores, audit)
     }

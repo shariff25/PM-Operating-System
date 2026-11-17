@@ -177,6 +177,11 @@ pub struct Config {
     /// `PMOS_AUDIT_RETENTION_DAYS`: audit events older than this many days are deleted once
     /// a day (`docs/audit-retention.md`). From 90 (the floor, and the default) to 3650.
     pub audit_retention_days: u32,
+    /// `PMOS_USERS_SEED`: a `team.yaml`-shaped file loaded into the in-memory user store at
+    /// start-up (`users::import`). Development and eval stacks only: refused with
+    /// `PMOS_DATABASE_URL` or live connectors. Nothing decides from the user store yet
+    /// (slice U1).
+    pub users_seed: Option<PathBuf>,
 }
 
 impl Config {
@@ -262,6 +267,28 @@ impl Config {
             }
             None => return Err("PMOS_CONNECTORS is required (`live` or `fake`)".into()),
         };
+        // The dev seed for the in-memory user store (docs/user-database-spec.md §3): never
+        // with a database (users come from the host commands there) or live connectors.
+        let users_seed = get("PMOS_USERS_SEED")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        if users_seed.is_some() {
+            if database_url.is_some() {
+                return Err(
+                    "PMOS_USERS_SEED is for in-memory development and eval stacks only; with \
+                     PMOS_DATABASE_URL, users come from `pmos-admin users import` and \
+                     `bootstrap-admin` (docs/runbooks/users.md)"
+                        .into(),
+                );
+            }
+            if matches!(connectors, Connectors::Live(_)) {
+                return Err(
+                    "PMOS_USERS_SEED is for development and eval stacks only: it can't be used \
+                     with PMOS_CONNECTORS=live"
+                        .into(),
+                );
+            }
+        }
         let fake_mode_docs = match (&connectors, get("PMOS_DOCS_URL"), get("PMOS_DOCS_TOKEN")) {
             (Connectors::Fake, Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
                 Some((url, Secret::new(token)))
@@ -366,6 +393,7 @@ impl Config {
             ledger_expire_days,
             slack_draft_ttl_hours,
             audit_retention_days,
+            users_seed,
         })
     }
 }
@@ -1071,5 +1099,47 @@ mod tests {
             let err = cfg(&with(&fake, &[("PMOS_AUDIT_RETENTION_DAYS", bad)])).unwrap_err();
             assert!(err.contains("from 90 to 3650"), "{err}");
         }
+    }
+
+    #[test]
+    fn the_users_seed_is_for_in_memory_dev_stacks_only() {
+        let fake = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert_eq!(cfg(&fake).unwrap().users_seed, None);
+        let seeded = cfg(&with(&fake, &[("PMOS_USERS_SEED", "/srv/users.seed.yaml")])).unwrap();
+        assert_eq!(
+            seeded.users_seed.as_deref(),
+            Some(std::path::Path::new("/srv/users.seed.yaml"))
+        );
+        // With a database: refused, even in dev mode.
+        let err = cfg(&with(
+            &fake,
+            &[
+                ("PMOS_USERS_SEED", "/srv/users.seed.yaml"),
+                ("PMOS_DATABASE_URL", "postgresql://pmos@localhost/pmos"),
+            ],
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("PMOS_USERS_SEED") && err.contains("PMOS_DATABASE_URL"),
+            "{err}"
+        );
+        let err = cfg(&[
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_CONNECTORS", "fake"),
+            ("PMOS_USERS_SEED", "/srv/users.seed.yaml"),
+            ("PMOS_DATABASE_URL", "postgresql://pmos@localhost/pmos"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("PMOS_USERS_SEED"), "{err}");
+        // With live connectors: refused.
+        let key = KeyRing::generate_spec("k1");
+        let live = live_base(&key);
+        assert!(cfg(&live).is_ok());
+        let err = cfg(&with(&live, &[("PMOS_USERS_SEED", "/srv/users.seed.yaml")])).unwrap_err();
+        assert!(err.contains("PMOS_USERS_SEED"), "{err}");
     }
 }
