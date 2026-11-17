@@ -132,6 +132,9 @@ struct Inner {
     proposals: proposal::Proposals,
     /// What refusals said of drafts' Slack audiences, by draft id ([`remember_audience`]).
     audiences: std::sync::Mutex<std::collections::HashMap<String, RefusedAudience>>,
+    /// Sign-in events the tool server didn't record ([`record_sign_in`]), since start-up:
+    /// `/readyz` reports it.
+    sign_in_record_failures: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -255,6 +258,7 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         clock: deps.clock,
         proposals: proposal::Proposals::new(deps.admin)?,
         audiences: Default::default(),
+        sign_in_record_failures: Default::default(),
     }));
     let api = Router::new()
         .route("/auth/providers", get(auth_providers))
@@ -377,10 +381,20 @@ async fn readyz(State(state): State<AppState>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+    // Not a readiness check: sign-in works without it (see `record_sign_in`). A number above
+    // zero means some sign-ins or sign-outs are missing from the audit log; the log says when.
+    let unrecorded = state
+        .0
+        .sign_in_record_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
     (
         status,
         [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({ "ready": ready, "checks": body })),
+        Json(json!({
+            "ready": ready,
+            "checks": body,
+            "unrecorded_sign_in_events": unrecorded,
+        })),
     )
         .into_response()
 }
@@ -798,6 +812,17 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
             provider = provider.name(),
             "sign-in refused: not in team.yaml"
         );
+        record_sign_in(
+            &state,
+            None,
+            SignInEvent::Refused {
+                provider: provider.name(),
+                reason: "not_a_member",
+                attempted: Some(&claimed.0),
+                member: None,
+            },
+        )
+        .await;
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "not_a_member",
@@ -842,11 +867,12 @@ async fn start_session(
     brief::housekeeping(state).await;
     let id = session::random_token();
     let at = now(state);
+    let hashed = session::hash_id(&id);
     state
         .0
         .sessions
         .insert(
-            session::hash_id(&id),
+            hashed,
             Session {
                 handle: member.handle.clone(),
                 csrf_token: session::random_token(),
@@ -859,7 +885,102 @@ async fn start_session(
         .await
         .map_err(ApiError::store)?;
     tracing::info!(user = %member.handle, provider, "signed in");
+    record_sign_in(
+        state,
+        Some((&member.handle, &session::assertion_ref(&hashed))),
+        SignInEvent::SignIn { provider },
+    )
+    .await;
     Ok(id)
+}
+
+/// How long recording a sign-in event may take before sign-in goes on without it.
+pub const SIGN_IN_RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A sign-in event for the audit log (`docs/web-api.md`, "Sign-in events"): fixed action
+/// names and codes, never free text, no IP address, no token, and for a refusal never the
+/// name tried, only a short keyed hash of it.
+enum SignInEvent<'a> {
+    SignIn {
+        provider: &'a str,
+    },
+    SignOut {
+        provider: &'a str,
+    },
+    Refused {
+        provider: &'a str,
+        /// The signed-out page's `reason`: `not_a_member`, `wrong_account`, `failed`, ….
+        reason: &'a str,
+        /// The handle or email tried, hashed before it leaves this server.
+        attempted: Option<&'a str>,
+        /// For `wrong_account`: the member whose email the account used.
+        member: Option<&'a str>,
+    },
+}
+
+/// Record `event` at the tool server (`POST /internal/admin/events`), for `member` (its
+/// handle and session reference, for the user assertion) on a sign-in or sign-out.
+///
+/// **Fail-open, on purpose.** A sign-in or sign-out goes ahead when this fails (after at most
+/// [`SIGN_IN_RECORD_TIMEOUT`]): the failure is logged as an error and counted on `/readyz`
+/// (`unrecorded_sign_in_events`). Signing out must never be blocked. Signing in isn't either,
+/// because a session alone reaches nothing: everything a signed-in person does goes through
+/// the tool server or the bot runtime, which audit each call themselves, so a missing
+/// sign-in event hides no action. Failing closed would turn a tool server blip into a
+/// lockout of everyone, the admins who would look into it included.
+async fn record_sign_in(state: &AppState, member: Option<(&str, &str)>, event: SignInEvent<'_>) {
+    let (action, body) = match &event {
+        SignInEvent::SignIn { provider } => (
+            "web.sign_in",
+            json!({"action": "web.sign_in", "provider": provider}),
+        ),
+        SignInEvent::SignOut { provider } => (
+            "web.sign_out",
+            json!({"action": "web.sign_out", "provider": provider}),
+        ),
+        SignInEvent::Refused {
+            provider,
+            reason,
+            attempted,
+            member,
+        } => {
+            let mut body = json!({
+                "action": "web.sign_in_refused",
+                "provider": provider,
+                "reason": reason,
+            });
+            if let Some(name) = attempted.filter(|n| !n.trim().is_empty()) {
+                body["attempt"] = json!(state.0.toolserver.attempt_hash(name));
+            }
+            if let Some(m) = member {
+                body["member"] = json!(m);
+            }
+            ("web.sign_in_refused", body)
+        }
+    };
+    let (toolserver, handle) = match member {
+        Some((handle, session_ref)) => (state.0.toolserver.for_session(session_ref), Some(handle)),
+        None => (state.0.toolserver.clone(), None),
+    };
+    let recorded = tokio::time::timeout(
+        SIGN_IN_RECORD_TIMEOUT,
+        toolserver.record_sign_in(handle, &body),
+    )
+    .await;
+    let why = match recorded {
+        Ok(Ok(())) => return,
+        Ok(Err(UpstreamError::Refused { status, code, .. })) => {
+            format!("refused ({status} {})", code.unwrap_or_default())
+        }
+        Ok(Err(UpstreamError::NotFound)) => "no such route (an older tool server)".to_string(),
+        Ok(Err(UpstreamError::Failed { why, .. } | UpstreamError::Unknown { why, .. })) => why,
+        Err(_) => "timed out".to_string(),
+    };
+    state
+        .0
+        .sign_in_record_failures
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::error!(action, error = %why, "AUDIT: a sign-in event wasn't recorded");
 }
 
 /// `GET /api/auth/providers` (no session): which sign-in buttons the app shows.
@@ -974,13 +1095,40 @@ async fn entra_callback(
     else {
         return fail(Failure::Failed("unsupported input"));
     };
+    // From here on the browser had started a sign-in with this server (its `state` matched),
+    // so a refusal is recorded. Earlier failures (no flow, a forged or replayed callback) are
+    // only logged: anyone can send those, and the audit log isn't theirs to fill.
     let identity = match entra.sign_in_identity(code, nonce, verifier, *now).await {
         Ok(identity) => identity,
-        Err(f) => return fail(f),
+        Err(f) => {
+            record_sign_in(
+                &state,
+                None,
+                SignInEvent::Refused {
+                    provider: "entra",
+                    reason: f.reason(),
+                    attempted: None,
+                    member: None,
+                },
+            )
+            .await;
+            return fail(f);
+        }
     };
     let team = load_team(&state)?;
     let Some(member) = auth::find_member_by_email(&team, &identity.email) else {
         tracing::info!(provider = "entra", "sign-in refused: not in team.yaml");
+        record_sign_in(
+            &state,
+            None,
+            SignInEvent::Refused {
+                provider: "entra",
+                reason: "not_a_member",
+                attempted: Some(&identity.email),
+                member: None,
+            },
+        )
+        .await;
         return Ok(redirect(
             &signed_out_at("not_a_member"),
             std::slice::from_ref(&clear),
@@ -990,6 +1138,17 @@ async fn entra_callback(
     // someone else in the tenant doesn't sign in as them.
     if !oid_matches(member, identity.oid.as_deref()) {
         tracing::warn!(provider = "entra", user = %member.handle, "sign-in refused: object id doesn't match team.yaml");
+        record_sign_in(
+            &state,
+            None,
+            SignInEvent::Refused {
+                provider: "entra",
+                reason: "wrong_account",
+                attempted: None,
+                member: Some(&member.handle),
+            },
+        )
+        .await;
         return Ok(redirect(
             &signed_out_at("wrong_account"),
             std::slice::from_ref(&clear),
@@ -1013,6 +1172,18 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult 
             .await
             .map_err(ApiError::store)?;
         tracing::info!(user = %session.handle, "signed out");
+        // Never blocks the sign-out: a failure is logged and counted.
+        let provider = if session.entra_tid.is_some() {
+            "entra"
+        } else {
+            "dev"
+        };
+        record_sign_in(
+            &state,
+            Some((&session.handle, &session::assertion_ref(&id))),
+            SignInEvent::SignOut { provider },
+        )
+        .await;
     }
     Ok((
         StatusCode::NO_CONTENT,

@@ -3,7 +3,9 @@
 //! **Who may call:** the orchestrator (`PMOS_SERVICE_TOKEN`) and `pmos-web` (`PMOS_WEB_TOKEN`).
 //! Never the Slack bot or the console. These routes only read, but one: `POST
 //! /internal/admin/proposals` records (only records: it writes nothing anywhere else) a change
-//! proposal `pmos-web` opens as a GitHub pull request, so proposals are in the audit log.
+//! proposal `pmos-web` opens as a GitHub pull request, so proposals are in the audit log; and
+//! `POST /internal/admin/events` (`pmos-web` only) records its sign-ins, sign-outs and refused
+//! sign-ins, from a fixed set of actions and codes, never free text ([`sign_in_event`]).
 //!
 //! **Whose view:** every call names its viewer as `user=`. The tool server checks that viewer's
 //! roles in its own `team.yaml` against the permission matrix (`pmos_contract::permissions`),
@@ -53,6 +55,7 @@ pub(super) fn routes(state: AppState) -> Router<AppState> {
         .route("/admin/connectors", get(connectors))
         .route("/admin/overview", get(overview))
         .route("/admin/proposals", axum::routing::post(proposal))
+        .route("/admin/events", axum::routing::post(sign_in_event))
         .layer(middleware::from_fn_with_state(state, identify_admin_client))
 }
 
@@ -221,10 +224,14 @@ const FIXED_DETAILS: [&str; 10] = [
 ];
 
 /// `detail` if it is metadata only: one of [`FIXED_DETAILS`], an invalid-draft count, a
-/// ledger rejection reason (a fixed label, not free text), or a Slack draft's expiry note.
+/// ledger rejection reason (a fixed label, not free text), a Slack draft's expiry note, a
+/// purge batch's count and cutoff, or a sign-in event's provider, refusal code and attempt
+/// hash.
 pub fn safe_detail(detail: &str) -> Option<String> {
     let digits = |s: &str| !s.is_empty() && s.len() <= 6 && s.bytes().all(|b| b.is_ascii_digit());
     let ok = FIXED_DETAILS.contains(&detail)
+        || crate::audit::parse_purge_detail(detail).is_some()
+        || is_sign_in_detail(detail)
         || detail
             .strip_prefix("reason: ")
             .is_some_and(|r| Reason::parse(r).is_some())
@@ -455,14 +462,207 @@ async fn overview(
             .as_ref()
             .map(|c| c.get(&o).copied().unwrap_or_default())
     };
+    let retention = match state.svc.stores().audit.retention().await {
+        Ok(r) => r.unwrap_or_default(),
+        Err(e) => return unavailable(e),
+    };
     Json(json!({
         "since": since,
         "pending_drafts": pending,
         "approved": count(Outcome::Approved),
         "rejected": count(Outcome::Rejected),
         "denied": count(Outcome::Denied),
+        "retention_days": state.svc.audit_retention_days(),
+        "oldest_event_at": retention.oldest_event_at,
+        "last_purge": retention
+            .last_purge
+            .map(|p| json!({ "at": p.at, "deleted": p.deleted })),
     }))
     .into_response()
+}
+
+// Sign-in events from `pmos-web`.
+
+/// The actions `POST /internal/admin/events` records. Nothing else is accepted.
+pub const SIGN_IN_ACTIONS: [&str; 3] = ["web.sign_in", "web.sign_out", "web.sign_in_refused"];
+
+/// The sign-in providers an event may name.
+pub const SIGN_IN_PROVIDERS: [&str; 2] = ["entra", "dev"];
+
+/// Why a sign-in was refused, as `pmos-web` codes it (its signed-out page's `reason`).
+pub const SIGN_IN_REFUSALS: [&str; 6] = [
+    "not_a_member",
+    "wrong_account",
+    "expired",
+    "cancelled",
+    "unavailable",
+    "failed",
+];
+
+/// Who a refused sign-in is recorded as: nobody signed in.
+pub const ANONYMOUS: &str = "anonymous";
+
+/// The run id sign-in events are recorded under.
+pub const SIGN_IN_RUN: &str = "web-auth";
+
+/// The length of a refused sign-in's `attempt`: hex of a keyed hash of the name tried.
+pub const ATTEMPT_HEX: usize = 12;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignInRecord {
+    action: String,
+    provider: String,
+    /// `web.sign_in_refused` only: one of [`SIGN_IN_REFUSALS`].
+    #[serde(default)]
+    reason: Option<String>,
+    /// `web.sign_in_refused` only: [`ATTEMPT_HEX`] lowercase hex characters.
+    #[serde(default)]
+    attempt: Option<String>,
+    /// `web.sign_in_refused` with `wrong_account` only: the member whose email was used.
+    #[serde(default)]
+    member: Option<String>,
+}
+
+fn is_attempt(a: &str) -> bool {
+    a.len() == ATTEMPT_HEX && a.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A sign-in event's `detail`: `provider: <p>`, and for a refusal `; reason: <r>` and
+/// optionally `; attempt: <hex>`. Fixed words and codes only.
+pub fn sign_in_detail(provider: &str, reason: Option<&str>, attempt: Option<&str>) -> String {
+    let mut d = format!("provider: {provider}");
+    if let Some(r) = reason {
+        d.push_str(&format!("; reason: {r}"));
+    }
+    if let Some(a) = attempt {
+        d.push_str(&format!("; attempt: {a}"));
+    }
+    d
+}
+
+/// Is `detail` exactly what [`sign_in_detail`] writes, from the fixed sets?
+fn is_sign_in_detail(detail: &str) -> bool {
+    let mut parts = detail.split("; ");
+    let Some(provider) = parts.next().and_then(|p| p.strip_prefix("provider: ")) else {
+        return false;
+    };
+    if !SIGN_IN_PROVIDERS.contains(&provider) {
+        return false;
+    }
+    match parts.next() {
+        None => return true,
+        Some(r) => match r.strip_prefix("reason: ") {
+            Some(r) if SIGN_IN_REFUSALS.contains(&r) => {}
+            _ => return false,
+        },
+    }
+    match parts.next() {
+        None => true,
+        Some(a) => a.strip_prefix("attempt: ").is_some_and(is_attempt) && parts.next().is_none(),
+    }
+}
+
+/// `POST /internal/admin/events[?user=<handle>]`: `pmos-web` records a sign-in, a sign-out
+/// or a refused sign-in (`docs/web-api.md`, "Sign-in events"). `pmos-web`'s token only.
+/// A sign-in or sign-out names the member as `user=` (with a user assertion for them, as on
+/// every admin route); a refusal names no one and is recorded as [`ANONYMOUS`], with the
+/// refusal's code, and at most a short keyed hash of the name tried, never the name.
+/// Answers `503` when the event couldn't be recorded, so the caller knows.
+async fn sign_in_event(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Query(q): Query<ViewerParams>,
+    body: axum::body::Bytes,
+) -> Response {
+    if client != Client::Web {
+        return coded(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "only pmos-web records sign-in events",
+        );
+    }
+    let bad = |why: &str| coded(StatusCode::BAD_REQUEST, "bad_request", why);
+    let Ok(r) = serde_json::from_slice::<SignInRecord>(&body) else {
+        return bad("the body isn't a sign-in event");
+    };
+    let Some(action) = SIGN_IN_ACTIONS.iter().find(|a| **a == r.action) else {
+        return bad("`action` isn't a sign-in event this server records");
+    };
+    let Some(provider) = SIGN_IN_PROVIDERS.iter().find(|p| **p == r.provider) else {
+        return bad("`provider` is `entra` or `dev`");
+    };
+    let user = q.user.as_deref().map(str::trim).filter(|u| !u.is_empty());
+    let team = state.svc.team();
+    let event = |user: &str, outcome, output_ref: Option<String>, detail: String| AuditEvent {
+        at: Utc::now(),
+        client,
+        run_id: SIGN_IN_RUN.to_string(),
+        user: user.to_string(),
+        skill: None,
+        bot: None,
+        tool: action.to_string(),
+        outcome,
+        sources: Vec::new(),
+        source_titles: Default::default(),
+        args_hash: None,
+        output_ref,
+        detail: Some(detail),
+    };
+    let ev = if *action == "web.sign_in_refused" {
+        if user.is_some() {
+            return bad("a refused sign-in names no `user`");
+        }
+        let Some(reason) = r
+            .reason
+            .as_deref()
+            .and_then(|x| SIGN_IN_REFUSALS.iter().find(|s| **s == x))
+        else {
+            return bad("`reason` isn't a refusal code this server records");
+        };
+        if r.attempt.as_deref().is_some_and(|a| !is_attempt(a)) {
+            return bad("`attempt` is 12 lowercase hex characters");
+        }
+        let member = match r.member.as_deref() {
+            None => None,
+            Some(m) if *reason == "wrong_account" && team.member(m).is_some() => {
+                Some(format!("member:{m}"))
+            }
+            Some(_) => return bad("`member` is only for `wrong_account`, and must be a member"),
+        };
+        event(
+            ANONYMOUS,
+            Outcome::Denied,
+            member,
+            sign_in_detail(provider, Some(reason), r.attempt.as_deref()),
+        )
+    } else {
+        if r.reason.is_some() || r.attempt.is_some() || r.member.is_some() {
+            return bad("only a refused sign-in has `reason`, `attempt` or `member`");
+        }
+        let Some(user) = user else {
+            return bad("`user` (who signed in or out) is required");
+        };
+        if team.member(user).is_none() {
+            return coded(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "this person isn't a team member",
+            );
+        }
+        event(
+            user,
+            Outcome::Ok,
+            None,
+            sign_in_detail(provider, None, None),
+        )
+    };
+    if let Err(e) = state.svc.stores().audit.record(ev).await {
+        tracing::error!(error = %e, action, "AUDIT UNAVAILABLE: sign-in event not recorded");
+        return unavailable(e);
+    }
+    tracing::info!(action, provider, "sign-in event recorded");
+    Json(json!({ "recorded": true })).into_response()
 }
 
 // Proposals.
@@ -613,6 +813,10 @@ mod tests {
             "invalid draft (1 of 2)",
             "invalid draft (2 of 2): no attempts left in this session",
             "undecided after 24 h: nothing was posted, and the draft's text was removed",
+            "purged 1200 events older than 2026-08-19T03:00:00Z",
+            "provider: entra",
+            "provider: dev; reason: not_a_member",
+            "provider: entra; reason: not_a_member; attempt: 3f9a1c2b4d5e",
         ] {
             assert_eq!(safe_detail(ok).as_deref(), Some(ok));
         }
@@ -622,6 +826,13 @@ mod tests {
             "jira answered 400: summary 'Secret project' is too long",
             "undecided after 24 h: something else",
             "",
+            "purged many events older than yesterday",
+            "purged 3 events older than 2026-08-19T03:00:00Z and the secret",
+            "provider: okta",
+            "provider: entra; reason: ana@example.com",
+            "provider: entra; reason: not_a_member; attempt: ana@example.com",
+            "provider: entra; reason: not_a_member; attempt: 3F9A1C2B4D5E",
+            "provider: entra; reason: not_a_member; attempt: 3f9a1c2b4d5e; extra",
         ] {
             assert_eq!(safe_detail(no), None, "{no}");
         }

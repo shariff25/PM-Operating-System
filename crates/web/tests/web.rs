@@ -47,6 +47,10 @@ struct Call {
 #[derive(Default)]
 struct Upstream {
     calls: Mutex<Vec<Call>>,
+    /// Sign-in events (`POST /internal/admin/events`), kept apart from `calls`.
+    sign_ins: Mutex<Vec<Call>>,
+    /// The sign-in events route answers `503`, as when the audit log is down.
+    sign_ins_down: std::sync::atomic::AtomicBool,
     /// Tasks (runtime) or approval items (tool server).
     data: Mutex<Vec<Value>>,
     next: AtomicUsize,
@@ -307,6 +311,16 @@ async fn toolserver(
 ) -> Response {
     if uri.path() == "/healthz" {
         return "ok".into_response();
+    }
+    if uri.path() == "/internal/admin/events" {
+        // Recorded apart, so the tests that count calls count what they always did.
+        up.record(&method, &uri, &headers, &body);
+        let c = up.calls.lock().unwrap().pop().unwrap();
+        up.sign_ins.lock().unwrap().push(c);
+        if up.sign_ins_down.load(Ordering::SeqCst) {
+            return coded(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+        }
+        return Json(json!({"recorded": true})).into_response();
     }
     up.record(&method, &uri, &headers, &body);
     if headers.get("authorization").and_then(|v| v.to_str().ok())
@@ -917,6 +931,91 @@ async fn sign_in_sets_the_host_cookie_and_rotates_it() {
         .post(&Browser::default(), "/api/auth/logout", json!(null))
         .await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
+}
+
+/// Sign-ins, sign-outs and refused sign-ins go to the tool server's audit log
+/// (`POST /internal/admin/events`): fixed actions and codes, the member as `user=`, and for a
+/// refusal no one, with only a short keyed hash of the name tried.
+#[tokio::test]
+async fn sign_ins_and_sign_outs_are_audited() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    let r = w.post(&b, "/api/auth/logout", json!(null)).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    for tried in [
+        "mallory@example.com",
+        " Mallory@Example.com ",
+        "eve@example.com",
+    ] {
+        let r = w
+            .post(
+                &Browser::default(),
+                "/api/auth/dev-login",
+                json!({ "handle": tried }),
+            )
+            .await;
+        assert_eq!(r.code(), "not_a_member");
+    }
+    let events = w.tools.sign_ins.lock().unwrap().clone();
+    assert_eq!(events.len(), 5, "{events:?}");
+    for c in &events {
+        assert_eq!(c.method, "POST");
+        assert_eq!(c.auth, format!("Bearer {TOOLS_TOKEN}"));
+        assert!(c.uri.starts_with("/internal/admin/events"));
+    }
+    assert_eq!(events[0].uri, "/internal/admin/events?user=ana");
+    assert_eq!(
+        events[0].body,
+        json!({"action": "web.sign_in", "provider": "dev"})
+    );
+    assert_eq!(events[1].uri, "/internal/admin/events?user=ana");
+    assert_eq!(
+        events[1].body,
+        json!({"action": "web.sign_out", "provider": "dev"})
+    );
+    let attempts: Vec<String> = events[2..]
+        .iter()
+        .map(|c| {
+            assert_eq!(c.uri, "/internal/admin/events", "a refusal names no one");
+            assert_eq!(c.body["action"], "web.sign_in_refused");
+            assert_eq!(c.body["provider"], "dev");
+            assert_eq!(c.body["reason"], "not_a_member");
+            let raw = String::from_utf8_lossy(&c.raw).to_lowercase();
+            assert!(
+                !raw.contains("mallory") && !raw.contains("eve") && !raw.contains('@'),
+                "never the name tried: {raw}"
+            );
+            let a = c.body["attempt"].as_str().unwrap().to_string();
+            assert!(
+                a.len() == 12 && a.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{a}"
+            );
+            a
+        })
+        .collect();
+    assert_eq!(attempts[0], attempts[1], "the same name, the same hash");
+    assert_ne!(attempts[0], attempts[2]);
+    assert_eq!(
+        w.get(&Browser::default(), "/readyz").await.body["unrecorded_sign_in_events"],
+        0
+    );
+    w.assert_no_tokens();
+}
+
+/// The audit log down: sign-in and sign-out still work, and `/readyz` counts what wasn't
+/// recorded.
+#[tokio::test]
+async fn sign_in_and_out_go_ahead_when_the_audit_log_is_down() {
+    let w = web().await;
+    w.tools.sign_ins_down.store(true, Ordering::SeqCst);
+    let b = w.login("ana").await;
+    assert_eq!(w.get(&b, "/api/me").await.status, StatusCode::OK);
+    let r = w.post(&b, "/api/auth/logout", json!(null)).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    assert_eq!(w.get(&b, "/api/me").await.status, StatusCode::UNAUTHORIZED);
+    let r = w.get(&Browser::default(), "/readyz").await;
+    assert_eq!(r.status, StatusCode::OK, "not a readiness failure");
+    assert_eq!(r.body["unrecorded_sign_in_events"], 2);
 }
 
 #[tokio::test]
@@ -3233,6 +3332,33 @@ async fn assertions_carry_a_session_reference_never_the_session() {
     }
 }
 
+/// A sign-in or sign-out event carries an assertion for the member, in the session it starts
+/// or ends; a refusal carries none (it is no one's).
+#[tokio::test]
+async fn sign_in_events_are_signed_for_the_member() {
+    let w = signing_web().await;
+    let ana = w.login("ana").await;
+    let r = w.post(&ana, "/api/auth/logout", json!(null)).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = w
+        .post(
+            &Browser::default(),
+            "/api/auth/dev-login",
+            json!({"handle": "nobody"}),
+        )
+        .await;
+    assert_eq!(r.code(), "not_a_member");
+    let events = w.tools.sign_ins.lock().unwrap().clone();
+    assert_eq!(events.len(), 3);
+    let cache = pmos_assertion::MemoryReplayCache::default();
+    for c in &events[..2] {
+        let a = verified(c, "toolserver", ("wt1", WEB_TOOLS_KEY), &cache).unwrap();
+        assert_eq!(a.subject(), "ana");
+        assert_eq!(a.session(), session_ref(&ana));
+    }
+    assert!(events[2].assertion.is_none());
+}
+
 #[tokio::test]
 async fn a_conflicting_decision_is_read_again_with_an_assertion() {
     let w = signing_web().await;
@@ -3485,7 +3611,8 @@ async fn readyz_checks_the_store_the_team_and_both_upstreams() {
     assert_eq!(
         r.body,
         json!({"ready": true, "checks": {"store": "ok", "team": "ok",
-                                         "bot_runtime": "ok", "tool_server": "ok"}})
+                                         "bot_runtime": "ok", "tool_server": "ok"},
+               "unrecorded_sign_in_events": 0})
     );
     std::fs::write(w.dir.path().join("team.yaml"), "members: [").unwrap();
     let r = w.get(&Browser::default(), "/readyz").await;

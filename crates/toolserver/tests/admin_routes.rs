@@ -507,5 +507,69 @@ async fn accounts_connectors_and_overview() {
     let since: DateTime<Utc> = body["since"].as_str().unwrap().parse().unwrap();
     assert!((Utc::now() - Duration::days(7) - since).num_seconds().abs() < 60);
     assert!(body["denied"].is_u64());
+    // Retention: the setting, the oldest event (seeded on 2026-11-13), no purge yet.
+    assert_eq!(body["retention_days"], 90);
+    assert_eq!(body["oldest_event_at"], "2026-11-13T09:00:00Z");
+    assert_eq!(body["last_purge"], Value::Null);
+    srv.stop().await;
+}
+
+/// The overview's retention facts after a purge, in memory and in Postgres.
+async fn overview_reports_retention(srv: &Server) {
+    let audit = &srv.f.stores.audit;
+    let now = Utc::now();
+    let mut old = event("2026-01-01T00:00:00Z", "ana", "jira.search", Outcome::Ok);
+    old.at = now - Duration::days(200);
+    audit.record(old).await.unwrap();
+    audit
+        .record(event(
+            "2026-11-14T08:00:00Z",
+            "ana",
+            "jira.search",
+            Outcome::Ok,
+        ))
+        .await
+        .unwrap();
+    let (_, before) = srv.web("ada", "/internal/admin/overview?user=ada").await;
+    let oldest: DateTime<Utc> = before["oldest_event_at"].as_str().unwrap().parse().unwrap();
+    assert!((oldest - (now - Duration::days(200))).num_seconds().abs() < 2);
+    let report = pmos_toolserver::retention::run(audit.as_ref(), 90, 100, now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.deleted, 1);
+    let (status, body) = srv.web("aud", "/internal/admin/overview?user=aud").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retention_days"], 90);
+    assert_eq!(body["last_purge"]["deleted"], 1, "{body}");
+    let at: DateTime<Utc> = body["last_purge"]["at"].as_str().unwrap().parse().unwrap();
+    assert!((Utc::now() - at).num_seconds().abs() < 60);
+    // The oldest left is the seeded one; the admin reads since are newer.
+    assert_eq!(body["oldest_event_at"], "2026-11-14T08:00:00Z");
+    // The purge shows in the audit list with the existing fields, its detail served.
+    let page = srv.search("ada", "action=audit.purge").await;
+    let run = &page["events"][0];
+    assert_eq!(run["actor"], "pmos-retention");
+    assert_eq!(run["client"], "system");
+    assert_eq!(run["outcome"], "ok");
+    assert!(run["detail"]
+        .as_str()
+        .unwrap()
+        .starts_with("purged 1 events older than "));
+}
+
+#[tokio::test]
+async fn overview_reports_retention_in_memory() {
+    let srv = start(Mode::Require, false).await.unwrap();
+    overview_reports_retention(&srv).await;
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn overview_reports_retention_in_postgres() {
+    let Some(srv) = start(Mode::Require, true).await else {
+        return;
+    };
+    overview_reports_retention(&srv).await;
     srv.stop().await;
 }
