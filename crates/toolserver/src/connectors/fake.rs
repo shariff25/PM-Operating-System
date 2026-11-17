@@ -1,12 +1,13 @@
 //! In-memory connectors with fixture data, for tests and for Phase 0 before real tokens are
 //! allowed (no real tokens or data before Gate 1).
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{Audience, Caller, Connector, ConnectorError, Item, SourceRef, TeamBot};
+use super::{Audience, Caller, Connector, ConnectorError, Item, SourceRef, TeamBot, PAGE_CHANGED};
 
 /// A write the fake received.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +27,9 @@ pub struct FakeConnector {
     /// Slack channels' audiences, by channel id.
     channels: Vec<(String, Audience)>,
     writes: Mutex<Vec<FakeWrite>>,
+    /// Confluence pages' versions, by page id: 1 until an update. `confluence.read` returns
+    /// it, and `update_page` must name it, as with the live connector.
+    versions: Mutex<HashMap<String, u64>>,
 }
 
 impl FakeConnector {
@@ -36,7 +40,26 @@ impl FakeConnector {
             threads: Vec::new(),
             channels: Vec::new(),
             writes: Mutex::new(Vec::new()),
+            versions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A Confluence page's current version: 1 until it is updated.
+    pub fn page_version(&self, id: &str) -> u64 {
+        self.versions
+            .lock()
+            .expect("fake lock")
+            .get(id)
+            .copied()
+            .unwrap_or(1)
+    }
+
+    /// Set a Confluence page's version, as if someone saved it outside PM OS.
+    pub fn set_page_version(&self, id: &str, version: u64) {
+        self.versions
+            .lock()
+            .expect("fake lock")
+            .insert(id.to_string(), version);
     }
 
     pub fn writes(&self) -> Vec<FakeWrite> {
@@ -594,6 +617,10 @@ impl Connector for FakeConnector {
                 if let Some(bot) = caller.team_bot {
                     self.item_in_scope(bot, &item)?;
                 }
+                let mut item = item;
+                if self.system == "confluence" {
+                    item.content["version"] = json!(self.page_version(&item.source.id));
+                }
                 Ok(vec![item])
             }
             other => Err(ConnectorError::Unsupported(other.to_string())),
@@ -606,6 +633,19 @@ impl Connector for FakeConnector {
         action: &str,
         args: &Value,
     ) -> Result<SourceRef, ConnectorError> {
+        // Like the live connector: refused, with nothing written, unless the page is still
+        // at the version the call names; then it moves to the next one.
+        if (self.system.as_str(), action) == ("confluence", "update_page") {
+            let page = str_arg(args, &["page_id"])
+                .ok_or_else(|| ConnectorError::BadArgs("`page_id` is required".into()))?;
+            let named = args["version"]
+                .as_u64()
+                .ok_or_else(|| ConnectorError::BadArgs("`version` is required".into()))?;
+            if named != self.page_version(page) {
+                return Err(ConnectorError::BadArgs(PAGE_CHANGED.into()));
+            }
+            self.set_page_version(page, named + 1);
+        }
         let mut writes = self.writes.lock().expect("fake lock");
         let id = format!("{}-W{}", self.system.to_uppercase(), writes.len() + 1);
         // What would be sent: like the live connector, a reply's `message_ts` stays behind.
@@ -650,6 +690,35 @@ impl Connector for FakeConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_page_update_names_the_version_it_read() {
+        let confluence = FakeConnector::confluence();
+        let caller = Caller::new("ana", "r1");
+        let page = confluence
+            .read(caller, "read", &json!({"page_id": "9002"}))
+            .await
+            .unwrap();
+        assert_eq!(page[0].content["version"], 1);
+        let update = |version: u64| json!({"page_id": "9002", "version": version, "body": "b"});
+        assert_eq!(
+            confluence.write(caller, "update_page", &update(2)).await,
+            Err(ConnectorError::BadArgs(PAGE_CHANGED.into())),
+            "a version it didn't read"
+        );
+        assert!(confluence.writes().is_empty(), "nothing written");
+        confluence
+            .write(caller, "update_page", &update(1))
+            .await
+            .unwrap();
+        assert_eq!(confluence.page_version("9002"), 2, "version + 1");
+        assert_eq!(
+            confluence.write(caller, "update_page", &update(1)).await,
+            Err(ConnectorError::BadArgs(PAGE_CHANGED.into())),
+            "now stale"
+        );
+        assert_eq!(confluence.writes().len(), 1);
+    }
 
     #[tokio::test]
     async fn search_read_and_write() {

@@ -206,6 +206,16 @@ async fn ts_decide(
     if !team.by_handle(admin).is_some_and(|m| m.is_admin()) {
         return answer(StatusCode::FORBIDDEN, json!({"error": "admins only"}));
     }
+    // The bot's token may grant `pm` and `skill-author` only (S2).
+    if body["roles"]
+        .as_array()
+        .is_some_and(|r| r.iter().any(|r| r == "admin"))
+    {
+        return answer(
+            StatusCode::FORBIDDEN,
+            json!({"error": "admins are added by a pull request to team.yaml"}),
+        );
+    }
     let mut requests = ts.requests.lock().unwrap();
     let Some(request) = requests.iter_mut().find(|r| r["id"] == id.as_str()) else {
         return answer(StatusCode::NOT_FOUND, json!({"error": "no such request"}));
@@ -821,6 +831,12 @@ async fn a_stranger_requests_access_and_an_admin_approves() {
         assert!(s.contains("Ben &lt;Smith&gt;"), "{s}");
         assert!(s.contains("ben.smith@example.com"));
         assert!(s.contains("`ben-smith`"));
+        // No admin choice (S2): the card says how admins are made instead.
+        assert!(
+            s.contains("Admins are added by a pull request to `team.yaml`"),
+            "{s}"
+        );
+        assert!(!s.to_lowercase().contains("make admin"), "{s}");
         for action in [
             "pmos_member_approve",
             "pmos_member_edit",

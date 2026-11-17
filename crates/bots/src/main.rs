@@ -59,7 +59,12 @@ async fn main() -> Result<()> {
         keys = ?config.assertions.key_ids(),
         "user assertions from web and console"
     );
-    let app = router_with(rt, config.clients.clone(), config.assertions.clone());
+    let app = router_with(
+        rt,
+        config.clients.clone(),
+        config.evals_as.clone(),
+        config.assertions.clone(),
+    );
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;

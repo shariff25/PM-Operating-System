@@ -106,6 +106,7 @@ providers, regenerate the policies (the old files are `policy-orphan`), and rest
 | `PMOS_SERVICE_TOKEN` | required | The tool server's orchestrator token: it creates bot sessions and reads approvals |
 | `PMOS_GATEWAY_URL` | required | The gateway's OpenAI base, ending in `/v1` (as the harness uses it) |
 | `PMOS_GATEWAY_TOKEN` | required | This service's client token in the gateway's `PMOS_GATEWAY_TOKENS` |
+| `PMOS_EVALS_AS` | `evals` | Comma-separated handles the `evals` client may request tasks as; any other is `403`. Eval tasks may not name a Slack target (`400`) and send no notifications |
 
 Tokens and the database URL never appear in `Debug` output or the log.
 

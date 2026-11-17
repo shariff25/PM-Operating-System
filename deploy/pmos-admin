@@ -28,8 +28,9 @@
 #                                     models); the report lands in <dir>/evals/reports to commit
 #   pmos-admin evals-stack [--checkout <dir>] <pmos-evals args>
 #                                     any pmos-evals command on the eval stack (judge calibrate …)
-#   pmos-admin evals-gate [--base origin/main]
-#                                     the eval gate for this checkout's changes (CI runs it)
+#   pmos-admin evals-gate [--checkout <dir>] [--base origin/main] [--dry-run]
+#                                     the eval gate for a checkout's changes (default: this
+#                                     one; CI passes the PR's head, which is only read as data)
 #   pmos-admin smoke <handle>         one Docs-bot question through the whole stack
 set -euo pipefail
 
@@ -133,7 +134,8 @@ eval_stack_up() { # checkout
   # the benchmark tasks are requested by, with their personal bot pm-evals, and their teammates
   # ben (U0BEN) and cy (U0CY), so the fake channels' audiences mean what the tasks say
   # (crates/toolserver/src/connectors/fake.rs). Only this copy is changed.
-  cp -r "$checkout/content" "$EVAL_DIR/content"
+  # -P: a symbolic link in the checkout is copied as a link, never followed on this machine.
+  cp -RP "$checkout/content" "$EVAL_DIR/content"
   mkdir -p "$EVAL_DIR/baseline" "$EVAL_DIR/out"
   local who
   for who in evals:U0EVALS ben:U0BEN cy:U0CY; do
@@ -430,22 +432,39 @@ for g in s["groups"]:
     ;;
 
   evals-gate)
+    # The eval gate. --checkout names the tree being measured (CI: the PR's head, in pr/). That
+    # tree is data: only git runs on it (diff, archive), and the eval stack's containers, which
+    # run this machine's installed images, read its content/, evals/ and deploy/gateway.yaml.
+    # Nothing from it is sourced or executed, and the compose file is this script's own.
     base=origin/main
+    checkout=$ROOT
+    dry=0
+    gate_usage() { say "usage: pmos-admin evals-gate [--checkout <dir>] [--base <ref>] [--dry-run]" >&2; exit 2; }
     while [ $# -gt 0 ]; do
       case "$1" in
-        --base) base=$2; shift 2 ;;
-        *) say "usage: pmos-admin evals-gate [--base <ref>]" >&2; exit 2 ;;
+        --base) [ $# -ge 2 ] || gate_usage; base=$2; shift 2 ;;
+        --checkout) [ $# -ge 2 ] || gate_usage; checkout=$2; shift 2 ;;
+        --dry-run) dry=1; shift ;;
+        *) gate_usage ;;
       esac
     done
-    changed=$(git -C "$ROOT" diff --name-only "$base"...HEAD)
-    eval_stack_up "$ROOT"
+    [ -d "$checkout" ] || { say "no directory $checkout" >&2; exit 2; }
+    checkout=$(cd "$checkout" && pwd)
+    if [ "$dry" = 1 ]; then
+      # What the gate would use, without starting anything (scripts and CI check the parse).
+      say "checkout=$checkout"
+      say "base=$base"
+      exit 0
+    fi
+    changed=$(git -C "$checkout" diff --name-only "$base"...HEAD)
+    eval_stack_up "$checkout"
     mapfile -t categories < <(printf '%s\n' "$changed" | evals_runner affected --content content)
     if [ ${#categories[@]} -eq 0 ]; then
       say "The eval gate: no benchmark category is affected by this change."
       exit 0
     fi
     # The baseline: the base branch's committed reports, unpacked where the runner can read them.
-    git -C "$ROOT" archive "$base" evals/reports | tar -x -C "$PMOS_EVAL_BASELINE"
+    git -C "$checkout" archive "$base" evals/reports | tar -x -C "$PMOS_EVAL_BASELINE"
     worst=0
     for c in "${categories[@]}"; do
       code=0

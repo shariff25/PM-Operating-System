@@ -88,6 +88,9 @@ impl GitHubSetup {
     }
 }
 
+/// The `403` code when a member decision from the Slack bot asks for the `admin` role.
+pub const ADMIN_BY_PULL_REQUEST: &str = "admin_by_pull_request";
+
 /// A refusal or failure, as the API answers it: `{error, code, request?}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
@@ -538,6 +541,26 @@ impl Onboarding {
                 }
             }
         };
+        // The Slack bot names the deciding admin unsigned, so it may grant `pm` and
+        // `skill-author` only. A new admin is made by a pull request to team.yaml.
+        if client == Client::Bot && roles.contains(&Role::Admin) {
+            self.audit(
+                client,
+                admin,
+                "members.add",
+                Outcome::Denied,
+                id,
+                None,
+                Some("an admin grant from Slack: admins are added by a pull request".into()),
+                now,
+            )
+            .await;
+            return Err(Refusal::new(
+                StatusCode::FORBIDDEN,
+                ADMIN_BY_PULL_REQUEST,
+                "PM OS won't make an admin from Slack: add the admin role with a pull request to team.yaml",
+            ));
+        }
         let member = TeamMember {
             handle: handle.clone(),
             slack_id: request.slack_id.clone(),

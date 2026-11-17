@@ -71,6 +71,7 @@ async fn start(mode: Mode, postgres: bool) -> Option<Server> {
                 token: BOT_TOKEN.into(),
                 skills: vec!["docs".into()],
             }),
+            console_token: Some(CONSOLE_TOKEN.into()),
             content_root: f.root.clone(),
             oauth: None,
             allowed_hosts: vec!["127.0.0.1".into(), "localhost".into()],
@@ -78,7 +79,6 @@ async fn start(mode: Mode, postgres: bool) -> Option<Server> {
         None,
         PersonClients {
             web_token: Some(WEB_TOKEN.into()),
-            console_token: Some(CONSOLE_TOKEN.into()),
             assertions: Arc::new(Assertions::new(mode, keys).unwrap()),
         },
         cancel.clone(),

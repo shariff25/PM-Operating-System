@@ -247,6 +247,12 @@ pub fn apply(task: &mut Task, change: &Transition, now: DateTime<Utc>) -> Result
     Ok(())
 }
 
+/// Whether a change to `task` may put a notification in the Slack feed. An eval task never
+/// does: benchmarks run as the benchmark member and must not post anywhere (spec §3).
+pub fn notifies(task: &Task) -> bool {
+    task.source != crate::model::Source::Eval
+}
+
 fn notification_for(
     task: &Task,
     seq: i64,
@@ -416,7 +422,7 @@ impl BotsStore for MemoryStore {
         if let Some((kind, text)) = &change.event {
             s.event(id, kind, text, now);
         }
-        if let Some(n) = &change.notify {
+        if let Some(n) = change.notify.as_ref().filter(|_| notifies(&updated)) {
             s.notify(&updated, n, now);
         }
         Ok(Ok(updated))
@@ -634,7 +640,7 @@ impl BotsStore for MemoryStore {
         let task = run.task.clone();
         s.tasks.insert(task.id.clone(), task.clone());
         s.event(&task.id, "status", &run.event, now);
-        if let Some(n) = &run.notify {
+        if let Some(n) = run.notify.as_ref().filter(|_| notifies(&task)) {
             s.notify(&task, n, now);
         }
         Ok(true)
