@@ -55,7 +55,7 @@ export type Route =
 
 /** `/admin`, `/admin/audit`, `/admin/team`, `/admin/connectors`, each with an optional `?query`. */
 function adminRoute(path: string): Route | null {
-  const m = /^\/admin(?:\/(audit|team|connectors))?\/?(?:\?(.*))?$/.exec(path);
+  const m = /^\/admin(?:\/(audit|team|connectors|policy|content))?\/?(?:\?(.*))?$/.exec(path);
   if (!m) return null;
   return { name: 'admin', section: (m[1] as AdminSection | undefined) ?? 'overview', search: m[2] ?? '' };
 }

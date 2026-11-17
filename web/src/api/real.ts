@@ -17,6 +17,7 @@ import type {
   TeamList,
   Task,
 } from './types';
+import type { ContentFileText, ContentView, Harness, PolicyView, ProposalList, ProposalResult, Validation } from './policyTypes';
 
 /** The query string for an audit route. Empty values are left out, as the server counts them as absent. */
 export function auditQueryString(q: AuditQuery): string {
@@ -73,10 +74,15 @@ export function createRealClient(opts: RealOptions = {}): Api {
 
     let code = 'unknown';
     let message: string = copy.errors.unknown;
+    let details: Record<string, unknown> = {};
     try {
-      const data = (await res.json()) as { code?: string; error?: string };
+      const data = (await res.json()) as { code?: string; error?: string } & Record<string, unknown>;
       if (data.code) code = data.code;
       if (data.error) message = data.error;
+      const { code: _c, error: _e, ...rest } = data;
+      void _c;
+      void _e;
+      details = rest;
     } catch {
       /* body was not JSON; keep the plain fallback */
     }
@@ -85,7 +91,8 @@ export function createRealClient(opts: RealOptions = {}): Api {
       opts.onSignedOut?.();
       code = 'signed_out';
     }
-    throw new ApiError(res.status, code, message);
+    const wait = Number(res.headers.get('Retry-After') ?? NaN);
+    throw new ApiError(res.status, code, message, details, Number.isFinite(wait) && wait >= 0 ? wait : null);
   }
 
   async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -160,5 +167,16 @@ export function createRealClient(opts: RealOptions = {}): Api {
     },
     adminTeam: () => call<TeamList>('GET', '/admin/team'),
     adminConnectors: async () => (await call<{ connectors: Connector[] }>('GET', '/admin/connectors')).connectors,
+
+    adminPolicy: () => call<PolicyView>('GET', '/admin/policy'),
+    adminPolicyValidate: (spec) => post<Validation>('/admin/policy/validate', { spec }),
+    adminPolicyPropose: (input) => post<ProposalResult>('/admin/policy/proposals', input),
+    adminPolicyProposals: () => call<ProposalList>('GET', '/admin/policy/proposals'),
+    adminContent: () => call<ContentView>('GET', '/admin/content'),
+    adminContentFile: (path) => call<ContentFileText>('GET', `/admin/content/file?path=${encodeURIComponent(path)}`),
+    adminContentValidate: (changes) => post<Validation>('/admin/content/validate', { changes }),
+    adminContentPropose: (input) => post<ProposalResult>('/admin/content/proposals', input),
+    adminContentProposals: () => call<ProposalList>('GET', '/admin/content/proposals'),
+    adminHarness: () => call<Harness>('GET', '/admin/harness'),
   };
 }

@@ -36,6 +36,8 @@ const CARDS: { section: Exclude<AdminSection, 'overview'>; icon: IconName }[] = 
   { section: 'audit', icon: 'activity' },
   { section: 'team', icon: 'followups' },
   { section: 'connectors', icon: 'globe' },
+  { section: 'policy', icon: 'shield' },
+  { section: 'content', icon: 'layers' },
 ];
 
 /**

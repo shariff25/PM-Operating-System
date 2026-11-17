@@ -319,6 +319,106 @@ for (const theme of ['light', 'dark'] as const) {
       await scan(page, 'auditor, no access');
     });
 
+    test('admin: policy, its check result, the pull-request dialog, a refusal and the result', async ({ page }) => {
+      await signIn(page, theme, undefined, 'ada', '?mock_proposal=stale_base');
+      await go(page, '/admin/policy');
+      await expect(page.getByRole('heading', { name: /^What each bot may do/ })).toBeVisible();
+      await expect(page.getByRole('list', { name: 'Open policy proposals' })).toBeVisible();
+      await page.getByText('Fixed in code').click();
+      await page.getByText('Policy files').click();
+      await page.getByText('Show how policies/bots/pm-ben.yaml differs').click();
+      await page.getByText('Read it as sentences').first().click();
+      await scan(page, 'policy, everything open');
+      await page.getByRole('tab', { name: 'Roles' }).click();
+      await scan(page, 'policy editor, roles');
+      await page.getByRole('tab', { name: 'JSON' }).click();
+      await scan(page, 'policy editor, JSON');
+      await page.getByRole('tab', { name: 'Skills' }).click();
+      await page.getByLabel('Tools for docs').fill('docs.search docs.read jira.search');
+      await page.getByRole('button', { name: 'Check this change' }).click();
+      await expect(page.getByRole('region', { name: 'Wider: 1' })).toBeVisible();
+      await page.getByText('Files this change writes (2)').click();
+      await page.locator('summary', { hasText: 'policies/bots/docs.yaml' }).click();
+      await scan(page, 'policy check result with a widening');
+      await page.getByRole('button', { name: 'Open a pull request' }).click();
+      const dialog = page.getByRole('dialog', { name: 'Open a pull request' });
+      await scan(page, 'pull-request dialog');
+      await dialog.getByLabel('Title').fill('Let the docs bot search Jira');
+      await dialog.getByLabel('Why this change').fill('Support asked.');
+      await dialog.getByRole('button', { name: 'Open the pull request' }).click();
+      await expect(dialog.getByRole('alert')).toBeVisible();
+      await scan(page, 'pull-request dialog, stale_base');
+    });
+
+    test('admin: a pull request opened, and GitHub not linked', async ({ page }) => {
+      await signIn(page, theme, undefined, 'ada');
+      await go(page, '/admin/policy');
+      await page.getByRole('tab', { name: 'Bots' }).click();
+      await page.getByLabel('Owner of docs').fill('ana');
+      await page.getByRole('button', { name: 'Check this change' }).click();
+      await page.getByRole('button', { name: 'Open a pull request' }).click();
+      const dialog = page.getByRole('dialog', { name: 'Open a pull request' });
+      await dialog.getByLabel('Title').fill('Give the docs bot an owner');
+      await dialog.getByLabel('Why this change').fill('Ana runs the docs now.');
+      await dialog.getByRole('button', { name: 'Open the pull request' }).click();
+      await expect(page.getByRole('heading', { name: 'Pull request #42 is open' })).toBeVisible();
+      await scan(page, 'pull request opened');
+      await signIn(page, theme, undefined, 'ada', '?mock_protection=not_linked');
+      await go(page, '/admin/policy');
+      await expect(page.getByText('Link GitHub to propose changes')).toBeVisible();
+      await expect(page.getByText(/Link your GitHub account to see proposals/)).toBeVisible();
+      await scan(page, 'policy, GitHub not linked');
+    });
+
+    test('admin: content tree, a file, the editor, the change tray with a check, and the harness', async ({ page }) => {
+      await signIn(page, theme, undefined, 'ada');
+      await go(page, '/admin/content');
+      await expect(page.getByRole('table', { name: 'Bots in the harness' })).toBeVisible();
+      await page.getByText('Model roles').click();
+      await scan(page, 'content tree and harness');
+      await go(page, '/admin/content?file=content%2Fskills%2Fdocs%2FSKILL.md');
+      await expect(page.getByText('Front matter')).toBeVisible();
+      await scan(page, 'content file, rendered');
+      await page.getByRole('radio', { name: 'Raw' }).click();
+      await scan(page, 'content file, raw');
+      await page.getByRole('button', { name: 'Edit', exact: true }).click();
+      const editor = page.getByLabel('Text of content/skills/docs/SKILL.md');
+      await editor.fill((await editor.inputValue()).replace('tools: "docs.search docs.read"', 'tools: "docs.search docs.read slack.search"'));
+      await scan(page, 'content editor');
+      await page.getByRole('button', { name: 'New file' }).click();
+      await scan(page, 'content, new file form');
+      await page.getByLabel('Path', { exact: true }).fill('content/playbooks/handoff.md');
+      await page.getByRole('button', { name: 'Add to the change' }).click();
+      const tray = page.getByRole('region', { name: 'Changes to propose' });
+      await tray.getByRole('button', { name: 'Check these changes' }).click();
+      await expect(tray.getByRole('heading', { name: 'Check result' })).toBeVisible();
+      await scan(page, 'content tray with a check result');
+    });
+
+    test('admin: policy and content as an auditor, with locked files', async ({ page }) => {
+      await signIn(page, theme, undefined, 'audrey');
+      await go(page, '/admin/policy');
+      await expect(page.getByRole('heading', { name: /^What each bot may do/ })).toBeVisible();
+      await scan(page, 'auditor policy');
+      await go(page, '/admin/content');
+      await expect(page.getByRole('navigation', { name: 'Content files' })).toBeVisible();
+      await scan(page, 'auditor content with locked files');
+      await go(page, '/admin/content?file=content%2Fcontext%2Fproducts%2Froadmap.md');
+      await expect(page.getByRole('navigation', { name: 'Content files' })).toBeVisible();
+      await scan(page, 'auditor following a link to a locked file');
+    });
+
+    test('admin on a phone: policy and content', async ({ page }) => {
+      await page.setViewportSize({ width: 390, height: 844 });
+      await signIn(page, theme, undefined, 'ada');
+      await go(page, '/admin/policy');
+      await expect(page.getByRole('heading', { name: /^What each bot may do/ })).toBeVisible();
+      await scan(page, 'phone policy');
+      await go(page, '/admin/content?file=content%2Fskills%2Fdocs%2FSKILL.md');
+      await expect(page.getByText('Front matter')).toBeVisible();
+      await scan(page, 'phone content file');
+    });
+
     test('admin on a phone: every part', async ({ page }) => {
       await page.setViewportSize({ width: 390, height: 844 });
       await signIn(page, theme, undefined, 'ada');
