@@ -962,19 +962,30 @@ async fn item_draft(
     item: &Approval,
     st: &UserState,
 ) -> Result<Draft, ApiError> {
-    let mut draft = drafts::draft(item, st).ok_or_else(ApiError::not_found)?;
-    draft.sources = match signed
+    let draft = drafts::draft(item, st).ok_or_else(ApiError::not_found)?;
+    let found = match signed
         .toolserver(state)
         .sources(&item.id, signed.handle())
         .await
     {
-        Ok(found) => drafts::sources(found),
-        // The draft is still shown; the app says it can't tell what the bot read.
+        Ok(found) => found,
+        // The draft is still shown, without citations; the app says it can't tell what the
+        // bot read.
         Err(e) => {
             tracing::warn!(error = ?e, draft = %item.id, "sources unavailable");
             Vec::new()
         }
     };
+    let (draft, citations) = drafts::with_sources(draft, item, st, found);
+    if citations.dropped > 0 {
+        // Counts only: never the draft's text or the refs.
+        tracing::info!(
+            draft = %item.id,
+            cited = citations.kept,
+            dropped = citations.dropped,
+            "source markers dropped: not a source this task read"
+        );
+    }
     Ok(draft)
 }
 
@@ -1083,6 +1094,12 @@ async fn put_draft(
 ) -> ApiResult {
     signed.drafts()?;
     let req: EditBody = parse(&body)?;
+    // The PM's text has no source markers (`[[src-…]]` or `[[sN]]`): they are removed
+    // before anything is checked or saved, so an edited draft has no citations.
+    let req = EditBody {
+        title: req.title.as_deref().map(pmos_contract::cite::strip),
+        body: pmos_contract::cite::strip(&req.body),
+    };
     if req.body.chars().count() > MAX_BODY {
         return Err(ApiError::bad_request("The text is too long."));
     }
@@ -1376,6 +1393,7 @@ async fn accept_suggestion(
             Box::new(move |s| {
                 s.suggestions.remove(&key);
                 let title = s.edits.get(&key).and_then(|e| e.title.clone());
+                let body = pmos_contract::cite::strip(&body);
                 s.edits.insert(key, DraftEdit { title, body });
             }),
         )
@@ -1790,7 +1808,8 @@ fn task_out(t: Task, events: Option<&[TaskEvent]>) -> TaskOut {
         bot: t.bot,
         text: t.text,
         status: t.status,
-        result: t.result,
+        // Source markers are for drafts; an answer that has some shows without them.
+        result: t.result.as_deref().map(pmos_contract::cite::strip),
         error: t.error,
         draft_ids: t.approvals,
         created_at: t.created_at,

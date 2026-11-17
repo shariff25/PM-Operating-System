@@ -147,6 +147,10 @@ pub struct ApprovalSource {
     pub url: Option<String>,
     #[serde(rename = "ref")]
     pub reference: String,
+    /// The ref the bot's source markers name this source by (`src-3f9a1c`). A tool server
+    /// from before markers doesn't send it: its drafts have no citations.
+    #[serde(default)]
+    pub cite: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

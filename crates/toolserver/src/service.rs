@@ -1041,6 +1041,8 @@ impl ToolService {
         let mut v = json!({
             "path": doc.path,
             "cite": doc.path,
+            // What a draft's source marker names it by (`[[src-…]]`).
+            "ref": crate::sources::cite_ref(&doc.path),
             "title": doc.title,
             "domain": doc.domain,
             "owner": doc.owner,
@@ -1311,6 +1313,11 @@ impl ToolService {
     /// Run an approved write as `caller`'s PM: through its connector, or, for the bets
     /// register (no connector), here. `writer` is the item's bot or skill; `sensitivity` is
     /// the highest data class the drafting session had read.
+    ///
+    /// Every write goes through here, so this is where draft source markers (`[[src-…]]`,
+    /// `crates/contract/src/cite.rs`) are removed from every string argument: they are for
+    /// the PM's review only and never reach Jira, Confluence, Slack or memory. The stored
+    /// item keeps them, so its `args_hash` and the web app's `version` are unchanged.
     async fn execute_write(
         &self,
         caller: Caller<'_>,
@@ -1320,6 +1327,8 @@ impl ToolService {
         sensitivity: Sensitivity,
         now: DateTime<Utc>,
     ) -> Result<Value, ToolError> {
+        let stripped = pmos_contract::cite::strip_json(args);
+        let args = &stripped;
         if spec.system == "bets" {
             return match spec.action() {
                 "record" => {
@@ -1623,6 +1632,7 @@ impl ToolService {
                     title,
                     url,
                     reference,
+                    cite: crate::sources::cite_ref(entry),
                     tool: spec.name.clone(),
                     read_at: event.at,
                 });

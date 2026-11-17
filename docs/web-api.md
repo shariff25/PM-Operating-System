@@ -89,7 +89,7 @@ document.
 | --- | --- | --- |
 | `GET /api/drafts` | | `{drafts: [DraftSummary]}`, newest first; pending ones, then the 20 most recently decided |
 | `GET /api/drafts/{id}` | | `Draft` |
-| `PUT /api/drafts/{id}` | `{title?, body}` | `Draft`. Saves the PM's edit; nothing is sent to the target system. `409 not_pending` once decided. |
+| `PUT /api/drafts/{id}` | `{title?, body}` | `Draft`. Saves the PM's edit; nothing is sent to the target system. Citation markers in `title` or `body` are removed before it is saved (see **Citations**). `409 not_pending` once decided. |
 | `POST /api/drafts/{id}/changes` | `{instruction}` | `202 {suggestion: Suggestion}`. Asks the bot to revise the draft. One at a time: `409 change_in_progress`. |
 | `GET /api/drafts/{id}/suggestion` | | `{suggestion: Suggestion \| null}` |
 | `POST /api/drafts/{id}/suggestion/accept` | | `Draft`, with the suggested text as its body |
@@ -112,7 +112,7 @@ document.
 
 // Source
 {"id": "s1", "system": "jira", "title": "PAY-212: TCB grace period", "url": "https://… or null",
- "excerpt": null}
+ "excerpt": null, "cited": true}
 
 // Suggestion
 {"status": "working", "instruction": "shorten the risks section", "body": null, "error": null}
@@ -140,11 +140,64 @@ document.
   always `Slack thread in C01` or `Slack message in C01` (Slack text is kept at most 24
   hours, so no title is recorded), and reads from before titles were recorded show the id
   (`PAY-212`, `Confluence page 12345`). `excerpt` is always `null`: no source text is kept.
-  `url` may be `null`.
+  `url` may be `null`. `cited` is true when the body has a citation marker for this source
+  (see **Citations**): the draft relies on it, rather than merely having read it.
 - **`body`** is shown as the bot wrote it, except that a body written entirely on one line
   with the characters `\n` where line breaks belong is shown with real line breaks (and
-  `\t` as tabs). That repair is for display only: approving without an edit sends the bot's
-  own text. Saving an edit (`PUT`) makes what the PM saw the text that is sent.
+  `\t` as tabs), and that the bot's source markers are shown as citation markers (see
+  **Citations**). Both are for display only: approving without an edit sends the bot's own
+  text, from which the tool server removes every marker as it writes. Saving an edit
+  (`PUT`) makes what the PM saw the text that is sent.
+
+### Citations
+
+A bot may end a sentence of a draft with a marker naming a source it read for the task. The
+`body` of a `Draft` carries these as **citation markers**, `[[s3]]`, where `s3` is the `id` of
+a source in the same draft's `sources`. They are placed right after the text they support,
+with no space before them, and several in a row (`[[s1]][[s4]]`) mean several sources.
+
+```json
+{"body": "## Grace period[[s1]]\n\nCustomers get 7 days to pay[[s1]][[s4]], as the pricing principles say.\n\n- Retries stop after the grace period[[s2]].\n\nWrite `[[src-3f9a1c]]` to cite.",
+ "sources": [
+   {"id": "s1", "system": "jira", "title": "PAY-212: TCB grace period", "url": "https://…", "excerpt": null, "cited": true},
+   {"id": "s2", "system": "confluence", "title": "PRD: Billing retries", "url": "https://…", "excerpt": null, "cited": true},
+   {"id": "s3", "system": "slack", "title": "Slack thread in C01", "url": "https://…", "excerpt": null, "cited": false},
+   {"id": "s4", "system": "context", "title": "Pricing principles", "url": null, "excerpt": null, "cited": true}]}
+```
+
+**What the app does.** Render `body` as markdown. In **text nodes only** (never inside inline
+code or code blocks, which the markdown parser already keeps apart), split on the regular
+expression `/\[\[s(\d{1,3})\]\]/g` and render each match as a small marker linked to the
+source with `id` `s` + the digits; its number can simply be those digits (`[[s3]]` → 3, the
+source's position in the list). Markers can appear in paragraphs, list items, headings,
+table cells, emphasis and link text. A marker whose id is not in `sources` cannot happen;
+if it ever does, render nothing for it. `cited` tells which sources to show as used.
+To show the body as plain text (a copy button, the edit box), remove the matches.
+
+**What the server guarantees:**
+
+- Every `[[sN]]` outside code in `body` is one the server put there, for a listed source the
+  task read. The bot writes markers in another form (`[[src-3f9a1c]]`, the ref each read
+  gave it, `crates/contract/src/cite.rs`); only those that name a source in `sources` become
+  `[[sN]]`. Markers naming a source the task did not read (or one past the 20 listed),
+  malformed ones, and any `[[sN]]` the bot wrote itself are removed, cleanly (no double
+  spaces, no space before punctuation), and counted in a log line that carries no text.
+- Text inside inline code and fenced code is left exactly as written: a marker there is
+  code, not a citation, and is never rewritten (so ``Write `[[src-3f9a1c]]` `` stays).
+- Titles are never cited: a marker in the bot's title or summary is removed.
+- A draft with no markers is exactly as before: the same `body`, every `cited` false.
+- With no sources (the tool server can't say, or an older one sends no refs), every marker
+  is removed and nothing is cited.
+- `version` is unchanged by all this: it is still the version of what an approve would send.
+- What is approved never contains a marker: the tool server removes them from every field
+  before writing to Jira, Confluence or Slack, and Slack approval cards and the console
+  show the text without them.
+
+**Edits.** The PM's text has no citations. The edit box should show the body with the
+`[[sN]]` markers removed; a `PUT` removes any marker it is sent anyway (`[[sN]]` or
+`[[src-…]]`, outside code), so an edited draft (`edited: true`) has a `body` with no markers
+and every source `cited: false`. The same holds for an accepted suggestion: `Suggestion.body`
+never has markers, and once accepted the draft is edited. A practice draft never has any.
 
 ## Asking
 
@@ -164,7 +217,8 @@ document.
 
 `status` is `queued`, `working`, `needs_approval`, `done`, `failed` or `cancelled`. A failed
 task carries a plain sentence in `error`. The app polls `GET /api/tasks/{id}` every two
-seconds until the task settles.
+seconds until the task settles. `result` never has citation markers: markers are for
+drafts, and any the bot put in its answer are removed.
 
 - `events` are the human-readable steps only: every event is `kind: "milestone"`, in order,
   each text once (its first time). The runtime's bookkeeping ("queued", "claimed by worker

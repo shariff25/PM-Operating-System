@@ -14,7 +14,7 @@ service and personal agents go through the same server, so they follow the same 
 | A bot calls only its role's tools, and never a `never` action | A bot session's `tools/list` is its role's tools less any write set to `never`; anything else is refused and audited as `denied` (see **Bot sessions**) | D7 |
 | A skill reads nothing above its data class | `context_search` drops results above the skill's `data-class` (a bot session's role's); `context_read` refuses them | Data classes |
 | A team bot reads only what its owner chose | Its Jira, Confluence and Slack reads use its own account and stay inside its `reads` list; anything else is `403`, audited as `denied` | Decision 26 |
-| External content is data, not instructions | Every Jira, Confluence and Slack item comes back wrapped as `{"untrusted": true, "source": …, "content": …}`; `bets_list` and `bets_read` results carry `"untrusted": true` and a note too | Untrusted content |
+| External content is data, not instructions | Every Jira, Confluence and Slack item comes back wrapped as `{"untrusted": true, "ref": …, "source": …, "content": …}` (`ref` is what a draft's source marker names it by; see **Source markers**); `bets_list` and `bets_read` results carry `"untrusted": true` and a note too | Untrusted content |
 | A note is as sensitive as what it was built from | A memory note stores the highest data class its writing session had read, and reading it raises the reader to that (see **Memory**) | Data classes |
 | The Slack bot's token can't act as everyone | It names the PM it acts for unsigned, so it reads one approval item only for that PM, sees no approval ids in the ledger, can't edit where a draft goes, and can't make an admin (see **Who holds which token**) | — |
 | Nothing is written outside PM OS without approval | A write runs only with a matching grant or an inbox approval by its own user; otherwise it returns `pending_approval` and does nothing | OUT-4 |
@@ -124,6 +124,27 @@ item it returned, in `source_titles`: a map from the `sources` entry to the titl
   when empty. Events recorded before 0010 have none, and their sources read as ids, as
   before.
 
+**Source markers.** Each source also has `cite`: `src-` and the first six hex characters of
+the SHA-256 of its audit `sources` entry (`sources::cite_ref("jira:PAY-212")`, a context
+path for a context file). Every item a read tool returns carries the same value as `ref`
+(the connectors' `untrusted` wrapper, and `context.search`/`context.read` results), so a bot
+can end a sentence of a draft with `[[src-3f9a1c]]` to say which source it came from
+(`content/roles/pm-assistant/ROLE.md`; the grammar is in `crates/contract/src/cite.rs`).
+The ref is made from ids only and needs nothing stored; the web app resolves markers
+against this list, so only sources the run really read can be cited (`docs/web-api.md`,
+Citations).
+
+**Markers never reach a target system.** Every approved write runs through
+`ToolService::execute_write`, which removes markers from every string argument
+(`cite::strip_json`) before the connector (or the bets register) sees them: on an inbox
+approve, an edit and a harness grant alike, including an edit from the Slack bot or
+`pmos-web` that keeps every target argument (a page update's `page_id` and `version`) as
+drafted: the target check compares the arguments as stored, and only then are markers removed
+from what is written. Text inside code spans and fenced code is left
+as written. The stored item keeps its markers (they are what the PM reviewed), so its
+`args_hash`, the grant match and the web app's `version` are unchanged. The Slack approval
+cards and the console show the arguments with markers removed too.
+
 Limits: Jira and Confluence links need a linked Atlassian site (else `url` is `null`); a
 read that found nothing, failed or was refused records no sources, so it isn't listed; a
 reference of an unknown shape is left out; memory, the bets register and the stats tools
@@ -146,7 +167,7 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/approvals?user=` | bot token | The App Home Inbox: `{approvals: […], total}`, only `pending` items whatever `status` says, oldest first, at most 50. Each item reads as `GET /internal/approvals/{id}` returns it; `total` counts every pending item. `403` if `user` isn't a team member (live connectors) or is a team bot's identity; `400` without `user` |
 | `GET /internal/approvals/{id}` | service or console token | One item (with a console user assertion, only the subject's own: anyone else's is `404`): `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity` and `redacted_at`; plus, when known, `expires_at`, `target_url` and `external` (see **What an item is shown with**). Listings and decision answers carry the same fields |
 | `GET /internal/approvals/{id}?user=<handle>` | bot or web token | The same item, for the PM the client acts for. `404 {error: "no such approval item"}` without `user`, when `user` isn't a team member, when the item isn't `user`'s, or when there is no such item: the client can't tell which ids exist. With the web token, the user assertion must name `user` |
-| `GET /internal/approvals/{id}/sources?user=` | service or web token | What the run that drafted the item read: `{sources: [{system, title, url, ref, tool, read_at}], available, truncated}`. `user` is required (`400`) and must be the item's user: anyone else's item, or a missing one, is `404`. See **What an item is shown with** |
+| `GET /internal/approvals/{id}/sources?user=` | service or web token | What the run that drafted the item read: `{sources: [{system, title, url, ref, cite, tool, read_at}], available, truncated}`. `user` is required (`400`) and must be the item's user: anyone else's item, or a missing one, is `404`. See **What an item is shown with** |
 | `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?}` | service, bot or web token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. From the bot or web token, an `edit` that changes where the draft goes is `422 target_changed` (see **How a write gets approved**). An internal failure is `500` with a generic `error`. |
 | `GET /internal/ledger?since=&until=&bot=&outcome=&min_edit=&limit=` | service or bot token | `{rows: […]}`, newest first; for the bot token, rows have no `id` (use `run_id`). See **Feedback ledger**. `422` for a bad parameter |
 | `GET /internal/ledger/summary?since=&bot=` | service token | Per bot (or skill) and tool: counts by outcome, label coverage, median edit distance, rejection reasons. `422` for a bad `since` |
