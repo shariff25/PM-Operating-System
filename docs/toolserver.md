@@ -247,6 +247,9 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/admin/protection?user=` | the same | `{configured, branch, required_reviews, verified, source?, github}`: whether `PMOS_CONTENT_BRANCH` requires reviews, as the viewer's token can read it. Best effort, never an error. `view-policies` or `view-content` |
 | `POST /internal/admin/actions?user=` `{action, outcome, detail, count, target?}` | the same | `pmos-web` records an admin refusal or an admin's sensitive read: `200 {recorded: true}`; `503 audit_unavailable` if it can't be recorded (pmos-web then serves nothing) |
 | `POST /internal/admin/events[?user=]` `{action, provider, reason?, attempt?, member?}` | web token only | A sign-in event from `pmos-web`: `web.sign_in` or `web.sign_out` (for the member named as `user=`, with a user assertion for them) or `web.sign_in_refused` (no `user=`). Fixed values only. See **Sign-in events** |
+| `GET /internal/directory` (+ `If-None-Match`) | service or bot token | Every user in the user database, `{version, users: [...]}`, with `ETag: "<version>"`; `304` when it matches. See **The user database's read API** |
+| `GET /internal/users/resolve?by=entra&tid=&oid=` / `?by=sign_in_name&name=` / `?by=handle&handle=` | web or console token, no assertion | One user, or `404`; `429 resolve_misses` past 20 misses a minute. See **The user database's read API** |
+| `POST /internal/users/{handle}/identities/entra` `{tid, oid, sign_in_name}` | web token, no assertion | The first Entra link. See **The user database's read API** |
 
 ### Admin reads
 
@@ -1086,7 +1089,7 @@ The in-memory team drops them at once. Someone who still owns a team bot can't b
 The source of users and roles is moving from `team.yaml` to the tool server's own tables
 (`docs/user-database-spec.md`). Slice U1 builds the store, its database guarantees and the
 host commands. **Nothing decides from it yet:** every service still reads `team.yaml` until
-slices U3-U7 cut them over, and no route reads or writes it (the read API is U2).
+slices U3-U7 cut them over. The read API (slice U2) is below.
 
 **Tables** (migration 0015): `users` (handle, display name, `sign_in_name` for Entra and
 `atlassian_email` as separate columns, GitHub login, status), `user_roles` (`admin`, `pm`,
@@ -1153,6 +1156,64 @@ token; `list`, `export` and the import's dry run show addresses, which the host 
 as a bootstrap) fills the in-memory store at start-up. It is refused with `PMOS_DATABASE_URL`
 or live connectors. With fake connectors only, it may give `evals` its fake Slack id. A seed
 needs an active admin like any import.
+
+### The user database's read API (slice U2)
+
+Three routes read the user database for the other services (`src/app/directory.rs`). Nothing
+calls them yet: the runtime, Slack, web sign-in and the console move to them in slice U4.
+Each route has its own allow-list, checked before anything reads the request; any other
+token is `403`, none is `401`.
+
+| Route | Tokens | Answers |
+| --- | --- | --- |
+| `GET /internal/directory` | service (the runtime), bot (Slack) | `{version, users: [...]}`, every user, deactivated ones included. `ETag: "<version>"` (strong; the database's `directory_version`, bumped by every committed change to users, roles, identities or the pilot exception); `If-None-Match` with it (also `W/"…"`, a list, or `*`) answers `304` with no body. `Cache-Control: private, no-cache` |
+| `GET /internal/users/resolve?by=entra&tid=&oid=` / `?by=sign_in_name&name=` / `?by=handle&handle=` | web, console | One user, or `404 not_found`. `by=sign_in_name` matches the stored lower-case name (`name` is trimmed and lower-cased). A malformed lookup (unknown `by`, a `tid`/`oid` that isn't a GUID, a name that isn't an address, a handle that can't exist) is `422 invalid` and isn't a miss |
+| `POST /internal/users/{handle}/identities/entra` `{tid, oid, sign_in_name}` | web | The first Entra link (below): `200 {first_link, user}` (`first_link: false` when the user already had exactly this key: nothing written) |
+
+**Projections** (fixed in code, tested field by field):
+
+| Client | Fields per user |
+| --- | --- |
+| Service token (`directory`) | `handle`, `display_name`, `status`, `roles` |
+| Bot token (`directory`) | the same and `slack_id` (or `null`) |
+| Web and console (`resolve`, and the link's `user`) | `handle`, `display_name`, `status`, `roles`, `entra` (`none`, `linked`, or `needs_host` for an Admin or Auditor whose link the host hasn't confirmed), `sign_in_name_confirmed`, `dual_role` |
+
+No answer ever carries a sign-in name, an Atlassian email, a GitHub login, a `tid`, an `oid`,
+or an Atlassian or GitHub id; only the Slack bot gets Slack ids; web and the console can't
+list. `roles` are the stored rows: a deactivated user's kept roles grant nothing, so every
+caller checks `status` first. Display names are untrusted text (render as plain text).
+
+**No user assertion.** `resolve` and the first link are how a person gets a session, so there
+is no signed-in subject to assert (spec §2); the routes answer the same in every assertion
+mode and don't read `X-Pmos-Assertion`. What bounds a stolen web or console token instead:
+one user per call, no addresses, and the **miss limit**. Each client may get at most 20
+`404`s in any rolling minute (from `resolve`, and for `pmos-web` from the first-link route);
+past that a miss answers `429 {code: "resolve_misses"}` with `Retry-After`, and hits keep
+being answered. Windows are per client (web and console apart) and in process. Every miss is
+logged with its kind (`entra`, `sign_in_name`, `handle`, `first_link`), never the value; more
+than 100 in an hour from one client logs a warning (the count is what U5's overview will
+show).
+
+**The first Entra link** (spec §7 step 2). One transaction, under the users lock, re-reads the
+directory and checks: the user exists and `sign_in_name` (the token's `preferred_username`,
+never `email`) is their stored sign-in name, else `404 not_found` (a miss, as above); they
+have no Entra identity yet (`409 linked` if a different one; the same key is `200` with
+`first_link: false`); no one else holds the key (`409 taken`); they are active (`403
+not_active`), not the `evals` account (`403 evals_account`), hold neither `admin` nor
+`auditor` (`403 host_only`: the host links those, `set-entra`), and their sign-in name is
+confirmed (`403 sign_in_unconfirmed`: a Slack join waits for an admin's confirmation in the
+web app). Then it stores `(tid, oid)` (lower-case, `host_confirmed` false, `linked_client`
+`link`), a `role_changes` row (`link`, `entra`, by the user through `web`) and the audit event
+`users.identity_link` (`entra`), and the version moves. Two links racing for one key: the
+unique key `(kind, issuer, subject)` lets exactly one commit, and `(handle, kind)` does the
+same for two keys racing for one person; the loser gets `409 taken` or `409 linked`.
+
+**Audited:** a link as `users.identity_link` (`ok`, actor the user, detail `entra`); a refused
+one as `users.identity_link` (`denied`, actor `anonymous`, detail `entra; <code>`, the target
+handle only when that user exists); a conflict (`linked`, `taken`) as
+`users.identity_conflict` (`denied`, detail `entra`). No address, `tid` or `oid` in any event
+or log line. `resolve` and `directory` record no audit events (they are reads that run on
+every sign-in and every poll).
 
 ### Content sync
 
