@@ -1917,10 +1917,13 @@ dependencies = [
  "jsonwebtoken",
  "pmos-assertion",
  "pmos-contract",
+ "pmos-policy",
  "pmos-runtime",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_norway",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "sqlx",
  "tempfile",
@@ -1928,6 +1931,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]

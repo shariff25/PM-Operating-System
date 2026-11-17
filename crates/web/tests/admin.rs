@@ -358,10 +358,20 @@ async fn me_lists_permissions() {
     assert!(p.contains(&"decide-own-approval".to_string()));
     assert!(!p.contains(&"view-audit-log".to_string()));
     let audrey = w.get(&w.login("audrey").await, "/api/me").await;
-    assert_eq!(perms(&audrey), ["view-audit-log", "export-audit"]);
+    // Audit metadata, and the platform's configuration read-only (the policy and content
+    // screens, `admin_proposals.rs`).
+    assert_eq!(
+        perms(&audrey),
+        [
+            "view-audit-log",
+            "export-audit",
+            "view-content",
+            "view-policies"
+        ]
+    );
     let adam = w.get(&w.login("adam").await, "/api/me").await;
     let p = perms(&adam);
-    assert_eq!(p.len(), 18);
+    assert_eq!(p.len(), 21);
     assert!(p.contains(&"manage-connectors".to_string()));
 }
 

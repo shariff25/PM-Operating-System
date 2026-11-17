@@ -58,13 +58,22 @@ async fn main() -> Result<()> {
         tracing::info!("no PMOS_WEB_STATIC_DIR: serving /api only");
     }
     let bind = config.bind;
-    let router = pmos_web::build(
-        config,
-        pmos_web::store_config::deps_from_env()
-            .await
-            .map_err(anyhow::Error::msg)?,
-    )
-    .map_err(anyhow::Error::msg)?;
+    let mut deps = pmos_web::store_config::deps_from_env()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    // The admin policy and content screens. Never logs the GitHub token.
+    deps.admin = pmos_web::admin_config::AdminConfig::from_env(&config.content_root)
+        .map_err(anyhow::Error::msg)?;
+    match &deps.admin.github {
+        Some(g) => {
+            tracing::info!(repo = %g.repo, base = ?g.base, "admin proposals open pull requests")
+        }
+        None => tracing::info!("no PMOS_WEB_GITHUB_REPO: admin proposals answer not_configured"),
+    }
+    if deps.admin.policies_root.is_none() {
+        tracing::info!("no policies root: the policy screen can't compare with checked-in files");
+    }
+    let router = pmos_web::build(config, deps).map_err(anyhow::Error::msg)?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
