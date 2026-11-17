@@ -143,7 +143,7 @@ for (const theme of ['light', 'dark'] as const) {
       await expect(page.locator('.cite-tip')).toHaveText('TCB grace period');
       await scan(page, 'draft, a marker hovered');
       await doc.getByRole('button', { name: /^Source 4:/ }).first().focus();
-      await expect(page.locator('.cite-tip')).toHaveText('Slack thread in C01');
+      await expect(page.locator('.cite-tip')).toHaveText('Slack thread');
       await scan(page, 'draft, a marker focused');
       await page.keyboard.press('Enter');
       await expect(page.getByRole('button', { name: /^Source 4:/ }).and(page.locator('.source'))).toBeFocused();
@@ -167,7 +167,7 @@ for (const theme of ['light', 'dark'] as const) {
       await expect(page.getByRole('dialog')).toBeVisible();
       await scan(page, 'approve dialog');
       await page.getByRole('button', { name: 'Confirm and create' }).click();
-      await expect(page.getByText('Created in Space PM, under Specs.')).toBeVisible();
+      await expect(page.getByText('Created in Space PM, under “Specs”.')).toBeVisible();
       await scan(page, 'draft, approved');
     });
 
@@ -195,7 +195,7 @@ for (const theme of ['light', 'dark'] as const) {
 
     test('home before any brief has run', async ({ page }) => {
       await signIn(page, theme, undefined, 'ana', '?mock_brief=never');
-      await expect(page.getByText(/first brief hasn't arrived yet/)).toBeVisible();
+      await expect(page.getByText(/No brief yet\. Want a morning brief/)).toBeVisible();
       await scan(page, 'home, no brief yet');
       await go(page, '/followups');
       await expect(page.getByText(/your first one has not arrived/)).toBeVisible();

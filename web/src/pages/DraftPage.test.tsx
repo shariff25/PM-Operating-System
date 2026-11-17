@@ -169,7 +169,7 @@ describe('approving', () => {
     open('apr_prd');
     await user.click(await screen.findByRole('button', { name: 'Approve to Confluence' }));
     const confirm = screen.getByRole('dialog', { name: copy.approve.confirmHeading });
-    expect(confirm).toHaveTextContent('create a Confluence page in Space PM, under Specs, under your name (Ana Silva)');
+    expect(confirm).toHaveTextContent('create a Confluence page in Space PM, under “Specs”, under your name (Ana Silva)');
     expect(within(confirm).getByText('PRD: TCB grace period setting')).toBeInTheDocument();
     expect(within(confirm).getByText('Ana Silva', { selector: 'dd' })).toBeInTheDocument();
     const links = within(confirm).getByRole('list', { name: copy.approve.confirmLinks });
@@ -283,7 +283,7 @@ describe('approving', () => {
     expect(screen.getByText(copy.approve.externalWarning)).toBeInTheDocument();
     await user.click(screen.getByRole('checkbox', { name: copy.approve.externalCheckbox }));
     await user.click(send);
-    await screen.findByText(copy.approve.approvedWhere('slack_reply', '#partner-pricing, a channel shared with Acme Corp'));
+    await screen.findByText(copy.approve.approvedWhere('slack_reply', 'A Slack thread'));
     expect(approve).toHaveBeenCalledWith('apr_slack', { confirmExternal: true, version: '1' });
   });
 
@@ -310,7 +310,7 @@ describe('approving', () => {
     const tick = screen.getByRole('checkbox', { name: copy.approve.externalCheckbox });
     await user.click(tick);
     await user.click(screen.getByRole('button', { name: copy.approve.confirmExternalButton }));
-    await screen.findByText(copy.approve.approvedWhere('confluence_page', 'Space PM, under Specs'));
+    await screen.findByText(copy.approve.approvedWhere('confluence_page', 'Space PM, under “Specs”'));
   });
 
   it('says what happened when the server reports expiry, and offers one next step', async () => {
@@ -430,7 +430,7 @@ describe('untrusted draft text (review findings 1, 2 and 5)', () => {
         return a;
       },
     });
-    await screen.findByText(copy.approve.approvedWhere('confluence_page', 'Space PM, under Updates'));
+    await screen.findByText(copy.approve.approvedWhere('confluence_page', 'Space PM, under “Updates”'));
     expect(document.querySelector('a[href^="javascript:"]')).toBeNull();
     expect(screen.getByText(/not a web link/)).toBeInTheDocument();
   });

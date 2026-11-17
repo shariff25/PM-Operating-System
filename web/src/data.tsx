@@ -4,7 +4,7 @@ import type { Brief, DraftSummary, Task } from './api';
 import { messageOf, useApp } from './app-context';
 import { copy } from './copy';
 import { effectiveStatus, sortDrafts } from './drafts';
-import { isDefiniteRefusal } from './errors';
+import { errorText, isDefiniteRefusal } from './errors';
 
 /** 'off' means the brief answered 501 not_built (or failed): follow-ups are hidden everywhere. */
 export type BriefState = 'loading' | 'ready' | 'off';
@@ -129,7 +129,7 @@ export function useAsk() {
         return true;
       } catch (e) {
         // Only a definite refusal says nothing was started; anything else may have gone through.
-        setError(isDefiniteRefusal(e) ? messageOf(e, fallback) : copy.errors.unsureStarted);
+        setError(isDefiniteRefusal(e) ? errorText(e, fallback) : copy.errors.unsureStarted);
         return false;
       } finally {
         setAsking(false);

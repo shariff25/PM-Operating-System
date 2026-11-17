@@ -291,6 +291,17 @@ export function SystemTag({ system, label }: { system: string; label: string }) 
 }
 
 /** The system a draft kind belongs to, for its tag. */
+/** "Open in Slack" next to a target, when the server gave a link to it. */
+export function TargetLink({ target }: { target: { system: string; url: string | null } }) {
+  if (!target.url) return null;
+  return (
+    <ExtLink href={target.url} className="target-link">
+      {copy.draft.openTarget(target.system)}
+      <Icon name="external" size={12} />
+    </ExtLink>
+  );
+}
+
 export function kindSystem(kind: string): string {
   if (kind === 'confluence_page') return 'Confluence';
   if (kind === 'jira_issue') return 'Jira';
