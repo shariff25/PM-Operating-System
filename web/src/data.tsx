@@ -12,6 +12,8 @@ export type BriefState = 'loading' | 'ready' | 'off';
 export interface DataValue {
   drafts: DraftSummary[] | null;
   draftsError: string | null;
+  /** Set when the server left pending drafts out of the list: `total` is how many wait (null if it did not say). */
+  draftsCut: { total: number | null } | null;
   reloadDrafts: () => Promise<void>;
   brief: Brief | null;
   briefState: BriefState;
@@ -37,6 +39,7 @@ export function useData(): DataValue {
 export function DataProvider({ children }: { children: ReactNode }) {
   const { api } = useApp();
   const [drafts, setDrafts] = useState<DraftSummary[] | null>(null);
+  const [draftsCut, setDraftsCut] = useState<{ total: number | null } | null>(null);
   const [draftsError, setDraftsError] = useState<string | null>(null);
   const [brief, setBriefState] = useState<Brief | null>(null);
   const [briefState, setBriefStatus] = useState<BriefState>('loading');
@@ -44,7 +47,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
   const reloadDrafts = useCallback(async () => {
     try {
-      setDrafts(sortDrafts(await api.listDrafts()));
+      const l = await api.listDrafts();
+      setDrafts(sortDrafts(l.drafts));
+      setDraftsCut(l.truncated ? { total: l.total_pending } : null);
       setDraftsError(null);
     } catch (e) {
       setDraftsError(messageOf(e, copy.errors.loadHomeFailed));
@@ -94,6 +99,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     return {
       drafts,
       draftsError,
+      draftsCut,
       reloadDrafts,
       brief,
       briefState,
@@ -104,7 +110,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       pendingCount: (drafts ?? []).filter((d) => effectiveStatus(d, now) === 'pending').length,
       runningCount: (tasks ?? []).filter((t) => t.status === 'queued' || t.status === 'working').length,
     };
-  }, [drafts, draftsError, reloadDrafts, brief, briefState, setBrief, tasks, reloadTasks, upsertTask]);
+  }, [drafts, draftsError, draftsCut, reloadDrafts, brief, briefState, setBrief, tasks, reloadTasks, upsertTask]);
 
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
 }

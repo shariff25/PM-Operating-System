@@ -241,7 +241,10 @@ describe('markers are removed wherever text is plain', () => {
     const user = userEvent.setup();
     const dirty = (a: Api) => {
       const list = a.listDrafts.bind(a);
-      a.listDrafts = async () => (await list()).map((d) => ({ ...d, title: `${d.title}[[s1]]` }));
+      a.listDrafts = async () => {
+        const l = await list();
+        return { ...l, drafts: l.drafts.map((d) => ({ ...d, title: `${d.title}[[s1]]` })) };
+      };
       const get = a.getDraft.bind(a);
       a.getDraft = async (id) => ({ ...(await get(id)), title: 'PRD: TCB grace period setting[[s1]]' });
       return a;

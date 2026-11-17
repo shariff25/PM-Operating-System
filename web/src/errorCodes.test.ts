@@ -17,12 +17,14 @@ function tableRows(): Row[] {
     if (!line.startsWith('|')) continue;
     const cells = line.split(/(?<!\\)\|/).slice(1, -1).map((c) => c.trim());
     if (cells.length < 4) continue;
-    const code = /^`([a-z_]+)`$/.exec(cells[1]!)?.[1];
-    if (!code || code === "code") continue; // the header, the divider, and the row with no body (413)
+    // one code, or several in one cell: "`github_refused`, `github_unavailable`"
+    const codes = /^`[a-z_]+`(, `[a-z_]+`)*$/.test(cells[1]!) ? [...cells[1]!.matchAll(/`([a-z_]+)`/g)].map((m) => m[1]!) : [];
+    if (codes.length === 0 || codes[0] === 'code') continue; // the header, the divider, and the row with no body (413)
     const col = cells[3]!;
+    const code = codes[0]!;
     const nothing = /^\*\*Unknown\*\*/i.test(col) ? 'unknown' : /^Yes on a decision/i.test(col) ? 'decision' : /^Yes\b/i.test(col) ? 'yes' : null;
     expect(nothing, `the "Nothing changed?" cell of ${code}: ${col}`).not.toBeNull();
-    rows.push({ status: cells[0]!, code, nothing: nothing! });
+    for (const c of codes) rows.push({ status: cells[0]!, code: c, nothing: nothing! });
   }
   return rows;
 }

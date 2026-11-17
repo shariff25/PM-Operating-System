@@ -17,8 +17,14 @@ interface Props {
   approving: boolean;
   confirmLabel: string;
   note: ReactNode;
-  /** The server will not post this where it goes (audience_blocked): only rejecting is left. */
+  /** The server will not post this where it goes (audience_blocked): no confirm, only the two real options. */
   blocked?: boolean;
+  /** The server has just answered needs_external_confirm: the external notice says what to do next, as an alert. */
+  externalAsked?: boolean;
+  /** Blocked only: leave the dialog and start rejecting the draft. */
+  onReject?: () => void;
+  /** Blocked only: leave the dialog and ask for a version meant for somewhere else. */
+  onAskElsewhere?: () => void;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -58,6 +64,7 @@ export function ApproveDialog(p: Props) {
     }
   };
 
+  const blocked = p.blocked === true;
   const seen = new Set<string>();
   const links = p.rendered.links.filter((l) => (seen.has(l.href) ? false : (seen.add(l.href), true)));
   const { draft } = p;
@@ -84,6 +91,7 @@ export function ApproveDialog(p: Props) {
         tabIndex={-1}
         onKeyDown={onKey}
       >
+        <div className="modal-scroll">
         <h2 id="confirm-heading">{copy.approve.confirmHeading}</h2>
         <p>{copy.approve.confirmText(draft.kind, draft.target.label, p.name)}</p>
         <dl className="facts">
@@ -107,6 +115,18 @@ export function ApproveDialog(p: Props) {
               </dd>
             </>
           )}
+          {draft.restricted_sources && (
+            <>
+              <dt>{copy.approve.restrictedFact}</dt>
+              <dd className="fact-warn">
+                <Icon name="alert" size={15} className="fact-warn-icon" />
+                <span>
+                  <strong>{copy.approve.restricted}</strong>
+                  <span className="muted block">{copy.approve.restrictedNote}</span>
+                </span>
+              </dd>
+            </>
+          )}
           {markerLine && (
             <>
               <dt>{copy.approve.markerHeading}</dt>
@@ -114,15 +134,6 @@ export function ApproveDialog(p: Props) {
             </>
           )}
         </dl>
-        {draft.restricted_sources && (
-          <div className="note note-warn note-restricted">
-            <Icon name="alert" className="note-icon" />
-            <div className="note-body">
-              <p><strong>{copy.approve.restricted}</strong></p>
-              <p>{copy.approve.restrictedNote}</p>
-            </div>
-          </div>
-        )}
         <h3>{copy.approve.confirmLinks}</h3>
         {links.length === 0 ? (
           <p className="muted">{copy.approve.confirmNoLinks}</p>
@@ -137,10 +148,11 @@ export function ApproveDialog(p: Props) {
           </ul>
         )}
         <StrippedNote parts={p.rendered.stripped} what={copy.stripped.draft} />
-        <p>{draft.practice ? copy.approve.confirmPractice : copy.approve.confirmNothing(draft.kind)}</p>
-        {p.showExternal && (
-          <div className="note note-warn">
+        {!blocked && <p>{draft.practice ? copy.approve.confirmPractice : copy.approve.confirmNothing(draft.kind)}</p>}
+        {p.showExternal && !blocked && (
+          <div className="note note-warn" role={p.externalAsked ? 'alert' : undefined}>
             <p>{copy.approve.externalWarning}</p>
+            {p.externalAsked && <p className="note-next">{copy.approve.errors.needs_external_confirm.next}</p>}
             <label className="check">
               <input type="checkbox" checked={p.externalOk} onChange={(e) => p.onExternalOk(e.target.checked)} />
               {copy.approve.externalCheckbox}
@@ -148,15 +160,27 @@ export function ApproveDialog(p: Props) {
           </div>
         )}
         {p.note}
+        </div>
         <div className="modal-actions">
-          <button
-            type="button"
-            className="btn btn-primary"
-            onClick={p.onConfirm}
-            disabled={p.approving || p.blocked || (p.showExternal && !p.externalOk)}
-          >
-            {p.approving ? copy.approve.confirming(draft.kind) : p.confirmLabel}
-          </button>
+          {blocked ? (
+            <>
+              <button type="button" className="btn btn-primary" onClick={p.onAskElsewhere}>
+                {copy.approve.blockedAsk}
+              </button>
+              <button type="button" className="btn" onClick={p.onReject}>
+                {copy.approve.blockedReject}
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={p.onConfirm}
+              disabled={p.approving || (p.showExternal && !p.externalOk)}
+            >
+              {p.approving ? copy.approve.confirming(draft.kind) : p.confirmLabel}
+            </button>
+          )}
           <button type="button" className="btn" onClick={p.onCancel}>
             {copy.approve.cancel}
           </button>

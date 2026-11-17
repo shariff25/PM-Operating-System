@@ -61,7 +61,7 @@ function DraftRow({ d, now }: { d: DraftSummary; now: number }) {
 /** Every draft, filtered by what it needs: Needs you, Approved, Expired, All. */
 export function Drafts() {
   const { openPalette } = useApp();
-  const { drafts, draftsError, reloadDrafts } = useData();
+  const { drafts, draftsError, draftsCut, reloadDrafts } = useData();
   const [filter, setFilter] = useState<Filter>('pending');
   const tabs = useRef<Record<string, HTMLButtonElement | null>>({});
 
@@ -136,6 +136,7 @@ export function Drafts() {
               {empty}
             </Empty>
           )}
+          {draftsCut && <p className="admin-hint drafts-cut">{copy.draftsPage.truncated(draftsCut.total, count('pending'))}</p>}
           {shown.length > 0 && (
             <div className="table">
               <div className="thead drafts-grid" aria-hidden="true">

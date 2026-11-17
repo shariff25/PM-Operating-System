@@ -80,7 +80,7 @@ describe('real client', () => {
       .mockResolvedValueOnce(json(200, { suggestion: null }))
       .mockResolvedValueOnce(json(202, { suggestion: { status: 'working', instruction: 'x', body: null, error: null } }));
     const api = createRealClient({ fetchImpl });
-    expect(await api.listDrafts()).toEqual([{ id: 'a' }]);
+    expect(await api.listDrafts()).toEqual({ drafts: [{ id: 'a' }], truncated: false, total_pending: null });
     expect(await api.getSuggestion('a')).toBeNull();
     expect((await api.requestChange('a', 'x')).status).toBe('working');
   });

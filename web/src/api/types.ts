@@ -191,6 +191,16 @@ export const SERVER_ERROR_CODES = {
   audience_unavailable: 'yes',
   unavailable: 'yes',
   team_unavailable: 'yes',
+  github_not_linked: 'yes',
+  stale_base: 'yes',
+  invalid: 'yes',
+  policy_mismatch: 'yes',
+  rate_limited: 'yes',
+  not_configured: 'yes',
+  audit_unavailable: 'yes',
+  github_refused: 'yes',
+  github_unavailable: 'yes',
+  github_rate_limited: 'yes',
 } as const satisfies Record<string, 'yes' | 'decision' | 'unknown'>;
 
 /** Codes the server sends. */
@@ -294,12 +304,23 @@ export interface Connector {
   checked_at: string;
 }
 
+/** `GET /api/drafts`: `truncated` only when the tool server left pending drafts out; then `total_pending` says how many wait. */
+export interface DraftList {
+  drafts: DraftSummary[];
+  truncated: boolean;
+  total_pending: number | null;
+}
+
 export interface AdminOverview {
   since: string;
   pending_drafts: number;
   approved: number | null;
   rejected: number | null;
   denied: number | null;
+  /** All three may be missing or null from a tool server older than retention. */
+  retention_days?: number | null;
+  oldest_event_at?: string | null;
+  last_purge?: { at: string; deleted: number } | null;
 }
 
 export class ApiError extends Error {
@@ -326,7 +347,7 @@ export interface Api {
   markHintSeen(seen: HintName): Promise<Me>;
   resetHints(): Promise<Me>;
 
-  listDrafts(): Promise<DraftSummary[]>;
+  listDrafts(): Promise<DraftList>;
   getDraft(id: string): Promise<Draft>;
   saveDraft(id: string, input: { title?: string; body: string }): Promise<Draft>;
   requestChange(id: string, instruction: string): Promise<Suggestion>;
