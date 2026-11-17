@@ -49,7 +49,11 @@ async fn stats_over_the_internal_call_path() {
         f.slack.clone(),
         Arc::new(pmos_toolserver::connectors::fake::FakeConnector::docs()),
     ];
-    f.svc = Arc::new(ToolService::new(catalog, f.stores.clone(), connectors).unwrap());
+    f.svc = Arc::new(
+        ToolService::new(catalog, f.stores.clone(), connectors)
+            .unwrap()
+            .with_open_directory(),
+    );
 
     let cancel = CancellationToken::new();
     let app = router(
@@ -212,7 +216,9 @@ async fn stats_need_no_connector_with_live_connectors() {
         Arc::new(Slack::new(tokens, dead)),
         Arc::new(Docs::new(dead, "docs-token")),
     ];
-    let svc = ToolService::new(catalog, stores, connectors).unwrap();
+    let svc = ToolService::new(catalog, stores, connectors)
+        .unwrap()
+        .with_open_directory();
     let session = svc
         .create_session("ana", "stats-test", "r1", None, now())
         .await

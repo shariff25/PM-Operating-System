@@ -13,7 +13,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
 
 use super::link::{self, EntraLink, LinkError, LinkRefusal, LinkResult, Linked, Planned};
-use super::rules::{self, denied_event, Rules, Write};
+use super::rules::{self, denied_event, Effect, Rules, Write};
 use super::{
     audit_event, Actor, Applied, ChangeKind, Directory, Identity, IdentityKind, Op, PilotException,
     Refusal, RoleChange, RoleGrant, Status, User, UserError, UserResult, UserRole, UserStore, Via,
@@ -266,6 +266,33 @@ async fn execute(conn: &mut PgConnection, writes: &[Write]) -> Result<(), sqlx::
     Ok(())
 }
 
+/// A write's consequence outside the users tables, in its own transaction (§6).
+async fn run_effect(
+    conn: &mut PgConnection,
+    effect: &Effect,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    use crate::pg as store;
+    match effect {
+        Effect::RevokeSessions(h) => {
+            store::revoke_user_sessions(conn, h).await?;
+        }
+        Effect::SuspendCredentials(h) => {
+            store::suspend_credentials(conn, h, now).await?;
+        }
+        Effect::RestoreCredentials(h) => {
+            store::restore_credentials(conn, h).await?;
+        }
+        Effect::DeleteSuspendedCredentials(h) => {
+            store::delete_suspended_credentials(conn, h).await?;
+        }
+        Effect::CloseHeldDrafts(h) => {
+            store::close_owner_drafts(conn, h, now).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn insert_change(conn: &mut PgConnection, c: &RoleChange) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO role_changes (at, actor, client, host_user, target, change, role, detail)
@@ -352,6 +379,11 @@ impl PgStore {
         let dir = load_directory(&mut tx, now).await?;
         let plan = rules::plan(&dir, actor, op, now, &self.users_rules())?;
         execute(&mut tx, &plan.writes).await.map_err(map_db)?;
+        for effect in &plan.effects {
+            run_effect(&mut tx, effect, now)
+                .await
+                .map_err(|e| UserError::Store(e.into()))?;
+        }
         for c in &plan.changes {
             insert_change(&mut tx, c).await.map_err(map_db)?;
         }

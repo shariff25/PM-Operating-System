@@ -1,9 +1,16 @@
 # Runbook: the user database
 
 PM OS is moving who-may-use-it from `content/team.yaml` to the tool server's own database
-(`docs/user-database-spec.md`). **Today (slice U1) nothing reads the database for a decision:**
-every service still reads `team.yaml`. Filling the database now is safe and is the first step
-of the cut-over.
+(`docs/user-database-spec.md`). **Since slice U3 the tool server decides from the database:**
+who may have a session, decide a draft, link an account, read the admin screens, approve a
+join or deactivate someone. The runtime, Slack, the web app and the console still read
+`team.yaml` until slices U4a-d, so **keep both equal**: a join approved in Slack writes both;
+anything you add by hand to `team.yaml`, add here too (`import` picks up new people).
+
+**Before deploying a release with U3, import.** A tool server with an empty user database lets
+nobody in (it logs `the user database is empty` at start-up). On an install that already has
+people in `team.yaml`: deploy, run the import below (with `--allow-admins`, or
+`bootstrap-admin` first), then everything works as before.
 
 Everything here runs on the Spark through `deploy/pmos-admin users …`. Each command runs in a
 one-off tool server container with the database's own access, and records **the OS user who
@@ -87,6 +94,29 @@ deploy/pmos-admin users export --format team-yaml > team.yaml # before a rollbac
 
 `grant-admin --keep-entra` reuses an Entra link the host already confirmed. A deactivated
 admin who comes back is reactivated without `admin`; grant it again on purpose.
+
+## Deactivating someone, and undoing it
+
+Slack's `remove <handle>` (and, from slice U5, the web app's Team page) deactivates; it never
+deletes and commits nothing. In one step: their sessions end, `admin` is taken away if they
+had it, and their linked Jira, Confluence, Slack and GitHub accounts are **suspended** (PM OS
+won't use them). Their pending drafts are **held**. Then:
+
+- **Reactivate within 24 hours** (`deploy/pmos-admin users reactivate <handle>`): the accounts
+  work again and the held drafts can be decided. `admin` doesn't come back: `grant-admin` it
+  on purpose.
+- **After 24 hours** the tool server deletes the accounts and closes the drafts
+  (`owner_deactivated`, nothing is posted). A reactivation then brings the person back, but
+  they link their accounts again.
+- Their personal bot's sandbox keeps idling until `deploy/pmos-admin pause pm-<handle>`.
+
+**The hourly limit.** The web app and Slack together may deactivate at most 3 people in any
+hour (`PMOS_USERS_DEACTIVATIONS_PER_HOUR`, 1 to 10, in `deploy/.env`). The fourth answers
+"PM OS has stopped deactivations for an hour": if that is a real need (a reorganization, a
+compromised account), continue on the host with `deploy/pmos-admin users deactivate`, which
+isn't limited. A sudden run of deactivations you didn't expect is a sign the web app or the
+Slack bot token is compromised: check the overview and the audit log (`users.deactivate`).
+Slack can never deactivate an Admin or Auditor.
 
 ## The pilot exception: one person as Admin and Auditor
 

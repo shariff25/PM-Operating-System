@@ -925,7 +925,7 @@ text as in §8.
 | Threat | How the design answers it |
 | --- | --- |
 | Privilege escalation through onboarding | A request grants nothing. The Slack bot client may create `pm` only; admin is host-only; tested per role and per client. |
-| Stolen Slack bot token | It can approve `pm`-only joins naming a real admin (visible on every admin's card), but those users can't sign in to web until an admin confirms their sign-in name (§4). It can deactivate non-Admin, non-Auditor users, at most 3 an hour (shared with web); credentials are suspended, not deleted, for 24 hours, and drafts are held, so a reactivation undoes it. It can't grant roles, touch addresses, or deactivate an Admin or Auditor. |
+| Stolen Slack bot token | It can approve `pm`-only joins naming a real admin (visible on every admin's card), but those users can't sign in to web until an admin confirms their sign-in name (§4). **Residual:** a user approved through the bot client can use Slack and the team bots (and their own personal bot) at once, before any signed confirmation; the confirmation gates only Microsoft sign-in to the web app. It can deactivate non-Admin, non-Auditor users, at most 3 an hour (shared with web); credentials are suspended, not deleted, for 24 hours, and drafts are held, so a reactivation undoes it. It can't grant roles, touch addresses, or deactivate an Admin or Auditor. |
 | Escalation through a pull request | No file grants anything after cut-over; `team.yaml` is a lint error; the import is a one-time host action. |
 | Compromised web backend | It can sign as any user to the tool server (a known limit of assertions). It **can't grant admin** (host-only), can't change an Admin's or Auditor's addresses or Entra link (host-only), can't remove the last admin (trigger), can't switch the pilot exception, and every change is in `role_changes` and the audit log with `client = web`. It can change other users' roles and deactivate up to 3 people an hour, reversible within the grace (§6); after that, host only. |
 | Compromised console | No write route accepts its token; single-item reads need a signed admin or the item's PM, checked against the database. |
@@ -998,6 +998,42 @@ route's `404`s count against `pmos-web`'s same window; the first link takes no a
 tool server doesn't check `tid` against a configured tenant (it has none outside the host
 commands); `pmos-web` validates it (U4c). The more-than-100-misses-an-hour count is kept in
 process and logged; U5 puts it on the overview.
+
+**U3 is built** on `claude/u3-toolserver-cutover` (migration `0017_users_cutover.sql`:
+`credentials.suspended_at` and the `owner_deactivated` ledger reason; `src/users/access.rs`;
+`tests/users_cutover.rs`; `docs/toolserver.md` "The tool server decides from the user
+database" and "Deactivation"). The tool server reads no `team.yaml` for any decision; the
+runtime, Slack, `pmos-web` and the console still do (U4a–d). Where it differs from the text
+above:
+- **No cut-over flag.** §3's `PMOS_USERS_SOURCE=database` was not built: there is no live
+  install with users, and two code paths in every check would be the larger risk. The
+  database is the only source in the tool server from U3; an empty database refuses everyone
+  (the server logs a warning at start-up), so step 4 of the real-install order is "import,
+  then deploy U3" rather than "turn on the flag".
+- **Onboarding still commits `team.yaml`** with the personal bot until U7: the other services
+  read it, and `pmos lint`'s `bot-owner-unknown` checks bot owners against it. The database
+  write comes first and decides; a failed commit leaves the user active and the request
+  `approved` with `commit: null` and the error (the retry route is U5's).
+- **The orchestrator token is unsigned too:** a join it approves is `pm` only, like the Slack
+  bot's, and its `remove` is capped and recorded with client `bot`.
+- **Who may use PM OS** is "active and holding `pm`, `reviewer` or `admin`" for sessions,
+  decisions and links, the same set as the audience insiders: an auditor-only person gets no
+  MCP session.
+- **A deactivation's sessions** are deleted in its transaction (so a host command ends them
+  too), and an open session also re-checks the user on each call through a cache of at most
+  5 seconds that a write through the server empties; the cache is not keyed by
+  `directory_version`.
+- **Reactivation after the grace** deletes the suspended credentials and closes the held drafts
+  itself, whether or not the sweeper ran first.
+- **The overview's flags** are in `users` on `GET /internal/admin/overview`: conflicts count
+  `users.identity_conflict` events of the last 7 days; the resolve-miss warning counts U2's
+  misses per client in the tool server process (`ResolveMisses`, fed by U2's routes).
+- **Atlassian and GitHub unlink** (removing the `atlassian`/`github` identity so another
+  account can be linked) is not built: the orchestrator's credential unlink deletes the token
+  but keeps the identity, by design. U5's admin unlink must remove the identity.
+- **Dev stacks:** `scripts/claude-test-stack.sh` seeds from the stack's own `team.yaml`; the
+  eval stack adds `eval-admin` (U0EVALADM, in no fake channel) to its `team.yaml` and seeds from
+  it; CI smoke imports `deploy/test/ci-users.yaml` with `--bootstrap` beside `pmos member add`.
 
 U4a–U4d run in parallel (U4b after U3, since `remove` calls U3's deactivation). U5 and U6 can
 overlap once the routes in U5 are merged.

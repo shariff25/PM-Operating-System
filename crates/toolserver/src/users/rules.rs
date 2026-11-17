@@ -78,6 +78,23 @@ pub enum Touched {
     Everyone,
 }
 
+/// A change outside the users tables that a write makes in the same transaction (Postgres) or
+/// right after it (in memory): a deactivation's and a reactivation's consequences (§6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    /// End every MCP session of the person.
+    RevokeSessions(String),
+    /// Suspend every linked account of the person: never unsealed until restored.
+    SuspendCredentials(String),
+    /// A reactivation within the grace: the accounts work again.
+    RestoreCredentials(String),
+    /// The grace is over: delete the suspended accounts.
+    DeleteSuspendedCredentials(String),
+    /// The grace is over: close the person's pending drafts as the system (`rejected`, ledger
+    /// reason `owner_deactivated`); no write runs.
+    CloseHeldDrafts(String),
+}
+
 /// One audit event a write records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserEvent {
@@ -95,6 +112,8 @@ pub struct Plan {
     pub events: Vec<UserEvent>,
     pub lines: Vec<String>,
     pub touched: Touched,
+    /// What else the write does, outside the users tables.
+    pub effects: Vec<Effect>,
     /// The directory after the writes (the in-memory store commits it).
     pub next: Directory,
 }
@@ -454,6 +473,7 @@ pub(crate) struct Builder<'a> {
     events: Vec<UserEvent>,
     pub(crate) lines: Vec<String>,
     touched: Touched,
+    effects: Vec<Effect>,
 }
 
 impl<'a> Builder<'a> {
@@ -467,6 +487,7 @@ impl<'a> Builder<'a> {
             events: Vec::new(),
             lines: Vec::new(),
             touched: Touched::People(BTreeSet::new()),
+            effects: Vec::new(),
         }
     }
 
@@ -707,6 +728,7 @@ impl<'a> Builder<'a> {
             events: self.events,
             lines: self.lines,
             touched: self.touched,
+            effects: self.effects,
             next,
         })
     }
@@ -1096,6 +1118,11 @@ pub fn plan(
             row.deactivated_by = Some(actor.name.clone());
             b.update(row);
             b.change(handle, ChangeKind::Deactivate, None, None);
+            // §6: sessions end and linked accounts are suspended in the same transaction;
+            // they are deleted after the grace unless the person is reactivated first.
+            b.effects.push(Effect::RevokeSessions(handle.clone()));
+            b.effects.push(Effect::SuspendCredentials(handle.clone()));
+            b.change(handle, ChangeKind::SuspendCredentials, None, None);
             // Review item 1: deactivation revokes admin; reactivation never restores it.
             if user.has(UserRole::Admin) {
                 b.revoke(handle, UserRole::Admin, Some("on deactivation"));
@@ -1104,8 +1131,16 @@ pub fn plan(
                     "`{handle}` was an admin: admin is revoked, and reactivation won't restore it"
                 ));
             }
-            b.event("users.deactivate", handle, vec![]);
-            b.lines.push(format!("`{handle}` deactivated"));
+            b.event(
+                "users.deactivate",
+                handle,
+                vec!["credentials suspended".into()],
+            );
+            b.lines.push(format!(
+                "`{handle}` deactivated: their sessions ended and their linked accounts are suspended; \
+                 reactivating within {}h restores them",
+                super::CREDENTIAL_GRACE_HOURS
+            ));
         }
         Op::Reactivate { handle } => {
             match actor.via {
@@ -1124,13 +1159,39 @@ pub fn plan(
             if user.active() {
                 return Err(refused(Refusal::Unchanged, format!("`{handle}` is active")));
             }
+            let within_grace = user
+                .deactivated_at
+                .is_some_and(|at| now < at + super::credential_grace());
             let mut row = user.clone();
             row.status = Status::Active;
             row.deactivated_at = None;
             row.deactivated_by = None;
             b.update(row);
             b.change(handle, ChangeKind::Reactivate, None, None);
-            b.event("users.reactivate", handle, vec![]);
+            if within_grace {
+                b.effects.push(Effect::RestoreCredentials(handle.clone()));
+                b.event(
+                    "users.reactivate",
+                    handle,
+                    vec!["credentials restored".into()],
+                );
+            } else {
+                // After the grace: the accounts and held drafts are gone, whether or not the
+                // sweeper got to them first.
+                b.effects
+                    .push(Effect::DeleteSuspendedCredentials(handle.clone()));
+                b.effects.push(Effect::CloseHeldDrafts(handle.clone()));
+                b.change(handle, ChangeKind::DeleteCredentials, None, None);
+                b.event(
+                    "users.reactivate",
+                    handle,
+                    vec!["credentials deleted".into()],
+                );
+                b.lines.push(format!(
+                    "`{handle}` was deactivated more than {}h ago: their accounts must be linked again",
+                    super::CREDENTIAL_GRACE_HOURS
+                ));
+            }
             b.lines.push(format!(
                 "`{handle}` reactivated with their kept roles (never admin: grant-admin on the host)"
             ));
@@ -1229,6 +1290,85 @@ pub fn plan(
             b.lines.push("pilot exception off".into());
         }
         Op::Import(req) => super::import::plan_import(&mut b, req, rules)?,
+        Op::LinkAccount {
+            handle,
+            kind,
+            subject,
+        } => {
+            if actor.via != Via::Link || actor.name != *handle {
+                return Err(refused(
+                    Refusal::Invalid,
+                    "an account link is the person's own OAuth sign-in",
+                ));
+            }
+            if !matches!(kind, IdentityKind::Atlassian | IdentityKind::Github) {
+                return Err(refused(
+                    Refusal::Invalid,
+                    "only Atlassian and GitHub accounts link this way",
+                ));
+            }
+            let user = b.need(handle)?;
+            if !user.active() {
+                return Err(refused(
+                    Refusal::NotActive,
+                    format!("`{handle}` is deactivated"),
+                ));
+            }
+            let subject = subject.trim();
+            if subject.is_empty() || subject.len() > 128 || subject.chars().any(char::is_control) {
+                return Err(refused(Refusal::Invalid, "not an account id"));
+            }
+            match user.identity(*kind) {
+                Some(i) if i.subject == subject => {
+                    return Err(refused(
+                        Refusal::Unchanged,
+                        "that account is already the linked one",
+                    ))
+                }
+                Some(_) => {
+                    return Err(refused(
+                        Refusal::DifferentAccount,
+                        format!(
+                            "`{handle}` linked a different {} account first: an admin unlinks it before another can be linked",
+                            if *kind == IdentityKind::Atlassian { "Atlassian" } else { "GitHub" }
+                        ),
+                    ))
+                }
+                None => {}
+            }
+            b.link(handle, *kind, "", subject, false);
+            b.event("users.identity_link", handle, vec![kind.as_str().into()]);
+            b.lines
+                .push(format!("`{handle}`: {} account linked", kind.as_str()));
+        }
+        Op::EndGrace { handle } => {
+            if actor.via != Via::System {
+                return Err(refused(Refusal::Invalid, "the sweeper is the system's"));
+            }
+            let user = b.need(handle)?;
+            let due = !user.active()
+                && user
+                    .deactivated_at
+                    .is_some_and(|at| at + super::credential_grace() <= now);
+            if !due {
+                return Err(refused(
+                    Refusal::NotDue,
+                    format!("`{handle}` isn't past the grace after a deactivation"),
+                ));
+            }
+            b.effects
+                .push(Effect::DeleteSuspendedCredentials(handle.clone()));
+            b.effects.push(Effect::CloseHeldDrafts(handle.clone()));
+            b.change(handle, ChangeKind::DeleteCredentials, None, None);
+            b.event(
+                "users.deactivate",
+                handle,
+                vec!["credentials deleted".into()],
+            );
+            b.lines.push(format!(
+                "`{handle}`: linked accounts deleted and held drafts closed"
+            ));
+        }
     }
     b.finish(rules)
 }

@@ -8,6 +8,10 @@
 
 use super::{HostUser, IdentityKind, Refusal, UserRole};
 
+/// The marker on an audit-log read (or export) by a person holding Admin and Auditor under
+/// the pilot exception (§6).
+pub const DUAL_ROLE: &str = "dual_role admin+auditor";
+
 /// The audit detail: `host_user <name>` (when given) and `parts`, joined by `"; "`.
 pub fn join(host_user: Option<&HostUser>, parts: &[String]) -> Option<String> {
     let all: Vec<String> = host_user
@@ -74,7 +78,7 @@ fn role_token(t: &str) -> bool {
 }
 
 fn is_safe_part(part: &str) -> bool {
-    const FIXED: [&str; 11] = [
+    const FIXED: [&str; 13] = [
         "off",
         "bootstrap",
         "sign_in_name",
@@ -84,6 +88,8 @@ fn is_safe_part(part: &str) -> bool {
         "sign_in unconfirmed",
         "credentials suspended",
         "credentials deleted",
+        "credentials restored",
+        DUAL_ROLE,
         "host",
         "on deactivation",
     ];

@@ -45,7 +45,7 @@ use crate::memory::{valid_key, MemoryError};
 use crate::schemas::{changed_target, check_args};
 use crate::session::{bot_identity, token_hash, valid_handle, Session};
 use crate::store::{StoreError, Stores};
-use crate::team::Team;
+use crate::users::access::{by_slack_id, may_use, People};
 
 pub const DEFAULT_SESSION_TTL_MINUTES: i64 = 60;
 const DEFAULT_LIMIT: usize = 5;
@@ -132,7 +132,8 @@ pub enum SessionError {
     InvalidUser(String),
     #[error("run_id must be 1–128 characters")]
     InvalidRun,
-    #[error("`{0}` is not in team.yaml")]
+    /// Not an active PM OS user who may use it (`users::access::may_use`).
+    #[error("`{0}` is not an active PM OS user")]
     NotAMember(String),
     /// A personal bot serves its owner only.
     #[error("`{bot}` is {owner}'s personal bot; only {owner} can use it")]
@@ -169,8 +170,8 @@ pub enum DecisionError {
     /// The item's bot is gone, its role lost the tool, or it is now set to `never`.
     #[error("the item's bot may no longer use `{0}`")]
     BotNotAllowed(String),
-    /// Only people in `team.yaml` decide approvals (when it is enforced).
-    #[error("`{0}` is not in team.yaml, so they can't decide approvals")]
+    /// Only active PM OS users decide approvals; a deactivated owner's drafts are held.
+    #[error("`{0}` is not an active PM OS user, so they can't decide approvals")]
     NotAMember(String),
     #[error("invalid arguments: {0}")]
     InvalidArgs(String),
@@ -207,8 +208,13 @@ pub enum DecisionError {
 /// The `409` code of a decision refused because the draft changed since it was shown.
 pub const STALE: &str = "stale";
 
+/// The audit note of a decision by someone who may not use PM OS (not a user, deactivated,
+/// or auditor-only): a deactivated owner's drafts are held this way.
+pub const NOT_A_MEMBER_DECISION: &str = "decision by someone who isn't an active PM OS user";
+
 /// What the audience check found, for the decision's answer: how many can see the channel,
-/// how many of them aren't in `team.yaml`, and whether it is shared outside the company.
+/// how many of them aren't on the product team (active users holding `pm`, `reviewer` or
+/// `admin`), and whether it is shared outside the company.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudienceSummary {
     pub members: usize,
@@ -371,7 +377,8 @@ pub struct ToolService {
     roster: RwLock<Arc<Roster>>,
     stores: Stores,
     connectors: HashMap<String, Arc<dyn Connector>>,
-    team: Arc<Team>,
+    /// The user directory every decision reads (`users::access`).
+    people: Arc<People>,
     stale_after_days: i64,
     /// The content repo's `HEAD`, read at load and on every reindex, for the ledger.
     content_sha: RwLock<Option<String>>,
@@ -430,9 +437,9 @@ impl ToolService {
             roster: RwLock::new(Arc::new(catalog.roster().clone())),
             content_sha: RwLock::new(catalog.content_sha().map(String::from)),
             catalog,
+            people: Arc::new(People::new(stores.users.clone())),
             stores,
             connectors,
-            team: Team::open(),
             stale_after_days: pmos_contract::lint::DEFAULT_STALE_AFTER_DAYS,
             ledger_expire_days: DEFAULT_EXPIRE_DAYS,
             invalid_drafts: Mutex::default(),
@@ -478,14 +485,24 @@ impl ToolService {
         self.content_sha.read().expect("content sha lock").clone()
     }
 
-    /// Only people in `team` may have sessions (when it is enforced).
-    pub fn with_team(mut self, team: Arc<Team>) -> Self {
-        self.team = team;
+    /// Tests only: any valid handle may use PM OS unless the directory says otherwise
+    /// ([`People::open`]).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_open_directory(mut self) -> Self {
+        self.people = Arc::new(People::open(self.stores.users.clone()));
         self
     }
 
-    pub fn team(&self) -> &Arc<Team> {
-        &self.team
+    /// Decide from `people` (shared with account linking, so they share one cache). It must
+    /// read the same user store as the service's own stores.
+    pub fn with_people(mut self, people: Arc<People>) -> Self {
+        self.people = people;
+        self
+    }
+
+    /// The user directory the service decides from.
+    pub fn people(&self) -> &Arc<People> {
+        &self.people
     }
 
     /// Readiness: storage answers within a second, and every connector's own dependency
@@ -544,7 +561,7 @@ impl ToolService {
     }
 
     /// Rebuild the context index from the content repo checkout at `content_root`, after a
-    /// merge, and reload `team.yaml`, the bots and their roles. Content that fails `pmos lint`
+    /// merge, and reload the bots and their roles (users and roles are in the database). Content that fails `pmos lint`
     /// is refused and everything is left as it was. Skill and tool registry changes take
     /// effect on the next restart.
     pub async fn reindex(
@@ -562,9 +579,6 @@ impl ToolService {
                 .map(|d| format!("  {}: {}: {}", d.code, d.path, d.message))
                 .collect();
             return Err(ReindexError::Lint(lines.join("\n")));
-        }
-        if let Err(e) = self.team.reload() {
-            return Err(ReindexError::Lint(format!("  team.yaml: {e}")));
         }
         // Live sessions pick up the new roles and settings on their next call.
         *self.roster.write().expect("roster lock") = Arc::new(Roster::from_report(&report));
@@ -618,7 +632,7 @@ impl ToolService {
         if !valid_handle(user) {
             return Err(SessionError::InvalidUser(user.to_string()));
         }
-        if !self.team.allows(user) {
+        if !self.people.allows(user).await? {
             return Err(SessionError::NotAMember(user.to_string()));
         }
         if self.catalog.skill(skill).is_none() {
@@ -665,7 +679,7 @@ impl ToolService {
         if !valid_handle(user) {
             return Err(SessionError::InvalidUser(user.to_string()));
         }
-        if !self.team.allows(user) {
+        if !self.people.allows(user).await? {
             return Err(SessionError::NotAMember(user.to_string()));
         }
         let (found, _) = self
@@ -696,18 +710,28 @@ impl ToolService {
 
     /// The live session for `token`. A session whose skill or bot is no longer in the content
     /// (it changed since the session was created), or whose personal bot changed owner, is
-    /// treated as gone.
+    /// treated as gone; so is one whose user may no longer use PM OS (deactivated, or no
+    /// longer holding a role that may), re-checked on every call against a directory at most
+    /// 5 seconds old (a deactivation here also ends the sessions in its own transaction).
     pub async fn session(
         &self,
         token: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<Session>, StoreError> {
-        Ok(self
+        let Some(session) = self
             .stores
             .sessions
             .get(token, now)
             .await?
-            .filter(|s| self.policy(s).is_some()))
+            .filter(|s| self.policy(s).is_some())
+        else {
+            return Ok(None);
+        };
+        if !self.people.allows_cached(&session.user).await? {
+            tracing::info!(user = %session.user, "session refused: the user may no longer use PM OS");
+            return Ok(None);
+        }
+        Ok(Some(session))
     }
 
     pub async fn revoke_session(&self, token: &str) -> Result<bool, StoreError> {
@@ -1631,12 +1655,10 @@ impl ToolService {
         if item.args["channel"].as_str() != Some(t.channel.as_str()) {
             return None;
         }
-        let with = t
-            .conversation
-            .peer
-            .as_deref()
-            .and_then(|p| self.team.by_slack_id(p))
-            .map(|m| m.handle);
+        let with = t.conversation.peer.as_deref().and_then(|p| {
+            let dir = self.people.snapshot()?;
+            by_slack_id(&dir, p).map(|u| u.handle.clone())
+        });
         Some(json!({
             "kind": t.conversation.kind,
             "name": t.conversation.name,
@@ -1937,10 +1959,9 @@ impl ToolService {
             output_ref: Some(item.id),
             detail: Some(why.to_string()),
         };
-        if !self.team.allows(decided_by) {
+        if !self.people.allows(decided_by).await? {
             if let Ok(Some(item)) = self.stores.approvals.get(id).await {
-                self.audit(denied(item, "decision by someone not in team.yaml"))
-                    .await;
+                self.audit(denied(item, NOT_A_MEMBER_DECISION)).await;
             }
             return Err(DecisionError::NotAMember(decided_by.to_string()));
         }
@@ -2136,7 +2157,7 @@ impl ToolService {
                 output_ref: Some(item.id.clone()),
                 detail,
             };
-        if !self.team.allows(user) {
+        if !self.people.allows(user).await? {
             return Err(DecisionError::NotAMember(user.to_string()));
         }
         let Some(current) = self.stores.approvals.get(id).await? else {
@@ -2208,7 +2229,9 @@ impl ToolService {
     /// Who can see the channel a Slack write is for, checked with the PM's own token before
     /// it posts (`docs/slack-reply-spec.md` §3). In order:
     /// 1. a draft built from restricted sources (or from unrecorded ones) is blocked if anyone
-    ///    in the channel isn't in `team.yaml`, or the channel is shared outside the company;
+    ///    in the channel isn't on the product team (an active user holding `pm`, `reviewer`
+    ///    or `admin`: a deactivated or auditor-only person is an outsider), or the channel is
+    ///    shared outside the company;
     /// 2. an externally shared channel needs `confirm_external`;
     /// 3. otherwise the write goes ahead.
     ///
@@ -2262,10 +2285,22 @@ impl ToolService {
                 return Err(DecisionError::AudienceUnavailable(why));
             }
         };
+        // Fail closed: no directory, no write.
+        let dir = match self.people.directory().await {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.audit(event(
+                    Outcome::Error,
+                    format!("{AUDIENCE_UNAVAILABLE}: users unavailable"),
+                ))
+                .await;
+                return Err(DecisionError::AudienceUnavailable(e.to_string()));
+            }
+        };
         let counted = audience
             .members
             .iter()
-            .filter(|m| self.team.by_slack_id(m).is_none())
+            .filter(|m| !by_slack_id(&dir, m).is_some_and(may_use))
             .count();
         // Members past the cap weren't read: count them as at least one outsider.
         let outsiders = counted.max(usize::from(audience.truncated));
@@ -2281,7 +2316,7 @@ impl ToolService {
             self.audit(event(
                 Outcome::Denied,
                 format!(
-                    "{AUDIENCE_BLOCKED}: {outsiders} not in team.yaml, external: {}",
+                    "{AUDIENCE_BLOCKED}: {outsiders} not on the product team, external: {}",
                     audience.external
                 ),
             ))
@@ -2338,6 +2373,48 @@ impl ToolService {
     /// The Slack draft sweep (`docs/slack-reply-spec.md` §3), run every 10 minutes: undecided
     /// drafts past `PMOS_SLACK_DRAFT_TTL_HOURS` expire, and decided ones lose their text that
     /// long after their decision. The posted copy lives in Slack.
+    /// The deactivation sweeper (`docs/user-database-spec.md` §6): for each person
+    /// deactivated at least [`crate::users::CREDENTIAL_GRACE_HOURS`] ago who still has linked
+    /// accounts or pending drafts, delete the accounts and close the drafts as the system
+    /// (`rejected`, ledger reason `owner_deactivated`; no write runs), recorded. Returns how
+    /// many people it cleaned up. Fails closed: with the database unavailable it does nothing.
+    pub async fn sweep_deactivated(&self, now: DateTime<Utc>) -> Result<usize, StoreError> {
+        let dir = self.stores.users.directory(now).await?;
+        let mut done = 0;
+        for u in dir.users.values().filter(|u| {
+            !u.active()
+                && u.deactivated_at
+                    .is_some_and(|at| at + crate::users::credential_grace() <= now)
+        }) {
+            let linked = !self.stores.credentials.list(&u.handle).await?.is_empty();
+            let held = !self
+                .stores
+                .approvals
+                .list(&u.handle, Some(crate::approvals::Status::Pending))
+                .await?
+                .is_empty();
+            if !linked && !held {
+                continue;
+            }
+            let op = crate::users::Op::EndGrace {
+                handle: u.handle.clone(),
+            };
+            match self
+                .people
+                .apply(&crate::users::Actor::system(), op, now)
+                .await
+            {
+                Ok(_) => {
+                    done += 1;
+                    tracing::info!(user = %u.handle, "grace over: linked accounts deleted, held drafts closed");
+                }
+                Err(crate::users::UserError::Store(e)) => return Err(e),
+                Err(e) => tracing::warn!(user = %u.handle, error = %e, "grace clean-up refused"),
+            }
+        }
+        Ok(done)
+    }
+
     pub async fn sweep_slack_drafts(&self, now: DateTime<Utc>) -> Result<Swept, StoreError> {
         let expired = self.expire_drafts(now).await?;
         let redacted = self

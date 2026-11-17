@@ -131,28 +131,37 @@ source: "pm-ana, task 0d3f…"   # the bot (or skill) and the run id that wrote 
 - **`POST /internal/members/requests {slack_id, email, name}`:**
   - **Answer:** `201 {request}`, or `200 {request}` with the existing request if one is still
     pending for that Slack id.
-  - **Proposed handle:** `propose_handle(email, name, taken)`, where `taken` covers the handles
-    in `team.yaml` and in pending requests.
+  - **Proposed handle:** `propose_handle(email, name, taken)`, where `taken` covers every
+    handle in the user database (deactivated people's too) and in pending requests.
   - **Refusals:**
-    - `409 {code: "already_member"}` if the Slack id is in `team.yaml`;
+    - `409 {code: "already_member"}` if the Slack id is an active user's in the user database;
+    - `409 {code: "deactivated"}` if it is a deactivated user's ("your access was turned off;
+      ask a platform owner"), not a new request;
     - `422 {code: "bad_request"}` for an invalid Slack id or email;
     - `429 {code: "too_many_pending"}` past 20 pending requests.
 - **`GET /internal/members/requests?status=pending`** returns `{requests: [...]}`.
 - **`POST /internal/members/requests/{id}/decision {decision: "approve"|"reject", decided_by,
   handle?, roles?}`:**
-  - **Who may decide:** `decided_by` must be an `admin` in `team.yaml`, or the answer is `403`.
+  - **Who may decide:** `decided_by` must be an active `admin` in the user database
+    (`docs/user-database-spec.md`, since slice U3), or the answer is `403 not_admin`.
   - **Already decided:** `409 {code: "already_decided", request}`.
   - **`reject`:** the status becomes `rejected`.
   - **`approve`:**
     1. **Check the handle.** `handle` defaults to `proposed_handle` and must pass
        `valid_new_handle` and be unused; otherwise `422 {code: "bad_handle"}`. `roles`
-       defaults to `[pm]`. From the Slack bot's token, `roles` may hold `pm` and
-       `skill-author` only: `admin` is `403`, and a new admin is added by a pull request to
-       `team.yaml`. The bot never sends `roles`, and its card says so.
-    2. **Check the approver's GitHub.** The admin needs a linked GitHub account with push
-       access to `PMOS_CONTENT_REPO`. If not, the answer is
-       `409 {code: "github_not_linked"}` or `{code: "no_push"}`, and the request stays pending.
-    3. **Commit two files in one commit, with the admin's token, on `PMOS_CONTENT_BRANCH`:**
+       defaults to `[pm]` and may be `pm` only (both tokens name the admin unsigned): `admin`
+       is `403 {code: "admin_not_from_slack"}`, any other role `403 {code:
+       "role_not_from_slack"}`, audited, the request still pending. Only `grant-admin` on the
+       host makes an admin. The bot never sends `roles`, and its card says so.
+    2. **Create the user in the database** (since slice U3): `active`, `pm`, the Slack
+       identity, the request's email as the Microsoft sign-in name (**unconfirmed**: no Entra
+       first link until an admin confirms it in the web app) and the Atlassian email. The
+       person can use PM OS at once. An address that belongs to another user is `409
+       already_member`; nothing is written.
+    3. **Commit the personal bot in one commit, with the admin's token, on
+       `PMOS_CONTENT_BRANCH`** (the admin needs a linked GitHub account with push access to
+       `PMOS_CONTENT_REPO`). Until slice U7 retires it, the commit also adds the member to
+       `team.yaml`, which the runtime, Slack, the web app and the lint still read:
        - `{dir}/team.yaml`: the current file at the branch head, rendered with
          `render_team_yaml` and the new member (`handle`, `slack-id`, `email`, `roles`);
        - `{dir}/bots/pm-<handle>/BOT.md` from `render_personal_bot`.
@@ -170,19 +179,26 @@ source: "pm-ana, task 0d3f…"   # the bot (or skill) and the run id that wrote 
        (`team-*`). The commit message is `Add <handle> to PM OS` with the trailer
        `Approved-by: <admin> (Slack, request <id>)`.
     4. **Answer** `200 {request}`: the status becomes `approved`, with `handle` and `commit` (the
-       sha). The in-memory team already includes the new member when this answer is sent, so
-       the welcome checklist's `oauth/.../start` and `onboarding` calls work at once. Then sync
-       the content checkout (below).
-    5. **If the commit fails** for any other reason, the status becomes `failed` with a readable
-       `error`, and the answer is `502 {request}`.
+       sha). The user database already holds the new member, so the welcome checklist's
+       `oauth/.../start` and `onboarding` calls work at once. Then sync the content checkout
+       (below).
+    5. **If the commit doesn't happen** (no linked GitHub, no push access, the branch keeps
+       moving, GitHub fails), access doesn't wait for it: the status is still `approved`,
+       `commit` is null, `error` says why the personal bot is missing, and the answer is `200`.
+       An admin retries the bot later (U5).
 - **`POST /internal/members/{handle}/remove {decided_by}`:** admin only, and an admin may not
-  remove themselves.
-  1. Commit `team.yaml` without the member, and delete their `pm-<handle>` `BOT.md` and its two
-     policy files (git data API, with `sha: null` in the tree). The member is gone from the
-     in-memory team when the answer is sent.
-  2. Then unlink all their credentials and delete their memory-repo record. The repo itself is
-     theirs and is left alone.
-  3. Answer `200 {handle, commit}`, or `404` if they aren't a member.
+  remove themselves. Since slice U3 it is a **deactivation** and commits nothing
+  (`docs/user-database-spec.md` §6, `docs/toolserver.md` "Deactivation"):
+  1. In one transaction: status `deactivated`, `admin` revoked if held (never restored by a
+     reactivation), their MCP sessions ended, their linked accounts suspended (never
+     unsealed). Their pending drafts are held. The memory-repo record and the bot files stay.
+  2. After 24 hours, unless reactivated (web or host), the accounts are deleted and the held
+     drafts closed (`owner_deactivated`).
+  3. Answer `200 {handle, deactivated: true, commit: null, note}`; the note says the personal
+     bot's sandbox keeps idling until `pmos-admin pause pm-<handle>`. Refused: `404` if they
+     aren't a user, `409 owns_bots`, `403 protected_not_from_slack` (an Admin or Auditor),
+     `429 deactivation_limit` (more than 3 an hour from web and Slack together; the host
+     command still works), `409 already_deactivated`.
 - **`GET /internal/onboarding?user=<handle>`**, or `?slack_id=` for someone not yet a member,
   returns:
   ```json
@@ -210,8 +226,9 @@ source: "pm-ana, task 0d3f…"   # the bot (or skill) and the run id that wrote 
 **Audit:** every decision and removal is an audit event:
 - `client: "bot"`, `user`: the admin;
 - `tool`: `members.add` or `members.remove`;
-- outcome `approved`, `rejected`, `failed` or `ok`;
-- `output_ref`: the commit sha.
+- outcome `approved`, `rejected`, `denied` or `ok`;
+- `output_ref`: the commit sha, when there is one.
+The user database records its own `users.create` and `users.deactivate` events beside them.
 
 ## 4. Slack (`pmos-slack`)
 

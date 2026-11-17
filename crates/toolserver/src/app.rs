@@ -738,8 +738,12 @@ async fn list_approvals(
         return error(StatusCode::BAD_REQUEST, "`user` is required");
     };
     if client == Client::Bot {
-        // As for sessions: enforced with live connectors, open in dev and tests.
-        if !state.svc.team().allows(&user) {
+        // As for sessions: an active PM OS user (the user database decides).
+        let allowed = match state.svc.people().allows(&user).await {
+            Ok(allowed) => allowed,
+            Err(e) => return unavailable(e),
+        };
+        if !allowed {
             return error(
                 StatusCode::FORBIDDEN,
                 "this token may list approvals for team members only",
@@ -813,7 +817,8 @@ struct OneApprovalQuery {
 /// read without `user`, is `404`, the same as a missing item, so they can't tell which ids
 /// exist. With a user assertion (`pmos-web`, the console), only the subject's own item is
 /// answered; anyone else's is `404` too, except that the console's admin view may read any
-/// item when the subject is an admin in the tool server's own `team.yaml`. Under `require`
+/// item when the subject is an active admin in the user database, read for this request.
+/// Under `require`
 /// a read from `pmos-web` or the console without an assertion never gets here (`401`); in
 /// `off` and `verify` the console's read-only token still reads any item by id.
 async fn get_approval(
@@ -826,21 +831,31 @@ async fn get_approval(
     let not_found = || error(StatusCode::NOT_FOUND, "no such approval item");
     let user = q.user.filter(|u| !u.trim().is_empty());
     let must_name = matches!(client, Client::Bot | Client::Web);
-    if must_name && !user.as_deref().is_some_and(|u| state.svc.team().allows(u)) {
-        return not_found();
+    if must_name {
+        let named = match user.as_deref() {
+            Some(u) => match state.svc.people().allows(u).await {
+                Ok(allowed) => allowed,
+                Err(e) => return unavailable(e),
+            },
+            None => false,
+        };
+        if !named {
+            return not_found();
+        }
     }
+    // The console's admin view: the subject is an active admin in the database, now.
+    let subject_is_admin = match (client, acting.0.as_deref()) {
+        (Client::Console, Some(who)) => match state.svc.people().is_admin(who).await {
+            Ok(admin) => admin,
+            Err(e) => return unavailable(e),
+        },
+        _ => false,
+    };
     // May the verified subject read `owner`'s item?
     let subject_may_read = |owner: &str| match acting.0.as_deref() {
         None => true,
         Some(who) if who == owner => true,
-        Some(who) => {
-            client == Client::Console
-                && state
-                    .svc
-                    .team()
-                    .member(who)
-                    .is_some_and(|m| m.roles.contains(&pmos_contract::model::Role::Admin))
-        }
+        Some(_) => subject_is_admin,
     };
     match state.svc.approval(&id).await {
         Ok(Some(item)) if must_name && user.as_deref() != Some(item.user.as_str()) => not_found(),
@@ -921,7 +936,7 @@ async fn decide(
 ) -> Response {
     let reason = match body.reason.as_deref() {
         None => None,
-        Some(r) => match Reason::parse(r) {
+        Some(r) => match Reason::chosen(r) {
             Some(reason) => Some(reason),
             None => {
                 let known: Vec<&str> = Reason::ALL.iter().map(|r| r.as_str()).collect();
@@ -1278,11 +1293,17 @@ async fn oauth_start(
     Path(provider): Path<String>,
     Query(q): Query<UserQuery>,
 ) -> Response {
-    if client != Client::Orchestrator && state.svc.team().member(&q.user).is_none() {
-        return error(
-            StatusCode::FORBIDDEN,
-            "this token may get link URLs for team members only",
-        );
+    if client != Client::Orchestrator {
+        match state.svc.people().allows(&q.user).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return error(
+                    StatusCode::FORBIDDEN,
+                    "this token may get link URLs for team members only",
+                )
+            }
+            Err(e) => return unavailable(e),
+        }
     }
     let (oauth, provider) = match linking(&state, &provider) {
         Ok(x) => x,
@@ -1372,6 +1393,14 @@ async fn oauth_callback(
                 "This sign-in link was made for someone else. Ask PM OS for your own link.",
             )
         }
+        Err(e @ OAuthError::DifferentAccount(..)) => {
+            tracing::warn!(provider = %provider, error = %e, "account linking refused: different_account");
+            page(
+                StatusCode::CONFLICT,
+                "Not connected",
+                "You linked a different account before. Ask a platform owner to unlink it first, then try again.",
+            )
+        }
         Err(e) => {
             tracing::warn!(provider = %provider, error = %e, "account linking failed");
             page(
@@ -1429,7 +1458,11 @@ async fn revoke_credential(
     };
     // As for sessions: enforced with live connectors (the only mode that links accounts),
     // and never a team bot's own account.
-    if client != Client::Orchestrator && !state.svc.team().allows(&user) {
+    let allowed = match state.svc.people().allows(&user).await {
+        Ok(allowed) => allowed,
+        Err(e) => return unavailable(e),
+    };
+    if client != Client::Orchestrator && !allowed {
         audit(
             Outcome::Denied,
             "unlink for someone who isn't a team member".into(),
@@ -1650,7 +1683,14 @@ async fn remove_member(
         .remove(client, &handle, &body.decided_by, Utc::now())
         .await
     {
-        Ok(commit) => Json(json!({ "handle": handle, "commit": commit })).into_response(),
+        // A deactivation since slice U3: nothing is committed (`commit` is null).
+        Ok(note) => Json(json!({
+            "handle": handle,
+            "deactivated": true,
+            "commit": null,
+            "note": note,
+        }))
+        .into_response(),
         Err(r) => refusal(r),
     }
 }

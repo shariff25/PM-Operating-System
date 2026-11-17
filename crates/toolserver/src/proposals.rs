@@ -339,7 +339,19 @@ pub async fn open(
         Kind::Policy => Permission::EditPolicies,
         Kind::Content => Permission::EditContent,
     };
-    if !svc.team().member(user).is_some_and(|m| m.allows(need)) {
+    let allowed = match svc.people().user(user).await {
+        Ok(u) => u.is_some_and(|u| crate::users::access::permits(&u, need)),
+        Err(e) => {
+            tracing::error!(error = %e, "users unavailable");
+            return coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "PM OS storage is unavailable",
+                json!({}),
+            );
+        }
+    };
+    if !allowed {
         tracing::info!(viewer = %user, tool, "proposal refused: role");
         refusal(svc, client, user, tool, "role").await;
         return coded(

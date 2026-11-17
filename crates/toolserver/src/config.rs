@@ -179,9 +179,11 @@ pub struct Config {
     pub audit_retention_days: u32,
     /// `PMOS_USERS_SEED`: a `team.yaml`-shaped file loaded into the in-memory user store at
     /// start-up (`users::import`). Development and eval stacks only: refused with
-    /// `PMOS_DATABASE_URL` or live connectors. Nothing decides from the user store yet
-    /// (slice U1).
+    /// `PMOS_DATABASE_URL` or live connectors. It must name an active admin.
     pub users_seed: Option<PathBuf>,
+    /// `PMOS_USERS_DEACTIVATIONS_PER_HOUR`: how many deactivations the web and Slack clients
+    /// together may make in any rolling hour (1 to 10, default 3); past it, host only.
+    pub users_deactivations_per_hour: u32,
 }
 
 impl Config {
@@ -289,6 +291,18 @@ impl Config {
                 );
             }
         }
+        let users_deactivations_per_hour =
+            match get("PMOS_USERS_DEACTIVATIONS_PER_HOUR").filter(|s| !s.trim().is_empty()) {
+                None => crate::users::DEFAULT_DEACTIVATIONS_PER_HOUR,
+                Some(s) => match s.trim().parse::<u32>() {
+                    Ok(n) if (1..=10).contains(&n) => n,
+                    _ => {
+                        return Err(format!(
+                        "PMOS_USERS_DEACTIVATIONS_PER_HOUR must be a number from 1 to 10, not `{s}`"
+                    ))
+                    }
+                },
+            };
         let fake_mode_docs = match (&connectors, get("PMOS_DOCS_URL"), get("PMOS_DOCS_TOKEN")) {
             (Connectors::Fake, Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
                 Some((url, Secret::new(token)))
@@ -394,6 +408,7 @@ impl Config {
             slack_draft_ttl_hours,
             audit_retention_days,
             users_seed,
+            users_deactivations_per_hour,
         })
     }
 }
@@ -1098,6 +1113,22 @@ mod tests {
         for bad in ["-1", "ninety", "90.5", "3651"] {
             let err = cfg(&with(&fake, &[("PMOS_AUDIT_RETENTION_DAYS", bad)])).unwrap_err();
             assert!(err.contains("from 90 to 3650"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_deactivation_cap_is_one_to_ten() {
+        let fake = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert_eq!(cfg(&fake).unwrap().users_deactivations_per_hour, 3);
+        let five = with(&fake, &[("PMOS_USERS_DEACTIVATIONS_PER_HOUR", "5")]);
+        assert_eq!(cfg(&five).unwrap().users_deactivations_per_hour, 5);
+        for bad in ["0", "11", "many"] {
+            let bad = with(&fake, &[("PMOS_USERS_DEACTIVATIONS_PER_HOUR", bad)]);
+            assert!(cfg(&bad).is_err());
         }
     }
 

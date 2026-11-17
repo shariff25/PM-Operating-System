@@ -1603,6 +1603,7 @@ fn sealed(user: &str, provider: Provider, token: &str) -> SealedCredential {
         site_url: Some("https://example.atlassian.net".into()),
         external_id: None,
         updated_at: now(),
+        suspended_at: None,
     }
 }
 
