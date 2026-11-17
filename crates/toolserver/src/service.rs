@@ -367,6 +367,8 @@ pub struct ToolService {
     /// checked and whether it is shared outside the company. In memory: a restart forgets
     /// it, and an item reads without `external` until it is checked again.
     audiences: Mutex<HashMap<String, (String, bool)>>,
+    /// `PMOS_AUDIT_RETENTION_DAYS`, for the admin overview.
+    audit_retention_days: u32,
 }
 
 /// The most audience results kept in memory; past it the oldest are forgotten all at once.
@@ -417,6 +419,7 @@ impl ToolService {
             invalid_drafts: Mutex::default(),
             slack_draft_ttl: Duration::hours(DEFAULT_SLACK_DRAFT_TTL_HOURS),
             audiences: Mutex::default(),
+            audit_retention_days: crate::audit::MIN_RETENTION_DAYS,
         })
     }
 
@@ -430,6 +433,19 @@ impl ToolService {
     /// How long an undecided Slack draft waits before it expires.
     pub fn slack_draft_ttl(&self) -> Duration {
         self.slack_draft_ttl
+    }
+
+    /// Keep audit events `days` days (`PMOS_AUDIT_RETENTION_DAYS`), never fewer than
+    /// [`crate::audit::MIN_RETENTION_DAYS`]. The admin overview reports it; the purge job
+    /// ([`crate::retention`]) is given the same number.
+    pub fn with_audit_retention_days(mut self, days: u32) -> Self {
+        self.audit_retention_days = days.max(crate::audit::MIN_RETENTION_DAYS);
+        self
+    }
+
+    /// How many days audit events are kept.
+    pub fn audit_retention_days(&self) -> u32 {
+        self.audit_retention_days
     }
 
     /// Report pending ledger rows older than `days` as expired (`PMOS_LEDGER_EXPIRE_DAYS`).
@@ -1340,6 +1356,9 @@ impl ToolService {
         } else {
             self.stores.approvals.create(new, now).await?
         };
+        if SLACK_DRAFT_TOOLS.contains(&spec.name.as_str()) {
+            self.note_target(&item, now).await;
+        }
         event.outcome = Outcome::Pending;
         event.output_ref = Some(item.id.clone());
         Ok(json!({
@@ -1523,6 +1542,74 @@ impl ToolService {
         None
     }
 
+    /// Record what kind of conversation a new Slack draft's channel is, and its name
+    /// (`conversations.info` as the PM), for the draft's target label. Best effort: if Slack
+    /// can't say, the draft reads without it until its audience is checked.
+    async fn note_target(&self, item: &ApprovalItem, now: DateTime<Utc>) {
+        let Some(channel) = item.args["channel"].as_str() else {
+            return;
+        };
+        let found = match self.connector("slack") {
+            Ok(slack) => slack
+                .conversation(Caller::new(&item.user, &item.run_id), channel)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match found {
+            Ok(conversation) => self.store_target(item, channel, conversation, now).await,
+            Err(why) => {
+                tracing::debug!(item = %item.id, error = %why, "a Slack draft's channel couldn't be read")
+            }
+        }
+    }
+
+    /// Keep `conversation` as `item`'s target. A storage failure is logged: the label is a
+    /// convenience, never a reason to fail.
+    async fn store_target(
+        &self,
+        item: &ApprovalItem,
+        channel: &str,
+        conversation: crate::connectors::Conversation,
+        now: DateTime<Utc>,
+    ) {
+        let target = crate::approvals::TargetConversation {
+            channel: channel.to_string(),
+            conversation,
+            checked_at: now,
+        };
+        if let Err(e) = self
+            .stores
+            .approvals
+            .set_target_conversation(&item.id, &target)
+            .await
+        {
+            tracing::warn!(item = %item.id, error = %e, "a Slack draft's channel name wasn't stored");
+        }
+    }
+
+    /// `target_channel` for `item`: its channel's kind, its name (a channel or private
+    /// channel), and for a direct message the other person's handle when they are a team
+    /// member (no new lookup). `None` until the channel it names has been read.
+    fn target_channel(&self, item: &ApprovalItem) -> Option<Value> {
+        let t = item.target_conversation.as_ref()?;
+        if item.args["channel"].as_str() != Some(t.channel.as_str()) {
+            return None;
+        }
+        let with = t
+            .conversation
+            .peer
+            .as_deref()
+            .and_then(|p| self.team.by_slack_id(p))
+            .map(|m| m.handle);
+        Some(json!({
+            "kind": t.conversation.kind,
+            "name": t.conversation.name,
+            "with": with,
+            "checked_at": t.checked_at,
+        }))
+    }
+
     /// Remember what the audience check of `item` found for `channel`.
     fn remember_audience(&self, item: &ApprovalItem, channel: &str, external: bool) {
         let mut seen = self.audiences.lock().expect("audiences lock");
@@ -1558,6 +1645,9 @@ impl ToolService {
         }
         if let Some(external) = self.external(item) {
             v["external"] = json!(external);
+        }
+        if let Some(target) = self.target_channel(item) {
+            v["target_channel"] = target;
         }
         // A person changed the bot's text (a saved edit, or an edit decision): `args` are
         // theirs. The bot's own arguments are never served.
@@ -2059,6 +2149,9 @@ impl ToolService {
         let audience: Audience = match found {
             Ok(audience) => {
                 self.remember_audience(item, channel, audience.external);
+                // A renamed channel reads its new name from here on.
+                self.store_target(item, channel, audience.conversation.clone(), now)
+                    .await;
                 audience
             }
             Err(why) => {

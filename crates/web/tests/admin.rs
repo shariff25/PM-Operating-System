@@ -132,7 +132,9 @@ async fn toolserver(
         .into_response(),
         "/internal/admin/overview" => Json(json!({
             "since": "2026-11-09T09:00:00Z", "pending_drafts": 4, "approved": 7,
-            "rejected": 2, "denied": 1,
+            "rejected": 2, "denied": 1, "retention_days": 90,
+            "oldest_event_at": "2026-08-19T03:00:01Z",
+            "last_purge": {"at": "2026-11-17T03:07:12Z", "deleted": 1200, "extra": "dropped"},
         }))
         .into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
@@ -561,7 +563,9 @@ async fn team_and_overview() {
     assert_eq!(
         r.body,
         json!({"since": "2026-11-09T09:00:00Z", "pending_drafts": 4, "approved": 7,
-               "rejected": 2, "denied": 1})
+               "rejected": 2, "denied": 1, "retention_days": 90,
+               "oldest_event_at": "2026-08-19T03:00:01Z",
+               "last_purge": {"at": "2026-11-17T03:07:12Z", "deleted": 1200}})
     );
 }
 
