@@ -23,6 +23,7 @@ hmac.workspace = true
 # Entra ID tokens (RS256) through aws-lc-rs, which rustls already uses: no OpenSSL.
 jsonwebtoken ={ version = "10", default-features = false, features = ["aws_lc_rs"] }
 pmos-assertion.workspace = true
+pmos-directory.workspace = true
 pmos-contract.workspace = true
 # The admin policy screens: generate and check sandbox policies on a proposed change.
 pmos-policy.workspace = true

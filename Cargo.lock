@@ -1764,6 +1764,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "chrono",
  "pmos-contract",
  "reqwest",
  "serde",
@@ -1899,6 +1900,7 @@ dependencies = [
  "chrono",
  "pmos-assertion",
  "pmos-bots",
+ "pmos-contract",
  "pmos-toolserver",
  "pmos-web",
  "reqwest",
@@ -1959,6 +1961,7 @@ dependencies = [
  "jsonwebtoken",
  "pmos-assertion",
  "pmos-contract",
+ "pmos-directory",
  "pmos-policy",
  "pmos-runtime",
  "reqwest",

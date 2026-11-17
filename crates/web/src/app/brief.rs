@@ -6,6 +6,12 @@
 //! `404 not_found`. Drafting makes a task for the PM's personal bot; its draft then arrives
 //! as an ordinary approval, and nothing is posted without the PM approving it.
 //!
+//! **When the tool server can't be reached** (spec §2), `GET /api/brief` still answers for
+//! at most 5 minutes on the PM's last-known-good answer, from pmos-web's own store, but with
+//! every item whose `system` is `slack` withheld (`slack_withheld: true` and the note): who
+//! may read Slack-derived text can't be checked then. Dismissing and drafting are writes and
+//! fail closed.
+//!
 //! **The internal route** is how the Slack service fills a PM's day when their daily brief
 //! finishes (`crates/slack/src/brief_feed.rs`): it needs `PMOS_WEB_BRIEF_TOKEN` as a bearer
 //! token, replaces that PM's follow-ups and `changed` items, and checks every field (counts,
@@ -22,7 +28,10 @@ use pmos_contract::permissions::Permission;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{is_json, now, parse, task_out, valid_id, ApiError, ApiResult, AppState, Signed};
+use super::{
+    is_json, now, parse, task_out, users_unavailable, valid_id, ApiError, ApiResult, AppState,
+    Signed, SignedRead, SLACK_WITHHELD_NOTE,
+};
 use crate::followups::{
     Changed, FollowUp, Kind, NewFollowUp, CHANGED_TTL_HOURS, MAX_ITEMS, MAX_SUMMARY, MAX_SYSTEM,
     MAX_URL, MAX_WHO,
@@ -85,8 +94,14 @@ fn followup_json(f: &FollowUp, at: DateTime<Utc>) -> serde_json::Value {
     })
 }
 
-async fn get_brief(State(state): State<AppState>, signed: Signed) -> ApiResult {
+/// Is this item from Slack? Withheld on the last-known-good path.
+fn from_slack(system: &str) -> bool {
+    system.trim().eq_ignore_ascii_case("slack")
+}
+
+async fn get_brief(State(state): State<AppState>, SignedRead(signed): SignedRead) -> ApiResult {
     on(&state)?;
+    let withhold = signed.stale;
     let at = now(&state);
     let handle = signed.handle();
     let all = state
@@ -104,6 +119,7 @@ async fn get_brief(State(state): State<AppState>, signed: Signed) -> ApiResult {
     let of = |kind: Kind| -> Vec<serde_json::Value> {
         all.iter()
             .filter(|f| f.kind == kind)
+            .filter(|f| !(withhold && from_slack(&f.system)))
             .map(|f| followup_json(f, at))
             .collect()
     };
@@ -117,17 +133,21 @@ async fn get_brief(State(state): State<AppState>, signed: Signed) -> ApiResult {
         Some(d) => (d.date, d.changed),
         None => (at.date_naive(), Vec::new()),
     };
-    Ok(Json(json!({
+    let mut body = json!({
         "date": date.to_string(),
         "delivered_at": delivered.map(crate::drafts::rfc3339),
         "status": brief_status(delivered, at),
-        "changed": changed.iter().map(|c| json!({
+        "changed": changed.iter().filter(|c| !(withhold && from_slack(&c.system))).map(|c| json!({
             "system": c.system, "title": c.title, "summary": c.summary, "url": c.url,
         })).collect::<Vec<_>>(),
         "waiting_on_you": of(Kind::WaitingOnYou),
         "you_wait_on": of(Kind::YouWaitOn),
-    }))
-    .into_response())
+        "slack_withheld": withhold,
+    });
+    if withhold {
+        body["note"] = json!(SLACK_WITHHELD_NOTE);
+    }
+    Ok(Json(body).into_response())
 }
 
 /// Whether a brief has been delivered: `never` (no brief has ever filled this PM's day: say
@@ -566,9 +586,17 @@ async fn fill(state: &AppState, handle: &str, headers: &HeaderMap, body: &Bytes)
             "That service token isn't accepted.",
         ));
     }
-    // Only for someone on the team: no rows for handles that aren't members.
-    if !valid_id(handle) || super::load_team(state)?.by_handle(handle).is_none() {
+    // Only for an active user: no rows for handles that aren't (the user database decides;
+    // nothing is stored while it can't be asked).
+    if !valid_id(handle) {
         return Err(ApiError::not_found());
+    }
+    match state.0.directory.by_handle(handle).await {
+        Ok(u) if u.is_active() => {}
+        Ok(_) | Err(pmos_directory::resolve::ResolveError::NotFound) => {
+            return Err(ApiError::not_found())
+        }
+        Err(_) => return Err(users_unavailable()),
     }
     if !is_json(headers) {
         return Err(ApiError::new(

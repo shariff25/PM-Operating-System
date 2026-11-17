@@ -4,7 +4,10 @@ export type HintName = 'sources' | 'ask' | 'approve';
 
 export interface Me {
   handle: string;
+  /** What to call the person: the display name, or the handle when there is none. Plain text. */
   name: string;
+  /** The display name from the user database, untrusted text (render it plainly). An older server leaves it out. */
+  display_name?: string;
   roles: string[];
   csrf_token: string;
   first_visit: boolean;
@@ -151,6 +154,13 @@ export interface Brief {
   delivered_at?: string | null;
   /** What to say about it: never delivered, delivered within the last day, or older. A missing field reads as `never`. */
   status?: 'never' | 'today' | 'stale';
+  /**
+   * True when PM OS couldn't check the person's access just now and left out every item from
+   * Slack (docs/web-api.md, "The daily brief and follow-ups"). A missing field reads as false.
+   */
+  slack_withheld?: boolean;
+  /** The server's sentence for `slack_withheld`; the app shows its own copy. */
+  note?: string;
 }
 
 /**
@@ -191,6 +201,8 @@ export const SERVER_ERROR_CODES = {
   audience_unavailable: 'yes',
   unavailable: 'yes',
   team_unavailable: 'yes',
+  users_unavailable: 'yes',
+  entra_needs_host: 'yes',
   github_not_linked: 'yes',
   stale_base: 'yes',
   invalid: 'yes',

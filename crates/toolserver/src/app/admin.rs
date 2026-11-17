@@ -730,19 +730,35 @@ fn users_flags(
 // Sign-in events from `pmos-web`.
 
 /// The actions `POST /internal/admin/events` records. Nothing else is accepted.
-pub const SIGN_IN_ACTIONS: [&str; 3] = ["web.sign_in", "web.sign_out", "web.sign_in_refused"];
+/// `users.identity_conflict` is `pmos-web` flagging a known Microsoft account that signed in
+/// with a name that is another user's sign-in name (spec §7 step 3; slice U4c).
+pub const SIGN_IN_ACTIONS: [&str; 4] = [
+    "web.sign_in",
+    "web.sign_out",
+    "web.sign_in_refused",
+    IDENTITY_CONFLICT,
+];
+
+/// The action an Entra identity conflict is recorded as, here and by the first-link route.
+pub const IDENTITY_CONFLICT: &str = "users.identity_conflict";
 
 /// The sign-in providers an event may name.
 pub const SIGN_IN_PROVIDERS: [&str; 2] = ["entra", "dev"];
 
 /// Why a sign-in was refused, as `pmos-web` codes it (its signed-out page's `reason`).
-pub const SIGN_IN_REFUSALS: [&str; 6] = [
+/// `wrong_account` is from before the user database (no longer sent, still accepted).
+pub const SIGN_IN_REFUSALS: [&str; 11] = [
     "not_a_member",
     "wrong_account",
     "expired",
     "cancelled",
     "unavailable",
     "failed",
+    "deactivated",
+    "sign_in_unconfirmed",
+    "entra_needs_host",
+    "entra_misconfigured",
+    "users_unavailable",
 ];
 
 /// Who a refused sign-in is recorded as: nobody signed in.
@@ -765,7 +781,8 @@ struct SignInRecord {
     /// `web.sign_in_refused` only: [`ATTEMPT_HEX`] lowercase hex characters.
     #[serde(default)]
     attempt: Option<String>,
-    /// `web.sign_in_refused` with `wrong_account` only: the member whose email was used.
+    /// `web.sign_in_refused` with `wrong_account`: the member whose email was used; and
+    /// `users.identity_conflict` (required): the user whose sign-in name was presented.
     #[serde(default)]
     member: Option<String>,
 }
@@ -860,7 +877,32 @@ async fn sign_in_event(
         output_ref,
         detail: Some(detail),
     };
-    let ev = if *action == "web.sign_in_refused" {
+    let ev = if *action == IDENTITY_CONFLICT {
+        // A known Microsoft account signed in with another user's sign-in name: recorded as
+        // the first-link route records a conflict (actor `anonymous`, detail `entra`, the
+        // user as target), so the overview counts it. No `user=`: nobody is asserted.
+        if user.is_some() || r.reason.is_some() || r.attempt.is_some() || *provider != "entra" {
+            return bad("an identity conflict is entra, with `member` only");
+        }
+        let Some(member) = r.member.as_deref().filter(|m| dir.get(m).is_some()) else {
+            return bad("`member` must be a user");
+        };
+        AuditEvent {
+            at: Utc::now(),
+            client,
+            run_id: SIGN_IN_RUN.to_string(),
+            user: ANONYMOUS.to_string(),
+            skill: None,
+            bot: None,
+            tool: IDENTITY_CONFLICT.to_string(),
+            outcome: Outcome::Denied,
+            sources: Vec::new(),
+            source_titles: Default::default(),
+            args_hash: None,
+            output_ref: Some(member.to_string()),
+            detail: Some("entra".to_string()),
+        }
+    } else if *action == "web.sign_in_refused" {
         if user.is_some() {
             return bad("a refused sign-in names no `user`");
         }

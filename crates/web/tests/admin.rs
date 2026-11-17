@@ -17,6 +17,8 @@ use pmos_web::{Config, Deps};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+mod support;
+
 const BOTS_TOKEN: &str = "web-client-token-0123456789abcdef0123";
 const TOOLS_TOKEN: &str = "toolserver-service-token-0123456789ab";
 // Test key only: fixed bytes, never used anywhere real.
@@ -45,6 +47,8 @@ struct Tools {
     calls: Mutex<Vec<Call>>,
     events: Mutex<Vec<Value>>,
     mode: AtomicUsize,
+    /// The user database's routes (who is signed in, with which roles).
+    directory: support::FakeDirectory,
 }
 
 impl Tools {
@@ -87,8 +91,11 @@ async fn toolserver(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    _body: Bytes,
+    body: Bytes,
 ) -> Response {
+    if let Some(res) = tools.directory.handle(&method, &uri, &body) {
+        return res;
+    }
     tools.calls.lock().unwrap().push(Call {
         uri: uri.to_string(),
         method: method.to_string(),
@@ -177,6 +184,7 @@ struct Reply {
 async fn web() -> Web {
     let tools = Arc::new(Tools::default());
     tools.events.lock().unwrap().extend((0..5).map(event));
+    tools.directory.seed_team(TEAM);
     let (tools_url, stop_tools) =
         serve(Router::new().fallback(toolserver).with_state(tools.clone())).await;
     let dir = tempfile::tempdir().unwrap();
@@ -191,7 +199,6 @@ async fn web() -> Web {
             "web",
             "toolserver",
             ring(),
-            dir.path().to_path_buf(),
         )),
         content_root: dir.path().to_path_buf(),
         static_dir: None,

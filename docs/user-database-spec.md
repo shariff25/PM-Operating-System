@@ -712,9 +712,10 @@ email.
 
 ### Microsoft's guidance, as I know it
 
-**To confirm against current Microsoft identity platform documentation ("ID token claims
-reference", "Optional claims", and the guidance on the `email` claim and `xms_edov`) before U4c
-is built; I could not check it from here.**
+**Confirmed for U4c** (2026-11-17) against Microsoft's ID token claims reference, optional
+claims reference and claims-validation guidance, with quotes and links in
+`docs/entra-sign-in.md` ("What Microsoft says about the claims"). The points below hold; for
+`idp`, an ordinary member's token carries none, or the issuer's value.
 
 - `oid` with `tid` is the stable, immutable identifier for a user in a tenant, and is what an
   app should key on. `sub` is pairwise per app and also stable, but `oid` is what other
@@ -1071,6 +1072,44 @@ bot-owner check reads it until U7. Where it differs from the text above:
   asked as (U3); CI smoke waits 35 s after its import, longer than one poll. The in-process
   stack test (`crates/stack-tests`) now seeds the tool server's user store and no longer
   opens the directory, so the runtime and the tool server both decide from the seed.
+
+**U4c is built** on `claude/u4c-web-signin` (`crates/directory/src/resolve.rs`, the shared
+resolve client the console's U4d reuses; `crates/web/src/app.rs` `Signed`/`SignedRead` and
+`entra_person`; `crates/web/src/entra.rs`; `crates/web/tests/{web,entra}.rs` with a fake of
+the read API in `tests/support/mod.rs`; a stack test against the real tool server;
+`docs/entra-sign-in.md`, `docs/web-api.md`). `pmos-web` reads no `team.yaml` for sign-in,
+sessions, roles, `/api/me`, admin access or the brief producer's membership check. Where it
+differs from the text above:
+- **`idp` accepts this tenant in either form:** absent, equal to the token's `iss`, or equal
+  to the tenant's v1 issuer `https://sts.windows.net/<tid>/` (Microsoft documents `idp` as
+  equal to the issuer for a member; the v1 form names the same tenant, accepted so a format
+  difference can't lock members out). `acct` must be `0` (a number, or the string `"0"`);
+  a missing `acct` is `entra_misconfigured`, any other value `not_a_member`. A token without
+  a GUID `oid` is `failed`. The `email` scope is no longer asked for.
+- **New signed-out reasons** beyond §7's `not_a_member`: `deactivated`,
+  `sign_in_unconfirmed`, `entra_needs_host`, `entra_misconfigured`, `users_unavailable`, so
+  a person is told what to ask for. A conflict, a guest and another identity provider stay
+  `not_a_member` as §7 says. The tool server's sign-in events route accepts these reasons.
+- **The second conflict flavour** (a known `oid` presenting another user's sign-in name) is
+  recorded through the sign-in events route as a new action, `users.identity_conflict`
+  (`member` = that user, detail `entra`), the same shape the first-link route writes, so the
+  overview counts both; the person still signs in by `oid`. It costs one more `resolve` per
+  such sign-in (a miss when the name is nobody's counts toward the miss limit).
+- **An Entra session is checked by its `(tid, oid)`**, not its handle, on every request (so
+  an unlinked or re-linked account ends it); the 10-second cache is per lookup key. Sessions
+  from before U4c (no `oid`) end on their next request.
+- **The stale path** serves `GET /api/me` and `GET /api/brief` only; the brief withholds
+  every item whose `system` is `slack` from `changed` and both follow-up lists, and adds
+  `slack_withheld: true` and the note. A last-known answer that says deactivated reads
+  nothing. Development sign-in accepts a handle only (no longer an email).
+- **The admin Team page's member list still comes from `team.yaml`** until U5 replaces it
+  with `GET /internal/admin/users`; it decides nothing (access to the page is the viewer's
+  roles from the directory), so `team_unavailable` stays for that page only. `/readyz` no
+  longer checks `team.yaml`, and `pmos-web` starts without it.
+- **Assertion roles** come from the directory answer for the request (`for_user`); a
+  sign-out's come from whatever answer is cached, never a call.
+- **Not built:** the "signed in with Microsoft for the first time" message (the link is
+  logged and audited only). **Not verified:** a real Entra tenant's tokens (none available).
 
 U4a–U4d run in parallel (U4b after U3, since `remove` calls U3's deactivation). U5 and U6 can
 overlap once the routes in U5 are merged.

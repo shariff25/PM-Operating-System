@@ -302,7 +302,7 @@ The mode, the start-up rule, the refusals and the verifier are shared code
   names the PM (the inbox, one item, sources, decisions), when it has a key for that upstream: lifetime
   60 seconds, audience `bots` or `toolserver`, bound to the method, path, query and body as
   sent, a fresh assertion per call, next to the existing `X-Pmos-User` and `decided_by`. Roles
-  come from `team.yaml`. `sid` is a reference to the PM's session: 16 hex characters of a
+  come from the user database (`resolve`, at most 10 seconds old; slice U4c). `sid` is a reference to the PM's session: 16 hex characters of a
   SHA-256 over the session's stored hash under a label of its own (`session::assertion_ref`),
   never the session id or the cookie. Re-reading one item after a conflicting decision carries
   an assertion too. It calls the tool server with its own token (`PMOS_WEB_TOKEN` there), which

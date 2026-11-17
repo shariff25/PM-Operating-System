@@ -93,6 +93,7 @@ export function FollowUps() {
       </PageHeader>
       {error && <ErrorNote>{error}</ErrorNote>}
       {rowError && <ErrorNote>{rowError}</ErrorNote>}
+      {brief?.slack_withheld && <p className="lede" role="status">{copy.today.slackWithheld}</p>}
       {!brief ? (
         <Skeleton rows={3} label={copy.activity.loading} />
       ) : brief.waiting_on_you.length === 0 && brief.you_wait_on.length === 0 && brief.changed.length === 0 ? (

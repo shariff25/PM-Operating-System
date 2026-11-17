@@ -323,6 +323,11 @@ export function Home() {
                 : copy.today.briefNever}
           </p>
         )}
+        {brief?.slack_withheld && (
+          <p className="today-brief today-brief-quiet" role="status">
+            {copy.today.slackWithheld}
+          </p>
+        )}
       </header>
 
       <Composer />

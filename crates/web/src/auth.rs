@@ -1,20 +1,21 @@
 //! Sign-in providers and the origin check for writes.
 //!
-//! A provider proves who the browser is and names them by a handle or an email. The app then
-//! looks that up in `team.yaml` (re-read when it changes) and starts a session; a provider
-//! never decides membership or roles.
+//! A provider proves who the browser is: development sign-in names a handle, Entra ID an
+//! Entra key `(tid, oid)` and a sign-in name. The app then looks the person up in the user
+//! database (the tool server's `resolve`) and starts a session; a provider never decides
+//! membership or roles.
 
 use async_trait::async_trait;
 use axum::http::{header, HeaderMap};
 use chrono::{DateTime, Utc};
-use pmos_contract::model::{valid_email, valid_handle, TeamFile, TeamMember};
+use pmos_contract::model::valid_handle;
 
 use crate::entra::Failure;
 
 /// What the browser sent to sign in.
 #[derive(Clone)]
 pub enum SignInInput {
-    /// `POST /api/auth/dev-login {handle}`: a handle, or a member's email.
+    /// `POST /api/auth/dev-login {handle}`: a handle.
     Dev { handle: String },
     /// `GET /api/auth/callback`: the authorization code, with the `nonce` and PKCE verifier
     /// of the flow its `state` matched, and the time to check the ID token against.
@@ -40,7 +41,8 @@ impl std::fmt::Debug for SignInInput {
     }
 }
 
-/// Who a provider says the person is: a PM OS handle or an email, to find in `team.yaml`.
+/// Who a provider says the person is: a PM OS handle (development sign-in) or an Entra
+/// object id, to find in the user database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claimed(pub String);
 
@@ -88,39 +90,10 @@ impl AuthProvider for DevLoginProvider {
             return Err(SignInError::Unsupported);
         };
         let handle = handle.trim();
-        if !valid_handle(handle) && !valid_email(handle) {
-            return Err(SignInError::Invalid(
-                "That isn't a PM OS handle or an email.".into(),
-            ));
+        if !valid_handle(handle) {
+            return Err(SignInError::Invalid("That isn't a PM OS handle.".into()));
         }
         Ok(Claimed(handle.to_string()))
-    }
-}
-
-/// The member a claim names: by handle, or by email (case-insensitive) when it has an `@`.
-pub fn find_member<'a>(team: &'a TeamFile, claimed: &str) -> Option<&'a TeamMember> {
-    team.by_handle(claimed).or_else(|| {
-        team.members.iter().find(|m| {
-            claimed.contains('@')
-                && m.email
-                    .as_deref()
-                    .is_some_and(|e| e.eq_ignore_ascii_case(claimed))
-        })
-    })
-}
-
-/// The one member whose `email` is `email` (case-insensitive), as Entra ID sign-in finds
-/// people: never by handle. Two members with the same email (which `pmos lint` refuses)
-/// match no one.
-pub fn find_member_by_email<'a>(team: &'a TeamFile, email: &str) -> Option<&'a TeamMember> {
-    let mut found = team.members.iter().filter(|m| {
-        m.email
-            .as_deref()
-            .is_some_and(|e| e.trim().eq_ignore_ascii_case(email.trim()))
-    });
-    match (found.next(), found.next()) {
-        (Some(m), None) => Some(m),
-        _ => None,
     }
 }
 
@@ -184,42 +157,13 @@ mod tests {
             .await,
             Ok(Claimed("ana".into()))
         );
-        assert!(matches!(
-            p.authenticate(&SignInInput::Dev {
-                handle: "Ana Smith".into()
-            })
-            .await,
-            Err(SignInError::Invalid(_))
-        ));
-    }
-
-    #[test]
-    fn finds_members_by_handle_or_email() {
-        let team = TeamFile::from_yaml(
-            "members:\n  - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm]}\n",
-        )
-        .unwrap();
-        assert!(find_member(&team, "ana").is_some());
-        assert!(find_member(&team, "ANA@example.com").is_some());
-        assert!(find_member(&team, "ben").is_none());
-    }
-
-    #[test]
-    fn finds_members_by_email_only_and_unambiguously() {
-        let team = TeamFile::from_yaml(
-            "members:\n  - {handle: ana, slack-id: U0ANA, email: Ana@Example.com, roles: [pm]}\n  \
-             - {handle: ben, slack-id: U0BEN, roles: [pm]}\n  \
-             - {handle: cy, slack-id: U0CY, email: twin@example.com, roles: [pm]}\n  \
-             - {handle: dee, slack-id: U0DEE, email: TWIN@example.com, roles: [pm]}\n",
-        )
-        .unwrap();
-        assert_eq!(
-            find_member_by_email(&team, "ana@example.com").map(|m| m.handle.as_str()),
-            Some("ana")
-        );
-        assert!(find_member_by_email(&team, "ana").is_none());
-        assert!(find_member_by_email(&team, "ben").is_none());
-        assert!(find_member_by_email(&team, "twin@example.com").is_none());
+        for bad in ["Ana Smith", "ana@example.com"] {
+            assert!(matches!(
+                p.authenticate(&SignInInput::Dev { handle: bad.into() })
+                    .await,
+                Err(SignInError::Invalid(_))
+            ));
+        }
     }
 
     #[test]

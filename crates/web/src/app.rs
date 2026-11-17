@@ -1,9 +1,12 @@
 //! The router and every `/api` route in `docs/web-api.md`.
 //!
 //! Every request but sign-in, `/healthz` and the static app needs a live session; the
-//! session's handle must still be a member in `team.yaml` (re-read when it changes), and
-//! every `POST`, `PUT` and `DELETE` must come from the app's own origin and carry the
-//! session's CSRF token. Drafts and tasks also need the PM abilities of the permission
+//! session's person must still be an active user in the user database (the tool server's
+//! `resolve`, cached 10 seconds per person: `pmos_directory::resolve`), and every `POST`,
+//! `PUT` and `DELETE` must come from the app's own origin and carry the session's CSRF token.
+//! When the tool server can't be reached, only `GET /api/me` and `GET /api/brief` may answer,
+//! on the person's last-known-good answer for at most 5 minutes, with Slack items withheld
+//! ([`SignedRead`]); everything else answers `503 users_unavailable`. Drafts and tasks also need the PM abilities of the permission
 //! matrix; someone else's draft or task answers `404 not_found`.
 
 use std::path::{Component, Path as FsPath, PathBuf};
@@ -19,12 +22,17 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use pmos_contract::model::{TeamFile, TeamMember};
+use pmos_contract::model::{Role, TeamFile};
 use pmos_contract::onboarding::personal_bot_name;
 use pmos_contract::permissions::Permission;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+use pmos_directory::resolve::{
+    DirectoryUser, EntraState, HttpTransport, LinkError, LinkRefusal, Lookup, ResolveClient,
+    ResolveError,
+};
 
 use crate::auth::{self, AuthProvider, DevLoginProvider, SignInError, SignInInput};
 use crate::config::{Config, NO_PROVIDER};
@@ -111,7 +119,11 @@ impl Deps {
 }
 
 struct Inner {
-    /// `team.yaml`, parsed once and re-read when it changes (`team.rs`).
+    /// Users and roles: the tool server's `resolve` and first-link routes, cached 10 seconds
+    /// per lookup, with the last-known-good answer kept for when it can't be reached.
+    directory: Arc<ResolveClient>,
+    /// `team.yaml`, for the admin Team page's member list only (until slice U5 replaces it
+    /// with the user database's admin list). It decides nothing.
     team: TeamCache,
     /// The deployed content tree the admin content and policy screens read.
     content_root: PathBuf,
@@ -240,7 +252,16 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
+    let directory = Arc::new(ResolveClient::new(
+        Arc::new(HttpTransport::new(
+            http.clone(),
+            &config.toolserver_url,
+            config.toolserver_token.token(),
+        )),
+        deps.clock.clone(),
+    ));
     let state = AppState(Arc::new(Inner {
+        directory,
         runtime: Runtime::new(http.clone(), &config.bots_url, &config.bots_token),
         toolserver: ToolServer::new(http, &config.toolserver_url, &config.toolserver_token),
         team: TeamCache::new(config.content_root.clone()),
@@ -349,8 +370,8 @@ async fn old_draft_link(Path(id): Path<String>) -> Response {
 }
 
 /// `GET /readyz`: `200` when this server can serve, `503` otherwise, with each check's
-/// result (`ok` or `down`) and no detail: its store answers, `team.yaml` reads, and the bot
-/// runtime and the tool server answer their own `/healthz` within two seconds. No sign-in
+/// result (`ok` or `down`) and no detail: its store answers, and the bot runtime and the tool
+/// server (which answers who may sign in) answer their own `/healthz` within two seconds. No sign-in
 /// and no secrets: the details go to the log.
 async fn readyz(State(state): State<AppState>) -> Response {
     let (store, runtime, toolserver) = tokio::join!(
@@ -361,13 +382,8 @@ async fn readyz(State(state): State<AppState>) -> Response {
     if let Err(e) = &store {
         tracing::warn!(error = %e, "not ready: store");
     }
-    let team = state.0.team.load();
-    if let Err(e) = &team {
-        tracing::warn!(error = %e, "not ready: team.yaml");
-    }
     let checks = [
         ("store", store.is_ok()),
-        ("team", team.is_ok()),
         ("bot_runtime", runtime),
         ("tool_server", toolserver),
     ];
@@ -661,29 +677,84 @@ fn now(state: &AppState) -> DateTime<Utc> {
 
 // The signed-in PM.
 
-/// A live session whose handle is a member now, and for a write, a checked origin and CSRF
-/// token.
+/// How long a session may keep reading pmos-web's own store on its last-known-good answer
+/// while the tool server can't be reached (spec §2, "Stated bounds").
+pub const LAST_KNOWN_GOOD: chrono::Duration = chrono::Duration::minutes(5);
+
+/// What the app says where it withheld Slack items on the last-known-good path.
+pub const SLACK_WITHHELD_NOTE: &str = "Slack items are hidden until PM OS can check your access";
+
+/// The signed-in person, as the user database answered for this request.
+#[derive(Debug, Clone)]
+pub struct Member {
+    pub handle: String,
+    /// Untrusted text (often from Slack): the app renders it as plain text.
+    pub display_name: String,
+    /// Known roles only; an unknown one grants nothing.
+    pub roles: Vec<Role>,
+}
+
+impl Member {
+    fn from_user(u: &DirectoryUser) -> Self {
+        Self {
+            handle: u.handle.clone(),
+            display_name: u.display_name.clone(),
+            roles: u.roles.iter().filter_map(|r| Role::parse(r)).collect(),
+        }
+    }
+
+    pub fn allows(&self, permission: Permission) -> bool {
+        pmos_contract::permissions::allows(&self.roles, permission)
+    }
+
+    /// The display name, or the handle when there is none.
+    fn name(&self) -> &str {
+        if self.display_name.trim().is_empty() {
+            &self.handle
+        } else {
+            &self.display_name
+        }
+    }
+}
+
+/// A live session whose person is an active user now (a fresh answer from the user database,
+/// at most 10 seconds old), and for a write, a checked origin and CSRF token.
 pub struct Signed {
-    pub member: TeamMember,
+    pub member: Member,
     pub session: Session,
     /// The session's reference for user assertions (`session::assertion_ref`): never the
     /// session id, and never logged.
     session_ref: String,
+    /// Answered from the last-known-good answer (the tool server unreachable): only through
+    /// [`SignedRead`], on a `GET` served from pmos-web's own store.
+    pub stale: bool,
 }
+
+/// [`Signed`] for the two `GET` routes served from pmos-web's own store (`/api/me`,
+/// `/api/brief`): when the tool server can't be reached, the session's last-known-good
+/// answer will do for at most [`LAST_KNOWN_GOOD`], and `stale` is then set (the route
+/// withholds Slack items). Every other route takes [`Signed`], which fails closed.
+pub struct SignedRead(pub Signed);
 
 impl Signed {
     fn handle(&self) -> &str {
         &self.member.handle
     }
 
-    /// The bot runtime, signing as this PM's session.
+    /// The bot runtime, signing as this PM's session, with their roles.
     fn runtime(&self, state: &AppState) -> Runtime {
-        state.0.runtime.for_session(&self.session_ref)
+        state
+            .0
+            .runtime
+            .for_user(&self.session_ref, &self.member.roles)
     }
 
-    /// The tool server, signing as this PM's session.
+    /// The tool server, signing as this PM's session, with their roles.
     fn toolserver(&self, state: &AppState) -> ToolServer {
-        state.0.toolserver.for_session(&self.session_ref)
+        state
+            .0
+            .toolserver
+            .for_user(&self.session_ref, &self.member.roles)
     }
 
     fn need(&self, permission: Permission) -> Result<(), ApiError> {
@@ -721,6 +792,7 @@ async fn live_session(
     Ok(found.map(|s| (id, s)))
 }
 
+/// `team.yaml`, for the admin Team page's member list only (it decides nothing).
 fn load_team(state: &AppState) -> Result<Arc<TeamFile>, ApiError> {
     state.0.team.load().map_err(|e| {
         tracing::error!(error = %e, "team.yaml can't be read");
@@ -732,49 +804,132 @@ fn load_team(state: &AppState) -> Result<Arc<TeamFile>, ApiError> {
     })
 }
 
-impl FromRequestParts<AppState> for Signed {
-    type Rejection = ApiError;
+fn users_unavailable() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "users_unavailable",
+        "PM OS can't check who you are right now. Try again in a minute.",
+    )
+}
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
-        let Some((id, session)) = live_session(state, &parts.headers).await? else {
+fn entra_needs_host() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "entra_needs_host",
+        "Someone with host access needs to confirm your Microsoft account before you can use \
+         PM OS with your admin or auditor role.",
+    )
+}
+
+fn no_longer_a_member() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "not_a_member",
+        "You're not on the PM OS team any more. Ask a platform owner.",
+    )
+}
+
+/// The session's person, from the user database. `allow_stale`: a `GET` may use the
+/// last-known-good answer when the tool server can't be reached ([`SignedRead`]).
+async fn signed_in(parts: &Parts, state: &AppState, allow_stale: bool) -> Result<Signed, ApiError> {
+    let Some((id, session)) = live_session(state, &parts.headers).await? else {
+        return Err(ApiError::signed_out());
+    };
+    let end_this = || async { state.0.sessions.remove(&id).await.map_err(ApiError::store) };
+    // An Entra session is looked up by the key it signed in with, so an unlinked or
+    // re-linked Microsoft account ends it; a development session by its handle.
+    let entra = session.entra_tid.is_some();
+    let lookup = match (&session.entra_tid, &session.entra_oid) {
+        (Some(tid), Some(oid)) => Lookup::entra(tid, oid),
+        (Some(_), None) => {
+            // From before sign-in was keyed on `(tid, oid)`: sign in again.
+            end_this().await?;
             return Err(ApiError::signed_out());
-        };
-        let team = load_team(state)?;
-        let Some(member) = team.by_handle(&session.handle).cloned() else {
-            // Removed from the team: end every session they have, at once.
-            tracing::info!(user = %session.handle, "no longer in team.yaml: signed out");
+        }
+        _ => Lookup::handle(&session.handle),
+    };
+    let (user, stale) = match state.0.directory.resolve(&lookup).await {
+        Ok(u) => (u, false),
+        Err(ResolveError::NotFound) if entra => {
+            tracing::info!(user = %session.handle, "the session's Microsoft account is no longer linked: signed out");
+            end_this().await?;
+            return Err(ApiError::signed_out());
+        }
+        Err(ResolveError::NotFound) => {
+            // Not in the user database: end every session they have, at once.
+            tracing::info!(user = %session.handle, "not in the user database: signed out");
             state
                 .0
                 .sessions
                 .remove_user(&session.handle)
                 .await
                 .map_err(ApiError::store)?;
-            return Err(ApiError::new(
-                StatusCode::FORBIDDEN,
-                "not_a_member",
-                "You're not on the PM OS team any more. Ask a platform owner.",
-            ));
-        };
-        // An Entra session of a member whose `entra-oid` (added or changed since) isn't the
-        // account that signed in: this session ends.
-        if session.entra_tid.is_some() && !oid_matches(&member, session.entra_oid.as_deref()) {
-            tracing::warn!(user = %session.handle, "session's Entra account no longer matches team.yaml: signed out");
-            state
-                .0
-                .sessions
-                .remove(&id)
-                .await
-                .map_err(ApiError::store)?;
-            return Err(ApiError::signed_out());
+            return Err(no_longer_a_member());
         }
-        if is_write(&parts.method) {
-            check_write(state, &parts.headers, &session)?;
+        Err(ResolveError::Unavailable {
+            last_known_good: Some(known),
+            ..
+        }) if allow_stale && parts.method == Method::GET && known.age <= LAST_KNOWN_GOOD => {
+            tracing::warn!(user = %session.handle, age_secs = known.age.num_seconds(), "user directory unavailable: a read on the last-known-good answer");
+            (known.user, true)
         }
-        Ok(Self {
-            member,
-            session,
-            session_ref: session::assertion_ref(&id),
-        })
+        Err(e) => {
+            let why = match e {
+                ResolveError::Unavailable { why, .. } => why,
+                ResolveError::RateLimited => "over the miss limit",
+                ResolveError::Refused { .. } => "refused this client",
+                _ => "failed",
+            };
+            tracing::warn!(user = %session.handle, why, "user directory unavailable: refused");
+            return Err(users_unavailable());
+        }
+    };
+    if user.handle != session.handle {
+        // The Microsoft account now belongs to someone else in PM OS.
+        tracing::warn!(user = %session.handle, "the session's Microsoft account is linked to another user: signed out");
+        end_this().await?;
+        return Err(ApiError::signed_out());
+    }
+    if !user.is_active() {
+        tracing::info!(user = %session.handle, "deactivated: signed out");
+        state
+            .0
+            .sessions
+            .remove_user(&session.handle)
+            .await
+            .map_err(ApiError::store)?;
+        return Err(no_longer_a_member());
+    }
+    if entra && user.entra != EntraState::Linked {
+        // An Admin or Auditor whose Microsoft account the host hasn't confirmed (spec §7).
+        tracing::warn!(user = %session.handle, "Entra link needs the host: signed out");
+        end_this().await?;
+        return Err(entra_needs_host());
+    }
+    if is_write(&parts.method) {
+        check_write(state, &parts.headers, &session)?;
+    }
+    Ok(Signed {
+        member: Member::from_user(&user),
+        session,
+        session_ref: session::assertion_ref(&id),
+        stale,
+    })
+}
+
+impl FromRequestParts<AppState> for Signed {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        signed_in(parts, state, false).await
+    }
+}
+
+impl FromRequestParts<AppState> for SignedRead {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        signed_in(parts, state, true).await.map(SignedRead)
     }
 }
 
@@ -785,6 +940,9 @@ struct DevLogin {
     handle: String,
 }
 
+/// `POST /api/auth/dev-login {handle}`: development sign-in (loopback only), resolved in the
+/// user database by handle. Fails closed: with the tool server unreachable it answers
+/// `503 users_unavailable`.
 async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> ApiResult {
     let Some(provider) = state.0.providers.iter().find(|p| p.name() == "dev") else {
         return Err(ApiError::not_found());
@@ -811,30 +969,48 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
             return Err(ApiError::not_found())
         }
     };
-    let team = load_team(&state)?;
-    let Some(member) = auth::find_member(&team, &claimed.0) else {
-        tracing::info!(
-            provider = provider.name(),
-            "sign-in refused: not in team.yaml"
-        );
-        record_sign_in(
-            &state,
-            None,
-            SignInEvent::Refused {
-                provider: provider.name(),
-                reason: "not_a_member",
-                attempted: Some(&claimed.0),
-                member: None,
-            },
-        )
-        .await;
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "not_a_member",
-            "That person isn't on the PM OS team.",
-        ));
+    let refuse = |reason: &'static str, attempted: bool| {
+        let state = state.clone();
+        let name = claimed.0.clone();
+        async move {
+            tracing::info!(provider = "dev", reason, "sign-in refused");
+            record_sign_in(
+                &state,
+                None,
+                SignInEvent::Refused {
+                    provider: "dev",
+                    reason,
+                    attempted: attempted.then_some(name.as_str()),
+                    member: None,
+                },
+            )
+            .await;
+        }
     };
-    let id = start_session(&state, &headers, member, provider.name(), None).await?;
+    let user = match state.0.directory.by_handle(&claimed.0).await {
+        Ok(u) if u.is_active() => u,
+        Ok(_) => {
+            refuse("deactivated", false).await;
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "not_a_member",
+                "That person's access to PM OS is turned off.",
+            ));
+        }
+        Err(ResolveError::NotFound | ResolveError::Invalid) => {
+            refuse("not_a_member", true).await;
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "not_a_member",
+                "That person isn't on the PM OS team.",
+            ));
+        }
+        Err(_) => {
+            refuse("users_unavailable", false).await;
+            return Err(users_unavailable());
+        }
+    };
+    let id = start_session(&state, &headers, &user, provider.name(), None).await?;
     Ok((
         StatusCode::NO_CONTENT,
         [(header::SET_COOKIE, session::set_cookie(&id))],
@@ -842,24 +1018,115 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
         .into_response())
 }
 
-/// Does an Entra sign-in's `oid` fit `member`? A member without `entra-oid` in `team.yaml`
-/// is matched by email alone; one with it only by a token carrying that `oid`.
-fn oid_matches(member: &TeamMember, oid: Option<&str>) -> bool {
-    match member.entra_oid.as_deref() {
-        None => true,
-        Some(want) => oid.is_some_and(|got| got.eq_ignore_ascii_case(want.trim())),
+/// Why an Entra sign-in was refused: the signed-out page's `reason`, and whether the name
+/// tried goes into the audit event (as its keyed hash).
+struct EntraRefusal {
+    reason: &'static str,
+    attempted: bool,
+}
+
+impl EntraRefusal {
+    fn new(reason: &'static str) -> Self {
+        Self {
+            reason,
+            attempted: false,
+        }
+    }
+
+    fn not_a_member() -> Self {
+        Self {
+            reason: "not_a_member",
+            attempted: true,
+        }
     }
 }
 
-/// A new session for `member`, whichever provider signed them in: the cookie value. Ends
+/// Who a checked ID token is in PM OS (`docs/user-database-spec.md` §7): by `(tid, oid)`;
+/// failing that, a first link by `preferred_username` only (never `email`), which the tool
+/// server re-checks and audits. Fails closed when the tool server can't be reached.
+async fn entra_person(
+    state: &AppState,
+    identity: &entra::Identity,
+) -> Result<DirectoryUser, EntraRefusal> {
+    let dir = &state.0.directory;
+    match dir.by_entra(&identity.tid, &identity.oid).await {
+        Ok(user) => {
+            // 1. A known identity: names in the token are ignored from here on.
+            if !user.is_active() {
+                return Err(EntraRefusal::new("deactivated"));
+            }
+            if user.entra != EntraState::Linked {
+                return Err(EntraRefusal::new("entra_needs_host"));
+            }
+            // The token's name is another user's sign-in name: flagged for admins (§7 step
+            // 3), but this person is who their `oid` says.
+            if let Some(name) = &identity.preferred_username {
+                if let Ok(other) = dir.by_sign_in_name(name).await {
+                    if other.handle != user.handle {
+                        tracing::warn!(user = %user.handle, other = %other.handle, "Microsoft sign-in name is another user's: flagged");
+                        record_identity_conflict(state, &other.handle).await;
+                    }
+                }
+            }
+            return Ok(user);
+        }
+        Err(ResolveError::NotFound) => {}
+        Err(_) => return Err(EntraRefusal::new("users_unavailable")),
+    }
+    // 2. A first link, by `preferred_username` only. No fallback to `email`.
+    let Some(name) = identity.preferred_username.as_deref() else {
+        return Err(EntraRefusal::not_a_member());
+    };
+    let user = match dir.by_sign_in_name(name).await {
+        Ok(u) => u,
+        Err(ResolveError::NotFound | ResolveError::Invalid) => {
+            return Err(EntraRefusal::not_a_member())
+        }
+        Err(_) => return Err(EntraRefusal::new("users_unavailable")),
+    };
+    match dir
+        .link_entra(&user.handle, &identity.tid, &identity.oid, name)
+        .await
+    {
+        Ok(linked) => {
+            if linked.first_link {
+                tracing::info!(user = %linked.user.handle, "first Microsoft sign-in: linked");
+            }
+            if !linked.user.is_active() {
+                return Err(EntraRefusal::new("deactivated"));
+            }
+            if linked.user.entra != EntraState::Linked {
+                return Err(EntraRefusal::new("entra_needs_host"));
+            }
+            Ok(linked.user)
+        }
+        Err(LinkError::Refused(why)) => Err(match why {
+            LinkRefusal::NotActive => EntraRefusal::new("deactivated"),
+            LinkRefusal::SignInUnconfirmed => EntraRefusal::new("sign_in_unconfirmed"),
+            LinkRefusal::HostOnly => EntraRefusal::new("entra_needs_host"),
+            // 3. A conflict: the tool server audited `users.identity_conflict` and flags it.
+            LinkRefusal::Linked | LinkRefusal::Taken => {
+                tracing::warn!(user = %user.handle, "Microsoft sign-in conflicts with an existing link: refused");
+                EntraRefusal::not_a_member()
+            }
+            // 4. Anything else.
+            _ => EntraRefusal::not_a_member(),
+        }),
+        Err(LinkError::RateLimited | LinkError::Unavailable(_)) => {
+            Err(EntraRefusal::new("users_unavailable"))
+        }
+    }
+}
+
+/// A new session for `user`, whichever provider signed them in: the cookie value. Ends
 /// whatever session this browser had (rotation). `entra` is the token's `(oid, tid)` for an
-/// Entra ID sign-in.
+/// Entra ID sign-in: the key the session is checked by on every request.
 async fn start_session(
     state: &AppState,
     headers: &HeaderMap,
-    member: &TeamMember,
+    user: &DirectoryUser,
     provider: &str,
-    entra: Option<(Option<String>, String)>,
+    entra: Option<(String, String)>,
 ) -> Result<String, ApiError> {
     if let Some(old) = session::cookie_value(headers) {
         state
@@ -879,24 +1146,51 @@ async fn start_session(
         .insert(
             hashed,
             Session {
-                handle: member.handle.clone(),
+                handle: user.handle.clone(),
                 csrf_token: session::random_token(),
                 created_at: at,
                 last_seen: at,
-                entra_oid: entra.as_ref().and_then(|(oid, _)| oid.clone()),
+                entra_oid: entra.as_ref().map(|(oid, _)| oid.clone()),
                 entra_tid: entra.map(|(_, tid)| tid),
             },
         )
         .await
         .map_err(ApiError::store)?;
-    tracing::info!(user = %member.handle, provider, "signed in");
+    tracing::info!(user = %user.handle, provider, "signed in");
+    let roles = Member::from_user(user).roles;
     record_sign_in(
         state,
-        Some((&member.handle, &session::assertion_ref(&hashed))),
+        Some((&user.handle, &session::assertion_ref(&hashed), &roles)),
         SignInEvent::SignIn { provider },
     )
     .await;
     Ok(id)
+}
+
+/// Flag a known Microsoft account signing in with a name that is `other`'s sign-in name
+/// (spec §7 step 3): `users.identity_conflict` at the tool server, through the sign-in events
+/// route. Best effort, like every sign-in event.
+async fn record_identity_conflict(state: &AppState, other: &str) {
+    let body = json!({
+        "action": "users.identity_conflict",
+        "provider": "entra",
+        "member": other,
+    });
+    let recorded = tokio::time::timeout(
+        SIGN_IN_RECORD_TIMEOUT,
+        state.0.toolserver.record_sign_in(None, &body),
+    )
+    .await;
+    if !matches!(recorded, Ok(Ok(()))) {
+        state
+            .0
+            .sign_in_record_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(
+            action = "users.identity_conflict",
+            "AUDIT: an identity conflict wasn't recorded"
+        );
+    }
 }
 
 /// How long recording a sign-in event may take before sign-in goes on without it.
@@ -914,17 +1208,17 @@ enum SignInEvent<'a> {
     },
     Refused {
         provider: &'a str,
-        /// The signed-out page's `reason`: `not_a_member`, `wrong_account`, `failed`, ….
+        /// The signed-out page's `reason`: `not_a_member`, `deactivated`, `failed`, ….
         reason: &'a str,
         /// The handle or email tried, hashed before it leaves this server.
         attempted: Option<&'a str>,
-        /// For `wrong_account`: the member whose email the account used.
+        /// For `wrong_account` (no longer sent): the member whose email the account used.
         member: Option<&'a str>,
     },
 }
 
 /// Record `event` at the tool server (`POST /internal/admin/events`), for `member` (its
-/// handle and session reference, for the user assertion) on a sign-in or sign-out.
+/// handle, session reference and roles, for the user assertion) on a sign-in or sign-out.
 ///
 /// **Fail-open, on purpose.** A sign-in or sign-out goes ahead when this fails (after at most
 /// [`SIGN_IN_RECORD_TIMEOUT`]): the failure is logged as an error and counted on `/readyz`
@@ -933,7 +1227,11 @@ enum SignInEvent<'a> {
 /// the tool server or the bot runtime, which audit each call themselves, so a missing
 /// sign-in event hides no action. Failing closed would turn a tool server blip into a
 /// lockout of everyone, the admins who would look into it included.
-async fn record_sign_in(state: &AppState, member: Option<(&str, &str)>, event: SignInEvent<'_>) {
+async fn record_sign_in(
+    state: &AppState,
+    member: Option<(&str, &str, &[Role])>,
+    event: SignInEvent<'_>,
+) {
     let (action, body) = match &event {
         SignInEvent::SignIn { provider } => (
             "web.sign_in",
@@ -964,7 +1262,10 @@ async fn record_sign_in(state: &AppState, member: Option<(&str, &str)>, event: S
         }
     };
     let (toolserver, handle) = match member {
-        Some((handle, session_ref)) => (state.0.toolserver.for_session(session_ref), Some(handle)),
+        Some((handle, session_ref, roles)) => (
+            state.0.toolserver.for_user(session_ref, roles),
+            Some(handle),
+        ),
         None => (state.0.toolserver.clone(), None),
     };
     let recorded = tokio::time::timeout(
@@ -1120,47 +1421,36 @@ async fn entra_callback(
             return fail(f);
         }
     };
-    let team = load_team(&state)?;
-    let Some(member) = auth::find_member_by_email(&team, &identity.email) else {
-        tracing::info!(provider = "entra", "sign-in refused: not in team.yaml");
-        record_sign_in(
-            &state,
-            None,
-            SignInEvent::Refused {
-                provider: "entra",
-                reason: "not_a_member",
-                attempted: Some(&identity.email),
-                member: None,
-            },
-        )
-        .await;
-        return Ok(redirect(
-            &signed_out_at("not_a_member"),
-            std::slice::from_ref(&clear),
-        ));
+    let user = match entra_person(&state, &identity).await {
+        Ok(user) => user,
+        Err(refusal) => {
+            tracing::info!(
+                provider = "entra",
+                reason = refusal.reason,
+                "sign-in refused"
+            );
+            record_sign_in(
+                &state,
+                None,
+                SignInEvent::Refused {
+                    provider: "entra",
+                    reason: refusal.reason,
+                    attempted: identity
+                        .preferred_username
+                        .as_deref()
+                        .filter(|_| refusal.attempted),
+                    member: None,
+                },
+            )
+            .await;
+            return Ok(redirect(
+                &signed_out_at(refusal.reason),
+                std::slice::from_ref(&clear),
+            ));
+        }
     };
-    // A member with `entra-oid` must be that very account: an email address reassigned to
-    // someone else in the tenant doesn't sign in as them.
-    if !oid_matches(member, identity.oid.as_deref()) {
-        tracing::warn!(provider = "entra", user = %member.handle, "sign-in refused: object id doesn't match team.yaml");
-        record_sign_in(
-            &state,
-            None,
-            SignInEvent::Refused {
-                provider: "entra",
-                reason: "wrong_account",
-                attempted: None,
-                member: Some(&member.handle),
-            },
-        )
-        .await;
-        return Ok(redirect(
-            &signed_out_at("wrong_account"),
-            std::slice::from_ref(&clear),
-        ));
-    }
     let entra_id = (identity.oid.clone(), identity.tid.clone());
-    let id = start_session(&state, &headers, member, entra.name(), Some(entra_id)).await?;
+    let id = start_session(&state, &headers, &user, entra.name(), Some(entra_id)).await?;
     Ok(redirect(
         &entra::safe_return(Some(&started.return_to)),
         &[clear, session::set_cookie(&id)],
@@ -1183,9 +1473,17 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult 
         } else {
             "dev"
         };
+        // The roles in the event's assertion are informational: whatever answer is kept, with
+        // no call to the tool server (a sign-out never waits on it).
+        let roles = state
+            .0
+            .directory
+            .peek(&Lookup::handle(&session.handle))
+            .map(|u| Member::from_user(&u).roles)
+            .unwrap_or_default();
         record_sign_in(
             &state,
-            Some((&session.handle, &session::assertion_ref(&id))),
+            Some((&session.handle, &session::assertion_ref(&id), &roles)),
             SignInEvent::SignOut { provider },
         )
         .await;
@@ -1202,10 +1500,9 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult 
 fn me_json(signed: &Signed, st: &UserState) -> Response {
     Json(json!({
         "handle": signed.member.handle,
-        // The handle: a team.yaml member (`pmos_contract::model::TeamMember`) has no display
-        // name, and the name onboarding takes from Slack stays on the join request, which
-        // is not written to team.yaml. The user database will have one.
-        "name": signed.member.handle,
+        // Untrusted text from the user database, rendered as plain text by the app.
+        "display_name": signed.member.display_name,
+        "name": signed.member.name(),
         "roles": signed.member.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
         "permissions": pmos_contract::permissions::granted(&signed.member.roles),
         "csrf_token": signed.session.csrf_token,
@@ -1216,7 +1513,9 @@ fn me_json(signed: &Signed, st: &UserState) -> Response {
     .into_response()
 }
 
-async fn me(State(state): State<AppState>, signed: Signed) -> ApiResult {
+/// `GET /api/me`: from the user database (a fresh answer, or on the last-known-good path at
+/// most 5 minutes old) and pmos-web's own store.
+async fn me(State(state): State<AppState>, SignedRead(signed): SignedRead) -> ApiResult {
     let st = state
         .0
         .settings
