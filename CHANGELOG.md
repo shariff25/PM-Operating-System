@@ -4,6 +4,18 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- Security fixes from the web app review (service side):
+  - **The web app and the console can't be run with signed user assertions off.** The runtime
+    and the tool server now require them whenever either is configured, and refuse to start
+    otherwise; `add-bot` and a restore no longer restart them with assertions off.
+  - **A follow-up can't leak what an earlier answer read.** A follow-up in the same
+    conversation starts as restricted as the answers it builds on, so a reply drawn from a
+    restricted source is still blocked in a channel with people outside the team.
+  - **The console reads one PM's draft or task only for that PM or an admin.**
+  - **A runtime restart no longer hides Slack replies silently.** The runtime now refuses the
+    Slack service's saved place in the feed when it is from before the restart, instead of
+    answering "nothing new"; the Slack service still needs a small change to start over by
+    itself (until then, its log says what to do).
 - Security fixes from the November review: each token can do only what its service needs, and
   text from a pull request, a model or a connected system never chooses what runs or who sees it.
   - **The eval gate no longer runs a pull request's code on the Spark.** A pull request could

@@ -76,6 +76,8 @@ pub struct Transition {
     pub error: Option<String>,
     pub approvals: Option<Vec<String>>,
     pub checklist: Option<Vec<ChecklistItem>>,
+    /// The highest data class the task's sessions read (`Task::sources_sensitivity`).
+    pub sensitivity: Option<crate::model::Sensitivity>,
     pub attempts_delta: i32,
     /// `(kind, text)` added to the task's events.
     pub event: Option<(String, String)>,
@@ -180,6 +182,10 @@ pub trait BotsStore: Send + Sync {
 
     /// Notifications after `after` (a sequence number), oldest first.
     async fn notifications(&self, after: i64, limit: usize) -> StoreResult<Vec<Notification>>;
+    /// The last notification sequence number issued, whether or not that notification has
+    /// been pruned since; `0` before the first. Never goes down while the store lives, so a
+    /// cursor past it came from another store (or another process's memory).
+    async fn feed_head(&self) -> StoreResult<i64>;
     /// Delete notifications created before `before`. Returns how many.
     async fn prune_notifications(&self, before: DateTime<Utc>) -> StoreResult<u64>;
 
@@ -241,6 +247,9 @@ pub fn apply(task: &mut Task, change: &Transition, now: DateTime<Utc>) -> Result
     }
     if let Some(c) = &change.checklist {
         task.checklist = c.clone();
+    }
+    if let Some(s) = change.sensitivity {
+        task.sources_sensitivity = Some(s);
     }
     task.attempts += change.attempts_delta;
     task.updated_at = now;
@@ -545,6 +554,10 @@ impl BotsStore for MemoryStore {
             .take(limit)
             .cloned()
             .collect())
+    }
+
+    async fn feed_head(&self) -> StoreResult<i64> {
+        Ok(self.state().notification_seq)
     }
 
     async fn prune_notifications(&self, before: DateTime<Utc>) -> StoreResult<u64> {

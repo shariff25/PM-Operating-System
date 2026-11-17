@@ -41,6 +41,66 @@ reach PMs until the affected category still meets its bar (D10).
 8. **Check:** run `deploy/pmos-admin smoke <your handle>`, then the benchmarks for any category
    the change touches (`deploy/pmos-admin evals-run --category <c>`).
 
+## Upgrading to user assertions on by default
+
+From this version the runtime and the tool server run in `require` whenever the web app's or
+the console's tokens are set, and refuse to start in `off` or `verify` (`docs/user-assertion.md`,
+Modes). On an existing install:
+
+1. Run `deploy/setup.sh` again (same arguments). It writes `PMOS_ASSERTION_MODE=require` into
+   `deploy/.env` if the line is blank, and `PMOS_ONBOARDING_V2=1` and `PMOS_NUDGES=1`.
+2. If `deploy/.env` says `PMOS_ASSERTION_MODE=off` or `verify`, change it to `require`.
+   `pmos-admin up`, `add-bot` and `restore` now refuse to go on otherwise, and say so.
+3. `deploy/pmos-admin up --models` (with `--console` and `--web` if you run them). The mode now
+   comes from `deploy/.env` on every path, so an `add-bot` or the `up` after a `restore` no
+   longer starts the runtime with assertions off while the web app keeps running.
+
+## Tool-server migrations renumbered (web-app branch databases only)
+
+Which databases: only a tool-server database (`pmos_toolserver`) that was migrated by the
+`claude/web-app` branch **before** it merged `main`'s security fixes (commit 5bb6de4). That
+branch numbered its migrations `0009_audit_source_titles` and `0010_audit_admin_reads`; after
+the merge they are `0010` and `0011`, and `main`'s `0009_note_sensitivity` is new. Such a
+database fails at start-up with sqlx's "migration 9 was previously applied but has been
+modified". Only dev and test stacks of that branch can have it: the Spark runs `main`, and
+`scripts/claude-test-stack.sh` keeps everything in memory. Check with:
+
+```sh
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T postgres \
+  psql -U postgres -d pmos_toolserver -c "SELECT version, description FROM _sqlx_migrations ORDER BY version"
+```
+
+Affected when version 9 reads `audit source titles`.
+
+**Reset (verified path; loses the tool server's data: approvals, sessions, linked accounts,
+audit):** a dev or test stack holds fake data only.
+
+```sh
+deploy/pmos-admin down
+docker compose -f deploy/compose.yaml --env-file deploy/.env up -d postgres
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T postgres psql -U postgres \
+  -v ON_ERROR_STOP=1 -c "DROP DATABASE pmos_toolserver WITH (FORCE)" \
+  -c "CREATE DATABASE pmos_toolserver OWNER pmos_toolserver"
+deploy/pmos-admin up
+```
+
+The tool server makes its tables again at start-up. For a local `cargo run` with its own
+database, drop and recreate that database the same way.
+
+**Repair (keeps the data; not exercised in CI, so take a backup first):** move the two
+applied rows to their new numbers with their new checksums, then start the tool server, which
+applies `0009_note_sensitivity` (it only adds a nullable column):
+
+```sh
+c10=$(sha384sum crates/toolserver/migrations/0010_audit_source_titles.sql | cut -d' ' -f1)
+c11=$(sha384sum crates/toolserver/migrations/0011_audit_admin_reads.sql | cut -d' ' -f1)
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T postgres \
+  psql -U postgres -d pmos_toolserver -v ON_ERROR_STOP=1 -1 \
+  -c "UPDATE _sqlx_migrations SET version = 11, description = 'audit admin reads', checksum = decode('$c11', 'hex') WHERE version = 10" \
+  -c "UPDATE _sqlx_migrations SET version = 10, description = 'audit source titles', checksum = decode('$c10', 'hex') WHERE version = 9"
+deploy/pmos-admin up
+```
+
 ## Updating the Slack app
 
 A new scope or event in `docs/slack-app-manifest.yaml` does nothing until the app in Slack has

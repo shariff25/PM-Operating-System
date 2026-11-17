@@ -258,13 +258,13 @@ async fn a_missing_assertion_is_refused_in_require_and_accepted_in_verify_and_of
         let read = format!("/internal/approvals/{}?user={SLACK_PM}", srv.mine);
         let (s, v) = srv.get(&read, WEB_TOKEN, None).await;
         assert_eq!(s, want, "{mode:?}: {v}");
+        // From the console's read-only token a single item may name nobody, but under
+        // `require` it still needs an assertion (W3); in `off` and `verify` it reads without.
+        let read = format!("/internal/approvals/{}", srv.mine);
+        let (s, v) = srv.get(&read, CONSOLE_TOKEN, None).await;
+        assert_eq!(s, want, "{mode:?}: {v}");
         if want == 401 {
             refused(s, &v);
-            // From the console's read-only token a single item may name nobody: it reads
-            // without one.
-            let read = format!("/internal/approvals/{}", srv.mine);
-            let (s, _) = srv.get(&read, CONSOLE_TOKEN, None).await;
-            assert_eq!(s, 200);
         }
     }
 }
@@ -536,4 +536,185 @@ async fn the_console_token_only_reads_even_with_an_assertion() {
         )
         .await;
     assert_eq!(s, 403);
+}
+
+/// Every approvals route × method, for each client token, with the request otherwise right
+/// (the PM named, signed for them when the client signs): exactly the expected set answers
+/// `2xx`, and everything else is refused (`401`, `403` or `405`). A new route or method that
+/// widens a client fails here (W1).
+#[tokio::test]
+async fn every_approvals_route_and_method_allows_exactly_what_each_client_needs() {
+    const METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+    type Allowed = &'static [(&'static str, &'static str)];
+    let clients: [(&str, &str, Option<Signer>, Allowed); 4] = [
+        (
+            "orchestrator",
+            SERVICE_TOKEN,
+            None,
+            &[
+                ("GET", "item"),
+                ("GET", "list"),
+                ("GET", "sources"),
+                ("POST", "decision"),
+            ],
+        ),
+        (
+            "slack bot",
+            BOT_TOKEN,
+            None,
+            &[("GET", "item"), ("GET", "list"), ("POST", "decision")],
+        ),
+        (
+            "web",
+            WEB_TOKEN,
+            Some(Signer::web()),
+            &[
+                ("GET", "item"),
+                ("GET", "list"),
+                ("GET", "sources"),
+                ("POST", "decision"),
+            ],
+        ),
+        (
+            "console",
+            CONSOLE_TOKEN,
+            Some(Signer::console()),
+            &[("GET", "item"), ("GET", "list")],
+        ),
+    ];
+    for (name, token, signer, expected) in clients {
+        // A fresh server each, since an allowed decision closes the item.
+        let srv = start(Mode::Require).await;
+        let routes = [
+            ("list", list_target(SLACK_PM)),
+            (
+                "item",
+                format!("/internal/approvals/{}?user={SLACK_PM}", srv.mine),
+            ),
+            (
+                "sources",
+                format!("/internal/approvals/{}/sources?user={SLACK_PM}", srv.mine),
+            ),
+            (
+                "decision",
+                format!("/internal/approvals/{}/decision", srv.mine),
+            ),
+        ];
+        let mut allowed = Vec::new();
+        for (route, target) in &routes {
+            for method in METHODS {
+                let body = (method != "GET" && method != "DELETE").then(|| reject(SLACK_PM));
+                let a = signer.as_ref().map(|s| {
+                    s.sign(
+                        SLACK_PM,
+                        method,
+                        target,
+                        body.as_deref().unwrap_or_default(),
+                    )
+                });
+                let (s, v) = srv
+                    .send(
+                        Method::from_bytes(method.as_bytes()).unwrap(),
+                        target,
+                        token,
+                        body.as_deref(),
+                        a.as_deref(),
+                    )
+                    .await;
+                match s {
+                    200..=299 => allowed.push((method, *route)),
+                    401 | 403 | 405 => {}
+                    other => panic!("{name} {method} {route}: unexpected {other}: {v}"),
+                }
+            }
+        }
+        allowed.sort();
+        assert_eq!(allowed, expected.to_vec(), "{name}");
+    }
+}
+
+/// The console reads one item (its admin view) only with an assertion under `require`, and
+/// then only the subject's own item, or any item when the subject is an admin in the tool
+/// server's own `team.yaml` (W3). The web token always names the PM and reads only theirs.
+#[tokio::test]
+async fn one_item_reads_are_the_subjects_own_or_a_signed_admins() {
+    let srv = start(Mode::Require).await;
+    let console = Signer::console();
+    let theirs = format!("/internal/approvals/{}", srv.theirs);
+    // Unsigned: refused.
+    let (s, v) = srv.get(&theirs, CONSOLE_TOKEN, None).await;
+    refused(s, &v);
+    // Signed as the owner: answered.
+    let a = console.sign(OTHER, "GET", &theirs, b"");
+    let (s, v) = srv.get(&theirs, CONSOLE_TOKEN, Some(&a)).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["user"], OTHER);
+    // Signed as another PM who isn't an admin: as if it didn't exist.
+    let a = console.sign(SLACK_PM, "GET", &theirs, b"");
+    let (s, _) = srv.get(&theirs, CONSOLE_TOKEN, Some(&a)).await;
+    assert_eq!(s, 404);
+    // The roles in the assertion don't count; the tool server's team.yaml does.
+    let claims = Claims::new("console", "toolserver", SLACK_PM, &[Role::Admin], "ses_t").unwrap();
+    let req = RequestBinding::new("GET", &theirs, b"").unwrap();
+    let a = console
+        .ring
+        .sign(&claims, unix_now(), 60, Some(&req))
+        .unwrap();
+    let (s, _) = srv.get(&theirs, CONSOLE_TOKEN, Some(&a)).await;
+    assert_eq!(s, 404);
+    // Made an admin there: answered.
+    let mut file = srv._f.svc.team().file();
+    for m in &mut file.members {
+        if m.handle == SLACK_PM {
+            m.roles.push(Role::Admin);
+        }
+    }
+    srv._f.svc.team().replace(file);
+    let a = console.sign(SLACK_PM, "GET", &theirs, b"");
+    let (s, v) = srv.get(&theirs, CONSOLE_TOKEN, Some(&a)).await;
+    assert_eq!(s, 200, "{v}");
+    // The web app is never the admin view: an admin still reads only their own items there.
+    let read = format!("/internal/approvals/{}?user={SLACK_PM}", srv.theirs);
+    let a = Signer::web().sign(SLACK_PM, "GET", &read, b"");
+    let (s, _) = srv.get(&read, WEB_TOKEN, Some(&a)).await;
+    assert_eq!(s, 404);
+    let a = Signer::web().sign(SLACK_PM, "GET", &theirs, b"");
+    let (s, _) = srv.get(&theirs, WEB_TOKEN, Some(&a)).await;
+    assert_eq!(s, 404);
+}
+
+/// An edit may never move a draft for any client but the orchestrator (W4): the Slack bot
+/// and `pmos-web` get `422 target_changed`, the console can't decide at all, and the
+/// orchestrator may.
+#[tokio::test]
+async fn target_changed_applies_to_every_client_but_the_orchestrator() {
+    let srv = start(Mode::Require).await;
+    let decide = format!("/internal/approvals/{}/decision", srv.mine);
+    let moved = serde_json::to_vec(&json!({
+        "decided_by": SLACK_PM,
+        "decision": "edit",
+        "args": {"channel": SLACK_ALL_TEAM, "thread_ts": "1731600000.000999", "text": "Yes."},
+    }))
+    .unwrap();
+    for (token, signer) in [(BOT_TOKEN, None), (WEB_TOKEN, Some(Signer::web()))] {
+        let a = signer.map(|s| s.sign(SLACK_PM, "POST", &decide, &moved));
+        let (s, v) = srv
+            .send(Method::POST, &decide, token, Some(&moved), a.as_deref())
+            .await;
+        assert_eq!(s, 422, "{v}");
+        assert_eq!(v["code"], "target_changed", "{v}");
+    }
+    let a = Signer::console().sign(SLACK_PM, "POST", &decide, &moved);
+    let (s, _) = srv
+        .send(Method::POST, &decide, CONSOLE_TOKEN, Some(&moved), Some(&a))
+        .await;
+    assert_eq!(s, 403);
+    let read = format!("/internal/approvals/{}", srv.mine);
+    let (_, item) = srv.get(&read, SERVICE_TOKEN, None).await;
+    assert_eq!(item["status"], "pending");
+    let (s, v) = srv
+        .send(Method::POST, &decide, SERVICE_TOKEN, Some(&moved), None)
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["args"]["thread_ts"], "1731600000.000999");
 }

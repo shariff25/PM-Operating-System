@@ -208,6 +208,72 @@ async fn the_subject_must_be_every_person_the_request_names() {
     env.finish().await;
 }
 
+/// Under `require`, the console reads one task's detail, events, trace or drafts only signed
+/// for a viewer who is that task's PM or an admin in the runtime's team.yaml. Its list of
+/// every task (metadata) still needs none. In `verify`, an unsigned read still works.
+#[tokio::test]
+async fn the_console_reads_one_task_only_for_its_pm_or_an_admin() {
+    let env = Env::memory_with_catalog_and_assertions(
+        catalog_with_admin(Some("cy")),
+        assertions(Mode::Require),
+    )
+    .await;
+    let id = env.ask("What's on the roadmap?").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let console = Signer::console();
+    for target in [
+        format!("/v1/tasks/{id}"),
+        format!("/v1/tasks/{id}/events"),
+        format!("/v1/tasks/{id}/trace"),
+        format!("/v1/tasks/{id}/drafts"),
+    ] {
+        let (s, v) = send(&env, Method::GET, &target, "console", None, None, None).await;
+        refused(s, &v);
+        for (viewer, want) in [("ana", 200), ("ben", 404), ("cy", 200)] {
+            let a = console.sign(viewer, "GET", &target, b"");
+            let (s, v) = send(&env, Method::GET, &target, "console", None, None, Some(&a)).await;
+            assert_eq!(s, want, "{viewer} {target}: {v}");
+        }
+        // The assertion's own roles don't make an admin.
+        let claims = pmos_assertion::Claims::new(
+            "console",
+            "bots",
+            "ben",
+            &[pmos_contract::model::Role::Admin],
+            "ses_test",
+        )
+        .unwrap();
+        let req = pmos_assertion::RequestBinding::new("GET", &target, b"").unwrap();
+        let a = console
+            .ring
+            .sign(&claims, unix_now(), 60, Some(&req))
+            .unwrap();
+        let (s, _) = send(&env, Method::GET, &target, "console", None, None, Some(&a)).await;
+        assert_eq!(s, 404, "{target}");
+    }
+    // The list of every task is metadata and names no one.
+    let (s, v) = send(&env, Method::GET, "/v1/tasks", "console", None, None, None).await;
+    assert_eq!(s, 200, "{v}");
+    env.finish().await;
+
+    let env = Env::memory_with_assertions(assertions(Mode::Verify)).await;
+    let id = env.ask("q").await["id"].as_str().unwrap().to_string();
+    let (s, v) = send(
+        &env,
+        Method::GET,
+        &format!("/v1/tasks/{id}"),
+        "console",
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    env.finish().await;
+}
+
 #[tokio::test]
 async fn the_console_signs_only_what_names_a_person() {
     let env = Env::memory_with_assertions(assertions(Mode::Require)).await;

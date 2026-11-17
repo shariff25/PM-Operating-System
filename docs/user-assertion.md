@@ -265,13 +265,30 @@ entries, one per caller→receiver pair.
 
 | Mode | Valid assertion | Bad assertion | No assertion |
 | --- | --- | --- | --- |
-| `off` (default) | ignored | ignored | as before: the named person is believed |
+| `off` | ignored | ignored | as before: the named person is believed |
 | `verify` | believed | `401` | as before |
-| `require` | believed | `401` | `401` if the call names a person |
+| `require` | believed | `401` | `401` if the call names a person, or reads one PM's item (an approval, or a task's detail, events, trace or drafts) |
 
-`verify` and `require` refuse to start without at least one key. The Slack client, workers,
-evals, the orchestrator's service token and the Slack bot's token are never checked, in any
-mode.
+**The secure state is the default, and the insecure one refuses to start** (W2). A receiver
+with a client that acts for a person configured (the tool server: `PMOS_WEB_TOKEN` or
+`PMOS_CONSOLE_TS_TOKEN`; the runtime: `web=` or `console=` in `PMOS_BOTS_TOKENS`):
+
+- runs in `require` when `PMOS_ASSERTION_MODE` is unset or blank;
+- needs a key for each such client in `PMOS_ASSERTION_KEYS` (`web:<aud>`, `console:<aud>`), or
+  refuses to start naming the setting and the missing pair;
+- refuses to start in `off` or `verify`, naming the token and the fix, unless
+  `PMOS_ASSERTION_INSECURE_OFF=1`. That override is for development only, **never
+  production**: anyone holding the client's token can then act as any PM. Every start-up
+  with it logs a line beginning `INSECURE` at error level.
+
+Without such a client, an unset mode is `off`, as before. To roll out in steps on an existing
+install, `verify` with the override for a short while is still possible; `require` is where
+it must end. `verify` and `require` refuse to start without at least one key. The Slack client,
+workers, evals, the orchestrator's service token and the Slack bot's token are never checked,
+in any mode.
+
+The mode, the start-up rule, the refusals and the verifier are shared code
+(`pmos_assertion::receiver`); each receiver's `assertion.rs` only names itself.
 
 ### What each service does
 
@@ -289,7 +306,10 @@ mode.
 - **The console** signs every call that names a person, as that person: one PM's tasks
   (`requested_by=`), routines (`owner=`) and pending approvals (`user=`). Routine pause, resume
   and delete name no one and are signed as the viewer who made them (an admin acting on
-  someone else's routine signs as the admin). Reads of everything carry none. For an admin's
+  someone else's routine signs as the admin). One task's detail, events and trace (the task
+  page) are signed as the viewer, and the runtime answers only the task's PM or an admin in
+  its own `team.yaml`. Reads of everything (the bot list, the list of all tasks, all routines)
+  carry none. For an admin's
   view of every inbox it signs as each member whose inbox it reads. Its `sid` is the fixed
   `unknown`: the SSO proxy's session isn't visible to it. It calls the tool server with its own
   token (`PMOS_CONSOLE_TS_TOKEN` there), which may only read approvals.
@@ -300,7 +320,10 @@ mode.
   still apply on top, so a body naming someone else is `403`.
 - **The tool server** checks calls with the web and console tokens on the approvals routes. The
   subject must equal `user=` and `decided_by`; one item read with an assertion must be the
-  subject's (`404` otherwise). Decisions still check the item's user and `team.yaml`. On the
+  subject's (`404` otherwise), except that the console's admin view reads any item when the
+  subject is an admin in the tool server's own `team.yaml`. Under `require`, every read of
+  one item needs an assertion, from the console too. The console's token never decides,
+  whatever it carries (the route and the service both refuse it). Decisions still check the item's user and `team.yaml`. On the
   admin routes (web token only) the subject must equal `user=`, the viewer, whose role the tool
   server then checks in its own `team.yaml` (`403 forbidden` without it).
 - **Every failure** is the same `401 {"code": "bad_assertion"}`. The log has the client and the
@@ -341,12 +364,23 @@ mode.
   and decides approvals for the person it signs for (an edit may change a draft's text, never
   where it goes: `422 target_changed`), and the console still reads everything
   with its runtime token and pauses any routine (those name no one).
-- **One item read by the console without an assertion:** from the console's read-only token,
-  `GET /internal/approvals/{id}` may name no one, so it reads any item by id without one. From
-  the web token it must name the PM (`?user=`, else `404`), so every `pmos-web` read of one
-  item (`ToolServer::approval_for`: the first read when a draft is opened and the re-read
-  after a conflicting decision) names the PM and is signed for them.
-- **Replicas and restarts:** the replay cache is per process (see **Replay protection**).
+- **One item read by the console:** under `require` it needs an assertion for the item's PM
+  or an admin; in `off` and `verify` (only with the development override once the console is
+  configured) it still reads any item by id. The same holds for one task's detail, events,
+  trace and drafts on the runtime. From the web token a read of one item must name the PM
+  (`?user=`, else `404`), so every `pmos-web` read of one item (`ToolServer::approval_for`:
+  the first read when a draft is opened and the re-read after a conflicting decision) names
+  the PM and is signed for them.
+- **What the console still sees on its token alone:** the list of every task (who asked,
+  which bot, status, times, and the fields the list carries), every routine, and the bot
+  roster. It signs as each member whose inbox an admin views.
+- **Replicas and restarts:** the replay cache is per process (see **Replay protection**). It
+  is a `MemoryReplayCache` in each receiver. The `ReplayGuard` trait is synchronous, so a
+  Postgres-backed guard would have to block an async runtime thread on every assertion; that
+  is not small or safe, so it is not built. On the single-box deployment there is one
+  runtime and one tool server, and a restart only re-opens the at most 125-second window of
+  assertions issued just before it, for the identical bound request. Before running more
+  than one replica of either, give the trait an async form and a shared store.
 - **Audit:** the tool server's audit records the client (`web`, `console`), not yet the
   assertion's `iss`, `sub` and `sid`.
 
@@ -357,19 +391,26 @@ mode.
    (`PMOS_AK_WEB_BOTS`, `PMOS_AK_WEB_TOOLSERVER`, `PMOS_AK_CONSOLE_BOTS`,
    `PMOS_AK_CONSOLE_TOOLSERVER`, each `<key id>:<base64>`). `compose.yaml` refuses to start
    until they exist. Keep the new `deploy/.env` in the password manager.
-2. `deploy/pmos-admin up …` as before. The web app and the console now use their own
-   tool-server tokens, and sign with their keys. Without `--web`, `PMOS_ASSERTION_MODE` stays
-   `off` unless `deploy/.env` sets it.
-3. With `--web`, `pmos-admin up` sets `PMOS_ASSERTION_MODE=require` for the runtime and the tool
-   server (unless `deploy/.env` sets another mode), and says so. To roll out in steps, set
-   `PMOS_ASSERTION_MODE=verify` in `deploy/.env` first, watch for `refused a user assertion` in
-   `pmos-admin logs bots` and `logs toolserver`, then clear it (or set `require`).
+2. `deploy/setup.sh` also writes `PMOS_ASSERTION_MODE=require` into `deploy/.env` when it is
+   blank. The mode lives there, not in one command's environment, so `pmos-admin up` (with or
+   without `--web`), `add-bot`, and the `up` after a `restore` all start the runtime and the
+   tool server in `require`. Each of those checks first and refuses (exit 2, before anything
+   is stopped, started or written) when the mode is `off` or `verify` while a web or console
+   token is set, or when a set token lacks its key.
+3. `deploy/pmos-admin up …` as before. The web app and the console use their own tool-server
+   tokens and sign with their keys. `up --web` and `up --console` also check that every
+   setting their client needs is there. Without the web app and console settings at all, the
+   default profile starts with neither client configured and assertions off
+   (`deploy/compose.yaml` passes those tokens and keys only when they are set).
 4. To rotate a key: give the receivers `<new id>:<new>:<old id>:<old>` for that pair, then the
    caller `<new id>:<new>`, then drop the old half everywhere after two minutes.
 
 `scripts/claude-test-stack.sh` with `PMOS_TEST_WEB=1` does the same for the test stack: fresh
 keys for `web:bots` and `web:toolserver`, pmos-web's own tool-server token, and `require` on
-both receivers.
+both receivers. Without it, neither receiver has a web or console client and assertions are
+off. The eval stack (`deploy/compose.evals.yaml`) gives its runtime a `console` token only for
+the benchmark runner's trace reads, on fake data in memory with fresh tokens each run, and so
+sets `off` with the development override, said so in the file.
 
 ## Adoption checklist
 

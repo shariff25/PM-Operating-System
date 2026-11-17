@@ -99,6 +99,18 @@ for k in PMOS_AK_WEB_BOTS PMOS_AK_WEB_TOOLSERVER PMOS_AK_CONSOLE_BOTS PMOS_AK_CO
 done
 fill PMOS_VAULT_KEY "k1:$(openssl rand -base64 32)"
 ok "secrets filled in (existing values kept)"
+# Kept in deploy/.env, so every later `pmos-admin up`, `add-bot` and `restore` keeps it: the
+# runtime and the tool server refuse to start in another mode while the web app's or the
+# console's tokens are set (docs/user-assertion.md, Modes).
+fill PMOS_ASSERTION_MODE require
+fill PMOS_ONBOARDING_V2 1
+fill PMOS_NUDGES 1
+mode=$(grep -E "^PMOS_ASSERTION_MODE=" "$ENV" | head -1 | cut -d= -f2-)
+if [ "$mode" = require ]; then
+  ok "user assertions: require"
+else
+  warn "PMOS_ASSERTION_MODE=$mode in deploy/.env: the runtime and the tool server will refuse to start with it unless PMOS_ASSERTION_INSECURE_OFF=1 (development only)"
+fi
 
 missing=()
 for k in PMOS_SLACK_BOT_TOKEN PMOS_SLACK_APP_TOKEN; do

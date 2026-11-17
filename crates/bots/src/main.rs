@@ -59,6 +59,9 @@ async fn main() -> Result<()> {
         keys = ?config.assertions.key_ids(),
         "user assertions from web and console"
     );
+    if let Some(warning) = config.assertions.insecure_warning() {
+        tracing::error!("{warning}");
+    }
     let app = router_with(
         rt,
         config.clients.clone(),
