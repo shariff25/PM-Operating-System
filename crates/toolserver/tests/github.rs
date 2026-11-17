@@ -640,6 +640,7 @@ fn member(handle: &str, slack: &str, github: Option<&str>, roles: Vec<Role>) -> 
         slack_id: slack.into(),
         email: Some(format!("{handle}@example.com")),
         github: github.map(String::from),
+        entra_oid: None,
         roles,
     }
 }

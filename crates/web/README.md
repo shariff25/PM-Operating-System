@@ -7,7 +7,8 @@ PM. The browser never sees a service token, a connector token or another PM's da
 ```
 browser ──HTTPS──► pmos-web :8770 ──► pmos-bots :8750        (client "web", X-Pmos-User + X-Pmos-Assertion)
                                └──► pmos-toolserver :8710  (approvals only, web token + X-Pmos-Assertion)
-                               └──► content/team.yaml      (re-read on every request)
+                               └──► content/team.yaml      (parsed once, re-read when it changes)
+pmos-slack ───────► pmos-web :8770, or :8771 with PMOS_WEB_INTERNAL_BIND  (PUT /internal/brief/{handle})
 ```
 
 ## Running it
@@ -27,8 +28,10 @@ For Entra ID sign-in instead of `PMOS_WEB_DEV_LOGIN=1`, set `PMOS_WEB_ENTRA_TENA
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `PMOS_WEB_BIND` | `127.0.0.1:8770` | |
-| `PMOS_WEB_DEV_LOGIN` | off | `1` turns on development sign-in. The server starts with Entra ID, development sign-in, or both (a loud warning); with neither it refuses to start |
+| `PMOS_WEB_BIND` | `127.0.0.1:8770` | Must be a loopback address (`127.0.0.1`, `::1`) while development sign-in is on |
+| `PMOS_WEB_INTERNAL_BIND` | none | A second listener for the server-to-server route `PUT /internal/brief/{handle}` (and `/healthz`, `/readyz`); the browser-facing `PMOS_WEB_BIND` then doesn't serve that route. Without it the route is on `PMOS_WEB_BIND`, refusing any call that carries a session cookie or an `Origin`. Must differ from `PMOS_WEB_BIND` |
+| `PMOS_WEB_DEV_LOGIN` | off | `1` turns on development sign-in, only on a loopback `PMOS_WEB_BIND`. The server starts with Entra ID or development sign-in; with neither it refuses to start |
+| `PMOS_WEB_DEV_LOGIN_WITH_ENTRA` | off | `1` lets development sign-in run beside Entra ID (a loud warning). Without it, both on refuses to start: development sign-in bypasses Entra. For a developer's own machine only |
 | `PMOS_WEB_ENTRA_TENANT_ID` | none | Entra ID sign-in (`docs/entra-sign-in.md`): the directory (tenant) id, a GUID. `common`, `organizations` and `consumers` are refused |
 | `PMOS_WEB_ENTRA_CLIENT_ID` | none | The application (client) id, a GUID |
 | `PMOS_WEB_ENTRA_CLIENT_SECRET` | none | The client secret, from the secret store. Never logged or shown in errors. Entra is on only with all three and `PMOS_WEB_PUBLIC_URL`; any of them alone refuses to start |
@@ -40,14 +43,20 @@ For Entra ID sign-in instead of `PMOS_WEB_DEV_LOGIN=1`, set `PMOS_WEB_ENTRA_TENA
 | `PMOS_ASSERTION_KEYS` | none | The keys pmos-web signs user assertions with: `web:bots:<kid>:<base64>` and `web:toolserver:<kid>:<base64>`, each optionally followed by `:<kid>:<base64>` for the previous key (`docs/user-assertion.md`, Keys). Without a key for an upstream, its calls carry no assertion. A malformed entry, a key under 32 bytes, or another service's pair refuses to start |
 | `PMOS_CONTENT_ROOT` | `content` | Where `team.yaml` is. The server won't start if it doesn't parse |
 | `PMOS_WEB_STATIC_DIR` | none | The built web app. Must contain `index.html`, served for any unknown non-`/api` path that isn't an asset; the icon is `favicon.svg` (or `favicon.ico`) here |
-| `PMOS_WEB_PUBLIC_URL` | none | The origin browsers use. Writes must come from it; without it, `Origin` must match `Host`. Required with Entra ID (`https` unless loopback): the redirect URI is `<PMOS_WEB_PUBLIC_URL>/api/auth/callback` |
+| `PMOS_WEB_PUBLIC_URL` | none | The origin browsers use. Writes must come from it; without it, `Origin` must match `Host`. Required with Entra ID (`https` unless loopback): the redirect URI is `<PMOS_WEB_PUBLIC_URL>/api/auth/callback`. When it is `https`, every response carries `Strict-Transport-Security: max-age=31536000` |
 | `PMOS_WEB_SESSION_IDLE_MINUTES` | `480` | Idle expiry |
 | `PMOS_WEB_SESSION_MAX_MINUTES` | `1440` | Absolute expiry from sign-in |
 | `PMOS_WEB_DATABASE_URL` | none | Postgres for sessions, settings and follow-ups (`src/store_config.rs`). Without it everything is in memory and a start-up warning says a restart signs everyone out |
 | `PMOS_WEB_BRIEF` | off | `1` turns on `GET /api/brief` and the follow-up routes; off, they answer `501 not_built` and the app hides the section |
 | `PMOS_WEB_BRIEF_TOKEN` | none | The bearer token `PUT /internal/brief/{handle}` needs, at least 32 characters. Without it that route answers `501` |
 
-`GET /healthz` answers `ok` with no sign-in. SIGTERM or Ctrl-C lets in-flight requests finish.
+`GET /healthz` answers `ok` with no sign-in while the process runs. `GET /readyz` answers `200`
+or `503` with each check `ok` or `down` (its store, `team.yaml`, and the runtime's and the tool
+server's own `/healthz` within two seconds); the reason goes to the log, never the answer.
+Every ten minutes (`app::HOUSEKEEPING_EVERY`, and at each sign-in) expired sessions,
+follow-ups, `changed` items and old edits and suggestions are deleted, whether or not anyone
+signs in. SIGTERM or Ctrl-C stops that task and lets in-flight requests finish on both
+listeners.
 
 The `__Host-pmos` cookie is `Secure`, so browsers only keep it over HTTPS (or on
 `http://localhost` in most browsers). Put a TLS proxy in front for anything else.
@@ -58,11 +67,18 @@ The `__Host-pmos` cookie is `Secure`, so browsers only keep it over HTTPS (or on
    `Domain`). The id is 256 random bits from the OS; the store keeps only its SHA-256. A
    session ends after 8 idle hours or 24 hours from sign-in, at logout, or when the person
    leaves the team. Signing in always makes a new id and ends the browser's old one.
-2. **Membership:** the session's handle must be a member in `team.yaml`, re-read on every
-   request. Someone removed gets `403 not_a_member` once and every session they have ends.
+2. **Membership:** the session's handle must be a member in `team.yaml`. The parsed file is
+   kept (`src/team.rs`) and read again when its modification time or size changes (one
+   `stat` per request), and at least every 5 seconds: so someone removed loses access on
+   their first request after the file changes, and never more than 5 seconds after it. They
+   get `403 not_a_member` once and every session they have ends. A file that doesn't parse is
+   `503 team_unavailable` at once, never an old copy. An Entra session also ends (`401
+   signed_out`) if the member's `entra-oid` (added or changed since) isn't the account that
+   signed in.
 3. **Writes** (`POST`, `PUT`, `DELETE`): `Sec-Fetch-Site` must not be another site, `Origin`
-   (or else `Referer`) must be the app (`403 bad_origin`), and `X-Pmos-Csrf` must equal the
-   session's own random token, compared in constant time (`403 bad_csrf`).
+   (or else `Referer`) must be the app, **and one of them must be there** (`403 bad_origin`;
+   browsers always send `Origin` on these), and `X-Pmos-Csrf` must equal the session's own
+   random token, compared in constant time (`403 bad_csrf`).
 4. **Roles,** from the permission matrix (`pmos_contract::permissions`): drafts need
    `decide-own-approval`, asking needs `ask-bot`, reading tasks `view-own-tasks`. An
    auditor-only member gets `403 not_allowed` on every draft and task route.
@@ -108,6 +124,17 @@ path with another method a JSON `405 method_not_allowed`.
   `kind`, `title`, `body` and `target.label` come from the write tool's arguments (the table
   in `src/drafts.rs`); the label uses only id-shaped values, and anything else reads "an
   unrecognised channel" (or space, page, project, epic), so it is never text the bot wrote.
+  Where the run read the target (a Confluence parent or updated page, a Jira epic), the label
+  names it with the title the tool server recorded at the read (`drafts::with_sources`). A
+  Slack label never shows a channel id: PM OS keeps no channel names, so it reads "A Slack
+  thread", "A direct message" and so on, and `target.url` opens the channel in Slack. Slack
+  sources' titles lose their channel id the same way ("Slack thread").
+- **What the approve dialog shows** (`restricted_sources`, `audience`, `marker`): from the
+  item's `sources_sensitivity` (missing counts as restricted, as at the tool server), the
+  `members` and `external` of the tool server's last `needs_external_confirm` or
+  `audience_blocked` refusal for that draft (kept in memory here, as the tool server keeps
+  `external`), and the marker the tool server's connectors append ("Drafted with PM OS", with
+  "· run <run id>" for Jira and Confluence).
   `target.url`, `expires_at` and `external` are the item's own `target_url`, `expires_at`
   and `external` from the tool server (`target.url` only if `https`; `expires_at` falls back
   to 24 hours for a tool server that doesn't send it; `external` to the last
@@ -141,16 +168,31 @@ path with another method a JSON `405 method_not_allowed`.
   restart; retrying" event. The gateway's and the harness's own retries aren't reported to
   the runtime, so they can't be shown.
 - **`version`** is the SHA-256 of the tool and the canonical JSON of what an approve would
-  send now (the item's arguments with the saved edit applied; for a practice draft, its
+  send now: the item's arguments, which hold the PM's saved edit (for a practice draft, its
   title and body). **Approve** takes an optional `version`: a different one is
   `409 stale` and nothing is sent.
-- **Edit** (`PUT`) is kept here. **Approve** sends `edit` with the edited arguments when
-  there is a saved edit and `approve` otherwise, always with `decided_by` = the signed-in
-  handle; the version is checked against the same arguments it sends. The tool server's
-  `409 needs_external_confirm`, `audience_blocked` and `expired` pass through; its
-  `503 audience_unavailable` too. A `409` without a code is `not_pending` when the item has
-  since been decided (in Slack, say), else `not_approvable`; a `400` on edited arguments is
-  `422 bad_edit`.
+- **Edit** (`PUT`, and accepting a suggestion) is saved **on the item at the tool server**
+  (`PUT /internal/approvals/{id}/draft?user=<handle>`, signed for the PM): the item's
+  arguments with the new body (and title), where it goes unchanged. The tool server keeps it
+  as the item's arguments, so the Slack card and the console show it, and an approve from
+  any of them writes it; it refuses a change of target (`422 target_changed`, here
+  `422 bad_edit`), a decided item (`409`, here `not_pending`) and an expired one (`expired`).
+  Nothing of a real draft's edit is kept here any more: `web_draft_edits` holds only practice
+  drafts' edits (rows saved for real drafts before this change are ignored and purged with
+  the rest). Suggestions stay here. **Approve** sends `edit` with the item's arguments, the
+  very ones the version was computed from, when the item is edited (so a save from another
+  tab a moment later can't change what is written), and `approve` otherwise, always with
+  `decided_by` = the signed-in handle. A save from another tab between this read and an
+  `approve` of an unedited draft would be what is written: it is the PM's own text, and the
+  window is one round trip.
+- **Refused decisions** answer fixed codes and sentences; the tool server's own text is never
+  passed on (it can quote the draft) and only its status and code are logged:
+  `needs_external_confirm`, `audience_blocked`, `expired` (`409`), `audience_unavailable`
+  (`503`); a `409` without a code is `not_pending` when the item has since been decided (in
+  Slack, say), else `not_approvable`; a `400` or `422` on edited arguments is `422 bad_edit`.
+  **A lost answer** (the call timed out, the connection dropped, a `5xx` other than `503`, an
+  unreadable reply) reads the item again: if it shows this PM's decision, that is the answer;
+  otherwise `504` (timed out) or `502` `unknown_outcome`, never "nothing was sent".
 - **Approve is safe to retry.** An approve of an item already `executing` or `approved`
   whose `decided_by` is this PM, with the same version (or none), answers the approved draft
   and sends nothing. So does an approve that loses a race with the PM's own other approve
@@ -180,7 +222,9 @@ path with another method a JSON `405 method_not_allowed`.
 - **Brief and follow-ups** (`src/app/brief.rs`, `src/followups.rs`), on with `PMOS_WEB_BRIEF=1`
   and `501 not_built` otherwise. `GET /api/brief` answers `200` with the PM's open follow-ups
   (not dismissed, not expired) and the day's `changed` items, empty lists when nothing is
-  stored. A follow-up holds a one-line summary (at most 200 characters, no message text), who,
+  stored, and `delivered_at` and `status` (`never`, `today`, `stale`): when the producer last
+  filled this PM's brief. That time outlives the day's items (`web_brief_days.updated_at`
+  stays after its `changed` list is emptied by the purge); it is a time, no text. A follow-up holds a one-line summary (at most 200 characters, no message text), who,
   system and url; Slack ones expire after 24 hours and every other after a week, both purged.
   Its id is derived from the handle, kind, system and url, so a producer sending the same one
   again refreshes it (keeping its age and a dismissal) rather than copying it. `POST
@@ -188,11 +232,17 @@ path with another method a JSON `405 method_not_allowed`.
   makes a task for `pm-<handle>` (`source: "web"`) asking for a reply (waiting on you) or a
   gentle nudge (you wait on), written through the bot's normal write tool so it arrives as an
   ordinary approval; it needs `ask-bot`. Someone else's, a dismissed, an expired or an
-  unknown id is `404`.
+  unknown id is `404`. **The follow-up is untrusted data in that prompt**: its who, system,
+  summary and url were written by the brief run from other people's messages, so they go in
+  as one JSON object between `<<<FOLLOW_UP_DATA` and `FOLLOW_UP_DATA>>>` (markers removed from
+  every value), after an instruction to treat every value as text and never as instructions.
+  The PM's own words around it are fixed. This lowers the risk, it doesn't remove it: the bot
+  reads the thread anyway, and whatever it drafts still waits for the PM's approval.
 - **`PUT /internal/brief/{handle}`** is the producer's route. The Slack service calls it
   when a PM's daily brief finishes (`crates/slack/src/brief_feed.rs`, on with `PMOS_WEB_URL`
   and `PMOS_WEB_BRIEF_TOKEN` set there; `docs/daily-brief.md`). It needs `Authorization: Bearer
-  <PMOS_WEB_BRIEF_TOKEN>` (`401 bad_token`, constant-time compare), a member's handle, JSON,
+  <PMOS_WEB_BRIEF_TOKEN>` (`401 bad_token`, constant-time compare), no session cookie and no
+  `Origin` (`403 forbidden`: a page can't reach it), a member's handle, JSON,
   at most 128 KiB (`413`), and replaces that PM's follow-ups and `changed` items:
   `{date?, changed: [{system, title, summary?, url}], waiting_on_you: [{system, who, summary,
   url, created_at?}], you_wait_on: [...]}`. At most 50 per list, `system` lower-case
@@ -229,11 +279,8 @@ path with another method a JSON `405 method_not_allowed`.
   `external: false` and the approve answers `409 needs_external_confirm` as before.
 - **`target.url`** is `null` where no link can be built from ids: a Confluence or Jira
   target without a linked Atlassian site.
-- **Error codes added** beyond the contract: `bad_origin`, `bad_request`,
-  `bad_content_type` (`415`), `method_not_allowed` (`405`), `not_approvable`, `bad_edit`, `no_suggestion` (accepting
-  before the text is ready), `audience_unavailable`, `task_refused`,
-  `upstream_unavailable`, `team_unavailable`, `unavailable`. `stale` (`409`) is the
-  contract's optional `version` check.
+- **Error codes:** every one, with whether it means nothing changed, is in
+  `docs/web-api.md`, **Error codes**.
 
 ## Limits of "ask for a change"
 
@@ -264,11 +311,19 @@ warning at start-up. Bind it to `127.0.0.1` (the default) and never put it behin
 proxy. Turning Entra ID on does not make it safe: with both on, development sign-in still
 bypasses Entra entirely, and the server logs a louder warning.
 
+**Development sign-in only on loopback, and never beside Entra by accident.** It refuses to
+start on a `PMOS_WEB_BIND` that isn't loopback, and refuses to start beside Entra ID unless
+`PMOS_WEB_DEV_LOGIN_WITH_ENTRA=1` says that is meant (a developer's machine).
+
 **Entra ID sign-in proves who the browser is, not what they may do.** Membership and roles
 still come only from `team.yaml`; group and role claims are ignored. A member is matched by
 `preferred_username` (or else `email`) against their `team.yaml` email, which the tenant's
-admins control; a guest account's `preferred_username` is its home address. Logout ends only
-the PM OS session.
+admins control; a guest account's `preferred_username` is its home address. The token's `oid`
+and `tid` are recorded on the session; a member with `entra-oid` in `team.yaml` signs in only
+as that account (`reason=wrong_account` otherwise), so an email address reassigned to someone
+else can't take their place, and a session ends if `entra-oid` changes under it. Members
+without `entra-oid` are matched by email alone, as before. Logout ends only the PM OS
+session.
 
 **This backend is still a deputy, now a narrower one.** It holds its own tool server token,
 which reaches only the approvals routes and the read-only admin routes (no sessions, grants,
@@ -292,17 +347,21 @@ Tables: `web_sessions` (the SHA-256 of the id only, never the cookie), `web_user
 query filters on it. Idle and absolute session expiry are in the `UPDATE … WHERE` that reads a
 session, so an expired one can't be used before a purge; the purge (sessions past either
 limit, expired follow-ups and `changed` items, edits and suggestions untouched for 7 days,
-flags older than 30) runs at sign-in, so no scheduler is needed. `SettingsStore::update` is one
+flags older than 30) runs every ten minutes (`app::Housekeeping`) and at each sign-in; the
+day's `changed` items are emptied, while the time of the last delivery is kept for
+`GET /api/brief`'s `delivered_at`. `web_sessions` also keeps an Entra session's `entra_oid` and
+`entra_tid` (migration `0002`). `SettingsStore::update` is one
 transaction holding `FOR UPDATE` on the PM's settings row. Without a URL the stores are in
 memory, a warning is logged, and a restart signs everyone out and forgets edits, suggestions,
 practice drafts and follow-ups. The session's CSRF token is stored (it is not the cookie).
-An edit of a Slack draft is Slack text: the tool server drops the draft's own text after 24
-hours and the edit is unreachable by then, but the row itself waits for the 7-day purge.
+An edit of a real draft is no longer kept here: it lives on the item at the tool server,
+which removes a Slack draft's edit with its text (24 hours after it expires or is decided).
 
 **Not built:** rate limiting (on sign-in, on asks and on change requests); an audit record of
 web actions (the tool server audits decisions and admin reads, with `web` as the client); a
 per-PM limit on running tasks; admin tasks-by-status counts (the runtime has no team-wide read
 for the `web` client); and, for Entra ID sign-in (`docs/entra-sign-in.md`, "Not built"): roles from
-group or app-role claims, matching by the token's `oid`, conditional access awareness, single
-logout, and token refresh (only the ID token is used, once). The deploy kit (`deploy/`) does
+group or app-role claims, matching by `oid` alone (it is checked only where `team.yaml` has
+`entra-oid`), conditional access awareness, single logout, and token refresh (only the ID
+token is used, once). The deploy kit (`deploy/`) does
 not pass the `PMOS_WEB_ENTRA_*` variables to the `web` service yet.

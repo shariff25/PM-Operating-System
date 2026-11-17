@@ -1,7 +1,7 @@
 //! Sign-in providers and the origin check for writes.
 //!
 //! A provider proves who the browser is and names them by a handle or an email. The app then
-//! looks that up in `team.yaml` (re-read on every request) and starts a session; a provider
+//! looks that up in `team.yaml` (re-read when it changes) and starts a session; a provider
 //! never decides membership or roles.
 
 use async_trait::async_trait;
@@ -126,8 +126,9 @@ pub fn find_member_by_email<'a>(team: &'a TeamFile, email: &str) -> Option<&'a T
 
 /// Whether a write came from the web app's own pages: never from another site, and with an
 /// `Origin` (or else `Referer`) matching `public_url`, or the request's `Host` without it. A
-/// request with neither header relies on the CSRF token and `SameSite=Lax` alone. The same
-/// rule as the console's forms.
+/// request with neither header is refused: every browser sends `Origin` on a `POST`, `PUT`
+/// or `DELETE` from `fetch`, so a write without one isn't the app's (the CSRF token is
+/// checked as well, not instead).
 pub fn same_origin(headers: &HeaderMap, public_url: Option<&str>) -> bool {
     let get = |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
@@ -139,7 +140,7 @@ pub fn same_origin(headers: &HeaderMap, public_url: Option<&str>) -> bool {
         Some(o) => o.to_string(),
         None => match get(header::REFERER).and_then(|r| reqwest::Url::parse(r).ok()) {
             Some(url) => url.origin().ascii_serialization(),
-            None => return true,
+            None => return false,
         },
     };
     if origin == "null" {
@@ -245,7 +246,17 @@ mod tests {
             &headers(&[host, ("sec-fetch-site", "same-site")]),
             None
         ));
-        assert!(same_origin(&headers(&[host]), None));
+        // Neither `Origin` nor `Referer`: refused, with or without a public URL.
+        assert!(!same_origin(&headers(&[host]), None));
+        assert!(!same_origin(
+            &headers(&[host, ("sec-fetch-site", "same-origin")]),
+            Some("https://pmos.example.com")
+        ));
+        // A same-origin `Referer` alone will do.
+        assert!(same_origin(
+            &headers(&[host, ("referer", "http://127.0.0.1:8770/#/d/apr_1")]),
+            None
+        ));
         let public = Some("https://pmos.example.com");
         assert!(same_origin(
             &headers(&[

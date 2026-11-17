@@ -71,7 +71,18 @@ fn producer(base: &str) -> Producer {
     Producer::new(base, WEB_TOKEN, reqwest::Client::new()).unwrap()
 }
 
+/// Ana's daily brief routine, as `brief me at …` makes it.
+const ROUTINE: &str = "rtn_brief_ana";
+
 fn start(stack: &Stack, producer: Option<Producer>) -> (CancellationToken, JoinHandle<()>) {
+    {
+        let mut routines = stack.runtime.routines.lock().unwrap();
+        if !routines.iter().any(|r| r["id"] == ROUTINE) {
+            let mut r = pmos_slack::brief::draft("ana", 8, 30, "UTC");
+            r["id"] = json!(ROUTINE);
+            routines.push(r);
+        }
+    }
     let shutdown = CancellationToken::new();
     let mut notifier =
         Notifier::new(stack.bots.clone(), stack.state.path()).with_brief_feed(producer);
@@ -99,10 +110,17 @@ fn block() -> String {
     )
 }
 
-/// A finished routine run for `handle` by `bot`, with `text` as its answer.
+/// A finished run of Ana's brief routine for `handle` by `bot`, with `text` as its answer.
 fn done(id: &str, bot: &str, handle: &str, text: &str) -> Value {
     json!({"id": id, "task_id": format!("tsk_{id}"), "bot": bot, "requested_by": handle,
-           "kind": "done", "text": text})
+           "kind": "done", "text": text, "routine_id": ROUTINE})
+}
+
+/// A finished task that isn't a brief routine's run.
+fn done_plain(id: &str, text: &str) -> Value {
+    let mut d = done(id, "pm-ana", "ana", text);
+    d.as_object_mut().unwrap().remove("routine_id");
+    d
 }
 
 fn push(stack: &Stack, items: &[Value]) {
@@ -250,6 +268,74 @@ async fn a_bad_block_or_someone_elses_bot_sends_nothing() {
     stop.cancel();
     let _ = notifier.await;
     stop_web.cancel();
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn only_a_brief_task_sends_its_block() {
+    let stack = Stack::new().await;
+    let (web, base, stop_web) = mock_web().await;
+    stack.runtime.routines.lock().unwrap().push(json!({
+        "id": "rtn_other", "owner": "ana", "bot": "pm-ana",
+        "prompt": "[reply-assistant] Draft replies", "schedule": {"cron": "0 8 * * 1-5", "tz": "UTC"},
+    }));
+    let (stop, notifier) = start(&stack, Some(producer(&base)));
+    let with_block = format!(
+        "{BRIEF}
+
+{}",
+        block()
+    );
+    let mut other_routine = done("ntf_2", "pm-ana", "ana", &with_block);
+    other_routine["routine_id"] = json!("rtn_other");
+    let mut unknown_routine = done("ntf_3", "pm-ana", "ana", &with_block);
+    unknown_routine["routine_id"] = json!("rtn_nope");
+    push(
+        &stack,
+        &[
+            // An ordinary answer that contains a block (a page quoting one, a prompt injection):
+            // the block is hidden and nothing is sent.
+            done_plain("ntf_1", &with_block),
+            // Another routine's run, or a routine Ana doesn't have.
+            other_routine,
+            unknown_routine,
+        ],
+    );
+    for n in 1..=3 {
+        let shown = posted(&stack, n).await;
+        assert!(!shown.contains("pmos-brief"), "{shown}");
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(web.puts.lock().unwrap().is_empty());
+    // A `brief now` this service started is a brief: marked at creation.
+    pmos_slack::brief::mark_brief_now("tsk_ntf_4");
+    push(&stack, &[done_plain("ntf_4", &with_block)]);
+    let (handle, ..) = until("the PUT", || web.puts.lock().unwrap().first().cloned()).await;
+    assert_eq!(handle, "ana");
+    stop.cancel();
+    let _ = notifier.await;
+    stop_web.cancel();
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_saved_cursor_ahead_of_the_runtime_starts_again_from_now() {
+    let stack = Stack::new().await;
+    // Saved before the runtime's database was reset: far past its feed.
+    let cursor_file = stack.state.path().join(pmos_slack::notify::CURSOR_FILE);
+    std::fs::write(&cursor_file, "900").unwrap();
+    let (stop, notifier) = start(&stack, None);
+    // Without the reset nothing new would ever be posted; with it, the next answer is.
+    until("the reset cursor", || {
+        std::fs::read_to_string(&cursor_file)
+            .ok()
+            .filter(|c| c.trim() == "0")
+    })
+    .await;
+    push(&stack, &[done_plain("ntf_1", "After the reset.")]);
+    assert!(posted(&stack, 1).await.contains("After the reset."));
+    stop.cancel();
+    let _ = notifier.await;
     stack.stop().await;
 }
 

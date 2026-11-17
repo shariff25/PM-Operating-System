@@ -566,6 +566,7 @@ impl Onboarding {
             slack_id: request.slack_id.clone(),
             email: Some(request.email.clone()),
             github: None,
+            entra_oid: None,
             roles,
         };
 
