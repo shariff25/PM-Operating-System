@@ -62,7 +62,7 @@ describe('navigation', () => {
     renderApp({
       wrap: (api) => {
         const me = api.me.bind(api);
-        api.me = async () => ({ ...(await me()), permissions: ['audit:read'] });
+        api.me = async () => ({ ...(await me()), permissions: ['view-audit-log'] });
         return api;
       },
     });

@@ -7,6 +7,7 @@ import { Shell } from './components/Shell';
 import { ToastProvider } from './components/Toasts';
 import { DataProvider, useData } from './data';
 import { Activity } from './pages/Activity';
+import { AdminPage } from './pages/admin/AdminPage';
 import { DraftPage } from './pages/DraftPage';
 import { Drafts } from './pages/Drafts';
 import { FollowUps } from './pages/FollowUps';
@@ -49,6 +50,8 @@ function Page({ route }: { route: Route }) {
       return <Activity />;
     case 'task':
       return <Thread key={route.id} id={route.id} />;
+    case 'admin':
+      return <AdminPage section={route.section} search={route.search} />;
     default:
       return <Home />;
   }

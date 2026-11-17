@@ -123,4 +123,39 @@ describe('real client', () => {
     await expect(api.getDraft('..')).rejects.toMatchObject({ code: 'not_found' });
     expect(fetchImpl.mock.calls[0]![0]).toBe('/api/drafts/%00');
   });
+
+  it('sends the audit filters and the cursor, and leaves empty ones out', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async () => json(200, { events: [], next_cursor: null }));
+    const api = createRealClient({ fetchImpl });
+    await api.adminAudit({ actor: 'ana', outcome: '', limit: 50, before: 'c1.abc', from: '2026-11-10T00:00:00.000Z' });
+    expect(fetchImpl.mock.calls[0]![0]).toBe('/api/admin/audit?actor=ana&from=2026-11-10T00%3A00%3A00.000Z&before=c1.abc&limit=50');
+    await api.adminAudit({});
+    expect(fetchImpl.mock.calls[1]![0]).toBe('/api/admin/audit');
+  });
+
+  it('reads the export headers, and never sends a page size or cursor with it', async () => {
+    const csv = (truncated: string) =>
+      new Response('"at"\r\n', {
+        status: 200,
+        headers: { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="pmos-audit.csv"', 'X-Pmos-Truncated': truncated, 'X-Pmos-Row-Count': '10000' },
+      });
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(csv('true')).mockResolvedValueOnce(csv('false'));
+    const api = createRealClient({ fetchImpl });
+    const cut = await api.adminAuditExport({ outcome: 'denied', limit: 50, before: 'c1.x' });
+    expect(fetchImpl.mock.calls[0]![0]).toBe('/api/admin/audit/export?outcome=denied');
+    expect(cut).toMatchObject({ truncated: true, rowCount: 10000, filename: 'pmos-audit.csv' });
+    expect(await cut.blob.text()).toBe('"at"\r\n');
+    expect((await api.adminAuditExport({})).truncated).toBe(false);
+  });
+
+  it('turns an admin 403 into a typed error', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(json(403, { code: 'forbidden', error: 'No.' }));
+    const api = createRealClient({ fetchImpl });
+    await expect(api.adminConnectors()).rejects.toMatchObject({ status: 403, code: 'forbidden' });
+  });
+
+  it('unwraps the connector list', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(json(200, { connectors: [{ name: 'jira' }] }));
+    expect(await createRealClient({ fetchImpl }).adminConnectors()).toEqual([{ name: 'jira' }]);
+  });
 });

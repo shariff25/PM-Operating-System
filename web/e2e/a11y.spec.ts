@@ -8,7 +8,7 @@ import type { Page } from '@playwright/test';
 const EMPTY = 'http://127.0.0.1:5192';
 const BRIEF_OFF = 'http://127.0.0.1:5193';
 
-async function signIn(page: Page, theme: 'light' | 'dark', base?: string) {
+async function signIn(page: Page, theme: 'light' | 'dark', base?: string, handle = 'ana') {
   await page.addInitScript((t) => {
     try {
       window.localStorage.setItem('pmos-theme', t);
@@ -17,7 +17,7 @@ async function signIn(page: Page, theme: 'light' | 'dark', base?: string) {
     }
   }, theme);
   await page.goto((base ?? '') + '/');
-  await page.getByLabel('Your handle').fill('ana');
+  await page.getByLabel('Your handle').fill(handle);
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await expect(page.getByLabel('What do you need?')).toBeVisible();
   await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
@@ -222,6 +222,57 @@ for (const theme of ['light', 'dark'] as const) {
       await go(page, '/a/tsk_seed_week');
       await expect(page.getByRole('region', { name: 'Conversation' })).toBeVisible();
       await scan(page, 'phone thread');
+    });
+
+    test('admin: overview, audit log (open row, empty, filtered), team, connectors, as admin', async ({ page }) => {
+      await signIn(page, theme, undefined, 'ada');
+      await go(page, '/admin');
+      await expect(page.getByRole('heading', { level: 1, name: 'Overview' })).toBeVisible();
+      await scan(page, 'admin overview');
+      await go(page, '/admin/audit');
+      await expect(page.getByRole('table', { name: 'Audit events' })).toBeVisible();
+      await scan(page, 'audit log');
+      await page.getByRole('button', { name: /^Show details for/ }).first().click();
+      await expect(page.getByRole('group', { name: 'Every field of this event' })).toBeVisible();
+      await scan(page, 'audit log, row open');
+      await go(page, '/admin/audit?actor=nobody');
+      await expect(page.getByText('Nothing matches these filters.')).toBeVisible();
+      await scan(page, 'audit log, nothing matches');
+      await go(page, '/admin/audit?from=2026-11-10&to=2026-11-01');
+      await expect(page.getByRole('alert')).toBeVisible();
+      await scan(page, 'audit log, backwards dates');
+      await go(page, '/admin/team');
+      await expect(page.getByRole('table', { name: 'Team members' })).toBeVisible();
+      await scan(page, 'team');
+      await go(page, '/admin/connectors');
+      await expect(page.getByRole('table', { name: 'Connectors' })).toBeVisible();
+      await scan(page, 'connectors');
+    });
+
+    test('admin: auditor views and the no-access page', async ({ page }) => {
+      await signIn(page, theme, undefined, 'audrey');
+      await go(page, '/admin');
+      await expect(page.getByRole('heading', { level: 1, name: 'Overview' })).toBeVisible();
+      await scan(page, 'auditor overview');
+      await go(page, '/admin/audit');
+      await expect(page.getByRole('table', { name: 'Audit events' })).toBeVisible();
+      await scan(page, 'auditor audit log');
+      await go(page, '/admin/connectors');
+      await expect(page.getByRole('heading', { level: 1, name: "You don't have access to this" })).toBeVisible();
+      await scan(page, 'auditor, no access');
+    });
+
+    test('admin on a phone: every part', async ({ page }) => {
+      await page.setViewportSize({ width: 390, height: 844 });
+      await signIn(page, theme, undefined, 'ada');
+      for (const [hash, heading] of [['/admin', 'Overview'], ['/admin/audit', 'Audit log'], ['/admin/team', 'Team'], ['/admin/connectors', 'Connectors']] as const) {
+        await go(page, hash);
+        await expect(page.getByRole('heading', { level: 1, name: heading })).toBeVisible();
+        await scan(page, `phone admin ${heading}`);
+      }
+      await go(page, '/admin/audit');
+      await page.getByRole('button', { name: /^Show details for/ }).first().click();
+      await scan(page, 'phone audit log, row open');
     });
   });
 }
