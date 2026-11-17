@@ -1,9 +1,14 @@
 //! Entra ID sign-in against a mock identity provider (discovery, JWKS, token endpoint):
-//! the happy path, every ID token check, `state` and PKCE, membership, start-up rules, and
-//! that nothing secret reaches the logs.
+//! the happy path, every ID token check, `state` and PKCE, the user database's sign-in rules
+//! (spec §7: `(tid, oid)`, first link by `preferred_username` only, guests, host links for
+//! Admins and Auditors, conflicts, deactivation, the tool server unreachable), start-up rules,
+//! and that nothing secret reaches the logs.
 
 #[path = "entra/keys.rs"]
 mod keys;
+
+mod support;
+use support::FakeDirectory;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -34,6 +39,37 @@ const TEAM: &str = "members:
   - {handle: ana, slack-id: U0ANA, email: ana@contoso.example, roles: [pm]}
   - {handle: ben, slack-id: U0BEN, roles: [pm]}
 ";
+
+/// The `oid` the harness's tokens carry: Ana's Microsoft account.
+const ANA_OID: &str = "00000000-0000-0000-0000-00000000a0a0";
+
+/// The tool server, as far as sign-in reaches it: the user database's routes, and the sign-in
+/// events route (each event kept as its URI, JSON body and raw body).
+#[derive(Default)]
+struct Tools {
+    directory: FakeDirectory,
+    events: Mutex<Vec<(String, Value, String)>>,
+}
+
+async fn tools_mock(
+    State(t): State<Arc<Tools>>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(res) = t.directory.handle(&method, &uri, &body) {
+        return res;
+    }
+    if uri.path() == "/internal/admin/events" {
+        t.events.lock().unwrap().push((
+            uri.to_string(),
+            serde_json::from_slice(&body).unwrap_or(Value::Null),
+            String::from_utf8_lossy(&body).into_owned(),
+        ));
+        return Json(json!({"recorded": true})).into_response();
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
 
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -160,6 +196,7 @@ async fn listener() -> (tokio::net::TcpListener, String) {
 struct Harness {
     web: String,
     idp: Arc<IdpState>,
+    tools: Arc<Tools>,
     http: reqwest::Client,
     clock: Arc<Mutex<DateTime<Utc>>>,
     _dir: tempfile::TempDir,
@@ -239,15 +276,23 @@ async fn harness_with(change: impl FnOnce(&mut Config)) -> Harness {
             .with_state(idp.clone()),
     )
     .await;
+    let tools = Arc::new(Tools::default());
+    tools.directory.seed_team(TEAM);
+    let (tools_listener, tools_base) = listener().await;
+    let stop_tools = serve(
+        tools_listener,
+        Router::new().fallback(tools_mock).with_state(tools.clone()),
+    )
+    .await;
     let (web_listener, web_base) = listener().await;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
     let mut config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
-        // Nothing here calls the runtime or the tool server.
+        // Nothing here calls the runtime; the tool server answers who people are.
         bots_url: "http://127.0.0.1:9".into(),
         bots_token: BOTS_TOKEN.into(),
-        toolserver_url: "http://127.0.0.1:9".into(),
+        toolserver_url: tools_base,
         toolserver_token: TOOLS_TOKEN.into(),
         content_root: dir.path().to_path_buf(),
         static_dir: None,
@@ -269,13 +314,14 @@ async fn harness_with(change: impl FnOnce(&mut Config)) -> Harness {
     Harness {
         web: web_base,
         idp,
+        tools,
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap(),
         clock,
         _dir: dir,
-        _stop: vec![stop_idp, stop_web],
+        _stop: vec![stop_idp, stop_tools, stop_web],
     }
 }
 
@@ -299,7 +345,9 @@ impl Harness {
             "iss": self.issuer(),
             "aud": CLIENT,
             "tid": TENANT,
-            "oid": "00000000-0000-0000-0000-00000000a0a0",
+            "oid": ANA_OID,
+            // The optional claim the app registration adds: a member of the tenant.
+            "acct": 0,
             "sub": "subject-of-ana",
             "iat": now,
             "nbf": now,
@@ -395,6 +443,27 @@ impl Harness {
         .await
     }
 
+    /// Move the clock past the 10 seconds a directory answer is cached for.
+    fn past_the_cache(&self) {
+        self.advance(Duration::seconds(10));
+    }
+
+    /// The handles linked by a first link so far.
+    fn links(&self) -> Vec<String> {
+        self.tools.directory.links.lock().unwrap().clone()
+    }
+
+    /// The sign-in events recorded, as JSON bodies.
+    fn events(&self) -> Vec<Value> {
+        self.tools
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.1.clone())
+            .collect()
+    }
+
     async fn me(&self, session: &str) -> (StatusCode, Value) {
         let res = self
             .http
@@ -449,7 +518,8 @@ async fn signs_in_with_entra_and_the_session_works() {
     assert_eq!(q["client_id"], CLIENT);
     assert_eq!(q["response_type"], "code");
     assert_eq!(q["response_mode"], "query");
-    assert_eq!(q["scope"], "openid profile email");
+    // No `email` scope: that claim is never read.
+    assert_eq!(q["scope"], "openid profile");
     assert_eq!(q["redirect_uri"], format!("{}/api/auth/callback", h.web));
     assert_eq!(q["code_challenge_method"], "S256");
     assert_eq!(begun.challenge.len(), 43);
@@ -502,7 +572,13 @@ async fn signs_in_with_entra_and_the_session_works() {
     assert_eq!(challenge(&form["code_verifier"]), begun.challenge);
     assert_eq!(form["redirect_uri"], format!("{}/api/auth/callback", h.web));
 
-    // The same session as development sign-in: /api/me, roles from team.yaml.
+    // The first sign-in linked Ana's Microsoft account, `(tid, oid)`, at the tool server.
+    assert_eq!(h.links(), ["ana"]);
+    assert_eq!(
+        h.tools.directory.get("ana").unwrap().entra,
+        Some((TENANT.into(), ANA_OID.into(), false))
+    );
+    // The same session as development sign-in: /api/me, roles from the user database.
     let (status, me) = h.me(&session).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(me["handle"], "ana");
@@ -527,9 +603,9 @@ async fn signs_in_with_entra_and_the_session_works() {
 }
 
 #[tokio::test]
-async fn falls_back_to_the_email_claim_and_keeps_safe_return_paths() {
+async fn never_falls_back_to_the_email_claim_and_keeps_safe_return_paths() {
     let h = harness().await;
-    // No preferred_username: the email claim.
+    // No preferred_username, and Ana's address in `email`: never used, so no first link.
     let landed = h
         .sign_in_with(|_, mut c| {
             c.as_object_mut().unwrap().remove("preferred_username");
@@ -537,8 +613,17 @@ async fn falls_back_to_the_email_claim_and_keeps_safe_return_paths() {
             sign(&c, keys::KEY_A_DER, "key-a")
         })
         .await;
-    assert_eq!(landed.location, "/");
-    assert!(landed.session().is_some());
+    landed.assert_refused("not_a_member");
+    // Nor when `preferred_username` names nobody and `email` names Ana.
+    let landed = h
+        .sign_in_with(|_, mut c| {
+            c["preferred_username"] = json!("a.silva@contoso.example");
+            c["email"] = json!("ana@contoso.example");
+            sign(&c, keys::KEY_A_DER, "key-a")
+        })
+        .await;
+    landed.assert_refused("not_a_member");
+    assert!(h.links().is_empty());
 
     for (asked, lands) in [
         ("/#/drafts/apr_1", "/#/drafts/apr_1"),
@@ -739,12 +824,8 @@ async fn refuses_every_bad_id_token() {
         ("not yet valid", with("nbf", json!(now + 120))),
         ("issued in the future", with("iat", json!(now + 120))),
         ("no exp", without("exp")),
-        ("no email", {
-            Box::new(|_, mut c: Value| {
-                c.as_object_mut().unwrap().remove("preferred_username");
-                sign(&c, keys::KEY_A_DER, "key-a")
-            })
-        }),
+        ("no object id", without("oid")),
+        ("an object id that isn't a GUID", with("oid", json!("ana"))),
         (
             "alg none",
             Box::new(|_, c: Value| {
@@ -832,6 +913,196 @@ async fn refuses_every_bad_id_token() {
     assert!(h.idp.jwks_hits.load(Ordering::SeqCst) <= 2);
 }
 
+/// Members only (spec §7): the optional `acct` claim must be there and say member; `idp`, when
+/// present, must name this tenant. Checked before any lookup in the user database.
+#[tokio::test]
+async fn guests_other_identity_providers_and_a_missing_acct_claim_are_refused() {
+    let h = harness().await;
+    let set = |key: &'static str, value: Value| {
+        move |_: &Begun, mut c: Value| {
+            c[key] = value;
+            sign(&c, keys::KEY_A_DER, "key-a")
+        }
+    };
+    let base = h.idp.base.lock().unwrap().clone();
+    let lookups = || {
+        h.tools
+            .directory
+            .resolves
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    // A guest (`acct: 1`), in either spelling.
+    h.sign_in_with(set("acct", json!(1)))
+        .await
+        .assert_refused("not_a_member");
+    h.sign_in_with(set("acct", json!("1")))
+        .await
+        .assert_refused("not_a_member");
+    h.sign_in_with(set("acct", json!(7)))
+        .await
+        .assert_refused("not_a_member");
+    // No `acct` at all: the registration lacks the optional claim. Fails closed.
+    h.sign_in_with(|_, mut c| {
+        c.as_object_mut().unwrap().remove("acct");
+        sign(&c, keys::KEY_A_DER, "key-a")
+    })
+    .await
+    .assert_refused("entra_misconfigured");
+    // Signed in by another identity provider: a personal Microsoft account, another tenant.
+    for idp in [
+        "live.com".to_string(),
+        "https://sts.windows.net/9188040d-6c67-4c5b-b112-36a304b66dad/".to_string(),
+        "https://sts.windows.net/99999999-9999-4999-8999-999999999999/".to_string(),
+        format!("{base}/99999999-9999-4999-8999-999999999999/v2.0"),
+    ] {
+        h.sign_in_with(set("idp", json!(idp)))
+            .await
+            .assert_refused("not_a_member");
+    }
+    assert_eq!(lookups(), 0, "refused before any lookup");
+    assert!(h.links().is_empty());
+    let reasons: Vec<Value> = h.events().iter().map(|e| e["reason"].clone()).collect();
+    assert_eq!(reasons.len(), 8);
+    assert_eq!(reasons[3], "entra_misconfigured");
+    // A member's `idp`, when Entra sends one, names this tenant: the token's own issuer, or
+    // the tenant's v1 issuer. Both sign in; so does `acct: "0"`.
+    let issuer = h.issuer();
+    h.sign_in_with(set("idp", json!(issuer)))
+        .await
+        .session()
+        .expect("idp is the issuer");
+    h.sign_in_with(set(
+        "idp",
+        json!(format!("https://sts.windows.net/{TENANT}/")),
+    ))
+    .await
+    .session()
+    .expect("idp is the tenant's v1 issuer");
+    h.sign_in_with(set("acct", json!("0")))
+        .await
+        .session()
+        .expect("acct as a string");
+}
+
+/// The first link is by `preferred_username` only, to an active user whose sign-in name an
+/// admin confirmed, holding neither Admin nor Auditor (spec §7 step 2).
+#[tokio::test]
+async fn the_first_link_needs_a_confirmed_name_and_no_admin_or_auditor_role() {
+    let h = harness().await;
+    // A Slack joiner whose sign-in name no admin has confirmed.
+    h.tools.directory.update("ana", |u| u.confirmed = false);
+    h.sign_in_with(good)
+        .await
+        .assert_refused("sign_in_unconfirmed");
+    h.tools.directory.update("ana", |u| u.confirmed = true);
+    // An Admin, and an Auditor, without a link the host set: refused, never auto-linked.
+    for roles in [vec!["pm", "admin"], vec!["auditor"]] {
+        h.tools.directory.update("ana", |u| {
+            u.roles = roles.iter().map(|r| r.to_string()).collect()
+        });
+        h.sign_in_with(good)
+            .await
+            .assert_refused("entra_needs_host");
+    }
+    assert!(h.links().is_empty());
+    // Linked automatically before (as a PM), not confirmed on the host: still refused.
+    h.tools.directory.update("ana", |u| {
+        u.entra = Some((TENANT.into(), ANA_OID.into(), false))
+    });
+    h.past_the_cache();
+    h.sign_in_with(good)
+        .await
+        .assert_refused("entra_needs_host");
+    // The host confirms it (`pmos-admin users set-entra`): in.
+    h.tools.directory.update("ana", |u| {
+        u.entra = Some((TENANT.into(), ANA_OID.into(), true))
+    });
+    h.past_the_cache();
+    let session = h.sign_in_with(good).await.session().expect("signed in");
+    assert_eq!(h.me(&session).await.1["roles"], json!(["auditor"]));
+    let reasons: Vec<Value> = h
+        .events()
+        .iter()
+        .filter(|e| e["action"] == "web.sign_in_refused")
+        .map(|e| e["reason"].clone())
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            "sign_in_unconfirmed",
+            "entra_needs_host",
+            "entra_needs_host",
+            "entra_needs_host"
+        ]
+    );
+}
+
+/// Granting Admin or Auditor to someone with an automatic link marks it `needs_host`: their
+/// session ends within 10 seconds, until the host confirms the link.
+#[tokio::test]
+async fn a_session_ends_when_its_link_needs_the_host() {
+    let h = harness().await;
+    let session = h.sign_in_with(good).await.session().expect("signed in");
+    h.tools
+        .directory
+        .update("ana", |u| u.roles = vec!["pm".into(), "auditor".into()]);
+    h.past_the_cache();
+    let (status, body) = h.me(&session).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "entra_needs_host");
+    assert_eq!(h.me(&session).await.0, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_deactivated_user_is_refused_at_sign_in_and_their_session_ends() {
+    let h = harness().await;
+    // Not linked yet: the first link refuses a deactivated user.
+    h.tools
+        .directory
+        .update("ana", |u| u.status = "deactivated".into());
+    h.sign_in_with(good).await.assert_refused("deactivated");
+    assert!(h.links().is_empty());
+    h.tools
+        .directory
+        .update("ana", |u| u.status = "active".into());
+    h.past_the_cache();
+    let session = h.sign_in_with(good).await.session().expect("signed in");
+    // Linked: deactivated now, the session ends within 10 seconds, and sign-in is refused.
+    h.tools
+        .directory
+        .update("ana", |u| u.status = "deactivated".into());
+    h.past_the_cache();
+    let (status, body) = h.me(&session).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "not_a_member");
+    h.sign_in_with(good).await.assert_refused("deactivated");
+}
+
+/// The tool server unreachable at sign-in: no session (`users_unavailable`), recorded.
+#[tokio::test]
+async fn sign_in_fails_closed_when_the_user_database_is_unreachable() {
+    let h = harness().await;
+    h.tools.directory.set_down(true);
+    h.sign_in_with(good)
+        .await
+        .assert_refused("users_unavailable");
+    assert_eq!(
+        h.events().last().unwrap()["reason"],
+        json!("users_unavailable")
+    );
+    // A session from before the outage: reads of pmos-web's own store only, for 5 minutes.
+    h.tools.directory.set_down(false);
+    h.past_the_cache();
+    let session = h.sign_in_with(good).await.session().expect("signed in");
+    h.tools.directory.set_down(true);
+    h.past_the_cache();
+    assert_eq!(h.me(&session).await.0, StatusCode::OK);
+    h.advance(Duration::minutes(5));
+    let (status, body) = h.me(&session).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "users_unavailable");
+}
+
 #[tokio::test]
 async fn an_unknown_kid_refetches_the_keys_so_rotation_works() {
     let h = harness_with(|c| {
@@ -873,38 +1144,14 @@ async fn unknown_kids_are_rate_limited() {
 /// not recorded (anyone can send one).
 #[tokio::test]
 async fn entra_sign_ins_and_refusals_are_audited() {
-    let seen: Arc<Mutex<Vec<(String, Value, String)>>> = Arc::default();
-    let s = seen.clone();
-    let (l, tools) = listener().await;
-    let _stop_tools = serve(
-        l,
-        Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
-            let s = s.clone();
-            async move {
-                s.lock().unwrap().push((
-                    uri.to_string(),
-                    serde_json::from_slice(&body).unwrap_or(Value::Null),
-                    String::from_utf8_lossy(&body).into_owned(),
-                ));
-                Json(json!({"recorded": true}))
-            }
-        }),
-    )
-    .await;
-    let h = harness_with(|c| c.toolserver_url = tools.clone()).await;
+    let h = harness().await;
     h.sign_in_with(good).await.session().expect("signed in");
     let zoe = |_: &Begun, mut c: Value| {
+        c["oid"] = json!("22222222-0000-0000-0000-000000000002");
         c["preferred_username"] = json!("zoe@contoso.example");
         sign(&c, keys::KEY_A_DER, "key-a")
     };
     h.sign_in_with(zoe).await.assert_refused("not_a_member");
-    std::fs::write(
-        h._dir.path().join("team.yaml"),
-        "members:\n  - {handle: ana, slack-id: U0ANA, email: ana@contoso.example, \
-         entra-oid: 99999999-0000-0000-0000-000000000001, roles: [pm]}\n",
-    )
-    .unwrap();
-    h.sign_in_with(good).await.assert_refused("wrong_account");
     // A callback with no flow behind it: refused, not recorded.
     let res = h
         .http
@@ -914,8 +1161,8 @@ async fn entra_sign_ins_and_refusals_are_audited() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
 
-    let events = seen.lock().unwrap().clone();
-    assert_eq!(events.len(), 3, "{events:?}");
+    let events = h.tools.events.lock().unwrap().clone();
+    assert_eq!(events.len(), 2, "{events:?}");
     assert_eq!(events[0].0, "/internal/admin/events?user=ana");
     assert_eq!(
         events[0].1,
@@ -927,14 +1174,81 @@ async fn entra_sign_ins_and_refusals_are_audited() {
     let attempt = events[1].1["attempt"].as_str().unwrap();
     assert!(attempt.len() == 12 && attempt.bytes().all(|b| b.is_ascii_hexdigit()));
     assert!(!events[1].2.contains("zoe") && !events[1].2.contains("contoso"));
-    assert_eq!(
-        events[2].1,
-        json!({"action": "web.sign_in_refused", "provider": "entra",
-               "reason": "wrong_account", "member": "ana"})
-    );
     for (_, _, raw) in &events {
         assert!(!raw.contains(SECRET) && !raw.contains(TOOLS_TOKEN));
+        assert!(!raw.contains(ANA_OID), "never an oid");
     }
+}
+
+/// Spec §7 step 3: a sign-in whose name is already linked to a different Microsoft account is
+/// refused, audited and flagged; and a known account signing in with another user's sign-in
+/// name is flagged (it signs in as itself).
+#[tokio::test]
+async fn conflicts_are_refused_audited_and_flagged() {
+    let h = harness().await;
+    h.sign_in_with(good).await.session().expect("ana linked");
+    // Someone else in the tenant now holds Ana's sign-in name (a reassigned mailbox): another
+    // account, another `oid`. Refused, and the tool server audited the conflict.
+    let reassigned = |_: &Begun, mut c: Value| {
+        c["oid"] = json!("11111111-2222-3333-4444-555555555555");
+        sign(&c, keys::KEY_A_DER, "key-a")
+    };
+    h.sign_in_with(reassigned)
+        .await
+        .assert_refused("not_a_member");
+    assert_eq!(*h.tools.directory.conflicts.lock().unwrap(), ["ana"]);
+    assert_eq!(h.links(), ["ana"], "nothing new linked");
+    let refused = h.events().last().cloned().unwrap();
+    assert_eq!(refused["action"], "web.sign_in_refused");
+    assert_eq!(refused["reason"], "not_a_member");
+    // Ana's own account presenting Ben's sign-in name: she signs in as Ana (the name is
+    // ignored after the first link), and the conflict is flagged at the tool server.
+    h.tools.directory.update("ben", |u| {
+        u.sign_in_name = Some("ben@contoso.example".into());
+        u.confirmed = true;
+    });
+    let as_ben = |_: &Begun, mut c: Value| {
+        c["preferred_username"] = json!("Ben@contoso.example");
+        sign(&c, keys::KEY_A_DER, "key-a")
+    };
+    let session = h.sign_in_with(as_ben).await.session().expect("signed in");
+    assert_eq!(h.me(&session).await.1["handle"], "ana");
+    let flagged: Vec<Value> = h
+        .events()
+        .into_iter()
+        .filter(|e| e["action"] == "users.identity_conflict")
+        .collect();
+    assert_eq!(
+        flagged,
+        [json!({"action": "users.identity_conflict", "provider": "entra", "member": "ben"})]
+    );
+}
+
+/// After the first link, the Microsoft account decides, not the name: a renamed account still
+/// signs in, a reassigned name doesn't, and an admin's unlink ends the old account's session.
+#[tokio::test]
+async fn the_microsoft_account_decides_after_the_first_link() {
+    let h = harness().await;
+    let session = h.sign_in_with(good).await.session().expect("signed in");
+    // Ana's account renamed in the tenant: still Ana.
+    let renamed = |_: &Begun, mut c: Value| {
+        c["preferred_username"] = json!("ana.silva@contoso.example");
+        sign(&c, keys::KEY_A_DER, "key-a")
+    };
+    assert!(h.sign_in_with(renamed).await.session().is_some());
+    // An admin unlinks it (the mailbox was reassigned): her session ends within 10 seconds.
+    h.tools.directory.update("ana", |u| u.entra = None);
+    h.past_the_cache();
+    let (status, body) = h.me(&session).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "signed_out");
+    // The account that now holds the name links on its next sign-in.
+    let new_owner = |_: &Begun, mut c: Value| {
+        c["oid"] = json!("11111111-2222-3333-4444-555555555555");
+        sign(&c, keys::KEY_A_DER, "key-a")
+    };
+    assert!(h.sign_in_with(new_owner).await.session().is_some());
+    assert_eq!(h.links(), ["ana", "ana"]);
 }
 
 #[tokio::test]
@@ -946,26 +1260,24 @@ async fn someone_not_on_the_team_gets_no_session() {
             sign(&c, keys::KEY_A_DER, "key-a")
         }
     };
-    // A valid token for someone not in team.yaml.
+    // A valid token for someone not in the user database.
     h.sign_in_with(as_user("zoe@contoso.example"))
         .await
         .assert_refused("not_a_member");
-    // A handle is never matched: only a member's email.
+    // A handle is never matched: only a confirmed sign-in name.
     h.sign_in_with(as_user("ben"))
         .await
-        .assert_refused("failed");
-    // Removed from the team after signing in: the session ends as with any provider.
-    let landed = h.sign_in_with(good).await;
-    let session = landed.session().unwrap();
+        .assert_refused("not_a_member");
+    // `team.yaml` decides nothing: someone only there doesn't sign in.
     std::fs::write(
         h._dir.path().join("team.yaml"),
-        "members:\n  - {handle: ben, slack-id: U0BEN, roles: [pm]}\n",
+        "members:\n  - {handle: zoe, slack-id: U0ZOE, email: zoe@contoso.example, roles: [pm, admin]}\n",
     )
     .unwrap();
-    let (status, body) = h.me(&session).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["code"], "not_a_member");
-    h.sign_in_with(good).await.assert_refused("not_a_member");
+    h.sign_in_with(as_user("zoe@contoso.example"))
+        .await
+        .assert_refused("not_a_member");
+    assert!(h.links().is_empty());
 }
 
 // Providers and start-up.
@@ -1251,58 +1563,17 @@ async fn logs_never_contain_a_secret_code_or_token() {
             assert!(!logs.contains(piece), "a secret in the logs: {piece}");
         }
     }
+    // Nor an object id or a sign-in name (the user database's keys).
+    assert!(!logs.contains(ANA_OID), "an oid in the logs");
+    assert!(
+        !logs.contains("ana@contoso.example"),
+        "a sign-in name in the logs"
+    );
+    assert!(
+        !logs.contains("zoe@contoso.example"),
+        "a sign-in name in the logs"
+    );
     // The hash of nothing logged either (sanity: the secret's digest isn't a log key).
     let digest = b64(&sha2::Sha256::digest(SECRET.as_bytes()));
     assert!(!logs.contains(&digest));
-}
-
-// Matching by object id.
-
-#[tokio::test]
-async fn a_member_with_an_object_id_signs_in_only_as_that_account() {
-    let h = harness().await;
-    let team = |oid: &str| {
-        format!(
-            "members:\n  - {{handle: ana, slack-id: U0ANA, email: ana@contoso.example, \
-             entra-oid: {oid}, roles: [pm]}}\n"
-        )
-    };
-    // The token's `oid` is ...a0a0: the member's matches, in any case.
-    std::fs::write(
-        h._dir.path().join("team.yaml"),
-        team("00000000-0000-0000-0000-00000000A0A0"),
-    )
-    .unwrap();
-    let landed = h.sign_in_with(good).await;
-    let session = landed.session().expect("signed in");
-    assert_eq!(h.me(&session).await.0, StatusCode::OK);
-    // Someone else now holds the email address in the tenant: another account, another
-    // `oid`. They don't sign in as ana.
-    let other = |_: &Begun, mut c: Value| {
-        c["oid"] = json!("11111111-2222-3333-4444-555555555555");
-        sign(&c, keys::KEY_A_DER, "key-a")
-    };
-    h.sign_in_with(other).await.assert_refused("wrong_account");
-    // Nor does a token without an `oid`.
-    let none = |_: &Begun, mut c: Value| {
-        c.as_object_mut().unwrap().remove("oid");
-        sign(&c, keys::KEY_A_DER, "key-a")
-    };
-    h.sign_in_with(none).await.assert_refused("wrong_account");
-    // team.yaml now names another account for ana (and is a different size, so the cached
-    // copy is read again at once): her existing session ends.
-    std::fs::write(
-        h._dir.path().join("team.yaml"),
-        format!(
-            "{}# changed\n",
-            team("99999999-0000-0000-0000-000000000001")
-        ),
-    )
-    .unwrap();
-    let (status, body) = h.me(&session).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["code"], "signed_out");
-    // Without `entra-oid`, the email alone still matches (as before).
-    std::fs::write(h._dir.path().join("team.yaml"), TEAM).unwrap();
-    assert!(h.sign_in_with(other).await.session().is_some());
 }

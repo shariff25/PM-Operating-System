@@ -1758,6 +1758,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmos-directory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pmos-docs"
 version = "0.1.0"
 dependencies = [
@@ -1883,6 +1896,7 @@ dependencies = [
  "chrono",
  "pmos-assertion",
  "pmos-bots",
+ "pmos-contract",
  "pmos-toolserver",
  "pmos-web",
  "reqwest",
@@ -1943,6 +1957,7 @@ dependencies = [
  "jsonwebtoken",
  "pmos-assertion",
  "pmos-contract",
+ "pmos-directory",
  "pmos-policy",
  "pmos-runtime",
  "reqwest",

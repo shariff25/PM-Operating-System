@@ -148,7 +148,7 @@ export const copy = {
       'Nothing is sent anywhere until you approve it',
     ],
     handleLabel: 'Your handle',
-    handleHint: 'Development sign-in. Use the handle from team.yaml, such as ana.',
+    handleHint: 'Development sign-in. Use a PM OS handle, such as ana.',
     submit: 'Sign in',
     working: 'Signing in…',
     microsoft: 'Sign in with Microsoft',
@@ -157,7 +157,7 @@ export const copy = {
     loading: 'Checking how you can sign in…',
     notSetUp: "Sign-in isn't set up yet.",
     devHeading: 'For development',
-    devNote: 'Only on development setups. Use the handle from team.yaml.',
+    devNote: 'Only on development setups. Use a PM OS handle.',
   },
 
   // ---- Signed out (where Microsoft sends people back to) ----
@@ -171,6 +171,14 @@ export const copy = {
       unavailable: "Microsoft sign-in isn't answering. Try again in a minute.",
       wrong_account:
         "That Microsoft account isn't the one on the team list. Sign in with your own work account, or ask a platform owner.",
+      deactivated: 'Your access to PM OS is turned off. A platform owner can turn it back on.',
+      sign_in_unconfirmed:
+        'Almost there. An admin needs to confirm your Microsoft sign-in name in PM OS first. Ask a platform owner to give it one click.',
+      entra_needs_host:
+        'Your role needs someone with host access to confirm your Microsoft account before you sign in. Ask a platform owner.',
+      entra_misconfigured:
+        "Microsoft sign-in isn't set up quite right for PM OS yet (the app registration needs the acct claim). Tell a platform owner.",
+      users_unavailable: "I can't check who you are right now, so I'm not letting anyone in. Try again in a minute.",
     } as Record<string, string>,
     failed: "Sign-in didn't work. Try again.",
   },
@@ -532,6 +540,7 @@ export const copy = {
     /** No brief has ever run. Briefs come on weekday mornings, at the time the PM sets in Slack. */
     briefNever: 'No brief yet. Want a morning brief? Say "brief me at 8" to the bot in Slack.',
     briefStale: (when: string) => `No brief yet today. Your last one was ${when}.`,
+    slackWithheld: 'Slack items are hidden until PM OS can check your access.',
     briefNeverCard: 'Nothing here yet. Say "brief me at 8" to the bot in Slack, and this fills in.',
     briefNeverSub: 'No brief yet',
     briefStaleCard: 'Nothing in your last brief.',
@@ -1400,6 +1409,9 @@ export const copy = {
       audience_unavailable: "Slack couldn't tell me who is in that channel, so nothing was sent. Try again in a minute.",
       unavailable: 'Something PM OS relies on is not answering. Nothing changed. Try again in a minute.',
       team_unavailable: "I can't read the team list right now. Nothing changed. Try again in a minute.",
+      users_unavailable: "I can't check who you are right now, so I'm playing it safe. Nothing changed. Try again in a minute.",
+      entra_needs_host:
+        'Your admin or auditor role needs someone with host access to confirm your Microsoft account first. Nothing changed.',
       github_not_linked:
         'Link your GitHub account in PM OS first. Pull requests are opened as you, so I need to know who you are there. Nothing changed.',
       stale_base:

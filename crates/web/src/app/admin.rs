@@ -1,7 +1,7 @@
 //! The admin area and the auditor's view: `GET /api/admin/{audit, audit/export, team,
 //! connectors, overview}` (`docs/web-api.md`, Admin and auditor). All read-only.
 //!
-//! **Who:** roles come from `team.yaml` through the permission matrix
+//! **Who:** roles come from the user database (`resolve`, at most 10 s old) through the matrix
 //! (`pmos_contract::permissions`): an `admin` sees everything; an `auditor` sees the audit log,
 //! its export, the team and the overview, never connectors; anyone else gets
 //! `403 {"code":"forbidden"}`. The tool server checks the viewer's role again on its side
@@ -249,9 +249,8 @@ async fn read_page(
     params: &[(&str, String)],
 ) -> Result<AuditPage, ApiError> {
     let query: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let value = state
-        .0
-        .toolserver
+    let value = signed
+        .toolserver(state)
         .admin(&signed.member.handle, "audit", &query)
         .await
         .map_err(upstream)?;
@@ -412,8 +411,9 @@ struct MemberAccounts {
 /// Confluence.
 const ACCOUNT_KINDS: [&str; 3] = ["atlassian", "slack", "github"];
 
-/// `GET /api/admin/team`: every member in `team.yaml`, with which accounts they've linked as
-/// booleans when the tool server answers (else `accounts: null`).
+/// `GET /api/admin/team`: every member in `team.yaml` (until slice U5; it decides nothing),
+/// with which accounts they've linked as booleans when the tool server answers (else
+/// `accounts: null`).
 async fn team(State(state): State<AppState>, signed: Signed) -> ApiResult {
     need_any(
         &signed,
@@ -421,9 +421,8 @@ async fn team(State(state): State<AppState>, signed: Signed) -> ApiResult {
     )?;
     read_log(&signed, "/api/admin/team", &[]);
     let file = load_team(&state)?;
-    let linked = match state
-        .0
-        .toolserver
+    let linked = match signed
+        .toolserver(&state)
         .admin(&signed.member.handle, "accounts", &[])
         .await
     {
@@ -491,9 +490,8 @@ struct ConnectorsReply {
 async fn connectors(State(state): State<AppState>, signed: Signed) -> ApiResult {
     need_any(&signed, &[Permission::ManageConnectors])?;
     read_log(&signed, "/api/admin/connectors", &[]);
-    let v = state
-        .0
-        .toolserver
+    let v = signed
+        .toolserver(&state)
         .admin(&signed.member.handle, "connectors", &[])
         .await
         .map_err(upstream)?;
@@ -543,9 +541,8 @@ async fn overview(State(state): State<AppState>, signed: Signed) -> ApiResult {
         &[Permission::ViewAuditLog, Permission::ManageMembers],
     )?;
     read_log(&signed, "/api/admin/overview", &[]);
-    let v = state
-        .0
-        .toolserver
+    let v = signed
+        .toolserver(&state)
         .admin(&signed.member.handle, "overview", &[])
         .await
         .map_err(upstream)?;

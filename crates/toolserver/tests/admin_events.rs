@@ -213,6 +213,79 @@ async fn sign_ins_sign_outs_and_refusals_are_listed() {
     srv.cancel.cancel();
 }
 
+/// Slice U4c: the user database's refusal codes, and a known Microsoft account signing in with
+/// another user's sign-in name, recorded as the first-link route records a conflict (so the
+/// overview's `identity_conflicts` counts it).
+#[tokio::test]
+async fn user_database_refusals_and_identity_conflicts_are_recorded() {
+    let srv = start(Mode::Require).await;
+    for reason in [
+        "deactivated",
+        "sign_in_unconfirmed",
+        "entra_needs_host",
+        "entra_misconfigured",
+        "users_unavailable",
+    ] {
+        let (status, body) = srv
+            .record(
+                None,
+                &json!({"action": "web.sign_in_refused", "provider": "entra", "reason": reason}),
+            )
+            .await;
+        assert_eq!(status, 200, "{reason}: {body}");
+    }
+    let refused = srv.events("web.sign_in_refused").await;
+    assert_eq!(refused.len(), 5);
+    assert_eq!(
+        refused[0]["detail"],
+        "provider: entra; reason: users_unavailable"
+    );
+
+    let (status, body) = srv
+        .record(
+            None,
+            &json!({"action": "users.identity_conflict", "provider": "entra", "member": "ana"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let conflicts = srv.events("users.identity_conflict").await;
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0]["actor"], "anonymous");
+    assert_eq!(conflicts[0]["outcome"], "denied");
+    assert_eq!(conflicts[0]["target"], "ana");
+    assert_eq!(conflicts[0]["detail"], "entra");
+
+    // Only entra, only `member` naming a user, and never for a signed-in subject.
+    for (user, body) in [
+        (
+            None,
+            json!({"action": "users.identity_conflict", "provider": "dev", "member": "ana"}),
+        ),
+        (
+            None,
+            json!({"action": "users.identity_conflict", "provider": "entra", "member": "mallory"}),
+        ),
+        (
+            None,
+            json!({"action": "users.identity_conflict", "provider": "entra"}),
+        ),
+        (
+            None,
+            json!({"action": "users.identity_conflict", "provider": "entra", "member": "ana",
+                   "reason": "not_a_member"}),
+        ),
+        (
+            Some("ana"),
+            json!({"action": "users.identity_conflict", "provider": "entra", "member": "ana"}),
+        ),
+    ] {
+        let (status, resp) = srv.record(user, &body).await;
+        assert_eq!(status, 400, "{body}: {resp}");
+    }
+    assert_eq!(srv.events("users.identity_conflict").await.len(), 1);
+    srv.cancel.cancel();
+}
+
 #[tokio::test]
 async fn only_fixed_actions_and_codes_never_free_text() {
     let srv = start(Mode::Require).await;

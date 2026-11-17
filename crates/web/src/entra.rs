@@ -9,9 +9,15 @@
 //!    used, exchanges the code with the client secret and the verifier, and validates the
 //!    ID token: RS256 only, signed by a key in the tenant's JWKS, `iss` exactly the tenant's
 //!    v2.0 issuer, `aud` the client id, `exp`/`nbf`/`iat` within 60 seconds of skew, the
-//!    flow's `nonce`, and `tid` the configured tenant.
-//! 3. The token names the person by `preferred_username` (or else `email`), which the app
-//!    looks up in `team.yaml`'s `email` field; Entra never decides membership or roles.
+//!    flow's `nonce`, and `tid` the configured tenant. Then the claims PM OS keys on
+//!    (`docs/entra-sign-in.md`, "What Microsoft says about the claims"): `oid` must be a GUID;
+//!    the optional `acct` claim must be present (else `entra_misconfigured`) and `0`, a member
+//!    of the tenant (a guest, `1`, is `not_a_member`); and `idp`, when present, must name this
+//!    tenant (the token's own issuer, or this tenant's v1 issuer `https://sts.windows.net/<tid>/`),
+//!    else `not_a_member`.
+//! 3. The app looks the person up in the user database by `(tid, oid)`, and only for a first
+//!    link by `preferred_username`. The `email` claim is never read. Entra never decides
+//!    membership or roles.
 //!
 //! Tokens, codes, verifiers and the client secret are never logged; failures log a short
 //! fixed reason.
@@ -41,8 +47,9 @@ pub const FLOW_COOKIE: &str = "__Host-pmos-entra";
 pub const FLOW_SECONDS: i64 = 600;
 /// The clock skew allowed on `exp`, `nbf` and `iat`.
 pub const SKEW_SECONDS: i64 = 60;
-/// The scopes asked for: an ID token with the person's name and email, nothing else.
-pub const SCOPES: &str = "openid profile email";
+/// The scopes asked for: an ID token with the person's `oid` and `preferred_username`
+/// (`profile`), nothing else. Not `email`: that claim is never read.
+pub const SCOPES: &str = "openid profile";
 /// How long the discovery document and the keys are kept before a fresh fetch.
 const METADATA_TTL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 /// The largest discovery, JWKS or token response read.
@@ -265,6 +272,12 @@ pub enum Failure {
     Unavailable(&'static str),
     /// Anything else: a bad state, code or token.
     Failed(&'static str),
+    /// The token has no `acct` claim: the app registration doesn't add the optional claim,
+    /// so PM OS can't tell a member from a guest and refuses everyone (`entra_misconfigured`).
+    Misconfigured,
+    /// A guest (`acct` not `0`), or an account from another identity provider (`idp`):
+    /// `not_a_member`, before any lookup.
+    NotMember(&'static str),
 }
 
 impl Failure {
@@ -274,6 +287,8 @@ impl Failure {
             Failure::Cancelled => "cancelled",
             Failure::Unavailable(_) => "unavailable",
             Failure::Failed(_) => "failed",
+            Failure::Misconfigured => "entra_misconfigured",
+            Failure::NotMember(_) => "not_a_member",
         }
     }
 
@@ -281,7 +296,10 @@ impl Failure {
         match self {
             Failure::Expired => "no sign-in in progress, or it expired",
             Failure::Cancelled => "cancelled at the identity provider",
-            Failure::Unavailable(w) | Failure::Failed(w) => w,
+            Failure::Misconfigured => {
+                "the ID token has no acct claim (add it in Token configuration)"
+            }
+            Failure::Unavailable(w) | Failure::Failed(w) | Failure::NotMember(w) => w,
         }
     }
 }
@@ -375,21 +393,45 @@ struct IdClaims {
     nbf: Option<i64>,
     nonce: Option<String>,
     tid: Option<String>,
-    /// The person's object id in the tenant: stable, never reassigned, unlike an email.
+    /// The person's object id in the tenant: stable, never reassigned, unlike a name.
     oid: Option<String>,
+    /// The optional claim: `0` for a member of the tenant, `1` for a guest. A number in
+    /// practice; a string `"0"` is read the same.
+    acct: Option<serde_json::Value>,
+    /// The identity provider that authenticated the person, when it isn't the tenant itself
+    /// (absent, or equal to the issuer, for a member).
+    idp: Option<String>,
     preferred_username: Option<String>,
-    email: Option<String>,
+    // `email` is deliberately not read: Microsoft says it is unverified and mutable, and it
+    // must never decide who someone is (`docs/entra-sign-in.md`).
 }
 
-/// Who a checked ID token names: the email the member is found by, and the token's `oid`
-/// and `tid`, recorded on the session (`docs/entra-sign-in.md`, "Matching by object id").
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Who a checked ID token names: its `(tid, oid)`, the key PM OS signs people in by, and its
+/// `preferred_username`, used only to find a person for their first link. `Debug` shows
+/// neither the `oid` nor the name.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Identity {
-    pub email: String,
-    /// The `oid` claim, lower-cased, when it is a GUID; `None` when the token has none.
-    pub oid: Option<String>,
+    /// The `oid` claim, lower-cased: always a GUID.
+    pub oid: String,
     /// The `tid` claim, lower-cased: always the configured tenant.
     pub tid: String,
+    /// The `preferred_username` claim, trimmed and lower-cased, when it is an email address.
+    pub preferred_username: Option<String>,
+}
+
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("oid", &"<redacted>")
+            .field("tid", &self.tid)
+            .field("preferred_username", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Is `acct` a member's (`0`)? `Some(false)` for a guest or any other value.
+fn acct_is_member(acct: &serde_json::Value) -> bool {
+    acct.as_i64() == Some(0) || acct.as_str().map(str::trim) == Some("0")
 }
 
 /// The Entra ID provider: builds the authorize redirect, checks the callback's flow cookie,
@@ -654,17 +696,13 @@ impl Entra {
             .ok_or(Failure::Failed("no id token"))
     }
 
-    /// Validate an ID token and return the email it names.
-    pub async fn validate(
-        &self,
-        token: &str,
-        nonce: &str,
-        now: DateTime<Utc>,
-    ) -> Result<String, Failure> {
-        Ok(self.validate_identity(token, nonce, now).await?.email)
+    /// This tenant's v1 issuer, `https://sts.windows.net/<tid>/`: what `idp` may also hold for
+    /// a member (it names the same tenant).
+    fn v1_issuer(&self) -> String {
+        format!("https://sts.windows.net/{}/", self.config.tenant_id)
     }
 
-    /// Validate an ID token and return who it names: the email, `oid` and `tid`.
+    /// Validate an ID token and return who it names: `(tid, oid)` and `preferred_username`.
     pub async fn validate_identity(
         &self,
         token: &str,
@@ -721,34 +759,36 @@ impl Entra {
         {
             return Err(Failure::Failed("token tenant"));
         }
-        let email = [claims.preferred_username, claims.email]
-            .into_iter()
-            .flatten()
-            .map(|e| e.trim().to_ascii_lowercase())
-            .find(|e| valid_email(e))
-            .ok_or(Failure::Failed("token names no email"))?;
+        let oid = claims
+            .oid
+            .map(|o| o.trim().to_ascii_lowercase())
+            .filter(|o| is_guid(o))
+            .ok_or(Failure::Failed("token without an object id"))?;
+        // Members only (spec §7): the optional `acct` claim must be there, so a registration
+        // that forgot it fails closed rather than letting guests through.
+        match &claims.acct {
+            None => return Err(Failure::Misconfigured),
+            Some(acct) if !acct_is_member(acct) => {
+                return Err(Failure::NotMember("a guest account"))
+            }
+            Some(_) => {}
+        }
+        // `idp` is absent for a member, or names this tenant; anything else is someone who
+        // signed in with another identity provider.
+        if let Some(idp) = claims.idp.as_deref().map(str::trim) {
+            if idp != claims.iss && !idp.eq_ignore_ascii_case(&self.v1_issuer()) {
+                return Err(Failure::NotMember("another identity provider"));
+            }
+        }
+        let preferred_username = claims
+            .preferred_username
+            .map(|e| e.trim().to_lowercase())
+            .filter(|e| valid_email(e));
         Ok(Identity {
-            email,
-            oid: claims
-                .oid
-                .map(|o| o.trim().to_ascii_lowercase())
-                .filter(|o| is_guid(o)),
+            oid,
             tid: self.config.tenant_id.to_ascii_lowercase(),
+            preferred_username,
         })
-    }
-
-    /// Exchange the code and validate the ID token: the email it names.
-    pub async fn sign_in(
-        &self,
-        code: &str,
-        nonce: &str,
-        verifier: &str,
-        now: DateTime<Utc>,
-    ) -> Result<String, Failure> {
-        Ok(self
-            .sign_in_identity(code, nonce, verifier, now)
-            .await?
-            .email)
     }
 
     /// Exchange the code and validate the ID token: who it names.
@@ -787,8 +827,9 @@ impl AuthProvider for Entra {
         else {
             return Err(SignInError::Unsupported);
         };
-        match self.sign_in(code, nonce, verifier, *now).await {
-            Ok(email) => Ok(Claimed(email)),
+        // The Entra key's `oid`: the callback looks the person up by `(tid, oid)` itself.
+        match self.sign_in_identity(code, nonce, verifier, *now).await {
+            Ok(identity) => Ok(Claimed(identity.oid)),
             Err(f) => Err(SignInError::Rejected(f)),
         }
     }

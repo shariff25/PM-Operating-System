@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use pmos_contract::model::TeamFile;
 use pmos_web::{app, Config};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -12,14 +11,8 @@ async fn main() -> Result<()> {
         .init();
     // Refuses to start without a sign-in provider, weak tokens or bad URLs.
     let config = Config::from_env().map_err(anyhow::Error::msg)?;
-    // Refuse to start on a team file that doesn't parse; it's re-read when it changes.
-    let team = TeamFile::load(&config.content_root).map_err(anyhow::Error::msg)?;
-    if team.members.is_empty() {
-        tracing::warn!(
-            root = %config.content_root.display(),
-            "team.yaml lists nobody: every sign-in will be refused"
-        );
-    }
+    // Who may sign in, and their roles, come from the user database at the tool server
+    // (`resolve`), not from a file: nothing to check here.
     let providers = app::providers(&config).map_err(anyhow::Error::msg)?;
     for provider in &providers {
         if provider.is_insecure() {

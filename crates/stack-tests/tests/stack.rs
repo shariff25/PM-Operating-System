@@ -5,12 +5,14 @@
 //!
 //! The walk: dev sign-in → ask → the bot drafts a Slack reply → the draft appears in the web
 //! app → the PM saves an edit → approves → the tool server writes the edited text. And a
-//! refusal: another PM gets `404` for that draft, reading or deciding it.
+//! refusal: another PM gets `404` for that draft, reading or deciding it. And slice U4c:
+//! `pmos-web` signs people in from the tool server's real user database (`resolve`), so a
+//! deactivation there ends a web session within 10 seconds.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use pmos_assertion::{Key, KeyRing};
 use pmos_toolserver::catalog::Catalog;
 use pmos_toolserver::connectors::fake::{FakeConnector, SLACK_ALL_TEAM};
@@ -91,6 +93,10 @@ struct Stack {
     slack: Arc<FakeConnector>,
     http: reqwest::Client,
     cancel: CancellationToken,
+    /// `pmos-web`'s clock, which a test moves (its directory cache reads it).
+    web_clock: Arc<Mutex<DateTime<Utc>>>,
+    /// The tool server's user database.
+    users: Arc<dyn pmos_toolserver::users::UserStore>,
     _content: tempfile::TempDir,
 }
 
@@ -106,6 +112,33 @@ async fn start() -> Stack {
 
     // The tool server: memory stores, fake connectors, `require` for pmos-web.
     let (stores, _audit) = Stores::in_memory(&root);
+    // The user database, as `import --bootstrap` fills it: Ana and Ben (PMs) and an admin.
+    let users = stores.users.clone();
+    let mut team = pmos_contract::model::TeamFile::from_yaml(TEAM).unwrap();
+    team.members.push(pmos_contract::model::TeamMember {
+        handle: "ada".into(),
+        slack_id: "U0ADA".into(),
+        email: None,
+        github: None,
+        entra_oid: None,
+        roles: vec![
+            pmos_contract::model::Role::Pm,
+            pmos_contract::model::Role::Admin,
+        ],
+    });
+    users
+        .apply(
+            &pmos_toolserver::users::Actor::import(None),
+            pmos_toolserver::users::Op::Import(Box::new(pmos_toolserver::users::ImportRequest {
+                file: team,
+                sha256: "0".repeat(64),
+                commit: None,
+                mode: pmos_toolserver::users::ImportMode::Bootstrap,
+            })),
+            Utc::now(),
+        )
+        .await
+        .expect("the stack's users import");
     let catalog = Catalog::load(&root, Utc::now().date_naive()).unwrap();
     let slack = Arc::new(FakeConnector::slack());
     let connectors: Vec<Arc<dyn Connector>> = vec![
@@ -194,14 +227,12 @@ async fn start() -> Stack {
             "web",
             "bots",
             ring("wb1", WEB_BOTS_KEY),
-            root.clone(),
         )),
         toolserver_url: toolserver.clone(),
         toolserver_token: Credentials::new(TS_WEB_TOKEN).with_signer(Signer::new(
             "web",
             "toolserver",
             ring("wt1", WEB_TOOLS_KEY),
-            root.clone(),
         )),
         content_root: root.clone(),
         static_dir: None,
@@ -212,7 +243,13 @@ async fn start() -> Stack {
         session_max: chrono::Duration::hours(24),
         internal_bind: None,
     };
-    let web = serve(pmos_web::build(config, Deps::in_memory()).unwrap(), &cancel).await;
+    let web_clock = Arc::new(Mutex::new(Utc::now()));
+    let clock = web_clock.clone();
+    let deps = Deps {
+        clock: Arc::new(move || *clock.lock().unwrap()),
+        ..Deps::in_memory()
+    };
+    let web = serve(pmos_web::build(config, deps).unwrap(), &cancel).await;
 
     Stack {
         web,
@@ -224,6 +261,8 @@ async fn start() -> Stack {
             .build()
             .unwrap(),
         cancel,
+        web_clock,
+        users,
         _content: dir,
     }
 }
@@ -440,4 +479,53 @@ async fn ask_draft_edit_approve_through_the_real_services() {
     assert_eq!(writes[0].user, "ana");
     let item = s.svc.approval(&approval).await.unwrap().unwrap();
     assert_eq!(item.decided_by.as_deref(), Some("ana"));
+}
+
+/// Slice U4c on the real tool server: sign-in and every request resolve the person in its
+/// user database; a deactivation there ends the web session within 10 seconds, and sign-in is
+/// then refused; someone only in `team.yaml` never signs in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deactivation_in_the_user_database_ends_the_web_session_within_ten_seconds() {
+    let stack = start().await;
+    let ana = stack.login("ana").await;
+    let (status, me, _) = stack.send(Some(&ana), Method::GET, "/api/me", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["roles"], json!(["pm"]));
+    stack
+        .users
+        .apply(
+            &pmos_toolserver::users::Actor::web("ada"),
+            pmos_toolserver::users::Op::Deactivate {
+                handle: "ana".into(),
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("ada deactivates ana");
+    *stack.web_clock.lock().unwrap() += chrono::Duration::seconds(10);
+    let (status, body, _) = stack
+        .send(Some(&ana), Method::GET, "/api/drafts", None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "not_a_member");
+    let (status, body, _) = stack
+        .send(
+            None,
+            Method::POST,
+            "/api/auth/dev-login",
+            Some(json!({"handle": "ana"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // Someone not in the user database never signs in; Ben still does.
+    let (status, _, _) = stack
+        .send(
+            None,
+            Method::POST,
+            "/api/auth/dev-login",
+            Some(json!({"handle": "mallory"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    stack.login("ben").await;
 }
