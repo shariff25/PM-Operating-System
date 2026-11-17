@@ -94,7 +94,7 @@ export function ApproveDialog(p: Props) {
           </ul>
         )}
         <StrippedNote parts={p.rendered.stripped} what={copy.stripped.draft} />
-        <p>{draft.practice ? copy.approve.confirmPractice : copy.approve.confirmNothing}</p>
+        <p>{draft.practice ? copy.approve.confirmPractice : copy.approve.confirmNothing(draft.kind)}</p>
         {p.showExternal && (
           <div className="note note-warn">
             <p>{copy.approve.externalWarning}</p>
@@ -112,7 +112,7 @@ export function ApproveDialog(p: Props) {
             onClick={p.onConfirm}
             disabled={p.approving || (p.showExternal && !p.externalOk)}
           >
-            {p.approving ? copy.approve.confirming : p.confirmLabel}
+            {p.approving ? copy.approve.confirming(draft.kind) : p.confirmLabel}
           </button>
           <button type="button" className="btn" onClick={p.onCancel}>
             {copy.approve.cancel}

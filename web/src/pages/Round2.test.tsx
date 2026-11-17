@@ -2,6 +2,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Api, Draft } from '../api';
+import { stripMarkers } from '../citations';
 import { copy } from '../copy';
 import { renderApp } from '../test/util';
 
@@ -272,7 +273,8 @@ describe('before and after: lighter fallbacks', () => {
     let old = '';
     a.getDraft = async (id) => {
       const d = await orig(id);
-      old = d.body;
+      // A suggestion never carries source markers, so it is built from the text without them.
+      old = stripMarkers(d.body);
       return d;
     };
     a.getSuggestion = async () => ({ status: 'ready', instruction: 'x', body: body(old), error: null });

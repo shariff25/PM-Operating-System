@@ -133,3 +133,84 @@ describe('renderMarkdown: only plain formatting survives', () => {
     expect(el.textContent).toContain('[x] done');
   });
 });
+
+describe('renderMarkdown: source markers', () => {
+  const sources = [
+    { id: 's1', title: 'Pricing principles' },
+    { id: 's2', title: 'PAY-212: Grace period' },
+    { id: 's4', title: 'Slack thread in C01' },
+  ];
+  const cites = (el: HTMLElement) => [...el.querySelectorAll('button.cite')].map((b) => [b.textContent, b.getAttribute('aria-label')]);
+
+  it('turns a marker in a paragraph into a numbered button named after its source', () => {
+    const r = renderMarkdown('Seven days[[s2]], as agreed.', { sources });
+    expect(cites(dom(r.html))).toEqual([['2', 'Source 2: PAY-212: Grace period']]);
+    expect(dom(r.html).textContent?.trim()).toBe('Seven days2, as agreed.');
+    expect(r.cites).toEqual({ s2: 1 });
+  });
+
+  it('numbers by the card position, not by the digits in the marker', () => {
+    const r = renderMarkdown('A[[s4]].', { sources });
+    expect(cites(dom(r.html))).toEqual([['3', 'Source 3: Slack thread in C01']]);
+  });
+
+  it('places markers in headings, lists, table cells, emphasis and link text', () => {
+    const r = renderMarkdown(
+      '## Head[[s1]]\n\n- item[[s2]]\n\n| a | b |\n|---|---|\n| cell[[s4]] | x |\n\n**bold[[s1]]** and *it[[s2]]*\n\nSee [the doc[[s4]]](https://example.com/x).',
+      { sources },
+    );
+    const el = dom(r.html);
+    expect(el.querySelector('h2 button.cite')).not.toBeNull();
+    expect(el.querySelector('li button.cite')).not.toBeNull();
+    expect(el.querySelector('td button.cite')).not.toBeNull();
+    expect(el.querySelector('strong button.cite')).not.toBeNull();
+    expect(el.querySelector('em button.cite')).not.toBeNull();
+    // a button inside a link is not allowed, so a marker in link text goes just after the link
+    expect(el.querySelector('a button')).toBeNull();
+    expect(el.querySelector('a + sup.cite-group button.cite')).not.toBeNull();
+    expect(el.textContent).not.toContain('[[s');
+    expect(r.links[0]!.text).toBe('the doc');
+  });
+
+  it('groups adjacent markers in card order, once each', () => {
+    const r = renderMarkdown('Claim[[s4]][[s1]][[s4]].', { sources });
+    expect(dom(r.html).querySelectorAll('sup.cite-group')).toHaveLength(1);
+    expect(cites(dom(r.html)).map((c) => c[0])).toEqual(['1', '3']);
+    expect(r.cites).toEqual({ s1: 1, s4: 1 });
+  });
+
+  it('renders nothing for a source that is not listed, or when no sources are given', () => {
+    expect(dom(renderMarkdown('A[[s9]]B', { sources }).html).textContent?.trim()).toBe('AB');
+    expect(dom(renderMarkdown('A[[s1]]B').html).textContent?.trim()).toBe('AB');
+    expect(renderMarkdown('A[[s9]][[s1]]B', { sources }).cites).toEqual({ s1: 1 });
+  });
+
+  it('never touches code, and a marker in code is not counted', () => {
+    const r = renderMarkdown('Inline `[[s1]]` and\n\n```\n[[s1]]\n```\n\nreal[[s1]]', { sources });
+    const el = dom(r.html);
+    expect(el.querySelectorAll('code button')).toHaveLength(0);
+    expect([...el.querySelectorAll('code')].map((c) => c.textContent)).toEqual(['[[s1]]', '[[s1]]\n']);
+    expect(r.cites).toEqual({ s1: 1 });
+  });
+
+  it('only matches one to three digits', () => {
+    const r = renderMarkdown('A[[s1234]] B[[s]] C[[x1]]', { sources });
+    expect(dom(r.html).querySelector('button')).toBeNull();
+    expect(dom(r.html).textContent).toContain('[[s1234]]');
+  });
+
+  it('cannot be faked with raw HTML: a button the bot writes is dropped and counted as stripped', () => {
+    const fake = '<button class="cite" data-cite="s1" aria-label="Source 1: Official">1</button>';
+    const r = renderMarkdown(`Look${fake} here.`, { sources });
+    const el = dom(r.html);
+    expect(el.querySelector('button')).toBeNull();
+    expect(r.stripped.length).toBeGreaterThan(0);
+  });
+
+  it('keeps a source title with markup in it as text', () => {
+    const r = renderMarkdown('A[[s1]]', { sources: [{ id: 's1', title: '<img src=x>' }] });
+    const el = dom(r.html);
+    expect(el.querySelector('img')).toBeNull();
+    expect(el.querySelector('button')!.getAttribute('aria-label')).toBe('Source 1: <img src=x>');
+  });
+});

@@ -1,4 +1,5 @@
 import type { Api, Task } from './api';
+import { stripFromLine, stripMarkers } from './citations';
 
 /**
  * A daily brief answer may end with a fenced block whose info string is `pmos-brief`: JSON for
@@ -32,9 +33,9 @@ export function stripBriefBlock(text: string): string {
 export function cleanTask(task: Task): Task {
   return {
     ...task,
-    result: task.result === null ? null : stripBriefBlock(task.result) || null,
+    result: task.result === null ? null : stripMarkers(stripBriefBlock(task.result)) || null,
     error: task.error === null ? null : stripBriefBlock(task.error) || null,
-    events: task.events?.map((e) => ({ ...e, text: stripBriefBlock(e.text) })),
+    events: task.events?.map((e) => ({ ...e, text: stripFromLine(stripBriefBlock(e.text)) })),
   };
 }
 

@@ -177,7 +177,7 @@ describe('approving', () => {
     expect(links).toHaveTextContent('https://example.com/wiki/billing-roadmap');
     // still pending until confirmed
     expect(screen.queryByText(copy.doneFirstApproval)).not.toBeInTheDocument();
-    await user.click(within(confirm).getByRole('button', { name: copy.approve.confirm }));
+    await user.click(within(confirm).getByRole('button', { name: copy.approve.confirm('confluence_page') }));
     await screen.findByText(copy.doneFirstApproval);
     expect(screen.getByRole('link', { name: copy.approve.resultLink })).toHaveAttribute('href', expect.stringContaining('example.com/confluence'));
   });
@@ -250,7 +250,7 @@ describe('approving', () => {
     // someone else changes the draft after the PM opened it
     await api.saveDraft('apr_prd', { body: '# Changed elsewhere\n\nA new risk.' });
     await user.click(screen.getByRole('button', { name: 'Approve to Confluence' }));
-    await user.click(screen.getByRole('button', { name: copy.approve.confirm }));
+    await user.click(screen.getByRole('button', { name: copy.approve.confirm('confluence_page') }));
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(copy.approve.errors.stale.text);
@@ -262,7 +262,7 @@ describe('approving', () => {
 
     // the second try carries the new version and goes through
     await user.click(screen.getByRole('button', { name: 'Approve to Confluence' }));
-    await user.click(screen.getByRole('button', { name: copy.approve.confirm }));
+    await user.click(screen.getByRole('button', { name: copy.approve.confirm('confluence_page') }));
     await screen.findByText(copy.doneFirstApproval);
     expect(seen).toEqual(['1', '2']);
   });
@@ -283,7 +283,7 @@ describe('approving', () => {
     expect(screen.getByText(copy.approve.externalWarning)).toBeInTheDocument();
     await user.click(screen.getByRole('checkbox', { name: copy.approve.externalCheckbox }));
     await user.click(send);
-    await screen.findByText(copy.approve.approvedWhere('#partner-pricing, a channel shared with Acme Corp'));
+    await screen.findByText(copy.approve.approvedWhere('slack_reply', '#partner-pricing, a channel shared with Acme Corp'));
     expect(approve).toHaveBeenCalledWith('apr_slack', { confirmExternal: true, version: '1' });
   });
 
@@ -304,13 +304,13 @@ describe('approving', () => {
       },
     });
     await user.click(await screen.findByRole('button', { name: 'Approve to Confluence' }));
-    await user.click(screen.getByRole('button', { name: copy.approve.confirm }));
+    await user.click(screen.getByRole('button', { name: copy.approve.confirm('confluence_page') }));
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(copy.approve.errors.needs_external_confirm.next);
     const tick = screen.getByRole('checkbox', { name: copy.approve.externalCheckbox });
     await user.click(tick);
     await user.click(screen.getByRole('button', { name: copy.approve.confirmExternalButton }));
-    await screen.findByText(copy.approve.approvedWhere('Space PM, under Specs'));
+    await screen.findByText(copy.approve.approvedWhere('confluence_page', 'Space PM, under Specs'));
   });
 
   it('says what happened when the server reports expiry, and offers one next step', async () => {
@@ -350,7 +350,7 @@ describe('approving', () => {
     expect(screen.getByText(copy.draft.practiceLabel + '.')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Approve to Confluence' }));
     expect(screen.getByText(copy.approve.confirmPractice)).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: copy.approve.confirm }));
+    await user.click(screen.getByRole('button', { name: copy.approve.confirm('confluence_page') }));
     await screen.findByText(copy.approve.practiceApproved);
     expect(screen.queryByRole('link', { name: copy.approve.resultLink })).not.toBeInTheDocument();
     expect(screen.queryByText(copy.doneFirstApproval)).not.toBeInTheDocument();
@@ -430,7 +430,7 @@ describe('untrusted draft text (review findings 1, 2 and 5)', () => {
         return a;
       },
     });
-    await screen.findByText(copy.approve.approvedWhere('Space PM, under Updates'));
+    await screen.findByText(copy.approve.approvedWhere('confluence_page', 'Space PM, under Updates'));
     expect(document.querySelector('a[href^="javascript:"]')).toBeNull();
     expect(screen.getByText(/not a web link/)).toBeInTheDocument();
   });
