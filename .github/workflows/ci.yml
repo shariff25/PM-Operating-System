@@ -111,7 +111,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Scripts parse
-        run: for f in deploy/setup.sh deploy/pmos-admin deploy/postgres-init.sh scripts/claude-test-stack.sh; do bash -n "$f"; done
+        run: for f in deploy/setup.sh deploy/pmos-admin deploy/postgres-init.sh scripts/claude-test-stack.sh scripts/test-pmos-admin.sh; do bash -n "$f"; done
+      - name: pmos-admin checks (the eval gate's arguments; the checkout stays data)
+        run: scripts/test-pmos-admin.sh
       - name: Settings
         run: deploy/setup.sh --content "$GITHUB_WORKSPACE" --state "$RUNNER_TEMP/pmos-state"
       - run: docker compose -f deploy/compose.yaml --env-file deploy/.env config -q

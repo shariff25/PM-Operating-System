@@ -95,9 +95,10 @@ services:
       PMOS_DATABASE_URL: postgresql://pmos_toolserver:${PMOS_DB_TOOLSERVER_PASSWORD}@postgres/pmos_toolserver
       PMOS_SERVICE_TOKEN: ${PMOS_SERVICE_TOKEN:?}
       PMOS_BOT_TOKEN: ${PMOS_BOT_TOKEN:?}
-      # The web app's and the console's own tokens: the approvals routes only.
+      # The web app's own token: the approvals routes and the read-only admin routes.
       PMOS_WEB_TOKEN: ${PMOS_TS_WEB_TOKEN:?run deploy/setup.sh again}
-      PMOS_CONSOLE_TOKEN: ${PMOS_TS_CONSOLE_TOKEN:?run deploy/setup.sh again}
+      # The console's read-only token: it may read approvals and nothing else.
+      PMOS_CONSOLE_TS_TOKEN: ${PMOS_CONSOLE_TS_TOKEN:-}
       # User assertions from the web app and the console (docs/user-assertion.md). `off` unless
       # set; `pmos-admin up --web` makes it `require`.
       PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-off}
@@ -160,6 +161,8 @@ services:
       # set; `pmos-admin up --web` makes it `require`.
       PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-off}
       PMOS_ASSERTION_KEYS: web:bots:${PMOS_AK_WEB_BOTS:?run deploy/setup.sh again},console:bots:${PMOS_AK_CONSOLE_BOTS:?run deploy/setup.sh again}
+      # The handles the evals client may request tasks as (empty: `evals`).
+      PMOS_EVALS_AS: ${PMOS_EVALS_AS:-}
     volumes:
       - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
     depends_on:
@@ -222,7 +225,8 @@ services:
       PMOS_BOTS_URL: http://bots.pmos.internal:8750
       PMOS_BOTS_TOKEN: ${PMOS_RT_CONSOLE_TOKEN}
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
-      PMOS_TOOLSERVER_TOKEN: ${PMOS_TS_CONSOLE_TOKEN}
+      # Its own read-only tool-server token, never the service token.
+      PMOS_TOOLSERVER_TOKEN: ${PMOS_CONSOLE_TS_TOKEN:-}
       PMOS_ASSERTION_KEYS: console:bots:${PMOS_AK_CONSOLE_BOTS},console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_CONSOLE_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl

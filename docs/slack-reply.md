@@ -86,7 +86,9 @@ These are commands to PM OS, typed alone in a DM:
   - what kind of sources it used;
   - who would see it.
 - **Post as you** posts it in the thread.
-- **Edit** opens the draft for changes; you post the edited text.
+- **Edit** opens the draft for changes; you post the edited text. An edit changes what the
+  draft says, never where it goes: the channel and thread aren't in the editor, and the tool
+  server refuses an edit that changes them.
 - **Snooze** brings the card back in 1 hour, in 4 hours, or tomorrow at 9:00, within the
   draft's 24 hours.
 - **Reject** asks why in one tap. Your reasons feed the improvement loop

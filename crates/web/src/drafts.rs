@@ -6,13 +6,16 @@
 //! | Tool | `kind` | `title` | `body` | Target |
 //! | --- | --- | --- | --- | --- |
 //! | `confluence.create_draft` `{space, title, body, parent_id?}` | `confluence_page` | `title` | `body` | Space `space`, under page `parent_id` |
-//! | `confluence.update_page` `{page_id, body, version_comment?}` | `confluence_page` | "Update to page `page_id`" (the item has no title) | `body` | Page `page_id` |
+//! | `confluence.update_page` `{page_id, version, body, version_comment?}` | `confluence_page` | "Update to page `page_id`" (the item has no title) | `body` | Page `page_id` |
 //! | `jira.create_issue` `{project, issue_type, summary, description?, epic?}` | `jira_issue` | `summary` | `description` | Project `project`, a `issue_type`, under `epic` |
 //! | `slack.post_reply` `{channel, thread_ts, text, message_ts?}` | `slack_reply` | "Reply in `channel`" | `text` | A thread in `channel` |
 //! | `slack.send_message` `{channel, text}` | `slack_message` | "Message to `channel`" | `text` | `channel` |
 //!
 //! Other write tools (such as `bets.record`) are not drafts in this contract and are left
-//! out. A PM's edit maps back onto the same fields ([`edited_args`]).
+//! out. A PM's edit maps back onto the same fields ([`edited_args`]) and leaves every other
+//! argument as drafted: the tool server refuses an edit from `pmos-web` that changes where a
+//! write goes (`422 target_changed`; for `confluence.update_page`, `page_id` and the page
+//! `version` the bot read).
 //!
 //! **What the PM is told about the target comes from ids, never from free text the bot
 //! wrote.** The label is built from the target arguments only (space, page, project, issue
@@ -730,10 +733,11 @@ mod tests {
             edited_args("slack.post_reply", &args, &edit),
             json!({"channel": "C01", "thread_ts": "1.2", "text": "Edited"})
         );
-        let args = json!({"page_id": "9", "body": "Old"});
+        // The page version the bot read is a target argument: an edit keeps it as drafted.
+        let args = json!({"page_id": "9", "version": 4, "body": "Old"});
         assert_eq!(
             edited_args("confluence.update_page", &args, &edit),
-            json!({"page_id": "9", "body": "Edited"})
+            json!({"page_id": "9", "version": 4, "body": "Edited"})
         );
     }
 

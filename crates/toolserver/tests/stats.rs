@@ -57,6 +57,7 @@ async fn stats_over_the_internal_call_path() {
         AppConfig {
             service_token: SERVICE_TOKEN.into(),
             bot: None,
+            console_token: None,
             content_root: f.root.clone(),
             oauth: None,
             allowed_hosts: vec!["127.0.0.1".into(), "localhost".into()],

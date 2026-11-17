@@ -612,6 +612,93 @@ async fn source_markers_are_given_on_reads_and_never_written() {
     }
 }
 
+/// The clients that act for a PM (the Slack bot, `pmos-web`) may edit only what a draft says,
+/// keeping every target argument, `version` included, as drafted. Those edits still send no
+/// marker: a page update names the version it read and its body arrives without markers,
+/// and an edit that moves the write is still refused.
+#[tokio::test]
+async fn edits_that_keep_the_target_send_no_markers() {
+    use pmos_toolserver::audit::Client;
+    use pmos_toolserver::sources::cite_ref;
+    let f = fixture();
+    let s = f
+        .svc
+        .create_session("ana", "page-update", "r1", None, now())
+        .await
+        .unwrap();
+    let read = f
+        .svc
+        .call(&s, "confluence_read", json!({"page_id": "9002"}), now())
+        .await
+        .unwrap();
+    let r = cite_ref("confluence:9002");
+    assert_eq!(read["results"][0]["ref"], json!(r), "{read}");
+
+    // A page update, edited from the Slack bot: same page, same version, new text.
+    let drafted =
+        json!({"page_id": "9002", "version": 1, "body": format!("Grace is 7 days [[{r}]].")});
+    let queued = f
+        .svc
+        .call(&s, "confluence_update_page", drafted, now())
+        .await
+        .unwrap();
+    let id = queued["approval_id"].as_str().unwrap().to_string();
+    let moved = json!({"page_id": "9002", "version": 2, "body": "Grace is 7 days."});
+    assert_eq!(
+        f.svc
+            .decide_as(Client::Bot, &id, "ana", Decision::Edit, Some(moved), now())
+            .await
+            .map(|_| ()),
+        Err(DecisionError::TargetChanged("version".into())),
+        "an edit can't change the version"
+    );
+    assert!(f.confluence.writes().is_empty());
+    let edited = json!({
+        "page_id": "9002", "version": 1,
+        "body": format!("Grace is 7 days [[{r}]], retries stop [[src-ffffff]][[s2]].\n\n`[[{r}]]`"),
+    });
+    let item = f
+        .svc
+        .decide_as(Client::Bot, &id, "ana", Decision::Edit, Some(edited), now())
+        .await
+        .unwrap();
+    assert_eq!(item.status, Status::Approved);
+    assert_eq!(
+        f.confluence.writes()[0].args,
+        json!({"page_id": "9002", "version": 1,
+               "body": format!("Grace is 7 days, retries stop.\n\n`[[{r}]]`")}),
+        "markers removed, page and version kept, code as written"
+    );
+
+    // A new page, edited from `pmos-web`: same space, the title and body changed.
+    let queued = f
+        .svc
+        .call(
+            &s,
+            "confluence_create_draft",
+            json!({"space": "PM", "title": "Plan [[src-ffffff]]", "body": "Draft."}),
+            now(),
+        )
+        .await
+        .unwrap();
+    let id = queued["approval_id"].as_str().unwrap().to_string();
+    f.svc
+        .decide_as(
+            Client::Web,
+            &id,
+            "ana",
+            Decision::Edit,
+            Some(json!({"space": "PM", "title": "Plan [[src-ffffff]]", "body": format!("Grace is 7 days [[{r}]].")})),
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.confluence.writes()[1].args,
+        json!({"space": "PM", "title": "Plan", "body": "Grace is 7 days."})
+    );
+}
+
 #[tokio::test]
 async fn edit_runs_the_edited_arguments_and_reject_runs_nothing() {
     let f = fixture();
