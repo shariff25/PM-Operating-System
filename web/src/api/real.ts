@@ -1,6 +1,39 @@
 import { copy } from '../copy';
 import { ApiError } from './types';
-import type { Api, AuthProvider, Brief, Draft, DraftSummary, HintName, Me, RejectReason, Suggestion, Task } from './types';
+import type {
+  AdminOverview,
+  Api,
+  AuditPage,
+  AuditQuery,
+  AuthProvider,
+  Brief,
+  Connector,
+  Draft,
+  DraftSummary,
+  HintName,
+  Me,
+  RejectReason,
+  Suggestion,
+  TeamList,
+  Task,
+} from './types';
+
+/** The query string for an audit route. Empty values are left out, as the server counts them as absent. */
+export function auditQueryString(q: AuditQuery): string {
+  const p = new URLSearchParams();
+  for (const key of ['actor', 'action', 'outcome', 'from', 'to', 'before'] as const) {
+    const v = q[key];
+    if (v) p.set(key, v);
+  }
+  if (q.limit !== undefined) p.set('limit', String(q.limit));
+  const s = p.toString();
+  return s ? `?${s}` : '';
+}
+
+function filenameOf(disposition: string | null): string {
+  const m = /filename="?([^";]+)"?/i.exec(disposition ?? '');
+  return m?.[1] ?? 'pmos-audit.csv';
+}
 
 export interface RealOptions {
   /** Called on any 401: the app goes back to sign-in. */
@@ -18,7 +51,8 @@ export function createRealClient(opts: RealOptions = {}): Api {
   const base = opts.baseUrl ?? '/api';
   let csrf: string | null = null;
 
-  async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  /** Send a request; resolve with the response when it is a success, throw an ApiError otherwise. */
+  async function send(method: string, path: string, body?: unknown): Promise<Response> {
     const headers: Record<string, string> = {};
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     if (method !== 'GET' && csrf) headers['X-Pmos-Csrf'] = csrf;
@@ -35,10 +69,7 @@ export function createRealClient(opts: RealOptions = {}): Api {
       throw new ApiError(0, 'network', copy.errors.network);
     }
 
-    if (res.ok) {
-      if (res.status === 204) return undefined as T;
-      return (await res.json()) as T;
-    }
+    if (res.ok) return res;
 
     let code = 'unknown';
     let message: string = copy.errors.unknown;
@@ -55,6 +86,12 @@ export function createRealClient(opts: RealOptions = {}): Api {
       code = 'signed_out';
     }
     throw new ApiError(res.status, code, message);
+  }
+
+  async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const res = await send(method, path, body);
+    if (res.status === 204) return undefined as T;
+    return (await res.json()) as T;
   }
 
   const post = <T>(path: string, body?: unknown) => call<T>('POST', path, body ?? undefined);
@@ -100,5 +137,25 @@ export function createRealClient(opts: RealOptions = {}): Api {
     brief: () => call<Brief>('GET', '/brief'),
     dismissFollowup: (id) => post<void>(`/followups/${seg(id)}/dismiss`),
     draftFollowup: (id) => post<Task>(`/followups/${seg(id)}/draft`),
+
+    adminOverview: () => call<AdminOverview>('GET', '/admin/overview'),
+    adminAudit: (q) => call<AuditPage>('GET', `/admin/audit${auditQueryString(q)}`),
+    adminAuditExport: async (q) => {
+      // The export takes the filters only, never a page size or a cursor.
+      const filters = { ...q };
+      delete filters.limit;
+      delete filters.before;
+      const res = await send('GET', `/admin/audit/export${auditQueryString(filters)}`);
+      const blob = await res.blob();
+      const rowCount = Number(res.headers.get('X-Pmos-Row-Count'));
+      return {
+        blob,
+        filename: filenameOf(res.headers.get('Content-Disposition')),
+        truncated: res.headers.get('X-Pmos-Truncated') === 'true',
+        rowCount: Number.isFinite(rowCount) ? rowCount : 0,
+      };
+    },
+    adminTeam: () => call<TeamList>('GET', '/admin/team'),
+    adminConnectors: async () => (await call<{ connectors: Connector[] }>('GET', '/admin/connectors')).connectors,
   };
 }
