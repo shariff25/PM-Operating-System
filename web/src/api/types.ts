@@ -35,6 +35,8 @@ export interface Source {
   title: string;
   url: string | null;
   excerpt: string | null;
+  /** True when the draft's text has a marker for this source: the draft relies on it. */
+  cited: boolean;
 }
 
 export interface DraftTarget {
@@ -126,6 +128,13 @@ export interface Brief {
   changed: BriefChange[];
   waiting_on_you: FollowUp[];
   you_wait_on: FollowUp[];
+  /**
+   * When the brief was last delivered, or null when none ever has. An older server leaves it out,
+   * which the app reads the same way as null.
+   */
+  delivered_at?: string | null;
+  /** Optional summary of the same fact. */
+  status?: 'never' | 'today' | 'stale';
 }
 
 /** Error codes named in the contract; the server may add others. */
@@ -145,6 +154,8 @@ export type ErrorCode =
   | 'forbidden'
   | 'bad_request'
   | 'upstream_unavailable'
+  /** The server could not tell whether a write went through. */
+  | 'unknown_outcome'
   | 'network'
   | 'unknown';
 

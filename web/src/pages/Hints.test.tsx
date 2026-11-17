@@ -22,7 +22,7 @@ describe('hints', () => {
     expect(visible()).toEqual(['ask']);
 
     await dismiss(user, 'ask');
-    await screen.findByText(copy.hints.approve);
+    await screen.findByText(copy.hints.approve('confluence_page'));
     expect(visible()).toEqual(['approve']);
 
     await dismiss(user, 'approve');
@@ -70,7 +70,7 @@ describe('hints', () => {
     // dismiss two, then reset: the order starts again at the first
     await dismiss(user, 'sources');
     await dismiss(user, 'ask');
-    await screen.findByText(copy.hints.approve);
+    await screen.findByText(copy.hints.approve('confluence_page'));
     await user.click(screen.getByRole('button', { name: /Menu for/ }));
     await user.click(screen.getByRole('menuitem', { name: copy.menu.showHints }));
     await screen.findByText(copy.hints.sources);

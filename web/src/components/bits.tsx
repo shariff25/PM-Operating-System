@@ -1,6 +1,7 @@
-import { useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import type { DraftStatus, HintName, TaskStatus } from '../api';
+import { createPortal } from 'react-dom';
+import type { DraftKind, DraftStatus, HintName, TaskStatus } from '../api';
 import { useApp, messageOf } from '../app-context';
 import { copy } from '../copy';
 import type { Rendered } from '../markdown';
@@ -8,9 +9,86 @@ import { PHONE_QUERY, useMediaQuery } from '../theme';
 import { safeUrl } from '../url';
 import { Icon } from './icons';
 
-/** The formatted text. `rendered` comes from renderMarkdown, which keeps only plain formatting. */
-export function Markdown({ rendered, className }: { rendered: Rendered; className?: string }) {
-  return <div className={`md ${className ?? ''}`} dangerouslySetInnerHTML={{ __html: rendered.html }} />;
+/**
+ * The formatted text. `rendered` comes from renderMarkdown, which keeps only plain formatting.
+ * With `onCite`, the numbered source markers in it are live: pressing one reports its source id,
+ * and hovering or focusing one shows the source's title. `highlight` marks every marker for one
+ * source.
+ */
+export function Markdown({
+  rendered,
+  className,
+  onCite,
+  highlight,
+}: {
+  rendered: Rendered;
+  className?: string;
+  onCite?: (id: string) => void;
+  highlight?: string | null;
+}) {
+  const box = useRef<HTMLDivElement>(null);
+  const [tip, setTip] = useState<{ text: string; x: number; y: number } | null>(null);
+
+  // The html is set once per text, so the highlight is applied to the markers afterwards.
+  useEffect(() => {
+    for (const b of box.current?.querySelectorAll<HTMLElement>('button.cite') ?? []) {
+      b.classList.toggle('cite-on', highlight != null && b.dataset.cite === highlight);
+    }
+  }, [highlight, rendered.html]);
+
+  const markerOf = (e: { target: EventTarget }) => (e.target instanceof Element ? e.target.closest<HTMLElement>('button.cite') : null);
+  const show = (b: HTMLElement | null) => {
+    if (!b || !b.dataset.title) return;
+    const r = b.getBoundingClientRect();
+    setTip({ text: b.dataset.title, x: r.left + r.width / 2, y: r.top });
+  };
+
+  return (
+    <>
+      <div
+        ref={box}
+        className={`md ${className ?? ''}`}
+        dangerouslySetInnerHTML={{ __html: rendered.html }}
+        onClick={(e) => {
+          const b = markerOf(e);
+          if (b?.dataset.cite && onCite) onCite(b.dataset.cite);
+        }}
+        onMouseOver={(e) => show(markerOf(e))}
+        onMouseOut={(e) => {
+          if (!markerOf(e)) return;
+          // Leaving a marker falls back to the focused one, if there is one.
+          const focused = document.activeElement;
+          if (focused instanceof HTMLElement && focused.matches('button.cite') && box.current?.contains(focused)) show(focused);
+          else setTip(null);
+        }}
+        onFocus={(e) => show(markerOf(e))}
+        onBlur={(e) => markerOf(e) && setTip(null)}
+        onKeyDown={(e) => e.key === 'Escape' && tip && setTip(null)}
+      />
+      {tip && <CiteTip tip={tip} />}
+    </>
+  );
+}
+
+/** The source's title above a marker, kept inside the window. It repeats the marker's own name, so screen readers skip it. */
+function CiteTip({ tip }: { tip: { text: string; x: number; y: number } }) {
+  const el = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const t = el.current;
+    if (!t) return;
+    const w = t.offsetWidth;
+    const left = Math.min(Math.max(tip.x - w / 2, 8), window.innerWidth - w - 8);
+    t.style.left = `${Math.round(left)}px`;
+    t.style.top = `${Math.round(tip.y - t.offsetHeight - 8)}px`;
+    t.style.setProperty('--tip-x', `${Math.round(tip.x - left)}px`);
+    t.style.visibility = 'visible';
+  }, [tip]);
+  return createPortal(
+    <div ref={el} className="cite-tip" aria-hidden="true" style={{ visibility: 'hidden' }}>
+      {tip.text}
+    </div>,
+    document.body,
+  );
 }
 
 /** A plain warning when parts of the text were left out of the formatted view, with a way to read them. */
@@ -98,6 +176,12 @@ export function ErrorNote({
   );
 }
 
+type HintTexts = Record<HintName, string | ((kind: DraftKind) => string)>;
+const hintText = (texts: HintTexts, name: HintName, kind: DraftKind) => {
+  const t = texts[name];
+  return typeof t === 'function' ? t(kind) : t;
+};
+
 /**
  * A one-time hint, drawn as a small coach mark next to the thing it describes. Hints appear one
  * at a time: sources, then ask, then approve. The next one shows only after the one before it
@@ -106,7 +190,7 @@ export function ErrorNote({
  * It sits in the page flow (never over content), with a small pointer toward the element named
  * by `anchor` (an element id). On a phone it is a compact banner without a pointer.
  */
-export function Hint({ name, anchor }: { name: HintName; anchor?: string }) {
+export function Hint({ name, anchor, kind = 'confluence_page' }: { name: HintName; anchor?: string; kind?: DraftKind }) {
   const { api, me, setMe } = useApp();
   const phone = useMediaQuery(PHONE_QUERY);
   const box = useRef<HTMLDivElement>(null);
@@ -150,7 +234,7 @@ export function Hint({ name, anchor }: { name: HintName; anchor?: string }) {
     >
       <div className="coach-text">
         {!phone && <span className="coach-step">{copy.hintStep(step, copy.hintOrder.length)}</span>}
-        <p>{phone ? copy.hintsShort[name] : copy.hints[name]}</p>
+        <p>{hintText(phone ? copy.hintsShort : copy.hints, name, kind)}</p>
         {error && <p className="coach-error" role="alert">{error}</p>}
       </div>
       <button type="button" className="coach-btn" onClick={dismiss}>
