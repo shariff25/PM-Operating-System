@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import type { FormEvent, KeyboardEvent, ReactNode } from 'react';
 import type { Brief, DraftSummary, FollowUp, Task } from '../api';
 import { messageOf, useApp } from '../app-context';
+import { briefTiming } from '../brief';
+import type { BriefTiming } from '../brief';
 import { Empty, ErrorNote, ExtLink, Skeleton, SystemTag, initials, kindSystem, systemTone } from '../components/bits';
 import { Icon } from '../components/icons';
 import { copy } from '../copy';
@@ -95,12 +97,12 @@ function Composer() {
   );
 }
 
-function Stat({ label, value, sub, lead, warn }: { label: string; value: number | null; sub: string; lead?: boolean; warn?: boolean }) {
+function Stat({ label, value, sub, lead, warn, subAlways }: { label: string; value: number | null; sub: string; lead?: boolean; warn?: boolean; subAlways?: boolean }) {
   return (
     <div className={`stat ${lead ? 'stat-lead' : ''}`}>
       <span className="stat-label">{label}</span>
       <span className="stat-value">{value ?? '–'}</span>
-      <span className={`stat-sub ${warn ? 'stat-sub-warn' : ''}`}>{value === null ? '' : sub}</span>
+      <span className={`stat-sub ${warn ? 'stat-sub-warn' : ''}`}>{value === null && !subAlways ? '' : sub}</span>
     </div>
   );
 }
@@ -113,10 +115,11 @@ function soonest(pending: DraftSummary[], now: number): string | null {
   return next ? timeLeft(next.expires_at, now) : null;
 }
 
-function Stats({ pending, brief, briefOn, tasks, draftsLoaded, now }: {
+function Stats({ pending, brief, briefOn, timing, tasks, draftsLoaded, now }: {
   pending: DraftSummary[];
   brief: Brief | null;
   briefOn: boolean;
+  timing: BriefTiming | null;
   tasks: Task[] | null;
   draftsLoaded: boolean;
   now: number;
@@ -133,25 +136,30 @@ function Stats({ pending, brief, briefOn, tasks, draftsLoaded, now }: {
     const names = [...new Set(waitedOn.map((f) => f.who))];
     const bySystem = new Map<string, number>();
     for (const c of changed) bySystem.set(c.system, (bySystem.get(c.system) ?? 0) + 1);
+    // No brief has ever run: the counts are not zero, they are not there yet.
+    const never = timing === 'never';
     const systems = [...bySystem].map(([s, n]) => copy.today.statSub.inSystem(n, s.charAt(0).toUpperCase() + s.slice(1)));
     return (
       <section className="stats" aria-label={copy.today.statsLabel}>
         {draftsTile}
         <Stat
           label={copy.today.stats.waiting}
-          value={brief ? waiting.length : null}
-          sub={waiting.length ? copy.today.statSub.oldest(copy.followups.age(oldest).toLowerCase()) : copy.today.statSub.nobody}
+          value={brief && !never ? waiting.length : null}
+          sub={never ? copy.today.briefNeverSub : waiting.length ? copy.today.statSub.oldest(copy.followups.age(oldest).toLowerCase()) : copy.today.statSub.nobody}
+          subAlways={never}
           warn={oldest >= 2}
         />
         <Stat
           label={copy.today.stats.waitedOn}
-          value={brief ? waitedOn.length : null}
-          sub={names.length ? names.slice(0, 3).join(', ') : copy.today.statSub.nobody}
+          value={brief && !never ? waitedOn.length : null}
+          sub={never ? copy.today.briefNeverSub : names.length ? names.slice(0, 3).join(', ') : copy.today.statSub.nobody}
+          subAlways={never}
         />
         <Stat
           label={copy.today.stats.changed}
-          value={brief ? changed.length : null}
-          sub={systems.length ? copy.today.statSub.bySystem(systems) : copy.today.statSub.quiet}
+          value={brief && !never ? changed.length : null}
+          sub={never ? copy.today.briefNeverSub : systems.length ? copy.today.statSub.bySystem(systems) : copy.today.statSub.quiet}
+          subAlways={never}
         />
       </section>
     );
@@ -289,6 +297,7 @@ export function Home() {
   const firstName = me.name.split(' ')[0] ?? me.name;
   const pending = (drafts ?? []).filter((d) => effectiveStatus(d, now) === 'pending');
   const briefOn = briefState !== 'off';
+  const timing = brief ? briefTiming(brief, now) : null;
   const running = (tasks ?? []).filter((t) => t.status === 'queued' || t.status === 'working');
   const recent = (tasks ?? []).slice(0, 4);
   // The headline counts what needs the PM: drafts to decide, and people waiting on them.
@@ -304,17 +313,21 @@ export function Home() {
           <h1>{known ? `${greeting} ${copy.today.needs(needs)}` : greeting}</h1>
           {firstVisit && drafts && drafts.length > 0 && <p className="lede">{copy.welcomeWithDrafts}</p>}
         </div>
-        {briefState === 'ready' && (
-          <p className="today-brief">
+        {brief && briefState === 'ready' && timing !== 'unknown' && (
+          <p className={`today-brief ${timing === 'today' ? '' : 'today-brief-quiet'}`}>
             <span className="accent-dot" aria-hidden="true" />
-            {copy.today.briefReady}
+            {timing === 'today'
+              ? copy.today.briefReady
+              : timing === 'stale'
+                ? copy.today.briefStale(relTime(brief.delivered_at ?? brief.date, now))
+                : copy.today.briefNever}
           </p>
         )}
       </header>
 
       <Composer />
 
-      <Stats pending={pending} brief={brief} briefOn={briefOn} tasks={tasks} draftsLoaded={drafts !== null} now={now} />
+      <Stats pending={pending} brief={brief} briefOn={briefOn} timing={timing} tasks={tasks} draftsLoaded={drafts !== null} now={now} />
 
       <div className={`today-grid ${briefOn ? '' : 'today-grid-even'}`}>
         <Card id="h-decide" className="card-decide">
@@ -360,7 +373,7 @@ export function Home() {
               {!brief ? (
                 <div className="card-body"><Skeleton rows={2} label={copy.home.loadingDrafts} /></div>
               ) : brief.waiting_on_you.length === 0 ? (
-                <Empty icon="inbox" small>{copy.nothingWaiting}</Empty>
+                <Empty icon="inbox" small>{timing === 'today' ? copy.nothingWaiting : timing === 'stale' ? copy.today.briefStaleCard : copy.today.briefNeverCard}</Empty>
               ) : (
                 <ul className="rows" aria-label={copy.today.waitingHeading}>
                   {brief.waiting_on_you.slice(0, 4).map((f) => (
@@ -376,7 +389,7 @@ export function Home() {
               {!brief ? (
                 <div className="card-body"><Skeleton rows={2} label={copy.home.loadingDrafts} /></div>
               ) : brief.changed.length === 0 ? (
-                <Empty icon="activity" small>{copy.today.statSub.quiet}</Empty>
+                <Empty icon="activity" small>{timing === 'today' ? copy.today.statSub.quiet : timing === 'stale' ? copy.today.briefStaleCard : copy.today.briefNeverCard}</Empty>
               ) : (
                 <ol className="timeline">
                   {brief.changed.map((c) => (

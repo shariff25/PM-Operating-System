@@ -1,6 +1,8 @@
 import DOMPurify from 'dompurify';
 import { Marked } from 'marked';
 import type { Renderer, Tokens } from 'marked';
+import { MARKER, stripFromLine } from './citations';
+import { copy } from './copy';
 
 /** One link destination found in a text. */
 export interface LinkRef {
@@ -14,6 +16,22 @@ export interface Rendered {
   /** Raw pieces that were left out of the formatted view (HTML, comments, hidden characters). */
   stripped: string[];
   links: LinkRef[];
+  /** For each source id, how many places in the text cite it. Only sources that were listed count. */
+  cites: Record<string, number>;
+}
+
+/** What the renderer needs to know about a source to draw its marker. */
+export interface CiteSource {
+  id: string;
+  title: string;
+}
+
+export interface RenderOptions {
+  /**
+   * The draft's sources, in the order of their cards. A marker becomes a numbered link to the card
+   * at that position. Without it, or for an id that is not listed, a marker renders nothing.
+   */
+  sources?: readonly CiteSource[];
 }
 
 // Text from a bot that read pages other people can write to. Only plain formatting survives.
@@ -43,10 +61,72 @@ const esc = (s: string) =>
 
 const bare = (s: string) => s.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '');
 
+const GROUP = /(?:\[\[s\d{1,3}\]\])+/g;
+
+/**
+ * Turn the markers in the sanitised HTML into numbered links. Only text nodes are touched, and
+ * never one inside code, so a marker written as code stays as written. The markers are built here
+ * as elements after the sanitiser has run, so nothing in the bot's text can pose as one.
+ */
+function placeMarkers(html: string, sources: readonly CiteSource[], cites: Record<string, number>): string {
+  if (!html.includes('[[s')) return html;
+  const root = document.createElement('div');
+  root.innerHTML = html;
+  const position = new Map(sources.map((s, i) => [s.id, i] as const));
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes: Text[] = [];
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const t = n as Text;
+    if (t.data.includes('[[s') && !t.parentElement?.closest('code, pre')) nodes.push(t);
+  }
+  // A marker inside link text would be a link in a link, so it is placed just after the link.
+  const lastAfter = new Map<Element, Node>();
+
+  for (const node of nodes) {
+    const text = node.data;
+    const anchor = node.parentElement?.closest('a') ?? null;
+    const out = document.createDocumentFragment();
+    let at = 0;
+    for (const run of text.matchAll(GROUP)) {
+      out.append(text.slice(at, run.index));
+      at = run.index + run[0].length;
+      const ids = [...new Set([...run[0].matchAll(MARKER)].map((m) => `s${m[1]}`))].filter((id) => position.has(id));
+      if (ids.length === 0) continue;
+      ids.sort((a, b) => position.get(a)! - position.get(b)!);
+      const group = document.createElement('sup');
+      group.className = 'cite-group';
+      for (const id of ids) {
+        const source = sources[position.get(id)!]!;
+        const n = position.get(id)! + 1;
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'cite';
+        b.dataset.cite = id;
+        b.dataset.title = source.title;
+        b.setAttribute('aria-label', copy.draft.citeLabel(n, source.title));
+        b.textContent = String(n);
+        group.append(b);
+        cites[id] = (cites[id] ?? 0) + 1;
+      }
+      if (anchor) {
+        const prev = lastAfter.get(anchor) ?? anchor;
+        prev.parentNode?.insertBefore(group, prev.nextSibling);
+        lastAfter.set(anchor, group);
+      } else {
+        out.append(group);
+      }
+    }
+    out.append(text.slice(at));
+    node.replaceWith(out);
+  }
+  return root.innerHTML;
+}
+
 /** Render markdown to sanitised HTML with the allowed formatting only. */
-export function renderMarkdown(text: string): Rendered {
+export function renderMarkdown(text: string, options: RenderOptions = {}): Rendered {
   const stripped: string[] = [];
   const links: LinkRef[] = [];
+  const cites: Record<string, number> = {};
 
   const source = text.replace(INVISIBLE, (run) => {
     stripped.push(
@@ -83,8 +163,9 @@ export function renderMarkdown(text: string): Rendered {
         if (url.protocol !== 'https:' && url.protocol !== 'http:') {
           return `${inner} (${esc(token.href)})`;
         }
-        links.push({ text: token.text, href: url.href, host: url.host });
-        const same = bare(token.text) === bare(url.href) || bare(token.text) === bare(token.href);
+        const label = stripFromLine(token.text);
+        links.push({ text: label, href: url.href, host: url.host });
+        const same = bare(label) === bare(url.href) || bare(label) === bare(token.href);
         return (
           `<a href="${esc(url.href)}" target="_blank" rel="noopener noreferrer">${inner}</a>` +
           (same ? '' : ` <small>(${esc(url.host)})</small>`)
@@ -107,5 +188,5 @@ export function renderMarkdown(text: string): Rendered {
     ],
     SANITIZE_NAMED_PROPS: true,
   });
-  return { html: clean, stripped, links };
+  return { html: placeMarkers(clean, options.sources ?? [], cites), stripped, links, cites };
 }

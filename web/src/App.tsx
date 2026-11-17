@@ -17,6 +17,7 @@ import { SignIn } from './pages/SignIn';
 import { Thread } from './pages/Thread';
 import { useTheme } from './theme';
 import { withCleanTasks } from './briefBlock';
+import { withCleanDrafts } from './citations';
 import { parseRoute, signedOutReason } from './url';
 import type { Route } from './url';
 
@@ -61,7 +62,7 @@ export function App({ createApi, pollMs }: AppProps) {
   const [me, setMe] = useState<Me | null>(null);
   const [ready, setReady] = useState(false);
   const signedOut = useRef<() => void>(() => {});
-  const [api] = useState(() => withCleanTasks(createApi(() => signedOut.current())));
+  const [api] = useState(() => withCleanDrafts(withCleanTasks(createApi(() => signedOut.current()))));
   const [path, navigate] = useHashPath();
   const [theme, setTheme] = useTheme();
   const [palette, setPalette] = useState<{ text: string } | null>(null);
