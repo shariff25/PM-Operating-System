@@ -1184,8 +1184,8 @@ or Auditor is never deactivated (`403 protected_not_from_slack`).
 
 The source of users and roles is moving from `team.yaml` to the tool server's own tables
 (`docs/user-database-spec.md`). Slice U1 builds the store, its database guarantees and the
-host commands. Since slice U3 the tool server decides from it (above); the runtime, Slack,
-`pmos-web` and the console still read `team.yaml` until slices U4a-d. The read API (slice U2)
+host commands. Since slice U3 the tool server decides from it (above), and the runtime since
+slice U4a; Slack, `pmos-web` and the console still read `team.yaml` until slices U4b-d. The read API (slice U2)
 is below.
 
 **Tables** (migration 0015): `users` (handle, display name, `sign_in_name` for Entra and
@@ -1256,8 +1256,9 @@ needs an active admin like any import.
 
 ### The user database's read API (slice U2)
 
-Three routes read the user database for the other services (`src/app/directory.rs`). Nothing
-calls them yet: the runtime, Slack, web sign-in and the console move to them in slice U4.
+Three routes read the user database for the other services (`src/app/directory.rs`). The
+runtime polls `directory` since slice U4a (`docs/bots-runtime.md` "Who may ask"); Slack, web
+sign-in and the console move to them in slices U4b-d.
 Each route has its own allow-list, checked before anything reads the request; any other
 token is `403`, none is `401`.
 

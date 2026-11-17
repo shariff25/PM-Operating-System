@@ -205,6 +205,16 @@ pub trait BotsStore: Send + Sync {
     /// Enqueue one run of a routine. False if it was no longer due (another tick ran it, or
     /// it was paused or changed meanwhile).
     async fn run_routine(&self, run: &RoutineRun, now: DateTime<Utc>) -> StoreResult<bool>;
+    /// Skip one run of a routine that is enabled and due at `due_at`: its next run becomes
+    /// `next_run_at`, nothing is enqueued, and it stays enabled. False if it was no longer
+    /// due, as for [`BotsStore::run_routine`].
+    async fn skip_routine_run(
+        &self,
+        id: &str,
+        due_at: DateTime<Utc>,
+        next_run_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool>;
 
     /// A PM's settings, if they ever set any.
     async fn member_settings(&self, handle: &str) -> StoreResult<Option<MemberSettings>>;
@@ -656,6 +666,25 @@ impl BotsStore for MemoryStore {
         if let Some(n) = run.notify.as_ref().filter(|_| notifies(&task)) {
             s.notify(&task, n, now);
         }
+        Ok(true)
+    }
+
+    async fn skip_routine_run(
+        &self,
+        id: &str,
+        due_at: DateTime<Utc>,
+        next_run_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        let mut s = self.state();
+        let Some(r) = s.routines.get_mut(id) else {
+            return Ok(false);
+        };
+        if !r.enabled || r.next_run_at != Some(due_at) {
+            return Ok(false);
+        }
+        r.next_run_at = Some(next_run_at);
+        r.updated_at = now;
         Ok(true)
     }
 

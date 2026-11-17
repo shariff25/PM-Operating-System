@@ -1035,6 +1035,43 @@ above:
   eval stack adds `eval-admin` (U0EVALADM, in no fake channel) to its `team.yaml` and seeds from
   it; CI smoke imports `deploy/test/ci-users.yaml` with `--bootstrap` beside `pmos member add`.
 
+**U4a is built** on `claude/u4a-runtime-directory`: the shared crate `crates/directory`
+(`pmos-directory`, `src/snapshot.rs`: the snapshot client), and in the bot runtime
+(`crates/bots`, package `pmos-bots`; `crates/runtime` is the small shared-helpers crate)
+`src/people.rs`, the catalog without the team, and `tests/directory.rs`; no migration;
+`docs/bots-runtime.md` "Who may ask". The runtime reads no `team.yaml` for any decision and
+never falls back to it; its reloader still watches the file only because the lint's
+bot-owner check reads it until U7. Where it differs from the text above:
+- **Bounds are named reads**, not a "stale ok" flag: `fresh()` (≤ 30 s, every allow),
+  `for_queueing_ask()` (≤ 5 min), `for_due_routine()` (≤ 5 min) and, for U4b,
+  `for_slack_identity()` (≤ 5 min). Each bound is inclusive (exactly 30 s still allows). The
+  age is measured from when the last `200` or `304` was *requested*, on a monotonic clock; a
+  failed poll keeps the old snapshot and its old age. A `304` for a snapshot the client
+  doesn't hold is an error, not a refresh.
+- **Before the first answer nobody may ask** (`503`); `/readyz` gained a fourth check,
+  `directory` (a snapshot ≤ 30 s old).
+- **Allows the table doesn't name** use the 30-second bound: parsing a routine (it calls the
+  model as the owner), creating one, and setting a PM's level; past it they answer `503`. An
+  ask past 5 minutes is `503`, never a guess from the old snapshot.
+- **Routines pause for any owner who may no longer ask**, not only on deactivation: removed
+  from the directory, deactivated, or left without `pm`, `reviewer` or `admin` (an Auditor
+  only). The sweep runs on each new snapshot and on every 30-second tick, only on a snapshot
+  ≤ 30 s old, and uses the existing guarded run (a failed task with "Your routine is paused:
+  …" and a notification). A routine whose bot is gone still pauses at its next due run.
+- **A skipped run** (snapshot older than 5 minutes when a routine falls due) moves the
+  routine's next run to its next slot through a new guarded store call
+  (`skip_routine_run`); it stays enabled, records no run and queues nothing. A due routine on
+  a snapshot between 30 s and 5 min old runs (its session decides afresh) or pauses.
+- **The console admin check** (`Runtime::is_admin`: active, `admin`, snapshot ≤ 30 s) also
+  governs the console's routine list, routine changes and cancels, which used the same
+  `team.yaml` check. An auditor-only console viewer still sees their own tasks: that rule is
+  U4d's, in the console.
+- **Stacks:** no new setting. The runtime already holds `PMOS_SERVICE_TOKEN` and
+  `PMOS_TOOLSERVER_URL`, and every stack already seeds or imports the users the runtime is
+  asked as (U3); CI smoke waits 35 s after its import, longer than one poll. The in-process
+  stack test (`crates/stack-tests`) now seeds the tool server's user store and no longer
+  opens the directory, so the runtime and the tool server both decide from the seed.
+
 U4a–U4d run in parallel (U4b after U3, since `remove` calls U3's deactivation). U5 and U6 can
 overlap once the routes in U5 are merged.
 

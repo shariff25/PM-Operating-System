@@ -209,15 +209,11 @@ async fn the_subject_must_be_every_person_the_request_names() {
 }
 
 /// Under `require`, the console reads one task's detail, events, trace or drafts only signed
-/// for a viewer who is that task's PM or an admin in the runtime's team.yaml. Its list of
+/// for a viewer who is that task's PM or an active admin in the user directory. Its list of
 /// every task (metadata) still needs none. In `verify`, an unsigned read still works.
 #[tokio::test]
 async fn the_console_reads_one_task_only_for_its_pm_or_an_admin() {
-    let env = Env::memory_with_catalog_and_assertions(
-        catalog_with_admin(Some("cy")),
-        assertions(Mode::Require),
-    )
-    .await;
+    let env = Env::memory_with_catalog_and_assertions(catalog(), assertions(Mode::Require)).await;
     let id = env.ask("What's on the roadmap?").await["id"]
         .as_str()
         .unwrap()
@@ -311,16 +307,12 @@ fn routine_draft(owner: &str, prompt: &str) -> Value {
 }
 
 /// R1: a non-admin viewer lists only their own tasks and routines, in full; an admin (in the
-/// runtime's own team.yaml) lists everyone's, with the ask, the result and the prompt of
+/// user directory) lists everyone's, with the ask, the result and the prompt of
 /// anyone else's left out. Cancel and routine changes: the owner or an admin, signed, and
 /// recorded as that person.
 #[tokio::test]
 async fn console_lists_are_the_viewers_own_or_metadata_for_an_admin() {
-    let env = Env::memory_with_catalog_and_assertions(
-        catalog_with_admin(Some("cy")),
-        assertions(Mode::Require),
-    )
-    .await;
+    let env = Env::memory_with_catalog_and_assertions(catalog(), assertions(Mode::Require)).await;
     let console = Signer::console();
     let ana_task = env.ask("Ana's private question").await;
     let (s, ben_task) = env
