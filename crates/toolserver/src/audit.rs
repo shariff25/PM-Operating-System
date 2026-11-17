@@ -121,6 +121,9 @@ pub enum Client {
     Web,
     /// The web console, with `PMOS_CONSOLE_TS_TOKEN`: reads approvals only.
     Console,
+    /// The tool server itself, with no caller: the audit retention purge records its runs
+    /// as this (`docs/audit-retention.md`). Never a token's client.
+    System,
 }
 
 impl Client {
@@ -131,6 +134,7 @@ impl Client {
             Self::Bot => "bot",
             Self::Web => "web",
             Self::Console => "console",
+            Self::System => "system",
         }
     }
 
@@ -141,6 +145,7 @@ impl Client {
             Self::Bot,
             Self::Web,
             Self::Console,
+            Self::System,
         ]
         .into_iter()
         .find(|c| c.as_str() == s)
@@ -338,24 +343,168 @@ pub trait AuditSink: Send + Sync {
     ) -> StoreResult<Option<BTreeMap<Outcome, u64>>> {
         Ok(None)
     }
+
+    /// One purge batch (`docs/audit-retention.md`): delete at most `batch` events (1 to
+    /// [`MAX_PURGE_BATCH`]) recorded before the cutoff (`now` less `retention_days`, and
+    /// never later than `now` less [`MIN_RETENTION_DAYS`]), oldest first, and record the batch
+    /// as a [`PURGE_TOOL`] event. A retention under [`MIN_RETENTION_DAYS`] is an error and
+    /// deletes nothing. `None` when this sink can't delete (a JSON-lines file);
+    /// [`Purged::Busy`] when another purge is running. Postgres keeps time by its own clock,
+    /// not `now`.
+    async fn purge(
+        &self,
+        _retention_days: u32,
+        _batch: u32,
+        _now: DateTime<Utc>,
+    ) -> StoreResult<Option<Purged>> {
+        Ok(None)
+    }
+
+    /// The oldest event's time and the last purge, for the admin overview. `None` when this
+    /// sink can't be read back.
+    async fn retention(&self) -> StoreResult<Option<RetentionFacts>> {
+        Ok(None)
+    }
 }
 
-/// Keeps events in memory. Used in tests and when no log file is configured.
+// Retention.
+
+/// The shortest audit retention there is, in days: the owner's decision (purge at 90 days,
+/// no archive). The database has the same floor written into its purge function and its
+/// append-only trigger (migration 0013), so no setting can lower it.
+pub const MIN_RETENTION_DAYS: u32 = 90;
+
+/// The longest retention `PMOS_AUDIT_RETENTION_DAYS` takes: ten years.
+pub const MAX_RETENTION_DAYS: u32 = 3650;
+
+/// The most events one purge batch deletes (the database function's own limit).
+pub const MAX_PURGE_BATCH: u32 = 100_000;
+
+/// The action a purge batch is recorded as.
+pub const PURGE_TOOL: &str = "audit.purge";
+
+/// Who a purge batch is recorded as (client [`Client::System`]).
+pub const PURGE_ACTOR: &str = "pmos-retention";
+
+/// The run id purge batches are recorded under.
+pub const PURGE_RUN: &str = "retention";
+
+/// What one purge batch did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PurgeBatch {
+    /// Events deleted.
+    pub deleted: u64,
+    /// Only events recorded before this were eligible.
+    pub cutoff: DateTime<Utc>,
+    /// Eligible events are left: the batch stopped at its limit.
+    pub more: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purged {
+    Ran(PurgeBatch),
+    /// Another purge holds the lock: nothing was deleted or recorded.
+    Busy,
+}
+
+/// The newest purge batch on record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastPurge {
+    pub at: DateTime<Utc>,
+    pub deleted: u64,
+}
+
+/// What the admin overview says of retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetentionFacts {
+    pub oldest_event_at: Option<DateTime<Utc>>,
+    pub last_purge: Option<LastPurge>,
+}
+
+/// A purge batch's `detail`: the count and the cutoff (to the second), no content. The
+/// database function writes the same words.
+pub fn purge_detail(deleted: u64, cutoff: DateTime<Utc>) -> String {
+    format!(
+        "purged {deleted} events older than {}",
+        cutoff.format("%Y-%m-%dT%H:%M:%SZ")
+    )
+}
+
+/// The count and cutoff of a [`purge_detail`], or `None` if `detail` isn't one.
+pub fn parse_purge_detail(detail: &str) -> Option<(u64, DateTime<Utc>)> {
+    let rest = detail.strip_prefix("purged ")?;
+    let (n, at) = rest.split_once(" events older than ")?;
+    if n.is_empty() || n.len() > 12 || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if at.len() != 20 || !at.ends_with('Z') {
+        return None;
+    }
+    let at = DateTime::parse_from_rfc3339(at).ok()?.with_timezone(&Utc);
+    Some((n.parse().ok()?, at))
+}
+
+/// The event that records a purge batch.
+pub fn purge_event(at: DateTime<Utc>, batch: &PurgeBatch) -> AuditEvent {
+    AuditEvent {
+        at,
+        client: Client::System,
+        run_id: PURGE_RUN.to_string(),
+        user: PURGE_ACTOR.to_string(),
+        skill: None,
+        bot: None,
+        tool: PURGE_TOOL.to_string(),
+        outcome: Outcome::Ok,
+        sources: Vec::new(),
+        source_titles: BTreeMap::new(),
+        args_hash: None,
+        output_ref: None,
+        detail: Some(purge_detail(batch.deleted, batch.cutoff)),
+    }
+}
+
+/// The checks every sink makes before purging: the floor and the batch limit.
+pub fn check_purge(retention_days: u32, batch: u32) -> StoreResult<()> {
+    if retention_days < MIN_RETENTION_DAYS {
+        return Err(StoreError(format!(
+            "audit retention must be at least {MIN_RETENTION_DAYS} days"
+        )));
+    }
+    if !(1..=MAX_PURGE_BATCH).contains(&batch) {
+        return Err(StoreError(format!(
+            "a purge batch must be from 1 to {MAX_PURGE_BATCH}"
+        )));
+    }
+    Ok(())
+}
+
+/// Keeps events in memory. Used in tests and when no log file is configured. Append-only
+/// like the Postgres table: the one deletion is [`AuditSink::purge`], under the same rules.
 #[derive(Default)]
 pub struct MemoryAudit {
-    events: Mutex<Vec<AuditEvent>>,
+    /// Each event with its store id, in the order recorded, and the last id given.
+    events: Mutex<(Vec<(i64, AuditEvent)>, i64)>,
 }
 
 impl MemoryAudit {
     pub fn events(&self) -> Vec<AuditEvent> {
-        self.events.lock().expect("audit lock").clone()
+        self.events
+            .lock()
+            .expect("audit lock")
+            .0
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect()
     }
 }
 
 #[async_trait]
 impl AuditSink for MemoryAudit {
     async fn record(&self, event: AuditEvent) -> StoreResult<()> {
-        self.events.lock().expect("audit lock").push(event);
+        let mut guard = self.events.lock().expect("audit lock");
+        guard.1 += 1;
+        let id = guard.1;
+        guard.0.push((id, event));
         Ok(())
     }
 
@@ -368,7 +517,9 @@ impl AuditSink for MemoryAudit {
     ) -> StoreResult<Option<Vec<ReadEvent>>> {
         let events = self.events.lock().expect("audit lock");
         let mut found: Vec<ReadEvent> = events
+            .0
             .iter()
+            .map(|(_, e)| e)
             .filter(|e| is_read_of(e, user, run_id, until))
             .map(ReadEvent::of)
             .collect();
@@ -382,12 +533,11 @@ impl AuditSink for MemoryAudit {
     async fn search(&self, query: &AuditQuery) -> StoreResult<Option<Vec<StoredEvent>>> {
         let events = self.events.lock().expect("audit lock");
         let mut found: Vec<StoredEvent> = events
+            .0
             .iter()
-            .enumerate()
-            .map(|(i, e)| (i as i64 + 1, e))
             .filter(|(id, e)| query.matches(*id, e))
             .map(|(id, e)| StoredEvent {
-                id,
+                id: *id,
                 event: e.clone(),
             })
             .collect();
@@ -401,12 +551,65 @@ impl AuditSink for MemoryAudit {
         since: DateTime<Utc>,
     ) -> StoreResult<Option<BTreeMap<Outcome, u64>>> {
         let mut counts = BTreeMap::new();
-        for e in self.events.lock().expect("audit lock").iter() {
+        for (_, e) in self.events.lock().expect("audit lock").0.iter() {
             if e.at >= since {
                 *counts.entry(e.outcome).or_insert(0) += 1;
             }
         }
         Ok(Some(counts))
+    }
+
+    async fn purge(
+        &self,
+        retention_days: u32,
+        batch: u32,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Option<Purged>> {
+        check_purge(retention_days, batch)?;
+        let floor = now - chrono::Duration::days(i64::from(MIN_RETENTION_DAYS));
+        let cutoff = (now - chrono::Duration::days(i64::from(retention_days))).min(floor);
+        let mut guard = self.events.lock().expect("audit lock");
+        let mut doomed: Vec<(DateTime<Utc>, i64)> = guard
+            .0
+            .iter()
+            .filter(|(_, e)| e.at < cutoff)
+            .map(|(id, e)| (e.at, *id))
+            .collect();
+        doomed.sort();
+        let more = doomed.len() > batch as usize;
+        doomed.truncate(batch as usize);
+        let ids: std::collections::HashSet<i64> = doomed.iter().map(|(_, id)| *id).collect();
+        // The re-check the database trigger makes, whatever the cutoff: never a newer event.
+        guard
+            .0
+            .retain(|(id, e)| !(ids.contains(id) && e.at < floor));
+        let done = PurgeBatch {
+            deleted: ids.len() as u64,
+            cutoff,
+            more,
+        };
+        guard.1 += 1;
+        let id = guard.1;
+        guard.0.push((id, purge_event(now, &done)));
+        Ok(Some(Purged::Ran(done)))
+    }
+
+    async fn retention(&self) -> StoreResult<Option<RetentionFacts>> {
+        let guard = self.events.lock().expect("audit lock");
+        let oldest_event_at = guard.0.iter().map(|(_, e)| e.at).min();
+        let last_purge = guard
+            .0
+            .iter()
+            .filter(|(_, e)| e.tool == PURGE_TOOL && e.client == Client::System)
+            .max_by_key(|(id, e)| (e.at, *id))
+            .and_then(|(_, e)| {
+                let (deleted, _) = parse_purge_detail(e.detail.as_deref()?)?;
+                Some(LastPurge { at: e.at, deleted })
+            });
+        Ok(Some(RetentionFacts {
+            oldest_event_at,
+            last_purge,
+        }))
     }
 }
 
@@ -459,6 +662,44 @@ impl AuditSink for TeeAudit {
     ) -> StoreResult<Option<BTreeMap<Outcome, u64>>> {
         for sink in &self.0 {
             if let Some(found) = sink.count_outcomes(since).await? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// In the first sink that can purge, which records the batch itself; the batch is then
+    /// recorded in every other sink too. A JSON-lines file shipped off-box is never purged
+    /// by PM OS, but it says when the database was.
+    async fn purge(
+        &self,
+        retention_days: u32,
+        batch: u32,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Option<Purged>> {
+        for (i, sink) in self.0.iter().enumerate() {
+            let Some(purged) = sink.purge(retention_days, batch, now).await? else {
+                continue;
+            };
+            if let Purged::Ran(done) = &purged {
+                for (j, other) in self.0.iter().enumerate() {
+                    if j == i {
+                        continue;
+                    }
+                    if let Err(e) = other.record(purge_event(now, done)).await {
+                        tracing::error!(error = %e, "a purge batch couldn't be recorded in every audit sink");
+                    }
+                }
+            }
+            return Ok(Some(purged));
+        }
+        Ok(None)
+    }
+
+    /// From the first sink that can be read back.
+    async fn retention(&self) -> StoreResult<Option<RetentionFacts>> {
+        for sink in &self.0 {
+            if let Some(found) = sink.retention().await? {
                 return Ok(Some(found));
             }
         }

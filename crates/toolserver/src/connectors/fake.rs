@@ -7,7 +7,10 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{Audience, Caller, Connector, ConnectorError, Item, SourceRef, TeamBot, PAGE_CHANGED};
+use super::{
+    Audience, Caller, Connector, ConnectorError, Conversation, ConversationKind, Item, SourceRef,
+    TeamBot, PAGE_CHANGED,
+};
 
 /// A write the fake received.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,8 +27,8 @@ pub struct FakeConnector {
     items: Vec<Item>,
     /// Slack threads, which `read_thread` returns for the thread's ts or any reply's.
     threads: Vec<Item>,
-    /// Slack channels' audiences, by channel id.
-    channels: Vec<(String, Audience)>,
+    /// Slack channels' audiences, by channel id. In a lock so a test can rename one.
+    channels: Mutex<Vec<(String, Audience)>>,
     writes: Mutex<Vec<FakeWrite>>,
     /// Confluence pages' versions, by page id: 1 until an update. `confluence.read` returns
     /// it, and `update_page` must name it, as with the live connector.
@@ -38,7 +41,7 @@ impl FakeConnector {
             system: system.to_string(),
             items,
             threads: Vec::new(),
-            channels: Vec::new(),
+            channels: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             versions: Mutex::new(HashMap::new()),
         }
@@ -60,6 +63,22 @@ impl FakeConnector {
             .lock()
             .expect("fake lock")
             .insert(id.to_string(), version);
+    }
+
+    /// Rename a Slack channel, as someone in Slack would: `conversations.info` then says
+    /// `name` (`None`: no name), read as the live connector reads it
+    /// ([`Conversation::from_info`]).
+    pub fn rename_channel(&self, channel: &str, name: Option<&str>) {
+        for (id, audience) in self.channels.lock().expect("fake lock").iter_mut() {
+            if id == channel {
+                let info = json!({
+                    "name": name,
+                    "is_im": audience.conversation.kind == ConversationKind::Im,
+                    "is_private": audience.conversation.kind == ConversationKind::PrivateChannel,
+                });
+                audience.conversation.name = Conversation::from_info(id, &info).name;
+            }
+        }
     }
 
     pub fn writes(&self) -> Vec<FakeWrite> {
@@ -189,29 +208,55 @@ impl FakeConnector {
             slack.threads.push(thread.item());
         }
         let members = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect();
-        let audience = |members, external, im| Audience {
+        let channel = |name: &str| Conversation {
+            kind: ConversationKind::Channel,
+            name: Some(name.to_string()),
+            peer: None,
+        };
+        let audience = |members, external, conversation: Conversation| Audience {
             external,
             shared: external,
-            im,
+            im: conversation.kind == ConversationKind::Im,
             members,
             truncated: false,
+            conversation,
         };
-        slack.channels = vec![
+        *slack.channels.get_mut().expect("fake lock") = vec![
             (
                 SLACK_ALL_TEAM.into(),
-                audience(members(&["U0EVALS", "U0BEN", "U0CY"]), false, false),
+                audience(
+                    members(&["U0EVALS", "U0BEN", "U0CY"]),
+                    false,
+                    channel("pm-team"),
+                ),
             ),
             (
                 SLACK_WITH_OUTSIDER.into(),
-                audience(members(&["U0EVALS", "U0BEN", "U0SE"]), false, false),
+                audience(
+                    members(&["U0EVALS", "U0BEN", "U0SE"]),
+                    false,
+                    channel("field-questions"),
+                ),
             ),
             (
                 SLACK_CONNECT.into(),
-                audience(members(&["U0EVALS", "U0BEN", "W0GLOBEX1"]), true, false),
+                audience(
+                    members(&["U0EVALS", "U0BEN", "W0GLOBEX1"]),
+                    true,
+                    channel("globex-shared"),
+                ),
             ),
             (
                 SLACK_DM.into(),
-                audience(members(&["U0EVALS", "U0BEN"]), false, true),
+                audience(
+                    members(&["U0EVALS", "U0BEN"]),
+                    false,
+                    Conversation {
+                        kind: ConversationKind::Im,
+                        name: None,
+                        peer: Some("U0BEN".into()),
+                    },
+                ),
             ),
         ];
         slack
@@ -680,10 +725,20 @@ impl Connector for FakeConnector {
             )));
         }
         self.channels
+            .lock()
+            .expect("fake lock")
             .iter()
             .find(|(id, _)| id == channel)
             .map(|(_, audience)| audience.clone())
             .ok_or_else(|| ConnectorError::NotFound(format!("channel {channel}")))
+    }
+
+    async fn conversation(
+        &self,
+        caller: Caller<'_>,
+        channel: &str,
+    ) -> Result<Conversation, ConnectorError> {
+        Ok(self.audience(caller, channel).await?.conversation)
     }
 }
 

@@ -183,6 +183,21 @@ pub struct ApprovalItem {
     /// When a person last saved an edit of this pending draft ([`ApprovalRepo::save_draft`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edited_at: Option<DateTime<Utc>>,
+    /// A Slack draft's channel as `conversations.info` last described it
+    /// ([`ApprovalRepo::set_target_conversation`]). Served as `target_channel` by
+    /// `ToolService::approval_json`, only while it is for the channel the item names.
+    #[serde(skip)]
+    pub target_conversation: Option<TargetConversation>,
+}
+
+/// What the tool server last read of a Slack draft's channel: metadata only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetConversation {
+    /// The channel id this describes.
+    pub channel: String,
+    #[serde(flatten)]
+    pub conversation: crate::connectors::Conversation,
+    pub checked_at: DateTime<Utc>,
 }
 
 impl ApprovalItem {
@@ -313,6 +328,7 @@ impl NewItem<'_> {
             redacted_at: None,
             drafted_args: None,
             edited_at: None,
+            target_conversation: None,
         }
     }
 }
@@ -433,6 +449,15 @@ pub trait ApprovalRepo: Send + Sync {
         args: Value,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError>;
+
+    /// Record what `conversations.info` said of a Slack draft's channel, replacing what was
+    /// there (a renamed channel reads its new name). Changes nothing else; `false` when there
+    /// is no such item.
+    async fn set_target_conversation(
+        &self,
+        id: &str,
+        target: &TargetConversation,
+    ) -> StoreResult<bool>;
 
     /// Store the outcome of an executing write: `approved` with the result, or `failed`
     /// with the error. Only an `executing` item changes; `None` otherwise. The ledger row
@@ -690,6 +715,21 @@ impl ApprovalRepo for MemoryApprovals {
         item.args_hash = args_hash(&args);
         item.args = args;
         Ok(item.clone())
+    }
+
+    async fn set_target_conversation(
+        &self,
+        id: &str,
+        target: &TargetConversation,
+    ) -> StoreResult<bool> {
+        let mut state = self.state.lock().expect("approvals lock");
+        Ok(match state.items.get_mut(id) {
+            Some(item) => {
+                item.target_conversation = Some(target.clone());
+                true
+            }
+            None => false,
+        })
     }
 
     async fn complete(

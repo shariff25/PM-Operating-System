@@ -288,7 +288,7 @@ path with another method a JSON `405 method_not_allowed`.
   checks everything again and opens the pull request **with the admin's own linked GitHub
   account**; pmos-web holds no GitHub token and relays the answer in its own words. Role
   refusals, refused proposals and an admin's reads of personal or restricted files are
-  recorded at the tool server (`POST /internal/admin/events`), the reads before the text is
+  recorded at the tool server (`POST /internal/admin/actions`), the reads before the text is
   served.
 
 ## Where the contract isn't met as written

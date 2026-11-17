@@ -41,9 +41,34 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
 - **Health:** `GET /healthz` (outside `/api`, no session) answers `ok` while the process runs.
   `GET /readyz` answers `200` when it can serve and `503` when it can't, with
   `{"ready": bool, "checks": {"store": "ok"|"down", "team": …, "bot_runtime": …,
-  "tool_server": …}}`: its own store answers, `team.yaml` reads, and the bot runtime and the
-  tool server answer their `/healthz` within two seconds. No detail and no secrets; the
+  "tool_server": …}, "unrecorded_sign_in_events": n}`: its own store answers, `team.yaml`
+  reads, and the bot runtime and the tool server answer their `/healthz` within two seconds.
+  `unrecorded_sign_in_events` counts, since start-up, sign-in events the audit log didn't take
+  (see **Sign-in events**); it never makes the server unready. No detail and no secrets; the
   reason goes to the server's log.
+- **Sign-in events.** Every sign-in, sign-out and refused sign-in is recorded in the tool
+  server's audit log (`POST /internal/admin/events`, `docs/toolserver.md`, **Sign-in
+  events**), and shows in the admin audit list with the usual fields:
+
+  | `action` | `actor` | `outcome` | `target` | `detail` |
+  | --- | --- | --- | --- | --- |
+  | `web.sign_in` | the member | `ok` | `null` | `provider: entra` (or `dev`) |
+  | `web.sign_out` | the member | `ok` | `null` | `provider: entra` (or `dev`) |
+  | `web.sign_in_refused` | `anonymous` | `denied` | `member:<handle>` for `wrong_account`, else `null` | `provider: entra; reason: not_a_member; attempt: 3f9a1c2b4d5e` |
+
+  `client` is `web` and `task_id` `web-auth`. `reason` is the signed-out page's code
+  (`not_a_member`, `wrong_account`, `failed`, `unavailable`, …). `attempt` (on
+  `not_a_member` only) is the first 12 hex characters of an HMAC-SHA256, under a key derived
+  from `pmos-web`'s tool server token, of the name tried (trimmed, lowercased): repeated
+  attempts with one name share it, and the name itself (an email or handle) is never sent or
+  stored. No IP address (PM OS records none), no token. An Entra refusal is recorded only once
+  the browser's `state` matched a sign-in this server started; a callback with no flow behind
+  it (which anyone can send) is only logged. **If the event can't be recorded, sign-in and
+  sign-out go ahead** (after at most 3 seconds): the failure is logged as an error and counted
+  in `/readyz`. Sign-out is never blocked; sign-in isn't because a session alone reaches
+  nothing: everything a signed-in person does goes through the tool server or the runtime,
+  which audit each call themselves, so a missing sign-in event hides no action, while failing
+  closed would lock everyone out (the admins included) whenever the tool server blips.
 - **Old links:** `GET /drafts/{id}` and `GET /d/{id}` (outside `/api`) answer `303` to the
   app's own route for that draft, `/#/d/{id}`, when `id` is shaped like an approval id (`apr_`
   and 1 to 64 letters or digits), and `303` to `/` otherwise. They are for links Slack cards
@@ -188,12 +213,26 @@ document.
   (space and project keys) and, when the run read them, the names the tool server recorded:
   "Space PM, under “Specs”", "Page “PRD: Billing retries”", "Project PAY, a new Story under
   PAY-212: TCB grace period"; an id the run didn't read stays an id ("under page 163841").
-  **Slack labels never show a channel id**: PM OS keeps no channel names, so they read "A
-  Slack thread", "A Slack channel", "A direct message thread" or "A direct message" (and the
-  titles "Reply in a Slack thread", "Message to a Slack channel", "Direct message"). The
-  channel's name is one tap away: `target.url` opens it in Slack, which shows the name to
-  whoever can see it. Anything that isn't shaped like an id reads "An unrecognised channel"
-  (or space, page, project, epic).
+  **Slack labels never show a channel id.** They name the channel from what the tool server
+  last read from Slack (its `target_channel`: when the draft was made, and again at each
+  approve or edit, so a renamed channel shows its new name after the next one):
+
+  | Channel | Message (`slack_message`) | Reply (`slack_reply`) |
+  | --- | --- | --- |
+  | A channel or private channel with a name | "#launch-acme" | "A thread in #launch-acme" |
+  | A private channel without a usable name | "A private channel" | "A thread in a private channel" |
+  | A DM with a team member | "Direct message with ben" (their handle) | "A direct message thread with ben" |
+  | Any other DM | "Direct message" | "A direct message thread" |
+  | A group DM | "A group direct message" | "A group direct message thread" |
+  | Not read yet, or a public channel with no usable name | "A Slack channel" (`D…`: "A direct message") | "A Slack thread" (`D…`: "A direct message thread") |
+
+  A private channel's name is shown: the draft is the owner's own, and they are a member of
+  the channel it goes to. A name is shown only if it is shaped like a Slack channel name
+  (letters, digits, `-`, `_`, `.`, at most 80), a DM partner only if it is a team handle;
+  anything else falls back to the row without a name. The titles stay "Reply in a Slack
+  thread", "Message to a Slack channel" and "Direct message". `target.url` opens the channel
+  in Slack. Anything that isn't shaped like an id reads "An unrecognised channel" (or space,
+  page, project, epic).
 - **A practice draft** (`practice: true`) lives only in `pmos-web`. Approving it creates
   nothing anywhere: it becomes `approved` with `result_url: null`.
 - **Sources** are what the bot read for the task that made the draft. When the runtime cannot
@@ -490,13 +529,13 @@ last. Every field below is always present.
 | --- | --- | --- |
 | `id` | string | Unique and stable; use it as a list key. Not an input anywhere. |
 | `at` | string, RFC 3339 UTC | When it happened. |
-| `actor` | string | The handle the event is about: the PM whose session or approval it was, the admin who read the log. |
-| `client` | string | Who made the call: `mcp` (a bot or skill run, from its sandbox), `orchestrator` (the bot runtime or a platform-owner tool), `bot` (the Slack app), `web` (this web app), `console` (the operator console). |
+| `actor` | string | The handle the event is about: the PM whose session or approval it was, the admin who read the log, who signed in or out. `anonymous` for a refused sign-in, `pmos-retention` for a purge. |
+| `client` | string | Who made the call: `mcp` (a bot or skill run, from its sandbox), `orchestrator` (the bot runtime or a platform-owner tool), `bot` (the Slack app), `web` (this web app), `console` (the operator console), `system` (the tool server itself: the audit retention purge). |
 | `action` | string | What was done: a tool name (`jira.search`, `confluence.create_draft`, `slack.post_reply`, `memory.write`, …), `credentials.unlink`, or `admin.*` for these reads. |
 | `system` | string | The part of `action` before the first dot (`jira`, `confluence`, `slack`, `docs`, `context`, `memory`, `credentials`, `admin`, …). |
 | `target` | string or `null` | What was written or decided: a page or issue URL, an approval id (`apr_…`), a memory note (`memory:…`), the provider of an unlink. `null` for reads and most refusals. |
 | `outcome` | string | `ok` (ran), `denied` (refused: not allowed, above the data ceiling, wrong person), `pending` (a write queued for approval), `approved` (approved and written), `rejected`, `granted` (approved in the bot's own flow), `started` (an approved write about to run), `error` (failed), `failed` (an approved member couldn't be committed), `expired` (a Slack draft nobody decided; its text was removed). |
-| `detail` | string or `null` | A short note, only when it is one of the fixed notes the tool server writes itself: `edited before approval`, `reason: <wrong_facts\|wrong_target\|tone\|incomplete\|should_not_draft\|other>`, `invalid draft (1 of 2)`, `approved in the inbox; writing`, `undecided after 24 h: …` and a few more. Otherwise `null`: a refusal's or a connector's message can quote arguments or content, so it is never served. |
+| `detail` | string or `null` | A short note, only when it is one of the fixed notes the tool server writes itself: `edited before approval`, `reason: <wrong_facts\|wrong_target\|tone\|incomplete\|should_not_draft\|other>`, `invalid draft (1 of 2)`, `approved in the inbox; writing`, `undecided after 24 h: …`, `purged 1200 events older than <time>` (a purge), `provider: entra; reason: not_a_member; attempt: <hex>` (a sign-in event) and a few more. Otherwise `null`: a refusal's or a connector's message can quote arguments or content, so it is never served. |
 | `sources` | integer ≥ 0 | How many items the call read (context files, Jira issues, pages, Slack messages). The items are not served. |
 | `titled_sources` | integer ≥ 0 | How many of those had a title recorded. **Only the count:** a title is a Jira issue's summary or a page's title, which can carry content, so titles are never served. |
 | `skill` | string or `null` | The run's skill, for a skill session. |
@@ -583,7 +622,9 @@ Counts for the admin home.
 
 ```json
 {"since": "2026-11-09T09:10:00.120Z", "pending_drafts": 4,
- "approved": 37, "rejected": 5, "denied": 2}
+ "approved": 37, "rejected": 5, "denied": 2,
+ "retention_days": 90, "oldest_event_at": "2026-08-19T03:07:41.500Z",
+ "last_purge": {"at": "2026-11-17T03:07:12.004Z", "deleted": 1200}}
 ```
 
 | Field | Type | Meaning |
@@ -593,8 +634,15 @@ Counts for the admin home.
 | `approved` | integer or `null` | Approved writes that ran since `since` (audit outcome `approved`). |
 | `rejected` | integer or `null` | Drafts rejected since `since`. |
 | `denied` | integer or `null` | Actions refused since `since` (audit outcome `denied`, admin reads refused included). |
+| `retention_days` | integer or `null` | How many days audit events are kept before the daily purge deletes them (`PMOS_AUDIT_RETENTION_DAYS`: 90, or more if set). `null` from a tool server older than retention. Show as "Audit events are kept 90 days". |
+| `oldest_event_at` | string, RFC 3339 UTC, or `null` | The oldest event still in the audit log. `null` when the log is empty or can't be read back. Right after a purge it is at most `retention_days` old (plus up to a day between runs). |
+| `last_purge` | object or `null` | The newest purge batch: `{"at": RFC 3339 UTC, "deleted": integer ≥ 0}`, when it ran and how many events it deleted (`0` is a normal day). `null` before the first purge, or when the log can't be read back. A run of several batches shows its last batch; each batch is also in the audit list as `audit.purge`. |
 
-The three counts are `null` when the tool server's audit log can't be read back. **Tasks by
+The three counts are `null` when the tool server's audit log can't be read back.
+**Purge runs in the audit list:** action `audit.purge`, system `audit`, actor
+`pmos-retention`, client `system`, task `retention`, outcome `ok`, target `null`, detail
+`purged 1200 events older than 2026-08-19T03:07:12Z`. `client` can therefore also be
+`system` (the tool server itself) in the list below. See `docs/audit-retention.md`. **Tasks by
 status are not here:** the bot runtime gives the `web` client only the signed-in PM's own
 tasks, with no team-wide read, so `pmos-web` can't count them.
 

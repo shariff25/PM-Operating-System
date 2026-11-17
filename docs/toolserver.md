@@ -85,8 +85,8 @@ harness ──same call (edited args if edited)──► tool server: grant matc
 
 ### What an item is shown with
 
-For the web app (`crates/web`), each item as the internal API answers it carries three more
-fields, which older readers ignore. None needs a network call:
+For the web app (`crates/web`), each item as the internal API answers it carries four more
+fields, which older readers ignore. None needs a network call when the item is read:
 
 - `expires_at`: for a Slack draft, `created_at` plus `PMOS_SLACK_DRAFT_TTL_HOURS`.
 - `target_url`: a link to where the write goes, built only from target ids that pass a
@@ -97,6 +97,26 @@ fields, which older readers ignore. None needs a network call:
 - `external`: for a Slack draft whose channel's audience has been checked (on an approve),
   whether the channel is shared outside the company. Kept in memory per item and channel:
   a restart forgets it, and it is left out until the next check.
+- `target_channel`: for a Slack draft, its channel as Slack last described it (see **Slack
+  draft targets**): `{kind, name, with, checked_at}`. Left out until the channel has been
+  read, and when the item's `channel` is no longer the one read.
+
+**Slack draft targets.** So the web app can say "#launch-acme" rather than "A Slack thread",
+the tool server records what `conversations.info` (the PM's own token) says of a Slack
+draft's channel: once when the draft is made (best effort: if Slack can't say, the draft is
+made anyway and reads without it), and again at every audience check, so a renamed channel
+reads its new name after the next approve or edit. It is stored on the item
+(`approvals.target_conversation`, a nullable `jsonb`, migration 0014) as `{channel, kind,
+name?, peer?, checked_at}` and served as `target_channel`:
+- `kind`: `channel`, `private_channel` (`is_private`, or an old `G…` group), `im` or `mpim`.
+- `name`: a channel's or private channel's name without `#`, only if it is shaped like one
+  (letters, digits, `-`, `_`, `.`, at most 80; `connectors::channel_name`), else `null`.
+  Names are metadata, not message text, but they come from Slack and are treated as untrusted.
+  A DM's or group DM's `name` is never kept.
+- `with`: for a DM, the other person's `team.yaml` handle when their Slack id (`user`, kept
+  only if shaped like a member id) belongs to a member; `null` otherwise. No extra lookup.
+- `checked_at`: when it was read.
+It is kept when a draft's text is removed: it holds no message text.
 
 `GET /internal/approvals/{id}/sources?user=` lists what the drafting run read, from the
 audit log: `user`'s successful read-tool calls with the item's `run_id`, at or before the
@@ -203,11 +223,12 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/admin/audit?user=&before=&limit=&actor=&action=&outcome=&from=&to=&purpose=` | service or web token | The whole audit log, newest first: `{events: [...], next}`. Needs the viewer `user` to have `view-audit-log` (`export-audit` with `purpose=export`). See **Admin reads** |
 | `GET /internal/admin/accounts?user=` | service or web token | `{linking, members: [{handle, accounts: {atlassian, slack, github}}]}`, booleans only. `view-audit-log` or `manage-members` |
 | `GET /internal/admin/connectors?user=` | service or web token | `{connectors: [{name, mode, health, error_class, checked_at}]}`, checked now. `manage-connectors` |
-| `GET /internal/admin/overview?user=` | service or web token | `{since, pending_drafts, approved, rejected, denied}`: pending items across the team now, audit outcomes over 7 days. `view-audit-log` or `manage-members` |
+| `GET /internal/admin/overview?user=` | service or web token | `{since, pending_drafts, approved, rejected, denied, retention_days, oldest_event_at, last_purge}`: pending items across the team now, audit outcomes over 7 days, and audit retention (see **Audit retention**). `view-audit-log` or `manage-members` |
 | `POST /internal/admin/proposals/open?user=` `{kind, title, reason, base_sha, changes}` | web token **and** a signed assertion for `user`, in every mode | Check an admin's policy or content change again and open it as a pull request with their own linked GitHub token. `201 {number, url, author, branch, base, files, widening, allowance_changes, stale_check, labels_added}`. See **Admin proposals** |
 | `GET /internal/admin/proposals?user=&kind=policy\|content` | the same | Open proposals, read with the viewer's own GitHub token: `{repo, github: "linked", proposals: [...]}`, or `{repo, github: "not_linked", proposals: []}`. `view-policies` / `view-content` |
 | `GET /internal/admin/protection?user=` | the same | `{configured, branch, required_reviews, verified, source?, github}`: whether `PMOS_CONTENT_BRANCH` requires reviews, as the viewer's token can read it. Best effort, never an error. `view-policies` or `view-content` |
-| `POST /internal/admin/events?user=` `{action, outcome, detail, count, target?}` | the same | `pmos-web` records an admin refusal or an admin's sensitive read: `200 {recorded: true}`; `503 audit_unavailable` if it can't be recorded (pmos-web then serves nothing) |
+| `POST /internal/admin/actions?user=` `{action, outcome, detail, count, target?}` | the same | `pmos-web` records an admin refusal or an admin's sensitive read: `200 {recorded: true}`; `503 audit_unavailable` if it can't be recorded (pmos-web then serves nothing) |
+| `POST /internal/admin/events[?user=]` `{action, provider, reason?, attempt?, member?}` | web token only | A sign-in event from `pmos-web`: `web.sign_in` or `web.sign_out` (for the member named as `user=`, with a user assertion for them) or `web.sign_in_refused` (no `user=`). Fixed values only. See **Sign-in events** |
 
 ### Admin reads
 
@@ -274,7 +295,8 @@ checks it again from nothing and opens the pull request **as the admin**.
   not_configured`) if such a layout reaches it anyway. `PMOS_POLICIES_ROOT` (default: the
   policies folder of the checkout `PMOS_CONTENT_ROOT` is in) is what the re-check compares
   regenerated policies with.
-- **Events** (`POST /internal/admin/events`): what `pmos-web` refused (a role refusal on an
+- **Admin actions** (`POST /internal/admin/actions`, apart from the sign-in events below,
+  which have their own rules): what `pmos-web` refused (a role refusal on an
   admin policy or content route; a proposal its own checks refused, `invalid` or `stale base`)
   as `denied`, and an admin's read of a PM's personal master file or restricted context
   (`admin.content_sensitive_read`, `ok`, note `personal file` or `restricted context`), which
@@ -282,6 +304,49 @@ checks it again from nothing and opens the pull request **as the admin**.
   how many files (kept as that many `content` entries in `sources`, served as a count); the
   only target allowed is `content:personal:<handle>`. A sensitive read needs `edit-content`
   (else `403`, recorded as `denied`); a refusal record needs a team member.
+
+### Sign-in events
+
+`POST /internal/admin/events` (`app/admin.rs`, `sign_in_event`) records `pmos-web`'s
+sign-ins, sign-outs and refused sign-ins, so they are in the same audit log as everything
+else and in the admin audit list with the usual fields.
+- **Only `pmos-web`'s token** (the orchestrator, bot and console get `403`).
+- **Only fixed values:** `action` is `web.sign_in`, `web.sign_out` or `web.sign_in_refused`;
+  `provider` is `entra` or `dev`; `reason` (refusals only) is `not_a_member`,
+  `wrong_account`, `expired`, `cancelled`, `unavailable` or `failed`; `attempt` (refusals
+  only) is 12 lowercase hex characters; `member` (with `wrong_account` only) is a team handle.
+  Unknown fields, other values and free text are `400 bad_request`.
+- **Sign-in and sign-out** name the member as `user=` (a team member, else `403`), with a user
+  assertion for them as on every admin route. Recorded as actor = the member, client `web`,
+  run `web-auth`, outcome `ok`, `detail` `provider: entra`.
+- **A refusal** names no one (`user=` is `400`): actor `anonymous`, outcome `denied`,
+  `detail` `provider: entra; reason: not_a_member[; attempt: 3f9a1c2b4d5e]`, and for
+  `wrong_account` the target `member:<handle>` whose email was used. The attempt is a keyed
+  hash `pmos-web` computes of the name tried; the name never reaches the tool server.
+- No IP address is recorded (PM OS records none anywhere), no token, no email.
+- `503` when the event couldn't be recorded, so `pmos-web` can count it (`docs/web-api.md`,
+  **Sign-in events**, for why sign-in goes ahead anyway).
+
+### Audit retention
+
+Owner's decision: audit events are purged at 90 days, with no archive. The whole design, and
+why a newer event can't be deleted by anyone, is in `docs/audit-retention.md`. In short:
+- Migration 0013 keeps the append-only triggers and gives them one exception: a row-level
+  DELETE of a row older than 90 days (the trigger checks the row's age itself), from inside
+  `purge_audit_events(interval, integer)` (a `SECURITY DEFINER` function that alone sets
+  `pmos.audit_purge`). UPDATE and TRUNCATE stay refused for everyone.
+- The function refuses a retention under 90 days, deletes at most a batch (1 to 100000) of the
+  oldest eligible rows, records the batch as `audit.purge` (client `system`, actor
+  `pmos-retention`, `detail` `purged <n> events older than <cutoff>`) in the same
+  transaction, and returns `ran = false` without doing anything if another purge holds its
+  advisory lock. `EXECUTE` is revoked from `PUBLIC`.
+- **The job** (`retention.rs`): `PMOS_AUDIT_RETENTION_DAYS` (default and minimum 90, at most
+  3650; under 90 the tool server refuses to start), first run 5 to 10 minutes after start-up
+  (random jitter), then daily, batches of 10000, at most 100 batches a run, stopped on
+  shutdown. In memory (`PMOS_DEV=1`) the same rules apply.
+- The JSON-lines file (`PMOS_AUDIT_LOG`) is not purged; it gets a copy of each purge event.
+- The tool server can't record a `system` event itself (`PgStore::record` refuses it), so the
+  overview's `last_purge` is always one the database function wrote.
 
 **Who holds which token:**
 - **Service token** (`PMOS_SERVICE_TOKEN`): the orchestrator, the bot runtime and platform-owner tools. Every route, and the only token that starts bot sessions.
@@ -293,9 +358,9 @@ checks it again from nothing and opens the pull request **as the admin**.
   (`403 admin_by_pull_request`: a new admin is made by a pull request to `team.yaml`).
 - **Web token** (`PMOS_WEB_TOKEN`): `pmos-web`, which acts for a signed-in person. Only the
   five approvals routes above (list, one item, sources, decision, saved edit), the four
-  read-only `GET /internal/admin/*` reads, and the admin proposal and event routes (all of
-  which check the viewer's role themselves; the proposal and event routes need a signed
-  assertion in every mode); every other
+  read-only `GET /internal/admin/*` reads, the admin proposal and action routes and the sign-in
+  events (all of which check the viewer's role themselves; the proposal and action routes need
+  a signed assertion in every mode); every other
   route (sessions, grants, calls, account linking, credentials, the ledger, reindexing,
   onboarding) is `403`. It has at least the bot token's limits: a read of one item must name
   its PM (`?user=`, else `404`); it never reaches the ledger (so sees no ledger ids) or the

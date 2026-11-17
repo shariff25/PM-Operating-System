@@ -178,8 +178,20 @@ async fn main() -> Result<()> {
         .map_err(anyhow::Error::msg)?
         .with_team(team.clone())
         .with_ledger_expire_days(config.ledger_expire_days)
-        .with_slack_draft_ttl_hours(config.slack_draft_ttl_hours);
+        .with_slack_draft_ttl_hours(config.slack_draft_ttl_hours)
+        .with_audit_retention_days(config.audit_retention_days);
     let svc = Arc::new(svc);
+    // Audit retention (docs/audit-retention.md): daily, the first run a few minutes after
+    // start-up; the database itself holds every rule.
+    pmos_toolserver::retention::spawn(
+        svc.stores().audit.clone(),
+        config.audit_retention_days,
+        cancel.clone(),
+    );
+    tracing::info!(
+        retention_days = config.audit_retention_days,
+        "audit retention on: events older than this are deleted daily"
+    );
     // One replica: anything still `executing` from a previous process was interrupted.
     match svc.reconcile(chrono::Duration::zero(), Utc::now()).await {
         Ok(0) => {}
