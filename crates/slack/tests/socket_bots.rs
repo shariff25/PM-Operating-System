@@ -318,6 +318,21 @@ async fn ts_decide(
     if item["status"] != "pending" {
         return refuse(StatusCode::CONFLICT, "approval item is already decided");
     }
+    // As the tool server (R4): an approve names the args hash the PM was shown, and a draft
+    // that changed since is refused as `stale`.
+    match body["expected_args_hash"].as_str() {
+        None if body["decision"] == "approve" => {
+            return refuse(StatusCode::BAD_REQUEST, "expected_args_hash required")
+        }
+        Some(h) if !item["args_hash"].as_str().unwrap_or("").starts_with(h) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "changed", "code": "stale"})),
+            )
+                .into_response()
+        }
+        _ => {}
+    }
     // A reason goes only with `reject` (spec §1 of `docs/improvement-loop-spec.md`).
     if body.get("reason").is_some() && body["decision"] != "reject" {
         return refuse(
@@ -367,9 +382,14 @@ fn tools_routes(ts: Arc<MockTools>) -> Router {
 fn approval(id: &str, user: &str, tool: &str, args: Value) -> Value {
     json!({
         "id": id, "user": user, "skill": "bot:docs", "run_id": "tsk_1", "tool": tool,
-        "args": args, "args_hash": "x", "status": "pending", "created_at": "2026-11-14T10:00:00Z",
+        "args": args, "args_hash": ARGS_HASH, "status": "pending", "created_at": "2026-11-14T10:00:00Z",
     })
 }
+
+/// Every fixture item's args hash; cards are posted with its first 16 characters.
+const ARGS_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// What a card posted for a fixture item carries, and an approve sends.
+const SHOWN: &str = "0123456789abcdef";
 
 // ---- The stack ----
 
@@ -532,7 +552,9 @@ fn click(
             "container": {"type": "message", "channel_id": channel, "message_ts": ts},
             "channel": {"id": channel},
             "message": {"ts": ts, "thread_ts": "100.2"},
-            "actions": [{"type": "button", "action_id": action_id, "block_id": "b", "value": value}],
+            // As on a card posted for a fixture item: its buttons carry what it showed.
+            "actions": [{"type": "button", "action_id": action_id,
+                         "block_id": format!("approval:{value}:{SHOWN}"), "value": value}],
         },
     })
 }
@@ -1049,7 +1071,7 @@ async fn approval_cards_are_decided_by_their_own_pm() {
         vec![
             (
                 "apr_a1".into(),
-                json!({"decided_by": "ana", "decision": "approve"})
+                json!({"decided_by": "ana", "decision": "approve", "expected_args_hash": SHOWN})
             ),
             (
                 "apr_a3".into(),
@@ -1193,7 +1215,8 @@ async fn an_edit_saved_in_the_web_app_is_what_the_card_approves() {
     assert_eq!(decisions.len(), 1);
     assert_eq!(
         decisions[0].2,
-        json!({"decided_by": "ana", "decision": "approve"})
+        json!({"decided_by": "ana", "decision": "approve",
+               "expected_args_hash": &hash('b')[..16]})
     );
     stop.cancel();
     handle.await.unwrap();
@@ -1211,6 +1234,52 @@ async fn card_update(stack: &Stack, ts: &str, what: &str, want: impl Fn(&str) ->
             .find(|u| u.body["ts"] == ts && want(&text_of(u)))
     })
     .await
+}
+
+/// R5: a card posted before cards carried the args hash approves nothing: the card is shown
+/// again as the item is now, with buttons that carry its hash; approving that one works.
+#[tokio::test]
+async fn an_old_card_without_its_hash_approves_nothing() {
+    let mut stack = Stack::new().await;
+    stack.tools.items.lock().unwrap().insert(
+        "apr_o1".into(),
+        approval(
+            "apr_o1",
+            "ana",
+            "confluence.create_draft",
+            json!({"space": "PM", "title": "Old card", "body": "Text"}),
+        ),
+    );
+    stack.connect();
+    let ts = "1700000000.000042";
+    stack
+        .send(click_in(
+            "o1",
+            "U0ANA",
+            "apr_approve",
+            "apr_o1",
+            ts,
+            "approval:apr_o1",
+        ))
+        .await;
+    let fresh = card_update(&stack, ts, "the card shown again", |t| {
+        t.contains("from an older version of PM OS")
+    })
+    .await;
+    assert!(stack.tools.decisions.lock().unwrap().is_empty());
+    let block = approval_block_id(&fresh.body["blocks"]);
+    assert_eq!(block, format!("approval:apr_o1:{SHOWN}"));
+    stack
+        .send(click_in("o2", "U0ANA", "apr_approve", "apr_o1", ts, &block))
+        .await;
+    card_update(&stack, ts, "the approved card", |t| {
+        t.contains("Approved by Ana")
+    })
+    .await;
+    let decisions = stack.tools.decisions.lock().unwrap().clone();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].2["expected_args_hash"], SHOWN);
+    stack.stop().await;
 }
 
 #[tokio::test]

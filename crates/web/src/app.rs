@@ -1249,11 +1249,15 @@ fn draft_response(draft: &Draft) -> Response {
 
 async fn list_drafts(State(state): State<AppState>, signed: Signed) -> ApiResult {
     signed.drafts()?;
-    let items = signed
+    let inbox = signed
         .toolserver(&state)
         .approvals(signed.handle())
         .await
         .map_err(ApiError::upstream)?;
+    if inbox.truncated {
+        tracing::warn!(user = %signed.handle(), total = ?inbox.total_pending, "the tool server cut this inbox at its safety cap");
+    }
+    let items = inbox.items;
     let st = settings_of(&state, signed.handle()).await?;
     let mut pending = Vec::new();
     let mut decided = Vec::new();
@@ -1307,7 +1311,13 @@ async fn list_drafts(State(state): State<AppState>, signed: Signed) -> ApiResult
             .map_err(ApiError::store)?;
     }
     let all: Vec<_> = pending.into_iter().chain(decided).map(|(_, s)| s).collect();
-    Ok(Json(json!({ "drafts": all })).into_response())
+    // `truncated`: the tool server left pending drafts out past its safety cap, and
+    // `total_pending` says how many there are (R12). Never true below that cap.
+    let mut body = json!({ "drafts": all, "truncated": inbox.truncated });
+    if let Some(total) = inbox.total_pending {
+        body["total_pending"] = json!(total);
+    }
+    Ok(Json(body).into_response())
 }
 
 async fn get_draft(
@@ -1368,7 +1378,17 @@ async fn put_draft(
     // console show it, and an approve anywhere writes it. Only a practice draft's stays here.
     if let Found::Item(item) = &found {
         let title = req.title.filter(|_| drafts::has_title(&item.tool));
-        let saved = save_edit(&state, &signed, item, title, req.body).await?;
+        let saved = save_edit(
+            &state,
+            &signed,
+            item,
+            DraftEdit {
+                title,
+                body: req.body,
+            },
+            None,
+        )
+        .await?;
         let st = settings_of(&state, signed.handle()).await?;
         let found = Found::Item(Box::new(saved));
         return Ok(draft_response(&render(&state, &found, &signed, &st).await?));
@@ -1400,17 +1420,21 @@ async fn put_draft(
 /// Save the PM's edit of `item` at the tool server (`PUT /internal/approvals/{id}/draft`):
 /// the item's arguments with the new body (and title, for a draft that has one), where it
 /// goes unchanged. Answers the item as the tool server now has it.
+///
+/// `revision` names the bot's revision task when the text is an accepted suggestion: the tool
+/// server then raises the draft's level to what that task read (R2). Text the PM typed has
+/// no level a machine knows; the draft keeps its own, which a save never lowers.
 async fn save_edit(
     state: &AppState,
     signed: &Signed,
     item: &Approval,
-    title: Option<String>,
-    body: String,
+    edit: DraftEdit,
+    revision: Option<&crate::upstream::Revision>,
 ) -> Result<Approval, ApiError> {
-    let args = drafts::edited_args(&item.tool, &item.args, &DraftEdit { title, body });
+    let args = drafts::edited_args(&item.tool, &item.args, &edit);
     let saved = signed
         .toolserver(state)
-        .save_draft(signed.handle(), &item.id, &args)
+        .save_draft(signed.handle(), &item.id, &args, revision)
         .await
         .map_err(|e| match e {
             UpstreamError::Refused {
@@ -1526,9 +1550,15 @@ async fn post_changes(
         &current.body,
         &instruction,
     );
+    // The prompt carries the draft's text, so the revision's session starts at the draft's
+    // level (unrecorded counts as restricted): the W6 carry-forward, for revisions (R2).
+    let floor = match &found {
+        Found::Item(item) => item.sources_sensitivity.as_deref().unwrap_or("restricted"),
+        Found::Practice(_) => "public",
+    };
     let created = signed
         .runtime(&state)
-        .create_task(signed.handle(), &signed.bot(), &prompt)
+        .create_task_at(signed.handle(), &signed.bot(), &prompt, Some(floor))
         .await;
     let key = id.clone();
     match created {
@@ -1675,9 +1705,9 @@ async fn accept_suggestion(
     }
     let ready = current_suggestion(&state, &signed, &id)
         .await?
-        .filter(|s| s.status == "ready")
-        .and_then(|s| s.body);
-    let Some(body) = ready else {
+        .filter(|s| s.status == "ready");
+    let task_id = ready.as_ref().and_then(|s| s.task_id.clone());
+    let Some(body) = ready.and_then(|s| s.body) else {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "no_suggestion",
@@ -1692,8 +1722,39 @@ async fn accept_suggestion(
             if body.chars().count() > MAX_BODY {
                 return Err(ApiError::bad_request("The text is too long."));
             }
+            // The text is the revision task's answer: name the task, so the tool server
+            // raises the draft to what it read (R2). Its recorded level goes along as a floor
+            // only; the tool server's own sessions decide. A suggestion without a task can't
+            // be accepted: nothing would say what its text drew on.
+            let Some(run_id) = task_id else {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "no_suggestion",
+                    "There's no suggested text to accept yet.",
+                ));
+            };
+            let sensitivity = signed
+                .runtime(&state)
+                .task(signed.handle(), &run_id)
+                .await
+                .ok()
+                .and_then(|t| t.sources_sensitivity);
+            let revision = crate::upstream::Revision {
+                run_id,
+                sensitivity,
+            };
             Found::Item(Box::new(
-                save_edit(&state, &signed, &item, None, body.clone()).await?,
+                save_edit(
+                    &state,
+                    &signed,
+                    &item,
+                    DraftEdit {
+                        title: None,
+                        body: body.clone(),
+                    },
+                    Some(&revision),
+                )
+                .await?,
             ))
         }
         practice => practice,
@@ -1881,6 +1942,8 @@ async fn refused_decision(
             "expired",
             "This draft expired before it was decided. Nothing was sent.",
         ),
+        // The draft changed between this read and the decision (R4): nothing was decided.
+        (409, Some("stale")) => stale(),
         (503, Some("audience_unavailable")) => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "audience_unavailable",
@@ -1996,12 +2059,16 @@ async fn approve(
     if version.is_some_and(|v| v != current) {
         return Err(stale());
     }
+    // What the PM was shown, in the tool server's terms (R4): the args hash of the item read
+    // just now, whose version the PM's matched. A save between that read and the decision is
+    // refused there as `stale`, atomically, and answered here as `409 stale`.
     let decision = DecisionBody {
         decided_by: signed.handle().to_string(),
         decision: if item.edited { "edit" } else { "approve" },
         args: item.edited.then(|| item.args.clone()),
         reason: None,
         confirm_external: req.confirm_external,
+        expected_args_hash: Some(item.args_hash.clone()).filter(|h| !h.is_empty()),
     };
     match signed.toolserver(&state).decide(&id, &decision).await {
         Ok(item) => {
@@ -2098,6 +2165,7 @@ async fn reject(
         args: None,
         reason: req.reason,
         confirm_external: false,
+        expected_args_hash: None,
     };
     match signed.toolserver(&state).decide(&id, &decision).await {
         Ok(item) => {
@@ -2484,6 +2552,7 @@ mod tests {
             attempts: 1,
             created_at: String::new(),
             updated_at: String::new(),
+            sources_sensitivity: None,
         };
         assert!(settle(&task("working", None)).is_none());
         assert_eq!(

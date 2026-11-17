@@ -568,6 +568,18 @@ mod tests {
             .insecure_warning()
             .unwrap()
             .contains("INSECURE"));
+        // ... and never with live connectors (R3).
+        let err = with(&[
+            ("PMOS_WEB_TOKEN", web),
+            ("PMOS_ASSERTION_MODE", "off"),
+            ("PMOS_ASSERTION_INSECURE_OFF", "1"),
+            ("PMOS_CONNECTORS", "live"),
+        ])
+        .unwrap_err();
+        assert!(
+            err.contains("PMOS_ASSERTION_INSECURE_OFF") && err.contains("fake-data development"),
+            "{err}"
+        );
         // Tokens are long and distinct.
         assert!(with(&[("PMOS_WEB_TOKEN", "short")])
             .unwrap_err()

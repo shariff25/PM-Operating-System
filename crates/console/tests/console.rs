@@ -169,8 +169,18 @@ async fn runtime(
         .into_response(),
         ("GET", ["v1", "tasks"]) => {
             let mut tasks = tasks_data();
-            if let Some(who) = param("requested_by") {
-                tasks.retain(|t| t["requested_by"] == json!(who));
+            match param("requested_by") {
+                Some(who) => tasks.retain(|t| t["requested_by"] == json!(who)),
+                // An admin's view of everyone (root's, who has no tasks of their own): as the
+                // runtime answers it, metadata only (R1).
+                None => {
+                    for t in &mut tasks {
+                        t["text"] = json!("");
+                        t["result"] = Value::Null;
+                        t["checklist"] = json!([]);
+                        t["hidden"] = json!(true);
+                    }
+                }
             }
             Json(json!({"items": tasks})).into_response()
         }
@@ -193,8 +203,15 @@ async fn runtime(
         .into_response(),
         ("GET", ["v1", "routines"]) => {
             let mut items = routines_data();
-            if let Some(owner) = param("owner") {
-                items.retain(|r| r["owner"] == json!(owner));
+            match param("owner") {
+                Some(owner) => items.retain(|r| r["owner"] == json!(owner)),
+                // The admin's view: no prompt of anyone else's (R1).
+                None => {
+                    for r in &mut items {
+                        r["prompt"] = json!("");
+                        r["hidden"] = json!(true);
+                    }
+                }
             }
             Json(items).into_response()
         }
@@ -238,7 +255,11 @@ async fn toolserver(
             "args_hash": "def", "status": "pending", "created_at": "2026-11-14T10:00:00Z"})],
         _ => vec![],
     };
-    Json(json!({ "items": items })).into_response()
+    // Ben's inbox is past the tool server's safety cap (R12).
+    let truncated = user == "ben";
+    let total_pending = if truncated { 1200 } else { items.len() };
+    Json(json!({ "items": items, "truncated": truncated, "total_pending": total_pending }))
+        .into_response()
 }
 
 async fn serve(app: Router) -> (String, CancellationToken) {
@@ -730,17 +751,19 @@ async fn routines_screen_lists_next_runs_by_who_may_see_them() {
     let (status, body) = c.get(Some("root"), "/routines").await;
     assert_eq!(status, StatusCode::OK);
     for want in [
-        "Summarize overnight #launch",
         "<code>0 8 * * 1-5</code> Europe/London",
         "2026-11-16 08:00 UTC",
-        "Weekly status for ben",
         "<span class=\"badge wait\">paused</span>",
         "action=\"/routines/rtn_ana1/pause\"",
         "action=\"/routines/rtn_ben1/resume\"",
         "action=\"/routines/rtn_ben1/delete\"",
+        // An admin gets everyone's routines without their prompts (R1).
+        "<span class=\"muted\">text hidden</span>",
     ] {
         assert!(body.contains(want), "missing {want}");
     }
+    assert!(!body.contains("Summarize overnight #launch"));
+    assert!(!body.contains("Weekly status for ben"));
     assert!(c
         .runtime
         .calls()
@@ -749,6 +772,10 @@ async fn routines_screen_lists_next_runs_by_who_may_see_them() {
 
     let (_, body) = c.get(Some("ana"), "/routines").await;
     assert!(body.contains("rtn_ana1") && !body.contains("rtn_ben1"));
+    assert!(
+        body.contains("Summarize overnight #launch"),
+        "her own prompt"
+    );
     assert!(c
         .runtime
         .calls()
@@ -896,6 +923,11 @@ async fn approvals_screen_is_read_only_and_scoped() {
     }
     assert_escaped(&body);
     assert!(!body.contains("<form"), "the queue has no actions");
+    // An inbox the tool server cut at its safety cap says so (R12).
+    assert!(
+        body.contains("ben's inbox has 1200 pending drafts"),
+        "{body}"
+    );
     // Newest first.
     assert!(
         body.find("slack.post_message").unwrap() < body.find("confluence.create_draft").unwrap()
@@ -929,7 +961,10 @@ async fn activity_lists_recent_tasks_by_who_may_see_them() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("href=\"/tasks/tsk_ana1\""));
     assert!(body.contains("href=\"/tasks/tsk_ben1\""));
-    assert!(body.contains("What ports does Acme Vault need? &lt;script&gt;"));
+    // An admin's list of everyone's tasks is metadata: the asks read "text hidden" (R1).
+    assert!(!body.contains("What ports does Acme Vault need?"));
+    assert!(!body.contains("Ben's private question"));
+    assert_eq!(body.matches("text hidden").count(), 2, "{body}");
     assert_escaped(&body);
     assert!(c
         .runtime
@@ -939,6 +974,8 @@ async fn activity_lists_recent_tasks_by_who_may_see_them() {
 
     let (_, body) = c.get(Some("ana"), "/activity").await;
     assert!(body.contains("tsk_ana1") && !body.contains("tsk_ben1"));
+    assert!(body.contains("What ports does Acme Vault need? &lt;script&gt;"));
+    assert!(!body.contains("text hidden"));
     assert!(c
         .runtime
         .calls()
@@ -1093,16 +1130,16 @@ fn one_task_read(method: &str, uri: &str) -> bool {
             .is_some_and(|rest| !rest.is_empty() && !rest.contains('?'))
 }
 
-/// Every call that names a person carries a valid assertion for exactly that person, and
-/// every routine change one for `actor`, issued by `console` for `audience`; every other call
-/// carries none.
+/// Issued by `console` for `audience`: every runtime call carries a valid assertion for the
+/// viewer, `actor` (R1: the runtime decides what the viewer sees from it); every tool-server
+/// call that names a person carries one for exactly that person, and every other carries none.
 fn check_calls(seen: &Seen, audience: &str, key: (&str, &str), actor: Option<&str>) -> usize {
     let cache = pmos_assertion::MemoryReplayCache::default();
     let policy = pmos_assertion::VerifyPolicy::new(audience, &["console"]).unwrap();
     let mut signed = 0;
     for (method, uri, body, assertion) in seen.asserted.lock().unwrap().iter() {
-        let expected = if routine_change(method, uri) {
-            Some(actor.expect("a routine change needs an actor").to_string())
+        let expected = if audience == "bots" || routine_change(method, uri) {
+            Some(actor.expect("a runtime call needs the viewer").to_string())
         } else {
             named(uri)
         };
@@ -1139,6 +1176,7 @@ async fn calls_that_name_a_person_carry_a_valid_assertion_for_them() {
     })
     .await;
     for user in ["ana", "root"] {
+        c.runtime.asserted.lock().unwrap().clear();
         for page in ["/routines", "/activity", "/approvals", "/bots"] {
             assert_eq!(
                 c.get(Some(user), page).await.0,
@@ -1146,7 +1184,10 @@ async fn calls_that_name_a_person_carry_a_valid_assertion_for_them() {
                 "{user} {page}"
             );
         }
+        // Every runtime call is signed for the viewer: the bots, tasks and routines lists.
+        assert!(check_calls(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY), Some(user)) >= 4);
     }
+    c.runtime.asserted.lock().unwrap().clear();
     let token = c.csrf("ana").await;
     let res = c
         .post(
@@ -1157,8 +1198,8 @@ async fn calls_that_name_a_person_carry_a_valid_assertion_for_them() {
         )
         .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    // Ana's own tasks and routines, and every member's inbox for root.
-    assert!(check_calls(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY), Some("ana")) >= 3);
+    // Ana's routine check and pause, and every member's inbox for root.
+    assert!(check_calls(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY), Some("ana")) >= 2);
     assert!(check_calls(&c.tools, "toolserver", ("ct1", CONSOLE_TOOLS_KEY), None) >= 4);
 }
 
@@ -1222,9 +1263,11 @@ async fn routine_changes_are_signed_for_the_viewer_who_made_them() {
         .cloned()
         .collect();
     assert_eq!(changes.len(), 2, "{changes:?}");
+    // Every runtime call, the changes and the routine reads before them, is signed as root.
+    let calls = c.runtime.asserted.lock().unwrap().len();
     assert_eq!(
         check_calls(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY), Some("root")),
-        2
+        calls
     );
     // The assertion is bound to the change itself: it doesn't verify for another routine.
     let (method, _, body, assertion) = &changes[0];

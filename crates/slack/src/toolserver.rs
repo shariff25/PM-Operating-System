@@ -78,6 +78,25 @@ pub fn request_of(body: &Value) -> &Value {
     }
 }
 
+/// What the PM deciding was shown, sent with a decision ([`ToolServer::decide`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Seen<'a> {
+    /// The start of the item's `args_hash` as the card or the App Home row showed it.
+    pub args_hash: Option<&'a str>,
+    /// The second confirmation for a Slack write to an externally shared channel.
+    pub confirm_external: bool,
+}
+
+impl<'a> Seen<'a> {
+    /// The text with this args hash start was shown.
+    pub fn hash(args_hash: &'a str) -> Self {
+        Self {
+            args_hash: Some(args_hash),
+            confirm_external: false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolServer {
     base: String,
@@ -214,6 +233,11 @@ impl ToolServer {
     /// A refusal keeps its status, `code` and body: the reply card turns `audience_blocked`,
     /// `needs_external_confirm` and `expired` (`409`) and `audience_unavailable` (`503`) into
     /// their own sentences. Any other `5xx`, or no answer, is [`ApiError::Unavailable`].
+    ///
+    /// `seen.args_hash` is the start of the `args_hash` the PM was shown (a card's buttons
+    /// carry it): the tool server refuses the decision as `409 stale` when the item now holds
+    /// other text, and refuses an `approve` without one. Callers never approve without it: a
+    /// card that carries none is shown again instead.
     pub async fn decide(
         &self,
         id: &str,
@@ -221,7 +245,7 @@ impl ToolServer {
         decision: &str,
         args: Option<Value>,
         reason: Option<&str>,
-        confirm_external: bool,
+        seen: Seen<'_>,
     ) -> Result<Value, ApiError> {
         if !approval_id_ok(id) {
             return Err(refused_locally("not an approval id"));
@@ -233,8 +257,11 @@ impl ToolServer {
         if let Some(reason) = reason {
             body["reason"] = json!(reason);
         }
-        if confirm_external {
+        if seen.confirm_external {
             body["confirm_external"] = json!(true);
+        }
+        if let Some(hash) = seen.args_hash {
+            body["expected_args_hash"] = json!(hash);
         }
         let res = self
             .http
@@ -570,10 +597,8 @@ mod decision_errors {
         let msg = "PM OS hit an internal error running this write; a platform owner can find \
                    the detail in the tool server's log";
         let ts = answering(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": msg})).await;
-        match ts
-            .decide("apr_1", "ana", "approve", None, None, false)
-            .await
-        {
+        let seen = Seen::hash("0123456789abcdef");
+        match ts.decide("apr_1", "ana", "approve", None, None, seen).await {
             Err(ApiError::Refused {
                 status: 500, error, ..
             }) => assert_eq!(error, msg),
@@ -582,8 +607,7 @@ mod decision_errors {
         // A bare 500 or 503 still means "try again".
         let ts = answering(StatusCode::SERVICE_UNAVAILABLE, json!({})).await;
         assert_eq!(
-            ts.decide("apr_1", "ana", "approve", None, None, false)
-                .await,
+            ts.decide("apr_1", "ana", "approve", None, None, seen).await,
             Err(ApiError::Unavailable)
         );
         // A changed target keeps its code.
@@ -593,10 +617,17 @@ mod decision_errors {
         )
         .await;
         assert_eq!(
-            ts.decide("apr_1", "ana", "edit", Some(json!({})), None, false)
-                .await
-                .unwrap_err()
-                .code(),
+            ts.decide(
+                "apr_1",
+                "ana",
+                "edit",
+                Some(json!({})),
+                None,
+                Seen::default()
+            )
+            .await
+            .unwrap_err()
+            .code(),
             Some("target_changed")
         );
     }

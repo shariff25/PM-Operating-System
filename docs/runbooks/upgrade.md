@@ -87,19 +87,30 @@ deploy/pmos-admin up
 The tool server makes its tables again at start-up. For a local `cargo run` with its own
 database, drop and recreate that database the same way.
 
-**Repair (keeps the data; not exercised in CI, so take a backup first):** move the two
-applied rows to their new numbers with their new checksums, then start the tool server, which
-applies `0009_note_sensitivity` (it only adds a nullable column):
+**Repair (keeps the data). Dev and test stacks of that branch only; prefer the reset above.**
+Never edit `_sqlx_migrations` by hand. The repair is one guarded script,
+`scripts/repair-toolserver-migration-numbers.sql`. In one transaction, with the table locked,
+it checks that the database is in exactly the affected state: version 9 is
+`audit source titles` and version 10 `audit admin reads`, both applied, each with the
+checksum of its file, and nothing after 10. Only then does it renumber them to 10 and 11 (the
+SQL of both files is unchanged, so their checksums stay). In any other state (already
+repaired, never affected, a different history) it changes nothing, rolls back and exits
+non-zero with what it found. Take a backup first ([backup-restore.md](backup-restore.md)), then:
 
 ```sh
-c10=$(sha384sum crates/toolserver/migrations/0010_audit_source_titles.sql | cut -d' ' -f1)
-c11=$(sha384sum crates/toolserver/migrations/0011_audit_admin_reads.sql | cut -d' ' -f1)
+deploy/pmos-admin down
+docker compose -f deploy/compose.yaml --env-file deploy/.env up -d postgres
 docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T postgres \
-  psql -U postgres -d pmos_toolserver -v ON_ERROR_STOP=1 -1 \
-  -c "UPDATE _sqlx_migrations SET version = 11, description = 'audit admin reads', checksum = decode('$c11', 'hex') WHERE version = 10" \
-  -c "UPDATE _sqlx_migrations SET version = 10, description = 'audit source titles', checksum = decode('$c10', 'hex') WHERE version = 9"
+  psql -U postgres -d pmos_toolserver -v ON_ERROR_STOP=1 \
+  -f - <scripts/repair-toolserver-migration-numbers.sql
 deploy/pmos-admin up
 ```
+
+`pmos-admin up` starts the tool server, which applies `0009_note_sensitivity` (it only adds a
+nullable column) and anything newer. Verified on 2026-11-17 against a scratch Postgres 16
+database: the branch's old migrations applied with sqlx, the current tool server refusing them
+("migration 9 was previously applied but has been modified"), the script refusing a tampered
+row and a second run, and after the repair the current migrations applying cleanly.
 
 ## Updating the Slack app
 

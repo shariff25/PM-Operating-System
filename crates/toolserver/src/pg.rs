@@ -633,6 +633,46 @@ impl ApprovalRepo for PgStore {
         rows.iter().map(item_from_row).collect()
     }
 
+    async fn inbox(
+        &self,
+        user: &str,
+        pending_cap: usize,
+        decided_limit: usize,
+    ) -> StoreResult<crate::approvals::Inbox> {
+        let page = |pending: bool, limit: usize| {
+            let sql = format!(
+                "SELECT {ITEM_COLUMNS} FROM approvals
+                 WHERE user_handle = $1 AND (status = 'pending') = $2
+                 ORDER BY created_at DESC, id COLLATE \"C\"
+                 LIMIT $3"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(user)
+                .bind(pending)
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .fetch_all(&self.pool)
+        };
+        let pending = page(true, pending_cap).await?;
+        let decided = page(false, decided_limit).await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM approvals WHERE user_handle = $1 AND status = 'pending'",
+        )
+        .bind(user)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(crate::approvals::Inbox {
+            pending: pending
+                .iter()
+                .map(item_from_row)
+                .collect::<StoreResult<_>>()?,
+            total_pending: usize::try_from(total).unwrap_or(0),
+            decided: decided
+                .iter()
+                .map(item_from_row)
+                .collect::<StoreResult<_>>()?,
+        })
+    }
+
     async fn decide_with(
         &self,
         id: &str,
@@ -689,6 +729,9 @@ impl ApprovalRepo for PgStore {
             Some(DecideError::Expired)
         } else if current.status != Status::Pending {
             Some(DecideError::NotPending)
+        } else if !crate::approvals::still_as_shown(&current, verdict.expected_args_hash.as_deref())
+        {
+            Some(DecideError::Stale)
         } else if verdict.decision == Decision::Edit && verdict.args.is_none() {
             Some(DecideError::MissingArgs)
         } else {
@@ -790,6 +833,7 @@ impl ApprovalRepo for PgStore {
         id: &str,
         user: &str,
         args: Value,
+        raise_to: Option<Sensitivity>,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::from)?;
@@ -819,9 +863,12 @@ impl ApprovalRepo for PgStore {
         }
         let drafted = crate::approvals::drafted_after(&current, &args);
         let edited_at = drafted.as_ref().map(|_| now);
+        // Worked out under the row lock, so a concurrent save can't lower it.
+        let level = crate::approvals::raised(current.sources_sensitivity, raise_to);
         let sql = format!(
             "UPDATE approvals
-             SET args = $2, args_hash = $3, drafted_args = $4, edited_at = $5
+             SET args = $2, args_hash = $3, drafted_args = $4, edited_at = $5,
+                 sources_sensitivity = $6
              WHERE id = $1 AND status = 'pending'
              RETURNING {ITEM_COLUMNS}"
         );
@@ -831,6 +878,7 @@ impl ApprovalRepo for PgStore {
             .bind(args_hash(&args))
             .bind(&drafted)
             .bind(edited_at)
+            .bind(level.map(|s| s.to_string()))
             .fetch_optional(&mut *tx)
             .await
             .map_err(StoreError::from)?

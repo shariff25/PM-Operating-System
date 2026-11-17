@@ -102,10 +102,11 @@ services:
       PMOS_CONSOLE_TS_TOKEN: ${PMOS_CONSOLE_TS_TOKEN:-}
       # User assertions from the web app and the console (docs/user-assertion.md). With either
       # token above set, the tool server runs in `require` (blank means that) and refuses to
-      # start in `off` or `verify` unless PMOS_ASSERTION_INSECURE_OFF=1 (development only).
+      # start in `off` or `verify`. The development override (PMOS_ASSERTION_INSECURE_OFF) is
+      # deliberately not passed here: it is for fake-data development stacks only, and the
+      # service refuses it with live connectors or a database anyway.
       # Each set token needs its key; a key is passed only when it is set.
       PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}
-      PMOS_ASSERTION_INSECURE_OFF: ${PMOS_ASSERTION_INSECURE_OFF:-}
       PMOS_ASSERTION_KEYS: "${PMOS_AK_WEB_TOOLSERVER:+web:toolserver:${PMOS_AK_WEB_TOOLSERVER},}${PMOS_AK_CONSOLE_TOOLSERVER:+console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER}}"
       PMOS_VAULT_KEY: ${PMOS_VAULT_KEY:?}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
@@ -163,9 +164,9 @@ services:
       PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
       PMOS_GATEWAY_TOKEN: ${PMOS_GW_RUNTIME_TOKEN}
       # User assertions from the web app and the console (docs/user-assertion.md), as for the
-      # tool server: `require` whenever either is in PMOS_BOTS_TOKENS.
+      # tool server: `require` whenever either is in PMOS_BOTS_TOKENS. No development override
+      # here either (PMOS_ASSERTION_INSECURE_OFF is never passed in production).
       PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}
-      PMOS_ASSERTION_INSECURE_OFF: ${PMOS_ASSERTION_INSECURE_OFF:-}
       PMOS_ASSERTION_KEYS: "${PMOS_AK_WEB_BOTS:+web:bots:${PMOS_AK_WEB_BOTS},}${PMOS_AK_CONSOLE_BOTS:+console:bots:${PMOS_AK_CONSOLE_BOTS}}"
       # The handles the evals client may request tasks as (empty: `evals`).
       PMOS_EVALS_AS: ${PMOS_EVALS_AS:-}

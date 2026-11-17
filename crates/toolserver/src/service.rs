@@ -149,6 +149,15 @@ pub enum ReindexError {
     Store(#[from] StoreError),
 }
 
+/// Where a saved edit's text came from, when a bot wrote it: the revision run (the web app's
+/// accepted suggestion, a runtime task id) and the level its caller recorded for it, which
+/// counts only as a floor ([`ToolService::save_draft`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revision {
+    pub run_id: String,
+    pub sensitivity: Option<Sensitivity>,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DecisionError {
     #[error(transparent)]
@@ -186,7 +195,17 @@ pub enum DecisionError {
     /// Slack's channel calls failed, so the audience is unknown. Nothing was written.
     #[error("PM OS couldn't check who can see this channel ({0}), so nothing was posted; try again shortly")]
     AudienceUnavailable(String),
+    /// An approve from the Slack bot or `pmos-web` didn't say which arguments the person was
+    /// shown (`expected_args_hash`). Nothing was decided.
+    #[error("an approve from this client must name the args hash the person was shown (`expected_args_hash`)")]
+    ShownHashMissing,
+    /// `expected_args_hash` isn't 16 to 64 lowercase hex characters.
+    #[error("`expected_args_hash` must be 16 to 64 lowercase hex characters")]
+    ShownHashMalformed,
 }
+
+/// The `409` code of a decision refused because the draft changed since it was shown.
+pub const STALE: &str = "stale";
 
 /// What the audience check found, for the decision's answer: how many can see the channel,
 /// how many of them aren't in `team.yaml`, and whether it is shared outside the company.
@@ -1471,19 +1490,35 @@ impl ToolService {
         user: &str,
         limit: usize,
     ) -> Result<(Vec<ApprovalItem>, usize), StoreError> {
-        let mut items = self
+        let inbox = self
             .stores
             .approvals
-            .list(user, Some(Status::Pending))
+            .inbox(user, crate::approvals::PENDING_CAP, 0)
             .await?;
+        let total = inbox.total_pending;
+        let mut items = inbox.pending;
         items.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        let total = items.len();
         items.truncate(limit);
         Ok((items, total))
+    }
+
+    /// `user`'s inbox for `GET /internal/approvals` without a narrower status: every pending
+    /// item (up to [`crate::approvals::PENDING_CAP`], the answer then says it is truncated)
+    /// and the newest [`crate::approvals::LIST_LIMIT`] decided ones. Pending items are never
+    /// cut at the decided cap.
+    pub async fn inbox(&self, user: &str) -> Result<crate::approvals::Inbox, StoreError> {
+        self.stores
+            .approvals
+            .inbox(
+                user,
+                crate::approvals::PENDING_CAP,
+                crate::approvals::LIST_LIMIT,
+            )
+            .await
     }
 
     pub async fn approval(&self, id: &str) -> Result<Option<ApprovalItem>, StoreError> {
@@ -1819,6 +1854,21 @@ impl ToolService {
             }
             return Err(DecisionError::NotAMember(decided_by.to_string()));
         }
+        // What the person was shown (R4). The clients that show a person a draft (the Slack
+        // bot's cards and App Home, `pmos-web`) must say so on every approve; the orchestrator
+        // may. A mismatch is refused below, before anything else runs, and again atomically by
+        // the store.
+        match verdict.expected_args_hash.as_deref() {
+            Some(e) if !crate::approvals::valid_expected_hash(e) => {
+                return Err(DecisionError::ShownHashMalformed)
+            }
+            None if decision == Decision::Approve
+                && matches!(client, Client::Bot | Client::Web) =>
+            {
+                return Err(DecisionError::ShownHashMissing)
+            }
+            _ => {}
+        }
         let current = self.stores.approvals.get(id).await?;
         // A Slack draft past its time expires now, even if the sweeper hasn't reached it: the
         // store then refuses the decision as `expired`.
@@ -1831,6 +1881,16 @@ impl ToolService {
         let open = current
             .as_ref()
             .filter(|c| !overdue && c.user == decided_by && c.status == Status::Pending);
+        if let Some(current) = open {
+            if !crate::approvals::still_as_shown(current, verdict.expected_args_hash.as_deref()) {
+                self.audit(denied(
+                    current.clone(),
+                    "stale: the draft changed since it was shown; nothing was decided",
+                ))
+                .await;
+                return Err(DecideError::Stale.into());
+            }
+        }
         if let (true, Some(current)) = (decision != Decision::Reject, open) {
             let spec = self.write_spec(current)?;
             let args = match decision {
@@ -1897,6 +1957,15 @@ impl ToolService {
                         .await;
                     }
                 }
+                if e == DecideError::Stale {
+                    if let Ok(Some(item)) = self.stores.approvals.get(id).await {
+                        self.audit(denied(
+                            item,
+                            "stale: the draft changed since it was shown; nothing was decided",
+                        ))
+                        .await;
+                    }
+                }
                 return Err(e.into());
             }
         };
@@ -1944,12 +2013,21 @@ impl ToolService {
     /// goes (`target_changed`, audited). Source markers may stay in the text: they are removed
     /// when the write runs. Nothing is written to the target system. Audited as
     /// `approval.draft_saved`, outcome `ok`, with the new args hash and never the text.
+    ///
+    /// **Sensitivity (R2).** A save can raise the item's `sources_sensitivity`, never lower
+    /// it. Text from a bot's revision run (`revision`, the web app's accepted suggestion) may
+    /// carry what that run read: the item's level becomes the highest of its own, the level the
+    /// tool server's own sessions for that run reached (`restricted` when it has none, so an
+    /// unknown run never lowers the bar), and the caller's `sensitivity`, which counts only as
+    /// a floor. Text a person typed (`revision: None`) carries no level the machine knows; the
+    /// item keeps its own.
     pub async fn save_draft(
         self: &Arc<Self>,
         client: Client,
         id: &str,
         user: &str,
         args: Value,
+        revision: Option<Revision>,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecisionError> {
         let event =
@@ -2006,12 +2084,33 @@ impl ToolService {
                 }
             }
         }
+        let raise_to = match &revision {
+            None => None,
+            Some(r) => {
+                let run = self.stores.sessions.run_sensitivity(&r.run_id).await?;
+                Some(
+                    run.unwrap_or(Sensitivity::Restricted)
+                        .max(r.sensitivity.unwrap_or(Sensitivity::Public)),
+                )
+            }
+        };
+        let before = current.sources_sensitivity;
         let item = self
             .stores
             .approvals
-            .save_draft(id, user, args, now)
+            .save_draft(id, user, args, raise_to, now)
             .await?;
-        self.audit(event(&item, Outcome::Ok, item.args_hash.clone(), None))
+        let detail = (revision.is_some()).then(|| {
+            let level = |s: Option<Sensitivity>| {
+                s.map_or_else(|| "unrecorded".to_string(), |s| s.to_string())
+            };
+            format!(
+                "a bot revision's text; sources {} -> {}",
+                level(before),
+                level(item.sources_sensitivity)
+            )
+        });
+        self.audit(event(&item, Outcome::Ok, item.args_hash.clone(), detail))
             .await;
         Ok(item)
     }

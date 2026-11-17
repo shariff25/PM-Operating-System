@@ -62,8 +62,9 @@ deploy/setup.sh --content /srv/pmos/content-repo --clone <the content repo> --st
    runtime and the tool server refuse to start in `off` or `verify` while those tokens are
    set, and every `pmos-admin up` (with any options, including the `up --models` restarts in
    these runbooks), `add-bot` and `restore` checks it before it starts anything
-   (`docs/user-assertion.md`, Modes). `PMOS_ASSERTION_INSECURE_OFF=1` overrides that for
-   development only; never set it on the Spark. `PMOS_ONBOARDING_V2` and `PMOS_NUDGES` (the
+   (`docs/user-assertion.md`, Modes). There is no override here: the development one
+   (`PMOS_ASSERTION_INSECURE_OFF`) is for fake-data stacks only, `deploy/compose.yaml` doesn't
+   pass it, and the services refuse it with live connectors or a database. `PMOS_ONBOARDING_V2` and `PMOS_NUDGES` (the
    Slack first-time flow and nudges) are written as `1`; set either to `0` to turn it off.
 7. **Save the settings.** Copy `deploy/.env` into the team password manager now. It holds the
    vault key and the console proxy secret; without the vault key, stored tokens can't be read.

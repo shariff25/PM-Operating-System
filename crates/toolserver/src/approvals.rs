@@ -30,6 +30,13 @@ pub const GRANT_TTL_MINUTES: i64 = 15;
 /// newest. Every caller shows a PM's inbox and recent history, which is far below this; an
 /// older item is still read by its id.
 pub const LIST_LIMIT: usize = 200;
+/// The safety cap on a PM's *pending* items in one inbox listing ([`ApprovalRepo::inbox`]).
+/// Pending items are never cut at [`LIST_LIMIT`]: only past this much higher cap, and then
+/// the answer says so (`truncated: true`, with `total_pending`).
+pub const PENDING_CAP: usize = 1000;
+/// The shortest `expected_args_hash` a decision may name: the start of the item's
+/// `args_hash` (a Slack card's buttons carry 16 hex characters of it).
+pub const MIN_EXPECTED_HASH: usize = 16;
 
 /// The Slack drafts that expire and lose their text after `PMOS_SLACK_DRAFT_TTL_HOURS`
 /// (`docs/slack-reply-spec.md` §3).
@@ -78,6 +85,21 @@ pub fn reply_thread(args: &Value) -> Option<(&str, &str)> {
 /// who tags PM OS twice in one thread gets a draft for each tag.
 pub fn reply_message(args: &Value) -> Option<&str> {
     args["message_ts"].as_str()
+}
+
+/// Is `expected` (a decision's `expected_args_hash`) a well-formed start of an args hash:
+/// [`MIN_EXPECTED_HASH`] to 64 lowercase hex characters?
+pub fn valid_expected_hash(expected: &str) -> bool {
+    (MIN_EXPECTED_HASH..=64).contains(&expected.len())
+        && expected
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// Does `item` still hold the arguments whose hash starts with `expected`? `None` (nothing
+/// named) always matches; a malformed value never does.
+pub fn still_as_shown(item: &ApprovalItem, expected: Option<&str>) -> bool {
+    expected.is_none_or(|e| valid_expected_hash(e) && item.args_hash.starts_with(e))
 }
 
 /// SHA-256 of the canonical JSON form of `args` (object keys sorted at every level).
@@ -221,6 +243,10 @@ pub struct Verdict {
     pub args: Option<Value>,
     pub reason: Option<Reason>,
     pub confirm_external: bool,
+    /// The start of the `args_hash` the deciding person was shown. When set and the item now
+    /// holds other arguments, the decision is refused as [`DecideError::Stale`] and nothing
+    /// changes; the store checks it under the same lock as the decision.
+    pub expected_args_hash: Option<String>,
 }
 
 impl Verdict {
@@ -230,7 +256,14 @@ impl Verdict {
             args,
             reason: None,
             confirm_external: false,
+            expected_args_hash: None,
         }
+    }
+
+    /// The same verdict, naming the args hash the person deciding was shown.
+    pub fn shown(mut self, expected_args_hash: Option<String>) -> Self {
+        self.expected_args_hash = expected_args_hash;
+        self
     }
 
     /// The reason to store: only a rejection keeps one.
@@ -252,6 +285,10 @@ pub enum DecideError {
     Expired,
     #[error("an edit decision needs the edited arguments")]
     MissingArgs,
+    /// The item's arguments changed since the person deciding was shown them (a saved edit
+    /// in between): nothing was decided.
+    #[error("this draft changed since it was shown; nothing was decided")]
+    Stale,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -388,10 +425,20 @@ pub trait ApprovalRepo: Send + Sync {
 
     async fn get(&self, id: &str) -> StoreResult<Option<ApprovalItem>>;
 
-    /// Items for one user, newest first, optionally filtered by status.
     /// `user`'s items, optionally only those with `status`: newest first (ties by id), at
-    /// most [`LIST_LIMIT`].
+    /// most [`LIST_LIMIT`]. An inbox that must show every pending item reads
+    /// [`ApprovalRepo::inbox`] instead.
     async fn list(&self, user: &str, status: Option<Status>) -> StoreResult<Vec<ApprovalItem>>;
+
+    /// `user`'s inbox: every pending item, newest first (ties by id), up to `pending_cap`,
+    /// with how many are pending in all; and the newest `decided_limit` items that aren't
+    /// pending.
+    async fn inbox(
+        &self,
+        user: &str,
+        pending_cap: usize,
+        decided_limit: usize,
+    ) -> StoreResult<Inbox>;
 
     /// Record a decision with no reason. See [`ApprovalRepo::decide_with`].
     async fn decide(
@@ -426,11 +473,16 @@ pub trait ApprovalRepo: Send + Sync {
     /// arguments are kept in `drafted_args` (saving them back clears it, and `edited_at`);
     /// `edited_at` is `now`. Only the item's own user, only while it is pending: the same
     /// refusals as a decision. The ledger row is unchanged until the decision.
+    ///
+    /// `raise_to` can only raise the item's `sources_sensitivity`, never lower it: the stored
+    /// level becomes [`raised`] (the higher of the item's own, unrecorded counting as
+    /// `restricted`, and `raise_to`), under the same lock as the save.
     async fn save_draft(
         &self,
         id: &str,
         user: &str,
         args: Value,
+        raise_to: Option<Sensitivity>,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError>;
 
@@ -470,6 +522,33 @@ pub trait ApprovalRepo: Send + Sync {
         before: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> StoreResult<usize>;
+}
+
+/// A PM's inbox as [`ApprovalRepo::inbox`] reads it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Inbox {
+    /// Pending items, newest first, at most the cap asked for.
+    pub pending: Vec<ApprovalItem>,
+    /// How many items are pending in all: more than `pending.len()` only past the cap.
+    pub total_pending: usize,
+    /// The newest items that aren't pending.
+    pub decided: Vec<ApprovalItem>,
+}
+
+impl Inbox {
+    /// Were pending items left out (past the safety cap)?
+    pub fn truncated(&self) -> bool {
+        self.total_pending > self.pending.len()
+    }
+}
+
+/// The level a saved edit leaves an item at: the higher of its own (unrecorded counts as
+/// `restricted`) and `raise_to`. Never lower than before.
+pub fn raised(current: Option<Sensitivity>, raise_to: Option<Sensitivity>) -> Option<Sensitivity> {
+    match raise_to {
+        None => current,
+        Some(r) => Some(current.unwrap_or(Sensitivity::Restricted).max(r)),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -605,6 +684,36 @@ impl ApprovalRepo for MemoryApprovals {
         Ok(items)
     }
 
+    async fn inbox(
+        &self,
+        user: &str,
+        pending_cap: usize,
+        decided_limit: usize,
+    ) -> StoreResult<Inbox> {
+        let state = self.state.lock().expect("approvals lock");
+        let mut mine: Vec<_> = state
+            .items
+            .values()
+            .filter(|i| i.user == user)
+            .cloned()
+            .collect();
+        mine.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let (mut pending, mut decided): (Vec<_>, Vec<_>) =
+            mine.into_iter().partition(|i| i.status == Status::Pending);
+        let total_pending = pending.len();
+        pending.truncate(pending_cap);
+        decided.truncate(decided_limit);
+        Ok(Inbox {
+            pending,
+            total_pending,
+            decided,
+        })
+    }
+
     async fn decide_with(
         &self,
         id: &str,
@@ -622,6 +731,9 @@ impl ApprovalRepo for MemoryApprovals {
         }
         if item.status != Status::Pending {
             return Err(DecideError::NotPending);
+        }
+        if !still_as_shown(item, verdict.expected_args_hash.as_deref()) {
+            return Err(DecideError::Stale);
         }
         let reason = verdict.stored_reason();
         // Measured from the bot's own arguments, so a saved edit approved as it stands
@@ -671,6 +783,7 @@ impl ApprovalRepo for MemoryApprovals {
         id: &str,
         user: &str,
         args: Value,
+        raise_to: Option<Sensitivity>,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError> {
         let mut state = self.state.lock().expect("approvals lock");
@@ -689,6 +802,7 @@ impl ApprovalRepo for MemoryApprovals {
         item.drafted_args = drafted;
         item.args_hash = args_hash(&args);
         item.args = args;
+        item.sources_sensitivity = raised(item.sources_sensitivity, raise_to);
         Ok(item.clone())
     }
 
