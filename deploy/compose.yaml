@@ -95,14 +95,18 @@ services:
       PMOS_DATABASE_URL: postgresql://pmos_toolserver:${PMOS_DB_TOOLSERVER_PASSWORD}@postgres/pmos_toolserver
       PMOS_SERVICE_TOKEN: ${PMOS_SERVICE_TOKEN:?}
       PMOS_BOT_TOKEN: ${PMOS_BOT_TOKEN:?}
-      # The web app's own token: the approvals routes and the read-only admin routes.
-      PMOS_WEB_TOKEN: ${PMOS_TS_WEB_TOKEN:?run deploy/setup.sh again}
-      # The console's read-only token: it may read approvals and nothing else.
+      # The web app's own token: the approvals routes and the read-only admin routes. Optional:
+      # blank, the tool server has no web client.
+      PMOS_WEB_TOKEN: ${PMOS_TS_WEB_TOKEN:-}
+      # The console's read-only token: it may read approvals and nothing else. Optional.
       PMOS_CONSOLE_TS_TOKEN: ${PMOS_CONSOLE_TS_TOKEN:-}
-      # User assertions from the web app and the console (docs/user-assertion.md). `off` unless
-      # set; `pmos-admin up --web` makes it `require`.
-      PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-off}
-      PMOS_ASSERTION_KEYS: web:toolserver:${PMOS_AK_WEB_TOOLSERVER:?run deploy/setup.sh again},console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER:?run deploy/setup.sh again}
+      # User assertions from the web app and the console (docs/user-assertion.md). With either
+      # token above set, the tool server runs in `require` (blank means that) and refuses to
+      # start in `off` or `verify` unless PMOS_ASSERTION_INSECURE_OFF=1 (development only).
+      # Each set token needs its key; a key is passed only when it is set.
+      PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}
+      PMOS_ASSERTION_INSECURE_OFF: ${PMOS_ASSERTION_INSECURE_OFF:-}
+      PMOS_ASSERTION_KEYS: "${PMOS_AK_WEB_TOOLSERVER:+web:toolserver:${PMOS_AK_WEB_TOOLSERVER},}${PMOS_AK_CONSOLE_TOOLSERVER:+console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER}}"
       PMOS_VAULT_KEY: ${PMOS_VAULT_KEY:?}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
@@ -151,16 +155,18 @@ services:
     environment:
       PMOS_BOTS_BIND: 0.0.0.0:8750
       PMOS_BOTS_DATABASE_URL: postgresql://pmos_bots:${PMOS_DB_BOTS_PASSWORD}@postgres/pmos_bots
-      PMOS_BOTS_TOKENS: slack=${PMOS_RT_SLACK_TOKEN:?},console=${PMOS_RT_CONSOLE_TOKEN:?},web=${PMOS_RT_WEB_TOKEN:?run deploy/setup.sh again},evals=${PMOS_RT_EVALS_TOKEN:?},worker-docs=${PMOS_RT_DOCS_WORKER_TOKEN:?},${PMOS_RT_WORKER_TOKENS:-}
+      # The console's and the web app's tokens are listed only when set.
+      PMOS_BOTS_TOKENS: "slack=${PMOS_RT_SLACK_TOKEN:?},${PMOS_RT_CONSOLE_TOKEN:+console=${PMOS_RT_CONSOLE_TOKEN},}${PMOS_RT_WEB_TOKEN:+web=${PMOS_RT_WEB_TOKEN},}evals=${PMOS_RT_EVALS_TOKEN:?},worker-docs=${PMOS_RT_DOCS_WORKER_TOKEN:?},${PMOS_RT_WORKER_TOKENS:-}"
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
       PMOS_SERVICE_TOKEN: ${PMOS_SERVICE_TOKEN}
       PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
       PMOS_GATEWAY_TOKEN: ${PMOS_GW_RUNTIME_TOKEN}
-      # User assertions from the web app and the console (docs/user-assertion.md). `off` unless
-      # set; `pmos-admin up --web` makes it `require`.
-      PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-off}
-      PMOS_ASSERTION_KEYS: web:bots:${PMOS_AK_WEB_BOTS:?run deploy/setup.sh again},console:bots:${PMOS_AK_CONSOLE_BOTS:?run deploy/setup.sh again}
+      # User assertions from the web app and the console (docs/user-assertion.md), as for the
+      # tool server: `require` whenever either is in PMOS_BOTS_TOKENS.
+      PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}
+      PMOS_ASSERTION_INSECURE_OFF: ${PMOS_ASSERTION_INSECURE_OFF:-}
+      PMOS_ASSERTION_KEYS: "${PMOS_AK_WEB_BOTS:+web:bots:${PMOS_AK_WEB_BOTS},}${PMOS_AK_CONSOLE_BOTS:+console:bots:${PMOS_AK_CONSOLE_BOTS}}"
       # The handles the evals client may request tasks as (empty: `evals`).
       PMOS_EVALS_AS: ${PMOS_EVALS_AS:-}
     volumes:
@@ -188,6 +194,10 @@ services:
       PMOS_SLACK_STATE_DIR: /var/lib/pmos/slack
       PMOS_DEFAULT_TZ: ${PMOS_DEFAULT_TZ:-America/Los_Angeles}
       PMOS_GITHUB_ORG: ${PMOS_GITHUB_ORG:-}
+      # The first-time flow and the nudges (deploy/env.example): on unless set to 0.
+      PMOS_ONBOARDING_V2: ${PMOS_ONBOARDING_V2:-1}
+      PMOS_NUDGES: ${PMOS_NUDGES:-1}
+      PMOS_NUDGES_HOURS: ${PMOS_NUDGES_HOURS:-}
       # The daily triage digest to each bot's quality owner (docs/runbooks/quality.md).
       PMOS_TRIAGE_AT: ${PMOS_TRIAGE_AT:-09:00}
       PMOS_TRIAGE_MIN_EDIT: ${PMOS_TRIAGE_MIN_EDIT:-0.3}
@@ -223,11 +233,11 @@ services:
     environment:
       PMOS_CONSOLE_BIND: 0.0.0.0:8760
       PMOS_BOTS_URL: http://bots.pmos.internal:8750
-      PMOS_BOTS_TOKEN: ${PMOS_RT_CONSOLE_TOKEN}
+      PMOS_BOTS_TOKEN: ${PMOS_RT_CONSOLE_TOKEN:-}
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
       # Its own read-only tool-server token, never the service token.
       PMOS_TOOLSERVER_TOKEN: ${PMOS_CONSOLE_TS_TOKEN:-}
-      PMOS_ASSERTION_KEYS: console:bots:${PMOS_AK_CONSOLE_BOTS},console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER}
+      PMOS_ASSERTION_KEYS: console:bots:${PMOS_AK_CONSOLE_BOTS:-},console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER:-}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_CONSOLE_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
       PMOS_CONSOLE_TRUST_PROXY: ${PMOS_CONSOLE_TRUST_PROXY:-0}
@@ -279,11 +289,11 @@ services:
       # and a restart signs everyone out.
       PMOS_WEB_DATABASE_URL: ${PMOS_WEB_DATABASE_URL:-}
       PMOS_BOTS_URL: http://bots.pmos.internal:8750
-      PMOS_WEB_BOTS_TOKEN: ${PMOS_RT_WEB_TOKEN}
+      PMOS_WEB_BOTS_TOKEN: ${PMOS_RT_WEB_TOKEN:-}
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
       # Its own tool server token (the approvals routes only), not the service token.
-      PMOS_WEB_TOOLSERVER_TOKEN: ${PMOS_TS_WEB_TOKEN}
-      PMOS_ASSERTION_KEYS: web:bots:${PMOS_AK_WEB_BOTS},web:toolserver:${PMOS_AK_WEB_TOOLSERVER}
+      PMOS_WEB_TOOLSERVER_TOKEN: ${PMOS_TS_WEB_TOKEN:-}
+      PMOS_ASSERTION_KEYS: web:bots:${PMOS_AK_WEB_BOTS:-},web:toolserver:${PMOS_AK_WEB_TOOLSERVER:-}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       # The built app, baked into the image (deploy/Dockerfile).
       PMOS_WEB_STATIC_DIR: /usr/share/pmos/web

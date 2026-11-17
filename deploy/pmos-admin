@@ -64,6 +64,66 @@ console_checks() {
   fi
 }
 
+# A real value in deploy/.env: set, and not the `generated` placeholder setup.sh fills in.
+is_set() { [ -n "${!1:-}" ] && [ "${!1}" != generated ]; }
+
+# User assertions (docs/user-assertion.md, Modes), checked before anything (re)creates the
+# runtime or the tool server: `up`, `add-bot`, and the `up` after a `restore`. The mode lives in
+# deploy/.env (setup.sh writes `require`), never in one command's environment, so every path
+# starts them the same way. With a web or console token set, the services themselves refuse to
+# start in `off` or `verify` (unless PMOS_ASSERTION_INSECURE_OFF=1); this says so first, and
+# that each set client has its keys, so nothing is half-configured.
+assertion_checks() {
+  local mode="${PMOS_ASSERTION_MODE:-}" person=() k
+  for k in PMOS_RT_WEB_TOKEN PMOS_TS_WEB_TOKEN PMOS_RT_CONSOLE_TOKEN PMOS_CONSOLE_TS_TOKEN; do
+    if is_set "$k"; then person+=("$k"); fi
+  done
+  case "$mode" in
+    "" | off | verify | require) ;;
+    *) say "PMOS_ASSERTION_MODE=$mode in deploy/.env: use require (docs/user-assertion.md)" >&2; return 1 ;;
+  esac
+  if [ ${#person[@]} -gt 0 ] && [ -n "$mode" ] && [ "$mode" != require ]; then
+    if [ "${PMOS_ASSERTION_INSECURE_OFF:-}" = 1 ]; then
+      say "WARNING, INSECURE: PMOS_ASSERTION_MODE=$mode with ${person[*]} set and" >&2
+      say "PMOS_ASSERTION_INSECURE_OFF=1. Anyone holding those tokens can act as any PM." >&2
+      say "Development only, never production." >&2
+    else
+      say "PMOS_ASSERTION_MODE=$mode in deploy/.env, with ${person[*]} set: the runtime and the" >&2
+      say "tool server refuse to start like this. Set PMOS_ASSERTION_MODE=require in deploy/.env" >&2
+      say "(docs/user-assertion.md, Modes)." >&2
+      return 1
+    fi
+  fi
+  local pair effective
+  for pair in PMOS_RT_WEB_TOKEN:PMOS_AK_WEB_BOTS PMOS_TS_WEB_TOKEN:PMOS_AK_WEB_TOOLSERVER \
+    PMOS_RT_CONSOLE_TOKEN:PMOS_AK_CONSOLE_BOTS PMOS_CONSOLE_TS_TOKEN:PMOS_AK_CONSOLE_TOOLSERVER; do
+    if is_set "${pair%%:*}" && ! is_set "${pair##*:}"; then
+      say "${pair%%:*} is set but ${pair##*:} isn't: run deploy/setup.sh again to generate it" >&2
+      return 1
+    fi
+  done
+  if [ ${#person[@]} -gt 0 ]; then
+    effective=${mode:-require}
+  else
+    effective=${mode:-off}
+  fi
+  say "user assertions: $effective"
+}
+
+# Everything a client needs before its profile starts: `up --web` or `up --console`.
+client_settings() { # web|console
+  local k missing=()
+  case "$1" in
+    web) set -- PMOS_RT_WEB_TOKEN PMOS_TS_WEB_TOKEN PMOS_AK_WEB_BOTS PMOS_AK_WEB_TOOLSERVER ;;
+    console) set -- PMOS_RT_CONSOLE_TOKEN PMOS_CONSOLE_TS_TOKEN PMOS_AK_CONSOLE_BOTS PMOS_AK_CONSOLE_TOOLSERVER ;;
+  esac
+  for k in "$@"; do is_set "$k" || missing+=("$k"); done
+  if [ ${#missing[@]} -gt 0 ]; then
+    say "not set in deploy/.env: ${missing[*]}. Run deploy/setup.sh again to generate them." >&2
+    return 1
+  fi
+}
+
 # Is the web app's Entra sign-in fully set in deploy/.env? (pmos-web itself refuses a partial
 # one at start-up, naming what is missing.)
 entra_configured() {
@@ -187,15 +247,14 @@ case "$cmd" in
 
   up)
     for arg in "$@"; do
-      if [ "$arg" = --console ]; then console_checks || exit 2; fi
+      if [ "$arg" = --console ]; then
+        console_checks || exit 2
+        client_settings console || exit 2
+      fi
+      if [ "$arg" = --web ]; then client_settings web || exit 2; fi
     done
     mapfile -t prof < <(profiles "$@")
-    for arg in "$@"; do
-      # With the web app on, the runtime and the tool server refuse its calls (and the
-      # console's) that name a person without a valid user assertion (docs/user-assertion.md).
-      if [ "$arg" = --web ]; then export PMOS_ASSERTION_MODE="${PMOS_ASSERTION_MODE:-require}"; fi
-    done
-    say "user assertions: ${PMOS_ASSERTION_MODE:-off}"
+    assertion_checks || exit 2
     if [ -z "${PMOS_SLACK_APP_TOKEN:-}" ] || [ -z "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
       say "note: the Slack bot is off until PMOS_SLACK_APP_TOKEN and PMOS_SLACK_BOT_TOKEN are set"
     fi
@@ -267,6 +326,9 @@ case "$cmd" in
     [ $# -eq 1 ] && [ -d "$1" ] || { say "usage: pmos-admin restore <backup dir>" >&2; exit 2; }
     dir=$(cd "$1" && pwd)
     (cd "$dir" && sha256sum -c --quiet SHA256SUMS) || { say "the backup's checksums don't match; not restoring" >&2; exit 1; }
+    # The `up` that follows starts the services from deploy/.env: check now that it will
+    # start them with assertions as configured, before anything is stopped.
+    assertion_checks || exit 2
     say "This replaces every PM OS database with the backup in $dir."
     read -r -p "Type RESTORE to go on: " answer
     [ "$answer" = RESTORE ] || { say "stopped; nothing changed"; exit 1; }
@@ -340,10 +402,19 @@ for g in s["groups"]:
       say "$bot already has tokens"
       exit 0
     fi
+    # The runtime is recreated with deploy/.env as it is, assertions included: the web app and
+    # the console may be running against it. Checked before anything is written.
+    assertion_checks || exit 2
     rt=$(openssl rand -hex 24)
     gw=$(openssl rand -hex 24)
     set_env PMOS_RT_WORKER_TOKENS "${PMOS_RT_WORKER_TOKENS:+$PMOS_RT_WORKER_TOKENS,}worker-$bot=$rt"
     set_env PMOS_GW_BOT_TOKENS "${PMOS_GW_BOT_TOKENS:+$PMOS_GW_BOT_TOKENS,}bot-$bot=$gw"
+    # Read deploy/.env again: compose prefers this process's environment over --env-file, so
+    # the values sourced at the top would hide the new tokens.
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV"
+    set +a
     compose up -d bots gateway
     say "tokens added for $bot; the runtime and gateway were restarted with them."
     say "next: deploy/pmos-admin sandbox $bot"

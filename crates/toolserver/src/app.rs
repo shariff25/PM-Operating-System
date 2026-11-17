@@ -66,6 +66,7 @@ use crate::session::BOT_IDENTITY_PREFIX;
 use crate::store::StoreError;
 use crate::vault::Provider;
 use pmos_contract::bots::BotScope;
+use pmos_contract::Sensitivity;
 
 mod admin;
 
@@ -214,6 +215,7 @@ pub fn router_full(
         .route("/reindex", post(reindex))
         .route("/ledger/summary", get(ledger_summary))
         .route("/credentials", get(list_credentials))
+        .route("/runs/{run_id}/sensitivity", get(run_sensitivity))
         .layer(middleware::from_fn(orchestrator_only));
 
     // Any internal client; the bot is limited to its own skills inside each handler. Both
@@ -442,10 +444,12 @@ async fn check_assertion(
         .map(|u| u.0.clone())
         .unwrap_or_else(|| req.uri().clone());
     let is_decision = req.method() == axum::http::Method::POST && uri.path().ends_with("/decision");
+    let is_item_read = req.method() == axum::http::Method::GET && is_item_path(uri.path());
     let user = named_user(&uri);
     let Some(header) = req.headers().get(pmos_assertion::HEADER).cloned() else {
-        // A decision always names `decided_by`.
-        if assertions.mode() == Mode::Require && (user.is_some() || is_decision) {
+        // A decision always names `decided_by`. A read of one item always reads someone's
+        // item, so under `require` it needs an assertion even when it names no one (W3).
+        if assertions.mode() == Mode::Require && (user.is_some() || is_decision || is_item_read) {
             return Err(refuse_assertion(client, assertion::Refusal::Missing));
         }
         return Ok((req, None));
@@ -495,19 +499,21 @@ async fn check_assertion(
     ))
 }
 
+/// `/approvals/{id}` (with or without `/internal` or a trailing `/`): one item, not the list,
+/// its decision or its sources.
+fn is_item_path(path: &str) -> bool {
+    let path = path.strip_prefix("/internal").unwrap_or(path);
+    let path = path.strip_suffix('/').unwrap_or(path);
+    path.strip_prefix("/approvals/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
 /// The console reads approvals and nothing else: `GET /approvals` and
 /// `GET /approvals/{id}` under `/internal`.
 fn console_may_call(method: &axum::http::Method, path: &str) -> bool {
     let path = path.strip_prefix("/internal").unwrap_or(path);
     let path = path.strip_suffix('/').unwrap_or(path);
-    method == axum::http::Method::GET
-        && match path.strip_prefix("/approvals") {
-            Some("") => true,
-            Some(rest) => rest
-                .strip_prefix('/')
-                .is_some_and(|id| !id.is_empty() && !id.contains('/')),
-            None => false,
-        }
+    method == axum::http::Method::GET && (path == "/approvals" || is_item_path(path))
 }
 
 async fn orchestrator_only(req: Request, next: Next) -> Response {
@@ -556,7 +562,8 @@ async fn header_session(
     }
 }
 
-/// `{user, skill, run_id, ttl_minutes?}` or `{user, bot, run_id, ttl_minutes?}`.
+/// `{user, skill, run_id, ttl_minutes?, history_sensitivity?}` or
+/// `{user, bot, run_id, ttl_minutes?, history_sensitivity?}`.
 #[derive(Deserialize)]
 struct NewSession {
     user: String,
@@ -564,6 +571,21 @@ struct NewSession {
     bot: Option<String>,
     run_id: String,
     ttl_minutes: Option<i64>,
+    /// The highest level the run's conversation history was built from (the runtime sends
+    /// it for a task that carries earlier turns, W6). The session starts at it. It can only
+    /// raise the session, never lower it.
+    #[serde(default)]
+    history_sensitivity: Option<Sensitivity>,
+}
+
+/// `{run_id, sensitivity}`: the highest level the run's sessions reached, or `null` when no
+/// session of it is stored. Orchestrator only: the runtime records it per task when the task
+/// finishes, and starts a follow-up's session at it (W6).
+async fn run_sensitivity(State(state): State<AppState>, Path(run_id): Path<String>) -> Response {
+    match state.svc.run_sensitivity(&run_id).await {
+        Ok(level) => Json(json!({ "run_id": run_id, "sensitivity": level })).into_response(),
+        Err(e) => unavailable(e),
+    }
 }
 
 async fn create_session(
@@ -590,17 +612,18 @@ async fn create_session(
     let ttl = body
         .ttl_minutes
         .map(|m| Duration::minutes(m.clamp(1, 24 * 60)));
+    let floor = body.history_sensitivity.unwrap_or(Sensitivity::Public);
     let created = match (&body.skill, &body.bot) {
         (Some(skill), _) => {
             state
                 .svc
-                .create_session(&body.user, skill, &body.run_id, ttl, Utc::now())
+                .create_session_from(&body.user, skill, &body.run_id, ttl, floor, Utc::now())
                 .await
         }
         (None, Some(bot)) => {
             state
                 .svc
-                .create_bot_session(&body.user, bot, &body.run_id, ttl, Utc::now())
+                .create_bot_session_from(&body.user, bot, &body.run_id, ttl, floor, Utc::now())
                 .await
         }
         (None, None) => unreachable!("checked above"),
@@ -736,11 +759,14 @@ struct OneApprovalQuery {
     user: Option<String>,
 }
 
-/// One approval item. The orchestrator and the console read any item. The Slack bot and
-/// `pmos-web` must name the PM they act for, `?user=<handle>`: an item that isn't that team
-/// member's, or a read without `user`, is `404`, the same as a missing item, so they can't
-/// tell which ids exist. With a user assertion (`pmos-web`, the console), only the subject's
-/// own item is answered; anyone else's is `404` too.
+/// One approval item. The orchestrator reads any item. The Slack bot and `pmos-web` must
+/// name the PM they act for, `?user=<handle>`: an item that isn't that team member's, or a
+/// read without `user`, is `404`, the same as a missing item, so they can't tell which ids
+/// exist. With a user assertion (`pmos-web`, the console), only the subject's own item is
+/// answered; anyone else's is `404` too, except that the console's admin view may read any
+/// item when the subject is an admin in the tool server's own `team.yaml`. Under `require`
+/// a read from `pmos-web` or the console without an assertion never gets here (`401`); in
+/// `off` and `verify` the console's read-only token still reads any item by id.
 async fn get_approval(
     State(state): State<AppState>,
     Extension(client): Extension<Client>,
@@ -754,9 +780,22 @@ async fn get_approval(
     if must_name && !user.as_deref().is_some_and(|u| state.svc.team().allows(u)) {
         return not_found();
     }
+    // May the verified subject read `owner`'s item?
+    let subject_may_read = |owner: &str| match acting.0.as_deref() {
+        None => true,
+        Some(who) if who == owner => true,
+        Some(who) => {
+            client == Client::Console
+                && state
+                    .svc
+                    .team()
+                    .member(who)
+                    .is_some_and(|m| m.roles.contains(&pmos_contract::model::Role::Admin))
+        }
+    };
     match state.svc.approval(&id).await {
         Ok(Some(item)) if must_name && user.as_deref() != Some(item.user.as_str()) => not_found(),
-        Ok(Some(item)) if acting.0.as_ref().is_some_and(|who| *who != item.user) => not_found(),
+        Ok(Some(item)) if !subject_may_read(&item.user) => not_found(),
         Ok(Some(item)) => Json(state.svc.approval_json(&item).await).into_response(),
         Ok(None) => not_found(),
         Err(e) => unavailable(e),

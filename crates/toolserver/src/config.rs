@@ -199,7 +199,18 @@ impl Config {
         };
         let web_token = person_token("PMOS_WEB_TOKEN")?;
         let console_token = person_token("PMOS_CONSOLE_TS_TOKEN")?;
-        let assertions = Arc::new(Assertions::from_lookup(&get)?);
+        // A client that acts for a person makes `require` the default, and `off` or `verify`
+        // refuses to start without the development override (W2).
+        let person_clients: Vec<(&str, &str)> = [
+            web_token.as_ref().map(|_| ("web", "PMOS_WEB_TOKEN")),
+            console_token
+                .as_ref()
+                .map(|_| ("console", "PMOS_CONSOLE_TS_TOKEN")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let assertions = Arc::new(Assertions::from_lookup(&get, &person_clients)?);
         let bot_skills: Vec<String> = get("PMOS_BOT_SKILLS")
             .unwrap_or_else(|| "docs".into())
             .split([' ', ','])
@@ -492,7 +503,7 @@ mod tests {
         let web = "web-token-0123456789abcdef-01234567";
         let console = "console-token-0123456789abcdef-0123";
         let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
-        let keys = format!("web:toolserver:k1:{key}");
+        let keys = format!("web:toolserver:k1:{key},console:toolserver:c1:{key}");
         let base = [
             ("PMOS_SERVICE_TOKEN", TOKEN),
             ("PMOS_DEV", "1"),
@@ -522,6 +533,41 @@ mod tests {
         );
         let err = with(&[("PMOS_ASSERTION_MODE", "verify")]).unwrap_err();
         assert!(err.contains("PMOS_ASSERTION_KEYS"), "{err}");
+        // With a person client, `require` is the default (W2) ...
+        for token in [("PMOS_WEB_TOKEN", web), ("PMOS_CONSOLE_TS_TOKEN", console)] {
+            let ok = with(&[token, ("PMOS_ASSERTION_KEYS", &keys)]).unwrap();
+            assert_eq!(ok.assertions.mode(), crate::assertion::Mode::Require);
+            assert!(ok.assertions.insecure_warning().is_none());
+            // ... it needs keys ...
+            let err = with(&[token]).unwrap_err();
+            assert!(err.contains("PMOS_ASSERTION_KEYS"), "{err}");
+            // ... and `off` or `verify` refuses to start, naming the token and the fix.
+            for mode in ["off", "verify"] {
+                let err = with(&[
+                    token,
+                    ("PMOS_ASSERTION_MODE", mode),
+                    ("PMOS_ASSERTION_KEYS", &keys),
+                ])
+                .unwrap_err();
+                assert!(
+                    err.contains(token.0) && err.contains("PMOS_ASSERTION_INSECURE_OFF"),
+                    "{err}"
+                );
+            }
+        }
+        // Only the development override lets it start insecurely, with a warning to log.
+        let dev = with(&[
+            ("PMOS_WEB_TOKEN", web),
+            ("PMOS_ASSERTION_MODE", "off"),
+            ("PMOS_ASSERTION_INSECURE_OFF", "1"),
+        ])
+        .unwrap();
+        assert_eq!(dev.assertions.mode(), crate::assertion::Mode::Off);
+        assert!(dev
+            .assertions
+            .insecure_warning()
+            .unwrap()
+            .contains("INSECURE"));
         // Tokens are long and distinct.
         assert!(with(&[("PMOS_WEB_TOKEN", "short")])
             .unwrap_err()
@@ -545,9 +591,11 @@ mod tests {
             ("PMOS_CONNECTORS", "fake"),
         ];
         assert!(cfg(&base).unwrap().console_token.is_none());
+        let keys = "console:toolserver:c1:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
         let with = |token: &'static str| {
             let mut vars = base.to_vec();
             vars.push(("PMOS_CONSOLE_TS_TOKEN", token));
+            vars.push(("PMOS_ASSERTION_KEYS", keys));
             cfg(&vars)
         };
         let ok = with("console-token-0123456789abcdef-012").unwrap();

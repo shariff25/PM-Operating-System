@@ -50,6 +50,9 @@ decided since, and links PMs made since.
    deploy/pmos-admin restore deploy/backups/<time>
    ```
    Type `RESTORE` when asked. The services are stopped while it runs; Postgres stays up.
+   Before it stops anything it checks the user-assertion settings in `deploy/.env` (as `up`
+   and `add-bot` do), so the `up` below starts the runtime and the tool server in `require`
+   (`docs/user-assertion.md`, Modes).
 4. **Start the stack again and check it:**
    ```sh
    deploy/pmos-admin up --models
