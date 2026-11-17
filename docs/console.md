@@ -28,16 +28,20 @@ width.
 | | Admin (`admin` in `team.yaml`) | PM |
 | --- | --- | --- |
 | Bots | every bot | team bots, and their own personal bots |
-| Routines | everyone's, and may pause, resume or delete any | their own |
+| Routines | everyone's, and may pause, resume or delete any; another member's prompt reads "text hidden" | their own |
 | Approvals | every member's pending items | their own |
-| Activity and task pages | every task | tasks they asked for (`requested_by`) |
+| Activity and task pages | every task; in the list, another member's ask reads "text hidden", and their task's page shows it in full | tasks they asked for (`requested_by`) |
 
-Someone else's task or routine answers `404`, so the console doesn't confirm it exists. The
-console's runtime token may read and change everything, so these checks are made in the
-console before any call: a PM's routine action is checked against their own routines first.
-With assertion keys (`PMOS_ASSERTION_KEYS`, `docs/user-assertion.md`), every call that names
-a person, and every routine pause, resume and delete, also carries a signed user assertion
-for that person or for the viewer who acted.
+Someone else's task or routine answers `404`, so the console doesn't confirm it exists. These
+checks are made in the console before any call (a PM's routine action is checked against
+their own routines first), and again by the runtime. With assertion keys
+(`PMOS_ASSERTION_KEYS`, `docs/user-assertion.md`), every runtime call carries a signed user
+assertion for the viewer, and under `require` the runtime refuses any console call without
+one. It answers from the viewer it names, in its own `team.yaml` (R1): a PM gets only their
+own tasks and routines; an admin gets everyone's, with the ask, result and prompt of anyone
+else's left out (metadata only: ids, bot, status, times, who asked). Tool-server calls carry
+one for the PM whose inbox is read. If the tool server ever cuts an inbox at its safety cap
+(more than 1,000 pending drafts), the Approvals screen says so for that member, with the total.
 
 ## Sign-in
 
@@ -155,12 +159,10 @@ results.
 All runtime calls carry the `console` client token. Tool server calls carry the tool
 server's own `console` token (`PMOS_CONSOLE_TS_TOKEN` there), which may read approvals
 (`GET /internal/approvals`, `GET /internal/approvals/{id}`) and nothing else. With assertion
-keys, a call that names a person (`requested_by=`,
-`owner=`, `user=`) carries an assertion for that person, and a routine `PATCH` or `DELETE` one
-for the viewer who pressed the button. A task page's three reads (the task, its events, its
-trace) carry one for the viewer: under `require` the runtime answers them only for the task's
-PM or an admin in its `team.yaml`. Reads of everything (bots, the task list, routines) carry
-none. Every route but `GET /healthz` needs the proxy secret when the console trusts the proxy,
+keys, every runtime call (bots, the task and routine lists, a task page's three reads, a
+routine `PATCH` or `DELETE`) carries an assertion for the viewer, and a tool-server call one
+for the PM it names (`user=`). Under `require` the runtime answers a task page only for the
+task's PM or an admin in its `team.yaml`, and the lists as **Who sees what** says. Every route but `GET /healthz` needs the proxy secret when the console trusts the proxy,
 whatever the method; a state-changing form needs `Origin` or `Referer` from the console's
 own origin, and one with neither is refused.
 Each call times out after 10 seconds. If an upstream is down, the screen says which one, with

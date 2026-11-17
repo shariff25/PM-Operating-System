@@ -467,6 +467,40 @@ async fn approvals_list_newest_first_and_filter(b: &Backend) {
         now() + Duration::seconds(1),
         "the oldest is the one left out"
     );
+
+    // R12: the inbox never hides a pending item behind that cap. With every one of dee's
+    // `LIST_LIMIT + 1` items pending, and three of them then decided, the inbox has every
+    // pending one, newest first, and the decided ones apart.
+    let inbox = a.inbox("dee", 10_000, 2).await.unwrap();
+    assert_eq!(inbox.pending.len(), limit + 1);
+    assert_eq!(inbox.total_pending, limit + 1);
+    assert!(!inbox.truncated());
+    let oldest = inbox.pending.last().unwrap().clone();
+    assert_eq!(
+        oldest.created_at,
+        now(),
+        "the oldest pending draft is there"
+    );
+    for item in inbox.pending.iter().take(3) {
+        a.decide(&item.id, "dee", Decision::Reject, None, now())
+            .await
+            .unwrap();
+    }
+    let inbox = a.inbox("dee", 10_000, 2).await.unwrap();
+    assert_eq!(inbox.pending.len(), limit - 2);
+    assert!(inbox.pending.iter().all(|i| i.status == Status::Pending));
+    assert!(inbox
+        .pending
+        .windows(2)
+        .all(|w| w[0].created_at > w[1].created_at));
+    assert_eq!(inbox.decided.len(), 2, "decided items are capped");
+    assert!(inbox.decided.iter().all(|i| i.status == Status::Rejected));
+    // Past the safety cap: truncated, with the total.
+    let inbox = a.inbox("dee", 5, 0).await.unwrap();
+    assert_eq!(inbox.pending.len(), 5);
+    assert_eq!(inbox.total_pending, limit - 2);
+    assert!(inbox.truncated());
+    assert!(inbox.decided.is_empty());
 }
 
 async fn decisions_follow_the_rules(b: &Backend) {
@@ -903,6 +937,7 @@ async fn ledger_rows_record_every_outcome(b: &Backend) {
             args: None,
             reason: Some(Reason::WrongFacts),
             confirm_external: false,
+            expected_args_hash: None,
         },
         decided,
     )
@@ -922,6 +957,7 @@ async fn ledger_rows_record_every_outcome(b: &Backend) {
             args: None,
             reason: Some(Reason::Tone),
             confirm_external: false,
+            expected_args_hash: None,
         },
         decided,
     )
@@ -1032,6 +1068,7 @@ async fn ledger_reads_filter_and_order(b: &Backend) {
             args: None,
             reason: Some(Reason::Tone),
             confirm_external: false,
+            expected_args_hash: None,
         },
         t(30),
     )
@@ -1152,6 +1189,7 @@ async fn ledger_rows_follow_concurrent_decisions(b: &Backend) {
                     args: None,
                     reason: Some(Reason::Incomplete),
                     confirm_external: false,
+                    expected_args_hash: None,
                 }
             };
             approvals

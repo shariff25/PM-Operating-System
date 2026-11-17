@@ -114,6 +114,10 @@ pub struct Task {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+    /// The highest data class the task's sessions read, once it finished (or its floor
+    /// before then): `public`, `internal` or `restricted`.
+    #[serde(default)]
+    pub sources_sensitivity: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,6 +142,10 @@ pub struct Approval {
     pub tool: String,
     #[serde(default)]
     pub args: Value,
+    /// The tool server's hash of `args`: an approve names it (`expected_args_hash`), so the
+    /// tool server refuses it as `stale` if the draft changed since this read.
+    #[serde(default)]
+    pub args_hash: String,
     pub status: String,
     #[serde(default)]
     pub created_at: String,
@@ -221,6 +229,41 @@ pub struct DecisionBody {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub confirm_external: bool,
+    /// The `args_hash` of the draft as the PM was shown it: the tool server refuses the
+    /// decision as `409 stale` if the item holds other arguments now. Required on `approve`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_args_hash: Option<String>,
+}
+
+/// One PM's inbox as the tool server lists it: every pending item (and the newest decided
+/// ones), and `truncated` if it ever left pending items out past its safety cap.
+#[derive(Debug, Clone, Default)]
+pub struct Inbox {
+    pub items: Vec<Approval>,
+    pub truncated: bool,
+    pub total_pending: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum InboxWire {
+    Paged {
+        items: Vec<Approval>,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        total_pending: Option<usize>,
+    },
+    Bare(Vec<Approval>),
+}
+
+/// Where the text of a saved edit came from, when a bot wrote it (an accepted suggestion):
+/// the revision task, and the level the runtime recorded for it. The tool server raises the
+/// draft's level to what its own sessions for that run read; the level here is only a floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revision {
+    pub run_id: String,
+    pub sensitivity: Option<String>,
 }
 
 /// How long an assertion lives. The receiver allows a few seconds of clock skew on top.
@@ -535,17 +578,30 @@ impl Runtime {
 
     /// `POST /v1/tasks` for `user`, with `source: "web"`.
     pub async fn create_task(&self, user: &str, bot: &str, text: &str) -> UpstreamResult<Task> {
+        self.create_task_at(user, bot, text, None).await
+    }
+
+    /// [`Self::create_task`] whose session starts at least at `floor` (`public`, `internal`
+    /// or `restricted`): a revision of a draft, whose prompt carries the draft's text at the
+    /// draft's level.
+    pub async fn create_task_at(
+        &self,
+        user: &str,
+        bot: &str,
+        text: &str,
+        floor: Option<&str>,
+    ) -> UpstreamResult<Task> {
         let url = self.0.url(&["v1", "tasks"])?;
+        let mut body = json!({
+            "bot": bot, "requested_by": user, "text": text, "source": "web",
+        });
+        if let Some(floor) = floor {
+            body["sensitivity_floor"] = json!(floor);
+        }
         let res = self
             .0
             .send(
-                self.0
-                    .http
-                    .post(url)
-                    .header(USER_HEADER, user)
-                    .json(&json!({
-                        "bot": bot, "requested_by": user, "text": text, "source": "web",
-                    })),
+                self.0.http.post(url).header(USER_HEADER, user).json(&body),
                 Some(user),
             )
             .await?;
@@ -601,14 +657,28 @@ impl ToolServer {
         Self(c)
     }
 
-    /// Every item in `user`'s inbox, newest first.
-    pub async fn approvals(&self, user: &str) -> UpstreamResult<Vec<Approval>> {
+    /// `user`'s inbox, newest first: every pending item, and the newest decided ones.
+    pub async fn approvals(&self, user: &str) -> UpstreamResult<Inbox> {
         let url = self.0.url(&["internal", "approvals"])?;
         let res = self
             .0
             .send(self.0.http.get(url).query(&[("user", user)]), Some(user))
             .await?;
-        Ok(self.0.read::<List<Approval>>(res).await?.into_vec())
+        Ok(match self.0.read::<InboxWire>(res).await? {
+            InboxWire::Bare(items) => Inbox {
+                items,
+                ..Inbox::default()
+            },
+            InboxWire::Paged {
+                items,
+                truncated,
+                total_pending,
+            } => Inbox {
+                items,
+                truncated,
+                total_pending,
+            },
+        })
     }
 
     /// One item of `user`'s, `?user=<handle>`, with an assertion for them: the tool server
@@ -635,16 +705,28 @@ impl ToolServer {
     /// Save `user`'s edit of their pending item `id`: `PUT /internal/approvals/{id}/draft
     /// ?user=<handle>` `{"args": …}`, with an assertion for them. The tool server keeps it on
     /// the item, so the Slack card and the console show it and an approve anywhere writes it.
-    pub async fn save_draft(&self, user: &str, id: &str, args: &Value) -> UpstreamResult<Approval> {
+    ///
+    /// Text a bot revised (`revision`) names its run, so the tool server raises the draft's
+    /// level to what that run read; text the PM typed names none.
+    pub async fn save_draft(
+        &self,
+        user: &str,
+        id: &str,
+        args: &Value,
+        revision: Option<&Revision>,
+    ) -> UpstreamResult<Approval> {
         let url = self.0.url(&["internal", "approvals", id, "draft"])?;
+        let mut body = json!({ "args": args });
+        if let Some(r) = revision {
+            body["revision_run"] = json!(r.run_id);
+            if let Some(level) = &r.sensitivity {
+                body["revision_sensitivity"] = json!(level);
+            }
+        }
         let res = self
             .0
             .send(
-                self.0
-                    .http
-                    .put(url)
-                    .query(&[("user", user)])
-                    .json(&json!({ "args": args })),
+                self.0.http.put(url).query(&[("user", user)]).json(&body),
                 Some(user),
             )
             .await?;

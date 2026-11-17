@@ -135,10 +135,14 @@ for mode in off verify; do
   done
   grep -q '^PMOS_RT_WORKER_TOKENS=$' "$WORK/stack/deploy/.env" || fail "a refused add-bot wrote tokens"
 done
-# ... unless the development override is set, and then it says so.
+# ... and the development override doesn't change that here (R3): it is for fake-data
+# development stacks only, and production compose doesn't pass it.
 stack_env off PMOS_ASSERTION_INSECURE_OFF=1
-out=$(run_stack up 2>&1)
-[[ "$out" == *"INSECURE"* ]] || fail "the insecure override isn't announced: $out"
+code=0
+out=$(run_stack up 2>&1) || code=$?
+[ "$code" = 2 ] || fail "up with PMOS_ASSERTION_MODE=off and the override exits $code, not 2"
+[[ "$out" == *"fake-data"* ]] || fail "the refused override isn't explained: $out"
+[ ! -s "$DOCKER_LOG" ] || fail "up with the override called docker: $(cat "$DOCKER_LOG")"
 # A client set up without its keys is refused (nothing half-configured).
 stack_env require
 sed -i '/^PMOS_AK_WEB_BOTS=/d' "$WORK/stack/deploy/.env"
@@ -183,6 +187,13 @@ if docker compose version >/dev/null 2>&1; then
   done
   [[ "$full" == *'console=test-'* && "$full" == *'web=test-'* ]] ||
     fail "the runtime's tokens lack web= or console="
+  # Production compose never passes the development override (R3), even when set.
+  echo "PMOS_ASSERTION_INSECURE_OFF=1" >>"$WORK/full.env"
+  full=$(render "$WORK/full.env" --profile web --profile console --profile slack) ||
+    fail "compose doesn't render with the override in deploy/.env"
+  [[ "$full" != *"PMOS_ASSERTION_INSECURE_OFF"* ]] ||
+    fail "deploy/compose.yaml passes PMOS_ASSERTION_INSECURE_OFF"
+  sed -i '/^PMOS_ASSERTION_INSECURE_OFF=/d' "$WORK/full.env"
   # The default profile with only the core settings: no web, console or assertion settings
   # are needed, and none is half there (C9).
   grep -vE '^PMOS_(RT_WEB_TOKEN|TS_WEB_TOKEN|RT_CONSOLE_TOKEN|CONSOLE_TS_TOKEN|AK_[A-Z_]+|ASSERTION_MODE|WEB_BRIEF_TOKEN|CONSOLE_PROXY_SECRET)=' \

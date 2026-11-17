@@ -582,7 +582,24 @@ async fn every_approvals_route_and_method_allows_exactly_what_each_client_needs(
             &[("GET", "item"), ("GET", "list")],
         ),
     ];
+    // R14: the saved-edit route too, and each signing client once more without its assertion
+    // (under `require` it then reaches nothing that names the PM).
+    let clients = clients
+        .into_iter()
+        .flat_map(|(name, token, signer, expected)| {
+            let unsigned = signer.as_ref().map(|_| (name, token, None, &[][..]));
+            std::iter::once((name, token, signer, expected)).chain(unsigned)
+        });
     for (name, token, signer, expected) in clients {
+        let expected: Vec<(&str, &str)> = {
+            let mut e = expected.to_vec();
+            // `PUT …/draft`: the orchestrator and a signed `pmos-web` only.
+            if signer.as_ref().is_some_and(|s| s.issuer == "web") || name == "orchestrator" {
+                e.push(("PUT", "draft"));
+            }
+            e.sort();
+            e
+        };
         // A fresh server each, since an allowed decision closes the item.
         let srv = start(Mode::Require).await;
         let routes = [
@@ -595,6 +612,11 @@ async fn every_approvals_route_and_method_allows_exactly_what_each_client_needs(
                 "sources",
                 format!("/internal/approvals/{}/sources?user={SLACK_PM}", srv.mine),
             ),
+            // Before the decision, which closes the item.
+            (
+                "draft",
+                format!("/internal/approvals/{}/draft?user={SLACK_PM}", srv.mine),
+            ),
             (
                 "decision",
                 format!("/internal/approvals/{}/decision", srv.mine),
@@ -603,7 +625,15 @@ async fn every_approvals_route_and_method_allows_exactly_what_each_client_needs(
         let mut allowed = Vec::new();
         for (route, target) in &routes {
             for method in METHODS {
-                let body = (method != "GET" && method != "DELETE").then(|| reject(SLACK_PM));
+                let body = (method != "GET" && method != "DELETE").then(|| {
+                    if *route == "draft" {
+                        serde_json::to_vec(&json!({"args": {"channel": SLACK_ALL_TEAM,
+                            "thread_ts": "1731600000.000100", "text": "Saved."}}))
+                        .unwrap()
+                    } else {
+                        reject(SLACK_PM)
+                    }
+                });
                 let a = signer.as_ref().map(|s| {
                     s.sign(
                         SLACK_PM,
@@ -629,7 +659,61 @@ async fn every_approvals_route_and_method_allows_exactly_what_each_client_needs(
             }
         }
         allowed.sort();
-        assert_eq!(allowed, expected.to_vec(), "{name}");
+        assert_eq!(allowed, expected, "{name}, signed: {}", signer.is_some());
+    }
+}
+
+/// R12: an inbox listing never hides a pending draft behind the cap on decided ones: more than
+/// `LIST_LIMIT` pending items all come back, with `truncated: false` and `total_pending`, to
+/// every client that lists the inbox (the orchestrator, `pmos-web`, the console).
+#[tokio::test]
+async fn every_pending_item_is_listed_past_the_decided_cap() {
+    let srv = start(Mode::Require).await;
+    let limit = pmos_toolserver::approvals::LIST_LIMIT;
+    let args = json!({"space": "PM", "title": "Plan", "body": "x"});
+    let t0 = Utc::now() - Duration::hours(1);
+    for i in 0..limit + 5 {
+        srv._f
+            .stores
+            .approvals
+            .create(
+                pmos_toolserver::approvals::NewItem {
+                    user: SLACK_PM,
+                    skill: Some("reply-test"),
+                    bot: None,
+                    run_id: "tsk_many",
+                    tool: "confluence.create_draft",
+                    args: &args,
+                    content_sha: None,
+                    model_alias: None,
+                    sources_sensitivity: pmos_contract::Sensitivity::Internal,
+                },
+                t0 + Duration::seconds(i as i64),
+            )
+            .await
+            .unwrap();
+    }
+    // `limit + 5` from here, plus the reply draft `start` made.
+    let want = limit + 6;
+    for target in [
+        format!("/internal/approvals?user={SLACK_PM}"),
+        list_target(SLACK_PM),
+    ] {
+        let (s, v) = srv.get(&target, SERVICE_TOKEN, None).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["items"].as_array().unwrap().len(), want, "{target}");
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["total_pending"], want);
+        for (token, signer) in [
+            (WEB_TOKEN, Signer::web()),
+            (CONSOLE_TOKEN, Signer::console()),
+        ] {
+            let a = signer.sign(SLACK_PM, "GET", &target, b"");
+            let (s, v) = srv.get(&target, token, Some(&a)).await;
+            assert_eq!(s, 200, "{v}");
+            assert_eq!(v["items"].as_array().unwrap().len(), want);
+            assert_eq!(v["total_pending"], want);
+        }
     }
 }
 

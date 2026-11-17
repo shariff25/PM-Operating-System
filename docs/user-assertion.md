@@ -277,13 +277,19 @@ with a client that acts for a person configured (the tool server: `PMOS_WEB_TOKE
 - needs a key for each such client in `PMOS_ASSERTION_KEYS` (`web:<aud>`, `console:<aud>`), or
   refuses to start naming the setting and the missing pair;
 - refuses to start in `off` or `verify`, naming the token and the fix, unless
-  `PMOS_ASSERTION_INSECURE_OFF=1`. That override is for development only, **never
-  production**: anyone holding the client's token can then act as any PM. Every start-up
-  with it logs a line beginning `INSECURE` at error level.
+  `PMOS_ASSERTION_INSECURE_OFF=1`. That override is for **fake-data development stacks
+  only**: anyone holding the client's token can then act as any PM. Every start-up with it
+  logs a line beginning `INSECURE` at error level.
+- refuses the override itself, and so refuses to start, on anything that holds real data:
+  `PMOS_CONNECTORS=live`, or a database URL (`PMOS_DATABASE_URL`, `PMOS_BOTS_DATABASE_URL`) set
+  without `PMOS_DEV=1` (`pmos_assertion::receiver::real_data`). The production
+  `deploy/compose.yaml` doesn't pass the override at all, and `pmos-admin` refuses `off` or
+  `verify` with a web or console token set whether or not it is in `deploy/.env`. The eval
+  stack (`deploy/compose.evals.yaml`: memory stores, fake data, `PMOS_DEV=1`) keeps it.
 
-Without such a client, an unset mode is `off`, as before. To roll out in steps on an existing
-install, `verify` with the override for a short while is still possible; `require` is where
-it must end. `verify` and `require` refuse to start without at least one key. The Slack client,
+Without such a client, an unset mode is `off`, as before. `require` is where every install
+with the web app or the console runs; there is no override for a production one. `verify` and
+`require` refuse to start without at least one key. The Slack client,
 workers, evals, the orchestrator's service token and the Slack bot's token are never checked,
 in any mode.
 
@@ -303,14 +309,15 @@ The mode, the start-up rule, the refusals and the verifier are shared code
   reaches only the approvals routes and the read-only admin routes (`GET /internal/admin/*`:
   the audit log, which accounts members have linked as booleans, connector status, overview
   counts). Each admin call names the viewer (`user=`) and is signed as them.
-- **The console** signs every call that names a person, as that person: one PM's tasks
-  (`requested_by=`), routines (`owner=`) and pending approvals (`user=`). Routine pause, resume
-  and delete name no one and are signed as the viewer who made them (an admin acting on
-  someone else's routine signs as the admin). One task's detail, events and trace (the task
-  page) are signed as the viewer, and the runtime answers only the task's PM or an admin in
-  its own `team.yaml`. Reads of everything (the bot list, the list of all tasks, all routines)
-  carry none. For an admin's
-  view of every inbox it signs as each member whose inbox it reads. Its `sid` is the fixed
+- **The console** signs every runtime call as its viewer: the bot list, the task and routine
+  lists, one task's detail, events and trace, and routine pause, resume and delete (an admin
+  acting on someone else's routine signs as the admin). Under `require` the runtime refuses an
+  unsigned console call. From the viewer it decides what they see (R1): a non-admin gets only
+  their own tasks and routines; an admin (in the runtime's own `team.yaml`) gets everyone's,
+  with the ask, result, error, checklist and prompt of anyone else's left out (`hidden: true`;
+  the console shows "text hidden"); one task's page answers its PM or an admin; a cancel is the
+  task's PM's or an admin's, recorded as them. To the tool server it signs as the PM whose
+  inbox it reads: for an admin's view of every inbox, as each member in turn. Its `sid` is the fixed
   `unknown`: the SSO proxy's session isn't visible to it. It calls the tool server with its own
   token (`PMOS_CONSOLE_TS_TOKEN` there), which may only read approvals.
 - **The runtime** checks calls from `web` and `console`: the policy for each allows exactly one
@@ -362,8 +369,8 @@ The mode, the start-up rule, the refusals and the verifier are shared code
   another container's environment, has every key, and the assertion stops nothing.
 - **Within its scope, a caller still acts as freely as before:** `web` creates `web` tasks
   and decides approvals for the person it signs for (an edit may change a draft's text, never
-  where it goes: `422 target_changed`), and the console still reads everything
-  with its runtime token and pauses any routine (those name no one).
+  where it goes: `422 target_changed`), and the console reads, pauses and cancels what its
+  signed viewer may.
 - **One item read by the console:** under `require` it needs an assertion for the item's PM
   or an admin; in `off` and `verify` (only with the development override once the console is
   configured) it still reads any item by id. The same holds for one task's detail, events,
@@ -371,9 +378,11 @@ The mode, the start-up rule, the refusals and the verifier are shared code
   (`?user=`, else `404`), so every `pmos-web` read of one item (`ToolServer::approval_for`:
   the first read when a draft is opened and the re-read after a conflicting decision) names
   the PM and is signed for them.
-- **What the console still sees on its token alone:** the list of every task (who asked,
-  which bot, status, times, and the fields the list carries), every routine, and the bot
-  roster. It signs as each member whose inbox an admin views.
+- **What the console sees on its token alone:** under `require`, nothing (every call needs
+  the viewer's assertion). In `off` and `verify` (only with the development override once the
+  console is configured), an unsigned list is metadata for everyone: who asked, which bot,
+  status and times, never an ask, a result or a routine prompt; it can't cancel. It signs as
+  each member whose inbox an admin views.
 - **Replicas and restarts:** the replay cache is per process (see **Replay protection**). It
   is a `MemoryReplayCache` in each receiver. The `ReplayGuard` trait is synchronous, so a
   Postgres-backed guard would have to block an async runtime thread on every assertion; that
@@ -438,10 +447,12 @@ Roll out in this order: shared pieces, then callers sending, then receivers enfo
 
 - [x] Do the same for calls made for the console viewer, with `iss=console`. This covers
       routine pause, resume and delete, task cancel, and anything that names `decided_by`.
-      The console signs every call that names a person, as that person, and routine changes
-      as the viewer; it decides nothing and cancels nothing today.
-- [x] For reads that are "read everything" (no person), send no assertion. Those reads stay on
-      the console token alone.
+      The console signs every runtime call as its viewer, and every tool-server call that
+      names a person as that person; it decides nothing and cancels nothing today.
+- [x] ~~For reads that are "read everything" (no person), send no assertion.~~ Replaced (R1):
+      there are no reads of everything any more. Every runtime call is signed for the viewer,
+      and the runtime answers what that viewer may see (others' tasks and routines as
+      metadata, for an admin only).
 
 **Bot runtime (receiver, `aud=bots`)**
 

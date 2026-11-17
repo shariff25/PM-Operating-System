@@ -395,12 +395,22 @@ async fn workers_are_held_to_their_claim(env: &Env) {
     let (status, _) = env
         .post(
             &format!("/v1/tasks/{tid}/cancel"),
+            "slack",
+            Some("ana"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 409, "already cancelled");
+    // The console cancels only signed for a viewer (R1), in every mode.
+    let (status, _) = env
+        .post(
+            &format!("/v1/tasks/{tid}/cancel"),
             "console",
             None,
             json!({}),
         )
         .await;
-    assert_eq!(status, 409, "already cancelled");
+    assert_eq!(status, 403, "an unsigned console cancel");
     let (status, _) = env
         .post(
             "/v1/worker/tasks/tsk_nope/heartbeat",
@@ -1512,11 +1522,13 @@ async fn every_endpoint_checks_the_client() {
             json!(null),
             &["slack", "web", "console"],
         ),
+        // The console cancels only signed for a viewer (R1): unsigned, as here, it is `403`.
+        // `tests/assertion.rs` checks it signed.
         (
             Method::POST,
             format!("/v1/tasks/{tid}/cancel"),
             json!({}),
-            &["slack", "web", "console"],
+            &["slack", "web"],
         ),
     ];
     for (method, path, body, allowed) in &rows {
@@ -1614,6 +1626,55 @@ async fn every_endpoint_checks_the_client() {
     // Health needs no token.
     let (status, _) = env.get("/healthz", "none", None).await;
     assert_eq!(status, 200);
+    env.finish().await;
+}
+
+/// R2 (W6 for revisions): the web client may give a task outside any conversation a
+/// sensitivity floor (a draft's revision, whose prompt holds the draft's text). The task's
+/// session starts there; no other client, and no task in a conversation, may set one.
+#[tokio::test]
+async fn a_revision_task_starts_its_session_at_its_floor() {
+    let env = Env::memory().await;
+    let task = |extra: Value| {
+        let mut body = json!({"bot": "docs", "requested_by": "ana", "text": "Revise: …",
+                              "source": "web", "sensitivity_floor": "restricted"});
+        if let (Some(b), Value::Object(extra)) = (body.as_object_mut(), extra) {
+            b.extend(extra);
+        }
+        body
+    };
+    let (status, t) = env
+        .post("/v1/tasks", "web", Some("ana"), task(json!({})))
+        .await;
+    assert_eq!(status, 201, "{t}");
+    assert_eq!(t["sources_sensitivity"], "restricted");
+    let (status, claim) = env.claim().await;
+    assert_eq!(status, 200, "{claim}");
+    let sessions = env.ts.sessions.lock().unwrap().clone();
+    assert_eq!(
+        sessions.last().unwrap()["history_sensitivity"],
+        "restricted",
+        "{sessions:?}"
+    );
+    // Not in a conversation, and not from Slack.
+    let (status, _) = env
+        .post(
+            "/v1/tasks",
+            "web",
+            Some("ana"),
+            task(json!({"conversation": "cnv_1"})),
+        )
+        .await;
+    assert_eq!(status, 403);
+    let (status, _) = env
+        .post(
+            "/v1/tasks",
+            "slack",
+            Some("ana"),
+            task(json!({"source": "slack"})),
+        )
+        .await;
+    assert_eq!(status, 403);
     env.finish().await;
 }
 

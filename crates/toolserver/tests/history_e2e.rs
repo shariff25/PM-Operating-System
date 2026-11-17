@@ -30,6 +30,7 @@ fn task(text: &str, conversation: &str) -> NewTask {
         slack: None,
         level: None,
         conversation: Some(conversation.into()),
+        sensitivity_floor: None,
     }
 }
 

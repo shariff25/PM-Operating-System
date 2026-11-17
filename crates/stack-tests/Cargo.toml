@@ -1,0 +1,27 @@
+[package]
+name = "pmos-stack-tests"
+description = "Test-only: the bot runtime, the tool server and pmos-web together, in one process"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version = "1.88"
+
+# Nothing ships from here: the crate exists for `tests/stack.rs`, which needs all three
+# services' crates at once.
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+axum.workspace = true
+chrono.workspace = true
+pmos-assertion.workspace = true
+pmos-bots = { path = "../bots" }
+pmos-toolserver = { path = "../toolserver" }
+pmos-web = { path = "../web" }
+reqwest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+walkdir.workspace = true

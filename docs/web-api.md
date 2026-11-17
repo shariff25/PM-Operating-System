@@ -140,12 +140,12 @@ document.
 
 | Method and path | Body | Answer |
 | --- | --- | --- |
-| `GET /api/drafts` | | `{drafts: [DraftSummary]}`, newest first; pending ones, then the 20 most recently decided |
+| `GET /api/drafts` | | `{drafts: [DraftSummary], truncated, total_pending?}`, newest first; every pending one, then the 20 most recently decided. `truncated` is `true` only if the tool server left pending drafts out past its safety cap (1,000), and `total_pending` then says how many there are |
 | `GET /api/drafts/{id}` | | `Draft` |
 | `PUT /api/drafts/{id}` | `{title?, body}` | `Draft`, with `edited: true` and a new `version`. Saves the PM's edit **on the draft itself, at the tool server**: the Slack card and the console show it from then on, and approving anywhere (here, the Slack card, the console) writes it. Nothing is sent to the target system. A `title` is kept only for drafts that have one (Confluence pages, Jira issues); without one the saved title stays. Citation markers in `title` or `body` are removed before it is saved (see **Citations**). `409 not_pending` once decided, `409 expired` for an expired Slack draft, `422 bad_edit` if the tool server refuses the edited text for its target. A practice draft's edit stays in `pmos-web`. |
 | `POST /api/drafts/{id}/changes` | `{instruction}` | `202 {suggestion: Suggestion}`. Asks the bot to revise the draft. One at a time: `409 change_in_progress`. |
 | `GET /api/drafts/{id}/suggestion` | | `{suggestion: Suggestion \| null}` |
-| `POST /api/drafts/{id}/suggestion/accept` | | `Draft`, with the suggested text as its body, saved as an edit is (`PUT` above): at the tool server, so every surface shows it |
+| `POST /api/drafts/{id}/suggestion/accept` | | `Draft`, with the suggested text as its body, saved as an edit is (`PUT` above): at the tool server, so every surface shows it. The save names the revision task, so the tool server raises the draft's sensitivity to what that task read (it never lowers it): a revision that read a restricted document can't then be posted to a channel with people outside the team (`409 audience_blocked`). The revision task itself starts at the draft's own level |
 | `POST /api/drafts/{id}/suggestion/reject` | | `Draft`, unchanged |
 | `POST /api/drafts/{id}/approve` | `{confirm_external?: bool, version?: string}` | `Draft` with `status: "approved"` and `result_url`. Refusals (nothing was sent): `409 needs_external_confirm`, `409 audience_blocked`, `409 expired`, `409 not_pending`, `409 stale`, `409 not_approvable`, `422 bad_edit`, `503 audience_unavailable`, `503 unavailable`, `403 not_a_member`. **Outcome unknown:** `502` or `504 unknown_outcome` (see **Error codes**). |
 | `POST /api/drafts/{id}/reject` | `{reason?}` | `Draft` with `status: "rejected"`. `reason` is one of `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft`, `other`. The same refusals and `unknown_outcome` as approve, where they apply. |
@@ -186,7 +186,10 @@ document.
   draft the PM was looking at in the approve body. When it is sent and does not match the stored
   draft, the server answers `409 stale` and publishes nothing; the app reloads the draft and
   tells the PM to read it again. A server that does not set `version` ignores the field, and an
-  approve without it skips the check. If the draft was approved elsewhere (the Slack card) with
+  approve without it skips this check. Either way the backend tells the tool server the
+  `args_hash` of the draft it just checked (`expected_args_hash`), so a save that lands between
+  that check and the decision (another tab) is refused there too, atomically, and answered
+  `409 stale`. If the draft was approved elsewhere (the Slack card) with
   the very text of that `version`, by the same PM, the approve answers the approved draft (`200`,
   `status: "approved"`) and sends nothing; approved elsewhere with other text, or rejected, it is
   `409 not_pending`. Either way the app should show the draft as decided.

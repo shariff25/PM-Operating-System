@@ -43,7 +43,8 @@ fn jira(id: &str, user: &str, h: i64) -> Value {
     )
 }
 
-/// The block ids of a view's tick boxes.
+/// The block ids of a view's tick boxes, without the args hash each carries (R5), which is
+/// checked to be what the row showed.
 fn picks(published: &Value) -> Vec<String> {
     published["view"]["blocks"]
         .as_array()
@@ -51,7 +52,11 @@ fn picks(published: &Value) -> Vec<String> {
         .iter()
         .filter_map(|b| b["block_id"].as_str())
         .filter(|b| b.starts_with("pick_"))
-        .map(String::from)
+        .map(|b| {
+            let (pick, hash) = b.split_once(':').expect("a row carries its args hash");
+            assert_eq!(hash, support::SHOWN);
+            pick.to_string()
+        })
         .collect()
 }
 
@@ -187,7 +192,11 @@ async fn ticking_two_and_approving_decides_both() {
     assert_eq!(decisions.len(), 2);
     for ((id, body), want) in decisions.iter().zip(["apr_a1", "apr_a2"]) {
         assert_eq!(id, want);
-        assert_eq!(body, &json!({"decided_by": "ana", "decision": "approve"}));
+        assert_eq!(
+            body,
+            &json!({"decided_by": "ana", "decision": "approve",
+                    "expected_args_hash": support::SHOWN})
+        );
     }
     let s = view_text(&after);
     assert!(
@@ -218,6 +227,63 @@ async fn ticking_two_and_approving_decides_both() {
         stack.slack.calls("chat.update").is_empty(),
         "only views.publish"
     );
+    stack.stop().await;
+}
+
+/// R5: **Approve selected** approves each draft as its row showed it. One changed since the
+/// view was published is refused as `stale` by the tool server; a row from a view published
+/// before rows carried the hash is skipped without a call. Both are reported as changed.
+#[tokio::test]
+async fn approve_selected_skips_drafts_changed_since_the_view() {
+    let stack = Stack::new().await;
+    stack.tools.items.lock().unwrap().extend([
+        jira("apr_a1", "ana", 3),
+        jira("apr_a2", "ana", 2),
+        jira("apr_a3", "ana", 1),
+    ]);
+    stack.send(home_opened("e1", "Ev1", "U0ANA", None)).await;
+    let mut inbox = stack.published(1).await;
+    // apr_a2 is edited in the web app after the view was published.
+    for item in stack.tools.items.lock().unwrap().iter_mut() {
+        if item["id"] == "apr_a2" {
+            item["args_hash"] = json!("f".repeat(64));
+        }
+    }
+    // apr_a3's row is as an older release published it: no hash.
+    for b in inbox["view"]["blocks"].as_array_mut().unwrap() {
+        if b["block_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("pick_apr_a3"))
+        {
+            b["block_id"] = json!("pick_apr_a3");
+        }
+    }
+    stack
+        .send(home_click(
+            "e2",
+            "U0ANA",
+            "home_approve",
+            &inbox,
+            &["apr_a1", "apr_a2", "apr_a3"],
+        ))
+        .await;
+    let s = view_text(&stack.published(2).await);
+    assert!(
+        s.contains(":white_check_mark: 1 approved or posted."),
+        "{s}"
+    );
+    assert!(
+        s.contains("2 changed since you looked, so they were not approved. Open each to review."),
+        "{s}"
+    );
+    let decisions = stack.tools.decisions.lock().unwrap().clone();
+    let ids: Vec<&str> = decisions.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["apr_a1", "apr_a2"], "apr_a3 was never sent");
+    let items = stack.tools.items.lock().unwrap().clone();
+    let status = |id: &str| items.iter().find(|i| i["id"] == id).unwrap()["status"].clone();
+    assert_eq!(status("apr_a1"), "approved");
+    assert_eq!(status("apr_a2"), "pending");
+    assert_eq!(status("apr_a3"), "pending");
     stack.stop().await;
 }
 

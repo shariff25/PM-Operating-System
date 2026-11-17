@@ -447,6 +447,19 @@ pub fn approval_changed(item: &Value, web: Option<&str>) -> (String, Value) {
     (text, Value::Array(blocks))
 }
 
+/// The card again, for a card that doesn't say what text it showed (posted before cards
+/// carried the args hash, or a confirmation card without it): nothing was approved, and the
+/// text as it is now is shown to approve.
+pub fn approval_reshown(item: &Value, web: Option<&str>) -> (String, Value) {
+    let (text, blocks) = approval_card(item, web);
+    let mut blocks = blocks.as_array().cloned().unwrap_or_default();
+    blocks.push(context(
+        ":arrows_counterclockwise: This card is from an older version of PM OS, so nothing was \
+         approved. Here is the text as it is now: read it, then approve.",
+    ));
+    (text, Value::Array(blocks))
+}
+
 /// "edited by Ana", when a person changed the bot's text (a saved edit or an edit), for the
 /// card's context line.
 fn edited_note(item: &Value) -> Option<String> {
@@ -888,10 +901,22 @@ pub fn reply_confirm_external(item: &Value, edited: bool) -> (String, Value) {
     shown["audience"]["external"] = json!(true);
     let mut blocks = approval_head(&shown);
     blocks.push(section(&line));
-    blocks.push(
-        json!({"type": "actions", "block_id": format!("external:{id}"), "elements": elements}),
-    );
+    // Like an approval card's, the buttons carry the start of the args hash of the text shown
+    // (not after an edit, whose own text is what posts): the confirmation approves exactly it.
+    let block_id = match shown_hash(item).filter(|_| !edited) {
+        Some(hash) => format!("external:{id}:{hash}"),
+        None => format!("external:{id}"),
+    };
+    blocks.push(json!({"type": "actions", "block_id": block_id, "elements": elements}));
     (truncate(&line, 300), Value::Array(blocks))
+}
+
+/// The args hash start a **Post to external channel** card was posted with
+/// (`external:<id>:<hash>`); `None` for one from before it carried it, or after an edit.
+pub fn confirmed_hash(block_id: &str) -> Option<&str> {
+    let rest = block_id.strip_prefix("external:")?;
+    let (_, hash) = rest.split_once(':')?;
+    (hash.len() == SHOWN_HASH_LEN && hash.chars().all(|c| c.is_ascii_hexdigit())).then_some(hash)
 }
 
 /// **Snooze**'s choices in place, each `(code, label)`, and **Back**. With none left before

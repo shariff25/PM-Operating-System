@@ -324,6 +324,70 @@ async fn the_web_token_reaches_the_admin_reads_and_nothing_more() {
     srv.stop().await;
 }
 
+/// R14: every `/internal/admin/*` route × method × client token under `require`, with and
+/// without `pmos-web`'s user assertion: exactly the orchestrator and a signed `pmos-web` get
+/// past the auth layers (not `401`, `403` or `405`), on the four reads (`GET`) and the
+/// proposal record (`POST`); everything else is refused. A route or method that widens a
+/// client fails here.
+#[tokio::test]
+async fn every_admin_route_method_and_token_under_require() {
+    let srv = start(Mode::Require, false).await.unwrap();
+    const METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+    let routes = ["audit", "accounts", "connectors", "overview", "proposals"];
+    let mut expected_reach: Vec<(&str, &str)> = ROUTES.iter().map(|r| ("GET", *r)).collect();
+    expected_reach.push(("POST", "proposals"));
+    expected_reach.sort();
+    let clients: [(&str, Option<&str>, bool, bool); 7] = [
+        ("orchestrator", Some(SERVICE_TOKEN), false, true),
+        ("web, signed", Some(WEB_TOKEN), true, true),
+        ("web, unsigned", Some(WEB_TOKEN), false, false),
+        ("slack bot", Some(BOT_TOKEN), false, false),
+        (
+            "slack bot, with a web assertion",
+            Some(BOT_TOKEN),
+            true,
+            false,
+        ),
+        ("console", Some(CONSOLE_TOKEN), true, false),
+        ("no token", None, false, false),
+    ];
+    for (name, token, signed, reaches) in clients {
+        let mut reached = Vec::new();
+        for route in routes {
+            let target = format!("/internal/admin/{route}?user=ada");
+            for method in METHODS {
+                let a = signed.then(|| sign("ada", method, &target));
+                let (s, v) = srv
+                    .send(
+                        Method::from_bytes(method.as_bytes()).unwrap(),
+                        &target,
+                        token,
+                        a.as_deref(),
+                    )
+                    .await;
+                match s {
+                    401 | 403 | 405 => {}
+                    _ => reached.push((method, route)),
+                }
+                if !reaches {
+                    assert!(
+                        matches!(s, 401 | 403 | 405),
+                        "{name} {method} {route}: {s} {v}"
+                    );
+                }
+            }
+        }
+        reached.sort();
+        let want = if reaches {
+            expected_reach.clone()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(reached, want, "{name}");
+    }
+    srv.stop().await;
+}
+
 #[tokio::test]
 async fn the_viewer_must_be_the_assertions_subject() {
     let srv = start(Mode::Require, false).await.unwrap();

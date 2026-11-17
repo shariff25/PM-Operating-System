@@ -28,7 +28,7 @@ use crate::blocks::escape;
 use crate::bots::{Bots, Click, Dm};
 use crate::cards::{self, action};
 use crate::runtime::RuntimeError;
-use crate::toolserver::CallError;
+use crate::toolserver::{CallError, Seen};
 use crate::triage::local_time;
 
 /// How Slack finds the routine: its prompt starts with this.
@@ -677,10 +677,30 @@ impl Bots {
             cards::approval_closed(&shown, ":hourglass_flowing_sand: Posting…"),
         )
         .await;
+        // An approve sends what the confirmation card showed (R4, R5). A card that doesn't
+        // carry it, or whose text has changed since, approves nothing: it is shown again.
+        let shown_hash = click.block_id.as_deref().and_then(cards::confirmed_hash);
+        if !edited {
+            let now = cards::shown_hash(&item);
+            if shown_hash.is_none() || shown_hash != now {
+                tracing::info!(approval = %id, "external confirmation was stale or unversioned; shown again");
+                let card = if shown_hash.is_none() {
+                    cards::approval_reshown(&item, self.web_url())
+                } else {
+                    cards::approval_changed(&item, self.web_url())
+                };
+                self.update(&click.channel, &click.message_ts, card).await;
+                return;
+            }
+        }
         let decision = if edited { "edit" } else { "approve" };
+        let seen = Seen {
+            args_hash: shown_hash.filter(|_| !edited),
+            confirm_external: true,
+        };
         let outcome = self
             .toolserver()
-            .decide(&id, &handle, decision, args, None, true)
+            .decide(&id, &handle, decision, args, None, seen)
             .await;
         self.show_decision(
             &click.channel,
