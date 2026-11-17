@@ -37,19 +37,21 @@ docs server.
 **At start-up, the runtime:**
 1. Lints `PMOS_CONTENT_ROOT` with the same lint CI runs (`pmos_contract::lint`), and refuses
    to start on any error. Warnings are counted in the log; `pmos lint` lists them.
-2. Loads the bots, their roles and skills, `tools.yaml` and `team.yaml`. Later changes are
-   picked up without a restart (see **Content changes**).
-3. Recovers tasks the last process left `working` (see **Durability**), and runs once any
+2. Loads the bots, their roles and skills, and `tools.yaml`. Later changes are picked up
+   without a restart (see **Content changes**).
+3. Starts polling the tool server's user directory (see **Who may ask**). Until the first
+   answer nobody may ask (`503`) and `/readyz` says `directory: down`.
+4. Recovers tasks the last process left `working` (see **Durability**), and runs once any
    routine that came due while it was down.
 
 ## Content changes
 
-Every 30 seconds the runtime checks a fingerprint of `team.yaml`, `tools.yaml`, `bots/**`,
-`roles/**` and `skills/**` under `PMOS_CONTENT_ROOT` (paths, sizes and modification times).
-When it changes:
+Every 30 seconds the runtime checks a fingerprint of `team.yaml` (only because the lint's
+bot-owner check still reads it, until slice U7; it decides nothing here), `tools.yaml`,
+`bots/**`, `roles/**` and `skills/**` under `PMOS_CONTENT_ROOT` (paths, sizes and
+modification times). When it changes:
 - **The tree passes the lint:** it is loaded again, and the new catalog replaces the old one
-  in one step. A new bot shows up in `GET /v1/bots` and can take tasks; a member added to
-  `team.yaml` can use the team bots.
+  in one step. A new bot shows up in `GET /v1/bots` and can take tasks.
 - **The tree fails the lint:** the catalog already loaded stays, and the errors are logged
   once (`content changed but fails the lint; keeping the old catalog`). The next change is
   checked again.
@@ -101,9 +103,9 @@ providers, regenerate the policies (the old files are `policy-orphan`), and rest
 | `PMOS_BOTS_DATABASE_URL` | required | Postgres. Not needed with `PMOS_DEV=1`, which keeps everything in memory. |
 | `PMOS_DEV` | off | `1`: the memory store |
 | `PMOS_BOTS_BIND` | `127.0.0.1:8750` | |
-| `PMOS_CONTENT_ROOT` | `content` | Bots, roles, skills, `tools.yaml`, `team.yaml` |
+| `PMOS_CONTENT_ROOT` | `content` | Bots, roles, skills, `tools.yaml` |
 | `PMOS_TOOLSERVER_URL` | required | The tool server's origin, such as `http://127.0.0.1:8710` |
-| `PMOS_SERVICE_TOKEN` | required | The tool server's orchestrator token: it creates bot sessions and reads approvals |
+| `PMOS_SERVICE_TOKEN` | required | The tool server's orchestrator token: it creates bot sessions, reads approvals and reads the user directory (`GET /internal/directory`) |
 | `PMOS_GATEWAY_URL` | required | The gateway's OpenAI base, ending in `/v1` (as the harness uses it) |
 | `PMOS_GATEWAY_TOKEN` | required | This service's client token in the gateway's `PMOS_GATEWAY_TOKENS` |
 | `PMOS_EVALS_AS` | `evals` | Comma-separated handles the `evals` client may request tasks as; any other is `403`. Eval tasks may not name a Slack target (`400`) and send no notifications |
@@ -125,10 +127,33 @@ it may do. Anything else is `403`.
 - **The Slack and web clients act for one PM per call**, named in `X-Pmos-User` (a PM OS handle). The
   call is `400` without it. Another PM's task or routine answers `404`, the same as one that
   doesn't exist.
-- **Who may use a bot:** a personal bot serves its owner only; a team bot serves the members
-  of `team.yaml`. A task or routine for anyone else is `403`, with the reason.
+- **Who may use a bot:** someone who may ask (below); then a personal bot serves its owner
+  only and a team bot serves everyone who may ask. A task or routine for anyone else is
+  `403`, with the reason.
 - **The console** may only switch `enabled` on a routine. Its schedule and prompt are the
   owner's to change, in Slack.
+
+## Who may ask
+
+Who exists, their status and their roles come from the PM OS user database
+(`docs/user-database-spec.md` §2, slice U4a), never from `team.yaml`. The runtime polls the
+tool server's `GET /internal/directory` every 10 seconds with its orchestrator token and
+`If-None-Match` (a `304` confirms the snapshot it holds), through the shared
+`pmos-directory` crate. A failed poll keeps the last snapshot **and its age**, so an outage
+only narrows what anyone may do.
+
+**May ask:** an active user holding `pm`, `reviewer` or `admin` (the `ask-bot` permission).
+An Auditor-only person can't ask, and a deactivated person's kept roles grant nothing.
+
+| Decision | Snapshot at most | Older, or none yet |
+| --- | --- | --- |
+| Queue an ask (`POST /v1/tasks`, every client) | 5 minutes (the task still needs a tool server session, which decides afresh) | `503` |
+| Parse or create a routine; set a PM's level | 30 seconds | `503` |
+| A routine falls due: run it, or pause it with the reason if its owner may no longer ask | 5 minutes | This run is skipped (the routine stays on, its next run is scheduled) and logged |
+| Pause a deactivated (or no longer allowed) owner's routines, with the "paused" note | 30 seconds; on each new snapshot and every 30-second tick | Waits for a fresh one |
+| The console's admin check (another PM's task, events, trace, drafts, cancel, routines) | 30 seconds | Not an admin: the viewer's own tasks and routines only |
+
+`/readyz` reports `directory: ok` only with a snapshot at most 30 seconds old.
 
 ## Tasks
 ```
@@ -289,11 +314,12 @@ call. The console reads them with `GET /v1/tasks/{id}/trace`.
 
 ## Health and shutdown
 - **`GET /healthz`:** the process is up.
-- **`GET /readyz`:** `200` when all three checks pass, `503` otherwise, with
-  `{"ready", "checks": {storage, toolserver, gateway}}`:
+- **`GET /readyz`:** `200` when all four checks pass, `503` otherwise, with
+  `{"ready", "checks": {storage, toolserver, gateway, directory}}`:
   - **storage:** the store answers within 2 seconds;
   - **toolserver:** the tool server's `/readyz` is `200`;
-  - **gateway:** `GET {PMOS_GATEWAY_URL}/models` is `200` with this service's token.
+  - **gateway:** `GET {PMOS_GATEWAY_URL}/models` is `200` with this service's token;
+  - **directory:** the user directory snapshot is at most 30 seconds old (**Who may ask**).
 - **SIGTERM** (or Ctrl-C): long-polls return at once (`204`, or an empty page), the
   background loops stop, and in-flight requests finish before the process exits. A task a
   worker was running keeps its lease and is recovered by the next process if the worker

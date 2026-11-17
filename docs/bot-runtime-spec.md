@@ -132,7 +132,8 @@ what the runtime does with it:
   and the header, if sent, must agree.
 - **The console** signs every call for its viewer, and under `require` every console call
   needs that assertion (`401` without). What the viewer gets depends on who they are, judged
-  by the runtime's own `team.yaml` (the assertion's roles don't count):
+  by the user directory on a snapshot at most 30 seconds old, else as a non-admin (slice U4a;
+  the assertion's roles don't count):
   - **Lists** (`GET /v1/tasks`, `GET /v1/routines`): a non-admin gets only their own; a
     `requested_by` or `owner` naming anyone else is `401`. An admin gets everyone's. Only the
     viewer's own come in full: anyone else's task is metadata (`id`, `bot`, `requested_by`,
