@@ -159,13 +159,14 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /readyz` | none | Readiness: `200` when storage answers within a second and every connector's own dependency (the docs server) answers; `503` otherwise, naming the check that failed |
 | `POST /mcp` (Streamable HTTP) | `Bearer <session token>` | MCP for the harness: `tools/list`, `tools/call` |
 | `POST /internal/sessions` `{user, skill, run_id, ttl_minutes?}` | service or bot token | Create a session; returns `token` and the session's tools. `403` if the user isn't in `team.yaml` (live connectors), or the bot asks for a skill outside `PMOS_BOT_SKILLS`. |
-| `POST /internal/sessions` `{user, bot, run_id, ttl_minutes?}` | service token | Create a bot session (see **Bot sessions**). Send `skill` or `bot`, never both (`400`). `404` for an unknown bot; `403` if `user` may not use it. |
+| `POST /internal/sessions` `{user, bot, run_id, ttl_minutes?, history_sensitivity?}` | service token | Create a bot session (see **Bot sessions**). Send `skill` or `bot`, never both (`400`). `404` for an unknown bot; `403` if `user` may not use it. `history_sensitivity` (`public`, `internal` or `restricted`; anything else is refused) starts the session at that level: see **Conversation history**. |
+| `GET /internal/runs/{run_id}/sensitivity` | service token | `{run_id, sensitivity}`: the highest level any stored session of that run reached, or `null` when none is stored (never made, or purged after it expired). The runtime records it on each finished task. |
 | `DELETE /internal/session` + `X-Pmos-Session` | service or bot token | Revoke a session (sandbox ended) |
 | `POST /internal/call` + `X-Pmos-Session` `{tool, args}` | service or bot token | One tool call for the session, with the same rules as MCP: allowlist, argument checks, approvals for writes, audit (which records the caller). |
 | `POST /internal/grants` `{session_token, tool, args}` | service token | Record an approval given in the harness |
-| `GET /internal/approvals?user=&status=` | service, web or console token | `{items: […]}`: a PM's inbox, newest first. `status` is `pending`, `executing`, `approved`, `rejected`, `failed` or `expired` (`400` for anything else) |
+| `GET /internal/approvals?user=&status=` | service, web or console token | `{items: […]}`: a PM's inbox, newest first (ties by id), at most the newest 200 (`approvals::LIST_LIMIT`; an older item is still read by its id). `status` is `pending`, `executing`, `approved`, `rejected`, `failed` or `expired` (`400` for anything else) |
 | `GET /internal/approvals?user=` | bot token | The App Home Inbox: `{approvals: […], total}`, only `pending` items whatever `status` says, oldest first, at most 50. Each item reads as `GET /internal/approvals/{id}` returns it; `total` counts every pending item. `403` if `user` isn't a team member (live connectors) or is a team bot's identity; `400` without `user` |
-| `GET /internal/approvals/{id}` | service or console token | One item (with a console user assertion, only the subject's own: anyone else's is `404`): `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity` and `redacted_at`; plus, when known, `expires_at`, `target_url` and `external` (see **What an item is shown with**). Listings and decision answers carry the same fields |
+| `GET /internal/approvals/{id}` | service or console token | One item (from the console: under `require` only with a user assertion, and then only the subject's own unless the subject is an admin in `team.yaml`; anything else is `404`): `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity` and `redacted_at`; plus, when known, `expires_at`, `target_url` and `external` (see **What an item is shown with**). Listings and decision answers carry the same fields |
 | `GET /internal/approvals/{id}?user=<handle>` | bot or web token | The same item, for the PM the client acts for. `404 {error: "no such approval item"}` without `user`, when `user` isn't a team member, when the item isn't `user`'s, or when there is no such item: the client can't tell which ids exist. With the web token, the user assertion must name `user` |
 | `GET /internal/approvals/{id}/sources?user=` | service or web token | What the run that drafted the item read: `{sources: [{system, title, url, ref, cite, tool, read_at}], available, truncated}`. `user` is required (`400`) and must be the item's user: anyone else's item, or a missing one, is `404`. See **What an item is shown with** |
 | `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?}` | service, bot or web token | `approve`, `edit` (with `args`) or `reject`. `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. From the bot or web token, an `edit` that changes where the draft goes is `422 target_changed` (see **How a write gets approved**). An internal failure is `500` with a generic `error`. |
@@ -235,9 +236,14 @@ bot and console tokens get `403`).
 - **Console token** (`PMOS_CONSOLE_TS_TOKEN`, optional): the web console, read-only.
   `GET /internal/approvals?user=` and `GET /internal/approvals/{id}`, answered as for the
   service token (`{items: […]}` and the item; no `user` needed for one item); every other
-  route (sources and decisions included) is `403`, and an unknown token `401`. With a
-  console user assertion, a list names that person and one item must be theirs. The console
-  is given it as its `PMOS_TOOLSERVER_TOKEN`; the audit records it as `console`.
+  route (sources and decisions included) is `403`, and an unknown token `401`. A decision
+  from it is refused by the service as well (`decide_verdict`), so no later route can widen
+  it. With a console user assertion, a list names that person, and one item must be theirs
+  or the subject must be an admin in the tool server's own `team.yaml` (the admin view; the
+  assertion's roles don't count). Under `require`, its read of one item needs that
+  assertion. The console is given it as its `PMOS_TOOLSERVER_TOKEN`; the audit records it as
+  `console`. `tests/approvals_assertion.rs` checks every approvals route and method for each
+  token against the exact set allowed, so a new route can't silently widen a client.
 - **Session token:** each sandbox gets only its own.
 
 ### Approvals auth: user assertions
@@ -247,9 +253,14 @@ only as `PMOS_ASSERTION_MODE` allows (`docs/user-assertion.md`):
 
 | Mode | A valid `X-Pmos-Assertion` | A bad one | None |
 | --- | --- | --- | --- |
-| `off` (default) | ignored | ignored | `user=` and `decided_by` believed, as before |
+| `off` | ignored | ignored | `user=` and `decided_by` believed, as before |
 | `verify` | checked | `401` | believed, as before |
-| `require` | checked | `401` | `401` for any call that names a person: a list, sources, a decision, and a web read of one item |
+| `require` | checked | `401` | `401` for any call that names a person (a list, sources, a decision) and for any read of one item, web or console |
+
+- **Secure by default:** with `PMOS_WEB_TOKEN` or `PMOS_CONSOLE_TS_TOKEN` set, an unset mode is
+  `require`, each set token needs its key, and `off` or `verify` refuse to start unless
+  `PMOS_ASSERTION_INSECURE_OFF=1` (development only, logged as `INSECURE` at error level on
+  every start). With neither token, an unset mode is `off`.
 
 - **Checked:** the signature with the `web:toolserver` or `console:toolserver` key from
   `PMOS_ASSERTION_KEYS`, the issuer (the client whose token was presented: the web token
@@ -257,8 +268,10 @@ only as `PMOS_ASSERTION_MODE` allows (`docs/user-assertion.md`):
   (method, path and query as received, raw body) and the nonce (once per process).
 - **Names:** the subject must equal `user=` and `decided_by`. From the web token,
   `GET /internal/approvals/{id}` must name its PM (`?user=`), so it is checked like the rest;
-  from the console token it may name no one and then needs no assertion. With one, an item
-  that isn't the subject's is `404`.
+  from the console token it may name no one, but under `require` it still needs an assertion.
+  With one, an item that isn't the subject's is `404`, except to the console when the subject
+  is an admin in `team.yaml`. In `off` and `verify`, the console's unsigned read of one item
+  still reads any item.
 - **Answer:** every failure is `401 {"code": "bad_assertion"}`; the log has the client and the
   kind of failure, never the assertion, a key or a handle.
 - **Not checked:** the service token and the bot token, in every mode. The runtime's approval
@@ -437,6 +450,22 @@ Spec: `docs/bot-runtime-spec.md` §2.
 
 Sessions, approval items and audit events record either `skill` or `bot`, never both; a bot
 session's `skill` is `null`.
+
+### Conversation history
+
+A follow-up task in a conversation replays earlier answers to the model
+(`docs/bot-runtime-spec.md` §3, Conversations). Those answers may carry what the earlier tasks
+read, so the follow-up's session must not start at `public`:
+
+- The runtime reads each finished task's level (`GET /internal/runs/{task id}/sensitivity`)
+  and stores it; for a new task with history, it sends the highest level of the replayed turns
+  as `history_sensitivity` (an unknown one as `restricted`).
+- The session starts at it (`sources_sensitivity`), and only rises from there. Every draft the
+  session makes records it, so a Slack draft to a channel with someone outside the team, or a
+  Slack Connect channel, is `409 audience_blocked` when the history was restricted, though
+  the session read nothing itself.
+- Only the runtime (the service token) sets it; the worker in the sandbox never sees or sends
+  it. `tests/history_e2e.rs` runs the runtime against a real tool server for this case.
 
 **Who a bot reads and writes as.**
 - **Personal bots** read as their owner, with the owner's linked accounts and no scope.
@@ -969,7 +998,8 @@ cargo run -p pmos-toolserver
 | `PMOS_CONSOLE_TS_TOKEN` | none | The web console's own read-only token (approvals only): at least 32 characters and different from every other token. The console gets it as `PMOS_TOOLSERVER_TOKEN` |
 | `PMOS_BOT_SKILLS` | `docs` | Skills the bot may start sessions for |
 | `PMOS_WEB_TOKEN` | none | `pmos-web`'s own token, for the approvals routes and the read-only admin routes. At least 32 characters, different from every other token |
-| `PMOS_ASSERTION_MODE` | `off` | `off`, `verify` or `require`: see **Approvals auth: user assertions**. `verify` and `require` refuse to start without keys |
+| `PMOS_ASSERTION_MODE` | `require` with `PMOS_WEB_TOKEN` or `PMOS_CONSOLE_TS_TOKEN` set, else `off` | `off`, `verify` or `require`: see **Approvals auth: user assertions**. `verify` and `require` refuse to start without a key for each set token; `off` and `verify` refuse to start with either token set |
+| `PMOS_ASSERTION_INSECURE_OFF` | none | `1`: DEVELOPMENT ONLY, never production. Lets the tool server start in `off` or `verify` with a web or console token set; logs `INSECURE` at error level |
 | `PMOS_ASSERTION_KEYS` | none | `web:toolserver:<kid>:<base64>[:<kid>:<base64>],console:toolserver:…` (`docs/user-assertion.md`, Keys). A malformed list, a key under 32 bytes, or another service's pair refuses to start, in every mode |
 | `PMOS_CONNECTORS` | required | `live` for real Atlassian and Slack with each PM's own token, and only people in `team.yaml` may have sessions; `fake` for fixture data (dev, tests, and everything before Gate 1), with `team.yaml` not enforced |
 | `PMOS_DATABASE_URL` | required | Postgres for every store. `PMOS_DEV=1` without it keeps everything in memory. |

@@ -56,6 +56,16 @@ export const ClaimSchema = z.object({
    * same PM and bot), oldest first. Empty for a first message; an older runtime sends none.
    */
   history: z.array(TurnSchema).default([]),
+  /**
+   * The highest data class those earlier turns were built from. The tool server already
+   * started this task's session at it, so the worker can neither raise nor lower what the
+   * audience check sees; it only tells the model. Null without history; an older runtime
+   * sends none. An unknown value reads as "restricted".
+   */
+  history_sensitivity: z
+    .enum(["public", "internal", "restricted"])
+    .nullish()
+    .catch("restricted"),
 });
 
 export type Claim = z.infer<typeof ClaimSchema>;

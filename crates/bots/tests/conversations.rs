@@ -271,7 +271,78 @@ async fn history_is_bounded_and_long_results_cut(env: &Env) {
     assert_eq!(cut.len(), TURN_FIELD_BYTES + TRUNCATED.len());
 }
 
+/// The session of a follow-up starts at the highest level its replayed turns reached (W6):
+/// the runtime records each task's level from the tool server when it finishes, and sends it
+/// when it opens the next session in the same conversation. Unknown counts as restricted.
+async fn a_follow_up_session_starts_at_its_historys_level(env: &Env) {
+    // Task 1 reads something restricted.
+    let t1 = ask(
+        env,
+        "ana",
+        "docs",
+        "1731.9",
+        "What does the Globex NDA say?",
+    )
+    .await;
+    env.ts
+        .run_levels
+        .lock()
+        .unwrap()
+        .insert(t1.clone(), Some("restricted".into()));
+    let first = run(env, "Under the NDA, ...").await;
+    assert_eq!(first["history_sensitivity"], Value::Null);
+    let (_, task) = env.get(&format!("/v1/tasks/{t1}"), "console", None).await;
+    assert_eq!(task["sources_sensitivity"], "restricted", "{task}");
+
+    // Task 2, same thread: its session starts restricted, and the claim says so.
+    ask(
+        env,
+        "ana",
+        "docs",
+        "1731.9",
+        "Post that to #field-questions",
+    )
+    .await;
+    let second = run(env, "Drafted.").await;
+    assert_eq!(second["history_sensitivity"], "restricted");
+    let sessions = env.ts.sessions.lock().unwrap().clone();
+    assert_eq!(
+        sessions.last().unwrap()["history_sensitivity"],
+        "restricted",
+        "{sessions:?}"
+    );
+    // The first session had no history, so no level was sent.
+    assert!(sessions[0].get("history_sensitivity").is_none());
+
+    // Another thread starts fresh.
+    ask(env, "ana", "docs", "1731.10", "Something public").await;
+    run(env, "ok").await;
+    ask(env, "ana", "docs", "1731.10", "and more").await;
+    let fresh = run(env, "ok").await;
+    assert_eq!(fresh["history_sensitivity"], "public");
+    assert_eq!(
+        env.ts.sessions.lock().unwrap().last().unwrap()["history_sensitivity"],
+        "public"
+    );
+
+    // When the tool server can't say what a task read, it is recorded as restricted.
+    let t5 = ask(env, "ana", "docs", "1731.11", "q").await;
+    *env.ts.runs_down.lock().unwrap() = true;
+    run(env, "a").await;
+    *env.ts.runs_down.lock().unwrap() = false;
+    let (_, task) = env.get(&format!("/v1/tasks/{t5}"), "console", None).await;
+    assert_eq!(task["sources_sensitivity"], "restricted");
+    let t6 = ask(env, "ana", "docs", "1731.12", "q").await;
+    env.ts.run_levels.lock().unwrap().insert(t6.clone(), None);
+    run(env, "a").await;
+    let (_, task) = env.get(&format!("/v1/tasks/{t6}"), "console", None).await;
+    assert_eq!(task["sources_sensitivity"], "restricted");
+    ask(env, "ana", "docs", "1731.12", "follow-up").await;
+    assert_eq!(run(env, "b").await["history_sensitivity"], "restricted");
+}
+
 both_envs!(
+    a_follow_up_session_starts_at_its_historys_level,
     a_follow_up_carries_the_earlier_turns,
     other_threads_people_and_bots_get_nothing,
     web_conversations_are_named_by_the_client,

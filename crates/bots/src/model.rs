@@ -3,6 +3,7 @@
 //! them, so a field is only ever added, never renamed.
 
 use chrono::{DateTime, SubsecRound, Utc};
+pub use pmos_contract::Sensitivity;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -194,6 +195,13 @@ pub struct Task {
     /// the same bot (spec §3, Conversations).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// The highest data class the task's tool-server sessions read, recorded when its worker
+    /// finishes it (spec §3, Conversations). A follow-up in the same conversation starts its
+    /// session at least here, since its history replays this task's answer. `None`: not
+    /// recorded (still running, recovered after a lost lease, or from before this field),
+    /// which a follow-up reads as `restricted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources_sensitivity: Option<Sensitivity>,
     pub attempts: i32,
     /// The worker holding the current claim, while `working`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -232,6 +240,7 @@ impl Task {
             routine_id,
             level: None,
             conversation: None,
+            sources_sensitivity: None,
             attempts: 0,
             worker: None,
             lease_until: None,

@@ -559,6 +559,44 @@ describe("a conversation's earlier turns", () => {
     expect(botSystemPrompt(first)).not.toContain("This conversation");
   });
 
+  it("reads the history's level from the claim, and tells the model when it is restricted", () => {
+    const RESTRICTED = "Earlier answers in this conversation drew on restricted sources.";
+    const restricted = ClaimSchema.parse({
+      ...claim("tsk_r", { text: "post that" }),
+      history: turns,
+      history_sensitivity: "restricted",
+    });
+    expect(restricted.history_sensitivity).toBe("restricted");
+    expect(botSystemPrompt(restricted)).toContain(RESTRICTED);
+    const internal = ClaimSchema.parse({
+      ...claim("tsk_i"),
+      history: turns,
+      history_sensitivity: "internal",
+    });
+    expect(botSystemPrompt(internal)).not.toContain(RESTRICTED);
+    // An older runtime sends none; a value the harness doesn't know reads as restricted.
+    expect(followUp(turns).history_sensitivity).toBeUndefined();
+    const odd = ClaimSchema.parse({ ...claim("tsk_o"), history: turns, history_sensitivity: "secret" });
+    expect(odd.history_sensitivity).toBe("restricted");
+  });
+
+  it("never lowers or reports the history's level: the tool server applies it", async () => {
+    const model = new ScriptedModel([new AIMessage("Drafted.")]);
+    const { runtime } = await setup({
+      claims: [
+        {
+          ...claim("tsk_lvl", { text: "post that" }),
+          history: turns.slice(0, 1),
+          history_sensitivity: "restricted",
+        },
+      ],
+      models: { tsk_lvl: model },
+    });
+    const done = await waitFor(() => runtime.forTask("tsk_lvl", "complete")[0]);
+    expect(JSON.stringify(done.body)).not.toContain("sensitivity");
+    expect(systemText(model.prompts[0] ?? [])).toContain("restricted sources");
+  });
+
   it("never takes a replayed reply as the final answer", () => {
     const messages = taskMessages(followUp(turns));
     expect(finalAnswer(messages)).toBe("");

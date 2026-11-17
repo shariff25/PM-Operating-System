@@ -100,6 +100,11 @@ fn member(handle: &str, slack_id: &str) -> TeamMember {
 /// bot, whose role may draft Jira issues (approve) but never send Slack messages. `eve` is
 /// not on the team.
 pub fn catalog() -> Catalog {
+    catalog_with_admin(None)
+}
+
+/// [`catalog`], with `cy` on the team as an admin when `admin` is set.
+pub fn catalog_with_admin(admin: Option<&str>) -> Catalog {
     let roles = vec![
         Role {
             name: "docs-helper".into(),
@@ -162,9 +167,13 @@ pub fn catalog() -> Catalog {
             tool("slack.send_message", ToolKind::Write),
         ],
     };
-    let team = TeamFile {
-        members: vec![member("ana", "U0ANA"), member("ben", "U0BEN")],
-    };
+    let mut members = vec![member("ana", "U0ANA"), member("ben", "U0BEN")];
+    if let Some(handle) = admin {
+        let mut m = member(handle, "U0ADMIN");
+        m.roles.push(TeamRole::Admin);
+        members.push(m);
+    }
+    let team = TeamFile { members };
     Catalog::from_parts(bots, roles, skills, registry, team)
 }
 
@@ -190,12 +199,19 @@ pub struct MockToolServer {
     /// Approval reads answer `503`.
     pub approvals_down: Mutex<bool>,
     pub ready: Mutex<bool>,
+    /// What `GET /internal/runs/{id}/sensitivity` answers per run: a level, or `None` for
+    /// "no session stored". A run not listed answers `public`.
+    pub run_levels: Mutex<HashMap<String, Option<String>>>,
+    /// Run-level reads answer `503`.
+    pub runs_down: Mutex<bool>,
 }
 
 impl Default for MockToolServer {
     fn default() -> Self {
         Self {
             mode: Mutex::new(SessionMode::Ok),
+            run_levels: Mutex::default(),
+            runs_down: Mutex::new(false),
             sessions: Mutex::default(),
             approvals: Mutex::default(),
             approval_reads: Mutex::new(0),
@@ -285,6 +301,27 @@ async fn ts_approval(
         )
             .into_response(),
     }
+}
+
+async fn ts_run_level(
+    State(ts): State<Arc<MockToolServer>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if *ts.runs_down.lock().unwrap() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let level = ts
+        .run_levels
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .unwrap_or(Some("public".into()));
+    Json(json!({"run_id": id, "sensitivity": level})).into_response()
 }
 
 async fn ts_ready(State(ts): State<Arc<MockToolServer>>) -> StatusCode {
@@ -402,6 +439,7 @@ impl Env {
             Router::new()
                 .route("/internal/sessions", post(ts_session))
                 .route("/internal/approvals/{id}", get(ts_approval))
+                .route("/internal/runs/{id}/sensitivity", get(ts_run_level))
                 .route("/readyz", get(ts_ready))
                 .with_state(ts.clone()),
             &stop,
@@ -454,6 +492,20 @@ impl Env {
             Arc::new(MemoryStore::default()),
             None,
             catalog(),
+            Some(assertions),
+        )
+        .await
+    }
+
+    /// In memory, with `catalog`, checking assertions as `assertions` says.
+    pub async fn memory_with_catalog_and_assertions(
+        catalog: Catalog,
+        assertions: Assertions,
+    ) -> Self {
+        Self::with_parts(
+            Arc::new(MemoryStore::default()),
+            None,
+            catalog,
             Some(assertions),
         )
         .await
