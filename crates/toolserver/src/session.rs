@@ -80,6 +80,8 @@ pub trait SessionRepo: Send + Sync {
     async fn get(&self, token: &str, now: DateTime<Utc>) -> StoreResult<Option<Session>>;
     /// End a session. Returns whether it existed.
     async fn revoke(&self, token: &str) -> StoreResult<bool>;
+    /// End every session of `user` (a deactivation). Returns how many.
+    async fn revoke_user(&self, user: &str) -> StoreResult<u64>;
     /// Record that the session read data of class `read`: its `sources_sensitivity` becomes
     /// `read` if that is higher, and never goes down.
     async fn raise_sensitivity(&self, token: &str, read: Sensitivity) -> StoreResult<()>;
@@ -115,6 +117,13 @@ impl SessionRepo for MemorySessions {
             .expect("session lock")
             .remove(token)
             .is_some())
+    }
+
+    async fn revoke_user(&self, user: &str) -> StoreResult<u64> {
+        let mut sessions = self.sessions.lock().expect("session lock");
+        let before = sessions.len();
+        sessions.retain(|_, s| s.user != user);
+        Ok((before - sessions.len()) as u64)
     }
 
     async fn raise_sensitivity(&self, token: &str, read: Sensitivity) -> StoreResult<()> {

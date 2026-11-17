@@ -127,6 +127,9 @@ jobs:
       - name: A member and a Docs-bot task end to end
         run: |
           deploy/pmos-admin pmos member add --root content --handle ci --slack-id U0CI00001 --roles pm,admin
+          # The tool server decides from its user database (slice U3): the same person, imported
+          # into the stack's empty database. team.yaml stays for the other services until U7.
+          deploy/pmos-admin users import --from deploy/test/ci-users.yaml --bootstrap --apply
           deploy/pmos-admin pmos policy generate --root content --out policies
           deploy/pmos-admin lint
           deploy/pmos-admin reindex

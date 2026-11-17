@@ -82,9 +82,14 @@ pub enum Reason {
     Incomplete,
     ShouldNotDraft,
     Other,
+    /// Not a person's choice: the tool server closed the draft because its owner was
+    /// deactivated and not reactivated within the grace (`docs/user-database-spec.md` §6).
+    /// No client may give it with a decision.
+    OwnerDeactivated,
 }
 
 impl Reason {
+    /// The reasons a person may give. [`Reason::OwnerDeactivated`] is the system's own.
     pub const ALL: [Self; 6] = [
         Self::WrongFacts,
         Self::WrongTarget,
@@ -102,10 +107,21 @@ impl Reason {
             Self::Incomplete => "incomplete",
             Self::ShouldNotDraft => "should_not_draft",
             Self::Other => "other",
+            Self::OwnerDeactivated => "owner_deactivated",
         }
     }
 
+    /// Any stored reason, the system's own included. A decision from a client takes only
+    /// [`Reason::ALL`] ([`Reason::chosen`]).
     pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .chain([Self::OwnerDeactivated])
+            .find(|r| r.as_str() == s)
+    }
+
+    /// A reason a person may give with a rejection.
+    pub fn chosen(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|r| r.as_str() == s)
     }
 }

@@ -14,10 +14,15 @@
 //! keeps its own rules (a refused sign-in names nobody, so it carries no assertion).
 //!
 //! **Whose view:** every call names its viewer as `user=`. The tool server checks that viewer's
-//! roles in its own `team.yaml` against the permission matrix (`pmos_contract::permissions`),
-//! whatever the caller already checked, and for `pmos-web` the user assertion must name that
-//! same person (`PMOS_ASSERTION_MODE`, as on the approvals routes). A viewer without the
+//! roles in the user database, read for this request (`users::access`), against the
+//! permission matrix (`pmos_contract::permissions`), whatever the caller already checked, and
+//! for `pmos-web` the user assertion must name that same person (`PMOS_ASSERTION_MODE`, as on
+//! the approvals routes). A deactivated person's kept roles grant nothing. A viewer without the
 //! permission gets `403 {"code":"forbidden"}`.
+//!
+//! **Admin and Auditor on one person** (the pilot exception, `docs/user-database-spec.md` §6):
+//! their audit-log reads and exports are recorded with the detail `dual_role admin+auditor`;
+//! once the exception has lapsed they are refused `403 role_conflict` (admin powers stay).
 //!
 //! **Metadata only:** an audit event is served as a projection that never carries the event's
 //! `sources` list, its source titles (Jira summaries and page titles can carry content), its
@@ -45,7 +50,8 @@ use crate::approvals::Status;
 use crate::assertion::Mode;
 use crate::audit::{AuditEvent, AuditQuery, Client, Cursor, Outcome, StoredEvent, MAX_PAGE};
 use crate::ledger::Reason;
-use crate::session::BOT_IDENTITY_PREFIX;
+use crate::users::access::{may_use, permits};
+use crate::users::{IdentityKind, User, UserRole};
 use crate::vault::Provider;
 
 /// The page size when `limit` is left out.
@@ -172,6 +178,18 @@ fn coded(status: StatusCode, code: &str, message: &str) -> Response {
 
 /// Record one admin read.
 async fn record(state: &AppState, client: Client, viewer: &str, tool: &str, outcome: Outcome) {
+    record_with(state, client, viewer, tool, outcome, None).await
+}
+
+/// Record one admin read, with a fixed-format detail.
+async fn record_with(
+    state: &AppState,
+    client: Client,
+    viewer: &str,
+    tool: &str,
+    outcome: Outcome,
+    detail: Option<&str>,
+) {
     state
         .svc
         .audit(AuditEvent {
@@ -187,12 +205,12 @@ async fn record(state: &AppState, client: Client, viewer: &str, tool: &str, outc
             source_titles: Default::default(),
             args_hash: None,
             output_ref: None,
-            detail: None,
+            detail: detail.map(String::from),
         })
         .await;
 }
 
-/// The viewer `user` names, if they are a team member with any of `any_of`. A refusal is
+/// The viewer `user` names, if they are an active user with any of `any_of`. A refusal is
 /// recorded and answered `403 forbidden`; a missing `user` is `400`.
 async fn viewer(
     state: &AppState,
@@ -201,6 +219,20 @@ async fn viewer(
     tool: &str,
     any_of: &[Permission],
 ) -> Result<String, Box<Response>> {
+    viewer_marked(state, client, user, tool, any_of, false).await
+}
+
+/// [`viewer`]; with `audit_read`, a read of the audit log: by a person holding Admin and
+/// Auditor it is recorded with [`crate::users::detail::DUAL_ROLE`] while the pilot exception
+/// is in force, and refused `403 role_conflict` once it has lapsed.
+async fn viewer_marked(
+    state: &AppState,
+    client: Client,
+    user: Option<&str>,
+    tool: &str,
+    any_of: &[Permission],
+    audit_read: bool,
+) -> Result<String, Box<Response>> {
     let Some(user) = user.map(str::trim).filter(|u| !u.is_empty()) else {
         return Err(Box::new(coded(
             StatusCode::BAD_REQUEST,
@@ -208,11 +240,30 @@ async fn viewer(
             "`user` (the viewer) is required",
         )));
     };
-    let allowed = state
-        .svc
-        .team()
-        .member(user)
-        .is_some_and(|m| any_of.iter().any(|p| m.allows(*p)));
+    let dir = match state.svc.people().directory().await {
+        Ok(dir) => dir,
+        Err(e) => return Err(Box::new(unavailable(e))),
+    };
+    let found = dir.get(user);
+    let allowed = found.is_some_and(|u| any_of.iter().any(|p| permits(u, *p)));
+    let dual = audit_read && found.is_some_and(|u| u.active() && u.dual_role());
+    if allowed && dual && !dir.exception_in_force(Utc::now()) {
+        record_with(
+            state,
+            client,
+            user,
+            tool,
+            Outcome::Denied,
+            Some(crate::users::Refusal::DualRole.code()),
+        )
+        .await;
+        tracing::info!(viewer = %user, tool, "audit read refused: the pilot exception has lapsed");
+        return Err(Box::new(coded(
+            StatusCode::FORBIDDEN,
+            "role_conflict",
+            "this person holds admin and auditor and the pilot exception has ended: someone with host access removes one role",
+        )));
+    }
     if !allowed {
         record(state, client, user, tool, Outcome::Denied).await;
         tracing::info!(viewer = %user, tool, "admin read refused: role");
@@ -222,7 +273,8 @@ async fn viewer(
             "this person's role doesn't allow this",
         )));
     }
-    record(state, client, user, tool, Outcome::Ok).await;
+    let detail = dual.then_some(crate::users::detail::DUAL_ROLE);
+    record_with(state, client, user, tool, Outcome::Ok, detail).await;
     Ok(user.to_string())
 }
 
@@ -288,7 +340,7 @@ fn audit_query(q: &AuditParams) -> Result<AuditQuery, String> {
 /// The notes the tool server writes itself in `detail`, which carry no content. Anything else
 /// (a rejection's free text, a connector's or a refusal's message, which can quote arguments)
 /// is never served. The admin proposal and event notes are [`ADMIN_NOTES`].
-const FIXED_DETAILS: [&str; 10] = [
+const FIXED_DETAILS: [&str; 11] = [
     "edited before approval",
     "approved in the harness",
     "approved in the harness; writing",
@@ -299,6 +351,7 @@ const FIXED_DETAILS: [&str; 10] = [
     "storage unavailable",
     "unlink for someone who isn't a team member",
     "decision by someone not in team.yaml",
+    crate::service::NOT_A_MEMBER_DECISION,
 ];
 
 /// The fixed notes of admin refusals and reads (`crate::proposals`, [`record_action`]).
@@ -394,7 +447,9 @@ async fn audit(
         Ok(query) => query,
         Err(why) => return coded(StatusCode::BAD_REQUEST, "bad_request", &why),
     };
-    if let Err(refused) = viewer(&state, client, q.user.as_deref(), tool, &[need]).await {
+    if let Err(refused) =
+        viewer_marked(&state, client, q.user.as_deref(), tool, &[need], true).await
+    {
         return *refused;
     }
     let page = query.limit;
@@ -427,8 +482,9 @@ struct ViewerParams {
     user: Option<String>,
 }
 
-/// `{"linking": bool, "members": [{"handle", "accounts": {"atlassian": bool, ...}}]}`: which
-/// accounts each team member has linked, as booleans. Never a token, scope or account id.
+/// `{"linking": bool, "members": [{"handle", "status", "roles", "accounts": {"atlassian":
+/// bool, ...}}]}`: every user in the database, with which accounts they have linked, as
+/// booleans. Never a token, scope, address or account id.
 async fn accounts(
     State(state): State<AppState>,
     Extension(client): Extension<Client>,
@@ -438,13 +494,12 @@ async fn accounts(
     if let Err(refused) = viewer(&state, client, q.user.as_deref(), "admin.accounts", &need).await {
         return *refused;
     }
-    let team = state.svc.team().file();
+    let dir = match state.svc.people().directory().await {
+        Ok(dir) => dir,
+        Err(e) => return unavailable(e),
+    };
     let mut members = Vec::new();
-    for m in team
-        .members
-        .iter()
-        .filter(|m| !m.handle.starts_with(BOT_IDENTITY_PREFIX))
-    {
+    for m in dir.users.values() {
         let linked = match state.svc.stores().credentials.list(&m.handle).await {
             Ok(linked) => linked,
             Err(e) => return unavailable(e),
@@ -458,7 +513,12 @@ async fn accounts(
                 )
             })
             .collect();
-        members.push(json!({ "handle": m.handle, "accounts": accounts }));
+        members.push(json!({
+            "handle": m.handle,
+            "status": m.status.as_str(),
+            "roles": m.roles.keys().map(|r| r.as_str()).collect::<Vec<_>>(),
+            "accounts": accounts,
+        }));
     }
     Json(json!({ "linking": state.oauth.is_some(), "members": members })).into_response()
 }
@@ -518,9 +578,10 @@ async fn connectors(
 /// How far back the overview's counts go.
 pub const OVERVIEW_DAYS: i64 = 7;
 
-/// `{"since", "pending_drafts", "approved", "rejected", "denied"}`: pending approval items of
-/// every team member now, and audit events of each outcome since `since` (`null` when the
-/// audit log can't be read back).
+/// `{"since", "pending_drafts", "held_drafts", "approved", "rejected", "denied", …, "users"}`:
+/// pending approval items of every active user now (a deactivated owner's are `held_drafts`),
+/// audit events of each outcome since `since` (`null` when the audit log can't be read back),
+/// and the user database's flags ([`users_flags`]).
 async fn overview(
     State(state): State<AppState>,
     Extension(client): Extension<Client>,
@@ -531,11 +592,12 @@ async fn overview(
         return *refused;
     }
     let since: DateTime<Utc> = Utc::now() - Duration::days(OVERVIEW_DAYS);
-    let mut pending = 0usize;
-    for m in state.svc.team().file().members {
-        if m.handle.starts_with(BOT_IDENTITY_PREFIX) {
-            continue;
-        }
+    let dir = match state.svc.people().directory().await {
+        Ok(dir) => dir,
+        Err(e) => return unavailable(e),
+    };
+    let (mut pending, mut held) = (0usize, 0usize);
+    for m in dir.users.values() {
         match state
             .svc
             .stores()
@@ -543,10 +605,16 @@ async fn overview(
             .list(&m.handle, Some(Status::Pending))
             .await
         {
-            Ok(items) => pending += items.len(),
+            Ok(items) if m.active() => pending += items.len(),
+            Ok(items) => held += items.len(),
             Err(e) => return unavailable(e),
         }
     }
+    let conflicts = match identity_conflicts(&state, since).await {
+        Ok(n) => n,
+        Err(e) => return unavailable(e),
+    };
+    let users = users_flags(&state, &dir, conflicts, Utc::now());
     let counts = match state.svc.stores().audit.count_outcomes(since).await {
         Ok(c) => c,
         Err(e) => return unavailable(e),
@@ -563,6 +631,8 @@ async fn overview(
     Json(json!({
         "since": since,
         "pending_drafts": pending,
+        "held_drafts": held,
+        "users": users,
         "approved": count(Outcome::Approved),
         "rejected": count(Outcome::Rejected),
         "denied": count(Outcome::Denied),
@@ -573,6 +643,88 @@ async fn overview(
             .map(|p| json!({ "at": p.at, "deleted": p.deleted })),
     }))
     .into_response()
+}
+
+/// The pilot exception's end is flagged this many days ahead (§6).
+pub const EXCEPTION_WARN_DAYS: i64 = 14;
+
+/// `users.identity_conflict` events since `since` (slice U4c records them), `None` when the
+/// audit log can't be read back.
+async fn identity_conflicts(
+    state: &AppState,
+    since: DateTime<Utc>,
+) -> Result<Option<usize>, crate::store::StoreError> {
+    let query = AuditQuery {
+        before: None,
+        limit: MAX_PAGE,
+        actor: None,
+        action: Some("users.identity_conflict".into()),
+        outcome: None,
+        from: Some(since),
+        to: None,
+    };
+    Ok(state
+        .svc
+        .stores()
+        .audit
+        .search(&query)
+        .await?
+        .map(|e| e.len()))
+}
+
+/// The user database's flags on the overview (§4, §6, §2): handles and counts only, never an
+/// address, a Slack id or an `oid`.
+fn users_flags(
+    state: &AppState,
+    dir: &crate::users::Directory,
+    conflicts: Option<usize>,
+    now: DateTime<Utc>,
+) -> Value {
+    let handles = |f: &dyn Fn(&User) -> bool| -> Vec<String> {
+        dir.users
+            .values()
+            .filter(|u| f(u))
+            .map(|u| u.handle.clone())
+            .collect()
+    };
+    // §4: joined through the Slack bot client, Microsoft sign-in name not confirmed yet.
+    let unconfirmed = handles(&|u| {
+        u.active() && u.sign_in_name.is_some() && u.sign_in_name_confirmed_at.is_none()
+    });
+    let dual = handles(&|u| u.active() && u.dual_role());
+    let in_force = dir.exception_in_force(now);
+    let exception = dir.exception.as_ref().map(|e| {
+        json!({
+            "ends": crate::users::detail::date(e.expires_at),
+            "ending_soon": in_force && e.expires_at - now <= Duration::days(EXCEPTION_WARN_DAYS),
+            "lapsed": !in_force,
+        })
+    });
+    let cap = state.svc.stores().users.rules().deactivations_per_hour as usize;
+    let recent = dir.capped_deactivations.len();
+    let roster = state.svc.roster();
+    let owner_gone: Vec<String> = roster
+        .bots()
+        .filter(|b| !dir.get(&b.owner).is_some_and(may_use))
+        .map(|b| b.name.clone())
+        .collect();
+    json!({
+        "active": dir.users.values().filter(|u| u.active()).count(),
+        "deactivated": dir.users.values().filter(|u| !u.active()).count(),
+        "sign_in_unconfirmed": unconfirmed,
+        "dual_role": dual,
+        "pilot_exception": exception,
+        // §6 "Lapsed": a red notice naming them until one role is gone.
+        "role_conflicts": if in_force { Vec::new() } else { dual.clone() },
+        "entra_needs_host": handles(&|u| u.active() && u.entra_state() == "needs_host"),
+        "no_slack": handles(&|u| u.active() && u.identity(IdentityKind::Slack).is_none() && u.has(UserRole::Pm)),
+        "identity_conflicts": conflicts,
+        "resolve_miss_warning": state.svc.people().resolve_misses().warning(),
+        "deactivations_last_hour": recent,
+        "deactivation_limit": cap,
+        "deactivation_limit_reached": recent >= cap,
+        "bots_without_active_owner": owner_gone,
+    })
 }
 
 // Sign-in events from `pmos-web`.
@@ -687,7 +839,12 @@ async fn sign_in_event(
         return bad("`provider` is `entra` or `dev`");
     };
     let user = q.user.as_deref().map(str::trim).filter(|u| !u.is_empty());
-    let team = state.svc.team();
+    let dir = match state.svc.people().directory().await {
+        Ok(dir) => dir,
+        Err(e) => return unavailable(e),
+    };
+    // Anyone active may sign in to the web app (an auditor reads the audit log there).
+    let is_user = |h: &str| dir.get(h).is_some_and(|u| u.active());
     let event = |user: &str, outcome, output_ref: Option<String>, detail: String| AuditEvent {
         at: Utc::now(),
         client,
@@ -719,9 +876,7 @@ async fn sign_in_event(
         }
         let member = match r.member.as_deref() {
             None => None,
-            Some(m) if *reason == "wrong_account" && team.member(m).is_some() => {
-                Some(format!("member:{m}"))
-            }
+            Some(m) if *reason == "wrong_account" && is_user(m) => Some(format!("member:{m}")),
             Some(_) => return bad("`member` is only for `wrong_account`, and must be a member"),
         };
         event(
@@ -737,7 +892,7 @@ async fn sign_in_event(
         let Some(user) = user else {
             return bad("`user` (who signed in or out) is required");
         };
-        if team.member(user).is_none() {
+        if !is_user(user) {
             return coded(
                 StatusCode::FORBIDDEN,
                 "forbidden",
@@ -854,10 +1009,12 @@ async fn protection(
         Ok(u) => u,
         Err(r) => return *r,
     };
-    let allowed =
-        state.svc.team().member(user).is_some_and(|m| {
-            m.allows(Permission::ViewPolicies) || m.allows(Permission::ViewContent)
-        });
+    let allowed = match state.svc.people().user(user).await {
+        Ok(u) => u.is_some_and(|m| {
+            permits(&m, Permission::ViewPolicies) || permits(&m, Permission::ViewContent)
+        }),
+        Err(e) => return unavailable(e),
+    };
     if !allowed {
         record(&state, client, user, "admin.protection", Outcome::Denied).await;
         return coded(
@@ -959,9 +1116,12 @@ async fn record_action(
             "the event has an unknown action or note, too many files, or a bad target",
         );
     }
-    let member = state.svc.team().member(user);
+    let member = match state.svc.people().user(user).await {
+        Ok(u) => u.filter(|u| u.active()),
+        Err(e) => return unavailable(e),
+    };
     let allowed = match outcome {
-        Outcome::Ok => member.is_some_and(|m| m.allows(Permission::EditContent)),
+        Outcome::Ok => member.is_some_and(|m| permits(&m, Permission::EditContent)),
         _ => member.is_some(),
     };
     let mut event = crate::proposals::event(client, user, &r.action, outcome);

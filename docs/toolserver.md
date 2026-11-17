@@ -22,7 +22,7 @@ service and personal agents go through the same server, so they follow the same 
 | Arguments match the tool's schema | Required keys, no unknown keys, types and enums checked before any handler runs | — |
 | A bad draft gets one correction | A write tool refused twice for invalid arguments in a session is refused for the rest of it, without reaching the connector (see **Invalid drafts**) | — |
 | Every draft is labelled | Each approval item has a row in the feedback ledger: what became of it, never its text (see **Feedback ledger**) | — |
-| A Slack post reaches only who it may | Before a Slack write runs, its channel's members are checked against `team.yaml` and the draft's sources: restricted sources never reach outsiders, and a Slack Connect channel needs a second confirmation (see **Slack drafts**) | SLK-6 |
+| A Slack post reaches only who it may | Before a Slack write runs, its channel's members are checked against the user database and the draft's sources: restricted sources never reach outsiders, and a Slack Connect channel needs a second confirmation (see **Slack drafts**) | SLK-6 |
 | No Slack text past a day | An undecided Slack draft expires after 24 hours; a decided one loses its text 24 hours after the decision (see **Slack drafts**) | SLK-8 |
 
 ## How a write gets approved
@@ -131,7 +131,7 @@ name?, peer?, checked_at}` and served as `target_channel`:
   (letters, digits, `-`, `_`, `.`, at most 80; `connectors::channel_name`), else `null`.
   Names are metadata, not message text, but they come from Slack and are treated as untrusted.
   A DM's or group DM's `name` is never kept.
-- `with`: for a DM, the other person's `team.yaml` handle when their Slack id (`user`, kept
+- `with`: for a DM, the other person's handle in the user database (as last read) when their Slack id (`user`, kept
   only if shaped like a member id) belongs to a member; `null` otherwise. No extra lookup.
 - `checked_at`: when it was read.
 It is kept when a draft's text is removed: it holds no message text.
@@ -211,7 +211,7 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /healthz` | none | Liveness: the process answers |
 | `GET /readyz` | none | Readiness: `200` when storage answers within a second and every connector's own dependency (the docs server) answers; `503` otherwise, naming the check that failed |
 | `POST /mcp` (Streamable HTTP) | `Bearer <session token>` | MCP for the harness: `tools/list`, `tools/call` |
-| `POST /internal/sessions` `{user, skill, run_id, ttl_minutes?}` | service or bot token | Create a session; returns `token` and the session's tools. `403` if the user isn't in `team.yaml` (live connectors), or the bot asks for a skill outside `PMOS_BOT_SKILLS`. |
+| `POST /internal/sessions` `{user, skill, run_id, ttl_minutes?}` | service or bot token | Create a session; returns `token` and the session's tools. `403` if the user isn't an active user holding `pm`, `reviewer` or `admin` in the user database, or the bot asks for a skill outside `PMOS_BOT_SKILLS`. |
 | `POST /internal/sessions` `{user, bot, run_id, ttl_minutes?, history_sensitivity?}` | service token | Create a bot session (see **Bot sessions**). Send `skill` or `bot`, never both (`400`). `404` for an unknown bot; `403` if `user` may not use it. `history_sensitivity` (`public`, `internal` or `restricted`; anything else is refused) starts the session at that level: see **Conversation history**. |
 | `GET /internal/runs/{run_id}/sensitivity` | service token | `{run_id, sensitivity}`: the highest level any stored session of that run reached, or `null` when none is stored (never made, or purged after it expired). The runtime records it on each finished task. |
 | `DELETE /internal/session` + `X-Pmos-Session` | service or bot token | Revoke a session (sandbox ended) |
@@ -219,14 +219,14 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `POST /internal/grants` `{session_token, tool, args}` | service token | Record an approval given in the harness |
 | `GET /internal/approvals?user=&status=` | service, web or console token | `{items: […], truncated, total_pending}`: a PM's inbox, newest first (ties by id). **Every pending item is listed**: the cap of 200 (`approvals::LIST_LIMIT`) applies only to items that aren't pending. Past a much higher safety cap on pending items (1,000, `approvals::PENDING_CAP`) the newest are listed with `truncated: true`, and `total_pending` counts them all (it is logged too). With `status=pending` only the pending ones; with another `status` (`executing`, `approved`, `rejected`, `failed` or `expired`; `400` for anything else) `{items}`, at most 200 (an older item is still read by its id) |
 | `GET /internal/approvals?user=` | bot token | The App Home Inbox: `{approvals: […], total}`, only `pending` items whatever `status` says, oldest first, at most 50. Each item reads as `GET /internal/approvals/{id}` returns it; `total` counts every pending item. `403` if `user` isn't a team member (live connectors) or is a team bot's identity; `400` without `user` |
-| `GET /internal/approvals/{id}` | service or console token | One item (from the console: under `require` only with a user assertion, and then only the subject's own unless the subject is an admin in `team.yaml`; anything else is `404`): `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity`, `redacted_at` and `edited_at`; always `edited` (whether a person changed the bot's arguments); plus, when known, `expires_at`, `target_url` and `external` (see **What an item is shown with**). Listings and decision answers carry the same fields |
+| `GET /internal/approvals/{id}` | service or console token | One item (from the console: under `require` only with a user assertion, and then only the subject's own unless the subject is an active admin in the user database; anything else is `404`): `id`, `user`, `skill` or `bot`, `run_id`, `tool`, `args`, `args_hash`, `status`, `created_at`, and when set `decided_at`, `decided_by`, `result`, `sources_sensitivity`, `redacted_at` and `edited_at`; always `edited` (whether a person changed the bot's arguments); plus, when known, `expires_at`, `target_url` and `external` (see **What an item is shown with**). Listings and decision answers carry the same fields |
 | `GET /internal/approvals/{id}?user=<handle>` | bot or web token | The same item, for the PM the client acts for. `404 {error: "no such approval item"}` without `user`, when `user` isn't a team member, when the item isn't `user`'s, or when there is no such item: the client can't tell which ids exist. With the web token, the user assertion must name `user` |
-| `PUT /internal/approvals/{id}/draft?user=<handle>` `{args, revision_run?, revision_sensitivity?}` | service or web token | Save `user`'s edit of their pending item (see **How a write gets approved**, "A saved edit"; with `revision_run`, the item's level is raised to what that run read: "A saved edit can raise the draft's sensitivity"); answers the item as `GET /internal/approvals/{id}` does, with `edited` and `edited_at`. With the web token the user assertion must name `user` (as for the other approvals routes); the bot and console tokens get `403`. `404` without `user`, for someone else's item or a missing one; `409 {code: "not_pending"}` once decided, `409 {code: "expired"}` for an expired Slack draft; `400` for arguments that don't fit the tool; `422 {code: "target_changed"}` for a change of where it goes; `403` when `user` isn't in `team.yaml` (enforced) |
+| `PUT /internal/approvals/{id}/draft?user=<handle>` `{args, revision_run?, revision_sensitivity?}` | service or web token | Save `user`'s edit of their pending item (see **How a write gets approved**, "A saved edit"; with `revision_run`, the item's level is raised to what that run read: "A saved edit can raise the draft's sensitivity"); answers the item as `GET /internal/approvals/{id}` does, with `edited` and `edited_at`. With the web token the user assertion must name `user` (as for the other approvals routes); the bot and console tokens get `403`. `404` without `user`, for someone else's item or a missing one; `409 {code: "not_pending"}` once decided, `409 {code: "expired"}` for an expired Slack draft; `400` for arguments that don't fit the tool; `422 {code: "target_changed"}` for a change of where it goes; `403` when `user` isn't an active PM OS user |
 | `GET /internal/approvals/{id}/sources?user=` | service or web token | What the run that drafted the item read: `{sources: [{system, title, url, ref, cite, tool, read_at}], available, truncated}`. `user` is required (`400`) and must be the item's user: anyone else's item, or a missing one, is `404`. See **What an item is shown with** |
-| `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?, expected_args_hash?}` | service, bot or web token | `approve`, `edit` (with `args`) or `reject`. `expected_args_hash` is the start of the `args_hash` the person was shown: a mismatch is `409 {code: "stale"}` and nothing is decided; it is required on `approve` from the bot and web tokens (`400 {code: "expected_args_hash_required"}`), optional for the service token (see "What the person was shown"). `decided_by` must be the item's user (`403`), and in `team.yaml` when it is enforced (`403`). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other`. The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. From the bot or web token, an `edit` that changes where the draft goes is `422 target_changed` (see **How a write gets approved**). An internal failure is `500` with a generic `error`. |
+| `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?, expected_args_hash?}` | service, bot or web token | `approve`, `edit` (with `args`) or `reject`. `expected_args_hash` is the start of the `args_hash` the person was shown: a mismatch is `409 {code: "stale"}` and nothing is decided; it is required on `approve` from the bot and web tokens (`400 {code: "expected_args_hash_required"}`), optional for the service token (see "What the person was shown"). `decided_by` must be the item's user (`403`), and an active PM OS user (`403`; a deactivated owner's drafts are held this way). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other` (`owner_deactivated` is the system's own, never accepted from a client). The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. From the bot or web token, an `edit` that changes where the draft goes is `422 target_changed` (see **How a write gets approved**). An internal failure is `500` with a generic `error`. |
 | `GET /internal/ledger?since=&until=&bot=&outcome=&min_edit=&limit=` | service or bot token | `{rows: […]}`, newest first; for the bot token, rows have no `id` (use `run_id`). See **Feedback ledger**. `422` for a bad parameter |
 | `GET /internal/ledger/summary?since=&bot=` | service token | Per bot (or skill) and tool: counts by outcome, label coverage, median edit distance, rejection reasons. `422` for a bad `since` |
-| `POST /internal/reindex` | service token | Rebuild the context index from the content checkout and re-read `team.yaml`, the bots and their roles; `422` if it fails `pmos lint` |
+| `POST /internal/reindex` | service token | Rebuild the context index from the content checkout and re-read the bots and their roles (users and roles are in the database); `422` if it fails `pmos lint` |
 | `GET /internal/oauth/{atlassian\|slack\|github}/start?user=` | service or bot token | The URL to send a PM to so they can link their account. The bot token gets URLs for team members only (`403` otherwise). `user=bots.<name>` (service token) gives the URL for a team bot's own account (`404` unless `<name>` is a team bot); GitHub links PMs only. |
 | `GET /oauth/{atlassian\|slack\|github}/callback` | none (the PM's browser) | Finishes linking; shows a short page |
 | `GET /internal/credentials?user=` | service token | A PM's linked accounts, without tokens |
@@ -235,7 +235,7 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/memory/repo?user=` | service or bot token | `{repo, verified_at}`, or `404` |
 | `POST /internal/members/requests` `{slack_id, email, name}` | service or bot token | A request to join: `201 {request}`, or `200 {request}` with the one already pending for that Slack id. `409 already_member`, `422 bad_request`, `429 too_many_pending` (past 20) |
 | `GET /internal/members/requests?status=` | service or bot token | `{requests: […]}`, oldest first; `status` is `pending`, `approved`, `rejected` or `failed` |
-| `POST /internal/members/requests/{id}/decision` `{decision, decided_by, handle?, roles?}` | service or bot token | `approve` or `reject`, by an `admin` in `team.yaml` (`403 not_admin`). From the bot token, `roles` may be `pm` and `skill-author` only: one with `admin` is `403 admin_by_pull_request`, audited as `denied`, the request still pending. See **Members**. `200 {request}`; `409 already_decided` with `request`; `422 bad_handle`; `409 github_not_linked`, `no_push` or `not_configured` (still pending); `502 commit_failed` with `request` (now `failed`) |
+| `POST /internal/members/requests/{id}/decision` `{decision, decided_by, handle?, roles?}` | service or bot token | `approve` or `reject`, by an active `admin` in the user database (`403 not_admin`). `roles` may be `pm` only (both tokens are unsigned): `admin` is `403 admin_not_from_slack`, any other `403 role_not_from_slack`, audited as `denied`, the request still pending. See **Members**. `200 {request}` (the user is created first; when the personal bot couldn't be committed, `commit` is null and `error` says why); `409 already_decided` with `request`; `422 bad_handle`; `409 already_member` |
 | `POST /internal/members/{handle}/remove` `{decided_by}` | service or bot token | Admin only; not oneself (`403 self_removal`). `200 {handle, commit}`, `404 not_a_member`, `409 owns_bots` if they still own a team bot |
 | `GET /internal/onboarding?user=` or `?slack_id=` | service or bot token | A PM's setup checklist: `member`, `handle`, `admin`, `linked` (`atlassian`, `slack`, `github`), `memory_repo`, `personal_bot` (in the loaded content), and for a non-member by Slack id, `pending_request` |
 | `GET /internal/admin/audit?user=&before=&limit=&actor=&action=&outcome=&from=&to=&purpose=` | service or web token | The whole audit log, newest first: `{events: [...], next}`. Needs the viewer `user` to have `view-audit-log` (`export-audit` with `purpose=export`). See **Admin reads** |
@@ -258,7 +258,7 @@ the log can't be read back, so the answer is `available: false` with no sources.
 bot and console tokens get `403`).
 
 - **The viewer is checked here.** Every call names its viewer as `user=` (else `400`), and the
-  viewer's roles in this server's `team.yaml` must grant the route's permission
+  viewer's roles in this server's user database must grant the route's permission
   (`pmos_contract::permissions`), else `403 {"code":"forbidden"}`, whatever the caller already
   checked. With the web token, the user assertion must name that same person, as on the
   approvals routes (`PMOS_ASSERTION_MODE`).
@@ -287,7 +287,7 @@ checks it again from nothing and opens the pull request **as the admin**.
 - **Who may call:** the web token only (the service, bot and console tokens get `403`), with
   `pmos-web`'s signed user assertion for the `user=` it names, bound to the exact request and
   body, **in every assertion mode, `off` included** (`401 bad_assertion` otherwise). The
-  subject must be an admin in this server's `team.yaml` (`edit-policies` or `edit-content` by
+  subject must be an admin in this server's user database (`edit-policies` or `edit-content` by
   kind), else `403 forbidden`.
 - **The checks** (`changeset::recheck`): the path allow-list (content files under
   `PMOS_CONTENT_DIR`, and only the generated `bots/<bot>.yaml`, `bots/<bot>.sandbox.yaml` and
@@ -375,8 +375,8 @@ why a newer event can't be deleted by anyone, is in `docs/audit-retention.md`. I
   Socket Mode gives the tool server nothing signed to check which PM the bot names, so what
   that trust allows is kept small: a read of one item must name its PM (`?user=`, else
   `404`); ledger rows come without `id`; an edit may change a draft's text but not where it
-  goes (`422 target_changed`); and a member decision may grant `pm` and `skill-author` only
-  (`403 admin_by_pull_request`: a new admin is made by a pull request to `team.yaml`).
+  goes (`422 target_changed`); and a member decision may grant `pm` only
+  (`403 admin_not_from_slack`, `403 role_not_from_slack`: only the host makes an admin).
 - **Web token** (`PMOS_WEB_TOKEN`): `pmos-web`, which acts for a signed-in person. Only the
   five approvals routes above (list, one item, sources, decision, saved edit), the four
   read-only `GET /internal/admin/*` reads, the admin proposal and action routes and the sign-in
@@ -395,7 +395,7 @@ why a newer event can't be deleted by anyone, is in `docs/audit-retention.md`. I
   route (sources and decisions included) is `403`, and an unknown token `401`. A decision
   from it is refused by the service as well (`decide_verdict`), so no later route can widen
   it. With a console user assertion, a list names that person, and one item must be theirs
-  or the subject must be an admin in the tool server's own `team.yaml` (the admin view; the
+  or the subject must be an active admin in the tool server's user database (the admin view; the
   assertion's roles don't count). Under `require`, its read of one item needs that
   assertion. The console is given it as its `PMOS_TOOLSERVER_TOKEN`; the audit records it as
   `console`. `tests/approvals_assertion.rs` checks every approvals route and method for each
@@ -428,7 +428,7 @@ only as `PMOS_ASSERTION_MODE` allows (`docs/user-assertion.md`):
   `GET /internal/approvals/{id}` must name its PM (`?user=`), so it is checked like the rest;
   from the console token it may name no one, but under `require` it still needs an assertion.
   With one, an item that isn't the subject's is `404`, except to the console when the subject
-  is an admin in `team.yaml`. In `off` and `verify`, the console's unsigned read of one item
+  is an active admin in the user database. In `off` and `verify`, the console's unsigned read of one item
   still reads any item.
 - **Answer:** every failure is `401 {"code": "bad_assertion"}`; the log has the client and the
   kind of failure, never the assertion, a key or a handle.
@@ -540,7 +540,8 @@ channel with more counts as having outsiders). An edit is checked against its ed
 channel. Then, in order:
 
 1. **Restricted sources never reach outsiders.** If `sources_sensitivity` is `restricted` and
-   any member isn't in `team.yaml` (by Slack id), or the channel is shared outside the
+   any member isn't on the product team (an active user holding `pm`, `reviewer` or `admin`,
+   found by Slack id: a deactivated or auditor-only person is an outsider), or the channel is shared outside the
    company (`is_ext_shared`): `409 {code: "audience_blocked", error, outsiders, members,
    external}`. Nothing is written and the item stays `pending`; the PM can reject it. An edit
    doesn't change what the draft was built from, so it is blocked too.
@@ -553,12 +554,12 @@ channel. Then, in order:
 If either Slack call fails (no such channel, a missing scope, Slack down), the decision fails
 closed: `503 {code: "audience_unavailable", error}`, nothing written, the item still
 `pending`. A block or confirmation request is audited as `denied` with its code in `detail`
-(`audience_blocked: 2 not in team.yaml, external: false`, `needs_external_confirm`); an
+(`audience_blocked: 2 not on the product team, external: false`, `needs_external_confirm`); an
 unavailable check as `error` (`audience_unavailable: …`). Rejecting is never checked. A write
 approved in the harness with a grant doesn't go through this check.
 
-The members count against `team.yaml` as loaded, enforced or not: with fake connectors and an
-empty `team.yaml`, everyone is an outsider.
+The members count against the user database, read for each decision: with an empty
+directory, everyone is an outsider; with the database unreachable, nothing is posted.
 
 **The 24-hour expiry (SLK-8).** A sweeper runs at start-up and every 10 minutes:
 - **Undecided drafts expire.** A `pending` Slack draft older than `PMOS_SLACK_DRAFT_TTL_HOURS`
@@ -604,7 +605,7 @@ Spec: `docs/bot-runtime-spec.md` §2.
 | Data class | the role's `data-class` |
 | A write set to `never` (`bot.action_setting(role, tool)`, the bot's override, else the role's) | not in `tools/list`; a call is refused (`403` on `/internal/call`, an MCP tool error), audited as `denied`, and never reaches the inbox. A harness grant can't make it run. |
 | A write set to `approve` | the usual grant-or-inbox path. The item records the bot, and is checked again when decided: if the bot is gone, its role lost the tool or it is now `never`, the decision is `409` and the item stays pending. |
-| `user` | the PM the task is for. A personal bot serves only its owner (`403` otherwise); a team bot, any team member (`team.yaml`, when enforced). Never a `bots.*` identity. |
+| `user` | the PM the task is for. A personal bot serves only its owner (`403` otherwise); a team bot, any active PM OS user (the user database). Never a `bots.*` identity. |
 
 Sessions, approval items and audit events record either `skill` or `bot`, never both; a bot
 session's `skill` is `null`.
@@ -630,7 +631,7 @@ read, so the follow-up's session must not start at `public`:
 - **Team bots** read Jira, Confluence and Slack as the bot's own service identity,
   `bots.<name>`. A platform owner links its read-only accounts with
   `GET /internal/oauth/{provider}/start?user=bots.<name>` (service token), then opens the
-  URL signed in as the bot's account. The `team.yaml` identity check is skipped only for
+  URL signed in as the bot's account. The user-database identity check is skipped only for
   `bots.<valid bot name>`; such a handle is never a PM, so it gets no session and can't
   decide approvals. `GET /internal/credentials?user=bots.<name>` and
   `DELETE /internal/credentials/bots.<name>/{provider}` list and unlink it. If it isn't
@@ -911,9 +912,10 @@ docs.github.com in November 2026, and tested against local mocks (`tests/live_co
 **Linking an account.**
 1. The Slack bot (its Accounts tab, or a first-use prompt) asks `/internal/oauth/{provider}/start` for a URL and sends the PM there.
 2. Atlassian or Slack sends the PM's browser back to `/oauth/{provider}/callback`.
-3. The tool server exchanges the code and checks the account belongs to that PM in
-   `team.yaml`: the Slack user must be the member's `slack-id`, and the Atlassian account's
-   email (from `/me`, scope `read:me`) must be the member's `email`. For GitHub, see
+3. The tool server exchanges the code and checks the account belongs to that PM in the user
+   database: the Slack user must be their Slack identity; the Atlassian account (from `/me`,
+   scope `read:me`) must be the one they linked first (its `account_id`), or on a first link
+   have their `atlassian_email` (see **The tool server decides from the user database**). For GitHub, see
    **GitHub**. Only then does it seal the tokens in the vault. A link forwarded to someone else
    attaches nothing.
 
@@ -979,8 +981,10 @@ with no scope (the App's permissions apply); the code is exchanged at
 1. `GET /user` gives the login.
 2. `GET /user/memberships/orgs/{PMOS_GITHUB_ORG}` must say `state: active`. A pending
    invitation or no membership is refused.
-3. If the member has `github` in `team.yaml`, the login must equal it (ignoring case).
-   Otherwise one **verified** address from `GET /user/emails` must equal their `email`.
+3. After their first link, the GitHub numeric user id must be the one recorded then (`409
+   different_account` otherwise). Before it: if the member has a `github_login` in the user
+   database, the login must equal it (ignoring case).
+   Otherwise one **verified** address from `GET /user/emails` must equal their `atlassian_email`.
 4. The login is kept as the credential's `external_id`.
 
 **Tokens** expire in 8 hours; the refresh token in about 6 months, and it rotates. GitHub
@@ -1042,18 +1046,31 @@ record of which repo (`memory_repos`) is set with `POST /internal/memory/repo` (
 
 ### Members
 
-Someone not in `team.yaml` asks in Slack; a platform owner (`admin` in `team.yaml`) approves
-or rejects there (`src/onboarding.rs`, `docs/onboarding-spec.md`). Requests are stored in
-`member_requests`; at most one is pending per Slack id, and at most 20 in all. The proposed
-handle comes from `propose_handle`, avoiding `team.yaml` and pending requests.
+Someone not in the user database asks in Slack; a platform owner (an active `admin` in the
+user database) approves or rejects there (`src/onboarding.rs`, `docs/onboarding-spec.md`).
+Requests are stored in `member_requests`; at most one is pending per Slack id, and at most 20
+in all. The proposed handle comes from `propose_handle`, avoiding every handle in the user
+database (deactivated people's too: handles are never reused) and pending requests. A Slack
+id that belongs to a deactivated user is `409 deactivated` ("your access was turned off"),
+not a new request.
 
-**Approving** commits, in **one commit** on `PMOS_CONTENT_BRANCH` with the approving admin's
-own GitHub token:
+**Approving** (since slice U3, `docs/user-database-spec.md` §4) first **creates the user in the
+database** (`active`, the display name from the request, cleaned; the Slack identity; the
+request's email as both `sign_in_name` and `atlassian_email`), so the person can use PM OS at
+once. The bot and service tokens both name the deciding admin unsigned, so the join gets
+**`pm` only**: `admin` is `403 admin_not_from_slack` (was `admin_by_pull_request`), any other
+role `403 role_not_from_slack`, audited as `denied`, the request still pending, nothing
+written. The sign-in name came through an unsigned client, so it is **unconfirmed**: the
+person can use Slack and link Atlassian and GitHub, but can't first-link Entra until an admin
+confirms it in the web app (slice U5). An address that belongs to another user is `409
+already_member`.
+
+**Then** it commits, in **one commit** on `PMOS_CONTENT_BRANCH` with the approving admin's own
+GitHub token:
 - `{PMOS_CONTENT_DIR}/team.yaml`: the file at the branch head plus the new member
-  (`handle`, `slack-id`, `email`, `roles`, default `[pm]`), written with `render_team_yaml`.
-  From Slack (the bot token), `roles` may be `pm` and `skill-author` only: `admin` is
-  refused with `403 admin_by_pull_request` and nothing is committed; a new admin is made by a
-  pull request to `team.yaml` (or with the service token);
+  (`handle`, `slack-id`, `email`, `roles: [pm]`), written with `render_team_yaml`. Until slice
+  U7 retires the file, the runtime, Slack, `pmos-web` and the console still read it, and
+  `pmos lint` checks bot owners against it;
 - `{PMOS_CONTENT_DIR}/bots/pm-<handle>/BOT.md` from `render_personal_bot`;
 - `{PMOS_POLICIES_DIR}/bots/pm-<handle>.yaml` and `pm-<handle>.sandbox.yaml`, the bot's sandbox
   policy and launch spec from `pmos_policy`, so `pmos policy check` has nothing missing.
@@ -1062,34 +1079,114 @@ The message is `Add <handle> to PM OS` with the trailer `Approved-by: <admin> (S
 <id>)`. Before committing, the new `team.yaml` must parse and pass the team lint rules, and
 the content with the new member in it (a scratch copy of the checkout) must pass `pmos lint`,
 since the policies are generated from it. The handle must pass `valid_new_handle` and be
-unused at the branch head (`422 bad_handle` otherwise). Decisions run one at a time, so two
-admins clicking at once make one commit; the store also lets only one decision win.
+unused (`422 bad_handle` otherwise). Decisions run one at a time, so two admins clicking at
+once make one commit; the store also lets only one decision win.
+
+**If the commit doesn't happen** (the admin hasn't linked GitHub, can't push, the branch
+keeps moving, GitHub fails), access doesn't wait for it: the user stays active, the request is
+`approved` with `commit: null` and an `error` saying why the personal bot is missing, and the
+answer is `200`. An admin retries the bot later (slice U5's
+`POST /internal/admin/users/{handle}/personal-bot`).
 
 **POL-2, for these policy files:** they are generated unchanged from the already-reviewed
 `pm-assistant` role template, and the approving platform owner is their reviewer of record,
 named in the `Approved-by` trailer. Any hand change to them still goes by pull request with a
 second owner.
 
-After the commit, the in-memory team includes the new member at once (so the Slack welcome
-checklist works before any pull), and the content checkout is synced (below). A commit that
-fails for any other reason marks the request `failed` with a readable `error` (`502`).
-
-**Removing** (`/internal/members/{handle}/remove`) commits `team.yaml` without the member and
-deletes their `BOT.md` and its two policy files, in one commit. Then every linked account is
-unlinked and their memory-repo record deleted; the repo itself is theirs and is left alone.
-The in-memory team drops them at once. Someone who still owns a team bot can't be removed
-(`409 owns_bots`): the bot's owner must change first, or the content would fail the lint.
+**Removing** (`/internal/members/{handle}/remove`) is a **deactivation** since slice U3; nothing
+is committed (the answer is `{handle, deactivated: true, commit: null, note}`). See
+**Deactivation** below. Refused: `403 not_admin`, `403 self_removal`, `404 not_a_member`,
+`409 owns_bots` (someone who still owns a team bot: its owner must change first), `403
+protected_not_from_slack` (an Admin or Auditor: host or web only), `429 deactivation_limit`,
+`409 already_deactivated`, `409 last_admin`.
 
 **Audit:** every decision and removal is an event with `tool` `members.add` or
 `members.remove`, `user` the admin, the caller (`bot` from Slack), outcome `approved`,
-`rejected`, `failed`, `ok` or `denied`, and `output_ref` the commit sha.
+`rejected`, `ok` or `denied`, and `output_ref` the commit sha when there is one; the user
+store records its own `users.create` / `users.deactivate` events (and `denied` ones with the
+refusal code).
 
-### The user database (slice U1: the store only)
+### The tool server decides from the user database (slice U3)
+
+Since slice U3 the tool server reads its own users tables (`src/users/access.rs`, `People`)
+for every decision it makes; `team.yaml` is no longer read by it at all (onboarding still
+**writes** it, above, for the other services until U7).
+
+- **Who may use PM OS:** an active user holding `pm`, `reviewer` or `admin`. An auditor-only
+  person never gets an MCP session, never decides a draft, never links an account. A team
+  bot's identity (`bots.*`) is never a user.
+- **Fresh for decisions:** session creation, decisions, draft saves, account links, admin
+  reads, onboarding and the audience check read the store each time (`UserStore::snapshot`,
+  one consistent read). An **open MCP session** is re-checked on every call against a
+  directory at most 5 seconds old; a write through this server empties that cache, and a
+  deactivation also deletes the person's sessions in its own transaction, so it dies at once
+  even when a host command made it.
+- **No open directory:** with fake connectors and no seed, nobody may use PM OS; the dev and
+  eval stacks seed the in-memory store (`PMOS_USERS_SEED`, which must name an admin). An open
+  directory exists for tests only (the `test-support` feature, never in a release binary).
+  At start-up the server logs a warning when the user database is empty.
+- **The audience check** for a restricted Slack draft: insiders are active users holding
+  `pm`, `reviewer` or `admin`, found by their Slack identity; a deactivated or auditor-only
+  person is an outsider. With the user database unreachable, nothing is posted
+  (`503 audience_unavailable`).
+- **The console's single-item read:** an assertion subject who isn't the item's PM reads it
+  only when they are an active admin in the database, read for that request.
+- **Admin reads** (`app/admin.rs`): the viewer's roles come from the database (a deactivated
+  person's kept roles grant nothing); `accounts` lists every user with `status` and `roles`;
+  `overview` adds `held_drafts` and `users` (below). A person holding Admin and Auditor under
+  the pilot exception has every audit-log read and export recorded with the detail
+  `dual_role admin+auditor`; once the exception has lapsed, those reads are `403
+  role_conflict` (admin powers stay).
+- **The overview's `users`:** counts `active` and `deactivated`; `sign_in_unconfirmed` (joined
+  through Slack, Microsoft sign-in name not confirmed); `dual_role`; `pilot_exception`
+  (`ends`, `ending_soon` within 14 days, `lapsed`) and `role_conflicts` once lapsed;
+  `entra_needs_host`; `identity_conflicts` (`users.identity_conflict` events in the last 7
+  days); `resolve_miss_warning` (clients past 100 resolve misses in an hour);
+  `deactivations_last_hour`, `deactivation_limit`, `deactivation_limit_reached`;
+  `bots_without_active_owner`. Handles and counts only, never an address, Slack id or `oid`.
+
+**Account linking** checks the account against the database (`src/oauth.rs`): the person must
+be an active user; Slack: the member id must be their Slack identity; **Atlassian and GitHub:
+after the first link the account id decides** (the Atlassian `account_id` from `/me`, the
+GitHub numeric user id), stored as an identity (`users.identity_link`); a link that signs in
+with a different account is refused `409 different_account` (the callback page) and nothing
+is stored, until an admin unlinks it (slice U5). Before the first link, the Atlassian email
+must equal their `atlassian_email`, and the GitHub login their `github_login` (or, with none,
+a verified email equal to their `atlassian_email`). The Atlassian account id is kept as the
+credential's `external_id`.
+
+### Deactivation
+
+One transaction (Postgres; in memory, the same steps under one lock), then a 24-hour grace,
+then clean-up, each recorded in `role_changes` and the audit log:
+
+| What | At deactivation | After 24 hours, unless reactivated |
+| --- | --- | --- |
+| Status | `deactivated` | — |
+| `admin` | Revoked (`revoke`, detail `on deactivation`); reactivation never restores it (`grant-admin` on the host) | — |
+| MCP sessions | Deleted | — |
+| Linked accounts | **Suspended** (`credentials.suspended_at`, migration 0017; `suspend_credentials`): the vault never unseals a suspended credential, so no connector call can use it | **Deleted** by the sweeper (`delete_credentials`, `users.deactivate` detail `credentials deleted`) |
+| Pending drafts | **Held**: still pending, but a decision is refused because the owner isn't an active user | **Closed** as `rejected` by `system`, ledger reason `owner_deactivated`; nothing is written |
+
+**Reactivation** within the grace restores the accounts (`credentials restored`) and the held
+drafts can be decided again; after the grace the accounts and drafts are gone, whether or not
+the sweeper ran first. The sweeper runs every 10 minutes beside the draft sweeper and does
+nothing if the database is unavailable.
+
+**The cap:** at most `PMOS_USERS_DEACTIVATIONS_PER_HOUR` (1 to 10, default 3) deactivations in
+any rolling hour from the web and Slack clients together, counted from `role_changes` under
+the users lock. The next is `429 deactivation_limit`, recorded as a `denied` event; a refused
+attempt writes no `role_changes` row, so it never counts, and a reactivation deletes nothing,
+so it never resets the window. Host commands aren't capped. From the Slack bot client an Admin
+or Auditor is never deactivated (`403 protected_not_from_slack`).
+
+### The user database: the store (slice U1)
 
 The source of users and roles is moving from `team.yaml` to the tool server's own tables
 (`docs/user-database-spec.md`). Slice U1 builds the store, its database guarantees and the
-host commands. **Nothing decides from it yet:** every service still reads `team.yaml` until
-slices U3-U7 cut them over. The read API (slice U2) is below.
+host commands. Since slice U3 the tool server decides from it (above); the runtime, Slack,
+`pmos-web` and the console still read `team.yaml` until slices U4a-d. The read API (slice U2)
+is below.
 
 **Tables** (migration 0015): `users` (handle, display name, `sign_in_name` for Entra and
 `atlassian_email` as separate columns, GitHub login, status), `user_roles` (`admin`, `pm`,
@@ -1296,7 +1393,9 @@ cargo run -p pmos-toolserver
 | `PMOS_ASSERTION_MODE` | `require` with `PMOS_WEB_TOKEN` or `PMOS_CONSOLE_TS_TOKEN` set, else `off` | `off`, `verify` or `require`: see **Approvals auth: user assertions**. `verify` and `require` refuse to start without a key for each set token; `off` and `verify` refuse to start with either token set |
 | `PMOS_ASSERTION_INSECURE_OFF` | none | `1`: FAKE-DATA DEVELOPMENT STACKS ONLY. Lets the tool server start in `off` or `verify` with a web or console token set; logs `INSECURE` at error level. Refused (the tool server won't start) with `PMOS_CONNECTORS=live`, or with `PMOS_DATABASE_URL` set without `PMOS_DEV=1`; `deploy/compose.yaml` doesn't pass it |
 | `PMOS_ASSERTION_KEYS` | none | `web:toolserver:<kid>:<base64>[:<kid>:<base64>],console:toolserver:…` (`docs/user-assertion.md`, Keys). A malformed list, a key under 32 bytes, or another service's pair refuses to start, in every mode |
-| `PMOS_CONNECTORS` | required | `live` for real Atlassian and Slack with each PM's own token, and only people in `team.yaml` may have sessions; `fake` for fixture data (dev, tests, and everything before Gate 1), with `team.yaml` not enforced |
+| `PMOS_CONNECTORS` | required | `live` for real Atlassian and Slack with each PM's own token; `fake` for fixture data (dev, tests, and everything before Gate 1). Either way, only active users in the user database (a seed in dev) may have sessions |
+| `PMOS_USERS_DEACTIVATIONS_PER_HOUR` | `3` | How many people the web app and Slack together may deactivate in any rolling hour (1 to 10); past it, `429 deactivation_limit` and host commands only (see **Deactivation**) |
+| `PMOS_USERS_SEED` | unset | Development and eval stacks only (refused with a database or live connectors): a `team.yaml`-shaped file loaded into the in-memory user database at start-up; it must name an admin |
 | `PMOS_DATABASE_URL` | required | Postgres for every store. `PMOS_DEV=1` without it keeps everything in memory. |
 | `PMOS_AUDIT_LOG` | none | Also writes audit events to this JSON-lines file, for shipping off-box |
 | `PMOS_CONTENT_ROOT` | `content` | Must pass `pmos lint`, or the server won't start |

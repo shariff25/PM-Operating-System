@@ -197,24 +197,111 @@ pub async fn pg_fixture() -> Option<(Fixture, TestPg)> {
     Some((fixture, pg))
 }
 
-/// The in-memory fixture with `team.yaml` enforced, as with live connectors.
-pub fn team_fixture(members: &[&str]) -> Fixture {
+/// The handle and Slack id of the admin a seeded directory gets when its members name none
+/// (the user database always has an active admin).
+pub const FIXTURE_ADMIN: (&str, &str) = ("fixture-admin", "U0FIXADMIN");
+
+/// `members` as a `team.yaml`-shaped seed, with [`FIXTURE_ADMIN`] added when none of them is
+/// an admin.
+pub fn seed_request(
+    mut members: Vec<pmos_contract::model::TeamMember>,
+) -> pmos_toolserver::users::ImportRequest {
+    use pmos_contract::model::{Role, TeamMember};
+    if !members.iter().any(|m| m.roles.contains(&Role::Admin)) {
+        members.push(TeamMember {
+            handle: FIXTURE_ADMIN.0.into(),
+            slack_id: FIXTURE_ADMIN.1.into(),
+            email: None,
+            github: None,
+            entra_oid: None,
+            roles: vec![Role::Pm, Role::Admin],
+        });
+    }
+    pmos_toolserver::users::ImportRequest {
+        file: pmos_contract::model::TeamFile { members },
+        sha256: "0".repeat(64),
+        commit: None,
+        mode: pmos_toolserver::users::ImportMode::Bootstrap,
+    }
+}
+
+/// An in-memory user store seeded with `members` (and [`FIXTURE_ADMIN`] if none is an admin),
+/// whose deactivations reach `stores`. The `evals` account may have its fake Slack id, as in
+/// the eval stack's seed.
+pub async fn memory_users(
+    members: Vec<pmos_contract::model::TeamMember>,
+    stores: &Stores,
+) -> Arc<dyn pmos_toolserver::users::UserStore> {
+    let rules = pmos_toolserver::users::Rules {
+        evals_slack_allowed: true,
+        ..Default::default()
+    };
+    Arc::new(
+        pmos_toolserver::users::MemoryUsers::seeded(
+            seed_request(members),
+            rules,
+            Some(stores.audit.clone()),
+        )
+        .await
+        .expect("the fixture seed applies")
+        .with_linked(stores.linked()),
+    )
+}
+
+/// Seed `members` (and [`FIXTURE_ADMIN`] if none is an admin) into `stores`' own user store,
+/// as `import --bootstrap` does.
+pub async fn seed_users(stores: &Stores, members: Vec<pmos_contract::model::TeamMember>) {
+    stores
+        .users
+        .apply(
+            &pmos_toolserver::users::Actor::import(None),
+            pmos_toolserver::users::Op::Import(Box::new(seed_request(members))),
+            seeded_at(),
+        )
+        .await
+        .expect("the fixture seed applies");
+}
+
+/// When fixtures seed their user database ([`now`]): its audit events are the newest.
+pub fn seeded_at() -> DateTime<Utc> {
+    now()
+}
+
+/// A `team.yaml` member: `handle`, Slack id, roles.
+pub fn member(
+    handle: &str,
+    slack_id: &str,
+    roles: Vec<pmos_contract::model::Role>,
+) -> pmos_contract::model::TeamMember {
+    pmos_contract::model::TeamMember {
+        handle: handle.to_string(),
+        slack_id: slack_id.to_string(),
+        email: None,
+        github: None,
+        entra_oid: None,
+        roles,
+    }
+}
+
+/// A distinct fake Slack id for the `i`th fixture member.
+fn slack_of(i: usize) -> String {
+    format!("U0TEST{i:03}")
+}
+
+/// The in-memory fixture with the user database enforced, holding `members` as PMs.
+pub async fn team_fixture(members: &[&str]) -> Fixture {
     let (dir, root) = content_tree();
     let (stores, audit) = Stores::in_memory(&root);
-    let team = pmos_toolserver::team::Team::of(
+    seed_users(
+        &stores,
         members
             .iter()
-            .map(|h| pmos_contract::model::TeamMember {
-                handle: h.to_string(),
-                slack_id: "U0TEST".into(),
-                email: None,
-                github: None,
-                entra_oid: None,
-                roles: vec![pmos_contract::model::Role::Pm],
-            })
+            .enumerate()
+            .map(|(i, h)| member(h, &slack_of(i), vec![pmos_contract::model::Role::Pm]))
             .collect(),
-    );
-    build_with(dir, root, stores, audit, Some(team))
+    )
+    .await;
+    build_with(dir, root, stores, audit, true)
 }
 
 /// For the Slack reply assistant: `team.yaml` enforced with the Slack fixtures' team
@@ -228,19 +315,10 @@ pub async fn reply_fixture(postgres: bool) -> Option<(Fixture, Option<TestPg>)> 
         "skills/reply-test/SKILL.md",
         "---\nname: reply-test\ndescription: Test skill that drafts Slack replies.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"restricted\"\n  tools: \"context.search context.read jira.search jira.read docs.search docs.read slack.search slack.read_thread slack.post_reply slack.send_message jira.create_issue memory.read memory.update\"\n---\n\n# /reply-test\n\nTest.\n",
     );
-    let team = pmos_toolserver::team::Team::of(
-        pmos_toolserver::connectors::fake::SLACK_TEAM
-            .iter()
-            .map(|(handle, slack_id)| pmos_contract::model::TeamMember {
-                handle: handle.to_string(),
-                slack_id: slack_id.to_string(),
-                email: None,
-                github: None,
-                entra_oid: None,
-                roles: vec![pmos_contract::model::Role::Pm],
-            })
-            .collect(),
-    );
+    let team: Vec<_> = pmos_toolserver::connectors::fake::SLACK_TEAM
+        .iter()
+        .map(|(handle, slack_id)| member(handle, slack_id, vec![pmos_contract::model::Role::Pm]))
+        .collect();
     if postgres {
         let pg = TestPg::new().await?;
         pg.store.reindex(&load_docs(&root)).await.expect("reindex");
@@ -251,11 +329,15 @@ pub async fn reply_fixture(postgres: bool) -> Option<(Fixture, Option<TestPg>)> 
             stores.audit.clone(),
             audit.clone(),
         ]));
-        let f = build_with(dir, root, stores, audit, Some(team));
+        // The users in memory: the `evals` account's fake Slack id is an eval stack's seed,
+        // which the database never holds.
+        stores.users = memory_users(team, &stores).await;
+        let f = build_with(dir, root, stores, audit, true);
         Some((f, Some(pg)))
     } else {
-        let (stores, audit) = Stores::in_memory(&root);
-        Some((build_with(dir, root, stores, audit, Some(team)), None))
+        let (mut stores, audit) = Stores::in_memory(&root);
+        stores.users = memory_users(team, &stores).await;
+        Some((build_with(dir, root, stores, audit, true), None))
     }
 }
 
@@ -267,46 +349,37 @@ pub async fn roles_fixture(
     postgres: bool,
 ) -> Option<(Fixture, Option<TestPg>)> {
     let (dir, root) = content_tree();
-    let team = pmos_toolserver::team::Team::of(
-        members
-            .iter()
-            .map(|(handle, role)| pmos_contract::model::TeamMember {
-                handle: handle.to_string(),
-                slack_id: "U0TEST".into(),
-                email: None,
-                github: None,
-                entra_oid: None,
-                roles: vec![role.clone()],
-            })
-            .collect(),
-    );
+    let team: Vec<_> = members
+        .iter()
+        .enumerate()
+        .map(|(i, (handle, role))| member(handle, &slack_of(i), vec![role.clone()]))
+        .collect();
     if postgres {
         let pg = TestPg::new().await?;
         pg.store.reindex(&load_docs(&root)).await.expect("reindex");
-        let f = build_with(
-            dir,
-            root,
-            pg.store.stores(),
-            Arc::new(MemoryAudit::default()),
-            Some(team),
-        );
+        let stores = pg.store.stores();
+        seed_users(&stores, team).await;
+        let f = build_with(dir, root, stores, Arc::new(MemoryAudit::default()), true);
         Some((f, Some(pg)))
     } else {
         let (stores, audit) = Stores::in_memory(&root);
-        Some((build_with(dir, root, stores, audit, Some(team)), None))
+        seed_users(&stores, team).await;
+        Some((build_with(dir, root, stores, audit, true), None))
     }
 }
 
 fn build(dir: TempDir, root: PathBuf, stores: Stores, audit: Arc<MemoryAudit>) -> Fixture {
-    build_with(dir, root, stores, audit, None)
+    build_with(dir, root, stores, audit, false)
 }
 
+/// `enforced`: the user database decides who may use PM OS; otherwise it is open (tests
+/// only: any valid handle not listed may).
 fn build_with(
     dir: TempDir,
     root: PathBuf,
     mut stores: Stores,
     audit: Arc<MemoryAudit>,
-    team: Option<Arc<pmos_toolserver::team::Team>>,
+    enforced: bool,
 ) -> Fixture {
     let audit_switch = Arc::new(SwitchAudit {
         inner: stores.audit.clone(),
@@ -324,8 +397,8 @@ fn build_with(
         Arc::new(FakeConnector::docs()),
     ];
     let mut svc = ToolService::new(catalog, stores.clone(), connectors).unwrap();
-    if let Some(team) = team {
-        svc = svc.with_team(team);
+    if !enforced {
+        svc = svc.with_open_directory();
     }
     Fixture {
         _dir: dir,

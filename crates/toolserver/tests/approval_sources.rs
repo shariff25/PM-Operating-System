@@ -86,6 +86,7 @@ async fn link_site(f: &Fixture, user: &str) {
             site_url: Some(format!("{SITE}/")),
             external_id: None,
             updated_at: Utc::now(),
+            suspended_at: None,
         })
         .await
         .unwrap();

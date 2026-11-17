@@ -235,7 +235,10 @@ start docs env PMOS_DEV=1 PMOS_DOCS_TOKEN="$DOCS_TOKEN" PMOS_DOCS_BIND=127.0.0.1
   "$BIN/pmos-docs"
 wait_for http://127.0.0.1:8730/healthz docs
 
+# The tool server decides who may use PM OS from its user database (slice U3), in memory
+# here: seeded from the same team.yaml the other services still read, so the two agree.
 start toolserver env PMOS_DEV=1 PMOS_CONNECTORS=fake \
+  PMOS_USERS_SEED="$STATE/content/team.yaml" \
   PMOS_SERVICE_TOKEN="$SERVICE_TOKEN" PMOS_BOT_TOKEN="$BOT_TOKEN" \
   PMOS_WEB_TOKEN="$TS_WEB" PMOS_ASSERTION_MODE="$ASSERTION_MODE" PMOS_ASSERTION_KEYS="$AK_TOOLS" \
   PMOS_CONTENT_ROOT="$STATE/content" PMOS_AUDIT_LOG="$STATE/audit.jsonl" \

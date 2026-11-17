@@ -1,7 +1,9 @@
 //! The user database (`docs/user-database-spec.md`): who exists, their status, roles and keys.
 //!
-//! Slice U1 ("Store"). Nothing decides from these tables yet: every service still reads
-//! `content/team.yaml` until slices U3-U7 cut them over. What is here:
+//! Slice U1 built the store; since slice U3 the tool server decides from it (who may have a
+//! session, decide an approval, link an account, read the admin screens, approve a join;
+//! [`access::People`]). The runtime, Slack, `pmos-web` and the console still read
+//! `content/team.yaml` until slices U4a-d. What is here:
 //!
 //! - the model ([`User`], [`UserRole`], [`Identity`], [`RoleChange`], [`PilotException`]);
 //! - [`UserStore`], with a Postgres implementation (`pg.rs`, migration 0015) and an in-memory
@@ -20,6 +22,7 @@
 //! write records a `denied` audit event with the refusal's code. Neither carries an address,
 //! an `oid` or a token.
 
+pub mod access;
 pub mod detail;
 pub mod host;
 pub mod import;
@@ -53,9 +56,14 @@ pub fn deactivation_window() -> Duration {
     Duration::hours(1)
 }
 
-/// A deactivated person's linked accounts are deleted this long after deactivation unless
-/// they are reactivated first (owner's answer to open question 2). Used by slice U3.
+/// A deactivated person's linked accounts are deleted, and their held drafts closed, this long
+/// after deactivation unless they are reactivated first (owner's answer to open question 2).
 pub const CREDENTIAL_GRACE_HOURS: i64 = 24;
+
+/// The grace as a duration.
+pub fn credential_grace() -> Duration {
+    Duration::hours(CREDENTIAL_GRACE_HOURS)
+}
 
 /// `role_changes` rows about a person are kept until this long after their deactivation
 /// (owner Q5). Written into the database's trigger too.
@@ -490,6 +498,24 @@ impl Actor {
             host_user: None,
         }
     }
+
+    /// A person linking their own account through OAuth (the sign-in proves it).
+    pub fn link(handle: &str) -> Self {
+        Self {
+            name: handle.into(),
+            via: Via::Link,
+            host_user: None,
+        }
+    }
+
+    /// The tool server itself: the credential sweeper.
+    pub fn system() -> Self {
+        Self {
+            name: "system".into(),
+            via: Via::System,
+            host_user: None,
+        }
+    }
 }
 
 /// Why a write was refused. [`Refusal::code`] is what the audit event's detail and an API's
@@ -533,10 +559,14 @@ pub enum Refusal {
     ExceptionTooLong,
     /// The import stopped before any write (unknown role, duplicate key, …).
     ImportRefused,
+    /// An Atlassian or GitHub link with another account than the one linked first (§6).
+    DifferentAccount,
+    /// Past the grace: nothing left to clean up yet, or the person isn't deactivated.
+    NotDue,
 }
 
 impl Refusal {
-    pub const ALL: [Refusal; 27] = [
+    pub const ALL: [Refusal; 29] = [
         Self::Invalid,
         Self::NotFound,
         Self::Exists,
@@ -564,6 +594,8 @@ impl Refusal {
         Self::NoException,
         Self::ExceptionTooLong,
         Self::ImportRefused,
+        Self::DifferentAccount,
+        Self::NotDue,
     ];
 
     pub fn code(self) -> &'static str {
@@ -595,6 +627,8 @@ impl Refusal {
             Self::NoException => "no_exception",
             Self::ExceptionTooLong => "exception_too_long",
             Self::ImportRefused => "import_refused",
+            Self::DifferentAccount => "different_account",
+            Self::NotDue => "not_due",
         }
     }
 
@@ -729,6 +763,18 @@ pub enum Op {
         revoke_auditor: bool,
     },
     Import(Box<ImportRequest>),
+    /// A person's own Atlassian or GitHub link (§6): the first link stores the account id as
+    /// an identity; a later link must present the same id.
+    LinkAccount {
+        handle: String,
+        kind: IdentityKind,
+        subject: String,
+    },
+    /// The sweeper (§6): the grace after a deactivation is over, so the person's suspended
+    /// credentials are deleted and their held drafts closed.
+    EndGrace {
+        handle: String,
+    },
 }
 
 impl Op {
@@ -746,6 +792,8 @@ impl Op {
             Self::Reactivate { .. } => "users.reactivate",
             Self::ExceptionOn { .. } | Self::ExceptionOff { .. } => "users.pilot_exception",
             Self::Import(_) => "users.import",
+            Self::LinkAccount { .. } => "users.identity_link",
+            Self::EndGrace { .. } => "users.deactivate",
         }
     }
 
@@ -760,7 +808,9 @@ impl Op {
             | Self::UnsetEntra { handle }
             | Self::SetField { handle, .. }
             | Self::Deactivate { handle }
-            | Self::Reactivate { handle } => handle.clone(),
+            | Self::Reactivate { handle }
+            | Self::LinkAccount { handle, .. }
+            | Self::EndGrace { handle } => handle.clone(),
             Self::ExceptionOn { .. } | Self::ExceptionOff { .. } | Self::Import(_) => "*".into(),
         }
     }

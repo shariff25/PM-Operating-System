@@ -35,8 +35,8 @@ pub struct Stores {
     pub memory_repos: Arc<dyn MemoryRepoStore>,
     /// Requests to join PM OS; see `members.rs`.
     pub member_requests: Arc<dyn MemberRequestStore>,
-    /// The user database (`users/`). Nothing decides from it yet (slice U1): the services
-    /// read `team.yaml` until slices U3-U7 cut them over.
+    /// The user database (`users/`): the tool server's source of users and roles since slice
+    /// U3 (`users::access::People`).
     pub users: Arc<dyn UserStore>,
 }
 
@@ -45,17 +45,35 @@ impl Stores {
     /// audit sink too, so tests can read its events.
     pub fn in_memory(content_root: &std::path::Path) -> (Self, Arc<MemoryAudit>) {
         let audit = Arc::new(MemoryAudit::default());
-        let stores = Self {
+        let sessions: Arc<dyn SessionRepo> = Arc::new(MemorySessions::default());
+        let approvals: Arc<dyn ApprovalRepo> = Arc::new(MemoryApprovals::default());
+        let credentials: Arc<dyn CredentialStore> = Arc::new(MemoryCredentials::default());
+        let mut stores = Self {
             context: Arc::new(MemoryIndex::load(content_root)),
             memory: Arc::new(InMemoryStore::default()),
-            sessions: Arc::new(MemorySessions::default()),
-            approvals: Arc::new(MemoryApprovals::default()),
+            sessions,
+            approvals,
             audit: audit.clone(),
-            credentials: Arc::new(MemoryCredentials::default()),
+            credentials,
             memory_repos: Arc::new(MemoryRepos::default()),
             member_requests: Arc::new(MemoryRequests::default()),
-            users: Arc::new(MemoryUsers::default().with_audit(audit.clone())),
+            users: Arc::new(MemoryUsers::default()),
         };
+        stores.users = Arc::new(
+            MemoryUsers::default()
+                .with_audit(audit.clone())
+                .with_linked(stores.linked()),
+        );
         (stores, audit)
+    }
+
+    /// The stores a deactivation and a reactivation reach (an in-memory user store's
+    /// [`crate::users::memory::LinkedStores`]).
+    pub fn linked(&self) -> crate::users::memory::LinkedStores {
+        crate::users::memory::LinkedStores {
+            sessions: self.sessions.clone(),
+            credentials: self.credentials.clone(),
+            approvals: self.approvals.clone(),
+        }
     }
 }

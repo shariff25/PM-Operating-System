@@ -117,6 +117,8 @@ services:
       # Audit events older than this are deleted daily (docs/audit-retention.md). 90 or more;
       # the tool server refuses to start with less.
       PMOS_AUDIT_RETENTION_DAYS: ${PMOS_AUDIT_RETENTION_DAYS:-90}
+      # Deactivations the web app and Slack may make in an hour (1 to 10); past it, host only.
+      PMOS_USERS_DEACTIVATIONS_PER_HOUR: ${PMOS_USERS_DEACTIVATIONS_PER_HOUR:-3}
     volumes:
       # The content checkout: the tool server pulls it (content sync), the others read it.
       - ${PMOS_CONTENT_CHECKOUT:?}:/srv/content-repo

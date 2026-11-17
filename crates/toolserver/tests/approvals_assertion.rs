@@ -737,7 +737,7 @@ async fn one_item_reads_are_the_subjects_own_or_a_signed_admins() {
     let a = console.sign(SLACK_PM, "GET", &theirs, b"");
     let (s, _) = srv.get(&theirs, CONSOLE_TOKEN, Some(&a)).await;
     assert_eq!(s, 404);
-    // The roles in the assertion don't count; the tool server's team.yaml does.
+    // The roles in the assertion don't count; the tool server's user database does.
     let claims = Claims::new("console", "toolserver", SLACK_PM, &[Role::Admin], "ses_t").unwrap();
     let req = RequestBinding::new("GET", &theirs, b"").unwrap();
     let a = console
@@ -746,17 +746,48 @@ async fn one_item_reads_are_the_subjects_own_or_a_signed_admins() {
         .unwrap();
     let (s, _) = srv.get(&theirs, CONSOLE_TOKEN, Some(&a)).await;
     assert_eq!(s, 404);
-    // Made an admin there: answered.
-    let mut file = srv._f.svc.team().file();
-    for m in &mut file.members {
-        if m.handle == SLACK_PM {
-            m.roles.push(Role::Admin);
-        }
-    }
-    srv._f.svc.team().replace(file);
-    let a = console.sign(SLACK_PM, "GET", &theirs, b"");
+    // Made an admin there (on the host; `evals` itself may hold pm only): answered, at once.
+    let cy = "cy";
+    let a = console.sign(cy, "GET", &theirs, b"");
+    let (s, _) = srv.get(&theirs, CONSOLE_TOKEN, Some(&a)).await;
+    assert_eq!(s, 404, "a PM who isn't an admin");
+    srv._f
+        .stores
+        .users
+        .apply(
+            &pmos_toolserver::users::Actor::host(
+                pmos_toolserver::users::HostUser::parse("ops").unwrap(),
+            ),
+            pmos_toolserver::users::Op::GrantAdmin {
+                handle: cy.into(),
+                entra: pmos_toolserver::users::AdminEntra::Oid(pmos_toolserver::users::EntraKey {
+                    tid: "11111111-1111-1111-1111-111111111111".into(),
+                    oid: "22222222-2222-2222-2222-222222222222".into(),
+                }),
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    let a = console.sign(cy, "GET", &theirs, b"");
     let (s, v) = srv.get(&theirs, CONSOLE_TOKEN, Some(&a)).await;
     assert_eq!(s, 200, "{v}");
+    // Deactivated (admin revoked with it): as if it didn't exist again.
+    srv._f
+        .stores
+        .users
+        .apply(
+            &pmos_toolserver::users::Actor::host(
+                pmos_toolserver::users::HostUser::parse("ops").unwrap(),
+            ),
+            pmos_toolserver::users::Op::Deactivate { handle: cy.into() },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    let a = console.sign(cy, "GET", &theirs, b"");
+    let (s, _) = srv.get(&theirs, CONSOLE_TOKEN, Some(&a)).await;
+    assert_eq!(s, 404);
     // The web app is never the admin view: an admin still reads only their own items there.
     let read = format!("/internal/approvals/{}?user={SLACK_PM}", srv.theirs);
     let a = Signer::web().sign(SLACK_PM, "GET", &read, b"");

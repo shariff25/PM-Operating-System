@@ -19,7 +19,7 @@ fn outcomes(f: &common::Fixture) -> Vec<(String, Outcome)> {
 
 #[tokio::test]
 async fn with_live_connectors_only_team_members_get_sessions() {
-    let f = common::team_fixture(&["ana"]);
+    let f = common::team_fixture(&["ana"]).await;
     assert!(f
         .svc
         .create_session("ana", "ask", "r1", None, now())
