@@ -4,7 +4,7 @@ The owner's requirements for the PM OS build. Read this before planning or build
 the owner on 2026-11-16 and 2026-11-17 (three decisions of 2026-11-17 reached this session through
 the reviewer session: the user database, the required assertion, 90-day purge); update it when they change something.
 
-## Scope (the owner's list, a to h)
+## Scope (the owner's list, a to g; h was dropped)
 
 - **a. Authentication:** primarily Azure AD (Entra ID) single sign-on.
 - **b. Authorization:** role-based access with four roles: Admin, Product Manager, Reviewer,
@@ -21,7 +21,8 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   older events and records its own run; nothing else can delete, and it cannot delete newer
   events.
 - **g. Connectors.**
-- **h. A review of how the Grok bot was built,** with pointers for PM OS.
+- **h. Dropped by the owner on 2026-11-17:** the review of how the Grok bot was built. Do not
+  build it.
 
 Earlier priorities that still hold: fix what the live test found (retry on quota errors, search
 before asking, keep thread context, a valid eval run); simple onboarding with gentle, funny
