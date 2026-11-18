@@ -2,7 +2,7 @@
 // Tone: light and gently funny in greetings, empty states and hints. Errors, approvals and
 // anything about security are plain.
 
-import type { DraftKind, DraftStatus, HintName, RejectReason, ServerErrorCode } from './api/types';
+import type { DraftKind, DraftStatus, HintName, RejectReason, ServerErrorCode, Verdict } from './api/types';
 
 /**
  * What approving means for each kind of draft, in one place: the button, the hint, the dialog,
@@ -449,6 +449,8 @@ export const copy = {
     draftsCount: (n: number) => `${n} ${n === 1 ? 'draft needs' : 'drafts need'} a decision`,
     followupsCount: (n: number) => `${n} waiting on you`,
     activityCount: (n: number) => `${n} still working`,
+    reviews: 'Reviews',
+    reviewsCount: (n: number) => `${n} ${n === 1 ? 'draft waits' : 'drafts wait'} for your advice`,
     collapse: 'Collapse sidebar',
     expand: 'Expand sidebar',
     skip: 'Skip to content',
@@ -599,6 +601,107 @@ export const copy = {
     emptyExpired: 'Nothing expired. Every draft got the attention it deserved.',
     created: (when: string) => `Created ${when}`,
     columns: { title: 'Draft', kind: 'Goes to', status: 'Status', expires: 'Time left', created: 'Created' },
+  },
+
+  // ---- Reviews: a reviewer recommends, the draft's owner decides ----
+  reviews: {
+    title: 'Reviews',
+    lede: 'Drafts from the PMs you review. You recommend, and each PM decides their own.',
+    countLine: (n: number) => `${n} to review`,
+    loading: 'Loading the drafts you review…',
+    loadFailed: 'I could not load the drafts you review.',
+    who: (handles: string) => `You review ${handles}.`,
+    emptyNobody: 'Nobody is assigned to you yet. An admin picks the PMs you review.',
+    empty: 'Nothing to review. Your PMs are either very careful or very quiet.',
+    truncated: (total: number, shown: number) => `${total} drafts are waiting in total. Only the newest ${shown} are listed here.`,
+    columns: { draft: 'Draft', owner: 'From', advice: 'Your advice', created: 'Created' },
+    restrictedTitle: 'Restricted draft',
+    restrictedRow: 'Built from restricted sources, so only its owner sees the text.',
+    restrictedLine: 'This draft uses restricted sources; its owner can share it with you.',
+    restrictedTag: 'Restricted sources',
+    editedByOwner: 'Edited by its owner',
+    from: (name: string) => `From ${name}`,
+    state: {
+      todo: 'Needs your advice',
+      approve: 'You recommend approving',
+      changes: 'You suggested changes',
+      stale: 'On an earlier version',
+      restricted: 'Text not shown',
+    },
+    back: 'Back to Reviews',
+    loadingDraft: 'Loading the draft…',
+    loadDraftFailed: 'I could not open that draft.',
+    breadcrumbRestricted: 'Restricted draft',
+    readOnly: 'Read only. Only its owner can edit, approve or send it.',
+    /** Each its own calm sentence: the draft can't be reviewed, and why. */
+    gone: {
+      own_draft: 'This is your own draft, so you decide it rather than review it.',
+      not_found: "This draft isn't one you review, or it no longer exists.",
+      not_pending: 'Its owner has already decided this draft, so there is nothing left to review.',
+      expired: 'This Slack draft passed its 24 hours, so there is nothing left to review.',
+      forbidden: 'Reviews are for people who hold the Reviewer role. If you should have it, ask an admin.',
+    },
+    openOwn: 'Open it in Drafts',
+    details: {
+      heading: 'Details',
+      owner: 'From',
+      kind: 'Kind',
+      target: 'Goes to',
+      created: 'Created',
+      expires: 'Expires',
+      never: 'Does not expire',
+      id: 'Draft id',
+    },
+    panel: {
+      heading: 'Your advice',
+      intro: (owner: string) => `Advice only. ${owner} decides, and nothing is sent from here.`,
+      noteLabel: (owner: string) => `Note for ${owner}`,
+      optional: 'Optional',
+      notePlaceholder: 'What looks right, or what to change',
+      counter: (n: number, max: number) => `${n} / ${max}`,
+      counterLabel: (n: number, max: number) => `${n} of ${max} characters`,
+      tooLong: (max: number) => `Keep the note to ${max} characters. Nothing is sent until it fits.`,
+      approve: 'Recommend approving',
+      changes: 'Suggest changes',
+      sending: 'Sending…',
+      mine: { approve: 'You recommend approving', changes: 'You suggested changes' } satisfies Record<Verdict, string>,
+      mineStale: { approve: 'You recommended approving an earlier version', changes: 'You suggested changes on an earlier version' } satisfies Record<Verdict, string>,
+      when: (when: string) => `Recorded ${when}`,
+      yourNote: 'Your note',
+      staleNext: 'Its owner changed the draft since. Read it again, then recommend on this version.',
+      replaces: 'Sending again replaces this one.',
+      noteRemoved: 'Your note was removed with the Slack draft’s text.',
+      recorded: { approve: 'Recorded: you recommend approving.', changes: 'Recorded: you suggested changes.' } satisfies Record<Verdict, string>,
+      changed: (owner: string) =>
+        `${owner} changed this draft after you opened it, so your recommendation was not saved. You are now looking at the new version, and your note is still here. Read it again, then recommend.`,
+      changedNoReload: 'This draft changed after you opened it, so your recommendation was not saved. I could not load the new version.',
+      reload: 'Reload the draft',
+      unsure: "I can't tell whether your recommendation was recorded: the answer was lost on the way back.",
+      unsureNext: 'Check what is recorded before you send it again.',
+      checkAgain: 'Check again',
+      checkFailed: "I still can't tell whether it was recorded. I could not reach the server to check.",
+      checkedSome: 'I checked. What is recorded now is shown above.',
+      checkedNone: 'I checked. Nothing from you is recorded on this draft yet. Your note is still here.',
+      upstream: "I couldn't reach the service behind this, so your recommendation was not saved. Try again in a minute.",
+      cannot: 'This draft can’t take a recommendation from here: the server did not say which version it is. Try again later.',
+    },
+  },
+
+  /** The owner's view of reviewers' advice, in the draft workspace and the approve dialog. */
+  recommendations: {
+    heading: 'Reviews',
+    line: (name: string, verdict: Verdict, stale: boolean) =>
+      stale
+        ? verdict === 'approve'
+          ? `${name} recommended approving an earlier version`
+          : `${name} suggested changes on an earlier version`
+        : verdict === 'approve'
+          ? `${name} recommends approving`
+          : `${name} suggests changes`,
+    earlier: 'Earlier version',
+    noteRemoved: 'The note was removed with the Slack draft’s text after 24 hours.',
+    adviceOnly: 'Advice from your reviewers. You still decide.',
+    factHeading: 'Reviews',
   },
 
   // ---- Follow-ups page ----
@@ -949,10 +1052,14 @@ export const copy = {
         atlassianEmail: 'Atlassian email',
         atlassianHint: 'Their Jira and Confluence account. Often the same.',
         githubLogin: 'GitHub login',
+        slackId: 'Slack member id',
+        slackHint: 'In Slack, open their profile, choose More (⋮), then Copy member ID. It starts with U or W.',
+        slackInvalid: 'A Slack member id is U or W, then capital letters and digits, like U012AB3CD.',
         roles: 'Roles',
         adminNote: 'Admin is not offered here: it is granted on the host, with',
         adminCommand: 'pmos-admin users grant-admin',
         required: 'Fill in the handle, both addresses and at least one role.',
+        fixSlack: 'Fix the Slack member id, or leave it empty.',
         submit: 'Invite',
         submitting: 'Inviting…',
         done: (who: string) => `${who} is in. They can sign in with Microsoft now.`,

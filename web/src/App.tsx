@@ -8,6 +8,8 @@ import { ToastProvider } from './components/Toasts';
 import { DataProvider, useData } from './data';
 import { Activity } from './pages/Activity';
 import { AdminLoading } from './components/AdminLoading';
+import { Skeleton } from './components/bits';
+import { copy } from './copy';
 import { DraftPage } from './pages/DraftPage';
 import { Drafts } from './pages/Drafts';
 import { FollowUps } from './pages/FollowUps';
@@ -24,6 +26,17 @@ import type { Route } from './url';
 // The whole Admin area (its pages, editors and diff code) is its own chunk: it is fetched the first
 // time someone opens #/admin, so a PM who never does never downloads it.
 const AdminPage = lazy(() => import('./pages/admin/AdminPage').then((m) => ({ default: m.AdminPage })));
+// Reviews are for reviewers only, so they are a chunk of their own too.
+const ReviewsPage = lazy(() => import('./pages/reviews/ReviewsPage').then((m) => ({ default: m.ReviewsPage })));
+
+/** Shown while the Reviews code is on its way. */
+function ReviewsLoading() {
+  return (
+    <div className="page">
+      <Skeleton rows={4} label={copy.reviews.loading} />
+    </div>
+  );
+}
 
 function useHashPath(): [string, (p: string) => void] {
   const read = () => window.location.hash.replace(/^#/, '') || '/';
@@ -55,6 +68,13 @@ function Page({ route }: { route: Route }) {
       return <Activity />;
     case 'task':
       return <Thread key={route.id} id={route.id} />;
+    case 'reviews':
+    case 'review':
+      return (
+        <Suspense fallback={<ReviewsLoading />}>
+          <ReviewsPage id={route.name === 'review' ? route.id : undefined} />
+        </Suspense>
+      );
     case 'admin':
       return (
         <Suspense fallback={<AdminLoading />}>

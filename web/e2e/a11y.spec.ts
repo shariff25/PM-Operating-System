@@ -515,5 +515,66 @@ for (const theme of ['light', 'dark'] as const) {
       await page.getByRole('button', { name: /^Show details for/ }).first().click();
       await scan(page, 'phone audit log, row open');
     });
+
+    test('reviews: the inbox, a draft and its panel, a recorded and a changed recommendation, restricted, own and refused', async ({ page }) => {
+      await signIn(page, theme, undefined, 'ben');
+      await go(page, '/reviews');
+      await expect(page.getByRole('list', { name: 'Reviews' }).getByRole('link').first()).toBeVisible();
+      await scan(page, 'reviews inbox');
+      await go(page, '/reviews/apr_dana_onboarding');
+      await expect(page.getByRole('region', { name: 'Your advice' })).toBeVisible();
+      await scan(page, 'review page with the panel');
+      await page.getByLabel('Note for dana').fill('x'.repeat(1001));
+      await expect(page.getByText('Keep the note to 1000 characters.', { exact: false })).toBeVisible();
+      await scan(page, 'review panel, note too long');
+      await page.getByLabel('Note for dana').fill('Looks right.');
+      await page.getByRole('button', { name: 'Recommend approving' }).click();
+      await expect(page.getByRole('region', { name: 'Your advice' }).getByText('You recommend approving', { exact: true })).toBeVisible();
+      await scan(page, 'review panel, recorded');
+      await go(page, '/reviews/apr_dana_exports');
+      await page.getByLabel('Note for dana').fill('Say who gets the email.');
+      await page.getByRole('button', { name: 'Suggest changes' }).click();
+      await expect(page.getByText(/changed this draft after you opened it/)).toBeVisible();
+      await scan(page, 'review panel, the draft changed');
+      await go(page, '/reviews/apr_prd');
+      await expect(page.getByText('This draft uses restricted sources; its owner can share it with you.')).toBeVisible();
+      await scan(page, 'review of a restricted draft');
+      await go(page, '/reviews/apr_ben_own');
+      await expect(page.getByText(/This is your own draft/)).toBeVisible();
+      await scan(page, 'review of their own draft');
+      await page.setViewportSize({ width: 390, height: 844 });
+      await go(page, '/reviews');
+      await expect(page.getByRole('list', { name: 'Reviews' }).getByRole('link').first()).toBeVisible();
+      await scan(page, 'phone reviews inbox');
+      await go(page, '/reviews/apr_jira');
+      await expect(page.getByRole('region', { name: 'Your advice' })).toBeVisible();
+      await scan(page, 'phone review page');
+    });
+
+    test('reviews: the owner’s Reviews block, stale, and the approve dialog with the advice', async ({ page }) => {
+      await signIn(page, theme);
+      await go(page, '/d/apr_jira');
+      await expect(page.getByRole('region', { name: 'Reviews' })).toBeVisible();
+      await page.getByRole('button', { name: 'Edit', exact: true }).click();
+      await page.getByLabel('Draft text').fill('Show the banner in the admin’s time zone.');
+      await page.getByRole('button', { name: 'Save', exact: true }).click();
+      await expect(page.getByRole('region', { name: 'Reviews' }).getByText('Earlier version', { exact: true })).toBeVisible();
+      await scan(page, 'owner Reviews block, stale');
+      await page.getByRole('button', { name: 'Approve to Jira' }).click();
+      await expect(page.getByRole('dialog').getByText('Ben Carter suggested changes on an earlier version')).toBeVisible();
+      await scan(page, 'approve dialog with advice');
+      await page.keyboard.press('Escape');
+      await go(page, '/d/apr_slack_old');
+      await expect(page.getByText(/The note was removed/)).toBeVisible();
+      await scan(page, 'owner Reviews block, note removed');
+      await page.setViewportSize({ width: 390, height: 844 });
+      await go(page, '/d/apr_slack');
+      await expect(page.getByRole('region', { name: 'Reviews' })).toBeVisible();
+      await scan(page, 'phone owner Reviews block');
+      await signIn(page, theme);
+      await go(page, '/reviews');
+      await expect(page.getByText('Reviews are for people who hold the Reviewer role', { exact: false })).toBeVisible();
+      await scan(page, 'reviews refused for a PM');
+    });
   });
 }
