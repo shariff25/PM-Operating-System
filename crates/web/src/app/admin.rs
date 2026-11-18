@@ -24,7 +24,7 @@ use pmos_contract::permissions::Permission;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{load_team, ApiError, ApiResult, AppState, Signed};
+use super::{ApiError, ApiResult, AppState, Signed};
 use crate::upstream::UpstreamError;
 
 /// The default and largest page of `GET /api/admin/audit`.
@@ -392,78 +392,52 @@ async fn export(State(state): State<AppState>, signed: Signed, q: Params) -> Api
 
 // The team.
 
-#[derive(Deserialize)]
-struct AccountsReply {
-    #[serde(default)]
-    linking: bool,
-    #[serde(default)]
-    members: Vec<MemberAccounts>,
-}
-
-#[derive(Deserialize)]
-struct MemberAccounts {
-    handle: String,
-    #[serde(default)]
-    accounts: std::collections::BTreeMap<String, bool>,
-}
-
-/// The account kinds the app shows, as the tool server names them: Atlassian covers Jira and
-/// Confluence.
-const ACCOUNT_KINDS: [&str; 3] = ["atlassian", "slack", "github"];
-
-/// `GET /api/admin/team`: every member in `team.yaml` (until slice U5; it decides nothing),
-/// with which accounts they've linked as booleans when the tool server answers (else
-/// `accounts: null`).
+/// `GET /api/admin/team`: the Team page's member list, from the user database (the tool
+/// server's `GET /internal/admin/users`; before slice U5a it was read from `team.yaml`). Kept in
+/// its old shape for the app until the Team screen moves to `GET /api/admin/users`
+/// (`app/users.rs`): active users only, no addresses for anyone.
 async fn team(State(state): State<AppState>, signed: Signed) -> ApiResult {
     need_any(
         &signed,
         &[Permission::ViewAuditLog, Permission::ManageMembers],
     )?;
     read_log(&signed, "/api/admin/team", &[]);
-    let file = load_team(&state)?;
-    let linked = match signed
-        .toolserver(&state)
-        .admin(&signed.member.handle, "accounts", &[])
+    let list = super::users::list_for_team(&state, &signed)
         .await
-    {
-        Ok(v) => serde_json::from_value::<AccountsReply>(v).ok(),
-        Err(e @ UpstreamError::Refused { status: 403, .. }) => return Err(upstream(e)),
-        Err(e) => {
-            tracing::warn!(error = ?e, "linked accounts unavailable");
-            None
-        }
-    };
-    let members: Vec<Value> = file
-        .members
+        .map_err(|e| {
+            if e.code() == "forbidden" {
+                forbidden()
+            } else {
+                e
+            }
+        })?;
+    let members: Vec<Value> = list["users"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
         .iter()
-        .filter(|m| !m.handle.starts_with("bots."))
-        .map(|m| {
-            let accounts = linked.as_ref().map(|l| {
-                let of = l.members.iter().find(|a| a.handle == m.handle);
-                let map: serde_json::Map<String, Value> = ACCOUNT_KINDS
-                    .iter()
-                    .map(|k| {
-                        let on = of.and_then(|a| a.accounts.get(*k)).copied() == Some(true);
-                        (k.to_string(), json!(on))
-                    })
-                    .collect();
-                map
-            });
+        .filter(|u| u["status"] == "active")
+        .map(|u| {
+            let handle = u["handle"].as_str().unwrap_or_default();
+            let name = u["display_name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .unwrap_or(handle);
             json!({
-                "handle": m.handle,
-                // team.yaml has no display name: the handle, as in `GET /api/me`.
-                "name": m.handle,
-                "roles": m.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
-                "has_email": m.email.as_deref().is_some_and(|e| !e.trim().is_empty()),
-                "bot": personal_bot_name(&m.handle),
-                "accounts": accounts,
+                "handle": handle,
+                "name": name,
+                "roles": u["roles"],
+                "has_email": u["has_sign_in_name"].as_bool().unwrap_or(false),
+                "bot": personal_bot_name(handle),
+                "accounts": u["accounts"],
             })
         })
         .collect();
     Ok(Json(json!({
         "members": members,
-        "accounts_available": linked.is_some(),
-        "linking": linked.as_ref().map(|l| l.linking),
+        "accounts_available": true,
+        "linking": list["linking"],
     }))
     .into_response())
 }
@@ -510,6 +484,9 @@ async fn connectors(State(state): State<AppState>, signed: Signed) -> ApiResult 
 struct OverviewReply {
     since: String,
     pending_drafts: u64,
+    /// Pending drafts of deactivated people, held for the grace (`null` from an older server).
+    #[serde(default)]
+    held_drafts: Option<u64>,
     #[serde(default)]
     approved: Option<u64>,
     #[serde(default)]
@@ -526,6 +503,41 @@ struct OverviewReply {
     /// The newest purge batch; `null` before the first.
     #[serde(default)]
     last_purge: Option<LastPurge>,
+    /// The user database's flags (slice U5a); `null` from an older server.
+    #[serde(default)]
+    users: Option<UsersFlags>,
+}
+
+/// The overview's user database flags (`docs/web-api.md`, `GET /api/admin/overview`): handles
+/// and counts only, re-picked field by field.
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct UsersFlags {
+    active: u64,
+    deactivated: u64,
+    sign_in_unconfirmed: Vec<String>,
+    dual_role: Vec<String>,
+    pilot_exception: Option<ExceptionFlag>,
+    role_conflicts: Vec<String>,
+    entra_needs_host: Vec<String>,
+    no_slack: Vec<String>,
+    identity_conflicts: Option<u64>,
+    identity_conflict_users: Option<Vec<String>>,
+    resolve_miss_warning: Vec<String>,
+    resolve_miss_warning_threshold: Option<u64>,
+    deactivations_last_hour: u64,
+    deactivation_limit: u64,
+    deactivation_limit_reached: bool,
+    deactivation_grace_hours: Option<u64>,
+    bots_without_active_owner: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct ExceptionFlag {
+    ends: String,
+    ending_soon: bool,
+    lapsed: bool,
 }
 
 #[derive(Deserialize, Serialize)]

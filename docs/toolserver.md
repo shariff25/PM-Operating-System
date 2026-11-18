@@ -241,7 +241,7 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/admin/audit?user=&before=&limit=&actor=&action=&outcome=&from=&to=&purpose=` | service or web token | The whole audit log, newest first: `{events: [...], next}`. Needs the viewer `user` to have `view-audit-log` (`export-audit` with `purpose=export`). See **Admin reads** |
 | `GET /internal/admin/accounts?user=` | service or web token | `{linking, members: [{handle, accounts: {atlassian, slack, github}}]}`, booleans only. `view-audit-log` or `manage-members` |
 | `GET /internal/admin/connectors?user=` | service or web token | `{connectors: [{name, mode, health, error_class, checked_at}]}`, checked now. `manage-connectors` |
-| `GET /internal/admin/overview?user=` | service or web token | `{since, pending_drafts, approved, rejected, denied, retention_days, oldest_event_at, last_purge}`: pending items across the team now, audit outcomes over 7 days, and audit retention (see **Audit retention**). `view-audit-log` or `manage-members` |
+| `GET /internal/admin/overview?user=` | service or web token | `{since, pending_drafts, held_drafts, approved, rejected, denied, retention_days, oldest_event_at, last_purge, users}`: pending items across the team now, audit outcomes over 7 days, audit retention (see **Audit retention**) and the user database's flags (below). `view-audit-log` or `manage-members` |
 | `POST /internal/admin/proposals/open?user=` `{kind, title, reason, base_sha, changes}` | web token **and** a signed assertion for `user`, in every mode | Check an admin's policy or content change again and open it as a pull request with their own linked GitHub token. `201 {number, url, author, branch, base, files, widening, allowance_changes, stale_check, labels_added}`. See **Admin proposals** |
 | `GET /internal/admin/proposals?user=&kind=policy\|content` | the same | Open proposals, read with the viewer's own GitHub token: `{repo, github: "linked", proposals: [...]}`, or `{repo, github: "not_linked", proposals: []}`. `view-policies` / `view-content` |
 | `GET /internal/admin/protection?user=` | the same | `{configured, branch, required_reviews, verified, source?, github}`: whether `PMOS_CONTENT_BRANCH` requires reviews, as the viewer's token can read it. Best effort, never an error. `view-policies` or `view-content` |
@@ -250,6 +250,9 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/directory` (+ `If-None-Match`) | service or bot token | Every user in the user database, `{version, users: [...]}`, with `ETag: "<version>"`; `304` when it matches. See **The user database's read API** |
 | `GET /internal/users/resolve?by=entra&tid=&oid=` / `?by=sign_in_name&name=` / `?by=handle&handle=` | web or console token, no assertion | One user, or `404`; `429 resolve_misses` past 20 misses a minute. See **The user database's read API** |
 | `POST /internal/users/{handle}/identities/entra` `{tid, oid, sign_in_name}` | web token, no assertion | The first Entra link. See **The user database's read API** |
+| `GET /internal/admin/users?user=` | web token (assertion as on the admin reads) | Every user, as an admin or an auditor may see them. See **The Admin API** |
+| `POST /internal/admin/users`, `PUT …/{handle}/roles`, `PUT …/{handle}/fields`, `POST …/{handle}/sign-in-name/confirm`, `POST …/{handle}/deactivate`, `POST …/{handle}/reactivate`, `DELETE …/{handle}/identities/{kind}`, `PUT /internal/admin/reviewers/{reviewer}` (all `?user=<admin>`) | web token **and** a signed assertion for `user`, and assertion `require` (else `503 assertion_required`) | User and role writes. See **The Admin API** |
+| `GET /internal/console/members?user=` | console token (assertion as on its approvals reads) | `{handles}` for an active admin's Approvals screen. See **The Admin API** |
 
 ### Admin reads
 
@@ -1151,16 +1154,21 @@ for every decision it makes; `team.yaml` is no longer read by it at all (onboard
   through Slack, Microsoft sign-in name not confirmed); `dual_role`; `pilot_exception`
   (`ends`, `ending_soon` within 14 days, `lapsed`) and `role_conflicts` once lapsed;
   `entra_needs_host`; `identity_conflicts` (`users.identity_conflict` events in the last 7
-  days); `resolve_miss_warning` (clients past 100 resolve misses in an hour);
-  `deactivations_last_hour`, `deactivation_limit`, `deactivation_limit_reached`;
+  days) and, since U5a, `identity_conflict_users` (whose sign-in names they presented);
+  `resolve_miss_warning` (clients past `resolve_miss_warning_threshold`, 100, resolve misses in
+  an hour, counted in this process since it started); `deactivations_last_hour`,
+  `deactivation_limit`, `deactivation_limit_reached`, `deactivation_grace_hours`;
   `bots_without_active_owner`. Handles and counts only, never an address, Slack id or `oid`.
+  `pmos-web` serves them field by field (`docs/web-api.md`, `GET /api/admin/overview`).
 
 **Account linking** checks the account against the database (`src/oauth.rs`): the person must
 be an active user; Slack: the member id must be their Slack identity; **Atlassian and GitHub:
 after the first link the account id decides** (the Atlassian `account_id` from `/me`, the
 GitHub numeric user id), stored as an identity (`users.identity_link`); a link that signs in
 with a different account is refused `409 different_account` (the callback page) and nothing
-is stored, until an admin unlinks it (slice U5). Before the first link, the Atlassian email
+is stored, until an admin unlinks it (slice U5a: `DELETE
+/internal/admin/users/{handle}/identities/{atlassian|github}`, which deletes the linked account
+too). Before the first link, the Atlassian email
 must equal their `atlassian_email`, and the GitHub login their `github_login` (or, with none,
 a verified email equal to their `atlassian_email`). The Atlassian account id is kept as the
 credential's `external_id`.
@@ -1303,8 +1311,8 @@ one user per call, no addresses, and the **miss limit**. Each client may get at 
 past that a miss answers `429 {code: "resolve_misses"}` with `Retry-After`, and hits keep
 being answered. Windows are per client (web and console apart) and in process. Every miss is
 logged with its kind (`entra`, `sign_in_name`, `handle`, `first_link`), never the value; more
-than 100 in an hour from one client logs a warning (the count is what U5's overview will
-show).
+than 100 in an hour from one client logs a warning, and the admin overview shows it
+(`resolve_miss_warning`, slice U5a).
 
 **The first Entra link** (spec §7 step 2). One transaction, under the users lock, re-reads the
 directory and checks: the user exists and `sign_in_name` (the token's `preferred_username`,
@@ -1326,6 +1334,89 @@ handle only when that user exists); a conflict (`linked`, `taken`) as
 `users.identity_conflict` (`denied`, detail `entra`). No address, `tid` or `oid` in any event
 or log line. `resolve` and `directory` record no audit events (they are reads that run on
 every sign-in and every poll).
+
+### The Admin API (slice U5a)
+
+`src/app/users.rs`. The routes behind the web app's Team screen (`pmos-web` mirrors them
+under `/api/admin/users…`; the full request and response contract, every field and error, is
+`docs/web-api.md` **Admin: users and roles**), plus the console's admin listing. Every rule
+is `crate::users::rules`, the same the host commands and the Slack client go through; the
+route only parses, gates and answers.
+
+| Route | Body | Does |
+| --- | --- | --- |
+| `GET /internal/admin/users?user=<viewer>` | | Every user: `{version, view, users, deactivations, pilot_exception, linking}`. `manage-members` (the admin view, with `sign_in_name`, `atlassian_email`, `github_login`) or `view-audit-log` (the auditor view: those three keys left out). Never an `oid`, `tid`, Slack id or account id. Audited `admin.users`. |
+| `POST /internal/admin/users?user=<admin>` | `{handle, display_name?, sign_in_name, atlassian_email, github_login?, slack_id?, roles}` | Invite: `201`, `active`, sign-in name confirmed. Never `admin` (`403 host_only`). |
+| `PUT /internal/admin/users/{handle}/roles?user=` | `{roles, expected_version}` | The whole set. |
+| `PUT /internal/admin/users/{handle}/fields?user=` | `{sign_in_name?, atlassian_email?, github_login?, display_name?, expected_version}` | All or nothing (`Op::SetFields`). |
+| `POST /internal/admin/users/{handle}/sign-in-name/confirm?user=` | `{sign_in_name, expected_version?}` | Confirm, or replace and confirm (§4). |
+| `POST /internal/admin/users/{handle}/deactivate?user=`, `/reactivate` | none or `{expected_version?}` | §6 **Deactivation** (above); `409 owns_bots` while they own a team bot. |
+| `DELETE /internal/admin/users/{handle}/identities/{entra\|atlassian\|github}?user=` | | `Op::Unlink`: an `atlassian` or `github` identity takes its linked account with it (§6: "an admin unlinks first"). |
+| `PUT /internal/admin/reviewers/{reviewer}?user=` | `{pms, expected_version?}` | The whole set of PMs assigned (§8; `reviewer_assignments`, migration 0018). |
+| `GET /internal/console/members?user=<admin>` | | The console's token only: `{handles: [...]}`, active users holding `pm`, `reviewer` or `admin`, for a viewer who is an active admin here (else `403 forbidden`). Its assertion is checked as on the console's approvals reads. Audited `admin.console_members`. |
+
+**Who may call.** The Admin API is `pmos-web`'s token only: the service (orchestrator),
+console and Slack bot tokens get `403`; the Slack bot keeps only its `pm`-only join approval
+and capped `remove` (**Members**). The console listing is the console's token only.
+
+**Writes** (every method but `GET`):
+
+1. **Never on the development override.** Unless this server runs in assertion `require`
+   (so never with `PMOS_ASSERTION_INSECURE_OFF=1`), a write answers `503
+   {"code":"assertion_required"}` before anything else, recorded as a `denied` event.
+2. **A signed assertion for the actor, in every mode:** present, valid, bound to the request
+   with its body (at most 16 KiB), and its subject the `user=` the call names; else `401
+   bad_assertion`, recorded.
+3. **The actor is checked in this server's tables:** an active admin (`403 forbidden`),
+   never from the assertion's roles.
+4. **The rules** (spec §6): nobody changes their own roles, status, addresses, links or
+   reviewer assignments (`403 self_change`); `admin` is never granted here (`403
+   host_only`); an Admin's or Auditor's sign-in name, Atlassian email, GitHub login and Entra
+   link are host-only (`403 host_only`); an Atlassian email or GitHub login changes only
+   while no account of that kind is linked (`409 linked`); addresses are unique across
+   everyone (`409 taken`); the last admin (`409 last_admin`) and Admin + Auditor outside the
+   pilot exception (`409 dual_role`) are refused by the plan and, in Postgres, by the
+   `users_invariants()` trigger; the cap (`429 deactivation_limit`, counted from
+   `role_changes`: a refused attempt writes no row, a reactivation deletes none, and the host
+   is never counted); reactivation never restores `admin`.
+5. **`expected_version`** (required on roles and fields, optional elsewhere): once every rule
+   above passes, a directory whose version moved since refuses the write `409 stale`
+   (`rules::plan_expecting`), before the invariants. The version is the read API's ETag:
+   bumped by every committed change to users, roles, identities, the pilot exception and
+   (migration 0018) reviewer assignments.
+6. **Audited, allowed or refused:** the store writes the `role_changes` rows and the audit
+   event in the write's transaction, or a `denied` event with the refusal's code; a refusal
+   before the store (a body that doesn't parse, the override, a bad assertion, `owns_bots`)
+   is recorded by the route (actor `anonymous` when no assertion was verified). Event details
+   are fixed formats only (`users::detail`): field names, `sign_in_name confirmed`, role
+   deltas, `<n> pms`, refusal codes; never a value.
+
+Each refusal is `{code, error}`; the status is `refusal_status`: `422 invalid`, `404
+not_found`, `403` for `forbidden`, `host_only`, `self_change`, `429 deactivation_limit`, and
+`409` for the rest (`exists`, `taken`, `unchanged`, `stale`, `last_admin`, `dual_role`,
+`evals_account`, `not_active`, `linked`, `owns_bots`, `not_reviewer`, `not_pm`). A write
+answers the target as an admin sees them and the new version: `{version, user, note?}`.
+
+**A lapsed pilot exception** never blocks what resolves it, and never leaves the stack without
+a working admin: the plan and the trigger check only the people a write touches, and a
+deactivated person never counts as holding both, so revoking either role or deactivating the
+person always goes through, and a person holding both keeps their admin powers (their writes
+on others go through) until one role is gone; only their audit-log reads are refused (`403
+role_conflict`). Tested on both stores (`tests/admin_users.rs`).
+
+**Reviewer assignments** (§8): `reviewer_assignments (reviewer, pm, assigned_by,
+assigned_at)`, both handles users, never the same person; changes bump the directory version
+under the users lock (migration 0018). The reviewer must be active and hold `reviewer`
+(`409 not_active`, `409 not_reviewer`), each PM added active and holding `pm` (`409 not_pm`),
+at most 200, unless the set is empty (clearing is always allowed). Kept, inert, when either
+loses the role or is deactivated. Recorded `assign`/`unassign` per PM in `role_changes`
+(detail `pm <handle>`) and `reviewers.assign` (`<n> pms`) in the audit log. Recommendations
+are slice U6.
+
+**Migration 0018** also widens `role_changes.client` to allow `link`: a person's own first
+Atlassian or GitHub link (`Op::LinkAccount`, the OAuth callback) records its row with that
+client, which 0015's check refused, so in Postgres every such first link failed until now
+(the in-memory store has no check, so U3's tests didn't see it).
 
 ### Content sync
 
