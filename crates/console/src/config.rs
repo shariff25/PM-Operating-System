@@ -52,12 +52,10 @@ pub struct Config {
     /// `PMOS_TOOLSERVER_URL`, default `http://127.0.0.1:8710`.
     pub toolserver_url: String,
     /// `PMOS_TOOLSERVER_TOKEN`: the tool server's read-only `console` client token
-    /// (`PMOS_CONSOLE_TS_TOKEN` there), which may only read approvals. Required, at least 32
-    /// characters. With a `console:toolserver` key in `PMOS_ASSERTION_KEYS`, calls that name a
-    /// person also carry a signed user assertion.
+    /// (`PMOS_CONSOLE_TS_TOKEN` there), which may only read approvals and look users up
+    /// (`resolve`). Required, at least 32 characters. With a `console:toolserver` key in
+    /// `PMOS_ASSERTION_KEYS`, calls that name a person also carry a signed user assertion.
     pub toolserver_token: Credentials,
-    /// `PMOS_CONTENT_ROOT`, default `content`: where `team.yaml` is.
-    pub content_root: PathBuf,
     /// `PMOS_CONSOLE_AUDIT_LOG`: the tool server's JSON-lines audit file (its
     /// `PMOS_AUDIT_LOG`), mounted read-only. A task page shows its audit events from it.
     pub audit_log: Option<PathBuf>,
@@ -79,7 +77,6 @@ impl std::fmt::Debug for Config {
             .field("bots_token", &self.bots_token)
             .field("toolserver_url", &self.toolserver_url)
             .field("toolserver_token", &self.toolserver_token)
-            .field("content_root", &self.content_root)
             .field("audit_log", &self.audit_log)
             .field("slack_url", &self.slack_url)
             .field("public_url", &self.public_url)
@@ -158,9 +155,6 @@ impl Config {
                 );
             }
         }
-        let content_root: PathBuf = set("PMOS_CONTENT_ROOT")
-            .unwrap_or_else(|| "content".into())
-            .into();
         let mut keys = match set("PMOS_ASSERTION_KEYS") {
             None => BTreeMap::new(),
             Some(spec) => parse_assertion_keys(&spec, "the console", |iss, aud| {
@@ -170,9 +164,7 @@ impl Config {
         let mut credentials = |token: String, audience: &str| {
             let c = Credentials::new(token);
             match keys.remove(&(ISSUER.to_string(), audience.to_string())) {
-                Some(ring) => {
-                    c.with_signer(Signer::new(ISSUER, audience, ring, content_root.clone()))
-                }
+                Some(ring) => c.with_signer(Signer::new(ISSUER, audience, ring)),
                 None => c,
             }
         };
@@ -201,7 +193,6 @@ impl Config {
                 set("PMOS_TOOLSERVER_URL").unwrap_or_else(|| "http://127.0.0.1:8710".into()),
             )?,
             toolserver_token,
-            content_root,
             audit_log: set("PMOS_CONSOLE_AUDIT_LOG").map(PathBuf::from),
             slack_url: set("PMOS_CONSOLE_SLACK_URL")
                 .map(|u| https_origin("PMOS_CONSOLE_SLACK_URL", u))
@@ -307,7 +298,6 @@ mod tests {
         assert_eq!(cfg.identity, Identity::Dev("ana".into()));
         assert_eq!(cfg.bots_url, "http://127.0.0.1:8750");
         assert_eq!(cfg.toolserver_url, "http://127.0.0.1:8710");
-        assert_eq!(cfg.content_root, PathBuf::from("content"));
         assert!(cfg.audit_log.is_none() && cfg.slack_url.is_none());
         let debug = format!("{cfg:?}");
         assert!(!debug.contains(BOTS) && !debug.contains(TOOLS));
