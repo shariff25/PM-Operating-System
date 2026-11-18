@@ -32,10 +32,11 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   models, chosen by configuration. If a model is not available, the system switches
   to another automatically. Added by the owner on 2026-11-18 as a requirement only: not
   planned or built yet; do not start it until the owner says so.
-  On 2026-11-18 the owner asked to drop the OpenRouter-like part and rely on OpenShell's
-  inference router. Not applied yet: OpenShell's docs (v0.1.9, "Inference") say the managed
-  inference route was removed and the workload chooses the model, so OpenShell gives no
-  switching or fallback. Waiting on the owner's decision.
+  Decided by the owner on 2026-11-18: keep this requirement. Switching and automatic fallback
+  are built in PM OS's own gateway service, which already sits between the bots and the
+  model; OpenShell holds one credential per provider and enforces which endpoints are
+  reachable. (OpenShell's docs, v0.1.9 "Inference", say its managed inference route was
+  removed and the workload chooses the model, so it gives no switching or fallback.)
 - **h. Dropped by the owner on 2026-11-17:** the review of how the Grok bot was built. Do not
   build it.
 
