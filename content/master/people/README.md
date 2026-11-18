@@ -1,7 +1,8 @@
 # Personal master context
 
-Each PM can add `people/<handle>/AGENTS.md`. PM OS loads it after the team file, so it can
-add to the team rules but not override them (CTX-3). Keep it short:
+Each PM can add `people/<handle>/AGENTS.md`. PM OS loads it after the team's
+`master/AGENTS.md`, so it can add to the team rules but not override them (CTX-3). Keep it
+short:
 
 ```markdown
 # <Name>'s context

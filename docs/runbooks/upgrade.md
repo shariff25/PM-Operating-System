@@ -41,6 +41,49 @@ reach PMs until the affected category still meets its bar (D10).
 8. **Check:** run `deploy/pmos-admin smoke <your handle>`, then the benchmarks for any category
    the change touches (`deploy/pmos-admin evals-run --category <c>`).
 
+## Upgrading to the user database (`team.yaml` retired)
+
+From this version **no service reads `content/team.yaml`**. Who may use PM OS, and their
+roles, come only from the tool server's user database ([users.md](users.md)): sign-in, Slack,
+asking bots, the console, the admin screens and approval decisions. Onboarding no longer
+writes the file, `pmos member add` is gone, and `pmos lint` fails while a `team.yaml` is in the
+content (`team-file-retired`). **Import the people in it before you start the new version.**
+
+1. Back up (step 1 above), get the new code and build it (steps 2 and 3), but don't run `up`
+   yet.
+2. Note the content commit and keep a copy of the file outside the content (the pull request
+   in step 5 deletes it):
+   ```sh
+   sha=$(git -C "$PMOS_CONTENT_CHECKOUT" rev-parse HEAD)
+   git -C "$PMOS_CONTENT_CHECKOUT" show "$sha:content/team.yaml" > ~/team.yaml.$sha
+   ```
+3. Import it with the new image (the one-off container applies the tool server's migrations
+   first). Read the dry run, then apply; admins come in with `--allow-admins`, or run
+   `bootstrap-admin` first ([users.md](users.md), "Importing team.yaml"):
+   ```sh
+   deploy/pmos-admin users import --from ~/team.yaml.$sha --commit "$sha"
+   deploy/pmos-admin users import --from ~/team.yaml.$sha --commit "$sha" --allow-admins --apply
+   deploy/pmos-admin users list
+   ```
+   Then `users set-entra <handle> --oid <object id>` for each Admin and Auditor. On an install
+   that already imported (any release since slice U3), the import is safe to run again: everyone
+   is `unchanged`, and anyone added to the file since then is created.
+4. Start the new version (step 4 above) and check (step 8).
+5. Open a pull request on the content repo that deletes `content/team.yaml` (and its
+   `CODEOWNERS` line, if you have one). Until it merges, CI's `pmos lint` fails on the file;
+   the services only log a warning and ignore it.
+
+**If you start the new version without importing,** nobody gets in, and the tool server says
+so at start-up (`deploy/pmos-admin logs toolserver`): "the user database is empty: nobody can
+use PM OS until `pmos-admin users import` (or bootstrap-admin) runs". The web app answers every sign-in with "not a member",
+Slack offers everyone **Request access**, and the runtime refuses every ask. Nothing is lost:
+run step 3; the services pick the users up within 30 seconds, without a restart.
+
+**Rolling back past this version:** the previous version's Slack service, runtime, web app and
+console may still read `team.yaml`. Write the current database back as one before you roll
+back: `deploy/pmos-admin users export --format team-yaml > team.yaml`, commit it to the content
+repo, then roll back as below.
+
 ## Upgrading to user assertions on by default
 
 From this version the runtime and the tool server run in `require` whenever the web app's or

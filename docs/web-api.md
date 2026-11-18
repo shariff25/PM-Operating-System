@@ -32,7 +32,8 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
   warning). `GET /api/auth/providers` tells the app which buttons to show.
 - **Who you are:** the user database (`docs/user-database-spec.md`), which the tool server
   owns; `pmos-web` asks it with `GET /internal/users/resolve` (`docs/toolserver.md`, "The user
-  database's read API") and keeps each answer 10 seconds. `team.yaml` decides nothing. The
+  database's read API") and keeps each answer 10 seconds. There is no team file (`team.yaml`
+  was retired in slice U7). The
   signed-in person must be an **active** user; roles come from there and are looked up on
   every request (sessions hold no roles), so a deactivation or a removed role reaches the
   app within 10 seconds. **Entra ID** signs people in by the token's `(tid, oid)`; a person's
@@ -1646,7 +1647,7 @@ lists one.
 | `files[].kind` | string | `role`, `bot`, `skill`, `skill_file` (another file in a skill's folder), `playbook`, `template`, `reviewer`, `context`, `readme`, `master` (`master/AGENTS.md`), `personal_master` (`master/people/<handle>/AGENTS.md`), `team`, `tools` or `other`. |
 | `files[].name`, `title`, `version`, `owner`, `sensitivity`, `last_reviewed` | string or `null` | From the file's front matter, where it has them (a skill's `version` and `owner` come from `metadata`). `null` when absent or unparsable. |
 | `files[].size` | integer | Bytes. |
-| `files[].editable` | boolean | Whether a proposal may change it: text (`.md`, `.yaml`, `.yml`, `.txt`) and not `team.yaml` (members are managed through onboarding). |
+| `files[].editable` | boolean | Whether a proposal may change it: text (`.md`, `.yaml`, `.yml`, `.txt`) and not `team.yaml` (retired: people and roles are in the user database, and `pmos lint` refuses the file). |
 | `files[].readable` | boolean | Whether this viewer may open it (`GET …/file`). An auditor sees personal master files and `restricted` context listed, not opened. |
 | `files[].lint` | object | `status` (`ok`, `warning` or `error`), counts, and that file's `Issue[]`. When `readable` is `false`, each issue's `message` is "A finding on a file your role can't open." (a parser's message can quote the file). |
 | `roles[]` | array | Each role: its skills, model role, data class, and the bots made from it. |
@@ -1720,7 +1721,7 @@ Refusals, before anything is linted:
 | --- | --- |
 | `400 bad_request` | The body doesn't parse (unknown fields included), a path is listed twice, or a change has both or neither of `text` and `delete`. |
 | `400 bad_path` | A path that isn't plain (above), or one that goes through a symlink. |
-| `400 path_not_allowed` | Outside the content tree, or `content/team.yaml`. |
+| `400 path_not_allowed` | Outside the content tree, or `content/team.yaml` (retired; never written by a proposal). |
 | `400 not_text` | Not `.md`, `.yaml`, `.yml` or `.txt`, or text with a NUL byte. |
 | `400 not_found` | Deleting a file that doesn't exist. |
 | `400 no_change` | No changes, or every change equals the deployed file. |

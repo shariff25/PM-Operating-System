@@ -91,6 +91,12 @@ deploy/pmos-admin build && deploy/pmos-admin up && deploy/pmos-admin status
 ```
 
 The full install, up to Gate 1, and day-2 operations are in [docs/runbooks](docs/runbooks/README.md).
+People and their roles (Admin, Product Manager, Reviewer, Auditor) live in the tool server's
+user database, not in the content: the first admin is made on the host
+(`deploy/pmos-admin users bootstrap-admin`), and everyone else joins through Slack or an admin's
+invite in the web app ([docs/runbooks/users.md](docs/runbooks/users.md)). Upgrading an install
+that still has a `content/team.yaml`: import it first
+([docs/runbooks/upgrade.md](docs/runbooks/upgrade.md)).
 
 ## Develop
 
@@ -108,7 +114,8 @@ a Claude model behind the gateway (testing only): [docs/testing-with-claude.md](
 
 ## Contributing content
 
-Change anything in `content/` by pull request. CI runs `pmos lint`. Context files need an
+Change anything in `content/` by pull request. CI runs `pmos lint`, which also refuses a
+`team.yaml` (retired: people and roles are in the user database). Context files need an
 owner, a `last-reviewed` date and a sensitivity label, and the file's owner reviews the change.
 To add a skill, copy one from `content/skills/`, rename the folder and its `name`, and declare
 only the tools it needs.

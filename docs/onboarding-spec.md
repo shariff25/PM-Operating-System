@@ -2,17 +2,20 @@
 
 The contract for the onboarding and GitHub-memory work, built in parallel by the tool server and
 the Slack bot. Decided 2026-11-14:
-- **The bot handles onboarding.** A platform owner (`admin` in `team.yaml`) approves each new
-  member in Slack. The tool server then commits the new `team.yaml` to the content repo, so git
-  stays the source of truth and the commit records who approved.
+- **The bot handles onboarding.** A platform owner (an active `admin` in the user database)
+  approves each new member in Slack. The tool server creates the user in its database, then
+  commits their personal bot to the content repo, so the commit records who approved.
+  (Originally the commit was a new `team.yaml`; the user database replaced the file, and slice
+  U7 retired it: `docs/user-database-spec.md`.)
 - **Personal memory lives in each PM's own private repo in your GitHub org.**
 - **Latency is not a priority.** The load test reports numbers but doesn't gate Gate 1.
 
 Shared helpers are in `pmos_contract::onboarding`:
 - `propose_handle`, `valid_new_handle`, `personal_bot_name`;
-- `render_team_yaml`, `render_personal_bot`, `bot_path`.
+- `render_personal_bot`, `bot_path`.
 
-`TeamMember` gains an optional `github` login. `TeamFile::admins()` lists the platform owners.
+People, their GitHub logins and the platform owners are in the user database (slice U7 removed
+`render_team_yaml`, `TeamMember` and `TeamFile` from the shared crate).
 
 ## 1. GitHub (tool server)
 
@@ -59,7 +62,8 @@ The tool server never uses an installation token.
 - **Identity check before storing anything:**
   1. `GET /user` gives the login.
   2. `GET /user/memberships/orgs/{org}` must say `state: active`.
-  3. If the member has `github` in `team.yaml`, the login must equal it (ignoring case).
+  3. If the user has a GitHub login in the user database, the login must equal it (ignoring
+     case).
      Otherwise one **verified** address from `GET /user/emails` must equal their `email`
      (ignoring case).
   4. Store the login in the credential's metadata.
@@ -160,12 +164,10 @@ source: "pm-ana, task 0d3f…"   # the bot (or skill) and the run id that wrote 
        already_member`; nothing is written.
     3. **Commit the personal bot in one commit, with the admin's token, on
        `PMOS_CONTENT_BRANCH`** (the admin needs a linked GitHub account with push access to
-       `PMOS_CONTENT_REPO`). Until slice U7 retires it, the commit also adds the member to
-       `team.yaml`, which Slack, the web app and the lint still read (the runtime reads the user
-       database since slice U4a):
-       - `{dir}/team.yaml`: the current file at the branch head, rendered with
-         `render_team_yaml` and the new member (`handle`, `slack-id`, `email`, `roles`);
-       - `{dir}/bots/pm-<handle>/BOT.md` from `render_personal_bot`.
+       `PMOS_CONTENT_REPO`). Since slice U7 the commit holds no `team.yaml`: nothing reads one.
+       - `{dir}/bots/pm-<handle>/BOT.md` from `render_personal_bot` (if one is already there at
+         the branch head, nothing is committed and the request's `error` says the handle is
+         taken, as in step 5);
 
        - the bot's sandbox policy, `policies/bots/pm-<handle>.yaml` and
          `policies/bots/pm-<handle>.sandbox.yaml`, generated with `pmos_policy` from the content
@@ -176,8 +178,8 @@ source: "pm-ana, task 0d3f…"   # the bot (or skill) and the run id that wrote 
          role, and the approving platform owner is the reviewer of record, named in the
          `Approved-by` trailer. Hand changes still go by pull request with a second owner.
 
-       Before committing, check that the new `team.yaml` parses and passes the team lint rules
-       (`team-*`). The commit message is `Add <handle> to PM OS` with the trailer
+       The scratch copy the policy is generated from must pass `pmos lint` as a whole. The
+       commit message is `Add <handle> to PM OS` with the trailer
        `Approved-by: <admin> (Slack, request <id>)`.
     4. **Answer** `200 {request}`: the status becomes `approved`, with `handle` and `commit` (the
        sha). The user database already holds the new member, so the welcome checklist's
@@ -303,8 +305,9 @@ the `docs` bot.
 ## 5. Bot runtime (`pmos-bots`)
 
 **Reloading the catalog:**
-- **When:** every 30 seconds, if a fingerprint of `team.yaml`, `bots/**` and `roles/**` under
-  the content root changed (paths, sizes and mtimes, or a hash).
+- **When:** every 30 seconds, if a fingerprint of `tools.yaml`, `bots/**`, `roles/**` and
+  `skills/**` under the content root changed (paths, sizes and mtimes, or a hash). (`team.yaml`
+  was watched until slice U7 retired it.)
 - **On success:** the new catalog replaces the old one atomically.
 - **If it fails the lint:** the old catalog stays and an error is logged.
 - **Running tasks** keep the bot settings they were claimed with.

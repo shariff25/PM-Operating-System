@@ -63,8 +63,8 @@ change**).
   applies the same allow-list again before it opens anything, and neither server accepts the
   repository root as the content folder.
 - **Files:** text only: `.md`, `.yaml`, `.yml`, `.txt`, valid UTF-8 (JSON strings always are),
-  no NUL, at most 256 KiB. `content/team.yaml` can't be changed here: members and roles are
-  managed through onboarding and `team.yaml`'s own review.
+  no NUL, at most 256 KiB. `content/team.yaml` can't be written here: it is retired (people and
+  roles are in the user database, and `pmos lint` refuses the file).
 - **Requests:** at most 50 files per proposal and 16 MiB per request; the title (120 characters)
   and reason (4,000) are cleaned of control characters; branch names are made by the server;
   every `POST` needs the session and its CSRF token, like every other.
@@ -122,7 +122,7 @@ GitHub App's contents and pull requests write), `PMOS_CONTENT_REPO`, `PMOS_CONTE
   can be behind the default branch) and proposes changes as pull requests; the workers pick up
   content only after the merge and the next content sync or deployment.
 - **Not built:** an in-app editor beyond whole-file text (the front end sends whole files);
-  renaming (a delete and an add); binary files; changing `team.yaml`; worker health and the
+  renaming (a delete and an add); binary files; worker health and the
   workers' loaded revision (nothing exposes them to `pmos-web`); review status and CI results of
   a proposal (link to the pull request); updating or closing a proposal from the app; a
   persisted rate limit (the tool server's is in memory).

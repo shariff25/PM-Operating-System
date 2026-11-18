@@ -4,6 +4,10 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- **People and roles have one home: the PM OS user database.** `content/team.yaml` is retired:
+  no part of PM OS reads it, onboarding no longer commits it, and `pmos lint` refuses one in
+  the content. Upgrading an install that still has the file means importing it once
+  (`pmos-admin users import`, `docs/runbooks/upgrade.md`) before starting the new version.
 - Security fixes from the web app review (service side):
   - **The web app and the console can't be run with signed user assertions off.** The runtime
     and the tool server now require them whenever either is configured, and refuse to start
@@ -23,8 +27,8 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
     Spark's own installed script, and the pull request is only read as data.
   - **The Slack bot's token can't make an admin or redirect a draft.** Someone holding it could
     have granted themselves admin, or edited a draft to post in another channel or page. Admins
-    are now added by a pull request to `team.yaml`, and an edit can change a draft's text but
-    not where it goes.
+    are now made only on the host (`pmos-admin users grant-admin`), and an edit can change a
+    draft's text but not where it goes.
   - **The Slack bot reads a draft only for the PM it belongs to.** Its token could read any
     PM's drafts by id. Now a read names the PM, and anyone else's draft isn't found; the
     ledger no longer shows it draft ids.
