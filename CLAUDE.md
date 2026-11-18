@@ -22,8 +22,9 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   events.
 - **g. Connectors.**
 - **i. Model providers:** the application must be able to switch between different model
-  providers. Added by the owner on 2026-11-18 as a requirement only: not planned or built yet;
-  do not start it until the owner says so.
+  providers, and behave like OpenRouter: one interface in front of many providers and
+  models, chosen by configuration. Added by the owner on 2026-11-18 as a requirement only: not
+  planned or built yet; do not start it until the owner says so.
 - **h. Dropped by the owner on 2026-11-17:** the review of how the Grok bot was built. Do not
   build it.
 
