@@ -1,5 +1,7 @@
 // Sample data for the Admin area: an audit log, a team, connectors and the overview counts.
 // Fake names and ids only. Used by the sample-data client (tests and the dev server).
+import { createMockUsers } from './mockUsers';
+import type { MockUsers, MockUsersOptions } from './mockUsers';
 import { ApiError } from './types';
 import type { AdminOverview, AuditEvent, AuditExport, AuditPage, AuditQuery, Connector, TeamList, TeamMember } from './types';
 
@@ -58,7 +60,7 @@ export function roleOfHandle(handle: string): MockRole | null {
   return null;
 }
 
-export interface MockAdminOptions {
+export interface MockAdminOptions extends MockUsersOptions {
   /** The tool server does not answer: no linked accounts, no counts, a connector down. */
   toolServerDown?: boolean;
   /** The most rows one export holds. The real server's cap is 10,000. */
@@ -172,12 +174,14 @@ export interface MockAdmin {
   auditExport(q: AuditQuery): AuditExport;
   team(): TeamList;
   connectors(): Connector[];
+  users: MockUsers;
 }
 
 export function createMockAdmin(now: number, options: MockAdminOptions, pendingDrafts: () => number): MockAdmin {
   const events = buildEvents(now, options.eventCount ?? 128);
   const cap = options.exportCap ?? 10_000;
   const down = options.toolServerDown ?? false;
+  const users = createMockUsers(now, options);
 
   const filtered = (q: AuditQuery) => {
     if (q.from && q.to && Date.parse(q.from) > Date.parse(q.to)) {
@@ -194,6 +198,7 @@ export function createMockAdmin(now: number, options: MockAdminOptions, pendingD
   };
 
   return {
+    users,
     overview() {
       const since = now - 7 * 24 * 60 * MIN;
       const count = (outcome: string) => events.filter((e) => e.outcome === outcome && Date.parse(e.at) >= since).length;
@@ -206,6 +211,8 @@ export function createMockAdmin(now: number, options: MockAdminOptions, pendingD
         retention_days: 90,
         oldest_event_at: events.length ? events.reduce((m, e) => (e.at < m ? e.at : m), events[0]!.at) : null,
         last_purge: { at: new Date(now - 9 * 60 * MIN).toISOString(), deleted: 1200 },
+        held_drafts: down ? null : 1,
+        users: down ? null : users.overview(),
       };
     },
     audit(q) {

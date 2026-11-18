@@ -158,4 +158,42 @@ describe('real client', () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(json(200, { connectors: [{ name: 'jira' }] }));
     expect(await createRealClient({ fetchImpl }).adminConnectors()).toEqual([{ name: 'jira' }]);
   });
+
+  it('sends each Team write to its route, with the CSRF header and the version', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (input) =>
+      String(input) === '/api/me' ? json(200, ME) : json(200, { version: 43, user: {} }),
+    );
+    const api = createRealClient({ fetchImpl });
+    await api.me();
+    await api.adminUsers();
+    await api.adminInvite({ handle: 'cy', sign_in_name: 'cy@x.example', atlassian_email: 'cy@x.example', roles: ['pm'] });
+    await api.adminSetRoles('ana', ['pm', 'reviewer'], 42);
+    await api.adminSetFields('ana', { display_name: 'Ana S.' }, 42);
+    await api.adminConfirmSignIn('sam', 'sam@x.example', 42);
+    await api.adminDeactivate('ben', 42);
+    await api.adminReactivate('ben');
+    await api.adminUnlink('ben', 'github');
+    await api.adminAssignReviewer('priya', ['ravi'], 42);
+    await api.adminSetRoles('..', [], 1);
+    const calls = fetchImpl.mock.calls.slice(1).map(([url, init]) => [init!.method, url, init!.body ?? null, (init!.headers as Record<string, string>)['X-Pmos-Csrf'] ?? null]);
+    expect(calls).toEqual([
+      ['GET', '/api/admin/users', null, null],
+      ['POST', '/api/admin/users', JSON.stringify({ handle: 'cy', sign_in_name: 'cy@x.example', atlassian_email: 'cy@x.example', roles: ['pm'] }), 'tok-1'],
+      ['PUT', '/api/admin/users/ana/roles', JSON.stringify({ roles: ['pm', 'reviewer'], expected_version: 42 }), 'tok-1'],
+      ['PUT', '/api/admin/users/ana/fields', JSON.stringify({ display_name: 'Ana S.', expected_version: 42 }), 'tok-1'],
+      ['POST', '/api/admin/users/sam/sign-in-name/confirm', JSON.stringify({ sign_in_name: 'sam@x.example', expected_version: 42 }), 'tok-1'],
+      ['POST', '/api/admin/users/ben/deactivate', JSON.stringify({ expected_version: 42 }), 'tok-1'],
+      ['POST', '/api/admin/users/ben/reactivate', '{}', 'tok-1'],
+      ['DELETE', '/api/admin/users/ben/identities/github', null, 'tok-1'],
+      ['PUT', '/api/admin/reviewers/priya', JSON.stringify({ pms: ['ravi'], expected_version: 42 }), 'tok-1'],
+      // A handle of dots alone is never sent as a path step.
+      ['PUT', '/api/admin/users/%00/roles', JSON.stringify({ roles: [], expected_version: 1 }), 'tok-1'],
+    ]);
+  });
+
+  it('keeps the code and status of a Team refusal', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(json(409, { code: 'stale', error: 'The team changed.' }));
+    const err = await createRealClient({ fetchImpl }).adminSetRoles('ana', ['pm'], 1).catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 409, code: 'stale' });
+  });
 });

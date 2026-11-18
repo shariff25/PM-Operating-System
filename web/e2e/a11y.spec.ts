@@ -305,6 +305,81 @@ for (const theme of ['light', 'dark'] as const) {
       await scan(page, 'connectors');
     });
 
+    test('admin: the Team page, its menu and every dialog, a refusal and a success', async ({ page }) => {
+      await signIn(page, theme, undefined, 'ada', '?mock_deactivations=capped');
+      await go(page, '/admin/team');
+      await expect(page.getByRole('table', { name: 'Team members' })).toBeVisible();
+      await page.getByRole('button', { name: 'Actions for Ben Carter' }).click();
+      await expect(page.getByRole('menu', { name: 'Actions for Ben Carter' })).toBeVisible();
+      await scan(page, 'team, action menu');
+      await page.keyboard.press('Escape');
+      await page.getByRole('button', { name: 'Actions for Ada Okafor' }).click();
+      await expect(page.getByText(/Nobody changes their own roles/)).toBeVisible();
+      await scan(page, 'team, own action menu');
+      await page.keyboard.press('Escape');
+
+      const each: [string, string, RegExp][] = [
+        ['Ben Carter', 'Change roles', /^Roles for/],
+        ['Raj Mehta', 'Edit details', /^Details for/],
+        ['Ben Carter', 'Assign PMs to review', /^PMs Ben Carter reviews/],
+        ['Tom Reyes', 'Reactivate', /^Reactivate/],
+      ];
+      for (const [who, item, name] of each) {
+        await page.getByRole('button', { name: `Actions for ${who}` }).click();
+        await page.getByRole('menuitem', { name: item }).click();
+        await expect(page.getByRole('dialog', { name })).toBeVisible();
+        await scan(page, `team, ${item} dialog`);
+        await page.keyboard.press('Escape');
+      }
+      for (const [who, item] of [['Ben Carter', 'Deactivate'], ['Ben Carter', 'Unlink GitHub']] as const) {
+        await page.getByRole('button', { name: `Actions for ${who}` }).click();
+        await page.getByRole('menuitem', { name: item }).click();
+        await expect(page.getByRole('alertdialog')).toBeVisible();
+        await scan(page, `team, ${item} dialog`);
+        await page.keyboard.press('Escape');
+      }
+      await page.getByRole('button', { name: 'Confirm the sign-in name for Sam Lee' }).click();
+      await expect(page.getByRole('dialog', { name: /^Confirm the sign-in name/ })).toBeVisible();
+      await scan(page, 'team, confirm sign-in dialog');
+      await page.keyboard.press('Escape');
+
+      await page.getByRole('button', { name: 'Invite a person' }).click();
+      const invite = page.getByRole('dialog', { name: 'Invite a person' });
+      await scan(page, 'team, invite dialog');
+      await invite.getByLabel('Handle').fill('ana');
+      await invite.getByLabel('Microsoft sign-in name').fill('ana2@contoso.example');
+      await invite.getByLabel('Atlassian email').fill('ana2@contoso.example');
+      await invite.getByRole('button', { name: 'Invite', exact: true }).click();
+      await expect(invite.getByRole('alert')).toBeVisible();
+      await scan(page, 'team, invite refused');
+      await invite.getByLabel('Handle').fill('cy');
+      await invite.getByLabel('Microsoft sign-in name').fill('cy@contoso.example');
+      await invite.getByLabel('Atlassian email').fill('cy@contoso.example');
+      await invite.getByRole('button', { name: 'Invite', exact: true }).click();
+      await expect(invite).toBeHidden();
+      await scan(page, 'team, after an invite');
+
+      await page.getByRole('tab', { name: /Needs you/ }).click();
+      await scan(page, 'team, needs you');
+
+      await go(page, '/admin');
+      await expect(page.getByRole('region', { name: /People who need an admin/ })).toBeVisible();
+      await scan(page, 'overview with people flags and the cap notice');
+    });
+
+    test('admin: the overview once the pilot exception has lapsed, and the Team page on a phone', async ({ page }) => {
+      await signIn(page, theme, undefined, 'ada', '?mock_pilot=lapsed');
+      await go(page, '/admin');
+      await expect(page.getByText(/^The pilot exception ended on/)).toBeVisible();
+      await scan(page, 'overview, pilot exception lapsed');
+      await go(page, '/admin/team');
+      await expect(page.getByText(/^The pilot exception ended on/)).toBeVisible();
+      await scan(page, 'team, pilot exception lapsed');
+      await page.setViewportSize({ width: 390, height: 844 });
+      await expect(page.getByRole('table', { name: 'Team members' })).toBeVisible();
+      await scan(page, 'phone team');
+    });
+
     test('admin: auditor views and the no-access page', async ({ page }) => {
       await signIn(page, theme, undefined, 'audrey');
       await go(page, '/admin');
@@ -314,6 +389,9 @@ for (const theme of ['light', 'dark'] as const) {
       await go(page, '/admin/audit');
       await expect(page.getByRole('table', { name: 'Audit events' })).toBeVisible();
       await scan(page, 'auditor audit log');
+      await go(page, '/admin/team');
+      await expect(page.getByText(/You're seeing the auditor's view/)).toBeVisible();
+      await scan(page, 'auditor team');
       await go(page, '/admin/connectors');
       await expect(page.getByRole('heading', { level: 1, name: "You don't have access to this" })).toBeVisible();
       await scan(page, 'auditor, no access');

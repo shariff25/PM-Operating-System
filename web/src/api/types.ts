@@ -337,9 +337,34 @@ export interface DraftList {
   total_pending: number | null;
 }
 
+/** `users` in `GET /api/admin/overview`: the user database's flags. Handles and counts only. */
+export interface OverviewUsers {
+  active: number;
+  deactivated: number;
+  sign_in_unconfirmed: string[];
+  dual_role: string[];
+  pilot_exception: { ends: string; ending_soon: boolean; lapsed: boolean } | null;
+  role_conflicts: string[];
+  entra_needs_host: string[];
+  no_slack: string[];
+  identity_conflicts: number | null;
+  identity_conflict_users: string[] | null;
+  resolve_miss_warning: string[];
+  resolve_miss_warning_threshold: number;
+  deactivations_last_hour: number;
+  deactivation_limit: number;
+  deactivation_limit_reached: boolean;
+  deactivation_grace_hours: number;
+  bots_without_active_owner: string[];
+}
+
 export interface AdminOverview {
   since: string;
   pending_drafts: number;
+  /** Pending drafts of deactivated people, held for the grace period. Missing or null from an older tool server. */
+  held_drafts?: number | null;
+  /** The user database's flags. Missing or null from an older tool server. */
+  users?: OverviewUsers | null;
   approved: number | null;
   rejected: number | null;
   denied: number | null;
@@ -347,6 +372,89 @@ export interface AdminOverview {
   retention_days?: number | null;
   oldest_event_at?: string | null;
   last_purge?: { at: string; deleted: number } | null;
+}
+
+// ---- Admin: users and roles (docs/web-api.md, "Admin: users and roles") ----
+
+/** The roles a user can hold, in the order the server sorts them. */
+export const USER_ROLES = ['admin', 'pm', 'reviewer', 'auditor'] as const;
+export type UserRole = (typeof USER_ROLES)[number];
+
+/** The kinds of identity an admin can unlink. */
+export type IdentityKind = 'entra' | 'atlassian' | 'github';
+
+/** One person in the user database. The three address fields are in the admin view only (absent, not null, for an auditor). */
+export interface DirectoryUser {
+  handle: string;
+  /** Untrusted text (often from Slack): render as plain text only. `""` when none. */
+  display_name: string;
+  status: 'active' | 'deactivated';
+  roles: string[];
+  created_at: string;
+  deactivated_at: string | null;
+  grace_ends_at: string | null;
+  dual_role: boolean;
+  role_conflict: boolean;
+  has_sign_in_name: boolean;
+  sign_in_name_confirmed: boolean;
+  sign_in_unconfirmed: boolean;
+  entra: 'none' | 'linked' | 'needs_host';
+  entra_needs_host: boolean;
+  slack_linked: boolean;
+  entra_linked: boolean;
+  atlassian_linked: boolean;
+  github_linked: boolean;
+  /** Whether each account's token is linked now. Null when it couldn't be read (writes' answers only). */
+  accounts: TeamAccounts | null;
+  host_only: boolean;
+  bot: string;
+  team_bots: string[];
+  reviews: string[];
+  reviewed_by: string[];
+  sign_in_name?: string | null;
+  atlassian_email?: string | null;
+  github_login?: string | null;
+}
+
+export interface PilotException {
+  ends: string;
+  ends_at: string;
+  ending_soon: boolean;
+  lapsed: boolean;
+}
+
+export interface UserList {
+  version: number;
+  view: 'admin' | 'auditor';
+  users: DirectoryUser[];
+  deactivations: { last_hour: number; limit: number; remaining: number; grace_hours: number };
+  pilot_exception: PilotException | null;
+  linking: boolean;
+}
+
+/** Every write's answer: the person as they are now (admin view) and the directory's new version. */
+export interface Written {
+  version: number;
+  user: DirectoryUser;
+  /** Only on a deactivation: plain text for the admin. */
+  note?: string;
+}
+
+export interface NewUser {
+  handle: string;
+  display_name?: string;
+  sign_in_name: string;
+  atlassian_email: string;
+  github_login?: string | null;
+  slack_id?: string | null;
+  roles: string[];
+}
+
+export interface UserFields {
+  sign_in_name?: string;
+  atlassian_email?: string;
+  github_login?: string;
+  display_name?: string;
 }
 
 export class ApiError extends Error {
@@ -404,6 +512,16 @@ export interface Api {
   adminAuditExport(query: AuditQuery): Promise<AuditExport>;
   adminTeam(): Promise<TeamList>;
   adminConnectors(): Promise<Connector[]>;
+
+  adminUsers(): Promise<UserList>;
+  adminInvite(input: NewUser): Promise<Written>;
+  adminSetRoles(handle: string, roles: string[], expectedVersion: number): Promise<Written>;
+  adminSetFields(handle: string, fields: UserFields, expectedVersion: number): Promise<Written>;
+  adminConfirmSignIn(handle: string, signInName: string, expectedVersion?: number): Promise<Written>;
+  adminDeactivate(handle: string, expectedVersion?: number): Promise<Written>;
+  adminReactivate(handle: string, expectedVersion?: number): Promise<Written>;
+  adminUnlink(handle: string, kind: IdentityKind): Promise<Written>;
+  adminAssignReviewer(reviewer: string, pms: string[], expectedVersion?: number): Promise<Written>;
 
   adminPolicy(): Promise<PolicyView>;
   adminPolicyValidate(spec: SpecPatch): Promise<Validation>;
