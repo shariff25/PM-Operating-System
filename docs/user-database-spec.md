@@ -1185,13 +1185,90 @@ from the text above:
   `resolve` one person but not list users (U2). It reads the inboxes of every personal bot's
   owner and everyone in the 50 most recent tasks (both from the runtime, signed as the
   admin), plus the admin's own. A PM with neither is missing from that screen until the tool
-  server offers the console an admin listing (left open; it changes the tool server).
+  server offers the console an admin listing (left open; it changes the tool server; built
+  in U5a, below).
 - **Assertion roles** are the viewer's from this request's answer. A read of another PM's
   inbox (an admin's view) is signed for that PM, as before, with **no roles**: the console has
   no answer about them and doesn't look one up (a lookup per PM per page would spend misses
   on stale handles); roles are informational (§9).
 - **Not verified:** the console against the real tool server's `resolve` (the tests use a
   mock with the route's wire shape, and the production router over HTTP); no stack test.
+
+**U5a is built** on `claude/u5a-admin-user-writes` (the back end of U5: `crates/toolserver/src/app/users.rs`,
+the write ops in `src/users/rules.rs` (`SetFields`, `Unlink`, `AssignReviewer`,
+`plan_expecting`), migration `0018_reviewer_assignments.sql`, `tests/admin_users.rs` on both
+stores; `crates/web/src/app/users.rs`; the console's `admin_inboxes`; a stack test through
+`pmos-web` and the real tool server; `docs/web-api.md` "Admin: users and roles",
+`docs/toolserver.md` "The Admin API", `docs/runbooks/users.md`). The Team screen is U5b, built
+from `docs/web-api.md`. Where it differs from the text above:
+- **Migration `0018`, not `NNNN` after U1's**: `0016` is left free for the B1 fix in flight.
+  It adds `reviewer_assignments` (U1 left it to U6; U5 needs it for the assignment route),
+  with its own deferred trigger that takes the users lock, checks READ COMMITTED and bumps
+  `directory_version` (`users_invariants()` keys on a `handle` column this table hasn't got).
+  `approval_recommendations` stays U6's.
+- **A U3 bug fixed in 0018:** a person's own first Atlassian or GitHub link records its
+  `role_changes` row with client `link`, which 0015's check didn't allow, so in Postgres
+  every such first link was refused ("not an active PM OS user"). The check now allows
+  `link`. U3's tests ran that path in memory only, which has no such check.
+- **Writes need `require`**: a write answers `503 assertion_required` unless the server runs
+  in assertion `require` with no development override (not only "started with
+  `PMOS_ASSERTION_INSECURE_OFF=1`": `off` and `verify` count too, which only tests can
+  build), and needs the web assertion for the actor in every mode. `GET` keeps the admin
+  reads' rule (the assertion as `PMOS_ASSERTION_MODE` says), so a development stack can read
+  the Team page. `GET /internal/admin/users` is `pmos-web`'s only, like the writes: the
+  orchestrator gets `403` (§2's route table names web only).
+- **`expected_version`** is required on roles and fields (`400 bad_request` without it) and
+  accepted on every other write. `409 stale` is checked after the actor and the change's own
+  rules, before the invariants, so `forbidden`, `self_change` and `host_only` answer as
+  themselves on an old version.
+- **The body of `PUT …/fields`** is all or nothing, and no field can be cleared through it.
+  The display name is not an address: an admin may change anyone's, their own and an Admin's
+  or Auditor's included. A sign-in name set through it is confirmed, as §6 says; the confirm
+  route is the same write with one field, and a confirmation of the stored, unconfirmed name
+  is recorded as `confirm_sign_in_name` (a different name as `set_field`).
+- **Unlink** takes `entra`, `atlassian` or `github` (§6's "an admin unlinks first", which U3's
+  note left to U5): an `atlassian` or `github` identity goes with its linked account (the
+  credential is deleted in the same transaction). Only an Admin's or Auditor's **`entra`**
+  link is host-only; their Atlassian or GitHub identity an admin may unlink (the next link is
+  the person's own OAuth sign-in, checked against their email or login, which stays
+  host-only). Nobody unlinks their own.
+- **Reviewer assignments:** an admin never assigns themselves PMs to review (`403
+  self_change`; separation of duties, not in §6's table); the reviewer must hold `reviewer`
+  and the PMs `pm`, all active (`409 not_reviewer`, `409 not_pm`, `409 not_active`), except
+  that clearing (`[]`) is always allowed; at most 200 PMs. Two new refusal codes, plus
+  `stale`.
+- **The invite** (`POST /internal/admin/users`) requires `sign_in_name` and
+  `atlassian_email` and at least one role; it creates no personal bot (`pmos bot
+  add-personal` until the Team screen offers one) and is not added to `team.yaml`. Approving
+  a Slack join request from the web app, and §4's `POST …/personal-bot` retry, are **not
+  built**.
+- **Deactivation from the web** is refused `409 owns_bots` while the person owns a team bot,
+  as Slack's `remove` is (checked only for an admin acting on another active person, so
+  anyone else gets the rules' own answer). Its answer carries a `note` with the personal
+  bot's `pmos-admin pause` line.
+- **The lapsed pilot exception** needed no new rule: the plan and the trigger check only the
+  people a write touches and count no deactivated person as holding both, so revoking either
+  role and deactivating always work, and the person's admin powers stay; tested on both stores,
+  with the exception moved into the past in Postgres by setting the trigger aside for that one
+  fixture statement.
+- **The overview** already had U3's flags; U5a adds `identity_conflict_users` (the targets of
+  the conflict events), `resolve_miss_warning_threshold` and `deactivation_grace_hours`, and
+  `pmos-web` now serves `users` and `held_drafts` field by field (it dropped them before).
+- **The console's listing** is `GET /internal/console/members?user=<admin>`: the console's
+  token only, its assertion as on its approvals reads, an active admin in the database,
+  `{handles}` of active users holding `pm`, `reviewer` or `admin`; audited
+  `admin.console_members`. The console no longer asks the runtime for the roster and recent
+  tasks to find PMs; a deactivated person's held drafts are not on its admin queue.
+- **`pmos-web`**: `GET /api/admin/team` now reads `GET /internal/admin/users` (active users,
+  the old shape; `has_email` is now "has a sign-in name"), so it fails `502` when the tool
+  server can't answer instead of falling back to the file; `team_unavailable` and
+  `pmos-web`'s `team.yaml` reader are removed. Refusals keep the tool server's code with
+  `pmos-web`'s own sentence; an unknown code is `502 upstream_unavailable`; a write whose
+  answer was lost is `502 unknown_outcome`.
+- **Not verified:** a real Entra tenant (the confirm-then-first-link path is tested against
+  the store's link route, not a token); the web front end against these routes (U5b); the
+  console against the real tool server's listing (its tests use a mock with the route's wire
+  shape; the tool server side is tested over HTTP).
 
 U4a–U4d run in parallel (U4b after U3, since `remove` calls U3's deactivation). U5 and U6 can
 overlap once the routes in U5 are merged.

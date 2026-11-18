@@ -107,6 +107,9 @@ impl MemoryUsers {
                 Effect::CloseHeldDrafts(h) => {
                     l.approvals.close_for_owner(h, now).await?;
                 }
+                Effect::DeleteCredential(h, provider) => {
+                    l.credentials.delete(h, *provider).await?;
+                }
             }
         }
         Ok(())
@@ -155,11 +158,17 @@ impl UserStore for MemoryUsers {
         Ok(self.state.lock().await.directory(now))
     }
 
-    async fn apply(&self, actor: &Actor, op: Op, now: DateTime<Utc>) -> UserResult<Applied> {
+    async fn apply_expecting(
+        &self,
+        actor: &Actor,
+        op: Op,
+        now: DateTime<Utc>,
+        expected: Option<i64>,
+    ) -> UserResult<Applied> {
         // One write at a time, as the database's advisory lock does.
         let mut state = self.state.lock().await;
         let dir = state.directory(now);
-        match rules::plan(&dir, actor, &op, now, &self.rules) {
+        match rules::plan_expecting(&dir, actor, &op, now, &self.rules, expected) {
             Ok(plan) => {
                 // The events first: if the audit log can't take them, nothing changes.
                 self.record(

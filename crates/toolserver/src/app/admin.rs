@@ -92,12 +92,13 @@ fn needs_assertion(path: &str) -> bool {
 }
 
 /// `pmos-web`'s assertion on a [`needs_assertion`] route, whatever the mode: present, valid,
-/// bound to this exact request (body included, up to [`MAX_PROPOSAL_BODY`]), and its subject
+/// bound to this exact request (body included, up to `max_body` bytes), and its subject
 /// the `user=` the call names. Returns the request with its body put back.
-async fn require_assertion(
+pub(super) async fn require_assertion(
     assertions: &crate::assertion::Assertions,
     client: Client,
     req: Request,
+    max_body: usize,
 ) -> Result<Request, Box<Response>> {
     use crate::assertion::Refusal;
     let uri = req
@@ -112,7 +113,7 @@ async fn require_assertion(
         return Err(super::refuse_assertion(client, Refusal::Header));
     };
     let (parts, body) = req.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, MAX_PROPOSAL_BODY).await else {
+    let Ok(bytes) = axum::body::to_bytes(body, max_body).await else {
         return Err(super::refuse_assertion(client, Refusal::Body));
     };
     let target = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
@@ -158,7 +159,7 @@ async fn identify_admin_client(
                 "only pmos-web, acting for a signed-in person, may use this route",
             );
         }
-        match require_assertion(assertions, client, req).await {
+        match require_assertion(assertions, client, req, MAX_PROPOSAL_BODY).await {
             Ok(checked) => req = checked,
             Err(refused) => return *refused,
         }
@@ -172,7 +173,7 @@ async fn identify_admin_client(
     next.run(req).await
 }
 
-fn coded(status: StatusCode, code: &str, message: &str) -> Response {
+pub(super) fn coded(status: StatusCode, code: &str, message: &str) -> Response {
     (status, Json(json!({ "code": code, "error": message }))).into_response()
 }
 
@@ -212,7 +213,7 @@ async fn record_with(
 
 /// The viewer `user` names, if they are an active user with any of `any_of`. A refusal is
 /// recorded and answered `403 forbidden`; a missing `user` is `400`.
-async fn viewer(
+pub(super) async fn viewer(
     state: &AppState,
     client: Client,
     user: Option<&str>,
@@ -648,12 +649,13 @@ async fn overview(
 /// The pilot exception's end is flagged this many days ahead (§6).
 pub const EXCEPTION_WARN_DAYS: i64 = 14;
 
-/// `users.identity_conflict` events since `since` (slice U4c records them), `None` when the
-/// audit log can't be read back.
+/// `users.identity_conflict` events since `since` (slice U4c records them): how many, and the
+/// users whose sign-in name was presented (their targets, handles only). `None` when the audit
+/// log can't be read back.
 async fn identity_conflicts(
     state: &AppState,
     since: DateTime<Utc>,
-) -> Result<Option<usize>, crate::store::StoreError> {
+) -> Result<Option<(usize, Vec<String>)>, crate::store::StoreError> {
     let query = AuditQuery {
         before: None,
         limit: MAX_PAGE,
@@ -669,7 +671,16 @@ async fn identity_conflicts(
         .audit
         .search(&query)
         .await?
-        .map(|e| e.len()))
+        .map(|events| {
+            let mut who: Vec<String> = events
+                .iter()
+                .filter_map(|e| e.event.output_ref.clone())
+                .filter(|h| crate::session::valid_handle(h))
+                .collect();
+            who.sort();
+            who.dedup();
+            (events.len(), who)
+        }))
 }
 
 /// The user database's flags on the overview (§4, §6, §2): handles and counts only, never an
@@ -677,7 +688,7 @@ async fn identity_conflicts(
 fn users_flags(
     state: &AppState,
     dir: &crate::users::Directory,
-    conflicts: Option<usize>,
+    conflicts: Option<(usize, Vec<String>)>,
     now: DateTime<Utc>,
 ) -> Value {
     let handles = |f: &dyn Fn(&User) -> bool| -> Vec<String> {
@@ -718,7 +729,11 @@ fn users_flags(
         "role_conflicts": if in_force { Vec::new() } else { dual.clone() },
         "entra_needs_host": handles(&|u| u.active() && u.entra_state() == "needs_host"),
         "no_slack": handles(&|u| u.active() && u.identity(IdentityKind::Slack).is_none() && u.has(UserRole::Pm)),
-        "identity_conflicts": conflicts,
+        "identity_conflicts": conflicts.as_ref().map(|(n, _)| *n),
+        // §7 step 3: "someone signed in with Microsoft as <handle>'s sign-in name".
+        "identity_conflict_users": conflicts.map(|(_, who)| who),
+        "resolve_miss_warning_threshold": crate::users::access::ResolveMisses::WARN_PER_HOUR,
+        "deactivation_grace_hours": crate::users::CREDENTIAL_GRACE_HOURS,
         "resolve_miss_warning": state.svc.people().resolve_misses().warning(),
         "deactivations_last_hour": recent,
         "deactivation_limit": cap,

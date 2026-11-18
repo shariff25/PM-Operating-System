@@ -3,10 +3,12 @@
 PM OS is moving who-may-use-it from `content/team.yaml` to the tool server's own database
 (`docs/user-database-spec.md`). **Since slice U3 the tool server decides from the database:**
 who may have a session, decide a draft, link an account, read the admin screens, approve a
-join or deactivate someone. The runtime (U4a), Slack (U4b) and the web app's sign-in (U4c)
-read the database too; the console and the web app's Team page still read `team.yaml` until
-slices U4d and U5, so **keep both equal**: a join approved in Slack writes both;
-anything you add by hand to `team.yaml`, add here too (`import` picks up new people).
+join or deactivate someone. The runtime (U4a), Slack (U4b), the web app's sign-in (U4c), the
+console (U4d) and the web app's Team page (U5a) read the database too; no service decides from
+`team.yaml`. Onboarding in Slack still writes `team.yaml` (with the personal bot) until slice
+U7 retires the file, for `pmos lint`'s bot-owner check; someone invited in the web app is not
+added to it. Anything you add by hand to `team.yaml`, add here too (`import` picks up new
+people).
 
 **Before deploying a release with U3, import.** A tool server with an empty user database lets
 nobody in (it logs `the user database is empty` at start-up). On an install that already has
@@ -85,6 +87,21 @@ deploy/pmos-admin users set-entra <handle> --oid <their object id>
 
 ## Day to day
 
+**Most of this is the web app's now** (slice U5a; the Team screen itself is slice U5b): an
+admin invites people, changes roles (never `admin`), sets or confirms sign-in names and the
+Atlassian email or GitHub login, deactivates and reactivates, unlinks a Microsoft, Atlassian
+or GitHub account, and assigns reviewers their PMs. Every change is signed by the admin's
+session and recorded. The web app only works with signed user assertions
+(`PMOS_ASSERTION_MODE=require`, as `deploy/setup.sh` sets it); a development stack with
+`PMOS_ASSERTION_INSECURE_OFF=1` can read the Team page but changes nobody (`assertion_required`).
+
+**Still the host's alone:** making an admin (`grant-admin`), the bootstrap admin, setting or
+removing an **Admin's or Auditor's** sign-in name, Atlassian email or Microsoft link
+(`set-sign-in-name`, `set-atlassian-email`, `set-entra`, `unset-entra`), the pilot exception,
+deactivations past the hourly limit, the import and export. Nobody changes their own roles,
+status or addresses in the web app, so an admin's own changes are another admin's or the
+host's.
+
 ```sh
 deploy/pmos-admin users list                                  # who, status, roles, flags
 deploy/pmos-admin users grant-admin ana --oid <object id>     # the only way to make an admin
@@ -98,13 +115,13 @@ admin who comes back is reactivated without `admin`; grant it again on purpose.
 
 ## Deactivating someone, and undoing it
 
-Slack's `remove <handle>` (and, from slice U5, the web app's Team page) deactivates; it never
-deletes and commits nothing. In one step: their sessions end, `admin` is taken away if they
+Slack's `remove <handle>` and the web app's Team page (slice U5a) deactivate; they never
+delete and commit nothing. In one step: their sessions end, `admin` is taken away if they
 had it, and their linked Jira, Confluence, Slack and GitHub accounts are **suspended** (PM OS
 won't use them). Their pending drafts are **held**. Then:
 
-- **Reactivate within 24 hours** (`deploy/pmos-admin users reactivate <handle>`): the accounts
-  work again and the held drafts can be decided. `admin` doesn't come back: `grant-admin` it
+- **Reactivate within 24 hours** (the Team page, or `deploy/pmos-admin users reactivate
+  <handle>`): the accounts work again and the held drafts can be decided. `admin` doesn't come back: `grant-admin` it
   on purpose.
 - **After 24 hours** the tool server deletes the accounts and closes the drafts
   (`owner_deactivated`, nothing is posted). A reactivation then brings the person back, but
@@ -130,12 +147,15 @@ deploy/pmos-admin users pilot-exception admin-and-auditor off --revoke-auditor
 ```
 
 `--until` is a date (it ends at 00:00 UTC that day). While it is on, granting `auditor` to an
-admin works (from the web app in a later release). `off` is refused while anyone holds both,
+admin works, on the host or in the web app (the person then shows a badge, and the overview
+says when the exception ends, from 14 days before). `off` is refused while anyone holds both,
 naming them; `--revoke-auditor` takes `auditor` away from each in the same step and keeps
 `admin`. If the date passes and nobody ran `off`, the exception counts as off: changes to
 that person are refused until one of the two roles is gone. Revoking either role,
-deactivating them and `off --revoke-auditor` still work, and PM OS never lets this leave it
-without a working admin.
+deactivating them and `off --revoke-auditor` still work (another admin can do the first two
+in the web app), the person keeps their admin powers meanwhile (only their audit-log reads
+are refused), and PM OS never lets this leave it without a working admin. The overview shows
+a red notice naming them.
 
 ## Break glass: the web app is down or an admin is locked out
 
@@ -147,6 +167,9 @@ deploy/pmos-admin users grant-admin <handle> --oid <object id>   # make someone 
 deploy/pmos-admin users revoke-admin <handle>                    # take admin away
 deploy/pmos-admin users unset-entra <handle>                     # a wrong Microsoft link
 ```
+
+The web app can do the last two for anyone but an Admin or Auditor (and not on oneself); the
+host does them for everyone.
 
 PM OS always keeps at least one active admin: the last one can't be demoted or deactivated by
 anyone, from anywhere, and the database itself enforces it. To replace the last admin,

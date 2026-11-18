@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use pmos_contract::model::{Role, TeamFile};
+use pmos_contract::model::Role;
 use pmos_contract::onboarding::personal_bot_name;
 use pmos_contract::permissions::Permission;
 use serde::de::DeserializeOwned;
@@ -44,7 +44,6 @@ use crate::session::{
     self, IdHash, MemorySessionStore, Session, SessionStore, StoreError, CSRF_HEADER,
 };
 use crate::settings::{DraftEdit, MemorySettingsStore, SettingsStore, StoredSuggestion, UserState};
-use crate::team::TeamCache;
 use crate::upstream::{
     Approval, DecisionBody, RefusedAudience, Runtime, Task, TaskEvent, ToolServer, UpstreamError,
 };
@@ -54,6 +53,7 @@ mod brief;
 mod content;
 mod policy;
 mod proposal;
+mod users;
 
 /// How many tasks `GET /api/tasks` lists.
 pub const RECENT_TASKS: usize = 20;
@@ -122,9 +122,6 @@ struct Inner {
     /// Users and roles: the tool server's `resolve` and first-link routes, cached 10 seconds
     /// per lookup, with the last-known-good answer kept for when it can't be reached.
     directory: Arc<ResolveClient>,
-    /// `team.yaml`, for the admin Team page's member list only (until slice U5 replaces it
-    /// with the user database's admin list). It decides nothing.
-    team: TeamCache,
     /// The deployed content tree the admin content and policy screens read.
     content_root: PathBuf,
     public_url: Option<String>,
@@ -264,7 +261,6 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         directory,
         runtime: Runtime::new(http.clone(), &config.bots_url, &config.bots_token),
         toolserver: ToolServer::new(http, &config.toolserver_url, &config.toolserver_token),
-        team: TeamCache::new(config.content_root.clone()),
         content_root: config.content_root,
         public_url: config.public_url,
         static_root,
@@ -306,6 +302,7 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         .route("/tasks/{id}", get(get_task))
         .merge(brief::routes())
         .merge(admin::routes())
+        .merge(users::routes())
         .merge(policy::routes())
         .merge(content::routes())
         .fallback(|| async { ApiError::not_found() })
@@ -790,18 +787,6 @@ async fn live_session(
         .await
         .map_err(ApiError::store)?;
     Ok(found.map(|s| (id, s)))
-}
-
-/// `team.yaml`, for the admin Team page's member list only (it decides nothing).
-fn load_team(state: &AppState) -> Result<Arc<TeamFile>, ApiError> {
-    state.0.team.load().map_err(|e| {
-        tracing::error!(error = %e, "team.yaml can't be read");
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "team_unavailable",
-            "PM OS can't read the team list right now. Tell a platform owner.",
-        )
-    })
 }
 
 fn users_unavailable() -> ApiError {

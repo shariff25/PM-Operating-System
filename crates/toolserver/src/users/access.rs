@@ -141,7 +141,22 @@ impl People {
         op: Op,
         now: chrono::DateTime<Utc>,
     ) -> UserResult<Applied> {
-        let result = self.store.apply(actor, op, now).await;
+        self.apply_expecting(actor, op, now, None).await
+    }
+
+    /// [`People::apply`] for a write made against the directory at `expected_version`: `409
+    /// stale` when it moved since (slice U5, `rules::plan_expecting`).
+    pub async fn apply_expecting(
+        &self,
+        actor: &Actor,
+        op: Op,
+        now: chrono::DateTime<Utc>,
+        expected_version: Option<i64>,
+    ) -> UserResult<Applied> {
+        let result = self
+            .store
+            .apply_expecting(actor, op, now, expected_version)
+            .await;
         self.invalidate();
         result
     }

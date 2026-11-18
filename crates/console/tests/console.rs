@@ -423,6 +423,27 @@ async fn toolserver(
         .into_response()
 }
 
+/// The tool server's admin listing for the console (`GET /internal/console/members`): handles
+/// only, for an admin (`root` here). `cy` has no personal bot and no recent task.
+async fn members(
+    State(seen): State<Arc<Seen>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    seen.record(&method, &uri, &headers, &[]);
+    if headers.get("authorization").and_then(|v| v.to_str().ok())
+        != Some(&format!("Bearer {TOOLS_TOKEN}"))
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if q.get("user").map(String::as_str) != Some("root") {
+        return (StatusCode::FORBIDDEN, Json(json!({"code": "forbidden"}))).into_response();
+    }
+    Json(json!({"handles": ["ana", "ben", "cy", "root"]})).into_response()
+}
+
 /// A URL nothing listens on.
 async fn closed_port() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -525,6 +546,7 @@ async fn console(opts: Options) -> Console {
     let (tools_url, stop_tools) = serve(
         Router::new()
             .route("/internal/approvals", get(toolserver))
+            .route("/internal/console/members", get(members))
             .with_state(tools_seen.clone())
             .merge(
                 Router::new()
@@ -1181,9 +1203,13 @@ async fn approvals_screen_is_read_only_and_scoped() {
     assert!(
         body.find("slack.post_message").unwrap() < body.find("confluence.create_draft").unwrap()
     );
-    // Every member's inbox, pending only, with the service token.
+    // Every member's inbox, pending only, with the service token: the members come from the
+    // tool server's admin listing, so `cy` (no personal bot, no recent task) is read too.
     let calls = c.tools.calls();
-    for user in ["ana", "ben", "root"] {
+    assert!(calls
+        .iter()
+        .any(|(_, p, ..)| p == "/internal/console/members?user=root"));
+    for user in ["ana", "ben", "cy", "root"] {
         let want = format!("/internal/approvals?user={user}&status=pending");
         assert!(calls.iter().any(|(_, p, ..)| p == &want), "missing {want}");
     }
@@ -1873,6 +1899,7 @@ async fn assertions_carry_the_roles_the_directory_gave() {
     c.runtime.asserted.lock().unwrap().clear();
     c.tools.asserted.lock().unwrap().clear();
     c.get(Some("root"), "/approvals").await;
+    c.get(Some("root"), "/activity").await;
     let runtime = verify(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY));
     assert!(!runtime.is_empty());
     for (subject, roles) in runtime {
@@ -1882,7 +1909,8 @@ async fn assertions_carry_the_roles_the_directory_gave() {
     let tools = verify(&c.tools, "toolserver", ("ct1", CONSOLE_TOOLS_KEY));
     let mut subjects: Vec<&str> = tools.iter().map(|(s, _)| s.as_str()).collect();
     subjects.sort();
-    assert_eq!(subjects, vec!["ana", "ben", "root"]);
+    // The listing and the admin's own inbox are signed as the admin.
+    assert_eq!(subjects, vec!["ana", "ben", "cy", "root", "root"]);
     for (subject, roles) in &tools {
         let want = if subject == "root" {
             vec![Role::Pm, Role::Admin]
