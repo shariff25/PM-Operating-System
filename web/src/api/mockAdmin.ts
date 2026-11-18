@@ -5,12 +5,14 @@ import type { MockUsers, MockUsersOptions } from './mockUsers';
 import { ApiError } from './types';
 import type { AdminOverview, AuditEvent, AuditExport, AuditPage, AuditQuery, Connector, TeamList, TeamMember } from './types';
 
-export type MockRole = 'pm' | 'admin' | 'auditor';
+export type MockRole = 'pm' | 'admin' | 'auditor' | 'reviewer';
 
 export const MOCK_PROFILES: Record<MockRole, { handle: string; name: string; roles: string[] }> = {
   pm: { handle: 'ana', name: 'Ana Silva', roles: ['pm'] },
   admin: { handle: 'ada', name: 'Ada Okafor', roles: ['admin'] },
   auditor: { handle: 'audrey', name: 'Audrey Nolan', roles: ['auditor'] },
+  // Reviews Ana's and Dana's drafts, as in the sample user database.
+  reviewer: { handle: 'ben', name: 'Ben Carter', roles: ['pm', 'reviewer'] },
 };
 
 const PM_PERMISSIONS = [
@@ -50,6 +52,17 @@ export const MOCK_PERMISSIONS: Record<MockRole, string[]> = {
   pm: PM_PERMISSIONS,
   admin: ADMIN_PERMISSIONS,
   auditor: ['view-audit-log', 'export-audit', 'view-policies', 'view-content'],
+  // The Reviewer row: a PM's, plus reading and recommending on others' drafts.
+  reviewer: [
+    'ask-bot',
+    'view-own-tasks',
+    'manage-own-routines',
+    'decide-own-approval',
+    'view-others-approvals',
+    'recommend-on-approval',
+    'view-own-traces',
+    'link-own-accounts',
+  ],
 };
 
 /** The role a development handle signs in as. Any other handle is a plain PM. */
@@ -57,6 +70,7 @@ export function roleOfHandle(handle: string): MockRole | null {
   const h = handle.trim().toLowerCase();
   if (h === 'ada' || h === 'admin') return 'admin';
   if (h === 'audrey' || h === 'auditor') return 'auditor';
+  if (h === 'ben' || h === 'reviewer') return 'reviewer';
   return null;
 }
 

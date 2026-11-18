@@ -43,6 +43,18 @@ export function taskIdFromPath(path: string): string | null {
   }
 }
 
+/** Read the id out of a `/reviews/<id>` hash path. Returns null when it is malformed or unsafe. */
+export function reviewIdFromPath(path: string): string | null {
+  const raw = /^\/reviews\/([^/]+)$/.exec(path)?.[1];
+  if (!raw) return null;
+  try {
+    const id = decodeURIComponent(raw);
+    return isSafeId(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
 export type Route =
   | { name: 'home' }
   | { name: 'drafts' }
@@ -50,6 +62,8 @@ export type Route =
   | { name: 'followups' }
   | { name: 'activity' }
   | { name: 'task'; id: string }
+  | { name: 'reviews' }
+  | { name: 'review'; id: string }
   /** `search` is the query part of the hash (the audit filters), without the `?`. */
   | { name: 'admin'; section: AdminSection; search: string; sub?: PolicyPart };
 
@@ -70,6 +84,9 @@ export function parseRoute(path: string): Route {
   if (path === '/drafts') return { name: 'drafts' };
   if (path === '/followups') return { name: 'followups' };
   if (path === '/activity') return { name: 'activity' };
+  if (path === '/reviews') return { name: 'reviews' };
+  const review = reviewIdFromPath(path);
+  if (review) return { name: 'review', id: review };
   const admin = adminRoute(path);
   if (admin) return admin;
   const draft = draftIdFromPath(path);
@@ -81,6 +98,7 @@ export function parseRoute(path: string): Route {
 
 export const draftHref = (id: string) => `#/d/${encodeURIComponent(id)}`;
 export const taskHref = (id: string) => `#/a/${encodeURIComponent(id)}`;
+export const reviewHref = (id: string) => `#/reviews/${encodeURIComponent(id)}`;
 
 /** `/signed-out?reason=…` is where the server sends someone whose sign-in did not finish. */
 export function signedOutReason(path: string): string | null {

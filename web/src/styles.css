@@ -2113,3 +2113,58 @@ a.handle-link:hover { background: var(--accent-soft); color: var(--accent-text);
   .team-head { flex-direction: column; align-items: flex-start; gap: 0; padding: 0 8px 10px; }
   .team-cap-line { padding: 0 10px; }
 }
+
+/* ---------- Reviews: a reviewer's inbox and read of a draft, and the owner's view of the advice ---------- */
+.reviews-grid { grid-template-columns: minmax(0, 1fr) 168px 204px 92px; }
+.reviews-grid .sys-tag { width: 104px; justify-content: center; }
+.tcell-owner { display: flex; align-items: center; gap: 8px; color: var(--ink); }
+.owner-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.row-title-restricted { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+a.trow:hover .row-title-restricted { color: var(--ink); }
+.reviews-who { padding: 0 2px; }
+.review-from { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+.review-intro { font-size: 13px; color: var(--muted); }
+.review-form { display: flex; flex-direction: column; gap: 12px; }
+.review-form textarea { min-height: 104px; font-size: 14px; }
+.note-counter { text-align: right; font: 400 11.5px/1.2 var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); }
+.note-counter-over { color: var(--bad-ink); font-weight: 500; }
+.review-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.review-actions .btn { flex: 1 1 auto; }
+.review-panel .note { font-size: 13px; }
+.mine { display: flex; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--border-2); border-radius: 10px; background: var(--surface-2); }
+.mine-line { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 500; color: var(--ink); }
+.mine-next { font-size: 12.5px; color: var(--muted); }
+.mine-stale .mine-line, .mine-stale .rec-note { color: var(--muted); }
+.review-restricted .card-body { display: flex; flex-direction: column; gap: 14px; padding: 18px; }
+.review-restricted-title { display: inline-flex; align-items: center; gap: 8px; font-size: 15px; letter-spacing: -0.01em; }
+.review-restricted-line { font-size: 14px; color: var(--ink-2); }
+.review-calm .empty { padding: 44px 18px; }
+
+.recs-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.rec { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--border-2); border-radius: 10px; background: var(--surface); }
+.rec-icon { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; }
+.rec-icon-approve { background: var(--good-bg); color: var(--good-ink); }
+.rec-icon-changes { background: var(--warn-bg); color: var(--warn-ink); }
+.rec-icon-stale { background: var(--surface-3); color: var(--muted); }
+.rec-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.rec-line { font-size: 13.5px; font-weight: 500; line-height: 1.4; color: var(--ink); overflow-wrap: anywhere; }
+.rec-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font: 400 12px/1.3 var(--mono); color: var(--muted); }
+.rec-note { margin-top: 2px; padding-left: 10px; border-left: 2px solid var(--border-2); font-size: 13px; line-height: 1.5; color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.rec-stale .rec-line, .rec-stale .rec-note { color: var(--muted); }
+.rec-removed { font-size: 12.5px; color: var(--muted); }
+.rec-foot { font-size: 12px; color: var(--muted); }
+/* A field whose value the server would refuse: the line under it says why, in the error colour. */
+.field-hint.field-error { color: var(--bad-ink); }
+input[aria-invalid='true'], textarea[aria-invalid='true'] { border-color: var(--bad-dot); }
+.recs-phone { padding: 14px; background: var(--surface); border: 1px solid var(--border-2); border-radius: 12px; }
+
+@media (max-width: 1240px) {
+  .reviews-grid { grid-template-columns: minmax(0, 1fr) 140px 188px 80px; }
+}
+@media (max-width: 1100px) {
+  .reviews-grid .tcell-owner .avatar { display: none; }
+}
+@media (max-width: 767px) {
+  .reviews-grid .sys-tag { width: auto; }
+  .trow .row-title.row-title-restricted { display: inline-flex; }
+}

@@ -3,6 +3,8 @@ import { MOCK_PERMISSIONS, MOCK_PROFILES, createMockAdmin, roleOfHandle } from '
 import type { MockAdminOptions, MockRole } from './mockAdmin';
 import { createMockPolicy } from './mockPolicy';
 import type { MockPolicyOptions } from './mockPolicy';
+import { createMockReviews } from './mockReviews';
+import type { MockReviewsOptions } from './mockReviews';
 import { ApiError, REJECT_REASONS } from './types';
 import type {
   Api,
@@ -19,8 +21,8 @@ import type {
   TaskEvent,
 } from './types';
 
-export interface MockOptions extends MockAdminOptions, MockPolicyOptions {
-  /** Who is signed in: a PM (default), an admin or an auditor. Signing in by handle (ada, audrey) also picks it. */
+export interface MockOptions extends MockAdminOptions, MockPolicyOptions, Omit<MockReviewsOptions, 'hostile'> {
+  /** Who is signed in: a PM (default), an admin, an auditor or a reviewer. Signing in by handle (ada, audrey, ben) also picks it. */
   role?: MockRole;
   /** Pretend network delay in ms. Tests use 0. */
   latency?: number;
@@ -176,6 +178,7 @@ export function createMockClient(options: MockOptions = {}): Api {
     first_visit: options.firstVisit ?? !!options.noDrafts,
     hints_seen: [],
     nudges: true,
+    reviewer: profile.roles.includes('reviewer'),
   };
 
   const drafts = new Map<string, Draft>();
@@ -557,6 +560,15 @@ export function createMockClient(options: MockOptions = {}): Api {
     return t;
   }
 
+  const reviews = createMockReviews(now0, drafts, { hostile: options.hostile, reviewError: options.reviewError });
+  /** A draft as its owner reads it: with the advice reviewers gave on it. */
+  const out = (d: Draft): Draft => clone({ ...d, recommendations: reviews.recommendationsFor(d) });
+  /** The reviewer routes: anyone without the reviewer role is refused by pmos-web itself. */
+  const needReviewer = () => {
+    guard();
+    if (!me.roles.includes('reviewer')) throw new ApiError(403, 'forbidden', 'Only reviewers have reviews.');
+  };
+
   const admin = createMockAdmin(now0, options, () => [...drafts.values()].filter((d) => d.status === 'pending' && !d.practice).length);
   const policy = createMockPolicy(now0, options);
   /** Personal master files and restricted context are for admins only (they may edit content). */
@@ -591,6 +603,7 @@ export function createMockClient(options: MockOptions = {}): Api {
         me.display_name = MOCK_PROFILES[named].name;
         me.roles = [...MOCK_PROFILES[named].roles];
         me.permissions = [...MOCK_PERMISSIONS[named]];
+        me.reviewer = me.roles.includes('reviewer');
       }
     },
     async logout() {
@@ -645,7 +658,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       const d = find(id);
       me.first_visit = false;
-      return clone(d);
+      return out(d);
     },
     async saveDraft(id, input) {
       await wait();
@@ -660,7 +673,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       d.edited_at = iso(Date.now());
       d.sources = d.sources.map((s) => ({ ...s, cited: false }));
       bump(d);
-      return clone(d);
+      return out(d);
     },
     async requestChange(id, instruction) {
       await wait();
@@ -719,7 +732,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       d.sources = d.sources.map((s) => ({ ...s, cited: false }));
       bump(d);
       suggestions.delete(id);
-      return clone(d);
+      return out(d);
     },
     async rejectSuggestion(id) {
       await wait();
@@ -727,7 +740,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       const d = find(id);
       suggestions.delete(id);
-      return clone(d);
+      return out(d);
     },
     async approve(id, o) {
       await wait();
@@ -758,7 +771,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       if (d.audience && d.audience.members === null) d.audience = { members: d.external ? 14 : 6, external: d.external };
       d.status = 'approved';
       d.result_url = d.practice ? null : `https://example.com/${d.target.system}/${d.id}`;
-      return clone(d);
+      return out(d);
     },
     async reject(id, reason?: RejectReason) {
       await wait();
@@ -770,14 +783,14 @@ export function createMockClient(options: MockOptions = {}): Api {
         throw new ApiError(400, 'bad_request', 'That is not a reason I know.');
       }
       d.status = 'rejected';
-      return clone(d);
+      return out(d);
     },
     async createPractice() {
       await wait();
       write();
       guard();
       const existing = [...drafts.values()].find((d) => d.practice && d.status === 'pending');
-      if (existing) return clone(existing);
+      if (existing) return out(existing);
       const d = add({
         id: nextId('prc'),
         kind: 'confluence_page',
@@ -795,7 +808,7 @@ export function createMockClient(options: MockOptions = {}): Api {
         result_url: null,
         external: false,
       });
-      return clone(d);
+      return out(d);
     },
     async deleteDraft(id) {
       await wait();
@@ -869,6 +882,23 @@ export function createMockClient(options: MockOptions = {}): Api {
       if (!f) throw new ApiError(404, 'not_found', 'I could not find that follow-up.');
       const mine = followUps.waiting_on_you.some((x) => x.id === id);
       return startTask(mine ? `Draft a reply to ${f.who}` : `Draft a nudge to ${f.who}`);
+    },
+
+    async listReviews() {
+      await wait();
+      needReviewer();
+      return reviews.list();
+    },
+    async getReview(id) {
+      await wait();
+      needReviewer();
+      return reviews.get(id);
+    },
+    async recommend(id, input) {
+      await wait();
+      write();
+      needReviewer();
+      return reviews.recommend(id, clone(input));
     },
 
     async adminOverview() {

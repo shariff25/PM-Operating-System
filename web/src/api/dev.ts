@@ -60,6 +60,8 @@ export function devApiFactory(): (onSignedOut: () => void) => Api {
       briefBuilt: import.meta.env.VITE_MOCK_BRIEF !== 'off',
       hostile: import.meta.env.VITE_MOCK_HOSTILE === 'on',
       toolServerDown: new URLSearchParams(window.location.search).get('mock_admin') === 'degraded',
+      // `?mock_reviews=<error code>` answers every recommendation with that code (`unknown_outcome` records it first).
+      reviewError: new URLSearchParams(window.location.search).get('mock_reviews') ?? undefined,
       ...mockUsersOptions(),
       ...mockPolicyOptions(),
       ...(import.meta.env.VITE_MOCK_EMPTY === 'on' ? { noDrafts: true, firstVisit: false, emptyBrief: true } : {}),
