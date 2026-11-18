@@ -1731,6 +1731,7 @@ dependencies = [
  "hmac 0.12.1",
  "pmos-assertion",
  "pmos-contract",
+ "pmos-directory",
  "pmos-runtime",
  "pmos-toolserver",
  "reqwest",

@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use pmos_console::config::{Config, Identity};
-use pmos_contract::model::TeamFile;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -10,14 +9,9 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let config = Config::from_env().map_err(anyhow::Error::msg)?;
-    // Refuse to start on a team file that doesn't parse; it's re-read on every request.
-    let team = TeamFile::load(&config.content_root).map_err(anyhow::Error::msg)?;
-    if team.members.is_empty() {
-        tracing::warn!(
-            root = %config.content_root.display(),
-            "team.yaml lists nobody: every request will be refused"
-        );
-    }
+    // Who may use the console is the user database's answer, through the tool server's
+    // `resolve` route; when the tool server can't answer, every request is refused.
+    tracing::info!("viewers are looked up in the PM OS user database through the tool server");
     match &config.identity {
         Identity::Proxy { .. } => tracing::info!(
             "trusting X-Forwarded-User on requests that carry the proxy's X-Pmos-Proxy-Secret"

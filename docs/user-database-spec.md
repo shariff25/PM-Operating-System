@@ -1111,6 +1111,43 @@ differs from the text above:
 - **Not built:** the "signed in with Microsoft for the first time" message (the link is
   logged and audited only). **Not verified:** a real Entra tenant's tokens (none available).
 
+**U4d is built** on `claude/u4d-console-resolve` (`crates/console/src/auth.rs` `viewer` and
+`Viewer::from_user`, `src/app.rs` `Signed` and `admin_inboxes`; the shared resolve client
+from U4c, unchanged; `crates/console/tests/console.rs` with a mock `resolve`;
+`docs/console.md`). The console reads no `team.yaml` and no content at all: `PMOS_CONTENT_ROOT`
+is ignored and the deploy kit no longer mounts the checkout into it. No new setting: it
+already held the tool server URL and its own tool server token (`PMOS_CONSOLE_TS_TOKEN`
+there). Every request resolves the viewer (`by=sign_in_name` for an `X-Forwarded-User` with
+an `@`, `by=handle` otherwise and for the development user), cached 10 seconds, checks
+`is_active()` before roles, and fails closed (`503 users_unavailable`) when the tool server
+can't answer, never using a kept answer. The console's admin view is its own resolve answer
+(≤ 10 s); the runtime still decides its admin view from its own snapshot (`Runtime::is_admin`,
+≤ 30 s) and the tool server from its tables, so none trusts another's claim: when they
+disagree within those bounds the narrower answer wins at each receiver. Where it differs
+from the text above:
+- **Who gets a console** is "active and holding `pm`, `reviewer` or `admin`", U3's set; an
+  active user with no role is refused like an auditor-only one (`403`, the §9 wording).
+- **An unconfirmed sign-in name is refused** (`403`, "an admin hasn't confirmed your sign-in
+  name") when the proxy names the person by it: the same rule as the web app's first link
+  (§4), since the console's proxy sign-in is also a sign-in by name. The same person named
+  by handle is not refused for it. Imported names count as confirmed (§3), so no existing
+  member is affected.
+- **A header value that is neither a valid handle nor a plausible sign-in name** is `403`
+  without a lookup, so junk costs no miss. A `429 resolve_misses` (misses only) is treated
+  as a miss (`403`); a `401`/`403` from the tool server (a token misconfiguration) as
+  `503 users_unavailable`.
+- **An admin's Approvals screen** can no longer list "every member": the console's token may
+  `resolve` one person but not list users (U2). It reads the inboxes of every personal bot's
+  owner and everyone in the 50 most recent tasks (both from the runtime, signed as the
+  admin), plus the admin's own. A PM with neither is missing from that screen until the tool
+  server offers the console an admin listing (left open; it changes the tool server).
+- **Assertion roles** are the viewer's from this request's answer. A read of another PM's
+  inbox (an admin's view) is signed for that PM, as before, with **no roles**: the console has
+  no answer about them and doesn't look one up (a lookup per PM per page would spend misses
+  on stale handles); roles are informational (§9).
+- **Not verified:** the console against the real tool server's `resolve` (the tests use a
+  mock with the route's wire shape, and the production router over HTTP); no stack test.
+
 U4a–U4d run in parallel (U4b after U3, since `remove` calls U3's deactivation). U5 and U6 can
 overlap once the routes in U5 are merged.
 
