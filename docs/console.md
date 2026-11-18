@@ -25,29 +25,44 @@ width.
 
 ## Who sees what
 
-| | Admin (`admin` in `team.yaml`) | PM |
+| | Admin (active, holding `admin`) | PM or Reviewer (active, holding `pm` or `reviewer`) |
 | --- | --- | --- |
 | Bots | every bot | team bots, and their own personal bots |
 | Routines | everyone's, and may pause, resume or delete any; another member's prompt reads "text hidden" | their own |
-| Approvals | every member's pending items | their own |
+| Approvals | the pending items of every PM the runtime knows (below) | their own |
 | Activity and task pages | every task; in the list, another member's ask reads "text hidden", and their task's page shows it in full | tasks they asked for (`requested_by`) |
+
+Roles come from the PM OS user database (`docs/user-database-spec.md`), never from
+`team.yaml`. **An Auditor is not a PM:** a person whose only role is `auditor` (or who holds no
+role) gets no console at all, `403` "the console is for PMs and admins; the audit log is in
+the web app". Someone holding `auditor` and `pm` is a PM here. A deactivated user is `403`
+whatever roles they kept.
 
 Someone else's task or routine answers `404`, so the console doesn't confirm it exists. These
 checks are made in the console before any call (a PM's routine action is checked against
 their own routines first), and again by the runtime. With assertion keys
 (`PMOS_ASSERTION_KEYS`, `docs/user-assertion.md`), every runtime call carries a signed user
 assertion for the viewer, and under `require` the runtime refuses any console call without
-one. It answers from the viewer it names, in its own `team.yaml` (R1): a PM gets only their
+one. It answers from the viewer it names, by its own directory snapshot (≤ 30 s old; on an
+older one the viewer is not treated as an admin) (R1): a PM gets only their
 own tasks and routines; an admin gets everyone's, with the ask, result and prompt of anyone
-else's left out (metadata only: ids, bot, status, times, who asked). Tool-server calls carry
-one for the PM whose inbox is read. If the tool server ever cuts an inbox at its safety cap
+else's left out (metadata only: ids, bot, status, times, who asked). Each assertion carries
+the viewer's roles from the user database's answer for this request; the runtime and the
+tool server decide from their own reading of the database, not from those roles, and the
+console decides from its answer, not from theirs. Tool-server calls carry one for the PM
+whose inbox is read (with the viewer's roles when that is the viewer, else none). An
+admin's Approvals screen reads the inbox of every personal bot's owner and of everyone in
+the recent activity, plus the admin's own: the console's token may look one person up but
+not list the users. If the tool server ever cuts an inbox at its safety cap
 (more than 1,000 pending drafts), the Approvals screen says so for that member, with the total.
 
 ## Sign-in
 
 - **Behind the Spark's SSO proxy:** with `PMOS_CONSOLE_TRUST_PROXY=1`, the proxy's
-  `X-Forwarded-User` names the person. It may be a PM OS handle or the member's email.
-  Without that setting the header is ignored.
+  `X-Forwarded-User` names the person. A value with an `@` is a sign-in name, looked up by
+  `by=sign_in_name` (case does not matter); anything else must be a valid PM OS handle, looked
+  up by `by=handle`. Anything that is neither is `403` without a lookup. Without that setting
+  the header is ignored.
 - **The proxy proves itself on every request.** With `PMOS_CONSOLE_TRUST_PROXY=1`, every
   request but `/healthz` must also carry `X-Pmos-Proxy-Secret` equal to
   `PMOS_CONSOLE_PROXY_SECRET` (at least 32 characters, different from both tokens), compared
@@ -60,8 +75,18 @@ one for the PM whose inbox is read. If the tool server ever cuts an inbox at its
   or `::1`; the default is `127.0.0.1:8760`). So it can't be used in the deploy kit, where
   the container listens on `0.0.0.0`: run the console on your own machine for that.
 - Set exactly one of the two; the console won't start with both or neither.
-- **The person must be in `team.yaml`.** It's re-read on every request, so removing someone
-  takes effect at once. Nobody signed in is `401`; someone not on the team is `403`.
+- **The person must be an active PM OS user** with `pm`, `reviewer` or `admin`, looked up in
+  the user database through the tool server's `GET /internal/users/resolve` with the
+  console's own tool server token (`docs/toolserver.md`, "The user database's read API").
+  An answer is used for at most 10 seconds, so a deactivation or a removed role counts here
+  within 10 seconds. Nobody signed in is `401`. `403` for someone who isn't a user, a
+  deactivated user, an Auditor only, and a sign-in name no admin has confirmed yet (a join
+  approved through the Slack bot, `docs/user-database-spec.md` §4; the same person by handle
+  is not refused for it).
+- **No answer, no console.** When the tool server can't be reached or its store fails, every
+  page is `503` with `users_unavailable`. There is no last-known-good allowance in the
+  console and no fallback to any file. Neither the header's value nor a sign-in name is ever
+  logged; refusals are logged by reason only.
 
 ### What the reverse proxy must do
 
@@ -153,16 +178,18 @@ results.
 | `DELETE /v1/routines/{id}` | Delete |
 | `GET /v1/tasks?limit=50` (admin), `…&requested_by=<handle>` (PM) | Activity |
 | `GET /v1/tasks/{id}`, `/events`, `/trace` | A task's page |
-| Tool server `GET /internal/approvals?user=<handle>&status=pending` | Approvals: once for a PM, once per `team.yaml` member for an admin |
+| Tool server `GET /internal/users/resolve?by=sign_in_name&name=` or `?by=handle&handle=` | Who the viewer is, on every request (cached 10 seconds) |
+| Tool server `GET /internal/approvals?user=<handle>&status=pending` | Approvals: once for a PM; for an admin, once per PM the runtime knows (personal bot owners and recent askers) |
 | The tool server's audit file | A task's audit events: lines whose `run_id` is the task id, at most 500 |
 
 All runtime calls carry the `console` client token. Tool server calls carry the tool
 server's own `console` token (`PMOS_CONSOLE_TS_TOKEN` there), which may read approvals
-(`GET /internal/approvals`, `GET /internal/approvals/{id}`) and nothing else. With assertion
+(`GET /internal/approvals`, `GET /internal/approvals/{id}`) and look one user up
+(`GET /internal/users/resolve`), and nothing else. With assertion
 keys, every runtime call (bots, the task and routine lists, a task page's three reads, a
 routine `PATCH` or `DELETE`) carries an assertion for the viewer, and a tool-server call one
 for the PM it names (`user=`). Under `require` the runtime answers a task page only for the
-task's PM or an admin in its `team.yaml`, and the lists as **Who sees what** says. Every route but `GET /healthz` needs the proxy secret when the console trusts the proxy,
+task's PM or an admin in its directory snapshot, and the lists as **Who sees what** says. Every route but `GET /healthz` needs the proxy secret when the console trusts the proxy,
 whatever the method; a state-changing form needs `Origin` or `Referer` from the console's
 own origin, and one with neither is refused.
 Each call times out after 10 seconds. If an upstream is down, the screen says which one, with
@@ -190,13 +217,12 @@ cargo run -p pmos-console
 | `PMOS_CONSOLE_BIND` | `127.0.0.1:8760` | |
 | `PMOS_CONSOLE_TRUST_PROXY` | off | `1` to trust `X-Forwarded-User` from the SSO proxy |
 | `PMOS_CONSOLE_PROXY_SECRET` | none | Required with `PMOS_CONSOLE_TRUST_PROXY=1`: the secret the proxy sends in `X-Pmos-Proxy-Secret`. At least 32 characters, different from both tokens. `deploy/setup.sh` generates it |
-| `PMOS_CONSOLE_DEV_USER` | none | A handle in `team.yaml`; every request is that person. Development only, and only with a loopback `PMOS_CONSOLE_BIND` |
+| `PMOS_CONSOLE_DEV_USER` | none | A user's handle; every request is that person, looked up in the user database like anyone else. Development only, and only with a loopback `PMOS_CONSOLE_BIND` |
 | `PMOS_BOTS_URL` | `http://127.0.0.1:8750` | The bot runtime |
 | `PMOS_BOTS_TOKEN` | required | The `console` entry of the runtime's `PMOS_BOTS_TOKENS`. At least 32 characters |
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | |
-| `PMOS_TOOLSERVER_TOKEN` | required | The tool server's read-only console token (`PMOS_CONSOLE_TS_TOKEN` there; never the service token). At least 32 characters, and different from `PMOS_BOTS_TOKEN` |
+| `PMOS_TOOLSERVER_TOKEN` | required | The tool server's read-only console token (`PMOS_CONSOLE_TS_TOKEN` there; never the service token): approvals reads and `resolve`. At least 32 characters, and different from `PMOS_BOTS_TOKEN` |
 | `PMOS_ASSERTION_KEYS` | none | `console:bots:<key id>:<base64>` and `console:toolserver:<key id>:<base64>`, comma-separated: sign user assertions for that upstream (`docs/user-assertion.md`). No other pair is accepted |
-| `PMOS_CONTENT_ROOT` | `content` | Where `team.yaml` is. The console won't start if it doesn't parse |
 | `PMOS_CONSOLE_AUDIT_LOG` | none | The tool server's `PMOS_AUDIT_LOG` file, mounted read-only. Without it, task pages say audit events aren't available |
 | `PMOS_CONSOLE_SLACK_URL` | none | The workspace, such as `https://acme.slack.com`, for links to Slack and to a task's thread |
 | `PMOS_CONSOLE_PUBLIC_URL` | none | The origin browsers use; forms must come from it |
@@ -214,5 +240,11 @@ cargo run -p pmos-console
 - **The console's tool server token reaches every approvals route,** deciding included,
   though the console only lists approvals. A read-only token for `GET /internal/approvals`
   would narrow that.
-- **An admin's approvals queue** makes one call per `team.yaml` member, because the tool
-  server lists one PM's inbox at a time.
+- **An admin's approvals queue** makes one call per PM, because the tool server lists one
+  PM's inbox at a time, and it finds the PMs through the runtime (personal bot owners and the
+  50 most recent askers), because the console's token may not list the user database. A PM
+  with neither a personal bot nor a recent task is missing from an admin's queue (their
+  items are still in Slack and the web app). A tool server listing for the console's admin
+  view would close that.
+- **The console no longer reads content.** `PMOS_CONTENT_ROOT` is ignored, and the deploy
+  kit no longer mounts the content checkout into the console.
