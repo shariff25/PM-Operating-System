@@ -15,7 +15,6 @@ content/
   reviewers/*.md                     reviewer personas
   templates/*.md                     document templates
   playbooks/*.md                     how a kind of PM work is done, and the bar (optional)
-  team.yaml                          who may use PM OS (optional)
 ```
 
 `README.md` files are documentation and are never linted as content.
@@ -142,23 +141,27 @@ the findings by severity: blocker, major or minor (REV-1, REV-2).
 
 Rules: `reviewer-parse`, `reviewer-flags`, `reviewer-body-empty`.
 
-## Team: `team.yaml`
+## People: not content (`team.yaml` is retired)
 
-Who may use PM OS until SSO replaces this file (Phase 1). It's optional; without it nobody can
-use the Slack bot.
+Who may use PM OS, and their roles, are not in the content. They live in the tool server's
+user database (`docs/user-database-spec.md`, `docs/runbooks/users.md`): the first admin is
+made on the host, and everyone else joins through Slack or an admin's invite in the web app.
+Until slice U7 a `content/team.yaml` listed them; no service reads one any more.
 
-```yaml
-members:
-  - handle: ana            # PM OS handle; matches master/people/<handle>/ if present
-    slack-id: U012AB3CD    # Slack member id (U… or W…)
-    email: ana@example.com # optional; Atlassian account email, needed to link Jira/Confluence
-    roles: [pm, skill-author]   # pm | skill-author | admin | reviewer | auditor
-```
+Rules:
+- `team-file-retired`: a file named `team.yaml` anywhere in the content tree. An **error** for
+  `pmos lint` and CI, pointing to `pmos-admin users import`, which reads an old file once on
+  the host. A service loading its content (the tool server, the bot runtime, the Slack App
+  Home) gets the same finding as a **warning** and ignores the file, so a leftover one, during
+  an upgrade before its pull request deletes it, never stops a service. The lint finds the
+  file; it doesn't read it.
+- `people-handle` (warning): a `master/people/` folder whose name isn't a PM OS handle, so no
+  one's personal context is read from it. Whether that person is a user is the database's to
+  say.
 
 Roles (what each may do is `pmos_contract::permissions`, the one matrix every service checks):
 - **`pm`**, Product Manager: asks bots; sees and decides their own tasks, approvals, routines
   and traces; links their own accounts.
-- **`skill-author`**: as `pm`, and proposes skill and bot changes by pull request.
 - **`reviewer`**: as `pm`, and sees other PMs' approvals and recommends a decision. The
   draft's owner confirms; a reviewer never decides someone else's approval.
 - **`auditor`**: searches and exports audit metadata only (no trace bodies, prompts or Slack
@@ -166,21 +169,8 @@ Roles (what each may do is `pmos_contract::permissions`, the one matrix every se
 - **`admin`**, platform owner: everything, except approving a policy change they authored
   (POL-2; the caller enforces it).
 
-Several roles take the union. A well-formed role name this version doesn't know (one added by
-a newer version) still parses but grants nothing, so a new role doesn't break services that
-aren't upgraded yet; versions before `reviewer` and `auditor` existed reject them, so upgrade
-every service before using them.
-
-With live connectors the tool server enforces this file: only members get sessions, and a
-linked account must match the member (the Slack member id for Slack, the email for
-Atlassian).
-
-Rules: `team-parse`, `team-handle`, `team-slack-id`, `team-email`, `team-duplicate` (a
-handle, Slack id, GitHub login or email listed twice; emails ignoring case, since the web app's
-Entra ID sign-in finds members by email), `team-roles` (no roles), `team-role-unknown` (warning: a
-role this version doesn't know), `team-role-separation` (warning: admin and auditor together),
-`people-unknown` (warning: a `master/people/` folder
-for someone not on the team).
+Several roles take the union. (`skill-author` was a fifth role in the old file; the import
+drops it and keeps `pm`.)
 
 ## Roles and bots: `roles/<role>/ROLE.md`, `bots/<name>/BOT.md`
 
@@ -221,7 +211,7 @@ The bot's job description.
 
 Rules:
 - **Roles:** `role-parse`, `role-name`, `role-version`, `role-description`, `role-body-empty`, `role-skills`, `role-skill-unknown`, `role-skill-data-class`.
-- **Bots:** `bot-parse`, `bot-name`, `bot-description`, `bot-body-empty`, `bot-role-unknown`, `bot-owner-unknown` (an error once `team.yaml` lists people), `bot-reads-personal`, and `bot-reads-empty` (warning).
+- **Bots:** `bot-parse`, `bot-name`, `bot-description`, `bot-body-empty`, `bot-role-unknown`, `bot-owner-handle` (the owner isn't a PM OS handle; whether they are an active user is the user database's to say: the admin overview lists bots without an active owner), `bot-reads-personal`, and `bot-reads-empty` (warning).
 - **Actions:** `action-auto`, `action-not-write`, `action-unknown-tool`.
 
 ## Templates: `templates/*.md`

@@ -184,8 +184,9 @@ If the store is down, the guard must return `Unavailable` and must not succeed.
   issuer scope.** It holds the key, so it can sign for any handle as its own `iss`. What it
   can do is limited by what the receiver lets that issuer do. Receivers must still apply
   per-issuer rules, for example `web` creates tasks only with `source: "web"`. Receivers must
-  also still check the subject against `team.yaml` and the roles against `team.yaml`, not
-  trust the assertion's roles for anything that matters more than display.
+  also still check the subject and the roles against the user database (the tool server's,
+  `docs/user-database-spec.md`), not trust the assertion's roles for anything that matters
+  more than display.
 - **Shared keys:** with a key shared between issuers, either issuer can sign as the other. Give
   each caller-receiver pair its own key where you can (see rotation).
 - **Theft of the key itself.** Keep keys in the same secret store as the service tokens. Never
@@ -328,11 +329,12 @@ The mode, the start-up rule, the refusals and the verifier are shared code
 - **The tool server** checks calls with the web and console tokens on the approvals routes. The
   subject must equal `user=` and `decided_by`; one item read with an assertion must be the
   subject's (`404` otherwise), except that the console's admin view reads any item when the
-  subject is an admin in the tool server's own `team.yaml`. Under `require`, every read of
+  subject is an active admin in the tool server's own user database. Under `require`, every read of
   one item needs an assertion, from the console too. The console's token never decides,
-  whatever it carries (the route and the service both refuse it). Decisions still check the item's user and `team.yaml`. On the
+  whatever it carries (the route and the service both refuse it). Decisions still check the
+  item's user and the user database. On the
   admin routes (web token only) the subject must equal `user=`, the viewer, whose role the tool
-  server then checks in its own `team.yaml` (`403 forbidden` without it). The admin proposal
+  server then checks in its own user database (`403 forbidden` without it). The admin proposal
   and event routes (`POST /internal/admin/proposals/open`, `GET /internal/admin/proposals`,
   `GET /internal/admin/protection`, `POST /internal/admin/actions`) need the assertion **in
   every mode, `off` included**, bound to the body (up to 24 MiB for a proposal): opening a pull
@@ -442,7 +444,7 @@ Roll out in this order: shared pieces, then callers sending, then receivers enfo
 **`pmos-web` (caller)**
 
 - [x] For every runtime or tool-server call made for the signed-in PM, sign `Claims::new("web",
-      <aud>, handle, roles from team.yaml, session id)`. Use a 60-second lifetime and bind
+      <aud>, handle, roles from the user database, session id)`. Use a 60-second lifetime and bind
       `RequestBinding::new(method, path_and_query, body_bytes)`. Send the result as
       `X-Pmos-Assertion`, next to the existing `X-Pmos-User` during the transition.
 - [x] Sign after the body is serialised. Never reuse an assertion, including on a retry.
@@ -454,7 +456,8 @@ Roll out in this order: shared pieces, then callers sending, then receivers enfo
       The console signs every runtime call as its viewer, and every tool-server call that
       names a person as that person; it decides nothing and cancels nothing today. Since
       U4d the roles are the viewer's from the user database's `resolve` answer for the
-      request (none for an admin's read of another PM's inbox), never from `team.yaml`.
+      request (none for an admin's read of another PM's inbox). There is no team file
+      (`team.yaml` was retired in slice U7).
 - [x] ~~For reads that are "read everything" (no person), send no assertion.~~ Replaced (R1):
       there are no reads of everything any more. Every runtime call is signed for the viewer,
       and the runtime answers what that viewer may see (others' tasks and routines as
@@ -471,7 +474,7 @@ Roll out in this order: shared pieces, then callers sending, then receivers enfo
       `console`'s assertion.
 - [x] Use `assertion.subject()` as the PM. If `X-Pmos-User` is also present it must equal
       the subject (built as the same `401` as every other assertion failure).
-- [x] Still check the subject against `team.yaml` and keep the existing per-client rules
+- [x] Still check the subject against the user directory and keep the existing per-client rules
       (`source: "web"` only, own tasks only).
 - [x] Answer every `VerifyError` with one `401 {"code":"bad_assertion"}`, and log the variant
       and the issuer.
@@ -489,7 +492,7 @@ Roll out in this order: shared pieces, then callers sending, then receivers enfo
       `assertion.subject()`. *Done for the approvals routes and the read-only admin routes
       (`/internal/admin/*`, web token only),* the only ones `pmos-web` and the console call;
       their tokens reach no other route. The rest stay on the service and bot tokens.
-- [x] Admin-only decisions still check `admin` in `team.yaml`, not the assertion's roles.
+- [x] Admin-only decisions still check `admin` in the user database, not the assertion's roles.
 - [x] Service-token calls that act for no person (the orchestrator, the runtime's own session
       creation and approval polling) send no assertion and are unchanged.
 - [ ] Record the assertion's `iss`, `sub` and `sid` in the audit next to the token's client

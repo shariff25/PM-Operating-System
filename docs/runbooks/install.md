@@ -84,18 +84,28 @@ deploy/pmos-admin status
 - `docs` turns ready once its first sync of your docs site finishes (about a second per page);
   with no `PMOS_DOCS_BASE_URL` it stays not ready (`docs site not configured`), which is expected.
 
-**Add the first platform owners.** Everyone after them joins through the bot.
+**Add the first platform owners.** People and roles live in the tool server's user database
+([users.md](users.md)), never in the content. Everyone after the first owners joins through
+the bot, or an admin's invite in the web app.
 
-1. Add each owner and generate their bots' sandbox policies:
+1. Make yourself the first admin, then give yourself a personal bot and generate its sandbox
+   policy:
 
    ```sh
-   deploy/pmos-admin pmos member add --root content --handle <handle> --slack-id <U…> \
-     --email <atlassian email> --github <login> --roles pm,admin
+   deploy/pmos-admin users bootstrap-admin --handle <handle> --name "<name>" \
+     --sign-in-name <work sign-in name> --atlassian-email <atlassian email> \
+     --slack-id <U…> --github <login> --no-entra        # or --oid <Entra object id>
+   deploy/pmos-admin pmos bot add-personal --root content --handle <handle>
    deploy/pmos-admin pmos policy generate --root content --out policies
    deploy/pmos-admin lint
    ```
 
-2. Commit the changes in `/srv/pmos/content-repo` on a branch, and merge them by pull request.
+   Each other owner then requests access in Slack (or you invite them in the web app); once
+   they are in, make them an admin on the host:
+   `deploy/pmos-admin users grant-admin <handle> --oid <their Entra object id>`.
+
+2. Commit the content changes in `/srv/pmos/content-repo` on a branch, and merge them by pull
+   request.
 3. Then pull the checkout and run `deploy/pmos-admin reindex`.
 4. **Smoke test:** `deploy/pmos-admin smoke <your handle>` should end with
    `smoke test passed`. The answer comes from the stub model, so it reads like test text; this
@@ -199,8 +209,11 @@ Only after the red-team checklist passes.
    ```
    Commit the reports in `/srv/pmos/content-repo/evals/reports`. The load test runs on the
    live stack as the benchmark member `evals`, the only handle the benchmark token may use
-   (`PMOS_EVALS_AS`). Add that member once, with no real Slack account, and merge it:
-   `deploy/pmos-admin pmos member add --root content --handle evals --slack-id U0EVALS --roles pm`.
+   (`PMOS_EVALS_AS`). Add that user once: write a file outside the content holding
+   `members: [{handle: evals, slack-id: U0EVALS, roles: [pm]}]`, import it with
+   `deploy/pmos-admin users import --from <that file> --apply` (the database keeps no Slack id
+   for `evals`; the import says so), then give it its bot with
+   `deploy/pmos-admin pmos bot add-personal --root content --handle evals` and merge that.
    To run it as yourself instead, set `PMOS_EVALS_AS=<your handle>` in `deploy/.env`,
    `deploy/pmos-admin restart bots`, pass `--as <your handle>`, then empty it and restart
    again.

@@ -1,19 +1,17 @@
 # Runbook: the user database
 
-PM OS is moving who-may-use-it from `content/team.yaml` to the tool server's own database
-(`docs/user-database-spec.md`). **Since slice U3 the tool server decides from the database:**
-who may have a session, decide a draft, link an account, read the admin screens, approve a
-join or deactivate someone. The runtime (U4a), Slack (U4b), the web app's sign-in (U4c), the
-console (U4d) and the web app's Team page (U5a) read the database too; no service decides from
-`team.yaml`. Onboarding in Slack still writes `team.yaml` (with the personal bot) until slice
-U7 retires the file, for `pmos lint`'s bot-owner check; someone invited in the web app is not
-added to it. Anything you add by hand to `team.yaml`, add here too (`import` picks up new
-people).
+Who may use PM OS, and their roles, live in the tool server's own database
+(`docs/user-database-spec.md`), and nowhere else. The tool server decides from it who may have
+a session, decide a draft, link an account, read the admin screens, approve a join or
+deactivate someone; the runtime, Slack, the web app and the console ask it. **`team.yaml` is
+retired** (slice U7): no service reads one, onboarding commits only the new person's personal
+bot, and `pmos lint` fails while a `team.yaml` is anywhere in the content
+(`team-file-retired`). People are added in the web app (an admin's invite), through Slack's
+join requests, or here on the host.
 
-**Before deploying a release with U3, import.** A tool server with an empty user database lets
-nobody in (it logs `the user database is empty` at start-up). On an install that already has
-people in `team.yaml`: deploy, run the import below (with `--allow-admins`, or
-`bootstrap-admin` first), then everything works as before.
+**Upgrading an install that still has a `team.yaml`: import it before you start the new
+version** ([upgrade.md](upgrade.md), "Upgrading to the user database"). A tool server with an
+empty user database lets nobody in, and logs `the user database is empty` at start-up.
 
 Everything here runs on the Spark through `deploy/pmos-admin users …`. Each command runs in a
 one-off tool server container with the database's own access, and records **the OS user who
@@ -43,11 +41,14 @@ refused (exit 3) once any active admin exists; after that, `grant-admin` makes a
 
 ## Importing team.yaml
 
-Read the file at a reviewed commit, and always look at the dry run first:
+Once, when upgrading an install that still has the old file. Read it at a reviewed commit,
+keep a copy outside the content (the pull request that deletes it comes next), and always look
+at the dry run first:
 
 ```sh
-git -C "$PMOS_CONTENT_CHECKOUT" rev-parse HEAD          # the commit to record
-deploy/pmos-admin users import --from "$PMOS_CONTENT_CHECKOUT/content/team.yaml" --commit <sha>
+sha=$(git -C "$PMOS_CONTENT_CHECKOUT" rev-parse HEAD)     # the commit to record
+git -C "$PMOS_CONTENT_CHECKOUT" show "$sha:content/team.yaml" > ~/team.yaml.$sha
+deploy/pmos-admin users import --from ~/team.yaml.$sha --commit "$sha"
 ```
 
 The dry run lists every person as `create`, `unchanged` or `conflict`, with the addresses it
@@ -72,9 +73,16 @@ would store. Then add `--apply`. What it does:
   An import that would leave people but no active admin is refused with that reason.
 - The file's SHA-256 and the commit you named are recorded.
 
-`--bootstrap` is for a test stack's empty database (CI): it takes the file's admins without
-asking, all in one transaction, and is refused (exit 3) if the users table has any row at all,
-deactivated people included.
+`--bootstrap` is for a test stack's empty database (CI imports `deploy/test/ci-users.yaml` this
+way): it takes the file's admins without asking, all in one transaction, and is refused
+(exit 3) if the users table has any row at all, deactivated people included. Development and
+eval stacks without a database use a seed instead (`PMOS_USERS_SEED`, the same file shape),
+which the tool server refuses if it is inside the content tree.
+
+Then delete `content/team.yaml` by a pull request on the content repo: nothing reads it any
+more, and `pmos lint` fails while it is there. To give someone a personal bot without the
+Slack join flow, `deploy/pmos-admin pmos bot add-personal --root content --handle <handle>`
+writes it into the content checkout; commit it like any content change.
 
 Then, for **every Admin and Auditor**, link their Microsoft account on the host (imported admins
 and auditors have none):

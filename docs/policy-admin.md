@@ -80,9 +80,9 @@ the tool server, which opens the pull request.
    id it was computed from (`null`: the file didn't exist). The tool server refuses the call
    without that assertion **in every assertion mode, `off` included**, and refuses any other
    client (`403`).
-3. **Who.** The assertion's subject must be the `user=` named, and an admin by the tool
-   server's own `team.yaml` (`edit-policies` for a policy proposal, `edit-content` for a content
-   one), else `403 forbidden`.
+3. **Who.** The assertion's subject must be the `user=` named, and an admin in the tool
+   server's own user database (`edit-policies` for a policy proposal, `edit-content` for a
+   content one), else `403 forbidden`.
 4. **Where** (A6). The tool server's `PMOS_CONTENT_DIR` and `PMOS_POLICIES_DIR` must be separate
    folders, neither the repository root nor inside the other: refused at start-up
    (`PMOS_PROPOSALS=off` keeps a root content folder for onboarding only), and again on every
@@ -144,8 +144,10 @@ never the author"), so it is a deployment requirement, not an option. On `PMOS_C
 - **Restrict who can push to the branch** (no direct pushes; nobody may bypass the rules,
   administrators included: "Do not allow bypassing the above settings" / no bypass list).
   Onboarding's member commits (`docs/toolserver.md`, **Members**) go straight to this branch
-  as the approving platform owner: give those platform owners a bypass for `content/team.yaml`
-  changes only through a ruleset, or approve members by pull request instead.
+  as the approving platform owner: give those platform owners a bypass for a new personal
+  bot's files only (`content/bots/pm-*/BOT.md` and `policies/bots/pm-*`) through a ruleset, or
+  add members' bots by pull request instead (`pmos bot add-personal`). There is no
+  `team.yaml` to commit since slice U7.
 - **Require status checks:** the content lint and `pmos policy check` (the `ci` workflow).
 - Optionally **require review from Code Owners**, with CODEOWNERS on `policies/**` and
   `crates/policy/**` naming the platform owners.
