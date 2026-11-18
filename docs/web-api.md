@@ -146,8 +146,13 @@ An unknown `reason` should read as `failed`.
 {"handle": "ana", "display_name": "Ana Silva", "name": "Ana Silva", "roles": ["pm"],
  "permissions": ["ask-bot", "view-own-tasks", "manage-own-routines", "decide-own-approval",
                  "view-own-traces", "link-own-accounts"],
+ "reviewer": false,
  "csrf_token": "…", "first_visit": true, "hints_seen": ["sources"], "nudges": true}
 ```
+
+`reviewer` is true when the person holds the `reviewer` role: show the Reviews entry
+(**Reviews**). It is the role, not the `recommend-on-approval` permission, which an admin
+holds too without reviewing anyone. An older server leaves it out: treat that as `false`.
 
 `first_visit` is true until the PM first opens a draft. `nudges: false` also hides hints.
 
@@ -198,7 +203,13 @@ document.
  "target": {"system": "confluence", "label": "Space PM, under “Specs”", "url": null},
  "sources": [Source], "result_url": null, "external": false, "version": "7",
  "restricted_sources": true, "audience": null,
- "marker": "Drafted with PM OS · run tsk_01JD…"}
+ "marker": "Drafted with PM OS · run tsk_01JD…",
+ "recommendations": [Recommendation]}
+
+// Recommendation: a reviewer's advice on this draft (Reviews)
+{"reviewer": "rex", "reviewer_name": "Rex Ito", "verdict": "approve",
+ "note": "Looks right to me." | null, "note_removed": false,
+ "created_at": "2026-11-16T10:00:00Z", "stale": false}
 
 // A Slack draft's audience, once PM OS has checked the channel (both null before)
 {"audience": {"members": 14, "external": true}}
@@ -271,6 +282,21 @@ document.
   thread", "Message to a Slack channel" and "Direct message". `target.url` opens the channel
   in Slack. Anything that isn't shaped like an id reads "An unrecognised channel" (or space,
   page, project, epic).
+- **`recommendations`** is what reviewers assigned to the PM recommend on this draft
+  (**Reviews**), oldest first, one per reviewer; `[]` when none has (always for a practice
+  draft, and from an older tool server). Advice only: it never decides the draft, and the
+  owner's buttons work the same with or without it.
+  - `reviewer` is their handle; `reviewer_name` their display name, or their handle when they
+    have none (**untrusted text**: plain text only).
+  - `verdict` is `approve` ("Rex recommends approving") or `changes` ("Rex suggests changes").
+  - `note` is the reviewer's note, **untrusted plain text** (no Markdown, HTML or links made
+    from it), or `null`: none given, or removed with a Slack draft's text after 24 hours, which
+    `note_removed: true` says.
+  - `stale: true` means the draft changed since the advice was given (an edit saved here, an
+    accepted suggestion, an edit on the Slack card): show "Rex recommended approving an
+    earlier version" and grey the note. The Slack card shows the same line without the note.
+  - When the owner then decides, the audit log records whether there was advice and on which
+    version (**Reviews**, "What gets recorded").
 - **A practice draft** (`practice: true`) lives only in `pmos-web`. Approving it creates
   nothing anywhere: it becomes `approved` with `result_url: null`.
 - **Sources** are what the bot read for the task that made the draft. When the runtime cannot
@@ -455,12 +481,15 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `403` | `bad_csrf` | A write without the session's CSRF token. | Yes |
 | `403` | `not_a_member` | Not (or no longer) an active user in the user database; every session of theirs ends. Also when the tool server doesn't count them a member on a decision. | Yes |
 | `403` | `not_allowed` | Their role doesn't allow drafts, tasks or asking. | Yes |
-| `403` | `forbidden` | Admin and auditor routes their role doesn't allow; the producer route called like a browser. | Yes |
-| `404` | `not_found` | Unknown path or id, or someone else's draft, task or follow-up. | Yes |
+| `403` | `forbidden` | Admin and auditor routes their role doesn't allow; the reviewer routes for someone who isn't an active reviewer; the producer route called like a browser. | Yes |
+| `403` | `own_draft` | A reviewer reading or recommending on their own draft: they decide it as its owner (**Reviews**). | Yes |
+| `403` | `restricted_draft` | A recommendation on a draft built from restricted sources: a reviewer sees its metadata only (**Reviews**). | Yes |
+| `404` | `not_found` | Unknown path or id, or someone else's draft, task or follow-up; for a reviewer, a draft of a PM not assigned to them. | Yes |
 | `405` | `method_not_allowed` | A known path with another method. | Yes |
 | `409` | `not_pending` | The draft was already decided (perhaps in Slack). Read it again to show how. | Yes |
 | `409` | `stale` | The draft changed since the `version` the PM approved. Also an admin's user or role change made against a directory `version` that has moved since (**Admin: users and roles**). | Yes |
 | `409` | `expired` | A Slack draft past its 24 hours. | Yes |
+| `409` | `draft_changed` | A reviewer's recommendation on a version of the draft that isn't current any more (its owner saved other text since it was read). Read it again (**Reviews**). | Yes |
 | `409` | `needs_external_confirm` | The channel is shared outside the company; ask, then approve with `confirm_external: true`. `audience` is now filled in. | Yes |
 | `409` | `audience_blocked` | Built from restricted sources, and people outside the product team can see the channel. Only rejecting is left. | Yes |
 | `409` | `not_approvable` | The tool server won't approve it as it stands (its tool or bot is no longer allowed). | Yes |
@@ -470,7 +499,7 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `409` | `task_refused` | The runtime won't take the PM's task (not onboarded, no bot). | Yes |
 | `409` | `github_not_linked` | An admin proposal: the admin hasn't linked GitHub in PM OS. Pull requests are opened as them; `error` says how to link. | Yes |
 | `409` | `stale_base` | An admin proposal or validation made from a copy that differs from the server's or the default branch's (**Admin: policy**). | Yes |
-| `422` | `invalid` | An admin proposal that doesn't pass validation (`errors`, `warnings`). Also a malformed value in an admin's user or role change. | Yes |
+| `422` | `invalid` | An admin proposal that doesn't pass validation (`errors`, `warnings`). Also a malformed value in an admin's user or role change, and a reviewer's note over 1,000 characters. | Yes |
 | `422` | `policy_mismatch` | An admin proposal: the tool server regenerates different policy files from it (`paths`). | Yes |
 | `429` | `rate_limited` | Too many admin proposals this hour; `Retry-After`. | Yes |
 | `501` | `not_configured` | Admin proposals are off at the tool server. | Yes |
@@ -483,13 +512,13 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `422` | `bad_brief` | The producer route's body failed a check. | Yes |
 | `501` | `not_built` | The daily brief is off on this server. | Yes |
 | `502` | `upstream_unavailable` | The runtime or tool server couldn't be reached, refused, or answered something unreadable. On a decision, only when the request never reached the tool server, or it refused it. | Yes on a decision; for a task (`POST /api/tasks`), the task may have been made: reload the list |
-| `502` | `unknown_outcome` | A decision was sent, but the answer was lost (the connection dropped, or the tool server failed with a `5xx`), and reading the draft again didn't show it decided. Also an admin proposal whose answer was lost: reload the proposals list. Also an admin's user or role change whose answer was lost: reload the team list. | **Unknown** |
+| `502` | `unknown_outcome` | A decision was sent, but the answer was lost (the connection dropped, or the tool server failed with a `5xx`), and reading the draft again didn't show it decided. Also an admin proposal whose answer was lost: reload the proposals list. Also an admin's user or role change whose answer was lost: reload the team list. Also a reviewer's recommendation whose answer was lost: read the draft again. | **Unknown** |
 | `504` | `unknown_outcome` | The same, when the tool server didn't answer in time (10 seconds). | **Unknown** |
 | `503` | `audience_unavailable` | Slack couldn't say who is in the channel. | Yes |
 | `503` | `unavailable` | `pmos-web`'s own store, or the tool server's, is down. | Yes |
 | `503` | `users_unavailable` | The tool server (the user database) can't be asked who the person is: sign-in, and every route but the last-known-good reads (**Sign-in and safety**). | Yes |
 | `403` | `entra_needs_host` | A Microsoft session of someone holding Admin or Auditor whose link the host hasn't confirmed: the session ends. | Yes |
-| `503` | `assertion_required` | An admin's user or role change, while the tool server runs without signed user assertions (a development stack): it makes none. | Yes |
+| `503` | `assertion_required` | An admin's user or role change, or a reviewer's recommendation, while the tool server runs without signed user assertions (a development stack): it makes none. | Yes |
 | `403` | `host_only` | A user or role change only someone with host access may make: granting `admin`, an Admin's or Auditor's addresses or Microsoft link. | Yes |
 | `403` | `self_change` | An admin changing their own roles, status, addresses, links or reviewer assignments. | Yes |
 | `409` | `exists` | Inviting a handle that is already taken (handles are never reused). | Yes |
@@ -968,7 +997,7 @@ text).
   `pm` (`409 not_active`, `409 not_pm`); nobody reviews themselves, and a PM appears once
   (`422 invalid`); an unknown handle is `404 not_found`. `[]` clears every assignment and is
   always allowed. Assignments are kept, and grant nothing, when either person loses the role
-  or is deactivated. (Recommendations are slice U6.)
+  or is deactivated. (What a reviewer then does: **Reviews**.)
 
 ### Errors
 
@@ -1022,6 +1051,143 @@ the user database's own role history:
 | any of these, `denied` | the refusal's code (`self_change`, `stale`, `deactivation_limit`, …), or `bad_request`, `bad_assertion`, `assertion_required`, `owns_bots` |
 
 `GET /api/admin/users` is recorded as `admin.users` (allowed or refused).
+
+## Reviews
+
+A **Reviewer recommends; the draft's owner confirms** (`CLAUDE.md`; slice U6a of
+`docs/user-database-spec.md` §8; the screens are U6b, built from this section). A person
+holding the `reviewer` role reads the **pending** drafts of the PMs an admin assigned to them
+(**Admin: users and roles**, `PUT /api/admin/reviewers/{reviewer}`) and records a
+recommendation on one: **approve** or **changes**, with an optional note. A recommendation
+**never decides anything**: the draft stays pending, nothing is sent anywhere, and only its
+owner approves or rejects it (`POST /api/drafts/{id}/approve`, the Slack card). The owner sees
+the advice on their draft (`recommendations`, **Drafts**), marked when it was given on an
+earlier version. Recommending happens in this app only: Slack shows one line and has no button
+for it.
+
+`pmos-web` mirrors the tool server's reviewer routes (`docs/toolserver.md`, "Reviews"), naming
+the signed-in person as `user=` and signing a user assertion for them bound to the exact request.
+**The tool server decides** who the reviewer is, whom they review and what they may see, from
+its own tables, on every call.
+
+| Method and path | Body | Answer |
+| --- | --- | --- |
+| `GET /api/reviews` | | `200` `{drafts: [ReviewSummary], total, truncated, pms}` |
+| `GET /api/reviews/{id}` | | `200` `ReviewDraft` |
+| `POST /api/reviews/{id}/recommendation` | `{verdict, note?, revision, args_hash}` | `200` `{recommendation: MyRecommendation, draft: ReviewDraft}` |
+
+**Who.** Show the Reviews entry when `GET /api/me` says `reviewer: true`. Anyone else gets
+`403 forbidden` from `pmos-web` itself, with no upstream call (an admin too: holding `admin` is
+not reviewing). The tool server checks again, on every call: an **active** user holding
+`reviewer`. It reads no one's draft for them but those of the PMs assigned to them who are
+active (a deactivated PM's held drafts are nobody's to review).
+
+**Which drafts.** `GET /api/reviews` lists every pending draft of the assigned PMs, newest
+first (up to the tool server's safety cap of 1,000; `truncated` then says some were left out,
+and `total` counts them all). Another person's draft, a missing one, and a draft whose owner
+isn't assigned to this reviewer all answer `404 not_found`, the same way, so the app can't
+learn which ids exist. A draft of **their own** answers `403 own_draft`: they decide it as its
+owner, under **Drafts**. A draft decided meanwhile is `409 not_pending`; a Slack draft past its
+24 hours, `409 expired`. An `{id}` that can't be one is `404 not_found` with no upstream call.
+
+**A restricted draft is metadata only** (`restricted: true`): built from restricted sources, or
+from unrecorded ones (older drafts), which count the same; that includes a follow-up whose
+conversation read restricted content, even if the follow-up itself read nothing. The reviewer
+sees who, what kind, when, and that it is restricted: no title, body, target, sources or
+version, and it can't be recommended on (`403 restricted_draft`). Show "This draft uses
+restricted sources; its owner can share it with you." `pmos-web` treats any draft the tool
+server doesn't mark `restricted: false` as restricted.
+
+```json
+// ReviewSummary (restricted: title and my_recommendation are null, no args_hash, no edited)
+{"id": "apr_…", "owner": "ana", "owner_name": "Ana Silva", "kind": "jira_issue",
+ "status": "pending", "created_at": "2026-11-16T09:00:00Z", "expires_at": null,
+ "restricted": false, "revision": 2, "title": "PAY-212: TCB grace period",
+ "edited": false, "args_hash": "3f9a…(64 hex)", "my_recommendation": MyRecommendation | null}
+
+// ReviewDraft = ReviewSummary plus, when restricted is false:
+{"body": "markdown with [[s1]] citations", "target": Target, "sources": [Source]}
+
+// A restricted ReviewDraft: exactly these fields
+{"id": "apr_…", "owner": "ana", "owner_name": "Ana Silva", "kind": "slack_reply",
+ "status": "pending", "created_at": "…", "expires_at": "…", "restricted": true, "revision": 1}
+
+// MyRecommendation: the reviewer's own live one on this draft
+{"verdict": "approve", "note": "Looks right to me." | null, "note_removed": false,
+ "revision": 2, "created_at": "2026-11-16T10:00:00Z", "stale": false}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | The draft's id (`apr_…`), as under **Drafts**. |
+| `owner` | string | The draft owner's handle. |
+| `owner_name` | string | Their display name, or their handle when they have none. **Untrusted text**: render as plain text. |
+| `kind` | string | `confluence_page`, `jira_issue`, `slack_reply` or `slack_message`. Other writes (such as a bet) are not listed. |
+| `status` | string | `pending` (a listed draft always is). |
+| `created_at`, `expires_at` | string, string or null | RFC 3339. `expires_at` is set for Slack drafts. |
+| `restricted` | bool | Metadata only: see above. |
+| `revision` | integer or null | The version of the draft's text: 1 as the bot drafted it, up by one each time its owner saves different text (an edit, an accepted suggestion, an edit on the Slack card). `null` from an older tool server. |
+| `title` | string or null | As under **Drafts**; `null` when restricted. |
+| `body`, `target`, `sources` | | As under **Drafts** (`Draft.body`, `Draft.target`, `[Source]`, citations resolved the same way). `ReviewDraft` only; absent when restricted. A Slack target names a public channel only: for a private channel or a direct message the reviewer gets the label without a name ("A Slack thread", "Direct message"), which the owner sees in full. |
+| `edited` | bool | Its owner changed the bot's text. Absent when restricted. |
+| `args_hash` | string | 64 lowercase hex: the SHA-256 of the draft's arguments as read. Send it back with `revision`. Absent when restricted. |
+| `my_recommendation` | object or null | The reviewer's own live recommendation; `null` for none. Never another reviewer's. |
+| `pms` (inbox only) | [string] | The handles whose drafts the reviewer reviews now (assigned and active). |
+
+**Recommending.** `POST /api/reviews/{id}/recommendation` with the `revision` and `args_hash`
+the reviewer read (from `ReviewDraft`):
+
+```json
+{"verdict": "approve", "note": "Looks right to me.", "revision": 2, "args_hash": "3f9a…"}
+```
+
+- `verdict` is `approve` ("recommends approving") or `changes` ("suggests changes"). Anything
+  else is `400 bad_request`.
+- `note` is optional, **plain text**, at most 1,000 characters (`422 invalid` past it). The
+  server removes control characters (a tab becomes a space, line breaks are kept) and trims it;
+  an empty note is no note. It is never a link, Markdown or HTML anywhere: render it as text.
+- `revision` (an integer ≥ 1) and `args_hash` (64 hex characters) are required; any other field
+  is `400 bad_request`.
+- **Bound to the version read.** If the owner saved different text since, or the draft holds
+  other arguments, nothing is recorded: `409 draft_changed`. Read the draft again, show what
+  changed, and let the reviewer recommend on the new version.
+- **One live recommendation per reviewer per draft**: a new one replaces the reviewer's earlier
+  one (and its note). The answer is the new `MyRecommendation` and the draft as now read.
+- Refused on a restricted draft (`403 restricted_draft`), on their own (`403 own_draft`), once
+  decided (`409 not_pending`) or expired (`409 expired`), and while the tool server runs
+  without signed user assertions (`503 assertion_required`, development stacks only).
+- A write: it needs the session's CSRF token and the app's own `Origin` (**Sign-in and
+  safety**). If the answer is lost, `502 unknown_outcome`: read the draft again to see whether
+  `my_recommendation` is the new one.
+
+**Stale advice.** `MyRecommendation.stale` (and `Recommendation.stale` on the owner's draft) is
+`true` when the draft changed since the recommendation was given: its revision moved on, or
+its arguments are others. Show it as given "on an earlier version" (the owner's draft: "Ana
+recommended approving an earlier version", the note greyed). The reviewer can recommend again
+on the new version.
+
+**What the note and names are.** A reviewer's note reaches the reviewer and the draft's owner
+in this app only: never a Slack message, the console, the audit log or any log. It is removed
+when its Slack draft's text is (24 hours after the draft was made or decided): `note: null`,
+`note_removed: true`. `owner_name` and `reviewer_name` are untrusted display names. A test
+feeds both a `<!channel>` and an `<img onerror>` string: React text nodes only.
+
+**Errors** (each changed nothing, and the tool server recorded it in the audit log with its
+code when it reached it): `400 bad_request`, `401 signed_out`, `403 bad_origin` / `bad_csrf`
+(a recommendation), `403 forbidden` (not an active reviewer), `403 own_draft`,
+`403 restricted_draft`, `404 not_found`, `409 not_pending`, `409 expired`,
+`409 draft_changed`, `422 invalid`, `502 upstream_unavailable`, `503 assertion_required`,
+`503 unavailable`, `503 users_unavailable`; and `502 unknown_outcome` (a recommendation whose
+answer was lost: it may have been recorded). See **Error codes**.
+
+**What gets recorded** (the tool server's audit log, `client` `web`, `task_id` `reviews`, the
+reviewer as `actor`, the draft as `target`, its args hash; never its text or the note):
+`approvals.review_inbox` for each listing, `approvals.review_read` for each read,
+`approvals.recommend` for each recommendation with the detail `verdict approve revision 2`,
+and each of them `denied` with the refusal's code. The owner's later decision of the draft is
+recorded with `after a recommendation to approve, on this version` (or `to make changes`, or
+`on an earlier version`), one part per kind of advice, after any detail of its own (`edited
+before approval; …`, `reason: tone; …`). Like every audit event they are deleted after 90 days.
 
 ## Admin: policy
 
