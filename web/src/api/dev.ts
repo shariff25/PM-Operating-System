@@ -33,6 +33,20 @@ function mockPolicyOptions(): MockPolicyOptions {
   };
 }
 
+/**
+ * The Team screen on the dev server: `?mock_users=<error code>` refuses every write with that code,
+ * `?mock_pilot=lapsed` puts the pilot exception in the past, `?mock_deactivations=capped` starts
+ * with the hourly deactivation cap reached.
+ */
+function mockUsersOptions(): { usersError?: string; pilotLapsed: boolean; deactivationCapReached: boolean } {
+  const q = new URLSearchParams(window.location.search);
+  return {
+    usersError: q.get('mock_users') ?? undefined,
+    pilotLapsed: q.get('mock_pilot') === 'lapsed',
+    deactivationCapReached: q.get('mock_deactivations') === 'capped',
+  };
+}
+
 /** VITE_API=real talks to pmos-web through the dev proxy; anything else uses the sample data. */
 export function devApiFactory(): (onSignedOut: () => void) => Api {
   if (import.meta.env.VITE_API === 'real') return (onSignedOut) => createRealClient({ onSignedOut });
@@ -46,6 +60,7 @@ export function devApiFactory(): (onSignedOut: () => void) => Api {
       briefBuilt: import.meta.env.VITE_MOCK_BRIEF !== 'off',
       hostile: import.meta.env.VITE_MOCK_HOSTILE === 'on',
       toolServerDown: new URLSearchParams(window.location.search).get('mock_admin') === 'degraded',
+      ...mockUsersOptions(),
       ...mockPolicyOptions(),
       ...(import.meta.env.VITE_MOCK_EMPTY === 'on' ? { noDrafts: true, firstVisit: false, emptyBrief: true } : {}),
       ...(import.meta.env.VITE_MOCK_FAST === 'on' ? { latency: 0, stepMs: 150 } : {}),

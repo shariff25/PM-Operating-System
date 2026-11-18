@@ -16,6 +16,8 @@ import type {
   Suggestion,
   TeamList,
   Task,
+  UserList,
+  Written,
 } from './types';
 import type { ContentFileText, ContentView, Harness, PolicyView, ProposalList, ProposalResult, Validation } from './policyTypes';
 
@@ -167,6 +169,28 @@ export function createRealClient(opts: RealOptions = {}): Api {
     },
     adminTeam: () => call<TeamList>('GET', '/admin/team'),
     adminConnectors: async () => (await call<{ connectors: Connector[] }>('GET', '/admin/connectors')).connectors,
+
+    adminUsers: () => call<UserList>('GET', '/admin/users'),
+    adminInvite: (input) => post<Written>('/admin/users', input),
+    adminSetRoles: (handle, roles, expectedVersion) =>
+      call<Written>('PUT', `/admin/users/${seg(handle)}/roles`, { roles, expected_version: expectedVersion }),
+    adminSetFields: (handle, fields, expectedVersion) =>
+      call<Written>('PUT', `/admin/users/${seg(handle)}/fields`, { ...fields, expected_version: expectedVersion }),
+    adminConfirmSignIn: (handle, signInName, expectedVersion) =>
+      post<Written>(`/admin/users/${seg(handle)}/sign-in-name/confirm`, {
+        sign_in_name: signInName,
+        ...(expectedVersion !== undefined ? { expected_version: expectedVersion } : {}),
+      }),
+    adminDeactivate: (handle, expectedVersion) =>
+      post<Written>(`/admin/users/${seg(handle)}/deactivate`, expectedVersion !== undefined ? { expected_version: expectedVersion } : {}),
+    adminReactivate: (handle, expectedVersion) =>
+      post<Written>(`/admin/users/${seg(handle)}/reactivate`, expectedVersion !== undefined ? { expected_version: expectedVersion } : {}),
+    adminUnlink: (handle, kind) => call<Written>('DELETE', `/admin/users/${seg(handle)}/identities/${seg(kind)}`),
+    adminAssignReviewer: (reviewer, pms, expectedVersion) =>
+      call<Written>('PUT', `/admin/reviewers/${seg(reviewer)}`, {
+        pms,
+        ...(expectedVersion !== undefined ? { expected_version: expectedVersion } : {}),
+      }),
 
     adminPolicy: () => call<PolicyView>('GET', '/admin/policy'),
     adminPolicyValidate: (spec) => post<Validation>('/admin/policy/validate', { spec }),
