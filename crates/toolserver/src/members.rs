@@ -1,4 +1,4 @@
-//! Requests to join PM OS (`docs/onboarding-spec.md` §3). Someone not in `team.yaml` asks in
+//! Requests to join PM OS (`docs/onboarding-spec.md` §3). Someone not in the user database asks in
 //! Slack; a platform owner approves or rejects there. In memory ([`MemoryRequests`]) or in
 //! Postgres (`pg.rs`). At most one request per Slack id is pending at a time.
 

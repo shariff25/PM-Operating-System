@@ -97,8 +97,6 @@ fn a_tree_with_lint_errors_refuses_to_load() {
     assert!(err.contains("bots/broken/BOT.md"), "{err}");
 }
 
-const TEAM: &str = "members:\n  - handle: ana\n    slack-id: U0ANA\n    email: ana@example.com\n    roles: [pm, admin]\n";
-
 fn names(bots: &Value) -> Vec<String> {
     bots.as_array()
         .unwrap()
@@ -111,7 +109,6 @@ fn names(bots: &Value) -> Vec<String> {
 async fn a_content_change_is_picked_up_and_a_bad_one_is_not() {
     let dir = tempfile::tempdir().unwrap();
     copy_dir(&content(), dir.path());
-    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
     let mut reloader = Reloader::new(dir.path());
     let env = Env::memory_with(Catalog::load(dir.path(), today()).expect("loads")).await;
     assert_eq!(reloader.check(&env.rt, today()).await, Reload::Unchanged);
@@ -196,6 +193,9 @@ fn the_fingerprint_follows_the_watched_files_only() {
         before,
         "only the catalog's files count"
     );
-    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
+    // A team.yaml decides nothing (slice U7), so it isn't watched either.
+    std::fs::write(dir.path().join("team.yaml"), "members: []\n").unwrap();
+    assert_eq!(fingerprint(dir.path()), before);
+    std::fs::write(dir.path().join("tools.yaml"), "tools: []\n").unwrap();
     assert_ne!(fingerprint(dir.path()), before);
 }

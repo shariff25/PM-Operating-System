@@ -39,12 +39,6 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
-    /// Members in `team.yaml`. Everyone after the first platform owners normally joins
-    /// through the bot (docs/onboarding-spec.md); this is for those first entries and tests.
-    Member {
-        #[command(subcommand)]
-        command: MemberCommand,
-    },
     /// Bots in the content.
     Bot {
         #[command(subcommand)]
@@ -65,32 +59,6 @@ enum BotCommand {
         /// The person's PM OS handle: lowercase letters, digits and single hyphens.
         #[arg(long)]
         handle: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum MemberCommand {
-    /// Add a member to `team.yaml` and write their personal bot `pm-<handle>`. Review the
-    /// change and commit it like any other content change.
-    Add {
-        /// Path to the content root.
-        #[arg(long, default_value = "content")]
-        root: PathBuf,
-        /// PM OS handle: lowercase letters, digits and single hyphens.
-        #[arg(long)]
-        handle: String,
-        /// Slack member id, such as U012AB3CD.
-        #[arg(long)]
-        slack_id: String,
-        /// Atlassian account email.
-        #[arg(long)]
-        email: Option<String>,
-        /// GitHub login in your GitHub org.
-        #[arg(long)]
-        github: Option<String>,
-        /// Roles, comma-separated: pm, skill-author, admin.
-        #[arg(long, default_value = "pm", value_delimiter = ',')]
-        roles: Vec<String>,
     },
 }
 
@@ -143,9 +111,10 @@ fn main() -> Result<ExitCode> {
             deny_warnings,
             format,
         } => {
+            // `team-file-retired` is an error here, as in CI (`LintOptions::new`).
             let opts = LintOptions {
-                today: today.unwrap_or_else(|| Local::now().date_naive()),
                 stale_after_days,
+                ..LintOptions::new(today.unwrap_or_else(|| Local::now().date_naive()))
             };
             run_lint(&root, &opts, deny_warnings, format)
         }
@@ -160,24 +129,14 @@ fn main() -> Result<ExitCode> {
                     format,
                 },
         } => policy_check(&root, &policies, format),
-        Command::Member {
-            command:
-                MemberCommand::Add {
-                    root,
-                    handle,
-                    slack_id,
-                    email,
-                    github,
-                    roles,
-                },
-        } => member_add(&root, handle, slack_id, email, github, &roles),
         Command::Bot {
             command: BotCommand::AddPersonal { root, handle },
         } => bot_add_personal(&root, &handle),
     }
 }
 
-/// `pmos bot add-personal`: the personal bot half of `pmos member add`, with no `team.yaml`.
+/// `pmos bot add-personal`: a person's personal bot, and nothing else. The person is added to
+/// the user database on the host (`pmos-admin users …`); there is no team file (slice U7).
 fn bot_add_personal(root: &Path, handle: &str) -> Result<ExitCode> {
     use pmos_contract::onboarding::{
         bot_path, personal_bot_name, render_personal_bot, valid_new_handle, MAX_PROPOSED_HANDLE,
@@ -201,78 +160,6 @@ fn bot_add_personal(root: &Path, handle: &str) -> Result<ExitCode> {
     std::fs::write(&bot, render_personal_bot(handle))?;
     println!(
         "wrote {}; run `pmos policy generate` for its sandbox policy",
-        bot.display()
-    );
-    Ok(ExitCode::SUCCESS)
-}
-
-fn member_add(
-    root: &Path,
-    handle: String,
-    slack_id: String,
-    email: Option<String>,
-    github: Option<String>,
-    roles: &[String],
-) -> Result<ExitCode> {
-    use pmos_contract::model::{valid_email, valid_slack_id, Role, TeamFile, TeamMember};
-    use pmos_contract::onboarding::{
-        bot_path, render_personal_bot, render_team_yaml, valid_github_login, valid_new_handle,
-    };
-    let fail = |m: String| -> Result<ExitCode> {
-        eprintln!("error: {m}");
-        Ok(ExitCode::FAILURE)
-    };
-    if !valid_new_handle(&handle) {
-        return fail(format!(
-            "`{handle}` is not a usable handle: lowercase letters, digits and single hyphens, at most {}",
-            pmos_contract::onboarding::MAX_PROPOSED_HANDLE
-        ));
-    }
-    if !valid_slack_id(&slack_id) {
-        return fail(format!("`{slack_id}` is not a Slack member id (U… or W…)"));
-    }
-    if let Some(e) = email.as_deref().filter(|e| !valid_email(e)) {
-        return fail(format!("`{e}` is not an email address"));
-    }
-    if let Some(g) = github.as_deref().filter(|g| !valid_github_login(g)) {
-        return fail(format!("`{g}` is not a GitHub login"));
-    }
-    let mut parsed = Vec::new();
-    for r in roles {
-        match serde_norway::from_str::<Role>(r.trim()) {
-            Ok(role) if !parsed.contains(&role) => parsed.push(role),
-            Ok(_) => {}
-            Err(_) => return fail(format!("unknown role `{r}`: use pm, skill-author or admin")),
-        }
-    }
-    let path = root.join("team.yaml");
-    let original = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut team =
-        TeamFile::from_yaml(&original).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-    if team.by_handle(&handle).is_some() || team.by_slack_id(&slack_id).is_some() {
-        return fail(format!(
-            "`{handle}` or `{slack_id}` is already in team.yaml"
-        ));
-    }
-    team.members.push(TeamMember {
-        handle: handle.clone(),
-        slack_id,
-        email,
-        github,
-        entra_oid: None,
-        roles: parsed,
-    });
-    std::fs::write(&path, render_team_yaml(&original, &team.members))?;
-    let bot = root.join(bot_path(&pmos_contract::onboarding::personal_bot_name(
-        &handle,
-    )));
-    if !bot.exists() {
-        std::fs::create_dir_all(bot.parent().expect("bot path has a folder"))?;
-        std::fs::write(&bot, render_personal_bot(&handle))?;
-    }
-    println!(
-        "added `{handle}` to {} and wrote {}; run `pmos policy generate` for its sandbox policy",
-        path.display(),
         bot.display()
     );
     Ok(ExitCode::SUCCESS)

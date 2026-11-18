@@ -35,7 +35,7 @@ Browser: TypeScript single-page app (pnpm workspace)
    │  user sign-in (local now, Entra later, one provider interface)
    ▼
 Web server (Rust)
-   ├─ user database (PM OS source of truth for people and roles; team.yaml follows it)
+   ├─ user database (PM OS source of truth for people and roles; team.yaml retired in U7)
    ├─ scoped calls to the bot runtime and tool server, each carrying a signed user assertion
    ├─ audit chain (every action recorded; retention 90 days)
    ├─ connector registry (which systems PM OS reads and writes)
@@ -81,7 +81,7 @@ Each gate needs written pass criteria before its phase starts.
 - **The gateway config file.** Its format and where it lives are not decided.
 - **Whether the context library is editable in the web client.** The decision was written with `context/` as the name. The repo's context tree is `content/`. Confirm which one is meant before deciding.
 - **Pass bars** for each phase gate.
-- **Entra ID requirements:** group-to-role mapping, and the sign-in fallback when Entra is down. Not yet written. `pmos-web` now has single-tenant Entra sign-in that maps people by email to `team.yaml` and takes roles only from there (`docs/entra-sign-in.md`).
+- **Entra ID requirements:** group-to-role mapping, and the sign-in fallback when Entra is down. Not yet written. `pmos-web` now has single-tenant Entra sign-in that maps people to the user database by their `(tid, oid)` after a first link by sign-in name, and takes roles only from there (`docs/entra-sign-in.md`).
 - **The full permission matrix** and the audit chain design (see above).
 
 ## Links

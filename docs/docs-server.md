@@ -195,10 +195,10 @@ index.)
 - The command is acknowledged at once with "Searching…".
 - The results arrive a moment later, visible only to the asker: up to 5 pages with links,
   product, updated date and a snippet.
-- **Who can use it:** only people in `content/team.yaml` (your decision). Anyone else gets a
-  private note with a **Request access** button (see **Onboarding in Slack** below), or, when
-  the bot runs without `PMOS_BOTS_URL`, a note saying who to ask. The file is re-read on every
-  command, so a merged change applies without a restart.
+- **Who can use it:** only active users of PM OS, from the tool server's user database
+  (`docs/user-database-spec.md`; the Slack service polls its directory every 10 seconds).
+  Anyone else gets a private note with a **Request access** button (see **Onboarding in
+  Slack** below), or, when the bot runs without `PMOS_BOTS_URL`, a note saying who to ask.
 - **Audit:** each search runs as that PM under the `docs` skill and is audited (`docs.search`,
   user, run `slack-docs-<envelope id>`).
 - **Connection:** Socket Mode, so the Spark needs no inbound connection from Slack.
@@ -239,8 +239,9 @@ index.)
      links to its task page. Without it, or with an `http://` one, the rows have no links.
 
    Without `PMOS_BOTS_URL` the bot serves `/docs` only.
-5. List at least one platform owner (`admin`) in `content/team.yaml` by pull request. After
-   that, new PMs ask for access in Slack (below); hand edits still go by pull request.
+5. Make at least one platform owner (`admin`) in the user database on the host
+   (`deploy/pmos-admin users bootstrap-admin`, `docs/runbooks/users.md`). After that, new PMs
+   ask for access in Slack (below), or an admin invites them in the web app.
 
 ## Onboarding in Slack (`pmos-slack`)
 
@@ -248,21 +249,22 @@ The contract is `docs/onboarding-spec.md` (§4 for Slack, §3 for the tool serve
 calls). It needs the bots (`PMOS_BOTS_URL`).
 
 **Asking for access:**
-1. Someone not in `team.yaml` DMs PM OS, or uses `/docs`, and gets "PM OS is for the product
-   team." with a **Request access** button.
+1. Someone not in the user database DMs PM OS, or uses `/docs`, and gets "PM OS is for the
+   product team." with a **Request access** button.
 2. A tap reads their name and email from Slack (`users.info`). With no email in their Slack
    profile they are told so, and nothing is sent.
 3. The request goes to the tool server, and they are told "Sent to the platform owners. I'll
    DM you when it's decided." Asking again while it waits says it is already pending.
 
 **Deciding:**
-- Every platform owner (`admin` in `team.yaml`) gets a DM card with the name, email and
+- Every platform owner (an active `admin` in the user database) gets a DM card with the name, email and
   proposed handle, and **Approve**, **Approve with another handle** and **Reject**.
 - Only an admin's tap counts; anyone else is told "Only platform owners can decide this."
 - **Approve with another handle** opens a form. A handle that isn't valid, or is taken, is
   shown under the field before anything is sent.
-- **Approving commits as the admin:** the tool server commits `team.yaml` and the new
-  member's `bots/pm-<handle>/BOT.md` to the content repo with the admin's GitHub account.
+- **Approving adds them, then commits as the admin:** the tool server adds the new member to
+  the user database (they can use PM OS at once), then commits their `bots/pm-<handle>/BOT.md`
+  and its sandbox policy to the content repo with the admin's GitHub account.
   - An admin who hasn't linked GitHub gets a private note with a **Connect GitHub** button.
   - An admin whose account can't push to the content repo is told so.
   - In both cases the card stays as it was, for them or another admin.
@@ -293,9 +295,10 @@ docs bot. The steps:
 messages to their bot):
 - `requests`: the pending requests, as cards.
 - `remove <handle>` (or `remove @name`): a confirmation card with **Remove** and **Cancel**.
-  **Remove** has the tool server commit `team.yaml` without them and delete their bot, unlink
-  their accounts and forget their memory repo (the repo itself stays theirs). An admin can't
-  remove themselves.
+  **Remove** has the tool server **deactivate** them in the user database: their sessions end
+  and their linked accounts are suspended, then deleted after 24 hours unless they are
+  reactivated; nothing is committed (`docs/runbooks/users.md`, "Deactivating someone"). An
+  admin can't remove themselves, and Slack never removes an Admin or Auditor.
 
 Every Slack envelope is still acknowledged within 3 seconds. The memory-repo form is the one
 answer that has to be in the acknowledgement (Slack shows field errors only from it), so the
@@ -325,7 +328,7 @@ text.
 - **When:** weekdays at `PMOS_TRIAGE_AT` (default 09:00) in `PMOS_DEFAULT_TZ`.
   `PMOS_TRIAGE_AT=off` turns it off.
 - **Who:** each bot's quality owner, the `owner` in the runtime's bot list, gets one DM for all
-  their bots. A bot with no owner, or whose owner isn't in `team.yaml`, is skipped and logged.
+  their bots. A bot with no owner, or whose owner isn't an active user, is skipped and logged.
 - **What:** the drafts decided since the previous digest (so Monday's covers the weekend) that
   were rejected, or approved after an edit with an edit distance of at least
   `PMOS_TRIAGE_MIN_EDIT`. Rows are grouped by bot, newest first, up to 30. Each shows:
@@ -363,7 +366,7 @@ bot `pm-<handle>`.
 - `reply assistant` (or `reply assistant status`) says whether it is on, and when it next
   runs.
 - A member without a personal bot is told the assistant runs on `pm-<handle>` and that
-  nothing was changed. Someone outside `team.yaml` gets the usual **Request access** note.
+  nothing was changed. Someone not in the user database gets the usual **Request access** note.
 - The member's other routines are never touched; "my routines" still lists them all.
 
 **The reply card.** Each `slack.post_reply` draft gets its own card in the member's DM:

@@ -55,8 +55,8 @@ client `evals`. For each task, `repeats` times, it:
   status, error and events only, and the report says how many failures were tagged that way.
 - **Who asks.** The runtime lets only active users who may ask bots (`pm`, `reviewer` or
   `admin`) ask, from the tool server's user database (slice U4a), so the `--as` handle must
-  be a user there; the eval stack seeds `evals` into it from its `team.yaml`
-  (`PMOS_USERS_SEED`). The runtime also lets the `evals` token request tasks only as the
+  be a user there; the eval stack seeds `evals` into it from a seed file beside its copy of
+  the content (`PMOS_USERS_SEED`). The runtime also lets the `evals` token request tasks only as the
   handles in its own `PMOS_EVALS_AS` (default `evals`; anything else is `403`), so a leaked
   benchmark token can't run a PM's bots as them. Add a member for the benchmarks (`evals`,
   as the eval stack does), or, for a run as a real PM, list their handle in the runtime's
@@ -816,7 +816,9 @@ case cards", have the starting bar (`pass_bar: 0.8`) and run each task three tim
 **The eval stack.** Benchmarks run against their own short-lived copy of the services
 (`deploy/compose.evals.yaml`), never against what PMs use. It has:
 - a tool server, runtime and the Docs and `pm-evals` workers, on a checkout's content;
-- the member `evals` added to that copy of `team.yaml`;
+- the user `evals` (with `ben`, `cy` and `eval-admin`) in its in-memory user database, from a
+  seed file written beside that copy of the content, never in it, and a personal bot for each
+  (`pmos bot add-personal`);
 - fake Jira, Confluence, Slack and docs fixtures. To benchmark your own docs site, set
   `PMOS_EVAL_DOCS_URL=http://docs.pmos.internal:8730/mcp` in `deploy/.env`, and the eval
   tool server reads the main stack's docs index, read-only;
@@ -867,7 +869,8 @@ because the load test measures the stack PMs use.
   labelled defaults. Latency isn't a priority, so they're informational unless
   `--enforce-targets` is passed.
 - **Who evals run as:** the spec doesn't name an identity for eval tasks. `requested_by` is a
-  config default (`evals`), so that handle has to be in `team.yaml`, or `--as` must name a PM.
+  config default (`evals`), so that handle has to be a user in the user database, or `--as`
+  must name a PM.
   For `bot: personal` categories that member also needs a personal bot.
 - **The clustered standard error** falls back to the binomial when every cluster holds one
   *attempt*, not one *task*: with repeats, each task's attempts are a cluster, and treating

@@ -43,7 +43,8 @@ const SECRET_TEXT: &str = "MARKER-proposed-file-text-7c41";
 const RESTRICTED_BODY: &str = "Restricted body.";
 const ANA_BODY: &str = "Ana's own";
 
-const TEAM: &str = "members:
+/// The fake user directory's people (`FakeDirectory::seed_team`).
+const USERS: &str = "members:
   - {handle: adam, slack-id: U0ADM, email: adam@example.com, roles: [admin]}
   - {handle: audrey, slack-id: U0AUD, roles: [auditor]}
   - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm]}
@@ -299,7 +300,6 @@ fn fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let content = dir.path().join("content");
     copy_tree(&repo_root().join("content"), &content);
-    std::fs::write(content.join("team.yaml"), TEAM).unwrap();
     // A restricted context file and a PM's own master file.
     std::fs::write(
         content.join("context/products/secret-roadmap.md"),
@@ -362,7 +362,7 @@ impl Reply {
 async fn web() -> Web {
     logs();
     let tools = Arc::new(Mock::default());
-    tools.directory.seed_team(TEAM);
+    tools.directory.seed_team(USERS);
     let (tools_url, stop_tools) =
         serve(Router::new().fallback(toolserver).with_state(tools.clone())).await;
     let (bots_url, stop_bots) = serve(Router::new().fallback(runtime)).await;
@@ -1441,11 +1441,8 @@ async fn the_content_tree_has_metadata_and_lint_status() {
     );
     assert!(skill["size"].as_u64().unwrap() > 0);
     assert_eq!(skill["editable"], true);
-    let team = files
-        .iter()
-        .find(|f| f["path"] == "content/team.yaml")
-        .unwrap();
-    assert_eq!(team["editable"], false);
+    // No team file in the content since slice U7 (a proposal may still never write one).
+    assert!(!files.iter().any(|f| f["path"] == "content/team.yaml"));
     let secret = files.iter().find(|f| f["path"] == RESTRICTED).unwrap();
     assert_eq!(secret["sensitivity"], "restricted");
     assert_eq!(secret["readable"], false, "an auditor doesn't open it");

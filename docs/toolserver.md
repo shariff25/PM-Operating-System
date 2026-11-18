@@ -1085,17 +1085,15 @@ already_member`.
 
 **Then** it commits, in **one commit** on `PMOS_CONTENT_BRANCH` with the approving admin's own
 GitHub token:
-- `{PMOS_CONTENT_DIR}/team.yaml`: the file at the branch head plus the new member
-  (`handle`, `slack-id`, `email`, `roles: [pm]`), written with `render_team_yaml`. Until slice
-  U7 retires the file, `pmos lint` checks bot owners against it; no service decides from it
-  any more (slices U3 and U4a-d);
-- `{PMOS_CONTENT_DIR}/bots/pm-<handle>/BOT.md` from `render_personal_bot`;
+- `{PMOS_CONTENT_DIR}/bots/pm-<handle>/BOT.md` from `render_personal_bot` (if one is already
+  at the branch head, nothing is committed and the request's `error` says the handle is
+  taken);
 - `{PMOS_POLICIES_DIR}/bots/pm-<handle>.yaml` and `pm-<handle>.sandbox.yaml`, the bot's sandbox
   policy and launch spec from `pmos_policy`, so `pmos policy check` has nothing missing.
 
 The message is `Add <handle> to PM OS` with the trailer `Approved-by: <admin> (Slack, request
-<id>)`. Before committing, the new `team.yaml` must parse and pass the team lint rules, and
-the content with the new member in it (a scratch copy of the checkout) must pass `pmos lint`,
+<id>)`. Since slice U7 there is no `team.yaml` in it: nothing reads one. Before committing,
+the content with the new bot in it (a scratch copy of the checkout) must pass `pmos lint`,
 since the policies are generated from it. The handle must pass `valid_new_handle` and be
 unused (`422 bad_handle` otherwise). Decisions run one at a time, so two admins clicking at
 once make one commit; the store also lets only one decision win.
@@ -1127,8 +1125,8 @@ refusal code).
 ### The tool server decides from the user database (slice U3)
 
 Since slice U3 the tool server reads its own users tables (`src/users/access.rs`, `People`)
-for every decision it makes; `team.yaml` is no longer read by it at all (onboarding still
-**writes** it, above, for the other services until U7).
+for every decision it makes; it never reads a `team.yaml`, and since slice U7 onboarding no
+longer writes one and no other service reads one either.
 
 - **Who may use PM OS:** an active user holding `pm`, `reviewer` or `admin`. An auditor-only
   person never gets an MCP session, never decides a draft, never links an account. A team
@@ -1205,10 +1203,11 @@ or Auditor is never deactivated (`403 protected_not_from_slack`).
 
 ### The user database: the store (slice U1)
 
-The source of users and roles is moving from `team.yaml` to the tool server's own tables
-(`docs/user-database-spec.md`). Slice U1 builds the store, its database guarantees and the
-host commands. Since slice U3 the tool server decides from it (above), and the runtime since
-slice U4a, Slack since slice U4b, `pmos-web`'s sign-in since U4c and the console since U4d.
+The source of users and roles is the tool server's own tables (`docs/user-database-spec.md`);
+`team.yaml` was retired in slice U7, and only the import below parses one. Slice U1 builds the
+store, its database guarantees and the host commands. Since slice U3 the tool server decides
+from it (above), and the runtime since slice U4a, Slack since slice U4b, `pmos-web`'s sign-in
+since U4c and the console since U4d.
 The read API (slice U2)
 is below.
 
@@ -1273,9 +1272,10 @@ record it in `role_changes.host_user` and the audit event's detail (`host_user <
 client `host`). Exit codes: 0 done, 1 failed, 2 usage, 3 refused by a rule. No command prints a
 token; `list`, `export` and the import's dry run show addresses, which the host already holds.
 
-**The dev seed:** `PMOS_USERS_SEED=<file>` (the `team.yaml` shape, loaded by the import's code
-as a bootstrap) fills the in-memory store at start-up. It is refused with `PMOS_DATABASE_URL`
-or live connectors. With fake connectors only, it may give `evals` its fake Slack id. A seed
+**The dev seed:** `PMOS_USERS_SEED=<file>` (the old `team.yaml` shape, loaded by the import's
+code as a bootstrap) fills the in-memory store at start-up. It is refused with
+`PMOS_DATABASE_URL`, with live connectors, and (slice U7) when the file is inside
+`PMOS_CONTENT_ROOT`: users are never read from the content. With fake connectors only, it may give `evals` its fake Slack id. A seed
 needs an active admin like any import.
 
 ### The user database's read API (slice U2)
@@ -1593,7 +1593,7 @@ cargo run -p pmos-toolserver
 | `PMOS_ASSERTION_KEYS` | none | `web:toolserver:<kid>:<base64>[:<kid>:<base64>],console:toolserver:…` (`docs/user-assertion.md`, Keys). A malformed list, a key under 32 bytes, or another service's pair refuses to start, in every mode |
 | `PMOS_CONNECTORS` | required | `live` for real Atlassian and Slack with each PM's own token; `fake` for fixture data (dev, tests, and everything before Gate 1). Either way, only active users in the user database (a seed in dev) may have sessions |
 | `PMOS_USERS_DEACTIVATIONS_PER_HOUR` | `3` | How many people the web app and Slack together may deactivate in any rolling hour (1 to 10); past it, `429 deactivation_limit` and host commands only (see **Deactivation**) |
-| `PMOS_USERS_SEED` | unset | Development and eval stacks only (refused with a database or live connectors): a `team.yaml`-shaped file loaded into the in-memory user database at start-up; it must name an admin |
+| `PMOS_USERS_SEED` | unset | Development and eval stacks only (refused with a database or live connectors): a file in the import's shape (a `members:` list), outside `PMOS_CONTENT_ROOT`, loaded into the in-memory user database at start-up; it must name an admin |
 | `PMOS_DATABASE_URL` | required | Postgres for every store. `PMOS_DEV=1` without it keeps everything in memory. |
 | `PMOS_AUDIT_LOG` | none | Also writes audit events to this JSON-lines file, for shipping off-box |
 | `PMOS_CONTENT_ROOT` | `content` | Must pass `pmos lint`, or the server won't start |

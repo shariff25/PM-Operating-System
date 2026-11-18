@@ -235,23 +235,15 @@ pub struct PlaybookFrontMatter {
 
 /// A role in PM OS (ADM-1). What each role may do is [`crate::permissions`].
 ///
-/// # Rolling out a new role
+/// Users and their roles live in the PM OS user database (`docs/user-database-spec.md`); the
+/// tool server stores the four roles there. This enum is the shared vocabulary for the
+/// permission matrix, and the import of an old `team.yaml` (`pmos-admin users import`, the
+/// only code that still parses that file) reads its roles with [`Role::parse_tolerant`]: a
+/// well-formed name this build doesn't know becomes [`Role::Unknown`], which grants no
+/// permission, so the import can name it and stop. A malformed name is an error there.
 ///
-/// `team.yaml` is read by every service (tool server, runtime, console, Slack bot, CLI), and
-/// they are not always upgraded together. A closed enum would make one new role name in
-/// `team.yaml` a parse error in every binary that predates it: the console stops serving and
-/// the tool server keeps a stale member list. So `team.yaml` parsing is tolerant: a
-/// well-formed role name this build doesn't know becomes [`Role::Unknown`], which grants no
-/// permission, keeps its name (so a binary that rewrites `team.yaml`, such as onboarding,
-/// writes it back unchanged) and draws the `team-role-unknown` lint warning. A malformed name
-/// (not lowercase letters, digits and hyphens) is still a parse error.
-///
-/// Tolerance applies only to `team.yaml` (the `roles` field of [`TeamMember`]). Deserializing
-/// a `Role` on its own, as an API body or a CLI argument does, stays strict: an unknown name
-/// is an error there, because it is a typo, not a newer file. Use [`Role::parse`] for input.
-///
-/// This only helps builds that have it: binaries older than this tolerance still reject
-/// `reviewer` and `auditor`, so upgrade every service before a `team.yaml` uses them.
+/// Deserializing a `Role` on its own, as an API body or a CLI argument does, is strict: an
+/// unknown name is an error, because it is a typo. Use [`Role::parse`] for input.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Role {
     /// Product Manager: asks bots and decides their own approvals.
@@ -266,15 +258,16 @@ pub enum Role {
     /// Reads audit metadata and exports it. Nothing else: no trace bodies, no prompt or
     /// Slack text, no asking bots.
     Auditor,
-    /// A role name from a newer `team.yaml` than this build knows. Grants nothing.
+    /// A well-formed role name this build doesn't know (from an imported file). Grants
+    /// nothing.
     Unknown(String),
 }
 
 impl Role {
-    /// Every role this build knows, in `team.yaml` spelling.
+    /// Every role this build knows, by name.
     pub const KNOWN: [&'static str; 5] = ["pm", "skill-author", "admin", "reviewer", "auditor"];
 
-    /// The name as written in `team.yaml`.
+    /// The role's name.
     pub fn as_str(&self) -> &str {
         match self {
             Role::Pm => "pm",
@@ -286,7 +279,7 @@ impl Role {
         }
     }
 
-    /// A known role by its `team.yaml` name. Strict: anything else is `None`.
+    /// A known role by its name. Strict: anything else is `None`.
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "pm" => Some(Role::Pm),
@@ -298,7 +291,7 @@ impl Role {
         }
     }
 
-    /// A role as read from `team.yaml`: a known role, else [`Role::Unknown`] if the name is
+    /// A role as read from an imported file: a known role, else [`Role::Unknown`] if the name is
     /// well formed (lowercase letters, digits and single hyphens, at most 32), else `None`.
     pub fn parse_tolerant(name: &str) -> Option<Self> {
         Self::parse(name).or_else(|| {
@@ -344,103 +337,8 @@ impl<'de> Deserialize<'de> for Role {
     }
 }
 
-/// `TeamMember.roles`: tolerant of well-formed role names this build doesn't know (see
-/// [`Role`]).
-fn tolerant_roles<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Role>, D::Error> {
-    Vec::<String>::deserialize(d)?
-        .into_iter()
-        .map(|name| {
-            Role::parse_tolerant(&name).ok_or_else(|| {
-                serde::de::Error::custom(format!(
-                    "`{name}` is not a role name (lowercase letters, digits and hyphens)"
-                ))
-            })
-        })
-        .collect()
-}
-
-impl TeamMember {
-    pub fn is_admin(&self) -> bool {
-        self.roles.contains(&Role::Admin)
-    }
-
-    /// Whether this member's roles allow `permission` ([`crate::permissions::allows`]).
-    pub fn allows(&self, permission: crate::permissions::Permission) -> bool {
-        crate::permissions::allows(&self.roles, permission)
-    }
-}
-
-/// One person who may use PM OS.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct TeamMember {
-    /// PM OS handle: lowercase letters, digits, `.`, `_` and `-`.
-    pub handle: String,
-    /// Slack member id, such as `U012AB3CD`.
-    pub slack_id: String,
-    /// Atlassian account email. Linking Jira and Confluence checks the signed-in account
-    /// has this email, so a forwarded link can't attach someone else's account. The web app's
-    /// Entra ID sign-in also finds the member by it (`docs/entra-sign-in.md`), so it must be
-    /// unique across members, ignoring case (`pmos lint`: `team-duplicate`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub email: Option<String>,
-    /// GitHub login in your GitHub org. Optional: linking GitHub checks this login when it is
-    /// set, and otherwise a verified email on the GitHub account matching `email`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub github: Option<String>,
-    /// Optional: the person's Entra ID object id (`oid`, a GUID). When it is set, the web
-    /// app's Entra ID sign-in also requires the token's `oid` to be this one, so an email
-    /// address reassigned to someone else in the tenant can't sign in as this member
-    /// (`docs/entra-sign-in.md`). Unique across members (`pmos lint`: `team-duplicate`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub entra_oid: Option<String>,
-    /// Tolerant of role names newer than this build (see [`Role`]).
-    #[serde(deserialize_with = "tolerant_roles")]
-    pub roles: Vec<Role>,
-}
-
-/// `content/team.yaml`: who may use PM OS, until SSO replaces it (Phase 1).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TeamFile {
-    #[serde(default)]
-    pub members: Vec<TeamMember>,
-}
-
-impl TeamFile {
-    pub fn from_yaml(text: &str) -> Result<Self, serde_norway::Error> {
-        serde_norway::from_str(text)
-    }
-
-    /// The member with this Slack id.
-    pub fn by_slack_id(&self, slack_id: &str) -> Option<&TeamMember> {
-        self.members.iter().find(|m| m.slack_id == slack_id)
-    }
-
-    /// The platform owners: members with the `admin` role.
-    pub fn admins(&self) -> impl Iterator<Item = &TeamMember> {
-        self.members.iter().filter(|m| m.is_admin())
-    }
-
-    /// The member with this PM OS handle.
-    pub fn by_handle(&self, handle: &str) -> Option<&TeamMember> {
-        self.members.iter().find(|m| m.handle == handle)
-    }
-
-    /// `<content_root>/team.yaml`. A missing file is an empty team; a file that doesn't parse
-    /// is an error, so a typo never silently opens or closes access.
-    pub fn load(content_root: &std::path::Path) -> Result<Self, String> {
-        let path = content_root.join("team.yaml");
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Self::from_yaml(&text).map_err(|e| format!("{}: {e}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(format!("{}: {e}", path.display())),
-        }
-    }
-}
-
 /// A plausible email address: one `@`, something either side, a dot in the domain, no
-/// spaces. Deliverability isn't checked; this catches typos in `team.yaml`.
+/// spaces. Deliverability isn't checked; this catches typos.
 pub fn valid_email(email: &str) -> bool {
     match email.split_once('@') {
         Some((local, domain)) => {
@@ -496,64 +394,6 @@ mod tests {
         assert_eq!(ModelRole::parse("reasoning"), Some(ModelRole::Reasoning));
         assert_eq!(ModelRole::parse("Reasoning"), None);
         assert_eq!(ModelRole::parse("large"), None);
-    }
-
-    fn member_yaml(roles: &str) -> String {
-        format!("members:\n  - handle: ana\n    slack-id: U0ANA\n    roles: {roles}\n")
-    }
-
-    #[test]
-    fn every_known_role_parses_and_round_trips() {
-        for name in Role::KNOWN {
-            let role = Role::parse(name).expect(name);
-            assert!(role.is_known());
-            assert_eq!(role.as_str(), name);
-            assert_eq!(serde_norway::to_string(&role).unwrap().trim(), name);
-            let strict: Role = serde_norway::from_str(name).unwrap();
-            assert_eq!(strict, role);
-        }
-    }
-
-    #[test]
-    fn team_yaml_reads_reviewer_and_auditor() {
-        let team = TeamFile::from_yaml(&member_yaml("[pm, reviewer]")).unwrap();
-        assert_eq!(team.members[0].roles, vec![Role::Pm, Role::Reviewer]);
-        let team = TeamFile::from_yaml(&member_yaml("[auditor]")).unwrap();
-        assert_eq!(team.members[0].roles, vec![Role::Auditor]);
-        assert!(!team.members[0].is_admin());
-    }
-
-    #[test]
-    fn team_yaml_tolerates_a_role_from_a_newer_build() {
-        // The rollout case: a newer team.yaml names a role this build doesn't know. The
-        // file still parses, the role grants nothing and keeps its name for a rewrite.
-        let team = TeamFile::from_yaml(&member_yaml("[pm, policy-steward]")).unwrap();
-        let roles = &team.members[0].roles;
-        assert_eq!(
-            roles,
-            &vec![Role::Pm, Role::Unknown("policy-steward".into())]
-        );
-        assert!(!roles[1].is_known());
-        assert_eq!(roles[1].as_str(), "policy-steward");
-        let yaml = serde_norway::to_string(&team).unwrap();
-        assert_eq!(TeamFile::from_yaml(&yaml).unwrap(), team);
-    }
-
-    #[test]
-    fn team_yaml_still_refuses_malformed_role_names() {
-        for bad in [
-            "[Admin]",
-            "[\"pm, admin\"]",
-            "[\"a b\"]",
-            "[\"-x\"]",
-            "[\"\"]",
-        ] {
-            assert!(TeamFile::from_yaml(&member_yaml(bad)).is_err(), "{bad}");
-        }
-        // Unknown fields are still refused.
-        let extra =
-            "members:\n  - handle: ana\n    slack-id: U0ANA\n    roles: [pm]\n    rank: 1\n";
-        assert!(TeamFile::from_yaml(extra).is_err());
     }
 
     #[test]

@@ -173,7 +173,7 @@ impl FakeConnector {
     }
 
     /// Slack, for the reply assistant (`docs/slack-reply-spec.md` §6). The PM is
-    /// [`SLACK_PM`] ([`SLACK_PM_ID`]); [`SLACK_TEAM`] lists the product team as `team.yaml`
+    /// [`SLACK_PM`] ([`SLACK_PM_ID`]); [`SLACK_TEAM`] lists the product team as a stack's seed
     /// would. Search finds each message that mentions the PM, and the original
     /// `#field-questions` thread; `read_thread` returns a whole thread for its ts or any
     /// reply's; the audience check sees four conversations:
@@ -267,7 +267,7 @@ impl FakeConnector {
 pub const SLACK_PM: &str = "evals";
 /// [`SLACK_PM`]'s Slack member id. Fixture messages mention it as `<@U0EVALS>`.
 pub const SLACK_PM_ID: &str = "U0EVALS";
-/// The product team in the Slack fixtures, `(handle, Slack id)`, as `team.yaml` would list
+/// The product team in the Slack fixtures, `(handle, Slack id)`, as the eval stack's seed lists
 /// them. U0SE (a sales engineer) and W0GLOBEX1 (at Globex, over Slack Connect) are not on it.
 pub const SLACK_TEAM: [(&str, &str); 3] = [("evals", "U0EVALS"), ("ben", "U0BEN"), ("cy", "U0CY")];
 /// #pm-team: only the product team.

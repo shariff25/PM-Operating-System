@@ -8,7 +8,7 @@ plan is `docs/web-client.md`.
 ```
 browser ──HTTPS──► reverse proxy ──► pmos-web :8770 ──► pmos-bots :8750        (client "web")
                                                    └──► pmos-toolserver :8710  (approvals, users)
-                                                   └──► content/team.yaml      (Team page list only)
+                                                   └──► content/               (the admin content and policy screens)
 ```
 
 **Not ready for production.** See [Not ready for production](#not-ready-for-production). It is

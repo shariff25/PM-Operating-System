@@ -194,10 +194,10 @@ for bad in "Bad User" "ROOT" "x;y"; do
   [ ! -s "$DOCKER_LOG" ] || fail "users with the OS user '$bad' called docker"
 done
 # import: the named file, mounted read-only; the other arguments passed through.
-printf 'members: []\n' >"$WORK/team.yaml"
+printf 'members: []\n' >"$WORK/old-members.yaml"
 : >"$DOCKER_LOG"
-run_stack users import --commit abc1234 --from "$WORK/team.yaml" --bootstrap --apply </dev/null >/dev/null
-grep -qF -- "-v $WORK/team.yaml:/run/pmos-import/team.yaml:ro toolserver pmos-toolserver users import --commit abc1234 --bootstrap --apply --from /run/pmos-import/team.yaml" "$DOCKER_LOG" ||
+run_stack users import --commit abc1234 --from "$WORK/old-members.yaml" --bootstrap --apply </dev/null >/dev/null
+grep -qF -- "-v $WORK/old-members.yaml:/run/pmos-import/members.yaml:ro toolserver pmos-toolserver users import --commit abc1234 --bootstrap --apply --from /run/pmos-import/members.yaml" "$DOCKER_LOG" ||
   fail "users import didn't mount the file read-only: $(cat "$DOCKER_LOG")"
 # The tenant for --oid comes from the web app's Entra settings.
 stack_env require PMOS_WEB_ENTRA_TENANT_ID=11111111-2222-3333-4444-555555555555

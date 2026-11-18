@@ -77,8 +77,8 @@ async fn main() -> Result<()> {
     // The user database (docs/user-database-spec.md): since slice U3 the tool server decides
     // from it who may use PM OS. In development the in-memory store is seeded (config.rs
     // refuses a seed with a database or live connectors); with no seed and no database
-    // nobody may use PM OS. The runtime, Slack, pmos-web and the console still read
-    // team.yaml until slices U4a-d, so the stacks keep both equal.
+    // nobody may use PM OS. Since slice U7 no service reads a team file: the runtime, Slack,
+    // pmos-web and the console ask this server's directory.
     let rules = pmos_toolserver::users::Rules {
         evals_slack_allowed: config.database_url.is_none()
             && matches!(config.connectors, Connectors::Fake),

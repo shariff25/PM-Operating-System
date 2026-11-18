@@ -810,7 +810,10 @@ mod tests {
 
     #[test]
     fn paths_are_encoded() {
-        assert_eq!(encode_path("content/team.yaml"), "content/team.yaml");
+        assert_eq!(
+            encode_path("content/bots/pm-ana/BOT.md"),
+            "content/bots/pm-ana/BOT.md"
+        );
         assert_eq!(encode_path("a b?#"), "a%20b%3F%23");
     }
 
