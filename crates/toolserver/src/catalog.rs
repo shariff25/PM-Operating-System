@@ -133,7 +133,7 @@ pub fn content_head(content_root: &Path) -> Option<String> {
 
 impl Catalog {
     pub fn load(content_root: &Path, today: NaiveDate) -> Result<Self, CatalogError> {
-        let report = lint(content_root, &LintOptions::new(today));
+        let report = lint(content_root, &LintOptions::for_service(today));
         if report.has_errors() {
             let lines: Vec<String> = report
                 .errors()

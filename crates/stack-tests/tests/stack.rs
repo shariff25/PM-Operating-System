@@ -8,6 +8,11 @@
 //! refusal: another PM gets `404` for that draft, reading or deciding it. And slice U4c:
 //! `pmos-web` signs people in from the tool server's real user database (`resolve`), so a
 //! deactivation there ends a web session within 10 seconds.
+//!
+//! And slice U7's proof (`docs/user-database-spec.md` §12, "Proving no service decides from the
+//! file"): the console and the Slack service's directory join the stack, a hostile `team.yaml`
+//! is planted wherever a service could read one, and every service decides as before; then the
+//! same with no `team.yaml` at all. The source half of the proof is `tests/no_team_file.rs`.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -26,6 +31,13 @@ use tokio_util::sync::CancellationToken;
 
 // Test tokens and keys only: fixed values, never used anywhere real.
 const SERVICE_TOKEN: &str = "stack-service-token-0123456789abcdef01";
+const TS_BOT_TOKEN: &str = "stack-ts-bot-token-0123456789abcdef012";
+const TS_CONSOLE_TOKEN: &str = "stack-ts-console-token-0123456789abcdef";
+const RT_SLACK_TOKEN: &str = "stack-rt-slack-token-0123456789abcdef01";
+const RT_CONSOLE_TOKEN: &str = "stack-rt-console-token-0123456789abcde";
+const PROXY_SECRET: &str = "stack-proxy-secret-0123456789abcdef012";
+const CONSOLE_BOTS_KEY: &str = "Y29uc29sZS1ib3RzLXRlc3Qta2V5LTAxMjM0NTY3ODk=";
+const CONSOLE_TOOLS_KEY: &str = "Y29uc29sZS10b29scy10ZXN0LWtleS0wMTIzNDU2Nzg=";
 const TS_WEB_TOKEN: &str = "stack-ts-web-token-0123456789abcdef012";
 const RT_WEB_TOKEN: &str = "stack-rt-web-token-0123456789abcdef012";
 const RT_WORKER_TOKEN: &str = "stack-rt-worker-token-0123456789abcdef";
@@ -33,11 +45,16 @@ const GATEWAY_TOKEN: &str = "stack-gateway-token-0123456789abcdef01";
 const WEB_BOTS_KEY: &str = "d2ViLWJvdHMtdGVzdC1rZXktMDEyMzQ1Njc4OWFiY2Q=";
 const WEB_TOOLS_KEY: &str = "d2ViLXRvb2xzZXJ2ZXItdGVzdC1rZXktMDEyMzQ1Njc=";
 
-const TEAM: &str = "members:
-  - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm]}
-  - {handle: ben, slack-id: U0BEN, email: ben@example.com, roles: [pm]}
+/// A hostile `team.yaml` (slice U7's proof): `mallory` as an admin with Ana's Slack id and
+/// address, Ana and Ben made admins and auditors, and a stranger with a Slack id. The user
+/// database says none of it, so none of it may count anywhere.
+const HOSTILE_TEAM: &str = "members:
+  - {handle: mallory, slack-id: U0ANA, email: ana@example.com, roles: [pm, admin]}
+  - {handle: ana, slack-id: U0MALLORY, email: mallory@example.com, roles: [pm, admin, auditor]}
+  - {handle: ben, slack-id: U0BEN, email: ben@example.com, roles: [admin, reviewer]}
+  - {handle: eve, slack-id: U0EVE, email: eve@example.com, roles: [pm, admin]}
 ";
-/// The user database's seed: the same two PMs, and the admin every user database has.
+/// The user database's seed: two PMs, and the admin every user database has.
 const USERS: &str = "members:
   - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm]}
   - {handle: ben, slack-id: U0BEN, email: ben@example.com, roles: [pm]}
@@ -57,8 +74,21 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// The repo's content, with Ana's personal bot and a team of Ana and Ben.
-fn content() -> (tempfile::TempDir, std::path::PathBuf) {
+/// Where a service could find a `team.yaml`, relative to the stack's checkout: the content
+/// root every service is given (`PMOS_CONTENT_ROOT`), the checkout around it, and the folders
+/// the lint and the runtime's reloader walk.
+const TEAM_FILE_PLACES: [&str; 6] = [
+    "content/team.yaml",
+    "team.yaml",
+    "content/bots/team.yaml",
+    "content/bots/pm-ana/team.yaml",
+    "content/master/team.yaml",
+    "content/roles/team.yaml",
+];
+
+/// The repo's content, with Ana's personal bot; with `hostile`, [`HOSTILE_TEAM`] in every one
+/// of [`TEAM_FILE_PLACES`].
+fn content(hostile: bool) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("content");
     copy_dir(
@@ -71,7 +101,15 @@ fn content() -> (tempfile::TempDir, std::path::PathBuf) {
         "---\nname: pm-ana\nrole: pm-assistant\nscope: personal\nowner: \"@ana\"\ndescription: Ana's assistant.\n---\n\n# Ana's assistant\n\nHelp Ana.\n",
     )
     .unwrap();
-    std::fs::write(root.join("team.yaml"), TEAM).unwrap();
+    for place in TEAM_FILE_PLACES {
+        let path = dir.path().join(place);
+        if hostile {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, HOSTILE_TEAM).unwrap();
+        } else {
+            assert!(!path.exists(), "{place}");
+        }
+    }
     (dir, root)
 }
 
@@ -95,6 +133,11 @@ fn ring(id: &str, key: &str) -> KeyRing {
 struct Stack {
     web: String,
     runtime: String,
+    /// The console, behind a stand-in sign-in proxy (`X-Forwarded-User`).
+    console: String,
+    /// The Slack service's view of who people are: the tool server's directory, read with
+    /// the Slack bot's token, as `pmos-slack` reads it.
+    slack_people: pmos_slack::people::People,
     svc: Arc<ToolService>,
     slack: Arc<FakeConnector>,
     http: reqwest::Client,
@@ -103,6 +146,7 @@ struct Stack {
     web_clock: Arc<Mutex<DateTime<Utc>>>,
     /// The tool server's user database.
     users: Arc<dyn pmos_toolserver::users::UserStore>,
+    root: std::path::PathBuf,
     _content: tempfile::TempDir,
 }
 
@@ -113,8 +157,12 @@ impl Drop for Stack {
 }
 
 async fn start() -> Stack {
+    start_with(false).await
+}
+
+async fn start_with(hostile: bool) -> Stack {
     let cancel = CancellationToken::new();
-    let (dir, root) = content();
+    let (dir, root) = content(hostile);
 
     // The tool server: memory stores, fake connectors, `require` for pmos-web. Its user
     // database is seeded as a dev stack's is (PMOS_USERS_SEED): the tool server and the
@@ -147,9 +195,9 @@ async fn start() -> Stack {
     ];
     let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
     let ts_keys = pmos_toolserver::assertion::parse_keys(
-        &format!("web:toolserver:wt1:{WEB_TOOLS_KEY}"),
+        &format!("web:toolserver:wt1:{WEB_TOOLS_KEY},console:toolserver:ct1:{CONSOLE_TOOLS_KEY}"),
         "the tool server",
-        |iss, aud| aud == "toolserver" && iss == "web",
+        |iss, aud| aud == "toolserver" && (iss == "web" || iss == "console"),
     )
     .unwrap();
     let toolserver = serve(
@@ -157,8 +205,11 @@ async fn start() -> Stack {
             svc.clone(),
             AppConfig {
                 service_token: SERVICE_TOKEN.into(),
-                bot: None,
-                console_token: None,
+                bot: Some(pmos_toolserver::app::BotAccess {
+                    token: TS_BOT_TOKEN.into(),
+                    skills: vec!["docs".into()],
+                }),
+                console_token: Some(TS_CONSOLE_TOKEN.into()),
                 content_root: root.clone(),
                 oauth: None,
                 allowed_hosts: vec!["127.0.0.1".into(), "localhost".into()],
@@ -182,9 +233,9 @@ async fn start() -> Stack {
 
     // The bot runtime: memory store, `require` for the web client.
     let rt_keys = pmos_bots::assertion::parse_keys(
-        &format!("web:bots:wb1:{WEB_BOTS_KEY}"),
+        &format!("web:bots:wb1:{WEB_BOTS_KEY},console:bots:cb1:{CONSOLE_BOTS_KEY}"),
         "the bot runtime",
-        |iss, aud| aud == "bots" && iss == "web",
+        |iss, aud| aud == "bots" && (iss == "web" || iss == "console"),
     )
     .unwrap();
     // Who may ask: the tool server's directory, with the orchestrator token, as in deploy.
@@ -209,7 +260,7 @@ async fn start() -> Stack {
         pmos_bots::router_with(
             rt,
             pmos_bots::config::parse_clients(&format!(
-                "web={RT_WEB_TOKEN},worker={RT_WORKER_TOKEN}"
+                "web={RT_WEB_TOKEN},worker={RT_WORKER_TOKEN},slack={RT_SLACK_TOKEN},console={RT_CONSOLE_TOKEN}"
             ))
             .unwrap(),
             Vec::new(),
@@ -254,9 +305,40 @@ async fn start() -> Stack {
     };
     let web = serve(pmos_web::build(config, deps).unwrap(), &cancel).await;
 
+    // The console, as deployed behind a sign-in proxy, signing for the runtime and the tool
+    // server. Its content root is the hostile one too: it reads no content at all (U4d).
+    let root_text = root.display().to_string();
+    let console_config = pmos_console::Config::from_lookup(|k| match k {
+        "PMOS_BOTS_TOKEN" => Some(RT_CONSOLE_TOKEN.to_string()),
+        "PMOS_TOOLSERVER_TOKEN" => Some(TS_CONSOLE_TOKEN.to_string()),
+        "PMOS_CONSOLE_TRUST_PROXY" => Some("1".into()),
+        "PMOS_CONSOLE_PROXY_SECRET" => Some(PROXY_SECRET.into()),
+        "PMOS_ASSERTION_KEYS" => Some(format!(
+            "console:bots:cb1:{CONSOLE_BOTS_KEY},console:toolserver:ct1:{CONSOLE_TOOLS_KEY}"
+        )),
+        "PMOS_CONTENT_ROOT" => Some(root_text.clone()),
+        "PMOS_BOTS_URL" => Some(runtime.clone()),
+        "PMOS_TOOLSERVER_URL" => Some(toolserver.clone()),
+        _ => None,
+    })
+    .unwrap();
+    let console = serve(pmos_console::router(console_config), &cancel).await;
+
+    // The Slack service's directory: the tool server's, with the Slack bot's token.
+    let slack_people = pmos_slack::people::People::new(Arc::new(
+        pmos_bots::people::SnapshotClient::http(&toolserver, TS_BOT_TOKEN),
+    ));
+    slack_people
+        .client()
+        .refresh()
+        .await
+        .expect("the tool server's directory answers the Slack bot");
+
     Stack {
         web,
         runtime,
+        console,
+        slack_people,
         svc,
         slack,
         http: reqwest::Client::builder()
@@ -266,6 +348,7 @@ async fn start() -> Stack {
         cancel,
         web_clock,
         users,
+        root,
         _content: dir,
     }
 }
@@ -725,4 +808,223 @@ async fn a_reviewer_recommends_through_pmos_web_and_the_owner_sees_it() {
         (StatusCode::CONFLICT, Some("draft_changed"))
     );
     assert!(s.slack.writes().is_empty());
+}
+
+impl Stack {
+    /// A console page for `user`, as the sign-in proxy names them.
+    async fn console_get(&self, user: &str, path: &str) -> (StatusCode, String) {
+        let res = self
+            .http
+            .get(format!("{}{path}", self.console))
+            .header("x-pmos-proxy-secret", PROXY_SECRET)
+            .header("x-forwarded-user", user)
+            .send()
+            .await
+            .unwrap();
+        let status = res.status();
+        (status, res.text().await.unwrap())
+    }
+
+    /// An ask through the runtime's Slack client, as the Slack service sends one for `who`.
+    async fn slack_ask(&self, who: &str) -> (StatusCode, Value) {
+        let res = self
+            .http
+            .post(format!("{}/v1/tasks", self.runtime))
+            .bearer_auth(RT_SLACK_TOKEN)
+            .header("x-pmos-user", who)
+            .json(
+                &json!({"bot": "docs", "requested_by": who, "text": "What does the docs site say?",
+                           "source": "slack", "slack": {"channel": "C0PROOF", "thread_ts": "0.0"}}),
+            )
+            .send()
+            .await
+            .unwrap();
+        let status = res.status();
+        (status, res.json().await.unwrap_or(Value::Null))
+    }
+
+    /// Every decision slice U7's proof checks, the same with a hostile `team.yaml` or none.
+    async fn decisions_from_the_user_database_only(&self) {
+        use pmos_slack::people::{AdminCheck, Identity};
+
+        // Sign-in (pmos-web): Mallory and Eve, only in the file, never sign in; Ana does, as
+        // the PM the database says, not the admin and auditor the file says.
+        for who in ["mallory", "eve"] {
+            let (status, body, _) = self
+                .send(
+                    None,
+                    Method::POST,
+                    "/api/auth/dev-login",
+                    Some(json!({ "handle": who })),
+                )
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{who}: {body}");
+        }
+        let ana = self.login("ana").await;
+        let (_, me, _) = self.send(Some(&ana), Method::GET, "/api/me", None).await;
+        assert_eq!(me["roles"], json!(["pm"]), "{me}");
+        assert_eq!(me["reviewer"], false, "{me}");
+
+        // Ana asks her own bot from the web app; the stand-in worker drafts a Slack reply.
+        let (status, task, _) = self
+            .send(
+                Some(&ana),
+                Method::POST,
+                "/api/tasks",
+                Some(json!({"text": "Answer Ben in #launch about SSO"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{task}");
+        let task_path = format!("/tasks/{}", task["id"].as_str().unwrap());
+        let approval = self.work().await;
+
+        // An admin read: refused to Ana and Ben (admins only in the file), served to the
+        // database's admin.
+        for (who, browser) in [("ana", &ana), ("ben", &self.login("ben").await)] {
+            for path in ["/api/admin/users", "/api/admin/overview"] {
+                let (status, body, _) = self.send(Some(browser), Method::GET, path, None).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{who} {path}: {body}");
+            }
+        }
+        let admin = self.login("stack-admin").await;
+        let (status, list, _) = self
+            .send(Some(&admin), Method::GET, "/api/admin/users", None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let handles: Vec<&str> = list["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|u| u["handle"].as_str())
+            .collect();
+        assert_eq!(handles, ["ana", "ben", "stack-admin"], "{list}");
+
+        // The tool server's own view.
+        let people = self.svc.people();
+        assert!(people.user("mallory").await.unwrap().is_none());
+        assert!(people.user("eve").await.unwrap().is_none());
+        for who in ["ana", "ben", "mallory"] {
+            assert!(!people.is_admin(who).await.unwrap(), "{who}");
+        }
+        assert!(people.is_admin("stack-admin").await.unwrap());
+
+        // A bot ask (the runtime): Mallory and Eve are refused; Ana is not.
+        for who in ["mallory", "eve"] {
+            let (status, body) = self.slack_ask(who).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{who}: {body}");
+        }
+        let (status, asked) = self.slack_ask("ana").await;
+        assert_eq!(status, StatusCode::CREATED, "{asked}");
+
+        // Slack: Ana's Slack id is Ana, a PM and no admin; the file's Slack ids are nobody.
+        match self.slack_people.identify("U0ANA") {
+            Identity::Member(m) => assert_eq!((m.handle.as_str(), m.admin), ("ana", false)),
+            other => panic!("U0ANA is {other:?}"),
+        }
+        assert_eq!(self.slack_people.admin("U0ANA"), AdminCheck::No);
+        assert_eq!(self.slack_people.admin("U0BEN"), AdminCheck::No);
+        for id in ["U0MALLORY", "U0EVE"] {
+            assert_eq!(self.slack_people.identify(id), Identity::Stranger, "{id}");
+        }
+        assert_eq!(self.slack_people.of_handle("mallory"), Identity::Stranger);
+        assert!(matches!(
+            self.slack_people.admin("U0STACKADM"),
+            AdminCheck::Admin(_)
+        ));
+        // The Slack App Home's skills catalog loads the content the same.
+        let today = Utc::now().date_naive();
+        let report =
+            pmos_contract::lint(&self.root, &pmos_contract::LintOptions::for_service(today));
+        assert!(!report.has_errors(), "{:#?}", report.diagnostics);
+        assert_eq!(report.skills.len(), 40);
+
+        // A console item read: Ana reads her task; Mallory (by handle, or by the address the
+        // file gives her) and Eve read nothing; Ben's console isn't an admin's.
+        for who in ["mallory", "ana@example.com", "eve", "eve@example.com"] {
+            let (status, body) = self.console_get(who, &task_path).await;
+            let expected = if who == "ana@example.com" {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            assert_eq!(status, expected, "{who}: {body}");
+        }
+        let (status, _) = self.console_get("mallory@example.com", "/bots").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, body) = self.console_get("ana", "/bots").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains("· admin"),
+            "the file can't make Ana an admin"
+        );
+        assert_eq!(
+            self.console_get("ben", &task_path).await.0,
+            StatusCode::NOT_FOUND
+        );
+        let (status, body) = self.console_get("stack-admin", "/bots").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("stack-admin · admin"),
+            "the database's admin is"
+        );
+
+        // An approval decision (the tool server): Mallory's is refused and nothing moves;
+        // Ana's own goes through.
+        let refused = self
+            .svc
+            .decide(
+                &approval,
+                "mallory",
+                pmos_toolserver::approvals::Decision::Approve,
+                None,
+                Utc::now(),
+            )
+            .await;
+        assert!(refused.is_err(), "{refused:?}");
+        let item = self.svc.approval(&approval).await.unwrap().unwrap();
+        assert_eq!(item.status.as_str(), "pending");
+        assert!(self.slack.writes().is_empty());
+        let (status, body, _) = self
+            .send(
+                Some(&ana),
+                Method::POST,
+                &format!("/api/drafts/{approval}/approve"),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(self.slack.writes()[0].user, "ana");
+    }
+}
+
+/// Slice U7's proof, part 1: a hostile `team.yaml` in every place a service could read one
+/// ([`TEAM_FILE_PLACES`]) changes no decision in any service: sign-in, an admin read, a bot ask,
+/// Slack's identities and admins, a console item read, an approval decision. Every service
+/// starts with it (it is at most a lint warning to them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hostile_team_yaml_decides_nothing_in_any_service() {
+    let s = start_with(true).await;
+    for place in TEAM_FILE_PLACES {
+        let path = s._content.path().join(place);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            HOSTILE_TEAM,
+            "{place}"
+        );
+    }
+    s.decisions_from_the_user_database_only().await;
+}
+
+/// Slice U7's proof, part 2: the same services start with no `team.yaml` anywhere, and decide
+/// the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_services_start_and_decide_with_no_team_yaml() {
+    let s = start().await;
+    let found: Vec<_> = walkdir::WalkDir::new(s._content.path())
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name() == "team.yaml")
+        .collect();
+    assert!(found.is_empty(), "{found:?}");
+    s.decisions_from_the_user_database_only().await;
 }

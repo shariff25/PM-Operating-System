@@ -571,7 +571,7 @@ impl ToolService {
     ) -> Result<ReindexReport, ReindexError> {
         let report = pmos_contract::lint(
             content_root,
-            &pmos_contract::LintOptions::new(now.date_naive()),
+            &pmos_contract::LintOptions::for_service(now.date_naive()),
         );
         if report.has_errors() {
             let lines: Vec<String> = report
@@ -1950,8 +1950,8 @@ impl ToolService {
     }
 
     /// Decide an inbox item as `decided_by`, for `client` (the orchestrator, or the Slack bot
-    /// from an approval card), which the audit log records. `decided_by` must be in
-    /// `team.yaml` when it is enforced, and must be the item's own user. Approve and edit run
+    /// from an approval card), which the audit log records. `decided_by` must be an active
+    /// PM OS user, and must be the item's own user. Approve and edit run
     /// the write as the item's user; edited arguments are checked like any call's, and the
     /// item's skill must still declare the tool (or its bot's role still have it, not set to
     /// `never`). A reason may come only with `reject`; the ledger and the audit event keep it.
@@ -2169,7 +2169,7 @@ impl ToolService {
     /// Save `user`'s edit of their pending item `id` (`PUT /internal/approvals/{id}/draft`,
     /// the web app's **Save**): `args` replace the item's arguments, so the Slack card, the
     /// console and the web app all show them and an approve anywhere writes them. The same
-    /// rules as an edit decision: only the item's own user (in `team.yaml` when enforced),
+    /// rules as an edit decision: only the item's own user (an active PM OS user),
     /// only while pending (a Slack draft past its time expires now), arguments checked against
     /// the tool's schema, and from any client but the orchestrator no change to where the write
     /// goes (`target_changed`, audited). Source markers may stay in the text: they are removed

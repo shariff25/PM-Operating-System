@@ -26,7 +26,7 @@
 #   pmos-admin pause <bot> / resume <bot>
 #                                     stop or restart a bot's sandbox
 #   pmos-admin lint                   pmos lint and pmos policy check on the content checkout
-#   pmos-admin pmos <args>            the pmos CLI on the checkout, e.g. `pmos member add …`
+#   pmos-admin pmos <args>            the pmos CLI on the checkout, e.g. `pmos bot add-personal …`
 #                                     (paths are relative to the checkout: --root content)
 #   pmos-admin evals <args>           pmos-evals against the live stack (the load test)
 #   pmos-admin evals-run --category <c> [--checkout <dir>] [--note <why>]
@@ -195,25 +195,26 @@ eval_stack_up() { # checkout
   fi
   EVAL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pmos-evals.XXXXXX")
   chmod 755 "$EVAL_DIR"
-  # The checkout's content, plus the members the fake fixtures expect: `evals` (U0EVALS), whom
-  # the benchmark tasks are requested by, with their personal bot pm-evals, and their teammates
-  # ben (U0BEN) and cy (U0CY), so the fake channels' audiences mean what the tasks say
-  # (crates/toolserver/src/connectors/fake.rs), and `eval-admin` (U0EVALADM, in no fake
-  # channel): the user database always needs an active admin. The tool server seeds its user
-  # database from this same team.yaml (PMOS_USERS_SEED, compose.evals.yaml), so the services
-  # that still read the file (until slice U7) and the tool server agree. Only this copy is
-  # changed.
+  # The checkout's content, plus the people the fake fixtures expect: `evals` (U0EVALS), whom
+  # the benchmark tasks are requested by, and their teammates ben (U0BEN) and cy (U0CY), so
+  # the fake channels' audiences mean what the tasks say (crates/toolserver/src/connectors/fake.rs),
+  # and `eval-admin` (U0EVALADM, in no fake channel): the user database always needs an active
+  # admin. They are the tool server's seed (PMOS_USERS_SEED, compose.evals.yaml), a file beside
+  # the content, never in it; each gets a personal bot in this copy of the content (pm-evals is
+  # the one the tasks use). Only this copy is changed.
   # -P: a symbolic link in the checkout is copied as a link, never followed on this machine.
   cp -RP "$checkout/content" "$EVAL_DIR/content"
   mkdir -p "$EVAL_DIR/baseline" "$EVAL_DIR/out"
   local who
+  printf 'members:\n' >"$EVAL_DIR/users.seed.yaml"
   for who in evals:U0EVALS:pm ben:U0BEN:pm cy:U0CY:pm eval-admin:U0EVALADM:pm,admin; do
     local handle=${who%%:*} rest=${who#*:}
+    printf '  - {handle: %s, slack-id: %s, roles: [%s]}\n' "$handle" "${rest%%:*}" "${rest#*:}" >>"$EVAL_DIR/users.seed.yaml"
     docker run --rm --user "${PMOS_UID:-10001}:${PMOS_GID:-10001}" -v "$EVAL_DIR/content:/srv/content" \
-      "pmos:${PMOS_VERSION:-local}" pmos member add --root /srv/content --handle "$handle" \
-      --slack-id "${rest%%:*}" --roles "${rest#*:}" >/dev/null
+      "pmos:${PMOS_VERSION:-local}" pmos bot add-personal --root /srv/content --handle "$handle" >/dev/null
   done
   chown -R "${PMOS_UID:-10001}:${PMOS_GID:-10001}" "$EVAL_DIR" 2>/dev/null || true
+  export PMOS_EVAL_USERS_SEED="$EVAL_DIR/users.seed.yaml"
   export PMOS_EVAL_CONTENT="$EVAL_DIR/content" PMOS_EVAL_CHECKOUT="$checkout" PMOS_EVAL_BASELINE="$EVAL_DIR/baseline" PMOS_EVAL_OUT="$EVAL_DIR/out"
   for v in SERVICE_TOKEN BOT_TOKEN RT_EVALS RT_CONSOLE RT_DOCS RT_PERSONAL; do
     export "PMOS_EVAL_$v=$(openssl rand -hex 24)"
@@ -406,8 +407,9 @@ case "$cmd" in
     # A terminal only when there is one (`import --allow-admins` asks on it; `export > f` has none).
     if ! [ -t 0 ] || ! [ -t 1 ]; then run+=(-T); fi
     if [ "$1" = import ]; then
-      # The file the operator names, normally the content checkout at a reviewed commit, is
-      # mounted read-only into the one-off container; never a URL.
+      # The file the operator names (an old team.yaml, normally read from the content checkout
+      # at a reviewed commit before the pull request that deletes it) is mounted read-only into
+      # the one-off container under a neutral name; never a URL.
       shift
       from=""
       args=(import)
@@ -417,12 +419,12 @@ case "$cmd" in
           *) args+=("$1"); shift ;;
         esac
       done
-      [ -n "$from" ] || { say "usage: pmos-admin users import --from <team.yaml> [--commit <sha>] [--allow-admins | --bootstrap] [--apply]" >&2; exit 2; }
+      [ -n "$from" ] || { say "usage: pmos-admin users import --from <file> [--commit <sha>] [--allow-admins | --bootstrap] [--apply]" >&2; exit 2; }
       [ -f "$from" ] || { say "no file $from" >&2; exit 2; }
       from="$(cd "$(dirname "$from")" && pwd)/$(basename "$from")"
       case "$from" in *:*) say "the path to import can't contain ':'" >&2; exit 2 ;; esac
-      run+=(-v "$from:/run/pmos-import/team.yaml:ro")
-      args+=(--from /run/pmos-import/team.yaml)
+      run+=(-v "$from:/run/pmos-import/members.yaml:ro")
+      args+=(--from /run/pmos-import/members.yaml)
     else
       args=("$@")
     fi
@@ -622,7 +624,7 @@ for g in s["groups"]:
 
   smoke)
     # One Docs-bot question through the whole stack, as the Slack bot would send it.
-    [ $# -eq 1 ] || { say "usage: pmos-admin smoke <handle in team.yaml>" >&2; exit 2; }
+    [ $# -eq 1 ] || { say "usage: pmos-admin smoke <handle of an active user>" >&2; exit 2; }
     auth=(-H "Authorization: Bearer $PMOS_RT_SLACK_TOKEN" -H "X-Pmos-User: $1")
     body=$(printf '{"bot":"docs","requested_by":"%s","text":"What does the docs site say about getting started?","source":"slack","slack":{"channel":"smoke","thread_ts":"0.0"}}' "$1")
     task=$(curl -sS --noproxy '*' -X POST http://127.0.0.1:8750/v1/tasks "${auth[@]}" -H 'content-type: application/json' -d "$body")

@@ -489,15 +489,16 @@ async fn a_hostile_team_yaml_decides_nothing() {
 }
 
 /// No decision path in the runtime reads the team file: its parser and lookups are gone from
-/// the runtime's code. The one mention left is the reloader's watch list, because the lint
-/// (in `pmos-contract`) still checks bot owners against it until U7.
+/// the runtime's code, and since slice U7 its code doesn't name the file at all (the reloader
+/// no longer watches it). The workspace-wide scan is `crates/stack-tests/tests/no_team_file.rs`.
 #[test]
 fn the_runtime_reads_no_team_file() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut mentions = Vec::new();
+    let mut files = 0;
     for entry in std::fs::read_dir(&src).unwrap() {
         let path = entry.unwrap().path();
         let text = std::fs::read_to_string(&path).unwrap();
+        files += 1;
         for (n, line) in text.lines().enumerate() {
             let code = line.split("//").next().unwrap_or_default();
             for banned in [
@@ -506,6 +507,7 @@ fn the_runtime_reads_no_team_file() {
                 "by_handle(",
                 "team::",
                 "load_team",
+                "team.yaml",
             ] {
                 assert!(
                     !code.contains(banned),
@@ -514,16 +516,9 @@ fn the_runtime_reads_no_team_file() {
                     n + 1
                 );
             }
-            if code.contains("team.yaml") {
-                mentions.push(format!("{}: {}", path.display(), line.trim()));
-            }
         }
     }
-    assert_eq!(mentions.len(), 1, "{mentions:#?}");
-    assert!(
-        mentions[0].contains("catalog.rs: const WATCHED"),
-        "{mentions:#?}"
-    );
+    assert!(files > 10, "read the runtime's sources ({files} files)");
 }
 
 both_envs!(

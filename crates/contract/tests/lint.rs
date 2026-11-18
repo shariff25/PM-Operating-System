@@ -514,131 +514,60 @@ fn repo_content_passes() {
     );
 }
 
+/// Slice U7: `team.yaml` is retired. One anywhere in the content tree is an error for
+/// `pmos lint` (and CI), pointing to the import; a service loading content gets the same
+/// finding as a warning, so a leftover file never stops it. The file isn't read: one that
+/// doesn't parse gets the same single finding, and nothing else in the report changes.
 #[test]
-fn team_file_rules() {
+fn a_team_file_is_retired() {
     let dir = valid_tree();
+    let clean = run(&dir);
     write(
         dir.path(),
         "team.yaml",
-        "members:\n  - {handle: ana, slack-id: U0ANA1, roles: [pm, skill-author]}\n  - {handle: Ana, slack-id: U0ANA1, roles: []}\n  - {handle: bo, slack-id: x123, roles: [admin]}\n  - {handle: bo, slack-id: U0BO, roles: [pm]}\n  - {handle: dee, slack-id: U0DEE, email: not-an-email, roles: [pm]}\n",
-    );
-    std::fs::create_dir_all(dir.path().join("master/people/cy")).unwrap();
-    let report = run(&dir);
-    for code in [
-        "team-handle",
-        "team-duplicate",
-        "team-slack-id",
-        "team-roles",
-        "team-email",
-    ] {
-        assert_code(&report, code, Severity::Error);
-    }
-    assert_code(&report, "people-unknown", Severity::Warning);
-    // Both duplicate kinds are reported: the Slack id and the handle.
-    assert_eq!(
-        report
-            .codes()
-            .iter()
-            .filter(|c| **c == "team-duplicate")
-            .count(),
-        2
-    );
-}
-
-#[test]
-fn team_emails_are_unique_ignoring_case() {
-    let dir = valid_tree();
-    write(
-        dir.path(),
-        "team.yaml",
-        "members:\n  - {handle: ana, slack-id: U0ANA1, email: ana@example.com, roles: [pm]}\n  - {handle: bo, slack-id: U0BO, email: ANA@Example.com, roles: [pm]}\n  - {handle: cy, slack-id: U0CY, roles: [pm]}\n  - {handle: dee, slack-id: U0DEE, roles: [pm]}\n",
+        "members:\n  - {handle: mallory, slack-id: U0ANA, email: ana@example.com, roles: [pm, admin]}\n",
     );
     let report = run(&dir);
-    assert_code(&report, "team-duplicate", Severity::Error);
-    assert_eq!(
-        report
-            .codes()
-            .iter()
-            .filter(|c| **c == "team-duplicate")
-            .count(),
-        1
-    );
-}
-
-#[test]
-fn team_entra_object_ids_are_guids_and_unique() {
-    let dir = valid_tree();
-    write(
-        dir.path(),
-        "team.yaml",
-        "members:\n  - {handle: ana, slack-id: U0ANA1, entra-oid: 00000000-0000-0000-0000-0000000000a1, roles: [pm]}\n  - {handle: bo, slack-id: U0BO, entra-oid: 00000000-0000-0000-0000-0000000000A1, roles: [pm]}\n  - {handle: cy, slack-id: U0CY, entra-oid: not-a-guid, roles: [pm]}\n  - {handle: dee, slack-id: U0DEE, roles: [pm]}\n",
-    );
-    let report = run(&dir);
-    assert_code(&report, "team-duplicate", Severity::Error);
-    assert_code(&report, "team-entra-oid", Severity::Error);
-    let team = pmos_contract::model::TeamFile::from_yaml(
-        "members:\n  - {handle: ana, slack-id: U0ANA1, entra-oid: 00000000-0000-0000-0000-0000000000a1, roles: [pm]}\n",
-    )
-    .unwrap();
-    assert_eq!(
-        team.members[0].entra_oid.as_deref(),
-        Some("00000000-0000-0000-0000-0000000000a1")
-    );
-}
-
-#[test]
-fn team_file_parses_and_looks_up_by_slack_id() {
-    let team = pmos_contract::model::TeamFile::from_yaml(
-        "members:\n  - {handle: ana, slack-id: U0ANA1, roles: [pm]}\n",
-    )
-    .unwrap();
-    assert_eq!(team.by_slack_id("U0ANA1").unwrap().handle, "ana");
-    assert!(team.by_slack_id("U0BO").is_none());
-    assert_eq!(team.by_handle("ana").unwrap().slack_id, "U0ANA1");
-    assert!(team.by_handle("ana").unwrap().email.is_none());
-    // A malformed role name is still a parse error.
-    assert!(pmos_contract::model::TeamFile::from_yaml(
-        "members:\n  - {handle: a, slack-id: U1, roles: [Owner]}\n"
-    )
-    .is_err());
-    let dir = valid_tree();
-    write(dir.path(), "team.yaml", "members: [\n");
-    assert_code(&run(&dir), "team-parse", Severity::Error);
-}
-
-#[test]
-fn team_file_new_and_unknown_roles() {
-    use pmos_contract::model::Role;
-    let dir = valid_tree();
-    write(
-        dir.path(),
-        "team.yaml",
-        "members:\n  - {handle: ana, slack-id: U0ANA1, roles: [pm, reviewer]}\n  - {handle: bo, slack-id: U0BO, roles: [auditor]}\n",
-    );
-    let report = run(&dir);
+    assert_code(&report, "team-file-retired", Severity::Error);
+    assert_eq!(report.errors().count(), 1, "{:#?}", report.diagnostics);
+    let d = report.errors().next().unwrap();
+    assert_eq!(d.path, "team.yaml");
     assert!(
-        !report.codes().iter().any(|c| c.starts_with("team-")),
-        "{:?}",
-        report.codes()
+        d.message.contains("pmos-admin users import"),
+        "{}",
+        d.message
+    );
+    assert_eq!(report.skills, clean.skills);
+    assert_eq!(report.bots, clean.bots);
+
+    // Not parsed: garbage gets the same one finding.
+    write(dir.path(), "team.yaml", "members: [\n");
+    assert_eq!(run(&dir).codes(), vec!["team-file-retired"]);
+
+    // Anywhere in the tree.
+    std::fs::remove_file(dir.path().join("team.yaml")).unwrap();
+    write(dir.path(), "context/products/team.yaml", "members: []\n");
+    let report = run(&dir);
+    assert_code(&report, "team-file-retired", Severity::Error);
+    assert_eq!(
+        report.errors().next().unwrap().path,
+        "context/products/team.yaml"
     );
 
-    // The rollout case: a role from a newer build parses, warns and grants nothing.
-    write(
-        dir.path(),
-        "team.yaml",
-        "members:\n  - {handle: ana, slack-id: U0ANA1, roles: [pm, owner]}\n  - {handle: bo, slack-id: U0BO, roles: [admin, auditor]}\n",
-    );
-    let report = run(&dir);
-    assert_code(&report, "team-role-unknown", Severity::Warning);
-    assert_code(&report, "team-role-separation", Severity::Warning);
-    assert!(!report.codes().contains(&"team-parse"));
-    let team = pmos_contract::model::TeamFile::load(dir.path()).unwrap();
-    let ana = team.by_handle("ana").unwrap();
-    assert_eq!(ana.roles, vec![Role::Pm, Role::Unknown("owner".into())]);
-    assert!(!pmos_contract::permissions::role_allows(
-        &ana.roles[1],
-        pmos_contract::permissions::Permission::ViewOwnTasks
-    ));
+    // A service loading the content: a warning, the content still loads.
+    let report = lint(dir.path(), &LintOptions::for_service(today()));
+    assert_code(&report, "team-file-retired", Severity::Warning);
+    assert!(!report.has_errors(), "{:#?}", report.diagnostics);
+}
+
+/// A personal context folder is named for a handle; who that person is is the database's.
+#[test]
+fn people_folders_are_handles() {
+    let dir = valid_tree();
+    std::fs::create_dir_all(dir.path().join("master/people/cy")).unwrap();
+    assert!(run(&dir).diagnostics.is_empty());
+    std::fs::create_dir_all(dir.path().join("master/people/Not A Handle")).unwrap();
+    assert_code(&run(&dir), "people-handle", Severity::Warning);
 }
 
 fn role(name: &str, extra: &str) -> String {
@@ -652,11 +581,6 @@ fn bot(name: &str, extra: &str) -> String {
 #[test]
 fn roles_and_bots_parse_and_resolve() {
     let dir = valid_tree();
-    write(
-        dir.path(),
-        "team.yaml",
-        "members:\n  - {handle: pm, slack-id: U0PM, roles: [pm]}\n",
-    );
     write(
         dir.path(),
         "roles/helper/ROLE.md",
@@ -708,11 +632,6 @@ fn roles_and_bots_parse_and_resolve() {
 #[test]
 fn role_and_bot_rules() {
     let dir = valid_tree();
-    write(
-        dir.path(),
-        "team.yaml",
-        "members:\n  - {handle: pm, slack-id: U0PM, roles: [pm]}\n",
-    );
     // auto is refused in v1; actions must name write tools; skills must exist and fit the class.
     write(
         dir.path(),
@@ -742,7 +661,7 @@ fn role_and_bot_rules() {
     write(
         dir.path(),
         "bots/z/BOT.md",
-        &bot("z", "scope: team\n").replace("\"@pm\"", "\"@stranger\""),
+        &bot("z", "scope: team\n").replace("\"@pm\"", "\"@Not A Handle\""),
     );
     write(dir.path(), "bots/w/BOT.md", &bot("other", "scope: team\n"));
     let report = run(&dir);
@@ -755,7 +674,7 @@ fn role_and_bot_rules() {
         "role-name",
         "bot-reads-personal",
         "bot-role-unknown",
-        "bot-owner-unknown",
+        "bot-owner-handle",
         "bot-name",
     ] {
         assert_code(&report, code, Severity::Error);
@@ -766,6 +685,11 @@ fn role_and_bot_rules() {
     write(dir.path(), "bots/t/BOT.md", &bot("t", "scope: team\n"));
     let report = run(&dir);
     assert_code(&report, "bot-reads-empty", Severity::Warning);
-    // team.yaml lists nobody yet: an unknown owner only warns.
-    assert_code(&report, "bot-owner-unknown", Severity::Warning);
+    // An owner who is a handle is all the lint checks: whether they are a user is the user
+    // database's to say (slice U7), so a handle nobody has yet is no finding.
+    assert!(
+        !report.codes().iter().any(|c| c.starts_with("bot-owner")),
+        "{:?}",
+        report.codes()
+    );
 }

@@ -154,11 +154,13 @@ if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
 fi
 BIN="$ROOT/target/debug"
 
-echo "== test content in $STATE/content (you as admin, plus your bot pm-$HANDLE)"
+echo "== test content in $STATE/content (your bot pm-$HANDLE); you as admin in $STATE/users.seed.yaml"
 rm -rf "$STATE/content"
 cp -r content "$STATE/content"
-"$BIN/pmos" member add --root "$STATE/content" --handle "$HANDLE" \
-  --slack-id "$PMOS_TEST_SLACK_ID" --roles pm,admin >/dev/null
+"$BIN/pmos" bot add-personal --root "$STATE/content" --handle "$HANDLE" >/dev/null
+# The user database's seed: beside the content, never in it (slice U7: no team file).
+printf 'members:\n  - {handle: "%s", slack-id: "%s", roles: [pm, admin]}\n' \
+  "$HANDLE" "$PMOS_TEST_SLACK_ID" >"$STATE/users.seed.yaml"
 "$BIN/pmos" lint --root "$STATE/content" | tail -1
 
 if [ -n "${PMOS_TEST_MODEL_URL:-}" ]; then
@@ -235,10 +237,10 @@ start docs env PMOS_DEV=1 PMOS_DOCS_TOKEN="$DOCS_TOKEN" PMOS_DOCS_BIND=127.0.0.1
   "$BIN/pmos-docs"
 wait_for http://127.0.0.1:8730/healthz docs
 
-# The tool server decides who may use PM OS from its user database (slice U3), in memory
-# here: seeded from the same team.yaml the other services still read, so the two agree.
+# Every service decides who may use PM OS from the tool server's user database, in memory
+# here, seeded from $STATE/users.seed.yaml (you, as pm and admin).
 start toolserver env PMOS_DEV=1 PMOS_CONNECTORS=fake \
-  PMOS_USERS_SEED="$STATE/content/team.yaml" \
+  PMOS_USERS_SEED="$STATE/users.seed.yaml" \
   PMOS_SERVICE_TOKEN="$SERVICE_TOKEN" PMOS_BOT_TOKEN="$BOT_TOKEN" \
   PMOS_WEB_TOKEN="$TS_WEB" PMOS_ASSERTION_MODE="$ASSERTION_MODE" PMOS_ASSERTION_KEYS="$AK_TOOLS" \
   PMOS_CONTENT_ROOT="$STATE/content" PMOS_AUDIT_LOG="$STATE/audit.jsonl" \
