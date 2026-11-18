@@ -51,9 +51,11 @@ the viewer's roles from the user database's answer for this request; the runtime
 tool server decide from their own reading of the database, not from those roles, and the
 console decides from its answer, not from theirs. Tool-server calls carry one for the PM
 whose inbox is read (with the viewer's roles when that is the viewer, else none). An
-admin's Approvals screen reads the inbox of every personal bot's owner and of everyone in
-the recent activity, plus the admin's own: the console's token may look one person up but
-not list the users. If the tool server ever cuts an inbox at its safety cap
+admin's Approvals screen reads the inbox of every active user who may hold drafts (holding
+`pm`, `reviewer` or `admin`), plus the admin's own: since slice U5a the tool server gives the
+console's token one narrow listing for this, `GET /internal/console/members?user=<admin>`
+(handles only, for an active admin in the database, with the console's assertion for the
+admin; `docs/toolserver.md`, "The Admin API"). If the tool server ever cuts an inbox at its safety cap
 (more than 1,000 pending drafts), the Approvals screen says so for that member, with the total.
 
 ## Sign-in
@@ -241,10 +243,8 @@ cargo run -p pmos-console
   though the console only lists approvals. A read-only token for `GET /internal/approvals`
   would narrow that.
 - **An admin's approvals queue** makes one call per PM, because the tool server lists one
-  PM's inbox at a time, and it finds the PMs through the runtime (personal bot owners and the
-  50 most recent askers), because the console's token may not list the user database. A PM
-  with neither a personal bot nor a recent task is missing from an admin's queue (their
-  items are still in Slack and the web app). A tool server listing for the console's admin
-  view would close that.
+  PM's inbox at a time. It finds the PMs with the tool server's admin listing for the console
+  (slice U5a: handles of the active users who may hold drafts), so every such PM is in it.
+  A deactivated person's held drafts are not in it (the web app's overview counts them).
 - **The console no longer reads content.** `PMOS_CONTENT_ROOT` is ignored, and the deploy
   kit no longer mounts the content checkout into the console.

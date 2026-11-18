@@ -459,7 +459,7 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `404` | `not_found` | Unknown path or id, or someone else's draft, task or follow-up. | Yes |
 | `405` | `method_not_allowed` | A known path with another method. | Yes |
 | `409` | `not_pending` | The draft was already decided (perhaps in Slack). Read it again to show how. | Yes |
-| `409` | `stale` | The draft changed since the `version` the PM approved. | Yes |
+| `409` | `stale` | The draft changed since the `version` the PM approved. Also an admin's user or role change made against a directory `version` that has moved since (**Admin: users and roles**). | Yes |
 | `409` | `expired` | A Slack draft past its 24 hours. | Yes |
 | `409` | `needs_external_confirm` | The channel is shared outside the company; ask, then approve with `confirm_external: true`. `audience` is now filled in. | Yes |
 | `409` | `audience_blocked` | Built from restricted sources, and people outside the product team can see the channel. Only rejecting is left. | Yes |
@@ -470,7 +470,7 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `409` | `task_refused` | The runtime won't take the PM's task (not onboarded, no bot). | Yes |
 | `409` | `github_not_linked` | An admin proposal: the admin hasn't linked GitHub in PM OS. Pull requests are opened as them; `error` says how to link. | Yes |
 | `409` | `stale_base` | An admin proposal or validation made from a copy that differs from the server's or the default branch's (**Admin: policy**). | Yes |
-| `422` | `invalid` | An admin proposal that doesn't pass validation (`errors`, `warnings`). | Yes |
+| `422` | `invalid` | An admin proposal that doesn't pass validation (`errors`, `warnings`). Also a malformed value in an admin's user or role change. | Yes |
 | `422` | `policy_mismatch` | An admin proposal: the tool server regenerates different policy files from it (`paths`). | Yes |
 | `429` | `rate_limited` | Too many admin proposals this hour; `Retry-After`. | Yes |
 | `501` | `not_configured` | Admin proposals are off at the tool server. | Yes |
@@ -483,13 +483,27 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `422` | `bad_brief` | The producer route's body failed a check. | Yes |
 | `501` | `not_built` | The daily brief is off on this server. | Yes |
 | `502` | `upstream_unavailable` | The runtime or tool server couldn't be reached, refused, or answered something unreadable. On a decision, only when the request never reached the tool server, or it refused it. | Yes on a decision; for a task (`POST /api/tasks`), the task may have been made: reload the list |
-| `502` | `unknown_outcome` | A decision was sent, but the answer was lost (the connection dropped, or the tool server failed with a `5xx`), and reading the draft again didn't show it decided. Also an admin proposal whose answer was lost: reload the proposals list. | **Unknown** |
+| `502` | `unknown_outcome` | A decision was sent, but the answer was lost (the connection dropped, or the tool server failed with a `5xx`), and reading the draft again didn't show it decided. Also an admin proposal whose answer was lost: reload the proposals list. Also an admin's user or role change whose answer was lost: reload the team list. | **Unknown** |
 | `504` | `unknown_outcome` | The same, when the tool server didn't answer in time (10 seconds). | **Unknown** |
 | `503` | `audience_unavailable` | Slack couldn't say who is in the channel. | Yes |
 | `503` | `unavailable` | `pmos-web`'s own store, or the tool server's, is down. | Yes |
-| `503` | `team_unavailable` | The admin Team page's member list: `team.yaml` can't be read (until that page moves to the user database). | Yes |
 | `503` | `users_unavailable` | The tool server (the user database) can't be asked who the person is: sign-in, and every route but the last-known-good reads (**Sign-in and safety**). | Yes |
 | `403` | `entra_needs_host` | A Microsoft session of someone holding Admin or Auditor whose link the host hasn't confirmed: the session ends. | Yes |
+| `503` | `assertion_required` | An admin's user or role change, while the tool server runs without signed user assertions (a development stack): it makes none. | Yes |
+| `403` | `host_only` | A user or role change only someone with host access may make: granting `admin`, an Admin's or Auditor's addresses or Microsoft link. | Yes |
+| `403` | `self_change` | An admin changing their own roles, status, addresses, links or reviewer assignments. | Yes |
+| `409` | `exists` | Inviting a handle that is already taken (handles are never reused). | Yes |
+| `409` | `taken` | An address or account that belongs to another user. | Yes |
+| `409` | `unchanged` | A user or role change that changes nothing. | Yes |
+| `409` | `last_admin` | A change that would leave PM OS without an active admin. | Yes |
+| `409` | `dual_role` | A change that would leave someone holding Admin and Auditor without the pilot exception in force. | Yes |
+| `409` | `evals_account` | A change to the `evals` account beyond `pm`. | Yes |
+| `409` | `not_active` | A reviewer assignment naming someone deactivated. | Yes |
+| `409` | `linked` | Changing an Atlassian email or GitHub login while that account is linked. | Yes |
+| `409` | `owns_bots` | Deactivating someone who still owns a team bot. | Yes |
+| `409` | `not_reviewer` | Assigning PMs to someone without the reviewer role. | Yes |
+| `409` | `not_pm` | Assigning a reviewer someone without the pm role. | Yes |
+| `429` | `deactivation_limit` | The hourly deactivation cap (3 by default, web and Slack together) is reached. | Yes |
 
 After an `unknown_outcome` the server has already read the draft once: if it showed this PM's
 approval (or rejection), the answer would have been that draft, `200`. Approving again is safe:
@@ -506,6 +520,7 @@ tool server checks them again in its own tables:
 | `GET /api/admin/audit` | yes | yes | `403 forbidden` |
 | `GET /api/admin/audit/export` | yes | yes | `403 forbidden` |
 | `GET /api/admin/team` | yes | yes | `403 forbidden` |
+| `GET /api/admin/users` | yes (addresses included) | yes (no addresses) | `403 forbidden` |
 | `GET /api/admin/overview` | yes | yes | `403 forbidden` |
 | `GET /api/admin/connectors` | yes | `403 forbidden` | `403 forbidden` |
 
@@ -522,7 +537,6 @@ The checks are the permission matrix: `audit` needs `view-audit-log`, `audit/exp
 | `403 forbidden` | The role doesn't allow this route. Also when the tool server, which checks the role again on its side, refuses. |
 | `400 bad_request` | A query parameter is malformed (see each route). Nothing is sent upstream. |
 | `502 upstream_unavailable` | The tool server didn't answer, or answered something unreadable. |
-| `503 team_unavailable` | `GET /api/admin/team` only: `team.yaml` can't be read. |
 | `503 users_unavailable` | The tool server can't be asked who the viewer is. |
 
 **What the auditor sees, and doesn't.** Metadata only: who did what, when, through which
@@ -533,7 +547,7 @@ see connectors at all, and sees no PM's drafts or tasks (those routes need PM pe
 auditor doesn't have).
 
 **Every admin read is itself audited.** The tool server records each call as an event of its
-own (`action` `admin.audit`, `admin.audit_export`, `admin.accounts` for the team page,
+own (`action` `admin.audit`, `admin.audit_export`, `admin.users` for the team page,
 `admin.connectors`, `admin.overview`), with the viewer as `actor`, `client` `web`, `task_id`
 `admin`, and `outcome` `ok` or `denied`; no query values are recorded. These events show up in
 the audit log like any other. `pmos-web` also logs each read (handle, route and the names of
@@ -621,15 +635,15 @@ to it directly.
 
 ### `GET /api/admin/team`
 
-Every member in `team.yaml`, in file order (team bots' service identities, `bots.<name>`, left
-out). Read-only. **This list still comes from `team.yaml` until slice U5** replaces it with the
-user database's admin list (`GET /internal/admin/users`); it decides nothing (who may open
-the page is the viewer's roles from the user database), and a person listed here may not be
-a user.
+The Team page's member list, kept in its first shape for the app until the Team screen moves
+to `GET /api/admin/users` (**Admin: users and roles**). Since slice U5a it comes from the user
+database (the tool server's `GET /internal/admin/users`), not `team.yaml`: **active** users
+only, by handle, and no addresses for anyone. When the tool server can't answer, the page
+fails like every admin read (`502 upstream_unavailable`); there is no file to fall back to.
 
 ```json
 {"members": [
-  {"handle": "ana", "name": "ana", "roles": ["pm"], "has_email": true, "bot": "pm-ana",
+  {"handle": "ana", "name": "Ana Silva", "roles": ["pm"], "has_email": true, "bot": "pm-ana",
    "accounts": {"atlassian": true, "slack": true, "github": false}},
   {"handle": "audrey", "name": "audrey", "roles": ["auditor"], "has_email": false,
    "bot": "pm-audrey", "accounts": {"atlassian": false, "slack": false, "github": false}}
@@ -640,14 +654,14 @@ a user.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `handle` | string | The member's handle. |
-| `name` | string | The handle again: `team.yaml` has no display name yet. |
-| `roles` | string[] | As written in `team.yaml`, including roles this server doesn't know. |
-| `has_email` | boolean | Whether `team.yaml` has an email for them (Microsoft sign-in needs one). The address is not served. |
-| `bot` | string | Their personal bot's name. It may not exist yet if they haven't finished onboarding. |
-| `accounts` | object or `null` | Whether each account is linked, as booleans: `atlassian` (Jira and Confluence share one Atlassian link), `slack`, `github`. Never a token, scope, site or account id. `null` when the tool server couldn't be asked. |
-| `accounts_available` | boolean | `false` when the tool server didn't answer: the list still shows, with every `accounts` `null`. |
-| `linking` | boolean or `null` | Whether account linking is on (live connectors). With fake connectors nothing can be linked and every account is `false`. `null` when the tool server didn't answer. |
+| `handle` | string | The user's handle. |
+| `name` | string | Their display name (untrusted text: render it plain), or the handle when there is none. |
+| `roles` | string[] | Their roles in the user database. |
+| `has_email` | boolean | Whether a Microsoft sign-in name is on file (`has_sign_in_name`). The address is not served. |
+| `bot` | string | Their personal bot's name. It may not exist yet. |
+| `accounts` | object | Whether each account is linked, as booleans: `atlassian` (Jira and Confluence share one Atlassian link), `slack`, `github`. Never a token, scope, site or account id. |
+| `accounts_available` | boolean | Always `true` now (kept for the app). |
+| `linking` | boolean | Whether account linking is on (live connectors). With fake connectors nothing can be linked and every account is `false`. |
 
 ### `GET /api/admin/connectors`
 
@@ -675,22 +689,52 @@ Admins only. Each connector, checked now.
 Counts for the admin home.
 
 ```json
-{"since": "2026-11-09T09:10:00.120Z", "pending_drafts": 4,
+{"since": "2026-11-09T09:10:00.120Z", "pending_drafts": 4, "held_drafts": 1,
  "approved": 37, "rejected": 5, "denied": 2,
  "retention_days": 90, "oldest_event_at": "2026-08-19T03:07:41.500Z",
- "last_purge": {"at": "2026-11-17T03:07:12.004Z", "deleted": 1200}}
+ "last_purge": {"at": "2026-11-17T03:07:12.004Z", "deleted": 1200},
+ "users": {"active": 9, "deactivated": 1,
+           "sign_in_unconfirmed": ["sam"], "dual_role": ["raj"],
+           "pilot_exception": {"ends": "2026-12-31", "ending_soon": false, "lapsed": false},
+           "role_conflicts": [], "entra_needs_host": [], "no_slack": [],
+           "identity_conflicts": 1, "identity_conflict_users": ["ana"],
+           "resolve_miss_warning": [], "resolve_miss_warning_threshold": 100,
+           "deactivations_last_hour": 1, "deactivation_limit": 3,
+           "deactivation_limit_reached": false, "deactivation_grace_hours": 24,
+           "bots_without_active_owner": []}}
 ```
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `since` | string, RFC 3339 UTC | Seven days before now: the window of the three counts below. |
-| `pending_drafts` | integer | Drafts waiting for a decision now, across every member of the team. |
+| `pending_drafts` | integer | Drafts waiting for a decision now, across every active user. |
+| `held_drafts` | integer or `null` | Pending drafts of deactivated people, held for the 24-hour grace (then closed). `null` from an older tool server. |
 | `approved` | integer or `null` | Approved writes that ran since `since` (audit outcome `approved`). |
 | `rejected` | integer or `null` | Drafts rejected since `since`. |
 | `denied` | integer or `null` | Actions refused since `since` (audit outcome `denied`, admin reads refused included). |
 | `retention_days` | integer or `null` | How many days audit events are kept before the daily purge deletes them (`PMOS_AUDIT_RETENTION_DAYS`: 90, or more if set). `null` from a tool server older than retention. Show as "Audit events are kept 90 days". |
 | `oldest_event_at` | string, RFC 3339 UTC, or `null` | The oldest event still in the audit log. `null` when the log is empty or can't be read back. Right after a purge it is at most `retention_days` old (plus up to a day between runs). |
 | `last_purge` | object or `null` | The newest purge batch: `{"at": RFC 3339 UTC, "deleted": integer ≥ 0}`, when it ran and how many events it deleted (`0` is a normal day). `null` before the first purge, or when the log can't be read back. A run of several batches shows its last batch; each batch is also in the audit list as `audit.purge`. |
+| `users` | object or `null` | The user database's flags (below). `null` from an older tool server. Handles and counts only: never an address, a Slack id or an object id. |
+
+`users`, what needs an admin (spec §2, §4, §6, §7):
+
+| Field | Type | Show |
+| --- | --- | --- |
+| `active`, `deactivated` | integer | How many users of each status. |
+| `sign_in_unconfirmed` | string[] | "Joined from Slack, Microsoft sign-in not confirmed": active people whose sign-in name an admin must confirm before their first Microsoft sign-in. |
+| `dual_role` | string[] | "Admin and Auditor (pilot exception, ends <date>)": active people holding both. |
+| `pilot_exception` | object or `null` | `{ends: "YYYY-MM-DD", ending_soon, lapsed}`. `ending_soon` (14 days or less): "The pilot exception ends on <date>". `lapsed`: past its end with nobody switching it off. `null` when off. |
+| `role_conflicts` | string[] | When the exception has lapsed: a **red notice** naming everyone still holding both ("their audit-log reads are refused until one role is removed"). Empty otherwise. |
+| `entra_needs_host` | string[] | Admins and Auditors whose Microsoft account the host hasn't confirmed (they can't sign in with Microsoft). |
+| `no_slack` | string[] | Active PMs with no Slack id. |
+| `identity_conflicts` | integer or `null` | Refused Microsoft sign-ins in the last 7 days that presented someone's sign-in name with a different Microsoft account (`users.identity_conflict`). `null` when the audit log can't be read back. |
+| `identity_conflict_users` | string[] or `null` | Whose sign-in names those were: "Someone signed in with Microsoft as <handle>'s sign-in name using a different Microsoft account". An admin may need to unlink the wrong account (`DELETE /api/admin/users/{handle}/identities/entra`). |
+| `resolve_miss_warning` | string[] | Services (`web`, `console`) whose lookups found nobody more than `resolve_miss_warning_threshold` times in the last hour: someone may be guessing names with that service's token. Counted in the tool server's memory since it started. |
+| `resolve_miss_warning_threshold` | integer | 100. |
+| `deactivations_last_hour`, `deactivation_limit`, `deactivation_limit_reached` | integer, integer, boolean | The hourly cap (**Admin: users and roles**). |
+| `deactivation_grace_hours` | integer | 24. |
+| `bots_without_active_owner` | string[] | Bots whose owner is not an active user who may use PM OS. |
 
 The three counts are `null` when the tool server's audit log can't be read back.
 **Purge runs in the audit list:** action `audit.purge`, system `audit`, actor
@@ -711,6 +755,273 @@ tasks, with no team-wide read, so `pmos-web` can't count them.
 - **A read refused by `pmos-web` itself** (a `400`, or its own `403`) never reaches the tool
   server, so it is only in `pmos-web`'s log, not the audit log.
 - **No free-text search**; `actor` and `action` match exactly.
+
+## Admin: users and roles
+
+The Team screen's routes (slice U5a of `docs/user-database-spec.md`; the screen itself is
+U5b). The user database belongs to the tool server; `pmos-web` mirrors its Admin API
+(`docs/toolserver.md`, "The Admin API") under `/api/admin/users…` and `/api/admin/reviewers/…`,
+naming the signed-in person as the actor and signing a user assertion for them bound to the
+exact request. **The tool server decides every write** in its own tables (never from roles the
+app or `pmos-web` believe); what `pmos-web` checks first is a convenience that saves a round
+trip.
+
+| Method and path | Body | Who (`pmos-web`'s first check) | Answer |
+| --- | --- | --- | --- |
+| `GET /api/admin/users` | | `manage-members` or `view-audit-log` (admin, auditor) | `200` `UserList` |
+| `POST /api/admin/users` | `NewUser` | `manage-members` (admin) | `201` `Written` |
+| `PUT /api/admin/users/{handle}/roles` | `{roles, expected_version}` | admin | `200` `Written` |
+| `PUT /api/admin/users/{handle}/fields` | `{sign_in_name?, atlassian_email?, github_login?, display_name?, expected_version}` | admin | `200` `Written` |
+| `POST /api/admin/users/{handle}/sign-in-name/confirm` | `{sign_in_name, expected_version?}` | admin | `200` `Written` |
+| `POST /api/admin/users/{handle}/deactivate` | none, `{}` or `{expected_version}` | admin | `200` `Written`, with `note` |
+| `POST /api/admin/users/{handle}/reactivate` | none, `{}` or `{expected_version}` | admin | `200` `Written` |
+| `DELETE /api/admin/users/{handle}/identities/{kind}` | none | admin | `200` `Written` |
+| `PUT /api/admin/reviewers/{reviewer}` | `{pms, expected_version?}` | admin | `200` `Written` (the reviewer) |
+
+Every write is a `POST`, `PUT` or `DELETE` and so needs the session's CSRF token and the app's
+own `Origin`, as every write does (**Sign-in and safety**). Any other method on these paths is
+`405 method_not_allowed`. A `{handle}` or `{reviewer}` that can't be a handle (lowercase
+letters, digits, `.`, `_`, `-`, at most 64) is `404 not_found`, and so is a `{kind}` other than
+`entra`, `atlassian` or `github`, all without an upstream call. A write body that isn't a JSON
+object is `400 bad_request`; a field a route doesn't take is `400 bad_request` from the tool
+server (every body is exact).
+
+### Who may do what
+
+The tool server's rules (spec §6), each a refusal code below:
+
+- **Only an active admin writes** (`403 forbidden`). An auditor reads the list and nothing
+  else; a PM or reviewer gets `403 forbidden` for the list too.
+- **Nobody changes their own roles, status or addresses**, in any direction (`403
+  self_change`): an admin can't change their own roles, deactivate or reactivate themselves,
+  change their own sign-in name, Atlassian email or GitHub login, unlink their own accounts,
+  or assign themselves PMs to review. An admin *may* change their own display name.
+- **`admin` is never granted from the web** (`403 host_only`), in an invite or a role change.
+  Revoking it from someone else is fine. Granting it is `pmos-admin users grant-admin` on the
+  host.
+- **An Admin's or Auditor's addresses and Microsoft link change on the host only** (`403
+  host_only`): their sign-in name, Atlassian email, GitHub login, the sign-in name
+  confirmation, and unlinking their `entra` identity. `host_only` in each user says so in
+  advance. Their display name and roles (but `admin` granted) are the web's to change.
+- **The last admin:** PM OS always keeps an active admin (`409 last_admin`). Through the web
+  this can't happen, since nobody changes their own roles: two admins demoting each other
+  leave the second refused `403 forbidden` (they are no longer an admin).
+- **Admin and Auditor together** only while the host's pilot exception is in force (`409
+  dual_role`). Once it has lapsed, any change that keeps someone holding both is refused, but
+  revoking either role or deactivating them always works, and their admin powers stay
+  meanwhile, so the team keeps a working admin.
+- **Addresses** (spec §6 "When addresses may change"): a sign-in name may be set any time
+  (it is informational once their Microsoft account is linked); setting it also confirms it.
+  An Atlassian email or GitHub login changes only while no account of that kind is linked
+  (`409 linked`): after the first link the account id decides; unlink first. Addresses are
+  unique across everyone, deactivated people included, and never reused (`409 taken`).
+- **Deactivation** is capped and reversible (below), refused while the person owns a team bot
+  (`409 owns_bots`), and never restores `admin` when reactivated.
+
+### `expected_version`
+
+`GET /api/admin/users` returns the directory's `version` (an integer that goes up with every
+change to anyone's user, roles, keys or reviewer assignments). Send it back as
+`expected_version`: **required** on `PUT …/roles` and `PUT …/fields` (`400 bad_request`
+without it), optional on the others. When the directory moved since, a write that would
+otherwise go through is refused `409 stale` and nothing changes: reload the list, show the
+person what is there now, and let them try again. A refusal that doesn't depend on what moved
+(`forbidden`, `self_change`, `host_only`, …) is answered as itself even with an old version.
+Every successful write answers the new `version`; use it for the next write.
+
+### `UserList`
+
+```json
+{"version": 42, "view": "admin",
+ "users": [
+   {"handle": "ana", "display_name": "Ana Silva", "status": "active", "roles": ["pm"],
+    "created_at": "2026-11-17T10:00:00Z", "deactivated_at": null, "grace_ends_at": null,
+    "dual_role": false, "role_conflict": false,
+    "has_sign_in_name": true, "sign_in_name_confirmed": true, "sign_in_unconfirmed": false,
+    "entra": "linked", "entra_needs_host": false,
+    "slack_linked": true, "entra_linked": true, "atlassian_linked": true, "github_linked": false,
+    "accounts": {"atlassian": true, "slack": true, "github": false},
+    "host_only": false, "bot": "pm-ana", "team_bots": ["scout"],
+    "reviews": [], "reviewed_by": ["rex"],
+    "sign_in_name": "ana@contoso.com", "atlassian_email": "ana@contoso.com",
+    "github_login": null}
+ ],
+ "deactivations": {"last_hour": 1, "limit": 3, "remaining": 2, "grace_hours": 24},
+ "pilot_exception": {"ends": "2026-12-31", "ends_at": "2026-12-31T00:00:00Z",
+                     "ending_soon": false, "lapsed": false},
+ "linking": true}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `version` | integer | The directory's version; send it back as `expected_version`. |
+| `view` | `"admin"` or `"auditor"` | `admin` for a viewer with `manage-members`: the addresses are included. `auditor` otherwise: they are left out (the keys are absent, not `null`). |
+| `users` | `User[]` | Every user, active or deactivated, by handle. |
+| `deactivations.last_hour` | integer | Deactivations through the web and Slack in the last rolling hour, counted from the role history: refused attempts never count, and a reactivation doesn't take one back. |
+| `deactivations.limit` | integer | The cap (`PMOS_USERS_DEACTIVATIONS_PER_HOUR`, 1–10, default 3). |
+| `deactivations.remaining` | integer | `limit - last_hour`, never below 0. At 0 a deactivation is `429 deactivation_limit` until the oldest leaves the hour; say "Someone with host access can continue with `pmos-admin users deactivate`". |
+| `deactivations.grace_hours` | integer | 24: how long a deactivation stays reversible (below). |
+| `pilot_exception` | object or `null` | The host's Admin + Auditor exception, when one is on (lapsed or not). `ends` (`YYYY-MM-DD`, UTC) and `ends_at` (RFC 3339): when it ends. `ending_soon`: in force and ends within 14 days ("The pilot exception ends on <date>"). `lapsed`: past `ends_at` and nobody switched it off: every person holding both has `role_conflict: true`. `null` when off. |
+| `linking` | boolean | Whether account linking is on (live connectors); with fake connectors no account can be linked. |
+
+`User`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `handle` | string | Their handle. Never changes. |
+| `display_name` | string | **Untrusted text** (often from Slack): render as plain text only. `""` when none. |
+| `status` | `"active"` or `"deactivated"` | |
+| `roles` | string[] | Of `admin`, `pm`, `reviewer`, `auditor`, sorted in that order. A deactivated person's kept roles grant nothing. |
+| `created_at` | string, RFC 3339 | When the user was created. |
+| `deactivated_at` | string or `null` | When they were deactivated; `null` while active. |
+| `grace_ends_at` | string or `null` | `deactivated_at` + 24 hours: until then a reactivation restores their linked accounts and held drafts; after it, their accounts are deleted and their held drafts closed, and a reactivation brings back only the person and their kept roles. `null` while active. |
+| `dual_role` | boolean | Holds both Admin and Auditor (the pilot exception). Show the badge. |
+| `role_conflict` | boolean | Active, holds both, and the pilot exception has lapsed: their audit-log reads are refused until one role goes. |
+| `has_sign_in_name` | boolean | A Microsoft sign-in name is on file. |
+| `sign_in_name_confirmed` | boolean | An admin (or the host, or the import) confirmed it. |
+| `sign_in_unconfirmed` | boolean | Active, with a sign-in name that came through Slack and nobody confirmed: they can't sign in with Microsoft until an admin confirms it ("Confirm Microsoft sign-in name"). |
+| `entra` | `"none"`, `"linked"` or `"needs_host"` | Their Microsoft account link. `needs_host`: an Admin or Auditor whose link the host hasn't confirmed (they can't sign in until it does). |
+| `entra_needs_host` | boolean | `entra == "needs_host"`. |
+| `slack_linked`, `entra_linked`, `atlassian_linked`, `github_linked` | boolean | Whether that key is on file (a Slack member id; a Microsoft account; the Atlassian or GitHub account id of their first link). Never the key itself. |
+| `accounts` | object or `null` | Whether each account's token is linked now: `atlassian`, `slack`, `github`, booleans. `null` when it couldn't be read (writes' answers only). |
+| `host_only` | boolean | Holds Admin or Auditor: their addresses and Microsoft link change on the host only. |
+| `bot` | string | Their personal bot's name. It may not exist (an invited person gets none until one is added). |
+| `team_bots` | string[] | Team bots they own: they can't be deactivated until each has another owner. |
+| `reviews` | string[] | For a reviewer: the PMs assigned to them, sorted. |
+| `reviewed_by` | string[] | The reviewers this person is assigned to. |
+| `sign_in_name` | string or `null` | **Admin view only.** Lower-case. |
+| `atlassian_email` | string or `null` | **Admin view only.** Lower-case. |
+| `github_login` | string or `null` | **Admin view only.** |
+
+**An auditor never gets an address, a Microsoft object id or a Slack id**: the three address
+fields are absent from every user. Nobody gets an object id, a tenant id, a Slack id or another
+account id from these routes. The tool server records every list read as `admin.users`.
+
+### `NewUser` (invite)
+
+`{"handle": "cy", "display_name": "Cy Young", "sign_in_name": "cy@contoso.com",
+"atlassian_email": "cy@contoso.com", "github_login": "cy-gh", "slack_id": "U0CY0001",
+"roles": ["pm", "reviewer"]}`
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `handle` | string, required | Lowercase letters, digits, `.`, `_`, `-`, at most 64, starting with a letter or digit; not `bots.…`, `host`, `import` or `system` (`422 invalid`). Never reused (`409 exists`). |
+| `display_name` | string, optional | Cleaned: control characters, `<` and `>` removed, spaces collapsed, at most 100 characters. Default `""`. |
+| `sign_in_name` | string, required | An email address (the Microsoft UPN), stored lower-case; confirmed by this invite. |
+| `atlassian_email` | string, required | An email address, stored lower-case. |
+| `github_login` | string, optional | `A–Z a–z 0–9 -`, 1–39. `null` or `""` means none. |
+| `slack_id` | string, optional | A Slack member id (`U…` or `W…`). `null` or `""` means none. |
+| `roles` | string[], required | At least one of `pm`, `reviewer`, `auditor` (`422 invalid` for none or an unknown name); `admin` is `403 host_only`. |
+
+The person is `active` at once and can sign in with Microsoft (their sign-in name is
+confirmed). No personal bot is created (`bot` names the one they would have).
+
+### `Written`
+
+Every write answers the person as they are now and the directory's new version:
+
+```json
+{"version": 43, "user": { …a User, admin view… },
+ "note": "`ana` is deactivated: …"}
+```
+
+`user` is the target (the reviewer, for `PUT /api/admin/reviewers/{reviewer}`), in the admin
+view. `note` is only on a deactivation: a sentence for the admin saying what happened and that
+the personal bot's sandbox keeps idling until `pmos-admin pause pm-<handle>` (show it as plain
+text).
+
+### Each write
+
+- **`PUT …/roles`** `{"roles": ["pm", "reviewer"], "expected_version": 42}`: the whole set
+  (`[]` removes every role). Unknown names `422 invalid`; adding `admin` `403 host_only`; the
+  same set `409 unchanged`. Granting `auditor` to an admin needs the pilot exception
+  (`409 dual_role`). Granting `auditor` to someone whose Microsoft account linked itself
+  leaves it `needs_host` until the host confirms it.
+- **`PUT …/fields`** `{"display_name": "Ana S.", "expected_version": 42}`: any of
+  `sign_in_name`, `atlassian_email`, `github_login`, `display_name`, at least one (`422
+  invalid` for none); a field left out is unchanged; none can be cleared here. All or
+  nothing. Values that are all already so are `409 unchanged`. A sign-in name set here is
+  confirmed too.
+- **`POST …/sign-in-name/confirm`** `{"sign_in_name": "ana@contoso.com"}`: confirms the
+  stored name, or replaces it and confirms (spec §4: "editable before confirming"). The same
+  name, already confirmed, is `409 unchanged`. Only then can a person who joined through Slack
+  sign in with Microsoft for the first time.
+- **`POST …/deactivate`**: at once, their sessions end (PM OS's tool sessions now, the web and
+  console within 10 seconds, Slack and bots within 30), their linked accounts are suspended
+  (unusable, not deleted), their pending drafts are held (not decided, not rejected), and
+  `admin` is revoked if they held it. Capped: at most `deactivations.limit` in any rolling
+  hour from the web and Slack together (`429 deactivation_limit`); the host is not capped.
+  `409 owns_bots` while they own a team bot; `409 unchanged` if already deactivated.
+- **`POST …/reactivate`**: `active` again with their kept roles, **never `admin`** (only the
+  host grants it). Within `grace_ends_at` their linked accounts and held drafts come back;
+  after it they must link their accounts again and their held drafts are gone. `409
+  unchanged` if active.
+- **`DELETE …/identities/{kind}`**: removes their `entra` link (a reassigned mailbox: the next
+  Microsoft sign-in with their sign-in name links afresh), or their `atlassian` or `github`
+  account id **and that linked account**, so another account can be linked (and the email or
+  login then edited). Their web sessions keyed on that Microsoft account end within 10
+  seconds. `409 unchanged` when nothing of that kind is linked; an Admin's or Auditor's
+  `entra` is `403 host_only`.
+- **`PUT /api/admin/reviewers/{reviewer}`** `{"pms": ["ana", "ben"]}`: the whole set of PMs
+  assigned to the reviewer (spec §8; at most 200). The reviewer must be active and hold
+  `reviewer` (`409 not_active`, `409 not_reviewer`); each PM added must be active and hold
+  `pm` (`409 not_active`, `409 not_pm`); nobody reviews themselves, and a PM appears once
+  (`422 invalid`); an unknown handle is `404 not_found`. `[]` clears every assignment and is
+  always allowed. Assignments are kept, and grant nothing, when either person loses the role
+  or is deactivated. (Recommendations are slice U6.)
+
+### Errors
+
+`{"code", "error"}` as everywhere; `error` is `pmos-web`'s own sentence, never the tool
+server's. Every refusal below changed nothing, and the tool server recorded it in the audit
+log (a `denied` event with the code as its detail) when it reached it.
+
+| Status | `code` | When |
+| --- | --- | --- |
+| `400` | `bad_request` | The body isn't a JSON object, has a field the route doesn't take, or lacks a required one (`expected_version` on roles and fields). |
+| `401` | `signed_out` | No live session. |
+| `403` | `bad_origin`, `bad_csrf` | A write without the app's origin or CSRF token. |
+| `403` | `forbidden` | Not an admin (for the list: not an admin or auditor). `pmos-web` answers it itself when the person's roles don't allow it; the tool server also answers it from its own tables. |
+| `403` | `host_only` | Granting `admin`; an Admin's or Auditor's addresses or Microsoft link. |
+| `403` | `self_change` | The actor's own roles, status, addresses, links or reviewer assignments. |
+| `404` | `not_found` | No such person (or PM, in an assignment), or a path that can't name one. |
+| `409` | `exists` | Invite: the handle is taken. |
+| `409` | `taken` | An address or account that belongs to someone else. |
+| `409` | `unchanged` | Nothing to change. |
+| `409` | `stale` | `expected_version` isn't the directory's version any more. |
+| `409` | `last_admin` | The change would leave no active admin. |
+| `409` | `dual_role` | The change would leave someone holding Admin and Auditor without a pilot exception in force. |
+| `409` | `evals_account` | The `evals` account holds `pm` only and is never linked. |
+| `409` | `not_active` | A reviewer assignment names someone deactivated. |
+| `409` | `linked` | An Atlassian email or GitHub login while that account is linked. |
+| `409` | `owns_bots` | Deactivating someone who owns a team bot; `error` names none of them, `team_bots` does. |
+| `409` | `not_reviewer`, `not_pm` | A reviewer assignment: the reviewer lacks `reviewer`, or a PM lacks `pm`. |
+| `422` | `invalid` | A malformed value: a handle, an address, a GitHub login, a Slack id, an unknown role, no role on an invite, no field to change, a PM twice or the reviewer themselves. |
+| `429` | `deactivation_limit` | The hourly deactivation cap is reached. |
+| `502` | `upstream_unavailable` | The tool server couldn't be reached, or answered something `pmos-web` doesn't know. Nothing changed. |
+| `502` | `unknown_outcome` | A write was sent and its answer was lost: it may have happened. Reload the list. |
+| `503` | `assertion_required` | The tool server isn't running with signed user assertions (`PMOS_ASSERTION_MODE=require`), so it makes no user or role change (development stacks with `PMOS_ASSERTION_INSECURE_OFF=1`). Reads still work. |
+| `503` | `unavailable` | The user database is down. |
+| `503` | `users_unavailable` | The tool server can't be asked who the signed-in person is. |
+
+### What gets recorded
+
+Every write, allowed or refused, is an audit event (`client` `web`, `task_id` `users`, the
+admin as `actor`, the target handle as `target`), and every allowed change is also a row of
+the user database's own role history:
+
+| `action` | `detail` |
+| --- | --- |
+| `users.create` | `roles pm,reviewer` |
+| `users.roles` | `+reviewer -pm`; `-admin on deactivation` |
+| `users.fields` | the field names changed (`sign_in_name; display_name`), `sign_in_name confirmed`; never a value |
+| `users.deactivate` | `credentials suspended` |
+| `users.reactivate` | `credentials restored`, or `credentials deleted` after the grace |
+| `users.identity_unlink` | `entra`, `atlassian` or `github` |
+| `reviewers.assign` | `<n> pms` (how many the reviewer has now) |
+| any of these, `denied` | the refusal's code (`self_change`, `stale`, `deactivation_limit`, …), or `bad_request`, `bad_assertion`, `assertion_required`, `owns_bots` |
+
+`GET /api/admin/users` is recorded as `admin.users` (allowed or refused).
 
 ## Admin: policy
 

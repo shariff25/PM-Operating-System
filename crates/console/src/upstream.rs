@@ -612,6 +612,24 @@ impl Upstream {
 
     // The tool server.
 
+    /// The handles of every active user who may hold drafts (`GET /internal/console/members
+    /// ?user=<viewer>`), signed for the viewer: the tool server answers only an active admin,
+    /// and only handles.
+    pub async fn members(&self, viewer: &Viewer) -> UpstreamResult<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Members {
+            handles: Vec<String>,
+        }
+        Ok(self
+            .get::<Members>(
+                &["internal", "console", "members"],
+                &[("user", &viewer.handle)],
+                Some(viewer.into()),
+            )
+            .await?
+            .handles)
+    }
+
     /// A PM's pending approvals, newest first, with an assertion for that PM (the tool server
     /// answers an inbox only to an assertion for its own PM). It carries the viewer's roles
     /// when the PM is the viewer, and none for an admin's read of another PM's inbox: the
