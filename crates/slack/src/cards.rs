@@ -337,7 +337,51 @@ pub fn args_summary(args: &Value) -> String {
     truncate(&lines.join("\n"), SECTION_MAX - 200)
 }
 
+/// The most reviewers a card names; past it, "and N more".
+const MAX_RECOMMENDERS: usize = 3;
+
+/// One context line when a reviewer has recommended on the draft (the tool server's
+/// `recommendations`, `docs/user-database-spec.md` §8): "Ana recommends approving", "Bo
+/// suggests changes", each marked "(on an earlier version)" when the draft changed since.
+/// The note is never on a card (the web app shows it). A display name is untrusted text,
+/// rendered inert with [`crate::blocks::name`]; an unknown verdict is left out. Recommending
+/// itself happens in the web app: there is no button for it here.
+pub fn recommendation_line(item: &Value) -> Option<String> {
+    let parts: Vec<String> = item["recommendations"]
+        .as_array()?
+        .iter()
+        .filter_map(|r| {
+            let what = match r["verdict"].as_str()? {
+                "approve" => "recommends approving",
+                "changes" => "suggests changes",
+                _ => return None,
+            };
+            let named = |k: &str| r[k].as_str().filter(|n| !n.trim().is_empty());
+            let who = named("reviewer_name").or_else(|| named("reviewer"))?;
+            let mut line = format!("{} {what}", crate::blocks::name(who, 60));
+            if r["stale"] == true {
+                line.push_str(" (on an earlier version)");
+            }
+            Some(line)
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut shown = parts[..parts.len().min(MAX_RECOMMENDERS)].join(" · ");
+    if parts.len() > MAX_RECOMMENDERS {
+        shown.push_str(&format!(" · and {} more", parts.len() - MAX_RECOMMENDERS));
+    }
+    Some(format!(":speech_balloon: {shown}"))
+}
+
 fn approval_head(item: &Value) -> Vec<Value> {
+    let mut head = approval_head_only(item);
+    head.extend(recommendation_line(item).map(|l| context(&l)));
+    head
+}
+
+fn approval_head_only(item: &Value) -> Vec<Value> {
     if is_reply(item) {
         return reply_head(item);
     }
@@ -1123,6 +1167,58 @@ mod tests {
             assert!(b["text"]["text"].as_str().unwrap().chars().count() <= SECTION_MAX);
         }
         assert_eq!(sections("").len(), 1, "never an empty section");
+    }
+
+    #[test]
+    fn a_reviewers_recommendation_is_one_inert_line_without_the_note() {
+        let mut item = json!({
+            "id": "apr_1", "user": "ana", "tool": "jira.create_issue",
+            "args": {"project": "PM", "summary": "Fake"}, "status": "pending",
+        });
+        let (_, blocks) = approval_card(&item, None);
+        assert!(!blocks.to_string().contains("recommends"));
+        item["recommendations"] = json!([
+            {"reviewer": "rev", "reviewer_name": "Rev <!channel> *Bold* @here", "verdict": "approve", "stale": false,
+             "note": "Fake note that a card never shows"},
+            {"reviewer": "bo", "reviewer_name": "", "verdict": "changes", "stale": true},
+            {"reviewer": "cy", "reviewer_name": "Cy", "verdict": "reject", "stale": false},
+        ]);
+        let line = recommendation_line(&item).unwrap();
+        assert!(line.contains("recommends approving"), "{line}");
+        assert!(
+            line.contains("bo suggests changes (on an earlier version)"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("<!channel>") && !line.contains("*Bold*") && !line.contains("@here"),
+            "{line}"
+        );
+        assert!(line.contains("&lt;!channel&gt;"), "{line}");
+        assert!(
+            !line.contains("Cy"),
+            "an unknown verdict is left out: {line}"
+        );
+        for card in [
+            approval_card(&item, None).1,
+            approval_closed(&item, "Approved").1,
+            approval_reasons(&item, None).1,
+        ] {
+            let s = card.to_string();
+            assert_eq!(s.matches("recommends approving").count(), 1, "{s}");
+            assert!(!s.contains("Fake note"), "{s}");
+        }
+        let mut reply = item.clone();
+        reply["tool"] = json!("slack.post_reply");
+        reply["args"] = json!({"channel": "C0PMTEAM", "thread_ts": "1.0", "text": "Fake"});
+        assert!(approval_card(&reply, None)
+            .1
+            .to_string()
+            .contains("suggests changes"));
+        let many: Vec<Value> = (0..5)
+            .map(|i| json!({"reviewer": format!("r{i}"), "verdict": "approve", "stale": false}))
+            .collect();
+        item["recommendations"] = json!(many);
+        assert!(recommendation_line(&item).unwrap().ends_with("and 2 more"));
     }
 
     #[test]

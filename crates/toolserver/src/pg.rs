@@ -44,6 +44,7 @@ use crate::members::{
 };
 use crate::memory::{MemoryResult, MemoryStore, Note, DEFAULT_NOTE_SENSITIVITY};
 use crate::memory_repo::{MemoryRepo, MemoryRepoStore};
+use crate::reviews::{NewRecommendation, RecVerdict, RecommendError, Recommendation};
 use crate::session::{token_hash, Session, SessionRepo};
 use crate::store::{StoreError, StoreResult, Stores};
 use crate::vault::{CredentialStore, Provider, SealedCredential};
@@ -440,6 +441,7 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
         tool: r.try_get("tool")?,
         args: r.try_get("args")?,
         args_hash: r.try_get("args_hash")?,
+        revision: i64::from(r.try_get::<i32, _>("revision")?),
         status: Status::parse(&status).ok_or_else(|| bad_row("status", &status))?,
         created_at: r.try_get("created_at")?,
         decided_at: r.try_get("decided_at")?,
@@ -460,7 +462,43 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
 
 const ITEM_COLUMNS: &str = "id, user_handle, skill, bot, run_id, tool, args, args_hash, status, \
                             created_at, decided_at, decided_by, result, sources_sensitivity, \
-                            redacted_at, drafted_args, edited_at, target_conversation";
+                            redacted_at, drafted_args, edited_at, target_conversation, revision";
+
+const REC_COLUMNS: &str = "id, approval_id, reviewer, verdict, note, note_removed_at, \
+                           draft_revision, draft_sha256, created_at, withdrawn_at";
+
+fn rec_from_row(r: &PgRow) -> StoreResult<Recommendation> {
+    let verdict: String = r.try_get("verdict")?;
+    Ok(Recommendation {
+        id: r.try_get("id")?,
+        approval_id: r.try_get("approval_id")?,
+        reviewer: r.try_get("reviewer")?,
+        verdict: RecVerdict::parse(&verdict).ok_or_else(|| bad_row("verdict", &verdict))?,
+        note: r.try_get("note")?,
+        note_removed_at: r.try_get("note_removed_at")?,
+        draft_revision: i64::from(r.try_get::<i32, _>("draft_revision")?),
+        draft_sha256: r.try_get("draft_sha256")?,
+        created_at: r.try_get("created_at")?,
+        withdrawn_at: r.try_get("withdrawn_at")?,
+    })
+}
+
+/// Remove the notes on `id`'s recommendations, inside `tx`: its Slack text is gone.
+async fn remove_notes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    now: DateTime<Utc>,
+) -> StoreResult<()> {
+    sqlx::query(
+        "UPDATE approval_recommendations SET note = NULL, note_removed_at = $2
+         WHERE approval_id = $1 AND note IS NOT NULL",
+    )
+    .bind(id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
 
 /// Insert a new item and its ledger row, inside `tx`.
 async fn insert_item(
@@ -817,7 +855,9 @@ impl ApprovalRepo for PgStore {
         let sql = format!(
             "UPDATE approvals
              SET status = $3, args = COALESCE($4, args), args_hash = COALESCE($5, args_hash),
-                 decided_at = $6, decided_by = $2, drafted_args = $7
+                 decided_at = $6, decided_by = $2, drafted_args = $7,
+                 revision = revision + CASE WHEN $5::text IS NOT NULL AND $5 <> args_hash
+                                            THEN 1 ELSE 0 END
              WHERE id = $1 AND user_handle = $2 AND status = 'pending'
              RETURNING {ITEM_COLUMNS}"
         );
@@ -895,7 +935,8 @@ impl ApprovalRepo for PgStore {
         let sql = format!(
             "UPDATE approvals
              SET args = $2, args_hash = $3, drafted_args = $4, edited_at = $5,
-                 sources_sensitivity = $6
+                 sources_sensitivity = $6,
+                 revision = revision + CASE WHEN args_hash <> $3 THEN 1 ELSE 0 END
              WHERE id = $1 AND status = 'pending'
              RETURNING {ITEM_COLUMNS}"
         );
@@ -1058,6 +1099,7 @@ impl ApprovalRepo for PgStore {
                 .bind(&item.id)
                 .execute(&mut *tx)
                 .await?;
+            remove_notes(&mut tx, &item.id, now).await?;
             expired.push(item_from_row(&row)?);
         }
         tx.commit().await?;
@@ -1098,6 +1140,7 @@ impl ApprovalRepo for PgStore {
             .bind(now)
             .execute(&mut *tx)
             .await?;
+            remove_notes(&mut tx, &id, now).await?;
         }
         tx.commit().await?;
         Ok(due.len())
@@ -1108,6 +1151,109 @@ impl ApprovalRepo for PgStore {
         let ids = close_owner_drafts(&mut tx, user, now).await?;
         tx.commit().await?;
         Ok(ids)
+    }
+
+    async fn pending_of(
+        &self,
+        users: &[String],
+        cap: usize,
+    ) -> StoreResult<(Vec<ApprovalItem>, usize)> {
+        if users.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let sql = format!(
+            "SELECT {ITEM_COLUMNS} FROM approvals
+             WHERE user_handle = ANY($1) AND status = 'pending'
+             ORDER BY created_at DESC, id COLLATE \"C\"
+             LIMIT $2"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(users)
+            .bind(i64::try_from(cap).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM approvals WHERE user_handle = ANY($1) AND status = 'pending'",
+        )
+        .bind(users)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((
+            rows.iter().map(item_from_row).collect::<StoreResult<_>>()?,
+            usize::try_from(total).unwrap_or(0),
+        ))
+    }
+
+    async fn recommend(
+        &self,
+        new: NewRecommendation<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<Recommendation, RecommendError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::from)?;
+        // The lock a decision and a saved edit take: none of them interleave on one item.
+        let sql = format!("SELECT {ITEM_COLUMNS} FROM approvals WHERE id = $1 FOR UPDATE");
+        let current = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(new.approval_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(StoreError::from)?
+            .as_ref()
+            .map(item_from_row)
+            .transpose()?;
+        let refused = match &current {
+            None => Err(RecommendError::NotFound),
+            Some(item) => crate::approvals::recommend_refusal(item, &new),
+        };
+        if let Err(e) = refused {
+            tx.rollback().await.map_err(StoreError::from)?;
+            return Err(e);
+        }
+        sqlx::query(
+            "UPDATE approval_recommendations SET withdrawn_at = $3, note = NULL
+             WHERE approval_id = $1 AND reviewer = $2 AND withdrawn_at IS NULL",
+        )
+        .bind(new.approval_id)
+        .bind(new.reviewer)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(StoreError::from)?;
+        let stored = new.into_stored(now);
+        sqlx::query(
+            "INSERT INTO approval_recommendations
+                 (id, approval_id, reviewer, verdict, note, draft_revision, draft_sha256,
+                  created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&stored.id)
+        .bind(&stored.approval_id)
+        .bind(&stored.reviewer)
+        .bind(stored.verdict.as_str())
+        .bind(&stored.note)
+        .bind(i32::try_from(stored.draft_revision).map_err(|_| bad_row("revision", "too large"))?)
+        .bind(&stored.draft_sha256)
+        .bind(stored.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(StoreError::from)?;
+        tx.commit().await.map_err(StoreError::from)?;
+        Ok(stored)
+    }
+
+    async fn recommendations(&self, approval_ids: &[String]) -> StoreResult<Vec<Recommendation>> {
+        if approval_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT {REC_COLUMNS} FROM approval_recommendations
+             WHERE approval_id = ANY($1) AND withdrawn_at IS NULL
+             ORDER BY created_at, id COLLATE \"C\""
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(approval_ids)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(rec_from_row).collect()
     }
 }
 

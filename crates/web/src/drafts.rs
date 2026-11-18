@@ -53,7 +53,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::settings::{DraftEdit, PracticeDraft, StoredSuggestion, UserState};
-use crate::upstream::{Approval, ApprovalSource};
+use crate::upstream::{Approval, ApprovalSource, UpstreamRecommendation};
 
 /// The most sources a draft shows.
 pub const MAX_SOURCES: usize = 20;
@@ -129,6 +129,80 @@ pub struct Draft {
     /// The line PM OS adds to what it writes, so readers know it was drafted with PM OS;
     /// `null` for a practice draft.
     pub marker: Option<String>,
+    /// What reviewers recommend on this draft (slice U6a), oldest first; empty when none has
+    /// (and always for a practice draft).
+    pub recommendations: Vec<Recommendation>,
+}
+
+/// A reviewer's recommendation, as the draft's owner sees it (`docs/web-api.md`, Drafts).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Recommendation {
+    /// The reviewer's handle.
+    pub reviewer: String,
+    /// Their display name, or their handle when they have none. Untrusted: plain text only.
+    pub reviewer_name: String,
+    /// `approve` or `changes`.
+    pub verdict: &'static str,
+    /// Untrusted plain text, or `null` (none given, or removed with a Slack draft's text).
+    pub note: Option<String>,
+    /// The note was removed with the Slack draft's text.
+    pub note_removed: bool,
+    pub created_at: String,
+    /// Given on an earlier version of the draft: it changed since.
+    pub stale: bool,
+}
+
+/// The longest reviewer name and note shown (the tool server keeps them shorter).
+pub const MAX_REVIEWER_NAME: usize = 100;
+pub const MAX_NOTE: usize = 1000;
+
+/// The tool server's recommendations as the owner's: only well-formed ones (a known verdict,
+/// a reviewer handle), names and notes bounded, control characters but line feeds removed.
+pub fn recommendations(found: &[UpstreamRecommendation]) -> Vec<Recommendation> {
+    found
+        .iter()
+        .filter(|r| valid_handle(&r.reviewer))
+        .filter_map(|r| {
+            let verdict = match r.verdict.as_str() {
+                "approve" => "approve",
+                "changes" => "changes",
+                _ => return None,
+            };
+            let name: String = r
+                .reviewer_name
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_REVIEWER_NAME)
+                .collect();
+            let name = name.trim();
+            Some(Recommendation {
+                reviewer: r.reviewer.clone(),
+                reviewer_name: if name.is_empty() {
+                    r.reviewer.clone()
+                } else {
+                    name.to_string()
+                },
+                verdict,
+                note: r
+                    .note
+                    .as_deref()
+                    .map(|n| {
+                        n.chars()
+                            .filter(|c| *c == '\n' || !c.is_control())
+                            .take(MAX_NOTE)
+                            .collect::<String>()
+                    })
+                    .filter(|n| !n.trim().is_empty()),
+                note_removed: r.note_removed,
+                created_at: DateTime::parse_from_rfc3339(&r.created_at)
+                    .map(|t| rfc3339(t.with_timezone(&Utc)))
+                    .unwrap_or_default(),
+                stale: r.stale,
+            })
+        })
+        .collect()
 }
 
 /// Who can see a Slack draft's channel. Both are `null` until PM OS has checked the channel,
@@ -759,6 +833,7 @@ pub fn draft(item: &Approval, state: &UserState) -> Option<Draft> {
             external,
         }),
         marker: Some(marker(item)),
+        recommendations: recommendations(&item.recommendations),
     })
 }
 
@@ -845,6 +920,7 @@ pub fn practice_draft(p: &PracticeDraft, bot: &str, state: &UserState) -> Draft 
         restricted_sources: false,
         audience: None,
         marker: None,
+        recommendations: Vec::new(),
     }
 }
 

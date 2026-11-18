@@ -22,6 +22,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::ledger::{args_edit_distance, LedgerOutcome, LedgerQuery, LedgerRow, Reason};
+use crate::reviews::{NewRecommendation, RecommendError, Recommendation};
 use crate::store::{StoreError, StoreResult};
 
 /// How long a grant stays valid after the PM approves.
@@ -182,6 +183,10 @@ pub struct ApprovalItem {
     pub tool: String,
     pub args: Value,
     pub args_hash: String,
+    /// The version of the draft's text: 1 as drafted, bumped each time a person changes its
+    /// arguments to others (a saved edit, or an edit decision). A reviewer's recommendation
+    /// names the revision it read (`crate::reviews`).
+    pub revision: i64,
     pub status: Status,
     pub created_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -356,6 +361,7 @@ impl NewItem<'_> {
             tool: self.tool.to_string(),
             args: self.args.clone(),
             args_hash: args_hash(self.args),
+            revision: 1,
             status: Status::Pending,
             created_at: now,
             decided_at: None,
@@ -553,6 +559,54 @@ pub trait ApprovalRepo: Send + Sync {
     /// write runs. The user was deactivated and not reactivated within the grace
     /// (`docs/user-database-spec.md` §6). Returns the ids closed.
     async fn close_for_owner(&self, user: &str, now: DateTime<Utc>) -> StoreResult<Vec<String>>;
+
+    /// The pending items of any of `users` (a reviewer's assigned PMs), newest first (ties by
+    /// id), at most `cap`, with how many are pending in all.
+    async fn pending_of(
+        &self,
+        users: &[String],
+        cap: usize,
+    ) -> StoreResult<(Vec<ApprovalItem>, usize)>;
+
+    /// Store a reviewer's recommendation (`crate::reviews`), under the item's own lock, so a
+    /// saved edit or a decision can't land between the check and the insert. Refused, with
+    /// nothing stored ([`recommend_refusal`]): no such item; the reviewer is its owner; not
+    /// pending (`Expired` for an expired Slack draft); the item's `revision` or `args_hash`
+    /// isn't the one named (`DraftChanged`, with what it holds now). The reviewer's live
+    /// recommendation on the item, if any, is withdrawn (and its note cleared) in the same
+    /// operation. Never changes the item, its ledger row or anything else.
+    async fn recommend(
+        &self,
+        new: NewRecommendation<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<Recommendation, RecommendError>;
+
+    /// The live recommendations on `approval_ids`, oldest first (ties by id).
+    async fn recommendations(&self, approval_ids: &[String]) -> StoreResult<Vec<Recommendation>>;
+}
+
+/// Why `new` can't be stored on `item` as it is now, checked in this order by both stores:
+/// the owner, the status, then the version the reviewer read.
+pub fn recommend_refusal(
+    item: &ApprovalItem,
+    new: &NewRecommendation<'_>,
+) -> Result<(), RecommendError> {
+    if item.user == new.reviewer {
+        return Err(RecommendError::OwnDraft);
+    }
+    if item.status == Status::Expired {
+        return Err(RecommendError::Expired);
+    }
+    if item.status != Status::Pending {
+        return Err(RecommendError::NotPending);
+    }
+    if item.revision != new.draft_revision || item.args_hash != new.draft_sha256 {
+        return Err(RecommendError::DraftChanged {
+            revision: item.revision,
+            args_hash: item.args_hash.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Who closes a deactivated owner's held drafts, in `decided_by`.
@@ -603,6 +657,22 @@ struct State {
     grants: Vec<Grant>,
     items: BTreeMap<String, ApprovalItem>,
     ledger: BTreeMap<String, Ledgered>,
+    /// Every recommendation, live and withdrawn, in the order stored.
+    recommendations: Vec<Recommendation>,
+}
+
+impl State {
+    /// Remove the notes on `id`'s recommendations: its Slack text is gone.
+    fn remove_notes(&mut self, id: &str, now: DateTime<Utc>) {
+        for r in self
+            .recommendations
+            .iter_mut()
+            .filter(|r| r.approval_id == id && r.note.is_some())
+        {
+            r.note = None;
+            r.note_removed_at = Some(now);
+        }
+    }
 }
 
 /// A stored ledger row, and whether the decision changed the item's arguments.
@@ -789,7 +859,11 @@ impl ApprovalRepo for MemoryApprovals {
                 let distance = args_edit_distance(item.drafted(), &args);
                 let drafted = drafted_after(item, &args);
                 let edited = drafted.is_some();
-                item.args_hash = args_hash(&args);
+                let hash = args_hash(&args);
+                if hash != item.args_hash {
+                    item.revision += 1;
+                }
+                item.args_hash = hash;
                 item.args = args;
                 item.drafted_args = drafted;
                 item.status = Status::Executing;
@@ -834,7 +908,11 @@ impl ApprovalRepo for MemoryApprovals {
         let drafted = drafted_after(item, &args);
         item.edited_at = drafted.as_ref().map(|_| now);
         item.drafted_args = drafted;
-        item.args_hash = args_hash(&args);
+        let hash = args_hash(&args);
+        if hash != item.args_hash {
+            item.revision += 1;
+        }
+        item.args_hash = hash;
         item.args = args;
         item.sources_sensitivity = raised(item.sources_sensitivity, raise_to);
         Ok(item.clone())
@@ -942,6 +1020,7 @@ impl ApprovalRepo for MemoryApprovals {
             if let Some(entry) = state.ledger.get_mut(&item.id) {
                 entry.row.outcome = LedgerOutcome::Expired;
             }
+            state.remove_notes(&item.id, now);
         }
         expired.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         Ok(expired)
@@ -954,7 +1033,7 @@ impl ApprovalRepo for MemoryApprovals {
         now: DateTime<Utc>,
     ) -> StoreResult<usize> {
         let mut state = self.state.lock().expect("approvals lock");
-        let mut n = 0;
+        let mut ids = Vec::new();
         for item in state.items.values_mut().filter(|i| {
             matches!(
                 i.status,
@@ -966,9 +1045,12 @@ impl ApprovalRepo for MemoryApprovals {
             item.args = redact_args(&item.args);
             item.drafted_args = None;
             item.redacted_at = Some(now);
-            n += 1;
+            ids.push(item.id.clone());
         }
-        Ok(n)
+        for id in &ids {
+            state.remove_notes(id, now);
+        }
+        Ok(ids.len())
     }
 
     async fn close_for_owner(&self, user: &str, now: DateTime<Utc>) -> StoreResult<Vec<String>> {
@@ -993,6 +1075,68 @@ impl ApprovalRepo for MemoryApprovals {
             }
         }
         Ok(ids)
+    }
+
+    async fn pending_of(
+        &self,
+        users: &[String],
+        cap: usize,
+    ) -> StoreResult<(Vec<ApprovalItem>, usize)> {
+        let state = self.state.lock().expect("approvals lock");
+        let mut pending: Vec<_> = state
+            .items
+            .values()
+            .filter(|i| i.status == Status::Pending && users.contains(&i.user))
+            .cloned()
+            .collect();
+        pending.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let total = pending.len();
+        pending.truncate(cap);
+        Ok((pending, total))
+    }
+
+    async fn recommend(
+        &self,
+        new: NewRecommendation<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<Recommendation, RecommendError> {
+        let mut state = self.state.lock().expect("approvals lock");
+        let item = state
+            .items
+            .get(new.approval_id)
+            .ok_or(RecommendError::NotFound)?;
+        recommend_refusal(item, &new)?;
+        for old in state.recommendations.iter_mut().filter(|r| {
+            r.approval_id == new.approval_id
+                && r.reviewer == new.reviewer
+                && r.withdrawn_at.is_none()
+        }) {
+            old.withdrawn_at = Some(now);
+            old.note = None;
+        }
+        let stored = new.into_stored(now);
+        state.recommendations.push(stored.clone());
+        Ok(stored)
+    }
+
+    async fn recommendations(&self, approval_ids: &[String]) -> StoreResult<Vec<Recommendation>> {
+        let state = self.state.lock().expect("approvals lock");
+        let mut live: Vec<_> = state
+            .recommendations
+            .iter()
+            .filter(|r| r.withdrawn_at.is_none() && approval_ids.contains(&r.approval_id))
+            .cloned()
+            .collect();
+        live.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(live)
     }
 }
 
