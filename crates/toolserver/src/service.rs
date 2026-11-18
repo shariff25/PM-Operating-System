@@ -1722,7 +1722,43 @@ impl ToolService {
         } else {
             None
         };
-        self.view(item, site.as_deref())
+        let mut views = [self.view(item, site.as_deref())];
+        self.attach_recommendations(std::slice::from_ref(item), &mut views)
+            .await;
+        let [view] = views;
+        view
+    }
+
+    /// Each item's live recommendations (`crate::reviews`), as `recommendations` on its view:
+    /// who, their display name, the verdict, when, the note, and whether it was given on an
+    /// earlier version (`stale`). The route leaves the note out for the Slack bot and the
+    /// console. If they can't be read the field is left out (and logged): advice is never a
+    /// reason to fail a read.
+    async fn attach_recommendations(&self, items: &[ApprovalItem], views: &mut [Value]) {
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        let recs = match self.stores.approvals.recommendations(&ids).await {
+            Ok(recs) => recs,
+            Err(e) => {
+                tracing::warn!(error = %e, "recommendations couldn't be read");
+                return;
+            }
+        };
+        let dir = if recs.is_empty() {
+            None
+        } else {
+            match self.people.snapshot() {
+                Some(dir) => Some(dir),
+                None => self.people.directory().await.ok(),
+            }
+        };
+        for (item, view) in items.iter().zip(views.iter_mut()) {
+            let mine: Vec<Value> = recs
+                .iter()
+                .filter(|r| r.approval_id == item.id)
+                .map(|r| r.owner_json(item, &display_name(dir.as_deref(), &r.reviewer), true))
+                .collect();
+            view["recommendations"] = Value::Array(mine);
+        }
     }
 
     /// [`ToolService::approval_json`] for a list, looking each user's site up once.
@@ -1741,6 +1777,7 @@ impl ToolService {
             };
             out.push(self.view(item, site.as_deref()));
         }
+        self.attach_recommendations(items, &mut out).await;
         out
     }
 
@@ -2081,6 +2118,28 @@ impl ToolService {
             }
         };
 
+        // Whether the owner decided after a reviewer's advice, and on which version
+        // (`crate::reviews`): advice only, read after the decision to word its record.
+        let advice = match self
+            .stores
+            .approvals
+            .recommendations(std::slice::from_ref(&item.id))
+            .await
+        {
+            Ok(recs) => crate::reviews::decision_detail(&recs, &item),
+            Err(e) => {
+                tracing::warn!(error = %e, id = %item.id, "recommendations couldn't be read for a decision's record");
+                Vec::new()
+            }
+        };
+        let own = match (decision, reason) {
+            (Decision::Edit, _) => Some("edited before approval".to_string()),
+            // A saved edit (`save_draft`), approved as it stands.
+            (Decision::Approve, _) if item.edited() => Some("edited before approval".to_string()),
+            (Decision::Reject, Some(reason)) => Some(format!("reason: {reason}")),
+            _ => None,
+        };
+        let parts: Vec<String> = own.into_iter().chain(advice).collect();
         let event = AuditEvent {
             client,
             at: now,
@@ -2094,15 +2153,7 @@ impl ToolService {
             source_titles: Default::default(),
             args_hash: Some(item.args_hash.clone()),
             output_ref: Some(item.id.clone()),
-            detail: match (decision, reason) {
-                (Decision::Edit, _) => Some("edited before approval".to_string()),
-                // A saved edit (`save_draft`), approved as it stands.
-                (Decision::Approve, _) if item.edited() => {
-                    Some("edited before approval".to_string())
-                }
-                (Decision::Reject, Some(reason)) => Some(format!("reason: {reason}")),
-                _ => None,
-            },
+            detail: (!parts.is_empty()).then(|| parts.join("; ")),
         };
         if item.status == Status::Rejected {
             self.audit(event).await;
@@ -2563,3 +2614,16 @@ impl ToolService {
         Ok(stuck.len())
     }
 }
+
+/// A person's name for display: their display name in `dir`, or their handle when they have
+/// none (or `dir` doesn't know them). Untrusted text: every surface renders it as plain text.
+pub(crate) fn display_name(dir: Option<&crate::users::Directory>, handle: &str) -> String {
+    dir.and_then(|d| d.get(handle))
+        .map(|u| u.display_name.trim())
+        .filter(|n| !n.is_empty())
+        .unwrap_or(handle)
+        .to_string()
+}
+
+mod review;
+pub use review::{About, ReviewError, ReviewInbox};

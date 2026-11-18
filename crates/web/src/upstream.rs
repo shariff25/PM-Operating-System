@@ -181,6 +181,35 @@ pub struct Approval {
     /// name, and for a DM the team member it is with. An older tool server doesn't send it.
     #[serde(default)]
     pub target_channel: Option<TargetChannel>,
+    /// The version of the draft's text (slice U6a): bumped by each change to its arguments.
+    /// An older tool server doesn't send it.
+    #[serde(default)]
+    pub revision: Option<i64>,
+    /// Reviewers' live recommendations on the draft (slice U6a), as its owner reads them. An
+    /// older tool server doesn't send them.
+    #[serde(default)]
+    pub recommendations: Vec<UpstreamRecommendation>,
+}
+
+/// One of the tool server's `recommendations` on an approval item (`docs/web-api.md`,
+/// Drafts): untrusted text (`reviewer_name`, `note`) by way of the tool server; `drafts.rs`
+/// keeps only what is shaped as the contract says.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct UpstreamRecommendation {
+    #[serde(default)]
+    pub reviewer: String,
+    #[serde(default)]
+    pub reviewer_name: Option<String>,
+    #[serde(default)]
+    pub verdict: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub note_removed: bool,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub stale: bool,
 }
 
 /// The tool server's `target_channel` (`docs/web-api.md`, Drafts). Untrusted text from
@@ -893,6 +922,34 @@ impl ToolServer {
             req = req.json(b);
         }
         let res = self.0.execute(req, Some(viewer), TIMEOUT).await?;
+        let status = res.status().as_u16();
+        let body = res.json::<Value>().await.unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
+    /// The Reviewer's routes (`/internal/reviews/{segments…}?user=<reviewer>`, slice U6a):
+    /// `method`, with `body` as JSON when given, and an assertion for `reviewer` bound to
+    /// exactly that request. Gives back the tool server's status and JSON body (`Value::Null`
+    /// when it isn't JSON) whatever the status: the route words its own answer from the code.
+    pub async fn reviews(
+        &self,
+        reviewer: &str,
+        method: reqwest::Method,
+        segments: &[&str],
+        body: Option<&Value>,
+    ) -> UpstreamResult<(u16, Value)> {
+        let mut path = vec!["internal", "reviews"];
+        path.extend_from_slice(segments);
+        let url = self.0.url(&path)?;
+        let mut req = self
+            .0
+            .http
+            .request(method, url)
+            .query(&[("user", reviewer)]);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let res = self.0.execute(req, Some(reviewer), TIMEOUT).await?;
         let status = res.status().as_u16();
         let body = res.json::<Value>().await.unwrap_or(Value::Null);
         Ok((status, body))

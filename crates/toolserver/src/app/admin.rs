@@ -373,8 +373,19 @@ pub const ADMIN_NOTES: [&str; 9] = [
 /// draft's expiry note, a purge batch's count and cutoff, or a sign-in event's provider,
 /// refusal code and attempt hash.
 pub fn safe_detail(detail: &str) -> Option<String> {
+    // A decision after a reviewer's recommendation adds fixed parts (`crate::reviews`) after
+    // its own detail, `; `-separated: each part must be safe on its own.
+    if detail.contains("; ")
+        && detail.split("; ").any(crate::reviews::is_safe_part)
+        && detail
+            .split("; ")
+            .all(|p| crate::reviews::is_safe_part(p) || safe_detail(p).is_some())
+    {
+        return Some(detail.to_string());
+    }
     let digits = |s: &str| !s.is_empty() && s.len() <= 6 && s.bytes().all(|b| b.is_ascii_digit());
     let ok = FIXED_DETAILS.contains(&detail)
+        || crate::reviews::is_safe_part(detail)
         || ADMIN_NOTES.contains(&detail)
         || crate::audit::parse_purge_detail(detail).is_some()
         || crate::users::detail::is_safe(detail)
@@ -1224,8 +1235,21 @@ mod tests {
             "provider: entra",
             "provider: dev; reason: not_a_member",
             "provider: entra; reason: not_a_member; attempt: 3f9a1c2b4d5e",
+            // A reviewer's recommendation, and a decision after one (slice U6a).
+            "verdict approve revision 3",
+            "own_draft",
+            "after a recommendation to approve, on an earlier version",
+            "edited before approval; after a recommendation to approve, on this version",
+            "reason: tone; after a recommendation to make changes, on this version; after a recommendation to approve, on an earlier version",
         ] {
             assert_eq!(safe_detail(ok).as_deref(), Some(ok));
+        }
+        for no in [
+            "reason: tone; Looks fine to me, ship it",
+            "after a recommendation to approve, on this version; the note says hi",
+            "verdict approve revision 3; note: ship it",
+        ] {
+            assert_eq!(safe_detail(no), None, "{no}");
         }
         for no in [
             "reason: the launch date is wrong, it's March 3",

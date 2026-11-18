@@ -618,3 +618,111 @@ async fn an_admin_changes_people_through_pmos_web_and_the_tool_server_decides() 
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+/// Slice U6a on the real tool server: an admin makes Ben a reviewer of Ana; Ben reads Ana's
+/// draft and recommends through `pmos-web`, signed for him; Ana sees the advice on her draft,
+/// marked "on an earlier version" once she edits it; Ben's recommendation on the old version
+/// is refused; nothing is ever sent by a recommendation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reviewer_recommends_through_pmos_web_and_the_owner_sees_it() {
+    let s = start().await;
+    let admin = s.login("stack-admin").await;
+    let (_, list, _) = s
+        .send(Some(&admin), Method::GET, "/api/admin/users", None)
+        .await;
+    let version = list["version"].as_i64().unwrap();
+    let (status, body, _) = s
+        .send(
+            Some(&admin),
+            Method::PUT,
+            "/api/admin/users/ben/roles",
+            Some(json!({"roles": ["pm", "reviewer"], "expected_version": version})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body, _) = s
+        .send(
+            Some(&admin),
+            Method::PUT,
+            "/api/admin/reviewers/ben",
+            Some(json!({"pms": ["ana"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let ana = s.login("ana").await;
+    let (status, _, _) = s
+        .send(
+            Some(&ana),
+            Method::POST,
+            "/api/tasks",
+            Some(json!({"text": "Answer Ben in #launch about SSO"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let approval = s.work().await;
+
+    let ben = s.login("ben").await;
+    let (_, me, _) = s.send(Some(&ben), Method::GET, "/api/me", None).await;
+    assert_eq!(me["reviewer"], true);
+    let (status, inbox, _) = s.send(Some(&ben), Method::GET, "/api/reviews", None).await;
+    assert_eq!(status, StatusCode::OK, "{inbox}");
+    assert_eq!(inbox["drafts"][0]["id"], approval.as_str());
+    let review_path = format!("/api/reviews/{approval}");
+    let (status, read, _) = s.send(Some(&ben), Method::GET, &review_path, None).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(read["restricted"], false, "{read}");
+    assert_eq!(read["body"], "The bot's first try.");
+    let (status, done, _) = s
+        .send(
+            Some(&ben),
+            Method::POST,
+            &format!("{review_path}/recommendation"),
+            Some(
+                json!({"verdict": "approve", "note": "Fake note: looks right.",
+                        "revision": read["revision"], "args_hash": read["args_hash"]}),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(done["recommendation"]["verdict"], "approve");
+    let item = s.svc.approval(&approval).await.unwrap().unwrap();
+    assert_eq!(item.status.as_str(), "pending");
+    assert!(s.slack.writes().is_empty());
+
+    // Ana sees it on her draft; Ana is not a reviewer.
+    let draft_path = format!("/api/drafts/{approval}");
+    let (_, draft, _) = s.send(Some(&ana), Method::GET, &draft_path, None).await;
+    let rec = &draft["recommendations"][0];
+    assert_eq!(rec["reviewer"], "ben");
+    assert_eq!(rec["note"], "Fake note: looks right.");
+    assert_eq!(rec["stale"], false);
+    let (status, _, _) = s.send(Some(&ana), Method::GET, "/api/reviews", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Ana edits: the advice was on an earlier version, and Ben's old read is refused.
+    let (status, saved, _) = s
+        .send(
+            Some(&ana),
+            Method::PUT,
+            &draft_path,
+            Some(json!({"body": "SSO ships in 5.1, edited by Ana."})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["recommendations"][0]["stale"], true);
+    let (status, body, _) = s
+        .send(
+            Some(&ben),
+            Method::POST,
+            &format!("{review_path}/recommendation"),
+            Some(json!({"verdict": "changes", "revision": read["revision"],
+                        "args_hash": read["args_hash"]})),
+        )
+        .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("draft_changed"))
+    );
+    assert!(s.slack.writes().is_empty());
+}

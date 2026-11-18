@@ -1270,6 +1270,71 @@ from `docs/web-api.md`. Where it differs from the text above:
   console against the real tool server's listing (its tests use a mock with the route's wire
   shape; the tool server side is tested over HTTP).
 
+**U6a is built** on `claude/u6a-reviewer-backend` (the back end of U6: migration
+`0019_approval_recommendations.sql`; `crates/toolserver/src/reviews.rs`,
+`src/service/review.rs`, `src/app/reviews.rs`, the store's `recommend`, `recommendations` and
+`pending_of` on both stores, `tests/reviews.rs` on both; the Slack card line in
+`crates/slack/src/cards.rs` `recommendation_line`; `crates/web/src/app/reviews.rs`, the owner's
+`recommendations` in `crates/web/src/drafts.rs`, `tests/reviews.rs`; a stack test through
+`pmos-web` and the real tool server; `docs/web-api.md` **Reviews**, `docs/toolserver.md`
+**Reviews**). The screens are U6b, built from `docs/web-api.md`. Where it differs from the
+text above:
+- **Two verdicts, not three:** `approve` and `changes` (the slice's brief: "recommends
+  approving" / "suggests changes"). `reject` is refused (`400`) and the table's check doesn't
+  allow it; a reviewer who thinks a draft shouldn't go says so with `changes` and a note.
+- **The routes are `/internal/reviews…`, not on `/internal/approvals`:** `GET
+  /internal/reviews?user=<reviewer>` (the inbox), `GET /internal/reviews/{id}?user=` (one
+  draft, with its sources: a reviewer gets no `GET /internal/approvals/{id}/sources`, the
+  read carries them), `POST /internal/reviews/{id}/recommendation?user=` `{verdict, note?,
+  draft_revision, args_hash}`. The actor is `user=`, as on the Admin API, so
+  `require_assertion` binds the subject with no new binding rule, and none of the existing
+  approvals routes (whose clients include the Slack bot and the console) widened. `pmos-web`'s
+  token only; every reviewer call needs its signed assertion **in every mode** (a reviewer
+  reads other people's drafts), and a recommendation also needs `require` with no override
+  (`503 assertion_required`), as U5a's writes.
+- **Bound to the hash as well as the revision:** the body names both, and either one moved is
+  `409 draft_changed` (with the current `revision` and `args_hash`). The check runs under the
+  item's row lock, the one a decision and a saved edit take.
+- **`approvals.revision` is U6's** (the B1 fix added none): 1 as drafted, bumped when the
+  arguments change **to others** (a saved edit or an edit decision). Saving the same text
+  again doesn't bump it, so advice isn't marked stale for nothing.
+- **A restricted draft can't be recommended on** (`403 restricted_draft`, a new code): the
+  reviewer sees no text, so has nothing to advise on. Its read and inbox line carry no
+  `args`, `args_hash`, target, sources or own recommendation. W6's follow-up is tested (a
+  session started at `restricted` that reads nothing drafts a restricted item). On any draft,
+  a Slack target names a public channel only: a private channel's name and a DM's other
+  person stay the owner's.
+- **Who reviews** is an active user holding `reviewer`; holding `admin` (which grants
+  `RecommendOnApproval` in the matrix) is not enough. A deactivated PM's held drafts are no
+  one's to review (`404`), and so is an assignment whose reviewer lost the role (`403`).
+  `/api/me` gains `reviewer: bool` (the role, not the permission) for the Reviews entry.
+- **The note** is cleaned on write (CR LF to LF, a tab to a space, other control characters
+  and bidirectional overrides dropped, trimmed; over 1,000 characters refused, never cut);
+  the table's check allows no control character but the line feed. A replaced
+  recommendation's note is cleared at once, not kept with the withdrawn row. Notes reach
+  `pmos-web` and the service token only; the Slack bot and the console get each
+  recommendation without its `note` field. A Slack draft's notes are removed
+  (`note_removed_at`) in the transaction that removes its text, both when it expires and a
+  day after its decision.
+- **Reads are audited too**, not only recommendations: `approvals.review_inbox`,
+  `approvals.review_read`, `approvals.recommend` (detail `verdict <v> revision <n>`), each
+  refusal `denied` with its code (`anonymous` before an assertion verified). They are
+  ordinary events, purged at 90 days (tested through the real purge on Postgres); the
+  recommendation rows go with their item.
+- **The decision's detail** reads `after a recommendation to approve, on this version` / `…, on
+  an earlier version` (and `to make changes`), one part per kind of live advice, after the
+  decision's own detail (`edited before approval; after …`, `reason: tone; after …`);
+  `safe_detail` serves these to the admin and auditor views.
+- **The Slack card's line** is ":speech_balloon: Rex recommends approving · Bo suggests
+  changes (on an earlier version)", at most three names then "and N more", on every state of
+  the card (pending, reasons, closed), names through `blocks::name`. A card shows it when it
+  is drawn from a fresh read: the first card is posted before any review, so the line appears
+  when the card is next redrawn (a click), not pushed when a recommendation is made.
+- **Not built:** sharing a restricted draft with a reviewer ("its owner can share it with
+  you" is only the wording); the web screens (U6b).
+- **Not verified:** the web front end against these routes (U6b); a real Slack workspace's
+  rendering of the card line.
+
 U4a–U4d run in parallel (U4b after U3, since `remove` calls U3's deactivation). U5 and U6 can
 overlap once the routes in U5 are merged.
 

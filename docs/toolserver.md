@@ -118,6 +118,9 @@ fields, which older readers ignore. None needs a network call when the item is r
 - `target_channel`: for a Slack draft, its channel as Slack last described it (see **Slack
   draft targets**): `{kind, name, with, checked_at}`. Left out until the channel has been
   read, and when the item's `channel` is no longer the one read.
+- `revision` and `recommendations` (slice U6a): the version of the draft's text, and the
+  reviewers' live recommendations on it, each marked `stale` when given on an earlier
+  version; the note never reaches the Slack bot or the console. See **Reviews**.
 
 **Slack draft targets.** So the web app can say "#launch-acme" rather than "A Slack thread",
 the tool server records what `conversations.info` (the PM's own token) says of a Slack
@@ -253,6 +256,8 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/admin/users?user=` | web token (assertion as on the admin reads) | Every user, as an admin or an auditor may see them. See **The Admin API** |
 | `POST /internal/admin/users`, `PUT …/{handle}/roles`, `PUT …/{handle}/fields`, `POST …/{handle}/sign-in-name/confirm`, `POST …/{handle}/deactivate`, `POST …/{handle}/reactivate`, `DELETE …/{handle}/identities/{kind}`, `PUT /internal/admin/reviewers/{reviewer}` (all `?user=<admin>`) | web token **and** a signed assertion for `user`, and assertion `require` (else `503 assertion_required`) | User and role writes. See **The Admin API** |
 | `GET /internal/console/members?user=` | console token (assertion as on its approvals reads) | `{handles}` for an active admin's Approvals screen. See **The Admin API** |
+| `GET /internal/reviews?user=`, `GET /internal/reviews/{id}?user=` | web token **and** a signed assertion for `user`, in every mode | A reviewer's inbox and one draft of a PM assigned to them; metadata only when restricted. See **Reviews** |
+| `POST /internal/reviews/{id}/recommendation?user=` `{verdict, note?, draft_revision, args_hash}` | the same, and assertion `require` (else `503 assertion_required`) | A reviewer's recommendation, bound to the version read (`409 draft_changed`). Never decides anything. See **Reviews** |
 
 ### Admin reads
 
@@ -1410,13 +1415,100 @@ under the users lock (migration 0018). The reviewer must be active and hold `rev
 (`409 not_active`, `409 not_reviewer`), each PM added active and holding `pm` (`409 not_pm`),
 at most 200, unless the set is empty (clearing is always allowed). Kept, inert, when either
 loses the role or is deactivated. Recorded `assign`/`unassign` per PM in `role_changes`
-(detail `pm <handle>`) and `reviewers.assign` (`<n> pms`) in the audit log. Recommendations
-are slice U6.
+(detail `pm <handle>`) and `reviewers.assign` (`<n> pms`) in the audit log. What a reviewer
+then reads and recommends: **Reviews** (below).
 
 **Migration 0018** also widens `role_changes.client` to allow `link`: a person's own first
 Atlassian or GitHub link (`Op::LinkAccount`, the OAuth callback) records its row with that
 client, which 0015's check refused, so in Postgres every such first link failed until now
 (the in-memory store has no check, so U3's tests didn't see it).
+
+### Reviews (slice U6a)
+
+`src/reviews.rs` (types, note cleaning, audit formats), `src/service/review.rs` (who may read
+and recommend, what they see), `src/app/reviews.rs` (the routes), the store's
+`ApprovalRepo::{recommend, recommendations, pending_of}` in memory and Postgres (migration
+0019), `tests/reviews.rs` on both stores. **A Reviewer recommends; the draft's owner
+confirms** (`docs/user-database-spec.md` §8). `pmos-web` mirrors the routes under
+`/api/reviews…`; the full contract is `docs/web-api.md` **Reviews**.
+
+| Route | Body | Does |
+| --- | --- | --- |
+| `GET /internal/reviews?user=<reviewer>` | | `{items, total, truncated, pms}`: every pending draft of the PMs assigned to the reviewer (and active), newest first, at most `PENDING_CAP` (1,000). Audited `approvals.review_inbox`. |
+| `GET /internal/reviews/{id}?user=<reviewer>` | | One such draft, with its sources (metadata only, as `GET /internal/approvals/{id}/sources`). Audited `approvals.review_read`. |
+| `POST /internal/reviews/{id}/recommendation?user=<reviewer>` | `{verdict, note?, draft_revision, args_hash}` | Record a recommendation: `{recommendation, draft}`. Audited `approvals.recommend`, detail `verdict <v> revision <n>`. |
+
+**Who may call.** `pmos-web`'s token only (the service, Slack bot and console tokens get
+`403`, recorded as `anonymous`). Every call needs `pmos-web`'s signed assertion whose subject
+is the `user=` it names, in **every** assertion mode (`401 bad_assertion`), since a reviewer
+reads other people's drafts. A recommendation also needs assertion `require` with no
+development override (`503 assertion_required`, as the Admin API's writes).
+
+**Who may review what** (from the user database, each call; never the assertion's roles):
+
+- the reviewer is an **active user holding `reviewer`** (`403 forbidden`; holding `admin` is
+  not enough, and an admin can't be assigned to themselves anyway);
+- the draft is a draft of a PM **assigned to them** (`reviewer_assignments`, migration 0018)
+  who may use PM OS (active, holding `pm`, `reviewer` or `admin`): anyone else's, or a missing
+  one, is `404 not_found`, the same answer, so ids can't be probed;
+- **never their own** (`403 own_draft`): they decide it as its owner;
+- **pending** (`409 not_pending`; `409 expired` for a Slack draft past its time, which expires
+  as soon as a reviewer reaches it, as a decision would find it).
+
+**What a reviewer sees.** `{id, owner, owner_name, tool, bot, skill, status, created_at,
+expires_at, revision, restricted, sources_sensitivity}` always; and only when the draft isn't
+restricted, `args`, `args_hash`, `edited`, `edited_at`, `target_url` (built without the
+owner's Atlassian site), `target_channel` (for a public channel only: a private channel's
+name and a direct message's other person are left to the owner), `my_recommendation` (their own live one, never
+another reviewer's) and, on a single read, `sources` and `sources_available`. **Restricted**
+means `sources_sensitivity` `restricted` or unrecorded, which since W6 includes a follow-up
+built on restricted conversation history (its session starts at that level): metadata only,
+and `403 restricted_draft` on a recommendation. No tasks, traces or routines of others.
+
+**A recommendation** is a row in `approval_recommendations` (migration 0019): `verdict`
+(`approve` or `changes`), an optional note, and the `draft_revision` and `draft_sha256` (the
+item's full `args_hash`) the reviewer read. The store takes the item's row lock (`SELECT …
+FOR UPDATE`, the lock a decision and a saved edit take) and refuses, storing nothing, when
+the item is missing, the reviewer's own, not pending, or its `revision` or `args_hash` isn't
+the one named: `409 {code: "draft_changed", revision, args_hash}` with what it holds now.
+One live row per reviewer per draft (a partial unique index): a new one withdraws the old
+(`withdrawn_at`) and clears its note. **It never changes the item**: no status, arguments,
+ledger row, grant or connector call; `decide` ignores recommendations and still requires
+`decided_by == item.user` (a reviewer's decision on someone else's item is `403`).
+
+`approvals.revision` (migration 0019; the B1 fix added none) is 1 as drafted and goes up by
+one whenever the item's arguments change to ones with another hash: a saved edit
+(`PUT …/draft`) or an edit decision. Saving the same text again leaves it.
+
+**The note** is untrusted plain text: cleaned on write (`reviews::clean_note`: CR LF to LF, a
+tab to a space, other control characters and bidirectional overrides dropped, trimmed; empty
+is none; over 1,000 characters is `422 invalid`, never cut), checked again by the table
+(no control character but the line feed). It is served to `pmos-web` (the reviewer, and the
+draft's owner) and the service token only, never to the Slack bot or the console
+(`app.rs` `for_client`), and never written to the audit log or a log line. When a Slack
+draft's text is removed (it expires, or a day after its decision: **Slack drafts**), the
+notes on it are removed in the same transaction (`note_removed_at`).
+
+**The owner's view.** Every item as the approvals routes answer it carries `revision` and
+`recommendations`: each live one as `{id, reviewer, reviewer_name, verdict, draft_revision,
+created_at, stale, note_removed, note}` (`note` left out for the Slack bot and the console).
+`reviewer_name` is the reviewer's display name, or their handle. `stale` is true when the
+item's revision or args hash is no longer the one the reviewer read: "given on an earlier
+version". If the recommendations can't be read, the field is left out and logged; a read
+never fails for it.
+
+**The decision's record.** A decision's audit event adds, after its own detail, one fixed
+part per kind of live advice: `after a recommendation to approve, on this version`, `… on an
+earlier version`, `after a recommendation to make changes, …` (so `edited before approval;
+after a recommendation to approve, on an earlier version`). The admin and auditor views serve
+these (`safe_detail`), and `verdict <v> revision <n>` and the refusal codes.
+
+**Audited.** Each listing, read and recommendation is an event as the reviewer (`client`
+`web`, `run_id` `reviews`, the item's id and args hash); each refusal `denied` with its code
+(`forbidden`, `not_found`, `own_draft`, `restricted_draft`, `not_pending`, `expired`,
+`draft_changed`, `bad_request`, `invalid`, `assertion_required`, or `bad_assertion` as
+`anonymous`). These are ordinary audit events: the 90-day purge deletes them like any other
+(tested on Postgres through the real purge). Recommendation rows go with their item.
 
 ### Content sync
 

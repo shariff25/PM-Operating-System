@@ -53,6 +53,7 @@ mod brief;
 mod content;
 mod policy;
 mod proposal;
+mod reviews;
 mod users;
 
 /// How many tasks `GET /api/tasks` lists.
@@ -303,6 +304,7 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         .merge(brief::routes())
         .merge(admin::routes())
         .merge(users::routes())
+        .merge(reviews::routes())
         .merge(policy::routes())
         .merge(content::routes())
         .fallback(|| async { ApiError::not_found() })
@@ -1490,6 +1492,9 @@ fn me_json(signed: &Signed, st: &UserState) -> Response {
         "name": signed.member.name(),
         "roles": signed.member.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
         "permissions": pmos_contract::permissions::granted(&signed.member.roles),
+        // Holds the `reviewer` role: show the Reviews entry (`/api/reviews`). Not the
+        // `recommend-on-approval` permission, which an admin holds too without reviewing.
+        "reviewer": signed.member.roles.contains(&Role::Reviewer),
         "csrf_token": signed.session.csrf_token,
         "first_visit": !st.opened_a_draft,
         "hints_seen": st.hints_seen.iter().collect::<Vec<_>>(),
