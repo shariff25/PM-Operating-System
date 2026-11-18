@@ -12,7 +12,9 @@ OS Slack bot"):
   approval, with the audience check and the 24-hour expiry it already has.
 - **The app's own token never reads channels.** A thread is read with the PM's own token, by
   their personal bot, through `slack.read_thread`.
-- **Only members can use it.** Membership is `team.yaml`.
+- **Only members can use it.** Membership is the user database (an active user holding `pm`,
+  `reviewer` or `admin`), read through the tool server's directory since slice U4b
+  (`docs/user-database-spec.md` §2); never `team.yaml`.
 
 ## 1. Design decisions, and why
 
@@ -172,7 +174,7 @@ plain words:
 The notice lives only in that publish; nothing is stored.
 
 ### Skills
-- **Data:** the content repo (`PMOS_CONTENT_ROOT`, already read for `team.yaml`), through
+- **Data:** the content repo (`PMOS_CONTENT_ROOT`), through
   `pmos_contract::lint`'s `Report.skills`, cached for 60 seconds. Shown: skills with the
   `slack` surface that the member's personal bot's role lists (`GET /v1/bots/pm-<handle>`,
   a new runtime-client call); with no personal bot, the Docs bot's.

@@ -274,12 +274,13 @@ pub fn view(tab: Tab, notice: Option<&str>, body: Vec<Value>) -> Value {
     })
 }
 
-/// The view for someone outside `team.yaml`.
-pub fn not_a_member_view() -> Value {
+/// The view for someone who may not use PM OS: `text` says why (outside the user directory,
+/// deactivated, no role that uses Slack, or PM OS can't check right now).
+pub fn not_a_member_view(text: &str) -> Value {
     json!({
         "type": "home",
         "private_metadata": json!({"tab": Tab::Inbox.code()}).to_string(),
-        "blocks": [header("PM OS"), section(NOT_A_MEMBER)],
+        "blocks": [header("PM OS"), section(text)],
     })
 }
 
@@ -931,7 +932,12 @@ impl Bots {
     /// Republish `handle`'s Home if they have opened it, on the section they left it on.
     /// Best effort and in the background: the notifier never waits for it.
     pub fn refresh_home(&self, handle: &str) {
-        let Some(slack_id) = self.team().by_handle(handle).map(|m| m.slack_id.clone()) else {
+        let Some(slack_id) = self
+            .people()
+            .of_handle(handle)
+            .into_member()
+            .and_then(|m| m.slack_id)
+        else {
             return;
         };
         let tab = self
@@ -949,8 +955,9 @@ impl Bots {
 
     /// Build and publish the Home for a Slack user.
     async fn publish_home(&self, user: &str, tab: Tab, notice: Option<String>) {
-        let view = match self.team().by_slack_id(user).map(|m| m.handle.clone()) {
-            None => not_a_member_view(),
+        let who = self.people().identify(user);
+        let view = match who.member().map(|m| m.handle.clone()) {
+            None => not_a_member_view(crate::people::refusal(&who, NOT_A_MEMBER)),
             Some(handle) => {
                 self.home_state()
                     .viewers
@@ -1099,7 +1106,7 @@ impl Bots {
     /// **Approve selected** / **Reject selected**: decide each ticked draft, then republish
     /// the Inbox with how each one ended.
     async fn decide_ticked(&self, user: &str, decision: &str, ids: Vec<Ticked>) {
-        let Some(handle) = self.team().by_slack_id(user).map(|m| m.handle.clone()) else {
+        let Some(handle) = self.people().identify(user).into_member().map(|m| m.handle) else {
             return self.publish_home(user, Tab::Inbox, None).await;
         };
         if ids.is_empty() {
@@ -1143,9 +1150,10 @@ impl Bots {
     /// **Disconnect**: unlink the account, then republish with what happened.
     async fn unlink_account(&self, user: &str, provider: &'static str, tab: Tab) {
         let Some(handle) = self
-            .team()
-            .by_slack_id(user)
-            .map(|m| m.handle.clone())
+            .people()
+            .identify(user)
+            .into_member()
+            .map(|m| m.handle)
             .filter(|h| valid_handle(h))
         else {
             return self.publish_home(user, tab, None).await;

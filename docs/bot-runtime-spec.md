@@ -310,7 +310,7 @@ preference, so it lives in the runtime, which builds each task's claim, and not 
   4. else `docs`.
 
   The bot posts its replies under its own name (`chat:write.customize`), so each bot reads as its own teammate in the thread. *Deviation to confirm:* D1 says a DM per bot. A Slack app per bot would meet that literally, at the cost of a Slack app per bot.
-- **Tasks:** a message becomes `POST /v1/tasks` (as the PM, mapped through `team.yaml`) with `slack: {channel, thread_ts}`. Replies go in that thread.
+- **Tasks:** a message becomes `POST /v1/tasks` (as the PM, mapped through the user directory since slice U4b) with `slack: {channel, thread_ts}`. Replies go in that thread.
   - **Notifications:** a single long-poll loop on `/v1/notifications`. Each milestone is one message, edited in place as the run goes, so a thread gets at most one message per milestone (D6).
   - **Result:** the final answer is a new message.
 - **Approval cards (D7):** for each `needs_approval` item, a card with the tool, a summary of the arguments, and buttons **Approve**, **Edit** and **Reject**.

@@ -533,12 +533,20 @@ impl Nudges {
         }
     }
 
-    /// Look at every member once; returns how many nudges were sent.
+    /// Look at every member once; returns how many nudges were sent. Members come from the
+    /// user directory on a snapshot at most 30 seconds old; past that, nobody is nudged this
+    /// time.
     pub async fn tick(&self) -> usize {
-        let team = self.inner.bots.team();
+        let Some(members) = self.inner.bots.people().members() else {
+            tracing::info!("the user directory isn't fresh; no nudges this time");
+            return 0;
+        };
         let mut sent = 0;
-        for member in &team.members {
-            if self.consider(&member.handle, &member.slack_id).await {
+        for member in &members {
+            let Some(slack_id) = member.slack_id.as_deref() else {
+                continue;
+            };
+            if self.consider(&member.handle, slack_id).await {
                 sent += 1;
             }
         }
@@ -656,11 +664,10 @@ impl Nudges {
         ) else {
             return;
         };
-        let team = self.inner.bots.team();
-        let Some(member) = team.by_slack_id(&user) else {
+        let Some(member) = self.inner.bots.people().identify(&user).into_member() else {
             return;
         };
-        let handle = member.handle.clone();
+        let handle = member.handle;
         let tz = self.tz_of(&handle, &user).await;
         let today = self.inner.clock.now().with_timezone(&tz).date_naive();
         self.update(&handle, |pm| {

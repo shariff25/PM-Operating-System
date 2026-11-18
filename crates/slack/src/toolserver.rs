@@ -428,9 +428,9 @@ impl ToolServer {
         if !request_id_ok(id) {
             return Err(refused_locally("not a request id"));
         }
-        // No `roles`: the tool server's default (`pm`) applies. The bot's token may grant
-        // `pm` and `skill-author` only, and never asks for more; admins are added by a pull
-        // request to `team.yaml`.
+        // No `roles`: the tool server's default (`pm`) applies. From the bot's token a join is
+        // `pm` only (`403 admin_not_from_slack`, `403 role_not_from_slack` otherwise), and
+        // this client never asks for more.
         let mut body = json!({"decision": decision, "decided_by": decided_by});
         if let Some(handle) = handle {
             body["handle"] = json!(handle);
@@ -444,7 +444,9 @@ impl ToolServer {
         Ok(request_of(&body).clone())
     }
 
-    /// `POST /internal/members/{handle}/remove`. Returns `{handle, commit}`.
+    /// `POST /internal/members/{handle}/remove`: a deactivation since slice U3. Returns
+    /// `{handle, deactivated, commit: null, note}`; refusals carry a `code`
+    /// (`docs/toolserver.md` "Members").
     pub async fn remove_member(&self, handle: &str, decided_by: &str) -> Result<Value, ApiError> {
         if !pmos_contract::model::valid_handle(handle) {
             return Err(refused_locally("not a handle"));

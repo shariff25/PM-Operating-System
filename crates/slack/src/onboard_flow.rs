@@ -200,7 +200,12 @@ impl Bots {
 
     /// The offer on a Home open: opens the DM only when the offer is due and the account linked.
     pub(crate) async fn onboarding_offer_for_slack_user(&self, slack_id: &str) {
-        let Some(handle) = self.team().by_slack_id(slack_id).map(|m| m.handle.clone()) else {
+        let Some(handle) = self
+            .people()
+            .identify(slack_id)
+            .into_member()
+            .map(|m| m.handle)
+        else {
             return;
         };
         if !self.offer_due(&handle) {
