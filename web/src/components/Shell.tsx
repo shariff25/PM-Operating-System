@@ -11,7 +11,7 @@ import { Icon, Mark } from './icons';
 import type { IconName } from './icons';
 import { UserMenu } from './UserMenu';
 
-type NavKey = 'home' | 'drafts' | 'followups' | 'activity' | 'admin';
+type NavKey = 'home' | 'drafts' | 'reviews' | 'followups' | 'activity' | 'admin';
 
 interface Slots {
   /** Where a page puts its title in the phone top bar. Null on desktop, where pages carry their own header. */
@@ -48,6 +48,9 @@ export function navKey(route: Route): NavKey {
     case 'drafts':
     case 'draft':
       return 'drafts';
+    case 'reviews':
+    case 'review':
+      return 'reviews';
     case 'followups':
       return 'followups';
     case 'activity':
@@ -107,16 +110,20 @@ interface NavItem {
 
 export function Shell({ route, children, onSignOut }: { route: Route; children: ReactNode; onSignOut: () => void }) {
   const { openPalette, me } = useApp();
-  const { pendingCount, brief, briefState, runningCount } = useData();
+  const { pendingCount, brief, briefState, runningCount, reviewCount } = useData();
   const isPhone = useMediaQuery(PHONE_QUERY);
   const [lead, setLead] = useState<HTMLElement | null>(null);
   const current = navKey(route);
-  // The draft workspace needs the width: there the rail is icons only.
-  const compact = !isPhone && route.name === 'draft';
+  // The draft workspace (and a reviewer's read of a draft) needs the width: there the rail is icons only.
+  const compact = !isPhone && (route.name === 'draft' || route.name === 'review');
 
   const items: NavItem[] = [
     { key: 'home', href: '#/', label: copy.nav.home, icon: 'home', count: 0, countLabel: () => '' },
     { key: 'drafts', href: '#/drafts', label: copy.nav.drafts, icon: 'drafts', count: pendingCount, countLabel: copy.nav.draftsCount, accent: true },
+    // Only for someone holding the reviewer role (not for an admin who merely may recommend).
+    ...(me.reviewer === true
+      ? [{ key: 'reviews' as const, href: '#/reviews', label: copy.nav.reviews, icon: 'review' as const, count: reviewCount, countLabel: copy.nav.reviewsCount }]
+      : []),
     ...(briefState === 'ready'
       ? [{
           key: 'followups' as const,
@@ -133,9 +140,9 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
       : []),
   ];
 
-  const detail = route.name === 'draft' || route.name === 'task';
+  const detail = route.name === 'draft' || route.name === 'task' || route.name === 'review';
   const shortcut = isMac() ? copy.nav.shortcutMac : copy.nav.shortcutOther;
-  const pageTitle = { home: copy.nav.home, drafts: copy.nav.drafts, followups: copy.nav.followups, activity: copy.nav.activity, admin: copy.nav.admin }[current];
+  const pageTitle = { home: copy.nav.home, drafts: copy.nav.drafts, reviews: copy.nav.reviews, followups: copy.nav.followups, activity: copy.nav.activity, admin: copy.nav.admin }[current];
 
   /** The second level under Admin: its parts, for the ones this person may open. */
   const adminSub = () => {
@@ -226,7 +233,7 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
           {isPhone && (
             <header className="topbar">
               {detail ? (
-                <a href={route.name === 'draft' ? '#/drafts' : '#/activity'} className="icon-btn topbar-btn" aria-label={copy.nav.back}>
+                <a href={route.name === 'draft' ? '#/drafts' : route.name === 'review' ? '#/reviews' : '#/activity'} className="icon-btn topbar-btn" aria-label={copy.nav.back}>
                   <Icon name="chevronLeft" size={20} />
                 </a>
               ) : (

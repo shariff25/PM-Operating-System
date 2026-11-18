@@ -6,6 +6,7 @@ import { copy } from '../copy';
 import type { Rendered } from '../markdown';
 import { Icon } from './icons';
 import { StrippedNote, TargetLink } from './bits';
+import { recommendationLines } from './Recommendations';
 
 interface Props {
   draft: Draft;
@@ -79,6 +80,8 @@ export function ApproveDialog(p: Props) {
   // The line the target will carry. Slack writes it in italics; here it is shown as plain words.
   const marker = draft.marker?.replace(/^[_*]+|[_*]+$/g, '').trim();
   const markerLine = marker ? (slack ? copy.approve.markerSlack(marker) : copy.approve.markerPage(marker)) : null;
+  // Reviewers' advice, as facts beside the others. It informs; it never blocks the confirm.
+  const advice = recommendationLines(draft.recommendations);
 
   return createPortal(
     <div className="modal-backdrop">
@@ -131,6 +134,18 @@ export function ApproveDialog(p: Props) {
             <>
               <dt>{copy.approve.markerHeading}</dt>
               <dd>{markerLine}</dd>
+            </>
+          )}
+          {advice.length > 0 && (
+            <>
+              <dt>{copy.recommendations.factHeading}</dt>
+              <dd>
+                <ul className="fact-lines">
+                  {advice.map((line, i) => (
+                    <li key={i}>{line}</li>
+                  ))}
+                </ul>
+              </dd>
             </>
           )}
         </dl>

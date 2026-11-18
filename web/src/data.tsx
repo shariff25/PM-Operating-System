@@ -1,10 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
-import type { Brief, DraftSummary, Task } from './api';
+import type { Brief, DraftSummary, ReviewList, Task } from './api';
 import { messageOf, useApp } from './app-context';
 import { copy } from './copy';
 import { effectiveStatus, sortDrafts } from './drafts';
 import { errorText, isDefiniteRefusal } from './errors';
+import { waitingCount } from './reviews';
 
 /** 'off' means the brief answered 501 not_built (or failed): follow-ups are hidden everywhere. */
 export type BriefState = 'loading' | 'ready' | 'off';
@@ -25,6 +26,12 @@ export interface DataValue {
   /** Drafts that need a decision now. */
   pendingCount: number;
   runningCount: number;
+  /** The reviewer's inbox (null until loaded, and always for someone who isn't a reviewer). */
+  reviews: ReviewList | null;
+  reviewsError: unknown;
+  reloadReviews: () => Promise<void>;
+  /** Drafts that wait for this reviewer's advice. */
+  reviewCount: number;
 }
 
 const DataContext = createContext<DataValue | null>(null);
@@ -37,7 +44,10 @@ export function useData(): DataValue {
 
 /** The lists the navigation counts and several pages share, loaded once and refreshed on demand. */
 export function DataProvider({ children }: { children: ReactNode }) {
-  const { api } = useApp();
+  const { api, me } = useApp();
+  const reviewer = me.reviewer === true;
+  const [reviews, setReviews] = useState<ReviewList | null>(null);
+  const [reviewsError, setReviewsError] = useState<unknown>(null);
   const [drafts, setDrafts] = useState<DraftSummary[] | null>(null);
   const [draftsCut, setDraftsCut] = useState<{ total: number | null } | null>(null);
   const [draftsError, setDraftsError] = useState<string | null>(null);
@@ -77,11 +87,29 @@ export function DataProvider({ children }: { children: ReactNode }) {
     }
   }, [api]);
 
+  const reloadReviews = useCallback(async () => {
+    if (!reviewer) return;
+    try {
+      setReviews(await api.listReviews());
+      setReviewsError(null);
+    } catch (e) {
+      setReviewsError(e);
+    }
+  }, [api, reviewer]);
+
   useEffect(() => {
     void reloadDrafts();
     void reloadBrief();
     void reloadTasks();
   }, [reloadDrafts, reloadBrief, reloadTasks]);
+
+  useEffect(() => {
+    if (reviewer) void reloadReviews();
+    else {
+      setReviews(null);
+      setReviewsError(null);
+    }
+  }, [reviewer, reloadReviews]);
 
   const upsertTask = useCallback((t: Task) => {
     setTasks((list) => {
@@ -109,8 +137,12 @@ export function DataProvider({ children }: { children: ReactNode }) {
       upsertTask,
       pendingCount: (drafts ?? []).filter((d) => effectiveStatus(d, now) === 'pending').length,
       runningCount: (tasks ?? []).filter((t) => t.status === 'queued' || t.status === 'working').length,
+      reviews,
+      reviewsError,
+      reloadReviews,
+      reviewCount: reviews ? waitingCount(reviews.drafts) : 0,
     };
-  }, [drafts, draftsError, draftsCut, reloadDrafts, brief, briefState, setBrief, tasks, reloadTasks, upsertTask]);
+  }, [drafts, draftsError, draftsCut, reloadDrafts, brief, briefState, setBrief, tasks, reloadTasks, upsertTask, reviews, reviewsError, reloadReviews]);
 
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
 }

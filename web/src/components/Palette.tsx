@@ -62,6 +62,9 @@ export function Palette({ initial, onClose }: { initial: string; onClose: () => 
     const pages: Option[] = [
       { id: 'p-home', group: 'pages', label: copy.nav.home, icon: 'home', run: go('/') },
       { id: 'p-drafts', group: 'pages', label: copy.nav.drafts, icon: 'drafts', run: go('/drafts') },
+      ...(me.reviewer === true
+        ? [{ id: 'p-reviews', group: 'pages' as const, label: copy.nav.reviews, icon: 'review' as const, run: go('/reviews') }]
+        : []),
       ...(briefState === 'ready'
         ? [{ id: 'p-followups', group: 'pages' as const, label: copy.nav.followups, icon: 'followups' as const, run: go('/followups') }]
         : []),

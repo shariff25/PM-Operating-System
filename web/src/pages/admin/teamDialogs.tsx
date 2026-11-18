@@ -4,7 +4,7 @@ import { USER_ROLES } from '../../api';
 import { useApp } from '../../app-context';
 import { Icon } from '../../components/icons';
 import { copy } from '../../copy';
-import { inGrace, listWords, longDay, nameOf, roleWords, whenUtc } from '../../admin/team';
+import { inGrace, listWords, longDay, nameOf, roleWords, validSlackId, whenUtc } from '../../admin/team';
 import { RoleChecks, TeamDialog, TextField } from './teamParts';
 import type { Problem } from './teamParts';
 
@@ -21,7 +21,6 @@ export interface Flow {
 
 const sameSet = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x) => b.includes(x));
 const sortRoles = (roles: readonly string[]) => USER_ROLES.filter((r) => roles.includes(r)) as string[];
-
 // ---------- Invite ----------
 
 export function InviteDialog({ flow }: { flow: Flow }) {
@@ -32,8 +31,12 @@ export function InviteDialog({ flow }: { flow: Flow }) {
   const [signIn, setSignIn] = useState('');
   const [atlassian, setAtlassian] = useState('');
   const [github, setGithub] = useState('');
+  const [slack, setSlack] = useState('');
   const [roles, setRoles] = useState<string[]>(['pm']);
-  const ok = handle.trim() !== '' && signIn.trim() !== '' && atlassian.trim() !== '' && roles.length > 0;
+  const slackId = slack.trim();
+  const slackBad = slackId !== '' && !validSlackId(slackId);
+  const filled = handle.trim() !== '' && signIn.trim() !== '' && atlassian.trim() !== '' && roles.length > 0;
+  const ok = filled && !slackBad;
 
   return (
     <TeamDialog
@@ -43,7 +46,7 @@ export function InviteDialog({ flow }: { flow: Flow }) {
       busy={flow.busy}
       problem={flow.problem}
       canSubmit={ok}
-      hint={ok ? null : I.required}
+      hint={ok ? null : filled ? I.fixSlack : I.required}
       submitLabel={I.submit}
       busyLabel={I.submitting}
       testId="invite-dialog"
@@ -54,6 +57,7 @@ export function InviteDialog({ flow }: { flow: Flow }) {
           sign_in_name: signIn.trim(),
           atlassian_email: atlassian.trim(),
           ...(github.trim() ? { github_login: github.trim() } : {}),
+          ...(slackId ? { slack_id: slackId } : {}),
           roles: sortRoles(roles),
         };
         flow.submit(() => api.adminInvite(body), (w) => I.done(nameOf(w.user)));
@@ -67,6 +71,15 @@ export function InviteDialog({ flow }: { flow: Flow }) {
         <TextField label={I.signInName} type="email" value={signIn} onChange={setSignIn} hint={I.signInHint} mono />
         <TextField label={I.atlassianEmail} type="email" value={atlassian} onChange={setAtlassian} hint={I.atlassianHint} mono />
         <TextField label={I.githubLogin} value={github} onChange={setGithub} optional mono />
+        <TextField
+          label={I.slackId}
+          value={slack}
+          onChange={setSlack}
+          optional
+          mono
+          invalid={slackBad}
+          hint={slackBad ? I.slackInvalid : I.slackHint}
+        />
       </div>
       <RoleChecks legend={I.roles} roles={['pm', 'reviewer', 'auditor']} value={roles} onChange={setRoles} />
       <p className="quiet-line team-host-line">
