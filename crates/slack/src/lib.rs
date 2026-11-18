@@ -18,7 +18,7 @@
 //!   that were rejected or heavily edited since the last one (`triage.rs`).
 //! - **Routines (D8):** "every weekday at 8am …" is read back for a one-tap confirm; "my
 //!   routines" lists them with **Pause**, **Resume** and **Delete**.
-//! - **Onboarding** (`docs/onboarding-spec.md` §4): someone outside `team.yaml` taps
+//! - **Onboarding** (`docs/onboarding-spec.md` §4): someone outside the user directory taps
 //!   **Request access**, a platform owner approves them in a DM card, and the new member gets
 //!   a welcome and a setup checklist (`setup`) for their accounts, memory repo and bot.
 //! - **Tagging PM OS in a channel** (`docs/slack-mentions-and-home-spec.md` §2): `@PM OS …`
@@ -31,8 +31,10 @@
 //!   the asker can see, through the tool server's `docs` skill.
 //!
 //! It connects with Socket Mode (outbound only) and maps each Slack user to a PM OS handle
-//! through `content/team.yaml`.
+//! through the user database: a snapshot of the tool server's `GET /internal/directory`
+//! (`people.rs`, `docs/user-database-spec.md` §2). It never reads `content/team.yaml`.
 
+pub mod access_copy;
 pub mod bets_review;
 pub mod blocks;
 pub mod bots;
@@ -51,6 +53,7 @@ pub mod nudge_copy;
 pub mod nudges;
 pub mod onboard_copy;
 pub mod onboard_flow;
+pub mod people;
 pub mod proxy;
 pub mod reply;
 pub mod runtime;

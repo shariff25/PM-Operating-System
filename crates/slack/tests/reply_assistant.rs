@@ -24,7 +24,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use common::{serve, until, Call, FakeSlack, APP_TOKEN, SLACK_BOT_TOKEN};
+use common::{person, serve, until, Call, Directory, FakeSlack, APP_TOKEN, SLACK_BOT_TOKEN};
 use pmos_slack::bots::{Bots, BotsConfig};
 use pmos_slack::commands::Commands;
 use pmos_slack::notify::Notifier;
@@ -40,7 +40,14 @@ use tokio_util::sync::CancellationToken;
 
 const BOTS_TOKEN: &str = "test-bots-token-slack-0123456789abcdef";
 const TOOL_BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
-const TEAM: &str = "members:\n  - {handle: ana, slack-id: U0ANA, roles: [pm]}\n  - {handle: bob, slack-id: U0BOB, roles: [pm]}\n  - {handle: cal, slack-id: U0CAL, roles: [pm]}\n";
+/// The user directory: Ana, Bob and Cal.
+fn team() -> Vec<pmos_directory::snapshot::DirectoryUser> {
+    vec![
+        person("ana", "U0ANA", &["pm"]),
+        person("bob", "U0BOB", &["pm"]),
+        person("cal", "U0CAL", &["pm"]),
+    ]
+}
 /// Words of the question in the thread. They must never reach a card.
 const QUESTION: &str = "QUESTION-TEXT when does SSO ship";
 
@@ -166,7 +173,7 @@ fn runtime_routes(rt: Arc<MockRuntime>) -> Router {
 /// What the audience check finds for an item's channel.
 #[derive(Clone, Copy, Default)]
 struct Audience {
-    /// Members not in `team.yaml`.
+    /// Channel members who aren't PM OS insiders.
     outsiders: u64,
     /// Slack Connect.
     external: bool,
@@ -347,7 +354,8 @@ struct Stack {
     rt_base: String,
     ts_base: String,
     state: tempfile::TempDir,
-    team: tempfile::TempDir,
+    content: tempfile::TempDir,
+    directory: Directory,
     stop: Vec<CancellationToken>,
     socket: Option<(CancellationToken, JoinHandle<Ended>)>,
 }
@@ -369,8 +377,8 @@ impl Stack {
         let (rt_base, stop_rt) = serve(runtime_routes(runtime.clone())).await;
         let tools = Arc::new(MockTools::default());
         let (ts_base, stop_ts) = serve(tools_routes(tools.clone())).await;
-        let team = tempfile::tempdir().unwrap();
-        std::fs::write(team.path().join("team.yaml"), TEAM).unwrap();
+        let content = tempfile::tempdir().unwrap();
+        let directory = Directory::seeded(team()).await;
         let state = tempfile::tempdir().unwrap();
         let mut stack = Self {
             slack,
@@ -381,14 +389,16 @@ impl Stack {
                 &slack_base,
                 &rt_base,
                 &ts_base,
-                team.path(),
+                &directory,
+                content.path(),
                 state.path(),
             )),
             slack_base,
             rt_base,
             ts_base,
             state,
-            team,
+            content,
+            directory,
             stop: vec![stop_slack, stop_rt, stop_ts],
             socket: None,
         };
@@ -402,7 +412,8 @@ impl Stack {
             &self.slack_base,
             &self.rt_base,
             &self.ts_base,
-            self.team.path(),
+            &self.directory,
+            self.content.path(),
             self.state.path(),
         ))
     }
@@ -414,7 +425,7 @@ impl Stack {
             APP_TOKEN,
             Commands {
                 toolserver: ToolServer::new("http://127.0.0.1:9", TOOL_BOT_TOKEN),
-                team_file: "/nonexistent/team.yaml".into(),
+                people: self.directory.people(),
                 http: http.clone(),
                 response_url_prefix: "https://hooks.slack.com/".into(),
                 request_access: true,
@@ -504,7 +515,8 @@ fn config(
     slack: &str,
     rt: &str,
     ts: &str,
-    team: &std::path::Path,
+    directory: &Directory,
+    content: &std::path::Path,
     state: &std::path::Path,
 ) -> BotsConfig {
     let http = reqwest::Client::new();
@@ -512,7 +524,8 @@ fn config(
         slack: SlackApi::new(slack, SLACK_BOT_TOKEN, http.clone()),
         runtime: Runtime::new(rt, BOTS_TOKEN, http),
         toolserver: ToolServer::new(ts, TOOL_BOT_TOKEN),
-        team_file: team.join("team.yaml"),
+        people: directory.people(),
+        content_root: content.to_path_buf(),
         default_tz: "America/New_York".into(),
         github_org: None,
         response_url_prefix: "https://hooks.slack.com/".into(),

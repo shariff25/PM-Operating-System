@@ -3,8 +3,9 @@
 PM OS is moving who-may-use-it from `content/team.yaml` to the tool server's own database
 (`docs/user-database-spec.md`). **Since slice U3 the tool server decides from the database:**
 who may have a session, decide a draft, link an account, read the admin screens, approve a
-join or deactivate someone. The runtime, Slack, the web app and the console still read
-`team.yaml` until slices U4a-d, so **keep both equal**: a join approved in Slack writes both;
+join or deactivate someone. The runtime (U4a), Slack (U4b) and the web app's sign-in (U4c)
+read the database too; the console and the web app's Team page still read `team.yaml` until
+slices U4d and U5, so **keep both equal**: a join approved in Slack writes both;
 anything you add by hand to `team.yaml`, add here too (`import` picks up new people).
 
 **Before deploying a release with U3, import.** A tool server with an empty user database lets

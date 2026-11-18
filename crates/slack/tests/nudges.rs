@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use common::{serve, Call, FakeSlack, SLACK_BOT_TOKEN};
+use common::{person, serve, Call, Directory, FakeSlack, SLACK_BOT_TOKEN};
 use pmos_slack::bots::{Bots, BotsConfig};
 use pmos_slack::nudge_copy::{self, Line, DRAFTS_WAITING};
 use pmos_slack::nudges::{self, Clock, NudgeConfig, Nudges, ACTION_NOT_NOW};
@@ -25,7 +25,14 @@ use tokio_util::sync::CancellationToken;
 
 const BOTS_TOKEN: &str = "test-bots-token-slack-0123456789abcdef";
 const TOOL_BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
-const TEAM: &str = "members:\n  - {handle: ana, slack-id: U0ANA, roles: [pm]}\n  - {handle: bob, slack-id: U0BOB, roles: [pm]}\n  - {handle: carol, slack-id: U0CAROL, roles: [pm]}\n";
+/// The user directory: Ana, Bob and Carol.
+fn team() -> Vec<pmos_directory::snapshot::DirectoryUser> {
+    vec![
+        person("ana", "U0ANA", &["pm"]),
+        person("bob", "U0BOB", &["pm"]),
+        person("carol", "U0CAROL", &["pm"]),
+    ]
+}
 
 // Tuesday 17 Nov 2026; Los Angeles is UTC-8, so 17:00Z is 09:00 there.
 const TUE_9AM_LA: &str = "2026-11-17T17:00:00Z";
@@ -104,7 +111,8 @@ struct Stack {
     slack_base: String,
     ts_base: String,
     state: tempfile::TempDir,
-    team: tempfile::TempDir,
+    content: tempfile::TempDir,
+    directory: Directory,
     stop: Vec<CancellationToken>,
 }
 
@@ -120,8 +128,8 @@ impl Stack {
                 .with_state(drafts.clone()),
         )
         .await;
-        let team = tempfile::tempdir().unwrap();
-        std::fs::write(team.path().join("team.yaml"), TEAM).unwrap();
+        let content = tempfile::tempdir().unwrap();
+        let directory = Directory::seeded(team()).await;
         Self {
             slack,
             drafts,
@@ -129,7 +137,8 @@ impl Stack {
             slack_base,
             ts_base,
             state: tempfile::tempdir().unwrap(),
-            team,
+            content,
+            directory,
             stop: vec![stop_slack, stop_ts],
         }
     }
@@ -148,7 +157,8 @@ impl Stack {
             slack: SlackApi::new(self.slack_base.clone(), SLACK_BOT_TOKEN, http.clone()),
             runtime: Runtime::new("http://127.0.0.1:9", BOTS_TOKEN, http),
             toolserver: ToolServer::new(&self.ts_base, TOOL_BOT_TOKEN),
-            team_file: self.team.path().join("team.yaml"),
+            people: self.directory.people(),
+            content_root: self.content.path().to_path_buf(),
             default_tz: "America/Los_Angeles".into(),
             github_org: None,
             response_url_prefix: "https://hooks.slack.com/".into(),

@@ -236,7 +236,10 @@ The user database records its own `users.create` and `users.deactivate` events b
 **New bot scopes** in `docs/slack-app-manifest.yaml` (keep the existing ones): `users:read`,
 `users:read.email` and `im:write`.
 
-**Someone not in `team.yaml` DMs PM OS, or uses `/docs`:**
+**Someone not in the user directory DMs PM OS, or uses `/docs`** (since slice U4b the Slack
+service reads who is who from the tool server's `GET /internal/directory`, never `team.yaml`;
+a deactivated person, an Auditor only, or anyone while the directory is more than 5 minutes
+old gets a plain note instead, `docs/user-database-spec.md` §2):
 - **The note:** "PM OS is for the product team." with a **Request access** button
   (`action_id: pmos_request_access`).
 - **Click:** call `users.info` for their `real_name` and `profile.email`. With no email, say so
@@ -253,8 +256,9 @@ The user database records its own `users.create` and `users.deactivate` events b
   admin's card can be updated once someone decides.
 
 **An admin decides:**
-- **Who may click:** the clicker must be an admin by Slack id in `team.yaml`; otherwise an
-  ephemeral "Only platform owners can decide this."
+- **Who may click:** the clicker must be an active admin by Slack id in the user directory, on
+  a snapshot at most 30 seconds old; otherwise an ephemeral "Only platform owners can decide
+  this." (or, past 30 seconds, "PM OS can't check your access right now", and nothing is sent).
 - **Call** the decision endpoint with `decided_by` set to the admin's handle.
 - **`github_not_linked` or `no_push`:** an ephemeral reply explains it. For `github_not_linked`
   it adds a **Connect GitHub** button (the OAuth start URL for the admin). Don't change the card.
@@ -284,7 +288,14 @@ The user database records its own `users.create` and `users.deactivate` events b
 - **`requests`** lists the pending requests with the same cards.
 - **`remove <handle>`** posts a confirmation card with **Remove** and **Cancel**
   (`pmos_member_remove_confirm` and `pmos_member_remove_cancel`). **Remove** calls the remove
-  endpoint and updates the card.
+  endpoint and updates the card. Since slice U3 that is a **deactivation** (nothing is
+  committed; `docs/user-database-spec.md` §6). Since slice U4b the Slack service checks the
+  admin and the target on a directory snapshot at most 30 seconds old before the card, and
+  says in plain words why not: an Admin or Auditor (never from Slack), someone already
+  deactivated, oneself, no such member. The tool server's refusals each get their own line
+  too: `403 protected_not_from_slack`, `429 deactivation_limit` (the hourly cap; host access
+  continues with `pmos-admin users deactivate`), `409 already_deactivated`, `409 last_admin`,
+  `409 owns_bots`, `403 self_removal`, `403 not_admin`, `404 not_a_member`.
 
 **Precedence:** these exact commands come before the bot routing. `docs: setup` still goes to
 the `docs` bot.

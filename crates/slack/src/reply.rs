@@ -13,6 +13,7 @@
 //! the item is still `pending`. Snoozes are kept in `<state dir>/snoozes.json` (ids and times
 //! only, never message text), so they survive a restart.
 
+use crate::people::Identity;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -375,17 +376,19 @@ impl Snoozer {
         let store = self.bots.snoozes();
         let mut posted = 0;
         for s in store.due(now) {
-            // The item is read for the PM who snoozed it; one who has left the team is
-            // dropped.
-            let Some(handle) = self
-                .bots
-                .team()
-                .by_slack_id(&s.user)
-                .map(|m| m.handle.clone())
-            else {
-                tracing::info!(approval = %s.approval_id, "snoozed by someone no longer in team.yaml; dropped");
-                store.remove(&s.approval_id);
-                continue;
+            // The item is read for the PM who snoozed it; one who may no longer use PM OS is
+            // dropped. While PM OS can't check who they are, the snooze waits.
+            let handle = match self.bots.people().identify(&s.user) {
+                Identity::Member(m) => m.handle,
+                Identity::CantCheck => {
+                    tracing::info!(approval = %s.approval_id, "the user directory isn't available; the snooze waits");
+                    continue;
+                }
+                other => {
+                    tracing::info!(approval = %s.approval_id, who = other.kind(), "snoozed by someone who may no longer use PM OS; dropped");
+                    store.remove(&s.approval_id);
+                    continue;
+                }
             };
             match self
                 .bots

@@ -198,10 +198,12 @@ impl Bots {
     }
 
     async fn on_mention(&self, m: Mention) {
-        let team = self.team();
-        let Some(member) = team.by_slack_id(&m.user) else {
-            tracing::info!(slack_id = %m.user, "tag from someone not in team.yaml");
-            return self.tell_thread(&m, NOT_A_MEMBER).await;
+        let who = self.people().identify(&m.user);
+        let Some(member) = who.member() else {
+            tracing::info!(slack_id = %m.user, who = who.kind(), "tag from someone who may not use PM OS");
+            return self
+                .tell_thread(&m, crate::people::refusal(&who, NOT_A_MEMBER))
+                .await;
         };
         let handle = member.handle.clone();
         let bot = personal_bot_name(&handle);
