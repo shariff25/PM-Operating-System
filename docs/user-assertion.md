@@ -452,7 +452,9 @@ Roll out in this order: shared pieces, then callers sending, then receivers enfo
 - [x] Do the same for calls made for the console viewer, with `iss=console`. This covers
       routine pause, resume and delete, task cancel, and anything that names `decided_by`.
       The console signs every runtime call as its viewer, and every tool-server call that
-      names a person as that person; it decides nothing and cancels nothing today.
+      names a person as that person; it decides nothing and cancels nothing today. Since
+      U4d the roles are the viewer's from the user database's `resolve` answer for the
+      request (none for an admin's read of another PM's inbox), never from `team.yaml`.
 - [x] ~~For reads that are "read everything" (no person), send no assertion.~~ Replaced (R1):
       there are no reads of everything any more. Every runtime call is signed for the viewer,
       and the runtime answers what that viewer may see (others' tasks and routines as

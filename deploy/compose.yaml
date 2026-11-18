@@ -244,7 +244,8 @@ services:
       # Its own read-only tool-server token, never the service token.
       PMOS_TOOLSERVER_TOKEN: ${PMOS_CONSOLE_TS_TOKEN:-}
       PMOS_ASSERTION_KEYS: console:bots:${PMOS_AK_CONSOLE_BOTS:-},console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER:-}
-      PMOS_CONTENT_ROOT: /srv/content-repo/content
+      # Who may use the console comes from the user database, through the tool server's
+      # `resolve` route with PMOS_TOOLSERVER_TOKEN; the console reads no content.
       PMOS_CONSOLE_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
       PMOS_CONSOLE_TRUST_PROXY: ${PMOS_CONSOLE_TRUST_PROXY:-0}
       # Required with TRUST_PROXY=1: the console refuses to start without it, naming it.
@@ -254,10 +255,10 @@ services:
       PMOS_CONSOLE_PUBLIC_URL: ${PMOS_CONSOLE_PUBLIC_URL:-}
       PMOS_CONSOLE_SLACK_URL: ${PMOS_CONSOLE_SLACK_URL:-}
     volumes:
-      - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
       - ${PMOS_STATE_DIR}/audit:/var/lib/pmos/audit:ro
     depends_on:
       bots: { condition: service_healthy }
+      toolserver: { condition: service_healthy }
     healthcheck:
       <<: *health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8760/healthz"]

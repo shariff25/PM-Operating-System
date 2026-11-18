@@ -6,22 +6,25 @@
 //! With a key for an upstream (`PMOS_ASSERTION_KEYS`), every call to the bot runtime carries
 //! a signed user assertion for the viewer (`X-Pmos-Assertion`, `docs/user-assertion.md`):
 //! issuer `console`, valid for 60 seconds, bound to the method, path, query and body sent,
-//! signed afresh for every call. The runtime decides from it what the viewer sees: their own
-//! tasks and routines, or for an admin everyone's with the ask, result and prompt of anyone
-//! else's left out. Tool-server calls carry one for the PM whose inbox is read.
+//! signed afresh for every call, with the viewer's roles from the user database's answer for
+//! this request. The runtime decides from it what the viewer sees: their own tasks and
+//! routines, or for an admin (by the runtime's own directory snapshot) everyone's with the
+//! ask, result and prompt of anyone else's left out. Tool-server calls carry one for the PM
+//! whose inbox is read.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use pmos_assertion::{Claims, KeyRing, RequestBinding};
-use pmos_contract::model::TeamFile;
+use pmos_contract::model::Role;
 use reqwest::header::{HeaderName, HeaderValue};
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
+
+use crate::auth::Viewer;
 
 /// How long the console waits for an upstream before showing an error page.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
@@ -280,8 +283,6 @@ pub struct Signer {
     issuer: &'static str,
     audience: String,
     ring: KeyRing,
-    /// Where `team.yaml` is: the subject's roles are read from it at each call.
-    content_root: PathBuf,
 }
 
 impl std::fmt::Debug for Signer {
@@ -296,34 +297,25 @@ impl std::fmt::Debug for Signer {
 
 impl Signer {
     /// As `issuer` (the console is `console`) for `audience` (`bots` or `toolserver`).
-    pub fn new(issuer: &'static str, audience: &str, ring: KeyRing, content_root: PathBuf) -> Self {
+    pub fn new(issuer: &'static str, audience: &str, ring: KeyRing) -> Self {
         Self {
             issuer,
             audience: audience.to_string(),
             ring,
-            content_root,
         }
     }
 
-    /// The subject's known roles in `team.yaml`; none if the file or the member is missing.
-    /// Receivers check roles against `team.yaml` themselves: these are informational.
-    fn roles(&self, subject: &str) -> Vec<pmos_contract::model::Role> {
-        TeamFile::load(&self.content_root)
-            .ok()
-            .and_then(|t| t.by_handle(subject).map(|m| m.roles.clone()))
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| r.is_known())
-            .collect()
-    }
-
     /// An assertion that `subject` is the person `request` is for, bound to it exactly as it
-    /// will be sent.
+    /// will be sent. `roles` are the subject's roles as the user database answered them for
+    /// this request (the viewer's), or none for someone else; receivers decide from their own
+    /// reading of the database, so these are informational. Unknown roles are left out.
     pub fn sign(
         &self,
         subject: &str,
+        roles: &[Role],
         request: &reqwest::Request,
     ) -> Result<HeaderValue, &'static str> {
+        let roles: Vec<Role> = roles.iter().filter(|r| r.is_known()).cloned().collect();
         let url = request.url();
         let target = match url.query() {
             Some(q) => format!("{}?{q}", url.path()),
@@ -339,7 +331,7 @@ impl Signer {
             self.issuer,
             &self.audience,
             subject,
-            &self.roles(subject),
+            &roles,
             ASSERTION_SESSION,
         )
         .map_err(|_| "can't sign for this person")?;
@@ -408,6 +400,22 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
+/// The person a call is for, and the roles its assertion carries.
+#[derive(Debug, Clone, Copy)]
+pub struct Subject<'a> {
+    pub handle: &'a str,
+    pub roles: &'a [Role],
+}
+
+impl<'a> From<&'a Viewer> for Subject<'a> {
+    fn from(v: &'a Viewer) -> Self {
+        Self {
+            handle: &v.handle,
+            roles: &v.roles,
+        }
+    }
+}
+
 /// An HTTP client for one upstream.
 #[derive(Clone)]
 pub struct Upstream {
@@ -456,7 +464,7 @@ impl Upstream {
     async fn send(
         &self,
         req: reqwest::RequestBuilder,
-        subject: Option<&str>,
+        subject: Option<Subject<'_>>,
     ) -> UpstreamResult<reqwest::Response> {
         let mut request = req
             .bearer_auth(&self.token)
@@ -465,7 +473,7 @@ impl Upstream {
             .map_err(|_| self.failed("couldn't build the request"))?;
         if let (Some(signer), Some(subject)) = (&self.signer, subject) {
             let value = signer
-                .sign(subject, &request)
+                .sign(subject.handle, subject.roles, &request)
                 .map_err(|why| self.failed(why))?;
             request
                 .headers_mut()
@@ -490,7 +498,7 @@ impl Upstream {
         &self,
         segments: &[&str],
         query: &[(&str, &str)],
-        subject: Option<&str>,
+        subject: Option<Subject<'_>>,
     ) -> UpstreamResult<T> {
         let url = self.url(segments)?;
         let res = self.send(self.http.get(url).query(query), subject).await?;
@@ -503,7 +511,7 @@ impl Upstream {
         &self,
         segments: &[&str],
         query: &[(&str, &str)],
-        subject: Option<&str>,
+        subject: Option<Subject<'_>>,
     ) -> UpstreamResult<Vec<T>> {
         Ok(self
             .get::<List<T>>(segments, query, subject)
@@ -515,13 +523,13 @@ impl Upstream {
 
     /// The bot roster, signed for `viewer`: under `require` every console call to the runtime
     /// carries the viewer's assertion.
-    pub async fn bots(&self, viewer: &str) -> UpstreamResult<Vec<BotSummary>> {
-        self.list(&["v1", "bots"], &[], Some(viewer)).await
+    pub async fn bots(&self, viewer: &Viewer) -> UpstreamResult<Vec<BotSummary>> {
+        self.list(&["v1", "bots"], &[], Some(viewer.into())).await
     }
 
-    pub async fn bot(&self, viewer: &str, name: &str) -> UpstreamResult<BotDetail> {
+    pub async fn bot(&self, viewer: &Viewer, name: &str) -> UpstreamResult<BotDetail> {
         Ok(self
-            .get::<BotDetailWire>(&["v1", "bots", name], &[], Some(viewer))
+            .get::<BotDetailWire>(&["v1", "bots", name], &[], Some(viewer.into()))
             .await?
             .into())
     }
@@ -531,7 +539,7 @@ impl Upstream {
     /// `requested_by`, when set, must be the viewer.
     pub async fn tasks(
         &self,
-        viewer: &str,
+        viewer: &Viewer,
         requested_by: Option<&str>,
         limit: u32,
     ) -> UpstreamResult<Vec<Task>> {
@@ -540,24 +548,26 @@ impl Upstream {
         if let Some(who) = requested_by {
             query.push(("requested_by", who));
         }
-        self.list(&["v1", "tasks"], &query, Some(viewer)).await
+        self.list(&["v1", "tasks"], &query, Some(viewer.into()))
+            .await
     }
 
     /// One task, with an assertion for `viewer`: under `require` the runtime answers only the
     /// task's own PM or an admin (`docs/user-assertion.md`, What each service does).
-    pub async fn task(&self, viewer: &str, id: &str) -> UpstreamResult<Task> {
-        self.get(&["v1", "tasks", id], &[], Some(viewer)).await
+    pub async fn task(&self, viewer: &Viewer, id: &str) -> UpstreamResult<Task> {
+        self.get(&["v1", "tasks", id], &[], Some(viewer.into()))
+            .await
     }
 
     /// A task's events, signed for `viewer` as [`Self::task`].
-    pub async fn task_events(&self, viewer: &str, id: &str) -> UpstreamResult<Vec<TaskEvent>> {
-        self.list(&["v1", "tasks", id, "events"], &[], Some(viewer))
+    pub async fn task_events(&self, viewer: &Viewer, id: &str) -> UpstreamResult<Vec<TaskEvent>> {
+        self.list(&["v1", "tasks", id, "events"], &[], Some(viewer.into()))
             .await
     }
 
     /// A task's trace, signed for `viewer` as [`Self::task`].
-    pub async fn task_trace(&self, viewer: &str, id: &str) -> UpstreamResult<Vec<TraceEntry>> {
-        self.list(&["v1", "tasks", id, "trace"], &[], Some(viewer))
+    pub async fn task_trace(&self, viewer: &Viewer, id: &str) -> UpstreamResult<Vec<TraceEntry>> {
+        self.list(&["v1", "tasks", id, "trace"], &[], Some(viewer.into()))
             .await
     }
 
@@ -565,18 +575,19 @@ impl Upstream {
     /// prompt (`hidden`). `owner`, when set, must be the viewer.
     pub async fn routines(
         &self,
-        viewer: &str,
+        viewer: &Viewer,
         owner: Option<&str>,
     ) -> UpstreamResult<Vec<Routine>> {
         let query: Vec<(&str, &str)> = owner.map(|o| ("owner", o)).into_iter().collect();
-        self.list(&["v1", "routines"], &query, Some(viewer)).await
+        self.list(&["v1", "routines"], &query, Some(viewer.into()))
+            .await
     }
 
     /// Pause or resume a routine, with an assertion for `viewer`, the person who asked. The
     /// console has checked they may (their own routine, or any for an admin).
     pub async fn set_routine_enabled(
         &self,
-        viewer: &str,
+        viewer: &Viewer,
         id: &str,
         enabled: bool,
     ) -> UpstreamResult<()> {
@@ -585,31 +596,46 @@ impl Upstream {
             self.http
                 .patch(url)
                 .json(&serde_json::json!({ "enabled": enabled })),
-            Some(viewer),
+            Some(viewer.into()),
         )
         .await
         .map(drop)
     }
 
     /// Delete a routine, with an assertion for `viewer`, as [`Self::set_routine_enabled`].
-    pub async fn delete_routine(&self, viewer: &str, id: &str) -> UpstreamResult<()> {
+    pub async fn delete_routine(&self, viewer: &Viewer, id: &str) -> UpstreamResult<()> {
         let url = self.url(&["v1", "routines", id])?;
-        self.send(self.http.delete(url), Some(viewer))
+        self.send(self.http.delete(url), Some(viewer.into()))
             .await
             .map(drop)
     }
 
     // The tool server.
 
-    /// A PM's pending approvals, newest first, with an assertion for that PM.
+    /// A PM's pending approvals, newest first, with an assertion for that PM (the tool server
+    /// answers an inbox only to an assertion for its own PM). It carries the viewer's roles
+    /// when the PM is the viewer, and none for an admin's read of another PM's inbox: the
+    /// console has no answer about that PM, and roles in an assertion are informational.
     /// Every pending item: the tool server never cuts them at its cap on decided items, and
     /// says `truncated` if it ever left some out past its much higher safety cap.
-    pub async fn pending_approvals(&self, user: &str) -> UpstreamResult<PendingPage> {
+    pub async fn pending_approvals(
+        &self,
+        viewer: &Viewer,
+        user: &str,
+    ) -> UpstreamResult<PendingPage> {
+        let subject = if user == viewer.handle {
+            Subject::from(viewer)
+        } else {
+            Subject {
+                handle: user,
+                roles: &[],
+            }
+        };
         let page = self
             .get::<ApprovalList>(
                 &["internal", "approvals"],
                 &[("user", user), ("status", "pending")],
-                Some(user),
+                Some(subject),
             )
             .await?;
         Ok(match page {

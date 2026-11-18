@@ -22,11 +22,172 @@ const TOOLS_TOKEN: &str = "toolserver-console-token-0123456789ab";
 const PROXY_SECRET: &str = "proxy-secret-0123456789abcdef0123456";
 const HOSTILE: &str = "<script>alert('x')</script>";
 
-const TEAM: &str = "members:
-  - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm]}
-  - {handle: ben, slack-id: U0BEN, roles: [pm]}
-  - {handle: root, slack-id: U0ROOT, email: root@example.com, roles: [pm, admin]}
+/// One seeded user: (handle, sign-in name, confirmed, status, roles).
+type Seed = (
+    &'static str,
+    Option<&'static str>,
+    bool,
+    &'static str,
+    &'static [&'static str],
+);
+
+/// One user as the mock keeps it, in the order of [`Seed`].
+type Row = (String, Option<String>, bool, String, Vec<String>);
+
+/// The user database as the mock tool server's `resolve` answers it.
+const USERS: &[Seed] = &[
+    ("ana", Some("ana@example.com"), true, "active", &["pm"]),
+    ("ben", None, false, "active", &["pm"]),
+    (
+        "root",
+        Some("root@example.com"),
+        true,
+        "active",
+        &["pm", "admin"],
+    ),
+    // An Auditor only: no console.
+    (
+        "audrey",
+        Some("audrey@example.com"),
+        true,
+        "active",
+        &["auditor"],
+    ),
+    // A PM who is also an Auditor: a PM here, not an admin.
+    (
+        "dot",
+        Some("dot@example.com"),
+        true,
+        "active",
+        &["pm", "auditor"],
+    ),
+    // A Reviewer only.
+    ("rae", None, false, "active", &["reviewer"]),
+    // Joined through the Slack bot client: sign-in name not confirmed yet.
+    (
+        "newbie",
+        Some("newbie@example.com"),
+        false,
+        "active",
+        &["pm"],
+    ),
+    // Deactivated, with the roles kept.
+    (
+        "olga",
+        Some("olga@example.com"),
+        true,
+        "deactivated",
+        &["pm", "admin"],
+    ),
+];
+
+/// A hostile `team.yaml`: `mallory` as an admin with Ana's address, and Ana made an admin.
+/// The console reads no team file, so none of it counts.
+const HOSTILE_TEAM: &str = "members:
+  - {handle: mallory, slack-id: U0ANA, email: ana@example.com, roles: [pm, admin]}
+  - {handle: ana, slack-id: U0ANA2, email: mallory@example.com, roles: [pm, admin]}
+  - {handle: audrey, slack-id: U0AUD, email: audrey@example.com, roles: [pm, admin]}
+  - {handle: olga, slack-id: U0OLGA, email: olga@example.com, roles: [pm, admin]}
 ";
+
+/// The mock tool server's user database: the rows `resolve` answers from, and whether the
+/// store is down (`503`).
+struct Directory {
+    users: Mutex<Vec<Row>>,
+    down: std::sync::atomic::AtomicBool,
+    seen: Seen,
+}
+
+impl Default for Directory {
+    fn default() -> Self {
+        Self {
+            users: Mutex::new(
+                USERS
+                    .iter()
+                    .map(|(h, n, c, s, r)| {
+                        (
+                            h.to_string(),
+                            n.map(String::from),
+                            *c,
+                            s.to_string(),
+                            r.iter().map(|r| r.to_string()).collect(),
+                        )
+                    })
+                    .collect(),
+            ),
+            down: Default::default(),
+            seen: Seen::default(),
+        }
+    }
+}
+
+impl Directory {
+    fn set(&self, handle: &str, status: &str, roles: &[&str]) {
+        let mut users = self.users.lock().unwrap();
+        let row = users.iter_mut().find(|u| u.0 == handle).unwrap();
+        row.3 = status.to_string();
+        row.4 = roles.iter().map(|r| r.to_string()).collect();
+    }
+
+    fn down(&self, down: bool) {
+        self.down.store(down, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The resolve calls so far: their queries.
+    fn lookups(&self) -> Vec<String> {
+        self.seen
+            .calls()
+            .into_iter()
+            .map(|(_, uri, ..)| {
+                uri.split_once('?')
+                    .map(|q| q.1.to_string())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+}
+
+async fn resolve(
+    State(dir): State<Arc<Directory>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    dir.seen.record(&method, &uri, &headers, &[]);
+    if headers.get("authorization").and_then(|v| v.to_str().ok())
+        != Some(&format!("Bearer {TOOLS_TOKEN}"))
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if dir.down.load(std::sync::atomic::Ordering::SeqCst) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"code": "unavailable"})),
+        )
+            .into_response();
+    }
+    let users = dir.users.lock().unwrap();
+    let found = match (
+        q.get("by").map(String::as_str),
+        q.get("handle"),
+        q.get("name"),
+    ) {
+        (Some("handle"), Some(h), _) => users.iter().find(|u| &u.0 == h),
+        (Some("sign_in_name"), _, Some(n)) => users
+            .iter()
+            .find(|u| u.1.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(n))),
+        _ => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    };
+    match found {
+        Some((handle, _, confirmed, status, roles)) => Json(json!({
+            "handle": handle, "display_name": handle, "status": status, "roles": roles,
+            "entra": "none", "sign_in_name_confirmed": confirmed, "dual_role": false,
+        }))
+        .into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({"code": "not_found"}))).into_response(),
+    }
+}
 
 /// Every call an upstream saw: method, path and query, the bearer token, and the body.
 /// Method, path and query, raw body, and the user assertion if any, of one call.
@@ -262,6 +423,14 @@ async fn toolserver(
         .into_response()
 }
 
+/// A URL nothing listens on.
+async fn closed_port() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    url
+}
+
 async fn serve(app: Router) -> (String, CancellationToken) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -282,6 +451,10 @@ struct Console {
     secret: Option<String>,
     runtime: Arc<Seen>,
     tools: Arc<Seen>,
+    directory: Arc<Directory>,
+    /// The mock runtime's and tool server's URLs.
+    bots_url: String,
+    tools_url: String,
     http: reqwest::Client,
     _dir: tempfile::TempDir,
     _stop: Vec<CancellationToken>,
@@ -294,6 +467,10 @@ struct Options {
     slack: bool,
     /// Keys for both upstreams, as `PMOS_ASSERTION_KEYS` would give them.
     sign: bool,
+    /// The resolve client's clock; the system clock when `None`.
+    clock: Option<pmos_directory::resolve::Clock>,
+    /// The tool server's `resolve` can't be reached at all (a closed port).
+    directory_unreachable: bool,
 }
 
 impl Default for Options {
@@ -306,13 +483,39 @@ impl Default for Options {
             audit: true,
             slack: true,
             sign: false,
+            clock: None,
+            directory_unreachable: false,
         }
+    }
+}
+
+/// A clock tests move by hand.
+#[derive(Clone)]
+struct FakeClock(Arc<Mutex<chrono::DateTime<chrono::Utc>>>);
+
+impl FakeClock {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(
+            chrono::DateTime::parse_from_rfc3339("2026-11-18T09:00:00Z")
+                .unwrap()
+                .into(),
+        )))
+    }
+
+    fn clock(&self) -> pmos_directory::resolve::Clock {
+        let now = self.0.clone();
+        Arc::new(move || *now.lock().unwrap())
+    }
+
+    fn advance(&self, secs: i64) {
+        *self.0.lock().unwrap() += chrono::Duration::seconds(secs);
     }
 }
 
 async fn console(opts: Options) -> Console {
     let runtime_seen = Arc::new(Seen::default());
     let tools_seen = Arc::new(Seen::default());
+    let directory = Arc::new(Directory::default());
     let (bots_url, stop_bots) = serve(
         Router::new()
             .fallback(runtime)
@@ -322,7 +525,12 @@ async fn console(opts: Options) -> Console {
     let (tools_url, stop_tools) = serve(
         Router::new()
             .route("/internal/approvals", get(toolserver))
-            .with_state(tools_seen.clone()),
+            .with_state(tools_seen.clone())
+            .merge(
+                Router::new()
+                    .route("/internal/users/resolve", get(resolve))
+                    .with_state(directory.clone()),
+            ),
     )
     .await;
     if !opts.runtime_up {
@@ -330,7 +538,6 @@ async fn console(opts: Options) -> Console {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
     let audit_path = dir.path().join("audit.jsonl");
     {
         let mut f = std::fs::File::create(&audit_path).unwrap();
@@ -357,38 +564,53 @@ async fn console(opts: Options) -> Console {
     let (mut bots_token, mut toolserver_token): (Credentials, Credentials) =
         (BOTS_TOKEN.into(), TOOLS_TOKEN.into());
     if opts.sign {
-        let root = dir.path().to_path_buf();
         bots_token = bots_token.with_signer(Signer::new(
             "console",
             "bots",
             ring("cb1", CONSOLE_BOTS_KEY),
-            root.clone(),
         ));
         toolserver_token = toolserver_token.with_signer(Signer::new(
             "console",
             "toolserver",
             ring("ct1", CONSOLE_TOOLS_KEY),
-            root,
         ));
     }
+    let resolve_url = if opts.directory_unreachable {
+        closed_port().await
+    } else {
+        tools_url.clone()
+    };
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         identity: opts.identity,
-        bots_url,
+        bots_url: bots_url.clone(),
         bots_token,
-        toolserver_url: tools_url,
+        toolserver_url: tools_url.clone(),
         toolserver_token,
-        content_root: dir.path().to_path_buf(),
         audit_log: opts.audit.then_some(audit_path),
         slack_url: opts.slack.then(|| "https://acme.slack.com".to_string()),
         public_url: None,
     };
-    let (base, stop_console) = serve(pmos_console::router(config)).await;
+    let transport = pmos_directory::resolve::HttpTransport::new(
+        reqwest::Client::new(),
+        &resolve_url,
+        TOOLS_TOKEN,
+    );
+    let clock = opts.clock.unwrap_or_else(|| Arc::new(chrono::Utc::now));
+    let resolver = pmos_directory::resolve::ResolveClient::new(Arc::new(transport), clock);
+    let (base, stop_console) = serve(pmos_console::app::router_with_directory(
+        config,
+        Arc::new(resolver),
+    ))
+    .await;
     Console {
         base,
         secret,
         runtime: runtime_seen,
         tools: tools_seen,
+        directory,
+        bots_url,
+        tools_url,
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -450,20 +672,26 @@ fn assert_escaped(body: &str) {
 }
 
 #[tokio::test]
-async fn auth_needs_a_team_member() {
+async fn auth_needs_a_user() {
     let c = console(Options::default()).await;
     // No user at all.
     let (status, body) = c.get(None, "/bots").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(body.contains("Not signed in"));
-    // Someone not in team.yaml, with a hostile name.
+    // A hostile name that is neither a handle nor a sign-in name: refused without a lookup,
+    // and never echoed.
     let (status, body) = c.get(Some("mallory<script>"), "/activity").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(body.contains("mallory&lt;script&gt;"));
+    assert!(!body.contains("mallory"));
     assert_escaped(&body);
+    assert!(c.directory.lookups().is_empty(), "junk costs no miss");
+    // Someone the user database doesn't know.
+    let (status, body) = c.get(Some("mallory"), "/activity").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("Not a PM OS user"), "{body}");
     // Refused requests never reach an upstream.
     assert!(c.runtime.calls().is_empty() && c.tools.calls().is_empty());
-    // A member, by handle or by email.
+    // A user, by handle or by sign-in name.
     assert_eq!(c.get(Some("ana"), "/bots").await.0, StatusCode::OK);
     let (status, body) = c.get(Some("ROOT@example.com"), "/bots").await;
     assert_eq!(status, StatusCode::OK);
@@ -580,13 +808,34 @@ async fn without_the_proxy_secret_the_forwarded_user_is_ignored() {
     // Liveness needs nobody.
     assert_eq!(bypass(&c, &[], "", "/healthz").await.0, StatusCode::OK);
 
-    // Nothing logged, by any test so far, holds the secret, a wrong secret, or the user named
-    // by a request that failed the check.
+    // Sign-in names, for the log check below: looked up, found or refused.
+    for user in [
+        "ana@example.com",
+        "audrey@example.com",
+        "olga@example.com",
+        "newbie@example.com",
+        "nobody-7f3a@example.com",
+    ] {
+        c.get(Some(user), "/bots").await;
+    }
+
+    // Nothing logged, by any test so far, holds the secret, a wrong secret, the user named by
+    // a request that failed the check, a token, or a sign-in name.
     tracing::info!("log capture is working");
     let logs = String::from_utf8_lossy(&logs.lock().unwrap()).to_string();
     assert!(logs.contains("log capture is working"), "{logs}");
     assert!(logs.contains("no valid X-Pmos-Proxy-Secret"), "{logs}");
-    for needle in [PROXY_SECRET, wrong, short, "bypass-mallory-7f3a"] {
+    assert!(logs.contains("refused a console viewer"), "{logs}");
+    for needle in [
+        PROXY_SECRET,
+        wrong,
+        short,
+        "bypass-mallory-7f3a",
+        TOOLS_TOKEN,
+        BOTS_TOKEN,
+        "@example.com",
+        "nobody-7f3a",
+    ] {
         assert!(!logs.contains(needle), "logs contain {needle}:\n{logs}");
     }
 }
@@ -1296,5 +1545,350 @@ async fn without_keys_the_console_sends_no_assertion() {
             .unwrap()
             .iter()
             .all(|(.., a)| a.is_none()));
+    }
+}
+
+// The user database (docs/user-database-spec.md §2, U4d).
+
+#[tokio::test]
+async fn the_proxy_names_a_person_by_sign_in_name_or_by_handle() {
+    let c = console(Options::default()).await;
+    // By sign-in name, in any case: Ana, a PM.
+    let (status, body) = c.get(Some("Ana@Example.COM"), "/bots").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<p class=\"who\">ana</p>"), "{body}");
+    assert!(!body.contains("bot-pm-ben"));
+    // By handle: the same person (the answer is kept under her handle too, so no new call).
+    let (status, body) = c.get(Some("ana"), "/bots").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<p class=\"who\">ana</p>"));
+    // Ben, who has no sign-in name, by handle.
+    let (status, body) = c.get(Some("ben"), "/bots").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<p class=\"who\">ben</p>") && !body.contains("bot-pm-ana"));
+    // Root by sign-in name is an admin.
+    let (status, body) = c.get(Some("root@example.com"), "/bots").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("root · admin") && body.contains("bot-pm-ben"));
+    // Each lookup went to `resolve` the way it was presented; a sign-in name lower-cased.
+    assert_eq!(
+        c.directory.lookups(),
+        vec![
+            "by=sign_in_name&name=ana%40example.com",
+            "by=handle&handle=ben",
+            "by=sign_in_name&name=root%40example.com",
+        ]
+    );
+    // A Reviewer may use the console (their own things).
+    assert_eq!(c.get(Some("rae"), "/activity").await.0, StatusCode::OK);
+    // A sign-in name nobody has, and one no admin has confirmed yet.
+    let (status, body) = c.get(Some("mallory@example.com"), "/bots").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("Not a PM OS user"));
+    let (status, body) = c.get(Some("newbie@example.com"), "/bots").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        body.contains("hasn&#39;t confirmed your sign-in name"),
+        "{body}"
+    );
+    // Every lookup used the console's own tool server token.
+    assert!(c
+        .directory
+        .seen
+        .calls()
+        .iter()
+        .all(|(_, _, auth, _)| auth == &format!("Bearer {TOOLS_TOKEN}")));
+}
+
+#[tokio::test]
+async fn an_auditor_only_person_gets_no_console() {
+    let c = console(Options::default()).await;
+    for who in ["audrey", "audrey@example.com"] {
+        for path in [
+            "/bots",
+            "/routines",
+            "/approvals",
+            "/activity",
+            "/tasks/tsk_ana1",
+        ] {
+            let (status, body) = c.get(Some(who), path).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{who} {path}");
+            assert!(
+                body.contains("the audit log is in the web app"),
+                "{who} {path}: {body}"
+            );
+        }
+    }
+    let res = c
+        .post("audrey", "/routines/rtn_ana1/pause", "x", Some(&c.base))
+        .await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(c.runtime.calls().is_empty() && c.tools.calls().is_empty());
+    // An Auditor who is also a PM is a PM here: their own only, not an admin.
+    let (status, body) = c.get(Some("dot"), "/bots").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("· admin") && !body.contains("bot-pm-ben"));
+    let (_, body) = c.get(Some("dot"), "/approvals").await;
+    assert!(!body.contains("slack.post_message"));
+}
+
+#[tokio::test]
+async fn a_deactivated_or_unknown_person_is_refused() {
+    let c = console(Options::default()).await;
+    // Olga is deactivated; her kept `admin` role grants nothing.
+    for who in ["olga", "olga@example.com"] {
+        let (status, body) = c.get(Some(who), "/bots").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{who}");
+        assert!(body.contains("deactivated"), "{body}");
+    }
+    assert_eq!(
+        c.get(Some("nobody"), "/bots").await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert!(c.runtime.calls().is_empty() && c.tools.calls().is_empty());
+}
+
+/// A deactivation, or a removed role, is seen within the 10-second cache: the answer is used
+/// for under 10 seconds, then asked for again.
+#[tokio::test]
+async fn a_change_in_the_directory_counts_within_ten_seconds() {
+    let clock = FakeClock::new();
+    let c = console(Options {
+        clock: Some(clock.clock()),
+        ..Options::default()
+    })
+    .await;
+    assert_eq!(c.get(Some("ana"), "/bots").await.0, StatusCode::OK);
+    let (_, body) = c.get(Some("root"), "/bots").await;
+    assert!(body.contains("root · admin"));
+    c.directory.set("ana", "deactivated", &["pm"]);
+    c.directory.set("root", "active", &["pm"]);
+    // Inside the cache: the earlier answer, with no new lookup.
+    clock.advance(9);
+    let lookups = c.directory.lookups().len();
+    assert_eq!(c.get(Some("ana"), "/bots").await.0, StatusCode::OK);
+    assert!(c
+        .get(Some("root"), "/bots")
+        .await
+        .1
+        .contains("root · admin"));
+    assert_eq!(
+        c.directory.lookups().len(),
+        lookups,
+        "served from the cache"
+    );
+    // At 10 seconds the change counts.
+    clock.advance(1);
+    let (status, body) = c.get(Some("ana"), "/bots").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("deactivated"));
+    let (status, body) = c.get(Some("root"), "/bots").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("· admin") && !body.contains("bot-pm-ben"));
+    let (_, body) = c.get(Some("root"), "/routines").await;
+    assert!(!body.contains("rtn_ana1"), "no longer everyone's routines");
+    // Reactivated: back within the same bound.
+    c.directory.set("ana", "active", &["pm"]);
+    clock.advance(10);
+    assert_eq!(c.get(Some("ana"), "/bots").await.0, StatusCode::OK);
+}
+
+/// When the tool server can't answer, the console refuses: `503 users_unavailable`, with no
+/// fallback to a kept answer (or to any file).
+#[tokio::test]
+async fn without_the_user_database_the_console_refuses() {
+    let c = console(Options {
+        directory_unreachable: true,
+        ..Options::default()
+    })
+    .await;
+    for who in ["ana", "root@example.com"] {
+        let (status, body) = c.get(Some(who), "/bots").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{who}");
+        assert!(body.contains("users_unavailable"), "{body}");
+    }
+    assert!(c.runtime.calls().is_empty() && c.tools.calls().is_empty());
+
+    // Reachable, then the store fails: the kept answer is not used once it is 10 seconds old.
+    let clock = FakeClock::new();
+    let c = console(Options {
+        clock: Some(clock.clock()),
+        ..Options::default()
+    })
+    .await;
+    assert_eq!(c.get(Some("root"), "/bots").await.0, StatusCode::OK);
+    c.directory.down(true);
+    clock.advance(10);
+    let before = c.runtime.calls().len();
+    for path in ["/bots", "/approvals", "/routines"] {
+        let (status, body) = c.get(Some("root"), path).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert!(body.contains("users_unavailable"));
+    }
+    assert_eq!(c.runtime.calls().len(), before);
+    c.directory.down(false);
+    assert_eq!(c.get(Some("root"), "/bots").await.0, StatusCode::OK);
+}
+
+/// The console reads no team file: a hostile `team.yaml` in its content root (the setting it
+/// used to read) changes nothing, and neither does having none.
+#[tokio::test]
+async fn a_hostile_or_missing_team_file_changes_nothing() {
+    let c = console(Options::default()).await;
+    let content = tempfile::tempdir().unwrap();
+    std::fs::write(content.path().join("team.yaml"), HOSTILE_TEAM).unwrap();
+    for present in [true, false] {
+        if !present {
+            std::fs::remove_file(content.path().join("team.yaml")).unwrap();
+        }
+        let root = content.path().display().to_string();
+        let config = Config::from_lookup(|k| {
+            match k {
+                "PMOS_BOTS_TOKEN" => Some(BOTS_TOKEN),
+                "PMOS_TOOLSERVER_TOKEN" => Some(TOOLS_TOKEN),
+                "PMOS_CONSOLE_TRUST_PROXY" => Some("1"),
+                "PMOS_CONSOLE_PROXY_SECRET" => Some(PROXY_SECRET),
+                "PMOS_CONTENT_ROOT" => Some(root.as_str()),
+                "PMOS_BOTS_URL" => Some(c.bots_url.as_str()),
+                "PMOS_TOOLSERVER_URL" => Some(c.tools_url.as_str()),
+                _ => None,
+            }
+            .map(String::from)
+        })
+        .unwrap();
+        // The production router: resolve at PMOS_TOOLSERVER_URL with the console's token.
+        let (base, stop) = serve(pmos_console::router(config)).await;
+        let get = |user: &'static str, path: &'static str| {
+            let base = base.clone();
+            async move {
+                let res = reqwest::Client::new()
+                    .get(format!("{base}{path}"))
+                    .header("x-pmos-proxy-secret", PROXY_SECRET)
+                    .header("x-forwarded-user", user)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = res.status();
+                (status, res.text().await.unwrap())
+            }
+        };
+        // Mallory, by handle or by the address the file gives her: nobody.
+        for who in ["mallory", "mallory@example.com"] {
+            for path in ["/bots", "/approvals", "/tasks/tsk_ana1"] {
+                assert_eq!(
+                    get(who, path).await.0,
+                    StatusCode::FORBIDDEN,
+                    "{present} {who} {path}"
+                );
+            }
+        }
+        // The file can't make Ana an admin, revive Olga or give Audrey a console.
+        let (status, body) = get("ana@example.com", "/bots").await;
+        assert_eq!(status, StatusCode::OK, "{present}");
+        assert!(body.contains("<p class=\"who\">ana</p>") && !body.contains("· admin"));
+        assert!(!body.contains("bot-pm-ben"));
+        assert_eq!(get("ana", "/tasks/tsk_ben1").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get("olga", "/bots").await.0, StatusCode::FORBIDDEN);
+        assert_eq!(get("audrey", "/bots").await.0, StatusCode::FORBIDDEN);
+        // The real admin is unaffected.
+        assert!(get("root", "/bots").await.1.contains("root · admin"));
+        stop.cancel();
+    }
+}
+
+/// No decision path in the console reads the team file: nothing in its code names it.
+#[test]
+fn the_console_reads_no_team_file() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let path = entry.unwrap().path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for (n, line) in text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or_default();
+            for banned in [
+                "TeamFile",
+                "TeamMember",
+                "team.yaml",
+                "load_team",
+                "content_root",
+                "PMOS_CONTENT_ROOT",
+                "team::",
+            ] {
+                assert!(
+                    !code.contains(banned),
+                    "{}:{}: `{banned}` in the console's code",
+                    path.display(),
+                    n + 1
+                );
+            }
+        }
+        checked += 1;
+    }
+    assert!(checked >= 8, "read every source file");
+}
+
+/// The assertion carries the viewer's roles from the user database's answer for this
+/// request; an admin's read of another PM's inbox is signed for that PM with no roles.
+#[tokio::test]
+async fn assertions_carry_the_roles_the_directory_gave() {
+    use pmos_contract::model::Role;
+    let c = console(Options {
+        sign: true,
+        ..Options::default()
+    })
+    .await;
+    let verify = |seen: &Seen, audience: &str, key: (&str, &str)| {
+        let cache = pmos_assertion::MemoryReplayCache::default();
+        let policy = pmos_assertion::VerifyPolicy::new(audience, &["console"]).unwrap();
+        seen.asserted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(m, u, b, a)| {
+                let binding = pmos_assertion::RequestBinding::new(m, u, b).unwrap();
+                let a = ring(key.0, key.1)
+                    .verify(
+                        a.as_deref()?,
+                        &policy,
+                        pmos_assertion::unix_now(),
+                        Some(&binding),
+                        &cache,
+                    )
+                    .unwrap();
+                Some((a.subject().to_string(), a.roles().to_vec()))
+            })
+            .collect::<Vec<_>>()
+    };
+    c.get(Some("ana"), "/activity").await;
+    c.get(Some("ana"), "/approvals").await;
+    let signed: Vec<_> = verify(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY))
+        .into_iter()
+        .chain(verify(&c.tools, "toolserver", ("ct1", CONSOLE_TOOLS_KEY)))
+        .collect();
+    assert!(signed.len() >= 2);
+    for (subject, roles) in signed {
+        assert_eq!((subject.as_str(), roles), ("ana", vec![Role::Pm]));
+    }
+    c.runtime.asserted.lock().unwrap().clear();
+    c.tools.asserted.lock().unwrap().clear();
+    c.get(Some("root"), "/approvals").await;
+    let runtime = verify(&c.runtime, "bots", ("cb1", CONSOLE_BOTS_KEY));
+    assert!(!runtime.is_empty());
+    for (subject, roles) in runtime {
+        assert_eq!(subject, "root");
+        assert_eq!(roles, vec![Role::Pm, Role::Admin]);
+    }
+    let tools = verify(&c.tools, "toolserver", ("ct1", CONSOLE_TOOLS_KEY));
+    let mut subjects: Vec<&str> = tools.iter().map(|(s, _)| s.as_str()).collect();
+    subjects.sort();
+    assert_eq!(subjects, vec!["ana", "ben", "root"]);
+    for (subject, roles) in &tools {
+        let want = if subject == "root" {
+            vec![Role::Pm, Role::Admin]
+        } else {
+            vec![]
+        };
+        assert_eq!(roles, &want, "{subject}");
     }
 }
