@@ -217,7 +217,8 @@ pub enum ResolveError {
     /// last answer for this lookup, if there is one, with its age.
     Unavailable {
         why: &'static str,
-        last_known_good: Option<LastKnown>,
+        /// Boxed so the error stays small (`clippy::result_large_err`).
+        last_known_good: Option<Box<LastKnown>>,
     },
 }
 
@@ -473,7 +474,7 @@ impl ResolveClient {
             tracing::warn!(kind = lookup.kind(), why, "user directory unavailable");
             ResolveError::Unavailable {
                 why,
-                last_known_good: self.last_known(lookup, now),
+                last_known_good: self.last_known(lookup, now).map(Box::new),
             }
         };
         let reply = match self.transport.send(request).await {
