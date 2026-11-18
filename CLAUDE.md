@@ -4,7 +4,7 @@ The owner's requirements for the PM OS build. Read this before planning or build
 the owner on 2026-11-16 and 2026-11-17 (three decisions of 2026-11-17 reached this session through
 the reviewer session: the user database, the required assertion, 90-day purge); update it when they change something.
 
-## Scope (the owner's list, a to g and i; h was dropped)
+## Scope (the owner's list, a to f and i; g and h were dropped)
 
 - **a. Authentication:** primarily Azure AD (Entra ID) single sign-on.
 - **b. Authorization:** role-based access with four roles: Admin, Product Manager, Reviewer,
@@ -20,7 +20,10 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
 - **f. Audit logging.** Retention: purge at 90 days, no archive. One controlled job deletes
   older events and records its own run; nothing else can delete, and it cannot delete newer
   events.
-- **g. Connectors.**
+- **g. Dropped by the owner on 2026-11-18:** connectors. The owner wants MCP servers used
+  instead of the connectors. Do not build further connector work. Recorded only: the existing
+  connector code is untouched, and the move to MCP servers is not planned or started until
+  the owner says so.
 - **i. Model providers:** the application must be able to switch between different model
   providers, and behave like OpenRouter: one interface in front of many providers and
   models, chosen by configuration. If a model is not available, the system switches
