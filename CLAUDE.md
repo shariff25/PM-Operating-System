@@ -21,9 +21,9 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   older events and records its own run; nothing else can delete, and it cannot delete newer
   events.
 - **g. Dropped by the owner on 2026-11-18:** connectors. The owner wants MCP servers used
-  instead of the connectors. Do not build further connector work. Recorded only: the existing
-  connector code is untouched, and the move to MCP servers is not planned or started until
-  the owner says so.
+  instead of the connectors. The connector code is to be removed and an MCP feature added in
+  its place (owner, 2026-11-18). Plan only for now: do not remove or build anything until the
+  owner approves the plan.
 - **i. Model providers:** the application must be able to switch between different model
   providers, and behave like OpenRouter: one interface in front of many providers and
   models, chosen by configuration. If a model is not available, the system switches
