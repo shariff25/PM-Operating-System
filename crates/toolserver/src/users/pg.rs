@@ -142,6 +142,14 @@ async fn load_directory(conn: &mut PgConnection, now: DateTime<Utc>) -> StoreRes
     dir.version = sqlx::query_scalar("SELECT v FROM directory_version")
         .fetch_one(&mut *conn)
         .await?;
+    for row in sqlx::query("SELECT reviewer, pm FROM reviewer_assignments")
+        .fetch_all(&mut *conn)
+        .await?
+    {
+        let reviewer: String = row.try_get("reviewer")?;
+        let pm: String = row.try_get("pm")?;
+        dir.assignments.entry(reviewer).or_default().insert(pm);
+    }
     Ok(dir)
 }
 
@@ -261,6 +269,32 @@ async fn execute(conn: &mut PgConnection, writes: &[Write]) -> Result<(), sqlx::
                 .execute(&mut *conn)
                 .await?;
             }
+            Write::SetAssignments {
+                reviewer,
+                pms,
+                at,
+                by,
+            } => {
+                let pms: Vec<&str> = pms.iter().map(String::as_str).collect();
+                sqlx::query(
+                    "DELETE FROM reviewer_assignments WHERE reviewer = $1 AND NOT (pm = ANY($2))",
+                )
+                .bind(reviewer)
+                .bind(&pms)
+                .execute(&mut *conn)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO reviewer_assignments (reviewer, pm, assigned_by, assigned_at)
+                     SELECT $1, pm, $3, $4 FROM unnest($2::text[]) AS pm
+                     ON CONFLICT (reviewer, pm) DO NOTHING",
+                )
+                .bind(reviewer)
+                .bind(&pms)
+                .bind(by)
+                .bind(at)
+                .execute(&mut *conn)
+                .await?;
+            }
         }
     }
     Ok(())
@@ -288,6 +322,13 @@ async fn run_effect(
         }
         Effect::CloseHeldDrafts(h) => {
             store::close_owner_drafts(conn, h, now).await?;
+        }
+        Effect::DeleteCredential(h, provider) => {
+            sqlx::query("DELETE FROM credentials WHERE user_handle = $1 AND provider = $2")
+                .bind(h)
+                .bind(provider.as_str())
+                .execute(&mut *conn)
+                .await?;
         }
     }
     Ok(())
@@ -344,6 +385,7 @@ fn map_db(e: sqlx::Error) -> UserError {
                     "users_sign_in_name" => "that sign-in name belongs to another user",
                     "users_atlassian_email" => "that Atlassian email belongs to another user",
                     "users_github_login" => "that GitHub login belongs to another user",
+                    "reviewer_assignments_pkey" => "that assignment is already there",
                     "users_pkey" => "that handle is taken (handles are never reused)",
                     "user_identities_kind_issuer_subject_key" => {
                         "that key belongs to another user (one person per key)"
@@ -370,14 +412,20 @@ fn map_db(e: sqlx::Error) -> UserError {
 }
 
 impl PgStore {
-    async fn apply_in_tx(&self, actor: &Actor, op: &Op, now: DateTime<Utc>) -> UserResult<Applied> {
+    async fn apply_in_tx(
+        &self,
+        actor: &Actor,
+        op: &Op,
+        now: DateTime<Utc>,
+        expected: Option<i64>,
+    ) -> UserResult<Applied> {
         let mut tx = self.pool().begin().await.map_err(StoreError::from)?;
         sqlx::query(LOCK)
             .execute(&mut *tx)
             .await
             .map_err(StoreError::from)?;
         let dir = load_directory(&mut tx, now).await?;
-        let plan = rules::plan(&dir, actor, op, now, &self.users_rules())?;
+        let plan = rules::plan_expecting(&dir, actor, op, now, &self.users_rules(), expected)?;
         execute(&mut tx, &plan.writes).await.map_err(map_db)?;
         for effect in &plan.effects {
             run_effect(&mut tx, effect, now)
@@ -409,8 +457,14 @@ impl UserStore for PgStore {
         load_directory(&mut conn, now).await
     }
 
-    async fn apply(&self, actor: &Actor, op: Op, now: DateTime<Utc>) -> UserResult<Applied> {
-        match self.apply_in_tx(actor, &op, now).await {
+    async fn apply_expecting(
+        &self,
+        actor: &Actor,
+        op: Op,
+        now: DateTime<Utc>,
+        expected: Option<i64>,
+    ) -> UserResult<Applied> {
+        match self.apply_in_tx(actor, &op, now, expected).await {
             Ok(applied) => Ok(applied),
             Err(e) => {
                 if let Some(refusal) = e.refusal() {

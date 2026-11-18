@@ -68,6 +68,14 @@ pub enum Write {
         ended_at: DateTime<Utc>,
         ended_by: String,
     },
+    /// The whole set of PMs assigned to `reviewer` (`reviewer_assignments`, migration 0018):
+    /// rows not in `pms` go, new ones are added with `at` and `by`, kept ones are untouched.
+    SetAssignments {
+        reviewer: String,
+        pms: BTreeSet<String>,
+        at: DateTime<Utc>,
+        by: String,
+    },
 }
 
 /// Whom a write touched: the trigger checks Admin+Auditor and the `evals` rule for these.
@@ -93,6 +101,9 @@ pub enum Effect {
     /// The grace is over: close the person's pending drafts as the system (`rejected`, ledger
     /// reason `owner_deactivated`); no write runs.
     CloseHeldDrafts(String),
+    /// An admin unlinked the person's Atlassian or GitHub identity: delete that linked
+    /// account too, so another one can be linked (§6).
+    DeleteCredential(String, crate::vault::Provider),
 }
 
 /// One audit event a write records.
@@ -400,6 +411,24 @@ pub fn apply_writes(dir: &mut Directory, writes: &[Write]) -> UserResult<()> {
                 dir.exception = Some(e.clone());
             }
             Write::EndException { .. } => dir.exception = None,
+            Write::SetAssignments { reviewer, pms, .. } => {
+                for h in std::iter::once(reviewer).chain(pms.iter()) {
+                    if !dir.users.contains_key(h) {
+                        return Err(not_found(h));
+                    }
+                }
+                if pms.contains(reviewer) {
+                    return Err(refused(
+                        Refusal::Invalid,
+                        "a reviewer is never assigned to review themselves",
+                    ));
+                }
+                if pms.is_empty() {
+                    dir.assignments.remove(reviewer);
+                } else {
+                    dir.assignments.insert(reviewer.clone(), pms.clone());
+                }
+            }
         }
     }
     Ok(())
@@ -475,6 +504,9 @@ pub(crate) struct Builder<'a> {
     touched: Touched,
     effects: Vec<Effect>,
 }
+
+/// The most PMs one reviewer may be assigned (a bound on one write, not a policy).
+pub const MAX_ASSIGNED_PMS: usize = 200;
 
 impl<'a> Builder<'a> {
     fn new(dir: &'a Directory, actor: &'a Actor, now: DateTime<Utc>) -> Self {
@@ -759,6 +791,42 @@ pub fn plan(
     now: DateTime<Utc>,
     rules: &Rules,
 ) -> UserResult<Plan> {
+    plan_expecting(dir, actor, op, now, rules, None)
+}
+
+/// [`plan`], for a write made against the directory at `expected_version` (slice U5): once
+/// the actor and the change pass every rule of their own, a directory whose version isn't
+/// `expected_version` refuses it [`Refusal::Stale`], before the invariants are checked. So a
+/// refusal that doesn't depend on what moved (not an admin, oneself, host only) is reported
+/// as itself, and a write that would have gone through on a directory that moved is `stale`.
+pub fn plan_expecting(
+    dir: &Directory,
+    actor: &Actor,
+    op: &Op,
+    now: DateTime<Utc>,
+    rules: &Rules,
+    expected_version: Option<i64>,
+) -> UserResult<Plan> {
+    let b = build(dir, actor, op, now, rules)?;
+    if let Some(expected) = expected_version {
+        if expected != dir.version {
+            return Err(refused(
+                Refusal::Stale,
+                "the team changed since this page loaded: reload it and try again",
+            ));
+        }
+    }
+    b.finish(rules)
+}
+
+/// Every op's own rules, into a builder not yet checked against the invariants.
+fn build<'a>(
+    dir: &'a Directory,
+    actor: &'a Actor,
+    op: &Op,
+    now: DateTime<Utc>,
+    rules: &Rules,
+) -> UserResult<Builder<'a>> {
     if actor.via == Via::Host && actor.host_user.is_none() {
         return Err(refused(
             Refusal::Invalid,
@@ -972,112 +1040,15 @@ pub fn plan(
             b.lines
                 .push(format!("`{handle}` has a host-confirmed Entra link"));
         }
-        Op::UnsetEntra { handle } => {
-            match actor.via {
-                Via::Host => {}
-                Via::Web => {
-                    b.actor_is_admin()?;
-                    b.not_self(handle)?;
-                    if b.need(handle)?.protected() {
-                        return Err(refused(
-                            Refusal::HostOnly,
-                            "an Admin's or Auditor's Entra link changes on the host only",
-                        ));
-                    }
-                }
-                Via::Bot => {
-                    return Err(refused(
-                        Refusal::NotFromSlack,
-                        "Entra links never change from Slack",
-                    ))
-                }
-                _ => return Err(refused(Refusal::Invalid, "not a client that unlinks")),
-            }
-            if b.need(handle)?.identity(IdentityKind::Entra).is_none() {
-                return Err(refused(
-                    Refusal::Unchanged,
-                    format!("`{handle}` has no Entra link"),
-                ));
-            }
-            b.unlink(handle, IdentityKind::Entra);
-            b.event("users.identity_unlink", handle, vec!["entra".into()]);
-            b.lines.push(format!("`{handle}`'s Entra link removed"));
-        }
+        Op::UnsetEntra { handle } => unlink_identity(&mut b, handle, IdentityKind::Entra)?,
+        Op::Unlink { handle, kind } => unlink_identity(&mut b, handle, *kind)?,
         Op::SetField {
             handle,
             field,
             value,
-        } => {
-            let user = b.need(handle)?;
-            match actor.via {
-                Via::Host => {}
-                Via::Web => {
-                    b.actor_is_admin()?;
-                    b.not_self(handle)?;
-                    if user.protected() {
-                        return Err(refused(
-                            Refusal::HostOnly,
-                            "an Admin's or Auditor's addresses change on the host only",
-                        ));
-                    }
-                    if *field == Field::AtlassianEmail
-                        && user.identity(IdentityKind::Atlassian).is_some()
-                    {
-                        return Err(refused(
-                            Refusal::Linked,
-                            "the Atlassian account is linked: its account id decides; unlink first",
-                        ));
-                    }
-                }
-                Via::Bot => {
-                    return Err(refused(
-                        Refusal::NotFromSlack,
-                        "addresses never change from Slack",
-                    ))
-                }
-                _ => return Err(refused(Refusal::Invalid, "not a client that sets fields")),
-            }
-            let what = match field {
-                Field::SignInName => "sign-in name",
-                Field::AtlassianEmail => "Atlassian email",
-            };
-            let value = address(value, what)?;
-            let mut row = user.clone();
-            match field {
-                Field::SignInName => {
-                    if row.sign_in_name.as_deref() == Some(value.as_str())
-                        && row.sign_in_name_confirmed_at.is_some()
-                    {
-                        return Err(refused(
-                            Refusal::Unchanged,
-                            format!("that is already `{handle}`'s confirmed sign-in name"),
-                        ));
-                    }
-                    row.sign_in_name = Some(value);
-                    // Setting it is also the confirmation (§6).
-                    row.sign_in_name_confirmed_at = Some(now);
-                    row.sign_in_name_confirmed_by = Some(actor.name.clone());
-                }
-                Field::AtlassianEmail => {
-                    if row.atlassian_email.as_deref() == Some(value.as_str()) {
-                        return Err(refused(
-                            Refusal::Unchanged,
-                            format!("that is already `{handle}`'s Atlassian email"),
-                        ));
-                    }
-                    row.atlassian_email = Some(value);
-                }
-            }
-            b.update(row);
-            b.change(
-                handle,
-                ChangeKind::SetField,
-                None,
-                Some(field.as_str().to_string()),
-            );
-            b.event("users.fields", handle, vec![field.as_str().to_string()]);
-            b.lines.push(format!("`{handle}`: {what} set"));
-        }
+        } => set_fields(&mut b, handle, &[(*field, value.clone())])?,
+        Op::SetFields { handle, values } => set_fields(&mut b, handle, values)?,
+        Op::AssignReviewer { reviewer, pms } => assign_reviewer(&mut b, reviewer, pms)?,
         Op::Deactivate { handle } => {
             match actor.via {
                 Via::Host | Via::Web | Via::Bot => {}
@@ -1370,5 +1341,285 @@ pub fn plan(
             ));
         }
     }
-    b.finish(rules)
+    Ok(b)
+}
+
+/// Remove `handle`'s identity of `kind` (§6, §7). The host may remove any; an admin in web may
+/// remove another person's, but an Admin's or Auditor's Entra link only on the host. An
+/// Atlassian or GitHub identity takes its linked account with it, so another account can be
+/// linked (the email or login then decides the next first link).
+fn unlink_identity(b: &mut Builder<'_>, handle: &str, kind: IdentityKind) -> UserResult<()> {
+    match b.actor.via {
+        Via::Host => {}
+        Via::Web => {
+            b.actor_is_admin()?;
+            b.not_self(handle)?;
+            if kind == IdentityKind::Entra && b.need(handle)?.protected() {
+                return Err(refused(
+                    Refusal::HostOnly,
+                    "an Admin's or Auditor's Entra link changes on the host only",
+                ));
+            }
+        }
+        Via::Bot => {
+            return Err(refused(
+                Refusal::NotFromSlack,
+                "identities never change from Slack",
+            ))
+        }
+        _ => return Err(refused(Refusal::Invalid, "not a client that unlinks")),
+    }
+    let provider = match kind {
+        IdentityKind::Entra => None,
+        IdentityKind::Atlassian => Some(crate::vault::Provider::Atlassian),
+        IdentityKind::Github => Some(crate::vault::Provider::Github),
+        IdentityKind::Slack => {
+            return Err(refused(
+                Refusal::Invalid,
+                "a Slack key isn't unlinked: it comes with the join or the import",
+            ))
+        }
+    };
+    if b.need(handle)?.identity(kind).is_none() {
+        return Err(refused(
+            Refusal::Unchanged,
+            format!("`{handle}` has no {} link", kind.as_str()),
+        ));
+    }
+    b.unlink(handle, kind);
+    if let Some(p) = provider {
+        b.effects
+            .push(Effect::DeleteCredential(handle.to_string(), p));
+    }
+    b.event("users.identity_unlink", handle, vec![kind.as_str().into()]);
+    b.lines
+        .push(format!("`{handle}`'s {} link removed", kind.as_str()));
+    Ok(())
+}
+
+/// Set `values` on `handle` in one write (§6 "When addresses may change"). From the web: an
+/// active admin, never an address of their own, never an Admin's or Auditor's address (host
+/// only), an Atlassian email or GitHub login only while no account of that kind is linked
+/// (after the first link its account id decides). The display name may be set by an admin
+/// for anyone, themselves included. Setting the sign-in name also confirms it: the same
+/// value, unconfirmed, is recorded as a confirmation; the same value, confirmed, is no change.
+fn set_fields(b: &mut Builder<'_>, handle: &str, values: &[(Field, String)]) -> UserResult<()> {
+    let user = b.need(handle)?;
+    match b.actor.via {
+        Via::Host => {}
+        Via::Web => {
+            b.actor_is_admin()?;
+            if values.iter().any(|(f, _)| f.is_address()) {
+                b.not_self(handle)?;
+                if user.protected() {
+                    return Err(refused(
+                        Refusal::HostOnly,
+                        "an Admin's or Auditor's addresses change on the host only",
+                    ));
+                }
+            }
+        }
+        Via::Bot => {
+            return Err(refused(
+                Refusal::NotFromSlack,
+                "addresses never change from Slack",
+            ))
+        }
+        _ => return Err(refused(Refusal::Invalid, "not a client that sets fields")),
+    }
+    if values.is_empty() {
+        return Err(refused(
+            Refusal::Invalid,
+            "name at least one field to change",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    if !values.iter().all(|(f, _)| seen.insert(*f)) {
+        return Err(refused(Refusal::Invalid, "each field at most once"));
+    }
+    let web = b.actor.via == Via::Web;
+    for (field, kind, name) in [
+        (Field::AtlassianEmail, IdentityKind::Atlassian, "Atlassian"),
+        (Field::GithubLogin, IdentityKind::Github, "GitHub"),
+    ] {
+        if web && seen.contains(&field) && user.identity(kind).is_some() {
+            return Err(refused(
+                Refusal::Linked,
+                format!("the {name} account is linked: its account id decides; unlink it first"),
+            ));
+        }
+    }
+    let mut row = user.clone();
+    let mut changed: Vec<(Field, ChangeKind)> = Vec::new();
+    for (field, raw) in values {
+        match field {
+            Field::SignInName => {
+                let value = address(raw, field.label())?;
+                let same = row.sign_in_name.as_deref() == Some(value.as_str());
+                if same && row.sign_in_name_confirmed_at.is_some() {
+                    continue;
+                }
+                row.sign_in_name = Some(value);
+                // Setting it is also the confirmation (§6).
+                row.sign_in_name_confirmed_at = Some(b.now);
+                row.sign_in_name_confirmed_by = Some(b.actor.name.clone());
+                let kind = if same {
+                    ChangeKind::ConfirmSignInName
+                } else {
+                    ChangeKind::SetField
+                };
+                changed.push((*field, kind));
+            }
+            Field::AtlassianEmail => {
+                let value = address(raw, field.label())?;
+                if row.atlassian_email.as_deref() != Some(value.as_str()) {
+                    row.atlassian_email = Some(value);
+                    changed.push((*field, ChangeKind::SetField));
+                }
+            }
+            Field::GithubLogin => {
+                let value = github_login(raw)?;
+                if row.github_login.as_deref() != Some(value.as_str()) {
+                    row.github_login = Some(value);
+                    changed.push((*field, ChangeKind::SetField));
+                }
+            }
+            Field::DisplayName => {
+                let value = clean_display_name(raw);
+                if row.display_name != value {
+                    row.display_name = value;
+                    changed.push((*field, ChangeKind::SetField));
+                }
+            }
+        }
+    }
+    if changed.is_empty() {
+        return Err(refused(
+            Refusal::Unchanged,
+            format!("those are already `{handle}`'s values"),
+        ));
+    }
+    b.update(row);
+    let mut parts = Vec::new();
+    for (field, kind) in &changed {
+        b.change(handle, *kind, None, Some(field.as_str().to_string()));
+        parts.push(if *kind == ChangeKind::ConfirmSignInName {
+            "sign_in_name confirmed".to_string()
+        } else {
+            field.as_str().to_string()
+        });
+        b.lines.push(format!("`{handle}`: {} set", field.label()));
+    }
+    b.event("users.fields", handle, parts);
+    Ok(())
+}
+
+/// The whole set of PMs assigned to `reviewer` (§8). From the web only, by an active admin,
+/// never with themselves as the reviewer. Each PM added must be an active user holding `pm`,
+/// and the reviewer an active user holding `reviewer`, unless the set is empty: clearing is
+/// always allowed (a reviewer who lost the role keeps inert assignments until cleared).
+fn assign_reviewer(b: &mut Builder<'_>, reviewer: &str, pms: &BTreeSet<String>) -> UserResult<()> {
+    match b.actor.via {
+        Via::Web => {
+            b.actor_is_admin()?;
+            b.not_self(reviewer)?;
+        }
+        Via::Bot => {
+            return Err(refused(
+                Refusal::NotFromSlack,
+                "reviewers are assigned in the web app",
+            ))
+        }
+        _ => {
+            return Err(refused(
+                Refusal::Invalid,
+                "reviewers are assigned in the web app",
+            ))
+        }
+    }
+    let rev = b.need(reviewer)?;
+    if pms.len() > MAX_ASSIGNED_PMS {
+        return Err(refused(
+            Refusal::Invalid,
+            format!("at most {MAX_ASSIGNED_PMS} PMs per reviewer"),
+        ));
+    }
+    if pms.contains(reviewer) {
+        return Err(refused(
+            Refusal::Invalid,
+            "a reviewer is never assigned to review themselves",
+        ));
+    }
+    if !pms.is_empty() {
+        if !rev.active() {
+            return Err(refused(
+                Refusal::NotActive,
+                format!("`{reviewer}` is deactivated"),
+            ));
+        }
+        if !rev.has(UserRole::Reviewer) {
+            return Err(refused(
+                Refusal::NotReviewer,
+                format!("`{reviewer}` doesn't hold the reviewer role"),
+            ));
+        }
+    }
+    let current = b.dir.reviews(reviewer);
+    for pm in pms.difference(&current) {
+        let u = b.need(pm)?;
+        if !u.active() {
+            return Err(refused(
+                Refusal::NotActive,
+                format!("`{pm}` is deactivated"),
+            ));
+        }
+        if !u.has(UserRole::Pm) {
+            return Err(refused(
+                Refusal::NotPm,
+                format!("`{pm}` doesn't hold the pm role"),
+            ));
+        }
+    }
+    let added: Vec<String> = pms.difference(&current).cloned().collect();
+    let removed: Vec<String> = current.difference(pms).cloned().collect();
+    if added.is_empty() && removed.is_empty() {
+        return Err(refused(
+            Refusal::Unchanged,
+            format!("those are already `{reviewer}`'s PMs"),
+        ));
+    }
+    b.writes.push(Write::SetAssignments {
+        reviewer: reviewer.to_string(),
+        pms: pms.clone(),
+        at: b.now,
+        by: b.actor.name.clone(),
+    });
+    for pm in &added {
+        b.change(
+            reviewer,
+            ChangeKind::Assign,
+            Some(UserRole::Reviewer),
+            Some(format!("pm {pm}")),
+        );
+    }
+    for pm in &removed {
+        b.change(
+            reviewer,
+            ChangeKind::Unassign,
+            Some(UserRole::Reviewer),
+            Some(format!("pm {pm}")),
+        );
+    }
+    b.event(
+        "reviewers.assign",
+        reviewer,
+        vec![format!("{} pms", pms.len())],
+    );
+    b.lines.push(format!(
+        "`{reviewer}` reviews {} PM(s): {} added, {} removed",
+        pms.len(),
+        added.len(),
+        removed.len()
+    ));
+    Ok(())
 }

@@ -35,7 +35,10 @@
 //!
 //!   The user database's read API (`app/directory.rs`) has its own allow-list per route: the
 //!   directory for the orchestrator and the Slack bot, `resolve` for `pmos-web` and the
-//!   console, the first Entra link for `pmos-web`.
+//!   console, the first Entra link for `pmos-web`. Its Admin API (`app/users.rs`, slice U5a)
+//!   is `pmos-web`'s alone, writes only in assertion `require` and with a signed assertion for
+//!   the acting admin; the console's one extra route, `GET /internal/console/members`, lists
+//!   handles for an admin's Approvals screen.
 //!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
@@ -77,6 +80,7 @@ use pmos_contract::Sensitivity;
 
 mod admin;
 pub mod directory;
+mod users;
 
 /// What the Slack bot's token may do.
 #[derive(Clone)]
@@ -276,7 +280,9 @@ pub fn router_full(
         .merge(approvals)
         .merge(admin::routes(state.clone()))
         // The user database's read API (`directory.rs`): each route its own clients.
-        .merge(directory::routes(state.clone()));
+        .merge(directory::routes(state.clone()))
+        // The Admin API (`users.rs`): pmos-web's writes, and the console's listing.
+        .merge(users::routes(state.clone()));
 
     Router::new()
         // Liveness: the process answers. Readiness: its dependencies do too.

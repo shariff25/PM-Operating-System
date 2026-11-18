@@ -2,8 +2,9 @@
 //!
 //! Slice U1 built the store; since slice U3 the tool server decides from it (who may have a
 //! session, decide an approval, link an account, read the admin screens, approve a join;
-//! [`access::People`]). The runtime, Slack, `pmos-web` and the console still read
-//! `content/team.yaml` until slices U4a-d. What is here:
+//! [`access::People`]); the runtime, Slack, `pmos-web` and the console since slices U4a-d;
+//! and since slice U5a admins change it from the web app (`app/users.rs`, the Admin API).
+//! What is here:
 //!
 //! - the model ([`User`], [`UserRole`], [`Identity`], [`RoleChange`], [`PilotException`]);
 //! - [`UserStore`], with a Postgres implementation (`pg.rs`, migration 0015) and an in-memory
@@ -403,6 +404,9 @@ pub struct Directory {
     pub capped_deactivations: Vec<DateTime<Utc>>,
     /// The directory's version (the ETag, slice U2).
     pub version: i64,
+    /// Reviewer assignments (§8, slice U5): each reviewer's handle and the PMs assigned to
+    /// them. Kept, inert, when either person loses the role or is deactivated.
+    pub assignments: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Directory {
@@ -420,6 +424,20 @@ impl Directory {
     /// May a person hold Admin and Auditor right now?
     pub fn exception_in_force(&self, now: DateTime<Utc>) -> bool {
         self.exception.as_ref().is_some_and(|e| e.in_force(now))
+    }
+
+    /// The PMs assigned to `reviewer` (empty when none).
+    pub fn reviews(&self, reviewer: &str) -> BTreeSet<String> {
+        self.assignments.get(reviewer).cloned().unwrap_or_default()
+    }
+
+    /// The reviewers `pm` is assigned to.
+    pub fn reviewers_of(&self, pm: &str) -> Vec<String> {
+        self.assignments
+            .iter()
+            .filter(|(_, pms)| pms.contains(pm))
+            .map(|(r, _)| r.clone())
+            .collect()
     }
 
     /// Active people holding both Admin and Auditor.
@@ -563,10 +581,16 @@ pub enum Refusal {
     DifferentAccount,
     /// Past the grace: nothing left to clean up yet, or the person isn't deactivated.
     NotDue,
+    /// The directory moved since the `expected_version` the write was made against (U5).
+    Stale,
+    /// A reviewer assignment names someone who doesn't hold `reviewer` (U5).
+    NotReviewer,
+    /// A reviewer assignment names a PM who doesn't hold `pm` (U5).
+    NotPm,
 }
 
 impl Refusal {
-    pub const ALL: [Refusal; 29] = [
+    pub const ALL: [Refusal; 32] = [
         Self::Invalid,
         Self::NotFound,
         Self::Exists,
@@ -596,6 +620,9 @@ impl Refusal {
         Self::ImportRefused,
         Self::DifferentAccount,
         Self::NotDue,
+        Self::Stale,
+        Self::NotReviewer,
+        Self::NotPm,
     ];
 
     pub fn code(self) -> &'static str {
@@ -629,6 +656,9 @@ impl Refusal {
             Self::ImportRefused => "import_refused",
             Self::DifferentAccount => "different_account",
             Self::NotDue => "not_due",
+            Self::Stale => "stale",
+            Self::NotReviewer => "not_reviewer",
+            Self::NotPm => "not_pm",
         }
     }
 
@@ -693,18 +723,50 @@ pub enum AdminEntra {
     Keep,
 }
 
-/// An address field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A field of a user an admin (web) or the host may change (§6 "When addresses may change").
+/// The first three are addresses: never on oneself, and for an Admin or Auditor on the host
+/// only. The display name is untrusted text, changed by an admin for anyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Field {
     SignInName,
     AtlassianEmail,
+    GithubLogin,
+    DisplayName,
 }
 
 impl Field {
+    pub const ALL: [Field; 4] = [
+        Self::SignInName,
+        Self::AtlassianEmail,
+        Self::GithubLogin,
+        Self::DisplayName,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SignInName => "sign_in_name",
             Self::AtlassianEmail => "atlassian_email",
+            Self::GithubLogin => "github_login",
+            Self::DisplayName => "display_name",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.as_str() == s)
+    }
+
+    /// An address: never changed on oneself; for an Admin or Auditor, on the host only.
+    pub fn is_address(self) -> bool {
+        self != Self::DisplayName
+    }
+
+    /// How a person reads it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SignInName => "sign-in name",
+            Self::AtlassianEmail => "Atlassian email",
+            Self::GithubLogin => "GitHub login",
+            Self::DisplayName => "display name",
         }
     }
 }
@@ -748,6 +810,23 @@ pub enum Op {
         field: Field,
         value: String,
     },
+    /// Several fields at once, whole or not at all (web, U5: `PUT …/fields` and the sign-in
+    /// name confirmation). Setting the sign-in name also confirms it.
+    SetFields {
+        handle: String,
+        values: Vec<(Field, String)>,
+    },
+    /// Remove an identity (U5): `entra` (a reassigned mailbox, §7), or `atlassian` / `github`,
+    /// which also deletes that linked account so another can be linked (§6).
+    Unlink {
+        handle: String,
+        kind: IdentityKind,
+    },
+    /// The whole set of PMs assigned to a reviewer (§8; web, U5).
+    AssignReviewer {
+        reviewer: String,
+        pms: BTreeSet<String>,
+    },
     Deactivate {
         handle: String,
     },
@@ -787,7 +866,9 @@ impl Op {
             Self::GrantAdmin { .. } => "users.grant_admin",
             Self::SetEntra { .. } => "users.set_entra",
             Self::UnsetEntra { .. } => "users.identity_unlink",
-            Self::SetField { .. } => "users.fields",
+            Self::SetField { .. } | Self::SetFields { .. } => "users.fields",
+            Self::Unlink { .. } => "users.identity_unlink",
+            Self::AssignReviewer { .. } => "reviewers.assign",
             Self::Deactivate { .. } => "users.deactivate",
             Self::Reactivate { .. } => "users.reactivate",
             Self::ExceptionOn { .. } | Self::ExceptionOff { .. } => "users.pilot_exception",
@@ -807,10 +888,13 @@ impl Op {
             | Self::SetEntra { handle, .. }
             | Self::UnsetEntra { handle }
             | Self::SetField { handle, .. }
+            | Self::SetFields { handle, .. }
+            | Self::Unlink { handle, .. }
             | Self::Deactivate { handle }
             | Self::Reactivate { handle }
             | Self::LinkAccount { handle, .. }
             | Self::EndGrace { handle } => handle.clone(),
+            Self::AssignReviewer { reviewer, .. } => reviewer.clone(),
             Self::ExceptionOn { .. } | Self::ExceptionOff { .. } | Self::Import(_) => "*".into(),
         }
     }
@@ -833,7 +917,20 @@ pub trait UserStore: Send + Sync {
     /// Plan `op` against the current directory under the users lock, check the result, write
     /// it with its `role_changes` rows and audit events in one transaction. A refusal records
     /// a `denied` audit event and changes nothing else.
-    async fn apply(&self, actor: &Actor, op: Op, now: DateTime<Utc>) -> UserResult<Applied>;
+    async fn apply(&self, actor: &Actor, op: Op, now: DateTime<Utc>) -> UserResult<Applied> {
+        self.apply_expecting(actor, op, now, None).await
+    }
+
+    /// [`UserStore::apply`], made against the directory at `expected_version` (U5's
+    /// `expected_version`): a write that would otherwise be allowed is refused
+    /// [`Refusal::Stale`] when the directory moved since (`rules::plan_expecting`).
+    async fn apply_expecting(
+        &self,
+        actor: &Actor,
+        op: Op,
+        now: DateTime<Utc>,
+        expected_version: Option<i64>,
+    ) -> UserResult<Applied>;
 
     /// `role_changes`, newest first; for one target when given.
     async fn role_changes(

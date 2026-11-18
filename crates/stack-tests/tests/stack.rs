@@ -532,3 +532,89 @@ async fn a_deactivation_in_the_user_database_ends_the_web_session_within_ten_sec
     assert_eq!(status, StatusCode::FORBIDDEN);
     stack.login("ben").await;
 }
+
+/// Slice U5a on the real tool server: an admin's Team screen calls go through `pmos-web` to the
+/// tool server's Admin API, signed for the admin, and its rules answer: the list, a role
+/// change with `expected_version`, a stale one, a self-change, and an invite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_changes_people_through_pmos_web_and_the_tool_server_decides() {
+    let s = start().await;
+    let admin = s.login("stack-admin").await;
+    let (status, list, _) = s
+        .send(Some(&admin), Method::GET, "/api/admin/users", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["view"], "admin");
+    let version = list["version"].as_i64().unwrap();
+    let ana = list["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["handle"] == "ana")
+        .unwrap();
+    assert_eq!(ana["sign_in_name"], "ana@example.com");
+    assert!(ana.get("slack_id").is_none() && ana.get("oid").is_none());
+
+    let (status, done, _) = s
+        .send(
+            Some(&admin),
+            Method::PUT,
+            "/api/admin/users/ana/roles",
+            Some(json!({"roles": ["pm", "reviewer"], "expected_version": version})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(done["user"]["roles"], json!(["pm", "reviewer"]));
+    // The same version again: the directory moved.
+    let (status, body, _) = s
+        .send(
+            Some(&admin),
+            Method::PUT,
+            "/api/admin/users/ben/roles",
+            Some(json!({"roles": ["pm", "reviewer"], "expected_version": version})),
+        )
+        .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("stale"))
+    );
+    // Nobody changes their own status.
+    let (status, body, _) = s
+        .send(
+            Some(&admin),
+            Method::POST,
+            "/api/admin/users/stack-admin/deactivate",
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("self_change"))
+    );
+    // Invite: the new person signs in at once.
+    let (status, body, _) = s
+        .send(
+            Some(&admin),
+            Method::POST,
+            "/api/admin/users",
+            Some(
+                json!({"handle": "cy", "display_name": "Cy", "sign_in_name": "cy@example.com",
+                        "atlassian_email": "cy@example.com", "roles": ["pm"]}),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["user"]["sign_in_name_confirmed"], true);
+    s.login("cy").await;
+    // A PM may not.
+    let ben = s.login("ben").await;
+    let (status, _, _) = s
+        .send(
+            Some(&ben),
+            Method::POST,
+            "/api/admin/users/cy/deactivate",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

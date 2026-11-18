@@ -78,8 +78,14 @@ fn role_token(t: &str) -> bool {
 }
 
 fn is_safe_part(part: &str) -> bool {
-    const FIXED: [&str; 13] = [
+    const FIXED: [&str; 18] = [
         "off",
+        "sign_in_name confirmed",
+        // The Admin API's refusals before the store sees a write (`app/users.rs`).
+        "bad_request",
+        "assertion_required",
+        "bad_assertion",
+        "owns_bots",
         "bootstrap",
         "sign_in_name",
         "atlassian_email",
@@ -118,6 +124,10 @@ fn is_safe_part(part: &str) -> bool {
         if let Some(rest) = part.strip_prefix(prefix) {
             return count(rest);
         }
+    }
+    // `reviewers.assign`: how many PMs the reviewer now has.
+    if let Some(n) = part.strip_suffix(" pms") {
+        return count(n);
     }
     // A role delta, possibly followed by `on deactivation`: `+reviewer -pm`.
     let tokens = part
@@ -169,6 +179,8 @@ mod tests {
             vec!["entra".into()],
             vec!["last_admin".into()],
             vec!["sign_in_name".into()],
+            vec!["sign_in_name confirmed".into(), "display_name".into()],
+            vec!["3 pms".into()],
         ] {
             let d = join(Some(&raj), &parts).unwrap();
             assert!(is_safe(&d), "{d}");
@@ -185,6 +197,8 @@ mod tests {
             "+superuser",
             "entra; 00000000-0000-0000-0000-000000000000",
             "created lots",
+            "many pms",
+            "ana pms",
         ] {
             assert!(!is_safe(bad), "{bad}");
         }

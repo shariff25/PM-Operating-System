@@ -874,6 +874,30 @@ impl ToolServer {
         Ok((status, body))
     }
 
+    /// The user database's Admin API (`/internal/admin/{segments…}?user=<viewer>`, slice U5a):
+    /// `method`, with `body` as JSON when given, and an assertion for `viewer` bound to exactly
+    /// that request. Gives back the tool server's status and JSON body (`Value::Null` when it
+    /// isn't JSON) whatever the status: the route words its own answer from the code.
+    pub async fn admin_users(
+        &self,
+        viewer: &str,
+        method: reqwest::Method,
+        segments: &[&str],
+        body: Option<&Value>,
+    ) -> UpstreamResult<(u16, Value)> {
+        let mut path = vec!["internal", "admin"];
+        path.extend_from_slice(segments);
+        let url = self.0.url(&path)?;
+        let mut req = self.0.http.request(method, url).query(&[("user", viewer)]);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let res = self.0.execute(req, Some(viewer), TIMEOUT).await?;
+        let status = res.status().as_u16();
+        let body = res.json::<Value>().await.unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
     /// `GET /internal/admin/{route}?user=<viewer>&…`, as [`Self::admin`], but giving back the
     /// tool server's status and JSON body whatever the status.
     pub async fn admin_raw(

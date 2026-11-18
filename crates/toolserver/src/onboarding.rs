@@ -163,6 +163,21 @@ impl From<Refusal> for Stop {
     }
 }
 
+/// The team bots `handle` owns (their personal bot aside): a deactivation, from Slack or the
+/// web, is refused `409 owns_bots` while there are any, so every team bot keeps an owner who
+/// is a member (spec §6 "Deactivation").
+pub fn owned_team_bots(svc: &ToolService, handle: &str) -> Vec<String> {
+    let personal = personal_bot_name(handle);
+    let mut owned: Vec<String> = svc
+        .roster()
+        .bots()
+        .filter(|b| b.owner == handle && b.name != personal)
+        .map(|b| b.name.clone())
+        .collect();
+    owned.sort();
+    owned
+}
+
 /// A refused or failed user write, as the API answers it.
 fn user_refusal(e: UserError) -> Refusal {
     use crate::users::Refusal as R;
@@ -867,13 +882,7 @@ impl Onboarding {
         // A team bot needs an owner who is a member: its owner must change first. The
         // personal bot stays in content, refused while its owner is deactivated.
         let personal = personal_bot_name(handle);
-        let owned: Vec<String> = self
-            .svc
-            .roster()
-            .bots()
-            .filter(|b| b.owner == handle && b.name != personal)
-            .map(|b| b.name.clone())
-            .collect();
+        let owned = owned_team_bots(&self.svc, handle);
         if user.active() && !owned.is_empty() {
             return Err(Refusal::new(
                 StatusCode::CONFLICT,

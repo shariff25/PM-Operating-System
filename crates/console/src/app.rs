@@ -577,21 +577,18 @@ async fn routine_action(
 
 // Approvals.
 
-/// Whose inboxes an admin's Approvals screen reads. The console may not list the user
-/// database (only `resolve` one person), so it takes the PMs the bot runtime knows: every
-/// personal bot's owner and everyone in the recent activity, plus the admin. This chooses
-/// nothing about access: the admin may read every inbox, and an inbox of someone who isn't a
-/// user is empty.
+/// Whose inboxes an admin's Approvals screen reads: every active user who may hold drafts,
+/// from the tool server's admin listing for the console (`GET /internal/console/members`,
+/// handles only, for an active admin, signed as the viewer; slice U5a), plus the admin. The
+/// tool server decides again that the viewer is an admin; the console's own admin view only
+/// chooses to ask.
 async fn admin_inboxes(state: &AppState, viewer: &Viewer) -> Result<Vec<String>, UpstreamError> {
-    let (roster, tasks) = tokio::join!(
-        state.0.bots.bots(viewer),
-        state.0.bots.tasks(viewer, None, RECENT_TASKS)
-    );
-    let mut users: std::collections::BTreeSet<String> = roster?
+    let mut users: std::collections::BTreeSet<String> = state
+        .0
+        .toolserver
+        .members(viewer)
+        .await?
         .into_iter()
-        .filter(|b| b.scope == "personal")
-        .map(|b| b.owner)
-        .chain(tasks?.into_iter().map(|t| t.requested_by))
         .filter(|h| pmos_contract::model::valid_handle(h))
         .collect();
     users.insert(viewer.handle.clone());

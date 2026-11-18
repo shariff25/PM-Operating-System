@@ -33,7 +33,7 @@ pub struct Config {
     /// signed user assertion.
     pub toolserver_token: Credentials,
     /// `PMOS_CONTENT_ROOT`, default `content`: the deployed content tree the admin screens
-    /// read (and, until slice U5, the Team page's member list in `team.yaml`).
+    /// read.
     pub content_root: PathBuf,
     /// `PMOS_WEB_STATIC_DIR`: the built web app (`web/dist`). Optional; without it only
     /// `/api` and `/healthz` answer.
