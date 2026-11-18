@@ -11,6 +11,8 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   Auditor. A Reviewer recommends and the draft's owner confirms. An Auditor sees metadata only.
   The PM OS user database is the source of users and roles, not `team.yaml`; the design is
   written as a spec and reviewed before it is built (`docs/user-database-spec.md`).
+  Built 2026-11-18 (slices U1 to U7): every service decides from the database and `team.yaml`
+  is retired. Still open: the reviewer session's security gate on the final commit.
 - **c. Policy Admin** for NVIDIA OpenShell. The app opens a pull request; the merge happens in
   GitHub.
   Owner, 2026-11-18, plan only (build nothing until the plan is approved): add OpenShell's
@@ -58,7 +60,7 @@ follow-up tracking.
 - **Checks:** `cargo fmt --check --all`; `cargo clippy --workspace --all-targets --locked -- -D
   warnings -D clippy::result_large_err` (CI's clippy is newer than a local one may be);
   `cargo test --workspace` with `PMOS_TEST_DATABASE_URL` set; in `web/`: typecheck, lint, test,
-  build and the browser tests; in `harness/`: typecheck, lint, test.
+  build and the browser tests; in `harness/`: typecheck, test (it has no lint script).
 - **Secrets:** never print, log or send a token. The test stack uses fake data only, and Slack
   message text never goes into a report.
 - **The signed user assertion is required whenever the web app or console is deployed.** The
@@ -71,5 +73,9 @@ follow-up tracking.
 
 ## Waiting on the owner
 
-An Entra app registration; a model key with enough quota for an eval run; pilot PM names and
-live connector accounts; edits to the nudge wording.
+GitHub Actions starting jobs again on the account (every CI job on pull request #10 ends within
+seconds without running); an Entra app registration, with `acct` as an optional claim; a model
+key with enough quota for an eval run; pilot PM names; edits to the nudge wording; a GitHub App
+with pull-request permission and branch protection on the content branch; approval of the three
+plans (MCP servers and which ones for the pilot, the OpenShell prover, sandbox decisions in the
+audit log) and the go-ahead for requirement i.
