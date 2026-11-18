@@ -28,6 +28,7 @@ pub mod onboarding;
 pub mod pg;
 pub mod proposals;
 pub mod retention;
+pub mod reviews;
 pub mod schemas;
 pub mod service;
 pub mod session;

@@ -80,6 +80,7 @@ use pmos_contract::Sensitivity;
 
 mod admin;
 pub mod directory;
+mod reviews;
 mod users;
 
 /// What the Slack bot's token may do.
@@ -282,7 +283,9 @@ pub fn router_full(
         // The user database's read API (`directory.rs`): each route its own clients.
         .merge(directory::routes(state.clone()))
         // The Admin API (`users.rs`): pmos-web's writes, and the console's listing.
-        .merge(users::routes(state.clone()));
+        .merge(users::routes(state.clone()))
+        // The Reviewer's inbox, reads and recommendations (`reviews.rs`): pmos-web's only.
+        .merge(reviews::routes(state.clone()));
 
     Router::new()
         // Liveness: the process answers. Readiness: its dependencies do too.
@@ -757,7 +760,7 @@ async fn list_approvals(
         }
         return match state.svc.pending_approvals(&user, BOT_PENDING_LIMIT).await {
             Ok((approvals, total)) => {
-                let approvals = state.svc.approvals_json(&approvals).await;
+                let approvals = for_client_all(client, state.svc.approvals_json(&approvals).await);
                 Json(json!({ "approvals": approvals, "total": total })).into_response()
             }
             Err(e) => unavailable(e),
@@ -793,7 +796,7 @@ async fn list_approvals(
                         "an inbox listing was truncated"
                     );
                 }
-                let items = state.svc.approvals_json(&items).await;
+                let items = for_client_all(client, state.svc.approvals_json(&items).await);
                 Json(json!({
                     "items": items,
                     "truncated": truncated,
@@ -806,7 +809,7 @@ async fn list_approvals(
     }
     match state.svc.approvals(&user, status).await {
         Ok(items) => {
-            let items = state.svc.approvals_json(&items).await;
+            let items = for_client_all(client, state.svc.approvals_json(&items).await);
             Json(json!({ "items": items })).into_response()
         }
         Err(e) => unavailable(e),
@@ -866,7 +869,9 @@ async fn get_approval(
     match state.svc.approval(&id).await {
         Ok(Some(item)) if must_name && user.as_deref() != Some(item.user.as_str()) => not_found(),
         Ok(Some(item)) if !subject_may_read(&item.user) => not_found(),
-        Ok(Some(item)) => Json(state.svc.approval_json(&item).await).into_response(),
+        Ok(Some(item)) => {
+            Json(for_client(client, state.svc.approval_json(&item).await)).into_response()
+        }
         Ok(None) => not_found(),
         Err(e) => unavailable(e),
     }
@@ -925,6 +930,27 @@ struct DecisionBody {
     expected_args_hash: Option<String>,
 }
 
+/// An item's view as `client` gets it: a reviewer's note (`recommendations[].note`) reaches
+/// `pmos-web` and the orchestrator only, never the Slack bot (a card shows who recommended
+/// what, not the note, to keep content out of more Slack messages) or the console.
+fn for_client(client: Client, mut view: Value) -> Value {
+    if matches!(client, Client::Bot | Client::Console) {
+        if let Some(recs) = view
+            .get_mut("recommendations")
+            .and_then(Value::as_array_mut)
+        {
+            for r in recs.iter_mut().filter_map(Value::as_object_mut) {
+                r.remove("note");
+            }
+        }
+    }
+    view
+}
+
+fn for_client_all(client: Client, views: Vec<Value>) -> Vec<Value> {
+    views.into_iter().map(|v| for_client(client, v)).collect()
+}
+
 /// An error with a machine-readable `code`, and any extra fields.
 fn coded(status: StatusCode, code: &str, message: String, extra: Value) -> Response {
     let mut body = json!({ "code": code, "error": message });
@@ -965,7 +991,7 @@ async fn decide(
         .decide_verdict(client, &id, &body.decided_by, verdict, Utc::now())
         .await
     {
-        Ok(item) => Json(state.svc.approval_json(&item).await).into_response(),
+        Ok(item) => Json(for_client(client, state.svc.approval_json(&item).await)).into_response(),
         Err(DecisionError::Decide(DecideError::Store(e))) => unavailable(e),
         Err(e @ DecisionError::Decide(DecideError::Stale)) => {
             coded(StatusCode::CONFLICT, STALE, e.to_string(), json!({}))
