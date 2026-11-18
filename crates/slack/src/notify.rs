@@ -195,15 +195,17 @@ impl Notifier {
                 // A task from outside Slack (a routine's run): DM the PM it is for.
                 None => {
                     let requester = item["requested_by"].as_str().unwrap_or_default();
-                    let Some(member) = self.bots.team().by_handle(requester).cloned() else {
+                    let who = self.bots.people().of_handle(requester);
+                    let Some(slack_id) = who.member().and_then(|m| m.slack_id.clone()) else {
                         tracing::warn!(
                             requester,
-                            "notification for someone not in team.yaml; dropped"
+                            who = who.kind(),
+                            "notification for someone who may not use PM OS in Slack; dropped"
                         );
                         return;
                     };
                     TaskThread {
-                        channel: member.slack_id,
+                        channel: slack_id,
                         thread_ts: None,
                         progress_ts: None,
                         milestones: Vec::new(),
@@ -302,7 +304,7 @@ impl Notifier {
         let handle = item["requested_by"].as_str().unwrap_or_default();
         if handle.is_empty()
             || bot != pmos_contract::onboarding::personal_bot_name(handle)
-            || self.bots.team().by_handle(handle).is_none()
+            || self.bots.people().of_handle(handle).member().is_none()
         {
             tracing::warn!(bot, "a brief block not from a member's own bot; not sent");
             return;

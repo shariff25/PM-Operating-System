@@ -2,13 +2,12 @@
 //! 3 seconds) and, for slow work, a follow-up that replies through `response_url`.
 
 use std::future::Future;
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use pmos_contract::model::TeamFile;
 use serde_json::{json, Value};
 
 use crate::blocks;
+use crate::people::{self, Identity, People};
 use crate::toolserver::{CallError, ToolServer};
 
 pub type FollowUp = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -32,44 +31,25 @@ fn product_id(id: &str) -> bool {
 #[derive(Clone)]
 pub struct Commands {
     pub toolserver: ToolServer,
-    /// `content/team.yaml`, read on each command so a merged change applies without a
-    /// restart.
-    pub team_file: PathBuf,
+    /// Who each Slack user is: the user directory (`people.rs`).
+    pub people: People,
     pub http: reqwest::Client,
     /// Where `response_url` may point. Slack's is always `https://hooks.slack.com/`; tests
     /// set a local mock.
     pub response_url_prefix: String,
-    /// Offer **Request access** to someone not in `team.yaml`. Needs the bots (`PMOS_BOTS_URL`),
+    /// Offer **Request access** to someone not in the user directory. Needs the bots (`PMOS_BOTS_URL`),
     /// which handle the tap; without them the note says who to ask.
     pub request_access: bool,
 }
 
 pub const SLACK_RESPONSE_URL_PREFIX: &str = "https://hooks.slack.com/";
 
-/// What someone outside `team.yaml` is told, privately, where there is no **Request access**
+/// What someone outside the user directory is told, privately, where there is no **Request access**
 /// button.
 pub const NOT_A_MEMBER: &str = "PM OS is for the product team. If you need access, ask a \
                                 platform-owner PM to add you.";
 
-/// Read `team.yaml`. Unreadable or unparseable means nobody may use the bot, never everyone.
-pub fn load_team(team_file: &Path) -> TeamFile {
-    match std::fs::read_to_string(team_file) {
-        Ok(text) => TeamFile::from_yaml(&text).unwrap_or_else(|e| {
-            tracing::error!(error = %e, "team.yaml does not parse; nobody can use the bot");
-            TeamFile::default()
-        }),
-        Err(e) => {
-            tracing::error!(error = %e, path = %team_file.display(), "team.yaml unreadable");
-            TeamFile::default()
-        }
-    }
-}
-
 impl Commands {
-    fn team(&self) -> TeamFile {
-        load_team(&self.team_file)
-    }
-
     /// Handle one `slash_commands` payload.
     pub fn handle(&self, payload: &Value, envelope_id: &str) -> Reply {
         let command = payload["command"].as_str().unwrap_or_default();
@@ -84,17 +64,26 @@ impl Commands {
 
     fn docs(&self, payload: &Value, envelope_id: &str) -> Reply {
         let slack_id = payload["user_id"].as_str().unwrap_or_default();
-        let team = self.team();
-        let Some(member) = team.by_slack_id(slack_id) else {
-            tracing::info!(slack_id, "/docs from someone not in team.yaml");
-            return Reply {
-                ack: if self.request_access {
-                    crate::member_cards::request_access_ack()
-                } else {
-                    blocks::text(NOT_A_MEMBER)
-                },
-                follow_up: None,
-            };
+        let member = match self.people.identify(slack_id) {
+            Identity::Member(m) => m,
+            Identity::Stranger => {
+                tracing::info!(slack_id, "/docs from someone not in the user directory");
+                return Reply {
+                    ack: if self.request_access {
+                        crate::member_cards::request_access_ack()
+                    } else {
+                        blocks::text(NOT_A_MEMBER)
+                    },
+                    follow_up: None,
+                };
+            }
+            other => {
+                tracing::info!(slack_id, who = other.kind(), "/docs refused");
+                return Reply {
+                    ack: blocks::text(people::refusal(&other, NOT_A_MEMBER)),
+                    follow_up: None,
+                };
+            }
         };
         let text = payload["text"].as_str().unwrap_or_default().trim();
         if text.is_empty() || text == "help" {

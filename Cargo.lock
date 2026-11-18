@@ -1876,6 +1876,7 @@ dependencies = [
  "chrono-tz",
  "futures-util",
  "pmos-contract",
+ "pmos-directory",
  "pmos-runtime",
  "pmos-toolserver",
  "reqwest",

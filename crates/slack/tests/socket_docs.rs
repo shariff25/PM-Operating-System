@@ -1,5 +1,7 @@
 //! `/docs` end to end: the fake Slack (`common`) with a `response_url` catcher, and a real
-//! tool server with the fake docs connector.
+//! tool server with the fake docs connector. Who may search comes from that tool server's
+//! user database, read through its `GET /internal/directory` with the Slack bot token
+//! (slice U4b), never from a `team.yaml`.
 
 mod common;
 
@@ -11,7 +13,9 @@ use axum::routing::post;
 use axum::Json;
 use chrono::Utc;
 use common::{serve, FakeSlack, APP_TOKEN};
+use pmos_directory::snapshot::SnapshotClient;
 use pmos_slack::commands::Commands;
+use pmos_slack::people::People;
 use pmos_slack::socket::{Ended, Socket};
 use pmos_slack::toolserver::ToolServer;
 use pmos_toolserver::audit::MemoryAudit;
@@ -24,6 +28,20 @@ use tokio_util::sync::CancellationToken;
 
 const SERVICE_TOKEN: &str = "test-service-token-0123456789abcdef";
 const BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
+/// The tool server's user database: only Ana (and she is its admin).
+const USERS: &str =
+    "members:\n  - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm, admin]}\n";
+
+/// The Slack service's view of the tool server's user directory, over HTTP with the bot
+/// token, fetched once.
+async fn people(ts_base: &str) -> People {
+    let client = Arc::new(SnapshotClient::http(ts_base, BOT_TOKEN));
+    client
+        .refresh()
+        .await
+        .expect("the tool server serves the directory to the bot token");
+    People::new(client)
+}
 
 async fn response(State(s): State<Arc<FakeSlack>>, Json(body): Json<Value>) -> Json<Value> {
     s.responses.lock().unwrap().push((Instant::now(), body));
@@ -63,19 +81,31 @@ async fn start_toolserver() -> (
     // Tool server with the repo's content (it has the `docs` skill) and fake connectors.
     let content = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content");
     let catalog = Catalog::load(&content, Utc::now().date_naive()).unwrap();
-    let (stores, audit): (Stores, Arc<MemoryAudit>) = Stores::in_memory(&content);
+    let (mut stores, audit): (Stores, Arc<MemoryAudit>) = Stores::in_memory(&content);
+    // The user database, seeded as a dev stack's is (`PMOS_USERS_SEED`).
+    let seed = pmos_toolserver::users::ImportRequest::parse(
+        USERS.as_bytes(),
+        None,
+        pmos_toolserver::users::ImportMode::Bootstrap,
+    )
+    .unwrap();
+    stores.users = Arc::new(
+        pmos_toolserver::users::MemoryUsers::seeded(
+            seed,
+            pmos_toolserver::users::Rules::default(),
+            Some(stores.audit.clone()),
+        )
+        .await
+        .unwrap()
+        .with_linked(stores.linked()),
+    );
     let connectors: Vec<Arc<dyn Connector>> = vec![
         Arc::new(FakeConnector::jira()),
         Arc::new(FakeConnector::confluence()),
         Arc::new(FakeConnector::slack()),
         Arc::new(FakeConnector::docs()),
     ];
-    // An open user directory, as with fake connectors before the user database (slice U3).
-    let svc = Arc::new(
-        ToolService::new(catalog, stores, connectors)
-            .unwrap()
-            .with_open_directory(),
-    );
+    let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
     let ts_cancel = CancellationToken::new();
     let (ts_base, stop_ts) = serve(router(
         svc,
@@ -123,14 +153,8 @@ async fn docs_command_over_socket_mode() {
         ],
     ]);
 
-    // The team: only Ana.
-    let dir = tempfile::tempdir().unwrap();
-    let team_file = dir.path().join("team.yaml");
-    std::fs::write(
-        &team_file,
-        "members:\n  - {handle: ana, slack-id: U0ANA, roles: [pm]}\n",
-    )
-    .unwrap();
+    // Who is who: the tool server's user directory (only Ana).
+    let people = people(&ts_base).await;
 
     let http = reqwest::Client::new();
     let bot = Socket::new(
@@ -138,7 +162,7 @@ async fn docs_command_over_socket_mode() {
         APP_TOKEN,
         Commands {
             toolserver: ToolServer::new(ts_base, BOT_TOKEN),
-            team_file,
+            people,
             http: http.clone(),
             response_url_prefix: format!("{slack_base}/hooks/"),
             request_access: false,
@@ -244,20 +268,14 @@ async fn a_silent_connection_is_replaced_and_a_refused_reply_falls_back_to_text(
             json!({"type": "disconnect", "reason": "link_disabled"}),
         ],
     ]);
-    let dir = tempfile::tempdir().unwrap();
-    let team_file = dir.path().join("team.yaml");
-    std::fs::write(
-        &team_file,
-        "members:\n  - {handle: ana, slack-id: U0ANA, roles: [pm]}\n",
-    )
-    .unwrap();
+    let people = people(&ts_base).await;
     let http = reqwest::Client::new();
     let mut bot = Socket::new(
         slack_base.clone(),
         APP_TOKEN,
         Commands {
             toolserver: ToolServer::new(ts_base, BOT_TOKEN),
-            team_file,
+            people,
             http: http.clone(),
             response_url_prefix: format!("{slack_base}/hooks/"),
             request_access: false,
@@ -312,7 +330,11 @@ async fn shutdown_closes_the_connection() {
         APP_TOKEN,
         Commands {
             toolserver: ToolServer::new("http://127.0.0.1:9", BOT_TOKEN),
-            team_file: "/nonexistent/team.yaml".into(),
+            // Never fetched: nobody can be checked, and nobody asks.
+            people: People::new(Arc::new(SnapshotClient::http(
+                "http://127.0.0.1:9",
+                BOT_TOKEN,
+            ))),
             http: http.clone(),
             response_url_prefix: "https://hooks.slack.com/".into(),
             request_access: false,

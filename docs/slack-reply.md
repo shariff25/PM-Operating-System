@@ -34,7 +34,7 @@ with PM OS, and nothing posts in the thread until you tap **Post as you**. The b
   draft. Repeat the same tag and you don't.
 - **Summaries and answers for you stay private.** They arrive in your DM and nothing is
   drafted for the thread.
-- **You need:** to be on the product team (`team.yaml`), a personal bot (DM `setup`), and
+- **You need:** to be on the product team (the user database), a personal bot (DM `setup`), and
   Slack linked. If one is missing, the note in the thread says which.
 
 ## Turning it on
@@ -104,7 +104,9 @@ When you tap **Post as you**, PM OS checks the channel first:
 | The channel is shared with another company (Slack Connect) | **Confirm first.** The card asks again before posting to an external channel. |
 | Otherwise | It posts. |
 
-**Who counts as the product team:** `team.yaml`.
+**Who counts as the product team:** active users in the user database holding `pm`,
+`reviewer` or `admin`. An Auditor only, or a deactivated person, counts as an outsider
+(`docs/user-database-spec.md` §6).
 
 **What counts as restricted:** a draft is restricted if your bot read any restricted context
 while writing it. Jira, Confluence and Slack reads count as internal, and the public docs as
