@@ -409,7 +409,7 @@ async fn live() -> Live {
 
 /// Live connectors with the user database enforced, as in production, holding `members`
 /// (and the fixture admin); `None`: an open directory (tests only).
-async fn live_with(members: Option<Vec<pmos_contract::model::TeamMember>>) -> Live {
+async fn live_with(members: Option<Vec<common::SeedMember>>) -> Live {
     let people = match members {
         Some(members) => Arc::new(People::new(Arc::new(
             pmos_toolserver::users::MemoryUsers::seeded(
@@ -781,8 +781,8 @@ async fn a_stale_write_cannot_replace_a_newer_credential() {
     l.cancel.cancel();
 }
 
-fn member(handle: &str, slack_id: &str, email: Option<&str>) -> pmos_contract::model::TeamMember {
-    pmos_contract::model::TeamMember {
+fn member(handle: &str, slack_id: &str, email: Option<&str>) -> common::SeedMember {
+    common::SeedMember {
         handle: handle.into(),
         slack_id: slack_id.into(),
         email: email.map(String::from),
@@ -1361,7 +1361,7 @@ async fn slack_writes_check_their_audience_before_posting() {
         Arc::new(Slack::new(tokens, l.base.clone())),
         Arc::new(pmos_toolserver::connectors::fake::FakeConnector::docs()),
     ];
-    let member = |handle: &str, slack_id: &str| pmos_contract::model::TeamMember {
+    let member = |handle: &str, slack_id: &str| common::SeedMember {
         handle: handle.into(),
         slack_id: slack_id.into(),
         email: None,

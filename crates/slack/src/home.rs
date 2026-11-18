@@ -1022,7 +1022,7 @@ impl Bots {
         }
         let root: PathBuf = self.content_root();
         let linted = tokio::task::spawn_blocking(move || {
-            lint(&root, &LintOptions::new(Utc::now().date_naive())).skills
+            lint(&root, &LintOptions::for_service(Utc::now().date_naive())).skills
         })
         .await;
         match linted {

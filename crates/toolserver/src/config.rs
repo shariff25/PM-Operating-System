@@ -177,7 +177,8 @@ pub struct Config {
     /// `PMOS_AUDIT_RETENTION_DAYS`: audit events older than this many days are deleted once
     /// a day (`docs/audit-retention.md`). From 90 (the floor, and the default) to 3650.
     pub audit_retention_days: u32,
-    /// `PMOS_USERS_SEED`: a `team.yaml`-shaped file loaded into the in-memory user store at
+    /// `PMOS_USERS_SEED`: a seed file (a `members:` list, the import's shape; never in the content
+    /// tree) loaded into the in-memory user store at
     /// start-up (`users::import`). Development and eval stacks only: refused with
     /// `PMOS_DATABASE_URL` or live connectors. It must name an active admin.
     pub users_seed: Option<PathBuf>,
@@ -274,7 +275,21 @@ impl Config {
         let users_seed = get("PMOS_USERS_SEED")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
-        if users_seed.is_some() {
+        let content_root: PathBuf = get("PMOS_CONTENT_ROOT")
+            .unwrap_or_else(|| "content".into())
+            .into();
+        if let Some(seed) = &users_seed {
+            // Slice U7: nothing about users is read from the content tree, the seed included,
+            // so a file there (a leftover team.yaml) can't become one by a setting.
+            let canon =
+                |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if canon(seed).starts_with(canon(&content_root)) {
+                return Err(
+                    "PMOS_USERS_SEED must be outside the content tree (PMOS_CONTENT_ROOT): users \
+                     are never read from content"
+                        .into(),
+                );
+            }
             if database_url.is_some() {
                 return Err(
                     "PMOS_USERS_SEED is for in-memory development and eval stacks only; with \
@@ -387,9 +402,7 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
         Ok(Self {
-            content_root: get("PMOS_CONTENT_ROOT")
-                .unwrap_or_else(|| "content".into())
-                .into(),
+            content_root,
             bind,
             service_token: Secret::new(service_token),
             bot_token: bot_token.map(Secret::new),
@@ -1172,5 +1185,27 @@ mod tests {
         assert!(cfg(&live).is_ok());
         let err = cfg(&with(&live, &[("PMOS_USERS_SEED", "/srv/users.seed.yaml")])).unwrap_err();
         assert!(err.contains("PMOS_USERS_SEED"), "{err}");
+        // Never from the content tree (slice U7).
+        for inside in ["/srv/content/team.yaml", "/srv/content/x/users.yaml"] {
+            let err = cfg(&with(
+                &fake,
+                &[
+                    ("PMOS_USERS_SEED", inside),
+                    ("PMOS_CONTENT_ROOT", "/srv/content"),
+                ],
+            ))
+            .unwrap_err();
+            assert!(err.contains("outside the content tree"), "{err}");
+        }
+        let err = cfg(&with(&fake, &[("PMOS_USERS_SEED", "content/team.yaml")])).unwrap_err();
+        assert!(err.contains("outside the content tree"), "{err}");
+        assert!(cfg(&with(
+            &fake,
+            &[
+                ("PMOS_USERS_SEED", "/srv/users.seed.yaml"),
+                ("PMOS_CONTENT_ROOT", "/srv/content"),
+            ],
+        ))
+        .is_ok());
     }
 }

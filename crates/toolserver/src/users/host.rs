@@ -115,7 +115,8 @@ enum Command {
         #[command(subcommand)]
         which: ExceptionName,
     },
-    /// Import content/team.yaml: a dry run unless --apply.
+    /// Import an old team.yaml from the path the operator names (normally a reviewed
+    /// commit): a dry run unless --apply.
     Import {
         #[arg(long)]
         from: PathBuf,

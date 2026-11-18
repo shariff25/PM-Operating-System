@@ -3,13 +3,12 @@
 //! starting, so a bad bot definition is caught before any task uses it.
 //!
 //! **Who may use a bot is not here.** Whether a person may ask bots at all comes from the user
-//! directory (`crate::people`, the tool server's `/internal/directory`), never from
-//! `team.yaml`; the catalog only knows each bot's scope ([`Catalog::may_use`]).
+//! directory (`crate::people`, the tool server's `/internal/directory`); the catalog only
+//! knows each bot's scope and owner ([`Catalog::may_use`]). There is no team file (slice U7).
 //!
 //! **Reloading** (onboarding spec §5): every 30 seconds, [`Reloader`] checks a fingerprint of
-//! the files the lint reads (`team.yaml`, which the lint's bot-owner check still reads until
-//! slice U7, `tools.yaml`, `bots/**`, `roles/**` and `skills/**`: paths, sizes and
-//! modification times). If it changed, the tree is linted and
+//! the files the lint reads (`tools.yaml`, `bots/**`, `roles/**` and `skills/**`: paths, sizes
+//! and modification times). If it changed, the tree is linted and
 //! loaded again and the new catalog replaces the old one whole. A tree that fails the lint
 //! leaves the old catalog in place and logs the errors. A task already claimed keeps the bot,
 //! role and tools it was claimed with.
@@ -54,9 +53,10 @@ pub struct BotDetail {
 }
 
 impl Catalog {
-    /// Lint `root` and load what it defines. Errors list every lint error.
+    /// Lint `root` and load what it defines. Errors list every lint error. A leftover
+    /// `team.yaml` is only a warning here (`LintOptions::for_service`): it decides nothing.
     pub fn load(root: &Path, today: NaiveDate) -> Result<Self, String> {
-        let report = lint(root, &LintOptions::new(today));
+        let report = lint(root, &LintOptions::for_service(today));
         if report.has_errors() {
             let errors: Vec<String> = report
                 .errors()
@@ -173,7 +173,7 @@ impl Catalog {
 pub const RELOAD_EVERY: Duration = Duration::from_secs(30);
 
 /// The files and folders under the content root the lint reads to build the catalog.
-const WATCHED: [&str; 5] = ["team.yaml", "tools.yaml", "bots", "roles", "skills"];
+const WATCHED: [&str; 4] = ["tools.yaml", "bots", "roles", "skills"];
 
 /// A fingerprint of the watched files: their paths, sizes and modification times. A file
 /// that can't be read still counts, as missing.

@@ -1675,7 +1675,6 @@ dependencies = [
  "pmos-contract",
  "pmos-policy",
  "serde_json",
- "serde_norway",
  "tempfile",
 ]
 
@@ -1902,7 +1901,9 @@ dependencies = [
  "chrono",
  "pmos-assertion",
  "pmos-bots",
+ "pmos-console",
  "pmos-contract",
+ "pmos-slack",
  "pmos-toolserver",
  "pmos-web",
  "reqwest",
@@ -1937,6 +1938,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "serde_norway",
  "sha2 0.10.9",
  "sqlx",
  "tempfile",

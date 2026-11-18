@@ -120,7 +120,7 @@ pub enum OAuthError {
     Exchange(Provider, String),
     #[error("no Atlassian site matches; set PMOS_ATLASSIAN_SITE (sites: {0})")]
     SiteChoice(String),
-    /// The account that signed in isn't the one `team.yaml` lists for this PM, so a link
+    /// The account that signed in isn't the one the user database lists for this PM, so a link
     /// forwarded to someone else can't attach their account to the sender.
     #[error("the {label} account that signed in doesn't belong to this PM: {detail}", label = .0.label(), detail = .1)]
     WrongAccount(Provider, String),

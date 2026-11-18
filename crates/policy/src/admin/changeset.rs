@@ -6,7 +6,7 @@
 //! must be exactly what it regenerated.
 //!
 //! **The allow-list.** A path is either a content file (`<content_dir>/…`, a plain path, a
-//! text type, not `team.yaml`) or a generated policy file (`<policies_dir>/bots/<bot>.yaml`,
+//! text type, not the retired `team.yaml`) or a generated policy file (`<policies_dir>/bots/<bot>.yaml`,
 //! `<policies_dir>/bots/<bot>.sandbox.yaml`, `<policies_dir>/providers/<profile>.yaml`).
 //! Nothing else: never `.github/`, `deploy/`, code, a hidden file or the repository root.
 //! [`Layout::new`] refuses an empty (repository root) content or policies directory, and one

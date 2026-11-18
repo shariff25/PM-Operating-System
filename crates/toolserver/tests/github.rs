@@ -17,8 +17,9 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::{Duration, Utc};
-use pmos_contract::model::{Role, TeamFile, TeamMember};
-use pmos_contract::onboarding::{render_personal_bot, render_team_yaml};
+use common::SeedMember;
+use pmos_contract::model::Role;
+use pmos_contract::onboarding::render_personal_bot;
 use pmos_contract::Sensitivity;
 use pmos_toolserver::app::BotAccess;
 use pmos_toolserver::audit::{Client, MemoryAudit, Outcome};
@@ -638,10 +639,9 @@ const SERVICE_TOKEN: &str = "test-service-token-0123456789abcdef";
 const BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
 const CONTENT_REPO: &str = "example-org/pm-os";
 const MEMORY_REPO: &str = "example-org/pm-os-memory-ana";
-const TEAM_HEADER: &str = "# Who may use PM OS.\n";
 
-fn member(handle: &str, slack: &str, github: Option<&str>, roles: Vec<Role>) -> TeamMember {
-    TeamMember {
+fn member(handle: &str, slack: &str, github: Option<&str>, roles: Vec<Role>) -> SeedMember {
+    SeedMember {
         handle: handle.into(),
         slack_id: slack.into(),
         email: Some(format!("{handle}@example.com")),
@@ -653,7 +653,7 @@ fn member(handle: &str, slack: &str, github: Option<&str>, roles: Vec<Role>) -> 
 
 /// Ana and Bo are PMs; Raj (GitHub `Raj-GH`) and Kim are platform owners; Eve isn't in the
 /// GitHub org and Pen's org invitation is still pending.
-fn team() -> Vec<TeamMember> {
+fn team() -> Vec<SeedMember> {
     vec![
         member("ana", "U0ANA", None, vec![Role::Pm]),
         member("bo", "U0BO", None, vec![Role::Pm]),
@@ -776,9 +776,8 @@ async fn env() -> Env {
             .unwrap();
     });
 
-    // The content repo: team.yaml for the team above, and Bo's personal bot. Only Raj may
-    // push to it.
-    let team_yaml = render_team_yaml(TEAM_HEADER, &team());
+    // The content repo: Bo's personal bot, and no team file (slice U7). Only Raj may push to
+    // it.
     let bo_bot = render_personal_bot("bo");
     mock.add_repo(
         CONTENT_REPO,
@@ -787,7 +786,6 @@ async fn env() -> Env {
         &["raj-gh"],
         &[
             ("README.md", "# PM OS\n"),
-            ("content/team.yaml", &team_yaml),
             ("content/bots/pm-bo/BOT.md", &bo_bot),
             ("policies/bots/pm-bo.yaml", "# Generated\n"),
             ("policies/bots/pm-bo.sandbox.yaml", "# Generated\n"),
@@ -913,7 +911,7 @@ async fn linking_checks_the_account_then_the_refresh_rotates_the_tokens() {
     assert_eq!(
         e.mock.requests("GET", "/user/emails").len(),
         1,
-        "no github login in team.yaml"
+        "no GitHub login in the user database"
     );
 
     let stored = e.vault.get("ana", Provider::Github).await.unwrap().unwrap();
@@ -1735,7 +1733,6 @@ async fn a_request_then_an_approval_commits_both_files_in_one_commit() {
         e.mock.changed(&commit),
         vec![
             "content/bots/pm-nia-lee/BOT.md",
-            "content/team.yaml",
             "policies/bots/pm-nia-lee.sandbox.yaml",
             "policies/bots/pm-nia-lee.yaml",
         ]
@@ -1744,7 +1741,6 @@ async fn a_request_then_an_approval_commits_both_files_in_one_commit() {
     // The policy files are generated, unchanged, from the content with Nia in it.
     let [policy, spec] = personal_policies(
         &e.root,
-        &files["content/team.yaml"],
         "pm-nia-lee",
         &render_personal_bot("nia-lee"),
         Utc::now().date_naive(),
@@ -1765,14 +1761,16 @@ async fn a_request_then_an_approval_commits_both_files_in_one_commit() {
     )
     .await;
     assert_eq!(status, 200);
-    let yaml = &files["content/team.yaml"];
-    assert!(yaml.starts_with(TEAM_HEADER), "the header is kept");
-    let parsed = TeamFile::from_yaml(yaml).unwrap();
-    assert_eq!(parsed.members.len(), team().len() + 1);
-    let nia = parsed.by_handle("nia-lee").unwrap();
-    assert_eq!(nia.slack_id, "U0NIA");
-    assert_eq!(nia.email.as_deref(), Some("Nia.Lee@example.com"));
-    assert_eq!(nia.roles, vec![Role::Pm]);
+    // No team file is written (slice U7): the user database holds Nia.
+    assert!(
+        !files.keys().any(|p| p.ends_with("team.yaml")),
+        "{:?}",
+        files.keys()
+    );
+    let nia = e.svc.people().user("nia-lee").await.unwrap().unwrap();
+    assert!(nia.active());
+    assert_eq!(nia.atlassian_email.as_deref(), Some("nia.lee@example.com"));
+    assert!(!e.svc.people().is_admin("nia-lee").await.unwrap());
     assert_eq!(
         files["content/bots/pm-nia-lee/BOT.md"],
         render_personal_bot("nia-lee")
@@ -1949,7 +1947,7 @@ async fn an_admin_grant_from_slack_is_refused() {
     .await;
     assert_eq!(pending["requests"][0]["id"], id.as_str());
 
-    // `pm`: approved, in the database and (until slice U7) in team.yaml.
+    // `pm`: approved, in the database (and in no team file: slice U7).
     let (status, body) = decide(
         &e,
         &id,
@@ -1957,8 +1955,12 @@ async fn an_admin_grant_from_slack_is_refused() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    let team = TeamFile::from_yaml(&e.mock.files(CONTENT_REPO)["content/team.yaml"]).unwrap();
-    assert_eq!(team.by_handle("nia").unwrap().roles, vec![Role::Pm]);
+    assert!(!e
+        .mock
+        .files(CONTENT_REPO)
+        .keys()
+        .any(|p| p.ends_with("team.yaml")));
+    assert!(e.svc.people().user("nia").await.unwrap().unwrap().active());
     assert!(!e.svc.people().is_admin("nia").await.unwrap());
 }
 
@@ -1989,8 +1991,8 @@ async fn a_ref_conflict_is_retried_and_a_failure_is_recorded() {
         2,
         "their changes stay"
     );
-    let nia = TeamFile::from_yaml(&files["content/team.yaml"]).unwrap();
-    assert_eq!(nia.by_handle("nia").unwrap().roles, vec![Role::Pm]);
+    assert!(files.contains_key("content/bots/pm-nia/BOT.md"));
+    assert!(e.svc.people().user("nia").await.unwrap().unwrap().active());
 
     // A branch that never stops moving: the person is in all the same, and the request says
     // the bot is missing, readably.
