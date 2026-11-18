@@ -8,8 +8,11 @@ what it's connected to, in one place. Three buttons at the top switch between th
 *Staff* level. Change it by sending me `level …`." (`docs/levels.md`). If PM OS can't read your
 level, the line is left out.
 
-You need to be on the product team (`team.yaml`). Anyone else sees "PM OS is for the product
-team. DM me to ask for access."
+You need to be an active PM OS user holding `pm`, `reviewer` or `admin` in the user database
+(the Slack service reads it from the tool server, `docs/user-database-spec.md` §2). Anyone the
+database doesn't have sees "PM OS is for the product team. DM me to ask for access."; a
+deactivated person, an Auditor only, or anyone while PM OS can't check (no directory answer
+for 5 minutes) sees a plain line saying which.
 
 ## Inbox
 
@@ -83,7 +86,8 @@ limits what its token can do:
   the card says so and keeps its buttons.
 - **The triage digest** reads the feedback ledger without approval ids: each row links to
   its task by `run_id`.
-- **New members** are added as PMs. Admins are added by a pull request to `team.yaml`.
+- **New members** are added as PMs. Other roles are given in the web app; admins only by
+  someone with host access (`pmos-admin users grant-admin`).
 
 ## Skills
 

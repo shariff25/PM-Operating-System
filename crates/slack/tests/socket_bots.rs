@@ -20,7 +20,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use common::{serve, until, Call, FakeSlack, APP_TOKEN, SLACK_BOT_TOKEN};
+use common::{person, serve, until, Call, Directory, FakeSlack, APP_TOKEN, SLACK_BOT_TOKEN};
 use pmos_slack::bots::{Bots, BotsConfig};
 use pmos_slack::commands::Commands;
 use pmos_slack::notify::{Notifier, CURSOR_FILE};
@@ -35,7 +35,13 @@ use tokio_util::sync::CancellationToken;
 
 const BOTS_TOKEN: &str = "test-bots-token-slack-0123456789abcdef";
 const TOOL_BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
-const TEAM: &str = "members:\n  - {handle: ana, slack-id: U0ANA, roles: [pm]}\n  - {handle: bob, slack-id: U0BOB, roles: [pm]}\n";
+/// The user directory: Ana and Bob.
+fn team() -> Vec<pmos_directory::snapshot::DirectoryUser> {
+    vec![
+        person("ana", "U0ANA", &["pm"]),
+        person("bob", "U0BOB", &["pm"]),
+    ]
+}
 
 fn bearer(headers: &HeaderMap) -> &str {
     headers
@@ -400,7 +406,9 @@ struct Stack {
     tools: Arc<MockTools>,
     bots: Bots,
     state: tempfile::TempDir,
-    _team: tempfile::TempDir,
+    /// The content root (empty: no skills).
+    _content: tempfile::TempDir,
+    directory: Directory,
     stop: Vec<CancellationToken>,
     socket: Option<(CancellationToken, JoinHandle<Ended>)>,
 }
@@ -423,16 +431,16 @@ impl Stack {
         let tools = Arc::new(MockTools::default());
         let (ts_base, stop_ts) = serve(tools_routes(tools.clone())).await;
 
-        let team = tempfile::tempdir().unwrap();
-        let team_file = team.path().join("team.yaml");
-        std::fs::write(&team_file, TEAM).unwrap();
+        let content = tempfile::tempdir().unwrap();
+        let directory = Directory::seeded(team()).await;
         let state = tempfile::tempdir().unwrap();
         let http = reqwest::Client::new();
         let bots = Bots::new(BotsConfig {
             slack: SlackApi::new(slack_base, SLACK_BOT_TOKEN, http.clone()),
             runtime: Runtime::new(rt_base, BOTS_TOKEN, http.clone()),
             toolserver: ToolServer::new(ts_base, TOOL_BOT_TOKEN),
-            team_file,
+            people: directory.people(),
+            content_root: content.path().to_path_buf(),
             default_tz: "UTC".into(),
             github_org: None,
             response_url_prefix: "https://hooks.slack.com/".into(),
@@ -446,7 +454,8 @@ impl Stack {
             tools,
             bots,
             state,
-            _team: team,
+            _content: content,
+            directory,
             stop: vec![stop_slack, stop_rt, stop_ts],
             socket: None,
         }
@@ -460,7 +469,7 @@ impl Stack {
             APP_TOKEN,
             Commands {
                 toolserver: ToolServer::new("http://127.0.0.1:9", TOOL_BOT_TOKEN),
-                team_file: "/nonexistent/team.yaml".into(),
+                people: self.directory.people(),
                 http: http.clone(),
                 response_url_prefix: "https://hooks.slack.com/".into(),
                 request_access: true,
@@ -643,7 +652,7 @@ async fn dms_go_to_the_right_bot_as_the_right_pm() {
         .send(dm("e5", "Ev5", "U0BOB", "100.5", None, "hello"))
         .await;
     tasks(5).await;
-    // Not in team.yaml: a private note, no task.
+    // Not in the user directory: a private note, no task.
     stack
         .send(dm("e6", "Ev6", "U0STRANGER", "100.6", None, "hi"))
         .await;

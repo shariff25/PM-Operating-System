@@ -849,8 +849,9 @@ pub fn reply_note(item: &Value, line: &str) -> (String, Value) {
 /// The `audience_blocked` answer: why, in plain words, with only **Reject**. Editing can't
 /// unblock it: the draft was built from restricted sources whatever its text now says, so
 /// the PM answers in the thread themselves if it still needs an answer.
-/// `outsiders` is how many members aren't in `team.yaml`; with none, the channel is
-/// externally shared.
+/// `outsiders` is how many channel members aren't PM OS insiders (the tool server's count:
+/// active users holding `pm`, `reviewer` or `admin`); with none, the channel is externally
+/// shared.
 pub fn reply_blocked(item: &Value, outsiders: Option<u64>) -> (String, Value) {
     let id = item["id"].as_str().unwrap_or_default();
     let place = reply_place(item);
@@ -1037,11 +1038,12 @@ pub const ONBOARD_CONNECT: &str = "pmos_onboard_connect";
 /// The welcome: two short lines and one **Connect Jira and Confluence** button. Without a
 /// link, the lines and a plain sentence say what to do instead.
 pub fn onboard_hello(first_name: &str, url: Option<&str>) -> (String, Value) {
-    let first = truncate(first_name.trim(), 60);
+    // A display name from Slack: rendered inert (no mention, link or formatting).
+    let first = crate::blocks::name(first_name, 60);
     let greeting = if first.is_empty() {
         crate::onboard_copy::HELLO_NO_NAME.to_string()
     } else {
-        crate::onboard_copy::HELLO.replace("{name}", &escape(&first))
+        crate::onboard_copy::HELLO.replace("{name}", &first)
     };
     match url.filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
         Some(url) => (

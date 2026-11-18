@@ -1079,8 +1079,8 @@ already_member`.
 GitHub token:
 - `{PMOS_CONTENT_DIR}/team.yaml`: the file at the branch head plus the new member
   (`handle`, `slack-id`, `email`, `roles: [pm]`), written with `render_team_yaml`. Until slice
-  U7 retires the file, the runtime, Slack, `pmos-web` and the console still read it, and
-  `pmos lint` checks bot owners against it;
+  U7 retires the file, `pmos lint` checks bot owners against it; no service decides from it
+  any more (slices U3 and U4a-d);
 - `{PMOS_CONTENT_DIR}/bots/pm-<handle>/BOT.md` from `render_personal_bot`;
 - `{PMOS_POLICIES_DIR}/bots/pm-<handle>.yaml` and `pm-<handle>.sandbox.yaml`, the bot's sandbox
   policy and launch spec from `pmos_policy`, so `pmos policy check` has nothing missing.
@@ -1195,7 +1195,8 @@ or Auditor is never deactivated (`403 protected_not_from_slack`).
 The source of users and roles is moving from `team.yaml` to the tool server's own tables
 (`docs/user-database-spec.md`). Slice U1 builds the store, its database guarantees and the
 host commands. Since slice U3 the tool server decides from it (above), and the runtime since
-slice U4a; Slack, `pmos-web` and the console still read `team.yaml` until slices U4b-d. The read API (slice U2)
+slice U4a, Slack since slice U4b, `pmos-web`'s sign-in since U4c and the console since U4d.
+The read API (slice U2)
 is below.
 
 **Tables** (migration 0015): `users` (handle, display name, `sign_in_name` for Entra and
@@ -1269,8 +1270,9 @@ needs an active admin like any import.
 Three routes read the user database for the other services (`src/app/directory.rs`). The
 runtime polls `directory` since slice U4a (`docs/bots-runtime.md` "Who may ask"); `pmos-web`
 calls `resolve` and the first link since slice U4c (sign-in and every request, through
-`crates/directory`'s `resolve` client, cached 10 seconds per lookup); Slack and the console
-move to them in slices U4b and U4d.
+`crates/directory`'s `resolve` client, cached 10 seconds per lookup); the Slack service polls
+`directory` with the bot token since slice U4b (`crates/slack/src/people.rs`); the console calls
+`resolve` on every request since slice U4d (`docs/console.md`).
 Each route has its own allow-list, checked before anything reads the request; any other
 token is `403`, none is `401`.
 

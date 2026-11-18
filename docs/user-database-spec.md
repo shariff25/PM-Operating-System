@@ -1111,6 +1111,51 @@ differs from the text above:
 - **Not built:** the "signed in with Microsoft for the first time" message (the link is
   logged and audited only). **Not verified:** a real Entra tenant's tokens (none available).
 
+**U4b is built** on `claude/u4b-slack-directory` (`crates/slack/src/people.rs`, the copy in
+`access_copy.rs`, `blocks::name`; `crates/slack/tests/socket_onboarding.rs` against a mock
+tool server's directory over HTTP, `socket_docs.rs` against the real tool server's,
+`no_team_file.rs`; no migration, no new setting). The Slack service reads no `team.yaml`
+for any decision, never falls back to it, and starts without one. It polls
+`GET /internal/directory` every 10 s with `PMOS_BOT_TOKEN` (`pmos-directory`'s
+`SnapshotClient`, unchanged). Where it differs from the text above:
+- **Who may use PM OS in Slack** is the tool server's and the runtime's set: an active user
+  holding `pm`, `reviewer` or `admin`. Someone the directory doesn't have gets **Request
+  access**; a deactivated person, an Auditor only, or a status this build doesn't know gets a
+  plain line instead (no button), in DMs, tags, `/docs`, the App Home, buttons and modals.
+- **Two bounds, by who decides.** The 5-minute identity read (`for_slack_identity`) maps a
+  Slack id to a handle *and* says whether that person may use PM OS; it is enough for
+  anything the runtime or the tool server decides again (a DM's task, a tag, an approval card,
+  settings, routines, `/docs`), so §2's "≤ 30 s" allow bound for Slack holds where Slack
+  itself decides: admin actions (deciding a join, the handle check, `requests`, `remove` and
+  its target) and who gets a join card, plus proactive sends (nudges, the triage digest),
+  all on `fresh()`. Past 30 s an admin action answers "PM OS can't check your access right
+  now" and sends nothing; a filed request then tells no admin (they see it in `requests`).
+  Past 5 minutes everyone, strangers included, is told "PM OS can't check who you are right
+  now" (no **Request access** while it can't check); a snoozed reply card waits rather than
+  being dropped; a notification for a PM is dropped and logged, as for a non-member before.
+- **After an approval or a deactivation** the service polls the directory at once, so the
+  change shows in Slack without waiting for the next poll.
+- **`remove`** checks the admin and the target on a fresh snapshot before showing the card,
+  and says why not in its own words (an Admin or Auditor, already deactivated, oneself, no
+  such member); the confirmation names the directory's display name and says it deactivates.
+  The tool server's refusals as U3 built them (`crates/toolserver/src/onboarding.rs`) each
+  have a line: `403 protected_not_from_slack`, `429 deactivation_limit` (the card closes and
+  points to `pmos-admin users deactivate`), `409 already_deactivated`, `409 last_admin`,
+  `409 owns_bots`, `403 self_removal`/`self_change`, `403 not_admin`, `404 not_a_member`. A
+  request from a deactivated Slack id is answered locally, and `409 deactivated` too.
+- **Display names render inert** through `blocks::name` wherever the service shows one (the
+  join card and its notification text, the handle modal, the welcome and first-time hello,
+  the `remove` card): control characters become spaces, `&<>` are escaped, and the `mrkdwn`
+  characters `*`, `_`, `~` and the backtick, and the auto-link characters `.`, `/`, `:`
+  and `@`, become look-alike
+  characters, so a name can't mention, link or format. The name reads the same; those
+  characters are not the originals.
+- **The App Home's skills catalog** still runs `pmos_contract::lint` over the content root,
+  which reads `team.yaml` for its own team rules; only its `skills` list is used. That goes
+  with the lint rules in U7.
+- **Not verified:** the live Slack test stack (not run); a real Slack workspace's rendering
+  of the look-alike characters.
+
 **U4d is built** on `claude/u4d-console-resolve` (`crates/console/src/auth.rs` `viewer` and
 `Viewer::from_user`, `src/app.rs` `Signed` and `admin_inboxes`; the shared resolve client
 from U4c, unchanged; `crates/console/tests/console.rs` with a mock `resolve`;

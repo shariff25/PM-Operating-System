@@ -295,3 +295,66 @@ pub async fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     }
     panic!("timed out waiting for {what}");
 }
+
+// ---- The user directory (slice U4b) ----
+
+/// A seeded user directory for a test stack: what the tool server's `GET /internal/directory`
+/// would answer the Slack bot token, in memory, on a clock that moves only when told.
+pub struct Directory {
+    pub fetcher: Arc<pmos_directory::snapshot::StaticFetcher>,
+    pub clock: Arc<pmos_directory::snapshot::FakeClock>,
+    pub client: Arc<pmos_directory::snapshot::SnapshotClient>,
+}
+
+impl Directory {
+    /// The directory with `users`, already fetched once.
+    pub async fn seeded(users: Vec<pmos_directory::snapshot::DirectoryUser>) -> Self {
+        let fetcher = Arc::new(pmos_directory::snapshot::StaticFetcher::new(users));
+        let clock = Arc::new(pmos_directory::snapshot::FakeClock::default());
+        let client = Arc::new(pmos_directory::snapshot::SnapshotClient::new(
+            fetcher.clone(),
+            clock.clone(),
+        ));
+        client
+            .refresh()
+            .await
+            .expect("the seeded directory answers");
+        Self {
+            fetcher,
+            clock,
+            client,
+        }
+    }
+
+    pub fn people(&self) -> pmos_slack::people::People {
+        pmos_slack::people::People::new(self.client.clone())
+    }
+
+    /// Change one user (or add them) and poll, as the service would within 10 seconds.
+    pub async fn upsert(&self, user: pmos_directory::snapshot::DirectoryUser) {
+        self.fetcher.upsert(user);
+        self.client.refresh().await.expect("the directory answers");
+    }
+}
+
+/// An active user with a Slack id and `roles`.
+pub fn person(
+    handle: &str,
+    slack_id: &str,
+    roles: &[&str],
+) -> pmos_directory::snapshot::DirectoryUser {
+    pmos_directory::snapshot::DirectoryUser {
+        slack_id: Some(slack_id.to_string()),
+        ..pmos_directory::snapshot::user(handle, roles)
+    }
+}
+
+/// The same user, deactivated.
+pub fn deactivated(
+    user: pmos_directory::snapshot::DirectoryUser,
+) -> pmos_directory::snapshot::DirectoryUser {
+    pmos_directory::snapshot::DirectoryUser {
+        status: pmos_directory::snapshot::UserStatus::Deactivated,
+        ..user
+    }
+}

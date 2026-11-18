@@ -183,12 +183,9 @@ pub async fn handle_dm(
         bots.post(channel, Some(thread_ts), None, cards::note(&line))
             .await;
     };
-    let Some(handle) = bots
-        .team()
-        .by_slack_id(slack_user)
-        .map(|m| m.handle.clone())
-    else {
-        say(copy::NOT_A_MEMBER.into()).await;
+    let who = bots.people().identify(slack_user);
+    let Some(handle) = who.member().map(|m| m.handle.clone()) else {
+        say(crate::people::refusal(&who, copy::NOT_A_MEMBER).into()).await;
         return true;
     };
     let bot = personal_bot_name(&handle);

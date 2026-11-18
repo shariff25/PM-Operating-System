@@ -42,8 +42,11 @@ To stop it for good, remove its `BOT.md` by pull request and delete its sandbox 
 
 ## A member leaves
 
-Use `remove <handle>` in a DM to PM OS, as a platform owner. It commits the removal and unlinks
-their accounts. Then delete their bot's sandbox:
+Use `remove <handle>` in a DM to PM OS, as a platform owner. It **deactivates** them in the
+user database (nothing is committed; see [users.md](users.md) "Deactivating someone"): their
+sessions end and their linked accounts are suspended, then deleted after 24 hours unless they
+are reactivated. Slack won't deactivate an Admin or an Auditor, and stops after 3
+deactivations an hour; use the host commands for those. Then delete their bot's sandbox:
 
 ```sh
 openshell sandbox delete pmos-pm-<handle>

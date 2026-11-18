@@ -13,7 +13,9 @@
 //! assistant, in `reply.rs`), `bets review on`, `off` and status (`bets_review.rs`) and
 //! `level` and `level <level>` (`level.rs`), in that order. `docs: setup` still goes to the
 //! `docs` bot. Someone not in
-//! `team.yaml` gets a note with **Request access**.
+//! the user directory gets a note with **Request access**; a deactivated person, an
+//! Auditor-only person and anyone PM OS can't check right now get a plain note instead
+//! (`people.rs`).
 //!
 //! Tagging PM OS in a channel (`app_mention`) is in `mention.rs`, and the App Home
 //! (`app_home_opened` and its clicks) in `home.rs` (`docs/slack-mentions-and-home-spec.md`).
@@ -26,8 +28,8 @@
 //! 3 seconds); the work happens in follow-ups. The one exception is the memory-repo modal,
 //! whose answer must be in the ack to show as a field error: [`Bots::late_ack`] waits for the
 //! tool server, never longer than the ack allows. The PM is always the Slack user mapped
-//! through `team.yaml`: the runtime and the tool server apply that PM's access, never the
-//! bot's.
+//! through the user directory (a snapshot at most 5 minutes old, `people.rs`): the runtime
+//! and the tool server apply that PM's access, never the bot's, and decide it again.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -35,14 +37,14 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pmos_contract::model::TeamFile;
 use pmos_contract::onboarding::personal_bot_name;
 use serde_json::{json, Value};
 
 use crate::blocks::escape;
 use crate::bounded::Bounded;
 use crate::cards::{self, action};
-use crate::commands::{load_team, FollowUp, NOT_A_MEMBER};
+use crate::commands::{FollowUp, NOT_A_MEMBER};
+use crate::people::{self as directory, Identity, Member, People};
 
 /// A click on an approval that isn't the clicker's (the tool server doesn't find it for
 /// them).
@@ -69,8 +71,10 @@ pub struct BotsConfig {
     pub slack: SlackApi,
     pub runtime: Runtime,
     pub toolserver: ToolServer,
-    /// `content/team.yaml`, read on each message so a merged change applies at once.
-    pub team_file: PathBuf,
+    /// Who each Slack user is: the user directory (`people.rs`). Never `team.yaml`.
+    pub people: People,
+    /// The content repo (`PMOS_CONTENT_ROOT`), for the skills catalog in the App Home.
+    pub content_root: PathBuf,
     /// The time zone for routines when Slack has none for the PM (`PMOS_DEFAULT_TZ`).
     pub default_tz: String,
     /// The GitHub org memory repos live in (`PMOS_GITHUB_ORG`), to prefill the memory-repo
@@ -239,8 +243,38 @@ impl Bots {
         self.inner.cfg.web_url.as_deref()
     }
 
-    pub fn team(&self) -> TeamFile {
-        load_team(&self.inner.cfg.team_file)
+    /// Who each Slack user is.
+    pub fn people(&self) -> &People {
+        &self.inner.cfg.people
+    }
+
+    /// The Slack user `slack_id` if they may use PM OS; anyone else gets the private note
+    /// that fits (`people::refusal`, with `stranger` for someone the directory doesn't have)
+    /// in `channel`, in `thread` if given.
+    pub(crate) async fn member_or_refuse(
+        &self,
+        channel: &str,
+        slack_id: &str,
+        thread: Option<&str>,
+        stranger: &'static str,
+    ) -> Option<Member> {
+        let who = self.people().identify(slack_id);
+        if let Identity::Member(m) = who {
+            return Some(m);
+        }
+        tracing::info!(
+            slack_id,
+            who = who.kind(),
+            "not someone who may use PM OS; refused"
+        );
+        self.private(
+            channel,
+            slack_id,
+            thread,
+            directory::refusal(&who, stranger),
+        )
+        .await;
+        None
     }
 
     pub(crate) fn flow(&self) -> &Flow {
@@ -255,14 +289,9 @@ impl Bots {
         &self.inner.home
     }
 
-    /// The content repo (`PMOS_CONTENT_ROOT`): the directory `team.yaml` is in.
+    /// The content repo (`PMOS_CONTENT_ROOT`).
     pub(crate) fn content_root(&self) -> PathBuf {
-        self.inner
-            .cfg
-            .team_file
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
+        self.inner.cfg.content_root.clone()
     }
 
     /// `true` the first time an event is seen: Slack retries an event it thinks was missed.
@@ -538,29 +567,43 @@ impl Bots {
     // ---- DMs ----
 
     async fn on_dm(&self, dm: Dm) {
-        let team = self.team();
-        let Some(member) = team.by_slack_id(&dm.user) else {
-            tracing::info!(slack_id = %dm.user, "DM from someone not in team.yaml");
-            let (text, blocks) = member_cards::request_access_note();
-            if let Err(e) = self
-                .slack()
-                .ephemeral_blocks(&dm.channel, &dm.user, None, &text, blocks)
-                .await
-            {
-                tracing::warn!(error = %e, "private note failed");
+        let member = match self.people().identify(&dm.user) {
+            Identity::Member(m) => m,
+            Identity::Stranger => {
+                tracing::info!(slack_id = %dm.user, "DM from someone not in the user directory");
+                let (text, blocks) = member_cards::request_access_note();
+                if let Err(e) = self
+                    .slack()
+                    .ephemeral_blocks(&dm.channel, &dm.user, None, &text, blocks)
+                    .await
+                {
+                    tracing::warn!(error = %e, "private note failed");
+                }
+                return;
             }
-            return;
+            other => {
+                tracing::info!(slack_id = %dm.user, who = other.kind(), "DM refused");
+                self.private(
+                    &dm.channel,
+                    &dm.user,
+                    None,
+                    directory::refusal(&other, NOT_A_MEMBER),
+                )
+                .await;
+                return;
+            }
         };
         let handle = member.handle.clone();
         let text = dm.text.trim().to_string();
         if text.is_empty() {
             return;
         }
-        match members::dm_command(&text, member.is_admin(), &team) {
+        let people = self.people().clone();
+        match members::dm_command(&text, member.admin, |id| people.handle_of(id)) {
             Some(DmCommand::Setup) => return self.post_setup(&dm, &handle).await,
             Some(DmCommand::Requests) => return self.list_requests(&dm).await,
             Some(DmCommand::Remove(who)) => {
-                return self.confirm_remove(&dm, &handle, &who).await;
+                return self.confirm_remove(&dm, &who).await;
             }
             None => {}
         }
@@ -770,22 +813,16 @@ impl Bots {
 
     // ---- Buttons ----
 
-    /// The clicking PM's handle; anyone outside `team.yaml` gets the private note.
+    /// The clicking PM's handle; anyone who may not use PM OS gets the private note.
     pub(crate) async fn clicker(&self, click: &Click) -> Option<String> {
-        let handle = self
-            .team()
-            .by_slack_id(&click.user)
-            .map(|m| m.handle.clone());
-        if handle.is_none() {
-            self.private(
-                &click.channel,
-                &click.user,
-                click.thread_ts.as_deref(),
-                NOT_A_MEMBER,
-            )
-            .await;
-        }
-        handle
+        self.member_or_refuse(
+            &click.channel,
+            &click.user,
+            click.thread_ts.as_deref(),
+            NOT_A_MEMBER,
+        )
+        .await
+        .map(|m| m.handle)
     }
 
     /// Only the item's own PM may decide it. Anyone else gets a private note, and nothing
@@ -1008,8 +1045,11 @@ impl Bots {
             tracing::warn!("edit submitted without its card's details; ignored");
             return;
         };
-        let Some(handle) = self.team().by_slack_id(&user).map(|m| m.handle.clone()) else {
-            self.private(channel, &user, None, NOT_A_MEMBER).await;
+        let Some(handle) = self
+            .member_or_refuse(channel, &user, None, NOT_A_MEMBER)
+            .await
+            .map(|m| m.handle)
+        else {
             return;
         };
         let Some(item) = self.load_item(channel, &user, &handle, id).await else {

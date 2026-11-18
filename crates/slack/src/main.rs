@@ -1,10 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use pmos_slack::bots::{Bots, BotsConfig};
 use pmos_slack::commands::{Commands, SLACK_RESPONSE_URL_PREFIX};
 use pmos_slack::notify::Notifier;
+use pmos_slack::people::People;
 use pmos_slack::reply::Snoozer;
 use pmos_slack::runtime::Runtime;
 use pmos_slack::slackapi::SlackApi;
@@ -85,13 +87,20 @@ async fn main() -> Result<()> {
             "PMOS_SLACK_APP_TOKEN must be an app-level token (xapp-…) with connections:write"
         ));
     }
-    let toolserver = ToolServer::new(need("PMOS_TOOLSERVER_URL")?, need("PMOS_BOT_TOKEN")?);
-    let team_file =
-        PathBuf::from(std::env::var("PMOS_CONTENT_ROOT").unwrap_or_else(|_| "content".into()))
-            .join("team.yaml");
-    if !team_file.is_file() {
-        return Err(anyhow!("{} not found", team_file.display()));
-    }
+    let toolserver_url = need("PMOS_TOOLSERVER_URL")?;
+    let tool_token = need("PMOS_BOT_TOKEN")?;
+    let toolserver = ToolServer::new(toolserver_url.clone(), tool_token.clone());
+    // Who each Slack user is: the tool server's user directory, polled with the same token
+    // (its projection for this token carries Slack ids). Never `team.yaml`.
+    let directory = Arc::new(pmos_directory::snapshot::SnapshotClient::http(
+        &toolserver_url,
+        &tool_token,
+    ));
+    drop(tool_token);
+    let people = People::new(directory.clone());
+    // The skills catalog in the App Home reads the content repo.
+    let content_root =
+        PathBuf::from(std::env::var("PMOS_CONTENT_ROOT").unwrap_or_else(|_| "content".into()));
     let web_url = web_public_url(optional("PMOS_WEB_PUBLIC_URL"))?;
     let slack_url = optional("PMOS_SLACK_URL").unwrap_or_else(|| "https://slack.com".into());
     let http = reqwest::Client::builder()
@@ -128,7 +137,8 @@ async fn main() -> Result<()> {
                 slack: SlackApi::new(slack_url.clone(), bot_token, http.clone()),
                 runtime: Runtime::new(bots_url, need("PMOS_BOTS_TOKEN")?, http.clone()),
                 toolserver: toolserver.clone(),
-                team_file: team_file.clone(),
+                people: people.clone(),
+                content_root: content_root.clone(),
                 default_tz: default_tz.clone(),
                 github_org: optional("PMOS_GITHUB_ORG"),
                 response_url_prefix: SLACK_RESPONSE_URL_PREFIX.into(),
@@ -147,7 +157,7 @@ async fn main() -> Result<()> {
         app_token,
         Commands {
             toolserver,
-            team_file,
+            people,
             http: http.clone(),
             response_url_prefix: SLACK_RESPONSE_URL_PREFIX.into(),
             request_access: bots.is_some(),
@@ -162,6 +172,13 @@ async fn main() -> Result<()> {
             shutdown.cancel();
         });
     }
+    // The first snapshot before Slack connects, then every 10 seconds. Until one arrives,
+    // everyone is told PM OS can't check who they are.
+    if let Err(e) = directory.refresh().await {
+        tracing::warn!(error = %e, "no user directory yet; PM OS can't check who anyone is until it answers");
+    }
+    let directory_poll =
+        directory.spawn(pmos_directory::snapshot::POLL_EVERY, shutdown.child_token());
     let mut notifier = None;
     let mut digest = None;
     let mut snoozer = None;
@@ -215,6 +232,7 @@ async fn main() -> Result<()> {
     if let Some(snoozer) = snoozer {
         let _ = tokio::time::timeout(Duration::from_secs(5), snoozer).await;
     }
+    let _ = tokio::time::timeout(Duration::from_secs(5), directory_poll).await;
     match ended {
         // A non-zero exit, so a supervisor shows it rather than treating it as a clean stop.
         Ended::Disabled => Err(anyhow!(

@@ -1,18 +1,22 @@
 //! Onboarding in Slack end to end (`docs/onboarding-spec.md` §4): the fake Slack (`common`),
 //! a mock bots runtime for the roster, and a mock tool server with the members, onboarding,
-//! OAuth-start and memory-repo endpoints of §3.
+//! OAuth-start and memory-repo endpoints of §3, and the user database's
+//! `GET /internal/directory` (slice U4b), which the Slack service reads over HTTP with the bot
+//! token on a clock the test moves.
 //!
 //! - A stranger taps **Request access**: the request is filed and every admin gets a card.
 //! - An admin approves: every card shows it, and the new member gets a welcome and the
 //!   checklist. A non-admin's tap is refused; a second admin's tap finds it decided.
 //! - `github_not_linked` gets a **Connect GitHub** button and leaves the card alone.
 //! - `setup` renders each state; the memory-repo modal shows refusals as field errors.
-//! - `remove` works with its confirmation; `requests` lists the pending cards.
+//! - `remove` deactivates with its confirmation, and each refusal of slice U3 (an Admin or
+//!   Auditor from Slack, the hourly cap, self, already deactivated) is its own sentence;
+//!   `requests` lists the pending cards.
 //! - Every envelope is acknowledged within 3 seconds.
 
 mod common;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,10 +27,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use common::{serve, until, Call, FakeSlack, APP_TOKEN, SLACK_BOT_TOKEN};
-use pmos_contract::model::{Role, TeamFile, TeamMember};
-use pmos_contract::onboarding::{propose_handle, render_team_yaml, valid_new_handle};
+use pmos_contract::onboarding::{propose_handle, valid_new_handle};
+use pmos_directory::snapshot::{FakeClock, HttpFetcher, SnapshotClient};
 use pmos_slack::bots::{Bots, BotsConfig};
 use pmos_slack::commands::Commands;
+use pmos_slack::people::People;
 use pmos_slack::runtime::Runtime;
 use pmos_slack::slackapi::SlackApi;
 use pmos_slack::socket::{Ended, Socket};
@@ -38,13 +43,18 @@ use tokio_util::sync::CancellationToken;
 
 const BOTS_TOKEN: &str = "test-bots-token-slack-0123456789abcdef";
 const TOOL_BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
-const TEAM: &str = "\
-# Who may use PM OS.
-members:
-  - {handle: ana, slack-id: U0ANA, email: ana@example.com, roles: [pm, admin]}
-  - {handle: cal, slack-id: U0CAL, email: cal@example.com, roles: [pm, admin]}
-  - {handle: bob, slack-id: U0BOB, email: bob@example.com, roles: [pm]}
-";
+/// The mock tool server's user database at the start: two admins and a PM. Aud is an Auditor
+/// only, Gil was deactivated, Ivy is a PM whose Slack display name is hostile.
+fn users() -> Value {
+    json!({"version": 1, "users": [
+        {"handle": "ana", "display_name": "Ana", "status": "active", "roles": ["pm", "admin"], "slack_id": "U0ANA"},
+        {"handle": "cal", "display_name": "Cal", "status": "active", "roles": ["pm", "admin"], "slack_id": "U0CAL"},
+        {"handle": "bob", "display_name": "Bob Jones", "status": "active", "roles": ["pm"], "slack_id": "U0BOB"},
+        {"handle": "aud", "display_name": "Aud", "status": "active", "roles": ["auditor"], "slack_id": "U0AUD"},
+        {"handle": "gil", "display_name": "Gil", "status": "deactivated", "roles": ["pm"], "slack_id": "U0GIL"},
+        {"handle": "ivy", "display_name": "<!channel> *Ivy* <https://evil.example|x>", "status": "active", "roles": ["pm"], "slack_id": "U0IVY"},
+    ]})
+}
 
 fn bearer(headers: &HeaderMap) -> &str {
     headers
@@ -62,7 +72,12 @@ fn answer(status: StatusCode, body: Value) -> Response {
 
 #[derive(Default)]
 struct MockTools {
-    team_file: Mutex<PathBuf>,
+    /// The user database, `{version, users}`, kept in a file so it outlives a restart.
+    users_file: Mutex<PathBuf>,
+    /// Deactivations so far (the hourly cap is 3).
+    deactivations: Mutex<u32>,
+    /// The directory answers 503 (an outage).
+    directory_down: Mutex<bool>,
     requests: Mutex<Vec<Value>>,
     /// Every write: (path, body).
     writes: Mutex<Vec<(String, Value)>>,
@@ -76,18 +91,42 @@ struct MockTools {
 }
 
 impl MockTools {
-    fn team(&self) -> (String, TeamFile) {
-        let text = std::fs::read_to_string(&*self.team_file.lock().unwrap()).unwrap();
-        let team = TeamFile::from_yaml(&text).unwrap();
-        (text, team)
+    fn db(&self) -> Value {
+        let text = std::fs::read_to_string(&*self.users_file.lock().unwrap()).unwrap();
+        serde_json::from_str(&text).unwrap()
     }
 
-    fn write_team(&self, original: &str, members: &[TeamMember]) -> String {
-        std::fs::write(
-            &*self.team_file.lock().unwrap(),
-            render_team_yaml(original, members),
-        )
-        .unwrap();
+    fn save(&self, mut db: Value) {
+        db["version"] = json!(db["version"].as_i64().unwrap() + 1);
+        std::fs::write(&*self.users_file.lock().unwrap(), db.to_string()).unwrap();
+    }
+
+    fn user(&self, handle: &str) -> Option<Value> {
+        self.db()["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["handle"] == handle)
+            .cloned()
+    }
+
+    fn by_slack_id(&self, slack_id: &str) -> Option<Value> {
+        self.db()["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["slack_id"] == slack_id)
+            .cloned()
+    }
+
+    fn active_admin(&self, handle: &str) -> bool {
+        self.user(handle).is_some_and(|u| {
+            u["status"] == "active" && u["roles"].as_array().unwrap().contains(&json!("admin"))
+        })
+    }
+
+    /// Commit the personal bot (as U3 still does): a fake sha.
+    fn commit(&self) -> String {
         let mut n = self.commits.lock().unwrap();
         *n += 1;
         format!("abc{:037x}", *n)
@@ -123,6 +162,25 @@ macro_rules! authed {
     };
 }
 
+/// `GET /internal/directory` for the bot token: every user with their Slack id, an ETag, and
+/// `304` for the current one.
+async fn ts_directory(State(ts): Ts, headers: HeaderMap) -> Response {
+    authed!(headers);
+    if *ts.directory_down.lock().unwrap() {
+        return answer(StatusCode::SERVICE_UNAVAILABLE, json!({"error": "down"}));
+    }
+    let db = ts.db();
+    let etag = format!("\"{}\"", db["version"]);
+    if headers.get("if-none-match").and_then(|v| v.to_str().ok()) == Some(etag.as_str()) {
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+    (
+        [("etag", etag)],
+        Json(json!({"version": db["version"], "users": db["users"]})),
+    )
+        .into_response()
+}
+
 async fn ts_new_request(State(ts): Ts, headers: HeaderMap, Json(body): Json<Value>) -> Response {
     authed!(headers);
     ts.writes
@@ -137,12 +195,18 @@ async fn ts_new_request(State(ts): Ts, headers: HeaderMap, Json(body): Json<Valu
             json!({"error": "bad request", "code": "bad_request"}),
         );
     }
-    let (_, team) = ts.team();
-    if team.by_slack_id(slack_id).is_some() {
-        return answer(
-            StatusCode::CONFLICT,
-            json!({"error": "already a member", "code": "already_member"}),
-        );
+    if let Some(u) = ts.by_slack_id(slack_id) {
+        return if u["status"] == "deactivated" {
+            answer(
+                StatusCode::CONFLICT,
+                json!({"error": "your access was turned off", "code": "deactivated"}),
+            )
+        } else {
+            answer(
+                StatusCode::CONFLICT,
+                json!({"error": "already a member", "code": "already_member"}),
+            )
+        };
     }
     let mut requests = ts.requests.lock().unwrap();
     if let Some(r) = requests
@@ -151,10 +215,11 @@ async fn ts_new_request(State(ts): Ts, headers: HeaderMap, Json(body): Json<Valu
     {
         return answer(StatusCode::OK, json!({"request": r}));
     }
-    let taken = team
-        .members
+    let taken: BTreeSet<String> = ts.db()["users"]
+        .as_array()
+        .unwrap()
         .iter()
-        .map(|m| m.handle.clone())
+        .map(|u| u["handle"].as_str().unwrap().to_string())
         .chain(
             requests
                 .iter()
@@ -201,19 +266,21 @@ async fn ts_decide(
         format!("/internal/members/requests/{id}/decision"),
         body.clone(),
     ));
-    let (original, team) = ts.team();
     let admin = body["decided_by"].as_str().unwrap_or_default();
-    if !team.by_handle(admin).is_some_and(|m| m.is_admin()) {
-        return answer(StatusCode::FORBIDDEN, json!({"error": "admins only"}));
+    if !ts.active_admin(admin) {
+        return answer(
+            StatusCode::FORBIDDEN,
+            json!({"error": "admins only", "code": "not_admin"}),
+        );
     }
-    // The bot's token may grant `pm` and `skill-author` only (S2).
+    // From the bot's token a join is `pm` only (U3).
     if body["roles"]
         .as_array()
-        .is_some_and(|r| r.iter().any(|r| r == "admin"))
+        .is_some_and(|r| r.iter().any(|r| r != "pm"))
     {
         return answer(
             StatusCode::FORBIDDEN,
-            json!({"error": "admins are added by a pull request to team.yaml"}),
+            json!({"error": "pm only from Slack", "code": "role_not_from_slack"}),
         );
     }
     let mut requests = ts.requests.lock().unwrap();
@@ -236,7 +303,7 @@ async fn ts_decide(
         .or(request["proposed_handle"].as_str())
         .unwrap()
         .to_string();
-    if !valid_new_handle(&handle) || team.by_handle(&handle).is_some() {
+    if !valid_new_handle(&handle) || ts.user(&handle).is_some() {
         return answer(
             StatusCode::UNPROCESSABLE_ENTITY,
             json!({"error": "that handle is taken", "code": "bad_handle"}),
@@ -257,16 +324,14 @@ async fn ts_decide(
         }
         Some(_) => {}
     }
-    let mut members = team.members.clone();
-    members.push(TeamMember {
-        handle: handle.clone(),
-        slack_id: request["slack_id"].as_str().unwrap().into(),
-        email: request["email"].as_str().map(String::from),
-        github: None,
-        entra_oid: None,
-        roles: vec![Role::Pm],
-    });
-    let commit = ts.write_team(&original, &members);
+    // The user first (U3), then the personal bot's commit.
+    let mut db = ts.db();
+    db["users"].as_array_mut().unwrap().push(json!({
+        "handle": handle, "display_name": request["name"], "status": "active",
+        "roles": ["pm"], "slack_id": request["slack_id"],
+    }));
+    ts.save(db);
+    let commit = ts.commit();
     request["status"] = json!("approved");
     request["decided_by"] = json!(admin);
     request["handle"] = json!(handle);
@@ -274,6 +339,7 @@ async fn ts_decide(
     answer(StatusCode::OK, json!({"request": request}))
 }
 
+/// `POST /internal/members/{handle}/remove`: a deactivation, with U3's refusals.
 async fn ts_remove(
     State(ts): Ts,
     Path(handle): Path<String>,
@@ -285,21 +351,48 @@ async fn ts_remove(
         .lock()
         .unwrap()
         .push((format!("/internal/members/{handle}/remove"), body.clone()));
-    let (original, team) = ts.team();
     let admin = body["decided_by"].as_str().unwrap_or_default();
-    if !team.by_handle(admin).is_some_and(|m| m.is_admin()) || admin == handle {
-        return answer(StatusCode::FORBIDDEN, json!({"error": "no"}));
+    let refuse = |status: StatusCode, code: &str| {
+        answer(
+            status,
+            json!({"error": format!("refused: {code}"), "code": code}),
+        )
+    };
+    if !ts.active_admin(admin) {
+        return refuse(StatusCode::FORBIDDEN, "not_admin");
     }
-    if team.by_handle(&handle).is_none() {
-        return answer(StatusCode::NOT_FOUND, json!({"error": "not a member"}));
+    if admin == handle {
+        return refuse(StatusCode::FORBIDDEN, "self_removal");
     }
-    let members: Vec<TeamMember> = team
-        .members
-        .into_iter()
-        .filter(|m| m.handle != handle)
-        .collect();
-    let commit = ts.write_team(&original, &members);
-    answer(StatusCode::OK, json!({"handle": handle, "commit": commit}))
+    let Some(user) = ts.user(&handle) else {
+        return refuse(StatusCode::NOT_FOUND, "not_a_member");
+    };
+    let roles = user["roles"].as_array().unwrap();
+    if roles.contains(&json!("admin")) || roles.contains(&json!("auditor")) {
+        return refuse(StatusCode::FORBIDDEN, "protected_not_from_slack");
+    }
+    if user["status"] == "deactivated" {
+        return refuse(StatusCode::CONFLICT, "already_deactivated");
+    }
+    {
+        let mut n = ts.deactivations.lock().unwrap();
+        if *n >= 3 {
+            return refuse(StatusCode::TOO_MANY_REQUESTS, "deactivation_limit");
+        }
+        *n += 1;
+    }
+    let mut db = ts.db();
+    for u in db["users"].as_array_mut().unwrap() {
+        if u["handle"] == handle.as_str() {
+            u["status"] = json!("deactivated");
+        }
+    }
+    ts.save(db);
+    answer(
+        StatusCode::OK,
+        json!({"handle": handle, "deactivated": true, "commit": null,
+               "note": format!("`{handle}` is deactivated")}),
+    )
 }
 
 async fn ts_onboarding(
@@ -309,10 +402,13 @@ async fn ts_onboarding(
 ) -> Response {
     authed!(headers);
     let user = q.get("user").cloned().unwrap_or_default();
-    let (_, team) = ts.team();
-    let Some(member) = team.by_handle(&user) else {
+    let Some(member) = ts.user(&user) else {
         return answer(StatusCode::NOT_FOUND, json!({"error": "not a member"}));
     };
+    let admin = member["roles"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("admin"));
     let linked = ts
         .linked
         .lock()
@@ -323,7 +419,7 @@ async fn ts_onboarding(
     answer(
         StatusCode::OK,
         json!({
-            "member": true, "handle": user, "admin": member.is_admin(),
+            "member": true, "handle": user, "admin": admin,
             "linked": {
                 "atlassian": linked.contains("atlassian"),
                 "slack": linked.contains("slack"),
@@ -344,7 +440,7 @@ async fn ts_oauth_start(
 ) -> Response {
     authed!(headers);
     let user = q.get("user").cloned().unwrap_or_default();
-    if ts.team().1.by_handle(&user).is_none() {
+    if ts.user(&user).is_none() {
         return answer(StatusCode::FORBIDDEN, json!({"error": "members only"}));
     }
     answer(
@@ -408,6 +504,7 @@ fn tools_routes(ts: Arc<MockTools>) -> Router {
         )
         .route("/internal/members/requests/{id}/decision", post(ts_decide))
         .route("/internal/members/{handle}/remove", post(ts_remove))
+        .route("/internal/directory", get(ts_directory))
         .route("/internal/onboarding", get(ts_onboarding))
         .route("/internal/oauth/{provider}/start", get(ts_oauth_start))
         .route("/internal/memory/repo", post(ts_memory_repo))
@@ -477,7 +574,11 @@ struct Stack {
     runtime: Arc<MockRuntime>,
     tools: Arc<MockTools>,
     bots: Bots,
+    /// The mock tool server's user database and the Slack state, across a restart.
     team: tempfile::TempDir,
+    /// The clock the Slack service's directory snapshot ages on.
+    clock: Arc<FakeClock>,
+    directory: Arc<SnapshotClient>,
     stop: Vec<CancellationToken>,
     socket: Option<(CancellationToken, JoinHandle<Ended>)>,
     next: Mutex<u32>,
@@ -493,7 +594,8 @@ impl Stack {
         Self::build(true, None).await
     }
 
-    /// Stop everything and keep the directory (team file and Slack state), to start again.
+    /// Stop everything and keep the directory (the user database and Slack state), to start
+    /// again.
     async fn stop_keep(mut self) -> tempfile::TempDir {
         if let Some((shutdown, handle)) = self.socket.take() {
             shutdown.cancel();
@@ -531,12 +633,12 @@ impl Stack {
 
         let fresh = dir.is_none();
         let team = dir.unwrap_or_else(|| tempfile::tempdir().unwrap());
-        let team_file = team.path().join("team.yaml");
+        let users_file = team.path().join("users.json");
         if fresh {
-            std::fs::write(&team_file, TEAM).unwrap();
+            std::fs::write(&users_file, users().to_string()).unwrap();
         }
         let tools = Arc::new(MockTools::default());
-        *tools.team_file.lock().unwrap() = team_file.clone();
+        *tools.users_file.lock().unwrap() = users_file;
         tools.github.lock().unwrap().insert("ana".into(), "push");
         let (ts_base, stop_ts) = serve(tools_routes(tools.clone())).await;
         let runtime = Arc::new(MockRuntime::default());
@@ -550,13 +652,23 @@ impl Stack {
         )
         .await;
 
+        // The Slack service reads the mock's directory over HTTP, as it reads the tool
+        // server's, with the bot token; its age moves only with `clock`.
+        let clock = Arc::new(FakeClock::default());
+        let directory = Arc::new(SnapshotClient::new(
+            Arc::new(HttpFetcher::new(&ts_base, TOOL_BOT_TOKEN)),
+            clock.clone(),
+        ));
+        directory.refresh().await.unwrap();
+        let people = People::new(directory.clone());
         let http = reqwest::Client::new();
         let bots = Bots::with_onboarding_v2(
             BotsConfig {
                 slack: SlackApi::new(slack_base.clone(), SLACK_BOT_TOKEN, http.clone()),
                 runtime: Runtime::new(rt_base, BOTS_TOKEN, http.clone()),
                 toolserver: ToolServer::new(ts_base.clone(), TOOL_BOT_TOKEN),
-                team_file: team_file.clone(),
+                people: people.clone(),
+                content_root: team.path().join("content"),
                 default_tz: "UTC".into(),
                 github_org: Some("example-org".into()),
                 response_url_prefix: format!("{slack_base}/hooks/"),
@@ -570,7 +682,7 @@ impl Stack {
             APP_TOKEN,
             Commands {
                 toolserver: ToolServer::new(ts_base, TOOL_BOT_TOKEN),
-                team_file,
+                people,
                 http: http.clone(),
                 response_url_prefix: format!("{slack_base}/hooks/"),
                 request_access: true,
@@ -589,6 +701,8 @@ impl Stack {
             tools,
             bots,
             team,
+            clock,
+            directory,
             stop: vec![stop_slack, stop_ts, stop_rt],
             socket: Some((shutdown, handle)),
             next: Mutex::new(0),
@@ -747,12 +861,12 @@ fn text_of(call: &Call) -> String {
     format!("{} {}", call.body["text"], call.body["blocks"])
 }
 
-/// Every element (buttons and accessories) in a message's blocks.
+/// Every element (buttons and accessories) in a message's blocks (none for plain text).
 fn elements(body: &Value) -> Vec<Value> {
     body["blocks"]
         .as_array()
-        .unwrap()
-        .iter()
+        .into_iter()
+        .flatten()
         .flat_map(|b| {
             let mut els = b["elements"].as_array().cloned().unwrap_or_default();
             if b["accessory"].is_object() {
@@ -786,7 +900,7 @@ fn has_action(body: &Value, action_id: &str) -> bool {
 async fn a_stranger_requests_access_and_an_admin_approves() {
     let stack = Stack::new().await;
 
-    // A DM from someone not in team.yaml: the note, with Request access.
+    // A DM from someone not in the user directory: the note, with Request access.
     stack.dm("U0BEN", "hi").await;
     let notes = stack.calls("chat.postEphemeral", 1).await;
     assert_eq!(notes[0].body["user"], "U0BEN");
@@ -832,11 +946,9 @@ async fn a_stranger_requests_access_and_an_admin_approves() {
         assert!(s.contains("Ben &lt;Smith&gt;"), "{s}");
         assert!(s.contains("ben.smith@example.com"));
         assert!(s.contains("`ben-smith`"));
-        // No admin choice (S2): the card says how admins are made instead.
-        assert!(
-            s.contains("Admins are added by a pull request to `team.yaml`"),
-            "{s}"
-        );
+        // No role choice (S2, U3): the card says what approving grants instead.
+        assert!(s.contains("Approving adds them to PM OS as a PM"), "{s}");
+        assert!(!s.contains("team.yaml"), "{s}");
         assert!(!s.to_lowercase().contains("make admin"), "{s}");
         for action in [
             "pmos_member_approve",
@@ -947,7 +1059,8 @@ async fn a_stranger_requests_access_and_an_admin_approves() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(stack.slack.calls("chat.postMessage").len(), 4);
 
-    // Ben is a member now (the tool server committed team.yaml): his DMs go to the bots.
+    // Ben is a user now (the tool server created him, and the Slack service polled the
+    // directory after the decision): his DMs go to the bots.
     stack.dm("U0BEN", "what ports does Acme Vault need?").await;
     until("Ben's task", || {
         let tasks = stack.runtime.tasks.lock().unwrap().clone();
@@ -1214,7 +1327,13 @@ async fn remove_works_with_its_confirmation_and_requests_lists_cards() {
     stack.dm("U0ANA", "remove bob").await;
     let posts = stack.calls("chat.postMessage", 7).await;
     let confirm = &posts[6];
-    assert!(text_of(confirm).contains("Remove `bob` (<@U0BOB>) from PM OS?"));
+    assert!(
+        text_of(confirm).contains("Remove Bob Jones `bob` (<@U0BOB>) from PM OS?"),
+        "{}",
+        text_of(confirm)
+    );
+    assert!(text_of(confirm).contains("This deactivates them"));
+    assert!(!text_of(confirm).contains("team.yaml"));
     assert_eq!(
         button_value(&confirm.body, "pmos_member_remove_confirm"),
         "bob"
@@ -1237,7 +1356,7 @@ async fn remove_works_with_its_confirmation_and_requests_lists_cards() {
     assert!(text_of(&notes[0]).contains("Only platform owners can remove members."));
     assert!(stack.tools.wrote("/remove").is_empty());
 
-    // Remove: the tool server commits, and the card says so.
+    // Remove: the tool server deactivates, and the card says so; nothing is committed.
     stack.dm("U0ANA", "remove bob").await;
     stack.calls("chat.postMessage", 8).await;
     let card = ("D0ANA", "1700000000.000008");
@@ -1251,16 +1370,326 @@ async fn remove_works_with_its_confirmation_and_requests_lists_cards() {
     );
     assert!(text_of(&updates[1]).contains("Removing…"));
     assert_eq!(updates[2].body["ts"], card.1);
+    let done = text_of(&updates[2]);
     assert!(
-        text_of(&updates[2]).contains(":white_check_mark: Removed `bob` by Ana (commit `abc0000`)"),
-        "{}",
-        text_of(&updates[2])
+        done.contains(":white_check_mark: Removed `bob` by Ana: deactivated."),
+        "{done}"
     );
+    assert!(!done.contains("commit"), "{done}");
 
-    // Bob is no longer a member: his next DM gets the Request access note.
+    // Bob is deactivated (the directory was polled after the change): his next DM is
+    // refused, with no Request access and no task.
+    let tasks = stack.runtime.tasks.lock().unwrap().len();
     stack.dm("U0BOB", "hi").await;
     let notes = stack.calls("chat.postEphemeral", 2).await;
-    assert!(has_action(&notes[1].body, "pmos_request_access"));
+    assert!(text_of(&notes[1]).contains("Your PM OS access was turned off"));
+    assert!(!has_action(&notes[1].body, "pmos_request_access"));
+    // Nor may he ask for access again (`409 deactivated` too, should he try).
+    stack.click_note("U0BOB", "pmos_request_access").await;
+    let replies = stack.responses(2).await;
+    assert!(replies[1]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Your PM OS access was turned off"));
+    quiet().await;
+    assert_eq!(stack.runtime.tasks.lock().unwrap().len(), tasks);
+    stack.stop().await;
+}
+
+/// `remove` refusals (slice U3), each its own sentence: an Admin or Auditor can't be
+/// deactivated from Slack (checked here first, and by the tool server), nor someone already
+/// deactivated; the fourth in an hour hits the cap.
+#[tokio::test]
+async fn remove_refusals_are_clear() {
+    let stack = Stack::new().await;
+    let st = &stack;
+    let note = move |n: usize| async move {
+        let posts = st.calls("chat.postMessage", n).await;
+        text_of(&posts[n - 1])
+    };
+
+    // An admin, and an Auditor: refused before the tool server is asked.
+    stack.dm("U0ANA", "remove cal").await;
+    let s = note(1).await;
+    assert!(s.contains("`cal` is a platform owner or an auditor"), "{s}");
+    assert!(s.contains("won't deactivate them from Slack"), "{s}");
+    stack.dm("U0ANA", "remove <@U0AUD>").await;
+    let s = note(2).await;
+    assert!(s.contains("`aud` is a platform owner or an auditor"), "{s}");
+    // Already deactivated.
+    stack.dm("U0ANA", "remove gil").await;
+    let s = note(3).await;
+    assert!(s.contains("`gil` is already deactivated"), "{s}");
+    assert!(stack.tools.wrote("/remove").is_empty());
+
+    // The tool server's own refusal, should the directory be behind: Ivy was made an
+    // admin a moment ago (on the host), so the confirmation offered Remove; the tool server
+    // says no.
+    stack.dm("U0ANA", "remove ivy").await;
+    note(4).await;
+    let mut db = stack.tools.db();
+    for u in db["users"].as_array_mut().unwrap() {
+        if u["handle"] == "ivy" {
+            u["roles"] = json!(["pm", "admin"]);
+        }
+    }
+    stack.tools.save(db);
+    let card = ("D0ANA", "1700000000.000004");
+    stack
+        .click("U0ANA", "pmos_member_remove_confirm", "ivy", card)
+        .await;
+    let updates = stack.calls("chat.update", 2).await;
+    let s = text_of(&updates[1]);
+    assert!(s.contains("won't deactivate them from Slack"), "{s}");
+    assert!(!has_action(&updates[1].body, "pmos_member_remove_confirm"));
+    assert_eq!(stack.tools.wrote("/internal/members/ivy/remove").len(), 1);
+
+    // The hourly cap: three go through, the fourth is refused and says who can continue.
+    *stack.tools.deactivations.lock().unwrap() = 3;
+    stack.dm("U0ANA", "remove bob").await;
+    note(5).await;
+    let card = ("D0ANA", "1700000000.000005");
+    stack
+        .click("U0ANA", "pmos_member_remove_confirm", "bob", card)
+        .await;
+    let updates = stack.calls("chat.update", 4).await;
+    let s = text_of(&updates[3]);
+    assert!(
+        s.contains("PM OS has stopped deactivations for an hour"),
+        "{s}"
+    );
+    assert!(s.contains("pmos-admin users deactivate"), "{s}");
+    // Bob is still active: his DM still reaches the bots.
+    stack.dm("U0BOB", "hello").await;
+    until("Bob's task", || {
+        (!stack.runtime.tasks.lock().unwrap().is_empty()).then_some(())
+    })
+    .await;
+    stack.stop().await;
+}
+
+/// Admin actions need a directory snapshot at most 30 seconds old; who someone is holds for
+/// 5 minutes; past that, PM OS can't check who anyone is. On the service's real path: the
+/// directory over HTTP, an outage, and the clock moving.
+#[tokio::test]
+async fn stale_directory_fails_closed() {
+    let stack = Stack::new().await;
+    *stack.tools.directory_down.lock().unwrap() = true;
+    assert!(stack.directory.refresh().await.is_err());
+
+    // 31 seconds: an approval, `requests` and `remove` are refused here; nothing is sent.
+    stack.clock.advance(Duration::from_secs(31));
+    let (id, cards) = {
+        // Ben's request is filed, but no admin can be told on a stale directory.
+        stack.click_note("U0BEN", "pmos_request_access").await;
+        let replies = stack.responses(1).await;
+        assert!(
+            replies[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("couldn't reach a platform owner"),
+            "{}",
+            replies[0]
+        );
+        assert!(stack.slack.calls("conversations.open").is_empty());
+        let id = stack.tools.requests.lock().unwrap()[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (id, ("D0ANA".to_string(), "1700000000.000001".to_string()))
+    };
+    stack
+        .click("U0ANA", "pmos_member_approve", &id, (&cards.0, &cards.1))
+        .await;
+    let notes = stack.calls("chat.postEphemeral", 1).await;
+    assert!(text_of(&notes[0]).contains("PM OS can't check your access right now"));
+    stack.dm("U0ANA", "requests").await;
+    let notes = stack.calls("chat.postEphemeral", 2).await;
+    assert!(text_of(&notes[1]).contains("can't check your access"));
+    stack.dm("U0ANA", "remove bob").await;
+    let notes = stack.calls("chat.postEphemeral", 3).await;
+    assert!(text_of(&notes[2]).contains("can't check your access"));
+    assert!(stack.tools.wrote("/decision").is_empty());
+    assert!(stack.tools.wrote("/remove").is_empty());
+    // A PM's ask still goes through on the 5-minute identity: the runtime decides again.
+    stack.dm("U0BOB", "hello").await;
+    until("Bob's task", || {
+        (!stack.runtime.tasks.lock().unwrap().is_empty()).then_some(())
+    })
+    .await;
+
+    // Exactly 5 minutes: still known. A moment later: PM OS can't check who anyone is.
+    stack
+        .clock
+        .advance(Duration::from_secs(5 * 60) - Duration::from_secs(31));
+    stack.dm("U0BOB", "again").await;
+    until("Bob's second task", || {
+        (stack.runtime.tasks.lock().unwrap().len() == 2).then_some(())
+    })
+    .await;
+    stack.clock.advance(Duration::from_millis(1));
+    stack.dm("U0BOB", "and again").await;
+    let notes = stack.calls("chat.postEphemeral", 4).await;
+    assert!(text_of(&notes[3]).contains("PM OS can't check who you are right now"));
+    // A stranger is not offered Request access while PM OS can't check.
+    stack.dm("U0ZED", "hi").await;
+    let notes = stack.calls("chat.postEphemeral", 5).await;
+    assert!(text_of(&notes[4]).contains("can't check who you are"));
+    assert!(!has_action(&notes[4].body, "pmos_request_access"));
+    quiet().await;
+    assert_eq!(stack.runtime.tasks.lock().unwrap().len(), 2);
+
+    // The directory answers again: everything is back.
+    *stack.tools.directory_down.lock().unwrap() = false;
+    stack.directory.refresh().await.unwrap();
+    stack.dm("U0BOB", "back").await;
+    until("Bob's third task", || {
+        (stack.runtime.tasks.lock().unwrap().len() == 3).then_some(())
+    })
+    .await;
+    stack.stop().await;
+}
+
+/// An Auditor-only person isn't a PM in Slack, and a deactivated person is refused: neither
+/// is offered Request access, and neither starts a task.
+#[tokio::test]
+async fn an_auditor_is_not_a_pm_and_a_deactivated_person_is_refused() {
+    let stack = Stack::new().await;
+    stack.dm("U0AUD", "what ports does Acme Vault need?").await;
+    let notes = stack.calls("chat.postEphemeral", 1).await;
+    assert!(text_of(&notes[0]).contains("Your PM OS role doesn't include using PM OS in Slack"));
+    assert!(!has_action(&notes[0].body, "pmos_request_access"));
+    stack.dm("U0GIL", "hello").await;
+    let notes = stack.calls("chat.postEphemeral", 2).await;
+    assert!(text_of(&notes[1]).contains("Your PM OS access was turned off"));
+    // `/docs` too.
+    for (user, says) in [
+        ("U0AUD", "doesn't include using PM OS in Slack"),
+        ("U0GIL", "access was turned off"),
+    ] {
+        let ack = stack
+            .send(
+                "slash_commands",
+                json!({"command": "/docs", "text": "saml", "user_id": user, "channel_id": "C1",
+                       "response_url": format!("{}/hooks/bots", stack.slack_base)}),
+            )
+            .await;
+        assert!(
+            ack["payload"]["text"].as_str().unwrap().contains(says),
+            "{ack}"
+        );
+    }
+    // Neither can decide a join, even holding a role row that once said admin.
+    let (id, cards) = stack.ben_requests().await;
+    stack
+        .click(
+            "U0AUD",
+            "pmos_member_approve",
+            &id,
+            (&cards[0].0, &cards[0].1),
+        )
+        .await;
+    let notes = stack.calls("chat.postEphemeral", 3).await;
+    assert!(text_of(&notes[2]).contains("Only platform owners can decide this."));
+    assert!(stack.tools.wrote("/decision").is_empty());
+    quiet().await;
+    assert!(stack.runtime.tasks.lock().unwrap().is_empty());
+    stack.stop().await;
+}
+
+/// A display name from Slack renders inert wherever the service shows it: the `remove`
+/// confirmation (the directory's name) and an access request's card (Slack's `users.info`).
+#[tokio::test]
+async fn a_hostile_display_name_renders_inert() {
+    let stack = Stack::new().await;
+    stack.dm("U0ANA", "remove ivy").await;
+    let posts = stack.calls("chat.postMessage", 1).await;
+    let s = text_of(&posts[0]);
+    assert!(!s.contains("<!channel>"), "{s}");
+    assert!(!s.contains("<https://evil"), "{s}");
+    assert!(!s.contains("*Ivy*"), "{s}");
+    assert!(s.contains("&lt;!channel&gt;"), "{s}");
+    assert!(s.contains("`ivy` (<@U0IVY>)"), "{s}");
+
+    stack.slack.users.lock().unwrap().insert(
+        "U0EVE".into(),
+        json!({"name": "eve", "real_name": "<!here> <@U0ANA> _Eve_ evil.example",
+               "profile": {"email": "eve@example.com"}}),
+    );
+    let before = stack.slack.calls("chat.postMessage").len();
+    stack.click_note("U0EVE", "pmos_request_access").await;
+    let posts = stack.calls("chat.postMessage", before + 2).await;
+    for card in &posts[before..] {
+        let s = text_of(card);
+        for live in ["<!here>", "<@U0ANA>", "_Eve_", "evil.example"] {
+            assert!(!s.contains(live), "{live} in {s}");
+        }
+        assert!(s.contains("&lt;!here&gt;"), "{s}");
+        // The card's own mention of the requester is still one.
+        assert!(s.contains("(<@U0EVE>)"), "{s}");
+    }
+    stack.stop().await;
+}
+
+/// A hostile `team.yaml` in the content root, listing `mallory` as an admin with Ana's Slack
+/// id and another for Mal's, changes nothing: the directory decides. Then none at all.
+#[tokio::test]
+async fn a_hostile_or_absent_team_yaml_changes_nothing() {
+    let stack = Stack::new().await;
+    let content = stack.team.path().join("content");
+    std::fs::create_dir_all(&content).unwrap();
+    std::fs::write(
+        content.join("team.yaml"),
+        "members:\n  - {handle: mallory, slack-id: U0ANA, email: ana@example.com, roles: [pm, admin]}\n  - {handle: mal, slack-id: U0MAL, roles: [pm, admin]}\n  - {handle: bob, slack-id: U0BOB, roles: [pm, admin]}\n",
+    )
+    .unwrap();
+    // Ana is still Ana: her task is hers, not mallory's.
+    stack.dm("U0ANA", "hello").await;
+    let tasks = until("Ana's task", || {
+        let t = stack.runtime.tasks.lock().unwrap().clone();
+        (!t.is_empty()).then_some(t)
+    })
+    .await;
+    assert_eq!(tasks[0]["requested_by"], "ana");
+    // Mal, in the file only, is a stranger; Bob, an admin in the file only, is not an admin.
+    stack.dm("U0MAL", "requests").await;
+    let notes = stack.calls("chat.postEphemeral", 1).await;
+    assert!(has_action(&notes[0].body, "pmos_request_access"));
+    stack.dm("U0BOB", "remove cal").await;
+    until("Bob's message to his bot", || {
+        (stack.runtime.tasks.lock().unwrap().len() == 2).then_some(())
+    })
+    .await;
+    assert!(stack.tools.wrote("/remove").is_empty());
+    let (id, cards) = stack.ben_requests().await;
+    let opened: Vec<Value> = stack
+        .slack
+        .calls("conversations.open")
+        .iter()
+        .map(|c| c.body["users"].clone())
+        .collect();
+    assert_eq!(
+        opened,
+        vec![json!("U0ANA"), json!("U0CAL")],
+        "admins from the directory"
+    );
+    stack
+        .click(
+            "U0BOB",
+            "pmos_member_approve",
+            &id,
+            (&cards[0].0, &cards[0].1),
+        )
+        .await;
+    let notes = stack.calls("chat.postEphemeral", 2).await;
+    assert!(text_of(&notes[1]).contains("Only platform owners can decide this."));
+
+    // No team.yaml at all: the same.
+    std::fs::remove_file(content.join("team.yaml")).unwrap();
+    stack.dm("U0ANA", "requests").await;
+    let posts = stack.calls("chat.postMessage", 3).await;
+    assert_eq!(posts[2].body["channel"], "D0ANA");
+    assert_eq!(button_value(&posts[2].body, "pmos_member_approve"), id);
     stack.stop().await;
 }
 
@@ -1461,7 +1890,7 @@ async fn the_offer_comes_after_linking_once_and_each_button_starts_a_task() {
     assert!(text_of(last).contains("On it:"));
     assert!(elements(&last.body).is_empty());
 
-    // Someone outside team.yaml tapping it gets the usual refusal and no task.
+    // Someone outside the user directory tapping it gets the usual refusal and no task.
     let tasks = stack.runtime.tasks.lock().unwrap().len();
     stack
         .click("U0ZED", "pmos_onboard_start_week", "week", ("D0ZED", "1.0"))
