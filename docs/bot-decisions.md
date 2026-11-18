@@ -71,8 +71,8 @@ the product lessons doc shared on 2026-11-14.
    - The content repo keeps its review-by-pull-request rule.
 7. **Slash commands stay as shortcuts (decided 2026-11-14).** `/docs` asks the Docs bot; a command is never a feature of its own (D1).
 8. **Onboarding is done by the bot (decided 2026-11-14).**
-   - Someone not in `team.yaml` taps **Request access** in Slack. A platform owner (`admin`) approves or rejects it on a card.
-   - On approval, PM OS commits the new `team.yaml` entry and the member's personal bot (`pm-<handle>`) to the content repo, with the approver's own GitHub token and an `Approved-by` trailer. Git stays the source of truth.
+   - Someone not in the user database taps **Request access** in Slack. A platform owner (`admin`) approves or rejects it on a card.
+   - On approval, PM OS adds them to the user database, then commits the member's personal bot (`pm-<handle>`) to the content repo, with the approver's own GitHub token and an `Approved-by` trailer. (Until the user database, the commit was a `team.yaml` entry; the file was retired in slice U7, `docs/user-database-spec.md`.)
    - The bot fills in the Slack id and email itself, then walks the new member through `setup`: Jira and Confluence, Slack, GitHub, their memory repo.
    - Platform owners remove members with `remove <handle>`, which also unlinks their accounts.
    - Spec: `docs/onboarding-spec.md`.

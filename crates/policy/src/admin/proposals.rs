@@ -41,7 +41,7 @@ pub const TEXT_EXTENSIONS: [&str; 4] = ["md", "yaml", "yml", "txt"];
 /// Content files a proposal may not touch, with why.
 pub const PROTECTED: [(&str, &str); 1] = [(
     "team.yaml",
-    "members and roles are managed through onboarding (and team.yaml's own review), not content proposals",
+    "team.yaml is retired: users and roles are in the PM OS user database, not content",
 )];
 
 /// What a proposal changes.

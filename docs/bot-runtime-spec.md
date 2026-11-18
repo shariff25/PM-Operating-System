@@ -62,7 +62,7 @@ It is an alternative to `skill`; send one of the two. It needs the service token
 **Read identity:**
 - **Personal bots** read as `user`, with that PM's linked accounts (unchanged).
 - **Team bots** read as the bot's service identity `bots.<name>`: a vault credential linked by a platform owner with `GET /internal/oauth/{provider}/start?user=bots.<name>`.
-  - The identity check against `team.yaml` is skipped for `bots.*` users, which aren't PMs.
+  - The identity check against the user database is skipped for `bots.*` users, which aren't PMs.
   - Writes from a team-bot session still run as `user` (the approving PM), never as the bot.
 
 **Read scope for team bots** (decision 26), enforced in the connectors:
@@ -83,7 +83,7 @@ It is an alternative to `skill`; send one of the two. It needs the service token
 - `GET /internal/approvals/{id}`;
 - `POST /internal/approvals/{id}/decision`, used by Slack approval cards.
 
-`decided_by` must be a `team.yaml` member. The Slack bot maps the clicking Slack user to their handle; the tool server checks membership and audits `client=bot`.
+`decided_by` must be an active PM OS user (the user database; `team.yaml` until slice U3). The Slack bot maps the clicking Slack user to their handle; the tool server checks membership and audits `client=bot`.
 
 ## 3. Runtime: `pmos-bots` (`crates/bots`)
 
@@ -247,7 +247,8 @@ The benchmark runner's token must not be able to act as a PM or reach Slack:
 
 ### Levels and member settings
 A PM's level (`senior`, `staff` or `principal`; `docs/levels.md`) is their own working
-preference, so it lives in the runtime, which builds each task's claim, and not in `team.yaml`.
+preference, so it lives in the runtime, which builds each task's claim, and not in the user
+database.
 - **Store:** `member_settings {handle (key), level, updated_at}`, on the memory and Postgres
   stores.
 - **The claim carries `level`:** the task's own `level` if it has one, else the setting of
@@ -338,7 +339,7 @@ preference, so it lives in the runtime, which builds each task's claim, and not 
 - a state-changing request must carry `Origin` or `Referer` from the console's own origin;
 - the console's tool-server token is its own (`PMOS_CONSOLE_TS_TOKEN` there): it may read approvals and nothing else.
 
-Admins (role `admin` in `team.yaml`) see everything; a PM sees their own bots, routines and tasks plus the team bots.
+Admins (an active `admin` in the user database) see everything; a PM sees their own bots, routines and tasks plus the team bots.
 
 ## 7. Sandbox policies (0f): `crates/policy` and `pmos policy`
 - **Per bot:** `policies/bots/<bot>.yaml` is generated from the bot's role (the D3 role template) by `pmos policy generate`.

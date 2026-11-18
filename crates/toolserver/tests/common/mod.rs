@@ -201,14 +201,49 @@ pub async fn pg_fixture() -> Option<(Fixture, TestPg)> {
 /// (the user database always has an active admin).
 pub const FIXTURE_ADMIN: (&str, &str) = ("fixture-admin", "U0FIXADMIN");
 
-/// `members` as a `team.yaml`-shaped seed, with [`FIXTURE_ADMIN`] added when none of them is
-/// an admin.
-pub fn seed_request(
-    mut members: Vec<pmos_contract::model::TeamMember>,
-) -> pmos_toolserver::users::ImportRequest {
-    use pmos_contract::model::{Role, TeamMember};
+/// One person in a fixture's seed. The seed is the import's file shape (a `members:` list),
+/// written out by [`seed_yaml`] and parsed by the tool server's import, the only code that
+/// parses that shape (slice U7).
+#[derive(Debug, Clone)]
+pub struct SeedMember {
+    pub handle: String,
+    pub slack_id: String,
+    pub email: Option<String>,
+    pub github: Option<String>,
+    pub entra_oid: Option<String>,
+    pub roles: Vec<pmos_contract::model::Role>,
+}
+
+/// `members` in the seed's YAML shape.
+pub fn seed_yaml(members: &[SeedMember]) -> String {
+    let quote = |s: &str| serde_json::to_string(s).unwrap();
+    let mut out = String::from("members:\n");
+    if members.is_empty() {
+        return "members: []\n".into();
+    }
+    for m in members {
+        out.push_str(&format!("  - handle: {}\n", quote(&m.handle)));
+        out.push_str(&format!("    slack-id: {}\n", quote(&m.slack_id)));
+        if let Some(e) = &m.email {
+            out.push_str(&format!("    email: {}\n", quote(e)));
+        }
+        if let Some(g) = &m.github {
+            out.push_str(&format!("    github: {}\n", quote(g)));
+        }
+        if let Some(o) = &m.entra_oid {
+            out.push_str(&format!("    entra-oid: {}\n", quote(o)));
+        }
+        let roles: Vec<&str> = m.roles.iter().map(|r| r.as_str()).collect();
+        out.push_str(&format!("    roles: [{}]\n", roles.join(", ")));
+    }
+    out
+}
+
+/// `members` as a bootstrap seed, with [`FIXTURE_ADMIN`] added when none of them is an admin.
+pub fn seed_request(mut members: Vec<SeedMember>) -> pmos_toolserver::users::ImportRequest {
+    use pmos_contract::model::Role;
     if !members.iter().any(|m| m.roles.contains(&Role::Admin)) {
-        members.push(TeamMember {
+        members.push(SeedMember {
             handle: FIXTURE_ADMIN.0.into(),
             slack_id: FIXTURE_ADMIN.1.into(),
             email: None,
@@ -217,19 +252,19 @@ pub fn seed_request(
             roles: vec![Role::Pm, Role::Admin],
         });
     }
-    pmos_toolserver::users::ImportRequest {
-        file: pmos_contract::model::TeamFile { members },
-        sha256: "0".repeat(64),
-        commit: None,
-        mode: pmos_toolserver::users::ImportMode::Bootstrap,
-    }
+    pmos_toolserver::users::ImportRequest::parse(
+        seed_yaml(&members).as_bytes(),
+        None,
+        pmos_toolserver::users::ImportMode::Bootstrap,
+    )
+    .expect("the fixture seed parses")
 }
 
 /// An in-memory user store seeded with `members` (and [`FIXTURE_ADMIN`] if none is an admin),
 /// whose deactivations reach `stores`. The `evals` account may have its fake Slack id, as in
 /// the eval stack's seed.
 pub async fn memory_users(
-    members: Vec<pmos_contract::model::TeamMember>,
+    members: Vec<SeedMember>,
     stores: &Stores,
 ) -> Arc<dyn pmos_toolserver::users::UserStore> {
     let rules = pmos_toolserver::users::Rules {
@@ -250,7 +285,7 @@ pub async fn memory_users(
 
 /// Seed `members` (and [`FIXTURE_ADMIN`] if none is an admin) into `stores`' own user store,
 /// as `import --bootstrap` does.
-pub async fn seed_users(stores: &Stores, members: Vec<pmos_contract::model::TeamMember>) {
+pub async fn seed_users(stores: &Stores, members: Vec<SeedMember>) {
     stores
         .users
         .apply(
@@ -267,13 +302,9 @@ pub fn seeded_at() -> DateTime<Utc> {
     now()
 }
 
-/// A `team.yaml` member: `handle`, Slack id, roles.
-pub fn member(
-    handle: &str,
-    slack_id: &str,
-    roles: Vec<pmos_contract::model::Role>,
-) -> pmos_contract::model::TeamMember {
-    pmos_contract::model::TeamMember {
+/// A seed member: `handle`, Slack id, roles.
+pub fn member(handle: &str, slack_id: &str, roles: Vec<pmos_contract::model::Role>) -> SeedMember {
+    SeedMember {
         handle: handle.to_string(),
         slack_id: slack_id.to_string(),
         email: None,
@@ -304,7 +335,7 @@ pub async fn team_fixture(members: &[&str]) -> Fixture {
     build_with(dir, root, stores, audit, true)
 }
 
-/// For the Slack reply assistant: `team.yaml` enforced with the Slack fixtures' team
+/// For the Slack reply assistant: the user database seeded with the Slack fixtures' team
 /// ([`pmos_toolserver::connectors::fake::SLACK_TEAM`]: evals, ben and cy), and a `reply-test`
 /// skill whose data class is `restricted`, with the context, Jira, docs, Slack and memory tools. In
 /// memory, or with `postgres` every store in Postgres (`None` when no test database is set).
@@ -341,7 +372,7 @@ pub async fn reply_fixture(postgres: bool) -> Option<(Fixture, Option<TestPg>)> 
     }
 }
 
-/// `team.yaml` enforced with `members` and their roles; every store in memory, or with
+/// The user database seeded with `members` and their roles; every store in memory, or with
 /// `postgres` in Postgres (`None` when no test database is set). The audit log is read back
 /// from the backend under test.
 pub async fn roles_fixture(

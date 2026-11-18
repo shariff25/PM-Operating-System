@@ -6,9 +6,8 @@
 //! from the Slack bot client, the sign-in name unconfirmed when it came through that client),
 //! so the person can use PM OS at once; **then** it commits the member's personal `BOT.md`
 //! and its two generated sandbox policy files to the content repo in one commit, made with the
-//! approving platform owner's own GitHub token, so the commit records who approved. Until
-//! slice U7 retires `team.yaml`, that commit also adds them to `team.yaml`, which the runtime,
-//! Slack, `pmos-web` and the console still read, and which the lint checks bot owners against.
+//! approving platform owner's own GitHub token, so the commit records who approved. Nothing
+//! else is committed: since slice U7 there is no `team.yaml`, and no service reads one.
 //! If the commit fails, the user stays active and the request is `approved` with the error;
 //! the bot is missing until an admin retries. The content checkout is then pulled and reloaded
 //! (`content_sync.rs`).
@@ -33,10 +32,9 @@ use std::time::Duration as StdDuration;
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
-use pmos_contract::model::{valid_email, valid_slack_id, Role, TeamFile, TeamMember};
+use pmos_contract::model::{valid_email, valid_slack_id};
 use pmos_contract::onboarding::{
-    bot_path, personal_bot_name, propose_handle, render_personal_bot, render_team_yaml,
-    valid_new_handle,
+    bot_path, personal_bot_name, propose_handle, render_personal_bot, valid_new_handle,
 };
 use serde_json::{json, Value};
 
@@ -660,8 +658,6 @@ impl Onboarding {
             .await;
             return Err(r);
         }
-        let roles = vec![Role::Pm];
-
         // 2. The user, in the database: they can use PM OS at once. A refusal (an address
         // that belongs to someone else, a forged admin) changes nothing.
         let created = self
@@ -700,68 +696,37 @@ impl Onboarding {
             }
             return Err(r);
         }
-        let member = TeamMember {
-            handle: handle.clone(),
-            slack_id: request.slack_id.clone(),
-            email: Some(request.email.clone()),
-            github: None,
-            entra_oid: None,
-            roles,
-        };
-
-        // 3. The approver's GitHub, then one commit with the bot, its policies and (until
-        // slice U7) team.yaml.
+        // 3. The approver's GitHub, then one commit with the bot and its policies.
         let bot = personal_bot_name(&handle);
         let bot_md = render_personal_bot(&handle);
         let paths = self.member_paths(&bot);
         let message =
             format!("Add {handle} to PM OS\n\nApproved-by: {admin} (Slack, request {id})\n");
         let committed = self
-            .commit_team(
-                admin,
-                &paths,
-                &message,
-                |team, existing| {
-                    if team.by_handle(&handle).is_some() || existing.contains(&paths[0]) {
-                        return Err(bad_handle(format!("`{handle}` is already taken")).into());
-                    }
-                    if team.by_slack_id(&member.slack_id).is_some() {
-                        return Err(Refusal::new(
-                            StatusCode::CONFLICT,
-                            "already_member",
-                            "that Slack user is already in team.yaml",
-                        )
-                        .into());
-                    }
-                    team.members.push(member.clone());
-                    Ok(vec![Change::write(&paths[0], &bot_md)])
-                },
-                |yaml| {
-                    let content_root = self
-                        .github
-                        .as_ref()
-                        .map(|gh| gh.content_root.clone())
-                        .unwrap_or_default();
-                    let [policy, spec] = personal_policies(
-                        &content_root,
-                        yaml,
-                        &bot,
-                        &bot_md,
-                        Utc::now().date_naive(),
-                    )
-                    .map_err(Stop::Fail)?;
-                    Ok(vec![
-                        Change::write(&paths[1], policy),
-                        Change::write(&paths[2], spec),
-                    ])
-                },
-            )
+            .commit_content(admin, &paths, &message, |existing| {
+                if existing.contains(&paths[0]) {
+                    return Err(bad_handle(format!("`{handle}` is already taken")).into());
+                }
+                let content_root = self
+                    .github
+                    .as_ref()
+                    .map(|gh| gh.content_root.clone())
+                    .unwrap_or_default();
+                let [policy, spec] =
+                    personal_policies(&content_root, &bot, &bot_md, Utc::now().date_naive())
+                        .map_err(Stop::Fail)?;
+                Ok(vec![
+                    Change::write(&paths[0], &bot_md),
+                    Change::write(&paths[1], policy),
+                    Change::write(&paths[2], spec),
+                ])
+            })
             .await;
 
         // 4. Record the outcome. The user exists either way: a bot that didn't commit is
         // missing until an admin retries, and the request says why.
         let (commit, error) = match committed {
-            Ok((commit, _)) => (Some(commit), None),
+            Ok(commit) => (Some(commit), None),
             Err(Stop::Refuse(r)) => {
                 tracing::warn!(id, handle = %handle, code = r.code, "the personal bot wasn't committed");
                 (
@@ -937,20 +902,17 @@ impl Onboarding {
         [gh.content_path(&bot_path(bot)), policy, spec]
     }
 
-    /// Change `team.yaml` at the head of the content branch with `edit`, which may also
-    /// return other changes (`existing` says which of `probe` are there), then add what
-    /// `with_yaml` makes from the new `team.yaml`, and commit it all in one commit with
-    /// `admin`'s GitHub token. The new `team.yaml` must parse and pass the team lint rules.
+    /// Make the changes `changes` returns at the head of the content branch (`existing` says
+    /// which of `probe` are there) and commit them in one commit with `admin`'s GitHub token.
     /// If the branch moves meanwhile, the change is made again on the new head, up to
-    /// [`COMMIT_RETRIES`] times. Returns the commit and the team it committed.
-    async fn commit_team(
+    /// [`COMMIT_RETRIES`] times. Returns the commit.
+    async fn commit_content(
         &self,
         admin: &str,
         probe: &[String],
         message: &str,
-        edit: impl Fn(&mut TeamFile, &BTreeSet<String>) -> Result<Vec<Change>, Stop>,
-        with_yaml: impl Fn(&str) -> Result<Vec<Change>, Stop>,
-    ) -> Result<(String, TeamFile), Stop> {
+        changes: impl Fn(&BTreeSet<String>) -> Result<Vec<Change>, Stop>,
+    ) -> Result<String, Stop> {
         let (gh, repo) = match &self.github {
             Some(gh) => match &gh.content_repo {
                 Some(repo) => (gh, repo.as_str()),
@@ -976,21 +938,8 @@ impl Onboarding {
             Err(e) => return Err(fail(e)),
         }
         let branch = gh.content_branch.as_str();
-        let team_path = gh.content_path("team.yaml");
         for attempt in 0..=COMMIT_RETRIES {
             let head = gh.github.head(&token, repo, branch).await.map_err(fail)?;
-            let current = gh
-                .github
-                .file(&token, repo, &team_path, &head.commit)
-                .await
-                .map_err(fail)?
-                .map(|f| f.text)
-                .unwrap_or_default();
-            let mut team = TeamFile::from_yaml(&current).map_err(|e| {
-                Stop::Fail(format!(
-                    "{team_path} at the head of {branch} doesn't parse: {e}"
-                ))
-            })?;
             let mut existing = BTreeSet::new();
             for path in probe {
                 let found = gh
@@ -1002,18 +951,14 @@ impl Onboarding {
                     existing.insert(path.clone());
                 }
             }
-            let mut changes = edit(&mut team, &existing)?;
-            let yaml = render_team_yaml(&current, &team.members);
-            lint_team(&yaml, chrono::Utc::now().date_naive()).map_err(Stop::Fail)?;
-            changes.extend(with_yaml(&yaml)?);
-            changes.insert(0, Change::write(&team_path, yaml));
+            let changes = changes(&existing)?;
             let commit = gh
                 .github
                 .create_commit(&token, repo, &head, message, &changes)
                 .await
                 .map_err(fail)?;
             match gh.github.update_ref(&token, repo, branch, &commit).await {
-                Ok(()) => return Ok((commit, team)),
+                Ok(()) => return Ok(commit),
                 Err(GitHubError::Conflict) => {
                     tracing::info!(
                         repo,
@@ -1142,11 +1087,10 @@ fn not_configured() -> Refusal {
 }
 
 /// A new member's sandbox policy and spec, generated by `pmos_policy` from a scratch copy of
-/// the content at `content_root` with `team_yaml` and the bot's `BOT.md` in place. The copy
-/// must pass `pmos lint` as a whole, as the content will after the commit.
+/// the content at `content_root` with the bot's `BOT.md` in place. The copy must pass
+/// `pmos lint` as a whole, as the content will after the commit.
 pub fn personal_policies(
     content_root: &Path,
-    team_yaml: &str,
     bot: &str,
     bot_md: &str,
     today: chrono::NaiveDate,
@@ -1170,7 +1114,6 @@ pub fn personal_policies(
             std::fs::copy(entry.path(), &dest).map_err(io)?;
         }
     }
-    std::fs::write(root.join("team.yaml"), team_yaml).map_err(io)?;
     let bot_file = root.join(bot_path(bot));
     std::fs::create_dir_all(bot_file.parent().expect("a bot file has a folder")).map_err(io)?;
     std::fs::write(&bot_file, bot_md).map_err(io)?;
@@ -1195,50 +1138,4 @@ pub fn personal_policies(
         take(format!("bots/{bot}.yaml"))?,
         take(format!("bots/{bot}.sandbox.yaml"))?,
     ])
-}
-
-/// Does `yaml` parse as `team.yaml` and pass the team lint rules (`team-*`)? It is linted
-/// alone in a scratch content root, so only the team rules can fire.
-pub fn lint_team(yaml: &str, today: chrono::NaiveDate) -> Result<(), String> {
-    TeamFile::from_yaml(yaml).map_err(|e| format!("the new team.yaml doesn't parse: {e}"))?;
-    let dir = tempfile::tempdir().map_err(|e| format!("a scratch directory: {e}"))?;
-    std::fs::write(dir.path().join("team.yaml"), yaml)
-        .map_err(|e| format!("a scratch team.yaml: {e}"))?;
-    let report = pmos_contract::lint(dir.path(), &pmos_contract::LintOptions::new(today));
-    let problems: Vec<String> = report
-        .errors()
-        .filter(|d| d.code.starts_with("team-"))
-        .map(|d| format!("{}: {}", d.code, d.message))
-        .collect();
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "the new team.yaml fails the team lint: {}",
-            problems.join("; ")
-        ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_team_lint_catches_what_the_contract_catches() {
-        let today = "2026-11-14".parse().unwrap();
-        let ok = "members:\n  - handle: \"ana\"\n    slack-id: \"U012AB3CD\"\n    roles: [pm]\n";
-        assert_eq!(lint_team(ok, today), Ok(()));
-        let dup = format!("{ok}  - handle: \"ana\"\n    slack-id: \"U0X\"\n    roles: [pm]\n");
-        assert!(lint_team(&dup, today)
-            .unwrap_err()
-            .contains("team-duplicate"));
-        let bad_slack = "members:\n  - handle: \"ana\"\n    slack-id: \"nope\"\n    roles: [pm]\n";
-        assert!(lint_team(bad_slack, today)
-            .unwrap_err()
-            .contains("team-slack-id"));
-        assert!(lint_team("members: [", today)
-            .unwrap_err()
-            .contains("parse"));
-    }
 }

@@ -93,19 +93,26 @@ fn url_pairs(q: &str) -> Vec<(String, String)> {
 }
 
 impl FakeDirectory {
-    /// Every member of a `team.yaml`-shaped file as an active user: the file's roles, its
-    /// `email` as a confirmed sign-in name, no Entra link.
+    /// Every member of a `members:` list (the seed's shape) as an active user: the list's
+    /// roles, its `email` as a confirmed sign-in name, no Entra link. Read here as plain YAML:
+    /// only the tool server's import parses that shape (slice U7).
     pub fn seed_team(&self, yaml: &str) {
-        let team = pmos_contract::model::TeamFile::from_yaml(yaml).unwrap();
+        let seed: serde_norway::Value = serde_norway::from_str(yaml).unwrap();
         let mut users = self.users.lock().unwrap();
         users.clear();
-        for m in team.members {
+        for m in seed["members"].as_sequence().unwrap() {
+            let text = |k: &str| m.get(k).and_then(|v| v.as_str()).map(String::from);
             users.push(FakeUser {
-                handle: m.handle.clone(),
+                handle: text("handle").unwrap(),
                 display_name: String::new(),
                 status: "active".into(),
-                roles: m.roles.iter().map(|r| r.as_str().to_string()).collect(),
-                sign_in_name: m.email.map(|e| e.to_lowercase()),
+                roles: m["roles"]
+                    .as_sequence()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.as_str().unwrap().to_string())
+                    .collect(),
+                sign_in_name: text("email").map(|e| e.to_lowercase()),
                 confirmed: true,
                 entra: None,
             });

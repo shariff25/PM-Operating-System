@@ -1,15 +1,15 @@
-//! Onboarding helpers shared by the tool server and the Slack bot (`docs/onboarding-spec.md`):
-//! proposing a handle for a new member, writing `team.yaml` back out, and the personal bot
-//! every member gets.
+//! Onboarding helpers shared by the tool server, the Slack bot and the CLI
+//! (`docs/onboarding-spec.md`): proposing a handle for a new member, and the personal bot every
+//! member gets.
 //!
-//! `team.yaml` stays the source of truth. When a platform owner approves a new member in
-//! Slack, the tool server commits a new `team.yaml` (and the member's `BOT.md`) to the content
-//! repo, produced by [`render_team_yaml`] and [`render_personal_bot`].
+//! Users and roles live in the PM OS user database (`docs/user-database-spec.md`). When a
+//! platform owner approves a new member, the tool server creates the user there and then
+//! commits the member's `BOT.md`, made by [`render_personal_bot`], to the content repo.
 
 use std::collections::BTreeSet;
 
 use crate::bots::valid_name;
-use crate::model::{valid_handle, TeamMember};
+use crate::model::valid_handle;
 
 /// The longest handle onboarding proposes, so `pm-<handle>` stays a valid bot name.
 pub const MAX_PROPOSED_HANDLE: usize = 24;
@@ -96,53 +96,6 @@ pub fn valid_new_handle(handle: &str) -> bool {
         && valid_name(&personal_bot_name(handle))
 }
 
-/// `team.yaml` with `members` in place of the old list. The comment block at the top of
-/// `original` (every line before `members:`) is kept as written; the member list is
-/// rewritten in one fixed layout, so the result parses back to exactly `members`.
-pub fn render_team_yaml(original: &str, members: &[TeamMember]) -> String {
-    let mut out = String::new();
-    for line in original.lines() {
-        if line.trim_start().starts_with("members:") {
-            break;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if members.is_empty() {
-        out.push_str("members: []\n");
-        return out;
-    }
-    out.push_str("members:\n");
-    for m in members {
-        out.push_str(&format!("  - handle: {}\n", quote(&m.handle)));
-        out.push_str(&format!("    slack-id: {}\n", quote(&m.slack_id)));
-        if let Some(email) = &m.email {
-            out.push_str(&format!("    email: {}\n", quote(email)));
-        }
-        if let Some(github) = &m.github {
-            out.push_str(&format!("    github: {}\n", quote(github)));
-        }
-        let roles: Vec<&str> = m.roles.iter().map(|r| r.as_str()).collect();
-        out.push_str(&format!("    roles: [{}]\n", roles.join(", ")));
-    }
-    out
-}
-
-/// A double-quoted YAML scalar.
-fn quote(value: &str) -> String {
-    let mut out = String::from("\"");
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 /// The path of a bot's `BOT.md` under the content root.
 pub fn bot_path(bot: &str) -> String {
     format!("bots/{bot}/BOT.md")
@@ -172,18 +125,6 @@ pub fn render_personal_bot(handle: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Role, TeamFile};
-
-    fn member(handle: &str, slack: &str) -> TeamMember {
-        TeamMember {
-            handle: handle.into(),
-            slack_id: slack.into(),
-            email: Some(format!("{handle}+x@example.com")),
-            github: Some("Ana-F".into()),
-            entra_oid: None,
-            roles: vec![Role::Pm, Role::SkillAuthor],
-        }
-    }
 
     #[test]
     fn github_logins() {
@@ -227,48 +168,6 @@ mod tests {
             !valid_new_handle("ana.k"),
             "a dot doesn't make a clean bot name"
         );
-    }
-
-    #[test]
-    fn team_yaml_round_trips_and_keeps_the_header() {
-        let original = "# Who may use PM OS.\n#   - handle: example\nmembers: []\n";
-        let members = vec![
-            member("ana", "U012AB3CD"),
-            TeamMember {
-                handle: "raj".into(),
-                slack_id: "W99".into(),
-                email: Some("we\"ird\\@x.com".into()),
-                github: None,
-                entra_oid: None,
-                roles: vec![Role::Admin],
-            },
-        ];
-        let text = render_team_yaml(original, &members);
-        assert!(text.starts_with("# Who may use PM OS.\n#   - handle: example\nmembers:\n"));
-        assert_eq!(TeamFile::from_yaml(&text).unwrap().members, members);
-        // Rendering again changes nothing.
-        assert_eq!(render_team_yaml(&text, &members), text);
-        // Removing everyone leaves an empty list.
-        let empty = render_team_yaml(&text, &[]);
-        assert!(empty.ends_with("members: []\n"));
-        assert!(TeamFile::from_yaml(&empty).unwrap().members.is_empty());
-    }
-
-    #[test]
-    fn a_rewrite_keeps_new_and_unknown_roles() {
-        // Onboarding rewrites team.yaml; a role this build doesn't know must survive it.
-        let mut ana = member("ana", "U012AB3CD");
-        ana.roles = vec![
-            Role::Reviewer,
-            Role::Auditor,
-            Role::Unknown("steward".into()),
-        ];
-        let text = render_team_yaml("members: []\n", std::slice::from_ref(&ana));
-        assert!(
-            text.contains("roles: [reviewer, auditor, steward]"),
-            "{text}"
-        );
-        assert_eq!(TeamFile::from_yaml(&text).unwrap().members, vec![ana]);
     }
 
     #[test]

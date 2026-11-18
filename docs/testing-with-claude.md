@@ -24,7 +24,7 @@ The same stack can use another provider's model instead of Claude: see
 | `every weekday at 9am, summarize the launch issues` | A routine is parsed and confirmed |
 | `setup` | The onboarding checklist. Its Connect links can't complete here, because the OAuth callback needs a public URL. |
 | `/docs rotate a key` | The `/docs` shortcut |
-| `requests`, `remove <handle>` | Platform-owner commands. You are an admin in the test `team.yaml`. |
+| `requests`, `remove <handle>` | Platform-owner commands. You are an admin in the test stack's user database (its seed). |
 
 **Not in this test:** real Jira, Confluence or Slack reads, account linking, GitHub memory and
 the approval commit. Those need the Spark setup (`docs/toolserver.md`).
@@ -71,8 +71,9 @@ scripts/claude-test-stack.sh
 
 **What the script does:**
 - builds everything;
-- copies `content/` to `state/claude-test/content` and adds you there as `pm` and `admin`, with
-  your bot `pm-<handle>` (`pmos member add`);
+- copies `content/` to `state/claude-test/content` and adds
+  your bot `pm-<handle>` there (`pmos bot add-personal`), and you as `pm, admin` in the user
+  database's seed (`$STATE/users.seed.yaml`, beside the content, never in it);
 - starts the services with fresh tokens between them;
 - deletes the Slack service's `notifications.cursor` from the last run, since the in-memory
   runtime restarts its notification ids at 1 and a stale cursor would make the bot skip replies;

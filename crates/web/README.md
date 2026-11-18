@@ -8,7 +8,7 @@ PM. The browser never sees a service token, a connector token or another PM's da
 browser ──HTTPS──► pmos-web :8770 ──► pmos-bots :8750        (client "web", X-Pmos-User + X-Pmos-Assertion)
                                └──► pmos-toolserver :8710  (approvals and admin reads: web token + X-Pmos-Assertion;
                                │                            users: GET /internal/users/resolve, cached 10 s)
-                               └──► content/team.yaml      (the admin Team page's list only, until U5)
+                               └──► content/               (the admin content and policy screens)
 pmos-slack ───────► pmos-web :8770, or :8771 with PMOS_WEB_INTERNAL_BIND  (PUT /internal/brief/{handle})
 ```
 
@@ -42,7 +42,7 @@ For Entra ID sign-in instead of `PMOS_WEB_DEV_LOGIN=1`, set `PMOS_WEB_ENTRA_TENA
 | `PMOS_TOOLSERVER_URL` | `http://127.0.0.1:8710` | |
 | `PMOS_WEB_TOOLSERVER_TOKEN` | required | The tool server's `PMOS_WEB_TOKEN`, which reaches only the approvals routes and the read-only admin routes (older deployments used `PMOS_SERVICE_TOKEN`). At least 32 characters, different from the runtime token |
 | `PMOS_ASSERTION_KEYS` | none | The keys pmos-web signs user assertions with: `web:bots:<kid>:<base64>` and `web:toolserver:<kid>:<base64>`, each optionally followed by `:<kid>:<base64>` for the previous key (`docs/user-assertion.md`, Keys). Without a key for an upstream, its calls carry no assertion. A malformed entry, a key under 32 bytes, or another service's pair refuses to start |
-| `PMOS_CONTENT_ROOT` | `content` | The deployed content tree the admin screens read. Its `team.yaml` feeds only the admin Team page's member list (until slice U5); who may sign in, and their roles, come from the user database at the tool server |
+| `PMOS_CONTENT_ROOT` | `content` | The deployed content tree the admin content and policy screens read. Who may sign in, their roles and the Team page's list come from the user database at the tool server; there is no team file (slice U7) |
 | `PMOS_WEB_STATIC_DIR` | none | The built web app. Must contain `index.html`, served for any unknown non-`/api` path that isn't an asset; the icon is `favicon.svg` (or `favicon.ico`) here |
 | `PMOS_WEB_PUBLIC_URL` | none | The origin browsers use. Writes must come from it; without it, `Origin` must match `Host`. Required with Entra ID (`https` unless loopback): the redirect URI is `<PMOS_WEB_PUBLIC_URL>/api/auth/callback`. When it is `https`, every response carries `Strict-Transport-Security: max-age=31536000` |
 | `PMOS_WEB_SESSION_IDLE_MINUTES` | `480` | Idle expiry |
@@ -88,8 +88,8 @@ The `__Host-pmos` cookie is `Secure`, so browsers only keep it over HTTPS (or on
    entra_needs_host`. **The tool server unreachable:** `GET /api/me` and `GET /api/brief`
    (pmos-web's own store) may use the person's last-known-good answer for at most 5 minutes
    (`app::LAST_KNOWN_GOOD`), the brief with every Slack item withheld; every other route and
-   every write is `503 users_unavailable` (`app::SignedRead` vs `app::Signed`). `team.yaml`
-   decides nothing.
+   every write is `503 users_unavailable` (`app::SignedRead` vs `app::Signed`). There is no
+   team file (`team.yaml` was retired in slice U7).
 3. **Writes** (`POST`, `PUT`, `DELETE`): `Sec-Fetch-Site` must not be another site, `Origin`
    (or else `Referer`) must be the app, **and one of them must be there** (`403 bad_origin`;
    browsers always send `Origin` on these), and `X-Pmos-Csrf` must equal the session's own
@@ -276,9 +276,9 @@ path with another method a JSON `405 method_not_allowed`.
   sources and titles, never the titles, Slack text, drafts, prompts, results or hashes). The
   export reads the tool server in pages of 1,000 (`purpose=export`, needing `export-audit`
   there too), up to 10,000 rows, with `X-Pmos-Truncated` saying when more were left out, and
-  every cell quoted and formula-guarded. The team list still comes from this server's
-  `team.yaml` (until slice U5; it decides nothing) and shows, with `accounts: null`, when the
-  tool server's accounts read fails. Every admin read is
+  every cell quoted and formula-guarded. The team list comes from the user database (the tool
+  server's `GET /internal/admin/users`, since slice U5a) and the page fails `502` when the tool
+  server can't answer. Every admin read is
   logged here (handle, route, filter names only). `GET /api/me` also gives `permissions`
   (from `pmos_contract::permissions::granted`), so the app knows whether to show the Admin
   area; an older client ignores it.

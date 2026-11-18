@@ -1,8 +1,8 @@
 # The CI smoke stack's users (.github/workflows/ci.yml): imported with
 # `deploy/pmos-admin users import --from deploy/test/ci-users.yaml --bootstrap --apply` into the
-# stack's empty user database, alongside `pmos member add` for the same person in team.yaml, so
-# the tool server (which decides from the database since slice U3) and the services that still
-# read team.yaml agree until slice U7. Fake data only.
+# stack's empty user database, the only source of users and roles (there is no team file since
+# slice U7). It has the old team file's shape because the import reads that shape; it lives
+# outside the content tree. Fake data only.
 members:
   - handle: ci
     slack-id: U0CI00001

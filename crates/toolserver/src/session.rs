@@ -164,7 +164,7 @@ fn new_token() -> String {
 }
 
 /// A user handle: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit.
-/// The same rule as the harness and `team.yaml`, so a handle can never escape `master/people/`.
+/// The same rule as the harness and the user database, so a handle can never escape `master/people/`.
 ///
 /// A handle under `bots.` is never a PM's: it is a team bot's service identity, accepted only
 /// where a team bot's own accounts are linked and used ([`is_bot_identity`]).

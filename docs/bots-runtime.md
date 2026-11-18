@@ -46,10 +46,10 @@ docs server.
 
 ## Content changes
 
-Every 30 seconds the runtime checks a fingerprint of `team.yaml` (only because the lint's
-bot-owner check still reads it, until slice U7; it decides nothing here), `tools.yaml`,
-`bots/**`, `roles/**` and `skills/**` under `PMOS_CONTENT_ROOT` (paths, sizes and
-modification times). When it changes:
+Every 30 seconds the runtime checks a fingerprint of `tools.yaml`, `bots/**`, `roles/**` and
+`skills/**` under `PMOS_CONTENT_ROOT` (paths, sizes and modification times). A `team.yaml`
+is neither watched nor read (slice U7); if one is left in the content, the lint reports it to
+the runtime as a warning only (`team-file-retired`), so it never stops a load. When it changes:
 - **The tree passes the lint:** it is loaded again, and the new catalog replaces the old one
   in one step. A new bot shows up in `GET /v1/bots` and can take tasks.
 - **The tree fails the lint:** the catalog already loaded stays, and the errors are logged
@@ -65,8 +65,8 @@ listed within about half a minute of the pull.
 
 ## A new member's worker (operations, for now)
 
-When a platform owner approves someone in Slack, the tool server commits their `team.yaml`
-entry and `bots/pm-<handle>/BOT.md`, and `pm-<handle>` appears in `GET /v1/bots` without a
+When a platform owner approves someone in Slack, the tool server adds them to the user
+database and commits their `bots/pm-<handle>/BOT.md` and its policy, and `pm-<handle>` appears in `GET /v1/bots` without a
 restart. Nothing claims its tasks yet: worker tokens are per bot and live in config, and a
 bot's sandbox is started by hand. Until that is automated, a platform owner does this on the
 Spark for each new member (the bot is `pm-<handle>`, as `personal_bot_name` makes it):
@@ -136,7 +136,7 @@ it may do. Anything else is `403`.
 ## Who may ask
 
 Who exists, their status and their roles come from the PM OS user database
-(`docs/user-database-spec.md` §2, slice U4a), never from `team.yaml`. The runtime polls the
+(`docs/user-database-spec.md` §2, slice U4a); there is no team file (slice U7). The runtime polls the
 tool server's `GET /internal/directory` every 10 seconds with its orchestrator token and
 `If-None-Match` (a `304` confirms the snapshot it holds), through the shared
 `pmos-directory` crate. A failed poll keeps the last snapshot **and its age**, so an outage

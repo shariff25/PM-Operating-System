@@ -1,5 +1,12 @@
 //! `team.yaml` into the user database (spec §3), the way back for a rollback, and the dev seed.
 //!
+//! **This module is the only code in PM OS that parses that file** (slice U7: no service reads
+//! one, `docs/user-database-spec.md` §12, "The proof"). Its model, `TeamFile` and
+//! `TeamMember`, is private to the crate; other crates hand the import bytes
+//! ([`ImportRequest::parse`]) or a path ([`seed_request`]). The file it reads is one the
+//! operator names on the host, or a development stack's seed (never inside the content tree:
+//! `config.rs` refuses that); no service reads one to decide anything.
+//!
 //! The import is keyed by handle and idempotent: a user that exists with the same fields is
 //! unchanged; a field that differs is a conflict, reported and never overwritten (the
 //! database wins); re-running never removes anyone or revokes a role. It stops before any
@@ -16,7 +23,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use pmos_contract::model::{valid_slack_id, Role, TeamFile, TeamMember};
+use pmos_contract::model::{valid_slack_id, Role};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::detail;
@@ -41,10 +49,96 @@ impl ImportMode {
     }
 }
 
+/// One person in an imported `team.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) struct TeamMember {
+    pub(crate) handle: String,
+    pub(crate) slack_id: String,
+    /// One address, imported as both the sign-in name and the Atlassian email.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) github: Option<String>,
+    /// Read so an old file still parses; never imported (the host sets Entra links).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) entra_oid: Option<String>,
+    /// Tolerant of well-formed names this build doesn't know ([`Role::parse_tolerant`]), so
+    /// the import can name them and stop; a malformed name doesn't parse.
+    #[serde(deserialize_with = "tolerant_roles")]
+    pub(crate) roles: Vec<Role>,
+}
+
+/// An imported `team.yaml` (or a seed in its shape).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TeamFile {
+    #[serde(default)]
+    pub(crate) members: Vec<TeamMember>,
+}
+
+impl TeamFile {
+    fn from_yaml(text: &str) -> Result<Self, serde_norway::Error> {
+        serde_norway::from_str(text)
+    }
+}
+
+fn tolerant_roles<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Role>, D::Error> {
+    Vec::<String>::deserialize(d)?
+        .into_iter()
+        .map(|name| {
+            Role::parse_tolerant(&name).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "`{name}` is not a role name (lowercase letters, digits and hyphens)"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// A `team.yaml` with `members`, after `header` (comment lines). One fixed layout, so the
+/// result parses back to exactly `members`.
+fn render_team_yaml(header: &str, members: &[TeamMember]) -> String {
+    let mut out = header.to_string();
+    if members.is_empty() {
+        out.push_str("members: []\n");
+        return out;
+    }
+    out.push_str("members:\n");
+    for m in members {
+        out.push_str(&format!("  - handle: {}\n", quote(&m.handle)));
+        out.push_str(&format!("    slack-id: {}\n", quote(&m.slack_id)));
+        if let Some(email) = &m.email {
+            out.push_str(&format!("    email: {}\n", quote(email)));
+        }
+        if let Some(github) = &m.github {
+            out.push_str(&format!("    github: {}\n", quote(github)));
+        }
+        let roles: Vec<&str> = m.roles.iter().map(|r| r.as_str()).collect();
+        out.push_str(&format!("    roles: [{}]\n", roles.join(", ")));
+    }
+    out
+}
+
+/// A double-quoted YAML scalar.
+fn quote(value: &str) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// One import of a `team.yaml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportRequest {
-    pub file: TeamFile,
+    pub(crate) file: TeamFile,
     /// SHA-256 of the file's bytes, lower-case hex.
     pub sha256: String,
     /// The commit the operator read it at (`--commit`), 7 to 40 hex digits.
@@ -90,6 +184,11 @@ impl ImportRequest {
             commit,
             mode,
         })
+    }
+
+    /// The handles the file lists, in its order.
+    pub fn handles(&self) -> Vec<String> {
+        self.file.members.iter().map(|m| m.handle.clone()).collect()
     }
 
     /// The people the file lists as admins (the host command lists them before asking).
@@ -434,10 +533,7 @@ pub fn export_team_yaml(dir: &Directory) -> (String, Vec<String>) {
     }
     let header =
         "# Exported from the PM OS user database (pmos-admin users export) for a rollback.\n";
-    (
-        pmos_contract::onboarding::render_team_yaml(header, &members),
-        warnings,
-    )
+    (render_team_yaml(header, &members), warnings)
 }
 
 /// The dev seed: `path` as a bootstrap import.
@@ -446,4 +542,74 @@ pub fn seed_request(path: &Path) -> Result<ImportRequest, String> {
         std::fs::read(path).map_err(|e| format!("PMOS_USERS_SEED {}: {e}", path.display()))?;
     ImportRequest::parse(&bytes, None, ImportMode::Bootstrap)
         .map_err(|e| format!("PMOS_USERS_SEED {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member_yaml(roles: &str) -> String {
+        format!("members:\n  - handle: ana\n    slack-id: U0ANA\n    roles: {roles}\n")
+    }
+
+    #[test]
+    fn reads_reviewer_and_auditor() {
+        let team = TeamFile::from_yaml(&member_yaml("[pm, reviewer]")).unwrap();
+        assert_eq!(team.members[0].roles, vec![Role::Pm, Role::Reviewer]);
+        let team = TeamFile::from_yaml(&member_yaml("[auditor]")).unwrap();
+        assert_eq!(team.members[0].roles, vec![Role::Auditor]);
+    }
+
+    #[test]
+    fn an_unknown_role_parses_so_the_import_can_name_it() {
+        let team = TeamFile::from_yaml(&member_yaml("[pm, policy-steward]")).unwrap();
+        assert_eq!(
+            team.members[0].roles,
+            vec![Role::Pm, Role::Unknown("policy-steward".into())]
+        );
+    }
+
+    #[test]
+    fn malformed_role_names_and_unknown_fields_are_refused() {
+        for bad in [
+            "[Admin]",
+            "[\"pm, admin\"]",
+            "[\"a b\"]",
+            "[\"-x\"]",
+            "[\"\"]",
+        ] {
+            assert!(TeamFile::from_yaml(&member_yaml(bad)).is_err(), "{bad}");
+        }
+        let extra =
+            "members:\n  - handle: ana\n    slack-id: U0ANA\n    roles: [pm]\n    rank: 1\n";
+        assert!(TeamFile::from_yaml(extra).is_err());
+    }
+
+    #[test]
+    fn the_export_round_trips_and_keeps_the_header() {
+        let members = vec![
+            TeamMember {
+                handle: "ana".into(),
+                slack_id: "U012AB3CD".into(),
+                email: Some("ana+x@example.com".into()),
+                github: Some("Ana-F".into()),
+                entra_oid: None,
+                roles: vec![Role::Pm, Role::Reviewer],
+            },
+            TeamMember {
+                handle: "raj".into(),
+                slack_id: "W99".into(),
+                email: Some("we\"ird\\@x.com".into()),
+                github: None,
+                entra_oid: None,
+                roles: vec![Role::Admin],
+            },
+        ];
+        let text = render_team_yaml("# Exported.\n", &members);
+        assert!(text.starts_with("# Exported.\nmembers:\n"));
+        assert_eq!(TeamFile::from_yaml(&text).unwrap().members, members);
+        let empty = render_team_yaml("", &[]);
+        assert_eq!(empty, "members: []\n");
+        assert!(TeamFile::from_yaml(&empty).unwrap().members.is_empty());
+    }
 }

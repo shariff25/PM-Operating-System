@@ -6,7 +6,7 @@
 //! body). This server trusts none of `pmos-web`'s work:
 //!
 //! 1. **Who:** the assertion's subject must be the `user=` it names, and an admin by this
-//!    server's own `team.yaml` (`edit-policies` or `edit-content`, by kind).
+//!    server's own user database (`edit-policies` or `edit-content`, by kind).
 //! 2. **Where:** the content and policies folders are separate, and neither is the
 //!    repository root (refused at start-up, and again here).
 //! 3. **What:** [`pmos_policy::admin::changeset::recheck`]: the path allow-list (content files

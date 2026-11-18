@@ -2,7 +2,8 @@
 //! check against.
 //!
 //! A person's permissions are the union of their roles' permissions. [`Role::Unknown`] (a role
-//! from a newer `team.yaml`) grants nothing, and an empty role list grants nothing.
+//! name this build doesn't know, from an imported file) grants nothing, and an empty role list
+//! grants nothing.
 //!
 //! The matrix says what kind of action a role may take. Rules that depend on who owns the
 //! thing are the caller's, because only the caller knows the owner:

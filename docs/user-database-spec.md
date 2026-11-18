@@ -1335,6 +1335,73 @@ text above:
 - **Not verified:** the web front end against these routes (U6b); a real Slack workspace's
   rendering of the card line.
 
+**U7 is built** on `claude/u7-retire-team-file` (`crates/stack-tests/tests/no_team_file.rs` and
+the two proof tests in `crates/stack-tests/tests/stack.rs`; the lint in
+`crates/contract/src/lint.rs`; no migration). No service reads a `team.yaml`, onboarding
+commits only the personal bot and its policies, `content/team.yaml` is deleted, `pmos member
+add` is gone, and CI smoke, the eval stack and the Claude test stack keep only
+`import --bootstrap` or `PMOS_USERS_SEED`, and `pmos bot add-personal`. The upgrade step is
+in `docs/runbooks/upgrade.md`. Where it differs from the text above:
+- **`team-file-retired` is an error for `pmos lint`, CI and `pmos policy generate`, and a
+  warning to a service loading its content** (`LintOptions::for_service`: the tool server's
+  catalog and reindex, the runtime's catalog and reloader, the Slack App Home). The file
+  decides nothing anywhere, so a leftover one (during an upgrade, before the content pull
+  request deletes it) must not stop a service from starting or reloading, and the proof
+  starts every service with one planted. It fires for a file of that name **anywhere** in the
+  content tree, not only at the root, and never reads it. The tool server's onboarding still
+  generates a new member's policy with the error form, so its commit fails, readably, while a
+  leftover file is in the checkout.
+- **Bot owners: structural in the lint, the directory at decision time.** `bot-owner-unknown`
+  (owners checked against the file) is replaced by `bot-owner-handle`: a bot's `owner` must
+  be a PM OS handle (or `TODO`). No new load-time check was added: whether the owner is an
+  active user is already decided from the directory where it matters, on every read rather
+  than once at load (a personal bot serves only its active owner; the overview's
+  `bots_without_active_owner`; Slack's and the web app's `409 owns_bots`; the triage digest
+  skips an owner who may not use PM OS). `people-unknown` (a `master/people/` folder for
+  someone not in the file) became `people-handle` (a folder name that isn't a handle). The
+  `team-*` rules are gone.
+- **Where the model went:** `TeamFile`, `TeamMember`, their tolerant role parsing and the
+  writer moved from `pmos-contract` into `crates/toolserver/src/users/import.rs`,
+  `pub(crate)`; `ImportRequest.file` is crate-private, and other crates (the tool server's
+  own integration tests included) hand the import YAML bytes (`ImportRequest::parse`) or a
+  path (`seed_request`). `Role::Unknown` and `Role::parse_tolerant` stay in `pmos-contract`
+  as the shared role vocabulary the import uses.
+- **The seed is refused inside the content tree** (new): `PMOS_USERS_SEED` under
+  `PMOS_CONTENT_ROOT` stops the tool server at start-up, so no file in content can become the
+  user list by a setting. The eval stack's seed is written beside its content copy and
+  mounted at `/run/pmos-users.seed.yaml`; the Claude test stack's is `$STATE/users.seed.yaml`;
+  `pmos-admin users import` mounts the operator's file as `/run/pmos-import/members.yaml`.
+- **Onboarding's commit** no longer checks the file for the Slack id (the database's create,
+  which runs first, already refuses a taken Slack id or address); a `BOT.md` already at the
+  branch head still leaves the commit undone with the reason on the request.
+- **The proof**, part 1 and 2 (`a_hostile_team_yaml_decides_nothing_in_any_service`,
+  `the_services_start_and_decide_with_no_team_yaml`): one in-process stack of the real tool
+  server, bot runtime, `pmos-web` and console routers, and the Slack service's directory view
+  (`pmos_slack::people::People` over the tool server's real `GET /internal/directory` with the
+  bot token), with a hostile file (`mallory` as admin with Ana's Slack id and address; Ana,
+  Ben and a stranger made admins) at the content root, the checkout root, and under `bots/`,
+  `bots/pm-ana/`, `master/` and `roles/`. Checked: sign-in (refused for `mallory` and the
+  stranger; Ana's `/api/me` roles are the database's), an admin read through `pmos-web`
+  (refused for Ana and Ben; the database's admin sees exactly the database's users), the tool
+  server's admin answer, a bot ask through the runtime's Slack client, Slack's identity and
+  admin checks by Slack id and handle, the App Home's skills catalog, a console item read by
+  handle and by address, and an approval decision as `mallory` (refused, nothing written)
+  while Ana's own goes through. The Slack check is the directory view the service decides
+  with, not a Socket Mode run; the per-service hostile-file tests from U4a, U4b and U4d stay.
+- **The source scan** (part 3) reads every `.rs` file under `crates/*/src` (unit-test modules
+  skipped, comments removed): `TeamFile`, `TeamMember` or `render_team_yaml` anywhere but the
+  import module fails, and so does `team.yaml` in code except seven reviewed lines, none of
+  which reads it (the lint's file name and message, the import's `role_changes` detail, a
+  fixed audit note of pre-U3 events, the policy admin's path kind and its refusal of the path).
+  It also fails on `team.yaml` or `member add` in the deploy kit, scripts, CI workflows or the
+  harness. It doesn't replace the per-crate scans (`crates/bots/tests/directory.rs`, now with
+  no exception; `crates/slack/tests/no_team_file.rs`; `crates/console/tests/console.rs`),
+  which also ban each service's own old lookups.
+- **Not verified:** CI's `deploy` job (the Docker stack, the `--bootstrap` import, the smoke
+  test) was not run, only read and its commands checked; `scripts/test-pmos-admin.sh` was run.
+  The eval stack and the Claude test stack were not started. No real install has a
+  `team.yaml` to import, so the upgrade step is untested beyond the import's own tests.
+
 U4a–U4d run in parallel (U4b after U3, since `remove` calls U3's deactivation). U5 and U6 can
 overlap once the routes in U5 are merged.
 

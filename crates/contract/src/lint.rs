@@ -23,6 +23,9 @@ pub const MAX_SKILL_DESCRIPTION_LEN: usize = 1024;
 /// The longest `metadata.track`: a catalog heading, such as "Strategy and decisions".
 pub const MAX_SKILL_TRACK_LEN: usize = 40;
 
+/// The retired team file's name. The lint only checks that it is absent; it never reads it.
+const RETIRED_TEAM_FILE: &str = "team.yaml";
+
 /// Metadata keys every PM OS skill must set.
 pub const REQUIRED_SKILL_METADATA: [&str; 5] = ["owner", "version", "model", "data-class", "tools"];
 
@@ -30,6 +33,13 @@ pub const REQUIRED_SKILL_METADATA: [&str; 5] = ["owner", "version", "model", "da
 pub struct LintOptions {
     pub today: NaiveDate,
     pub stale_after_days: i64,
+    /// How `team-file-retired` (a `team.yaml` in the content tree) is reported. An error for
+    /// `pmos lint`, CI and `pmos policy generate` ([`LintOptions::new`]); a warning for a
+    /// service loading its content ([`LintOptions::for_service`]). The file decides nothing
+    /// in any service (`docs/user-database-spec.md` §12, slice U7), so a leftover one, such
+    /// as during an upgrade before its pull request deletes it, must not stop a service from
+    /// starting or reloading: the service logs the warning and ignores the file.
+    pub retired_team_file: Severity,
 }
 
 impl LintOptions {
@@ -37,6 +47,16 @@ impl LintOptions {
         Self {
             today,
             stale_after_days: DEFAULT_STALE_AFTER_DAYS,
+            retired_team_file: Severity::Error,
+        }
+    }
+
+    /// For a service loading its content (the tool server, the bot runtime, the Slack App
+    /// Home): every rule as [`LintOptions::new`], except that `team-file-retired` is a warning.
+    pub fn for_service(today: NaiveDate) -> Self {
+        Self {
+            retired_team_file: Severity::Warning,
+            ..Self::new(today)
         }
     }
 }
@@ -110,7 +130,8 @@ pub fn lint(root: &Path, opts: &LintOptions) -> Report {
     cx.check_reviewers();
     cx.check_templates();
     cx.check_playbooks();
-    cx.check_team();
+    cx.check_team_file_retired(opts);
+    cx.check_people();
     cx.check_roles_and_bots(registry.as_ref());
 
     cx.report
@@ -724,7 +745,6 @@ impl Cx {
             }
         }
 
-        let team = crate::model::TeamFile::load(&self.root).unwrap_or_default();
         let bots_dir = self.root.join("bots");
         if let Some(entries) = sorted_entries(&bots_dir) {
             for dir in entries.into_iter().filter(|p| p.is_dir()) {
@@ -753,24 +773,22 @@ impl Cx {
                 self.check_owner(&path, &fm.owner);
                 check_actions(self, &path, &fm.actions);
                 let bot = fm.into_bot(body);
-                let owner_known = team.by_handle(&bot.owner).is_some();
-                if !owner_known && !bot.owner.to_ascii_uppercase().starts_with("TODO") {
-                    if team.members.is_empty() {
-                        self.warn(
-                            "bot-owner-unknown",
-                            &path,
-                            format!(
-                                "owner `{}` is not in team.yaml (team.yaml lists nobody yet)",
-                                bot.owner
-                            ),
-                        );
-                    } else {
-                        self.error(
-                            "bot-owner-unknown",
-                            &path,
-                            format!("owner `{}` is not in team.yaml", bot.owner),
-                        );
-                    }
+                // Who the owner is, and whether they may still use PM OS, is the user
+                // database's to say (the tool server's overview lists bots whose owner can't;
+                // a personal bot serves only its owner, while active). Here the owner must at
+                // least be a handle.
+                if !bot.owner.is_empty()
+                    && !bot.owner.to_ascii_uppercase().starts_with("TODO")
+                    && !crate::model::valid_handle(&bot.owner)
+                {
+                    self.error(
+                        "bot-owner-handle",
+                        &path,
+                        format!(
+                            "owner `{}` is not a PM OS handle (lowercase letters, digits, `.`, `_`, `-`)",
+                            bot.owner
+                        ),
+                    );
                 }
                 match roles.get(&bot.role) {
                     None => self.error(
@@ -804,146 +822,48 @@ impl Cx {
         self.report.roles = roles.into_values().collect();
     }
 
-    /// `team.yaml` is optional; without it nobody can use the Slack bot.
-    fn check_team(&mut self) {
-        let path = self.root.join("team.yaml");
-        if !path.is_file() {
-            return;
+    /// `team.yaml` is retired (slice U7): users and roles are in the PM OS user database, and
+    /// nothing reads the file. One left in the content tree would look like the truth to a
+    /// reader, and a pull request to it like a role grant, so `pmos lint` refuses one anywhere
+    /// in the content tree. The file is not read here, only found.
+    fn check_team_file_retired(&mut self, opts: &LintOptions) {
+        let found: Vec<PathBuf> = WalkDir::new(&self.root)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(|e| e.file_name() != ".git")
+            .filter_map(Result::ok)
+            .filter(|e| !e.file_type().is_dir() && e.file_name() == RETIRED_TEAM_FILE)
+            .map(|e| e.into_path())
+            .collect();
+        for path in found {
+            self.push(
+                opts.retired_team_file,
+                "team-file-retired",
+                &path,
+                "team.yaml is retired: users and roles are in the PM OS user database, and \
+                 nothing reads this file. Import it once on the host (`pmos-admin users import \
+                 --from <file>`, docs/runbooks/users.md), then delete it"
+                    .to_string(),
+            );
         }
-        let Some(text) = self.read(&path) else {
-            return;
-        };
-        let team = match crate::model::TeamFile::from_yaml(&text) {
-            Ok(t) => t,
-            Err(e) => {
-                self.error("team-parse", &path, format!("invalid team.yaml: {e}"));
-                return;
-            }
-        };
-        let mut handles = BTreeSet::new();
-        let mut slack_ids = BTreeSet::new();
-        let mut github_logins = BTreeSet::new();
-        let mut emails = BTreeSet::new();
-        let mut entra_oids = BTreeSet::new();
-        for m in &team.members {
-            if !crate::model::valid_handle(&m.handle) {
-                self.error(
-                    "team-handle",
-                    &path,
-                    format!(
-                        "`{}` is not a valid handle (lowercase letters, digits, `.`, `_`, `-`)",
-                        m.handle
-                    ),
-                );
-            }
-            if !handles.insert(m.handle.clone()) {
-                self.error(
-                    "team-duplicate",
-                    &path,
-                    format!("handle `{}` is listed twice", m.handle),
-                );
-            }
-            if !crate::model::valid_slack_id(&m.slack_id) {
-                self.error(
-                    "team-slack-id",
-                    &path,
-                    format!("`{}` is not a Slack member id (U… or W…)", m.slack_id),
-                );
-            }
-            if !slack_ids.insert(m.slack_id.clone()) {
-                self.error(
-                    "team-duplicate",
-                    &path,
-                    format!("Slack id `{}` is listed twice", m.slack_id),
-                );
-            }
-            if let Some(email) = &m.email {
-                if !crate::model::valid_email(email) {
-                    self.error(
-                        "team-email",
-                        &path,
-                        format!("`{email}` is not an email address"),
-                    );
-                } else if !emails.insert(email.trim().to_ascii_lowercase()) {
-                    // Entra ID sign-in finds people by email: two members with one email
-                    // would be ambiguous, so pmos-web signs in neither.
-                    self.error(
-                        "team-duplicate",
-                        &path,
-                        format!("email `{email}` is listed twice"),
-                    );
-                }
-            }
-            if let Some(login) = &m.github {
-                if !crate::onboarding::valid_github_login(login) {
-                    self.error(
-                        "team-github",
-                        &path,
-                        format!("`{login}` is not a GitHub login"),
-                    );
-                } else if !github_logins.insert(login.to_ascii_lowercase()) {
-                    self.error(
-                        "team-duplicate",
-                        &path,
-                        format!("GitHub login `{login}` is listed twice"),
-                    );
-                }
-            }
-            if let Some(oid) = &m.entra_oid {
-                if !crate::model::valid_entra_oid(oid) {
-                    self.error(
-                        "team-entra-oid",
-                        &path,
-                        format!("`{oid}` is not an Entra ID object id (a GUID)"),
-                    );
-                } else if !entra_oids.insert(oid.trim().to_ascii_lowercase()) {
-                    self.error(
-                        "team-duplicate",
-                        &path,
-                        format!("Entra ID object id `{oid}` is listed twice"),
-                    );
-                }
-            }
-            if m.roles.is_empty() {
-                self.error("team-roles", &path, format!("`{}` has no roles", m.handle));
-            }
-            // A role newer than this build (or a typo): it parses, so older and newer
-            // services agree on the file, but it grants nothing here.
-            for role in m.roles.iter().filter(|r| !r.is_known()) {
-                self.warn(
-                    "team-role-unknown",
-                    &path,
-                    format!(
-                        "`{}` has role `{role}`, which this version doesn't know and grants nothing (known: {})",
-                        m.handle,
-                        crate::model::Role::KNOWN.join(", ")
-                    ),
-                );
-            }
-            // Separation of duties: an auditor reviews what admins do.
-            if m.roles.contains(&crate::model::Role::Auditor) && m.is_admin() {
-                self.warn(
-                    "team-role-separation",
-                    &path,
-                    format!(
-                        "`{}` is both admin and auditor; an auditor should not audit their own actions",
-                        m.handle
-                    ),
-                );
-            }
-        }
-        // A personal master-context folder should belong to someone on the team.
+    }
+
+    /// A personal master-context folder is named after its owner's handle
+    /// (`master/people/<handle>/`). Whether that person is a user is the database's to say.
+    fn check_people(&mut self) {
         if let Some(people) = sorted_entries(&self.root.join("master").join("people")) {
             for dir in people.into_iter().filter(|p| p.is_dir()) {
                 let name = dir
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                if !handles.contains(&name) {
+                if !crate::model::valid_handle(&name) {
                     self.warn(
-                        "people-unknown",
+                        "people-handle",
                         &dir,
-                        format!("`{name}` is not in team.yaml"),
+                        format!(
+                            "`{name}` is not a PM OS handle, so no one's personal context is read from it"
+                        ),
                     );
                 }
             }

@@ -29,7 +29,8 @@ edit that adds egress to slack.com fails `net-egress`; one that makes content wr
 ## Review rule (POL-2)
 
 **A change to a bot's network policy needs approval from a second platform-owner PM, who isn't
-its author.** Platform owners are the `admin` members of `content/team.yaml`.
+its author.** Platform owners are the active `admin` users in the PM OS user database
+(`docs/runbooks/users.md`).
 
 - **What counts as a network change:** any change to `network_policies` in `bots/*.yaml`, or to
   the code that produces it: the hosts, ports, routes, MCP methods and binaries in

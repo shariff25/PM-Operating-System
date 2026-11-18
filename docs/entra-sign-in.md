@@ -10,7 +10,8 @@ Entra proves who the browser is. **Who may use PM OS, and with which roles, come
 the user database** (`docs/user-database-spec.md`), which the tool server owns. `pmos-web`
 asks it through `GET /internal/users/resolve` and `POST /internal/users/{handle}/identities/entra`
 (`docs/toolserver.md`, "The user database's read API"), with the client in
-`crates/directory/src/resolve.rs`. `content/team.yaml` decides nothing here (slice U4c).
+`crates/directory/src/resolve.rs`. There is no team file: `team.yaml` was retired in slice U7,
+and none decided anything here since U4c.
 
 ## What to register in Entra
 
@@ -254,8 +255,9 @@ before any lookup), and a member's `idp` accepted in both forms; no fallback to 
 unconfirmed sign-in name; Admin and Auditor without a host link; a conflict refused, audited
 and flagged, and a known account presenting another user's name flagged; a reassigned name
 and an admin's unlink; a deactivated user at sign-in and on a live session; the tool server
-unreachable (`users_unavailable`, then the 5-minute last-known-good limit); someone only in
-`team.yaml`; the start-up rules; and that no secret, code, token, verifier, `oid` or sign-in
+unreachable (`users_unavailable`, then the 5-minute last-known-good limit); someone only in a
+leftover `team.yaml`; the start-up rules; and that no secret, code, token, verifier, `oid` or sign-in
 name is ever logged. `crates/stack-tests/tests/stack.rs` signs in against the real tool
 server's user database and shows a deactivation there ending the web session within 10
-seconds. **Not tested against a real Entra tenant** (none is available yet).
+seconds, and (slice U7) that a hostile `team.yaml` planted in the content changes no sign-in.
+**Not tested against a real Entra tenant** (none is available yet).
