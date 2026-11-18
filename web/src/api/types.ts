@@ -15,6 +15,8 @@ export interface Me {
   nudges: boolean;
   /** What the person's roles allow, kebab-case. An older server leaves it out: treat that as none. */
   permissions?: string[];
+  /** True when the person holds the reviewer role: show Reviews. An older server leaves it out: treat that as false. */
+  reviewer?: boolean;
 }
 
 export type DraftKind = 'confluence_page' | 'jira_issue' | 'slack_reply' | 'slack_message';
@@ -73,6 +75,87 @@ export interface Draft extends DraftSummary {
   marker: string | null;
   /** Opaque. Sent back with approve so the server can refuse a draft that changed after it was shown. */
   version?: string;
+  /** What the reviewers assigned to the PM recommend, oldest first, one per reviewer. An older server leaves it out. */
+  recommendations?: Recommendation[];
+}
+
+// ---- Reviews (docs/web-api.md, "Reviews") ----
+
+/** `approve` ("recommends approving") or `changes` ("suggests changes"). */
+export type Verdict = 'approve' | 'changes';
+
+/** A reviewer's advice on the owner's draft. Names and notes are untrusted plain text. */
+export interface Recommendation {
+  reviewer: string;
+  /** Their display name, or their handle. Untrusted: plain text only. */
+  reviewer_name: string;
+  verdict: Verdict;
+  /** Untrusted plain text, or null: none given, or removed with a Slack draft's text (`note_removed`). */
+  note: string | null;
+  note_removed: boolean;
+  created_at: string;
+  /** The draft changed since the advice was given. */
+  stale: boolean;
+}
+
+/** The reviewer's own live recommendation on a draft. */
+export interface MyRecommendation {
+  verdict: Verdict;
+  note: string | null;
+  note_removed: boolean;
+  revision: number;
+  created_at: string;
+  stale: boolean;
+}
+
+/**
+ * One line of the reviewer's inbox. A restricted draft (`restricted` anything but `false`) is
+ * metadata only: no title, no `args_hash`, no `edited`, no recommendation.
+ */
+export interface ReviewSummary {
+  id: string;
+  owner: string;
+  /** Untrusted: plain text only. */
+  owner_name: string;
+  kind: DraftKind;
+  status: DraftStatus;
+  created_at: string;
+  expires_at: string | null;
+  restricted: boolean;
+  /** The version of the draft's text, 1 as drafted. Null from an older tool server. */
+  revision: number | null;
+  title?: string | null;
+  edited?: boolean;
+  /** 64 lowercase hex: send it back with `revision`. */
+  args_hash?: string;
+  my_recommendation?: MyRecommendation | null;
+}
+
+/** One draft as a reviewer reads it. The text, target and sources are absent when restricted. */
+export interface ReviewDraft extends ReviewSummary {
+  body?: string;
+  target?: DraftTarget;
+  sources?: Source[];
+}
+
+export interface ReviewList {
+  drafts: ReviewSummary[];
+  total: number;
+  truncated: boolean;
+  /** The handles whose drafts the reviewer reviews now. */
+  pms: string[];
+}
+
+export interface RecommendInput {
+  verdict: Verdict;
+  note?: string;
+  revision: number;
+  args_hash: string;
+}
+
+export interface Recommended {
+  recommendation: MyRecommendation;
+  draft: ReviewDraft;
 }
 
 export type SuggestionStatus = 'working' | 'ready' | 'failed';
@@ -509,6 +592,10 @@ export interface Api {
   brief(): Promise<Brief>;
   dismissFollowup(id: string): Promise<void>;
   draftFollowup(id: string): Promise<Task>;
+
+  listReviews(): Promise<ReviewList>;
+  getReview(id: string): Promise<ReviewDraft>;
+  recommend(id: string, input: RecommendInput): Promise<Recommended>;
 
   adminOverview(): Promise<AdminOverview>;
   adminAudit(query: AuditQuery): Promise<AuditPage>;

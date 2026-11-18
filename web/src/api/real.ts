@@ -13,6 +13,9 @@ import type {
   HintName,
   Me,
   RejectReason,
+  Recommended,
+  ReviewDraft,
+  ReviewSummary,
   Suggestion,
   TeamList,
   Task,
@@ -149,6 +152,24 @@ export function createRealClient(opts: RealOptions = {}): Api {
     brief: () => call<Brief>('GET', '/brief'),
     dismissFollowup: (id) => post<void>(`/followups/${seg(id)}/dismiss`),
     draftFollowup: (id) => post<Task>(`/followups/${seg(id)}/draft`),
+
+    listReviews: async () => {
+      const r = await call<{ drafts: ReviewSummary[]; total?: number; truncated?: boolean; pms?: string[] }>('GET', '/reviews');
+      return {
+        drafts: r.drafts,
+        total: typeof r.total === 'number' ? r.total : r.drafts.length,
+        truncated: r.truncated === true,
+        pms: Array.isArray(r.pms) ? r.pms : [],
+      };
+    },
+    getReview: (id) => call<ReviewDraft>('GET', `/reviews/${seg(id)}`),
+    recommend: (id, input) =>
+      post<Recommended>(`/reviews/${seg(id)}/recommendation`, {
+        verdict: input.verdict,
+        ...(input.note !== undefined && input.note.trim() !== '' ? { note: input.note } : {}),
+        revision: input.revision,
+        args_hash: input.args_hash,
+      }),
 
     adminOverview: () => call<AdminOverview>('GET', '/admin/overview'),
     adminAudit: (q) => call<AuditPage>('GET', `/admin/audit${auditQueryString(q)}`),

@@ -47,6 +47,8 @@ const PATHS = {
   confluence: 'M6.5 3.5h7l4 4v12a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1v-15a1 1 0 0 1 1-1zM13.5 3.5v4h4M8.5 12h7M8.5 15h7M8.5 18h4',
   jira: 'M12 3 21 12l-9 9-9-9zM12 8.5 15.5 12 12 15.5 8.5 12z',
   slack: 'M9.5 3.5v17M14.5 3.5v17M3.5 9.5h17M3.5 14.5h17',
+  // A speech bubble with a tick: a reviewer's advice.
+  review: 'M5 5h14a1 1 0 0 1 1 1v9.5a1 1 0 0 1-1 1h-7.5L7 20v-3.5H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1zM9 10.75l2 2 4-4',
   message: 'M5 5h14a1 1 0 0 1 1 1v9.5a1 1 0 0 1-1 1h-7.5L7 20v-3.5H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1z',
   drive: 'M8.5 4h7l5 8.5-3.5 6h-10L3.5 12.5zM8.5 4l5 8.5h7M3.5 12.5h10l-3.5 6',
   docs: 'M5.5 4.5h13v15h-13zM8.5 8.5h7M8.5 12h7M8.5 15.5h4',

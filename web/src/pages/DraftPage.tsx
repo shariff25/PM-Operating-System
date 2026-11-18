@@ -4,7 +4,9 @@ import { ApiError, REJECT_REASONS } from '../api';
 import type { Draft, HintName, RejectReason, Suggestion } from '../api';
 import { useApp } from '../app-context';
 import { ApproveDialog } from '../components/ApproveDialog';
-import { DraftPill, Empty, ErrorNote, ExtLink, Hint, Markdown, Skeleton, StrippedNote, SystemTag, TargetLink, kindSystem } from '../components/bits';
+import { DraftPill, ErrorNote, ExtLink, Hint, Markdown, Skeleton, StrippedNote, SystemTag, TargetLink, kindSystem } from '../components/bits';
+import { Recommendations } from '../components/Recommendations';
+import { SourceList, useSourceJump } from '../components/Sources';
 import { Icon } from '../components/icons';
 import { PageBar, useShell } from '../components/Shell';
 import { useToast } from '../components/Toasts';
@@ -220,8 +222,6 @@ function CheckItem({ c }: { c: Check }) {
   );
 }
 
-const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-const reducedMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
 
 export function DraftPage({ id }: { id: string }) {
   const { api, me, refreshMe, pollMs, navigate } = useApp();
@@ -235,17 +235,14 @@ export function DraftPage({ id }: { id: string }) {
   const [body, setBody] = useState('');
   const [saveState, setSaveState] = useState<SaveState>('saved');
   const [editing, setEditing] = useState(false);
-  const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>('doc');
+  const { selected, flash, pick: pickSource, toSource, toText } = useSourceJump(tab);
   const tabRefs = useRef<Partial<Record<PanelTab, HTMLButtonElement | null>>>({});
   const changeBox = useRef<HTMLTextAreaElement>(null);
 
   const [instruction, setInstruction] = useState('');
   const [suggestion, setSuggestion] = useState<Suggestion | null>(null);
   const [changeError, setChangeError] = useState<ChangeError | null>(null);
-  // Which source card to bring into view, and when to show its markers in the text (a phone has one at a time).
-  const [jump, setJump] = useState<{ to: 'source' | 'text'; id: string; n: number } | null>(null);
-  const [flash, setFlash] = useState<string | null>(null);
   const [changeBusy, setChangeBusy] = useState(false);
 
   const [confirming, setConfirming] = useState(false);
@@ -321,24 +318,6 @@ export function DraftPage({ id }: { id: string }) {
     },
     pollMs,
   );
-
-  // A marker or a card asked to be shown: bring it into view and move focus there. On a phone the
-  // other tab is opened first, and this runs once it is on screen.
-  useEffect(() => {
-    if (!jump) return;
-    if (jump.to === 'source') {
-      const card = document.getElementById(`src-${jump.id}`);
-      if (!card) return;
-      card.querySelector<HTMLElement>('button.source')?.focus({ preventScroll: true });
-      card.scrollIntoView?.({ block: 'center', behavior: reducedMotion() ? 'auto' : 'smooth' });
-      setFlash(jump.id);
-      const t = setTimeout(() => setFlash((f) => (f === jump.id ? null : f)), 1800);
-      return () => clearTimeout(t);
-    }
-    const mark = document.querySelector<HTMLElement>('.sheet button.cite-on');
-    mark?.focus({ preventScroll: true });
-    mark?.scrollIntoView?.({ block: 'center', behavior: reducedMotion() ? 'auto' : 'smooth' });
-  }, [jump, tab]);
 
   // The reject popover and the phone's More menu close on a click outside them.
   useEffect(() => {
@@ -835,81 +814,33 @@ export function DraftPage({ id }: { id: string }) {
   ) : null;
 
   // ---- The side panel: what the bot read, the checklist, and the details. ----
-  // Markers in the text, per source. Cards tell which sources the draft relies on, once any does.
+  // Markers in the text, per source.
   const places = rendered.cites;
-  const anyCited = draft.sources.some((s) => s.cited);
-  const pickSource = (sid: string) => setSelected(selected === sid ? null : sid);
   const onCite = (sid: string) => {
-    setSelected(sid);
     if (isPhone) setTab('sources');
-    setJump((j) => ({ to: 'source', id: sid, n: (j?.n ?? 0) + 1 }));
+    toSource(sid);
   };
   const showInText = (sid: string) => {
     setTab('doc');
-    setJump((j) => ({ to: 'text', id: sid, n: (j?.n ?? 0) + 1 }));
+    toText(sid);
   };
 
-  const sourcesList = draft.sources.length === 0 ? (
-    <Empty
-      icon="link"
-      small
-      action={
+  const sourcesList = (
+    <SourceList
+      sources={draft.sources}
+      places={places}
+      selected={selected}
+      flash={flash}
+      onPick={pickSource}
+      onShowInText={isPhone ? showInText : undefined}
+      emptyAction={
         pending ? (
           <button type="button" className="btn btn-sm" onClick={askForSources}>
             {copy.draft.askSources}
           </button>
         ) : undefined
       }
-    >
-      {copy.noSources}
-    </Empty>
-  ) : (
-    <ol className="sources">
-      {draft.sources.map((s, i) => (
-        <li
-          key={s.id}
-          id={`src-${s.id}`}
-          className={`source-item ${selected === s.id ? 'source-item-on' : ''} ${anyCited ? (s.cited ? 'source-item-cited' : 'source-item-uncited') : ''} ${flash === s.id ? 'source-item-flash' : ''}`}
-        >
-          <button type="button" className="source" aria-pressed={selected === s.id} onClick={() => pickSource(s.id)}>
-            <span className="source-num"><span className="sr-only">{copy.draft.sourceNumber(i + 1)}</span><span aria-hidden="true">{i + 1}</span></span>
-            <span className="source-text">
-              <span className="source-title">{s.title}</span>
-              <span className="source-sys">
-                <span className="sr-only">, </span>
-                {capital(s.system)}
-                {anyCited && !s.cited && (
-                  <>
-                    <span aria-hidden="true"> · </span>
-                    <span className="sr-only">, </span>
-                    <span className="source-uncited">{copy.draft.notCited}</span>
-                  </>
-                )}
-              </span>
-              {s.excerpt && <span className="source-excerpt">“{s.excerpt}”</span>}
-            </span>
-          </button>
-          {selected === s.id && (places[s.id] ?? 0) > 0 && (
-            <p className="source-cites">
-              <span>{copy.draft.citedPlaces(places[s.id]!)}</span>
-              {isPhone && (
-                <button type="button" className="source-show" onClick={() => showInText(s.id)}>
-                  {copy.draft.showInDraft}
-                </button>
-              )}
-            </p>
-          )}
-          {selected === s.id && (s.url ? (
-            <ExtLink href={s.url} className="source-link" label={`: ${s.title}`}>
-              {copy.draft.sourceOpen}
-              <Icon name="external" size={13} />
-            </ExtLink>
-          ) : (
-            <p className="source-link source-nolink">{copy.draft.sourceNoLink}</p>
-          ))}
-        </li>
-      ))}
-    </ol>
+    />
   );
 
   const sourcesSection = (
@@ -1182,6 +1113,11 @@ export function DraftPage({ id }: { id: string }) {
         </section>
       )}
 
+      {isPhone && (
+        <div className="recs-phone">
+          <Recommendations recs={draft.recommendations} />
+        </div>
+      )}
       {sheet}
       {!pending && !expired && <p className="muted small read-only">{copy.draft.readOnly(draft.status)}</p>}
       {changeForm}
@@ -1292,6 +1228,7 @@ export function DraftPage({ id }: { id: string }) {
         {docColumn}
         <aside className="panel" aria-label={copy.panel.label}>
           {pending && <Hint name="approve" anchor="approve-btn" kind={draft.kind} />}
+          <Recommendations recs={draft.recommendations} />
           {sourcesSection}
           {checklist}
           {detailsSection}

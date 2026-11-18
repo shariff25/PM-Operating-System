@@ -98,3 +98,11 @@ export function writeOutcome(e: unknown): WriteOutcome {
   const text = Object.hasOwn(T.errors, code) ? T.errors[code]! : errorText(e, T.failed);
   return { kind: 'refused', text, code };
 }
+
+/**
+ * A Slack member id as the server takes it (docs/web-api.md, `NewUser`: "U… or W…"): U or W,
+ * then capital letters and digits, 3 to 32 characters in all, as the contract crate checks.
+ */
+export function validSlackId(id: string): boolean {
+  return /^[UW][A-Z0-9]{2,31}$/.test(id);
+}

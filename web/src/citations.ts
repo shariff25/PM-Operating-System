@@ -1,4 +1,4 @@
-import type { Api, Draft, DraftSummary, Suggestion } from './api/types';
+import type { Api, Draft, DraftSummary, ReviewSummary, Suggestion } from './api/types';
 
 // Source markers. The server puts `[[s3]]` after the text a source supports (docs/web-api.md,
 // "Citations"). The app turns each into a small numbered link in the formatted draft, and
@@ -64,6 +64,7 @@ export function stripFromLine(text: string): string {
 }
 
 const cleanSummary = <T extends DraftSummary>(d: T): T => ({ ...d, title: stripFromLine(d.title) });
+const cleanReview = <T extends ReviewSummary>(r: T): T => (typeof r.title === 'string' ? { ...r, title: stripFromLine(r.title) } : r);
 const cleanSuggestion = (s: Suggestion | null): Suggestion | null =>
   s && s.body !== null ? { ...s, body: stripMarkers(s.body) } : s;
 
@@ -75,7 +76,7 @@ const cleanSuggestion = (s: Suggestion | null): Suggestion | null =>
  */
 export function withCleanDrafts(api: Api): Api {
   const { listDrafts, getDraft, saveDraft, acceptSuggestion, rejectSuggestion, approve, reject, createPractice } = api;
-  const { requestChange, getSuggestion } = api;
+  const { requestChange, getSuggestion, listReviews, getReview, recommend } = api;
   const one = (d: Draft): Draft => cleanSummary(d);
   api.listDrafts = async () => {
     const l = await listDrafts.call(api);
@@ -90,5 +91,15 @@ export function withCleanDrafts(api: Api): Api {
   api.createPractice = async () => one(await createPractice.call(api));
   api.requestChange = async (id, text) => cleanSuggestion(await requestChange.call(api, id, text))!;
   api.getSuggestion = async (id) => cleanSuggestion(await getSuggestion.call(api, id));
+  // A reviewer reads the same drafts: their titles are never cited either.
+  api.listReviews = async () => {
+    const l = await listReviews.call(api);
+    return { ...l, drafts: l.drafts.map(cleanReview) };
+  };
+  api.getReview = async (id) => cleanReview(await getReview.call(api, id));
+  api.recommend = async (id, input) => {
+    const r = await recommend.call(api, id, input);
+    return { ...r, draft: cleanReview(r.draft) };
+  };
   return api;
 }
