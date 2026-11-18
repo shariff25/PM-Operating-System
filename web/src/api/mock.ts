@@ -897,6 +897,60 @@ export function createMockClient(options: MockOptions = {}): Api {
       return admin.connectors();
     },
 
+    async adminUsers() {
+      await wait();
+      need('manage-members', 'view-audit-log');
+      return admin.users.list(me.handle, (me.permissions ?? []).includes('manage-members'));
+    },
+    async adminInvite(input) {
+      await wait();
+      write();
+      need('manage-members');
+      return admin.users.invite(me.handle, clone(input));
+    },
+    async adminSetRoles(handle, roles, expectedVersion) {
+      await wait();
+      write();
+      need('manage-members');
+      return admin.users.setRoles(me.handle, handle, [...roles], expectedVersion);
+    },
+    async adminSetFields(handle, fields, expectedVersion) {
+      await wait();
+      write();
+      need('manage-members');
+      return admin.users.setFields(me.handle, handle, clone(fields), expectedVersion);
+    },
+    async adminConfirmSignIn(handle, signInName, expectedVersion) {
+      await wait();
+      write();
+      need('manage-members');
+      return admin.users.confirmSignIn(me.handle, handle, signInName, expectedVersion);
+    },
+    async adminDeactivate(handle, expectedVersion) {
+      await wait();
+      write();
+      need('manage-members');
+      return admin.users.deactivate(me.handle, handle, expectedVersion);
+    },
+    async adminReactivate(handle, expectedVersion) {
+      await wait();
+      write();
+      need('manage-members');
+      return admin.users.reactivate(me.handle, handle, expectedVersion);
+    },
+    async adminUnlink(handle, kind) {
+      await wait();
+      write();
+      need('manage-members');
+      return admin.users.unlink(me.handle, handle, kind);
+    },
+    async adminAssignReviewer(reviewer, pms, expectedVersion) {
+      await wait();
+      write();
+      need('manage-members');
+      return admin.users.assignReviewer(me.handle, reviewer, [...pms], expectedVersion);
+    },
+
     async adminPolicy() {
       await wait();
       need('view-policies');

@@ -23,7 +23,7 @@ export function AdminPage({ section, search, sub }: { section: AdminSection; sea
     case 'audit':
       return <AuditLog search={search} />;
     case 'team':
-      return <Team />;
+      return <Team search={search} />;
     case 'connectors':
       return <Connectors />;
     case 'policy':

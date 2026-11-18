@@ -60,7 +60,7 @@ describe('admin navigation and access', () => {
       role: 'admin',
       hash: '/admin/team',
       wrap: (api) => {
-        api.adminTeam = async () => { throw new ApiError(403, 'forbidden', 'Your role does not allow this.'); };
+        api.adminUsers = async () => { throw new ApiError(403, 'forbidden', 'Your role does not allow this.'); };
         return api;
       },
     });
@@ -83,6 +83,83 @@ describe('overview', () => {
     renderApp({ role: 'admin', hash: '/admin', toolServerDown: true });
     await screen.findByText(A.overview.partial);
     expect(screen.getAllByText(A.overview.subs.unavailable)).toHaveLength(3);
+  });
+});
+
+describe('overview: people who need an admin', () => {
+  const P = A.overview.people;
+  it('lists each flag with its people, each a link to them on the Team page', async () => {
+    renderApp({ role: 'admin', hash: '/admin' });
+    const card = await screen.findByRole('region', { name: new RegExp(P.title) });
+    expect(within(card).getByText(P.unconfirmed)).toBeInTheDocument();
+    expect(within(card).getByRole('link', { name: 'sam' })).toHaveAttribute('href', '#/admin/team?person=sam');
+    expect(within(card).getByText(P.conflicts(1))).toBeInTheDocument();
+    expect(within(card).getByRole('link', { name: 'ana' })).toHaveAttribute('href', '#/admin/team?person=ana');
+    expect(within(card).getByText(/^Admin and Auditor \(pilot exception, ends \d+ \w+ \d{4}\)$/)).toBeInTheDocument();
+    expect(within(card).getByRole('link', { name: 'raj' })).toBeInTheDocument();
+    expect(within(card).getByText(P.needsHost)).toBeInTheDocument();
+    expect(within(card).getByRole('link', { name: P.openTeam })).toHaveAttribute('href', '#/admin/team?show=attention');
+    // Bots are not people: their names are not links.
+    expect(within(card).queryByRole('link', { name: 'pm-tom' })).not.toBeInTheDocument();
+    expect(within(card).getByText('pm-tom')).toBeInTheDocument();
+    expect(screen.getByText(/^The pilot exception ends on /)).toBeInTheDocument();
+    expect(screen.getByText(A.overview.held(1))).toBeInTheDocument();
+  });
+
+  it('shows nothing when no list has anyone, and nothing from an older server', async () => {
+    const first = renderApp({
+      role: 'admin',
+      hash: '/admin',
+      wrap: (api) => {
+        const f = api.adminOverview.bind(api);
+        api.adminOverview = async () => {
+          const o = await f();
+          return {
+            ...o,
+            users: {
+              ...o.users!, sign_in_unconfirmed: [], dual_role: [], pilot_exception: null, role_conflicts: [], entra_needs_host: [],
+              no_slack: [], identity_conflicts: 0, identity_conflict_users: [], resolve_miss_warning: [], bots_without_active_owner: [],
+              deactivation_limit_reached: false,
+            },
+          };
+        };
+        return api;
+      },
+    });
+    await screen.findByRole('group', { name: A.overview.statsLabel });
+    expect(screen.queryByRole('region', { name: new RegExp(P.title) })).not.toBeInTheDocument();
+    expect(document.querySelector('.overview-notices')).toBeNull();
+    first.unmount();
+    renderApp({
+      role: 'admin',
+      hash: '/admin',
+      wrap: (api) => {
+        const f = api.adminOverview.bind(api);
+        api.adminOverview = async () => {
+          const o = await f();
+          delete o.users;
+          return o;
+        };
+        return api;
+      },
+    });
+    await screen.findByRole('group', { name: A.overview.statsLabel });
+    expect(screen.queryByRole('region', { name: new RegExp(P.title) })).not.toBeInTheDocument();
+  });
+
+  it('shows the red notice naming who still holds both once the exception has lapsed, and the guessing warning', async () => {
+    renderApp({ role: 'admin', hash: '/admin', pilotLapsed: true });
+    const alert = await screen.findByText(/^The pilot exception ended on /);
+    const note = alert.closest('.note')!;
+    expect(note).toHaveClass('note-error');
+    expect(within(note as HTMLElement).getByRole('link', { name: 'raj' })).toBeInTheDocument();
+    expect(screen.getByText(/^Lookups from the operator console found nobody more than 100 times/)).toBeInTheDocument();
+  });
+
+  it('shows an auditor the same lists, linked to the Team page they may read', async () => {
+    renderApp({ role: 'auditor', hash: '/admin' });
+    const card = await screen.findByRole('region', { name: new RegExp(P.title) });
+    expect(within(card).getByRole('link', { name: 'sam' })).toBeInTheDocument();
   });
 });
 
@@ -361,42 +438,6 @@ describe('audit export', () => {
     await userEvent.click(screen.getByRole('button', { name: A.audit.export }));
     expect(await screen.findByText('The tool server did not answer.')).toBeInTheDocument();
     expect(saveBlob).not.toHaveBeenCalled();
-  });
-});
-
-describe('team', () => {
-  it('lists members with roles, bot, email and linked accounts as words for screen readers', async () => {
-    renderApp({ role: 'auditor', hash: '/admin/team' });
-    const table = await screen.findByRole('table', { name: A.team.tableLabel });
-    const ravi = within(table).getByRole('row', { name: /ravi/ });
-    expect(within(ravi).getByText('Product Manager')).toBeInTheDocument();
-    expect(within(ravi).getByText('Skill author')).toBeInTheDocument();
-    expect(within(ravi).getByText('pm-ravi')).toBeInTheDocument();
-    expect(within(ravi).getByText(A.team.emailNo)).toBeInTheDocument();
-    const ben = within(table).getByRole('row', { name: /ben/ });
-    expect(within(ben).getAllByText(A.team.linked)).toHaveLength(3);
-    expect(within(ben).getByText(A.team.emailYes)).toBeInTheDocument();
-  });
-
-  it('shows a member once when the name is the handle, and both when they differ', async () => {
-    renderApp({ role: 'auditor', hash: '/admin/team' });
-    const table = await screen.findByRole('table', { name: A.team.tableLabel });
-    const ben = within(table).getByRole('row', { name: /ben/ });
-    expect(within(ben).getAllByText('ben')).toHaveLength(1);
-    const ana = within(table).getByRole('row', { name: /Ana Silva/ });
-    expect(within(ana).getByText('Ana Silva')).toBeInTheDocument();
-    expect(within(ana).getByText('ana')).toBeInTheDocument();
-  });
-
-  it('copes with the tool server being down: blanks, not breakage', async () => {
-    renderApp({ role: 'admin', hash: '/admin/team', toolServerDown: true });
-    await screen.findByText(A.team.accountsDown);
-    const table = screen.getByRole('table', { name: A.team.tableLabel });
-    expect(within(table).queryByText(A.team.linked)).not.toBeInTheDocument();
-    expect(within(table).queryByText(A.team.notLinked)).not.toBeInTheDocument();
-    expect(within(table).getAllByText(A.team.unknown).length).toBeGreaterThan(0);
-    // Email still comes from team.yaml.
-    expect(within(table).getAllByText(A.team.emailYes).length).toBeGreaterThan(0);
   });
 });
 
