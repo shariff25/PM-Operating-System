@@ -13,6 +13,9 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   written as a spec and reviewed before it is built (`docs/user-database-spec.md`).
 - **c. Policy Admin** for NVIDIA OpenShell. The app opens a pull request; the merge happens in
   GitHub.
+  Owner, 2026-11-18, plan only (build nothing until the plan is approved): add OpenShell's
+  policy prover to Policy Admin, and bring OpenShell's sandbox allow and deny decisions into
+  the audit log.
 - **d. Front end:** a web app PMs love. The owner holds the design to the standard of the
   Baseten and WorkOS dashboards and will keep challenging it. Design approved for the MVP on
   2026-11-16: `web/` as rebuilt in `claude/web-redesign-v3`.
@@ -29,6 +32,10 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   models, chosen by configuration. If a model is not available, the system switches
   to another automatically. Added by the owner on 2026-11-18 as a requirement only: not
   planned or built yet; do not start it until the owner says so.
+  On 2026-11-18 the owner asked to drop the OpenRouter-like part and rely on OpenShell's
+  inference router. Not applied yet: OpenShell's docs (v0.1.9, "Inference") say the managed
+  inference route was removed and the workload chooses the model, so OpenShell gives no
+  switching or fallback. Waiting on the owner's decision.
 - **h. Dropped by the owner on 2026-11-17:** the review of how the Grok bot was built. Do not
   build it.
 
