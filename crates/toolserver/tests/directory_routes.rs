@@ -467,18 +467,22 @@ async fn each_token_sees_exactly_its_fields() {
             ] {
                 let (s, one) = srv.get(&target, token).await;
                 assert_eq!(s, 200, "{target}: {one}");
-                assert_eq!(
-                    keys(&one),
-                    set(&[
-                        "display_name",
-                        "dual_role",
-                        "entra",
-                        "handle",
-                        "roles",
-                        "sign_in_name_confirmed",
-                        "status",
-                    ])
-                );
+                let mut want = vec![
+                    "display_name",
+                    "dual_role",
+                    "entra",
+                    "handle",
+                    "roles",
+                    "sign_in_name_confirmed",
+                    "status",
+                ];
+                // pmos-web's answer also carries the password credential's epoch (null without
+                // one), which ends a password session when it moves (docs/password-sign-in.md).
+                if token == WEB_TOKEN {
+                    want.push("password_epoch");
+                    assert_eq!(one["password_epoch"], Value::Null);
+                }
+                assert_eq!(keys(&one), set(&want));
                 assert_eq!(one["handle"], "ada");
                 assert_eq!(one["entra"], "linked");
                 assert_eq!(one["sign_in_name_confirmed"], true);

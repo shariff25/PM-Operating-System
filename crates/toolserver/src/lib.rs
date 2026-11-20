@@ -24,6 +24,7 @@ pub mod members;
 pub mod memory;
 pub mod memory_repo;
 pub mod oauth;
+pub mod password;
 pub mod onboarding;
 pub mod pg;
 pub mod proposals;

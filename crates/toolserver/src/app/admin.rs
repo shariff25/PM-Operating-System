@@ -390,6 +390,7 @@ pub fn safe_detail(detail: &str) -> Option<String> {
         || crate::audit::parse_purge_detail(detail).is_some()
         || crate::users::detail::is_safe(detail)
         || crate::users::detail::is_purge_detail(detail)
+        || crate::password::is_safe_detail(detail)
         || is_sign_in_detail(detail)
         || detail
             .strip_prefix("reason: ")
@@ -769,7 +770,7 @@ pub const SIGN_IN_ACTIONS: [&str; 4] = [
 pub const IDENTITY_CONFLICT: &str = "users.identity_conflict";
 
 /// The sign-in providers an event may name.
-pub const SIGN_IN_PROVIDERS: [&str; 2] = ["entra", "dev"];
+pub const SIGN_IN_PROVIDERS: [&str; 3] = ["entra", "dev", "password"];
 
 /// Why a sign-in was refused, as `pmos-web` codes it (its signed-out page's `reason`).
 /// `wrong_account` is from before the user database (no longer sent, still accepted).
@@ -879,7 +880,7 @@ async fn sign_in_event(
         return bad("`action` isn't a sign-in event this server records");
     };
     let Some(provider) = SIGN_IN_PROVIDERS.iter().find(|p| **p == r.provider) else {
-        return bad("`provider` is `entra` or `dev`");
+        return bad("`provider` is `entra`, `dev` or `password`");
     };
     let user = q.user.as_deref().map(str::trim).filter(|u| !u.is_empty());
     let dir = match state.svc.people().directory().await {
