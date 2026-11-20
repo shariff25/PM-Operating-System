@@ -62,7 +62,10 @@ fn signed_in_route(path: &str) -> bool {
     let path = path.strip_prefix("/internal").unwrap_or(path);
     matches!(
         path.trim_end_matches('/'),
-        "/password/change" | "/password/recovery-codes" | "/password/status" | "/password/setup-codes"
+        "/password/change"
+            | "/password/recovery-codes"
+            | "/password/status"
+            | "/password/setup-codes"
     )
 }
 
@@ -80,7 +83,9 @@ async fn identify(State(state): State<AppState>, req: Request, next: Next) -> Re
     };
     let assertions = &state.people.assertions;
     if !writes_allowed(assertions) {
-        tracing::warn!("password route refused: the tool server isn't running in assertion require");
+        tracing::warn!(
+            "password route refused: the tool server isn't running in assertion require"
+        );
         return no_store(coded(
             StatusCode::SERVICE_UNAVAILABLE,
             "assertion_required",
@@ -182,11 +187,7 @@ macro_rules! parse {
 }
 
 /// The user as `resolve` answers for `pmos-web`, with the credential's epoch.
-async fn user_answer(
-    state: &AppState,
-    handle: &str,
-    epoch: i64,
-) -> Result<Value, Box<Response>> {
+async fn user_answer(state: &AppState, handle: &str, epoch: i64) -> Result<Value, Box<Response>> {
     let dir = match state.svc.people().directory().await {
         Ok(d) => d,
         Err(e) => return Err(Box::new(refused(PwError::from(e)))),
@@ -535,7 +536,11 @@ mod tests {
             "begin; setup",
             "wrong_password",
         ] {
-            assert_eq!(super::super::admin::safe_detail(d).as_deref(), Some(d), "{d}");
+            assert_eq!(
+                super::super::admin::safe_detail(d).as_deref(),
+                Some(d),
+                "{d}"
+            );
         }
         assert_eq!(super::super::admin::safe_detail("hunter2hunter2"), None);
     }

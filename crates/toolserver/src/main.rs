@@ -220,8 +220,8 @@ async fn main() -> Result<()> {
     // authenticator secrets with; its routes also need assertion `require`.
     match &config.password_keys {
         Some(keys) => {
-            let passwords =
-                pmos_toolserver::password::PasswordService::new(keys.clone()).map_err(anyhow::Error::msg)?;
+            let passwords = pmos_toolserver::password::PasswordService::new(keys.clone())
+                .map_err(anyhow::Error::msg)?;
             let p = passwords.params();
             tracing::info!(
                 argon2id_m_kib = p.m_kib,
@@ -338,11 +338,7 @@ async fn main() -> Result<()> {
 
 /// Development only (config.rs refuses it anywhere else): a setup code for `handle`, issued as
 /// the host would, written to a new file only its owner can read, so a test stack can print it.
-async fn dev_password_setup(
-    svc: &ToolService,
-    handle: &str,
-    file: &std::path::Path,
-) -> Result<()> {
+async fn dev_password_setup(svc: &ToolService, handle: &str, file: &std::path::Path) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let host = pmos_toolserver::users::HostUser::parse("dev")

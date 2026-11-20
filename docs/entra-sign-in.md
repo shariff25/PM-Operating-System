@@ -49,8 +49,9 @@ Start-up rules:
 - Entra is on when the three `PMOS_WEB_ENTRA_*` variables above and `PMOS_WEB_PUBLIC_URL` are
   all set. Setting only some of them (or only `PMOS_WEB_ENTRA_AUTHORITY`) refuses to start and
   names what is missing: a half-configured provider never runs.
-- The server starts if Entra is fully configured **or** `PMOS_WEB_DEV_LOGIN=1`, and refuses with
-  neither. **With both it refuses to start**, unless `PMOS_WEB_DEV_LOGIN_WITH_ENTRA=1` is also
+- The server starts if Entra is fully configured, `PMOS_WEB_DEV_LOGIN=1` or
+  `PMOS_WEB_PASSWORD_LOGIN=1` (password sign-in with an authenticator code,
+  `docs/password-sign-in.md`, which may run beside Entra), and refuses with none of them. **With both it refuses to start**, unless `PMOS_WEB_DEV_LOGIN_WITH_ENTRA=1` is also
   set: development sign-in lets anyone who reaches the port sign in as anyone, bypassing
   Entra, so running both has to be meant (a developer's own machine). With the override it
   starts and logs a loud warning. Development sign-in also refuses to start unless

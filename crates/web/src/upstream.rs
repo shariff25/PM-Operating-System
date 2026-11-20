@@ -927,6 +927,35 @@ impl ToolServer {
         Ok((status, body))
     }
 
+    /// Password sign-in's routes (`/internal/password/{segments…}`, `docs/password-sign-in.md`):
+    /// for a signed-in `user`, named as `user=` with an assertion for them bound to exactly
+    /// this request; with no `user`, unsigned (nobody is signed in yet). Gives back the tool
+    /// server's status, JSON body (`Value::Null` when it isn't JSON) and `Retry-After`,
+    /// whatever the status. The body holds what the person typed: never logged here.
+    pub async fn password_call(
+        &self,
+        method: reqwest::Method,
+        segments: &[&str],
+        user: Option<&str>,
+        body: Option<&Value>,
+    ) -> UpstreamResult<(u16, Value, Option<reqwest::header::HeaderValue>)> {
+        let mut path = vec!["internal", "password"];
+        path.extend_from_slice(segments);
+        let url = self.0.url(&path)?;
+        let mut req = self.0.http.request(method, url);
+        if let Some(u) = user {
+            req = req.query(&[("user", u)]);
+        }
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let res = self.0.execute(req, user, TIMEOUT).await?;
+        let status = res.status().as_u16();
+        let retry_after = res.headers().get(reqwest::header::RETRY_AFTER).cloned();
+        let body = res.json::<Value>().await.unwrap_or(Value::Null);
+        Ok((status, body, retry_after))
+    }
+
     /// The Reviewer's routes (`/internal/reviews/{segments…}?user=<reviewer>`, slice U6a):
     /// `method`, with `body` as JSON when given, and an assertion for `reviewer` bound to
     /// exactly that request. Gives back the tool server's status and JSON body (`Value::Null`

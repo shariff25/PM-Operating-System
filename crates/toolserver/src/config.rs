@@ -403,9 +403,9 @@ impl Config {
         let password_keys = match &connectors {
             Connectors::Live(live) => Some(live.vault_keys.clone()),
             Connectors::Fake => match get("PMOS_VAULT_KEY").filter(|v| !v.trim().is_empty()) {
-                Some(spec) => Some(
-                    KeyRing::from_spec(&spec).map_err(|e| format!("PMOS_VAULT_KEY: {e}"))?,
-                ),
+                Some(spec) => {
+                    Some(KeyRing::from_spec(&spec).map_err(|e| format!("PMOS_VAULT_KEY: {e}"))?)
+                }
                 None => None,
             },
         };
@@ -420,11 +420,13 @@ impl Config {
                     || users_seed.is_none()
                     || password_keys.is_none()
                 {
-                    return Err("PMOS_DEV_PASSWORD_SETUP_FOR is for an in-memory development stack \
+                    return Err(
+                        "PMOS_DEV_PASSWORD_SETUP_FOR is for an in-memory development stack \
                                 only: it needs PMOS_USERS_SEED and PMOS_VAULT_KEY, fake connectors \
                                 and no PMOS_DATABASE_URL (a real install uses `pmos-admin users \
                                 password-setup`)"
-                        .into());
+                            .into(),
+                    );
                 }
                 Some((handle.trim().to_string(), PathBuf::from(file)))
             }

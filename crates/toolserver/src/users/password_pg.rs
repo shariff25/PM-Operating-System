@@ -31,7 +31,9 @@ const LOCK: &str = "SELECT pg_advisory_xact_lock(hashtext('pmos.password'), \
                     hashtext(current_schema() || ':' || $1))";
 
 fn bad(what: &str, value: &str) -> StoreError {
-    StoreError(format!("unexpected {what} `{value}` in the password tables"))
+    StoreError(format!(
+        "unexpected {what} `{value}` in the password tables"
+    ))
 }
 
 async fn person(conn: &mut PgConnection, handle: &str) -> StoreResult<Option<Person>> {
@@ -86,11 +88,7 @@ fn pending_of(row: &PgRow) -> StoreResult<Pending> {
     })
 }
 
-async fn load(
-    conn: &mut PgConnection,
-    handle: &str,
-    actor: Option<&str>,
-) -> StoreResult<Snapshot> {
+async fn load(conn: &mut PgConnection, handle: &str, actor: Option<&str>) -> StoreResult<Snapshot> {
     let credential = match sqlx::query(
         "SELECT password_hash, totp_sealed, totp_last_step, epoch, failed_count, failed_last_at,
                 locked_until, setup_failed_count, setup_failed_last_at, setup_locked_until, set_at
@@ -344,7 +342,9 @@ const STATUS: &str = "SELECT u.handle,
 
 fn status_of(row: &PgRow) -> StoreResult<PasswordStatus> {
     Ok(PasswordStatus {
-        password_set: row.try_get::<Option<bool>, _>("password_set")?.unwrap_or(false),
+        password_set: row
+            .try_get::<Option<bool>, _>("password_set")?
+            .unwrap_or(false),
         second_step_enrolled: row
             .try_get::<Option<bool>, _>("second_step_enrolled")?
             .unwrap_or(false),

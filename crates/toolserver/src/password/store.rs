@@ -256,8 +256,11 @@ pub trait PasswordStore: Send + Sync {
     ) -> StoreResult<BTreeMap<String, PasswordStatus>>;
 
     /// `handle`'s [`PasswordStatus`] (all false when none).
-    async fn password_status(&self, handle: &str, now: DateTime<Utc>)
-        -> StoreResult<PasswordStatus>;
+    async fn password_status(
+        &self,
+        handle: &str,
+        now: DateTime<Utc>,
+    ) -> StoreResult<PasswordStatus>;
 
     /// Delete pending tokens past their expiry and setup codes past theirs. Returns how many.
     async fn prune_passwords(&self, now: DateTime<Utc>) -> StoreResult<u64>;

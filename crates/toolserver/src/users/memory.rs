@@ -23,8 +23,8 @@ use super::{
 };
 use crate::audit::{AuditEvent, AuditSink, Client, Outcome};
 use crate::password::store::{
-    Credential, PasswordStatus, PasswordStore, Pending, Person, Plan, Purpose,
-    RecoveryCode, SetupCode, Snapshot, Writes,
+    Credential, PasswordStatus, PasswordStore, Pending, Person, Plan, Purpose, RecoveryCode,
+    SetupCode, Snapshot, Writes,
 };
 use crate::store::StoreResult;
 
@@ -87,7 +87,11 @@ fn person_of(u: &super::User) -> Person {
 /// What the database's checks on the password tables refuse (migration 0020), checked the
 /// same way here before anything is written.
 fn check_writes(handle: &str, exists: bool, w: &Writes, now: DateTime<Utc>) -> StoreResult<()> {
-    let bad = |why: &str| Err(crate::store::StoreError(format!("password write refused: {why}")));
+    let bad = |why: &str| {
+        Err(crate::store::StoreError(format!(
+            "password write refused: {why}"
+        )))
+    };
     let writes_rows = w.credential.is_some()
         || w.recovery.is_some()
         || w.issue_code.is_some()
@@ -101,7 +105,10 @@ fn check_writes(handle: &str, exists: bool, w: &Writes, now: DateTime<Utc>) -> S
         {
             return bad("a password without its second step");
         }
-        if c.password_hash.as_ref().is_some_and(|h| !h.starts_with("$argon2id$")) {
+        if c.password_hash
+            .as_ref()
+            .is_some_and(|h| !h.starts_with("$argon2id$"))
+        {
             return bad("not an Argon2id hash");
         }
     }
@@ -462,7 +469,11 @@ impl PasswordStore for MemoryUsers {
             });
         }
         if let Some(id) = w.use_code {
-            for c in pw.codes.iter_mut().filter(|c| c.code.id == id && c.handle == handle) {
+            for c in pw
+                .codes
+                .iter_mut()
+                .filter(|c| c.code.id == id && c.handle == handle)
+            {
                 c.used_at.get_or_insert(now);
             }
             // A token on a code that is gone goes with it.
@@ -478,7 +489,11 @@ impl PasswordStore for MemoryUsers {
             }
         }
         for p in w.put_pending {
-            if pw.pending.get(&p.token_hash).is_some_and(|(h, _)| h != handle) {
+            if pw
+                .pending
+                .get(&p.token_hash)
+                .is_some_and(|(h, _)| h != handle)
+            {
                 return Err(crate::store::StoreError("a token collided".into()));
             }
             pw.pending
@@ -539,14 +554,12 @@ fn status_of(pw: &Passwords, handle: &str, now: DateTime<Utc>) -> PasswordStatus
         password_set: cred.is_some_and(|c| c.password_hash.is_some()),
         second_step_enrolled: cred.is_some_and(|c| c.totp_sealed.is_some()),
         setup_code_pending: pw.live_code(handle).is_some_and(|c| c.expires_at > now),
-        recovery_codes_left: pw
-            .recovery
-            .get(handle)
-            .map_or(0, |r| r.iter().filter(|c| c.used_at.is_none()).count() as u32),
+        recovery_codes_left: pw.recovery.get(handle).map_or(0, |r| {
+            r.iter().filter(|c| c.used_at.is_none()).count() as u32
+        }),
         epoch: cred.map_or(0, |c| c.epoch),
     }
 }
-
 
 // --- The first Entra link (slice U2) ---------------------------------------------------------
 

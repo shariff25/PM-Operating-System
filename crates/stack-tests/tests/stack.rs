@@ -193,7 +193,18 @@ async fn start_with(hostile: bool) -> Stack {
         slack.clone(),
         Arc::new(FakeConnector::docs()),
     ];
-    let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
+    // Password sign-in on (docs/password-sign-in.md), with a test vault key.
+    let vault = pmos_toolserver::vault::KeyRing::from_spec(
+        &pmos_toolserver::vault::KeyRing::generate_spec("pw1"),
+    )
+    .unwrap();
+    let svc = Arc::new(
+        ToolService::new(catalog, stores, connectors)
+            .unwrap()
+            .with_passwords(Arc::new(
+                pmos_toolserver::password::PasswordService::new(vault).unwrap(),
+            )),
+    );
     let ts_keys = pmos_toolserver::assertion::parse_keys(
         &format!("web:toolserver:wt1:{WEB_TOOLS_KEY},console:toolserver:ct1:{CONSOLE_TOOLS_KEY}"),
         "the tool server",
@@ -296,6 +307,8 @@ async fn start_with(hostile: bool) -> Stack {
         session_idle: chrono::Duration::hours(8),
         session_max: chrono::Duration::hours(24),
         internal_bind: None,
+        password_login: true,
+        trusted_proxies: Vec::new(),
     };
     let web_clock = Arc::new(Mutex::new(Utc::now()));
     let clock = web_clock.clone();
@@ -1027,4 +1040,458 @@ async fn the_services_start_and_decide_with_no_team_yaml() {
         .collect();
     assert!(found.is_empty(), "{found:?}");
     s.decisions_from_the_user_database_only().await;
+}
+
+// --- Password sign-in (docs/password-sign-in.md) ----------------------------------------------
+
+/// The value of the cookie `name` that `headers` set, if any (empty when cleared).
+fn set_cookie(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| v.strip_prefix(&format!("{name}=")))
+        .map(|v| v.split(';').next().unwrap_or_default().to_string())
+        .next_back()
+}
+
+impl Stack {
+    /// A call with exactly these cookies (no session unless given), from the app's origin.
+    async fn with_cookies(
+        &self,
+        cookies: &[(&str, &str)],
+        csrf: Option<&str>,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value, reqwest::header::HeaderMap) {
+        let mut req = self
+            .http
+            .request(method.clone(), format!("{}{path}", self.web))
+            .header("origin", self.web.clone());
+        let jar: Vec<String> = cookies.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        if !jar.is_empty() {
+            req = req.header("cookie", jar.join("; "));
+        }
+        if let Some(c) = csrf {
+            req = req.header("x-pmos-csrf", c);
+        }
+        req = req.json(&body.unwrap_or_else(|| json!({})));
+        let res = req.send().await.unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let body = res.json().await.unwrap_or(Value::Null);
+        (status, body, headers)
+    }
+
+    /// A browser for the session cookie `headers` set.
+    async fn browser_from(&self, headers: &reqwest::header::HeaderMap) -> Browser {
+        let cookie = set_cookie(headers, "__Host-pmos").expect("a session cookie");
+        let mut b = Browser {
+            cookie,
+            csrf: String::new(),
+        };
+        let (status, me, _) = self.send(Some(&b), Method::GET, "/api/me", None).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        b.csrf = me["csrf_token"].as_str().unwrap().to_string();
+        b
+    }
+
+    /// The whole set-up with `code`: the enrolment secret, the recovery codes and the browser.
+    async fn password_setup(&self, code: &str, password: &str) -> (Vec<u8>, Vec<String>, Browser) {
+        let (status, begun, h) = self
+            .with_cookies(
+                &[],
+                None,
+                Method::POST,
+                "/api/auth/password/setup/begin",
+                Some(json!({"sign_in_name": "ana@example.com", "setup_code": code})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{begun}");
+        assert_eq!(begun["handle"], "ana");
+        assert_eq!(begun["password"]["min_length"], 12);
+        let setup = set_cookie(&h, "__Host-pmos-setup").unwrap();
+        let jar = [("__Host-pmos-setup", setup.as_str())];
+        let (status, body, _) = self
+            .with_cookies(
+                &jar,
+                None,
+                Method::POST,
+                "/api/auth/password/setup/password",
+                Some(json!({"password": "password1234"})),
+            )
+            .await;
+        assert_eq!(
+            (status, body["code"].as_str(), body["reason"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("weak_password"),
+                Some("common")
+            )
+        );
+        let (status, _, _) = self
+            .with_cookies(
+                &jar,
+                None,
+                Method::POST,
+                "/api/auth/password/setup/password",
+                Some(json!({"password": password})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, enrol, _) = self
+            .with_cookies(
+                &jar,
+                None,
+                Method::POST,
+                "/api/auth/password/setup/authenticator",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{enrol}");
+        assert!(enrol["otpauth_uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("otpauth://totp/"));
+        let secret = pmos_toolserver::password::totp::unbase32(enrol["secret"].as_str().unwrap())
+            .unwrap()
+            .to_vec();
+        let code = pmos_toolserver::password::totp::code_at(
+            &secret,
+            pmos_toolserver::password::totp::step_at(Utc::now().timestamp()),
+        );
+        let (status, done, h) = self
+            .with_cookies(
+                &jar,
+                None,
+                Method::POST,
+                "/api/auth/password/setup/confirm",
+                Some(json!({"code": code})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{done}");
+        assert_eq!(
+            set_cookie(&h, "__Host-pmos-setup").as_deref(),
+            Some(""),
+            "the setup cookie is cleared"
+        );
+        let codes: Vec<String> = done["recovery_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(codes.len(), 10);
+        let b = self.browser_from(&h).await;
+        (secret, codes, b)
+    }
+
+    /// Password, then a recovery code: a browser.
+    async fn password_sign_in(&self, password: &str, recovery: &str) -> Browser {
+        let (status, body, h) = self
+            .with_cookies(
+                &[],
+                None,
+                Method::POST,
+                "/api/auth/password/sign-in",
+                Some(json!({"sign_in_name": "ana@example.com", "password": password})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            set_cookie(&h, "__Host-pmos").is_none(),
+            "a password alone is no session"
+        );
+        let pending = set_cookie(&h, "__Host-pmos-pending").unwrap();
+        let (status, body, h) = self
+            .with_cookies(
+                &[("__Host-pmos-pending", &pending)],
+                None,
+                Method::POST,
+                "/api/auth/password/second-step",
+                Some(json!({"recovery_code": recovery})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["recovery_code_used"], true);
+        self.browser_from(&h).await
+    }
+}
+
+/// Password sign-in through `pmos-web` and the real tool server: an admin makes a setup code;
+/// Ana sets up (password, authenticator, a code) and is signed in; she signs in again with
+/// her password and the second step; the refusals look alike; a password change ends her
+/// other sessions; a reset ends every one; a deactivation in the user database ends the
+/// session within 10 seconds; and an address that keeps guessing is told to wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn password_sign_in_through_pmos_web_and_the_real_tool_server() {
+    let s = start().await;
+    let (status, providers, _) = s.send(None, Method::GET, "/api/auth/providers", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(providers["providers"], json!(["password", "dev"]));
+
+    // The admin makes a setup code (shown once); the Team page shows it pending.
+    let admin = s.login("stack-admin").await;
+    let (status, issued, _) = s
+        .send(
+            Some(&admin),
+            Method::POST,
+            "/api/admin/users/ana/password-setup-code",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+    assert_eq!(issued["kind"], "setup");
+    let code = issued["setup_code"].as_str().unwrap().to_string();
+    let (_, list, _) = s
+        .send(Some(&admin), Method::GET, "/api/admin/users", None)
+        .await;
+    let ana = list["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["handle"] == "ana")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (
+            ana["setup_code_pending"].as_bool(),
+            ana["password_set"].as_bool()
+        ),
+        (Some(true), Some(false))
+    );
+    // Never for oneself; a PM can't make one.
+    let (status, body, _) = s
+        .send(
+            Some(&admin),
+            Method::POST,
+            "/api/admin/users/stack-admin/password-setup-code",
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("self_change"))
+    );
+    let ben = s.login("ben").await;
+    let (status, _, _) = s
+        .send(
+            Some(&ben),
+            Method::POST,
+            "/api/admin/users/ana/password-setup-code",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Set-up: Ana is signed in at the end, and her status says so.
+    let (_secret, recovery, first) = s
+        .password_setup(&code, "correct horse battery staple")
+        .await;
+    let (status, st, _) = s
+        .send(Some(&first), Method::GET, "/api/auth/password/status", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{st}");
+    assert_eq!(
+        st,
+        json!({"enabled": true, "password_set": true, "second_step_enrolled": true, "recovery_codes_left": 10})
+    );
+    // The code is spent.
+    let (status, body, _) = s
+        .with_cookies(
+            &[],
+            None,
+            Method::POST,
+            "/api/auth/password/setup/begin",
+            Some(json!({"sign_in_name": "ana@example.com", "setup_code": code})),
+        )
+        .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("setup_failed"))
+    );
+
+    // Sign in twice more (two browsers), each with the password and then the second step.
+    let second = s
+        .password_sign_in("correct horse battery staple", &recovery[0])
+        .await;
+    let third = s
+        .password_sign_in("correct horse battery staple", &recovery[1])
+        .await;
+    // The refusals at the password step look alike: a wrong password, nobody, no password.
+    let mut answers = Vec::new();
+    for (name, pw) in [
+        ("ana@example.com", "not the right passphrase"),
+        ("nobody@example.com", "correct horse battery staple"),
+        ("ben@example.com", "correct horse battery staple"),
+    ] {
+        let (status, body, h) = s
+            .with_cookies(
+                &[],
+                None,
+                Method::POST,
+                "/api/auth/password/sign-in",
+                Some(json!({"sign_in_name": name, "password": pw})),
+            )
+            .await;
+        assert!(set_cookie(&h, "__Host-pmos-pending").is_none());
+        answers.push((status, body));
+    }
+    assert!(answers.iter().all(|a| a == &answers[0]), "{answers:?}");
+    assert_eq!(answers[0].0, StatusCode::UNAUTHORIZED);
+    assert_eq!(answers[0].1["code"], "sign_in_failed");
+    // A second step without the pending cookie: start again.
+    let (status, body, _) = s
+        .with_cookies(
+            &[],
+            None,
+            Method::POST,
+            "/api/auth/password/second-step",
+            Some(json!({"code": "123456"})),
+        )
+        .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("sign_in_expired"))
+    );
+
+    // A password change (from the second browser) ends the others; the changer keeps going.
+    let (status, body, _) = s
+        .with_cookies(
+            &[("__Host-pmos", &second.cookie)],
+            Some(&second.csrf),
+            Method::POST,
+            "/api/auth/password/change",
+            Some(
+                json!({"current_password": "correct horse battery staple", "code": "000000",
+                        "new_password": "a brand new passphrase"}),
+            ),
+        )
+        .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("reauth_failed")),
+        "{body}"
+    );
+    let secret = _secret;
+    let step = pmos_toolserver::password::totp::step_at(Utc::now().timestamp());
+    let mut changed = None;
+    for next in [step + 1, step] {
+        let code = pmos_toolserver::password::totp::code_at(&secret, next);
+        let (status, _, h) = s
+            .with_cookies(
+                &[("__Host-pmos", &second.cookie)],
+                Some(&second.csrf),
+                Method::POST,
+                "/api/auth/password/change",
+                Some(
+                    json!({"current_password": "correct horse battery staple", "code": code,
+                            "new_password": "a brand new passphrase"}),
+                ),
+            )
+            .await;
+        if status == StatusCode::NO_CONTENT {
+            changed = Some(h);
+            break;
+        }
+    }
+    let changed = changed.expect("the password change went through");
+    let after = s.browser_from(&changed).await;
+    for gone in [&first, &second, &third] {
+        let (status, _, _) = s.send(Some(gone), Method::GET, "/api/me", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "the other sessions ended");
+    }
+    let (status, _, _) = s.send(Some(&after), Method::GET, "/api/drafts", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A reset (a new code from the admin) ends every session of hers, the new one included.
+    let (status, issued, _) = s
+        .send(
+            Some(&admin),
+            Method::POST,
+            "/api/admin/users/ana/password-setup-code",
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, issued["kind"].as_str()),
+        (StatusCode::CREATED, Some("reset"))
+    );
+    let reset = issued["setup_code"].as_str().unwrap().to_string();
+    let (_, recovery, fresh) = s.password_setup(&reset, "the reset passphrase here").await;
+    let (status, _, _) = s.send(Some(&after), Method::GET, "/api/me", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, _) = s.send(Some(&fresh), Method::GET, "/api/me", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let later = s
+        .password_sign_in("the reset passphrase here", &recovery[0])
+        .await;
+
+    // A deactivation in the user database ends the session within 10 seconds.
+    s.users
+        .apply(
+            &pmos_toolserver::users::Actor::web("stack-admin"),
+            pmos_toolserver::users::Op::Deactivate {
+                handle: "ana".into(),
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    *s.web_clock.lock().unwrap() += chrono::Duration::seconds(10);
+    let (status, body, _) = s.send(Some(&later), Method::GET, "/api/drafts", None).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("not_a_member"))
+    );
+    let (status, body, _) = s
+        .with_cookies(
+            &[],
+            None,
+            Method::POST,
+            "/api/auth/password/sign-in",
+            Some(
+                json!({"sign_in_name": "ana@example.com", "password": "the reset passphrase here"}),
+            ),
+        )
+        .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("sign_in_failed"))
+    );
+
+    // An address that keeps guessing waits (20 refused guesses in 15 minutes; this test
+    // serves without peer addresses, so every request shares one count).
+    let mut limited = None;
+    for _ in 0..25 {
+        let (status, body, h) = s
+            .with_cookies(
+                &[],
+                None,
+                Method::POST,
+                "/api/auth/password/sign-in",
+                Some(
+                    json!({"sign_in_name": "nobody@example.com", "password": "guessing guessing"}),
+                ),
+            )
+            .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            limited = Some((body, h));
+            break;
+        }
+    }
+    let (body, h) = limited.expect("the address was told to wait");
+    assert_eq!(body["code"], "too_many_attempts");
+    assert!(h.get("retry-after").is_some());
+
+    // Writes without the app's origin are refused before anything is asked.
+    let res = s
+        .http
+        .post(format!("{}/api/auth/password/sign-in", s.web))
+        .json(&json!({"sign_in_name": "ana@example.com", "password": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
 }

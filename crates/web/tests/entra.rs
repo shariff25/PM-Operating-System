@@ -302,6 +302,8 @@ async fn harness_with(change: impl FnOnce(&mut Config)) -> Harness {
         session_idle: Duration::hours(8),
         session_max: Duration::hours(24),
         internal_bind: None,
+        password_login: false,
+        trusted_proxies: Vec::new(),
     };
     change(&mut config);
     let clock = Arc::new(Mutex::new(Utc::now()));

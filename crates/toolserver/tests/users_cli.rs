@@ -215,3 +215,67 @@ async fn host_commands_record_the_host_user() {
     );
     pg.drop_schema().await;
 }
+
+/// `password-setup` (docs/password-sign-in.md): the host issues a setup code, for an Admin too,
+/// shows it once, and records the host user; the code itself is in no log or audit event.
+#[tokio::test]
+async fn the_host_issues_a_password_setup_code() {
+    let Some(pg) = TestPg::new().await else {
+        return;
+    };
+    let url = pg.schema_url();
+    let env = [
+        ("PMOS_HOST_USER", "opsuser"),
+        ("PMOS_DATABASE_URL", url.as_str()),
+    ];
+    let o = users(&BOOTSTRAP, &env);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    // raj is an Admin: only the host may issue his code.
+    let o = users(&["password-setup", "raj"], &env);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(out.contains("setup code for `raj`"), "{out}");
+    assert!(out.contains("recorded as host user opsuser"), "{out}");
+    let code = out
+        .lines()
+        .find(|l| l.len() == 23 && l.matches('-').count() == 3)
+        .expect("the code, on a line of its own")
+        .to_string();
+    // A refusal by the rules: no such user, exit 3.
+    let o = users(&["password-setup", "nobody"], &env);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(text(&o).1.contains("refused (not_found)"));
+    // Without a host user, nothing runs.
+    let o = users(&["password-setup", "raj"], &[env[1]]);
+    assert_eq!(o.status.code(), Some(2));
+    let (host_user, change, detail): (Option<String>, String, Option<String>) = sqlx::query_as(
+        "SELECT host_user, change, detail FROM role_changes WHERE change = 'issue_password_code'",
+    )
+    .fetch_one(pg.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        (host_user.as_deref(), change.as_str(), detail.as_deref()),
+        (Some("opsuser"), "issue_password_code", Some("setup"))
+    );
+    let details: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT detail FROM audit_events WHERE tool = 'password.setup_code' ORDER BY id",
+    )
+    .fetch_all(pg.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        details,
+        vec![
+            Some("host_user opsuser; setup".to_string()),
+            Some("host_user opsuser; not_found".to_string())
+        ]
+    );
+    let stored: Vec<String> = sqlx::query_scalar("SELECT code_hash FROM password_setup_codes")
+        .fetch_all(pg.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(!stored[0].contains(&code) && stored[0].len() == 64);
+    pg.drop_schema().await;
+}
