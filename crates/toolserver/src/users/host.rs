@@ -139,6 +139,9 @@ enum Command {
     },
     /// Every user: handle, status, roles, flags.
     List,
+    /// A one-time password setup (or reset) code for a user, shown once
+    /// (docs/password-sign-in.md). The only way to issue one for an Admin or Auditor.
+    PasswordSetup { handle: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -231,6 +234,7 @@ enum Action {
     List,
     Export,
     ExceptionStatus,
+    PasswordSetup(String),
 }
 
 impl Action {
@@ -431,6 +435,7 @@ pub async fn run(args: &[String], io: Io<'_>) -> i32 {
             format: ExportFormat::TeamYaml,
         } => Action::Export,
         Command::List => Action::List,
+        Command::PasswordSetup { handle } => Action::PasswordSetup(handle),
     };
 
     let store = match PgStore::connect(&database_url).await {
@@ -561,6 +566,36 @@ pub async fn run(args: &[String], io: Io<'_>) -> i32 {
                 FAILED
             }
         },
+        Action::PasswordSetup(handle) => {
+            let actor = Actor::host(host_user.clone());
+            match crate::password::issue_setup_code(store.passwords(), &actor, &handle, now).await
+            {
+                Ok(issued) => {
+                    say!(
+                        out,
+                        "{} code for `{}` (shown once; it works once, until {}):",
+                        issued.kind.as_str(),
+                        issued.handle,
+                        issued.expires_at.format("%Y-%m-%d %H:%M UTC")
+                    );
+                    say!(out, "{}", issued.code.expose());
+                    say!(
+                        out,
+                        "give it to them yourself; they open the web app's set-up page with their sign-in name and this code"
+                    );
+                    say!(out, "recorded as host user {}", host_user.as_str());
+                    DONE
+                }
+                Err(e @ crate::password::PwError::Unavailable(_)) => {
+                    say!(err, "{}", e.message());
+                    FAILED
+                }
+                Err(e) => {
+                    say!(err, "refused ({}): {}", e.code(), e.message());
+                    REFUSED
+                }
+            }
+        }
         Action::ExceptionStatus => match store.directory(now).await {
             Ok(dir) => {
                 match &dir.exception {

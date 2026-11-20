@@ -373,7 +373,23 @@ async fn resolve(
     };
     match lookup.find(&dir) {
         Some(u) => {
-            let mut res = Json(resolve_entry(u)).into_response();
+            let mut v = resolve_entry(u);
+            if client == Client::Web {
+                // A password session holds the credential's epoch and ends when it moves
+                // (docs/password-sign-in.md): pmos-web's answer carries it; `null` without one.
+                match state
+                    .svc
+                    .stores()
+                    .users
+                    .passwords()
+                    .password_status(&u.handle, Utc::now())
+                    .await
+                {
+                    Ok(s) => v["password_epoch"] = json!(s.password_set.then_some(s.epoch)),
+                    Err(e) => return unavailable(e),
+                }
+            }
+            let mut res = Json(v).into_response();
             res.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             res

@@ -80,6 +80,7 @@ use pmos_contract::Sensitivity;
 
 mod admin;
 pub mod directory;
+mod password;
 mod reviews;
 mod users;
 
@@ -285,7 +286,9 @@ pub fn router_full(
         // The Admin API (`users.rs`): pmos-web's writes, and the console's listing.
         .merge(users::routes(state.clone()))
         // The Reviewer's inbox, reads and recommendations (`reviews.rs`): pmos-web's only.
-        .merge(reviews::routes(state.clone()));
+        .merge(reviews::routes(state.clone()))
+        // Password sign-in (`password.rs`): pmos-web's only, in assertion `require` only.
+        .merge(password::routes(state.clone()));
 
     Router::new()
         // Liveness: the process answers. Readiness: its dependencies do too.

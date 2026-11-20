@@ -210,12 +210,32 @@ async fn main() -> Result<()> {
     }
     let skills = catalog.skills().count();
     let bots = catalog.roster().bots().count();
-    let svc = ToolService::new(catalog, stores, connectors)
+    let mut svc = ToolService::new(catalog, stores, connectors)
         .map_err(anyhow::Error::msg)?
         .with_people(people)
         .with_ledger_expire_days(config.ledger_expire_days)
         .with_slack_draft_ttl_hours(config.slack_draft_ttl_hours)
         .with_audit_retention_days(config.audit_retention_days);
+    // Password sign-in (docs/password-sign-in.md): on when the vault has a key to seal
+    // authenticator secrets with; its routes also need assertion `require`.
+    match &config.password_keys {
+        Some(keys) => {
+            let passwords =
+                pmos_toolserver::password::PasswordService::new(keys.clone()).map_err(anyhow::Error::msg)?;
+            let p = passwords.params();
+            tracing::info!(
+                argon2id_m_kib = p.m_kib,
+                argon2id_t = p.t,
+                argon2id_p = p.p,
+                "password sign-in available (pmos-web turns it on with PMOS_WEB_PASSWORD_LOGIN=1)"
+            );
+            svc = svc.with_passwords(Arc::new(passwords));
+        }
+        None => tracing::info!("password sign-in off: no PMOS_VAULT_KEY"),
+    }
+    if let Some((handle, file)) = &config.dev_password_setup {
+        dev_password_setup(&svc, handle, file).await?;
+    }
     let svc = Arc::new(svc);
     // Audit retention (docs/audit-retention.md): daily, the first run a few minutes after
     // start-up; the database itself holds every rule.
@@ -313,6 +333,39 @@ async fn main() -> Result<()> {
             cancel.cancel();
         })
         .await?;
+    Ok(())
+}
+
+/// Development only (config.rs refuses it anywhere else): a setup code for `handle`, issued as
+/// the host would, written to a new file only its owner can read, so a test stack can print it.
+async fn dev_password_setup(
+    svc: &ToolService,
+    handle: &str,
+    file: &std::path::Path,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let host = pmos_toolserver::users::HostUser::parse("dev")
+        .ok_or_else(|| anyhow::anyhow!("host user"))?;
+    let issued = pmos_toolserver::password::issue_setup_code(
+        svc.stores().users.passwords(),
+        &pmos_toolserver::users::Actor::host(host),
+        handle,
+        Utc::now(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("PMOS_DEV_PASSWORD_SETUP_FOR: {}", e.message()))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(file)
+        .with_context(|| format!("PMOS_DEV_PASSWORD_SETUP_FILE {}", file.display()))?;
+    writeln!(f, "{}", issued.code.expose())?;
+    tracing::warn!(
+        user = %handle,
+        "DEVELOPMENT: a password setup code was written to PMOS_DEV_PASSWORD_SETUP_FILE"
+    );
     Ok(())
 }
 
