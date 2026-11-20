@@ -251,6 +251,22 @@ if docker compose version >/dev/null 2>&1; then
   done
   [[ "$full" == *'console=test-'* && "$full" == *'web=test-'* ]] ||
     fail "the runtime's tokens lack web= or console="
+  # The first Microsoft sign-in (U1): the tool server gets the web app's tenant and client id
+  # (it validates the ID token itself), never its client secret.
+  entra_env="$WORK/entra.env"
+  sed -e 's|^PMOS_WEB_ENTRA_TENANT_ID=.*|PMOS_WEB_ENTRA_TENANT_ID=11111111-2222-3333-4444-555555555555|' \
+    -e 's|^PMOS_WEB_ENTRA_CLIENT_ID=.*|PMOS_WEB_ENTRA_CLIENT_ID=0b7f0c6e-1111-4222-8333-444455556666|' \
+    -e 's|^PMOS_WEB_ENTRA_CLIENT_SECRET=.*|PMOS_WEB_ENTRA_CLIENT_SECRET=entra-secret-for-the-render-check|' \
+    "$WORK/full.env" >"$entra_env"
+  entra=$(render "$entra_env" --profile web) || fail "compose doesn't render with Entra settings"
+  # Only the tool server's environment has PMOS_ENTRA_* (the web app's is PMOS_WEB_ENTRA_*).
+  [[ "$entra" == *'PMOS_ENTRA_TENANT_ID: 11111111-2222-3333-4444-555555555555'* ]] ||
+    fail "the tool server doesn't get the Entra tenant id"
+  [[ "$entra" == *'PMOS_ENTRA_CLIENT_ID: 0b7f0c6e-1111-4222-8333-444455556666'* ]] ||
+    fail "the tool server doesn't get the Entra client id"
+  [ "$(grep -c 'entra-secret-for-the-render-check' <<<"$entra")" = 1 ] ||
+    fail "the Entra client secret reaches more than the web app"
+  [[ "$entra" != *PMOS_ENTRA_CLIENT_SECRET* ]] || fail "the tool server gets the Entra client secret"
   # Production compose never passes the development override (R3), even when set.
   echo "PMOS_ASSERTION_INSECURE_OFF=1" >>"$WORK/full.env"
   full=$(render "$WORK/full.env" --profile web --profile console --profile slack) ||

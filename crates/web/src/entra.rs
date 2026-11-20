@@ -14,45 +14,44 @@
 //!    the optional `acct` claim must be present (else `entra_misconfigured`) and `0`, a member
 //!    of the tenant (a guest, `1`, is `not_a_member`); and `idp`, when present, must name this
 //!    tenant (the token's own issuer, or this tenant's v1 issuer `https://sts.windows.net/<tid>/`),
-//!    else `not_a_member`.
+//!    else `not_a_member`. These checks live in `pmos-entra` (`crates/entra`), the one copy
+//!    the tool server uses too.
 //! 3. The app looks the person up in the user database by `(tid, oid)`, and only for a first
-//!    link by `preferred_username`. The `email` claim is never read. Entra never decides
-//!    membership or roles.
+//!    link by `preferred_username`. A first link sends the tool server the raw ID token and
+//!    the flow's `nonce`, never a bare `(tid, oid)`: the tool server validates the token
+//!    itself and links only the identity it names. The `email` claim is never read. Entra
+//!    never decides membership or roles.
 //!
 //! Tokens, codes, verifiers and the client secret are never logged; failures log a short
 //! fixed reason.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration as StdDuration, Instant};
+use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use pmos_contract::model::valid_email;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::auth::{AuthProvider, Claimed, SignInError, SignInInput};
 use crate::session;
 
-/// Microsoft's public cloud.
-pub const DEFAULT_AUTHORITY: &str = "https://login.microsoftonline.com";
+/// The ID token rules, shared with the tool server (`crates/entra`): one copy, so the two
+/// can't drift.
+pub use pmos_entra::{Failure, Identity, Tenant, DEFAULT_AUTHORITY, SKEW_SECONDS};
+
 /// The cookie that carries a sign-in in progress.
 pub const FLOW_COOKIE: &str = "__Host-pmos-entra";
 /// How long a sign-in may take, from `/api/auth/login` to the callback.
 pub const FLOW_SECONDS: i64 = 600;
-/// The clock skew allowed on `exp`, `nbf` and `iat`.
-pub const SKEW_SECONDS: i64 = 60;
 /// The scopes asked for: an ID token with the person's `oid` and `preferred_username`
 /// (`profile`), nothing else. Not `email`: that claim is never read.
 pub const SCOPES: &str = "openid profile";
-/// How long the discovery document and the keys are kept before a fresh fetch.
-const METADATA_TTL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
-/// The largest discovery, JWKS or token response read.
+/// The largest token response read.
 const MAX_RESPONSE: usize = 256 * 1024;
 /// The longest post-login path kept.
 const MAX_RETURN: usize = 512;
@@ -125,102 +124,46 @@ impl EntraConfig {
             "PMOS_WEB_PUBLIC_URL is required with Entra ID sign-in: the redirect URI is \
              <PMOS_WEB_PUBLIC_URL>/api/auth/callback",
         )?;
-        if !secure_or_loopback(public_url) {
+        if !pmos_entra::secure_or_loopback(public_url) {
             return Err(
                 "PMOS_WEB_PUBLIC_URL must be https with Entra ID sign-in (http only on loopback)"
                     .into(),
             );
         }
-        let guid = |k: &str| -> Result<String, String> {
-            let v = set(k).unwrap_or_default().trim().to_ascii_lowercase();
-            if matches!(v.as_str(), "common" | "organizations" | "consumers") {
-                return Err(format!(
-                    "{k} must be your tenant's own id: `{v}` is a multi-tenant authority, which \
-                     PM OS refuses"
-                ));
-            }
-            if !is_guid(&v) {
-                return Err(format!(
-                    "{k} must be a GUID such as 00000000-0000-0000-0000-000000000000"
-                ));
-            }
-            Ok(v)
-        };
-        let tenant_id = guid("PMOS_WEB_ENTRA_TENANT_ID")?;
-        let client_id = guid("PMOS_WEB_ENTRA_CLIENT_ID")?;
+        let tenant = Tenant::from_settings(
+            [VARS[0], VARS[1], AUTHORITY_VAR],
+            &set(VARS[0]).unwrap_or_default(),
+            &set(VARS[1]).unwrap_or_default(),
+            set(AUTHORITY_VAR).as_deref(),
+        )?;
         let client_secret = set("PMOS_WEB_ENTRA_CLIENT_SECRET")
             .unwrap_or_default()
             .trim()
             .to_string();
-        let authority = match set(AUTHORITY_VAR) {
-            None => DEFAULT_AUTHORITY.to_string(),
-            Some(a) => {
-                let url = reqwest::Url::parse(a.trim())
-                    .map_err(|_| format!("{AUTHORITY_VAR} must be a URL"))?;
-                if url.path() != "/"
-                    || url.query().is_some()
-                    || !url.username().is_empty()
-                    || url.password().is_some()
-                {
-                    return Err(format!(
-                        "{AUTHORITY_VAR} must be an origin such as {DEFAULT_AUTHORITY}, with no \
-                         path"
-                    ));
-                }
-                let origin = url.origin().ascii_serialization();
-                if !secure_or_loopback(&origin) {
-                    return Err(format!(
-                        "{AUTHORITY_VAR} must be https unless it is loopback"
-                    ));
-                }
-                origin
-            }
-        };
         Ok(Some(Self {
-            tenant_id,
-            client_id,
+            tenant_id: tenant.tenant_id,
+            client_id: tenant.client_id,
             client_secret,
-            authority,
+            authority: tenant.authority,
             redirect_uri: format!("{}/api/auth/callback", public_url.trim_end_matches('/')),
-            jwks_refetch_after: StdDuration::from_secs(60),
+            jwks_refetch_after: tenant.jwks_refetch_after,
         }))
+    }
+
+    /// The tenant and application tokens must be for.
+    pub fn tenant(&self) -> Tenant {
+        Tenant {
+            tenant_id: self.tenant_id.clone(),
+            client_id: self.client_id.clone(),
+            authority: self.authority.clone(),
+            jwks_refetch_after: self.jwks_refetch_after,
+        }
     }
 
     /// The only issuer accepted: `<authority>/<tenant id>/v2.0`.
     pub fn issuer(&self) -> String {
-        format!("{}/{}/v2.0", self.authority, self.tenant_id)
+        self.tenant().issuer()
     }
-
-    fn discovery_url(&self) -> String {
-        format!("{}/.well-known/openid-configuration", self.issuer())
-    }
-}
-
-fn is_guid(v: &str) -> bool {
-    let groups: Vec<&str> = v.split('-').collect();
-    groups.len() == 5
-        && groups
-            .iter()
-            .zip([8, 4, 4, 4, 12])
-            .all(|(g, n)| g.len() == n && g.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
-fn is_loopback_host(url: &reqwest::Url) -> bool {
-    match url.host_str() {
-        Some(h) if h.eq_ignore_ascii_case("localhost") => true,
-        Some(h) => h
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback()),
-        None => false,
-    }
-}
-
-/// `https`, or `http` to a loopback host.
-fn secure_or_loopback(value: &str) -> bool {
-    reqwest::Url::parse(value)
-        .is_ok_and(|u| u.scheme() == "https" || (u.scheme() == "http" && is_loopback_host(&u)))
 }
 
 /// The post-login path: a same-origin relative path (`/…`, never `//…` or `/\…`, no
@@ -260,47 +203,20 @@ pub struct Started {
     pub return_to: String,
 }
 
-/// Why a sign-in didn't finish. `reason()` is what the app is told
-/// (`/#/signed-out?reason=…`); the `&'static str` is a fixed phrase for the log.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Failure {
-    /// No flow cookie, or one past its ten minutes.
-    Expired,
-    /// The person cancelled at Microsoft (`error=access_denied`).
-    Cancelled,
-    /// Microsoft or the network failed.
-    Unavailable(&'static str),
-    /// Anything else: a bad state, code or token.
-    Failed(&'static str),
-    /// The token has no `acct` claim: the app registration doesn't add the optional claim,
-    /// so PM OS can't tell a member from a guest and refuses everyone (`entra_misconfigured`).
-    Misconfigured,
-    /// A guest (`acct` not `0`), or an account from another identity provider (`idp`):
-    /// `not_a_member`, before any lookup.
-    NotMember(&'static str),
+/// A validated sign-in: who the ID token names, and the token itself, which the tool server
+/// validates again for a first link (it never takes `pmos-web`'s word for who someone is).
+/// `Debug` shows neither.
+pub struct SignedIn {
+    pub identity: Identity,
+    pub id_token: String,
 }
 
-impl Failure {
-    pub fn reason(&self) -> &'static str {
-        match self {
-            Failure::Expired => "expired",
-            Failure::Cancelled => "cancelled",
-            Failure::Unavailable(_) => "unavailable",
-            Failure::Failed(_) => "failed",
-            Failure::Misconfigured => "entra_misconfigured",
-            Failure::NotMember(_) => "not_a_member",
-        }
-    }
-
-    pub fn why(&self) -> &'static str {
-        match self {
-            Failure::Expired => "no sign-in in progress, or it expired",
-            Failure::Cancelled => "cancelled at the identity provider",
-            Failure::Misconfigured => {
-                "the ID token has no acct claim (add it in Token configuration)"
-            }
-            Failure::Unavailable(w) | Failure::Failed(w) | Failure::NotMember(w) => w,
-        }
+impl std::fmt::Debug for SignedIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignedIn")
+            .field("identity", &self.identity)
+            .field("id_token", &"<redacted>")
+            .finish()
     }
 }
 
@@ -334,39 +250,6 @@ pub fn challenge(verifier: &str) -> String {
     b64(&Sha256::digest(verifier.as_bytes()))
 }
 
-// Provider metadata and keys.
-
-#[derive(Clone, Deserialize)]
-struct Discovery {
-    issuer: String,
-    authorization_endpoint: String,
-    token_endpoint: String,
-    jwks_uri: String,
-}
-
-#[derive(Deserialize)]
-struct Jwks {
-    keys: Vec<Jwk>,
-}
-
-#[derive(Deserialize)]
-struct Jwk {
-    kty: String,
-    kid: Option<String>,
-    #[serde(rename = "use")]
-    use_: Option<String>,
-    alg: Option<String>,
-    n: Option<String>,
-    e: Option<String>,
-}
-
-#[derive(Default)]
-struct KeyCache {
-    /// RSA signing keys by `kid`: `(n, e)`.
-    keys: HashMap<String, (String, String)>,
-    fetched: Option<Instant>,
-}
-
 #[derive(Deserialize)]
 struct TokenResponse {
     id_token: Option<String>,
@@ -377,73 +260,15 @@ struct TokenError {
     error: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Audience {
-    One(String),
-    Many(Vec<String>),
-}
-
-#[derive(Deserialize)]
-struct IdClaims {
-    iss: String,
-    aud: Audience,
-    exp: i64,
-    iat: i64,
-    nbf: Option<i64>,
-    nonce: Option<String>,
-    tid: Option<String>,
-    /// The person's object id in the tenant: stable, never reassigned, unlike a name.
-    oid: Option<String>,
-    /// The optional claim: `0` for a member of the tenant, `1` for a guest. A number in
-    /// practice; a string `"0"` is read the same.
-    acct: Option<serde_json::Value>,
-    /// The identity provider that authenticated the person, when it isn't the tenant itself
-    /// (absent, or equal to the issuer, for a member).
-    idp: Option<String>,
-    preferred_username: Option<String>,
-    // `email` is deliberately not read: Microsoft says it is unverified and mutable, and it
-    // must never decide who someone is (`docs/entra-sign-in.md`).
-}
-
-/// Who a checked ID token names: its `(tid, oid)`, the key PM OS signs people in by, and its
-/// `preferred_username`, used only to find a person for their first link. `Debug` shows
-/// neither the `oid` nor the name.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Identity {
-    /// The `oid` claim, lower-cased: always a GUID.
-    pub oid: String,
-    /// The `tid` claim, lower-cased: always the configured tenant.
-    pub tid: String,
-    /// The `preferred_username` claim, trimmed and lower-cased, when it is an email address.
-    pub preferred_username: Option<String>,
-}
-
-impl std::fmt::Debug for Identity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Identity")
-            .field("oid", &"<redacted>")
-            .field("tid", &self.tid)
-            .field("preferred_username", &"<redacted>")
-            .finish()
-    }
-}
-
-/// Is `acct` a member's (`0`)? `Some(false)` for a guest or any other value.
-fn acct_is_member(acct: &serde_json::Value) -> bool {
-    acct.as_i64() == Some(0) || acct.as_str().map(str::trim) == Some("0")
-}
-
 /// The Entra ID provider: builds the authorize redirect, checks the callback's flow cookie,
-/// exchanges the code and validates the ID token.
+/// exchanges the code and validates the ID token (through [`pmos_entra::Verifier`]).
 pub struct Entra {
     config: EntraConfig,
     http: reqwest::Client,
+    verifier: pmos_entra::Verifier,
     /// Signs the flow cookie: derived from the client secret, so every `pmos-web` with the
     /// same configuration accepts the others' cookies and nothing new needs storing.
     flow_key: [u8; 32],
-    metadata: tokio::sync::Mutex<Option<(Instant, Discovery)>>,
-    keys: tokio::sync::Mutex<KeyCache>,
     /// The hashes of `state`s already used, with their expiry: a state works once.
     used: Mutex<HashMap<[u8; 32], i64>>,
 }
@@ -455,6 +280,7 @@ impl Entra {
             .timeout(StdDuration::from_secs(10))
             .build()
             .map_err(|e| format!("HTTP client: {e}"))?;
+        let verifier = pmos_entra::Verifier::new(config.tenant())?;
         let mut mac = HmacSha256::new_from_slice(config.client_secret.as_bytes())
             .expect("HMAC takes any key length");
         mac.update(b"pmos-web entra flow cookie v1");
@@ -462,9 +288,8 @@ impl Entra {
         Ok(Self {
             config,
             http,
+            verifier,
             flow_key,
-            metadata: tokio::sync::Mutex::new(None),
-            keys: tokio::sync::Mutex::new(KeyCache::default()),
             used: Mutex::new(HashMap::new()),
         })
     }
@@ -485,7 +310,7 @@ impl Entra {
         now: DateTime<Utc>,
         return_to: Option<&str>,
     ) -> Result<(String, String), Failure> {
-        let meta = self.discovery().await?;
+        let meta = self.verifier.discovery().await?;
         let flow = Flow {
             s: session::random_token(),
             n: session::random_token(),
@@ -556,103 +381,9 @@ impl Entra {
         })
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(
-        &self,
-        url: &str,
-        what: &'static str,
-    ) -> Result<T, Failure> {
-        let res = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|_| Failure::Unavailable(what))?;
-        if !res.status().is_success() {
-            return Err(Failure::Unavailable(what));
-        }
-        let body = res.bytes().await.map_err(|_| Failure::Unavailable(what))?;
-        if body.len() > MAX_RESPONSE {
-            return Err(Failure::Unavailable(what));
-        }
-        serde_json::from_slice(&body).map_err(|_| Failure::Unavailable(what))
-    }
-
-    /// The tenant's discovery document, cached for a day. Its issuer must be exactly the
-    /// configured one, and every endpoint on the authority's own origin.
-    async fn discovery(&self) -> Result<Discovery, Failure> {
-        let mut cached = self.metadata.lock().await;
-        if let Some((at, meta)) = cached.as_ref() {
-            if at.elapsed() < METADATA_TTL {
-                return Ok(meta.clone());
-            }
-        }
-        let meta: Discovery = self
-            .get_json(
-                &self.config.discovery_url(),
-                "discovery document unavailable",
-            )
-            .await?;
-        if meta.issuer != self.config.issuer() {
-            tracing::error!(
-                expected = %self.config.issuer(),
-                "Entra discovery document names another issuer"
-            );
-            return Err(Failure::Unavailable("discovery issuer mismatch"));
-        }
-        let ours = |u: &str| {
-            reqwest::Url::parse(u)
-                .is_ok_and(|u| u.origin().ascii_serialization() == self.config.authority)
-        };
-        if ![
-            &meta.authorization_endpoint,
-            &meta.token_endpoint,
-            &meta.jwks_uri,
-        ]
-        .iter()
-        .all(|u| ours(u))
-        {
-            tracing::error!("Entra discovery document points off the authority");
-            return Err(Failure::Unavailable(
-                "discovery endpoints off the authority",
-            ));
-        }
-        *cached = Some((Instant::now(), meta.clone()));
-        Ok(meta)
-    }
-
-    /// The key a token's `kid` names. An unknown `kid` refetches the keys, at most once per
-    /// `jwks_refetch_after`, so a stream of bad tokens can't hammer Microsoft.
-    async fn key(&self, kid: &str) -> Result<DecodingKey, Failure> {
-        let mut cache = self.keys.lock().await;
-        let stale = cache.fetched.is_none_or(|at| at.elapsed() >= METADATA_TTL);
-        let may_refetch = cache
-            .fetched
-            .is_none_or(|at| at.elapsed() >= self.config.jwks_refetch_after);
-        if stale || (!cache.keys.contains_key(kid) && may_refetch) {
-            let meta = self.discovery().await?;
-            let jwks: Jwks = self.get_json(&meta.jwks_uri, "keys unavailable").await?;
-            cache.keys = jwks
-                .keys
-                .into_iter()
-                .filter(|k| {
-                    k.kty == "RSA"
-                        && k.use_.as_deref().is_none_or(|u| u == "sig")
-                        && k.alg.as_deref().is_none_or(|a| a == "RS256")
-                })
-                .filter_map(|k| Some((k.kid?, (k.n?, k.e?))))
-                .collect();
-            cache.fetched = Some(Instant::now());
-        }
-        let (n, e) = cache
-            .keys
-            .get(kid)
-            .ok_or(Failure::Failed("unknown signing key"))?;
-        DecodingKey::from_rsa_components(n, e).map_err(|_| Failure::Failed("unusable signing key"))
-    }
-
     /// Exchange the code for an ID token (client secret and PKCE verifier).
     async fn exchange(&self, code: &str, verifier: &str) -> Result<String, Failure> {
-        let meta = self.discovery().await?;
+        let meta = self.verifier.discovery().await?;
         let res = self
             .http
             .post(&meta.token_endpoint)
@@ -696,12 +427,6 @@ impl Entra {
             .ok_or(Failure::Failed("no id token"))
     }
 
-    /// This tenant's v1 issuer, `https://sts.windows.net/<tid>/`: what `idp` may also hold for
-    /// a member (it names the same tenant).
-    fn v1_issuer(&self) -> String {
-        format!("https://sts.windows.net/{}/", self.config.tenant_id)
-    }
-
     /// Validate an ID token and return who it names: `(tid, oid)` and `preferred_username`.
     pub async fn validate_identity(
         &self,
@@ -709,101 +434,23 @@ impl Entra {
         nonce: &str,
         now: DateTime<Utc>,
     ) -> Result<Identity, Failure> {
-        let header =
-            jsonwebtoken::decode_header(token).map_err(|_| Failure::Failed("malformed token"))?;
-        if header.alg != Algorithm::RS256 {
-            return Err(Failure::Failed("token not RS256"));
-        }
-        let kid = header.kid.ok_or(Failure::Failed("token without kid"))?;
-        let key = self.key(&kid).await?;
-        // The signature only: every claim is checked below against the app's clock.
-        let mut v = Validation::new(Algorithm::RS256);
-        v.validate_exp = false;
-        v.validate_nbf = false;
-        v.validate_aud = false;
-        v.required_spec_claims.clear();
-        let claims = jsonwebtoken::decode::<IdClaims>(token, &key, &v)
-            .map_err(|_| Failure::Failed("token signature or shape"))?
-            .claims;
-        if claims.iss != self.config.issuer() {
-            return Err(Failure::Failed("token issuer"));
-        }
-        let aud_ok = match &claims.aud {
-            Audience::One(a) => *a == self.config.client_id,
-            Audience::Many(list) => list.len() == 1 && list[0] == self.config.client_id,
-        };
-        if !aud_ok {
-            return Err(Failure::Failed("token audience"));
-        }
-        let t = now.timestamp();
-        if t >= claims.exp + SKEW_SECONDS {
-            return Err(Failure::Failed("token expired"));
-        }
-        if claims.nbf.is_some_and(|nbf| t + SKEW_SECONDS < nbf) {
-            return Err(Failure::Failed("token not yet valid"));
-        }
-        if t + SKEW_SECONDS < claims.iat || claims.iat > claims.exp {
-            return Err(Failure::Failed("token issued in the future"));
-        }
-        if !claims
-            .nonce
-            .as_deref()
-            .is_some_and(|n| pmos_runtime::token_eq(n, nonce))
-        {
-            return Err(Failure::Failed("token nonce"));
-        }
-        if !claims
-            .tid
-            .as_deref()
-            .is_some_and(|tid| tid.eq_ignore_ascii_case(&self.config.tenant_id))
-        {
-            return Err(Failure::Failed("token tenant"));
-        }
-        let oid = claims
-            .oid
-            .map(|o| o.trim().to_ascii_lowercase())
-            .filter(|o| is_guid(o))
-            .ok_or(Failure::Failed("token without an object id"))?;
-        // Members only (spec §7): the optional `acct` claim must be there, so a registration
-        // that forgot it fails closed rather than letting guests through.
-        match &claims.acct {
-            None => return Err(Failure::Misconfigured),
-            Some(acct) if !acct_is_member(acct) => {
-                return Err(Failure::NotMember("a guest account"))
-            }
-            Some(_) => {}
-        }
-        // `idp` is absent for a member, or names this tenant; anything else is someone who
-        // signed in with another identity provider.
-        if let Some(idp) = claims.idp.as_deref().map(str::trim) {
-            if idp != claims.iss && !idp.eq_ignore_ascii_case(&self.v1_issuer()) {
-                return Err(Failure::NotMember("another identity provider"));
-            }
-        }
-        let preferred_username = claims
-            .preferred_username
-            .map(|e| e.trim().to_lowercase())
-            .filter(|e| valid_email(e));
-        Ok(Identity {
-            oid,
-            tid: self.config.tenant_id.to_ascii_lowercase(),
-            preferred_username,
-        })
+        self.verifier.validate(token, nonce, now).await
     }
 
-    /// Exchange the code and validate the ID token: who it names.
+    /// Exchange the code and validate the ID token: who it names, and the token.
     pub async fn sign_in_identity(
         &self,
         code: &str,
         nonce: &str,
         verifier: &str,
         now: DateTime<Utc>,
-    ) -> Result<Identity, Failure> {
+    ) -> Result<SignedIn, Failure> {
         if code.is_empty() || code.len() > 4096 {
             return Err(Failure::Failed("malformed code"));
         }
-        let token = self.exchange(code, verifier).await?;
-        self.validate_identity(&token, nonce, now).await
+        let id_token = self.exchange(code, verifier).await?;
+        let identity = self.validate_identity(&id_token, nonce, now).await?;
+        Ok(SignedIn { identity, id_token })
     }
 }
 
@@ -829,7 +476,7 @@ impl AuthProvider for Entra {
         };
         // The Entra key's `oid`: the callback looks the person up by `(tid, oid)` itself.
         match self.sign_in_identity(code, nonce, verifier, *now).await {
-            Ok(identity) => Ok(Claimed(identity.oid)),
+            Ok(signed) => Ok(Claimed(signed.identity.oid)),
             Err(f) => Err(SignInError::Rejected(f)),
         }
     }

@@ -501,6 +501,10 @@ pub async fn open(
     }
 
     let branch = proposals::branch_name(kind, user, Utc::now());
+    // The title becomes the merge commit's subject and the reason sits in the body: neither
+    // may close an issue when the pull request merges (L11).
+    let title = proposals::no_closing_keywords(&title);
+    let reason = proposals::no_closing_keywords(&reason);
     let full_title = format!("PM OS {}: {title}", kind.as_str());
     let message = format!("{full_title}\n\nProposed in PM OS by {user}.");
     let pr_body = pr_body(
@@ -652,19 +656,22 @@ pub async fn list(
 
 /// `GET /internal/admin/protection?user=<viewer>`: whether the content branch requires
 /// reviews, as far as the viewer's own GitHub account can read it. Best effort, never an
-/// error: `verified: false` when it can't tell.
+/// error. `verified: true` only when reviews are required **and** GitHub's answer showed that
+/// admins are not exempt and nobody may bypass (UM4), or when no review is required at all (a
+/// known gap the screen warns about); anything the answer left out is `null` in
+/// `admins_enforced` / `bypass_allowed` and `verified: false`.
 pub async fn protection(
     oauth: Option<&Arc<OAuth>>,
     setup: Option<&ProposalsSetup>,
     viewer: &str,
 ) -> Response {
     let Some(setup) = setup else {
-        return Json(json!({"configured": false, "branch": null, "required_reviews": null, "verified": false, "github": null}))
+        return Json(json!({"configured": false, "branch": null, "required_reviews": null, "verified": false, "admins_enforced": null, "bypass_allowed": null, "github": null}))
             .into_response();
     };
     let configured = setup.layout.is_ok();
     let unknown = |github: &str| {
-        Json(json!({"configured": configured, "branch": setup.branch, "required_reviews": null, "verified": false, "github": github}))
+        Json(json!({"configured": configured, "branch": setup.branch, "required_reviews": null, "verified": false, "admins_enforced": null, "bypass_allowed": null, "github": github}))
             .into_response()
     };
     let token = match token(oauth, viewer).await {
@@ -678,7 +685,9 @@ pub async fn protection(
             "configured": configured,
             "branch": setup.branch,
             "required_reviews": p.required_reviews,
-            "verified": true,
+            "verified": p.verified(),
+            "admins_enforced": p.admins_enforced,
+            "bypass_allowed": p.bypass_allowed,
             "source": p.source,
             "github": "linked",
         }))

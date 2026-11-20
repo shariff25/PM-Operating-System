@@ -227,6 +227,7 @@ async fn start_with(hostile: bool) -> Stack {
             },
             None,
             PersonClients {
+                entra: None,
                 web_token: Some(TS_WEB_TOKEN.into()),
                 assertions: Arc::new(
                     pmos_toolserver::assertion::Assertions::new(

@@ -20,8 +20,8 @@ chrono.workspace = true
 # Session ids and CSRF tokens: 256 bits from the operating system's generator.
 getrandom.workspace = true
 hmac.workspace = true
-# Entra ID tokens (RS256) through aws-lc-rs, which rustls already uses: no OpenSSL.
-jsonwebtoken ={ version = "10", default-features = false, features = ["aws_lc_rs"] }
+# The ID token checks the tool server makes too (one copy of the claim rules).
+pmos-entra.workspace = true
 pmos-assertion.workspace = true
 pmos-directory.workspace = true
 pmos-contract.workspace = true
@@ -45,3 +45,6 @@ tracing-subscriber.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+# Entra tests sign ID tokens with the shared test keys (`pmos_entra::testing`).
+jsonwebtoken.workspace = true
+pmos-entra = { workspace = true, features = ["test-support"] }

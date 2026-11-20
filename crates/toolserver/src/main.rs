@@ -293,6 +293,29 @@ async fn main() -> Result<()> {
     if let Some(warning) = config.assertions.insecure_warning() {
         tracing::error!("{warning}");
     }
+    let entra = match &config.entra {
+        Some(tenant) => {
+            tracing::info!(
+                tenant = %tenant.tenant_id,
+                client = %tenant.client_id,
+                "first Entra links: ID tokens validated here for this tenant and client"
+            );
+            Some(Arc::new(
+                pmos_toolserver::app::EntraLinkCheck::new(tenant.clone())
+                    .map_err(anyhow::Error::msg)?,
+            ))
+        }
+        None => {
+            if config.web_token.is_some() {
+                tracing::warn!(
+                    "no PMOS_ENTRA_TENANT_ID and PMOS_ENTRA_CLIENT_ID: a first Microsoft sign-in \
+                     can't link (the first-link route answers 501); pmos-web's /readyz reports \
+                     it when Entra sign-in is on"
+                );
+            }
+            None
+        }
+    };
     let app = router_full(
         svc,
         AppConfig {
@@ -313,6 +336,7 @@ async fn main() -> Result<()> {
         PersonClients {
             web_token: config.web_token.as_ref().map(|t| t.expose().to_string()),
             assertions: config.assertions.clone(),
+            entra,
         },
         cancel.clone(),
     );

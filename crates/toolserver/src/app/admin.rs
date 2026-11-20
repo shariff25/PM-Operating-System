@@ -627,7 +627,14 @@ async fn overview(
         Ok(n) => n,
         Err(e) => return unavailable(e),
     };
-    let users = users_flags(&state, &dir, conflicts, Utc::now());
+    let links = match first_links(&state, since).await {
+        Ok(l) => l,
+        Err(e) => return unavailable(e),
+    };
+    let mut users = users_flags(&state, &dir, conflicts, Utc::now());
+    // U1: every first link a person made through pmos-web (who, when, which identity
+    // provider), never the `oid`. `null` when the audit log can't be read back.
+    users["first_links"] = json!(links);
     let counts = match state.svc.stores().audit.count_outcomes(since).await {
         Ok(c) => c,
         Err(e) => return unavailable(e),
@@ -692,6 +699,50 @@ async fn identity_conflicts(
             who.sort();
             who.dedup();
             (events.len(), who)
+        }))
+}
+
+/// First Entra links since `since` (U1, the review of `b469d5b`): the `users.identity_link`
+/// events the first-link route recorded (client `web`, outcome `ok`, detail `entra`), newest
+/// first, each `{handle, at, provider}`. Handles only: never an `oid` or an address, to an
+/// admin or an Auditor. `None` when the audit log can't be read back.
+async fn first_links(
+    state: &AppState,
+    since: DateTime<Utc>,
+) -> Result<Option<Vec<Value>>, crate::store::StoreError> {
+    let query = AuditQuery {
+        before: None,
+        limit: MAX_PAGE,
+        actor: None,
+        action: Some("users.identity_link".into()),
+        outcome: Some(Outcome::Ok),
+        from: Some(since),
+        to: None,
+    };
+    Ok(state
+        .svc
+        .stores()
+        .audit
+        .search(&query)
+        .await?
+        .map(|events| {
+            let mut out: Vec<(DateTime<Utc>, String)> = events
+                .iter()
+                .filter(|e| {
+                    e.event.client == Client::Web && e.event.detail.as_deref() == Some("entra")
+                })
+                .filter_map(|e| {
+                    e.event
+                        .output_ref
+                        .clone()
+                        .filter(|h| crate::session::valid_handle(h))
+                        .map(|h| (e.event.at, h))
+                })
+                .collect();
+            out.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+            out.into_iter()
+                .map(|(at, handle)| json!({"handle": handle, "at": at, "provider": "entra"}))
+                .collect()
         }))
 }
 

@@ -24,6 +24,8 @@ clap.workspace = true
 getrandom.workspace = true
 pmos-assertion.workspace = true
 pmos-contract.workspace = true
+# The ID token rules pmos-web applies, for the first Entra link (one copy: crates/entra).
+pmos-entra.workspace = true
 pmos-policy.workspace = true
 pmos-runtime.workspace = true
 pulldown-cmark.workspace = true
@@ -57,4 +59,6 @@ pmos-toolserver = { path = ".", features = ["test-support"] }
 # The runtime, for the end-to-end conversation test (tests/history_e2e.rs).
 pmos-bots = { path = "../bots" }
 pmos-docs = { path = "../docs" }
+# Test keys and a fake tenant (discovery and JWKS) for the first-link tests.
+pmos-entra = { workspace = true, features = ["test-support"] }
 rmcp = { version = "3.10", features = ["client", "transport-streamable-http-client-reqwest"] }
