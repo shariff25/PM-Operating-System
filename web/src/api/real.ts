@@ -136,6 +136,7 @@ export function createRealClient(opts: RealOptions = {}): Api {
       post<void>('/auth/password/change', { current_password: input.current_password, code: input.code, new_password: input.new_password }),
     passwordRecoveryCodes: (code) => post<PasswordRecoveryCodes>('/auth/password/recovery-codes', { code }),
     passwordStatus: () => call<PasswordStatus>('GET', '/auth/password/status'),
+    passwordDismissResetNotice: () => post<void>('/auth/password/reset-notice/dismiss', {}),
     logout: async () => {
       await post<void>('/auth/logout');
       csrf = null;

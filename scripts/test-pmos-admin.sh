@@ -82,6 +82,8 @@ for a in "$@"; do [ "$prev" = --env-file ] && envfile=$a; prev=$a; done
 filemode=$(grep -E '^PMOS_ASSERTION_MODE=' "$envfile" 2>/dev/null | cut -d= -f2-)
 printf 'mode=%s file=%s workers=%s args=%s\n' "${PMOS_ASSERTION_MODE:-}" "$filemode" \
   "${PMOS_RT_WORKER_TOKENS:-}" "$*" >>"$DOCKER_LOG"
+# `docker network inspect`: the pmos network's gateway, when the test gives one.
+if [ "${1:-}" = network ] && [ -n "${FAKE_GATEWAY:-}" ]; then echo "$FAKE_GATEWAY"; fi
 EOF
 chmod +x "$WORK/bin/docker"
 export DOCKER_LOG="$WORK/docker.log"
@@ -120,9 +122,33 @@ line=$(grep 'up -d bots gateway' "$DOCKER_LOG") || fail "add-bot didn't recreate
 grep -q '^PMOS_ASSERTION_MODE=require$' "$WORK/stack/deploy/.env" || fail "add-bot changed the mode in deploy/.env"
 # Password sign-in alone is a sign-in for the web app (docs/password-sign-in.md); with neither
 # it, Entra nor the development opt-in, `up --web` refuses before anything starts.
-stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1"
+stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
+  "PMOS_WEB_TRUSTED_PROXIES=172.18.0.1" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
 run_stack up --web >/dev/null
 grep -q 'args=compose .*--profile web up -d' "$DOCKER_LOG" || fail "up --web with password sign-in didn't start the web profile: $(cat "$DOCKER_LOG")"
+# Password sign-in with no trusted proxy (P2): `up --web` refuses before anything starts and
+# says exactly what to set: the pmos network's gateway when the network exists, and how to
+# find it otherwise. Without an https:// public URL it refuses too.
+stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
+  "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
+code=0
+out=$(FAKE_GATEWAY=172.18.0.1 run_stack up --web 2>&1) || code=$?
+[ "$code" = 2 ] || fail "up --web with password sign-in and no trusted proxy exits $code, not 2"
+[[ "$out" == *"PMOS_WEB_TRUSTED_PROXIES=172.18.0.1"* ]] || fail "up --web doesn't say what to set: $out"
+[[ "$out" == *"docker network inspect pmos_pmos"* ]] || fail "up --web doesn't say how to find it: $out"
+! grep -q ' up -d' "$DOCKER_LOG" || fail "up --web with no trusted proxy started something"
+code=0
+out=$(run_stack up --web 2>&1) || code=$?
+[ "$code" = 2 ] || fail "up --web before the network exists exits $code, not 2"
+[[ "$out" == *"deploy/pmos-admin up"* && "$out" == *"docker network inspect pmos_pmos"* ]] ||
+  fail "up --web before the network exists doesn't say how to find the address: $out"
+stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
+  "PMOS_WEB_TRUSTED_PROXIES=172.18.0.1" "PMOS_WEB_PUBLIC_URL=http://pmos.example.com"
+code=0
+out=$(run_stack up --web 2>&1) || code=$?
+[ "$code" = 2 ] || fail "up --web with password sign-in and an http public URL exits $code, not 2"
+[[ "$out" == *"https://"* ]] || fail "up --web doesn't ask for https: $out"
+! grep -q ' up -d' "$DOCKER_LOG" || fail "up --web with an http public URL started something"
 stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0"
 code=0
 run_stack up --web >/dev/null 2>&1 || code=$?

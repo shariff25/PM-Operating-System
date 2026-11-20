@@ -460,11 +460,16 @@ async fn audit(
         Ok(query) => query,
         Err(why) => return coded(StatusCode::BAD_REQUEST, "bad_request", &why),
     };
-    if let Err(refused) =
-        viewer_marked(&state, client, q.user.as_deref(), tool, &[need], true).await
-    {
-        return *refused;
-    }
+    let who = match viewer_marked(&state, client, q.user.as_deref(), tool, &[need], true).await {
+        Ok(who) => who,
+        Err(refused) => return *refused,
+    };
+    // An Auditor (without Admin) sees one reason for every refused password step, and no
+    // target, so the log can't tell them which sign-in names exist (L15). Admins see each.
+    let admin_view = match state.svc.people().directory().await {
+        Ok(dir) => dir.get(&who).is_some_and(|u| u.has(UserRole::Admin)),
+        Err(e) => return unavailable(e),
+    };
     let page = query.limit;
     let mut wide = query.clone();
     wide.limit = page + 1;
@@ -484,8 +489,52 @@ async fn audit(
     let next = more
         .then(|| found.last().map(|s| s.cursor().encode()))
         .flatten();
-    let events: Vec<Value> = found.iter().map(event_json).collect();
+    let events: Vec<Value> = found
+        .iter()
+        .map(|e| {
+            if admin_view {
+                event_json(e)
+            } else {
+                auditor_event_json(e)
+            }
+        })
+        .collect();
     Json(json!({ "events": events, "next": next })).into_response()
+}
+
+/// The password refusals whose reason, or target, would tell whether a sign-in name exists.
+const NAME_REVEALING: [(&str, &str); 2] = [
+    ("password.sign_in", "sign_in_failed"),
+    ("password.setup_begin", "setup_failed"),
+];
+
+/// [`event_json`] as an Auditor sees it (L15): a refused password step, or a refused setup's
+/// first step before its code matched, shows one reason and no target, whatever happened.
+pub fn auditor_event_json(stored: &StoredEvent) -> Value {
+    let mut v = event_json(stored);
+    let e = &stored.event;
+    let before_match = |d: &str| {
+        matches!(
+            d,
+            "unknown_name"
+                | "no_password"
+                | "wrong_password"
+                | "deactivated"
+                | "locked"
+                | "host_only"
+                | "wrong_code"
+                | "expired"
+        )
+    };
+    if let Some((_, one)) = NAME_REVEALING.iter().find(|(a, _)| *a == e.tool) {
+        let reveals = e.outcome == Outcome::Denied
+            && (e.tool == "password.sign_in" || e.detail.as_deref().is_some_and(before_match));
+        if reveals {
+            v["detail"] = json!(one);
+            v["target"] = Value::Null;
+        }
+    }
+    v
 }
 
 // Team accounts.
@@ -627,7 +676,22 @@ async fn overview(
         Ok(n) => n,
         Err(e) => return unavailable(e),
     };
-    let users = users_flags(&state, &dir, conflicts, Utc::now());
+    let mut users = users_flags(&state, &dir, conflicts, Utc::now());
+    // PM2: every reset code issued for someone who had a password, in the overview's window:
+    // who, by whom, when (handles only).
+    let resets = match state.svc.stores().users.role_changes(None, 500).await {
+        Ok(changes) => changes
+            .into_iter()
+            .filter(|c| {
+                c.change == crate::users::ChangeKind::IssuePasswordCode
+                    && c.detail.as_deref() == Some("reset")
+                    && c.at >= since
+            })
+            .map(|c| json!({"handle": c.target, "by": c.actor, "at": c.at}))
+            .collect::<Vec<_>>(),
+        Err(e) => return unavailable(e),
+    };
+    users["password_resets"] = json!(resets);
     let counts = match state.svc.stores().audit.count_outcomes(since).await {
         Ok(c) => c,
         Err(e) => return unavailable(e),

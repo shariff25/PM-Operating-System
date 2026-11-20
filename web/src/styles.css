@@ -744,6 +744,7 @@ a.tab { text-decoration: none; }
 .note-error { background: var(--bad-bg); color: var(--bad-ink); }
 .note-warn { background: var(--warn-bg); color: var(--warn-ink); }
 .note-error .btn, .note-warn .btn { background: var(--surface); color: var(--ink); border-color: var(--control-line); }
+.reset-notice { margin: 0 0 16px; align-items: center; }
 .stripped { margin-top: 24px; }
 .stripped-list { margin: 0; padding-left: 1.2rem; color: var(--ink); width: 100%; }
 .stripped-list li { margin-bottom: 4px; }

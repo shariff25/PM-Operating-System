@@ -1525,23 +1525,27 @@ sign-in**.
 
 | Route | Body | Answer |
 | --- | --- | --- |
-| `POST /internal/password/sign-in` | `{sign_in_name, password}` | `{pending_token, expires_at}`; every refusal `401 sign_in_failed` |
-| `POST /internal/password/second-step` | `{pending_token, code}` or `{pending_token, recovery_code}` | `{user, password_epoch, recovery_code_used, recovery_codes_left}`; `401 code_failed` (`attempts_left`), `401 sign_in_expired`, `403 not_a_member`, `429 too_many_attempts` |
-| `POST /internal/password/setup/begin` | `{sign_in_name, setup_code}` | `{setup_token, handle, kind, expires_at}`; `401 setup_failed`, then `403 not_a_member`, `409 sign_in_unconfirmed`, `403 host_only`, `409 evals_account` |
+| `POST /internal/password/sign-in` | `{sign_in_name, password, source?}` | `{pending_token, expires_at}`; every refusal `401 sign_in_failed`; `429 too_many_attempts` from the global limit |
+| `POST /internal/password/second-step` | `{pending_token, code, source?}` or `{pending_token, recovery_code, source?}` | `{user, password_epoch, recovery_code_used, recovery_codes_left}`; `401 code_failed` (`attempts_left`), `401 sign_in_expired`, `403 not_a_member`, `429 too_many_attempts` |
+| `POST /internal/password/setup/begin` | `{sign_in_name, setup_code, source?}` | `{setup_token, handle, kind, expires_at}`; `401 setup_failed`, then `403 not_a_member`, `409 sign_in_unconfirmed`, `403 host_only`, `409 evals_account` |
 | `POST /internal/password/setup/password` | `{setup_token, password}` | `{next: "authenticator"}`; `422 weak_password` (`reason`), `401 setup_expired` |
 | `POST /internal/password/setup/authenticator` | `{setup_token}` | `{otpauth_uri, secret, account, issuer, algorithm, digits, period}`; `409 wrong_step` |
-| `POST /internal/password/setup/confirm` | `{setup_token, code}` | `{user, password_epoch, kind, recovery_codes}`; `401 code_failed`, `409 wrong_step`, `403 host_only` |
+| `POST /internal/password/setup/confirm` | `{setup_token, code, source?}` | `{user, password_epoch, kind, recovery_codes}`; `401 code_failed`, `409 wrong_step`, `403 host_only` |
 | `POST /internal/password/change?user=<handle>` | `{current_password, code, new_password}` | `{password_epoch}`; `403 reauth_failed`, `422 weak_password`, `409 no_password`, `429 too_many_attempts` |
 | `POST /internal/password/recovery-codes?user=<handle>` | `{code}` | `{recovery_codes}`; `403 reauth_failed`, `409 no_password` |
-| `GET /internal/password/status?user=<handle>` | | `{enabled, password_set, second_step_enrolled, setup_code_pending, recovery_codes_left}` |
+| `GET /internal/password/status?user=<handle>` | | `{enabled, password_set, second_step_enrolled, setup_code_pending, recovery_codes_left, needs_host_setup, reset_notice: {by, by_name, at} \| null}` |
+| `POST /internal/password/reset-notice/dismiss?user=<handle>` | `{}` | `204` |
 | `POST /internal/password/setup-codes?user=<admin>` | `{handle}` | `201 {setup_code, handle, kind, expires_at}`; `403 forbidden`, `403 host_only`, `403 self_change`, `404 not_found`, `409 not_active`, `409 sign_in_unconfirmed`, `409 evals_account` |
 
 - **`pmos-web`'s token only:** the orchestrator's, the console's and the Slack bot's get `403`,
   no token `401`.
 - **Only in assertion `require`**, with no development override: `503 assertion_required`
-  otherwise. The four routes that name `user=` need `pmos-web`'s assertion for that person,
+  otherwise. The five routes that name `user=` need `pmos-web`'s assertion for that person,
   bound to the request (`401 bad_assertion`); the six before a session take none (as
   `resolve`, nobody is signed in yet).
+- **`source`** is the browser's address as `pmos-web` counts it (an IPv4 address, or an IPv6
+  `/64`): the per-account waits are per address (`docs/password-sign-in.md`, "Limits"). It is
+  hashed before it is stored and never logged; missing, those attempts share one count.
 - **Off without `PMOS_VAULT_KEY`** (`501 not_configured`); with live connectors it is required
   anyway. The host command `pmos-toolserver users password-setup <handle>`
   (`pmos-admin users password-setup`) issues a code for anyone but `evals`, Admins and

@@ -530,6 +530,17 @@ struct UsersFlags {
     deactivation_limit_reached: bool,
     deactivation_grace_hours: Option<u64>,
     bots_without_active_owner: Vec<String>,
+    /// Reset codes issued in the window for people who had a password (PM2): handles only.
+    password_resets: Vec<ResetFlag>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct ResetFlag {
+    handle: String,
+    /// The admin's handle, or `host`.
+    by: String,
+    at: String,
 }
 
 #[derive(Deserialize, Serialize, Default)]

@@ -136,10 +136,18 @@ function PasswordState({ u }: { u: DirectoryUser }) {
   const S = T.signIn;
   const set = u.password_set === true;
   const pending = u.setup_code_pending === true;
-  if (!set && !pending) return null;
+  const held = u.password_needs_host_setup === true;
+  if (!set && !pending && !held) return null;
   const whole = set && u.second_step_enrolled === true;
   return (
     <>
+      {held && (
+        <span className="pw-tag pw-tag-warn" title={S.needsHostSetupSr}>
+          <Icon name="lock" size={11} />
+          <span aria-hidden="true">{S.needsHostSetup}</span>
+          <span className="sr-only">{S.needsHostSetupSr}</span>
+        </span>
+      )}
       {set && (
         <span className={`pw-tag ${whole ? 'pw-tag-on' : 'pw-tag-warn'}`} title={whole ? S.passwordSr : S.passwordHalfSr}>
           <Icon name="lock" size={11} />

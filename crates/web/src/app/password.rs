@@ -12,21 +12,31 @@
 //! - **The session**, exactly as every other sign-in makes it ([`super::start_session`]), with
 //!   the credential's epoch: every request checks it against the user database, so a reset or
 //!   a password change ends it within 10 seconds (at once in this server).
-//! - **A per-address limit** ([`SourceLimiter`]): at most [`SOURCE_REFUSALS`] refused guesses
-//!   (a wrong password, code or setup code) from one address in any [`SOURCE_WINDOW_MINUTES`]
+//! - **A per-address limit** ([`SourceLimiter`]): at most [`SOURCE_REFUSALS`] refused attempts
+//!   from one address (an IPv4 address, or an IPv6 /64) in any [`SOURCE_WINDOW_MINUTES`]
 //!   minutes; past it every unauthenticated password route answers `429 too_many_attempts`.
+//!   **Every** attempt that doesn't succeed counts: a wrong password, code or setup code, an
+//!   unknown or expired token, a step out of order, a body that isn't the route's JSON. Only
+//!   PM OS's own failures (a `5xx`) don't. The check and the count are one step: each attempt
+//!   takes its slot before the tool server is asked and gives it back if it succeeds.
+//! - **The address** ([`source`]): the peer, or behind a proxy named in
+//!   `PMOS_WEB_TRUSTED_PROXIES`, `X-Forwarded-For` read strictly from the right. With no
+//!   trusted proxy (`PMOS_WEB_DIRECT=1`, a loopback bind), a password request that carries a
+//!   forwarded header is refused: a proxy nobody named is in front. The address goes to the
+//!   tool server too, whose per-account waits are per address.
 //!
 //! Every write takes the origin check and JSON (a login CSRF defence, as development sign-in
-//! does); the signed-in ones take the session's CSRF token too. Refusals keep the tool server's
-//! code with `pmos-web`'s own sentence ([`PASSWORD_CODES`]). Nothing here logs a password, a
-//! code, a token, a secret or a sign-in name.
+//! does); the signed-in ones take the session's CSRF token too. Bodies are at most
+//! [`MAX_BODY`]. Refusals keep the tool server's code with `pmos-web`'s own sentence
+//! ([`PASSWORD_CODES`]). Nothing here logs a password, a code, a token, a secret, a sign-in
+//! name or an address.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -43,12 +53,14 @@ use super::{
 };
 use crate::upstream::UpstreamError;
 
-/// Refused guesses from one address before it waits.
+/// Refused attempts from one address before it waits.
 pub const SOURCE_REFUSALS: usize = 20;
 /// The window those are counted in.
 pub const SOURCE_WINDOW_MINUTES: i64 = 15;
 /// Addresses tracked at once; past it the one seen longest ago goes.
 pub const MAX_SOURCES: usize = 10_000;
+/// The largest body a password route reads (the tool server's limit too).
+pub const MAX_BODY: usize = 4 * 1024;
 
 /// The cookie that carries the pending token after a correct password.
 pub const PENDING_COOKIE: &str = "__Host-pmos-pending";
@@ -73,9 +85,14 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/auth/password/recovery-codes", post(recovery_codes))
         .route("/auth/password/status", get(status))
         .route(
+            "/auth/password/reset-notice/dismiss",
+            post(dismiss_reset_notice),
+        )
+        .route(
             "/admin/users/{handle}/password-setup-code",
             post(issue_setup_code),
         )
+        .layer(DefaultBodyLimit::max(MAX_BODY))
 }
 
 /// The tool server's codes on these routes, the status `pmos-web` answers with, and its own
@@ -106,15 +123,34 @@ pub const PASSWORD_CODES: [(&str, u16, &str); 23] = [
     ("unavailable", 503, "PM OS storage isn't answering. Try again in a minute."),
 ];
 
-/// The codes counted against an address: a wrong guess.
-const GUESSES: [&str; 3] = ["sign_in_failed", "code_failed", "setup_failed"];
-
 // --- The per-address limit ---------------------------------------------------------------------
 
-/// Refused guesses per address in a rolling window. In this process only.
+/// The key an address is counted under: an IPv4 address, or an IPv6 address's /64
+/// (`2001:db8:1:2::/64`), so one host can't step through the addresses of its own network (L3).
+/// `None` when the server has no peer address (tests that serve without it).
+pub type SourceKey = Option<String>;
+
+/// The /64 an IPv6 address is in, or the IPv4 address (an IPv4-mapped one as IPv4).
+pub fn source_key(ip: Option<IpAddr>) -> SourceKey {
+    ip.map(|ip| match canonical(ip) {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{}/64", Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+    })
+}
+
+/// One attempt's slot in the per-address count ([`SourceLimiter::begin`]).
+pub struct Attempt {
+    key: SourceKey,
+    at: DateTime<Utc>,
+}
+
+/// Refused attempts per address in a rolling window. In this process only.
 #[derive(Default)]
 pub struct SourceLimiter {
-    seen: Mutex<HashMap<Option<IpAddr>, VecDeque<DateTime<Utc>>>>,
+    seen: Mutex<HashMap<SourceKey, VecDeque<DateTime<Utc>>>>,
 }
 
 impl SourceLimiter {
@@ -122,65 +158,123 @@ impl SourceLimiter {
         Duration::minutes(SOURCE_WINDOW_MINUTES)
     }
 
-    /// May `source` try at `now`? `Err(retry_after_secs)` when it has used its refusals.
-    pub fn check(&self, source: Option<IpAddr>, now: DateTime<Utc>) -> Result<(), u64> {
+    /// Check `source` and take a slot for this attempt at `now`, in one step (L2): concurrent
+    /// attempts from one address can't pass the limit together. `Err(retry_after_secs)` when
+    /// the address has used its refusals. The slot counts as a refusal unless the attempt is
+    /// [`Self::settle`]d as not counted.
+    pub fn begin(&self, source: &SourceKey, now: DateTime<Utc>) -> Result<Attempt, u64> {
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(times) = seen.get_mut(&source) else {
-            return Ok(());
-        };
-        times.retain(|t| now - *t < Self::window() && *t <= now);
-        if times.len() >= SOURCE_REFUSALS {
-            let oldest = times.front().copied().unwrap_or(now);
-            let wait = (oldest + Self::window() - now).num_seconds().max(1);
-            return Err(u64::try_from(wait).unwrap_or(1));
-        }
-        Ok(())
-    }
-
-    /// Count a refused guess from `source` at `now`.
-    pub fn refused(&self, source: Option<IpAddr>, now: DateTime<Utc>) {
-        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        if !seen.contains_key(&source) && seen.len() >= MAX_SOURCES {
+        if let Some(times) = seen.get_mut(source) {
+            times.retain(|t| now - *t < Self::window() && *t <= now);
+            if times.len() >= SOURCE_REFUSALS {
+                let oldest = times.front().copied().unwrap_or(now);
+                let wait = (oldest + Self::window() - now).num_seconds().max(1);
+                return Err(u64::try_from(wait).unwrap_or(1));
+            }
+        } else if seen.len() >= MAX_SOURCES {
             let stalest = seen
                 .iter()
                 .min_by_key(|(_, t)| t.back().copied())
-                .map(|(k, _)| *k);
+                .map(|(k, _)| k.clone());
             if let Some(k) = stalest {
                 seen.remove(&k);
             }
         }
-        let times = seen.entry(source).or_default();
-        times.retain(|t| now - *t < Self::window());
-        times.push_back(now);
+        seen.entry(source.clone()).or_default().push_back(now);
+        Ok(Attempt {
+            key: source.clone(),
+            at: now,
+        })
+    }
+
+    /// The attempt's outcome: `counted` keeps its slot (a refusal); otherwise (it succeeded,
+    /// or PM OS itself failed) the slot is given back.
+    pub fn settle(&self, attempt: Attempt, counted: bool) {
+        if counted {
+            return;
+        }
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(times) = seen.get_mut(&attempt.key) {
+            if let Some(i) = times.iter().rposition(|t| *t == attempt.at) {
+                times.remove(i);
+            }
+            if times.is_empty() {
+                seen.remove(&attempt.key);
+            }
+        }
     }
 }
 
-/// Where a request came from: the peer, or behind a trusted proxy the right-most
-/// `X-Forwarded-For` address that isn't one. `None` when the server has no peer address (tests
-/// that serve without it): every such request shares one count.
+/// An IPv4-mapped IPv6 address as IPv4; anything else as it is.
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// One `X-Forwarded-For` entry: an address, `ip:port`, `[ipv6]` or `[ipv6]:port`. `None` for
+/// anything else (`unknown`, an obfuscated name, garbage).
+fn forwarded_entry(entry: &str) -> Option<IpAddr> {
+    let e = entry.trim();
+    if let Some(rest) = e.strip_prefix('[') {
+        let (inside, after) = rest.split_once(']')?;
+        let port_ok = after.is_empty()
+            || after
+                .strip_prefix(':')
+                .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+        return port_ok
+            .then(|| inside.parse::<Ipv6Addr>().ok().map(IpAddr::V6))
+            .flatten();
+    }
+    if let Ok(ip) = e.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    e.parse::<SocketAddr>().ok().map(|s| s.ip())
+}
+
+/// Where a request came from (L1): the peer; or, when the peer is a trusted proxy,
+/// `X-Forwarded-For` read strictly from the right, every header in order: each entry that is a
+/// trusted proxy is passed, and the first that isn't is the client. An entry that can't be
+/// read ends the walk (it is never skipped): the address is then the last trusted hop's, a
+/// count the client can't choose. With every entry a proxy, or none, it is the left-most
+/// proxy. `None` when the server has no peer address (tests that serve without it): every such
+/// request shares one count.
 pub fn source(
     parts_peer: Option<SocketAddr>,
     headers: &HeaderMap,
     trusted: &[IpAddr],
 ) -> Option<IpAddr> {
-    let peer = parts_peer.map(|p| p.ip())?;
-    if !trusted.contains(&peer) {
+    let peer = canonical(parts_peer?.ip());
+    let is_trusted = |ip: IpAddr| trusted.iter().any(|t| canonical(*t) == ip);
+    if !is_trusted(peer) {
         return Some(peer);
     }
-    let forwarded: Vec<IpAddr> = headers
-        .get_all("x-forwarded-for")
+    let mut entries: Vec<Option<IpAddr>> = Vec::new();
+    for v in headers.get_all("x-forwarded-for") {
+        match v.to_str() {
+            Ok(text) => entries.extend(text.split(',').map(forwarded_entry)),
+            Err(_) => entries.push(None),
+        }
+    }
+    let mut current = peer;
+    for entry in entries.into_iter().rev() {
+        match entry.map(canonical) {
+            None => return Some(current),
+            Some(ip) if is_trusted(ip) => current = ip,
+            Some(ip) => return Some(ip),
+        }
+    }
+    Some(current)
+}
+
+/// Does the request carry a header a proxy adds? (With no trusted proxy, a password request
+/// that does is refused: a proxy nobody named is in front, and every browser would share its
+/// address.)
+fn forwarded(headers: &HeaderMap) -> bool {
+    ["x-forwarded-for", "forwarded", "x-real-ip"]
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .filter_map(|a| a.trim().parse::<IpAddr>().ok())
-        .collect();
-    Some(
-        forwarded
-            .into_iter()
-            .rev()
-            .find(|a| !trusted.contains(a))
-            .unwrap_or(peer),
-    )
+        .any(|h| headers.contains_key(*h))
 }
 
 // --- Cookies -----------------------------------------------------------------------------------
@@ -304,13 +398,44 @@ async fn call(state: &AppState, segments: &[&str], body: &Value) -> Result<Answe
     }
 }
 
-/// An unauthenticated password route's checks: on; same origin; JSON; the address not over
-/// its limit. Gives back the address.
+/// An unauthenticated attempt in progress: the address it is counted against (sent to the tool
+/// server as `source`), and its slot in the per-address count.
+struct Try {
+    from: SourceKey,
+    attempt: Option<Attempt>,
+}
+
+impl Try {
+    /// The address, for the tool server's per-account waits.
+    fn source(&self) -> Value {
+        json!(self.from)
+    }
+
+    /// The attempt succeeded, or PM OS failed: the slot goes back.
+    fn not_counted(&mut self, state: &AppState) {
+        if let Some(a) = self.attempt.take() {
+            state.0.sources.settle(a, false);
+        }
+    }
+
+    /// After the tool server answered: counted unless it succeeded (`2xx`) or PM OS itself
+    /// failed (`5xx`). Every other refusal counts: a wrong guess, an unknown or expired token,
+    /// a step out of order, a body it couldn't read (P1).
+    fn answered(&mut self, state: &AppState, status: u16) {
+        if (200..300).contains(&status) || status >= 500 {
+            self.not_counted(state);
+        }
+    }
+}
+
+/// An unauthenticated password route's checks: on; same origin; JSON; no forwarded header
+/// unless a proxy is trusted; the address not over its limit. Takes the attempt's slot (it
+/// counts unless it is given back), so every refusal from here on is counted.
 fn pre(
     state: &AppState,
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
-) -> Result<Option<IpAddr>, Box<Response>> {
+) -> Result<Try, Box<Response>> {
     if !state.0.password_login {
         return Err(Box::new(off().into_response()));
     }
@@ -328,23 +453,29 @@ fn pre(
     if !is_json(headers) {
         return Err(Box::new(bad_content_type().into_response()));
     }
-    let from = source(peer, headers, &state.0.trusted_proxies);
-    if let Err(wait) = state.0.sources.check(from, now(state)) {
-        tracing::warn!("password sign-in: an address over its limit");
-        return Err(Box::new(too_many(wait)));
+    if state.0.trusted_proxies.is_empty() && forwarded(headers) {
+        tracing::warn!(
+            "password sign-in refused: a forwarded header with no trusted proxy (set PMOS_WEB_TRUSTED_PROXIES)"
+        );
+        return Err(Box::new(
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "proxy_not_trusted",
+                "PM OS can't sign you in through this address. Tell an admin: the web app's proxy isn't set up.",
+            )
+            .into_response(),
+        ));
     }
-    Ok(from)
-}
-
-/// After a refusal: count a guess against the address.
-fn count(state: &AppState, from: Option<IpAddr>, a: &Answer) {
-    let code = a
-        .body
-        .get("code")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if GUESSES.contains(&code) {
-        state.0.sources.refused(from, now(state));
+    let from = source_key(source(peer, headers, &state.0.trusted_proxies));
+    match state.0.sources.begin(&from, now(state)) {
+        Ok(attempt) => Ok(Try {
+            from,
+            attempt: Some(attempt),
+        }),
+        Err(wait) => {
+            tracing::warn!("password sign-in: an address over its limit");
+            Err(Box::new(too_many(wait)))
+        }
     }
 }
 
@@ -381,8 +512,8 @@ async fn sign_in(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let from = match pre(&state, &headers, peer) {
-        Ok(f) => f,
+    let mut t = match pre(&state, &headers, peer) {
+        Ok(t) => t,
         Err(r) => return *r,
     };
     let b: SignInBody = match parse(&body) {
@@ -392,15 +523,18 @@ async fn sign_in(
     let a = match call(
         &state,
         &["sign-in"],
-        &json!({"sign_in_name": b.sign_in_name, "password": b.password}),
+        &json!({"sign_in_name": b.sign_in_name, "password": b.password, "source": t.source()}),
     )
     .await
     {
         Ok(a) => a,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            t.not_counted(&state);
+            return e.into_response();
+        }
     };
+    t.answered(&state, a.status);
     if a.status != 200 {
-        count(&state, from, &a);
         return refused(a.status, &a.body, a.retry_after);
     }
     let Some(token) = a.body.get("pending_token").and_then(Value::as_str) else {
@@ -431,13 +565,24 @@ struct SecondStepBody {
     recovery_code: Option<String>,
 }
 
+/// The credential's epoch in the tool server's answer: required (L7). A password session
+/// without one would never be checked against a reset, so none is started.
+fn epoch_of(body: &Value) -> Result<i64, Box<Response>> {
+    body.get("password_epoch")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            tracing::warn!("the tool server answered a password sign-in without an epoch");
+            Box::new(bad_reply())
+        })
+}
+
 /// Start the session for the tool server's `user` with `epoch`, ending `others` first when
 /// asked (a setup or reset ends every session of theirs).
 async fn session_for(
     state: &AppState,
     headers: &HeaderMap,
     user: &Value,
-    epoch: Option<i64>,
+    epoch: i64,
     end_others: bool,
 ) -> Result<String, Box<Response>> {
     let Some(user) = pmos_directory::resolve::parse_user(user) else {
@@ -455,7 +600,7 @@ async fn session_for(
             .map_err(|e| Box::new(ApiError::store(e).into_response()))?;
     }
     state.0.directory.forget(&user.handle);
-    start_session(state, headers, &user, "password", None, epoch)
+    start_session(state, headers, &user, "password", None, Some(epoch))
         .await
         .map_err(|e| Box::new(e.into_response()))
 }
@@ -468,8 +613,8 @@ async fn second_step(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let from = match pre(&state, &headers, peer) {
-        Ok(f) => f,
+    let mut t = match pre(&state, &headers, peer) {
+        Ok(t) => t,
         Err(r) => return *r,
     };
     let b: SecondStepBody = match parse(&body) {
@@ -491,12 +636,16 @@ async fn second_step(
         );
     };
     req["pending_token"] = json!(token);
+    req["source"] = t.source();
     let a = match call(&state, &["second-step"], &req).await {
         Ok(a) => a,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            t.not_counted(&state);
+            return e.into_response();
+        }
     };
+    t.answered(&state, a.status);
     if a.status != 200 {
-        count(&state, from, &a);
         let code = a
             .body
             .get("code")
@@ -513,7 +662,10 @@ async fn second_step(
             res
         };
     }
-    let epoch = a.body.get("password_epoch").and_then(Value::as_i64);
+    let epoch = match epoch_of(&a.body) {
+        Ok(e) => e,
+        Err(r) => return *r,
+    };
     let id = match session_for(&state, &headers, &a.body["user"], epoch, false).await {
         Ok(id) => id,
         Err(r) => return *r,
@@ -545,8 +697,8 @@ async fn setup_begin(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let from = match pre(&state, &headers, peer) {
-        Ok(f) => f,
+    let mut t = match pre(&state, &headers, peer) {
+        Ok(t) => t,
         Err(r) => return *r,
     };
     let b: BeginBody = match parse(&body) {
@@ -556,15 +708,18 @@ async fn setup_begin(
     let a = match call(
         &state,
         &["setup", "begin"],
-        &json!({"sign_in_name": b.sign_in_name, "setup_code": b.setup_code}),
+        &json!({"sign_in_name": b.sign_in_name, "setup_code": b.setup_code, "source": t.source()}),
     )
     .await
     {
         Ok(a) => a,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            t.not_counted(&state);
+            return e.into_response();
+        }
     };
+    t.answered(&state, a.status);
     if a.status != 200 {
-        count(&state, from, &a);
         return refused(a.status, &a.body, a.retry_after);
     }
     let Some(token) = a.body.get("setup_token").and_then(Value::as_str) else {
@@ -623,9 +778,10 @@ async fn setup_password(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = pre(&state, &headers, peer) {
-        return *r;
-    }
+    let mut t = match pre(&state, &headers, peer) {
+        Ok(t) => t,
+        Err(r) => return *r,
+    };
     let b: PasswordBody = match parse(&body) {
         Ok(b) => b,
         Err(e) => return e.into_response(),
@@ -641,9 +797,18 @@ async fn setup_password(
     )
     .await
     {
-        Ok(a) if a.status == 200 => StatusCode::NO_CONTENT.into_response(),
-        Ok(a) => setup_refused(&a),
-        Err(e) => e.into_response(),
+        Ok(a) => {
+            t.answered(&state, a.status);
+            if a.status == 200 {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                setup_refused(&a)
+            }
+        }
+        Err(e) => {
+            t.not_counted(&state);
+            e.into_response()
+        }
     }
 }
 
@@ -658,9 +823,10 @@ async fn setup_authenticator(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = pre(&state, &headers, peer) {
-        return *r;
-    }
+    let mut t = match pre(&state, &headers, peer) {
+        Ok(t) => t,
+        Err(r) => return *r,
+    };
     if let Err(e) = parse_optional::<Empty>(&body) {
         return e.into_response();
     }
@@ -668,13 +834,17 @@ async fn setup_authenticator(
         Ok(t) => t,
         Err(r) => return *r,
     };
-    match call(
+    let answer = call(
         &state,
         &["setup", "authenticator"],
         &json!({ "setup_token": token }),
     )
-    .await
-    {
+    .await;
+    match &answer {
+        Ok(a) => t.answered(&state, a.status),
+        Err(_) => t.not_counted(&state),
+    }
+    match answer {
         Ok(a) if a.status == 200 => {
             let pick = |k: &str| a.body.get(k).cloned().unwrap_or(Value::Null);
             Json(json!({
@@ -707,8 +877,8 @@ async fn setup_confirm(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let from = match pre(&state, &headers, peer) {
-        Ok(f) => f,
+    let mut t = match pre(&state, &headers, peer) {
+        Ok(t) => t,
         Err(r) => return *r,
     };
     let b: CodeBody = match parse(&body) {
@@ -722,15 +892,18 @@ async fn setup_confirm(
     let a = match call(
         &state,
         &["setup", "confirm"],
-        &json!({"setup_token": token, "code": b.code}),
+        &json!({"setup_token": token, "code": b.code, "source": t.source()}),
     )
     .await
     {
         Ok(a) => a,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            t.not_counted(&state);
+            return e.into_response();
+        }
     };
+    t.answered(&state, a.status);
     if a.status != 200 {
-        count(&state, from, &a);
         return setup_refused(&a);
     }
     let Some(codes) = a
@@ -741,7 +914,10 @@ async fn setup_confirm(
     else {
         return bad_reply();
     };
-    let epoch = a.body.get("password_epoch").and_then(Value::as_i64);
+    let epoch = match epoch_of(&a.body) {
+        Ok(e) => e,
+        Err(r) => return *r,
+    };
     let id = match session_for(&state, &headers, &a.body["user"], epoch, true).await {
         Ok(id) => id,
         Err(r) => return *r,
@@ -831,7 +1007,10 @@ async fn change(
     if a.status != 200 {
         return Ok(refused(a.status, &a.body, a.retry_after));
     }
-    let epoch = a.body.get("password_epoch").and_then(Value::as_i64);
+    let epoch = match epoch_of(&a.body) {
+        Ok(e) => e,
+        Err(r) => return Ok(*r),
+    };
     state
         .0
         .sessions
@@ -849,7 +1028,7 @@ async fn change(
         Ok(u) => u,
         Err(_) => return Err(super::users_unavailable()),
     };
-    let id = start_session(&state, &headers, &user, "password", None, epoch).await?;
+    let id = start_session(&state, &headers, &user, "password", None, Some(epoch)).await?;
     Ok((
         StatusCode::NO_CONTENT,
         [(header::SET_COOKIE, crate::session::set_cookie(&id))],
@@ -894,13 +1073,59 @@ async fn status(State(state): State<AppState>, signed: Signed) -> ApiResult {
         return Ok(refused(a.status, &a.body, a.retry_after));
     }
     let pick = |k: &str| a.body.get(k).and_then(Value::as_bool).unwrap_or(false);
+    // A reset someone issued for this person (PM2): who (a handle, or `host`), their name,
+    // and when. Re-picked field by field.
+    let notice = a
+        .body
+        .get("reset_notice")
+        .filter(|n| {
+            n.get("by").is_some_and(Value::is_string) && n.get("at").is_some_and(Value::is_string)
+        })
+        .map(|n| {
+            json!({
+                "by": n["by"],
+                "by_name": n.get("by_name").filter(|v| v.is_string()),
+                "at": n["at"],
+            })
+        });
     Ok(Json(json!({
         "enabled": pick("enabled"),
         "password_set": pick("password_set"),
         "second_step_enrolled": pick("second_step_enrolled"),
         "recovery_codes_left": a.body.get("recovery_codes_left").and_then(Value::as_u64).unwrap_or(0),
+        "needs_host_setup": pick("needs_host_setup"),
+        "reset_notice": notice,
     }))
     .into_response())
+}
+
+/// `POST /api/auth/password/reset-notice/dismiss {}`: the signed-in person has read the notice
+/// of a reset someone issued for them. `204`.
+async fn dismiss_reset_notice(
+    State(state): State<AppState>,
+    signed: Signed,
+    body: Bytes,
+) -> ApiResult {
+    if !state.0.password_login {
+        return Err(off());
+    }
+    parse_optional::<Empty>(&body)?;
+    let a = match signed_call(
+        &state,
+        &signed,
+        reqwest::Method::POST,
+        &["reset-notice", "dismiss"],
+        Some(&json!({})),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(r) => return Ok(*r),
+    };
+    if !(200..300).contains(&a.status) {
+        return Ok(refused(a.status, &a.body, a.retry_after));
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// `POST /api/admin/users/{handle}/password-setup-code`: an admin makes a one-time setup (or
@@ -962,36 +1187,80 @@ mod tests {
             + Duration::seconds(secs)
     }
 
+    fn key(s: &str) -> SourceKey {
+        source_key(Some(s.parse().unwrap()))
+    }
+
     #[test]
     fn an_address_waits_after_twenty_refusals_in_fifteen_minutes() {
         let l = SourceLimiter::default();
-        let a: Option<IpAddr> = Some("203.0.113.7".parse().unwrap());
-        let b: Option<IpAddr> = Some("203.0.113.8".parse().unwrap());
+        let (a, b) = (key("203.0.113.7"), key("203.0.113.8"));
         for i in 0..SOURCE_REFUSALS as i64 {
-            assert!(l.check(a, at(i)).is_ok());
-            l.refused(a, at(i));
+            let t = l.begin(&a, at(i)).expect("room");
+            l.settle(t, true);
         }
-        assert_eq!(l.check(a, at(30)), Err(15 * 60 - 30));
+        assert_eq!(l.begin(&a, at(30)).err(), Some(15 * 60 - 30));
         assert!(
-            l.check(b, at(30)).is_ok(),
+            l.begin(&b, at(30)).is_ok(),
             "another address has its own count"
         );
         // The first refusal leaves the window after 15 minutes: one more try.
-        assert!(l.check(a, at(15 * 60)).is_ok());
-        l.refused(a, at(15 * 60));
-        assert!(l.check(a, at(15 * 60)).is_err());
-        assert!(l.check(a, at(15 * 60 + 20 * 60)).is_ok());
+        assert!(l.begin(&a, at(15 * 60)).is_ok());
+        assert!(l.begin(&a, at(15 * 60)).is_err());
+        assert!(l.begin(&a, at(15 * 60 + 20 * 60)).is_ok());
+    }
+
+    /// L2: the check and the count are one step. Twenty attempts in flight at once from one
+    /// address take every slot; the twenty-first is refused before it reaches the tool server,
+    /// and a success gives its slot back.
+    #[test]
+    fn concurrent_attempts_cannot_pass_the_limit_together() {
+        let l = SourceLimiter::default();
+        let a = key("203.0.113.7");
+        let held: Vec<Attempt> = (0..SOURCE_REFUSALS)
+            .map(|_| l.begin(&a, at(0)).expect("room"))
+            .collect();
+        assert!(l.begin(&a, at(0)).is_err(), "all twenty are in flight");
+        let mut held = held.into_iter();
+        l.settle(held.next().unwrap(), false);
+        assert!(l.begin(&a, at(1)).is_ok(), "a success gave its slot back");
+        assert!(l.begin(&a, at(1)).is_err());
+    }
+
+    /// L3: IPv6 counts by /64; an IPv4-mapped address counts as IPv4.
+    #[test]
+    fn ipv6_addresses_count_by_their_64() {
+        assert_eq!(
+            key("2001:db8:1:2::1"),
+            key("2001:db8:1:2:ffff:ffff:ffff:ffff")
+        );
+        assert_eq!(key("2001:db8:1:2::1").as_deref(), Some("2001:db8:1:2::/64"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("::ffff:203.0.113.7"), key("203.0.113.7"));
+        let l = SourceLimiter::default();
+        for i in 0..SOURCE_REFUSALS {
+            let t = l
+                .begin(&key(&format!("2001:db8:1:2::{:x}", i + 1)), at(0))
+                .unwrap();
+            l.settle(t, true);
+        }
+        assert!(l.begin(&key("2001:db8:1:2::abcd"), at(1)).is_err());
+        assert!(l.begin(&key("2001:db8:1:99::1"), at(1)).is_ok());
+    }
+
+    fn xff(values: &[&'static str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append("x-forwarded-for", HeaderValue::from_static(v));
+        }
+        h
     }
 
     #[test]
     fn the_address_behind_a_trusted_proxy_is_the_forwarded_one() {
         let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
         let proxy: IpAddr = "10.0.0.1".parse().unwrap();
-        let mut h = HeaderMap::new();
-        h.insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("198.51.100.9, 203.0.113.7, 10.0.0.1"),
-        );
+        let h = xff(&["198.51.100.9, 203.0.113.7, 10.0.0.1"]);
         // Untrusted peer: its own address, whatever it forwards.
         assert_eq!(source(Some(peer), &h, &[]), Some(proxy));
         // Trusted: the right-most address that isn't a proxy (the client's own claim to the
@@ -999,6 +1268,76 @@ mod tests {
         assert_eq!(source(Some(peer), &h, &[proxy]), "203.0.113.7".parse().ok());
         assert_eq!(source(Some(peer), &HeaderMap::new(), &[proxy]), Some(proxy));
         assert_eq!(source(None, &h, &[proxy]), None);
+    }
+
+    /// L1: strictly from the right; `ip:port` and bracketed IPv6 read; an entry that can't be
+    /// read ends the walk (never skipped), so a client can't slip its own value past it.
+    #[test]
+    fn forwarded_for_is_read_strictly_from_the_right() {
+        let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let proxy: IpAddr = "10.0.0.1".parse().unwrap();
+        let inner: IpAddr = "10.0.0.2".parse().unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().ok();
+        // A proxy that writes the port.
+        assert_eq!(
+            source(Some(peer), &xff(&["203.0.113.7:51234"]), &[proxy]),
+            ip("203.0.113.7")
+        );
+        assert_eq!(
+            source(Some(peer), &xff(&["[2001:db8::7]:443"]), &[proxy]),
+            ip("2001:db8::7")
+        );
+        assert_eq!(
+            source(Some(peer), &xff(&["[2001:db8::7]"]), &[proxy]),
+            ip("2001:db8::7")
+        );
+        // A client-written value to the left of something unreadable is never reached: the
+        // address is the last trusted hop's.
+        assert_eq!(
+            source(Some(peer), &xff(&["198.51.100.66, garbage"]), &[proxy]),
+            Some(proxy)
+        );
+        assert_eq!(
+            source(
+                Some(peer),
+                &xff(&["198.51.100.66, unknown, 10.0.0.2"]),
+                &[proxy, inner]
+            ),
+            Some(inner)
+        );
+        assert_eq!(
+            source(
+                Some(peer),
+                &xff(&["198.51.100.66, [2001:db8::7]:x"]),
+                &[proxy]
+            ),
+            Some(proxy)
+        );
+        // Two proxies: both passed, the client is the next one left; the left-most claim isn't.
+        assert_eq!(
+            source(
+                Some(peer),
+                &xff(&["192.0.2.1, 203.0.113.9, 10.0.0.2"]),
+                &[proxy, inner]
+            ),
+            ip("203.0.113.9")
+        );
+        // Several headers are one list, in order.
+        assert_eq!(
+            source(Some(peer), &xff(&["192.0.2.1", "203.0.113.9"]), &[proxy]),
+            ip("203.0.113.9")
+        );
+        // Every entry a proxy: the left-most proxy.
+        assert_eq!(
+            source(Some(peer), &xff(&["10.0.0.2"]), &[proxy, inner]),
+            Some(inner)
+        );
+        // An IPv4-mapped peer matches its IPv4 proxy entry.
+        let mapped: SocketAddr = "[::ffff:10.0.0.1]:5000".parse().unwrap();
+        assert_eq!(
+            source(Some(mapped), &xff(&["203.0.113.7"]), &[proxy]),
+            ip("203.0.113.7")
+        );
     }
 
     #[test]
