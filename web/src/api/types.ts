@@ -1,6 +1,13 @@
 // Types match docs/web-api.md exactly.
 
 export type HintName = 'sources' | 'ask' | 'approve';
+/**
+ * The guided start's marks, kept in `hints_seen` beside the hints (docs/web-api.md, "Me"):
+ * started, its three steps, skipped, and the one "Approved!" moment.
+ */
+export type TourMark = 'tour_started' | 'tour_asked' | 'tour_opened' | 'tour_decided' | 'tour_skipped' | 'tour_cheered';
+/** Anything `POST /api/me/hints` can mark seen. */
+export type SeenName = HintName | TourMark;
 
 export interface Me {
   handle: string;
@@ -11,8 +18,10 @@ export interface Me {
   roles: string[];
   csrf_token: string;
   first_visit: boolean;
-  hints_seen: HintName[];
+  hints_seen: SeenName[];
   nudges: boolean;
+  /** "Show Nudge": whether to draw the mascot. An older server leaves it out: treat that as true. */
+  mascot?: boolean;
   /** What the person's roles allow, kebab-case. An older server leaves it out: treat that as none. */
   permissions?: string[];
   /** True when the person holds the reviewer role: show Reviews. An older server leaves it out: treat that as false. */
@@ -570,7 +579,8 @@ export interface Api {
   logout(): Promise<void>;
   me(): Promise<Me>;
   setNudges(nudges: boolean): Promise<Me>;
-  markHintSeen(seen: HintName): Promise<Me>;
+  setMascot(mascot: boolean): Promise<Me>;
+  markHintSeen(seen: SeenName): Promise<Me>;
   resetHints(): Promise<Me>;
 
   listDrafts(): Promise<DraftList>;

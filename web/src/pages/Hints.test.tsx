@@ -100,13 +100,13 @@ describe('user menu keyboard', () => {
     expect(button).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByRole('menu')).toBeInTheDocument();
     const items = menuItems();
-    // theme (system, light, dark), nudges, show hints again, sign out
-    expect(items).toHaveLength(6);
+    // theme (system, light, dark), nudges, show Nudge, show hints again, sign out
+    expect(items).toHaveLength(7);
     expect(items[0]).toHaveFocus();
     await user.keyboard('{ArrowDown}');
     expect(items[1]).toHaveFocus();
     await user.keyboard('{End}');
-    expect(items[5]).toHaveFocus();
+    expect(items[6]).toHaveFocus();
     await user.keyboard('{ArrowDown}');
     expect(items[0]).toHaveFocus();
     await user.keyboard('{Escape}');
@@ -122,7 +122,7 @@ describe('user menu keyboard', () => {
     await user.keyboard('{Enter}');
     expect(menuItems()[0]).toHaveFocus();
     await user.keyboard('{ArrowUp}');
-    expect(menuItems()[5]).toHaveFocus();
+    expect(menuItems()[6]).toHaveFocus();
   });
 
   it('closes when you click elsewhere', async () => {

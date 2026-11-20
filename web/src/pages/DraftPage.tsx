@@ -8,6 +8,7 @@ import { DraftPill, ErrorNote, ExtLink, Hint, Markdown, Skeleton, StrippedNote, 
 import { Recommendations } from '../components/Recommendations';
 import { SourceList, useSourceJump } from '../components/Sources';
 import { Icon } from '../components/icons';
+import { Nudge, useShowNudge } from '../components/Nudge';
 import { PageBar, useShell } from '../components/Shell';
 import { useToast } from '../components/Toasts';
 import { copy } from '../copy';
@@ -19,6 +20,7 @@ import { stripMarkers } from '../citations';
 import { errorText, isDefiniteRefusal } from '../errors';
 import { usePoll } from '../polling';
 import { renderMarkdown } from '../markdown';
+import { mayCheer, useTour } from '../onboarding';
 import { longTime, relTime, timeLeft } from '../time';
 import { taskHref } from '../url';
 import { tabKeys } from './Drafts';
@@ -228,6 +230,11 @@ export function DraftPage({ id }: { id: string }) {
   const { reloadDrafts } = useData();
   const { isPhone } = useShell();
   const toast = useToast();
+  const { mark, step } = useTour();
+  const showNudge = useShowNudge();
+  // The one "Approved!" moment: shown on this page right after the approval that earned it.
+  const [cheer, setCheer] = useState(false);
+  const opened = useRef(false);
 
   const [draft, setDraft] = useState<Draft | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -270,6 +277,21 @@ export function DraftPage({ id }: { id: string }) {
   );
   // The edit box, the suggestion diff and the "unsaved" check all work on the text without markers.
   const plainBody = useMemo(() => stripMarkers(draft?.body ?? ''), [draft?.body]);
+
+  // The guided start's second step: a draft was opened, and what the bot read is beside it.
+  const loaded = draft !== null;
+  useEffect(() => {
+    if (!loaded || opened.current) return;
+    opened.current = true;
+    void step('open');
+  }, [loaded, step]);
+
+  /** After an approval: the third step, and the "Approved!" moment if one is due. */
+  const approvedNow = () => {
+    const due = mayCheer(me);
+    setCheer(due);
+    void mark('tour_decided', ...(due ? (['tour_cheered'] as const) : []));
+  };
 
   const adopt = useCallback((d: Draft) => {
     setDraft(d);
@@ -404,6 +426,7 @@ export function DraftPage({ id }: { id: string }) {
       const d = await api.saveDraft(id, { title, body });
       adopt(d);
       toast(copy.toast.saved, 'good');
+      void step('decide');
       void reloadDrafts();
       return true;
     } catch {
@@ -422,6 +445,7 @@ export function DraftPage({ id }: { id: string }) {
       if (dirty && !(await save())) return;
       setSuggestion(await api.requestChange(id, text));
       setInstruction('');
+      void step('decide');
     } catch (err) {
       setChangeError(
         err instanceof ApiError && err.code === 'change_in_progress'
@@ -497,6 +521,7 @@ export function DraftPage({ id }: { id: string }) {
       setDraft(d);
       setConfirming(false);
       setJustApproved(true);
+      approvedNow();
       toast(d.practice ? copy.toast.practiceApproved : copy.toast.approved(d.kind), 'good');
       void refreshMe();
       void reloadDrafts();
@@ -559,6 +584,7 @@ export function DraftPage({ id }: { id: string }) {
       if (d.status === 'pending') toast(copy.approve.checkedPending);
       else if (d.status === 'approved') {
         setJustApproved(true);
+        approvedNow();
         toast(d.practice ? copy.toast.practiceApproved : copy.toast.approved(d.kind), 'good');
         void refreshMe();
       }
@@ -572,6 +598,7 @@ export function DraftPage({ id }: { id: string }) {
     try {
       setDraft(await api.reject(id, reason || undefined));
       setRejecting(false);
+      void step('decide');
       toast(copy.toast.rejected);
       void reloadDrafts();
     } catch (err) {
@@ -1087,9 +1114,22 @@ export function DraftPage({ id }: { id: string }) {
       )}
 
       {!pending && (
-        <section className={`banner banner-${draft.status === 'approved' ? 'good' : 'neutral'} outcome`} aria-label="Outcome" role="status">
-          <Icon name={draft.status === 'approved' ? 'check' : 'info'} className="banner-icon" />
+        <section
+          className={`banner banner-${draft.status === 'approved' ? 'good' : 'neutral'} outcome ${cheer && draft.status === 'approved' ? 'outcome-cheer' : ''}`}
+          aria-label="Outcome"
+          role="status"
+        >
+          {cheer && draft.status === 'approved' && showNudge ? (
+            <Nudge pose="yay" size={46} className="cheer-art" />
+          ) : (
+            <Icon name={draft.status === 'approved' ? 'check' : 'info'} className="banner-icon" />
+          )}
           <div className="banner-body">
+            {cheer && draft.status === 'approved' && (
+              <p className="cheer-text" data-cheer="true">
+                <strong className="cheer-title">{copy.tour.cheerTitle}</strong> {copy.tour.cheerText}
+              </p>
+            )}
             {draft.status === 'approved' && draft.practice && <p>{copy.approve.practiceApproved}</p>}
             {draft.status === 'approved' && !draft.practice && (
               <>

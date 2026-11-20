@@ -139,23 +139,34 @@ An unknown `reason` should read as `failed`.
 | Method and path | Body | Answer |
 | --- | --- | --- |
 | `GET /api/me` | | `Me` |
-| `PUT /api/me/settings` | `{nudges?: bool}` | `Me` |
-| `POST /api/me/hints` | `{seen: "sources" \| "ask" \| "approve"}` | `Me` |
-| `DELETE /api/me/hints` | | `Me`, with `hints_seen` empty ("Show hints again") |
+| `PUT /api/me/settings` | `{nudges?: bool, mascot?: bool}` | `Me` |
+| `POST /api/me/hints` | `{seen: "sources" \| "ask" \| "approve" \| "tour_started" \| "tour_asked" \| "tour_opened" \| "tour_decided" \| "tour_skipped" \| "tour_cheered"}` | `Me` |
+| `DELETE /api/me/hints` | | `Me`, with `hints_seen` empty ("Show hints again"; it restarts the guided start too) |
 
 ```json
 {"handle": "ana", "display_name": "Ana Silva", "name": "Ana Silva", "roles": ["pm"],
  "permissions": ["ask-bot", "view-own-tasks", "manage-own-routines", "decide-own-approval",
                  "view-own-traces", "link-own-accounts"],
  "reviewer": false,
- "csrf_token": "…", "first_visit": true, "hints_seen": ["sources"], "nudges": true}
+ "csrf_token": "…", "first_visit": true, "hints_seen": ["sources"], "nudges": true, "mascot": true}
 ```
 
 `reviewer` is true when the person holds the `reviewer` role: show the Reviews entry
 (**Reviews**). It is the role, not the `recommend-on-approval` permission, which an admin
 holds too without reviewing anyone. An older server leaves it out: treat that as `false`.
 
-`first_visit` is true until the PM first opens a draft. `nudges: false` also hides hints.
+`first_visit` is true until the PM first opens a draft. `nudges: false` also hides hints and
+the guided start.
+
+`hints_seen` also carries the guided start's marks, which the app writes and reads; the server
+only keeps them. `tour_started` means the guided start is on (written when a first visit shows
+the welcome card, and after "Show hints again"); `tour_asked`, `tour_opened` and
+`tour_decided` are its three steps (ask for something; open a draft; approve, reject or change
+one); `tour_skipped` ends it early; `tour_cheered` records the one "Approved!" moment.
+
+`mascot` is "Show Nudge": whether the app draws its mascot. `false` hides the character
+everywhere and nothing else: hints, empty states and the guided start keep their text. It
+defaults to `true`; an older server leaves it out, which means `true`.
 
 `display_name` is the person's display name in the user database (`""` when none is set),
 **untrusted text**: render it as plain text, never as HTML or Markdown. `name` is what to
