@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { Suspense, lazy, useEffect, useRef, useState } from 'react';
 import type { FormEvent, KeyboardEvent, ReactNode } from 'react';
 import type { Brief, DraftSummary, FollowUp, Task } from '../api';
 import { messageOf, useApp } from '../app-context';
@@ -9,10 +9,14 @@ import { Icon } from '../components/icons';
 import { copy } from '../copy';
 import { useAsk, useData } from '../data';
 import { draftWhere, effectiveStatus } from '../drafts';
+import { tourState } from '../onboarding';
 import { usableProgress } from '../tasks';
 import { relTime, timeLeft } from '../time';
 import { draftHref, taskHref } from '../url';
 import { TaskTable } from './Activity';
+
+// The guided start is for new people only, so its card is a small chunk of its own.
+const Welcome = lazy(() => import('../components/Welcome').then((m) => ({ default: m.Welcome })));
 
 function dateLine(d: Date): string {
   return d.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' });
@@ -269,29 +273,31 @@ function Card({ id, className, children }: { id: string; className?: string; chi
 }
 
 export function Home() {
-  const { api, me, navigate, openPalette } = useApp();
+  const { api, me, openPalette } = useApp();
   const { drafts, draftsError, reloadDrafts, brief, briefState, tasks, reloadTasks } = useData();
   const { start, asking, error: followError } = useAsk();
-  const firstVisit = useRef(me.first_visit).current;
   const [practiceError, setPracticeError] = useState<string | null>(null);
   const practiceStarted = useRef(false);
+  const tour = tourState(me);
 
   useEffect(() => {
     void reloadDrafts();
     void reloadTasks();
   }, [reloadDrafts, reloadTasks]);
 
-  // Onboarding: a first visit with no drafts opens the practice draft.
+  // The guided start practises on the practice draft, so nothing real is sent: make one when
+  // it is on (or on a first visit with no drafts) and there is none yet. It is not opened by
+  // itself; the welcome card's steps point at it.
+  const practice = (drafts ?? []).find((d) => d.practice && d.status === 'pending') ?? (drafts ?? []).find((d) => d.practice) ?? null;
+  const wantsPractice = tour.variant !== 'auditor' && (tour.active || (me.first_visit && drafts?.length === 0));
   useEffect(() => {
-    if (!drafts || practiceStarted.current) return;
-    if (me.first_visit && drafts.length === 0) {
-      practiceStarted.current = true;
-      api
-        .createPractice()
-        .then((d) => navigate(`/d/${d.id}`))
-        .catch((e) => setPracticeError(messageOf(e, copy.errors.loadHomeFailed)));
-    }
-  }, [drafts, me.first_visit, api, navigate]);
+    if (!drafts || practiceStarted.current || !wantsPractice || practice) return;
+    practiceStarted.current = true;
+    api
+      .createPractice()
+      .then(() => reloadDrafts())
+      .catch((e) => setPracticeError(messageOf(e, copy.errors.loadHomeFailed)));
+  }, [drafts, wantsPractice, practice, api, reloadDrafts]);
 
   const now = Date.now();
   const firstName = me.name.split(' ')[0] ?? me.name;
@@ -311,7 +317,6 @@ export function Home() {
         <div className="today-head-text">
           <p className="eyebrow">{dateLine(new Date())}</p>
           <h1>{known ? `${greeting} ${copy.today.needs(needs)}` : greeting}</h1>
-          {firstVisit && drafts && drafts.length > 0 && <p className="lede">{copy.welcomeWithDrafts}</p>}
         </div>
         {brief && briefState === 'ready' && timing !== 'unknown' && (
           <p className={`today-brief ${timing === 'today' ? '' : 'today-brief-quiet'}`}>
@@ -329,6 +334,12 @@ export function Home() {
           </p>
         )}
       </header>
+
+      {tour.active && (
+        <Suspense fallback={null}>
+          <Welcome practiceId={practice?.id ?? null} />
+        </Suspense>
+      )}
 
       <Composer />
 
@@ -378,7 +389,9 @@ export function Home() {
               {!brief ? (
                 <div className="card-body"><Skeleton rows={2} label={copy.home.loadingDrafts} /></div>
               ) : brief.waiting_on_you.length === 0 ? (
-                <Empty icon="inbox" small>{timing === 'today' ? copy.nothingWaiting : timing === 'stale' ? copy.today.briefStaleCard : copy.today.briefNeverCard}</Empty>
+                <Empty icon="inbox" small nudge={timing === 'today' && !tour.active ? 'calm' : undefined}>
+                  {timing === 'today' ? copy.nothingWaiting : timing === 'stale' ? copy.today.briefStaleCard : copy.today.briefNeverCard}
+                </Empty>
               ) : (
                 <ul className="rows" aria-label={copy.today.waitingHeading}>
                   {brief.waiting_on_you.slice(0, 4).map((f) => (

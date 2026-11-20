@@ -87,7 +87,7 @@ export function ReviewsInbox() {
         {!reviews && reviewsError === null && <Skeleton rows={4} label={copy.reviews.loading} />}
         {reviews?.truncated && <p className="admin-hint drafts-cut">{copy.reviews.truncated(reviews.total, drafts.length)}</p>}
         {reviews && drafts.length === 0 && (
-          <Empty icon="review">{reviews.pms.length === 0 ? copy.reviews.emptyNobody : copy.reviews.empty}</Empty>
+          <Empty icon="review" nudge="calm">{reviews.pms.length === 0 ? copy.reviews.emptyNobody : copy.reviews.empty}</Empty>
         )}
         {drafts.length > 0 && (
           <div className="table">

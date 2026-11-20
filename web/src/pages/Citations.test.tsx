@@ -184,7 +184,9 @@ describe('before you approve: the source check', () => {
   });
 
   it('does not warn on a practice draft, which never has links', async () => {
+    const user = userEvent.setup();
     renderApp({ noDrafts: true });
+    await user.click(await screen.findByRole('link', { name: /Practice: why PMs should take the stairs/ }));
     expect(await screen.findByText(copy.draft.practiceLabel + '.')).toBeInTheDocument();
     expect(checklist()).not.toHaveTextContent(copy.draft.checklist.noneCited);
   });
