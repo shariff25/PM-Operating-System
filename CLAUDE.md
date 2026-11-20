@@ -42,11 +42,16 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   model; OpenShell holds one credential per provider and enforces which endpoints are
   reachable. (OpenShell's docs, v0.1.9 "Inference", say its managed inference route was
   removed and the workload chooses the model, so it gives no switching or fallback.)
-- **j. Bot marketplace** (owner, 2026-11-20; plan only, build nothing until the plan is
-  approved): widen the product beyond one PM assistant. Three new bots: a Chief of Staff for a
+- **j. Bot marketplace** (owner, 2026-11-20): widen the product beyond one PM assistant. Three new bots: a Chief of Staff for a
   product manager, a Growth product manager and an Outbound product manager. As part of
   onboarding the user sees a bot marketplace and chooses which bots to include. Each bot has
   its own mascot.
+  Go-ahead given by the owner on 2026-11-20 ("integrate the bot marketplace as onboarding"),
+  with the conductor's recommended defaults since the owner named none: each PM gets their own
+  use of each bot they pick; today's assistant (Nudge) stays as the always-on generalist; PMs
+  choose freely from the catalog an Admin offers; the mascots are Chief (Chief of Staff),
+  Sprout (Growth PM) and Echo (Outbound PM), in Nudge's style, which the owner chose to keep.
+  Spec: `docs/bot-marketplace-spec.md`.
 - **h. Dropped by the owner on 2026-11-17:** the review of how the Grok bot was built. Do not
   build it.
 
