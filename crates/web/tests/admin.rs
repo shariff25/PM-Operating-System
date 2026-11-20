@@ -195,6 +195,7 @@ async fn toolserver(
                       "deactivation_grace_hours": 24, "bots_without_active_owner": [],
                       "first_links": [{"handle": "ana", "at": "2026-11-16T09:00:00Z",
                                        "provider": "entra", "oid": "SECRET"}],
+                      "password_resets": [{"handle": "ana", "by": "ada", "at": "2026-11-16T08:00:00Z", "extra": "dropped"}],
                       "secret": "SECRET"},
         }))
         .into_response(),
@@ -657,7 +658,8 @@ async fn team_and_overview() {
                          "deactivation_limit": 3, "deactivation_limit_reached": false,
                          "deactivation_grace_hours": 24, "bots_without_active_owner": [],
                          "first_links": [{"handle": "ana", "at": "2026-11-16T09:00:00Z",
-                                          "provider": "entra"}]}})
+                                          "provider": "entra"}],
+                         "password_resets": [{"handle": "ana", "by": "ada", "at": "2026-11-16T08:00:00Z"}]}})
     );
 }
 

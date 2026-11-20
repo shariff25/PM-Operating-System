@@ -919,10 +919,18 @@ async fn signed_in(parts: &Parts, state: &AppState, allow_stale: bool) -> Result
                 .map_err(ApiError::store)?;
             return Err(no_longer_a_member());
         }
+        // A password session never runs on the last-known-good answer (PM4): its epoch must be
+        // checked against the user database on every request, so a reset or a password change
+        // ends it within 10 seconds even while the tool server can't be reached. It fails
+        // closed below, like every write.
         Err(ResolveError::Unavailable {
             last_known_good: Some(known),
             ..
-        }) if allow_stale && parts.method == Method::GET && known.age <= LAST_KNOWN_GOOD => {
+        }) if allow_stale
+            && parts.method == Method::GET
+            && known.age <= LAST_KNOWN_GOOD
+            && session.password_epoch.is_none() =>
+        {
             tracing::warn!(user = %session.handle, age_secs = known.age.num_seconds(), "user directory unavailable: a read on the last-known-good answer");
             (known.user, true)
         }

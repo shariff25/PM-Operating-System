@@ -230,7 +230,9 @@ if [ "${PMOS_TEST_PASSWORD_LOGIN:-}" = 1 ]; then
   rm -f "$STATE/password-setup-code"
   TS_PASSWORD=(PMOS_VAULT_KEY="pw1:$(openssl rand -base64 32)"
     PMOS_DEV_PASSWORD_SETUP_FOR="$HANDLE" PMOS_DEV_PASSWORD_SETUP_FILE="$STATE/password-setup-code")
-  WEB_PASSWORD=(PMOS_WEB_PASSWORD_LOGIN=1)
+  # Browsers reach pmos-web on 127.0.0.1 with no proxy (PMOS_WEB_DIRECT=1, loopback only), and
+  # development sign-in runs beside password sign-in on this machine only (the override).
+  WEB_PASSWORD=(PMOS_WEB_PASSWORD_LOGIN=1 PMOS_WEB_DIRECT=1 PMOS_WEB_DEV_LOGIN_WITH_PASSWORD=1)
 fi
 
 PIDS=()

@@ -268,3 +268,10 @@ compromised console can't decide one or call a tool.
 The web app is **off by default**. Turn it on only for a closed test network: development
 sign-in lets anyone who can reach its port sign in as any member. See
 [docs/web-app-running.md](../web-app-running.md) before you start it.
+
+With **password sign-in** (`PMOS_WEB_PASSWORD_LOGIN=1`, [docs/password-sign-in.md](../password-sign-in.md))
+the web app also needs `PMOS_WEB_PUBLIC_URL` set to its `https://` address and
+`PMOS_WEB_TRUSTED_PROXIES` set to the address the reverse proxy reaches it from: for a proxy on
+this host, the `pmos` network's gateway. Run `deploy/pmos-admin up` first (it makes the
+network), then `deploy/pmos-admin up --web`: while the setting is blank it refuses, printing the
+line to put in `deploy/.env`. The proxy must send `X-Forwarded-For`.

@@ -258,6 +258,7 @@ export const copy = {
       users_unavailable: "PM OS can't check who you are right now. Try again in a minute.",
       not_configured: "Password sign-in isn't fully set up on this PM OS yet. Tell a platform owner.",
       assertion_required: "Password sign-in can't run on this PM OS as it is set up. Tell a platform owner.",
+      proxy_not_trusted: "Password sign-in can't run through this address as PM OS is set up. Tell a platform owner.",
       not_found: "Password sign-in isn't switched on here.",
       failed: "That didn't work. Try again.",
     },
@@ -397,6 +398,15 @@ export const copy = {
       reauth_failed: "Your current password or the authenticator code wasn't right. Nothing changed.",
       no_password: "You don't have a PM OS password, so there is nothing to change. Nothing changed.",
       unknown: "I can't tell whether that went through. Sign out and sign in again to see where things stand.",
+    },
+
+    // Someone issued a reset code for this person (docs/web-api.md, "Password sign-in"). Shown until dismissed.
+    resetNotice: {
+      text: (who: string, date: string) => `Your sign-in was reset by ${who} on ${date}. If this was not you, tell an admin.`,
+      host: 'someone with host access',
+      dismiss: 'Dismiss',
+      dismissing: 'Dismissing…',
+      dismissFailed: "I couldn't dismiss this notice. Try again.",
     },
   },
 
@@ -1087,6 +1097,8 @@ export const copy = {
         firstLinks: (n: number) =>
           `${n} ${n === 1 ? 'person' : 'people'} signed in with Microsoft for the first time in the last 7 days`,
         firstLinksNext: "Each link is in the audit log. If you didn't expect one, unlink that Microsoft account on the Team page.",
+        resets: (n: number) => (n === 1 ? 'A password sign-in was reset this week' : `${n} password sign-ins were reset this week`),
+        resetsNext: 'Each person sees who reset it and when. Check the reset was asked for.',
       },
       notices: {
         ending: (date: string) => `The pilot exception ends on ${date}. After that nobody may hold Admin and Auditor together.`,
@@ -1256,6 +1268,9 @@ export const copy = {
         codeWaitingSetup: 'Setup code out',
         codeWaitingReset: 'Reset code out',
         codeWaitingSr: 'A setup or reset code was made and is not used yet.',
+        needsHostSetup: 'Password needs host',
+        needsHostSetupSr:
+          'Their password came from a code made in the web app, so it stopped working when they became an Admin or Auditor. They will need a host-issued setup code.',
       },
 
       setupCode: {
@@ -2127,6 +2142,7 @@ export const copy = {
       sign_in_unconfirmed: 'An admin needs to confirm the sign-in name first. Nothing changed.',
       too_many_attempts: 'Too many tries. Wait a few minutes, then try again.',
       sign_in_busy: 'Sign-in is busy right now. Try again in a moment.',
+      proxy_not_trusted: "Password sign-in can't run through this address as PM OS is set up. Nothing changed. Tell a platform owner.",
     } satisfies Record<ServerErrorCode, string>,
     loadDraftFailed: 'I could not open that draft.',
     notFound: 'That draft does not exist, or it is not yours.',

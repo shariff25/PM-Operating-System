@@ -9,6 +9,7 @@ import { PHONE_QUERY, useMediaQuery } from '../theme';
 import type { Route } from '../url';
 import { Icon, Mark } from './icons';
 import type { IconName } from './icons';
+import { ResetNotice } from './ResetNotice';
 import { UserMenu } from './UserMenu';
 
 type NavKey = 'home' | 'drafts' | 'reviews' | 'followups' | 'activity' | 'admin' | 'security';
@@ -259,6 +260,7 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
             </header>
           )}
           <main id="main" tabIndex={-1} className={`main main-${route.name}`}>
+            <ResetNotice />
             {children}
           </main>
         </div>

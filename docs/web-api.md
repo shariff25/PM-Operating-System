@@ -57,7 +57,10 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
   only** (pmos-web's own store); the brief then leaves out every item whose `system` is
   `slack` and says so (`slack_withheld: true`, see **The daily brief and follow-ups**).
   Every other route, every write, and anything that reaches the tool server or the runtime
-  answers `503 users_unavailable`. Past the 5 minutes, reads do too.
+  answers `503 users_unavailable`. Past the 5 minutes, reads do too. **A password session
+  never uses the last-known-good answer**: its credential's epoch must be checked on every
+  request, so it answers `503 users_unavailable` at once (a reset can't be outlived while the
+  tool server is down).
 - **HTTPS:** with an `https` `PMOS_WEB_PUBLIC_URL`, every response carries
   `Strict-Transport-Security: max-age=31536000`.
 - **Health:** `GET /healthz` (outside `/api`, no session) answers `ok` while the process runs.
@@ -186,7 +189,15 @@ step 1 again with the same code (it is spent only when step 4 succeeds).
 
 After step 2 the app continues as after any sign-in: `GET /api/me` for the CSRF token.
 
-**Signed in:** change the password, make new recovery codes, read one's own status (below).
+**Signed in:** change the password, make new recovery codes, read one's own status, dismiss a
+reset notice (below).
+
+**A reset is never silent.** When an admin (or someone with host access) makes a reset code for
+someone who already has a password, their `PasswordStatus.reset_notice` names who and when from
+that moment, through the reset, until they dismiss it
+(`POST /api/auth/password/reset-notice/dismiss`). Show it on every page from their next sign-in
+and on the security page, plainly: "Your sign-in was reset by <name> on <date>. If this was not
+you, tell an admin." Their old password keeps working until the code is used.
 
 ### Routes
 
@@ -201,12 +212,16 @@ After step 2 the app continues as after any sign-in: `GET /api/me` for the CSRF 
 | `POST /api/auth/password/change` | `{current_password: string, code: string, new_password: string}` | yes, with CSRF | `204`; sets a new `__Host-pmos` (this browser stays signed in, every other session ends) |
 | `POST /api/auth/password/recovery-codes` | `{code: string}` | yes, with CSRF | `200 {recovery_codes: string[10]}`, shown once; the old ones stop working |
 | `GET /api/auth/password/status` | | yes | `200 PasswordStatus` |
+| `POST /api/auth/password/reset-notice/dismiss` | `{}` | yes, with CSRF | `204`: the reset notice goes |
 | `POST /api/admin/users/{handle}/password-setup-code` | none or `{}` | yes, with CSRF; `manage-members` | `201 SetupCode`, shown once to the admin |
 
 Every `POST` needs the app's own `Origin` and a JSON body (`Content-Type: application/json`;
 send `{}` where there is nothing to say), the sign-in routes included (`403 bad_origin`,
 `415 bad_content_type`). The signed-in ones also need `X-Pmos-Csrf`. A field a route doesn't
-take, or a missing one, is `400 bad_request`. Every answer is `Cache-Control: no-store`.
+take, or a missing one, is `400 bad_request`; a body over 4 KiB is `413`. Every answer is
+`Cache-Control: no-store`. With no trusted proxy (`PMOS_WEB_DIRECT=1`), a request to the
+unauthenticated routes that carries `X-Forwarded-For`, `Forwarded` or `X-Real-IP` is
+`403 proxy_not_trusted`.
 
 **Cookies** (set and read by the server; the app never sees their values): `__Host-pmos-pending`
 (5 minutes) and `__Host-pmos-setup` (15 minutes), both `Path=/; Secure; HttpOnly;
@@ -236,7 +251,9 @@ every sign-in's.
 {"kind": "setup", "recovery_codes": ["abcd-efgh-ijkl-mnop", "…ten in all…"]}
 
 // PasswordStatus
-{"enabled": true, "password_set": true, "second_step_enrolled": true, "recovery_codes_left": 9}
+{"enabled": true, "password_set": true, "second_step_enrolled": true, "recovery_codes_left": 9,
+ "needs_host_setup": false,
+ "reset_notice": {"by": "ada", "by_name": "Ada Lovelace", "at": "2026-11-20T08:00:00Z"}}
 
 // SetupCode (shown once, to the admin)
 {"setup_code": "ABCDE-FGHIJ-KLMNO-PQRST", "handle": "ana", "kind": "reset",
@@ -260,6 +277,8 @@ every sign-in's.
 | `PasswordStatus.enabled` | boolean | The tool server has password sign-in on. |
 | `PasswordStatus.password_set`, `second_step_enrolled` | boolean | They have a password and an authenticator (always both, or neither). |
 | `PasswordStatus.recovery_codes_left` | integer, 0–10 | Unused recovery codes. |
+| `PasswordStatus.needs_host_setup` | boolean | They hold Admin or Auditor and their password came from a code an admin made in the web app: it doesn't work (`password_set` is then false) until someone with host access makes them a setup code. |
+| `PasswordStatus.reset_notice` | object or `null` | A reset someone made for them that they haven't dismissed: `by` (an admin's handle, or `host` for someone with host access), `by_name` (the admin's display name or `null`; plain text), `at` (RFC 3339). |
 | `SetupCode.setup_code` | string | `XXXXX-XXXXX-XXXXX-XXXXX`, 20 letters and digits. **Shown once** to the admin, who passes it on (it is never sent by PM OS). Spaces, hyphens and case don't matter when typed. |
 | `SetupCode.kind` | `"setup"` or `"reset"` | `reset` when the person already has a password: using it replaces everything and signs them out everywhere. |
 
@@ -273,13 +292,17 @@ ten (case, spaces and hyphens ignored).
   `422 weak_password`, word `reason`: `too_short`, `too_long`, `matches_name`, `common`.
 - **A wrong password, name or setup code** never says which was wrong, nor whether the account
   exists, has a password, is turned off or is waiting (`401 sign_in_failed`,
-  `401 setup_failed`). After **5** failures (passwords and codes together) an account waits
-  30 seconds, then longer with each further failure, at most **15 minutes**; the wait ends on
-  its own. Say "wait a few minutes" rather than a number.
+  `401 setup_failed`). After **5** failures (passwords and codes together) from one address,
+  that address waits 30 seconds for that account, then longer with each further failure, at
+  most **15 minutes**; the wait ends on its own, and the person can still sign in from their own
+  address meanwhile. Say "wait a few minutes" rather than a number.
 - **Codes:** 3 tries per sign-in (`attempts_left`), 5 at the setup's confirmation. Each code
   works once; if one was just used, wait for the next.
 - **Too many tries from one place:** `429 too_many_attempts` with `Retry-After` (seconds): 20
-  refused guesses from one address in 15 minutes, or the server's own limit.
+  refused attempts from one address (an IPv6 address counts by its /64) in 15 minutes, or the
+  server's own limit. **Every** refused attempt counts: a wrong password or code, an unknown or
+  expired sign-in or setup, a step out of order, a body that isn't the route's JSON; only PM OS's
+  own failures (`5xx`) don't.
 - **Setup codes** last 24 hours and work once; a new one replaces the old one.
 - **Recovery codes:** ten, each works once; making new ones replaces all ten.
 
@@ -311,7 +334,11 @@ for an admin's and an auditor's view alike, and never anything secret:
 and `setup_code_pending` (a setup or reset code was made, not yet used, not expired). Offer
 "Make a setup code" (or "Make a reset code" when `password_set`) for an active person with a
 confirmed sign-in name; for someone with `host_only` say it takes `pmos-admin users
-password-setup <handle>` instead; never for oneself.
+password-setup <handle>` instead; never for oneself. A fourth, `password_needs_host_setup`,
+is true when the person holds Admin or Auditor and their password came from a code made in the
+web app: it no longer works (`password_set` is then false) and their password sessions have
+ended. A role change's answer carries it, so the page can say at once "They will need a
+host-issued setup code".
 
 ## Me
 
@@ -670,6 +697,7 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `401` | `bad_token` | The producer route's token is wrong (server to server only). | Yes |
 | `403` | `bad_origin` | A write from another origin, or with neither `Origin` nor `Referer`. | Yes |
 | `403` | `bad_csrf` | A write without the session's CSRF token. | Yes |
+| `403` | `proxy_not_trusted` | Password sign-in: a request that carries a forwarded header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) while `pmos-web` trusts no proxy (`PMOS_WEB_DIRECT=1`): a proxy nobody named is in front. | Yes |
 | `403` | `not_a_member` | Not (or no longer) an active user in the user database; every session of theirs ends. Also when the tool server doesn't count them a member on a decision. | Yes |
 | `403` | `not_allowed` | Their role doesn't allow drafts, tasks or asking. | Yes |
 | `403` | `forbidden` | Admin and auditor routes their role doesn't allow; the reviewer routes for someone who isn't an active reviewer; the producer route called like a browser. | Yes |
@@ -734,7 +762,7 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `403` | `reauth_failed` | Changing a password or making new recovery codes: the current password or the authenticator code wasn't right. | Yes |
 | `409` | `no_password` | Changing a password, or making new recovery codes, for someone without a password. | Yes |
 | `409` | `sign_in_unconfirmed` | A password setup code for someone whose sign-in name no admin has confirmed, or a setup started with one. | Yes |
-| `429` | `too_many_attempts` | Password sign-in: too many refused guesses from one address (20 in 15 minutes), the server's own limit, or the account's delay on a signed-in change; `Retry-After`. | Yes |
+| `429` | `too_many_attempts` | Password sign-in: too many refused attempts from one address (20 in 15 minutes), the server's own limit, or a wait on a signed-in change; `Retry-After`. | Yes |
 | `503` | `sign_in_busy` | Password sign-in: every password check is busy; try again in a moment. | Yes |
 
 After an `unknown_outcome` the server has already read the draft once: if it showed this PM's
@@ -934,7 +962,8 @@ Counts for the admin home.
            "deactivations_last_hour": 1, "deactivation_limit": 3,
            "deactivation_limit_reached": false, "deactivation_grace_hours": 24,
            "bots_without_active_owner": [],
-           "first_links": [{"handle": "ben", "at": "2026-11-16T08:02:11.000Z", "provider": "entra"}]}}
+           "first_links": [{"handle": "ben", "at": "2026-11-16T08:02:11.000Z", "provider": "entra"}],
+           "password_resets": [{"handle": "ana", "by": "ada", "at": "2026-11-16T08:00:00Z"}]}}
 ```
 
 | Field | Type | Meaning |
@@ -969,6 +998,7 @@ Counts for the admin home.
 | `deactivation_grace_hours` | integer | 24. |
 | `bots_without_active_owner` | string[] | Bots whose owner is not an active user who may use PM OS. |
 | `first_links` | object[] or `null` | **New (review of `b469d5b`, U1).** Everyone who signed in with Microsoft for the first time in the last 7 days, newest first: `{handle, at (RFC 3339 UTC), provider: "entra"}`. "N people signed in with Microsoft for the first time in the last 7 days"; if one wasn't expected, unlink it on the Team page. Never an object id. `null` when the audit log can't be read back (or from an older tool server). |
+| `password_resets` | object[] | Reset codes made in the window for people who had a password: `handle`, `by` (an admin's handle, or `host`), `at`. Each person also sees a notice until they dismiss it. An older server leaves it out. |
 
 The three counts are `null` when the tool server's audit log can't be read back.
 **Purge runs in the audit list:** action `audit.purge`, system `audit`, actor
@@ -1128,6 +1158,7 @@ Every successful write answers the new `version`; use it for the next write.
 | `password_set` | boolean | They have a password for password sign-in (**Password sign-in**). An older server leaves it out: treat as `false`. |
 | `second_step_enrolled` | boolean | They have an authenticator for its second step (with a password, always). |
 | `setup_code_pending` | boolean | A setup or reset code was made for them and is unused and unexpired. |
+| `password_needs_host_setup` | boolean | They hold Admin or Auditor and their password came from a code made in the web app: it doesn't work until someone with host access makes them a setup code. An older server leaves it out. |
 | `sign_in_name` | string or `null` | **Admin view only.** Lower-case. |
 | `atlassian_email` | string or `null` | **Admin view only.** Lower-case. |
 | `github_login` | string or `null` | **Admin view only.** |

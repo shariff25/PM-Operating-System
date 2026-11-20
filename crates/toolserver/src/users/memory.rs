@@ -22,6 +22,7 @@ use super::{
     ROLE_CHANGES_RETENTION_DAYS,
 };
 use crate::audit::{AuditEvent, AuditSink, Client, Outcome};
+use crate::password::limits::{Counter, SourceCounters};
 use crate::password::store::{
     Credential, PasswordStatus, PasswordStore, Pending, Person, Plan, Purpose, RecoveryCode,
     SetupCode, Snapshot, Writes,
@@ -55,6 +56,8 @@ struct Passwords {
     /// By token hash: the owner and the token.
     pending: BTreeMap<String, (String, Pending)>,
     next_code_id: i64,
+    /// By (handle, source key): one person's counters for one address.
+    sources: BTreeMap<(String, String), SourceCounters>,
 }
 
 impl Passwords {
@@ -71,6 +74,7 @@ impl Passwords {
         self.recovery.remove(handle);
         self.codes.retain(|c| c.handle != handle);
         self.pending.retain(|_, (h, _)| h != handle);
+        self.sources.retain(|(h, _), _| h != handle);
     }
 }
 
@@ -95,6 +99,7 @@ fn check_writes(handle: &str, exists: bool, w: &Writes, now: DateTime<Utc>) -> S
     let writes_rows = w.credential.is_some()
         || w.recovery.is_some()
         || w.issue_code.is_some()
+        || w.source.is_some()
         || !w.put_pending.is_empty();
     if writes_rows && (!exists || handle == super::EVALS) {
         return bad("no such user, or the evals account");
@@ -395,12 +400,18 @@ impl PasswordStore for MemoryUsers {
         &self,
         handle: &str,
         actor: Option<&str>,
+        source: Option<&str>,
         now: DateTime<Utc>,
         plan: Plan<'_>,
     ) -> StoreResult<()> {
         // One person at a time, as the database's lock does; here the one lock covers all.
         let mut state = self.state.lock().await;
+        let source_row = source.map(|k| (handle.to_string(), k.to_string()));
         let snapshot = Snapshot {
+            source: source_row
+                .as_ref()
+                .and_then(|k| state.pw.sources.get(k).copied())
+                .unwrap_or_default(),
             person: state.dir.get(handle).map(person_of),
             actor: actor.and_then(|a| state.dir.get(a)).map(person_of),
             credential: state.pw.credentials.get(handle).cloned(),
@@ -421,6 +432,20 @@ impl PasswordStore for MemoryUsers {
         let pw = &mut state.pw;
         if let Some(c) = w.credential {
             pw.credentials.insert(handle.to_string(), c);
+        }
+        for ((h, _), s) in pw.sources.iter_mut() {
+            if h != handle {
+                continue;
+            }
+            if w.reset_sources {
+                s.sign_in = Counter::default();
+            }
+            if w.reset_sources || w.reset_source_setup {
+                s.setup = Counter::default();
+            }
+        }
+        if let (Some(s), Some(k)) = (w.source, source_row) {
+            pw.sources.insert(k, s);
         }
         if let Some(hashes) = w.recovery {
             pw.recovery.insert(
@@ -524,7 +549,7 @@ impl PasswordStore for MemoryUsers {
             .chain(state.pw.codes.iter().map(|c| &c.handle))
             .collect();
         for h in handles {
-            out.insert(h.clone(), status_of(&state.pw, h, now));
+            out.insert(h.clone(), status_of(&state, h, now));
         }
         Ok(out)
     }
@@ -535,30 +560,31 @@ impl PasswordStore for MemoryUsers {
         now: DateTime<Utc>,
     ) -> StoreResult<PasswordStatus> {
         let state = self.state.lock().await;
-        Ok(status_of(&state.pw, handle, now))
+        Ok(status_of(&state, handle, now))
     }
 
     async fn prune_passwords(&self, now: DateTime<Utc>) -> StoreResult<u64> {
         let mut state = self.state.lock().await;
         let pw = &mut state.pw;
-        let before = pw.pending.len() + pw.codes.len();
+        let before = pw.pending.len() + pw.codes.len() + pw.sources.len();
         pw.pending.retain(|_, (_, p)| p.expires_at > now);
         pw.codes.retain(|c| c.code.expires_at > now);
-        Ok((before - pw.pending.len() - pw.codes.len()) as u64)
+        pw.sources.retain(|_, s| !s.is_idle(now));
+        Ok((before - pw.pending.len() - pw.codes.len() - pw.sources.len()) as u64)
     }
 }
 
-fn status_of(pw: &Passwords, handle: &str, now: DateTime<Utc>) -> PasswordStatus {
-    let cred = pw.credentials.get(handle);
-    PasswordStatus {
-        password_set: cred.is_some_and(|c| c.password_hash.is_some()),
-        second_step_enrolled: cred.is_some_and(|c| c.totp_sealed.is_some()),
-        setup_code_pending: pw.live_code(handle).is_some_and(|c| c.expires_at > now),
-        recovery_codes_left: pw.recovery.get(handle).map_or(0, |r| {
+fn status_of(state: &State, handle: &str, now: DateTime<Utc>) -> PasswordStatus {
+    let pw = &state.pw;
+    let person = state.dir.get(handle).map(person_of);
+    PasswordStatus::of(
+        person.as_ref(),
+        pw.credentials.get(handle),
+        pw.live_code(handle).is_some_and(|c| c.expires_at > now),
+        pw.recovery.get(handle).map_or(0, |r| {
             r.iter().filter(|c| c.used_at.is_none()).count() as u32
         }),
-        epoch: cred.map_or(0, |c| c.epoch),
-    }
+    )
 }
 
 // --- The first Entra link (slice U2) ---------------------------------------------------------
