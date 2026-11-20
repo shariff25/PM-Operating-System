@@ -150,6 +150,15 @@ async fn load_directory(conn: &mut PgConnection, now: DateTime<Utc>) -> StoreRes
         let pm: String = row.try_get("pm")?;
         dir.assignments.entry(reviewer).or_default().insert(pm);
     }
+    for row in sqlx::query("SELECT kind, address, handle FROM retired_addresses")
+        .fetch_all(&mut *conn)
+        .await?
+    {
+        dir.retired.insert(
+            (row.try_get("kind")?, row.try_get("address")?),
+            row.try_get("handle")?,
+        );
+    }
     Ok(dir)
 }
 

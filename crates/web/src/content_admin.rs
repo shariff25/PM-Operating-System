@@ -134,7 +134,17 @@ pub fn tree(
         } else {
             (fm_str(fm, &["version"]), fm_str(fm, &["owner"]))
         };
-        let readable = admin || auditor_may_read(k, sensitivity.as_deref());
+        // The one read rule (UM3): it fails closed on front matter that doesn't parse, and a
+        // Markdown file whose text wasn't read (too large, or unreadable) is closed to an
+        // auditor too.
+        let readable = admin
+            || (auditor_may_read(k, sensitivity.as_deref())
+                && if rel.ends_with(".md") {
+                    text.as_deref()
+                        .is_some_and(|t| pmos_policy::admin::access::may_read(false, &rel, Some(t)))
+                } else {
+                    true
+                });
         let mut issues = by_path.remove(&rel).unwrap_or_default();
         if !readable {
             // Lint and parser messages can quote a file's values.
@@ -142,14 +152,17 @@ pub fn tree(
                 i.message = pmos_policy::admin::access::REDACTED_MESSAGE.to_string();
             }
         }
+        // A file this viewer may not open shows its path, kind, sensitivity, size and lint
+        // status only: no title, name, owner, version or review date from its front matter.
+        let shown = |v: Option<String>| v.filter(|_| readable);
         out.push(Entry {
             path: repo_path(content_dir, &rel),
             kind: k,
-            name: fm_str(fm, &["name"]),
-            title: fm_str(fm, &["title"]),
-            version,
-            owner: owner.map(|o| o.trim_start_matches('@').to_string()),
-            last_reviewed: fm_str(fm, &["last-reviewed"]),
+            name: shown(fm_str(fm, &["name"])),
+            title: shown(fm_str(fm, &["title"])),
+            version: shown(version),
+            owner: shown(owner.map(|o| o.trim_start_matches('@').to_string())),
+            last_reviewed: shown(fm_str(fm, &["last-reviewed"])),
             editable: proposals::writable(&rel).is_ok(),
             readable,
             sensitivity,
@@ -157,7 +170,14 @@ pub fn tree(
             lint: status(issues),
         });
     }
-    let other = by_path.into_values().flatten().collect();
+    // Findings on no listed file: their paths and messages can name anything in the tree,
+    // so a viewer without the edit permission gets them redacted like a closed file's.
+    let mut other: Vec<Issue> = by_path.into_values().flatten().collect();
+    if !admin {
+        for i in &mut other {
+            i.message = pmos_policy::admin::access::REDACTED_MESSAGE.to_string();
+        }
+    }
     (out, other)
 }
 

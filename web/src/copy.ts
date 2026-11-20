@@ -1084,6 +1084,9 @@ export const copy = {
         noSlackNext: 'They can use the web app, but their bot cannot reach them in Slack.',
         orphanBots: 'Bots without an active owner',
         orphanBotsNext: 'Give each bot an active owner, or pause it on the host.',
+        firstLinks: (n: number) =>
+          `${n} ${n === 1 ? 'person' : 'people'} signed in with Microsoft for the first time in the last 7 days`,
+        firstLinksNext: "Each link is in the audit log. If you didn't expect one, unlink that Microsoft account on the Team page.",
       },
       notices: {
         ending: (date: string) => `The pilot exception ends on ${date}. After that nobody may hold Admin and Auditor together.`,
@@ -1551,7 +1554,7 @@ export const copy = {
       zeroReviews: (branch: string) =>
         `GitHub lets whoever opens a pull request on ${branch} merge it with nobody else's review. Ask a repository owner to require at least one approving review.`,
       unverified: (branch: string) =>
-        `I couldn't check whether ${branch} requires a review. Your GitHub account may not be allowed to read branch protection. Check it in GitHub before you rely on review.`,
+        `I couldn't confirm that every change to ${branch} needs someone else's review: admins may be exempt, someone may be allowed to bypass it, or your GitHub account may not be allowed to read branch protection. Check it in GitHub before you rely on review.`,
       unavailable: "GitHub didn't answer, so I couldn't check whether the branch requires a review.",
       notLinkedTitle: 'Link GitHub to propose changes',
       notLinked:

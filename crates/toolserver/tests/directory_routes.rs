@@ -6,17 +6,26 @@
 //! fields), the ETag and `304`, the miss-only rate limit, every first-link condition, and two
 //! links racing for one identity: through the API on both stores, and in Postgres with raw SQL
 //! and no application lock, where the unique key alone decides.
+//!
+//! The first link takes the raw ID token (review of `b469d5b`, U1): the server here checks
+//! tokens against a fake tenant (`pmos_entra::testing::FakeIdp`) with locally generated keys.
+//! Forged, unsigned, wrong audience, issuer or tenant, expired, guest and replayed tokens are
+//! refused; the takeover from the review (the web token alone posting someone else's sign-in
+//! name) fails end to end; key rotation refetches; the tenant's keys down fail closed; no
+//! settings is `501`.
 
 mod common;
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use chrono::Utc;
 use common::{Fixture, TestPg};
 use pmos_assertion::{unix_now, Claims, Key, KeyRing, RequestBinding};
+use pmos_entra::testing::{jwk, keys, member_claims, sign, unsigned, FakeIdp};
 use pmos_toolserver::app::directory::MISSES_PER_MINUTE;
-use pmos_toolserver::app::BotAccess;
+use pmos_toolserver::app::{BotAccess, EntraLinkCheck};
 use pmos_toolserver::assertion::{parse_keys, Assertions, Mode, AUDIENCE, ISSUERS};
 use pmos_toolserver::audit::{AuditEvent, AuditQuery, Client, Outcome};
 use pmos_toolserver::users::{
@@ -39,12 +48,20 @@ const OID_ADA: &str = "aaaaaaaa-0000-0000-0000-00000000000a";
 const OID_CY: &str = "aaaaaaaa-0000-0000-0000-00000000000c";
 const OID_NEW: &str = "bbbbbbbb-0000-0000-0000-000000000001";
 const OID_NEW2: &str = "bbbbbbbb-0000-0000-0000-000000000002";
+/// The PM OS application (client) id the tool server checks `aud` against.
+const CLIENT: &str = "0b7f0c6e-1111-4222-8333-444455556666";
+const NONCE: &str = "the-sign-in-nonce-0123456789";
 
 struct Server {
     base: String,
     cancel: CancellationToken,
     f: Fixture,
     pg: Option<TestPg>,
+    /// The fake tenant the server validates first-link tokens against (`None`: not
+    /// configured).
+    idp: Option<FakeIdp>,
+    /// Each token gets its own `iat`, so two tokens are never one (a replay).
+    issued: AtomicI64,
 }
 
 impl Server {
@@ -88,17 +105,45 @@ impl Server {
         (s, serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 
-    async fn link(&self, handle: &str, name: &str, oid: &str) -> (u16, Value) {
+    /// A member's claims from the fake tenant for `oid` and `name`, valid now (each with its
+    /// own `iat`, a second apart).
+    fn claims(&self, oid: &str, name: &str) -> Value {
+        let idp = self.idp.as_ref().expect("a server with Entra settings");
+        let now = Utc::now().timestamp();
+        let mut c = member_claims(&idp.base, TID, CLIENT, oid, name, NONCE, now);
+        c["iat"] = json!(self.issued.fetch_add(1, Ordering::SeqCst));
+        c
+    }
+
+    /// Microsoft's ID token for `oid` with sign-in name `name`, signed with the tenant's key.
+    fn token(&self, oid: &str, name: &str) -> String {
+        sign(&self.claims(oid, name), keys::KEY_A_DER, "key-a")
+    }
+
+    /// The first-link route with `body`, as pmos-web.
+    async fn link_body(&self, handle: &str, body: Value) -> (u16, Value) {
         let (s, _, text) = self
             .send(
                 Method::POST,
                 &format!("/internal/users/{handle}/identities/entra"),
                 Some(WEB_TOKEN),
                 &[],
-                Some(json!({ "tid": TID, "oid": oid, "sign_in_name": name })),
+                Some(body),
             )
             .await;
         (s, serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    /// The first-link route with `token` and the sign-in's nonce.
+    async fn link_token(&self, handle: &str, token: &str) -> (u16, Value) {
+        self.link_body(handle, json!({ "id_token": token, "nonce": NONCE }))
+            .await
+    }
+
+    /// A first link for `handle` with a fresh, valid token naming `oid` and `name`.
+    async fn link(&self, handle: &str, name: &str, oid: &str) -> (u16, Value) {
+        let token = self.token(oid, name);
+        self.link_token(handle, &token).await
     }
 
     async fn events(&self) -> Vec<AuditEvent> {
@@ -228,6 +273,11 @@ async fn seed(users: &dyn UserStore) {
 /// token runs), and the seeded directory. In memory, or in Postgres (`None` without a test
 /// database).
 async fn start(postgres: bool) -> Option<Server> {
+    start_with(postgres, true).await
+}
+
+/// As [`start`], with or without Entra settings (a fake tenant).
+async fn start_with(postgres: bool, entra: bool) -> Option<Server> {
     let (f, pg) = if postgres {
         let (f, pg) = common::pg_fixture().await?;
         (f, Some(pg))
@@ -241,6 +291,27 @@ async fn start(postgres: bool) -> Option<Server> {
         |iss, aud| aud == AUDIENCE && ISSUERS.contains(&iss),
     )
     .unwrap();
+    let idp = if entra {
+        Some(FakeIdp::start(TID).await)
+    } else {
+        None
+    };
+    let check = idp.as_ref().map(|idp| {
+        let mut tenant = pmos_entra::Tenant::from_settings(
+            [
+                "PMOS_ENTRA_TENANT_ID",
+                "PMOS_ENTRA_CLIENT_ID",
+                "PMOS_ENTRA_AUTHORITY",
+            ],
+            TID,
+            CLIENT,
+            Some(&idp.base),
+        )
+        .unwrap();
+        // Short, so the key rotation case needn't wait a minute.
+        tenant.jwks_refetch_after = std::time::Duration::from_millis(200);
+        Arc::new(EntraLinkCheck::new(tenant).unwrap())
+    });
     let cancel = CancellationToken::new();
     let app = router_full(
         Arc::clone(&f.svc),
@@ -259,6 +330,7 @@ async fn start(postgres: bool) -> Option<Server> {
         PersonClients {
             web_token: Some(WEB_TOKEN.into()),
             assertions: Arc::new(Assertions::new(Mode::Require, keys).unwrap()),
+            entra: check,
         },
         cancel.clone(),
     );
@@ -276,6 +348,8 @@ async fn start(postgres: bool) -> Option<Server> {
         cancel,
         f,
         pg,
+        idp,
+        issued: AtomicI64::new(Utc::now().timestamp() - 600),
     })
 }
 
@@ -288,7 +362,7 @@ async fn both() -> Vec<Server> {
     v
 }
 
-fn sign(sub: &str, method: &str, target: &str) -> String {
+fn sign_assertion(sub: &str, method: &str, target: &str) -> String {
     let ring = KeyRing::new(Key::from_base64("w1", WEB_KEY).unwrap());
     let claims = Claims::new("web", "toolserver", sub, &[], "unknown").unwrap();
     let req = RequestBinding::new(method, target, b"").unwrap();
@@ -330,6 +404,7 @@ async fn every_directory_route_method_and_token() {
         ("directory", "/internal/directory"),
         ("resolve", "/internal/users/resolve?by=handle&handle=ana"),
         ("link", "/internal/users/ana/identities/entra"),
+        ("entra-link", "/internal/users/entra-link"),
     ];
     type Row<'a> = (&'a str, Option<&'a str>, bool, Vec<(&'a str, &'a str)>);
     let clients: [Row; 9] = [
@@ -355,13 +430,13 @@ async fn every_directory_route_method_and_token() {
             "web",
             Some(WEB_TOKEN),
             false,
-            vec![("GET", "resolve"), ("POST", "link")],
+            vec![("GET", "resolve"), ("POST", "link"), ("GET", "entra-link")],
         ),
         (
             "web, with an assertion",
             Some(WEB_TOKEN),
             true,
-            vec![("GET", "resolve"), ("POST", "link")],
+            vec![("GET", "resolve"), ("POST", "link"), ("GET", "entra-link")],
         ),
         (
             "console",
@@ -387,7 +462,7 @@ async fn every_directory_route_method_and_token() {
         let mut reached = Vec::new();
         for (route, target) in routes {
             for method in METHODS {
-                let a = signed.then(|| sign("ana", method, target));
+                let a = signed.then(|| sign_assertion("ana", method, target));
                 let headers: Vec<(&str, &str)> = a
                     .as_deref()
                     .map(|a| vec![("x-pmos-assertion", a)])
@@ -701,11 +776,13 @@ async fn first_link_conditions() {
             assert_eq!((s, body["code"].as_str()), (status, Some(code)), "{handle}");
             assert_no_secrets(&body.to_string(), false);
         }
-        // Malformed.
+        // Malformed. The old body, a bare `(tid, oid)` and a name on pmos-web's word, is
+        // refused outright (U1); so is a token without the nonce, or anything extra.
+        let token = srv.token(OID_NEW, "ana@contoso.com");
         for body in [
-            json!({ "tid": TID, "oid": "nope", "sign_in_name": "ana@contoso.com" }),
-            json!({ "tid": TID, "oid": OID_NEW }),
-            json!({ "tid": TID, "oid": OID_NEW, "sign_in_name": "ana@contoso.com", "email": "x" }),
+            json!({ "tid": TID, "oid": OID_NEW, "sign_in_name": "ana@contoso.com" }),
+            json!({ "id_token": token }),
+            json!({ "id_token": token, "nonce": NONCE, "oid": OID_NEW }),
         ] {
             let (s, _, text) = srv
                 .send(
@@ -947,5 +1024,323 @@ async fn trigger_free_race_the_unique_key_decides() {
     .await
     .unwrap();
     assert_eq!(n, 1);
+    srv.stop().await;
+}
+
+/// No Ana link, nothing written: the user database's version is unchanged since `before`.
+async fn assert_nothing_linked(srv: &Server, before: i64) {
+    let dir = srv.users().directory(Utc::now()).await.unwrap();
+    assert_eq!(dir.version, before);
+    assert!(dir
+        .get("ana")
+        .unwrap()
+        .identity(IdentityKind::Entra)
+        .is_none());
+}
+
+/// The route checks the ID token itself (U1): forged, unsigned, another audience, issuer or
+/// tenant, expired, a guest, no `acct`, another nonce. Each is refused, audited (`entra;
+/// <code>`, target Ana), counted as a miss, and writes nothing. On both stores.
+#[tokio::test]
+async fn the_first_link_validates_the_id_token_itself() {
+    for srv in both().await {
+        let before = srv.users().directory(Utc::now()).await.unwrap().version;
+        let good = srv.claims(OID_NEW, "ana@contoso.com");
+        let with = |k: &str, v: Value| {
+            let mut c = good.clone();
+            c[k] = v;
+            sign(&c, keys::KEY_A_DER, "key-a")
+        };
+        let base = srv.idp.as_ref().unwrap().base.clone();
+        let cases: Vec<(&str, String, u16, &str)> = vec![
+            (
+                "forged: signed with a key the tenant doesn't publish",
+                sign(&good, keys::KEY_B_DER, "key-a"),
+                422,
+                "invalid_token",
+            ),
+            ("unsigned", unsigned(&good, "key-a"), 422, "invalid_token"),
+            (
+                "another application's token",
+                with("aud", json!("aaaaaaaa-0000-0000-0000-0000000000ff")),
+                422,
+                "invalid_token",
+            ),
+            (
+                "another issuer",
+                with(
+                    "iss",
+                    json!(format!("{base}/99999999-2222-3333-4444-555555555555/v2.0")),
+                ),
+                422,
+                "invalid_token",
+            ),
+            (
+                "another tenant",
+                with("tid", json!("99999999-2222-3333-4444-555555555555")),
+                422,
+                "invalid_token",
+            ),
+            (
+                "expired",
+                with("exp", json!(Utc::now().timestamp() - 3600)),
+                422,
+                "invalid_token",
+            ),
+            (
+                "another sign-in's nonce",
+                with("nonce", json!("not-this-one")),
+                422,
+                "invalid_token",
+            ),
+            ("a guest", with("acct", json!(1)), 403, "not_a_member"),
+            (
+                "another identity provider",
+                with("idp", json!("live.com")),
+                403,
+                "not_a_member",
+            ),
+            (
+                "no acct claim",
+                {
+                    let mut c = good.clone();
+                    c.as_object_mut().unwrap().remove("acct");
+                    sign(&c, keys::KEY_A_DER, "key-a")
+                },
+                422,
+                "entra_misconfigured",
+            ),
+        ];
+        for (name, token, status, code) in &cases {
+            let (s, body) = srv.link_token("ana", token).await;
+            assert_eq!((s, body["code"].as_str()), (*status, Some(*code)), "{name}");
+            assert_no_secrets(&body.to_string(), false);
+        }
+        assert_nothing_linked(&srv, before).await;
+        let events = srv.events().await;
+        for code in ["invalid_token", "not_a_member", "entra_misconfigured"] {
+            let detail = format!("entra; {code}");
+            assert!(
+                events.iter().any(|e| e.tool == "users.identity_link"
+                    && e.outcome == Outcome::Denied
+                    && e.user == "anonymous"
+                    && e.output_ref.as_deref() == Some("ana")
+                    && e.detail.as_deref() == Some(detail.as_str())),
+                "{code}"
+            );
+            assert!(pmos_toolserver::users::detail::is_safe(&detail));
+        }
+        // Every refusal counted as a miss: the 11th..20th are still answered, then 429.
+        for i in cases.len()..MISSES_PER_MINUTE {
+            let (s, _) = srv
+                .link_token("ana", &sign(&good, keys::KEY_B_DER, "key-a"))
+                .await;
+            assert_eq!(s, 422, "refusal {i}");
+        }
+        let (s, body) = srv
+            .link_token("ana", &sign(&good, keys::KEY_B_DER, "key-a"))
+            .await;
+        assert_eq!((s, body["code"].as_str()), (429, Some("resolve_misses")));
+        srv.stop().await;
+    }
+}
+
+/// A token links once (U1): presented again, even for the same person, it is `403
+/// token_used`, audited; a later sign-in's token (a new `iat`) is its own.
+#[tokio::test]
+async fn a_replayed_token_is_refused() {
+    for srv in both().await {
+        let token = srv.token(OID_NEW, "ana@contoso.com");
+        let (s, body) = srv.link_token("ana", &token).await;
+        assert_eq!(
+            (s, body["first_link"].as_bool()),
+            (200, Some(true)),
+            "{body}"
+        );
+        for handle in ["ana", "ben"] {
+            let (s, body) = srv.link_token(handle, &token).await;
+            assert_eq!(
+                (s, body["code"].as_str()),
+                (403, Some("token_used")),
+                "{handle}"
+            );
+        }
+        assert!(srv
+            .events()
+            .await
+            .iter()
+            .any(|e| e.outcome == Outcome::Denied
+                && e.detail.as_deref() == Some("entra; token_used")));
+        // Her next sign-in's token answers as before: already linked, nothing written.
+        let (s, body) = srv.link("ana", "ana@contoso.com", OID_NEW).await;
+        assert_eq!((s, body["first_link"].as_bool()), (200, Some(false)));
+        srv.stop().await;
+    }
+}
+
+/// The takeover from the review (U1), end to end: someone holding only the web token, and a
+/// Microsoft account of their own in the tenant, confirms Ana's sign-in name through
+/// `resolve`, then tries to link their own `oid` to her. The old body (their `oid`, her name)
+/// is refused; their real token names their own sign-in name, not hers (`not_found`); a token
+/// they make up naming her is forged or unsigned. Nothing is linked, and Ana's own first
+/// sign-in later links her own account, which the admin overview lists (handle, time,
+/// provider; never the `oid`).
+#[tokio::test]
+async fn the_takeover_from_the_review_fails_end_to_end() {
+    for srv in both().await {
+        let before = srv.users().directory(Utc::now()).await.unwrap().version;
+        const MALLORY_OID: &str = "eeeeeeee-0000-0000-0000-00000000000e";
+        let (s, ana) = srv
+            .get(
+                "/internal/users/resolve?by=sign_in_name&name=ana@contoso.com",
+                WEB_TOKEN,
+            )
+            .await;
+        assert_eq!((s, ana["handle"].as_str()), (200, Some("ana")));
+        // 1. The request the review described: refused outright.
+        let (s, _) = srv
+            .link_body(
+                "ana",
+                json!({ "tid": TID, "oid": MALLORY_OID, "sign_in_name": "ana@contoso.com" }),
+            )
+            .await;
+        assert_eq!(s, 422);
+        // 2. Mallory's own valid token: it names her, not Ana.
+        let (s, body) = srv.link("ana", "mallory@contoso.com", MALLORY_OID).await;
+        assert_eq!((s, body["code"].as_str()), (404, Some("not_found")));
+        // 3. A token naming Ana with Mallory's oid: she can't get the tenant to sign it.
+        let forged = srv.claims(MALLORY_OID, "ana@contoso.com");
+        for token in [
+            sign(&forged, keys::KEY_B_DER, "key-a"),
+            sign(&forged, keys::KEY_B_DER, "key-b"),
+            unsigned(&forged, "key-a"),
+        ] {
+            let (s, body) = srv.link_token("ana", &token).await;
+            assert_eq!((s, body["code"].as_str()), (422, Some("invalid_token")));
+        }
+        assert_nothing_linked(&srv, before).await;
+        // Mallory's oid finds nobody.
+        let (s, _) = srv
+            .get(
+                &format!("/internal/users/resolve?by=entra&tid={TID}&oid={MALLORY_OID}"),
+                WEB_TOKEN,
+            )
+            .await;
+        assert_eq!(s, 404);
+
+        // Ana's own first sign-in links her own account.
+        let (s, body) = srv.link("ana", "ana@contoso.com", OID_NEW).await;
+        assert_eq!((s, body["first_link"].as_bool()), (200, Some(true)));
+        let e = srv
+            .users()
+            .directory(Utc::now())
+            .await
+            .unwrap()
+            .get("ana")
+            .unwrap()
+            .identity(IdentityKind::Entra)
+            .cloned()
+            .unwrap();
+        assert_eq!(e.subject, OID_NEW);
+        // The admin overview lists the first link: who, when, which provider; no oid.
+        let target = "/internal/admin/overview?user=raj";
+        let a = sign_assertion("raj", "GET", target);
+        let (s, _, text) = srv
+            .send(
+                Method::GET,
+                target,
+                Some(WEB_TOKEN),
+                &[("x-pmos-assertion", &a)],
+                None,
+            )
+            .await;
+        assert_eq!(s, 200, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let links = v["users"]["first_links"].as_array().unwrap();
+        assert_eq!(links.len(), 1, "{v}");
+        assert_eq!(links[0]["handle"], "ana");
+        assert_eq!(links[0]["provider"], "entra");
+        assert!(links[0]["at"].is_string());
+        assert_no_secrets(&text, false);
+        assert!(!text.contains(MALLORY_OID));
+        srv.stop().await;
+    }
+}
+
+/// The tenant rotates its keys: a token under a `kid` not yet fetched refetches the JWKS
+/// (at most once per interval) and links. With the tenant's endpoints down, nothing links
+/// (`503 entra_unavailable`): fail closed.
+#[tokio::test]
+async fn key_rotation_refetches_and_keys_down_fail_closed() {
+    let srv = start(false).await.unwrap();
+    let idp = srv.idp.as_ref().unwrap();
+    let (s, _) = srv.link("ana", "ana@contoso.com", OID_NEW).await;
+    assert_eq!(s, 200);
+    assert_eq!(idp.jwks_hits(), 1);
+    idp.set_keys(vec![
+        jwk("key-a", keys::KEY_A_N),
+        jwk("key-b", keys::KEY_B_N),
+    ]);
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let rotated = sign(
+        &srv.claims(OID_NEW2, "ben@contoso.com"),
+        keys::KEY_B_DER,
+        "key-b",
+    );
+    let (s, body) = srv.link_token("ben", &rotated).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(idp.jwks_hits(), 2);
+    srv.stop().await;
+
+    let srv = start(false).await.unwrap();
+    srv.idp.as_ref().unwrap().set_down(true);
+    let before = srv.users().directory(Utc::now()).await.unwrap().version;
+    for _ in 0..3 {
+        let (s, body) = srv.link("ana", "ana@contoso.com", OID_NEW).await;
+        assert_eq!((s, body["code"].as_str()), (503, Some("entra_unavailable")));
+    }
+    assert_nothing_linked(&srv, before).await;
+    srv.stop().await;
+}
+
+/// Without Entra settings the route answers `501 not_configured` and links nothing, whatever
+/// the body; `GET /internal/users/entra-link` says so. With them it names the tenant and
+/// client id.
+#[tokio::test]
+async fn no_entra_settings_is_501_and_says_so() {
+    let srv = start_with(false, false).await.unwrap();
+    let (s, v) = srv.get("/internal/users/entra-link", WEB_TOKEN).await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        v,
+        json!({"configured": false, "tenant_id": null, "client_id": null})
+    );
+    for body in [
+        json!({ "id_token": "x.y.z", "nonce": NONCE }),
+        json!({ "tid": TID, "oid": OID_NEW, "sign_in_name": "ana@contoso.com" }),
+    ] {
+        let (s, v) = srv.link_body("ana", body).await;
+        assert_eq!((s, v["code"].as_str()), (501, Some("not_configured")));
+    }
+    assert!(srv
+        .users()
+        .directory(Utc::now())
+        .await
+        .unwrap()
+        .get("ana")
+        .unwrap()
+        .identity(IdentityKind::Entra)
+        .is_none());
+    srv.stop().await;
+
+    let srv = start(false).await.unwrap();
+    let (s, v) = srv.get("/internal/users/entra-link", WEB_TOKEN).await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        v,
+        json!({"configured": true, "tenant_id": TID, "client_id": CLIENT})
+    );
+    let (s, _) = srv.get("/internal/users/entra-link", CONSOLE_TOKEN).await;
+    assert_eq!(s, 403);
     srv.stop().await;
 }

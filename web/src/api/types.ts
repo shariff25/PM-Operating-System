@@ -463,6 +463,8 @@ export interface OverviewUsers {
   deactivation_limit_reached: boolean;
   deactivation_grace_hours: number;
   bots_without_active_owner: string[];
+  /** First Microsoft (Entra) links in the window: who, when, which provider. Missing or null from an older tool server, or when the audit log can't be read back. */
+  first_links?: { handle: string; at: string; provider: string }[] | null;
 }
 
 export interface AdminOverview {

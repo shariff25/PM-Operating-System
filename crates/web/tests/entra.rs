@@ -4,8 +4,7 @@
 //! Admins and Auditors, conflicts, deactivation, the tool server unreachable), start-up rules,
 //! and that nothing secret reaches the logs.
 
-#[path = "entra/keys.rs"]
-mod keys;
+use pmos_entra::testing::keys;
 
 mod support;
 use support::FakeDirectory;
@@ -574,8 +573,18 @@ async fn signs_in_with_entra_and_the_session_works() {
     assert_eq!(challenge(&form["code_verifier"]), begun.challenge);
     assert_eq!(form["redirect_uri"], format!("{}/api/auth/callback", h.web));
 
-    // The first sign-in linked Ana's Microsoft account, `(tid, oid)`, at the tool server.
+    // The first sign-in linked Ana's Microsoft account, `(tid, oid)`, at the tool server,
+    // which got the raw ID token Microsoft issued and this flow's nonce, nothing else: never
+    // a bare `(tid, oid)` or a name it would have to take on pmos-web's word (U1).
     assert_eq!(h.links(), ["ana"]);
+    let bodies = h.tools.directory.link_bodies.lock().unwrap().clone();
+    assert_eq!(
+        bodies,
+        [json!({
+            "id_token": sign(&claims, keys::KEY_A_DER, "key-a"),
+            "nonce": begun.nonce,
+        })]
+    );
     assert_eq!(
         h.tools.directory.get("ana").unwrap().entra,
         Some((TENANT.into(), ANA_OID.into(), false))
@@ -1578,4 +1587,52 @@ async fn logs_never_contain_a_secret_code_or_token() {
     // The hash of nothing logged either (sanity: the secret's digest isn't a log key).
     let digest = b64(&sha2::Sha256::digest(SECRET.as_bytes()));
     assert!(!logs.contains(&digest));
+}
+
+/// With Entra sign-in on, `/readyz` checks that the tool server validates first-link tokens
+/// for the same tenant and client id (U1): not configured there, or another tenant or client,
+/// is `entra_link: down` (and the server not ready); the same ids are `ok`. With Entra off
+/// there is no such check.
+#[tokio::test]
+async fn readyz_checks_the_tool_servers_entra_settings() {
+    let h = harness().await;
+    let check = || async {
+        let res = h
+            .http
+            .get(format!("{}/readyz", h.web))
+            .send()
+            .await
+            .unwrap();
+        let status = res.status();
+        let body: Value = res.json().await.unwrap();
+        (status, body["checks"]["entra_link"].clone())
+    };
+    let (status, link) = check().await;
+    assert_eq!(link, "down");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    for (tenant, client) in [
+        ("11111111-2222-3333-4444-555555555555", CLIENT),
+        (TENANT, "11111111-2222-3333-4444-555555555555"),
+    ] {
+        *h.tools.directory.entra_link.lock().unwrap() = Some((tenant.into(), client.into()));
+        assert_eq!(check().await.1, "down", "{tenant} {client}");
+    }
+    *h.tools.directory.entra_link.lock().unwrap() = Some((TENANT.to_uppercase(), CLIENT.into()));
+    assert_eq!(check().await.1, "ok");
+
+    let off = harness_with(|c| {
+        c.entra = None;
+        c.dev_login = true;
+    })
+    .await;
+    let body: Value = off
+        .http
+        .get(format!("{}/readyz", off.web))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(body["checks"].get("entra_link").is_none(), "{body}");
 }

@@ -511,7 +511,7 @@ pub(super) async fn list(state: &AppState, signed: &Signed, kind: Kind) -> ApiRe
 /// viewer's own account, and whether proposals are set up there. Best effort: anything that
 /// goes wrong is `verified: false`, never an error.
 pub(super) async fn protection(state: &AppState, signed: &Signed) -> (Value, bool) {
-    let unknown = json!({"required_reviews": null, "verified": false});
+    let unknown = json!({"required_reviews": null, "verified": false, "admins_enforced": null, "bypass_allowed": null});
     match signed
         .toolserver(state)
         .admin(&signed.member.handle, "protection", &[])
@@ -524,11 +524,14 @@ pub(super) async fn protection(state: &AppState, signed: &Signed) -> (Value, boo
                 .unwrap_or(false);
             let reviews = v.get("required_reviews").and_then(Value::as_u64);
             let verified = v.get("verified").and_then(Value::as_bool).unwrap_or(false);
+            let flag = |k: &str| v.get(k).and_then(Value::as_bool);
             (
                 json!({
                     "branch": v.get("branch"),
                     "required_reviews": reviews,
                     "verified": verified,
+                    "admins_enforced": flag("admins_enforced"),
+                    "bypass_allowed": flag("bypass_allowed"),
                     "github": v.get("github"),
                 }),
                 configured,

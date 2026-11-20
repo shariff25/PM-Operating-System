@@ -78,8 +78,13 @@ fn role_token(t: &str) -> bool {
 }
 
 fn is_safe_part(part: &str) -> bool {
-    const FIXED: [&str; 20] = [
+    const FIXED: [&str; 24] = [
         "off",
+        // A first Entra link refused on the route's own check of the ID token (`link.rs`).
+        "invalid_token",
+        "token_used",
+        "not_a_member",
+        "entra_misconfigured",
         // `role_changes` of password sign-in: which kind of code, which credential.
         "setup",
         "reset",

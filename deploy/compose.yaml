@@ -108,6 +108,14 @@ services:
       # Each set token needs its key; a key is passed only when it is set.
       PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}
       PMOS_ASSERTION_KEYS: "${PMOS_AK_WEB_TOOLSERVER:+web:toolserver:${PMOS_AK_WEB_TOOLSERVER},}${PMOS_AK_CONSOLE_TOOLSERVER:+console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER}}"
+      # The first Microsoft sign-in (docs/entra-sign-in.md): the tool server validates the ID
+      # token the web app forwards itself, for the same tenant and application as the web app,
+      # so it gets the web app's settings (never the client secret, which it doesn't need). It
+      # fetches the tenant's keys from Microsoft through the proxy above. Blank: a first link
+      # answers 501 and the web app's /readyz reports `entra_link: down`.
+      PMOS_ENTRA_TENANT_ID: ${PMOS_WEB_ENTRA_TENANT_ID:-}
+      PMOS_ENTRA_CLIENT_ID: ${PMOS_WEB_ENTRA_CLIENT_ID:-}
+      PMOS_ENTRA_AUTHORITY: ${PMOS_WEB_ENTRA_AUTHORITY:-}
       PMOS_VAULT_KEY: ${PMOS_VAULT_KEY:?}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl

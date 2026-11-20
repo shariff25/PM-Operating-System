@@ -156,6 +156,28 @@ describe('overview: people who need an admin', () => {
     expect(screen.getByText(/^Lookups from the operator console found nobody more than 100 times/)).toBeInTheDocument();
   });
 
+  it('lists who signed in with Microsoft for the first time, by handle', async () => {
+    renderApp({
+      role: 'admin',
+      hash: '/admin',
+      wrap: (api) => {
+        const f = api.adminOverview.bind(api);
+        api.adminOverview = async () => {
+          const o = await f();
+          return {
+            ...o,
+            users: { ...o.users!, first_links: [{ handle: 'nia-first', at: '2026-11-19T09:00:00Z', provider: 'entra' }] },
+          };
+        };
+        return api;
+      },
+    });
+    const card = await screen.findByRole('region', { name: new RegExp(P.title) });
+    expect(within(card).getByText(P.firstLinks(1))).toBeInTheDocument();
+    expect(within(card).getByText(P.firstLinksNext)).toBeInTheDocument();
+    expect(within(card).getByRole('link', { name: 'nia-first' })).toBeInTheDocument();
+  });
+
   it('shows an auditor the same lists, linked to the Team page they may read', async () => {
     renderApp({ role: 'auditor', hash: '/admin' });
     const card = await screen.findByRole('region', { name: new RegExp(P.title) });

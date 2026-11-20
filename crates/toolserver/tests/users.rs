@@ -1074,6 +1074,73 @@ async fn unique_keys_and_addresses_never_reused(env: &Env) {
     let raj = env.dir().await.get("raj").cloned().unwrap();
     assert_eq!(raj.sign_in_name.as_deref(), Some("raj.kumar@contoso.com"));
     assert_eq!(raj.atlassian_email.as_deref(), Some("raj@contoso.com"));
+    // L8: the sign-in name raj had is still his, never anyone else's: not by a change, not
+    // for a new user. Raj may have it back.
+    let r = env
+        .apply(
+            &host(),
+            Op::SetField {
+                handle: "ben-not-yet".into(),
+                field: Field::SignInName,
+                value: "raj@contoso.com".into(),
+            },
+        )
+        .await;
+    assert!(r.is_err());
+    let mut carl = person("carl", &[UserRole::Pm]);
+    carl.sign_in_name = Some("Raj@Contoso.com".into());
+    let r = env.apply(&host(), Op::CreateUser { user: carl }).await;
+    assert_eq!(refusal(r), Refusal::Taken, "a retired sign-in name");
+    let r = env
+        .apply(
+            &host(),
+            Op::SetField {
+                handle: "ana".into(),
+                field: Field::SignInName,
+                value: "raj@contoso.com".into(),
+            },
+        )
+        .await;
+    assert_eq!(
+        refusal(r),
+        Refusal::Taken,
+        "a retired sign-in name, by a change"
+    );
+    // A retired GitHub login likewise, in any case.
+    env.apply(
+        &host(),
+        Op::SetField {
+            handle: "raj".into(),
+            field: Field::GithubLogin,
+            value: "raj-new".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut dan = person("dan", &[UserRole::Pm]);
+    dan.github_login = Some("RAJ-GH".into());
+    let r = env.apply(&host(), Op::CreateUser { user: dan }).await;
+    assert_eq!(refusal(r), Refusal::Taken, "a retired GitHub login");
+    env.apply(
+        &host(),
+        Op::SetField {
+            handle: "raj".into(),
+            field: Field::SignInName,
+            value: "raj@contoso.com".into(),
+        },
+    )
+    .await
+    .unwrap();
+    env.apply(
+        &host(),
+        Op::SetField {
+            handle: "raj".into(),
+            field: Field::SignInName,
+            value: "raj.kumar@contoso.com".into(),
+        },
+    )
+    .await
+    .unwrap();
     // One Entra key per person; one person per key.
     let r = env
         .apply(
@@ -2046,6 +2113,204 @@ async fn trigger_role_changes_append_only_and_retention() {
     .await
     .unwrap();
     assert_eq!(recorded, 1);
+    pg.drop_schema().await;
+}
+
+/// UM5 (review of `b469d5b`, migration 0021): a function with the purge's own name and
+/// signature in another schema, put first on the search path and called by its bare name,
+/// defeats neither append-only exception, even when it deletes only rows the real purge
+/// would (an old audit event; the role history of someone deactivated 91 days ago). Both
+/// triggers accept only the real function's frame, with its schema; the real purges still
+/// work.
+#[tokio::test]
+async fn a_same_named_function_on_the_search_path_defeats_neither_purge() {
+    let Some(pg) = pg().await else { return };
+    two_admins(&pg).await;
+    raw(
+        &pg,
+        "INSERT INTO users (handle, status, created_at, created_by, created_client, deactivated_at, deactivated_by)
+         VALUES ('gone91', 'deactivated', now() - interval '200 days', 'host', 'host', now() - interval '91 days', 'host')",
+    )
+    .await
+    .unwrap();
+    raw(
+        &pg,
+        "INSERT INTO role_changes (at, actor, client, host_user, target, change)
+         VALUES (now() - interval '300 days', 'host', 'host', 'opsuser', 'gone91', 'set_field')",
+    )
+    .await
+    .unwrap();
+    raw(
+        &pg,
+        "INSERT INTO audit_events (at, run_id, user_handle, skill, tool, outcome, sources, client, detail)
+         VALUES (now() - interval '200 days', 'old', 'ana', NULL, 'docs.search', 'ok', '{}', 'mcp', NULL)",
+    )
+    .await
+    .unwrap();
+    let schema: String = sqlx::query_scalar("SELECT current_schema()")
+        .fetch_one(pg.store.pool())
+        .await
+        .unwrap();
+    let count = |sql: &'static str| {
+        let pool = pg.store.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let old_events = "SELECT count(*) FROM audit_events WHERE run_id = 'old'";
+    let gone_rows = "SELECT count(*) FROM role_changes WHERE target = 'gone91'";
+    assert_eq!((count(old_events).await, count(gone_rows).await), (1, 1));
+
+    let evil = format!("{schema}_evil");
+    raw(&pg, &format!("CREATE SCHEMA {evil}")).await.unwrap();
+    for f in [
+        format!(
+            "CREATE FUNCTION {evil}.purge_audit_events(retention interval, batch_size integer)
+             RETURNS bigint LANGUAGE plpgsql AS $$
+             DECLARE n bigint;
+             BEGIN
+                 PERFORM set_config('pmos.audit_purge', 'on', true);
+                 DELETE FROM {schema}.audit_events WHERE at < now() - interval '100 days';
+                 GET DIAGNOSTICS n = ROW_COUNT;
+                 RETURN n;
+             END $$"
+        ),
+        format!(
+            "CREATE FUNCTION {evil}.purge_role_changes(batch_size integer)
+             RETURNS bigint LANGUAGE plpgsql AS $$
+             DECLARE n bigint;
+             BEGIN
+                 PERFORM set_config('pmos.role_changes_retention', 'on', true);
+                 DELETE FROM {schema}.role_changes WHERE target = 'gone91';
+                 GET DIAGNOSTICS n = ROW_COUNT;
+                 RETURN n;
+             END $$"
+        ),
+    ] {
+        raw(&pg, &f).await.unwrap();
+    }
+    for call in [
+        "SELECT purge_audit_events(interval '90 days', 10)",
+        "SELECT purge_role_changes(10)",
+    ] {
+        let mut tx = pg.store.pool().begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL search_path = {evil}, {schema}"
+        )))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        // The look-alike is what the bare name finds.
+        let found: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE p.oid = '{}'::regprocedure",
+            if call.contains("audit") {
+                "purge_audit_events(interval,integer)"
+            } else {
+                "purge_role_changes(integer)"
+            }
+        )))
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(found, evil);
+        let err = sqlx::query(sqlx::AssertSqlSafe(call.to_string()))
+            .execute(&mut *tx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("append-only"), "{call}: {err}");
+        tx.rollback().await.unwrap();
+    }
+    assert_eq!(
+        (count(old_events).await, count(gone_rows).await),
+        (1, 1),
+        "nothing went"
+    );
+    raw(&pg, &format!("DROP SCHEMA {evil} CASCADE"))
+        .await
+        .unwrap();
+    // The real purges, by their bare names on the normal search path, still do their work.
+    let purged: i64 =
+        sqlx::query_scalar("SELECT deleted FROM purge_audit_events(interval '90 days', 1000)")
+            .fetch_one(pg.store.pool())
+            .await
+            .unwrap();
+    assert!(purged >= 1);
+    assert_eq!(count(old_events).await, 0);
+    let row = sqlx::query("SELECT deleted FROM purge_role_changes(1000)")
+        .fetch_one(pg.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(row.get::<i64, _>("deleted"), 1);
+    assert_eq!(count(gone_rows).await, 0);
+    // Both functions and both triggers run with the fixed path.
+    let paths: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT p.proname || ' ' || array_to_string(p.proconfig, ',')
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = '{schema}' AND p.proname IN ('purge_audit_events', 'audit_events_append_only',
+               'purge_role_changes', 'role_changes_append_only')
+         ORDER BY 1"
+    )))
+    .fetch_all(pg.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(paths.len(), 4, "{paths:?}");
+    for p in &paths {
+        assert!(p.ends_with("search_path=pg_catalog, pg_temp"), "{p}");
+    }
+    pg.drop_schema().await;
+}
+
+/// L8 (review of `b469d5b`): an address a user had is never anyone else's, even after it
+/// changed, in the database itself (raw SQL, no application check); the same user may have
+/// it back.
+#[tokio::test]
+async fn trigger_an_old_address_is_never_reused() {
+    let Some(pg) = pg().await else { return };
+    two_admins(&pg).await;
+    let sign_in: String = sqlx::query_scalar("SELECT sign_in_name FROM users WHERE handle = 'ana'")
+        .fetch_one(pg.store.pool())
+        .await
+        .unwrap();
+    raw(
+        &pg,
+        "UPDATE users SET sign_in_name = 'ana.new@contoso.com', github_login = 'Ana-New' WHERE handle = 'ana'",
+    )
+    .await
+    .unwrap();
+    for sql in [
+        format!("UPDATE users SET sign_in_name = '{sign_in}' WHERE handle = 'raj'"),
+        format!(
+            "INSERT INTO users (handle, sign_in_name, status, created_at, created_by, created_client)
+             VALUES ('newbie', '{sign_in}', 'active', now(), 'host', 'host')"
+        ),
+    ] {
+        let err = raw(&pg, &sql).await.unwrap_err();
+        assert!(
+            err.contains("taken") && err.contains("never reused"),
+            "{sql}: {err}"
+        );
+    }
+    // The retired values can't be edited away.
+    for sql in [
+        "DELETE FROM retired_addresses",
+        "UPDATE retired_addresses SET handle = 'raj'",
+        "TRUNCATE retired_addresses",
+    ] {
+        let err = raw(&pg, sql).await.unwrap_err();
+        assert!(err.contains("append-only"), "{sql}: {err}");
+    }
+    // Ana may have her own old name back.
+    raw(
+        &pg,
+        &format!("UPDATE users SET sign_in_name = '{sign_in}' WHERE handle = 'ana'"),
+    )
+    .await
+    .unwrap();
     pg.drop_schema().await;
 }
 

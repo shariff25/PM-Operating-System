@@ -930,7 +930,7 @@ text as in §8.
 | Escalation through a pull request | No file grants anything after cut-over; `team.yaml` is a lint error; the import is a one-time host action. |
 | Compromised web backend | It can sign as any user to the tool server (a known limit of assertions). It **can't grant admin** (host-only), can't change an Admin's or Auditor's addresses or Entra link (host-only), can't remove the last admin (trigger), can't switch the pilot exception, and every change is in `role_changes` and the audit log with `client = web`. It can change other users' roles and deactivate up to 3 people an hour, reversible within the grace (§6); after that, host only. |
 | Compromised console | No write route accepts its token; single-item reads need a signed admin or the item's PM, checked against the database. |
-| Entra account takeover at first link | Links on `preferred_username` only, a confirmed name, members only (no guests), never for an Admin or Auditor (host sets their `oid`); a conflicting sign-in is refused, audited and flagged (§7). |
+| Entra account takeover at first link | Links on `preferred_username` only, a confirmed name, members only (no guests), never for an Admin or Auditor (host sets their `oid`); a conflicting sign-in is refused, audited and flagged (§7). Since the review of `b469d5b` the tool server validates the raw ID token itself and links only what it names, once per token, so the web token alone can't link anyone (§12). |
 | Stale cache after demotion | Bounded: tool server immediate, web/console ≤ 10 s, runtime/Slack ≤ 30 s while reachable; ≤ 5 min of web's own non-Slack data if the tool server is unreachable (§2). Writes are decided only at the tool server from the database. |
 | Database unavailable | Fail closed for sign-in, decisions, admin; last-known-good ≤ 5 min only for web's own non-Slack reads and for queueing (§2). No fallback to a file. |
 | Import tampering | Dry run first, conflicts never overwrite, admins only with `--allow-admins` and a terminal confirmation (or `--bootstrap` on an empty table, host only), file hash and commit recorded. |
@@ -1201,7 +1201,10 @@ stores; `crates/web/src/app/users.rs`; the console's `admin_inboxes`; a stack te
 `pmos-web` and the real tool server; `docs/web-api.md` "Admin: users and roles",
 `docs/toolserver.md` "The Admin API", `docs/runbooks/users.md`). The Team screen is U5b, built
 from `docs/web-api.md`. Where it differs from the text above:
-- **Migration `0018`, not `NNNN` after U1's**: `0016` is left free for the B1 fix in flight.
+- **Migration `0018`, not `NNNN` after U1's**: `0016` was left free for the B1 fix then in
+  flight. (Corrected in the review of `b469d5b`, L13: B1 had already landed as `0012`, so
+  `0016` is never used; the comments in `0018` and `0020` that still call it reserved are kept
+  as they are, because editing an applied migration changes its checksum.)
   It adds `reviewer_assignments` (U1 left it to U6; U5 needs it for the assignment route),
   with its own deferred trigger that takes the users lock, checks READ COMMITTED and bumps
   `directory_version` (`users_invariants()` keys on a `handle` column this table hasn't got).
@@ -1401,6 +1404,76 @@ in `docs/runbooks/upgrade.md`. Where it differs from the text above:
   test) was not run, only read and its commands checked; `scripts/test-pmos-admin.sh` was run.
   The eval stack and the Claude test stack were not started. No real install has a
   `team.yaml` to import, so the upgrade step is untested beyond the import's own tests.
+
+**Review of `b469d5b` (2026-11-20): the user database's findings, fixed** on
+`claude/gate-fix-userdb` (migration `0021_gate_fixes_userdb.sql`, the new crate `crates/entra`).
+The password sign-in findings (P1, P2, PM1–PM4, L1–L7, L12, L14, L15) are fixed on their own
+branch; UM6 is not in this batch.
+- **U1 (High), the first Entra link took `pmos-web`'s word.** `POST …/identities/entra` now
+  takes `{id_token, nonce}` only: the raw ID token Microsoft issued and the sign-in's `nonce`.
+  The tool server validates it itself (signature against the tenant's JWKS, fetched from the
+  tenant's OpenID configuration and cached a day, refetched on an unknown `kid` at most once a
+  minute, a failed fetch not retried for 5 seconds, 4 seconds per fetch, failing closed; `iss`,
+  `aud` = its own `PMOS_ENTRA_CLIENT_ID`, time with 60 seconds of skew, `nonce`, `tid` = its own
+  `PMOS_ENTRA_TENANT_ID`, and the `acct`, `idp`, `oid` and `preferred_username` rules), with
+  the **same code** as `pmos-web`: the rules moved into `crates/entra` (`pmos-entra`), which
+  both use. The `(tid, oid)` linked and the sign-in name matched come only from the validated
+  token; each token links once (`(oid, iat)` remembered until expiry; again is `403
+  token_used`). New tool server settings `PMOS_ENTRA_TENANT_ID` (already read by the host
+  commands), `PMOS_ENTRA_CLIENT_ID` and `PMOS_ENTRA_AUTHORITY`, passed by `deploy/compose.yaml`
+  from the web app's; without them the route answers `501 not_configured`. `pmos-web` doesn't
+  refuse to start over it (the tool server may not be up yet): its `/readyz` has `entra_link`,
+  `ok` only when `GET /internal/users/entra-link` names the same tenant and client. Every first
+  link is audited (as before) and now listed on the admin overview (`users.first_links`:
+  handle, time, provider; never the `oid`, to an admin or an Auditor), with a row on the
+  overview page. What still rests on `pmos-web`'s word, the later `resolve?by=entra` lookups
+  and sessions, is written down in `docs/entra-sign-in.md` ("What still rests on `pmos-web`'s
+  word"); not redesigned. Tests: `crates/entra/src/tests.rs`, `crates/toolserver/tests/
+  directory_routes.rs` (forged and unsigned tokens, wrong `aud`, `iss` and `tid`, expired, a
+  guest, another identity provider, no `acct`, another nonce, a replay, the review's takeover
+  end to end, key rotation, the keys down, no settings, refusals counted as misses, the
+  overview), `crates/web/tests/entra.rs` (the forwarded body, `/readyz`).
+- **UM1.** `/internal/members/requests/{id}/decision` and `/internal/members/{handle}/remove`
+  take the Slack bot's token only; the orchestrator's is `403` before the handler
+  (`tests/approvals_assertion.rs`, `only_the_slack_bot_token_decides_joins_and_removes_members`;
+  the U3 note above, "The orchestrator token is unsigned too", no longer applies).
+- **UM2.** `resolve` answers at most 600 hits per client in any rolling minute (`429
+  resolve_rate`); a signed-in person costs at most 6 a minute through the 10-second caches, so
+  600 covers 100 people active at once. Every first-link refusal counts as a miss, not only its
+  `404`s.
+- **UM3.** An Auditor's content tree shows no `title`, `name`, `owner`, `version` or
+  `last_reviewed` of a file they can't open; findings under `lint.other` are redacted for them;
+  the read rule (`pmos_policy::admin::access`) reads `sensitivity` in any case and fails closed
+  on front matter that doesn't parse or close, a non-text `sensitivity`, or a Markdown file
+  whose text wasn't read; the file route uses the same rule on the text.
+- **UM4.** `GET /internal/admin/protection` says `verified: true` only when the review is
+  required and GitHub's answer showed admins bound (`enforce_admins`, or a ruleset with no
+  bypass actor, read from the ruleset itself) and nobody on a bypass list, or when no review is
+  required at all (a known gap, warned). New fields `admins_enforced` and `bypass_allowed`,
+  `null` when the answer doesn't say. The screen's `unverified` sentence now names admins and
+  bypass; no new state.
+- **UM5.** Migration `0021`: the audit purge, the role-history purge and both append-only
+  triggers run with `search_path = pg_catalog, pg_temp`, tables named with their schema, and
+  each trigger accepts only the real function's frame **with its schema**
+  (`<schema>.purge_…`), which PL/pgSQL prints because the function isn't visible on its own
+  path. Tested in Postgres with a same-named function in another schema first on the search
+  path (`tests/users.rs`, `a_same_named_function_on_the_search_path_defeats_neither_purge`).
+- **L8.** `retired_addresses` (append-only) keeps every sign-in name, Atlassian email and
+  GitHub login a user had; a trigger refuses one for another user, and the rules check the same
+  in memory. The same user may have an old value back.
+- **L9.** After an OAuth link saves the credential, the person is read again: deactivated
+  since the checks, the credential is suspended (as the deactivation would have) and the link
+  refused; otherwise not allowed to use PM OS, it is deleted.
+- **L10.** `PMOS_GITHUB_URL`, `PMOS_GITHUB_AUTH_URL` and the Atlassian and Slack base overrides
+  must be `https://`; `http://` only to loopback (`localhost`, `127.0.0.0/8`, `::1`), which the
+  tests' mocks use.
+- **L11.** A proposal's title and reason have GitHub's closing keywords quoted (`'Fixes' #12`),
+  so merging it closes no issue.
+- **L13.** As noted in the U5a list above.
+- **Not verified:** a real Entra tenant's tokens and keys (the tests use a fake tenant with
+  locally generated keys); GitHub's real protection and ruleset answers (a mock with the
+  documented shapes); the deploy kit's tool server reaching `login.microsoftonline.com`
+  through the proxy.
 
 U4a–U4d run in parallel (U4b after U3, since `remove` calls U3's deactivation). U5 and U6 can
 overlap once the routes in U5 are merged.

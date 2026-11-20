@@ -396,24 +396,62 @@ async fn old_draft_link(Path(id): Path<String>) -> Response {
     }
 }
 
+/// With Entra sign-in on: does the tool server check first-link tokens for this server's tenant
+/// and client id? `None` with Entra off. The reason goes to the log, never the ids.
+async fn entra_link_ready(state: &AppState) -> Option<bool> {
+    let entra = state.0.entra.as_ref()?;
+    let ours = entra.config();
+    let ok = match state.0.directory.entra_link_settings().await {
+        Ok(Some((tenant, client)))
+            if tenant.eq_ignore_ascii_case(&ours.tenant_id)
+                && client.eq_ignore_ascii_case(&ours.client_id) =>
+        {
+            true
+        }
+        Ok(Some(_)) => {
+            tracing::error!("not ready: the tool server's Entra tenant or client id differs from PMOS_WEB_ENTRA_*: no first Microsoft sign-in can link (docs/entra-sign-in.md)");
+            false
+        }
+        Ok(None) => {
+            tracing::error!("not ready: the tool server has no Entra settings (PMOS_ENTRA_TENANT_ID, PMOS_ENTRA_CLIENT_ID): no first Microsoft sign-in can link (docs/entra-sign-in.md)");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                why = e.0,
+                "not ready: the tool server's Entra settings couldn't be read"
+            );
+            false
+        }
+    };
+    Some(ok)
+}
+
 /// `GET /readyz`: `200` when this server can serve, `503` otherwise, with each check's
 /// result (`ok` or `down`) and no detail: its store answers, and the bot runtime and the tool
 /// server (which answers who may sign in) answer their own `/healthz` within two seconds. No sign-in
-/// and no secrets: the details go to the log.
+/// and no secrets: the details go to the log. With Entra sign-in on, also `entra_link`: the
+/// tool server validates first-link ID tokens for the same tenant and client id as this
+/// server (`GET /internal/users/entra-link`); without that, a first Microsoft sign-in can't
+/// link, so the server isn't ready.
 async fn readyz(State(state): State<AppState>) -> Response {
-    let (store, runtime, toolserver) = tokio::join!(
+    let (store, runtime, toolserver, entra_link) = tokio::join!(
         state.0.sessions.ping(),
         state.0.runtime.healthy(),
         state.0.toolserver.healthy(),
+        entra_link_ready(&state),
     );
     if let Err(e) = &store {
         tracing::warn!(error = %e, "not ready: store");
     }
-    let checks = [
+    let mut checks = vec![
         ("store", store.is_ok()),
         ("bot_runtime", runtime),
         ("tool_server", toolserver),
     ];
+    if let Some(ok) = entra_link {
+        checks.push(("entra_link", ok));
+    }
     let ready = checks.iter().all(|(_, ok)| *ok);
     let body: serde_json::Map<String, serde_json::Value> = checks
         .iter()
@@ -1064,12 +1102,16 @@ impl EntraRefusal {
 }
 
 /// Who a checked ID token is in PM OS (`docs/user-database-spec.md` §7): by `(tid, oid)`;
-/// failing that, a first link by `preferred_username` only (never `email`), which the tool
-/// server re-checks and audits. Fails closed when the tool server can't be reached.
+/// failing that, a first link by `preferred_username` only (never `email`). The first link
+/// sends the tool server the raw ID token and this sign-in's `nonce`: it validates the token
+/// itself, links only the identity the token names, and audits it. Fails closed when the tool
+/// server can't be reached.
 async fn entra_person(
     state: &AppState,
-    identity: &entra::Identity,
+    signed: &entra::SignedIn,
+    nonce: &str,
 ) -> Result<DirectoryUser, EntraRefusal> {
+    let identity = &signed.identity;
     let dir = &state.0.directory;
     match dir.by_entra(&identity.tid, &identity.oid).await {
         Ok(user) => {
@@ -1107,7 +1149,13 @@ async fn entra_person(
         Err(_) => return Err(EntraRefusal::new("users_unavailable")),
     };
     match dir
-        .link_entra(&user.handle, &identity.tid, &identity.oid, name)
+        .link_entra(
+            &user.handle,
+            &identity.tid,
+            &identity.oid,
+            &signed.id_token,
+            nonce,
+        )
         .await
     {
         Ok(linked) => {
@@ -1130,6 +1178,13 @@ async fn entra_person(
             LinkRefusal::Linked | LinkRefusal::Taken => {
                 tracing::warn!(user = %user.handle, "Microsoft sign-in conflicts with an existing link: refused");
                 EntraRefusal::not_a_member()
+            }
+            // The tool server's own check of the token disagreed with ours (a configuration
+            // mismatch between the two, or a token pmos-web shouldn't have accepted): refused,
+            // and the log says so.
+            LinkRefusal::InvalidToken => {
+                tracing::error!(user = %user.handle, "the tool server refused an ID token pmos-web accepted: check that both have the same tenant and client id (docs/entra-sign-in.md)");
+                EntraRefusal::new("failed")
             }
             // 4. Anything else.
             _ => EntraRefusal::not_a_member(),
@@ -1429,8 +1484,8 @@ async fn entra_callback(
     // From here on the browser had started a sign-in with this server (its `state` matched),
     // so a refusal is recorded. Earlier failures (no flow, a forged or replayed callback) are
     // only logged: anyone can send those, and the audit log isn't theirs to fill.
-    let identity = match entra.sign_in_identity(code, nonce, verifier, *now).await {
-        Ok(identity) => identity,
+    let signed = match entra.sign_in_identity(code, nonce, verifier, *now).await {
+        Ok(signed) => signed,
         Err(f) => {
             record_sign_in(
                 &state,
@@ -1446,7 +1501,7 @@ async fn entra_callback(
             return fail(f);
         }
     };
-    let user = match entra_person(&state, &identity).await {
+    let user = match entra_person(&state, &signed, nonce).await {
         Ok(user) => user,
         Err(refusal) => {
             tracing::info!(
@@ -1460,7 +1515,8 @@ async fn entra_callback(
                 SignInEvent::Refused {
                     provider: "entra",
                     reason: refusal.reason,
-                    attempted: identity
+                    attempted: signed
+                        .identity
                         .preferred_username
                         .as_deref()
                         .filter(|_| refusal.attempted),
@@ -1474,7 +1530,7 @@ async fn entra_callback(
             ));
         }
     };
-    let entra_id = (identity.oid.clone(), identity.tid.clone());
+    let entra_id = (signed.identity.oid.clone(), signed.identity.tid.clone());
     let id = start_session(&state, &headers, &user, entra.name(), Some(entra_id), None).await?;
     Ok(redirect(
         &entra::safe_return(Some(&started.return_to)),
