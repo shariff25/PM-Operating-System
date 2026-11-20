@@ -1099,7 +1099,8 @@ export function DraftPage({ id }: { id: string }) {
           <div className="banner-body">
             <p><strong>{copy.draft.practiceLabel}.</strong> {copy.draft.practiceNote}</p>
             {pending && <p>{copy.welcomeNoDrafts}</p>}
-            <button type="button" className="btn btn-sm" onClick={remove}>{copy.draft.practiceDelete}</button>
+            {/* Once the draft is decided the status banner below carries this button; one is enough. */}
+            {pending && <button type="button" className="btn btn-sm" onClick={remove}>{copy.draft.practiceDelete}</button>}
             {deleteError && <ErrorNote>{deleteError}</ErrorNote>}
           </div>
         </div>
