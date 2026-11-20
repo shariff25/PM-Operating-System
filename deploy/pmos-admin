@@ -129,6 +129,44 @@ client_settings() { # web|console
   fi
 }
 
+# Password sign-in counts refused attempts per browser address (docs/password-sign-in.md,
+# "Behind the deploy kit's reverse proxy"). The web app listens on 0.0.0.0 in its container and
+# the reverse proxy on this host reaches it through the published port, so every request
+# arrives from the `pmos` network's gateway. pmos-web refuses to start unless it is told that
+# address (PMOS_WEB_TRUSTED_PROXIES) and has an https:// public URL; this says exactly what to
+# set before anything starts.
+password_web_checks() {
+  [ "${PMOS_WEB_PASSWORD_LOGIN:-0}" = 1 ] || return 0
+  local bad=0 gw
+  if [ -z "${PMOS_WEB_TRUSTED_PROXIES:-}" ]; then
+    gw=$(docker network inspect pmos_pmos --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)
+    {
+      say "PMOS_WEB_TRUSTED_PROXIES is blank in deploy/.env. With password sign-in on, the web app"
+      say "must know the address the reverse proxy reaches it from, or every browser would share"
+      say "one limit on refused sign-ins (and pmos-web refuses to start)."
+      if [ -n "$gw" ]; then
+        say "The reverse proxy on this host reaches it from the pmos network's gateway. Set:"
+        say "  PMOS_WEB_TRUSTED_PROXIES=$gw"
+      else
+        say "Start the core services first (deploy/pmos-admin up), then read the pmos network's"
+        say "gateway and set PMOS_WEB_TRUSTED_PROXIES to it:"
+      fi
+      say "  (found with: docker network inspect pmos_pmos --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}')"
+      say "A reverse proxy in a container on the pmos network instead: set its container address."
+    } >&2
+    bad=1
+  fi
+  case "${PMOS_WEB_PUBLIC_URL:-}" in
+    https://*) ;;
+    *)
+      say "PMOS_WEB_PUBLIC_URL must be the web app's https:// address with password sign-in on" >&2
+      say "(passwords and codes never cross the network in the clear)." >&2
+      bad=1
+      ;;
+  esac
+  return $bad
+}
+
 # Is the web app's Entra sign-in fully set in deploy/.env? (pmos-web itself refuses a partial
 # one at start-up, naming what is missing.)
 entra_configured() {
@@ -264,7 +302,10 @@ case "$cmd" in
         console_checks || exit 2
         client_settings console || exit 2
       fi
-      if [ "$arg" = --web ]; then client_settings web || exit 2; fi
+      if [ "$arg" = --web ]; then
+        client_settings web || exit 2
+        password_web_checks || exit 2
+      fi
     done
     # Not a process substitution: a refusal in `profiles` (an unknown option, a web app with no
     # sign-in) must stop `up` here, and its exit would be lost in one.

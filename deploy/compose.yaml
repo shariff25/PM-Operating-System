@@ -294,8 +294,11 @@ services:
       # Password sign-in with a required authenticator code (docs/password-sign-in.md): 1 turns
       # it on, beside Entra or alone; the tool server decides (it seals secrets with
       # PMOS_VAULT_KEY). pmos-web refuses it unless assertions are `require`, so it gets the
-      # mode from deploy/.env. Behind the reverse proxy, PMOS_WEB_TRUSTED_PROXIES names the
-      # proxy's address, so the per-address limit counts browsers, not the proxy.
+      # mode from deploy/.env. It also refuses it unless PMOS_WEB_TRUSTED_PROXIES names the
+      # address the reverse proxy reaches it from, so the per-address limit counts browsers, not
+      # the proxy: a proxy on this host comes in through the published port, from the `pmos`
+      # network's gateway (`pmos-admin up --web` prints it), and PMOS_WEB_PUBLIC_URL must be
+      # https://. PMOS_WEB_DIRECT is never passed: it is for a loopback bind with no proxy.
       PMOS_WEB_PASSWORD_LOGIN: ${PMOS_WEB_PASSWORD_LOGIN:-0}
       PMOS_WEB_TRUSTED_PROXIES: ${PMOS_WEB_TRUSTED_PROXIES:-}
       PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}

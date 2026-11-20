@@ -54,8 +54,11 @@ pub struct Config {
     pub password_login: bool,
     /// `PMOS_WEB_TRUSTED_PROXIES`: the addresses of the reverse proxies in front of pmos-web,
     /// comma-separated. A request from one of them is counted, for password sign-in's
-    /// per-address limit, by the right-most `X-Forwarded-For` address that isn't one of them;
-    /// any other request by its own peer address. Empty: every request by its peer.
+    /// per-address limit, by its `X-Forwarded-For` read from the right ([`crate::app`]'s
+    /// `password::source`); any other request by its own peer address. With password sign-in
+    /// on, it must be set unless `PMOS_WEB_DIRECT=1` says browsers reach pmos-web with no proxy
+    /// (a loopback bind only); with it empty, a password request that carries a forwarded
+    /// header is refused.
     pub trusted_proxies: Vec<IpAddr>,
     /// `PMOS_WEB_SESSION_IDLE_MINUTES`, default 480 (8 hours).
     pub session_idle: Duration,
@@ -112,6 +115,61 @@ pub const NO_PROVIDER: &str = "no sign-in provider: set PMOS_WEB_ENTRA_TENANT_ID
      PMOS_WEB_ENTRA_CLIENT_ID, PMOS_WEB_ENTRA_CLIENT_SECRET and PMOS_WEB_PUBLIC_URL for Entra \
      ID sign-in, PMOS_WEB_PASSWORD_LOGIN=1 for password sign-in, or PMOS_WEB_DEV_LOGIN=1 for \
      development sign-in (never expose it)";
+
+/// Why development sign-in won't start beside password sign-in without the override.
+pub const DEV_WITH_PASSWORD: &str = "PMOS_WEB_DEV_LOGIN=1 with PMOS_WEB_PASSWORD_LOGIN=1: \
+     development sign-in lets anyone who reaches the port in as any member, password or not. \
+     Unset PMOS_WEB_DEV_LOGIN, or set PMOS_WEB_DEV_LOGIN_WITH_PASSWORD=1 on a development \
+     machine that nobody else can reach";
+
+/// Why password sign-in won't start without knowing where browsers' addresses come from.
+pub const PASSWORD_NEEDS_PROXY: &str = "PMOS_WEB_PASSWORD_LOGIN=1 needs to tell browsers \
+     apart for its per-address limit: set PMOS_WEB_TRUSTED_PROXIES to the address your reverse \
+     proxy reaches pmos-web from (in the deploy kit, the `pmos` network's gateway: \
+     `deploy/pmos-admin up --web` prints it), or, only when browsers reach pmos-web directly \
+     on a loopback address with no proxy, PMOS_WEB_DIRECT=1 (docs/password-sign-in.md)";
+
+/// Why `PMOS_WEB_DIRECT=1` won't start on a reachable address.
+pub const DIRECT_NOT_LOOPBACK: &str = "PMOS_WEB_DIRECT=1 (browsers reach pmos-web with no \
+     proxy) is only for a loopback PMOS_WEB_BIND (127.0.0.1 or ::1): anywhere else, put the \
+     reverse proxy in front and name it in PMOS_WEB_TRUSTED_PROXIES";
+
+/// Why `PMOS_WEB_DIRECT=1` and a proxy list can't go together.
+pub const DIRECT_WITH_PROXIES: &str = "PMOS_WEB_DIRECT=1 says there is no proxy, and \
+     PMOS_WEB_TRUSTED_PROXIES names one: set one of them";
+
+/// Why password sign-in won't start on a reachable address without `https`.
+pub const PASSWORD_NEEDS_HTTPS: &str = "PMOS_WEB_PASSWORD_LOGIN=1 on an address that isn't \
+     loopback needs PMOS_WEB_PUBLIC_URL set to the https:// address browsers use (passwords \
+     and codes must never cross the network in the clear)";
+
+/// Password sign-in's start-up rules (the review of 2026-11-20, P2 and L5): the per-address
+/// limit must be per real address, so either a trusted proxy is named, or `direct` says there
+/// is none (loopback only); and a reachable bind needs an `https://` public URL.
+pub fn check_password_reach(
+    password_login: bool,
+    bind: SocketAddr,
+    trusted_proxies: &[IpAddr],
+    direct: bool,
+    public_url: Option<&str>,
+) -> Result<(), String> {
+    if direct && !trusted_proxies.is_empty() {
+        return Err(DIRECT_WITH_PROXIES.into());
+    }
+    if direct && !bind.ip().is_loopback() {
+        return Err(DIRECT_NOT_LOOPBACK.into());
+    }
+    if !password_login {
+        return Ok(());
+    }
+    if trusted_proxies.is_empty() && !direct {
+        return Err(PASSWORD_NEEDS_PROXY.into());
+    }
+    if !bind.ip().is_loopback() && !public_url.is_some_and(|u| u.starts_with("https://")) {
+        return Err(PASSWORD_NEEDS_HTTPS.into());
+    }
+    Ok(())
+}
 
 /// Why password sign-in won't start without signed user assertions.
 pub const PASSWORD_NEEDS_REQUIRE: &str = "PMOS_WEB_PASSWORD_LOGIN=1 needs signed user \
@@ -170,21 +228,21 @@ impl Config {
                 })
                 .collect::<Result<_, _>>()?,
         };
-        let dev_with_entra = match get("PMOS_WEB_DEV_LOGIN_WITH_ENTRA")
-            .as_deref()
-            .map(str::trim)
-        {
-            None | Some("") | Some("0") => false,
-            Some("1") => true,
-            Some(other) => {
-                return Err(format!(
-                    "PMOS_WEB_DEV_LOGIN_WITH_ENTRA must be `1` or `0`, not `{other}`"
-                ))
+        let flag = |k: &str| -> Result<bool, String> {
+            match get(k).as_deref().map(str::trim) {
+                None | Some("") | Some("0") => Ok(false),
+                Some("1") => Ok(true),
+                Some(other) => Err(format!("{k} must be `1` or `0`, not `{other}`")),
             }
         };
+        let dev_with_entra = flag("PMOS_WEB_DEV_LOGIN_WITH_ENTRA")?;
         if dev_login && entra.is_some() && !dev_with_entra {
             return Err(DEV_WITH_ENTRA.into());
         }
+        if dev_login && password_login && !flag("PMOS_WEB_DEV_LOGIN_WITH_PASSWORD")? {
+            return Err(DEV_WITH_PASSWORD.into());
+        }
+        let direct = flag("PMOS_WEB_DIRECT")?;
         let bots_token = token("PMOS_WEB_BOTS_TOKEN")?;
         let toolserver_token = token("PMOS_WEB_TOOLSERVER_TOKEN")?;
         if bots_token == toolserver_token {
@@ -239,6 +297,13 @@ impl Config {
             .parse()
             .map_err(|e| format!("PMOS_WEB_BIND: {e}"))?;
         check_dev_bind(dev_login, bind)?;
+        check_password_reach(
+            password_login,
+            bind,
+            &trusted_proxies,
+            direct,
+            public_url.as_deref(),
+        )?;
         let internal_bind: Option<SocketAddr> = set("PMOS_WEB_INTERNAL_BIND")
             .map(|v| v.parse())
             .transpose()
@@ -536,6 +601,7 @@ mod tests {
         let mut alone = base();
         alone.retain(|(k, _)| *k != "PMOS_WEB_DEV_LOGIN");
         alone.push(("PMOS_WEB_PASSWORD_LOGIN", "1"));
+        alone.push(("PMOS_WEB_DIRECT", "1"));
         // Without a key for the tool server: refused.
         let err = Config::from_lookup(lookup(&alone)).unwrap_err();
         assert!(err.contains("PMOS_WEB_PASSWORD_LOGIN"), "{err}");
@@ -552,15 +618,19 @@ mod tests {
         }
         let pairs = [with_key.clone(), vec![("PMOS_ASSERTION_MODE", "require")]].concat();
         assert!(Config::from_lookup(lookup(&pairs)).is_ok());
-        // Beside development sign-in, too; and off by default.
+        // Beside development sign-in only with its override (L4); and off by default.
         let both = [
             base(),
             vec![
                 ("PMOS_WEB_PASSWORD_LOGIN", "1"),
+                ("PMOS_WEB_DIRECT", "1"),
                 ("PMOS_ASSERTION_KEYS", keys.as_str()),
             ],
         ]
         .concat();
+        let err = Config::from_lookup(lookup(&both)).unwrap_err();
+        assert!(err.contains("PMOS_WEB_DEV_LOGIN_WITH_PASSWORD"), "{err}");
+        let both = [both, vec![("PMOS_WEB_DEV_LOGIN_WITH_PASSWORD", "1")]].concat();
         assert!(Config::from_lookup(lookup(&both)).unwrap().password_login);
         assert!(!Config::from_lookup(lookup(&base())).unwrap().password_login);
         let bad = [base(), vec![("PMOS_WEB_PASSWORD_LOGIN", "yes")]].concat();
@@ -578,6 +648,72 @@ mod tests {
         );
         let proxies = [base(), vec![("PMOS_WEB_TRUSTED_PROXIES", "proxy.local")]].concat();
         assert!(Config::from_lookup(lookup(&proxies)).is_err());
+    }
+
+    /// P2 and L5: password sign-in starts only when its per-address limit is per real address
+    /// (a trusted proxy named, or `PMOS_WEB_DIRECT=1` on loopback) and, on a reachable address,
+    /// with an `https://` public URL.
+    #[test]
+    fn password_sign_in_refuses_to_start_without_knowing_the_browsers_address() {
+        let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let keys = format!("web:toolserver:k1:{key}");
+        let mut on = base();
+        on.retain(|(k, _)| *k != "PMOS_WEB_DEV_LOGIN");
+        on.push(("PMOS_WEB_PASSWORD_LOGIN", "1"));
+        on.push(("PMOS_ASSERTION_KEYS", keys.as_str()));
+        let start = |extra: &[(&'static str, &'static str)]| {
+            Config::from_lookup(lookup(&[on.clone(), extra.to_vec()].concat()))
+        };
+        // Neither a proxy nor direct: refused, naming both settings.
+        let err = start(&[]).unwrap_err();
+        assert!(
+            err.contains("PMOS_WEB_TRUSTED_PROXIES") && err.contains("PMOS_WEB_DIRECT"),
+            "{err}"
+        );
+        // Direct on loopback: the test stack. Direct anywhere else: refused.
+        assert!(start(&[("PMOS_WEB_DIRECT", "1")]).is_ok());
+        let err =
+            start(&[("PMOS_WEB_DIRECT", "1"), ("PMOS_WEB_BIND", "0.0.0.0:8770")]).unwrap_err();
+        assert!(err.contains("loopback"), "{err}");
+        // Direct beside a proxy list: refused.
+        let err = start(&[
+            ("PMOS_WEB_DIRECT", "1"),
+            ("PMOS_WEB_TRUSTED_PROXIES", "127.0.0.1"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("set one of them"), "{err}");
+        // A proxy, as in the deploy kit (0.0.0.0 in a container): needs an https public URL.
+        let kit = [
+            ("PMOS_WEB_TRUSTED_PROXIES", "172.18.0.1"),
+            ("PMOS_WEB_BIND", "0.0.0.0:8770"),
+        ];
+        let err = start(&kit).unwrap_err();
+        assert!(err.contains("https://"), "{err}");
+        let err = start(
+            &[
+                kit.as_slice(),
+                &[("PMOS_WEB_PUBLIC_URL", "http://pmos.example.com")],
+            ]
+            .concat(),
+        )
+        .unwrap_err();
+        assert!(err.contains("https://"), "{err}");
+        let cfg = start(
+            &[
+                kit.as_slice(),
+                &[("PMOS_WEB_PUBLIC_URL", "https://pmos.example.com")],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.trusted_proxies,
+            vec!["172.18.0.1".parse::<IpAddr>().unwrap()]
+        );
+        // Without password sign-in none of this is asked; a bad flag still is.
+        assert!(Config::from_lookup(lookup(&base())).is_ok());
+        let err = start(&[("PMOS_WEB_DIRECT", "yes")]).unwrap_err();
+        assert!(err.contains("`1` or `0`"), "{err}");
     }
 
     #[test]

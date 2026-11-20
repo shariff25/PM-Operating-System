@@ -28,6 +28,7 @@ import type {
   PasswordSetupDone,
   PasswordSetupStarted,
   PasswordSignedIn,
+  PasswordResetNotice,
   PasswordSignInStarted,
   PasswordStatus,
   WeakPasswordReason,
@@ -77,6 +78,8 @@ interface Account {
   setupCode: string | null;
   /** Someone holding Admin or Auditor: a code made on the web never works for them. */
   hostOnly?: boolean;
+  /** A reset someone made while they had a password, until they dismiss it. */
+  resetNotice?: PasswordResetNotice | null;
 }
 
 export interface MockPasswordOptions {
@@ -96,8 +99,10 @@ export interface MockPassword {
   change(handle: string, input: PasswordChange): void;
   recoveryCodes(handle: string, code: string): string[];
   status(handle: string): PasswordStatus;
-  /** An admin made a code on the Team page: it replaces any earlier one. */
-  issueCode(handle: string, signInName: string, code: string): void;
+  /** An admin made a code on the Team page: it replaces any earlier one. A reset (they had a password) leaves them a notice naming `by`. */
+  issueCode(handle: string, signInName: string, code: string, by?: { handle: string; name: string | null }): void;
+  /** The person read the notice of a reset. */
+  dismissNotice(handle: string): void;
   hasPassword(handle: string): boolean;
 }
 
@@ -323,15 +328,28 @@ export function createMockPassword(options: MockPasswordOptions = {}): MockPassw
     status(handle) {
       const a = account(handle);
       const set = !!a?.password;
-      return { enabled: true, password_set: set, second_step_enrolled: set, recovery_codes_left: a ? a.recovery.filter((r) => !r.used).length : 0 };
+      return {
+        enabled: true,
+        password_set: set,
+        second_step_enrolled: set,
+        recovery_codes_left: a ? a.recovery.filter((r) => !r.used).length : 0,
+        needs_host_setup: false,
+        reset_notice: a?.resetNotice ? { ...a.resetNotice } : null,
+      };
     },
 
-    issueCode(handle, signInName, code) {
+    issueCode(handle, signInName, code, by) {
       const a = account(handle) ?? { handle, signInName, password: null, recovery: [], setupCode: null };
       a.signInName = signInName;
       a.setupCode = normCode(code);
+      if (a.password && by) a.resetNotice = { by: by.handle, by_name: by.name, at: new Date().toISOString() };
       accounts.set(handle, a);
       if (setup?.handle === handle) setup = null;
+    },
+
+    dismissNotice(handle) {
+      const a = account(handle);
+      if (a) a.resetNotice = null;
     },
 
     hasPassword(handle) {

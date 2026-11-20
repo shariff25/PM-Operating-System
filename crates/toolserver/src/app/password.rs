@@ -4,16 +4,21 @@
 //!
 //! | Route | Assertion | Does |
 //! | --- | --- | --- |
-//! | `POST /internal/password/sign-in` | none (nobody is signed in yet) | `{sign_in_name, password}` → a pending token, or the uniform `401 sign_in_failed` |
-//! | `POST /internal/password/second-step` | none | `{pending_token, code}` or `{pending_token, recovery_code}` → the user and the credential's epoch |
-//! | `POST /internal/password/setup/begin` | none | `{sign_in_name, setup_code}` → a setup token, or the uniform `401 setup_failed` |
+//! | `POST /internal/password/sign-in` | none (nobody is signed in yet) | `{sign_in_name, password, source?}` → a pending token, or the uniform `401 sign_in_failed` |
+//! | `POST /internal/password/second-step` | none | `{pending_token, code, source?}` or `{pending_token, recovery_code, source?}` → the user and the credential's epoch |
+//! | `POST /internal/password/setup/begin` | none | `{sign_in_name, setup_code, source?}` → a setup token, or the uniform `401 setup_failed` |
 //! | `POST /internal/password/setup/password` | none | `{setup_token, password}` |
 //! | `POST /internal/password/setup/authenticator` | none | `{setup_token}` → the enrolment secret and URI, once |
-//! | `POST /internal/password/setup/confirm` | none | `{setup_token, code}` → recovery codes, the user, the epoch |
+//! | `POST /internal/password/setup/confirm` | none | `{setup_token, code, source?}` → recovery codes, the user, the epoch |
 //! | `POST /internal/password/change?user=` | the person's | `{current_password, code, new_password}` → the new epoch |
 //! | `POST /internal/password/recovery-codes?user=` | the person's | `{code}` → ten new recovery codes |
-//! | `GET /internal/password/status?user=` | the person's | their own password status |
+//! | `GET /internal/password/status?user=` | the person's | their own password status, with any reset notice |
+//! | `POST /internal/password/reset-notice/dismiss?user=` | the person's | `{}` → `204`: the reset notice goes |
 //! | `POST /internal/password/setup-codes?user=<admin>` | the admin's | `{handle}` → a setup or reset code, once |
+//!
+//! `source` is the browser's address as `pmos-web` counts it (an IPv4 address, or an IPv6
+//! /64): the per-account waits are per address (`crate::password::limits`). It is hashed
+//! before it is stored and never logged. Missing, every such attempt shares one count.
 //!
 //! **Every route runs only in assertion `require`** with no development override
 //! (`503 assertion_required` otherwise), so password sign-in never runs on a stack that
@@ -53,6 +58,7 @@ pub(super) fn routes(state: AppState) -> Router<AppState> {
         .route("/password/change", post(change))
         .route("/password/recovery-codes", post(regenerate))
         .route("/password/status", get(status))
+        .route("/password/reset-notice/dismiss", post(dismiss_reset_notice))
         .route("/password/setup-codes", post(issue))
         .layer(middleware::from_fn_with_state(state, identify))
 }
@@ -65,6 +71,7 @@ fn signed_in_route(path: &str) -> bool {
         "/password/change"
             | "/password/recovery-codes"
             | "/password/status"
+            | "/password/reset-notice/dismiss"
             | "/password/setup-codes"
     )
 }
@@ -207,6 +214,9 @@ async fn user_answer(state: &AppState, handle: &str, epoch: i64) -> Result<Value
 struct SignInBody {
     sign_in_name: String,
     password: String,
+    /// The browser's address as pmos-web counts it.
+    #[serde(default)]
+    source: Option<String>,
 }
 
 async fn sign_in(State(state): State<AppState>, bytes: axum::body::Bytes) -> Response {
@@ -215,7 +225,13 @@ async fn sign_in(State(state): State<AppState>, bytes: axum::body::Bytes) -> Res
     let password = Secret::new(b.password);
     let store = state.svc.stores().users.clone();
     match svc
-        .sign_in(store.passwords(), &b.sign_in_name, &password, Utc::now())
+        .sign_in(
+            store.passwords(),
+            &b.sign_in_name,
+            &password,
+            b.source.as_deref(),
+            Utc::now(),
+        )
         .await
     {
         Ok(started) => ok(
@@ -237,6 +253,8 @@ struct SecondStepBody {
     code: Option<String>,
     #[serde(default)]
     recovery_code: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 async fn second_step(State(state): State<AppState>, bytes: axum::body::Bytes) -> Response {
@@ -249,7 +267,13 @@ async fn second_step(State(state): State<AppState>, bytes: axum::body::Bytes) ->
     };
     let store = state.svc.stores().users.clone();
     match svc
-        .second_step(store.passwords(), &b.pending_token, &step, Utc::now())
+        .second_step(
+            store.passwords(),
+            &b.pending_token,
+            &step,
+            b.source.as_deref(),
+            Utc::now(),
+        )
         .await
     {
         Ok(done) => match user_answer(&state, &done.handle, done.epoch).await {
@@ -273,6 +297,8 @@ async fn second_step(State(state): State<AppState>, bytes: axum::body::Bytes) ->
 struct SetupBeginBody {
     sign_in_name: String,
     setup_code: String,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 async fn setup_begin(State(state): State<AppState>, bytes: axum::body::Bytes) -> Response {
@@ -281,7 +307,13 @@ async fn setup_begin(State(state): State<AppState>, bytes: axum::body::Bytes) ->
     let code = Secret::new(b.setup_code);
     let store = state.svc.stores().users.clone();
     match svc
-        .setup_begin(store.passwords(), &b.sign_in_name, &code, Utc::now())
+        .setup_begin(
+            store.passwords(),
+            &b.sign_in_name,
+            &code,
+            b.source.as_deref(),
+            Utc::now(),
+        )
         .await
     {
         Ok(s) => ok(
@@ -353,6 +385,8 @@ async fn setup_authenticator(State(state): State<AppState>, bytes: axum::body::B
 struct ConfirmBody {
     setup_token: String,
     code: String,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 async fn setup_confirm(State(state): State<AppState>, bytes: axum::body::Bytes) -> Response {
@@ -361,7 +395,13 @@ async fn setup_confirm(State(state): State<AppState>, bytes: axum::body::Bytes) 
     let code = Secret::new(b.code);
     let store = state.svc.stores().users.clone();
     match svc
-        .setup_confirm(store.passwords(), &b.setup_token, &code, Utc::now())
+        .setup_confirm(
+            store.passwords(),
+            &b.setup_token,
+            &code,
+            b.source.as_deref(),
+            Utc::now(),
+        )
         .await
     {
         Ok(done) => match user_answer(&state, &done.handle, done.epoch).await {
@@ -465,18 +505,58 @@ async fn status(State(state): State<AppState>, Query(q): Query<Named>) -> Respon
         return bad_request();
     };
     let store = state.svc.stores().users.clone();
-    match store.passwords().password_status(&user, Utc::now()).await {
-        Ok(s) => ok(
-            StatusCode::OK,
+    let s = match store.passwords().password_status(&user, Utc::now()).await {
+        Ok(s) => s,
+        Err(e) => return refused(e.into()),
+    };
+    let notice = match &s.reset_notice {
+        None => Value::Null,
+        Some(n) => {
+            // The admin's name as the person knows it; `host` for someone with host access.
+            let by_name = match n.via {
+                crate::users::Via::Host => None,
+                _ => match state.svc.people().directory().await {
+                    Ok(dir) => dir
+                        .get(&n.by)
+                        .map(|u| u.display_name.trim().to_string())
+                        .filter(|d| !d.is_empty()),
+                    Err(e) => return refused(e.into()),
+                },
+            };
             json!({
-                "enabled": state.svc.passwords().is_some(),
-                "password_set": s.password_set,
-                "second_step_enrolled": s.second_step_enrolled,
-                "setup_code_pending": s.setup_code_pending,
-                "recovery_codes_left": s.recovery_codes_left,
-            }),
-        ),
-        Err(e) => refused(e.into()),
+                "by": if n.via == crate::users::Via::Host { "host" } else { n.by.as_str() },
+                "by_name": by_name,
+                "at": n.at,
+            })
+        }
+    };
+    ok(
+        StatusCode::OK,
+        json!({
+            "enabled": state.svc.passwords().is_some(),
+            "password_set": s.password_set,
+            "second_step_enrolled": s.second_step_enrolled,
+            "setup_code_pending": s.setup_code_pending,
+            "recovery_codes_left": s.recovery_codes_left,
+            "needs_host_setup": s.needs_host_setup,
+            "reset_notice": notice,
+        }),
+    )
+}
+
+/// `POST /internal/password/reset-notice/dismiss?user=`: the person's reset notice goes.
+async fn dismiss_reset_notice(State(state): State<AppState>, Query(q): Query<Named>) -> Response {
+    let svc = service!(state);
+    let Some(user) = named(&q) else {
+        return bad_request();
+    };
+    let store = state.svc.stores().users.clone();
+    match svc
+        .dismiss_reset_notice(store.passwords(), &user, Utc::now())
+        .await
+    {
+        Ok(()) => no_store(StatusCode::NO_CONTENT.into_response()),
+        Err(e) => refused(e),
     }
 }
 

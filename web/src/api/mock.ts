@@ -717,6 +717,13 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       return password.status(me.handle);
     },
+    async passwordDismissResetNotice() {
+      await wait();
+      write();
+      passwordOn();
+      guard();
+      password.dismissNotice(me.handle);
+    },
     async logout() {
       await wait();
       write();
@@ -1109,7 +1116,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       passwordOn();
       need('manage-members');
       const { code, signInName } = admin.users.passwordSetupCode(me.handle, handle);
-      password.issueCode(handle, signInName, code.setup_code);
+      password.issueCode(handle, signInName, code.setup_code, { handle: me.handle, name: me.display_name || null });
       return clone(code);
     },
 

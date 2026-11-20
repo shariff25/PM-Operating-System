@@ -193,6 +193,7 @@ async fn toolserver(
                       "resolve_miss_warning_threshold": 100, "deactivations_last_hour": 1,
                       "deactivation_limit": 3, "deactivation_limit_reached": false,
                       "deactivation_grace_hours": 24, "bots_without_active_owner": [],
+                      "password_resets": [{"handle": "ana", "by": "ada", "at": "2026-11-16T08:00:00Z", "extra": "dropped"}],
                       "secret": "SECRET"},
         }))
         .into_response(),
@@ -653,7 +654,8 @@ async fn team_and_overview() {
                          "resolve_miss_warning": ["console"],
                          "resolve_miss_warning_threshold": 100, "deactivations_last_hour": 1,
                          "deactivation_limit": 3, "deactivation_limit_reached": false,
-                         "deactivation_grace_hours": 24, "bots_without_active_owner": []}})
+                         "deactivation_grace_hours": 24, "bots_without_active_owner": [],
+                         "password_resets": [{"handle": "ana", "by": "ada", "at": "2026-11-16T08:00:00Z"}]}})
     );
 }
 

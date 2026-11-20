@@ -29,6 +29,18 @@ async fn main() -> Result<()> {
             trusted_proxies = config.trusted_proxies.len(),
             "password sign-in is on (PMOS_WEB_PASSWORD_LOGIN=1), with a required authenticator code"
         );
+        if config.trusted_proxies.is_empty() {
+            // Only with PMOS_WEB_DIRECT=1 on a loopback bind (config.rs).
+            tracing::info!("no trusted proxy (PMOS_WEB_DIRECT=1): browsers are counted by their own address, and a forwarded header is refused");
+        }
+        if config.dev_login {
+            // Only with PMOS_WEB_DEV_LOGIN_WITH_PASSWORD=1 (config.rs).
+            tracing::warn!(
+                "BOTH PASSWORD AND DEVELOPMENT SIGN-IN ARE ON (PMOS_WEB_DEV_LOGIN_WITH_PASSWORD=1): \
+                 anyone who can reach this port can still sign in as any member without a \
+                 password. Never on a server people use."
+            );
+        }
     }
     if let Some(entra) = &config.entra {
         // Ids and URLs only: never the client secret.

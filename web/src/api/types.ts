@@ -334,6 +334,7 @@ export const SERVER_ERROR_CODES = {
   sign_in_unconfirmed: 'yes',
   too_many_attempts: 'yes',
   sign_in_busy: 'yes',
+  proxy_not_trusted: 'yes',
 } as const satisfies Record<string, 'yes' | 'decision' | 'unknown'>;
 
 /** Codes the server sends. */
@@ -463,6 +464,8 @@ export interface OverviewUsers {
   deactivation_limit_reached: boolean;
   deactivation_grace_hours: number;
   bots_without_active_owner: string[];
+  /** Reset codes made this week for people who had a password: whose, by whom (a handle, or `host`), when. Absent from an older server. */
+  password_resets?: { handle: string; by: string; at: string }[];
 }
 
 export interface AdminOverview {
@@ -525,6 +528,8 @@ export interface DirectoryUser {
   password_set?: boolean;
   second_step_enrolled?: boolean;
   setup_code_pending?: boolean;
+  /** Their password came from a code made in the web app and they now hold Admin or Auditor: it doesn't work until a host-issued setup code replaces it. */
+  password_needs_host_setup?: boolean;
 }
 
 export interface PilotException {
@@ -645,12 +650,23 @@ export interface PasswordChange {
   new_password: string;
 }
 
+/** Someone made a reset code for this person: shown until they dismiss it. `by` is an admin's handle, or `host`. */
+export interface PasswordResetNotice {
+  by: string;
+  by_name: string | null;
+  at: string;
+}
+
 /** `GET /api/auth/password/status`. */
 export interface PasswordStatus {
   enabled: boolean;
   password_set: boolean;
   second_step_enrolled: boolean;
   recovery_codes_left: number;
+  /** Held until a host-issued setup code (an Admin's or Auditor's web-issued password). Absent from an older server. */
+  needs_host_setup?: boolean;
+  /** A reset the person hasn't dismissed. Absent from an older server. */
+  reset_notice?: PasswordResetNotice | null;
 }
 
 /** `POST /api/admin/users/{handle}/password-setup-code`: shown once to the admin. */
@@ -677,6 +693,8 @@ export interface Api {
   passwordChange(input: PasswordChange): Promise<void>;
   passwordRecoveryCodes(code: string): Promise<PasswordRecoveryCodes>;
   passwordStatus(): Promise<PasswordStatus>;
+  /** The signed-in person has read the notice of a reset someone made for them. */
+  passwordDismissResetNotice(): Promise<void>;
   me(): Promise<Me>;
   setNudges(nudges: boolean): Promise<Me>;
   setMascot(mascot: boolean): Promise<Me>;
