@@ -72,7 +72,7 @@ pub const USER_CODES: [(&str, u16, &str); 21] = [
 ];
 
 /// Every field of a user the contract has, but the addresses.
-pub const USER_FIELDS: [&str; 27] = [
+pub const USER_FIELDS: [&str; 28] = [
     "handle",
     "display_name",
     "status",
@@ -101,6 +101,8 @@ pub const USER_FIELDS: [&str; 27] = [
     "password_set",
     "second_step_enrolled",
     "setup_code_pending",
+    // An Admin's or Auditor's web-issued credential, held until a host-issued setup (PM3).
+    "password_needs_host_setup",
 ];
 
 /// The addresses: only for a viewer with `manage-members`, and only when the tool server sent
@@ -339,7 +341,7 @@ async fn set_roles(
 ) -> ApiResult {
     let handle = handle_param(&handle)?;
     let body = body_object(&body, false)?;
-    write(
+    let done = write(
         &state,
         &signed,
         reqwest::Method::PUT,
@@ -347,7 +349,11 @@ async fn set_roles(
         body,
         "/api/admin/users/{handle}/roles",
     )
-    .await
+    .await;
+    // The person's next request here asks the user database afresh: a promotion that holds a
+    // web-issued password (PM3) ends their password sessions at once, not within 10 seconds.
+    state.0.directory.forget(handle);
+    done
 }
 
 async fn set_fields(

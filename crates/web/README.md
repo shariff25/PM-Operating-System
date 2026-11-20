@@ -33,6 +33,10 @@ For Entra ID sign-in instead of `PMOS_WEB_DEV_LOGIN=1`, set `PMOS_WEB_ENTRA_TENA
 | `PMOS_WEB_INTERNAL_BIND` | none | A second listener for the server-to-server route `PUT /internal/brief/{handle}` (and `/healthz`, `/readyz`); the browser-facing `PMOS_WEB_BIND` then doesn't serve that route. Without it the route is on `PMOS_WEB_BIND`, refusing any call that carries a session cookie or an `Origin`. Must differ from `PMOS_WEB_BIND` |
 | `PMOS_WEB_DEV_LOGIN` | off | `1` turns on development sign-in, only on a loopback `PMOS_WEB_BIND`. The server starts with Entra ID or development sign-in; with neither it refuses to start |
 | `PMOS_WEB_DEV_LOGIN_WITH_ENTRA` | off | `1` lets development sign-in run beside Entra ID (a loud warning). Without it, both on refuses to start: development sign-in bypasses Entra. For a developer's own machine only |
+| `PMOS_WEB_PASSWORD_LOGIN` | off | `1`: password sign-in with an authenticator code (`docs/password-sign-in.md`). Needs `PMOS_WEB_TRUSTED_PROXIES` or `PMOS_WEB_DIRECT=1`, and an `https://` `PMOS_WEB_PUBLIC_URL` unless the bind is loopback |
+| `PMOS_WEB_TRUSTED_PROXIES` | blank | The reverse proxies' addresses, comma-separated: their `X-Forwarded-For` (read from the right) names the browser for password sign-in's per-address limit |
+| `PMOS_WEB_DIRECT` | off | `1`: browsers reach pmos-web with no proxy (loopback bind only); a forwarded header on a password route is then refused |
+| `PMOS_WEB_DEV_LOGIN_WITH_PASSWORD` | off | `1` lets development sign-in run beside password sign-in (a loud warning). For a developer's own machine only |
 | `PMOS_WEB_ENTRA_TENANT_ID` | none | Entra ID sign-in (`docs/entra-sign-in.md`): the directory (tenant) id, a GUID. `common`, `organizations` and `consumers` are refused |
 | `PMOS_WEB_ENTRA_CLIENT_ID` | none | The application (client) id, a GUID |
 | `PMOS_WEB_ENTRA_CLIENT_SECRET` | none | The client secret, from the secret store. Never logged or shown in errors. Entra is on only with all three and `PMOS_WEB_PUBLIC_URL`; any of them alone refuses to start |

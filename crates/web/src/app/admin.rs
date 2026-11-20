@@ -533,6 +533,8 @@ struct UsersFlags {
     /// First Entra links this week (U1): who, when, which identity provider; never an `oid`.
     /// `null` when the tool server couldn't read the audit log back, or is older.
     first_links: Option<Vec<FirstLink>>,
+    /// Reset codes issued in the window for people who had a password (PM2): handles only.
+    password_resets: Vec<ResetFlag>,
 }
 
 /// One first link on the overview.
@@ -542,6 +544,15 @@ struct FirstLink {
     handle: String,
     at: String,
     provider: String,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct ResetFlag {
+    handle: String,
+    /// The admin's handle, or `host`.
+    by: String,
+    at: String,
 }
 
 #[derive(Deserialize, Serialize, Default)]

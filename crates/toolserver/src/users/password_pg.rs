@@ -1,4 +1,4 @@
-//! Password sign-in's Postgres store (migration 0020; `crate::password::store`).
+//! Password sign-in's Postgres store (migrations 0020 and 0022; `crate::password::store`).
 //!
 //! A change: one READ COMMITTED transaction; the person's own advisory lock first (one key per
 //! person and schema, so two people never wait on each other and the users lock, which every
@@ -18,10 +18,10 @@ use sqlx::{PgConnection, Row};
 use super::pg::{insert_change, insert_event};
 use super::{Status, UserRole, Via};
 use crate::audit::AuditEvent;
-use crate::password::limits::Counter;
+use crate::password::limits::{Counter, SourceCounters, FORGET_AFTER, KNOWN_SOURCE_DAYS};
 use crate::password::store::{
     CodeKind, Credential, PasswordStatus, PasswordStore, Pending, Person, Plan, Purpose,
-    RecoveryCode, SetupCode, Snapshot, Writes,
+    RecoveryCode, ResetNotice, SetupCode, Snapshot, Writes,
 };
 use crate::pg::PgStore;
 use crate::store::{StoreError, StoreResult};
@@ -88,26 +88,92 @@ fn pending_of(row: &PgRow) -> StoreResult<Pending> {
     })
 }
 
-async fn load(conn: &mut PgConnection, handle: &str, actor: Option<&str>) -> StoreResult<Snapshot> {
-    let credential = match sqlx::query(
-        "SELECT password_hash, totp_sealed, totp_last_step, epoch, failed_count, failed_last_at,
-                locked_until, setup_failed_count, setup_failed_last_at, setup_locked_until, set_at
-         FROM password_credentials WHERE handle = $1",
+fn via_of(v: Option<String>) -> StoreResult<Option<Via>> {
+    v.map(|v| Via::parse(&v).ok_or_else(|| bad("client", &v)))
+        .transpose()
+}
+
+fn credential_of(row: &PgRow) -> StoreResult<Credential> {
+    let notice_by: Option<String> = row.try_get("reset_notice_by")?;
+    let notice_via = via_of(row.try_get("reset_notice_via")?)?;
+    let notice_at: Option<DateTime<Utc>> = row.try_get("reset_notice_at")?;
+    let reset_notice = match (notice_by, notice_via, notice_at) {
+        (Some(by), Some(via), Some(at)) => Some(ResetNotice {
+            by,
+            via,
+            host_user: row.try_get("reset_notice_host_user")?,
+            at,
+        }),
+        _ => None,
+    };
+    Ok(Credential {
+        password_hash: row.try_get("password_hash")?,
+        totp_sealed: row.try_get("totp_sealed")?,
+        totp_last_step: row.try_get("totp_last_step")?,
+        epoch: row.try_get("epoch")?,
+        failed: counter(row, "")?,
+        setup_failed: counter(row, "setup_")?,
+        set_at: row.try_get("set_at")?,
+        issued_via: via_of(row.try_get("issued_via")?)?,
+        reset_notice,
+    })
+}
+
+const CREDENTIAL: &str = "SELECT password_hash, totp_sealed, totp_last_step, epoch, failed_count,
+        failed_last_at, locked_until, setup_failed_count, setup_failed_last_at,
+        setup_locked_until, set_at, issued_via, reset_notice_by, reset_notice_via,
+        reset_notice_host_user, reset_notice_at
+     FROM password_credentials WHERE handle = $1";
+
+async fn source_of(
+    conn: &mut PgConnection,
+    handle: &str,
+    key: &str,
+) -> StoreResult<SourceCounters> {
+    let Some(row) = sqlx::query(
+        "SELECT sign_in_count, sign_in_last_at, sign_in_locked_until, setup_count, setup_last_at,
+                setup_locked_until, last_success_at
+         FROM password_source_counters WHERE handle = $1 AND source_key = $2",
     )
     .bind(handle)
+    .bind(key)
     .fetch_optional(&mut *conn)
     .await?
+    else {
+        return Ok(SourceCounters::default());
+    };
+    Ok(SourceCounters {
+        sign_in: Counter {
+            count: row.try_get("sign_in_count")?,
+            last_at: row.try_get("sign_in_last_at")?,
+            locked_until: row.try_get("sign_in_locked_until")?,
+        },
+        setup: Counter {
+            count: row.try_get("setup_count")?,
+            last_at: row.try_get("setup_last_at")?,
+            locked_until: row.try_get("setup_locked_until")?,
+        },
+        last_success_at: row.try_get("last_success_at")?,
+    })
+}
+
+async fn load(
+    conn: &mut PgConnection,
+    handle: &str,
+    actor: Option<&str>,
+    source: Option<&str>,
+) -> StoreResult<Snapshot> {
+    let credential = match sqlx::query(CREDENTIAL)
+        .bind(handle)
+        .fetch_optional(&mut *conn)
+        .await?
     {
         None => None,
-        Some(row) => Some(Credential {
-            password_hash: row.try_get("password_hash")?,
-            totp_sealed: row.try_get("totp_sealed")?,
-            totp_last_step: row.try_get("totp_last_step")?,
-            epoch: row.try_get("epoch")?,
-            failed: counter(&row, "")?,
-            setup_failed: counter(&row, "setup_")?,
-            set_at: row.try_get("set_at")?,
-        }),
+        Some(row) => Some(credential_of(&row)?),
+    };
+    let source = match source {
+        Some(key) => source_of(conn, handle, key).await?,
+        None => SourceCounters::default(),
     };
     let mut recovery = Vec::new();
     for row in sqlx::query(
@@ -168,22 +234,27 @@ async fn load(conn: &mut PgConnection, handle: &str, actor: Option<&str>) -> Sto
         recovery,
         setup_code,
         pending,
+        source,
     })
 }
 
 async fn write(
     conn: &mut PgConnection,
     handle: &str,
+    source: Option<&str>,
     w: &Writes,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     if let Some(c) = &w.credential {
+        let notice = c.reset_notice.as_ref();
         sqlx::query(
             "INSERT INTO password_credentials
                  (handle, password_hash, totp_sealed, totp_last_step, epoch, failed_count,
                   failed_last_at, locked_until, setup_failed_count, setup_failed_last_at,
-                  setup_locked_until, set_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                  setup_locked_until, set_at, updated_at, issued_via, reset_notice_by,
+                  reset_notice_via, reset_notice_host_user, reset_notice_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                     $18)
              ON CONFLICT (handle) DO UPDATE SET
                  password_hash = EXCLUDED.password_hash, totp_sealed = EXCLUDED.totp_sealed,
                  totp_last_step = EXCLUDED.totp_last_step, epoch = EXCLUDED.epoch,
@@ -192,7 +263,11 @@ async fn write(
                  setup_failed_count = EXCLUDED.setup_failed_count,
                  setup_failed_last_at = EXCLUDED.setup_failed_last_at,
                  setup_locked_until = EXCLUDED.setup_locked_until, set_at = EXCLUDED.set_at,
-                 updated_at = EXCLUDED.updated_at",
+                 updated_at = EXCLUDED.updated_at, issued_via = EXCLUDED.issued_via,
+                 reset_notice_by = EXCLUDED.reset_notice_by,
+                 reset_notice_via = EXCLUDED.reset_notice_via,
+                 reset_notice_host_user = EXCLUDED.reset_notice_host_user,
+                 reset_notice_at = EXCLUDED.reset_notice_at",
         )
         .bind(handle)
         .bind(&c.password_hash)
@@ -206,6 +281,60 @@ async fn write(
         .bind(c.setup_failed.last_at)
         .bind(c.setup_failed.locked_until)
         .bind(c.set_at)
+        .bind(now)
+        .bind(c.issued_via.map(|v| v.as_str()))
+        .bind(notice.map(|n| n.by.as_str()))
+        .bind(notice.map(|n| n.via.as_str()))
+        .bind(notice.and_then(|n| n.host_user.as_deref()))
+        .bind(notice.map(|n| n.at))
+        .execute(&mut *conn)
+        .await?;
+    }
+    if w.reset_sources {
+        sqlx::query(
+            "UPDATE password_source_counters SET sign_in_count = 0, sign_in_last_at = NULL,
+                 sign_in_locked_until = NULL, setup_count = 0, setup_last_at = NULL,
+                 setup_locked_until = NULL, updated_at = $2
+             WHERE handle = $1",
+        )
+        .bind(handle)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+    } else if w.reset_source_setup {
+        sqlx::query(
+            "UPDATE password_source_counters SET setup_count = 0, setup_last_at = NULL,
+                 setup_locked_until = NULL, updated_at = $2
+             WHERE handle = $1",
+        )
+        .bind(handle)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+    }
+    if let (Some(s), Some(key)) = (&w.source, source) {
+        sqlx::query(
+            "INSERT INTO password_source_counters
+                 (handle, source_key, sign_in_count, sign_in_last_at, sign_in_locked_until,
+                  setup_count, setup_last_at, setup_locked_until, last_success_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (handle, source_key) DO UPDATE SET
+                 sign_in_count = EXCLUDED.sign_in_count,
+                 sign_in_last_at = EXCLUDED.sign_in_last_at,
+                 sign_in_locked_until = EXCLUDED.sign_in_locked_until,
+                 setup_count = EXCLUDED.setup_count, setup_last_at = EXCLUDED.setup_last_at,
+                 setup_locked_until = EXCLUDED.setup_locked_until,
+                 last_success_at = EXCLUDED.last_success_at, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(handle)
+        .bind(key)
+        .bind(s.sign_in.count)
+        .bind(s.sign_in.last_at)
+        .bind(s.sign_in.locked_until)
+        .bind(s.setup.count)
+        .bind(s.setup.last_at)
+        .bind(s.setup.locked_until)
+        .bind(s.last_success_at)
         .bind(now)
         .execute(&mut *conn)
         .await?;
@@ -333,6 +462,10 @@ const STATUS: &str = "SELECT u.handle,
         c.password_hash IS NOT NULL AS password_set,
         c.totp_sealed IS NOT NULL AS second_step_enrolled,
         coalesce(c.epoch, 0) AS epoch,
+        c.issued_via, c.reset_notice_by, c.reset_notice_via, c.reset_notice_host_user,
+        c.reset_notice_at,
+        EXISTS (SELECT 1 FROM user_roles r
+                WHERE r.handle = u.handle AND r.role IN ('admin', 'auditor')) AS protected,
         EXISTS (SELECT 1 FROM password_setup_codes s
                 WHERE s.handle = u.handle AND s.used_at IS NULL AND s.revoked_at IS NULL
                   AND s.expires_at > $1) AS setup_code_pending,
@@ -341,17 +474,37 @@ const STATUS: &str = "SELECT u.handle,
      FROM users u LEFT JOIN password_credentials c ON c.handle = u.handle";
 
 fn status_of(row: &PgRow) -> StoreResult<PasswordStatus> {
+    let set = row
+        .try_get::<Option<bool>, _>("password_set")?
+        .unwrap_or(false);
+    let enrolled = row
+        .try_get::<Option<bool>, _>("second_step_enrolled")?
+        .unwrap_or(false);
+    let issued_via = via_of(row.try_get("issued_via")?)?;
+    // Held: an Admin's or Auditor's credential that an admin issued in the web app (PM3).
+    let held =
+        set && enrolled && row.try_get::<bool, _>("protected")? && issued_via != Some(Via::Host);
+    let notice_by: Option<String> = row.try_get("reset_notice_by")?;
+    let notice_via = via_of(row.try_get("reset_notice_via")?)?;
+    let notice_at: Option<DateTime<Utc>> = row.try_get("reset_notice_at")?;
+    let reset_notice = match (notice_by, notice_via, notice_at) {
+        (Some(by), Some(via), Some(at)) => Some(ResetNotice {
+            by,
+            via,
+            host_user: row.try_get("reset_notice_host_user")?,
+            at,
+        }),
+        _ => None,
+    };
     Ok(PasswordStatus {
-        password_set: row
-            .try_get::<Option<bool>, _>("password_set")?
-            .unwrap_or(false),
-        second_step_enrolled: row
-            .try_get::<Option<bool>, _>("second_step_enrolled")?
-            .unwrap_or(false),
+        password_set: set && !held,
+        second_step_enrolled: enrolled && !held,
         setup_code_pending: row.try_get("setup_code_pending")?,
         recovery_codes_left: u32::try_from(row.try_get::<i64, _>("recovery_codes_left")?)
             .unwrap_or(0),
         epoch: row.try_get("epoch")?,
+        needs_host_setup: held,
+        reset_notice,
     })
 }
 
@@ -366,6 +519,7 @@ impl PgStore {
             "password_pending",
             "password_recovery_codes",
             "password_setup_codes",
+            "password_source_counters",
             "password_credentials",
         ] {
             sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -403,14 +557,15 @@ impl PasswordStore for PgStore {
         &self,
         handle: &str,
         actor: Option<&str>,
+        source: Option<&str>,
         now: DateTime<Utc>,
         plan: Plan<'_>,
     ) -> StoreResult<()> {
         let mut tx = self.pool().begin().await?;
         sqlx::query(LOCK).bind(handle).execute(&mut *tx).await?;
-        let snapshot = load(&mut tx, handle, actor).await?;
+        let snapshot = load(&mut tx, handle, actor, source).await?;
         let w = plan(&snapshot);
-        write(&mut tx, handle, &w, now).await?;
+        write(&mut tx, handle, source, &w, now).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -469,6 +624,22 @@ impl PasswordStore for PgStore {
             .execute(self.pool())
             .await?
             .rows_affected();
-        Ok(pending + codes)
+        // An address's counters with nothing left to remember: no failure in the last 24
+        // hours, no wait, and no full sign-in in the last 30 days.
+        let sources = sqlx::query(
+            "DELETE FROM password_source_counters
+             WHERE (sign_in_last_at IS NULL OR sign_in_last_at < $1)
+               AND (setup_last_at IS NULL OR setup_last_at < $1)
+               AND (sign_in_locked_until IS NULL OR sign_in_locked_until <= $3)
+               AND (setup_locked_until IS NULL OR setup_locked_until <= $3)
+               AND (last_success_at IS NULL OR last_success_at < $2)",
+        )
+        .bind(now - FORGET_AFTER)
+        .bind(now - chrono::Duration::days(KNOWN_SOURCE_DAYS))
+        .bind(now)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(pending + codes + sources)
     }
 }

@@ -43,6 +43,9 @@ const USERS: &str = "members:
 ";
 const PASSWORD: &str = "correct horse battery staple";
 const OTHER_PASSWORD: &str = "a different long passphrase";
+/// The person's own address (documentation ranges only), and someone else's.
+const HOME: &str = "203.0.113.10";
+const AWAY: &str = "198.51.100.66";
 
 /// Quick parameters for the flows; the real ones are tested on their own below.
 const QUICK: HashParams = HashParams {
@@ -126,6 +129,7 @@ impl T {
                 self.store(),
                 &format!("{handle}@example.com"),
                 &Secret::new(code),
+                Some(HOME),
                 now,
             )
             .await
@@ -147,6 +151,7 @@ impl T {
                 self.store(),
                 &token,
                 &Secret::new(code_now(&secret, now)),
+                Some(HOME),
                 now,
             )
             .await
@@ -173,11 +178,22 @@ impl T {
         password: &str,
         now: DateTime<Utc>,
     ) -> Result<String, PwError> {
+        self.sign_in_from(HOME, handle, password, now).await
+    }
+
+    async fn sign_in_from(
+        &self,
+        from: &str,
+        handle: &str,
+        password: &str,
+        now: DateTime<Utc>,
+    ) -> Result<String, PwError> {
         self.svc
             .sign_in(
                 self.store(),
                 &format!("{handle}@example.com"),
                 &Secret::new(password),
+                Some(from),
                 now,
             )
             .await
@@ -190,14 +206,46 @@ impl T {
         code: &str,
         now: DateTime<Utc>,
     ) -> Result<pmos_toolserver::password::SignedIn, PwError> {
+        self.code_from(HOME, token, code, now).await
+    }
+
+    async fn code_from(
+        &self,
+        from: &str,
+        token: &str,
+        code: &str,
+        now: DateTime<Utc>,
+    ) -> Result<pmos_toolserver::password::SignedIn, PwError> {
         self.svc
             .second_step(
                 self.store(),
                 token,
                 &SecondStep::Code(Secret::new(code)),
+                Some(from),
                 now,
             )
             .await
+    }
+
+    /// Give `handle` exactly the Auditor role (as an admin in the web app does).
+    async fn make_auditor(&self, handle: &str, now: DateTime<Utc>) {
+        for roles in [
+            [UserRole::Pm, UserRole::Reviewer].into(),
+            [UserRole::Auditor].into(),
+        ] {
+            self.stores
+                .users
+                .apply(
+                    &Actor::web("ada"),
+                    Op::SetRoles {
+                        handle: handle.into(),
+                        roles,
+                    },
+                    now,
+                )
+                .await
+                .unwrap();
+        }
     }
 
     async fn events(&self, action: &str) -> Vec<(String, Outcome, Option<String>, Option<String>)> {
@@ -362,7 +410,13 @@ both!(every_password_step_refusal_is_the_same, |t| {
     // Not even an address: the same.
     assert_eq!(
         t.svc
-            .sign_in(t.store(), "not an address", &Secret::new(PASSWORD), now)
+            .sign_in(
+                t.store(),
+                "not an address",
+                &Secret::new(PASSWORD),
+                Some(HOME),
+                now
+            )
             .await
             .err(),
         Some(PwError::SignInFailed)
@@ -444,6 +498,7 @@ both!(a_recovery_code_works_once, |t| {
             t.store(),
             &token,
             &SecondStep::Recovery(Secret::new(recovery[3].to_uppercase())),
+            Some(HOME),
             at,
         )
         .await
@@ -457,6 +512,7 @@ both!(a_recovery_code_works_once, |t| {
                 t.store(),
                 &token,
                 &SecondStep::Recovery(Secret::new(recovery[3].clone())),
+                Some(HOME),
                 at
             )
             .await,
@@ -485,7 +541,13 @@ both!(setup_codes_are_single_use_expire_and_are_replaced, |t| {
     let second = t.issue(&Actor::web("ada"), "ana", now).await.unwrap();
     let begin = |code: String, at| async move {
         t.svc
-            .setup_begin(t.store(), "ana@example.com", &Secret::new(code), at)
+            .setup_begin(
+                t.store(),
+                "ana@example.com",
+                &Secret::new(code),
+                Some(HOME),
+                at,
+            )
             .await
             .map(|s| s.kind)
     };
@@ -503,7 +565,13 @@ both!(setup_codes_are_single_use_expire_and_are_replaced, |t| {
     // A wrong code for a real user, and for nobody, look alike.
     assert_eq!(
         t.svc
-            .setup_begin(t.store(), "nobody@example.com", &Secret::new(third), now)
+            .setup_begin(
+                t.store(),
+                "nobody@example.com",
+                &Secret::new(third),
+                Some(HOME),
+                now
+            )
             .await
             .err(),
         Some(PwError::SetupFailed)
@@ -620,7 +688,13 @@ both!(
         {
             assert_eq!(
                 t.svc
-                    .setup_begin(t.store(), "ana@example.com", &Secret::new(code), now)
+                    .setup_begin(
+                        t.store(),
+                        "ana@example.com",
+                        &Secret::new(code),
+                        Some(HOME),
+                        now
+                    )
                     .await
                     .err(),
                 Some(PwError::HostOnly)
@@ -653,7 +727,13 @@ both!(
                 .unwrap();
             assert_eq!(
                 t.svc
-                    .setup_begin(t.store(), "ana@example.com", &Secret::new(code), now)
+                    .setup_begin(
+                        t.store(),
+                        "ana@example.com",
+                        &Secret::new(code),
+                        Some(HOME),
+                        now
+                    )
                     .await
                     .err(),
                 Some(PwError::HostOnly)
@@ -742,7 +822,13 @@ both!(setup_code_guesses_wait_the_same_way, |t| {
         let c = c.to_string();
         async move {
             t.svc
-                .setup_begin(t.store(), "ana@example.com", &Secret::new(c), at)
+                .setup_begin(
+                    t.store(),
+                    "ana@example.com",
+                    &Secret::new(c),
+                    Some(HOME),
+                    at,
+                )
                 .await
                 .map(drop)
         }
@@ -815,7 +901,13 @@ both!(the_pending_token_grants_three_tries_for_five_minutes, |t| {
     let c = t.issue(&Actor::web("ada"), "ben", at).await.unwrap();
     let s = t
         .svc
-        .setup_begin(t.store(), "ben@example.com", &Secret::new(c), at)
+        .setup_begin(
+            t.store(),
+            "ben@example.com",
+            &Secret::new(c),
+            Some(HOME),
+            at,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -839,7 +931,13 @@ both!(a_deactivation_after_the_password_ends_the_sign_in, |t| {
     t.deactivate("ben", at).await;
     assert_eq!(
         t.svc
-            .setup_begin(t.store(), "ben@example.com", &Secret::new(code), at)
+            .setup_begin(
+                t.store(),
+                "ben@example.com",
+                &Secret::new(code),
+                Some(HOME),
+                at
+            )
             .await
             .err(),
         Some(PwError::NotAMember)
@@ -857,7 +955,13 @@ both!(
         t.sign_in("ana", PASSWORD, at).await.unwrap();
         let s = t
             .svc
-            .setup_begin(t.store(), "ana@example.com", &Secret::new(code.clone()), at)
+            .setup_begin(
+                t.store(),
+                "ana@example.com",
+                &Secret::new(code.clone()),
+                Some(HOME),
+                at,
+            )
             .await
             .unwrap();
         assert_eq!(s.kind, CodeKind::Reset);
@@ -877,6 +981,7 @@ both!(
                 t.store(),
                 &token,
                 &SecondStep::Recovery(Secret::new(old_recovery[0].clone())),
+                Some(HOME),
                 later
             )
             .await
@@ -957,6 +1062,7 @@ both!(change_password_and_regenerate_recovery_codes, |t| {
             t.store(),
             &token,
             &SecondStep::Recovery(Secret::new(recovery[0].clone())),
+            Some(HOME),
             next
         )
         .await
@@ -966,6 +1072,7 @@ both!(change_password_and_regenerate_recovery_codes, |t| {
             t.store(),
             &token,
             &SecondStep::Recovery(Secret::new(fresh[0].expose())),
+            Some(HOME),
             next,
         )
         .await
@@ -1003,7 +1110,13 @@ both!(raised_parameters_rehash_at_the_next_sign_in, |t| {
     let raised = PasswordService::with_params(t.keys.clone(), stronger).unwrap();
     let at = now + Duration::minutes(1);
     let token = raised
-        .sign_in(t.store(), "ana@example.com", &Secret::new(PASSWORD), at)
+        .sign_in(
+            t.store(),
+            "ana@example.com",
+            &Secret::new(PASSWORD),
+            Some(HOME),
+            at,
+        )
         .await
         .unwrap();
     raised
@@ -1011,6 +1124,7 @@ both!(raised_parameters_rehash_at_the_next_sign_in, |t| {
             t.store(),
             token.token.expose(),
             &SecondStep::Code(Secret::new(code_now(&secret, at))),
+            Some(HOME),
             at,
         )
         .await
@@ -1023,7 +1137,13 @@ both!(raised_parameters_rehash_at_the_next_sign_in, |t| {
     );
     // Next time, at the raised parameters, nothing to do; the old service still verifies it.
     let again = raised
-        .sign_in(t.store(), "ana@example.com", &Secret::new(PASSWORD), at)
+        .sign_in(
+            t.store(),
+            "ana@example.com",
+            &Secret::new(PASSWORD),
+            Some(HOME),
+            at,
+        )
         .await;
     assert!(again.is_ok());
     let n = t
@@ -1036,45 +1156,255 @@ both!(raised_parameters_rehash_at_the_next_sign_in, |t| {
     assert!(t.sign_in("ana", PASSWORD, at).await.is_ok());
 });
 
-both!(the_global_limit_holds_every_caller, |t| {
+// P1: a flood of junk from one address (unknown names, made-up tokens) can't shut out a real
+// sign-in from another. Junk fills only the open allowance; a made-up token costs nothing.
+both!(junk_cannot_shut_out_a_real_sign_in, |t| {
+    let now = t0();
+    let (secret, _) = t.enrolled("ana", now).await;
+    let at = now + Duration::minutes(1);
     let svc = PasswordService::with_params(t.keys.clone(), QUICK)
         .unwrap()
-        .with_global_limit(3);
-    let now = t0();
-    for _ in 0..3 {
-        assert_eq!(
-            svc.sign_in(t.store(), "nobody@example.com", &Secret::new(PASSWORD), now)
-                .await
-                .err(),
-            Some(PwError::SignInFailed)
-        );
+        .with_global_limit(3, 2);
+    let junk = |n: usize| {
+        let svc = &svc;
+        async move {
+            svc.sign_in(
+                t.store(),
+                &format!("nobody{n}@example.com"),
+                &Secret::new(PASSWORD),
+                Some(AWAY),
+                at,
+            )
+            .await
+            .err()
+        }
+    };
+    for n in 0..3 {
+        assert_eq!(junk(n).await, Some(PwError::SignInFailed));
     }
-    assert_eq!(
-        svc.sign_in(t.store(), "nobody@example.com", &Secret::new(PASSWORD), now)
+    // The open allowance is full: more junk is refused at once (and computes nothing).
+    for n in 3..20 {
+        assert!(matches!(junk(n).await, Some(PwError::TooMany { .. })));
+    }
+    // Made-up tokens cost nothing at all: checked before any hash.
+    for _ in 0..20 {
+        assert_eq!(
+            svc.second_step(
+                t.store(),
+                &"x".repeat(43),
+                &SecondStep::Code(Secret::new("1")),
+                Some(AWAY),
+                at
+            )
             .await
             .err(),
-        Some(PwError::TooMany { retry_after: 60 })
-    );
-    assert_eq!(
-        svc.second_step(
+            Some(PwError::SignInExpired)
+        );
+        assert_eq!(
+            svc.setup_password(t.store(), &"y".repeat(43), &Secret::new(PASSWORD), at)
+                .await
+                .err(),
+            Some(PwError::SetupExpired)
+        );
+    }
+    // Ana, from her own address, still signs in: her attempt may use the reserve.
+    let token = svc
+        .sign_in(
             t.store(),
-            &"x".repeat(43),
-            &SecondStep::Code(Secret::new("1")),
-            now
+            "ana@example.com",
+            &Secret::new(PASSWORD),
+            Some(HOME),
+            at,
         )
         .await
-        .err(),
-        Some(PwError::TooMany { retry_after: 60 })
-    );
+        .expect("a real sign-in isn't shut out by junk");
+    svc.second_step(
+        t.store(),
+        token.token.expose(),
+        &SecondStep::Code(Secret::new(code_now(&secret, at))),
+        Some(HOME),
+        at,
+    )
+    .await
+    .unwrap();
+    // A minute on, the open allowance is back.
     assert!(svc
         .sign_in(
             t.store(),
             "nobody@example.com",
             &Secret::new(PASSWORD),
-            now + Duration::minutes(1)
+            Some(AWAY),
+            at + Duration::minutes(1)
         )
         .await
         .is_err_and(|e| e == PwError::SignInFailed));
+});
+
+// PM1: ten wrong guesses from one address, then the owner signs in from another at once.
+// Guessing stays bounded: past the account's ceiling only an address the person signed in
+// from may try.
+both!(guesses_from_one_address_never_hold_the_owner_out, |t| {
+    let now = t0();
+    let (secret, _) = t.enrolled("ana", now).await;
+    let at = now + Duration::minutes(1);
+    for _ in 0..10 {
+        assert_eq!(
+            t.sign_in_from(AWAY, "ana", OTHER_PASSWORD, at).await,
+            Err(PwError::SignInFailed)
+        );
+    }
+    // That address waits (even the right password from it is the same refusal) ...
+    assert_eq!(
+        t.sign_in_from(AWAY, "ana", PASSWORD, at).await,
+        Err(PwError::SignInFailed)
+    );
+    // ... but Ana, from her own address, gets in at once.
+    let token = t.sign_in_from(HOME, "ana", PASSWORD, at).await.unwrap();
+    t.code_from(HOME, &token, &code_now(&secret, at), at)
+        .await
+        .unwrap();
+    // IPv6 addresses count by /64: another address in the attacker's /64 waits too.
+    for _ in 0..5 {
+        t.sign_in_from("2001:db8:aa:bb::1", "ana", OTHER_PASSWORD, at)
+            .await
+            .ok();
+    }
+    assert_eq!(
+        t.sign_in_from("2001:db8:aa:bb::ffff", "ana", PASSWORD, at)
+            .await,
+        Err(PwError::SignInFailed),
+        "the same /64"
+    );
+    // Many addresses at once: past the account's ceiling a new address is refused, but Ana's
+    // known address still works.
+    let mut later = at + Duration::minutes(2);
+    let mut n = 0;
+    while n < limits::ACCOUNT_CEILING {
+        let from = format!("192.0.2.{}", n % 200 + 1);
+        t.sign_in_from(&from, "ana", OTHER_PASSWORD, later)
+            .await
+            .ok();
+        n += 1;
+        later += Duration::seconds(1);
+    }
+    assert_eq!(
+        t.sign_in_from("198.18.0.1", "ana", PASSWORD, later).await,
+        Err(PwError::SignInFailed),
+        "a new address past the ceiling"
+    );
+    let token = t.sign_in_from(HOME, "ana", PASSWORD, later).await.unwrap();
+    let step_later = later + Duration::seconds(30);
+    t.code_from(HOME, &token, &code_now(&secret, step_later), step_later)
+        .await
+        .unwrap();
+    let locks = t.events("password.sign_in").await;
+    assert!(locks.iter().any(|e| e.3.as_deref() == Some("locked")));
+});
+
+// PM2: a reset is never silent. The person sees who reset their sign-in and when, from the
+// moment the code is issued, through the reset, until they dismiss it.
+both!(a_reset_leaves_a_notice_until_dismissed, |t| {
+    let now = t0();
+    t.enrolled("ana", now).await;
+    let st = t.store().password_status("ana", now).await.unwrap();
+    assert_eq!(st.reset_notice, None, "a first setup is no reset");
+    let at = now + Duration::minutes(1);
+    let code = t.issue(&Actor::web("ada"), "ana", at).await.unwrap();
+    let st = t.store().password_status("ana", at).await.unwrap();
+    let notice = st.reset_notice.expect("a notice");
+    assert_eq!((notice.by.as_str(), notice.at), ("ada", at));
+    // The old credential keeps working until the code is used.
+    t.sign_in("ana", PASSWORD, at).await.unwrap();
+    t.setup("ana", &code, OTHER_PASSWORD, at).await;
+    assert!(t
+        .store()
+        .password_status("ana", at)
+        .await
+        .unwrap()
+        .reset_notice
+        .is_some());
+    t.svc
+        .dismiss_reset_notice(t.store(), "ana", at)
+        .await
+        .unwrap();
+    assert_eq!(
+        t.store()
+            .password_status("ana", at)
+            .await
+            .unwrap()
+            .reset_notice,
+        None
+    );
+    let ev = t.events("password.reset_notice").await;
+    assert_eq!(ev[0].3.as_deref(), Some("dismissed"));
+    // From the host, the notice names the host.
+    t.issue(&ops(), "ana", at).await.unwrap();
+    let notice = t
+        .store()
+        .password_status("ana", at)
+        .await
+        .unwrap()
+        .reset_notice
+        .unwrap();
+    assert_eq!(
+        (notice.by.as_str(), notice.host_user.as_deref()),
+        ("host", Some("ops"))
+    );
+    // A reset for an Admin or Auditor is still host-only.
+    t.enrolled("bob", at).await;
+    assert_eq!(
+        t.issue(&Actor::web("ada"), "bob", at).await,
+        Err(PwError::HostOnly)
+    );
+});
+
+// PM3: a credential set with a web-issued code stops working when the person becomes an
+// Auditor (or Admin), at the password step and at the second step, until a host-issued
+// setup replaces it. A host-issued one keeps working.
+both!(a_web_issued_credential_does_not_survive_promotion, |t| {
+    let now = t0();
+    let code = t.issue(&Actor::web("ada"), "ana", now).await.unwrap();
+    let (secret, _) = t.setup("ana", &code, PASSWORD, now).await;
+    let (ben_secret, _) = t.enrolled("ben", now).await; // host-issued
+    let at = now + Duration::minutes(1);
+    let pending = t.sign_in("ana", PASSWORD, at).await.unwrap();
+    t.make_auditor("ana", at).await;
+    t.make_auditor("ben", at).await;
+    // The second step of a sign-in begun before the promotion: refused.
+    assert_eq!(
+        t.code(&pending, &code_now(&secret, at), at).await.err(),
+        Some(PwError::SignInExpired)
+    );
+    // The password step: the uniform refusal.
+    assert_eq!(
+        t.sign_in("ana", PASSWORD, at).await,
+        Err(PwError::SignInFailed)
+    );
+    let st = t.store().password_status("ana", at).await.unwrap();
+    assert!(st.needs_host_setup && !st.password_set && !st.second_step_enrolled);
+    let ev = t.events("password.sign_in").await;
+    assert!(ev.iter().any(|e| e.3.as_deref() == Some("host_only")));
+    // Ben's credential came from the host: it still works.
+    let token = t.sign_in("ben", PASSWORD, at).await.unwrap();
+    t.code(&token, &code_now(&ben_secret, at), at)
+        .await
+        .unwrap();
+    assert!(
+        !t.store()
+            .password_status("ben", at)
+            .await
+            .unwrap()
+            .needs_host_setup
+    );
+    // A host-issued setup replaces Ana's, and she signs in again.
+    let later = at + Duration::minutes(1);
+    let host_code = t.issue(&ops(), "ana", later).await.unwrap();
+    let (fresh, _) = t.setup("ana", &host_code, OTHER_PASSWORD, later).await;
+    let st = t.store().password_status("ana", later).await.unwrap();
+    assert!(st.password_set && !st.needs_host_setup);
+    let next = later + Duration::seconds(31);
+    let token = t.sign_in("ana", OTHER_PASSWORD, next).await.unwrap();
+    t.code(&token, &code_now(&fresh, next), next).await.unwrap();
 });
 
 both!(the_grace_end_deletes_the_credential, |t| {
@@ -1352,7 +1682,8 @@ macro_rules! http {
     };
 }
 
-const ROUTES: [&str; 10] = [
+const ROUTES: [&str; 11] = [
+    "/internal/password/reset-notice/dismiss",
     "/internal/password/sign-in",
     "/internal/password/second-step",
     "/internal/password/setup/begin",
@@ -1632,7 +1963,8 @@ http!(
         assert_eq!(
             st,
             json!({"enabled": true, "password_set": true, "second_step_enrolled": true,
-                          "setup_code_pending": false, "recovery_codes_left": 9})
+                          "setup_code_pending": false, "recovery_codes_left": 9,
+                          "needs_host_setup": false, "reset_notice": null})
         );
         let (_, list) = s
             .signed("ada", Method::GET, "/internal/admin/users", None)
@@ -1704,6 +2036,109 @@ http!(
             status == 200 || body["code"] == "reauth_failed",
             "{status} {body}"
         );
+    }
+);
+
+// L15: an Auditor reading the audit log sees one reason, and no target, for every refused
+// password step; an Admin sees each reason.
+http!(
+    an_auditor_sees_one_reason_for_a_refused_password_step,
+    true,
+    true,
+    |s| {
+        s.t.enrolled("ana", Utc::now()).await;
+        for (name, pw) in [
+            ("nobody@example.com", PASSWORD),
+            ("ana@example.com", OTHER_PASSWORD),
+        ] {
+            let (status, _) = s
+                .web(
+                    "/internal/password/sign-in",
+                    json!({"sign_in_name": name, "password": pw, "source": HOME}),
+                )
+                .await;
+            assert_eq!(status, 401);
+        }
+        let refusals = |page: &Value| -> Vec<(Value, Value)> {
+            page["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["action"] == "password.sign_in" && e["outcome"] == "denied")
+                .map(|e| (e["detail"].clone(), e["target"].clone()))
+                .collect()
+        };
+        let (status, admin) = s
+            .signed("ada", Method::GET, "/internal/admin/audit", None)
+            .await;
+        assert_eq!(status, 200, "{admin}");
+        let seen = refusals(&admin);
+        assert!(
+            seen.contains(&(json!("unknown_name"), Value::Null)),
+            "{seen:?}"
+        );
+        assert!(
+            seen.contains(&(json!("wrong_password"), json!("ana"))),
+            "{seen:?}"
+        );
+        let (status, auditor) = s
+            .signed("aud", Method::GET, "/internal/admin/audit", None)
+            .await;
+        assert_eq!(status, 200, "{auditor}");
+        let seen = refusals(&auditor);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(
+            seen.iter()
+                .all(|r| *r == (json!("sign_in_failed"), Value::Null)),
+            "{seen:?}"
+        );
+    }
+);
+
+// PM2 over HTTP: the person's status carries the notice, the overview lists the reset, and
+// the person dismisses it.
+http!(
+    a_reset_shows_on_the_status_and_the_overview,
+    true,
+    true,
+    |s| {
+        s.t.enrolled("ana", Utc::now()).await;
+        let (status, issued) = s
+            .signed(
+                "ada",
+                Method::POST,
+                "/internal/password/setup-codes",
+                Some(json!({"handle": "ana"})),
+            )
+            .await;
+        assert_eq!((status, issued["kind"].as_str()), (201, Some("reset")));
+        let (_, st) = s
+            .signed("ana", Method::GET, "/internal/password/status", None)
+            .await;
+        assert_eq!(st["reset_notice"]["by"], "ada", "{st}");
+        assert!(st["reset_notice"]["at"].is_string(), "{st}");
+        let (status, overview) = s
+            .signed("ada", Method::GET, "/internal/admin/overview", None)
+            .await;
+        assert_eq!(status, 200, "{overview}");
+        let resets = overview["users"]["password_resets"].as_array().unwrap();
+        assert_eq!(
+            (resets[0]["handle"].as_str(), resets[0]["by"].as_str()),
+            (Some("ana"), Some("ada"))
+        );
+        let (status, _) = s
+            .signed(
+                "ana",
+                Method::POST,
+                "/internal/password/reset-notice/dismiss",
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (_, st) = s
+            .signed("ana", Method::GET, "/internal/password/status", None)
+            .await;
+        assert_eq!(st["reset_notice"], Value::Null);
     }
 );
 

@@ -354,11 +354,16 @@ pub fn user_json(
 }
 
 /// What the Team page shows about a person's password sign-in (docs/password-sign-in.md):
-/// three booleans, never anything secret, for an Admin's and an Auditor's view alike.
-pub fn with_password(v: &mut Value, s: crate::password::store::PasswordStatus) {
+/// four booleans, never anything secret, for an Admin's and an Auditor's view alike.
+/// `password_needs_host_setup`: the person holds Admin or Auditor and their credential came
+/// from a code an admin issued in the web app, so it doesn't work and their password sessions
+/// have ended until someone with host access issues a setup code (`pmos-admin users
+/// password-setup`). A role change's answer carries it, so the Team page can say so at once.
+pub fn with_password(v: &mut Value, s: &crate::password::store::PasswordStatus) {
     v["password_set"] = json!(s.password_set);
     v["second_step_enrolled"] = json!(s.second_step_enrolled);
     v["setup_code_pending"] = json!(s.setup_code_pending);
+    v["password_needs_host_setup"] = json!(s.needs_host_setup);
 }
 
 /// The cap and grace the screen shows (§6).
@@ -439,7 +444,7 @@ async fn list(
         let mut v = user_json(u, &dir, Some(&accounts), bots, now, admin_view);
         with_password(
             &mut v,
-            passwords.get(&u.handle).copied().unwrap_or_default(),
+            &passwords.get(&u.handle).cloned().unwrap_or_default(),
         );
         users.push(v);
     }
@@ -480,7 +485,7 @@ async fn written(
                 .password_status(handle, Utc::now())
                 .await;
             match status {
-                Ok(s) => with_password(&mut v, s),
+                Ok(s) => with_password(&mut v, &s),
                 Err(e) => return store_down(e),
             }
             v

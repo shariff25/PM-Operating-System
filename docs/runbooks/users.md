@@ -125,7 +125,18 @@ host can, with `password-setup <handle>`, which prints the code once (24 hours, 
 new one replaces it). Give it to the person yourself, never by a channel others read. The same
 command is the **reset** for someone who forgot their password or lost their phone: using the
 code replaces their password, authenticator and recovery codes and signs them out everywhere.
-Until it is used the old password still works: to shut someone out now, deactivate them.
+Until it is used the old password still works: to shut someone out now, deactivate them. A
+reset is never silent: the person sees "Your sign-in was reset by <name> on <date>" until they
+dismiss it, and the admin overview lists the week's resets. When someone becomes an Admin or
+Auditor, a password they set up with a code made in the web app stops working (the Team page
+says "Password needs host"): give them a code with `password-setup <handle>`.
+
+**Turning password sign-in on in the kit**: set `PMOS_WEB_PASSWORD_LOGIN=1`, the web app's
+`https://` address in `PMOS_WEB_PUBLIC_URL`, and `PMOS_WEB_TRUSTED_PROXIES` to the address
+your reverse proxy reaches the web app from (for a proxy on this host, the `pmos` network's
+gateway: `deploy/pmos-admin up --web` prints it when it is blank, and refuses to start the web
+app until it is set). The proxy must send `X-Forwarded-For`. Someone guessing from one address
+only makes that address wait; the person still signs in from their own.
 
 `grant-admin --keep-entra` reuses an Entra link the host already confirmed. A deactivated
 admin who comes back is reactivated without `admin`; grant it again on purpose.

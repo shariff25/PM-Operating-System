@@ -1296,7 +1296,8 @@ async fn password_sign_in_through_pmos_web_and_the_real_tool_server() {
     assert_eq!(status, StatusCode::OK, "{st}");
     assert_eq!(
         st,
-        json!({"enabled": true, "password_set": true, "second_step_enrolled": true, "recovery_codes_left": 10})
+        json!({"enabled": true, "password_set": true, "second_step_enrolled": true, "recovery_codes_left": 10,
+               "needs_host_setup": false, "reset_notice": null})
     );
     // The code is spent.
     let (status, body, _) = s
@@ -1425,6 +1426,24 @@ async fn password_sign_in_through_pmos_web_and_the_real_tool_server() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _, _) = s.send(Some(&fresh), Method::GET, "/api/me", None).await;
     assert_eq!(status, StatusCode::OK);
+    // The reset is never silent (PM2): her status names who reset it until she dismisses it.
+    let (_, st, _) = s
+        .send(Some(&fresh), Method::GET, "/api/auth/password/status", None)
+        .await;
+    assert_eq!(st["reset_notice"]["by"], "stack-admin", "{st}");
+    let (status, _, _) = s
+        .send(
+            Some(&fresh),
+            Method::POST,
+            "/api/auth/password/reset-notice/dismiss",
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, st, _) = s
+        .send(Some(&fresh), Method::GET, "/api/auth/password/status", None)
+        .await;
+    assert_eq!(st["reset_notice"], Value::Null, "{st}");
     let later = s
         .password_sign_in("the reset passphrase here", &recovery[0])
         .await;
