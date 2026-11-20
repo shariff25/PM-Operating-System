@@ -7,6 +7,9 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
 ## Scope (the owner's list, a to f, i and j; g and h were dropped)
 
 - **a. Authentication:** primarily Azure AD (Entra ID) single sign-on.
+  Owner, 2026-11-20: add a second way to sign in without Entra: email and password kept by
+  PM OS, with an authenticator-app code required as a second step. It sits beside Entra and is
+  switched on by configuration (`docs/password-sign-in.md`).
 - **b. Authorization:** role-based access with four roles: Admin, Product Manager, Reviewer,
   Auditor. A Reviewer recommends and the draft's owner confirms. An Auditor sees metadata only.
   The PM OS user database is the source of users and roles, not `team.yaml`; the design is
