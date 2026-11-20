@@ -2,7 +2,7 @@
 // the tool server's rules for each write (docs/web-api.md, "Admin: users and roles"). Fake names,
 // fake addresses and fake ids only. Used by the sample-data client (tests and the dev server).
 import { ApiError, USER_ROLES } from './types';
-import type { DirectoryUser, IdentityKind, NewUser, OverviewUsers, UserFields, UserList, Written } from './types';
+import type { DirectoryUser, IdentityKind, NewUser, OverviewUsers, PasswordSetupCode, UserFields, UserList, Written } from './types';
 
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
@@ -46,6 +46,7 @@ function seeds(now: number, hostile: boolean): Seed[] {
       handle: 'ana', display_name: 'Ana Silva', roles: ['pm'], entra: 'linked', slack_linked: true, entra_linked: true,
       atlassian_linked: true, accounts: { atlassian: true, slack: true, github: false }, team_bots: ['scout'], reviewed_by: ['ben'],
       sign_in_name: 'ana@contoso.example', atlassian_email: 'ana@contoso.example',
+      password_set: true, second_step_enrolled: true,
     },
     {
       handle: 'ben', display_name: 'Ben Carter', roles: ['pm', 'reviewer'], entra: 'linked', slack_linked: true, entra_linked: true,
@@ -56,16 +57,19 @@ function seeds(now: number, hostile: boolean): Seed[] {
       handle: 'dana', display_name: '', roles: ['pm'], entra: 'linked', slack_linked: false, entra_linked: true,
       atlassian_linked: true, accounts: { atlassian: true, slack: false, github: false }, reviewed_by: ['ben'],
       sign_in_name: 'dana@contoso.example', atlassian_email: 'dana.w@contoso.example',
+      password_set: true, second_step_enrolled: true, setup_code_pending: true,
     },
     {
       handle: 'priya', display_name: 'Priya Nair', roles: ['reviewer'], entra: 'linked', slack_linked: true, entra_linked: true,
       accounts: { atlassian: false, slack: true, github: false }, reviews: ['ravi'],
       sign_in_name: 'priya@contoso.example', atlassian_email: 'priya@contoso.example',
+      password_set: true, second_step_enrolled: true,
     },
     {
       handle: 'ravi', display_name: 'Ravi Kumar', roles: ['pm'], entra: 'none', slack_linked: true,
       accounts: { atlassian: false, slack: true, github: false }, reviewed_by: ['priya'],
       sign_in_name: 'ravi@contoso.example', atlassian_email: 'ravi@contoso.example',
+      setup_code_pending: true,
     },
     {
       handle: 'sam', display_name: 'Sam Lee', roles: ['pm'], entra: 'none', slack_linked: true, sign_in_name_confirmed: false,
@@ -140,6 +144,9 @@ function build(s: Seed, now: number): DirectoryUser {
     sign_in_name: s.sign_in_name ?? null,
     atlassian_email: s.atlassian_email ?? null,
     github_login: s.github_login ?? null,
+    password_set: s.password_set ?? false,
+    second_step_enrolled: s.second_step_enrolled ?? false,
+    setup_code_pending: s.setup_code_pending ?? false,
   };
   return u;
 }
@@ -172,12 +179,18 @@ export interface MockUsers {
   reactivate(actor: string, handle: string, expected: number | undefined): Written;
   unlink(actor: string, handle: string, kind: IdentityKind): Written;
   assignReviewer(actor: string, reviewer: string, pms: string[], expected: number | undefined): Written;
+  /** A password setup or reset code, shown once; the sign-in name goes to the password sample data with it. */
+  passwordSetupCode(actor: string, handle: string): { code: PasswordSetupCode; signInName: string };
+  /** A setup or reset finished in the password sample data. */
+  passwordSet(handle: string): void;
 }
 
 export function createMockUsers(now0: number, options: MockUsersOptions = {}): MockUsers {
   const users = new Map<string, DirectoryUser>();
   for (const s of seeds(now0, options.hostile ?? false)) users.set(s.handle, build(s, now0));
   let version = 42;
+  /** Setup codes made so far, so each one differs. */
+  let codes = 0;
   /** When each web or Slack deactivation happened: the hourly cap counts these. */
   const deactivations: number[] = options.deactivationCapReached ? [now0 - 5 * 60_000, now0 - 15 * 60_000, now0 - 25 * 60_000] : [now0 - 20 * 60_000];
   const LIMIT = 3;
@@ -225,6 +238,7 @@ export function createMockUsers(now0: number, options: MockUsersOptions = {}): M
       const status = code === 'unknown_outcome' || code === 'upstream_unavailable' ? 502
         : ['assertion_required', 'unavailable', 'users_unavailable'].includes(code) ? 503
         : code === 'deactivation_limit' ? 429
+        : code === 'not_configured' ? 501
         : ['forbidden', 'host_only', 'self_change', 'bad_origin', 'bad_csrf'].includes(code) ? 403
         : code === 'invalid' ? 422
         : code === 'not_found' ? 404
@@ -467,6 +481,32 @@ export function createMockUsers(now0: number, options: MockUsersOptions = {}): M
         if (u.accounts) u.accounts.github = false;
       }
       return done(u);
+    },
+
+    passwordSetupCode(actor, handle) {
+      begin(actor);
+      const u = find(handle);
+      if (handle === actor) throw refuse(403, 'self_change', 'Nobody makes a setup code for themselves.');
+      if (u.host_only) throw refuse(403, 'host_only', 'Host only: pmos-admin users password-setup.');
+      if (handle === 'evals') throw refuse(409, 'evals_account', 'The evals account never has a password.');
+      if (u.status !== 'active') throw refuse(409, 'not_active', 'They are deactivated.');
+      if (!u.sign_in_name || !u.sign_in_name_confirmed) throw refuse(409, 'sign_in_unconfirmed', 'Confirm their sign-in name first.');
+      codes += 1;
+      const body = `${handle.slice(0, 4).toUpperCase().padEnd(4, 'X')}${codes}`.slice(0, 5);
+      const code = `K7Q4M-P9X3T-${body}-W2R8N`;
+      u.setup_code_pending = true;
+      return {
+        code: { setup_code: code, handle, kind: u.password_set ? 'reset' : 'setup', expires_at: iso(now() + DAY) },
+        signInName: u.sign_in_name,
+      };
+    },
+
+    passwordSet(handle) {
+      const u = users.get(handle);
+      if (!u) return;
+      u.password_set = true;
+      u.second_step_enrolled = true;
+      u.setup_code_pending = false;
     },
 
     assignReviewer(actor, reviewer, pms, expected) {

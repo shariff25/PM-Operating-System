@@ -1,10 +1,10 @@
 import { useState } from 'react';
-import type { DirectoryUser, IdentityKind, UserFields, UserList, Written } from '../../api';
+import type { DirectoryUser, IdentityKind, PasswordSetupCode, UserFields, UserList, Written } from '../../api';
 import { USER_ROLES } from '../../api';
 import { useApp } from '../../app-context';
 import { Icon } from '../../components/icons';
 import { copy } from '../../copy';
-import { inGrace, listWords, longDay, nameOf, roleWords, validSlackId, whenUtc } from '../../admin/team';
+import { inGrace, listWords, longDay, nameOf, roleWords, validSlackId, whenUtc, writeOutcome } from '../../admin/team';
 import { RoleChecks, TeamDialog, TextField } from './teamParts';
 import type { Problem } from './teamParts';
 
@@ -343,6 +343,136 @@ export function UnlinkDialog({ user, kind, flow }: { user: DirectoryUser; kind: 
       testId="unlink-dialog"
       onSubmit={() => flow.submit(() => api.adminUnlink(user.handle, kind), (w) => U.done(what, nameOf(w.user)))}
     />
+  );
+}
+
+// ---------- Password setup and reset codes ----------
+
+/**
+ * A setup code (no password yet) or a reset code (replaces everything), made by an admin and shown
+ * to them once (docs/web-api.md, "Password sign-in"). Someone holding Admin or Auditor gets theirs
+ * from the host, so the dialog says that instead of offering to make one.
+ */
+export function SetupCodeDialog({ user, onClose, onMade }: { user: DirectoryUser; onClose: () => void; onMade: () => void }) {
+  const { api } = useApp();
+  const SC = T.setupCode;
+  const who = nameOf(user);
+  const reset = user.password_set === true;
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState<Problem | null>(null);
+  const [made, setMade] = useState<PasswordSetupCode | null>(null);
+  const [copied, setCopied] = useState<'yes' | 'failed' | null>(null);
+
+  if (made) {
+    return (
+      <TeamDialog
+        key="made"
+        title={made.kind === 'reset' ? SC.doneReset(who) : SC.doneSetup(who)}
+        onClose={onClose}
+        onSubmit={onClose}
+        busy={false}
+        problem={null}
+        submitLabel={SC.done}
+        busyLabel={SC.done}
+        hideCancel
+        testId="setup-code-made"
+      >
+        <div className="setup-code-box">
+          <span className="field-label" id="setup-code-label">{SC.codeLabel}</span>
+          <div className="setup-code-row">
+            <code className="setup-code" aria-labelledby="setup-code-label">{made.setup_code}</code>
+            <button
+              type="button"
+              className="btn btn-sm"
+              data-autofocus
+              onClick={() => {
+                if (!navigator.clipboard?.writeText) return setCopied('failed');
+                navigator.clipboard.writeText(made.setup_code).then(() => setCopied('yes'), () => setCopied('failed'));
+              }}
+            >
+              <Icon name={copied === 'yes' ? 'check' : 'docs'} size={14} />
+              {copied === 'yes' ? SC.copied : SC.copy}
+            </button>
+          </div>
+          <span className="sr-only" role="status">{copied === 'yes' ? SC.copied : ''}</span>
+          {copied === 'failed' && <p className="field-hint" role="alert">{SC.copyFailed}</p>}
+          <p className="setup-code-once">
+            <Icon name="alert" size={14} />
+            <span>{SC.once} {SC.expires(whenUtc(made.expires_at))}</span>
+          </p>
+        </div>
+        <ul className="checklist setup-code-steps">
+          <li className="check-item check-info"><Icon name="lock" size={15} className="check-icon" /><span>{SC.handOff}</span></li>
+          <li className="check-item check-info"><Icon name="arrowRight" size={15} className="check-icon" /><span>{SC.whatTheyDo(who)}</span></li>
+        </ul>
+      </TeamDialog>
+    );
+  }
+
+  if (user.host_only) {
+    return (
+      <TeamDialog
+        title={SC.headingHost(who)}
+        onClose={onClose}
+        onSubmit={onClose}
+        busy={false}
+        problem={null}
+        submitLabel={SC.close}
+        busyLabel={SC.close}
+        hideCancel
+        testId="setup-code-host"
+      >
+        <div className="note note-info">
+          <Icon name="lock" className="note-icon" />
+          <div className="note-body">
+            <p>{SC.hostOnly(who)}</p>
+            <code className="mono-val team-command">{SC.hostCommand(user.handle)}</code>
+          </div>
+        </div>
+      </TeamDialog>
+    );
+  }
+
+  const create = () => {
+    if (busy) return;
+    setBusy(true);
+    setProblem(null);
+    void (async () => {
+      try {
+        setMade(await api.adminPasswordSetupCode(user.handle));
+        onMade();
+      } catch (e) {
+        const out = writeOutcome(e);
+        if (out.kind === 'refused') setProblem({ text: Object.hasOwn(SC.errors, out.code) ? SC.errors[out.code]! : out.text, tone: 'error' });
+        else {
+          onMade();
+          setProblem({ text: T.unknownReloaded, tone: 'warn' });
+        }
+      } finally {
+        setBusy(false);
+      }
+    })();
+  };
+
+  return (
+    <TeamDialog
+      title={reset ? SC.headingReset(who) : SC.headingSetup(who)}
+      intro={reset ? SC.introReset(who) : SC.introSetup(who)}
+      onClose={onClose}
+      onSubmit={create}
+      busy={busy}
+      problem={problem}
+      submitLabel={SC.submit}
+      busyLabel={SC.submitting}
+      testId="setup-code-dialog"
+    >
+      {(reset || user.setup_code_pending) && (
+        <ul className="checklist">
+          {reset && <li className="check-item check-info"><Icon name="clock" size={15} className="check-icon" /><span>{SC.stillWorks}</span></li>}
+          {user.setup_code_pending && <li className="check-item check-info"><Icon name="refresh" size={15} className="check-icon" /><span>{SC.replaces}</span></li>}
+        </ul>
+      )}
+    </TeamDialog>
   );
 }
 

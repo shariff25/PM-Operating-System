@@ -32,6 +32,7 @@ import {
   ReactivateDialog,
   ReviewersDialog,
   RolesDialog,
+  SetupCodeDialog,
   UnlinkDialog,
 } from './teamDialogs';
 import type { Flow } from './teamDialogs';
@@ -40,7 +41,7 @@ const T = copy.admin.team;
 
 type Action =
   | { kind: 'invite' }
-  | { kind: 'roles' | 'fields' | 'confirm' | 'deactivate' | 'reactivate' | 'reviewers'; handle: string }
+  | { kind: 'roles' | 'fields' | 'confirm' | 'deactivate' | 'reactivate' | 'reviewers' | 'setupCode'; handle: string }
   | { kind: 'unlink'; handle: string; identity: IdentityKind };
 
 // ---------- Cells ----------
@@ -121,9 +122,39 @@ function SignInCell({ u, admin, onConfirm }: { u: DirectoryUser; admin: boolean;
   }
   return (
     <span className="cell-stack">
-      {state}
+      <span className="sign-line">
+        {state}
+        <PasswordState u={u} />
+      </span>
       {address}
     </span>
+  );
+}
+
+/** Password sign-in beside the Microsoft state: booleans only, never anything secret. Nothing when neither is so. */
+function PasswordState({ u }: { u: DirectoryUser }) {
+  const S = T.signIn;
+  const set = u.password_set === true;
+  const pending = u.setup_code_pending === true;
+  if (!set && !pending) return null;
+  const whole = set && u.second_step_enrolled === true;
+  return (
+    <>
+      {set && (
+        <span className={`pw-tag ${whole ? 'pw-tag-on' : 'pw-tag-warn'}`} title={whole ? S.passwordSr : S.passwordHalfSr}>
+          <Icon name="lock" size={11} />
+          <span aria-hidden="true">{whole ? S.password : S.passwordHalf}</span>
+          <span className="sr-only">{whole ? S.passwordSr : S.passwordHalfSr}</span>
+        </span>
+      )}
+      {pending && (
+        <span className="pw-tag" title={S.codeWaitingSr}>
+          <Icon name="clock" size={11} />
+          <span aria-hidden="true">{set ? S.codeWaitingReset : S.codeWaitingSetup}</span>
+          <span className="sr-only">{S.codeWaitingSr}</span>
+        </span>
+      )}
+    </>
   );
 }
 
@@ -208,7 +239,7 @@ function useUsers() {
 
 /** Everyone in the user database: roles, status, sign-in and linked accounts. Admins change people here; auditors read. */
 export function Team({ search = '' }: { search?: string }) {
-  const { me } = useApp();
+  const { api, me } = useApp();
   const toast = useToast();
   const { data, error, forbidden, reload, apply, current } = useUsers();
   const query = teamQuery(search);
@@ -219,6 +250,18 @@ export function Team({ search = '' }: { search?: string }) {
   const [note, setNote] = useState<string | null>(null);
   const tabs = useRef<Partial<Record<TeamFilter, HTMLButtonElement | null>>>({});
   const scrolled = useRef(false);
+  // Setup codes are offered only while password sign-in is on.
+  const [passwordOn, setPasswordOn] = useState(false);
+  useEffect(() => {
+    let live = true;
+    api.providers().then(
+      (list) => live && setPasswordOn(list.includes('password')),
+      () => live && setPasswordOn(false),
+    );
+    return () => {
+      live = false;
+    };
+  }, [api]);
 
   // Follow a link from the overview: the filter it names, and the person it points at.
   useEffect(() => {
@@ -288,6 +331,14 @@ export function Team({ search = '' }: { search?: string }) {
     items.push({ label: T.fields.menu, icon: 'edit', onSelect: () => open({ kind: 'fields', handle: u.handle }) });
     if (self) return items;
     if (u.sign_in_unconfirmed && !u.host_only) items.push({ label: T.confirm.menu, icon: 'check', onSelect: () => open({ kind: 'confirm', handle: u.handle }) });
+    // A setup code for an active person with a confirmed sign-in name; for an Admin or Auditor the dialog says the host makes it.
+    if (passwordOn && active && u.handle !== 'evals' && u.has_sign_in_name && u.sign_in_name_confirmed) {
+      items.push({
+        label: u.password_set ? T.setupCode.menuReset : T.setupCode.menuSetup,
+        icon: 'lock',
+        onSelect: () => open({ kind: 'setupCode', handle: u.handle }),
+      });
+    }
     if (active && u.roles.includes('reviewer')) items.push({ label: T.reviewers.menu, icon: 'followups', onSelect: () => open({ kind: 'reviewers', handle: u.handle }) });
     if (u.entra_linked && !u.host_only) items.push({ label: T.unlink.menu(T.unlink.names.entra!), icon: 'link', danger: true, onSelect: () => open({ kind: 'unlink', handle: u.handle, identity: 'entra' }) });
     if (u.atlassian_linked) items.push({ label: T.unlink.menu(T.unlink.names.atlassian!), icon: 'link', danger: true, onSelect: () => open({ kind: 'unlink', handle: u.handle, identity: 'atlassian' }) });
@@ -449,6 +500,7 @@ export function Team({ search = '' }: { search?: string }) {
           {action.kind === 'reactivate' && <ReactivateDialog user={target} flow={flow} />}
           {action.kind === 'unlink' && <UnlinkDialog user={target} kind={action.identity} flow={flow} />}
           {action.kind === 'reviewers' && <ReviewersDialog user={target} list={data} flow={flow} />}
+          {action.kind === 'setupCode' && <SetupCodeDialog user={target} onClose={close} onMade={() => void reload()} />}
         </>
       )}
     </div>
