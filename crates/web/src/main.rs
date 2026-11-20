@@ -23,6 +23,13 @@ async fn main() -> Result<()> {
             );
         }
     }
+    if config.password_login {
+        // The tool server decides each sign-in; pmos-web holds no hash or secret.
+        tracing::info!(
+            trusted_proxies = config.trusted_proxies.len(),
+            "password sign-in is on (PMOS_WEB_PASSWORD_LOGIN=1), with a required authenticator code"
+        );
+    }
     if let Some(entra) = &config.entra {
         // Ids and URLs only: never the client secret.
         tracing::info!(
@@ -105,9 +112,15 @@ async fn main() -> Result<()> {
         stop.cancel();
     });
     let stop = shutdown.clone();
-    axum::serve(listener, server.public)
-        .with_graceful_shutdown(async move { stop.cancelled_owned().await })
-        .await?;
+    // With the peer's address: password sign-in counts refused guesses per address.
+    axum::serve(
+        listener,
+        server
+            .public
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { stop.cancelled_owned().await })
+    .await?;
     shutdown.cancel();
     if let Some(internal) = internal {
         internal.await??;

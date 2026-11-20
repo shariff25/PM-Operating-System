@@ -279,6 +279,8 @@ async fn web() -> Web {
         session_idle: Duration::hours(8),
         session_max: Duration::hours(24),
         internal_bind: None,
+        password_login: false,
+        trusted_proxies: Vec::new(),
     };
     let (base, stop_web) = serve(pmos_web::build(cfg, Deps::in_memory()).unwrap()).await;
     Web {

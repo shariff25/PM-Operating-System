@@ -90,7 +90,9 @@ impl Counter {
 
 /// Seconds until `until`, at least 1: a `Retry-After`.
 pub fn retry_after(until: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
-    u64::try_from((until - now).num_seconds()).unwrap_or(0).max(1)
+    u64::try_from((until - now).num_seconds())
+        .unwrap_or(0)
+        .max(1)
 }
 
 /// The rolling-minute limit across the tool server's unauthenticated password routes.

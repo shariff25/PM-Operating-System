@@ -137,7 +137,12 @@ mod tests {
         let typed = code.to_lowercase().replace('-', " ");
         assert_eq!(setup_code_hash(&typed).as_deref(), Some(h.as_str()));
         assert_ne!(code.as_str(), new_setup_code().unwrap().as_str());
-        for bad in ["", "ABCDE", "ABCDE-ABCDE-ABCDE-ABCD1", "ABCDE-ABCDE-ABCDE-ABCDEF"] {
+        for bad in [
+            "",
+            "ABCDE",
+            "ABCDE-ABCDE-ABCDE-ABCD1",
+            "ABCDE-ABCDE-ABCDE-ABCDEF",
+        ] {
             assert_eq!(setup_code_hash(bad), None, "{bad}");
         }
     }
@@ -151,7 +156,10 @@ mod tests {
         for c in &codes {
             assert_eq!(c.len(), 19, "{}", c.as_str());
             let h = recovery_code_hash("ana", c).unwrap();
-            assert_eq!(recovery_code_hash("ana", &c.to_uppercase()), Some(h.clone()));
+            assert_eq!(
+                recovery_code_hash("ana", &c.to_uppercase()),
+                Some(h.clone())
+            );
             assert_ne!(recovery_code_hash("ben", c), Some(h));
         }
         assert_eq!(recovery_code_hash("ana", "abcd-efgh"), None);

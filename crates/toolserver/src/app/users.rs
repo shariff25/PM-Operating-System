@@ -418,7 +418,14 @@ async fn list(
         .get(&who)
         .is_some_and(|u| permits(u, Permission::ManageMembers));
     let now = Utc::now();
-    let passwords = match state.svc.stores().users.passwords().password_statuses(now).await {
+    let passwords = match state
+        .svc
+        .stores()
+        .users
+        .passwords()
+        .password_statuses(now)
+        .await
+    {
         Ok(p) => p,
         Err(e) => return store_down(e),
     };
@@ -430,7 +437,10 @@ async fn list(
         };
         let bots = crate::onboarding::owned_team_bots(&state.svc, &u.handle);
         let mut v = user_json(u, &dir, Some(&accounts), bots, now, admin_view);
-        with_password(&mut v, passwords.get(&u.handle).copied().unwrap_or_default());
+        with_password(
+            &mut v,
+            passwords.get(&u.handle).copied().unwrap_or_default(),
+        );
         users.push(v);
     }
     no_store(

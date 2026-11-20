@@ -39,6 +39,10 @@ pub struct Session {
     /// for development sign-in.
     pub entra_oid: Option<String>,
     pub entra_tid: Option<String>,
+    /// For a password sign-in (`docs/password-sign-in.md`), the password credential's epoch it
+    /// signed in with: checked against the user database on every request, so a reset or a
+    /// password change ends it. `None` for every other sign-in.
+    pub password_epoch: Option<i64>,
 }
 
 impl Session {
@@ -222,6 +226,7 @@ mod tests {
             last_seen: at(0),
             entra_oid: None,
             entra_tid: None,
+            password_epoch: None,
         }
     }
 

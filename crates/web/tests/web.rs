@@ -599,6 +599,8 @@ fn config(bots_url: &str, tools_url: &str, root: &std::path::Path) -> Config {
         session_idle: Duration::hours(8),
         session_max: Duration::hours(24),
         internal_bind: None,
+        password_login: false,
+        trusted_proxies: Vec::new(),
     }
 }
 
@@ -776,6 +778,88 @@ impl Web {
             );
         }
     }
+}
+
+// Password sign-in (docs/password-sign-in.md; the flows run against the real tool server in
+// crates/stack-tests).
+
+#[tokio::test]
+async fn password_sign_in_is_off_unless_turned_on() {
+    let w = web().await;
+    let r = w.get(&Browser::default(), "/api/auth/providers").await;
+    assert_eq!(r.body["providers"], json!(["dev"]));
+    for path in [
+        "/api/auth/password/sign-in",
+        "/api/auth/password/second-step",
+        "/api/auth/password/setup/begin",
+        "/api/auth/password/setup/password",
+        "/api/auth/password/setup/authenticator",
+        "/api/auth/password/setup/confirm",
+    ] {
+        let r = w.post(&Browser::default(), path, json!({})).await;
+        assert_eq!(
+            (r.status, r.code()),
+            (StatusCode::NOT_FOUND, "not_found"),
+            "{path}"
+        );
+    }
+    let ana = w.login("ana").await;
+    for path in [
+        "/api/auth/password/change",
+        "/api/auth/password/recovery-codes",
+    ] {
+        let r = w.post(&ana, path, json!({})).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{path}");
+    }
+    assert_eq!(
+        w.get(&ana, "/api/auth/password/status").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert!(
+        !w.tools
+            .calls()
+            .iter()
+            .any(|c| c.uri.contains("/internal/password")),
+        "nothing reached the tool server's password routes"
+    );
+}
+
+#[tokio::test]
+async fn password_sign_in_is_listed_and_its_writes_need_the_origin_and_json() {
+    let w = web_with(|c| c.password_login = true).await;
+    let r = w.get(&Browser::default(), "/api/auth/providers").await;
+    assert_eq!(r.body["providers"], json!(["password", "dev"]));
+    let elsewhere = Browser {
+        extra: vec![("origin", "https://evil.example".into())],
+        ..Browser::default()
+    };
+    let r = w
+        .post(
+            &elsewhere,
+            "/api/auth/password/sign-in",
+            json!({"sign_in_name": "ana@example.com", "password": "x"}),
+        )
+        .await;
+    assert_eq!((r.status, r.code()), (StatusCode::FORBIDDEN, "bad_origin"));
+    let r = w
+        .send(
+            &Browser {
+                extra: vec![("content-type", "text/plain".into())],
+                ..Browser::default()
+            },
+            Method::POST,
+            "/api/auth/password/sign-in",
+            None,
+        )
+        .await;
+    assert_eq!(r.code(), "bad_content_type");
+    assert!(
+        !w.tools
+            .calls()
+            .iter()
+            .any(|c| c.uri.contains("/internal/password")),
+        "refused before the tool server was asked"
+    );
 }
 
 // Start-up.

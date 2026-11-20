@@ -116,7 +116,16 @@ deploy/pmos-admin users grant-admin ana --oid <object id>     # the only way to 
 deploy/pmos-admin users deactivate ben                        # not capped; revokes admin
 deploy/pmos-admin users reactivate ben                        # never restores admin
 deploy/pmos-admin users export --format team-yaml > team.yaml # before a rollback
+deploy/pmos-admin users password-setup ana                    # a one-time password setup code
 ```
+
+**Password sign-in** (`docs/password-sign-in.md`, when `PMOS_WEB_PASSWORD_LOGIN=1`): an admin
+makes a person's one-time setup code on the Team page; for an **Admin or Auditor** only the
+host can, with `password-setup <handle>`, which prints the code once (24 hours, single use; a
+new one replaces it). Give it to the person yourself, never by a channel others read. The same
+command is the **reset** for someone who forgot their password or lost their phone: using the
+code replaces their password, authenticator and recovery codes and signs them out everywhere.
+Until it is used the old password still works: to shut someone out now, deactivate them.
 
 `grant-admin --keep-entra` reuses an Entra link the host already confirmed. A deactivated
 admin who comes back is reactivated without `admin`; grant it again on purpose.

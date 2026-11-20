@@ -42,7 +42,7 @@ use crate::vault::KeyRing;
 use hash::{HashParams, Weak};
 use limits::{GlobalLimit, HASH_PERMITS, HASH_WAIT_SECS};
 use store::{
-    CodeKind, Credential, NewSetupCode, Pending, PasswordStore, Person, Purpose, Snapshot, Writes,
+    CodeKind, Credential, NewSetupCode, PasswordStore, Pending, Person, Purpose, Snapshot, Writes,
 };
 
 /// How long the pending token after a correct password lives.
@@ -70,7 +70,9 @@ pub enum PwError {
     /// password, a deactivated user, an account waiting out its delay.
     SignInFailed,
     /// A wrong authenticator or recovery code; the pending token has this many tries left.
-    CodeFailed { attempts_left: i32 },
+    CodeFailed {
+        attempts_left: i32,
+    },
     /// No sign-in in progress for that token (unknown, expired, used up): start again.
     SignInExpired,
     /// The setup's first step, for every reason alike: no such user, no code, a wrong,
@@ -87,7 +89,9 @@ pub enum PwError {
     /// The signed-in person has no password to change.
     NoPassword,
     /// Too many attempts: the account's delay, or the tool server's limit.
-    TooMany { retry_after: u64 },
+    TooMany {
+        retry_after: u64,
+    },
     /// Every hashing slot is busy.
     Busy,
     /// Deactivated (after a correct password or setup code).
@@ -554,7 +558,8 @@ impl PasswordService {
 
     fn unseal_totp(&self, handle: &str, sealed: &str) -> PwResult<Zeroizing<Vec<u8>>> {
         let text = Zeroizing::new(self.keys.unseal_bound(sealed, &totp_aad(handle))?);
-        totp::unbase32(&text).ok_or_else(|| PwError::Unavailable("a stored secret is malformed".into()))
+        totp::unbase32(&text)
+            .ok_or_else(|| PwError::Unavailable("a stored secret is malformed".into()))
     }
 
     fn seal_totp(&self, handle: &str, secret: &[u8]) -> PwResult<String> {
@@ -694,12 +699,26 @@ impl PasswordService {
             next.failed.take_back();
             w.credential = Some(next.clone());
             if !person_ok {
-                w.events.push(web_event(ANONYMOUS, "password.sign_in", Outcome::Denied, &h, "deactivated", now));
+                w.events.push(web_event(
+                    ANONYMOUS,
+                    "password.sign_in",
+                    Outcome::Denied,
+                    &h,
+                    "deactivated",
+                    now,
+                ));
                 return (w, Err("deactivated"));
             }
             if cred.epoch != epoch || cred.password_hash.as_deref() != Some(stored.as_str()) {
                 // Reset or changed while the password was being checked.
-                w.events.push(web_event(ANONYMOUS, "password.sign_in", Outcome::Denied, &h, "stale", now));
+                w.events.push(web_event(
+                    ANONYMOUS,
+                    "password.sign_in",
+                    Outcome::Denied,
+                    &h,
+                    "stale",
+                    now,
+                ));
                 return (w, Err("stale"));
             }
             let mut detail = "password".to_string();
@@ -776,7 +795,9 @@ impl PasswordService {
             };
             let Some(p) = live_pending(s, &token_hash, Purpose::SignIn, now).cloned() else {
                 // An expired sign-in token goes; another purpose's token is left alone.
-                if s.pending(&token_hash).is_some_and(|p| p.purpose == Purpose::SignIn) {
+                if s.pending(&token_hash)
+                    .is_some_and(|p| p.purpose == Purpose::SignIn)
+                {
                     w.delete_pending.push(token_hash.clone());
                     w.events.push(ev(Outcome::Denied, "expired"));
                 }
@@ -787,7 +808,10 @@ impl PasswordService {
                 w.events.push(ev(Outcome::Denied, "deactivated"));
                 return (w, Err(PwError::NotAMember));
             }
-            let Some(cred) = s.credential.clone().filter(|c| c.is_set() && c.epoch == p.epoch)
+            let Some(cred) = s
+                .credential
+                .clone()
+                .filter(|c| c.is_set() && c.epoch == p.epoch)
             else {
                 w.delete_pending.push(p.token_hash.clone());
                 w.events.push(ev(Outcome::Denied, "stale"));
@@ -806,7 +830,9 @@ impl PasswordService {
             let unused = s.recovery.iter().filter(|r| r.used_at.is_none());
             let matched: Option<(Option<i64>, Option<String>)> = match step {
                 SecondStep::Code(code) => {
-                    let secret = match self.unseal_totp(&h, cred.totp_sealed.as_deref().unwrap_or_default()) {
+                    let secret = match self
+                        .unseal_totp(&h, cred.totp_sealed.as_deref().unwrap_or_default())
+                    {
                         Ok(s) => s,
                         Err(e) => return (Writes::default(), Err(e)),
                     };
@@ -827,8 +853,13 @@ impl PasswordService {
                     if let Some(step) = step {
                         next.totp_last_step = Some(step);
                         // A secret sealed with an older vault key is sealed again.
-                        if !self.keys.sealed_with_active(next.totp_sealed.as_deref().unwrap_or_default()) {
-                            if let Ok(secret) = self.unseal_totp(&h, next.totp_sealed.as_deref().unwrap_or_default()) {
+                        if !self
+                            .keys
+                            .sealed_with_active(next.totp_sealed.as_deref().unwrap_or_default())
+                        {
+                            if let Ok(secret) = self
+                                .unseal_totp(&h, next.totp_sealed.as_deref().unwrap_or_default())
+                            {
                                 if let Ok(sealed) = self.seal_totp(&h, &secret) {
                                     next.totp_sealed = Some(sealed);
                                 }
@@ -843,7 +874,14 @@ impl PasswordService {
                     w.use_recovery = recovery.clone();
                     w.credential = Some(next);
                     w.delete_pending.push(p.token_hash.clone());
-                    w.events.push(web_event(&h, "password.second_step", Outcome::Ok, &h, &detail, now));
+                    w.events.push(web_event(
+                        &h,
+                        "password.second_step",
+                        Outcome::Ok,
+                        &h,
+                        &detail,
+                        now,
+                    ));
                     (
                         w,
                         Ok(SignedIn {
@@ -869,7 +907,12 @@ impl PasswordService {
                         w.events.push(lockout(&h, &next.failed, false, now));
                     }
                     w.credential = Some(next);
-                    (w, Err(PwError::CodeFailed { attempts_left: left }))
+                    (
+                        w,
+                        Err(PwError::CodeFailed {
+                            attempts_left: left,
+                        }),
+                    )
                 }
             }
         })
@@ -976,7 +1019,8 @@ impl PasswordService {
                 staged_hash: None,
                 staged_totp: None,
             });
-            w.events.push(ev(Outcome::Ok, &format!("begin; {}", c.kind.as_str())));
+            w.events
+                .push(ev(Outcome::Ok, &format!("begin; {}", c.kind.as_str())));
             (w, Ok((c.kind, expires_at)))
         })
         .await?;
@@ -1108,7 +1152,8 @@ impl PasswordService {
                 return (w, Err(PwError::HostOnly));
             }
             if person.sign_in_name.is_none() || !person.sign_in_name_confirmed {
-                w.events.push(ev(ANONYMOUS, Outcome::Denied, "sign_in_unconfirmed"));
+                w.events
+                    .push(ev(ANONYMOUS, Outcome::Denied, "sign_in_unconfirmed"));
                 return (w, Err(PwError::SignInUnconfirmed));
             }
             let mut cred = s.credential.clone().unwrap_or_default();
@@ -1140,7 +1185,12 @@ impl PasswordService {
                     w.events.push(lockout(&h, &cred.setup_failed, true, now));
                 }
                 w.credential = Some(cred);
-                return (w, Err(PwError::CodeFailed { attempts_left: left }));
+                return (
+                    w,
+                    Err(PwError::CodeFailed {
+                        attempts_left: left,
+                    }),
+                );
             };
             let epoch = cred.epoch + 1;
             cred = Credential {
@@ -1216,7 +1266,14 @@ impl PasswordService {
                 return (w, Err(PwError::NoPassword));
             };
             if let Some(until) = cred.failed.locked(now) {
-                w.events.push(web_event(&h, "password.change", Outcome::Denied, &h, "locked", now));
+                w.events.push(web_event(
+                    &h,
+                    "password.change",
+                    Outcome::Denied,
+                    &h,
+                    "locked",
+                    now,
+                ));
                 return (
                     w,
                     Err(PwError::TooMany {
@@ -1239,12 +1296,23 @@ impl PasswordService {
         .await??;
         let (stored, epoch, started_wait) = reserved;
         let right = self.verify(current, stored.clone()).await?;
-        let new_hash = if right { Some(self.hash(new).await?) } else { None };
+        let new_hash = if right {
+            Some(self.hash(new).await?)
+        } else {
+            None
+        };
         let h = handle.to_string();
         tx(store, handle, None, now, move |s| {
             let mut w = Writes::default();
             let deny = |mut w: Writes, detail: &str, failed: &limits::Counter| {
-                w.events.push(web_event(&h, "password.change", Outcome::Denied, &h, detail, now));
+                w.events.push(web_event(
+                    &h,
+                    "password.change",
+                    Outcome::Denied,
+                    &h,
+                    detail,
+                    now,
+                ));
                 if started_wait {
                     w.events.push(lockout(&h, failed, false, now));
                 }
@@ -1260,11 +1328,13 @@ impl PasswordService {
             let Some(new_hash) = new_hash else {
                 return deny(w, "reauth_failed", &cred.failed);
             };
-            let secret = match self.unseal_totp(&h, cred.totp_sealed.as_deref().unwrap_or_default()) {
+            let secret = match self.unseal_totp(&h, cred.totp_sealed.as_deref().unwrap_or_default())
+            {
                 Ok(s) => s,
                 Err(e) => return (Writes::default(), Err(e)),
             };
-            let Some(step) = totp::verify(&secret, code.expose(), now.timestamp(), cred.totp_last_step)
+            let Some(step) =
+                totp::verify(&secret, code.expose(), now.timestamp(), cred.totp_last_step)
             else {
                 return deny(w, "reauth_failed", &cred.failed);
             };
@@ -1277,7 +1347,14 @@ impl PasswordService {
             let epoch = next.epoch;
             w.credential = Some(next);
             w.clear_pending = true;
-            w.events.push(web_event(&h, "password.change", Outcome::Ok, &h, "change", now));
+            w.events.push(web_event(
+                &h,
+                "password.change",
+                Outcome::Ok,
+                &h,
+                "change",
+                now,
+            ));
             (w, Ok(epoch))
         })
         .await?
@@ -1319,7 +1396,8 @@ impl PasswordService {
                     }),
                 );
             }
-            let secret = match self.unseal_totp(&h, cred.totp_sealed.as_deref().unwrap_or_default()) {
+            let secret = match self.unseal_totp(&h, cred.totp_sealed.as_deref().unwrap_or_default())
+            {
                 Ok(s) => s,
                 Err(e) => return (Writes::default(), Err(e)),
             };
@@ -1494,6 +1572,9 @@ mod tests {
         assert_eq!(PwError::SignInFailed.status(), 401);
         assert_eq!(PwError::TooMany { retry_after: 3 }.status(), 429);
         assert_eq!(PwError::Weak(Weak::Common).code(), "weak_password");
-        assert_eq!(format!("{:?}", Secret::new("hunter2hunter2")), "Secret(<redacted>)");
+        assert_eq!(
+            format!("{:?}", Secret::new("hunter2hunter2")),
+            "Secret(<redacted>)"
+        );
     }
 }

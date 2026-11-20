@@ -336,7 +336,10 @@ async fn run_effect(
     Ok(())
 }
 
-pub(super) async fn insert_change(conn: &mut PgConnection, c: &RoleChange) -> Result<(), sqlx::Error> {
+pub(super) async fn insert_change(
+    conn: &mut PgConnection,
+    c: &RoleChange,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO role_changes (at, actor, client, host_user, target, change, role, detail)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -356,7 +359,10 @@ pub(super) async fn insert_change(conn: &mut PgConnection, c: &RoleChange) -> Re
 
 /// An audit event, in the caller's transaction (the purge's `system` rule in `pg.rs` is for
 /// application events through the audit sink; these are the users module's own).
-pub(super) async fn insert_event(conn: &mut PgConnection, e: &AuditEvent) -> Result<(), sqlx::Error> {
+pub(super) async fn insert_event(
+    conn: &mut PgConnection,
+    e: &AuditEvent,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO audit_events
              (at, run_id, user_handle, skill, bot, tool, outcome, sources, args_hash,

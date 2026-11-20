@@ -34,7 +34,9 @@ use pmos_directory::resolve::{
     ResolveError,
 };
 
-use crate::auth::{self, AuthProvider, DevLoginProvider, SignInError, SignInInput};
+use crate::auth::{
+    self, AuthProvider, DevLoginProvider, PasswordProvider, SignInError, SignInInput,
+};
 use crate::config::{Config, NO_PROVIDER};
 use crate::drafts::{self, Draft, Suggestion};
 use crate::entra::{self, Entra, Failure};
@@ -51,6 +53,7 @@ use crate::upstream::{
 mod admin;
 mod brief;
 mod content;
+mod password;
 mod policy;
 mod proposal;
 mod reviews;
@@ -157,6 +160,12 @@ struct Inner {
     /// Sign-in events the tool server didn't record ([`record_sign_in`]), since start-up:
     /// `/readyz` reports it.
     sign_in_record_failures: std::sync::atomic::AtomicU64,
+    /// Password sign-in (`PMOS_WEB_PASSWORD_LOGIN=1`; `password.rs`).
+    password_login: bool,
+    /// `PMOS_WEB_TRUSTED_PROXIES`: whose `X-Forwarded-For` names the client's address.
+    trusted_proxies: Vec<std::net::IpAddr>,
+    /// Password sign-in's per-address limit.
+    sources: password::SourceLimiter,
 }
 
 #[derive(Clone)]
@@ -212,6 +221,9 @@ fn make_providers(config: &Config) -> Result<Providers, String> {
     };
     if let Some(e) = &entra {
         out.push(e.clone());
+    }
+    if config.password_login {
+        out.push(Arc::new(PasswordProvider));
     }
     if config.dev_login {
         out.push(Arc::new(DevLoginProvider));
@@ -289,6 +301,9 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         proposals: proposal::Proposals::new(deps.admin)?,
         audiences: Default::default(),
         sign_in_record_failures: Default::default(),
+        password_login: config.password_login,
+        trusted_proxies: config.trusted_proxies,
+        sources: Default::default(),
     }));
     let api = Router::new()
         .route("/auth/providers", get(auth_providers))
@@ -319,6 +334,7 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         .merge(reviews::routes())
         .merge(policy::routes())
         .merge(content::routes())
+        .merge(password::routes())
         .fallback(|| async { ApiError::not_found() })
         // A known path with another method: JSON too, never an empty body or the app.
         .method_not_allowed_fallback(|| async {
@@ -899,6 +915,13 @@ async fn signed_in(parts: &Parts, state: &AppState, allow_stale: bool) -> Result
             .map_err(ApiError::store)?;
         return Err(no_longer_a_member());
     }
+    if session.password_epoch.is_some() && user.password_epoch != session.password_epoch {
+        // A password session from before a reset or a password change (or one whose
+        // credential is gone): it ends (docs/password-sign-in.md).
+        tracing::info!(user = %session.handle, "the password credential changed: signed out");
+        end_this().await?;
+        return Err(ApiError::signed_out());
+    }
     if entra && user.entra != EntraState::Linked {
         // An Admin or Auditor whose Microsoft account the host hasn't confirmed (spec §7).
         tracing::warn!(user = %session.handle, "Entra link needs the host: signed out");
@@ -1009,7 +1032,7 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
             return Err(users_unavailable());
         }
     };
-    let id = start_session(&state, &headers, &user, provider.name(), None).await?;
+    let id = start_session(&state, &headers, &user, provider.name(), None, None).await?;
     Ok((
         StatusCode::NO_CONTENT,
         [(header::SET_COOKIE, session::set_cookie(&id))],
@@ -1119,13 +1142,15 @@ async fn entra_person(
 
 /// A new session for `user`, whichever provider signed them in: the cookie value. Ends
 /// whatever session this browser had (rotation). `entra` is the token's `(oid, tid)` for an
-/// Entra ID sign-in: the key the session is checked by on every request.
+/// Entra ID sign-in: the key the session is checked by on every request. `password_epoch`
+/// is the password credential's epoch for a password sign-in, checked on every request too.
 async fn start_session(
     state: &AppState,
     headers: &HeaderMap,
     user: &DirectoryUser,
     provider: &str,
     entra: Option<(String, String)>,
+    password_epoch: Option<i64>,
 ) -> Result<String, ApiError> {
     if let Some(old) = session::cookie_value(headers) {
         state
@@ -1151,6 +1176,7 @@ async fn start_session(
                 last_seen: at,
                 entra_oid: entra.as_ref().map(|(oid, _)| oid.clone()),
                 entra_tid: entra.map(|(_, tid)| tid),
+                password_epoch,
             },
         )
         .await
@@ -1449,7 +1475,7 @@ async fn entra_callback(
         }
     };
     let entra_id = (identity.oid.clone(), identity.tid.clone());
-    let id = start_session(&state, &headers, &user, entra.name(), Some(entra_id)).await?;
+    let id = start_session(&state, &headers, &user, entra.name(), Some(entra_id), None).await?;
     Ok(redirect(
         &entra::safe_return(Some(&started.return_to)),
         &[clear, session::set_cookie(&id)],
@@ -1469,6 +1495,8 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult 
         // Never blocks the sign-out: a failure is logged and counted.
         let provider = if session.entra_tid.is_some() {
             "entra"
+        } else if session.password_epoch.is_some() {
+            "password"
         } else {
             "dev"
         };

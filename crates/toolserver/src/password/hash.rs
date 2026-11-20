@@ -250,7 +250,10 @@ mod tests {
         assert_ne!(h, hash(b"correct horse battery", QUICK).unwrap());
         assert!(needs_rehash(&h, CURRENT));
         assert!(!needs_rehash(&h, QUICK));
-        assert!(needs_rehash("$argon2i$v=19$m=65536,t=3,p=1$c2FsdHNhbHQ$aGFzaA", QUICK));
+        assert!(needs_rehash(
+            "$argon2i$v=19$m=65536,t=3,p=1$c2FsdHNhbHQ$aGFzaA",
+            QUICK
+        ));
     }
 
     #[test]

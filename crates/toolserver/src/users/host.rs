@@ -141,7 +141,9 @@ enum Command {
     List,
     /// A one-time password setup (or reset) code for a user, shown once
     /// (docs/password-sign-in.md). The only way to issue one for an Admin or Auditor.
-    PasswordSetup { handle: String },
+    PasswordSetup {
+        handle: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -568,8 +570,7 @@ pub async fn run(args: &[String], io: Io<'_>) -> i32 {
         },
         Action::PasswordSetup(handle) => {
             let actor = Actor::host(host_user.clone());
-            match crate::password::issue_setup_code(store.passwords(), &actor, &handle, now).await
-            {
+            match crate::password::issue_setup_code(store.passwords(), &actor, &handle, now).await {
                 Ok(issued) => {
                     say!(
                         out,

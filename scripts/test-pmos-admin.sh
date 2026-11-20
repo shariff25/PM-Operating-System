@@ -118,6 +118,16 @@ line=$(grep 'up -d bots gateway' "$DOCKER_LOG") || fail "add-bot didn't recreate
 [[ "$line" == mode=require\ file=require\ * ]] || fail "add-bot recreated the runtime without require: $line"
 [[ "$line" == *"workers=worker-scout="* ]] || fail "add-bot recreated the runtime without the new worker token: $line"
 grep -q '^PMOS_ASSERTION_MODE=require$' "$WORK/stack/deploy/.env" || fail "add-bot changed the mode in deploy/.env"
+# Password sign-in alone is a sign-in for the web app (docs/password-sign-in.md); with neither
+# it, Entra nor the development opt-in, `up --web` refuses before anything starts.
+stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1"
+run_stack up --web >/dev/null
+grep -q 'args=compose .*--profile web up -d' "$DOCKER_LOG" || fail "up --web with password sign-in didn't start the web profile: $(cat "$DOCKER_LOG")"
+stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0"
+code=0
+run_stack up --web >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "up --web with no sign-in exits $code, not 2"
+[ ! -s "$DOCKER_LOG" ] || fail "up --web with no sign-in called docker"
 # A blank mode means `require` once a web or console token is set (the services' default).
 stack_env ""
 out=$(run_stack up 2>&1)
@@ -182,6 +192,10 @@ run_stack users list </dev/null >/dev/null
 grep -qF -- "run --rm --no-deps -e PMOS_HOST_USER=$me -T toolserver pmos-toolserver users list" "$DOCKER_LOG" ||
   fail "users list didn't pass PMOS_HOST_USER=$me: $(cat "$DOCKER_LOG")"
 : >"$DOCKER_LOG"
+# A password setup code (docs/password-sign-in.md): the host's own command, with its host user.
+run_stack users password-setup raj </dev/null >/dev/null
+grep -qF -- "-e PMOS_HOST_USER=$me -T toolserver pmos-toolserver users password-setup raj" "$DOCKER_LOG" ||
+  fail "users password-setup didn't run with PMOS_HOST_USER: $(cat "$DOCKER_LOG")"
 SUDO_USER=alice run_stack users deactivate ana </dev/null >/dev/null
 grep -qF -- "-e PMOS_HOST_USER=alice -T toolserver pmos-toolserver users deactivate ana" "$DOCKER_LOG" ||
   fail "users deactivate didn't pass SUDO_USER as PMOS_HOST_USER: $(cat "$DOCKER_LOG")"

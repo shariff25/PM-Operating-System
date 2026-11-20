@@ -128,6 +128,7 @@ fn session(handle: &str, minutes: i64) -> Session {
         last_seen: at(minutes),
         entra_oid: None,
         entra_tid: None,
+        password_epoch: None,
     }
 }
 
@@ -567,6 +568,19 @@ async fn sessions_keep_the_entra_account(s: &Stores) {
         .unwrap()
         .unwrap();
     assert_eq!((back.entra_oid, back.entra_tid), (None, None));
+    assert_eq!(back.password_epoch, None);
+    // A password sign-in keeps the credential's epoch it signed in with.
+    let pw = hash_id(&random_token());
+    let mut with_epoch = session("cy", 0);
+    with_epoch.password_epoch = Some(7);
+    s.sessions.insert(pw, with_epoch).await.unwrap();
+    let back = s
+        .sessions
+        .touch(&pw, at(1), idle, max)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.password_epoch, Some(7));
     s.sessions.ping().await.unwrap();
 }
 

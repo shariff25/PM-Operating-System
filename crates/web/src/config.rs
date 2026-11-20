@@ -1,7 +1,7 @@
 //! Configuration from environment variables, checked at start-up.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use chrono::Duration;
@@ -47,6 +47,16 @@ pub struct Config {
     /// Entra ID sign-in (`PMOS_WEB_ENTRA_*`, with `PMOS_WEB_PUBLIC_URL`): on when fully
     /// configured. The server starts with Entra, development sign-in, or both.
     pub entra: Option<EntraConfig>,
+    /// `PMOS_WEB_PASSWORD_LOGIN=1`: email-and-password sign-in with a required
+    /// authenticator code (`docs/password-sign-in.md`), the tool server deciding. Off by
+    /// default; needs signed user assertions to the tool server (a `web:toolserver` key, and
+    /// `PMOS_ASSERTION_MODE` `require` or unset).
+    pub password_login: bool,
+    /// `PMOS_WEB_TRUSTED_PROXIES`: the addresses of the reverse proxies in front of pmos-web,
+    /// comma-separated. A request from one of them is counted, for password sign-in's
+    /// per-address limit, by the right-most `X-Forwarded-For` address that isn't one of them;
+    /// any other request by its own peer address. Empty: every request by its peer.
+    pub trusted_proxies: Vec<IpAddr>,
     /// `PMOS_WEB_SESSION_IDLE_MINUTES`, default 480 (8 hours).
     pub session_idle: Duration,
     /// `PMOS_WEB_SESSION_MAX_MINUTES`, default 1440 (24 hours), from sign-in.
@@ -70,6 +80,8 @@ impl std::fmt::Debug for Config {
             .field("public_url", &self.public_url)
             .field("dev_login", &self.dev_login)
             .field("entra", &self.entra)
+            .field("password_login", &self.password_login)
+            .field("trusted_proxies", &self.trusted_proxies)
             .field("session_idle", &self.session_idle)
             .field("session_max", &self.session_max)
             .field("internal_bind", &self.internal_bind)
@@ -98,7 +110,14 @@ pub fn check_dev_bind(dev_login: bool, bind: SocketAddr) -> Result<(), String> {
 /// Why the server won't start without a provider.
 pub const NO_PROVIDER: &str = "no sign-in provider: set PMOS_WEB_ENTRA_TENANT_ID, \
      PMOS_WEB_ENTRA_CLIENT_ID, PMOS_WEB_ENTRA_CLIENT_SECRET and PMOS_WEB_PUBLIC_URL for Entra \
-     ID sign-in, or PMOS_WEB_DEV_LOGIN=1 for development sign-in (never expose it)";
+     ID sign-in, PMOS_WEB_PASSWORD_LOGIN=1 for password sign-in, or PMOS_WEB_DEV_LOGIN=1 for \
+     development sign-in (never expose it)";
+
+/// Why password sign-in won't start without signed user assertions.
+pub const PASSWORD_NEEDS_REQUIRE: &str = "PMOS_WEB_PASSWORD_LOGIN=1 needs signed user \
+     assertions to the tool server in `require` mode: a web:toolserver key in \
+     PMOS_ASSERTION_KEYS, and PMOS_ASSERTION_MODE unset or `require` \
+     (docs/password-sign-in.md)";
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
@@ -123,13 +142,34 @@ impl Config {
                 ))
             }
         };
+        let password_login = match get("PMOS_WEB_PASSWORD_LOGIN").as_deref().map(str::trim) {
+            None | Some("") | Some("0") => false,
+            Some("1") => true,
+            Some(other) => {
+                return Err(format!(
+                    "PMOS_WEB_PASSWORD_LOGIN must be `1` or `0`, not `{other}`"
+                ))
+            }
+        };
         let public_url = set("PMOS_WEB_PUBLIC_URL")
             .map(|u| origin("PMOS_WEB_PUBLIC_URL", u))
             .transpose()?;
         let entra = EntraConfig::from_lookup(set, public_url.as_deref())?;
-        if !dev_login && entra.is_none() {
+        if !dev_login && entra.is_none() && !password_login {
             return Err(NO_PROVIDER.into());
         }
+        let trusted_proxies = match set("PMOS_WEB_TRUSTED_PROXIES") {
+            None => Vec::new(),
+            Some(list) => list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.parse::<IpAddr>()
+                        .map_err(|_| format!("PMOS_WEB_TRUSTED_PROXIES: `{s}` isn't an IP address"))
+                })
+                .collect::<Result<_, _>>()?,
+        };
         let dev_with_entra = match get("PMOS_WEB_DEV_LOGIN_WITH_ENTRA")
             .as_deref()
             .map(str::trim)
@@ -168,6 +208,15 @@ impl Config {
         };
         let bots_token = credentials(bots_token, "bots");
         let toolserver_token = credentials(toolserver_token, "toolserver");
+        if password_login {
+            let mode_ok = matches!(
+                set("PMOS_ASSERTION_MODE").as_deref().map(str::trim),
+                None | Some("require")
+            );
+            if !toolserver_token.signs() || !mode_ok {
+                return Err(PASSWORD_NEEDS_REQUIRE.into());
+            }
+        }
         let minutes = |k: &str, default: i64| -> Result<Duration, String> {
             match set(k) {
                 None => Ok(Duration::minutes(default)),
@@ -215,6 +264,8 @@ impl Config {
             public_url,
             dev_login,
             entra,
+            password_login,
+            trusted_proxies,
             session_idle,
             session_max,
         })
@@ -476,6 +527,57 @@ mod tests {
         ))
         .unwrap_err()
         .contains("differ"));
+    }
+
+    #[test]
+    fn password_sign_in_needs_signed_assertions_in_require() {
+        let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let keys = format!("web:toolserver:k1:{key}");
+        let mut alone = base();
+        alone.retain(|(k, _)| *k != "PMOS_WEB_DEV_LOGIN");
+        alone.push(("PMOS_WEB_PASSWORD_LOGIN", "1"));
+        // Without a key for the tool server: refused.
+        let err = Config::from_lookup(lookup(&alone)).unwrap_err();
+        assert!(err.contains("PMOS_WEB_PASSWORD_LOGIN"), "{err}");
+        // With one: password sign-in alone is a provider.
+        let with_key = [alone.clone(), vec![("PMOS_ASSERTION_KEYS", keys.as_str())]].concat();
+        let cfg = Config::from_lookup(lookup(&with_key)).unwrap();
+        assert!(cfg.password_login && !cfg.dev_login && cfg.entra.is_none());
+        // A mode other than require refuses; require is fine.
+        for mode in ["off", "verify"] {
+            let pairs = [with_key.clone(), vec![("PMOS_ASSERTION_MODE", mode)]].concat();
+            assert!(Config::from_lookup(lookup(&pairs))
+                .unwrap_err()
+                .contains("require"));
+        }
+        let pairs = [with_key.clone(), vec![("PMOS_ASSERTION_MODE", "require")]].concat();
+        assert!(Config::from_lookup(lookup(&pairs)).is_ok());
+        // Beside development sign-in, too; and off by default.
+        let both = [
+            base(),
+            vec![
+                ("PMOS_WEB_PASSWORD_LOGIN", "1"),
+                ("PMOS_ASSERTION_KEYS", keys.as_str()),
+            ],
+        ]
+        .concat();
+        assert!(Config::from_lookup(lookup(&both)).unwrap().password_login);
+        assert!(!Config::from_lookup(lookup(&base())).unwrap().password_login);
+        let bad = [base(), vec![("PMOS_WEB_PASSWORD_LOGIN", "yes")]].concat();
+        assert!(Config::from_lookup(lookup(&bad))
+            .unwrap_err()
+            .contains("`1` or `0`"));
+        // Trusted proxies are addresses.
+        let proxies = [base(), vec![("PMOS_WEB_TRUSTED_PROXIES", "10.0.0.1, ::1")]].concat();
+        assert_eq!(
+            Config::from_lookup(lookup(&proxies))
+                .unwrap()
+                .trusted_proxies
+                .len(),
+            2
+        );
+        let proxies = [base(), vec![("PMOS_WEB_TRUSTED_PROXIES", "proxy.local")]].concat();
+        assert!(Config::from_lookup(lookup(&proxies)).is_err());
     }
 
     #[test]

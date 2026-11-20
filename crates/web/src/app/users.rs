@@ -72,7 +72,7 @@ pub const USER_CODES: [(&str, u16, &str); 21] = [
 ];
 
 /// Every field of a user the contract has, but the addresses.
-pub const USER_FIELDS: [&str; 24] = [
+pub const USER_FIELDS: [&str; 27] = [
     "handle",
     "display_name",
     "status",
@@ -97,6 +97,10 @@ pub const USER_FIELDS: [&str; 24] = [
     "team_bots",
     "reviews",
     "reviewed_by",
+    // Password sign-in (docs/password-sign-in.md): booleans only, never anything secret.
+    "password_set",
+    "second_step_enrolled",
+    "setup_code_pending",
 ];
 
 /// The addresses: only for a viewer with `manage-members`, and only when the tool server sent
