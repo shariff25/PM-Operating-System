@@ -11,7 +11,7 @@ import { Icon, Mark } from './icons';
 import type { IconName } from './icons';
 import { UserMenu } from './UserMenu';
 
-type NavKey = 'home' | 'drafts' | 'reviews' | 'followups' | 'activity' | 'admin';
+type NavKey = 'home' | 'drafts' | 'reviews' | 'followups' | 'activity' | 'admin' | 'security';
 
 interface Slots {
   /** Where a page puts its title in the phone top bar. Null on desktop, where pages carry their own header. */
@@ -58,6 +58,8 @@ export function navKey(route: Route): NavKey {
       return 'activity';
     case 'admin':
       return 'admin';
+    case 'security':
+      return 'security';
     default:
       return 'home';
   }
@@ -142,7 +144,7 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
 
   const detail = route.name === 'draft' || route.name === 'task' || route.name === 'review';
   const shortcut = isMac() ? copy.nav.shortcutMac : copy.nav.shortcutOther;
-  const pageTitle = { home: copy.nav.home, drafts: copy.nav.drafts, reviews: copy.nav.reviews, followups: copy.nav.followups, activity: copy.nav.activity, admin: copy.nav.admin }[current];
+  const pageTitle = { home: copy.nav.home, drafts: copy.nav.drafts, reviews: copy.nav.reviews, followups: copy.nav.followups, activity: copy.nav.activity, admin: copy.nav.admin, security: copy.password.security.title }[current];
 
   /** The second level under Admin: its parts, for the ones this person may open. */
   const adminSub = () => {

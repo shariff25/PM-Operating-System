@@ -87,6 +87,135 @@ for (const theme of ['light', 'dark'] as const) {
       await expect(page.getByRole('link', { name: 'Sign in with Microsoft' })).toBeVisible();
     });
 
+    test('password sign-in: each step and refusal, at desktop and phone widths', async ({ page }) => {
+      await page.addInitScript((t) => {
+        try {
+          window.localStorage.setItem('pmos-theme', t);
+        } catch {
+          /* the page still loads */
+        }
+      }, theme);
+      const fill = async () => {
+        await page.getByLabel('Sign-in name').fill('ana@contoso.example');
+        await page.getByLabel('Password', { exact: true }).fill('paper-lantern-harbour');
+        await page.getByRole('button', { name: 'Continue' }).click();
+      };
+      for (const width of [1280, 390]) {
+        await page.setViewportSize({ width, height: 900 });
+        for (const providers of ['password', 'entra,password', 'entra,password,dev']) {
+          await page.goto(`/?mock_providers=${providers}`);
+          await expect(page.getByLabel('Sign-in name')).toBeVisible();
+          await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+          await scan(page, `sign-in, ${providers}, ${width}`);
+        }
+        await page.getByLabel('Sign-in name').fill('ana@contoso.example');
+        await page.getByLabel('Password', { exact: true }).fill('wrong-wrong-wrong');
+        await page.getByRole('button', { name: 'Continue' }).click();
+        await expect(page.getByRole('alert')).toBeVisible();
+        await scan(page, `sign-in refused, ${width}`);
+        await page.getByLabel('Password', { exact: true }).fill('paper-lantern-harbour');
+        await page.getByRole('button', { name: 'Continue' }).click();
+        await page.getByLabel('Authenticator code').fill('111111');
+        await page.getByRole('button', { name: 'Sign in' }).click();
+        await expect(page.getByRole('alert')).toContainText('2 tries left');
+        await scan(page, `code step, refused, ${width}`);
+        await page.getByRole('button', { name: 'Use a recovery code instead' }).click();
+        await page.getByLabel('Recovery code').fill('kite-moss-reed-lamp');
+        await scan(page, `recovery code step, ${width}`);
+        await page.getByRole('button', { name: 'Sign in' }).click();
+        await expect(page.getByText(/You used a recovery code/)).toBeVisible();
+        await scan(page, `signed in with a recovery code, ${width}`);
+        await page.goto('/?mock_providers=password&mock_password=too_many_attempts&mock_retry_after=90');
+        await fill();
+        await expect(page.getByTestId('wait-note')).toBeVisible();
+        await scan(page, `lockout, ${width}`);
+      }
+    });
+
+    test('password setup: each step and the recovery codes, at desktop and phone widths', async ({ page }) => {
+      await page.addInitScript((t) => {
+        try {
+          window.localStorage.setItem('pmos-theme', t);
+        } catch {
+          /* the page still loads */
+        }
+      }, theme);
+      for (const width of [1280, 390]) {
+        await page.setViewportSize({ width, height: 900 });
+        // A fresh page each time: the setup lives in the page's memory only.
+        await page.goto('about:blank');
+        await page.goto('/?mock_providers=password#/setup');
+        await expect(page.getByLabel('Setup code')).toBeVisible();
+        await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+        await scan(page, `setup 1, ${width}`);
+        await page.getByLabel('Sign-in name').fill('dana@contoso.example');
+        await page.getByLabel('Setup code').fill('RESET-DANA1-23456-78900');
+        await page.getByRole('button', { name: 'Continue' }).click();
+        await page.getByLabel('New password').fill('password1234');
+        await page.getByRole('button', { name: 'Continue' }).click();
+        await expect(page.getByRole('alert')).toBeVisible();
+        await scan(page, `setup 2, refused, reset, ${width}`);
+        await page.getByLabel('New password').fill('a calm river at dawn');
+        await page.getByRole('button', { name: 'Continue' }).click();
+        await expect(page.getByRole('img', { name: /QR code/ })).toBeVisible();
+        await scan(page, `setup 3, ${width}`);
+        await page.getByRole('button', { name: 'Make a new QR code' }).click();
+        await expect(page.getByText(/This is a new QR code/)).toBeVisible();
+        await scan(page, `setup 3, new code, ${width}`);
+        await page.getByRole('button', { name: "I've added it" }).click();
+        await page.getByLabel('Authenticator code').fill('000000');
+        await page.getByRole('button', { name: 'Confirm and finish' }).click();
+        await expect(page.getByRole('alert')).toBeVisible();
+        await scan(page, `setup 4, refused, ${width}`);
+        await page.getByLabel('Authenticator code').fill('246810');
+        await page.getByRole('button', { name: 'Confirm and finish' }).click();
+        await expect(page.getByRole('list', { name: 'Recovery codes' })).toBeVisible();
+        await scan(page, `setup recovery codes, ${width}`);
+      }
+    });
+
+    test('sign-in and security, and the Team page setup-code dialogs', async ({ page }) => {
+      await signIn(page, theme, undefined, 'ana', '?mock_providers=password,dev');
+      await go(page, '/security');
+      await expect(page.getByRole('heading', { level: 1, name: 'Sign-in and security' })).toBeVisible();
+      await expect(page.getByRole('heading', { name: 'Change your password' })).toBeVisible();
+      await scan(page, 'security');
+      const form = page.getByRole('region', { name: 'Change your password' });
+      await form.getByLabel('Current password').fill('nope-nope-nope');
+      await form.getByLabel('Authenticator code').fill('246810');
+      await form.getByLabel('New password').fill('a calm river at dawn');
+      await form.getByRole('button', { name: 'Change password' }).click();
+      await expect(form.getByRole('alert')).toBeVisible();
+      await scan(page, 'security, change refused');
+      const codes = page.getByRole('region', { name: 'Recovery codes' });
+      await codes.getByLabel('Authenticator code').fill('246810');
+      await codes.getByRole('button', { name: 'Make new codes' }).click();
+      await expect(codes.getByRole('heading', { name: 'Your new recovery codes' })).toBeVisible();
+      await scan(page, 'security, new recovery codes');
+      await page.getByRole('button', { name: 'Menu for Ana Silva' }).click();
+      await expect(page.getByRole('menuitem', { name: 'Sign-in and security' })).toBeVisible();
+      await scan(page, 'user menu with security');
+      await page.keyboard.press('Escape');
+
+      await page.goto('/?mock_providers=entra,password,dev');
+      await page.getByLabel('Your handle').fill('ada');
+      await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+      await expect(page.getByLabel('What do you need?')).toBeVisible();
+      await go(page, '/admin/team');
+      await expect(page.getByRole('table', { name: 'Team members' })).toBeVisible();
+      await scan(page, 'team with password state');
+      for (const [who, item] of [['Ana Silva', 'Create a reset code'], ['Raj Mehta', 'Create a setup code'], ['Ravi Kumar', 'Create a setup code']]) {
+        await page.getByRole('button', { name: `Actions for ${who}` }).click();
+        await page.getByRole('menuitem', { name: item }).click();
+        await expect(page.getByRole('dialog')).toBeVisible();
+        await scan(page, `${item} for ${who}`);
+        if (who !== 'Ravi Kumar') await page.keyboard.press('Escape');
+      }
+      await page.getByRole('dialog').getByRole('button', { name: 'Create code' }).click();
+      await expect(page.getByRole('dialog', { name: 'Setup code for Ravi Kumar' })).toBeVisible();
+      await scan(page, 'setup code made');
+    });
+
     test('home, drafts, follow-ups and activity', async ({ page }) => {
       await signIn(page, theme);
       await expect(page.getByRole('heading', { level: 1 })).toBeVisible();

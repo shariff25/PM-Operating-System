@@ -5,6 +5,7 @@ import { messageOf } from '../app-context';
 import { ErrorNote } from '../components/bits';
 import { Icon, Mark } from '../components/icons';
 import { Nudge } from '../components/Nudge';
+import { PasswordLogin } from './PasswordLogin';
 import { copy } from '../copy';
 import { loginHref } from '../url';
 
@@ -105,29 +106,47 @@ export function SignInBrand() {
   );
 }
 
-/** `path` is the page the PM was trying to reach, so Microsoft can send them back to it. */
+/** A quiet "or" between two ways to sign in. */
+function Or() {
+  return (
+    <div className="signin-or" role="separator">
+      <span>{copy.signIn.or}</span>
+    </div>
+  );
+}
+
+/**
+ * `path` is the page the PM was trying to reach, so Microsoft can send them back to it. The ways
+ * to sign in come in the server's order: Microsoft, then a password, then development sign-in.
+ */
 export function SignIn(props: ProviderProps & { path?: string }) {
   const providers = useProviders(props.api);
+  const [secondStep, setSecondStep] = useState(false);
   const entra = providers.state === 'ready' && providers.list.includes('entra');
+  const password = providers.state === 'ready' && providers.list.includes('password');
   const dev = providers.state === 'ready' && providers.list.includes('dev');
   return (
     <div className="signin-wrap">
       <SignInBrand />
-      <main className="signin">
-        <div className="signin-head">
-          <Nudge pose="hello" size={44} className="signin-nudge" />
-          <h1>{copy.signIn.title}</h1>
-          <p className="muted">{copy.signIn.lede}</p>
-        </div>
+      <main className={`signin ${secondStep ? 'signin-step' : ''}`}>
+        {!secondStep && (
+          <div className="signin-head">
+            <Nudge pose="hello" size={44} className="signin-nudge" />
+            <h1>{copy.signIn.title}</h1>
+            <p className="muted">{copy.signIn.lede}</p>
+          </div>
+        )}
         {providers.state === 'loading' && <p className="muted" role="status">{copy.signIn.loading}</p>}
-        {providers.state === 'ready' && !entra && !dev && (
+        {providers.state === 'ready' && !entra && !dev && !password && (
           <p className="signin-none">
             <Icon name="alert" size={16} />
             <span>{copy.signIn.notSetUp}</span>
           </p>
         )}
-        {entra && <MicrosoftLogin path={props.path ?? '/'} />}
-        {dev && <DevLogin api={props.api} onSignedIn={props.onSignedIn} secondary={entra} />}
+        {entra && !secondStep && <MicrosoftLogin path={props.path ?? '/'} />}
+        {entra && password && !secondStep && <Or />}
+        {password && <PasswordLogin api={props.api} onSignedIn={props.onSignedIn} primary={!entra} onSecondStep={setSecondStep} />}
+        {dev && !secondStep && <DevLogin api={props.api} onSignedIn={props.onSignedIn} secondary={entra || password} />}
       </main>
     </div>
   );
