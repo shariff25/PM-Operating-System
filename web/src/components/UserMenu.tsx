@@ -12,7 +12,6 @@ const THEMES: { value: Theme; icon: IconName; label: string }[] = [
   { value: 'light', icon: 'sun', label: copy.theme.light },
   { value: 'dark', icon: 'moon', label: copy.theme.dark },
 ];
-const COUNT = THEMES.length + 4;
 
 /**
  * The user's menu: theme, nudges, Show Nudge, hints and sign out. A menu button: Enter, Space or the arrow
@@ -36,6 +35,20 @@ export function UserMenu({
   const box = useRef<HTMLDivElement>(null);
   const button = useRef<HTMLButtonElement>(null);
   const items = useRef<(HTMLButtonElement | null)[]>([]);
+  // "Sign-in and security" is there only for someone who signs in with a password here.
+  const [security, setSecurity] = useState(false);
+  const COUNT = THEMES.length + 4 + (security ? 1 : 0);
+
+  useEffect(() => {
+    let live = true;
+    api.passwordStatus().then(
+      (s) => live && setSecurity(s.enabled && s.password_set),
+      () => live && setSecurity(false),
+    );
+    return () => {
+      live = false;
+    };
+  }, [api]);
 
   useEffect(() => {
     if (open) items.current[focusIdx]?.focus();
@@ -207,9 +220,25 @@ export function UserMenu({
             <Icon name="lightbulb" size={16} />
             <span className="menu-item-label">{copy.menu.showHints}</span>
           </button>
+          {security && (
+            <button
+              ref={ref(THEMES.length + 3)}
+              type="button"
+              role="menuitem"
+              tabIndex={-1}
+              className="menu-item"
+              onClick={() => {
+                close(true);
+                window.location.hash = '/security';
+              }}
+            >
+              <Icon name="lock" size={16} />
+              <span className="menu-item-label">{copy.menu.security}</span>
+            </button>
+          )}
           <div className="menu-sep" role="separator" />
           <button
-            ref={ref(THEMES.length + 3)}
+            ref={ref(COUNT - 1)}
             type="button"
             role="menuitem"
             tabIndex={-1}

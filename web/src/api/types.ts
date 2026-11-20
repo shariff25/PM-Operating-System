@@ -588,7 +588,7 @@ export class ApiError extends Error {
 /** A way to sign in that the server has turned on. `password` is email-and-password sign-in with an authenticator code (docs/web-api.md, "Password sign-in"). */
 export type AuthProvider = 'entra' | 'password' | 'dev';
 
-// ---- Password sign-in (docs/web-api.md, "Password sign-in"). The screens aren't built yet. ----
+// ---- Password sign-in (docs/web-api.md, "Password sign-in") ----
 
 /** Why a new password was refused (`422 weak_password`'s `reason`). */
 export type WeakPasswordReason = 'too_short' | 'too_long' | 'matches_name' | 'common';
@@ -624,10 +624,25 @@ export interface PasswordEnrolment {
   period: 30;
 }
 
-/** `POST /api/auth/password/setup/confirm` and `POST /api/auth/password/recovery-codes`: shown once. */
+/** `POST /api/auth/password/recovery-codes`: the ten new codes, shown once. */
 export interface PasswordRecoveryCodes {
-  kind?: 'setup' | 'reset';
   recovery_codes: string[];
+}
+
+/** `POST /api/auth/password/setup/confirm` (`SetupDone`): signed in, and the ten recovery codes, shown once. */
+export interface PasswordSetupDone {
+  kind: 'setup' | 'reset';
+  recovery_codes: string[];
+}
+
+/** The second step's body: exactly one of the authenticator code or a recovery code. */
+export type PasswordSecondStep = { code: string } | { recovery_code: string };
+
+/** `POST /api/auth/password/change`. */
+export interface PasswordChange {
+  current_password: string;
+  code: string;
+  new_password: string;
 }
 
 /** `GET /api/auth/password/status`. */
@@ -651,6 +666,17 @@ export interface Api {
   providers(): Promise<AuthProvider[]>;
   devLogin(handle: string): Promise<void>;
   logout(): Promise<void>;
+
+  /** Password sign-in (docs/web-api.md, "Password sign-in"). Nothing here is ever logged or kept. */
+  passwordSignIn(signInName: string, password: string): Promise<PasswordSignInStarted>;
+  passwordSecondStep(input: PasswordSecondStep): Promise<PasswordSignedIn>;
+  passwordSetupBegin(signInName: string, setupCode: string): Promise<PasswordSetupStarted>;
+  passwordSetupPassword(password: string): Promise<void>;
+  passwordSetupAuthenticator(): Promise<PasswordEnrolment>;
+  passwordSetupConfirm(code: string): Promise<PasswordSetupDone>;
+  passwordChange(input: PasswordChange): Promise<void>;
+  passwordRecoveryCodes(code: string): Promise<PasswordRecoveryCodes>;
+  passwordStatus(): Promise<PasswordStatus>;
   me(): Promise<Me>;
   setNudges(nudges: boolean): Promise<Me>;
   setMascot(mascot: boolean): Promise<Me>;
@@ -696,6 +722,8 @@ export interface Api {
   adminReactivate(handle: string, expectedVersion?: number): Promise<Written>;
   adminUnlink(handle: string, kind: IdentityKind): Promise<Written>;
   adminAssignReviewer(reviewer: string, pms: string[], expectedVersion?: number): Promise<Written>;
+  /** `201 SetupCode`, shown once to the admin. */
+  adminPasswordSetupCode(handle: string): Promise<PasswordSetupCode>;
 
   adminPolicy(): Promise<PolicyView>;
   adminPolicyValidate(spec: SpecPatch): Promise<Validation>;

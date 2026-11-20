@@ -1,6 +1,8 @@
 import { stripMarkers } from '../citations';
 import { MOCK_PERMISSIONS, MOCK_PROFILES, createMockAdmin, roleOfHandle } from './mockAdmin';
 import type { MockAdminOptions, MockRole } from './mockAdmin';
+import { createMockPassword } from './mockPassword';
+import type { MockPasswordOptions } from './mockPassword';
 import { createMockPolicy } from './mockPolicy';
 import type { MockPolicyOptions } from './mockPolicy';
 import { createMockReviews } from './mockReviews';
@@ -21,7 +23,7 @@ import type {
   TaskEvent,
 } from './types';
 
-export interface MockOptions extends MockAdminOptions, MockPolicyOptions, Omit<MockReviewsOptions, 'hostile'> {
+export interface MockOptions extends MockAdminOptions, MockPolicyOptions, MockPasswordOptions, Omit<MockReviewsOptions, 'hostile'> {
   /** Who is signed in: a PM (default), an admin, an auditor or a reviewer. Signing in by handle (ada, audrey, ben) also picks it. */
   role?: MockRole;
   /** Pretend network delay in ms. Tests use 0. */
@@ -613,6 +615,32 @@ export function createMockClient(options: MockOptions = {}): Api {
     }
   };
 
+  const password = createMockPassword(options);
+  /** Every password route is 404 while password sign-in is off (it is on when `providers` lists it). */
+  const passwordOn = () => {
+    if (!(options.providers ?? ['dev']).includes('password')) throw new ApiError(404, 'not_found', 'Password sign-in is off.');
+  };
+  /** Start a session as this handle. A handle that names a role signs in as that role; any other keeps the role the client started with. */
+  const signInAs = (handle: string) => {
+    signedIn = true;
+    me.handle = handle.trim().toLowerCase();
+    const named = roleOfHandle(me.handle);
+    if (named) {
+      role = named;
+      me.name = MOCK_PROFILES[named].name;
+      me.display_name = MOCK_PROFILES[named].name;
+      me.roles = [...MOCK_PROFILES[named].roles];
+      me.permissions = [...MOCK_PERMISSIONS[named]];
+      me.reviewer = me.roles.includes('reviewer');
+    } else if (me.handle === 'ravi' || me.handle === 'dana') {
+      // Password sign-in's sample people are plain PMs.
+      const name = me.handle === 'ravi' ? 'Ravi Kumar' : 'Dana';
+      me.name = name;
+      me.display_name = me.handle === 'dana' ? '' : name;
+    }
+    restore();
+  };
+
   return {
     async providers() {
       await wait();
@@ -625,19 +653,69 @@ export function createMockClient(options: MockOptions = {}): Api {
       if (handle.trim().toLowerCase() === 'nobody') {
         throw new ApiError(403, 'not_a_member', 'That handle is not on the team list, so I can not sign you in.');
       }
-      signedIn = true;
-      me.handle = handle.trim().toLowerCase();
-      // A handle that names a role signs in as that role; any other keeps the role the client started with.
-      const named = roleOfHandle(me.handle);
-      if (named) {
-        role = named;
-        me.name = MOCK_PROFILES[named].name;
-        me.display_name = MOCK_PROFILES[named].name;
-        me.roles = [...MOCK_PROFILES[named].roles];
-        me.permissions = [...MOCK_PERMISSIONS[named]];
-        me.reviewer = me.roles.includes('reviewer');
-      }
-      restore();
+      signInAs(handle);
+    },
+
+    async passwordSignIn(signInName, pw) {
+      await wait();
+      write();
+      passwordOn();
+      return password.signIn(signInName, pw);
+    },
+    async passwordSecondStep(input) {
+      await wait();
+      write();
+      passwordOn();
+      const { handle, result } = password.secondStep(clone(input));
+      signInAs(handle);
+      return result;
+    },
+    async passwordSetupBegin(signInName, setupCode) {
+      await wait();
+      write();
+      passwordOn();
+      return password.setupBegin(signInName, setupCode);
+    },
+    async passwordSetupPassword(pw) {
+      await wait();
+      write();
+      passwordOn();
+      password.setupPassword(pw);
+    },
+    async passwordSetupAuthenticator() {
+      await wait();
+      write();
+      passwordOn();
+      return password.setupAuthenticator();
+    },
+    async passwordSetupConfirm(code) {
+      await wait();
+      write();
+      passwordOn();
+      const { handle, done } = password.setupConfirm(code);
+      admin.users.passwordSet(handle);
+      signInAs(handle);
+      return done;
+    },
+    async passwordChange(input) {
+      await wait();
+      write();
+      passwordOn();
+      guard();
+      password.change(me.handle, clone(input));
+    },
+    async passwordRecoveryCodes(code) {
+      await wait();
+      write();
+      passwordOn();
+      guard();
+      return { recovery_codes: password.recoveryCodes(me.handle, code) };
+    },
+    async passwordStatus() {
+      await wait();
+      passwordOn();
+      guard();
+      return password.status(me.handle);
     },
     async logout() {
       await wait();
@@ -1024,6 +1102,15 @@ export function createMockClient(options: MockOptions = {}): Api {
       write();
       need('manage-members');
       return admin.users.assignReviewer(me.handle, reviewer, [...pms], expectedVersion);
+    },
+    async adminPasswordSetupCode(handle) {
+      await wait();
+      write();
+      passwordOn();
+      need('manage-members');
+      const { code, signInName } = admin.users.passwordSetupCode(me.handle, handle);
+      password.issueCode(handle, signInName, code.setup_code);
+      return clone(code);
     },
 
     async adminPolicy() {

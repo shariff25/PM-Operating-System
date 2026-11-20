@@ -291,7 +291,7 @@ input:focus-visible, textarea:focus-visible { outline-offset: 0; }
 }
 .icon-btn:hover { background: var(--surface-3); color: var(--ink); }
 
-input[type='text'], input[type='email'], input:not([type]), textarea {
+input[type='text'], input[type='email'], input[type='password'], input:not([type]), textarea {
   width: 100%; min-height: 40px; padding: 9px 12px; border-radius: var(--r-control);
   border: 1px solid var(--border-strong); background: var(--surface); color: var(--ink); font: 14px/1.5 var(--font);
   transition: border-color var(--t) var(--ease), box-shadow var(--t) var(--ease);
@@ -2245,4 +2245,141 @@ input[aria-invalid='true'], textarea[aria-invalid='true'] { border-color: var(--
   0% { transform: translateY(6px) scale(0.92); opacity: 0; }
   55% { transform: translateY(-4px) scale(1.02); opacity: 1; }
   100% { transform: none; opacity: 1; }
+}
+
+/* ---------- Password sign-in, setup and the security page ----------
+   Calm and plain: the sign-in card's own fields and notes, nothing new to learn. */
+.signin-or { display: flex; align-items: center; gap: 12px; color: var(--muted); font: 500 11px/1 var(--mono); letter-spacing: 0.05em; text-transform: uppercase; }
+.signin-or::before, .signin-or::after { content: ''; flex: 1; height: 1px; background: var(--border-2); }
+.pw-form { display: flex; flex-direction: column; gap: 14px; }
+.pw-form .btn { margin-top: 2px; min-height: 44px; }
+.pw-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.pw-field .field-label { margin-bottom: 0; font-size: 13.5px; }
+.pw-field .field-hint { font-size: 12.5px; }
+.pw-input { position: relative; display: flex; }
+.pw-input input { padding-right: 68px; }
+.pw-toggle {
+  position: absolute; right: 4px; top: 50%; transform: translateY(-50%); min-height: 32px; min-width: 56px; padding: 0 10px;
+  border: 0; border-radius: 7px; background: transparent; color: var(--muted); font: 500 12.5px/1 var(--font); cursor: pointer;
+}
+.pw-toggle:hover { background: var(--surface-3); color: var(--ink); }
+
+input.pw-code {
+  font: 500 20px/1.2 var(--mono); letter-spacing: 0.32em; font-variant-numeric: tabular-nums; min-height: 48px; padding: 10px 14px;
+}
+.pw-form input.pw-hidden-user { width: 1px; height: 1px; min-height: 0; padding: 0; border: 0; }
+.pw-note { outline: none; }
+.pw-note:focus-visible { box-shadow: 0 0 0 2px var(--focus); }
+.pw-wait-clock { font: 500 13px/1.3 var(--mono); font-variant-numeric: tabular-nums; }
+.pw-wait-over { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--good-ink); }
+.pw-setup-link, .pw-link {
+  display: inline-flex; align-items: center; gap: 6px; align-self: flex-start; min-height: 32px; padding: 0; border: 0; background: none;
+  color: var(--accent-text); font: 500 13px/1.3 var(--font); text-decoration: none; cursor: pointer;
+}
+.pw-setup-link:hover, .pw-link:hover { color: var(--ink); text-decoration: underline; }
+.pw-link:disabled { color: var(--muted); cursor: default; text-decoration: none; }
+.pw-setup-link .icon { color: var(--muted); }
+.pw-links { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 16px; }
+.pw-step { display: flex; flex-direction: column; gap: 14px; }
+.pw-step .signin-head { gap: 8px; margin-bottom: 2px; }
+.pw-step-icon {
+  display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 10px;
+  background: var(--surface-2); border: 1px solid var(--border-2); color: var(--ink-2); margin-bottom: 4px;
+}
+.pw-step h1:focus, .setup h1:focus { outline: none; }
+.pw-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.pw-actions .btn { flex: 1 1 auto; min-height: 44px; }
+.pw-aside { font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+
+.pw-rules { border: 1px solid var(--border-2); border-radius: 10px; background: var(--surface-2); padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+.pw-rules-title { font: 500 11px/1.4 var(--mono); letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+.pw-rules ul { list-style: none; display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--ink-2); }
+.pw-rules li { display: flex; gap: 8px; align-items: flex-start; }
+.pw-rules li .icon { color: var(--accent); margin-top: 3px; }
+.pw-rules-tip { font-size: 12.5px; color: var(--muted); }
+
+/* Setup: progress, the QR code and its key, the recovery codes */
+.signin.setup { max-width: 460px; gap: 18px; }
+.setup-progress { display: flex; flex-direction: column; gap: 8px; }
+.setup-steps { list-style: none; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.setup-step { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.setup-bar { height: 4px; border-radius: 2px; background: var(--border-2); }
+.setup-step-done .setup-bar { background: var(--accent-line); }
+.setup-step-now .setup-bar { background: var(--accent); }
+.setup-step-label { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.setup-step-now .setup-step-label { color: var(--ink); font-weight: 500; }
+.setup-meta { display: flex; flex-direction: column; gap: 10px; }
+.setup-meta .meta-line { padding: 9px 12px; }
+.setup-meta .meta-line .icon { color: var(--muted); }
+.setup-as { color: var(--ink); font-weight: 500; }
+.setup-qr { align-self: center; padding: 10px; border: 1px solid var(--border-2); border-radius: 12px; background: #ffffff; line-height: 0; }
+.qr { display: block; width: 184px; height: 184px; }
+.setup-auth .note-info { flex-direction: row; align-items: flex-start; }
+.setup-cant { font-size: 13px; font-weight: 500; color: var(--ink); }
+.setup-key { display: flex; flex-direction: column; gap: 6px; margin-top: -6px; }
+.setup-key .field-label { margin-bottom: 0; }
+.setup-key-row { display: flex; align-items: center; gap: 8px; }
+.setup-key-text {
+  flex: 1; min-width: 0; padding: 9px 12px; border: 1px solid var(--border-2); border-radius: var(--r-control); background: var(--surface-2);
+  font: 500 13.5px/1.5 var(--mono); letter-spacing: 0.04em; color: var(--ink); user-select: all; overflow-wrap: anywhere;
+}
+.setup-foot { border-top: 1px solid var(--border); padding-top: 14px; margin-top: -2px; }
+
+.codes { display: flex; flex-direction: column; gap: 12px; }
+.codes-list {
+  list-style: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; margin: 0; padding: 6px 0;
+  border: 1px solid var(--border-2); border-radius: 10px; background: var(--surface-2); counter-reset: code;
+}
+.codes-list li { counter-increment: code; display: flex; align-items: baseline; gap: 8px; padding: 6px 14px; min-width: 0; }
+.codes-list li::before { content: counter(code); width: 16px; flex: none; text-align: right; font: 400 11px/1 var(--mono); color: var(--subtle); }
+.codes-list code { font: 500 13.5px/1.5 var(--mono); color: var(--ink); user-select: all; white-space: nowrap; font-size: 13px; }
+.codes-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.codes-saved { min-height: 36px; font-size: 13.5px; }
+
+/* The security page */
+.security .card-head h2 .icon { color: var(--muted); }
+.security-form { display: flex; flex-direction: column; gap: 14px; padding: 16px 18px 18px; }
+.security-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 0.9fr); gap: 16px 20px; align-items: start; }
+.security-fields { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.security-narrow { max-width: 280px; }
+.security-fields input.pw-code { max-width: 240px; }
+.security-ends { color: var(--ink-2); }
+.security-ends .icon { color: var(--muted); }
+.security-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.security-actions .btn { min-height: 40px; }
+.security-new { font-size: 15px; letter-spacing: -0.01em; }
+.security-new:focus { outline: none; }
+.security-status { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0; }
+.security-status > div { padding: 14px 18px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.security-status > div + div { border-left: 1px solid var(--border); }
+.security-status dt { font: 500 10.5px/1.4 var(--mono); letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+.security-status dd { margin: 0; font-size: 13.5px; color: var(--ink); }
+
+/* Team: password state beside the Microsoft state, and the setup-code dialog */
+.pw-tag {
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--border-2);
+  font-size: 11.5px; line-height: 1.5; color: var(--muted); background: var(--surface); white-space: nowrap;
+}
+.pw-tag-on { color: var(--good-ink); background: var(--good-bg); border-color: transparent; }
+.pw-tag-warn { color: var(--warn-ink); background: var(--warn-bg); border-color: transparent; }
+.setup-code-box { display: flex; flex-direction: column; gap: 8px; padding: 14px; border: 1px solid var(--border-2); border-radius: 12px; background: var(--surface-2); }
+.setup-code-box .field-label { margin-bottom: 0; }
+.setup-code-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.setup-code { flex: 1 1 auto; font: 600 18px/1.4 var(--mono); letter-spacing: 0.06em; color: var(--ink); user-select: all; overflow-wrap: anywhere; }
+.setup-code-once { display: flex; align-items: flex-start; gap: 6px; font-size: 13px; color: var(--warn-ink); }
+.setup-code-once .icon { margin-top: 2px; flex: none; }
+.setup-code-steps { font-size: 13.5px; }
+.team-command { display: inline-block; margin-top: 2px; padding: 4px 8px; border-radius: 6px; background: var(--surface); border: 1px solid var(--border-2); color: var(--ink); }
+
+@media (max-width: 767px) {
+  .signin.setup { padding: 22px 18px; }
+  .setup-step-label { font-size: 10.5px; }
+  .security-grid { grid-template-columns: minmax(0, 1fr); }
+  .security-narrow { max-width: none; }
+  .security-fields input.pw-code { max-width: none; }
+  .security-status { grid-template-columns: minmax(0, 1fr); }
+  .security-status > div + div { border-left: 0; border-top: 1px solid var(--border); }
+  .codes-list { grid-template-columns: minmax(0, 1fr); }
+  .codes-list li { padding: 5px 14px; }
+  .codes-list code { font-size: 12.5px; }
 }

@@ -47,6 +47,21 @@ function mockUsersOptions(): { usersError?: string; pilotLapsed: boolean; deacti
   };
 }
 
+/**
+ * Password sign-in on the dev server (sample people and codes: api/mockPassword.ts):
+ * `?mock_password=<error code>` answers that refusal once, on the first route in the flow that can
+ * send it (`weak_password:common` picks the reason), and `?mock_retry_after=<seconds>` sets the
+ * wait `too_many_attempts` gives.
+ */
+function mockPasswordOptions(): { passwordRefusal?: string; retryAfter?: number } {
+  const q = new URLSearchParams(window.location.search);
+  const wait = Number(q.get('mock_retry_after'));
+  return {
+    passwordRefusal: q.get('mock_password') ?? undefined,
+    retryAfter: Number.isFinite(wait) && wait > 0 ? wait : undefined,
+  };
+}
+
 /** VITE_API=real talks to pmos-web through the dev proxy; anything else uses the sample data. */
 export function devApiFactory(): (onSignedOut: () => void) => Api {
   if (import.meta.env.VITE_API === 'real') return (onSignedOut) => createRealClient({ onSignedOut });
@@ -66,6 +81,7 @@ export function devApiFactory(): (onSignedOut: () => void) => Api {
       // `?mock_reviews=<error code>` answers every recommendation with that code (`unknown_outcome` records it first).
       reviewError: new URLSearchParams(window.location.search).get('mock_reviews') ?? undefined,
       ...mockUsersOptions(),
+      ...mockPasswordOptions(),
       ...mockPolicyOptions(),
       ...(import.meta.env.VITE_MOCK_EMPTY === 'on' ? { noDrafts: true, firstVisit: false, emptyBrief: true } : {}),
       ...(import.meta.env.VITE_MOCK_FAST === 'on' ? { latency: 0, stepMs: 150 } : {}),
