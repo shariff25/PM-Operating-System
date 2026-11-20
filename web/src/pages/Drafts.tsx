@@ -121,6 +121,7 @@ export function Drafts() {
           {drafts && shown.length === 0 && (
             <Empty
               icon="drafts"
+              nudge="calm"
               action={
                 drafts.length === 0 ? (
                   <button type="button" className="btn btn-sm" onClick={() => openPalette(copy.emptyActions.askDraftText)}>

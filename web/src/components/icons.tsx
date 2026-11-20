@@ -25,6 +25,8 @@ const PATHS = {
   lightbulb: 'M9.5 18h5M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z',
   logout: 'M14.5 4.5H18a1.5 1.5 0 0 1 1.5 1.5v12a1.5 1.5 0 0 1-1.5 1.5h-3.5M10 8l-4 4 4 4M6 12h9.5',
   check: 'M5 12.5l4.5 4.5L19 7.5',
+  // A sticky note with a face: the line-icon stand-in for Nudge (the "Show Nudge" setting).
+  mascot: 'M7 4.5h7l5.5 5.5V17a2.5 2.5 0 0 1-2.5 2.5H7A2.5 2.5 0 0 1 4.5 17V7A2.5 2.5 0 0 1 7 4.5zM14 4.5V8a2 2 0 0 0 2 2h3.5M9.5 11.5h.01M13.5 11.5h.01M10 14.5q1.5 1.2 3 0',
   x: 'M6 6l12 12M18 6 6 18',
   more: 'M6 12h.01M12 12h.01M18 12h.01',
   external: 'M14 4.5h5.5V10M19.5 4.5 11 13M18 14v4.5a1 1 0 0 1-1 1H5.5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1H10',

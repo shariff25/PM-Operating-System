@@ -74,8 +74,20 @@ pub const REJECT_REASONS: [&str; 6] = [
     "other",
 ];
 
-/// The hints the app can mark seen.
-pub const HINTS: [&str; 3] = ["sources", "ask", "approve"];
+/// What the app can mark seen: the three one-time hints, then the guided start's own marks
+/// (started, each of its three steps, skipped, and the one "Approved!" moment). `DELETE
+/// /api/me/hints` clears them all, which is how "Show hints again" restarts the guided start.
+pub const HINTS: [&str; 9] = [
+    "sources",
+    "ask",
+    "approve",
+    "tour_started",
+    "tour_asked",
+    "tour_opened",
+    "tour_decided",
+    "tour_skipped",
+    "tour_cheered",
+];
 
 /// The tool server's `409` codes passed through on approve.
 pub const PASSED_THROUGH: [&str; 3] = ["needs_external_confirm", "audience_blocked", "expired"];
@@ -1499,6 +1511,7 @@ fn me_json(signed: &Signed, st: &UserState) -> Response {
         "first_visit": !st.opened_a_draft,
         "hints_seen": st.hints_seen.iter().collect::<Vec<_>>(),
         "nudges": st.nudges,
+        "mascot": st.mascot,
     }))
     .into_response()
 }
@@ -1519,6 +1532,7 @@ async fn me(State(state): State<AppState>, SignedRead(signed): SignedRead) -> Ap
 #[serde(deny_unknown_fields)]
 struct SettingsBody {
     nudges: Option<bool>,
+    mascot: Option<bool>,
 }
 
 async fn put_settings(State(state): State<AppState>, signed: Signed, body: Bytes) -> ApiResult {
@@ -1531,6 +1545,9 @@ async fn put_settings(State(state): State<AppState>, signed: Signed, body: Bytes
             Box::new(move |s| {
                 if let Some(n) = req.nudges {
                     s.nudges = n;
+                }
+                if let Some(m) = req.mascot {
+                    s.mascot = m;
                 }
             }),
         )

@@ -10,7 +10,7 @@ import type {
   Connector,
   Draft,
   DraftSummary,
-  HintName,
+  SeenName,
   Me,
   RejectReason,
   Recommended,
@@ -121,7 +121,8 @@ export function createRealClient(opts: RealOptions = {}): Api {
       return me;
     },
     setNudges: (nudges) => call<Me>('PUT', '/me/settings', { nudges }),
-    markHintSeen: (seen: HintName) => post<Me>('/me/hints', { seen }),
+    setMascot: (mascot) => call<Me>('PUT', '/me/settings', { mascot }),
+    markHintSeen: (seen: SeenName) => post<Me>('/me/hints', { seen }),
     resetHints: () => call<Me>('DELETE', '/me/hints'),
 
     listDrafts: async () => {
