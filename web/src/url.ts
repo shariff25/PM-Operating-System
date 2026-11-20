@@ -63,6 +63,7 @@ export type Route =
   | { name: 'activity' }
   | { name: 'task'; id: string }
   | { name: 'reviews' }
+  | { name: 'security' }
   | { name: 'review'; id: string }
   /** `search` is the query part of the hash (the audit filters), without the `?`. */
   | { name: 'admin'; section: AdminSection; search: string; sub?: PolicyPart };
@@ -85,6 +86,7 @@ export function parseRoute(path: string): Route {
   if (path === '/followups') return { name: 'followups' };
   if (path === '/activity') return { name: 'activity' };
   if (path === '/reviews') return { name: 'reviews' };
+  if (path === '/security') return { name: 'security' };
   const review = reviewIdFromPath(path);
   if (review) return { name: 'review', id: review };
   const admin = adminRoute(path);
@@ -99,6 +101,11 @@ export function parseRoute(path: string): Route {
 export const draftHref = (id: string) => `#/d/${encodeURIComponent(id)}`;
 export const taskHref = (id: string) => `#/a/${encodeURIComponent(id)}`;
 export const reviewHref = (id: string) => `#/reviews/${encodeURIComponent(id)}`;
+
+/** `#/setup`: password setup with a setup or reset code. It works signed in or out, so it is read before the rest. */
+export function isSetupPath(path: string): boolean {
+  return /^\/setup\/?(?:\?.*)?$/.test(path);
+}
 
 /** `/signed-out?reason=…` is where the server sends someone whose sign-in did not finish. */
 export function signedOutReason(path: string): string | null {

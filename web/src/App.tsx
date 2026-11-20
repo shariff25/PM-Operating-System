@@ -20,7 +20,7 @@ import { Thread } from './pages/Thread';
 import { useTheme } from './theme';
 import { withCleanTasks } from './briefBlock';
 import { withCleanDrafts } from './citations';
-import { parseRoute, signedOutReason } from './url';
+import { isSetupPath, parseRoute, signedOutReason } from './url';
 import type { Route } from './url';
 
 // The whole Admin area (its pages, editors and diff code) is its own chunk: it is fetched the first
@@ -28,6 +28,18 @@ import type { Route } from './url';
 const AdminPage = lazy(() => import('./pages/admin/AdminPage').then((m) => ({ default: m.AdminPage })));
 // Reviews are for reviewers only, so they are a chunk of their own too.
 const ReviewsPage = lazy(() => import('./pages/reviews/ReviewsPage').then((m) => ({ default: m.ReviewsPage })));
+// Password setup (with its QR code drawing) and the security page are used rarely: chunks of their own.
+const SetupPage = lazy(() => import('./pages/password/SetupPage').then((m) => ({ default: m.SetupPage })));
+const SecurityPage = lazy(() => import('./pages/password/SecurityPage').then((m) => ({ default: m.SecurityPage })));
+
+/** Shown while a small page's code is on its way. */
+function PageLoading({ label }: { label: string }) {
+  return (
+    <div className="page">
+      <Skeleton rows={3} label={label} />
+    </div>
+  );
+}
 
 /** Shown while the Reviews code is on its way. */
 function ReviewsLoading() {
@@ -73,6 +85,12 @@ function Page({ route }: { route: Route }) {
       return (
         <Suspense fallback={<ReviewsLoading />}>
           <ReviewsPage id={route.name === 'review' ? route.id : undefined} />
+        </Suspense>
+      );
+    case 'security':
+      return (
+        <Suspense fallback={<PageLoading label={copy.password.security.loading} />}>
+          <SecurityPage />
         </Suspense>
       );
     case 'admin':
@@ -137,6 +155,20 @@ export function App({ createApi, pollMs }: AppProps) {
   );
 
   if (!ready) return null;
+  // Setup with a setup or reset code works whether or not someone is signed in in this browser.
+  if (isSetupPath(path)) {
+    return (
+      <Suspense fallback={null}>
+        <SetupPage
+          api={api}
+          onDone={async () => {
+            await refreshMe();
+            navigate('/');
+          }}
+        />
+      </Suspense>
+    );
+  }
   if (!ctx) {
     const reason = signedOutReason(path);
     if (reason !== null) return <SignedOut reason={reason} onTryAgain={() => navigate('/')} />;

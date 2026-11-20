@@ -12,6 +12,14 @@ import type {
   DraftSummary,
   SeenName,
   Me,
+  PasswordEnrolment,
+  PasswordRecoveryCodes,
+  PasswordSetupCode,
+  PasswordSetupDone,
+  PasswordSetupStarted,
+  PasswordSignedIn,
+  PasswordSignInStarted,
+  PasswordStatus,
   RejectReason,
   Recommended,
   ReviewDraft,
@@ -40,6 +48,9 @@ function filenameOf(disposition: string | null): string {
   const m = /filename="?([^";]+)"?/i.exec(disposition ?? '');
   return m?.[1] ?? 'pmos-audit.csv';
 }
+
+/** The `401`s the password sign-in and setup routes answer for a refused step. They never mean "signed out". */
+const PASSWORD_STEP_REFUSALS = new Set(['sign_in_failed', 'code_failed', 'sign_in_expired', 'setup_failed', 'setup_expired']);
 
 export interface RealOptions {
   /** Called on any 401: the app goes back to sign-in. */
@@ -91,7 +102,9 @@ export function createRealClient(opts: RealOptions = {}): Api {
     } catch {
       /* body was not JSON; keep the plain fallback */
     }
-    if (res.status === 401) {
+    // A 401 is a lost session, except the password steps' own refusals: those are answers to the person
+    // signing in, who has no session to lose (docs/web-api.md, "Password sign-in").
+    if (res.status === 401 && !PASSWORD_STEP_REFUSALS.has(code)) {
       csrf = null;
       opts.onSignedOut?.();
       code = 'signed_out';
@@ -111,6 +124,18 @@ export function createRealClient(opts: RealOptions = {}): Api {
   return {
     providers: async () => (await call<{ providers: AuthProvider[] }>('GET', '/auth/providers')).providers,
     devLogin: (handle) => post<void>('/auth/dev-login', { handle }),
+    passwordSignIn: (signInName, password) => post<PasswordSignInStarted>('/auth/password/sign-in', { sign_in_name: signInName, password }),
+    passwordSecondStep: (input) =>
+      post<PasswordSignedIn>('/auth/password/second-step', 'code' in input ? { code: input.code } : { recovery_code: input.recovery_code }),
+    passwordSetupBegin: (signInName, setupCode) =>
+      post<PasswordSetupStarted>('/auth/password/setup/begin', { sign_in_name: signInName, setup_code: setupCode }),
+    passwordSetupPassword: (password) => post<void>('/auth/password/setup/password', { password }),
+    passwordSetupAuthenticator: () => post<PasswordEnrolment>('/auth/password/setup/authenticator', {}),
+    passwordSetupConfirm: (code) => post<PasswordSetupDone>('/auth/password/setup/confirm', { code }),
+    passwordChange: (input) =>
+      post<void>('/auth/password/change', { current_password: input.current_password, code: input.code, new_password: input.new_password }),
+    passwordRecoveryCodes: (code) => post<PasswordRecoveryCodes>('/auth/password/recovery-codes', { code }),
+    passwordStatus: () => call<PasswordStatus>('GET', '/auth/password/status'),
     logout: async () => {
       await post<void>('/auth/logout');
       csrf = null;
@@ -213,6 +238,8 @@ export function createRealClient(opts: RealOptions = {}): Api {
         pms,
         ...(expectedVersion !== undefined ? { expected_version: expectedVersion } : {}),
       }),
+
+    adminPasswordSetupCode: (handle) => post<PasswordSetupCode>(`/admin/users/${seg(handle)}/password-setup-code`, {}),
 
     adminPolicy: () => call<PolicyView>('GET', '/admin/policy'),
     adminPolicyValidate: (spec) => post<Validation>('/admin/policy/validate', { spec }),

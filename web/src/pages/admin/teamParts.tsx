@@ -33,6 +33,7 @@ export function TeamDialog({
   problem,
   danger,
   testId,
+  hideCancel,
 }: {
   title: string;
   intro?: ReactNode;
@@ -49,6 +50,8 @@ export function TeamDialog({
   /** A change that takes something away: the confirm button is red, and the dialog is an alert dialog. */
   danger?: boolean;
   testId?: string;
+  /** Only one way out (a result shown once): the submit button closes it. */
+  hideCancel?: boolean;
 }) {
   const box = useRef<HTMLDivElement>(null);
   const id = useId();
@@ -59,7 +62,8 @@ export function TeamDialog({
     const first =
       el.querySelector<HTMLElement>('[data-autofocus]') ??
       el.querySelector<HTMLElement>('input:not(:disabled):not([readonly]), textarea:not(:disabled)') ??
-      el.querySelector<HTMLElement>('[data-cancel]');
+      el.querySelector<HTMLElement>('[data-cancel]') ??
+      el.querySelector<HTMLElement>('button[type="submit"]');
     first?.focus();
   }, []);
 
@@ -117,9 +121,11 @@ export function TeamDialog({
             <button type="submit" className={`btn ${danger ? 'btn-danger' : 'btn-primary'}`} disabled={!canSubmit || busy}>
               {busy ? busyLabel : submitLabel}
             </button>
-            <button type="button" className="btn" data-cancel disabled={busy} onClick={onClose}>
-              {T.cancel}
-            </button>
+            {!hideCancel && (
+              <button type="button" className="btn" data-cancel disabled={busy} onClick={onClose}>
+                {T.cancel}
+              </button>
+            )}
             {hint && !busy && <span className="modal-hint">{hint}</span>}
           </div>
         </form>
