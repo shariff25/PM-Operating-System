@@ -64,8 +64,11 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
   `GET /readyz` answers `200` when it can serve and `503` when it can't, with
   `{"ready": bool, "checks": {"store": "ok"|"down", "bot_runtime": …, "tool_server": …},
   "unrecorded_sign_in_events": n}`: its own store answers, and the bot runtime and the tool
-  server (which answers who may sign in) answer their `/healthz` within two seconds.
-  `unrecorded_sign_in_events` counts, since start-up, sign-in events the audit log didn't take
+  server (which answers who may sign in) answer their `/healthz` within two seconds. With
+  Entra sign-in on, `checks` also has `entra_link` (since the review of `b469d5b`, U1): `ok`
+  only when the tool server validates first-link ID tokens for the same tenant and client id
+  (`docs/entra-sign-in.md`); without that a first Microsoft sign-in can't link, so it is
+  `down` and the server is not ready. `unrecorded_sign_in_events` counts, since start-up, sign-in events the audit log didn't take
   (see **Sign-in events**); it never makes the server unready. No detail and no secrets; the
   reason goes to the server's log.
 - **Sign-in events.** Every sign-in, sign-out and refused sign-in is recorded in the tool
@@ -930,7 +933,8 @@ Counts for the admin home.
            "resolve_miss_warning": [], "resolve_miss_warning_threshold": 100,
            "deactivations_last_hour": 1, "deactivation_limit": 3,
            "deactivation_limit_reached": false, "deactivation_grace_hours": 24,
-           "bots_without_active_owner": []}}
+           "bots_without_active_owner": [],
+           "first_links": [{"handle": "ben", "at": "2026-11-16T08:02:11.000Z", "provider": "entra"}]}}
 ```
 
 | Field | Type | Meaning |
@@ -964,6 +968,7 @@ Counts for the admin home.
 | `deactivations_last_hour`, `deactivation_limit`, `deactivation_limit_reached` | integer, integer, boolean | The hourly cap (**Admin: users and roles**). |
 | `deactivation_grace_hours` | integer | 24. |
 | `bots_without_active_owner` | string[] | Bots whose owner is not an active user who may use PM OS. |
+| `first_links` | object[] or `null` | **New (review of `b469d5b`, U1).** Everyone who signed in with Microsoft for the first time in the last 7 days, newest first: `{handle, at (RFC 3339 UTC), provider: "entra"}`. "N people signed in with Microsoft for the first time in the last 7 days"; if one wasn't expected, unlink it on the Team page. Never an object id. `null` when the audit log can't be read back (or from an older tool server). |
 
 The three counts are `null` when the tool server's audit log can't be read back.
 **Purge runs in the audit list:** action `audit.purge`, system `audit`, actor
@@ -1575,7 +1580,9 @@ summary line.)
 | `protection` | object | Whether the default branch makes GitHub require someone else's review, as the tool server could read it with **this viewer's** GitHub account. Best effort: never an error, never blocks a proposal. |
 | `protection.branch` | string or `null` | The branch proposals target (`null` when proposals are off). |
 | `protection.required_reviews` | integer or `null` | Approving reviews the branch requires; `0`: none (warn: the author could merge without anyone's review). `null`: unknown. |
-| `protection.verified` | boolean | `true` when it could be read (classic branch protection, or a ruleset that requires reviews). `false`: unknown (warn that it couldn't be checked; the admin's GitHub account may lack the read permission, or isn't linked). |
+| `protection.verified` | boolean | **Changed (review of `b469d5b`, UM4).** `true` only when GitHub's answer showed that the branch requires a review **and** that admins aren't exempt **and** that nobody may bypass it (`admins_enforced: true`, `bypass_allowed: false`), or that no review is required at all (`required_reviews: 0`, which the screen warns about). Anything else is `false`: warn that every change can't be confirmed to need someone else's review (the existing `unverified` sentence, reworded to say admins may be exempt, someone may be allowed to bypass, or the account can't read it). |
+| `protection.admins_enforced` | boolean or `null` | **New.** Whether the rule binds admins too (classic `enforce_admins`, or a ruleset with no bypass actor). `null`: GitHub's answer didn't say (never treated as `true`). |
+| `protection.bypass_allowed` | boolean or `null` | **New.** Whether anyone may merge without the review (classic `bypass_pull_request_allowances`, or a ruleset's `bypass_actors`). `null`: GitHub's answer didn't say (a ruleset's bypass list is shown only to someone who may edit it). |
 | `protection.github` | `"linked"`, `"not_linked"`, `"unavailable"` or `null` | Whether this viewer has linked GitHub (`null` when proposals are off or the tool server didn't answer). |
 
 **Allowances** (one object per bot):
@@ -1828,8 +1835,8 @@ lists one.
                          "path": "content/skills/docs/SKILL.md", "line": null,
                          "message": "owner is not assigned yet"}]}},
    {"path": "content/context/products/roadmap.md", "kind": "context", "name": null,
-    "title": "Roadmap", "version": null, "owner": "adam", "sensitivity": "restricted",
-    "last_reviewed": "2026-11-14", "size": 112, "editable": true, "readable": false,
+    "title": null, "version": null, "owner": null, "sensitivity": "restricted",
+    "last_reviewed": null, "size": 112, "editable": true, "readable": false,
     "lint": {"status": "ok", "errors": 0, "warnings": 0, "issues": []}}],
  "roles": [
    {"name": "docs-helper", "version": "0.1.0", "owner": "TODO", "model": "default",
@@ -1846,13 +1853,13 @@ lists one.
 | --- | --- | --- |
 | `revision` | object | As in **Admin: policy**. |
 | `root` | string | The content tree's folder in the repository (`content`; empty if the content is the repository root). |
-| `lint` | object | The content lint, run now on the deployed tree: counts, when, and `other` (`Issue[]` about a folder rather than a file, such as a skill folder with no `SKILL.md`). |
+| `lint` | object | The content lint, run now on the deployed tree: counts, when, and `other` (`Issue[]` about a folder rather than a file, such as a skill folder with no `SKILL.md`). For a viewer without `edit-content` (an auditor), every `other` message is "A finding on a file your role can't open." (review of `b469d5b`, UM3: such a finding can name anything in the tree). |
 | `files[]` | array | Every regular file in the tree, sorted by path (no symlinks, nothing hidden). |
 | `files[].kind` | string | `role`, `bot`, `skill`, `skill_file` (another file in a skill's folder), `playbook`, `template`, `reviewer`, `context`, `readme`, `master` (`master/AGENTS.md`), `personal_master` (`master/people/<handle>/AGENTS.md`), `team`, `tools` or `other`. |
-| `files[].name`, `title`, `version`, `owner`, `sensitivity`, `last_reviewed` | string or `null` | From the file's front matter, where it has them (a skill's `version` and `owner` come from `metadata`). `null` when absent or unparsable. |
+| `files[].name`, `title`, `version`, `owner`, `sensitivity`, `last_reviewed` | string or `null` | From the file's front matter, where it has them (a skill's `version` and `owner` come from `metadata`). `null` when absent or unparsable. **For a file this viewer may not open** (`readable: false`), `name`, `title`, `version`, `owner` and `last_reviewed` are always `null` (UM3); `sensitivity` stays, to say why. |
 | `files[].size` | integer | Bytes. |
 | `files[].editable` | boolean | Whether a proposal may change it: text (`.md`, `.yaml`, `.yml`, `.txt`) and not `team.yaml` (retired: people and roles are in the user database, and `pmos lint` refuses the file). |
-| `files[].readable` | boolean | Whether this viewer may open it (`GET …/file`). An auditor sees personal master files and `restricted` context listed, not opened. |
+| `files[].readable` | boolean | Whether this viewer may open it (`GET …/file`). An auditor sees personal master files and `restricted` context listed, not opened. The rule fails closed (UM3): `sensitivity` is read in any letter case (`Restricted` is restricted), and a Markdown file whose front matter doesn't parse, never closes, has a `sensitivity` that isn't text, or wasn't read (too large) is closed to an auditor too. |
 | `files[].lint` | object | `status` (`ok`, `warning` or `error`), counts, and that file's `Issue[]`. When `readable` is `false`, each issue's `message` is "A finding on a file your role can't open." (a parser's message can quote the file). |
 | `roles[]` | array | Each role: its skills, model role, data class, and the bots made from it. |
 | `skills[]` | array | Each skill: its tools and `used_by` (the roles that list it). A skill that doesn't lint isn't here (its file shows the error). |

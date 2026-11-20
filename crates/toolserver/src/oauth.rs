@@ -393,6 +393,7 @@ impl OAuth {
                 .await?;
         }
         self.vault.put(&credential).await?;
+        self.settle_after_save(&user, provider, now).await?;
         tracing::info!(user = %user, provider = %provider, "account linked");
         Ok(CredentialInfo {
             provider,
@@ -402,6 +403,39 @@ impl OAuth {
             external_id: credential.external_id,
             updated_at: credential.updated_at,
         })
+    }
+
+    /// After a credential is saved, check the person again (L9): a deactivation that
+    /// committed between the checks above and the save suspended the credentials stored then,
+    /// not this one. So the person is read again, from the store: deactivated now, their
+    /// credentials are suspended here, as the deactivation would have (a reactivation within
+    /// the grace restores them, the sweeper deletes them after); otherwise no longer allowed to
+    /// use PM OS, this credential is deleted. Either way the link is refused. A deactivation
+    /// after this read finds the credential stored and suspends it itself.
+    pub(crate) async fn settle_after_save(
+        &self,
+        user: &str,
+        provider: Provider,
+        now: DateTime<Utc>,
+    ) -> Result<(), OAuthError> {
+        if is_bot_identity(user) || !self.people.enforced() {
+            return Ok(());
+        }
+        let member = self.people.user(user).await?;
+        if member.as_ref().is_some_and(may_use) {
+            return Ok(());
+        }
+        if member.as_ref().is_some_and(|m| !m.active()) {
+            self.vault.suspend(user, now).await?;
+            tracing::warn!(user, provider = %provider, "deactivated while linking: the new credential is suspended");
+        } else {
+            self.vault.delete(user, provider).await?;
+            tracing::warn!(user, provider = %provider, "no longer may use PM OS while linking: the new credential is deleted");
+        }
+        Err(OAuthError::WrongAccount(
+            provider,
+            "not an active PM OS user".into(),
+        ))
     }
 
     /// Store the account id of `user`'s first Atlassian or GitHub link; a later link must
@@ -1057,7 +1091,7 @@ impl TokenSource for OAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::{KeyRing, MemoryCredentials};
+    use crate::vault::{CredentialStore, KeyRing, MemoryCredentials};
 
     fn oauth() -> OAuth {
         let vault = Vault::new(
@@ -1241,5 +1275,107 @@ mod tests {
 
         let bot_only = serde_json::json!({"ok": true, "access_token": "xoxb", "token_type": "bot"});
         assert!(slack_user_credential("ana", &bot_only, now()).is_none());
+    }
+
+    /// L9 (review of `b469d5b`): a credential saved after the person was deactivated (the
+    /// deactivation committed between the link's checks and its save) ends up suspended, and
+    /// the link is refused; an active person's stays as it is.
+    #[tokio::test]
+    async fn a_credential_saved_after_a_deactivation_is_suspended() {
+        use crate::users::{Actor, HostUser, NewUser, Op, UserRole, UserStore};
+        let users = Arc::new(crate::users::MemoryUsers::default());
+        let host = Actor::host(HostUser::parse("opsuser").unwrap());
+        let person = |h: &str, roles: &[UserRole]| NewUser {
+            handle: h.into(),
+            display_name: h.into(),
+            sign_in_name: Some(format!("{h}@contoso.com")),
+            atlassian_email: Some(format!("{h}@contoso.com")),
+            github_login: None,
+            slack_id: None,
+            roles: roles.iter().copied().collect(),
+        };
+        users
+            .apply(
+                &host,
+                Op::BootstrapAdmin {
+                    user: person("raj", &[UserRole::Pm]),
+                    entra: None,
+                },
+                now(),
+            )
+            .await
+            .unwrap();
+        for h in ["ana", "ben"] {
+            users
+                .apply(
+                    &host,
+                    Op::CreateUser {
+                        user: person(h, &[UserRole::Pm]),
+                    },
+                    now(),
+                )
+                .await
+                .unwrap();
+        }
+        let store = Arc::new(MemoryCredentials::default());
+        let vault = Vault::new(
+            KeyRing::from_spec(&KeyRing::generate_spec("k1")).unwrap(),
+            store.clone(),
+        );
+        let mut o = oauth();
+        o.vault = vault;
+        o.people = Arc::new(People::new(users.clone()));
+        let credential = |user: &str| Credential {
+            user: user.into(),
+            provider: Provider::Atlassian,
+            access_token: Secret::new("fake-access-token"),
+            refresh_token: None,
+            expires_at: None,
+            scopes: "read:jira-work".into(),
+            cloud_id: None,
+            site_url: None,
+            external_id: None,
+            updated_at: now(),
+        };
+        // The checks passed for ana; then she is deactivated; then the save lands.
+        users
+            .apply(
+                &host,
+                Op::Deactivate {
+                    handle: "ana".into(),
+                },
+                now(),
+            )
+            .await
+            .unwrap();
+        o.vault.put(&credential("ana")).await.unwrap();
+        let r = o.settle_after_save("ana", Provider::Atlassian, now()).await;
+        assert!(matches!(r, Err(OAuthError::WrongAccount(..))), "{r:?}");
+        let sealed = store
+            .get("ana", Provider::Atlassian)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            sealed.suspended_at.is_some(),
+            "suspended, as the deactivation would have"
+        );
+        assert!(o
+            .vault
+            .get("ana", Provider::Atlassian)
+            .await
+            .unwrap()
+            .is_none());
+        // An active person's credential is untouched.
+        o.vault.put(&credential("ben")).await.unwrap();
+        o.settle_after_save("ben", Provider::Atlassian, now())
+            .await
+            .unwrap();
+        assert!(o
+            .vault
+            .get("ben", Provider::Atlassian)
+            .await
+            .unwrap()
+            .is_some());
     }
 }

@@ -1,9 +1,12 @@
 //! The first Entra link (`docs/user-database-spec.md` §7 step 2; slice U2).
 //!
 //! `pmos-web` found nobody by `(tid, oid)` and one user by the token's `preferred_username`
-//! (`resolve?by=sign_in_name`); it now asks to store `(tid, oid)` as that user's `entra`
-//! identity. [`plan`] re-checks every condition against the directory read in the same
-//! transaction, under the users lock:
+//! (`resolve?by=sign_in_name`); it now asks to store the token's `(tid, oid)` as that user's
+//! `entra` identity. Since the review of `b469d5b` (U1) it sends the raw ID token, which the
+//! route validates itself (`app/directory.rs`, `pmos_entra::Verifier`): the [`EntraLink`]
+//! planned here is made only from a validated token's `tid`, `oid` and `preferred_username`,
+//! never from values `pmos-web` states. [`plan`] re-checks every condition against the
+//! directory read in the same transaction, under the users lock:
 //!
 //! - the user exists and their sign-in name is the one presented (else `not_found`, which
 //!   counts as a miss for the caller's rate limit, so the route is no better an oracle than
@@ -62,10 +65,19 @@ pub enum LinkRefusal {
     Linked,
     /// Another user holds this `(tid, oid)` (a conflict).
     Taken,
+    /// The ID token failed the route's own check (signature, issuer, audience, time, nonce,
+    /// tenant, `oid`).
+    InvalidToken,
+    /// This ID token was already presented for a first link (a replay).
+    TokenUsed,
+    /// The ID token is a guest's (`acct`) or another identity provider's (`idp`).
+    NotAMember,
+    /// The ID token has no `acct` claim: the app registration lacks the optional claim.
+    EntraMisconfigured,
 }
 
 impl LinkRefusal {
-    pub const ALL: [LinkRefusal; 8] = [
+    pub const ALL: [LinkRefusal; 12] = [
         Self::Invalid,
         Self::NotFound,
         Self::NotActive,
@@ -74,6 +86,10 @@ impl LinkRefusal {
         Self::EvalsAccount,
         Self::Linked,
         Self::Taken,
+        Self::InvalidToken,
+        Self::TokenUsed,
+        Self::NotAMember,
+        Self::EntraMisconfigured,
     ];
 
     /// The API's error code.
@@ -87,6 +103,19 @@ impl LinkRefusal {
             Self::EvalsAccount => "evals_account",
             Self::Linked => "linked",
             Self::Taken => "taken",
+            Self::InvalidToken => "invalid_token",
+            Self::TokenUsed => "token_used",
+            Self::NotAMember => "not_a_member",
+            Self::EntraMisconfigured => "entra_misconfigured",
+        }
+    }
+
+    /// The refusal for a token the route's own check refused.
+    pub fn from_token(f: &pmos_entra::Failure) -> Self {
+        match f {
+            pmos_entra::Failure::NotMember(_) => Self::NotAMember,
+            pmos_entra::Failure::Misconfigured => Self::EntraMisconfigured,
+            _ => Self::InvalidToken,
         }
     }
 
@@ -108,7 +137,15 @@ impl LinkRefusal {
 
     pub fn message(self) -> &'static str {
         match self {
-            Self::Invalid => "tid and oid must be GUIDs and sign_in_name an email address",
+            Self::Invalid => {
+                "the body is {\"id_token\", \"nonce\"}, and the token's sign-in name an email address"
+            }
+            Self::InvalidToken => "the ID token didn't pass this server's own check",
+            Self::TokenUsed => "this ID token was already used for a first link",
+            Self::NotAMember => "the ID token is a guest's or another identity provider's",
+            Self::EntraMisconfigured => {
+                "the ID token has no acct claim: add it in the app registration's Token configuration"
+            }
             Self::NotFound => "no user has that handle and sign-in name",
             Self::NotActive => "this user is deactivated",
             Self::Unconfirmed => {

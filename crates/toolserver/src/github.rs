@@ -544,6 +544,39 @@ pub struct Protection {
     pub required_reviews: u64,
     /// Where it was read: `branch_protection` or `rulesets`.
     pub source: &'static str,
+    /// Whether the rule binds admins too: classic protection's `enforce_admins.enabled`; for
+    /// a ruleset, no bypass actors at all (an admin exemption is a bypass actor). `None`: the
+    /// answer didn't say (review of `b469d5b`, UM4).
+    pub admins_enforced: Option<bool>,
+    /// Whether anyone may merge without the review: classic protection's
+    /// `bypass_pull_request_allowances` (users, teams, apps), or a ruleset's
+    /// `bypass_actors`. `None`: the answer didn't say.
+    pub bypass_allowed: Option<bool>,
+}
+
+impl Protection {
+    /// Verified: reviews are required and GitHub's answer showed that admins aren't exempt
+    /// and nobody may bypass; or no review is required at all (known, and warned about).
+    /// Anything the answer left out is unknown, never verified.
+    pub fn verified(&self) -> bool {
+        self.required_reviews == 0
+            || (self.admins_enforced == Some(true) && self.bypass_allowed == Some(false))
+    }
+}
+
+/// Classic protection's bypass list, if the answer has one: any user, team or app on it is a
+/// bypass. `None` when the answer has no such object.
+fn classic_bypass(reviews: &Value) -> Option<bool> {
+    let allowances = reviews.get("bypass_pull_request_allowances")?;
+    let mut any = false;
+    for k in ["users", "teams", "apps"] {
+        match allowances.get(k) {
+            Some(Value::Array(a)) => any |= !a.is_empty(),
+            Some(_) => return None,
+            None => {}
+        }
+    }
+    Some(any)
 }
 
 impl GitHub {
@@ -690,37 +723,124 @@ impl GitHub {
                 &format!("the rules of {branch}"),
             )
             .await;
-        let ruleset_reviews = rules.as_ref().ok().map(|v| {
+        // The pull-request rules that require reviews, and the rulesets they come from.
+        let review_rules: Option<Vec<(u64, Option<u64>)>> = rules.as_ref().ok().map(|v| {
             v.as_array()
                 .map(|a| {
                     a.iter()
                         .filter(|r| r["type"] == "pull_request")
-                        .filter_map(|r| r["parameters"]["required_approving_review_count"].as_u64())
-                        .max()
-                        .unwrap_or(0)
+                        .filter_map(|r| {
+                            let n = r["parameters"]["required_approving_review_count"].as_u64()?;
+                            (n > 0).then(|| (n, r["ruleset_id"].as_u64()))
+                        })
+                        .collect()
                 })
-                .unwrap_or(0)
+                .unwrap_or_default()
         });
+        let ruleset_reviews = review_rules
+            .as_ref()
+            .map(|r| r.iter().map(|(n, _)| *n).max().unwrap_or(0));
         match classic {
             Ok(v) => {
-                let n = v["required_pull_request_reviews"]["required_approving_review_count"]
+                let reviews = &v["required_pull_request_reviews"];
+                let n = reviews["required_approving_review_count"]
                     .as_u64()
                     .unwrap_or(0);
+                if n > 0 {
+                    // Classic protection binds everyone it names: its own exemptions decide.
+                    return Some(Protection {
+                        required_reviews: n.max(ruleset_reviews.unwrap_or(0)),
+                        source: "branch_protection",
+                        admins_enforced: v["enforce_admins"]["enabled"].as_bool(),
+                        bypass_allowed: classic_bypass(reviews),
+                    });
+                }
+                let rs = ruleset_reviews.unwrap_or(0);
+                if rs > 0 {
+                    let (admins, bypass) = self
+                        .ruleset_bypass(token, repo, review_rules.as_deref().unwrap_or(&[]))
+                        .await;
+                    return Some(Protection {
+                        required_reviews: rs,
+                        source: "rulesets",
+                        admins_enforced: admins,
+                        bypass_allowed: bypass,
+                    });
+                }
                 Some(Protection {
-                    required_reviews: n.max(ruleset_reviews.unwrap_or(0)),
+                    required_reviews: 0,
                     source: "branch_protection",
+                    admins_enforced: v["enforce_admins"]["enabled"].as_bool(),
+                    bypass_allowed: None,
                 })
             }
             // A ruleset that requires reviews is enough to say so; one that doesn't can't
             // rule out classic protection the token couldn't read.
             Err(_) => match ruleset_reviews {
-                Some(n) if n > 0 => Some(Protection {
-                    required_reviews: n,
-                    source: "rulesets",
-                }),
+                Some(n) if n > 0 => {
+                    let (admins, bypass) = self
+                        .ruleset_bypass(token, repo, review_rules.as_deref().unwrap_or(&[]))
+                        .await;
+                    Some(Protection {
+                        required_reviews: n,
+                        source: "rulesets",
+                        admins_enforced: admins,
+                        bypass_allowed: bypass,
+                    })
+                }
                 _ => None,
             },
         }
+    }
+
+    /// Who may bypass the rulesets that require reviews: each ruleset's `bypass_actors`
+    /// (`GET /repos/{repo}/rulesets/{id}`), which GitHub shows only to someone who may edit
+    /// it. An admin exemption is a bypass actor too. `(admins_enforced, bypass_allowed)`:
+    /// `(Some(true), Some(false))` only when every such ruleset was read, is `active` and has
+    /// no bypass actor; `(None, None)` when any answer didn't say (at most five read).
+    async fn ruleset_bypass(
+        &self,
+        token: &Secret,
+        repo: &str,
+        rules: &[(u64, Option<u64>)],
+    ) -> (Option<bool>, Option<bool>) {
+        let mut ids: Vec<u64> = Vec::new();
+        for (_, id) in rules {
+            let Some(id) = id else {
+                return (None, None);
+            };
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        if ids.is_empty() || ids.len() > 5 {
+            return (None, None);
+        }
+        let mut any_bypass = false;
+        for id in ids {
+            let Ok(v) = self
+                .send(
+                    self.request(
+                        Method::GET,
+                        &format!("/repos/{}/rulesets/{id}", encode_path(repo)),
+                        token,
+                    ),
+                    &format!("ruleset {id} of {repo}"),
+                )
+                .await
+            else {
+                return (None, None);
+            };
+            if v["enforcement"] != "active" {
+                return (None, None);
+            }
+            match v.get("bypass_actors") {
+                Some(Value::Array(a)) => any_bypass |= !a.is_empty(),
+                _ => return (None, None),
+            }
+        }
+        // With bypass actors, whether one of them is the admin role isn't read: unknown.
+        ((!any_bypass).then_some(true), Some(any_bypass))
     }
 }
 

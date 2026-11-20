@@ -1839,6 +1839,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmos-entra"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "jsonwebtoken",
+ "pmos-contract",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pmos-evals"
 version = "0.1.0"
 dependencies = [
@@ -1971,6 +1989,7 @@ dependencies = [
  "pmos-bots",
  "pmos-contract",
  "pmos-docs",
+ "pmos-entra",
  "pmos-policy",
  "pmos-runtime",
  "pmos-toolserver",
@@ -2010,6 +2029,7 @@ dependencies = [
  "pmos-assertion",
  "pmos-contract",
  "pmos-directory",
+ "pmos-entra",
  "pmos-policy",
  "pmos-runtime",
  "reqwest",

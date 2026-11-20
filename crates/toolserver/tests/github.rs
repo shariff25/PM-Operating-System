@@ -1923,7 +1923,7 @@ async fn an_admin_grant_from_slack_is_refused() {
         assert_eq!((ev.outcome, ev.client), (Outcome::Denied, Client::Bot));
         assert_eq!(ev.detail.as_deref(), Some(code));
     }
-    // The orchestrator's token is no different: it signs nothing either.
+    // The orchestrator's token can't decide a join at all (UM1): refused before the handler.
     let (status, body) = call(
         &e,
         Method::POST,
@@ -1933,8 +1933,8 @@ async fn an_admin_grant_from_slack_is_refused() {
     )
     .await;
     assert_eq!(
-        (status, body["code"].as_str()),
-        (403, Some("admin_not_from_slack"))
+        (status, body["error"].as_str()),
+        (403, Some("this token may not use this endpoint"))
     );
     assert_eq!(e.mock.head(CONTENT_REPO), head, "nothing committed");
     assert!(e.svc.people().user("nia").await.unwrap().is_none());

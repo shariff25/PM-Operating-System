@@ -30,9 +30,35 @@ pub fn kind(rel: &str) -> &'static str {
 }
 
 /// Files an auditor sees listed but may not open: a PM's personal master file, and context
-/// marked `restricted`. An admin opens everything.
+/// marked `restricted` (in any letter case). An admin opens everything. Prefer [`may_read`],
+/// which also fails closed on front matter that doesn't parse.
 pub fn auditor_may_read(kind: &str, sensitivity: Option<&str>) -> bool {
-    kind != "personal_master" && sensitivity != Some("restricted")
+    kind != "personal_master" && !sensitivity.is_some_and(is_restricted_value)
+}
+
+/// `restricted`, ignoring case and surrounding space.
+fn is_restricted_value(v: &str) -> bool {
+    v.trim().eq_ignore_ascii_case("restricted")
+}
+
+/// Is this Markdown text restricted to admins? Its front matter says `sensitivity:
+/// restricted` in any letter case, or **can't be read**: front matter that starts but never
+/// closes, YAML that doesn't parse, or a `sensitivity` that isn't text all fail closed (review
+/// of `b469d5b`, UM3). No front matter at all is not restricted.
+pub fn restricted_text(text: &str) -> bool {
+    let doc = match pmos_contract::frontmatter::split(text) {
+        Ok(doc) => doc,
+        Err(pmos_contract::frontmatter::FrontMatterError::Missing) => return false,
+        Err(_) => return true,
+    };
+    let Ok(v) = serde_norway::from_str::<serde_norway::Value>(doc.yaml) else {
+        return true;
+    };
+    match v.get("sensitivity") {
+        None | Some(serde_norway::Value::Null) => false,
+        Some(serde_norway::Value::String(s)) => is_restricted_value(s),
+        Some(_) => true,
+    }
 }
 
 /// Why reading a file is sensitive, for the audit log.
@@ -69,8 +95,7 @@ pub fn sensitive(rel: &str, text: Option<&str>) -> Option<Sensitive> {
     if kind(rel) == "personal_master" {
         return Some(Sensitive::Personal);
     }
-    let restricted =
-        rel.ends_with(".md") && text.and_then(sensitivity).as_deref() == Some("restricted");
+    let restricted = rel.ends_with(".md") && text.is_some_and(restricted_text);
     restricted.then_some(Sensitive::Restricted)
 }
 
@@ -140,5 +165,40 @@ mod tests {
         assert!(!may_read(false, "master/people/ana/AGENTS.md", None));
         assert!(!may_read(false, "context/products/r.md", Some(restricted)));
         assert!(may_read(false, "context/products/r.md", Some(internal)));
+    }
+
+    /// UM3: the rule fails closed. `Restricted` in any case is restricted; so is front matter
+    /// that never closes, YAML that doesn't parse, or a `sensitivity` that isn't text. A file
+    /// without front matter, or with no `sensitivity`, isn't.
+    #[test]
+    fn the_read_rule_fails_closed() {
+        let rel = "context/products/r.md";
+        for text in [
+            "---\nsensitivity: Restricted\n---\nBody\n",
+            "---\nsensitivity: RESTRICTED \n---\nBody\n",
+            "---\nsensitivity: restricted\ntitle: [unclosed\n---\nBody\n",
+            "---\nsensitivity: restricted\nBody with no closing line\n",
+            "---\nsensitivity: [restricted]\n---\nBody\n",
+            "---\nsensitivity: {level: restricted}\n---\n",
+            "---\n\t: :\n---\n",
+        ] {
+            assert_eq!(
+                sensitive(rel, Some(text)),
+                Some(Sensitive::Restricted),
+                "{text:?}"
+            );
+            assert!(!may_read(false, rel, Some(text)), "{text:?}");
+            assert!(may_read(true, rel, Some(text)));
+        }
+        for text in [
+            "# No front matter\n",
+            "---\ntitle: T\n---\nBody\n",
+            "---\nsensitivity: internal\n---\n",
+            "---\nsensitivity:\n---\n",
+        ] {
+            assert_eq!(sensitive(rel, Some(text)), None, "{text:?}");
+        }
+        assert!(!auditor_may_read("context", Some("Restricted")));
+        assert!(!auditor_may_read("context", Some(" restricted ")));
     }
 }

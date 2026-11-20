@@ -205,6 +205,8 @@ function PeopleFlags({ users, linkable }: { users: OverviewUsers; linkable: bool
   if (users.entra_needs_host.length) rows.push({ key: 'host', icon: 'lock', title: P.needsHost, next: P.needsHostNext, handles: users.entra_needs_host });
   if (users.no_slack.length) rows.push({ key: 'slack', icon: 'message', title: P.noSlack, next: P.noSlackNext, handles: users.no_slack });
   if (users.bots_without_active_owner.length) rows.push({ key: 'bots', icon: 'cpu', title: P.orphanBots, next: P.orphanBotsNext, handles: users.bots_without_active_owner, plain: true });
+  const firstLinks = users.first_links ?? [];
+  if (firstLinks.length) rows.push({ key: 'first-links', icon: 'link', title: P.firstLinks(firstLinks.length), next: P.firstLinksNext, handles: firstLinks.map((l) => l.handle) });
   if (rows.length === 0) return null;
   return (
     <section className="card" aria-labelledby="admin-people">

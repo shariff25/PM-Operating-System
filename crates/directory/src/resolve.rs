@@ -257,6 +257,12 @@ pub enum LinkRefusal {
     Taken,
     /// `422 invalid`.
     Invalid,
+    /// `422 invalid_token`: the tool server's own check of the ID token failed.
+    InvalidToken,
+    /// `403 token_used`: this ID token was already presented for a first link.
+    TokenUsed,
+    /// `403 not_a_member`: the token is a guest's or another identity provider's.
+    NotAMember,
     /// Another refusal a newer tool server sends.
     Other { status: u16, code: Option<String> },
 }
@@ -541,21 +547,22 @@ impl ResolveClient {
     }
 
     /// The first Entra link (`POST /internal/users/{handle}/identities/entra`, `pmos-web`'s
-    /// token only): store `(tid, oid)` for `handle`, whose sign-in name must be
-    /// `sign_in_name` (the ID token's `preferred_username`, never its `email`). The tool
-    /// server re-checks every condition and audits the outcome. Never cached as a refusal;
-    /// a link's user is cached under the handle and the key.
+    /// token only). Sends the raw ID token and the sign-in's `nonce`, never a bare
+    /// `(tid, oid)`: the tool server validates the token itself (signature, issuer, audience,
+    /// time, tenant, `acct`, `idp`) and links the `(tid, oid)` it names to `handle`, whose
+    /// sign-in name must be the token's `preferred_username`. It re-checks every condition
+    /// and audits the outcome. `tid` and `oid` are what `pmos-web` itself read from the token:
+    /// only the cache key here. Never cached as a refusal; a link's user is cached under the
+    /// handle and the key.
     pub async fn link_entra(
         &self,
         handle: &str,
         tid: &str,
         oid: &str,
-        sign_in_name: &str,
+        id_token: &str,
+        nonce: &str,
     ) -> Result<Linked, LinkError> {
         let key = Lookup::entra(tid, oid);
-        let Lookup::Entra { tid, oid } = &key else {
-            unreachable!("Lookup::entra makes an Entra lookup")
-        };
         let request = Request {
             method: Method::Post,
             path: vec![
@@ -567,9 +574,8 @@ impl ResolveClient {
             ],
             query: Vec::new(),
             body: Some(json!({
-                "tid": tid,
-                "oid": oid,
-                "sign_in_name": sign_in_name.trim().to_lowercase(),
+                "id_token": id_token,
+                "nonce": nonce,
             })),
         };
         let reply = match self.transport.send(request).await {
@@ -606,11 +612,53 @@ impl ResolveClient {
             (403, Some("evals_account")) => refused(LinkRefusal::EvalsAccount),
             (409, Some("linked")) => refused(LinkRefusal::Linked),
             (409, Some("taken")) => refused(LinkRefusal::Taken),
+            (422, Some("invalid_token")) => refused(LinkRefusal::InvalidToken),
+            (403, Some("token_used")) => refused(LinkRefusal::TokenUsed),
+            (403, Some("not_a_member")) => refused(LinkRefusal::NotAMember),
             (422, _) => refused(LinkRefusal::Invalid),
             (429, _) => Err(LinkError::RateLimited),
+            (501, _) => {
+                tracing::error!(
+                    "first Entra link: the tool server has no Entra settings (PMOS_ENTRA_TENANT_ID \
+                     and PMOS_ENTRA_CLIENT_ID; docs/entra-sign-in.md)"
+                );
+                Err(LinkError::Unavailable(
+                    "the tool server has no Entra settings",
+                ))
+            }
             (s, _) if (400..500).contains(&s) => refused(LinkRefusal::Other { status: s, code }),
             _ => Err(LinkError::Unavailable("failed")),
         }
+    }
+
+    /// The tenant and client id the tool server validates first-link tokens for
+    /// (`GET /internal/users/entra-link`, `pmos-web`'s token only): `Ok(None)` when it has no
+    /// Entra settings. For `pmos-web`'s `/readyz`, which compares them with its own.
+    pub async fn entra_link_settings(&self) -> Result<Option<(String, String)>, TransportError> {
+        let reply = self
+            .transport
+            .send(Request {
+                method: Method::Get,
+                path: vec!["internal".into(), "users".into(), "entra-link".into()],
+                query: Vec::new(),
+                body: None,
+            })
+            .await?;
+        #[derive(Deserialize)]
+        struct Wire {
+            configured: bool,
+            tenant_id: Option<String>,
+            client_id: Option<String>,
+        }
+        if reply.status != 200 {
+            return Err(TransportError("refused or failed"));
+        }
+        let w: Wire =
+            serde_json::from_slice(&reply.body).map_err(|_| TransportError("unreadable answer"))?;
+        Ok(match (w.configured, w.tenant_id, w.client_id) {
+            (true, Some(t), Some(c)) => Some((t, c)),
+            _ => None,
+        })
     }
 
     /// The answer kept for `lookup`, however old (within [`RETAIN`]), without asking the tool
@@ -920,7 +968,7 @@ mod tests {
             .push(200, json!({"first_link": true, "user": ana("active")}));
         let l = t
             .client
-            .link_entra("ana", tid, oid, " Ana@Example.com ")
+            .link_entra("ana", tid, oid, "the.id.token", "the-nonce")
             .await
             .unwrap();
         assert!(l.first_link);
@@ -929,7 +977,7 @@ mod tests {
         assert_eq!(path, ["internal", "users", "ana", "identities", "entra"]);
         assert_eq!(
             body.unwrap(),
-            json!({"tid": tid, "oid": oid, "sign_in_name": "ana@example.com"})
+            json!({"id_token": "the.id.token", "nonce": "the-nonce"})
         );
         // Cached by the key now.
         t.client.by_entra(tid, oid).await.unwrap();
@@ -943,10 +991,13 @@ mod tests {
             (409, "linked", LinkRefusal::Linked),
             (409, "taken", LinkRefusal::Taken),
             (422, "invalid", LinkRefusal::Invalid),
+            (422, "invalid_token", LinkRefusal::InvalidToken),
+            (403, "token_used", LinkRefusal::TokenUsed),
+            (403, "not_a_member", LinkRefusal::NotAMember),
         ] {
             t.fake.push(status, json!({"code": code}));
             assert_eq!(
-                t.client.link_entra("ana", tid, oid, "a@b.c").await,
+                t.client.link_entra("ana", tid, oid, "t.o.k", "n").await,
                 Err(LinkError::Refused(want.clone())),
                 "{code}"
             );
@@ -954,12 +1005,18 @@ mod tests {
         }
         t.fake.push(429, json!({"code": "resolve_misses"}));
         assert_eq!(
-            t.client.link_entra("ana", tid, oid, "a@b.c").await,
+            t.client.link_entra("ana", tid, oid, "t.o.k", "n").await,
             Err(LinkError::RateLimited)
         );
+        // A tool server without Entra settings: nothing is known, so sign-in fails closed.
+        t.fake.push(501, json!({"code": "not_configured"}));
+        assert!(matches!(
+            t.client.link_entra("ana", tid, oid, "t.o.k", "n").await,
+            Err(LinkError::Unavailable(_))
+        ));
         t.fake.down();
         assert!(matches!(
-            t.client.link_entra("ana", tid, oid, "a@b.c").await,
+            t.client.link_entra("ana", tid, oid, "t.o.k", "n").await,
             Err(LinkError::Unavailable(_))
         ));
     }

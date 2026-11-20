@@ -1,6 +1,6 @@
-//! Two RSA keys generated for these tests only (`openssl genrsa 2048`), never used anywhere
-//! else: A is the mock identity provider's published key, B one it does not publish (or
-//! publishes later). PKCS#1 DER in base64, and each modulus in base64url for the JWKS.
+//! Two RSA keys generated for tests only (`openssl genrsa 2048`), never used anywhere else: A
+//! is the mock identity provider's published key, B one it does not publish (or publishes
+//! later). PKCS#1 DER in base64, and each modulus in base64url for the JWKS.
 
 pub const KEY_A_DER: &str = concat!(
     "MIIEpQIBAAKCAQEA4MKvZf7hQ9BNP/COfHIx6H5LR52nRzOgte3lPKtxRCpP1tDmpAAiXTAlN73IevPIzSNqAOirJfRQ",

@@ -4,6 +4,20 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- Security fixes from the review of `b469d5b` (user database):
+  - **Nobody can link someone else's account to their own Microsoft account.** The tool server
+    now checks the Microsoft ID token of a first sign-in itself, once per token, instead of
+    taking the web app's word; the admin overview lists every first Microsoft sign-in. The
+    tool server gets the web app's tenant and client id (the deploy kit passes them;
+    `docs/runbooks/upgrade.md`).
+  - **An auditor sees nothing of a file they can't open** but its path and status, and a file
+    whose header can't be read counts as restricted.
+  - **The branch-protection check no longer says "verified" when admins are exempt or someone
+    may bypass the review.**
+  - Smaller: only the Slack bot may approve a join or remove a member; a person's old
+    addresses are never given to someone else; user lookups are rate-limited for hits too; a
+    proposal's title can't close an issue; the purges' database exceptions can't be imitated
+    by a look-alike function.
 - **PM OS can now sign people in with a password and an authenticator app**, beside Microsoft
   sign-in or on its own (`PMOS_WEB_PASSWORD_LOGIN=1`): a one-time setup code from an admin,
   a password, then always a code from the app (or a recovery code). The back end and its

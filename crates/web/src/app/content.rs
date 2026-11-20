@@ -119,12 +119,9 @@ async fn file(
         .ok_or_else(ApiError::not_found)?;
     let view = content_admin::view(&rel, path, text);
     if !admin {
-        let sensitivity = view
-            .front_matter
-            .as_ref()
-            .and_then(|f| f.get("sensitivity"))
-            .and_then(Value::as_str);
-        if !content_admin::auditor_may_read(view.kind, sensitivity) {
+        // The one read rule, on the text itself: it fails closed when the front matter
+        // doesn't parse and reads `restricted` in any letter case (UM3).
+        if !pmos_policy::admin::access::may_read(false, &rel, Some(&view.text)) {
             proposal::record_refusal(&state, &signed, Action::ContentFile, "role", 1).await;
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,

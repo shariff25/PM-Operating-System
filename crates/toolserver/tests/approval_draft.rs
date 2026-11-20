@@ -97,6 +97,7 @@ async fn start_with(f: Fixture, mode: Mode) -> Server {
         },
         None,
         PersonClients {
+            entra: None,
             web_token: Some(WEB_TOKEN.into()),
             assertions: Arc::new(Assertions::new(mode, keys).unwrap()),
         },

@@ -74,6 +74,11 @@ pub struct FakeDirectory {
     pub links: Mutex<Vec<String>>,
     /// Conflicts the first-link route audited (`users.identity_conflict`), by target handle.
     pub conflicts: Mutex<Vec<String>>,
+    /// Every first-link body received (`{id_token, nonce}`).
+    pub link_bodies: Mutex<Vec<Value>>,
+    /// What `GET /internal/users/entra-link` answers: the tenant and client id first-link
+    /// tokens are checked for, or `None` (not configured).
+    pub entra_link: Mutex<Option<(String, String)>>,
 }
 
 fn coded(status: StatusCode, code: &str) -> Response {
@@ -160,6 +165,18 @@ impl FakeDirectory {
         }
         Some(match (method.as_str(), path.as_slice()) {
             ("GET", ["internal", "users", "resolve"]) => self.resolve(uri),
+            ("GET", ["internal", "users", "entra-link"]) => {
+                match self.entra_link.lock().unwrap().clone() {
+                    Some((t, c)) => {
+                        Json(json!({"configured": true, "tenant_id": t, "client_id": c}))
+                            .into_response()
+                    }
+                    None => {
+                        Json(json!({"configured": false, "tenant_id": null, "client_id": null}))
+                            .into_response()
+                    }
+                }
+            }
             ("POST", ["internal", "users", handle, "identities", "entra"]) => {
                 self.link(handle, body)
             }
@@ -201,16 +218,36 @@ impl FakeDirectory {
         }
     }
 
-    /// The first link, in the real route's order (`users/link.rs`, `plan`).
+    /// The first link, in the real route's order (`users/link.rs`, `plan`). The body is
+    /// `{id_token, nonce}` as the real route takes it; the fake reads the token's claims
+    /// without checking its signature (the real tool server does: `crates/toolserver/tests/
+    /// entra_link.rs`), and keeps each body for the tests.
     fn link(&self, handle: &str, body: &[u8]) -> Response {
         let b: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        self.link_bodies.lock().unwrap().push(b.clone());
+        let claims = b["id_token"]
+            .as_str()
+            .and_then(|t| t.split('.').nth(1))
+            .and_then(|p| {
+                base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, p).ok()
+            })
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or(Value::Null);
+        if b.as_object().map(|o| o.len()) != Some(2)
+            || b["nonce"].as_str().is_none()
+            || claims["nonce"] != b["nonce"]
+        {
+            return coded(StatusCode::UNPROCESSABLE_ENTITY, "invalid_token");
+        }
+        let lower = |v: &Value| v.as_str().map(|s| s.trim().to_lowercase());
         let (Some(tid), Some(oid), Some(name)) = (
-            b["tid"].as_str(),
-            b["oid"].as_str(),
-            b["sign_in_name"].as_str(),
+            lower(&claims["tid"]),
+            lower(&claims["oid"]),
+            lower(&claims["preferred_username"]),
         ) else {
-            return coded(StatusCode::UNPROCESSABLE_ENTITY, "invalid");
+            return coded(StatusCode::UNPROCESSABLE_ENTITY, "invalid_token");
         };
+        let (tid, oid, name) = (tid.as_str(), oid.as_str(), name.as_str());
         let mut users = self.users.lock().unwrap();
         let Some(i) = users
             .iter()

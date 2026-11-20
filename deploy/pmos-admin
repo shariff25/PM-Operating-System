@@ -302,7 +302,9 @@ case "$cmd" in
       check console http://127.0.0.1:8760/healthz
     fi
     if compose --profile web ps --status running --services 2>/dev/null | grep -qx web; then
-      check web http://127.0.0.1:8770/healthz
+      # /readyz: with Entra sign-in on it includes `entra_link`, whether the tool server
+      # validates first-link tokens for the same tenant and client id (docs/entra-sign-in.md).
+      check web http://127.0.0.1:8770/readyz
     fi
     if compose exec -T docs curl -fsS -m 5 http://127.0.0.1:8730/readyz >/dev/null 2>&1; then
       row docs ok "ready"

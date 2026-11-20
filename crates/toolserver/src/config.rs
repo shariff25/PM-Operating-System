@@ -194,6 +194,47 @@ pub struct Config {
     /// that seeded user, as the host would, and write it to that new file (mode 0600). Refused
     /// with a database, live connectors, no seed or no vault key.
     pub dev_password_setup: Option<(String, PathBuf)>,
+    /// The tenant and application whose ID tokens a first Entra link must carry
+    /// (`docs/entra-sign-in.md`): `PMOS_ENTRA_TENANT_ID` and `PMOS_ENTRA_CLIENT_ID` (the same
+    /// values as `pmos-web`'s `PMOS_WEB_ENTRA_*`; the deploy kit passes them through), and
+    /// `PMOS_ENTRA_AUTHORITY` (default Microsoft's public cloud; loopback for tests). `None`
+    /// without a client id: the first-link route answers `501 not_configured`. The tenant id
+    /// alone is what the host commands (`users set-entra`) read.
+    pub entra: Option<pmos_entra::Tenant>,
+}
+
+/// The tool server's Entra settings: the first-link route validates ID tokens for this tenant
+/// and client id itself. A client id or authority without a tenant id is an error; a tenant
+/// id alone (the host commands' setting) leaves the route off.
+pub fn entra_settings(
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<pmos_entra::Tenant>, String> {
+    let set = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+    let tenant = set("PMOS_ENTRA_TENANT_ID");
+    let client = set("PMOS_ENTRA_CLIENT_ID");
+    let authority = set("PMOS_ENTRA_AUTHORITY");
+    match (tenant, client) {
+        (Some(t), Some(c)) => pmos_entra::Tenant::from_settings(
+            [
+                "PMOS_ENTRA_TENANT_ID",
+                "PMOS_ENTRA_CLIENT_ID",
+                "PMOS_ENTRA_AUTHORITY",
+            ],
+            &t,
+            &c,
+            authority.as_deref(),
+        )
+        .map(Some),
+        (None, Some(_)) => Err(
+            "PMOS_ENTRA_CLIENT_ID needs PMOS_ENTRA_TENANT_ID (the same values as pmos-web's \
+             PMOS_WEB_ENTRA_TENANT_ID and PMOS_WEB_ENTRA_CLIENT_ID)"
+                .into(),
+        ),
+        (_, None) if authority.is_some() => {
+            Err("PMOS_ENTRA_AUTHORITY needs PMOS_ENTRA_TENANT_ID and PMOS_ENTRA_CLIENT_ID".into())
+        }
+        (_, None) => Ok(None),
+    }
 }
 
 impl Config {
@@ -470,6 +511,7 @@ impl Config {
             users_deactivations_per_hour,
             password_keys,
             dev_password_setup,
+            entra: entra_settings(&get)?,
         })
     }
 }
@@ -634,15 +676,33 @@ fn live_config(get: &impl Fn(&str) -> Option<String>) -> Result<LiveConfig, Stri
         },
         github,
         endpoints: Endpoints {
-            atlassian_auth: get("PMOS_ATLASSIAN_AUTH_URL").unwrap_or(defaults.atlassian_auth),
-            atlassian_api: get("PMOS_ATLASSIAN_API_URL").unwrap_or(defaults.atlassian_api),
-            slack: get("PMOS_SLACK_URL").unwrap_or(defaults.slack),
-            github_auth: get("PMOS_GITHUB_AUTH_URL").unwrap_or(defaults.github_auth),
-            github_api: get("PMOS_GITHUB_URL").unwrap_or(defaults.github_api),
+            atlassian_auth: endpoint(get, "PMOS_ATLASSIAN_AUTH_URL", defaults.atlassian_auth)?,
+            atlassian_api: endpoint(get, "PMOS_ATLASSIAN_API_URL", defaults.atlassian_api)?,
+            slack: endpoint(get, "PMOS_SLACK_URL", defaults.slack)?,
+            github_auth: endpoint(get, "PMOS_GITHUB_AUTH_URL", defaults.github_auth)?,
+            github_api: endpoint(get, "PMOS_GITHUB_URL", defaults.github_api)?,
         },
         docs_url: need("PMOS_DOCS_URL")?,
         docs_token: Secret::new(need("PMOS_DOCS_TOKEN")?),
     })
+}
+
+/// A connector's API or sign-in base override (`PMOS_GITHUB_URL` and the like; for pointing
+/// at mocks), else `default`. Every one of these carries a PM's token or the app's secret, so
+/// it must be `https`; `http` only to a loopback host (`localhost`, `127.0.0.0/8`, `::1`),
+/// which is what the tests' mocks use (review of `b469d5b`, L10).
+fn endpoint(
+    get: &impl Fn(&str) -> Option<String>,
+    var: &str,
+    default: String,
+) -> Result<String, String> {
+    match get(var).filter(|v| !v.trim().is_empty()) {
+        None => Ok(default),
+        Some(v) if pmos_entra::secure_or_loopback(v.trim()) => Ok(v.trim().to_string()),
+        Some(_) => Err(format!(
+            "{var} must be an https:// URL (http:// only to a loopback host, for tests)"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -941,6 +1001,85 @@ mod tests {
             .collect();
         v.extend_from_slice(extra);
         v
+    }
+
+    /// L10: a connector base that carries tokens is https; http only to loopback (mocks).
+    #[test]
+    fn connector_bases_are_https_or_loopback() {
+        let key = KeyRing::generate_spec("k1");
+        let base = live_base(&key);
+        for var in [
+            "PMOS_GITHUB_URL",
+            "PMOS_GITHUB_AUTH_URL",
+            "PMOS_ATLASSIAN_AUTH_URL",
+            "PMOS_ATLASSIAN_API_URL",
+            "PMOS_SLACK_URL",
+        ] {
+            for bad in [
+                "http://api.github.example",
+                "http://10.0.0.5:8080",
+                "ftp://x",
+            ] {
+                let err = cfg(&with(&base, &[(var, bad)])).unwrap_err();
+                assert!(
+                    err.contains(var) && err.contains("https"),
+                    "{var} {bad}: {err}"
+                );
+            }
+            for good in [
+                "https://ghe.example.com/api/v3",
+                "http://127.0.0.1:9",
+                "http://localhost:8080",
+                "http://[::1]:9",
+            ] {
+                assert!(cfg(&with(&base, &[(var, good)])).is_ok(), "{var} {good}");
+            }
+        }
+    }
+
+    /// U1: the first link's Entra settings: both ids, or the tenant alone (host commands),
+    /// never a client id or an authority without a tenant.
+    #[test]
+    fn entra_settings_for_the_first_link() {
+        let key = KeyRing::generate_spec("k1");
+        let base = live_base(&key);
+        let tenant = (
+            "PMOS_ENTRA_TENANT_ID",
+            "11111111-2222-3333-4444-555555555555",
+        );
+        let client = (
+            "PMOS_ENTRA_CLIENT_ID",
+            "0b7f0c6e-1111-4222-8333-444455556666",
+        );
+        assert!(cfg(&base).unwrap().entra.is_none());
+        assert!(cfg(&with(&base, &[tenant])).unwrap().entra.is_none());
+        let t = cfg(&with(&base, &[tenant, client])).unwrap().entra.unwrap();
+        assert_eq!(t.tenant_id, tenant.1);
+        assert_eq!(t.client_id, client.1);
+        assert_eq!(t.authority, pmos_entra::DEFAULT_AUTHORITY);
+        for (pairs, want) in [
+            (vec![client], "needs PMOS_ENTRA_TENANT_ID"),
+            (
+                vec![("PMOS_ENTRA_AUTHORITY", "http://127.0.0.1:9")],
+                "needs PMOS_ENTRA_TENANT_ID",
+            ),
+            (
+                vec![("PMOS_ENTRA_TENANT_ID", "common"), client],
+                "multi-tenant",
+            ),
+            (vec![tenant, ("PMOS_ENTRA_CLIENT_ID", "app")], "GUID"),
+            (
+                vec![
+                    tenant,
+                    client,
+                    ("PMOS_ENTRA_AUTHORITY", "http://idp.example.com"),
+                ],
+                "https unless",
+            ),
+        ] {
+            let err = cfg(&with(&base, &pairs)).unwrap_err();
+            assert!(err.contains(want), "{pairs:?}: {err}");
+        }
     }
 
     #[test]
