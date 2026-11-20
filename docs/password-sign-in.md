@@ -235,10 +235,14 @@ In the deploy kit, `deploy/compose.yaml` passes `PMOS_WEB_PASSWORD_LOGIN`,
 --web` starts the web app with password sign-in as its provider too.
 `pmos-admin users password-setup <handle>` issues a code on the host.
 
+## The screens
+
+Built in `web/` from `docs/web-api.md`: the sign-in card with the code step, the setup page
+(`#/setup`, the QR code drawn in the browser), "Sign-in and security" (`#/security`: change
+password, new recovery codes) and the Team page's setup or reset code action.
+
 ## Not built
 
-- **The screens** (sign-in form, setup wizard, QR code, recovery codes, change password, the Team
-  page's button): a front-end slice built from `docs/web-api.md`.
 - **Self-service reset by email**, by design: there is no email sending.
 - **WebAuthn or passkeys**; only TOTP and recovery codes.
 - **Breached-password lookups** (for example Have I Been Pwned): only the built-in list, so no

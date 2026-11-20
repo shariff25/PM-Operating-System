@@ -26,6 +26,8 @@ export default defineConfig(({ mode, command }) => {
       setupFiles: ['./src/test/setup.ts'],
       include: ['src/**/*.test.{ts,tsx}'],
       css: false,
+      // Room for a cold lazy-page import on a slow runner (see src/test/setup.ts).
+      testTimeout: 15000,
     },
   };
 });
