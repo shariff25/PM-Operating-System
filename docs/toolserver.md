@@ -238,8 +238,8 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/memory/repo?user=` | service or bot token | `{repo, verified_at}`, or `404` |
 | `POST /internal/members/requests` `{slack_id, email, name}` | service or bot token | A request to join: `201 {request}`, or `200 {request}` with the one already pending for that Slack id. `409 already_member`, `422 bad_request`, `429 too_many_pending` (past 20) |
 | `GET /internal/members/requests?status=` | service or bot token | `{requests: […]}`, oldest first; `status` is `pending`, `approved`, `rejected` or `failed` |
-| `POST /internal/members/requests/{id}/decision` `{decision, decided_by, handle?, roles?}` | service or bot token | `approve` or `reject`, by an active `admin` in the user database (`403 not_admin`). `roles` may be `pm` only (both tokens are unsigned): `admin` is `403 admin_not_from_slack`, any other `403 role_not_from_slack`, audited as `denied`, the request still pending. See **Members**. `200 {request}` (the user is created first; when the personal bot couldn't be committed, `commit` is null and `error` says why); `409 already_decided` with `request`; `422 bad_handle`; `409 already_member` |
-| `POST /internal/members/{handle}/remove` `{decided_by}` | service or bot token | Admin only; not oneself (`403 self_removal`). `200 {handle, commit}`, `404 not_a_member`, `409 owns_bots` if they still own a team bot |
+| `POST /internal/members/requests/{id}/decision` `{decision, decided_by, handle?, roles?}` | bot token only (the service token gets `403`: review of `b469d5b`, UM1) | `approve` or `reject`, by an active `admin` in the user database (`403 not_admin`). `roles` may be `pm` only (the token is unsigned): `admin` is `403 admin_not_from_slack`, any other `403 role_not_from_slack`, audited as `denied`, the request still pending. See **Members**. `200 {request}` (the user is created first; when the personal bot couldn't be committed, `commit` is null and `error` says why); `409 already_decided` with `request`; `422 bad_handle`; `409 already_member` |
+| `POST /internal/members/{handle}/remove` `{decided_by}` | bot token only (UM1) | Admin only; not oneself (`403 self_removal`). `200 {handle, commit}`, `404 not_a_member`, `409 owns_bots` if they still own a team bot |
 | `GET /internal/onboarding?user=` or `?slack_id=` | service or bot token | A PM's setup checklist: `member`, `handle`, `admin`, `linked` (`atlassian`, `slack`, `github`), `memory_repo`, `personal_bot` (in the loaded content), and for a non-member by Slack id, `pending_request` |
 | `GET /internal/admin/audit?user=&before=&limit=&actor=&action=&outcome=&from=&to=&purpose=` | service or web token | The whole audit log, newest first: `{events: [...], next}`. Needs the viewer `user` to have `view-audit-log` (`export-audit` with `purpose=export`). See **Admin reads** |
 | `GET /internal/admin/accounts?user=` | service or web token | `{linking, members: [{handle, accounts: {atlassian, slack, github}}]}`, booleans only. `view-audit-log` or `manage-members` |
@@ -247,12 +247,12 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/admin/overview?user=` | service or web token | `{since, pending_drafts, held_drafts, approved, rejected, denied, retention_days, oldest_event_at, last_purge, users}`: pending items across the team now, audit outcomes over 7 days, audit retention (see **Audit retention**) and the user database's flags (below). `view-audit-log` or `manage-members` |
 | `POST /internal/admin/proposals/open?user=` `{kind, title, reason, base_sha, changes}` | web token **and** a signed assertion for `user`, in every mode | Check an admin's policy or content change again and open it as a pull request with their own linked GitHub token. `201 {number, url, author, branch, base, files, widening, allowance_changes, stale_check, labels_added}`. See **Admin proposals** |
 | `GET /internal/admin/proposals?user=&kind=policy\|content` | the same | Open proposals, read with the viewer's own GitHub token: `{repo, github: "linked", proposals: [...]}`, or `{repo, github: "not_linked", proposals: []}`. `view-policies` / `view-content` |
-| `GET /internal/admin/protection?user=` | the same | `{configured, branch, required_reviews, verified, source?, github}`: whether `PMOS_CONTENT_BRANCH` requires reviews, as the viewer's token can read it. Best effort, never an error. `view-policies` or `view-content` |
+| `GET /internal/admin/protection?user=` | the same | `{configured, branch, required_reviews, verified, admins_enforced, bypass_allowed, source?, github}`: whether `PMOS_CONTENT_BRANCH` requires reviews, as the viewer's token can read it. `verified` is `true` only when reviews are required and the answer showed admins bound (`enforce_admins`, or a ruleset with no bypass actor) and nobody on a bypass list, or when no review is required at all; a setting the answer doesn't expose is `null` and never verified (UM4). Best effort, never an error. `view-policies` or `view-content` |
 | `POST /internal/admin/actions?user=` `{action, outcome, detail, count, target?}` | the same | `pmos-web` records an admin refusal or an admin's sensitive read: `200 {recorded: true}`; `503 audit_unavailable` if it can't be recorded (pmos-web then serves nothing) |
 | `POST /internal/admin/events[?user=]` `{action, provider, reason?, attempt?, member?}` | web token only | A sign-in event from `pmos-web`: `web.sign_in` or `web.sign_out` (for the member named as `user=`, with a user assertion for them), `web.sign_in_refused` or `users.identity_conflict` (no `user=`). Fixed values only. See **Sign-in events** |
 | `GET /internal/directory` (+ `If-None-Match`) | service or bot token | Every user in the user database, `{version, users: [...]}`, with `ETag: "<version>"`; `304` when it matches. See **The user database's read API** |
-| `GET /internal/users/resolve?by=entra&tid=&oid=` / `?by=sign_in_name&name=` / `?by=handle&handle=` | web or console token, no assertion | One user, or `404`; `429 resolve_misses` past 20 misses a minute. See **The user database's read API** |
-| `POST /internal/users/{handle}/identities/entra` `{tid, oid, sign_in_name}` | web token, no assertion | The first Entra link. See **The user database's read API** |
+| `GET /internal/users/resolve?by=entra&tid=&oid=` / `?by=sign_in_name&name=` / `?by=handle&handle=` | web or console token, no assertion | One user, or `404`; `429 resolve_misses` past 20 misses a minute, `429 resolve_rate` past 600 hits a minute. See **The user database's read API** |
+| `POST /internal/users/{handle}/identities/entra` `{id_token, nonce}` | web token, no assertion | The first Entra link, from an ID token this server validates itself; `GET /internal/users/entra-link` (web token) says for which tenant and client. See **The user database's read API** |
 | `GET /internal/admin/users?user=` | web token (assertion as on the admin reads) | Every user, as an admin or an auditor may see them. See **The Admin API** |
 | `POST /internal/admin/users`, `PUT …/{handle}/roles`, `PUT …/{handle}/fields`, `POST …/{handle}/sign-in-name/confirm`, `POST …/{handle}/deactivate`, `POST …/{handle}/reactivate`, `DELETE …/{handle}/identities/{kind}`, `PUT /internal/admin/reviewers/{reviewer}` (all `?user=<admin>`) | web token **and** a signed assertion for `user`, and assertion `require` (else `503 assertion_required`) | User and role writes. See **The Admin API** |
 | `GET /internal/console/members?user=` | console token (assertion as on its approvals reads) | `{handles}` for an active admin's Approvals screen. See **The Admin API** |
@@ -1077,7 +1077,7 @@ not a new request.
 **Approving** (since slice U3, `docs/user-database-spec.md` §4) first **creates the user in the
 database** (`active`, the display name from the request, cleaned; the Slack identity; the
 request's email as both `sign_in_name` and `atlassian_email`), so the person can use PM OS at
-once. The bot and service tokens both name the deciding admin unsigned, so the join gets
+once. Only the Slack bot's token may decide (the service token gets `403` since the review of `b469d5b`, UM1); it names the deciding admin unsigned, so the join gets
 **`pm` only**: `admin` is `403 admin_not_from_slack` (was `admin_by_pull_request`), any other
 role `403 role_not_from_slack`, audited as `denied`, the request still pending, nothing
 written. The sign-in name came through an unsigned client, so it is **unconfirmed**: the
@@ -1163,7 +1163,10 @@ longer writes one and no other service reads one either.
   `resolve_miss_warning` (clients past `resolve_miss_warning_threshold`, 100, resolve misses in
   an hour, counted in this process since it started); `deactivations_last_hour`,
   `deactivation_limit`, `deactivation_limit_reached`, `deactivation_grace_hours`;
-  `bots_without_active_owner`. Handles and counts only, never an address, Slack id or `oid`.
+  `bots_without_active_owner`; and, since the review of `b469d5b` (U1), `first_links`: each
+  `users.identity_link` the first-link route recorded in the last 7 days, `{handle, at,
+  provider: "entra"}`, newest first (`null` when the audit log can't be read back). Handles
+  and counts only, never an address, Slack id or `oid`.
   `pmos-web` serves them field by field (`docs/web-api.md`, `GET /api/admin/overview`).
 
 **Account linking** checks the account against the database (`src/oauth.rs`): the person must
@@ -1295,7 +1298,8 @@ token is `403`, none is `401`.
 | --- | --- | --- |
 | `GET /internal/directory` | service (the runtime), bot (Slack) | `{version, users: [...]}`, every user, deactivated ones included. `ETag: "<version>"` (strong; the database's `directory_version`, bumped by every committed change to users, roles, identities or the pilot exception); `If-None-Match` with it (also `W/"…"`, a list, or `*`) answers `304` with no body. `Cache-Control: private, no-cache` |
 | `GET /internal/users/resolve?by=entra&tid=&oid=` / `?by=sign_in_name&name=` / `?by=handle&handle=` | web, console | One user, or `404 not_found`. `by=sign_in_name` matches the stored lower-case name (`name` is trimmed and lower-cased). A malformed lookup (unknown `by`, a `tid`/`oid` that isn't a GUID, a name that isn't an address, a handle that can't exist) is `422 invalid` and isn't a miss |
-| `POST /internal/users/{handle}/identities/entra` `{tid, oid, sign_in_name}` | web | The first Entra link (below): `200 {first_link, user}` (`first_link: false` when the user already had exactly this key: nothing written) |
+| `POST /internal/users/{handle}/identities/entra` `{id_token, nonce}` | web | The first Entra link (below), from the raw ID token, which this server validates itself: `200 {first_link, user}` (`first_link: false` when the user already had exactly this key: nothing written). `501 not_configured` without `PMOS_ENTRA_TENANT_ID` and `PMOS_ENTRA_CLIENT_ID` |
+| `GET /internal/users/entra-link` | web | `{configured, tenant_id, client_id}`: the tenant and application first-link tokens are validated for (`null`s and `false` without them). `pmos-web`'s `/readyz` compares them with its own (`entra_link`) |
 
 **Projections** (fixed in code, tested field by field):
 
@@ -1313,17 +1317,39 @@ caller checks `status` first. Display names are untrusted text (render as plain 
 **No user assertion.** `resolve` and the first link are how a person gets a session, so there
 is no signed-in subject to assert (spec §2); the routes answer the same in every assertion
 mode and don't read `X-Pmos-Assertion`. What bounds a stolen web or console token instead:
-one user per call, no addresses, and the **miss limit**. Each client may get at most 20
-`404`s in any rolling minute (from `resolve`, and for `pmos-web` from the first-link route);
-past that a miss answers `429 {code: "resolve_misses"}` with `Retry-After`, and hits keep
-being answered. Windows are per client (web and console apart) and in process. Every miss is
+one user per call, no addresses, and two limits. The **miss limit**: each client may get at
+most 20 misses in any rolling minute (`404`s from `resolve`, and for `pmos-web` every refusal
+of the first-link route, not only its `404`s: review of `b469d5b`, UM2); past that a miss
+answers `429 {code: "resolve_misses"}` with `Retry-After`. The **hit limit** (UM2): at most
+600 `resolve` answers that found someone, per client, in any rolling minute; past that `429
+{code: "resolve_rate"}` with `Retry-After`. 600 is generous on purpose: `pmos-web` and the
+console cache each answer 10 seconds per person, so a signed-in person costs at most 6 a
+minute, and 600 covers 100 people active at once (the pilot is a few dozen) with room for
+sign-ins; a stolen token can confirm at most 600 names, handles or `oid`s a minute. Windows
+are per client (web and console apart) and in process. Every miss is
 logged with its kind (`entra`, `sign_in_name`, `handle`, `first_link`), never the value; more
 than 100 in an hour from one client logs a warning, and the admin overview shows it
 (`resolve_miss_warning`, slice U5a).
 
-**The first Entra link** (spec §7 step 2). One transaction, under the users lock, re-reads the
-directory and checks: the user exists and `sign_in_name` (the token's `preferred_username`,
-never `email`) is their stored sign-in name, else `404 not_found` (a miss, as above); they
+**The first Entra link** (spec §7 step 2). Since the review of `b469d5b` (U1) the body is
+`{id_token, nonce}`, nothing else (anything more, or the old `{tid, oid, sign_in_name}`, is
+`422 invalid`): the raw ID token Microsoft issued to `pmos-web` and the `nonce` of that
+sign-in. The route **validates the token itself** (`pmos_entra::Verifier`, the one copy of the
+rules `pmos-web` applies): RS256, signed by a key in the tenant's JWKS (from the tenant's
+OpenID configuration, cached a day, refetched on an unknown `kid` at most once a minute, a
+failed fetch not retried for 5 seconds, 4 seconds per fetch), `iss` the tenant's v2.0
+issuer, `aud` exactly `PMOS_ENTRA_CLIENT_ID`, `exp`/`nbf`/`iat` within 60 seconds, the
+`nonce`, `tid` = `PMOS_ENTRA_TENANT_ID`, `oid` a GUID, `acct` `0`, `idp` this tenant or
+absent. A token that fails is `422 invalid_token` (`422 entra_misconfigured` without `acct`,
+`403 not_a_member` for a guest or another identity provider); the tenant's keys unreachable is
+`503 entra_unavailable` (nothing linked: fail closed). Each token is good for **one** first
+link: its `(oid, iat)` is remembered until it expires, and the same token again is `403
+token_used` (in process, like the miss windows: a restart forgets, leaving at most a token's
+remaining hour). The `(tid, oid)` and the sign-in name come only from the validated token; a
+token with no usable `preferred_username` is `404 not_found`. Every refusal counts as a miss
+and is audited. Then one transaction, under the users lock, re-reads the directory and
+checks: the user exists and the token's `preferred_username` (never `email`) is their stored
+sign-in name, else `404 not_found`; they
 have no Entra identity yet (`409 linked` if a different one; the same key is `200` with
 `first_link: false`); no one else holds the key (`409 taken`); they are active (`403
 not_active`), not the `evals` account (`403 evals_account`), hold neither `admin` nor
@@ -1640,6 +1666,8 @@ cargo run -p pmos-toolserver
 | `PMOS_ASSERTION_KEYS` | none | `web:toolserver:<kid>:<base64>[:<kid>:<base64>],console:toolserver:…` (`docs/user-assertion.md`, Keys). A malformed list, a key under 32 bytes, or another service's pair refuses to start, in every mode |
 | `PMOS_CONNECTORS` | required | `live` for real Atlassian and Slack with each PM's own token; `fake` for fixture data (dev, tests, and everything before Gate 1). Either way, only active users in the user database (a seed in dev) may have sessions |
 | `PMOS_USERS_DEACTIVATIONS_PER_HOUR` | `3` | How many people the web app and Slack together may deactivate in any rolling hour (1 to 10); past it, `429 deactivation_limit` and host commands only (see **Deactivation**) |
+| `PMOS_ENTRA_TENANT_ID`, `PMOS_ENTRA_CLIENT_ID` | none | The Entra tenant and application (GUIDs; the same as `pmos-web`'s `PMOS_WEB_ENTRA_*`): the first-link route validates ID tokens for them itself (see **The user database's read API**). Both, or the tenant alone (the host commands' setting: the route then answers `501 not_configured`); a client id without a tenant refuses to start |
+| `PMOS_ENTRA_AUTHORITY` | `https://login.microsoftonline.com` | The authority the tenant's discovery document and keys are fetched from: an origin, `https` unless loopback (tests) |
 | `PMOS_USERS_SEED` | unset | Development and eval stacks only (refused with a database or live connectors): a file in the import's shape (a `members:` list), outside `PMOS_CONTENT_ROOT`, loaded into the in-memory user database at start-up; it must name an admin |
 | `PMOS_DATABASE_URL` | required | Postgres for every store. `PMOS_DEV=1` without it keeps everything in memory. |
 | `PMOS_AUDIT_LOG` | none | Also writes audit events to this JSON-lines file, for shipping off-box |
@@ -1661,11 +1689,11 @@ With `PMOS_CONNECTORS=live`:
 | `PMOS_ATLASSIAN_SITE` | none | Needed only if a grant covers several sites |
 | `PMOS_SLACK_CLIENT_ID`, `PMOS_SLACK_CLIENT_SECRET` | required | From the internal Slack app |
 | `PMOS_SLACK_SCOPES` | search (`search:read.public`, `.private`, `.im`, `.mpim`), history (`channels:history`, `groups:history`, `im:history`, `mpim:history`), channel info and members for the audience check (`channels:read`, `groups:read`, `mpim:read`, `im:read`) and `chat:write` | Requested as `user_scope` only. A PM linked before the `:read` scopes were added must link Slack again: until then the audience check answers `503 audience_unavailable` ("reconnect Slack") |
-| `PMOS_ATLASSIAN_AUTH_URL`, `PMOS_ATLASSIAN_API_URL`, `PMOS_SLACK_URL` | the real hosts | For pointing at mocks |
+| `PMOS_ATLASSIAN_AUTH_URL`, `PMOS_ATLASSIAN_API_URL`, `PMOS_SLACK_URL` | the real hosts | For pointing at mocks. `https://` only; `http://` only to a loopback host (review of `b469d5b`, L10), else the server refuses to start |
 | `PMOS_GITHUB_CLIENT_ID`, `PMOS_GITHUB_CLIENT_SECRET` | none | From the GitHub App (see **GitHub**). Set both or neither; without them GitHub linking, `PMOS_MEMORY=github` and approving members are off |
 | `PMOS_GITHUB_ORG` | required with GitHub | Your GitHub org's login. Memory repos and the content repo must be in it |
-| `PMOS_GITHUB_URL` | `https://api.github.com` | API base, for mocks |
-| `PMOS_GITHUB_AUTH_URL` | `https://github.com` | `/login/oauth/authorize` and `/login/oauth/access_token`, for mocks |
+| `PMOS_GITHUB_URL` | `https://api.github.com` | API base, for mocks. `https://`, or `http://` to loopback only (L10) |
+| `PMOS_GITHUB_AUTH_URL` | `https://github.com` | `/login/oauth/authorize` and `/login/oauth/access_token`, for mocks. `https://`, or `http://` to loopback only (L10) |
 | `PMOS_CONTENT_REPO` | none | `org/name` of the content repo, in `PMOS_GITHUB_ORG`. Required for approving and removing members, and for admin proposals |
 | `PMOS_CONTENT_BRANCH` | `main` | The branch member commits go to, and admin proposals are made on |
 | `PMOS_CONTENT_DIR` | `content` | Where the content root sits in that repo (`.` for its root, only with `PMOS_PROPOSALS=off`) |

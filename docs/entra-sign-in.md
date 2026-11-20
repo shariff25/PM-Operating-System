@@ -41,8 +41,31 @@ Object ID) for the host command below.
 | `PMOS_WEB_ENTRA_AUTHORITY` | Optional, default `https://login.microsoftonline.com`. For tests (a mock identity provider) or a sovereign cloud. An origin; `https` unless loopback. |
 | `PMOS_TOOLSERVER_URL`, `PMOS_WEB_TOOLSERVER_TOKEN` | The tool server and `pmos-web`'s own token there (`PMOS_WEB_TOKEN`): the user database is asked with it. |
 
-The tool server's host commands use `PMOS_ENTRA_TENANT_ID` (the same tenant) for the links the
-host sets.
+**The tool server needs the tenant and client id too** (since the review of `b469d5b`, U1): it
+validates the ID token of a first link itself rather than take `pmos-web`'s word for who signed
+in (below, "How a sign-in is decided", step 2).
+
+| Tool server variable | What it is |
+| --- | --- |
+| `PMOS_ENTRA_TENANT_ID` | The same tenant id as `PMOS_WEB_ENTRA_TENANT_ID`. The host commands read it too, for the links the host sets. |
+| `PMOS_ENTRA_CLIENT_ID` | The same client id as `PMOS_WEB_ENTRA_CLIENT_ID`: the only `aud` a first-link token may carry. Never the client secret: the tool server doesn't need it. |
+| `PMOS_ENTRA_AUTHORITY` | Optional, as `PMOS_WEB_ENTRA_AUTHORITY`. |
+
+The tool server refuses to start with a client id or an authority but no tenant id; with the
+tenant id alone (the host commands' setting) the first-link route answers `501
+not_configured`. It fetches the tenant's discovery document and JWKS itself (cached a day; an
+unknown `kid` refetches at most once a minute; a failed fetch isn't retried for 5 seconds; 4
+seconds per fetch; anything it can't fetch fails closed), so it needs the same outbound access
+to the authority as `pmos-web`.
+
+**Choice: `pmos-web` reports a missing or different tool server setting at `/readyz`; it doesn't
+refuse to start.** At start-up the tool server may not be up yet, and a check then would race
+the compose order. With Entra on, `GET /readyz` asks `GET /internal/users/entra-link` and adds
+`entra_link: ok` only when the tool server validates for the same tenant and client id;
+otherwise `entra_link: down` (and `503`), with the reason in `pmos-web`'s log
+(`pmos-admin status` reads `/readyz`). A first sign-in that reaches a tool server without the
+settings is refused `reason=users_unavailable` and logged as an error; known identities keep
+signing in.
 
 Start-up rules:
 
@@ -150,8 +173,22 @@ Then the user database (`docs/user-database-spec.md` §7):
    overview counts.
 2. **First link:** nobody has that `(tid, oid)`. `resolve?by=sign_in_name` with the token's
    `preferred_username` only, **never `email`**; no such user is `reason=not_a_member`. Found:
-   `POST /internal/users/{handle}/identities/entra {tid, oid, sign_in_name}`, where the tool
-   server re-checks everything in one transaction and audits the outcome. Its refusals:
+   `POST /internal/users/{handle}/identities/entra {id_token, nonce}`: the **raw ID token**
+   Microsoft issued and this flow's `nonce`, never a bare `(tid, oid)` or a name. The tool
+   server validates the token itself with the same rules (one copy, `crates/entra`: signature
+   against the tenant's keys, `iss`, `aud` = its `PMOS_ENTRA_CLIENT_ID`, time, `nonce`, `tid` =
+   its `PMOS_ENTRA_TENANT_ID`, `oid`, `acct`, `idp`), takes the `(tid, oid)` and
+   `preferred_username` from the validated token only, accepts each token for **one** first
+   link (`(oid, iat)` remembered until the token expires; again is `403 token_used`), and then
+   re-checks everything in one transaction and audits the outcome. So the web token alone can
+   no longer link someone's account to a Microsoft account of the caller's choosing: the
+   takeover the review of `b469d5b` found (U1) needs a token the tenant signed naming the
+   victim's sign-in name. Every first link is audited (`users.identity_link`, the person as
+   actor) and listed on the admin overview (`users.first_links`: handle, time, provider; never
+   the `oid`). Its token refusals: `invalid_token` → `reason=failed` (logged as an error: the
+   two servers disagree), `not_a_member` and `token_used` → `reason=not_a_member`, the tenant's
+   keys unreachable → `reason=users_unavailable`. Every refusal counts against `pmos-web`'s
+   miss limit. Its other refusals:
    `not_active` → `reason=deactivated`; `sign_in_unconfirmed` (a Slack joiner whose name no
    admin has confirmed) → `reason=sign_in_unconfirmed`; `host_only` (an Admin or Auditor) →
    `reason=entra_needs_host`; `linked` or `taken` (the name's user already has a different
@@ -183,6 +220,20 @@ session ends (`403 entra_needs_host`) within 10 seconds, until the host confirms
   else is `503 users_unavailable` (`docs/web-api.md`, "Sign-in and safety").
 - A session from before slice U4c (an Entra session with no `oid`) ends on its next request:
   sign in again.
+
+### What still rests on `pmos-web`'s word
+
+After U1 the tool server checks the token of every **first** link. Later sign-ins, and every
+request on a session, are `pmos-web`'s: it validates the token, holds the session, and asks
+`resolve?by=entra&tid=&oid=` with the key it stored. A stolen web token can still look up
+whether a `(tid, oid)` or a sign-in name is someone's (at most 20 misses and 600 hits a minute,
+no address in any answer), and a compromised `pmos-web` can still act as anyone it can name: it
+holds the assertion keys and signs user assertions for any user to the tool server and the
+runtime (`docs/user-assertion.md`, "What this does and does not fix"; spec §11, "Compromised
+web backend"). What it can no longer do is **change who a Microsoft account belongs to**:
+linking needs a token the tenant signed, used once. Closing the rest would mean the tool server
+validating every sign-in and issuing the sessions itself, a redesign of sessions this fix
+doesn't attempt.
 
 ## The flow
 
@@ -237,7 +288,10 @@ Microsoft too, the person signs out at Microsoft.
 ## In the deploy kit
 
 `deploy/compose.yaml` passes the four `PMOS_WEB_ENTRA_*` variables from `deploy/.env` (blank by
-default, so off) to the web app, with the Spark's outbound proxy. `deploy/pmos-admin up --web`
+default, so off) to the web app, with the Spark's outbound proxy, and the tenant id, client id
+and authority (not the secret) to the tool server as `PMOS_ENTRA_*`, so the two always agree;
+no new line in `deploy/.env`. `deploy/pmos-admin status` reads the web app's `/readyz`, which
+shows `entra_link`. `deploy/pmos-admin up --web`
 starts the web app when the tenant, client id, secret and `PMOS_WEB_PUBLIC_URL` are all set, or
 with the development opt-in (`docs/web-app-running.md`). `deploy/setup.sh` doesn't make the
 secret: it comes from the app registration, and goes in `deploy/.env` and the team password
@@ -245,10 +299,23 @@ manager.
 
 ## Tests
 
+The claim rules have their own tests in `crates/entra/src/tests.rs` (every refusal, key
+rotation, attacker-chosen `kid`s refetching at most once an interval, the tenant's endpoints
+down failing closed, a token used once), with the test keys and a fake tenant
+(`pmos_entra::testing`) both crates' tests use. `crates/toolserver/tests/directory_routes.rs`
+runs the first-link route against that fake tenant: forged, unsigned, another audience, issuer
+or tenant, expired, a guest, another identity provider, no `acct`, another nonce, a replayed
+token, the takeover from the review end to end (the old body; the caller's own valid token
+naming their own name; a forged token naming the victim's), key rotation, the keys down (`503`,
+nothing linked), no settings (`501`), every refusal counted as a miss, and the first link on
+the admin overview; with every earlier first-link condition, on both stores.
+
 `crates/web/tests/entra.rs` runs the whole flow against a mock identity provider (discovery,
 JWKS and a token endpoint that checks the client secret and PKCE) with RSA keys generated for
 the tests only, and a fake of the tool server's user database routes with the real first-link
-rules (`crates/web/tests/support/mod.rs`): the happy path and the first link; wrong or reused
+rules (`crates/web/tests/support/mod.rs`; it reads the forwarded token's claims without the
+signature check, which the tool server's own tests cover): that the first link forwards exactly
+the raw token and the nonce; `/readyz`'s `entra_link`; the happy path and the first link; wrong or reused
 `state`, an expired flow, a tampered flow cookie, a code for another PKCE challenge; every ID
 token check (nonce, audience, issuer, tenant, expiry, `alg: none`, HS256, an unknown `kid`, a
 tampered payload, no `oid`); guests, other identity providers and a missing `acct` (refused

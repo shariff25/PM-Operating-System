@@ -416,6 +416,10 @@ pub struct Directory {
     /// Reviewer assignments (§8, slice U5): each reviewer's handle and the PMs assigned to
     /// them. Kept, inert, when either person loses the role or is deactivated.
     pub assignments: BTreeMap<String, BTreeSet<String>>,
+    /// Every address a user had and no longer has (`retired_addresses`, migration 0021): by
+    /// `(field, value as compared)`, whose it was. Never anyone else's (L8: addresses are
+    /// never reused).
+    pub retired: BTreeMap<(String, String), String>,
 }
 
 impl Directory {

@@ -135,6 +135,10 @@ pub struct PersonClients {
     pub web_token: Option<String>,
     /// `PMOS_ASSERTION_MODE` and `PMOS_ASSERTION_KEYS`.
     pub assertions: Arc<Assertions>,
+    /// The first Entra link's own check of the ID token `pmos-web` forwards
+    /// (`PMOS_ENTRA_TENANT_ID`, `PMOS_ENTRA_CLIENT_ID`). `None`: the route answers
+    /// `501 not_configured`.
+    pub entra: Option<Arc<EntraLinkCheck>>,
 }
 
 impl std::fmt::Debug for PersonClients {
@@ -142,7 +146,24 @@ impl std::fmt::Debug for PersonClients {
         f.debug_struct("PersonClients")
             .field("web", &self.web_token.is_some())
             .field("assertions", &self.assertions)
+            .field("entra", &self.entra.is_some())
             .finish()
+    }
+}
+
+/// What the first-link route checks an ID token with: the tenant's keys (fetched and cached)
+/// and the tokens already used for a first link.
+pub struct EntraLinkCheck {
+    pub verifier: pmos_entra::Verifier,
+    pub used: pmos_entra::UsedTokens,
+}
+
+impl EntraLinkCheck {
+    pub fn new(tenant: pmos_entra::Tenant) -> Result<Self, String> {
+        Ok(Self {
+            verifier: pmos_entra::Verifier::new(tenant)?,
+            used: pmos_entra::UsedTokens::default(),
+        })
     }
 }
 
@@ -234,7 +255,8 @@ pub fn router_full(
 
     // Any internal client; the bot is limited to its own skills inside each handler. Both
     // may read and decide one approval item: the Slack bot does so from approval cards. Both
-    // run onboarding, and the bot gets link URLs for team members only. Both read the
+    // read onboarding requests; only the Slack bot decides a join or removes a member. The
+    // bot gets link URLs for team members only. Both read the
     // ledger: the Slack bot for the daily triage digest. The Slack bot may also list a team
     // member's pending approvals and unlink a team member's account, for the App Home
     // (`docs/slack-mentions-and-home-spec.md` §3); each handler limits it.
@@ -253,11 +275,15 @@ pub fn router_full(
             "/members/requests",
             post(create_member_request).get(list_member_requests),
         )
+        // A join decision and a removal: the Slack bot's token only (UM1).
         .route(
             "/members/requests/{id}/decision",
-            post(decide_member_request),
+            post(decide_member_request).route_layer(middleware::from_fn(slack_bot_only)),
         )
-        .route("/members/{handle}/remove", post(remove_member))
+        .route(
+            "/members/{handle}/remove",
+            post(remove_member).route_layer(middleware::from_fn(slack_bot_only)),
+        )
         .route("/onboarding", get(onboarding_status))
         .merge(admin)
         .layer(middleware::from_fn_with_state(
@@ -542,6 +568,19 @@ fn console_may_call(method: &axum::http::Method, path: &str) -> bool {
 async fn orchestrator_only(req: Request, next: Next) -> Response {
     match req.extensions().get::<Client>() {
         Some(Client::Orchestrator) => next.run(req).await,
+        _ => error(
+            StatusCode::FORBIDDEN,
+            "this token may not use this endpoint",
+        ),
+    }
+}
+
+/// The Slack bot's token only: a join decision and a removal (`docs/user-database-spec.md`
+/// §4, §6). The orchestrator's token is unsigned like the bot's, and nothing it does needs
+/// these (review of `b469d5b`, UM1).
+async fn slack_bot_only(req: Request, next: Next) -> Response {
+    match req.extensions().get::<Client>() {
+        Some(Client::Bot) => next.run(req).await,
         _ => error(
             StatusCode::FORBIDDEN,
             "this token may not use this endpoint",

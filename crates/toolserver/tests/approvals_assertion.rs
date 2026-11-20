@@ -93,6 +93,7 @@ async fn start(mode: Mode) -> Server {
         },
         None,
         PersonClients {
+            entra: None,
             web_token: Some(WEB_TOKEN.into()),
             assertions: Arc::new(assertions(mode)),
         },
@@ -423,6 +424,43 @@ async fn person_tokens_reach_only_the_approvals_routes() {
         )
         .await;
     assert_eq!(s, 401);
+}
+
+/// A join decision and a removal are the Slack bot's alone (review of `b469d5b`, UM1): the
+/// orchestrator's token, unsigned like the bot's, gets `403` before the handler runs, as do
+/// `pmos-web`'s and the console's. The Slack bot gets past the gate (an unknown request is
+/// `404`, an unknown member `404`).
+#[tokio::test]
+async fn only_the_slack_bot_token_decides_joins_and_removes_members() {
+    let srv = start(Mode::Off).await;
+    let decide = serde_json::to_vec(&json!({
+        "decision": "approve", "decided_by": SLACK_PM, "handle": "newbie", "roles": ["pm"]
+    }))
+    .unwrap();
+    let remove = serde_json::to_vec(&json!({ "decided_by": SLACK_PM })).unwrap();
+    let routes = [
+        ("/internal/members/requests/req_nope/decision", &decide),
+        ("/internal/members/nobody-here/remove", &remove),
+    ];
+    for (path, body) in routes {
+        for token in [SERVICE_TOKEN, WEB_TOKEN, CONSOLE_TOKEN] {
+            let (s, v) = srv.send(Method::POST, path, token, Some(body), None).await;
+            assert_eq!(s, 403, "{path}: {v}");
+            assert_eq!(v["error"], "this token may not use this endpoint", "{path}");
+        }
+        // The handler answers the Slack bot (here: the decider isn't an admin).
+        let (s, v) = srv
+            .send(Method::POST, path, BOT_TOKEN, Some(body), None)
+            .await;
+        assert_ne!(s, 401, "{path}: {v}");
+        assert_ne!(v["error"], "this token may not use this endpoint", "{path}");
+        assert!(v["code"].is_string(), "{path}: {v}");
+    }
+    // Reading the requests stays open to both internal clients.
+    let (s, _) = srv
+        .get("/internal/members/requests", SERVICE_TOKEN, None)
+        .await;
+    assert_eq!(s, 200);
 }
 
 #[tokio::test]

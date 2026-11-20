@@ -19,7 +19,12 @@ export interface Revision {
 export interface Protection {
   branch: string | null;
   required_reviews: number | null;
+  /** True only when reviews are required and GitHub showed admins bound and nobody able to bypass (or none are required). */
   verified: boolean;
+  /** Whether the rule binds admins too; null when GitHub's answer didn't say. Missing from an older server. */
+  admins_enforced?: boolean | null;
+  /** Whether anyone may merge without the review; null when GitHub's answer didn't say. Missing from an older server. */
+  bypass_allowed?: boolean | null;
   github: 'linked' | 'not_linked' | 'unavailable' | null;
 }
 

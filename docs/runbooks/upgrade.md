@@ -41,6 +41,33 @@ reach PMs until the affected category still meets its bar (D10).
 8. **Check:** run `deploy/pmos-admin smoke <your handle>`, then the benchmarks for any category
    the change touches (`deploy/pmos-admin evals-run --category <c>`).
 
+## The tool server validates first Microsoft sign-ins (review of `b469d5b`)
+
+From this version the tool server checks the ID token of a person's **first** Microsoft
+sign-in itself, instead of taking the web app's word for who it is
+([../entra-sign-in.md](../entra-sign-in.md)). It needs the tenant id and client id:
+
+- **With the deploy kit, nothing to add.** `deploy/compose.yaml` passes the web app's
+  `PMOS_WEB_ENTRA_TENANT_ID`, `PMOS_WEB_ENTRA_CLIENT_ID` and `PMOS_WEB_ENTRA_AUTHORITY` to the
+  tool server as `PMOS_ENTRA_TENANT_ID`, `PMOS_ENTRA_CLIENT_ID` and `PMOS_ENTRA_AUTHORITY`
+  (never the client secret). The tool server now fetches the tenant's keys from
+  `login.microsoftonline.com` itself, through the same outbound proxy as the web app.
+- **Running the services another way:** set those three on the tool server, with the same
+  values as the web app's. Without them a first Microsoft sign-in is refused
+  (`reason=users_unavailable`) and the tool server logs it; people already linked keep signing
+  in.
+- **Check:** `deploy/pmos-admin status` shows the web app's `/readyz`; with Entra on it must
+  include `"entra_link":"ok"`. `down` means the tool server has no Entra settings, or other ids
+  than the web app (its log says which).
+
+The same version also (all automatic, migration `0021`): only the Slack bot's token may decide
+a join request or remove a member (an orchestrator script that did either now gets `403`);
+`resolve` answers at most 600 hits a minute per client; the audit and role-history purges run
+with a fixed search path and their triggers accept only the real function; and a user's old
+sign-in name, Atlassian email or GitHub login can no longer be given to someone else. A
+`PMOS_GITHUB_URL` (or any other connector base override) that is `http://` to anything but
+loopback now stops the tool server at start-up: use `https://`.
+
 ## Upgrading to the user database (`team.yaml` retired)
 
 From this version **no service reads `content/team.yaml`**. Who may use PM OS, and their

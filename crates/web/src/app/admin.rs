@@ -530,6 +530,18 @@ struct UsersFlags {
     deactivation_limit_reached: bool,
     deactivation_grace_hours: Option<u64>,
     bots_without_active_owner: Vec<String>,
+    /// First Entra links this week (U1): who, when, which identity provider; never an `oid`.
+    /// `null` when the tool server couldn't read the audit log back, or is older.
+    first_links: Option<Vec<FirstLink>>,
+}
+
+/// One first link on the overview.
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct FirstLink {
+    handle: String,
+    at: String,
+    provider: String,
 }
 
 #[derive(Deserialize, Serialize, Default)]

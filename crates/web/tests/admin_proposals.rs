@@ -1468,6 +1468,86 @@ async fn the_content_tree_has_metadata_and_lint_status() {
     assert_eq!(secret["readable"], true);
 }
 
+/// UM3 (review of `b469d5b`): an auditor's tree shows a closed file's path, kind,
+/// sensitivity, size and lint status, never its title, name, owner, version or review date;
+/// `Restricted` in any case is closed, and so is front matter that doesn't parse (the rule
+/// fails closed); findings on no listed file are redacted for an auditor too. The file route
+/// agrees.
+#[tokio::test]
+async fn an_auditors_tree_shows_no_metadata_of_a_closed_file_and_fails_closed() {
+    let w = web().await;
+    let products = w.dir.path().join("content/context/products");
+    std::fs::write(
+        products.join("shouty.md"),
+        "---\ntitle: Shouty secret\nowner: \"adam\"\nversion: 2\nsensitivity: Restricted\n---\n\nShouty body.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        products.join("broken.md"),
+        "---\ntitle: Broken secret\nsensitivity: restricted\nowner: [adam\n---\n\nBroken body.\n",
+    )
+    .unwrap();
+    let audrey = w.login("audrey").await;
+    let r = w.get(&audrey, "/api/admin/content").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let files = r.body["files"].as_array().unwrap();
+    let entry = |p: &str| {
+        files
+            .iter()
+            .find(|f| f["path"] == p)
+            .unwrap_or_else(|| panic!("{p} listed"))
+            .clone()
+    };
+    for path in [
+        RESTRICTED,
+        "content/context/products/shouty.md",
+        "content/context/products/broken.md",
+    ] {
+        let e = entry(path);
+        assert_eq!(e["readable"], false, "{path}");
+        for field in ["title", "name", "owner", "version", "last_reviewed"] {
+            assert_eq!(e[field], Value::Null, "{path}: {field}");
+        }
+        for issue in e["lint"]["issues"].as_array().unwrap() {
+            assert_eq!(
+                issue["message"], "A finding on a file your role can't open.",
+                "{path}"
+            );
+        }
+        let r = w
+            .get(&audrey, &format!("/api/admin/content/file?path={path}"))
+            .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{path}");
+    }
+    let text = r.body.to_string();
+    for secret in ["Secret roadmap", "Shouty secret", "Broken secret"] {
+        assert!(!text.contains(secret), "{secret} shown to an auditor");
+    }
+    for issue in r.body["lint"]["other"].as_array().unwrap() {
+        assert_eq!(
+            issue["message"],
+            "A finding on a file your role can't open."
+        );
+    }
+    // A skill stays readable, with its metadata.
+    let skill = entry("content/skills/docs/SKILL.md");
+    assert_eq!(
+        (skill["readable"].clone(), skill["name"].clone()),
+        (json!(true), json!("docs"))
+    );
+    // An admin sees everything.
+    let adam = w.login("adam").await;
+    let r = w.get(&adam, "/api/admin/content").await;
+    let secret = r.body["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == RESTRICTED)
+        .unwrap()
+        .clone();
+    assert_eq!(secret["title"], "Secret roadmap");
+}
+
 #[tokio::test]
 async fn file_reads_are_confined_to_the_content_tree() {
     let w = web().await;

@@ -265,8 +265,38 @@ fn validate_row(u: &User) -> UserResult<()> {
     Ok(())
 }
 
-/// The unique indexes on addresses, across every user, active or not.
+/// A user's addresses as the unique indexes compare them: `(field, value)`, GitHub logins
+/// lower-cased (the names `retired_addresses.kind` uses).
+fn compared_addresses(u: &User) -> Vec<(&'static str, String)> {
+    [
+        ("sign_in_name", u.sign_in_name.clone()),
+        ("atlassian_email", u.atlassian_email.clone()),
+        (
+            "github_login",
+            u.github_login.as_ref().map(|g| g.to_lowercase()),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k, v)))
+    .collect()
+}
+
+/// The unique indexes on addresses, across every user, active or not, and every address a
+/// user had before (`retired_addresses`): never another user's (L8).
 fn unique_addresses(dir: &Directory, u: &User) -> UserResult<()> {
+    for (field, value) in compared_addresses(u) {
+        if let Some(holder) = dir.retired.get(&(field.to_string(), value)) {
+            if holder != &u.handle {
+                return Err(refused(
+                    Refusal::Taken,
+                    format!(
+                        "that {} was `{holder}`'s (addresses are never reused)",
+                        field.replace('_', " ")
+                    ),
+                ));
+            }
+        }
+    }
     for other in dir.users.values().filter(|o| o.handle != u.handle) {
         let clash = |a: &Option<String>, b: &Option<String>| a.is_some() && a == b;
         let field = if clash(&u.sign_in_name, &other.sign_in_name) {
@@ -324,6 +354,16 @@ pub fn apply_writes(dir: &mut Directory, writes: &[Write]) -> UserResult<()> {
                 let Some(row) = dir.users.get_mut(&u.handle) else {
                     return Err(not_found(&u.handle));
                 };
+                // An address the user no longer has is kept as theirs (L8), as the
+                // `users_addresses_never_reused` trigger keeps it in Postgres.
+                let now: Vec<(&str, String)> = compared_addresses(u);
+                for (field, value) in compared_addresses(row) {
+                    if !now.iter().any(|(f, v)| *f == field && *v == value) {
+                        dir.retired
+                            .entry((field.to_string(), value))
+                            .or_insert_with(|| u.handle.clone());
+                    }
+                }
                 let (roles, identities) = (row.roles.clone(), row.identities.clone());
                 *row = (**u).clone();
                 row.roles = roles;

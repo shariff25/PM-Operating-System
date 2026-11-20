@@ -90,6 +90,8 @@ struct Mock {
     protection: Mutex<(u16, Value)>,
     /// What `GET …/rules/branches/main` answers.
     rules: Mutex<(u16, Value)>,
+    /// What `GET …/rulesets/{id}` answers, by id (`404` for any other).
+    rulesets: Mutex<std::collections::HashMap<String, Value>>,
 }
 
 impl Mock {
@@ -304,6 +306,10 @@ async fn github(
             let (s, v) = m.rules.lock().unwrap().clone();
             reply(s, v)
         }
+        ("GET", ["rulesets", id]) => match m.rulesets.lock().unwrap().get(*id).cloned() {
+            Some(v) => reply(200, v),
+            None => reply(404, json!({"message": "Not Found"})),
+        },
         _ => panic!(
             "the mock GitHub has no route for {} {}",
             req.method, req.path
@@ -378,10 +384,7 @@ async fn start(opts: Opts) -> Server {
     pmos_policy::write(&policies, &generated).unwrap();
 
     let gh = Arc::new(Mock::default());
-    *gh.protection.lock().unwrap() = (
-        200,
-        json!({"required_pull_request_reviews": {"required_approving_review_count": 1}}),
-    );
+    *gh.protection.lock().unwrap() = (200, verified_protection());
     *gh.rules.lock().unwrap() = (200, json!([]));
     let mut seed = files_under(&f.root, "content");
     seed.extend(files_under(&policies, "policies"));
@@ -470,6 +473,7 @@ async fn start(opts: Opts) -> Server {
         },
         Some(Arc::new(onboarding)),
         PersonClients {
+            entra: None,
             web_token: Some(WEB_TOKEN.into()),
             assertions: Arc::new(Assertions::new(opts.mode, keys).unwrap()),
         },
@@ -620,6 +624,32 @@ fn body(kind: &str, changes: Vec<ProposedFile>) -> Value {
 }
 
 // ----- opening ----------------------------------------------------------------------------
+
+/// L11: a proposal's title (the merge commit's subject) and reason can't close an issue when
+/// the pull request merges: closing keywords are quoted.
+#[tokio::test]
+async fn a_proposal_never_closes_an_issue_on_merge() {
+    let srv = start(Opts::default()).await;
+    let mut set = srv.change_set(
+        "policy",
+        vec![srv.skill_with("docs.search docs.read jira.search")],
+    );
+    set["title"] = json!("Fixes #12: let Docs search Jira");
+    set["reason"] = json!("Closes example-org/pm-os#3 and resolves: #4");
+    let (status, r) = srv.open("ada", &set).await;
+    assert_eq!(status, 201, "{r}");
+    let pr = srv.gh.git.lock().unwrap().pulls[0].clone();
+    let title = pr["title"].as_str().unwrap();
+    assert_eq!(title, "PM OS policy: 'Fixes' #12: let Docs search Jira");
+    let text = pr["body"].as_str().unwrap();
+    assert!(
+        text.contains("'Closes' example-org/pm-os#3 and 'resolves': #4"),
+        "{text}"
+    );
+    for kw in ["Fixes #", "Closes example", "resolves:"] {
+        assert!(!title.contains(kw) && !text.contains(kw), "{kw}");
+    }
+}
 
 #[tokio::test]
 async fn an_admins_proposal_is_opened_with_their_own_github_account() {
@@ -1129,6 +1159,123 @@ async fn an_empty_content_folder_never_makes_the_repository_root_writable() {
 
 // ----- branch protection ------------------------------------------------------------------
 
+/// Classic protection as GitHub shows it to someone who may read it: one review required,
+/// admins included, nobody on the bypass list.
+fn verified_protection() -> Value {
+    json!({
+        "required_pull_request_reviews": {
+            "required_approving_review_count": 1,
+            "bypass_pull_request_allowances": {"users": [], "teams": [], "apps": []},
+        },
+        "enforce_admins": {"enabled": true},
+    })
+}
+
+/// `verified: true` only when GitHub's answer shows the review is required, admins aren't
+/// exempt and nobody may bypass (UM4); a setting the answer doesn't expose is `null`, never
+/// verified.
+#[tokio::test]
+async fn protection_is_verified_only_when_admins_are_bound_and_nobody_bypasses() {
+    let srv = start(Opts::default()).await;
+    let check = || async {
+        let (s, p) = srv
+            .web(
+                reqwest::Method::GET,
+                "ada",
+                "/internal/admin/protection?user=ada",
+                None,
+            )
+            .await;
+        assert_eq!(s, 200, "{p}");
+        (
+            p["verified"].clone(),
+            p["admins_enforced"].clone(),
+            p["bypass_allowed"].clone(),
+        )
+    };
+    assert_eq!(check().await, (json!(true), json!(true), json!(false)));
+    let classic = |admins: Option<bool>, allowances: Option<Value>| {
+        let mut reviews = json!({"required_approving_review_count": 1});
+        if let Some(a) = allowances {
+            reviews["bypass_pull_request_allowances"] = a;
+        }
+        let mut v = json!({ "required_pull_request_reviews": reviews });
+        if let Some(a) = admins {
+            v["enforce_admins"] = json!({ "enabled": a });
+        }
+        v
+    };
+    let empty = json!({"users": [], "teams": [], "apps": []});
+    for (body, want) in [
+        // The review count alone, as before the fix: unknown, not verified.
+        (
+            classic(None, None),
+            (json!(false), Value::Null, Value::Null),
+        ),
+        // Admins exempt.
+        (
+            classic(Some(false), Some(empty.clone())),
+            (json!(false), json!(false), json!(false)),
+        ),
+        // Admins bound, bypass list not in the answer: unknown.
+        (
+            classic(Some(true), None),
+            (json!(false), json!(true), Value::Null),
+        ),
+        // Someone may bypass.
+        (
+            classic(
+                Some(true),
+                Some(json!({"users": [{"login": "boss"}], "teams": [], "apps": []})),
+            ),
+            (json!(false), json!(true), json!(true)),
+        ),
+        (
+            classic(Some(true), Some(json!({"apps": [{"slug": "merge-bot"}]}))),
+            (json!(false), json!(true), json!(true)),
+        ),
+    ] {
+        *srv.gh.protection.lock().unwrap() = (200, body.clone());
+        assert_eq!(check().await, want, "{body}");
+    }
+    // A ruleset: verified only when the ruleset itself is read, active, with no bypass actor.
+    *srv.gh.protection.lock().unwrap() = (403, json!({"message": "Resource not accessible"}));
+    *srv.gh.rules.lock().unwrap() = (
+        200,
+        json!([{"type": "pull_request", "ruleset_id": 7,
+                "parameters": {"required_approving_review_count": 1}}]),
+    );
+    // Not readable (404): unknown.
+    assert_eq!(check().await, (json!(false), Value::Null, Value::Null));
+    for (ruleset, want) in [
+        (
+            json!({"id": 7, "enforcement": "active", "bypass_actors": []}),
+            (json!(true), json!(true), json!(false)),
+        ),
+        (
+            json!({"id": 7, "enforcement": "active",
+                   "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]}),
+            (json!(false), Value::Null, json!(true)),
+        ),
+        // No bypass_actors in the answer (the viewer can't edit the ruleset): unknown.
+        (
+            json!({"id": 7, "enforcement": "active"}),
+            (json!(false), Value::Null, Value::Null),
+        ),
+        (
+            json!({"id": 7, "enforcement": "evaluate", "bypass_actors": []}),
+            (json!(false), Value::Null, Value::Null),
+        ),
+    ] {
+        srv.gh
+            .rulesets
+            .lock()
+            .unwrap()
+            .insert("7".into(), ruleset.clone());
+        assert_eq!(check().await, want, "{ruleset}");
+    }
+}
+
 #[tokio::test]
 async fn branch_protection_is_read_with_the_viewers_account() {
     let srv = start(Opts::default()).await;
@@ -1158,9 +1305,10 @@ async fn branch_protection_is_read_with_the_viewers_account() {
         json!([{"type": "pull_request", "parameters": {"required_approving_review_count": 2}}]),
     );
     let (_, p) = check("ada").await;
+    // The count is known; who may bypass the ruleset isn't, so it isn't verified (UM4).
     assert_eq!(
         (p["required_reviews"].clone(), p["verified"].clone()),
-        (json!(2), json!(true))
+        (json!(2), json!(false))
     );
     assert_eq!(p["source"], "rulesets");
     // Neither readable, or a ruleset that requires none: unknown, never an error.

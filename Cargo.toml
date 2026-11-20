@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/contract", "crates/cli", "crates/runtime", "crates/toolserver", "crates/docs", "crates/slack", "crates/gateway", "crates/bots", "crates/console", "crates/evals", "crates/policy", "crates/web", "crates/assertion", "crates/stack-tests", "crates/directory"]
+members = ["crates/contract", "crates/cli", "crates/runtime", "crates/toolserver", "crates/docs", "crates/slack", "crates/gateway", "crates/bots", "crates/console", "crates/evals", "crates/policy", "crates/web", "crates/assertion", "crates/stack-tests", "crates/directory", "crates/entra"]
 
 [workspace.package]
 edition = "2021"
@@ -26,6 +26,9 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 chrono-tz = "0.10"
 croner = "4.0"
 hmac = "0.12"
+# Entra ID tokens (RS256) through aws-lc-rs, which rustls already uses: no OpenSSL. Shared by
+# pmos-web and the tool server through pmos-entra.
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
 clap = { version = "4", features = ["derive"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 reqwest = { version = "0.13", features = ["json", "form", "query"] }
@@ -45,6 +48,7 @@ walkdir = "2"
 pmos-assertion = { path = "crates/assertion" }
 pmos-contract = { path = "crates/contract" }
 pmos-directory = { path = "crates/directory" }
+pmos-entra = { path = "crates/entra" }
 pmos-policy = { path = "crates/policy" }
 pmos-runtime = { path = "crates/runtime" }
 

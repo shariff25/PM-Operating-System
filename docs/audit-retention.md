@@ -46,10 +46,13 @@ piece):
    90 days written into the trigger;
    (b) the transaction-local setting `pmos.audit_purge` is `on`, which only the purge function
    sets, and clears before it returns; and
-   (c) the DELETE runs inside `purge_audit_events(interval, integer)` (the trigger reads the
-   call stack, `PG_CONTEXT`).
+   (c) the DELETE runs inside **this schema's** `purge_audit_events(interval, integer)` (the trigger reads the
+   call stack, `PG_CONTEXT`, for the frame `<schema>.purge_audit_events(interval,integer)`; since
+   migration 0021 the function and the trigger run with `search_path = pg_catalog, pg_temp`, so
+   the real function always prints with its schema and a look-alike elsewhere never matches).
 3. **`purge_audit_events(retention, batch_size)`** is `SECURITY DEFINER` with a fixed
-   `search_path` (its schema, then `pg_temp`). It raises for a retention under 90 days or a
+   `search_path` (`pg_catalog, pg_temp` since migration 0021, every table named with its
+   schema). It raises for a retention under 90 days or a
    batch outside 1 to 100,000; takes a transaction-scoped advisory lock (and returns
    `ran = false`, doing nothing, if another purge holds it); deletes at most `batch_size` of
    the oldest rows before its cutoff (`FOR UPDATE SKIP LOCKED`), the cutoff being the older of
@@ -62,7 +65,8 @@ piece):
 **Why a newer event can't be deleted by anyone:** (a) is checked for every row by the trigger,
 with a constant no caller supplies. A direct `DELETE` fails (no setting). Forging the setting
 (`SET LOCAL pmos.audit_purge = 'on'`) fails (not inside the function). A function written to
-look like the purge (same name, another schema) gets past (b) and (c) but not (a): its DELETE
+look like the purge (same name, another schema, even first on the caller's search path) gets
+past (b) but not (c) (since migration 0021; review of `b469d5b`, UM5), and not (a): its DELETE
 of a newer row raises, and the whole statement and transaction fail. Calling the real function
 with a short retention raises before anything is deleted. The tests in
 `crates/toolserver/tests/audit_retention.rs` try each of these against Postgres.

@@ -384,6 +384,41 @@ pub fn clean_line(s: &str, max: usize) -> String {
     collapsed.chars().take(max).collect()
 }
 
+/// GitHub's closing keywords (`Fixes #12` closes issue 12 when the pull request merges).
+const CLOSING_KEYWORDS: [&str; 9] = [
+    "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+];
+
+/// `s` with every closing keyword, as a whole word in any letter case, wrapped in single
+/// quotes (`'Fixes' #12`), so a proposal's title or reason can never close an issue on merge:
+/// GitHub links an issue only when the keyword is followed directly by a colon or a space and
+/// the reference (review of `b469d5b`, L11). Everything else is kept as written.
+pub fn no_closing_keywords(s: &str) -> String {
+    let wordish = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        if CLOSING_KEYWORDS.contains(&word.to_ascii_lowercase().as_str()) {
+            out.push('\'');
+            out.push_str(word);
+            out.push('\'');
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for c in s.chars() {
+        if wordish(c) {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
 /// Free text: control characters other than newlines and tabs dropped, `\r\n` as `\n`, at most
 /// `max` characters.
 pub fn clean_text(s: &str, max: usize) -> String {
@@ -638,6 +673,30 @@ fn line_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_keywords_never_close_an_issue() {
+        for (raw, want) in [
+            ("Fixes #12", "'Fixes' #12"),
+            (
+                "fix: #3 and CLOSES org/repo#4",
+                "'fix': #3 and 'CLOSES' org/repo#4",
+            ),
+            (
+                "resolved https://github.com/o/r/issues/9",
+                "'resolved' https://github.com/o/r/issues/9",
+            ),
+            ("Closed\t#1\nresolves GH-2", "'Closed'\t#1\n'resolves' GH-2"),
+            // Not a keyword: a longer word, or part of one.
+            (
+                "prefixes #1, fixer #2, fix_up #3, fixes1",
+                "prefixes #1, fixer #2, fix_up #3, fixes1",
+            ),
+            ("Add the docs tool", "Add the docs tool"),
+        ] {
+            assert_eq!(no_closing_keywords(raw), want, "{raw:?}");
+        }
+    }
 
     #[test]
     fn paths_must_be_plain_and_inside_the_content_tree() {

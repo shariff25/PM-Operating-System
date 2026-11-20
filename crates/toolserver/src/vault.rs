@@ -516,6 +516,12 @@ impl Vault {
         self.store.delete(user, provider).await
     }
 
+    /// Suspend every credential of `user` that isn't already (a link that landed after the
+    /// person was deactivated). Returns how many.
+    pub async fn suspend(&self, user: &str, at: DateTime<Utc>) -> StoreResult<u64> {
+        self.store.suspend(user, at).await
+    }
+
     /// The user's linked accounts, without tokens.
     pub async fn list(&self, user: &str) -> StoreResult<Vec<CredentialInfo>> {
         Ok(self
