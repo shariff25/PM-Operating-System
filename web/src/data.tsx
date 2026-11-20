@@ -5,6 +5,7 @@ import { messageOf, useApp } from './app-context';
 import { copy } from './copy';
 import { effectiveStatus, sortDrafts } from './drafts';
 import { errorText, isDefiniteRefusal } from './errors';
+import { useTour } from './onboarding';
 import { waitingCount } from './reviews';
 
 /** 'off' means the brief answered 501 not_built (or failed): follow-ups are hidden everywhere. */
@@ -154,6 +155,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
 export function useAsk() {
   const { navigate } = useApp();
   const { upsertTask } = useData();
+  const { step } = useTour();
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const start = useCallback(
@@ -163,6 +165,8 @@ export function useAsk() {
       try {
         const t = await run();
         upsertTask(t);
+        // The guided start's first step: asking for something.
+        void step('ask');
         navigate(`/a/${encodeURIComponent(t.id)}`);
         return true;
       } catch (e) {
@@ -173,7 +177,7 @@ export function useAsk() {
         setAsking(false);
       }
     },
-    [navigate, upsertTask],
+    [navigate, upsertTask, step],
   );
   return { start, asking, error, setError };
 }

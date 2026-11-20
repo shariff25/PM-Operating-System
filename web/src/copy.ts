@@ -89,9 +89,8 @@ export const copy = {
     const part = hour < 5 ? 'Still up' : hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
     return `${part}, ${name}.`;
   },
-  welcomeWithDrafts: "Welcome in. Your drafts beat you here.",
   welcomeNoDrafts:
-    "No drafts yet, so here's one about me. Edit it, argue with it, press every button. Nothing leaves this page.",
+    "A draft about me, to practise on. Edit it, argue with it, press every button. Nothing leaves this page.",
   emptyDrafts: 'No drafts here. Ask me for one, or start one from Slack.',
   nothingWaiting: 'Nothing is waiting for you. Suspiciously calm.',
   nothingWaitedOn: 'You are not waiting on anyone. Enjoy it while it lasts.',
@@ -122,6 +121,53 @@ export const copy = {
   hintLabel: 'Hint',
   hintDismiss: 'Got it',
   hintStep: (i: number, n: number) => `Tip ${i} of ${n}`,
+
+  /**
+   * The guided start on Today, led by Nudge. Light in the greeting and the steps; plain where it
+   * is about roles or what approving does.
+   */
+  tour: {
+    label: 'Getting started',
+    hello: (name: string) => `Hi ${name}, I'm Nudge.`,
+    lede: "I read Jira, Confluence and Slack so you don't have to, and I draft the dull parts. Three small things and you'll know your way around.",
+    progress: (done: number, total: number) => `${done} of ${total}`,
+    progressLabel: (done: number, total: number) => `Getting started: ${done} of ${total} done`,
+    skip: 'Skip the tour',
+    stepsLabel: 'Steps',
+    stepDone: 'Done: ',
+    stepNext: 'Next: ',
+    steps: {
+      ask: {
+        title: 'Ask me for something',
+        detail: 'Use the box below, the way you would ask a colleague. "Summarize my week" works.',
+        action: 'Take me to the box',
+      },
+      open: {
+        title: 'Open a draft and see what I read',
+        detail: 'I made you a practice draft. Every claim in it lists where I found it.',
+        action: 'Open the practice draft',
+      },
+      decide: {
+        title: 'Approve it, or ask for a change',
+        detail: 'It is practice, so approving it sends nothing anywhere.',
+        action: 'Back to the practice draft',
+      },
+    },
+    reviewer: {
+      text: 'You are also a reviewer. Drafts your PMs want a second look at wait in Reviews.',
+      action: 'Open Reviews',
+    },
+    admin: {
+      text: 'You are an admin. People and their roles are managed on the Team page.',
+      action: 'Open Team',
+    },
+    auditor: {
+      text: 'Welcome to PM OS. You have read-only access to the audit log, policies and content, under Admin.',
+      dismiss: 'Got it',
+    },
+    cheerTitle: 'Approved!',
+    cheerText: "Your first one. That's the whole loop: ask, check what I read, approve.",
+  },
   /** Hints come one at a time, in this order. */
   hintOrder: ['sources', 'ask', 'approve'] as const satisfies readonly HintName[],
 
@@ -190,6 +236,9 @@ export const copy = {
     nudgesOn: 'On',
     nudgesOff: 'Off',
     showHints: 'Show hints again',
+    mascot: 'Show Nudge',
+    mascotOn: 'On',
+    mascotOff: 'Off',
     signOut: 'Sign out',
   },
 

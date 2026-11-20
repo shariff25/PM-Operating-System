@@ -252,6 +252,7 @@ async fn sessions_end_by_id_and_by_user_and_purge(s: &Stores) {
 fn busy_state() -> impl FnOnce(&mut UserState) + Send {
     |st| {
         st.nudges = false;
+        st.mascot = false;
         st.opened_a_draft = true;
         st.hints_seen.insert("ask".into());
         st.hints_seen.insert("sources".into());
@@ -297,7 +298,7 @@ async fn settings_keep_each_pms_state_apart(s: &Stores) {
         .update("ana", Box::new(busy_state()))
         .await
         .unwrap();
-    assert!(!ana.nudges && ana.opened_a_draft && ana.edits.len() == 2);
+    assert!(!ana.nudges && !ana.mascot && ana.opened_a_draft && ana.edits.len() == 2);
     assert_eq!(s.settings.get("ana").await.unwrap(), ana);
     // Ben has none of it.
     assert_eq!(s.settings.get("ben").await.unwrap(), UserState::default());

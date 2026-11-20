@@ -13,7 +13,7 @@ import type {
   Draft,
   DraftSummary,
   FollowUp,
-  HintName,
+  SeenName,
   Me,
   RejectReason,
   Suggestion,
@@ -48,6 +48,17 @@ export interface MockOptions extends MockAdminOptions, MockPolicyOptions, Omit<M
   providers?: AuthProvider[];
   /** Start with this first_visit value. */
   firstVisit?: boolean;
+  /** Start with these hints and guided-start marks already seen. */
+  hintsSeen?: SeenName[];
+  /** Start with "Hints and nudges" set this way (default on). */
+  nudges?: boolean;
+  /** Start with "Show Nudge" set this way (default on). */
+  mascot?: boolean;
+  /**
+   * Keep each person's settings (hints seen, nudges, Show Nudge, first visit) in sessionStorage,
+   * so a reload of the dev server keeps them, as the real server does. Off in unit tests.
+   */
+  keepSettings?: boolean;
   /**
    * The Origin a browser sends with every write. By default the page's own origin, as a browser
    * would. `null` models a script that sends none: the mock then refuses every write with
@@ -176,9 +187,30 @@ export function createMockClient(options: MockOptions = {}): Api {
     permissions: [...MOCK_PERMISSIONS[role]],
     csrf_token: 'mock-csrf-token',
     first_visit: options.firstVisit ?? !!options.noDrafts,
-    hints_seen: [],
-    nudges: true,
+    hints_seen: [...(options.hintsSeen ?? [])],
+    nudges: options.nudges ?? true,
+    mascot: options.mascot ?? true,
     reviewer: profile.roles.includes('reviewer'),
+  };
+  /** The settings the real server keeps per person, kept across a reload when `keepSettings` is on. */
+  const keyFor = (handle: string) => `pmos-mock-settings:${handle}`;
+  const keep = () => {
+    if (!options.keepSettings) return;
+    try {
+      const { hints_seen, nudges, mascot, first_visit } = me;
+      window.sessionStorage.setItem(keyFor(me.handle), JSON.stringify({ hints_seen, nudges, mascot, first_visit }));
+    } catch {
+      /* storage may be blocked: the settings then last as long as the page */
+    }
+  };
+  const restore = () => {
+    if (!options.keepSettings) return;
+    try {
+      const raw = window.sessionStorage.getItem(keyFor(me.handle));
+      if (raw) Object.assign(me, JSON.parse(raw) as Partial<Me>);
+    } catch {
+      /* nothing kept */
+    }
   };
 
   const drafts = new Map<string, Draft>();
@@ -605,6 +637,7 @@ export function createMockClient(options: MockOptions = {}): Api {
         me.permissions = [...MOCK_PERMISSIONS[named]];
         me.reviewer = me.roles.includes('reviewer');
       }
+      restore();
     },
     async logout() {
       await wait();
@@ -621,13 +654,23 @@ export function createMockClient(options: MockOptions = {}): Api {
       write();
       guard();
       me.nudges = nudges;
+      keep();
       return clone(me);
     },
-    async markHintSeen(seen: HintName) {
+    async setMascot(mascot) {
+      await wait();
+      write();
+      guard();
+      me.mascot = mascot;
+      keep();
+      return clone(me);
+    },
+    async markHintSeen(seen: SeenName) {
       await wait();
       write();
       guard();
       if (!me.hints_seen.includes(seen)) me.hints_seen.push(seen);
+      keep();
       return clone(me);
     },
     async resetHints() {
@@ -635,6 +678,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       write();
       guard();
       me.hints_seen = [];
+      keep();
       return clone(me);
     },
 
@@ -658,6 +702,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       const d = find(id);
       me.first_visit = false;
+      keep();
       return out(d);
     },
     async saveDraft(id, input) {

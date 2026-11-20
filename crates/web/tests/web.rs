@@ -1512,6 +1512,7 @@ async fn me_settings_and_hints() {
     assert_eq!(me["roles"], json!(["pm"]));
     assert_eq!(me["first_visit"], true);
     assert_eq!(me["nudges"], true);
+    assert_eq!(me["mascot"], true);
     assert_eq!(me["hints_seen"], json!([]));
     assert_eq!(me["csrf_token"].as_str().unwrap().len(), 43);
 
@@ -1532,9 +1533,29 @@ async fn me_settings_and_hints() {
         .post(&b, "/api/me/hints", json!({"seen": "everything"}))
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    // The guided start's marks are kept with the hints, and cleared with them.
+    let r = w
+        .post(&b, "/api/me/hints", json!({"seen": "tour_skipped"}))
+        .await;
+    assert_eq!(
+        r.body["hints_seen"],
+        json!(["ask", "sources", "tour_skipped"])
+    );
+    // Hiding Nudge is its own setting: it leaves nudges, and hints, as they were.
+    let r = w
+        .send(
+            &b,
+            Method::PUT,
+            "/api/me/settings",
+            Some(json!({"mascot": false})),
+        )
+        .await;
+    assert_eq!(r.body["mascot"], false);
+    assert_eq!(r.body["nudges"], false);
     let r = w.send(&b, Method::DELETE, "/api/me/hints", None).await;
     assert_eq!(r.body["hints_seen"], json!([]));
     assert_eq!(r.body["nudges"], false);
+    assert_eq!(r.body["mascot"], false);
 
     // first_visit ends when a draft is opened.
     w.get(&b, "/api/drafts/apr_conf").await;

@@ -8,6 +8,8 @@ import { useModalOpen } from '../modalOpen';
 import type { Rendered } from '../markdown';
 import { PHONE_QUERY, useMediaQuery } from '../theme';
 import { safeUrl } from '../url';
+import { Nudge, useShowNudge } from './Nudge';
+import type { NudgePose } from './Nudge';
 import { Icon } from './icons';
 
 /**
@@ -184,15 +186,17 @@ const hintText = (texts: HintTexts, name: HintName, kind: DraftKind) => {
 };
 
 /**
- * A one-time hint, drawn as a small coach mark next to the thing it describes. Hints appear one
- * at a time: sources, then ask, then approve. The next one shows only after the one before it
- * was dismissed. Hidden when nudges are off.
+ * A one-time hint, drawn as a small coach mark next to the thing it describes, with a small
+ * Nudge beside the text (unless "Show Nudge" is off; the text is the same either way). Hints
+ * appear one at a time: sources, then ask, then approve. The next one shows only after the one
+ * before it was dismissed. Hidden when nudges are off.
  *
  * It sits in the page flow (never over content), with a small pointer toward the element named
  * by `anchor` (an element id). On a phone it is a compact banner without a pointer.
  */
 export function Hint({ name, anchor, kind = 'confluence_page' }: { name: HintName; anchor?: string; kind?: DraftKind }) {
   const { api, me, setMe } = useApp();
+  const showNudge = useShowNudge();
   const phone = useMediaQuery(PHONE_QUERY);
   const box = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
@@ -235,6 +239,7 @@ export function Hint({ name, anchor, kind = 'confluence_page' }: { name: HintNam
       aria-label={copy.hintLabel}
       data-hint={name}
     >
+      {showNudge && <Nudge pose="nudge" size={phone ? 24 : 30} className="coach-nudge" />}
       <div className="coach-text">
         {!phone && <span className="coach-step">{copy.hintStep(step, copy.hintOrder.length)}</span>}
         <p>{hintText(phone ? copy.hintsShort : copy.hints, name, kind)}</p>
@@ -341,21 +346,32 @@ export function Skeleton({ rows = 3, label, variant = 'rows' }: { rows?: number;
   );
 }
 
-/** A friendly empty state: an icon, one line of copy, and an optional action. */
+/**
+ * A friendly empty state: an icon, one line of copy, and an optional action. With `nudge`, Nudge
+ * in that pose takes the icon's place (and the icon comes back when "Show Nudge" is off). Only
+ * for calm, nothing-to-do states: never an error.
+ */
 export function Empty({
   icon,
   children,
   action,
   small,
+  nudge,
 }: {
   icon: Parameters<typeof Icon>[0]['name'];
   children: ReactNode;
   action?: ReactNode;
   small?: boolean;
+  nudge?: NudgePose;
 }) {
+  const showNudge = useShowNudge() && nudge !== undefined;
   return (
-    <div className={`empty ${small ? 'empty-sm' : ''}`}>
-      <span className="empty-icon"><Icon name={icon} size={small ? 18 : 20} /></span>
+    <div className={`empty ${small ? 'empty-sm' : ''} ${showNudge ? 'empty-nudge' : ''}`}>
+      {showNudge ? (
+        <Nudge pose={nudge} size={small ? 40 : 52} className="empty-art" />
+      ) : (
+        <span className="empty-icon"><Icon name={icon} size={small ? 18 : 20} /></span>
+      )}
       <p>{children}</p>
       {action}
     </div>

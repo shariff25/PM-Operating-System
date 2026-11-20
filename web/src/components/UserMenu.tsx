@@ -12,10 +12,10 @@ const THEMES: { value: Theme; icon: IconName; label: string }[] = [
   { value: 'light', icon: 'sun', label: copy.theme.light },
   { value: 'dark', icon: 'moon', label: copy.theme.dark },
 ];
-const COUNT = THEMES.length + 3;
+const COUNT = THEMES.length + 4;
 
 /**
- * The user's menu: theme, nudges, hints and sign out. A menu button: Enter, Space or the arrow
+ * The user's menu: theme, nudges, Show Nudge, hints and sign out. A menu button: Enter, Space or the arrow
  * keys open it; arrows, Home and End move; Escape closes and returns focus to the button.
  */
 export function UserMenu({
@@ -29,6 +29,7 @@ export function UserMenu({
   collapsed?: boolean;
 }) {
   const { api, me, setMe, theme, setTheme } = useApp();
+  const mascot = me.mascot !== false;
   const [open, setOpen] = useState(false);
   const [focusIdx, setFocusIdx] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -175,17 +176,40 @@ export function UserMenu({
           <button
             ref={ref(THEMES.length + 1)}
             type="button"
+            role="menuitemcheckbox"
+            aria-checked={mascot}
+            tabIndex={-1}
+            className="menu-item"
+            data-setting="mascot"
+            onClick={() => void run(async () => setMe(await api.setMascot(!mascot)), false)}
+          >
+            <Icon name="mascot" size={16} />
+            <span className="menu-item-label">{copy.menu.mascot}</span>
+            <span className={`switch ${mascot ? 'switch-on' : ''}`} aria-hidden="true">
+              <span className="switch-knob" />
+            </span>
+            <span className="sr-only">{mascot ? copy.menu.mascotOn : copy.menu.mascotOff}</span>
+          </button>
+          <button
+            ref={ref(THEMES.length + 2)}
+            type="button"
             role="menuitem"
             tabIndex={-1}
             className="menu-item"
-            onClick={() => void run(async () => setMe(await api.resetHints()), true)}
+            onClick={() =>
+              void run(async () => {
+                // Clears every hint and the guided start's marks, then starts the guided start again.
+                await api.resetHints();
+                setMe(await api.markHintSeen('tour_started'));
+              }, true)
+            }
           >
             <Icon name="lightbulb" size={16} />
             <span className="menu-item-label">{copy.menu.showHints}</span>
           </button>
           <div className="menu-sep" role="separator" />
           <button
-            ref={ref(THEMES.length + 2)}
+            ref={ref(THEMES.length + 3)}
             type="button"
             role="menuitem"
             tabIndex={-1}

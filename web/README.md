@@ -62,6 +62,12 @@ when that exists, or the one in `PW_CHROMIUM`; otherwise run `pnpm exec playwrig
 - `src/components/`: the app shell (the dark rail, icons only on the draft workspace; on a phone a top bar and a bottom tab bar), command palette, user menu,
   toasts, coach-mark hints, approve dialog, icons (drawn here and inlined).
 - `src/data.tsx`: the drafts, brief and task lists the navigation counts and pages share.
+- Nudge, the mascot (`docs/design/nudge`): `src/components/Nudge.tsx` draws it from the approved
+  art; `src/onboarding.ts` is the guided start on Today (`src/components/Welcome.tsx`), kept in
+  the server's `hints_seen`. It lives only in the welcome card, beside the one-time hints, in
+  calm empty states, in the one "Approved!" moment and on the sign-in screen; "Show Nudge" in the
+  user menu hides it everywhere. On the dev server `?mock_new=1` signs in as a first visit, and
+  the sample data keeps each person's settings in sessionStorage so a reload keeps them.
 - Routes are hashes, checked in `src/url.ts`: `#/`, `#/drafts`, `#/d/<id>`, `#/followups`,
   `#/activity`, `#/a/<task id>`. Anything else is the home page.
 - A running request is polled every 600 ms for six seconds, then every 2 s, then every 5 s after a minute (`src/polling.ts`); polling pauses in a hidden tab and resumes on focus.

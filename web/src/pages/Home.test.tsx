@@ -119,9 +119,10 @@ describe('home launchpad', () => {
     expect(screen.getByRole('button', { name: copy.activity.copyReference })).toBeInTheDocument();
   });
 
-  it('greets a first sign-in that already has drafts', async () => {
+  it('greets a first sign-in that already has drafts with the guided start', async () => {
     renderApp({ firstVisit: true });
-    await screen.findByText(copy.welcomeWithDrafts);
+    expect(await screen.findByRole('heading', { name: copy.tour.hello('Ana') })).toBeInTheDocument();
+    expect(screen.getByText(copy.tour.lede)).toBeInTheDocument();
   });
 
   it('shows the empty states when there are no drafts and nothing asked yet', async () => {

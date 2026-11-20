@@ -4,6 +4,7 @@ import type { Api, AuthProvider } from '../api';
 import { messageOf } from '../app-context';
 import { ErrorNote } from '../components/bits';
 import { Icon, Mark } from '../components/icons';
+import { Nudge } from '../components/Nudge';
 import { copy } from '../copy';
 import { loginHref } from '../url';
 
@@ -114,6 +115,7 @@ export function SignIn(props: ProviderProps & { path?: string }) {
       <SignInBrand />
       <main className="signin">
         <div className="signin-head">
+          <Nudge pose="hello" size={44} className="signin-nudge" />
           <h1>{copy.signIn.title}</h1>
           <p className="muted">{copy.signIn.lede}</p>
         </div>

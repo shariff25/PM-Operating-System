@@ -99,6 +99,7 @@ export function FollowUps() {
       ) : brief.waiting_on_you.length === 0 && brief.you_wait_on.length === 0 && brief.changed.length === 0 ? (
         <Empty
           icon="inbox"
+          nudge="calm"
           action={
             <button type="button" className="btn btn-sm" onClick={() => openPalette(copy.emptyActions.askOpenText)}>
               {copy.emptyActions.askOpen}

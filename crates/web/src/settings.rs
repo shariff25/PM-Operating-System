@@ -1,4 +1,4 @@
-//! What the web app keeps per PM: hints seen, nudges, whether they have opened a draft yet,
+//! What the web app keeps per PM: hints seen, nudges, the mascot, whether they have opened a draft yet,
 //! the practice draft and its edit, and change suggestions. (A real draft's edit is saved on
 //! the item at the tool server, so every surface shows it: `app.rs`, `save_edit`.)
 //!
@@ -58,6 +58,8 @@ pub struct PracticeDraft {
 pub struct UserState {
     pub hints_seen: BTreeSet<String>,
     pub nudges: bool,
+    /// Whether the app draws Nudge, its mascot. Off keeps every hint and empty state's text.
+    pub mascot: bool,
     /// `first_visit` is `!opened_a_draft`.
     pub opened_a_draft: bool,
     /// The practice draft's edit, by its id. Real drafts' edits live at the tool server; an
@@ -78,6 +80,7 @@ impl Default for UserState {
         Self {
             hints_seen: BTreeSet::new(),
             nudges: true,
+            mascot: true,
             opened_a_draft: false,
             edits: BTreeMap::new(),
             suggestions: BTreeMap::new(),

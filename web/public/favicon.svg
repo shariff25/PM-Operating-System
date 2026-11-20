@@ -1,5 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect width="32" height="32" rx="8" fill="#0f766e"/>
-  <path d="M10 9.5h8.5l4 4V22a1.5 1.5 0 0 1-1.5 1.5H10A1.5 1.5 0 0 1 8.5 22V11A1.5 1.5 0 0 1 10 9.5z" fill="none" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>
-  <path d="M15.5 13.5c.3 2 1 2.8 2.8 3.2-1.8.4-2.5 1.2-2.8 3.2-.3-2-1-2.8-2.8-3.2 1.8-.4 2.5-1.2 2.8-3.2z" fill="#fff"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+  <!-- Nudge's face on the app's green tile: the simplified icon from docs/design/nudge. -->
+  <rect width="200" height="200" rx="50" fill="#1F8A5B"/>
+  <path d="M0 142 a58 58 0 0 0 58 58 h84 a58 58 0 0 0 58 -58 v-18 q-100 46 -200 0z" fill="#156B45" opacity=".35"/>
+  <path d="M150 0 h-6 l56 56 v-6 a50 50 0 0 0 -50 -50z" fill="#F6F5F0"/>
+  <path d="M144 0 l56 56 h-34 a22 22 0 0 1 -22 -22z" fill="#7FD3A8"/>
+  <ellipse cx="38" cy="128" rx="17" ry="10" fill="#FF9DB0" opacity=".8"/>
+  <ellipse cx="162" cy="128" rx="17" ry="10" fill="#FF9DB0" opacity=".8"/>
+  <ellipse cx="68" cy="92" rx="31" ry="35" fill="#fff"/>
+  <ellipse cx="132" cy="92" rx="31" ry="35" fill="#fff"/>
+  <circle cx="68" cy="97" r="17" fill="#10231A"/>
+  <circle cx="132" cy="97" r="17" fill="#10231A"/>
+  <circle cx="74" cy="90" r="6" fill="#fff"/>
+  <circle cx="138" cy="90" r="6" fill="#fff"/>
+  <path d="M82 140 q18 18 36 0" fill="none" stroke="#10231A" stroke-width="10" stroke-linecap="round"/>
 </svg>

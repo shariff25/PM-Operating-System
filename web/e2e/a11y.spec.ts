@@ -243,6 +243,41 @@ for (const theme of ['light', 'dark'] as const) {
       await scan(page, 'user menu');
     });
 
+    test('Nudge: the welcome card, a hint, a calm empty state, the finish and the Show Nudge control', async ({ page }) => {
+      await signIn(page, theme, undefined, 'ana', '?mock_new=1');
+      const welcome = page.getByRole('region', { name: "Hi Ana, I'm Nudge." });
+      await expect(welcome).toBeVisible();
+      await expect(welcome.locator('svg[data-nudge="hello"]')).toBeVisible();
+      await scan(page, 'welcome card');
+      await page.getByRole('link', { name: /Practice: why PMs should take the stairs/ }).click();
+      await expect(page.locator('[data-hint="sources"] svg[data-nudge="nudge"]')).toBeVisible();
+      await scan(page, 'a hint with Nudge');
+      await page.getByRole('button', { name: 'Approve to Confluence' }).click();
+      await page.getByRole('dialog').getByRole('button', { name: /^Confirm/ }).click();
+      await expect(page.getByText('Approved!', { exact: true })).toBeVisible();
+      await scan(page, 'the Approved! moment');
+      await page.getByRole('button', { name: /Menu for/ }).click();
+      await expect(page.getByRole('menuitemcheckbox', { name: /Show Nudge/ })).toBeVisible();
+      await scan(page, 'user menu with Show Nudge');
+      await page.getByRole('menuitemcheckbox', { name: /Show Nudge/ }).click();
+      await expect(page.getByRole('menuitemcheckbox', { name: /Show Nudge/ })).toHaveAttribute('aria-checked', 'false');
+      await scan(page, 'user menu, Show Nudge off');
+    });
+
+    test('Nudge: calm empty states and the sign-in screen', async ({ page }) => {
+      await page.addInitScript((t) => window.localStorage.setItem('pmos-theme', t), theme);
+      await page.goto(EMPTY + '/');
+      await expect(page.locator('.signin svg[data-nudge="hello"]')).toBeVisible();
+      await scan(page, 'sign-in with Nudge');
+      await page.getByLabel('Your handle').fill('ana');
+      await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+      await expect(page.locator('svg[data-nudge="calm"]')).toBeVisible();
+      await scan(page, 'calm Today');
+      await go(page, '/drafts');
+      await expect(page.locator('.empty svg[data-nudge="calm"]')).toBeVisible();
+      await scan(page, 'calm Drafts');
+    });
+
     test('a brand-new account: every empty state', async ({ page }) => {
       await signIn(page, theme, EMPTY);
       await scan(page, 'home, new account');

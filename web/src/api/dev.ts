@@ -53,6 +53,9 @@ export function devApiFactory(): (onSignedOut: () => void) => Api {
   return (onSignedOut) =>
     createMockClient({
       onSignedOut,
+      keepSettings: true,
+      // `?mock_new=1` signs in as a brand-new PM: a first visit, with the sample drafts.
+      ...(new URLSearchParams(window.location.search).get('mock_new') === '1' ? { firstVisit: true } : {}),
       providers: mockProviders(),
       briefDelivery: mockBrief(),
       audienceDrafts: new URLSearchParams(window.location.search).get('mock_slack') === 'audience',

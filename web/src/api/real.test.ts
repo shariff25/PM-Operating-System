@@ -32,6 +32,23 @@ describe('real client', () => {
     expect((delCall![1]!.headers as Record<string, string>)['X-Pmos-Csrf']).toBe('tok-1');
   });
 
+  it('saves Show Nudge as its own setting, and marks guided-start steps as hints', async () => {
+    const fetchImpl = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(json(200, ME))
+      .mockResolvedValueOnce(json(200, { ...ME, mascot: false }))
+      .mockResolvedValueOnce(json(200, { ...ME, hints_seen: ['tour_asked'] }));
+    const api = createRealClient({ fetchImpl });
+    await api.me();
+    expect((await api.setMascot(false)).mascot).toBe(false);
+    expect((await api.markHintSeen('tour_asked')).hints_seen).toEqual(['tour_asked']);
+    const [, putCall, postCall] = fetchImpl.mock.calls;
+    expect(putCall![0]).toBe('/api/me/settings');
+    expect(putCall![1]!.method).toBe('PUT');
+    expect(putCall![1]!.body).toBe(JSON.stringify({ mascot: false }));
+    expect(postCall![0]).toBe('/api/me/hints');
+    expect(postCall![1]!.body).toBe(JSON.stringify({ seen: 'tour_asked' }));
+  });
+
   it('asks for the sign-in providers without a session or a CSRF header', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(json(200, { providers: ['entra', 'dev'] }));
     const api = createRealClient({ fetchImpl });
