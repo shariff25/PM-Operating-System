@@ -4,7 +4,7 @@ The owner's requirements for the PM OS build. Read this before planning or build
 the owner on 2026-11-16 and 2026-11-17 (three decisions of 2026-11-17 reached this session through
 the reviewer session: the user database, the required assertion, 90-day purge); update it when they change something.
 
-## Scope (the owner's list, a to f and i; g and h were dropped)
+## Scope (the owner's list, a to f, i and j; g and h were dropped)
 
 - **a. Authentication:** primarily Azure AD (Entra ID) single sign-on.
 - **b. Authorization:** role-based access with four roles: Admin, Product Manager, Reviewer,
@@ -39,6 +39,11 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   model; OpenShell holds one credential per provider and enforces which endpoints are
   reachable. (OpenShell's docs, v0.1.9 "Inference", say its managed inference route was
   removed and the workload chooses the model, so it gives no switching or fallback.)
+- **j. Bot marketplace** (owner, 2026-11-20; plan only, build nothing until the plan is
+  approved): widen the product beyond one PM assistant. Three new bots: a Chief of Staff for a
+  product manager, a Growth product manager and an Outbound product manager. As part of
+  onboarding the user sees a bot marketplace and chooses which bots to include. Each bot has
+  its own mascot.
 - **h. Dropped by the owner on 2026-11-17:** the review of how the Grok bot was built. Do not
   build it.
 
