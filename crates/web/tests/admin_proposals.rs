@@ -389,6 +389,8 @@ async fn web() -> Web {
         session_idle: Duration::hours(8),
         session_max: Duration::hours(24),
         internal_bind: None,
+        password_login: false,
+        trusted_proxies: Vec::new(),
     };
     let admin = AdminConfig {
         policies_root: Some(dir.path().join("policies")),

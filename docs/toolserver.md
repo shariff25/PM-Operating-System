@@ -341,7 +341,9 @@ sign-ins, sign-outs and refused sign-ins, so they are in the same audit log as e
 else and in the admin audit list with the usual fields.
 - **Only `pmos-web`'s token** (the orchestrator, bot and console get `403`).
 - **Only fixed values:** `action` is `web.sign_in`, `web.sign_out`, `web.sign_in_refused` or
-  `users.identity_conflict`; `provider` is `entra` or `dev`; `reason` (refusals only) is
+  `users.identity_conflict`; `provider` is `entra`, `dev` or `password` (a password
+  sign-in's session, `docs/password-sign-in.md`; its refusals the password routes record
+  themselves); `reason` (refusals only) is
   `not_a_member`, `wrong_account` (no longer sent by `pmos-web`), `expired`, `cancelled`,
   `unavailable`, `failed`, or, since slice U4c, `deactivated`, `sign_in_unconfirmed`,
   `entra_needs_host`, `entra_misconfigured` or `users_unavailable`; `attempt` (refusals
@@ -1510,6 +1512,48 @@ these (`safe_detail`), and `verdict <v> revision <n>` and the refusal codes.
 `anonymous`). These are ordinary audit events: the 90-day purge deletes them like any other
 (tested on Postgres through the real purge). Recommendation rows go with their item.
 
+### Password sign-in
+
+Email-and-password sign-in with a required authenticator code (`docs/password-sign-in.md`,
+where the flows, limits and threats are): `src/password/` (rules and Argon2id, TOTP, codes,
+limits, the flows), `src/app/password.rs` (the routes), the store in memory
+(`src/users/memory.rs`) and Postgres (`src/users/password_pg.rs`, migration 0020),
+`tests/password.rs` on both stores. The tool server owns the password hash, the authenticator
+secret (sealed by the vault, below) and the recovery codes; `pmos-web` forwards what a person
+typed and acts on the answer. The full browser contract is `docs/web-api.md` **Password
+sign-in**.
+
+| Route | Body | Answer |
+| --- | --- | --- |
+| `POST /internal/password/sign-in` | `{sign_in_name, password}` | `{pending_token, expires_at}`; every refusal `401 sign_in_failed` |
+| `POST /internal/password/second-step` | `{pending_token, code}` or `{pending_token, recovery_code}` | `{user, password_epoch, recovery_code_used, recovery_codes_left}`; `401 code_failed` (`attempts_left`), `401 sign_in_expired`, `403 not_a_member`, `429 too_many_attempts` |
+| `POST /internal/password/setup/begin` | `{sign_in_name, setup_code}` | `{setup_token, handle, kind, expires_at}`; `401 setup_failed`, then `403 not_a_member`, `409 sign_in_unconfirmed`, `403 host_only`, `409 evals_account` |
+| `POST /internal/password/setup/password` | `{setup_token, password}` | `{next: "authenticator"}`; `422 weak_password` (`reason`), `401 setup_expired` |
+| `POST /internal/password/setup/authenticator` | `{setup_token}` | `{otpauth_uri, secret, account, issuer, algorithm, digits, period}`; `409 wrong_step` |
+| `POST /internal/password/setup/confirm` | `{setup_token, code}` | `{user, password_epoch, kind, recovery_codes}`; `401 code_failed`, `409 wrong_step`, `403 host_only` |
+| `POST /internal/password/change?user=<handle>` | `{current_password, code, new_password}` | `{password_epoch}`; `403 reauth_failed`, `422 weak_password`, `409 no_password`, `429 too_many_attempts` |
+| `POST /internal/password/recovery-codes?user=<handle>` | `{code}` | `{recovery_codes}`; `403 reauth_failed`, `409 no_password` |
+| `GET /internal/password/status?user=<handle>` | | `{enabled, password_set, second_step_enrolled, setup_code_pending, recovery_codes_left}` |
+| `POST /internal/password/setup-codes?user=<admin>` | `{handle}` | `201 {setup_code, handle, kind, expires_at}`; `403 forbidden`, `403 host_only`, `403 self_change`, `404 not_found`, `409 not_active`, `409 sign_in_unconfirmed`, `409 evals_account` |
+
+- **`pmos-web`'s token only:** the orchestrator's, the console's and the Slack bot's get `403`,
+  no token `401`.
+- **Only in assertion `require`**, with no development override: `503 assertion_required`
+  otherwise. The four routes that name `user=` need `pmos-web`'s assertion for that person,
+  bound to the request (`401 bad_assertion`); the six before a session take none (as
+  `resolve`, nobody is signed in yet).
+- **Off without `PMOS_VAULT_KEY`** (`501 not_configured`); with live connectors it is required
+  anyway. The host command `pmos-toolserver users password-setup <handle>`
+  (`pmos-admin users password-setup`) issues a code for anyone but `evals`, Admins and
+  Auditors included, and needs no key.
+- **`resolve` for `pmos-web`** carries `password_epoch` (the credential's epoch, `null` without
+  one), so a password session ends when a reset or a change moves it. The console's answer
+  doesn't. `GET /internal/admin/users` gives each user `password_set`,
+  `second_step_enrolled` and `setup_code_pending`.
+- Bodies are at most 4 KiB; answers are `no-store`; refusals carry fixed sentences. Nothing is
+  logged or audited but fixed words and counts (`password::is_safe_detail`, which the admin
+  audit views accept).
+
 ### Content sync
 
 Every `PMOS_CONTENT_SYNC_SECS`, and right after a member commit, the tool server runs
@@ -1534,6 +1578,9 @@ Tokens are sealed with AES-256-GCM before any store sees them (`src/vault.rs`, t
   new key on their next read, and the old key can be dropped once nothing uses it.
 - Tokens never appear in logs, audit events, API responses or `Debug` output (sessions and
   the bot's access print `<redacted>` for theirs).
+- Password sign-in's authenticator secrets are sealed with the same keys and format, bound to
+  their person and use (`pmos-vault|<handle>|password|totp`), and re-sealed under the newest
+  key when next used (`docs/password-sign-in.md`).
 
 ## Storage
 

@@ -172,6 +172,8 @@ impl PgStore {
             .bind(now)
             .execute(&self.pool)
             .await?;
+        // Password sign-in's pending tokens and setup codes past their expiry.
+        crate::password::store::PasswordStore::prune_passwords(self, now).await?;
         Ok(())
     }
 }

@@ -29,6 +29,7 @@ pub mod host;
 pub mod import;
 pub mod link;
 pub mod memory;
+pub mod password_pg;
 pub mod pg;
 pub mod rules;
 
@@ -234,10 +235,14 @@ pub enum ChangeKind {
     DeleteCredentials,
     ExceptionOn,
     ExceptionOff,
+    /// A password setup or reset code issued (`docs/password-sign-in.md`).
+    IssuePasswordCode,
+    /// A password credential set by a finished setup or reset.
+    SetPassword,
 }
 
 impl ChangeKind {
-    pub const ALL: [ChangeKind; 16] = [
+    pub const ALL: [ChangeKind; 18] = [
         Self::Create,
         Self::Grant,
         Self::Revoke,
@@ -254,6 +259,8 @@ impl ChangeKind {
         Self::DeleteCredentials,
         Self::ExceptionOn,
         Self::ExceptionOff,
+        Self::IssuePasswordCode,
+        Self::SetPassword,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -274,6 +281,8 @@ impl ChangeKind {
             Self::DeleteCredentials => "delete_credentials",
             Self::ExceptionOn => "exception_on",
             Self::ExceptionOff => "exception_off",
+            Self::IssuePasswordCode => "issue_password_code",
+            Self::SetPassword => "set_password",
         }
     }
 
@@ -971,6 +980,10 @@ pub trait UserStore: Send + Sync {
     /// lock in the transaction that writes the identity, its `role_changes` row and its audit
     /// event. A refusal records a `denied` event (a conflict as `users.identity_conflict`).
     async fn link_entra(&self, link: &link::EntraLink, now: DateTime<Utc>) -> link::LinkResult;
+
+    /// The same store's password sign-in state (`crate::password`, migration 0020): one
+    /// person's, under that person's lock, changed whole or not at all.
+    fn passwords(&self) -> &dyn crate::password::store::PasswordStore;
 }
 
 /// The audit event for one of a write's [`rules::UserEvent`]s: the actor, the client (host

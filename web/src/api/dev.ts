@@ -9,7 +9,7 @@ import type { Api, AuthProvider } from './types';
 function mockProviders(): AuthProvider[] | undefined {
   const raw = new URLSearchParams(window.location.search).get('mock_providers');
   if (raw === null) return undefined;
-  return raw.split(',').filter((p): p is AuthProvider => p === 'entra' || p === 'dev');
+  return raw.split(',').filter((p): p is AuthProvider => p === 'entra' || p === 'password' || p === 'dev');
 }
 
 /** `?mock_brief=never` or `stale` on the dev server shows the home page of a PM whose brief has not run. */

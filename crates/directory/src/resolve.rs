@@ -138,6 +138,10 @@ pub struct DirectoryUser {
     pub entra: EntraState,
     pub sign_in_name_confirmed: bool,
     pub dual_role: bool,
+    /// `pmos-web`'s answer only: the epoch of the user's password credential (`None` without
+    /// one). A password session holds the epoch it signed in with and ends when this moves
+    /// (`docs/password-sign-in.md`). The console's answer never has it.
+    pub password_epoch: Option<i64>,
 }
 
 impl DirectoryUser {
@@ -169,6 +173,16 @@ struct UserWire {
     sign_in_name_confirmed: bool,
     #[serde(default)]
     dual_role: bool,
+    #[serde(default)]
+    password_epoch: Option<i64>,
+}
+
+/// A user as the tool server's answers carry one (`resolve`, the first link, password
+/// sign-in's second step), or `None` when it isn't one.
+pub fn parse_user(v: &Value) -> Option<DirectoryUser> {
+    serde_json::from_value::<UserWire>(v.clone())
+        .ok()
+        .map(DirectoryUser::from)
 }
 
 impl From<UserWire> for DirectoryUser {
@@ -190,6 +204,7 @@ impl From<UserWire> for DirectoryUser {
             },
             sign_in_name_confirmed: w.sign_in_name_confirmed,
             dual_role: w.dual_role,
+            password_epoch: w.password_epoch,
         }
     }
 }
@@ -957,6 +972,17 @@ mod tests {
         assert!(!format!("{l:?}").contains("the-oid"));
         let h = HttpTransport::new(reqwest::Client::new(), "http://x", "tok-123456789");
         assert!(!format!("{h:?}").contains("tok-123456789"));
+    }
+
+    #[test]
+    fn the_password_epoch_is_read_when_sent() {
+        let mut v = ana("active");
+        assert_eq!(parse_user(&v).unwrap().password_epoch, None);
+        v["password_epoch"] = json!(3);
+        assert_eq!(parse_user(&v).unwrap().password_epoch, Some(3));
+        v["password_epoch"] = Value::Null;
+        assert_eq!(parse_user(&v).unwrap().password_epoch, None);
+        assert!(parse_user(&json!({"nope": 1})).is_none());
     }
 
     #[tokio::test]

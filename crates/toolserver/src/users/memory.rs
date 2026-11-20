@@ -12,6 +12,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::Mutex;
 
+use std::collections::BTreeMap;
+
 use super::import::ImportRequest;
 use super::link::{self, EntraLink, LinkError, LinkRefusal, LinkResult, Linked, Planned};
 use super::rules::{self, denied_event, Effect, Rules};
@@ -20,6 +22,10 @@ use super::{
     ROLE_CHANGES_RETENTION_DAYS,
 };
 use crate::audit::{AuditEvent, AuditSink, Client, Outcome};
+use crate::password::store::{
+    Credential, PasswordStatus, PasswordStore, Pending, Person, Plan, Purpose, RecoveryCode,
+    SetupCode, Snapshot, Writes,
+};
 use crate::store::StoreResult;
 
 #[derive(Default)]
@@ -27,6 +33,101 @@ struct State {
     dir: Directory,
     changes: Vec<RoleChange>,
     next_id: i64,
+    /// Password sign-in (`crate::password`), under the same lock as the directory.
+    pw: Passwords,
+}
+
+/// One setup code as stored, with its owner and end.
+#[derive(Debug, Clone)]
+struct StoredCode {
+    handle: String,
+    code: SetupCode,
+    used_at: Option<DateTime<Utc>>,
+    revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Password sign-in's tables, in memory.
+#[derive(Default)]
+struct Passwords {
+    credentials: BTreeMap<String, Credential>,
+    recovery: BTreeMap<String, Vec<RecoveryCode>>,
+    codes: Vec<StoredCode>,
+    /// By token hash: the owner and the token.
+    pending: BTreeMap<String, (String, Pending)>,
+    next_code_id: i64,
+}
+
+impl Passwords {
+    fn live_code(&self, handle: &str) -> Option<&SetupCode> {
+        self.codes
+            .iter()
+            .find(|c| c.handle == handle && c.used_at.is_none() && c.revoked_at.is_none())
+            .map(|c| &c.code)
+    }
+
+    /// Everything about `handle` goes (the deactivation grace is over).
+    fn forget(&mut self, handle: &str) {
+        self.credentials.remove(handle);
+        self.recovery.remove(handle);
+        self.codes.retain(|c| c.handle != handle);
+        self.pending.retain(|_, (h, _)| h != handle);
+    }
+}
+
+fn person_of(u: &super::User) -> Person {
+    Person {
+        handle: u.handle.clone(),
+        status: u.status,
+        roles: u.role_set(),
+        sign_in_name: u.sign_in_name.clone(),
+        sign_in_name_confirmed: u.sign_in_name_confirmed_at.is_some(),
+    }
+}
+
+/// What the database's checks on the password tables refuse (migration 0020), checked the
+/// same way here before anything is written.
+fn check_writes(handle: &str, exists: bool, w: &Writes, now: DateTime<Utc>) -> StoreResult<()> {
+    let bad = |why: &str| {
+        Err(crate::store::StoreError(format!(
+            "password write refused: {why}"
+        )))
+    };
+    let writes_rows = w.credential.is_some()
+        || w.recovery.is_some()
+        || w.issue_code.is_some()
+        || !w.put_pending.is_empty();
+    if writes_rows && (!exists || handle == super::EVALS) {
+        return bad("no such user, or the evals account");
+    }
+    if let Some(c) = &w.credential {
+        if c.password_hash.is_some() != c.totp_sealed.is_some()
+            || c.password_hash.is_some() != c.set_at.is_some()
+        {
+            return bad("a password without its second step");
+        }
+        if c.password_hash
+            .as_ref()
+            .is_some_and(|h| !h.starts_with("$argon2id$"))
+        {
+            return bad("not an Argon2id hash");
+        }
+    }
+    if let Some(code) = &w.issue_code {
+        if code.expires_at <= now || code.expires_at > now + chrono::Duration::hours(24) {
+            return bad("a setup code lives at most 24 hours");
+        }
+    }
+    for p in &w.put_pending {
+        let setup = p.purpose == Purpose::Setup;
+        if p.expires_at <= p.created_at
+            || p.expires_at > p.created_at + chrono::Duration::minutes(15)
+            || setup != p.setup_code_id.is_some()
+            || (!setup && (p.staged_hash.is_some() || p.staged_totp.is_some()))
+        {
+            return bad("a pending token's shape");
+        }
+    }
+    Ok(())
 }
 
 impl State {
@@ -181,6 +282,11 @@ impl UserStore for MemoryUsers {
                 // The effects next, still under the lock: a failure leaves the directory as
                 // it was (an effect already run is idempotent on a retry).
                 self.run(&plan.effects, now).await?;
+                for effect in &plan.effects {
+                    if let Effect::DeleteSuspendedCredentials(h) = effect {
+                        state.pw.forget(h);
+                    }
+                }
                 let mut next = plan.next;
                 next.capped_deactivations.clear();
                 state.dir = next;
@@ -259,6 +365,199 @@ impl UserStore for MemoryUsers {
 
     async fn link_entra(&self, link: &EntraLink, now: DateTime<Utc>) -> LinkResult {
         self.first_entra_link(link, now).await
+    }
+
+    fn passwords(&self) -> &dyn PasswordStore {
+        self
+    }
+}
+
+// --- Password sign-in (crate::password) -------------------------------------------------------
+
+#[async_trait]
+impl PasswordStore for MemoryUsers {
+    async fn handle_by_sign_in_name(&self, name: &str) -> StoreResult<Option<String>> {
+        let state = self.state.lock().await;
+        Ok(state
+            .dir
+            .users
+            .values()
+            .find(|u| u.sign_in_name.as_deref() == Some(name))
+            .map(|u| u.handle.clone()))
+    }
+
+    async fn handle_by_token(&self, token_hash: &str) -> StoreResult<Option<String>> {
+        let state = self.state.lock().await;
+        Ok(state.pw.pending.get(token_hash).map(|(h, _)| h.clone()))
+    }
+
+    async fn password_tx(
+        &self,
+        handle: &str,
+        actor: Option<&str>,
+        now: DateTime<Utc>,
+        plan: Plan<'_>,
+    ) -> StoreResult<()> {
+        // One person at a time, as the database's lock does; here the one lock covers all.
+        let mut state = self.state.lock().await;
+        let snapshot = Snapshot {
+            person: state.dir.get(handle).map(person_of),
+            actor: actor.and_then(|a| state.dir.get(a)).map(person_of),
+            credential: state.pw.credentials.get(handle).cloned(),
+            recovery: state.pw.recovery.get(handle).cloned().unwrap_or_default(),
+            setup_code: state.pw.live_code(handle).cloned(),
+            pending: state
+                .pw
+                .pending
+                .values()
+                .filter(|(h, _)| h == handle)
+                .map(|(_, p)| p.clone())
+                .collect(),
+        };
+        let w = plan(&snapshot);
+        check_writes(handle, snapshot.person.is_some(), &w, now)?;
+        // The events first: if the audit log can't take them, nothing changes.
+        self.record(w.events.clone()).await?;
+        let pw = &mut state.pw;
+        if let Some(c) = w.credential {
+            pw.credentials.insert(handle.to_string(), c);
+        }
+        if let Some(hashes) = w.recovery {
+            pw.recovery.insert(
+                handle.to_string(),
+                hashes
+                    .into_iter()
+                    .map(|hash| RecoveryCode {
+                        hash,
+                        used_at: None,
+                    })
+                    .collect(),
+            );
+        }
+        if let Some(used) = w.use_recovery {
+            if let Some(codes) = pw.recovery.get_mut(handle) {
+                for c in codes.iter_mut().filter(|c| c.hash == used) {
+                    c.used_at.get_or_insert(now);
+                }
+            }
+        }
+        if let Some(new) = w.issue_code {
+            for c in pw
+                .codes
+                .iter_mut()
+                .filter(|c| c.handle == handle && c.used_at.is_none() && c.revoked_at.is_none())
+            {
+                c.revoked_at = Some(now);
+            }
+            if pw.codes.iter().any(|c| c.code.hash == new.hash) {
+                return Err(crate::store::StoreError("a setup code collided".into()));
+            }
+            pw.next_code_id += 1;
+            pw.codes.push(StoredCode {
+                handle: handle.to_string(),
+                code: SetupCode {
+                    id: pw.next_code_id,
+                    hash: new.hash,
+                    kind: new.kind,
+                    issued_at: now,
+                    issued_by: new.issued_by,
+                    issued_via: new.issued_via,
+                    expires_at: new.expires_at,
+                },
+                used_at: None,
+                revoked_at: None,
+            });
+        }
+        if let Some(id) = w.use_code {
+            for c in pw
+                .codes
+                .iter_mut()
+                .filter(|c| c.code.id == id && c.handle == handle)
+            {
+                c.used_at.get_or_insert(now);
+            }
+            // A token on a code that is gone goes with it.
+            pw.pending
+                .retain(|_, (_, p)| p.setup_code_id.is_none_or(|code| code != id));
+        }
+        if w.clear_pending {
+            pw.pending.retain(|_, (h, _)| h != handle);
+        }
+        for t in &w.delete_pending {
+            if pw.pending.get(t).is_some_and(|(h, _)| h == handle) {
+                pw.pending.remove(t);
+            }
+        }
+        for p in w.put_pending {
+            if pw
+                .pending
+                .get(&p.token_hash)
+                .is_some_and(|(h, _)| h != handle)
+            {
+                return Err(crate::store::StoreError("a token collided".into()));
+            }
+            pw.pending
+                .insert(p.token_hash.clone(), (handle.to_string(), p));
+        }
+        for mut change in w.changes {
+            state.next_id += 1;
+            change.id = state.next_id;
+            state.changes.push(change);
+        }
+        Ok(())
+    }
+
+    async fn password_events(&self, events: Vec<AuditEvent>) -> StoreResult<()> {
+        self.record(events).await
+    }
+
+    async fn password_statuses(
+        &self,
+        now: DateTime<Utc>,
+    ) -> StoreResult<BTreeMap<String, PasswordStatus>> {
+        let state = self.state.lock().await;
+        let mut out = BTreeMap::new();
+        let handles: std::collections::BTreeSet<&String> = state
+            .pw
+            .credentials
+            .keys()
+            .chain(state.pw.codes.iter().map(|c| &c.handle))
+            .collect();
+        for h in handles {
+            out.insert(h.clone(), status_of(&state.pw, h, now));
+        }
+        Ok(out)
+    }
+
+    async fn password_status(
+        &self,
+        handle: &str,
+        now: DateTime<Utc>,
+    ) -> StoreResult<PasswordStatus> {
+        let state = self.state.lock().await;
+        Ok(status_of(&state.pw, handle, now))
+    }
+
+    async fn prune_passwords(&self, now: DateTime<Utc>) -> StoreResult<u64> {
+        let mut state = self.state.lock().await;
+        let pw = &mut state.pw;
+        let before = pw.pending.len() + pw.codes.len();
+        pw.pending.retain(|_, (_, p)| p.expires_at > now);
+        pw.codes.retain(|c| c.code.expires_at > now);
+        Ok((before - pw.pending.len() - pw.codes.len()) as u64)
+    }
+}
+
+fn status_of(pw: &Passwords, handle: &str, now: DateTime<Utc>) -> PasswordStatus {
+    let cred = pw.credentials.get(handle);
+    PasswordStatus {
+        password_set: cred.is_some_and(|c| c.password_hash.is_some()),
+        second_step_enrolled: cred.is_some_and(|c| c.totp_sealed.is_some()),
+        setup_code_pending: pw.live_code(handle).is_some_and(|c| c.expires_at > now),
+        recovery_codes_left: pw.recovery.get(handle).map_or(0, |r| {
+            r.iter().filter(|c| c.used_at.is_none()).count() as u32
+        }),
+        epoch: cred.map_or(0, |c| c.epoch),
     }
 }
 
