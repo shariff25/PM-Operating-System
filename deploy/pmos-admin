@@ -146,11 +146,13 @@ profiles() {
       --models) p+=(--profile models) ;;
       --console) p+=(--profile console) ;;
       --web)
-        if [ "${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}" != 1 ] && ! entra_configured; then
+        if [ "${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}" != 1 ] && ! entra_configured &&
+          [ "${PMOS_WEB_PASSWORD_LOGIN:-0}" != 1 ]; then
           {
             echo "the web app is off: it needs Entra sign-in (PMOS_WEB_ENTRA_TENANT_ID,"
             echo "PMOS_WEB_ENTRA_CLIENT_ID, PMOS_WEB_ENTRA_CLIENT_SECRET and PMOS_WEB_PUBLIC_URL in"
-            echo "deploy/.env; docs/entra-sign-in.md). Or, on a closed test network only, set"
+            echo "deploy/.env; docs/entra-sign-in.md), or password sign-in (PMOS_WEB_PASSWORD_LOGIN=1;"
+            echo "docs/password-sign-in.md). Or, on a closed test network only, set"
             echo "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1 for DEVELOPMENT sign-in"
             echo "(anyone who can reach it signs in as any team member; docs/web-app-running.md)."
           } >&2
@@ -264,7 +266,11 @@ case "$cmd" in
       fi
       if [ "$arg" = --web ]; then client_settings web || exit 2; fi
     done
-    mapfile -t prof < <(profiles "$@")
+    # Not a process substitution: a refusal in `profiles` (an unknown option, a web app with no
+    # sign-in) must stop `up` here, and its exit would be lost in one.
+    profile_lines=$(profiles "$@") || exit $?
+    prof=()
+    [ -z "$profile_lines" ] || mapfile -t prof <<<"$profile_lines"
     assertion_checks || exit 2
     if [ -z "${PMOS_SLACK_APP_TOKEN:-}" ] || [ -z "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
       say "note: the Slack bot is off until PMOS_SLACK_APP_TOKEN and PMOS_SLACK_BOT_TOKEN are set"
@@ -385,13 +391,14 @@ case "$cmd" in
     # without it. A one-off container starts no service, so this needs no assertion check
     # (that is for `up`, `add-bot` and `restore`), and break glass works whatever the mode.
     users_usage() {
-      say "usage: pmos-admin users <bootstrap-admin|grant-admin|revoke-admin|set-entra|unset-entra|set-sign-in-name|set-atlassian-email|deactivate|reactivate|pilot-exception|import|export|list> …" >&2
+      say "usage: pmos-admin users <bootstrap-admin|grant-admin|revoke-admin|set-entra|unset-entra|set-sign-in-name|set-atlassian-email|deactivate|reactivate|pilot-exception|password-setup|import|export|list> …" >&2
       exit 2
     }
     [ $# -ge 1 ] || users_usage
     case "$1" in
       bootstrap-admin | grant-admin | revoke-admin | set-entra | unset-entra | set-sign-in-name | \
-        set-atlassian-email | deactivate | reactivate | pilot-exception | import | export | list) ;;
+        set-atlassian-email | deactivate | reactivate | pilot-exception | password-setup | import | \
+        export | list) ;;
       *) users_usage ;;
     esac
     host_user=${SUDO_USER:-$(id -un)}

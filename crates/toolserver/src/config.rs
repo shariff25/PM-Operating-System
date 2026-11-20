@@ -185,6 +185,15 @@ pub struct Config {
     /// `PMOS_USERS_DEACTIVATIONS_PER_HOUR`: how many deactivations the web and Slack clients
     /// together may make in any rolling hour (1 to 10, default 3); past it, host only.
     pub users_deactivations_per_hour: u32,
+    /// The vault's keys for password sign-in's authenticator secrets
+    /// (`docs/password-sign-in.md`): `PMOS_VAULT_KEY`, required with live connectors and
+    /// optional with fake ones. Without it, password sign-in is off (`501 not_configured`).
+    pub password_keys: Option<KeyRing>,
+    /// Development only (`PMOS_DEV_PASSWORD_SETUP_FOR=<handle>` and
+    /// `PMOS_DEV_PASSWORD_SETUP_FILE=<path>`): at start-up, issue a password setup code for
+    /// that seeded user, as the host would, and write it to that new file (mode 0600). Refused
+    /// with a database, live connectors, no seed or no vault key.
+    pub dev_password_setup: Option<(String, PathBuf)>,
 }
 
 impl Config {
@@ -391,6 +400,43 @@ impl Config {
             },
             None => min_days,
         };
+        let password_keys = match &connectors {
+            Connectors::Live(live) => Some(live.vault_keys.clone()),
+            Connectors::Fake => match get("PMOS_VAULT_KEY").filter(|v| !v.trim().is_empty()) {
+                Some(spec) => {
+                    Some(KeyRing::from_spec(&spec).map_err(|e| format!("PMOS_VAULT_KEY: {e}"))?)
+                }
+                None => None,
+            },
+        };
+        let dev_password_setup = match (
+            get("PMOS_DEV_PASSWORD_SETUP_FOR").filter(|v| !v.trim().is_empty()),
+            get("PMOS_DEV_PASSWORD_SETUP_FILE").filter(|v| !v.trim().is_empty()),
+        ) {
+            (None, None) => None,
+            (Some(handle), Some(file)) => {
+                if database_url.is_some()
+                    || matches!(connectors, Connectors::Live(_))
+                    || users_seed.is_none()
+                    || password_keys.is_none()
+                {
+                    return Err(
+                        "PMOS_DEV_PASSWORD_SETUP_FOR is for an in-memory development stack \
+                                only: it needs PMOS_USERS_SEED and PMOS_VAULT_KEY, fake connectors \
+                                and no PMOS_DATABASE_URL (a real install uses `pmos-admin users \
+                                password-setup`)"
+                            .into(),
+                    );
+                }
+                Some((handle.trim().to_string(), PathBuf::from(file)))
+            }
+            _ => {
+                return Err(
+                    "PMOS_DEV_PASSWORD_SETUP_FOR and PMOS_DEV_PASSWORD_SETUP_FILE go together"
+                        .into(),
+                )
+            }
+        };
         let bind = get("PMOS_BIND")
             .unwrap_or_else(|| "127.0.0.1:8710".into())
             .parse()
@@ -422,6 +468,8 @@ impl Config {
             audit_retention_days,
             users_seed,
             users_deactivations_per_hour,
+            password_keys,
+            dev_password_setup,
         })
     }
 }

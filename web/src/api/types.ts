@@ -322,6 +322,18 @@ export const SERVER_ERROR_CODES = {
   not_reviewer: 'yes',
   not_pm: 'yes',
   deactivation_limit: 'yes',
+  sign_in_failed: 'yes',
+  code_failed: 'yes',
+  sign_in_expired: 'yes',
+  setup_failed: 'yes',
+  setup_expired: 'yes',
+  wrong_step: 'yes',
+  weak_password: 'yes',
+  reauth_failed: 'yes',
+  no_password: 'yes',
+  sign_in_unconfirmed: 'yes',
+  too_many_attempts: 'yes',
+  sign_in_busy: 'yes',
 } as const satisfies Record<string, 'yes' | 'decision' | 'unknown'>;
 
 /** Codes the server sends. */
@@ -509,6 +521,10 @@ export interface DirectoryUser {
   sign_in_name?: string | null;
   atlassian_email?: string | null;
   github_login?: string | null;
+  /** Password sign-in (docs/web-api.md, "Password sign-in"): booleans only. Absent from an older server. */
+  password_set?: boolean;
+  second_step_enrolled?: boolean;
+  setup_code_pending?: boolean;
 }
 
 export interface PilotException {
@@ -569,8 +585,66 @@ export class ApiError extends Error {
   }
 }
 
-/** A way to sign in that the server has turned on. */
-export type AuthProvider = 'entra' | 'dev';
+/** A way to sign in that the server has turned on. `password` is email-and-password sign-in with an authenticator code (docs/web-api.md, "Password sign-in"). */
+export type AuthProvider = 'entra' | 'password' | 'dev';
+
+// ---- Password sign-in (docs/web-api.md, "Password sign-in"). The screens aren't built yet. ----
+
+/** Why a new password was refused (`422 weak_password`'s `reason`). */
+export type WeakPasswordReason = 'too_short' | 'too_long' | 'matches_name' | 'common';
+
+/** `POST /api/auth/password/sign-in`: the password was right; the second step is next. */
+export interface PasswordSignInStarted {
+  next: 'second_step';
+  expires_at: string;
+}
+
+/** `POST /api/auth/password/second-step`: signed in. */
+export interface PasswordSignedIn {
+  recovery_code_used: boolean;
+  recovery_codes_left: number;
+}
+
+/** `POST /api/auth/password/setup/begin`. */
+export interface PasswordSetupStarted {
+  handle: string;
+  kind: 'setup' | 'reset';
+  expires_at: string;
+  password: { min_length: number; max_length: number };
+}
+
+/** `POST /api/auth/password/setup/authenticator`: shown once; the app draws `otpauth_uri` as a QR code. */
+export interface PasswordEnrolment {
+  otpauth_uri: string;
+  secret: string;
+  account: string;
+  issuer: string;
+  algorithm: 'SHA1';
+  digits: 6;
+  period: 30;
+}
+
+/** `POST /api/auth/password/setup/confirm` and `POST /api/auth/password/recovery-codes`: shown once. */
+export interface PasswordRecoveryCodes {
+  kind?: 'setup' | 'reset';
+  recovery_codes: string[];
+}
+
+/** `GET /api/auth/password/status`. */
+export interface PasswordStatus {
+  enabled: boolean;
+  password_set: boolean;
+  second_step_enrolled: boolean;
+  recovery_codes_left: number;
+}
+
+/** `POST /api/admin/users/{handle}/password-setup-code`: shown once to the admin. */
+export interface PasswordSetupCode {
+  setup_code: string;
+  handle: string;
+  kind: 'setup' | 'reset';
+  expires_at: string;
+}
 
 export interface Api {
   /** Public: which sign-in methods the server offers. Never needs a session. */

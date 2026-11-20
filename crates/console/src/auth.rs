@@ -270,6 +270,7 @@ mod tests {
             entra: EntraState::None,
             sign_in_name_confirmed: true,
             dual_role: false,
+            password_epoch: None,
         }
     }
 

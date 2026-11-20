@@ -384,6 +384,27 @@ impl KeyRing {
     }
 }
 
+impl KeyRing {
+    /// Seal `plaintext` under the active key, bound to `aad`: for secrets the vault keeps
+    /// outside linked accounts (password sign-in's authenticator secret,
+    /// `crate::password`). The same format and keys as linked accounts' tokens.
+    pub fn seal_bound(&self, plaintext: &str, aad: &str) -> StoreResult<String> {
+        self.seal(plaintext, aad)
+    }
+
+    /// Unseal what [`KeyRing::seal_bound`] sealed with the same `aad`. Copied to another
+    /// owner's `aad`, it does not unseal.
+    pub fn unseal_bound(&self, sealed: &str, aad: &str) -> StoreResult<String> {
+        self.unseal(sealed, aad)
+    }
+
+    /// Was `sealed` sealed with the active key? (An older key's is re-sealed when next used.)
+    pub fn sealed_with_active(&self, sealed: &str) -> bool {
+        let mut parts = sealed.split('.');
+        parts.next() == Some("v1") && parts.next() == Some(self.active.as_str())
+    }
+}
+
 fn aad(user: &str, provider: Provider, field: &str) -> String {
     format!("pmos-vault|{user}|{provider}|{field}")
 }

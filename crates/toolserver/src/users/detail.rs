@@ -78,8 +78,11 @@ fn role_token(t: &str) -> bool {
 }
 
 fn is_safe_part(part: &str) -> bool {
-    const FIXED: [&str; 18] = [
+    const FIXED: [&str; 20] = [
         "off",
+        // `role_changes` of password sign-in: which kind of code, which credential.
+        "setup",
+        "reset",
         "sign_in_name confirmed",
         // The Admin API's refusals before the store sees a write (`app/users.rs`).
         "bad_request",

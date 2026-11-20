@@ -353,6 +353,14 @@ pub fn user_json(
     v
 }
 
+/// What the Team page shows about a person's password sign-in (docs/password-sign-in.md):
+/// three booleans, never anything secret, for an Admin's and an Auditor's view alike.
+pub fn with_password(v: &mut Value, s: crate::password::store::PasswordStatus) {
+    v["password_set"] = json!(s.password_set);
+    v["second_step_enrolled"] = json!(s.second_step_enrolled);
+    v["setup_code_pending"] = json!(s.setup_code_pending);
+}
+
 /// The cap and grace the screen shows (§6).
 fn limits(state: &AppState, dir: &Directory) -> Value {
     let cap = state.svc.stores().users.rules().deactivations_per_hour as usize;
@@ -410,6 +418,17 @@ async fn list(
         .get(&who)
         .is_some_and(|u| permits(u, Permission::ManageMembers));
     let now = Utc::now();
+    let passwords = match state
+        .svc
+        .stores()
+        .users
+        .passwords()
+        .password_statuses(now)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return store_down(e),
+    };
     let mut users = Vec::new();
     for u in dir.users.values() {
         let accounts = match accounts_of(&state, &u.handle).await {
@@ -417,7 +436,12 @@ async fn list(
             Err(e) => return store_down(e),
         };
         let bots = crate::onboarding::owned_team_bots(&state.svc, &u.handle);
-        users.push(user_json(u, &dir, Some(&accounts), bots, now, admin_view));
+        let mut v = user_json(u, &dir, Some(&accounts), bots, now, admin_view);
+        with_password(
+            &mut v,
+            passwords.get(&u.handle).copied().unwrap_or_default(),
+        );
+        users.push(v);
     }
     no_store(
         Json(json!({
@@ -447,7 +471,19 @@ async fn written(
         Some(u) => {
             let accounts = accounts_of(state, handle).await.ok();
             let bots = crate::onboarding::owned_team_bots(&state.svc, handle);
-            user_json(u, &dir, accounts.as_deref(), bots, Utc::now(), true)
+            let mut v = user_json(u, &dir, accounts.as_deref(), bots, Utc::now(), true);
+            let status = state
+                .svc
+                .stores()
+                .users
+                .passwords()
+                .password_status(handle, Utc::now())
+                .await;
+            match status {
+                Ok(s) => with_password(&mut v, s),
+                Err(e) => return store_down(e),
+            }
+            v
         }
         None => Value::Null,
     };

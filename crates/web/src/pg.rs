@@ -89,12 +89,13 @@ impl SessionStore for PgStore {
     async fn insert(&self, id: IdHash, session: Session) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO web_sessions
-                 (id_hash, handle, csrf_token, created_at, last_seen, entra_oid, entra_tid)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 (id_hash, handle, csrf_token, created_at, last_seen, entra_oid, entra_tid,
+                  password_epoch)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id_hash) DO UPDATE SET handle = EXCLUDED.handle,
                  csrf_token = EXCLUDED.csrf_token, created_at = EXCLUDED.created_at,
                  last_seen = EXCLUDED.last_seen, entra_oid = EXCLUDED.entra_oid,
-                 entra_tid = EXCLUDED.entra_tid",
+                 entra_tid = EXCLUDED.entra_tid, password_epoch = EXCLUDED.password_epoch",
         )
         .bind(&id[..])
         .bind(&session.handle)
@@ -103,6 +104,7 @@ impl SessionStore for PgStore {
         .bind(session.last_seen)
         .bind(&session.entra_oid)
         .bind(&session.entra_tid)
+        .bind(session.password_epoch)
         .execute(&self.pool)
         .await
         .map_err(err)?;
@@ -121,7 +123,8 @@ impl SessionStore for PgStore {
              WHERE id_hash = $1
                AND last_seen + make_interval(secs => $3) > $2
                AND created_at + make_interval(secs => $4) > $2
-             RETURNING handle, csrf_token, created_at, last_seen, entra_oid, entra_tid",
+             RETURNING handle, csrf_token, created_at, last_seen, entra_oid, entra_tid,
+                       password_epoch",
         )
         .bind(&id[..])
         .bind(now)
@@ -138,6 +141,7 @@ impl SessionStore for PgStore {
                 last_seen: r.try_get("last_seen").map_err(err)?,
                 entra_oid: r.try_get("entra_oid").map_err(err)?,
                 entra_tid: r.try_get("entra_tid").map_err(err)?,
+                password_epoch: r.try_get("password_epoch").map_err(err)?,
             })),
             None => {
                 // Expired (or never there): make sure nothing is left of it.

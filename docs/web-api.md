@@ -29,7 +29,9 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
   it starts only on a loopback `PMOS_WEB_BIND` (`127.0.0.1`, `::1`). `pmos-web` refuses to
   start with neither provider, with Entra half-configured, or with both unless
   `PMOS_WEB_DEV_LOGIN_WITH_ENTRA=1` is also set (a development override; it then logs a loud
-  warning). `GET /api/auth/providers` tells the app which buttons to show.
+  warning). **Password sign-in** (`PMOS_WEB_PASSWORD_LOGIN=1`, **Password sign-in** below) is a
+  third provider, off by default, on alone, with Entra, or beside development sign-in.
+  `GET /api/auth/providers` tells the app which buttons to show.
 - **Who you are:** the user database (`docs/user-database-spec.md`), which the tool server
   owns; `pmos-web` asks it with `GET /internal/users/resolve` (`docs/toolserver.md`, "The user
   database's read API") and keeps each answer 10 seconds. There is no team file (`team.yaml`
@@ -45,7 +47,9 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
   session is checked by its `(tid, oid)` on every request: if that key is unlinked, or now
   names someone else, it ends (`401 signed_out`); if the person holds Admin or Auditor and
   the host hasn't confirmed the link, it ends with `403 entra_needs_host`. **Development
-  sign-in** resolves by handle.
+  sign-in** resolves by handle. **Password sign-in** resolves by handle too, and its session
+  also holds the password credential's epoch: a reset or a password change moves it and the
+  session ends (`401 signed_out`).
 - **When the tool server can't be reached** (spec §2, "When the store is unavailable"):
   sign-in fails closed (`503 users_unavailable`, or the callback's
   `reason=users_unavailable`). An existing session may keep using the person's
@@ -70,8 +74,8 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
 
   | `action` | `actor` | `outcome` | `target` | `detail` |
   | --- | --- | --- | --- | --- |
-  | `web.sign_in` | the member | `ok` | `null` | `provider: entra` (or `dev`) |
-  | `web.sign_out` | the member | `ok` | `null` | `provider: entra` (or `dev`) |
+  | `web.sign_in` | the member | `ok` | `null` | `provider: entra` (or `password`, `dev`) |
+  | `web.sign_out` | the member | `ok` | `null` | `provider: entra` (or `password`, `dev`) |
   | `web.sign_in_refused` | `anonymous` | `denied` | `null` | `provider: entra; reason: not_a_member; attempt: 3f9a1c2b4d5e` |
   | `users.identity_conflict` | `anonymous` | `denied` | the user whose sign-in name was presented | `entra` |
 
@@ -110,7 +114,7 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
 
 | Method and path | Body | Answer |
 | --- | --- | --- |
-| `GET /api/auth/providers` | | `{providers: ["entra", "dev"]}`: the providers that are on, Entra first. No session needed. |
+| `GET /api/auth/providers` | | `{providers: ["entra", "password", "dev"]}`: the providers that are on, in that order. No session needed. |
 | `GET /api/auth/login[?return_to=/path]` | | `303` to Microsoft's authorize endpoint, setting the `__Host-pmos-entra` flow cookie (ten minutes). `return_to` is kept only if it is a same-origin path (`/…`, not `//…`); else `/`. `404` unless Entra is on. If Microsoft's metadata can't be fetched: `303` to `/#/signed-out?reason=unavailable`. |
 | `GET /api/auth/callback?code&state` | | Microsoft's redirect back. `303` to the `return_to` path (default `/`) with the session cookie, or `303` to `/#/signed-out?reason=<reason>` with no session. Always clears the flow cookie. `404` unless Entra is on. |
 | `POST /api/auth/dev-login` | `{handle}` | `204` and the cookie. `404` unless development sign-in is on. `400 bad_request` for anything but a handle. `403 not_a_member` for a handle that isn't an active user in the user database. `503 users_unavailable` when the tool server can't be asked. |
@@ -133,6 +137,178 @@ The callback's `reason`s, for the app's signed-out page:
 | `failed` | Anything else (a wrong or reused `state`, a refused code, a token that failed a check). | "Sign-in didn't work. Try again." |
 
 An unknown `reason` should read as `failed`.
+
+## Password sign-in
+
+Email-and-password sign-in with a **required** authenticator-app code, on when `pmos-web` runs
+with `PMOS_WEB_PASSWORD_LOGIN=1` (`GET /api/auth/providers` then lists `password`). The design,
+every limit and the threats are in `docs/password-sign-in.md`. **The tool server decides every
+step**; `pmos-web` holds no password, hash or secret. When password sign-in is off, every route
+here is `404 not_found`.
+
+**There is no way to sign in with a password alone.** A correct password gives a short-lived
+pending sign-in for the second step only (an authenticator code, or a recovery code), and only
+the second step makes a session. There is no email: a person gets a password with a one-time
+**setup code** an admin makes for them on the Team page and passes on; a forgotten password or
+a lost phone is a new code from an admin (a **reset**).
+
+### The flows, step by step
+
+**Set up (or reset)**, with a setup code:
+
+1. `POST /api/auth/password/setup/begin` `{sign_in_name, setup_code}` → `200 SetupStarted`, and
+   the `__Host-pmos-setup` cookie.
+2. `POST /api/auth/password/setup/password` `{password}` → `204`. A refused password is
+   `422 weak_password` with `reason`; send another.
+3. `POST /api/auth/password/setup/authenticator` `{}` → `200 Enrolment`. Show the QR code of
+   `otpauth_uri` (drawn by the app; the server sends no image) and `secret` as text for typing
+   in. Calling it again makes a **new** secret (say so: "scan the new code"); only the last one
+   counts.
+4. `POST /api/auth/password/setup/confirm` `{code}` (6 digits from the app) → `200 SetupDone`:
+   the ten recovery codes, **shown once**, and the session cookie (signed in). The setup cookie
+   is cleared. Every other session the person had ends (a reset signs them out everywhere).
+
+Steps 2 and 3 must come in that order before 4 (`409 wrong_step` otherwise); step 2 may be
+repeated (the last password wins). The setup lasts 15 minutes from step 1 (never past the
+code's own expiry); after that, or after 5 wrong codes at step 4, `401 setup_expired`: start at
+step 1 again with the same code (it is spent only when step 4 succeeds).
+
+**Sign in:**
+
+1. `POST /api/auth/password/sign-in` `{sign_in_name, password}` → `200 SignInStarted` and the
+   `__Host-pmos-pending` cookie. No session yet.
+2. `POST /api/auth/password/second-step` `{code}` **or** `{recovery_code}` (exactly one) →
+   `200 SignedIn` and the session cookie; the pending cookie is cleared. `401 code_failed` with
+   `attempts_left`: try again (3 tries in all); `401 sign_in_expired`: start at step 1.
+
+After step 2 the app continues as after any sign-in: `GET /api/me` for the CSRF token.
+
+**Signed in:** change the password, make new recovery codes, read one's own status (below).
+
+### Routes
+
+| Method and path | Body | Session | Answer |
+| --- | --- | --- | --- |
+| `POST /api/auth/password/sign-in` | `{sign_in_name: string, password: string}` | none | `200 SignInStarted`; sets `__Host-pmos-pending` |
+| `POST /api/auth/password/second-step` | `{code: string}` or `{recovery_code: string}` | none; the pending cookie | `200 SignedIn`; sets `__Host-pmos`, clears `__Host-pmos-pending` |
+| `POST /api/auth/password/setup/begin` | `{sign_in_name: string, setup_code: string}` | none | `200 SetupStarted`; sets `__Host-pmos-setup` |
+| `POST /api/auth/password/setup/password` | `{password: string}` | none; the setup cookie | `204` |
+| `POST /api/auth/password/setup/authenticator` | `{}` | none; the setup cookie | `200 Enrolment` |
+| `POST /api/auth/password/setup/confirm` | `{code: string}` | none; the setup cookie | `200 SetupDone`; sets `__Host-pmos`, clears `__Host-pmos-setup` |
+| `POST /api/auth/password/change` | `{current_password: string, code: string, new_password: string}` | yes, with CSRF | `204`; sets a new `__Host-pmos` (this browser stays signed in, every other session ends) |
+| `POST /api/auth/password/recovery-codes` | `{code: string}` | yes, with CSRF | `200 {recovery_codes: string[10]}`, shown once; the old ones stop working |
+| `GET /api/auth/password/status` | | yes | `200 PasswordStatus` |
+| `POST /api/admin/users/{handle}/password-setup-code` | none or `{}` | yes, with CSRF; `manage-members` | `201 SetupCode`, shown once to the admin |
+
+Every `POST` needs the app's own `Origin` and a JSON body (`Content-Type: application/json`;
+send `{}` where there is nothing to say), the sign-in routes included (`403 bad_origin`,
+`415 bad_content_type`). The signed-in ones also need `X-Pmos-Csrf`. A field a route doesn't
+take, or a missing one, is `400 bad_request`. Every answer is `Cache-Control: no-store`.
+
+**Cookies** (set and read by the server; the app never sees their values): `__Host-pmos-pending`
+(5 minutes) and `__Host-pmos-setup` (15 minutes), both `Path=/; Secure; HttpOnly;
+SameSite=Strict`. A refusal that ends the step (`sign_in_expired`, `setup_expired`, the last
+try used, `not_a_member`, …) clears its cookie. The session cookie is the same `__Host-pmos` as
+every sign-in's.
+
+### Bodies
+
+```json
+// SignInStarted
+{"next": "second_step", "expires_at": "2026-11-20T09:05:00Z"}
+
+// SignedIn
+{"recovery_code_used": false, "recovery_codes_left": 10}
+
+// SetupStarted
+{"handle": "ana", "kind": "setup", "expires_at": "2026-11-20T09:15:00Z",
+ "password": {"min_length": 12, "max_length": 128}}
+
+// Enrolment (shown once)
+{"otpauth_uri": "otpauth://totp/PM%20OS:ana@example.com?secret=JBSWY3DPEHPK3PXP…&issuer=PM%20OS&algorithm=SHA1&digits=6&period=30",
+ "secret": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", "account": "ana@example.com",
+ "issuer": "PM OS", "algorithm": "SHA1", "digits": 6, "period": 30}
+
+// SetupDone (the codes shown once)
+{"kind": "setup", "recovery_codes": ["abcd-efgh-ijkl-mnop", "…ten in all…"]}
+
+// PasswordStatus
+{"enabled": true, "password_set": true, "second_step_enrolled": true, "recovery_codes_left": 9}
+
+// SetupCode (shown once, to the admin)
+{"setup_code": "ABCDE-FGHIJ-KLMNO-PQRST", "handle": "ana", "kind": "reset",
+ "expires_at": "2026-11-21T09:00:00Z"}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `SignInStarted.next` | `"second_step"` | Always: show the code form. |
+| `…expires_at` | string, RFC 3339 | When this step's token ends (sign-in: 5 minutes; setup: 15 minutes, or the code's own expiry if sooner; a setup code: 24 hours). |
+| `SignedIn.recovery_code_used` | boolean | They signed in with a recovery code: suggest making new ones, and say how many are left. |
+| `SignedIn.recovery_codes_left` | integer, 0–10 | Unused recovery codes now. At 0, warn that a lost phone will need an admin. |
+| `SetupStarted.handle` | string | Whose setup this is (show "Setting up as ana"). |
+| `SetupStarted.kind` | `"setup"` or `"reset"` | A first password, or replacing one ("This replaces your password, authenticator and recovery codes, and signs you out everywhere"). |
+| `SetupStarted.password` | object | The length rules to state: `min_length` 12, `max_length` 128. |
+| `Enrolment.otpauth_uri` | string | Draw as a QR code. **A secret**: never log it or keep it after the step. |
+| `Enrolment.secret` | string | The same secret as base32 text, for typing into the app. **A secret.** |
+| `Enrolment.account`, `issuer` | string | What the authenticator app shows (the sign-in name, `PM OS`). |
+| `Enrolment.algorithm`, `digits`, `period` | `"SHA1"`, `6`, `30` | For apps that ask. |
+| `SetupDone.recovery_codes` | string[10] | `xxxx-xxxx-xxxx-xxxx`, lower-case. **Shown once**: offer copy and download; say each works once. |
+| `PasswordStatus.enabled` | boolean | The tool server has password sign-in on. |
+| `PasswordStatus.password_set`, `second_step_enrolled` | boolean | They have a password and an authenticator (always both, or neither). |
+| `PasswordStatus.recovery_codes_left` | integer, 0–10 | Unused recovery codes. |
+| `SetupCode.setup_code` | string | `XXXXX-XXXXX-XXXXX-XXXXX`, 20 letters and digits. **Shown once** to the admin, who passes it on (it is never sent by PM OS). Spaces, hyphens and case don't matter when typed. |
+| `SetupCode.kind` | `"setup"` or `"reset"` | `reset` when the person already has a password: using it replaces everything and signs them out everywhere. |
+
+A `code` is the 6 digits the app shows (spaces are ignored). A `recovery_code` is one of the
+ten (case, spaces and hyphens ignored).
+
+### What a screen should say
+
+- **Passwords:** 12 to 128 characters, any characters (spaces and symbols welcome), no
+  composition rules; not your handle or sign-in name, and not a common password. On
+  `422 weak_password`, word `reason`: `too_short`, `too_long`, `matches_name`, `common`.
+- **A wrong password, name or setup code** never says which was wrong, nor whether the account
+  exists, has a password, is turned off or is waiting (`401 sign_in_failed`,
+  `401 setup_failed`). After **5** failures (passwords and codes together) an account waits
+  30 seconds, then longer with each further failure, at most **15 minutes**; the wait ends on
+  its own. Say "wait a few minutes" rather than a number.
+- **Codes:** 3 tries per sign-in (`attempts_left`), 5 at the setup's confirmation. Each code
+  works once; if one was just used, wait for the next.
+- **Too many tries from one place:** `429 too_many_attempts` with `Retry-After` (seconds): 20
+  refused guesses from one address in 15 minutes, or the server's own limit.
+- **Setup codes** last 24 hours and work once; a new one replaces the old one.
+- **Recovery codes:** ten, each works once; making new ones replaces all ten.
+
+### Errors on these routes
+
+Each is in **Error codes**; `error` is `pmos-web`'s own sentence.
+
+| Route | Refusals |
+| --- | --- |
+| `sign-in` | `401 sign_in_failed` (one answer for every reason), `429 too_many_attempts`, `503 sign_in_busy`, `503 users_unavailable`, `501 not_configured`, `503 assertion_required` |
+| `second-step` | `401 code_failed` (`attempts_left`), `401 sign_in_expired`, `403 not_a_member` (deactivated since the password), `429 too_many_attempts` |
+| `setup/begin` | `401 setup_failed` (one answer for every reason until the code matched), then `403 not_a_member`, `409 sign_in_unconfirmed`, `403 host_only` (an Admin's or Auditor's code must come from the host), `409 evals_account`; `429 too_many_attempts` |
+| `setup/password` | `401 setup_expired`, `422 weak_password` (`reason`), `403 not_a_member`, `503 sign_in_busy` |
+| `setup/authenticator` | `401 setup_expired`, `409 wrong_step` |
+| `setup/confirm` | `401 code_failed` (`attempts_left`), `401 setup_expired`, `409 wrong_step`, `403 host_only`, `409 sign_in_unconfirmed`, `429 too_many_attempts` |
+| `change` | `403 reauth_failed` (the current password or the code), `422 weak_password`, `409 no_password`, `429 too_many_attempts`, `502 unknown_outcome` |
+| `recovery-codes` | `403 reauth_failed`, `409 no_password`, `429 too_many_attempts`, `502 unknown_outcome` |
+| `password-setup-code` | `403 forbidden` (not an active admin), `403 self_change`, `403 host_only` (an Admin or Auditor: `pmos-admin users password-setup`), `404 not_found`, `409 not_active`, `409 sign_in_unconfirmed` (no confirmed sign-in name), `409 evals_account`, `501 not_configured`, `503 assertion_required` |
+
+Every route can also answer `400 bad_request`, `403 bad_origin`, `415 bad_content_type`,
+`502 upstream_unavailable`, `503 unavailable`; the signed-in ones `401 signed_out` and
+`403 bad_csrf`.
+
+### The Team page
+
+Each `User` in `GET /api/admin/users` (**Admin: users and roles**) carries three booleans,
+for an admin's and an auditor's view alike, and never anything secret:
+`password_set`, `second_step_enrolled` (always equal to `password_set` once a setup finished)
+and `setup_code_pending` (a setup or reset code was made, not yet used, not expired). Offer
+"Make a setup code" (or "Make a reset code" when `password_set`) for an active person with a
+confirmed sign-in name; for someone with `host_only` say it takes `pmos-admin users
+password-setup <handle>` instead; never for oneself.
 
 ## Me
 
@@ -514,7 +690,7 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `422` | `invalid` | An admin proposal that doesn't pass validation (`errors`, `warnings`). Also a malformed value in an admin's user or role change, and a reviewer's note over 1,000 characters. | Yes |
 | `422` | `policy_mismatch` | An admin proposal: the tool server regenerates different policy files from it (`paths`). | Yes |
 | `429` | `rate_limited` | Too many admin proposals this hour; `Retry-After`. | Yes |
-| `501` | `not_configured` | Admin proposals are off at the tool server. | Yes |
+| `501` | `not_configured` | Admin proposals are off at the tool server. Also password sign-in on in `pmos-web` while the tool server has no vault key for it. | Yes |
 | `502` | `audit_unavailable` | The audit log couldn't record an admin proposal, or an admin's read of a personal or restricted file, so it wasn't done or shown. | Yes |
 | `502` | `github_refused`, `github_unavailable` | GitHub refused the admin's account, or didn't take the proposal. | Yes |
 | `503` | `github_rate_limited` | GitHub's own rate limit. | Yes |
@@ -524,27 +700,39 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `422` | `bad_brief` | The producer route's body failed a check. | Yes |
 | `501` | `not_built` | The daily brief is off on this server. | Yes |
 | `502` | `upstream_unavailable` | The runtime or tool server couldn't be reached, refused, or answered something unreadable. On a decision, only when the request never reached the tool server, or it refused it. | Yes on a decision; for a task (`POST /api/tasks`), the task may have been made: reload the list |
-| `502` | `unknown_outcome` | A decision was sent, but the answer was lost (the connection dropped, or the tool server failed with a `5xx`), and reading the draft again didn't show it decided. Also an admin proposal whose answer was lost: reload the proposals list. Also an admin's user or role change whose answer was lost: reload the team list. Also a reviewer's recommendation whose answer was lost: read the draft again. | **Unknown** |
+| `502` | `unknown_outcome` | A decision was sent, but the answer was lost (the connection dropped, or the tool server failed with a `5xx`), and reading the draft again didn't show it decided. Also an admin proposal whose answer was lost: reload the proposals list. Also an admin's user or role change whose answer was lost: reload the team list. Also a reviewer's recommendation whose answer was lost: read the draft again. Also a password change or new recovery codes whose answer was lost: sign in again to see. | **Unknown** |
 | `504` | `unknown_outcome` | The same, when the tool server didn't answer in time (10 seconds). | **Unknown** |
 | `503` | `audience_unavailable` | Slack couldn't say who is in the channel. | Yes |
 | `503` | `unavailable` | `pmos-web`'s own store, or the tool server's, is down. | Yes |
 | `503` | `users_unavailable` | The tool server (the user database) can't be asked who the person is: sign-in, and every route but the last-known-good reads (**Sign-in and safety**). | Yes |
 | `403` | `entra_needs_host` | A Microsoft session of someone holding Admin or Auditor whose link the host hasn't confirmed: the session ends. | Yes |
-| `503` | `assertion_required` | An admin's user or role change, or a reviewer's recommendation, while the tool server runs without signed user assertions (a development stack): it makes none. | Yes |
-| `403` | `host_only` | A user or role change only someone with host access may make: granting `admin`, an Admin's or Auditor's addresses or Microsoft link. | Yes |
-| `403` | `self_change` | An admin changing their own roles, status, addresses, links or reviewer assignments. | Yes |
+| `503` | `assertion_required` | An admin's user or role change, a reviewer's recommendation, or any password sign-in route, while the tool server runs without signed user assertions (a development stack): it makes none. | Yes |
+| `403` | `host_only` | A user or role change only someone with host access may make: granting `admin`, an Admin's or Auditor's addresses or Microsoft link, or their password setup code (also when a code the web made is used by someone who holds Admin or Auditor now). | Yes |
+| `403` | `self_change` | An admin changing their own roles, status, addresses, links or reviewer assignments, or making a password setup code for themselves. | Yes |
 | `409` | `exists` | Inviting a handle that is already taken (handles are never reused). | Yes |
 | `409` | `taken` | An address or account that belongs to another user. | Yes |
 | `409` | `unchanged` | A user or role change that changes nothing. | Yes |
 | `409` | `last_admin` | A change that would leave PM OS without an active admin. | Yes |
 | `409` | `dual_role` | A change that would leave someone holding Admin and Auditor without the pilot exception in force. | Yes |
-| `409` | `evals_account` | A change to the `evals` account beyond `pm`. | Yes |
-| `409` | `not_active` | A reviewer assignment naming someone deactivated. | Yes |
+| `409` | `evals_account` | A change to the `evals` account beyond `pm`, or a password for it. | Yes |
+| `409` | `not_active` | A reviewer assignment naming someone deactivated, or a password setup code for them. | Yes |
 | `409` | `linked` | Changing an Atlassian email or GitHub login while that account is linked. | Yes |
 | `409` | `owns_bots` | Deactivating someone who still owns a team bot. | Yes |
 | `409` | `not_reviewer` | Assigning PMs to someone without the reviewer role. | Yes |
 | `409` | `not_pm` | Assigning a reviewer someone without the pm role. | Yes |
 | `429` | `deactivation_limit` | The hourly deactivation cap (3 by default, web and Slack together) is reached. | Yes |
+| `401` | `sign_in_failed` | Password sign-in's first step, for every reason alike: no such user, no password, a wrong password, deactivated, or the account waiting out its delay (**Password sign-in**). | Yes |
+| `401` | `code_failed` | A wrong authenticator or recovery code; `attempts_left` says how many tries this step has left. | Yes |
+| `401` | `sign_in_expired` | No password sign-in in progress (none started, five minutes passed, or its tries used up): start again with the password. | Yes |
+| `401` | `setup_failed` | A password setup's first step, for every reason alike: no such user, no code, a wrong, expired or replaced code, or the account waiting. | Yes |
+| `401` | `setup_expired` | No password setup in progress (fifteen minutes passed, or its tries used up): start again with the setup code. | Yes |
+| `409` | `wrong_step` | A password setup's steps out of order: the password, then the authenticator, then the code. | Yes |
+| `422` | `weak_password` | A new password isn't accepted; `reason` is `too_short`, `too_long`, `matches_name` or `common`. | Yes |
+| `403` | `reauth_failed` | Changing a password or making new recovery codes: the current password or the authenticator code wasn't right. | Yes |
+| `409` | `no_password` | Changing a password, or making new recovery codes, for someone without a password. | Yes |
+| `409` | `sign_in_unconfirmed` | A password setup code for someone whose sign-in name no admin has confirmed, or a setup started with one. | Yes |
+| `429` | `too_many_attempts` | Password sign-in: too many refused guesses from one address (20 in 15 minutes), the server's own limit, or the account's delay on a signed-in change; `Retry-After`. | Yes |
+| `503` | `sign_in_busy` | Password sign-in: every password check is busy; try again in a moment. | Yes |
 
 After an `unknown_outcome` the server has already read the draft once: if it showed this PM's
 approval (or rejection), the answer would have been that draft, `200`. Approving again is safe:
@@ -818,6 +1006,7 @@ trip.
 | `POST /api/admin/users/{handle}/reactivate` | none, `{}` or `{expected_version}` | admin | `200` `Written` |
 | `DELETE /api/admin/users/{handle}/identities/{kind}` | none | admin | `200` `Written` |
 | `PUT /api/admin/reviewers/{reviewer}` | `{pms, expected_version?}` | admin | `200` `Written` (the reviewer) |
+| `POST /api/admin/users/{handle}/password-setup-code` | none or `{}` | admin | `201` `SetupCode`, shown once (**Password sign-in**) |
 
 Every write is a `POST`, `PUT` or `DELETE` and so needs the session's CSRF token and the app's
 own `Origin`, as every write does (**Sign-in and safety**). Any other method on these paths is
@@ -884,6 +1073,7 @@ Every successful write answers the new `version`; use it for the next write.
     "accounts": {"atlassian": true, "slack": true, "github": false},
     "host_only": false, "bot": "pm-ana", "team_bots": ["scout"],
     "reviews": [], "reviewed_by": ["rex"],
+    "password_set": true, "second_step_enrolled": true, "setup_code_pending": false,
     "sign_in_name": "ana@contoso.com", "atlassian_email": "ana@contoso.com",
     "github_login": null}
  ],
@@ -930,6 +1120,9 @@ Every successful write answers the new `version`; use it for the next write.
 | `team_bots` | string[] | Team bots they own: they can't be deactivated until each has another owner. |
 | `reviews` | string[] | For a reviewer: the PMs assigned to them, sorted. |
 | `reviewed_by` | string[] | The reviewers this person is assigned to. |
+| `password_set` | boolean | They have a password for password sign-in (**Password sign-in**). An older server leaves it out: treat as `false`. |
+| `second_step_enrolled` | boolean | They have an authenticator for its second step (with a password, always). |
+| `setup_code_pending` | boolean | A setup or reset code was made for them and is unused and unexpired. |
 | `sign_in_name` | string or `null` | **Admin view only.** Lower-case. |
 | `atlassian_email` | string or `null` | **Admin view only.** Lower-case. |
 | `github_login` | string or `null` | **Admin view only.** |

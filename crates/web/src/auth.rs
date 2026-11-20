@@ -97,6 +97,26 @@ impl AuthProvider for DevLoginProvider {
     }
 }
 
+/// Password sign-in (`PMOS_WEB_PASSWORD_LOGIN=1`, `docs/password-sign-in.md`): listed so the
+/// app shows its form. Its routes (`app::password`) hand what the person typed to the tool
+/// server, which decides; this provider takes no input itself.
+pub struct PasswordProvider;
+
+#[async_trait]
+impl AuthProvider for PasswordProvider {
+    fn name(&self) -> &'static str {
+        "password"
+    }
+
+    fn is_insecure(&self) -> bool {
+        false
+    }
+
+    async fn authenticate(&self, _input: &SignInInput) -> Result<Claimed, SignInError> {
+        Err(SignInError::Unsupported)
+    }
+}
+
 /// Whether a write came from the web app's own pages: never from another site, and with an
 /// `Origin` (or else `Referer`) matching `public_url`, or the request's `Host` without it. A
 /// request with neither header is refused: every browser sends `Origin` on a `POST`, `PUT`

@@ -4,6 +4,10 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- **PM OS can now sign people in with a password and an authenticator app**, beside Microsoft
+  sign-in or on its own (`PMOS_WEB_PASSWORD_LOGIN=1`): a one-time setup code from an admin,
+  a password, then always a code from the app (or a recovery code). The back end and its
+  contract are built (`docs/password-sign-in.md`); the screens come next.
 - **People and roles have one home: the PM OS user database.** `content/team.yaml` is retired:
   no part of PM OS reads it, onboarding no longer commits it, and `pmos lint` refuses one in
   the content. Upgrading an install that still has the file means importing it once

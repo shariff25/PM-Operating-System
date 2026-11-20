@@ -395,6 +395,9 @@ pub struct ToolService {
     audiences: Mutex<HashMap<String, (String, bool)>>,
     /// `PMOS_AUDIT_RETENTION_DAYS`, for the admin overview.
     audit_retention_days: u32,
+    /// Password sign-in (`crate::password`), when `PMOS_VAULT_KEY` gives it a key to seal
+    /// authenticator secrets with. `None`: its routes answer `501 not_configured`.
+    passwords: Option<Arc<crate::password::PasswordService>>,
 }
 
 /// The most audience results kept in memory; past it the oldest are forgotten all at once.
@@ -446,7 +449,19 @@ impl ToolService {
             slack_draft_ttl: Duration::hours(DEFAULT_SLACK_DRAFT_TTL_HOURS),
             audiences: Mutex::default(),
             audit_retention_days: crate::audit::MIN_RETENTION_DAYS,
+            passwords: None,
         })
+    }
+
+    /// Turn password sign-in on, with its service (the vault's keys, the hashing parameters).
+    pub fn with_passwords(mut self, passwords: Arc<crate::password::PasswordService>) -> Self {
+        self.passwords = Some(passwords);
+        self
+    }
+
+    /// Password sign-in, when it is on.
+    pub fn passwords(&self) -> Option<&Arc<crate::password::PasswordService>> {
+        self.passwords.as_ref()
     }
 
     /// Expire undecided Slack drafts, and remove decided ones' text, after `hours`

@@ -43,6 +43,11 @@
 #                         machine only). Unset: nothing about the web app runs. With it, the
 #                         daily brief (`brief now` in a DM) also fills the app's home page:
 #                         Slack and pmos-web share a fresh brief token (docs/daily-brief.md).
+#   PMOS_TEST_PASSWORD_LOGIN=1
+#                         with PMOS_TEST_WEB=1: also turn on password sign-in with an
+#                         authenticator code (docs/password-sign-in.md), with a fresh vault key
+#                         for this run, and print a one-time setup code for you (sign-in name
+#                         <handle>@example.com) once the stack is up. Fake data only.
 #
 # Stop with Ctrl-C; every service is stopped with it.
 set -euo pipefail
@@ -63,6 +68,10 @@ else
   MODEL_DESC="Claude (config/gateway.claude-test.yaml)"
 fi
 HANDLE="${PMOS_TEST_HANDLE:-tester}"
+if [ "${PMOS_TEST_PASSWORD_LOGIN:-}" = 1 ] && [ "${PMOS_TEST_WEB:-}" != 1 ]; then
+  echo "error: PMOS_TEST_PASSWORD_LOGIN=1 needs PMOS_TEST_WEB=1 (it is a way to sign in to the web app)" >&2
+  exit 1
+fi
 
 # --- Slack app preflight -------------------------------------------------------------------
 # Before anything starts: both tokens are valid and belong to the same Slack app, and the bot
@@ -159,8 +168,14 @@ rm -rf "$STATE/content"
 cp -r content "$STATE/content"
 "$BIN/pmos" bot add-personal --root "$STATE/content" --handle "$HANDLE" >/dev/null
 # The user database's seed: beside the content, never in it (slice U7: no team file).
-printf 'members:\n  - {handle: "%s", slack-id: "%s", roles: [pm, admin]}\n' \
-  "$HANDLE" "$PMOS_TEST_SLACK_ID" >"$STATE/users.seed.yaml"
+if [ "${PMOS_TEST_PASSWORD_LOGIN:-}" = 1 ]; then
+  # Password sign-in needs a confirmed sign-in name (the seed's email is one): a fake address.
+  printf 'members:\n  - {handle: "%s", slack-id: "%s", email: "%s@example.com", roles: [pm, admin]}\n' \
+    "$HANDLE" "$PMOS_TEST_SLACK_ID" "$HANDLE" >"$STATE/users.seed.yaml"
+else
+  printf 'members:\n  - {handle: "%s", slack-id: "%s", roles: [pm, admin]}\n' \
+    "$HANDLE" "$PMOS_TEST_SLACK_ID" >"$STATE/users.seed.yaml"
+fi
 "$BIN/pmos" lint --root "$STATE/content" | tail -1
 
 if [ -n "${PMOS_TEST_MODEL_URL:-}" ]; then
@@ -207,6 +222,16 @@ if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
 else
   SLACK_WEB_FEED=()
 fi
+# Password sign-in (docs/password-sign-in.md): a vault key for this run to seal the
+# authenticator secret with, and a setup code the tool server writes to a 0600 file at start-up
+# (development only; it refuses with a database or live connectors).
+TS_PASSWORD=() WEB_PASSWORD=()
+if [ "${PMOS_TEST_PASSWORD_LOGIN:-}" = 1 ]; then
+  rm -f "$STATE/password-setup-code"
+  TS_PASSWORD=(PMOS_VAULT_KEY="pw1:$(openssl rand -base64 32)"
+    PMOS_DEV_PASSWORD_SETUP_FOR="$HANDLE" PMOS_DEV_PASSWORD_SETUP_FILE="$STATE/password-setup-code")
+  WEB_PASSWORD=(PMOS_WEB_PASSWORD_LOGIN=1)
+fi
 
 PIDS=()
 start() { # name, then the command; logs go to $STATE/logs/<name>.log
@@ -245,6 +270,7 @@ start toolserver env PMOS_DEV=1 PMOS_CONNECTORS=fake \
   PMOS_WEB_TOKEN="$TS_WEB" PMOS_ASSERTION_MODE="$ASSERTION_MODE" PMOS_ASSERTION_KEYS="$AK_TOOLS" \
   PMOS_CONTENT_ROOT="$STATE/content" PMOS_AUDIT_LOG="$STATE/audit.jsonl" \
   PMOS_DOCS_URL=http://127.0.0.1:8730/mcp PMOS_DOCS_TOKEN="$DOCS_TOKEN" \
+  ${TS_PASSWORD[@]+"${TS_PASSWORD[@]}"} \
   "$BIN/pmos-toolserver"
 wait_for http://127.0.0.1:8710/healthz toolserver
 
@@ -288,6 +314,7 @@ if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
     PMOS_WEB_BRIEF=1 PMOS_WEB_BRIEF_TOKEN="$WEB_BRIEF_TOKEN" \
     PMOS_BOTS_URL=http://127.0.0.1:8750 PMOS_TOOLSERVER_URL=http://127.0.0.1:8710 \
     PMOS_CONTENT_ROOT="$STATE/content" PMOS_WEB_STATIC_DIR="$ROOT/web/dist" \
+    ${WEB_PASSWORD[@]+"${WEB_PASSWORD[@]}"} \
     "$BIN/pmos-web"
   wait_for http://127.0.0.1:8770/healthz web
 fi
@@ -300,6 +327,11 @@ echo "   summarize the open launch issues    (your bot $BOT_PERSONAL, fake Jira)
 echo "   setup                               (the onboarding checklist)"
 if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
   echo "   Web app: http://127.0.0.1:8770 (sign in as $HANDLE; development sign-in, this machine only)"
+fi
+if [ "${PMOS_TEST_PASSWORD_LOGIN:-}" = 1 ]; then
+  # TESTING ONLY: a one-time code for this run's fake account, shown so you can set it up.
+  echo "   Password sign-in: set up with sign-in name $HANDLE@example.com and the one-time code"
+  echo "   $(cat "$STATE/password-setup-code") (24 hours; you'll need an authenticator app)."
 fi
 echo "   Logs: $STATE/logs; model calls (who, role, tokens; never text): $STATE/usage.jsonl."
 echo "   Prompts go to the test model off this machine: fake data only. Ctrl-C stops everything."
