@@ -1102,9 +1102,6 @@ export const copy = {
         resetsNext: 'Each person sees who reset it and when. Check the reset was asked for.',
         resetsDismissed: (n: number) =>
           n === 1 ? 'One of them has dismissed the notice.' : `${n} of them have dismissed the notice.`,
-        voided: (n: number) =>
-          n === 1 ? 'A setup code was made void after too many wrong tries' : `${n} setup codes were made void after too many wrong tries`,
-        voidedNext: 'Someone kept guessing at it. Make a new setup code for them on the Team page and hand it over straight away.',
       },
       notices: {
         ending: (date: string) => `The pilot exception ends on ${date}. After that nobody may hold Admin and Auditor together.`,

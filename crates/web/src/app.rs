@@ -165,6 +165,9 @@ struct Inner {
     untrusted_proxy_refusals: std::sync::atomic::AtomicU64,
     /// When that was last logged (Unix seconds), so the log says it at most once a minute.
     untrusted_proxy_logged: std::sync::atomic::AtomicI64,
+    /// When the last such refusal was (Unix seconds; 0: never): `/readyz` warns while it is
+    /// recent (the gate review of 04c175f, GL3).
+    untrusted_proxy_last_at: std::sync::atomic::AtomicI64,
     /// Password sign-in (`PMOS_WEB_PASSWORD_LOGIN=1`; `password.rs`).
     password_login: bool,
     /// `PMOS_WEB_TRUSTED_PROXIES`: whose `X-Forwarded-For` names the client's address.
@@ -308,6 +311,7 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         sign_in_record_failures: Default::default(),
         untrusted_proxy_refusals: Default::default(),
         untrusted_proxy_logged: Default::default(),
+        untrusted_proxy_last_at: Default::default(),
         password_login: config.password_login,
         trusted_proxies: config.trusted_proxies,
         sources: Default::default(),
@@ -441,6 +445,9 @@ async fn entra_link_ready(state: &AppState) -> Option<bool> {
 /// tool server validates first-link ID tokens for the same tenant and client id as this
 /// server (`GET /internal/users/entra-link`); without that, a first Microsoft sign-in can't
 /// link, so the server isn't ready.
+/// How long after the last `proxy_not_trusted` refusal `/readyz` keeps its warning (GL3).
+pub const UNTRUSTED_PROXY_WARN_MINUTES: i64 = 15;
+
 async fn readyz(State(state): State<AppState>) -> Response {
     let (store, runtime, toolserver, entra_link) = tokio::join!(
         state.0.sessions.ping(),
@@ -482,6 +489,17 @@ async fn readyz(State(state): State<AppState>) -> Response {
         .0
         .untrusted_proxy_refusals
         .load(std::sync::atomic::Ordering::Relaxed);
+    // GL3: a warning, not unready (Entra and every other route still serve), while password
+    // requests were refused `proxy_not_trusted` in the last UNTRUSTED_PROXY_WARN_MINUTES: then
+    // every browser behind that proxy is being refused. `pmos-admin status` shows it.
+    let last = state
+        .0
+        .untrusted_proxy_last_at
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let mut warnings = Vec::new();
+    if last > 0 && now(&state).timestamp() - last < UNTRUSTED_PROXY_WARN_MINUTES * 60 {
+        warnings.push("untrusted_proxy_refusals");
+    }
     (
         status,
         [(header::CACHE_CONTROL, "no-store")],
@@ -490,6 +508,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
             "checks": body,
             "unrecorded_sign_in_events": unrecorded,
             "untrusted_proxy_refusals": untrusted,
+            "warnings": warnings,
         })),
     )
         .into_response()
