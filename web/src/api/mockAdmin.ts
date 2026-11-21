@@ -1,9 +1,10 @@
 // Sample data for the Admin area: an audit log, a team, connectors and the overview counts.
 // Fake names and ids only. Used by the sample-data client (tests and the dev server).
+import { MOCK_CATALOG } from './mockBots';
 import { createMockUsers } from './mockUsers';
 import type { MockUsers, MockUsersOptions } from './mockUsers';
 import { ApiError } from './types';
-import type { AdminOverview, AuditEvent, AuditExport, AuditPage, AuditQuery, Connector, TeamList, TeamMember } from './types';
+import type { AdminBot, AdminBots, AdminHeldDraft, AdminOverview, AuditEvent, AuditExport, AuditPage, AuditQuery, Connector, TeamList, TeamMember } from './types';
 
 export type MockRole = 'pm' | 'admin' | 'auditor' | 'reviewer';
 
@@ -96,12 +97,14 @@ interface Template {
   titled: number;
   skill: string | null;
   bot: string | null;
+  /** The marketplace bot the event ran as; absent is Nudge or no bot. */
+  persona?: string;
 }
 
 const T: Template[] = [
   { actor: 'ana', client: 'mcp', action: 'jira.search', target: null, outcome: 'ok', detail: null, sources: 8, titled: 8, skill: 'brief', bot: 'pm-ana' },
-  { actor: 'ana', client: 'mcp', action: 'confluence.create_draft', target: 'apr_prd', outcome: 'pending', detail: null, sources: 5, titled: 4, skill: 'prd', bot: 'pm-ana' },
-  { actor: 'ana', client: 'web', action: 'jira.create_issue', target: 'https://acme.atlassian.net/browse/PAY-301', outcome: 'approved', detail: 'edited before approval', sources: 3, titled: 2, skill: null, bot: 'pm-ana' },
+  { actor: 'ana', client: 'mcp', action: 'confluence.create_draft', target: 'apr_prd', outcome: 'pending', detail: null, sources: 5, titled: 4, skill: 'prd', bot: 'pm-ana', persona: 'chief' },
+  { actor: 'ana', client: 'web', action: 'jira.create_issue', target: 'https://acme.atlassian.net/browse/PAY-301', outcome: 'approved', detail: 'edited before approval', sources: 3, titled: 2, skill: null, bot: 'pm-ana', persona: 'chief' },
   { actor: 'ben', client: 'bot', action: 'slack.post_reply', target: null, outcome: 'denied', detail: null, sources: 0, titled: 0, skill: 'reply', bot: null },
   { actor: 'ben', client: 'mcp', action: 'slack.read_thread', target: null, outcome: 'ok', detail: null, sources: 14, titled: 0, skill: 'reply', bot: 'pm-ben' },
   { actor: 'dana', client: 'web', action: 'confluence.create_page', target: 'https://acme.atlassian.net/wiki/spaces/PM/pages/48211', outcome: 'approved', detail: null, sources: 6, titled: 6, skill: null, bot: 'pm-dana' },
@@ -114,7 +117,7 @@ const T: Template[] = [
   { actor: 'priya', client: 'mcp', action: 'jira.update_issue', target: 'apr_77be', outcome: 'failed', detail: null, sources: 1, titled: 1, skill: 'triage', bot: 'pm-priya' },
   { actor: 'priya', client: 'web', action: 'slack.post_reply', target: 'apr_51aa', outcome: 'granted', detail: 'approved in the inbox; writing', sources: 2, titled: 0, skill: 'reply', bot: 'pm-priya' },
   { actor: 'audrey', client: 'web', action: 'admin.audit_export', target: null, outcome: 'ok', detail: null, sources: 0, titled: 0, skill: null, bot: null },
-  { actor: 'dana', client: 'mcp', action: 'docs.search', target: null, outcome: 'error', detail: null, sources: 0, titled: 0, skill: 'brief', bot: 'pm-dana' },
+  { actor: 'dana', client: 'mcp', action: 'docs.search', target: null, outcome: 'error', detail: null, sources: 0, titled: 0, skill: 'brief', bot: 'pm-dana', persona: 'echo' },
   { actor: 'ben', client: 'web', action: 'admin.overview', target: null, outcome: 'denied', detail: null, sources: 0, titled: 0, skill: null, bot: null },
   { actor: 'ana', client: 'web', action: 'slack.post_reply', target: 'apr_e19c', outcome: 'started', detail: 'approved in the inbox; writing', sources: 1, titled: 0, skill: 'reply', bot: 'pm-ana' },
 ];
@@ -139,6 +142,7 @@ function buildEvents(now: number, count: number): AuditEvent[] {
       titled_sources: tpl.titled,
       skill: tpl.skill,
       bot: tpl.bot,
+      persona: tpl.persona ?? null,
       task_id: tpl.action.startsWith('admin.') ? 'admin' : tpl.client === 'mcp' ? `run_${(7000 + i * 13).toString(16)}` : `tsk_01JD${(4100 + i * 29).toString(36).toUpperCase()}`,
     });
     // Gaps of 3 to 95 minutes, so a week holds a hundred or so events.
@@ -157,7 +161,7 @@ const MEMBERS: TeamMember[] = [
   { handle: 'audrey', name: 'audrey', roles: ['auditor'], has_email: false, bot: 'pm-audrey', accounts: { atlassian: false, slack: false, github: false } },
 ];
 
-const CSV_COLUMNS = ['at', 'actor', 'client', 'action', 'system', 'target', 'outcome', 'detail', 'sources', 'titled_sources', 'skill', 'bot', 'task_id', 'id'] as const;
+const CSV_COLUMNS = ['at', 'actor', 'client', 'action', 'system', 'target', 'outcome', 'detail', 'sources', 'titled_sources', 'skill', 'bot', 'task_id', 'id', 'persona'] as const;
 
 /** Every cell quoted, quotes doubled, and a leading ' on a cell a spreadsheet would run as a formula. */
 export function csvCell(v: string | number | null): string {
@@ -168,7 +172,7 @@ export function csvCell(v: string | number | null): string {
 
 export function toCsv(events: AuditEvent[]): string {
   const lines = [CSV_COLUMNS.map((c) => csvCell(c)).join(',')];
-  for (const e of events) lines.push(CSV_COLUMNS.map((c) => csvCell(e[c])).join(','));
+  for (const e of events) lines.push(CSV_COLUMNS.map((c) => csvCell(e[c] ?? null)).join(','));
   return lines.join('\r\n') + '\r\n';
 }
 
@@ -182,8 +186,19 @@ function indexOfCursor(cursor: string): number {
   return n;
 }
 
+/** Who has each bot in the sample team, and what else the admin view shows of it. */
+const BOT_USAGE: Record<string, { handles: string[]; drafts: number; clashes?: string[]; lint?: AdminBot['lint'] }> = {
+  chief: { handles: ['ana', 'ben', 'dana', 'ravi'], drafts: 23 },
+  sprout: { handles: ['ana', 'priya'], drafts: 6 },
+  echo: { handles: ['dana'], drafts: 3, clashes: ['echo'], lint: { status: 'warning', errors: 0, warnings: 1 } },
+  scout: { handles: ['ana', 'ravi'], drafts: 2 },
+};
+
 export interface MockAdmin {
   overview(): AdminOverview;
+  bots(canEdit: boolean): AdminBots;
+  /** Release a held draft: false when there is none by that id. */
+  release(id: string): boolean;
   audit(q: AuditQuery): AuditPage;
   auditExport(q: AuditQuery): AuditExport;
   team(): TeamList;
@@ -206,13 +221,60 @@ export function createMockAdmin(now: number, options: MockAdminOptions, pendingD
         (!q.actor || e.actor === q.actor) &&
         (!q.action || e.action === q.action) &&
         (!q.outcome || e.outcome === q.outcome) &&
+        (!q.persona || e.persona === q.persona) &&
         (!q.from || Date.parse(e.at) >= Date.parse(q.from)) &&
         (!q.to || Date.parse(e.at) < Date.parse(q.to)),
     );
   };
 
+  // Drafts on hold: the withdrawn Scout's pending drafts, and one of a bot deleted from the catalog.
+  const held: Record<string, AdminHeldDraft[]> = {
+    scout: [
+      { id: 'apr_held', user: 'ana', kind: 'confluence_page', tool: 'confluence.create_draft', created_at: new Date(now - 5 * 60 * MIN).toISOString() },
+      { id: 'apr_held_ravi', user: 'ravi', kind: 'jira_issue', tool: 'jira.create_issue', created_at: new Date(now - 30 * 60 * MIN).toISOString() },
+    ],
+    atlas: [{ id: 'apr_held_atlas', user: 'ravi', kind: 'slack_reply', tool: 'slack.post_reply', created_at: new Date(now - 3 * 24 * 60 * MIN).toISOString() }],
+  };
+
   return {
     users,
+    bots(canEdit) {
+      if (down) throw new ApiError(503, 'unavailable', 'The tool server is not answering.');
+      const bots: AdminBot[] = MOCK_CATALOG.map((c) => {
+        const u = BOT_USAGE[c.key];
+        const state = !c.offered ? 'withdrawn' : c.preview ? 'preview' : 'offered';
+        return {
+          key: c.key,
+          display_name: c.display_name,
+          mascot: c.mascot,
+          state,
+          offered: c.offered,
+          always_on: c.always_on,
+          preview: c.preview ?? false,
+          users: c.always_on ? null : (u?.handles.length ?? 0),
+          handles: c.always_on ? null : [...(u?.handles ?? [])],
+          needs: c.needs.map(({ source, label, met }) => ({ source, label, met })),
+          drafts_30d: c.always_on ? 41 : (u?.drafts ?? 0),
+          name_clashes: [...(u?.clashes ?? [])],
+          held: structuredClone(held[c.key] ?? []),
+          path: `content/personas/${c.key}/PERSONA.md`,
+          lint: u?.lint ?? { status: 'ok', errors: 0, warnings: 0 },
+        };
+      });
+      const unknown = [{ key: 'atlas', users: 1, handles: ['ravi'], drafts_30d: 0, held: structuredClone(held.atlas ?? []) }];
+      const total = Object.values(held).reduce((n, l) => n + l.length, 0);
+      return { bots, unknown, held_total: total, can_release: canEdit, can_edit_content: canEdit };
+    },
+    release(id) {
+      for (const list of Object.values(held)) {
+        const i = list.findIndex((h) => h.id === id);
+        if (i >= 0) {
+          list.splice(i, 1);
+          return true;
+        }
+      }
+      return false;
+    },
     overview() {
       const since = now - 7 * 24 * 60 * MIN;
       const count = (outcome: string) => events.filter((e) => e.outcome === outcome && Date.parse(e.at) >= since).length;

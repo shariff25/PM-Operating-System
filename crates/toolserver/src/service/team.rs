@@ -327,6 +327,11 @@ impl ToolService {
     /// have it on their team and who, its needs, and how many items it drafted in the last 30
     /// days; Nudge first (on every team: `users` and `handles` are `null`). `unknown` lists
     /// team rows naming a persona no longer in the catalog. Keys, handles and counts only.
+    ///
+    /// Slice A1 adds `mascot` (a key from the fixed set) and each persona's **held** drafts
+    /// (`held`: `{id, user, tool, created_at}` each, newest first, at most [`ADMIN_HELD_CAP`] in
+    /// all; `held_total` at the top counts every held draft), so an Admin can find and release them; the same for an `unknown`
+    /// key. Metadata only: never a draft's title, text or arguments.
     pub async fn admin_personas(&self, now: DateTime<Utc>) -> Result<Value, StoreError> {
         let roster = self.roster();
         let rows = self.stores().teams.rows().await?;
@@ -335,6 +340,27 @@ impl ToolService {
             .approvals
             .persona_counts(None, now - Duration::days(30))
             .await?;
+        let offered: Vec<String> = roster
+            .personas()
+            .filter(|p| roster.offered(&p.name).is_some())
+            .map(|p| p.name.clone())
+            .collect();
+        let (held_items, held_total) = self
+            .stores()
+            .approvals
+            .unreleased_pending_outside(&offered, ADMIN_HELD_CAP)
+            .await?;
+        let mut held: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for item in &held_items {
+            if let Some(key) = &item.persona {
+                held.entry(key.clone()).or_default().push(json!({
+                    "id": item.id,
+                    "user": item.user,
+                    "tool": item.tool,
+                    "created_at": item.created_at,
+                }));
+            }
+        }
         let mut holders: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (persona, handle) in &rows {
             holders.entry(persona).or_default().push(handle);
@@ -368,6 +394,7 @@ impl ToolService {
             personas.push(json!({
                 "key": p.name,
                 "display_name": p.display_name,
+                "mascot": p.mascot,
                 "offered": roster.offered(&p.name).is_some(),
                 "always_on": p.always_on,
                 "preview": p.preview,
@@ -380,20 +407,30 @@ impl ToolService {
                 })).collect::<Vec<_>>(),
                 "drafts_30d": drafts.get(&p.name).copied().unwrap_or(0),
                 "name_clashes": clashes,
+                "held": held.remove(&p.name).unwrap_or_default(),
             }));
         }
-        let unknown: Vec<Value> = holders
+        // Keys no longer in the catalog: named by a team row, by a held draft, or both.
+        let mut gone: BTreeMap<String, Vec<&str>> = holders
+            .into_iter()
+            .map(|(k, h)| (k.to_string(), h))
+            .collect();
+        for key in held.keys() {
+            gone.entry(key.clone()).or_default();
+        }
+        let unknown: Vec<Value> = gone
             .into_iter()
             .map(|(key, handles)| {
                 json!({
-                    "key": key,
                     "users": handles.len(),
                     "handles": handles,
-                    "drafts_30d": drafts.get(key).copied().unwrap_or(0),
+                    "drafts_30d": drafts.get(&key).copied().unwrap_or(0),
+                    "held": held.remove(&key).unwrap_or_default(),
+                    "key": key,
                 })
             })
             .collect();
-        Ok(json!({ "personas": personas, "unknown": unknown }))
+        Ok(json!({ "personas": personas, "unknown": unknown, "held_total": held_total }))
     }
 
     /// Whether `item` is **held** (`docs/bot-marketplace-spec.md` §6, "Removal", as the
@@ -500,6 +537,9 @@ impl ToolService {
         Ok(())
     }
 }
+
+/// The most held drafts the admin view lists (newest first); `held_total` counts them all.
+pub const ADMIN_HELD_CAP: usize = 200;
 
 /// The audit tool of an Admin's release of a held draft.
 pub const RELEASE_HOLD: &str = "approvals.release_hold";

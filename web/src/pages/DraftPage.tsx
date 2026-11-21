@@ -400,12 +400,21 @@ export function DraftPage({ id }: { id: string }) {
 
   const expired = isExpired(draft);
   const pending = draft.status === 'pending' && !expired;
+  // On hold: its bot was withdrawn. Rejecting stays open; approving and editing wait for an admin.
+  const held = pending && draft.held === true;
   const dirty = title !== draft.title || body !== plainBody;
   const unresolved = suggestion?.status === 'working' || suggestion?.status === 'ready';
   // The PM must have seen the formatted, saved text, with no suggestion left hanging, and know
   // whether an approval that may or may not have gone through did.
-  const blocked =
-    editing || dirty ? copy.draft.saveFirst : unresolved ? copy.draft.resolveFirst : uncertain ? copy.draft.checkFirst : null;
+  const blocked = held
+    ? copy.draft.held.blocked
+    : editing || dirty
+      ? copy.draft.saveFirst
+      : unresolved
+        ? copy.draft.resolveFirst
+        : uncertain
+          ? copy.draft.checkFirst
+          : null;
 
   const startEdit = () => {
     setTitle(draft.title);
@@ -534,6 +543,16 @@ export function DraftPage({ id }: { id: string }) {
         setUncertain(true);
         if (isPhone) setTab('doc');
         setApproveError({ key: 'unknown_outcome', message: '' });
+      } else if (err.code === 'held') {
+        // Its bot was withdrawn since this page loaded: read it again, so the page says it is on hold.
+        setConfirming(false);
+        try {
+          const fresh = await api.getDraft(id);
+          adopt(fresh);
+          setApproveError(fresh.held ? null : { key: 'other', message: errorText(err, copy.errors.unknown) });
+        } catch {
+          setApproveError({ key: 'other', message: errorText(err, copy.errors.unknown) });
+        }
       } else {
         const known: ApproveErrorKey[] = ['needs_external_confirm', 'audience_blocked', 'expired', 'not_pending', 'stale'];
         const key = known.find((k) => k === err.code) ?? 'other';
@@ -747,7 +766,7 @@ export function DraftPage({ id }: { id: string }) {
 
   // On a phone the header holds the primary button and one More menu (Edit, Reject).
   const moreEntries = [
-    ...(!editing ? [{ key: 'edit', label: copy.draft.edit, icon: 'edit' as const, run: startEdit }] : []),
+    ...(!editing && !held ? [{ key: 'edit', label: copy.draft.edit, icon: 'edit' as const, run: startEdit }] : []),
     { key: 'reject', label: copy.reject.button, icon: 'x' as const, run: () => setRejecting(true) },
   ];
   const moreMenu = (
@@ -819,7 +838,14 @@ export function DraftPage({ id }: { id: string }) {
     ) : (
       <div className="draft-actions">
         {!editing && (
-          <button type="button" className="btn" onClick={startEdit}>
+          <button
+            type="button"
+            className="btn"
+            onClick={startEdit}
+            disabled={held}
+            aria-describedby={held ? 'held-note' : undefined}
+            title={held ? copy.draft.held.editOff : undefined}
+          >
             <Icon name="edit" size={16} />
             {copy.draft.edit}
           </button>
@@ -1042,7 +1068,7 @@ export function DraftPage({ id }: { id: string }) {
     );
   }
 
-  const changeForm = pending ? (
+  const changeForm = pending && !held ? (
     <div className="dock">
       {!isPhone && <Hint name="ask" anchor="change-box" />}
       <form onSubmit={askChange} className="change-form" aria-label={copy.draft.askHeading}>
@@ -1109,9 +1135,19 @@ export function DraftPage({ id }: { id: string }) {
         </div>
       )}
 
+      {held && (
+        <div className="banner held-banner" id="held-note" role="note">
+          <Icon name="clock" className="banner-icon" />
+          <div className="banner-body">
+            <p><strong>{copy.draft.held.titleGone}</strong></p>
+            <p>{copy.draft.held.body}</p>
+            <p className="small">{copy.draft.held.editOff}</p>
+          </div>
+        </div>
+      )}
       {pending && !confirming && approveNote}
       {pending && blocked && (
-        <p id="approve-blocked" className="blocked-line">
+        <p id="approve-blocked" className={held ? 'sr-only' : 'blocked-line'}>
           <Icon name="info" size={16} />
           {blocked}
         </p>
@@ -1157,7 +1193,7 @@ export function DraftPage({ id }: { id: string }) {
         </section>
       )}
 
-      {isPhone && (
+      {isPhone && (draft.recommendations?.length ?? 0) > 0 && (
         <div className="recs-phone">
           <Recommendations recs={draft.recommendations} />
         </div>

@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useId, useState } from 'react';
+import { Fragment, useCallback, useEffect, useId, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import { canExport } from '../../admin/access';
 import { saveBlob } from '../../admin/download';
@@ -8,6 +8,7 @@ import { NO_FILTERS, auditHash, countFilters, parseFilters, rangeBackwards, toQu
 import type { AuditFilters } from '../../admin/filters';
 import { auditTime } from '../../admin/format';
 import { useAuditEvents } from '../../admin/useAuditEvents';
+import { useLoad } from '../../admin/useLoad';
 import { messageOf, useApp } from '../../app-context';
 import { Empty, ErrorNote, Skeleton, SystemTag } from '../../components/bits';
 import { Icon } from '../../components/icons';
@@ -49,6 +50,9 @@ function EventDetails({ e }: { e: AuditEvent }) {
         <Field label={f.outcome}><OutcomePill outcome={e.outcome} /></Field>
         <Field label={f.skill}><Value v={e.skill} mono /></Field>
         <Field label={f.bot}><Value v={e.bot} mono /></Field>
+        <Field label={f.persona}>
+          {e.persona ? <span className="mono-val">{e.persona}</span> : <span className="not-recorded">{A.personaNone}</span>}
+        </Field>
         <Field label={f.task}><Value v={e.task_id} mono /></Field>
         <Field label={f.sources}><Value v={e.sources} mono /></Field>
         <Field label={f.titledSources}>
@@ -102,8 +106,25 @@ function AuditRow({ e, open, onToggle }: { e: AuditEvent; open: boolean; onToggl
   );
 }
 
+/**
+ * The bots the filter offers: the catalog's, less Nudge (its events carry no bot key), and any key
+ * the address names that the catalog no longer has. Falls back to the address alone when the
+ * catalog can't be read.
+ */
+function useBotChoices(current: string): { key: string; label: string }[] {
+  const { api } = useApp();
+  const load = useCallback(() => api.adminBots(), [api]);
+  const { data } = useLoad(load, A.loadFailed);
+  const out: { key: string; label: string }[] = [];
+  for (const b of data?.bots ?? []) if (!b.always_on && b.key !== 'nudge') out.push({ key: b.key, label: b.display_name });
+  for (const u of data?.unknown ?? []) if (!out.some((o) => o.key === u.key)) out.push({ key: u.key, label: A.fields.personaGone(u.key) });
+  if (current && !out.some((o) => o.key === current)) out.push({ key: current, label: current });
+  return out;
+}
+
 function FilterBar({ filters, onApply }: { filters: AuditFilters; onApply: (f: AuditFilters) => void }) {
   const id = useId();
+  const bots = useBotChoices(filters.persona);
   const [draft, setDraft] = useState<AuditFilters>(filters);
   // When the address changes (back, a bookmark, Clear), the boxes follow it.
   const shown = JSON.stringify(filters);
@@ -115,8 +136,8 @@ function FilterBar({ filters, onApply }: { filters: AuditFilters; onApply: (f: A
     e.preventDefault();
     onApply({ ...draft, actor: draft.actor.trim(), action: draft.action.trim() });
   };
-  // Choosing an outcome or a day applies at once; the two text boxes apply on Enter or Apply.
-  const pick = (k: 'outcome' | 'from' | 'to', v: string) => {
+  // Choosing an outcome, a bot or a day applies at once; the two text boxes apply on Enter or Apply.
+  const pick = (k: 'outcome' | 'persona' | 'from' | 'to', v: string) => {
     const next = { ...draft, [k]: v };
     setDraft(next);
     if (!rangeBackwards(next)) onApply({ ...next, actor: next.actor.trim(), action: next.action.trim() });
@@ -137,6 +158,15 @@ function FilterBar({ filters, onApply }: { filters: AuditFilters; onApply: (f: A
           <option value="">{A.fields.anyOutcome}</option>
           {AUDIT_OUTCOMES.map((o) => (
             <option key={o} value={o}>{A.outcomes[o]}</option>
+          ))}
+        </select>
+      </div>
+      <div className="filter-field filter-persona">
+        <label className="field-label" htmlFor={`${id}-persona`}>{A.fields.persona}</label>
+        <select id={`${id}-persona`} value={draft.persona} onChange={(e) => pick('persona', e.target.value)}>
+          <option value="">{A.fields.anyPersona}</option>
+          {bots.map((b) => (
+            <option key={b.key} value={b.key}>{b.label}</option>
           ))}
         </select>
       </div>

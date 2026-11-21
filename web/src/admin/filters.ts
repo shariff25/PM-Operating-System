@@ -9,15 +9,19 @@ export interface AuditFilters {
   actor: string;
   action: string;
   outcome: string;
+  /** A marketplace bot's key (never `nudge`: Nudge's events carry none). */
+  persona: string;
   from: string;
   to: string;
 }
 
-export const NO_FILTERS: AuditFilters = { actor: '', action: '', outcome: '', from: '', to: '' };
+export const NO_FILTERS: AuditFilters = { actor: '', action: '', outcome: '', persona: '', from: '', to: '' };
 
-const FILTER_KEYS = ['actor', 'action', 'outcome', 'from', 'to'] as const;
+const FILTER_KEYS = ['actor', 'action', 'outcome', 'persona', 'from', 'to'] as const;
 
 const NAME = /^[A-Za-z0-9._-]+$/;
+/** A bot's key, as the catalog's lint allows it. */
+const BOT_KEY = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 /** A calendar day as `YYYY-MM-DD` that really exists. */
 export function isDay(v: string): boolean {
@@ -39,6 +43,8 @@ export function parseFilters(search: string): AuditFilters {
   if (action.length <= 100 && NAME.test(action)) out.action = action;
   const outcome = params.get('outcome') ?? '';
   if ((AUDIT_OUTCOMES as readonly string[]).includes(outcome)) out.outcome = outcome;
+  const persona = params.get('persona') ?? '';
+  if (persona.length <= 32 && BOT_KEY.test(persona) && persona !== 'nudge') out.persona = persona;
   const from = params.get('from') ?? '';
   if (isDay(from)) out.from = from;
   const to = params.get('to') ?? '';
@@ -74,6 +80,7 @@ export function toQuery(f: AuditFilters): AuditQuery {
   if (f.actor) q.actor = f.actor;
   if (f.action) q.action = f.action;
   if (f.outcome) q.outcome = f.outcome;
+  if (f.persona) q.persona = f.persona;
   if (f.from) q.from = `${f.from}T00:00:00.000Z`;
   if (f.to) q.to = new Date(Date.parse(`${f.to}T00:00:00Z`) + DAY_MS).toISOString();
   return q;

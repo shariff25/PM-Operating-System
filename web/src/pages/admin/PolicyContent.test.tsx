@@ -52,7 +52,7 @@ describe('who sees policy and content', () => {
     renderApp({ role: 'admin', hash: '/admin' });
     await screen.findByRole('heading', { level: 1, name: A.sections.overview });
     const sub = within(nav()).getByRole('list', { name: A.subnavLabel });
-    expect(within(sub).getAllByRole('link').map((a) => a.textContent)).toEqual(['Overview', 'Audit log', 'Team', 'Connectors', 'Policy', 'Content and harness']);
+    expect(within(sub).getAllByRole('link').map((a) => a.textContent)).toEqual(['Overview', 'Audit log', 'Team', 'Bots', 'Connectors', 'Policy', 'Content and harness']);
     expect(await screen.findByRole('link', { name: new RegExp(A.overview.links.policy.body) })).toHaveAttribute('href', '#/admin/policy');
     expect(await screen.findByRole('link', { name: new RegExp(A.overview.links.content.body) })).toHaveAttribute('href', '#/admin/content');
   });

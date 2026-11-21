@@ -276,6 +276,9 @@ pub struct AuditQuery {
     pub from: Option<DateTime<Utc>>,
     /// Strictly before this time.
     pub to: Option<DateTime<Utc>>,
+    /// Only events of this marketplace bot (`persona`, a key; slice A1). Nudge's events carry
+    /// no persona, so they are never matched by a key.
+    pub persona: Option<String>,
 }
 
 impl AuditQuery {
@@ -288,6 +291,10 @@ impl AuditQuery {
             && self.outcome.is_none_or(|o| o == event.outcome)
             && self.from.is_none_or(|f| event.at >= f)
             && self.to.is_none_or(|t| event.at < t)
+            && self
+                .persona
+                .as_ref()
+                .is_none_or(|p| event.persona.as_deref() == Some(p.as_str()))
     }
 
     /// The limit, clamped to 1 to [`MAX_SEARCH`].

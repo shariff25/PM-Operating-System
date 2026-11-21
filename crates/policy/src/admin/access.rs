@@ -18,6 +18,8 @@ pub fn kind(rel: &str) -> &'static str {
         ["master", "people", _, "AGENTS.md"] => "personal_master",
         ["roles", _, "ROLE.md"] => "role",
         ["bots", _, "BOT.md"] => "bot",
+        // The bot marketplace's catalog (slice A1): one file per bot.
+        ["personas", _, "PERSONA.md"] => "persona",
         ["skills", _, "SKILL.md"] => "skill",
         ["skills", _, ..] => "skill_file",
         [.., "README.md"] => "readme",
@@ -132,6 +134,8 @@ mod tests {
         assert_eq!(kind("skills/docs/examples.md"), "skill_file");
         assert_eq!(kind("roles/docs-helper/ROLE.md"), "role");
         assert_eq!(kind("bots/docs/BOT.md"), "bot");
+        assert_eq!(kind("personas/chief/PERSONA.md"), "persona");
+        assert_eq!(kind("personas/chief/notes.md"), "other");
         assert_eq!(kind("context/products/x.md"), "context");
         assert_eq!(kind("context/products/README.md"), "readme");
         assert_eq!(kind("master/people/ana/AGENTS.md"), "personal_master");

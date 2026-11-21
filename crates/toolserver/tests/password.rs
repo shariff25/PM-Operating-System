@@ -257,6 +257,7 @@ impl T {
             outcome: None,
             from: None,
             to: None,
+            persona: None,
         };
         self.stores
             .audit
@@ -285,6 +286,7 @@ impl T {
             outcome: None,
             from: None,
             to: None,
+            persona: None,
         };
         self.stores
             .audit

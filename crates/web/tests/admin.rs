@@ -607,6 +607,7 @@ async fn only_metadata_reaches_the_browser() {
             "detail",
             "id",
             "outcome",
+            "persona",
             "skill",
             "sources",
             "system",
@@ -700,13 +701,13 @@ async fn csv_export_escapes_and_caps() {
     assert_eq!(
         lines[0],
         "\"at\",\"actor\",\"client\",\"action\",\"system\",\"target\",\"outcome\",\"detail\",\
-         \"sources\",\"titled_sources\",\"skill\",\"bot\",\"task_id\",\"id\""
+         \"sources\",\"titled_sources\",\"skill\",\"bot\",\"task_id\",\"id\",\"persona\""
     );
     assert_eq!(
         lines[1],
         "\"2026-11-16T09:00:00Z\",\"'=HYPERLINK(\"\"http://x\"\")\",\"mcp\",\"jira.create_issue\",\
          \"jira\",\"'@SUM(1)\",\"pending\",\"'-2+3\",\"2\",\"1\",\"'\tx\",\"'+cmd\",\"a,b\"\"c\",\
-         \"ev_0\""
+         \"ev_0\",\"\""
     );
     assert_eq!(lines[2], "");
     let call = w.tools.calls().last().unwrap().clone();

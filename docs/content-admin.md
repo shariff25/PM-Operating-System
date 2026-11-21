@@ -12,8 +12,8 @@ and `crates/web/src/content_admin.rs`, sharing the proposal machinery with the P
 ## What it shows
 
 **The tree.** Every regular file under the content root (`PMOS_CONTENT_ROOT`), never a symlink
-or a hidden file, with its kind (role, bot, skill, playbook, template, reviewer, context,
-master, …), the metadata its front matter has (name, title, version, owner, sensitivity,
+or a hidden file, with its kind (role, bot, persona (a marketplace bot's
+`personas/<key>/PERSONA.md`), skill, playbook, template, reviewer, context, master, …), the metadata its front matter has (name, title, version, owner, sensitivity,
 last-reviewed), its size, whether a proposal may change it, and its lint status from the
 contract crate's lint (`pmos lint`, `docs/contract.md`) run now on the deployed tree. Beside it:
 which roles use which skills, which bots are made from which role, and each skill's tools.

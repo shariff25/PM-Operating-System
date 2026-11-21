@@ -51,6 +51,7 @@ use crate::upstream::{
 };
 
 mod admin;
+mod admin_bots;
 mod bots;
 mod brief;
 mod content;
@@ -351,6 +352,7 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         .merge(brief::routes())
         .merge(bots::routes())
         .merge(admin::routes())
+        .merge(admin_bots::routes())
         .merge(users::routes())
         .merge(reviews::routes())
         .merge(policy::routes())
@@ -2034,6 +2036,7 @@ async fn put_draft(
     if !is_pending(&found) {
         return Err(ApiError::not_pending());
     }
+    not_held(&found)?;
     // A real draft's edit is saved on the item at the tool server, so the Slack card and the
     // console show it, and an approve anywhere writes it. Only a practice draft's stays here.
     if let Found::Item(item) = &found {
@@ -2116,6 +2119,11 @@ async fn save_edit(
                 "expired",
                 "This draft expired before it was decided. Nothing was sent.",
             ),
+            UpstreamError::Refused {
+                status: 409,
+                code: Some(code),
+                ..
+            } if code == "held" => held(),
             UpstreamError::Refused { status: 409, .. } => ApiError::not_pending(),
             UpstreamError::Refused {
                 status: 400 | 422,
@@ -2165,6 +2173,7 @@ async fn post_changes(
     if !is_pending(&found) {
         return Err(ApiError::not_pending());
     }
+    not_held(&found)?;
     let st = settings_of(&state, signed.handle()).await?;
     let current = base_draft(&found, &signed, &st)?;
 
@@ -2373,6 +2382,7 @@ async fn accept_suggestion(
     if !is_pending(&found) {
         return Err(ApiError::not_pending());
     }
+    not_held(&found)?;
     let ready = current_suggestion(&state, &signed, &id)
         .await?
         .filter(|s| s.status == "ready");
@@ -2489,6 +2499,28 @@ struct ApproveBody {
     /// draft's version (`409 stale` otherwise).
     #[serde(default)]
     version: Option<String>,
+}
+
+/// `409 held` (slice A1): the bot that drafted this was withdrawn from the catalog, so the
+/// draft can be rejected but not approved or edited until the bot is offered again or an Admin
+/// releases it (`docs/bot-marketplace-spec.md` §6, "Removal"). Nothing was changed or sent.
+pub(super) fn held() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "held",
+        "This draft is on hold: the bot that drafted it isn't offered any more. You can reject \
+         it; approving or editing it waits until an admin releases it or the bot is offered \
+         again. Nothing was changed or sent.",
+    )
+}
+
+/// A held draft can't be edited or approved here, as the tool server can't approve it
+/// (`409 held`): refused before anything is sent.
+fn not_held(found: &Found) -> Result<(), ApiError> {
+    match found {
+        Found::Item(item) if item.held => Err(held()),
+        _ => Ok(()),
+    }
 }
 
 fn stale() -> ApiError {
@@ -2624,6 +2656,8 @@ async fn refused_decision(
         ),
         // The draft changed between this read and the decision (R4): nothing was decided.
         (409, Some("stale")) => stale(),
+        // Its bot was withdrawn since this read (slice M1): nothing was decided.
+        (409, Some("held")) => held(),
         (503, Some("audience_unavailable")) => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "audience_unavailable",
@@ -2731,6 +2765,9 @@ async fn approve(
             return decided(&state, &signed, item).await;
         }
         return Err(ApiError::not_pending());
+    }
+    if item.held {
+        return Err(held());
     }
     // Exactly what the PM saw: the version is computed from the item's arguments, which hold
     // their saved edit. An edited draft is approved with those arguments (`edit`), so a save

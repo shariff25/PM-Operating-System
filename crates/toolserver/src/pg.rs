@@ -1295,6 +1295,34 @@ impl ApprovalRepo for PgStore {
         .await?)
     }
 
+    async fn unreleased_pending_outside(
+        &self,
+        offered: &[String],
+        cap: usize,
+    ) -> StoreResult<(Vec<ApprovalItem>, usize)> {
+        const WHERE: &str = "status = 'pending' AND persona IS NOT NULL AND persona <> ALL($1)
+             AND NOT EXISTS (SELECT 1 FROM approval_hold_releases r WHERE r.approval_id = approvals.id)";
+        let sql = format!(
+            "SELECT {ITEM_COLUMNS} FROM approvals WHERE {WHERE}
+             ORDER BY created_at DESC, id COLLATE \"C\" LIMIT $2"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(offered)
+            .bind(i64::try_from(cap).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await?;
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM approvals WHERE {WHERE}"
+        )))
+        .bind(offered)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((
+            rows.iter().map(item_from_row).collect::<StoreResult<_>>()?,
+            usize::try_from(total).unwrap_or(0),
+        ))
+    }
+
     async fn recommendations(&self, approval_ids: &[String]) -> StoreResult<Vec<Recommendation>> {
         if approval_ids.is_empty() {
             return Ok(Vec::new());
@@ -1409,6 +1437,7 @@ impl AuditSink for PgStore {
                AND ($5::text IS NULL OR outcome = $5)
                AND ($6::timestamptz IS NULL OR at >= $6)
                AND ($7::timestamptz IS NULL OR at < $7)
+               AND ($9::text IS NULL OR persona = $9)
              ORDER BY at DESC, id DESC
              LIMIT $8",
         )
@@ -1420,6 +1449,7 @@ impl AuditSink for PgStore {
         .bind(query.from)
         .bind(query.to)
         .bind(i64::try_from(query.bounded_limit()).unwrap_or(i64::MAX))
+        .bind(&query.persona)
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());

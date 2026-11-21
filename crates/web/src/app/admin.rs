@@ -45,8 +45,9 @@ pub const OUTCOMES: [&str; 10] = [
     "expired",
 ];
 
-/// The CSV columns, in order: the fields of an event in `GET /api/admin/audit`.
-pub const CSV_COLUMNS: [&str; 14] = [
+/// The CSV columns, in order: the fields of an event in `GET /api/admin/audit`. `persona`
+/// (slice A1) is last, so the columns before it keep their places.
+pub const CSV_COLUMNS: [&str; 15] = [
     "at",
     "actor",
     "client",
@@ -61,6 +62,7 @@ pub const CSV_COLUMNS: [&str; 14] = [
     "bot",
     "task_id",
     "id",
+    "persona",
 ];
 
 pub(super) fn routes() -> Router<AppState> {
@@ -122,6 +124,7 @@ struct AuditParams {
     outcome: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    persona: Option<String>,
 }
 
 /// One audit event as the app gets it. Only these fields are ever served.
@@ -148,6 +151,16 @@ pub struct AuditRow {
     pub bot: Option<String>,
     #[serde(default)]
     pub task_id: String,
+    /// The marketplace bot the event's session, draft or decision belongs to, by key (slice
+    /// A1); `null` for Nudge and for events of no bot. Anything not shaped like a key is
+    /// served as `null`.
+    #[serde(default, deserialize_with = "persona_key")]
+    pub persona: Option<String>,
+}
+
+fn persona_key<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let raw = Option::<String>::deserialize(d)?;
+    Ok(raw.filter(|k| pmos_contract::bots::valid_name(k)))
 }
 
 #[derive(Deserialize)]
@@ -206,6 +219,19 @@ fn filters(q: &AuditParams) -> Result<(UpstreamParams, Vec<&'static str>), ApiEr
             ));
         }
         out.push(("action", action.to_string()));
+    }
+    if let Some(persona) = trimmed(&q.persona) {
+        if persona == pmos_contract::personas::ALWAYS_ON {
+            return Err(ApiError::bad_request(
+                "Nudge's events carry no bot key: filter by `actor` or `action` instead.",
+            ));
+        }
+        if !pmos_contract::bots::valid_name(persona) {
+            return Err(ApiError::bad_request(
+                "`persona` must be a bot's key, such as chief.",
+            ));
+        }
+        out.push(("persona", persona.to_string()));
     }
     if let Some(outcome) = trimmed(&q.outcome) {
         if !OUTCOMES.contains(&outcome) {
@@ -332,6 +358,7 @@ fn row_cells(r: &AuditRow) -> Vec<String> {
         opt(&r.bot),
         r.task_id.clone(),
         r.id.clone(),
+        opt(&r.persona),
     ]
 }
 
