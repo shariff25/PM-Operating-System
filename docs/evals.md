@@ -157,8 +157,10 @@ set -a; . state/claude-test/evals.env; set +a
 target/debug/pmos-evals run --category jira-draft --concurrency 3 --note "model: <name>"
 ```
 
-The gateway lets one person have two model calls in flight (`limits.per-user`), so more than
-two or three tasks at once mostly adds queue time.
+The gateway lets one person have two model calls in flight (`limits.per-user`). With another
+provider (`PMOS_TEST_MODEL_URL`) and more than two workers, the script raises that to one call
+per worker, so `--concurrency` up to the number of workers runs in parallel; watch the
+provider's rate limits (`429`s in `$STATE/usage.jsonl`).
 
 ## Reading a report
 

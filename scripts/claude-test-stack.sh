@@ -60,7 +60,9 @@
 #                         runner's settings are written to $STATE/evals.env (mode 0600; it holds
 #                         this run's tokens): `set -a; . $STATE/evals.env; set +a`.
 #   PMOS_TEST_EVALS_WORKERS  with PMOS_TEST_EVALS=1: how many pm-evals workers (default 1), for
-#                         `pmos-evals run --concurrency N`.
+#                         `pmos-evals run --concurrency N`. With another provider and more than
+#                         two, the gateway lets the evals user have one model call in flight
+#                         per worker (two otherwise).
 #
 # Stop with Ctrl-C; every service is stopped with it.
 set -euo pipefail
@@ -210,6 +212,12 @@ fi
 
 if [ -n "${PMOS_TEST_MODEL_URL:-}" ]; then
   GATEWAY_CONFIG="$STATE/gateway.yaml"
+  # One person may have two model calls in flight; the benchmarks ask as one person (evals), so
+  # with more pm-evals workers that person may have one call in flight per worker.
+  GW_PER_USER=2 GW_IN_FLIGHT=4
+  if [ "${PMOS_TEST_EVALS:-}" = 1 ] && [ "$EVALS_WORKERS" -gt 2 ]; then
+    GW_PER_USER=$EVALS_WORKERS GW_IN_FLIGHT=$((EVALS_WORKERS + 2))
+  fi
   echo "== gateway config in $GATEWAY_CONFIG ($MODEL_DESC)"
   cat >"$GATEWAY_CONFIG" <<EOF
 # TESTING ONLY, written by scripts/claude-test-stack.sh: every role on a remote
@@ -221,8 +229,8 @@ roles:
   reasoning: {upstream: remote, model: "$PMOS_TEST_MODEL"}
   extraction: {upstream: remote, model: "${PMOS_TEST_MODEL_FAST:-$PMOS_TEST_MODEL}"}
 limits:
-  max-in-flight: 4
-  per-user: 2
+  max-in-flight: $GW_IN_FLIGHT
+  per-user: $GW_PER_USER
   max-queue: 64
 EOF
 else
