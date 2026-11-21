@@ -362,6 +362,25 @@ impl Runtime {
         .await
     }
 
+    /// `PATCH /v1/routines/{id} {schedule, enabled: true}`: the same routine on at a new time,
+    /// so whatever else it has (the bot it runs as, above all) stays (slice R2: a daily brief
+    /// Chief writes).
+    pub async fn set_routine_schedule(
+        &self,
+        owner: &str,
+        id: &str,
+        schedule: &Value,
+    ) -> Result<Value, RuntimeError> {
+        if !safe_id(id) {
+            return Err(RuntimeError::Refused("not a routine id".into()));
+        }
+        self.send(
+            self.request(Method::PATCH, &format!("/v1/routines/{id}"), Some(owner))
+                .json(&json!({ "schedule": schedule, "enabled": true })),
+        )
+        .await
+    }
+
     /// `GET /v1/members/{handle}/settings`: the PM's level (`senior`, `staff` or
     /// `principal`).
     pub async fn level(&self, handle: &str) -> Result<String, RuntimeError> {

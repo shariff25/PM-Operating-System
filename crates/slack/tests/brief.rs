@@ -277,3 +277,48 @@ async fn unrelated_messages_are_left_alone() {
     assert!(stack.slack.calls("chat.postMessage").is_empty());
     stack.stop().await;
 }
+
+/// Slice R2: a brief Chief writes (chosen in the web app) stays Chief's when the PM moves it
+/// to a new time, and `brief now` runs as Chief too. This service never sets the bot itself.
+#[tokio::test]
+async fn a_brief_chief_writes_stays_chiefs_when_moved_and_on_brief_now() {
+    let stack = Stack::new().await;
+    let mut r = brief::draft("ana", 8, 0, "UTC");
+    r["id"] = json!("rtn_brief_ana");
+    r["enabled"] = json!(false);
+    r["persona"] = json!("chief");
+    stack.runtime.routines.lock().unwrap().push(r);
+
+    assert!(say(&stack, ANA, "brief me at 9:15").await);
+    let routines = mine(&stack, "ana");
+    assert_eq!(routines.len(), 1);
+    assert_eq!(routines[0]["id"], "rtn_brief_ana", "the same routine");
+    assert_eq!(routines[0]["persona"], "chief");
+    assert_eq!(routines[0]["enabled"], true, "moving it turns it on");
+    assert_eq!(
+        routines[0]["schedule"],
+        json!({"cron": "15 9 * * 1-5", "tz": "UTC"})
+    );
+    let writes = stack.runtime.routine_writes.lock().unwrap().clone();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(writes[0].0, "PATCH");
+    assert!(
+        writes[0].3.get("persona").is_none(),
+        "the bot is never set from Slack: {:?}",
+        writes[0].3
+    );
+    assert!(answer(&stack, 1).await.0.contains("09:15"));
+
+    assert!(say(&stack, ANA, "brief now").await);
+    let tasks = stack.runtime.tasks.lock().unwrap().clone();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].1["persona"], "chief");
+    assert_eq!(tasks[0].1["text"], PROMPT);
+
+    // Nudge's brief: no persona on `brief now`, as before.
+    stack.runtime.routines.lock().unwrap()[0]["persona"] = Value::Null;
+    assert!(say(&stack, ANA, "brief now").await);
+    let tasks = stack.runtime.tasks.lock().unwrap().clone();
+    assert!(tasks[1].1.get("persona").is_none(), "{:?}", tasks[1].1);
+    stack.stop().await;
+}

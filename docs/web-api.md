@@ -691,8 +691,9 @@ and Auditors, is `GET /api/admin/bots`, slice A1; it is not built yet.)
 
 | Method and path | Body | Answer |
 | --- | --- | --- |
-| `GET /api/bots` | | `200 {bots: [BotCard], withdrawn: [WithdrawnBot]}` |
-| `PUT /api/me/team` | `{add?: [key], remove?: [key], via: "onboarding" \| "bots_page" \| "picker", routines?: "nudge" \| "pause"}` | `200 {bots: [BotCard], withdrawn: [WithdrawnBot]}`, the same as `GET /api/bots` after the change |
+| `GET /api/bots` | | `200 {bots: [BotCard], withdrawn: [WithdrawnBot], brief: BriefWriter \| null}` |
+| `PUT /api/me/team` | `{add?: [key], remove?: [key], via: "onboarding" \| "bots_page" \| "picker", routines?: "nudge" \| "pause"}` | `200 {bots, withdrawn, brief}`, the same as `GET /api/bots` after the change |
+| `PUT /api/me/brief` | `{persona: key}` (`"nudge"` for Nudge) | `200 {bots, withdrawn, brief}`, the same as `GET /api/bots` after the change (**Who writes the daily brief**, below) |
 | `POST /api/tasks` | `{text, persona?: key}` | `201 Task` (**Asking**) |
 | `PUT /api/me/settings` | `{ask_persona: key}` | `Me` (**Me**) |
 
@@ -721,7 +722,11 @@ and Auditors, is `GET /api/admin/bots`, slice A1; it is not built yet.)
 
 // Routine: one of the PM's own routines that runs as this bot (read only here)
 {"id": "rtn_…", "enabled": true, "cron": "0 8 * * 1-5", "tz": "Europe/London",
- "prompt": "brief me", "next_run_at": "2026-11-24T08:00:00Z"}
+ "prompt": "[daily-brief] Write my daily brief with the daily-brief skill.",
+ "next_run_at": "2026-11-24T08:00:00Z"}
+
+// BriefWriter: who writes the PM's daily brief (slice R2)
+{"routine_id": "rtn_…", "writer": "chief", "enabled": true}
 ```
 
 | Field | Type | Meaning |
@@ -742,7 +747,14 @@ and Auditors, is `GET /api/admin/bots`, slice A1; it is not built yet.)
 | `new` | bool | "New" label under Available. **Always `false` in this version**: no service records when a bot was first offered (see the spec's §13, "W1 is built"). |
 | `drafts_this_month` | integer | Drafts this bot made for this PM since the first of this month (UTC), any status. `0` when none. |
 | `last_used_at` | string or null | When the PM last asked this bot (their newest task that ran as it, from the runtime's `GET /v1/tasks?persona=`), or `null`: never, or the runtime couldn't say. A `null` hides the part ("· last used today"). |
-| `routines` | [Routine] or null | The PM's own routines that run as this bot (Nudge's: those that name no bot); `null` when the runtime couldn't say. For Settings (read only) and for the removal question. |
+| `routines` | [Routine] or null | The PM's own routines that run as this bot (Nudge's: those that name no bot); `null` when the runtime couldn't say. For Settings (read only) and for the removal question. The daily brief is a routine whose `prompt` starts with `[daily-brief]`. |
+
+`brief` (`BriefWriter`, beside `bots` and `withdrawn`) says who writes the PM's daily brief:
+`writer` is `"nudge"` or a bot's key, from the PM's first routine whose prompt starts with
+`[daily-brief]` (the Slack service keeps one); `routine_id` is that routine and `enabled`
+whether it is on. With no brief routine it is `{routine_id: null, writer: null, enabled:
+false}`; `brief: null` when the runtime couldn't list the routines. An older server leaves the
+field out: show no brief switch.
 
 The text fields are passed on **exactly as the tool server served them from the content files**,
 JSON string for string: `pmos-web` builds no HTML, Markdown or instructions from them, and keeps
@@ -771,7 +783,9 @@ name to show ("A bot no longer offered", the neutral face).
 2. **A bot's routines move before the bot leaves** (spec §6, "Removal"). When `remove` names any
    key, `pmos-web` reads the PM's routines from the runtime and, for each that runs as a removed
    bot, either moves it to Nudge (`routines: "nudge"`, the default) or pauses it (`"pause"`; it
-   keeps its bot, so adding the bot back and resuming it works). The Bots page asks only when the
+   keeps its bot, so adding the bot back and resuming it works). **The daily brief is always moved
+   to Nudge, never paused**, whichever was chosen for the others (slice R2): the brief is the
+   day's one message, and Nudge writes it as it did before. The Bots page asks only when the
    bot has routines (`BotCard.routines`; when that is `null`, ask anyway). If the runtime can't be
    read or refuses a change, **the team is not changed**: `502 upstream_unavailable` when no
    routine had been changed yet, `502 unknown_outcome` when some may have (reload the Bots page to
@@ -789,6 +803,36 @@ name to show ("A bot no longer offered", the neutral face).
 Removing a bot keeps everything it made: its drafts stay the PM's, decidable and attributed to it;
 a task it already started finishes; a queued one fails when it is claimed with the tool server's
 plain sentence ("Chief isn't on your team any more…"), which arrives as the task's `error`.
+
+**Who writes the daily brief** (slice R2). Nudge writes it unless the PM chooses Chief in Chief's
+Settings on the Bots page. `PUT /api/me/brief {persona}` sets who writes it: `"nudge"`, or a bot
+that is on the PM's team, still offered and whose `can_do` lists `daily-brief` (Chief today). It
+changes only the signed-in PM's own routines whose prompt starts with `[daily-brief]`, and of
+those only who runs them: the schedule, the prompt and whether it is on stay as they are, and the
+brief's content is the same `daily-brief` skill. In order:
+
+1. Checked here, before anything is sent: `ask-bot` (`403 not_allowed`); the body is exactly
+   `{persona}` (`400 bad_request`); a key (`400 bad_request`); for a bot other than Nudge, a fresh
+   read of the catalog lists it (`409 bot_unavailable`), it writes briefs and isn't always-on
+   (`409 cant_write_brief`), and a fresh read of the PM's team has it, offered (`409
+   bot_not_on_team`, `409 bot_unavailable`).
+2. The PM's routines are read from the runtime; none with the tag is `409 no_brief` ("say
+   `brief me at 8` in Slack"). Each brief routine not already run by that bot is changed with the
+   runtime's `PATCH /v1/routines/{id} {persona}` (`null` for Nudge). A refusal before any change is
+   `502 upstream_unavailable` (`409 bot_unavailable` for the runtime's `400`: its catalog doesn't
+   offer the bot); once one may have changed, `502 unknown_outcome`.
+3. For a bot other than Nudge, the team is read **again**: if the bot left it in between (a
+   removal in another tab), the brief is moved straight back to Nudge and the answer is `409
+   bot_not_on_team`. The tool server still decides at every run of the routine; a run it refuses
+   pauses the routine with its sentence (`docs/bots-runtime.md`, "Personas").
+4. The answer is the Bots page as it now is.
+
+What changes for the PM: the next brief's DM in Slack says it is Chief's ("Chief: …", and the
+Preview line while Chief is a Preview), and Today's card says "Written by Chief". The brief's
+block still reaches the panels on Today. A reply in the brief's Slack thread goes to Nudge unless
+it starts with "Chief:" (a routine's run starts no thread to inherit; `docs/bots-runtime.md`).
+Moving the brief to a new time in Slack (`brief me at 9`) keeps the writer; `brief now` runs as
+the writer.
 
 **The picker.** The ask box's bot picker lists `Me.team` (selectable) and the other offered bots
 from `GET /api/bots` (greyed, with "Add", which sends `PUT /api/me/team {add: [key], via:
@@ -821,9 +865,9 @@ tool server can't be read); with no catalog at all every key reads `false`.
 
 **Errors** (see **Error codes**): `400 bad_request`, `401 signed_out`, `403 bad_origin` /
 `bad_csrf` (writes), `403 not_allowed`, `403 not_a_member`, `409 bot_not_on_team`, `409
-bot_unavailable`, `409 always_on`, `409 team_full`, `429 rate_limited`, `502
-upstream_unavailable`, `502 unknown_outcome` (a team change), `503 assertion_required`, `503
-unavailable`, `503 users_unavailable`.
+bot_unavailable`, `409 always_on`, `409 team_full`, `409 no_brief`, `409 cant_write_brief`, `429
+rate_limited`, `502 upstream_unavailable`, `502 unknown_outcome` (a team or brief change), `503
+assertion_required`, `503 unavailable`, `503 users_unavailable`.
 
 ## The daily brief and follow-ups
 
@@ -838,8 +882,15 @@ unavailable`, `503 users_unavailable`.
  "changed": [{"system": "jira", "title": "PAY-212 moved to Blocked", "summary": "…", "url": "…"}],
  "waiting_on_you": [{"id": "fu_…", "system": "slack", "who": "Ben", "summary": "asked about the pricing page", "url": "…", "age_days": 2}],
  "you_wait_on": [{"id": "fu_…", "system": "slack", "who": "Legal", "summary": "the DPA question", "url": "…", "age_days": 3}],
- "slack_withheld": false}
+ "slack_withheld": false, "persona": "chief", "persona_offered": true}
 ```
+
+- `persona` and `persona_offered` (slice R2) say who wrote the day's brief, as drafts do
+  (**Bots**, "Attribution"): `null` is Nudge; a key is looked up in `GET /api/bots`, and
+  `persona_offered: false` (or a key it doesn't list) reads "a bot no longer offered". It is the
+  bot that wrote the brief that filled the day, as the Slack service reported it, kept with the
+  day's `changed` items: once those expire (`stale`, `never`) it is `null`. It is not who writes
+  the next one (that is `GET /api/bots`'s `brief`). An older server leaves both out: read Nudge.
 
 - `slack_withheld` is `true` when the tool server couldn't be reached and the brief was
   served on the PM's last-known-good answer (**Sign-in and safety**): every item whose
@@ -874,7 +925,11 @@ items last 24 hours.
 **Producer route (server to server, not for the app).** `PUT /internal/brief/{handle}` with
 `Authorization: Bearer <PMOS_WEB_BRIEF_TOKEN>` replaces that member's follow-ups and `changed`
 items: `{"date"?: "2026-11-16", "changed": [{system, title, summary?, url}], "waiting_on_you":
-[{system, who, summary, url, created_at?}], "you_wait_on": [...]}`. At most 50 items per list,
+[{system, who, summary, url, created_at?}], "you_wait_on": [...], "persona"?: key}`. `persona`
+(slice R2) is who wrote the brief, from the runtime's notification (absent or `"nudge"` is
+Nudge; anything not shaped like a key is `422 bad_brief`); it is stored with the day and replaced
+by each brief. **Deploy pmos-web before the Slack service**: an older pmos-web refuses the field
+(`422`), so a Chief-written brief would not fill the panels. At most 50 items per list,
 a 128 KiB body, one-line text (`summary` at most 200 characters, `who` 80), `system` made of
 `a-z`, digits, `-` and `_`, every `url` `http` or `https` without credentials; anything else
 is `422 bad_brief` (`413` for an oversize body, `401 bad_token`, `404` for a handle that isn't
@@ -929,6 +984,8 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `409` | `bot_unavailable` | A bot that isn't offered any more (withdrawn, deleted, or unknown): adding it, asking it, or making it the picker's default (**Bots**). | Yes |
 | `409` | `always_on` | A team change naming Nudge: it is always on the team (**Bots**). | Yes |
 | `409` | `team_full` | A team change that would put more than 16 bots on the team (**Bots**). | Yes |
+| `409` | `no_brief` | Choosing who writes the daily brief when the PM has no brief routine (**Bots**, "Who writes the daily brief"). One is started in Slack (`brief me at 8`). | Yes |
+| `409` | `cant_write_brief` | Choosing a bot to write the daily brief that doesn't write briefs (its `can_do` lacks `daily-brief`) (**Bots**). | Yes |
 | `409` | `held` | Approving, editing or asking for a change to a draft on hold: the bot that drafted it is no longer offered (**Drafts**, "Held drafts"). It can still be rejected. | Yes |
 | `409` | `not_held` | An admin releasing a draft that isn't on hold (decided, its bot offered again, or already released) (**Admin: bots**). | Yes |
 | `409` | `github_not_linked` | An admin proposal: the admin hasn't linked GitHub in PM OS. Pull requests are opened as them; `error` says how to link. | Yes |

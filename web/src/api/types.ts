@@ -311,10 +311,22 @@ export interface WithdrawnBot extends BotUsage {
   added_via: string | null;
 }
 
-/** `GET /api/bots` and `PUT /api/me/team`. */
+/**
+ * Who writes the person's daily brief (slice R2). `writer` is `nudge` or a bot's key; null with
+ * `routine_id` null when there is no brief routine.
+ */
+export interface BriefWriter {
+  routine_id: string | null;
+  writer: string | null;
+  enabled: boolean;
+}
+
+/** `GET /api/bots`, `PUT /api/me/team` and `PUT /api/me/brief`. */
 export interface Bots {
   bots: BotCard[];
   withdrawn: WithdrawnBot[];
+  /** Null: the runtime couldn't list the routines. An older server leaves it out. */
+  brief?: BriefWriter | null;
 }
 
 /** `PUT /api/me/team`. */
@@ -361,6 +373,10 @@ export interface Brief {
   slack_withheld?: boolean;
   /** The server's sentence for `slack_withheld`; the app shows its own copy. */
   note?: string;
+  /** Who wrote the day's brief (slice R2): null is Nudge. An older server leaves it out. */
+  persona?: string | null;
+  /** Whether that bot is still offered; false also while the catalog can't be read. */
+  persona_offered?: boolean;
 }
 
 /**
@@ -399,6 +415,8 @@ export const SERVER_ERROR_CODES = {
   bot_unavailable: 'yes',
   always_on: 'yes',
   team_full: 'yes',
+  no_brief: 'yes',
+  cant_write_brief: 'yes',
   held: 'yes',
   not_held: 'yes',
   bad_content_type: 'yes',
@@ -908,6 +926,8 @@ export interface Api {
   bots(): Promise<Bots>;
   /** Change the person's own team; answers the Bots page as it now is. */
   changeTeam(change: TeamChange): Promise<Bots>;
+  /** `PUT /api/me/brief`: who writes the daily brief, `nudge` or a bot on the team that writes briefs. */
+  setBriefWriter(persona: string): Promise<Bots>;
 
   brief(): Promise<Brief>;
   dismissFollowup(id: string): Promise<void>;

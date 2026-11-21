@@ -15,7 +15,15 @@
 //! field ([`persona_card`]); nothing here builds HTML or instructions from it.
 //!
 //! **Removing a bot** moves or pauses its routines at the runtime *before* the team changes
-//! (spec §6, "Removal"); if that can't be done, the team is left as it was.
+//! (spec §6, "Removal"); if that can't be done, the team is left as it was. The daily brief is
+//! always moved back to Nudge, never paused, whichever the person chose for the others (slice
+//! R2: the brief is the day's one message, and Nudge writes it as before).
+//!
+//! **Who writes the daily brief** (`PUT /api/me/brief`, slice R2): Nudge, or a bot on the
+//! person's team whose catalog entry lists the `daily-brief` skill (Chief). Only the person's
+//! own `[daily-brief]` routines change, and only their `persona`. The team is read fresh from
+//! the tool server before the change and again after it: a bot that left the team in between
+//! has the brief moved back to Nudge at once. The tool server decides again at every run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -42,6 +50,7 @@ pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/bots", get(list_bots))
         .route("/me/team", put(change_team))
+        .route("/me/brief", put(change_brief))
 }
 
 /// How long a catalog read is reused for attribution (never for `GET /api/me`, `GET
@@ -58,6 +67,11 @@ pub const MAX_TEAM_KEYS: usize = 16;
 pub const VIA: [&str; 3] = ["onboarding", "bots_page", "picker"];
 /// What happens to a removed bot's routines.
 pub const ROUTINES: [&str; 2] = ["nudge", "pause"];
+/// How the daily brief's routine is known: its prompt starts with this (the Slack service's
+/// `brief::TAG`; `docs/daily-brief.md`).
+pub const BRIEF_TAG: &str = "[daily-brief]";
+/// The skill a bot must list in `can_do` to write the daily brief.
+pub const BRIEF_SKILL: &str = "daily-brief";
 
 /// The offered personas, as the tool server served them.
 #[derive(Debug, Clone, Default)]
@@ -683,7 +697,32 @@ fn bots_answer(catalog: &Catalog, team: &Team, usage: &Usage) -> Value {
             Value::Object(m)
         })
         .collect();
-    json!({ "bots": bots, "withdrawn": withdrawn })
+    json!({ "bots": bots, "withdrawn": withdrawn, "brief": brief_field(usage) })
+}
+
+/// Is this routine (as [`routine_out`] shows it) a daily brief?
+fn is_brief(r: &Value) -> bool {
+    r.get("prompt")
+        .and_then(Value::as_str)
+        .is_some_and(|p| p.trim_start().starts_with(BRIEF_TAG))
+}
+
+/// `brief` in the Bots answer: who writes the person's daily brief. `null` when the runtime
+/// couldn't list the routines; `{routine_id: null, writer: null, enabled: false}` when there is
+/// no brief routine; else the first one's id, its writer (`"nudge"` or a bot's key) and whether
+/// it is on.
+fn brief_field(usage: &Usage) -> Value {
+    let Some(list) = &usage.routines else {
+        return Value::Null;
+    };
+    match list.iter().find(|(_, r)| is_brief(r)) {
+        None => json!({ "routine_id": null, "writer": null, "enabled": false }),
+        Some((persona, r)) => json!({
+            "routine_id": r["id"],
+            "writer": persona.as_deref().unwrap_or(ALWAYS_ON),
+            "enabled": r["enabled"],
+        }),
+    }
 }
 
 /// `GET /api/bots`: the offered bots, with which are on the PM's team and how each is used.
@@ -733,12 +772,9 @@ async fn settle_routines(
     let runtime = signed.runtime(state);
     let handle = signed.handle();
     let list = runtime.routines(handle).await.map_err(ApiError::upstream)?;
-    let body = if how == "pause" {
-        json!({ "enabled": false })
-    } else {
-        // R1: `null` is Nudge.
-        json!({ "persona": null })
-    };
+    let pause = json!({ "enabled": false });
+    // R1: `null` is Nudge.
+    let to_nudge = json!({ "persona": null });
     let mut changed = 0;
     for r in list
         .iter()
@@ -751,7 +787,13 @@ async fn settle_routines(
             continue;
         }
         let id = out["id"].as_str().unwrap_or_default();
-        if let Err(e) = runtime.patch_routine(handle, id, &body).await {
+        // The daily brief goes back to Nudge whatever was chosen for the others (R2).
+        let body = if how == "pause" && !is_brief(&out) {
+            &pause
+        } else {
+            &to_nudge
+        };
+        if let Err(e) = runtime.patch_routine(handle, id, body).await {
             tracing::warn!(error = ?e, routine = %id, changed, "a removed bot's routine couldn't be moved; the team is unchanged");
             let lost = matches!(e, UpstreamError::Unknown { .. });
             return Err(if changed > 0 || lost {
@@ -845,6 +887,139 @@ async fn change_team(State(state): State<AppState>, signed: Signed, body: Bytes)
     }
     let team = Team::from_wire(&v, signed.handle()).ok_or_else(lost_team_change)?;
     tracing::info!(user = %signed.handle(), added = add.len(), removed = remove.len(), via = %req.via, "team changed");
+    let usage = usage(&state, &signed, &usage_keys(&catalog, &team)).await;
+    Ok(Json(bots_answer(&catalog, &team, &usage)).into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BriefBody {
+    persona: String,
+}
+
+fn no_brief() -> ApiError {
+    coded(
+        StatusCode::CONFLICT,
+        "no_brief",
+        "You don't have a daily brief yet. Say \"brief me at 8\" to your bot in Slack to start \
+         one. Nothing changed.",
+    )
+}
+
+fn cant_write_brief() -> ApiError {
+    coded(
+        StatusCode::CONFLICT,
+        "cant_write_brief",
+        "That bot doesn't write daily briefs. Nothing changed.",
+    )
+}
+
+fn brief_lost() -> ApiError {
+    coded(
+        StatusCode::BAD_GATEWAY,
+        "unknown_outcome",
+        "PM OS can't tell who writes your daily brief now. Reload the Bots page to see.",
+    )
+}
+
+/// Set each of `briefs` (the person's own brief routines) to run as `persona` (`None` is
+/// Nudge). Answers how many it changed; `Err` once a change may have half happened.
+async fn set_brief_writer(
+    state: &AppState,
+    signed: &Signed,
+    briefs: &[String],
+    persona: Option<&str>,
+) -> Result<usize, ApiError> {
+    let runtime = signed.runtime(state);
+    let body = json!({ "persona": persona });
+    for (n, id) in briefs.iter().enumerate() {
+        if let Err(e) = runtime.patch_routine(signed.handle(), id, &body).await {
+            tracing::warn!(error = ?e, routine = %id, "the daily brief's writer couldn't be changed");
+            let lost = matches!(e, UpstreamError::Unknown { .. });
+            return Err(if n > 0 || lost {
+                brief_lost()
+            } else {
+                match e {
+                    // R1's `400` codes: a bot the runtime's catalog doesn't offer, or that
+                    // doesn't suit the bot. pmos-web checked the tool server's catalog first.
+                    UpstreamError::Refused { status: 400, .. } => bot_unavailable(),
+                    e => ApiError::upstream(e),
+                }
+            });
+        }
+    }
+    Ok(briefs.len())
+}
+
+/// `PUT /api/me/brief {persona}`: who writes the signed-in person's daily brief, Nudge
+/// (`"nudge"`) or a bot on their team that writes briefs (Chief). Only their own
+/// `[daily-brief]` routines change, and only who runs them: the schedule, the prompt and
+/// whether it is on stay as they are. Answers as `GET /api/bots` (`{bots, withdrawn, brief}`).
+async fn change_brief(State(state): State<AppState>, signed: Signed, body: Bytes) -> ApiResult {
+    signed.need(Permission::AskBot)?;
+    let req: BriefBody = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::bad_request("The body is {persona: key}, `nudge` for Nudge. Nothing changed.")
+    })?;
+    let wanted = requested_key(&req.persona)?;
+    let catalog = catalog(&state, &signed, true).await?;
+    if let Some(key) = wanted.as_deref() {
+        if catalog.always_on(key) {
+            // Another always-on bot would be a second Nudge; there is none to choose.
+            return Err(cant_write_brief());
+        }
+        let Some(card) = catalog.personas.iter().find(|p| p["key"] == json!(key)) else {
+            return Err(bot_unavailable());
+        };
+        let writes_briefs = card["can_do"]
+            .as_array()
+            .is_some_and(|l| l.iter().any(|s| s == BRIEF_SKILL));
+        if !writes_briefs {
+            return Err(cant_write_brief());
+        }
+        check_on_team(&state, &signed, Some(key)).await?;
+    }
+    let handle = signed.handle();
+    let runtime = signed.runtime(&state);
+    let list = runtime.routines(handle).await.map_err(ApiError::upstream)?;
+    let briefs: Vec<(Option<String>, String)> = list
+        .iter()
+        .filter(|r| r.get("owner").and_then(Value::as_str) == Some(handle))
+        .filter_map(routine_out)
+        .filter(|(_, r)| is_brief(r))
+        .map(|(p, r)| (p, r["id"].as_str().unwrap_or_default().to_string()))
+        .collect();
+    if briefs.is_empty() {
+        return Err(no_brief());
+    }
+    let to_change: Vec<String> = briefs
+        .iter()
+        .filter(|(p, _)| *p != wanted)
+        .map(|(_, id)| id.clone())
+        .collect();
+    let changed = set_brief_writer(&state, &signed, &to_change, wanted.as_deref()).await?;
+    // The bot may have left the team between the check and the change (a removal in another
+    // tab lists the routines before this change lands): read the team again, and if it is
+    // gone, the brief goes back to Nudge now rather than pausing at its next run.
+    if let (Some(key), true) = (wanted.as_deref(), changed > 0) {
+        let still = match team(&state, &signed).await {
+            Ok(t) => t.find(key).is_some_and(|b| b.offered),
+            Err(e) => {
+                tracing::warn!(
+                    code = e.code(),
+                    "the team couldn't be read again after the brief changed"
+                );
+                true
+            }
+        };
+        if !still {
+            tracing::info!(user = %handle, bot = %key, "the brief's bot left the team meanwhile; back to Nudge");
+            let ids: Vec<String> = briefs.iter().map(|(_, id)| id.clone()).collect();
+            set_brief_writer(&state, &signed, &ids, None).await?;
+            return Err(bot_not_on_team());
+        }
+    }
+    tracing::info!(user = %handle, writer = wanted.as_deref().unwrap_or(ALWAYS_ON), changed, "daily brief writer set");
+    let team = team(&state, &signed).await?;
     let usage = usage(&state, &signed, &usage_keys(&catalog, &team)).await;
     Ok(Json(bots_answer(&catalog, &team, &usage)).into_response())
 }

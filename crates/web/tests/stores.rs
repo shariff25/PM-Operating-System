@@ -428,6 +428,7 @@ async fn followups_are_listed_per_pm_and_expire(s: &Stores) {
             new_followup(Kind::WaitingOnYou, "slack", "Ben", 1),
             new_followup(Kind::YouWaitOn, "jira", "Legal", 2),
         ],
+        None,
         at(0),
     )
     .await
@@ -482,9 +483,16 @@ async fn followups_dismiss_and_replace(s: &Stores) {
     let f = &s.followups;
     let a = new_followup(Kind::WaitingOnYou, "jira", "Ben", 1);
     let b = new_followup(Kind::WaitingOnYou, "jira", "Cy", 2);
-    f.replace("ana", day(), vec![], vec![a.clone(), b.clone()], at(0))
-        .await
-        .unwrap();
+    f.replace(
+        "ana",
+        day(),
+        vec![],
+        vec![a.clone(), b.clone()],
+        None,
+        at(0),
+    )
+    .await
+    .unwrap();
     let id_a = a.id("ana");
     // Dismiss twice: both say it was there; it is not listed or open either way.
     assert!(f.dismiss("ana", &id_a, at(1)).await.unwrap());
@@ -507,6 +515,7 @@ async fn followups_dismiss_and_replace(s: &Stores) {
         day(),
         vec![],
         vec![a2, b.clone(), b.clone(), c.clone()],
+        None,
         at(60),
     )
     .await
@@ -519,7 +528,7 @@ async fn followups_dismiss_and_replace(s: &Stores) {
     assert!(list.iter().any(|x| x.id == c.id("ana")));
     assert!(f.open("ana", &id_a, at(61)).await.unwrap().is_none());
     // Dropped by the producer: gone.
-    f.replace("ana", day(), vec![], vec![c.clone()], at(120))
+    f.replace("ana", day(), vec![], vec![c.clone()], None, at(120))
         .await
         .unwrap();
     assert_eq!(f.list("ana", at(121)).await.unwrap().len(), 1);
@@ -527,7 +536,7 @@ async fn followups_dismiss_and_replace(s: &Stores) {
     // A producer-supplied `created` is used for a new one.
     let mut old = new_followup(Kind::YouWaitOn, "jira", "Ed", 4);
     old.created = Some(at(-3 * 24 * 60));
-    f.replace("ana", day(), vec![], vec![old.clone()], at(130))
+    f.replace("ana", day(), vec![], vec![old.clone()], None, at(130))
         .await
         .unwrap();
     assert_eq!(
@@ -535,10 +544,17 @@ async fn followups_dismiss_and_replace(s: &Stores) {
         at(-3 * 24 * 60)
     );
     // Replacing Ana's leaves Ben's alone.
-    f.replace("ben", day(), vec![changed("x")], vec![c.clone()], at(140))
-        .await
-        .unwrap();
-    f.replace("ana", day(), vec![], vec![], at(150))
+    f.replace(
+        "ben",
+        day(),
+        vec![changed("x")],
+        vec![c.clone()],
+        None,
+        at(140),
+    )
+    .await
+    .unwrap();
+    f.replace("ana", day(), vec![], vec![], None, at(150))
         .await
         .unwrap();
     assert!(f.list("ana", at(151)).await.unwrap().is_empty());
@@ -589,10 +605,20 @@ async fn sessions_keep_the_entra_account(s: &Stores) {
 async fn a_delivery_is_remembered_after_its_items_go(s: &Stores) {
     assert_eq!(s.followups.delivered("ana").await.unwrap(), None);
     s.followups
-        .replace("ana", day(), vec![changed("t")], vec![], at(0))
+        .replace(
+            "ana",
+            day(),
+            vec![changed("t")],
+            vec![],
+            Some("chief"),
+            at(0),
+        )
         .await
         .unwrap();
     assert_eq!(s.followups.delivered("ana").await.unwrap(), Some(at(0)));
+    // Who wrote it (slice R2) is kept with the day.
+    let d = s.followups.day("ana", at(1)).await.unwrap().unwrap();
+    assert_eq!(d.persona.as_deref(), Some("chief"));
     // A day and more later the items are purged; when it was delivered is not.
     let later = at(25 * 60);
     s.followups.purge(later).await.unwrap();
@@ -601,10 +627,15 @@ async fn a_delivery_is_remembered_after_its_items_go(s: &Stores) {
     assert_eq!(s.followups.delivered("ben").await.unwrap(), None);
     // A new delivery moves it on.
     s.followups
-        .replace("ana", day(), vec![], vec![], later)
+        .replace("ana", day(), vec![], vec![], None, later)
         .await
         .unwrap();
     assert_eq!(s.followups.delivered("ana").await.unwrap(), Some(later));
+    let d = s.followups.day("ana", later).await.unwrap().unwrap();
+    assert_eq!(
+        d.persona, None,
+        "Nudge's brief replaces Chief's attribution"
+    );
 }
 
 // Running the contract.
@@ -665,7 +696,14 @@ async fn postgres_data_survives_a_restart() {
     let a = new_followup(Kind::YouWaitOn, "jira", "Legal", 1);
     pg.stores
         .followups
-        .replace("ana", day(), vec![changed("t")], vec![a.clone()], at(0))
+        .replace(
+            "ana",
+            day(),
+            vec![changed("t")],
+            vec![a.clone()],
+            None,
+            at(0),
+        )
         .await
         .unwrap();
     pg.stores
@@ -675,7 +713,7 @@ async fn postgres_data_survives_a_restart() {
         .unwrap();
     pg.stores
         .followups
-        .replace("ben", day(), vec![], vec![a.clone()], at(1))
+        .replace("ben", day(), vec![], vec![a.clone()], None, at(1))
         .await
         .unwrap();
 
