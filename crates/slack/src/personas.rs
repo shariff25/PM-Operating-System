@@ -24,6 +24,21 @@ use serde_json::Value;
 pub const PREVIEW_LABEL: &str = "Preview: not yet benchmarked";
 /// A persona key the catalog doesn't (or no longer) list: never guessed from the key.
 pub const NO_LONGER_OFFERED: &str = "A bot no longer offered";
+/// A persona the Slack bot can't name because neither the tool server's item nor any catalog
+/// read says who it is. Shown with the Preview line: nothing says it was benchmarked
+/// (gate-fix-4, M1: the line is never dropped for want of a catalog).
+pub const UNNAMED_BOT: &str = "A marketplace bot";
+
+/// A stand-in for a persona whose catalog entry couldn't be read: [`UNNAMED_BOT`], a Preview.
+pub fn unnamed(key: &str) -> Persona {
+    Persona {
+        key: key.to_string(),
+        display_name: UNNAMED_BOT.to_string(),
+        title: String::new(),
+        always_on: false,
+        preview: true,
+    }
+}
 
 /// One offered persona, from `GET /v1/personas`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,17 +174,52 @@ impl Catalog {
 }
 
 /// The field the Slack bot adds to an approval item for its card: who drafted it, as safe
-/// `mrkdwn`. Never taken from the tool server (any copy it sends is dropped first).
+/// `mrkdwn`. Never taken as sent (any copy in the tool server's answer is dropped first).
 pub const DRAFTED_BY_FIELD: &str = "_slack_drafted_by";
+/// With [`DRAFTED_BY_FIELD`]: `true` when that bot is a Preview, so the card and the App Home
+/// row say "Preview: not yet benchmarked" (gate-fix-4, M1).
+pub const DRAFTED_PREVIEW_FIELD: &str = "_slack_drafted_preview";
 
-/// Put [`DRAFTED_BY_FIELD`] on `item` from its `persona` (or take it off).
+/// Who drafted `item`, from the **tool server's item** (`persona_name`, `persona_preview`,
+/// gate-fix-4): the name (safe `mrkdwn`) and whether it is a Preview. `None` for Nudge. A
+/// `persona_name` of `null` is a bot no longer offered. An item from an older tool server,
+/// without the fields, falls back to the catalog the Slack bot read; with none read, the bot
+/// is [`UNNAMED_BOT`] and a Preview (fail safe: the label is never dropped for want of a
+/// catalog).
+pub fn drafter(item: &Value, catalog: &Catalog) -> Option<(String, bool)> {
+    let key = item["persona"].as_str().filter(|k| *k != ALWAYS_ON)?;
+    if let Some(name) = item.get("persona_name") {
+        return Some(match name.as_str().filter(|n| !n.trim().is_empty()) {
+            Some(n) => (
+                // Room for the tool server's " (bot)" on a name like a colleague's.
+                crate::blocks::name(n, MAX_DISPLAY_NAME + 6),
+                item["persona_preview"] != false,
+            ),
+            None => (NO_LONGER_OFFERED.to_string(), false),
+        });
+    }
+    if catalog.current().is_none() {
+        return Some((UNNAMED_BOT.to_string(), true));
+    }
+    let found = key_ok(key).then(|| catalog.get(key)).flatten();
+    Some(match found {
+        Some(p) => (p.shown(), p.preview),
+        None => (NO_LONGER_OFFERED.to_string(), false),
+    })
+}
+
+/// Put [`DRAFTED_BY_FIELD`] and [`DRAFTED_PREVIEW_FIELD`] on `item` ([`drafter`]), or take
+/// them off.
 pub fn annotate(item: &mut Value, catalog: &Catalog) {
+    let who = drafter(item, catalog);
     let Some(obj) = item.as_object_mut() else {
         return;
     };
     obj.remove(DRAFTED_BY_FIELD);
-    if let Some(name) = catalog.drafted_by(obj.get("persona").unwrap_or(&Value::Null)) {
+    obj.remove(DRAFTED_PREVIEW_FIELD);
+    if let Some((name, preview)) = who {
         obj.insert(DRAFTED_BY_FIELD.into(), Value::String(name));
+        obj.insert(DRAFTED_PREVIEW_FIELD.into(), Value::Bool(preview));
     }
 }
 
@@ -247,6 +297,11 @@ pub fn refusal(code: &str, shown: &str) -> String {
              (just leave out “{shown}:”)."
         ),
         "persona_needs_personal_bot" => NEEDS_PERSONAL_BOT.replace("{name}", shown),
+        "persona_not_on_team" => format!(
+            "{shown} isn't on your team, so I didn't send that. Add {shown} on the Bots page in \
+             PM OS (if you just did, try again in a couple of minutes), or ask Nudge (just leave \
+             out “{shown}:”)."
+        ),
         _ => format!("{shown} can't take that right now. Try again, or ask Nudge."),
     }
 }
@@ -440,6 +495,57 @@ mod tests {
         assert_eq!(
             blocks[2]["elements"][0]["text"],
             "Preview: not yet benchmarked"
+        );
+    }
+
+    #[test]
+    fn a_bot_refused_moments_ago_is_explained_without_a_task() {
+        let s = refusal("persona_not_on_team", "Chief");
+        assert!(s.starts_with("Chief isn't on your team"), "{s}");
+        assert!(s.contains("Bots page"), "{s}");
+        assert!(crate::runtime::PERSONA_CODES.contains(&"persona_not_on_team"));
+    }
+
+    #[test]
+    fn the_drafter_comes_from_the_tool_servers_item_and_fails_safe() {
+        let cat = Catalog::default();
+        let item = |v: Value| drafter(&v, &cat);
+        assert_eq!(item(json!({"persona": null})), None);
+        assert_eq!(item(json!({"persona": "nudge"})), None);
+        assert_eq!(
+            item(json!({"persona": "chief", "persona_name": "Boss", "persona_preview": true})),
+            Some(("Boss".into(), true))
+        );
+        assert_eq!(
+            item(json!({"persona": "chief", "persona_name": "Boss", "persona_preview": false})),
+            Some(("Boss".into(), false))
+        );
+        // Not a bool: a Preview (fail safe).
+        assert_eq!(
+            item(json!({"persona": "chief", "persona_name": "Boss"})),
+            Some(("Boss".into(), true))
+        );
+        assert_eq!(
+            item(json!({"persona": "chief", "persona_name": null})),
+            Some((NO_LONGER_OFFERED.into(), false))
+        );
+        // Hostile text from the item is inert.
+        let (n, _) = item(json!({"persona": "chief", "persona_name": "<!channel> *x*"})).unwrap();
+        assert!(!n.contains("<!") && !n.contains('*'), "{n}");
+        // An older tool server and no catalog read: unnamed, a Preview.
+        assert_eq!(
+            item(json!({"persona": "chief"})),
+            Some((UNNAMED_BOT.into(), true))
+        );
+        // ... with a catalog read: the catalog's.
+        cat.store(catalog());
+        assert_eq!(
+            drafter(&json!({"persona": "chief"}), &cat),
+            Some(("Chief".into(), true))
+        );
+        assert_eq!(
+            drafter(&json!({"persona": "ghost"}), &cat),
+            Some((NO_LONGER_OFFERED.into(), false))
         );
     }
 

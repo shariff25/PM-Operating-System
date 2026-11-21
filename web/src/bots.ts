@@ -34,9 +34,15 @@ export interface BotIdentity {
   name: string;
   /** Which drawing: an unknown value draws the neutral face. */
   mascot: string;
+  /**
+   * Shown with the Preview tag ("not yet benchmarked"): an offered bot whose card says so. Never
+   * Nudge, nor a bot no longer offered; a bot the app can't check (`unchecked`) is shown as a
+   * Preview, since nothing says it was benchmarked.
+   */
+  preview: boolean;
 }
 
-const NUDGE: BotIdentity = { kind: 'nudge', name: copy.bots.nudgeName, mascot: 'nudge' };
+const NUDGE: BotIdentity = { kind: 'nudge', name: copy.bots.nudgeName, mascot: 'nudge', preview: false };
 
 /**
  * Who drafted a draft or ran a task: `persona` null is Nudge; a key the server says is offered is
@@ -46,11 +52,11 @@ const NUDGE: BotIdentity = { kind: 'nudge', name: copy.bots.nudgeName, mascot: '
  */
 export function identify(persona: string | null | undefined, offered: boolean | undefined, catalog: readonly BotCard[] | null | undefined): BotIdentity {
   if (persona === null || persona === undefined || persona === 'nudge') return NUDGE;
-  if (offered === false) return { kind: 'gone', name: copy.bots.gone, mascot: 'unknown' };
-  if (!catalog) return { kind: 'unchecked', name: copy.bots.unchecked, mascot: 'unknown' };
+  if (offered === false) return { kind: 'gone', name: copy.bots.gone, mascot: 'unknown', preview: false };
+  if (!catalog) return { kind: 'unchecked', name: copy.bots.unchecked, mascot: 'unknown', preview: true };
   const card = catalog.find((b) => b.key === persona);
-  if (!card) return { kind: 'gone', name: copy.bots.gone, mascot: 'unknown' };
-  return { kind: 'bot', name: card.display_name, mascot: card.mascot };
+  if (!card) return { kind: 'gone', name: copy.bots.gone, mascot: 'unknown', preview: false };
+  return { kind: 'bot', name: card.display_name, mascot: card.mascot, preview: card.preview === true };
 }
 
 /** The card for a key in the catalog, if it is offered. */

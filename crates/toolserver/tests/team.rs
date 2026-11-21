@@ -87,7 +87,18 @@ fn market(root: &Path) {
     write_content(
         root,
         "personas/quill/PERSONA.md",
-        &persona_file("quill", "Quill", "quill-role", "chief", true, 900, ""),
+        // Quill claims a passing benchmark (the lint checks the claim against the eval reports;
+        // the tool server can't read them, so it trusts only this). Abacus claims none: the
+        // tool server shows it as a Preview though its file doesn't say `preview: true` (M2).
+        &persona_file(
+            "quill",
+            "Quill",
+            "quill-role",
+            "chief",
+            true,
+            900,
+            "benchmarked: true\n",
+        ),
     );
     write_content(
         root,
@@ -111,6 +122,12 @@ fn market(root: &Path) {
         root,
         "bots/pm-bo/BOT.md",
         "---\nname: pm-bo\nrole: pm-assistant\nscope: personal\nowner: \"@bo\"\ndescription: Bo's assistant.\n---\n\n# Bo's assistant\n\nHelp Bo.\n",
+    );
+    // Ada (an Admin) has a personal bot too, so her own drafts can be held (gate-fix-4).
+    write_content(
+        root,
+        "bots/pm-ada/BOT.md",
+        "---\nname: pm-ada\nrole: pm-assistant\nscope: personal\nowner: \"@ada\"\ndescription: Ada's assistant.\n---\n\n# Ada's assistant\n\nHelp Ada.\n",
     );
 }
 
@@ -269,6 +286,10 @@ async fn catalog_serves_only_offered_personas_and_their_fields(f: &Fixture, _: O
     assert_eq!(quill["always_on"], false);
     assert_eq!(quill["preview"], false);
     assert_eq!(personas[0]["preview"], false, "Nudge is never a Preview");
+    // Offered with no benchmark claimed and no `preview: true`: served as a Preview all the
+    // same, whatever CI's lint did (gate-fix-4, M2).
+    assert_eq!(personas[a]["key"], "abacus");
+    assert_eq!(personas[a]["preview"], true, "fail safe: {}", personas[a]);
     // The repository's three new bots are Previews until their benchmark passes.
     for p in personas {
         if ["chief", "sprout", "echo"].contains(&p["key"].as_str().unwrap()) {
@@ -312,6 +333,33 @@ async fn catalog_serves_only_offered_personas_and_their_fields(f: &Fixture, _: O
     assert_eq!(personas[0]["always_on"], true);
     // The catalog has the content's commit, as the ledger does.
     assert_eq!(v["catalog_sha"], json!(f.svc.content_sha()));
+
+    // Content put in force without the lint (hand-built, as a merge that skipped CI would):
+    // neither `preview` nor `benchmarked` on the persona itself is a Preview, in the catalog
+    // and the admin view alike.
+    let roster = f.svc.roster();
+    let mut p: Persona = roster.persona("quill").unwrap().as_ref().clone();
+    (p.preview, p.benchmarked) = (false, false);
+    f.svc
+        .replace_roster(roster.as_ref().clone().with_unlinted_persona(p, None));
+    let v = f.svc.persona_catalog();
+    let quill = v["personas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["key"] == "quill")
+        .unwrap()
+        .clone();
+    assert_eq!(quill["preview"], true, "{quill}");
+    let admin = f.svc.admin_personas(now()).await.unwrap();
+    let row = admin["personas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["key"] == "quill")
+        .unwrap()
+        .clone();
+    assert_eq!(row["preview"], true, "{row}");
 }
 both!(catalog_serves_only_offered_personas_and_their_fields);
 
@@ -2469,3 +2517,319 @@ async fn the_admin_view_lists_held_drafts_and_the_audit_filters_by_bot(
     assert!(none.is_empty(), "Nudge's events carry no persona");
 }
 both!(the_admin_view_lists_held_drafts_and_the_audit_filters_by_bot);
+
+// ----- the security gate's marketplace findings on 8e8f8fe (gate-fix-4) -------------------
+
+/// Echo's line is stored on the item: a saved edit that drops it, or moves it to the bottom,
+/// and the approved write both start with it, even once Echo's file no longer says it.
+async fn the_notice_is_stored_on_the_item_and_heads_every_edit(f: &Fixture, _: Option<&TestPg>) {
+    use pmos_contract::personas::INTERNAL_REVIEW_NOTICE as NOTICE;
+    add(f, "ana", &["echo"]).await.unwrap();
+    let s = persona_session(f, "ana", "pm-ana", Some("echo"), "tsk_notice")
+        .await
+        .unwrap();
+    let out = f
+        .svc
+        .call(
+            &s,
+            "confluence_create_draft",
+            json!({"space": "PM", "title": "Fake: brief", "body": format!("Fake.\n\n{NOTICE}")}),
+            now(),
+        )
+        .await
+        .unwrap();
+    let id = out["approval_id"].as_str().unwrap().to_string();
+    let item = f.svc.approval(&id).await.unwrap().unwrap();
+    assert!(
+        item.args["body"].as_str().unwrap().starts_with(NOTICE),
+        "a copy at the bottom doesn't count: {}",
+        item.args["body"]
+    );
+    assert_eq!(item.draft_notice.as_deref(), Some(NOTICE), "stored");
+    // The item names its bot for a card, from the catalog here (never a client's copy).
+    let view = f.svc.approval_json(&item).await;
+    assert_eq!(
+        (&view["persona_name"], &view["persona_preview"]),
+        (&json!("Echo"), &json!(true))
+    );
+    assert!(view.get("draft_notice").is_none(), "never served");
+    // Echo's file no longer has the line (as if gone or changed): the item's copy holds.
+    let roster = f.svc.roster();
+    let mut echo: Persona = roster.persona("echo").unwrap().as_ref().clone();
+    echo.draft_notice = None;
+    f.svc
+        .replace_roster(roster.as_ref().clone().with_unlinted_persona(echo, None));
+    let saved = f
+        .svc
+        .save_draft(
+            Client::Web,
+            &id,
+            "ana",
+            json!({"space": "PM", "title": "Fake: brief", "body": "Edited, line dropped."}),
+            None,
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        saved.args["body"],
+        format!("{NOTICE}\n\nEdited, line dropped.")
+    );
+    let shown = saved.args_hash.chars().take(16).collect::<String>();
+    f.svc
+        .decide_verdict(
+            Client::Web,
+            &id,
+            "ana",
+            pmos_toolserver::approvals::Verdict::new(Decision::Approve, None).shown(Some(shown)),
+            now(),
+        )
+        .await
+        .unwrap();
+    let written = f.confluence.writes();
+    assert_eq!(written.len(), 1, "{written:?}");
+    assert!(written[0].args["body"]
+        .as_str()
+        .unwrap()
+        .starts_with(NOTICE));
+    // Only page tools store it.
+    let issue = jira_draft(f, &s).await;
+    let issue = f.svc.approval(&issue).await.unwrap().unwrap();
+    assert_eq!(issue.draft_notice, None);
+
+    // A bot named like a colleague is marked as a bot where a card names it.
+    let roster = f.svc.roster();
+    let mut echo: Persona = roster.persona("echo").unwrap().as_ref().clone();
+    echo.display_name = "Ana".into();
+    f.svc
+        .replace_roster(roster.as_ref().clone().with_unlinted_persona(echo, None));
+    let view = f.svc.approval_json(&issue).await;
+    assert_eq!(view["persona_name"], "Ana (bot)", "{view}");
+}
+both!(the_notice_is_stored_on_the_item_and_heads_every_edit);
+
+/// An Admin can't release their own held draft; a held draft can't be saved; and the store
+/// refuses a held approve under the decision's own lock, unless released.
+async fn holds_are_checked_with_the_decision_and_the_save(f: &Fixture, _: Option<&TestPg>) {
+    use pmos_toolserver::approvals::{DecideError, Verdict};
+    use pmos_toolserver::service::{ReleaseRefusal, RELEASE_HOLD};
+    add(f, "ada", &["quill"]).await.unwrap();
+    add(f, "ana", &["quill"]).await.unwrap();
+    let own = persona_session(f, "ada", "pm-ada", Some("quill"), "tsk_own")
+        .await
+        .unwrap();
+    let ada_draft = jira_draft(f, &own).await;
+    let s = persona_session(f, "ana", "pm-ana", Some("quill"), "tsk_hold2")
+        .await
+        .unwrap();
+    let first = jira_draft(f, &s).await;
+    let second = jira_draft(f, &s).await;
+    let view = f
+        .svc
+        .approval_json(&f.svc.approval(&first).await.unwrap().unwrap())
+        .await;
+    assert_eq!(
+        (&view["persona_name"], &view["persona_preview"]),
+        (&json!("Quill"), &json!(false)),
+        "Quill claims a benchmark"
+    );
+    withdraw(f, "quill");
+    let view = f
+        .svc
+        .approval_json(&f.svc.approval(&first).await.unwrap().unwrap())
+        .await;
+    assert_eq!(view["persona_name"], Value::Null, "no longer offered");
+
+    // Ada is an Admin, but the draft is her own: another Admin releases it.
+    let err = f
+        .svc
+        .release_held_draft(Client::Web, "ada", &ada_draft, now())
+        .await
+        .unwrap_err();
+    assert_eq!(err, ReleaseRefusal::OwnDraft);
+    assert_eq!(err.code(), "own_draft");
+    let last = events(f)
+        .await
+        .into_iter()
+        .rev()
+        .find(|e| e.tool == RELEASE_HOLD)
+        .unwrap();
+    assert_eq!(
+        (last.outcome, last.detail.as_deref()),
+        (Outcome::Denied, Some("own_draft"))
+    );
+
+    // Saving an edit of a held draft is refused, and nothing changes.
+    let before = f.svc.approval(&first).await.unwrap().unwrap();
+    let err = f
+        .svc
+        .save_draft(
+            Client::Web,
+            &first,
+            "ana",
+            json!({"project": "PM", "issue_type": "Story", "summary": "Fake: edited", "description": "Fake."}),
+            None,
+            now(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DecisionError::Held(_)), "{err:?}");
+    let after = f.svc.approval(&first).await.unwrap().unwrap();
+    assert_eq!(after.args_hash, before.args_hash);
+
+    // The store itself refuses an approve of a held item when given what is offered, under
+    // the decision's lock; a reject is never held; a released item is approvable.
+    let offered = f.svc.offered_keys();
+    assert!(!offered.contains("quill"));
+    let err = f
+        .stores
+        .approvals
+        .decide_with(
+            &first,
+            "ana",
+            Verdict::new(Decision::Approve, None).holding(offered.clone()),
+            now(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, DecideError::Held);
+    let err = f
+        .stores
+        .approvals
+        .save_draft_held(&first, "ana", json!({}), None, Some(&offered), now())
+        .await
+        .unwrap_err();
+    assert_eq!(err, DecideError::Held);
+    f.stores
+        .approvals
+        .release_hold(&first, "ada", now())
+        .await
+        .unwrap();
+    let ok = f
+        .stores
+        .approvals
+        .decide_with(
+            &first,
+            "ana",
+            Verdict::new(Decision::Approve, None).holding(offered.clone()),
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status, Status::Executing);
+    let rejected = f
+        .stores
+        .approvals
+        .decide_with(
+            &second,
+            "ana",
+            Verdict::new(Decision::Reject, None).holding(offered),
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status, Status::Rejected);
+}
+both!(holds_are_checked_with_the_decision_and_the_save);
+
+/// Over the hourly limit, refused team changes write one audit row an hour, not one each.
+async fn rate_limited_changes_are_recorded_once_an_hour(f: &Fixture, _: Option<&TestPg>) {
+    for i in 0..30 {
+        let at = now() + Duration::seconds(i);
+        let keys = vec!["quill".to_string()];
+        let (a, r): (&[String], &[String]) = if i % 2 == 0 {
+            (&keys, &[])
+        } else {
+            (&[], &keys)
+        };
+        f.svc
+            .change_team(Client::Web, "ana", a, r, "bots_page", at)
+            .await
+            .unwrap();
+    }
+    for i in 0..5 {
+        let at = now() + Duration::seconds(30 + i);
+        let err = f
+            .svc
+            .change_team(Client::Web, "ana", &["quill".into()], &[], "bots_page", at)
+            .await
+            .unwrap_err();
+        assert_eq!(err, TeamRefusal::RateLimited);
+    }
+    let limited = team_changes(f)
+        .await
+        .into_iter()
+        .filter(|e| e.detail.as_deref() == Some("rate_limited"))
+        .count();
+    assert_eq!(limited, 1, "the first refusal of the hour only");
+    // Other refusals are still each recorded.
+    for _ in 0..2 {
+        f.svc
+            .change_team(
+                Client::Web,
+                "bo",
+                &["ghost".into()],
+                &[],
+                "bots_page",
+                now(),
+            )
+            .await
+            .unwrap_err();
+    }
+    let bo = team_changes(f)
+        .await
+        .into_iter()
+        .filter(|e| e.user == "bo" && e.outcome == Outcome::Denied)
+        .count();
+    assert_eq!(bo, 2);
+}
+both!(rate_limited_changes_are_recorded_once_an_hour);
+
+/// The admin bots view, which the audit log's page also reads for its filter, is recorded
+/// once per viewer per ten minutes when allowed; every refusal is recorded.
+#[tokio::test]
+async fn admin_bots_reads_are_recorded_once_per_window() {
+    let srv = start(Assert::Require).await;
+    for _ in 0..3 {
+        let (s, _) = srv
+            .send(
+                Method::GET,
+                "/internal/admin/personas?user=ada",
+                WEB_TOKEN,
+                None,
+                Some("ada"),
+            )
+            .await;
+        assert_eq!(s, 200);
+        let (s, _) = srv
+            .send(
+                Method::GET,
+                "/internal/admin/personas?user=ana",
+                WEB_TOKEN,
+                None,
+                Some("ana"),
+            )
+            .await;
+        assert_eq!(s, 403);
+    }
+    let reads: Vec<(String, Outcome)> = events(&srv.f)
+        .await
+        .into_iter()
+        .filter(|e| e.tool == "admin.personas_read")
+        .map(|e| (e.user, e.outcome))
+        .collect();
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|(u, o)| u == "ada" && *o == Outcome::Ok)
+            .count(),
+        1
+    );
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|(u, o)| u == "ana" && *o == Outcome::Denied)
+            .count(),
+        3
+    );
+}

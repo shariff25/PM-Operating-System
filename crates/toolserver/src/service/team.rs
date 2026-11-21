@@ -92,6 +92,16 @@ impl From<TeamError> for TeamRefusal {
     }
 }
 
+/// Whether the tool server shows `p` as a Preview ("not yet benchmarked"): every persona but
+/// the always-on one, unless its file claims a passing benchmark (`benchmarked: true`, which
+/// `pmos lint` checks against the eval reports) and doesn't say `preview: true`. The tool
+/// server can't read the eval reports, so it fails safe on the claim alone: content that
+/// skipped the lint (no branch protection, a hand edit) never ships a bot as benchmarked
+/// unless it says so in so many words (gate-fix-4, M2).
+pub fn shown_as_preview(p: &Persona) -> bool {
+    pmos_contract::personas::is_preview(p.always_on, p.preview, p.benchmarked)
+}
+
 /// A persona as the catalog serves it: the spec's `Persona` shape and nothing else.
 pub fn persona_json(p: &Persona) -> Value {
     json!({
@@ -100,7 +110,7 @@ pub fn persona_json(p: &Persona) -> Value {
         "title": p.title,
         "mascot": p.mascot,
         "always_on": p.always_on,
-        "preview": p.preview,
+        "preview": shown_as_preview(p),
         "summary": p.summary,
         "examples": p.examples,
         "can_do": p.can_do,
@@ -228,7 +238,14 @@ impl ToolService {
         {
             Ok(team) => Ok(team),
             Err(e) => {
-                if !matches!(e, TeamRefusal::Store(_)) {
+                // Over the hourly limit, one row per person per hour records it, not one per
+                // refused call: a loop of refused changes can't flood the audit log
+                // (gate-fix-4). The first refusal of the hour is always recorded.
+                let quiet = matches!(e, TeamRefusal::RateLimited)
+                    && !self.first_in_window(RATE_LIMITED_MARK, handle, Duration::hours(1), now);
+                if quiet {
+                    tracing::info!(user = %handle, "team change over the hourly limit; already recorded this hour");
+                } else if !matches!(e, TeamRefusal::Store(_)) {
                     self.audit(change_event(
                         client,
                         handle,
@@ -397,7 +414,7 @@ impl ToolService {
                 "mascot": p.mascot,
                 "offered": roster.offered(&p.name).is_some(),
                 "always_on": p.always_on,
-                "preview": p.preview,
+                "preview": shown_as_preview(p),
                 "users": users,
                 "handles": handles,
                 "needs": p.needs.iter().map(|n| json!({
@@ -523,6 +540,11 @@ impl ToolService {
             _ => return Err(ReleaseRefusal::Forbidden),
         }
         let item = item.ok_or(ReleaseRefusal::NotFound)?;
+        // Two people, as for any approval: an Admin can't release their own held draft and
+        // then approve it (gate-fix-4). Another Admin releases it.
+        if item.user == admin {
+            return Err(ReleaseRefusal::OwnDraft);
+        }
         if self.held(item).await?.is_none() {
             return Err(ReleaseRefusal::NotHeld);
         }
@@ -538,6 +560,14 @@ impl ToolService {
     }
 }
 
+/// The mark of a recorded refusal over the hourly team-change limit
+/// ([`ToolService::first_in_window`]).
+pub const RATE_LIMITED_MARK: &str = "team.rate_limited";
+
+/// An allowed admin read of the bots view (`admin.personas_read`) is recorded once per viewer
+/// per this many minutes; a refused one always is.
+pub const PERSONAS_READ_WINDOW_MINUTES: i64 = 10;
+
 /// The most held drafts the admin view lists (newest first); `held_total` counts them all.
 pub const ADMIN_HELD_CAP: usize = 200;
 
@@ -550,6 +580,9 @@ pub enum ReleaseRefusal {
     /// Not an active person holding `edit-content`.
     #[error("only an Admin releases a held draft")]
     Forbidden,
+    /// The Admin owns the draft: another Admin releases it.
+    #[error("an Admin can't release their own held draft; another Admin releases it")]
+    OwnDraft,
     #[error("no such draft")]
     NotFound,
     /// Not pending, not a persona's, its persona is offered, or already released.
@@ -566,6 +599,7 @@ impl ReleaseRefusal {
     pub fn code(&self) -> &'static str {
         match self {
             ReleaseRefusal::Forbidden => "forbidden",
+            ReleaseRefusal::OwnDraft => "own_draft",
             ReleaseRefusal::NotFound => "not_found",
             ReleaseRefusal::NotHeld => "not_held",
             ReleaseRefusal::Store(_) => "unavailable",

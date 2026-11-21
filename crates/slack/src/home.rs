@@ -366,7 +366,11 @@ fn preview(item: &Value) -> Option<String> {
 pub fn inbox_row(item: &Value, display: &dyn Fn(&str) -> String, now: DateTime<Utc>) -> Value {
     let id = item["id"].as_str().unwrap_or_default();
     let mut meta = Vec::new();
-    if let Some(bot) = drafted_by(item) {
+    // A marketplace bot's draft names the bot, and a Preview says so on every row
+    // (gate-fix-4, M1); the name is already safe `mrkdwn` (`personas::annotate`).
+    if let Some(drafted) = cards::drafted_by(item) {
+        meta.push(drafted);
+    } else if let Some(bot) = drafted_by(item) {
         meta.push(format!("by {}", escape(&display(bot))));
     }
     if let Some(ago) = ago(item["created_at"].as_str(), now) {
@@ -1283,6 +1287,51 @@ mod tests {
             ]
         );
         assert!(ticked(&json!(null)).is_empty());
+    }
+
+    /// gate-fix-4 (M1): an App Home row names the marketplace bot that drafted it, from the
+    /// tool server's item, and a Preview says so on every row; with no catalog and no fields,
+    /// the row still says Preview.
+    #[test]
+    fn rows_name_their_bot_and_a_preview() {
+        use crate::personas::{annotate, Catalog};
+        let now = Utc::now();
+        let mut item = json!({"id": "apr_1", "tool": "jira.create_issue", "status": "pending",
+                              "bot": "pm-ana", "persona": "chief", "persona_name": "Chief",
+                              "persona_preview": true, "args": {"summary": "x"}});
+        let unread = Catalog::default();
+        annotate(&mut item, &unread);
+        let text = inbox_row(&item, &|b: &str| b.to_string(), now).to_string();
+        assert!(
+            text.contains("Drafted by Chief · Preview: not yet benchmarked"),
+            "{text}"
+        );
+        assert!(!text.contains("by pm-ana"), "{text}");
+        item["persona_preview"] = json!(false);
+        annotate(&mut item, &unread);
+        let text = inbox_row(&item, &|b: &str| b.to_string(), now).to_string();
+        assert!(
+            text.contains("Drafted by Chief") && !text.contains("Preview"),
+            "{text}"
+        );
+        // No fields (an older tool server) and no catalog ever read: unnamed, a Preview.
+        let mut older = json!({"id": "apr_2", "tool": "jira.create_issue", "status": "pending",
+                               "persona": "chief", "args": {"summary": "x"}});
+        annotate(&mut older, &unread);
+        let text = inbox_row(&older, &|b: &str| b.to_string(), now).to_string();
+        assert!(
+            text.contains("Drafted by A marketplace bot · Preview: not yet benchmarked"),
+            "{text}"
+        );
+        // Nudge's rows are as before.
+        let mut nudge = json!({"id": "apr_3", "tool": "jira.create_issue", "status": "pending",
+                               "bot": "pm-ana", "persona": null, "args": {"summary": "x"}});
+        annotate(&mut nudge, &unread);
+        let text = inbox_row(&nudge, &|b: &str| b.to_string(), now).to_string();
+        assert!(
+            text.contains("by pm-ana") && !text.contains("Drafted"),
+            "{text}"
+        );
     }
 
     /// R5: a row carries the start of the args hash it showed, and a stale or unversioned

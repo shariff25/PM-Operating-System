@@ -95,6 +95,8 @@ struct Mocks {
     /// When a routine is set to run as this bot, the bot leaves Ana's team at that moment (a
     /// removal in another tab racing a brief change; slice R2).
     leave_team_on_patch: Mutex<Option<String>>,
+    /// The runtime takes this many more routine changes, then answers `503` to each.
+    patches_left: Mutex<Option<usize>>,
 }
 
 impl Mocks {
@@ -281,6 +283,12 @@ async fn runtime(State(m): State<Arc<Mocks>>, method: Method, uri: Uri, body: By
         ("PATCH", path) if path.starts_with("/v1/routines/") => {
             if m.routines_down.load(Ordering::SeqCst) {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if let Some(left) = m.patches_left.lock().unwrap().as_mut() {
+                if *left == 0 {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                *left -= 1;
             }
             let id = path.trim_start_matches("/v1/routines/");
             let mut all = m.routines.lock().unwrap();
@@ -900,6 +908,71 @@ async fn removing_a_bot_moves_its_routines_before_the_team_changes() {
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
 }
 
+/// gate-fix-4 (W1): the tool server refuses a removal after its routines were moved: they are
+/// put back, so "Nothing changed" is true; if they can't be, the PM is told what changed.
+#[tokio::test]
+async fn a_refused_removal_puts_the_moved_routines_back() {
+    let w = web().await;
+    w.m.put_on_team("ana", "chief");
+    *w.m.routines.lock().unwrap() = vec![
+        routine("rtn_1", Some("chief")),
+        routine("rtn_2", Some("chief")),
+    ];
+    *w.m.bots.refuse_change.lock().unwrap() = Some((429, "rate_limited".into()));
+    let c = w.login("ana").await;
+    let r = w
+        .put(
+            &c,
+            "/api/me/team",
+            &json!({"remove": ["chief"], "via": "bots_page", "routines": "pause"}),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")),
+        "{}",
+        r.text
+    );
+    let routines = w.m.routines.lock().unwrap().clone();
+    assert!(
+        routines
+            .iter()
+            .all(|r| r["persona"] == "chief" && r["enabled"] == true),
+        "put back as they were: {routines:?}"
+    );
+    let patches: Vec<Value> =
+        w.m.calls("runtime")
+            .into_iter()
+            .filter(|c| c.method == "PATCH")
+            .map(|c| c.body)
+            .collect();
+    assert_eq!(
+        patches,
+        [
+            json!({"enabled": false}),
+            json!({"enabled": false}),
+            json!({"enabled": true}),
+            json!({"enabled": true}),
+        ]
+    );
+    assert_eq!(w.m.bots.team_rows("ana"), ["chief"]);
+
+    // Moved to Nudge, and the runtime fails before they can be put back: never "Nothing
+    // changed"; the PM is told some routines moved.
+    *w.m.patches_left.lock().unwrap() = Some(2);
+    let r = w
+        .put(
+            &c,
+            "/api/me/team",
+            &json!({"remove": ["chief"], "via": "bots_page"}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_GATEWAY, "{}", r.text);
+    assert_eq!(r.body["code"], "unknown_outcome", "{}", r.text);
+    assert!(!r.text.contains("Nothing changed"), "{}", r.text);
+    assert!(r.text.contains("moved"), "{}", r.text);
+}
+
 #[tokio::test]
 async fn team_changes_are_checked_before_anything_is_sent() {
     let w = web().await;
@@ -1071,6 +1144,8 @@ async fn catalog_text_passes_through_unchanged() {
         "title",
         "mascot",
         "always_on",
+        // The Preview label (gate-fix-4, H1: left out before, so the app never showed it).
+        "preview",
         "summary",
         "examples",
         "can_do",
@@ -1087,7 +1162,7 @@ async fn catalog_text_passes_through_unchanged() {
     ] {
         assert!(chief.get(k).is_some(), "{k}");
     }
-    assert_eq!(chief.as_object().unwrap().len(), 18);
+    assert_eq!(chief.as_object().unwrap().len(), 19);
     // A persona not in the catalog's shape is left out, never half-shown.
     let mut bad = sprout();
     bad["examples"] = json!("not a list");
@@ -1482,6 +1557,8 @@ async fn an_admin_releases_a_held_draft_through_the_tool_server() {
     for (status, code, want_status, want_code) in [
         (409, "not_held", StatusCode::CONFLICT, "not_held"),
         (403, "forbidden", StatusCode::FORBIDDEN, "forbidden"),
+        // gate-fix-4: an Admin's own held draft is released by another Admin.
+        (403, "own_draft", StatusCode::FORBIDDEN, "release_own_draft"),
         (404, "not_found", StatusCode::NOT_FOUND, "not_found"),
         (
             503,
@@ -1971,4 +2048,98 @@ async fn the_brief_says_who_wrote_it_and_still_fills_the_panels() {
     );
     let b = w.get(&c, "/api/brief").await;
     assert_eq!(b.body["persona"], "ghost");
+}
+
+// ----- gate-fix-4, H1: the Preview label reaches the app from the real answer --------------
+
+/// The repository's catalog as the tool server serves it: each offered persona through the
+/// tool server's own projection (`persona_json`), Nudge first, then by `order`.
+fn repo_catalog() -> Vec<Value> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content");
+    let today = chrono::Utc::now().date_naive();
+    let report = pmos_contract::lint(&root, &pmos_contract::LintOptions::new(today));
+    assert!(!report.has_errors(), "{:#?}", report.diagnostics);
+    let mut offered: Vec<_> = report.personas.iter().filter(|p| p.offered).collect();
+    offered.sort_by_key(|p| (!p.always_on, p.order));
+    offered
+        .into_iter()
+        .map(pmos_toolserver::service::persona_json)
+        .collect()
+}
+
+/// The fixture the web app's tests render (`web/src/api/fixtures/realBots.json`): this test's
+/// real answer, exactly. `PMOS_WRITE_FIXTURES=1` writes it again after a deliberate change.
+const REAL_BOTS_FIXTURE: &str = "../../web/src/api/fixtures/realBots.json";
+
+#[tokio::test]
+async fn the_real_bots_answer_carries_the_preview_label_the_app_shows() {
+    let w = web().await;
+    let catalog = repo_catalog();
+    for p in &catalog {
+        let key = p["key"].as_str().unwrap();
+        assert_eq!(p["preview"], json!(key != "nudge"), "{key} as served");
+    }
+    *w.m.bots.catalog.lock().unwrap() = catalog;
+    w.m.put_on_team("ana", "chief");
+    let c = w.login("ana").await;
+
+    let r = w.get(&c, "/api/bots").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    for key in ["chief", "sprout", "echo"] {
+        assert_eq!(card(&r, key)["preview"], true, "{key}: {}", r.text);
+    }
+    assert_eq!(card(&r, "nudge")["preview"], false);
+    // Every card has exactly the fields the app's `BotCard` reads.
+    let wanted: std::collections::BTreeSet<&str> = [
+        "key",
+        "display_name",
+        "title",
+        "mascot",
+        "always_on",
+        "preview",
+        "summary",
+        "examples",
+        "can_do",
+        "reads",
+        "drafts",
+        "needs",
+        "on_team",
+        "added_at",
+        "added_via",
+        "new",
+        "drafts_this_month",
+        "last_used_at",
+        "routines",
+    ]
+    .into();
+    for b in r.body["bots"].as_array().unwrap() {
+        let have: std::collections::BTreeSet<&str> =
+            b.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(have, wanted, "{b}");
+    }
+
+    // The app's fixture is this answer (Ana, with Chief on her team), so its tests render
+    // what pmos-web really sends, not the mock's shape.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(REAL_BOTS_FIXTURE);
+    let text = format!("{}\n", serde_json::to_string_pretty(&r.body).unwrap());
+    if std::env::var_os("PMOS_WRITE_FIXTURES").is_some() {
+        std::fs::write(&path, &text).unwrap();
+    }
+    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        fixture, r.body,
+        "web/src/api/fixtures/realBots.json is not pmos-web's answer: run this test with \
+         PMOS_WRITE_FIXTURES=1 and commit the file"
+    );
+
+    // A team change answers the same cards, the label included.
+    let t = w
+        .put(
+            &c,
+            "/api/me/team",
+            &json!({"add": ["sprout"], "via": "bots_page"}),
+        )
+        .await;
+    assert_eq!(t.status, StatusCode::OK, "{}", t.text);
+    assert_eq!(card(&t, "sprout")["preview"], true);
 }

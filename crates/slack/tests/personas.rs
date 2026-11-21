@@ -450,6 +450,101 @@ async fn the_approval_card_says_which_bot_drafted_it_and_a_held_draft_can_only_b
     stack.stop().await;
 }
 
+/// gate-fix-4 (M1 and the "Drafted by" Low): every card of a Preview bot says so, the name
+/// comes from the tool server's item (not the Slack bot's catalog copy), and with no catalog
+/// and an item that doesn't say, the card still carries the Preview line.
+#[tokio::test]
+async fn every_card_of_a_preview_bot_says_so_with_the_tool_servers_name() {
+    let stack = stack().await;
+    let item = |id: &str, persona: &str| {
+        let mut a = approval(
+            id,
+            "ana",
+            "jira.create_issue",
+            json!({"project": "PAY", "summary": format!("Fake {id}")}),
+            "2026-11-21T09:00:00Z",
+        );
+        a["persona"] = json!(persona);
+        a
+    };
+    // The tool server names Chief "Boss" (its catalog); the Slack bot's copy says "Chief".
+    let mut named = item("apr_p1", "chief");
+    named["persona_name"] = json!("Boss");
+    named["persona_preview"] = json!(true);
+    let mut benchmarked = item("apr_p2", "steady");
+    benchmarked["persona_name"] = json!("Steady");
+    benchmarked["persona_preview"] = json!(false);
+    // An older tool server: no fields; the Slack bot's catalog says Sprout is a Preview.
+    let older = item("apr_p3", "sprout");
+    stack
+        .tools
+        .items
+        .lock()
+        .unwrap()
+        .extend([named, benchmarked, older]);
+    let (stop, notifier) = stack.notifier();
+    stack.runtime.feed.lock().unwrap().push(json!({
+        "id": "ntf_p", "task_id": "tsk_p", "bot": "pm-ana", "requested_by": "ana",
+        "persona": "chief", "slack": {"channel": DM, "thread_ts": "3.1"},
+        "kind": "needs_approval", "text": "", "approvals": ["apr_p1", "apr_p2", "apr_p3"],
+    }));
+    let posts = stack.calls("chat.postMessage", 3).await;
+    let card = |id: &str| {
+        posts
+            .iter()
+            .map(call_text)
+            .find(|t| t.contains(id))
+            .unwrap_or_else(|| panic!("no card for {id}"))
+    };
+    let p1 = card("apr_p1");
+    assert!(
+        p1.contains("Drafted by Boss · Preview: not yet benchmarked"),
+        "{p1}"
+    );
+    assert!(!p1.contains("Drafted by Chief"), "never Slack's copy: {p1}");
+    let p2 = card("apr_p2");
+    assert!(p2.contains("Drafted by Steady"), "{p2}");
+    assert!(!p2.contains("Preview"), "benchmarked: {p2}");
+    let p3 = card("apr_p3");
+    assert!(
+        p3.contains("Drafted by Sprout · Preview: not yet benchmarked"),
+        "{p3}"
+    );
+    stop.cancel();
+    let _ = notifier.await;
+    stack.stop().await;
+
+    // No catalog at all (the runtime can't answer and nothing was read before) and an item
+    // that doesn't say: the bot is unnamed and the Preview line is still there.
+    let stack = Stack::new().await;
+    *stack.runtime.personas.lock().unwrap() = Some(json!("unavailable"));
+    stack
+        .tools
+        .items
+        .lock()
+        .unwrap()
+        .push(item("apr_p4", "chief"));
+    let (stop, notifier) = stack.notifier();
+    stack.runtime.feed.lock().unwrap().push(json!({
+        "id": "ntf_q", "task_id": "tsk_q", "bot": "pm-ana", "requested_by": "ana",
+        "persona": "chief", "slack": {"channel": DM, "thread_ts": "3.2"},
+        "kind": "needs_approval", "text": "", "approvals": ["apr_p4"],
+    }));
+    let posts = stack.calls("chat.postMessage", 1).await;
+    let p4 = posts
+        .iter()
+        .map(call_text)
+        .find(|t| t.contains("apr_p4"))
+        .unwrap();
+    assert!(
+        p4.contains("Preview: not yet benchmarked"),
+        "never dropped for want of a catalog: {p4}"
+    );
+    stop.cancel();
+    let _ = notifier.await;
+    stack.stop().await;
+}
+
 #[tokio::test]
 async fn what_slack_can_tell_before_sending_is_told_at_once() {
     let stack = stack().await;

@@ -292,6 +292,7 @@ async fn approval_items_and_audit_events_keep_their_bot(b: &Backend) {
                 model_alias: None,
                 sources_sensitivity: Sensitivity::Internal,
                 persona: None,
+                draft_notice: None,
             },
             now(),
         )
@@ -420,6 +421,7 @@ fn new_item<'a>(user: &'a str, args: &'a Value) -> NewItem<'a> {
         model_alias: Some("pmos/default"),
         sources_sensitivity: Sensitivity::Internal,
         persona: None,
+        draft_notice: None,
     }
 }
 
@@ -690,6 +692,7 @@ fn slack_item<'a>(tool: &'a str, args: &'a Value) -> NewItem<'a> {
         model_alias: Some("pmos/default"),
         sources_sensitivity: Sensitivity::Restricted,
         persona: None,
+        draft_notice: None,
     }
 }
 
@@ -891,6 +894,7 @@ fn bot_item<'a>(bot: &'a str, args: &'a Value) -> NewItem<'a> {
         model_alias: Some("pmos/extraction"),
         sources_sensitivity: Sensitivity::Internal,
         persona: None,
+        draft_notice: None,
     }
 }
 
@@ -946,6 +950,7 @@ async fn ledger_rows_record_every_outcome(b: &Backend) {
             reason: Some(Reason::WrongFacts),
             confirm_external: false,
             expected_args_hash: None,
+            hold: None,
         },
         decided,
     )
@@ -966,6 +971,7 @@ async fn ledger_rows_record_every_outcome(b: &Backend) {
             reason: Some(Reason::Tone),
             confirm_external: false,
             expected_args_hash: None,
+            hold: None,
         },
         decided,
     )
@@ -1077,6 +1083,7 @@ async fn ledger_reads_filter_and_order(b: &Backend) {
             reason: Some(Reason::Tone),
             confirm_external: false,
             expected_args_hash: None,
+            hold: None,
         },
         t(30),
     )
@@ -1198,6 +1205,7 @@ async fn ledger_rows_follow_concurrent_decisions(b: &Backend) {
                     reason: Some(Reason::Incomplete),
                     confirm_external: false,
                     expected_args_hash: None,
+                    hold: None,
                 }
             };
             approvals

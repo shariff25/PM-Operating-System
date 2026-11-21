@@ -51,7 +51,7 @@ function Composer() {
     const card = cardOf(bots, k);
     if (card) return pickerBot(card);
     const who = identify(k === 'nudge' ? null : k, true, bots?.bots);
-    return { key: k, name: who.name, mascot: who.mascot, title: '', summary: '', preview: false };
+    return { key: k, name: who.name, mascot: who.mascot, title: '', summary: '', preview: who.preview };
   });
   const others = (bots?.bots ?? []).filter((b) => !team.includes(b.key) && !b.always_on).map(pickerBot);
   const examples = cardOf(bots, chosen)?.examples ?? [];

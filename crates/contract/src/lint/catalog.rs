@@ -451,7 +451,8 @@ impl Cx {
             version: fm.version.clone(),
             offered: fm.offered,
             always_on: fm.always_on,
-            preview: fm.preview,
+            preview: crate::personas::is_preview(fm.always_on, fm.preview, fm.benchmarked),
+            benchmarked: fm.benchmarked,
             draft_notice: fm.draft_notice.clone(),
             order: u32::try_from(fm.order).unwrap_or(u32::MAX),
             summary: fm.summary.clone(),
@@ -473,18 +474,43 @@ impl Cx {
     }
 
     /// D10 and the owner's Preview exception (2026-11-21): a persona is offered as a full bot
-    /// only once its eval category meets its bar; before that it must say `preview: true`
-    /// (`persona-benchmark`). Checked only when the caller read the reports
-    /// ([`LintOptions::benchmarked`]); the always-on persona is today's assistant and exempt.
+    /// only once its eval category meets its bar, and then its file says `benchmarked: true`
+    /// (`persona-benchmark`). The services can't read the reports, so they show every persona
+    /// that doesn't say it as a Preview ([`crate::personas::is_preview`]); this rule keeps the
+    /// claim true. `preview: true` with `benchmarked: true` is always an error. The rest is
+    /// checked only when the caller read the reports ([`LintOptions::benchmarked`]): a claim
+    /// with no passing report is an error, as is an offered persona that neither claims it nor
+    /// says `preview: true`; one whose categories pass but that doesn't claim it gets a warning
+    /// (it is still shown as a Preview). The always-on persona is today's assistant and exempt.
     fn check_benchmark(&mut self, path: &Path, fm: &PersonaFrontMatter, opts: &LintOptions) {
-        let Some(benchmarked) = &opts.benchmarked else {
-            return;
-        };
         if fm.always_on {
             return;
         }
+        if fm.preview && fm.benchmarked {
+            self.error(
+                "persona-benchmark",
+                path,
+                format!(
+                    "`{}` says both `preview: true` and `benchmarked: true`: keep one (it is shown as a Preview while `preview: true` is there)",
+                    fm.name
+                ),
+            );
+        }
+        let Some(benchmarked) = &opts.benchmarked else {
+            return;
+        };
         let passed = benchmarked.contains(&fm.name);
-        if fm.offered && !fm.preview && !passed {
+        if fm.benchmarked && !passed {
+            self.error(
+                "persona-benchmark",
+                path,
+                format!(
+                    "`{}` says `benchmarked: true` but no eval category for it (`persona: {}` in evals/categories/*/category.yaml) has met its pass bar two weeks in a row in evals/reports (D10). Drop the claim and offer it as a Preview (`preview: true`) until it has",
+                    fm.name, fm.name
+                ),
+            );
+        }
+        if fm.offered && !fm.preview && !fm.benchmarked && !passed {
             self.error(
                 "persona-benchmark",
                 path,
@@ -494,12 +520,12 @@ impl Cx {
                 ),
             );
         }
-        if fm.preview && passed {
+        if passed && !fm.benchmarked {
             self.warn(
                 "persona-benchmark",
                 path,
                 format!(
-                    "`{}`'s eval category meets its bar: drop `preview: true` so it is no longer shown as not yet benchmarked",
+                    "`{}`'s eval category meets its bar: say `benchmarked: true` (and drop `preview: true`) so it is no longer shown as not yet benchmarked",
                     fm.name
                 ),
             );

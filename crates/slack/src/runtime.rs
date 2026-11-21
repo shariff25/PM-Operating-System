@@ -33,10 +33,12 @@ pub enum RuntimeError {
 
 /// The `400` codes `POST /v1/tasks` gives an ask's `persona` (`docs/bots-runtime.md`,
 /// "Personas").
-pub const PERSONA_CODES: [&str; 3] = [
+pub const PERSONA_CODES: [&str; 4] = [
     "bad_request",
     "unknown_persona",
     "persona_needs_personal_bot",
+    // The runtime refused it at claim moments ago: not on the PM's team (gate-fix-4).
+    "persona_not_on_team",
 ];
 
 /// One entry of `GET /v1/bots`.

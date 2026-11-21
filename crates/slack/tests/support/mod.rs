@@ -312,6 +312,10 @@ async fn rt_personas(State(rt): Rt, headers: HeaderMap) -> Response {
     }
     *rt.persona_reads.lock().unwrap() += 1;
     match rt.personas.lock().unwrap().clone() {
+        // A runtime that can't answer just now (gate-fix-4's unreadable catalog).
+        Some(down) if down == json!("unavailable") => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
         Some(catalog) => Json(catalog).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }

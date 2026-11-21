@@ -162,6 +162,7 @@ async fn decisions_through_the_service_label_their_rows() {
                 reason: Some(Reason::WrongTarget),
                 confirm_external: false,
                 expected_args_hash: None,
+                hold: None,
             },
             now(),
         )
@@ -239,6 +240,7 @@ async fn a_reason_is_only_accepted_with_reject() {
                     reason: Some(Reason::Tone),
                     confirm_external: false,
                     expected_args_hash: None,
+                    hold: None,
                 },
                 now(),
             )
@@ -285,6 +287,7 @@ async fn the_summary_counts_outcomes_coverage_edits_and_reasons() {
                 reason: Some(Reason::Incomplete),
                 confirm_external: false,
                 expected_args_hash: None,
+                hold: None,
             },
             now(),
         )

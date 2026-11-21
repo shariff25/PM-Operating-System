@@ -769,6 +769,7 @@ async fn an_item_runs_only_if_its_skill_still_declares_the_tool() {
                 model_alias: None,
                 sources_sensitivity: pmos_contract::Sensitivity::Internal,
                 persona: None,
+                draft_notice: None,
             },
             now(),
         )

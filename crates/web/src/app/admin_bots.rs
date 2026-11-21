@@ -300,6 +300,11 @@ async fn release(
     tracing::info!(user = %signed.member.handle, draft = %id, status, code = code.unwrap_or("none"), "held draft release");
     match (status, code) {
         (200, _) => Ok(Json(json!({ "id": id, "released": true })).into_response()),
+        (403, Some("own_draft")) => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "release_own_draft",
+            "This is your own draft, so another Admin releases it. Nothing changed.",
+        )),
         (403, _) => Err(forbidden(
             "The tool server doesn't count you as an admin who may release drafts. Nothing changed.",
         )),

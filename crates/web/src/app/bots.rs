@@ -150,12 +150,18 @@ pub fn persona_card(p: &Value) -> Option<Value> {
             Some(Value::Array(out))
         })
         .unwrap_or(Some(json!([])))?;
+    let always_on = p.get("always_on").and_then(Value::as_bool)?;
+    // The Preview label ("not yet benchmarked") the owner made the condition for offering an
+    // un-benchmarked bot (gate-fix-4, H1). Fail safe: a bot other than Nudge whose entry
+    // doesn't say `false` in so many words is shown as a Preview.
+    let preview = !always_on && p.get("preview").and_then(Value::as_bool) != Some(false);
     Some(json!({
         "key": key,
         "display_name": s("display_name")?,
         "title": s("title")?,
         "mascot": s("mascot")?,
-        "always_on": p.get("always_on").and_then(Value::as_bool)?,
+        "always_on": always_on,
+        "preview": preview,
         "summary": s("summary")?,
         "examples": strings("examples")?,
         "can_do": strings("can_do")?,
@@ -768,14 +774,16 @@ async fn settle_routines(
     signed: &Signed,
     removed: &[String],
     how: &str,
-) -> Result<usize, ApiError> {
+) -> Result<Vec<(String, Value)>, ApiError> {
     let runtime = signed.runtime(state);
     let handle = signed.handle();
     let list = runtime.routines(handle).await.map_err(ApiError::upstream)?;
     let pause = json!({ "enabled": false });
     // R1: `null` is Nudge.
     let to_nudge = json!({ "persona": null });
-    let mut changed = 0;
+    // Each change made, with the body that undoes it (gate-fix-4: a team change refused after
+    // this ran puts them back).
+    let mut done: Vec<(String, Value)> = Vec::new();
     for r in list
         .iter()
         .filter(|r| r.get("owner").and_then(Value::as_str) == Some(handle))
@@ -788,14 +796,20 @@ async fn settle_routines(
         }
         let id = out["id"].as_str().unwrap_or_default();
         // The daily brief goes back to Nudge whatever was chosen for the others (R2).
-        let body = if how == "pause" && !is_brief(&out) {
-            &pause
+        let (body, undo) = if how == "pause" && !is_brief(&out) {
+            (&pause, json!({ "enabled": out["enabled"] }))
         } else {
-            &to_nudge
+            (&to_nudge, json!({ "persona": persona }))
         };
+        let changed = done.len();
         if let Err(e) = runtime.patch_routine(handle, id, body).await {
             tracing::warn!(error = ?e, routine = %id, changed, "a removed bot's routine couldn't be moved; the team is unchanged");
             let lost = matches!(e, UpstreamError::Unknown { .. });
+            // Put back what was moved, so "your team is unchanged" is the whole truth.
+            let undone = changed > 0 && undo_routines(state, signed, &done).await;
+            if undone && !lost {
+                return Err(ApiError::upstream(e));
+            }
             return Err(if changed > 0 || lost {
                 coded(
                     StatusCode::BAD_GATEWAY,
@@ -807,9 +821,47 @@ async fn settle_routines(
                 ApiError::upstream(e)
             });
         }
-        changed += 1;
+        done.push((id.to_string(), undo));
     }
-    Ok(changed)
+    Ok(done)
+}
+
+/// Put back the routine changes `settle_routines` made (`done`: each id and the body that
+/// undoes its change), newest first. `true` when every one was put back.
+async fn undo_routines(state: &AppState, signed: &Signed, done: &[(String, Value)]) -> bool {
+    let runtime = signed.runtime(state);
+    let mut all = true;
+    for (id, undo) in done.iter().rev() {
+        if let Err(e) = runtime.patch_routine(signed.handle(), id, undo).await {
+            tracing::warn!(error = ?e, routine = %id, "a routine moved before a refused team change couldn't be put back");
+            all = false;
+        }
+    }
+    all
+}
+
+/// The team change was refused (or failed) after routines were moved for it: put them back,
+/// and answer `refusal` (whose "Nothing changed" is then true) or, when they couldn't all be
+/// put back, say so (gate-fix-4; never "Nothing changed" when something did).
+async fn refused_after_moves(
+    state: &AppState,
+    signed: &Signed,
+    moved: &[(String, Value)],
+    refusal: ApiError,
+) -> ApiError {
+    if moved.is_empty() || undo_routines(state, signed, moved).await {
+        if !moved.is_empty() {
+            tracing::info!(user = %signed.handle(), moved = moved.len(), "team change refused; the routines moved for it were put back");
+        }
+        return refusal;
+    }
+    coded(
+        StatusCode::BAD_GATEWAY,
+        "unknown_outcome",
+        "PM OS couldn't change your team, and it had already moved or paused some of that bot's \
+         routines for the change. It couldn't put all of them back: reload the Bots page to see \
+         them.",
+    )
 }
 
 /// `PUT /api/me/team` `{add?, remove?, via, routines?}`: change the signed-in PM's own team.
@@ -856,11 +908,13 @@ async fn change_team(State(state): State<AppState>, signed: Signed, body: Bytes)
     }
     // Routines first (spec §6, "Removal"): a bot leaves the team only once nothing of the
     // PM's runs as it any more.
-    if !remove.is_empty() {
-        let moved = settle_routines(&state, &signed, &remove, how).await?;
-        if moved > 0 {
-            tracing::info!(user = %signed.handle(), moved, how, "a removed bot's routines were settled before the team change");
-        }
+    let moved = if remove.is_empty() {
+        Vec::new()
+    } else {
+        settle_routines(&state, &signed, &remove, how).await?
+    };
+    if !moved.is_empty() {
+        tracing::info!(user = %signed.handle(), moved = moved.len(), how, "a removed bot's routines were settled before the team change");
     }
     let upstream = json!({ "add": add, "remove": remove, "via": req.via });
     let answer = signed
@@ -873,7 +927,9 @@ async fn change_team(State(state): State<AppState>, signed: Signed, body: Bytes)
             tracing::warn!(why = %why, "a team change's answer was lost");
             return Err(lost_team_change());
         }
-        Err(e) => return Err(ApiError::upstream(e)),
+        Err(e) => {
+            return Err(refused_after_moves(&state, &signed, &moved, ApiError::upstream(e)).await)
+        }
     };
     if status >= 500 && status != 503 {
         tracing::warn!(
@@ -883,7 +939,8 @@ async fn change_team(State(state): State<AppState>, signed: Signed, body: Bytes)
         return Err(lost_team_change());
     }
     if !(200..300).contains(&status) {
-        return Err(team_refusal(status, &v));
+        let refusal = team_refusal(status, &v);
+        return Err(refused_after_moves(&state, &signed, &moved, refusal).await);
     }
     let team = Team::from_wire(&v, signed.handle()).ok_or_else(lost_team_change)?;
     tracing::info!(user = %signed.handle(), added = add.len(), removed = remove.len(), via = %req.via, "team changed");
@@ -1046,6 +1103,24 @@ mod tests {
         let mut bad = persona("chief");
         bad["examples"] = json!([1]);
         assert!(persona_card(&bad).is_none());
+    }
+
+    #[test]
+    fn a_card_carries_the_preview_label_and_fails_safe() {
+        // No `preview` from the tool server: a Preview (never claimed benchmarked by default).
+        assert_eq!(persona_card(&persona("chief")).unwrap()["preview"], true);
+        let mut p = persona("chief");
+        p["preview"] = json!(true);
+        assert_eq!(persona_card(&p).unwrap()["preview"], true);
+        p["preview"] = json!("no");
+        assert_eq!(persona_card(&p).unwrap()["preview"], true, "not a bool");
+        p["preview"] = json!(false);
+        assert_eq!(persona_card(&p).unwrap()["preview"], false);
+        // Nudge never is.
+        let mut n = persona("nudge");
+        n["always_on"] = json!(true);
+        n["preview"] = json!(true);
+        assert_eq!(persona_card(&n).unwrap()["preview"], false);
     }
 
     fn st(hints: &[&str], opened: bool) -> UserState {

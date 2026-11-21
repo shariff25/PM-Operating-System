@@ -1,0 +1,182 @@
+{
+  "bots": [
+    {
+      "added_at": null,
+      "added_via": null,
+      "always_on": true,
+      "can_do": [
+        "ask",
+        "prd-draft",
+        "meeting-notes",
+        "decision-doc",
+        "product-critique",
+        "slack-reply"
+      ],
+      "display_name": "Nudge",
+      "drafts": [
+        "Jira issues",
+        "Confluence pages",
+        "Slack replies",
+        "Slack messages",
+        "bets register entries"
+      ],
+      "drafts_this_month": 0,
+      "examples": [
+        "Draft a PRD for the grace period",
+        "What is blocked this week?",
+        "Critique this idea"
+      ],
+      "key": "nudge",
+      "last_used_at": null,
+      "mascot": "nudge",
+      "needs": [],
+      "new": false,
+      "on_team": true,
+      "preview": false,
+      "reads": [
+        "jira",
+        "confluence",
+        "slack",
+        "docs"
+      ],
+      "routines": [],
+      "summary": "The generalist. Answers questions, writes up meetings and drafts PRDs and decisions.",
+      "title": "Your PM assistant"
+    },
+    {
+      "added_at": "2026-11-20T09:01:00Z",
+      "added_via": "bots_page",
+      "always_on": false,
+      "can_do": [
+        "daily-brief",
+        "meeting-prep",
+        "week-review",
+        "meeting-notes",
+        "status-update",
+        "exec-brief",
+        "decision-doc",
+        "okr-draft"
+      ],
+      "display_name": "Chief",
+      "drafts": [
+        "Jira issues",
+        "Confluence pages",
+        "Slack replies"
+      ],
+      "drafts_this_month": 0,
+      "examples": [
+        "Prep me for the staff meeting",
+        "What slipped since Monday?",
+        "Draft my weekly update"
+      ],
+      "key": "chief",
+      "last_used_at": null,
+      "mascot": "chief",
+      "needs": [],
+      "new": false,
+      "on_team": true,
+      "preview": true,
+      "reads": [
+        "jira",
+        "confluence",
+        "slack",
+        "docs"
+      ],
+      "routines": [],
+      "summary": "Runs your week: what needs you, what is slipping, and what to tell your leadership.",
+      "title": "Chief of Staff"
+    },
+    {
+      "added_at": null,
+      "added_via": null,
+      "always_on": false,
+      "can_do": [
+        "funnel-diagnosis",
+        "experiment-design",
+        "experiment-readout",
+        "experiment-backlog",
+        "opportunity-sizing",
+        "pricing-proposal",
+        "metrics-tree"
+      ],
+      "display_name": "Sprout",
+      "drafts": [
+        "Jira issues",
+        "Confluence pages"
+      ],
+      "drafts_this_month": 0,
+      "examples": [
+        "Where does the signup funnel leak?",
+        "Design a test for the paywall",
+        "Size the annual-plan idea"
+      ],
+      "key": "sprout",
+      "last_used_at": null,
+      "mascot": "sprout",
+      "needs": [
+        {
+          "label": "an analytics source",
+          "met": false,
+          "source": "analytics",
+          "without": "I work from numbers you paste in or that a Confluence page holds, and I say so."
+        }
+      ],
+      "new": false,
+      "on_team": false,
+      "preview": true,
+      "reads": [
+        "jira",
+        "confluence",
+        "docs"
+      ],
+      "routines": [],
+      "summary": "Finds and tests growth: funnels, experiments, sizing and pricing.",
+      "title": "Growth PM"
+    },
+    {
+      "added_at": null,
+      "added_via": null,
+      "always_on": false,
+      "can_do": [
+        "release-notes",
+        "launch-checklist",
+        "positioning-brief",
+        "battlecard",
+        "competitive-brief",
+        "call-synth"
+      ],
+      "display_name": "Echo",
+      "drafts": [
+        "Jira issues",
+        "Confluence pages"
+      ],
+      "drafts_this_month": 0,
+      "examples": [
+        "Write release notes for 4.2",
+        "Build a battlecard vs. Northwind",
+        "Plan the SSO launch"
+      ],
+      "key": "echo",
+      "last_used_at": null,
+      "mascot": "echo",
+      "needs": [],
+      "new": false,
+      "on_team": false,
+      "preview": true,
+      "reads": [
+        "jira",
+        "confluence",
+        "docs"
+      ],
+      "routines": [],
+      "summary": "Takes the product to market: launches, positioning, sales and customers.",
+      "title": "Outbound PM"
+    }
+  ],
+  "brief": {
+    "enabled": false,
+    "routine_id": null,
+    "writer": null
+  },
+  "withdrawn": []
+}

@@ -166,6 +166,34 @@ async fn a_refused_session_fails_the_task_with_the_sentence(env: &Env) {
     let feed = env.feed().await;
     assert_eq!(feed.last().unwrap()["text"], NOT_ON_TEAM);
     assert_eq!(feed.last().unwrap()["persona"], "chief");
+
+    // gate-fix-4: the same ask from Slack moments later is refused at once, with no task and
+    // no claim (the runtime can't read a team; this bounds the repeats).
+    let before = env.feed().await.len();
+    let (status, body) = ask_as(env, Some("chief"), "5.2", "Prep me again").await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("persona_not_on_team")),
+        "{body}"
+    );
+    assert_eq!(env.claim().await.0, 204, "nothing was queued");
+    assert_eq!(env.feed().await.len(), before);
+    // Another bot, or another person, is not affected.
+    let (status, _) = ask_as(env, Some("nudge"), "5.3", "x").await;
+    assert_eq!(status, 201);
+    // A web ask naming the bot (pmos-web checked the team first) clears it.
+    let (status, _) = env
+        .post(
+            "/v1/tasks",
+            "web",
+            Some("ana"),
+            json!({"bot": "pm-ana", "requested_by": "ana", "text": "x", "source": "web",
+                   "persona": "chief"}),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let (status, body) = ask_as(env, Some("chief"), "5.4", "and now?").await;
+    assert_eq!(status, 201, "{body}");
 }
 
 /// A tool server that ignores `persona` (deployed before personas) gives a Nudge session: the

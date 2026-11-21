@@ -435,6 +435,21 @@ impl SessionRepo for PgStore {
     }
 }
 
+/// Whether an Admin released item `id` from its hold, read inside `tx` (which holds the item's
+/// row lock), so the hold is decided with the decision or the save it guards.
+async fn hold_released_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> Result<bool, DecideError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM approval_hold_releases WHERE approval_id = $1)",
+    )
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| DecideError::Store(StoreError::from(e)))
+}
+
 fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
     let status: String = r.try_get("status")?;
     let read: Option<String> = r.try_get("sources_sensitivity")?;
@@ -444,6 +459,7 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
         skill: r.try_get("skill")?,
         bot: r.try_get("bot")?,
         persona: r.try_get("persona")?,
+        draft_notice: r.try_get("draft_notice")?,
         run_id: r.try_get("run_id")?,
         tool: r.try_get("tool")?,
         args: r.try_get("args")?,
@@ -470,7 +486,7 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
 const ITEM_COLUMNS: &str = "id, user_handle, skill, bot, run_id, tool, args, args_hash, status, \
                             created_at, decided_at, decided_by, result, sources_sensitivity, \
                             redacted_at, drafted_args, edited_at, target_conversation, revision, \
-                            persona";
+                            persona, draft_notice";
 
 const REC_COLUMNS: &str = "id, approval_id, reviewer, verdict, note, note_removed_at, \
                            draft_revision, draft_sha256, created_at, withdrawn_at";
@@ -517,8 +533,8 @@ async fn insert_item(
     sqlx::query(
         "INSERT INTO approvals
              (id, user_handle, skill, bot, run_id, tool, args, args_hash, status, created_at,
-              sources_sensitivity, persona)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+              sources_sensitivity, persona, draft_notice)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(&item.id)
     .bind(&item.user)
@@ -532,6 +548,7 @@ async fn insert_item(
     .bind(item.created_at)
     .bind(item.sources_sensitivity.map(|s| s.to_string()))
     .bind(&item.persona)
+    .bind(&item.draft_notice)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
@@ -808,6 +825,14 @@ impl ApprovalRepo for PgStore {
             Some(DecideError::Stale)
         } else if verdict.decision == Decision::Edit && verdict.args.is_none() {
             Some(DecideError::MissingArgs)
+        } else if verdict.decision != Decision::Reject
+            && verdict
+                .hold
+                .as_deref()
+                .is_some_and(|offered| crate::approvals::held_by(&current, offered, false))
+            && !hold_released_in(&mut tx, id).await?
+        {
+            Some(DecideError::Held)
         } else {
             None
         };
@@ -904,12 +929,13 @@ impl ApprovalRepo for PgStore {
         Ok(item)
     }
 
-    async fn save_draft(
+    async fn save_draft_held(
         &self,
         id: &str,
         user: &str,
         args: Value,
         raise_to: Option<Sensitivity>,
+        hold: Option<&std::collections::BTreeSet<String>>,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::from)?;
@@ -930,6 +956,10 @@ impl ApprovalRepo for PgStore {
             Some(DecideError::Expired)
         } else if current.status != Status::Pending {
             Some(DecideError::NotPending)
+        } else if hold.is_some_and(|offered| crate::approvals::held_by(&current, offered, false))
+            && !hold_released_in(&mut tx, id).await?
+        {
+            Some(DecideError::Held)
         } else {
             None
         };

@@ -171,25 +171,51 @@ pub const MASTER_CONTEXT: &str = "master/AGENTS.md";
 /// The content files (paths relative to the content root) whose change alters what a
 /// marketplace bot is told, so a change to one needs a second platform owner's review, as a
 /// network change does (`policies/README.md`, "Bot instructions"): the team's standing context
-/// ([`MASTER_CONTEXT`]), each persona's file, and the role body of every role a persona runs
-/// as, the personal role included (its standing sections are copied into every other).
-pub fn instruction_paths<'a>(personas: impl IntoIterator<Item = &'a Persona>) -> BTreeSet<String> {
+/// ([`MASTER_CONTEXT`]), each persona's file, the role body of every role a persona runs as,
+/// the personal role included (its standing sections are copied into every other), the
+/// `SKILL.md` of every skill those roles hold (a persona runs its role's skills), and the
+/// `BOT.md` of every personal bot (a persona runs on the PM's own bot, which keeps its body;
+/// gate-fix-4). `roles` and `bots` are the catalog's; a role it doesn't have adds no skills.
+pub fn instruction_paths<'a>(
+    personas: impl IntoIterator<Item = &'a Persona>,
+    roles: &[&Role],
+    bots: &[&crate::bots::Bot],
+) -> BTreeSet<String> {
     let mut out = BTreeSet::from([MASTER_CONTEXT.to_string()]);
+    let mut persona_roles = BTreeSet::from([PERSONAL_ROLE.to_string()]);
     for p in personas {
         out.insert(format!("personas/{}/PERSONA.md", p.name));
         out.insert(format!("roles/{}/ROLE.md", p.role));
+        persona_roles.insert(p.role.clone());
+    }
+    for role in roles.iter().filter(|r| persona_roles.contains(&r.name)) {
+        out.insert(format!("roles/{}/ROLE.md", role.name));
+        for skill in &role.skills {
+            out.insert(format!("skills/{skill}/SKILL.md"));
+        }
+    }
+    for bot in bots
+        .iter()
+        .filter(|b| b.scope == crate::bots::BotScope::Personal)
+    {
+        out.insert(format!("bots/{}/BOT.md", bot.name));
     }
     out
 }
 
 /// Whether a change to content file `rel` changes a marketplace bot's instructions: one of
-/// `known` ([`instruction_paths`]), or any file under `personas/` (a new persona).
+/// `known` ([`instruction_paths`]), any file under `personas/` (a new persona), or a new
+/// personal bot's `BOT.md` (`bots/pm-<handle>/BOT.md`).
 pub fn is_bot_instructions(rel: &str, known: &BTreeSet<String>) -> bool {
-    known.contains(rel) || rel.starts_with("personas/")
+    known.contains(rel)
+        || rel.starts_with("personas/")
+        || (rel.starts_with("bots/pm-") && rel.ends_with("/BOT.md"))
 }
 
 /// `args` with `notice` as the first line of the page body, for a tool in [`NOTICE_TOOLS`]
-/// whose `body` doesn't already carry it. Anything else is returned unchanged.
+/// whose `body` doesn't already **start** with it (leading whitespace aside): a copy further
+/// down, where a reader may never get to it, doesn't count, and the notice is put first
+/// anyway. Anything else is returned unchanged.
 pub fn with_draft_notice(tool: &str, args: &serde_json::Value, notice: &str) -> serde_json::Value {
     let mut out = args.clone();
     if !NOTICE_TOOLS.contains(&tool) {
@@ -197,7 +223,7 @@ pub fn with_draft_notice(tool: &str, args: &serde_json::Value, notice: &str) -> 
     }
     if let Some(body) = out.get_mut("body") {
         if let Some(text) = body.as_str() {
-            if !text.contains(notice) {
+            if !text.trim_start().starts_with(notice) {
                 *body = serde_json::Value::String(format!("{notice}\n\n{text}"));
             }
         }
@@ -246,6 +272,12 @@ pub(crate) struct PersonaFrontMatter {
     /// (the owner's exception to D10, 2026-11-21).
     #[serde(default)]
     pub preview: bool,
+    /// The content's claim that every eval category naming this persona met its bar two weeks
+    /// in a row (D10). `pmos lint` checks the claim against `evals/reports`
+    /// (`persona-benchmark`); the services can't read the reports, so for them a persona is a
+    /// Preview unless it says this ([`Persona::preview`]: fail safe).
+    #[serde(default)]
+    pub benchmarked: bool,
     /// A line every page it drafts carries ([`NOTICE_TOOLS`]), such as Echo's
     /// [`INTERNAL_REVIEW_NOTICE`].
     #[serde(default)]
@@ -293,8 +325,14 @@ pub struct Persona {
     /// Nudge: on every team, never removable.
     pub always_on: bool,
     /// A Preview: offered before its eval category has met its bar, shown as "Preview: not
-    /// yet benchmarked" (the owner's exception to D10, 2026-11-21).
+    /// yet benchmarked" (the owner's exception to D10, 2026-11-21). **Worked out, fail safe**
+    /// ([`is_preview`]): every persona but the always-on one is a Preview unless its file says
+    /// `benchmarked: true` (a claim `pmos lint` verifies against the eval reports) and not
+    /// `preview: true`. A file that leaves both out, or content whose lint never ran, still
+    /// shows the label: no service needs the eval reports to fail safe.
     pub preview: bool,
+    /// The file's `benchmarked: true`: the claim the lint verifies.
+    pub benchmarked: bool,
     /// The line the tool server puts at the top of every page this persona drafts
     /// ([`with_draft_notice`]); `None` for most.
     pub draft_notice: Option<String>,
@@ -308,6 +346,12 @@ pub struct Persona {
     pub reads: Vec<String>,
     /// Derived: what it may draft ([`drafts`]).
     pub drafts: Vec<String>,
+}
+
+/// Whether a persona is shown as a Preview: never the always-on persona; any other unless it
+/// is `benchmarked` and not marked `preview` (see [`Persona::preview`]).
+pub fn is_preview(always_on: bool, preview: bool, benchmarked: bool) -> bool {
+    !always_on && (preview || !benchmarked)
 }
 
 /// The stricter of two settings (`never` beats `approve`, which beats `auto`).
@@ -544,6 +588,16 @@ mod tests {
     }
 
     #[test]
+    fn a_persona_is_a_preview_unless_it_claims_a_benchmark() {
+        // (always_on, preview, benchmarked)
+        assert!(!is_preview(true, false, false), "Nudge never");
+        assert!(is_preview(false, false, false), "no claim: a Preview");
+        assert!(is_preview(false, true, false));
+        assert!(is_preview(false, true, true), "both: the label wins");
+        assert!(!is_preview(false, false, true));
+    }
+
+    #[test]
     fn a_need_is_met_only_by_a_read_tool_of_the_role() {
         let r = registry();
         assert!(need_met("analytics", &set(&["analytics.query"]), &r));
@@ -632,7 +686,9 @@ mod tests {
     fn bot_instructions_are_the_master_context_personas_and_their_roles() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content");
         let report = crate::lint(&root, &crate::LintOptions::new(chrono::NaiveDate::MIN));
-        let known = instruction_paths(&report.personas);
+        let roles: Vec<&Role> = report.roles.iter().collect();
+        let bots: Vec<&crate::bots::Bot> = report.bots.iter().collect();
+        let known = instruction_paths(&report.personas, &roles, &bots);
         for p in [
             "master/AGENTS.md",
             "roles/pm-assistant/ROLE.md",
@@ -640,14 +696,32 @@ mod tests {
             "roles/growth-pm/ROLE.md",
             "roles/outbound-pm/ROLE.md",
             "personas/echo/PERSONA.md",
+            // A persona runs its role's skills (gate-fix-4).
+            "skills/ask/SKILL.md",
+            "skills/battlecard/SKILL.md",
+            "skills/daily-brief/SKILL.md",
         ] {
             assert!(is_bot_instructions(p, &known), "{p}");
         }
         assert!(is_bot_instructions("personas/newbot/PERSONA.md", &known));
+        // A personal bot's BOT.md: a persona runs on it and keeps its body.
+        for b in report
+            .bots
+            .iter()
+            .filter(|b| b.scope == crate::bots::BotScope::Personal)
+        {
+            assert!(is_bot_instructions(
+                &format!("bots/{}/BOT.md", b.name),
+                &known
+            ));
+        }
+        assert!(is_bot_instructions("bots/pm-newpm/BOT.md", &known));
         for p in [
             "roles/docs-helper/ROLE.md",
             "context/products/x.md",
-            "skills/ask/SKILL.md",
+            // Only the team bot `docs` runs it: no persona does.
+            "skills/docs/SKILL.md",
+            "bots/docs/BOT.md",
         ] {
             assert!(!is_bot_instructions(p, &known), "{p}");
         }
@@ -669,6 +743,12 @@ mod tests {
         assert_eq!(
             with_draft_notice("confluence.update_page", &update, n)["body"],
             format!("{n}\n\nx")
+        );
+        // A copy at the bottom doesn't count: the notice goes first.
+        let bottom = serde_json::json!({"body": format!("Things.\n\n{n}")});
+        assert_eq!(
+            with_draft_notice("confluence.create_draft", &bottom, n)["body"],
+            format!("{n}\n\nThings.\n\n{n}")
         );
         // Not a page: unchanged.
         let issue = serde_json::json!({"project": "PM", "summary": "s", "description": "d"});

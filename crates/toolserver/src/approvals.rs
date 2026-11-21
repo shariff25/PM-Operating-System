@@ -11,8 +11,8 @@
 //! that long after its decision. Either way only `channel`, `thread_ts`, `message_ts` and the
 //! args hash stay.
 
-use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -182,6 +182,12 @@ pub struct ApprovalItem {
     /// the item is created and never changed (`docs/bot-marketplace-spec.md` §5). `None` (served
     /// as `null`) is Nudge, and every item from before personas.
     pub persona: Option<String>,
+    /// The line its persona's pages carry (`draft-notice`, Echo's internal-review line), copied
+    /// from the persona when the item is drafted and never changed: a saved edit and the
+    /// approved write put it back at the top of the page from here, even once the persona's
+    /// file is gone or says something else (gate-fix-4). Never served.
+    #[serde(skip)]
+    pub draft_notice: Option<String>,
     pub run_id: String,
     /// Registry name, such as `confluence.create_draft`.
     pub tool: String,
@@ -271,6 +277,12 @@ pub struct Verdict {
     /// holds other arguments, the decision is refused as [`DecideError::Stale`] and nothing
     /// changes; the store checks it under the same lock as the decision.
     pub expected_args_hash: Option<String>,
+    /// The personas offered now, when the decision must respect holds: an approve or an edit
+    /// of an item drafted by a persona not in it, that no Admin released, is refused as
+    /// [`DecideError::Held`] and nothing changes. The store checks it under the same lock as
+    /// the decision (and the release), so a release or a withdrawal can't slip between the
+    /// check and the decision (gate-fix-4). `None`: not checked (the store's own tests).
+    pub hold: Option<Arc<BTreeSet<String>>>,
 }
 
 impl Verdict {
@@ -281,7 +293,14 @@ impl Verdict {
             reason: None,
             confirm_external: false,
             expected_args_hash: None,
+            hold: None,
         }
+    }
+
+    /// The same verdict, checked against holds: `offered` are the personas offered now.
+    pub fn holding(mut self, offered: Arc<BTreeSet<String>>) -> Self {
+        self.hold = Some(offered);
+        self
     }
 
     /// The same verdict, naming the args hash the person deciding was shown.
@@ -313,8 +332,20 @@ pub enum DecideError {
     /// in between): nothing was decided.
     #[error("this draft changed since it was shown; nothing was decided")]
     Stale,
+    /// Drafted by a persona that is no longer offered and not released by an Admin: it can be
+    /// rejected, not approved, edited or saved ([`Verdict::hold`]).
+    #[error("this draft is held: the bot that drafted it isn't offered any more")]
+    Held,
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+/// Is `item` held, given the personas `offered` now and whether it was `released`? A pending
+/// item of a persona not offered, not released. The stores call it under their lock.
+pub fn held_by(item: &ApprovalItem, offered: &BTreeSet<String>, released: bool) -> bool {
+    item.status == Status::Pending
+        && !released
+        && item.persona.as_ref().is_some_and(|p| !offered.contains(p))
 }
 
 pub struct NewItem<'a> {
@@ -325,6 +356,8 @@ pub struct NewItem<'a> {
     pub bot: Option<&'a str>,
     /// The session's persona; `None` for Nudge and for a skill session.
     pub persona: Option<&'a str>,
+    /// The persona's draft notice when the item is drafted ([`ApprovalItem::draft_notice`]).
+    pub draft_notice: Option<&'a str>,
     pub run_id: &'a str,
     pub tool: &'a str,
     pub args: &'a Value,
@@ -364,6 +397,7 @@ impl NewItem<'_> {
             skill: self.skill.map(String::from),
             bot: self.bot.map(String::from),
             persona: self.persona.map(String::from),
+            draft_notice: self.draft_notice.map(String::from),
             run_id: self.run_id.to_string(),
             tool: self.tool.to_string(),
             args: self.args.clone(),
@@ -512,6 +546,22 @@ pub trait ApprovalRepo: Send + Sync {
         user: &str,
         args: Value,
         raise_to: Option<Sensitivity>,
+        now: DateTime<Utc>,
+    ) -> Result<ApprovalItem, DecideError> {
+        self.save_draft_held(id, user, args, raise_to, None, now)
+            .await
+    }
+
+    /// [`ApprovalRepo::save_draft`], refused as [`DecideError::Held`] when `hold` (the
+    /// personas offered now) is given and the item is held, checked under the same lock as the
+    /// save.
+    async fn save_draft_held(
+        &self,
+        id: &str,
+        user: &str,
+        args: Value,
+        raise_to: Option<Sensitivity>,
+        hold: Option<&BTreeSet<String>>,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError>;
 
@@ -864,6 +914,7 @@ impl ApprovalRepo for MemoryApprovals {
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError> {
         let mut state = self.state.lock().expect("approvals lock");
+        let released = state.released.contains_key(id);
         let item = state.items.get_mut(id).ok_or(DecideError::NotFound)?;
         if item.user != decided_by {
             return Err(DecideError::Forbidden);
@@ -876,6 +927,11 @@ impl ApprovalRepo for MemoryApprovals {
         }
         if !still_as_shown(item, verdict.expected_args_hash.as_deref()) {
             return Err(DecideError::Stale);
+        }
+        if let (Some(offered), true) = (&verdict.hold, verdict.decision != Decision::Reject) {
+            if held_by(item, offered, released) {
+                return Err(DecideError::Held);
+            }
         }
         let reason = verdict.stored_reason();
         // Measured from the bot's own arguments, so a saved edit approved as it stands
@@ -924,15 +980,17 @@ impl ApprovalRepo for MemoryApprovals {
         Ok(item)
     }
 
-    async fn save_draft(
+    async fn save_draft_held(
         &self,
         id: &str,
         user: &str,
         args: Value,
         raise_to: Option<Sensitivity>,
+        hold: Option<&BTreeSet<String>>,
         now: DateTime<Utc>,
     ) -> Result<ApprovalItem, DecideError> {
         let mut state = self.state.lock().expect("approvals lock");
+        let released = state.released.contains_key(id);
         let item = state.items.get_mut(id).ok_or(DecideError::NotFound)?;
         if item.user != user {
             return Err(DecideError::Forbidden);
@@ -942,6 +1000,9 @@ impl ApprovalRepo for MemoryApprovals {
         }
         if item.status != Status::Pending {
             return Err(DecideError::NotPending);
+        }
+        if hold.is_some_and(|offered| held_by(item, offered, released)) {
+            return Err(DecideError::Held);
         }
         let drafted = drafted_after(item, &args);
         item.edited_at = drafted.as_ref().map(|_| now);

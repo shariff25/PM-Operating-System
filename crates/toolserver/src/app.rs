@@ -1090,6 +1090,7 @@ async fn decide(
         reason,
         confirm_external: body.confirm_external,
         expected_args_hash: body.expected_args_hash,
+        hold: None,
     };
     match state
         .svc
@@ -1138,9 +1139,10 @@ async fn decide(
             let status = match e {
                 DecideError::NotFound => StatusCode::NOT_FOUND,
                 DecideError::Forbidden => StatusCode::FORBIDDEN,
-                DecideError::NotPending | DecideError::Expired | DecideError::Stale => {
-                    StatusCode::CONFLICT
-                }
+                DecideError::NotPending
+                | DecideError::Expired
+                | DecideError::Stale
+                | DecideError::Held => StatusCode::CONFLICT,
                 DecideError::MissingArgs => StatusCode::BAD_REQUEST,
                 DecideError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
             };
@@ -1243,6 +1245,13 @@ async fn save_draft(
         Err(e @ DecisionError::Decide(DecideError::Expired)) => {
             coded(StatusCode::CONFLICT, "expired", e.to_string(), json!({}))
         }
+        // A withdrawn bot's draft: its owner may reject it, not save an edit (gate-fix-4).
+        Err(e @ DecisionError::Held(_)) => coded(
+            StatusCode::CONFLICT,
+            crate::service::HELD,
+            e.to_string(),
+            json!({}),
+        ),
         Err(e @ DecisionError::Decide(_)) => coded(
             StatusCode::CONFLICT,
             "not_pending",

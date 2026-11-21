@@ -364,12 +364,26 @@ impl Notifier {
 
     /// Who a notification's task runs as: `None` for Nudge (a notification carries `persona`
     /// only when it isn't Nudge). The name comes from the runtime's catalog, never from the
-    /// key; a key it doesn't list reads "A bot no longer offered".
+    /// key; a key it doesn't list reads "A bot no longer offered". With no catalog at all (the
+    /// runtime unreachable and nothing read before), the bot is "A marketplace bot" and its
+    /// thread still gets the Preview line: nothing says it was benchmarked (gate-fix-4, M1).
     async fn speaker(&self, item: &Value) -> Option<(Speaker, Option<Persona>)> {
         let persona = &item["persona"];
-        persona.as_str().filter(|k| *k != "nudge")?;
-        let catalog = self.bots.personas().await.unwrap_or_default();
-        Speaker::of(persona, &catalog)
+        let key = persona.as_str().filter(|k| *k != "nudge")?;
+        match self.bots.personas().await {
+            Ok(catalog) => Speaker::of(persona, &catalog),
+            Err(e) => {
+                tracing::warn!(error = %e, "persona catalog unreadable: the bot is unnamed and shown as a Preview");
+                let stand_in = personas::unnamed(key);
+                Some((
+                    Speaker {
+                        name: stand_in.shown(),
+                        preview: None,
+                    },
+                    Some(stand_in),
+                ))
+            }
+        }
     }
 
     /// Post in the task's thread. The first message of a task with no thread starts one.
