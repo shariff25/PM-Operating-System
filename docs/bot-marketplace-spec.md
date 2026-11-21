@@ -1,7 +1,7 @@
 # Bot marketplace: Chief, Sprout and Echo beside Nudge
 
-Status: **design spec; slices C1 and B1 built** (contract, lint and generator; the tool
-server: §13, "Status"). The independent reviewer checks it before any slice starts.
+Status: **design spec; slices C1, B1 and W1 built** (contract, lint and generator; the tool
+server; the `pmos-web` API: §13, "Status"). The independent reviewer checks it before any slice starts.
 Owner's requirement (scope item j in `CLAUDE.md`, 2026-11-20): widen the product beyond one PM
 assistant with three new bots, a Chief of Staff, a Growth PM and an Outbound PM; as part of
 onboarding the PM sees a bot marketplace and chooses which bots to include; each bot has its own
@@ -1016,6 +1016,92 @@ tests in `team.rs`, `service/team.rs` and `app/team.rs`. Every case uses fixture
 **Not verified**: R1 and W1 against these routes (not built); the routes with C2–C4's real
 personas (fixtures only); the Postgres cap under concurrent requests from two processes (the
 advisory lock and the deferred trigger are tested one at a time).
+
+### Status: W1 is built (2026-11-21, branch `claude/market-w1-web-api`)
+
+Built, in `crates/web`: `src/app/bots.rs` (`GET /api/bots`, `PUT /api/me/team`, the catalog read
+and its short cache for attribution, the team read, the ask check, `Me`'s team fields and their
+rules, the removal's routine step); `ask_persona` on the per-user settings (migration
+`0005_ask_persona.sql`, `settings.rs`, `pg.rs`); `POST /api/tasks {text, persona?}`;
+`PUT /api/me/settings {ask_persona}`; the hints `team_picked`, `team_skipped`, `team_announced`;
+`persona` and `persona_offered` on `DraftSummary` (so every `Draft`), `Task` and the reviewer's
+views (`app/reviews.rs`, kept for a restricted draft); the tool server calls in `upstream.rs`
+(`personas`, `team`) and the runtime calls (`create_task_as`, `routines`, `patch_routine`). The
+contract for F2 and F3 is `docs/web-api.md`: **Me** (the team fields and the exact step and note
+conditions), **Asking**, **Bots** (routes, `BotCard`, `WithdrawnBot`, `Routine`, the removal order,
+the picker's default, attribution), **Drafts**, **Reviews** and **Error codes** (`409
+bot_not_on_team`, `409 bot_unavailable`, `409 always_on`, `409 team_full`; `429 rate_limited`, `503
+assertion_required` and `502 unknown_outcome` widened). In `web/`: the four codes in
+`SERVER_ERROR_CODES` and `copy.ts`, and types only (`TeamMark`, the optional `Me`, `DraftSummary`,
+`ReviewSummary` and `Task` fields, `BotCard`, `WithdrawnBot`, `Bots`, `TeamChange`); no screen, no
+client method. Tests: `crates/web/tests/bots.rs` (12, against a mock tool server and a mock
+runtime: each route's role matrix with PM, Reviewer, Admin, Auditor and signed out; only the
+person's own team, every team call signed for them; `bot_not_on_team`, `bot_unavailable` and an
+unreadable team never reaching the runtime; the picker's default and its fallback; routines
+patched before the team change, `pause`, and a runtime failure leaving the team unchanged; local
+checks and the tool server's codes kept; origin and CSRF on the three writes; catalog text
+byte-identical; the counts and a withdrawn bot; attribution on drafts, tasks and reviews with a
+withdrawn key; `Me`'s step; the tool server unreachable), 3 unit tests in `app/bots.rs` (the
+step and note rules case by case, the default's fallback, the card's re-pick), and
+`support::FakeBots`, a fake of B1's three routes that the four existing mock tool servers now
+answer apart (as they do the user database), so their call counts are unchanged.
+
+**Against R1's runtime contract** (R1 is built, `74785f4`): W1 calls `POST /v1/tasks` with
+`persona` (none for Nudge; web tasks name no conversation, so no thread inheritance applies),
+maps `400 unknown_persona` to `409 bot_unavailable` and `400 persona_needs_personal_bot` to `409
+task_refused` (R1's `bad_request` can't arise: W1 checks the key's shape first, and would be `502
+upstream_unavailable`); reads `persona` on every task (`null` is Nudge); works `last_used_at` out
+with `GET /v1/tasks?requested_by=<handle>&persona=<key>|nudge&limit=5` per bot (5, not 1, so a
+hidden revision task of Nudge's can be skipped; a task counts only if its own `persona` matches,
+so a runtime that ignored the filter can't misdate a bot); lists routines with `GET
+/v1/routines?owner=` and reads `Routine.persona` (`null` is Nudge); and moves a removed bot's
+routines with `PATCH /v1/routines/{id} {"persona": null}`, or pauses them with `{"enabled":
+false}`. It does not call `GET /v1/personas` (the catalog comes from the tool server's
+`/internal/personas`, which has `catalog_sha`) and doesn't read notifications. Where W1 differs
+from R1: R1 accepts an ask naming a bot not on the team (it fails at claim); W1 refuses it first
+with `409 bot_not_on_team` and never sends it, as §6 says.
+
+**Departures**, all small:
+
+1. **`persona_offered`** sits beside every `persona` (drafts, tasks, reviews): `false` for a
+   withdrawn or deleted key, and for any key while the catalog can't be read (read at most 10
+   seconds old for attribution, 5 minutes while unreadable). A `persona` an upstream sends that
+   isn't shaped like a key is shown as `"unknown"`, never as sent.
+2. **`GET /api/bots`** answers `{bots, withdrawn}`: `withdrawn` lists team rows whose bot isn't
+   offered (the Bots page's "No longer offered", which §6 lists only "every offered persona"
+   could not show). `BotCard` adds `added_via` and `routines` (the PM's routines that run as the
+   bot: for Settings, read only, and the removal question); `new` is **always `false`**: no
+   service records when a persona was first offered, and W1 adds none. `last_used_at` is the
+   PM's newest task with that bot (R1's `?persona=` filter, one read per bot), `null` when none
+   or when the runtime can't say; `routines` is `null` when the runtime can't list them. The tool
+   server failing fails the page; the runtime failing doesn't.
+3. **`Me`** adds `team_unavailable`, `show_team_step` and `show_team_note`: the server works the
+   §8 conditions out, so F2 doesn't. Without `ask-bot`, `team: []` and `ask_persona: null`. The note
+   is shown whenever the step isn't (a finished or skipped guided start counts as "existing", as
+   well as no `first_visit` and no `tour_started`), and **not** when the team already has a bot
+   besides Nudge. `/api/me` reads the team and the catalog fresh (two tool server calls); on the
+   last-known-good path it reads neither and says `team_unavailable`.
+4. **`PUT /api/me/team`** checks locally first (the body's fields, `via`, `routines`, key shapes, at
+   most 16 each, none in both, `nudge` or any always-on persona `409 always_on`, a key to add not
+   in a fresh catalog `409 bot_unavailable`), so routines move only for a change the tool server
+   can be expected to take. If the tool server still refuses after routines moved (the rate limit,
+   say), they stay moved (to Nudge, or paused); the team is unchanged. Added: `409 team_full`, `403
+   not_a_member` and `403 not_allowed` passed on; a lost answer, or a removal that stopped after
+   moving some routines, is `502 unknown_outcome`. The answer is `{bots, withdrawn}`.
+5. **An ask without a `persona`** sets the picker's default to Nudge (it is "the bot last asked");
+   `PUT /api/me/settings {ask_persona: "nudge"}` stores NULL. Keeping the default after a
+   successful ask is best effort: a store failure is logged, never the ask's answer.
+6. **Left to A1:** `GET /api/admin/bots`, the audit route's `persona=` filter and column, and the
+   content admin's file kind for `personas/…` (C1's departure 7). §6 lists `GET /api/admin/bots`
+   among `pmos-web`'s routes, but §13 gives it to A1.
+7. **Test support:** the existing mock tool servers in `tests/admin.rs`, `admin_proposals.rs`,
+   `reviews.rs` and `web.rs` gain `support::FakeBots` and answer the catalog and team routes apart
+   (one field and one line each), because `/api/me` now calls them; no assertion changed.
+
+**Not verified**: W1 against the real B1 tool server and the real R1 runtime (mocks only; the
+stack tests are not changed); the R1 contract above is matched from its text, not run against
+R1's code; the Postgres check on `ask_persona`
+with a malformed value (the column's `CHECK` is not exercised by a test); F2 and F3 (not built).
 
 ### Order and parallelism
 

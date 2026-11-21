@@ -195,7 +195,8 @@ impl SessionStore for PgStore {
 async fn load_state(conn: &mut PgConnection, handle: &str) -> Result<UserState, StoreError> {
     let mut st = UserState::default();
     if let Some(r) = sqlx::query(
-        "SELECT hints_seen, nudges, mascot, opened_a_draft FROM web_user_settings WHERE handle = $1",
+        "SELECT hints_seen, nudges, mascot, opened_a_draft, ask_persona FROM web_user_settings
+         WHERE handle = $1",
     )
     .bind(handle)
     .fetch_optional(&mut *conn)
@@ -207,6 +208,7 @@ async fn load_state(conn: &mut PgConnection, handle: &str) -> Result<UserState, 
         st.nudges = r.try_get("nudges").map_err(err)?;
         st.mascot = r.try_get("mascot").map_err(err)?;
         st.opened_a_draft = r.try_get("opened_a_draft").map_err(err)?;
+        st.ask_persona = r.try_get("ask_persona").map_err(err)?;
     }
     for r in sqlx::query("SELECT draft_id, title, body FROM web_draft_edits WHERE handle = $1")
         .bind(handle)
@@ -288,7 +290,7 @@ async fn write_state(
     let hints: Vec<String> = new.hints_seen.iter().cloned().collect();
     sqlx::query(
         "UPDATE web_user_settings SET hints_seen = $2, nudges = $3, opened_a_draft = $4,
-             mascot = $5, updated_at = $6 WHERE handle = $1",
+             mascot = $5, updated_at = $6, ask_persona = $7 WHERE handle = $1",
     )
     .bind(handle)
     .bind(&hints)
@@ -296,6 +298,7 @@ async fn write_state(
     .bind(new.opened_a_draft)
     .bind(new.mascot)
     .bind(now)
+    .bind(&new.ask_persona)
     .execute(&mut *conn)
     .await
     .map_err(err)?;

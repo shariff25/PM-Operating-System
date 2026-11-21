@@ -26,6 +26,7 @@ use pmos_contract::model::{valid_handle, Role};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+use super::bots::{self, Offered};
 use super::{valid_id, ApiError, ApiResult, AppState, Signed};
 use crate::drafts;
 use crate::settings::UserState;
@@ -183,7 +184,8 @@ fn my_recommendation(v: &Value) -> Value {
 /// One draft as a reviewer gets it, from the tool server's review view; `None` for an item
 /// that isn't a draft in this contract (another write tool) or isn't shaped as one. Text,
 /// target, sources and the version only when the tool server says `restricted: false`.
-pub fn review_draft(v: &Value) -> Option<Value> {
+/// `persona` (which bot drafted it, `null` for Nudge) is metadata: kept for a restricted draft.
+pub(super) fn review_draft(v: &Value, offered: &Offered) -> Option<Value> {
     let id = v
         .get("id")
         .and_then(Value::as_str)
@@ -202,6 +204,7 @@ pub fn review_draft(v: &Value) -> Option<Value> {
     // Fail closed: anything but an explicit `false` is restricted.
     let restricted = v.get("restricted").and_then(Value::as_bool) != Some(false);
     let str_field = |k: &str| v.get(k).and_then(Value::as_str);
+    let persona = drafts::persona_key(str_field("persona"));
     let mut out = json!({
         "id": id,
         "owner": owner,
@@ -212,6 +215,8 @@ pub fn review_draft(v: &Value) -> Option<Value> {
         "expires_at": str_field("expires_at"),
         "restricted": restricted,
         "revision": v.get("revision").and_then(Value::as_i64),
+        "persona_offered": bots::is_offered(persona.as_deref(), offered),
+        "persona": persona,
     });
     if restricted {
         return Some(out);
@@ -242,8 +247,8 @@ pub fn review_draft(v: &Value) -> Option<Value> {
 }
 
 /// A draft's line in the inbox: [`review_draft`] without the body, target and sources.
-fn summary(v: &Value) -> Option<Value> {
-    let mut d = review_draft(v)?;
+fn summary(v: &Value, offered: &Offered) -> Option<Value> {
+    let mut d = review_draft(v, offered)?;
     if let Some(o) = d.as_object_mut() {
         for k in ["body", "target", "sources"] {
             o.remove(k);
@@ -267,7 +272,11 @@ async fn inbox(State(state): State<AppState>, signed: Signed) -> ApiResult {
     ) else {
         return Err(bad_reply());
     };
-    let drafts: Vec<Value> = items.iter().filter_map(summary).collect();
+    let needed = items
+        .iter()
+        .any(|i| i.get("persona").is_some_and(|p| !p.is_null()));
+    let offered = bots::offered_if(&state, &signed, needed).await;
+    let drafts: Vec<Value> = items.iter().filter_map(|i| summary(i, &offered)).collect();
     let pms: Vec<&str> = v
         .get("pms")
         .and_then(Value::as_array)
@@ -295,7 +304,9 @@ async fn read(State(state): State<AppState>, signed: Signed, Path(id): Path<Stri
     }
     tracing::info!(user = %signed.member.handle, route = "/api/reviews/{id}", "reviewer read");
     let v = call(&state, &signed, reqwest::Method::GET, &[&id], None).await?;
-    let draft = review_draft(&v).ok_or_else(bad_reply)?;
+    let needed = v.get("persona").is_some_and(|p| !p.is_null());
+    let offered = bots::offered_if(&state, &signed, needed).await;
+    let draft = review_draft(&v, &offered).ok_or_else(bad_reply)?;
     Ok(Json(draft).into_response())
 }
 
@@ -361,9 +372,14 @@ async fn recommend(
         Some(&Value::Object(upstream)),
     )
     .await?;
+    let needed = v
+        .get("draft")
+        .and_then(|d| d.get("persona"))
+        .is_some_and(|p| !p.is_null());
+    let offered = bots::offered_if(&state, &signed, needed).await;
     let draft = v
         .get("draft")
-        .and_then(review_draft)
+        .and_then(|d| review_draft(d, &offered))
         .ok_or_else(bad_reply)?;
     Ok(Json(json!({
         "recommendation": draft.get("my_recommendation").cloned().unwrap_or(Value::Null),
