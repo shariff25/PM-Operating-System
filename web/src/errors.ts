@@ -21,14 +21,17 @@ export function isDefiniteRefusal(e: unknown, what: 'decision' | 'other' = 'othe
 
 /**
  * The plain sentence for an error. For a code in the contract it is the app's own wording (which
- * claims "nothing changed" only where the table does); for anything else, the server's sentence.
+ * claims "nothing changed" only where the table does). For any other answer from the server it
+ * is the caller's own fixed `fallback`, never the server's message (the re-check of eb24d28, LH):
+ * what the app shows is always a sentence it wrote.
  */
 export function errorText(e: unknown, fallback: string): string {
   if (e instanceof ApiError) {
     if (isServerErrorCode(e.code)) return copy.errors.codes[e.code];
-    if (e.message) return e.message;
-  } else if (e instanceof Error && e.message) {
-    return e.message;
+    // The one code the client makes up itself for "no answer at all".
+    if (e.code === 'network') return copy.errors.network;
+    return fallback;
   }
+  if (e instanceof Error && e.message) return e.message;
   return fallback;
 }

@@ -338,6 +338,7 @@ export const copy = {
       setup_failed: "That sign-in name and setup code didn't work. Check them, or ask an admin for a new code.",
       setup_expired: 'That setup took more than 15 minutes or ran out of tries, so it ended. Nothing changed. Start again with the same setup code.',
       wrong_step: 'The setup got out of step, so it ended. Nothing changed. Start again with the same setup code.',
+      setup_code_spent: 'This setup code was used for as many tries as it allows, so it ended. Ask an admin for a new code.',
       codeFailed: (left: number) =>
         `That code didn't work. ${left === 1 ? '1 try left' : `${left} tries left`}. Type the newest code from your app.`,
       not_a_member: "This code can't be used: your access to PM OS is turned off. Ask a platform owner.",
@@ -1099,6 +1100,11 @@ export const copy = {
         firstLinksNext: "Each link is in the audit log. If you didn't expect one, unlink that Microsoft account on the Team page.",
         resets: (n: number) => (n === 1 ? 'A password sign-in was reset this week' : `${n} password sign-ins were reset this week`),
         resetsNext: 'Each person sees who reset it and when. Check the reset was asked for.',
+        resetsDismissed: (n: number) =>
+          n === 1 ? 'One of them has dismissed the notice.' : `${n} of them have dismissed the notice.`,
+        voided: (n: number) =>
+          n === 1 ? 'A setup code was made void after too many wrong tries' : `${n} setup codes were made void after too many wrong tries`,
+        voidedNext: 'Someone kept guessing at it. Make a new setup code for them on the Team page and hand it over straight away.',
       },
       notices: {
         ending: (date: string) => `The pilot exception ends on ${date}. After that nobody may hold Admin and Auditor together.`,
@@ -2134,6 +2140,7 @@ export const copy = {
       sign_in_expired: 'That sign-in took too long or was used up. Start again with your password.',
       setup_failed: "That sign-in name and setup code didn't work. Check them, or ask an admin for a new code.",
       setup_expired: 'That setup took too long. Start again with your setup code.',
+      setup_code_spent: 'That setup code was used for as many tries as it allows. Ask an admin for a new one.',
       wrong_step: 'Do the set-up steps in order: your password, then your authenticator app, then a code.',
       weak_password:
         'Choose another password: at least 12 characters, not your name or sign-in name, and not a common one.',

@@ -20,8 +20,9 @@ use super::{Status, UserRole, Via};
 use crate::audit::AuditEvent;
 use crate::password::limits::{Counter, SourceCounters, FORGET_AFTER, KNOWN_SOURCE_DAYS};
 use crate::password::store::{
-    CodeKind, Credential, PasswordStatus, PasswordStore, Pending, Person, Plan, Purpose,
-    RecoveryCode, ResetNotice, SetupCode, Snapshot, Writes,
+    pair_resets, CodeKind, Credential, PasswordOverview, PasswordStatus, PasswordStore, Pending,
+    Person, Plan, Purpose, RecoveryCode, ResetNotice, SetupCode, Snapshot, VoidedCode, Writes,
+    VOIDED_KEPT_DAYS,
 };
 use crate::pg::PgStore;
 use crate::store::{StoreError, StoreResult};
@@ -85,6 +86,8 @@ fn pending_of(row: &PgRow) -> StoreResult<Pending> {
         attempts: row.try_get("attempts")?,
         staged_hash: row.try_get("staged_hash")?,
         staged_totp: row.try_get("staged_totp")?,
+        password_sets: row.try_get("password_sets")?,
+        enrolments: row.try_get("enrolments")?,
     })
 }
 
@@ -189,7 +192,8 @@ async fn load(
         });
     }
     let setup_code = match sqlx::query(
-        "SELECT id, code_hash, kind, issued_at, issued_by, issued_client, expires_at
+        "SELECT id, code_hash, kind, issued_at, issued_by, issued_client, expires_at, begins,
+                password_sets, wrong_guesses
          FROM password_setup_codes
          WHERE handle = $1 AND used_at IS NULL AND revoked_at IS NULL",
     )
@@ -209,13 +213,16 @@ async fn load(
                 issued_by: row.try_get("issued_by")?,
                 issued_via: Via::parse(&client).ok_or_else(|| bad("client", &client))?,
                 expires_at: row.try_get("expires_at")?,
+                begins: row.try_get("begins")?,
+                password_sets: row.try_get("password_sets")?,
+                wrong_guesses: row.try_get("wrong_guesses")?,
             })
         }
     };
     let mut pending = Vec::new();
     for row in sqlx::query(
         "SELECT token_hash, purpose, setup_code_id, epoch, created_at, expires_at, attempts,
-                staged_hash, staged_totp
+                staged_hash, staged_totp, password_sets, enrolments
          FROM password_pending WHERE handle = $1 ORDER BY created_at",
     )
     .bind(handle)
@@ -406,6 +413,24 @@ async fn write(
             .execute(&mut *conn)
             .await?;
     }
+    if let Some(c) = &w.code_counts {
+        sqlx::query(
+            "UPDATE password_setup_codes
+                SET begins = $3, password_sets = $4, wrong_guesses = $5,
+                    revoked_at = CASE WHEN $6 THEN $7 ELSE revoked_at END,
+                    voided_at = CASE WHEN $6 THEN $7 ELSE voided_at END
+              WHERE id = $1 AND handle = $2 AND used_at IS NULL AND revoked_at IS NULL",
+        )
+        .bind(c.id)
+        .bind(handle)
+        .bind(c.begins)
+        .bind(c.password_sets)
+        .bind(c.wrong_guesses)
+        .bind(c.void)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+    }
     if w.clear_pending {
         sqlx::query("DELETE FROM password_pending WHERE handle = $1")
             .bind(handle)
@@ -423,11 +448,12 @@ async fn write(
         let done = sqlx::query(
             "INSERT INTO password_pending
                  (token_hash, handle, purpose, setup_code_id, epoch, created_at, expires_at,
-                  attempts, staged_hash, staged_totp)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                  attempts, staged_hash, staged_totp, password_sets, enrolments)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT (token_hash) DO UPDATE SET
                  attempts = EXCLUDED.attempts, staged_hash = EXCLUDED.staged_hash,
-                 staged_totp = EXCLUDED.staged_totp
+                 staged_totp = EXCLUDED.staged_totp,
+                 password_sets = EXCLUDED.password_sets, enrolments = EXCLUDED.enrolments
              WHERE password_pending.handle = EXCLUDED.handle
                AND password_pending.purpose = EXCLUDED.purpose",
         )
@@ -441,6 +467,8 @@ async fn write(
         .bind(p.attempts)
         .bind(&p.staged_hash)
         .bind(&p.staged_totp)
+        .bind(p.password_sets)
+        .bind(p.enrolments)
         .execute(&mut *conn)
         .await?;
         if done.rows_affected() != 1 {
@@ -535,6 +563,61 @@ impl PgStore {
 
 #[async_trait]
 impl PasswordStore for PgStore {
+    async fn source_known(&self, source_key: &str, since: DateTime<Utc>) -> StoreResult<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM password_source_counters
+                            WHERE source_key = $1 AND last_success_at > $2)",
+        )
+        .bind(source_key)
+        .bind(since)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
+    async fn password_overview(&self, since: DateTime<Utc>) -> StoreResult<PasswordOverview> {
+        let resets = sqlx::query(
+            "SELECT target, actor, at FROM role_changes
+             WHERE change = 'issue_password_code' AND detail = 'reset' AND at >= $1
+             ORDER BY at DESC, id DESC",
+        )
+        .bind(since)
+        .fetch_all(self.pool())
+        .await?
+        .iter()
+        .map(|r| Ok((r.try_get("target")?, r.try_get("actor")?, r.try_get("at")?)))
+        .collect::<StoreResult<Vec<(String, String, DateTime<Utc>)>>>()?;
+        let dismissals = sqlx::query(
+            "SELECT target, at FROM role_changes
+             WHERE change = 'dismiss_reset_notice' AND at >= $1",
+        )
+        .bind(since)
+        .fetch_all(self.pool())
+        .await?
+        .iter()
+        .map(|r| Ok((r.try_get("target")?, r.try_get("at")?)))
+        .collect::<StoreResult<Vec<(String, DateTime<Utc>)>>>()?;
+        let voided = sqlx::query(
+            "SELECT handle, voided_at, wrong_guesses FROM password_setup_codes
+             WHERE voided_at >= $1 ORDER BY voided_at DESC, id DESC",
+        )
+        .bind(since)
+        .fetch_all(self.pool())
+        .await?
+        .iter()
+        .map(|r| {
+            Ok(VoidedCode {
+                handle: r.try_get("handle")?,
+                at: r.try_get("voided_at")?,
+                wrong_guesses: r.try_get("wrong_guesses")?,
+            })
+        })
+        .collect::<StoreResult<Vec<VoidedCode>>>()?;
+        Ok(PasswordOverview {
+            resets: pair_resets(resets, &dismissals),
+            voided,
+        })
+    }
+
     async fn handle_by_sign_in_name(&self, name: &str) -> StoreResult<Option<String>> {
         Ok(
             sqlx::query_scalar("SELECT handle FROM users WHERE sign_in_name = $1")
@@ -619,11 +702,16 @@ impl PasswordStore for PgStore {
             .execute(self.pool())
             .await?
             .rows_affected();
-        let codes = sqlx::query("DELETE FROM password_setup_codes WHERE expires_at <= $1")
-            .bind(now)
-            .execute(self.pool())
-            .await?
-            .rows_affected();
+        // A void code stays for the admin overview's window (M2).
+        let codes = sqlx::query(
+            "DELETE FROM password_setup_codes
+             WHERE expires_at <= $1 AND (voided_at IS NULL OR voided_at <= $2)",
+        )
+        .bind(now)
+        .bind(now - chrono::Duration::days(VOIDED_KEPT_DAYS))
+        .execute(self.pool())
+        .await?
+        .rows_affected();
         // An address's counters with nothing left to remember: no failure in the last 24
         // hours, no wait, and no full sign-in in the last 30 days.
         let sources = sqlx::query(

@@ -560,6 +560,35 @@ impl UserStore for PgStore {
         self.first_entra_link(link, now).await
     }
 
+    async fn first_token_use(
+        &self,
+        key: &str,
+        expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("DELETE FROM entra_used_tokens WHERE expires_at <= $1")
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        let added = sqlx::query(
+            "INSERT INTO entra_used_tokens (token_key, used_at, expires_at)
+             VALUES ($1, $2, $3) ON CONFLICT (token_key) DO NOTHING",
+        )
+        .bind(key)
+        .bind(now)
+        // Entra's ID tokens live an hour; the table keeps a day at most.
+        .bind(expires_at.clamp(
+            now + chrono::Duration::seconds(1),
+            now + chrono::Duration::days(1),
+        ))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(added == 1)
+    }
+
     fn passwords(&self) -> &dyn crate::password::store::PasswordStore {
         self
     }

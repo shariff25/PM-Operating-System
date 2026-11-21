@@ -40,7 +40,7 @@ use crate::store::StoreError;
 use crate::users::{Actor, ChangeKind, HostUser, RoleChange, Via, EVALS};
 use crate::vault::KeyRing;
 use hash::{HashParams, Weak};
-use limits::{GlobalLimit, SourceCounters, HASH_PERMITS, HASH_WAIT_SECS};
+use limits::{AccountWork, GlobalLimit, SourceCounters, HASH_PERMITS, HASH_WAIT_SECS};
 use store::{
     CodeKind, Credential, NewSetupCode, PasswordStore, Pending, Person, Purpose, ResetNotice,
     Snapshot, Writes,
@@ -81,6 +81,9 @@ pub enum PwError {
     SetupFailed,
     /// No setup in progress for that token: start again with the code.
     SetupExpired,
+    /// The setup code gave all the work it may (its tokens or its password sets): an admin
+    /// issues a new one (H1).
+    SetupCodeSpent,
     /// A setup step out of order (the authenticator before the password, or the confirmation
     /// before the authenticator).
     WrongStep,
@@ -122,6 +125,7 @@ impl PwError {
             Self::SignInExpired => "sign_in_expired",
             Self::SetupFailed => "setup_failed",
             Self::SetupExpired => "setup_expired",
+            Self::SetupCodeSpent => "setup_code_spent",
             Self::WrongStep => "wrong_step",
             Self::Weak(_) => "weak_password",
             Self::ReauthFailed => "reauth_failed",
@@ -155,6 +159,7 @@ impl PwError {
             | Self::Forbidden => 403,
             Self::NotFound => 404,
             Self::WrongStep
+            | Self::SetupCodeSpent
             | Self::NoPassword
             | Self::SignInUnconfirmed
             | Self::EvalsAccount
@@ -175,6 +180,9 @@ impl PwError {
             Self::SignInExpired => "no sign-in in progress: start again with the password",
             Self::SetupFailed => "that sign-in name and setup code don't match a setup that can start now",
             Self::SetupExpired => "no setup in progress: start again with the setup code",
+            Self::SetupCodeSpent => {
+                "this setup code was used for as many tries as it allows: ask an admin for a new one"
+            }
             Self::WrongStep => "do the setup's steps in order: password, authenticator, confirm",
             Self::Weak(w) => w.message(),
             Self::ReauthFailed => "the current password or the authenticator code isn't right",
@@ -282,8 +290,13 @@ fn totp_aad(handle: &str) -> String {
 }
 
 /// The fixed words an audit detail of a password event is made of (see [`is_safe_detail`]).
-pub const DETAIL_WORDS: [&str; 33] = [
+pub const DETAIL_WORDS: [&str; 36] = [
     "dismissed",
+    // The re-check of eb24d28: an account reaching its ceiling (M2), a setup code void after
+    // too many wrong guesses (M2), a setup code that gave all its work (H1).
+    "ceiling",
+    "voided",
+    "spent",
     // An Auditor's view of a refused password step or setup's first step: one reason for all
     // (`app::admin`, L15).
     "sign_in_failed",
@@ -400,6 +413,31 @@ fn lockout(handle: &str, counter: &limits::Counter, setup: bool, now: DateTime<U
     )
 }
 
+/// The events a counted sign-in failure leaves: the address's wait, and the account reaching
+/// its ceiling (from then on, new addresses are rationed: M2).
+fn failure_events(
+    handle: &str,
+    failed: limits::Failed,
+    source: &limits::Counter,
+    now: DateTime<Utc>,
+) -> Vec<AuditEvent> {
+    let mut out = Vec::new();
+    if failed.started_wait {
+        out.push(lockout(handle, source, false, now));
+    }
+    if failed.reached_ceiling {
+        out.push(web_event(
+            ANONYMOUS,
+            "password.lockout",
+            Outcome::Denied,
+            handle,
+            "ceiling",
+            now,
+        ));
+    }
+    out
+}
+
 /// Run `plan` on `handle`'s state (with the counters of the address `source`, a
 /// [`limits::source_key`]) in one transaction; give back what it decided.
 async fn tx<T: Send>(
@@ -478,6 +516,8 @@ pub struct PasswordService {
     dummy: String,
     slots: Arc<Semaphore>,
     global: GlobalLimit,
+    /// Hashing work after an authentication, per account (H1, LA).
+    work: AccountWork,
 }
 
 impl std::fmt::Debug for PasswordService {
@@ -505,6 +545,7 @@ impl PasswordService {
             dummy,
             slots: Arc::new(Semaphore::new(HASH_PERMITS)),
             global: GlobalLimit::default(),
+            work: AccountWork::default(),
         })
     }
 
@@ -518,12 +559,24 @@ impl PasswordService {
         self.params
     }
 
-    /// One hash from the global limit; `eligible`: an attempt on a real account from an
-    /// address below its threshold (or a valid setup token), which may use the reserve.
+    /// One hash from the global limit; `eligible`: a password step from a known address
+    /// ([`PasswordStore::source_known`]), which may use the reserve. Everything else (setup,
+    /// the signed-in routes) passes `false`: the open allowance only.
     fn take_global(&self, now: DateTime<Utc>, eligible: bool) -> Result<(), u64> {
         self.global.take(now, eligible).inspect_err(|_| {
             tracing::warn!(eligible, "password hashing over the tool server's limit");
         })
+    }
+
+    /// One piece of hashing work for `handle` after an authentication, checked and counted
+    /// (H1, LA); then one hash from the open allowance.
+    fn take_work(&self, handle: &str, now: DateTime<Utc>) -> PwResult<()> {
+        self.work.take(handle, now).map_err(|retry_after| {
+            tracing::warn!("password work for one account over its limit");
+            PwError::TooMany { retry_after }
+        })?;
+        self.take_global(now, false)
+            .map_err(|retry_after| PwError::TooMany { retry_after })
     }
 
     /// Run `work` (Argon2id) on the blocking pool, in one of the [`HASH_PERMITS`] slots, waiting
@@ -582,7 +635,11 @@ impl PasswordService {
     /// The password step, from the address `source` (pmos-web's view of the browser; `None`
     /// shares one count). Every refusal is [`PwError::SignInFailed`], after the same work;
     /// what happened is in the audit log (by reason, never by value). Only the global limit's
-    /// own refusal differs (`429`, from every caller alike).
+    /// own refusal differs (`429`), and whether an attempt may use its reserve is decided from
+    /// the address alone, before the name is looked up, so an unknown name and a real account
+    /// get the same answer under load too (M3). The one other `429` is an account whose
+    /// correct password was already given [`limits::ACCOUNT_WORK`] times in the window: only
+    /// whoever holds the password can cause it.
     pub async fn sign_in(
         &self,
         store: &dyn PasswordStore,
@@ -592,12 +649,17 @@ impl PasswordService {
         now: DateTime<Utc>,
     ) -> PwResult<Started> {
         let key = limits::source_key(source);
+        // M3: from the address alone. The shared `unknown` key is never known.
+        let eligible = limits::is_address(source)
+            && store
+                .source_known(&key, now - Duration::days(limits::KNOWN_SOURCE_DAYS))
+                .await?;
         let handle = match sign_in_name(name) {
             Some(n) => store.handle_by_sign_in_name(&n).await?,
             None => None,
         };
         let Some(handle) = handle else {
-            self.take_global(now, false)
+            self.take_global(now, eligible)
                 .map_err(|retry_after| PwError::TooMany { retry_after })?;
             self.dummy_verify(password).await?;
             store
@@ -624,17 +686,16 @@ impl PasswordService {
             Check {
                 stored: String,
                 epoch: i64,
-                /// The address's counter, when this failure (taken back if the password is
-                /// right) started a wait.
-                wait: Option<limits::Counter>,
+                /// The events this failure (taken back if the password is right) leaves.
+                events: Vec<AuditEvent>,
             },
         }
         let h = handle.clone();
         let reserved = tx(store, &handle, None, Some(&key), now, move |s| {
             let mut w = Writes::default();
             let refuse = |reason: &'static str, mut w: Writes| {
-                // A refusal costs a (dummy) hash too.
-                if let Err(retry_after) = self.take_global(now, false) {
+                // A refusal costs a (dummy) hash too, from the same allowance.
+                if let Err(retry_after) = self.take_global(now, eligible) {
                     return (Writes::default(), Reserve::Busy(retry_after));
                 }
                 w.events.push(web_event(
@@ -660,17 +721,21 @@ impl PasswordService {
                 // An Admin's or Auditor's credential an admin issued in the web app (PM3).
                 return refuse("host_only", w);
             }
-            if limits::may_try(&cred.failed, &s.source, now).is_err() {
+            if limits::may_try(&s.source, now).is_err() {
                 return refuse("locked", w);
             }
-            let eligible = s.source.sign_in.live_count(now) < limits::THRESHOLD;
+            // H1: a correct password already given this many times in the window. Only the
+            // holder of the password fills it (wrong guesses never count here).
+            if let Err(retry_after) = self.work.check(&h, now) {
+                return (w, Reserve::Busy(retry_after));
+            }
             if let Err(retry_after) = self.take_global(now, eligible) {
                 return (w, Reserve::Busy(retry_after));
             }
             let mut next = cred.clone();
-            next.failed.count_only(now);
             let mut src = s.source;
-            let wait = src.sign_in.fail(now).then_some(src.sign_in);
+            let failed = limits::fail_sign_in(&mut next.failed, &mut src, now);
+            let events = failure_events(&h, failed, &src.sign_in, now);
             let stored = cred.password_hash.clone().unwrap_or_default();
             let epoch = cred.epoch;
             w.credential = Some(next);
@@ -680,12 +745,12 @@ impl PasswordService {
                 Reserve::Check {
                     stored,
                     epoch,
-                    wait,
+                    events,
                 },
             )
         })
         .await?;
-        let (stored, epoch, wait) = match reserved {
+        let (stored, epoch, failure) = match reserved {
             Reserve::Busy(retry_after) => return Err(PwError::TooMany { retry_after }),
             Reserve::Refused(reason) => {
                 self.dummy_verify(password).await?;
@@ -695,8 +760,8 @@ impl PasswordService {
             Reserve::Check {
                 stored,
                 epoch,
-                wait,
-            } => (stored, epoch, wait),
+                events,
+            } => (stored, epoch, events),
         };
         if !self.verify(password, stored.clone()).await? {
             let mut events = vec![web_event(
@@ -707,9 +772,7 @@ impl PasswordService {
                 "wrong_password",
                 now,
             )];
-            if let Some(counter) = wait {
-                events.push(lockout(&handle, &counter, false, now));
-            }
+            events.extend(failure);
             store.password_events(events).await?;
             tracing::info!(reason = "wrong_password", "password sign-in refused");
             return Err(PwError::SignInFailed);
@@ -785,17 +848,14 @@ impl PasswordService {
             while live.len() >= MAX_SIGN_IN_PENDING {
                 w.delete_pending.push(live.remove(0).token_hash.clone());
             }
-            w.put_pending.push(Pending {
+            w.put_pending.push(Pending::new(
                 token_hash,
-                purpose: Purpose::SignIn,
-                setup_code_id: None,
+                Purpose::SignIn,
+                None,
                 epoch,
-                created_at: now,
-                expires_at: now + SIGN_IN_PENDING,
-                attempts: 0,
-                staged_hash: None,
-                staged_totp: None,
-            });
+                now,
+                now + SIGN_IN_PENDING,
+            ));
             w.events.push(web_event(
                 ANONYMOUS,
                 "password.sign_in",
@@ -808,10 +868,13 @@ impl PasswordService {
         })
         .await?;
         match started {
-            Ok(()) => Ok(Started {
-                token: Secret(token),
-                expires_at: now + SIGN_IN_PENDING,
-            }),
+            Ok(()) => {
+                self.work.count(&handle, now);
+                Ok(Started {
+                    token: Secret(token),
+                    expires_at: now + SIGN_IN_PENDING,
+                })
+            }
             Err(reason) => {
                 tracing::info!(reason, "password sign-in refused");
                 Err(PwError::SignInFailed)
@@ -838,6 +901,7 @@ impl PasswordService {
             return Err(PwError::SignInExpired);
         };
         let key = limits::source_key(source);
+        let address = limits::is_address(source);
         let h = handle.clone();
         tx(store, &handle, None, Some(&key), now, move |s| {
             let mut w = Writes::default();
@@ -874,7 +938,7 @@ impl PasswordService {
                 w.events.push(ev(Outcome::Denied, "host_only"));
                 return (w, Err(PwError::SignInExpired));
             }
-            if let Err(until) = limits::may_try(&cred.failed, &s.source, now) {
+            if let Err(until) = limits::may_try(&s.source, now) {
                 w.events.push(ev(Outcome::Denied, "locked"));
                 return (
                     w,
@@ -908,9 +972,12 @@ impl PasswordService {
             match matched {
                 Some((step, recovery)) => {
                     // This address is the person's own now: its count goes back to zero and
-                    // it stays known. The account-wide count is left to age out.
+                    // it stays known. The account-wide count is left to age out. Only a real
+                    // address becomes known: never the shared key of attempts with none (M1).
                     src.sign_in.clear();
-                    src.last_success_at = Some(now);
+                    if address {
+                        src.last_success_at = Some(now);
+                    }
                     w.source = Some(src);
                     if let Some(step) = step {
                         next.totp_last_step = Some(step);
@@ -955,8 +1022,7 @@ impl PasswordService {
                     )
                 }
                 None => {
-                    next.failed.count_only(now);
-                    let started_wait = src.sign_in.fail(now);
+                    let failed = limits::fail_sign_in(&mut next.failed, &mut src, now);
                     w.source = Some(src);
                     let mut p = p.clone();
                     p.attempts += 1;
@@ -967,9 +1033,8 @@ impl PasswordService {
                         w.put_pending.push(p);
                     }
                     w.events.push(ev(Outcome::Denied, "wrong_code"));
-                    if started_wait {
-                        w.events.push(lockout(&h, &src.sign_in, false, now));
-                    }
+                    w.events
+                        .extend(failure_events(&h, failed, &src.sign_in, now));
                     w.credential = Some(next);
                     (
                         w,
@@ -1028,7 +1093,7 @@ impl PasswordService {
                 return (w, Err(PwError::SetupFailed));
             };
             let mut cred = s.credential.clone().unwrap_or_default();
-            if limits::may_try_setup(&cred.setup_failed, &s.source, now).is_err() {
+            if limits::may_try_setup(&s.source, now).is_err() {
                 w.events.push(ev(Outcome::Denied, "locked"));
                 return (w, Err(PwError::SetupFailed));
             }
@@ -1046,6 +1111,32 @@ impl PasswordService {
                 if started_wait {
                     w.events.push(lockout(&h, &src.setup, true, now));
                 }
+                // M2: a wrong guess counts against the person's live code itself; at the cap
+                // the code is void (the admin overview lists it) and a new one starts at zero.
+                if let Some(live) = live.filter(|c| !matched && c.expires_at > now) {
+                    let mut code = live.clone();
+                    code.wrong_guesses = code.wrong_guesses.saturating_add(1);
+                    let void = code.wrong_guesses >= limits::SETUP_WRONG_GUESSES_PER_CODE;
+                    w.code_counts = Some(code.counts(void));
+                    if void {
+                        w.delete_pending = s
+                            .pending
+                            .iter()
+                            .filter(|p| p.purpose == Purpose::Setup)
+                            .map(|p| p.token_hash.clone())
+                            .collect();
+                        w.events.push(event(
+                            Client::Web,
+                            ANONYMOUS,
+                            "password.setup_code",
+                            Outcome::Denied,
+                            Some(&h),
+                            &format!("voided; failures {}", code.wrong_guesses.min(999_999)),
+                            now,
+                        ));
+                        tracing::warn!("a setup code is void after too many wrong guesses");
+                    }
+                }
                 if h != EVALS {
                     w.credential = Some(cred);
                     w.source = Some(src);
@@ -1061,6 +1152,9 @@ impl PasswordService {
                 Some((PwError::SignInUnconfirmed, "sign_in_unconfirmed"))
             } else if person.protected() && c.issued_via != Via::Host {
                 Some((PwError::HostOnly, "host_only"))
+            } else if c.spent() {
+                // H1: the code gave all its tokens or password sets.
+                Some((PwError::SetupCodeSpent, "spent"))
             } else {
                 None
             };
@@ -1078,18 +1172,18 @@ impl PasswordService {
                 .filter(|p| p.purpose == Purpose::Setup)
                 .map(|p| p.token_hash.clone())
                 .collect();
+            let mut code = c.clone();
+            code.begins = code.begins.saturating_add(1);
+            w.code_counts = Some(code.counts(false));
             let expires_at = (now + SETUP_PENDING).min(c.expires_at);
-            w.put_pending.push(Pending {
+            w.put_pending.push(Pending::new(
                 token_hash,
-                purpose: Purpose::Setup,
-                setup_code_id: Some(c.id),
-                epoch: cred.epoch,
-                created_at: now,
+                Purpose::Setup,
+                Some(c.id),
+                cred.epoch,
+                now,
                 expires_at,
-                attempts: 0,
-                staged_hash: None,
-                staged_totp: None,
-            });
+            ));
             w.events
                 .push(ev(Outcome::Ok, &format!("begin; {}", c.kind.as_str())));
             (w, Ok((c.kind, expires_at)))
@@ -1105,7 +1199,11 @@ impl PasswordService {
     }
 
     /// The setup's password. Checked against the rules, hashed, kept with the setup until it
-    /// is confirmed.
+    /// is confirmed. **Bounded** (the re-check of eb24d28, H1): each call is counted against
+    /// the token ([`limits::SETUP_PASSWORD_SETS_PER_TOKEN`], then the token is spent), the code
+    /// across its renewals ([`limits::SETUP_PASSWORD_SETS_PER_CODE`], then the code is spent)
+    /// and the account ([`limits::ACCOUNT_WORK`]), before the hash, whatever the outcome; the
+    /// hash comes from the global limit's open allowance only, never its reserve.
     pub async fn setup_password(
         &self,
         store: &dyn PasswordStore,
@@ -1114,21 +1212,45 @@ impl PasswordService {
         now: DateTime<Utc>,
     ) -> PwResult<()> {
         // The token first (a cheap lookup): a made-up or spent one costs the global limit
-        // nothing. A live setup token may use the reserve.
+        // nothing.
         let token_hash = codes::token_hash(token).ok_or(PwError::SetupExpired)?;
         let handle = store
             .handle_by_token(&token_hash)
             .await?
             .ok_or(PwError::SetupExpired)?;
         let th = token_hash.clone();
-        let name = tx(store, &handle, None, None, now, move |s| {
-            let r = live_setup(s, &th, now).map(|(_, _, person)| person.sign_in_name.clone());
-            (Writes::default(), r)
+        let h = handle.clone();
+        tx(store, &handle, None, None, now, move |s| {
+            let mut w = Writes::default();
+            let (p, c, person) = match live_setup(s, &th, now) {
+                Ok(v) => v,
+                Err(e) => return (w, Err(e)),
+            };
+            // The rules first: a password they refuse costs nothing and isn't counted.
+            if let Err(weak) =
+                hash::check_new(password.expose(), &h, person.sign_in_name.as_deref())
+            {
+                return (w, Err(PwError::Weak(weak)));
+            }
+            if p.password_sets >= limits::SETUP_PASSWORD_SETS_PER_TOKEN {
+                w.delete_pending.push(p.token_hash.clone());
+                return (w, Err(PwError::SetupExpired));
+            }
+            if c.spent() {
+                w.delete_pending.push(p.token_hash.clone());
+                return (w, Err(PwError::SetupCodeSpent));
+            }
+            // Counted now, before the hash, whatever comes of it.
+            let mut p = p.clone();
+            p.password_sets += 1;
+            w.put_pending.push(p);
+            let mut code = c.clone();
+            code.password_sets = code.password_sets.saturating_add(1);
+            w.code_counts = Some(code.counts(false));
+            (w, Ok(()))
         })
         .await??;
-        hash::check_new(password.expose(), &handle, name.as_deref()).map_err(PwError::Weak)?;
-        self.take_global(now, true)
-            .map_err(|retry_after| PwError::TooMany { retry_after })?;
+        self.take_work(&handle, now)?;
         let hashed = self.hash(password).await?;
         tx(store, &handle, None, None, now, move |s| {
             let mut w = Writes::default();
@@ -1162,9 +1284,15 @@ impl PasswordService {
         let account = tx(store, &handle, None, None, now, move |s| {
             let mut w = Writes::default();
             match live_setup(s, &token_hash, now) {
+                Ok((p, _, _)) if p.enrolments >= limits::SETUP_ENROLMENTS_PER_TOKEN => {
+                    // Bounded per token too: past it, start again with the code.
+                    w.delete_pending.push(p.token_hash.clone());
+                    (w, Err(PwError::SetupExpired))
+                }
                 Ok((p, _, person)) if p.staged_hash.is_some() => {
                     let mut p = p.clone();
                     p.staged_totp = Some(sealed);
+                    p.enrolments += 1;
                     w.put_pending.push(p);
                     let account = person
                         .sign_in_name
@@ -1199,6 +1327,7 @@ impl PasswordService {
         now: DateTime<Utc>,
     ) -> PwResult<SetupDone> {
         let key = limits::source_key(source);
+        let address = limits::is_address(source);
         let token_hash = codes::token_hash(token).ok_or(PwError::SetupExpired)?;
         let handle = store
             .handle_by_token(&token_hash)
@@ -1233,7 +1362,7 @@ impl PasswordService {
                 return (w, Err(PwError::SignInUnconfirmed));
             }
             let mut cred = s.credential.clone().unwrap_or_default();
-            if let Err(until) = limits::may_try_setup(&cred.setup_failed, &s.source, now) {
+            if let Err(until) = limits::may_try_setup(&s.source, now) {
                 w.events.push(ev(ANONYMOUS, Outcome::Denied, "locked"));
                 return (
                     w,
@@ -1289,10 +1418,11 @@ impl PasswordService {
             w.recovery = Some(hashes);
             w.use_code = Some(c.id);
             w.clear_pending = true;
-            // Every address's counts start again; this one is the person's own now.
+            // Every address's counts start again; this one is the person's own now (only a
+            // real address: never the shared key of attempts with none, M1).
             w.reset_sources = true;
             w.source = Some(SourceCounters {
-                last_success_at: Some(now),
+                last_success_at: address.then_some(now),
                 ..SourceCounters::default()
             });
             w.changes.push(RoleChange {
@@ -1350,6 +1480,12 @@ impl PasswordService {
         if let Err(weak) = hash::check_new(new.expose(), handle, name.as_deref()) {
             return Err(PwError::Weak(weak));
         }
+        // LA: a change costs two hashes (the current password, the new one). Both are counted
+        // against the account's work and taken from the open allowance before either, so a
+        // signed-in person can't spend what everyone shares.
+        self.take_work(handle, now)?;
+        self.take_global(now, false)
+            .map_err(|retry_after| PwError::TooMany { retry_after })?;
         let h = handle.to_string();
         let reserved = tx(store, handle, None, Some(&key), now, move |s| {
             let mut w = Writes::default();
@@ -1459,6 +1595,12 @@ impl PasswordService {
         code: &Secret,
         now: DateTime<Utc>,
     ) -> PwResult<Vec<Secret>> {
+        // LA: no Argon2 hash here (an authenticator code and ten SHA-256s), so nothing from the
+        // global limit; counted against the account's work all the same.
+        self.work.take(handle, now).map_err(|retry_after| {
+            tracing::warn!("password work for one account over its limit");
+            PwError::TooMany { retry_after }
+        })?;
         let recovery = codes::new_recovery_codes().map_err(|e| PwError::Unavailable(e.into()))?;
         let hashes: Vec<String> = recovery
             .iter()
@@ -1537,6 +1679,20 @@ impl PasswordService {
             if let Some(mut cred) = s.credential.clone().filter(|c| c.reset_notice.is_some()) {
                 cred.reset_notice = None;
                 w.credential = Some(cred);
+                // LF: recorded as a role change (who, when), so the admin overview shows the
+                // reset as dismissed, by this account's own session, from the database by
+                // time, whoever is holding the account.
+                w.changes.push(RoleChange {
+                    id: 0,
+                    at: now,
+                    actor: h.clone(),
+                    via: Via::Web,
+                    host_user: None,
+                    target: h.clone(),
+                    change: ChangeKind::DismissResetNotice,
+                    role: None,
+                    detail: Some("reset".into()),
+                });
                 w.events.push(web_event(
                     &h,
                     "password.reset_notice",
@@ -1748,6 +1904,8 @@ mod tests {
             attempts: 0,
             staged_hash: Some(staged.into()),
             staged_totp: Some(sealed.into()),
+            password_sets: 1,
+            enrolments: 1,
         };
         let setup = store::SetupCode {
             id: 1,
@@ -1757,6 +1915,9 @@ mod tests {
             issued_by: "ada".into(),
             issued_via: Via::Web,
             expires_at: now,
+            begins: 1,
+            password_sets: 1,
+            wrong_guesses: 0,
         };
         let new_code = NewSetupCode {
             hash: code.into(),
