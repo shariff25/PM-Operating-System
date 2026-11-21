@@ -588,7 +588,13 @@ async fn forward(
             return finish(res);
         }
         Attempt::Down(e) => {
-            tracing::warn!(upstream = %role.upstream, error = %e, "model server unreachable");
+            tracing::warn!(
+                upstream = %role.upstream,
+                error = %e,
+                cause = %causes(&e),
+                timeout = e.is_timeout(),
+                "model server unreachable"
+            );
             event.status = 502;
             event.latency_ms = started.elapsed().as_millis() as u64;
             inner.usage.record(event);
@@ -766,5 +772,50 @@ async fn claude(
             .into_response()
     } else {
         Json(answer).into_response()
+    }
+}
+
+/// What lies under a transport error ("connection reset by peer", "operation timed out"),
+/// which reqwest's own message ("error sending request for url ...") leaves out. Never holds
+/// a header, so never the remote key.
+fn causes(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = Vec::new();
+    let mut next = e.source();
+    while let Some(cause) = next {
+        out.push(cause.to_string());
+        next = cause.source();
+    }
+    out.join(": ")
+}
+
+#[cfg(test)]
+mod causes_tests {
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as _)
+        }
+    }
+
+    #[test]
+    fn lists_every_cause_under_the_error() {
+        let e = Layer(
+            "error sending request",
+            Some(Box::new(Layer(
+                "client error (SendRequest)",
+                Some(Box::new(Layer("connection reset by peer", None))),
+            ))),
+        );
+        assert_eq!(
+            super::causes(&e),
+            "client error (SendRequest): connection reset by peer"
+        );
+        assert_eq!(super::causes(&Layer("alone", None)), "");
     }
 }
