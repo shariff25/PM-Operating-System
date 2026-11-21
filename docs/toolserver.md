@@ -1343,11 +1343,13 @@ issuer, `aud` exactly `PMOS_ENTRA_CLIENT_ID`, `exp`/`nbf`/`iat` within 60 second
 absent. A token that fails is `422 invalid_token` (`422 entra_misconfigured` without `acct`,
 `403 not_a_member` for a guest or another identity provider); the tenant's keys unreachable is
 `503 entra_unavailable` (nothing linked: fail closed). Each token is good for **one** first
-link: its `(oid, iat)` is remembered until it expires, and the same token again is `403
-token_used` (in process, like the miss windows: a restart forgets, leaving at most a token's
-remaining hour). The `(tid, oid)` and the sign-in name come only from the validated token; a
-token with no usable `preferred_username` is `404 not_found`. Every refusal counts as a miss
-and is audited. Then one transaction, under the users lock, re-reads the directory and
+link: a SHA-256 of its `(oid, iat)` is kept by the user store until the token expires (in
+Postgres, `entra_used_tokens`, migration 0023, so a restart doesn't forget it), and the same
+token again is `403 token_used`. The `(tid, oid)` and the sign-in name come only from the
+validated token; a token with no usable `preferred_username` is `404 not_found`. Every refusal
+(`501 not_configured` and `503 entra_unavailable` included) counts as a miss first: past the
+miss limit it is `429 resolve_misses` and not audited; below it, it is audited. A deactivated
+user, `evals`, and an Admin or Auditor are refused even when already linked with this key. Then one transaction, under the users lock, re-reads the directory and
 checks: the user exists and the token's `preferred_username` (never `email`) is their stored
 sign-in name, else `404 not_found`; they
 have no Entra identity yet (`409 linked` if a different one; the same key is `200` with
@@ -1551,14 +1553,14 @@ sign-in**.
 
 | Route | Body | Answer |
 | --- | --- | --- |
-| `POST /internal/password/sign-in` | `{sign_in_name, password, source?}` | `{pending_token, expires_at}`; every refusal `401 sign_in_failed`; `429 too_many_attempts` from the global limit |
+| `POST /internal/password/sign-in` | `{sign_in_name, password, source?}` | `{pending_token, expires_at}`; every refusal `401 sign_in_failed`; `429 too_many_attempts` from the global limit (its reserve only for an address someone signed in from, decided before the name is looked up), or an account whose correct password was given 10 times in 15 minutes |
 | `POST /internal/password/second-step` | `{pending_token, code, source?}` or `{pending_token, recovery_code, source?}` | `{user, password_epoch, recovery_code_used, recovery_codes_left}`; `401 code_failed` (`attempts_left`), `401 sign_in_expired`, `403 not_a_member`, `429 too_many_attempts` |
-| `POST /internal/password/setup/begin` | `{sign_in_name, setup_code, source?}` | `{setup_token, handle, kind, expires_at}`; `401 setup_failed`, then `403 not_a_member`, `409 sign_in_unconfirmed`, `403 host_only`, `409 evals_account` |
-| `POST /internal/password/setup/password` | `{setup_token, password}` | `{next: "authenticator"}`; `422 weak_password` (`reason`), `401 setup_expired` |
-| `POST /internal/password/setup/authenticator` | `{setup_token}` | `{otpauth_uri, secret, account, issuer, algorithm, digits, period}`; `409 wrong_step` |
+| `POST /internal/password/setup/begin` | `{sign_in_name, setup_code, source?}` | `{setup_token, handle, kind, expires_at}`; `401 setup_failed` (a wrong guess also counts against the person's live code: void at 20), then `403 not_a_member`, `409 sign_in_unconfirmed`, `403 host_only`, `409 evals_account`, `409 setup_code_spent` (5 setups started or 6 passwords set with the code) |
+| `POST /internal/password/setup/password` | `{setup_token, password}` | `{next: "authenticator"}`; `422 weak_password` (`reason`), `401 setup_expired` (also past 3 per token), `409 setup_code_spent`, `429 too_many_attempts` (the account's work, or the global limit's open allowance: never the reserve) |
+| `POST /internal/password/setup/authenticator` | `{setup_token}` | `{otpauth_uri, secret, account, issuer, algorithm, digits, period}`; `409 wrong_step`, `401 setup_expired` (also past 5 per token) |
 | `POST /internal/password/setup/confirm` | `{setup_token, code, source?}` | `{user, password_epoch, kind, recovery_codes}`; `401 code_failed`, `409 wrong_step`, `403 host_only` |
-| `POST /internal/password/change?user=<handle>` | `{current_password, code, new_password}` | `{password_epoch}`; `403 reauth_failed`, `422 weak_password`, `409 no_password`, `429 too_many_attempts` |
-| `POST /internal/password/recovery-codes?user=<handle>` | `{code}` | `{recovery_codes}`; `403 reauth_failed`, `409 no_password` |
+| `POST /internal/password/change?user=<handle>` | `{current_password, code, new_password}` | `{password_epoch}`; `403 reauth_failed`, `422 weak_password`, `409 no_password`, `429 too_many_attempts` (the wait, the account's work, or the open allowance) |
+| `POST /internal/password/recovery-codes?user=<handle>` | `{code}` | `{recovery_codes}`; `403 reauth_failed`, `409 no_password`, `429 too_many_attempts` |
 | `GET /internal/password/status?user=<handle>` | | `{enabled, password_set, second_step_enrolled, setup_code_pending, recovery_codes_left, needs_host_setup, reset_notice: {by, by_name, at} \| null}` |
 | `POST /internal/password/reset-notice/dismiss?user=<handle>` | `{}` | `204` |
 | `POST /internal/password/setup-codes?user=<admin>` | `{handle}` | `201 {setup_code, handle, kind, expires_at}`; `403 forbidden`, `403 host_only`, `403 self_change`, `404 not_found`, `409 not_active`, `409 sign_in_unconfirmed`, `409 evals_account` |
