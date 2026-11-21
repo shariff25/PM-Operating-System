@@ -7,6 +7,7 @@ mascot: sprout
 owner: "TODO"
 version: "0.1.0"
 offered: true
+preview: true
 order: 30
 summary: "Finds and tests growth: funnels, experiments, sizing and pricing."
 examples:

@@ -49,6 +49,7 @@ pmos-assertion = { path = "crates/assertion" }
 pmos-contract = { path = "crates/contract" }
 pmos-directory = { path = "crates/directory" }
 pmos-entra = { path = "crates/entra" }
+pmos-evals = { path = "crates/evals" }
 pmos-policy = { path = "crates/policy" }
 pmos-runtime = { path = "crates/runtime" }
 

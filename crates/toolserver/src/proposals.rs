@@ -252,6 +252,25 @@ struct Base<'a> {
 /// The pull request's body: who proposed it (their PM OS handle, in code so GitHub notifies
 /// nobody), the reason (fenced, so it can't format or mention), the base, what the sandboxes
 /// gain and lose, and the files.
+/// The repository paths among `paths` that change a marketplace bot's instructions
+/// ([`pmos_contract::personas::is_bot_instructions`]), by the catalog this server runs.
+fn bot_instructions(
+    roster: &crate::catalog::Roster,
+    content_dir: &str,
+    paths: &[String],
+) -> Vec<String> {
+    let known = pmos_contract::personas::instruction_paths(roster.personas().map(|p| p.as_ref()));
+    let prefix = format!("{}/", content_dir.trim_end_matches('/'));
+    paths
+        .iter()
+        .filter(|p| {
+            p.strip_prefix(&prefix)
+                .is_some_and(|rel| pmos_contract::personas::is_bot_instructions(rel, &known))
+        })
+        .cloned()
+        .collect()
+}
+
 fn pr_body(
     kind: Kind,
     handle: &str,
@@ -259,6 +278,7 @@ fn pr_body(
     base: &Base,
     e: &Evaluation,
     files: &[String],
+    instructions: &[String],
 ) -> String {
     let (branch, commit, revision) = (base.branch, base.commit, base.revision);
     let mut b = format!(
@@ -290,6 +310,12 @@ fn pr_body(
                 "- **{mark}**: {}\n",
                 proposals::clean_line(&c.description, 300).replace('`', "'")
             ));
+        }
+    }
+    if !instructions.is_empty() {
+        b.push_str("\n### Bot instructions\n\n**This changes what a marketplace bot is told.** It changes no sandbox policy, but it needs a second platform owner's review, as a network change does (`policies/README.md`, \"Bot instructions\"):\n\n");
+        for f in instructions {
+            b.push_str(&format!("- `{f}`\n"));
         }
     }
     b.push_str("\n### Files\n\n");
@@ -425,6 +451,7 @@ pub async fn open(
         }
     };
     let paths: Vec<String> = checked.files.iter().map(|(p, _)| p.clone()).collect();
+    let instructions = bot_instructions(&svc.roster(), layout.content_dir(), &paths);
 
     // The base: the content branch's head, which must have every file as this server has it.
     let gh = &setup.github;
@@ -519,6 +546,7 @@ pub async fn open(
         },
         &checked.evaluation,
         &paths,
+        &instructions,
     );
     let changes: Vec<Change> = checked
         .files
@@ -700,6 +728,59 @@ pub async fn protection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn evaluation() -> Evaluation {
+        Evaluation {
+            valid: true,
+            issues: Vec::new(),
+            content_diffs: Vec::new(),
+            policy_diffs: Vec::new(),
+            allowance_changes: Vec::new(),
+            widening: false,
+            policy_writes: Vec::new(),
+            base_texts: BTreeMap::new(),
+        }
+    }
+
+    /// Slice M1: a change to what a marketplace bot is told is called out for a second
+    /// platform owner's review, though it changes no policy.
+    #[test]
+    fn bot_instruction_changes_ask_for_a_second_review() {
+        let base = Base {
+            branch: "main",
+            commit: "abc1234",
+            revision: None,
+        };
+        let files = vec![
+            "content/roles/outbound-pm/ROLE.md".to_string(),
+            "content/context/products/x.md".to_string(),
+        ];
+        let body = pr_body(
+            Kind::Content,
+            "ada",
+            "why",
+            &base,
+            &evaluation(),
+            &files,
+            &files[..1],
+        );
+        assert!(body.contains("### Bot instructions"), "{body}");
+        assert!(body.contains("second platform owner's review"), "{body}");
+        assert!(
+            body.contains("- `content/roles/outbound-pm/ROLE.md`"),
+            "{body}"
+        );
+        let body = pr_body(
+            Kind::Content,
+            "ada",
+            "why",
+            &base,
+            &evaluation(),
+            &files,
+            &[],
+        );
+        assert!(!body.contains("### Bot instructions"), "{body}");
+    }
 
     #[test]
     fn markers_are_read_strictly() {

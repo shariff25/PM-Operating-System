@@ -1,7 +1,11 @@
 # Bot marketplace: Chief, Sprout and Echo beside Nudge
 
-Status: **design spec; slices C1, B1 and R1 built** (contract, lint and generator; the tool
-server; the runtime and harness: §13, "Status"). The independent reviewer checks it before any slice starts.
+Status: **design spec; slices C1, B1, R1 and M1 built** (contract, lint and generator; the
+tool server; the runtime and harness; the reviewer's changes: §13, "Status"). The independent
+reviewer reviewed it on 2026-11-21 ("sound after changes"); M1 builds those changes and the
+owner's two decisions of that day (Chief, Sprout and Echo are offered as **Previews** until their
+eval run passes; Echo's pages carry "Draft for internal review. Not approved for external
+use."). Where a section below and a status note in §13 differ, the later status note holds.
 Owner's requirement (scope item j in `CLAUDE.md`, 2026-11-20): widen the product beyond one PM
 assistant with three new bots, a Chief of Staff, a Growth PM and an Outbound PM; as part of
 onboarding the PM sees a bot marketplace and chooses which bots to include; each bot has its own
@@ -253,6 +257,13 @@ it back. Offering changes no policy (the uploads include every defined persona, 
 so it is a plain content change. A withdrawn persona still appears in the admin view with its
 users.
 
+**Preview** (the owner's exception to D10, 2026-11-21; slice M1). `preview: true` offers a
+persona before its eval category has met its pass bar; every catalog read carries `preview`, and
+the screens show "Preview: not yet benchmarked". CI's `pmos lint` refuses an offered persona that
+is neither always-on nor a Preview unless every category naming it has met its bar two weeks in
+a row in `evals/reports` (`persona-benchmark`). Chief, Sprout and Echo are Previews; Nudge is not.
+A withdrawn persona's pending drafts are **held** (§6, "Removal").
+
 ## 3. The three bots
 
 All three: data class `restricted` (the same as `pm-assistant`), model class `reasoning` (the
@@ -261,7 +272,9 @@ bake-off points `reasoning` at a larger model), writes only through draft-and-ap
 role bodies carry the same standing sections as `pm-assistant`'s (source markers, look before
 you ask, point of view), copied into each `ROLE.md`; a shared include is not part of the role
 format today, so the content slice adds a lint test that the three sections are present
-verbatim in every persona role (`persona-role-sections`, warning).
+verbatim in every persona role (`persona-role-sections`, warning). *M1 made it an error and
+added "Untrusted data" and "Hard limits" to the standing sections, in `pm-assistant` too; each
+persona's own limits moved to "Your own limits" (§13, "M1 is built").*
 
 **Who owns what.** Nudge keeps every skill it has today: removing any would surprise existing
 PMs. Where a specialist and Nudge both have a skill, the specialist's card and examples
@@ -519,6 +532,8 @@ mid-task: the task the PM already started finishes (bounded by the session's 30-
 bot)`), not the persona. A draft therefore stays decidable after its persona is removed from the
 team or the catalog: the PM approves what the PM's own bot may write, and the persona's rules
 already applied when it was drafted. The decision's audit event records the item's `persona`.
+*M1: a draft whose persona was withdrawn from the catalog is held instead (§6, "Removal");
+removal from one PM's team holds nothing.*
 
 ### The runtime (`crates/bots`)
 
@@ -583,8 +598,8 @@ always_on` ("Nudge is always on your team."). All "nothing changed".
 | Event | Claimed tasks | Queued tasks | Drafts | Routines | Team row |
 | --- | --- | --- | --- | --- | --- |
 | The PM removes a bot | Finish | Fail at claim, "<Name> isn't on your team any more…" | Stay the PM's, decidable, still attributed | The remove request carries `routines: "nudge" \| "pause"` (the Bots page asks when the bot has any; default `"nudge"`): `pmos-web` calls the runtime to set `persona` to NULL or to pause them **before** the team change | Deleted |
-| An Admin withdraws a bot (`offered: false`) | Finish, unless they call a tool after the reload: the session ends ("no longer offered") | Fail at claim | As above | Paused at their next run, with the reason in the PM's DM | Kept, inert, shown as withdrawn |
-| A persona file is deleted | As withdrawn | As withdrawn | Attributed by key; the app shows "a bot no longer offered" and a neutral face | As withdrawn | Kept, inert; an admin view warning lists rows with no persona |
+| An Admin withdraws a bot (`offered: false`) | Finish, unless they call a tool after the reload: the session ends ("no longer offered") | Fail at claim | **Held** (M1): pending ones can be rejected, not approved or edited (`409 held`), until the bot is offered again or an Admin releases each (`POST /internal/admin/personas/drafts/{id}/release`) | Paused at their next run, with the reason in the PM's DM | Kept, inert, shown as withdrawn |
+| A persona file is deleted | As withdrawn | As withdrawn | Held, as withdrawn; attributed by key; the app shows "a bot no longer offered" and a neutral face | As withdrawn | Kept, inert; an admin view warning lists rows with no persona |
 | The PM is deactivated | As today | As today | Held, as today | Paused, as today | Kept |
 
 ## 7. Authorization and safety
@@ -828,6 +843,15 @@ docs pages `vault-saml-sso` and `vault-key-rotation`; the Slack threads listed i
 | An Admin forces a bot on a PM | No route lets anyone change another person's team. |
 | Team changes flood the audit log | 30 changes an hour per person; cap of 16 rows. |
 | The `evals` account gains access through seeded rows | Seed rows only on the in-memory eval stack and CI, as the existing seed; `evals` keeps `pm` only. |
+| A persona-instruction change merged by one reviewer (a role body changes no policy, so POL-2 never applied) (M1) | The files that change what a bot is told (`content/master/AGENTS.md`, `content/personas/**`, every persona role's `ROLE.md`) need a second platform owner's review: CODEOWNERS lines and branch-protection settings the owner sets in GitHub (`policies/README.md`, "Bot instructions"; a test keeps the lines complete for the catalog); a content proposal from the web app says so in its body. The lint refuses a persona role whose "Untrusted data", "Hard limits" and other standing sections differ from `pm-assistant`'s by one character (`persona-role-sections`, error). **Enforced only once the owner sets it in GitHub.** |
+| A persona's "You are Chief" text taken over the team's rules (M1) | `content/master/AGENTS.md` says it comes first for every bot, whatever name it runs under; every persona role's standing "Hard limits" say so; the harness prompt's "What comes first" section (R1) says so; tests pin all three. Tools, writes and approvals don't depend on any of it: the tool server enforces them. |
+| Bots offered before their benchmark passes (D10) (M1) | `preview: true` is required for an offered persona whose eval categories haven't met their bar two weeks in a row (`persona-benchmark`, a CI lint error); every catalog read carries `preview` so the screens say "Preview: not yet benchmarked". The owner accepted the exception on 2026-11-21. |
+| A mixed-version rollout drops `persona` (a tool server without B1 runs Chief as Nudge) (M1) | The tool server refuses an unknown field in a session body (`422`); the runtime requires the answer to echo the persona and its role and revokes the session otherwise (R1); `docs/bots-runtime.md` deploys the tool server first. |
+| Pending drafts of a withdrawn bot stay one click from approval (M1) | Held: rejectable, not approvable or editable (`409 held`), until the bot is offered again or an Admin releases each, recorded as `approvals.release_hold`. |
+| A write a later skill adds becomes `approve` with nobody deciding (M1) | A persona role lists every write in `actions` (`persona-action-unlisted`, error); the tool server treats an unlisted one as `never` and refuses it. |
+| Display-name spoofing ("PM OS: …", "Admin: …" in Slack) (M1) | `persona-reserved` refuses keys and display names that read as PM OS, its roles, system words or the systems it talks to; the admin view lists a persona named like a PM OS user (`name_clashes`), since people's names aren't in the content. **A clash with a person is shown, not refused.** |
+| The 16-row cap raced by two concurrent inserts (M1) | The cap trigger takes the per-person advisory lock the team change takes (migration `0026`); a Postgres test holds one writer's lock and shows the second waits and is refused. The hourly count is taken under one lock (concurrency test on both stores). |
+| Echo's customer-facing pages used outside before Legal's outbound policy (M1) | Every Confluence page Echo drafts starts with "Draft for internal review. Not approved for external use.", added by the tool server when recorded and again when written; Echo's role and its own skills say so; tests pin the sentence. No extra approval step (owner, 2026-11-21). |
 
 ## 12. Open questions for the owner
 
@@ -875,6 +899,7 @@ waiting on a model key).
 | A1 | **Admin view** | `admin/Bots.tsx`, `GET /api/admin/bots`, audit `persona` filter and column | B1, W1 | Admin and auditor see it, PM `403`; no team-changing controls; deleted-persona warning |
 | R2 | **Chief writes the brief** | `PATCH /v1/routines/{id} {persona}`, `PUT /api/me/brief`, Chief's Settings switch, card attribution of the brief | R1, W1, F2 | Only the owner's `[daily-brief]` routine; removing Chief moves it back; the brief block still reaches the web panels |
 | E1 | **First eval run** | Run `chief`, `sprout`, `echo` and the parity tasks; commit the report | C2–C4, R1; a model key with quota (waiting on the owner) | The report; no quality claim before it |
+| M1 | **The reviewer's changes** (strongest model) | Preview and `persona-benchmark`; Echo's draft notice; strict session body; standing sections as an error; precedence of `content/master/AGENTS.md`; second-review instructions; held drafts and their release; every write listed; the cap lock; reserved names; migration `0026` | C1, B1, R1 | See "M1 is built" |
 
 ### Status: C1 is built (2026-11-21, branch `claude/market-c1-contract`)
 
@@ -1097,6 +1122,118 @@ Chief removed, the draft is approved through `pmos-web`).
 **Not verified**: a real worker in a real sandbox (no OpenShell here) and the recreate
 runbook; any model run (no eval run has happened, so nothing is claimed about any persona's
 quality); W1 and S1 against these routes (not built).
+
+### Status: M1 is built (2026-11-21, branch `claude/market-review-fixes`)
+
+M1 builds the independent reviewer's required changes to this spec (review of 2026-11-21) and
+the owner's two decisions of that day. Built:
+
+- **Preview.** `preview` in `PERSONA.md` and on `Persona` (`crates/contract/src/personas.rs`);
+  `preview: true` on Chief, Sprout and Echo, not Nudge; carried by the tool server's
+  `GET /internal/personas` and `GET /internal/admin/personas` and the runtime's
+  `GET /v1/personas`. Lint `persona-benchmark` (error): an offered persona that is neither
+  always-on nor a Preview needs every eval category naming it to have met its bar two weeks in a
+  row; a Preview whose categories pass gets a warning to drop the label.
+  `pmos_evals::history::benchmarked_personas` reads `evals/`; `pmos lint` passes it in
+  (`--evals`, default `evals` beside the content root). Tests: `persona_benchmark`,
+  `repo_previews_notice_and_precedence` (`crates/contract/tests/lint.rs`),
+  `a_persona_is_benchmarked_after_two_weeks_at_its_bar` (`crates/evals/tests/report_history.rs`),
+  `crates/cli/tests/lint_benchmark.rs`, the catalog tests in `crates/toolserver/tests/team.rs`
+  and `crates/bots/tests/personas.rs`.
+- **Echo's line.** `draft-notice` in `PERSONA.md` (Echo's is `INTERNAL_REVIEW_NOTICE`, "Draft for
+  internal review. Not approved for external use."); the tool server puts it at the top of the
+  body of every `confluence.create_draft` and `confluence.update_page` the persona drafts, when
+  the item is recorded and again when the approved write runs (`with_draft_notice`); Echo's role
+  ("The internal-review line") and its own skills `positioning-brief` and `battlecard` state it;
+  lint `persona-draft-notice` requires the role to. No extra approval step. Tests:
+  `echos_pages_carry_the_internal_review_line` (`tests/team.rs`), `persona_draft_notice`,
+  `repo_previews_notice_and_precedence`, `the_notice_heads_every_page_body_once`.
+- **The session body is strict.** `NewSession` (`POST /internal/sessions`) has
+  `deny_unknown_fields`: an unknown field is `422`. Test:
+  `a_session_body_with_an_unknown_field_is_refused`.
+- **Standing sections, verbatim, as an error.** `persona-role-sections` covers "Untrusted data",
+  "Hard limits", "Source markers in drafts", "Look before you ask" and "Point of view"
+  (`STANDING_SECTIONS`), compared character for character with `pm-assistant`'s; `pm-assistant`
+  must have all five. Test: `persona_role_sections`.
+- **`content/master/AGENTS.md` comes first.** It now says so for every bot, whatever name it
+  runs under, and every persona role's standing "Hard limits" say so; R1's harness section is
+  unchanged. Tests: `repo_previews_notice_and_precedence`, and R1's `harness/test/persona.test.ts`.
+- **Second owner's review of bot instructions**: `policies/README.md`, "Bot instructions",
+  gives the CODEOWNERS lines and branch-protection settings the owner must set in GitHub; the
+  test `codeowners_lines_cover_every_bot_instruction_file` keeps the lines complete for the
+  catalog (`instruction_paths`); a content proposal from the web app adds a "Bot instructions"
+  section to its pull request asking for that review (`proposals.rs`,
+  `bot_instruction_changes_ask_for_a_second_review`).
+- **Held drafts.** A pending item whose persona is no longer offered can be rejected, not
+  approved or edited (`DecisionError::Held`, `409 held`, recorded `denied`), until the persona is
+  offered again or an Admin (`edit-content`) releases it:
+  `POST /internal/admin/personas/drafts/{id}/release?user=<admin>` (assertion `require`),
+  recorded as `approvals.release_hold`, stored in `approval_hold_releases`
+  (migration `0026_market_review_fixes.sql`). Views carry `held: true`. Tests:
+  `a_draft_names_its_persona_and_outlives_it`, `a_withdrawn_bots_drafts_are_held`,
+  `an_admin_releases_a_held_draft_over_http`.
+- **Every write listed.** `persona-action-unlisted` (error) for every persona role, the personal
+  role included; the tool server treats a persona role's unlisted write as `never`
+  (`persona_role_setting`) and refuses it with "the role doesn't list it". Tests:
+  `persona_action_unlisted`, `an_unlisted_write_is_refused`, `drafts_are_the_approve_writes_labelled`.
+- **The limits under concurrency.** The cap trigger takes the per-person advisory lock the team
+  change takes (migration `0026`). Tests: `the_cap_trigger_serialises_concurrent_writers`
+  (Postgres: the second writer waits and is refused; it fails with the lock removed),
+  `the_limits_hold_under_concurrent_requests` (both stores: 40 attempts at once give exactly 30;
+  20 concurrent adds give exactly 16 rows).
+- **Reserved names.** `persona-reserved` (error) for a key or display name that reads as one of
+  `RESERVED_NAMES`. Test: `persona_reserved`.
+
+**Departures** from this spec and the reviewer's file:
+
+1. **Previews, not `offered: false`.** The reviewer asked for the three bots to be withdrawn
+   until their benchmark passes; the owner decided on 2026-11-21 to offer them as Previews.
+2. **Where the benchmark rule runs.** Only `pmos lint` from the command line (CI) reads the
+   reports; the services, `pmos policy generate` and the content admin's validation don't check
+   it (`LintOptions::benchmarked` is `None`). "Passing" is D10's "Done when": every category that
+   names the persona met its bar two weeks in a row; a category that doesn't load counts against
+   it, and a missing `evals/` benchmarks nothing. `pmos` (`crates/cli`) now depends on `pmos-evals`.
+3. **"Untrusted data" and "Hard limits" were not in `pm-assistant`.** Each persona role had its
+   own wording, so "match the base text" had no base. M1 adds both sections to `pm-assistant`
+   (one wording for all four bots, so **Nudge's instructions change too**), copies them into the
+   three persona roles, and moves each persona's own limits to a "Your own limits" section. A
+   standing heading may appear once; a persona role may not carry one the base lacks.
+4. **The unlisted-write rule covers the always-on persona's role** (`pm-assistant`) in the lint.
+   At the tool server the `never` default applies to persona sessions; a Nudge session keeps
+   the role fallback, which the lint makes moot by requiring `pm-assistant` to list its writes.
+   "Drafts" on the card now uses the strict setting.
+5. **The notice is a field, applied to Confluence pages only.** `draft-notice` is generic (any
+   persona may have one; only Echo does); Jira issues and Slack replies are internal and don't
+   carry it. It is prepended when the body doesn't contain the sentence. A PM's saved edit that
+   drops it is shown without it until the write runs, which adds it back. Echo's reused skills
+   (`release-notes` and the others it shares with Nudge) are not edited, since Nudge runs them too:
+   Echo's role and the tool server cover them.
+6. **The second review can't be enforced from the repository.** No `.github/CODEOWNERS` is
+   committed: the owners' GitHub handles aren't in the repository, and a line with no valid owner
+   protects nothing. **Until the owner sets the GitHub settings in `policies/README.md`, a
+   persona-instruction change can merge with one reviewer.**
+7. **Holds.** A release is per item and permanent; an Admin is a person holding `edit-content`
+   (the people who may change the catalog). Saving an edit of a held draft's text (`PUT
+   …/draft`) is still allowed; deciding it is not. The hold is checked before the decision, not
+   in the same statement: a re-offer or a release in between can only loosen it. pmos-web and
+   the Slack bot pass `409 held` on as they pass other `409`s; their own wording and a "held"
+   badge are W1, F3 and S1's (not built here).
+8. **The hourly limit stays in process memory**, checked and counted under one lock: it holds
+   for concurrent requests to one tool server, not across replicas or a restart (as B1 said).
+9. **People's names are shown, not refused.** The lint can't see the user database; the admin
+   view's `name_clashes` lists users whose handle or display name reads as a persona's key or
+   display name, and the tool server logs a warning.
+10. **The strict session body answers `422`** (the JSON extractor's refusal), not `400`.
+11. **Migration `0026`** (0025 is reserved for another slice).
+
+**Not in M1** (the reviewer's other points): per-PM restrictions (R1 already keeps the PM's
+`BOT.md` body for a persona); D12's change (recorded in `docs/bot-decisions.md`); the routines
+`PATCH` team check (R2); "inherits from the thread's latest task: whose task"; the memory note
+(unverified, as the reviewer said).
+
+**Not verified**: the GitHub settings (not set; CI on the account doesn't start jobs); any eval
+run (none has happened, so no bot is benchmarked and nothing is claimed about quality); pmos-web,
+Slack and the web app showing `preview` or `held` (not built); the hourly limit across replicas.
 
 ### Order and parallelism
 

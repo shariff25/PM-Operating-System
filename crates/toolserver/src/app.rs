@@ -635,7 +635,13 @@ async fn header_session(
 
 /// `{user, skill, run_id, ttl_minutes?, history_sensitivity?}` or
 /// `{user, bot, run_id, ttl_minutes?, history_sensitivity?, persona?}`.
+///
+/// Strict (the marketplace review): a field this server doesn't know is refused (`422`), never
+/// dropped, so a caller newer than this server (one that sends a field a later version adds)
+/// fails closed instead of getting a session without it, as a server before B1 would have
+/// dropped `persona` and run a Chief task with Nudge's tools.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NewSession {
     user: String,
     skill: Option<String>,
@@ -1140,6 +1146,12 @@ async fn decide(
             error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
         }
         Err(e @ DecisionError::NotAMember(_)) => error(StatusCode::FORBIDDEN, e.to_string()),
+        Err(e @ DecisionError::Held(_)) => coded(
+            StatusCode::CONFLICT,
+            crate::service::HELD,
+            e.to_string(),
+            json!({}),
+        ),
         Err(
             e @ (DecisionError::UnknownTool(_)
             | DecisionError::NotAllowed(_)
