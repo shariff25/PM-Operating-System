@@ -3,7 +3,7 @@ import { ApiError } from '../api';
 import type { Draft, Task } from '../api';
 import { messageOf, useApp } from '../app-context';
 import { identify } from '../bots';
-import { BotFace } from '../components/BotParts';
+import { BotFace, PreviewTag } from '../components/BotParts';
 import { Avatar, Empty, ErrorNote, Markdown, Skeleton, StrippedNote, SystemTag, kindSystem } from '../components/bits';
 import { Icon, Mark, kindIcon } from '../components/icons';
 import { PageBar } from '../components/Shell';
@@ -167,6 +167,7 @@ export function Thread({ id }: { id: string }) {
             {/* Which bot answered: from `persona` when the server says (an older one doesn't: PM OS). */}
             {who ? <BotFace mascot={who.mascot} size={24} /> : <Mark size={24} />}
             <span className="msg-who">{who ? who.name : copy.activity.bot}</span>
+            {who?.preview && <PreviewTag short />}
             <span className="msg-time">{relTime(task.updated_at)}</span>
           </div>
           <div className="msg-body">

@@ -221,7 +221,30 @@ pub(super) async fn viewer(
     tool: &str,
     any_of: &[Permission],
 ) -> Result<String, Box<Response>> {
-    viewer_marked(state, client, user, tool, any_of, false).await
+    viewer_marked(state, client, user, tool, any_of, false, None).await
+}
+
+/// [`viewer`], but an **allowed** read is recorded at most once per viewer per `window`
+/// (refusals always are): for a view the app reads on every page open, such as the admin's
+/// bots view, which the audit log's own page reads for its filter (gate-fix-4).
+pub(super) async fn viewer_coalesced(
+    state: &AppState,
+    client: Client,
+    user: Option<&str>,
+    tool: &'static str,
+    any_of: &[Permission],
+    window: chrono::Duration,
+) -> Result<String, Box<Response>> {
+    viewer_marked(
+        state,
+        client,
+        user,
+        tool,
+        any_of,
+        false,
+        Some((tool, window)),
+    )
+    .await
 }
 
 /// [`viewer`]; with `audit_read`, a read of the audit log: by a person holding Admin and
@@ -234,6 +257,7 @@ async fn viewer_marked(
     tool: &str,
     any_of: &[Permission],
     audit_read: bool,
+    coalesce: Option<(&'static str, chrono::Duration)>,
 ) -> Result<String, Box<Response>> {
     let Some(user) = user.map(str::trim).filter(|u| !u.is_empty()) else {
         return Err(Box::new(coded(
@@ -276,7 +300,11 @@ async fn viewer_marked(
         )));
     }
     let detail = dual.then_some(crate::users::detail::DUAL_ROLE);
-    record_with(state, client, user, tool, Outcome::Ok, detail).await;
+    let record_it = coalesce
+        .is_none_or(|(kind, window)| state.svc.first_in_window(kind, user, window, Utc::now()));
+    if record_it {
+        record_with(state, client, user, tool, Outcome::Ok, detail).await;
+    }
     Ok(user.to_string())
 }
 
@@ -471,10 +499,11 @@ async fn audit(
         Ok(query) => query,
         Err(why) => return coded(StatusCode::BAD_REQUEST, "bad_request", &why),
     };
-    let who = match viewer_marked(&state, client, q.user.as_deref(), tool, &[need], true).await {
-        Ok(who) => who,
-        Err(refused) => return *refused,
-    };
+    let who =
+        match viewer_marked(&state, client, q.user.as_deref(), tool, &[need], true, None).await {
+            Ok(who) => who,
+            Err(refused) => return *refused,
+        };
     // An Auditor (without Admin) sees one reason for every refused password step, and no
     // target, so the log can't tell them which sign-in names exist (L15). Admins see each.
     let admin_view = match state.svc.people().directory().await {

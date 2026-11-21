@@ -383,13 +383,18 @@ fn approval_head(item: &Value) -> Vec<Value> {
 }
 
 /// "Drafted by Chief", when a marketplace bot drafted the item: the name the Slack bot put on
-/// it from the persona catalog (`personas::annotate`), already safe `mrkdwn`. `None` for
-/// Nudge.
+/// it from the tool server's item (`personas::annotate`), already safe `mrkdwn`, followed by
+/// "· Preview: not yet benchmarked" on **every** card of a Preview bot (gate-fix-4, M1).
+/// `None` for Nudge.
 pub fn drafted_by(item: &Value) -> Option<String> {
-    item[crate::personas::DRAFTED_BY_FIELD]
+    let name = item[crate::personas::DRAFTED_BY_FIELD]
         .as_str()
-        .filter(|n| !n.trim().is_empty())
-        .map(|n| format!("Drafted by {n}"))
+        .filter(|n| !n.trim().is_empty())?;
+    Some(if item[crate::personas::DRAFTED_PREVIEW_FIELD] == true {
+        format!("Drafted by {name} · {}", crate::personas::PREVIEW_LABEL)
+    } else {
+        format!("Drafted by {name}")
+    })
 }
 
 /// A pending draft whose bot was withdrawn from the catalog is **held**

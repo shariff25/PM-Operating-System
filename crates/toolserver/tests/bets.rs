@@ -484,6 +484,7 @@ async fn a_bet_carries_its_sources_sensitivity(f: Fixture) {
                 model_alias: None,
                 sources_sensitivity: Sensitivity::Restricted,
                 persona: None,
+                draft_notice: None,
             },
             now(),
         )
@@ -707,6 +708,7 @@ async fn an_internal_failure_answers_a_generic_message() {
                 model_alias: None,
                 sources_sensitivity: Sensitivity::Internal,
                 persona: None,
+                draft_notice: None,
             },
             now(),
         )

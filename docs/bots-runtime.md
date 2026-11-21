@@ -209,6 +209,15 @@ for a persona). The tool server decides the team:
   isn't on your team any more. Add it on the Bots page in PM OS, or ask Nudge."). For a
   routine's run with either of the first two codes, the routine is paused (disabled, no next
   run) and the task's error and DM read "Your routine is paused: <sentence>."
+- **Repeats from Slack are bounded** (gate-fix-4). The runtime can't read a team (only
+  `pmos-web` may), so it can't check one when a task is created. Instead, once an interactive
+  task is refused at claim with `persona_not_on_team`, for two minutes
+  (`NOT_ON_TEAM_WINDOW`) a `source: slack` task of that requester running as that persona
+  (named or inherited) is refused at once, `400 {code: "persona_not_on_team"}`, with no task and
+  no claim; the Slack bot answers it with its own sentence. A `source: web` task naming the
+  persona clears the mark (pmos-web checked the team first). So at most one task and one claim
+  per person and bot per two minutes come from Slack for a bot not on the team. Kept in memory
+  (at most 10,000 marks): a restart forgets them.
 - A routine whose persona is withdrawn is paused at its next due run ("Your routine is
   paused: its bot Chief isn't offered in PM OS any more.").
 

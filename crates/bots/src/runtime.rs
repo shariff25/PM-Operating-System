@@ -110,7 +110,11 @@ impl From<PersonaRefusal> for Error {
 
 /// The persona codes on which a routine's run pauses the routine
 /// (`docs/bot-marketplace-spec.md` §6, the runtime's "Routines" row).
-const PAUSING_CODES: [&str; 2] = ["persona_not_on_team", "persona_unavailable"];
+const PAUSING_CODES: [&str; 2] = [NOT_ON_TEAM, "persona_unavailable"];
+
+/// The tool server's code for a persona not on the PM's team; also the runtime's `400` code
+/// for a Slack ask refused at once after one ([`NOT_ON_TEAM_WINDOW`]).
+pub const NOT_ON_TEAM: &str = "persona_not_on_team";
 
 fn refused(id: &str, r: Refused) -> Error {
     match r {
@@ -256,7 +260,22 @@ pub struct Runtime {
     changed: watch::Sender<u64>,
     /// Cancelled on shutdown: long-polls return at once and the loops stop.
     pub stop: CancellationToken,
+    /// When the tool server last refused a requester's interactive task at claim because the
+    /// persona isn't on their team, by (requester, persona): for
+    /// [`NOT_ON_TEAM_WINDOW`] a Slack ask of that bot by that person is refused at once,
+    /// with no task and no claim (gate-fix-4). The runtime can't read a team (only pmos-web
+    /// may), so this is the bound: at most one task and one claim per person and bot per
+    /// window from Slack. In memory, at most [`NOT_ON_TEAM_MARKS`].
+    not_on_team: std::sync::Mutex<std::collections::HashMap<(String, String), Instant>>,
 }
+
+/// How long a not-on-team refusal at claim stands for a Slack ask of the same bot by the same
+/// person ([`Runtime::create_task_as`]). A web ask naming the bot clears it at once (pmos-web
+/// checked the team first), and it lapses by itself, so adding the bot in the web app works
+/// from Slack within this.
+pub const NOT_ON_TEAM_WINDOW: Duration = Duration::from_secs(120);
+/// The most (person, bot) marks kept.
+pub const NOT_ON_TEAM_MARKS: usize = 10_000;
 
 fn trimmed(s: &str) -> String {
     s.trim().to_string()
@@ -284,7 +303,33 @@ impl Runtime {
             gateway,
             changed: watch::channel(0).0,
             stop,
+            not_on_team: std::sync::Mutex::default(),
         }
+    }
+
+    /// Is `persona` marked not on `requester`'s team (refused at claim within
+    /// [`NOT_ON_TEAM_WINDOW`])?
+    fn marked_not_on_team(&self, requester: &str, persona: &str) -> bool {
+        let marks = self.not_on_team.lock().expect("not on team lock");
+        marks
+            .get(&(requester.to_string(), persona.to_string()))
+            .is_some_and(|at| at.elapsed() < NOT_ON_TEAM_WINDOW)
+    }
+
+    fn mark_not_on_team(&self, requester: &str, persona: &str, on: bool) {
+        let mut marks = self.not_on_team.lock().expect("not on team lock");
+        let key = (requester.to_string(), persona.to_string());
+        if !on {
+            marks.remove(&key);
+            return;
+        }
+        if marks.len() >= NOT_ON_TEAM_MARKS {
+            marks.retain(|_, at| at.elapsed() < NOT_ON_TEAM_WINDOW);
+            if marks.len() >= NOT_ON_TEAM_MARKS {
+                return;
+            }
+        }
+        marks.insert(key, Instant::now());
     }
 
     /// The catalog as it is now.
@@ -411,6 +456,19 @@ impl Runtime {
             // stays with Chief). Not checked here: the claim checks it as for any persona.
             None => self.store.thread_persona(&task).await?,
         };
+        if let Some(key) = task.persona.as_deref() {
+            if task.source == Source::Slack && self.marked_not_on_team(&task.requested_by, key) {
+                // Refused at claim moments ago: say so now, with no task and no claim.
+                return Err(Error::BadRequestCode {
+                    code: NOT_ON_TEAM,
+                    message: format!("`{key}` isn't on this person's team (the tool server refused it moments ago); add it in the web app first"),
+                });
+            }
+            if task.source == Source::Web {
+                // pmos-web checked the team before it asked.
+                self.mark_not_on_team(&task.requested_by, key, false);
+            }
+        }
         self.store.create_task(&task, "queued").await?;
         tracing::info!(task = %task.id, bot = %task.bot, source = %task.source, persona = task.persona.as_deref().unwrap_or(model::NUDGE), "task queued");
         self.bump();
@@ -608,6 +666,11 @@ impl Runtime {
         now: DateTime<Utc>,
     ) -> Result<()> {
         tracing::info!(task = %task.id, %code, "persona refused at claim");
+        if let (NOT_ON_TEAM, None, Some(key)) =
+            (code, task.routine_id.as_deref(), task.persona.as_deref())
+        {
+            self.mark_not_on_team(&task.requested_by, key, true);
+        }
         let mut reason = sentence.trim().to_string();
         if let Some(id) = task.routine_id.as_deref() {
             if PAUSING_CODES.contains(&code) {

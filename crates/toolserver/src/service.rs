@@ -498,7 +498,15 @@ pub struct ToolService {
     /// Team changes by person in the last hour, for [`crate::team::CHANGES_PER_HOUR`]. In
     /// memory: a restart starts every count again.
     team_changes: Mutex<HashMap<String, std::collections::VecDeque<DateTime<Utc>>>>,
+    /// When an audit row was last written for a repeated record (a person's refused team
+    /// change over the hourly limit; an admin's read of the bots view), by (kind, person): one
+    /// row per window instead of one per call (gate-fix-4). In memory, at most
+    /// [`QUIET_MARKS`] entries.
+    quiet_marks: Mutex<HashMap<(&'static str, String), DateTime<Utc>>>,
 }
+
+/// The most (kind, person) marks [`ToolService::first_in_window`] keeps.
+pub const QUIET_MARKS: usize = 10_000;
 
 /// The most audience results kept in memory; past it the oldest are forgotten all at once.
 const MAX_AUDIENCES: usize = 10_000;
@@ -551,6 +559,7 @@ impl ToolService {
             audit_retention_days: crate::audit::MIN_RETENTION_DAYS,
             passwords: None,
             team_changes: Mutex::default(),
+            quiet_marks: Mutex::default(),
         })
     }
 
@@ -1556,11 +1565,17 @@ impl ToolService {
         }
         let content_sha = self.content_sha();
         let model = self.policy(session).map(|p| model_alias(p.model));
+        // Stored on the item, so an edit and the approved write keep it however the persona's
+        // file changes (gate-fix-4). Pages only: other writes never carry it.
+        let notice = self
+            .persona_notice(session.persona.as_deref())
+            .filter(|_| pmos_contract::personas::NOTICE_TOOLS.contains(&spec.name.as_str()));
         let new = NewItem {
             user: &session.user,
             skill: session.skill.as_deref(),
             bot: session.bot.as_deref(),
             persona: session.persona.as_deref(),
+            draft_notice: notice.as_deref(),
             run_id: &session.run_id,
             tool: &spec.name,
             args,
@@ -1617,12 +1632,75 @@ impl ToolService {
     /// when a persona's draft is recorded and again when it is written, so neither the model
     /// nor a later edit can leave it out.
     fn with_persona_notice(&self, persona: Option<&str>, tool: &str, args: &Value) -> Value {
-        let roster = self.roster();
-        let notice = persona
-            .and_then(|key| roster.persona(key))
-            .and_then(|p| p.draft_notice.clone());
-        match notice {
+        match self.persona_notice(persona) {
             Some(notice) => with_draft_notice(tool, args, &notice),
+            None => args.clone(),
+        }
+    }
+
+    /// Whether a repeated record of `kind` for `person` at `now` is the first in its `window`
+    /// (and so gets an audit row). Marks older than their window are dropped as the map fills.
+    pub fn first_in_window(
+        &self,
+        kind: &'static str,
+        person: &str,
+        window: Duration,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let mut marks = self.quiet_marks.lock().expect("quiet marks lock");
+        let key = (kind, person.to_string());
+        if marks.get(&key).is_some_and(|at| now - *at < window) {
+            return false;
+        }
+        if marks.len() >= QUIET_MARKS {
+            marks.retain(|_, at| now - *at < window);
+            if marks.len() >= QUIET_MARKS {
+                // Still full of live marks: record rather than forget.
+                return true;
+            }
+        }
+        marks.insert(key, now);
+        true
+    }
+
+    /// The keys of the personas offered now: what a hold is checked against.
+    pub fn offered_keys(&self) -> Arc<std::collections::BTreeSet<String>> {
+        let roster = self.roster();
+        Arc::new(
+            roster
+                .personas()
+                .filter(|p| roster.offered(&p.name).is_some())
+                .map(|p| p.name.clone())
+                .collect(),
+        )
+    }
+
+    /// The name a held draft's refusal gives its bot.
+    pub fn held_name(&self, persona: Option<&str>) -> String {
+        persona
+            .and_then(|k| self.roster().persona(k).map(|p| p.display_name.clone()))
+            .unwrap_or_else(|| "The bot that drafted this".to_string())
+    }
+
+    /// The draft notice of `persona` in the catalog now, if it has one.
+    fn persona_notice(&self, persona: Option<&str>) -> Option<String> {
+        let roster = self.roster();
+        persona
+            .and_then(|key| roster.persona(key))
+            .and_then(|p| p.draft_notice.clone())
+    }
+
+    /// `args` for `item` with its draft notice first: the one stored on the item when it was
+    /// drafted, else (an item from before it was stored) its persona's notice now. A saved
+    /// edit and the approved write both go through here, so neither can drop it, even once the
+    /// persona's file is gone.
+    fn with_item_notice(&self, item: &ApprovalItem, args: &Value) -> Value {
+        let notice = item
+            .draft_notice
+            .clone()
+            .or_else(|| self.persona_notice(item.persona.as_deref()));
+        match notice {
+            Some(notice) => with_draft_notice(&item.tool, args, &notice),
             None => args.clone(),
         }
     }
@@ -1923,6 +2001,32 @@ impl ToolService {
         // A person changed the bot's text (a saved edit, or an edit decision): `args` are
         // theirs. The bot's own arguments are never served.
         v["edited"] = json!(item.edited());
+        // Who drafted it, for a card that names the bot (gate-fix-4): the persona's display
+        // name and whether it is a Preview, from the catalog in force here, so the Slack bot
+        // never words "Drafted by" from its own copy. `persona_name` is `null` for a persona no
+        // longer offered. Nudge's items carry neither.
+        if let Some(key) = item.persona.as_deref() {
+            let roster = self.roster();
+            let offered = roster.offered(key).map(|(p, _)| p);
+            // A bot named like a colleague (`name_clashes` in the admin view) is marked as a
+            // bot where a card names it, so "Drafted by Ana" can't read as a person's work.
+            let name = offered.as_ref().map(|p| {
+                let clash = self.people.snapshot().is_some_and(|dir| {
+                    dir.users.values().any(|u| {
+                        pmos_contract::personas::reads_as(&p.display_name, &u.handle)
+                            || pmos_contract::personas::reads_as(&p.display_name, &u.display_name)
+                    })
+                });
+                if clash {
+                    format!("{} (bot)", p.display_name)
+                } else {
+                    p.display_name.clone()
+                }
+            });
+            v["persona_name"] = json!(name);
+            v["persona_preview"] =
+                json!(offered.as_ref().is_some_and(|p| team::shown_as_preview(p)));
+        }
         v
     }
 
@@ -2329,6 +2433,10 @@ impl ToolService {
             }
         }
 
+        // The hold again, inside the decision (gate-fix-4): the store refuses an approve or an
+        // edit of a held item under the same lock as the decision, so nothing between the
+        // check above and here (the Slack audience lookup included) can let one through.
+        let verdict = verdict.holding(self.offered_keys());
         let item = match self
             .stores
             .approvals
@@ -2336,6 +2444,15 @@ impl ToolService {
             .await
         {
             Ok(item) => item,
+            Err(DecideError::Held) => {
+                let item = self.stores.approvals.get(id).await?;
+                if let Some(item) = &item {
+                    self.audit(denied(item.clone(), HELD_DECISION)).await;
+                }
+                return Err(DecisionError::Held(
+                    self.held_name(item.as_ref().and_then(|i| i.persona.as_deref())),
+                ));
+            }
             Err(e) => {
                 if e == DecideError::Forbidden {
                     if let Ok(Some(item)) = self.stores.approvals.get(id).await {
@@ -2500,11 +2617,33 @@ impl ToolService {
             }
         };
         let before = current.sources_sensitivity;
-        let item = self
+        // The draft notice stays first in a saved edit too (gate-fix-4): from the item, so a
+        // persona file that is gone or changed can't drop it.
+        let args = self.with_item_notice(&current, &args);
+        // A held draft can't be edited (`held`'s rule): checked by the store under the same
+        // lock as the save.
+        let offered = self.offered_keys();
+        let item = match self
             .stores
             .approvals
-            .save_draft(id, user, args, raise_to, now)
-            .await?;
+            .save_draft_held(id, user, args, raise_to, Some(&offered), now)
+            .await
+        {
+            Ok(item) => item,
+            Err(DecideError::Held) => {
+                self.audit(event(
+                    &current,
+                    Outcome::Denied,
+                    current.args_hash.clone(),
+                    Some(HELD_DECISION.to_string()),
+                ))
+                .await;
+                return Err(DecisionError::Held(
+                    self.held_name(current.persona.as_deref()),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let detail = (revision.is_some()).then(|| {
             let level = |s: Option<Sensitivity>| {
                 s.map_or_else(|| "unrecorded".to_string(), |s| s.to_string())
@@ -2784,8 +2923,9 @@ impl ToolService {
         // counts as restricted, as the audience check counts it.
         let writer = item.bot.as_deref().or(item.skill.as_deref());
         let sensitivity = item.sources_sensitivity.unwrap_or(Sensitivity::Restricted);
-        // The persona's draft notice survives an edit that dropped it.
-        let args = self.with_persona_notice(item.persona.as_deref(), &item.tool, &item.args);
+        // The draft notice stored on the item survives an edit that dropped it, and a persona
+        // file that is gone.
+        let args = self.with_item_notice(&item, &item.args);
         let result = self
             .execute_write(
                 Caller::new(&item.user, &item.run_id),
@@ -2878,4 +3018,7 @@ pub(crate) fn display_name(dir: Option<&crate::users::Directory>, handle: &str) 
 mod review;
 mod team;
 pub use review::{About, ReviewError, ReviewInbox};
-pub use team::{ReleaseRefusal, TeamRefusal, RELEASE_HOLD};
+pub use team::{
+    persona_json, shown_as_preview, ReleaseRefusal, TeamRefusal, PERSONAS_READ_WINDOW_MINUTES,
+    RELEASE_HOLD,
+};

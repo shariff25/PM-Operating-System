@@ -197,7 +197,9 @@ impl Catalog {
                 role: p.role.clone(),
                 mascot: p.mascot.clone(),
                 always_on: p.always_on,
-                preview: p.preview,
+                // Fail safe (gate-fix-4, M2): a Preview unless the content claims a benchmark
+                // (a claim `pmos lint` checks against the eval reports).
+                preview: pmos_contract::personas::is_preview(p.always_on, p.preview, p.benchmarked),
                 summary: p.summary.clone(),
                 examples: p.examples.clone(),
                 can_do: p.can_do.clone(),
