@@ -43,6 +43,8 @@ struct Call {
 struct Tools {
     calls: Mutex<Vec<Call>>,
     directory: support::FakeDirectory,
+    /// The bot marketplace's routes (the catalog, each PM's team), answered apart.
+    bots: support::FakeBots,
     /// A refusal the reviewer routes answer with, instead of success.
     refuse: Mutex<Option<(u16, String)>>,
     /// The recommendation's answer is lost (a `500`).
@@ -95,6 +97,9 @@ async fn toolserver(
     body: Bytes,
 ) -> Response {
     if let Some(res) = tools.directory.handle(&method, &uri, &body) {
+        return res;
+    }
+    if let Some(res) = tools.bots.handle(&method, &uri, &headers, &body) {
         return res;
     }
     tools.calls.lock().unwrap().push(Call {

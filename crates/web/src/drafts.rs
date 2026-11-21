@@ -78,6 +78,13 @@ pub struct DraftSummary {
     pub expires_at: Option<String>,
     pub task_id: Option<String>,
     pub practice: bool,
+    /// The marketplace bot (persona) that drafted it, by key; `null` is Nudge (the bot
+    /// marketplace, `docs/web-api.md`, "Bots"). See [`persona_key`].
+    pub persona: Option<String>,
+    /// Whether `persona` is offered in the catalog now: `true` for Nudge; `false` for a
+    /// withdrawn or deleted bot's key (the app says "A bot no longer offered"), and for any
+    /// key while the catalog can't be read. Set by the route (`app::bots::attribute`).
+    pub persona_offered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -734,8 +741,26 @@ pub fn summary(item: &Approval) -> Option<DraftSummary> {
         expires_at: expires_at(item),
         task_id: Some(item.run_id.clone()).filter(|r| r.starts_with("tsk_")),
         practice: false,
+        persona: persona_key(item.persona.as_deref()),
+        persona_offered: true,
     })
 }
+
+/// What an upstream's `persona` field is shown as: `None` (Nudge) for none or for `nudge`
+/// itself; the key when it is shaped like a persona name; otherwise [`UNKNOWN_PERSONA`], which
+/// the route marks not offered. Never the upstream's text as it came, when it isn't a key.
+pub fn persona_key(raw: Option<&str>) -> Option<String> {
+    match raw {
+        None => None,
+        Some(pmos_contract::personas::ALWAYS_ON) => None,
+        Some(k) if pmos_contract::bots::valid_name(k) => Some(k.to_string()),
+        Some(_) => Some(UNKNOWN_PERSONA.to_string()),
+    }
+}
+
+/// The key shown for a `persona` that isn't shaped like a persona name (no upstream sends
+/// one: the tool server's and the runtime's columns check the shape). Never offered.
+pub const UNKNOWN_PERSONA: &str = "unknown";
 
 /// A body for display: if it has no real line break at all but does contain the two
 /// characters `\` `n`, the model wrote its line breaks as JSON escapes (a whole draft on one
@@ -902,6 +927,8 @@ pub fn practice_draft(p: &PracticeDraft, bot: &str, state: &UserState) -> Draft 
             expires_at: None,
             task_id: None,
             practice: true,
+            persona: None,
+            persona_offered: true,
         },
         body: edit
             .map(|e| cite::strip(&e.body))

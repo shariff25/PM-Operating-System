@@ -289,6 +289,7 @@ fn busy_state() -> impl FnOnce(&mut UserState) + Send {
         });
         st.external.insert("apr_2".into());
         st.revision_tasks.insert("tsk_1".into());
+        st.ask_persona = Some("chief".into());
     }
 }
 
@@ -300,6 +301,7 @@ async fn settings_keep_each_pms_state_apart(s: &Stores) {
         .await
         .unwrap();
     assert!(!ana.nudges && !ana.mascot && ana.opened_a_draft && ana.edits.len() == 2);
+    assert_eq!(ana.ask_persona.as_deref(), Some("chief"));
     assert_eq!(s.settings.get("ana").await.unwrap(), ana);
     // Ben has none of it.
     assert_eq!(s.settings.get("ben").await.unwrap(), UserState::default());

@@ -124,6 +124,8 @@ struct Mock {
     sign_ins: Mutex<Vec<Call>>,
     /// The user database's routes (who is signed in, with which roles).
     directory: support::FakeDirectory,
+    /// The bot marketplace's routes (the catalog, each PM's team), answered apart.
+    bots: support::FakeBots,
 }
 
 impl Mock {
@@ -171,6 +173,9 @@ async fn toolserver(
     body: Bytes,
 ) -> Response {
     if let Some(res) = m.directory.handle(&method, &uri, &body) {
+        return res;
+    }
+    if let Some(res) = m.bots.handle(&method, &uri, &headers, &body) {
         return res;
     }
     let c = call(&method, &uri, &headers, &body);
