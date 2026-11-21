@@ -185,7 +185,8 @@ pub struct SetupCode {
     /// Passwords set with it, across its tokens (at most
     /// `limits::SETUP_PASSWORD_SETS_PER_CODE`).
     pub password_sets: i32,
-    /// Wrong codes tried against it (void at `limits::SETUP_WRONG_GUESSES_PER_CODE`).
+    /// Wrong codes tried at its person while it was live: a plain count, which decides nothing
+    /// (a wrong guess never voids a code: the gate review of 04c175f, G2).
     pub wrong_guesses: i32,
 }
 
@@ -198,13 +199,12 @@ impl SetupCode {
     }
 
     /// Its counters, to write back.
-    pub fn counts(&self, void: bool) -> CodeCounts {
+    pub fn counts(&self) -> CodeCounts {
         CodeCounts {
             id: self.id,
             begins: self.begins,
             password_sets: self.password_sets,
             wrong_guesses: self.wrong_guesses,
-            void,
         }
     }
 }
@@ -226,20 +226,14 @@ impl std::fmt::Debug for SetupCode {
     }
 }
 
-/// A live setup code's counters, written back by a plan; `void` revokes it as void (too many
-/// wrong guesses).
+/// A live setup code's counters, written back by a plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodeCounts {
     pub id: i64,
     pub begins: i32,
     pub password_sets: i32,
     pub wrong_guesses: i32,
-    pub void: bool,
 }
-
-/// How long a void code is kept for the admin overview after it was voided (the overview's
-/// window).
-pub const VOIDED_KEPT_DAYS: i64 = 7;
 
 /// A code to issue (replacing the live one).
 #[derive(Clone, PartialEq, Eq)]
@@ -394,7 +388,7 @@ pub struct Writes {
     pub issue_code: Option<NewSetupCode>,
     /// Mark a setup code used.
     pub use_code: Option<i64>,
-    /// Write back the live setup code's counters (and void it).
+    /// Write back the live setup code's counters.
     pub code_counts: Option<CodeCounts>,
     /// Insert or replace these pending tokens (by hash).
     pub put_pending: Vec<Pending>,
@@ -492,19 +486,10 @@ pub struct ResetEntry {
     pub dismissed_at: Option<DateTime<Utc>>,
 }
 
-/// A setup code void after too many wrong guesses (M2): the admin issues a new one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VoidedCode {
-    pub handle: String,
-    pub at: DateTime<Utc>,
-    pub wrong_guesses: i32,
-}
-
 /// What the admin overview shows about passwords since a time.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PasswordOverview {
     pub resets: Vec<ResetEntry>,
-    pub voided: Vec<VoidedCode>,
 }
 
 /// Pair each reset with the first dismissal of its person's notice after it (and before the
@@ -543,8 +528,8 @@ pub trait PasswordStore: Send + Sync {
     /// may use the global limit's reserve, from the address alone (M3).
     async fn source_known(&self, source_key: &str, since: DateTime<Utc>) -> StoreResult<bool>;
 
-    /// Resets issued since `since` (with their dismissals) and setup codes voided since then,
-    /// by time, not from a window of recent rows (LF).
+    /// Resets issued since `since` (with their dismissals), by time, not from a window of
+    /// recent rows (LF).
     async fn password_overview(&self, since: DateTime<Utc>) -> StoreResult<PasswordOverview>;
 
     /// The handle whose sign-in name is `name` (lower-case), if any. No lock.

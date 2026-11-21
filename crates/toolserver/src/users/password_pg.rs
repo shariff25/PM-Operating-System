@@ -21,8 +21,7 @@ use crate::audit::AuditEvent;
 use crate::password::limits::{Counter, SourceCounters, FORGET_AFTER, KNOWN_SOURCE_DAYS};
 use crate::password::store::{
     pair_resets, CodeKind, Credential, PasswordOverview, PasswordStatus, PasswordStore, Pending,
-    Person, Plan, Purpose, RecoveryCode, ResetNotice, SetupCode, Snapshot, VoidedCode, Writes,
-    VOIDED_KEPT_DAYS,
+    Person, Plan, Purpose, RecoveryCode, ResetNotice, SetupCode, Snapshot, Writes,
 };
 use crate::pg::PgStore;
 use crate::store::{StoreError, StoreResult};
@@ -416,9 +415,7 @@ async fn write(
     if let Some(c) = &w.code_counts {
         sqlx::query(
             "UPDATE password_setup_codes
-                SET begins = $3, password_sets = $4, wrong_guesses = $5,
-                    revoked_at = CASE WHEN $6 THEN $7 ELSE revoked_at END,
-                    voided_at = CASE WHEN $6 THEN $7 ELSE voided_at END
+                SET begins = $3, password_sets = $4, wrong_guesses = $5
               WHERE id = $1 AND handle = $2 AND used_at IS NULL AND revoked_at IS NULL",
         )
         .bind(c.id)
@@ -426,8 +423,6 @@ async fn write(
         .bind(c.begins)
         .bind(c.password_sets)
         .bind(c.wrong_guesses)
-        .bind(c.void)
-        .bind(now)
         .execute(&mut *conn)
         .await?;
     }
@@ -596,25 +591,8 @@ impl PasswordStore for PgStore {
         .iter()
         .map(|r| Ok((r.try_get("target")?, r.try_get("at")?)))
         .collect::<StoreResult<Vec<(String, DateTime<Utc>)>>>()?;
-        let voided = sqlx::query(
-            "SELECT handle, voided_at, wrong_guesses FROM password_setup_codes
-             WHERE voided_at >= $1 ORDER BY voided_at DESC, id DESC",
-        )
-        .bind(since)
-        .fetch_all(self.pool())
-        .await?
-        .iter()
-        .map(|r| {
-            Ok(VoidedCode {
-                handle: r.try_get("handle")?,
-                at: r.try_get("voided_at")?,
-                wrong_guesses: r.try_get("wrong_guesses")?,
-            })
-        })
-        .collect::<StoreResult<Vec<VoidedCode>>>()?;
         Ok(PasswordOverview {
             resets: pair_resets(resets, &dismissals),
-            voided,
         })
     }
 
@@ -702,16 +680,13 @@ impl PasswordStore for PgStore {
             .execute(self.pool())
             .await?
             .rows_affected();
-        // A void code stays for the admin overview's window (M2).
-        let codes = sqlx::query(
-            "DELETE FROM password_setup_codes
-             WHERE expires_at <= $1 AND (voided_at IS NULL OR voided_at <= $2)",
-        )
-        .bind(now)
-        .bind(now - chrono::Duration::days(VOIDED_KEPT_DAYS))
-        .execute(self.pool())
-        .await?
-        .rows_affected();
+        // A code made void by wrong guesses before the gate review of 04c175f (G2: no code is
+        // voided any more) goes at its expiry like any other.
+        let codes = sqlx::query("DELETE FROM password_setup_codes WHERE expires_at <= $1")
+            .bind(now)
+            .execute(self.pool())
+            .await?
+            .rows_affected();
         // An address's counters with nothing left to remember: no failure in the last 24
         // hours, no wait, and no full sign-in in the last 30 days.
         let sources = sqlx::query(

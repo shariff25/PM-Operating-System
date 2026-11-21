@@ -358,7 +358,18 @@ async fn readyz(State(state): State<AppState>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(json!({ "ready": ok, "checks": body }))).into_response()
+    let mut answer = json!({ "ready": ok, "checks": body });
+    // Not readiness checks: plain counts since start-up for an operator, with password sign-in
+    // on (docs/password-sign-in.md, the gate review of 04c175f): wrong setup codes tried (G2;
+    // each is in the audit log too), and rehashes put off while the hashing allowance was full
+    // (GL2; each is done at a later correct sign-in).
+    if let Some(pw) = state.svc.passwords() {
+        answer["password"] = json!({
+            "setup_code_wrong_guesses": pw.setup_wrong_guesses(),
+            "rehashes_deferred": pw.rehashes_deferred(),
+        });
+    }
+    (status, Json(answer)).into_response()
 }
 
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
