@@ -12,14 +12,17 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use pmos_contract::bots::{Bot, BotScope, Role};
 use pmos_contract::model::valid_handle;
+use pmos_contract::personas::Persona;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::catalog::Catalog;
-use crate::clients::{valid_approval_id, ApprovalState, CallError, Gateway, TaskDraft, ToolServer};
+use crate::catalog::{Catalog, PersonaRefusal};
+use crate::clients::{
+    valid_approval_id, ApprovalState, CallError, Gateway, SessionGrant, TaskDraft, ToolServer,
+};
 use crate::model::{
     self, ApprovalOutcome, ChecklistItem, Draft, Level, MemberSettings, NewNotification,
     Notification, NotificationKind, Routine, Schedule, Sensitivity, SlackRef, Source, Task,
@@ -62,6 +65,10 @@ pub const TRUNCATED: &str = "… [truncated]";
 pub enum Error {
     #[error("{0}")]
     BadRequest(String),
+    /// A `400` with a code a client can act on (`unknown_persona`,
+    /// `persona_needs_personal_bot`, `bad_request`): `{code, error}`.
+    #[error("{message}")]
+    BadRequestCode { code: &'static str, message: String },
     #[error("{0}")]
     Forbidden(String),
     #[error("{0}")]
@@ -91,6 +98,19 @@ pub enum Error {
 pub const CURSOR_AHEAD: &str = "cursor_ahead";
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<PersonaRefusal> for Error {
+    fn from(r: PersonaRefusal) -> Self {
+        Error::BadRequestCode {
+            code: r.code(),
+            message: r.message().to_string(),
+        }
+    }
+}
+
+/// The persona codes on which a routine's run pauses the routine
+/// (`docs/bot-marketplace-spec.md` §6, the runtime's "Routines" row).
+const PAUSING_CODES: [&str; 2] = ["persona_not_on_team", "persona_unavailable"];
 
 fn refused(id: &str, r: Refused) -> Error {
     match r {
@@ -130,6 +150,16 @@ pub struct NewTask {
     pub sensitivity_floor: Option<Sensitivity>,
 }
 
+/// The persona a claim runs as, for the worker's system prompt (`docs/bot-marketplace-spec.md`
+/// §6, "The harness"). Catalog text, reviewed by pull request and checked by the lint's
+/// character rules; the worker checks it again before using it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClaimPersona {
+    pub key: String,
+    pub display_name: String,
+    pub title: String,
+}
+
 /// What the harness needs to call the gateway for this task: the bot's model role and the
 /// headers that put each call in the right queue and usage line.
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +186,10 @@ pub struct Claim {
     /// server already started the session at it (the worker can't lower it); it is here so
     /// the worker can tell the model the earlier answers drew on restricted sources.
     pub history_sensitivity: Option<Sensitivity>,
+    /// The persona the task runs as; absent for Nudge. `role` is then the persona's role
+    /// (its skills, model class and instructions) and `tools` the persona session's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona: Option<ClaimPersona>,
 }
 
 /// The session token never reaches a log through `Debug`.
@@ -169,6 +203,7 @@ impl std::fmt::Debug for Claim {
             .field("level", &self.level)
             .field("history", &self.history.len())
             .field("history_sensitivity", &self.history_sensitivity)
+            .field("persona", &self.persona.as_ref().map(|p| &p.key))
             .finish()
     }
 }
@@ -202,6 +237,9 @@ pub struct RoutineChange {
     pub enabled: Option<bool>,
     pub schedule: Option<Schedule>,
     pub prompt: Option<String>,
+    /// `Some(None)` (or `Some(Some("nudge"))`) moves the routine to Nudge; `Some(Some(key))`
+    /// to that persona.
+    pub persona: Option<Option<String>>,
 }
 
 pub struct Runtime {
@@ -311,7 +349,20 @@ impl Runtime {
             .ok_or_else(|| Error::NotFound(format!("there's no bot called `{name}`")))
     }
 
+    /// A task that names no persona: Nudge, or the thread's persona in a thread.
     pub async fn create_task(&self, new: NewTask, now: DateTime<Utc>) -> Result<Task> {
+        self.create_task_as(new, None, now).await
+    }
+
+    /// A task asking `persona` as the client named it: `Some("nudge")` is Nudge, named
+    /// (stored as `None`, and not inherited); `None` names none, so a task in a thread takes
+    /// the persona of the thread's latest task (`docs/bot-marketplace-spec.md` §6).
+    pub async fn create_task_as(
+        &self,
+        new: NewTask,
+        persona: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<Task> {
         if !valid_handle(&new.requested_by) {
             return Err(Error::BadRequest(format!(
                 "`{}` isn't a PM OS handle",
@@ -336,6 +387,12 @@ impl Runtime {
         // Queued on a snapshot up to 5 minutes old (spec §2): the task can't run without a
         // tool server session, which decides afresh and fails closed.
         self.may_ask(self.people.for_queueing_ask(), &new.requested_by, &bot)?;
+        // A named persona must exist, be offered and suit the bot. Whether it is on the PM's
+        // team is the tool server's decision, at claim: one place decides it.
+        let named = match persona {
+            Some(key) => Some(self.catalog().check_persona(&bot, key)?),
+            None => None,
+        };
         let mut task = Task::queued(
             &bot.name,
             &new.requested_by,
@@ -348,8 +405,14 @@ impl Runtime {
         task.level = new.level;
         task.conversation = new.conversation;
         task.sources_sensitivity = new.sensitivity_floor;
+        task.persona = match named {
+            Some(persona) => persona,
+            // Naming none in a thread keeps the thread's bot (a Slack reply in Chief's thread
+            // stays with Chief). Not checked here: the claim checks it as for any persona.
+            None => self.store.thread_persona(&task).await?,
+        };
         self.store.create_task(&task, "queued").await?;
-        tracing::info!(task = %task.id, bot = %task.bot, source = %task.source, "task queued");
+        tracing::info!(task = %task.id, bot = %task.bot, source = %task.source, persona = task.persona.as_deref().unwrap_or(model::NUDGE), "task queued");
         self.bump();
         Ok(task)
     }
@@ -417,11 +480,26 @@ impl Runtime {
             let found = catalog
                 .bot(&task.bot)
                 .and_then(|b| catalog.role(b).map(|r| (b, r)));
-            let Some((bot, role)) = found else {
+            let Some((bot, base_role)) = found else {
                 let reason = format!("the bot `{}` no longer exists", task.bot);
                 self.fail_claimed(&task, worker, &reason, now).await?;
                 continue;
             };
+            // A persona task runs as the persona's role. Checked here against the catalog as
+            // it is now (a queued task whose bot was withdrawn meanwhile fails), and again by
+            // the tool server, which also checks the PM's team.
+            let persona = match task.persona.as_deref() {
+                None => None,
+                Some(key) => match claim_persona(&catalog, bot, key) {
+                    Ok(found) => Some(found),
+                    Err((code, sentence)) => {
+                        self.refuse_persona(&task, worker, code, &sentence, now)
+                            .await?;
+                        continue;
+                    }
+                },
+            };
+            let role = persona.map_or(base_role, |(_, role)| role);
             // The history first: its level is where the session starts (W6).
             let (history, history_sensitivity) = self.history(&task, now).await;
             // A task not yet finished carries in `sources_sensitivity` only its own floor
@@ -429,10 +507,33 @@ impl Runtime {
             let floor = history_sensitivity.max(task.sources_sensitivity);
             match self
                 .toolserver
-                .create_session(&task.requested_by, &bot.name, &task.id, floor)
+                .create_session(
+                    &task.requested_by,
+                    &bot.name,
+                    &task.id,
+                    floor,
+                    task.persona.as_deref(),
+                )
                 .await
             {
-                Ok(session_token) => {
+                Ok(grant) => {
+                    // The tool server must say it runs the persona that was asked, as the same
+                    // role: an older tool server that ignores `persona` would otherwise run a
+                    // Chief task as Nudge, silently.
+                    if let Err(why) = grant_matches(&grant, persona.map(|(p, _)| p)) {
+                        tracing::warn!(task = %task.id, "the tool server's session doesn't match the task's persona; revoking it");
+                        self.toolserver.revoke_session(&grant.token).await;
+                        self.fail_claimed(&task, worker, &why, now).await?;
+                        continue;
+                    }
+                    let tools: Vec<String> = match persona {
+                        None => catalog.tools(bot).into_iter().collect(),
+                        Some((p, _)) => match &grant.tools {
+                            Some(names) => registry_names(&catalog, names),
+                            None => catalog.persona_tools(bot, p).into_iter().collect(),
+                        },
+                    };
+                    let session_token = grant.token;
                     let level = self.claim_level(&task).await;
                     tracing::info!(task = %task.id, bot = %bot.name, %worker, attempt = task.attempts, %level, turns = history.len(), "task claimed");
                     let mut headers = serde_json::Map::new();
@@ -444,7 +545,7 @@ impl Runtime {
                         .and_then(|v| v.as_str().map(str::to_string))
                         .unwrap_or_else(|| "default".into());
                     return Ok(Some(Claim {
-                        tools: catalog.tools(bot).into_iter().collect(),
+                        tools,
                         bot: bot.clone(),
                         role: role.clone(),
                         session_token,
@@ -456,8 +557,17 @@ impl Runtime {
                         level,
                         history,
                         history_sensitivity,
+                        persona: persona.map(|(p, _)| ClaimPersona {
+                            key: p.name.clone(),
+                            display_name: p.display_name.clone(),
+                            title: p.title.clone(),
+                        }),
                         task,
                     }));
+                }
+                Err(CallError::PersonaRefused { code, message }) => {
+                    self.refuse_persona(&task, worker, &code, &message, now)
+                        .await?;
                 }
                 Err(CallError::Refused(why)) => {
                     let reason =
@@ -484,6 +594,39 @@ impl Runtime {
                 }
             }
         }
+    }
+
+    /// Fail a claimed task whose persona was refused, with the sentence for the PM. A
+    /// routine's run refused because the persona is no longer on the PM's team or offered
+    /// pauses the routine, with the usual "paused" note (`docs/bot-marketplace-spec.md` §6).
+    async fn refuse_persona(
+        &self,
+        task: &Task,
+        worker: &str,
+        code: &str,
+        sentence: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        tracing::info!(task = %task.id, %code, "persona refused at claim");
+        let mut reason = sentence.trim().to_string();
+        if let Some(id) = task.routine_id.as_deref() {
+            if PAUSING_CODES.contains(&code) {
+                if let Some(r) = self.store.routine(id).await? {
+                    if r.enabled {
+                        let paused = RoutinePatch {
+                            enabled: Some(false),
+                            next_run_at: Some(None),
+                            ..RoutinePatch::default()
+                        };
+                        self.store.update_routine(id, &paused, now).await?;
+                        tracing::info!(routine = %id, %code, "routine paused: its bot was refused");
+                        reason =
+                            format!("Your routine is paused: {}.", reason.trim_end_matches('.'));
+                    }
+                }
+            }
+        }
+        self.fail_claimed(task, worker, &reason, now).await
     }
 
     /// The level a claimed task runs at: its own, else its requester's setting, else
@@ -1012,7 +1155,11 @@ impl Runtime {
     }
 
     pub async fn create_routine(&self, draft: Draft, now: DateTime<Utc>) -> Result<Routine> {
-        self.bot_for(&draft.bot, &draft.owner)?;
+        let bot = self.bot_for(&draft.bot, &draft.owner)?;
+        let persona = match draft.persona.as_deref() {
+            Some(key) => self.catalog().check_persona(&bot, key)?,
+            None => None,
+        };
         if draft.approval != routines::APPROVAL {
             return Err(Error::BadRequest(
                 "a routine's approval setting is `approve` in v1: every outbound action waits for you".into(),
@@ -1048,6 +1195,7 @@ impl Runtime {
             prompt,
             output: draft.output,
             approval: draft.approval,
+            persona,
             next_run_at: Some(next),
             last_run_at: None,
             created_at: now,
@@ -1078,6 +1226,14 @@ impl Runtime {
             enabled: change.enabled,
             ..RoutinePatch::default()
         };
+        if let Some(persona) = change.persona {
+            patch.persona = Some(match persona.as_deref() {
+                None => None,
+                Some(key) => self
+                    .catalog()
+                    .check_persona(&self.bot(&current.bot)?, key)?,
+            });
+        }
         if let Some(p) = change.prompt {
             let p = trimmed(&p);
             if p.is_empty() {
@@ -1149,6 +1305,17 @@ impl Runtime {
                 None => Some(format!("its bot `{}` no longer exists", r.bot)),
                 Some(bot) => people::may_ask(&people, &catalog, &r.owner, bot).err(),
             };
+            // A routine of a withdrawn (or deleted) persona pauses at its next run; whether
+            // the persona is still on the owner's team is the tool server's, at claim.
+            let problem = problem.or_else(|| {
+                let key = r.persona.as_deref()?;
+                catalog.offered_persona(key).is_none().then(|| {
+                    let name = catalog
+                        .persona(key)
+                        .map_or(key, |p| p.display_name.as_str());
+                    format!("its bot {name} isn't offered in PM OS any more")
+                })
+            });
             let next = routines::next_run(&r.schedule, now);
             let problem = problem.or_else(|| next.as_ref().err().cloned());
             let run = match problem {
@@ -1156,15 +1323,18 @@ impl Runtime {
                     routine_id: r.id.clone(),
                     due_at,
                     next_run_at: next.ok(),
-                    task: Task::queued(
-                        &r.bot,
-                        &r.owner,
-                        Source::Routine,
-                        &r.prompt,
-                        None,
-                        Some(r.id.clone()),
-                        now,
-                    ),
+                    task: Task {
+                        persona: r.persona.clone(),
+                        ..Task::queued(
+                            &r.bot,
+                            &r.owner,
+                            Source::Routine,
+                            &r.prompt,
+                            None,
+                            Some(r.id.clone()),
+                            now,
+                        )
+                    },
                     event: "queued by its routine".into(),
                     notify: None,
                 },
@@ -1365,6 +1535,7 @@ fn paused_run(r: &Routine, due_at: DateTime<Utc>, problem: &str, now: DateTime<U
     );
     task.status = TaskStatus::Failed;
     task.error = Some(reason.clone());
+    task.persona = r.persona.clone();
     RoutineRun {
         routine_id: r.id.clone(),
         due_at,
@@ -1373,6 +1544,75 @@ fn paused_run(r: &Routine, due_at: DateTime<Utc>, problem: &str, now: DateTime<U
         event: format!("failed: {reason}"),
         notify: Some(NewNotification::new(NotificationKind::Failed, reason)),
     }
+}
+
+/// A persona refused at claim: the code, and the sentence for the PM.
+type ClaimRefusal = (&'static str, String);
+
+/// The persona `key` a claimed task of `bot` runs as, and its role, from the catalog as it is
+/// now; or the refusal code and the sentence for the PM, worded as the tool server words its
+/// own (`docs/toolserver.md`, "Personas and teams").
+fn claim_persona<'c>(
+    catalog: &'c Catalog,
+    bot: &Bot,
+    key: &str,
+) -> std::result::Result<(&'c Persona, &'c Role), ClaimRefusal> {
+    let name = catalog
+        .persona(key)
+        .map_or_else(|| format!("That bot ({key})"), |p| p.display_name.clone());
+    let unavailable = || {
+        (
+            "persona_unavailable",
+            format!("{name} isn't offered in PM OS any more. Ask Nudge instead."),
+        )
+    };
+    match catalog.check_persona(bot, key) {
+        Ok(_) => {}
+        Err(PersonaRefusal::NeedsPersonalBot(_)) => {
+            return Err((
+                "persona_needs_personal_bot",
+                format!("{name} runs only on your own PM OS bot. Ask Nudge instead."),
+            ))
+        }
+        Err(_) => return Err(unavailable()),
+    }
+    let persona = catalog.offered_persona(key).ok_or_else(unavailable)?;
+    let role = catalog.role_named(&persona.role).ok_or_else(unavailable)?;
+    Ok((persona, role))
+}
+
+/// Does the tool server's session run the persona the task asked (`persona`: `None` for
+/// Nudge), as the same role? If not, the sentence the task fails with: never a silent run as
+/// another bot.
+fn grant_matches(
+    grant: &SessionGrant,
+    persona: Option<&Persona>,
+) -> std::result::Result<(), String> {
+    match (persona, &grant.persona) {
+        (None, None) => Ok(()),
+        (Some(p), Some(g)) if g.key == p.name && g.role == p.role => Ok(()),
+        (Some(p), _) => Err(format!(
+            "PM OS couldn't start {name} for this request: the tool server didn't run it as {name}. A platform owner needs to check that the tool server and the bot runtime run the same version; Nudge can help meanwhile.",
+            name = p.display_name
+        )),
+        (None, Some(_)) => Err(
+            "PM OS couldn't start this request: the tool server ran it as another bot. A platform owner needs to check the tool server.".into(),
+        ),
+    }
+}
+
+/// The registry names (`jira.search`) of a session's tools given by harness name
+/// (`jira_search`), sorted. A name the registry doesn't have is left out.
+fn registry_names(catalog: &Catalog, harness: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = catalog
+        .registry()
+        .tools
+        .iter()
+        .filter(|t| harness.contains(&pmos_contract::model::harness_tool_name(&t.name)))
+        .map(|t| t.name.clone())
+        .collect();
+    names.sort();
+    names
 }
 
 /// "confluence.create_draft was approved by ana; slack.send_message was rejected by ana."

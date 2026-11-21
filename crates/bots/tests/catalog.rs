@@ -50,6 +50,38 @@ fn the_seeded_content_loads() {
     assert!(catalog.summaries().iter().any(|b| b.name == "docs"));
 }
 
+/// The marketplace bots load from `content/personas/` (`docs/bot-marketplace-spec.md` §6),
+/// and a change there is a catalog change.
+#[test]
+fn the_seeded_personas_load_and_are_watched() {
+    let catalog = Catalog::load(&content(), today()).unwrap();
+    let keys: Vec<String> = catalog
+        .persona_summaries()
+        .into_iter()
+        .map(|p| p.key)
+        .collect();
+    assert_eq!(keys.first().map(String::as_str), Some("nudge"));
+    for key in ["chief", "sprout", "echo"] {
+        assert!(keys.contains(&key.to_string()), "{key} in {keys:?}");
+    }
+    let chief = catalog.offered_persona("chief").unwrap();
+    assert_eq!(chief.role, "chief-of-staff");
+    assert!(catalog.role_named("chief-of-staff").is_some());
+    assert!(pmos_bots::catalog::WATCHED.contains(&"personas"));
+
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir(&content(), dir.path());
+    let before = fingerprint(dir.path());
+    let file = dir.path().join("personas/chief/PERSONA.md");
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(&file, text.replace("offered: true", "offered: false")).unwrap();
+    assert_ne!(
+        fingerprint(dir.path()),
+        before,
+        "withdrawing a persona reloads"
+    );
+}
+
 #[test]
 fn a_personal_bot_gets_its_roles_write_settings() {
     let dir = tempfile::tempdir().unwrap();

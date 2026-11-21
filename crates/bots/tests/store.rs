@@ -562,6 +562,7 @@ fn routine(owner: &str, minute: u32, next: Option<chrono::DateTime<chrono::Utc>>
         prompt: "Summarize #launch".into(),
         output: Output::dm(),
         approval: "approve".into(),
+        persona: None,
         next_run_at: next,
         last_run_at: None,
         created_at: created,
@@ -593,6 +594,7 @@ async fn routines_crud(store: Arc<dyn BotsStore>) {
                 }),
                 prompt: Some("New prompt".into()),
                 next_run_at: Some(None),
+                persona: Some(Some("chief".into())),
             },
             now,
         )
@@ -604,6 +606,7 @@ async fn routines_crud(store: Arc<dyn BotsStore>) {
     assert_eq!(patched.schedule.tz, "America/New_York");
     assert_eq!(patched.prompt, "New prompt");
     assert_eq!(patched.next_run_at, None);
+    assert_eq!(patched.persona.as_deref(), Some("chief"));
     assert_eq!(patched.updated_at, now);
     // An empty patch changes nothing but the time.
     let same = store

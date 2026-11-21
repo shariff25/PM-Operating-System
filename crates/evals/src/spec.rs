@@ -29,6 +29,10 @@ pub struct Category {
     /// The level every task runs at (`senior`, `staff` or `principal`), sent as the task's
     /// own `level`. `None`: the requester's setting in the runtime.
     pub level: Option<String>,
+    /// The marketplace bot (persona) every task asks, sent as the task's `persona`
+    /// (`docs/bot-marketplace-spec.md` §10). Only with `bot: personal`; `pmos-evals check` checks
+    /// the key against the content's catalog. `None`: Nudge.
+    pub persona: Option<String>,
     pub description: String,
     pub tasks: Vec<EvalTask>,
 }
@@ -44,6 +48,8 @@ struct CategoryFile {
     repeats: Option<u32>,
     #[serde(default)]
     level: Option<String>,
+    #[serde(default)]
+    persona: Option<String>,
     description: String,
 }
 
@@ -279,6 +285,18 @@ pub fn load_category(root: &Path, name: &str) -> Result<Category, SpecErrors> {
             ));
         }
     }
+    if let Some(persona) = &file.persona {
+        if !is_slug(persona) || persona.len() > 32 {
+            errors.push(format!(
+                "{shown}: `persona` `{persona}` is not a persona key (lowercase letters, digits and hyphens, at most 32)"
+            ));
+        }
+        if file.bot != PERSONAL_BOT {
+            errors.push(format!(
+                "{shown}: `persona` needs `bot: {PERSONAL_BOT}`; a marketplace bot runs only on a PM's personal bot"
+            ));
+        }
+    }
     if file.description.trim().is_empty() {
         errors.push(format!("{shown}: `description` is empty"));
     }
@@ -341,6 +359,9 @@ pub fn load_category(root: &Path, name: &str) -> Result<Category, SpecErrors> {
         pass_bar: file.pass_bar,
         repeats: file.repeats.unwrap_or(1).max(1),
         level: file.level,
+        persona: file
+            .persona
+            .filter(|p| p != pmos_contract::personas::ALWAYS_ON),
         description: file.description.trim().to_string(),
         tasks,
     })

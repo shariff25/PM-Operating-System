@@ -291,7 +291,10 @@ async fn load_test_reports_percentiles_against_targets() {
         "docs",
         "ana",
         &["ask".to_string()],
-        Some("staff"),
+        pmos_evals::run::AskAs {
+            level: Some("staff"),
+            persona: None,
+        },
         5,
         &follow,
     )
@@ -357,7 +360,7 @@ async fn load_test_counts_unfinished_tasks() {
         "docs",
         "ana",
         &["stuck".to_string(), "fine".to_string()],
-        None,
+        pmos_evals::run::AskAs::default(),
         4,
         &follow,
     )
@@ -563,5 +566,69 @@ async fn a_category_level_goes_on_every_task_and_check_reports_it() {
     assert!(
         stdout.contains("staff-craft: 2 tasks for bot `personal`, bar 100%, level staff"),
         "{stdout}"
+    );
+}
+
+/// A category that names a persona (`docs/bot-marketplace-spec.md` §10): every task the
+/// runner creates asks it, and `check` accepts an offered persona of the content and refuses
+/// an unknown one.
+#[tokio::test]
+async fn a_category_persona_goes_on_every_task_and_check_validates_it() {
+    let mock = Arc::new(Mock::default());
+    mock.script(
+        "q-one",
+        Script {
+            result: Some("Done.".into()),
+            ..Script::default()
+        },
+    );
+    let url = spawn(mock.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (a, ay) = task("t-one", "q-one", "  approvals: 0\n");
+    write_category(dir.path(), "chiefly", "personal", 1.0, &[(a.as_str(), ay)]);
+    let path = dir.path().join("categories/chiefly/category.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{yaml}persona: chief\n")).unwrap();
+    common::write_taxonomy(dir.path());
+    let category = load_category(dir.path(), "chiefly").unwrap();
+    assert_eq!(category.persona.as_deref(), Some("chief"));
+
+    let rt = Runtime::new(&url, TOKEN, None);
+    run_category(&rt, &url, &category, &opts(1500)).await;
+    let bodies = mock.created_bodies();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["persona"], "chief", "{bodies:?}");
+    assert_eq!(bodies[0]["bot"], "pm-ana");
+
+    let content = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../content");
+    let check = |root: std::path::PathBuf| {
+        let content = content.clone();
+        tokio::task::spawn_blocking(move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_pmos-evals"))
+                .arg("--root")
+                .arg(&root)
+                .arg("check")
+                .arg("--content")
+                .arg(&content)
+                .output()
+                .unwrap()
+        })
+    };
+    let out = check(dir.path().to_path_buf()).await.unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("as persona `chief`"), "{stdout}");
+
+    std::fs::write(&path, format!("{yaml}persona: quill\n")).unwrap();
+    let out = check(dir.path().to_path_buf()).await.unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`persona` `quill` is not a persona"),
+        "{stderr}"
     );
 }

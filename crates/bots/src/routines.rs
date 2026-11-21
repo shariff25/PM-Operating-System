@@ -182,6 +182,7 @@ pub fn read_reply(
         prompt: prompt.to_string(),
         output: Output::dm(),
         approval: APPROVAL.into(),
+        persona: None,
     })
 }
 
@@ -429,6 +430,7 @@ mod tests {
             prompt: prompt.into(),
             output: Output::dm(),
             approval: APPROVAL.into(),
+            persona: None,
         }
     }
 

@@ -8,7 +8,7 @@ use tokio::task::JoinSet;
 use crate::client::{status, Runtime};
 use crate::config::{LatencyTargets, Target};
 use crate::outcome::Outcome;
-use crate::run::{follow_task, Follow};
+use crate::run::{follow_turn, AskAs, Follow};
 
 /// The nearest-rank percentile: the smallest value with at least `p`% of the values at or
 /// below it. `None` for no values.
@@ -176,14 +176,14 @@ impl LoadResult {
     }
 }
 
-/// Send `n` tasks at once, the asks taken in turn from `asks`, each at `level` (the
-/// category's, if any), and follow them all.
+/// Send `n` tasks at once, the asks taken in turn from `asks`, each at `level` and as `persona`
+/// (the category's, if any), and follow them all.
 pub async fn run_load(
     rt: &Runtime,
     bot: &str,
     requested_by: &str,
     asks: &[String],
-    level: Option<&str>,
+    as_: AskAs<'_>,
     n: usize,
     follow: &Follow,
 ) -> LoadResult {
@@ -193,11 +193,24 @@ pub async fn run_load(
         let bot = bot.to_string();
         let who = requested_by.to_string();
         let ask = asks[i % asks.len()].clone();
-        let level = level.map(str::to_string);
+        let level = as_.level.map(str::to_string);
+        let persona = as_.persona.map(str::to_string);
         let follow = follow.clone();
-        set.spawn(
-            async move { follow_task(&rt, &bot, &who, &ask, level.as_deref(), &follow).await },
-        );
+        set.spawn(async move {
+            follow_turn(
+                &rt,
+                &bot,
+                &who,
+                &ask,
+                AskAs {
+                    level: level.as_deref(),
+                    persona: persona.as_deref(),
+                },
+                None,
+                &follow,
+            )
+            .await
+        });
     }
     let mut outcomes = Vec::with_capacity(n);
     while let Some(o) = set.join_next().await {
