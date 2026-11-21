@@ -51,6 +51,8 @@ pub struct PersonaSummary {
     pub role: String,
     pub mascot: String,
     pub always_on: bool,
+    /// Offered before its benchmark passed: shown as "Preview: not yet benchmarked".
+    pub preview: bool,
     pub summary: String,
     pub examples: Vec<String>,
     pub can_do: Vec<String>,
@@ -195,6 +197,7 @@ impl Catalog {
                 role: p.role.clone(),
                 mascot: p.mascot.clone(),
                 always_on: p.always_on,
+                preview: p.preview,
                 summary: p.summary.clone(),
                 examples: p.examples.clone(),
                 can_do: p.can_do.clone(),

@@ -260,6 +260,7 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/team/{handle}` | web token **and** a signed assertion for `handle`, in every mode | `Team`: the person's own team. See **Personas and teams** |
 | `PUT /internal/team/{handle}` `{add?, remove?, via}` | the same, and assertion `require` (else `503 assertion_required`) | Change one's own team, atomically. See **Personas and teams** |
 | `GET /internal/admin/personas?user=` | web token (assertion as on the admin reads) | `AdminPersonas`: who uses which bot. `view-audit-log` or `manage-members`. See **Personas and teams** |
+| `POST /internal/admin/personas/drafts/{id}/release?user=` | web token, a signed assertion for `user`, and assertion `require` | An Admin (`edit-content`) releases a draft held because its bot was withdrawn. See **Personas and teams** |
 | `GET /internal/reviews?user=`, `GET /internal/reviews/{id}?user=` | web token **and** a signed assertion for `user`, in every mode | A reviewer's inbox and one draft of a PM assigned to them; metadata only when restricted. See **Reviews** |
 | `POST /internal/reviews/{id}/recommendation?user=` `{verdict, note?, draft_revision, args_hash}` | the same, and assertion `require` (else `503 assertion_required`) | A reviewer's recommendation, bound to the version read (`409 draft_changed`). Never decides anything. See **Reviews** |
 
@@ -668,21 +669,42 @@ names `nudge`). What it may do, with `B` the personal role and `P` the persona's
 
 Every audit event of the session records `persona`; every approval item it drafts records it
 (`approvals.persona`, copied at creation, never changed: no route writes it and a trigger
-refuses an update). **Decisions are unchanged**: they check the item's bot and its own role,
-never the persona, so a draft stays the PM's and decidable after its persona leaves the team or
-the catalog; the decision's event records the item's `persona`. Sensitivity, the audience
-check, the owner-only rule and the reviewer rules are the same for every persona. Item views
-(`GET /internal/approvals…`, the reviewer's views, restricted metadata-only included) add
-`persona` (`null` is Nudge).
+refuses an update). **Decisions** check the item's bot and its own role, never the persona, so a
+draft stays the PM's and decidable after its persona leaves the PM's team; the decision's event
+records the item's `persona`. Sensitivity, the audience check, the owner-only rule and the
+reviewer rules are the same for every persona. Item views (`GET /internal/approvals…`, the
+reviewer's views, restricted metadata-only included) add `persona` (`null` is Nudge).
+
+**A withdrawn bot's drafts are held** (slice M1, the security review): a pending item whose
+persona is no longer offered (withdrawn, or gone from the catalog) can be rejected by its owner
+but not approved or edited (`409 {code: "held"}`, recorded `denied` with the note `held: the
+draft's bot is no longer offered`) until the persona is offered again or an Admin releases it
+(`POST /internal/admin/personas/drafts/{id}/release`, below; stored in
+`approval_hold_releases`, migration `0026`). Its views carry `held: true` (left out otherwise).
+
+**A write a persona role doesn't list is refused** (`403`, "the role doesn't list it in its
+`actions`"): a persona role's unlisted write is `never`, not `approve`. `pmos lint` refuses such
+a role too (`persona-action-unlisted`).
+
+**A persona's draft notice** (`draft-notice` in its `PERSONA.md`; Echo's "Draft for internal
+review. Not approved for external use.") is put at the top of the `body` of every
+`confluence.create_draft` and `confluence.update_page` it drafts when the item is recorded, and
+again when the approved write runs, so neither the model nor an edit leaves it out. Jira issues
+and Slack replies don't carry it. No extra approval step goes with it.
+
+**The session body is strict**: `POST /internal/sessions` refuses a field it doesn't know
+(`422`), so a caller that sends a field a later version adds fails closed instead of getting a
+session without it (the runtime also requires the answer to echo the persona and its role).
 
 **Routes.**
 
 | Route | Token | Answer |
 | --- | --- | --- |
-| `GET /internal/personas` | service, bot, web (no assertion; the console `403`) | `{catalog_sha, personas: [Persona]}`, the offered ones, Nudge first, then by `order`. `Persona` is `{key, display_name, title, mascot, always_on, summary, examples, can_do, reads, drafts, needs: [{source, label, without, met}]}`, nothing else of the file; `reads`, `drafts` and `needs[].met` are derived from the role's tools by `pmos lint`. |
+| `GET /internal/personas` | service, bot, web (no assertion; the console `403`) | `{catalog_sha, personas: [Persona]}`, the offered ones, Nudge first, then by `order`. `Persona` is `{key, display_name, title, mascot, always_on, preview, summary, examples, can_do, reads, drafts, needs: [{source, label, without, met}]}`, nothing else of the file (`preview: true` is "Preview: not yet benchmarked"); `reads`, `drafts` and `needs[].met` are derived from the role's tools by `pmos lint`. |
 | `GET /internal/team/{handle}` | web, signed for `handle` in every mode | `Team` = `{handle, bots: [{key, always_on, added_at, offered, added_via?}], drafts_this_month: {key: n}}`. `bots` is Nudge (`added_at: null`), then each row in catalog order (a row whose persona left the catalog last); `offered: false` marks a withdrawn or deleted one. `drafts_this_month` counts the person's approval items per persona since the 1st, UTC (Nudge's under `nudge`). |
 | `PUT /internal/team/{handle}` | the same, and assertion `require` | `{add?: [key], remove?: [key], via: "onboarding" \| "bots_page" \| "picker"}` (no other field): `Team`. Atomic; adding a key already there or removing one that isn't is a no-op. |
-| `GET /internal/admin/personas?user=<viewer>` | web (assertion as the mode says) | `{personas: [{key, display_name, offered, always_on, users, handles, needs: [{source, label, met}], drafts_30d}], unknown: [{key, users, handles, drafts_30d}]}`: every persona in the catalog, offered or not (Nudge's `users` and `handles` are `null`); `unknown` lists rows naming a persona no longer in the catalog. Keys, handles and counts only. Needs `view-audit-log` or `manage-members` (`403 forbidden`), recorded as `admin.personas_read`. |
+| `GET /internal/admin/personas?user=<viewer>` | web (assertion as the mode says) | `{personas: [{key, display_name, offered, always_on, preview, users, handles, needs: [{source, label, met}], drafts_30d, name_clashes}], unknown: [{key, users, handles, drafts_30d}]}`: every persona in the catalog, offered or not (Nudge's `users` and `handles` are `null`); `unknown` lists rows naming a persona no longer in the catalog; `name_clashes` the handles of users whose handle or display name reads as the persona's key or display name. Keys, handles and counts only. Needs `view-audit-log` or `manage-members` (`403 forbidden`), recorded as `admin.personas_read`. |
+| `POST /internal/admin/personas/drafts/{id}/release?user=<admin>` | web, signed for `user`, assertion `require` (else `503 assertion_required`) | Release a held draft (above): `200` the item. `403 forbidden` (not an active person with `edit-content`), `404 not_found`, `409 not_held` (decided, not a persona's, its persona offered, or already released). Every attempt is recorded as `approvals.release_hold` (`ok` or `denied` with the code), with the item's `persona`. |
 
 Team route errors, each `{code, error}`: `401 bad_assertion` (missing, invalid, or not for this
 request); `403 forbidden` (signed for someone other than `handle`: nobody changes another
@@ -708,7 +730,9 @@ here deletes an event.
 
 **Defaults and limits.** Everyone starts with Nudge only, existing users included: the migration
 adds no rows, and rows from before it read `persona` as `null`. At most 16 rows per person (in
-code and in a deferred constraint trigger). The eval stack's `evals` account gets every offered
+code and in a deferred constraint trigger that takes the same per-person lock as a team change, so
+concurrent writers are serialised: migration `0026`). The 30-an-hour count is checked and taken
+under one lock, so concurrent requests can't pass it either (`tests/team.rs`). The eval stack's `evals` account gets every offered
 persona (`added_via: seed`) when the in-memory user store is seeded from `PMOS_USERS_SEED`; never
 with a database.
 

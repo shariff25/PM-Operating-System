@@ -177,7 +177,7 @@ Nudge, the always-on generalist; `nudge` is never stored.
 
 | Route | Field | Rule |
 | --- | --- | --- |
-| `GET /v1/personas` | | `200 {personas: [{key, display_name, title, role, mascot, always_on, summary, examples, can_do, reads, drafts, needs: [{source, label, without, met}]}]}`: offered only, Nudge first, then by `order`. From the runtime's catalog (`content/personas/*/PERSONA.md` through the lint). |
+| `GET /v1/personas` | | `200 {personas: [{key, display_name, title, role, mascot, always_on, preview, summary, examples, can_do, reads, drafts, needs: [{source, label, without, met}]}]}`: offered only, Nudge first, then by `order`. From the runtime's catalog (`content/personas/*/PERSONA.md` through the lint). `preview: true` is a bot offered before its benchmark passes ("Preview: not yet benchmarked"). |
 | `POST /v1/tasks` | `persona?` | `web`, `slack`, `evals` only (others `403`). Not a key shape: `400 {code: "bad_request"}`. Not in the catalog or not offered: `400 {code: "unknown_persona"}`. The bot not a personal bot of role `pm-assistant`: `400 {code: "persona_needs_personal_bot"}`. `nudge` is stored as `null`. The team is **not** checked here. Left out in a thread: the thread's latest task's persona is inherited (`null` included); naming `nudge` does not inherit. |
 | `GET /v1/tasks` | `?persona=<key>` | Only that persona's tasks; `persona=nudge` is Nudge's. `400` if not a key shape. |
 | Task, notification | `persona` | Every task carries `persona` (`null` is Nudge). A notification carries it only when not Nudge. The console's metadata view keeps it. |

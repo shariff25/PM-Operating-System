@@ -1272,6 +1272,29 @@ impl ApprovalRepo for PgStore {
         Ok(out)
     }
 
+    async fn release_hold(&self, id: &str, by: &str, now: DateTime<Utc>) -> StoreResult<bool> {
+        let done = sqlx::query(
+            "INSERT INTO approval_hold_releases (approval_id, released_by, released_at)
+             SELECT id, $2, $3 FROM approvals WHERE id = $1
+             ON CONFLICT (approval_id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(by)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn hold_released(&self, id: &str) -> StoreResult<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM approval_hold_releases WHERE approval_id = $1)",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     async fn recommendations(&self, approval_ids: &[String]) -> StoreResult<Vec<Recommendation>> {
         if approval_ids.is_empty() {
             return Ok(Vec::new());
