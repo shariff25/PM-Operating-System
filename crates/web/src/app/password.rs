@@ -468,6 +468,8 @@ impl super::Inner {
             .fetch_add(1, Ordering::Relaxed)
             + 1;
         let at = now.timestamp();
+        // GL3: `/readyz` warns while this is recent.
+        self.untrusted_proxy_last_at.store(at, Ordering::Relaxed);
         let last = self.untrusted_proxy_logged.load(Ordering::Relaxed);
         if at - last >= 60
             && self

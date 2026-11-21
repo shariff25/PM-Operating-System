@@ -85,8 +85,15 @@ impl Weak {
     }
 }
 
-/// The most common passwords of 12 characters or more (from the public breach-frequency lists
-/// most guessing starts with), lower-case. Shorter ones are refused for their length anyway.
+/// The common-password list (the gate review of 04c175f, G5): every entry of SecLists'
+/// 1,000,000 most frequent passwords (xato.net's ten-million set) that the length rule
+/// wouldn't already refuse, trimmed and lower-cased, one per line. Source, derivation, hashes
+/// and the MIT licence: `crates/toolserver/data/common-passwords.NOTICE`.
+pub const COMMON_LIST: &str = include_str!("../../data/common-passwords.txt");
+
+/// A few more, written here: the ones of the old built-in list (the most common passwords of
+/// 12 characters or more on public breach-frequency lists, and PM OS's own name), lower-case.
+/// [`COMMON_LIST`] holds most of them already.
 pub const COMMON: [&str; 60] = [
     "123456789012",
     "1234567890123",
@@ -150,6 +157,32 @@ pub const COMMON: [&str; 60] = [
     "pmospassword1",
 ];
 
+/// Every common password, as a set, built once. A lookup hashes the candidate (SipHash with a
+/// random key) and compares it with the few entries in its bucket: its time depends on the
+/// candidate's length, not on where, or whether, it is in the list.
+fn common_set() -> &'static std::collections::HashSet<&'static str> {
+    static SET: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        COMMON_LIST
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .chain(COMMON)
+            .collect()
+    })
+}
+
+/// Is `lowered` (trimmed, lower-case) a common password? Never logged.
+pub fn is_common(lowered: &str) -> bool {
+    common_set().contains(lowered)
+}
+
+/// How many common passwords are refused (tests, the documentation).
+pub fn common_count() -> usize {
+    common_set().len()
+}
+
 /// Check a new password for `handle` (with `sign_in_name`, when they have one).
 pub fn check_new(password: &str, handle: &str, sign_in_name: Option<&str>) -> Result<(), Weak> {
     let chars = password.chars().count();
@@ -171,7 +204,7 @@ pub fn check_new(password: &str, handle: &str, sign_in_name: Option<&str>) -> Re
     if names.iter().any(|n| !n.is_empty() && *n == *lowered) {
         return Err(Weak::MatchesName);
     }
-    if COMMON.contains(&lowered.as_str()) {
+    if is_common(&lowered) {
         return Err(Weak::Common);
     }
     Ok(())
@@ -292,5 +325,34 @@ mod tests {
             assert!(c.chars().count() >= MIN_LEN, "{c}");
             assert_eq!(c, c.to_lowercase());
         }
+    }
+
+    // G5: a real list, of at least the passwords the 10,000 most common would be past the
+    // length rule, and far more: every one of the 1,000,000 most common that is long enough.
+    #[test]
+    fn the_common_list_is_a_real_one() {
+        assert!(common_count() >= 46_000, "{}", common_count());
+        for line in COMMON_LIST.lines() {
+            let n = line.chars().count();
+            assert!((MIN_LEN..=MAX_LEN).contains(&n));
+            assert_eq!(line, line.trim().to_lowercase());
+        }
+        let ok = |p: &str| check_new(p, "ana", Some("ana.silva@example.com"));
+        // From the list (high and low in it), in any case and with spaces around.
+        for p in [
+            "123qweasdzxc",
+            "QAZWSXEDCRFV",
+            "  qwertyqwerty ",
+            "leavemealone",
+            "iloveyouforever",
+        ] {
+            assert_eq!(ok(p), Err(Weak::Common), "{p}");
+        }
+        assert_eq!(
+            ok("pmospassword1"),
+            Err(Weak::Common),
+            "the written ones too"
+        );
+        assert_eq!(ok("plum-kettle orbit 42"), Ok(()));
     }
 }

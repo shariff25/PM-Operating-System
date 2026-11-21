@@ -712,11 +712,6 @@ async fn overview(
             "dismissed_at": r.dismissed_at,
         }))
         .collect::<Vec<_>>());
-    users["password_codes_voided"] = json!(pw
-        .voided
-        .iter()
-        .map(|v| json!({"handle": v.handle, "at": v.at, "wrong_guesses": v.wrong_guesses}))
-        .collect::<Vec<_>>());
     let counts = match state.svc.stores().audit.count_outcomes(since).await {
         Ok(c) => c,
         Err(e) => return unavailable(e),

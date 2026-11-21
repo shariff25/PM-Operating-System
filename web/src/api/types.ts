@@ -571,8 +571,6 @@ export interface OverviewUsers {
   first_links?: { handle: string; at: string; provider: string }[] | null;
   /** Reset codes made this week for people who had a password: whose, by whom (a handle, or `host`), when, and when the person's notice of it was dismissed (`null` while it shows). Absent from an older server. */
   password_resets?: { handle: string; by: string; at: string; dismissed_at?: string | null }[];
-  /** Setup codes made void this week after too many wrong guesses: the admin makes a new one. Absent from an older server. */
-  password_codes_voided?: { handle: string; at: string; wrong_guesses: number }[];
 }
 
 export interface AdminOverview {

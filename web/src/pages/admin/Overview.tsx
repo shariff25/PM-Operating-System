@@ -217,8 +217,6 @@ function PeopleFlags({ users, linkable }: { users: OverviewUsers; linkable: bool
       next: dismissed ? `${P.resetsNext} ${P.resetsDismissed(dismissed)}` : P.resetsNext,
       handles: [...new Set(resets.map((r) => r.handle))],
     });
-  const voided = users.password_codes_voided ?? [];
-  if (voided.length) rows.push({ key: 'voided', icon: 'lock', title: P.voided(voided.length), next: P.voidedNext, handles: [...new Set(voided.map((v) => v.handle))] });
   if (rows.length === 0) return null;
   return (
     <section className="card" aria-labelledby="admin-people">
