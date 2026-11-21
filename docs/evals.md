@@ -136,6 +136,30 @@ and whether a workaround can be deleted:
 run is lost. Every run counts toward its week, so a change that breaks a category fails that
 week (see **History** below).
 
+### On the test stack
+Before the Spark's eval stack is available, the benchmarks run on this machine's test stack
+(`scripts/claude-test-stack.sh`, `docs/testing-with-claude.md`) with a cloud model behind the
+gateway. Prompts leave the machine, so it runs on the fake fixtures only.
+`PMOS_TEST_EVALS=1` sets it up the way `deploy/compose.evals.yaml` does:
+- `evals`, `ben` and `cy` join the seed (`pm` only), so the tool server gives `evals` every
+  offered persona (`chief`, `sprout`, `echo`) and the persona categories pass the team check;
+- a personal bot `pm-evals`, with `PMOS_TEST_EVALS_WORKERS` workers (default 1, at most 8);
+- runtime clients `evals` and `console` (the trace reader), `PMOS_EVALS_AS=evals`, and
+  assertions off with the development override, as on the eval stack (so it can't be combined
+  with `PMOS_TEST_WEB=1`); a gateway client `evals` for the judges;
+- the docs tools on the fake docs fixtures, unless `PMOS_DOCS_BASE_URL` is set.
+
+It writes the runner's settings, with this run's fresh tokens, to `$STATE/evals.env`
+(mode 0600). In a second shell:
+
+```sh
+set -a; . state/claude-test/evals.env; set +a
+target/debug/pmos-evals run --category jira-draft --concurrency 3 --note "model: <name>"
+```
+
+The gateway lets one person have two model calls in flight (`limits.per-user`), so more than
+two or three tasks at once mostly adds queue time.
+
 ## Reading a report
 
 `evals/reports/<date>-<category>.md` has these parts.
@@ -308,7 +332,8 @@ Every failure gets exactly one tag. The rules run in this order, and the first m
 
 **Terms in the rules:**
 - **"Error"** is the task's `error` field, lowercased, checked only for tasks that ended
-  `failed`.
+  `failed`. A word in a rule matches only at the start of a word: `restart` matches
+  "restarts", but `lease` doesn't match "please".
 - **"Trace"** is the task's trace, when the runner could read it. Entry kinds are
   `prompt`, `model_reply`, `tool_call`, `tool_result` and `policy_denial`.
 - **A tool's name** is the `tool` or `name` field of an entry's body.
@@ -320,7 +345,7 @@ Every failure gets exactly one tag. The rules run in this order, and the first m
 | 3 | `policy-error` | policy | `policy/refused` | The error says `policy`, `denied`, `forbidden`, `not permitted` or `403` |
 | 4 | `never-claimed` | harness | `harness/never-claimed` | Timed out while still `queued`: no worker picked it up |
 | 5 | `cancelled` | harness | `harness/cancelled` | The task was cancelled; nothing in a benchmark cancels tasks |
-| 6 | `interrupted` | harness | `harness/interrupted` | The error says `interrupted`, `restart`, `lease`, `heartbeat`, `worker`, `sandbox` or `gateway`. This covers restarts (D2), the worker and its sandbox, and the model endpoint being unreachable. |
+| 6 | `interrupted` | harness | `harness/interrupted` | The error says `interrupted`, `restart`, `lease`, `heartbeat`, `worker`, `sandbox`, `gateway`, `model is busy` or `model is still busy`. This covers restarts (D2), the worker and its sandbox, and the model endpoint being unreachable or busy (a `429` or `503` after the gateway's retries). |
 | 7 | `silent-timeout` | harness | `harness/silent-timeout` | Timed out while `working`, with no events: the worker never reported progress |
 | 8 | `done-without-answer` | harness | `harness/empty-answer` | Ended `done` with an empty result |
 | 9 | `drafts-unreadable` | harness | `harness/drafts-unreadable` | The task has `drafts` checks and its drafts couldn't be read |

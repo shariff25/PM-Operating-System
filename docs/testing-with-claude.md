@@ -91,6 +91,13 @@ To try the web app (`web/` and its backend `pmos-web`) against this stack, run
 address. Without the variable nothing changes. See [Running the web app](web-app-running.md),
 including why it isn't ready for production.
 
+## Benchmarks (optional)
+
+`PMOS_TEST_EVALS=1 scripts/claude-test-stack.sh` also sets the stack up for `pmos-evals`: the
+benchmark member `evals` with a personal bot `pm-evals` and every offered persona on its team,
+the runner's and judges' tokens, and the fake docs fixtures. It can't be combined with
+`PMOS_TEST_WEB=1`. See "On the test stack" in [Benchmarks](evals.md).
+
 ## The model
 
 `config/gateway.claude-test.yaml` maps both roles to `claude-opus-5-5`:
