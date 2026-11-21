@@ -14,7 +14,11 @@ in [`docs/sandbox-policies.md`](../docs/sandbox-policies.md).
 ## Don't edit the generated files
 
 A bot's policy comes from its definition (`content/bots/<bot>/BOT.md`) and its role
-(`content/roles/<role>/ROLE.md`). To change what a bot can do, change those, then:
+(`content/roles/<role>/ROLE.md`). A personal bot of `pm-assistant` also gets, read-only, the
+skill folders of every persona in the bot marketplace's catalog
+(`content/personas/<key>/PERSONA.md` and its role); nothing else in its policy depends on the
+catalog (`docs/sandbox-policies.md`, "Personas"). To change what a bot can do, change those,
+then:
 
 ```sh
 cargo run -q -p pmos -- policy generate   # writes policies/
@@ -38,6 +42,9 @@ its author.** Platform owners are the active `admin` users in the PM OS user dat
   tools also changes what `tools/call` allows, so it counts.
 - **Who approves:** a platform-owner PM other than the author. If the author is a platform owner,
   that's a second one.
+- **A persona** (`content/personas/`) can only add read-only skill folders to the `pm-*`
+  policies, never a tool or a host (the lint refuses a persona whose tools exceed
+  `pm-assistant`'s), so it is a filesystem change, below.
 - **Filesystem, credential and process changes** go through the content repo's usual
   pull-request review, plus a platform owner. They also need the sandbox recreated on the Spark
   (OpenShell applies them only at startup).
