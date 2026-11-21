@@ -699,3 +699,722 @@ fn role_and_bot_rules() {
         report.codes()
     );
 }
+
+// The bot marketplace's catalog (`personas/<key>/PERSONA.md`, docs/bot-marketplace-spec.md §2).
+
+const MARKET_TOOLS: &str = "tools:\n  - name: context.search\n    system: context\n    kind: read\n  - name: jira.search\n    system: jira\n    kind: read\n  - name: docs.search\n    system: docs\n    kind: read\n  - name: jira.create_issue\n    system: jira\n    kind: write\n  - name: slack.send_message\n    system: slack\n    kind: write\n  - name: jira.transition\n    system: jira\n    kind: write\n  - name: analytics.query\n    system: analytics\n    kind: read\n";
+
+fn meta_with(tools: &str, extra: &str) -> String {
+    format!("  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"internal\"\n  tools: \"{tools}\"\n{extra}")
+}
+
+fn named_role(name: &str, skills: &str, extra: &str) -> String {
+    role(name, extra).replace("skills: \"ask\"", &format!("skills: \"{skills}\""))
+}
+
+/// A persona file; `extra` is added to the front matter, and each `(key, value)` in `set`
+/// replaces that key's line.
+fn persona(name: &str, role: &str, extra: &str, set: &[(&str, &str)]) -> String {
+    let mut fields: Vec<(String, String)> = [
+        ("name", name.to_string()),
+        ("display-name", capitalised(name)),
+        ("title", "Chief of Staff".to_string()),
+        ("role", role.to_string()),
+        ("mascot", "chief".to_string()),
+        ("owner", "\"@pm\"".to_string()),
+        ("version", "\"0.1.0\"".to_string()),
+        ("offered", "true".to_string()),
+        ("order", "20".to_string()),
+        ("summary", "Runs your week.".to_string()),
+        (
+            "examples",
+            "\n  - Prep me for the staff meeting\n  - What slipped since Monday?".to_string(),
+        ),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    for (key, value) in set {
+        match fields.iter_mut().find(|(k, _)| k == key) {
+            Some(field) => field.1 = value.to_string(),
+            None => fields.push((key.to_string(), value.to_string())),
+        }
+    }
+    let mut text = String::from("---\n");
+    for (k, v) in fields {
+        if v.starts_with('\n') {
+            text.push_str(&format!("{k}:{v}\n"));
+        } else {
+            text.push_str(&format!("{k}: {v}\n"));
+        }
+    }
+    text.push_str(extra);
+    text.push_str("---\n\n# Notes\n\nFor maintainers.\n");
+    text
+}
+
+fn capitalised(name: &str) -> String {
+    let mut c = name.chars();
+    match c.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+fn nudge() -> String {
+    persona(
+        "nudge",
+        "pm-assistant",
+        "always-on: true\n",
+        &[("mascot", "nudge"), ("order", "10")],
+    )
+}
+
+/// The valid tree plus a catalog: the personal role `pm-assistant` (skills `ask` and `look`),
+/// a persona role `chief-of-staff` (skills `ask` and `prep`, where `prep` is not the personal
+/// role's but its tools are), Nudge and Chief. Passes with no diagnostics.
+fn market_tree() -> TempDir {
+    let dir = valid_tree();
+    let root = dir.path();
+    write(root, "tools.yaml", MARKET_TOOLS);
+    write(
+        root,
+        "skills/look/SKILL.md",
+        &skill("look", &meta_with("jira.search docs.search", "")),
+    );
+    write(
+        root,
+        "skills/prep/SKILL.md",
+        &skill("prep", &meta_with("context.search jira.search", "")),
+    );
+    write(
+        root,
+        "roles/pm-assistant/ROLE.md",
+        &named_role("pm-assistant", "ask look", ""),
+    );
+    write(
+        root,
+        "roles/chief-of-staff/ROLE.md",
+        &named_role("chief-of-staff", "ask prep", ""),
+    );
+    write(root, "personas/nudge/PERSONA.md", &nudge());
+    write(
+        root,
+        "personas/chief/PERSONA.md",
+        &persona("chief", "chief-of-staff", "", &[]),
+    );
+    dir
+}
+
+fn put_chief(dir: &TempDir, extra: &str, set: &[(&str, &str)]) {
+    write(
+        dir.path(),
+        "personas/chief/PERSONA.md",
+        &persona("chief", "chief-of-staff", extra, set),
+    );
+}
+
+/// `code` is reported at `path`, with the given severity.
+fn assert_at(report: &pmos_contract::Report, code: &str, path: &str, severity: Severity) {
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == code && d.path == path && d.severity == severity),
+        "expected {severity:?} `{code}` at {path}, got {:#?}",
+        report.diagnostics
+    );
+}
+
+fn assert_clean(dir: &TempDir) -> pmos_contract::Report {
+    let report = run(dir);
+    assert!(report.diagnostics.is_empty(), "{:#?}", report.diagnostics);
+    report
+}
+
+const CHIEF: &str = "personas/chief/PERSONA.md";
+
+#[test]
+fn the_catalog_parses_and_derives_reads_and_drafts() {
+    let dir = market_tree();
+    let report = assert_clean(&dir);
+    let keys: Vec<_> = report.personas.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(keys, ["nudge", "chief"], "by order");
+    let nudge = &report.personas[0];
+    assert!(nudge.always_on && nudge.offered);
+    assert_eq!(nudge.role, "pm-assistant");
+    let chief = &report.personas[1];
+    assert_eq!(chief.display_name, "Chief");
+    assert_eq!(chief.title, "Chief of Staff");
+    assert_eq!(chief.mascot, "chief");
+    assert_eq!(chief.owner, "pm");
+    assert_eq!(chief.order, 20);
+    assert!(!chief.always_on);
+    assert_eq!(
+        chief.examples,
+        [
+            "Prep me for the staff meeting",
+            "What slipped since Monday?"
+        ]
+    );
+    // can-do defaults to every skill of the role.
+    assert_eq!(chief.can_do, ["ask", "prep"]);
+    // Derived: `context` is PM OS's own, so not a source; `jira.create_issue` (from `ask`)
+    // is approve.
+    assert_eq!(chief.reads, ["jira"]);
+    assert_eq!(chief.drafts, ["Jira issues"]);
+    assert!(chief.needs.is_empty());
+    assert_eq!(nudge.reads, ["jira", "docs"]);
+}
+
+#[test]
+fn no_catalog_is_no_finding() {
+    let dir = market_tree();
+    fs::remove_dir_all(dir.path().join("personas")).unwrap();
+    let report = assert_clean(&dir);
+    assert!(report.personas.is_empty());
+}
+
+#[test]
+fn persona_exceeds_base() {
+    let dir = market_tree();
+    // `blast` sends Slack messages; the personal role can't.
+    write(
+        dir.path(),
+        "skills/blast/SKILL.md",
+        &skill("blast", &meta_with("slack.send_message", "")),
+    );
+    write(
+        dir.path(),
+        "roles/chief-of-staff/ROLE.md",
+        &named_role("chief-of-staff", "ask prep blast", ""),
+    );
+    let report = run(&dir);
+    assert_at(&report, "persona-exceeds-base", CHIEF, Severity::Error);
+    let d = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "persona-exceeds-base")
+        .unwrap();
+    assert!(d.message.contains("slack.send_message"), "{}", d.message);
+    assert!(
+        !report.personas.iter().any(|p| p.name == "chief"),
+        "a persona with errors is not in the catalog"
+    );
+    // Give the personal role the same tool and it passes.
+    write(
+        dir.path(),
+        "roles/pm-assistant/ROLE.md",
+        &named_role("pm-assistant", "ask look blast", ""),
+    );
+    assert_clean(&dir);
+}
+
+#[test]
+fn persona_data_class() {
+    let dir = market_tree();
+    write(
+        dir.path(),
+        "roles/chief-of-staff/ROLE.md",
+        &named_role("chief-of-staff", "ask prep", "")
+            .replace("data-class: \"internal\"", "data-class: \"restricted\""),
+    );
+    assert_at(&run(&dir), "persona-data-class", CHIEF, Severity::Error);
+    // A lower class than the base is fine.
+    write(
+        dir.path(),
+        "roles/chief-of-staff/ROLE.md",
+        &named_role("chief-of-staff", "prep", "")
+            .replace("data-class: \"internal\"", "data-class: \"public\""),
+    );
+    write(
+        dir.path(),
+        "skills/prep/SKILL.md",
+        &skill(
+            "prep",
+            &meta_with("context.search jira.search", "")
+                .replace("data-class: \"internal\"", "data-class: \"public\""),
+        ),
+    );
+    assert_clean(&dir);
+}
+
+#[test]
+fn persona_action() {
+    let dir = market_tree();
+    // The personal role never creates Jira issues; Chief's role leaves it at approve.
+    write(
+        dir.path(),
+        "roles/pm-assistant/ROLE.md",
+        &named_role(
+            "pm-assistant",
+            "ask look",
+            "actions:\n  jira.create_issue: never\n",
+        ),
+    );
+    assert_at(&run(&dir), "persona-action", CHIEF, Severity::Error);
+    // Setting it to approve explicitly is the same re-enabling.
+    write(
+        dir.path(),
+        "roles/chief-of-staff/ROLE.md",
+        &named_role(
+            "chief-of-staff",
+            "ask prep",
+            "actions:\n  jira.create_issue: approve\n",
+        ),
+    );
+    assert_at(&run(&dir), "persona-action", CHIEF, Severity::Error);
+    // `never` in both passes, and Chief then drafts nothing.
+    write(
+        dir.path(),
+        "roles/chief-of-staff/ROLE.md",
+        &named_role(
+            "chief-of-staff",
+            "ask prep",
+            "actions:\n  jira.create_issue: never\n",
+        ),
+    );
+    let report = assert_clean(&dir);
+    let chief = report.personas.iter().find(|p| p.name == "chief").unwrap();
+    assert!(chief.drafts.is_empty());
+    // A persona may be stricter than the base: `never` where the base approves.
+    let dir = market_tree();
+    write(
+        dir.path(),
+        "roles/chief-of-staff/ROLE.md",
+        &named_role(
+            "chief-of-staff",
+            "ask prep",
+            "actions:\n  jira.create_issue: never\n",
+        ),
+    );
+    assert_clean(&dir);
+}
+
+#[test]
+fn persona_role_team() {
+    let dir = market_tree();
+    write(
+        dir.path(),
+        "bots/chief-team/BOT.md",
+        &bot("chief-team", "scope: team\n").replace("role: helper", "role: chief-of-staff"),
+    );
+    assert_at(&run(&dir), "persona-role-team", CHIEF, Severity::Error);
+    // A personal bot of that role is not a team bot.
+    write(
+        dir.path(),
+        "bots/chief-team/BOT.md",
+        &bot("chief-team", "scope: personal\n").replace("role: helper", "role: chief-of-staff"),
+    );
+    assert!(!run(&dir).codes().contains(&"persona-role-team"));
+}
+
+#[test]
+fn persona_role_unknown_and_base_missing() {
+    let dir = market_tree();
+    put_chief(&dir, "", &[("role", "ghost")]);
+    assert_at(&run(&dir), "persona-role-unknown", CHIEF, Severity::Error);
+
+    let dir = market_tree();
+    fs::remove_dir_all(dir.path().join("roles/pm-assistant")).unwrap();
+    let report = run(&dir);
+    assert_at(&report, "persona-base-missing", CHIEF, Severity::Error);
+    assert_at(
+        &report,
+        "persona-role-unknown",
+        "personas/nudge/PERSONA.md",
+        Severity::Error,
+    );
+}
+
+#[test]
+fn persona_skill_surface() {
+    let dir = market_tree();
+    write(
+        dir.path(),
+        "skills/prep/SKILL.md",
+        &skill(
+            "prep",
+            &meta_with("context.search jira.search", "  surfaces: \"cli\"\n"),
+        ),
+    );
+    let report = run(&dir);
+    assert_at(&report, "persona-skill-surface", CHIEF, Severity::Warning);
+    assert!(!report.has_errors(), "{:#?}", report.diagnostics);
+    // `web` alone is enough.
+    write(
+        dir.path(),
+        "skills/prep/SKILL.md",
+        &skill(
+            "prep",
+            &meta_with("context.search jira.search", "  surfaces: \"web\"\n"),
+        ),
+    );
+    assert_clean(&dir);
+}
+
+#[test]
+fn persona_always_on() {
+    let nudge_path = "personas/nudge/PERSONA.md";
+    // Two always-on.
+    let dir = market_tree();
+    put_chief(&dir, "always-on: true\n", &[]);
+    let report = run(&dir);
+    assert_at(&report, "persona-always-on", "personas", Severity::Error);
+    assert_at(&report, "persona-always-on", CHIEF, Severity::Error);
+    // None.
+    let dir = market_tree();
+    write(
+        dir.path(),
+        nudge_path,
+        &persona(
+            "nudge",
+            "pm-assistant",
+            "",
+            &[("mascot", "nudge"), ("order", "10")],
+        ),
+    );
+    let report = run(&dir);
+    assert_at(&report, "persona-always-on", "personas", Severity::Error);
+    assert_at(&report, "persona-always-on", nudge_path, Severity::Error);
+    // Always-on with another role, or not offered.
+    let dir = market_tree();
+    write(
+        dir.path(),
+        nudge_path,
+        &persona(
+            "nudge",
+            "chief-of-staff",
+            "always-on: true\n",
+            &[("mascot", "nudge"), ("order", "10"), ("offered", "false")],
+        ),
+    );
+    let report = run(&dir);
+    let n = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "persona-always-on" && d.path == nudge_path)
+        .count();
+    assert_eq!(n, 2, "{:#?}", report.diagnostics);
+    // `offered` defaults to false, and that's the always-on persona's error too.
+    let dir = market_tree();
+    let text = nudge().replace("offered: true\n", "");
+    write(dir.path(), nudge_path, &text);
+    assert_at(&run(&dir), "persona-always-on", nudge_path, Severity::Error);
+}
+
+#[test]
+fn persona_mascot() {
+    let dir = market_tree();
+    put_chief(&dir, "", &[("mascot", "unicorn")]);
+    assert_at(&run(&dir), "persona-mascot", CHIEF, Severity::Error);
+    for ok in ["nudge", "chief", "sprout", "echo"] {
+        put_chief(&dir, "", &[("mascot", ok)]);
+        assert_clean(&dir);
+    }
+}
+
+#[test]
+fn persona_text_limits() {
+    let long_name = "X".repeat(25);
+    let long_title = "t".repeat(41);
+    let long_summary = "s".repeat(161);
+    let long_example = format!("\n  - {}", "e".repeat(81));
+    let seven = format!("\n{}", "  - Ask\n".repeat(7).trim_end());
+    for (key, bad) in [
+        ("display-name", long_name.as_str()),
+        ("display-name", "Chief!"),
+        ("display-name", "\"<b>Chief</b>\""),
+        ("title", long_title.as_str()),
+        ("title", "\"Chief <script>\""),
+        ("summary", long_summary.as_str()),
+        ("summary", "\"Two\\nlines\""),
+        ("summary", "\"  \""),
+        ("examples", long_example.as_str()),
+        ("examples", seven.as_str()),
+        ("examples", "[]"),
+        ("examples", "\n  - \"Prep <img src=x>\""),
+    ] {
+        let dir = market_tree();
+        put_chief(&dir, "", &[(key, bad)]);
+        assert_at(&run(&dir), "persona-text", CHIEF, Severity::Error);
+    }
+    // At the limits it passes.
+    let dir = market_tree();
+    let name = "X".repeat(24);
+    let title = "t".repeat(40);
+    let summary = "s".repeat(160);
+    let example = format!("\n  - {}", "e".repeat(80));
+    let six = format!("\n{}", "  - Ask\n".repeat(6).trim_end());
+    put_chief(
+        &dir,
+        "",
+        &[
+            ("display-name", name.as_str()),
+            ("title", title.as_str()),
+            ("summary", summary.as_str()),
+            ("examples", example.as_str()),
+        ],
+    );
+    assert_clean(&dir);
+    put_chief(&dir, "", &[("examples", six.as_str())]);
+    assert_clean(&dir);
+}
+
+#[test]
+fn persona_count() {
+    let dir = market_tree();
+    for i in 0..15 {
+        let key = format!("extra{i}");
+        let display = format!("Extra {i}");
+        let order = format!("{}", 100 + i);
+        write(
+            dir.path(),
+            &format!("personas/{key}/PERSONA.md"),
+            &persona(
+                &key,
+                "chief-of-staff",
+                "",
+                &[
+                    ("display-name", display.as_str()),
+                    ("order", order.as_str()),
+                ],
+            ),
+        );
+    }
+    // 17 personas.
+    assert_at(&run(&dir), "persona-count", "personas", Severity::Error);
+    // 16 pass.
+    fs::remove_dir_all(dir.path().join("personas/extra14")).unwrap();
+    let report = assert_clean(&dir);
+    assert_eq!(report.personas.len(), 16);
+}
+
+#[test]
+fn persona_can_do() {
+    let dir = market_tree();
+    // `look` is the personal role's skill, not Chief's.
+    put_chief(&dir, "can-do: ask look\n", &[]);
+    assert_at(&run(&dir), "persona-can-do", CHIEF, Severity::Error);
+    put_chief(&dir, "can-do: \"\"\n", &[]);
+    assert_at(&run(&dir), "persona-can-do", CHIEF, Severity::Error);
+    put_chief(&dir, "can-do: prep prep\n", &[]);
+    assert_at(&run(&dir), "persona-can-do", CHIEF, Severity::Error);
+    put_chief(&dir, "can-do: prep\n", &[]);
+    let report = assert_clean(&dir);
+    let chief = report.personas.iter().find(|p| p.name == "chief").unwrap();
+    assert_eq!(chief.can_do, ["prep"]);
+}
+
+#[test]
+fn persona_need() {
+    let need = |source: &str, label: &str, without: &str| {
+        format!("needs:\n  - source: {source}\n    label: {label}\n    without: {without}\n")
+    };
+    for extra in [
+        need("warehouse", "a warehouse", "I work from pasted numbers."),
+        need("analytics", &"l".repeat(41), "I work from pasted numbers."),
+        need("analytics", "an analytics source", &"w".repeat(161)),
+        need("analytics", "\"<b>x</b>\"", "I work from pasted numbers."),
+        format!(
+            "{}{}",
+            need("crm", "a CRM", "Paste it."),
+            need("crm", "a CRM", "Paste it.").replace("needs:\n", "")
+        ),
+    ] {
+        let dir = market_tree();
+        put_chief(&dir, &extra, &[]);
+        assert_at(&run(&dir), "persona-need", CHIEF, Severity::Error);
+    }
+    // A valid need: unmet while no read tool of its system is in the role, met once one is.
+    let dir = market_tree();
+    put_chief(
+        &dir,
+        &need(
+            "analytics",
+            "an analytics source",
+            "I work from numbers you paste in, and I say so.",
+        ),
+        &[],
+    );
+    let report = assert_clean(&dir);
+    let chief = report.personas.iter().find(|p| p.name == "chief").unwrap();
+    assert_eq!(chief.needs.len(), 1);
+    assert_eq!(chief.needs[0].label, "an analytics source");
+    assert!(
+        !chief.needs[0].met,
+        "the registry has analytics.query, but the role doesn't"
+    );
+    for (name, tools) in [
+        ("look", "jira.search docs.search analytics.query"),
+        ("prep", "context.search jira.search analytics.query"),
+    ] {
+        write(
+            dir.path(),
+            &format!("skills/{name}/SKILL.md"),
+            &skill(name, &meta_with(tools, "")),
+        );
+    }
+    let report = assert_clean(&dir);
+    let chief = report.personas.iter().find(|p| p.name == "chief").unwrap();
+    assert!(chief.needs[0].met);
+    assert_eq!(chief.reads, ["jira", "analytics"]);
+}
+
+#[test]
+fn persona_name() {
+    // The folder and the name differ.
+    let dir = market_tree();
+    write(
+        dir.path(),
+        CHIEF,
+        &persona("boss", "chief-of-staff", "", &[("display-name", "Chief")]),
+    );
+    assert_at(&run(&dir), "persona-name", CHIEF, Severity::Error);
+    // Not a valid name.
+    let dir = market_tree();
+    write(
+        dir.path(),
+        "personas/Big--Boss/PERSONA.md",
+        &persona(
+            "Big--Boss",
+            "chief-of-staff",
+            "",
+            &[("display-name", "Boss"), ("order", "30")],
+        ),
+    );
+    assert_at(
+        &run(&dir),
+        "persona-name",
+        "personas/Big--Boss/PERSONA.md",
+        Severity::Error,
+    );
+    // A display name that is another persona's key or display name, in any case, would make
+    // the Slack prefix ambiguous.
+    let dir = market_tree();
+    write(
+        dir.path(),
+        "personas/boss/PERSONA.md",
+        &persona(
+            "boss",
+            "chief-of-staff",
+            "",
+            &[("display-name", "CHIEF"), ("order", "30")],
+        ),
+    );
+    assert_at(
+        &run(&dir),
+        "persona-name",
+        "personas/boss/PERSONA.md",
+        Severity::Error,
+    );
+    // A persona's own display name may equal its key.
+    assert_clean(&market_tree());
+}
+
+#[test]
+fn persona_order() {
+    let dir = market_tree();
+    put_chief(&dir, "", &[("order", "1001")]);
+    assert_at(&run(&dir), "persona-order", CHIEF, Severity::Error);
+    put_chief(&dir, "", &[("order", "-1")]);
+    assert_at(&run(&dir), "persona-order", CHIEF, Severity::Error);
+    // A duplicate is a warning only.
+    put_chief(&dir, "", &[("order", "10")]);
+    let report = run(&dir);
+    assert_at(&report, "persona-order", CHIEF, Severity::Warning);
+    assert!(!report.has_errors(), "{:#?}", report.diagnostics);
+    put_chief(&dir, "", &[("order", "1000")]);
+    assert_clean(&dir);
+}
+
+#[test]
+fn persona_parse_version_and_missing_file() {
+    let dir = market_tree();
+    put_chief(&dir, "colour: blue\n", &[]);
+    assert_at(&run(&dir), "persona-parse", CHIEF, Severity::Error);
+    put_chief(&dir, "", &[("offered", "\"yes\"")]);
+    assert_at(&run(&dir), "persona-parse", CHIEF, Severity::Error);
+    let text = persona("chief", "chief-of-staff", "", &[]).replace("order: 20\n", "");
+    write(dir.path(), CHIEF, &text);
+    assert_at(&run(&dir), "persona-parse", CHIEF, Severity::Error);
+    put_chief(&dir, "", &[("version", "\"1.0\"")]);
+    assert_at(&run(&dir), "persona-version", CHIEF, Severity::Error);
+    put_chief(&dir, "", &[("owner", "\"TODO\"")]);
+    let report = run(&dir);
+    assert_at(&report, "owner-unassigned", CHIEF, Severity::Warning);
+    assert!(!report.has_errors());
+
+    let dir = market_tree();
+    fs::create_dir_all(dir.path().join("personas/empty")).unwrap();
+    assert_at(
+        &run(&dir),
+        "persona-missing-file",
+        "personas/empty",
+        Severity::Error,
+    );
+}
+
+#[test]
+fn persona_write_label() {
+    let dir = market_tree();
+    // `jira.transition` is a write tool with no label; the base has it too, so only the label
+    // rule fires.
+    write(
+        dir.path(),
+        "skills/move/SKILL.md",
+        &skill("move", &meta_with("jira.transition", "")),
+    );
+    write(
+        dir.path(),
+        "roles/pm-assistant/ROLE.md",
+        &named_role("pm-assistant", "ask look move", ""),
+    );
+    write(
+        dir.path(),
+        "roles/chief-of-staff/ROLE.md",
+        &named_role("chief-of-staff", "ask prep move", ""),
+    );
+    let report = run(&dir);
+    assert_at(&report, "persona-write-label", CHIEF, Severity::Error);
+    assert!(!report.codes().contains(&"persona-exceeds-base"));
+    // Without the tool in Chief's role, it passes (Nudge's role still has it, so Nudge fails).
+    write(
+        dir.path(),
+        "roles/chief-of-staff/ROLE.md",
+        &named_role("chief-of-staff", "ask prep", ""),
+    );
+    let report = run(&dir);
+    assert!(!report
+        .diagnostics
+        .iter()
+        .any(|d| d.path == CHIEF && d.severity == Severity::Error));
+    assert_at(
+        &report,
+        "persona-write-label",
+        "personas/nudge/PERSONA.md",
+        Severity::Error,
+    );
+}
+
+/// The repository's catalog: Nudge, always on, made from the personal role.
+#[test]
+fn repo_catalog_has_nudge_always_on() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content");
+    let report = lint(&root, &LintOptions::new(today()));
+    assert!(
+        !report.has_errors(),
+        "{:#?}",
+        report.errors().collect::<Vec<_>>()
+    );
+    let always_on: Vec<_> = report.personas.iter().filter(|p| p.always_on).collect();
+    assert_eq!(always_on.len(), 1);
+    let nudge = always_on[0];
+    assert_eq!(nudge.name, "nudge");
+    assert_eq!(nudge.role, pmos_contract::onboarding::PERSONAL_ROLE);
+    assert!(nudge.offered);
+    assert_eq!(nudge.mascot, "nudge");
+    for p in &report.personas {
+        assert!(pmos_contract::personas::MASCOTS.contains(&p.mascot.as_str()));
+    }
+}

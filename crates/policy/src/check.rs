@@ -244,8 +244,8 @@ fn readable_problem(ctx: &BotContext, p: &str) -> String {
         let skill = rest.split('/').next().unwrap_or(rest);
         if !ctx.skills.iter().any(|s| s == skill) {
             return format!(
-                "`{p}` is skill `{skill}`, which role `{}` doesn't have",
-                ctx.role
+                "`{p}` is skill `{skill}`, which {} doesn't have",
+                skill_owners(ctx)
             );
         }
     }
@@ -262,6 +262,18 @@ fn readable_problem(ctx: &BotContext, p: &str) -> String {
         return format!("`{p}` is broader than the paths this bot may read");
     }
     format!("`{p}` is not a path this sandbox may read (only OpenShell's system paths, the role's skills and the bot's master context)")
+}
+
+/// Where a bot's skills come from, in words: its role, and for a personal bot of the personal
+/// role also the catalog's personas (`docs/bot-marketplace-spec.md` §4).
+fn skill_owners(ctx: &BotContext) -> String {
+    if ctx.scope == Some(pmos_contract::bots::BotScope::Personal)
+        && ctx.role == pmos_contract::onboarding::PERSONAL_ROLE
+    {
+        format!("role `{}` or any persona in the catalog", ctx.role)
+    } else {
+        format!("role `{}`", ctx.role)
+    }
 }
 
 /// Under the content mount, and not the workspace.
@@ -732,8 +744,9 @@ pub fn check_spec(
             None => out.add(
                 FS_UPLOADS,
                 format!(
-                    "uploads `{}`, which is not a skill of role `{}`, the bot's master context or the tool registry",
-                    u.from, ctx.role
+                    "uploads `{}`, which is not a skill of {}, the bot's master context or the tool registry",
+                    u.from,
+                    skill_owners(ctx)
                 ),
             ),
         }

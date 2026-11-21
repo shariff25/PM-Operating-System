@@ -25,6 +25,15 @@ Policy Admin's **spec** is exactly what generation reads, and nothing more:
 | `roles.<role>.skills` | `content/roles/<role>/ROLE.md` | Which `skills/<skill>` folders are uploaded read-only, and so which tools are allowed. |
 | `skills.<skill>.tools` | `content/skills/<skill>/SKILL.md` `metadata.tools` | The MCP tools `tools/call` may name (`docs.search` becomes `docs_search`). |
 
+Generation reads one more input that the spec doesn't edit: the bot marketplace's catalog,
+`content/personas/<key>/PERSONA.md` (`docs/bot-marketplace-spec.md` §4). A personal bot of
+`pm-assistant` also uploads, read-only, the skills of every persona's role; its tools stay
+`pm-assistant`'s, because the lint refuses a persona whose role has a tool `pm-assistant`
+doesn't (`persona-exceeds-base`). So a change to a persona's role skills, made here or in a
+content proposal, shows up as new read-only uploads on every `pm-*` bot, and one that would
+reach a new tool is refused as invalid content. The catalog itself is changed in a content
+proposal, not on this screen; the bots' facts list the uploaded skills, personas' included.
+
 Everything else in a policy is fixed in `crates/policy/src/lib.rs` and shown as `fixed`: egress
 only to the tool server (`toolserver.pmos.internal:8710`, MCP on `/mcp`), the gateway
 (`gateway.pmos.internal:8740`, `POST /v1/chat/completions`) and the bot runtime

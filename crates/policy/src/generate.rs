@@ -8,6 +8,7 @@ use std::path::Path;
 use chrono::NaiveDate;
 use pmos_contract::bots::{role_tools, Bot, BotScope};
 use pmos_contract::model::harness_tool_name;
+use pmos_contract::onboarding::PERSONAL_ROLE;
 use pmos_contract::{lint, Diagnostic, LintOptions, Report, Severity};
 use serde_json::json;
 
@@ -29,9 +30,15 @@ pub struct BotContext {
     pub role: String,
     /// `None` for a policy file whose bot isn't in the content (checked with no grants).
     pub scope: Option<BotScope>,
-    /// The role's skills, sorted.
+    /// The skills uploaded into the sandbox, sorted: the role's, and for a personal bot of the
+    /// personal role also every persona's (`docs/bot-marketplace-spec.md` §4).
     pub skills: Vec<String>,
+    /// The skills in `skills` that only the catalog's personas bring (not the role's own),
+    /// sorted. Always empty for a team bot or a personal bot of another role.
+    pub persona_skills: Vec<String>,
     /// The role's tools as MCP tool names (`docs_search`), which is what `tools/call` carries.
+    /// Personas never change it: a persona's tools are a subset of the personal role's (the
+    /// lint's `persona-exceeds-base`).
     pub mcp_tools: BTreeSet<String>,
     /// The bot's master context files, relative to the content root.
     pub master: Vec<String>,
@@ -41,10 +48,26 @@ pub struct BotContext {
 
 impl BotContext {
     /// The context for `bot`, from a lint report of the content at `content_root`. `None` if
-    /// the bot's role isn't in the report.
+    /// the bot's role, or a persona's role, isn't in the report.
+    ///
+    /// A personal bot of the [`PERSONAL_ROLE`] runs as any persona of the catalog, so it gets
+    /// the skill folders of every persona in `report.personas`, offered or not (offering then
+    /// changes no policy). Nothing else depends on the catalog: the tool allowlist stays the
+    /// personal role's, and the network, binaries, credentials and writable paths are the same.
     pub fn from_report(report: &Report, bot: &Bot, content_root: &Path) -> Option<Self> {
         let role = report.roles.iter().find(|r| r.name == bot.role)?;
-        let skills: BTreeSet<String> = role.skills.iter().cloned().collect();
+        let mut skills: BTreeSet<String> = role.skills.iter().cloned().collect();
+        let mut persona_skills = BTreeSet::new();
+        if bot.scope == BotScope::Personal && role.name == PERSONAL_ROLE {
+            for persona in &report.personas {
+                let persona_role = report.roles.iter().find(|r| r.name == persona.role)?;
+                for skill in &persona_role.skills {
+                    if skills.insert(skill.clone()) {
+                        persona_skills.insert(skill.clone());
+                    }
+                }
+            }
+        }
         let mcp_tools = role_tools(role, &report.skills)
             .iter()
             .map(|t| harness_tool_name(t))
@@ -67,6 +90,7 @@ impl BotContext {
             role: role.name.clone(),
             scope: Some(bot.scope),
             skills: skills.into_iter().collect(),
+            persona_skills: persona_skills.into_iter().collect(),
             mcp_tools,
             master,
             shared,
@@ -80,6 +104,7 @@ impl BotContext {
             role: String::new(),
             scope: None,
             skills: Vec::new(),
+            persona_skills: Vec::new(),
             mcp_tools: BTreeSet::new(),
             master: Vec::new(),
             shared: Vec::new(),
@@ -94,7 +119,8 @@ impl BotContext {
         }
     }
 
-    /// The content uploaded into the sandbox, read-only: the role's skills, the bot's master
+    /// The content uploaded into the sandbox, read-only: the bot's skills ([`Self::skills`]: the
+    /// role's, plus the personas' for a personal bot of the personal role), the bot's master
     /// context, the shared templates, reviewers and playbooks, and the tool registry
     /// (`tools.yaml`, which the worker reads to tell reads from writes), each at the same
     /// relative path under [`CONTENT_MOUNT`].
@@ -249,8 +275,18 @@ impl BotContext {
         }
     }
 
+    /// The files the policy is made from, for its header. The catalog is named only when its
+    /// personas add a skill folder, so a catalog that adds nothing (Nudge alone, whose role is
+    /// the personal role) leaves every policy byte for byte as it was.
     fn sources(&self) -> String {
-        format!("bots/{}/BOT.md and roles/{}/ROLE.md", self.bot, self.role)
+        if self.persona_skills.is_empty() {
+            format!("bots/{}/BOT.md and roles/{}/ROLE.md", self.bot, self.role)
+        } else {
+            format!(
+                "bots/{}/BOT.md, roles/{}/ROLE.md and personas/*/PERSONA.md",
+                self.bot, self.role
+            )
+        }
     }
 
     /// The policy file's text, header included.
@@ -474,6 +510,7 @@ pub(crate) mod tests {
             role: "docs-helper".into(),
             scope: Some(BotScope::Team),
             skills: vec!["docs".into()],
+            persona_skills: vec![],
             mcp_tools: ["docs_read", "docs_search"].map(String::from).into(),
             master: vec!["master/AGENTS.md".into()],
             shared: vec!["playbooks".into(), "reviewers".into(), "templates".into()],
@@ -487,6 +524,7 @@ pub(crate) mod tests {
             role: "pm-assistant".into(),
             scope: Some(BotScope::Personal),
             skills: vec!["ask".into(), "meeting-notes".into(), "prd-draft".into()],
+            persona_skills: vec![],
             mcp_tools: ["context_search", "jira_create_issue", "jira_search"]
                 .map(String::from)
                 .into(),
