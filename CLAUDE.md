@@ -15,7 +15,8 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   The PM OS user database is the source of users and roles, not `team.yaml`; the design is
   written as a spec and reviewed before it is built (`docs/user-database-spec.md`).
   Built 2026-11-18 (slices U1 to U7): every service decides from the database and `team.yaml`
-  is retired. Still open: the reviewer session's security gate on the final commit.
+  is retired. Security gate passed on 2026-11-21 at `04c175f` (no open High or Critical for the
+  user database and password sign-in; Medium findings G1 to G5 are being fixed).
 - **c. Policy Admin** for NVIDIA OpenShell. The app opens a pull request; the merge happens in
   GitHub.
   Owner, 2026-11-18, plan only (build nothing until the plan is approved): add OpenShell's
