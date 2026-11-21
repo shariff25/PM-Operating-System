@@ -83,6 +83,8 @@ struct IdpState {
     down: AtomicBool,
     discovery_hits: AtomicUsize,
     jwks_hits: AtomicUsize,
+    /// How long the keys take to answer, in milliseconds.
+    jwks_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 /// A fake Entra tenant: `GET /{tenant}/v2.0/.well-known/openid-configuration` and
@@ -123,6 +125,10 @@ async fn discovery(State(idp): State<Arc<IdpState>>, Path(tenant): Path<String>)
 
 async fn jwks(State(idp): State<Arc<IdpState>>) -> Response {
     idp.jwks_hits.fetch_add(1, Ordering::SeqCst);
+    let delay = idp.jwks_delay_ms.load(Ordering::SeqCst);
+    if delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
     if idp.down.load(Ordering::SeqCst) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -170,6 +176,13 @@ impl FakeIdp {
     /// Answer `503` to everything (or stop doing so).
     pub fn set_down(&self, down: bool) {
         self.state.down.store(down, Ordering::SeqCst);
+    }
+
+    /// Make the keys answer only after `delay` (a slow tenant).
+    pub fn set_jwks_delay(&self, delay: std::time::Duration) {
+        self.state
+            .jwks_delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 
     pub fn jwks_hits(&self) -> usize {

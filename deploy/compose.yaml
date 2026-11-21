@@ -305,8 +305,10 @@ services:
       # mode from deploy/.env. It also refuses it unless PMOS_WEB_TRUSTED_PROXIES names the
       # address the reverse proxy reaches it from, so the per-address limit counts browsers, not
       # the proxy: a proxy on this host comes in through the published port, from the `pmos`
-      # network's gateway (`pmos-admin up --web` prints it), and PMOS_WEB_PUBLIC_URL must be
-      # https://. PMOS_WEB_DIRECT is never passed: it is for a loopback bind with no proxy.
+      # network's gateway (PMOS_NETWORK_GATEWAY, pinned below; `pmos-admin up --web` checks
+      # it), and PMOS_WEB_PUBLIC_URL must be https://. A forwarded header from any other peer
+      # is refused and counted on /readyz. PMOS_WEB_DIRECT is never passed: it is for a
+      # loopback bind with no proxy.
       PMOS_WEB_PASSWORD_LOGIN: ${PMOS_WEB_PASSWORD_LOGIN:-0}
       PMOS_WEB_TRUSTED_PROXIES: ${PMOS_WEB_TRUSTED_PROXIES:-}
       PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}
@@ -400,7 +402,18 @@ services:
       - --port=8000
 
 networks:
-  pmos: {}
+  # A fixed subnet and gateway (the re-check of eb24d28, M1), so the address the reverse proxy
+  # on this host reaches the web app from (the gateway) never moves when the network is made
+  # again, and PMOS_WEB_TRUSTED_PROXIES stays right. 10.201.77.0/24 is outside Docker's own
+  # default pools (172.17-172.31.0.0/16, 192.168.0.0/16), so Docker never gives it to another
+  # network; a site that already routes it sets both in deploy/.env (deploy/env.example).
+  # `deploy/pmos-admin up --web` checks the real gateway against these and against
+  # PMOS_WEB_TRUSTED_PROXIES, and refuses on a mismatch.
+  pmos:
+    ipam:
+      config:
+        - subnet: ${PMOS_NETWORK_SUBNET:-10.201.77.0/24}
+          gateway: ${PMOS_NETWORK_GATEWAY:-10.201.77.1}
 
 volumes:
   pgdata: {}

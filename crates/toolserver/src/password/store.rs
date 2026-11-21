@@ -180,6 +180,33 @@ pub struct SetupCode {
     /// `Web` (an admin) or `Host`.
     pub issued_via: Via,
     pub expires_at: DateTime<Utc>,
+    /// Setup tokens it gave (migration 0023; at most `limits::SETUP_BEGINS_PER_CODE`).
+    pub begins: i32,
+    /// Passwords set with it, across its tokens (at most
+    /// `limits::SETUP_PASSWORD_SETS_PER_CODE`).
+    pub password_sets: i32,
+    /// Wrong codes tried against it (void at `limits::SETUP_WRONG_GUESSES_PER_CODE`).
+    pub wrong_guesses: i32,
+}
+
+impl SetupCode {
+    /// Has it given all the work it may (its tokens, or its password sets)? Then it is spent:
+    /// an admin issues a new one.
+    pub fn spent(&self) -> bool {
+        self.begins >= super::limits::SETUP_BEGINS_PER_CODE
+            || self.password_sets >= super::limits::SETUP_PASSWORD_SETS_PER_CODE
+    }
+
+    /// Its counters, to write back.
+    pub fn counts(&self, void: bool) -> CodeCounts {
+        CodeCounts {
+            id: self.id,
+            begins: self.begins,
+            password_sets: self.password_sets,
+            wrong_guesses: self.wrong_guesses,
+            void,
+        }
+    }
 }
 
 impl std::fmt::Debug for SetupCode {
@@ -192,9 +219,27 @@ impl std::fmt::Debug for SetupCode {
             .field("issued_by", &self.issued_by)
             .field("issued_via", &self.issued_via)
             .field("expires_at", &self.expires_at)
+            .field("begins", &self.begins)
+            .field("password_sets", &self.password_sets)
+            .field("wrong_guesses", &self.wrong_guesses)
             .finish()
     }
 }
+
+/// A live setup code's counters, written back by a plan; `void` revokes it as void (too many
+/// wrong guesses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeCounts {
+    pub id: i64,
+    pub begins: i32,
+    pub password_sets: i32,
+    pub wrong_guesses: i32,
+    pub void: bool,
+}
+
+/// How long a void code is kept for the admin overview after it was voided (the overview's
+/// window).
+pub const VOIDED_KEPT_DAYS: i64 = 7;
 
 /// A code to issue (replacing the live one).
 #[derive(Clone, PartialEq, Eq)]
@@ -260,6 +305,36 @@ pub struct Pending {
     pub staged_hash: Option<String>,
     /// Setup only: the authenticator secret being enrolled, sealed.
     pub staged_totp: Option<String>,
+    /// Setup only: passwords set with this token (migration 0023).
+    pub password_sets: i32,
+    /// Setup only: authenticator secrets made with this token.
+    pub enrolments: i32,
+}
+
+impl Pending {
+    /// A new token, with nothing staged and nothing counted.
+    pub fn new(
+        token_hash: String,
+        purpose: Purpose,
+        setup_code_id: Option<i64>,
+        epoch: i64,
+        created_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            token_hash,
+            purpose,
+            setup_code_id,
+            epoch,
+            created_at,
+            expires_at,
+            attempts: 0,
+            staged_hash: None,
+            staged_totp: None,
+            password_sets: 0,
+            enrolments: 0,
+        }
+    }
 }
 
 impl std::fmt::Debug for Pending {
@@ -274,6 +349,8 @@ impl std::fmt::Debug for Pending {
             .field("attempts", &self.attempts)
             .field("staged_hash", &redacted(&self.staged_hash))
             .field("staged_totp", &redacted(&self.staged_totp))
+            .field("password_sets", &self.password_sets)
+            .field("enrolments", &self.enrolments)
             .finish()
     }
 }
@@ -317,6 +394,8 @@ pub struct Writes {
     pub issue_code: Option<NewSetupCode>,
     /// Mark a setup code used.
     pub use_code: Option<i64>,
+    /// Write back the live setup code's counters (and void it).
+    pub code_counts: Option<CodeCounts>,
     /// Insert or replace these pending tokens (by hash).
     pub put_pending: Vec<Pending>,
     /// Delete these pending tokens (by hash).
@@ -342,6 +421,7 @@ impl std::fmt::Debug for Writes {
             .field("use_recovery", &redacted(&self.use_recovery))
             .field("issue_code", &self.issue_code)
             .field("use_code", &self.use_code)
+            .field("code_counts", &self.code_counts)
             .field("put_pending", &self.put_pending)
             .field("delete_pending", &self.delete_pending.len())
             .field("clear_pending", &self.clear_pending)
@@ -400,8 +480,73 @@ impl PasswordStatus {
     }
 }
 
+/// A reset code issued in the overview's window, and whether its person dismissed the notice
+/// since (LF).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetEntry {
+    pub handle: String,
+    /// The admin's handle, or `host`.
+    pub by: String,
+    pub at: DateTime<Utc>,
+    /// When the notice was dismissed after this reset, by the account's own session.
+    pub dismissed_at: Option<DateTime<Utc>>,
+}
+
+/// A setup code void after too many wrong guesses (M2): the admin issues a new one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoidedCode {
+    pub handle: String,
+    pub at: DateTime<Utc>,
+    pub wrong_guesses: i32,
+}
+
+/// What the admin overview shows about passwords since a time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PasswordOverview {
+    pub resets: Vec<ResetEntry>,
+    pub voided: Vec<VoidedCode>,
+}
+
+/// Pair each reset with the first dismissal of its person's notice after it (and before the
+/// person's next reset): the overview's view of `role_changes` (LF).
+pub fn pair_resets(
+    resets: Vec<(String, String, DateTime<Utc>)>,
+    dismissals: &[(String, DateTime<Utc>)],
+) -> Vec<ResetEntry> {
+    let mut out: Vec<ResetEntry> = Vec::new();
+    for (handle, by, at) in &resets {
+        let next_reset = resets
+            .iter()
+            .filter(|(h, _, a)| h == handle && a > at)
+            .map(|(_, _, a)| *a)
+            .min();
+        let dismissed_at = dismissals
+            .iter()
+            .filter(|(h, d)| h == handle && d >= at && next_reset.is_none_or(|n| *d < n))
+            .map(|(_, d)| *d)
+            .min();
+        out.push(ResetEntry {
+            handle: handle.clone(),
+            by: by.clone(),
+            at: *at,
+            dismissed_at,
+        });
+    }
+    out.sort_by_key(|r| std::cmp::Reverse(r.at));
+    out
+}
+
 #[async_trait]
 pub trait PasswordStore: Send + Sync {
+    /// Did anyone fully sign in from the address `source_key` (a
+    /// [`super::limits::source_key`]) since `since`? No lock. Decides whether a password step
+    /// may use the global limit's reserve, from the address alone (M3).
+    async fn source_known(&self, source_key: &str, since: DateTime<Utc>) -> StoreResult<bool>;
+
+    /// Resets issued since `since` (with their dismissals) and setup codes voided since then,
+    /// by time, not from a window of recent rows (LF).
+    async fn password_overview(&self, since: DateTime<Utc>) -> StoreResult<PasswordOverview>;
+
     /// The handle whose sign-in name is `name` (lower-case), if any. No lock.
     async fn handle_by_sign_in_name(&self, name: &str) -> StoreResult<Option<String>>;
 

@@ -125,8 +125,9 @@ pub const DEV_WITH_PASSWORD: &str = "PMOS_WEB_DEV_LOGIN=1 with PMOS_WEB_PASSWORD
 /// Why password sign-in won't start without knowing where browsers' addresses come from.
 pub const PASSWORD_NEEDS_PROXY: &str = "PMOS_WEB_PASSWORD_LOGIN=1 needs to tell browsers \
      apart for its per-address limit: set PMOS_WEB_TRUSTED_PROXIES to the address your reverse \
-     proxy reaches pmos-web from (in the deploy kit, the `pmos` network's gateway: \
-     `deploy/pmos-admin up --web` prints it), or, only when browsers reach pmos-web directly \
+     proxy reaches pmos-web from (in the deploy kit, the `pmos` network's pinned gateway, \
+     PMOS_NETWORK_GATEWAY, 10.201.77.1 unless changed: `deploy/pmos-admin up --web` checks \
+     it), or, only when browsers reach pmos-web directly \
      on a loopback address with no proxy, PMOS_WEB_DIRECT=1 (docs/password-sign-in.md)";
 
 /// Why `PMOS_WEB_DIRECT=1` won't start on a reachable address.

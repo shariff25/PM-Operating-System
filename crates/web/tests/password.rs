@@ -30,6 +30,8 @@ const TEAM: &str = "members:
 ";
 /// The one pending token the stand-in hands out after the right password.
 const PENDING: &str = "ppppppppppppppppppppppppppppppppppppppppppp";
+/// A live setup token the stand-in accepts.
+const SETUP: &str = "sssssssssssssssssssssssssssssssssssssssssss";
 const RIGHT: &str = "the right passphrase";
 const CODE: &str = "123456";
 
@@ -138,6 +140,16 @@ async fn toolserver(
         }))
         .into_response(),
         "/internal/password/reset-notice/dismiss" => StatusCode::NO_CONTENT.into_response(),
+        "/internal/password/setup/password" => {
+            if b["setup_token"] == SETUP {
+                Json(json!({"next": "authenticator"})).into_response()
+            } else {
+                coded(StatusCode::UNAUTHORIZED, "setup_expired")
+            }
+        }
+        "/internal/password/recovery-codes" => {
+            Json(json!({"recovery_codes": ["aaaa-bbbb-cccc-dddd"]})).into_response()
+        }
         _ => coded(StatusCode::NOT_FOUND, "not_found"),
     }
 }
@@ -421,20 +433,147 @@ async fn behind_a_trusted_proxy_a_flood_from_one_browser_does_not_stop_another()
     assert!(w.sources().contains(&json!("2001:db8:5:6::/64")));
 }
 
-/// P2: a peer that isn't a trusted proxy is counted by its own address, whatever
-/// `X-Forwarded-For` it sends.
+/// M1 (the re-check of eb24d28): with proxies named, a forwarded header from a peer that isn't
+/// one (the proxy's address moved, or the setting is wrong) is refused, not silently counted
+/// as one address for everyone, and counted on `/readyz`; so is a trusted proxy that names no
+/// client. The tool server is never asked, so it never learns a proxy's address as anyone's.
+/// A peer not on the list that forwards nothing is still counted by its own address.
 #[tokio::test]
-async fn an_untrusted_peers_forwarded_for_is_ignored() {
+async fn a_wrong_or_stale_proxy_setting_is_refused_and_counted() {
     let w = web(&["10.9.9.9"]).await;
+    for i in 0..3 {
+        let r = w
+            .sign_in(&[xff(&format!("192.0.2.{}", i + 1))], RIGHT)
+            .await;
+        assert_eq!(
+            (r.status, r.code()),
+            (StatusCode::FORBIDDEN, "proxy_not_trusted"),
+            "{}",
+            r.body
+        );
+    }
+    let r = w
+        .send(
+            Method::POST,
+            "/api/auth/password/setup/begin",
+            &[("x-real-ip", "192.0.2.9".into())],
+            Some(json!({"sign_in_name": "ana@example.com", "setup_code": "AAAAA"})),
+        )
+        .await;
+    assert_eq!(r.code(), "proxy_not_trusted");
+    assert_eq!(w.password_calls(), 0, "the tool server wasn't asked");
+    let ready = w.send(Method::GET, "/readyz", &[], None).await;
+    assert_eq!(ready.body["untrusted_proxy_refusals"], 4, "{}", ready.body);
+    // Nothing forwarded: counted by its own address, as before.
+    assert_eq!(w.sign_in(&[], RIGHT).await.status, StatusCode::OK);
+    assert_eq!(w.sources(), [json!("127.0.0.1")]);
+
+    // The trusted proxy itself, naming no client: refused too, never counted as the proxy.
+    let w = web(&["127.0.0.1"]).await;
+    for headers in [
+        vec![],
+        vec![xff("127.0.0.1")],
+        vec![xff("198.51.100.66, junk")],
+    ] {
+        let r = w.sign_in(&headers, RIGHT).await;
+        assert_eq!(
+            (r.status, r.code()),
+            (StatusCode::FORBIDDEN, "proxy_not_trusted"),
+            "{headers:?}"
+        );
+    }
+    assert_eq!(w.password_calls(), 0);
+    let ready = w.send(Method::GET, "/readyz", &[], None).await;
+    assert_eq!(ready.body["untrusted_proxy_refusals"], 3, "{}", ready.body);
+    // nginx's appending header, with junk the client sent: the address nginx appended counts.
+    let r = w
+        .sign_in(&[xff("junk, unknown, 203.0.113.10")], RIGHT)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(w.sources(), [json!("203.0.113.10")]);
+}
+
+/// H1 (the re-check of eb24d28): every `setup/password` call hashes at the tool server, so
+/// each counts against the caller's address even when it succeeds; after twenty the address
+/// waits and the tool server isn't asked again. Another browser's sign-in still goes through.
+/// LA: the signed-in routes that do work (`recovery-codes`, `change`) count the same way.
+#[tokio::test]
+async fn setup_passwords_count_against_the_address_even_when_they_succeed() {
+    let w = web(&["127.0.0.1"]).await;
+    let holder = [
+        xff("198.51.100.66"),
+        ("cookie", format!("__Host-pmos-setup={SETUP}")),
+    ];
     for i in 0..20 {
         let r = w
-            .sign_in(&[xff(&format!("192.0.2.{}", i + 1))], "a wrong guess here")
+            .send(
+                Method::POST,
+                "/api/auth/password/setup/password",
+                &holder,
+                Some(json!({"password": "a long enough passphrase"})),
+            )
             .await;
-        assert_eq!(r.code(), "sign_in_failed");
+        assert_eq!(r.status, StatusCode::NO_CONTENT, "{i}: {}", r.body);
     }
-    let r = w.sign_in(&[xff("192.0.2.200")], RIGHT).await;
+    let asked = w.password_calls();
+    let r = w
+        .send(
+            Method::POST,
+            "/api/auth/password/setup/password",
+            &holder,
+            Some(json!({"password": "a long enough passphrase"})),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.code()),
+        (StatusCode::TOO_MANY_REQUESTS, "too_many_attempts")
+    );
+    assert_eq!(w.password_calls(), asked, "the tool server wasn't asked");
+    // Another browser signs in meanwhile.
+    let owner = [xff("203.0.113.10")];
+    let session = w.full_sign_in(&owner).await.expect("signed in");
+    // Its recovery codes, twenty times: then its address waits too.
+    let me = w
+        .send(
+            Method::GET,
+            "/api/me",
+            &[("cookie", format!("__Host-pmos={session}"))],
+            None,
+        )
+        .await;
+    let csrf = me.body["csrf_token"].as_str().unwrap().to_string();
+    let signed = [
+        xff("203.0.113.10"),
+        ("cookie", format!("__Host-pmos={session}")),
+        ("x-pmos-csrf", csrf),
+    ];
+    let mut statuses = Vec::new();
+    for _ in 0..20 {
+        statuses.push(
+            w.send(
+                Method::POST,
+                "/api/auth/password/recovery-codes",
+                &signed,
+                Some(json!({"code": CODE})),
+            )
+            .await
+            .status,
+        );
+    }
+    // The full sign-in's two steps succeeded (not counted); so twenty calls fit, then a wait.
+    assert!(
+        statuses.iter().all(|s| *s == StatusCode::OK),
+        "{statuses:?}"
+    );
+    let r = w
+        .send(
+            Method::POST,
+            "/api/auth/password/recovery-codes",
+            &signed,
+            Some(json!({"code": CODE})),
+        )
+        .await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
-    assert!(w.sources().iter().all(|s| *s == json!("127.0.0.1")));
 }
 
 /// With no trusted proxy (`PMOS_WEB_DIRECT=1`), a forwarded header means a proxy nobody named

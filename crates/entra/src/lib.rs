@@ -332,7 +332,12 @@ pub struct Verifier {
     tenant: Tenant,
     http: reqwest::Client,
     metadata: tokio::sync::Mutex<MetadataCache>,
-    keys: tokio::sync::Mutex<KeyCache>,
+    /// The keys. Never held across a fetch (the re-check of eb24d28, LC): a token under a
+    /// known key is checked at once, even while the keys are being fetched.
+    keys: std::sync::Mutex<KeyCache>,
+    /// One fetch of the keys at a time: concurrent requests for an unknown `kid` wait for the
+    /// one fetch in flight (at most [`FETCH_TIMEOUT`]) and read what it found.
+    refresh: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for Verifier {
@@ -354,7 +359,8 @@ impl Verifier {
             tenant,
             http,
             metadata: tokio::sync::Mutex::new(MetadataCache::default()),
-            keys: tokio::sync::Mutex::new(KeyCache::default()),
+            keys: std::sync::Mutex::new(KeyCache::default()),
+            refresh: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -454,23 +460,60 @@ impl Verifier {
         Ok(meta)
     }
 
+    fn cache(&self) -> std::sync::MutexGuard<'_, KeyCache> {
+        self.keys.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The key `kid` names in the cache, while the cache is fresh.
+    fn cached(&self, kid: &str) -> Option<Result<DecodingKey, Failure>> {
+        let cache = self.cache();
+        let fresh = cache.fetched.is_some_and(|at| at.elapsed() < METADATA_TTL);
+        let (n, e) = cache.keys.get(kid).filter(|_| fresh)?;
+        Some(
+            DecodingKey::from_rsa_components(n, e)
+                .map_err(|_| Failure::Failed("unusable signing key")),
+        )
+    }
+
     /// The key a token's `kid` names. The keys are fetched when there are none or they are a
     /// day old (after a failure, not again for the backoff), and an unknown `kid` refetches
-    /// them at most once per `jwks_refetch_after`. Fails closed: a key that can't be read
-    /// signs nothing in.
+    /// them at most once per `jwks_refetch_after`. A fetch runs outside the cache's lock, one
+    /// at a time (concurrent requests wait for it and read its result), within
+    /// [`FETCH_TIMEOUT`] for the discovery document and the keys together, so a first link
+    /// on a cold cache answers inside `pmos-web`'s 5 seconds (LC). Fails closed: a key that
+    /// can't be read signs nothing in.
     async fn key(&self, kid: &str) -> Result<DecodingKey, Failure> {
-        let mut cache = self.keys.lock().await;
-        let stale = cache.fetched.is_none_or(|at| at.elapsed() >= METADATA_TTL);
-        let unknown = !cache.keys.contains_key(kid);
-        let gap = if cache.failed {
-            self.backoff()
-        } else {
-            self.tenant.jwks_refetch_after
+        if let Some(found) = self.cached(kid) {
+            return found;
+        }
+        let _one = self.refresh.lock().await;
+        let fetch = {
+            let mut cache = self.cache();
+            let stale = cache.fetched.is_none_or(|at| at.elapsed() >= METADATA_TTL);
+            let unknown = !cache.keys.contains_key(kid);
+            let gap = if cache.failed {
+                self.backoff()
+            } else {
+                self.tenant.jwks_refetch_after
+            };
+            let may_fetch = cache.attempted.is_none_or(|at| at.elapsed() >= gap);
+            if (stale || unknown) && may_fetch {
+                cache.attempted = Some(Instant::now());
+                true
+            } else if stale {
+                return Err(Failure::Unavailable("keys unavailable"));
+            } else {
+                // Fresh, and either another request just fetched it, or the kid is unknown
+                // and refetched too recently.
+                false
+            }
         };
-        let may_fetch = cache.attempted.is_none_or(|at| at.elapsed() >= gap);
-        if (stale || unknown) && may_fetch {
-            cache.attempted = Some(Instant::now());
-            match self.fetch_keys().await {
+        if fetch {
+            let fetched = tokio::time::timeout(FETCH_TIMEOUT, self.fetch_keys())
+                .await
+                .unwrap_or(Err(Failure::Unavailable("keys unavailable")));
+            let mut cache = self.cache();
+            match fetched {
                 Ok(keys) => {
                     cache.keys = keys;
                     cache.fetched = Some(Instant::now());
@@ -481,9 +524,8 @@ impl Verifier {
                     return Err(f);
                 }
             }
-        } else if stale {
-            return Err(Failure::Unavailable("keys unavailable"));
         }
+        let cache = self.cache();
         let (n, e) = cache
             .keys
             .get(kid)
@@ -606,36 +648,24 @@ impl Verifier {
     }
 }
 
-/// The tokens already used for a first link, so a captured one can't be replayed: each
-/// `(oid, iat)` is remembered until its token expires (plus the skew). In memory: the tool
-/// server runs one replica (`docs/user-database-spec.md` §12, "Out of scope"), and a restart
-/// forgets, which leaves a token's remaining lifetime (an hour at most) open after a restart.
-#[derive(Default)]
-pub struct UsedTokens {
-    used: std::sync::Mutex<HashMap<(String, i64), i64>>,
-}
-
-impl UsedTokens {
-    /// Record `identity`'s token as used at `now`. `false` if it was already used.
-    pub fn first_use(&self, identity: &Identity, now: DateTime<Utc>) -> bool {
-        let t = now.timestamp();
-        let mut used = self.used.lock().unwrap_or_else(|p| p.into_inner());
-        used.retain(|_, until| *until > t);
-        let key = (identity.oid.clone(), identity.issued_at);
-        if used.contains_key(&key) {
-            return false;
-        }
-        used.insert(key, identity.expires_at + SKEW_SECONDS);
-        true
+impl Identity {
+    /// What makes this token usable for one first link only: a SHA-256 of its `(oid, iat)`,
+    /// 64 hex characters. The tool server keeps it (never the `oid`) until
+    /// [`Self::replay_until`], in Postgres, so a restart doesn't forget a used token (the
+    /// re-check of eb24d28, M4).
+    pub fn replay_key(&self) -> String {
+        let mut h = Sha256::new();
+        h.update(b"pmos-entra-first-link\0");
+        h.update(self.oid.as_bytes());
+        h.update(b"\0");
+        h.update(self.issued_at.to_string().as_bytes());
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// How many are remembered now (for tests).
-    pub fn len(&self) -> usize {
-        self.used.lock().unwrap_or_else(|p| p.into_inner()).len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// Until when the token could still pass [`Verifier::validate`]: its `exp` plus the skew.
+    pub fn replay_until(&self) -> DateTime<Utc> {
+        DateTime::from_timestamp(self.expires_at.saturating_add(SKEW_SECONDS), 0)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
     }
 }
 

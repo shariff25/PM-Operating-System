@@ -1,6 +1,7 @@
 import { createContext, useContext } from 'react';
 import type { Api, Me } from './api';
 import type { Theme } from './theme';
+import { ApiError, isServerErrorCode } from './api/types';
 
 export interface AppContextValue {
   api: Api;
@@ -24,7 +25,12 @@ export function useApp(): AppContextValue {
   return ctx;
 }
 
-/** A plain sentence from any thrown value. ApiError messages are already plain. */
+/**
+ * A plain sentence from any thrown value. ApiError messages for a code in the contract are
+ * pmos-web's own plain sentences; for any other code the server's message is never shown, only
+ * `fallback` (as `errorText`, the re-check of eb24d28, LH).
+ */
 export function messageOf(e: unknown, fallback: string): string {
+  if (e instanceof ApiError && !isServerErrorCode(e.code) && e.code !== 'network') return fallback;
   return e instanceof Error && e.message ? e.message : fallback;
 }

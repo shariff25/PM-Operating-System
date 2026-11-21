@@ -285,18 +285,32 @@ async fn start_with(postgres: bool, entra: bool) -> Option<Server> {
         (common::fixture(), None)
     };
     seed(f.stores.users.as_ref()).await;
+    let idp = if entra {
+        Some(FakeIdp::start(TID).await)
+    } else {
+        None
+    };
+    let (base, cancel) = serve(&f, idp.as_ref()).await;
+    Some(Server {
+        base,
+        cancel,
+        f,
+        pg,
+        idp,
+        issued: AtomicI64::new(Utc::now().timestamp() - 600),
+    })
+}
+
+/// The tool server's router over `f`'s stores, with its own first-link check (a fresh key
+/// cache and nothing remembered in the process), served on a new port.
+async fn serve(f: &Fixture, idp: Option<&FakeIdp>) -> (String, CancellationToken) {
     let keys = parse_keys(
         &format!("web:toolserver:w1:{WEB_KEY}"),
         "the tool server",
         |iss, aud| aud == AUDIENCE && ISSUERS.contains(&iss),
     )
     .unwrap();
-    let idp = if entra {
-        Some(FakeIdp::start(TID).await)
-    } else {
-        None
-    };
-    let check = idp.as_ref().map(|idp| {
+    let check = idp.map(|idp| {
         let mut tenant = pmos_entra::Tenant::from_settings(
             [
                 "PMOS_ENTRA_TENANT_ID",
@@ -343,14 +357,18 @@ async fn start_with(postgres: bool, entra: bool) -> Option<Server> {
             .await
             .unwrap();
     });
-    Some(Server {
-        base,
-        cancel,
-        f,
-        pg,
-        idp,
-        issued: AtomicI64::new(Utc::now().timestamp() - 600),
-    })
+    (base, cancel)
+}
+
+impl Server {
+    /// A restart: this process's state (the first-link check, its key cache, every limit) is
+    /// gone; the stores remain (in Postgres, the database).
+    async fn restart(&mut self) {
+        self.cancel.cancel();
+        let (base, cancel) = serve(&self.f, self.idp.as_ref()).await;
+        self.base = base;
+        self.cancel = cancel;
+    }
 }
 
 /// Both stores: memory always, Postgres when a test database is set.
@@ -1176,6 +1194,122 @@ async fn a_replayed_token_is_refused() {
         assert_eq!((s, body["first_link"].as_bool()), (200, Some(false)));
         srv.stop().await;
     }
+}
+
+/// M4 (the re-check of eb24d28): a used token stays used across a restart. The used tokens
+/// are the store's (Postgres in a deployment; the memory store keeps its own list), not the
+/// process's: a new router, a new first-link check and an empty key cache still refuse it.
+#[tokio::test]
+async fn a_replayed_token_is_refused_after_a_restart() {
+    for mut srv in both().await {
+        let token = srv.token(OID_NEW, "ana@contoso.com");
+        let (s, body) = srv.link_token("ana", &token).await;
+        assert_eq!(
+            (s, body["first_link"].as_bool()),
+            (200, Some(true)),
+            "{body}"
+        );
+        srv.restart().await;
+        let (s, body) = srv.link_token("ana", &token).await;
+        assert_eq!(
+            (s, body["code"].as_str()),
+            (403, Some("token_used")),
+            "a replay after a restart: {body}"
+        );
+        // Her next sign-in's token (a new `iat`) is its own.
+        let (s, body) = srv.link("ana", "ana@contoso.com", OID_NEW).await;
+        assert_eq!((s, body["first_link"].as_bool()), (200, Some(false)));
+        srv.stop().await;
+    }
+}
+
+/// LE: "already linked" never vouches for someone who may not be linked through pmos-web: an
+/// Admin's host-set link, a deactivated person.
+#[tokio::test]
+async fn already_linked_still_checks_who_may_link() {
+    for srv in both().await {
+        let (s, body) = srv.link("ada", "ada@contoso.com", OID_ADA).await;
+        assert_eq!(
+            (s, body["code"].as_str()),
+            (403, Some("host_only")),
+            "{body}"
+        );
+        let (s, _) = srv.link("ana", "ana@contoso.com", OID_NEW).await;
+        assert_eq!(s, 200);
+        srv.users()
+            .apply(
+                &host(),
+                Op::Deactivate {
+                    handle: "ana".into(),
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let (s, body) = srv.link("ana", "ana@contoso.com", OID_NEW).await;
+        assert_eq!(
+            (s, body["code"].as_str()),
+            (403, Some("not_active")),
+            "{body}"
+        );
+        srv.stop().await;
+    }
+}
+
+/// LB and LD: refusals decided before the store (a malformed body, the tenant's keys down, no
+/// settings) are counted against the caller's miss limit first, and audited only while under
+/// it: past it they answer `429` with no audit row, so a web-token holder can't flood the
+/// audit log.
+#[tokio::test]
+async fn refusals_before_the_store_are_limited_before_they_are_audited() {
+    let audited = |events: &[AuditEvent], detail: &str| {
+        events
+            .iter()
+            .filter(|e| e.tool == "users.identity_link" && e.detail.as_deref() == Some(detail))
+            .count()
+    };
+    // A malformed body (LB).
+    let srv = start(false).await.unwrap();
+    for i in 0..MISSES_PER_MINUTE + 5 {
+        let (s, body) = srv.link_body("ana", json!({ "nope": 1 })).await;
+        let want = if i < MISSES_PER_MINUTE { 422 } else { 429 };
+        assert_eq!(s, want, "{i}: {body}");
+    }
+    assert_eq!(
+        audited(&srv.events().await, "entra; invalid"),
+        MISSES_PER_MINUTE
+    );
+    srv.stop().await;
+    // The tenant's keys down (LD): 503, counted and audited, then 429.
+    let srv = start(false).await.unwrap();
+    srv.idp.as_ref().unwrap().set_down(true);
+    for i in 0..MISSES_PER_MINUTE + 3 {
+        let (s, body) = srv.link("ana", "ana@contoso.com", OID_NEW).await;
+        let want = if i < MISSES_PER_MINUTE {
+            (503, "entra_unavailable")
+        } else {
+            (429, "resolve_misses")
+        };
+        assert_eq!((s, body["code"].as_str().unwrap()), want, "{i}");
+    }
+    assert_eq!(
+        audited(&srv.events().await, "entra; entra_unavailable"),
+        MISSES_PER_MINUTE
+    );
+    srv.stop().await;
+    // No Entra settings (LD): 501, counted and audited, then 429.
+    let srv = start_with(false, false).await.unwrap();
+    for i in 0..MISSES_PER_MINUTE + 3 {
+        let (s, _) = srv
+            .link_body("ana", json!({ "id_token": "x.y.z", "nonce": NONCE }))
+            .await;
+        assert_eq!(s, if i < MISSES_PER_MINUTE { 501 } else { 429 }, "{i}");
+    }
+    assert_eq!(
+        audited(&srv.events().await, "entra; not_configured"),
+        MISSES_PER_MINUTE
+    );
+    srv.stop().await;
 }
 
 /// The takeover from the review (U1), end to end: someone holding only the web token, and a

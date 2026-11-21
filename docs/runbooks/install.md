@@ -272,6 +272,27 @@ sign-in lets anyone who can reach its port sign in as any member. See
 With **password sign-in** (`PMOS_WEB_PASSWORD_LOGIN=1`, [docs/password-sign-in.md](../password-sign-in.md))
 the web app also needs `PMOS_WEB_PUBLIC_URL` set to its `https://` address and
 `PMOS_WEB_TRUSTED_PROXIES` set to the address the reverse proxy reaches it from: for a proxy on
-this host, the `pmos` network's gateway. Run `deploy/pmos-admin up` first (it makes the
-network), then `deploy/pmos-admin up --web`: while the setting is blank it refuses, printing the
-line to put in `deploy/.env`. The proxy must send `X-Forwarded-For`.
+this host, the `pmos` network's gateway, which the kit **pins**: `PMOS_NETWORK_SUBNET`
+(`10.201.77.0/24`) and `PMOS_NETWORK_GATEWAY` (`10.201.77.1`) in `deploy/.env`, and
+`env.example` already sets `PMOS_WEB_TRUSTED_PROXIES=10.201.77.1`. Change the pair only if
+your site already routes that range. The proxy must send `X-Forwarded-For` (nginx:
+`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`).
+
+`deploy/pmos-admin up --web` refuses before anything starts, printing the fix, when:
+
+| It says | What to do |
+| --- | --- |
+| `PMOS_WEB_TRUSTED_PROXIES is blank` | Put the printed `PMOS_WEB_TRUSTED_PROXIES=<gateway>` line in `deploy/.env`. |
+| `The pmos network's gateway is <a>, but deploy/.env pins PMOS_NETWORK_GATEWAY=<b>` | The network was made before the kit pinned it (or with other settings). Run `deploy/pmos-admin down && deploy/pmos-admin up --web`: `down` removes the network and `up` makes it at the pinned address. Every service restarts. |
+| `PMOS_WEB_TRUSTED_PROXIES names <x>, but ... the gateway, <g>` | The setting is stale (an old, unpinned gateway such as `172.18.0.1`). Set the printed line. A proxy in a container on the `pmos` network may be listed by its own address inside the subnet. |
+| `PMOS_WEB_PUBLIC_URL must be the web app's https:// address` | Set it. |
+
+**After it starts, if password sign-in answers "PM OS can't sign you in through this
+address"** (`403 proxy_not_trusted`): the requests arrive from somewhere
+`PMOS_WEB_TRUSTED_PROXIES` doesn't name, or the proxy sends no `X-Forwarded-For`. The web app's
+`/readyz` counts them (`untrusted_proxy_refusals`, since it started:
+`curl -s http://127.0.0.1:8770/readyz`) and its log says so at error level once a minute
+(`deploy/pmos-admin logs web`). Check the proxy sets `X-Forwarded-For`, and that its requests
+reach the published port from the gateway; fix `deploy/.env` and run `deploy/pmos-admin up
+--web` again. Nothing is counted against a shared address meanwhile: every such request is
+refused.

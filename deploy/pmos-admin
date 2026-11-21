@@ -129,32 +129,82 @@ client_settings() { # web|console
   fi
 }
 
+# An IPv4 address as a number; nothing for anything else.
+ipv4_number() {
+  local IFS=. a b c d
+  read -r a b c d <<<"$1"
+  for o in "$a" "$b" "$c" "$d"; do
+    [[ "$o" =~ ^[0-9]{1,3}$ ]] && [ "$o" -le 255 ] || return 1
+  done
+  echo $(((a << 24) | (b << 16) | (c << 8) | d))
+}
+
+# Is the IPv4 address $1 inside the IPv4 subnet $2 (a.b.c.d/n)?
+ipv4_in_subnet() {
+  local ip net bits mask
+  ip=$(ipv4_number "$1") || return 1
+  net=$(ipv4_number "${2%/*}") || return 1
+  bits=${2#*/}
+  [[ "$bits" =~ ^[0-9]{1,2}$ ]] && [ "$bits" -le 32 ] || return 1
+  mask=$(((0xffffffff << (32 - bits)) & 0xffffffff))
+  [ $((ip & mask)) = $((net & mask)) ]
+}
+
 # Password sign-in counts refused attempts per browser address (docs/password-sign-in.md,
 # "Behind the deploy kit's reverse proxy"). The web app listens on 0.0.0.0 in its container and
 # the reverse proxy on this host reaches it through the published port, so every request
-# arrives from the `pmos` network's gateway. pmos-web refuses to start unless it is told that
-# address (PMOS_WEB_TRUSTED_PROXIES) and has an https:// public URL; this says exactly what to
-# set before anything starts.
+# arrives from the `pmos` network's gateway, which deploy/compose.yaml pins
+# (PMOS_NETWORK_GATEWAY, in PMOS_NETWORK_SUBNET; the re-check of eb24d28, M1). pmos-web refuses
+# to start unless it is told that address (PMOS_WEB_TRUSTED_PROXIES) and has an https:// public
+# URL. This refuses, with the exact fix, before anything starts: a blank setting; a network
+# made before its gateway was pinned (its real gateway isn't PMOS_NETWORK_GATEWAY); and a
+# trusted address that is neither the real gateway nor inside the pinned subnet (a proxy in a
+# container on the pmos network), which would make pmos-web refuse every browser.
 password_web_checks() {
   [ "${PMOS_WEB_PASSWORD_LOGIN:-0}" = 1 ] || return 0
-  local bad=0 gw
+  local bad=0 real want subnet entry
+  want=${PMOS_NETWORK_GATEWAY:-10.201.77.1}
+  subnet=${PMOS_NETWORK_SUBNET:-10.201.77.0/24}
+  real=$(docker network inspect pmos_pmos --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)
+  if [ -n "$real" ] && [ "$real" != "$want" ]; then
+    {
+      say "The pmos network's gateway is $real, but deploy/.env pins PMOS_NETWORK_GATEWAY=$want"
+      say "(PMOS_NETWORK_SUBNET=$subnet): the network was made before its address was pinned, or"
+      say "with other settings. Re-create it, then start again:"
+      say "  deploy/pmos-admin down && deploy/pmos-admin up --web"
+    } >&2
+    bad=1
+  fi
+  [ -n "$real" ] || real=$want
   if [ -z "${PMOS_WEB_TRUSTED_PROXIES:-}" ]; then
-    gw=$(docker network inspect pmos_pmos --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)
     {
       say "PMOS_WEB_TRUSTED_PROXIES is blank in deploy/.env. With password sign-in on, the web app"
       say "must know the address the reverse proxy reaches it from, or every browser would share"
       say "one limit on refused sign-ins (and pmos-web refuses to start)."
-      if [ -n "$gw" ]; then
-        say "The reverse proxy on this host reaches it from the pmos network's gateway. Set:"
-        say "  PMOS_WEB_TRUSTED_PROXIES=$gw"
-      else
-        say "Start the core services first (deploy/pmos-admin up), then read the pmos network's"
-        say "gateway and set PMOS_WEB_TRUSTED_PROXIES to it:"
-      fi
-      say "  (found with: docker network inspect pmos_pmos --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}')"
+      say "The reverse proxy on this host reaches it from the pmos network's gateway. Set:"
+      say "  PMOS_WEB_TRUSTED_PROXIES=$real"
+      say "  (the gateway is pinned in deploy/.env, PMOS_NETWORK_GATEWAY; check it with:"
+      say "   docker network inspect pmos_pmos --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}')"
       say "A reverse proxy in a container on the pmos network instead: set its container address."
     } >&2
     bad=1
+  else
+    local list=()
+    IFS=, read -ra list <<<"$PMOS_WEB_TRUSTED_PROXIES"
+    for entry in "${list[@]}"; do
+      entry=${entry//[[:space:]]/}
+      [ -n "$entry" ] || continue
+      if [ "$entry" != "$real" ] && ! ipv4_in_subnet "$entry" "$subnet"; then
+        {
+          say "PMOS_WEB_TRUSTED_PROXIES names $entry, but the reverse proxy on this host reaches the"
+          say "web app from the pmos network's gateway, $real. pmos-web would refuse every browser"
+          say "(403 proxy_not_trusted). Set:"
+          say "  PMOS_WEB_TRUSTED_PROXIES=$real"
+          say "(A proxy in a container on the pmos network has an address inside $subnet.)"
+        } >&2
+        bad=1
+      fi
+    done
   fi
   case "${PMOS_WEB_PUBLIC_URL:-}" in
     https://*) ;;
