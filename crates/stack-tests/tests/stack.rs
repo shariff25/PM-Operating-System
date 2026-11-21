@@ -950,7 +950,7 @@ impl Stack {
         let report =
             pmos_contract::lint(&self.root, &pmos_contract::LintOptions::for_service(today));
         assert!(!report.has_errors(), "{:#?}", report.diagnostics);
-        assert_eq!(report.skills.len(), 40);
+        assert_eq!(report.skills.len(), 46);
 
         // A console item read: Ana reads her task; Mallory (by handle, or by the address the
         // file gives her) and Eve read nothing; Ben's console isn't an admin's.
