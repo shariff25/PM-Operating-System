@@ -10,6 +10,8 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 use crate::frontmatter;
+
+mod catalog;
 use crate::model::{
     ContextFrontMatter, ModelRole, PlaybookFrontMatter, ReviewerFrontMatter, Sensitivity, Skill,
     SkillFrontMatter, TemplateFrontMatter, ToolRegistry, CONTEXT_DOMAINS, PHASES, SURFACES,
@@ -85,6 +87,9 @@ pub struct Report {
     /// Roles and bots that parsed, for services that load them (the bot runtime).
     pub roles: Vec<crate::bots::Role>,
     pub bots: Vec<crate::bots::Bot>,
+    /// The bot marketplace's catalog (`personas/<key>/PERSONA.md`): each persona whose own file
+    /// has no error, by `order`, then name.
+    pub personas: Vec<crate::personas::Persona>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -133,6 +138,7 @@ pub fn lint(root: &Path, opts: &LintOptions) -> Report {
     cx.check_team_file_retired(opts);
     cx.check_people();
     cx.check_roles_and_bots(registry.as_ref());
+    cx.check_personas(registry.as_ref());
 
     cx.report
         .diagnostics

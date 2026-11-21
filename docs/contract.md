@@ -15,6 +15,9 @@ content/
   reviewers/*.md                     reviewer personas
   templates/*.md                     document templates
   playbooks/*.md                     how a kind of PM work is done, and the bar (optional)
+  roles/<role>/ROLE.md               bot roles (optional)
+  bots/<name>/BOT.md                 named bots (optional)
+  personas/<key>/PERSONA.md          the bot marketplace's catalog (optional)
 ```
 
 `README.md` files are documentation and are never linted as content.
@@ -214,6 +217,69 @@ Rules:
 - **Bots:** `bot-parse`, `bot-name`, `bot-description`, `bot-body-empty`, `bot-role-unknown`, `bot-owner-handle` (the owner isn't a PM OS handle; whether they are an active user is the user database's to say: the admin overview lists bots without an active owner), `bot-reads-personal`, and `bot-reads-empty` (warning).
 - **Actions:** `action-auto`, `action-not-write`, `action-unknown-tool`.
 
+## Personas: `personas/<key>/PERSONA.md`
+
+The bot marketplace's catalog (`docs/bot-marketplace-spec.md` §2). In the product Chief,
+Sprout and Echo are "bots"; in code they are **personas**: a role a PM's own personal bot
+(`pm-<handle>`) runs as, chosen per ask. A persona has no sandbox of its own. The folder is
+optional; a catalog with any persona needs Nudge.
+
+```yaml
+# personas/chief/PERSONA.md
+---
+name: chief                   # equals the folder; lowercase, digits, single hyphens, at most 32
+display-name: Chief           # 1-24 ASCII letters, digits and single spaces; the Slack prefix
+title: Chief of Staff         # 1-40 characters
+role: chief-of-staff          # a role in roles/, at most as wide as pm-assistant (below)
+mascot: chief                 # nudge | chief | sprout | echo
+owner: "TODO"
+version: "0.1.0"
+offered: true                 # default false: whether PMs see and may use it
+always-on: false              # default false; exactly one persona, `nudge`, sets true
+order: 20                     # 0-1000, display order
+summary: Runs your week: what needs you, what is slipping, and what to tell your leadership.
+examples:                     # 1 to 6, each 1-80 characters
+  - Prep me for the staff meeting
+  - What slipped since Monday?
+can-do: daily-brief meeting-prep week-review   # optional; skills of the role; default all
+needs:                        # optional
+  - source: analytics         # analytics | crm
+    label: an analytics source                 # 1-40 characters
+    without: I work from numbers you paste in or that a Confluence page holds, and I say so.
+---
+Notes for maintainers (optional): never shown to PMs, never sent to a model.
+```
+
+`title`, `summary`, `examples`, `needs[].label` and `needs[].without` are one line each, not
+blank, with no `<`, `>` or control characters. The persona's instructions are its role's body.
+What it reads and may draft is derived from its role's tools, never written here
+(`crates/contract/src/personas.rs`): "reads" is the systems of its read tools other than
+`context`, `memory`, `stats` and `bets`; "drafts" is the label of each write tool whose setting
+(the stricter of its role's and `pm-assistant`'s) is `approve`. A need is met when the role has
+a `read` tool whose `system` is the need's source.
+
+**The ceiling.** The personal role is `pm-assistant` (`PERSONAL_ROLE` in
+`crates/contract/src/onboarding.rs`). A persona can never do more than a PM's own bot:
+
+| Rule | Code | Severity |
+| --- | --- | --- |
+| Every tool of the persona's role is a tool of `pm-assistant` (each extra one is named) | `persona-exceeds-base` | error |
+| The role's data class is at most `pm-assistant`'s | `persona-data-class` | error |
+| No write that `pm-assistant` sets to `never` is anything but `never` in the role | `persona-action` | error |
+| The role is not a team bot's role | `persona-role-team` | error |
+| Every skill of the role lists `web` or `slack` in `surfaces` | `persona-skill-surface` | warning |
+
+A persona's skills need not be `pm-assistant`'s (that is how a specialist gets a skill Nudge
+doesn't have); their tools must be.
+
+Other rules: `persona-parse` (front matter missing, unknown field or wrong type),
+`persona-missing-file`, `persona-name` (folder, format, or a key or display name that is another
+persona's in any case), `persona-text`, `persona-mascot`, `persona-version`, `persona-order`
+(out of range; a duplicate is a warning), `persona-role-unknown`, `persona-base-missing` (no
+`pm-assistant` role to check against), `persona-can-do`, `persona-need`, `persona-write-label` (a
+write tool of the role with no "drafts" label in `WRITE_LABELS`), `persona-always-on` (exactly
+one, named `nudge`, of role `pm-assistant`, offered) and `persona-count` (at most 16).
+
 ## Templates: `templates/*.md`
 
 ```yaml
@@ -255,7 +321,7 @@ The harness mounts these read-only in a bot's sandbox, each only if the director
 
 | Path in the sandbox | From | Which files |
 | --- | --- | --- |
-| `/content/skills/` | `content/skills/` | Only the skills of the bot's role |
+| `/content/skills/` | `content/skills/` | Only the skills of the bot's role; a personal bot of `pm-assistant` also gets every persona's skills |
 | `/content/templates/` | `content/templates/` | All |
 | `/content/reviewers/` | `content/reviewers/` | All |
 | `/content/playbooks/` | `content/playbooks/` | All |

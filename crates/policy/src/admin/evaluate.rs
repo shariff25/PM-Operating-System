@@ -9,7 +9,11 @@
 //!   reads its owner's `master/people/<owner>/AGENTS.md`, when there is one);
 //! - a role (`content/roles/<role>/ROLE.md`): its `skills`, each uploaded read-only;
 //! - a skill (`content/skills/<skill>/SKILL.md`): its `metadata.tools`, the only tools
-//!   `tools/call` may name.
+//!   `tools/call` may name;
+//! - the bot marketplace's catalog (`content/personas/<key>/PERSONA.md`, not part of the
+//!   spec): a personal bot of the personal role also uploads every persona's role skills,
+//!   read-only. Its tools stay the personal role's (the lint refuses a persona that would
+//!   widen them), so a persona shows up here only as uploads.
 //!
 //! Those inputs are the [`PolicySpec`] the admin edits. Everything else (the three hosts and
 //! ports, the REST routes, the MCP methods and revisions, the worker binary, the system paths,
