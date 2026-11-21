@@ -17,7 +17,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Check skills, context, reviewers and templates against the content contract.
+    /// Check skills, context, reviewers, templates, roles, bots and the bot marketplace's
+    /// personas against the content contract.
     Lint {
         /// Path to the content root.
         #[arg(long, default_value = "content")]
@@ -186,9 +187,10 @@ fn run_lint(
                 println!("{level}[{}] {}: {}", d.code, d.path, d.message);
             }
             println!(
-                "{} files checked, {} skills, {errors} errors, {warnings} warnings",
+                "{} files checked, {} skills, {} personas, {errors} errors, {warnings} warnings",
                 report.files_checked,
-                report.skills.len()
+                report.skills.len(),
+                report.personas.len()
             );
         }
     }

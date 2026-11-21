@@ -11,6 +11,11 @@ use std::collections::BTreeSet;
 use crate::bots::valid_name;
 use crate::model::valid_handle;
 
+/// The role every personal bot is made from, and the ceiling of every persona
+/// (`docs/bot-marketplace-spec.md` §2, "The ceiling rules"): no persona's role may have a tool,
+/// a data class or a write setting looser than this role's.
+pub const PERSONAL_ROLE: &str = "pm-assistant";
+
 /// The longest handle onboarding proposes, so `pm-<handle>` stays a valid bot name.
 pub const MAX_PROPOSED_HANDLE: usize = 24;
 
@@ -101,14 +106,14 @@ pub fn bot_path(bot: &str) -> String {
     format!("bots/{bot}/BOT.md")
 }
 
-/// The `BOT.md` for a new member's personal bot: made from the `pm-assistant` role, owned by
+/// The `BOT.md` for a new member's personal bot: made from the [`PERSONAL_ROLE`], owned by
 /// the member, reading as them.
 pub fn render_personal_bot(handle: &str) -> String {
     let name = personal_bot_name(handle);
     format!(
         "---\n\
          name: {name}\n\
-         role: pm-assistant\n\
+         role: {PERSONAL_ROLE}\n\
          scope: personal\n\
          owner: \"{handle}\"\n\
          description: {handle}'s personal assistant. It reads what {handle} can read and drafts; {handle} approves anything others will see.\n\
@@ -177,7 +182,8 @@ mod tests {
         let fm: crate::bots::BotFrontMatter = serde_norway::from_str(doc.yaml).expect("parses");
         let body = doc.body;
         assert_eq!(fm.name, "pm-ana");
-        assert_eq!(fm.role, "pm-assistant");
+        assert_eq!(fm.role, PERSONAL_ROLE);
+        assert_eq!(PERSONAL_ROLE, "pm-assistant");
         assert_eq!(fm.scope, crate::bots::BotScope::Personal);
         assert_eq!(fm.owner, "ana");
         assert!(body.contains("Work for ana"));

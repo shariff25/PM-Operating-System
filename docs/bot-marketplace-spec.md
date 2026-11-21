@@ -1,6 +1,7 @@
 # Bot marketplace: Chief, Sprout and Echo beside Nudge
 
-Status: **design spec; not built.** The independent reviewer checks it before any slice starts.
+Status: **design spec; slice C1 built** (contract, lint and generator: §13, "Status"). The
+independent reviewer checks it before any slice starts.
 Owner's requirement (scope item j in `CLAUDE.md`, 2026-11-20): widen the product beyond one PM
 assistant with three new bots, a Chief of Staff, a Growth PM and an Outbound PM; as part of
 onboarding the PM sees a bot marketplace and chooses which bots to include; each bot has its own
@@ -874,6 +875,51 @@ waiting on a model key).
 | A1 | **Admin view** | `admin/Bots.tsx`, `GET /api/admin/bots`, audit `persona` filter and column | B1, W1 | Admin and auditor see it, PM `403`; no team-changing controls; deleted-persona warning |
 | R2 | **Chief writes the brief** | `PATCH /v1/routines/{id} {persona}`, `PUT /api/me/brief`, Chief's Settings switch, card attribution of the brief | R1, W1, F2 | Only the owner's `[daily-brief]` routine; removing Chief moves it back; the brief block still reaches the web panels |
 | E1 | **First eval run** | Run `chief`, `sprout`, `echo` and the parity tasks; commit the report | C2–C4, R1; a model key with quota (waiting on the owner) | The report; no quality claim before it |
+
+### Status: C1 is built (2026-11-21, branch `claude/market-c1-contract`)
+
+Built: `crates/contract/src/personas.rs` (`PersonaFrontMatter`, `Persona`, `Need`, `MASCOTS`,
+`NEED_SOURCES`, `WRITE_LABELS`, the derived `reads`, `drafts` and `need_met`, the text rules);
+the catalog rules in `crates/contract/src/lint/catalog.rs` with `Report.personas`;
+`PERSONAL_ROLE` in `onboarding.rs`, used by `render_personal_bot` (and re-exported by
+`crates/evals`); the generator union in `crates/policy/src/generate.rs`
+(`BotContext::persona_skills`); `content/personas/nudge/PERSONA.md`; the persona count on
+`pmos lint`'s summary line; `docs/contract.md`, `docs/sandbox-policies.md`, `policies/README.md`
+and `docs/policy-admin.md`. Each rule has a failing and a passing fixture in
+`crates/contract/tests/lint.rs`; the §4 proof is in `crates/policy/tests/policies.rs`
+(generated with and without a persona: every file but the personal bot's two is byte-identical,
+its `network_policies`, `process`, `landlock` and writable paths are byte-identical, and the
+read-only list and the launch spec's uploads differ by exactly the new skill folder; offering
+changes nothing; a persona reaching a new tool is refused before generation). No persona besides
+Nudge is in the content; C2 to C4 add theirs.
+
+Departures from the text above, all small:
+
+1. **The header names the catalog only when it adds a folder.** `sources()` adds
+   `personas/*/PERSONA.md` only when the personas bring a skill the role doesn't have. With Nudge
+   alone (role `pm-assistant`) every policy file, the `pm-*` ones included, is byte for byte as
+   before, so merging C1 makes no checked-in or deployed policy stale (test
+   `nudge_alone_changes_no_policy_file`).
+2. **An empty catalog is no finding.** "Exactly one always-on" applies once `personas/` holds any
+   persona; no folder, or an empty one, passes (the lint's own fixtures have none).
+3. **Added rules.** The always-on persona must also be `offered: true` (`persona-always-on`); a
+   key or display name that equals another persona's key or display name, ignoring case, is a
+   `persona-name` error on each of them (the Slack prefix must pick one bot); a duplicate need
+   source, an empty `can-do` and a skill listed twice in `can-do` are errors; three codes the
+   table doesn't name: `persona-missing-file`, `persona-version` (semver, as for roles) and
+   `persona-base-missing` (no `pm-assistant` role to check the ceiling against).
+4. **`display-name` is ASCII** letters and digits with single spaces, not starting or ending
+   with one. `order` is required (the table gives no default).
+5. **`WRITE_LABELS` also labels `confluence.update_page`** ("Confluence page updates"), the one
+   write tool in `tools.yaml` the §2 map leaves out. `persona-write-label` checks the write tools
+   of each persona's role (a unit test checks every write tool in the repository's registry has a
+   label). "Drafts" uses the stricter of the persona's role and `pm-assistant` (no bot override:
+   it is the catalog's view).
+6. **`Report.personas` holds only personas whose own file has no error**, sorted by `order`, then
+   key. The struct's key field is `name` (the API's `key`).
+7. **Not in C1:** `persona-role-sections` (the content slices' test, §3); the content admin's
+   file kinds (`crates/policy/src/admin/access.rs` `kind`) still class `personas/…` as `other`,
+   since a new kind needs the web app's labels too (W1 or A1).
 
 ### Order and parallelism
 
