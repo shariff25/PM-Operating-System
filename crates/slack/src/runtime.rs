@@ -25,7 +25,19 @@ pub enum RuntimeError {
     /// `422 {question}` from routine parsing: the request was unclear.
     #[error("{0}")]
     Question(String),
+    /// `400 {code}` from `POST /v1/tasks` about the ask's `persona`: one of
+    /// [`PERSONA_CODES`]. Only [`Runtime::create_task_as`] answers it.
+    #[error("that bot can't take this ({0})")]
+    Persona(String),
 }
+
+/// The `400` codes `POST /v1/tasks` gives an ask's `persona` (`docs/bots-runtime.md`,
+/// "Personas").
+pub const PERSONA_CODES: [&str; 3] = [
+    "bad_request",
+    "unknown_persona",
+    "persona_needs_personal_bot",
+];
 
 /// One entry of `GET /v1/bots`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -175,17 +187,80 @@ impl Runtime {
         channel: &str,
         thread_ts: &str,
     ) -> Result<Value, RuntimeError> {
-        self.send(
-            self.request(Method::POST, "/v1/tasks", Some(user))
-                .json(&json!({
-                    "bot": bot,
-                    "requested_by": user,
-                    "text": text,
-                    "source": "slack",
-                    "slack": {"channel": channel, "thread_ts": thread_ts},
-                })),
-        )
-        .await
+        self.create_task_as(user, bot, text, channel, thread_ts, None)
+            .await
+    }
+
+    /// [`Runtime::create_task`] naming a persona (`docs/bots-runtime.md`, "Personas"): `None`
+    /// sends no `persona`, so a reply in a thread inherits the thread's; `Some("nudge")`
+    /// switches the thread to Nudge. A `400` with one of [`PERSONA_CODES`] is
+    /// [`RuntimeError::Persona`]. Whether the persona is on the PM's team is decided at claim
+    /// by the tool server: a task for one that isn't is created, and fails with its sentence.
+    pub async fn create_task_as(
+        &self,
+        user: &str,
+        bot: &str,
+        text: &str,
+        channel: &str,
+        thread_ts: &str,
+        persona: Option<&str>,
+    ) -> Result<Value, RuntimeError> {
+        let mut body = json!({
+            "bot": bot,
+            "requested_by": user,
+            "text": text,
+            "source": "slack",
+            "slack": {"channel": channel, "thread_ts": thread_ts},
+        });
+        if let Some(persona) = persona {
+            body["persona"] = json!(persona);
+        }
+        let res = self
+            .request(Method::POST, "/v1/tasks", Some(user))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "bots runtime unreachable");
+                RuntimeError::Unavailable
+            })?;
+        let status = res.status();
+        let json: Value = res.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            return Ok(json);
+        }
+        if status.is_server_error() {
+            tracing::warn!(%status, "bots runtime error");
+            return Err(RuntimeError::Unavailable);
+        }
+        let code = json["code"].as_str().unwrap_or_default();
+        if persona.is_some() && status.as_u16() == 400 && PERSONA_CODES.contains(&code) {
+            return Err(RuntimeError::Persona(code.to_string()));
+        }
+        Err(RuntimeError::Refused(
+            json["error"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| format!("refused ({status})")),
+        ))
+    }
+
+    /// `GET /v1/personas`: the offered marketplace bots, Nudge first. A runtime without the
+    /// route (`404`, from before personas) or one that refuses it gives an empty catalog, so
+    /// no prefix matches and every ask goes as before; unreachable or failing is
+    /// [`RuntimeError::Unavailable`].
+    pub async fn personas(&self) -> Result<Vec<crate::personas::Persona>, RuntimeError> {
+        match self
+            .send(self.request(Method::GET, "/v1/personas", None))
+            .await
+        {
+            Ok(json) => Ok(crate::personas::parse(&json)),
+            Err(RuntimeError::Unavailable) => Err(RuntimeError::Unavailable),
+            Err(e) => {
+                tracing::info!(error = %e, "no persona catalog from the runtime; none used");
+                Ok(Vec::new())
+            }
+        }
     }
 
     /// `GET /v1/notifications`: long-polls up to `wait`.

@@ -80,6 +80,14 @@ pub struct MockRuntime {
     pub routines: Mutex<Vec<Value>>,
     /// Routine writes: (method, routine id, X-Pmos-User, body).
     pub routine_writes: Mutex<Vec<RoutineWrite>>,
+    /// `GET /v1/personas`'s answer; `None` answers `404`, as a runtime from before personas.
+    pub personas: Mutex<Option<Value>>,
+    /// How many times `GET /v1/personas` was read.
+    pub persona_reads: Mutex<usize>,
+    /// Refuse a task naming a persona with `400 {code}`, as the runtime does.
+    pub persona_refusal: Mutex<Option<String>>,
+    /// `POST /v1/routines/parse` bodies.
+    pub parses: Mutex<Vec<Value>>,
 }
 
 type Rt = State<Arc<MockRuntime>>;
@@ -280,10 +288,39 @@ async fn rt_create_task(State(rt): Rt, headers: HeaderMap, Json(body): Json<Valu
     if *rt.fail_tasks.lock().unwrap() {
         return answer(StatusCode::SERVICE_UNAVAILABLE, json!({"error": "down"}));
     }
+    if let (Some(code), true) = (
+        rt.persona_refusal.lock().unwrap().clone(),
+        body.get("persona").is_some(),
+    ) {
+        return answer(
+            StatusCode::BAD_REQUEST,
+            json!({"code": code, "error": "a developer's sentence the PM never sees"}),
+        );
+    }
     let n = rt.tasks.lock().unwrap().len();
     let mut task = body;
     task["id"] = json!(format!("tsk_{n:032x}"));
     answer(StatusCode::CREATED, task)
+}
+
+async fn rt_personas(State(rt): Rt, headers: HeaderMap) -> Response {
+    if bearer(&headers) != BOTS_TOKEN {
+        return answer(StatusCode::UNAUTHORIZED, json!({"error": "bad token"}));
+    }
+    *rt.persona_reads.lock().unwrap() += 1;
+    match rt.personas.lock().unwrap().clone() {
+        Some(catalog) => Json(catalog).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn rt_parse_routine(State(rt): Rt, Json(body): Json<Value>) -> Response {
+    rt.parses.lock().unwrap().push(body.clone());
+    Json(
+        json!({"draft": {"bot": body["bot"], "owner": body["owner"], "schedule": "0 9 * * 1-5"},
+                "summary": "Every weekday at 9am"}),
+    )
+    .into_response()
 }
 
 async fn rt_notifications(State(rt): Rt, Query(q): Query<HashMap<String, String>>) -> Response {
@@ -538,6 +575,8 @@ impl Stack {
                 .route("/v1/bots", get(rt_bots))
                 .route("/v1/bots/{name}", get(rt_bot))
                 .route("/v1/tasks", post(rt_create_task))
+                .route("/v1/personas", get(rt_personas))
+                .route("/v1/routines/parse", post(rt_parse_routine))
                 .route("/v1/notifications", get(rt_notifications))
                 .route(
                     "/v1/members/{handle}/settings",

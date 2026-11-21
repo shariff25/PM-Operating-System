@@ -20,6 +20,8 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 
+use crate::personas::{annotate, Catalog};
+
 /// The header that carries a session token on the tool server's `/internal` API.
 const SESSION_HEADER: &str = "x-pmos-session";
 
@@ -102,6 +104,9 @@ pub struct ToolServer {
     base: String,
     token: String,
     http: reqwest::Client,
+    /// The persona catalog the Slack bot last read, so each approval item read or decided
+    /// here carries who drafted it for its card (`personas::annotate`).
+    personas: Catalog,
 }
 
 impl ToolServer {
@@ -113,7 +118,14 @@ impl ToolServer {
                 .timeout(Duration::from_secs(20))
                 .build()
                 .expect("http client builds"),
+            personas: Catalog::default(),
         }
+    }
+
+    /// Share `catalog` (the Slack bot's, kept fresh by `Bots::personas`).
+    pub fn with_personas(mut self, catalog: Catalog) -> Self {
+        self.personas = catalog;
+        self
     }
 
     async fn post(
@@ -220,7 +232,9 @@ impl ToolServer {
         if res.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(CallError::NotFound);
         }
-        Self::finish_response(res).await
+        let mut item = Self::finish_response(res).await?;
+        annotate(&mut item, &self.personas);
+        Ok(item)
     }
 
     /// `POST /internal/approvals/{id}/decision`. `decision` is `approve`, `edit` (with `args`)
@@ -276,8 +290,9 @@ impl ToolServer {
                 ApiError::Unavailable
             })?;
         let status = res.status();
-        let json: Value = res.json().await.unwrap_or(Value::Null);
+        let mut json: Value = res.json().await.unwrap_or(Value::Null);
         if status.is_success() {
+            annotate(&mut json, &self.personas);
             return Ok(json);
         }
         let code = json["code"].as_str().unwrap_or_default().to_string();
