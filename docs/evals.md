@@ -12,7 +12,7 @@ evals/
   config.yaml                         runner defaults, decline phrases, load-test targets
   taxonomy.yaml                       second-level failure tags under the five bottlenecks
   case-card.md                        the template for turning a real case into a task
-  categories/<name>/category.yaml     {name, bot, level?, pass_bar?, repeats?, description}
+  categories/<name>/category.yaml     {name, bot, level?, persona?, pass_bar?, repeats?, description}
   categories/<name>/tasks/<id>.yaml   {id, ask, expect | thread, cluster?, regression?, tags?}
   judges/<name>.yaml                  an LLM judge
   judges/<name>.labels.jsonl          its labels (empty: none yet)
@@ -614,6 +614,9 @@ So queue time can be over-counted by up to one poll interval when a task has no 
    pass_bar: 0.8         # optional: fraction of attempts that must pass, 0 to 1;
                          # leave it out until the tasks are real, and the category reports only
    repeats: 3            # optional: runs per task (default 1)
+   persona: chief        # optional, with `bot: personal` only: the marketplace bot every
+                         # task asks (sent as the task's `persona`); `pmos-evals check` refuses
+                         # a key that isn't an offered persona in --content; `nudge` sends none
    description: What the category covers and where its answers come from.
    ```
 3. **Write one file per task, `tasks/<id>.yaml`.** The `id` must match the file name. Real
@@ -668,6 +671,9 @@ number only as the 80% example, so tighten each one after the category's first v
 | `pm-craft` | `personal` | 23 | 0.8 | 3 | Starting value; pass^3 as above |
 | `staff-craft` | `personal` (`level: staff`) | 8 | 0.8 | 3 | Starting value; pass^3 as above |
 | `principal-craft` | `personal` (`level: principal`) | 8 | 0.8 | 3 | Starting value; pass^3 as above |
+| `chief` | `personal` (`persona: chief`) | 7 | 0.7 | 3 | Starting value (`docs/bot-marketplace-spec.md` §10); no run yet |
+| `sprout` | `personal` (`persona: sprout`) | 8 | 0.7 | 3 | Starting value (§10); no run yet |
+| `echo` | `personal` (`persona: echo`) | 7 | 0.7 | 3 | Starting value (§10); no run yet |
 
 ### `docs-qa`
 A template category for the Docs bot. PM OS can't ship real questions, because every team's

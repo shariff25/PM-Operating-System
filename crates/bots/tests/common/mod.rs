@@ -22,6 +22,7 @@ use pmos_bots::store::{BotsStore, MemoryStore};
 use pmos_bots::{router, router_with, Runtime};
 use pmos_contract::bots::{ActionSetting, Bot, BotScope, Reads, Role};
 use pmos_contract::model::{ModelRole, Sensitivity, Skill, ToolDef, ToolKind, ToolRegistry};
+use pmos_contract::personas::Persona;
 use pmos_directory::snapshot::{
     user, DirectoryUser, FakeClock, SnapshotClient, StaticFetcher, UserStatus,
 };
@@ -173,6 +174,74 @@ pub fn catalog() -> Catalog {
     Catalog::from_parts(bots, roles, skills, registry)
 }
 
+fn persona(name: &str, display: &str, role: &str, offered: bool, order: u32) -> Persona {
+    Persona {
+        name: name.into(),
+        display_name: display.into(),
+        title: format!("{display} title"),
+        role: role.into(),
+        mascot: name.into(),
+        owner: "pm".into(),
+        version: "0.1.0".into(),
+        offered,
+        always_on: name == "nudge",
+        order,
+        summary: format!("{display} summary"),
+        examples: vec![format!("Ask {display}")],
+        can_do: vec!["ask".into()],
+        needs: Vec::new(),
+        reads: vec!["jira".into()],
+        drafts: Vec::new(),
+    }
+}
+
+/// [`catalog`] with marketplace bots: Nudge (always on, `pm-assistant`), Chief (offered, role
+/// `chief-of-staff`: `meet` and `ask`'s Jira search only, model `reasoning`), and Ghost
+/// (withdrawn, `offered: false`).
+pub fn persona_catalog() -> Catalog {
+    let base = catalog();
+    let mut bots: Vec<Bot> = ["docs", "pm-ana"]
+        .iter()
+        .map(|n| base.bot(n).unwrap().clone())
+        .collect();
+    // Ben's personal bot too, so a second PM can ask.
+    bots.push(Bot {
+        name: "pm-ben".into(),
+        owner: "ben".into(),
+        description: "Ben's assistant".into(),
+        job: "Help Ben.".into(),
+        ..bots[1].clone()
+    });
+    let mut roles: Vec<Role> = ["docs-helper", "pm-assistant"]
+        .iter()
+        .map(|n| base.role_named(n).unwrap().clone())
+        .collect();
+    roles.push(Role {
+        name: "chief-of-staff".into(),
+        description: "Runs the week".into(),
+        owner: "pm".into(),
+        version: "0.1.0".into(),
+        skills: vec!["meet".into()],
+        data_class: Sensitivity::Restricted,
+        model: ModelRole::Reasoning,
+        actions: BTreeMap::new(),
+        instructions: "Lead with what needs the PM.".into(),
+    });
+    let skills = vec![
+        skill("docs", &["docs.search", "docs.read"]),
+        skill(
+            "ask",
+            &["jira.search", "jira.create_issue", "slack.send_message"],
+        ),
+        skill("meet", &["jira.search"]),
+    ];
+    Catalog::from_parts(bots, roles, skills, base.registry().clone()).with_personas(vec![
+        persona("nudge", "Nudge", "pm-assistant", true, 10),
+        persona("chief", "Chief", "chief-of-staff", true, 20),
+        persona("ghost", "Ghost", "chief-of-staff", false, 30),
+    ])
+}
+
 // ----- mock tool server -------------------------------------------------------------------
 
 /// How the mock tool server answers session requests.
@@ -200,6 +269,12 @@ pub struct MockToolServer {
     pub run_levels: Mutex<HashMap<String, Option<String>>>,
     /// Run-level reads answer `503`.
     pub runs_down: Mutex<bool>,
+    /// A persona session is refused with this `(code, sentence)`.
+    pub persona_refusal: Mutex<Option<(String, String)>>,
+    /// Behave like a tool server from before personas: ignore `persona`, answer `persona: null`.
+    pub drop_persona: Mutex<bool>,
+    /// Session tokens revoked (`DELETE /internal/session`), in order.
+    pub revoked: Mutex<Vec<String>>,
 }
 
 impl Default for MockToolServer {
@@ -208,6 +283,9 @@ impl Default for MockToolServer {
             mode: Mutex::new(SessionMode::Ok),
             run_levels: Mutex::default(),
             runs_down: Mutex::new(false),
+            persona_refusal: Mutex::default(),
+            drop_persona: Mutex::new(false),
+            revoked: Mutex::default(),
             sessions: Mutex::default(),
             approvals: Mutex::default(),
             approval_reads: Mutex::new(0),
@@ -249,12 +327,41 @@ async fn ts_session(
         )
             .into_response();
     }
+    let persona = body["persona"]
+        .as_str()
+        .filter(|p| *p != "nudge")
+        .map(str::to_string);
     let n = {
         let mut s = ts.sessions.lock().unwrap();
         s.push(body);
         s.len()
     };
-    match *ts.mode.lock().unwrap() {
+    let mode = *ts.mode.lock().unwrap();
+    if let (SessionMode::Ok, Some(key)) = (mode, &persona) {
+        if let Some((code, error)) = ts.persona_refusal.lock().unwrap().clone() {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"code": code, "error": error})),
+            )
+                .into_response();
+        }
+        let echoed = if *ts.drop_persona.lock().unwrap() {
+            Value::Null
+        } else {
+            let mut display = key.clone();
+            display[..1].make_ascii_uppercase();
+            json!({"key": key, "display_name": display, "title": format!("{display} title"),
+                   "role": "chief-of-staff"})
+        };
+        return (
+            StatusCode::CREATED,
+            Json(json!({"token": format!("pmos_s_test{n}"), "session": {},
+                        "tools": [{"name": "jira_search", "kind": "read"}],
+                        "persona": echoed})),
+        )
+            .into_response();
+    }
+    match mode {
         SessionMode::Ok => (
             StatusCode::CREATED,
             Json(json!({"token": format!("pmos_s_test{n}"), "session": {}, "tools": []})),
@@ -271,6 +378,18 @@ async fn ts_session(
         )
             .into_response(),
     }
+}
+
+async fn ts_revoke(State(ts): State<Arc<MockToolServer>>, headers: HeaderMap) -> StatusCode {
+    if !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let token = headers
+        .get("x-pmos-session")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    ts.revoked.lock().unwrap().push(token.to_string());
+    StatusCode::NO_CONTENT
 }
 
 async fn ts_approval(
@@ -438,6 +557,7 @@ impl Env {
         let ts_base = serve(
             Router::new()
                 .route("/internal/sessions", post(ts_session))
+                .route("/internal/session", axum::routing::delete(ts_revoke))
                 .route("/internal/approvals/{id}", get(ts_approval))
                 .route("/internal/runs/{id}/sensitivity", get(ts_run_level))
                 .route("/readyz", get(ts_ready))
@@ -534,6 +654,13 @@ impl Env {
             Some(assertions),
         )
         .await
+    }
+
+    /// On a fresh Postgres schema, with the bots of `catalog`.
+    pub async fn postgres_with(catalog: Catalog) -> Option<Self> {
+        let pg = TestPg::new().await?;
+        let store: Arc<dyn BotsStore> = Arc::new(pg.store.clone());
+        Some(Self::with_parts(store, Some(pg), catalog, None).await)
     }
 
     pub async fn postgres() -> Option<Self> {

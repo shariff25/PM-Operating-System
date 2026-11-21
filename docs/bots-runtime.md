@@ -46,8 +46,8 @@ docs server.
 
 ## Content changes
 
-Every 30 seconds the runtime checks a fingerprint of `tools.yaml`, `bots/**`, `roles/**` and
-`skills/**` under `PMOS_CONTENT_ROOT` (paths, sizes and modification times). A `team.yaml`
+Every 30 seconds the runtime checks a fingerprint of `tools.yaml`, `bots/**`, `roles/**`,
+`skills/**` and `personas/**` under `PMOS_CONTENT_ROOT` (paths, sizes and modification times). A `team.yaml`
 is neither watched nor read (slice U7); if one is left in the content, the lint reports it to
 the runtime as a warning only (`team-file-retired`), so it never stops a load. When it changes:
 - **The tree passes the lint:** it is loaded again, and the new catalog replaces the old one
@@ -96,6 +96,39 @@ catalog at the next check. Then stop and delete their sandbox, remove both token
 providers, regenerate the policies (the old files are `policy-orphan`), and restart
 `pmos-bots` and `pmos-gateway`.
 
+### After a catalog change adds skills: recreate each personal sandbox once
+
+A persona (Chief, Sprout, Echo, or a later one) brings skill folders the personal role
+doesn't have. The pull request that adds it regenerates every `policies/bots/pm-*.yaml` and
+`.sandbox.yaml` (uploads and read-only paths only; the network policy is byte-identical,
+`docs/bot-marketplace-spec.md` §4). OpenShell applies uploads only when a sandbox starts, so
+after that pull request merges a platform owner does this **once per personal bot**:
+
+1. Pull the content repo on the Spark; `cargo run -q -p pmos -- policy check` is green.
+2. For each `pm-<handle>`: stop its worker, delete the sandbox `pmos-pm-<handle>`, and create
+   it again from `policies/bots/pm-<handle>.sandbox.yaml` with the same two providers, as in
+   **Creating a bot's sandbox** in `docs/sandbox-policies.md`. Tokens and providers are
+   unchanged; nothing in `pmos-bots` or the gateway restarts.
+3. Run `policies/redteam/isolation.sh`.
+4. Check: ask the new bot once as that PM (after adding it to their team). Until the sandbox is
+   recreated, a task for a persona whose skill isn't in it fails with "This bot's skills aren't
+   installed in your sandbox yet. A platform owner needs to restart it; Nudge can help
+   meanwhile." It never runs with fewer skills or as Nudge.
+
+Offering or withdrawing a persona (`offered:`) changes no policy and needs no recreate.
+
+### Deploy order: the tool server first
+
+Deploy a tool server that knows personas (slice B1 or later) **before** a runtime that sends
+them. The runtime requires the tool server's `201` to echo the persona it asked for
+(`persona.key`, and the same role); a tool server that ignores the field answers with a Nudge
+session, so the runtime revokes that session at once (`DELETE /internal/session`; if that
+fails, it lapses at its TTL, unused), fails the task
+with "PM OS couldn't start Chief for this request: the tool server didn't run it as Chief. A
+platform owner needs to check that the tool server and the bot runtime run the same
+version; Nudge can help meanwhile.", and never runs a persona's instructions on a session not
+opened for it. Nudge tasks send no `persona` field, so they work with either version.
+
 ## Configuration
 | Variable | Default | Notes |
 | --- | --- | --- |
@@ -130,8 +163,56 @@ it may do. Anything else is `403`.
 - **Who may use a bot:** someone who may ask (below); then a personal bot serves its owner
   only and a team bot serves everyone who may ask. A task or routine for anyone else is
   `403`, with the reason.
-- **The console** may only switch `enabled` on a routine. Its schedule and prompt are the
-  owner's to change, in Slack.
+- **The console** may only switch `enabled` on a routine. Its schedule, prompt and persona are
+  the owner's to change.
+- **`GET /v1/personas`** (`web`, `slack`, `console`, `evals`; others `403`): the offered
+  personas, see **Personas** below.
+
+## Personas (marketplace bots)
+
+`docs/bot-marketplace-spec.md` §6. A persona (Chief, Sprout, Echo) is a role a PM's personal
+bot runs as, chosen per ask by the PM. It is a field the client sets from the PM's own choice;
+the model never sets it. `null` (and every row from before migration `0007_personas.sql`) is
+Nudge, the always-on generalist; `nudge` is never stored.
+
+| Route | Field | Rule |
+| --- | --- | --- |
+| `GET /v1/personas` | | `200 {personas: [{key, display_name, title, role, mascot, always_on, summary, examples, can_do, reads, drafts, needs: [{source, label, without, met}]}]}`: offered only, Nudge first, then by `order`. From the runtime's catalog (`content/personas/*/PERSONA.md` through the lint). |
+| `POST /v1/tasks` | `persona?` | `web`, `slack`, `evals` only (others `403`). Not a key shape: `400 {code: "bad_request"}`. Not in the catalog or not offered: `400 {code: "unknown_persona"}`. The bot not a personal bot of role `pm-assistant`: `400 {code: "persona_needs_personal_bot"}`. `nudge` is stored as `null`. The team is **not** checked here. Left out in a thread: the thread's latest task's persona is inherited (`null` included); naming `nudge` does not inherit. |
+| `GET /v1/tasks` | `?persona=<key>` | Only that persona's tasks; `persona=nudge` is Nudge's. `400` if not a key shape. |
+| Task, notification | `persona` | Every task carries `persona` (`null` is Nudge). A notification carries it only when not Nudge. The console's metadata view keeps it. |
+| `POST /v1/routines` | `draft.persona?` | As for tasks (`400` codes above); `nudge` or absent is Nudge. |
+| `PATCH /v1/routines/{id}` | `persona: key \| "nudge" \| null` | The owner only (`slack`, `web`); the console `403`. Checked as above. |
+
+**At claim** the runtime checks the persona against its catalog again (withdrawn or deleted:
+the task fails with "Chief isn't offered in PM OS any more. Ask Nudge instead."), then asks
+`POST /internal/sessions {user, bot, run_id, history_sensitivity?, persona}` (the field only
+for a persona). The tool server decides the team:
+- **`201`** must echo `persona: {key, display_name, title, role}` with the asked key and the
+  catalog's role, else the task fails (**Deploy order**, above). The claim then carries
+  `role` = the persona's role (skills, model class, instructions), `gateway.model` =
+  `pmos/<that role's model>`, `tools` = the session's tools (registry names), and
+  `persona: {key, display_name, title}`. A Nudge claim has no `persona` field and is as before.
+- **`403 {code, error}`** with `persona_not_on_team`, `persona_unavailable` or
+  `persona_needs_personal_bot`: the task fails with the tool server's `error` sentence ("Chief
+  isn't on your team any more. Add it on the Bots page in PM OS, or ask Nudge."). For a
+  routine's run with either of the first two codes, the routine is paused (disabled, no next
+  run) and the task's error and DM read "Your routine is paused: <sentence>."
+- A routine whose persona is withdrawn is paused at its next due run ("Your routine is
+  paused: its bot Chief isn't offered in PM OS any more.").
+
+**History:** earlier turns are those with the same bot, requester, thread **and persona**, so
+Nudge never sees Chief's turns in a thread and the other way round.
+
+**The worker** (`harness/src/worker.ts`) stages the persona role's skills. A skill folder
+missing from the sandbox (the window before **recreate each personal sandbox once**) fails the
+task with the plain sentence above. The system prompt's first line is "You are Chief, the Chief
+of Staff on <handle>'s PM OS team, running in pm-<handle>." after checking the display name and
+title are plain one-line text (else the task fails; the key is never put in the prompt). The
+PM's own `BOT.md` body is kept, after the persona's instructions, as limits that still apply,
+and a "What comes first" section says `content/master/AGENTS.md` and that body take precedence
+over the persona's "You are …" line and instructions: restrictions accumulate. The tool server
+enforces the tools, writes and data class whatever the prompt says.
 
 ## Who may ask
 
@@ -170,7 +251,8 @@ queued ──claim──► working ──complete──► done
   runtime then creates the task's tool-server session:
   `POST /internal/sessions {user, bot, run_id: <task id>}`.
   - **Answer:** `{task, bot, role, tools, session_token, lease_until, gateway, level,
-    history}`. `gateway` is
+    history, history_sensitivity, persona?}` (`persona` and the session's `persona` field
+    only for a persona task: see **Personas**). `gateway` is
     `{model: "pmos/<role model>", headers: {X-Pmos-User, X-Pmos-Run, X-Pmos-Priority}}`,
     ready for the harness's gateway client. `history` is the conversation's earlier turns
     (below), `[]` for a first message.
@@ -196,8 +278,8 @@ A follow-up in a thread is claimed with the thread's earlier turns, so "customer
   any other client, `400` if malformed). The id is only a label: it is matched within the
   same requester and bot, so naming another PM's id finds nothing. Only interactive tasks
   (`slack`, `web`, `cli`) have a thread; routines always start fresh, and so does an eval task unless it names a `conversation` (a benchmark thread).
-- **The turns:** earlier tasks with the same bot, the same `requested_by` and the same
-  thread, created before this one and no longer `queued` or `working`. Each is
+- **The turns:** earlier tasks with the same bot, the same `requested_by`, the same
+  thread and the same persona (`null` equals `null`), created before this one and no longer `queued` or `working`. Each is
   `{text, result?, error?, status, at}`, oldest first, in the claim's `history`.
 - **Bounds:** the newest 6 turns; each `text`, `result` and `error` cut to 4,000 bytes with
   `… [truncated]` after; at most 16,000 bytes in all, the oldest dropped first.
@@ -207,7 +289,7 @@ A follow-up in a thread is claimed with the thread's earlier turns, so "customer
   stranding the task.
 - **Storage:** `bots_tasks.conversation` (the client's id) and `bots_tasks.thread_key`
   (`c:<conversation>` or `s:<channel>:<thread_ts>`, interactive tasks only), indexed by bot,
-  requester and key (migration `0004_conversations.sql`).
+  requester, key and persona (migrations `0004_conversations.sql`, `0007_personas.sql`).
 
 ## Durability (D2)
 - **Leases:** a claim holds the task for 120 seconds, and each heartbeat extends that. The

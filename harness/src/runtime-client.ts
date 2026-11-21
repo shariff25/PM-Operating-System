@@ -66,6 +66,19 @@ export const ClaimSchema = z.object({
     .enum(["public", "internal", "restricted"])
     .nullish()
     .catch("restricted"),
+  /**
+   * The marketplace bot (persona) this task runs as (docs/bot-marketplace-spec.md §6). Absent
+   * (or null) for Nudge and from an older runtime. With one, `role` is the persona's role.
+   * `display_name` and `title` are catalog text: the worker checks their shape again before
+   * putting them in the system prompt (`personaLine`).
+   */
+  persona: z
+    .object({
+      key: z.string().min(1),
+      display_name: z.string().min(1),
+      title: z.string().min(1),
+    })
+    .nullish(),
 });
 
 export type Claim = z.infer<typeof ClaimSchema>;

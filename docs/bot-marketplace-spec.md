@@ -1,7 +1,7 @@
 # Bot marketplace: Chief, Sprout and Echo beside Nudge
 
-Status: **design spec; slices C1 and B1 built** (contract, lint and generator; the tool
-server: §13, "Status"). The independent reviewer checks it before any slice starts.
+Status: **design spec; slices C1, B1 and R1 built** (contract, lint and generator; the tool
+server; the runtime and harness: §13, "Status"). The independent reviewer checks it before any slice starts.
 Owner's requirement (scope item j in `CLAUDE.md`, 2026-11-20): widen the product beyond one PM
 assistant with three new bots, a Chief of Staff, a Growth PM and an Outbound PM; as part of
 onboarding the PM sees a bot marketplace and chooses which bots to include; each bot has its own
@@ -1016,6 +1016,87 @@ tests in `team.rs`, `service/team.rs` and `app/team.rs`. Every case uses fixture
 **Not verified**: R1 and W1 against these routes (not built); the routes with C2–C4's real
 personas (fixtures only); the Postgres cap under concurrent requests from two processes (the
 advisory lock and the deferred trigger are tested one at a time).
+
+### Status: R1 is built (2026-11-21, branch `claude/market-r1-runtime`)
+
+Built, in `crates/bots`: migration `0007_personas.sql` (`persona` on `bots_tasks`,
+`bots_routines` and `bots_notifications`, each checked as a key and never `nudge`; NULL is
+Nudge, so every existing row keeps its meaning; the thread index gains `persona`); the
+catalog's personas (`report.personas`, `check_persona`, `persona_summaries`, `personas` in
+`WATCHED`); `persona` on `Task`, `Routine`, `Draft`, `Notification`, `TaskFilter`,
+`RoutinePatch`; the `POST /v1/tasks` rules, thread inheritance (`BotsStore::thread_persona`),
+the history match on persona, the claim as the persona's role with the session's tools, the
+routine pause, `GET /v1/personas` and `GET /v1/tasks?persona=`. In `harness/src`: `ClaimSchema`
+`persona`, `personaLine` and the persona prompt, `MissingSkillError` and the PM-facing
+sentence. In `crates/evals`: `persona` in `category.yaml` (sent on every task; `check`
+validates it against the content's lint report), and `persona:` uncommented in the `chief`,
+`sprout` and `echo` categories. Docs: `docs/bots-runtime.md` ("Personas", the sandbox-recreate
+step, "Deploy order"), `docs/evals.md`. Tests: `crates/bots/tests/personas.rs` (12 cases on both
+stores), a catalog test, the persona patch in `tests/store.rs`;
+`harness/test/persona.test.ts` (10); `crates/evals` (a spec test and a runner-and-check test);
+`crates/stack-tests/tests/stack.rs`
+`a_pm_asks_chief_and_the_draft_survives_chief_leaving_the_team` (real tool server and runtime:
+add Chief, ask as Chief, the claim's tools equal the session's intersected `list_tools`, the
+draft carries `persona: chief`; Sprout not on the team fails with the tool server's sentence;
+Chief removed, the draft is approved through `pmos-web`).
+
+**The runtime contract W1 and S1 call** (all `/v1`, the existing tokens and assertion rules):
+
+- `GET /v1/personas` (`web`, `slack`, `console`, `evals`; `worker` `403`): `200 {personas:
+  [{key, display_name, title, role, mascot, always_on, summary, examples, can_do, reads,
+  drafts, needs: [{source, label, without, met}]}]}`, offered only, Nudge first, then `order`.
+  No `catalog_sha` (the runtime has none).
+- `POST /v1/tasks` adds `persona?: key` (`web`, `slack`, `evals`). `400 {code, error}` with
+  `code` `bad_request` (not a key shape), `unknown_persona` (unknown or not offered) or
+  `persona_needs_personal_bot` (the bot isn't a personal bot of `pm-assistant`). `nudge` is
+  stored `null`. Absent in a thread (`slack` thread or `conversation`): the thread's latest
+  task's persona is inherited; S1 sends the prefix's persona to switch, or `nudge` to start
+  Nudge in that thread. The team is not checked here: a not-on-team ask is `201` and fails at
+  claim with the tool server's sentence (S1 posts it; W1 checks the team first, `409`).
+- Every `Task` (create, `GET /v1/tasks`, `GET /v1/tasks/{id}`) carries `persona` (`null` is
+  Nudge). `GET /v1/tasks?persona=<key>|nudge` filters (W1's `last_used_at`: `?persona=chief&
+  limit=1`, newest first).
+- Notifications carry `persona` when it isn't Nudge (left out otherwise): S1's "Chief: …"
+  prefix, with the name from `GET /v1/personas`.
+- Routines: `Routine.persona` (`null` is Nudge); `POST /v1/routines {draft: {…, persona?}}`;
+  `PATCH /v1/routines/{id} {persona: key | "nudge" | null}` (owner via `slack`/`web`; console
+  `403`), with the same `400` codes. W1's remove with `routines: "nudge"` is this PATCH with
+  `null` per routine (list with `GET /v1/routines?owner=`); `"pause"` is `{enabled: false}`.
+- Worker claim adds `persona: {key, display_name, title}` (absent for Nudge); `role`, `tools`
+  and `gateway.model` are the persona's.
+
+**Departures**:
+
+1. **Fail closed on a mixed-version rollout** (security review): the runtime requires the
+   tool server's `201` to echo the persona asked (`persona.key`) **and its role**; otherwise
+   the session is revoked (`DELETE /internal/session`, best effort; unrevoked, it lapses at its
+   TTL) and never handed to a worker, and the task fails with a plain sentence. Tested with a
+   mock tool server that drops the field. `docs/bots-runtime.md` says to deploy the tool server first.
+2. **The PM's own `BOT.md` body is kept for a persona** (security review), against §6's "the
+   bot's `job` is left out": it follows the persona's instructions under "Your PM's bot …
+   Its limits still apply to you", and a "What comes first" section says
+   `content/master/AGENTS.md` and that body take precedence over the persona's "You are …"
+   line and instructions (restrictions accumulate). Tested in the harness.
+3. **The claim checks the persona locally too**: a queued task whose persona was withdrawn
+   (or deleted) fails at claim with "<Name> isn't offered in PM OS any more. Ask Nudge
+   instead." before any session is asked for; a withdrawn persona's routine pauses at its next
+   due run (the tool server would refuse it anyway).
+4. **The harness re-checks the display name and title** (the lint's character rules, one line,
+   no `<`, `>` or control characters) and fails the task otherwise; the persona key is never
+   in the prompt.
+5. **Additions**: `persona` on notifications (for S1), `GET /v1/tasks?persona=` (for W1's
+   `last_used_at`), the `bad_request` code for a malformed key, `PATCH /v1/routines {persona}`
+   built here (W1's removal needs it; R2 builds only the brief switch on it), and an inherited
+   persona is not checked at create (it is at claim). A routine paused at claim keeps the
+   tool server's sentence: "Your routine is paused: <sentence without its full stop>."
+6. **`tools`** in a persona claim are the session's (`201 tools`, mapped from harness to
+   registry names); a Nudge claim's are the catalog's, as before.
+7. **The missing-skill sentence applies to any role**, not only a persona's: a missing skill
+   folder is never a silent run with fewer skills.
+
+**Not verified**: a real worker in a real sandbox (no OpenShell here) and the recreate
+runbook; any model run (no eval run has happened, so nothing is claimed about any persona's
+quality); W1 and S1 against these routes (not built).
 
 ### Order and parallelism
 
