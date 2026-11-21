@@ -235,6 +235,7 @@ mascot: chief                 # nudge | chief | sprout | echo
 owner: "TODO"
 version: "0.1.0"
 offered: true                 # default false: whether PMs see and may use it
+preview: true                 # default false: offered before its benchmark passes ("not yet benchmarked")
 always-on: false              # default false; exactly one persona, `nudge`, sets true
 order: 20                     # 0-1000, display order
 summary: Runs your week: what needs you, what is slipping, and what to tell your leadership.
@@ -266,11 +267,34 @@ a `read` tool whose `system` is the need's source.
 | Every tool of the persona's role is a tool of `pm-assistant` (each extra one is named) | `persona-exceeds-base` | error |
 | The role's data class is at most `pm-assistant`'s | `persona-data-class` | error |
 | No write that `pm-assistant` sets to `never` is anything but `never` in the role | `persona-action` | error |
+| Every write the role can make (through any of its skills) is listed in its `actions`: there is no fallback to `approve`, and the tool server refuses an unlisted one | `persona-action-unlisted` | error |
+| The role carries the sections "Untrusted data", "Hard limits", "Source markers in drafts", "Look before you ask" and "Point of view" exactly as `pm-assistant` has them, once each; `pm-assistant` must have all five (`STANDING_SECTIONS`) | `persona-role-sections` | error |
 | The role is not a team bot's role | `persona-role-team` | error |
 | Every skill of the role lists `web` or `slack` in `surfaces` | `persona-skill-surface` | warning |
 
 A persona's skills need not be `pm-assistant`'s (that is how a specialist gets a skill Nudge
 doesn't have); their tools must be.
+
+**Offering before a benchmark (D10 and the owner's Preview exception, 2026-11-21).**
+`preview: true` (default `false`) offers a persona as a Preview, shown as "Preview: not yet
+benchmarked". `pmos lint` refuses an offered persona that is neither always-on nor a Preview
+unless every eval category naming it (`persona: <key>` in `evals/categories/*/category.yaml`) has
+met its pass bar two weeks in a row in `evals/reports` (`persona-benchmark`, an error; `--evals`
+names the evals directory, default `evals` beside the content root; a Preview whose category
+passes gets a warning to drop the label). The services, the policy generator and the content
+admin don't read the reports and don't check this rule; CI's `pmos lint` does.
+
+**A draft notice.** `draft-notice: "<one line>"` (optional, at most 160 characters, the text
+rule) is put by the tool server at the top of the body of every Confluence page the persona
+drafts, when it is recorded and again when it is written (`NOTICE_TOOLS`); the role's body must
+state it (`persona-draft-notice`). Echo's is "Draft for internal review. Not approved for external
+use." (`INTERNAL_REVIEW_NOTICE`), pinned by a test.
+
+**Reserved names.** A key or display name that reads as one of `RESERVED_NAMES` (PM OS, its four
+roles, words such as Admin, Owner or System, the systems it talks to, Slack's special words),
+ignoring case and anything but letters and digits, is refused (`persona-reserved`). People's
+names are in the user database: the admin view lists a persona named like a user
+(`name_clashes`).
 
 Other rules: `persona-parse` (front matter missing, unknown field or wrong type),
 `persona-missing-file`, `persona-name` (folder, format, or a key or display name that is another

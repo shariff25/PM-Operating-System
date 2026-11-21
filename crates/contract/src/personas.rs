@@ -59,6 +59,152 @@ pub const WRITE_LABELS: [(&str, &str); 6] = [
     ("bets.record", "bets register entries"),
 ];
 
+/// The line every customer-facing draft of the Outbound PM bot (Echo) carries until Legal's
+/// outbound policy exists (the owner's decision of 2026-11-21, `docs/bot-decisions.md`, note on
+/// D10 and D12). Echo's `PERSONA.md` names it as its `draft-notice`; the tool server puts it at
+/// the top of every page body such a persona drafts ([`with_draft_notice`]), whatever the
+/// model wrote. No extra approval step goes with it.
+pub const INTERNAL_REVIEW_NOTICE: &str =
+    "Draft for internal review. Not approved for external use.";
+
+/// The longest `draft-notice`.
+pub const MAX_DRAFT_NOTICE: usize = 160;
+
+/// The write tools whose drafts are pages read beyond the team: a persona's `draft-notice`
+/// goes at the top of their `body`. Jira issues and Slack replies are internal work and don't
+/// carry it.
+pub const NOTICE_TOOLS: [&str; 2] = ["confluence.create_draft", "confluence.update_page"];
+
+/// The role sections a persona role carries **verbatim** from the personal role
+/// (`docs/bot-marketplace-spec.md` §3): the lint refuses a persona role whose copy differs in
+/// any character, and a personal role that lacks one (`persona-role-sections`, an error). A
+/// persona's own limits go in a section of another name.
+pub const STANDING_SECTIONS: [&str; 5] = [
+    "Untrusted data",
+    "Hard limits",
+    "Source markers in drafts",
+    "Look before you ask",
+    "Point of view",
+];
+
+/// Names no persona may take as its key or display name, compared ignoring case and anything
+/// but letters and digits (`persona-reserved`): PM OS itself, its four roles and their words,
+/// the systems it talks to, and words Slack treats specially. A display name is shown in Slack
+/// as "Name: …", so one of these would read as PM OS, a person's role or a system speaking.
+pub const RESERVED_NAMES: [&str; 30] = [
+    "PM OS",
+    "PMOS",
+    "PM",
+    "Admin",
+    "Administrator",
+    "Product Manager",
+    "Reviewer",
+    "Auditor",
+    "Owner",
+    "Platform owner",
+    "System",
+    "Security",
+    "Legal",
+    "Support",
+    "Help",
+    "Bot",
+    "Assistant",
+    "Evals",
+    "Anonymous",
+    "Slack",
+    "Slackbot",
+    "Jira",
+    "Confluence",
+    "GitHub",
+    "OpenShell",
+    "Claude",
+    "Anthropic",
+    "Everyone",
+    "Channel",
+    "Here",
+];
+
+/// Lowercase letters and digits only: how names are compared.
+fn fold_name(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The reserved name ([`RESERVED_NAMES`]) `s` reads as, if any.
+pub fn reserved_name(s: &str) -> Option<&'static str> {
+    let me = fold_name(s);
+    RESERVED_NAMES.iter().copied().find(|r| fold_name(r) == me)
+}
+
+/// Whether `s` reads as the person's name or handle `name` (compared as [`reserved_name`]
+/// compares): a persona must not be named like a PM OS user, whose name Slack and the web app
+/// show in the same place.
+pub fn reads_as(s: &str, name: &str) -> bool {
+    let (a, b) = (fold_name(s), fold_name(name));
+    !a.is_empty() && a == b
+}
+
+/// The sections of a role body, by `## ` heading: `(heading, text)`, the text running from the
+/// heading line to the line before the next `## ` heading, trailing whitespace trimmed.
+pub fn role_sections(body: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in body.lines() {
+        if let Some(h) = line.strip_prefix("## ") {
+            out.push((h.trim().to_string(), format!("{line}\n")));
+        } else if let Some((_, text)) = out.last_mut() {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    for (_, text) in &mut out {
+        let keep = text.trim_end().len();
+        text.truncate(keep);
+    }
+    out
+}
+
+/// The team's standing context, which comes before any persona's text.
+pub const MASTER_CONTEXT: &str = "master/AGENTS.md";
+
+/// The content files (paths relative to the content root) whose change alters what a
+/// marketplace bot is told, so a change to one needs a second platform owner's review, as a
+/// network change does (`policies/README.md`, "Bot instructions"): the team's standing context
+/// ([`MASTER_CONTEXT`]), each persona's file, and the role body of every role a persona runs
+/// as, the personal role included (its standing sections are copied into every other).
+pub fn instruction_paths<'a>(personas: impl IntoIterator<Item = &'a Persona>) -> BTreeSet<String> {
+    let mut out = BTreeSet::from([MASTER_CONTEXT.to_string()]);
+    for p in personas {
+        out.insert(format!("personas/{}/PERSONA.md", p.name));
+        out.insert(format!("roles/{}/ROLE.md", p.role));
+    }
+    out
+}
+
+/// Whether a change to content file `rel` changes a marketplace bot's instructions: one of
+/// `known` ([`instruction_paths`]), or any file under `personas/` (a new persona).
+pub fn is_bot_instructions(rel: &str, known: &BTreeSet<String>) -> bool {
+    known.contains(rel) || rel.starts_with("personas/")
+}
+
+/// `args` with `notice` as the first line of the page body, for a tool in [`NOTICE_TOOLS`]
+/// whose `body` doesn't already carry it. Anything else is returned unchanged.
+pub fn with_draft_notice(tool: &str, args: &serde_json::Value, notice: &str) -> serde_json::Value {
+    let mut out = args.clone();
+    if !NOTICE_TOOLS.contains(&tool) {
+        return out;
+    }
+    if let Some(body) = out.get_mut("body") {
+        if let Some(text) = body.as_str() {
+            if !text.contains(notice) {
+                *body = serde_json::Value::String(format!("{notice}\n\n{text}"));
+            }
+        }
+    }
+    out
+}
+
 /// Systems whose read tools are not shown as sources ("Reads"): PM OS's own context, memory,
 /// statistics and bets register.
 pub const NOT_SOURCES: [&str; 4] = ["context", "memory", "stats", "bets"];
@@ -96,6 +242,14 @@ pub(crate) struct PersonaFrontMatter {
     pub offered: bool,
     #[serde(default)]
     pub always_on: bool,
+    /// Offered as a Preview ("not yet benchmarked") before its eval category meets its bar
+    /// (the owner's exception to D10, 2026-11-21).
+    #[serde(default)]
+    pub preview: bool,
+    /// A line every page it drafts carries ([`NOTICE_TOOLS`]), such as Echo's
+    /// [`INTERNAL_REVIEW_NOTICE`].
+    #[serde(default)]
+    pub draft_notice: Option<String>,
     pub order: i64,
     pub summary: String,
     pub examples: Vec<String>,
@@ -138,6 +292,12 @@ pub struct Persona {
     pub offered: bool,
     /// Nudge: on every team, never removable.
     pub always_on: bool,
+    /// A Preview: offered before its eval category has met its bar, shown as "Preview: not
+    /// yet benchmarked" (the owner's exception to D10, 2026-11-21).
+    pub preview: bool,
+    /// The line the tool server puts at the top of every page this persona drafts
+    /// ([`with_draft_notice`]); `None` for most.
+    pub draft_notice: Option<String>,
     pub order: u32,
     pub summary: String,
     pub examples: Vec<String>,
@@ -163,10 +323,24 @@ pub fn role_setting(role: &Role, tool: &str) -> ActionSetting {
         .unwrap_or(ActionSetting::Approve)
 }
 
+/// A **persona** role's own setting for a write tool: its `actions` entry, else `never`. A
+/// persona role lists every write it may draft (`persona-action-unlisted`); there is no
+/// fallback to `approve`, so a skill that later declares a new write tool gives the persona
+/// nothing until someone decides its setting in the role.
+pub fn persona_role_setting(role: &Role, tool: &str) -> ActionSetting {
+    role.actions
+        .get(tool)
+        .copied()
+        .unwrap_or(ActionSetting::Never)
+}
+
 /// A persona's effective setting for a write tool before any bot override: the stricter of
-/// its role's and the personal role's.
+/// its role's ([`persona_role_setting`]) and the personal role's.
 pub fn effective_setting(persona_role: &Role, base: &Role, tool: &str) -> ActionSetting {
-    stricter(role_setting(persona_role, tool), role_setting(base, tool))
+    stricter(
+        persona_role_setting(persona_role, tool),
+        role_setting(base, tool),
+    )
 }
 
 /// The systems a set of tools reads, as sources: Jira, Confluence, Slack and Docs first (in
@@ -323,20 +497,37 @@ mod tests {
 
     #[test]
     fn drafts_are_the_approve_writes_labelled() {
+        use ActionSetting::*;
         let tools = set(&["jira.create_issue", "slack.send_message", "jira.search"]);
         let base = role(&[]);
+        let both = role(&[
+            ("jira.create_issue", Approve),
+            ("slack.send_message", Approve),
+        ]);
         assert_eq!(
-            drafts(&tools, &registry(), &role(&[]), &base),
+            drafts(&tools, &registry(), &both, &base),
             ["Jira issues", "Slack messages"]
         );
         // `never` in the persona's role or in the base hides it.
-        let p = role(&[("slack.send_message", ActionSetting::Never)]);
+        let p = role(&[
+            ("jira.create_issue", Approve),
+            ("slack.send_message", Never),
+        ]);
         assert_eq!(drafts(&tools, &registry(), &p, &base), ["Jira issues"]);
-        let base = role(&[("jira.create_issue", ActionSetting::Never)]);
+        let base = role(&[("jira.create_issue", Never)]);
         assert_eq!(
-            drafts(&tools, &registry(), &role(&[]), &base),
+            drafts(&tools, &registry(), &both, &base),
             ["Slack messages"]
         );
+        // A write the persona's role doesn't list is `never`: no fallback to approve.
+        let base = role(&[]);
+        let unlisted = role(&[("jira.create_issue", Approve)]);
+        assert_eq!(
+            drafts(&tools, &registry(), &unlisted, &base),
+            ["Jira issues"]
+        );
+        assert_eq!(persona_role_setting(&unlisted, "slack.send_message"), Never);
+        assert_eq!(role_setting(&unlisted, "slack.send_message"), Approve);
     }
 
     #[test]
@@ -393,5 +584,94 @@ mod tests {
             assert!(check_text("title", bad, 40).is_err(), "{bad:?}");
         }
         assert!(check_text("title", &"x".repeat(41), 40).is_err());
+    }
+
+    #[test]
+    fn reserved_names_match_ignoring_case_and_spacing() {
+        for name in [
+            "PM OS",
+            "pmos",
+            "Pm-Os",
+            "admin",
+            "ADMIN",
+            "Product Manager",
+            "slackbot",
+        ] {
+            assert!(reserved_name(name).is_some(), "{name}");
+        }
+        for name in ["Chief", "Sprout", "Echo", "Nudge", "Admiral", "Pmo"] {
+            assert_eq!(reserved_name(name), None, "{name}");
+        }
+        assert!(reads_as("Ana Lopez", "ana-lopez"));
+        assert!(!reads_as("Chief", "ana"));
+        assert!(!reads_as("", ""));
+    }
+
+    #[test]
+    fn sections_split_on_level_two_headings() {
+        let body = "# Role\n\nIntro.\n\n## Untrusted data\nOne.\nTwo.\n\n## Hard limits\n- No.\n\n### Sub\nStill limits.\n";
+        let s = role_sections(body);
+        assert_eq!(s.len(), 2);
+        assert_eq!(
+            s[0],
+            (
+                "Untrusted data".into(),
+                "## Untrusted data\nOne.\nTwo.".into()
+            )
+        );
+        assert_eq!(
+            s[1],
+            (
+                "Hard limits".into(),
+                "## Hard limits\n- No.\n\n### Sub\nStill limits.".into()
+            )
+        );
+    }
+
+    #[test]
+    fn bot_instructions_are_the_master_context_personas_and_their_roles() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content");
+        let report = crate::lint(&root, &crate::LintOptions::new(chrono::NaiveDate::MIN));
+        let known = instruction_paths(&report.personas);
+        for p in [
+            "master/AGENTS.md",
+            "roles/pm-assistant/ROLE.md",
+            "roles/chief-of-staff/ROLE.md",
+            "roles/growth-pm/ROLE.md",
+            "roles/outbound-pm/ROLE.md",
+            "personas/echo/PERSONA.md",
+        ] {
+            assert!(is_bot_instructions(p, &known), "{p}");
+        }
+        assert!(is_bot_instructions("personas/newbot/PERSONA.md", &known));
+        for p in [
+            "roles/docs-helper/ROLE.md",
+            "context/products/x.md",
+            "skills/ask/SKILL.md",
+        ] {
+            assert!(!is_bot_instructions(p, &known), "{p}");
+        }
+    }
+
+    #[test]
+    fn the_notice_heads_every_page_body_once() {
+        let n = INTERNAL_REVIEW_NOTICE;
+        let page = serde_json::json!({"space": "PM", "title": "4.2", "body": "## New\nThings."});
+        let noted = with_draft_notice("confluence.create_draft", &page, n);
+        assert_eq!(noted["body"], format!("{n}\n\n## New\nThings."));
+        assert_eq!(noted["title"], "4.2");
+        // Already there: unchanged, so it is never doubled.
+        assert_eq!(
+            with_draft_notice("confluence.create_draft", &noted, n),
+            noted
+        );
+        let update = serde_json::json!({"page_id": "1", "version": 2, "body": "x"});
+        assert_eq!(
+            with_draft_notice("confluence.update_page", &update, n)["body"],
+            format!("{n}\n\nx")
+        );
+        // Not a page: unchanged.
+        let issue = serde_json::json!({"project": "PM", "summary": "s", "description": "d"});
+        assert_eq!(with_draft_notice("jira.create_issue", &issue, n), issue);
     }
 }

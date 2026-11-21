@@ -7,6 +7,8 @@ mascot: echo
 owner: "TODO"
 version: "0.1.0"
 offered: true
+preview: true
+draft-notice: "Draft for internal review. Not approved for external use."
 order: 40
 summary: "Takes the product to market: launches, positioning, sales and customers."
 examples:

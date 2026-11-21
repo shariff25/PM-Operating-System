@@ -34,6 +34,11 @@ enum Command {
         deny_warnings: bool,
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
+        /// The evals directory whose categories and reports decide which marketplace bots are
+        /// benchmarked (`persona-benchmark`, D10). Default: `evals` beside the content root.
+        /// A missing directory benchmarks none, so every offered bot must be a Preview.
+        #[arg(long)]
+        evals: Option<PathBuf>,
     },
     /// Each bot's OpenShell sandbox policy (docs/sandbox-policies.md).
     Policy {
@@ -111,10 +116,14 @@ fn main() -> Result<ExitCode> {
             stale_after_days,
             deny_warnings,
             format,
+            evals,
         } => {
-            // `team-file-retired` is an error here, as in CI (`LintOptions::new`).
+            // `team-file-retired` is an error here, as in CI (`LintOptions::new`), and so is
+            // an offered marketplace bot that is neither benchmarked nor a Preview.
+            let evals = evals.unwrap_or_else(|| evals_beside(&root));
             let opts = LintOptions {
                 stale_after_days,
+                benchmarked: Some(pmos_evals::history::benchmarked_personas(&evals)),
                 ..LintOptions::new(today.unwrap_or_else(|| Local::now().date_naive()))
             };
             run_lint(&root, &opts, deny_warnings, format)
@@ -164,6 +173,15 @@ fn bot_add_personal(root: &Path, handle: &str) -> Result<ExitCode> {
         bot.display()
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// `evals` beside the content root (`content` and `evals` are siblings in the repository).
+fn evals_beside(root: &Path) -> PathBuf {
+    let parent = match root.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    parent.join("evals")
 }
 
 fn run_lint(

@@ -7,6 +7,7 @@
 //! | `GET /internal/team/{handle}` | `pmos-web` | `Team`: the person's own team. |
 //! | `PUT /internal/team/{handle}` | `pmos-web` | `{add?, remove?, via}`: change it, atomically; answers `Team`. |
 //! | `GET /internal/admin/personas?user=<viewer>` | `pmos-web` | `AdminPersonas`: who uses which, for `view-audit-log` or `manage-members`. |
+//! | `POST /internal/admin/personas/drafts/{id}/release?user=<admin>` | `pmos-web` | An Admin (`edit-content`) releases a draft held because its bot was withdrawn. Assertion `require` only. |
 //!
 //! **`/internal/team/{handle}` acts for one PM.** Only `pmos-web`'s token (every other gets
 //! `403`); in **every** assertion mode the call carries `pmos-web`'s signed user assertion,
@@ -60,6 +61,10 @@ pub(super) fn routes(state: AppState) -> Router<AppState> {
         .layer(middleware::from_fn_with_state(state.clone(), identify_pm));
     let admin = Router::new()
         .route("/admin/personas", get(admin_personas))
+        .route(
+            "/admin/personas/drafts/{id}/release",
+            axum::routing::post(release_held_draft),
+        )
         .layer(middleware::from_fn_with_state(state, identify_admin));
     catalog.merge(team).merge(admin)
 }
@@ -299,6 +304,50 @@ async fn admin_personas(
     match state.svc.admin_personas(Utc::now()).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => unavailable(e),
+    }
+}
+
+/// `POST /internal/admin/personas/drafts/{id}/release?user=<admin>`: an Admin releases a draft
+/// held because its bot was withdrawn (`docs/bot-marketplace-spec.md` §6, "Removal"). A write:
+/// the tool server must run in assertion `require` (`503 assertion_required` otherwise), and
+/// the assertion's subject is `user` (checked by [`identify_admin`]). `200` the item; `403
+/// forbidden` (not an active Admin), `404 not_found`, `409 not_held`.
+async fn release_held_draft(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Path(id): Path<String>,
+    Query(q): Query<ViewerParams>,
+) -> Response {
+    if !writes_allowed(&state.people.assertions) {
+        return coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "assertion_required",
+            "releasing a held draft needs signed user assertions (PMOS_ASSERTION_MODE=require); this tool server runs without them",
+        );
+    }
+    let Some(admin) = q.user.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
+        return coded(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "`user` (the admin) is required",
+        );
+    };
+    use crate::service::ReleaseRefusal;
+    match state
+        .svc
+        .release_held_draft(client, admin, &id, Utc::now())
+        .await
+    {
+        Ok(item) => Json(state.svc.approval_json(&item).await).into_response(),
+        Err(ReleaseRefusal::Store(e)) => unavailable(e),
+        Err(e) => {
+            let status = match e {
+                ReleaseRefusal::Forbidden => StatusCode::FORBIDDEN,
+                ReleaseRefusal::NotFound => StatusCode::NOT_FOUND,
+                _ => StatusCode::CONFLICT,
+            };
+            coded(status, e.code(), &e.to_string())
+        }
     }
 }
 

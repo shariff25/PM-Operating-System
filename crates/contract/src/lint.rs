@@ -42,6 +42,12 @@ pub struct LintOptions {
     /// as during an upgrade before its pull request deletes it, must not stop a service from
     /// starting or reloading: the service logs the warning and ignores the file.
     pub retired_team_file: Severity,
+    /// The personas whose eval categories meet their pass bar (D10: two weeks in a row), as
+    /// `pmos lint` reads them from the eval reports (`pmos_evals::history::benchmarked_personas`).
+    /// `Some`: an offered persona that is neither always-on nor `preview: true` must be in it
+    /// (`persona-benchmark`, an error). `None`: the rule is not checked here (a service loading
+    /// its content, the policy generator, the content admin): CI's `pmos lint` is the gate.
+    pub benchmarked: Option<BTreeSet<String>>,
 }
 
 impl LintOptions {
@@ -50,6 +56,7 @@ impl LintOptions {
             today,
             stale_after_days: DEFAULT_STALE_AFTER_DAYS,
             retired_team_file: Severity::Error,
+            benchmarked: None,
         }
     }
 
@@ -138,7 +145,7 @@ pub fn lint(root: &Path, opts: &LintOptions) -> Report {
     cx.check_team_file_retired(opts);
     cx.check_people();
     cx.check_roles_and_bots(registry.as_ref());
-    cx.check_personas(registry.as_ref());
+    cx.check_personas(registry.as_ref(), opts);
 
     cx.report
         .diagnostics
