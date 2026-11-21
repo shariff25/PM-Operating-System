@@ -79,7 +79,9 @@ typed alone in a DM, in any case:
 - **One routine.** The draft is the one in part 1, built directly (the model is not
   involved). Asking again for the same time says it is already set; a new time creates the
   new routine and then deletes the old one, so there is never more than one; a paused one at
-  the same time is resumed.
+  the same time is resumed. A brief Chief writes (chosen in the web app's Bots page, slice R2)
+  is moved instead: the same routine gets the new time and is turned on (`PATCH {schedule,
+  enabled: true}`), so it stays Chief's, and `brief now` runs as Chief too.
 - **Identifying it.** The prompt starts with `[daily-brief]` (`brief::TAG`);
   `brief::is_brief_routine(routine)` tests it. The runtime is unchanged.
 - **Times** are 00:00 to 23:59 (`7am`, `7:30 pm` also work). Anything else, such as `25` or

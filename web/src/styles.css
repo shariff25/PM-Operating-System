@@ -599,7 +599,7 @@ input[type='checkbox'], input[type='radio'] { width: 16px; height: 16px; margin:
 .today-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 12px; }
 .today-head-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .today-head h1 { font-size: 30px; letter-spacing: -0.025em; line-height: 1.15; }
-.today-brief { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); max-width: 380px; }
+.today-brief { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 13px; color: var(--muted); max-width: 380px; }
 .today-brief-quiet .accent-dot { background: var(--subtle); }
 
 .composer { display: flex; flex-direction: column; gap: 12px; padding: 16px 18px; box-shadow: var(--shadow-card); overflow: visible; transition: border-color var(--t) var(--ease), box-shadow var(--t) var(--ease); }
@@ -2691,6 +2691,21 @@ input.pw-code {
 .bot-routine-prompt { font-weight: 500; overflow-wrap: anywhere; }
 .bot-routine-meta { font: 400 12px/1.4 var(--mono); color: var(--muted); overflow-wrap: anywhere; }
 .bot-routine-choice { gap: 2px; }
+/* The daily-brief switch in a bot's Settings (slice R2) */
+.bot-brief { display: flex; flex-direction: column; gap: 8px; }
+.bot-brief-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--border-2); border-radius: 10px; }
+.bot-brief-label { font-weight: 500; min-width: 0; overflow-wrap: anywhere; }
+.bot-brief-switch { display: inline-flex; align-items: center; gap: 8px; flex: none; padding: 4px 8px; border: 0; border-radius: 999px; background: transparent; color: var(--ink-2); font: inherit; font-size: 13px; cursor: pointer; }
+.bot-brief-switch[aria-disabled='true'] { cursor: progress; }
+.bot-brief-state { min-width: 1.75em; text-align: left; }
+.bot-brief-what { font-size: 13px; line-height: 1.5; color: var(--muted); }
+.bot-brief-done { font-size: 13px; color: var(--ink-2); }
+/* Kept in the page while empty, so screen readers announce what arrives; no gap meanwhile. */
+.bot-brief-done:empty { margin-top: -8px; }
+.bot-brief-back { font-size: 13px; color: var(--ink-2); }
+/* "Written by Chief" after "Your daily brief is in" on Today */
+.today-brief-by { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--ink-2); white-space: nowrap; }
+.today-brief-sep { color: var(--subtle); }
 .radio-hint { align-items: flex-start; padding-top: 8px; padding-bottom: 8px; }
 .radio-hint input { margin-top: 3px; }
 .welcome-steps-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }

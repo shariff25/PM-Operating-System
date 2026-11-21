@@ -1070,6 +1070,12 @@ export function createMockClient(options: MockOptions = {}): Api {
       keep();
       return answer;
     },
+    async setBriefWriter(persona) {
+      await wait();
+      write();
+      guard();
+      return team.setBrief(me, persona);
+    },
 
     async brief(): Promise<Brief> {
       await wait();
@@ -1079,12 +1085,17 @@ export function createMockClient(options: MockOptions = {}): Api {
       const delivered_at =
         delivery === 'never' ? null : delivery === 'stale' ? iso(Date.now() - 3 * 24 * HOUR) : iso(Date.now() - 1000);
       const status = delivery;
+      // Who wrote it: kept with the day's items, so only a brief from the last day names its bot
+      // (as pmos-web's `GET /api/brief` does).
+      const persona = delivery === 'today' ? team.briefAuthor() : null;
       if (options.emptyBrief || delivery === 'never') {
-        return { date: iso(Date.now()).slice(0, 10), changed: [], waiting_on_you: [], you_wait_on: [], delivered_at, status };
+        return { date: iso(Date.now()).slice(0, 10), changed: [], waiting_on_you: [], you_wait_on: [], delivered_at, status, persona, persona_offered: team.offered(persona) };
       }
       return {
         delivered_at,
         status,
+        persona,
+        persona_offered: team.offered(persona),
         date: iso(Date.now()).slice(0, 10),
         // A brief that came before today has no `changed` items; its follow-ups are the ones not yet expired.
         changed:

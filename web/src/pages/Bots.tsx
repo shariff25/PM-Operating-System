@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import type { BotCard, BotRoutine, WithdrawnBot } from '../api';
 import { useApp } from '../app-context';
-import { isUnknownOutcome, skillLabel, teamErrorText } from '../bots';
+import { identify, isBriefRoutine, isUnknownOutcome, skillLabel, teamErrorText, writesBriefs } from '../bots';
 import { BotFace, NeedBadges, PreviewTag, ReadsPills, RoleLine, Words } from '../components/BotParts';
 import { ErrorNote, PageHeader, Skeleton } from '../components/bits';
 import { Mascot } from '../components/Mascot';
@@ -196,7 +196,11 @@ function RoutineList({ routines, name }: { routines: BotRoutine[] | null; name: 
     <ul className="bot-routines">
       {routines.map((r) => (
         <li key={r.id}>
-          <span className="bot-routine-prompt">“{r.prompt ?? ''}”</span>
+          {isBriefRoutine(r) ? (
+            <span className="bot-routine-prompt">{copy.bots.settings.briefRoutine}</span>
+          ) : (
+            <span className="bot-routine-prompt">“{r.prompt ?? ''}”</span>
+          )}
           <span className="bot-routine-meta">
             {[r.cron && `${r.cron}${r.tz ? ` (${r.tz})` : ''}`, r.enabled ? (r.next_run_at ? copy.bots.settings.next(longTime(r.next_run_at)) : null) : copy.bots.settings.paused]
               .filter(Boolean)
@@ -205,6 +209,95 @@ function RoutineList({ routines, name }: { routines: BotRoutine[] | null; name: 
         </li>
       ))}
     </ul>
+  );
+}
+
+const BS = copy.bots.settings.brief;
+
+/**
+ * "Chief writes my daily brief" (slice R2), in the Settings of a bot that writes briefs. A switch
+ * that acts at once (`PUT /api/me/brief`): on hands the person's brief routine to this bot, off
+ * gives it back to Nudge. Its description says what changes before it is used; the result is
+ * announced in a status line, a failure in an alert, and focus stays on the switch.
+ */
+function BriefSwitch({ bot }: { bot: BotCard }) {
+  const { api } = useApp();
+  const { bots, setBots, reloadBots } = useData();
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState<string | null>(null);
+  const [problem, setProblem] = useState<string | null>(null);
+  const id = useId();
+  const brief = bots?.brief;
+  // An older server says nothing about the brief: no switch.
+  if (brief === undefined) return null;
+  const name = bot.display_name;
+  const on = brief?.writer === bot.key;
+
+  const toggle = async () => {
+    if (busy || !brief) return;
+    setBusy(true);
+    setDone(null);
+    setProblem(null);
+    try {
+      setBots(await api.setBriefWriter(on ? 'nudge' : bot.key));
+      setDone(on ? BS.movedOff : BS.movedOn(name));
+    } catch (e) {
+      const unknown = isUnknownOutcome(e);
+      setProblem(unknown ? BS.lost : teamErrorText(e));
+      if (unknown) void reloadBots();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const now = (() => {
+    if (!brief?.writer || brief.writer === 'nudge') return BS.nowNudge;
+    if (on) return BS.nowThis(name);
+    return BS.nowOther(identify(brief.writer, true, bots?.bots).name);
+  })();
+
+  return (
+    <section className="bot-brief" aria-labelledby={`${id}-h`}>
+      <h3 id={`${id}-h`}>{BS.heading}</h3>
+      {brief === null ? (
+        <p className="muted">{BS.unknown}</p>
+      ) : brief.routine_id === null ? (
+        <p className="muted">{BS.none(name)}</p>
+      ) : (
+        <>
+          <div className="bot-brief-row">
+            <span className="bot-brief-label" id={`${id}-l`}>{BS.label(name)}</span>
+            <button
+              type="button"
+              role="switch"
+              className="bot-brief-switch"
+              aria-checked={on}
+              aria-labelledby={`${id}-l`}
+              aria-describedby={`${id}-d`}
+              aria-disabled={busy || undefined}
+              data-brief-switch={bot.key}
+              onClick={() => void toggle()}
+            >
+              <span className={`switch ${on ? 'switch-on' : ''}`} aria-hidden="true">
+                <span className="switch-knob" />
+              </span>
+              <span className="bot-brief-state" aria-hidden="true">{busy ? BS.saving : on ? BS.on : BS.off}</span>
+            </button>
+          </div>
+          <p id={`${id}-d`} className="bot-brief-what">
+            {now} {on ? BS.whatOn(name) : BS.what(name)}
+            {bot.preview ? ` ${BS.preview(name)}` : ''}
+            {!brief.enabled ? ` ${BS.paused}` : ''}
+          </p>
+        </>
+      )}
+      <p className="bot-brief-done" role="status">{done}</p>
+      {problem && (
+        <div className="note note-error" role="alert">
+          <div className="note-body"><p>{problem}</p></div>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -249,6 +342,8 @@ export function Bots() {
   const current = pick && (pick.kind === 'bot' ? all.some((b) => b.key === pick.key) : withdrawn.some((w) => w.key === pick.key)) ? pick : fallback;
   const currentBot = current?.kind === 'bot' ? all.find((b) => b.key === current.key) ?? null : null;
   const currentGone = current?.kind === 'withdrawn' ? withdrawn.find((w) => w.key === current.key) ?? null : null;
+  // The open Settings follow the page's latest answer (the brief switch changes the routines).
+  const settingsBot = settings ? all.find((b) => b.key === settings.key) ?? settings : null;
 
   const select = (p: Pick) => {
     setPick(p);
@@ -455,12 +550,13 @@ export function Bots() {
               </label>
             </fieldset>
           )}
+          {bots?.brief?.writer === removing.key && <p className="bot-brief-back">{copy.bots.remove.briefBack(removing.name)}</p>}
         </TeamDialog>
       )}
 
-      {settings && (
+      {settingsBot && (
         <TeamDialog
-          title={copy.bots.settings.title(settings.display_name)}
+          title={copy.bots.settings.title(settingsBot.display_name)}
           intro={copy.bots.settings.intro}
           onClose={() => {
             setSettings(null);
@@ -477,8 +573,9 @@ export function Bots() {
           hideCancel
           testId="bot-settings"
         >
+          {writesBriefs(settingsBot) && <BriefSwitch bot={settingsBot} />}
           <h3>{copy.bots.settings.routines}</h3>
-          <RoutineList routines={settings.routines} name={settings.display_name} />
+          <RoutineList routines={settingsBot.routines} name={settingsBot.display_name} />
         </TeamDialog>
       )}
     </div>

@@ -180,6 +180,7 @@ export function createRealClient(opts: RealOptions = {}): Api {
 
     bots: () => call<Bots>('GET', '/bots'),
     changeTeam: (change) => call<Bots>('PUT', '/me/team', change),
+    setBriefWriter: (persona) => call<Bots>('PUT', '/me/brief', { persona }),
 
     brief: () => call<Brief>('GET', '/brief'),
     dismissFollowup: (id) => post<void>(`/followups/${seg(id)}/dismiss`),

@@ -329,7 +329,7 @@ impl Notifier {
             tracing::warn!(bot, "a brief block not from a member's own bot; not sent");
             return;
         }
-        let payload = match block {
+        let mut payload = match block {
             Ok(p) => p,
             Err(why) => {
                 tracing::warn!(
@@ -340,6 +340,14 @@ impl Notifier {
                 return;
             }
         };
+        // Who wrote it, for Today's attribution (slice R2): the runtime's notification names
+        // the persona when it isn't Nudge. A key not shaped like one is left out (Nudge),
+        // never passed on.
+        payload.persona = item["persona"]
+            .as_str()
+            .filter(|k| *k != pmos_contract::personas::ALWAYS_ON)
+            .filter(|k| pmos_contract::bots::valid_name(k))
+            .map(String::from);
         let Some(producer) = self.brief_feed.clone() else {
             return;
         };

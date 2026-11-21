@@ -58,6 +58,16 @@ export function cardOf(bots: Bots | null, key: string): BotCard | null {
   return bots?.bots.find((b) => b.key === key) ?? null;
 }
 
+/** Whether a routine is the daily brief: its prompt starts with `[daily-brief]`, as pmos-web finds it. */
+export function isBriefRoutine(r: { prompt: string | null }): boolean {
+  return (r.prompt ?? '').trimStart().startsWith('[daily-brief]');
+}
+
+/** Whether a bot may be chosen to write the daily brief (slice R2): not Nudge, and it lists the skill. */
+export function writesBriefs(bot: Pick<BotCard, 'always_on' | 'can_do'>): boolean {
+  return !bot.always_on && bot.can_do.includes('daily-brief');
+}
+
 /** A skill key's label, from the app's own fixed map; a key it has no label for is shown as the key. */
 export function skillLabel(key: string): string {
   const labels: Record<string, string> = copy.bots.skills;

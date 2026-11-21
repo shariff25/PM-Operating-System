@@ -819,6 +819,8 @@ export const copy = {
       return `${n <= 10 ? words[n] : n} things need you.`;
     },
     briefReady: 'Your daily brief is in',
+    /** Who wrote it, after "Your daily brief is in" (slice R2), as drafts say who drafted them. */
+    briefBy: (name: string) => `Written by ${name}`,
     /** No brief has ever run. Briefs come on weekday mornings, at the time the PM sets in Slack. */
     briefNever: 'No brief yet. Want a morning brief? Say "brief me at 8" to the bot in Slack.',
     briefStale: (when: string) => `No brief yet today. Your last one was ${when}.`,
@@ -1178,9 +1180,11 @@ export const copy = {
       pauseHint: 'They stop until you add the bot back and turn them on again.',
       confirm: 'Remove',
       removing: 'Removing…',
+      /** When the bot writes the daily brief: said whichever option is picked. */
+      briefBack: (name: string) => `${name} writes your daily brief. It goes back to Nudge either way, and keeps its time.`,
     },
 
-    // A bot's settings: its routines, read only in this version
+    // A bot's settings: its routines (read only), and the daily-brief switch for a bot that writes briefs
     settings: {
       title: (name: string) => `${name} settings`,
       intro: 'Routines are asks that run on a schedule. You set them up in Slack.',
@@ -1190,6 +1194,31 @@ export const copy = {
       paused: 'Paused',
       next: (when: string) => `Next: ${when}`,
       close: 'Close',
+      /** The daily brief's routine, by name instead of its prompt. */
+      briefRoutine: 'Your daily brief',
+      brief: {
+        heading: 'Daily brief',
+        label: (name: string) => `${name} writes my daily brief`,
+        on: 'On',
+        off: 'Off',
+        /** What changes, said before the switch is used. */
+        what: (name: string) =>
+          `Same brief, same time, same Slack DM. Only who writes it changes: from the next one, it comes from ${name}, and Today says so. Turn this off, or remove ${name}, and Nudge writes it again.`,
+        /** The same, once this bot writes it. */
+        whatOn: (name: string) =>
+          `Same brief, same time, same Slack DM as before; it comes from ${name}, and Today says so. Turn this off, or remove ${name}, and Nudge writes it again.`,
+        nowNudge: 'Nudge writes it now.',
+        nowThis: (name: string) => `${name} writes it now.`,
+        nowOther: (name: string) => `${name} writes it now. Switching this on hands it to this bot instead.`,
+        preview: (name: string) => `${name} is a Preview: it hasn't been benchmarked yet.`,
+        paused: 'Your brief is paused. Say "brief me at 8" to the bot in Slack to turn it back on.',
+        none: (name: string) => `You don't have a daily brief yet. Say "brief me at 8" to the bot in Slack, then come back here if you want ${name} to write it.`,
+        unknown: "I couldn't read your daily brief just now, so I can't change who writes it. Try again in a minute.",
+        saving: 'Saving…',
+        movedOn: (name: string) => `${name} writes your daily brief from the next one.`,
+        movedOff: 'Nudge writes your daily brief again, from the next one.',
+        lost: "I can't tell who writes your daily brief now. Reload the page to see before you try again.",
+      },
     },
 
     // The picker in the ask box
@@ -2399,6 +2428,8 @@ export const copy = {
       bot_unavailable: "That bot isn't offered any more. Nothing changed.",
       always_on: 'Nudge is always on your team. Nothing changed.',
       team_full: 'A team holds at most 16 bots. Remove one first. Nothing changed.',
+      no_brief: 'You don\'t have a daily brief yet. Say "brief me at 8" to the bot in Slack to start one. Nothing changed.',
+      cant_write_brief: "That bot doesn't write daily briefs. Nothing changed.",
       held: 'This draft is on hold: the bot that drafted it isn’t offered any more. You can still reject it. Nothing was sent.',
       not_held: 'That draft isn’t on hold any more: it was decided, its bot is offered again, or someone released it. Nothing changed.',
       bad_content_type: "That request wasn't sent the way I need it. Nothing changed.",

@@ -1198,6 +1198,7 @@ async fn create_routine(
     )?;
     let req: CreateRoutine = body(&bytes)?;
     own(&caller, &req.draft.owner)?;
+    may_name_routine_persona(&caller, req.draft.persona.as_deref())?;
     let routine = state.rt.create_routine(req.draft, model::now()).await?;
     Ok((StatusCode::CREATED, Json(routine)).into_response())
 }
@@ -1265,6 +1266,27 @@ async fn managed_routine(state: &AppState, caller: &Caller, id: &str) -> Result<
     Ok(())
 }
 
+/// May `caller` set a routine to run as `persona` (`None` or `nudge` is Nudge)? Moving a
+/// routine to Nudge is always allowed (it narrows nothing a PM chose to keep: Nudge is on
+/// every team). Naming any other persona is for the `web` client only (`pmos-web`, slice R2),
+/// because whether that bot is on the owner's team is known only to the tool server, which
+/// lets `pmos-web` alone read a team, with the owner's signed assertion: `pmos-web` checks it
+/// from a fresh read before it calls here (`PUT /api/me/brief`), and the tool server decides
+/// again at every run, pausing the routine on `persona_not_on_team` or `persona_unavailable`.
+/// The Slack bot can't read a team, so it may only move a routine to Nudge; the console may
+/// not change a routine's persona at all ([`update_routine`]). Whether the persona is offered
+/// and suits the bot is checked here too, against the catalog ([`Runtime::update_routine`]).
+fn may_name_routine_persona(caller: &Caller, persona: Option<&str>) -> Result<(), Error> {
+    let names_a_bot = persona.is_some_and(|p| p != model::NUDGE);
+    if names_a_bot && caller.kind != ClientKind::Web {
+        return Err(forbidden(
+            "only the web client sets a routine to run as a marketplace bot, once it has checked \
+             the bot is on the owner's team; any client that manages routines may move one to Nudge",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PatchRoutine {
@@ -1296,6 +1318,9 @@ async fn update_routine(
     {
         return Err(forbidden("the console may pause and resume routines, not change them; the owner does that in Slack",
         ));
+    }
+    if let Some(persona) = &req.persona {
+        may_name_routine_persona(&caller, persona.as_deref())?;
     }
     managed_routine(&state, &caller, &id).await?;
     let routine = state

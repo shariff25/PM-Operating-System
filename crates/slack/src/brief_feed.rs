@@ -58,6 +58,11 @@ pub struct Payload {
     pub changed: Vec<Changed>,
     pub waiting_on_you: Vec<FollowUp>,
     pub you_wait_on: Vec<FollowUp>,
+    /// Who wrote the brief: the notification's marketplace bot, left out for Nudge (slice
+    /// R2). Set by the notifier from the runtime's notification, never from the block, which
+    /// the model writes. pmos-web shows it on Today as the brief's attribution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -249,6 +254,7 @@ pub fn parse(json: &str, now: DateTime<Utc>) -> Result<Payload, String> {
         changed,
         waiting_on_you: follow("waiting_on_you", &block.waiting_on_you)?,
         you_wait_on: follow("you_wait_on", &block.you_wait_on)?,
+        persona: None,
     };
     let size = serde_json::to_vec(&payload).map(|b| b.len()).unwrap_or(0);
     if size > MAX_BODY_BYTES {
