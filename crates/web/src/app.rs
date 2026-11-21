@@ -160,6 +160,11 @@ struct Inner {
     /// Sign-in events the tool server didn't record ([`record_sign_in`]), since start-up:
     /// `/readyz` reports it.
     sign_in_record_failures: std::sync::atomic::AtomicU64,
+    /// Password requests refused because the trusted-proxy setting doesn't match where they
+    /// came from (`password.rs`, M1), since start-up: `/readyz` reports it.
+    untrusted_proxy_refusals: std::sync::atomic::AtomicU64,
+    /// When that was last logged (Unix seconds), so the log says it at most once a minute.
+    untrusted_proxy_logged: std::sync::atomic::AtomicI64,
     /// Password sign-in (`PMOS_WEB_PASSWORD_LOGIN=1`; `password.rs`).
     password_login: bool,
     /// `PMOS_WEB_TRUSTED_PROXIES`: whose `X-Forwarded-For` names the client's address.
@@ -301,6 +306,8 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         proposals: proposal::Proposals::new(deps.admin)?,
         audiences: Default::default(),
         sign_in_record_failures: Default::default(),
+        untrusted_proxy_refusals: Default::default(),
+        untrusted_proxy_logged: Default::default(),
         password_login: config.password_login,
         trusted_proxies: config.trusted_proxies,
         sources: Default::default(),
@@ -468,6 +475,13 @@ async fn readyz(State(state): State<AppState>) -> Response {
         .0
         .sign_in_record_failures
         .load(std::sync::atomic::Ordering::Relaxed);
+    // Not a readiness check either: above zero means password requests arrive from somewhere
+    // PMOS_WEB_TRUSTED_PROXIES doesn't name, or a trusted proxy names no client (M1); the log
+    // says what to fix.
+    let untrusted = state
+        .0
+        .untrusted_proxy_refusals
+        .load(std::sync::atomic::Ordering::Relaxed);
     (
         status,
         [(header::CACHE_CONTROL, "no-store")],
@@ -475,6 +489,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
             "ready": ready,
             "checks": body,
             "unrecorded_sign_in_events": unrecorded,
+            "untrusted_proxy_refusals": untrusted,
         })),
     )
         .into_response()

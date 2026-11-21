@@ -53,9 +53,9 @@ const COMMON = new Set(['password1234', '123456789012', 'qwertyuiopas', 'iloveyo
 const ROUTES = {
   'sign-in': ['sign_in_failed', 'too_many_attempts', 'sign_in_busy', 'users_unavailable', 'not_configured', 'assertion_required'],
   'second-step': ['code_failed', 'sign_in_expired', 'not_a_member', 'too_many_attempts'],
-  'setup/begin': ['setup_failed', 'not_a_member', 'sign_in_unconfirmed', 'host_only', 'evals_account', 'too_many_attempts'],
-  'setup/password': ['setup_expired', 'weak_password', 'not_a_member', 'sign_in_busy'],
-  'setup/authenticator': ['setup_expired', 'wrong_step'],
+  'setup/begin': ['setup_failed', 'not_a_member', 'sign_in_unconfirmed', 'host_only', 'evals_account', 'setup_code_spent', 'too_many_attempts'],
+  'setup/password': ['setup_expired', 'setup_code_spent', 'weak_password', 'not_a_member', 'too_many_attempts', 'sign_in_busy'],
+  'setup/authenticator': ['setup_expired', 'wrong_step', 'too_many_attempts'],
   'setup/confirm': ['code_failed', 'setup_expired', 'wrong_step', 'host_only', 'sign_in_unconfirmed', 'too_many_attempts'],
   change: ['reauth_failed', 'weak_password', 'no_password', 'too_many_attempts', 'unknown_outcome'],
   'recovery-codes': ['reauth_failed', 'no_password', 'too_many_attempts', 'unknown_outcome'],
@@ -67,6 +67,7 @@ const STATUS: Record<string, number> = {
   wrong_step: 409, weak_password: 422, reauth_failed: 403, no_password: 409, too_many_attempts: 429,
   sign_in_busy: 503, users_unavailable: 503, not_configured: 501, assertion_required: 503, not_a_member: 403,
   host_only: 403, sign_in_unconfirmed: 409, evals_account: 409, unknown_outcome: 502,
+  setup_code_spent: 409,
 };
 
 interface Account {
@@ -152,7 +153,7 @@ export function createMockPassword(options: MockPasswordOptions = {}): MockPassw
     if (code === 'code_failed') refuse(code, { attempts_left: route === 'setup/confirm' ? 4 : 2 });
     if (code === 'weak_password') refuse(code, { reason: reason ?? 'common' });
     if (code === 'sign_in_expired') pending = null;
-    if (code === 'setup_expired') setup = null;
+    if (code === 'setup_expired' || code === 'setup_code_spent') setup = null;
     refuse(code);
   }
 

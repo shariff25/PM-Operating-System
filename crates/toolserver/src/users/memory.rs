@@ -45,6 +45,8 @@ struct StoredCode {
     code: SetupCode,
     used_at: Option<DateTime<Utc>>,
     revoked_at: Option<DateTime<Utc>>,
+    /// Void after too many wrong guesses (migration 0023).
+    voided_at: Option<DateTime<Utc>>,
 }
 
 /// Password sign-in's tables, in memory.
@@ -58,6 +60,9 @@ struct Passwords {
     next_code_id: i64,
     /// By (handle, source key): one person's counters for one address.
     sources: BTreeMap<(String, String), SourceCounters>,
+    /// The ID tokens already used for a first Entra link, by key, until when (M4; in
+    /// Postgres, `entra_used_tokens`).
+    used_tokens: BTreeMap<String, DateTime<Utc>>,
 }
 
 impl Passwords {
@@ -372,6 +377,22 @@ impl UserStore for MemoryUsers {
         self.first_entra_link(link, now).await
     }
 
+    async fn first_token_use(
+        &self,
+        key: &str,
+        expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        let mut state = self.state.lock().await;
+        let used = &mut state.pw.used_tokens;
+        used.retain(|_, until| *until > now);
+        if used.contains_key(key) {
+            return Ok(false);
+        }
+        used.insert(key.to_string(), expires_at);
+        Ok(true)
+    }
+
     fn passwords(&self) -> &dyn PasswordStore {
         self
     }
@@ -381,6 +402,57 @@ impl UserStore for MemoryUsers {
 
 #[async_trait]
 impl PasswordStore for MemoryUsers {
+    async fn source_known(&self, source_key: &str, since: DateTime<Utc>) -> StoreResult<bool> {
+        let state = self.state.lock().await;
+        Ok(state
+            .pw
+            .sources
+            .iter()
+            .any(|((_, k), s)| k == source_key && s.last_success_at.is_some_and(|at| at > since)))
+    }
+
+    async fn password_overview(
+        &self,
+        since: DateTime<Utc>,
+    ) -> StoreResult<crate::password::store::PasswordOverview> {
+        let state = self.state.lock().await;
+        let resets = state
+            .changes
+            .iter()
+            .filter(|c| {
+                c.change == ChangeKind::IssuePasswordCode
+                    && c.detail.as_deref() == Some("reset")
+                    && c.at >= since
+            })
+            .map(|c| (c.target.clone(), c.actor.clone(), c.at))
+            .collect();
+        let dismissals: Vec<(String, DateTime<Utc>)> = state
+            .changes
+            .iter()
+            .filter(|c| c.change == ChangeKind::DismissResetNotice && c.at >= since)
+            .map(|c| (c.target.clone(), c.at))
+            .collect();
+        let mut voided: Vec<crate::password::store::VoidedCode> = state
+            .pw
+            .codes
+            .iter()
+            .filter_map(|c| {
+                c.voided_at
+                    .filter(|at| *at >= since)
+                    .map(|at| crate::password::store::VoidedCode {
+                        handle: c.handle.clone(),
+                        at,
+                        wrong_guesses: c.code.wrong_guesses,
+                    })
+            })
+            .collect();
+        voided.sort_by_key(|v| std::cmp::Reverse(v.at));
+        Ok(crate::password::store::PasswordOverview {
+            resets: crate::password::store::pair_resets(resets, &dismissals),
+            voided,
+        })
+    }
+
     async fn handle_by_sign_in_name(&self, name: &str) -> StoreResult<Option<String>> {
         let state = self.state.lock().await;
         Ok(state
@@ -488,10 +560,30 @@ impl PasswordStore for MemoryUsers {
                     issued_by: new.issued_by,
                     issued_via: new.issued_via,
                     expires_at: new.expires_at,
+                    begins: 0,
+                    password_sets: 0,
+                    wrong_guesses: 0,
                 },
                 used_at: None,
                 revoked_at: None,
+                voided_at: None,
             });
+        }
+        if let Some(counts) = w.code_counts {
+            for c in pw.codes.iter_mut().filter(|c| {
+                c.code.id == counts.id
+                    && c.handle == handle
+                    && c.used_at.is_none()
+                    && c.revoked_at.is_none()
+            }) {
+                c.code.begins = counts.begins;
+                c.code.password_sets = counts.password_sets;
+                c.code.wrong_guesses = counts.wrong_guesses;
+                if counts.void {
+                    c.revoked_at = Some(now);
+                    c.voided_at = Some(now);
+                }
+            }
         }
         if let Some(id) = w.use_code {
             for c in pw
@@ -568,7 +660,11 @@ impl PasswordStore for MemoryUsers {
         let pw = &mut state.pw;
         let before = pw.pending.len() + pw.codes.len() + pw.sources.len();
         pw.pending.retain(|_, (_, p)| p.expires_at > now);
-        pw.codes.retain(|c| c.code.expires_at > now);
+        // A void code stays for the overview's window.
+        let kept = chrono::Duration::days(crate::password::store::VOIDED_KEPT_DAYS);
+        pw.codes
+            .retain(|c| c.code.expires_at > now || c.voided_at.is_some_and(|at| at > now - kept));
+        pw.used_tokens.retain(|_, until| *until > now);
         pw.sources.retain(|_, s| !s.is_idle(now));
         Ok((before - pw.pending.len() - pw.codes.len() - pw.sources.len()) as u64)
     }

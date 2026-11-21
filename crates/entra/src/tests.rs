@@ -205,6 +205,48 @@ async fn every_bad_token_is_refused() {
             sign(&base, keys::KEY_A_DER, "key-z"),
             Failure::Failed("unknown signing key"),
         ),
+        // The re-check of eb24d28's missing tests. A v1-format token (issuer
+        // `https://sts.windows.net/<tid>/`, `ver` 1.0) for this very tenant and app: refused,
+        // only the v2.0 issuer is accepted.
+        (
+            "a v1 token (sts.windows.net issuer)",
+            good(&{
+                let mut c = with("iss", json!(format!("https://sts.windows.net/{TENANT}/")));
+                c["ver"] = json!("1.0");
+                c
+            }),
+            Failure::Failed("token issuer"),
+        ),
+        // `idp` naming another tenant, in either issuer form: someone from that tenant, here
+        // as a guest-like account even with `acct` 0.
+        (
+            "idp names another tenant (v1 form)",
+            good(&with(
+                "idp",
+                json!(format!("https://sts.windows.net/{OTHER_TENANT}/")),
+            )),
+            Failure::NotMember("another identity provider"),
+        ),
+        (
+            "idp names another tenant (v2 form)",
+            good(&with(
+                "idp",
+                json!(format!("{}/{OTHER_TENANT}/v2.0", idp.base)),
+            )),
+            Failure::NotMember("another identity provider"),
+        ),
+        // A token Entra issued to another application in the same tenant, for a real member
+        // with an otherwise valid identity (signature, issuer, tenant, oid, acct, nonce all
+        // right): its `aud` is that app's client id, so it is refused.
+        (
+            "another app in the same tenant",
+            good(&{
+                let mut c = with("aud", json!("9d2b6f1e-aaaa-4bbb-8ccc-ddddeeeeffff"));
+                c["azp"] = json!("9d2b6f1e-aaaa-4bbb-8ccc-ddddeeeeffff");
+                c
+            }),
+            Failure::Failed("token audience"),
+        ),
     ];
     for (name, token, want) in cases {
         assert_eq!(v.validate(&token, NONCE, now).await, Err(want), "{name}");
@@ -265,6 +307,68 @@ async fn an_unknown_kid_refetches_at_most_once_per_interval() {
     assert_eq!(idp.jwks_hits(), 2);
 }
 
+/// LC: a refresh of the keys is one fetch however many requests want it at once, runs
+/// outside the cache's lock (a token under a known key is checked at once meanwhile), and ends
+/// within the fetch timeout when the tenant is slow, inside pmos-web's 5 seconds.
+#[tokio::test]
+async fn key_refreshes_are_coalesced_bounded_and_never_block_known_keys() {
+    let idp = FakeIdp::start(TENANT).await;
+    let mut cfg = tenant(&idp);
+    cfg.jwks_refetch_after = StdDuration::from_millis(200);
+    let v = std::sync::Arc::new(Verifier::new(cfg).unwrap());
+    let now = Utc::now();
+    let c = claims(&idp, now.timestamp());
+    let known = sign(&c, keys::KEY_A_DER, "key-a");
+    assert!(v.validate(&known, NONCE, now).await.is_ok());
+    assert_eq!(idp.jwks_hits(), 1);
+    // The tenant rotates to key B, slowly: twenty requests for it at once make one fetch.
+    idp.set_keys(vec![
+        jwk("key-a", keys::KEY_A_N),
+        jwk("key-b", keys::KEY_B_N),
+    ]);
+    idp.set_jwks_delay(StdDuration::from_millis(500));
+    tokio::time::sleep(StdDuration::from_millis(250)).await;
+    let rotated = sign(&c, keys::KEY_B_DER, "key-b");
+    let mut waiting = Vec::new();
+    for _ in 0..20 {
+        let (v, t) = (v.clone(), rotated.clone());
+        waiting.push(tokio::spawn(
+            async move { v.validate(&t, NONCE, now).await },
+        ));
+    }
+    // Meanwhile a token under the known key isn't held up by the fetch.
+    tokio::time::sleep(StdDuration::from_millis(50)).await;
+    let started = Instant::now();
+    assert!(v.validate(&known, NONCE, now).await.is_ok());
+    assert!(
+        started.elapsed() < StdDuration::from_millis(250),
+        "a known key waited for the fetch: {:?}",
+        started.elapsed()
+    );
+    for w in waiting {
+        assert!(w.await.unwrap().is_ok());
+    }
+    assert_eq!(idp.jwks_hits(), 2, "one fetch for twenty requests");
+    // A tenant slower than the budget: the fetch gives up within FETCH_TIMEOUT, fails closed.
+    idp.set_jwks_delay(StdDuration::from_secs(8));
+    tokio::time::sleep(StdDuration::from_millis(250)).await;
+    let started = Instant::now();
+    let unknown = sign(&c, keys::KEY_B_DER, "key-c");
+    assert_eq!(
+        v.validate(&unknown, NONCE, now).await,
+        Err(Failure::Unavailable("keys unavailable"))
+    );
+    let took = started.elapsed();
+    assert!(
+        took < FETCH_TIMEOUT + StdDuration::from_millis(500) && took < StdDuration::from_secs(5),
+        "{took:?}"
+    );
+    assert!(
+        v.validate(&known, NONCE, now).await.is_ok(),
+        "known keys still work"
+    );
+}
+
 /// The tenant's endpoints down: nothing validates (fail closed), and a stream of tokens
 /// doesn't become a stream of fetches.
 #[tokio::test]
@@ -289,8 +393,7 @@ async fn jwks_down_fails_closed() {
 }
 
 #[test]
-fn a_token_is_used_once_within_its_lifetime() {
-    let used = UsedTokens::default();
+fn a_token_has_one_replay_key_that_names_no_one() {
     let now = Utc::now();
     let id = Identity {
         oid: OID.into(),
@@ -299,16 +402,27 @@ fn a_token_is_used_once_within_its_lifetime() {
         issued_at: now.timestamp(),
         expires_at: now.timestamp() + 3600,
     };
-    assert!(used.first_use(&id, now));
-    assert!(!used.first_use(&id, now));
-    // Another token for the same person (a later sign-in) is its own.
+    let key = id.replay_key();
+    assert_eq!(key.len(), 64);
+    assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(
+        !key.contains(&OID.replace('-', "")),
+        "the key never holds the oid"
+    );
+    assert_eq!(key, id.clone().replay_key(), "the same token, the same key");
+    // Another token for the same person (a later sign-in) is its own; so is another person's.
     let later = Identity {
         issued_at: id.issued_at + 1,
         ..id.clone()
     };
-    assert!(used.first_use(&later, now));
-    // Forgotten once expired (it would fail the expiry check anyway).
-    let after = now + chrono::Duration::seconds(3600 + SKEW_SECONDS + 1);
-    assert!(used.first_use(&id, after));
-    assert_eq!(used.len(), 1);
+    assert_ne!(later.replay_key(), key);
+    let other = Identity {
+        oid: "00000000-0000-0000-0000-00000000b0b0".into(),
+        ..id.clone()
+    };
+    assert_ne!(other.replay_key(), key);
+    assert_eq!(
+        id.replay_until().timestamp(),
+        now.timestamp() + 3600 + SKEW_SECONDS
+    );
 }

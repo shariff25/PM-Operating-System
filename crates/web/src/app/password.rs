@@ -97,7 +97,7 @@ pub(super) fn routes() -> Router<AppState> {
 
 /// The tool server's codes on these routes, the status `pmos-web` answers with, and its own
 /// sentence. Any other code is `502 upstream_unavailable`.
-pub const PASSWORD_CODES: [(&str, u16, &str); 23] = [
+pub const PASSWORD_CODES: [(&str, u16, &str); 24] = [
     ("bad_request", 400, "That request wasn't in a shape PM OS takes."),
     ("sign_in_failed", 401, "That sign-in name and password didn't work. Check them and try again, or wait a few minutes."),
     ("code_failed", 401, "That code didn't work. Try the newest code from your authenticator app."),
@@ -111,6 +111,7 @@ pub const PASSWORD_CODES: [(&str, u16, &str); 23] = [
     ("self_change", 403, "Nobody makes a setup code for themselves. Ask another admin. Nothing changed."),
     ("not_found", 404, "There's no such person in PM OS. Nothing changed."),
     ("wrong_step", 409, "Do the set-up steps in order: password, then authenticator, then the code."),
+    ("setup_code_spent", 409, "That setup code was used for as many tries as it allows. Ask an admin for a new one."),
     ("no_password", 409, "You don't have a PM OS password yet. Nothing changed."),
     ("sign_in_unconfirmed", 409, "An admin needs to confirm this person's sign-in name first. Nothing changed."),
     ("evals_account", 409, "The evals account never has a password. Nothing changed."),
@@ -213,10 +214,11 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// One `X-Forwarded-For` entry: an address, `ip:port`, `[ipv6]` or `[ipv6]:port`. `None` for
-/// anything else (`unknown`, an obfuscated name, garbage).
-fn forwarded_entry(entry: &str) -> Option<IpAddr> {
-    let e = entry.trim();
+/// One `X-Forwarded-For` entry, as raw bytes: an address, `ip:port`, `[ipv6]` or
+/// `[ipv6]:port`. `None` for anything else (`unknown`, an obfuscated name, garbage, bytes that
+/// aren't text).
+fn forwarded_entry(entry: &[u8]) -> Option<IpAddr> {
+    let e = std::str::from_utf8(entry).ok()?.trim();
     if let Some(rest) = e.strip_prefix('[') {
         let (inside, after) = rest.split_once(']')?;
         let port_ok = after.is_empty()
@@ -233,39 +235,58 @@ fn forwarded_entry(entry: &str) -> Option<IpAddr> {
     e.parse::<SocketAddr>().ok().map(|s| s.ip())
 }
 
-/// Where a request came from (L1): the peer; or, when the peer is a trusted proxy,
-/// `X-Forwarded-For` read strictly from the right, every header in order: each entry that is a
-/// trusted proxy is passed, and the first that isn't is the client. An entry that can't be
-/// read ends the walk (it is never skipped): the address is then the last trusted hop's, a
-/// count the client can't choose. With every entry a proxy, or none, it is the left-most
-/// proxy. `None` when the server has no peer address (tests that serve without it): every such
-/// request shares one count.
+/// Why a password request's address can't be known (the re-check of eb24d28, M1): pmos-web
+/// refuses it (`403 proxy_not_trusted`) rather than count the browser as some proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unsourced {
+    /// A forwarded header from a peer that isn't a trusted proxy while some are named: the
+    /// setting is wrong or stale (the proxy's address moved), and every browser would share
+    /// one count.
+    UntrustedForwarder,
+    /// A trusted proxy that named no client (no `X-Forwarded-For`, only proxies in it, or an
+    /// unreadable entry right after the trusted hops): the address would be a proxy's.
+    NoClient,
+}
+
+/// Where a request came from (L1, LI, M1): the peer; or, when the peer is a trusted proxy,
+/// `X-Forwarded-For` read strictly from the right, every header in order, **entry by entry on
+/// the raw bytes** (an entry that isn't text spoils only itself, not its header: nginx's
+/// appending `$proxy_add_x_forwarded_for` puts the client's own claim on the left of the
+/// address nginx saw). Each entry that is a trusted proxy is passed; the first that isn't, and
+/// can be read, is the client. An entry that can't be read ends the walk (it is never
+/// skipped), and so does running out of entries: what was read is then only trusted hops, so
+/// the answer is [`Unsourced::NoClient`], never a proxy's own address. A peer that isn't a
+/// trusted proxy is the client, unless it sends a forwarded header while proxies are named
+/// ([`Unsourced::UntrustedForwarder`]). `Ok(None)` when the server has no peer address (tests
+/// that serve without it): every such request shares one count, which the tool server never
+/// takes for anyone's own address.
 pub fn source(
     parts_peer: Option<SocketAddr>,
     headers: &HeaderMap,
     trusted: &[IpAddr],
-) -> Option<IpAddr> {
-    let peer = canonical(parts_peer?.ip());
+) -> Result<Option<IpAddr>, Unsourced> {
+    let Some(peer) = parts_peer.map(|p| canonical(p.ip())) else {
+        return Ok(None);
+    };
     let is_trusted = |ip: IpAddr| trusted.iter().any(|t| canonical(*t) == ip);
     if !is_trusted(peer) {
-        return Some(peer);
+        if !trusted.is_empty() && forwarded(headers) {
+            return Err(Unsourced::UntrustedForwarder);
+        }
+        return Ok(Some(peer));
     }
     let mut entries: Vec<Option<IpAddr>> = Vec::new();
     for v in headers.get_all("x-forwarded-for") {
-        match v.to_str() {
-            Ok(text) => entries.extend(text.split(',').map(forwarded_entry)),
-            Err(_) => entries.push(None),
-        }
+        entries.extend(v.as_bytes().split(|b| *b == b',').map(forwarded_entry));
     }
-    let mut current = peer;
     for entry in entries.into_iter().rev() {
         match entry.map(canonical) {
-            None => return Some(current),
-            Some(ip) if is_trusted(ip) => current = ip,
-            Some(ip) => return Some(ip),
+            Some(ip) if is_trusted(ip) => continue,
+            Some(ip) => return Ok(Some(ip)),
+            None => break,
         }
     }
-    Some(current)
+    Err(Unsourced::NoClient)
 }
 
 /// Does the request carry a header a proxy adds? (With no trusted proxy, a password request
@@ -426,6 +447,49 @@ impl Try {
             self.not_counted(state);
         }
     }
+
+    /// For a step that does work whatever comes of it (a setup's password: a hash; its
+    /// authenticator: a new secret): counted **even when it succeeds** (the re-check of
+    /// eb24d28, H1); only PM OS's own failure (`5xx`) gives the slot back.
+    fn answered_with_work(&mut self, state: &AppState, status: u16) {
+        if status >= 500 {
+            self.not_counted(state);
+        }
+    }
+}
+
+impl super::Inner {
+    /// A request refused because its address can't be known with the proxy setting as it is
+    /// (M1): counted for `/readyz`, logged at error level at most once a minute.
+    fn note_untrusted_proxy(&self, why: Unsourced, now: DateTime<Utc>) {
+        use std::sync::atomic::Ordering;
+        let total = self
+            .untrusted_proxy_refusals
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let at = now.timestamp();
+        let last = self.untrusted_proxy_logged.load(Ordering::Relaxed);
+        if at - last >= 60
+            && self
+                .untrusted_proxy_logged
+                .compare_exchange(last, at, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let what = match why {
+                Unsourced::UntrustedForwarder => {
+                    "a forwarded header from a peer not in PMOS_WEB_TRUSTED_PROXIES"
+                }
+                Unsourced::NoClient => "a trusted proxy that named no client in X-Forwarded-For",
+            };
+            tracing::error!(
+                refused_since_start = total,
+                "password sign-in refused: {what}. PMOS_WEB_TRUSTED_PROXIES is wrong or stale \
+                 (in the deploy kit it must be the pmos network's gateway, PMOS_NETWORK_GATEWAY; \
+                 deploy/pmos-admin up --web checks it), or the proxy doesn't set X-Forwarded-For \
+                 (docs/password-sign-in.md)"
+            );
+        }
+    }
 }
 
 /// An unauthenticated password route's checks: on; same origin; JSON; no forwarded header
@@ -453,20 +517,7 @@ fn pre(
     if !is_json(headers) {
         return Err(Box::new(bad_content_type().into_response()));
     }
-    if state.0.trusted_proxies.is_empty() && forwarded(headers) {
-        tracing::warn!(
-            "password sign-in refused: a forwarded header with no trusted proxy (set PMOS_WEB_TRUSTED_PROXIES)"
-        );
-        return Err(Box::new(
-            ApiError::new(
-                StatusCode::FORBIDDEN,
-                "proxy_not_trusted",
-                "PM OS can't sign you in through this address. Tell an admin: the web app's proxy isn't set up.",
-            )
-            .into_response(),
-        ));
-    }
-    let from = source_key(source(peer, headers, &state.0.trusted_proxies));
+    let from = address(state, headers, peer)?;
     match state.0.sources.begin(&from, now(state)) {
         Ok(attempt) => Ok(Try {
             from,
@@ -474,6 +525,62 @@ fn pre(
         }),
         Err(wait) => {
             tracing::warn!("password sign-in: an address over its limit");
+            Err(Box::new(too_many(wait)))
+        }
+    }
+}
+
+fn proxy_not_trusted() -> Box<Response> {
+    Box::new(
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "proxy_not_trusted",
+            "PM OS can't sign you in through this address. Tell an admin: the web app's proxy isn't set up.",
+        )
+        .into_response(),
+    )
+}
+
+/// The address a password request is counted under, or its refusal (`403 proxy_not_trusted`):
+/// a forwarded header with no trusted proxy (`PMOS_WEB_DIRECT=1`), or, with
+/// `PMOS_WEB_TRUSTED_PROXIES` set, one from a peer not on it or a trusted proxy that names no
+/// client (M1). The two with a list set are a wrong or stale setting: counted on `/readyz`
+/// (`untrusted_proxy_refusals`) and logged at error level, at most once a minute with the
+/// count, so an operator sees it. The tool server gets only an address resolved here, in the
+/// body of a call made with pmos-web's own token; it never sees a proxy's address as anyone's.
+fn address(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<SourceKey, Box<Response>> {
+    if state.0.trusted_proxies.is_empty() && forwarded(headers) {
+        tracing::warn!(
+            "password sign-in refused: a forwarded header with no trusted proxy (set PMOS_WEB_TRUSTED_PROXIES)"
+        );
+        return Err(proxy_not_trusted());
+    }
+    match source(peer, headers, &state.0.trusted_proxies) {
+        Ok(ip) => Ok(source_key(ip)),
+        Err(why) => {
+            state.0.note_untrusted_proxy(why, now(state));
+            Err(proxy_not_trusted())
+        }
+    }
+}
+
+/// A signed-in password route that hashes or makes new secrets (`change`, `recovery-codes`):
+/// counted against the caller's address like every unauthenticated attempt, whatever its
+/// outcome (the re-check of eb24d28, LA), so one session can't spend the address's share.
+fn count_signed(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<(), Box<Response>> {
+    let from = address(state, headers, peer)?;
+    match state.0.sources.begin(&from, now(state)) {
+        Ok(_kept) => Ok(()),
+        Err(wait) => {
+            tracing::warn!("password route: an address over its limit");
             Err(Box::new(too_many(wait)))
         }
     }
@@ -755,7 +862,7 @@ fn setup_refused(a: &Answer) -> Response {
         .unwrap_or_default();
     let used_up = matches!(
         code,
-        "setup_expired" | "not_a_member" | "host_only" | "sign_in_unconfirmed"
+        "setup_expired" | "setup_code_spent" | "not_a_member" | "host_only" | "sign_in_unconfirmed"
     ) || (code == "code_failed"
         && a.body.get("attempts_left").and_then(Value::as_i64) == Some(0));
     if used_up {
@@ -798,7 +905,9 @@ async fn setup_password(
     .await
     {
         Ok(a) => {
-            t.answered(&state, a.status);
+            // Every call hashes at the tool server: counted against the address even when it
+            // succeeds (H1).
+            t.answered_with_work(&state, a.status);
             if a.status == 200 {
                 StatusCode::NO_CONTENT.into_response()
             } else {
@@ -841,7 +950,8 @@ async fn setup_authenticator(
     )
     .await;
     match &answer {
-        Ok(a) => t.answered(&state, a.status),
+        // Every call makes a new secret: counted even when it succeeds (H1).
+        Ok(a) => t.answered_with_work(&state, a.status),
         Err(_) => t.not_counted(&state),
     }
     match answer {
@@ -979,12 +1089,16 @@ struct ChangeBody {
 /// session cookie; every other session of the person ends.
 async fn change(
     State(state): State<AppState>,
+    Peer(peer): Peer,
     signed: Signed,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult {
     if !state.0.password_login {
         return Err(off());
+    }
+    if let Err(r) = count_signed(&state, &headers, peer) {
+        return Ok(*r);
     }
     let b: ChangeBody = parse(&body)?;
     let req = json!({
@@ -1037,9 +1151,18 @@ async fn change(
 }
 
 /// `POST /api/auth/password/recovery-codes {code}`: ten new recovery codes, once.
-async fn recovery_codes(State(state): State<AppState>, signed: Signed, body: Bytes) -> ApiResult {
+async fn recovery_codes(
+    State(state): State<AppState>,
+    Peer(peer): Peer,
+    signed: Signed,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
     if !state.0.password_login {
         return Err(off());
+    }
+    if let Err(r) = count_signed(&state, &headers, peer) {
+        return Ok(*r);
     }
     let b: CodeBody = parse(&body)?;
     let a = match signed_call(
@@ -1261,13 +1384,50 @@ mod tests {
         let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
         let proxy: IpAddr = "10.0.0.1".parse().unwrap();
         let h = xff(&["198.51.100.9, 203.0.113.7, 10.0.0.1"]);
-        // Untrusted peer: its own address, whatever it forwards.
-        assert_eq!(source(Some(peer), &h, &[]), Some(proxy));
+        // No proxies named (direct): the peer's own address (pmos-web refuses the forwarded
+        // header itself before asking).
+        assert_eq!(source(Some(peer), &h, &[]), Ok(Some(proxy)));
         // Trusted: the right-most address that isn't a proxy (the client's own claim to the
         // left of it is not believed).
-        assert_eq!(source(Some(peer), &h, &[proxy]), "203.0.113.7".parse().ok());
-        assert_eq!(source(Some(peer), &HeaderMap::new(), &[proxy]), Some(proxy));
-        assert_eq!(source(None, &h, &[proxy]), None);
+        assert_eq!(
+            source(Some(peer), &h, &[proxy]),
+            Ok("203.0.113.7".parse().ok())
+        );
+        assert_eq!(source(None, &h, &[proxy]), Ok(None));
+    }
+
+    /// M1: with proxies named, a wrong or stale setting is loud, never one shared count. A
+    /// forwarded header from a peer not on the list is refused (the proxy's address moved), and
+    /// a trusted proxy that names no client is refused (the address would be the proxy's).
+    #[test]
+    fn a_wrong_or_stale_proxy_setting_is_refused_not_shared() {
+        let proxy: IpAddr = "10.201.77.1".parse().unwrap();
+        let moved: SocketAddr = "172.18.0.1:5000".parse().unwrap();
+        let at_proxy: SocketAddr = "10.201.77.1:5000".parse().unwrap();
+        assert_eq!(
+            source(Some(moved), &xff(&["203.0.113.7"]), &[proxy]),
+            Err(Unsourced::UntrustedForwarder)
+        );
+        let mut real_ip = HeaderMap::new();
+        real_ip.insert("x-real-ip", HeaderValue::from_static("203.0.113.7"));
+        assert_eq!(
+            source(Some(moved), &real_ip, &[proxy]),
+            Err(Unsourced::UntrustedForwarder)
+        );
+        // A peer that isn't the proxy and forwards nothing is counted by its own address.
+        assert_eq!(
+            source(Some(moved), &HeaderMap::new(), &[proxy]),
+            Ok("172.18.0.1".parse().ok())
+        );
+        // The proxy itself, naming nobody: no header, or only proxies in it.
+        assert_eq!(
+            source(Some(at_proxy), &HeaderMap::new(), &[proxy]),
+            Err(Unsourced::NoClient)
+        );
+        assert_eq!(
+            source(Some(at_proxy), &xff(&["10.201.77.1"]), &[proxy]),
+            Err(Unsourced::NoClient)
+        );
     }
 
     /// L1: strictly from the right; `ip:port` and bracketed IPv6 read; an entry that can't be
@@ -1277,7 +1437,7 @@ mod tests {
         let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
         let proxy: IpAddr = "10.0.0.1".parse().unwrap();
         let inner: IpAddr = "10.0.0.2".parse().unwrap();
-        let ip = |s: &str| s.parse::<IpAddr>().ok();
+        let ip = |s: &str| Ok(s.parse::<IpAddr>().ok());
         // A proxy that writes the port.
         assert_eq!(
             source(Some(peer), &xff(&["203.0.113.7:51234"]), &[proxy]),
@@ -1291,11 +1451,12 @@ mod tests {
             source(Some(peer), &xff(&["[2001:db8::7]"]), &[proxy]),
             ip("2001:db8::7")
         );
-        // A client-written value to the left of something unreadable is never reached: the
-        // address is the last trusted hop's.
+        // A client-written value to the left of something unreadable is never reached; what
+        // was read is only trusted hops, so the request names no client and is refused (M1),
+        // never counted as the proxy.
         assert_eq!(
             source(Some(peer), &xff(&["198.51.100.66, garbage"]), &[proxy]),
-            Some(proxy)
+            Err(Unsourced::NoClient)
         );
         assert_eq!(
             source(
@@ -1303,7 +1464,7 @@ mod tests {
                 &xff(&["198.51.100.66, unknown, 10.0.0.2"]),
                 &[proxy, inner]
             ),
-            Some(inner)
+            Err(Unsourced::NoClient)
         );
         assert_eq!(
             source(
@@ -1311,7 +1472,7 @@ mod tests {
                 &xff(&["198.51.100.66, [2001:db8::7]:x"]),
                 &[proxy]
             ),
-            Some(proxy)
+            Err(Unsourced::NoClient)
         );
         // Two proxies: both passed, the client is the next one left; the left-most claim isn't.
         assert_eq!(
@@ -1327,10 +1488,10 @@ mod tests {
             source(Some(peer), &xff(&["192.0.2.1", "203.0.113.9"]), &[proxy]),
             ip("203.0.113.9")
         );
-        // Every entry a proxy: the left-most proxy.
+        // Every entry a proxy: no client named.
         assert_eq!(
             source(Some(peer), &xff(&["10.0.0.2"]), &[proxy, inner]),
-            Some(inner)
+            Err(Unsourced::NoClient)
         );
         // An IPv4-mapped peer matches its IPv4 proxy entry.
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:5000".parse().unwrap();
@@ -1338,6 +1499,48 @@ mod tests {
             source(Some(mapped), &xff(&["203.0.113.7"]), &[proxy]),
             ip("203.0.113.7")
         );
+    }
+
+    /// LI: nginx's `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for` appends the
+    /// address it saw to whatever the client sent. A client that sends a value that isn't text
+    /// (or isn't an address) spoils only its own entry: the address nginx appended, on the
+    /// right, is still the client's, and the client is never counted as the proxy.
+    #[test]
+    fn a_malformed_client_entry_with_an_appending_proxy_is_its_own_entry() {
+        let peer: SocketAddr = "10.201.77.1:5000".parse().unwrap();
+        let proxy: IpAddr = "10.201.77.1".parse().unwrap();
+        let client = Ok("203.0.113.7".parse().ok());
+        let nginx = |client_sent: &[u8]| {
+            let mut v = client_sent.to_vec();
+            v.extend_from_slice(b", 203.0.113.7");
+            let mut h = HeaderMap::new();
+            h.insert(
+                "x-forwarded-for",
+                HeaderValue::from_bytes(&v).expect("a header value"),
+            );
+            h
+        };
+        for sent in [
+            b"\xff\xfe".as_slice(),
+            b"caf\xc3\xa9, \x80",
+            b"unknown",
+            b"198.51.100.66",
+            b"[::1",
+            b"1.2.3.4:99999",
+            b"",
+        ] {
+            assert!(
+                HeaderValue::from_bytes(sent).is_ok(),
+                "{sent:?} is a header value a client can send"
+            );
+            assert_eq!(
+                source(Some(peer), &nginx(sent), &[proxy]),
+                client,
+                "{sent:?}"
+            );
+        }
+        // Without a client value nginx sends just the address.
+        assert_eq!(source(Some(peer), &xff(&["203.0.113.7"]), &[proxy]), client);
     }
 
     #[test]

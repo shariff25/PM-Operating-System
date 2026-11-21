@@ -123,27 +123,61 @@ grep -q '^PMOS_ASSERTION_MODE=require$' "$WORK/stack/deploy/.env" || fail "add-b
 # Password sign-in alone is a sign-in for the web app (docs/password-sign-in.md); with neither
 # it, Entra nor the development opt-in, `up --web` refuses before anything starts.
 stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
-  "PMOS_WEB_TRUSTED_PROXIES=172.18.0.1" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
+  "PMOS_WEB_TRUSTED_PROXIES=10.201.77.1" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
 run_stack up --web >/dev/null
 grep -q 'args=compose .*--profile web up -d' "$DOCKER_LOG" || fail "up --web with password sign-in didn't start the web profile: $(cat "$DOCKER_LOG")"
+# The same with the network already made at its pinned gateway.
+: >"$DOCKER_LOG"
+FAKE_GATEWAY=10.201.77.1 run_stack up --web >/dev/null ||
+  fail "up --web at the pinned gateway was refused"
+grep -q ' up -d' "$DOCKER_LOG" || fail "up --web at the pinned gateway didn't start"
 # Password sign-in with no trusted proxy (P2): `up --web` refuses before anything starts and
-# says exactly what to set: the pmos network's gateway when the network exists, and how to
-# find it otherwise. Without an https:// public URL it refuses too.
+# says exactly what to set: the pmos network's (pinned) gateway, and how to check it. Without
+# an https:// public URL it refuses too.
 stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
   "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
 code=0
-out=$(FAKE_GATEWAY=172.18.0.1 run_stack up --web 2>&1) || code=$?
+out=$(FAKE_GATEWAY=10.201.77.1 run_stack up --web 2>&1) || code=$?
 [ "$code" = 2 ] || fail "up --web with password sign-in and no trusted proxy exits $code, not 2"
-[[ "$out" == *"PMOS_WEB_TRUSTED_PROXIES=172.18.0.1"* ]] || fail "up --web doesn't say what to set: $out"
+[[ "$out" == *"PMOS_WEB_TRUSTED_PROXIES=10.201.77.1"* ]] || fail "up --web doesn't say what to set: $out"
 [[ "$out" == *"docker network inspect pmos_pmos"* ]] || fail "up --web doesn't say how to find it: $out"
 ! grep -q ' up -d' "$DOCKER_LOG" || fail "up --web with no trusted proxy started something"
 code=0
 out=$(run_stack up --web 2>&1) || code=$?
 [ "$code" = 2 ] || fail "up --web before the network exists exits $code, not 2"
-[[ "$out" == *"deploy/pmos-admin up"* && "$out" == *"docker network inspect pmos_pmos"* ]] ||
-  fail "up --web before the network exists doesn't say how to find the address: $out"
+[[ "$out" == *"PMOS_WEB_TRUSTED_PROXIES=10.201.77.1"* && "$out" == *"docker network inspect pmos_pmos"* ]] ||
+  fail "up --web before the network exists doesn't say the pinned address: $out"
+# M1 (the re-check of eb24d28): a wrong or stale setting is refused with the exact fix.
+# - A trusted address that isn't the gateway (an old, unpinned one): refused, naming the line.
 stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
-  "PMOS_WEB_TRUSTED_PROXIES=172.18.0.1" "PMOS_WEB_PUBLIC_URL=http://pmos.example.com"
+  "PMOS_WEB_TRUSTED_PROXIES=172.18.0.1" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
+code=0
+out=$(run_stack up --web 2>&1) || code=$?
+[ "$code" = 2 ] || fail "up --web with a trusted address that isn't the gateway exits $code, not 2"
+[[ "$out" == *"names 172.18.0.1"* && "$out" == *"PMOS_WEB_TRUSTED_PROXIES=10.201.77.1"* ]] ||
+  fail "up --web doesn't give the fix for a wrong trusted address: $out"
+! grep -q ' up -d' "$DOCKER_LOG" || fail "up --web with a wrong trusted address started something"
+# - A network made before its gateway was pinned: refused, saying to re-create it.
+stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
+  "PMOS_WEB_TRUSTED_PROXIES=10.201.77.1" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
+code=0
+out=$(FAKE_GATEWAY=172.18.0.1 run_stack up --web 2>&1) || code=$?
+[ "$code" = 2 ] || fail "up --web on a stale network exits $code, not 2"
+[[ "$out" == *"gateway is 172.18.0.1"* && "$out" == *"PMOS_NETWORK_GATEWAY=10.201.77.1"* &&
+  "$out" == *"deploy/pmos-admin down && deploy/pmos-admin up --web"* ]] ||
+  fail "up --web on a stale network doesn't say to re-create it: $out"
+! grep -q ' up -d' "$DOCKER_LOG" || fail "up --web on a stale network started something"
+# - A proxy in a container on the pmos network (inside the pinned subnet), and a site that
+#   overrides the subnet and gateway: both start.
+stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
+  "PMOS_WEB_TRUSTED_PROXIES=10.201.77.40" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
+FAKE_GATEWAY=10.201.77.1 run_stack up --web >/dev/null || fail "a proxy inside the pinned subnet was refused"
+stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
+  "PMOS_NETWORK_SUBNET=10.50.0.0/24" "PMOS_NETWORK_GATEWAY=10.50.0.1" \
+  "PMOS_WEB_TRUSTED_PROXIES=10.50.0.1" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
+FAKE_GATEWAY=10.50.0.1 run_stack up --web >/dev/null || fail "an overridden network was refused"
+stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
+  "PMOS_WEB_TRUSTED_PROXIES=10.201.77.1" "PMOS_WEB_PUBLIC_URL=http://pmos.example.com"
 code=0
 out=$(run_stack up --web 2>&1) || code=$?
 [ "$code" = 2 ] || fail "up --web with password sign-in and an http public URL exits $code, not 2"
@@ -277,6 +311,14 @@ if docker compose version >/dev/null 2>&1; then
   done
   [[ "$full" == *'console=test-'* && "$full" == *'web=test-'* ]] ||
     fail "the runtime's tokens lack web= or console="
+  # M1: the pmos network's subnet and gateway are pinned, and can be overridden.
+  [[ "$full" == *'subnet: 10.201.77.0/24'* && "$full" == *'gateway: 10.201.77.1'* ]] ||
+    fail "the pmos network's subnet and gateway aren't pinned"
+  sed -e 's|^PMOS_NETWORK_SUBNET=.*|PMOS_NETWORK_SUBNET=10.50.0.0/24|' \
+    -e 's|^PMOS_NETWORK_GATEWAY=.*|PMOS_NETWORK_GATEWAY=10.50.0.1|' "$WORK/full.env" >"$WORK/net.env"
+  net=$(render "$WORK/net.env") || fail "compose doesn't render with another subnet"
+  [[ "$net" == *'subnet: 10.50.0.0/24'* && "$net" == *'gateway: 10.50.0.1'* ]] ||
+    fail "the pmos network's subnet and gateway can't be overridden"
   # The first Microsoft sign-in (U1): the tool server gets the web app's tenant and client id
   # (it validates the ID token itself), never its client secret.
   entra_env="$WORK/entra.env"

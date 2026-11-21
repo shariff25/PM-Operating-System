@@ -54,9 +54,12 @@ in (below, "How a sign-in is decided", step 2).
 The tool server refuses to start with a client id or an authority but no tenant id; with the
 tenant id alone (the host commands' setting) the first-link route answers `501
 not_configured`. It fetches the tenant's discovery document and JWKS itself (cached a day; an
-unknown `kid` refetches at most once a minute; a failed fetch isn't retried for 5 seconds; 4
-seconds per fetch; anything it can't fetch fails closed), so it needs the same outbound access
-to the authority as `pmos-web`.
+unknown `kid` refetches at most once a minute; a failed fetch isn't retried for 5 seconds; **4
+seconds for the discovery document and the keys together**, inside `pmos-web`'s 5-second
+budget; a fetch runs outside the key cache's lock, so a token under a known key is checked at
+once meanwhile, and concurrent requests for an unknown `kid` share one fetch; anything it
+can't fetch fails closed), so it needs the same outbound access to the authority as
+`pmos-web`.
 
 **Choice: `pmos-web` reports a missing or different tool server setting at `/readyz`; it doesn't
 refuse to start.** At start-up the tool server may not be up yet, and a check then would race
@@ -179,16 +182,22 @@ Then the user database (`docs/user-database-spec.md` §7):
    against the tenant's keys, `iss`, `aud` = its `PMOS_ENTRA_CLIENT_ID`, time, `nonce`, `tid` =
    its `PMOS_ENTRA_TENANT_ID`, `oid`, `acct`, `idp`), takes the `(tid, oid)` and
    `preferred_username` from the validated token only, accepts each token for **one** first
-   link (`(oid, iat)` remembered until the token expires; again is `403 token_used`), and then
-   re-checks everything in one transaction and audits the outcome. So the web token alone can
+   link (a SHA-256 of its `(oid, iat)`, never the `oid`, kept until the token expires, in
+   Postgres (`entra_used_tokens`, migration 0023) so a restart doesn't forget it; again is
+   `403 token_used`), and then re-checks everything in one transaction and audits the outcome:
+   who may never be linked through `pmos-web` (deactivated, the `evals` account, an Admin or
+   Auditor) is refused even when the account is already linked with exactly this key. So the web token alone can
    no longer link someone's account to a Microsoft account of the caller's choosing: the
    takeover the review of `b469d5b` found (U1) needs a token the tenant signed naming the
    victim's sign-in name. Every first link is audited (`users.identity_link`, the person as
    actor) and listed on the admin overview (`users.first_links`: handle, time, provider; never
    the `oid`). Its token refusals: `invalid_token` → `reason=failed` (logged as an error: the
    two servers disagree), `not_a_member` and `token_used` → `reason=not_a_member`, the tenant's
-   keys unreachable → `reason=users_unavailable`. Every refusal counts against `pmos-web`'s
-   miss limit. Its other refusals:
+   keys unreachable (`503 entra_unavailable`) → `reason=users_unavailable`. Every refusal,
+   `503 entra_unavailable` and `501 not_configured` included, counts against `pmos-web`'s miss
+   limit (20 a minute), **checked first**: past it the route answers `429 resolve_misses` without
+   reading the directory or writing an audit row, so a web-token holder can't flood the audit
+   log; below it each refusal is audited (`users.identity_link`, `entra; <code>`). Its other refusals:
    `not_active` → `reason=deactivated`; `sign_in_unconfirmed` (a Slack joiner whose name no
    admin has confirmed) → `reason=sign_in_unconfirmed`; `host_only` (an Admin or Auditor) →
    `reason=entra_needs_host`; `linked` or `taken` (the name's user already has a different
@@ -263,6 +272,20 @@ doesn't attempt.
 untouched, so signing in again usually goes straight through without a prompt; to sign out of
 Microsoft too, the person signs out at Microsoft.
 
+## Re-check of eb24d28
+
+The independent re-check of `eb24d28` (2026-11-21); its password findings are in
+`docs/password-sign-in.md`, "Re-check of eb24d28". Migration `0023_gate_fixes_2.sql`.
+
+| Finding | What changed | The test |
+| --- | --- | --- |
+| M4: a used first-link token could be replayed after a restart (`(oid, iat)` kept in memory per process) | The user store keeps the used tokens: in Postgres, `entra_used_tokens` (a SHA-256 of `(oid, iat)`, never the `oid`, until the token's `exp` plus the skew, a day at most; expired rows go at the next first link); the memory store keeps its own list. The first-link check holds no used tokens of its own. | `a_replayed_token_is_refused_after_a_restart` (a new router, first-link check and key cache over the same store; on both stores) |
+| LB: refusals before the store took a directory snapshot and wrote an audit row even past the `429` | The miss limit is checked first; past it, `429 resolve_misses` with no snapshot and no audit row. | `refusals_before_the_store_are_limited_before_they_are_audited` (25 malformed bodies: 20 audited, 5 not) |
+| LC: the JWKS fetch ran under the key lock for up to about 8 seconds | The fetch runs outside the key cache's lock, one at a time (concurrent requests for an unknown `kid` wait for it and read its result), within 4 seconds for the discovery document and the keys together. A token under a known key isn't held up. | `key_refreshes_are_coalesced_bounded_and_never_block_known_keys` (`crates/entra`: 20 requests, one fetch; a known key answered in under 250 ms during a slow fetch; a tenant slower than the budget fails closed within 4.5 s) |
+| LD: the `503` and `501` first-link answers were neither counted nor audited | Both are refusals like any other: counted against the miss limit and audited (`entra; entra_unavailable`, `entra; not_configured`), past the limit `429` and unaudited. | the LB test (the keys down; no settings) |
+| LE: "already linked" returned before the active and host-only checks | A deactivated user, the `evals` account, and an Admin or Auditor are refused before "already linked" too (`403 not_active`, `evals_account`, `host_only`), so the answer never vouches for them. | `already_linked_still_checks_who_may_link` |
+| Missing tests | A v1-format token (`iss` `https://sts.windows.net/<tid>/`, `ver` 1.0) for this tenant and app: refused (`token issuer`). `idp` naming another tenant, in either issuer form: refused (`another identity provider`). A token Entra issued to another application in the same tenant for a real member, otherwise valid: refused (`token audience`). Replay after a restart: above. | `every_bad_token_is_refused` (`crates/entra/src/tests.rs`) |
+
 ## Not built
 
 - **Roles from Entra.** Group claims and app roles are ignored; roles come only from the user
@@ -299,16 +322,19 @@ manager.
 
 ## Tests
 
-The claim rules have their own tests in `crates/entra/src/tests.rs` (every refusal, key
-rotation, attacker-chosen `kid`s refetching at most once an interval, the tenant's endpoints
-down failing closed, a token used once), with the test keys and a fake tenant
+The claim rules have their own tests in `crates/entra/src/tests.rs` (every refusal, a v1 token,
+`idp` naming another tenant, another app's token in the same tenant, key rotation,
+attacker-chosen `kid`s refetching at most once an interval, refreshes coalesced and bounded
+outside the key lock, the tenant's endpoints down failing closed, a token's replay key), with
+the test keys and a fake tenant
 (`pmos_entra::testing`) both crates' tests use. `crates/toolserver/tests/directory_routes.rs`
 runs the first-link route against that fake tenant: forged, unsigned, another audience, issuer
 or tenant, expired, a guest, another identity provider, no `acct`, another nonce, a replayed
-token, the takeover from the review end to end (the old body; the caller's own valid token
-naming their own name; a forged token naming the victim's), key rotation, the keys down (`503`,
-nothing linked), no settings (`501`), every refusal counted as a miss, and the first link on
-the admin overview; with every earlier first-link condition, on both stores.
+token (also after a restart), the takeover from the review end to end (the old body; the
+caller's own valid token naming their own name; a forged token naming the victim's), key
+rotation, the keys down (`503`, nothing linked), no settings (`501`), every refusal counted as a
+miss and audited only under the limit, "already linked" still refusing who may not link, and
+the first link on the admin overview; with every earlier first-link condition, on both stores.
 
 `crates/web/tests/entra.rs` runs the whole flow against a mock identity provider (discovery,
 JWKS and a token endpoint that checks the client secret and PKCE) with RSA keys generated for

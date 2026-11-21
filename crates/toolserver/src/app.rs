@@ -151,18 +151,17 @@ impl std::fmt::Debug for PersonClients {
     }
 }
 
-/// What the first-link route checks an ID token with: the tenant's keys (fetched and cached)
-/// and the tokens already used for a first link.
+/// What the first-link route checks an ID token with: the tenant's keys (fetched and cached).
+/// The tokens already used for a first link are kept by the user store
+/// (`UserStore::first_token_use`: Postgres in a deployment, so a restart doesn't forget them).
 pub struct EntraLinkCheck {
     pub verifier: pmos_entra::Verifier,
-    pub used: pmos_entra::UsedTokens,
 }
 
 impl EntraLinkCheck {
     pub fn new(tenant: pmos_entra::Tenant) -> Result<Self, String> {
         Ok(Self {
             verifier: pmos_entra::Verifier::new(tenant)?,
-            used: pmos_entra::UsedTokens::default(),
         })
     }
 }

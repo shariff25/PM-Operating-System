@@ -1275,8 +1275,10 @@ both!(guesses_from_one_address_never_hold_the_owner_out, |t| {
         Err(PwError::SignInFailed),
         "the same /64"
     );
-    // Many addresses at once: past the account's ceiling a new address is refused, but Ana's
-    // known address still works.
+    // Many addresses at once (the re-check of eb24d28, M2): past the account's ceiling a new
+    // address is never refused outright. Ana, from an address she has never used, with the
+    // right password and code, gets in; an attacker's new address gets one guess, then waits
+    // 15 minutes (rationed); Ana's known address keeps its own schedule.
     let mut later = at + Duration::minutes(2);
     let mut n = 0;
     while n < limits::ACCOUNT_CEILING {
@@ -1287,13 +1289,46 @@ both!(guesses_from_one_address_never_hold_the_owner_out, |t| {
         n += 1;
         later += Duration::seconds(1);
     }
-    assert_eq!(
-        t.sign_in_from("198.18.0.1", "ana", PASSWORD, later).await,
-        Err(PwError::SignInFailed),
-        "a new address past the ceiling"
+    let ceiling = t.events("password.lockout").await;
+    assert!(
+        ceiling.iter().any(|e| e.3.as_deref() == Some("ceiling")),
+        "reaching the ceiling is recorded: {ceiling:?}"
     );
-    let token = t.sign_in_from(HOME, "ana", PASSWORD, later).await.unwrap();
+    let token = t
+        .sign_in_from("198.18.0.1", "ana", PASSWORD, later)
+        .await
+        .expect("the owner from a new address, past the ceiling");
     let step_later = later + Duration::seconds(30);
+    t.code_from(
+        "198.18.0.1",
+        &token,
+        &code_now(&secret, step_later),
+        step_later,
+    )
+    .await
+    .unwrap();
+    // A fresh attacker address: one guess is checked, then it waits 15 minutes, even with the
+    // right password (it is rationed, not refused for the ceiling).
+    let fresh = "198.18.0.77";
+    assert_eq!(
+        t.sign_in_from(fresh, "ana", OTHER_PASSWORD, step_later)
+            .await,
+        Err(PwError::SignInFailed)
+    );
+    assert_eq!(
+        t.sign_in_from(fresh, "ana", PASSWORD, step_later + Duration::minutes(14))
+            .await,
+        Err(PwError::SignInFailed),
+        "rationed: one attempt per 15 minutes"
+    );
+    t.sign_in_from(fresh, "ana", PASSWORD, step_later + limits::MAX_DELAY)
+        .await
+        .expect("after its wait, the right password is honoured");
+    let token = t
+        .sign_in_from(HOME, "ana", PASSWORD, step_later)
+        .await
+        .unwrap();
+    let step_later = step_later + Duration::seconds(30);
     t.code_from(HOME, &token, &code_now(&secret, step_later), step_later)
         .await
         .unwrap();
@@ -1507,6 +1542,463 @@ async fn futures_join<F: std::future::Future>(fs: Vec<F>) -> Vec<F::Output> {
     .await;
     out
 }
+
+// --- The re-check of eb24d28 ------------------------------------------------------------------
+
+/// The setup's first step for `handle` with `code`, from `from`: the setup token.
+async fn begin_from(
+    t: &T,
+    svc: &PasswordService,
+    handle: &str,
+    code: &str,
+    from: &str,
+    at: DateTime<Utc>,
+) -> Result<String, PwError> {
+    svc.setup_begin(
+        t.store(),
+        &format!("{handle}@example.com"),
+        &Secret::new(code),
+        Some(from),
+        at,
+    )
+    .await
+    .map(|s| s.token.expose().to_string())
+}
+
+// H1: the loop from the finding. One live setup token sets password after password, and the
+// code renews the token when it ends. Each password set hashed and replaced the staged one, so
+// about 7 a second filled the shared allowance and its reserve. Now: 3 per token, then the
+// token is spent; 6 per code across renewals, then the code is spent and an admin must issue
+// a new one; and the hashes come from the open allowance only, so a sign-in from another
+// address still gets one while the loop runs.
+both!(one_setup_code_cannot_spend_the_shared_allowance, |t| {
+    let now = t0();
+    let (ben_secret, _) = t.enrolled("ben", now).await;
+    let code = t.issue(&Actor::web("ada"), "ana", now).await.unwrap();
+    let at = now + Duration::minutes(1);
+    let mut sets = 0;
+    let mut refusals = Vec::new();
+    for _ in 0..5 {
+        let token = match begin_from(t, &t.svc, "ana", &code, AWAY, at).await {
+            Ok(token) => token,
+            Err(e) => {
+                refusals.push(e);
+                continue;
+            }
+        };
+        for _ in 0..50 {
+            match t
+                .svc
+                .setup_password(t.store(), &token, &Secret::new(PASSWORD), at)
+                .await
+            {
+                Ok(()) => sets += 1,
+                Err(e) => {
+                    refusals.push(e);
+                    break;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        sets,
+        limits::SETUP_PASSWORD_SETS_PER_CODE,
+        "3 per token, 6 per code"
+    );
+    assert_eq!(
+        refusals[..3],
+        [
+            PwError::SetupExpired,
+            PwError::SetupExpired,
+            PwError::SetupCodeSpent
+        ],
+        "{refusals:?}"
+    );
+    assert!(refusals[3..].iter().all(|e| *e == PwError::SetupCodeSpent));
+    assert_eq!(PwError::SetupCodeSpent.status(), 409);
+    let spent = t.events("password.setup_begin").await;
+    assert!(spent.iter().any(|e| e.3.as_deref() == Some("spent")));
+    // An admin's new code works at once.
+    let fresh = t.issue(&Actor::web("ada"), "ana", at).await.unwrap();
+    t.setup("ana", &fresh, PASSWORD, at).await;
+
+    // The hashes come from the open allowance only: with it full of setup work, Ben, from his
+    // own address, still signs in (the reserve is for password steps from known addresses).
+    let svc = PasswordService::with_params(t.keys.clone(), QUICK)
+        .unwrap()
+        .with_global_limit(3, 2);
+    let code = t.issue(&Actor::web("ada"), "cy", at).await.unwrap();
+    let token = begin_from(t, &svc, "cy", &code, AWAY, at).await.unwrap();
+    let mut answers = Vec::new();
+    for _ in 0..3 {
+        answers.push(
+            svc.setup_password(t.store(), &token, &Secret::new(PASSWORD), at)
+                .await,
+        );
+    }
+    let token = begin_from(t, &svc, "cy", &code, AWAY, at).await.unwrap();
+    answers.push(
+        svc.setup_password(t.store(), &token, &Secret::new(PASSWORD), at)
+            .await,
+    );
+    assert_eq!(answers[..3], [Ok(()), Ok(()), Ok(())]);
+    assert!(
+        matches!(answers[3], Err(PwError::TooMany { .. })),
+        "setup never takes the reserve: {answers:?}"
+    );
+    let pending = svc
+        .sign_in(
+            t.store(),
+            "ben@example.com",
+            &Secret::new(PASSWORD),
+            Some(HOME),
+            at,
+        )
+        .await
+        .expect("a sign-in from another address while the loop runs");
+    svc.second_step(
+        t.store(),
+        pending.token.expose(),
+        &SecondStep::Code(Secret::new(code_now(&ben_secret, at))),
+        Some(HOME),
+        at,
+    )
+    .await
+    .unwrap();
+});
+
+// H1's shape elsewhere: work after an authentication is bounded per account. Ten correct
+// password steps in 15 minutes; the eleventh is refused before its hash, for that account
+// only. Someone else's wrong guesses never use the owner's room.
+both!(correct_password_steps_are_bounded_per_account, |t| {
+    let now = t0();
+    t.enrolled("ana", now).await;
+    t.enrolled("ben", now).await;
+    // Past the window of the setups' own work.
+    let at = now + Duration::minutes(16);
+    for _ in 0..20 {
+        t.sign_in_from(AWAY, "ana", OTHER_PASSWORD, at).await.ok();
+    }
+    for i in 0..limits::ACCOUNT_WORK {
+        t.sign_in("ana", PASSWORD, at)
+            .await
+            .unwrap_or_else(|e| panic!("sign-in {i}: {e:?}"));
+    }
+    assert!(matches!(
+        t.sign_in("ana", PASSWORD, at).await,
+        Err(PwError::TooMany { .. })
+    ));
+    t.sign_in("ben", PASSWORD, at)
+        .await
+        .expect("another account has its own");
+    t.sign_in("ana", PASSWORD, at + Duration::minutes(15))
+        .await
+        .expect("the window moves on");
+});
+
+// LA: a password change hashes twice, from the open allowance only, counted against the
+// account's work; new recovery codes compute no Argon2 hash but are counted too.
+both!(change_and_recovery_codes_are_bounded, |t| {
+    let now = t0();
+    let (secret, _) = t.enrolled("ana", now).await;
+    let svc = PasswordService::with_params(t.keys.clone(), QUICK)
+        .unwrap()
+        .with_global_limit(2, 50);
+    let mut at = now + Duration::minutes(1);
+    let new = Secret::new(OTHER_PASSWORD);
+    svc.change(
+        t.store(),
+        "ana",
+        &Secret::new(PASSWORD),
+        &Secret::new(code_now(&secret, at)),
+        &new,
+        at,
+    )
+    .await
+    .expect("two hashes from the open allowance");
+    at += Duration::seconds(30);
+    assert!(
+        matches!(
+            svc.change(
+                t.store(),
+                "ana",
+                &Secret::new(OTHER_PASSWORD),
+                &Secret::new(code_now(&secret, at)),
+                &Secret::new(PASSWORD),
+                at
+            )
+            .await,
+            Err(PwError::TooMany { .. })
+        ),
+        "the open allowance is spent and the reserve is never used for a change"
+    );
+    // The account's work: ten regenerations, then the eleventh is refused.
+    let (secret, _) = t.enrolled("cy", now).await;
+    // Past the window of the setup's own work.
+    let mut at = now + Duration::minutes(16);
+    for i in 0..limits::ACCOUNT_WORK {
+        at += Duration::seconds(30);
+        t.svc
+            .regenerate_recovery_codes(t.store(), "cy", &Secret::new(code_now(&secret, at)), at)
+            .await
+            .unwrap_or_else(|e| panic!("regeneration {i}: {e:?}"));
+    }
+    at += Duration::seconds(30);
+    assert!(matches!(
+        t.svc
+            .regenerate_recovery_codes(t.store(), "cy", &Secret::new(code_now(&secret, at)), at)
+            .await,
+        Err(PwError::TooMany { .. })
+    ));
+});
+
+// M2: guesses at a setup code count against the code itself. A new code starts clean; at 20
+// wrong guesses (from any number of addresses) the code is void, the overview lists it, and
+// a fresh code works at once. Before the cap the right code still works.
+both!(setup_code_guesses_void_the_code_not_the_person, |t| {
+    let now = t0();
+    let wrong = "AAAAA-AAAAA-AAAAA-AAAAA";
+    let code = t.issue(&Actor::web("ada"), "ana", now).await.unwrap();
+    // Nineteen wrong guesses from nineteen addresses: the right code still works.
+    for n in 0..limits::SETUP_WRONG_GUESSES_PER_CODE - 1 {
+        let from = format!("192.0.2.{}", n + 1);
+        assert_eq!(
+            begin_from(t, &t.svc, "ana", wrong, &from, now).await,
+            Err(PwError::SetupFailed)
+        );
+    }
+    begin_from(t, &t.svc, "ana", &code, HOME, now)
+        .await
+        .expect("below the cap the code works");
+    // The twentieth wrong guess voids it.
+    assert_eq!(
+        begin_from(t, &t.svc, "ana", wrong, "192.0.2.99", now).await,
+        Err(PwError::SetupFailed)
+    );
+    assert_eq!(
+        begin_from(t, &t.svc, "ana", &code, HOME, now).await,
+        Err(PwError::SetupFailed),
+        "a void code is no code"
+    );
+    let ev = t.events("password.setup_code").await;
+    assert!(
+        ev.iter()
+            .any(|e| e.1 == Outcome::Denied && e.3.as_deref() == Some("voided; failures 20")),
+        "{ev:?}"
+    );
+    let overview = t
+        .store()
+        .password_overview(now - Duration::days(7))
+        .await
+        .unwrap();
+    assert_eq!(overview.voided.len(), 1);
+    assert_eq!(
+        (
+            overview.voided[0].handle.as_str(),
+            overview.voided[0].wrong_guesses
+        ),
+        ("ana", 20)
+    );
+    // A fresh code is not held up by the guesses against the old one, from any address.
+    let at = now + Duration::seconds(5);
+    let fresh = t.issue(&Actor::web("ada"), "ana", at).await.unwrap();
+    begin_from(t, &t.svc, "ana", &fresh, "192.0.2.99", at)
+        .await
+        .expect("a fresh code works at once");
+    t.setup("ana", &fresh, PASSWORD, at).await;
+    // A void code is kept for the overview after it expires, and pruned after a week.
+    t.store()
+        .prune_passwords(now + Duration::days(2))
+        .await
+        .unwrap();
+    let still = t
+        .store()
+        .password_overview(now - Duration::days(7))
+        .await
+        .unwrap();
+    assert_eq!(still.voided.len(), 1);
+});
+
+// M3: with the open allowance full, an unknown name and a real account get the same answer:
+// whether an attempt may use the reserve is decided from the address alone.
+both!(
+    under_load_an_unknown_name_and_a_real_account_answer_alike,
+    |t| {
+        let now = t0();
+        t.enrolled("ana", now).await;
+        let at = now + Duration::minutes(1);
+        let svc = PasswordService::with_params(t.keys.clone(), QUICK)
+            .unwrap()
+            .with_global_limit(2, 4);
+        let attempt = |name: &'static str, from: &'static str| {
+            let svc = &svc;
+            async move {
+                svc.sign_in(
+                    t.store(),
+                    name,
+                    &Secret::new(OTHER_PASSWORD),
+                    Some(from),
+                    at,
+                )
+                .await
+                .map(drop)
+            }
+        };
+        for _ in 0..2 {
+            attempt("nobody@example.com", AWAY).await.ok();
+        }
+        // A new address: both refused alike before any hash.
+        let unknown = attempt("nobody@example.com", AWAY).await;
+        let real = attempt("ana@example.com", AWAY).await;
+        assert!(
+            matches!(unknown, Err(PwError::TooMany { .. }))
+                && matches!(real, Err(PwError::TooMany { .. })),
+            "{unknown:?} {real:?}"
+        );
+        // A known address (Ana's setup was finished from it): both checked, both the uniform 401.
+        let unknown = attempt("nobody@example.com", HOME).await;
+        let real = attempt("ana@example.com", HOME).await;
+        assert_eq!(
+            (unknown, real),
+            (Err(PwError::SignInFailed), Err(PwError::SignInFailed))
+        );
+    }
+);
+
+// M1: attempts with no address share one key, and that key never becomes anyone's known
+// address (a known address may use the reserve and is spared the ceiling's rationing).
+both!(no_address_never_becomes_a_known_address, |t| {
+    let now = t0();
+    let code = t.issue(&ops(), "ana", now).await.unwrap();
+    let s = t
+        .svc
+        .setup_begin(t.store(), "ana@example.com", &Secret::new(code), None, now)
+        .await
+        .unwrap();
+    let token = s.token.expose().to_string();
+    t.svc
+        .setup_password(t.store(), &token, &Secret::new(PASSWORD), now)
+        .await
+        .unwrap();
+    let e = t
+        .svc
+        .setup_authenticator(t.store(), &token, now)
+        .await
+        .unwrap();
+    let secret = totp::unbase32(e.secret.expose()).unwrap().to_vec();
+    t.svc
+        .setup_confirm(
+            t.store(),
+            &token,
+            &Secret::new(code_now(&secret, now)),
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+    let at = now + Duration::seconds(31);
+    let p = t
+        .svc
+        .sign_in(
+            t.store(),
+            "ana@example.com",
+            &Secret::new(PASSWORD),
+            None,
+            at,
+        )
+        .await
+        .unwrap();
+    t.svc
+        .second_step(
+            t.store(),
+            p.token.expose(),
+            &SecondStep::Code(Secret::new(code_now(&secret, at))),
+            None,
+            at,
+        )
+        .await
+        .unwrap();
+    let since = now - Duration::days(1);
+    assert!(!t
+        .store()
+        .source_known(&limits::source_key(None), since)
+        .await
+        .unwrap());
+    // A real address does.
+    let p = t.sign_in("ana", PASSWORD, at).await.unwrap();
+    let later = at + Duration::seconds(30);
+    t.code(&p, &code_now(&secret, later), later).await.unwrap();
+    assert!(t
+        .store()
+        .source_known(&limits::source_key(Some(HOME)), since)
+        .await
+        .unwrap());
+});
+
+// LF: a reset's dismissal is a role change (who, when), and the overview reads resets by time,
+// not from the last 500 role changes.
+both!(a_dismissal_is_recorded_and_resets_are_read_by_time, |t| {
+    let now = t0();
+    t.enrolled("ana", now).await;
+    let at = now + Duration::minutes(1);
+    t.issue(&Actor::web("ada"), "ana", at).await.unwrap();
+    // Far more than 500 later role changes: the reset is still on the overview.
+    for i in 0..260 {
+        let later = at + Duration::seconds(i + 1);
+        for roles in [
+            [UserRole::Pm, UserRole::Reviewer].into(),
+            [UserRole::Pm].into(),
+        ] {
+            t.stores
+                .users
+                .apply(
+                    &Actor::web("ada"),
+                    Op::SetRoles {
+                        handle: "ben".into(),
+                        roles,
+                    },
+                    later,
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let since = at - Duration::days(7);
+    let o = t.store().password_overview(since).await.unwrap();
+    assert_eq!(o.resets.len(), 1, "{o:?}");
+    assert_eq!(
+        (
+            o.resets[0].handle.as_str(),
+            o.resets[0].by.as_str(),
+            o.resets[0].dismissed_at
+        ),
+        ("ana", "ada", None)
+    );
+    let dismissed = at + Duration::minutes(10);
+    t.svc
+        .dismiss_reset_notice(t.store(), "ana", dismissed)
+        .await
+        .unwrap();
+    let o = t.store().password_overview(since).await.unwrap();
+    assert_eq!(o.resets[0].dismissed_at, Some(dismissed));
+    let changes = t.stores.users.role_changes(Some("ana"), 5).await.unwrap();
+    let d = changes
+        .iter()
+        .find(|c| c.change == ChangeKind::DismissResetNotice)
+        .expect("the dismissal is a role change");
+    assert_eq!((d.actor.as_str(), d.at), ("ana", dismissed));
+    // A later reset shows as not dismissed until its own dismissal.
+    t.issue(&ops(), "ana", dismissed + Duration::minutes(1))
+        .await
+        .unwrap();
+    let o = t.store().password_overview(since).await.unwrap();
+    assert_eq!(o.resets.len(), 2);
+    assert_eq!(
+        (o.resets[0].by.as_str(), o.resets[0].dismissed_at),
+        ("host", None)
+    );
+    assert_eq!(o.resets[1].dismissed_at, Some(dismissed));
+});
 
 // --- Over HTTP --------------------------------------------------------------------------------
 

@@ -684,21 +684,36 @@ async fn overview(
     // U1: every first link a person made through pmos-web (who, when, which identity
     // provider), never the `oid`. `null` when the audit log can't be read back.
     users["first_links"] = json!(links);
-    // PM2: every reset code issued for someone who had a password, in the overview's window:
-    // who, by whom, when (handles only).
-    let resets = match state.svc.stores().users.role_changes(None, 500).await {
-        Ok(changes) => changes
-            .into_iter()
-            .filter(|c| {
-                c.change == crate::users::ChangeKind::IssuePasswordCode
-                    && c.detail.as_deref() == Some("reset")
-                    && c.at >= since
-            })
-            .map(|c| json!({"handle": c.target, "by": c.actor, "at": c.at}))
-            .collect::<Vec<_>>(),
+    // PM2, LF: every reset code issued for someone who had a password, in the overview's
+    // window, read by time (not from a window of recent rows): who, by whom, when, and when
+    // the person's notice was dismissed (handles only). M2: every setup code void after too
+    // many wrong guesses, so the admin issues a new one.
+    let pw = match state
+        .svc
+        .stores()
+        .users
+        .passwords()
+        .password_overview(since)
+        .await
+    {
+        Ok(pw) => pw,
         Err(e) => return unavailable(e),
     };
-    users["password_resets"] = json!(resets);
+    users["password_resets"] = json!(pw
+        .resets
+        .iter()
+        .map(|r| json!({
+            "handle": r.handle,
+            "by": r.by,
+            "at": r.at,
+            "dismissed_at": r.dismissed_at,
+        }))
+        .collect::<Vec<_>>());
+    users["password_codes_voided"] = json!(pw
+        .voided
+        .iter()
+        .map(|v| json!({"handle": v.handle, "at": v.at, "wrong_guesses": v.wrong_guesses}))
+        .collect::<Vec<_>>());
     let counts = match state.svc.stores().audit.count_outcomes(since).await {
         Ok(c) => c,
         Err(e) => return unavailable(e),

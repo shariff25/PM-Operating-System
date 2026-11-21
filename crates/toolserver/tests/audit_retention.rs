@@ -416,6 +416,138 @@ async fn postgres_nothing_else_deletes_and_nothing_new_is_ever_deleted() {
     pg.drop_schema().await;
 }
 
+/// LG (the re-check of eb24d28): a function whose quoted name is a newline and the text of the
+/// real purge's call-stack frame, so PG_CONTEXT holds that text, sets the purge's setting and
+/// deletes only old rows, from the audit log and from role history. Identifiers are cut at 63
+/// bytes, so the name fits only beside a short schema name: role history's frame fits with a
+/// schema of up to 10 characters (`public` among them), the audit log's with one character;
+/// the case runs in a one-letter schema so both fit. Before migration 0023 both deletes went
+/// through (checked); now both are refused: the triggers no longer read a name from the call
+/// stack, they look for a mark only the purge itself writes. The real purges still work.
+#[tokio::test]
+async fn postgres_a_crafted_function_name_cannot_pass_as_the_purge() {
+    let Some(pg) = TestPg::new_short_schema().await else {
+        return;
+    };
+    let now = Utc::now();
+    seed(&pg.store, now).await;
+    let pool = pg.store.pool();
+    let schema: String = sqlx::query_scalar("SELECT current_schema()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let evil = format!("{schema}_lg");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {evil}")))
+        .execute(pool)
+        .await
+        .unwrap();
+    // The name: a newline, then what the real frame prints, so PG_CONTEXT holds that text.
+    let audit_name =
+        format!("\nPL/pgSQL function {schema}.purge_audit_events(interval,integer) line ");
+    let roles_name = format!("\nPL/pgSQL function {schema}.purge_role_changes(integer) line ");
+    assert!(
+        audit_name.len() <= 63 && roles_name.len() <= 63,
+        "the names fit"
+    );
+    for (name, setting, body) in [
+        (
+            &audit_name,
+            "pmos.audit_purge",
+            format!("DELETE FROM {schema}.audit_events WHERE at < now() - interval '100 days'"),
+        ),
+        (
+            &roles_name,
+            "pmos.role_changes_retention",
+            format!(
+                "DELETE FROM {schema}.role_changes c USING {schema}.users u
+                 WHERE u.handle = c.target AND u.status = 'deactivated'
+                   AND u.deactivated_at < now() - interval '90 days'"
+            ),
+        ),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION {evil}.\"{name}\"() RETURNS bigint LANGUAGE plpgsql AS $$
+             DECLARE n bigint;
+             BEGIN
+                 PERFORM set_config('{setting}', 'on', true);
+                 {body};
+                 GET DIAGNOSTICS n = ROW_COUNT;
+                 RETURN n;
+             END $$"
+        )))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    // A user deactivated long ago, with role history the role purge may take (and the active
+    // admin the user database always has).
+    let mut tx = pool.begin().await.unwrap();
+    for sql in [
+        "INSERT INTO users (handle, status, created_at, created_by, created_client)
+         VALUES ('lg-admin', 'active', now(), 'host', 'host')",
+        "INSERT INTO user_roles (handle, role, granted_at, granted_by)
+         VALUES ('lg-admin', 'admin', now(), 'host')",
+        "INSERT INTO users (handle, status, created_at, created_by, created_client,
+                            deactivated_at, deactivated_by)
+         VALUES ('lg-gone', 'deactivated', now() - interval '400 days', 'host', 'host',
+                 now() - interval '200 days', 'host')",
+    ] {
+        sqlx::query(sql).execute(&mut *tx).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    sqlx::query(
+        "INSERT INTO role_changes (at, actor, client, host_user, target, change)
+         VALUES (now() - interval '300 days', 'host', 'host', 'opsuser', 'lg-gone', 'set_field')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let count = |sql: &'static str| async move {
+        sqlx::query_scalar::<_, i64>(sql)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    };
+    let events = count("SELECT count(*) FROM audit_events").await;
+    let history = count("SELECT count(*) FROM role_changes WHERE target = 'lg-gone'").await;
+    for name in [&audit_name, &roles_name] {
+        let err = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {evil}.\"{name}\"()")))
+            .execute(pool)
+            .await
+            .expect_err("a crafted name passed as the purge");
+        assert!(err.to_string().contains("append-only"), "{err}");
+    }
+    assert_eq!(count("SELECT count(*) FROM audit_events").await, events);
+    assert_eq!(
+        count("SELECT count(*) FROM role_changes WHERE target = 'lg-gone'").await,
+        history
+    );
+    // Nobody but the purge's owner can write the mark (nothing on it is granted to PUBLIC).
+    let public: bool =
+        sqlx::query_scalar("SELECT has_table_privilege('public', 'purge_marks', 'INSERT')")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(!public);
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {evil} CASCADE")))
+        .execute(pool)
+        .await
+        .unwrap();
+    // The real purges still take what they may, and leave no mark behind.
+    let Some(Purged::Ran(done)) = pg.store.purge(90, 100, now).await.unwrap() else {
+        panic!("the purge ran");
+    };
+    assert_eq!(done.deleted, 1);
+    let (deleted, _): (i64, bool) =
+        sqlx::query_as("SELECT deleted, more FROM purge_role_changes(100)")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(deleted >= 1, "{deleted}");
+    assert_eq!(count("SELECT count(*) FROM purge_marks").await, 0);
+    pg.drop_schema().await;
+}
+
 /// Two purges at once (two replicas): between them every old event goes exactly once, none
 /// fails, none waits on the other, and nothing new goes.
 #[tokio::test]

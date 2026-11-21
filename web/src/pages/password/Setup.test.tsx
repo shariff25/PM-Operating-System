@@ -167,6 +167,50 @@ describe('password setup', () => {
     expect(screen.getByText(/^[A-Z2-7]{4}( [A-Z2-7]{4}){7}$/).textContent).not.toBe(first);
   });
 
+  // The re-check of eb24d28: the authenticator secret is shown, never kept. It is in no web
+  // storage, no cookie the page can read, the address bar or the history's state, before or
+  // after the setup finishes; nor is the setup code or the new password.
+  it('keeps the authenticator secret out of web storage, cookies and history', async () => {
+    open();
+    await screen.findByLabelText(P.nameLabel);
+    const before = window.history.length;
+    await begin();
+    await choose('a calm river at dawn');
+    const shown = (await screen.findByText(/^[A-Z2-7]{4}( [A-Z2-7]{4}){7}$/)).textContent!;
+    const secret = shown.replace(/ /g, '');
+    const qr = screen.getByRole('img', { name: S.qrLabel('ravi@contoso.example') });
+    expect(qr.outerHTML).not.toContain(secret);
+    const leaks = () => {
+      const everywhere = [
+        ...Object.keys(localStorage).map((k) => `${k}=${localStorage.getItem(k)}`),
+        ...Object.keys(sessionStorage).map((k) => `${k}=${sessionStorage.getItem(k)}`),
+        document.cookie,
+        window.location.href,
+        JSON.stringify(window.history.state ?? null),
+      ].join('\n');
+      return [secret, secret.toLowerCase(), 'otpauth', MOCK_SETUP_CODES.ravi, 'a calm river at dawn'].filter((s) =>
+        everywhere.includes(s),
+      );
+    };
+    expect(leaks()).toEqual([]);
+    await userEvent.click(screen.getByRole('button', { name: S.newQr }));
+    await screen.findByText(S.newQrDone);
+    await userEvent.click(screen.getByRole('button', { name: S.added }));
+    await userEvent.type(await screen.findByLabelText(P.codeLabel), MOCK_TOTP);
+    await userEvent.click(screen.getByRole('button', { name: S.confirm }));
+    expect(await screen.findByRole('heading', { level: 1, name: S.codesTitle })).toBeInTheDocument();
+    expect(leaks()).toEqual([]);
+    // No history entry was pushed for a step: Back can't bring a secret back.
+    expect(window.history.length).toBe(before);
+  });
+
+  it('starts again with a new code when the setup code is spent', async () => {
+    open({ passwordRefusal: 'setup_code_spent' });
+    await begin();
+    expect(await screen.findByRole('alert')).toHaveTextContent(S.setup_code_spent);
+    expect(step()).toBe('Step 1 of 4');
+  });
+
   it('leaves part-way with Start over, which keeps nothing secret', async () => {
     open();
     await begin();

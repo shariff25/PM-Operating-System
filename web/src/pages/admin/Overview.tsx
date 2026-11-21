@@ -208,7 +208,17 @@ function PeopleFlags({ users, linkable }: { users: OverviewUsers; linkable: bool
   const firstLinks = users.first_links ?? [];
   if (firstLinks.length) rows.push({ key: 'first-links', icon: 'link', title: P.firstLinks(firstLinks.length), next: P.firstLinksNext, handles: firstLinks.map((l) => l.handle) });
   const resets = users.password_resets ?? [];
-  if (resets.length) rows.push({ key: 'resets', icon: 'shield', title: P.resets(resets.length), next: P.resetsNext, handles: [...new Set(resets.map((r) => r.handle))] });
+  const dismissed = resets.filter((r) => r.dismissed_at).length;
+  if (resets.length)
+    rows.push({
+      key: 'resets',
+      icon: 'shield',
+      title: P.resets(resets.length),
+      next: dismissed ? `${P.resetsNext} ${P.resetsDismissed(dismissed)}` : P.resetsNext,
+      handles: [...new Set(resets.map((r) => r.handle))],
+    });
+  const voided = users.password_codes_voided ?? [];
+  if (voided.length) rows.push({ key: 'voided', icon: 'lock', title: P.voided(voided.length), next: P.voidedNext, handles: [...new Set(voided.map((v) => v.handle))] });
   if (rows.length === 0) return null;
   return (
     <section className="card" aria-labelledby="admin-people">

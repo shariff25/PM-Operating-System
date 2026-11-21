@@ -134,9 +134,18 @@ says "Password needs host"): give them a code with `password-setup <handle>`.
 **Turning password sign-in on in the kit**: set `PMOS_WEB_PASSWORD_LOGIN=1`, the web app's
 `https://` address in `PMOS_WEB_PUBLIC_URL`, and `PMOS_WEB_TRUSTED_PROXIES` to the address
 your reverse proxy reaches the web app from (for a proxy on this host, the `pmos` network's
-gateway: `deploy/pmos-admin up --web` prints it when it is blank, and refuses to start the web
-app until it is set). The proxy must send `X-Forwarded-For`. Someone guessing from one address
-only makes that address wait; the person still signs in from their own.
+pinned gateway, `10.201.77.1` unless `PMOS_NETWORK_GATEWAY` says otherwise:
+`deploy/pmos-admin up --web` checks it and refuses, with the fix, while it is blank, stale or
+doesn't match the network; see [install.md](install.md), "Optional: the web app"). The proxy
+must send `X-Forwarded-For`. Someone guessing from one address only makes that address wait;
+the person still signs in from their own, and from a new address too.
+
+**A setup code that stops working.** `setup_code_spent` ("used for as many tries as it
+allows"): the person started 5 setups or set 6 passwords with it; make them a new code. A code
+listed on the admin overview as **made void after too many wrong tries** drew 20 wrong guesses
+from someone: make a new code and hand it over straight away (the guesses against the old one
+don't hold the new one up). Each person's dismissal of a reset notice is recorded, and the
+overview shows which of the week's resets were dismissed.
 
 `grant-admin --keep-entra` reuses an Entra link the host already confirmed. A deactivated
 admin who comes back is reactivated without `admin`; grant it again on purpose.

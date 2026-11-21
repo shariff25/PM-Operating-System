@@ -502,6 +502,8 @@ fn link_status(why: LinkRefusal) -> StatusCode {
         | LinkRefusal::TokenUsed
         | LinkRefusal::NotAMember => StatusCode::FORBIDDEN,
         LinkRefusal::Linked | LinkRefusal::Taken => StatusCode::CONFLICT,
+        LinkRefusal::EntraUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        LinkRefusal::NotConfigured => StatusCode::NOT_IMPLEMENTED,
     }
 }
 
@@ -523,9 +525,12 @@ fn link_refused(
     )
 }
 
-/// A refusal decided before the store saw the link (the body, the token, a replay): audited
-/// here as the store audits its own (`users.identity_link`, denied, `anonymous`, detail
-/// `entra; <code>`, the target handle only when that user exists).
+/// A refusal decided before the store saw the link (no settings, the tenant's keys unreadable,
+/// the body, the token, a replay): counted as a miss **first**, so past the miss limit it
+/// answers `429` with no directory snapshot and no audit row (the re-check of eb24d28, LB:
+/// a web-token holder can't flood the audit log); otherwise audited here as the store audits
+/// its own (`users.identity_link`, denied, `anonymous`, detail `entra; <code>`, the target
+/// handle only when that user exists).
 async fn refuse_before_store(
     state: &AppState,
     limiter: &MissLimiter,
@@ -534,6 +539,20 @@ async fn refuse_before_store(
     why: LinkRefusal,
     now: chrono::DateTime<Utc>,
 ) -> Response {
+    state.svc.people().resolve_misses().record(client.as_str());
+    if let Miss::Limited(retry) = limiter.miss(client, Instant::now()) {
+        tracing::warn!(
+            client = client.as_str(),
+            code = why.code(),
+            "first Entra link refused, over the miss limit"
+        );
+        return limited(
+            "resolve_misses",
+            "too many lookups that found nobody; try again shortly",
+            retry,
+        );
+    }
+    tracing::info!(code = why.code(), "first Entra link refused");
     let dir = state.svc.stores().users.snapshot(now).await.ok();
     let (actor, event) = crate::users::link::refused_event(dir.as_ref(), handle, why);
     if let Err(e) = state
@@ -545,7 +564,7 @@ async fn refuse_before_store(
     {
         return unavailable(e);
     }
-    link_refused(state, limiter, client, why)
+    coded(link_status(why), why.code(), why.message())
 }
 
 /// `GET /internal/users/entra-link`: the tenant and client id first-link tokens are validated
@@ -571,17 +590,22 @@ async fn first_link(
     Path(handle): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
+    let now = Utc::now();
     let Some(check) = state.people.entra.clone() else {
         tracing::error!(
             "first Entra link refused: no PMOS_ENTRA_TENANT_ID and PMOS_ENTRA_CLIENT_ID here"
         );
-        return coded(
-            StatusCode::NOT_IMPLEMENTED,
-            "not_configured",
-            "this tool server has no Entra settings (PMOS_ENTRA_TENANT_ID, PMOS_ENTRA_CLIENT_ID)",
-        );
+        // Counted and audited like every refusal (LD), the limit first (LB).
+        return refuse_before_store(
+            &state,
+            &limiter,
+            client,
+            &handle,
+            LinkRefusal::NotConfigured,
+            now,
+        )
+        .await;
     };
-    let now = Utc::now();
     let Ok(b) = serde_json::from_slice::<LinkBody>(&body) else {
         return refuse_before_store(&state, &limiter, client, &handle, LinkRefusal::Invalid, now)
             .await;
@@ -592,11 +616,15 @@ async fn first_link(
         Ok(identity) => identity,
         Err(pmos_entra::Failure::Unavailable(why)) => {
             tracing::warn!(why, "first Entra link: the tenant's keys couldn't be read");
-            return coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "entra_unavailable",
-                "the Microsoft keys couldn't be read; try again shortly",
-            );
+            return refuse_before_store(
+                &state,
+                &limiter,
+                client,
+                &handle,
+                LinkRefusal::EntraUnavailable,
+                now,
+            )
+            .await;
         }
         Err(f) => {
             tracing::warn!(why = f.why(), "first Entra link: the ID token was refused");
@@ -604,8 +632,19 @@ async fn first_link(
             return refuse_before_store(&state, &limiter, client, &handle, why, now).await;
         }
     };
-    // One first link per token: a captured token can't be replayed here.
-    if !check.used.first_use(&identity, now) {
+    // One first link per token: a captured token can't be replayed here, before or after a
+    // restart (M4: the store keeps the used tokens, in Postgres in a deployment).
+    let first_use = match state
+        .svc
+        .stores()
+        .users
+        .first_token_use(&identity.replay_key(), identity.replay_until(), now)
+        .await
+    {
+        Ok(first) => first,
+        Err(e) => return unavailable(e),
+    };
+    if !first_use {
         tracing::warn!("first Entra link: an ID token presented again");
         return refuse_before_store(
             &state,

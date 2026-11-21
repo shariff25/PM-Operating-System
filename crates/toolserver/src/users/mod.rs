@@ -239,10 +239,12 @@ pub enum ChangeKind {
     IssuePasswordCode,
     /// A password credential set by a finished setup or reset.
     SetPassword,
+    /// A person dismissed the notice of a reset someone issued for them (migration 0023, LF).
+    DismissResetNotice,
 }
 
 impl ChangeKind {
-    pub const ALL: [ChangeKind; 18] = [
+    pub const ALL: [ChangeKind; 19] = [
         Self::Create,
         Self::Grant,
         Self::Revoke,
@@ -261,6 +263,7 @@ impl ChangeKind {
         Self::ExceptionOff,
         Self::IssuePasswordCode,
         Self::SetPassword,
+        Self::DismissResetNotice,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -283,6 +286,7 @@ impl ChangeKind {
             Self::ExceptionOff => "exception_off",
             Self::IssuePasswordCode => "issue_password_code",
             Self::SetPassword => "set_password",
+            Self::DismissResetNotice => "dismiss_reset_notice",
         }
     }
 
@@ -984,6 +988,17 @@ pub trait UserStore: Send + Sync {
     /// lock in the transaction that writes the identity, its `role_changes` row and its audit
     /// event. A refusal records a `denied` event (a conflict as `users.identity_conflict`).
     async fn link_entra(&self, link: &link::EntraLink, now: DateTime<Utc>) -> link::LinkResult;
+
+    /// Record an ID token as used for a first Entra link (M4): `key` is
+    /// `pmos_entra::Identity::replay_key` (a SHA-256, never the `oid`), kept until
+    /// `expires_at`. `false` when it was already used. In Postgres, so a restart doesn't
+    /// forget (`entra_used_tokens`, migration 0023).
+    async fn first_token_use(
+        &self,
+        key: &str,
+        expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool>;
 
     /// The same store's password sign-in state (`crate::password`, migration 0020): one
     /// person's, under that person's lock, changed whole or not at all.
