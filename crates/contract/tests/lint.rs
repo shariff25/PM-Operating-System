@@ -518,6 +518,64 @@ fn repo_content_passes() {
             "week-review",
         ]
     );
+
+    // The bot marketplace's catalog (docs/bot-marketplace-spec.md §3): Nudge, then the three
+    // specialists, each with exactly the skills the spec gives it and the writes it names.
+    let personas: Vec<_> = report.personas.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(personas, vec!["nudge", "chief", "sprout", "echo"]);
+    assert!(report.personas.iter().all(|p| p.offered));
+    let role = |name: &str| report.roles.iter().find(|r| r.name == name).unwrap();
+    let skills = |name: &str| -> Vec<&str> {
+        let mut v: Vec<&str> = role(name).skills.iter().map(String::as_str).collect();
+        v.sort_unstable();
+        v
+    };
+    let sorted = |s: &str| -> Vec<String> {
+        let mut v: Vec<String> = s.split(' ').map(str::to_owned).collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        skills("chief-of-staff"),
+        sorted("ask daily-brief meeting-prep week-review meeting-notes status-update exec-brief decision-doc okr-draft slack-reply jira-draft")
+    );
+    assert_eq!(
+        skills("growth-pm"),
+        sorted("ask problem-framing metrics-tree funnel-diagnosis experiment-design experiment-readout experiment-backlog opportunity-sizing pricing-proposal jira-draft")
+    );
+    assert_eq!(
+        skills("outbound-pm"),
+        sorted("ask release-notes launch-checklist positioning-brief battlecard competitive-brief call-synth partner-brief advisory-draft poc-plan jira-draft")
+    );
+    let drafts = |name: &str| -> Vec<String> {
+        let p = report.personas.iter().find(|p| p.name == name).unwrap();
+        let mut d = p.drafts.clone();
+        d.sort_unstable();
+        d
+    };
+    // Chief never starts a Slack conversation; Sprout and Echo have no Slack write at all.
+    assert_eq!(
+        drafts("chief"),
+        vec!["Confluence pages", "Jira issues", "Slack replies"]
+    );
+    assert_eq!(drafts("sprout"), vec!["Confluence pages", "Jira issues"]);
+    assert_eq!(drafts("echo"), vec!["Confluence pages", "Jira issues"]);
+    // Only Sprout needs a source, and PM OS has no analytics tool yet.
+    for p in &report.personas {
+        let expected = usize::from(p.name == "sprout");
+        assert_eq!(p.needs.len(), expected, "{}", p.name);
+        assert!(p.needs.iter().all(|n| n.source == "analytics" && !n.met));
+    }
+    // Each specialist's role carries the base role's three standing sections verbatim
+    // (spec §3; the lint has no shared include).
+    let base = &role("pm-assistant").instructions;
+    let standing = &base[base.find("## Source markers in drafts").unwrap()..];
+    for name in ["chief-of-staff", "growth-pm", "outbound-pm"] {
+        assert!(
+            role(name).instructions.contains(standing.trim_end()),
+            "{name} is missing the standing sections"
+        );
+    }
 }
 
 /// Slice U7: `team.yaml` is retired. One anywhere in the content tree is an error for
