@@ -79,7 +79,7 @@ export type PolicyPart = 'propose' | 'proposals';
 function adminRoute(path: string): Route | null {
   const part = /^\/admin\/policy\/(propose|proposals)\/?(?:\?(.*))?$/.exec(path);
   if (part) return { name: 'admin', section: 'policy', search: part[2] ?? '', sub: part[1] as PolicyPart };
-  const m = /^\/admin(?:\/(audit|team|connectors|policy|content))?\/?(?:\?(.*))?$/.exec(path);
+  const m = /^\/admin(?:\/(audit|team|bots|connectors|policy|content))?\/?(?:\?(.*))?$/.exec(path);
   if (!m) return null;
   return { name: 'admin', section: (m[1] as AdminSection | undefined) ?? 'overview', search: m[2] ?? '' };
 }

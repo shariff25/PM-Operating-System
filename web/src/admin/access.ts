@@ -1,8 +1,8 @@
 import type { Me } from '../api';
 
 /** The parts of the Admin area, in the order they are listed. */
-export type AdminSection = 'overview' | 'audit' | 'team' | 'connectors' | 'policy' | 'content';
-export const ADMIN_SECTIONS: readonly AdminSection[] = ['overview', 'audit', 'team', 'connectors', 'policy', 'content'];
+export type AdminSection = 'overview' | 'audit' | 'team' | 'bots' | 'connectors' | 'policy' | 'content';
+export const ADMIN_SECTIONS: readonly AdminSection[] = ['overview', 'audit', 'team', 'bots', 'connectors', 'policy', 'content'];
 
 const has = (me: Pick<Me, 'permissions'>, ...wanted: string[]) => {
   const given = me.permissions ?? [];
@@ -14,6 +14,7 @@ export function canSee(me: Pick<Me, 'permissions'>, section: AdminSection): bool
   switch (section) {
     case 'overview':
     case 'team':
+    case 'bots':
       return has(me, 'view-audit-log', 'manage-members');
     case 'audit':
       return has(me, 'view-audit-log');

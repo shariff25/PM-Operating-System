@@ -85,6 +85,10 @@ pub struct DraftSummary {
     /// withdrawn or deleted bot's key (the app says "A bot no longer offered"), and for any
     /// key while the catalog can't be read. Set by the route (`app::bots::attribute`).
     pub persona_offered: bool,
+    /// On hold (slice A1, from the tool server's `held`): pending, and the bot that drafted it
+    /// was withdrawn. It can be rejected; approving or editing it answers `409 held` until an
+    /// Admin releases it or the bot is offered again. `false` for every other draft.
+    pub held: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -743,6 +747,7 @@ pub fn summary(item: &Approval) -> Option<DraftSummary> {
         practice: false,
         persona: persona_key(item.persona.as_deref()),
         persona_offered: true,
+        held: item.held && item.status == "pending",
     })
 }
 
@@ -929,6 +934,7 @@ pub fn practice_draft(p: &PracticeDraft, bot: &str, state: &UserState) -> Draft 
             practice: true,
             persona: None,
             persona_offered: true,
+            held: false,
         },
         body: edit
             .map(|e| cite::strip(&e.body))

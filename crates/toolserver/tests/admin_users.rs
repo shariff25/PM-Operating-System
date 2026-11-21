@@ -278,6 +278,7 @@ impl Server {
             outcome: None,
             from: None,
             to: None,
+            persona: None,
         };
         self.f
             .stores

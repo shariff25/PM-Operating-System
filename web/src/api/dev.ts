@@ -91,6 +91,8 @@ export function devApiFactory(): (onSignedOut: () => void) => Api {
       briefDelivery: mockBrief(),
       audienceDrafts: new URLSearchParams(window.location.search).get('mock_slack') === 'audience',
       listCap: new URLSearchParams(window.location.search).get('mock_drafts') === 'truncated' ? 3 : undefined,
+      // `?mock_held=1` adds a draft by a withdrawn bot, on hold until an admin releases it.
+      heldDraft: new URLSearchParams(window.location.search).get('mock_held') === '1',
       briefBuilt: import.meta.env.VITE_MOCK_BRIEF !== 'off',
       hostile: import.meta.env.VITE_MOCK_HOSTILE === 'on',
       toolServerDown: new URLSearchParams(window.location.search).get('mock_admin') === 'degraded',
