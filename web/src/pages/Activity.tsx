@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import type { Task } from '../api';
 import { useApp } from '../app-context';
+import { BotBy } from '../components/BotParts';
 import { Empty, NewRequestButton, PageHeader, Skeleton, TaskPill } from '../components/bits';
 import { copy } from '../copy';
 import { useData } from '../data';
@@ -28,6 +29,7 @@ export function TaskTable({ tasks, label, compact }: { tasks: Task[]; label: str
                   <span className="row-title">{t.text}</span>
                   {t.status === 'failed' && t.error && <span className="row-meta">{t.error}</span>}
                 </span>
+                <BotBy persona={t.persona} offered={t.persona_offered} className="row-bot" />
               </span>
               <span className="tcell tcell-status"><TaskPill status={t.status} /></span>
               <span className="tcell tcell-time">{relTime(t.created_at, now)}</span>

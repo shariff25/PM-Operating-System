@@ -149,6 +149,7 @@ Single sign-on setup stays with the IT guide.
   });
   own('dana', 'dana', {
     id: 'apr_dana_exports',
+    persona: 'sprout',
     kind: 'jira_issue',
     title: 'Retry failed exports nightly',
     bot: 'pm-dana',
@@ -284,6 +285,9 @@ Exports that fail because the warehouse is busy are never tried again[[s1]]. Ret
       created_at: d.created_at,
       expires_at: d.expires_at,
       revision: revisionOf(d),
+      // Which bot drafted it: metadata, so it is kept for a restricted draft too.
+      persona: d.persona ?? null,
+      persona_offered: d.persona_offered ?? true,
     };
     if (d.restricted_sources) return { ...base, restricted: true, title: null, my_recommendation: null };
     return { ...base, restricted: false, title: d.title, edited: d.edited, args_hash: fakeArgsHash(d), my_recommendation: mine(d) };
@@ -293,8 +297,8 @@ Exports that fail because the warehouse is busy are never tried again[[s1]]. Ret
     const d = o.draft;
     if (d.restricted_sources) {
       // Exactly the metadata: nothing about the text.
-      const { id, owner, owner_name, kind, status, created_at, expires_at, revision } = summary(o);
-      return structuredClone({ id, owner, owner_name, kind, status, created_at, expires_at, restricted: true, revision });
+      const { id, owner, owner_name, kind, status, created_at, expires_at, revision, persona, persona_offered } = summary(o);
+      return structuredClone({ id, owner, owner_name, kind, status, created_at, expires_at, restricted: true, revision, persona, persona_offered });
     }
     // A Slack target names a public channel only; the sample channels here have no name to hide.
     return structuredClone({ ...summary(o), body: d.body, target: d.target, sources: d.sources });

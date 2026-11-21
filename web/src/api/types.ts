@@ -292,6 +292,11 @@ export interface BotCard extends BotUsage {
   added_via: 'onboarding' | 'bots_page' | 'picker' | 'seed' | null;
   /** Always false in this version. */
   new: boolean;
+  /**
+   * Offered as a Preview: not yet benchmarked by an eval run (the owner's decision of 2026-11-21).
+   * Optional: a server that doesn't send it means false.
+   */
+  preview?: boolean;
 }
 
 /** A bot on the person's team that is no longer offered: "No longer offered", Remove only. */
@@ -820,9 +825,15 @@ export interface Api {
   createPractice(): Promise<Draft>;
   deleteDraft(id: string): Promise<void>;
 
-  createTask(text: string): Promise<Task>;
+  /** `persona` names the bot to ask (docs/web-api.md, "Asking"); left out, Nudge is asked. */
+  createTask(text: string, persona?: string): Promise<Task>;
   getTask(id: string): Promise<Task>;
   listTasks(): Promise<Task[]>;
+
+  /** The catalog and the person's own team (docs/web-api.md, "Bots"). */
+  bots(): Promise<Bots>;
+  /** Change the person's own team; answers the Bots page as it now is. */
+  changeTeam(change: TeamChange): Promise<Bots>;
 
   brief(): Promise<Brief>;
   dismissFollowup(id: string): Promise<void>;

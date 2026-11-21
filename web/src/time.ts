@@ -4,6 +4,16 @@ const MIN = 60_000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
 
+/** The calendar day of a moment: "today", "yesterday", or "20 Nov". */
+export function dayOf(at: string, now = Date.now()): string {
+  const t = Date.parse(at);
+  if (Number.isNaN(t)) return '';
+  const day = (ms: number) => new Date(ms).toDateString();
+  if (day(t) === day(now)) return copy.time.today;
+  if (day(t) === day(now - DAY)) return copy.time.yesterday;
+  return new Date(t).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+}
+
 /** "5 min ago", "yesterday", "3 days ago", or a short date for anything older than a week. */
 export function relTime(at: string, now = Date.now()): string {
   const t = Date.parse(at);

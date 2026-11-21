@@ -45,7 +45,7 @@ export function cleanTask(task: Task): Task {
  */
 export function withCleanTasks(api: Api): Api {
   const { createTask, getTask, listTasks, draftFollowup } = api;
-  api.createTask = async (text) => cleanTask(await createTask.call(api, text));
+  api.createTask = async (text, persona) => cleanTask(await createTask.call(api, text, persona));
   api.getTask = async (id) => cleanTask(await getTask.call(api, id));
   api.listTasks = async () => (await listTasks.call(api)).map(cleanTask);
   api.draftFollowup = async (id) => cleanTask(await draftFollowup.call(api, id));

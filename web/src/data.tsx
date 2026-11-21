@@ -1,6 +1,7 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import type { Brief, DraftSummary, ReviewList, Task } from './api';
+import type { Bots, Brief, DraftSummary, ReviewList, Task } from './api';
+import { canAsk } from './bots';
 import { messageOf, useApp } from './app-context';
 import { copy } from './copy';
 import { effectiveStatus, sortDrafts } from './drafts';
@@ -33,6 +34,20 @@ export interface DataValue {
   reloadReviews: () => Promise<void>;
   /** Drafts that wait for this reviewer's advice. */
   reviewCount: number;
+  /**
+   * The catalog and the person's own team (`GET /api/bots`): null until loaded, and always for
+   * someone who may not ask. `botsError` is the failure of the last read.
+   */
+  bots: Bots | null;
+  botsError: unknown;
+  reloadBots: () => Promise<void>;
+  /** Put the answer of a team change in place. */
+  setBots: (b: Bots) => void;
+  /**
+   * Today sends a person to "Pick your team" once: true the first time it is asked in this
+   * signed-in session, false after, so going back to Today is never blocked.
+   */
+  takeTeamStep: () => boolean;
 }
 
 const DataContext = createContext<DataValue | null>(null);
@@ -55,6 +70,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [brief, setBriefState] = useState<Brief | null>(null);
   const [briefState, setBriefStatus] = useState<BriefState>('loading');
   const [tasks, setTasks] = useState<Task[] | null>(null);
+  const asks = canAsk(me);
+  const [bots, setBotsState] = useState<Bots | null>(null);
+  const [botsError, setBotsError] = useState<unknown>(null);
+  const teamStepTaken = useRef(false);
 
   const reloadDrafts = useCallback(async () => {
     try {
@@ -97,6 +116,35 @@ export function DataProvider({ children }: { children: ReactNode }) {
       setReviewsError(e);
     }
   }, [api, reviewer]);
+
+  const reloadBots = useCallback(async () => {
+    if (!asks) return;
+    try {
+      setBotsState(await api.bots());
+      setBotsError(null);
+    } catch (e) {
+      setBotsError(e);
+    }
+  }, [api, asks]);
+
+  useEffect(() => {
+    if (asks) void reloadBots();
+    else {
+      setBotsState(null);
+      setBotsError(null);
+    }
+  }, [asks, reloadBots]);
+
+  const setBots = useCallback((b: Bots) => {
+    setBotsState(b);
+    setBotsError(null);
+  }, []);
+
+  const takeTeamStep = useCallback(() => {
+    if (teamStepTaken.current) return false;
+    teamStepTaken.current = true;
+    return true;
+  }, []);
 
   useEffect(() => {
     void reloadDrafts();
@@ -142,8 +190,13 @@ export function DataProvider({ children }: { children: ReactNode }) {
       reviewsError,
       reloadReviews,
       reviewCount: reviews ? waitingCount(reviews.drafts) : 0,
+      bots,
+      botsError,
+      reloadBots,
+      setBots,
+      takeTeamStep,
     };
-  }, [drafts, draftsError, draftsCut, reloadDrafts, brief, briefState, setBrief, tasks, reloadTasks, upsertTask, reviews, reviewsError, reloadReviews]);
+  }, [drafts, draftsError, draftsCut, reloadDrafts, brief, briefState, setBrief, tasks, reloadTasks, upsertTask, reviews, reviewsError, reloadReviews, bots, botsError, reloadBots, setBots, takeTeamStep]);
 
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
 }
@@ -159,7 +212,7 @@ export function useAsk() {
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const start = useCallback(
-    async (run: () => Promise<Task>, fallback: string): Promise<boolean> => {
+    async (run: () => Promise<Task>, fallback: string, onError?: (e: unknown) => void): Promise<boolean> => {
       setAsking(true);
       setError(null);
       try {
@@ -172,6 +225,7 @@ export function useAsk() {
       } catch (e) {
         // Only a definite refusal says nothing was started; anything else may have gone through.
         setError(isDefiniteRefusal(e) ? errorText(e, fallback) : copy.errors.unsureStarted);
+        onError?.(e);
         return false;
       } finally {
         setAsking(false);

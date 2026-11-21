@@ -21,10 +21,14 @@ const approvePractice = async (user: ReturnType<typeof userEvent.setup>) => {
   await screen.findByText(copy.approve.practiceApproved);
 };
 
+// These tests are the guided start's three steps, as it is where nothing is offered besides Nudge
+// (`catalog: 'nudge_only'`, so no "Pick your team" step). The four-step start, with the bot
+// marketplace, is tested in Market.test.tsx.
 describe('the guided start on Today', () => {
   it('welcomes a first visit with Nudge waving, two sentences and three steps at 0 of 3', async () => {
     const marked = vi.fn();
     renderApp({
+      catalog: 'nudge_only',
       noDrafts: true,
       wrap: (a: Api) => {
         const orig = a.markHintSeen.bind(a);
@@ -47,7 +51,7 @@ describe('the guided start on Today', () => {
 
   it('marks each step done by doing it, then shows "Approved!" once and ends', async () => {
     const user = userEvent.setup();
-    const { api } = renderApp({ noDrafts: true });
+    const { api } = renderApp({ catalog: 'nudge_only', noDrafts: true });
     await findCard();
 
     // 1. ask for something
@@ -78,7 +82,7 @@ describe('the guided start on Today', () => {
 
   it('shows "Approved!" only once: a later first approval is just an approval', async () => {
     const user = userEvent.setup();
-    renderApp({ hash: '/d/apr_jira', firstVisit: false, hintsSeen: ['tour_started', 'tour_cheered', 'sources', 'ask', 'approve'] });
+    renderApp({ catalog: 'nudge_only', hash: '/d/apr_jira', firstVisit: false, hintsSeen: ['tour_started', 'tour_cheered', 'sources', 'ask', 'approve'] });
     await user.click(await screen.findByRole('button', { name: 'Approve to Jira' }));
     await user.click(screen.getByRole('button', { name: copy.approve.confirm('jira_issue') }));
     await screen.findByRole('status', { name: 'Outcome' });
@@ -87,7 +91,7 @@ describe('the guided start on Today', () => {
 
   it('gives a returning person who approves no "Approved!" moment', async () => {
     const user = userEvent.setup();
-    renderApp({ hash: '/d/apr_jira', firstVisit: false, hintsSeen: ['sources', 'ask', 'approve'] });
+    renderApp({ catalog: 'nudge_only', hash: '/d/apr_jira', firstVisit: false, hintsSeen: ['sources', 'ask', 'approve'] });
     await user.click(await screen.findByRole('button', { name: 'Approve to Jira' }));
     await user.click(screen.getByRole('button', { name: copy.approve.confirm('jira_issue') }));
     await screen.findByRole('status', { name: 'Outcome' });
@@ -95,7 +99,7 @@ describe('the guided start on Today', () => {
   });
 
   it('keeps progress across a reload, because it comes from the server', async () => {
-    renderApp({ firstVisit: false, hintsSeen: ['tour_started', 'tour_asked'] });
+    renderApp({ catalog: 'nudge_only', firstVisit: false, hintsSeen: ['tour_started', 'tour_asked'] });
     await findCard();
     expect(screen.getByText(copy.tour.progressLabel(1, 3))).toBeInTheDocument();
     expect(stepDone('ask')).toBe('true');
@@ -105,7 +109,7 @@ describe('the guided start on Today', () => {
   });
 
   it('a step done before its turn still counts', async () => {
-    renderApp({ firstVisit: false, hintsSeen: ['tour_started', 'tour_decided'] });
+    renderApp({ catalog: 'nudge_only', firstVisit: false, hintsSeen: ['tour_started', 'tour_decided'] });
     await findCard();
     expect(screen.getByText(copy.tour.progressLabel(1, 3))).toBeInTheDocument();
     expect(stepDone('decide')).toBe('true');
@@ -113,7 +117,7 @@ describe('the guided start on Today', () => {
 
   it('"Skip the tour" ends it at once, for good', async () => {
     const user = userEvent.setup();
-    const { api } = renderApp({ noDrafts: true });
+    const { api } = renderApp({ catalog: 'nudge_only', noDrafts: true });
     await findCard();
     await user.click(screen.getByRole('button', { name: copy.tour.skip }));
     await waitFor(() => expect(card()).not.toBeInTheDocument());
@@ -126,7 +130,7 @@ describe('the guided start on Today', () => {
 
   it('"Show hints again" restarts it from step 1', async () => {
     const user = userEvent.setup();
-    renderApp({ firstVisit: false, hintsSeen: ['tour_started', 'tour_asked', 'tour_skipped', 'sources'] });
+    renderApp({ catalog: 'nudge_only', firstVisit: false, hintsSeen: ['tour_started', 'tour_asked', 'tour_skipped', 'sources'] });
     await screen.findByLabelText(copy.home.askLabel);
     expect(card()).not.toBeInTheDocument();
     await openMenu(user);
@@ -136,14 +140,14 @@ describe('the guided start on Today', () => {
   });
 
   it('a returning person sees no guided start', async () => {
-    renderApp({ firstVisit: false });
+    renderApp({ catalog: 'nudge_only', firstVisit: false });
     await screen.findByLabelText(copy.home.askLabel);
     await screen.findAllByRole('link', { name: /PRD: TCB grace period setting/ });
     expect(card()).not.toBeInTheDocument();
   });
 
   it('is hidden with "Hints and nudges" off', async () => {
-    renderApp({ noDrafts: true, nudges: false });
+    renderApp({ catalog: 'nudge_only', noDrafts: true, nudges: false });
     await screen.findByLabelText(copy.home.askLabel);
     await screen.findByRole('link', { name: /Practice: why PMs should take the stairs/ });
     expect(card()).not.toBeInTheDocument();
@@ -152,7 +156,7 @@ describe('the guided start on Today', () => {
 
 describe('the guided start for each role', () => {
   it('points a reviewer at Reviews', async () => {
-    renderApp({ role: 'reviewer', firstVisit: true });
+    renderApp({ catalog: 'nudge_only', role: 'reviewer', firstVisit: true });
     const welcome = await findCard('Ben');
     expect(within(welcome).getByText(copy.tour.reviewer.text)).toBeInTheDocument();
     expect(within(welcome).getByRole('link', { name: copy.tour.reviewer.action })).toHaveAttribute('href', '#/reviews');
@@ -160,7 +164,7 @@ describe('the guided start for each role', () => {
   });
 
   it('gives an admin one extra pointer, to the Team page', async () => {
-    renderApp({ role: 'admin', firstVisit: true });
+    renderApp({ catalog: 'nudge_only', role: 'admin', firstVisit: true });
     const welcome = await findCard('Ada');
     expect(within(welcome).getByRole('link', { name: copy.tour.admin.action })).toHaveAttribute('href', '#/admin/team');
     expect(within(welcome).queryByText(copy.tour.reviewer.text)).not.toBeInTheDocument();
@@ -168,7 +172,7 @@ describe('the guided start for each role', () => {
 
   it('gives an auditor a one-line, read-only welcome with no steps', async () => {
     const user = userEvent.setup();
-    renderApp({ role: 'auditor', firstVisit: true });
+    renderApp({ catalog: 'nudge_only', role: 'auditor', firstVisit: true });
     const line = await screen.findByRole('region', { name: copy.tour.label });
     expect(within(line).getByText(copy.tour.auditor.text)).toBeInTheDocument();
     expect(within(line).queryByRole('list')).not.toBeInTheDocument();
@@ -180,38 +184,38 @@ describe('the guided start for each role', () => {
 
 describe('Nudge around the app', () => {
   it('sits beside each one-time hint, with the same text', async () => {
-    renderApp({ hash: '/d/apr_prd' });
+    renderApp({ catalog: 'nudge_only', hash: '/d/apr_prd' });
     await screen.findByText(copy.hints.sources);
     const hint = document.querySelector('[data-hint="sources"]') as HTMLElement;
     expect(nudges(hint)).toEqual(['nudge']);
   });
 
   it('is calm in an empty state, and the line is the same', async () => {
-    renderApp({ firstVisit: false, emptyBrief: true });
+    renderApp({ catalog: 'nudge_only', firstVisit: false, emptyBrief: true });
     await screen.findByText(copy.nothingWaiting);
     const empty = screen.getByText(copy.nothingWaiting).closest('.empty') as HTMLElement;
     expect(nudges(empty)).toEqual(['calm']);
   });
 
   it('is not on Today twice: the calm one waits while the welcome card is up', async () => {
-    renderApp({ firstVisit: true, emptyBrief: true });
+    renderApp({ catalog: 'nudge_only', firstVisit: true, emptyBrief: true });
     await findCard();
     await screen.findByText(copy.nothingWaiting);
     expect(nudges()).toEqual(['hello']);
   });
 
   it('waves, small, on the sign-in screen, and is not on the signed-out page', async () => {
-    const first = renderApp({ signedIn: false });
+    const first = renderApp({ catalog: 'nudge_only', signedIn: false });
     await screen.findByLabelText(copy.signIn.handleLabel);
     expect(nudges()).toEqual(['hello']);
     first.unmount();
-    renderApp({ signedIn: false, hash: '/signed-out?reason=not_a_member' });
+    renderApp({ catalog: 'nudge_only', signedIn: false, hash: '/signed-out?reason=not_a_member' });
     await screen.findByText(copy.signedOut.reasons.not_a_member!);
     expect(nudges()).toEqual([]);
   });
 
   it('is not shown in error states', async () => {
-    renderApp({ hash: '/d/apr_missing' });
+    renderApp({ catalog: 'nudge_only', hash: '/d/apr_missing' });
     await screen.findByText(copy.errors.notFound);
     expect(nudges()).toEqual([]);
   });
@@ -220,7 +224,7 @@ describe('Nudge around the app', () => {
 describe('Show Nudge', () => {
   it('off removes the character everywhere, and every text stays', async () => {
     const user = userEvent.setup();
-    const { api } = renderApp({ noDrafts: true, emptyBrief: true });
+    const { api } = renderApp({ catalog: 'nudge_only', noDrafts: true, emptyBrief: true });
     await findCard();
     expect(nudges().length).toBeGreaterThan(0);
 
@@ -248,14 +252,14 @@ describe('Show Nudge', () => {
   });
 
   it('off keeps hints, with their text, on the draft page', async () => {
-    renderApp({ hash: '/d/apr_prd', mascot: false });
+    renderApp({ catalog: 'nudge_only', hash: '/d/apr_prd', mascot: false });
     await screen.findByText(copy.hints.sources);
     expect(nudges()).toEqual([]);
   });
 
   it('turns back on from the same menu', async () => {
     const user = userEvent.setup();
-    renderApp({ firstVisit: false, emptyBrief: true, mascot: false });
+    renderApp({ catalog: 'nudge_only', firstVisit: false, emptyBrief: true, mascot: false });
     await screen.findByText(copy.nothingWaiting);
     expect(nudges()).toEqual([]);
     await openMenu(user);
@@ -266,7 +270,7 @@ describe('Show Nudge', () => {
 
   it('is separate from "Hints and nudges": turning Nudge off leaves hints on', async () => {
     const user = userEvent.setup();
-    renderApp({ hash: '/d/apr_prd' });
+    renderApp({ catalog: 'nudge_only', hash: '/d/apr_prd' });
     await screen.findByText(copy.hints.sources);
     await openMenu(user);
     await user.click(screen.getByRole('menuitemcheckbox', { name: new RegExp(copy.menu.mascot) }));
@@ -277,7 +281,7 @@ describe('Show Nudge', () => {
 
   it('off still shows the "Approved!" words, without the picture', async () => {
     const user = userEvent.setup();
-    renderApp({ noDrafts: true, mascot: false });
+    renderApp({ catalog: 'nudge_only', noDrafts: true, mascot: false });
     await user.click(await screen.findByRole('link', { name: /Practice: why PMs should take the stairs/ }));
     await approvePractice(user);
     expect(screen.getByText(copy.tour.cheerTitle)).toBeInTheDocument();

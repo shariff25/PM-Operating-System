@@ -6,6 +6,7 @@ import type {
   AuditPage,
   AuditQuery,
   AuthProvider,
+  Bots,
   Brief,
   Connector,
   Draft,
@@ -172,9 +173,12 @@ export function createRealClient(opts: RealOptions = {}): Api {
     createPractice: () => post<Draft>('/drafts/practice'),
     deleteDraft: (id) => call<void>('DELETE', `/drafts/${seg(id)}`),
 
-    createTask: (text) => post<Task>('/tasks', { text }),
+    createTask: (text, persona) => post<Task>('/tasks', persona === undefined ? { text } : { text, persona }),
     getTask: (id) => call<Task>('GET', `/tasks/${seg(id)}`),
     listTasks: async () => (await call<{ tasks: Task[] }>('GET', '/tasks')).tasks,
+
+    bots: () => call<Bots>('GET', '/bots'),
+    changeTeam: (change) => call<Bots>('PUT', '/me/team', change),
 
     brief: () => call<Brief>('GET', '/brief'),
     dismissFollowup: (id) => post<void>(`/followups/${seg(id)}/dismiss`),
