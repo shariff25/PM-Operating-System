@@ -2,6 +2,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import type { Task } from '../api';
+import { MOCK_CATALOG } from '../api/mockBots';
 import { copy } from '../copy';
 import { renderApp } from '../test/util';
 
@@ -35,11 +36,22 @@ describe('home launchpad', () => {
   it('fills the composer from a suggestion chip', async () => {
     const user = userEvent.setup();
     renderApp();
+    // The chips are the selected bot's examples: Ana last asked Chief.
+    const examples = MOCK_CATALOG.find((b) => b.key === 'chief')!.examples;
+    const chips = await screen.findByRole('list', { name: copy.launch.suggestionsLabel });
+    await waitFor(() => expect(within(chips).getAllByRole('button')).toHaveLength(3));
+    await user.click(await within(chips).findByRole('button', { name: examples[2] }));
+    expect(screen.getByLabelText(copy.home.askLabel)).toHaveValue(examples[2]);
+    expect(screen.getByLabelText(copy.home.askLabel)).toHaveFocus();
+  });
+
+  it('shows the app\'s own suggestions while the catalog can\'t be read', async () => {
+    const user = userEvent.setup();
+    renderApp({ catalog: 'unavailable' });
     const chips = await screen.findByRole('list', { name: copy.launch.suggestionsLabel });
     expect(within(chips).getAllByRole('button')).toHaveLength(3);
     await user.click(within(chips).getByRole('button', { name: copy.launch.suggestions[2] }));
     expect(screen.getByLabelText(copy.home.askLabel)).toHaveValue(copy.launch.suggestions[2]);
-    expect(screen.getByLabelText(copy.home.askLabel)).toHaveFocus();
   });
 
   it('says what needs the PM, then shows the numbers, the decisions and who is waiting', async () => {
@@ -120,7 +132,8 @@ describe('home launchpad', () => {
   });
 
   it('greets a first sign-in that already has drafts with the guided start', async () => {
-    renderApp({ firstVisit: true });
+    // Nothing offered besides Nudge: the three-step start (the four-step one is in Market.test.tsx).
+    renderApp({ firstVisit: true, catalog: 'nudge_only' });
     expect(await screen.findByRole('heading', { name: copy.tour.hello('Ana') })).toBeInTheDocument();
     expect(screen.getByText(copy.tour.lede)).toBeInTheDocument();
   });

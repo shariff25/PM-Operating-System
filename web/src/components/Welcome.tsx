@@ -18,6 +18,14 @@ function focusComposer() {
 
 function StepAction({ step, practiceId }: { step: TourStep; practiceId: string | null }) {
   const words = copy.tour.steps[step];
+  if (step === 'team') {
+    return (
+      <a className="btn btn-sm welcome-action" href="#/start/team">
+        {words.action}
+        <Icon name="chevronRight" size={14} />
+      </a>
+    );
+  }
   if (step === 'ask') {
     return (
       <button type="button" className="btn btn-sm welcome-action" onClick={focusComposer}>
@@ -99,13 +107,13 @@ export function Welcome({ practiceId }: { practiceId: string | null }) {
               </span>
             </p>
             <h2 id="welcome-title">{copy.tour.hello(firstName)}</h2>
-            <p className="welcome-lede">{copy.tour.lede}</p>
+            <p className="welcome-lede">{total === 4 ? copy.tour.ledeFour : copy.tour.lede}</p>
           </div>
           <button type="button" className="btn btn-ghost btn-sm welcome-skip" onClick={skip}>
             {copy.tour.skip}
           </button>
         </div>
-        <ol className="welcome-steps" aria-label={copy.tour.stepsLabel}>
+        <ol className={`welcome-steps ${total === 4 ? 'welcome-steps-4' : ''}`} aria-label={copy.tour.stepsLabel}>
           {state.steps.map((s, i) => {
             const current = s.key === state.current;
             const words = copy.tour.steps[s.key];

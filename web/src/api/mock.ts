@@ -3,6 +3,8 @@ import { MOCK_PERMISSIONS, MOCK_PROFILES, createMockAdmin, roleOfHandle } from '
 import type { MockAdminOptions, MockRole } from './mockAdmin';
 import { createMockPassword } from './mockPassword';
 import type { MockPasswordOptions } from './mockPassword';
+import { ECHO_LINE, createMockTeam } from './mockBots';
+import type { MockBotsOptions } from './mockBots';
 import { createMockPolicy } from './mockPolicy';
 import type { MockPolicyOptions } from './mockPolicy';
 import { createMockReviews } from './mockReviews';
@@ -23,7 +25,7 @@ import type {
   TaskEvent,
 } from './types';
 
-export interface MockOptions extends MockAdminOptions, MockPolicyOptions, MockPasswordOptions, Omit<MockReviewsOptions, 'hostile'> {
+export interface MockOptions extends MockAdminOptions, MockPolicyOptions, MockPasswordOptions, MockBotsOptions, Omit<MockReviewsOptions, 'hostile'> {
   /** Who is signed in: a PM (default), an admin, an auditor or a reviewer. Signing in by handle (ada, audrey, ben) also picks it. */
   role?: MockRole;
   /** Pretend network delay in ms. Tests use 0. */
@@ -129,6 +131,14 @@ const HOSTILE_BODY = `Summary of the call.<style>.confirm{display:none}body{back
 See [the PRD](https://evil.example/login) and [the roadmap](https://example.com/wiki/roadmap).
 `;
 
+// What Echo drafts: customer-facing, so the back end puts the internal-review line first.
+const ECHO_BODY = `## What's new
+Workspace admins can now set a **grace period** of 0, 3, 7 or 14 days for failed payments[[s1]].
+
+## Why it matters
+Customers keep working while a card is updated, instead of losing access the moment a payment fails[[s2]].
+`;
+
 const DECIDED_BODY = `Shipped the invoice export. Next up: the grace period spec.`;
 
 const PRACTICE_BODY = `This is a practice draft. It lives only on this page. Edit it, argue with it, press every button.
@@ -200,7 +210,7 @@ export function createMockClient(options: MockOptions = {}): Api {
     if (!options.keepSettings) return;
     try {
       const { hints_seen, nudges, mascot, first_visit } = me;
-      window.sessionStorage.setItem(keyFor(me.handle), JSON.stringify({ hints_seen, nudges, mascot, first_visit }));
+      window.sessionStorage.setItem(keyFor(me.handle), JSON.stringify({ hints_seen, nudges, mascot, first_visit, bots: team.snapshot() }));
     } catch {
       /* storage may be blocked: the settings then last as long as the page */
     }
@@ -209,7 +219,11 @@ export function createMockClient(options: MockOptions = {}): Api {
     if (!options.keepSettings) return;
     try {
       const raw = window.sessionStorage.getItem(keyFor(me.handle));
-      if (raw) Object.assign(me, JSON.parse(raw) as Partial<Me>);
+      if (raw) {
+        const { bots, ...kept } = JSON.parse(raw) as Partial<Me> & { bots?: Parameters<typeof team.restore>[0] };
+        Object.assign(me, kept);
+        if (bots) team.restore(bots);
+      }
     } catch {
       /* nothing kept */
     }
@@ -364,6 +378,15 @@ export function createMockClient(options: MockOptions = {}): Api {
     });
   }
 
+  // Which bot drafted each sample draft (docs/web-api.md, "Attribution"): null is Nudge.
+  const attribute = (id: string, persona: string | null) => {
+    const d = drafts.get(id);
+    if (d) d.persona = persona;
+  };
+  attribute('apr_jira', 'chief');
+  attribute('apr_slack_old', 'chief');
+  attribute('apr_done', options.withdrawnBot ? 'scout' : 'chief');
+
   if (options.hostile) {
     add({
       id: 'apr_hostile',
@@ -386,6 +409,24 @@ export function createMockClient(options: MockOptions = {}): Api {
 
   const suggestions = new Map<string, { s: Suggestion; at: number; ready: string }>();
   const tasks = new Map<string, MockTask>();
+  const monthStart = () => {
+    const n = new Date();
+    return Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), 1);
+  };
+  const team = createMockTeam(now0, { ...options, firstVisit: options.firstVisit ?? !!options.noDrafts }, {
+    draftsThisMonth: (persona) =>
+      [...drafts.values()].filter((d) => !d.practice && (d.persona ?? null) === persona && Date.parse(d.created_at) >= monthStart()).length,
+    lastUsed: (persona) =>
+      [...tasks.values()]
+        .map((m) => m.task)
+        .filter((t) => (t.persona ?? null) === persona)
+        .map((t) => t.created_at)
+        .sort()
+        .at(-1) ?? null,
+  });
+  /** `Me` as pmos-web answers it: the settings, and the team fields worked out from them. */
+  const view = (): Me => clone({ ...me, ...team.meFields(me) });
+  const withOffered = (t: Task): Task => ({ ...t, persona: t.persona ?? null, persona_offered: team.offered(t.persona) });
   const failedOnce = new Set<string>();
 
   // Earlier requests, so Activity and the home page have a history to show.
@@ -419,6 +460,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       error: 'I could not reach Slack just now, so I stopped before guessing. Try again in a moment.',
     });
     seed('tsk_seed_week', 'What changed in billing this week?', 26 * HOUR, {
+      persona: 'chief',
       result:
         '## Billing this week\n\n- **PAY-212** moved to *Blocked*, waiting on Finance sign-off\n- The grace period spec got two new comments from Legal\n- Support tickets about lock-outs are down 12% on last week\n\nNothing needs you right now, but Finance is the one to watch.',
     });
@@ -469,14 +511,15 @@ export function createMockClient(options: MockOptions = {}): Api {
     const {
       id, kind, title, bot, status, created_at, expires_at, task_id, practice,
     } = d;
-    return { id, kind, title, bot, status, created_at, expires_at, task_id, practice };
+    return { id, kind, title, bot, status, created_at, expires_at, task_id, practice, persona: d.persona ?? null, persona_offered: team.offered(d.persona) };
   };
   const pendingOnly = (d: Draft) => {
     if (d.status !== 'pending') throw new ApiError(409, 'not_pending', 'This draft has already been decided.');
   };
 
-  function makeDraftFromTask(text: string, taskId: string): Draft {
-    const slack = /reply|nudge/i.test(text);
+  function makeDraftFromTask(text: string, taskId: string, persona: string | null): Draft {
+    // Echo writes no Slack messages; its customer-facing text carries the internal-review line.
+    const slack = /reply|nudge/i.test(text) && persona !== 'echo' && persona !== 'sprout';
     const id = nextId('apr');
     const init: DraftInit = slack
       ? {
@@ -515,10 +558,16 @@ export function createMockClient(options: MockOptions = {}): Api {
           result_url: null,
           external: false,
         };
+    init.persona = persona;
+    if (persona === 'echo') {
+      init.title = text.replace(/^(draft|write)( a| the)?/i, '').trim().replace(/^./, (c) => c.toUpperCase()) || 'Launch notes';
+      init.body = `${ECHO_LINE}\n\n${ECHO_BODY}`;
+      init.sources = citedBy(ECHO_BODY, sources());
+    }
     return add(init);
   }
 
-  function startTask(text: string): Task {
+  function startTask(text: string, persona: string | null = null): Task {
     const id = nextId('tsk');
     const t0 = Date.now();
     const wantsDraft = /draft|prd|write|reply|nudge/i.test(text);
@@ -543,6 +592,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       progress: null,
       retrying: false,
       events: [],
+      persona,
     };
     tasks.set(id, {
       task,
@@ -582,7 +632,7 @@ export function createMockClient(options: MockOptions = {}): Api {
         t.status = 'failed';
         t.error = 'I could not reach Jira just now, so I stopped before guessing. Try again in a moment.';
       } else if (m.outcome === 'draft') {
-        const d = makeDraftFromTask(t.text, t.id);
+        const d = makeDraftFromTask(t.text, t.id, t.persona ?? null);
         t.status = 'needs_approval';
         t.draft_ids = [d.id];
         t.result = 'The draft is ready, with the sources I read alongside it.';
@@ -596,7 +646,8 @@ export function createMockClient(options: MockOptions = {}): Api {
 
   const reviews = createMockReviews(now0, drafts, { hostile: options.hostile, reviewError: options.reviewError });
   /** A draft as its owner reads it: with the advice reviewers gave on it. */
-  const out = (d: Draft): Draft => clone({ ...d, recommendations: reviews.recommendationsFor(d) });
+  const out = (d: Draft): Draft =>
+    clone({ ...d, persona: d.persona ?? null, persona_offered: team.offered(d.persona), recommendations: reviews.recommendationsFor(d) });
   /** The reviewer routes: anyone without the reviewer role is refused by pmos-web itself. */
   const needReviewer = () => {
     guard();
@@ -732,7 +783,7 @@ export function createMockClient(options: MockOptions = {}): Api {
     async me() {
       await wait();
       guard();
-      return clone(me);
+      return view();
     },
     async setNudges(nudges) {
       await wait();
@@ -740,7 +791,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       me.nudges = nudges;
       keep();
-      return clone(me);
+      return view();
     },
     async setMascot(mascot) {
       await wait();
@@ -748,7 +799,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       me.mascot = mascot;
       keep();
-      return clone(me);
+      return view();
     },
     async markHintSeen(seen: SeenName) {
       await wait();
@@ -756,7 +807,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       if (!me.hints_seen.includes(seen)) me.hints_seen.push(seen);
       keep();
-      return clone(me);
+      return view();
     },
     async resetHints() {
       await wait();
@@ -764,7 +815,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       me.hints_seen = [];
       keep();
-      return clone(me);
+      return view();
     },
 
     async listDrafts() {
@@ -949,27 +1000,41 @@ export function createMockClient(options: MockOptions = {}): Api {
       drafts.delete(id);
     },
 
-    async createTask(text) {
+    async createTask(text, persona) {
       await wait();
       write();
       guard();
-      return startTask(text);
+      return startTask(text, team.checkAsk(me, persona));
     },
     async getTask(id) {
       await wait();
       guard();
       const m = tasks.get(id);
       if (!m) throw new ApiError(404, 'not_found', 'I could not find that task.');
-      return clone(advance(m));
+      return withOffered(clone(advance(m)));
     },
     async listTasks() {
       await wait();
       guard();
       return [...tasks.values()].map((m) => {
-        const t = clone(advance(m));
+        const t = withOffered(clone(advance(m)));
         delete t.events;
         return t;
       });
+    },
+
+    async bots() {
+      await wait();
+      guard();
+      return team.bots(me);
+    },
+    async changeTeam(change) {
+      await wait();
+      write();
+      guard();
+      const answer = team.change(me, clone(change));
+      keep();
+      return answer;
     },
 
     async brief(): Promise<Brief> {

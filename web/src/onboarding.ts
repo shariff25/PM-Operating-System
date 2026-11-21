@@ -1,5 +1,5 @@
 import { useCallback } from 'react';
-import type { Me, TourMark } from './api';
+import type { Me, SeenName, TourMark } from './api';
 import { useApp } from './app-context';
 
 /**
@@ -13,11 +13,17 @@ import { useApp } from './app-context';
  *   (`tour_opened`), approving, rejecting or changing one (`tour_decided`).
  * - It ends when every step is done, or with "Skip the tour" (`tour_skipped`).
  * - "Hints and nudges" off hides it, as it hides the hints.
+ * - With the bot marketplace it has a fourth step, first: "Pick your team" (`/start/team`). It is
+ *   one of the steps while the server says to show it (`show_team_step`) and, once picked or
+ *   skipped (`team_picked`, `team_skipped`), it stays one, done. Where nothing is offered besides
+ *   Nudge (or an older server), the guided start keeps its three steps.
  */
-export type TourStep = 'ask' | 'open' | 'decide';
+export type TourStep = 'team' | 'ask' | 'open' | 'decide';
+/** The steps done by doing them in the app, each with its own mark. */
+export type DoStep = Exclude<TourStep, 'team'>;
 export type TourVariant = 'pm' | 'reviewer' | 'admin' | 'auditor';
 
-export const STEP_MARK: Record<TourStep, TourMark> = {
+export const STEP_MARK: Record<DoStep, TourMark> = {
   ask: 'tour_asked',
   open: 'tour_opened',
   decide: 'tour_decided',
@@ -37,7 +43,10 @@ export interface TourState {
   skipped: boolean;
 }
 
-const has = (me: Pick<Me, 'hints_seen'>, mark: TourMark) => me.hints_seen.includes(mark);
+const has = (me: Pick<Me, 'hints_seen'>, mark: SeenName) => me.hints_seen.includes(mark);
+
+/** "Pick your team" was picked or skipped: the step is done. */
+export const teamStepDone = (me: Pick<Me, 'hints_seen'>) => has(me, 'team_picked') || has(me, 'team_skipped');
 
 /** Who the welcome is for. An admin who also reviews is shown the admin's pointer. */
 export function tourVariant(me: Pick<Me, 'roles' | 'reviewer' | 'permissions'>): TourVariant {
@@ -52,8 +61,9 @@ export function tourVariant(me: Pick<Me, 'roles' | 'reviewer' | 'permissions'>):
 export function tourState(me: Me): TourState {
   const variant = tourVariant(me);
   const skipped = has(me, 'tour_skipped');
-  const keys: TourStep[] = variant === 'auditor' ? [] : ['ask', 'open', 'decide'];
-  const steps = keys.map((key) => ({ key, done: has(me, STEP_MARK[key]) }));
+  const team = variant !== 'auditor' && (me.show_team_step === true || teamStepDone(me));
+  const keys: TourStep[] = variant === 'auditor' ? [] : [...(team ? (['team'] as const) : []), 'ask', 'open', 'decide'];
+  const steps = keys.map((key) => ({ key, done: key === 'team' ? teamStepDone(me) : has(me, STEP_MARK[key]) }));
   const done = steps.filter((s) => s.done).length;
   const started = !skipped && (me.first_visit || has(me, 'tour_started') || steps.some((s) => s.done));
   const finished = steps.length > 0 && done === steps.length;
@@ -101,6 +111,6 @@ export function useTour() {
     },
     [api, me, setMe],
   );
-  const step = useCallback((s: TourStep) => mark(STEP_MARK[s]), [mark]);
+  const step = useCallback((s: DoStep) => mark(STEP_MARK[s]), [mark]);
   return { state: tourState(me), mark, step };
 }

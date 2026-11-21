@@ -42,6 +42,10 @@ const PAIRS: [string, string][] = [
   ['sys-ink', 'sys-bg'], ['slack-ink', 'slack-bg'], ['accent-text', 'accent-soft'], ['accent-text', 'surface'],
   ['ink-2', 'surface'], ['muted', 'surface-3'], ['ink', 'surface-3'], ['muted', 'warn-bg'], ['primary-ink', 'primary-hover'],
   ['accent-ink', 'accent-hover'], ['warn-ink', 'surface-2'],
+  // The bot marketplace: each bot's role line on a card, on the page, and on the picked card's tint.
+  ['bot-nudge-ink', 'surface'], ['bot-chief-ink', 'surface'], ['bot-sprout-ink', 'surface'], ['bot-echo-ink', 'surface'],
+  ['bot-nudge-ink', 'surface-2'], ['bot-chief-ink', 'surface-2'], ['bot-sprout-ink', 'surface-2'], ['bot-echo-ink', 'surface-2'],
+  ['bot-nudge-ink', 'bg'], ['bot-chief-ink', 'bg'], ['bot-sprout-ink', 'bg'], ['bot-echo-ink', 'bg'],
 ];
 
 describe('dark tokens', () => {

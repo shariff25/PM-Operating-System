@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { ApiError } from '../api';
 import type { Draft, Task } from '../api';
 import { messageOf, useApp } from '../app-context';
+import { identify } from '../bots';
+import { BotFace } from '../components/BotParts';
 import { Avatar, Empty, ErrorNote, Markdown, Skeleton, StrippedNote, SystemTag, kindSystem } from '../components/bits';
 import { Icon, Mark, kindIcon } from '../components/icons';
 import { PageBar } from '../components/Shell';
@@ -66,7 +68,7 @@ function DraftCard({ id }: { id: string }) {
  */
 export function Thread({ id }: { id: string }) {
   const { api, me, pollMs } = useApp();
-  const { upsertTask, reloadDrafts } = useData();
+  const { upsertTask, reloadDrafts, bots } = useData();
   const { start, asking, error: retryError } = useAsk();
   const [task, setTask] = useState<Task | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -140,6 +142,7 @@ export function Thread({ id }: { id: string }) {
   const liveLine = working ? (latest?.text ?? copy.task.status[task.status]) : copy.task.status[task.status];
   const progress = working ? usableProgress(task) : null;
   const nothingToShow = settled && !task.result && !task.error && task.draft_ids.length === 0 && task.status !== 'failed';
+  const who = task.persona !== undefined ? identify(task.persona, task.persona_offered, bots?.bots) : null;
 
   return (
     <>
@@ -159,10 +162,11 @@ export function Thread({ id }: { id: string }) {
           <div className="msg-bubble">{task.text}</div>
         </article>
 
-        <article className="msg msg-bot" aria-label={copy.activity.bot}>
+        <article className="msg msg-bot" aria-label={who ? who.name : copy.activity.bot}>
           <div className="msg-head">
-            <Mark size={24} />
-            <span className="msg-who">{copy.activity.bot}</span>
+            {/* Which bot answered: from `persona` when the server says (an older one doesn't: PM OS). */}
+            {who ? <BotFace mascot={who.mascot} size={24} /> : <Mark size={24} />}
+            <span className="msg-who">{who ? who.name : copy.activity.bot}</span>
             <span className="msg-time">{relTime(task.updated_at)}</span>
           </div>
           <div className="msg-body">
@@ -229,7 +233,7 @@ export function Thread({ id }: { id: string }) {
                     type="button"
                     className="btn btn-sm"
                     disabled={asking}
-                    onClick={() => void start(() => api.createTask(task.text), copy.errors.askFailed)}
+                    onClick={() => void start(() => api.createTask(task.text, task.persona ?? undefined), copy.errors.askFailed)}
                   >
                     {copy.task.tryAgain}
                   </button>
@@ -241,7 +245,7 @@ export function Thread({ id }: { id: string }) {
               <Empty
                 icon="sparkle"
                 action={
-                  <button type="button" className="btn btn-sm" disabled={asking} onClick={() => void start(() => api.createTask(task.text), copy.errors.askFailed)}>
+                  <button type="button" className="btn btn-sm" disabled={asking} onClick={() => void start(() => api.createTask(task.text, task.persona ?? undefined), copy.errors.askFailed)}>
                     {copy.task.tryAgain}
                   </button>
                 }

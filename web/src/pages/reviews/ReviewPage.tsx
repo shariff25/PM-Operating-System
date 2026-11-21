@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ApiError } from '../../api';
 import type { MyRecommendation, ReviewDraft, Verdict } from '../../api';
 import { useApp } from '../../app-context';
+import { BotBy, DraftedBy } from '../../components/BotParts';
 import { ErrorNote, Markdown, Skeleton, StrippedNote, SystemTag, TargetLink, kindSystem } from '../../components/bits';
 import { Icon } from '../../components/icons';
 import { PageBar } from '../../components/Shell';
@@ -158,6 +159,8 @@ export function ReviewPage({ id }: { id: string }) {
                 <dd>{owner}</dd>
                 <dt>{copy.reviews.details.kind}</dt>
                 <dd>{copy.home.kindLabel(review.kind)}</dd>
+                <dt>{copy.reviews.details.bot}</dt>
+                <dd><BotBy persona={review.persona} offered={review.persona_offered} /></dd>
                 <dt>{copy.reviews.details.created}</dt>
                 <dd>{longTime(review.created_at)} <span className="muted">· {relTime(review.created_at)}</span></dd>
                 <dt>{copy.reviews.details.expires}</dt>
@@ -323,7 +326,8 @@ export function ReviewPage({ id }: { id: string }) {
               {left && <span className="doc-left"><Icon name="clock" size={14} />{left}</span>}
               {review.edited && <span className="doc-edited">{copy.reviews.editedByOwner}</span>}
             </div>
-            <h1 className="doc-title">{review.title || copy.home.kindLabel(review.kind)}</h1>
+            <h1 className="doc-title doc-title-by">{review.title || copy.home.kindLabel(review.kind)}</h1>
+            <DraftedBy persona={review.persona} offered={review.persona_offered} />
             <Markdown rendered={rendered} className="prose" onCite={toSource} highlight={selected} />
             <StrippedNote parts={rendered.stripped} what={copy.stripped.draft} />
           </article>

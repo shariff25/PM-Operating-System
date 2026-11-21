@@ -184,6 +184,7 @@ describe('phone layout', () => {
       copy.nav.drafts,
       copy.nav.followups,
       copy.nav.activity,
+      copy.nav.bots,
     ]);
     expect(document.querySelector('.rail')).toBeNull();
     await user.click(within(bar).getByRole('link', { name: new RegExp(`^${copy.nav.drafts}`) }));

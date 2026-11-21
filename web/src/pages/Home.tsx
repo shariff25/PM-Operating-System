@@ -14,6 +14,12 @@ import { usableProgress } from '../tasks';
 import { relTime, timeLeft } from '../time';
 import { draftHref, taskHref } from '../url';
 import { TaskTable } from './Activity';
+import { ApiError } from '../api';
+import { cardOf, defaultPersona, identify, isUnknownOutcome, teamErrorText, teamOf } from '../bots';
+import { BotBy } from '../components/BotParts';
+import { BotPicker, pickerBot } from '../components/BotPicker';
+import type { PickerBot } from '../components/BotPicker';
+import { TeamNote } from '../components/TeamNote';
 
 // The guided start is for new people only, so its card is a small chunk of its own.
 const Welcome = lazy(() => import('../components/Welcome').then((m) => ({ default: m.Welcome })));
@@ -22,17 +28,73 @@ function dateLine(d: Date): string {
   return d.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' });
 }
 
-/** The composer: multi-line, grows with the text, Enter sends and Shift+Enter adds a line. */
+/**
+ * The composer: multi-line, grows with the text, Enter sends and Shift+Enter adds a line. With
+ * more than Nudge on the team, a bot picker sits before the box (defaulting to the bot asked last,
+ * `ask_persona`), the ask names that bot, and the example chips are its examples.
+ */
 function Composer() {
-  const { api } = useApp();
-  const { start, asking, error } = useAsk();
+  const { api, me, refreshMe } = useApp();
+  const { bots, setBots, reloadBots } = useData();
+  const { start, asking, error, setError } = useAsk();
   const [text, setText] = useState('');
+  const [persona, setPersona] = useState(() => defaultPersona(me));
+  const [adding, setAdding] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const box = useRef<HTMLTextAreaElement>(null);
+
+  const team = teamOf(me);
+  // A bot that left the team (removed elsewhere, or withdrawn) falls back to Nudge.
+  const chosen = team.includes(persona) ? persona : 'nudge';
+  const picker = team.length > 1;
+  const teamBots: PickerBot[] = team.map((k) => {
+    const card = cardOf(bots, k);
+    if (card) return pickerBot(card);
+    const who = identify(k === 'nudge' ? null : k, true, bots?.bots);
+    return { key: k, name: who.name, mascot: who.mascot, title: '', summary: '', preview: false };
+  });
+  const others = (bots?.bots ?? []).filter((b) => !team.includes(b.key) && !b.always_on).map(pickerBot);
+  const examples = cardOf(bots, chosen)?.examples ?? [];
+  const chips = examples.length > 0 ? examples : copy.launch.suggestions;
 
   const send = () => {
     const q = text.trim();
     if (!q || asking) return;
-    void start(() => api.createTask(q), copy.errors.askFailed).then((ok) => ok && setText(''));
+    setNotice(null);
+    void start(
+      () => (picker ? api.createTask(q, chosen) : api.createTask(q)),
+      copy.errors.askFailed,
+      (e) => {
+        // The bot left the team, or is no longer offered: read the team again, so the picker falls back to Nudge.
+        if (e instanceof ApiError && (e.code === 'bot_not_on_team' || e.code === 'bot_unavailable')) {
+          void refreshMe();
+          void reloadBots();
+        }
+      },
+    ).then((ok) => ok && setText(''));
+  };
+
+  const addBot = async (key: string): Promise<boolean> => {
+    setAdding(key);
+    setError(null);
+    setNotice(null);
+    try {
+      setBots(await api.changeTeam({ add: [key], via: 'picker' }));
+      await refreshMe();
+      setPersona(key);
+      const name = cardOf(bots, key)?.display_name;
+      if (name) setNotice(copy.bots.picker.added(name));
+      return true;
+    } catch (e) {
+      setError(teamErrorText(e));
+      if (isUnknownOutcome(e)) {
+        void refreshMe();
+        void reloadBots();
+      }
+      return false;
+    } finally {
+      setAdding(null);
+    }
   };
 
   const onSubmit = (e: FormEvent) => {
@@ -57,6 +119,20 @@ function Composer() {
       <form onSubmit={onSubmit} className="composer-form">
         <label htmlFor="ask-box" className="micro-label">{copy.home.askLabel}</label>
         <div className="composer-row">
+          {picker && (
+            <BotPicker
+              team={teamBots}
+              others={others}
+              value={chosen}
+              onChange={(k) => {
+                setPersona(k);
+                setNotice(null);
+              }}
+              onAdd={addBot}
+              adding={adding}
+              disabled={asking}
+            />
+          )}
           <textarea
             id="ask-box"
             ref={box}
@@ -75,15 +151,18 @@ function Composer() {
         </div>
         <p id="ask-help" className="sr-only">{copy.launch.newLine}</p>
       </form>
+      {/* A chip fills the box and never sends: content can't send an ask on the PM's behalf. */}
       <ul className="chips" aria-label={copy.launch.suggestionsLabel}>
-        {copy.launch.suggestions.map((s) => (
-          <li key={s}>
+        {chips.map((s, i) => (
+          <li key={`${i}-${s}`}>
             <button type="button" className="chip" onClick={() => pick(s)}>
               {s}
             </button>
           </li>
         ))}
       </ul>
+      {notice && <p className="composer-notice" role="status">{notice}</p>}
+      {me.team_unavailable && <p className="composer-notice muted">{copy.bots.picker.unavailableNote}</p>}
       <div className="composer-foot">
         <span className="composer-reads">{copy.today.readsFrom}</span>
         <ul className="composer-systems" aria-label={copy.today.readsFrom}>
@@ -212,6 +291,7 @@ function DecideRow({ d, now }: { d: DraftSummary; now: number }) {
           <span className="row-meta">{whereText}</span>
         </span>
         {d.practice && <span className="tag">{copy.home.practiceBadge}</span>}
+        <BotBy persona={d.persona} offered={d.persona_offered} className="row-bot" />
         <span className={`row-when ${left ? 'row-when-warn' : ''}`}>
           {left ? <><Icon name="clock" size={13} />{left}</> : relTime(d.created_at, now)}
         </span>
@@ -273,12 +353,21 @@ function Card({ id, className, children }: { id: string; className?: string; chi
 }
 
 export function Home() {
-  const { api, me, openPalette } = useApp();
-  const { drafts, draftsError, reloadDrafts, brief, briefState, tasks, reloadTasks } = useData();
+  const { api, me, openPalette, navigate } = useApp();
+  const { drafts, draftsError, reloadDrafts, brief, briefState, tasks, reloadTasks, takeTeamStep } = useData();
   const { start, asking, error: followError } = useAsk();
   const [practiceError, setPracticeError] = useState<string | null>(null);
   const practiceStarted = useRef(false);
   const tour = tourState(me);
+
+  // "Pick your team" comes first in the guided start: Today sends the person there once. Coming
+  // back to Today without picking is never blocked; the welcome card points at the step instead.
+  const toTeamStep = me.show_team_step === true && tour.active;
+  useEffect(() => {
+    if (toTeamStep && takeTeamStep()) navigate('/start/team');
+    // navigate only writes to location.hash
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toTeamStep, takeTeamStep]);
 
   useEffect(() => {
     void reloadDrafts();
@@ -340,6 +429,8 @@ export function Home() {
           <Welcome practiceId={practice?.id ?? null} />
         </Suspense>
       )}
+
+      {me.show_team_note === true && !tour.active && <TeamNote />}
 
       <Composer />
 
