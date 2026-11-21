@@ -1,0 +1,32 @@
+# The sample size comes from the stats.sample_size tool, never from the model's arithmetic.
+# Inputs: proportion, baseline 0.04, absolute MDE 0.005 (half a point), the defaults (alpha 0.05,
+# power 0.8, two-sided, two arms). From the spec's formula (docs/pm-craft-spec.md section 5),
+# unpooled: n = (1.959964 + 0.841621)^2 * (0.04 * 0.96 + 0.045 * 0.955) / 0.005^2
+#   = 7.848879 * 0.081375 / 0.000025 = 25,548.1, rounded up: 25,549 per arm.
+# Matching drops thousands separators. Rubric: the draft carries the tool's number under
+# "Sample size and duration", one primary metric, a decision rule written before launch; one
+# draft in space PM; the answer says what is waiting for approval.
+id: experiment-paywall
+ask: "Draft anyway, no questions: an experiment plan in the PM space for a new paywall. The baseline conversion rate is 4%, and we want to detect an absolute lift of half a percentage point (0.5 points), with the default significance level and power, in two arms."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include:
+        - "Experiment:"
+        - "Hypothesis"
+        - "Primary metric"
+        - "Guardrail metrics"
+        - "Sample size and duration"
+        - "Decision rule"
+        - "25549"
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: experiment-design
+tags:
+  - model/draft-content
