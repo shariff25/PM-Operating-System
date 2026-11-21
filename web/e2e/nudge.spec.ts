@@ -2,7 +2,9 @@ import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
 
 // Nudge and the guided start. The sample-data client keeps each person's settings in
-// sessionStorage, as the server keeps them, so a reload keeps them too.
+// sessionStorage, as the server keeps them, so a reload keeps them too. These walk the three-step
+// start, where nothing is offered besides Nudge (`mock_bots=nudge_only`); the four-step start with
+// "Pick your team" is in market.spec.ts.
 
 const EMPTY = 'http://127.0.0.1:5192';
 const WELCOME = "Hi Ana, I'm Nudge.";
@@ -18,7 +20,7 @@ const today = (page: Page) => page.getByRole('navigation', { name: 'Main' }).get
 const nudges = (page: Page) => page.locator('svg[data-nudge]');
 
 test('a new PM is guided through the three steps, and sees "Approved!" once', async ({ page }) => {
-  await signIn(page, '?mock_new=1');
+  await signIn(page, '?mock_new=1&mock_bots=nudge_only');
   await expect(card(page)).toBeVisible();
   await expect(card(page).locator('svg[data-nudge="hello"]')).toBeVisible();
   await expect(card(page).getByText('Getting started: 0 of 3 done')).toBeAttached();
@@ -65,7 +67,7 @@ test('a new PM is guided through the three steps, and sees "Approved!" once', as
 });
 
 test('"Skip the tour" ends it, it stays ended after a reload, and "Show hints again" restarts it', async ({ page }) => {
-  await signIn(page, '?mock_new=1');
+  await signIn(page, '?mock_new=1&mock_bots=nudge_only');
   await card(page).getByRole('button', { name: 'Skip the tour' }).click();
   await expect(card(page)).toHaveCount(0);
   await page.reload();
@@ -80,7 +82,7 @@ test('"Skip the tour" ends it, it stays ended after a reload, and "Show hints ag
 });
 
 test('hiding Nudge removes the character on every page and keeps every text; it comes back when turned on', async ({ page }) => {
-  await signIn(page, '?mock_new=1');
+  await signIn(page, '?mock_new=1&mock_bots=nudge_only');
   await expect(nudges(page).first()).toBeVisible();
   await page.getByRole('button', { name: /Menu for/ }).click();
   await page.getByRole('menuitemcheckbox', { name: /Show Nudge/ }).click();

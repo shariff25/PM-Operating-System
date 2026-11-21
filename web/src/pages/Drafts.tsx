@@ -3,6 +3,7 @@ import type { KeyboardEvent } from 'react';
 import type { DraftStatus, DraftSummary } from '../api';
 import { useApp } from '../app-context';
 import { DraftPill, Empty, ErrorNote, NewRequestButton, PageHeader, Skeleton, SystemTag, kindSystem } from '../components/bits';
+import { BotBy } from '../components/BotParts';
 import { Icon } from '../components/icons';
 import { copy } from '../copy';
 import { useData } from '../data';
@@ -43,6 +44,7 @@ function DraftRow({ d, now }: { d: DraftSummary; now: number }) {
             <span className="row-meta">{whereText}</span>
           </span>
           {d.practice && <span className="tag">{copy.home.practiceBadge}</span>}
+          <BotBy persona={d.persona} offered={d.persona_offered} className="row-bot" />
         </span>
         <span className="tcell tcell-status"><DraftPill status={status} /></span>
         <span className="tcell tcell-left">

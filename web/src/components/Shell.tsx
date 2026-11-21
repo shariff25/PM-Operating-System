@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { ADMIN_SECTIONS, canAdminister, canSee, sectionHref } from '../admin/access';
 import { useApp } from '../app-context';
+import { canAsk } from '../bots';
 import { copy } from '../copy';
 import { useData } from '../data';
 import { PHONE_QUERY, useMediaQuery } from '../theme';
@@ -12,7 +13,7 @@ import type { IconName } from './icons';
 import { ResetNotice } from './ResetNotice';
 import { UserMenu } from './UserMenu';
 
-type NavKey = 'home' | 'drafts' | 'reviews' | 'followups' | 'activity' | 'admin' | 'security';
+type NavKey = 'home' | 'drafts' | 'reviews' | 'followups' | 'activity' | 'bots' | 'admin' | 'security';
 
 interface Slots {
   /** Where a page puts its title in the phone top bar. Null on desktop, where pages carry their own header. */
@@ -57,6 +58,8 @@ export function navKey(route: Route): NavKey {
     case 'activity':
     case 'task':
       return 'activity';
+    case 'bots':
+      return 'bots';
     case 'admin':
       return 'admin';
     case 'security':
@@ -138,6 +141,8 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
         }]
       : []),
     { key: 'activity', href: '#/activity', label: copy.nav.activity, icon: 'activity', count: runningCount, countLabel: copy.nav.activityCount },
+    // The person's own team: for anyone who may ask (never an Auditor-only person).
+    ...(canAsk(me) ? [{ key: 'bots' as const, href: '#/bots', label: copy.nav.bots, icon: 'mascot' as const, count: 0, countLabel: () => '' }] : []),
     ...(canAdminister(me)
       ? [{ key: 'admin' as const, href: '#/admin', label: copy.nav.admin, icon: 'shield' as const, count: 0, countLabel: () => '' }]
       : []),
@@ -145,7 +150,7 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
 
   const detail = route.name === 'draft' || route.name === 'task' || route.name === 'review';
   const shortcut = isMac() ? copy.nav.shortcutMac : copy.nav.shortcutOther;
-  const pageTitle = { home: copy.nav.home, drafts: copy.nav.drafts, reviews: copy.nav.reviews, followups: copy.nav.followups, activity: copy.nav.activity, admin: copy.nav.admin, security: copy.password.security.title }[current];
+  const pageTitle = { home: copy.nav.home, drafts: copy.nav.drafts, reviews: copy.nav.reviews, followups: copy.nav.followups, activity: copy.nav.activity, bots: copy.nav.bots, admin: copy.nav.admin, security: copy.password.security.title }[current];
 
   /** The second level under Admin: its parts, for the ones this person may open. */
   const adminSub = () => {

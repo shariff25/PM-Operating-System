@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { ApiError } from '../../api';
 import type { ReviewSummary } from '../../api';
 import { Avatar, Empty, ErrorNote, PageHeader, Skeleton, SystemTag, kindSystem } from '../../components/bits';
+import { BotBy } from '../../components/BotParts';
 import { Icon } from '../../components/icons';
 import { copy } from '../../copy';
 import { useData } from '../../data';
@@ -37,7 +38,9 @@ function ReviewRow({ r, now }: { r: ReviewSummary; now: number }) {
             ) : (
               <span className="row-title">{r.title || copy.home.kindLabel(r.kind)}</span>
             )}
-            <span className="row-meta">
+            <span className="row-meta row-meta-bot">
+              <BotBy persona={r.persona} offered={r.persona_offered} size={16} className="row-bot-inline" />
+              <span aria-hidden="true"> · </span>
               {restricted ? copy.reviews.restrictedRow : meta}
               {left && (
                 <span className="row-when-warn">

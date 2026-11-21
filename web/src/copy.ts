@@ -81,6 +81,12 @@ const APPROVE_WORDS: Record<DraftKind, ApproveWords> = {
 
 export const approveWords = (kind: DraftKind): ApproveWords => APPROVE_WORDS[kind];
 
+/** "Chief, Sprout and Echo". */
+function listOf(items: readonly string[]): string {
+  if (items.length <= 1) return items.join('');
+  return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
 export const copy = {
   appName: 'PM OS',
 
@@ -130,6 +136,8 @@ export const copy = {
     label: 'Getting started',
     hello: (name: string) => `Hi ${name}, I'm Nudge.`,
     lede: "I read Jira, Confluence and Slack so you don't have to, and I draft the dull parts. Three small things and you'll know your way around.",
+    /** With "Pick your team" as the first step. */
+    ledeFour: "I read Jira, Confluence and Slack so you don't have to, and I draft the dull parts. Four small things and you'll know your way around.",
     progress: (done: number, total: number) => `${done} of ${total}`,
     progressLabel: (done: number, total: number) => `Getting started: ${done} of ${total} done`,
     skip: 'Skip the tour',
@@ -137,6 +145,11 @@ export const copy = {
     stepDone: 'Done: ',
     stepNext: 'Next: ',
     steps: {
+      team: {
+        title: 'Pick your team',
+        detail: 'Bring in a specialist or two. I stay on your team either way.',
+        action: 'Pick your team',
+      },
       ask: {
         title: 'Ask me for something',
         detail: 'Use the box below, the way you would ask a colleague. "Summarize my week" works.',
@@ -704,6 +717,7 @@ export const copy = {
     draftsCount: (n: number) => `${n} ${n === 1 ? 'draft needs' : 'drafts need'} a decision`,
     followupsCount: (n: number) => `${n} waiting on you`,
     activityCount: (n: number) => `${n} still working`,
+    bots: 'Bots',
     reviews: 'Reviews',
     reviewsCount: (n: number) => `${n} ${n === 1 ? 'draft waits' : 'drafts wait'} for your advice`,
     collapse: 'Collapse sidebar',
@@ -761,6 +775,7 @@ export const copy = {
     minutes: (n: number) => `${n} min ago`,
     hours: (n: number) => `${n} h ago`,
     yesterday: 'yesterday',
+    today: 'today',
     days: (n: number) => `${n} days ago`,
     left: (hours: number, minutes: number) => (hours >= 1 ? `${hours} h left` : `${minutes} min left`),
   },
@@ -901,6 +916,7 @@ export const copy = {
       heading: 'Details',
       owner: 'From',
       kind: 'Kind',
+      bot: 'Drafted by',
       target: 'Goes to',
       created: 'Created',
       expires: 'Expires',
@@ -1004,6 +1020,196 @@ export const copy = {
     notFound: 'I could not find that request.',
     threadLabel: 'Conversation',
     columns: { request: 'Request', status: 'Status', created: 'Asked' },
+  },
+
+  // ---- The bot marketplace: Pick your team, the Bots page, the picker and attribution ----
+  // Bot names, titles, summaries and examples come from the catalog (content); only the app's own
+  // words are here.
+  bots: {
+    nudgeName: 'Nudge',
+    /** A draft or task by a bot that was withdrawn, or that the catalog doesn't list. */
+    gone: 'A bot no longer offered',
+    /** A bot the app can't name right now (the catalog can't be read). */
+    unchecked: 'Another bot',
+    draftedBy: (name: string) => `Drafted by ${name}`,
+    /** A control's words with the bot's name before them, for screen readers: "Chief: Added". */
+    named: (name: string, words: string) => `${name}: ${words}`,
+    byLabel: (name: string) => `By ${name}`,
+    preview: 'Preview',
+    previewNote: 'Not yet benchmarked',
+    needs: (label: string) => `Needs ${label}`,
+    alwaysOn: 'Always on',
+    alwaysOnTeam: 'Always on your team',
+    reads: {
+      jira: 'Jira',
+      confluence: 'Confluence',
+      slack: 'Slack',
+      docs: 'Docs',
+    } as Record<string, string>,
+    /** "What it can do": skill keys, labelled from this fixed map. A key missing here is shown as the key. */
+    skills: {
+      ask: 'Answers',
+      prd: 'PRDs',
+      strategy: 'Strategy',
+      critique: 'Critique',
+      'daily-brief': 'Daily brief',
+      'meeting-prep': 'Meeting prep',
+      'week-review': 'Week review',
+      'meeting-notes': 'Meeting notes',
+      'status-update': 'Weekly update',
+      'exec-brief': 'Exec brief',
+      'decision-doc': 'Decision doc',
+      'okr-draft': 'OKR draft',
+      'slack-reply': 'Slack replies',
+      'jira-draft': 'Jira issues',
+      'problem-framing': 'Problem framing',
+      'metrics-tree': 'Metrics tree',
+      'funnel-diagnosis': 'Funnel diagnosis',
+      'experiment-design': 'Experiment design',
+      'experiment-readout': 'Experiment readout',
+      'experiment-backlog': 'Experiment backlog',
+      'opportunity-sizing': 'Opportunity sizing',
+      'pricing-proposal': 'Pricing proposal',
+      'release-notes': 'Release notes',
+      'launch-checklist': 'Launch checklist',
+      'positioning-brief': 'Positioning brief',
+      battlecard: 'Battlecard',
+      'competitive-brief': 'Competitive brief',
+      'call-synth': 'Call synthesis',
+      'partner-brief': 'Partner brief',
+      'advisory-draft': 'Advisory draft',
+      'poc-plan': 'POC plan',
+    } as Record<string, string>,
+    /** "6 drafts this month · last used today". */
+    draftsThisMonth: (n: number) => `${n} ${n === 1 ? 'draft' : 'drafts'} this month`,
+    lastUsed: (when: string) => `last used ${when}`,
+    onTeamSince: (when: string) => `On your team since ${when}`,
+
+    // "Pick your team", the first step of the guided start
+    pick: {
+      eyebrow: 'Getting started',
+      step: (n: number, total: number) => `Step ${n} of ${total}`,
+      title: 'Pick your team',
+      lede: 'Each bot is good at one kind of product work. Choose the ones you want. You can change this any time.',
+      skip: 'Skip for now',
+      loading: 'Loading the bots…',
+      cardsLabel: 'Bots you can add',
+      readsLabel: 'Reads',
+      examplesLabel: (name: string) => `Things to ask ${name}`,
+      add: 'Add to my team',
+      added: 'Added',
+      onTeam: 'On your team',
+      footHead: (n: number) => `${n} on your team:`,
+      footNames: (names: string[]) => `${listOf(names)}.`,
+      footSafe: 'Each one drafts; nothing is sent anywhere until you approve it.',
+      continue: (n: number) => (n === 1 ? 'Continue with Nudge' : `Continue with ${n} bots`),
+      saving: 'Saving your team…',
+      failed: "I couldn't save your team, so nothing changed. Try again, or skip for now and pick later in Bots.",
+      loadFailed: "I couldn't load the bots just now. Skip for now and pick them later in Bots.",
+    },
+
+    // The one-time note on Today for people who were here before the marketplace
+    note: {
+      label: 'New bots',
+      title: 'New: you can add bots to your team',
+      text: (names: string[]) =>
+        names.length > 0
+          ? `${listOf(names)} each take one kind of product work off your plate. I stay on your team either way.`
+          : 'Specialist bots each take one kind of product work off your plate. I stay on your team either way.',
+      action: 'Pick your team',
+      dismiss: 'Not now',
+    },
+
+    // The Bots page
+    page: {
+      eyebrow: 'Your team',
+      title: 'Bots',
+      lede: 'The bots that work for you. Add one when you need it; remove one and its drafts stay yours.',
+      loading: 'Loading your team…',
+      loadFailed: "I couldn't load your team just now. Nothing changed.",
+      teamUnavailable: "I can't show your team right now, so you're asking Nudge for everything. Try again in a minute.",
+      onTeam: 'On your team',
+      available: 'Available',
+      noneAvailable: 'Nothing else is on offer right now. When an admin offers a new bot, it shows up here.',
+      withdrawnHeading: 'No longer offered',
+      withdrawnLine: 'An admin stopped offering this bot. Its drafts stay yours.',
+      newLabel: 'New',
+      details: (name: string) => `Details for ${name}`,
+      add: 'Add',
+      addLabel: (name: string) => `Add ${name} to your team`,
+      remove: 'Remove',
+      removeLabel: (name: string) => `Remove ${name} from your team`,
+      removeGoneLabel: 'Remove the bot no longer offered from your team',
+      settings: 'Settings',
+      settingsLabel: (name: string) => `Settings for ${name}`,
+      detailLabel: 'Bot details',
+      canDo: 'What it can do',
+      mayRead: 'What it may read',
+      mayDraft: 'What it may draft',
+      draftsSentence: (labels: string[]) =>
+        labels.length > 0 ? `${listOf(labels)}. Every one waits for your approval. It never sends on its own.` : 'Nothing. It answers in words only.',
+      examples: 'Try asking',
+      added: (name: string) => `${name} is on your team.`,
+      removed: (name: string) => `${name} is off your team. Its drafts stay yours.`,
+      reload: 'Reload the page',
+    },
+
+    // Removing a bot
+    remove: {
+      title: (name: string) => `Remove ${name} from your team?`,
+      intro: "Its drafts stay yours and you can still decide them. Anything it's already working on finishes.",
+      routinesHeading: (name: string, n: number | null) =>
+        n === null
+          ? `${name} may run routines for you. What should happen to them?`
+          : `${name} runs ${n === 1 ? '1 routine' : `${n} routines`} for you. What should happen to ${n === 1 ? 'it' : 'them'}?`,
+      toNudge: 'Move them to Nudge',
+      toNudgeHint: 'They keep running, as Nudge.',
+      pause: 'Pause them',
+      pauseHint: 'They stop until you add the bot back and turn them on again.',
+      confirm: 'Remove',
+      removing: 'Removing…',
+    },
+
+    // A bot's settings: its routines, read only in this version
+    settings: {
+      title: (name: string) => `${name} settings`,
+      intro: 'Routines are asks that run on a schedule. You set them up in Slack.',
+      routines: 'Routines',
+      none: (name: string) => `Nothing runs as ${name} on a schedule.`,
+      unknown: "I couldn't read your routines just now.",
+      paused: 'Paused',
+      next: (when: string) => `Next: ${when}`,
+      close: 'Close',
+    },
+
+    // The picker in the ask box
+    picker: {
+      button: (name: string) => `Asking ${name}. Choose a bot`,
+      listLabel: 'Ask',
+      notOnTeam: 'Not on your team',
+      notOnTeamShort: 'not on your team',
+      add: 'Add',
+      addLabel: (name: string) => `Add ${name} to your team and ask it`,
+      manage: 'Manage your team in Bots',
+      nudgeLine: 'anything',
+      added: (name: string) => `${name} is on your team. You're asking ${name}.`,
+      unavailableNote: "I can't show your team right now, so this goes to Nudge.",
+      fellBack: 'I switched you back to Nudge.',
+    },
+
+    errors: {
+      fallback: "I couldn't change your team. Nothing changed.",
+      /** Team-specific wording where the general sentence is about drafts or proposals. */
+      codes: {
+        rate_limited: "You've changed your team a lot this hour, so I'm pausing. Nothing changed. Try again a little later.",
+        unknown_outcome: "I can't tell whether your team changed. Reload the page to see it as it is before you try again.",
+        upstream_unavailable: "I couldn't reach the service that keeps your team or your routines. Nothing changed on your team. Try again in a minute.",
+        assertion_required: "This PM OS isn't set up to sign team changes, so I didn't make one. Nothing changed. Tell a platform owner.",
+        unavailable: "The service that keeps your team isn't answering. Nothing changed. Try again in a minute.",
+        bot_unavailable: "That bot isn't offered any more, so I couldn't add it. Nothing changed.",
+        not_allowed: "Your role doesn't include asking bots, so you don't have a team. Nothing changed.",
+      } as Record<string, string>,
+    },
   },
 
   // ---- Draft workspace panel ----

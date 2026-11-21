@@ -373,7 +373,7 @@ for (const theme of ['light', 'dark'] as const) {
     });
 
     test('Nudge: the welcome card, a hint, a calm empty state, the finish and the Show Nudge control', async ({ page }) => {
-      await signIn(page, theme, undefined, 'ana', '?mock_new=1');
+      await signIn(page, theme, undefined, 'ana', '?mock_new=1&mock_bots=nudge_only');
       const welcome = page.getByRole('region', { name: "Hi Ana, I'm Nudge." });
       await expect(welcome).toBeVisible();
       await expect(welcome.locator('svg[data-nudge="hello"]')).toBeVisible();
