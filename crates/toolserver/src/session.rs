@@ -23,6 +23,10 @@ pub struct Session {
     /// session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot: Option<String>,
+    /// The persona a bot session runs as (`docs/bot-marketplace-spec.md` §6): a marketplace
+    /// bot on the PM's team, such as `chief`. `None` is Nudge, the personal bot's own role.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
     pub run_id: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -39,6 +43,7 @@ impl std::fmt::Debug for Session {
             .field("user", &self.user)
             .field("skill", &self.skill)
             .field("bot", &self.bot)
+            .field("persona", &self.persona)
             .field("run_id", &self.run_id)
             .field("created_at", &self.created_at)
             .field("expires_at", &self.expires_at)
@@ -55,6 +60,7 @@ impl Session {
             user: user.to_string(),
             skill: Some(skill.to_string()),
             bot: None,
+            persona: None,
             run_id: run_id.to_string(),
             created_at: now,
             expires_at: now + ttl,

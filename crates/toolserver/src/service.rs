@@ -13,6 +13,12 @@
 //! 5. Every call and decision is audited (ADM-2).
 //! 6. A write tool refused twice for invalid arguments in one session is refused for the
 //!    rest of it, without reaching the connector (`docs/improvement-loop-spec.md` §2).
+//! 7. A personal bot's session may run as a **persona** (a marketplace bot on the PM's team,
+//!    `docs/bot-marketplace-spec.md` §6): its tools are the persona role's ∩ the personal
+//!    role's, each write at the stricter of the bot's, the personal role's and the persona
+//!    role's setting, and its data class the lower of the two roles'. So it can never do more
+//!    than the personal bot, whatever the content says. Decisions still check the item's bot
+//!    and the personal role alone, so a draft stays decidable after its persona is removed.
 //!
 //! Every approval item has a row in the feedback ledger (`ledger.rs`), which the approval
 //! store writes with the item.
@@ -29,6 +35,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use chrono::{DateTime, Duration, Utc};
 use pmos_contract::bots::{role_tools, ActionSetting, Bot, BotScope, Role};
 use pmos_contract::model::{ModelRole, CONTEXT_DOMAINS};
+use pmos_contract::personas::{role_setting, stricter, ALWAYS_ON, PERSONAL_ROLE};
 use pmos_contract::{Sensitivity, ToolKind};
 use serde_json::{json, Value};
 
@@ -138,8 +145,31 @@ pub enum SessionError {
     /// A personal bot serves its owner only.
     #[error("`{bot}` is {owner}'s personal bot; only {owner} can use it")]
     NotOwner { bot: String, owner: String },
+    /// A persona runs only on a personal bot of the personal role.
+    #[error("a marketplace bot runs only on a PM's own personal bot (role `pm-assistant`)")]
+    PersonaNeedsPersonalBot,
+    /// The persona is not in the catalog, not offered, or its role is missing. `name` is its
+    /// display name when the catalog has it (never the request's text otherwise).
+    #[error("{} isn't offered in PM OS any more. Ask Nudge instead.", .name.as_deref().unwrap_or("That bot"))]
+    PersonaUnavailable { name: Option<String> },
+    /// The persona is offered but not on the PM's team.
+    #[error("{name} isn't on your team any more. Add it on the Bots page in PM OS, or ask Nudge.")]
+    PersonaNotOnTeam { name: String },
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+impl SessionError {
+    /// The `code` a refused persona session answers with (`docs/bot-marketplace-spec.md` §6),
+    /// which the runtime passes on. `None` for the other refusals.
+    pub fn persona_code(&self) -> Option<&'static str> {
+        match self {
+            SessionError::PersonaNeedsPersonalBot => Some("persona_needs_personal_bot"),
+            SessionError::PersonaUnavailable { .. } => Some("persona_unavailable"),
+            SessionError::PersonaNotOnTeam { .. } => Some("persona_not_on_team"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -247,9 +277,12 @@ struct Policy {
     tools: BTreeSet<String>,
     /// The highest data class it may read.
     ceiling: Sensitivity,
-    /// Its skill's or role's model, for the ledger.
+    /// Its skill's or role's model, for the ledger (a persona's role's for a persona session).
     model: ModelRole,
+    /// The bot and its own role (for a persona session, the personal role).
     bot: Option<(Arc<Bot>, Arc<Role>)>,
+    /// The persona's role, for a persona session: its write settings count too.
+    persona: Option<Arc<Role>>,
 }
 
 /// Systems the tool server answers itself, with no connector: the context library, memory,
@@ -331,12 +364,24 @@ fn model_alias(model: ModelRole) -> String {
 }
 
 impl Policy {
-    /// A write tool its bot is set to `never` use.
+    /// A write tool its bot is set to `never` use: by the bot's setting (its override, else its
+    /// role's), and for a persona session by the stricter of that, the personal role's own and
+    /// the persona role's (`never` beats `approve`).
     fn never(&self, spec: &ToolSpec) -> bool {
-        spec.kind == ToolKind::Write
-            && self.bot.as_ref().is_some_and(|(bot, role)| {
-                bot.action_setting(role, &spec.name) == ActionSetting::Never
-            })
+        spec.kind == ToolKind::Write && self.setting(&spec.name) == Some(ActionSetting::Never)
+    }
+
+    /// The effective setting of write tool `tool` for a bot session; `None` for a skill session.
+    fn setting(&self, tool: &str) -> Option<ActionSetting> {
+        let (bot, role) = self.bot.as_ref()?;
+        let own = bot.action_setting(role, tool);
+        Some(match &self.persona {
+            Some(p) => stricter(
+                own,
+                stricter(role_setting(role, tool), role_setting(p, tool)),
+            ),
+            None => own,
+        })
     }
 
     /// May the session call `spec`? Refusals name the rule, for the model and the audit log.
@@ -348,9 +393,13 @@ impl Policy {
             });
         }
         if let (true, Some((bot, _))) = (self.never(spec), &self.bot) {
+            let who = match &self.persona {
+                Some(p) => format!("the {} bot as {}", bot.name, p.name),
+                None => format!("the {} bot", bot.name),
+            };
             return Err(ToolError::Forbidden(format!(
-                "the {} bot may never use {}: its setting for it is `never`",
-                bot.name, spec.name
+                "{who} may never use {}: its setting for it is `never`",
+                spec.name
             )));
         }
         Ok(())
@@ -362,6 +411,27 @@ impl Policy {
             .as_ref()
             .map(|(bot, _)| bot.as_ref())
             .filter(|bot| bot.scope == BotScope::Team)
+    }
+}
+
+/// A persona session's policy (`docs/bot-marketplace-spec.md` §6), with `base` the tools of
+/// `role` (the personal role) and `persona` the persona's role: tools are `role_tools(persona)
+/// ∩ base` (a write set to `never` by the stricter setting is refused by [`Policy::check`]);
+/// the data class is the lower of the two roles'; the model is the persona's.
+fn persona_policy<'a>(
+    base: BTreeSet<String>,
+    bot: Arc<Bot>,
+    role: Arc<Role>,
+    persona: Arc<Role>,
+    skills: impl IntoIterator<Item = &'a pmos_contract::Skill>,
+) -> Policy {
+    let own = role_tools(&persona, skills);
+    Policy {
+        tools: own.intersection(&base).cloned().collect(),
+        ceiling: persona.data_class.min(role.data_class),
+        model: persona.model,
+        bot: Some((bot, role)),
+        persona: Some(persona),
     }
 }
 
@@ -398,6 +468,9 @@ pub struct ToolService {
     /// Password sign-in (`crate::password`), when `PMOS_VAULT_KEY` gives it a key to seal
     /// authenticator secrets with. `None`: its routes answer `501 not_configured`.
     passwords: Option<Arc<crate::password::PasswordService>>,
+    /// Team changes by person in the last hour, for [`crate::team::CHANGES_PER_HOUR`]. In
+    /// memory: a restart starts every count again.
+    team_changes: Mutex<HashMap<String, std::collections::VecDeque<DateTime<Utc>>>>,
 }
 
 /// The most audience results kept in memory; past it the oldest are forgotten all at once.
@@ -450,6 +523,7 @@ impl ToolService {
             audiences: Mutex::default(),
             audit_retention_days: crate::audit::MIN_RETENTION_DAYS,
             passwords: None,
+            team_changes: Mutex::default(),
         })
     }
 
@@ -575,6 +649,13 @@ impl ToolService {
         self.roster.read().expect("roster lock").clone()
     }
 
+    /// Tests only: put `roster` in force, as a reindex would, but without the lint (content
+    /// that bypassed `pmos lint`, `docs/bot-marketplace-spec.md` §6).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn replace_roster(&self, roster: Roster) {
+        *self.roster.write().expect("roster lock") = Arc::new(roster);
+    }
+
     /// Rebuild the context index from the content repo checkout at `content_root`, after a
     /// merge, and reload the bots and their roles (users and roles are in the database). Content that fails `pmos lint`
     /// is refused and everything is left as it was. Skill and tool registry changes take
@@ -691,6 +772,27 @@ impl ToolService {
         floor: Sensitivity,
         now: DateTime<Utc>,
     ) -> Result<Session, SessionError> {
+        self.create_bot_session_as(user, bot, None, run_id, ttl, floor, now)
+            .await
+    }
+
+    /// [`ToolService::create_bot_session_from`], running as `persona` (a marketplace bot,
+    /// `docs/bot-marketplace-spec.md` §6). After today's checks, in order: the bot is a
+    /// personal bot of the personal role ([`SessionError::PersonaNeedsPersonalBot`]); the
+    /// persona is in the catalog and offered ([`SessionError::PersonaUnavailable`]); it is the
+    /// always-on persona or on `user`'s team ([`SessionError::PersonaNotOnTeam`]). The session
+    /// stores the persona, `None` for Nudge (also when the request names `nudge`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_bot_session_as(
+        &self,
+        user: &str,
+        bot: &str,
+        persona: Option<&str>,
+        run_id: &str,
+        ttl: Option<Duration>,
+        floor: Sensitivity,
+        now: DateTime<Utc>,
+    ) -> Result<Session, SessionError> {
         if !valid_handle(user) {
             return Err(SessionError::InvalidUser(user.to_string()));
         }
@@ -710,8 +812,26 @@ impl ToolService {
         if run_id.is_empty() || run_id.len() > 128 {
             return Err(SessionError::InvalidRun);
         }
+        let persona = persona.filter(|p| *p != ALWAYS_ON);
+        if let Some(key) = persona {
+            if found.scope != BotScope::Personal || found.role != PERSONAL_ROLE {
+                return Err(SessionError::PersonaNeedsPersonalBot);
+            }
+            let roster = self.roster();
+            let Some((p, _)) = roster.offered(key) else {
+                return Err(SessionError::PersonaUnavailable {
+                    name: roster.persona(key).map(|p| p.display_name.clone()),
+                });
+            };
+            if !self.stores.teams.has(user, key).await? {
+                return Err(SessionError::PersonaNotOnTeam {
+                    name: p.display_name.clone(),
+                });
+            }
+        }
         let ttl = ttl.unwrap_or_else(|| Duration::minutes(DEFAULT_SESSION_TTL_MINUTES));
         let mut session = Session::for_bot(user, bot, run_id, ttl, now);
+        session.persona = persona.map(String::from);
         session.sources_sensitivity = floor;
         self.stores.sessions.insert(&session, now).await?;
         Ok(session)
@@ -753,29 +873,57 @@ impl ToolService {
         self.stores.sessions.revoke(token).await
     }
 
-    /// What a session, or an approval item, with this skill or bot for `user` may do.
-    fn policy_for(&self, skill: Option<&str>, bot: Option<&str>, user: &str) -> Option<Policy> {
+    /// What a session, or an approval item, with this skill or bot (and, for a session, this
+    /// persona) for `user` may do. A persona that is no longer offered, or a bot that is no
+    /// longer a personal bot of the personal role, gives `None`: the session is gone.
+    fn policy_for(
+        &self,
+        skill: Option<&str>,
+        bot: Option<&str>,
+        persona: Option<&str>,
+        user: &str,
+    ) -> Option<Policy> {
         match (skill, bot) {
             (Some(skill), None) => {
+                if persona.is_some() {
+                    return None;
+                }
                 let skill = self.catalog.skill(skill)?;
                 Some(Policy {
                     tools: skill.tools.iter().cloned().collect(),
                     ceiling: skill.data_class,
                     model: skill.model,
                     bot: None,
+                    persona: None,
                 })
             }
             (None, Some(bot)) => {
-                let (bot, role) = self.roster().bot(bot)?;
+                let roster = self.roster();
+                let (bot, role) = roster.bot(bot)?;
                 if bot.scope == BotScope::Personal && bot.owner != user {
                     return None;
                 }
-                Some(Policy {
-                    tools: role_tools(&role, self.catalog.skills()),
-                    ceiling: role.data_class,
-                    model: role.model,
-                    bot: Some((bot, role)),
-                })
+                let base = role_tools(&role, self.catalog.skills());
+                let Some(key) = persona else {
+                    return Some(Policy {
+                        tools: base,
+                        ceiling: role.data_class,
+                        model: role.model,
+                        bot: Some((bot, role)),
+                        persona: None,
+                    });
+                };
+                if bot.scope != BotScope::Personal || bot.role != PERSONAL_ROLE {
+                    return None;
+                }
+                let (_, prole) = roster.offered(key)?;
+                Some(persona_policy(
+                    base,
+                    bot,
+                    role,
+                    prole,
+                    self.catalog.skills(),
+                ))
             }
             _ => None,
         }
@@ -785,6 +933,7 @@ impl ToolService {
         self.policy_for(
             session.skill.as_deref(),
             session.bot.as_deref(),
+            session.persona.as_deref(),
             &session.user,
         )
     }
@@ -839,6 +988,7 @@ impl ToolService {
             args_hash: Some(args_hash(&args)),
             output_ref: None,
             detail: None,
+            persona: session.persona.clone(),
         };
 
         let write = self
@@ -1379,6 +1529,7 @@ impl ToolService {
             user: &session.user,
             skill: session.skill.as_deref(),
             bot: session.bot.as_deref(),
+            persona: session.persona.as_deref(),
             run_id: &session.run_id,
             tool: &spec.name,
             args,
@@ -1528,6 +1679,7 @@ impl ToolService {
             args_hash: Some(args_hash(args)),
             output_ref: None,
             detail: None,
+            persona: session.persona.clone(),
         })
         .await;
         Ok(())
@@ -2010,6 +2162,7 @@ impl ToolService {
             args_hash: Some(item.args_hash),
             output_ref: Some(item.id),
             detail: Some(why.to_string()),
+            persona: item.persona,
         };
         if !self.people.allows(decided_by).await? {
             if let Ok(Some(item)) = self.stores.approvals.get(id).await {
@@ -2169,6 +2322,7 @@ impl ToolService {
             args_hash: Some(item.args_hash.clone()),
             output_ref: Some(item.id.clone()),
             detail: (!parts.is_empty()).then(|| parts.join("; ")),
+            persona: item.persona.clone(),
         };
         if item.status == Status::Rejected {
             self.audit(event).await;
@@ -2222,6 +2376,7 @@ impl ToolService {
                 args_hash: Some(hash),
                 output_ref: Some(item.id.clone()),
                 detail,
+                persona: item.persona.clone(),
             };
         if !self.people.allows(user).await? {
             return Err(DecisionError::NotAMember(user.to_string()));
@@ -2325,6 +2480,7 @@ impl ToolService {
             args_hash: Some(item.args_hash.clone()),
             output_ref: Some(item.id.clone()),
             detail: Some(detail),
+            persona: item.persona.clone(),
         };
         let channel = args["channel"].as_str().unwrap_or_default();
         let found = match self.connector("slack") {
@@ -2430,6 +2586,7 @@ impl ToolService {
                     "undecided after {} h: nothing was posted, and the draft's text was removed",
                     self.slack_draft_ttl.num_hours()
                 )),
+                persona: item.persona.clone(),
             })
             .await;
         }
@@ -2503,7 +2660,9 @@ impl ToolService {
         // Memory and the bets register are never a team bot's, even if its role gained the
         // tool.
         let allowed = self
-            .policy_for(item.skill.as_deref(), item.bot.as_deref(), &item.user)
+            // The item's bot and the personal role, never its persona: a draft stays
+            // decidable after its persona leaves the team or the catalog (§6).
+            .policy_for(item.skill.as_deref(), item.bot.as_deref(), None, &item.user)
             .is_some_and(|p| {
                 p.check(&spec).is_ok()
                     && !(personal_system(&spec.system).is_some() && p.team_bot().is_some())
@@ -2622,6 +2781,7 @@ impl ToolService {
                     args_hash: Some(item.args_hash.clone()),
                     output_ref: Some(item.id.clone()),
                     detail: Some(format!("outcome unknown: {message}")),
+                    persona: item.persona.clone(),
                 })
                 .await;
             }
@@ -2641,4 +2801,6 @@ pub(crate) fn display_name(dir: Option<&crate::users::Directory>, handle: &str) 
 }
 
 mod review;
+mod team;
 pub use review::{About, ReviewError, ReviewInbox};
+pub use team::TeamRefusal;

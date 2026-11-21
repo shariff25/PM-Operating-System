@@ -523,6 +523,7 @@ impl Onboarding {
                 args_hash: None,
                 output_ref,
                 detail,
+                persona: None,
             })
             .await;
     }

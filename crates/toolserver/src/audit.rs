@@ -168,6 +168,11 @@ pub struct AuditEvent {
     /// The session's bot, for a bot session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot: Option<String>,
+    /// The persona (marketplace bot, `docs/bot-marketplace-spec.md` §7) the session ran as, or
+    /// the drafting persona of the item a decision was about. `None` is Nudge, and every event
+    /// that isn't about a bot's call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
     /// Registry name, such as `jira.create_issue`.
     pub tool: String,
     pub outcome: Outcome,
@@ -465,6 +470,7 @@ pub fn purge_event(at: DateTime<Utc>, batch: &PurgeBatch) -> AuditEvent {
         args_hash: None,
         output_ref: None,
         detail: Some(purge_detail(batch.deleted, batch.cutoff)),
+        persona: None,
     }
 }
 
@@ -756,6 +762,7 @@ mod tests {
             args_hash: None,
             output_ref: None,
             detail: None,
+            persona: None,
         }
     }
 

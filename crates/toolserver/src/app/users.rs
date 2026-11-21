@@ -143,6 +143,7 @@ async fn record_refused(state: &AppState, actor: &str, action: &str, target: &st
             args_hash: None,
             output_ref: (!target.is_empty()).then(|| target.to_string()),
             detail: Some(code.to_string()),
+            persona: None,
         })
         .await;
 }
@@ -913,6 +914,7 @@ async fn console_members(
         args_hash: None,
         output_ref: None,
         detail: None,
+        persona: None,
     };
     if !admin {
         state.svc.audit(event(Outcome::Denied)).await;

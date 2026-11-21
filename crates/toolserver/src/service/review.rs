@@ -161,6 +161,7 @@ impl ToolService {
             args_hash: item.map(|i| i.args_hash.clone()),
             output_ref: item.map(|i| i.id.clone()).or(target.map(String::from)),
             detail,
+            persona: item.and_then(|i| i.persona.clone()),
         })
         .await;
     }
@@ -259,6 +260,7 @@ impl ToolService {
             "owner_name": display_name(Some(dir), &item.user),
             "tool": item.tool,
             "bot": item.bot,
+            "persona": item.persona,
             "skill": item.skill,
             "status": item.status.as_str(),
             "created_at": item.created_at,

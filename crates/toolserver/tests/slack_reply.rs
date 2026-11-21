@@ -1138,6 +1138,7 @@ async fn unrecorded_sources_count_as_restricted() {
         content_sha: None,
         model_alias: None,
         sources_sensitivity: Sensitivity::Public,
+        persona: None,
     };
     let public = f
         .stores

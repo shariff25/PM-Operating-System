@@ -374,6 +374,7 @@ fn event(
         args_hash: None,
         output_ref: target.map(String::from),
         detail: Some(detail.to_string()),
+        persona: None,
     }
 }
 
