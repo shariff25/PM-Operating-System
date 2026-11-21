@@ -203,18 +203,21 @@ impl Runtime {
         text: &str,
         level: Option<&str>,
     ) -> Result<RuntimeTask, ApiError> {
-        self.create_task_in(bot, requested_by, text, level, None)
+        self.create_task_in(bot, requested_by, text, level, None, None)
             .await
     }
 
-    /// [`Self::create_task`] as a turn of `conversation`: tasks with the same conversation id,
-    /// from the same requester for the same bot, are given earlier turns as `history`.
+    /// [`Self::create_task`] as a turn of `conversation`, asking `persona` (a marketplace
+    /// bot, docs/bot-marketplace-spec.md §10) when the category names one: tasks with the same
+    /// conversation id, from the same requester for the same bot and persona, are given earlier
+    /// turns as `history`.
     pub async fn create_task_in(
         &self,
         bot: &str,
         requested_by: &str,
         text: &str,
         level: Option<&str>,
+        persona: Option<&str>,
         conversation: Option<&str>,
     ) -> Result<RuntimeTask, ApiError> {
         let mut body =
@@ -224,6 +227,9 @@ impl Runtime {
         }
         if let Some(conversation) = conversation {
             body["conversation"] = json!(conversation);
+        }
+        if let Some(persona) = persona {
+            body["persona"] = json!(persona);
         }
         let v = self
             .send("POST", "/v1/tasks", &self.token, Some(body))

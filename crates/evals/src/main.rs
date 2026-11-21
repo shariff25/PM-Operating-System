@@ -327,7 +327,7 @@ fn file_name(path: &Path) -> String {
 /// bar (reports only), level staff".
 fn check_line(c: &pmos_evals::spec::Category) -> String {
     format!(
-        "{}: {} tasks for bot `{}`, {}{}{}",
+        "{}: {} tasks for bot `{}`, {}{}{}{}",
         c.name,
         c.tasks.len(),
         c.bot,
@@ -343,8 +343,44 @@ fn check_line(c: &pmos_evals::spec::Category) -> String {
         match &c.level {
             Some(level) => format!(", level {level}"),
             None => String::new(),
+        },
+        match &c.persona {
+            Some(persona) => format!(", as persona `{persona}`"),
+            None => String::new(),
         }
     )
+}
+
+/// A category's `persona` must be one of the content's personas, offered, so its tasks pass
+/// the runtime's own check (`docs/bot-marketplace-spec.md` §10). The catalog is the lint's
+/// (`report.personas`: personas whose files pass), read once into `catalog`.
+fn check_persona(
+    root: &Path,
+    category: &str,
+    persona: &str,
+    content: &Path,
+    catalog: &mut Option<Vec<pmos_contract::personas::Persona>>,
+) -> Vec<String> {
+    let personas = catalog.get_or_insert_with(|| {
+        let today = chrono::Utc::now().date_naive();
+        pmos_contract::lint(content, &pmos_contract::LintOptions::for_service(today)).personas
+    });
+    let shown = root
+        .join("categories")
+        .join(category)
+        .join("category.yaml")
+        .display()
+        .to_string();
+    match personas.iter().find(|p| p.name == persona) {
+        None => vec![format!(
+            "{shown}: `persona` `{persona}` is not a persona in {} (personas/<key>/PERSONA.md)",
+            content.display()
+        )],
+        Some(p) if !p.offered => vec![format!(
+            "{shown}: `persona` `{persona}` is not offered (`offered: false`), so the runtime refuses its tasks"
+        )],
+        Some(_) => Vec::new(),
+    }
 }
 
 fn check(root: &Path, category: Option<String>, content: &Path) -> Result<bool> {
@@ -379,10 +415,15 @@ fn check(root: &Path, category: Option<String>, content: &Path) -> Result<bool> 
     };
     let mut used: Vec<(String, String)> = Vec::new();
     let mut declines = false;
+    // The content's personas, linted once, when a category first names one.
+    let mut catalog: Option<Vec<pmos_contract::personas::Persona>> = None;
     for name in &names {
         match load_category(root, name) {
             Ok(c) => {
                 println!("{}", check_line(&c));
+                if let Some(persona) = &c.persona {
+                    problems.extend(check_persona(root, &c.name, persona, content, &mut catalog));
+                }
                 if let Some(reg) = &registry {
                     problems.extend(check_draft_tools(root, &c, reg));
                 }
@@ -600,7 +641,10 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 &bot,
                 &r.requested_by,
                 &asks,
-                category.level.as_deref(),
+                pmos_evals::run::AskAs {
+                    level: category.level.as_deref(),
+                    persona: category.persona.as_deref(),
+                },
                 args.tasks,
                 &r.follow,
             )

@@ -37,6 +37,8 @@ pub struct TaskFilter {
     pub requested_by: Option<String>,
     pub status: Option<TaskStatus>,
     pub source: Option<crate::model::Source>,
+    /// `Some(None)`: Nudge's tasks only; `Some(Some(key))`: that persona's.
+    pub persona: Option<Option<String>>,
     pub limit: usize,
 }
 
@@ -49,6 +51,7 @@ impl TaskFilter {
                 .is_none_or(|r| &t.requested_by == r)
             && self.status.is_none_or(|s| t.status == s)
             && self.source.is_none_or(|s| t.source == s)
+            && self.persona.as_ref().is_none_or(|p| &t.persona == p)
     }
 }
 
@@ -111,6 +114,8 @@ pub struct RoutinePatch {
     pub enabled: Option<bool>,
     pub schedule: Option<Schedule>,
     pub prompt: Option<String>,
+    /// `Some(None)` moves the routine to Nudge; `Some(Some(key))` to that persona.
+    pub persona: Option<Option<String>>,
     /// Recomputed by the caller whenever the schedule or `enabled` changes.
     pub next_run_at: Option<Option<DateTime<Utc>>>,
 }
@@ -155,15 +160,20 @@ pub trait BotsStore: Send + Sync {
         now: DateTime<Utc>,
     ) -> StoreResult<Result<Task, Refused>>;
     /// The earlier turns of `task`'s conversation, newest first, at most `limit`: tasks of the
-    /// same bot, the same requester and the same thread (`Task::thread_key`), created at or
-    /// after `since` and before `task`, and no longer queued or working. Empty for a task
-    /// with no thread.
+    /// same bot, the same requester, the same thread (`Task::thread_key`) and the same persona
+    /// (`None` equals `None`), created at or after `since` and before `task`, and no longer
+    /// queued or working. Empty for a task with no thread.
     async fn earlier_turns(
         &self,
         task: &Task,
         since: DateTime<Utc>,
         limit: usize,
     ) -> StoreResult<Vec<Task>>;
+    /// The persona of the newest task in `task`'s thread (same bot, requester and thread,
+    /// any status, any age), or `None` when that task is Nudge's or the thread has no task
+    /// yet. A task naming no persona inherits it (`docs/bot-marketplace-spec.md` §6,
+    /// Conversations). `None` for a task with no thread.
+    async fn thread_persona(&self, task: &Task) -> StoreResult<Option<String>>;
     /// `working` tasks whose lease lapsed before `now`.
     async fn expired_leases(&self, now: DateTime<Utc>) -> StoreResult<Vec<Task>>;
     async fn events(&self, task_id: &str) -> StoreResult<Vec<Event>>;
@@ -290,6 +300,7 @@ fn notification_for(
         approvals: n.approvals.clone(),
         outcomes: n.outcomes.clone(),
         routine_id: task.routine_id.clone(),
+        persona: task.persona.clone(),
         at: now,
     }
 }
@@ -463,6 +474,7 @@ impl BotsStore for MemoryStore {
             .filter(|t| {
                 t.bot == task.bot
                     && t.requested_by == task.requested_by
+                    && t.persona == task.persona
                     && t.thread_key().as_ref() == Some(&key)
                     && t.created_at >= since
                     && (&t.created_at, &t.id) < (&task.created_at, &task.id)
@@ -477,6 +489,23 @@ impl BotsStore for MemoryStore {
         });
         out.truncate(limit);
         Ok(out)
+    }
+
+    async fn thread_persona(&self, task: &Task) -> StoreResult<Option<String>> {
+        let Some(key) = task.thread_key() else {
+            return Ok(None);
+        };
+        let s = self.state();
+        Ok(s.tasks
+            .values()
+            .filter(|t| {
+                t.id != task.id
+                    && t.bot == task.bot
+                    && t.requested_by == task.requested_by
+                    && t.thread_key().as_ref() == Some(&key)
+            })
+            .max_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)))
+            .and_then(|t| t.persona.clone()))
     }
 
     async fn expired_leases(&self, now: DateTime<Utc>) -> StoreResult<Vec<Task>> {
@@ -624,6 +653,9 @@ impl BotsStore for MemoryStore {
         }
         if let Some(p) = &patch.prompt {
             r.prompt = p.clone();
+        }
+        if let Some(p) = &patch.persona {
+            r.persona = p.clone();
         }
         if let Some(n) = patch.next_run_at {
             r.next_run_at = n;

@@ -58,7 +58,7 @@ impl PgStore {
 
 const TASK_COLUMNS: &str = "id, bot, requested_by, source, priority, text, status, checklist, \
      result, error, approvals, slack, routine_id, level, conversation, sources_sensitivity, \
-     attempts, worker, lease_until, created_at, updated_at";
+     persona, attempts, worker, lease_until, created_at, updated_at";
 
 fn bad(what: &str, value: &str) -> StoreError {
     StoreError(format!("unexpected {what} `{value}` in storage"))
@@ -98,6 +98,7 @@ fn task_from_row(r: &PgRow) -> StoreResult<Task> {
         level,
         conversation: r.try_get("conversation")?,
         sources_sensitivity,
+        persona: r.try_get("persona")?,
         attempts: r.try_get("attempts")?,
         worker: r.try_get("worker")?,
         lease_until: r.try_get("lease_until")?,
@@ -107,7 +108,7 @@ fn task_from_row(r: &PgRow) -> StoreResult<Task> {
 }
 
 const ROUTINE_COLUMNS: &str = "id, bot, owner, enabled, cron, tz, prompt, output, approval, \
-     next_run_at, last_run_at, created_at, updated_at";
+     persona, next_run_at, last_run_at, created_at, updated_at";
 
 fn routine_from_row(r: &PgRow) -> StoreResult<Routine> {
     let output: Json<Output> = r.try_get("output")?;
@@ -123,6 +124,7 @@ fn routine_from_row(r: &PgRow) -> StoreResult<Routine> {
         prompt: r.try_get("prompt")?,
         output: output.0,
         approval: r.try_get("approval")?,
+        persona: r.try_get("persona")?,
         next_run_at: r.try_get("next_run_at")?,
         last_run_at: r.try_get("last_run_at")?,
         created_at: r.try_get("created_at")?,
@@ -135,9 +137,9 @@ async fn insert_task(conn: &mut PgConnection, t: &Task) -> StoreResult<()> {
         "INSERT INTO bots_tasks (id, bot, requested_by, source, priority, priority_rank, text,
              status, checklist, result, error, approvals, slack, routine_id, attempts, worker,
              lease_until, created_at, updated_at, level, conversation, thread_key,
-             sources_sensitivity)
+             sources_sensitivity, persona)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-             $18, $19, $20, $21, $22, $23)",
+             $18, $19, $20, $21, $22, $23, $24)",
     )
     .bind(&t.id)
     .bind(&t.bot)
@@ -162,6 +164,7 @@ async fn insert_task(conn: &mut PgConnection, t: &Task) -> StoreResult<()> {
     .bind(&t.conversation)
     .bind(t.thread_key())
     .bind(t.sources_sensitivity.map(|s| s.to_string()))
+    .bind(&t.persona)
     .execute(conn)
     .await?;
     Ok(())
@@ -203,8 +206,8 @@ async fn insert_notification(
     .await?;
     sqlx::query(
         "INSERT INTO bots_notifications (seq, task_id, bot, requested_by, slack, kind, text,
-             approvals, outcomes, routine_id, at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             approvals, outcomes, routine_id, at, persona)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(seq)
     .bind(&task.id)
@@ -217,6 +220,7 @@ async fn insert_notification(
     .bind(Json(&n.outcomes))
     .bind(&task.routine_id)
     .bind(now)
+    .bind(&task.persona)
     .execute(conn)
     .await?;
     Ok(())
@@ -253,6 +257,7 @@ impl BotsStore for PgStore {
                AND ($2::text IS NULL OR requested_by = $2)
                AND ($3::text IS NULL OR status = $3)
                AND ($4::text IS NULL OR source = $4)
+               AND (NOT $6 OR persona IS NOT DISTINCT FROM $7)
              ORDER BY created_at DESC, id DESC
              LIMIT $5"
         );
@@ -262,6 +267,8 @@ impl BotsStore for PgStore {
             .bind(f.status.map(TaskStatus::as_str))
             .bind(f.source.map(Source::as_str))
             .bind(f.limit as i64)
+            .bind(f.persona.is_some())
+            .bind(f.persona.clone().flatten())
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(task_from_row).collect()
@@ -388,6 +395,7 @@ impl BotsStore for PgStore {
         let sql = format!(
             "SELECT {TASK_COLUMNS} FROM bots_tasks
              WHERE bot = $1 AND requested_by = $2 AND thread_key = $3
+               AND persona IS NOT DISTINCT FROM $8
                AND created_at >= $4
                AND (created_at < $5 OR (created_at = $5 AND id COLLATE \"C\" < $6))
                AND status NOT IN ('queued', 'working')
@@ -402,9 +410,29 @@ impl BotsStore for PgStore {
             .bind(task.created_at)
             .bind(&task.id)
             .bind(limit as i64)
+            .bind(&task.persona)
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(task_from_row).collect()
+    }
+
+    async fn thread_persona(&self, task: &Task) -> StoreResult<Option<String>> {
+        let Some(key) = task.thread_key() else {
+            return Ok(None);
+        };
+        let persona: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT persona FROM bots_tasks
+             WHERE bot = $1 AND requested_by = $2 AND thread_key = $3 AND id <> $4
+             ORDER BY created_at DESC, id COLLATE \"C\" DESC
+             LIMIT 1",
+        )
+        .bind(&task.bot)
+        .bind(&task.requested_by)
+        .bind(key)
+        .bind(&task.id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(persona.flatten())
     }
 
     async fn expired_leases(&self, now: DateTime<Utc>) -> StoreResult<Vec<Task>> {
@@ -504,7 +532,7 @@ impl BotsStore for PgStore {
     async fn notifications(&self, after: i64, limit: usize) -> StoreResult<Vec<Notification>> {
         let rows = sqlx::query(
             "SELECT seq, task_id, bot, requested_by, slack, kind, text, approvals, outcomes,
-                    routine_id, at
+                    routine_id, at, persona
              FROM bots_notifications WHERE seq > $1 ORDER BY seq LIMIT $2",
         )
         .bind(after)
@@ -531,6 +559,7 @@ impl BotsStore for PgStore {
                     approvals: approvals.0,
                     outcomes: outcomes.0,
                     routine_id: r.try_get("routine_id")?,
+                    persona: r.try_get("persona")?,
                     at: r.try_get("at")?,
                 })
             })
@@ -558,8 +587,8 @@ impl BotsStore for PgStore {
     async fn create_routine(&self, r: &Routine) -> StoreResult<()> {
         sqlx::query(
             "INSERT INTO bots_routines (id, bot, owner, enabled, cron, tz, prompt, output,
-                 approval, next_run_at, last_run_at, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                 approval, next_run_at, last_run_at, created_at, updated_at, persona)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(&r.id)
         .bind(&r.bot)
@@ -574,6 +603,7 @@ impl BotsStore for PgStore {
         .bind(r.last_run_at)
         .bind(r.created_at)
         .bind(r.updated_at)
+        .bind(&r.persona)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -614,7 +644,8 @@ impl BotsStore for PgStore {
                  tz = coalesce($4, tz),
                  prompt = coalesce($5, prompt),
                  next_run_at = CASE WHEN $6 THEN $7 ELSE next_run_at END,
-                 updated_at = $8
+                 updated_at = $8,
+                 persona = CASE WHEN $9 THEN $10 ELSE persona END
              WHERE id = $1
              RETURNING {ROUTINE_COLUMNS}"
         );
@@ -627,6 +658,8 @@ impl BotsStore for PgStore {
             .bind(patch.next_run_at.is_some())
             .bind(patch.next_run_at.flatten())
             .bind(now)
+            .bind(patch.persona.is_some())
+            .bind(patch.persona.clone().flatten())
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(routine_from_row).transpose()

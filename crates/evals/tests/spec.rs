@@ -67,6 +67,46 @@ fn a_category_may_set_a_level() {
 }
 
 #[test]
+fn a_category_may_name_a_persona_on_the_personal_bot_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let task = || {
+        vec![(
+            "a-task",
+            "id: a-task\nask: \"One?\"\nexpect:\n  approvals: 0\n".to_string(),
+        )]
+    };
+    write_category(dir.path(), "cat", "personal", 0.8, &task());
+    let path = dir.path().join("categories/cat/category.yaml");
+    let base = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(load_category(dir.path(), "cat").unwrap().persona, None);
+    std::fs::write(&path, format!("{base}persona: chief\n")).unwrap();
+    assert_eq!(
+        load_category(dir.path(), "cat").unwrap().persona.as_deref(),
+        Some("chief")
+    );
+    // `nudge` is the personal bot's own generalist: no persona is sent.
+    std::fs::write(&path, format!("{base}persona: nudge\n")).unwrap();
+    assert_eq!(load_category(dir.path(), "cat").unwrap().persona, None);
+    std::fs::write(&path, format!("{base}persona: Chief!\n")).unwrap();
+    let errors = load_category(dir.path(), "cat").unwrap_err().0;
+    assert!(
+        errors.iter().any(|e| e.contains("is not a persona key")),
+        "{errors:#?}"
+    );
+    write_category(dir.path(), "team", "docs", 0.8, &task());
+    let path = dir.path().join("categories/team/category.yaml");
+    let base = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{base}persona: chief\n")).unwrap();
+    let errors = load_category(dir.path(), "team").unwrap_err().0;
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("`persona` needs `bot: personal`")),
+        "{errors:#?}"
+    );
+}
+
+#[test]
 fn every_problem_is_reported_with_its_file() {
     let dir = tempfile::tempdir().unwrap();
     write_category(dir.path(), "cat", "Docs Bot", 1.5, &[
