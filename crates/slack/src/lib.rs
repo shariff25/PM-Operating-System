@@ -4,6 +4,8 @@
 //! - **DMs:** a PM's DM becomes a task for a bot (`pm-<handle>`, `docs`, or the one named with
 //!   a `<bot>:` prefix) in the bots runtime. Progress, answers and failures come back in the
 //!   thread from the runtime's notification feed, posted under the bot's own name.
+//!   `Chief: …` or `sprout, …` asks a marketplace bot on the PM's own bot, and its messages
+//!   start with its name (`personas.rs`, `docs/slack-bots.md`).
 //! - **Approval cards (D7):** each write a bot drafts is a card with **Approve**, **Edit** and
 //!   **Reject**; only the PM it is for can decide it, through the tool server. **Reject**
 //!   asks why first, with six one-tap reasons the feedback ledger keeps
@@ -54,6 +56,7 @@ pub mod nudges;
 pub mod onboard_copy;
 pub mod onboard_flow;
 pub mod people;
+pub mod personas;
 pub mod proxy;
 pub mod reply;
 pub mod runtime;

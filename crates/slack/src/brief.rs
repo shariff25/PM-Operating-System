@@ -159,7 +159,9 @@ fn next_run(routine: &Value, default_tz: &str) -> String {
 fn failure(e: &RuntimeError) -> String {
     match e {
         RuntimeError::Unavailable => copy::UNAVAILABLE.into(),
-        RuntimeError::Refused(why) | RuntimeError::Question(why) => copy::failed(&escape(why)),
+        RuntimeError::Refused(why) | RuntimeError::Question(why) | RuntimeError::Persona(why) => {
+            copy::failed(&escape(why))
+        }
     }
 }
 

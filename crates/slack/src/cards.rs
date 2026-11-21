@@ -378,7 +378,34 @@ pub fn recommendation_line(item: &Value) -> Option<String> {
 fn approval_head(item: &Value) -> Vec<Value> {
     let mut head = approval_head_only(item);
     head.extend(recommendation_line(item).map(|l| context(&l)));
+    head.extend(held_line(item).map(context));
     head
+}
+
+/// "Drafted by Chief", when a marketplace bot drafted the item: the name the Slack bot put on
+/// it from the persona catalog (`personas::annotate`), already safe `mrkdwn`. `None` for
+/// Nudge.
+pub fn drafted_by(item: &Value) -> Option<String> {
+    item[crate::personas::DRAFTED_BY_FIELD]
+        .as_str()
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| format!("Drafted by {n}"))
+}
+
+/// A pending draft whose bot was withdrawn from the catalog is **held**
+/// (`docs/bot-marketplace-spec.md` §6, "Removal"): it can be rejected, not approved or edited,
+/// until the bot is offered again or an Admin releases it.
+pub fn is_held(item: &Value) -> bool {
+    item["held"] == true && item["status"] == "pending"
+}
+
+/// The line a held draft's card carries.
+pub const HELD_LINE: &str = ":lock: Held: the bot that drafted this isn't offered in PM OS \
+     any more, so it can't be approved or edited until an Admin releases it. You can still \
+     reject it.";
+
+fn held_line(item: &Value) -> Option<&'static str> {
+    is_held(item).then_some(HELD_LINE)
 }
 
 fn approval_head_only(item: &Value) -> Vec<Value> {
@@ -398,6 +425,10 @@ fn approval_head_only(item: &Value) -> Vec<Value> {
                 escape(tool),
                 escape(&person(item["user"].as_str().unwrap_or("you")))
             );
+            if let Some(drafted) = drafted_by(item) {
+                line.push_str(" · ");
+                line.push_str(&drafted);
+            }
             if let Some(edited) = edited_note(item) {
                 line.push_str(" · ");
                 line.push_str(&edited);
@@ -430,15 +461,18 @@ fn open_web_button(item: &Value, web: Option<&str>) -> Option<Value> {
 
 fn approval_buttons(item: &Value, web: Option<&str>) -> Value {
     let id = item["id"].as_str().unwrap_or_default();
-    let mut elements = if is_reply(item) {
+    let held = is_held(item);
+    let mut elements = if held {
+        Vec::new()
+    } else if is_reply(item) {
         vec![button("Post as you", action::APPROVE, id, Some("primary"))]
     } else {
         vec![button("Approve", action::APPROVE, id, Some("primary"))]
     };
-    if !editable_fields(item).is_empty() {
+    if !held && !editable_fields(item).is_empty() {
         elements.push(button("Edit", action::EDIT, id, None));
     }
-    if is_reply(item) {
+    if !held && is_reply(item) {
         elements.push(button("Snooze", action::SNOOZE, id, None));
     }
     elements.push(button("Reject", action::REJECT, id, Some("danger")));
@@ -863,6 +897,7 @@ fn reply_head(item: &Value) -> Vec<Value> {
         ),
         "posts as you, marked “Drafted with PM OS”".to_string(),
     ];
+    meta.extend(drafted_by(item));
     meta.extend(edited_note(item));
     if let Some(s) = item["sources_sensitivity"]
         .as_str()
