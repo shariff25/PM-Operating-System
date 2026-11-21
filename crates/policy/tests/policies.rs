@@ -254,6 +254,12 @@ fn chief_persona(offered: bool) -> String {
 fn marketplace_content(dir: &Path, persona: Option<String>, prep: &str) -> PathBuf {
     let content = dir.join("content");
     copy_dir(&repo().join("content"), &content);
+    // The fixtures stand in for the catalog: Nudge alone, plus the Chief fixture when asked.
+    // The repository's own specialists are left out (their proof is
+    // `the_repositorys_specialists_add_only_read_only_skill_folders`).
+    for key in ["chief", "sprout", "echo"] {
+        let _ = fs::remove_dir_all(content.join("personas").join(key));
+    }
     let put = |rel: &str, text: &str| {
         let path = content.join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -415,6 +421,62 @@ fn personas_add_only_read_only_skill_folders_to_the_personal_bots() {
         .violations
         .iter()
         .any(|v| v.message.contains("or any persona in the catalog")));
+}
+
+/// The real catalog (Chief, Sprout, Echo): for a personal bot of the personal role, the policy
+/// differs from the one without them only by the specialists' new read-only skill folders and
+/// the header's source line. No network rule, process, Landlock or writable path changes.
+#[test]
+fn the_repositorys_specialists_add_only_read_only_skill_folders() {
+    let with_dir = tempfile::tempdir().unwrap();
+    let without_dir = tempfile::tempdir().unwrap();
+    let with = marketplace_content(with_dir.path(), None, PREP_SKILL);
+    let without = marketplace_content(without_dir.path(), None, PREP_SKILL);
+    for key in ["chief", "sprout", "echo"] {
+        copy_dir(
+            &repo().join("content/personas").join(key),
+            &with.join("personas").join(key),
+        );
+    }
+    let before = generate(&without, today()).unwrap();
+    let after = generate(&with, today()).unwrap();
+    for (rel, text) in &before.files {
+        if !rel.starts_with("bots/pm-ana.") {
+            assert_eq!(text, &after.files[rel], "{rel} changed");
+        }
+    }
+    let (p0, p1) = (
+        &before.files["bots/pm-ana.yaml"],
+        &after.files["bots/pm-ana.yaml"],
+    );
+    for key in ["network_policies", "process", "landlock", "version"] {
+        assert_eq!(section(p0, key), section(p1, key), "{key}");
+    }
+    let (a, b) = (
+        pmos_policy::openshell::parse(p0).unwrap(),
+        pmos_policy::openshell::parse(p1).unwrap(),
+    );
+    assert_eq!(a.network_policies, b.network_policies);
+    assert_eq!(a.network_middlewares, b.network_middlewares);
+    let (fa, fb) = (a.filesystem_policy.unwrap(), b.filesystem_policy.unwrap());
+    assert_eq!(fa.read_write, fb.read_write);
+    let ro0: BTreeSet<&String> = fa.read_only.iter().collect();
+    let ro1: BTreeSet<&String> = fb.read_only.iter().collect();
+    assert!(ro0.is_subset(&ro1));
+    assert_eq!(
+        ro1.difference(&ro0).map(|p| p.as_str()).collect::<Vec<_>>(),
+        [
+            "/sandbox/skills/battlecard",
+            "/sandbox/skills/experiment-backlog",
+            "/sandbox/skills/funnel-diagnosis",
+            "/sandbox/skills/meeting-prep",
+            "/sandbox/skills/positioning-brief",
+            "/sandbox/skills/week-review",
+        ]
+    );
+    let ctx = |g: &pmos_policy::Generated| g.bots.iter().find(|b| b.bot == "pm-ana").cloned();
+    let (c0, c1) = (ctx(&before).unwrap(), ctx(&after).unwrap());
+    assert_eq!(c0.mcp_tools, c1.mcp_tools);
 }
 
 #[test]
