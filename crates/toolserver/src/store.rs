@@ -11,6 +11,7 @@ use crate::members::{MemberRequestStore, MemoryRequests};
 use crate::memory::{InMemoryStore, MemoryStore};
 use crate::memory_repo::{MemoryRepoStore, MemoryRepos};
 use crate::session::{MemorySessions, SessionRepo};
+use crate::team::{MemoryTeams, TeamStore};
 use crate::users::{MemoryUsers, UserStore};
 use crate::vault::{CredentialStore, MemoryCredentials};
 
@@ -38,6 +39,8 @@ pub struct Stores {
     /// The user database (`users/`): the tool server's source of users and roles since slice
     /// U3 (`users::access::People`).
     pub users: Arc<dyn UserStore>,
+    /// Each PM's team of marketplace bots; see `team.rs`.
+    pub teams: Arc<dyn TeamStore>,
 }
 
 impl Stores {
@@ -58,6 +61,7 @@ impl Stores {
             memory_repos: Arc::new(MemoryRepos::default()),
             member_requests: Arc::new(MemoryRequests::default()),
             users: Arc::new(MemoryUsers::default()),
+            teams: Arc::new(MemoryTeams::default().with_audit(audit.clone())),
         };
         stores.users = Arc::new(
             MemoryUsers::default()

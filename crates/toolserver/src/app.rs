@@ -40,6 +40,11 @@
 //!   the acting admin; the console's one extra route, `GET /internal/console/members`, lists
 //!   handles for an admin's Approvals screen.
 //!
+//!   The bot marketplace's routes (`app/team.rs`) have their own allow-list: the catalog
+//!   (`GET /internal/personas`) for `pmos-web`, the orchestrator and the Slack bot; a PM's
+//!   own team (`/internal/team/{handle}`) and the admin's read (`GET /internal/admin/personas`)
+//!   for `pmos-web` only, the team with its signed assertion for that person in every mode.
+//!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
 //!   `/internal`), never in URLs, so access logs and proxies don't record them.
@@ -82,6 +87,7 @@ mod admin;
 pub mod directory;
 mod password;
 mod reviews;
+mod team;
 mod users;
 
 /// What the Slack bot's token may do.
@@ -314,7 +320,10 @@ pub fn router_full(
         // The Reviewer's inbox, reads and recommendations (`reviews.rs`): pmos-web's only.
         .merge(reviews::routes(state.clone()))
         // Password sign-in (`password.rs`): pmos-web's only, in assertion `require` only.
-        .merge(password::routes(state.clone()));
+        .merge(password::routes(state.clone()))
+        // The bot marketplace (`team.rs`): the catalog for pmos-web, the runtime and the
+        // Slack bot; a PM's own team and the admin's read for pmos-web only.
+        .merge(team::routes(state.clone()));
 
     Router::new()
         // Liveness: the process answers. Readiness: its dependencies do too.
@@ -626,12 +635,16 @@ async fn header_session(
 }
 
 /// `{user, skill, run_id, ttl_minutes?, history_sensitivity?}` or
-/// `{user, bot, run_id, ttl_minutes?, history_sensitivity?}`.
+/// `{user, bot, run_id, ttl_minutes?, history_sensitivity?, persona?}`.
 #[derive(Deserialize)]
 struct NewSession {
     user: String,
     skill: Option<String>,
     bot: Option<String>,
+    /// The persona (marketplace bot) a bot session runs as (`docs/bot-marketplace-spec.md`
+    /// §6). Absent, `null` or `nudge` is Nudge.
+    #[serde(default)]
+    persona: Option<String>,
     run_id: String,
     ttl_minutes: Option<i64>,
     /// The highest level the run's conversation history was built from (the runtime sends
@@ -662,6 +675,12 @@ async fn create_session(
             "send either `skill` or `bot`, not both",
         );
     }
+    if body.skill.is_some() && body.persona.is_some() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "`persona` goes with `bot`, never with `skill`",
+        );
+    }
     if !client_may_use(&state, client, body.skill.as_deref()) {
         let what = match (&body.skill, &body.bot) {
             (Some(skill), _) => format!("`{skill}` sessions"),
@@ -686,7 +705,15 @@ async fn create_session(
         (None, Some(bot)) => {
             state
                 .svc
-                .create_bot_session_from(&body.user, bot, &body.run_id, ttl, floor, Utc::now())
+                .create_bot_session_as(
+                    &body.user,
+                    bot,
+                    body.persona.as_deref(),
+                    &body.run_id,
+                    ttl,
+                    floor,
+                    Utc::now(),
+                )
                 .await
         }
         (None, None) => unreachable!("checked above"),
@@ -699,16 +726,36 @@ async fn create_session(
                 .iter()
                 .map(|t| json!({"name": t.harness_name, "kind": t.kind}))
                 .collect();
+            // The persona the session runs as, for the runtime's claim: its key, name, title
+            // and role. `null` for Nudge and for skill sessions.
+            let persona = session.persona.as_deref().and_then(|key| {
+                let roster = state.svc.roster();
+                roster.persona(key).map(|p| {
+                    json!({
+                        "key": p.name,
+                        "display_name": p.display_name,
+                        "title": p.title,
+                        "role": p.role,
+                    })
+                })
+            });
             (
                 StatusCode::CREATED,
                 Json(json!({
                     "token": session.token,
                     "session": session,
                     "tools": tools,
+                    "persona": persona,
                 })),
             )
                 .into_response()
         }
+        Err(e) if e.persona_code().is_some() => coded(
+            StatusCode::FORBIDDEN,
+            e.persona_code().unwrap_or_default(),
+            e.to_string(),
+            json!({}),
+        ),
         Err(e @ (SessionError::UnknownSkill(_) | SessionError::UnknownBot(_))) => {
             error(StatusCode::NOT_FOUND, e.to_string())
         }
@@ -1526,6 +1573,7 @@ async fn revoke_credential(
                 args_hash: None,
                 output_ref: Some(provider),
                 detail: Some(detail),
+                persona: None,
             })
             .await;
         }

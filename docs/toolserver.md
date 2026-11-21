@@ -215,7 +215,7 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /readyz` | none | Readiness: `200` when storage answers within a second and every connector's own dependency (the docs server) answers; `503` otherwise, naming the check that failed |
 | `POST /mcp` (Streamable HTTP) | `Bearer <session token>` | MCP for the harness: `tools/list`, `tools/call` |
 | `POST /internal/sessions` `{user, skill, run_id, ttl_minutes?}` | service or bot token | Create a session; returns `token` and the session's tools. `403` if the user isn't an active user holding `pm`, `reviewer` or `admin` in the user database, or the bot asks for a skill outside `PMOS_BOT_SKILLS`. |
-| `POST /internal/sessions` `{user, bot, run_id, ttl_minutes?, history_sensitivity?}` | service token | Create a bot session (see **Bot sessions**). Send `skill` or `bot`, never both (`400`). `404` for an unknown bot; `403` if `user` may not use it. `history_sensitivity` (`public`, `internal` or `restricted`; anything else is refused) starts the session at that level: see **Conversation history**. |
+| `POST /internal/sessions` `{user, bot, run_id, ttl_minutes?, history_sensitivity?, persona?}` | service token | Create a bot session (see **Bot sessions**). Send `skill` or `bot`, never both (`400`). `404` for an unknown bot; `403` if `user` may not use it. `history_sensitivity` (`public`, `internal` or `restricted`; anything else is refused) starts the session at that level: see **Conversation history**. `persona` runs the session as a marketplace bot (`400` with `skill`); refusals are `403 {code, error}` with `persona_needs_personal_bot`, `persona_unavailable` or `persona_not_on_team`, and the answer adds `persona: {key, display_name, title, role}` (`null` for Nudge): see **Personas and teams**. |
 | `GET /internal/runs/{run_id}/sensitivity` | service token | `{run_id, sensitivity}`: the highest level any stored session of that run reached, or `null` when none is stored (never made, or purged after it expired). The runtime records it on each finished task. |
 | `DELETE /internal/session` + `X-Pmos-Session` | service or bot token | Revoke a session (sandbox ended) |
 | `POST /internal/call` + `X-Pmos-Session` `{tool, args}` | service or bot token | One tool call for the session, with the same rules as MCP: allowlist, argument checks, approvals for writes, audit (which records the caller). |
@@ -256,6 +256,10 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/admin/users?user=` | web token (assertion as on the admin reads) | Every user, as an admin or an auditor may see them. See **The Admin API** |
 | `POST /internal/admin/users`, `PUT …/{handle}/roles`, `PUT …/{handle}/fields`, `POST …/{handle}/sign-in-name/confirm`, `POST …/{handle}/deactivate`, `POST …/{handle}/reactivate`, `DELETE …/{handle}/identities/{kind}`, `PUT /internal/admin/reviewers/{reviewer}` (all `?user=<admin>`) | web token **and** a signed assertion for `user`, and assertion `require` (else `503 assertion_required`) | User and role writes. See **The Admin API** |
 | `GET /internal/console/members?user=` | console token (assertion as on its approvals reads) | `{handles}` for an active admin's Approvals screen. See **The Admin API** |
+| `GET /internal/personas` | service, bot or web token (no assertion) | `{catalog_sha, personas}`: the offered marketplace bots, Nudge first. See **Personas and teams** |
+| `GET /internal/team/{handle}` | web token **and** a signed assertion for `handle`, in every mode | `Team`: the person's own team. See **Personas and teams** |
+| `PUT /internal/team/{handle}` `{add?, remove?, via}` | the same, and assertion `require` (else `503 assertion_required`) | Change one's own team, atomically. See **Personas and teams** |
+| `GET /internal/admin/personas?user=` | web token (assertion as on the admin reads) | `AdminPersonas`: who uses which bot. `view-audit-log` or `manage-members`. See **Personas and teams** |
 | `GET /internal/reviews?user=`, `GET /internal/reviews/{id}?user=` | web token **and** a signed assertion for `user`, in every mode | A reviewer's inbox and one draft of a PM assigned to them; metadata only when restricted. See **Reviews** |
 | `POST /internal/reviews/{id}/recommendation?user=` `{verdict, note?, draft_revision, args_hash}` | the same, and assertion `require` (else `503 assertion_required`) | A reviewer's recommendation, bound to the version read (`409 draft_changed`). Never decides anything. See **Reviews** |
 
@@ -628,7 +632,85 @@ Spec: `docs/bot-runtime-spec.md` §2.
 | `user` | the PM the task is for. A personal bot serves only its owner (`403` otherwise); a team bot, any active PM OS user (the user database). Never a `bots.*` identity. |
 
 Sessions, approval items and audit events record either `skill` or `bot`, never both; a bot
-session's `skill` is `null`.
+session's `skill` is `null`. A personal bot's session may also run as a persona (below).
+
+## Personas and teams
+
+The bot marketplace (`docs/bot-marketplace-spec.md`, slice B1): Chief, Sprout, Echo and any
+other **persona** in `content/personas/` is a role a PM's own personal bot (`pm-<handle>`, role
+`pm-assistant`) runs as, chosen per ask. Which ones a PM may ask is their **team**, one
+`user_bots` row per persona they picked (migration 0024). Nudge, the always-on generalist, is on
+every team and is never a row. `src/team.rs` (the store, in memory and Postgres),
+`src/service/team.rs` (the rules), `src/app/team.rs` (the routes), `tests/team.rs` (every rule on
+both stores).
+
+**A persona session** (`POST /internal/sessions {user, bot, run_id, persona}`, service token
+only, `ToolService::create_bot_session_as`). After the bot session's own checks, in order, each
+refusal `403 {code, error}` with a sentence the runtime passes on to the PM:
+
+1. the bot is a personal bot whose role is `pm-assistant` (`persona_needs_personal_bot`);
+2. the persona is in the catalog, offered and its role loaded (`persona_unavailable`: "Chief
+   isn't offered in PM OS any more. Ask Nudge instead."; an unknown key reads "That bot", and
+   the request's text is never echoed);
+3. it is `nudge`, or a row on `user`'s team (`persona_not_on_team`: "Chief isn't on your team
+   any more. Add it on the Bots page in PM OS, or ask Nudge.").
+
+The session stores the persona (`sessions.persona`; `null` for Nudge, also when the request
+names `nudge`). What it may do, with `B` the personal role and `P` the persona's role:
+
+| Session property | Rule |
+| --- | --- |
+| Tools | `role_tools(P) ∩ role_tools(B)`, less any write whose effective setting is `never`. `tools/list` shows only these. |
+| A write's setting | the stricter of the bot's own setting (its override, else `B`'s), `B`'s and `P`'s: `never` beats `approve`. A tool `P` adds, or a write `B` sets to `never`, stays out even if content that fails `pmos lint` were loaded (`tests/team.rs`, "holds the ceiling without the lint"). |
+| Data class | the lower of `P`'s and `B`'s |
+| Model (ledger) | `P`'s |
+| Re-checked | on every call, as any session: a persona withdrawn (`offered: false`) or gone from the catalog ends it. Removing the persona from the PM's team does **not** end a live session: the task already started finishes (within the session's TTL). |
+
+Every audit event of the session records `persona`; every approval item it drafts records it
+(`approvals.persona`, copied at creation, never changed: no route writes it and a trigger
+refuses an update). **Decisions are unchanged**: they check the item's bot and its own role,
+never the persona, so a draft stays the PM's and decidable after its persona leaves the team or
+the catalog; the decision's event records the item's `persona`. Sensitivity, the audience
+check, the owner-only rule and the reviewer rules are the same for every persona. Item views
+(`GET /internal/approvals…`, the reviewer's views, restricted metadata-only included) add
+`persona` (`null` is Nudge).
+
+**Routes.**
+
+| Route | Token | Answer |
+| --- | --- | --- |
+| `GET /internal/personas` | service, bot, web (no assertion; the console `403`) | `{catalog_sha, personas: [Persona]}`, the offered ones, Nudge first, then by `order`. `Persona` is `{key, display_name, title, mascot, always_on, summary, examples, can_do, reads, drafts, needs: [{source, label, without, met}]}`, nothing else of the file; `reads`, `drafts` and `needs[].met` are derived from the role's tools by `pmos lint`. |
+| `GET /internal/team/{handle}` | web, signed for `handle` in every mode | `Team` = `{handle, bots: [{key, always_on, added_at, offered, added_via?}], drafts_this_month: {key: n}}`. `bots` is Nudge (`added_at: null`), then each row in catalog order (a row whose persona left the catalog last); `offered: false` marks a withdrawn or deleted one. `drafts_this_month` counts the person's approval items per persona since the 1st, UTC (Nudge's under `nudge`). |
+| `PUT /internal/team/{handle}` | the same, and assertion `require` | `{add?: [key], remove?: [key], via: "onboarding" \| "bots_page" \| "picker"}` (no other field): `Team`. Atomic; adding a key already there or removing one that isn't is a no-op. |
+| `GET /internal/admin/personas?user=<viewer>` | web (assertion as the mode says) | `{personas: [{key, display_name, offered, always_on, users, handles, needs: [{source, label, met}], drafts_30d}], unknown: [{key, users, handles, drafts_30d}]}`: every persona in the catalog, offered or not (Nudge's `users` and `handles` are `null`); `unknown` lists rows naming a persona no longer in the catalog. Keys, handles and counts only. Needs `view-audit-log` or `manage-members` (`403 forbidden`), recorded as `admin.personas_read`. |
+
+Team route errors, each `{code, error}`: `401 bad_assertion` (missing, invalid, or not for this
+request); `403 forbidden` (signed for someone other than `handle`: nobody changes another
+person's team, an admin neither); `403 not_allowed` (active but without `ask-bot`, such as an
+Auditor-only person); `403 not_a_member` (not a user, or deactivated: their rows are kept and
+grant nothing); `400 bad_request` (a body that doesn't parse or names another field, both lists
+empty, a key that isn't a persona name, a key in both lists, `via` not one of the three);
+`409 always_on` (`nudge` in either list); `409 bot_unavailable` (adding a key that isn't offered:
+unknown, withdrawn or role missing; removing a withdrawn or deleted persona's row is allowed);
+`409 team_full` (more than 16 rows); `429 rate_limited` (more than 30 change attempts in an hour
+by one person, counted in memory); `503 assertion_required` (a change without assertion
+`require`).
+
+**History is the audit log.** Every change attempt is a `team.change` event (client `web`,
+`user` the person, `output_ref` their handle), written in the same transaction as the rows in
+Postgres. Allowed: `ok`, detail `add=chief,sprout remove=echo via=onboarding` (keys only, `-` for
+an empty list). Refused: `denied`, detail one fixed note: `not_offered`, `always_on`,
+`rate_limited`, `not_allowed`, `not_a_member`, `bad_request`, `team_full`, or before the person
+is verified (user `anonymous`) `forbidden`, `bad_assertion`, `assertion_required`. The admin
+audit view serves these details and each event's `persona`. Events are purged at 90 days by the
+one retention job; `user_bots` is current state (a removed bot's row is deleted) and nothing
+here deletes an event.
+
+**Defaults and limits.** Everyone starts with Nudge only, existing users included: the migration
+adds no rows, and rows from before it read `persona` as `null`. At most 16 rows per person (in
+code and in a deferred constraint trigger). The eval stack's `evals` account gets every offered
+persona (`added_via: seed`) when the in-memory user store is seeded from `PMOS_USERS_SEED`; never
+with a database.
 
 ### Conversation history
 
@@ -1630,6 +1712,7 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 | Credentials | `credentials` | Tokens sealed by the vault; the database never sees plaintext. Providers `atlassian`, `slack`, `github` |
 | Memory repos | `memory_repos` | One row per PM: `repo` (`org/name`) and `verified_at` |
 | Member requests | `member_requests` | A partial unique index keeps one `pending` request per Slack id; a decision is a conditional `UPDATE … WHERE status = 'pending'`, so exactly one wins |
+| Teams | `user_bots` | Migration 0024: one row per person and persona (never `nudge`), `added_at`, `added_via`; at most 16 per person (a deferred constraint trigger). A change takes an advisory lock per person and writes its `team.change` audit event in the same transaction. `sessions.persona`, `approvals.persona` (fixed by a trigger) and `audit_events.persona` are `null` for Nudge and for every row from before. See **Personas and teams** |
 | Users | `users`, `user_roles`, `user_identities`, `role_changes`, `pilot_exceptions`, `directory_version` | Migration 0015; see **The user database**. The invariants are a deferred trigger that takes an advisory lock; `role_changes` is append-only with its own retention rule. Audit events of host commands have client `host`. |
 
 - **Migrations** run on start-up.

@@ -415,6 +415,27 @@ async fn person_tokens_reach_only_the_approvals_routes() {
             .await;
         assert_eq!(s, 403);
     }
+    // The bot marketplace's routes (`app/team.rs`): the console reaches none of them; a PM's
+    // team and the admin read are pmos-web's alone (`tests/team.rs` has the whole matrix).
+    for path in [
+        "/internal/personas".to_string(),
+        format!("/internal/team/{SLACK_PM}"),
+        format!("/internal/admin/personas?user={SLACK_PM}"),
+    ] {
+        let (s, _) = srv.get(&path, CONSOLE_TOKEN, None).await;
+        assert_eq!(s, 403, "{path}");
+    }
+    for token in [SERVICE_TOKEN, BOT_TOKEN] {
+        for path in [
+            format!("/internal/team/{SLACK_PM}"),
+            format!("/internal/admin/personas?user={SLACK_PM}"),
+        ] {
+            let (s, _) = srv.get(&path, token, None).await;
+            assert_eq!(s, 403, "{path}");
+        }
+        let (s, _) = srv.get("/internal/personas", token, None).await;
+        assert_eq!(s, 200);
+    }
     // An unknown token is still a 401.
     let (s, _) = srv
         .get(
@@ -725,6 +746,7 @@ async fn every_pending_item_is_listed_past_the_decided_cap() {
                     content_sha: None,
                     model_alias: None,
                     sources_sensitivity: pmos_contract::Sensitivity::Internal,
+                    persona: None,
                 },
                 t0 + Duration::seconds(i as i64),
             )

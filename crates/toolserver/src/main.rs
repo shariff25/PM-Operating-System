@@ -93,6 +93,19 @@ async fn main() -> Result<()> {
                 .with_linked(stores.linked());
         stores.users = Arc::new(seeded);
         tracing::info!("user store seeded from PMOS_USERS_SEED (development only)");
+        // The eval stack's `evals` account gets every offered persona, so eval tasks pass the
+        // team check (docs/bot-marketplace-spec.md §5). In memory only, as the seed is.
+        let seeded = pmos_toolserver::team::seed_evals(
+            stores.teams.as_ref(),
+            stores.users.as_ref(),
+            catalog.roster(),
+            Utc::now(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        if seeded > 0 {
+            tracing::info!(personas = seeded, "the evals account's team seeded");
+        }
     } else if config.database_url.is_none() {
         stores.users = Arc::new(
             pmos_toolserver::users::MemoryUsers::new(rules)

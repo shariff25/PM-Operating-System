@@ -123,6 +123,8 @@ mod tests {
             user: "ana".into(),
             skill: None,
             bot: Some("docs".into()),
+            // A persona session's line carries `persona`; the console reads past it.
+            persona: Some("chief".into()),
             tool: "docs.search".into(),
             outcome: Outcome::Ok,
             sources: vec![],

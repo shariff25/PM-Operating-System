@@ -7,6 +7,7 @@ use std::sync::Arc;
 use chrono::NaiveDate;
 use pmos_contract::bots::{Bot, Role};
 use pmos_contract::model::harness_tool_name;
+use pmos_contract::personas::Persona;
 use pmos_contract::{lint, LintOptions, Skill, ToolKind, ToolRegistry};
 use serde::Serialize;
 use serde_json::Value;
@@ -45,17 +46,24 @@ pub enum CatalogError {
     MissingSchema(String),
 }
 
-/// The named bots and their roles (`content/bots/`, `content/roles/`). Loaded at start-up
-/// with the skills, and reloaded on `POST /internal/reindex`.
+/// The named bots and their roles (`content/bots/`, `content/roles/`), and the marketplace's
+/// personas (`content/personas/`, `docs/bot-marketplace-spec.md` §2). Loaded at start-up with
+/// the skills, and reloaded on `POST /internal/reindex`.
 #[derive(Debug, Clone, Default)]
 pub struct Roster {
     roles: BTreeMap<String, Arc<Role>>,
     bots: BTreeMap<String, Arc<Bot>>,
+    /// Every persona whose file linted clean (`Report.personas`), offered or not, in catalog
+    /// order: the always-on one first, then by `order`, then by key.
+    personas: Vec<Arc<Persona>>,
 }
 
 impl Roster {
     /// The roles and bots of a lint report that passed.
     pub fn from_report(report: &pmos_contract::Report) -> Self {
+        let mut personas: Vec<Arc<Persona>> =
+            report.personas.iter().cloned().map(Arc::new).collect();
+        sort_personas(&mut personas);
         let roster = Self {
             roles: report
                 .roles
@@ -67,6 +75,7 @@ impl Roster {
                 .iter()
                 .map(|b| (b.name.clone(), Arc::new(b.clone())))
                 .collect(),
+            personas,
         };
         for bot in roster.bots.values() {
             let reads = &bot.reads;
@@ -102,6 +111,61 @@ impl Roster {
     pub fn roles(&self) -> impl Iterator<Item = &Role> {
         self.roles.values().map(|r| r.as_ref())
     }
+
+    /// A role by name.
+    pub fn role(&self, name: &str) -> Option<Arc<Role>> {
+        self.roles.get(name).cloned()
+    }
+
+    /// Every persona in the catalog, offered or not, in catalog order.
+    pub fn personas(&self) -> impl Iterator<Item = &Arc<Persona>> {
+        self.personas.iter()
+    }
+
+    /// A persona by key, offered or not. `None` for a key not in the catalog.
+    pub fn persona(&self, key: &str) -> Option<&Arc<Persona>> {
+        self.personas.iter().find(|p| p.name == key)
+    }
+
+    /// A persona that PMs may use now (offered), with its role. `None` when the key is unknown,
+    /// the persona is withdrawn, or its role is missing: every caller fails closed on `None`.
+    pub fn offered(&self, key: &str) -> Option<(Arc<Persona>, Arc<Role>)> {
+        let persona = self.persona(key).filter(|p| p.offered)?;
+        let role = self.roles.get(&persona.role)?;
+        Some((persona.clone(), role.clone()))
+    }
+
+    /// Tests only: add `persona`, and `role` when given, **without the lint**, as content that
+    /// bypassed `pmos lint` would (the tool server must still hold the ceiling,
+    /// `docs/bot-marketplace-spec.md` §6). Replaces a persona or role of the same name.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_unlinted_persona(mut self, persona: Persona, role: Option<Role>) -> Self {
+        if let Some(role) = role {
+            self.roles.insert(role.name.clone(), Arc::new(role));
+        }
+        self.personas.retain(|p| p.name != persona.name);
+        self.personas.push(Arc::new(persona));
+        sort_personas(&mut self.personas);
+        self
+    }
+
+    /// Tests only: replace (or add) `role`, **without the lint**, as content that bypassed
+    /// `pmos lint` would.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_unlinted_role(mut self, role: Role) -> Self {
+        self.roles.insert(role.name.clone(), Arc::new(role));
+        self
+    }
+}
+
+/// Catalog order: the always-on persona first, then by `order`, then by key.
+fn sort_personas(personas: &mut [Arc<Persona>]) {
+    personas.sort_by(|a, b| {
+        b.always_on
+            .cmp(&a.always_on)
+            .then(a.order.cmp(&b.order))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 }
 
 #[derive(Debug, Clone)]

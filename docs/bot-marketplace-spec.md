@@ -1,7 +1,7 @@
 # Bot marketplace: Chief, Sprout and Echo beside Nudge
 
-Status: **design spec; slice C1 built** (contract, lint and generator: §13, "Status"). The
-independent reviewer checks it before any slice starts.
+Status: **design spec; slices C1 and B1 built** (contract, lint and generator; the tool
+server: §13, "Status"). The independent reviewer checks it before any slice starts.
 Owner's requirement (scope item j in `CLAUDE.md`, 2026-11-20): widen the product beyond one PM
 assistant with three new bots, a Chief of Staff, a Growth PM and an Outbound PM; as part of
 onboarding the PM sees a bot marketplace and chooses which bots to include; each bot has its own
@@ -920,6 +920,102 @@ Departures from the text above, all small:
 7. **Not in C1:** `persona-role-sections` (the content slices' test, §3); the content admin's
    file kinds (`crates/policy/src/admin/access.rs` `kind`) still class `personas/…` as `other`,
    since a new kind needs the web app's labels too (W1 or A1).
+
+### Status: B1 is built (2026-11-21, branch `claude/market-b1-toolserver`)
+
+Built, in `crates/toolserver`: migration `0024_user_bots.sql` (the `user_bots` table, its
+16-row deferred trigger, `persona` on `sessions`, `approvals` and `audit_events`, and
+`sessions_persona_needs_bot`); `src/team.rs` (`TeamStore` in memory and Postgres, the
+`team.change` event and its fixed details, the eval seed); `src/service/team.rs` (the catalog
+projection, a PM's own team, the admin read, the rate limit); `src/app/team.rs` (the four
+routes); persona sessions in `src/service.rs` (`create_bot_session_as`, `policy_for`'s
+intersection, the stricter setting and the lower data class; decisions still `policy_for(None,
+bot)`); `persona` on `Session`, `ApprovalItem`, `NewItem`, `AuditEvent`, the reviewer's views
+and the admin audit projection; the personas in `Roster` (reloaded on reindex); the `evals`
+seed in `main.rs`; `docs/toolserver.md` ("Personas and teams"). Tests: `tests/team.rs`, 42
+(17 cases on both the in-memory store and Postgres, 1 Postgres-only, 7 over HTTP), plus the
+console's lines to the existing allow-list test in `tests/approvals_assertion.rs`, and unit
+tests in `team.rs`, `service/team.rs` and `app/team.rs`. Every case uses fixture personas
+(`quill`, `abacus`, the withdrawn `ghost`), not C2–C4's content.
+
+**The internal contract W1 and R1 call.**
+
+- `GET /internal/personas`, with `PMOS_SERVICE_TOKEN` (runtime), `PMOS_BOT_TOKEN` (Slack) or
+  `PMOS_WEB_TOKEN` (no assertion needed; one that is sent is checked as the mode says):
+  `200 {catalog_sha, personas: [{key, display_name, title, mascot, always_on, summary,
+  examples, can_do, reads, drafts, needs: [{source, label, without, met}]}]}`, offered only,
+  Nudge first, then by `order`. The console's token `403`.
+- `GET /internal/team/{handle}`, `PMOS_WEB_TOKEN` and `X-Pmos-Assertion` signed for `handle`
+  in every mode: `200 {handle, bots: [{key: "nudge", always_on: true, added_at: null, offered:
+  true}, {key, always_on: false, added_at, added_via, offered}…], drafts_this_month: {key: n}}`
+  (rows in catalog order, withdrawn or deleted ones last with `offered: false`;
+  `drafts_this_month` is W1's `drafts_this_month`, keyed by persona, Nudge under `nudge`).
+- `PUT /internal/team/{handle}`, the same token and assertion, and the tool server in assertion
+  `require`: body exactly `{add?: [key], remove?: [key], via: "onboarding" | "bots_page" |
+  "picker"}` (W1 must not forward `routines`: it moves or pauses routines at the runtime first,
+  §6 "Removal"); `200 Team`.
+- `GET /internal/admin/personas?user=<viewer>`, `PMOS_WEB_TOKEN` (assertion for `user` as the
+  mode says): `200 {personas: [{key, display_name, offered, always_on, users, handles, needs:
+  [{source, label, met}], drafts_30d}], unknown: [{key, users, handles, drafts_30d}]}`.
+- Errors of the three PM and admin routes, each `{code, error}`: `401 bad_assertion`, `403
+  forbidden` (subject ≠ `handle`, or the viewer lacks the permission), `403 not_allowed` (no
+  `ask-bot`: an Auditor-only person), `403 not_a_member` (unknown or deactivated), `400
+  bad_request`, `409 always_on`, `409 bot_unavailable`, `409 team_full`, `429 rate_limited`, `503
+  assertion_required`, `503 unavailable`. W1 maps `409 bot_unavailable` and `409 always_on`
+  through as §6 says; `409 bot_not_on_team` is W1's own check (the tool server never answers it).
+- `POST /internal/sessions {user, bot, run_id, ttl_minutes?, history_sensitivity?, persona?}`,
+  `PMOS_SERVICE_TOKEN` only: `201 {token, session: {…, persona?}, tools, persona: {key,
+  display_name, title, role} | null}`. `persona` absent, `null` or `"nudge"` is Nudge (stored
+  `null`). Refusals `403 {code, error}`: `persona_needs_personal_bot`, `persona_unavailable`,
+  `persona_not_on_team`, `error` the sentence for the PM ("Chief isn't on your team any more. Add
+  it on the Bots page in PM OS, or ask Nudge." / "Chief isn't offered in PM OS any more. Ask
+  Nudge instead."). `{skill, persona}` is `400`. R1 pauses a routine on the two persona codes
+  and fails the task with `error`. A live persona session ends (`401` on `/mcp`, `404` on
+  `/internal/call`) once the persona is withdrawn; removing it from the team doesn't end it.
+- Approval items (`GET /internal/approvals…`, decisions, the reviewer's views) carry `persona`
+  (`null` is Nudge); `GET /internal/admin/audit` rows carry `persona`.
+
+**Departures**, all small:
+
+1. **Migration 0024, not 0023**: a security-fix branch in flight took 0023.
+2. **The trigger functions' path** is `<this schema>, pg_temp`, set by `ALTER FUNCTION` as 0021
+   does, not `pg_catalog, public` (which misses a schema other than `public`, as each test's).
+3. **Added fences**: a trigger refuses any `UPDATE` of `approvals.persona`; a Postgres team
+   change takes an advisory lock per person and writes its `team.change` event in the same
+   transaction (in memory: recorded first, applied only if recorded).
+4. **`create_bot_session_as`** is a new method with `persona`; `create_bot_session_from` keeps
+   its signature and delegates with none, so no existing caller changed.
+5. **`Team`** adds `offered: true` on Nudge's entry, `added_via` on rows, and
+   `drafts_this_month` (§6 has W1 serve "the tool server's count" but gave the tool server no
+   route for it).
+6. **Removing a withdrawn or deleted persona's row is allowed** ("each key must be offered"
+   applies to `add`; §6 also says a withdrawn bot "can only be removed"). A key that isn't a
+   persona name is `400 bad_request` (never recorded), not `409`. Added codes: `409 team_full`,
+   `403 forbidden` for a subject mismatch, `403 not_a_member` also for a handle that isn't a
+   user. Added denied notes: `not_a_member`, `bad_request`, `team_full`, and, recorded as
+   `anonymous` before the person is verified, `forbidden`, `bad_assertion`,
+   `assertion_required`.
+7. **Assertions**: the team routes need one in every mode, reads included, as the reviewer
+   routes do; the catalog needs none (it names no one).
+8. **`GET /internal/admin/personas`** is `pmos-web`'s only (the other admin reads also take the
+   service token); it adds `display_name`, `always_on` and `unknown` (the §8 warning list), gives
+   Nudge `users: null`, leaves `needs[].without` out, and lists every row's handle, a
+   deactivated person's included.
+9. **The rate limit** counts every change attempt by an active person who may ask, refused
+   ones included, in process memory (a restart starts the count again).
+10. **The in-memory team store** doesn't check a handle exists (Postgres's foreign key does);
+    the service checks the person before every read and write.
+11. **The admin audit projection** adds `persona` and serves `team.change` details; the
+    `persona=` filter is left to A1. A reviewer's own audit events (`approvals.review_*`) also
+    carry the item's persona.
+12. **One line outside the slice**: `crates/toolserver/src/password/mod.rs` gains `persona:
+    None,` in its one `AuditEvent` literal, which the new field requires to compile. Nothing
+    else in the password, Entra or directory files changed; a merge with the password fixes
+    keeps both sides. `crates/console/src/audit.rs`'s test literal gains the field too.
+
+**Not verified**: R1 and W1 against these routes (not built); the routes with C2–C4's real
+personas (fixtures only); the Postgres cap under concurrent requests from two processes (the
+advisory lock and the deferred trigger are tested one at a time).
 
 ### Order and parallelism
 
