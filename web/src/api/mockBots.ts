@@ -108,6 +108,20 @@ export interface MockBotsOptions {
   withdrawnBot?: boolean;
   /** Refuse every team change with this code. `unknown_outcome` makes the change first, then loses the answer. */
   teamError?: string;
+  /**
+   * Who writes the daily brief at the start (slice R2): `chief`, or Nudge (the default). Also who
+   * wrote the brief that is already in, so Today's card names them. `none` gives the person no
+   * brief routine at all.
+   */
+  briefWriter?: 'chief' | 'nudge' | 'none';
+}
+
+/** The daily brief's routine prompt, as the Slack service makes it (`[daily-brief]` finds it). */
+export const BRIEF_PROMPT = '[daily-brief] Write my daily brief with the daily-brief skill.';
+
+/** Whether a routine is the daily brief, as pmos-web finds it. */
+export function isBriefRoutine(r: Pick<BotRoutine, 'prompt'>): boolean {
+  return (r.prompt ?? '').trimStart().startsWith('[daily-brief]');
 }
 
 const TEAM_STATUS: Record<string, number> = {
@@ -145,6 +159,10 @@ export interface MockTeam {
   meFields(me: Me): Pick<Me, 'team' | 'ask_persona' | 'team_unavailable' | 'show_team_step' | 'show_team_note'>;
   bots(me: Me): Bots;
   change(me: Me, change: TeamChange): Bots;
+  /** `PUT /api/me/brief`, with pmos-web's checks. */
+  setBrief(me: Me, persona: string): Bots;
+  /** Who wrote the brief that is in (Today's attribution): null is Nudge. Not who writes the next one. */
+  briefAuthor(): string | null;
   /** The checks `POST /api/tasks` makes for `persona`; answers the key to store (null for Nudge). */
   checkAsk(me: Me, persona: string | undefined): string | null;
   /** Whether attribution may name this key now (`persona_offered`). */
@@ -177,8 +195,12 @@ export function createMockTeam(
   let lastAsked = seed.includes('chief') ? 'chief' : 'nudge';
   let changes = 0;
 
+  const writer = options.briefWriter === 'chief' ? 'chief' : null;
+  const author = writer;
   const routines: MockRoutine[] = [
-    { id: 'rtn_brief', persona: null, enabled: true, cron: '30 8 * * 1-5', tz: 'Europe/London', prompt: 'brief me', next_run_at: iso(now0 + 18 * HOUR) },
+    ...(options.briefWriter === 'none'
+      ? []
+      : [{ id: 'rtn_brief', persona: writer, enabled: true, cron: '30 8 * * 1-5', tz: 'Europe/London', prompt: BRIEF_PROMPT, next_run_at: iso(now0 + 18 * HOUR) }]),
     { id: 'rtn_week', persona: 'chief', enabled: true, cron: '0 9 * * 1', tz: 'Europe/London', prompt: 'What slipped last week?', next_run_at: iso(now0 + 3 * 24 * HOUR) },
     { id: 'rtn_scout', persona: 'scout', enabled: true, cron: '0 10 * * 3', tz: 'Europe/London', prompt: 'What are customers asking about?', next_run_at: iso(now0 + 4 * 24 * HOUR) },
   ];
@@ -216,7 +238,8 @@ export function createMockTeam(
     const withdrawn: WithdrawnBot[] = [...team.entries()]
       .filter(([k]) => !isOffered(k))
       .map(([k, row]) => ({ key: k, added_at: row.added_at, added_via: row.added_via, drafts_this_month: usage.draftsThisMonth(k), last_used_at: usage.lastUsed(k), routines: routinesOf(k) }));
-    return { bots, withdrawn };
+    const brief = routines.find(isBriefRoutine);
+    return { bots, withdrawn, brief: brief ? { routine_id: brief.id, writer: brief.persona ?? 'nudge', enabled: brief.enabled } : { routine_id: null, writer: null, enabled: false } };
   };
 
   return {
@@ -250,10 +273,11 @@ export function createMockTeam(
       if (++changes > 30) throw new ApiError(429, 'rate_limited', 'Too many team changes this hour.');
       const after = new Set([...team.keys(), ...add].filter((k) => !remove.includes(k)));
       if (after.size + 1 > 16) throw new ApiError(409, 'team_full', 'A team holds at most 16 bots.');
-      // A removed bot's routines move (or pause) before the bot leaves.
+      // A removed bot's routines move (or pause) before the bot leaves; the daily brief always
+      // goes back to Nudge (slice R2).
       for (const r of routines) {
         if (r.persona !== null && remove.includes(r.persona)) {
-          if (body.routines === 'pause') r.enabled = false;
+          if (body.routines === 'pause' && !isBriefRoutine(r)) r.enabled = false;
           else r.persona = null;
         }
       }
@@ -261,6 +285,30 @@ export function createMockTeam(
       for (const k of add) if (!team.has(k)) team.set(k, { added_at: iso(Date.now()), added_via: body.via });
       if (code === 'unknown_outcome') throw new ApiError(502, 'unknown_outcome', 'The answer was lost.');
       return botsOf(me);
+    },
+
+    setBrief(me, persona) {
+      if (!canAsk(me)) throw new ApiError(403, 'not_allowed', 'Your role does not allow asking.');
+      if (!KEY.test(persona) || persona.length > 32) throw new ApiError(400, 'bad_request', 'That is not a bot key.');
+      const code = options.teamError;
+      if (code && code !== 'unknown_outcome') throw new ApiError(TEAM_STATUS[code] ?? 400, code, 'Refused by the sample data.');
+      if (catalogMode === 'unavailable') throw new ApiError(503, 'unavailable', 'The tool server is not answering.');
+      const want = persona === 'nudge' ? null : persona;
+      if (want !== null) {
+        const entry = catalogEntry(want);
+        if (!entry || !isOffered(want)) throw new ApiError(409, 'bot_unavailable', 'That bot is not offered.');
+        if (entry.always_on || !entry.can_do.includes('daily-brief')) throw new ApiError(409, 'cant_write_brief', 'That bot does not write briefs.');
+        if (!team.has(want)) throw new ApiError(409, 'bot_not_on_team', 'That bot is not on your team.');
+      }
+      const briefs = routines.filter(isBriefRoutine);
+      if (briefs.length === 0) throw new ApiError(409, 'no_brief', 'You have no daily brief yet.');
+      for (const r of briefs) r.persona = want;
+      if (code === 'unknown_outcome') throw new ApiError(502, 'unknown_outcome', 'The answer was lost.');
+      return botsOf(me);
+    },
+
+    briefAuthor() {
+      return author;
     },
 
     checkAsk(me, persona) {

@@ -4176,10 +4176,11 @@ impl FollowUpStore for CountingFollowUps {
         date: chrono::NaiveDate,
         changed: Vec<Changed>,
         followups: Vec<NewFollowUp>,
+        persona: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<(), StoreError> {
         self.inner
-            .replace(handle, date, changed, followups, now)
+            .replace(handle, date, changed, followups, persona, now)
             .await
     }
     async fn day(&self, handle: &str, now: DateTime<Utc>) -> Result<Option<Day>, StoreError> {

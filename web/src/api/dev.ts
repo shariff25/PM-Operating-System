@@ -66,15 +66,18 @@ function mockPasswordOptions(): { passwordRefusal?: string; retryAfter?: number 
 /**
  * The bot marketplace on the dev server: `?mock_bots=nudge_only` offers nothing besides Nudge,
  * `unavailable` makes the team unreadable, `withdrawn` puts a withdrawn bot on the team, and
- * `?mock_team=<error code>` refuses every team change with that code.
+ * `?mock_team=<error code>` refuses every team change with that code, and `?mock_brief_writer=chief`
+ * starts with Chief writing the daily brief (and having written today's), `none` with no brief routine.
  */
 function mockBotsOptions(): MockBotsOptions {
   const q = new URLSearchParams(window.location.search);
   const bots = q.get('mock_bots');
+  const writer = q.get('mock_brief_writer');
   return {
     catalog: bots === 'nudge_only' || bots === 'unavailable' ? bots : undefined,
     withdrawnBot: bots === 'withdrawn',
     teamError: q.get('mock_team') ?? undefined,
+    briefWriter: writer === 'chief' || writer === 'none' ? writer : undefined,
   };
 }
 

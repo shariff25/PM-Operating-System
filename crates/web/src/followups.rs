@@ -101,6 +101,9 @@ pub struct Day {
     pub date: NaiveDate,
     pub changed: Vec<Changed>,
     pub updated: DateTime<Utc>,
+    /// Who wrote the brief that filled this day: a marketplace bot's key, `None` for Nudge
+    /// (slice R2). Attribution only, as the Slack service reported it.
+    pub persona: Option<String>,
 }
 
 pub fn followup_id(handle: &str, kind: Kind, system: &str, url: &str) -> String {
@@ -143,15 +146,17 @@ pub trait FollowUpStore: Send + Sync {
     async fn dismiss(&self, handle: &str, id: &str, now: DateTime<Utc>)
         -> Result<bool, StoreError>;
 
-    /// Replace the PM's follow-ups and the day's `changed` items. A follow-up already held
-    /// (same id) keeps its `created` and `dismissed` and gets a fresh expiry; others are
-    /// added; any the producer no longer lists is removed.
+    /// Replace the PM's follow-ups and the day's `changed` items, and record who wrote the
+    /// brief (`persona`: a bot's key, `None` for Nudge). A follow-up already held (same id)
+    /// keeps its `created` and `dismissed` and gets a fresh expiry; others are added; any the
+    /// producer no longer lists is removed.
     async fn replace(
         &self,
         handle: &str,
         date: NaiveDate,
         changed: Vec<Changed>,
         followups: Vec<NewFollowUp>,
+        persona: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<(), StoreError>;
 
@@ -249,6 +254,7 @@ impl FollowUpStore for MemoryFollowUpStore {
         date: NaiveDate,
         changed: Vec<Changed>,
         followups: Vec<NewFollowUp>,
+        persona: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<(), StoreError> {
         let mut pms = self.pms.lock().expect("followups lock");
@@ -276,6 +282,7 @@ impl FollowUpStore for MemoryFollowUpStore {
             date,
             changed,
             updated: now,
+            persona: persona.map(str::to_string),
         });
         pm.delivered = Some(now);
         Ok(())

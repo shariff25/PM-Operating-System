@@ -12,7 +12,11 @@
 //! prompt starting with [`TAG`] (`[daily-brief]`), as `[reply-assistant]` and `[bets-review]`
 //! are, so the runtime needs nothing new. Asking again never makes a second one: the same
 //! time says so; a new time creates the new routine and then deletes the old one (the
-//! runtime's routine PATCH is not used for schedules). `brief off` deletes only routines with
+//! runtime's routine PATCH is not used for schedules), **except** for a brief another bot
+//! writes (Chief, chosen in the web app's Bots page; slice R2): that routine is moved to the
+//! new time with `PATCH {schedule, enabled: true}`, so it stays that bot's (this service may
+//! not set a routine's bot), and any extra brief routine is deleted. `brief now` runs as the
+//! bot that writes the brief. `brief off` deletes only routines with
 //! the tag. Times are 00:00 to 23:59 (`7am`, `7:30 pm` also work); anything else gets one
 //! helpful line and changes nothing. The wording is in `brief_copy.rs`.
 //!
@@ -135,6 +139,18 @@ pub fn is_brief_routine(routine: &Value) -> bool {
         .is_some_and(|p| p.trim_start().starts_with(TAG))
 }
 
+/// The marketplace bot that writes the PM's brief (the first brief routine's `persona`), or
+/// `None` for Nudge (slice R2: the PM chooses Chief in the web app).
+pub fn brief_writer(routines: &[Value]) -> Option<String> {
+    routines
+        .iter()
+        .find(|r| is_brief_routine(r))
+        .and_then(|r| r["persona"].as_str())
+        .filter(|k| *k != pmos_contract::personas::ALWAYS_ON)
+        .filter(|k| pmos_contract::bots::valid_name(k))
+        .map(String::from)
+}
+
 /// The `(hour, minute)` a routine's cron runs at.
 fn time_of(routine: &Value) -> Option<(u32, u32)> {
     let cron = routine["schedule"]["cron"].as_str()?;
@@ -206,9 +222,19 @@ pub async fn handle_dm(
         Command::BadTime => copy::BAD_TIME.into(),
         Command::Now => {
             bots.remember_thread(channel, thread_ts, &bot);
+            // The bot that writes the PM's brief writes this one too (slice R2): Chief, when
+            // the PM chose it in the web app. Nudge's, or routines that can't be read, send
+            // no persona, as before.
+            let writer = match bots.runtime().routines(&handle).await {
+                Ok(routines) => brief_writer(&routines),
+                Err(e) => {
+                    tracing::warn!(error = %e, "couldn't read the brief routine; brief now as Nudge");
+                    None
+                }
+            };
             match bots
                 .runtime()
-                .create_task(&handle, &bot, PROMPT, channel, thread_ts)
+                .create_task_as(&handle, &bot, PROMPT, channel, thread_ts, writer.as_deref())
                 .await
             {
                 Ok(task) => {
@@ -282,6 +308,30 @@ async fn routine_command(bots: &Bots, handle: &str, slack_user: &str, cmd: Comma
                     };
                 }
                 return copy::unchanged(&time, &shown_tz);
+            }
+            // A brief another bot writes (Chief, chosen in the web app; slice R2) keeps its
+            // routine and gets the new time, so it stays that bot's: this service may not set a
+            // routine's bot (only pmos-web can check the team), and making a new routine would
+            // hand the brief back to Nudge without a word.
+            let written_by_another = |r: &&&Value| {
+                r["persona"]
+                    .as_str()
+                    .is_some_and(|p| p != pmos_contract::personas::ALWAYS_ON)
+            };
+            if let Some(r) = found.iter().find(written_by_another) {
+                let id = r["id"].as_str().unwrap_or_default();
+                let schedule = json!({"cron": wanted, "tz": tz});
+                if let Err(e) = runtime.set_routine_schedule(handle, id, &schedule).await {
+                    return failure(&e);
+                }
+                tracing::info!(owner = handle, time = %time, "brief moved, same writer");
+                for other in found.iter().filter(|o| o["id"] != r["id"]) {
+                    let id = other["id"].as_str().unwrap_or_default();
+                    if let Err(e) = runtime.delete_routine(handle, id).await {
+                        tracing::warn!(error = %e, "removing an extra brief routine failed");
+                    }
+                }
+                return copy::on(&time, &shown_tz);
             }
             // A new time (or zone): make the new routine first, then remove the old ones, so
             // a failure never leaves the PM with none.

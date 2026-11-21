@@ -16,7 +16,7 @@ import { draftHref, taskHref } from '../url';
 import { TaskTable } from './Activity';
 import { ApiError } from '../api';
 import { cardOf, defaultPersona, identify, isUnknownOutcome, teamErrorText, teamOf } from '../bots';
-import { BotBy } from '../components/BotParts';
+import { BotBy, BotFace } from '../components/BotParts';
 import { BotPicker, pickerBot } from '../components/BotPicker';
 import type { PickerBot } from '../components/BotPicker';
 import { TeamNote } from '../components/TeamNote';
@@ -353,6 +353,25 @@ function Card({ id, className, children }: { id: string; className?: string; chi
   );
 }
 
+/**
+ * "· Written by Chief" after "Your daily brief is in" (slice R2): who wrote the brief that is in,
+ * named as drafts are (`identify`: null is Nudge; a bot no longer offered reads so, with the
+ * neutral face). The name is plain text.
+ */
+function BriefBy({ persona, offered }: { persona: string | null; offered: boolean | undefined }) {
+  const { bots } = useData();
+  const who = identify(persona, offered, bots?.bots);
+  return (
+    <>
+      <span className="today-brief-sep" aria-hidden="true">·</span>
+      <span className={`today-brief-by bot-by-${who.kind}`} data-bot={who.kind === 'bot' || who.kind === 'nudge' ? who.mascot : who.kind}>
+        <BotFace mascot={who.mascot} size={16} />
+        <span>{copy.today.briefBy(who.name)}</span>
+      </span>
+    </>
+  );
+}
+
 export function Home() {
   const { api, me, openPalette, navigate } = useApp();
   const { drafts, draftsError, reloadDrafts, brief, briefState, tasks, reloadTasks, takeTeamStep } = useData();
@@ -416,6 +435,7 @@ export function Home() {
               : timing === 'stale'
                 ? copy.today.briefStale(relTime(brief.delivered_at ?? brief.date, now))
                 : copy.today.briefNever}
+            {timing === 'today' && brief.persona !== undefined && <BriefBy persona={brief.persona} offered={brief.persona_offered} />}
           </p>
         )}
         {brief?.slack_withheld && (

@@ -361,3 +361,45 @@ async fn with_the_feed_off_the_block_is_still_hidden() {
     let _ = notifier.await;
     stack.stop().await;
 }
+
+/// Slice R2: a brief Chief wrote reaches the web app's panels as Nudge's does, and says who
+/// wrote it (from the runtime's notification, never from the block); Nudge's says nothing.
+#[tokio::test]
+async fn a_brief_chief_wrote_still_fills_the_panels_and_names_chief() {
+    let stack = Stack::new().await;
+    let (web, base, stop_web) = mock_web().await;
+    let (stop, notifier) = start(&stack, Some(producer(&base)));
+    let text = format!("{BRIEF}\n\n{}", block());
+    let mut chiefs = done("ntf_1", "pm-ana", "ana", &text);
+    chiefs["persona"] = json!("chief");
+    push(&stack, &[chiefs]);
+    let shown = posted(&stack, 1).await;
+    assert!(
+        shown.contains("SAML SSO") && !shown.contains("pmos-brief"),
+        "{shown}"
+    );
+    let (handle, _, _, body) = until("the PUT", || web.puts.lock().unwrap().first().cloned()).await;
+    assert_eq!(handle, "ana");
+    assert_eq!(body["persona"], "chief");
+    assert_eq!(body["changed"].as_array().unwrap().len(), 1);
+    assert_eq!(body["waiting_on_you"].as_array().unwrap().len(), 1);
+
+    // Nudge's (`nudge`, or no persona) and a key not shaped like one: no `persona` sent.
+    let mut nudges = done("ntf_2", "pm-ana", "ana", &text);
+    nudges["persona"] = json!("nudge");
+    let mut odd = done("ntf_3", "pm-ana", "ana", &text);
+    odd["persona"] = json!("<!channel>");
+    push(&stack, &[nudges, odd]);
+    let puts = until("three PUTs", || {
+        let p = web.puts.lock().unwrap().clone();
+        (p.len() >= 3).then_some(p)
+    })
+    .await;
+    for (_, _, _, body) in &puts[1..] {
+        assert!(body.get("persona").is_none(), "{body}");
+    }
+    stop.cancel();
+    let _ = notifier.await;
+    stop_web.cancel();
+    stack.stop().await;
+}
