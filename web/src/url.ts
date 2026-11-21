@@ -65,6 +65,10 @@ export type Route =
   | { name: 'reviews' }
   | { name: 'security' }
   | { name: 'review'; id: string }
+  /** The person's own team: `#/bots`. */
+  | { name: 'bots' }
+  /** "Pick your team", the first step of the guided start: `#/start/team`. */
+  | { name: 'pickTeam' }
   /** `search` is the query part of the hash (the audit filters), without the `?`. */
   | { name: 'admin'; section: AdminSection; search: string; sub?: PolicyPart };
 
@@ -87,6 +91,8 @@ export function parseRoute(path: string): Route {
   if (path === '/activity') return { name: 'activity' };
   if (path === '/reviews') return { name: 'reviews' };
   if (path === '/security') return { name: 'security' };
+  if (path === '/bots') return { name: 'bots' };
+  if (path === '/start/team') return { name: 'pickTeam' };
   const review = reviewIdFromPath(path);
   if (review) return { name: 'review', id: review };
   const admin = adminRoute(path);

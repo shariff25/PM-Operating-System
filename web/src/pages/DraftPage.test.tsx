@@ -344,7 +344,8 @@ describe('approving', () => {
 
   it('practice draft: approving creates nothing and no link appears', async () => {
     const user = userEvent.setup();
-    renderApp({ noDrafts: true });
+    // Nothing offered besides Nudge, so the first visit stays on Today (no "Pick your team" step).
+    renderApp({ noDrafts: true, catalog: 'nudge_only' });
     // a first visit with no drafts makes the practice draft; it is listed on Today, and opens from there
     await user.click(await screen.findByRole('link', { name: /Practice: why PMs should take the stairs/ }));
     expect(await screen.findByText(copy.welcomeNoDrafts)).toBeInTheDocument();

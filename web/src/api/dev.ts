@@ -1,6 +1,7 @@
 // Dev server only. This file is reached through `if (import.meta.env.DEV)` in ./index.ts, so a
 // production build never includes it or the sample-data client.
 import { createMockClient } from './mock';
+import type { MockBotsOptions } from './mockBots';
 import type { MockPolicyOptions } from './mockPolicy';
 import { createRealClient } from './real';
 import type { Api, AuthProvider } from './types';
@@ -62,6 +63,21 @@ function mockPasswordOptions(): { passwordRefusal?: string; retryAfter?: number 
   };
 }
 
+/**
+ * The bot marketplace on the dev server: `?mock_bots=nudge_only` offers nothing besides Nudge,
+ * `unavailable` makes the team unreadable, `withdrawn` puts a withdrawn bot on the team, and
+ * `?mock_team=<error code>` refuses every team change with that code.
+ */
+function mockBotsOptions(): MockBotsOptions {
+  const q = new URLSearchParams(window.location.search);
+  const bots = q.get('mock_bots');
+  return {
+    catalog: bots === 'nudge_only' || bots === 'unavailable' ? bots : undefined,
+    withdrawnBot: bots === 'withdrawn',
+    teamError: q.get('mock_team') ?? undefined,
+  };
+}
+
 /** VITE_API=real talks to pmos-web through the dev proxy; anything else uses the sample data. */
 export function devApiFactory(): (onSignedOut: () => void) => Api {
   if (import.meta.env.VITE_API === 'real') return (onSignedOut) => createRealClient({ onSignedOut });
@@ -83,6 +99,7 @@ export function devApiFactory(): (onSignedOut: () => void) => Api {
       ...mockUsersOptions(),
       ...mockPasswordOptions(),
       ...mockPolicyOptions(),
+      ...mockBotsOptions(),
       ...(import.meta.env.VITE_MOCK_EMPTY === 'on' ? { noDrafts: true, firstVisit: false, emptyBrief: true } : {}),
       ...(import.meta.env.VITE_MOCK_FAST === 'on' ? { latency: 0, stepMs: 150 } : {}),
     });

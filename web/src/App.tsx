@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Api, Me } from './api';
-import { AppContext } from './app-context';
+import { AppContext, useApp } from './app-context';
+import { canAsk } from './bots';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Palette } from './components/Palette';
 import { Shell } from './components/Shell';
@@ -31,6 +32,9 @@ const ReviewsPage = lazy(() => import('./pages/reviews/ReviewsPage').then((m) =>
 // Password setup (with its QR code drawing) and the security page are used rarely: chunks of their own.
 const SetupPage = lazy(() => import('./pages/password/SetupPage').then((m) => ({ default: m.SetupPage })));
 const SecurityPage = lazy(() => import('./pages/password/SecurityPage').then((m) => ({ default: m.SecurityPage })));
+// The Bots page and the one-time "Pick your team" step are visited rarely: chunks of their own.
+const BotsPage = lazy(() => import('./pages/Bots').then((m) => ({ default: m.Bots })));
+const PickTeam = lazy(() => import('./pages/PickTeam').then((m) => ({ default: m.PickTeam })));
 
 /** Shown while a small page's code is on its way. */
 function PageLoading({ label }: { label: string }) {
@@ -69,7 +73,25 @@ export interface AppProps {
 /** The page for a route. Follow-ups exist only when the brief is built; otherwise it is home. */
 function Page({ route }: { route: Route }) {
   const { briefState } = useData();
+  const { me } = useApp();
   switch (route.name) {
+    // Only someone who may ask has a team; for anyone else these are the home page.
+    case 'bots':
+      return canAsk(me) ? (
+        <Suspense fallback={<PageLoading label={copy.bots.page.loading} />}>
+          <BotsPage />
+        </Suspense>
+      ) : (
+        <Home />
+      );
+    case 'pickTeam':
+      return canAsk(me) ? (
+        <Suspense fallback={<PageLoading label={copy.bots.pick.loading} />}>
+          <PickTeam />
+        </Suspense>
+      ) : (
+        <Home />
+      );
     case 'drafts':
       return <Drafts />;
     case 'draft':

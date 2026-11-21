@@ -4,6 +4,7 @@ import { ApiError, REJECT_REASONS } from '../api';
 import type { Draft, HintName, RejectReason, Suggestion } from '../api';
 import { useApp } from '../app-context';
 import { ApproveDialog } from '../components/ApproveDialog';
+import { DraftedBy } from '../components/BotParts';
 import { DraftPill, ErrorNote, ExtLink, Hint, Markdown, Skeleton, StrippedNote, SystemTag, TargetLink, kindSystem } from '../components/bits';
 import { Recommendations } from '../components/Recommendations';
 import { SourceList, useSourceJump } from '../components/Sources';
@@ -1024,7 +1025,8 @@ export function DraftPage({ id }: { id: string }) {
           </div>
         </div>
         {meta}
-        <h1 className="doc-title">{draft.title}</h1>
+        <h1 className="doc-title doc-title-by">{draft.title}</h1>
+        <DraftedBy persona={draft.persona} offered={draft.persona_offered} />
         {changed ? <DocDiff diff={diff} /> : <p className="muted">{copy.draft.diffNoChange}</p>}
       </section>
     );
@@ -1032,7 +1034,8 @@ export function DraftPage({ id }: { id: string }) {
     sheet = (
       <article className="sheet" aria-label={copy.draft.formattedLabel}>
         {meta}
-        <h1 className="doc-title">{draft.title}</h1>
+        <h1 className="doc-title doc-title-by">{draft.title}</h1>
+        <DraftedBy persona={draft.persona} offered={draft.persona_offered} />
         <Markdown rendered={rendered} className="prose" onCite={onCite} highlight={selected} />
         <StrippedNote parts={rendered.stripped} what={copy.stripped.draft} />
       </article>
