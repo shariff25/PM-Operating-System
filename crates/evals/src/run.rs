@@ -38,7 +38,19 @@ pub async fn follow_task(
     level: Option<&str>,
     follow: &Follow,
 ) -> Outcome {
-    follow_turn(rt, bot, requested_by, text, level, None, follow).await
+    let as_ = AskAs {
+        level,
+        persona: None,
+    };
+    follow_turn(rt, bot, requested_by, text, as_, None, follow).await
+}
+
+/// What a task is asked as: the category's `level` and `persona` (a marketplace bot,
+/// `docs/bot-marketplace-spec.md` §10), when it names them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AskAs<'a> {
+    pub level: Option<&'a str>,
+    pub persona: Option<&'a str>,
 }
 
 /// [`follow_task`] for one turn of `conversation` (a thread's turns share one id).
@@ -47,12 +59,19 @@ pub async fn follow_turn(
     bot: &str,
     requested_by: &str,
     text: &str,
-    level: Option<&str>,
+    as_: AskAs<'_>,
     conversation: Option<&str>,
     follow: &Follow,
 ) -> Outcome {
     let created = match rt
-        .create_task_in(bot, requested_by, text, level, conversation)
+        .create_task_in(
+            bot,
+            requested_by,
+            text,
+            as_.level,
+            as_.persona,
+            conversation,
+        )
         .await
     {
         Ok(t) => t,
@@ -242,6 +261,7 @@ async fn run_turn(
     rt: &Runtime,
     bot: &str,
     level: Option<&str>,
+    persona: Option<&str>,
     req: TurnRequest<'_>,
     opts: &RunOptions,
 ) -> TurnResult {
@@ -256,7 +276,7 @@ async fn run_turn(
         bot,
         &opts.requested_by,
         ask,
-        level,
+        AskAs { level, persona },
         conversation,
         &opts.follow,
     )
@@ -342,12 +362,13 @@ async fn attempt(
     rt: &Runtime,
     bot: &str,
     level: Option<&str>,
+    persona: Option<&str>,
     task: &EvalTask,
     repeat: u32,
     opts: &RunOptions,
 ) -> TaskReport {
     if task.is_thread() {
-        return attempt_thread(rt, bot, level, task, repeat, opts).await;
+        return attempt_thread(rt, bot, level, persona, task, repeat, opts).await;
     }
     let req = TurnRequest {
         conversation: None,
@@ -355,7 +376,7 @@ async fn attempt(
         expect: Some(&task.expect),
         judge_ask: Some(&task.ask),
     };
-    let r = run_turn(rt, bot, level, req, opts).await;
+    let r = run_turn(rt, bot, level, persona, req, opts).await;
     let tag = (!r.grade.passed()).then(|| tag_failure(&r.outcome, &r.grade));
     TaskReport {
         id: task.id.clone(),
@@ -400,6 +421,7 @@ async fn attempt_thread(
     rt: &Runtime,
     bot: &str,
     level: Option<&str>,
+    persona: Option<&str>,
     task: &EvalTask,
     repeat: u32,
     opts: &RunOptions,
@@ -443,7 +465,7 @@ async fn attempt_thread(
             expect: turn.expect.as_ref(),
             judge_ask: judge_ask.as_deref(),
         };
-        let r = run_turn(rt, bot, level, req, opts).await;
+        let r = run_turn(rt, bot, level, persona, req, opts).await;
         let tag = (!r.grade.passed()).then(|| {
             let mut t = tag_failure(&r.outcome, &r.grade);
             t.reason = format!("turn {n} of {}: {}", task.thread.len(), t.reason);
@@ -536,13 +558,23 @@ pub async fn run_category(
             let limit = limit.clone();
             let bot = bot.clone();
             let level = category.level.clone();
+            let persona = category.persona.clone();
             let opts = opts.clone();
             set.spawn(async move {
                 let _permit = limit
                     .acquire_owned()
                     .await
                     .expect("the semaphore is never closed");
-                let line = attempt(&rt, &bot, level.as_deref(), &task, repeat, &opts).await;
+                let line = attempt(
+                    &rt,
+                    &bot,
+                    level.as_deref(),
+                    persona.as_deref(),
+                    &task,
+                    repeat,
+                    &opts,
+                )
+                .await;
                 (i * repeats as usize + (repeat as usize - 1), line)
             });
         }

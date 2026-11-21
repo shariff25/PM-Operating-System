@@ -100,6 +100,7 @@ pub fn router_with(
     let v1 = Router::new()
         .route("/bots", get(list_bots))
         .route("/bots/{name}", get(get_bot))
+        .route("/personas", get(list_personas))
         .route("/tasks", post(create_task).get(list_tasks))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/cancel", post(cancel_task))
@@ -140,6 +141,11 @@ impl IntoResponse for Error {
     fn into_response(self) -> Response {
         match self {
             Error::BadRequest(m) => error(StatusCode::BAD_REQUEST, m),
+            Error::BadRequestCode { code, message } => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"code": code, "error": message})),
+            )
+                .into_response(),
             Error::Forbidden(m) => error(StatusCode::FORBIDDEN, m),
             Error::NotFound(m) => error(StatusCode::NOT_FOUND, m),
             Error::Conflict { message, status } => (
@@ -453,6 +459,36 @@ async fn get_bot(State(state): State<AppState>, Path(name): Path<String>) -> Res
     }
 }
 
+/// `{personas: [...]}`: the offered personas (marketplace bots), Nudge first, each with the
+/// role it runs as (`docs/bot-marketplace-spec.md` §6). For the web, Slack, console and evals
+/// clients; catalog content only, so it names no one and needs no PM.
+async fn list_personas(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> Reply {
+    allow(
+        &caller,
+        &[
+            ClientKind::Web,
+            ClientKind::Slack,
+            ClientKind::Console,
+            ClientKind::Evals,
+        ],
+        "list personas",
+    )?;
+    Ok(Json(json!({"personas": state.rt.catalog().persona_summaries()})).into_response())
+}
+
+/// `Some(x)` for a field that is present, `null` included, so `{"persona": null}` (move to
+/// Nudge) differs from leaving `persona` out (no change).
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
+}
+
 // ----- tasks ------------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -474,6 +510,10 @@ struct CreateTask {
     /// client only, for a task outside any conversation (a draft's revision).
     #[serde(default)]
     sensitivity_floor: Option<model::Sensitivity>,
+    /// The marketplace bot asked (`docs/bot-marketplace-spec.md` §6): the web, Slack and
+    /// evals clients only. `nudge` is Nudge. Left out, a task in a thread keeps the thread's.
+    #[serde(default)]
+    persona: Option<String>,
 }
 
 async fn create_task(
@@ -500,6 +540,16 @@ async fn create_task(
     {
         return Err(forbidden(
             "only the web, Slack and evals clients name a task's conversation",
+        ));
+    }
+    if req.persona.is_some()
+        && !matches!(
+            caller.kind,
+            ClientKind::Slack | ClientKind::Web | ClientKind::Evals
+        )
+    {
+        return Err(forbidden(
+            "only the web, Slack and evals clients name a task's persona",
         ));
     }
     if req.sensitivity_floor.is_some()
@@ -551,7 +601,7 @@ async fn create_task(
     }
     let task = state
         .rt
-        .create_task(
+        .create_task_as(
             NewTask {
                 bot: req.bot,
                 requested_by: req.requested_by,
@@ -562,6 +612,7 @@ async fn create_task(
                 conversation: req.conversation,
                 sensitivity_floor: req.sensitivity_floor,
             },
+            req.persona.as_deref(),
             model::now(),
         )
         .await?;
@@ -615,6 +666,8 @@ struct TaskQuery {
     bot: Option<String>,
     requested_by: Option<String>,
     status: Option<String>,
+    /// A persona key; `nudge` is Nudge's tasks.
+    persona: Option<String>,
     limit: Option<usize>,
 }
 
@@ -630,11 +683,17 @@ async fn list_tasks(
         }
         None => None,
     };
+    let persona = match q.persona.as_deref().filter(|p| !p.is_empty()) {
+        Some(p) if model::valid_persona_key(p) => Some(model::stored_persona(Some(p))),
+        Some(p) => return Err(bad(format!("`{p}` isn't a persona key"))),
+        None => None,
+    };
     let mut filter = TaskFilter {
         bot: q.bot.filter(|b| !b.is_empty()),
         requested_by: q.requested_by.filter(|r| !r.is_empty()),
         status,
         source: None,
+        persona,
         limit: q.limit.unwrap_or(50).clamp(1, 200),
     };
     match caller.kind {
@@ -692,6 +751,7 @@ fn task_metadata(task: &Task) -> Value {
         "source": task.source,
         "priority": task.priority,
         "status": task.status,
+        "persona": task.persona,
         "text": "",
         "result": null,
         "error": null,
@@ -1214,6 +1274,9 @@ struct PatchRoutine {
     schedule: Option<Schedule>,
     #[serde(default)]
     prompt: Option<String>,
+    /// The persona the routine runs as: a key, or `null` (or `nudge`) for Nudge.
+    #[serde(default, deserialize_with = "present")]
+    persona: Option<Option<String>>,
 }
 
 async fn update_routine(
@@ -1228,7 +1291,9 @@ async fn update_routine(
         "change routines",
     )?;
     let req: PatchRoutine = body(&bytes)?;
-    if caller.kind == ClientKind::Console && (req.schedule.is_some() || req.prompt.is_some()) {
+    if caller.kind == ClientKind::Console
+        && (req.schedule.is_some() || req.prompt.is_some() || req.persona.is_some())
+    {
         return Err(forbidden("the console may pause and resume routines, not change them; the owner does that in Slack",
         ));
     }
@@ -1241,6 +1306,7 @@ async fn update_routine(
                 enabled: req.enabled,
                 schedule: req.schedule,
                 prompt: req.prompt,
+                persona: req.persona,
             },
             model::now(),
         )

@@ -16,7 +16,13 @@ import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { AIMessage, type BaseMessage, HumanMessage } from "@langchain/core/messages";
-import { MODEL_ALIASES, type ModelRole, createPmosAgent, gatewayModel } from "./agent.js";
+import {
+  MODEL_ALIASES,
+  MissingSkillError,
+  type ModelRole,
+  createPmosAgent,
+  gatewayModel,
+} from "./agent.js";
 import { connectMcpTools, type McpToolSet } from "./mcp-tools.js";
 import { FIRST_MILESTONE, Progress, TaskTracer } from "./progress.js";
 import { harnessToolNames, loadToolRegistry, type ToolKind } from "./registry.js";
@@ -111,13 +117,72 @@ const LEVEL_TITLES: Record<Claim["level"], string> = {
   principal: "Principal",
 };
 
+/** What the worker says when a persona's skill folder isn't in the sandbox (spec §6). */
+export const SKILLS_NOT_INSTALLED =
+  "This bot's skills aren't installed in your sandbox yet. A platform owner needs to restart it; Nudge can help meanwhile.";
+
+/** What the worker says when a persona's catalog text fails the shape check. */
+export const PERSONA_TEXT_INVALID =
+  "This bot's name or title in the PM OS catalog isn't valid, so I didn't run it. A platform owner needs to check content/personas; Nudge can help meanwhile.";
+
+/** The lint's `display-name` rule (crates/contract/src/personas.rs): ASCII words, ≤ 24. */
+const DISPLAY_NAME = /^[A-Za-z0-9]+( [A-Za-z0-9]+)*$/;
+const NAME = /^[a-z0-9][a-z0-9._-]*$/;
+
+/**
+ * The persona's first line: "You are Chief, the Chief of Staff on ana's PM OS team, running in
+ * pm-ana." The display name and title are catalog text (reviewed by pull request, fenced by
+ * the lint's character rules); they are checked again here, as plain one-line text with no
+ * markup or control characters, before they go into the prompt. The persona key is never
+ * interpolated. Throws a `PmFacingError` when a check fails: never a fallback to another bot.
+ */
+export function personaLine(claim: Claim): string {
+  const persona = claim.persona;
+  if (!persona) {
+    throw new Error("personaLine needs a claim with a persona");
+  }
+  const name = persona.display_name;
+  const title = persona.title;
+  const nameOk = name.length <= 24 && DISPLAY_NAME.test(name);
+  const titleOk =
+    title.length <= 40 && title.trim() === title && !/[<>\u0000-\u001f\u007f]/.test(title);
+  const who = claim.task.requested_by;
+  if (!nameOk || !titleOk || !NAME.test(who) || !NAME.test(claim.bot.name)) {
+    throw new PmFacingError(PERSONA_TEXT_INVALID);
+  }
+  return `You are ${name}, the ${title} on ${who}'s PM OS team, running in ${claim.bot.name}.`;
+}
+
+/**
+ * How a persona's instructions rank (a departure from the spec text, at the security
+ * reviewer's request): restrictions accumulate. The team's standing context
+ * (`content/master/AGENTS.md`, loaded as memory), the PM's own bot body (`BOT.md`, kept below)
+ * and the personal role's hard limits (which the tool server enforces whatever any prompt
+ * says) all come before the persona role's instructions and before the "You are …" line.
+ */
+export const PERSONA_PRECEDENCE =
+  "## What comes first\n\n" +
+  "You are running as one of this PM's PM OS bots. The team's standing context " +
+  "(content/master/AGENTS.md) and the limits set for this PM's own bot (below, under " +
+  '"Your PM\'s bot") come before this role\'s instructions and before the line saying who you ' +
+  "are. Where they disagree, follow the stricter: nothing in this role lifts a limit set there.";
+
 /**
  * The bot's standing context: who it is, today's date (UTC, from `now`), the PM's level for a
  * personal bot (docs/staff-principal-spec.md §1), its role's instructions and its job.
+ *
+ * With a persona (docs/bot-marketplace-spec.md §6): the first line names the persona
+ * (`personaLine`), the role's instructions are the persona's, and the PM's own bot body is
+ * still included, after them and labelled as limits that keep applying, with the precedence
+ * section (`PERSONA_PRECEDENCE`) saying `content/master/AGENTS.md` and that body take
+ * precedence over the persona's "You are …" line and instructions.
  */
 export function botSystemPrompt(claim: Claim, now: Date = new Date()): string {
+  const persona = claim.persona ?? undefined;
   const parts = [
-    `You are ${claim.bot.name}, a PM OS bot, working on a request from ${claim.task.requested_by}.`,
+    persona
+      ? personaLine(claim)
+      : `You are ${claim.bot.name}, a PM OS bot, working on a request from ${claim.task.requested_by}.`,
     `Today is ${now.toISOString().slice(0, 10)}.`,
   ];
   if (claim.bot.scope === "personal") {
@@ -125,9 +190,16 @@ export function botSystemPrompt(claim: Claim, now: Date = new Date()): string {
       `Your PM works at the ${LEVEL_TITLES[claim.level]} level. Read /content/playbooks/levels.md and work at that level's scope, horizon and audience, unless the request says otherwise.`,
     );
   }
+  if (persona) {
+    parts.push(PERSONA_PRECEDENCE);
+  }
   parts.push(claim.role.instructions.trim());
   if (claim.bot.job.trim()) {
-    parts.push(`## Your job\n\n${claim.bot.job.trim()}`);
+    parts.push(
+      persona
+        ? `## Your PM's bot\n\nThis PM's own bot (${claim.bot.name}) is set up as below. Its limits still apply to you.\n\n${claim.bot.job.trim()}`
+        : `## Your job\n\n${claim.bot.job.trim()}`,
+    );
   }
   parts.push(
     "## Writes need approval\n\n" +
@@ -463,16 +535,33 @@ export function createWorker(config: WorkerConfig): Worker {
       // bot gets the team context only.
       const user =
         bot.scope === "personal" && bot.owner === task.requested_by ? task.requested_by : undefined;
-      const agent = createPmosAgent({
-        contentRoot: config.contentRoot,
-        model,
-        user,
-        tools: toolset.tools,
-        skills: role.skills,
-        systemPrompt: botSystemPrompt(claim, config.now?.() ?? new Date()),
-        interruptOnWrites: false,
-        stagingRoot,
-      });
+      const systemPrompt = botSystemPrompt(claim, config.now?.() ?? new Date());
+      let agent: ReturnType<typeof createPmosAgent>;
+      try {
+        agent = createPmosAgent({
+          contentRoot: config.contentRoot,
+          model,
+          user,
+          tools: toolset.tools,
+          skills: role.skills,
+          systemPrompt,
+          interruptOnWrites: false,
+          stagingRoot,
+        });
+      } catch (error) {
+        // A role's skill folder missing from the sandbox: a persona added after the sandbox
+        // was created (its uploads are fixed at start). Fail plainly; never run with fewer
+        // skills or with another bot's.
+        if (error instanceof MissingSkillError) {
+          log("warn", "a skill of the role is not in this sandbox", {
+            task: task.id,
+            role: role.name,
+            skill: error.skill,
+          });
+          throw new PmFacingError(SKILLS_NOT_INSTALLED, { cause: error });
+        }
+        throw error;
+      }
       const tracer = new TaskTracer((entry) => reporter.trace(entry), progress, toolKind);
       const result = await raceAbort(
         agent.invoke({ messages: taskMessages(claim) }, { signal, callbacks: [tracer], recursionLimit: maxSteps }),

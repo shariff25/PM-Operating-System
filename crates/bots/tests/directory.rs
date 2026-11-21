@@ -57,6 +57,7 @@ async fn routine(env: &Env, bot: &str, owner: &str, due: chrono::DateTime<chrono
         prompt: "What changed?".into(),
         output: Output::dm(),
         approval: "approve".into(),
+        persona: None,
         next_run_at: Some(due),
         last_run_at: None,
         created_at: due - Span::days(1),

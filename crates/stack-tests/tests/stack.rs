@@ -1515,3 +1515,202 @@ async fn password_sign_in_through_pmos_web_and_the_real_tool_server() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
 }
+
+impl Stack {
+    /// Ana asks her own bot from Slack (the runtime's Slack client), as `persona`.
+    async fn ask_as(&self, persona: &str, text: &str) -> Value {
+        let res = self
+            .http
+            .post(format!("{}/v1/tasks", self.runtime))
+            .bearer_auth(RT_SLACK_TOKEN)
+            .header("x-pmos-user", "ana")
+            .json(
+                &json!({"bot": "pm-ana", "requested_by": "ana", "text": text,
+                          "source": "slack", "persona": persona,
+                          "slack": {"channel": "D0ANA", "thread_ts": THREAD}}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        res.json().await.unwrap()
+    }
+
+    /// The worker's claim, or `None` on `204`.
+    async fn claim(&self) -> Option<Value> {
+        let res = self
+            .http
+            .post(format!("{}/v1/worker/claim", self.runtime))
+            .bearer_auth(RT_WORKER_TOKEN)
+            .json(&json!({"worker": "w1"}))
+            .send()
+            .await
+            .unwrap();
+        if res.status() == StatusCode::NO_CONTENT {
+            return None;
+        }
+        assert_eq!(res.status(), StatusCode::OK);
+        Some(res.json().await.unwrap())
+    }
+
+    async fn task(&self, id: &str) -> Value {
+        self.http
+            .get(format!("{}/v1/tasks/{id}", self.runtime))
+            .bearer_auth(RT_SLACK_TOKEN)
+            .header("x-pmos-user", "ana")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+}
+
+/// Slice R1 (`docs/bot-marketplace-spec.md` §6) through the real tool server and runtime: Ana
+/// adds Chief to her team and asks as Chief; the claim runs as Chief's role with exactly the
+/// tool server's intersected tools; the draft is attributed to Chief. Asking as Sprout, not on
+/// her team, is refused end to end with the tool server's sentence. Removing Chief leaves the
+/// draft hers and decidable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pm_asks_chief_and_the_draft_survives_chief_leaving_the_team() {
+    use pmos_toolserver::audit::Client;
+    let s = start().await;
+    s.svc
+        .change_team(
+            Client::Web,
+            "ana",
+            &["chief".into()],
+            &[],
+            "bots_page",
+            Utc::now(),
+        )
+        .await
+        .expect("Ana adds Chief");
+
+    let task = s.ask_as("chief", "Nudge Ben about the SAML thread").await;
+    assert_eq!(task["persona"], "chief");
+    let claim = s.claim().await.expect("Chief's task is claimed");
+    assert_eq!(claim["task"]["id"], task["id"]);
+    assert_eq!(claim["bot"]["name"], "pm-ana");
+    assert_eq!(claim["role"]["name"], "chief-of-staff");
+    assert_eq!(claim["gateway"]["model"], "pmos/reasoning");
+    assert_eq!(claim["persona"]["key"], "chief");
+    assert_eq!(claim["persona"]["display_name"], "Chief");
+
+    // The session is Chief's, and its tools are the tool server's intersection: what the
+    // claim lists is exactly what the session may call.
+    let session = s
+        .svc
+        .session(claim["session_token"].as_str().unwrap(), Utc::now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.persona.as_deref(), Some("chief"));
+    let mut session_tools: Vec<String> = s
+        .svc
+        .list_tools(&session)
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    session_tools.sort();
+    let claimed: Vec<String> = claim["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(claimed, session_tools);
+    assert!(
+        claimed.contains(&"slack.post_reply".to_string()),
+        "{claimed:?}"
+    );
+    assert!(
+        !claimed.contains(&"slack.send_message".to_string()),
+        "never for Chief: {claimed:?}"
+    );
+    assert!(
+        !claimed
+            .iter()
+            .any(|t| t.starts_with("stats.") || t.starts_with("bets.")),
+        "not in Chief's role: {claimed:?}"
+    );
+    let drafted = s
+        .svc
+        .call(
+            &session,
+            "slack_post_reply",
+            json!({"channel": SLACK_ALL_TEAM, "thread_ts": THREAD,
+                   "text": "Ben, any news on SAML?"}),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let approval = drafted["approval_id"].as_str().unwrap().to_string();
+    let item = s.svc.approval(&approval).await.unwrap().unwrap();
+    assert_eq!(
+        item.persona.as_deref(),
+        Some("chief"),
+        "attributed to Chief"
+    );
+    let res = s
+        .http
+        .post(format!(
+            "{}/v1/worker/tasks/{}/complete",
+            s.runtime,
+            task["id"].as_str().unwrap()
+        ))
+        .bearer_auth(RT_WORKER_TOKEN)
+        .json(&json!({"worker": "w1", "result": "I drafted a nudge.", "approvals": [approval]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "{}", res.status());
+
+    // Sprout isn't on Ana's team: the tool server refuses at claim and the task fails with
+    // its sentence. No session, no fallback to Nudge.
+    let sprout = s
+        .ask_as("sprout", "Where does the signup funnel leak?")
+        .await;
+    assert!(
+        s.claim().await.is_none(),
+        "the refused task isn't handed out"
+    );
+    let failed = s.task(sprout["id"].as_str().unwrap()).await;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(failed["persona"], "sprout");
+    let error = failed["error"].as_str().unwrap();
+    assert!(error.contains("isn't on your team"), "{error}");
+
+    // Ana removes Chief: the draft stays hers, still attributed, and she approves it.
+    s.svc
+        .change_team(
+            Client::Web,
+            "ana",
+            &[],
+            &["chief".into()],
+            "bots_page",
+            Utc::now(),
+        )
+        .await
+        .expect("Ana removes Chief");
+    let ana = s.login("ana").await;
+    let draft_path = format!("/api/drafts/{approval}");
+    let (status, draft, _) = s.send(Some(&ana), Method::GET, &draft_path, None).await;
+    assert_eq!(status, StatusCode::OK, "{draft}");
+    let (status, approved, _) = s
+        .send(
+            Some(&ana),
+            Method::POST,
+            &format!("{draft_path}/approve"),
+            Some(json!({"version": draft["version"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{approved}");
+    assert_eq!(approved["status"], "approved");
+    let writes = s.slack.writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].args["text"], "Ben, any news on SAML?");
+    let item = s.svc.approval(&approval).await.unwrap().unwrap();
+    assert_eq!(item.persona.as_deref(), Some("chief"));
+}

@@ -202,6 +202,12 @@ pub struct Task {
     /// which a follow-up reads as `restricted`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources_sensitivity: Option<Sensitivity>,
+    /// The marketplace bot the task asks (`docs/bot-marketplace-spec.md` §6): a persona key,
+    /// or `None` for Nudge, the always-on generalist (never stored as `nudge`). Set by the
+    /// client from the PM's own choice, inherited in a thread, or copied from its routine;
+    /// never by the model.
+    #[serde(default)]
+    pub persona: Option<String>,
     pub attempts: i32,
     /// The worker holding the current claim, while `working`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,6 +247,7 @@ impl Task {
             level: None,
             conversation: None,
             sources_sensitivity: None,
+            persona: None,
             attempts: 0,
             worker: None,
             lease_until: None,
@@ -278,6 +285,27 @@ pub fn valid_conversation(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+}
+
+/// The always-on persona's key. It is never stored: `None` means Nudge everywhere.
+pub const NUDGE: &str = pmos_contract::personas::ALWAYS_ON;
+
+/// Is `key` shaped like a persona key? Lowercase letters and digits in hyphen-separated
+/// parts, at most 32 characters (the lint's `persona-name`, and the tool server's check).
+pub fn valid_persona_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 32
+        && !key.starts_with('-')
+        && !key.ends_with('-')
+        && !key.contains("--")
+        && key
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// A persona key as stored: `nudge` (and nothing) is `None`.
+pub fn stored_persona(key: Option<&str>) -> Option<String> {
+    key.filter(|k| *k != NUDGE).map(str::to_string)
 }
 
 /// One earlier turn of a task's conversation, as the claim carries it (oldest first).
@@ -410,6 +438,11 @@ pub struct Notification {
     /// stored before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routine_id: Option<String>,
+    /// The persona whose task it is, when it isn't Nudge's (`docs/bot-marketplace-spec.md`
+    /// §9: the Slack service starts the message with the bot's name). Left out for Nudge, and
+    /// on items stored before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
     pub at: DateTime<Utc>,
 }
 
@@ -448,6 +481,10 @@ pub struct Draft {
     pub prompt: String,
     pub output: Output,
     pub approval: String,
+    /// The persona the routine runs as (`docs/bot-marketplace-spec.md` §6): a key, or absent
+    /// (or `null`, or `nudge`) for Nudge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +497,9 @@ pub struct Routine {
     pub prompt: String,
     pub output: Output,
     pub approval: String,
+    /// The persona its runs ask, or `None` for Nudge.
+    #[serde(default)]
+    pub persona: Option<String>,
     pub next_run_at: Option<DateTime<Utc>>,
     pub last_run_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -507,6 +547,7 @@ mod tests {
             approvals: Vec::new(),
             outcomes: Vec::new(),
             routine_id: None,
+            persona: None,
             at: now(),
         };
         let plain = serde_json::to_value(&n).unwrap();

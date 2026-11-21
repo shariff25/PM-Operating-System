@@ -174,6 +174,7 @@ fn draft(bot: &str, owner: &str, cron: &str) -> Draft {
         prompt: "Summarize overnight #launch".into(),
         output: Output::dm(),
         approval: "approve".into(),
+        persona: None,
     }
 }
 
@@ -326,6 +327,7 @@ async fn a_routine_that_can_no_longer_run_is_paused_with_a_reason(env: &Env) {
         prompt: "p".into(),
         output: Output::dm(),
         approval: "approve".into(),
+        persona: None,
         next_run_at: Some(now),
         last_run_at: None,
         created_at: now,
