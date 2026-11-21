@@ -18,7 +18,7 @@ use pmos_toolserver::catalog::Catalog;
 use pmos_toolserver::connectors::fake::FakeConnector;
 use pmos_toolserver::connectors::Connector;
 use pmos_toolserver::password::hash::{self, HashParams};
-use pmos_toolserver::password::store::{CodeKind, PasswordStore};
+use pmos_toolserver::password::store::{CodeKind, PasswordStore, Snapshot, Writes};
 use pmos_toolserver::password::{
     issue_setup_code, limits, totp, PasswordService, PwError, SecondStep, Secret,
 };
@@ -1878,7 +1878,9 @@ both!(a_rehash_draws_from_the_shared_allowance, |t| {
 
 // G1: a flood from a few hundred addresses in a few blocks can't fill the open allowance.
 // Before, 300 unknown-name guesses from anywhere filled it and a sign-in from an address
-// nobody had used was refused (`429`); now each /24 takes at most its share (30 a minute).
+// nobody had used was refused (`429`). Since M4 (the review of 8e8f8fe) the shares apply from
+// 80% of the allowance: the three /24s take 240 between them, then 6 each of the rest, and a
+// fourth block still gets in. (Before M4 this asserted 3 x 30 taken; it now asserts 240 + 18.)
 both!(a_flood_from_a_few_blocks_leaves_room_for_another, |t| {
     let now = t0();
     let (secret, _) = t.enrolled("ana", now).await;
@@ -1902,7 +1904,11 @@ both!(a_flood_from_a_few_blocks_leaves_room_for_another, |t| {
             other => panic!("{other:?}"),
         }
     }
-    assert_eq!(refused, 600 - 3 * 30, "three blocks' shares");
+    assert_eq!(
+        refused,
+        600 - limits::SHARES_FROM_PER_MINUTE - 3 * limits::BLOCK_SHARE_PER_MINUTE,
+        "80% for anyone, then three blocks' shares"
+    );
     let new_address = "100.64.9.1";
     let p = t
         .sign_in_from(new_address, "ana", PASSWORD, at)
@@ -2103,8 +2109,10 @@ both!(wrong_setup_guesses_never_void_a_code_or_end_a_setup, |t| {
 });
 
 // G2: guesses are counted against the guesser's block as well: past 100 in 15 minutes from
-// one /24, the setup's first step answers 429 for that block (decided before the name is
-// looked up, so it says nothing about the name), and other blocks are not held up.
+// one /24, every refusal of the setup's first step from that block is 429, whatever the name,
+// and other blocks are not held up. The review of 8e8f8fe (a Low): the invitee's right code
+// from that block is no longer refused (before, this test asserted it was `429`; it now
+// asserts it begins), and an over-limit wrong guess writes nothing.
 both!(setup_code_guesses_are_bounded_per_block, |t| {
     let now = t0();
     let wrong = "AAAAA-AAAAA-AAAAA-AAAAA";
@@ -2120,12 +2128,28 @@ both!(setup_code_guesses_are_bounded_per_block, |t| {
             "{n}"
         );
     }
-    for who in ["ana", "nobody"] {
-        assert!(matches!(
-            begin_from(t, &t.svc, who, &code, "203.0.113.200", now).await,
-            Err(PwError::TooMany { .. })
-        ));
+    let events = t.all_events().await.len();
+    let guesses = t.svc.setup_wrong_guesses();
+    // Over the limit: an unknown name, and a wrong code at a real one, answer alike.
+    for (who, c) in [("nobody", code.as_str()), ("ana", wrong), ("nobody", wrong)] {
+        assert!(
+            matches!(
+                begin_from(t, &t.svc, who, c, "203.0.113.200", now).await,
+                Err(PwError::TooMany { .. })
+            ),
+            "{who}"
+        );
     }
+    assert_eq!(t.all_events().await.len(), events, "nothing written");
+    assert_eq!(t.svc.setup_wrong_guesses(), guesses);
+    // Ana's own right code, from the flooded block, begins her setup.
+    let token = begin_from(t, &t.svc, "ana", &code, "203.0.113.201", now)
+        .await
+        .expect("a right code is never refused for its block's guesses");
+    t.svc
+        .setup_password(t.store(), &token, &Secret::new(PASSWORD), now)
+        .await
+        .expect("and the setup goes on");
     begin_from(t, &t.svc, "ana", &code, AWAY, now)
         .await
         .expect("another block begins");
@@ -2139,6 +2163,238 @@ both!(setup_code_guesses_are_bounded_per_block, |t| {
     )
     .await
     .expect("the block's window moves on");
+});
+
+// --- The review of 8e8f8fe ----------------------------------------------------------------------
+
+// M3: the rules read a new password without its outer whitespace and with each inner run once,
+// but what is hashed, and checked at sign-in, is exactly what was typed. So a password set
+// before the change that the rules now refuse (here `password` and four spaces, written as a
+// stored hash, as an old setup left it) still signs in, typed as it was set; and a new one with
+// inner runs of spaces must be typed with them.
+both!(a_password_set_before_the_new_rules_still_signs_in, |t| {
+    let now = t0();
+    let (secret, _) = t.enrolled("ana", now).await;
+    let old = "password    ";
+    assert_eq!(
+        hash::check_new(old, "ana", Some("ana@example.com")),
+        Err(hash::Weak::TooShort),
+        "the rules refuse it now"
+    );
+    let stored = hash::hash(old.as_bytes(), QUICK).unwrap();
+    t.store()
+        .password_tx(
+            "ana",
+            None,
+            None,
+            now,
+            Box::new(move |s: &Snapshot| {
+                let mut c = s.credential.clone().unwrap();
+                c.password_hash = Some(stored);
+                Writes {
+                    credential: Some(c),
+                    ..Writes::default()
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let at = now + Duration::minutes(1);
+    assert_eq!(
+        t.sign_in("ana", "password", at).await,
+        Err(PwError::SignInFailed),
+        "not trimmed at sign-in"
+    );
+    let p = t
+        .sign_in("ana", old, at)
+        .await
+        .expect("the old password, as it was set");
+    t.code(&p, &code_now(&secret, at), at).await.unwrap();
+    // A new password with inner runs of spaces: accepted, and hashed as typed.
+    let spaced = "plum   kettle  orbit 42";
+    let code = t.issue(&ops(), "ben", now).await.unwrap();
+    t.setup("ben", &code, spaced, now).await;
+    assert_eq!(
+        t.sign_in("ben", "plum kettle orbit 42", at).await,
+        Err(PwError::SignInFailed)
+    );
+    t.sign_in("ben", spaced, at).await.expect("as typed");
+    // And the setup refuses what M3 found: twelve spaces, a common one padded or spaced out.
+    let code = t.issue(&ops(), "cy", now).await.unwrap();
+    let token = begin_from(t, &t.svc, "cy", &code, HOME, now).await.unwrap();
+    for (weak, why) in [
+        ("            ", hash::Weak::TooShort),
+        ("password    ", hash::Weak::TooShort),
+        ("password 1234", hash::Weak::Common),
+        ("password1234\u{3000}\u{3000}", hash::Weak::Common),
+    ] {
+        assert_eq!(
+            t.svc
+                .setup_password(t.store(), &token, &Secret::new(weak), now)
+                .await,
+            Err(PwError::Weak(why)),
+            "{weak:?}"
+        );
+    }
+});
+
+// M4: the block shares apply only once the open allowance is nearly full. A 30-person office
+// behind one address nobody signed in from (so no reserve), everyone mistyping once, takes 60
+// hashes from one /24 in a quiet minute: all of them sign in. (Before, the block's share of 30
+// refused the second half `429`, and pmos-web counted each `429` against the office's
+// address.) Then G1 still holds: junk from another block fills the allowance to 80% and takes
+// only its share past it, and Ana, from a block and an address nobody used, still gets in.
+both!(
+    a_busy_office_behind_one_address_signs_in_in_a_quiet_minute,
+    |t| {
+        let now = t0();
+        let office: Vec<String> = (0..30).map(|n| format!("p{n:02}")).collect();
+        let yaml = office.iter().fold(String::from("members:\n"), |mut y, h| {
+            y.push_str(&format!(
+                "  - {{handle: {h}, slack-id: U0{}, email: {h}@example.com, roles: [pm]}}\n",
+                h.to_uppercase()
+            ));
+            y
+        });
+        let req = ImportRequest::parse(yaml.as_bytes(), None, ImportMode::Members).unwrap();
+        t.stores
+            .users
+            .apply(&Actor::import(None), Op::Import(Box::new(req)), now)
+            .await
+            .unwrap();
+        let mut secrets = Vec::new();
+        for h in &office {
+            secrets.push(t.enrolled(h, now).await.0);
+        }
+        let (ana_secret, _) = t.enrolled("ana", now).await;
+        // A quiet minute later (the setups' hashes have left the window).
+        let at = now + Duration::minutes(2);
+        let from = "192.0.2.50";
+        for (h, secret) in office.iter().zip(&secrets) {
+            assert_eq!(
+                t.sign_in_from(from, h, OTHER_PASSWORD, at).await,
+                Err(PwError::SignInFailed),
+                "{h}: a typo"
+            );
+            let p = t
+                .sign_in_from(from, h, PASSWORD, at)
+                .await
+                .unwrap_or_else(|e| panic!("{h}: {e:?}"));
+            t.code_from(from, &p, &code_now(secret, at), at)
+                .await
+                .unwrap_or_else(|e| panic!("{h}: {e:?}"));
+        }
+        // G1 once nearly full: a flood from one block takes the allowance to 80% and then only its
+        // share of the rest.
+        let mut granted = 0;
+        for n in 0..300 {
+            let junk = format!("198.18.0.{}", n % 250 + 1);
+            match t
+                .svc
+                .sign_in(
+                    t.store(),
+                    &format!("nobody{n}@example.com"),
+                    &Secret::new(OTHER_PASSWORD),
+                    Some(&junk),
+                    at,
+                )
+                .await
+            {
+                Err(PwError::SignInFailed) => granted += 1,
+                Err(PwError::TooMany { .. }) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(
+            granted,
+            limits::SHARES_FROM_PER_MINUTE - 60 + limits::BLOCK_SHARE_PER_MINUTE
+        );
+        let new_address = "100.64.9.1";
+        let p = t
+            .sign_in_from(new_address, "ana", PASSWORD, at)
+            .await
+            .expect("another block, an address nobody used");
+        t.code_from(new_address, &p, &code_now(&ana_secret, at), at)
+            .await
+            .unwrap();
+    }
+);
+
+// Lows of the review of 8e8f8fe: with every hashing slot busy, nothing is checked, so nothing
+// counted ahead stays. Before, `change` kept the piece of the account's work and the failure it
+// counted ahead: ten busy tries during someone else's flood filled the person's own room for 15
+// minutes (and five made their re-authentication wait). Now fifteen busy tries leave both as
+// they were, and the change then goes through. The password step's give-back (G3, untested
+// until now) is shown the same way: twelve busy tries from one address, then it signs in.
+both!(busy_hashing_gives_back_what_it_counted, |t| {
+    let now = t0();
+    let (secret, _) = t.enrolled("ana", now).await;
+    let svc = PasswordService::with_params(t.keys.clone(), QUICK)
+        .unwrap()
+        .with_hash_wait(std::time::Duration::from_millis(20));
+    let at = now + Duration::minutes(16);
+    let held = svc.hold_hashing_slots().await;
+    for i in 0..15 {
+        assert_eq!(
+            svc.change(
+                t.store(),
+                "ana",
+                &Secret::new(PASSWORD),
+                &Secret::new(code_now(&secret, at)),
+                &Secret::new(OTHER_PASSWORD),
+                at,
+            )
+            .await,
+            Err(PwError::Busy),
+            "{i}"
+        );
+    }
+    for i in 0..12 {
+        assert_eq!(
+            svc.sign_in(
+                t.store(),
+                "ana@example.com",
+                &Secret::new(PASSWORD),
+                Some(AWAY),
+                at
+            )
+            .await
+            .map(drop),
+            Err(PwError::Busy),
+            "{i}"
+        );
+    }
+    drop(held);
+    let p = svc
+        .sign_in(
+            t.store(),
+            "ana@example.com",
+            &Secret::new(PASSWORD),
+            Some(AWAY),
+            at,
+        )
+        .await
+        .expect("no wait was left by the busy tries");
+    svc.second_step(
+        t.store(),
+        p.token.expose(),
+        &SecondStep::Code(Secret::new(code_now(&secret, at))),
+        Some(AWAY),
+        at,
+    )
+    .await
+    .unwrap();
+    let later = at + Duration::seconds(30);
+    svc.change(
+        t.store(),
+        "ana",
+        &Secret::new(PASSWORD),
+        &Secret::new(code_now(&secret, later)),
+        &Secret::new(OTHER_PASSWORD),
+        later,
+    )
+    .await
+    .expect("the room and the re-authentication count were given back");
 });
 
 // M3: with the open allowance full, an unknown name and a real account get the same answer:

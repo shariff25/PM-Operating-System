@@ -17,8 +17,11 @@
 //!   minutes; past it every unauthenticated password route answers `429 too_many_attempts`.
 //!   **Every** attempt that doesn't succeed counts: a wrong password, code or setup code, an
 //!   unknown or expired token, a step out of order, a body that isn't the route's JSON. Only
-//!   PM OS's own failures (a `5xx`) don't. The check and the count are one step: each attempt
-//!   takes its slot before the tool server is asked and gives it back if it succeeds.
+//!   PM OS's own failures (a `5xx`) don't, and nor does a `429` from a limit the tool server
+//!   shares (on the password step and a setup's password: the global allowance, its block
+//!   shares, the account's room; the review of 8e8f8fe, M4). The check and the count are one
+//!   step: each attempt takes its slot before the tool server is asked and gives it back if it
+//!   succeeds.
 //! - **The address** ([`source`]): the peer, or behind a proxy named in
 //!   `PMOS_WEB_TRUSTED_PROXIES`, `X-Forwarded-For` read strictly from the right. With no
 //!   trusted proxy (`PMOS_WEB_DIRECT=1`, a loopback bind), a password request that carries a
@@ -439,10 +442,24 @@ impl Try {
         }
     }
 
-    /// After the tool server answered: counted unless it succeeded (`2xx`) or PM OS itself
-    /// failed (`5xx`). Every other refusal counts: a wrong guess, an unknown or expired token,
-    /// a step out of order, a body it couldn't read (P1).
+    /// After the tool server answered: counted unless it succeeded (`2xx`), PM OS itself
+    /// failed (`5xx`), or a limit the tool server shares refused it before any check (`429`
+    /// on the password step: the global hashing allowance, its block shares, or the
+    /// account's room; the review of 8e8f8fe, M4: before, a busy office's `429`s used up its
+    /// address's twenty refusals and locked it out for 15 minutes). Every other refusal
+    /// counts: a wrong guess, an unknown or expired token, a step out of order, a body it
+    /// couldn't read (P1).
     fn answered(&mut self, state: &AppState, status: u16) {
+        if (200..300).contains(&status) || status >= 500 || status == 429 {
+            self.not_counted(state);
+        }
+    }
+
+    /// After the tool server answered a step whose `429` is about this address's own guessing
+    /// (the second step and a setup's confirmation: the address waits for that person; a
+    /// setup's first step: the block used its guesses, and this one was checked and wrong):
+    /// those count, like every other refusal.
+    fn answered_guess(&mut self, state: &AppState, status: u16) {
         if (200..300).contains(&status) || status >= 500 {
             self.not_counted(state);
         }
@@ -450,9 +467,11 @@ impl Try {
 
     /// For a step that does work whatever comes of it (a setup's password: a hash; its
     /// authenticator: a new secret): counted **even when it succeeds** (the re-check of
-    /// eb24d28, H1); only PM OS's own failure (`5xx`) gives the slot back.
+    /// eb24d28, H1); PM OS's own failure (`5xx`) and a refusal by a limit the tool server
+    /// shares (`429`: the account's work or the open allowance, which did no work and cost
+    /// the invitee nothing there, G3) give the slot back (the review of 8e8f8fe).
     fn answered_with_work(&mut self, state: &AppState, status: u16) {
-        if status >= 500 {
+        if status >= 500 || status == 429 {
             self.not_counted(state);
         }
     }
@@ -753,7 +772,7 @@ async fn second_step(
             return e.into_response();
         }
     };
-    t.answered(&state, a.status);
+    t.answered_guess(&state, a.status);
     if a.status != 200 {
         let code = a
             .body
@@ -827,7 +846,7 @@ async fn setup_begin(
             return e.into_response();
         }
     };
-    t.answered(&state, a.status);
+    t.answered_guess(&state, a.status);
     if a.status != 200 {
         return refused(a.status, &a.body, a.retry_after);
     }
@@ -1014,7 +1033,7 @@ async fn setup_confirm(
             return e.into_response();
         }
     };
-    t.answered(&state, a.status);
+    t.answered_guess(&state, a.status);
     if a.status != 200 {
         return setup_refused(&a);
     }

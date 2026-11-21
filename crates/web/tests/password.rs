@@ -33,6 +33,10 @@ const PENDING: &str = "ppppppppppppppppppppppppppppppppppppppppppp";
 /// A live setup token the stand-in accepts.
 const SETUP: &str = "sssssssssssssssssssssssssssssssssssssssssss";
 const RIGHT: &str = "the right passphrase";
+/// A password the stand-in answers as the tool server does when its shared limit is full.
+const SHARED_FULL: &str = "the shared allowance is full";
+/// A setup token whose password the stand-in refuses with the shared limit's `429`.
+const SETUP_SHARED_FULL: &str = "fffffffffffffffffffffffffffffffffffffffffff";
 const CODE: &str = "123456";
 
 /// The stand-in tool server: the user database (with Ana's password epoch) and the password
@@ -67,6 +71,14 @@ fn coded(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({"code": code, "error": code}))).into_response()
 }
 
+/// The tool server's `429` from a limit it shares (the global allowance, a block's share).
+fn too_many_from_tools() -> Response {
+    let mut res = coded(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
+    res.headers_mut()
+        .insert("retry-after", axum::http::HeaderValue::from_static("7"));
+    res
+}
+
 async fn toolserver(
     State(t): State<Arc<Tools>>,
     method: Method,
@@ -99,6 +111,9 @@ async fn toolserver(
     }
     match path.as_str() {
         "/internal/password/sign-in" => {
+            if b["password"] == SHARED_FULL {
+                return too_many_from_tools();
+            }
             if b["sign_in_name"] == "ana@example.com" && b["password"] == RIGHT {
                 Json(json!({"pending_token": PENDING, "expires_at": "2026-11-20T09:05:00Z"}))
                     .into_response()
@@ -141,6 +156,9 @@ async fn toolserver(
         .into_response(),
         "/internal/password/reset-notice/dismiss" => StatusCode::NO_CONTENT.into_response(),
         "/internal/password/setup/password" => {
+            if b["setup_token"] == SETUP_SHARED_FULL {
+                return too_many_from_tools();
+            }
             if b["setup_token"] == SETUP {
                 Json(json!({"next": "authenticator"})).into_response()
             } else {
@@ -587,6 +605,82 @@ async fn setup_passwords_count_against_the_address_even_when_they_succeed() {
         )
         .await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
+}
+
+/// M4 and a Low of the review of 8e8f8fe: a `429` from a limit the tool server shares refused
+/// the attempt before any check, so it is not a refusal of this address's. Before, each one
+/// counted: a 30-person office behind one address, during a minute the tool server was full,
+/// used up its twenty refusals and was locked out of password sign-in for 15 minutes; and an
+/// invitee's setup password refused that way cost their slot. Now 30 such answers pass through
+/// (with the tool server's `Retry-After`) and the office's sign-ins and the invitee's set still
+/// go through after them, from the same address.
+#[tokio::test]
+async fn the_tool_servers_shared_limit_refusals_are_not_counted_against_the_address() {
+    let w = web(&["127.0.0.1"]).await;
+    let office = [xff("203.0.113.10")];
+    for i in 0..30 {
+        let r = w.sign_in(&office, SHARED_FULL).await;
+        assert_eq!(
+            (r.status, r.code()),
+            (StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"),
+            "{i}"
+        );
+        assert_eq!(
+            r.headers.get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("7"),
+            "the tool server's own wait, not pmos-web's"
+        );
+    }
+    let asked = w.password_calls();
+    for _ in 0..30 {
+        assert!(
+            w.full_sign_in(&office).await.is_some(),
+            "the office signs in"
+        );
+    }
+    assert!(
+        w.password_calls() > asked,
+        "the tool server was asked every time"
+    );
+    let invitee = [
+        xff("203.0.113.10"),
+        ("cookie", format!("__Host-pmos-setup={SETUP_SHARED_FULL}")),
+    ];
+    for _ in 0..30 {
+        let r = w
+            .send(
+                Method::POST,
+                "/api/auth/password/setup/password",
+                &invitee,
+                Some(json!({"password": "a long enough passphrase"})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
+    }
+    let r = w
+        .send(
+            Method::POST,
+            "/api/auth/password/setup/password",
+            &[
+                xff("203.0.113.10"),
+                ("cookie", format!("__Host-pmos-setup={SETUP}")),
+            ],
+            Some(json!({"password": "a long enough passphrase"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.body);
+    // Wrong passwords still count, as before: with the set that hashed (counted, H1), twenty,
+    // then the address waits.
+    for _ in 0..19 {
+        assert_eq!(
+            w.sign_in(&office, "a wrong guess here").await.status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let asked = w.password_calls();
+    let r = w.sign_in(&office, RIGHT).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(w.password_calls(), asked, "pmos-web's own wait");
 }
 
 /// With no trusted proxy (`PMOS_WEB_DIRECT=1`), a forwarded header means a proxy nobody named
