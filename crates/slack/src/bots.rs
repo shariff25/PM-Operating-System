@@ -3,9 +3,12 @@
 //!
 //! **Which bot a DM goes to:**
 //! 1. a `<bot>:` prefix (`docs: what ports does Acme Vault need?`);
-//! 2. else the bot already working in that thread;
-//! 3. else the PM's personal bot `pm-<handle>`, if it exists;
-//! 4. else `docs`.
+//! 2. else a marketplace bot's name (`Chief: …`, `sprout, …`): the PM's personal bot, run as
+//!    that persona (`personas.rs`, `docs/bot-marketplace-spec.md` §9);
+//! 3. else the bot already working in that thread (with no `persona`, so the runtime keeps
+//!    the thread's);
+//! 4. else the PM's personal bot `pm-<handle>`, if it exists;
+//! 5. else `docs`.
 //!
 //! **Commands first:** typed alone in a DM, `setup` (or `status`, `onboarding`), and for
 //! platform owners `requests` and `remove <handle>`, are handled before any of that
@@ -53,6 +56,7 @@ use crate::home::Home;
 use crate::member_cards::{self, action as member_action};
 use crate::members::{self, DmCommand, Onboarding};
 use crate::onboard_flow::{self, Flow};
+use crate::personas::{self, Catalog, Persona};
 use crate::reply::{self, SnoozeStore};
 use crate::runtime::{display_name, BotInfo, Runtime, RuntimeError};
 use crate::slackapi::{Posted, SlackApi};
@@ -131,6 +135,11 @@ struct Inner {
     home: Home,
     /// The new first-time flow (`PMOS_ONBOARDING_V2=1`) and what each PM has seen of it.
     flow: Flow,
+    /// The marketplace bots (`GET /v1/personas`), reused for a minute, shared with the tool
+    /// server client for "Drafted by" on cards.
+    personas: Catalog,
+    /// `(channel, thread_ts, persona)` whose Preview line was already posted in that thread.
+    previewed: Mutex<Bounded<(String, String, String), ()>>,
 }
 
 #[derive(Clone)]
@@ -205,7 +214,9 @@ impl Bots {
     }
 
     /// As [`Bots::new`], with the new first-time flow (`PMOS_ONBOARDING_V2`) set explicitly.
-    pub fn with_onboarding_v2(cfg: BotsConfig, onboarding_v2: bool) -> Self {
+    pub fn with_onboarding_v2(mut cfg: BotsConfig, onboarding_v2: bool) -> Self {
+        let personas = Catalog::default();
+        cfg.toolserver = cfg.toolserver.with_personas(personas.clone());
         let flow = Flow::open(&cfg.state_dir, onboarding_v2);
         let onboarding = Onboarding::new(cfg.github_org.clone(), cfg.response_url_prefix.clone());
         let snoozes = SnoozeStore::open(&cfg.state_dir);
@@ -222,8 +233,38 @@ impl Bots {
                 questions: Mutex::new(Bounded::new(500)),
                 drafts: Mutex::new(Bounded::new(500)),
                 roster: Mutex::new(None),
+                personas,
+                previewed: Mutex::new(Bounded::new(5000)),
             }),
         }
+    }
+
+    /// The offered marketplace bots (`GET /v1/personas`), reused for a minute; a stale copy
+    /// if the runtime is down.
+    pub async fn personas(&self) -> Result<Arc<Vec<Persona>>, RuntimeError> {
+        let current = self.inner.personas.current();
+        if let Some((at, list)) = &current {
+            if at.elapsed() < ROSTER_TTL {
+                return Ok(list.clone());
+            }
+        }
+        match self.runtime().personas().await {
+            Ok(list) => Ok(self.inner.personas.store(list)),
+            Err(e) => current.map(|(_, list)| list).ok_or(e),
+        }
+    }
+
+    /// `true` the first time `persona`'s Preview line is to be shown in this thread.
+    pub(crate) fn first_preview(&self, channel: &str, thread_ts: &str, persona: &str) -> bool {
+        self.inner
+            .previewed
+            .lock()
+            .expect("previewed lock")
+            .first_time((
+                channel.to_string(),
+                thread_ts.to_string(),
+                persona.to_string(),
+            ))
     }
 
     pub fn slack(&self) -> &SlackApi {
@@ -649,6 +690,16 @@ impl Bots {
             }
         };
         let (prefix, rest) = split_prefix(&text, &roster);
+        // A bot's own `<bot>:` prefix comes first, as before; then a marketplace bot's name.
+        let asked = match prefix {
+            Some(_) => None,
+            None => self.persona_prefix(&text).await,
+        };
+        if let Some((persona, ask)) = asked {
+            return self
+                .ask_persona(&dm, &handle, &roster, &persona, &ask)
+                .await;
+        }
         let key = (dm.channel.clone(), dm.thread_ts.clone());
         if prefix.is_none() {
             let pending = self
@@ -683,6 +734,56 @@ impl Bots {
             .await;
     }
 
+    /// The marketplace bot a message's text names (`Chief: …`, `sprout, …`) and the ask after
+    /// the name (`personas::split`), from the runtime's catalog. `None` when no offered
+    /// persona is named, or no catalog can be read (the text then goes as it is, as before).
+    pub(crate) async fn persona_prefix(&self, text: &str) -> Option<(Persona, String)> {
+        let catalog = match self.personas().await {
+            Ok(catalog) => catalog,
+            Err(e) => {
+                tracing::warn!(error = %e, "persona catalog unavailable; no bot prefix read");
+                return None;
+            }
+        };
+        personas::split(text, &catalog).map(|(p, ask)| (p.clone(), ask.to_string()))
+    }
+
+    /// A DM that names a marketplace bot: the PM's personal bot runs it as that persona.
+    /// What the Slack bot can tell before sending is told at once (no personal bot, nothing
+    /// asked, a routine); the team is the tool server's to check at claim, and its sentence
+    /// comes back in the thread.
+    async fn ask_persona(
+        &self,
+        dm: &Dm,
+        handle: &str,
+        roster: &[BotInfo],
+        persona: &Persona,
+        ask: &str,
+    ) {
+        let shown = persona.shown();
+        let note = |text: String| cards::note(&text);
+        let bot = personal_bot_name(handle);
+        let thread = Some(dm.thread_ts.as_str());
+        if !roster.iter().any(|b| b.name == bot) {
+            tracing::info!(user = handle, "persona ask without a personal bot");
+            let text = personas::NEEDS_PERSONAL_BOT.replace("{name}", &shown);
+            self.post(&dm.channel, thread, None, note(text)).await;
+            return;
+        }
+        if ask.is_empty() {
+            self.post(&dm.channel, thread, None, note(personas::empty_ask(&shown)))
+                .await;
+            return;
+        }
+        if routine_request(ask).is_some() {
+            let text = personas::routine_not_yet(&shown);
+            self.post(&dm.channel, thread, None, note(text)).await;
+            return;
+        }
+        self.start_task_as(dm, handle, &bot, &named(roster, &bot), ask, Some(persona))
+            .await;
+    }
+
     /// Creates the task for a DM; `false` when it was refused or failed (the PM was told).
     pub(crate) async fn start_task(
         &self,
@@ -692,13 +793,34 @@ impl Bots {
         shown: &str,
         text: &str,
     ) -> bool {
+        self.start_task_as(dm, handle, bot, shown, text, None).await
+    }
+
+    /// [`Bots::start_task`] as `persona` (`None`: no `persona` is sent, so a reply in a thread
+    /// stays with the thread's bot, as the runtime decides).
+    pub(crate) async fn start_task_as(
+        &self,
+        dm: &Dm,
+        handle: &str,
+        bot: &str,
+        shown: &str,
+        text: &str,
+        persona: Option<&Persona>,
+    ) -> bool {
         // Remembered first, so a second message sent quickly in the thread goes to the same
         // bot; put back if the task isn't created.
         let previous = self.thread_bot(&dm.channel, &dm.thread_ts);
         self.remember_thread(&dm.channel, &dm.thread_ts, bot);
         let created = self
             .runtime()
-            .create_task(handle, bot, text, &dm.channel, &dm.thread_ts)
+            .create_task_as(
+                handle,
+                bot,
+                text,
+                &dm.channel,
+                &dm.thread_ts,
+                persona.map(|p| p.key.as_str()),
+            )
             .await;
         if created.is_err() {
             let key = (dm.channel.clone(), dm.thread_ts.clone());
@@ -713,7 +835,18 @@ impl Bots {
         let ok = created.is_ok();
         match created {
             Ok(task) => {
-                tracing::info!(task = %task["id"], bot, user = handle, "task created from a DM");
+                tracing::info!(task = %task["id"], bot, user = handle, persona = persona.map(|p| p.key.as_str()).unwrap_or("nudge"), "task created from a DM");
+            }
+            Err(RuntimeError::Persona(code)) => {
+                tracing::info!(code, user = handle, "persona ask refused by the runtime");
+                let name = persona.map(Persona::shown).unwrap_or_else(|| escape(shown));
+                self.post(
+                    &dm.channel,
+                    Some(&dm.thread_ts),
+                    None,
+                    cards::note(&personas::refusal(&code, &name)),
+                )
+                .await;
             }
             Err(RuntimeError::Refused(why)) => {
                 let message = format!("{} can't take that: {}", escape(shown), escape(&why));
@@ -798,7 +931,8 @@ impl Bots {
                 self.post(&dm.channel, thread, Some(&shown), cards::note(&message))
                     .await;
             }
-            Err(RuntimeError::Unavailable) => {
+            // Only a task names a persona; kept for the match.
+            Err(RuntimeError::Unavailable | RuntimeError::Persona(_)) => {
                 self.post(&dm.channel, thread, None, cards::note(UNAVAILABLE))
                     .await;
             }
@@ -855,6 +989,8 @@ impl Bots {
         handle: &str,
         id: &str,
     ) -> Option<Value> {
+        // The card says which bot drafted the item, from a catalog at most a minute old.
+        let _ = self.personas().await;
         match self.toolserver().approval(id, handle).await {
             Ok(item) => Some(item),
             Err(CallError::NotFound) => {
@@ -1254,7 +1390,11 @@ impl Bots {
                 )
                 .await;
             }
-            Err(RuntimeError::Refused(why) | RuntimeError::Question(why)) => {
+            Err(
+                RuntimeError::Refused(why)
+                | RuntimeError::Question(why)
+                | RuntimeError::Persona(why),
+            ) => {
                 let line = format!("I couldn't create that routine: {}", escape(&why));
                 self.update(&click.channel, &click.message_ts, cards::note(&line))
                     .await;

@@ -1,7 +1,7 @@
 # Bot marketplace: Chief, Sprout and Echo beside Nudge
 
-Status: **design spec; slices C1, B1, R1, W1 and M1 built** (contract, lint and generator; the
-tool server; the runtime and harness; the `pmos-web` API; the reviewer's changes: §13, "Status"). The independent
+Status: **design spec; slices C1, B1, R1, W1, M1 and S1 built** (contract, lint and generator; the
+tool server; the runtime and harness; the `pmos-web` API; the reviewer's changes; Slack: §13, "Status"). The independent
 reviewer reviewed it on 2026-11-21 ("sound after changes"); M1 builds those changes and the
 owner's two decisions of that day (Chief, Sprout and Echo are offered as **Previews** until their
 eval run passes; Echo's pages carry "Draft for internal review. Not approved for external
@@ -729,7 +729,8 @@ toggling `offered` becomes a pull request. No buttons that change anyone's team.
 
 ## 9. Slack (`crates/slack`)
 
-Minimal on purpose.
+Minimal on purpose. *Built in S1 (§13, "S1 is built"); the PM-facing description is
+`docs/slack-bots.md`.*
 
 - **Addressing:** a DM to PM OS, or the text after an `@PM OS` tag, that begins with a persona's
   display name or key, any case, followed by `:` or `,` (`Chief: what slipped since Monday?`,
@@ -1320,6 +1321,84 @@ the owner's two decisions of that day. Built:
 **Not verified**: the GitHub settings (not set; CI on the account doesn't start jobs); any eval
 run (none has happened, so no bot is benchmarked and nothing is claimed about quality); pmos-web,
 Slack and the web app showing `preview` or `held` (not built); the hourly limit across replicas.
+
+### Status: S1 is built (2026-11-21, branch `claude/market-s1-slack`)
+
+Built, in `crates/slack`: `src/personas.rs` (the catalog as the Slack bot reads it, the prefix
+rule `split`, `Speaker` and `attribute` for "Chief: …" and the Preview line, `Catalog` and
+`annotate` for "Drafted by", the PM-facing sentences); `Runtime::personas` (`GET /v1/personas`)
+and `Runtime::create_task_as` (`persona`, and the `400` codes as `RuntimeError::Persona`) in
+`src/runtime.rs`; the DM path (`Bots::persona_prefix`, `ask_persona`, `start_task_as`, the
+catalog cache `Bots::personas`, the once-per-thread Preview record) in `src/bots.rs`; the tag
+path in `src/mention.rs`; the speaker on every notification message in `src/notify.rs`; "Drafted
+by" and held drafts on the cards in `src/cards.rs`; the tool server client puts "Drafted by" on
+each item it reads or decides (`src/toolserver.rs`). Docs: `docs/slack-bots.md`. Tests:
+`crates/slack/tests/personas.rs` (9, against the fake Slack, a mock runtime with a catalog and a
+mock tool server): `Chief: x`, `chief, x` and `SPROUT:x` route on `pm-ana` with `persona`;
+`Chiefly speaking, …` and a withdrawn bot's name (`Echo: …`) go as plain text to Nudge; `Nudge:`
+sends `nudge`; `docs:` still wins; a thread reply sends no persona, another bot's prefix sends
+that bot, `nudge:` switches back; a not-on-team ask is sent and the claim's sentence is posted,
+said by the bot; names on progress (kept on its edits), answers and failures; the Preview line
+once per thread, again in another thread, never for a benchmarked bot or Nudge; an unknown key
+reads "A bot no longer offered"; "Drafted by Chief" on the card, none for Nudge, a tool server's
+copy of the field ignored, a held draft offering only **Reject**; no personal bot, an empty ask,
+a routine and the runtime's `unknown_persona` and `persona_needs_personal_bot` each told before or
+instead of a task; a tag naming Chief; a hostile display name and title (`<!channel>`, `<@U…>`,
+a link, `*`, `` ` ``, `_`, a domain) inert, and not a prefix; a runtime without `/v1/personas`
+works as before. Unit tests in `personas.rs` (8): the prefix rule case by case (non-ASCII text
+included), the longest name winning, catalog parsing, attribution, the hostile text, the drafted
+line needing a read catalog.
+
+**Departures**, all small:
+
+1. **The catalog comes from the runtime** (`GET /v1/personas`, R1), not the tool server's
+   `/internal/personas`: it is the list `POST /v1/tasks` checks against. Reused for a minute; a
+   stale copy while the runtime is down. A runtime without the route (`404`) or refusing it is
+   an empty catalog (no prefix matches). **With no copy at all and the runtime unreachable, the
+   text goes as it is** (to Nudge, or wherever it would have gone); the task then fails to be
+   created anyway, since the runtime is down.
+2. **The team isn't checked by the Slack bot**: its token can't read a team (the team routes
+   take `PMOS_WEB_TOKEN` and a signed assertion), so, as §9 says, the ask is sent and the claim's
+   sentence is posted. What it can tell first, it tells, and sends nothing: no personal bot
+   (sentence), the name with nothing after it, a routine. A `400 unknown_persona` (withdrawn
+   since the catalog was read) or `persona_needs_personal_bot` from the runtime gets Slack's own
+   sentence, not the runtime's developer text.
+3. **Order**: a team bot's `<bot>:` prefix (D9) still comes first, then a persona's name; a
+   persona ask always goes to the PM's personal bot, also in another bot's thread (which then
+   becomes the personal bot's). Only a display name the lint would accept (ASCII letters,
+   digits, single spaces) is matched; the key always is; the longest match wins; the name must
+   be followed at once by `:` or `,` (`Chief : x` is plain text).
+4. **"Chief: …"** is the start of the message's first section (`*Chief:*`) and of its fallback
+   text; a message whose first block isn't a section gets a context line with the name first.
+   Messages still post under the personal bot's `username`. **No mascot**: Slack shows a sender
+   icon only from an image URL or an emoji, and there is no hosted image of the mascots; the
+   name carries the meaning, as in the web app.
+5. **The Preview line** is "<title> · Preview: not yet benchmarked", a context block under the
+   persona's first message in a thread (a routine's run: the message that starts its thread).
+   "Once" is kept per thread and persona in memory (5,000 threads): after a restart a thread can
+   show it once more. The progress message keeps the line on its edits.
+6. **A notification key the catalog doesn't list** (or not key-shaped) reads "A bot no longer
+   offered"; a `nudge` or absent `persona` is Nudge, with no name.
+7. **Routines named with a persona are refused** with a sentence ("Routines set up in Slack run as
+   Nudge for now …"), since §9 adds no command and routine parsing takes no persona; a routine
+   asked without a prefix in a persona's thread is Nudge's, as before.
+8. **"Drafted by"** is put on each approval item by the tool server client
+   (`_slack_drafted_by`, a field the Slack bot owns: any copy from the tool server is dropped),
+   from the catalog read before a card is posted or a click is handled. Before the catalog was
+   ever read, no line (never guessed). Nudge's cards are unchanged; reply cards carry it in
+   their meta line.
+9. **Held drafts** (M1 left Slack's wording to S1): the card says "Held: the bot that drafted
+   this isn't offered in PM OS any more …" and offers only **Reject** (and **Open in
+   workspace**); a `409 held` from a decision is shown as other refusals are.
+10. **A tag** that names a bot starts its DM root message with the bot's name; a tag with only
+    the name asks "Draft a reply to this thread.", as a bare tag does.
+11. **Not in S1**: the App Home's Skills section listing the team (§9 says later); the brief
+    under Chief (R2).
+
+**Not verified**: a real Slack workspace (the fake Slack only: no real rendering, notification
+text or `username` display was seen); the real R1 runtime and B1 tool server (mocks built from
+`docs/bots-runtime.md` and the B1 and R1 notes above; the stack tests are not changed); any eval
+run (none has happened; nothing is claimed about any bot's quality).
 
 ### Order and parallelism
 

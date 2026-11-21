@@ -33,6 +33,7 @@ use crate::bots::{Bots, DEFAULT_BOT};
 use crate::bounded::Bounded;
 use crate::brief_feed::{self, Producer};
 use crate::cards::{self, Stage};
+use crate::personas::{self, Persona, Speaker};
 use crate::slackapi::Posted;
 use crate::toolserver::CallError;
 
@@ -46,6 +47,12 @@ struct TaskThread {
     thread_ts: Option<String>,
     progress_ts: Option<String>,
     milestones: Vec<String>,
+    /// The marketplace bot the task runs as (`None`: Nudge), named on every message.
+    speaker: Option<Speaker>,
+    /// A Preview persona's key and line, shown once per thread.
+    preview: Option<(String, String)>,
+    /// The progress message carries the Preview line, so its edits keep it.
+    progress_preview: bool,
 }
 
 pub struct Notifier {
@@ -191,6 +198,9 @@ impl Notifier {
                     thread_ts: item["slack"]["thread_ts"].as_str().map(String::from),
                     progress_ts: None,
                     milestones: Vec::new(),
+                    speaker: None,
+                    preview: None,
+                    progress_preview: false,
                 },
                 // A task from outside Slack (a routine's run): DM the PM it is for.
                 None => {
@@ -209,9 +219,19 @@ impl Notifier {
                         thread_ts: None,
                         progress_ts: None,
                         milestones: Vec::new(),
+                        speaker: None,
+                        preview: None,
+                        progress_preview: false,
                     }
                 }
             };
+            let mut place = place;
+            if let Some((speaker, persona)) = self.speaker(item).await {
+                place.preview = persona
+                    .filter(|p| p.preview)
+                    .map(|p| (p.key.clone(), Speaker::preview_line(&p)));
+                place.speaker = Some(speaker);
+            }
             self.tasks.insert(task_id.clone(), place);
         }
         let username = self.bots.display_name(&bot).await;
@@ -334,6 +354,16 @@ impl Notifier {
         }
     }
 
+    /// Who a notification's task runs as: `None` for Nudge (a notification carries `persona`
+    /// only when it isn't Nudge). The name comes from the runtime's catalog, never from the
+    /// key; a key it doesn't list reads "A bot no longer offered".
+    async fn speaker(&self, item: &Value) -> Option<(Speaker, Option<Persona>)> {
+        let persona = &item["persona"];
+        persona.as_str().filter(|k| *k != "nudge")?;
+        let catalog = self.bots.personas().await.unwrap_or_default();
+        Speaker::of(persona, &catalog)
+    }
+
     /// Post in the task's thread. The first message of a task with no thread starts one.
     async fn say(
         &mut self,
@@ -342,9 +372,47 @@ impl Notifier {
         username: &str,
         message: (String, Value),
     ) -> Option<Posted> {
-        let (channel, thread_ts) = {
+        self.say_with(task_id, bot, username, message)
+            .await
+            .map(|(posted, _)| posted)
+    }
+
+    /// [`Notifier::say`], and whether the message carried the Preview line. A persona's
+    /// message starts with its name; a Preview persona's first message in a thread also says
+    /// "Preview: not yet benchmarked".
+    async fn say_with(
+        &mut self,
+        task_id: &str,
+        bot: &str,
+        username: &str,
+        message: (String, Value),
+    ) -> Option<(Posted, bool)> {
+        let (channel, thread_ts, speaker, preview) = {
             let t = self.tasks.get(&task_id.to_string())?;
-            (t.channel.clone(), t.thread_ts.clone())
+            (
+                t.channel.clone(),
+                t.thread_ts.clone(),
+                t.speaker.clone(),
+                t.preview.clone(),
+            )
+        };
+        let mut previewed = false;
+        let message = match speaker {
+            Some(mut speaker) => {
+                if let Some((key, line)) = &preview {
+                    // A task with no thread yet starts one: its first message is the first.
+                    let first = match &thread_ts {
+                        Some(ts) => self.bots.first_preview(&channel, ts, key),
+                        None => true,
+                    };
+                    if first {
+                        speaker.preview = Some(line.clone());
+                        previewed = true;
+                    }
+                }
+                personas::attribute(message, &speaker)
+            }
+            None => message,
         };
         let posted = self
             .bots
@@ -356,8 +424,26 @@ impl Notifier {
                 t.thread_ts = Some(posted.ts.clone());
             }
             self.bots.remember_thread(&posted.channel, &posted.ts, bot);
+            if let Some((key, _)) = &preview {
+                self.bots.first_preview(&posted.channel, &posted.ts, key);
+            }
         }
-        Some(posted)
+        Some((posted, previewed))
+    }
+
+    /// A progress message as its task's persona says it, keeping the Preview line on a
+    /// message that was posted with it.
+    fn attributed(t: &TaskThread, message: (String, Value)) -> (String, Value) {
+        match &t.speaker {
+            Some(speaker) => {
+                let mut speaker = speaker.clone();
+                if t.progress_preview {
+                    speaker.preview = t.preview.as_ref().map(|(_, line)| line.clone());
+                }
+                personas::attribute(message, &speaker)
+            }
+            None => message,
+        }
     }
 
     async fn milestone(&mut self, task_id: &str, bot: &str, username: &str, text: &str) {
@@ -372,12 +458,16 @@ impl Notifier {
         match t.progress_ts.clone() {
             Some(ts) => {
                 let channel = t.channel.clone();
+                let message = Self::attributed(t, message);
                 self.bots.update(&channel, &ts, message).await;
             }
             None => {
-                if let Some(posted) = self.say(task_id, bot, username, message).await {
+                if let Some((posted, previewed)) =
+                    self.say_with(task_id, bot, username, message).await
+                {
                     if let Some(t) = self.tasks.get_mut(&key) {
                         t.progress_ts = Some(posted.ts);
+                        t.progress_preview = previewed;
                     }
                 }
             }
@@ -393,13 +483,15 @@ impl Notifier {
             return;
         };
         let channel = t.channel.clone();
-        let message = cards::progress(&t.milestones, stage);
+        let message = Self::attributed(t, cards::progress(&t.milestones, stage));
         self.bots.update(&channel, &ts, message).await;
     }
 
     /// The approval card for one item, read for `requested_by` (the task's PM), retried
     /// briefly if the tool server is unavailable.
     async fn card(&self, id: &str, requested_by: &str) -> (String, Value) {
+        // "Drafted by Chief" needs the catalog: at most a minute old.
+        let _ = self.bots.personas().await;
         for attempt in 0..3 {
             match self.bots.toolserver().approval(id, requested_by).await {
                 Ok(item) if item["status"] == "pending" => {

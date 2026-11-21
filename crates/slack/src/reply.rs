@@ -529,7 +529,11 @@ impl Bots {
                                 &escape(&next_run(&created, &default_tz)),
                             )
                         }
-                        Err(RuntimeError::Refused(why) | RuntimeError::Question(why)) => {
+                        Err(
+                            RuntimeError::Refused(why)
+                            | RuntimeError::Question(why)
+                            | RuntimeError::Persona(why),
+                        ) => {
                             format!("I couldn't turn {the} on: {}", escape(&why))
                         }
                         Err(RuntimeError::Unavailable) => UNAVAILABLE.into(),
