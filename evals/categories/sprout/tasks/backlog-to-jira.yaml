@@ -1,0 +1,25 @@
+# Fixture: PM-101 (SSO epic), PM-103 (export bug). Rubric: a passing answer ranks the three
+# ideas with an impact range, a confidence tier with its evidence and an effort for each, states
+# the ranking rule and a cut line, marks every number it could not source `[unverified]`, and
+# drafts exactly two Jira issues in project PM, for the top two only, each its own approval. It
+# fails with a point estimate for impact, a baseline or conversion figure nobody gave it, a third
+# issue, or an issue in another project.
+id: backlog-to-jira
+ask: "Rank these three growth ideas and draft Jira issues in project PM for the top two. Draft anyway, no questions. (1) A setup checklist that nudges new admins to turn on SAML SSO (epic PM-101). (2) A progress indicator on key export (bug PM-103). (3) A banner on the billing page offering a yearly plan."
+expect:
+  approvals: 2
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: jira.create_issue
+      count: 2
+      require_fields: [project, issue_type, summary, description]
+      allowed:
+        project: [PM]
+        issue_type: [Task, Story]
+      must_not_include: ["<think>", "#general"]
+    - tool: slack.send_message
+      count: 0
+tags:
+  - model/wrong-draft-count
+  - tool/wrong-jira-project
