@@ -35,7 +35,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use chrono::{DateTime, Duration, Utc};
 use pmos_contract::bots::{role_tools, ActionSetting, Bot, BotScope, Role};
 use pmos_contract::model::{ModelRole, CONTEXT_DOMAINS};
-use pmos_contract::personas::{role_setting, stricter, ALWAYS_ON, PERSONAL_ROLE};
+use pmos_contract::personas::{
+    persona_role_setting, role_setting, stricter, with_draft_notice, ALWAYS_ON, PERSONAL_ROLE,
+};
 use pmos_contract::{Sensitivity, ToolKind};
 use serde_json::{json, Value};
 
@@ -233,7 +235,18 @@ pub enum DecisionError {
     /// `expected_args_hash` isn't 16 to 64 lowercase hex characters.
     #[error("`expected_args_hash` must be 16 to 64 lowercase hex characters")]
     ShownHashMalformed,
+    /// The draft's persona (marketplace bot) is no longer offered, so the draft is held: it
+    /// can be rejected but not approved or edited until the bot is offered again or an Admin
+    /// releases it (`docs/bot-marketplace-spec.md` §6, "Removal"). Nothing was decided.
+    #[error("{0} isn't offered in PM OS any more, so its drafts are held: reject this one, or ask an Admin to release it. Nothing was approved")]
+    Held(String),
 }
+
+/// The `409` code of a decision refused because the draft's bot was withdrawn.
+pub const HELD: &str = "held";
+
+/// The audit note of a decision refused because the draft's bot was withdrawn.
+pub const HELD_DECISION: &str = "held: the draft's bot is no longer offered";
 
 /// The `409` code of a decision refused because the draft changed since it was shown.
 pub const STALE: &str = "stale";
@@ -378,7 +391,7 @@ impl Policy {
         Some(match &self.persona {
             Some(p) => stricter(
                 own,
-                stricter(role_setting(role, tool), role_setting(p, tool)),
+                stricter(role_setting(role, tool), persona_role_setting(p, tool)),
             ),
             None => own,
         })
@@ -397,10 +410,24 @@ impl Policy {
                 Some(p) => format!("the {} bot as {}", bot.name, p.name),
                 None => format!("the {} bot", bot.name),
             };
-            return Err(ToolError::Forbidden(format!(
-                "{who} may never use {}: its setting for it is `never`",
-                spec.name
-            )));
+            // A persona role lists every write it may draft; one it doesn't list is refused,
+            // never approved by default (the marketplace review).
+            let unlisted = spec.kind == ToolKind::Write
+                && self
+                    .persona
+                    .as_ref()
+                    .is_some_and(|p| !p.actions.contains_key(&spec.name));
+            return Err(ToolError::Forbidden(if unlisted {
+                format!(
+                    "{who} may not use {}: the role doesn't list it in its `actions`, and a marketplace bot's unlisted writes are refused",
+                    spec.name
+                )
+            } else {
+                format!(
+                    "{who} may never use {}: its setting for it is `never`",
+                    spec.name
+                )
+            }));
         }
         Ok(())
     }
@@ -1483,12 +1510,16 @@ impl ToolService {
         event: &mut AuditEvent,
     ) -> Result<Value, ToolError> {
         let key = token_hash(&session.token);
-        if self
+        // A persona's draft notice (Echo's "Draft for internal review. …") heads every page it
+        // drafts, whatever the model wrote: recorded so, shown so, written so.
+        let noted = self.with_persona_notice(session.persona.as_deref(), &spec.name, args);
+        let granted = self
             .stores
             .approvals
             .take_grant(&key, &spec.name, args, now)
-            .await?
-        {
+            .await?;
+        let (granted_args, args) = (args, &noted);
+        if granted {
             // Fail closed: the write runs only once the audit log has recorded it starting.
             let started = AuditEvent {
                 outcome: Outcome::Started,
@@ -1501,7 +1532,7 @@ impl ToolService {
                 let _ = self
                     .stores
                     .approvals
-                    .add_grant(&key, &spec.name, args, now)
+                    .add_grant(&key, &spec.name, granted_args, now)
                     .await;
                 return Err(ToolError::Unavailable(e.0));
             }
@@ -1578,6 +1609,22 @@ impl ToolService {
                 spec.name, session.user
             ),
         }))
+    }
+
+    /// `args` with the draft notice of `persona` (its `draft-notice`, such as Echo's
+    /// [`pmos_contract::personas::INTERNAL_REVIEW_NOTICE`]) at the top of the page body, for a
+    /// page tool ([`pmos_contract::personas::NOTICE_TOOLS`]); unchanged otherwise. Applied
+    /// when a persona's draft is recorded and again when it is written, so neither the model
+    /// nor a later edit can leave it out.
+    fn with_persona_notice(&self, persona: Option<&str>, tool: &str, args: &Value) -> Value {
+        let roster = self.roster();
+        let notice = persona
+            .and_then(|key| roster.persona(key))
+            .and_then(|p| p.draft_notice.clone());
+        match notice {
+            Some(notice) => with_draft_notice(tool, args, &notice),
+            None => args.clone(),
+        }
     }
 
     /// Run an approved write as `caller`'s PM: through its connector, or, for the bets
@@ -1892,8 +1939,28 @@ impl ToolService {
         let mut views = [self.view(item, site.as_deref())];
         self.attach_recommendations(std::slice::from_ref(item), &mut views)
             .await;
+        self.attach_holds(std::slice::from_ref(item), &mut views)
+            .await;
         let [view] = views;
         view
+    }
+
+    /// `held: true` on each pending view whose bot was withdrawn and that no Admin released
+    /// ([`ToolService::held`]): the owner may reject it, not approve it. Left out otherwise. If
+    /// the release can't be read the view says held, which is what a decision would find.
+    async fn attach_holds(&self, items: &[ApprovalItem], views: &mut [Value]) {
+        for (item, view) in items.iter().zip(views.iter_mut()) {
+            let held = match self.held(item).await {
+                Ok(held) => held.is_some(),
+                Err(e) => {
+                    tracing::warn!(error = %e, id = %item.id, "a draft's hold couldn't be read");
+                    item.persona.is_some() && item.status == Status::Pending
+                }
+            };
+            if let (true, Some(obj)) = (held, view.as_object_mut()) {
+                obj.insert("held".into(), Value::Bool(true));
+            }
+        }
     }
 
     /// Each item's live recommendations (`crate::reviews`), as `recommendations` on its view:
@@ -1945,6 +2012,7 @@ impl ToolService {
             out.push(self.view(item, site.as_deref()));
         }
         self.attach_recommendations(items, &mut out).await;
+        self.attach_holds(items, &mut out).await;
         out
     }
 
@@ -2208,6 +2276,11 @@ impl ToolService {
             }
         }
         if let (true, Some(current)) = (decision != Decision::Reject, open) {
+            // A withdrawn bot's drafts are held: rejecting stays open, approving doesn't.
+            if let Some(name) = self.held(current).await? {
+                self.audit(denied(current.clone(), HELD_DECISION)).await;
+                return Err(DecisionError::Held(name));
+            }
             let spec = self.write_spec(current)?;
             let args = match decision {
                 Decision::Edit => {
@@ -2711,12 +2784,14 @@ impl ToolService {
         // counts as restricted, as the audience check counts it.
         let writer = item.bot.as_deref().or(item.skill.as_deref());
         let sensitivity = item.sources_sensitivity.unwrap_or(Sensitivity::Restricted);
+        // The persona's draft notice survives an edit that dropped it.
+        let args = self.with_persona_notice(item.persona.as_deref(), &item.tool, &item.args);
         let result = self
             .execute_write(
                 Caller::new(&item.user, &item.run_id),
                 writer,
                 &spec,
-                &item.args,
+                &args,
                 sensitivity,
                 event.at,
             )
@@ -2803,4 +2878,4 @@ pub(crate) fn display_name(dir: Option<&crate::users::Directory>, handle: &str) 
 mod review;
 mod team;
 pub use review::{About, ReviewError, ReviewInbox};
-pub use team::TeamRefusal;
+pub use team::{ReleaseRefusal, TeamRefusal, RELEASE_HOLD};

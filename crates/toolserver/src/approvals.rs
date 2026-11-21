@@ -600,6 +600,15 @@ pub trait ApprovalRepo: Send + Sync {
         user: Option<&str>,
         since: DateTime<Utc>,
     ) -> StoreResult<BTreeMap<String, u64>>;
+
+    /// Release item `id` from the hold its withdrawn persona puts on it
+    /// (`docs/bot-marketplace-spec.md` §6, "Removal"): an Admin's decision, recorded once with
+    /// who and when. `false` when there is no such item or it was already released. Changes
+    /// nothing else on the item.
+    async fn release_hold(&self, id: &str, by: &str, now: DateTime<Utc>) -> StoreResult<bool>;
+
+    /// Whether an Admin released item `id` from its persona's hold ([`Self::release_hold`]).
+    async fn hold_released(&self, id: &str) -> StoreResult<bool>;
 }
 
 /// Why `new` can't be stored on `item` as it is now, checked in this order by both stores:
@@ -676,6 +685,8 @@ struct State {
     ledger: BTreeMap<String, Ledgered>,
     /// Every recommendation, live and withdrawn, in the order stored.
     recommendations: Vec<Recommendation>,
+    /// Items an Admin released from their withdrawn persona's hold: who, and when.
+    released: BTreeMap<String, (String, DateTime<Utc>)>,
 }
 
 impl State {
@@ -1112,6 +1123,20 @@ impl ApprovalRepo for MemoryApprovals {
             *out.entry(key).or_insert(0) += 1;
         }
         Ok(out)
+    }
+
+    async fn release_hold(&self, id: &str, by: &str, now: DateTime<Utc>) -> StoreResult<bool> {
+        let mut state = self.state.lock().expect("approvals lock");
+        if !state.items.contains_key(id) || state.released.contains_key(id) {
+            return Ok(false);
+        }
+        state.released.insert(id.to_string(), (by.to_string(), now));
+        Ok(true)
+    }
+
+    async fn hold_released(&self, id: &str) -> StoreResult<bool> {
+        let state = self.state.lock().expect("approvals lock");
+        Ok(state.released.contains_key(id))
     }
 
     async fn pending_of(

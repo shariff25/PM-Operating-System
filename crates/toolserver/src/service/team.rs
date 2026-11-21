@@ -24,6 +24,7 @@ use pmos_contract::personas::{Persona, ALWAYS_ON};
 use serde_json::{json, Value};
 
 use super::ToolService;
+use crate::approvals::{ApprovalItem, Status};
 use crate::audit::{Client, Outcome};
 use crate::store::StoreError;
 use crate::team::{
@@ -99,6 +100,7 @@ pub fn persona_json(p: &Persona) -> Value {
         "title": p.title,
         "mascot": p.mascot,
         "always_on": p.always_on,
+        "preview": p.preview,
         "summary": p.summary,
         "examples": p.examples,
         "can_do": p.can_do,
@@ -337,8 +339,25 @@ impl ToolService {
         for (persona, handle) in &rows {
             holders.entry(persona).or_default().push(handle);
         }
+        // People are in the database, not the content, so the lint's reserved names can't
+        // cover them: a persona named like a user is shown to Admins here (`name_clashes`).
+        let dir = self.people().directory().await?;
         let mut personas = Vec::new();
         for p in roster.personas() {
+            let clashes: Vec<&str> = dir
+                .users
+                .values()
+                .filter(|u| {
+                    [p.name.as_str(), p.display_name.as_str()].iter().any(|n| {
+                        pmos_contract::personas::reads_as(n, &u.handle)
+                            || pmos_contract::personas::reads_as(n, &u.display_name)
+                    })
+                })
+                .map(|u| u.handle.as_str())
+                .collect();
+            if !clashes.is_empty() {
+                tracing::warn!(persona = %p.name, people = clashes.len(), "a marketplace bot is named like a PM OS user");
+            }
             let handles = holders.remove(p.name.as_str());
             let (users, handles) = if p.always_on {
                 (Value::Null, Value::Null)
@@ -351,6 +370,7 @@ impl ToolService {
                 "display_name": p.display_name,
                 "offered": roster.offered(&p.name).is_some(),
                 "always_on": p.always_on,
+                "preview": p.preview,
                 "users": users,
                 "handles": handles,
                 "needs": p.needs.iter().map(|n| json!({
@@ -359,6 +379,7 @@ impl ToolService {
                     "met": n.met,
                 })).collect::<Vec<_>>(),
                 "drafts_30d": drafts.get(&p.name).copied().unwrap_or(0),
+                "name_clashes": clashes,
             }));
         }
         let unknown: Vec<Value> = holders
@@ -373,6 +394,142 @@ impl ToolService {
             })
             .collect();
         Ok(json!({ "personas": personas, "unknown": unknown }))
+    }
+
+    /// Whether `item` is **held** (`docs/bot-marketplace-spec.md` §6, "Removal", as the
+    /// reviewer changed it): pending, drafted by a persona that is no longer offered (withdrawn,
+    /// or gone from the catalog), and not released by an Admin. Its owner may still reject it;
+    /// approving or editing it is refused ([`super::DecisionError::Held`]). `Some` carries the
+    /// bot's name for the refusal. Removing a bot from one's own team holds nothing: the
+    /// persona is still offered.
+    pub async fn held(&self, item: &ApprovalItem) -> Result<Option<String>, StoreError> {
+        let Some(key) = item.persona.as_deref() else {
+            return Ok(None);
+        };
+        if item.status != Status::Pending {
+            return Ok(None);
+        }
+        let roster = self.roster();
+        if roster.offered(key).is_some() {
+            return Ok(None);
+        }
+        if self.stores().approvals.hold_released(&item.id).await? {
+            return Ok(None);
+        }
+        Ok(Some(
+            roster
+                .persona(key)
+                .map(|p| p.display_name.clone())
+                .unwrap_or_else(|| "The bot that drafted this".to_string()),
+        ))
+    }
+
+    /// An Admin releases held draft `id` (`POST /internal/admin/personas/drafts/{id}/release`):
+    /// its owner may then approve it as any other draft, with the personal bot's rules (the
+    /// decision checks the item's bot and the personal role, never the persona). Only an
+    /// active person holding `edit-content` (who may also change the catalog: an Admin), only
+    /// a held item. Recorded as `approvals.release_hold`, allowed or refused, with the item's
+    /// persona; never its text.
+    pub async fn release_held_draft(
+        &self,
+        client: Client,
+        admin: &str,
+        id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ApprovalItem, ReleaseRefusal> {
+        let item = self.stores().approvals.get(id).await?;
+        let result = self.try_release(admin, item.as_ref(), now).await;
+        let (outcome, detail) = match &result {
+            Ok(()) => (
+                Outcome::Ok,
+                Some("released from its withdrawn bot's hold".to_string()),
+            ),
+            Err(ReleaseRefusal::Store(_)) => (Outcome::Error, None),
+            Err(e) => (Outcome::Denied, Some(e.code().to_string())),
+        };
+        self.audit(crate::audit::AuditEvent {
+            client,
+            at: now,
+            run_id: item
+                .as_ref()
+                .map_or_else(|| crate::proposals::RUN.to_string(), |i| i.run_id.clone()),
+            user: admin.to_string(),
+            skill: None,
+            bot: item.as_ref().and_then(|i| i.bot.clone()),
+            tool: RELEASE_HOLD.to_string(),
+            outcome,
+            sources: Vec::new(),
+            source_titles: Default::default(),
+            args_hash: None,
+            output_ref: Some(id.to_string()),
+            detail,
+            persona: item.as_ref().and_then(|i| i.persona.clone()),
+        })
+        .await;
+        result?;
+        self.stores()
+            .approvals
+            .get(id)
+            .await?
+            .ok_or(ReleaseRefusal::NotFound)
+    }
+
+    async fn try_release(
+        &self,
+        admin: &str,
+        item: Option<&ApprovalItem>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ReleaseRefusal> {
+        let dir = self.people().directory().await?;
+        match dir.get(admin) {
+            Some(u) if u.active() && permits(u, Permission::EditContent) => {}
+            _ => return Err(ReleaseRefusal::Forbidden),
+        }
+        let item = item.ok_or(ReleaseRefusal::NotFound)?;
+        if self.held(item).await?.is_none() {
+            return Err(ReleaseRefusal::NotHeld);
+        }
+        if !self
+            .stores()
+            .approvals
+            .release_hold(&item.id, admin, now)
+            .await?
+        {
+            return Err(ReleaseRefusal::NotHeld);
+        }
+        Ok(())
+    }
+}
+
+/// The audit tool of an Admin's release of a held draft.
+pub const RELEASE_HOLD: &str = "approvals.release_hold";
+
+/// Why a held draft wasn't released.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReleaseRefusal {
+    /// Not an active person holding `edit-content`.
+    #[error("only an Admin releases a held draft")]
+    Forbidden,
+    #[error("no such draft")]
+    NotFound,
+    /// Not pending, not a persona's, its persona is offered, or already released.
+    #[error(
+        "this draft isn't held: it is decided, its bot is offered, or it was already released"
+    )]
+    NotHeld,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl ReleaseRefusal {
+    /// The wire's `code`, and the audit note of a refusal.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ReleaseRefusal::Forbidden => "forbidden",
+            ReleaseRefusal::NotFound => "not_found",
+            ReleaseRefusal::NotHeld => "not_held",
+            ReleaseRefusal::Store(_) => "unavailable",
+        }
     }
 }
 

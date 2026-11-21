@@ -10,14 +10,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use super::{is_semver, sorted_entries, Cx, Severity};
+use super::{is_semver, sorted_entries, Cx, LintOptions, Severity};
 use crate::bots::{role_tools, valid_name, ActionSetting, BotScope, Role};
 use crate::model::{ToolKind, ToolRegistry};
 use crate::personas::{
-    check_display_name, check_text, drafts, need_met, reads, role_setting, write_label, Need,
-    Persona, PersonaFrontMatter, ALWAYS_ON, MASCOTS, MAX_EXAMPLE, MAX_EXAMPLES, MAX_NEED_LABEL,
-    MAX_NEED_WITHOUT, MAX_ORDER, MAX_PERSONAS, MAX_SUMMARY, MAX_TITLE, NEED_SOURCES, PERSONAL_ROLE,
+    check_display_name, check_text, drafts, need_met, reads, reserved_name, role_sections,
+    role_setting, write_label, Need, Persona, PersonaFrontMatter, ALWAYS_ON, MASCOTS,
+    MAX_DRAFT_NOTICE, MAX_EXAMPLE, MAX_EXAMPLES, MAX_NEED_LABEL, MAX_NEED_WITHOUT, MAX_ORDER,
+    MAX_PERSONAS, MAX_SUMMARY, MAX_TITLE, NEED_SOURCES, PERSONAL_ROLE, STANDING_SECTIONS,
 };
+
+/// The personal role's file, where a missing standing section is reported.
+const BASE_ROLE_FILE: &str = "roles/pm-assistant/ROLE.md";
 
 impl Cx {
     fn error_count(&self) -> usize {
@@ -29,7 +33,7 @@ impl Cx {
     }
 
     /// `personas/<key>/PERSONA.md` (an optional folder). Runs after roles and bots.
-    pub(super) fn check_personas(&mut self, registry: Option<&ToolRegistry>) {
+    pub(super) fn check_personas(&mut self, registry: Option<&ToolRegistry>, opts: &LintOptions) {
         let dir = self.root.join("personas");
         let Some(entries) = sorted_entries(&dir) else {
             return;
@@ -84,10 +88,28 @@ impl Cx {
             let before = self.error_count();
             let persona =
                 self.check_persona(&path, &dir_name, &fm, base.as_ref(), &team_roles, registry);
+            self.check_benchmark(&path, &fm, opts);
             if self.error_count() == before {
                 personas.extend(persona);
             }
             parsed.push((path, fm));
+        }
+        // The personal role holds the standing sections every persona role copies.
+        if let Some(base) = &base {
+            if parsed.iter().any(|(_, fm)| fm.role != PERSONAL_ROLE) {
+                let have: BTreeSet<String> = role_sections(&base.instructions)
+                    .into_iter()
+                    .map(|(h, _)| h)
+                    .collect();
+                let path = self.root.join(BASE_ROLE_FILE);
+                for name in STANDING_SECTIONS.iter().filter(|s| !have.contains(**s)) {
+                    self.error(
+                        "persona-role-sections",
+                        &path,
+                        format!("the personal role has no `## {name}` section, which every persona role carries verbatim (`STANDING_SECTIONS` in crates/contract/src/personas.rs)"),
+                    );
+                }
+            }
         }
         self.check_catalog(&dir, &parsed);
         personas.sort_by(|a: &Persona, b: &Persona| (a.order, &a.name).cmp(&(b.order, &b.name)));
@@ -117,6 +139,20 @@ impl Cx {
         }
         if let Err(msg) = check_display_name(&fm.display_name) {
             self.error("persona-text", path, msg);
+        }
+        for (field, value) in [("name", &fm.name), ("display-name", &fm.display_name)] {
+            if let Some(reserved) = reserved_name(value) {
+                self.error(
+                    "persona-reserved",
+                    path,
+                    format!("{field} `{value}` reads as `{reserved}`, a name reserved for PM OS, its roles or the systems it talks to (`RESERVED_NAMES` in crates/contract/src/personas.rs): in Slack it would look like \"{reserved}: …\""),
+                );
+            }
+        }
+        if let Some(notice) = &fm.draft_notice {
+            if let Err(msg) = check_text("draft-notice", notice, MAX_DRAFT_NOTICE) {
+                self.error("persona-draft-notice", path, msg);
+            }
         }
         for (field, text, max) in [
             ("title", &fm.title, MAX_TITLE),
@@ -221,6 +257,72 @@ impl Cx {
             );
         }
         let tools = role_tools(&role, &self.report.skills);
+
+        // The standing sections, verbatim from the personal role (its own role is the base).
+        if let Some(base) = base.filter(|_| role.name != PERSONAL_ROLE) {
+            let mine = role_sections(&role.instructions);
+            let theirs = role_sections(&base.instructions);
+            for name in STANDING_SECTIONS {
+                let want = theirs.iter().find(|(h, _)| h == name).map(|(_, t)| t);
+                let got: Vec<&String> = mine
+                    .iter()
+                    .filter(|(h, _)| h == name)
+                    .map(|(_, t)| t)
+                    .collect();
+                let problem = match (want, got.as_slice()) {
+                    (Some(w), [g]) if *g == w => None,
+                    (Some(_), []) => Some("is missing".to_string()),
+                    (Some(_), [_]) => {
+                        Some("differs from the personal role's; copy it exactly".to_string())
+                    }
+                    (_, [_, _, ..]) => Some("appears more than once".to_string()),
+                    (None, []) => None,
+                    (None, [_]) => Some(format!(
+                        "is not in the personal role `{PERSONAL_ROLE}`; add it there first, or give this role's own rules another heading"
+                    )),
+                };
+                if let Some(problem) = problem {
+                    self.error(
+                        "persona-role-sections",
+                        path,
+                        format!(
+                            "role `{}`: the section `## {name}` {problem} (a persona role carries the personal role's standing sections verbatim; put its own limits under another heading)",
+                            role.name
+                        ),
+                    );
+                }
+            }
+        }
+        if let Some(notice) = &fm.draft_notice {
+            if !role.instructions.contains(notice.as_str()) {
+                self.error(
+                    "persona-draft-notice",
+                    path,
+                    format!(
+                        "role `{}` doesn't state the draft notice `{notice}`; say in its instructions that every page it drafts carries it",
+                        role.name
+                    ),
+                );
+            }
+        }
+        // Every write the role can make is listed in its `actions`: no fallback to approve.
+        if let Some(registry) = registry {
+            for tool in &tools {
+                let is_write = registry
+                    .get(tool)
+                    .is_some_and(|t| t.kind == ToolKind::Write);
+                if is_write && !role.actions.contains_key(tool) {
+                    self.error(
+                        "persona-action-unlisted",
+                        path,
+                        format!(
+                            "role `{}` can call the write tool `{tool}` (through a skill) but its `actions` don't list it; a persona role lists every write as `approve` or `never`, and the tool server refuses an unlisted one",
+                            role.name
+                        ),
+                    );
+                }
+            }
+        }
 
         for name in &role.skills {
             let Some(skill) = self.report.skills.iter().find(|s| &s.name == name) else {
@@ -349,6 +451,8 @@ impl Cx {
             version: fm.version.clone(),
             offered: fm.offered,
             always_on: fm.always_on,
+            preview: fm.preview,
+            draft_notice: fm.draft_notice.clone(),
             order: u32::try_from(fm.order).unwrap_or(u32::MAX),
             summary: fm.summary.clone(),
             examples: fm.examples.clone(),
@@ -366,6 +470,40 @@ impl Cx {
             reads: reads(&tools, registry),
             drafts: drafts(&tools, registry, &role, base),
         })
+    }
+
+    /// D10 and the owner's Preview exception (2026-11-21): a persona is offered as a full bot
+    /// only once its eval category meets its bar; before that it must say `preview: true`
+    /// (`persona-benchmark`). Checked only when the caller read the reports
+    /// ([`LintOptions::benchmarked`]); the always-on persona is today's assistant and exempt.
+    fn check_benchmark(&mut self, path: &Path, fm: &PersonaFrontMatter, opts: &LintOptions) {
+        let Some(benchmarked) = &opts.benchmarked else {
+            return;
+        };
+        if fm.always_on {
+            return;
+        }
+        let passed = benchmarked.contains(&fm.name);
+        if fm.offered && !fm.preview && !passed {
+            self.error(
+                "persona-benchmark",
+                path,
+                format!(
+                    "`{}` is `offered: true` but no eval category for it (`persona: {}` in evals/categories/*/category.yaml) has met its pass bar two weeks in a row in evals/reports (D10). Offer it as a Preview (`preview: true`, shown as \"Preview: not yet benchmarked\") until it has, or set `offered: false`",
+                    fm.name, fm.name
+                ),
+            );
+        }
+        if fm.preview && passed {
+            self.warn(
+                "persona-benchmark",
+                path,
+                format!(
+                    "`{}`'s eval category meets its bar: drop `preview: true` so it is no longer shown as not yet benchmarked",
+                    fm.name
+                ),
+            );
+        }
     }
 
     /// The rules across persona files: one always-on Nudge, names that don't collide (the

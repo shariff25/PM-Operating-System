@@ -59,17 +59,30 @@ fn persona_file(
     )
 }
 
+/// The personal role's standing sections, as every persona role carries them verbatim (the
+/// lint's `persona-role-sections`), read from the content tree under test.
+fn standing_sections(root: &Path) -> String {
+    let base = std::fs::read_to_string(root.join("roles/pm-assistant/ROLE.md")).unwrap();
+    let body = base.splitn(3, "---\n").nth(2).unwrap();
+    pmos_contract::personas::role_sections(body)
+        .into_iter()
+        .filter(|(h, _)| pmos_contract::personas::STANDING_SECTIONS.contains(&h.as_str()))
+        .map(|(_, text)| format!("{text}\n\n"))
+        .collect()
+}
+
 /// The marketplace content the tests use (see the module docs), and Bo's personal bot.
 fn market(root: &Path) {
+    let standing = standing_sections(root);
     write_content(
         root,
         "roles/quill-role/ROLE.md",
-        "---\nname: quill-role\ndescription: Fake persona role that drafts Jira issues and Slack replies.\nowner: \"@pm\"\nversion: \"0.1.0\"\nskills: \"ask slack-reply jira-draft meeting-notes\"\ndata-class: \"restricted\"\nmodel: \"default\"\nactions:\n  jira.create_issue: approve\n  slack.post_reply: approve\n  slack.send_message: never\n---\n\n# Quill\n\nFake.\n",
+        &format!("---\nname: quill-role\ndescription: Fake persona role that drafts Jira issues and Slack replies.\nowner: \"@pm\"\nversion: \"0.1.0\"\nskills: \"ask slack-reply jira-draft meeting-notes\"\ndata-class: \"restricted\"\nmodel: \"default\"\nactions:\n  jira.create_issue: approve\n  slack.post_reply: approve\n  slack.send_message: never\n---\n\n# Quill\n\nFake.\n\n{standing}"),
     );
     write_content(
         root,
         "roles/abacus-role/ROLE.md",
-        "---\nname: abacus-role\ndescription: Fake persona role that reads and drafts Jira issues.\nowner: \"@pm\"\nversion: \"0.1.0\"\nskills: \"ask jira-draft\"\ndata-class: \"restricted\"\nmodel: \"default\"\n---\n\n# Abacus\n\nFake.\n",
+        &format!("---\nname: abacus-role\ndescription: Fake persona role that reads and drafts Jira issues.\nowner: \"@pm\"\nversion: \"0.1.0\"\nskills: \"ask jira-draft\"\ndata-class: \"restricted\"\nmodel: \"default\"\nactions:\n  jira.create_issue: approve\n---\n\n# Abacus\n\nFake.\n\n{standing}"),
     );
     write_content(
         root,
@@ -237,6 +250,8 @@ async fn catalog_serves_only_offered_personas_and_their_fields(f: &Fixture, _: O
         "title",
         "mascot",
         "always_on",
+        // The Preview label (the owner's exception to D10), added by slice M1.
+        "preview",
         "summary",
         "examples",
         "can_do",
@@ -252,6 +267,14 @@ async fn catalog_serves_only_offered_personas_and_their_fields(f: &Fixture, _: O
     let quill = &personas[q];
     assert_eq!(quill["display_name"], "Quill");
     assert_eq!(quill["always_on"], false);
+    assert_eq!(quill["preview"], false);
+    assert_eq!(personas[0]["preview"], false, "Nudge is never a Preview");
+    // The repository's three new bots are Previews until their benchmark passes.
+    for p in personas {
+        if ["chief", "sprout", "echo"].contains(&p["key"].as_str().unwrap()) {
+            assert_eq!(p["preview"], true, "{p}");
+        }
+    }
     let drafts: Vec<&str> = quill["drafts"]
         .as_array()
         .unwrap()
@@ -647,6 +670,113 @@ async fn at_most_sixteen_rows(f: &Fixture, pg: Option<&TestPg>) {
 }
 both!(at_most_sixteen_rows);
 
+/// Slice M1: the limits hold under concurrent requests. Forty change attempts at once by one
+/// person: exactly thirty go through, the rest are `rate_limited`; twenty concurrent adds of
+/// different bots to an empty team: exactly sixteen rows.
+async fn the_limits_hold_under_concurrent_requests(f: &Fixture, _: Option<&TestPg>) {
+    let mut attempts = tokio::task::JoinSet::new();
+    for _ in 0..40 {
+        let svc = Arc::clone(&f.svc);
+        attempts.spawn(async move {
+            svc.change_team(Client::Web, "ana", &["quill".into()], &[], "picker", now())
+                .await
+        });
+    }
+    let results = attempts.join_all().await;
+    let ok = results.iter().filter(|r| r.is_ok()).count();
+    let limited = results
+        .iter()
+        .filter(|r| matches!(r, Err(TeamRefusal::RateLimited)))
+        .count();
+    assert_eq!((ok, limited), (30, 10), "{results:?}");
+
+    let event =
+        pmos_toolserver::team::change_event(Client::Web, "bo", Outcome::Ok, "x".into(), now());
+    let mut adds = tokio::task::JoinSet::new();
+    for i in 0..20 {
+        let (teams, event) = (Arc::clone(&f.stores.teams), event.clone());
+        adds.spawn(async move {
+            let key = vec![format!("c{i}")];
+            let change = TeamChange {
+                handle: "bo",
+                add: &key,
+                remove: &[],
+                via: AddedVia::BotsPage,
+                now: now(),
+            };
+            teams.change(&change, &event).await
+        });
+    }
+    let results = adds.join_all().await;
+    let ok = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(ok, MAX_TEAM, "{results:?}");
+    assert!(results
+        .iter()
+        .filter_map(|r| r.as_ref().err())
+        .all(|e| *e == TeamError::Full));
+    assert_eq!(f.stores.teams.team("bo").await.unwrap().len(), MAX_TEAM);
+}
+both!(the_limits_hold_under_concurrent_requests);
+
+/// Slice M1 (the reviewer: "the 16-row cap trigger can be raced by two concurrent inserts;
+/// take a lock in the trigger"): two transactions that each add a row past the 15th, outside
+/// the tool server's own lock. The first holds the trigger's per-person lock until it commits;
+/// the second waits, then counts the first one's row and is refused. Without the lock the
+/// second would count 16, not wait, and both would commit: 17 rows.
+#[tokio::test]
+async fn the_cap_trigger_serialises_concurrent_writers() {
+    let Some((f, Some(pg))) = fixture(true).await else {
+        return;
+    };
+    let keys: Vec<String> = (0..15).map(|i| format!("p{i}")).collect();
+    let event =
+        pmos_toolserver::team::change_event(Client::Web, "ana", Outcome::Ok, "x".into(), now());
+    f.stores.teams.change(&change(&keys), &event).await.unwrap();
+    let insert = |key: &'static str| {
+        format!("INSERT INTO user_bots (handle, persona, added_at, added_via) VALUES ('ana', '{key}', now(), 'bots_page')")
+    };
+    let pool = pg.store.pool().clone();
+    let mut first = pool.begin().await.unwrap();
+    // The trigger is deferred to commit; run it now, so the first holds the lock from here.
+    sqlx::query("SET CONSTRAINTS user_bots_cap IMMEDIATE")
+        .execute(&mut *first)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(insert("p15")))
+        .execute(&mut *first)
+        .await
+        .unwrap();
+    let second = tokio::spawn({
+        let pool = pool.clone();
+        let sql = insert("p16");
+        async move {
+            let mut tx = pool.begin().await?;
+            sqlx::query("SET CONSTRAINTS user_bots_cap IMMEDIATE")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !second.is_finished(),
+        "the second writer waits for the first one's lock"
+    );
+    first.commit().await.unwrap();
+    let err = second.await.unwrap().unwrap_err();
+    assert!(err.to_string().contains("at most 16 bots"), "{err}");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM user_bots WHERE handle = 'ana'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 16);
+    drop(f);
+    pg.drop_schema().await;
+}
+
 // ----- persona sessions -------------------------------------------------------------------
 
 async fn a_persona_session_gets_the_intersection(f: &Fixture, _: Option<&TestPg>) {
@@ -946,9 +1076,50 @@ async fn a_draft_names_its_persona_and_outlives_it(f: &Fixture, _: Option<&TestP
     // The draft counts for this month, per persona.
     let team = f.svc.team("ana", now()).await.unwrap();
     assert_eq!(team["drafts_this_month"], json!({"nudge": 1, "quill": 1}));
-    // Quill leaves the team and the catalog; the draft stays Ana's and decidable.
+    // Quill leaves Ana's team: the draft stays Ana's and decidable (Quill is still offered).
     remove(f, "ana", &["quill"]).await.unwrap();
+    assert_eq!(f.svc.held(&item).await.unwrap(), None);
+    assert!(f.svc.approval_json(&item).await.get("held").is_none());
+    // Quill is withdrawn from the catalog: its pending draft is held (the reviewer's change,
+    // slice M1): not approvable until Quill is offered again or an Admin releases it.
     withdraw(f, "quill");
+    assert_eq!(f.svc.held(&item).await.unwrap().as_deref(), Some("Quill"));
+    assert_eq!(f.svc.approval_json(&item).await["held"], true);
+    assert_eq!(
+        f.svc.approvals_json(std::slice::from_ref(&item)).await[0]["held"],
+        true
+    );
+    let err = f
+        .svc
+        .decide(&id, "ana", Decision::Approve, None, now())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DecisionError::Held(name) if name == "Quill"),
+        "{err}"
+    );
+    assert_eq!(
+        f.svc.approval(&id).await.unwrap().unwrap().status,
+        Status::Pending,
+        "nothing was decided"
+    );
+    let refused = events(f)
+        .await
+        .into_iter()
+        .rev()
+        .find(|e| e.run_id == "tsk_attr" && e.outcome == Outcome::Denied)
+        .unwrap();
+    assert_eq!(
+        refused.detail.as_deref(),
+        Some(pmos_toolserver::service::HELD_DECISION)
+    );
+    assert_eq!(refused.persona.as_deref(), Some("quill"));
+    // An Admin releases it; Ana then approves it under the personal bot's rules.
+    f.svc
+        .release_held_draft(Client::Web, "ada", &id, now())
+        .await
+        .unwrap();
+    assert_eq!(f.svc.held(&item).await.unwrap(), None);
     let decided = f
         .svc
         .decide(&id, "ana", Decision::Approve, None, now())
@@ -970,6 +1141,257 @@ async fn a_draft_names_its_persona_and_outlives_it(f: &Fixture, _: Option<&TestP
     assert_eq!(decision.client, Client::Orchestrator);
 }
 both!(a_draft_names_its_persona_and_outlives_it);
+
+/// Slice M1 (the reviewer's change to §6, "Removal"): a withdrawn bot's pending drafts are
+/// held. The owner may reject one; approving or editing it is refused until the bot is offered
+/// again or an Admin releases it. Only an active Admin releases, only a held draft, recorded.
+async fn a_withdrawn_bots_drafts_are_held(f: &Fixture, _: Option<&TestPg>) {
+    add(f, "ana", &["quill"]).await.unwrap();
+    let s = persona_session(f, "ana", "pm-ana", Some("quill"), "tsk_held")
+        .await
+        .unwrap();
+    let first = jira_draft(f, &s).await;
+    let second = jira_draft(f, &s).await;
+    let nudge = persona_session(f, "ana", "pm-ana", None, "tsk_held_n")
+        .await
+        .unwrap();
+    let nudge_draft = jira_draft(f, &nudge).await;
+    let offered = f.svc.roster();
+    withdraw(f, "quill");
+
+    // An edit is refused like an approval; nothing changes.
+    let edited = json!({"project": "PM", "issue_type": "Story", "summary": "Fake: edited", "description": "Fake."});
+    let err = f
+        .svc
+        .decide(&first, "ana", Decision::Edit, Some(edited), now())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DecisionError::Held(_)), "{err:?}");
+    assert!(f.jira.writes().is_empty(), "nothing was written");
+    // Rejecting stays open to the owner.
+    let rejected = f
+        .svc
+        .decide(&second, "ana", Decision::Reject, None, now())
+        .await
+        .unwrap();
+    assert_eq!(rejected.status, Status::Rejected);
+    // Nudge's drafts are never held.
+    let item = f.svc.approval(&nudge_draft).await.unwrap().unwrap();
+    assert_eq!(f.svc.held(&item).await.unwrap(), None);
+
+    // Only an active Admin releases, and only a held draft; each attempt is recorded.
+    use pmos_toolserver::service::{ReleaseRefusal, RELEASE_HOLD};
+    for who in ["ana", "aud", "rev", "zed"] {
+        assert_eq!(
+            f.svc
+                .release_held_draft(Client::Web, who, &first, now())
+                .await
+                .unwrap_err(),
+            ReleaseRefusal::Forbidden,
+            "{who}"
+        );
+    }
+    for (id, why) in [
+        (nudge_draft.as_str(), ReleaseRefusal::NotHeld),
+        (second.as_str(), ReleaseRefusal::NotHeld),
+        ("apr_nope", ReleaseRefusal::NotFound),
+    ] {
+        assert_eq!(
+            f.svc
+                .release_held_draft(Client::Web, "ada", id, now())
+                .await
+                .unwrap_err(),
+            why,
+            "{id}"
+        );
+    }
+    let releases: Vec<AuditEvent> = events(f)
+        .await
+        .into_iter()
+        .filter(|e| e.tool == RELEASE_HOLD)
+        .collect();
+    assert_eq!(releases.len(), 7);
+    assert!(releases.iter().all(|e| e.outcome == Outcome::Denied));
+    assert_eq!(releases[0].detail.as_deref(), Some("forbidden"));
+    assert_eq!(releases[0].persona.as_deref(), Some("quill"));
+    assert_eq!(releases[0].output_ref.as_deref(), Some(first.as_str()));
+
+    // Offered again: no longer held, and approvable.
+    f.svc.replace_roster(offered.as_ref().clone());
+    let item = f.svc.approval(&first).await.unwrap().unwrap();
+    assert_eq!(f.svc.held(&item).await.unwrap(), None);
+    assert_eq!(
+        f.svc
+            .release_held_draft(Client::Web, "ada", &first, now())
+            .await
+            .unwrap_err(),
+        ReleaseRefusal::NotHeld,
+        "nothing to release while it is offered"
+    );
+    let decided = f
+        .svc
+        .decide(&first, "ana", Decision::Approve, None, now())
+        .await
+        .unwrap();
+    assert_eq!(decided.status, Status::Approved);
+
+    // A release is once per draft.
+    let third = jira_draft(f, &s).await;
+    withdraw(f, "quill");
+    let released = f
+        .svc
+        .release_held_draft(Client::Web, "ada", &third, now())
+        .await
+        .unwrap();
+    assert_eq!(released.status, Status::Pending, "the owner still decides");
+    assert_eq!(
+        f.svc
+            .release_held_draft(Client::Web, "ada", &third, now())
+            .await
+            .unwrap_err(),
+        ReleaseRefusal::NotHeld
+    );
+    let ok = events(f)
+        .await
+        .into_iter()
+        .rev()
+        .find(|e| e.tool == RELEASE_HOLD && e.outcome == Outcome::Ok)
+        .unwrap();
+    assert_eq!(ok.user, "ada");
+    assert_eq!(ok.persona.as_deref(), Some("quill"));
+}
+both!(a_withdrawn_bots_drafts_are_held);
+
+/// Slice M1: a persona role lists every write it may make; the tool server refuses one it
+/// doesn't list, even with content that bypassed the lint (no fallback to `approve`).
+async fn an_unlisted_write_is_refused(f: &Fixture, _: Option<&TestPg>) {
+    let roster = f.svc.roster();
+    let mut role: ContentRole = roster.role("quill-role").unwrap().as_ref().clone();
+    role.actions.remove("jira.create_issue");
+    f.svc
+        .replace_roster(roster.as_ref().clone().with_unlinted_role(role));
+    add(f, "ana", &["quill"]).await.unwrap();
+    let s = persona_session(f, "ana", "pm-ana", Some("quill"), "tsk_unlisted")
+        .await
+        .unwrap();
+    let err = f
+        .svc
+        .call(&s, "jira_create_issue", json!({"project": "PM", "issue_type": "Story", "summary": "Fake", "description": "Fake."}), now())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ToolError::Forbidden(m) if m.contains("doesn't list it")),
+        "{err:?}"
+    );
+    assert!(f
+        .stores
+        .approvals
+        .list("ana", None)
+        .await
+        .unwrap()
+        .is_empty());
+    // Listed writes still draft, and Nudge (no persona) keeps the personal role's rules.
+    let out = f
+        .svc
+        .call(
+            &s,
+            "slack_post_reply",
+            json!({"channel": "C0PMTEAM", "thread_ts": "1731601200.000600", "text": "Fake."}),
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out["status"], "pending_approval");
+    let n = persona_session(f, "ana", "pm-ana", None, "tsk_unlisted_n")
+        .await
+        .unwrap();
+    jira_draft(f, &n).await;
+}
+both!(an_unlisted_write_is_refused);
+
+/// Slice M1 and the owner's decision of 2026-11-21: every page Echo drafts carries the line
+/// "Draft for internal review. Not approved for external use.", put there by the tool server
+/// when the draft is recorded and again when it is written, whatever the model or an edit did.
+async fn echos_pages_carry_the_internal_review_line(f: &Fixture, _: Option<&TestPg>) {
+    use pmos_contract::personas::INTERNAL_REVIEW_NOTICE as NOTICE;
+    add(f, "ana", &["echo"]).await.unwrap();
+    let s = persona_session(f, "ana", "pm-ana", Some("echo"), "tsk_echo")
+        .await
+        .unwrap();
+    let out = f
+        .svc
+        .call(
+            &s,
+            "confluence_create_draft",
+            json!({"space": "PM", "title": "Fake: 4.2 release notes", "body": "## New\nFake."}),
+            now(),
+        )
+        .await
+        .unwrap();
+    let id = out["approval_id"].as_str().unwrap().to_string();
+    let item = f.svc.approval(&id).await.unwrap().unwrap();
+    assert_eq!(item.persona.as_deref(), Some("echo"));
+    assert_eq!(item.args["body"], format!("{NOTICE}\n\n## New\nFake."));
+    // Written once even when the model already put it in.
+    let out = f
+        .svc
+        .call(
+            &s,
+            "confluence_create_draft",
+            json!({"space": "PM", "title": "Fake: battlecard", "body": format!("{NOTICE}\n\nFake.")}),
+            now(),
+        )
+        .await
+        .unwrap();
+    let again = f
+        .svc
+        .approval(out["approval_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        again.args["body"].as_str().unwrap().matches(NOTICE).count(),
+        1
+    );
+    // A Jira issue is internal work: unchanged.
+    let issue = jira_draft(f, &s).await;
+    let issue = f.svc.approval(&issue).await.unwrap().unwrap();
+    assert!(!issue.args.to_string().contains(NOTICE));
+    // An edit that drops the line: what is written still starts with it.
+    let edited = json!({"space": "PM", "title": "Fake: 4.2 release notes", "body": "Edited without the line."});
+    f.svc
+        .decide(&id, "ana", Decision::Edit, Some(edited), now())
+        .await
+        .unwrap();
+    let written = f.confluence.writes();
+    assert_eq!(written.len(), 1, "{written:?}");
+    assert_eq!(
+        written[0].args["body"],
+        format!("{NOTICE}\n\nEdited without the line.")
+    );
+    // Nudge's pages carry no notice.
+    let n = persona_session(f, "ana", "pm-ana", None, "tsk_echo_n")
+        .await
+        .unwrap();
+    let out = f
+        .svc
+        .call(
+            &n,
+            "confluence_create_draft",
+            json!({"space": "PM", "title": "Fake: PRD", "body": "Fake."}),
+            now(),
+        )
+        .await
+        .unwrap();
+    let nudge = f
+        .svc
+        .approval(out["approval_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(nudge.args["body"], "Fake.");
+}
+both!(echos_pages_carry_the_internal_review_line);
 
 async fn no_route_writes_a_drafts_persona(f: &Fixture, pg: Option<&TestPg>) {
     add(f, "ana", &["quill"]).await.unwrap();
@@ -1175,7 +1597,35 @@ async fn the_admin_read_is_keys_handles_and_counts(f: &Fixture, _: Option<&TestP
         for field in ["summary", "examples", "title", "can_do"] {
             assert!(p.get(field).is_none(), "{field}");
         }
+        assert_eq!(p["name_clashes"], json!([]), "{p}");
     }
+    // Slice M1: a persona named like a PM OS user (display name or handle) is shown to the
+    // admin; people's names aren't in the content, so the lint can't refuse it.
+    f.stores
+        .users
+        .apply(
+            &Actor::bot("ada"),
+            Op::CreateUser {
+                user: pmos_toolserver::users::NewUser {
+                    handle: "kim".into(),
+                    display_name: "Quill".into(),
+                    slack_id: Some("U0KIM0001".into()),
+                    roles: [pmos_toolserver::users::UserRole::Pm].into(),
+                    ..Default::default()
+                },
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let v = f.svc.admin_personas(Utc::now()).await.unwrap();
+    let quill = v["personas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["key"] == "quill")
+        .unwrap();
+    assert_eq!(quill["name_clashes"], json!(["kim"]));
 }
 both!(the_admin_read_is_keys_handles_and_counts);
 
@@ -1502,6 +1952,65 @@ async fn the_team_is_the_signed_persons_own() {
     );
 }
 
+/// Slice M1: `POST /internal/admin/personas/drafts/{id}/release?user=<admin>`, `pmos-web`'s
+/// token, the admin's own assertion, the tool server in `require`.
+#[tokio::test]
+async fn an_admin_releases_a_held_draft_over_http() {
+    let srv = start(Assert::Require).await;
+    let f = &srv.f;
+    add(f, "ana", &["quill"]).await.unwrap();
+    let s = persona_session(f, "ana", "pm-ana", Some("quill"), "tsk_http_held")
+        .await
+        .unwrap();
+    let id = jira_draft(f, &s).await;
+    withdraw(f, "quill");
+    let path = |who: &str| format!("/internal/admin/personas/drafts/{id}/release?user={who}");
+    let (st, v) = srv
+        .send(Method::POST, &path("ana"), WEB_TOKEN, None, Some("ana"))
+        .await;
+    assert_eq!((st, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    let (st, _) = srv
+        .send(Method::POST, &path("ada"), WEB_TOKEN, None, None)
+        .await;
+    assert_eq!(st, 401, "unsigned");
+    let (st, _) = srv
+        .send(Method::POST, &path("ada"), WEB_TOKEN, None, Some("ana"))
+        .await;
+    assert_ne!(st, 200, "signed for someone else");
+    for token in [SERVICE_TOKEN, BOT_TOKEN, CONSOLE_TOKEN] {
+        let (st, _) = srv
+            .send(Method::POST, &path("ada"), token, None, None)
+            .await;
+        assert_eq!(st, 403);
+    }
+    assert!(f
+        .svc
+        .held(&f.svc.approval(&id).await.unwrap().unwrap())
+        .await
+        .unwrap()
+        .is_some());
+    let (st, v) = srv
+        .send(Method::POST, &path("ada"), WEB_TOKEN, None, Some("ada"))
+        .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["id"], id.as_str());
+    assert!(v.get("held").is_none(), "{v}");
+    let (st, v) = srv
+        .send(Method::POST, &path("ada"), WEB_TOKEN, None, Some("ada"))
+        .await;
+    assert_eq!((st, v["code"].as_str()), (409, Some("not_held")));
+    // Without assertion `require`, nothing is released.
+    let srv = start(Assert::InsecureOff).await;
+    let (st, v) = srv
+        .send(Method::POST, &path("ada"), WEB_TOKEN, None, Some("ada"))
+        .await;
+    assert_eq!(
+        (st, v["code"].as_str()),
+        (503, Some("assertion_required")),
+        "{v}"
+    );
+}
+
 #[tokio::test]
 async fn changes_need_assertion_require() {
     let srv = start(Assert::InsecureOff).await;
@@ -1719,6 +2228,51 @@ async fn sessions_over_http_name_the_persona_or_say_why_not() {
         assert_eq!(v["persona"], Value::Null);
         assert!(v["session"].get("persona").is_none());
     }
+}
+
+/// The reviewer's change to the session body: a field this server doesn't know is refused,
+/// never dropped, so a caller that sends one (a persona-like field a later version adds, or a
+/// typo of `persona`) gets no session at all rather than one without it.
+#[tokio::test]
+async fn a_session_body_with_an_unknown_field_is_refused() {
+    let srv = start(Assert::Require).await;
+    srv.f
+        .svc
+        .change_team(Client::Web, "ana", &["quill".into()], &[], "picker", now())
+        .await
+        .unwrap();
+    for extra in [
+        json!({"personna": "quill"}),
+        json!({"persona_key": "quill"}),
+        json!({"level": "staff"}),
+    ] {
+        let mut body = json!({"user": "ana", "bot": "pm-ana", "run_id": "tsk_unknown"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (s, v) = srv
+            .json(
+                Method::POST,
+                "/internal/sessions",
+                SERVICE_TOKEN,
+                body,
+                None,
+            )
+            .await;
+        assert_eq!(s, 422, "{extra}: {v}");
+        assert!(v.get("token").is_none(), "{v}");
+    }
+    // The same body without the unknown field starts a session.
+    let (s, _) = srv
+        .json(
+            Method::POST,
+            "/internal/sessions",
+            SERVICE_TOKEN,
+            json!({"user": "ana", "bot": "pm-ana", "run_id": "tsk_unknown", "persona": "quill"}),
+            None,
+        )
+        .await;
+    assert_eq!(s, 201);
 }
 
 #[tokio::test]

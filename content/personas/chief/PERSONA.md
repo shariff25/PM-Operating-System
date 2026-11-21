@@ -7,6 +7,7 @@ mascot: chief
 owner: "TODO"
 version: "0.1.0"
 offered: true
+preview: true
 order: 20
 summary: "Runs your week: what needs you, what is slipping, and what to tell your leadership."
 examples:

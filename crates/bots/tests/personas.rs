@@ -368,6 +368,9 @@ async fn personas_are_listed_for_the_clients(env: &Env) {
         assert_eq!(keys, ["nudge", "chief"], "offered only, Nudge first");
         assert_eq!(body["personas"][1]["role"], "chief-of-staff");
         assert_eq!(body["personas"][0]["always_on"], true);
+        // The Preview label is carried for the screens ("Preview: not yet benchmarked").
+        assert_eq!(body["personas"][0]["preview"], false);
+        assert_eq!(body["personas"][1]["preview"], true);
     }
     let (status, _) = env.get("/v1/personas", "worker", None).await;
     assert_eq!(status, 403);

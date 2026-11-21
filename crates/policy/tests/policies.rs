@@ -242,7 +242,21 @@ fn invalid_content_blocks_generation_and_fails_the_check() {
 
 const PREP_SKILL: &str = "---\nname: fixture-prep\ndescription: Prepares the PM for a meeting (a test fixture).\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"restricted\"\n  tools: \"context.search jira.search confluence.create_draft\"\n  surfaces: \"slack web\"\n---\n\n# Prep\n\nSteps.\n";
 
-const CHIEF_ROLE: &str = "---\nname: fixture-chief\ndescription: Runs the PM's week (a test fixture).\nowner: \"@pm\"\nversion: \"0.1.0\"\nskills: \"ask daily-brief fixture-prep\"\ndata-class: \"restricted\"\nmodel: \"reasoning\"\nactions:\n  slack.post_reply: approve\n---\n\n# Chief\n\nRun the PM's week.\n";
+/// Every write its skills can make is listed (`persona-action-unlisted`); its body gets the
+/// personal role's standing sections appended ([`standing_sections`]).
+const CHIEF_ROLE: &str = "---\nname: fixture-chief\ndescription: Runs the PM's week (a test fixture).\nowner: \"@pm\"\nversion: \"0.1.0\"\nskills: \"ask daily-brief fixture-prep\"\ndata-class: \"restricted\"\nmodel: \"reasoning\"\nactions:\n  slack.post_reply: approve\n  confluence.create_draft: approve\n---\n\n# Chief\n\nRun the PM's week.\n";
+
+/// The personal role's standing sections, which a persona role carries verbatim
+/// (`persona-role-sections`), from the content tree at `content`.
+fn standing_sections(content: &Path) -> String {
+    let base = fs::read_to_string(content.join("roles/pm-assistant/ROLE.md")).unwrap();
+    let body = base.splitn(3, "---\n").nth(2).unwrap();
+    pmos_contract::personas::role_sections(body)
+        .into_iter()
+        .filter(|(h, _)| pmos_contract::personas::STANDING_SECTIONS.contains(&h.as_str()))
+        .map(|(_, text)| format!("\n{text}\n"))
+        .collect()
+}
 
 fn chief_persona(offered: bool) -> String {
     format!("---\nname: chief\ndisplay-name: Chief\ntitle: Chief of Staff\nrole: fixture-chief\nmascot: chief\nowner: \"@pm\"\nversion: \"0.1.0\"\noffered: {offered}\norder: 20\nsummary: Runs your week.\nexamples:\n  - Prep me for the staff meeting\n---\n\n# Chief\n")
@@ -275,7 +289,10 @@ fn marketplace_content(dir: &Path, persona: Option<String>, prep: &str) -> PathB
     );
     if let Some(persona) = persona {
         put("skills/fixture-prep/SKILL.md", prep);
-        put("roles/fixture-chief/ROLE.md", CHIEF_ROLE);
+        put(
+            "roles/fixture-chief/ROLE.md",
+            &format!("{CHIEF_ROLE}{}", standing_sections(&content)),
+        );
         put("personas/chief/PERSONA.md", &persona);
     }
     content
