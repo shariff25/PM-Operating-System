@@ -65,7 +65,11 @@ marketplace, `docs/bot-marketplace-spec.md` §11). These are the files
 - `content/personas/**`: the catalog (a new bot, a Preview label, Echo's internal-review line);
 - `content/roles/<role>/ROLE.md` for every role a persona runs as, the personal role
   `pm-assistant` included (its "Untrusted data" and "Hard limits" sections are copied verbatim
-  into every persona role, and `pmos lint` refuses a copy that differs).
+  into every persona role, and `pmos lint` refuses a copy that differs);
+- `content/skills/<skill>/SKILL.md` for every skill of those roles (a persona runs its role's
+  skills, so a skill's text is part of what it is told);
+- `content/bots/<bot>/BOT.md` for every personal bot (`pm-<handle>`): a persona runs on the
+  PM's own bot and keeps that file's body.
 
 What the repository does by itself: `pmos lint` refuses a persona role whose standing sections
 differ from the personal role's, an unlisted write, a reserved name and an offered bot that is
@@ -87,6 +91,8 @@ change"):
    /content/roles/chief-of-staff/ROLE.md     @<org>/<team>
    /content/roles/growth-pm/ROLE.md          @<org>/<team>
    /content/roles/outbound-pm/ROLE.md        @<org>/<team>
+   /content/skills/                          @<org>/<team>
+   /content/bots/                            @<org>/<team>
    # Sandbox policies and their generator (POL-2).
    /policies/                                @<org>/<team>
    /crates/policy/                           @<org>/<team>

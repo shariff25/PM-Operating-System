@@ -2033,6 +2033,7 @@ dependencies = [
  "pmos-entra",
  "pmos-policy",
  "pmos-runtime",
+ "pmos-toolserver",
  "reqwest",
  "serde",
  "serde_json",

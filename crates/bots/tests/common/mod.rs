@@ -187,6 +187,7 @@ fn persona(name: &str, display: &str, role: &str, offered: bool, order: u32) -> 
         always_on: name == "nudge",
         // Chief, like the repository's, is a Preview until its benchmark passes.
         preview: name == "chief",
+        benchmarked: name != "chief" && name != "nudge",
         draft_notice: None,
         order,
         summary: format!("{display} summary"),

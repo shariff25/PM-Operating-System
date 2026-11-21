@@ -259,7 +259,13 @@ fn bot_instructions(
     content_dir: &str,
     paths: &[String],
 ) -> Vec<String> {
-    let known = pmos_contract::personas::instruction_paths(roster.personas().map(|p| p.as_ref()));
+    let roles: Vec<_> = roster.roles().collect();
+    let bots: Vec<_> = roster.bots().collect();
+    let known = pmos_contract::personas::instruction_paths(
+        roster.personas().map(|p| p.as_ref()),
+        &roles,
+        &bots,
+    );
     let prefix = format!("{}/", content_dir.trim_end_matches('/'));
     paths
         .iter()

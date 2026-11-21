@@ -48,3 +48,6 @@ walkdir.workspace = true
 # Entra tests sign ID tokens with the shared test keys (`pmos_entra::testing`).
 jsonwebtoken.workspace = true
 pmos-entra = { workspace = true, features = ["test-support"] }
+# The tool server's own catalog projection (`persona_json`), so the Bots route test reads a
+# catalog in the tool server's real shape, not a hand-written one (gate-fix-4, H1).
+pmos-toolserver = { path = "../toolserver" }

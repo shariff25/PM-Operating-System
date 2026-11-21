@@ -236,6 +236,7 @@ owner: "TODO"
 version: "0.1.0"
 offered: true                 # default false: whether PMs see and may use it
 preview: true                 # default false: offered before its benchmark passes ("not yet benchmarked")
+# benchmarked: true           # default false: the claim that its eval categories pass (lint-checked)
 always-on: false              # default false; exactly one persona, `nudge`, sets true
 order: 20                     # 0-1000, display order
 summary: Runs your week: what needs you, what is slipping, and what to tell your leadership.
@@ -283,6 +284,17 @@ met its pass bar two weeks in a row in `evals/reports` (`persona-benchmark`, an 
 names the evals directory, default `evals` beside the content root; a Preview whose category
 passes gets a warning to drop the label). The services, the policy generator and the content
 admin don't read the reports and don't check this rule; CI's `pmos lint` does.
+
+**Fail safe without the lint (gate-fix-4, M2).** Since the services can't read the eval reports,
+they show **every persona but the always-on one as a Preview unless its file says
+`benchmarked: true`** (and not `preview: true`): `Persona::preview` is worked out so
+(`personas::is_preview`), and the tool server's catalog, its admin view, the runtime's
+`GET /v1/personas` and pmos-web all carry it. Content merged without CI (no branch protection,
+a hand edit) that leaves both labels out is therefore still shown as "Preview: not yet
+benchmarked". `benchmarked: true` is the one claim a full bot needs, and `pmos lint` makes it
+true: with the reports read, the claim without a passing report is an error, an offered persona
+with neither label is an error, and a persona whose categories pass without the claim gets a
+warning (it stays a Preview until the file says so). Both labels at once is an error everywhere.
 
 **A draft notice.** `draft-notice: "<one line>"` (optional, at most 160 characters, the text
 rule) is put by the tool server at the top of the body of every Confluence page the persona

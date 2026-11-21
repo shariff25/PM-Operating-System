@@ -747,6 +747,7 @@ async fn every_pending_item_is_listed_past_the_decided_cap() {
                     model_alias: None,
                     sources_sensitivity: pmos_contract::Sensitivity::Internal,
                     persona: None,
+                    draft_notice: None,
                 },
                 t0 + Duration::seconds(i as i64),
             )

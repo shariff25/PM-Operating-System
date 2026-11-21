@@ -262,6 +262,9 @@ persona before its eval category has met its pass bar; every catalog read carrie
 the screens show "Preview: not yet benchmarked". CI's `pmos lint` refuses an offered persona that
 is neither always-on nor a Preview unless every category naming it has met its bar two weeks in
 a row in `evals/reports` (`persona-benchmark`). Chief, Sprout and Echo are Previews; Nudge is not.
+Since the gate fixes after the review of 8e8f8fe, the services fail safe on their own: a persona
+other than Nudge is a Preview unless its file says `benchmarked: true`, the claim the lint checks
+against the reports (§13, "Gate fixes after the review of 8e8f8fe (marketplace)", M2).
 A withdrawn persona's pending drafts are **held** (§6, "Removal").
 
 ## 3. The three bots
@@ -1320,7 +1323,7 @@ the owner's two decisions of that day. Built:
 
 **Not verified**: the GitHub settings (not set; CI on the account doesn't start jobs); any eval
 run (none has happened, so no bot is benchmarked and nothing is claimed about quality); pmos-web,
-Slack and the web app showing `preview` or `held` (not built); the hourly limit across replicas.
+Slack and the web app showing `preview` or `held` (not built then; see "Gate fixes after the review of 8e8f8fe"); the hourly limit across replicas.
 
 ### Status: S1 is built (2026-11-21, branch `claude/market-s1-slack`)
 
@@ -1554,6 +1557,36 @@ it.
 the stack tests are not changed), the brief written by Chief's model (no eval run has happened;
 nothing is claimed about the quality of Chief's brief), the real `daily-brief` skill emitting
 its block under Chief's role in a sandbox.
+
+### Gate fixes after the review of 8e8f8fe (marketplace)
+
+Branch `claude/gate-fix-4-market`, from `1d2c586` (after R2). The reviewer's file held the gate
+on H1 and listed M1, M2 and the marketplace Lows; the password findings (M3, M4, the password
+Lows) are another slice's. Each finding was checked in the code before it was changed.
+
+| Finding | Confirmed | Fix | Test |
+| --- | --- | --- | --- |
+| **H1** the web app never shows Preview | Yes: `persona_card` built each entry field by field without `preview`, so every pmos-web answer describing a bot (`GET /api/bots`, `PUT /api/me/team`, `PUT /api/me/brief`) lacked it; a test even asserted the 18 fields without it | `persona_card` carries `preview` (fail safe: any bot but Nudge whose entry doesn't say `false`). The app: `identify` carries `preview`, and the draft page's "Drafted by" (also the reviewer's page) and the thread header show the Preview tag; Today's picker stand-in reads it. `BotCard.preview` is now required, and the mock's Nudge and Scout say it. The admin view already carried it | `the_real_bots_answer_carries_the_preview_label_the_app_shows` (`crates/web/tests/bots.rs`): the repository's catalog through the tool server's own `persona_json`, then the real `GET /api/bots`; asserts `preview` and the exact card fields, and that `web/src/api/fixtures/realBots.json` is that answer; `web/src/pages/PreviewReal.test.tsx` (5) renders the Bots page, the draft page and the thread from that fixture; `a_card_carries_the_preview_label_and_fails_safe`; `catalog_text_passes_through_unchanged` now expects 19 fields |
+| Mock vs real shape | The bots answer differed only in `preview` (now the same, and pinned by the fixture test). Drafts, tasks, reviews and the brief carry `persona`/`persona_offered` in both; `AdminBot` already matched | — | as above |
+| **M1** Slack's Preview line | Yes: only the first thread message; cards rarely, Home rows never named the bot; dropped with no catalog | Every approval card and App Home Inbox row of a Preview bot says "· Preview: not yet benchmarked"; Home rows name the bot. **Safe behaviour without a catalog:** the card says "Drafted by A marketplace bot · Preview: …" and the thread's messages are said by "A marketplace bot" with the Preview line: an unknown bot is never presented as benchmarked | `every_card_of_a_preview_bot_says_so_with_the_tool_servers_name` (`crates/slack/tests/personas.rs`), `rows_name_their_bot_and_a_preview` (`home.rs`), `the_drafter_comes_from_the_tool_servers_item_and_fails_safe` (`personas.rs`) |
+| **M2** benchmark only in CI lint | Yes | The services can't read eval reports, so a persona other than Nudge is a **Preview unless its file says `benchmarked: true`** (and not `preview: true`): `personas::is_preview`, applied when the catalog is loaded and again by the tool server (`shown_as_preview`: catalog and admin view) and the runtime (`GET /v1/personas`). `pmos lint` (`persona-benchmark`) verifies the claim against `evals/reports`: claimed without a pass is an error, both labels is an error, a pass without the claim a warning. No file changes: Chief, Sprout and Echo stay `preview: true`, Nudge is exempt | `catalog_serves_only_offered_personas_and_their_fields` (`crates/toolserver/tests/team.rs`: Abacus, with neither label, is served as a Preview; Quill claims it; hand-built content with neither is a Preview in the catalog and the admin view), `persona_benchmark` (`crates/contract/tests/lint.rs`), `a_persona_is_a_preview_unless_it_claims_a_benchmark` |
+| Echo's notice at the bottom; dropped when the file is gone | Yes | `with_draft_notice` checks `starts_with` (leading whitespace aside) and puts the line first otherwise. The notice is stored on the item (`approvals.draft_notice`, migration `0027`, fixed by a trigger, never served) and put first in every saved edit and in the approved write from there | `the_notice_is_stored_on_the_item_and_heads_every_edit` (both stores), `the_notice_heads_every_page_body_once` |
+| `try_release` by the draft's owner | Yes | `ReleaseRefusal::OwnDraft` (`403 own_draft`, recorded); pmos-web answers `403 release_own_draft` | `holds_are_checked_with_the_decision_and_the_save`, `an_admin_releases_a_held_draft_through_the_tool_server` |
+| Hold not re-checked inside the decision; `save_draft` unchecked | Yes | `Verdict::holding(offered)`: the store refuses an approve or edit of a held item under the decision's row lock, reading the release in the same transaction (`DecideError::Held`); `save_draft_held` does the same for a saved edit (`409 held`), as `held`'s doc says. The offered set is the roster read just before the call (process memory): a withdrawal landing in that instant is the one gap left, and the next decision sees it | `holds_are_checked_with_the_decision_and_the_save` (both stores) |
+| W1 "Nothing changed" after routines moved | Yes | A refused (or failed) team change puts back the routines moved or paused for it (`undo_routines`), so the refusal's "Nothing changed" is true; if they can't all be put back the PM is told so (`502 unknown_outcome`, "it had already moved or paused some…"), never "Nothing changed" | `a_refused_removal_puts_the_moved_routines_back` |
+| Slack token PATCHes a routine to a bot | **Already fixed by R2** (`may_name_routine_persona`, `crates/bots/src/app.rs`): `slack` gets `403` naming a bot, on create and on `PATCH` | — | R2's `routines_carry_a_persona_and_pause_when_it_is_refused` asserts `slack` `403` with `chief` on both |
+| Audit rows for `rate_limited` and admin view reads | Yes | A refused team change over the hourly limit is recorded once per person per hour (other refusals each time); an allowed `admin.personas_read` once per viewer per 10 minutes, every refusal each time (`first_in_window`, in memory, at most 10,000 marks). The audit log's own read (`admin.audit_read`) is still recorded every time | `rate_limited_changes_are_recorded_once_an_hour` (both stores), `admin_bots_reads_are_recorded_once_per_window` |
+| Not-on-team asks from Slack | Yes | **A check at creation isn't possible**: only pmos-web may read a team (with the person's signed assertion); the runtime and the Slack bot can't. **Bound:** after a claim refused `persona_not_on_team`, for two minutes a Slack task of that person as that bot is refused at once (`400 persona_not_on_team`, no task, no claim), and Slack says so; a web ask naming it clears the mark | `a_refused_session_fails_the_task_with_the_sentence` (`crates/bots/tests/personas.rs`), `a_bot_refused_moments_ago_is_explained_without_a_task` |
+| `instruction_paths` misses SKILL.md and BOT.md | Yes | It now lists every `skills/<skill>/SKILL.md` of the personal role and each persona role, and every personal bot's `BOT.md`; a new `bots/pm-*/BOT.md` counts too. `policies/README.md`'s CODEOWNERS block adds `/content/skills/` and `/content/bots/` | `bot_instructions_are_the_master_context_personas_and_their_roles`, `codeowners_lines_cover_every_bot_instruction_file` |
+| "Drafted by" from Slack's catalog copy | Yes | The tool server's item carries `persona_name` and `persona_preview` (from its own catalog); Slack's card and Home row use them, falling back to its copy only for an older tool server | as M1 |
+| Display name like a colleague's | Yes (warning only) | Not refused (a user import could then withdraw a bot from everyone). Where a card names the bot, the tool server serves "<name> (bot)" when the name reads as a PM OS user's handle or display name; the admin view still lists `name_clashes`. The web app still shows the catalog name with the bot's face and role (not changed here) | `the_notice_is_stored_on_the_item_and_heads_every_edit` (last part) |
+
+**Not done:** the web app does not add "(bot)" to a clashing name (the mascot, colour and role
+line already mark a bot there); Jira issues still carry no notice (as M1 decided).
+
+**Not verified:** a real Slack workspace, a real runtime and tool server together (mocks per
+crate), CI (it doesn't start jobs on the account), any eval run (none has happened; no persona
+is `benchmarked: true`).
 
 ### Order and parallelism
 

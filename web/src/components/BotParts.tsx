@@ -65,6 +65,7 @@ export function DraftedBy({ persona, offered }: { persona: string | null | undef
     <p className={`drafted-by bot-by-${who.kind}`} data-bot={who.kind === 'bot' || who.kind === 'nudge' ? who.mascot : who.kind}>
       <BotFace mascot={who.mascot} size={20} />
       <span>{copy.bots.draftedBy(who.name)}</span>
+      {who.preview && <PreviewTag short />}
     </p>
   );
 }
