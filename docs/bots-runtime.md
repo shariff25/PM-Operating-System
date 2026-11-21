@@ -178,11 +178,22 @@ Nudge, the always-on generalist; `nudge` is never stored.
 | Route | Field | Rule |
 | --- | --- | --- |
 | `GET /v1/personas` | | `200 {personas: [{key, display_name, title, role, mascot, always_on, preview, summary, examples, can_do, reads, drafts, needs: [{source, label, without, met}]}]}`: offered only, Nudge first, then by `order`. From the runtime's catalog (`content/personas/*/PERSONA.md` through the lint). `preview: true` is a bot offered before its benchmark passes ("Preview: not yet benchmarked"). |
-| `POST /v1/tasks` | `persona?` | `web`, `slack`, `evals` only (others `403`). Not a key shape: `400 {code: "bad_request"}`. Not in the catalog or not offered: `400 {code: "unknown_persona"}`. The bot not a personal bot of role `pm-assistant`: `400 {code: "persona_needs_personal_bot"}`. `nudge` is stored as `null`. The team is **not** checked here. Left out in a thread: the thread's latest task's persona is inherited (`null` included); naming `nudge` does not inherit. |
+| `POST /v1/tasks` | `persona?` | `web`, `slack`, `evals` only (others `403`). Not a key shape: `400 {code: "bad_request"}`. Not in the catalog or not offered: `400 {code: "unknown_persona"}`. The bot not a personal bot of role `pm-assistant`: `400 {code: "persona_needs_personal_bot"}`. `nudge` is stored as `null`. The team is **not** checked here. Left out in a thread: the persona of the thread's latest task **asked by the same requester of the same bot** is inherited (`null` included); naming `nudge` does not inherit. Another person's task in the thread passes nothing on, and neither does a routine's run (routines start no thread), so a reply to a routine's message (Chief's daily brief, say) is Nudge's unless it names a bot. |
 | `GET /v1/tasks` | `?persona=<key>` | Only that persona's tasks; `persona=nudge` is Nudge's. `400` if not a key shape. |
 | Task, notification | `persona` | Every task carries `persona` (`null` is Nudge). A notification carries it only when not Nudge. The console's metadata view keeps it. |
-| `POST /v1/routines` | `draft.persona?` | As for tasks (`400` codes above); `nudge` or absent is Nudge. |
-| `PATCH /v1/routines/{id}` | `persona: key \| "nudge" \| null` | The owner only (`slack`, `web`); the console `403`. Checked as above. |
+| `POST /v1/routines` | `draft.persona?` | As for tasks (`400` codes above); `nudge` or absent is Nudge. A key other than `nudge`: `web` only (`slack` `403`), as for `PATCH` below. |
+| `PATCH /v1/routines/{id}` | `persona: key \| "nudge" \| null` | The owner only. `null` or `nudge` (back to Nudge): `slack` or `web`. Any other key: **`web` only** (`slack` `403`); the console `403` for any `persona`. Checked against the catalog as above. |
+
+**Who decides the team for a routine's persona** (slice R2, the reviewer's finding on this
+`PATCH`). The team lives in the tool server, which lets only `pmos-web` read it, with the
+person's signed assertion; the runtime has no way to read it. So: (1) only the `web` client may
+set a routine to run as a bot other than Nudge, and `pmos-web` reads the owner's team fresh
+before it does (`PUT /api/me/brief`, `docs/web-api.md`) and again after, moving the routine
+back to Nudge if the bot left in between; (2) the Slack bot, which can't read a team, may only
+move a routine back to Nudge (moving to Nudge widens nothing: Nudge is on every team); (3) the
+tool server decides again at **every run** (below): a run refused with `persona_not_on_team` or
+`persona_unavailable` pauses the routine. A wrong persona therefore never runs with a bot's
+role the owner doesn't have; at worst the routine pauses with the reason in the owner's DM.
 
 **At claim** the runtime checks the persona against its catalog again (withdrawn or deleted:
 the task fails with "Chief isn't offered in PM OS any more. Ask Nudge instead."), then asks
@@ -203,6 +214,16 @@ for a persona). The tool server decides the team:
 
 **History:** earlier turns are those with the same bot, requester, thread **and persona**, so
 Nudge never sees Chief's turns in a thread and the other way round.
+
+**The daily brief under Chief** (slice R2). The brief is the owner's routine whose prompt starts
+with `[daily-brief]`; `pmos-web` sets its `persona` when the PM switches "Chief writes my daily
+brief" (Chief's role lists the `daily-brief` skill). Nothing else about it changes: the run is a
+routine run as for any persona, its notification carries `persona`, and the Slack service
+attributes the DM and sends the brief's block to `pmos-web` with `persona`, so Today's panels
+fill and say who wrote it. The Slack service keeps the persona when the PM moves the brief to a
+new time (`PATCH {schedule, enabled: true}` on the same routine) and runs `brief now` as it.
+Removing Chief from the team moves the brief back to Nudge whatever the PM chose for Chief's
+other routines.
 
 **The worker** (`harness/src/worker.ts`) stages the persona role's skills. A skill folder
 missing from the sandbox (the window before **recreate each personal sandbox once**) fails the

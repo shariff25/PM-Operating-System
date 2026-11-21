@@ -598,6 +598,7 @@ impl FollowUpStore for PgStore {
         date: NaiveDate,
         changed: Vec<Changed>,
         followups: Vec<NewFollowUp>,
+        persona: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<(), StoreError> {
         let mut seen = HashSet::new();
@@ -639,15 +640,17 @@ impl FollowUpStore for PgStore {
             .map_err(err)?;
         }
         sqlx::query(
-            "INSERT INTO web_brief_days (handle, date, changed, updated_at)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO web_brief_days (handle, date, changed, updated_at, persona)
+             VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (handle) DO UPDATE SET date = EXCLUDED.date,
-                 changed = EXCLUDED.changed, updated_at = EXCLUDED.updated_at",
+                 changed = EXCLUDED.changed, updated_at = EXCLUDED.updated_at,
+                 persona = EXCLUDED.persona",
         )
         .bind(handle)
         .bind(date)
         .bind(Json(&changed))
         .bind(now)
+        .bind(persona)
         .execute(&mut *tx)
         .await
         .map_err(err)?;
@@ -656,7 +659,7 @@ impl FollowUpStore for PgStore {
 
     async fn day(&self, handle: &str, now: DateTime<Utc>) -> Result<Option<Day>, StoreError> {
         let Some(r) = sqlx::query(
-            "SELECT date, changed, updated_at FROM web_brief_days
+            "SELECT date, changed, updated_at, persona FROM web_brief_days
              WHERE handle = $1 AND updated_at + make_interval(secs => $3) > $2",
         )
         .bind(handle)
@@ -673,6 +676,7 @@ impl FollowUpStore for PgStore {
             date: r.try_get("date").map_err(err)?,
             changed: changed.0,
             updated: r.try_get("updated_at").map_err(err)?,
+            persona: r.try_get("persona").map_err(err)?,
         }))
     }
 

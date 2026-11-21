@@ -1462,6 +1462,99 @@ filter, its refusals and the CSV column); unit tests in `app/admin_bots.rs` and
 separately, with a mock tool server for `pmos-web`); the release with a real assertion
 `require` deployment; any eval run (none has happened).
 
+### Status: R2 is built (2026-11-21, branch `claude/market-r2-brief`)
+
+Built: the PM chooses who writes their daily brief, Nudge or Chief, and the brief says who wrote
+it.
+
+- **Runtime (`crates/bots/src/app.rs`)**, the reviewer's finding "PATCH /v1/routines {persona}
+  has no team check and doesn't say which clients may call it". **Where the team is decided, and
+  why:** the team lives in the tool server, which lets only `pmos-web` read it, with the
+  person's signed assertion; the runtime can't read it. So (1) only the `web` client may set a
+  routine (`PATCH /v1/routines/{id}` or `POST /v1/routines`) to run as a bot other than Nudge
+  (`slack` `403`; the console already `403`), and `pmos-web` reads the owner's team fresh before
+  it calls and again after; (2) `slack` and `web` may move a routine back to Nudge (`null` or
+  `nudge`), which widens nothing; (3) the tool server decides again at every run, and a refused
+  run pauses the routine (R1). `may_name_routine_persona`. Tests: R1's
+  `routines_carry_a_persona_and_pause_when_it_is_refused` now also asserts `slack` `403` on
+  create and on `PATCH` with `chief`, and `web` allowed (`crates/bots/tests/personas.rs`, both
+  stores).
+- **"Inherits from the thread's latest task: whose task"** (the reviewer's other point) is a
+  behaviour, now stated and tested: the latest task in the thread **asked by the same requester
+  of the same bot**, interactively. Another person's task in the thread, and a routine's run
+  (routines start no thread), pass nothing on. Test:
+  `a_reply_inherits_only_the_requesters_own_interactive_task` (both stores). §6's
+  "Conversations" row is read with that meaning; `docs/bots-runtime.md` says it.
+- **`pmos-web` (`crates/web/src/app/bots.rs`)**: `PUT /api/me/brief {persona}` (`"nudge"` or a
+  bot on the person's team, offered, whose `can_do` lists `daily-brief`), changing only the
+  `persona` of the signed-in person's own routines whose prompt starts with `[daily-brief]`;
+  the team read again after the change, the brief moved back to Nudge and `409 bot_not_on_team`
+  if the bot left meanwhile; `409 no_brief`, `409 cant_write_brief`; `brief` (`BriefWriter`)
+  on every Bots answer (`GET /api/bots`, `PUT /api/me/team`, `PUT /api/me/brief`). **W1's
+  removal** did *not* move the brief back when the person chose `pause`: it now always moves the
+  brief to Nudge, pausing only the others (`settle_routines`). `GET /api/brief` adds `persona`
+  and `persona_offered`; the producer route takes `persona` and stores it with the day
+  (migration `0006_brief_persona.sql`; `FollowUpStore::replace` takes it). Tests
+  (`crates/web/tests/bots.rs`, 5): `the_daily_brief_is_written_by_nudge_or_chief_as_the_owner_chooses`
+  (only Ana's own brief routine patched, another PM's listed brief untouched, every refusal
+  before the runtime, back to Nudge, no brief), `only_a_signed_in_person_who_may_ask_changes_their_own_brief`
+  (signed out `401`, Auditor `403`, origin and CSRF `403`, team reads signed for the person),
+  `removing_chief_moves_the_brief_back_to_nudge_whatever_was_chosen` (`pause`: the brief to
+  Nudge, the other routine paused, both before the team change),
+  `chief_leaving_the_team_meanwhile_takes_the_brief_back_to_nudge`,
+  `the_brief_says_who_wrote_it_and_still_fills_the_panels` (a Chief brief fills `changed` and
+  `waiting_on_you` and reads `persona: chief`; `nudge` or none is `null`; a withdrawn key reads
+  not offered; a malformed one `422`, nothing stored); `crates/web/tests/stores.rs` keeps
+  `persona` with the day on both stores.
+- **The brief block still reaches the web panels** (`crates/slack`): the notifier already sent a
+  brief routine's block whatever its persona; it now adds the notification's `persona` (left out
+  for Nudge or a key not shaped like one). Test: `a_brief_chief_wrote_still_fills_the_panels_and_names_chief`
+  (`crates/slack/tests/brief_feed.rs`).
+- **`web/`**: in Chief's Settings on the Bots page, a section "Daily brief" with a switch
+  (`role="switch"`, `aria-checked`, described by what changes) "Chief writes my daily brief",
+  acting at once, the result in a status line and a failure in an alert inside the dialog, focus
+  kept on the switch; the brief shown among routines as "Your daily brief"; the removal dialog
+  says the brief goes back to Nudge either way; Today's brief line adds "· Written by Chief"
+  with the face (`identify`, as drafts). Copy in `copy.ts`; the mock API (`setBriefWriter`,
+  `brief`, `?mock_brief_writer=chief|none`); codes `no_brief`, `cant_write_brief`. Tests:
+  `web/src/pages/BriefWriter.test.tsx` (9), `web/e2e/brief-writer.spec.ts` (keyboard flow,
+  attribution, axe in both themes at 1280 and 390 px with no sideways scroll).
+- Docs: `docs/web-api.md` (**Bots**: `BriefWriter`, "Who writes the daily brief", the removal,
+  errors; the brief's `persona`; the producer's `persona` and deploy order; two error codes),
+  `docs/bots-runtime.md` (the routine persona rule and why; whose task is inherited; the brief
+  under Chief), `docs/daily-brief.md`.
+
+**Departures:**
+
+1. **The team check is not in the runtime** (it can't read a team): the runtime limits who may
+   name a bot (`web` only) and `pmos-web` checks the team, before and after; the tool server's
+   check at each run stays the authority. A caller holding the web token could still set a
+   persona on its own routine; the run would then be refused and the routine paused.
+2. **"Chief" is any bot that writes briefs**: the switch and the route accept a bot whose
+   catalog `can_do` lists `daily-brief` (today only Chief), not the key `chief`.
+3. **Who wrote the brief comes from the Slack service** (`persona` on `PUT
+   /internal/brief/{handle}`, from the runtime's notification), stored with the day, and is
+   shown only while the day's items are (24 hours; `stale` and `never` show none). It is not
+   worked out from the routine, which says who writes the *next* one. **Deploy `pmos-web` before
+   the Slack service**: an older `pmos-web` refuses the field, so a Chief brief would not fill
+   the panels.
+4. **Slack changes** beyond the block: moving a Chief brief to a new time (`brief me at 9`) now
+   patches the same routine (`{schedule, enabled: true}`) instead of creating a new one and
+   deleting the old, which would have handed the brief back to Nudge silently (the Slack bot
+   may not set a bot); `brief now` runs as the brief's writer. Test:
+   `a_brief_chief_writes_stays_chiefs_when_moved_and_on_brief_now` (`crates/slack/tests/brief.rs`).
+5. **A reply in the brief's Slack thread goes to Nudge** unless it starts with "Chief:": a
+   routine's run starts no thread to inherit (unchanged behaviour, now documented).
+6. **`Me` is unchanged**; the Bots answer carries `brief`.
+7. **Settings follow the page's latest answer** (the dialog used a snapshot of the card), so the
+   routine list updates after the switch.
+8. Migrations: `pmos-web` `0006`; no tool-server or runtime migration.
+
+**Not verified:** a real Slack DM, a real runtime and tool server together (mocks per crate;
+the stack tests are not changed), the brief written by Chief's model (no eval run has happened;
+nothing is claimed about the quality of Chief's brief), the real `daily-brief` skill emitting
+its block under Chief's role in a sandbox.
+
 ### Order and parallelism
 
 1. **Wave 1, in parallel:** C1, F1, and the skill, template and eval parts of C2, C3, C4.

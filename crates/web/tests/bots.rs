@@ -92,6 +92,9 @@ struct Mocks {
     refuse_decision: Mutex<Option<&'static str>>,
     /// `GET /internal/admin/audit`'s events.
     audit_events: Mutex<Vec<Value>>,
+    /// When a routine is set to run as this bot, the bot leaves Ana's team at that moment (a
+    /// removal in another tab racing a brief change; slice R2).
+    leave_team_on_patch: Mutex<Option<String>>,
 }
 
 impl Mocks {
@@ -290,6 +293,12 @@ async fn runtime(State(m): State<Arc<Mocks>>, method: Method, uri: Uri, body: By
                 } else {
                     p.clone()
                 };
+                let leaving = m.leave_team_on_patch.lock().unwrap().clone();
+                if let Some(key) = leaving.filter(|k| p == &json!(k)) {
+                    if let Some(rows) = m.bots.teams.lock().unwrap().get_mut("ana") {
+                        rows.retain(|(k, ..)| *k != key);
+                    }
+                }
             }
             if let Some(e) = b.get("enabled") {
                 r["enabled"] = e.clone();
@@ -340,6 +349,10 @@ struct Reply {
 }
 
 async fn web() -> Web {
+    web_with(Deps::in_memory()).await
+}
+
+async fn web_with(deps: Deps) -> Web {
     let m = Arc::new(Mocks::default());
     m.directory.seed_team(TEAM);
     m.offer(vec![chief(), sprout()]);
@@ -369,7 +382,7 @@ async fn web() -> Web {
         password_login: false,
         trusted_proxies: Vec::new(),
     };
-    let (base, stop_web) = serve(pmos_web::build(cfg, Deps::in_memory()).unwrap()).await;
+    let (base, stop_web) = serve(pmos_web::build(cfg, deps).unwrap()).await;
     Web {
         base,
         m,
@@ -1616,4 +1629,346 @@ async fn the_audit_log_filters_by_bot_and_shows_it() {
     let header = r.text.lines().next().unwrap();
     assert!(header.ends_with("\"id\",\"persona\""), "{header}");
     assert!(r.text.lines().nth(1).unwrap().ends_with("\"chief\""));
+}
+
+// ---- Who writes the daily brief (slice R2) ----
+
+const BRIEF_PROMPT: &str = "[daily-brief] Write my daily brief with the daily-brief skill.";
+const BRIEF_TOKEN: &str = "brief-producer-token-0123456789abcdef";
+
+/// Chief as the real catalog lists it: it writes daily briefs.
+fn chief_briefs() -> Value {
+    let mut c = chief();
+    c["can_do"] = json!(["daily-brief", "meeting-prep", "week-review"]);
+    c
+}
+
+fn brief_routine(id: &str, owner: &str, persona: Option<&str>) -> Value {
+    let mut r = routine(id, persona);
+    r["owner"] = json!(owner);
+    r["bot"] = json!(format!("pm-{owner}"));
+    r["prompt"] = json!(BRIEF_PROMPT);
+    r
+}
+
+fn patches(w: &Web) -> Vec<Call> {
+    w.m.calls("runtime")
+        .into_iter()
+        .filter(|c| c.method == "PATCH")
+        .collect()
+}
+
+#[tokio::test]
+async fn the_daily_brief_is_written_by_nudge_or_chief_as_the_owner_chooses() {
+    let w = web().await;
+    w.m.offer(vec![chief_briefs(), sprout()]);
+    *w.m.routines.lock().unwrap() = vec![
+        routine("rtn_other", None),
+        brief_routine("rtn_brief", "ana", None),
+        // Ben's brief: listed by a runtime that ignored `?owner=`, never touched.
+        brief_routine("rtn_ben", "ben", None),
+    ];
+    let c = w.login("ana").await;
+    let r = w.get(&c, "/api/bots").await;
+    assert_eq!(
+        r.body["brief"],
+        json!({"routine_id": "rtn_brief", "writer": "nudge", "enabled": true})
+    );
+
+    // Chief isn't on the team yet: refused before the runtime is asked.
+    let r = w
+        .put(&c, "/api/me/brief", &json!({"persona": "chief"}))
+        .await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("bot_not_on_team"))
+    );
+    assert!(patches(&w).is_empty());
+
+    // On the team: only Ana's own brief routine moves, and only its persona.
+    w.m.put_on_team("ana", "chief");
+    w.m.put_on_team("ana", "sprout");
+    let r = w
+        .put(&c, "/api/me/brief", &json!({"persona": "chief"}))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let p = patches(&w);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(
+        (p[0].uri.as_str(), &p[0].body),
+        ("/v1/routines/rtn_brief", &json!({"persona": "chief"}))
+    );
+    assert_eq!(r.body["brief"]["writer"], "chief");
+    assert_eq!(card(&r, "chief")["routines"][0]["id"], "rtn_brief");
+    assert_eq!(w.m.routines.lock().unwrap()[2]["persona"], Value::Null);
+    // Asking again changes nothing upstream.
+    let r = w
+        .put(&c, "/api/me/brief", &json!({"persona": "chief"}))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    assert_eq!(patches(&w).len(), 1);
+
+    // A bot that doesn't write briefs, one not offered, a malformed key, a bad body.
+    for (body, status, code) in [
+        (
+            json!({"persona": "sprout"}),
+            StatusCode::CONFLICT,
+            "cant_write_brief",
+        ),
+        (
+            json!({"persona": "ghost"}),
+            StatusCode::CONFLICT,
+            "bot_unavailable",
+        ),
+        (
+            json!({"persona": "Not A Key"}),
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+        (
+            json!({"persona": "chief", "routine": "rtn_ben"}),
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+        (json!({}), StatusCode::BAD_REQUEST, "bad_request"),
+    ] {
+        let r = w.put(&c, "/api/me/brief", &body).await;
+        assert_eq!(
+            (r.status, r.body["code"].as_str()),
+            (status, Some(code)),
+            "{body}"
+        );
+    }
+    assert_eq!(patches(&w).len(), 1, "none of those reached the runtime");
+
+    // Back to Nudge: R1's `null`.
+    let r = w
+        .put(&c, "/api/me/brief", &json!({"persona": "nudge"}))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let last = patches(&w).pop().unwrap();
+    assert_eq!(
+        (last.uri.as_str(), &last.body),
+        ("/v1/routines/rtn_brief", &json!({"persona": null}))
+    );
+    assert_eq!(r.body["brief"]["writer"], "nudge");
+
+    // No brief routine: said so, nothing sent.
+    w.m.routines
+        .lock()
+        .unwrap()
+        .retain(|r| r["owner"] != "ana" || r["prompt"] != BRIEF_PROMPT);
+    let r = w.get(&c, "/api/bots").await;
+    assert_eq!(
+        r.body["brief"],
+        json!({"routine_id": null, "writer": null, "enabled": false})
+    );
+    let n = patches(&w).len();
+    let r = w
+        .put(&c, "/api/me/brief", &json!({"persona": "chief"}))
+        .await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("no_brief"))
+    );
+    assert_eq!(patches(&w).len(), n);
+}
+
+#[tokio::test]
+async fn only_a_signed_in_person_who_may_ask_changes_their_own_brief() {
+    let w = web().await;
+    w.m.offer(vec![chief_briefs()]);
+    *w.m.routines.lock().unwrap() = vec![brief_routine("rtn_brief", "ana", None)];
+    w.m.put_on_team("ana", "chief");
+    let body = json!({"persona": "chief"});
+    // Signed out.
+    let r = w.put("", "/api/me/brief", &body).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    // An Auditor may not ask, so has no brief writer to choose.
+    let a = w.login("audrey").await;
+    let r = w.put(&a, "/api/me/brief", &body).await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("not_allowed"))
+    );
+    // Another origin, and no CSRF token.
+    let c = w.login("ana").await;
+    let r = w
+        .write(
+            &c,
+            Method::PUT,
+            "/api/me/brief",
+            &body,
+            Some("https://evil.example"),
+            true,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let base = w.base.clone();
+    let r = w
+        .write(&c, Method::PUT, "/api/me/brief", &body, Some(&base), false)
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert!(patches(&w).is_empty());
+    // Every team read was Ana's own, signed for her.
+    for call in
+        w.m.bots
+            .calls()
+            .iter()
+            .filter(|c| c.uri.starts_with("/internal/team/"))
+    {
+        assert_eq!(call.uri, "/internal/team/ana");
+        assert_eq!(subject(call), "ana");
+    }
+    // Ben has no brief routine of his own: Ana's is never his to change.
+    w.m.put_on_team("ben", "chief");
+    let b = w.login("ben").await;
+    let r = w.put(&b, "/api/me/brief", &body).await;
+    assert_eq!(r.body["code"], "no_brief", "{}", r.text);
+    assert!(patches(&w).is_empty());
+}
+
+#[tokio::test]
+async fn removing_chief_moves_the_brief_back_to_nudge_whatever_was_chosen() {
+    let w = web().await;
+    w.m.offer(vec![chief_briefs()]);
+    w.m.put_on_team("ana", "chief");
+    *w.m.routines.lock().unwrap() = vec![
+        brief_routine("rtn_brief", "ana", Some("chief")),
+        routine("rtn_week", Some("chief")),
+    ];
+    let c = w.login("ana").await;
+    let r = w
+        .put(
+            &c,
+            "/api/me/team",
+            &json!({"remove": ["chief"], "via": "bots_page", "routines": "pause"}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let p = patches(&w);
+    assert_eq!(p.len(), 2, "{p:?}");
+    assert_eq!(
+        (p[0].uri.as_str(), &p[0].body),
+        ("/v1/routines/rtn_brief", &json!({"persona": null})),
+        "the brief goes back to Nudge, not paused"
+    );
+    assert_eq!(
+        (p[1].uri.as_str(), &p[1].body),
+        ("/v1/routines/rtn_week", &json!({"enabled": false}))
+    );
+    let put = w.m.team_puts();
+    assert!(p[1].seq < put[0].seq, "the routines first, then the team");
+    assert_eq!(
+        r.body["brief"],
+        json!({"routine_id": "rtn_brief", "writer": "nudge", "enabled": true})
+    );
+}
+
+#[tokio::test]
+async fn chief_leaving_the_team_meanwhile_takes_the_brief_back_to_nudge() {
+    let w = web().await;
+    w.m.offer(vec![chief_briefs()]);
+    w.m.put_on_team("ana", "chief");
+    *w.m.routines.lock().unwrap() = vec![brief_routine("rtn_brief", "ana", None)];
+    // Chief is removed (in another tab) just as the brief is moved to it.
+    *w.m.leave_team_on_patch.lock().unwrap() = Some("chief".into());
+    let c = w.login("ana").await;
+    let r = w
+        .put(&c, "/api/me/brief", &json!({"persona": "chief"}))
+        .await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("bot_not_on_team")),
+        "{}",
+        r.text
+    );
+    let p = patches(&w);
+    assert_eq!(p.len(), 2, "{p:?}");
+    assert_eq!(p[1].body, json!({"persona": null}));
+    assert_eq!(w.m.routines.lock().unwrap()[0]["persona"], Value::Null);
+}
+
+#[tokio::test]
+async fn the_brief_says_who_wrote_it_and_still_fills_the_panels() {
+    let deps = Deps {
+        brief: pmos_web::followups::BriefConfig {
+            enabled: true,
+            token: Some(BRIEF_TOKEN.into()),
+        },
+        ..Deps::in_memory()
+    };
+    let w = web_with(deps).await;
+    w.m.offer(vec![chief_briefs()]);
+    let fill = |body: Value| {
+        let http = w.http.clone();
+        let base = w.base.clone();
+        async move {
+            reply(
+                http.put(format!("{base}/internal/brief/ana"))
+                    .header("authorization", format!("Bearer {BRIEF_TOKEN}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    let items = json!({
+        "changed": [{"system": "jira", "title": "Fake: PAY-1 blocked", "summary": "", "url": "https://example.com/1"}],
+        "waiting_on_you": [{"system": "jira", "who": "Ben", "summary": "Fake: asked", "url": "https://example.com/2", "created_at": null}],
+    });
+    let mut chiefs = items.clone();
+    chiefs["persona"] = json!("chief");
+    let r = fill(chiefs).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let c = w.login("ana").await;
+    let b = w.get(&c, "/api/brief").await;
+    assert_eq!(b.status, StatusCode::OK, "{}", b.text);
+    assert_eq!(
+        (&b.body["persona"], &b.body["persona_offered"]),
+        (&json!("chief"), &json!(true))
+    );
+    assert_eq!(
+        b.body["changed"].as_array().unwrap().len(),
+        1,
+        "the panels are filled"
+    );
+    assert_eq!(b.body["waiting_on_you"].as_array().unwrap().len(), 1);
+
+    // Nudge's brief: `nudge`, or no `persona` at all, is `null`.
+    for body in [items.clone(), {
+        let mut n = items.clone();
+        n["persona"] = json!("nudge");
+        n
+    }] {
+        assert_eq!(fill(body).await.status, StatusCode::OK);
+        let b = w.get(&c, "/api/brief").await;
+        assert_eq!(
+            (&b.body["persona"], &b.body["persona_offered"]),
+            (&Value::Null, &json!(true))
+        );
+    }
+
+    // A bot withdrawn since it wrote the brief reads as not offered.
+    let mut gone = items.clone();
+    gone["persona"] = json!("ghost");
+    assert_eq!(fill(gone).await.status, StatusCode::OK);
+    let b = w.get(&c, "/api/brief").await;
+    assert_eq!(
+        (&b.body["persona"], &b.body["persona_offered"]),
+        (&json!("ghost"), &json!(false))
+    );
+
+    // A persona not shaped like a key is refused, and nothing is stored.
+    let mut bad = items.clone();
+    bad["persona"] = json!("<b>Chief</b>");
+    let r = fill(bad).await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("bad_brief"))
+    );
+    let b = w.get(&c, "/api/brief").await;
+    assert_eq!(b.body["persona"], "ghost");
 }

@@ -7,7 +7,7 @@
 mod common;
 
 use common::{at, persona_catalog, Env};
-use pmos_bots::model::{Draft, Output, Schedule, TaskStatus};
+use pmos_bots::model::{Draft, Output, Schedule, SlackRef, Source, Task, TaskStatus};
 use pmos_bots::store::TaskFilter;
 use serde_json::{json, Value};
 
@@ -40,6 +40,7 @@ persona_envs!(
     a_tool_server_that_drops_the_persona_fails_the_task,
     a_withdrawn_persona_fails_a_queued_task_at_claim,
     history_keeps_to_one_persona_and_a_reply_inherits_it,
+    a_reply_inherits_only_the_requesters_own_interactive_task,
     routines_carry_a_persona_and_pause_when_it_is_refused,
     a_withdrawn_personas_routine_pauses_at_its_next_run,
     personas_are_listed_for_the_clients,
@@ -241,6 +242,51 @@ async fn history_keeps_to_one_persona_and_a_reply_inherits_it(env: &Env) {
     assert_eq!(fourth["history"].as_array().unwrap().len(), 1);
 }
 
+/// Whose task a reply inherits (the reviewer's question, settled in R2): the latest task in
+/// the thread that the **same requester** asked of the **same bot**, interactively. Another
+/// person's task in that thread, and a routine's run (which starts no thread), pass nothing on.
+async fn a_reply_inherits_only_the_requesters_own_interactive_task(env: &Env) {
+    let thread = SlackRef {
+        channel: "D0ANA".into(),
+        thread_ts: "9.1".into(),
+    };
+    // Someone else's Chief task in the thread (only the store can put one there: a personal
+    // bot serves its owner), and a routine's run as Chief with the same Slack place.
+    let mut other = Task::queued(
+        "pm-ana",
+        "ben",
+        Source::Slack,
+        "ben asks",
+        Some(thread.clone()),
+        None,
+        at(2026, 11, 20, 9, 0),
+    );
+    other.persona = Some("chief".into());
+    env.store.create_task(&other, "queued").await.unwrap();
+    let mut run = Task::queued(
+        "pm-ana",
+        "ana",
+        Source::Routine,
+        "[daily-brief] Write my daily brief with the daily-brief skill.",
+        Some(thread.clone()),
+        Some("rtn_x".into()),
+        at(2026, 11, 20, 9, 1),
+    );
+    run.persona = Some("chief".into());
+    env.store.create_task(&run, "queued").await.unwrap();
+    let (status, reply) = ask_as(env, None, "9.1", "thanks").await;
+    assert_eq!(status, 201, "{reply}");
+    assert_eq!(
+        reply["persona"],
+        Value::Null,
+        "neither another person's task nor a routine's run is inherited"
+    );
+    // The requester's own Chief task in the thread is.
+    ask_as(env, Some("chief"), "9.1", "what slipped?").await;
+    let (_, again) = ask_as(env, None, "9.1", "and then?").await;
+    assert_eq!(again["persona"], "chief");
+}
+
 fn draft(persona: Option<&str>) -> Draft {
     Draft {
         bot: "pm-ana".into(),
@@ -257,17 +303,22 @@ fn draft(persona: Option<&str>) -> Draft {
 }
 
 async fn routines_carry_a_persona_and_pause_when_it_is_refused(env: &Env) {
-    // Created over HTTP with a persona; an unknown one is refused.
+    // Created over HTTP with a persona, by the web client (R2: the only client that may name
+    // one, since only pmos-web can check the team); an unknown one is refused.
     let mut body = json!({"draft": draft(Some("quill"))});
     let (status, refused) = env
-        .post("/v1/routines", "slack", Some("ana"), body.clone())
+        .post("/v1/routines", "web", Some("ana"), body.clone())
         .await;
     assert_eq!(
         (status, refused["code"].as_str()),
         (400, Some("unknown_persona"))
     );
     body["draft"]["persona"] = json!("chief");
-    let (status, r) = env.post("/v1/routines", "slack", Some("ana"), body).await;
+    let (status, _) = env
+        .post("/v1/routines", "slack", Some("ana"), body.clone())
+        .await;
+    assert_eq!(status, 403, "the Slack bot can't check the team");
+    let (status, r) = env.post("/v1/routines", "web", Some("ana"), body).await;
     assert_eq!(status, 201, "{r}");
     assert_eq!(r["persona"], "chief");
     let id = r["id"].as_str().unwrap().to_string();
@@ -285,8 +336,15 @@ async fn routines_carry_a_persona_and_pause_when_it_is_refused(env: &Env) {
         .patch(&path, "console", None, json!({"persona": "chief"}))
         .await;
     assert_eq!(status, 403);
-    let (status, moved) = env
+    let (status, _) = env
         .patch(&path, "slack", Some("ana"), json!({"persona": "chief"}))
+        .await;
+    assert_eq!(
+        status, 403,
+        "the Slack bot may only move a routine to Nudge"
+    );
+    let (status, moved) = env
+        .patch(&path, "web", Some("ana"), json!({"persona": "chief"}))
         .await;
     assert_eq!((status, moved["persona"].as_str()), (200, Some("chief")));
     let (status, _) = env

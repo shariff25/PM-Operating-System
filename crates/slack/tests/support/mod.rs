@@ -224,6 +224,9 @@ async fn rt_patch_routine(
             if let Some(e) = body.get("enabled") {
                 r["enabled"] = e.clone();
             }
+            if let Some(s) = body.get("schedule") {
+                r["schedule"] = s.clone();
+            }
             Json(r.clone()).into_response()
         }
         None => answer(StatusCode::NOT_FOUND, json!({"error": "no such routine"})),

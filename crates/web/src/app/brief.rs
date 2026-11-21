@@ -129,10 +129,15 @@ async fn get_brief(State(state): State<AppState>, SignedRead(signed): SignedRead
         .delivered(handle)
         .await
         .map_err(ApiError::store)?;
-    let (date, changed) = match day {
-        Some(d) => (d.date, d.changed),
-        None => (at.date_naive(), Vec::new()),
+    let (date, changed, persona) = match day {
+        Some(d) => (d.date, d.changed, d.persona),
+        None => (at.date_naive(), Vec::new(), None),
     };
+    // Who wrote the day's brief (slice R2): `null` is Nudge; a bot's key is checked against
+    // the catalog as drafts are, so a withdrawn one reads "a bot no longer offered".
+    let persona = crate::drafts::persona_key(persona.as_deref());
+    let offered = super::bots::offered_if(&state, &signed, persona.is_some()).await;
+    let persona_offered = super::bots::is_offered(persona.as_deref(), &offered);
     let mut body = json!({
         "date": date.to_string(),
         "delivered_at": delivered.map(crate::drafts::rfc3339),
@@ -143,6 +148,8 @@ async fn get_brief(State(state): State<AppState>, SignedRead(signed): SignedRead
         "waiting_on_you": of(Kind::WaitingOnYou),
         "you_wait_on": of(Kind::YouWaitOn),
         "slack_withheld": withhold,
+        "persona": persona,
+        "persona_offered": persona_offered,
     });
     if withhold {
         body["note"] = json!(SLACK_WITHHELD_NOTE);
@@ -407,6 +414,10 @@ struct FollowIn {
 #[serde(deny_unknown_fields)]
 struct BriefIn {
     date: Option<String>,
+    /// Who wrote the brief: a marketplace bot's key (`nudge`, or none, is Nudge). Sent by the
+    /// Slack service from the runtime's notification (slice R2).
+    #[serde(default)]
+    persona: Option<String>,
     #[serde(default)]
     changed: Vec<ChangedIn>,
     #[serde(default)]
@@ -468,7 +479,7 @@ fn system(field: &str, text: &str) -> Result<String, ApiError> {
     }
 }
 
-type Checked = (NaiveDate, Vec<Changed>, Vec<NewFollowUp>);
+type Checked = (NaiveDate, Vec<Changed>, Vec<NewFollowUp>, Option<String>);
 
 fn validate(body: BriefIn, at: DateTime<Utc>) -> Result<Checked, ApiError> {
     for (name, n) in [
@@ -480,6 +491,11 @@ fn validate(body: BriefIn, at: DateTime<Utc>) -> Result<Checked, ApiError> {
             return Err(bad(name, &format!("at most {MAX_ITEMS} items")));
         }
     }
+    let persona = match body.persona.as_deref() {
+        None | Some(pmos_contract::personas::ALWAYS_ON) => None,
+        Some(k) if pmos_contract::bots::valid_name(k) => Some(k.to_string()),
+        Some(_) => return Err(bad("persona", "must be a bot's key")),
+    };
     let date = match body.date {
         None => at.date_naive(),
         Some(d) => NaiveDate::parse_from_str(&d, "%Y-%m-%d")
@@ -525,7 +541,7 @@ fn validate(body: BriefIn, at: DateTime<Utc>) -> Result<Checked, ApiError> {
             });
         }
     }
-    Ok((date, changed, followups))
+    Ok((date, changed, followups, persona))
 }
 
 fn bearer(headers: &HeaderMap) -> &str {
@@ -606,12 +622,12 @@ async fn fill(state: &AppState, handle: &str, headers: &HeaderMap, body: &Bytes)
         ));
     }
     let at = now(state);
-    let (date, changed, followups) = validate(parse(body)?, at)?;
+    let (date, changed, followups, persona) = validate(parse(body)?, at)?;
     let (n_changed, n_followups) = (changed.len(), followups.len());
     state
         .0
         .followups
-        .replace(handle, date, changed, followups, at)
+        .replace(handle, date, changed, followups, persona.as_deref(), at)
         .await
         .map_err(ApiError::store)?;
     tracing::info!(user = %handle, changed = n_changed, followups = n_followups, "brief filled");
