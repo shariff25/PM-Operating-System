@@ -1204,7 +1204,6 @@ Counts for the admin home.
 | `bots_without_active_owner` | string[] | Bots whose owner is not an active user who may use PM OS. |
 | `first_links` | object[] or `null` | **New (review of `b469d5b`, U1).** Everyone who signed in with Microsoft for the first time in the last 7 days, newest first: `{handle, at (RFC 3339 UTC), provider: "entra"}`. "N people signed in with Microsoft for the first time in the last 7 days"; if one wasn't expected, unlink it on the Team page. Never an object id. `null` when the audit log can't be read back (or from an older tool server). |
 | `password_resets` | object[] | Reset codes made in the window for people who had a password: `handle`, `by` (an admin's handle, or `host`), `at`, and `dismissed_at`: when the person's notice of it was dismissed (from their own session), `null` while it shows. Read by time, however many other role changes there were. Each person also sees a notice until they dismiss it. An older server leaves it out. |
-| `password_codes_voided` | object[] | **Removed (the gate review of `04c175f`, G2):** a wrong guess no longer voids a setup code, so there is nothing to list. Always empty until `pmos-web` drops the field; the app no longer reads it. |
 
 The three counts are `null` when the tool server's audit log can't be read back.
 **Purge runs in the audit list:** action `audit.purge`, system `audit`, actor
