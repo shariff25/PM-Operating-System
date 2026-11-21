@@ -311,9 +311,10 @@ ten (case, spaces and hyphens ignored).
   refused attempts from one address (an IPv6 address counts by its /64) in 15 minutes, or the
   server's own limit. **Every** refused attempt counts: a wrong password or code, an unknown or
   expired sign-in or setup, a step out of order, a body that isn't the route's JSON; only PM OS's
-  own failures (`5xx`) don't. The tool server has limits of its own behind the same answer
+  own failures (`5xx`) and the tool server's shared-limit `429`s on sign-in and on setting a
+  password (since the gate review of `8e8f8fe`) don't. The tool server has limits of its own behind the same answer
   (since the gate review of `04c175f`): a share of its hashing allowance per network (an IPv4
-  /24, an IPv6 /48), and 100 wrong setup codes per network in 15 minutes. A `429` or `503` from
+  /24, an IPv6 /48) once that allowance is nearly used up, and 100 wrong setup codes per network in 15 minutes. A `429` or `503` from
   them never costs a setup code or a setup token one of its tries: try again after
   `Retry-After`.
 - **Setup codes** last 24 hours and work once; a new one replaces the old one. Wrong guesses
