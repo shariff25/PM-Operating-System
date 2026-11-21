@@ -45,8 +45,6 @@ struct StoredCode {
     code: SetupCode,
     used_at: Option<DateTime<Utc>>,
     revoked_at: Option<DateTime<Utc>>,
-    /// Void after too many wrong guesses (migration 0023).
-    voided_at: Option<DateTime<Utc>>,
 }
 
 /// Password sign-in's tables, in memory.
@@ -433,24 +431,8 @@ impl PasswordStore for MemoryUsers {
             .filter(|c| c.change == ChangeKind::DismissResetNotice && c.at >= since)
             .map(|c| (c.target.clone(), c.at))
             .collect();
-        let mut voided: Vec<crate::password::store::VoidedCode> = state
-            .pw
-            .codes
-            .iter()
-            .filter_map(|c| {
-                c.voided_at
-                    .filter(|at| *at >= since)
-                    .map(|at| crate::password::store::VoidedCode {
-                        handle: c.handle.clone(),
-                        at,
-                        wrong_guesses: c.code.wrong_guesses,
-                    })
-            })
-            .collect();
-        voided.sort_by_key(|v| std::cmp::Reverse(v.at));
         Ok(crate::password::store::PasswordOverview {
             resets: crate::password::store::pair_resets(resets, &dismissals),
-            voided,
         })
     }
 
@@ -567,7 +549,6 @@ impl PasswordStore for MemoryUsers {
                 },
                 used_at: None,
                 revoked_at: None,
-                voided_at: None,
             });
         }
         if let Some(counts) = w.code_counts {
@@ -580,10 +561,6 @@ impl PasswordStore for MemoryUsers {
                 c.code.begins = counts.begins;
                 c.code.password_sets = counts.password_sets;
                 c.code.wrong_guesses = counts.wrong_guesses;
-                if counts.void {
-                    c.revoked_at = Some(now);
-                    c.voided_at = Some(now);
-                }
             }
         }
         if let Some(id) = w.use_code {
@@ -661,10 +638,7 @@ impl PasswordStore for MemoryUsers {
         let pw = &mut state.pw;
         let before = pw.pending.len() + pw.codes.len() + pw.sources.len();
         pw.pending.retain(|_, (_, p)| p.expires_at > now);
-        // A void code stays for the overview's window.
-        let kept = chrono::Duration::days(crate::password::store::VOIDED_KEPT_DAYS);
-        pw.codes
-            .retain(|c| c.code.expires_at > now || c.voided_at.is_some_and(|at| at > now - kept));
+        pw.codes.retain(|c| c.code.expires_at > now);
         pw.used_tokens.retain(|_, until| *until > now);
         pw.sources.retain(|_, s| !s.is_idle(now));
         Ok((before - pw.pending.len() - pw.codes.len() - pw.sources.len()) as u64)
