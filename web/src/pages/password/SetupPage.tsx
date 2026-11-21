@@ -148,7 +148,7 @@ export function SetupPage({ api, onDone }: { api: Api; onDone: () => Promise<voi
     }
     const code = e instanceof ApiError ? e.code : '';
     if (code === 'too_many_attempts') return refuse(P.wait.noTime);
-    if (code === 'setup_expired' || code === 'wrong_step') return restart(S[code]);
+    if (code === 'setup_expired' || code === 'wrong_step' || code === 'setup_code_spent') return restart(S[code]);
     if (code === 'weak_password') return refuse(weakText(e instanceof ApiError ? e.details.reason : null, rules));
     if (code === 'code_failed' && e instanceof ApiError) {
       const n = Number(e.details.attempts_left);

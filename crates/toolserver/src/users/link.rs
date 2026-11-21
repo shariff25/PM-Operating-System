@@ -74,10 +74,15 @@ pub enum LinkRefusal {
     NotAMember,
     /// The ID token has no `acct` claim: the app registration lacks the optional claim.
     EntraMisconfigured,
+    /// The tenant's keys couldn't be read (`503`): counted and audited like any refusal (the
+    /// re-check of eb24d28, LD).
+    EntraUnavailable,
+    /// This tool server has no Entra settings (`501`): counted and audited too (LD).
+    NotConfigured,
 }
 
 impl LinkRefusal {
-    pub const ALL: [LinkRefusal; 12] = [
+    pub const ALL: [LinkRefusal; 14] = [
         Self::Invalid,
         Self::NotFound,
         Self::NotActive,
@@ -90,6 +95,8 @@ impl LinkRefusal {
         Self::TokenUsed,
         Self::NotAMember,
         Self::EntraMisconfigured,
+        Self::EntraUnavailable,
+        Self::NotConfigured,
     ];
 
     /// The API's error code.
@@ -107,6 +114,8 @@ impl LinkRefusal {
             Self::TokenUsed => "token_used",
             Self::NotAMember => "not_a_member",
             Self::EntraMisconfigured => "entra_misconfigured",
+            Self::EntraUnavailable => "entra_unavailable",
+            Self::NotConfigured => "not_configured",
         }
     }
 
@@ -157,6 +166,10 @@ impl LinkRefusal {
             Self::EvalsAccount => "the evals account never has an Entra identity",
             Self::Linked => "this user is already linked to a different Microsoft account",
             Self::Taken => "this Microsoft account is linked to another user",
+            Self::EntraUnavailable => "the Microsoft keys couldn't be read; try again shortly",
+            Self::NotConfigured => {
+                "this tool server has no Entra settings (PMOS_ENTRA_TENANT_ID, PMOS_ENTRA_CLIENT_ID)"
+            }
         }
     }
 }
@@ -221,8 +234,25 @@ pub fn plan(dir: &Directory, link: &EntraLink, now: DateTime<Utc>) -> Result<Pla
         .get(&link.handle)
         .filter(|u| u.sign_in_name.as_deref() == Some(link.sign_in_name.as_str()))
         .ok_or(LinkRefusal::NotFound)?;
+    // Who may never be linked through pmos-web, checked before "already linked" too (the
+    // re-check of eb24d28, LE): the answer then never vouches for a deactivated person, the
+    // evals account or an Admin's or Auditor's host-set link.
+    let barred = || {
+        if !user.active() {
+            Some(LinkRefusal::NotActive)
+        } else if user.handle == EVALS {
+            Some(LinkRefusal::EvalsAccount)
+        } else if user.has(UserRole::Admin) || user.has(UserRole::Auditor) {
+            Some(LinkRefusal::HostOnly)
+        } else {
+            None
+        }
+    };
     match user.identity(IdentityKind::Entra) {
         Some(e) if e.issuer == link.key.tid && e.subject == link.key.oid => {
+            if let Some(why) = barred() {
+                return Err(why);
+            }
             return Ok(Planned::Same(Box::new(user.clone())));
         }
         Some(_) => return Err(LinkRefusal::Linked),
@@ -236,14 +266,8 @@ pub fn plan(dir: &Directory, link: &EntraLink, now: DateTime<Utc>) -> Result<Pla
     if held_by_other {
         return Err(LinkRefusal::Taken);
     }
-    if !user.active() {
-        return Err(LinkRefusal::NotActive);
-    }
-    if user.handle == EVALS {
-        return Err(LinkRefusal::EvalsAccount);
-    }
-    if user.has(UserRole::Admin) || user.has(UserRole::Auditor) {
-        return Err(LinkRefusal::HostOnly);
+    if let Some(why) = barred() {
+        return Err(why);
     }
     if user.sign_in_name_confirmed_at.is_none() {
         return Err(LinkRefusal::Unconfirmed);

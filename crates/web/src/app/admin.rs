@@ -535,6 +535,17 @@ struct UsersFlags {
     first_links: Option<Vec<FirstLink>>,
     /// Reset codes issued in the window for people who had a password (PM2): handles only.
     password_resets: Vec<ResetFlag>,
+    /// Setup codes void after too many wrong guesses in the window (the re-check of eb24d28,
+    /// M2): the admin issues a new one.
+    password_codes_voided: Vec<VoidedFlag>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct VoidedFlag {
+    handle: String,
+    at: String,
+    wrong_guesses: u64,
 }
 
 /// One first link on the overview.
@@ -553,6 +564,8 @@ struct ResetFlag {
     /// The admin's handle, or `host`.
     by: String,
     at: String,
+    /// When the person's notice of it was dismissed (LF); `null` while it shows.
+    dismissed_at: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Default)]

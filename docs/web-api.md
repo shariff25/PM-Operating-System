@@ -175,9 +175,13 @@ a lost phone is a new code from an admin (a **reset**).
    is cleared. Every other session the person had ends (a reset signs them out everywhere).
 
 Steps 2 and 3 must come in that order before 4 (`409 wrong_step` otherwise); step 2 may be
-repeated (the last password wins). The setup lasts 15 minutes from step 1 (never past the
-code's own expiry); after that, or after 5 wrong codes at step 4, `401 setup_expired`: start at
-step 1 again with the same code (it is spent only when step 4 succeeds).
+repeated (the last password wins) up to 3 times and step 3 up to 5 times in one setup. The
+setup lasts 15 minutes from step 1 (never past the code's own expiry); after that, after 5
+wrong codes at step 4, or past those repeats, `401 setup_expired`: start at step 1 again with
+the same code (it is spent when step 4 succeeds). One code starts at most 5 setups and sets at
+most 6 passwords across them; past that `409 setup_code_spent`: an admin makes a new code.
+Every call of steps 2 and 3 counts against the browser's address (20 in 15 minutes), even when
+it succeeds.
 
 **Sign in:**
 
@@ -314,9 +318,9 @@ Each is in **Error codes**; `error` is `pmos-web`'s own sentence.
 | --- | --- |
 | `sign-in` | `401 sign_in_failed` (one answer for every reason), `429 too_many_attempts`, `503 sign_in_busy`, `503 users_unavailable`, `501 not_configured`, `503 assertion_required` |
 | `second-step` | `401 code_failed` (`attempts_left`), `401 sign_in_expired`, `403 not_a_member` (deactivated since the password), `429 too_many_attempts` |
-| `setup/begin` | `401 setup_failed` (one answer for every reason until the code matched), then `403 not_a_member`, `409 sign_in_unconfirmed`, `403 host_only` (an Admin's or Auditor's code must come from the host), `409 evals_account`; `429 too_many_attempts` |
-| `setup/password` | `401 setup_expired`, `422 weak_password` (`reason`), `403 not_a_member`, `503 sign_in_busy` |
-| `setup/authenticator` | `401 setup_expired`, `409 wrong_step` |
+| `setup/begin` | `401 setup_failed` (one answer for every reason until the code matched), then `403 not_a_member`, `409 sign_in_unconfirmed`, `403 host_only` (an Admin's or Auditor's code must come from the host), `409 evals_account`, `409 setup_code_spent`; `429 too_many_attempts` |
+| `setup/password` | `401 setup_expired`, `409 setup_code_spent`, `422 weak_password` (`reason`), `403 not_a_member`, `429 too_many_attempts`, `503 sign_in_busy` |
+| `setup/authenticator` | `401 setup_expired`, `409 wrong_step`, `429 too_many_attempts` |
 | `setup/confirm` | `401 code_failed` (`attempts_left`), `401 setup_expired`, `409 wrong_step`, `403 host_only`, `409 sign_in_unconfirmed`, `429 too_many_attempts` |
 | `change` | `403 reauth_failed` (the current password or the code), `422 weak_password`, `409 no_password`, `429 too_many_attempts`, `502 unknown_outcome` |
 | `recovery-codes` | `403 reauth_failed`, `409 no_password`, `429 too_many_attempts`, `502 unknown_outcome` |
@@ -697,7 +701,7 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `401` | `bad_token` | The producer route's token is wrong (server to server only). | Yes |
 | `403` | `bad_origin` | A write from another origin, or with neither `Origin` nor `Referer`. | Yes |
 | `403` | `bad_csrf` | A write without the session's CSRF token. | Yes |
-| `403` | `proxy_not_trusted` | Password sign-in: a request that carries a forwarded header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) while `pmos-web` trusts no proxy (`PMOS_WEB_DIRECT=1`): a proxy nobody named is in front. | Yes |
+| `403` | `proxy_not_trusted` | Password sign-in: a request that carries a forwarded header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) while `pmos-web` trusts no proxy (`PMOS_WEB_DIRECT=1`), or from a peer not in `PMOS_WEB_TRUSTED_PROXIES`, or from a trusted proxy that names no client: the proxy setting doesn't match the deployment. | Yes |
 | `403` | `not_a_member` | Not (or no longer) an active user in the user database; every session of theirs ends. Also when the tool server doesn't count them a member on a decision. | Yes |
 | `403` | `not_allowed` | Their role doesn't allow drafts, tasks or asking. | Yes |
 | `403` | `forbidden` | Admin and auditor routes their role doesn't allow; the reviewer routes for someone who isn't an active reviewer; the producer route called like a browser. | Yes |
@@ -757,6 +761,7 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `401` | `sign_in_expired` | No password sign-in in progress (none started, five minutes passed, or its tries used up): start again with the password. | Yes |
 | `401` | `setup_failed` | A password setup's first step, for every reason alike: no such user, no code, a wrong, expired or replaced code, or the account waiting. | Yes |
 | `401` | `setup_expired` | No password setup in progress (fifteen minutes passed, or its tries used up): start again with the setup code. | Yes |
+| `409` | `setup_code_spent` | A password setup code that gave all the work it allows (5 setups started with it, or 6 passwords set with it): an admin makes a new one. | Yes |
 | `409` | `wrong_step` | A password setup's steps out of order: the password, then the authenticator, then the code. | Yes |
 | `422` | `weak_password` | A new password isn't accepted; `reason` is `too_short`, `too_long`, `matches_name` or `common`. | Yes |
 | `403` | `reauth_failed` | Changing a password or making new recovery codes: the current password or the authenticator code wasn't right. | Yes |
@@ -963,7 +968,10 @@ Counts for the admin home.
            "deactivation_limit_reached": false, "deactivation_grace_hours": 24,
            "bots_without_active_owner": [],
            "first_links": [{"handle": "ben", "at": "2026-11-16T08:02:11.000Z", "provider": "entra"}],
-           "password_resets": [{"handle": "ana", "by": "ada", "at": "2026-11-16T08:00:00Z"}]}}
+           "password_resets": [{"handle": "ana", "by": "ada", "at": "2026-11-16T08:00:00Z",
+                                "dismissed_at": null}],
+           "password_codes_voided": [{"handle": "ben", "at": "2026-11-16T09:00:00Z",
+                                      "wrong_guesses": 20}]}}
 ```
 
 | Field | Type | Meaning |
@@ -998,7 +1006,8 @@ Counts for the admin home.
 | `deactivation_grace_hours` | integer | 24. |
 | `bots_without_active_owner` | string[] | Bots whose owner is not an active user who may use PM OS. |
 | `first_links` | object[] or `null` | **New (review of `b469d5b`, U1).** Everyone who signed in with Microsoft for the first time in the last 7 days, newest first: `{handle, at (RFC 3339 UTC), provider: "entra"}`. "N people signed in with Microsoft for the first time in the last 7 days"; if one wasn't expected, unlink it on the Team page. Never an object id. `null` when the audit log can't be read back (or from an older tool server). |
-| `password_resets` | object[] | Reset codes made in the window for people who had a password: `handle`, `by` (an admin's handle, or `host`), `at`. Each person also sees a notice until they dismiss it. An older server leaves it out. |
+| `password_resets` | object[] | Reset codes made in the window for people who had a password: `handle`, `by` (an admin's handle, or `host`), `at`, and `dismissed_at`: when the person's notice of it was dismissed (from their own session), `null` while it shows. Read by time, however many other role changes there were. Each person also sees a notice until they dismiss it. An older server leaves it out. |
+| `password_codes_voided` | object[] | **New (re-check of `eb24d28`, M2).** Setup codes made void in the window after 20 wrong tries against them: `handle`, `at`, `wrong_guesses`. Make the person a new code and hand it over at once. An older server leaves it out. |
 
 The three counts are `null` when the tool server's audit log can't be read back.
 **Purge runs in the audit list:** action `audit.purge`, system `audit`, actor

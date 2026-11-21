@@ -38,6 +38,16 @@ pub struct TestPg {
 
 impl TestPg {
     pub async fn new() -> Option<Self> {
+        Self::create(false).await
+    }
+
+    /// As [`Self::new`], in a schema whose name is one letter (the first free one): for the
+    /// cases where a name's length matters (identifiers are cut at 63 bytes).
+    pub async fn new_short_schema() -> Option<Self> {
+        Self::create(true).await
+    }
+
+    async fn create(short: bool) -> Option<Self> {
         let Ok(url) = std::env::var("PMOS_TEST_DATABASE_URL") else {
             assert!(
                 std::env::var_os("CI").is_none(),
@@ -47,14 +57,26 @@ impl TestPg {
             return None;
         };
         let base = PgConnectOptions::from_str(&url).expect("PMOS_TEST_DATABASE_URL parses");
-        let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
         let mut admin = sqlx::PgConnection::connect_with(&base)
             .await
             .expect("connect");
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&mut admin)
-            .await
-            .expect("create schema");
+        let names: Vec<String> = if short {
+            ('a'..='z').map(String::from).collect()
+        } else {
+            vec![format!("t_{}", uuid::Uuid::new_v4().simple())]
+        };
+        let mut schema = None;
+        for name in names {
+            if sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}")))
+                .execute(&mut admin)
+                .await
+                .is_ok()
+            {
+                schema = Some(name);
+                break;
+            }
+        }
+        let schema = schema.expect("create schema");
         admin.close().await.ok();
         let pool = PgPoolOptions::new()
             .max_connections(12)

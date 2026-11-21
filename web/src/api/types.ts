@@ -327,6 +327,7 @@ export const SERVER_ERROR_CODES = {
   sign_in_expired: 'yes',
   setup_failed: 'yes',
   setup_expired: 'yes',
+  setup_code_spent: 'yes',
   wrong_step: 'yes',
   weak_password: 'yes',
   reauth_failed: 'yes',
@@ -466,8 +467,10 @@ export interface OverviewUsers {
   bots_without_active_owner: string[];
   /** First Microsoft (Entra) links in the window: who, when, which provider. Missing or null from an older tool server, or when the audit log can't be read back. */
   first_links?: { handle: string; at: string; provider: string }[] | null;
-  /** Reset codes made this week for people who had a password: whose, by whom (a handle, or `host`), when. Absent from an older server. */
-  password_resets?: { handle: string; by: string; at: string }[];
+  /** Reset codes made this week for people who had a password: whose, by whom (a handle, or `host`), when, and when the person's notice of it was dismissed (`null` while it shows). Absent from an older server. */
+  password_resets?: { handle: string; by: string; at: string; dismissed_at?: string | null }[];
+  /** Setup codes made void this week after too many wrong guesses: the admin makes a new one. Absent from an older server. */
+  password_codes_voided?: { handle: string; at: string; wrong_guesses: number }[];
 }
 
 export interface AdminOverview {
