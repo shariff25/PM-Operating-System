@@ -53,6 +53,12 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   choose freely from the catalog an Admin offers; the mascots are Chief (Chief of Staff),
   Sprout (Growth PM) and Echo (Outbound PM), in Nudge's style, which the owner chose to keep.
   Spec: `docs/bot-marketplace-spec.md`.
+  Owner's decisions of 2026-11-21, after the reviewer's review of the spec: (1) the three new
+  bots are offered as **Preview** ("not yet benchmarked") until their eval run passes: an
+  accepted exception to decision D10; (2) Echo's customer-facing drafts carry the line "Draft
+  for internal review. Not approved for external use." and need no extra approval step, until
+  Legal's outbound policy exists; (3) decision D12 is changed: the Chief of Staff, Growth and
+  Outbound bots are built now (none of them directs other bots).
 - **h. Dropped by the owner on 2026-11-17:** the review of how the Grok bot was built. Do not
   build it.
 
