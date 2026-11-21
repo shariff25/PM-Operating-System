@@ -90,6 +90,8 @@ fn harness_rules() {
         "lease expired",
         "worker crashed",
         "the model gateway answered 502",
+        "The model is busy right now. Please try again in a few minutes.",
+        "The model is still busy after several tries. Please try again in a few minutes.",
     ] {
         assert_eq!(
             rule_of(&ended("failed", Some(e)), &wrong()),
@@ -251,6 +253,38 @@ fn everything_else_is_the_model_with_a_reason() {
     assert_eq!(
         (other.tag, other.reason.as_str()),
         (Tag::Model, "failed: i could not answer")
+    );
+}
+
+/// A rule's word matches only at the start of a word: "please" isn't a lost `lease`, "stool"
+/// isn't a `tool`, and an id with 403 inside it isn't a `403`. (The 2026-11-16 run tagged
+/// every "Please try again" as `harness/interrupted` by `lease`.)
+#[test]
+fn rule_words_match_only_at_the_start_of_a_word() {
+    for e in [
+        "Please try again with a narrower question",
+        "the stool sample was empty",
+        "ticket PM-14033 was closed",
+    ] {
+        assert_eq!(
+            rule_of(&ended("failed", Some(e)), &wrong()),
+            is(Tag::Model, "model"),
+            "{e}"
+        );
+    }
+    assert_eq!(
+        rule_of(
+            &ended("failed", Some("lease expired; restarts: 2")),
+            &wrong()
+        ),
+        is(Tag::Harness, "interrupted")
+    );
+    assert_eq!(
+        rule_of(
+            &ended("failed", Some("tools.yaml refused it (403)")),
+            &wrong()
+        ),
+        is(Tag::Policy, "policy-error")
     );
 }
 

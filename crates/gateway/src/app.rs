@@ -50,6 +50,28 @@ pub struct GatewayConfig {
     pub remote_key: String,
     /// How a `429`/`503` from an upstream is retried (`retry.rs`).
     pub retry: RetryPolicy,
+    /// How long an upstream may take ([`Timeouts`]).
+    pub timeouts: Timeouts,
+}
+
+/// How long an upstream may take. A streamed answer sends bytes as it goes, so a stream that
+/// goes silent for `stream_silence` is stuck. An answer that isn't streamed (most calls the
+/// harness makes, and every call to the Claude test upstream) sends nothing until it's
+/// whole, so it gets `whole_answer` from the request to its last byte: with only the silence
+/// limit, every generation longer than it was cut off as a `502`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    pub stream_silence: Duration,
+    pub whole_answer: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            stream_silence: Duration::from_secs(120),
+            whole_answer: Duration::from_secs(600),
+        }
+    }
 }
 
 struct Inner {
@@ -58,9 +80,11 @@ struct Inner {
     clients: Vec<Client>,
     usage: Arc<UsageLog>,
     sched: Arc<Scheduler>,
+    /// For streamed answers: [`Timeouts::stream_silence`] between bytes.
     http: reqwest::Client,
-    /// For the testing-only Claude upstream: a whole answer arrives at once, so allow longer.
-    claude_http: reqwest::Client,
+    /// For answers that arrive whole (not streamed, and the testing-only Claude upstream):
+    /// [`Timeouts::whole_answer`] in all.
+    whole_http: reqwest::Client,
     stub: bool,
     workarounds_on: bool,
     anthropic_key: String,
@@ -97,12 +121,12 @@ pub fn router(cfg: GatewayConfig) -> Router {
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         // A long generation streams for minutes; a server that goes silent this long is stuck.
-        .read_timeout(Duration::from_secs(120))
+        .read_timeout(cfg.timeouts.stream_silence)
         .build()
         .expect("http client builds");
-    let claude_http = reqwest::Client::builder()
+    let whole_http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(600))
+        .timeout(cfg.timeouts.whole_answer)
         .build()
         .expect("http client builds");
     let state = AppState(Arc::new(Inner {
@@ -111,7 +135,7 @@ pub fn router(cfg: GatewayConfig) -> Router {
         usage: cfg.usage,
         sched,
         http,
-        claude_http,
+        whole_http,
         stub: cfg.stub,
         workarounds_on: cfg.workarounds_on,
         anthropic_key: cfg.anthropic_key,
@@ -467,7 +491,14 @@ async fn forward(
     let mut attempt = 0u32;
     let outcome = loop {
         attempt += 1;
-        let post = inner.http.post(&url);
+        // Not streamed: nothing arrives until the answer is whole, so the silence limit
+        // would cut off every long generation.
+        let client = if stream {
+            &inner.http
+        } else {
+            &inner.whole_http
+        };
+        let post = client.post(&url);
         // The client's own gateway token never goes upstream; the remote key does.
         let post = if remote {
             post.bearer_auth(&inner.remote_key)
@@ -684,7 +715,7 @@ async fn claude(
         }
     };
     let res = inner
-        .claude_http
+        .whole_http
         .post(format!("{}/v1/messages", role.upstream))
         .header("x-api-key", &inner.anthropic_key)
         .header("anthropic-version", anthropic::API_VERSION)

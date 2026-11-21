@@ -133,6 +133,7 @@ async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_o
         anthropic_key: "test-key".into(),
         remote_key: String::new(),
         retry: Default::default(),
+        timeouts: Default::default(),
     });
     let (base, stop) = serve(app).await;
     Gw { base, usage, stop }
@@ -684,6 +685,7 @@ async fn the_claude_test_upstream_needs_its_switch_and_translates_both_ways() {
         anthropic_key: "sk-test-placeholder".into(),
         remote_key: String::new(),
         retry: Default::default(),
+        timeouts: Default::default(),
     }))
     .await;
     let http = reqwest::Client::new();
@@ -906,6 +908,7 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
         anthropic_key: String::new(),
         remote_key: REMOTE_KEY.into(),
         retry: Default::default(),
+        timeouts: Default::default(),
     }))
     .await;
     let http = reqwest::Client::new();
@@ -1249,6 +1252,7 @@ async fn retry_gateway(steps: Vec<Step>, retry: RetryPolicy) -> (Gw, Arc<Scripte
         anthropic_key: String::new(),
         remote_key: String::new(),
         retry,
+        timeouts: Default::default(),
     }))
     .await;
     (
@@ -1432,4 +1436,88 @@ async fn a_waiting_retry_gives_its_slot_to_the_queue() {
     assert_eq!(first.await.unwrap().status(), 200);
     assert_eq!(up.calls.lock().unwrap().len(), 3);
     gw.stop.cancel();
+}
+
+/// A model server that answers after `delay`, whole or streamed.
+async fn slow_upstream(delay: Duration) -> (String, CancellationToken) {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: Bytes| async move {
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            tokio::time::sleep(delay).await;
+            if body["stream"] == json!(true) {
+                let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+                           data: [DONE]\n\n";
+                return ([("content-type", "text/event-stream")], sse).into_response();
+            }
+            Json(json!({
+                "id": "x", "object": "chat.completion", "model": body["model"],
+                "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "A long answer."}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }))
+            .into_response()
+        }),
+    );
+    let (base, stop) = serve(app).await;
+    (format!("{base}/v1"), stop)
+}
+
+/// A long generation that isn't streamed sends nothing until it's whole: it must not be cut
+/// off by the silence limit meant for streams (a real run on a remote model lost every call
+/// over 120 s as a `502`). A stream that goes silent that long still fails, and a whole
+/// answer still has its own limit.
+#[tokio::test]
+async fn a_whole_answer_may_take_longer_than_a_stream_may_stay_silent() {
+    let (up, stop_up) = slow_upstream(Duration::from_millis(1500)).await;
+    let start = |timeouts: pmos_gateway::Timeouts| {
+        let models = Models::from_yaml(&format!(
+            "upstreams: {{a: '{up}'}}\nroles:\n  default: {{upstream: a, model: qwen-test}}\n"
+        ))
+        .unwrap();
+        router(GatewayConfig {
+            models,
+            clients: vec![Client {
+                name: "runtime".into(),
+                token: TOKEN.into(),
+            }],
+            usage: Arc::new(UsageLog::new(None).unwrap()),
+            stub: false,
+            workarounds_on: true,
+            anthropic_key: String::new(),
+            remote_key: String::new(),
+            retry: Default::default(),
+            timeouts,
+        })
+    };
+    let ask = |gw: &str, stream: bool| {
+        reqwest::Client::new()
+            .post(format!("{gw}/v1/chat/completions"))
+            .bearer_auth(TOKEN)
+            .header("X-Pmos-User", "ana")
+            .json(&json!({"model": "pmos/default", "stream": stream,
+                "messages": [{"role": "user", "content": "Draft the PRD"}]}))
+            .send()
+    };
+    let (gw, stop) = serve(start(pmos_gateway::Timeouts {
+        stream_silence: Duration::from_millis(500),
+        whole_answer: Duration::from_secs(10),
+    }))
+    .await;
+    let whole = ask(&gw, false).await.unwrap();
+    assert_eq!(whole.status(), 200);
+    let body: Value = whole.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "A long answer.");
+    assert_eq!(ask(&gw, true).await.unwrap().status(), 502);
+    stop.cancel();
+
+    let (gw, stop) = serve(start(pmos_gateway::Timeouts {
+        stream_silence: Duration::from_secs(10),
+        whole_answer: Duration::from_millis(500),
+    }))
+    .await;
+    assert_eq!(ask(&gw, false).await.unwrap().status(), 502);
+    assert_eq!(ask(&gw, true).await.unwrap().status(), 200);
+    stop.cancel();
+    stop_up.cancel();
 }
