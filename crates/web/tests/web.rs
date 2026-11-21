@@ -4061,7 +4061,8 @@ async fn readyz_checks_the_store_and_both_upstreams() {
         r.body,
         json!({"ready": true, "checks": {"store": "ok",
                                          "bot_runtime": "ok", "tool_server": "ok"},
-               "unrecorded_sign_in_events": 0, "untrusted_proxy_refusals": 0})
+               "unrecorded_sign_in_events": 0, "untrusted_proxy_refusals": 0,
+               "warnings": []})
     );
     // `team.yaml` isn't what readiness depends on any more.
     std::fs::write(w.dir.path().join("team.yaml"), "members: [").unwrap();

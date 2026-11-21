@@ -66,7 +66,7 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
 - **Health:** `GET /healthz` (outside `/api`, no session) answers `ok` while the process runs.
   `GET /readyz` answers `200` when it can serve and `503` when it can't, with
   `{"ready": bool, "checks": {"store": "ok"|"down", "bot_runtime": …, "tool_server": …},
-  "unrecorded_sign_in_events": n, "untrusted_proxy_refusals": n}`: its own store answers, and the bot runtime and the tool
+  "unrecorded_sign_in_events": n, "untrusted_proxy_refusals": n, "warnings": [...]}`: its own store answers, and the bot runtime and the tool
   server (which answers who may sign in) answer their `/healthz` within two seconds. With
   Entra sign-in on, `checks` also has `entra_link` (since the review of `b469d5b`, U1): `ok`
   only when the tool server validates first-link ID tokens for the same tenant and client id
@@ -75,7 +75,9 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
   (see **Sign-in events**); it never makes the server unready. `untrusted_proxy_refusals`
   counts, since start-up, password requests refused `403 proxy_not_trusted` because the proxy
   setting doesn't match where they came from (`docs/password-sign-in.md`); above zero, the
-  setting is wrong or stale; it never makes the server unready either. No detail and no
+  setting is wrong or stale; it never makes the server unready either, but while the last such
+  refusal is under 15 minutes old `warnings` holds `"untrusted_proxy_refusals"` (the gate
+  review of `04c175f`, GL3), which `pmos-admin status` shows as `WARN`. No detail and no
   secrets; the reason goes to the server's log.
 - **Sign-in events.** Every sign-in, sign-out and refused sign-in is recorded in the tool
   server's audit log (`POST /internal/admin/events`, `docs/toolserver.md`, **Sign-in
@@ -309,8 +311,13 @@ ten (case, spaces and hyphens ignored).
   refused attempts from one address (an IPv6 address counts by its /64) in 15 minutes, or the
   server's own limit. **Every** refused attempt counts: a wrong password or code, an unknown or
   expired sign-in or setup, a step out of order, a body that isn't the route's JSON; only PM OS's
-  own failures (`5xx`) don't.
-- **Setup codes** last 24 hours and work once; a new one replaces the old one.
+  own failures (`5xx`) don't. The tool server has limits of its own behind the same answer
+  (since the gate review of `04c175f`): a share of its hashing allowance per network (an IPv4
+  /24, an IPv6 /48), and 100 wrong setup codes per network in 15 minutes. A `429` or `503` from
+  them never costs a setup code or a setup token one of its tries: try again after
+  `Retry-After`.
+- **Setup codes** last 24 hours and work once; a new one replaces the old one. Wrong guesses
+  by anyone never void a code or end a setup in progress (since the gate review of `04c175f`).
 - **Recovery codes:** ten, each works once; making new ones replaces all ten.
 
 ### Errors on these routes
@@ -1161,9 +1168,7 @@ Counts for the admin home.
            "bots_without_active_owner": [],
            "first_links": [{"handle": "ben", "at": "2026-11-16T08:02:11.000Z", "provider": "entra"}],
            "password_resets": [{"handle": "ana", "by": "ada", "at": "2026-11-16T08:00:00Z",
-                                "dismissed_at": null}],
-           "password_codes_voided": [{"handle": "ben", "at": "2026-11-16T09:00:00Z",
-                                      "wrong_guesses": 20}]}}
+                                "dismissed_at": null}]}}
 ```
 
 | Field | Type | Meaning |
@@ -1199,7 +1204,7 @@ Counts for the admin home.
 | `bots_without_active_owner` | string[] | Bots whose owner is not an active user who may use PM OS. |
 | `first_links` | object[] or `null` | **New (review of `b469d5b`, U1).** Everyone who signed in with Microsoft for the first time in the last 7 days, newest first: `{handle, at (RFC 3339 UTC), provider: "entra"}`. "N people signed in with Microsoft for the first time in the last 7 days"; if one wasn't expected, unlink it on the Team page. Never an object id. `null` when the audit log can't be read back (or from an older tool server). |
 | `password_resets` | object[] | Reset codes made in the window for people who had a password: `handle`, `by` (an admin's handle, or `host`), `at`, and `dismissed_at`: when the person's notice of it was dismissed (from their own session), `null` while it shows. Read by time, however many other role changes there were. Each person also sees a notice until they dismiss it. An older server leaves it out. |
-| `password_codes_voided` | object[] | **New (re-check of `eb24d28`, M2).** Setup codes made void in the window after 20 wrong tries against them: `handle`, `at`, `wrong_guesses`. Make the person a new code and hand it over at once. An older server leaves it out. |
+| `password_codes_voided` | object[] | **Removed (the gate review of `04c175f`, G2):** a wrong guess no longer voids a setup code, so there is nothing to list. Always empty until `pmos-web` drops the field; the app no longer reads it. |
 
 The three counts are `null` when the tool server's audit log can't be read back.
 **Purge runs in the audit list:** action `audit.purge`, system `audit`, actor

@@ -84,8 +84,16 @@ printf 'mode=%s file=%s workers=%s args=%s\n' "${PMOS_ASSERTION_MODE:-}" "$filem
   "${PMOS_RT_WORKER_TOKENS:-}" "$*" >>"$DOCKER_LOG"
 # `docker network inspect`: the pmos network's gateway, when the test gives one.
 if [ "${1:-}" = network ] && [ -n "${FAKE_GATEWAY:-}" ]; then echo "$FAKE_GATEWAY"; fi
+# `compose … ps --services`: the running services, when the test gives them.
+if [[ " $* " == *" ps "*"--services"* ]] && [ -n "${FAKE_PS:-}" ]; then echo "$FAKE_PS"; fi
 EOF
 chmod +x "$WORK/bin/docker"
+# A stand-in `curl` for `status`: every /readyz answers FAKE_READYZ with 200.
+cat >"$WORK/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n200' "${FAKE_READYZ:-{\}}"
+EOF
+chmod +x "$WORK/bin/curl"
 export DOCKER_LOG="$WORK/docker.log"
 stack_env() { # mode [extra lines...]
   {
@@ -167,11 +175,38 @@ out=$(FAKE_GATEWAY=172.18.0.1 run_stack up --web 2>&1) || code=$?
   "$out" == *"deploy/pmos-admin down && deploy/pmos-admin up --web"* ]] ||
   fail "up --web on a stale network doesn't say to re-create it: $out"
 ! grep -q ' up -d' "$DOCKER_LOG" || fail "up --web on a stale network started something"
-# - A proxy in a container on the pmos network (inside the pinned subnet), and a site that
-#   overrides the subnet and gateway: both start.
+# - A proxy in a container on the pmos network (inside the pinned subnet): refused by default
+#   (GL4: Docker assigns those addresses), naming the gateway and the override; with
+#   PMOS_WEB_TRUST_PROXY_IN_NETWORK=1 it starts, with a warning. A site that overrides the
+#   subnet and gateway starts.
 stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
   "PMOS_WEB_TRUSTED_PROXIES=10.201.77.40" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
-FAKE_GATEWAY=10.201.77.1 run_stack up --web >/dev/null || fail "a proxy inside the pinned subnet was refused"
+code=0
+out=$(FAKE_GATEWAY=10.201.77.1 run_stack up --web 2>&1) || code=$?
+[ "$code" = 2 ] || fail "a proxy inside the pinned subnet without the override exits $code, not 2"
+[[ "$out" == *"PMOS_WEB_TRUSTED_PROXIES=10.201.77.1"* && "$out" == *"PMOS_WEB_TRUST_PROXY_IN_NETWORK=1"* ]] ||
+  fail "a proxy inside the subnet isn't told the fix: $out"
+! grep -q ' up -d' "$DOCKER_LOG" || fail "a proxy inside the subnet without the override started something"
+stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
+  "PMOS_WEB_TRUSTED_PROXIES=10.201.77.40" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com" \
+  "PMOS_WEB_TRUST_PROXY_IN_NETWORK=1"
+out=$(FAKE_GATEWAY=10.201.77.1 run_stack up --web 2>&1) || fail "a proxy inside the subnet with the override was refused: $out"
+[[ "$out" == *"WARNING: PMOS_WEB_TRUSTED_PROXIES names 10.201.77.40"* ]] || fail "the override isn't warned about: $out"
+grep -q ' up -d' "$DOCKER_LOG" || fail "the override didn't start the web app"
+# The override never trusts an address outside the subnet.
+stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
+  "PMOS_WEB_TRUSTED_PROXIES=172.18.0.1" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com" \
+  "PMOS_WEB_TRUST_PROXY_IN_NETWORK=1"
+code=0
+run_stack up --web >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "the override let an address outside the subnet through ($code)"
+# `status` shows a readiness warning from the web app (GL3).
+stack_env require "PMOS_WEB_PASSWORD_LOGIN=1" "PMOS_WEB_TRUSTED_PROXIES=10.201.77.1"
+out=$(FAKE_PS=web FAKE_READYZ='{"checks":{},"ready":true,"untrusted_proxy_refusals":3,"warnings":["untrusted_proxy_refusals"]}' run_stack status 2>&1)
+[[ "$out" == *"WARN"*"untrusted_proxy_refusals"* && "$out" == *"PMOS_WEB_TRUSTED_PROXIES"* ]] ||
+  fail "status doesn't show the web app's warning: $out"
+out=$(FAKE_PS=web FAKE_READYZ='{"checks":{},"ready":true,"warnings":[]}' run_stack status 2>&1)
+[[ "$out" != *"WARN"* ]] || fail "status warns with no warning: $out"
 stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
   "PMOS_NETWORK_SUBNET=10.50.0.0/24" "PMOS_NETWORK_GATEWAY=10.50.0.1" \
   "PMOS_WEB_TRUSTED_PROXIES=10.50.0.1" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"

@@ -1282,7 +1282,9 @@ both!(guesses_from_one_address_never_hold_the_owner_out, |t| {
     let mut later = at + Duration::minutes(2);
     let mut n = 0;
     while n < limits::ACCOUNT_CEILING {
-        let from = format!("192.0.2.{}", n % 200 + 1);
+        // Each from its own block: one block's share of the hashing allowance is 30 a minute
+        // (the gate review of 04c175f, G1), and this is about many addresses.
+        let from = format!("198.19.{n}.1");
         t.sign_in_from(&from, "ana", OTHER_PASSWORD, later)
             .await
             .ok();
@@ -1637,14 +1639,40 @@ both!(one_setup_code_cannot_spend_the_shared_allowance, |t| {
         );
     }
     let token = begin_from(t, &svc, "cy", &code, AWAY, at).await.unwrap();
-    answers.push(
-        svc.setup_password(t.store(), &token, &Secret::new(PASSWORD), at)
-            .await,
-    );
+    // G3 (the gate review of 04c175f): a refusal by the shared allowance costs the invitee
+    // nothing. Before, each `429` still counted against the token and the code, so six of
+    // them spent the code; now twenty leave both as they were.
+    for _ in 0..20 {
+        answers.push(
+            svc.setup_password(t.store(), &token, &Secret::new(PASSWORD), at)
+                .await,
+        );
+    }
     assert_eq!(answers[..3], [Ok(()), Ok(()), Ok(())]);
     assert!(
-        matches!(answers[3], Err(PwError::TooMany { .. })),
+        answers[3..]
+            .iter()
+            .all(|a| matches!(a, Err(PwError::TooMany { .. }))),
         "setup never takes the reserve: {answers:?}"
+    );
+    // A minute on, the same token still has all three of its sets (3 per token), and the code
+    // its other three (6 per code).
+    let later = at + Duration::minutes(1);
+    for _ in 0..3 {
+        svc.setup_password(t.store(), &token, &Secret::new(PASSWORD), later)
+            .await
+            .expect("the 429s cost the token and the code nothing");
+    }
+    assert_eq!(
+        svc.setup_password(t.store(), &token, &Secret::new(PASSWORD), later)
+            .await,
+        Err(PwError::SetupExpired),
+        "three per token, counting only sets that hashed"
+    );
+    assert_eq!(
+        begin_from(t, &svc, "cy", &code, AWAY, later).await,
+        Err(PwError::SetupCodeSpent),
+        "and H1 holds: six hashes per code in all"
     );
     let pending = svc
         .sign_in(
@@ -1665,6 +1693,255 @@ both!(one_setup_code_cannot_spend_the_shared_allowance, |t| {
     )
     .await
     .unwrap();
+});
+
+// GL5: H1's loop in parallel. Ten setups begun at once with one code, each sending ten
+// password sets at once: still at most six sets (six hashes) in all for the code, then it is
+// spent. Meanwhile Ben signs in from an address nobody has used (so no reserve: the open
+// allowance only), and gets in.
+both!(
+    one_setup_code_in_parallel_still_hashes_at_most_six_times,
+    |t| {
+        let now = t0();
+        let (ben_secret, _) = t.enrolled("ben", now).await;
+        let at = now + Duration::minutes(1);
+        // Room for the loop's six and Ben's one, and nothing more.
+        let svc = PasswordService::with_params(t.keys.clone(), QUICK)
+            .unwrap()
+            .with_global_limit(7, 0);
+        let code = t.issue(&Actor::web("ada"), "cy", at).await.unwrap();
+        let setup = |n: usize| {
+            let (svc, code) = (&svc, code.clone());
+            async move {
+                let from = format!("198.19.{n}.1");
+                let Ok(token) = begin_from(t, svc, "cy", &code, &from, at).await else {
+                    return 0;
+                };
+                let pw = Secret::new(PASSWORD);
+                let sets: Vec<_> = (0..10)
+                    .map(|_| svc.setup_password(t.store(), &token, &pw, at))
+                    .collect();
+                futures_join(sets)
+                    .await
+                    .iter()
+                    .filter(|r| r.is_ok())
+                    .count()
+            }
+        };
+        let ben = async {
+            let new_address = "100.64.7.9";
+            let p = svc
+                .sign_in(
+                    t.store(),
+                    "ben@example.com",
+                    &Secret::new(PASSWORD),
+                    Some(new_address),
+                    at,
+                )
+                .await?;
+            svc.second_step(
+                t.store(),
+                p.token.expose(),
+                &SecondStep::Code(Secret::new(code_now(&ben_secret, at))),
+                Some(new_address),
+                at,
+            )
+            .await
+        };
+        let loops: Vec<_> = (0..10).map(setup).collect();
+        let (sets, signed_in) = tokio::join!(futures_join(loops), ben);
+        let sets: usize = sets.iter().sum();
+        assert!(
+            sets <= limits::SETUP_PASSWORD_SETS_PER_CODE as usize,
+            "{sets} sets"
+        );
+        signed_in.expect("Ben, from a new address, while the loop runs");
+        // However the loop went, the code gives no more.
+        let token = begin_from(t, &svc, "cy", &code, AWAY, at + Duration::minutes(1)).await;
+        if let Ok(token) = token {
+            let pw = Secret::new(PASSWORD);
+            let more: Vec<_> = (0..10)
+                .map(|_| svc.setup_password(t.store(), &token, &pw, at + Duration::minutes(1)))
+                .collect();
+            let more = futures_join(more)
+                .await
+                .iter()
+                .filter(|r| r.is_ok())
+                .count();
+            assert!(
+                sets + more <= limits::SETUP_PASSWORD_SETS_PER_CODE as usize,
+                "{sets} + {more} sets"
+            );
+        }
+    }
+);
+
+// GL1: correct password steps in parallel can't pass the account's room together. Before,
+// each was checked before its hash and counted after it, so twenty at once all passed; now
+// the room is taken in one step once the password proved right.
+both!(
+    parallel_correct_password_steps_are_bounded_per_account,
+    |t| {
+        let now = t0();
+        t.enrolled("ana", now).await;
+        // Past the window of the setup's own work.
+        let at = now + Duration::minutes(16);
+        // From five addresses, four each: below each address's threshold of failures counted
+        // ahead (5), so none is held up by its own others in flight.
+        let from: Vec<String> = (0..20)
+            .map(|n| format!("203.0.113.{}", 20 + n % 5))
+            .collect();
+        let tries: Vec<_> = from
+            .iter()
+            .map(|f| t.sign_in_from(f, "ana", PASSWORD, at))
+            .collect();
+        let out = futures_join(tries).await;
+        let passed = out.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(passed, limits::ACCOUNT_WORK, "{out:?}");
+        assert!(out
+            .iter()
+            .filter(|r| r.is_err())
+            .all(|r| matches!(r, Err(PwError::TooMany { .. }))));
+    }
+);
+
+// GL2: a rehash is a hash like any other: it draws from the shared allowance, and with no
+// room it is put off (recorded, counted) and done at a later correct sign-in.
+both!(a_rehash_draws_from_the_shared_allowance, |t| {
+    let now = t0();
+    let (secret, _) = t.enrolled("ana", now).await;
+    let stronger = HashParams {
+        m_kib: 2048,
+        t: 2,
+        p: 1,
+    };
+    // One hash a minute: the check takes it, so the rehash has none.
+    let raised = PasswordService::with_params(t.keys.clone(), stronger)
+        .unwrap()
+        .with_global_limit(1, 0);
+    let at = now + Duration::minutes(1);
+    let sign_in = |at| {
+        let raised = &raised;
+        async move {
+            raised
+                .sign_in(
+                    t.store(),
+                    "ana@example.com",
+                    &Secret::new(PASSWORD),
+                    Some(HOME),
+                    at,
+                )
+                .await
+        }
+    };
+    let p = sign_in(at).await.expect("the sign-in isn't refused for it");
+    raised
+        .second_step(
+            t.store(),
+            p.token.expose(),
+            &SecondStep::Code(Secret::new(code_now(&secret, at))),
+            Some(HOME),
+            at,
+        )
+        .await
+        .unwrap();
+    let details = |ev: Vec<(String, Outcome, Option<String>, Option<String>)>| {
+        ev.into_iter().filter_map(|e| e.3).collect::<Vec<_>>()
+    };
+    let ev = details(t.events("password.sign_in").await);
+    assert!(
+        ev.iter().any(|d| d == "password; rehash_deferred"),
+        "{ev:?}"
+    );
+    assert!(!ev.iter().any(|d| d == "password; rehashed"), "{ev:?}");
+    assert_eq!(raised.rehashes_deferred(), 1);
+    // A minute on, with two hashes of room, it is done.
+    let raised = PasswordService::with_params(t.keys.clone(), stronger)
+        .unwrap()
+        .with_global_limit(2, 0);
+    let later = at + Duration::minutes(1);
+    raised
+        .sign_in(
+            t.store(),
+            "ana@example.com",
+            &Secret::new(PASSWORD),
+            Some(HOME),
+            later,
+        )
+        .await
+        .unwrap();
+    let ev = details(t.events("password.sign_in").await);
+    assert!(ev.iter().any(|d| d == "password; rehashed"), "{ev:?}");
+});
+
+// G1: a flood from a few hundred addresses in a few blocks can't fill the open allowance.
+// Before, 300 unknown-name guesses from anywhere filled it and a sign-in from an address
+// nobody had used was refused (`429`); now each /24 takes at most its share (30 a minute).
+both!(a_flood_from_a_few_blocks_leaves_room_for_another, |t| {
+    let now = t0();
+    let (secret, _) = t.enrolled("ana", now).await;
+    let at = now + Duration::minutes(1);
+    let mut refused = 0;
+    for n in 0..600 {
+        let from = format!("198.19.{}.{}", n % 3, n / 3 + 1);
+        match t
+            .svc
+            .sign_in(
+                t.store(),
+                &format!("nobody{n}@example.com"),
+                &Secret::new(OTHER_PASSWORD),
+                Some(&from),
+                at,
+            )
+            .await
+        {
+            Err(PwError::SignInFailed) => {}
+            Err(PwError::TooMany { .. }) => refused += 1,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(refused, 600 - 3 * 30, "three blocks' shares");
+    let new_address = "100.64.9.1";
+    let p = t
+        .sign_in_from(new_address, "ana", PASSWORD, at)
+        .await
+        .expect("a sign-in from another block, an address nobody has used");
+    t.code_from(new_address, &p, &code_now(&secret, at), at)
+        .await
+        .unwrap();
+});
+
+// G1: the reserve is shared out too. Someone who signed in from an address gets at most two
+// of its hashes a minute there, so an insider with a few known addresses can't fill it.
+both!(one_address_takes_at_most_two_of_the_reserve_a_minute, |t| {
+    let now = t0();
+    t.enrolled("ana", now).await;
+    let at = now + Duration::minutes(1);
+    let svc = PasswordService::with_params(t.keys.clone(), QUICK)
+        .unwrap()
+        .with_global_limit(2, 50);
+    let attempt = |from: &'static str| {
+        let svc = &svc;
+        async move {
+            svc.sign_in(
+                t.store(),
+                "nobody@example.com",
+                &Secret::new(OTHER_PASSWORD),
+                Some(from),
+                at,
+            )
+            .await
+            .map(drop)
+        }
+    };
+    // Junk fills the open allowance.
+    for _ in 0..2 {
+        assert_eq!(attempt(AWAY).await, Err(PwError::SignInFailed));
+    }
+    // From Ana's known address: two from the reserve, then 429.
+    assert_eq!(attempt(HOME).await, Err(PwError::SignInFailed));
+    assert_eq!(attempt(HOME).await, Err(PwError::SignInFailed));
+    assert!(matches!(attempt(HOME).await, Err(PwError::TooMany { .. })));
 });
 
 // H1's shape elsewhere: work after an authentication is bounded per account. Ten correct
@@ -1752,71 +2029,114 @@ both!(change_and_recovery_codes_are_bounded, |t| {
     ));
 });
 
-// M2: guesses at a setup code count against the code itself. A new code starts clean; at 20
-// wrong guesses (from any number of addresses) the code is void, the overview lists it, and
-// a fresh code works at once. Before the cap the right code still works.
-both!(setup_code_guesses_void_the_code_not_the_person, |t| {
+// G2 (the gate review of 04c175f): a wrong guess needs only a sign-in name with a live code,
+// so voiding the code at 20 let anyone kill a setup in progress. Now a wrong guess never
+// touches the code or the setup: it counts against the guesser's address (and its block)
+// only. Forty wrong guesses from eight addresses in eight blocks (old: void at 20) while Ana's
+// setup is in progress, and she finishes it; the right code still begins for Cy afterwards.
+both!(wrong_setup_guesses_never_void_a_code_or_end_a_setup, |t| {
     let now = t0();
     let wrong = "AAAAA-AAAAA-AAAAA-AAAAA";
     let code = t.issue(&Actor::web("ada"), "ana", now).await.unwrap();
-    // Nineteen wrong guesses from nineteen addresses: the right code still works.
-    for n in 0..limits::SETUP_WRONG_GUESSES_PER_CODE - 1 {
-        let from = format!("192.0.2.{}", n + 1);
+    let token = begin_from(t, &t.svc, "ana", &code, HOME, now)
+        .await
+        .expect("Ana starts her setup");
+    let guess = |who: &'static str, from: String| async move {
+        begin_from(t, &t.svc, who, wrong, &from, now).await
+    };
+    for n in 0..40 {
+        let from = format!("198.19.{}.{}", n % 8, n + 1);
+        assert_eq!(guess("ana", from).await, Err(PwError::SetupFailed));
+    }
+    // Her setup goes on with the token she already has.
+    t.svc
+        .setup_password(t.store(), &token, &Secret::new(PASSWORD), now)
+        .await
+        .expect("the setup in progress is untouched");
+    let e = t
+        .svc
+        .setup_authenticator(t.store(), &token, now)
+        .await
+        .unwrap();
+    let secret = totp::unbase32(e.secret.expose()).unwrap().to_vec();
+    t.svc
+        .setup_confirm(
+            t.store(),
+            &token,
+            &Secret::new(code_now(&secret, now)),
+            Some(HOME),
+            now,
+        )
+        .await
+        .expect("and finishes");
+    // The same against a code no setup has started with yet: it still begins, from anywhere
+    // the guesser isn't.
+    let code = t.issue(&Actor::web("ada"), "cy", now).await.unwrap();
+    for n in 0..40 {
+        let from = format!("198.19.{}.{}", 8 + n % 8, n + 1);
+        assert_eq!(guess("cy", from).await, Err(PwError::SetupFailed));
+    }
+    begin_from(t, &t.svc, "cy", &code, HOME, now)
+        .await
+        .expect("the code still works");
+    // Nothing is voided, and the wrong guesses are a plain count for an operator.
+    let ev = t.events("password.setup_code").await;
+    assert!(
+        ev.iter().all(|e| e.1 == Outcome::Ok),
+        "no code was made void: {ev:?}"
+    );
+    assert_eq!(t.svc.setup_wrong_guesses(), 80);
+    // A guesser's own address waits as before (five, then 30 s), for that person.
+    for _ in 0..5 {
         assert_eq!(
-            begin_from(t, &t.svc, "ana", wrong, &from, now).await,
+            guess("cy", "198.19.30.1".into()).await,
             Err(PwError::SetupFailed)
         );
     }
-    begin_from(t, &t.svc, "ana", &code, HOME, now)
-        .await
-        .expect("below the cap the code works");
-    // The twentieth wrong guess voids it.
     assert_eq!(
-        begin_from(t, &t.svc, "ana", wrong, "192.0.2.99", now).await,
-        Err(PwError::SetupFailed)
-    );
-    assert_eq!(
-        begin_from(t, &t.svc, "ana", &code, HOME, now).await,
+        begin_from(t, &t.svc, "cy", &code, "198.19.30.1", now).await,
         Err(PwError::SetupFailed),
-        "a void code is no code"
+        "that address waits"
     );
-    let ev = t.events("password.setup_code").await;
-    assert!(
-        ev.iter()
-            .any(|e| e.1 == Outcome::Denied && e.3.as_deref() == Some("voided; failures 20")),
-        "{ev:?}"
-    );
-    let overview = t
-        .store()
-        .password_overview(now - Duration::days(7))
+});
+
+// G2: guesses are counted against the guesser's block as well: past 100 in 15 minutes from
+// one /24, the setup's first step answers 429 for that block (decided before the name is
+// looked up, so it says nothing about the name), and other blocks are not held up.
+both!(setup_code_guesses_are_bounded_per_block, |t| {
+    let now = t0();
+    let wrong = "AAAAA-AAAAA-AAAAA-AAAAA";
+    let code = t.issue(&Actor::web("ada"), "ana", now).await.unwrap();
+    // 100 wrong guesses from 25 addresses in 203.0.113.0/24, four each (below each address's
+    // own wait), at made-up names and at Ana's.
+    for n in 0..100 {
+        let from = format!("203.0.113.{}", 100 + n / 4);
+        let who = if n % 2 == 0 { "ana" } else { "nobody" };
+        assert_eq!(
+            begin_from(t, &t.svc, who, wrong, &from, now).await,
+            Err(PwError::SetupFailed),
+            "{n}"
+        );
+    }
+    for who in ["ana", "nobody"] {
+        assert!(matches!(
+            begin_from(t, &t.svc, who, &code, "203.0.113.200", now).await,
+            Err(PwError::TooMany { .. })
+        ));
+    }
+    begin_from(t, &t.svc, "ana", &code, AWAY, now)
         .await
-        .unwrap();
-    assert_eq!(overview.voided.len(), 1);
-    assert_eq!(
-        (
-            overview.voided[0].handle.as_str(),
-            overview.voided[0].wrong_guesses
-        ),
-        ("ana", 20)
-    );
-    // A fresh code is not held up by the guesses against the old one, from any address.
-    let at = now + Duration::seconds(5);
-    let fresh = t.issue(&Actor::web("ada"), "ana", at).await.unwrap();
-    begin_from(t, &t.svc, "ana", &fresh, "192.0.2.99", at)
-        .await
-        .expect("a fresh code works at once");
-    t.setup("ana", &fresh, PASSWORD, at).await;
-    // A void code is kept for the overview after it expires, and pruned after a week.
-    t.store()
-        .prune_passwords(now + Duration::days(2))
-        .await
-        .unwrap();
-    let still = t
-        .store()
-        .password_overview(now - Duration::days(7))
-        .await
-        .unwrap();
-    assert_eq!(still.voided.len(), 1);
+        .expect("another block begins");
+    begin_from(
+        t,
+        &t.svc,
+        "ana",
+        &code,
+        "203.0.113.200",
+        now + Duration::minutes(15),
+    )
+    .await
+    .expect("the block's window moves on");
 });
 
 // M3: with the open allowance full, an unknown name and a real account get the same answer:
