@@ -59,6 +59,8 @@ struct Upstream {
     next: AtomicUsize,
     /// The tool server's user database routes (tool server only).
     directory: FakeDirectory,
+    /// The bot marketplace's routes (the catalog, each PM's team), answered apart.
+    bots: support::FakeBots,
 }
 
 impl Upstream {
@@ -320,6 +322,9 @@ async fn toolserver(
     // The user database: answered apart, so the tests that count calls count what they
     // always did.
     if let Some(res) = up.directory.handle(&method, &uri, &body) {
+        return res;
+    }
+    if let Some(res) = up.bots.handle(&method, &uri, &headers, &body) {
         return res;
     }
     if uri.path() == "/internal/admin/events" {

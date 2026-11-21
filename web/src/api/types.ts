@@ -6,8 +6,13 @@ export type HintName = 'sources' | 'ask' | 'approve';
  * started, its three steps, skipped, and the one "Approved!" moment.
  */
 export type TourMark = 'tour_started' | 'tour_asked' | 'tour_opened' | 'tour_decided' | 'tour_skipped' | 'tour_cheered';
+/**
+ * The bot marketplace's marks (docs/web-api.md, "Me"): the "Pick your team" step finished or
+ * skipped, and the existing user's "New: pick your team" note dismissed.
+ */
+export type TeamMark = 'team_picked' | 'team_skipped' | 'team_announced';
 /** Anything `POST /api/me/hints` can mark seen. */
-export type SeenName = HintName | TourMark;
+export type SeenName = HintName | TourMark | TeamMark;
 
 export interface Me {
   handle: string;
@@ -26,6 +31,18 @@ export interface Me {
   permissions?: string[];
   /** True when the person holds the reviewer role: show Reviews. An older server leaves it out: treat that as false. */
   reviewer?: boolean;
+  // The bot marketplace (docs/web-api.md, "Me" and "Bots"). An older server leaves these out:
+  // treat that as `team: ['nudge']`, `ask_persona: 'nudge'` and both `show_…` false.
+  /** Keys of the offered bots on the person's team, `nudge` first; `[]` without `ask-bot`. */
+  team?: string[];
+  /** The picker's default: the last bot asked if still on the team, else `nudge`; null without `ask-bot`. */
+  ask_persona?: string | null;
+  /** The team couldn't be read just now: offer Nudge only. */
+  team_unavailable?: boolean;
+  /** Route Today to the "Pick your team" step once. */
+  show_team_step?: boolean;
+  /** Show the dismissible "New: pick your team" note on Today. */
+  show_team_note?: boolean;
 }
 
 export type DraftKind = 'confluence_page' | 'jira_issue' | 'slack_reply' | 'slack_message';
@@ -41,6 +58,10 @@ export interface DraftSummary {
   expires_at: string | null;
   task_id: string | null;
   practice: boolean;
+  /** The bot that drafted it, by key; null is Nudge. An older server leaves it out: Nudge. */
+  persona?: string | null;
+  /** False for a bot no longer offered (show "A bot no longer offered"). */
+  persona_offered?: boolean;
 }
 
 export interface Source {
@@ -133,6 +154,9 @@ export interface ReviewSummary {
   restricted: boolean;
   /** The version of the draft's text, 1 as drafted. Null from an older tool server. */
   revision: number | null;
+  /** The bot that drafted it, by key; null is Nudge. Kept for a restricted draft. */
+  persona?: string | null;
+  persona_offered?: boolean;
   title?: string | null;
   edited?: boolean;
   /** 64 lowercase hex: send it back with `revision`. */
@@ -216,6 +240,80 @@ export interface Task {
   retrying?: boolean;
   /** Absent in the list answer. */
   events?: TaskEvent[];
+  /** The bot the task ran as, by key; null is Nudge. An older server leaves it out: Nudge. */
+  persona?: string | null;
+  persona_offered?: boolean;
+}
+
+// ---- The bot marketplace (docs/web-api.md, "Bots") ----
+
+/** A data source a bot would use but PM OS doesn't have. `label` and `without` are untrusted text. */
+export interface BotNeed {
+  source: string;
+  label: string;
+  without: string;
+  met: boolean;
+}
+
+/** One of the person's own routines that runs as a bot (read only). */
+export interface BotRoutine {
+  id: string;
+  enabled: boolean;
+  cron: string | null;
+  tz: string | null;
+  prompt: string | null;
+  next_run_at: string | null;
+}
+
+/** Usage of a bot on the person's team. */
+export interface BotUsage {
+  drafts_this_month: number;
+  /** Null hides "last used". */
+  last_used_at: string | null;
+  /** Null: the runtime couldn't say. */
+  routines: BotRoutine[] | null;
+}
+
+/** An offered bot. Every string from the catalog is untrusted content: render as plain text. */
+export interface BotCard extends BotUsage {
+  key: string;
+  display_name: string;
+  title: string;
+  mascot: string;
+  always_on: boolean;
+  summary: string;
+  examples: string[];
+  can_do: string[];
+  reads: string[];
+  drafts: string[];
+  needs: BotNeed[];
+  on_team: boolean;
+  added_at: string | null;
+  added_via: 'onboarding' | 'bots_page' | 'picker' | 'seed' | null;
+  /** Always false in this version. */
+  new: boolean;
+}
+
+/** A bot on the person's team that is no longer offered: "No longer offered", Remove only. */
+export interface WithdrawnBot extends BotUsage {
+  key: string;
+  added_at: string | null;
+  added_via: string | null;
+}
+
+/** `GET /api/bots` and `PUT /api/me/team`. */
+export interface Bots {
+  bots: BotCard[];
+  withdrawn: WithdrawnBot[];
+}
+
+/** `PUT /api/me/team`. */
+export interface TeamChange {
+  add?: string[];
+  remove?: string[];
+  via: 'onboarding' | 'bots_page' | 'picker';
+  /** What happens to a removed bot's routines; the server's default is `nudge`. */
+  routines?: 'nudge' | 'pause';
 }
 
 export interface BriefChange {
@@ -287,6 +385,10 @@ export const SERVER_ERROR_CODES = {
   no_suggestion: 'yes',
   not_practice: 'yes',
   task_refused: 'yes',
+  bot_not_on_team: 'yes',
+  bot_unavailable: 'yes',
+  always_on: 'yes',
+  team_full: 'yes',
   bad_content_type: 'yes',
   bad_edit: 'yes',
   bad_brief: 'yes',

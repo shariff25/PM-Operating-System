@@ -53,6 +53,8 @@ struct Tools {
     mode: AtomicUsize,
     /// The user database's routes (who is signed in, with which roles).
     directory: support::FakeDirectory,
+    /// The bot marketplace's routes (the catalog, each PM's team), answered apart.
+    bots: support::FakeBots,
     /// A refusal the Admin API's writes answer with, instead of success.
     refuse: Mutex<Option<(u16, String)>>,
 }
@@ -100,6 +102,9 @@ async fn toolserver(
     body: Bytes,
 ) -> Response {
     if let Some(res) = tools.directory.handle(&method, &uri, &body) {
+        return res;
+    }
+    if let Some(res) = tools.bots.handle(&method, &uri, &headers, &body) {
         return res;
     }
     tools.calls.lock().unwrap().push(Call {
