@@ -5,8 +5,10 @@
 //!   PHC string (`$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`), so the parameters travel with
 //!   the hash. A stored hash below the current parameters is re-hashed at the next correct
 //!   sign-in ([`needs_rehash`]).
-//! - **Rules** ([`check_new`]): 12 to 128 characters, any characters, no composition rules; not
-//!   the handle, the sign-in name or its local part, and not one of [`COMMON`].
+//! - **Rules** ([`check_new`]): at least 12 characters not counting whitespace at either end
+//!   and counting a run of whitespace once ([`collapsed`]), at most 128 as typed; any
+//!   characters, no composition rules; not the handle, the sign-in name or its local part, and
+//!   not one of [`COMMON`] (with or without its spaces). The rules never change what is hashed.
 //! - The work runs on the blocking pool (the caller does that, `password::PasswordService`),
 //!   never on the async executor.
 //! - Never logged, never in an error: errors here are fixed words. Inputs are taken by
@@ -77,7 +79,9 @@ impl Weak {
 
     pub fn message(self) -> &'static str {
         match self {
-            Self::TooShort => "a password needs at least 12 characters",
+            Self::TooShort => {
+                "a password needs at least 12 characters, not counting spaces at either end, and a run of spaces counts once"
+            }
             Self::TooLong => "a password may have at most 128 characters",
             Self::MatchesName => "a password can't be your handle or sign-in name",
             Self::Common => "that password is one of the most common ones; choose another",
@@ -183,16 +187,41 @@ pub fn common_count() -> usize {
     common_set().len()
 }
 
-/// Check a new password for `handle` (with `sign_in_name`, when they have one).
-pub fn check_new(password: &str, handle: &str, sign_in_name: Option<&str>) -> Result<(), Weak> {
-    let chars = password.chars().count();
-    if chars < MIN_LEN {
-        return Err(Weak::TooShort);
+/// `password` as the rules read it (the gate review of 8e8f8fe, M3): whitespace at either end
+/// dropped and every run of whitespace inside made one space. Whitespace is Unicode's
+/// `White_Space` (spaces, tabs, line breaks, the no-break and ideographic spaces and the other
+/// Unicode spaces), as [`char::is_whitespace`] reads it. For the rules only: what is hashed,
+/// and checked at sign-in, is always exactly what the person typed.
+pub fn collapsed(password: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(password.len()));
+    for word in password.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
     }
-    if chars > MAX_LEN {
+    out
+}
+
+/// Check a new password for `handle` (with `sign_in_name`, when they have one).
+///
+/// The length is counted on [`collapsed`] (M3): twelve spaces, or a short word padded with
+/// spaces to twelve, is too short. The name and common-list checks are made on the collapsed
+/// text lower-cased, and again with every space taken out, so `password` padded with spaces,
+/// or `pass word 1234`, is refused as the common password it is. Not normalised: Unicode
+/// compatibility forms (NFKC: full-width letters, ligatures) and characters that aren't
+/// whitespace but show nothing (a zero-width space): `docs/password-sign-in.md`, "The rules
+/// for a password".
+pub fn check_new(password: &str, handle: &str, sign_in_name: Option<&str>) -> Result<(), Weak> {
+    if password.chars().count() > MAX_LEN {
         return Err(Weak::TooLong);
     }
-    let lowered = Zeroizing::new(password.trim().to_lowercase());
+    let collapsed = collapsed(password);
+    if collapsed.chars().count() < MIN_LEN {
+        return Err(Weak::TooShort);
+    }
+    let lowered = Zeroizing::new(collapsed.to_lowercase());
+    let joined = Zeroizing::new(lowered.replace(' ', ""));
     let mut names = vec![handle.to_lowercase()];
     if let Some(name) = sign_in_name {
         let name = name.to_lowercase();
@@ -201,10 +230,14 @@ pub fn check_new(password: &str, handle: &str, sign_in_name: Option<&str>) -> Re
         }
         names.push(name);
     }
-    if names.iter().any(|n| !n.is_empty() && *n == *lowered) {
+    let forms = [lowered.as_str(), joined.as_str()];
+    if names
+        .iter()
+        .any(|n| !n.is_empty() && forms.contains(&n.as_str()))
+    {
         return Err(Weak::MatchesName);
     }
-    if is_common(&lowered) {
+    if forms.iter().any(|f| is_common(f)) {
         return Err(Weak::Common);
     }
     Ok(())
@@ -307,8 +340,9 @@ mod tests {
         assert_eq!(ok(&"x".repeat(129)), Err(Weak::TooLong));
         assert_eq!(ok(&"x".repeat(128)), Ok(()));
         assert_eq!(ok("ANA.SILVA@example.com"), Err(Weak::MatchesName));
-        // Spaces around a name don't make it another password.
-        assert_eq!(ok("ana.silva   "), Err(Weak::MatchesName));
+        // Spaces around a name don't make it another password (nor long enough: M3).
+        assert_eq!(ok("ana.silva   "), Err(Weak::TooShort));
+        assert_eq!(ok("   ana.silva@example.com   "), Err(Weak::MatchesName));
         assert_eq!(
             check_new("ana.silva.pmos", "ana", Some("ana.silva.pmos@x.io")),
             Err(Weak::MatchesName)
@@ -320,7 +354,36 @@ mod tests {
         assert_eq!(ok("Password1234"), Err(Weak::Common));
         assert_eq!(ok("correct horse battery staple"), Ok(()));
         // No composition rules: any characters, spaces included.
-        assert_eq!(ok("            a"), Ok(()));
+        assert_eq!(ok("plum kettle orbit 42"), Ok(()));
+        assert_eq!(ok("plum\tkettle\u{3000}orbit 42"), Ok(()));
+        // M3 (the gate review of 8e8f8fe): spaces don't make up the length. Before, this
+        // asserted that twelve spaces and a letter were accepted; it now asserts the refusal.
+        assert_eq!(ok("            a"), Err(Weak::TooShort));
+        assert_eq!(ok(&" ".repeat(12)), Err(Weak::TooShort));
+        assert_eq!(ok(&" ".repeat(40)), Err(Weak::TooShort));
+        assert_eq!(ok("password    "), Err(Weak::TooShort));
+        assert_eq!(ok("    password    "), Err(Weak::TooShort));
+        assert_eq!(ok("ab          cd"), Err(Weak::TooShort), "runs count once");
+        // Unicode whitespace too: tabs, line breaks, no-break and ideographic spaces.
+        assert_eq!(
+            ok("pass\u{a0}\u{a0}\u{a0}\u{a0}\u{3000}\t\n\u{2003}word"),
+            Err(Weak::TooShort)
+        );
+        // Common ones padded, or spaced out inside, are still common.
+        assert_eq!(ok("password1234    "), Err(Weak::Common));
+        assert_eq!(ok("password   1234"), Err(Weak::Common));
+        assert_eq!(ok("p a s s w o r d 1 2 3 4"), Err(Weak::Common));
+        assert_eq!(ok("password\u{a0}1234"), Err(Weak::Common));
+        assert_eq!(ok("ana . silva @ example . com"), Err(Weak::MatchesName));
+        // Not normalised (documented): compatibility forms and invisible characters.
+        assert_eq!(ok("ｐａｓｓｗｏｒｄ１２３４"), Ok(()));
+        assert_eq!(ok("password\u{200b}1234"), Ok(()));
+        // At most 128 as typed: spaces count there, since they are hashed.
+        assert_eq!(
+            ok(&format!("{}{}", "x".repeat(20), " ".repeat(109))),
+            Err(Weak::TooLong)
+        );
+        assert_eq!(collapsed("  a \t b\u{3000}\u{3000}c  ").as_str(), "a b c");
         for c in COMMON {
             assert!(c.chars().count() >= MIN_LEN, "{c}");
             assert_eq!(c, c.to_lowercase());
