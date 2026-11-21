@@ -189,6 +189,11 @@ pub struct Approval {
     /// An older tool server doesn't send it.
     #[serde(default)]
     pub revision: Option<i64>,
+    /// Held (slice M1): pending, drafted by a bot no longer offered, and not released by an
+    /// Admin. The owner may reject it; approving or editing it is refused (`409 held`). The
+    /// tool server leaves the field out otherwise.
+    #[serde(default)]
+    pub held: bool,
     /// Reviewers' live recommendations on the draft (slice U6a), as its owner reads them. An
     /// older tool server doesn't send them.
     #[serde(default)]

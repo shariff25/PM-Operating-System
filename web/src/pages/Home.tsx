@@ -291,6 +291,7 @@ function DecideRow({ d, now }: { d: DraftSummary; now: number }) {
           <span className="row-meta">{whereText}</span>
         </span>
         {d.practice && <span className="tag">{copy.home.practiceBadge}</span>}
+        {d.held && <span className="tag tag-warn" title={copy.home.heldBadgeNote}>{copy.home.heldBadge}<span className="sr-only">: {copy.home.heldBadgeNote}</span></span>}
         <BotBy persona={d.persona} offered={d.persona_offered} className="row-bot" />
         <span className={`row-when ${left ? 'row-when-warn' : ''}`}>
           {left ? <><Icon name="clock" size={13} />{left}</> : relTime(d.created_at, now)}

@@ -1,6 +1,7 @@
 import { copy } from '../copy';
 import { ApiError } from './types';
 import type {
+  AdminBots,
   AdminOverview,
   Api,
   AuditPage,
@@ -36,7 +37,7 @@ import type { ContentFileText, ContentView, Harness, PolicyView, ProposalList, P
 /** The query string for an audit route. Empty values are left out, as the server counts them as absent. */
 export function auditQueryString(q: AuditQuery): string {
   const p = new URLSearchParams();
-  for (const key of ['actor', 'action', 'outcome', 'from', 'to', 'before'] as const) {
+  for (const key of ['actor', 'action', 'outcome', 'persona', 'from', 'to', 'before'] as const) {
     const v = q[key];
     if (v) p.set(key, v);
   }
@@ -221,6 +222,8 @@ export function createRealClient(opts: RealOptions = {}): Api {
     },
     adminTeam: () => call<TeamList>('GET', '/admin/team'),
     adminConnectors: async () => (await call<{ connectors: Connector[] }>('GET', '/admin/connectors')).connectors,
+    adminBots: () => call<AdminBots>('GET', '/admin/bots'),
+    adminReleaseHeld: (id) => call<{ id: string; released: true }>('POST', `/admin/bots/drafts/${seg(id)}/release`),
 
     adminUsers: () => call<UserList>('GET', '/admin/users'),
     adminInvite: (input) => post<Written>('/admin/users', input),

@@ -21,7 +21,7 @@ describe('admin navigation and access', () => {
     renderApp({ role: 'admin', hash: '/admin' });
     await screen.findByRole('heading', { level: 1, name: A.sections.overview });
     const sub = within(nav()).getByRole('list', { name: A.subnavLabel });
-    expect(within(sub).getAllByRole('link').map((a) => a.textContent)).toEqual(['Overview', 'Audit log', 'Team', 'Connectors', 'Policy', 'Content and harness']);
+    expect(within(sub).getAllByRole('link').map((a) => a.textContent)).toEqual(['Overview', 'Audit log', 'Team', 'Bots', 'Connectors', 'Policy', 'Content and harness']);
     expect(within(sub).getByRole('link', { name: 'Overview' })).toHaveAttribute('aria-current', 'page');
   });
 
@@ -434,7 +434,7 @@ describe('audit export', () => {
     expect(saveBlob.mock.calls[0]![1]).toBe('pmos-audit.csv');
     expect(seen[0]).toEqual({ outcome: 'denied', from: '2026-11-01T00:00:00.000Z' });
     const csv = await (saveBlob.mock.calls[0]![0] as Blob).text();
-    expect(csv.split('\r\n')[0]).toBe('"at","actor","client","action","system","target","outcome","detail","sources","titled_sources","skill","bot","task_id","id"');
+    expect(csv.split('\r\n')[0]).toBe('"at","actor","client","action","system","target","outcome","detail","sources","titled_sources","skill","bot","task_id","id","persona"');
   });
 
   it('tells the person when the export was cut at the row cap', async () => {

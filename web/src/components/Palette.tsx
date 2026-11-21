@@ -16,6 +16,7 @@ const ADMIN_ICONS: Record<AdminSection, IconName> = {
   overview: 'shield',
   audit: 'activity',
   team: 'followups',
+  bots: 'cpu',
   connectors: 'globe',
   policy: 'shield',
   content: 'layers',

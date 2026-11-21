@@ -437,16 +437,26 @@ document.
 | `GET /api/drafts/{id}/suggestion` | | `{suggestion: Suggestion \| null}` |
 | `POST /api/drafts/{id}/suggestion/accept` | | `Draft`, with the suggested text as its body, saved as an edit is (`PUT` above): at the tool server, so every surface shows it. The save names the revision task, so the tool server raises the draft's sensitivity to what that task read (it never lowers it): a revision that read a restricted document can't then be posted to a channel with people outside the team (`409 audience_blocked`). The revision task itself starts at the draft's own level |
 | `POST /api/drafts/{id}/suggestion/reject` | | `Draft`, unchanged |
-| `POST /api/drafts/{id}/approve` | `{confirm_external?: bool, version?: string}` | `Draft` with `status: "approved"` and `result_url`. Refusals (nothing was sent): `409 needs_external_confirm`, `409 audience_blocked`, `409 expired`, `409 not_pending`, `409 stale`, `409 not_approvable`, `422 bad_edit`, `503 audience_unavailable`, `503 unavailable`, `403 not_a_member`. **Outcome unknown:** `502` or `504 unknown_outcome` (see **Error codes**). |
+| `POST /api/drafts/{id}/approve` | `{confirm_external?: bool, version?: string}` | `Draft` with `status: "approved"` and `result_url`. Refusals (nothing was sent): `409 needs_external_confirm`, `409 audience_blocked`, `409 expired`, `409 not_pending`, `409 stale`, `409 not_approvable`, `409 held`, `422 bad_edit`, `503 audience_unavailable`, `503 unavailable`, `403 not_a_member`. **Outcome unknown:** `502` or `504 unknown_outcome` (see **Error codes**). |
 | `POST /api/drafts/{id}/reject` | `{reason?}` | `Draft` with `status: "rejected"`. `reason` is one of `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft`, `other`. The same refusals and `unknown_outcome` as approve, where they apply. |
 | `POST /api/drafts/practice` | | `Draft`, a practice draft for this PM. Idempotent while one exists. |
 | `DELETE /api/drafts/{id}` | | `204`, practice drafts only; `409 not_practice` otherwise. |
+
+**Held drafts** (slice A1; `docs/bot-marketplace-spec.md` §6, "Removal"). A pending draft
+whose bot was withdrawn from the catalog (or deleted from it), and that no Admin released, is
+**on hold**: `held: true` on its `DraftSummary` (and so on its `Draft`), `false` on every
+other draft. Its owner may still reject it. Approving it, saving an edit (`PUT`), asking for a
+change (`POST …/changes`) and accepting a suggestion are refused by `pmos-web` itself with `409
+held` before anything is sent; a draft whose bot is withdrawn between the read and the decision
+gets the tool server's own refusal, answered as the same `409 held`. It is decidable again once
+the bot is offered again or an Admin releases it (**Admin: bots**).
 
 ```json
 // DraftSummary
 {"id": "apr_…", "kind": "confluence_page", "title": "PRD: TCB grace period setting",
  "bot": "pm-ana", "status": "pending", "created_at": "…", "expires_at": null,
- "task_id": "tsk_…", "practice": false, "persona": "chief", "persona_offered": true}
+ "task_id": "tsk_…", "practice": false, "persona": "chief", "persona_offered": true,
+ "held": false}
 
 // Draft = DraftSummary plus
 {"body": "markdown", "edited": false, "edited_at": null,
@@ -919,6 +929,8 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `409` | `bot_unavailable` | A bot that isn't offered any more (withdrawn, deleted, or unknown): adding it, asking it, or making it the picker's default (**Bots**). | Yes |
 | `409` | `always_on` | A team change naming Nudge: it is always on the team (**Bots**). | Yes |
 | `409` | `team_full` | A team change that would put more than 16 bots on the team (**Bots**). | Yes |
+| `409` | `held` | Approving, editing or asking for a change to a draft on hold: the bot that drafted it is no longer offered (**Drafts**, "Held drafts"). It can still be rejected. | Yes |
+| `409` | `not_held` | An admin releasing a draft that isn't on hold (decided, its bot offered again, or already released) (**Admin: bots**). | Yes |
 | `409` | `github_not_linked` | An admin proposal: the admin hasn't linked GitHub in PM OS. Pull requests are opened as them; `error` says how to link. | Yes |
 | `409` | `stale_base` | An admin proposal or validation made from a copy that differs from the server's or the default branch's (**Admin: policy**). | Yes |
 | `422` | `invalid` | An admin proposal that doesn't pass validation (`errors`, `warnings`). Also a malformed value in an admin's user or role change, and a reviewer's note over 1,000 characters. | Yes |
@@ -987,6 +999,9 @@ tool server checks them again in its own tables:
 | `GET /api/admin/users` | yes (addresses included) | yes (no addresses) | `403 forbidden` |
 | `GET /api/admin/overview` | yes | yes | `403 forbidden` |
 | `GET /api/admin/connectors` | yes | `403 forbidden` | `403 forbidden` |
+| `GET /api/admin/bots` | yes | yes | `403 forbidden` |
+
+`GET /api/admin/bots` and its one write are described in **Admin: bots**.
 
 The checks are the permission matrix: `audit` needs `view-audit-log`, `audit/export`
 `export-audit`, `team` and `overview` `view-audit-log` or `manage-members`, `connectors`
@@ -1028,12 +1043,14 @@ Audit events, newest first, one page at a time.
 | `actor` | a handle (`A–Z a–z 0–9 . _ -`, at most 64) | Only this person's events (a team bot's service identity is `bots.<name>`). |
 | `action` | a tool name such as `jira.create_issue` (`A–Z a–z 0–9 . _ -`, at most 100) | Only this action. |
 | `outcome` | one of the outcomes below | Only this outcome. |
+| `persona` | a marketplace bot's key, such as `chief` (slice A1) | Only the events of that bot's sessions, drafts and decisions. `nudge` is `400 bad_request`: Nudge's events carry no key (filter by `actor` or `action`). |
 | `from` | RFC 3339 time | Events at or after it. |
 | `to` | RFC 3339 time | Events strictly before it. |
 
 Unknown parameters are ignored; an empty value counts as absent. `400 bad_request` for a
 `limit` outside 1–100 or not a number, an unknown `outcome`, a malformed time, `from` after
-`to`, or an `actor`, `action` or `before` with other characters. A `before` the tool server
+`to`, a `persona` that isn't a key (or is `nudge`), or an `actor`, `action` or `before` with
+other characters. A `before` the tool server
 doesn't recognise is also `400 bad_request`.
 
 ```json
@@ -1069,12 +1086,14 @@ last. Every field below is always present.
 | `titled_sources` | integer ≥ 0 | How many of those had a title recorded. **Only the count:** a title is a Jira issue's summary or a page's title, which can carry content, so titles are never served. |
 | `skill` | string or `null` | The run's skill, for a skill session. |
 | `bot` | string or `null` | The run's bot, for a bot session. |
+| `persona` | string or `null` | The marketplace bot the event belongs to, by key (slice A1): a persona session's calls, its drafts, their decisions and releases. `null` for Nudge and for events of no bot; a value not shaped like a key is served as `null`. |
 | `task_id` | string | The run: a task id (`tsk_…`) for bot tasks, a run id otherwise, `admin` for admin reads. Not a link: an auditor can't open tasks. |
 
 ### `GET /api/admin/audit/export`
 
 The same events as CSV, newest first. Takes the same filters as `GET /api/admin/audit`
-(`from`, `to`, `actor`, `action`, `outcome`, with the same `400`s), not `limit` or `before`.
+(`from`, `to`, `actor`, `action`, `outcome`, `persona`, with the same `400`s), not `limit` or
+`before`.
 Needs `export-audit`.
 
 - `200`, `Content-Type: text/csv; charset=utf-8`,
@@ -1084,14 +1103,15 @@ Needs `export-audit`.
   rows, the header row not counted.
 - A header row, then one row per event, every line ending `\r\n`. Columns, in order: `at`,
   `actor`, `client`, `action`, `system`, `target`, `outcome`, `detail`, `sources`,
-  `titled_sources`, `skill`, `bot`, `task_id`, `id` (the fields above; `null` is an empty cell).
+  `titled_sources`, `skill`, `bot`, `task_id`, `id`, `persona` (the fields above; `null` is an
+  empty cell). `persona` (slice A1) is last, so the columns before it keep their places.
 - Every cell is quoted, with `"` doubled. **Formula-safe:** a cell starting with `=`, `+`, `-`,
   `@`, a tab or a carriage return gets a leading `'`, so a spreadsheet shows it as text.
 - Errors are JSON, as above.
 
 ```
-"at","actor","client","action","system","target","outcome","detail","sources","titled_sources","skill","bot","task_id","id"
-"2026-11-16T09:05:12.481Z","ana","web","jira.create_issue","jira","https://acme.atlassian.net/browse/PAY-301","approved","edited before approval","3","2","","pm-ana","tsk_01JD…","ev_8812"
+"at","actor","client","action","system","target","outcome","detail","sources","titled_sources","skill","bot","task_id","id","persona"
+"2026-11-16T09:05:12.481Z","ana","web","jira.create_issue","jira","https://acme.atlassian.net/browse/PAY-301","approved","edited before approval","3","2","","pm-ana","tsk_01JD…","ev_8812","chief"
 ```
 
 The app downloads it with `fetch` (the session cookie goes along) and saves the blob, or links
@@ -1224,6 +1244,59 @@ tasks, with no team-wide read, so `pmos-web` can't count them.
 - **A read refused by `pmos-web` itself** (a `400`, or its own `403`) never reaches the tool
   server, so it is only in `pmos-web`'s log, not the audit log.
 - **No free-text search**; `actor` and `action` match exactly.
+
+## Admin: bots
+
+The Admin's view of the bot marketplace (slice A1; `docs/bot-marketplace-spec.md` §8, "The
+admin view"): every bot in the catalog, offered or not, who has it on their team, and the
+drafts on hold because their bot was withdrawn. Offering or withdrawing a bot is a content
+change by pull request (`offered` in its `PERSONA.md`, through **Admin: content and harness**);
+nothing here changes the catalog or anyone's team. The one write is releasing a held draft.
+
+| Method and path | Who | Answer |
+| --- | --- | --- |
+| `GET /api/admin/bots` | `view-audit-log` or `manage-members` (Admin, Auditor); others `403 forbidden` before the tool server is asked | `AdminBots` (below). Read from the tool server's `GET /internal/admin/personas?user=<viewer>`, signed for the viewer, which checks the role again and records `admin.personas_read`. `502 upstream_unavailable` when it can't be read. |
+| `POST /api/admin/bots/drafts/{id}/release` | `edit-content` (an Admin); others `403 forbidden` before the tool server is asked. No body. Origin and CSRF as every write | `{id, released: true}`, never the draft. Passed to `POST /internal/admin/personas/drafts/{id}/release?user=<admin>`, signed for the admin, which checks again (an active person with `edit-content`), needs assertion `require`, and records `approvals.release_hold`. Errors: `404 not_found` (a malformed or practice id is never sent), `409 not_held`, `403 forbidden`, `503 assertion_required`, `503 unavailable`. |
+
+```json
+// AdminBots
+{"bots": [
+   {"key": "chief", "display_name": "Chief", "mascot": "chief",
+    "state": "preview", "offered": true, "always_on": false, "preview": true,
+    "users": 4, "handles": ["ana", "ben", "dana", "ravi"],
+    "needs": [{"source": "analytics", "label": "an analytics source", "met": false}],
+    "drafts_30d": 23, "name_clashes": [],
+    "held": [],
+    "path": "content/personas/chief/PERSONA.md",
+    "lint": {"status": "ok", "errors": 0, "warnings": 0}},
+   {"key": "scout", "display_name": "Scout", "mascot": "nudge", "state": "withdrawn", …,
+    "held": [{"id": "apr_…", "user": "ana", "kind": "confluence_page",
+              "tool": "confluence.create_draft", "created_at": "2026-11-21T08:00:00Z"}]}],
+ "unknown": [{"key": "atlas", "users": 1, "handles": ["ravi"], "drafts_30d": 0, "held": []}],
+ "held_total": 1, "can_release": true, "can_edit_content": true}
+```
+
+- `bots` is the catalog in its order, Nudge first. `state` is `withdrawn` when `offered` is
+  `false`, else `preview` when `preview` is `true` ("not yet benchmarked"), else `offered`.
+  Nudge's `users` and `handles` are `null` (it is on every team).
+- `handles` lists every person with a team row for the bot, a deactivated person's included;
+  `name_clashes` the handles of people whose handle or display name reads as the bot's key or
+  name (a Slack prefix could be ambiguous).
+- `held` lists the bot's drafts on hold, newest first: id, owner, kind (`null` for a tool that
+  isn't a draft kind) and when it was drafted. **Never a title, text or arguments.** At most 200
+  are listed in all; `held_total` counts every one.
+- `path` is the bot's file for the content admin; `lint` is that file's lint status in
+  `pmos-web`'s content checkout (counts only, never a finding's message), `null` when the
+  checkout can't be read.
+- `unknown` lists keys that team rows or held drafts still name but the catalog no longer has
+  (a deleted `PERSONA.md`): the rows grant nothing.
+- `display_name` and `needs[].label` are catalog content: shown as plain text.
+- `can_release` and `can_edit_content` say whether the viewer holds `edit-content`.
+
+**What releasing means.** The draft's owner may then approve or edit it like any other draft,
+under their own personal bot's rules (the decision checks the item's bot and the personal role,
+never the withdrawn bot). Nothing is sent until they approve. It is one draft, once: a release
+can't be undone, and the bot stays withdrawn.
 
 ## Admin: users and roles
 

@@ -11,9 +11,17 @@ describe('audit filters and the address', () => {
   });
 
   it('reads them back, so a bookmark opens the same view', () => {
-    const f = { actor: 'ana', action: 'jira.create_issue', outcome: 'approved', from: '2026-11-01', to: '2026-11-16' };
+    const f = { actor: 'ana', action: 'jira.create_issue', outcome: 'approved', persona: 'chief', from: '2026-11-01', to: '2026-11-16' };
     expect(parseFilters(filtersToSearch(f))).toEqual(f);
     expect(parseFilters('?actor=ana')).toEqual({ ...NO_FILTERS, actor: 'ana' });
+  });
+
+  it('takes a bot key, but never nudge or a malformed one', () => {
+    expect(parseFilters('persona=chief').persona).toBe('chief');
+    expect(toQuery(parseFilters('persona=chief')).persona).toBe('chief');
+    for (const bad of ['nudge', 'Chief', 'a b', 'a--b', '<b>', 'x'.repeat(33)]) {
+      expect(parseFilters(`persona=${encodeURIComponent(bad)}`).persona, bad).toBe('');
+    }
   });
 
   it('drops anything malformed instead of sending it', () => {

@@ -1587,7 +1587,7 @@ async fn the_admin_read_is_keys_handles_and_counts(f: &Fixture, _: Option<&TestP
     assert_eq!(find("nudge")["users"], Value::Null);
     assert_eq!(
         v["unknown"],
-        json!([{"key": "gone-bot", "users": 1, "handles": ["bo"], "drafts_30d": 0}])
+        json!([{"key": "gone-bot", "users": 1, "handles": ["bo"], "drafts_30d": 0, "held": []}])
     );
     // Drafts in the last 30 days (the draft is dated by the fixture's clock).
     let recent = (Utc::now() - now()).num_days() < 30;
@@ -2369,3 +2369,103 @@ async fn the_audit_view_shows_team_changes_and_personas() {
     let call = rows.iter().find(|e| e["task_id"] == "tsk_v").unwrap();
     assert_eq!(call["persona"], "quill");
 }
+
+/// Slice A1: the admin view lists each held draft (metadata only) under its bot, and drops it
+/// once it is released or decided; the audit search filters by persona and never matches
+/// Nudge's events (they carry none).
+async fn the_admin_view_lists_held_drafts_and_the_audit_filters_by_bot(
+    f: &Fixture,
+    _: Option<&TestPg>,
+) {
+    add(f, "ana", &["quill"]).await.unwrap();
+    let s = persona_session(f, "ana", "pm-ana", Some("quill"), "tsk_a1")
+        .await
+        .unwrap();
+    let first = jira_draft(f, &s).await;
+    let second = jira_draft(f, &s).await;
+    let nudge = persona_session(f, "ana", "pm-ana", None, "tsk_a1_n")
+        .await
+        .unwrap();
+    jira_draft(f, &nudge).await;
+    let quill = |v: &Value| {
+        v["personas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["key"] == "quill")
+            .cloned()
+            .unwrap()
+    };
+    // Offered: nothing is held.
+    let v = f.svc.admin_personas(Utc::now()).await.unwrap();
+    assert_eq!(quill(&v)["held"], json!([]));
+    assert!(quill(&v)["mascot"].is_string(), "{}", quill(&v));
+    assert_eq!(v["held_total"], 0);
+
+    withdraw(f, "quill");
+    let v = f.svc.admin_personas(Utc::now()).await.unwrap();
+    let held = quill(&v)["held"].as_array().unwrap().clone();
+    let ids: Vec<&str> = held.iter().map(|h| h["id"].as_str().unwrap()).collect();
+    assert_eq!(ids.len(), 2, "{v}");
+    assert!(ids.contains(&first.as_str()) && ids.contains(&second.as_str()));
+    for h in &held {
+        let mut keys: Vec<&str> = h.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["created_at", "id", "tool", "user"],
+            "metadata only: {h}"
+        );
+        assert_eq!(h["user"], "ana");
+        assert_eq!(h["tool"], "jira.create_issue");
+    }
+    assert_eq!(v["held_total"], 2);
+    for p in v["personas"].as_array().unwrap() {
+        if p["key"] != "quill" {
+            assert_eq!(p["held"], json!([]), "{p}");
+        }
+    }
+    // Released or decided: no longer listed.
+    f.svc
+        .release_held_draft(Client::Web, "ada", &first, now())
+        .await
+        .unwrap();
+    f.svc
+        .decide(&second, "ana", Decision::Reject, None, now())
+        .await
+        .unwrap();
+    let v = f.svc.admin_personas(Utc::now()).await.unwrap();
+    assert_eq!(quill(&v)["held"], json!([]));
+    assert_eq!(v["held_total"], 0);
+
+    // The audit search by persona: Quill's events only, never Nudge's.
+    let search = |persona: &str| AuditQuery {
+        limit: 500,
+        persona: Some(persona.into()),
+        ..Default::default()
+    };
+    let found = f
+        .stores
+        .audit
+        .search(&search("quill"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!found.is_empty());
+    assert!(found
+        .iter()
+        .all(|e| e.event.persona.as_deref() == Some("quill")));
+    let all = events(f).await;
+    assert!(all
+        .iter()
+        .any(|e| e.persona.is_none() && e.bot.as_deref() == Some("pm-ana")));
+    let none = f
+        .stores
+        .audit
+        .search(&search("nudge"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(none.is_empty(), "Nudge's events carry no persona");
+}
+both!(the_admin_view_lists_held_drafts_and_the_audit_filters_by_bot);

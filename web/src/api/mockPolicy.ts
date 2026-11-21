@@ -1,6 +1,7 @@
 // Sample data for Admin: policy, content and harness (docs/web-api.md). Fake names only.
 // The content tree is generated from a small spec; validation really regenerates each bot's
 // allowances from the changed tree and compares them, so widenings in the sample data are real.
+import { MOCK_CATALOG } from './mockBots';
 import { unifiedDiff } from '../admin/unified';
 import { ApiError } from './types';
 import type {
@@ -130,11 +131,19 @@ const STATIC_FILES: Record<string, string> = {
   'content/templates/one-pager.md': '---\ntitle: "One-pager"\nowner: "TODO"\nversion: "0.1.0"\n---\n\n# {{title}}\n\nWhat, why, who, when.\n',
   'content/reviewers/security.md': '---\ntitle: "Security reviewer"\nowner: "ada"\nversion: "0.2.0"\n---\n\n# Security reviewer\n\nCheck every change that widens what a bot may reach.\n',
   'content/skills/prd/template.md': '# PRD skeleton\n\nThe skill fills these sections in order.\n',
+  // The bot marketplace's catalog: one PERSONA.md per bot (the sample's Scout is withdrawn).
+  ...Object.fromEntries(
+    MOCK_CATALOG.map((c, i) => [
+      `content/personas/${c.key}/PERSONA.md`,
+      `---\nname: ${c.key}\ndisplay-name: ${c.display_name}\ntitle: ${c.title}\nrole: ${c.always_on ? 'pm-assistant' : c.key === 'chief' ? 'chief-of-staff' : `${c.key}-pm`}\nmascot: ${c.mascot === 'unknown' ? 'nudge' : c.mascot}\nowner: "ada"\nversion: "0.1.0"\noffered: ${c.offered}\n${c.always_on ? 'always-on: true\n' : ''}${c.preview ? 'preview: true\n' : ''}order: ${i * 10}\nsummary: ${c.summary}\n---\n\n# ${c.display_name}\n\nNotes for whoever maintains this bot.\n`,
+    ]),
+  ),
 };
 
 function kindOf(path: string): string {
   if (/^content\/roles\/[^/]+\/ROLE\.md$/.test(path)) return 'role';
   if (/^content\/bots\/[^/]+\/BOT\.md$/.test(path)) return 'bot';
+  if (/^content\/personas\/[^/]+\/PERSONA\.md$/.test(path)) return 'persona';
   if (/^content\/skills\/[^/]+\/SKILL\.md$/.test(path)) return 'skill';
   if (path.startsWith('content/skills/')) return 'skill_file';
   if (path.startsWith('content/playbooks/')) return 'playbook';
