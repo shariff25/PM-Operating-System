@@ -464,6 +464,19 @@ async fn a_wrong_or_stale_proxy_setting_is_refused_and_counted() {
     assert_eq!(w.password_calls(), 0, "the tool server wasn't asked");
     let ready = w.send(Method::GET, "/readyz", &[], None).await;
     assert_eq!(ready.body["untrusted_proxy_refusals"], 4, "{}", ready.body);
+    // GL3 (the gate review of 04c175f): a warning an operator and `pmos-admin status` see,
+    // while the refusals are recent. It never makes the server unready by itself (this test
+    // serves no bot runtime, so it isn't ready here for that reason alone).
+    assert_eq!(
+        ready.body["warnings"],
+        json!(["untrusted_proxy_refusals"]),
+        "{}",
+        ready.body
+    );
+    *w.clock.lock().unwrap() += Duration::minutes(15);
+    let ready = w.send(Method::GET, "/readyz", &[], None).await;
+    assert_eq!(ready.body["warnings"], json!([]), "15 quiet minutes on");
+    assert_eq!(ready.body["untrusted_proxy_refusals"], 4, "the count stays");
     // Nothing forwarded: counted by its own address, as before.
     assert_eq!(w.sign_in(&[], RIGHT).await.status, StatusCode::OK);
     assert_eq!(w.sources(), [json!("127.0.0.1")]);

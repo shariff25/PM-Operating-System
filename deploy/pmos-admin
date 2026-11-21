@@ -158,8 +158,10 @@ ipv4_in_subnet() {
 # to start unless it is told that address (PMOS_WEB_TRUSTED_PROXIES) and has an https:// public
 # URL. This refuses, with the exact fix, before anything starts: a blank setting; a network
 # made before its gateway was pinned (its real gateway isn't PMOS_NETWORK_GATEWAY); and a
-# trusted address that is neither the real gateway nor inside the pinned subnet (a proxy in a
-# container on the pmos network), which would make pmos-web refuse every browser.
+# trusted address that is neither the real gateway nor inside the pinned subnet, which would
+# make pmos-web refuse every browser. An address inside the subnet (a proxy in a container on
+# the pmos network) needs PMOS_WEB_TRUST_PROXY_IN_NETWORK=1 and is warned about every time
+# (the gate review of 04c175f, GL4): Docker hands those addresses out.
 password_web_checks() {
   [ "${PMOS_WEB_PASSWORD_LOGIN:-0}" = 1 ] || return 0
   local bad=0 real want subnet entry
@@ -194,7 +196,33 @@ password_web_checks() {
     for entry in "${list[@]}"; do
       entry=${entry//[[:space:]]/}
       [ -n "$entry" ] || continue
-      if [ "$entry" != "$real" ] && ! ipv4_in_subnet "$entry" "$subnet"; then
+      [ "$entry" = "$real" ] && continue
+      # The gate review of 04c175f (GL4): only the gateway by default. An address inside the
+      # subnet (a proxy in a container on the pmos network) is assigned by Docker and can be
+      # handed to another container after a restart, which would then be believed about its
+      # X-Forwarded-For: it needs PMOS_WEB_TRUST_PROXY_IN_NETWORK=1, and a warning every time.
+      if ipv4_in_subnet "$entry" "$subnet" && [ "${PMOS_WEB_TRUST_PROXY_IN_NETWORK:-0}" = 1 ]; then
+        {
+          say "WARNING: PMOS_WEB_TRUSTED_PROXIES names $entry, an address inside the pmos network"
+          say "($subnet), trusted because PMOS_WEB_TRUST_PROXY_IN_NETWORK=1. Docker assigns those"
+          say "addresses: pin the proxy container's address (ipv4_address in compose), or any"
+          say "container that later gets $entry is believed about which browser it speaks for."
+        } >&2
+        continue
+      fi
+      if ipv4_in_subnet "$entry" "$subnet"; then
+        {
+          say "PMOS_WEB_TRUSTED_PROXIES names $entry, an address inside the pmos network ($subnet)."
+          say "Only the network's gateway, $real, is trusted by default: Docker assigns the other"
+          say "addresses, and whichever container holds $entry would be believed about which"
+          say "browser it speaks for. A reverse proxy on this host reaches the web app from the"
+          say "gateway; set:"
+          say "  PMOS_WEB_TRUSTED_PROXIES=$real"
+          say "A reverse proxy in a container on the pmos network with a pinned address: also set"
+          say "  PMOS_WEB_TRUST_PROXY_IN_NETWORK=1"
+        } >&2
+        bad=1
+      else
         {
           say "PMOS_WEB_TRUSTED_PROXIES names $entry, but the reverse proxy on this host reaches the"
           say "web app from the pmos network's gateway, $real. pmos-web would refuse every browser"
@@ -385,6 +413,17 @@ case "$cmd" in
       code=${body##*$'\n'}
       body=${body%$'\n'*}
       if [ "$code" = 200 ]; then row "$1" ok "${body:0:90}"; else row "$1" "$code" "${body:0:90}"; fi
+      # A readiness warning (the web app's GL3: password requests refused proxy_not_trusted
+      # in the last 15 minutes): ready, but every browser behind that proxy is refused.
+      if [[ "$body" == *'"warnings":["'* ]]; then
+        local w=${body#*\"warnings\":[}
+        w=${w%%]*}
+        row "$1" WARN "${w//\"/}"
+        if [[ "$w" == *untrusted_proxy_refusals* ]]; then
+          row "" "" "password sign-ins are refused proxy_not_trusted: PMOS_WEB_TRUSTED_PROXIES must be"
+          row "" "" "where the reverse proxy reaches the web app from (docs/password-sign-in.md)"
+        fi
+      fi
     }
     check toolserver http://127.0.0.1:8710/readyz
     check gateway http://127.0.0.1:8740/readyz
