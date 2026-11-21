@@ -292,6 +292,8 @@ struct AuditParams {
     outcome: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    /// A marketplace bot's key: only the events of its sessions, drafts and decisions.
+    persona: Option<String>,
     /// `export`: the CSV export, which needs [`Permission::ExportAudit`].
     purpose: Option<String>,
 }
@@ -328,6 +330,11 @@ fn audit_query(q: &AuditParams) -> Result<AuditQuery, String> {
             return Err("`from` must not be after `to`".into());
         }
     }
+    let persona = match param(&q.persona) {
+        None => None,
+        Some(p) if pmos_contract::bots::valid_name(&p) => Some(p),
+        Some(_) => return Err("`persona` must be a bot's key, such as chief".into()),
+    };
     Ok(AuditQuery {
         before,
         limit,
@@ -336,6 +343,7 @@ fn audit_query(q: &AuditParams) -> Result<AuditQuery, String> {
         outcome,
         from,
         to,
+        persona,
     })
 }
 
@@ -760,6 +768,7 @@ async fn identity_conflicts(
         outcome: None,
         from: Some(since),
         to: None,
+        persona: None,
     };
     Ok(state
         .svc
@@ -795,6 +804,7 @@ async fn first_links(
         outcome: Some(Outcome::Ok),
         from: Some(since),
         to: None,
+        persona: None,
     };
     Ok(state
         .svc

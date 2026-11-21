@@ -6,7 +6,7 @@ const as = (role: keyof typeof MOCK_PERMISSIONS) => ({ permissions: MOCK_PERMISS
 
 describe('what each role may open', () => {
   it('gives an admin every part, the export, and both kinds of proposal', () => {
-    expect(sectionsFor(as('admin'))).toEqual(['overview', 'audit', 'team', 'connectors', 'policy', 'content']);
+    expect(sectionsFor(as('admin'))).toEqual(['overview', 'audit', 'team', 'bots', 'connectors', 'policy', 'content']);
     expect(canAdminister(as('admin'))).toBe(true);
     expect(canExport(as('admin'))).toBe(true);
     expect(canEditPolicy(as('admin'))).toBe(true);
@@ -14,7 +14,7 @@ describe('what each role may open', () => {
   });
 
   it('gives an auditor everything but the connectors, and lets them read policy and content but not propose', () => {
-    expect(sectionsFor(as('auditor'))).toEqual(['overview', 'audit', 'team', 'policy', 'content']);
+    expect(sectionsFor(as('auditor'))).toEqual(['overview', 'audit', 'team', 'bots', 'policy', 'content']);
     expect(canSee(as('auditor'), 'connectors')).toBe(false);
     expect(canAdminister(as('auditor'))).toBe(true);
     expect(canExport(as('auditor'))).toBe(true);

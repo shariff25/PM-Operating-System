@@ -62,6 +62,11 @@ export interface DraftSummary {
   persona?: string | null;
   /** False for a bot no longer offered (show "A bot no longer offered"). */
   persona_offered?: boolean;
+  /**
+   * On hold: the bot that drafted it was withdrawn. It can be rejected; approving or editing it
+   * answers `409 held` until an admin releases it or the bot is offered again. Absent: false.
+   */
+  held?: boolean;
 }
 
 export interface Source {
@@ -394,6 +399,8 @@ export const SERVER_ERROR_CODES = {
   bot_unavailable: 'yes',
   always_on: 'yes',
   team_full: 'yes',
+  held: 'yes',
+  not_held: 'yes',
   bad_content_type: 'yes',
   bad_edit: 'yes',
   bad_brief: 'yes',
@@ -487,6 +494,8 @@ export interface AuditEvent {
   skill: string | null;
   bot: string | null;
   task_id: string;
+  /** The marketplace bot of the event, by key; null for Nudge and events of no bot. An older server leaves it out. */
+  persona?: string | null;
 }
 
 /** The query the audit routes take. `before` is the opaque cursor from the page before. */
@@ -498,8 +507,75 @@ export interface AuditQuery {
   from?: string;
   /** RFC 3339, events strictly before it. */
   to?: string;
+  /** A marketplace bot's key (never `nudge`: Nudge's events carry none). */
+  persona?: string;
   limit?: number;
   before?: string;
+}
+
+// ---- Admin: bots (docs/web-api.md, "Admin: bots") ----
+
+/** A draft on hold because its bot was withdrawn. Metadata only: never its title or text. */
+export interface AdminHeldDraft {
+  id: string;
+  /** The draft's owner, by handle. */
+  user: string;
+  kind: DraftKind | null;
+  tool: string | null;
+  created_at: string | null;
+}
+
+/** A `PERSONA.md`'s lint status in the content checkout. */
+export interface AdminBotLint {
+  status: 'ok' | 'warning' | 'error';
+  errors: number;
+  warnings: number;
+}
+
+export type AdminBotState = 'offered' | 'preview' | 'withdrawn';
+
+/** One bot in the catalog, offered or not. `display_name` is catalog content: render as plain text. */
+export interface AdminBot {
+  key: string;
+  display_name: string;
+  mascot: string | null;
+  state: AdminBotState;
+  offered: boolean;
+  always_on: boolean;
+  preview: boolean;
+  /** Null for Nudge, which is on every team. */
+  users: number | null;
+  handles: string[] | null;
+  needs: { source: string; label: string; met: boolean }[];
+  drafts_30d: number;
+  /** People whose handle or name reads as this bot's. */
+  name_clashes: string[];
+  held: AdminHeldDraft[];
+  /** The bot's file in the content admin. */
+  path: string;
+  /** Null when the content checkout can't be read. */
+  lint: AdminBotLint | null;
+}
+
+/** A key that team rows or held drafts still name, but the catalog no longer has. */
+export interface AdminUnknownBot {
+  key: string;
+  users: number;
+  handles: string[];
+  drafts_30d: number;
+  held: AdminHeldDraft[];
+}
+
+/** `GET /api/admin/bots`. */
+export interface AdminBots {
+  bots: AdminBot[];
+  unknown: AdminUnknownBot[];
+  /** Every held draft; the lists above hold at most 200 of them. */
+  held_total: number;
+  /** The viewer may release a held draft (an admin). */
+  can_release: boolean;
+  /** The viewer may change content (offer or withdraw a bot by pull request). */
+  can_edit_content: boolean;
 }
 
 export interface AuditPage {
@@ -846,6 +922,9 @@ export interface Api {
   adminAuditExport(query: AuditQuery): Promise<AuditExport>;
   adminTeam(): Promise<TeamList>;
   adminConnectors(): Promise<Connector[]>;
+  adminBots(): Promise<AdminBots>;
+  /** An admin releases a held draft, so its owner can approve or edit it again. */
+  adminReleaseHeld(id: string): Promise<{ id: string; released: true }>;
 
   adminUsers(): Promise<UserList>;
   adminInvite(input: NewUser): Promise<Written>;

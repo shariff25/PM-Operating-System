@@ -1,7 +1,7 @@
 # Bot marketplace: Chief, Sprout and Echo beside Nudge
 
-Status: **design spec; slices C1, B1, R1, W1, M1 and S1 built** (contract, lint and generator; the
-tool server; the runtime and harness; the `pmos-web` API; the reviewer's changes; Slack: §13, "Status"). The independent
+Status: **design spec; slices C1, B1, R1, W1, M1, S1, F2, F3 and A1 built** (contract, lint and generator; the
+tool server; the runtime and harness; the `pmos-web` API; the reviewer's changes; Slack; the screens; the Admin's view: §13, "Status"). The independent
 reviewer reviewed it on 2026-11-21 ("sound after changes"); M1 builds those changes and the
 owner's two decisions of that day (Chief, Sprout and Echo are offered as **Previews** until their
 eval run passes; Echo's pages carry "Draft for internal review. Not approved for external
@@ -1399,6 +1399,68 @@ line needing a read catalog.
 text or `username` display was seen); the real R1 runtime and B1 tool server (mocks built from
 `docs/bots-runtime.md` and the B1 and R1 notes above; the stack tests are not changed); any eval
 run (none has happened; nothing is claimed about any bot's quality).
+
+### Status: A1 is built (2026-11-21, branch `claude/market-a1-admin`)
+
+Built: in `crates/web`, `src/app/admin_bots.rs` (`GET /api/admin/bots` and `POST
+/api/admin/bots/drafts/{id}/release`); the audit route's `persona=` filter, the `persona` field
+on every event and the `persona` CSV column (`app/admin.rs`); `held` on `DraftSummary` (so on
+every `Draft`) and `409 held` on approve, edit, a requested change and an accepted suggestion
+(`app.rs`, `drafts.rs`, `upstream.rs`); in `crates/policy`, the content admin's file kind
+`persona` for `personas/<key>/PERSONA.md` (C1's departure 7). In `web/`: the Admin page **Bots**
+(`src/pages/admin/AdminBots.tsx`, route `#/admin/bots`, in the admin rail, the phone tabs, the
+palette and the overview's links), the audit log's **Bot** filter and the event's "Marketplace
+bot" field, the held draft on the draft page (a banner; Approve and Edit off with the reason; no
+change box; Reject open) and an "On hold" tag in Drafts and on Today, the `persona` kind in the
+content tree, the mock API (`mockAdmin.bots`, `release`, `heldDraft`, persona events, persona
+files in the content sample; dev server `?mock_held=1`), and the codes `held` and `not_held`.
+Docs: `docs/web-api.md` (**Admin: bots**, **Drafts** "Held drafts", the audit `persona`, the
+error codes), `docs/toolserver.md`, `docs/content-admin.md`.
+
+**Tool server changes (small; no migration):** A1 needed two things the tool server didn't
+have. (1) `AuditQuery.persona` and `GET /internal/admin/audit?persona=` (in memory and Postgres;
+B1 left the filter to A1). (2) The held drafts in `GET /internal/admin/personas`: each persona
+(and `unknown` key) gains `held: [{id, user, tool, created_at}]`, the answer `held_total`, and
+each persona `mascot`, from a new `ApprovalRepo::unreleased_pending_outside(offered, cap)`
+(both stores). Without it an Admin had no way to find a held draft's id. The literals of
+`AuditQuery` in the tool server's tests gained `persona: None`, and B1's
+`the_admin_read_is_keys_handles_and_counts` now expects `"held": []` on its `unknown` row.
+
+Tests: `crates/toolserver/tests/team.rs`
+`the_admin_view_lists_held_drafts_and_the_audit_filters_by_bot` (both stores);
+`crates/web/tests/bots.rs` (4: the view's role matrix and metadata-only answer, the release's
+role checks, CSRF, id check and every refusal mapped, a held draft refused locally on approve,
+edit and change with nothing written upstream and the tool server's `409 held` mapped, the audit
+filter, its refusals and the CSV column); unit tests in `app/admin_bots.rs` and
+`crates/policy/src/admin/access.rs`; `web/src/pages/admin/AdminBots.test.tsx` (8),
+`web/src/admin/filters.test.ts`; `web/e2e/admin-bots.spec.ts` (3 flows and axe in both themes at
+1280 and 390 px, with no sideways scroll).
+
+**Departures:**
+
+1. **The page is `web/src/pages/admin/AdminBots.tsx`**, beside the other admin pages, not
+   `web/src/admin/Bots.tsx`.
+2. **Held drafts are listed and released here**; §8 lists neither (M1 added holds after §8).
+   The release needs `edit-content` (M1's rule); an Auditor sees the held drafts without the
+   button. A held draft's title is never shown to the admin: id, owner, kind, tool and time only.
+3. **`pmos-web` is stricter than the tool server on a held draft:** saving an edit (`PUT`), a
+   requested change and accepting a suggestion are refused `409 held` locally (M1 still lets the
+   tool server save an edit), so "edit is unavailable" holds on every route.
+4. **Nudge isn't an audit filter.** `persona=nudge` is `400`: Nudge's events carry no persona, so
+   `persona IS NULL` would match every event of no bot as well. The filter's choices come from
+   `GET /api/admin/bots`, so opening the audit log also records an `admin.personas_read`.
+5. **The CSV's `persona` column is last** (after `id`) so existing columns keep their places.
+6. **`lint` is the file's status in `pmos-web`'s checkout** (counts, never messages), not the
+   tool server's; it is `null` when the checkout can't be read. The view has no "Change in
+   content" toggle: each row links to its `PERSONA.md` in the content admin ("Change" for an
+   Admin, "Open" for an Auditor), where offering or withdrawing becomes a pull request.
+7. **At most 200 held drafts are listed** (newest first); `held_total` counts all of them.
+8. **One fix outside the slice:** the draft page on a phone drew an empty recommendations box
+   when a draft had none; it is now drawn only when there are recommendations.
+
+**Not verified:** against a real tool server and `pmos-web` together (the routes are tested
+separately, with a mock tool server for `pmos-web`); the release with a real assertion
+`require` deployment; any eval run (none has happened).
 
 ### Order and parallelism
 

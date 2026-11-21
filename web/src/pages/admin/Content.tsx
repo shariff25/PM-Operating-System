@@ -40,6 +40,7 @@ const PROPOSALS_ID = 'content-proposals';
 const GROUP_OF: Record<string, string> = {
   role: 'role',
   bot: 'bot',
+  persona: 'persona',
   skill: 'skill',
   skill_file: 'skill',
   playbook: 'playbook',
@@ -49,10 +50,11 @@ const GROUP_OF: Record<string, string> = {
   master: 'master',
   personal_master: 'master',
 };
-const GROUPS = ['role', 'bot', 'skill', 'playbook', 'context', 'template', 'reviewer', 'master', 'other'];
+const GROUPS = ['role', 'bot', 'persona', 'skill', 'playbook', 'context', 'template', 'reviewer', 'master', 'other'];
 const GROUP_ICON: Record<string, IconName> = {
   role: 'followups',
   bot: 'cpu',
+  persona: 'mascot',
   skill: 'sparkle',
   playbook: 'docs',
   context: 'layers',

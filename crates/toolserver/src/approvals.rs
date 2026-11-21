@@ -609,6 +609,16 @@ pub trait ApprovalRepo: Send + Sync {
 
     /// Whether an Admin released item `id` from its persona's hold ([`Self::release_hold`]).
     async fn hold_released(&self, id: &str) -> StoreResult<bool>;
+
+    /// The pending items drafted by a persona **not** in `offered` that no Admin released,
+    /// newest first (ties by id), at most `cap`, with how many there are in all: with `offered`
+    /// the keys offered now, these are the held drafts ([`crate::service::ToolService::held`];
+    /// the admin view, slice A1). Nudge's items (`persona` NULL) are never among them.
+    async fn unreleased_pending_outside(
+        &self,
+        offered: &[String],
+        cap: usize,
+    ) -> StoreResult<(Vec<ApprovalItem>, usize)>;
 }
 
 /// Why `new` can't be stored on `item` as it is now, checked in this order by both stores:
@@ -1137,6 +1147,32 @@ impl ApprovalRepo for MemoryApprovals {
     async fn hold_released(&self, id: &str) -> StoreResult<bool> {
         let state = self.state.lock().expect("approvals lock");
         Ok(state.released.contains_key(id))
+    }
+
+    async fn unreleased_pending_outside(
+        &self,
+        offered: &[String],
+        cap: usize,
+    ) -> StoreResult<(Vec<ApprovalItem>, usize)> {
+        let state = self.state.lock().expect("approvals lock");
+        let mut found: Vec<_> = state
+            .items
+            .values()
+            .filter(|i| {
+                i.status == Status::Pending
+                    && i.persona.as_ref().is_some_and(|p| !offered.contains(p))
+                    && !state.released.contains_key(&i.id)
+            })
+            .cloned()
+            .collect();
+        found.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let total = found.len();
+        found.truncate(cap);
+        Ok((found, total))
     }
 
     async fn pending_of(

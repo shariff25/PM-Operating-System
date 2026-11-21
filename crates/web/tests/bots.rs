@@ -83,6 +83,15 @@ struct Mocks {
     refuse_persona: Mutex<Option<&'static str>>,
     /// The runtime refuses every routine change (`503`).
     routines_down: AtomicBool,
+    /// `GET /internal/admin/personas`'s answer (slice A1).
+    admin_personas: Mutex<Value>,
+    /// `POST /internal/admin/personas/drafts/{id}/release`'s answer: `(status, body)`; status
+    /// 0 is `200` with the item.
+    release_answer: Mutex<(u16, Value)>,
+    /// A decision answers `409` with this code.
+    refuse_decision: Mutex<Option<&'static str>>,
+    /// `GET /internal/admin/audit`'s events.
+    audit_events: Mutex<Vec<Value>>,
 }
 
 impl Mocks {
@@ -170,6 +179,44 @@ async fn toolserver(
         .into_response(),
         ("GET", "/internal/reviews/apr_r2") => {
             Json(review_item("apr_r2", Some("ghost"), true)).into_response()
+        }
+        ("GET", "/internal/admin/personas") => {
+            Json(m.admin_personas.lock().unwrap().clone()).into_response()
+        }
+        ("GET", "/internal/admin/audit") => {
+            Json(json!({"events": m.audit_events.lock().unwrap().clone(), "next": null}))
+                .into_response()
+        }
+        ("POST", path) if path.starts_with("/internal/admin/personas/drafts/") => {
+            let (status, body) = m.release_answer.lock().unwrap().clone();
+            if status == 0 {
+                Json(json!({"id": "apr_9", "args": {"summary": "SECRET draft text"}}))
+                    .into_response()
+            } else {
+                (StatusCode::from_u16(status).unwrap(), Json(body)).into_response()
+            }
+        }
+        ("POST", path) if path.ends_with("/decision") => {
+            match *m.refuse_decision.lock().unwrap() {
+                Some(code) => (
+                    StatusCode::CONFLICT,
+                    Json(json!({"code": code, "error": "SECRET tool server sentence"})),
+                )
+                    .into_response(),
+                None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+        ("GET", path) if path.starts_with("/internal/approvals/") => {
+            let id = path.trim_start_matches("/internal/approvals/");
+            m.approvals
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|a| a["id"] == json!(id))
+                .map_or_else(
+                    || StatusCode::NOT_FOUND.into_response(),
+                    |a| Json(a.clone()).into_response(),
+                )
         }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
@@ -1268,4 +1315,305 @@ async fn the_tool_server_unreachable_fails_closed() {
         (json!(false), json!(false))
     );
     assert!(w.m.calls("runtime").iter().all(|c| c.method == "GET"));
+}
+
+// ----- The Admin's view of the bots (slice A1) -----------------------------------------------
+
+fn admin_personas() -> Value {
+    json!({
+        "personas": [
+            {"key": "nudge", "display_name": "Nudge", "mascot": "nudge", "offered": true,
+             "always_on": true, "preview": false, "users": null, "handles": null, "needs": [],
+             "drafts_30d": 9, "name_clashes": [], "held": []},
+            {"key": "chief", "display_name": "Chief <b>", "mascot": "chief", "offered": true,
+             "always_on": false, "preview": true, "users": 2, "handles": ["ana", "ben"],
+             "needs": [], "drafts_30d": 4, "name_clashes": ["chief.lee"], "held": [],
+             "summary": "SECRET summary", "title": "SECRET title"},
+            {"key": "scout", "display_name": "Scout", "mascot": "nudge", "offered": false,
+             "always_on": false, "preview": false, "users": 1, "handles": ["ana"],
+             "needs": [{"source": "crm", "label": "a CRM", "met": false, "without": "SECRET"}],
+             "drafts_30d": 1, "name_clashes": [],
+             "held": [{"id": "apr_9", "user": "ana", "tool": "confluence.create_draft",
+                       "created_at": "2026-11-20T09:00:00Z", "args": {"body": "SECRET body"},
+                       "title": "SECRET title"}]}
+        ],
+        "unknown": [{"key": "gone-bot", "users": 1, "handles": ["ben"], "drafts_30d": 0,
+                     "held": [{"id": "apr_8", "user": "ben", "tool": "jira.create_issue",
+                               "created_at": "2026-11-19T09:00:00Z"}]}],
+        "held_total": 2
+    })
+}
+
+#[tokio::test]
+async fn the_admin_bots_view_is_for_admins_and_auditors_and_metadata_only() {
+    let w = web().await;
+    *w.m.admin_personas.lock().unwrap() = admin_personas();
+    for who in ["ana", "rex"] {
+        let c = w.login(who).await;
+        let before = w.m.calls("toolserver").len();
+        let r = w.get(&c, "/api/admin/bots").await;
+        assert_eq!(
+            (r.status, &r.body["code"]),
+            (StatusCode::FORBIDDEN, &json!("forbidden")),
+            "{who}"
+        );
+        let after: Vec<Call> = w.m.calls("toolserver")[before..].to_vec();
+        assert!(
+            after
+                .iter()
+                .all(|c| !c.uri.starts_with("/internal/admin/personas")),
+            "{who}: refused before the tool server"
+        );
+    }
+    for (who, may_release) in [("adam", true), ("audrey", false)] {
+        let c = w.login(who).await;
+        let r = w.get(&c, "/api/admin/bots").await;
+        assert_eq!(r.status, StatusCode::OK, "{who}: {}", r.text);
+        assert_eq!(r.body["can_release"], may_release, "{who}");
+        assert_eq!(r.body["can_edit_content"], may_release, "{who}");
+        // The read names the viewer.
+        let read =
+            w.m.calls("toolserver")
+                .into_iter()
+                .rev()
+                .find(|c| c.uri.starts_with("/internal/admin/personas"))
+                .unwrap();
+        assert_eq!(read.uri, format!("/internal/admin/personas?user={who}"));
+        let by = |key: &str| card(&r, key).clone();
+        assert_eq!(by("nudge")["state"], "offered");
+        assert_eq!(by("nudge")["users"], Value::Null);
+        assert_eq!(by("chief")["state"], "preview");
+        assert_eq!(
+            by("chief")["display_name"],
+            "Chief <b>",
+            "catalog text as sent"
+        );
+        assert_eq!(by("chief")["handles"], json!(["ana", "ben"]));
+        assert_eq!(by("chief")["name_clashes"], json!(["chief.lee"]));
+        assert_eq!(by("chief")["path"], "content/personas/chief/PERSONA.md");
+        let scout = by("scout");
+        assert_eq!(scout["state"], "withdrawn");
+        assert_eq!(
+            scout["needs"],
+            json!([{"source": "crm", "label": "a CRM", "met": false}])
+        );
+        assert_eq!(
+            scout["held"],
+            json!([{"id": "apr_9", "user": "ana", "kind": "confluence_page",
+                    "tool": "confluence.create_draft", "created_at": "2026-11-20T09:00:00Z"}])
+        );
+        assert_eq!(r.body["unknown"][0]["key"], "gone-bot");
+        assert_eq!(r.body["unknown"][0]["held"][0]["id"], "apr_8");
+        assert_eq!(r.body["held_total"], 2);
+        // Never a draft's text, a bot's summary or title, or a need's explanation.
+        assert!(!r.text.contains("SECRET"), "{who}: {}", r.text);
+    }
+    // The tool server's own refusal is the same answer.
+    *w.m.admin_personas.lock().unwrap() = Value::Null;
+    let c = w.login("adam").await;
+    let r = w.get(&c, "/api/admin/bots").await;
+    assert_eq!(r.status, StatusCode::BAD_GATEWAY, "{}", r.text);
+}
+
+#[tokio::test]
+async fn an_admin_releases_a_held_draft_through_the_tool_server() {
+    let w = web().await;
+    let path = "/api/admin/bots/drafts/apr_9/release";
+    // Only an Admin (edit-content): an Auditor and a PM are refused before the tool server.
+    for who in ["audrey", "ana"] {
+        let c = w.login(who).await;
+        let r = w.post(&c, path, &json!({})).await;
+        assert_eq!(
+            (r.status, &r.body["code"]),
+            (StatusCode::FORBIDDEN, &json!("forbidden")),
+            "{who}"
+        );
+    }
+    assert!(w
+        .m
+        .calls("toolserver")
+        .iter()
+        .all(|c| !c.uri.contains("/release")));
+    let c = w.login("adam").await;
+    // The CSRF token is required, as on every write.
+    let base = w.base.clone();
+    let r = w
+        .write(&c, Method::POST, path, &json!({}), Some(&base), false)
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text);
+    // A malformed id is never sent.
+    let r = w
+        .post(&c, "/api/admin/bots/drafts/apr%20x/release", &json!({}))
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(w
+        .m
+        .calls("toolserver")
+        .iter()
+        .all(|c| !c.uri.contains("/release")));
+    let r = w.post(&c, path, &json!({})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    assert_eq!(r.body, json!({"id": "apr_9", "released": true}));
+    assert!(!r.text.contains("SECRET"), "never the draft");
+    let sent =
+        w.m.calls("toolserver")
+            .into_iter()
+            .find(|c| c.uri.contains("/release"))
+            .unwrap();
+    assert_eq!(sent.method, "POST");
+    assert_eq!(
+        sent.uri,
+        "/internal/admin/personas/drafts/apr_9/release?user=adam"
+    );
+    // The tool server's refusals, worded here.
+    for (status, code, want_status, want_code) in [
+        (409, "not_held", StatusCode::CONFLICT, "not_held"),
+        (403, "forbidden", StatusCode::FORBIDDEN, "forbidden"),
+        (404, "not_found", StatusCode::NOT_FOUND, "not_found"),
+        (
+            503,
+            "assertion_required",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "assertion_required",
+        ),
+    ] {
+        *w.m.release_answer.lock().unwrap() = (
+            status,
+            json!({"code": code, "error": "SECRET tool server sentence"}),
+        );
+        let r = w.post(&c, path, &json!({})).await;
+        assert_eq!(
+            (r.status, r.body["code"].as_str()),
+            (want_status, Some(want_code)),
+            "{code}"
+        );
+        assert!(!r.text.contains("SECRET"));
+    }
+}
+
+#[tokio::test]
+async fn a_held_draft_says_so_and_cannot_be_approved_or_edited() {
+    let w = web().await;
+    let item = |id: &str, held: bool| {
+        let mut v = json!({"id": id, "user": "ana", "bot": "pm-ana", "run_id": "tsk_1",
+               "tool": "jira.create_issue", "persona": "scout",
+               "args": {"project": "PM", "issue_type": "Story", "summary": "Fake", "description": "Fake."},
+               "args_hash": HASH, "status": "pending", "created_at": "2026-11-20T09:00:00Z"});
+        if held {
+            v["held"] = json!(true);
+        }
+        v
+    };
+    *w.m.approvals.lock().unwrap() = vec![item("apr_h", true), item("apr_n", false)];
+    let c = w.login("ana").await;
+    let r = w.get(&c, "/api/drafts").await;
+    let drafts = r.body["drafts"].as_array().unwrap().clone();
+    let held_of = |id: &str| {
+        drafts
+            .iter()
+            .find(|d| d["id"] == json!(id))
+            .map(|d| d["held"].clone())
+            .unwrap()
+    };
+    assert_eq!(held_of("apr_h"), true);
+    assert_eq!(held_of("apr_n"), false);
+    let r = w.get(&c, "/api/drafts/apr_h").await;
+    assert_eq!(r.body["held"], true, "{}", r.text);
+    // Approving or editing a held draft is refused here; nothing reaches the tool server.
+    let before = w.m.calls("toolserver").len();
+    let r = w.post(&c, "/api/drafts/apr_h/approve", &json!({})).await;
+    assert_eq!(
+        (r.status, &r.body["code"]),
+        (StatusCode::CONFLICT, &json!("held")),
+        "{}",
+        r.text
+    );
+    let r = w
+        .put(
+            &c,
+            "/api/drafts/apr_h",
+            &json!({"title": "Fake", "body": "Edited."}),
+        )
+        .await;
+    assert_eq!(
+        (r.status, &r.body["code"]),
+        (StatusCode::CONFLICT, &json!("held")),
+        "{}",
+        r.text
+    );
+    let r = w
+        .post(
+            &c,
+            "/api/drafts/apr_h/changes",
+            &json!({"instruction": "shorter"}),
+        )
+        .await;
+    assert_eq!(
+        (r.status, &r.body["code"]),
+        (StatusCode::CONFLICT, &json!("held")),
+        "{}",
+        r.text
+    );
+    let sent: Vec<Call> = w.m.calls("toolserver")[before..].to_vec();
+    assert!(
+        sent.iter().all(|c| c.method == "GET"),
+        "only reads: {:?}",
+        sent.iter().map(|c| (&c.method, &c.uri)).collect::<Vec<_>>()
+    );
+    assert!(w.m.calls("runtime").iter().all(|c| c.method == "GET"));
+    // Withdrawn between the read and the decision: the tool server's `409 held`, worded here.
+    *w.m.refuse_decision.lock().unwrap() = Some("held");
+    let r = w.post(&c, "/api/drafts/apr_n/approve", &json!({})).await;
+    assert_eq!(
+        (r.status, &r.body["code"]),
+        (StatusCode::CONFLICT, &json!("held")),
+        "{}",
+        r.text
+    );
+    assert!(!r.text.contains("SECRET"));
+    assert!(r.body["error"].as_str().unwrap().contains("on hold"));
+}
+
+#[tokio::test]
+async fn the_audit_log_filters_by_bot_and_shows_it() {
+    let w = web().await;
+    let event = |id: &str, persona: Value| {
+        json!({"id": id, "at": "2026-11-20T09:00:00Z", "actor": "ana", "client": "mcp",
+               "action": "jira.search", "system": "jira", "target": null, "outcome": "ok",
+               "detail": null, "sources": 0, "titled_sources": 0, "skill": null,
+               "bot": "pm-ana", "task_id": "run_1", "persona": persona})
+    };
+    *w.m.audit_events.lock().unwrap() = vec![
+        event("ev_1", json!("chief")),
+        event("ev_2", Value::Null),
+        event("ev_3", json!("<b>bad</b>")),
+    ];
+    let c = w.login("audrey").await;
+    let r = w.get(&c, "/api/admin/audit?persona=chief").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let sent =
+        w.m.calls("toolserver")
+            .into_iter()
+            .rev()
+            .find(|c| c.uri.starts_with("/internal/admin/audit"))
+            .unwrap();
+    assert!(sent.uri.contains("persona=chief"), "{}", sent.uri);
+    let events = r.body["events"].as_array().unwrap();
+    assert_eq!(events[0]["persona"], "chief");
+    assert_eq!(events[1]["persona"], Value::Null);
+    assert_eq!(events[2]["persona"], Value::Null, "not shaped like a key");
+    for bad in ["nudge", "Bad%20Key", "a/b"] {
+        let r = w.get(&c, &format!("/api/admin/audit?persona={bad}")).await;
+        assert_eq!(
+            (r.status, &r.body["code"]),
+            (StatusCode::BAD_REQUEST, &json!("bad_request")),
+            "{bad}"
+        );
+    }
+    // The export has the column, last.
+    let r = w.get(&c, "/api/admin/audit/export?persona=chief").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let header = r.text.lines().next().unwrap();
+    assert!(header.ends_with("\"id\",\"persona\""), "{header}");
+    assert!(r.text.lines().nth(1).unwrap().ends_with("\"chief\""));
 }

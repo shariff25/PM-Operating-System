@@ -73,6 +73,8 @@ export interface MockOptions extends MockAdminOptions, MockPolicyOptions, MockPa
   audienceDrafts?: boolean;
   /** List at most this many pending drafts, as the tool server does past its safety cap: the list then says it is truncated. */
   listCap?: number;
+  /** Add a pending draft by Scout, a bot an admin withdrew: it is on hold until an admin releases it. */
+  heldDraft?: boolean;
 }
 
 /** A draft as the sample data writes it: the fields every draft gets the same way are filled in by `add`. */
@@ -387,6 +389,28 @@ export function createMockClient(options: MockOptions = {}): Api {
   attribute('apr_slack_old', 'chief');
   attribute('apr_done', options.withdrawnBot ? 'scout' : 'chief');
 
+  if (options.heldDraft) {
+    add({
+      id: 'apr_held',
+      kind: 'confluence_page',
+      title: 'Customer research notes, November',
+      bot: 'pm-ana',
+      status: 'pending',
+      created_at: iso(now0 - 5 * HOUR),
+      expires_at: null,
+      task_id: null,
+      practice: false,
+      body: '## What customers asked about\n\n- Fake: exports in more formats\n- Fake: a clearer billing page\n',
+      edited: false,
+      target: { system: 'confluence', label: 'Space PM, under “Research”', url: null },
+      sources: sources().slice(0, 2),
+      result_url: null,
+      external: false,
+      persona: 'scout',
+      held: true,
+    });
+  }
+
   if (options.hostile) {
     add({
       id: 'apr_hostile',
@@ -511,10 +535,16 @@ export function createMockClient(options: MockOptions = {}): Api {
     const {
       id, kind, title, bot, status, created_at, expires_at, task_id, practice,
     } = d;
-    return { id, kind, title, bot, status, created_at, expires_at, task_id, practice, persona: d.persona ?? null, persona_offered: team.offered(d.persona) };
+    return { id, kind, title, bot, status, created_at, expires_at, task_id, practice, persona: d.persona ?? null, persona_offered: team.offered(d.persona), held: isHeld(d) };
   };
+  /** On hold while pending: its bot was withdrawn and no admin released it. */
+  const isHeld = (d: Draft) => d.status === 'pending' && d.held === true;
   const pendingOnly = (d: Draft) => {
     if (d.status !== 'pending') throw new ApiError(409, 'not_pending', 'This draft has already been decided.');
+  };
+  /** What pmos-web refuses before anything is sent: approving or editing a held draft. */
+  const notHeld = (d: Draft) => {
+    if (isHeld(d)) throw new ApiError(409, 'held', 'This draft is on hold: the bot that drafted it is not offered any more.');
   };
 
   function makeDraftFromTask(text: string, taskId: string, persona: string | null): Draft {
@@ -647,7 +677,7 @@ export function createMockClient(options: MockOptions = {}): Api {
   const reviews = createMockReviews(now0, drafts, { hostile: options.hostile, reviewError: options.reviewError });
   /** A draft as its owner reads it: with the advice reviewers gave on it. */
   const out = (d: Draft): Draft =>
-    clone({ ...d, persona: d.persona ?? null, persona_offered: team.offered(d.persona), recommendations: reviews.recommendationsFor(d) });
+    clone({ ...d, persona: d.persona ?? null, persona_offered: team.offered(d.persona), held: isHeld(d), recommendations: reviews.recommendationsFor(d) });
   /** The reviewer routes: anyone without the reviewer role is refused by pmos-web itself. */
   const needReviewer = () => {
     guard();
@@ -847,6 +877,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       const d = find(id);
       pendingOnly(d);
+      notHeld(d);
       // The server removes any marker it is sent, and an edited draft cites nothing.
       d.body = stripMarkers(input.body);
       if (input.title !== undefined) d.title = stripMarkers(input.title);
@@ -862,6 +893,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       const d = find(id);
       pendingOnly(d);
+      notHeld(d);
       if (suggestions.get(id)?.s.status === 'working') {
         throw new ApiError(409, 'change_in_progress', 'I am still working on your last change.');
       }
@@ -904,6 +936,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       const d = find(id);
       pendingOnly(d);
+      notHeld(d);
       const entry = suggestions.get(id);
       if (!entry || entry.s.status !== 'ready' || entry.s.body === null) {
         throw new ApiError(409, 'no_suggestion', 'There is no suggestion to accept.');
@@ -929,6 +962,7 @@ export function createMockClient(options: MockOptions = {}): Api {
       guard();
       const d = find(id);
       pendingOnly(d);
+      notHeld(d);
       if (d.expires_at && Date.parse(d.expires_at) < Date.now()) {
         d.status = 'expired';
         throw new ApiError(409, 'expired', 'This Slack draft expired after 24 hours, so it was not sent.');
@@ -1120,6 +1154,21 @@ export function createMockClient(options: MockOptions = {}): Api {
       await wait();
       need('manage-connectors');
       return admin.connectors();
+    },
+    async adminBots() {
+      await wait();
+      need('view-audit-log', 'manage-members');
+      return admin.bots((me.permissions ?? []).includes('edit-content'));
+    },
+    async adminReleaseHeld(id) {
+      await wait();
+      write();
+      need('edit-content');
+      const own = drafts.get(id);
+      const released = admin.release(id) || (own !== undefined && isHeld(own));
+      if (!released) throw new ApiError(409, 'not_held', 'This draft is not on hold.');
+      if (own) own.held = false;
+      return { id, released: true as const };
     },
 
     async adminUsers() {

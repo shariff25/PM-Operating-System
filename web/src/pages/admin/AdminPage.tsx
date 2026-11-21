@@ -2,6 +2,7 @@ import { canSee, sectionsFor } from '../../admin/access';
 import type { AdminSection } from '../../admin/access';
 import { useApp } from '../../app-context';
 import type { PolicyPart } from '../../url';
+import { AdminBots } from './AdminBots';
 import { AuditLog } from './AuditLog';
 import { Connectors } from './Connectors';
 import { Content } from './Content';
@@ -24,6 +25,8 @@ export function AdminPage({ section, search, sub }: { section: AdminSection; sea
       return <AuditLog search={search} />;
     case 'team':
       return <Team search={search} />;
+    case 'bots':
+      return <AdminBots />;
     case 'connectors':
       return <Connectors />;
     case 'policy':
