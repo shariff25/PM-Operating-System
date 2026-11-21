@@ -1,4 +1,4 @@
-//! What the web app keeps per PM: hints seen, nudges, the mascot, whether they have opened a draft yet,
+//! What the web app keeps per PM: hints seen, nudges, the mascot, the picker's last bot, whether they have opened a draft yet,
 //! the practice draft and its edit, and change suggestions. (A real draft's edit is saved on
 //! the item at the tool server, so every surface shows it: `app.rs`, `save_edit`.)
 //!
@@ -73,6 +73,10 @@ pub struct UserState {
     pub external: BTreeSet<String>,
     /// Tasks this backend made to revise drafts; hidden from the PM's task list.
     pub revision_tasks: BTreeSet<String>,
+    /// The bot the ask box's picker last asked (a persona key; `None` is Nudge). A preference
+    /// only, never a decision: `GET /api/me` falls back to Nudge when it is no longer on the
+    /// PM's team, and every ask is checked again.
+    pub ask_persona: Option<String>,
 }
 
 impl Default for UserState {
@@ -87,6 +91,7 @@ impl Default for UserState {
             practice: None,
             external: BTreeSet::new(),
             revision_tasks: BTreeSet::new(),
+            ask_persona: None,
         }
     }
 }

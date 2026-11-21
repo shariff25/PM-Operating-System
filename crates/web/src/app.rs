@@ -51,6 +51,7 @@ use crate::upstream::{
 };
 
 mod admin;
+mod bots;
 mod brief;
 mod content;
 mod password;
@@ -80,7 +81,7 @@ pub const REJECT_REASONS: [&str; 6] = [
 /// What the app can mark seen: the three one-time hints, then the guided start's own marks
 /// (started, each of its three steps, skipped, and the one "Approved!" moment). `DELETE
 /// /api/me/hints` clears them all, which is how "Show hints again" restarts the guided start.
-pub const HINTS: [&str; 9] = [
+pub const HINTS: [&str; 12] = [
     "sources",
     "ask",
     "approve",
@@ -90,6 +91,11 @@ pub const HINTS: [&str; 9] = [
     "tour_decided",
     "tour_skipped",
     "tour_cheered",
+    // The bot marketplace (docs/web-api.md, "Me"): the "Pick your team" step was finished or
+    // skipped, and the existing user's "New: pick your team" note was dismissed.
+    "team_picked",
+    "team_skipped",
+    "team_announced",
 ];
 
 /// The tool server's `409` codes passed through on approve.
@@ -171,6 +177,8 @@ struct Inner {
     trusted_proxies: Vec<std::net::IpAddr>,
     /// Password sign-in's per-address limit.
     sources: password::SourceLimiter,
+    /// The bot catalog's last read, for attribution (`app/bots.rs`).
+    catalog: std::sync::Mutex<Option<(std::time::Instant, Arc<bots::Catalog>)>>,
 }
 
 #[derive(Clone)]
@@ -311,6 +319,7 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         password_login: config.password_login,
         trusted_proxies: config.trusted_proxies,
         sources: Default::default(),
+        catalog: Default::default(),
     }));
     let api = Router::new()
         .route("/auth/providers", get(auth_providers))
@@ -336,6 +345,7 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{id}", get(get_task))
         .merge(brief::routes())
+        .merge(bots::routes())
         .merge(admin::routes())
         .merge(users::routes())
         .merge(reviews::routes())
@@ -1603,8 +1613,9 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult 
 
 // Me.
 
-fn me_json(signed: &Signed, st: &UserState) -> Response {
-    Json(json!({
+async fn me_json(state: &AppState, signed: &Signed, st: &UserState) -> Response {
+    let team = bots::me_team(state, signed).await;
+    let mut body = json!({
         "handle": signed.member.handle,
         // Untrusted text from the user database, rendered as plain text by the app.
         "display_name": signed.member.display_name,
@@ -1619,8 +1630,11 @@ fn me_json(signed: &Signed, st: &UserState) -> Response {
         "hints_seen": st.hints_seen.iter().collect::<Vec<_>>(),
         "nudges": st.nudges,
         "mascot": st.mascot,
-    }))
-    .into_response()
+    });
+    if let Some(o) = body.as_object_mut() {
+        o.extend(bots::me_fields(st, &team));
+    }
+    Json(body).into_response()
 }
 
 /// `GET /api/me`: from the user database (a fresh answer, or on the last-known-good path at
@@ -1632,7 +1646,7 @@ async fn me(State(state): State<AppState>, SignedRead(signed): SignedRead) -> Ap
         .get(signed.handle())
         .await
         .map_err(ApiError::store)?;
-    Ok(me_json(&signed, &st))
+    Ok(me_json(&state, &signed, &st).await)
 }
 
 #[derive(Deserialize, Default)]
@@ -1640,10 +1654,22 @@ async fn me(State(state): State<AppState>, SignedRead(signed): SignedRead) -> Ap
 struct SettingsBody {
     nudges: Option<bool>,
     mascot: Option<bool>,
+    /// The picker's bot: a key on the PM's team (`409 bot_not_on_team` otherwise).
+    ask_persona: Option<String>,
 }
 
 async fn put_settings(State(state): State<AppState>, signed: Signed, body: Bytes) -> ApiResult {
     let req: SettingsBody = parse_optional(&body)?;
+    // `Some(None)` sets Nudge; `None` leaves it.
+    let ask_persona = match req.ask_persona.as_deref() {
+        None => None,
+        Some(key) => {
+            signed.need(Permission::AskBot)?;
+            let key = bots::requested_key(key)?;
+            bots::check_on_team(&state, &signed, key.as_deref()).await?;
+            Some(key)
+        }
+    };
     let st = state
         .0
         .settings
@@ -1656,11 +1682,14 @@ async fn put_settings(State(state): State<AppState>, signed: Signed, body: Bytes
                 if let Some(m) = req.mascot {
                     s.mascot = m;
                 }
+                if let Some(p) = ask_persona {
+                    s.ask_persona = p;
+                }
             }),
         )
         .await
         .map_err(ApiError::store)?;
-    Ok(me_json(&signed, &st))
+    Ok(me_json(&state, &signed, &st).await)
 }
 
 #[derive(Deserialize)]
@@ -1687,7 +1716,7 @@ async fn post_hint(State(state): State<AppState>, signed: Signed, body: Bytes) -
         )
         .await
         .map_err(ApiError::store)?;
-    Ok(me_json(&signed, &st))
+    Ok(me_json(&state, &signed, &st).await)
 }
 
 async fn delete_hints(State(state): State<AppState>, signed: Signed) -> ApiResult {
@@ -1697,7 +1726,7 @@ async fn delete_hints(State(state): State<AppState>, signed: Signed) -> ApiResul
         .update(signed.handle(), Box::new(|s| s.hints_seen.clear()))
         .await
         .map_err(ApiError::store)?;
-    Ok(me_json(&signed, &st))
+    Ok(me_json(&state, &signed, &st).await)
 }
 
 // Drafts.
@@ -1832,7 +1861,13 @@ fn is_pending(found: &Found) -> bool {
     }
 }
 
-fn draft_response(draft: &Draft) -> Response {
+/// A draft as the app gets it, with `persona_offered` checked against the catalog.
+async fn draft_response(state: &AppState, signed: &Signed, draft: &Draft) -> Response {
+    let mut draft = draft.clone();
+    if draft.summary.persona.is_some() {
+        let offered = bots::offered(state, signed).await;
+        bots::attribute(&mut draft.summary, &offered);
+    }
     Json(draft).into_response()
 }
 
@@ -1899,7 +1934,19 @@ async fn list_drafts(State(state): State<AppState>, signed: Signed) -> ApiResult
             .await
             .map_err(ApiError::store)?;
     }
-    let all: Vec<_> = pending.into_iter().chain(decided).map(|(_, s)| s).collect();
+    let needed = pending
+        .iter()
+        .chain(&decided)
+        .any(|(_, s)| s.persona.is_some());
+    let offered = bots::offered_if(&state, &signed, needed).await;
+    let all: Vec<_> = pending
+        .into_iter()
+        .chain(decided)
+        .map(|(_, mut s)| {
+            bots::attribute(&mut s, &offered);
+            s
+        })
+        .collect();
     // `truncated`: the tool server left pending drafts out past its safety cap, and
     // `total_pending` says how many there are (R12). Never true below that cap.
     let mut body = json!({ "drafts": all, "truncated": inbox.truncated });
@@ -1922,7 +1969,12 @@ async fn get_draft(
         .update(signed.handle(), Box::new(|s| s.opened_a_draft = true))
         .await
         .map_err(ApiError::store)?;
-    Ok(draft_response(&render(&state, &found, &signed, &st).await?))
+    Ok(draft_response(
+        &state,
+        &signed,
+        &render(&state, &found, &signed, &st).await?,
+    )
+    .await)
 }
 
 #[derive(Deserialize)]
@@ -1980,7 +2032,12 @@ async fn put_draft(
         .await?;
         let st = settings_of(&state, signed.handle()).await?;
         let found = Found::Item(Box::new(saved));
-        return Ok(draft_response(&render(&state, &found, &signed, &st).await?));
+        return Ok(draft_response(
+            &state,
+            &signed,
+            &render(&state, &found, &signed, &st).await?,
+        )
+        .await);
     }
     let key = id.clone();
     let st = state
@@ -2003,7 +2060,12 @@ async fn put_draft(
         )
         .await
         .map_err(ApiError::store)?;
-    Ok(draft_response(&render(&state, &found, &signed, &st).await?))
+    Ok(draft_response(
+        &state,
+        &signed,
+        &render(&state, &found, &signed, &st).await?,
+    )
+    .await)
 }
 
 /// Save the PM's edit of `item` at the tool server (`PUT /internal/approvals/{id}/draft`):
@@ -2365,7 +2427,12 @@ async fn accept_suggestion(
         )
         .await
         .map_err(ApiError::store)?;
-    Ok(draft_response(&render(&state, &found, &signed, &st).await?))
+    Ok(draft_response(
+        &state,
+        &signed,
+        &render(&state, &found, &signed, &st).await?,
+    )
+    .await)
 }
 
 async fn reject_suggestion(
@@ -2387,7 +2454,12 @@ async fn reject_suggestion(
         )
         .await
         .map_err(ApiError::store)?;
-    Ok(draft_response(&render(&state, &found, &signed, &st).await?))
+    Ok(draft_response(
+        &state,
+        &signed,
+        &render(&state, &found, &signed, &st).await?,
+    )
+    .await)
 }
 
 #[derive(Deserialize, Default)]
@@ -2423,11 +2495,12 @@ async fn decide_practice(
         return Err(stale());
     }
     if p.status == to && to == "approved" {
-        return Ok(draft_response(&drafts::practice_draft(
-            p,
-            &signed.bot(),
-            &st,
-        )));
+        return Ok(draft_response(
+            state,
+            signed,
+            &drafts::practice_draft(p, &signed.bot(), &st),
+        )
+        .await);
     }
     if p.status != "pending" {
         return Err(ApiError::not_pending());
@@ -2450,11 +2523,12 @@ async fn decide_practice(
         .await
         .map_err(ApiError::store)?;
     let p = st.practice.clone().ok_or_else(ApiError::not_found)?;
-    Ok(draft_response(&drafts::practice_draft(
-        &p,
-        &signed.bot(),
-        &st,
-    )))
+    Ok(draft_response(
+        state,
+        signed,
+        &drafts::practice_draft(&p, &signed.bot(), &st),
+    )
+    .await)
 }
 
 /// After a decision: forget the edit and suggestion and show the item as it now is.
@@ -2466,9 +2540,7 @@ async fn decided(state: &AppState, signed: &Signed, item: Approval) -> ApiResult
         .update(signed.handle(), Box::new(move |s| s.forget_draft(&key)))
         .await
         .map_err(ApiError::store)?;
-    Ok(draft_response(
-        &item_draft(state, signed, &item, &st).await?,
-    ))
+    Ok(draft_response(state, signed, &item_draft(state, signed, &item, &st).await?).await)
 }
 
 /// Is `item` already approved by this PM with exactly the arguments of `version` (when
@@ -2789,11 +2861,12 @@ async fn create_practice(State(state): State<AppState>, signed: Signed) -> ApiRe
         .await
         .map_err(ApiError::store)?;
     let p = st.practice.as_ref().ok_or_else(ApiError::not_found)?;
-    Ok(draft_response(&drafts::practice_draft(
-        p,
-        &signed.bot(),
-        &st,
-    )))
+    Ok(draft_response(
+        &state,
+        &signed,
+        &drafts::practice_draft(p, &signed.bot(), &st),
+    )
+    .await)
 }
 
 async fn delete_draft(
@@ -2843,18 +2916,25 @@ struct TaskOut {
     updated_at: String,
     progress: Option<Progress>,
     retrying: bool,
+    /// The marketplace bot the task ran as, by key; `null` is Nudge.
+    persona: Option<String>,
+    /// Whether `persona` is offered now (`true` for Nudge); see `DraftSummary`.
+    persona_offered: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     events: Option<Vec<EventOut>>,
 }
 
 /// `events` is `None` for a list (no events are read) and `Some` for a single task.
-fn task_out(t: Task, events: Option<&[TaskEvent]>) -> TaskOut {
+fn task_out(t: Task, events: Option<&[TaskEvent]>, offered: &bots::Offered) -> TaskOut {
     let seen = events.unwrap_or_default();
     let progress = progress::progress(&t, seen);
     let retrying = progress::retrying(&t, seen);
+    let persona = drafts::persona_key(t.persona.as_deref());
     TaskOut {
         progress,
         retrying,
+        persona_offered: bots::is_offered(persona.as_deref(), offered),
+        persona,
         events: events.map(progress::milestones),
         id: t.id,
         bot: t.bot,
@@ -2872,6 +2952,9 @@ fn task_out(t: Task, events: Option<&[TaskEvent]>) -> TaskOut {
 #[derive(Deserialize)]
 struct AskBody {
     text: String,
+    /// The bot to ask, by key; absent or `nudge` is Nudge.
+    #[serde(default)]
+    persona: Option<String>,
 }
 
 async fn create_task(State(state): State<AppState>, signed: Signed, body: Bytes) -> ApiResult {
@@ -2883,11 +2966,34 @@ async fn create_task(State(state): State<AppState>, signed: Signed, body: Bytes)
             "Say what you need, in at most 8,000 characters.",
         ));
     }
+    let persona = match req.persona.as_deref() {
+        None => None,
+        Some(key) => bots::requested_key(key)?,
+    };
+    // The team first: a bot that isn't on it never reaches the runtime. The tool server
+    // decides again when the task is claimed.
+    bots::check_on_team(&state, &signed, persona.as_deref()).await?;
     let task = signed
         .runtime(&state)
-        .create_task(signed.handle(), &signed.bot(), text)
+        .create_task_as(signed.handle(), &signed.bot(), text, persona.as_deref())
         .await
         .map_err(|e| match e {
+            UpstreamError::Refused {
+                status: 400,
+                code: Some(ref code),
+                ..
+            } if code == "unknown_persona" => bots::bot_unavailable(),
+            // The PM's bot isn't a personal bot of the personal role: not onboarded for bots.
+            UpstreamError::Refused {
+                status: 400,
+                code: Some(ref code),
+                ..
+            } if code == "persona_needs_personal_bot" => ApiError::new(
+                StatusCode::CONFLICT,
+                "task_refused",
+                "Your bot can't take this. If you're new to PM OS, finish onboarding in Slack \
+                 first.",
+            ),
             UpstreamError::Refused {
                 status: 403 | 404 | 422,
                 ..
@@ -2906,7 +3012,23 @@ async fn create_task(State(state): State<AppState>, signed: Signed, body: Bytes)
         }));
     }
     tracing::info!(user = %signed.handle(), task = %task.id, "task created");
-    Ok((StatusCode::CREATED, Json(task_out(task, Some(&[])))).into_response())
+    // The picker's default is the bot last asked: a preference, so a failure to keep it is
+    // logged, never the ask's answer.
+    let last = persona.clone();
+    if let Err(e) = state
+        .0
+        .settings
+        .update(signed.handle(), Box::new(move |s| s.ask_persona = last))
+        .await
+    {
+        tracing::warn!(error = %e, "the picker's last bot wasn't kept");
+    }
+    let offered = bots::offered_if(&state, &signed, task.persona.is_some()).await;
+    Ok((
+        StatusCode::CREATED,
+        Json(task_out(task, Some(&[]), &offered)),
+    )
+        .into_response())
 }
 
 async fn get_task(
@@ -2940,7 +3062,8 @@ async fn get_task(
             Vec::new()
         }
     };
-    Ok(Json(task_out(task, Some(&events))).into_response())
+    let offered = bots::offered_if(&state, &signed, task.persona.is_some()).await;
+    Ok(Json(task_out(task, Some(&events), &offered)).into_response())
 }
 
 async fn list_tasks(State(state): State<AppState>, signed: Signed) -> ApiResult {
@@ -2954,11 +3077,16 @@ async fn list_tasks(State(state): State<AppState>, signed: Signed) -> ApiResult 
         )
         .await
         .map_err(ApiError::upstream)?;
-    let tasks: Vec<TaskOut> = tasks
+    let tasks: Vec<Task> = tasks
         .into_iter()
         .filter(|t| t.requested_by == signed.handle() && !st.revision_tasks.contains(&t.id))
         .take(RECENT_TASKS)
-        .map(|t| task_out(t, None))
+        .collect();
+    let needed = tasks.iter().any(|t| t.persona.is_some());
+    let offered = bots::offered_if(&state, &signed, needed).await;
+    let tasks: Vec<TaskOut> = tasks
+        .into_iter()
+        .map(|t| task_out(t, None, &offered))
         .collect();
     Ok(Json(json!({ "tasks": tasks })).into_response())
 }
@@ -3142,6 +3270,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             sources_sensitivity: None,
+            persona: None,
         };
         assert!(settle(&task("working", None)).is_none());
         assert_eq!(

@@ -352,8 +352,8 @@ host-issued setup code".
 | Method and path | Body | Answer |
 | --- | --- | --- |
 | `GET /api/me` | | `Me` |
-| `PUT /api/me/settings` | `{nudges?: bool, mascot?: bool}` | `Me` |
-| `POST /api/me/hints` | `{seen: "sources" \| "ask" \| "approve" \| "tour_started" \| "tour_asked" \| "tour_opened" \| "tour_decided" \| "tour_skipped" \| "tour_cheered"}` | `Me` |
+| `PUT /api/me/settings` | `{nudges?: bool, mascot?: bool, ask_persona?: key}` | `Me`. `ask_persona` (the picker's bot, **Bots**) needs `ask-bot` (`403 not_allowed`), a key (`400 bad_request`), and a bot on the PM's team (`409 bot_not_on_team`) that is still offered (`409 bot_unavailable`); `"nudge"` always works. The team is read from the tool server for it (`503 unavailable`, `502 upstream_unavailable` when it can't be). |
+| `POST /api/me/hints` | `{seen: "sources" \| "ask" \| "approve" \| "tour_started" \| "tour_asked" \| "tour_opened" \| "tour_decided" \| "tour_skipped" \| "tour_cheered" \| "team_picked" \| "team_skipped" \| "team_announced"}` | `Me` |
 | `DELETE /api/me/hints` | | `Me`, with `hints_seen` empty ("Show hints again"; it restarts the guided start too) |
 
 ```json
@@ -361,7 +361,9 @@ host-issued setup code".
  "permissions": ["ask-bot", "view-own-tasks", "manage-own-routines", "decide-own-approval",
                  "view-own-traces", "link-own-accounts"],
  "reviewer": false,
- "csrf_token": "…", "first_visit": true, "hints_seen": ["sources"], "nudges": true, "mascot": true}
+ "csrf_token": "…", "first_visit": true, "hints_seen": ["sources"], "nudges": true, "mascot": true,
+ "team": ["nudge", "chief"], "ask_persona": "chief", "team_unavailable": false,
+ "show_team_step": false, "show_team_note": false}
 ```
 
 `reviewer` is true when the person holds the `reviewer` role: show the Reviews entry
@@ -376,6 +378,22 @@ only keeps them. `tour_started` means the guided start is on (written when a fir
 the welcome card, and after "Show hints again"); `tour_asked`, `tour_opened` and
 `tour_decided` are its three steps (ask for something; open a draft; approve, reject or change
 one); `tour_skipped` ends it early; `tour_cheered` records the one "Approved!" moment.
+
+**The team fields** (the bot marketplace, **Bots**). An older server leaves them out: treat
+that as `team: ["nudge"]`, `ask_persona: "nudge"`, and both `show_…` false.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `team` | [string] | The keys of the bots on the PM's team that are offered now, `"nudge"` first, then in catalog order. `[]` for someone without `ask-bot` (an Auditor-only person). `["nudge"]` while `team_unavailable`. A withdrawn bot still on the team is not listed here (it is in `GET /api/bots`'s `withdrawn`). |
+| `ask_persona` | string or null | **The picker's default**: the bot the PM last asked (kept by `POST /api/tasks` and `PUT /api/me/settings`) when it is in `team`; otherwise `"nudge"`, so a bot removed from the team, or withdrawn, falls back to Nudge. `null` without `ask-bot`. `"nudge"` while `team_unavailable`. |
+| `team_unavailable` | bool | The team or the catalog couldn't be read from the tool server just now (or `/api/me` was served on the last-known-good answer, **Sign-in and safety**). Then `team` is `["nudge"]`, `ask_persona` `"nudge"`, both `show_…` false; the app should offer only Nudge and may say it can't show the team. `false` without `ask-bot`. |
+| `show_team_step` | bool | Route Today to the "Pick your team" step (`/start/team`) once. Exactly when **all** of: the person holds `ask-bot` (never an Auditor-only person; a Reviewer or Admin who may ask does see it); `team_unavailable` is false; the catalog offers at least one bot besides Nudge; neither `team_picked` nor `team_skipped` is in `hints_seen`; and **the guided start is on**, worked out as the app's `tourState(me).active` does: `nudges` is true, and `tour_skipped` is not in `hints_seen`, and at least one of `first_visit`, `tour_started`, `tour_asked`, `tour_opened`, `tour_decided` holds, and not all three of `tour_asked`, `tour_opened` and `tour_decided` are in `hints_seen`. So a returning person (no `first_visit`, no guided start marks) never gets the step. |
+| `show_team_note` | bool | Show the one dismissible "New: you can add Chief, Sprout and Echo to your team" note on Today (with "Pick your team" to the Bots page, and a dismiss that marks `team_announced`). Exactly when: the person holds `ask-bot`; `team_unavailable` is false; the catalog offers at least one bot besides Nudge; none of `team_picked`, `team_skipped`, `team_announced` is in `hints_seen`; `show_team_step` is false (the guided start is off, finished or skipped); and `team` is `["nudge"]` (nobody who already added a bot is told they can). Never together with `show_team_step`. |
+
+The app marks `team_picked` after a successful "Continue" (`PUT /api/me/team` with `via:
+"onboarding"`), `team_skipped` for "Skip for now" (and nothing else), and `team_announced` when the
+note is dismissed. `DELETE /api/me/hints` clears them with the rest, so "Show hints again" shows
+the step again (with the guided start).
 
 `mascot` is "Show Nudge": whether the app draws its mascot. `false` hides the character
 everywhere and nothing else: hints, empty states and the guided start keep their text. It
@@ -421,7 +439,7 @@ document.
 // DraftSummary
 {"id": "apr_…", "kind": "confluence_page", "title": "PRD: TCB grace period setting",
  "bot": "pm-ana", "status": "pending", "created_at": "…", "expires_at": null,
- "task_id": "tsk_…", "practice": false}
+ "task_id": "tsk_…", "practice": false, "persona": "chief", "persona_offered": true}
 
 // Draft = DraftSummary plus
 {"body": "markdown", "edited": false, "edited_at": null,
@@ -449,6 +467,14 @@ document.
 
 - `kind` is `confluence_page`, `jira_issue`, `slack_reply` or `slack_message`.
 - `status` is `pending`, `approved`, `rejected`, `expired` or `failed`.
+- **`persona` and `persona_offered`: which bot drafted it** (**Bots**, "Attribution"), on every
+  `DraftSummary` and so on every `Draft` (the list, a draft, and every answer that returns a
+  draft: an edit, a suggestion accepted or rejected, an approve, a reject, a practice draft).
+  `persona` is the bot's key, or `null` for Nudge (and for a practice draft, and every draft made
+  before the marketplace). `persona_offered` is `true` for `null` and for a key the catalog offers
+  now; `false` for a key of a bot that was withdrawn or deleted, and for any key while the catalog
+  can't be read (fail closed: the app never claims a bot it can't check). The tool server copies
+  `persona` from the drafting session and nothing changes it.
 - `Suggestion.status` is `working`, `ready` or `failed`. `body` is set when `ready`, `error`
   (a plain sentence) when `failed`.
 - `expires_at` is set for Slack drafts, which expire after 24 hours.
@@ -594,7 +620,7 @@ never has markers, and once accepted the draft is edited. A practice draft never
 
 | Method and path | Body | Answer |
 | --- | --- | --- |
-| `POST /api/tasks` | `{text}` | `201 Task`. The PM's personal bot takes it. |
+| `POST /api/tasks` | `{text, persona?}` | `201 Task`. The PM's personal bot takes it, as `persona` (a bot's key, **Bots**; absent or `"nudge"` is Nudge). A bot not on the PM's team is `409 bot_not_on_team`, one no longer offered `409 bot_unavailable`, and neither reaches the runtime. On success the picker's default (`Me.ask_persona`) becomes this bot. |
 | `GET /api/tasks/{id}` | | `Task` |
 | `GET /api/tasks` | | `{tasks: [Task]}`, the PM's 20 most recent, without `events` |
 
@@ -602,6 +628,7 @@ never has markers, and once accepted the draft is edited. A practice draft never
 {"id": "tsk_…", "bot": "pm-ana", "text": "…", "status": "working",
  "result": null, "error": null, "draft_ids": [], "created_at": "…", "updated_at": "…",
  "progress": {"done": 2, "total": 3}, "retrying": false,
+ "persona": "chief", "persona_offered": true,
  "events": [{"at": "…", "kind": "milestone", "text": "Reading Jira"},
             {"at": "…", "kind": "milestone", "text": "Drafting in Confluence"}]}
 ```
@@ -622,6 +649,164 @@ drafts, and any the bot put in its answer are removed.
   else is signalled today: the model gateway's own short retries are invisible here.
 - In `GET /api/tasks`, each task has `progress` and `retrying` (from the task alone) but no
   `events`.
+- `persona` is the bot the task ran as (`null` for Nudge, and for tasks from before the
+  marketplace or from a runtime that doesn't say), and `persona_offered` whether it is offered
+  now, exactly as on drafts (**Bots**, "Attribution"). Activity shows each row's bot from them.
+
+## Bots
+
+The bot marketplace (`docs/bot-marketplace-spec.md`, slice W1). Besides Nudge, the always-on
+generalist, an Admin offers bots (Chief, Sprout, Echo, …) through content, and each PM picks
+which are on **their own** team: during onboarding ("Pick your team"), on the Bots page, or from
+the ask box's picker. In the API a bot is a **persona** and is named by its **key** (`"chief"`;
+lowercase letters, digits and single hyphens, at most 32). `"nudge"` is Nudge's key, and Nudge is
+always on every team. A team grants nothing: every ask, draft and write is still the PM's own
+bot's, checked by the tool server, and every write still waits for the PM's approval.
+
+Same session, origin and CSRF rules as every route (**Sign-in and safety**). **Who:** every route
+here needs `ask-bot` (`403 not_allowed` otherwise: an Auditor-only person never has a team, and
+`pmos-web` refuses them before any upstream call). A PM, Reviewer, Admin or skill author who may
+ask has a team like anyone. **Nobody reads or changes anyone else's team, an Admin included:**
+there is no route that takes a handle; every call `pmos-web` makes goes to the signed-in
+person's own team at the tool server, with a user assertion for them bound to the exact request,
+and the tool server checks the person again in its own tables. (Who uses which bot, for Admins
+and Auditors, is `GET /api/admin/bots`, slice A1; it is not built yet.)
+
+| Method and path | Body | Answer |
+| --- | --- | --- |
+| `GET /api/bots` | | `200 {bots: [BotCard], withdrawn: [WithdrawnBot]}` |
+| `PUT /api/me/team` | `{add?: [key], remove?: [key], via: "onboarding" \| "bots_page" \| "picker", routines?: "nudge" \| "pause"}` | `200 {bots: [BotCard], withdrawn: [WithdrawnBot]}`, the same as `GET /api/bots` after the change |
+| `POST /api/tasks` | `{text, persona?: key}` | `201 Task` (**Asking**) |
+| `PUT /api/me/settings` | `{ask_persona: key}` | `Me` (**Me**) |
+
+```json
+// BotCard: an offered bot, Nudge first, then in the catalog's order
+{"key": "chief", "display_name": "Chief", "title": "Chief of Staff", "mascot": "chief",
+ "always_on": false,
+ "summary": "Runs your week: what needs you, what is slipping, and what to tell your leadership.",
+ "examples": ["Prep me for the staff meeting", "What slipped since Monday?"],
+ "can_do": ["daily-brief", "meeting-prep", "week-review"],
+ "reads": ["jira", "confluence", "slack", "docs"],
+ "drafts": ["Jira issues", "Confluence pages", "Slack replies"],
+ "needs": [],
+ "on_team": true, "added_at": "2026-11-20T09:01:00Z", "added_via": "onboarding", "new": false,
+ "drafts_this_month": 6, "last_used_at": "2026-11-21T09:00:00Z",
+ "routines": [Routine]}
+
+// Need: a data source the bot would use but PM OS doesn't have (Sprout: analytics)
+{"source": "analytics", "label": "an analytics source",
+ "without": "I work from numbers you paste in or that a Confluence page holds, and I say so.",
+ "met": false}
+
+// WithdrawnBot: a row on the PM's team whose bot is no longer offered (or no longer exists)
+{"key": "ghost", "added_at": "2026-11-20T09:01:00Z", "added_via": "bots_page",
+ "drafts_this_month": 1, "last_used_at": null, "routines": []}
+
+// Routine: one of the PM's own routines that runs as this bot (read only here)
+{"id": "rtn_…", "enabled": true, "cron": "0 8 * * 1-5", "tz": "Europe/London",
+ "prompt": "brief me", "next_run_at": "2026-11-24T08:00:00Z"}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `key` | string | The bot's key: what every route, `Me.team`, `Me.ask_persona`, `persona` on drafts and tasks use. |
+| `display_name` | string | Its name ("Chief"). **Untrusted text** (content): plain text only. |
+| `title` | string | Its role line ("Chief of Staff"). Untrusted text. |
+| `mascot` | string | Which drawing: `nudge`, `chief`, `sprout` or `echo` today. Choose from the app's own fixed set; an unknown value draws the neutral face, never a guess. |
+| `always_on` | bool | `true` for Nudge only: "Always on your team", no Add or Remove. |
+| `summary` | string | One line for the card. Untrusted text. |
+| `examples` | [string] | 1 to 6 example asks: the card's examples and the chips under the ask box. Untrusted text. A chip fills the ask box and never sends. |
+| `can_do` | [string] | Skill keys ("What it can do"); the app labels them from its own fixed map, and shows a key it has no label for as the key. |
+| `reads` | [string] | The systems it reads (`jira`, `confluence`, `slack`, `docs`), worked out from its tools. |
+| `drafts` | [string] | What it may draft, as labels ("Jira issues", "Confluence pages", "Slack replies", "Slack messages", "bets register entries", "Confluence page updates"). "Every one waits for your approval." |
+| `needs` | [Need] | Data sources it would use but PM OS lacks; `[]` for none. `label` and `without` are untrusted text. `met: false` shows the badge "Needs <label>", with `without` as its explanation; the bot can still be added. |
+| `on_team` | bool | On the PM's team now. Always `true` for Nudge. |
+| `added_at`, `added_via` | string or null | When and from where it was added (`onboarding`, `bots_page`, `picker`, or `seed` for the `evals` account); `null` for Nudge and for a bot not on the team. "On your team since…". |
+| `new` | bool | "New" label under Available. **Always `false` in this version**: no service records when a bot was first offered (see the spec's §13, "W1 is built"). |
+| `drafts_this_month` | integer | Drafts this bot made for this PM since the first of this month (UTC), any status. `0` when none. |
+| `last_used_at` | string or null | When the PM last asked this bot (their newest task that ran as it, from the runtime's `GET /v1/tasks?persona=`), or `null`: never, or the runtime couldn't say. A `null` hides the part ("· last used today"). |
+| `routines` | [Routine] or null | The PM's own routines that run as this bot (Nudge's: those that name no bot); `null` when the runtime couldn't say. For Settings (read only) and for the removal question. |
+
+The text fields are passed on **exactly as the tool server served them from the content files**,
+JSON string for string: `pmos-web` builds no HTML, Markdown or instructions from them, and keeps
+only the fields above (never the persona file's role, owner or body). Render them as React text
+nodes, never `dangerouslySetInnerHTML` or Markdown: a summary can hold `<img onerror>` and must
+show as those characters. A persona the tool server lists in another shape is left out whole.
+
+**`GET /api/bots`** reads the catalog and the PM's team from the tool server, fresh, and the PM's
+recent tasks and routines from the runtime. The tool server failing fails the route (`502
+upstream_unavailable`, `503 unavailable`); the runtime failing does not: `last_used_at` and
+`routines` are then `null`. `withdrawn` lists the team's rows whose bot isn't offered now (an
+Admin withdrew it, or its file is gone): show "No longer offered", with Remove only; it has no
+name to show ("A bot no longer offered", the neutral face).
+
+**`PUT /api/me/team`** changes the PM's own team, at once and atomically. "Add to my team" and
+"Continue with 2 bots" are `{add: [...], via: "onboarding"}`; the Bots page uses `via:
+"bots_page"`, the picker's Add `via: "picker"`. In order:
+
+1. Checked here, before anything is sent: `ask-bot` (`403 not_allowed`); the body has exactly these
+   fields (`400 bad_request` otherwise, a `handle` included); `via` is one of the three; `routines`,
+   if given, is `nudge` or `pause`; every key is a key; at most 16 in each list; at least one key in
+   all; no key in both; `nudge` (or any always-on bot) in neither (`409 always_on`); every key to
+   **add** offered in a fresh read of the catalog (`409 bot_unavailable`). Removing a bot that is
+   no longer offered is allowed (that is the only thing a withdrawn bot allows); adding one already
+   there, or removing one that isn't, changes nothing and is not an error.
+2. **A bot's routines move before the bot leaves** (spec §6, "Removal"). When `remove` names any
+   key, `pmos-web` reads the PM's routines from the runtime and, for each that runs as a removed
+   bot, either moves it to Nudge (`routines: "nudge"`, the default) or pauses it (`"pause"`; it
+   keeps its bot, so adding the bot back and resuming it works). The Bots page asks only when the
+   bot has routines (`BotCard.routines`; when that is `null`, ask anyway). If the runtime can't be
+   read or refuses a change, **the team is not changed**: `502 upstream_unavailable` when no
+   routine had been changed yet, `502 unknown_outcome` when some may have (reload the Bots page to
+   see).
+3. The change goes to the tool server as `{add, remove, via}` (never `routines`), which decides
+   again. Its refusals keep their codes: `400 bad_request`, `403 not_allowed`, `403 not_a_member`,
+   `409 always_on`, `409 bot_unavailable`, `409 team_full` (16 bots), `429 rate_limited` (30 team
+   changes an hour per person, refused ones included), `503 assertion_required` (a development
+   stack without signed assertions), `503 unavailable`. Every one is "nothing changed" on the team
+   (routines moved in step 2 stay moved, to Nudge or paused). A change whose answer was lost is `502
+   unknown_outcome`: reload the Bots page.
+4. The answer is the Bots page as it now is. A failed save keeps the page and says so; the app
+   marks no hint for it.
+
+Removing a bot keeps everything it made: its drafts stay the PM's, decidable and attributed to it;
+a task it already started finishes; a queued one fails when it is claimed with the tool server's
+plain sentence ("Chief isn't on your team any more…"), which arrives as the task's `error`.
+
+**The picker.** The ask box's bot picker lists `Me.team` (selectable) and the other offered bots
+from `GET /api/bots` (greyed, with "Add", which sends `PUT /api/me/team {add: [key], via:
+"picker"}` and then selects it). **Its default is `Me.ask_persona`**: the bot the PM last asked,
+kept by the server on every successful `POST /api/tasks` (Nudge when the ask named none), or set
+with `PUT /api/me/settings {ask_persona}`; when that bot is no longer on the team (or no longer
+offered) it reads `"nudge"`. The example chips are the selected bot's `examples`.
+
+**Asking a bot.** `POST /api/tasks {text, persona}` (**Asking**): `persona` absent or `"nudge"`
+asks Nudge. For another key, `pmos-web` reads the PM's team from the tool server first: not on
+it is `409 bot_not_on_team`, on it but no longer offered `409 bot_unavailable`, and the team
+unreadable fails the ask (`503 unavailable` or `502 upstream_unavailable`); in each case **no task
+is made and the runtime is never called**. The tool server checks the team again when the task is
+claimed. If the runtime itself refuses the bot (`unknown_persona`), the answer is `409
+bot_unavailable`; if it refuses because the PM's bot can't run personas
+(`persona_needs_personal_bot`), `409 task_refused`.
+
+**Attribution.** Drafts (`DraftSummary`, `Draft`), tasks (`Task`, so Activity's rows) and the
+reviewer's views (`ReviewSummary`, `ReviewDraft`, restricted ones included: it is metadata)
+carry `persona` (the key, `null` for Nudge) and `persona_offered`. To show it:
+
+- `persona: null`: Nudge ("Drafted by Nudge", Nudge's face).
+- A key with `persona_offered: true`: look it up in `GET /api/bots` for its `display_name` and
+  `mascot` ("Drafted by Chief").
+- `persona_offered: false`, or a key not in `GET /api/bots`: "A bot no longer offered", with the
+  neutral face. Never guess a name or a mascot from the key.
+
+`persona_offered` is checked against a catalog read at most 10 seconds old (5 minutes while the
+tool server can't be read); with no catalog at all every key reads `false`.
+
+**Errors** (see **Error codes**): `400 bad_request`, `401 signed_out`, `403 bad_origin` /
+`bad_csrf` (writes), `403 not_allowed`, `403 not_a_member`, `409 bot_not_on_team`, `409
+bot_unavailable`, `409 always_on`, `409 team_full`, `429 rate_limited`, `502
+upstream_unavailable`, `502 unknown_outcome` (a team change), `503 assertion_required`, `503
+unavailable`, `503 users_unavailable`.
 
 ## The daily brief and follow-ups
 
@@ -706,7 +891,7 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `403` | `bad_csrf` | A write without the session's CSRF token. | Yes |
 | `403` | `proxy_not_trusted` | Password sign-in: a request that carries a forwarded header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) while `pmos-web` trusts no proxy (`PMOS_WEB_DIRECT=1`), or from a peer not in `PMOS_WEB_TRUSTED_PROXIES`, or from a trusted proxy that names no client: the proxy setting doesn't match the deployment. | Yes |
 | `403` | `not_a_member` | Not (or no longer) an active user in the user database; every session of theirs ends. Also when the tool server doesn't count them a member on a decision. | Yes |
-| `403` | `not_allowed` | Their role doesn't allow drafts, tasks or asking. | Yes |
+| `403` | `not_allowed` | Their role doesn't allow drafts, tasks or asking (also the Bots page and team changes: **Bots**). | Yes |
 | `403` | `forbidden` | Admin and auditor routes their role doesn't allow; the reviewer routes for someone who isn't an active reviewer; the producer route called like a browser. | Yes |
 | `403` | `own_draft` | A reviewer reading or recommending on their own draft: they decide it as its owner (**Reviews**). | Yes |
 | `403` | `restricted_draft` | A recommendation on a draft built from restricted sources: a reviewer sees its metadata only (**Reviews**). | Yes |
@@ -723,11 +908,15 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `409` | `no_suggestion` | Accepting a suggestion that isn't ready. | Yes |
 | `409` | `not_practice` | Deleting a draft that isn't the practice draft. | Yes |
 | `409` | `task_refused` | The runtime won't take the PM's task (not onboarded, no bot). | Yes |
+| `409` | `bot_not_on_team` | Asking a bot, or making it the picker's default, while it isn't on the PM's team (**Bots**). Add it first. The ask never reached the runtime. | Yes |
+| `409` | `bot_unavailable` | A bot that isn't offered any more (withdrawn, deleted, or unknown): adding it, asking it, or making it the picker's default (**Bots**). | Yes |
+| `409` | `always_on` | A team change naming Nudge: it is always on the team (**Bots**). | Yes |
+| `409` | `team_full` | A team change that would put more than 16 bots on the team (**Bots**). | Yes |
 | `409` | `github_not_linked` | An admin proposal: the admin hasn't linked GitHub in PM OS. Pull requests are opened as them; `error` says how to link. | Yes |
 | `409` | `stale_base` | An admin proposal or validation made from a copy that differs from the server's or the default branch's (**Admin: policy**). | Yes |
 | `422` | `invalid` | An admin proposal that doesn't pass validation (`errors`, `warnings`). Also a malformed value in an admin's user or role change, and a reviewer's note over 1,000 characters. | Yes |
 | `422` | `policy_mismatch` | An admin proposal: the tool server regenerates different policy files from it (`paths`). | Yes |
-| `429` | `rate_limited` | Too many admin proposals this hour; `Retry-After`. | Yes |
+| `429` | `rate_limited` | Too many admin proposals this hour; `Retry-After`. Also more than 30 team changes in an hour (**Bots**). | Yes |
 | `501` | `not_configured` | Admin proposals are off at the tool server. Also password sign-in on in `pmos-web` while the tool server has no vault key for it. | Yes |
 | `502` | `audit_unavailable` | The audit log couldn't record an admin proposal, or an admin's read of a personal or restricted file, so it wasn't done or shown. | Yes |
 | `502` | `github_refused`, `github_unavailable` | GitHub refused the admin's account, or didn't take the proposal. | Yes |
@@ -738,13 +927,13 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `422` | `bad_brief` | The producer route's body failed a check. | Yes |
 | `501` | `not_built` | The daily brief is off on this server. | Yes |
 | `502` | `upstream_unavailable` | The runtime or tool server couldn't be reached, refused, or answered something unreadable. On a decision, only when the request never reached the tool server, or it refused it. | Yes on a decision; for a task (`POST /api/tasks`), the task may have been made: reload the list |
-| `502` | `unknown_outcome` | A decision was sent, but the answer was lost (the connection dropped, or the tool server failed with a `5xx`), and reading the draft again didn't show it decided. Also an admin proposal whose answer was lost: reload the proposals list. Also an admin's user or role change whose answer was lost: reload the team list. Also a reviewer's recommendation whose answer was lost: read the draft again. Also a password change or new recovery codes whose answer was lost: sign in again to see. | **Unknown** |
+| `502` | `unknown_outcome` | A decision was sent, but the answer was lost (the connection dropped, or the tool server failed with a `5xx`), and reading the draft again didn't show it decided. Also an admin proposal whose answer was lost: reload the proposals list. Also an admin's user or role change whose answer was lost: reload the team list. Also a reviewer's recommendation whose answer was lost: read the draft again. Also a password change or new recovery codes whose answer was lost: sign in again to see. Also a team change whose answer was lost, or a removal that stopped after moving some of the bot's routines: reload the Bots page (**Bots**). | **Unknown** |
 | `504` | `unknown_outcome` | The same, when the tool server didn't answer in time (10 seconds). | **Unknown** |
 | `503` | `audience_unavailable` | Slack couldn't say who is in the channel. | Yes |
 | `503` | `unavailable` | `pmos-web`'s own store, or the tool server's, is down. | Yes |
 | `503` | `users_unavailable` | The tool server (the user database) can't be asked who the person is: sign-in, and every route but the last-known-good reads (**Sign-in and safety**). | Yes |
 | `403` | `entra_needs_host` | A Microsoft session of someone holding Admin or Auditor whose link the host hasn't confirmed: the session ends. | Yes |
-| `503` | `assertion_required` | An admin's user or role change, a reviewer's recommendation, or any password sign-in route, while the tool server runs without signed user assertions (a development stack): it makes none. | Yes |
+| `503` | `assertion_required` | An admin's user or role change, a reviewer's recommendation, a team change (**Bots**), or any password sign-in route, while the tool server runs without signed user assertions (a development stack): it makes none. | Yes |
 | `403` | `host_only` | A user or role change only someone with host access may make: granting `admin`, an Admin's or Auditor's addresses or Microsoft link, or their password setup code (also when a code the web made is used by someone who holds Admin or Auditor now). | Yes |
 | `403` | `self_change` | An admin changing their own roles, status, addresses, links or reviewer assignments, or making a password setup code for themselves. | Yes |
 | `409` | `exists` | Inviting a handle that is already taken (handles are never reused). | Yes |
@@ -1355,7 +1544,8 @@ server doesn't mark `restricted: false` as restricted.
 // ReviewSummary (restricted: title and my_recommendation are null, no args_hash, no edited)
 {"id": "apr_…", "owner": "ana", "owner_name": "Ana Silva", "kind": "jira_issue",
  "status": "pending", "created_at": "2026-11-16T09:00:00Z", "expires_at": null,
- "restricted": false, "revision": 2, "title": "PAY-212: TCB grace period",
+ "restricted": false, "revision": 2, "persona": "chief", "persona_offered": true,
+ "title": "PAY-212: TCB grace period",
  "edited": false, "args_hash": "3f9a…(64 hex)", "my_recommendation": MyRecommendation | null}
 
 // ReviewDraft = ReviewSummary plus, when restricted is false:
@@ -1363,7 +1553,8 @@ server doesn't mark `restricted: false` as restricted.
 
 // A restricted ReviewDraft: exactly these fields
 {"id": "apr_…", "owner": "ana", "owner_name": "Ana Silva", "kind": "slack_reply",
- "status": "pending", "created_at": "…", "expires_at": "…", "restricted": true, "revision": 1}
+ "status": "pending", "created_at": "…", "expires_at": "…", "restricted": true, "revision": 1,
+ "persona": null, "persona_offered": true}
 
 // MyRecommendation: the reviewer's own live one on this draft
 {"verdict": "approve", "note": "Looks right to me." | null, "note_removed": false,
@@ -1380,6 +1571,7 @@ server doesn't mark `restricted: false` as restricted.
 | `created_at`, `expires_at` | string, string or null | RFC 3339. `expires_at` is set for Slack drafts. |
 | `restricted` | bool | Metadata only: see above. |
 | `revision` | integer or null | The version of the draft's text: 1 as the bot drafted it, up by one each time its owner saves different text (an edit, an accepted suggestion, an edit on the Slack card). `null` from an older tool server. |
+| `persona`, `persona_offered` | string or null, bool | Which bot drafted it, as under **Drafts** and **Bots** ("Attribution"): show "Drafted by Chief". Metadata, so also on a restricted draft. |
 | `title` | string or null | As under **Drafts**; `null` when restricted. |
 | `body`, `target`, `sources` | | As under **Drafts** (`Draft.body`, `Draft.target`, `[Source]`, citations resolved the same way). `ReviewDraft` only; absent when restricted. A Slack target names a public channel only: for a private channel or a direct message the reviewer gets the label without a name ("A Slack thread", "Direct message"), which the owner sees in full. |
 | `edited` | bool | Its owner changed the bot's text. Absent when restricted. |

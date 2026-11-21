@@ -119,6 +119,10 @@ pub struct Task {
     /// before then): `public`, `internal` or `restricted`.
     #[serde(default)]
     pub sources_sensitivity: Option<String>,
+    /// The persona (marketplace bot) the task runs as, `null` for Nudge (the bot marketplace,
+    /// slice R1). A runtime from before personas doesn't send it: every task is then Nudge's.
+    #[serde(default)]
+    pub persona: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -189,6 +193,10 @@ pub struct Approval {
     /// older tool server doesn't send them.
     #[serde(default)]
     pub recommendations: Vec<UpstreamRecommendation>,
+    /// The persona whose session drafted the item, `null` for Nudge (slice B1; copied from
+    /// the drafting session and never changed). An older tool server doesn't send it.
+    #[serde(default)]
+    pub persona: Option<String>,
 }
 
 /// One of the tool server's `recommendations` on an approval item (`docs/web-api.md`,
@@ -625,6 +633,18 @@ impl Runtime {
         self.create_task_at(user, bot, text, None).await
     }
 
+    /// [`Self::create_task`] as `persona` (a marketplace bot's key; `None` is Nudge, and is
+    /// sent as no `persona` at all, as before personas).
+    pub async fn create_task_as(
+        &self,
+        user: &str,
+        bot: &str,
+        text: &str,
+        persona: Option<&str>,
+    ) -> UpstreamResult<Task> {
+        self.create_task_with(user, bot, text, None, persona).await
+    }
+
     /// [`Self::create_task`] whose session starts at least at `floor` (`public`, `internal`
     /// or `restricted`): a revision of a draft, whose prompt carries the draft's text at the
     /// draft's level.
@@ -635,12 +655,26 @@ impl Runtime {
         text: &str,
         floor: Option<&str>,
     ) -> UpstreamResult<Task> {
+        self.create_task_with(user, bot, text, floor, None).await
+    }
+
+    async fn create_task_with(
+        &self,
+        user: &str,
+        bot: &str,
+        text: &str,
+        floor: Option<&str>,
+        persona: Option<&str>,
+    ) -> UpstreamResult<Task> {
         let url = self.0.url(&["v1", "tasks"])?;
         let mut body = json!({
             "bot": bot, "requested_by": user, "text": text, "source": "web",
         });
         if let Some(floor) = floor {
             body["sensitivity_floor"] = json!(floor);
+        }
+        if let Some(persona) = persona {
+            body["persona"] = json!(persona);
         }
         let res = self
             .0
@@ -659,6 +693,29 @@ impl Runtime {
     pub async fn task_events(&self, user: &str, id: &str) -> UpstreamResult<Vec<TaskEvent>> {
         Ok(self
             .get::<List<TaskEvent>>(user, &["v1", "tasks", id, "events"], &[])
+            .await?
+            .into_vec())
+    }
+
+    /// The PM's most recent tasks that ran as `persona` (a key, or `nudge`), newest first
+    /// (`GET /v1/tasks?persona=`, slice R1).
+    pub async fn tasks_as(
+        &self,
+        user: &str,
+        persona: &str,
+        limit: usize,
+    ) -> UpstreamResult<Vec<Task>> {
+        let limit = limit.to_string();
+        Ok(self
+            .get::<List<Task>>(
+                user,
+                &["v1", "tasks"],
+                &[
+                    ("requested_by", user),
+                    ("persona", persona),
+                    ("limit", &limit),
+                ],
+            )
             .await?
             .into_vec())
     }
@@ -984,6 +1041,30 @@ impl ToolServer {
         Ok((status, body))
     }
 
+    /// The bot catalog (`GET /internal/personas`, slice B1): the offered personas, Nudge first,
+    /// with an assertion for `user` (the tool server needs none here; one sent is checked).
+    pub async fn personas(&self, user: &str) -> UpstreamResult<Value> {
+        let url = self.0.url(&["internal", "personas"])?;
+        let res = self.0.send(self.0.http.get(url), Some(user)).await?;
+        self.0.read(res).await
+    }
+
+    /// `user`'s own team (`GET /internal/team/{handle}`), or with `change` a change to it
+    /// (`PUT`, JSON `{add, remove, via}`), with an assertion for `user` bound to exactly that
+    /// request. Gives back the tool server's status and JSON body (`Value::Null` when it isn't
+    /// JSON) whatever the status: the route words its own answer from the code.
+    pub async fn team(&self, user: &str, change: Option<&Value>) -> UpstreamResult<(u16, Value)> {
+        let url = self.0.url(&["internal", "team", user])?;
+        let req = match change {
+            None => self.0.http.get(url),
+            Some(b) => self.0.http.put(url).json(b),
+        };
+        let res = self.0.execute(req, Some(user), TIMEOUT).await?;
+        let status = res.status().as_u16();
+        let body = res.json::<Value>().await.unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
     /// `GET /internal/admin/{route}?user=<viewer>&…`, as [`Self::admin`], but giving back the
     /// tool server's status and JSON body whatever the status.
     pub async fn admin_raw(
@@ -1006,6 +1087,30 @@ impl ToolServer {
 }
 
 impl Runtime {
+    /// `owner`'s own routines (`GET /v1/routines?owner=<handle>`), as the runtime lists them;
+    /// the caller keeps only the fields it serves (`app/bots.rs`).
+    pub async fn routines(&self, owner: &str) -> UpstreamResult<Vec<Value>> {
+        Ok(self
+            .get::<List<Value>>(owner, &["v1", "routines"], &[("owner", owner)])
+            .await?
+            .into_vec())
+    }
+
+    /// Change one of `owner`'s routines (`PATCH /v1/routines/{id}`, JSON `body`): the bot
+    /// marketplace moves a removed bot's routines to Nudge (`{"persona": "nudge"}`) or pauses
+    /// them (`{"enabled": false}`).
+    pub async fn patch_routine(&self, owner: &str, id: &str, body: &Value) -> UpstreamResult<()> {
+        let url = self.0.url(&["v1", "routines", id])?;
+        let res = self
+            .0
+            .send(
+                self.0.http.patch(url).header(USER_HEADER, owner).json(body),
+                Some(owner),
+            )
+            .await?;
+        self.0.read::<Value>(res).await.map(drop)
+    }
+
     /// The bots the runtime has loaded (`GET /v1/bots`), as it lists them: names, roles and
     /// scopes. For the admin's harness view.
     pub async fn bots(&self, user: &str) -> UpstreamResult<Vec<Value>> {

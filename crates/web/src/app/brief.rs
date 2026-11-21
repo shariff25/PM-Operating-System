@@ -378,7 +378,7 @@ async fn draft(State(state): State<AppState>, signed: Signed, Path(id): Path<Str
         }));
     }
     tracing::info!(user = %signed.handle(), task = %task.id, followup = %id, "follow-up draft asked");
-    Ok((StatusCode::CREATED, Json(task_out(task, Some(&[])))).into_response())
+    Ok((StatusCode::CREATED, Json(task_out(task, Some(&[]), &None))).into_response())
 }
 
 // The producer's route.
