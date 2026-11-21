@@ -59,6 +59,15 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   for internal review. Not approved for external use." and need no extra approval step, until
   Legal's outbound policy exists; (3) decision D12 is changed: the Chief of Staff, Growth and
   Outbound bots are built now (none of them directs other bots).
+  Built 2026-11-21 (slices C1, B1, R1, W1, M1, F2, F3, S1, A1, R2; status notes in the spec's
+  §13): the catalog and lint, the tool server's teams, the runtime and harness, the web API and
+  screens, Slack, the Admin's view, and Chief writing the daily brief. Every bot but Nudge is a
+  Preview until its content file claims a benchmark that lint verifies against an eval report.
+  The security gate did not pass at `8e8f8fe` (one High: the web app dropped the Preview label);
+  the fixes are at `c00e682` and the reviewer's re-check is pending. Real run on the test stack
+  at `c00e682` with fake data: pick a team in onboarding, ask Chief and Echo, attributed drafts,
+  Echo's draft line, approving after a bot left the team, the Admin's view. Not verified: a real
+  Slack workspace, a held draft and the brief switch on the stack, and any eval run.
 - **h. Dropped by the owner on 2026-11-17:** the review of how the Grok bot was built. Do not
   build it.
 
@@ -98,4 +107,5 @@ seconds without running); an Entra app registration, with `acct` as an optional 
 key with enough quota for an eval run; pilot PM names; edits to the nudge wording; a GitHub App
 with pull-request permission and branch protection on the content branch; approval of the three
 plans (MCP servers and which ones for the pilot, the OpenShell prover, sandbox decisions in the
-audit log) and the go-ahead for requirement i.
+audit log) and the go-ahead for requirement i; the CODEOWNERS lines and branch-protection settings in
+`policies/README.md`, so a change to a bot's instructions needs a second reviewer.
