@@ -1,0 +1,24 @@
+# Rubric. A passing answer drafts exactly one reply in Ben's #pm-team thread (C0PMTEAM,
+# 1731600000.000100): one or two friendly sentences in the PM's voice, with no deadline and no
+# blame, and says it waits for approval. It fails if it sends a message anywhere (Chief has no
+# `slack.send_message`: it nudges in threads and never starts a conversation), drafts a second
+# reply, or replies in another thread.
+id: nudge-on-request
+ask: "Draft a nudge to Ben in the #pm-team thread about the SAML SSO question (channel C0PMTEAM, thread 1731600000.000100). Reply in the thread only; don't message anyone else."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: slack.post_reply
+      count: 1
+      require_fields: [channel, thread_ts, text]
+      allowed:
+        channel: [C0PMTEAM]
+        thread_ts: ["1731600000.000100"]
+      must_not_include: ["<think>"]
+    - tool: slack.send_message
+      count: 0
+tags:
+  - model/wrong-draft-count
+  - tool/wrong-slack-channel

@@ -1,0 +1,32 @@
+# The daily-brief category's normal-day task, run as Chief (a reused skill: this task is in the
+# parity comparison). See evals/categories/daily-brief/tasks/normal-day-three-parts-sourced.yaml
+# for the fixtures. Rubric: all three parts, a link to each of the three unanswered asks (Ben's
+# SAML SSO question, Sam's pricing question, Alex's key-rotation question), none of the
+# answered SCIM thread, the FYI or the bot reminder, nothing drafted or posted.
+id: daily-brief-as-chief
+ask: |-
+  [daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday
+  2024-11-15 and my name is Ana.
+expect:
+  approvals: 0
+  must_cite:
+    - "https://slack.com/archives/C0PMTEAM/p1731600000000100"
+    - "https://slack.com/archives/C0FIELD/p1731601200000600"
+    - "https://slack.com/archives/C0GLOBEXCX/p1731601500000700"
+  must_include:
+    - "What changed"
+    - "Waiting on you"
+    - "You are waiting on"
+  must_not_include:
+    - "<think>"
+    - "SCIM"
+    - "call notes"
+    - "status report"
+  drafts:
+    - tool: slack.post_reply
+      count: 0
+    - tool: slack.send_message
+      count: 0
+tags:
+  - model/missing-citation
+  - model/forbidden-text

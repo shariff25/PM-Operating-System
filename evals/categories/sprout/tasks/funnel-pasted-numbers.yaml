@@ -1,0 +1,27 @@
+# Rubric. The counts in the ask (visits 10,000, sign-ups 6,000, activated 1,500) give a step rate
+# of 60% from visit to sign-up, 25% from sign-up to activation and 15% overall; sign-up to
+# activation is both the lowest rate and the larger loss (4,500 users against 4,000). A passing
+# answer names it as the biggest drop, shows the counts beside the rates, gives two hypotheses
+# each with a test, says what the numbers do not show (the unit and the cohort), cites or
+# flags every claim, and drafts nothing because no page was asked for. It fails with a rate not
+# derived from these counts, a benchmark, one hypothesis, or a draft.
+# Departure from the spec's example numbers (sign-ups 1,200, activated 300): with those, visit
+# to sign-up is both the lowest rate (12%) and the larger loss, so the spec's expectation that
+# sign-up to activation is the biggest drop does not hold. Those numbers are in
+# funnel-measures-disagree.
+id: funnel-pasted-numbers
+ask: "Where does our signup funnel leak? Last month, 10,000 visits to the pricing page, 6,000 sign-ups, and 1,500 of those sign-ups activated (created their first project). All counts are users."
+expect:
+  approvals: 0
+  must_include:
+    - "25%"
+    - "60%"
+    - "15%"
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 0
+tags:
+  - model/missing-fact
+  - model/answered-beyond-sources

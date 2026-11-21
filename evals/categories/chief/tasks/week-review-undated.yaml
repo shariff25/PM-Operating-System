@@ -1,0 +1,25 @@
+# Rubric. The Jira fixtures carry no dates, so no Jira line can be shown: a passing answer shows
+# Ben's open SAML SSO question (1 day old on 2024-11-15, so under "Needs you" and not yet
+# "slipped") with its link, never names PM-101, PM-102 or PM-103 as slipped or late, and says
+# at most in one line that the Jira items carry no due dates (without their keys). It fails if
+# it calls any Jira item late, moved or backwards, invents a date, or drafts a nudge nobody
+# asked for.
+id: week-review-undated
+ask: "What slipped since Monday? Act as if today is 2024-11-15."
+expect:
+  approvals: 0
+  must_cite:
+    - "https://slack.com/archives/C0PMTEAM/p1731600000000100"
+  must_not_include:
+    - "<think>"
+    - "PM-101"
+    - "PM-102"
+    - "PM-103"
+  drafts:
+    - tool: slack.post_reply
+      count: 0
+    - tool: slack.send_message
+      count: 0
+tags:
+  - model/forbidden-text
+  - model/missing-citation

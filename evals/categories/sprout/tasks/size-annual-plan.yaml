@@ -1,0 +1,24 @@
+# No fixture holds customer counts, prices or conversion data, and the ask gives none. Rubric: a
+# passing answer proposes one Sizing draft in space PM with a low, base and high case (a range,
+# never one number) and the arithmetic shown, marks every input it could not source
+# `[unverified]` and lists them under "What would change it", and names the one assumption that
+# moves the answer most. It fails with a single point estimate, an invented customer count or
+# price presented as fact, or a missing section.
+id: size-annual-plan
+ask: "Draft anyway, no questions: size the annual-plan idea for Acme Vault in the PM space. The idea is a yearly subscription at a discount for customers who pay monthly today. I have no counts of customers, no prices and no conversion data to give you."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Sizing:", "Estimate", "Method", "Assumptions", "Sensitivity", "What would change it", "[unverified]"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: opportunity-sizing
+tags:
+  - model/draft-content
+  - model/answered-beyond-sources

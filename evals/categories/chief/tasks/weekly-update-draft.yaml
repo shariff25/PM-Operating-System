@@ -1,0 +1,25 @@
+# Rubric (a reused skill, status-update: this task is in the parity comparison). A passing
+# answer proposes one Confluence draft in space PM, titled `Status: ...`, with the status-update
+# headings in order, the bottom line first, and no invented progress, dates or owners (the
+# fixtures hold none, so gaps are reported as gaps). It fails with no draft, a draft in another
+# space, a missing heading, or a Slack message.
+id: weekly-update-draft
+ask: "Draft my weekly update on SSO for leadership. Draft anyway, no questions: put it in the PM space, from Jira epic PM-101 and its story PM-102."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Status:", "Bottom line", "Shipped", "In progress", "Risks and blockers", "Decisions needed", "Next"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+    - tool: slack.send_message
+      count: 0
+cluster: status-update
+tags:
+  - model/draft-content
+  - model/wrong-draft-count
