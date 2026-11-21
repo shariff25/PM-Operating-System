@@ -264,6 +264,9 @@ from the address alone before the sign-in name is looked up (M3), so an unknown 
 account get the same answer under load (tested with the open allowance full: both `429` from a
 new address, both the uniform `401` from a known one). A flood of junk can't stop a sign-in from
 a known address (tested), and setup and the signed-in routes never use the reserve (H1, LA).
+Junk sent from a known address may use the reserve too, but `pmos-web` lets one address make at
+most 20 refused attempts in 15 minutes, so filling 120 a minute takes many addresses where
+people really sign in.
 What it costs: under a flood, someone signing in from an address nobody has signed in from (a
 new person on a new network) waits until the flood ends; a new person's first sign-in is
 usually from the address they finished setup from, which is known. Routes that compute no hash
