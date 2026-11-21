@@ -483,6 +483,7 @@ async fn a_bet_carries_its_sources_sensitivity(f: Fixture) {
                 content_sha: None,
                 model_alias: None,
                 sources_sensitivity: Sensitivity::Restricted,
+                persona: None,
             },
             now(),
         )
@@ -705,6 +706,7 @@ async fn an_internal_failure_answers_a_generic_message() {
                 content_sha: None,
                 model_alias: None,
                 sources_sensitivity: Sensitivity::Internal,
+                persona: None,
             },
             now(),
         )

@@ -219,6 +219,7 @@ pub fn event(client: Client, user: &str, tool: &str, outcome: Outcome) -> AuditE
         args_hash: None,
         output_ref: None,
         detail: None,
+        persona: None,
     }
 }
 

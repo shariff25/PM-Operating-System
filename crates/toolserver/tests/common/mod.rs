@@ -379,7 +379,18 @@ pub async fn roles_fixture(
     members: &[(&str, pmos_contract::model::Role)],
     postgres: bool,
 ) -> Option<(Fixture, Option<TestPg>)> {
+    roles_fixture_with(members, postgres, |_| {}).await
+}
+
+/// [`roles_fixture`], with `extra` writing more content under the fixture's content root
+/// before it is loaded.
+pub async fn roles_fixture_with(
+    members: &[(&str, pmos_contract::model::Role)],
+    postgres: bool,
+    extra: impl FnOnce(&Path),
+) -> Option<(Fixture, Option<TestPg>)> {
     let (dir, root) = content_tree();
+    extra(&root);
     let team: Vec<_> = members
         .iter()
         .enumerate()

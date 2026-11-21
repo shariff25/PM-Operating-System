@@ -207,6 +207,7 @@ async fn record_with(
             args_hash: None,
             output_ref: None,
             detail: detail.map(String::from),
+            persona: None,
         })
         .await;
 }
@@ -391,6 +392,7 @@ pub fn safe_detail(detail: &str) -> Option<String> {
         || crate::users::detail::is_safe(detail)
         || crate::users::detail::is_purge_detail(detail)
         || crate::password::is_safe_detail(detail)
+        || crate::team::is_safe_detail(detail)
         || is_sign_in_detail(detail)
         || detail
             .strip_prefix("reason: ")
@@ -426,6 +428,7 @@ pub fn event_json(stored: &StoredEvent) -> Value {
         "target": e.output_ref,
         "skill": e.skill,
         "bot": e.bot,
+        "persona": e.persona,
         "task_id": e.run_id,
         "outcome": e.outcome.as_str(),
         "detail": e.detail.as_deref().and_then(safe_detail),
@@ -1018,6 +1021,7 @@ async fn sign_in_event(
         args_hash: None,
         output_ref,
         detail: Some(detail),
+        persona: None,
     };
     let ev = if *action == IDENTITY_CONFLICT {
         // A known Microsoft account signed in with another user's sign-in name: recorded as
@@ -1043,6 +1047,7 @@ async fn sign_in_event(
             args_hash: None,
             output_ref: Some(member.to_string()),
             detail: Some("entra".to_string()),
+            persona: None,
         }
     } else if *action == "web.sign_in_refused" {
         if user.is_some() {

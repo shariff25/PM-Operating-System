@@ -34,6 +34,7 @@ fn event(at: DateTime<Utc>, tool: &str) -> AuditEvent {
         args_hash: None,
         output_ref: None,
         detail: None,
+        persona: None,
     }
 }
 

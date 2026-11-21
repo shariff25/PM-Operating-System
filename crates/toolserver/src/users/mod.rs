@@ -1018,5 +1018,6 @@ pub(crate) fn audit_event(
         args_hash: None,
         output_ref: Some(event.target.clone()),
         detail: event.detail.clone(),
+        persona: None,
     }
 }

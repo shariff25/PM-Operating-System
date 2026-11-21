@@ -121,7 +121,8 @@ impl PgStore {
             credentials: s.clone(),
             memory_repos: s.clone(),
             member_requests: s.clone(),
-            users: s,
+            users: s.clone(),
+            teams: s,
         }
     }
 
@@ -345,8 +346,8 @@ impl SessionRepo for PgStore {
         sqlx::query(
             "INSERT INTO sessions
                  (token_hash, user_handle, skill, bot, run_id, created_at, expires_at,
-                  sources_sensitivity)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                  sources_sensitivity, persona)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(token_hash(&session.token))
         .bind(&session.user)
@@ -356,6 +357,7 @@ impl SessionRepo for PgStore {
         .bind(session.created_at)
         .bind(session.expires_at)
         .bind(session.sources_sensitivity.to_string())
+        .bind(&session.persona)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -363,7 +365,8 @@ impl SessionRepo for PgStore {
 
     async fn get(&self, token: &str, now: DateTime<Utc>) -> StoreResult<Option<Session>> {
         let row = sqlx::query(
-            "SELECT user_handle, skill, bot, run_id, created_at, expires_at, sources_sensitivity
+            "SELECT user_handle, skill, bot, persona, run_id, created_at, expires_at,
+                    sources_sensitivity
              FROM sessions WHERE token_hash = $1 AND expires_at > $2",
         )
         .bind(token_hash(token))
@@ -377,6 +380,7 @@ impl SessionRepo for PgStore {
                 user: r.try_get("user_handle")?,
                 skill: r.try_get("skill")?,
                 bot: r.try_get("bot")?,
+                persona: r.try_get("persona")?,
                 run_id: r.try_get("run_id")?,
                 created_at: r.try_get("created_at")?,
                 expires_at: r.try_get("expires_at")?,
@@ -439,6 +443,7 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
         user: r.try_get("user_handle")?,
         skill: r.try_get("skill")?,
         bot: r.try_get("bot")?,
+        persona: r.try_get("persona")?,
         run_id: r.try_get("run_id")?,
         tool: r.try_get("tool")?,
         args: r.try_get("args")?,
@@ -464,7 +469,8 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
 
 const ITEM_COLUMNS: &str = "id, user_handle, skill, bot, run_id, tool, args, args_hash, status, \
                             created_at, decided_at, decided_by, result, sources_sensitivity, \
-                            redacted_at, drafted_args, edited_at, target_conversation, revision";
+                            redacted_at, drafted_args, edited_at, target_conversation, revision, \
+                            persona";
 
 const REC_COLUMNS: &str = "id, approval_id, reviewer, verdict, note, note_removed_at, \
                            draft_revision, draft_sha256, created_at, withdrawn_at";
@@ -511,8 +517,8 @@ async fn insert_item(
     sqlx::query(
         "INSERT INTO approvals
              (id, user_handle, skill, bot, run_id, tool, args, args_hash, status, created_at,
-              sources_sensitivity)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+              sources_sensitivity, persona)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(&item.id)
     .bind(&item.user)
@@ -525,6 +531,7 @@ async fn insert_item(
     .bind(item.status.as_str())
     .bind(item.created_at)
     .bind(item.sources_sensitivity.map(|s| s.to_string()))
+    .bind(&item.persona)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
@@ -1242,6 +1249,29 @@ impl ApprovalRepo for PgStore {
         Ok(stored)
     }
 
+    async fn persona_counts(
+        &self,
+        user: Option<&str>,
+        since: DateTime<Utc>,
+    ) -> StoreResult<BTreeMap<String, u64>> {
+        let rows = sqlx::query(
+            "SELECT COALESCE(persona, $3) AS persona, count(*) AS n FROM approvals
+             WHERE created_at >= $1 AND ($2::text IS NULL OR user_handle = $2)
+             GROUP BY 1",
+        )
+        .bind(since)
+        .bind(user)
+        .bind(pmos_contract::personas::ALWAYS_ON)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = BTreeMap::new();
+        for r in &rows {
+            let n: i64 = r.try_get("n")?;
+            out.insert(r.try_get("persona")?, u64::try_from(n).unwrap_or(0));
+        }
+        Ok(out)
+    }
+
     async fn recommendations(&self, approval_ids: &[String]) -> StoreResult<Vec<Recommendation>> {
         if approval_ids.is_empty() {
             return Ok(Vec::new());
@@ -1280,8 +1310,8 @@ impl AuditSink for PgStore {
         sqlx::query(
             "INSERT INTO audit_events
                  (at, run_id, user_handle, skill, bot, tool, outcome, sources, args_hash,
-                  output_ref, detail, client, source_titles)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                  output_ref, detail, client, source_titles, persona)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(event.at)
         .bind(&event.run_id)
@@ -1300,6 +1330,7 @@ impl AuditSink for PgStore {
             (!event.source_titles.is_empty())
                 .then(|| sqlx::types::Json(event.source_titles.clone())),
         )
+        .bind(&event.persona)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1347,7 +1378,7 @@ impl AuditSink for PgStore {
         // `audit_events_at` covers the order and the cursor.
         let rows = sqlx::query(
             "SELECT id, at, run_id, user_handle, skill, bot, tool, outcome, sources, args_hash,
-                    output_ref, detail, client, source_titles
+                    output_ref, detail, client, source_titles, persona
              FROM audit_events
              WHERE ($1::timestamptz IS NULL OR (at, id) < ($1, $2))
                AND ($3::text IS NULL OR user_handle = $3)
@@ -1382,6 +1413,7 @@ impl AuditSink for PgStore {
                     user: r.try_get("user_handle")?,
                     skill: r.try_get("skill")?,
                     bot: r.try_get("bot")?,
+                    persona: r.try_get("persona")?,
                     tool: r.try_get("tool")?,
                     outcome: Outcome::parse(&outcome)
                         .ok_or_else(|| bad_row("outcome", &outcome))?,

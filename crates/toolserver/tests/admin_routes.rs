@@ -167,6 +167,7 @@ fn event(at_: &str, user: &str, tool: &str, outcome: Outcome) -> AuditEvent {
         args_hash: Some("hash-abc".into()),
         output_ref: None,
         detail: None,
+        persona: None,
     }
 }
 
