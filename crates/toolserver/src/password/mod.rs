@@ -520,6 +520,8 @@ pub struct PasswordService {
     /// refusal at the password step costs the same.
     dummy: String,
     slots: Arc<Semaphore>,
+    /// How long a request waits for a hashing slot ([`HASH_WAIT_SECS`]; shorter in tests).
+    hash_wait: std::time::Duration,
     global: GlobalLimit,
     /// Hashing work after an authentication, per account (H1, LA).
     work: AccountWork,
@@ -554,6 +556,7 @@ impl PasswordService {
             params,
             dummy,
             slots: Arc::new(Semaphore::new(HASH_PERMITS)),
+            hash_wait: std::time::Duration::from_secs(HASH_WAIT_SECS),
             global: GlobalLimit::default(),
             work: AccountWork::default(),
             setup_guesses: BlockGuesses::default(),
@@ -572,6 +575,23 @@ impl PasswordService {
     pub fn with_global(mut self, global: GlobalLimit) -> Self {
         self.global = global;
         self
+    }
+
+    /// With another wait for a hashing slot (tests: the busy paths without a 10-second wait).
+    pub fn with_hash_wait(mut self, wait: std::time::Duration) -> Self {
+        self.hash_wait = wait;
+        self
+    }
+
+    /// Hold every hashing slot until the permits are dropped (tests: every slot busy).
+    pub async fn hold_hashing_slots(&self) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let mut held = Vec::new();
+        for _ in 0..HASH_PERMITS {
+            if let Ok(p) = self.slots.clone().acquire_owned().await {
+                held.push(p);
+            }
+        }
+        held
     }
 
     pub fn params(&self) -> HashParams {
@@ -625,13 +645,10 @@ impl PasswordService {
         &self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> PwResult<T> {
-        let slot = tokio::time::timeout(
-            std::time::Duration::from_secs(HASH_WAIT_SECS),
-            self.slots.clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| PwError::Busy)?
-        .map_err(|_| PwError::Busy)?;
+        let slot = tokio::time::timeout(self.hash_wait, self.slots.clone().acquire_owned())
+            .await
+            .map_err(|_| PwError::Busy)?
+            .map_err(|_| PwError::Busy)?;
         let out = tokio::task::spawn_blocking(move || {
             let _slot = slot;
             work()
@@ -774,6 +791,12 @@ impl PasswordService {
             // H1: a correct password already given this many times in the window. Only the
             // holder of the password fills it (wrong guesses never count here). Checked here,
             // before the hash, and taken, in one step, once the password proved right (GL1).
+            // A full room answers `429` to every attempt on the account, right or wrong, as
+            // `docs/password-sign-in.md` says (the review of 8e8f8fe weighed `401`): only the
+            // password's holder fills it (wrong guesses never count; a busy check, here or in
+            // `change`, gives its piece back), and answering `401` would mean either hashing
+            // every attempt on a full room, which lets the holder spend the shared allowance
+            // past `pmos-web`'s count (H1), or calling the holder's right password wrong.
             if let Err(retry_after) = self.work.check(&h, now) {
                 return (w, Reserve::Busy(retry_after));
             }
@@ -1181,28 +1204,42 @@ impl PasswordService {
         // block (here, before the name is looked up, so the answer says nothing about it),
         // never against anyone's code. The slot is taken first and given back unless the
         // attempt was a wrong guess.
+        //
+        // The review of 8e8f8fe: past the block's guesses the attempt is still checked, so a
+        // flood of wrong guesses from the invitee's network can't refuse their right code. Over
+        // the limit every other outcome before the code matched is `429` (unknown name, wrong,
+        // expired or replaced code, a waiting address), whatever the name, and writes nothing:
+        // the answer says nothing about the name, as before. What such an attempt can still
+        // tell is whether its (name, code) pair is right, which takes a 100-bit code, and, by
+        // timing, whether the name exists (one lookup for an unknown name; a lookup and a short
+        // read for a real one), as below the limit. `pmos-web` counts each of these `429`s
+        // against the address (20 per 15 minutes).
         let block = limits::block_key(source);
-        self.setup_guesses
-            .take(&block, now)
-            .map_err(|retry_after| {
+        let over = match self.setup_guesses.take(&block, now) {
+            limits::Guess::Counted => None,
+            limits::Guess::OverLimit(retry_after) => {
                 tracing::warn!("setup-code guesses from one network block over the limit");
-                PwError::TooMany { retry_after }
-            })?;
+                Some(retry_after)
+            }
+        };
         let out = self
-            .setup_begin_counted(store, name, code, source, now)
+            .setup_begin_counted(store, name, code, source, over, now)
             .await;
-        if !matches!(out, Err(PwError::SetupFailed)) {
+        if over.is_none() && !matches!(out, Err(PwError::SetupFailed)) {
             self.setup_guesses.give_back(&block, now);
         }
         out
     }
 
+    /// The setup's first step; `over` is the block's `Retry-After` when it used its guesses
+    /// (then a refusal before the code matched is `429` and writes nothing).
     async fn setup_begin_counted(
         &self,
         store: &dyn PasswordStore,
         name: &str,
         code: &Secret,
         source: Option<&str>,
+        over: Option<u64>,
         now: DateTime<Utc>,
     ) -> PwResult<SetupStarted> {
         let key = limits::source_key(source);
@@ -1210,7 +1247,11 @@ impl PasswordService {
             Some(n) => store.handle_by_sign_in_name(&n).await?,
             None => None,
         };
+        let over_limit = |retry_after: u64| PwError::TooMany { retry_after };
         let Some(handle) = handle else {
+            if let Some(retry_after) = over {
+                return Err(over_limit(retry_after));
+            }
             self.setup_wrong_guesses.fetch_add(1, Ordering::Relaxed);
             store
                 .password_events(vec![event(
@@ -1235,10 +1276,13 @@ impl PasswordService {
                 web_event(ANONYMOUS, "password.setup_begin", outcome, &h, detail, now)
             };
             let Some(person) = s.person.as_ref() else {
-                return (w, Err(PwError::SetupFailed));
+                return (w, Err(over.map_or(PwError::SetupFailed, over_limit)));
             };
             let cred = s.credential.clone().unwrap_or_default();
             if limits::may_try_setup(&s.source, now).is_err() {
+                if let Some(retry_after) = over {
+                    return (Writes::default(), Err(over_limit(retry_after)));
+                }
                 w.events.push(ev(Outcome::Denied, "locked"));
                 return (w, Err(PwError::SetupFailed));
             }
@@ -1247,7 +1291,12 @@ impl PasswordService {
                 (Some(c), Some(hash)) => codes::same_hash(&c.hash, hash),
                 _ => false,
             };
-            let Some(c) = live.filter(|c| matched && c.expires_at > now) else {
+            let right = live.filter(|c| matched && c.expires_at > now);
+            if let (None, Some(retry_after)) = (right, over) {
+                // Over the block's guesses: only a right code goes on; nothing is written.
+                return (Writes::default(), Err(over_limit(retry_after)));
+            }
+            let Some(c) = right else {
                 let why = if matched { "expired" } else { "wrong_code" };
                 let mut src = s.source;
                 let started_wait = src.setup.fail(now);
@@ -1672,7 +1721,11 @@ impl PasswordService {
         self.take_work(handle, now)?;
         let block = limits::account_block(handle);
         self.take_global(now, Draw::open(&block))
-            .map_err(|retry_after| PwError::TooMany { retry_after })?;
+            .map_err(|retry_after| {
+                // The second hash had no room: no work was done, so the piece goes back.
+                self.work.give_back(handle, now);
+                PwError::TooMany { retry_after }
+            })?;
         let h = handle.to_string();
         let reserved = tx(store, handle, None, Some(&key), now, move |s| {
             let mut w = Writes::default();
@@ -1709,9 +1762,29 @@ impl PasswordService {
         })
         .await??;
         let (stored, epoch, started_wait) = reserved;
-        let right = self.verify(current, stored.clone()).await?;
+        // The review of 8e8f8fe: when every hashing slot is busy nothing was checked, so what
+        // this call counted goes back: the piece of the account's work and the failure counted
+        // ahead (a wait it started stays), as the password step and a setup's password do (G3).
+        // Before, ten busy tries during someone else's flood filled the person's own room.
+        let right = match self.verify(current, stored.clone()).await {
+            Ok(right) => right,
+            Err(PwError::Busy) => {
+                self.give_back_change(store, handle, now).await;
+                return Err(PwError::Busy);
+            }
+            Err(e) => return Err(e),
+        };
         let new_hash = if right {
-            Some(self.hash(new).await?)
+            match self.hash(new).await {
+                Ok(h) => Some(h),
+                Err(PwError::Busy) => {
+                    // The current password was checked (one hash ran), and was right: the
+                    // failure counted ahead goes back; the piece of work stays (work was done).
+                    self.give_back_reauth_failure(store, handle, now).await;
+                    return Err(PwError::Busy);
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             None
         };
@@ -1772,6 +1845,37 @@ impl PasswordService {
             (w, Ok(epoch))
         })
         .await?
+    }
+
+    /// Give back what [`Self::change`] counted ahead of a check that never ran: the piece of
+    /// the account's work and the re-authentication failure. Best effort, as
+    /// [`Self::give_back_failure`].
+    async fn give_back_change(&self, store: &dyn PasswordStore, handle: &str, now: DateTime<Utc>) {
+        self.work.give_back(handle, now);
+        self.give_back_reauth_failure(store, handle, now).await;
+    }
+
+    /// Give back one re-authentication failure counted ahead (a count only: a wait stays).
+    async fn give_back_reauth_failure(
+        &self,
+        store: &dyn PasswordStore,
+        handle: &str,
+        now: DateTime<Utc>,
+    ) {
+        let key = limits::session_key();
+        let r = tx(store, handle, None, Some(&key), now, |s| {
+            let mut w = Writes::default();
+            let mut src = s.source;
+            src.sign_in.give_back();
+            w.source = Some(src);
+            (w, ())
+        })
+        .await;
+        if r.is_err() {
+            tracing::warn!(
+                "a re-authentication failure counted ahead of a busy check wasn't given back"
+            );
+        }
     }
 
     /// A signed-in person replaces their recovery codes (an authenticator code proves it).
