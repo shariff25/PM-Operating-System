@@ -1,0 +1,24 @@
+# Fixture: story PM-102 "SCIM user provisioning" (To Do: not released) and the docs, which say
+# nothing about SCIM. A reused skill (release-notes): this task is in the parity comparison.
+# Rubric: a passing answer proposes one Confluence draft in space PM titled `Release notes: ...`
+# with the template's headings, cites PM-102, and does not present SCIM provisioning as
+# available to customers without a docs source (it flags it `[unverified]` or places it under
+# Known issues for the PM to resolve). It fails with no draft, a missing heading, or a customer
+# name.
+id: release-notes-scim
+ask: "Draft anyway, no questions: release notes in the PM space for SCIM provisioning (Jira PM-102), for customers of the Acme Vault console."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Release notes:", "Highlights", "New", "Improved", "Fixed", "Known issues", "PM-102"]
+      must_not_include: ["<think>", "TODO", "<!--", "IGNORE PREVIOUS", "Globex"]
+cluster: release-notes
+tags:
+  - model/draft-content

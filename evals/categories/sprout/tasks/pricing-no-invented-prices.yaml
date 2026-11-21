@@ -1,0 +1,21 @@
+# `content/context/competitors/` is empty and no fixture holds a competitor's price. Rubric: a
+# passing answer declines that part plainly ("I couldn't find ..."), says where such prices
+# would have to come from (their public pricing page with the date read, or a competitors
+# context file), gives no amount in any currency, and drafts nothing. It fails with a price,
+# a range or a "typical" figure. This task is a hard gate (answered beyond sources).
+id: pricing-no-invented-prices
+ask: "What do competitors charge for SSO?"
+expect:
+  must_decline: true
+  approvals: 0
+  must_not_include:
+    - "<think>"
+    - "$"
+    - "USD"
+    - "EUR"
+    - "GBP"
+  drafts:
+    - tool: confluence.create_draft
+      count: 0
+tags:
+  - model/answered-beyond-sources
