@@ -22,6 +22,7 @@ use crate::bots::{plain_text, Bots};
 use crate::cards;
 use crate::commands::FollowUp;
 use crate::member_cards::NOT_A_MEMBER;
+use crate::personas::{self, Persona, Speaker};
 use crate::runtime::RuntimeError;
 
 /// The marker the `slack-reply` skill recognizes, first on the task's first line.
@@ -228,20 +229,44 @@ impl Bots {
             // The tool reports it later, if it is a problem.
             Err(e) => tracing::warn!(error = %e, "onboarding state unavailable for a tag"),
         }
-        let Some((dm, root)) = self.open_tag_thread(&m, &shown).await else {
+        // `@PM OS Chief: …` asks Chief (`docs/bot-marketplace-spec.md` §9): the prefix is read
+        // only from the PM's own tag, after the app's mention.
+        let (persona, ask) = match self.persona_prefix(&m.ask).await {
+            Some((p, ask)) if ask.is_empty() => (Some(p), DEFAULT_ASK.to_string()),
+            Some((p, ask)) => (Some(p), ask),
+            None => (None, m.ask.clone()),
+        };
+        let speaker = persona.as_ref().map(|p| Speaker {
+            name: p.shown(),
+            preview: None,
+        });
+        let Some((dm, root)) = self.open_tag_thread(&m, &shown, speaker.as_ref()).await else {
             return self.tell_thread(&m, COULD_NOT_START).await;
         };
-        let text = task_text(&m.channel, &m.thread_ts, &m.ts, &m.ask);
+        let text = task_text(&m.channel, &m.thread_ts, &m.ts, &ask);
         // Remembered first, so the PM's reply in the DM thread goes to the same bot.
         self.remember_thread(&dm, &root, &bot);
         match self
             .runtime()
-            .create_task(&handle, &bot, &text, &dm, &root)
+            .create_task_as(
+                &handle,
+                &bot,
+                &text,
+                &dm,
+                &root,
+                persona.as_ref().map(|p| p.key.as_str()),
+            )
             .await
         {
             Ok(task) => {
                 tracing::info!(task = %task["id"], bot, user = handle, "task created from a tag");
                 self.tell_thread(&m, &on_it_text(&dm)).await;
+            }
+            Err(RuntimeError::Persona(code)) => {
+                self.forget_thread(&dm, &root);
+                tracing::info!(code, user = handle, "persona tag refused by the runtime");
+                let name = persona.as_ref().map(Persona::shown).unwrap_or_default();
+                self.tell_thread(&m, &personas::refusal(&code, &name)).await;
             }
             Err(e) => {
                 self.forget_thread(&dm, &root);
@@ -257,8 +282,14 @@ impl Bots {
     }
 
     /// Open the PM's DM and post the thread's root message there, under the personal bot's
-    /// name. Returns the DM channel and the root message's ts.
-    async fn open_tag_thread(&self, m: &Mention, shown: &str) -> Option<(String, String)> {
+    /// name (starting with the marketplace bot's, when one was asked). Returns the DM channel
+    /// and the root message's ts.
+    async fn open_tag_thread(
+        &self,
+        m: &Mention,
+        shown: &str,
+        speaker: Option<&Speaker>,
+    ) -> Option<(String, String)> {
         let dm = match self.slack().open_dm(&m.user).await {
             Ok(dm) if dm_ok(&dm) => dm,
             Ok(_) => {
@@ -277,14 +308,11 @@ impl Bots {
                 None
             }
         };
-        let root = self
-            .post(
-                &dm,
-                None,
-                Some(shown),
-                cards::note(&dm_root_text(&m.channel, permalink.as_deref())),
-            )
-            .await?;
+        let mut message = cards::note(&dm_root_text(&m.channel, permalink.as_deref()));
+        if let Some(speaker) = speaker {
+            message = personas::attribute(message, speaker);
+        }
+        let root = self.post(&dm, None, Some(shown), message).await?;
         if !dm_ok(&root.channel) || !ts_ok(&root.ts) {
             tracing::warn!("the DM root message came back without usable ids");
             return None;
