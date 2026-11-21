@@ -2,7 +2,7 @@
 # PM OS operations on the Spark, for platform-owner PMs (docs/runbooks/README.md).
 #
 #   pmos-admin build                  build the service and worker images on this machine
-#   pmos-admin up [--models] [--console] [--bringup]
+#   pmos-admin up [--models] [--console] [--web] [--bringup]
 #                                     start the stack (Slack joins when its tokens are set)
 #   pmos-admin down                   stop everything (data is kept)
 #   pmos-admin status                 is every service up and ready?
@@ -11,8 +11,14 @@
 #   pmos-admin backup                 databases and logs to deploy/backups/<time>/
 #   pmos-admin restore <dir>          put a backup back (stops the services while it runs)
 #   pmos-admin reindex                reload content after a merge (lint-gated)
+#   pmos-admin audit purge --dry-run  how many audit events the next daily purge deletes
 #   pmos-admin revoke <handle> <atlassian|slack|github>
 #                                     remove a PM's linked account and its tokens
+#   pmos-admin users <command> …      the user database, on the host (docs/runbooks/users.md):
+#                                     bootstrap-admin, grant-admin, revoke-admin, set-entra,
+#                                     unset-entra, set-sign-in-name, set-atlassian-email,
+#                                     deactivate, reactivate, pilot-exception, import, export,
+#                                     list; each records the OS user who ran it
 #   pmos-admin ledger [--since 7d] [--export]
 #                                     what happened to the bots' drafts (feedback ledger)
 #   pmos-admin add-bot <bot>          give a new bot its own runtime and gateway tokens
@@ -20,7 +26,7 @@
 #   pmos-admin pause <bot> / resume <bot>
 #                                     stop or restart a bot's sandbox
 #   pmos-admin lint                   pmos lint and pmos policy check on the content checkout
-#   pmos-admin pmos <args>            the pmos CLI on the checkout, e.g. `pmos member add …`
+#   pmos-admin pmos <args>            the pmos CLI on the checkout, e.g. `pmos bot add-personal …`
 #                                     (paths are relative to the checkout: --root content)
 #   pmos-admin evals <args>           pmos-evals against the live stack (the load test)
 #   pmos-admin evals-run --category <c> [--checkout <dir>] [--note <why>]
@@ -47,6 +53,205 @@ compose() { docker compose --project-directory "$DEPLOY" -f "$DEPLOY/compose.yam
 say() { printf '%s\n' "$*"; }
 row() { printf '  %-12s %-6s %s\n' "$1" "$2" "$3"; }
 
+# The console's sign-in settings. The console checks them too; this says so before anything
+# starts (docs/console.md, Sign-in).
+console_checks() {
+  local proxy_secret="${PMOS_CONSOLE_PROXY_SECRET:-}"
+  if [ "${PMOS_CONSOLE_TRUST_PROXY:-0}" = 1 ] && [ ${#proxy_secret} -lt 32 ]; then
+    echo "PMOS_CONSOLE_TRUST_PROXY=1 needs PMOS_CONSOLE_PROXY_SECRET (at least 32 characters) in" >&2
+    echo "deploy/.env: run deploy/setup.sh to generate it, and set the reverse proxy to send it in" >&2
+    echo "X-Pmos-Proxy-Secret (docs/console.md, Sign-in)." >&2
+    return 1
+  fi
+  if [ -n "${PMOS_CONSOLE_DEV_USER:-}" ]; then
+    echo "PMOS_CONSOLE_DEV_USER needs a loopback bind, and the console container listens on" >&2
+    echo "0.0.0.0: clear it and use PMOS_CONSOLE_TRUST_PROXY=1 (docs/console.md, Sign-in)." >&2
+    return 1
+  fi
+}
+
+# A real value in deploy/.env: set, and not the `generated` placeholder setup.sh fills in.
+is_set() { [ -n "${!1:-}" ] && [ "${!1}" != generated ]; }
+
+# User assertions (docs/user-assertion.md, Modes), checked before anything (re)creates the
+# runtime or the tool server: `up`, `add-bot`, and the `up` after a `restore`. The mode lives in
+# deploy/.env (setup.sh writes `require`), never in one command's environment, so every path
+# starts them the same way. With a web or console token set, the services themselves refuse to
+# start in `off` or `verify`; this says so first, and that each set client has its keys, so
+# nothing is half-configured. The development override (PMOS_ASSERTION_INSECURE_OFF) is for
+# fake-data development stacks only: compose.yaml doesn't pass it, so it is refused here too.
+assertion_checks() {
+  local mode="${PMOS_ASSERTION_MODE:-}" person=() k
+  for k in PMOS_RT_WEB_TOKEN PMOS_TS_WEB_TOKEN PMOS_RT_CONSOLE_TOKEN PMOS_CONSOLE_TS_TOKEN; do
+    if is_set "$k"; then person+=("$k"); fi
+  done
+  case "$mode" in
+    "" | off | verify | require) ;;
+    *) say "PMOS_ASSERTION_MODE=$mode in deploy/.env: use require (docs/user-assertion.md)" >&2; return 1 ;;
+  esac
+  if [ ${#person[@]} -gt 0 ] && [ -n "$mode" ] && [ "$mode" != require ]; then
+    if [ -n "${PMOS_ASSERTION_INSECURE_OFF:-}" ]; then
+      say "PMOS_ASSERTION_INSECURE_OFF is set in deploy/.env: that override is for fake-data" >&2
+      say "development stacks only, and this deployment doesn't pass it to the services." >&2
+    fi
+    say "PMOS_ASSERTION_MODE=$mode in deploy/.env, with ${person[*]} set: the runtime and the" >&2
+    say "tool server refuse to start like this. Set PMOS_ASSERTION_MODE=require in deploy/.env" >&2
+    say "(docs/user-assertion.md, Modes)." >&2
+    return 1
+  fi
+  local pair effective
+  for pair in PMOS_RT_WEB_TOKEN:PMOS_AK_WEB_BOTS PMOS_TS_WEB_TOKEN:PMOS_AK_WEB_TOOLSERVER \
+    PMOS_RT_CONSOLE_TOKEN:PMOS_AK_CONSOLE_BOTS PMOS_CONSOLE_TS_TOKEN:PMOS_AK_CONSOLE_TOOLSERVER; do
+    if is_set "${pair%%:*}" && ! is_set "${pair##*:}"; then
+      say "${pair%%:*} is set but ${pair##*:} isn't: run deploy/setup.sh again to generate it" >&2
+      return 1
+    fi
+  done
+  if [ ${#person[@]} -gt 0 ]; then
+    effective=${mode:-require}
+  else
+    effective=${mode:-off}
+  fi
+  say "user assertions: $effective"
+}
+
+# Everything a client needs before its profile starts: `up --web` or `up --console`.
+client_settings() { # web|console
+  local k missing=()
+  case "$1" in
+    web) set -- PMOS_RT_WEB_TOKEN PMOS_TS_WEB_TOKEN PMOS_AK_WEB_BOTS PMOS_AK_WEB_TOOLSERVER ;;
+    console) set -- PMOS_RT_CONSOLE_TOKEN PMOS_CONSOLE_TS_TOKEN PMOS_AK_CONSOLE_BOTS PMOS_AK_CONSOLE_TOOLSERVER ;;
+  esac
+  for k in "$@"; do is_set "$k" || missing+=("$k"); done
+  if [ ${#missing[@]} -gt 0 ]; then
+    say "not set in deploy/.env: ${missing[*]}. Run deploy/setup.sh again to generate them." >&2
+    return 1
+  fi
+}
+
+# An IPv4 address as a number; nothing for anything else.
+ipv4_number() {
+  local IFS=. a b c d
+  read -r a b c d <<<"$1"
+  for o in "$a" "$b" "$c" "$d"; do
+    [[ "$o" =~ ^[0-9]{1,3}$ ]] && [ "$o" -le 255 ] || return 1
+  done
+  echo $(((a << 24) | (b << 16) | (c << 8) | d))
+}
+
+# Is the IPv4 address $1 inside the IPv4 subnet $2 (a.b.c.d/n)?
+ipv4_in_subnet() {
+  local ip net bits mask
+  ip=$(ipv4_number "$1") || return 1
+  net=$(ipv4_number "${2%/*}") || return 1
+  bits=${2#*/}
+  [[ "$bits" =~ ^[0-9]{1,2}$ ]] && [ "$bits" -le 32 ] || return 1
+  mask=$(((0xffffffff << (32 - bits)) & 0xffffffff))
+  [ $((ip & mask)) = $((net & mask)) ]
+}
+
+# Password sign-in counts refused attempts per browser address (docs/password-sign-in.md,
+# "Behind the deploy kit's reverse proxy"). The web app listens on 0.0.0.0 in its container and
+# the reverse proxy on this host reaches it through the published port, so every request
+# arrives from the `pmos` network's gateway, which deploy/compose.yaml pins
+# (PMOS_NETWORK_GATEWAY, in PMOS_NETWORK_SUBNET; the re-check of eb24d28, M1). pmos-web refuses
+# to start unless it is told that address (PMOS_WEB_TRUSTED_PROXIES) and has an https:// public
+# URL. This refuses, with the exact fix, before anything starts: a blank setting; a network
+# made before its gateway was pinned (its real gateway isn't PMOS_NETWORK_GATEWAY); and a
+# trusted address that is neither the real gateway nor inside the pinned subnet, which would
+# make pmos-web refuse every browser. An address inside the subnet (a proxy in a container on
+# the pmos network) needs PMOS_WEB_TRUST_PROXY_IN_NETWORK=1 and is warned about every time
+# (the gate review of 04c175f, GL4): Docker hands those addresses out.
+password_web_checks() {
+  [ "${PMOS_WEB_PASSWORD_LOGIN:-0}" = 1 ] || return 0
+  local bad=0 real want subnet entry
+  want=${PMOS_NETWORK_GATEWAY:-10.201.77.1}
+  subnet=${PMOS_NETWORK_SUBNET:-10.201.77.0/24}
+  real=$(docker network inspect pmos_pmos --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)
+  if [ -n "$real" ] && [ "$real" != "$want" ]; then
+    {
+      say "The pmos network's gateway is $real, but deploy/.env pins PMOS_NETWORK_GATEWAY=$want"
+      say "(PMOS_NETWORK_SUBNET=$subnet): the network was made before its address was pinned, or"
+      say "with other settings. Re-create it, then start again:"
+      say "  deploy/pmos-admin down && deploy/pmos-admin up --web"
+    } >&2
+    bad=1
+  fi
+  [ -n "$real" ] || real=$want
+  if [ -z "${PMOS_WEB_TRUSTED_PROXIES:-}" ]; then
+    {
+      say "PMOS_WEB_TRUSTED_PROXIES is blank in deploy/.env. With password sign-in on, the web app"
+      say "must know the address the reverse proxy reaches it from, or every browser would share"
+      say "one limit on refused sign-ins (and pmos-web refuses to start)."
+      say "The reverse proxy on this host reaches it from the pmos network's gateway. Set:"
+      say "  PMOS_WEB_TRUSTED_PROXIES=$real"
+      say "  (the gateway is pinned in deploy/.env, PMOS_NETWORK_GATEWAY; check it with:"
+      say "   docker network inspect pmos_pmos --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}')"
+      say "A reverse proxy in a container on the pmos network instead: set its container address."
+    } >&2
+    bad=1
+  else
+    local list=()
+    IFS=, read -ra list <<<"$PMOS_WEB_TRUSTED_PROXIES"
+    for entry in "${list[@]}"; do
+      entry=${entry//[[:space:]]/}
+      [ -n "$entry" ] || continue
+      [ "$entry" = "$real" ] && continue
+      # The gate review of 04c175f (GL4): only the gateway by default. An address inside the
+      # subnet (a proxy in a container on the pmos network) is assigned by Docker and can be
+      # handed to another container after a restart, which would then be believed about its
+      # X-Forwarded-For: it needs PMOS_WEB_TRUST_PROXY_IN_NETWORK=1, and a warning every time.
+      if ipv4_in_subnet "$entry" "$subnet" && [ "${PMOS_WEB_TRUST_PROXY_IN_NETWORK:-0}" = 1 ]; then
+        {
+          say "WARNING: PMOS_WEB_TRUSTED_PROXIES names $entry, an address inside the pmos network"
+          say "($subnet), trusted because PMOS_WEB_TRUST_PROXY_IN_NETWORK=1. Docker assigns those"
+          say "addresses: pin the proxy container's address (ipv4_address in compose), or any"
+          say "container that later gets $entry is believed about which browser it speaks for."
+        } >&2
+        continue
+      fi
+      if ipv4_in_subnet "$entry" "$subnet"; then
+        {
+          say "PMOS_WEB_TRUSTED_PROXIES names $entry, an address inside the pmos network ($subnet)."
+          say "Only the network's gateway, $real, is trusted by default: Docker assigns the other"
+          say "addresses, and whichever container holds $entry would be believed about which"
+          say "browser it speaks for. A reverse proxy on this host reaches the web app from the"
+          say "gateway; set:"
+          say "  PMOS_WEB_TRUSTED_PROXIES=$real"
+          say "A reverse proxy in a container on the pmos network with a pinned address: also set"
+          say "  PMOS_WEB_TRUST_PROXY_IN_NETWORK=1"
+        } >&2
+        bad=1
+      else
+        {
+          say "PMOS_WEB_TRUSTED_PROXIES names $entry, but the reverse proxy on this host reaches the"
+          say "web app from the pmos network's gateway, $real. pmos-web would refuse every browser"
+          say "(403 proxy_not_trusted). Set:"
+          say "  PMOS_WEB_TRUSTED_PROXIES=$real"
+          say "(A proxy in a container on the pmos network has an address inside $subnet.)"
+        } >&2
+        bad=1
+      fi
+    done
+  fi
+  case "${PMOS_WEB_PUBLIC_URL:-}" in
+    https://*) ;;
+    *)
+      say "PMOS_WEB_PUBLIC_URL must be the web app's https:// address with password sign-in on" >&2
+      say "(passwords and codes never cross the network in the clear)." >&2
+      bad=1
+      ;;
+  esac
+  return $bad
+}
+
+# Is the web app's Entra sign-in fully set in deploy/.env? (pmos-web itself refuses a partial
+# one at start-up, naming what is missing.)
+entra_configured() {
+  [ -n "${PMOS_WEB_ENTRA_TENANT_ID:-}" ] && [ -n "${PMOS_WEB_ENTRA_CLIENT_ID:-}" ] &&
+    [ -n "${PMOS_WEB_ENTRA_CLIENT_SECRET:-}" ] && [ -n "${PMOS_WEB_PUBLIC_URL:-}" ]
+}
+
 profiles() {
   local p=()
   if [ -n "${PMOS_SLACK_APP_TOKEN:-}" ] && [ -n "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
@@ -56,6 +261,20 @@ profiles() {
     case "$arg" in
       --models) p+=(--profile models) ;;
       --console) p+=(--profile console) ;;
+      --web)
+        if [ "${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}" != 1 ] && ! entra_configured &&
+          [ "${PMOS_WEB_PASSWORD_LOGIN:-0}" != 1 ]; then
+          {
+            echo "the web app is off: it needs Entra sign-in (PMOS_WEB_ENTRA_TENANT_ID,"
+            echo "PMOS_WEB_ENTRA_CLIENT_ID, PMOS_WEB_ENTRA_CLIENT_SECRET and PMOS_WEB_PUBLIC_URL in"
+            echo "deploy/.env; docs/entra-sign-in.md), or password sign-in (PMOS_WEB_PASSWORD_LOGIN=1;"
+            echo "docs/password-sign-in.md). Or, on a closed test network only, set"
+            echo "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1 for DEVELOPMENT sign-in"
+            echo "(anyone who can reach it signs in as any team member; docs/web-app-running.md)."
+          } >&2
+          exit 2
+        fi
+        p+=(--profile web) ;;
       --bringup) p+=(--profile bringup) ;;
       *) say "unknown option $arg" >&2; exit 2 ;;
     esac
@@ -94,20 +313,26 @@ eval_stack_up() { # checkout
   fi
   EVAL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pmos-evals.XXXXXX")
   chmod 755 "$EVAL_DIR"
-  # The checkout's content, plus the members the fake fixtures expect: `evals` (U0EVALS), whom
-  # the benchmark tasks are requested by, with their personal bot pm-evals, and their teammates
-  # ben (U0BEN) and cy (U0CY), so the fake channels' audiences mean what the tasks say
-  # (crates/toolserver/src/connectors/fake.rs). Only this copy is changed.
+  # The checkout's content, plus the people the fake fixtures expect: `evals` (U0EVALS), whom
+  # the benchmark tasks are requested by, and their teammates ben (U0BEN) and cy (U0CY), so
+  # the fake channels' audiences mean what the tasks say (crates/toolserver/src/connectors/fake.rs),
+  # and `eval-admin` (U0EVALADM, in no fake channel): the user database always needs an active
+  # admin. They are the tool server's seed (PMOS_USERS_SEED, compose.evals.yaml), a file beside
+  # the content, never in it; each gets a personal bot in this copy of the content (pm-evals is
+  # the one the tasks use). Only this copy is changed.
   # -P: a symbolic link in the checkout is copied as a link, never followed on this machine.
   cp -RP "$checkout/content" "$EVAL_DIR/content"
   mkdir -p "$EVAL_DIR/baseline" "$EVAL_DIR/out"
   local who
-  for who in evals:U0EVALS ben:U0BEN cy:U0CY; do
+  printf 'members:\n' >"$EVAL_DIR/users.seed.yaml"
+  for who in evals:U0EVALS:pm ben:U0BEN:pm cy:U0CY:pm eval-admin:U0EVALADM:pm,admin; do
+    local handle=${who%%:*} rest=${who#*:}
+    printf '  - {handle: %s, slack-id: %s, roles: [%s]}\n' "$handle" "${rest%%:*}" "${rest#*:}" >>"$EVAL_DIR/users.seed.yaml"
     docker run --rm --user "${PMOS_UID:-10001}:${PMOS_GID:-10001}" -v "$EVAL_DIR/content:/srv/content" \
-      "pmos:${PMOS_VERSION:-local}" pmos member add --root /srv/content --handle "${who%%:*}" \
-      --slack-id "${who##*:}" --roles pm >/dev/null
+      "pmos:${PMOS_VERSION:-local}" pmos bot add-personal --root /srv/content --handle "$handle" >/dev/null
   done
   chown -R "${PMOS_UID:-10001}:${PMOS_GID:-10001}" "$EVAL_DIR" 2>/dev/null || true
+  export PMOS_EVAL_USERS_SEED="$EVAL_DIR/users.seed.yaml"
   export PMOS_EVAL_CONTENT="$EVAL_DIR/content" PMOS_EVAL_CHECKOUT="$checkout" PMOS_EVAL_BASELINE="$EVAL_DIR/baseline" PMOS_EVAL_OUT="$EVAL_DIR/out"
   for v in SERVICE_TOKEN BOT_TOKEN RT_EVALS RT_CONSOLE RT_DOCS RT_PERSONAL; do
     export "PMOS_EVAL_$v=$(openssl rand -hex 24)"
@@ -150,7 +375,22 @@ case "$cmd" in
     ;;
 
   up)
-    mapfile -t prof < <(profiles "$@")
+    for arg in "$@"; do
+      if [ "$arg" = --console ]; then
+        console_checks || exit 2
+        client_settings console || exit 2
+      fi
+      if [ "$arg" = --web ]; then
+        client_settings web || exit 2
+        password_web_checks || exit 2
+      fi
+    done
+    # Not a process substitution: a refusal in `profiles` (an unknown option, a web app with no
+    # sign-in) must stop `up` here, and its exit would be lost in one.
+    profile_lines=$(profiles "$@") || exit $?
+    prof=()
+    [ -z "$profile_lines" ] || mapfile -t prof <<<"$profile_lines"
+    assertion_checks || exit 2
     if [ -z "${PMOS_SLACK_APP_TOKEN:-}" ] || [ -z "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
       say "note: the Slack bot is off until PMOS_SLACK_APP_TOKEN and PMOS_SLACK_BOT_TOKEN are set"
     fi
@@ -159,12 +399,12 @@ case "$cmd" in
     ;;
 
   down)
-    compose --profile slack --profile console --profile models --profile bringup down
+    compose --profile slack --profile console --profile web --profile models --profile bringup down
     ;;
 
   status)
     say "== containers"
-    compose --profile slack --profile console --profile models --profile bringup ps \
+    compose --profile slack --profile console --profile web --profile models --profile bringup ps \
       --format 'table {{.Service}}\t{{.Status}}'
     say "== readiness"
     check() { # name url
@@ -173,12 +413,28 @@ case "$cmd" in
       code=${body##*$'\n'}
       body=${body%$'\n'*}
       if [ "$code" = 200 ]; then row "$1" ok "${body:0:90}"; else row "$1" "$code" "${body:0:90}"; fi
+      # A readiness warning (the web app's GL3: password requests refused proxy_not_trusted
+      # in the last 15 minutes): ready, but every browser behind that proxy is refused.
+      if [[ "$body" == *'"warnings":["'* ]]; then
+        local w=${body#*\"warnings\":[}
+        w=${w%%]*}
+        row "$1" WARN "${w//\"/}"
+        if [[ "$w" == *untrusted_proxy_refusals* ]]; then
+          row "" "" "password sign-ins are refused proxy_not_trusted: PMOS_WEB_TRUSTED_PROXIES must be"
+          row "" "" "where the reverse proxy reaches the web app from (docs/password-sign-in.md)"
+        fi
+      fi
     }
     check toolserver http://127.0.0.1:8710/readyz
     check gateway http://127.0.0.1:8740/readyz
     check bots http://127.0.0.1:8750/readyz
     if compose --profile console ps --status running --services 2>/dev/null | grep -qx console; then
       check console http://127.0.0.1:8760/healthz
+    fi
+    if compose --profile web ps --status running --services 2>/dev/null | grep -qx web; then
+      # /readyz: with Entra sign-in on it includes `entra_link`, whether the tool server
+      # validates first-link tokens for the same tenant and client id (docs/entra-sign-in.md).
+      check web http://127.0.0.1:8770/readyz
     fi
     if compose exec -T docs curl -fsS -m 5 http://127.0.0.1:8730/readyz >/dev/null 2>&1; then
       row docs ok "ready"
@@ -191,12 +447,12 @@ case "$cmd" in
     [ $# -ge 1 ] || { say "usage: pmos-admin logs <service> [-f]" >&2; exit 2; }
     svc=$1
     shift
-    compose --profile slack --profile console --profile models --profile bringup logs --tail 200 "$@" "$svc"
+    compose --profile slack --profile console --profile web --profile models --profile bringup logs --tail 200 "$@" "$svc"
     ;;
 
   restart)
     [ $# -eq 1 ] || { say "usage: pmos-admin restart <service>" >&2; exit 2; }
-    compose --profile slack --profile console --profile models --profile bringup restart "$1"
+    compose --profile slack --profile console --profile web --profile models --profile bringup restart "$1"
     ;;
 
   backup)
@@ -219,10 +475,13 @@ case "$cmd" in
     [ $# -eq 1 ] && [ -d "$1" ] || { say "usage: pmos-admin restore <backup dir>" >&2; exit 2; }
     dir=$(cd "$1" && pwd)
     (cd "$dir" && sha256sum -c --quiet SHA256SUMS) || { say "the backup's checksums don't match; not restoring" >&2; exit 1; }
+    # The `up` that follows starts the services from deploy/.env: check now that it will
+    # start them with assertions as configured, before anything is stopped.
+    assertion_checks || exit 2
     say "This replaces every PM OS database with the backup in $dir."
     read -r -p "Type RESTORE to go on: " answer
     [ "$answer" = RESTORE ] || { say "stopped; nothing changed"; exit 1; }
-    compose --profile slack --profile console --profile bringup stop docs toolserver gateway bots slack console worker-docs 2>/dev/null || true
+    compose --profile slack --profile console --profile web --profile bringup stop docs toolserver gateway bots slack console web worker-docs 2>/dev/null || true
     compose up -d postgres
     until compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
     for db in toolserver bots docs; do
@@ -241,9 +500,74 @@ case "$cmd" in
     internal POST /internal/reindex && echo
     ;;
 
+  audit)
+    # Read-only: what the tool server's next daily purge would delete (docs/audit-retention.md).
+    [ "$*" = "purge --dry-run" ] || { say "usage: pmos-admin audit purge --dry-run (the tool server purges daily itself)" >&2; exit 2; }
+    days=${PMOS_AUDIT_RETENTION_DAYS:-90}
+    case "$days" in '' | *[!0-9]*) say "PMOS_AUDIT_RETENTION_DAYS=$days isn't a number of days" >&2; exit 2 ;; esac
+    [ "$days" -ge 90 ] || { say "PMOS_AUDIT_RETENTION_DAYS=$days is under the 90-day minimum" >&2; exit 2; }
+    compose exec -T postgres psql -U postgres -d pmos_toolserver -v ON_ERROR_STOP=1 -At -F ' ' \
+      -c "SELECT count(*), coalesce(min(at)::text, '-') FROM audit_events WHERE at < now() - make_interval(days => $days)" |
+      { read -r n oldest; say "retention $days days: $n events would be deleted (oldest: $oldest); nothing was deleted"; }
+    ;;
+
   revoke)
     [ $# -eq 2 ] || { say "usage: pmos-admin revoke <handle> <atlassian|slack|github>" >&2; exit 2; }
     internal DELETE "/internal/credentials/$1/$2" && say "revoked $2 for $1"
+    ;;
+
+  users)
+    # The user database's host commands (docs/runbooks/users.md): `pmos-toolserver users …` in a
+    # one-off tool server container, with the database's own access. The OS user who ran it is
+    # passed as PMOS_HOST_USER and recorded with every change; the tool server refuses to run
+    # without it. A one-off container starts no service, so this needs no assertion check
+    # (that is for `up`, `add-bot` and `restore`), and break glass works whatever the mode.
+    users_usage() {
+      say "usage: pmos-admin users <bootstrap-admin|grant-admin|revoke-admin|set-entra|unset-entra|set-sign-in-name|set-atlassian-email|deactivate|reactivate|pilot-exception|password-setup|import|export|list> …" >&2
+      exit 2
+    }
+    [ $# -ge 1 ] || users_usage
+    case "$1" in
+      bootstrap-admin | grant-admin | revoke-admin | set-entra | unset-entra | set-sign-in-name | \
+        set-atlassian-email | deactivate | reactivate | pilot-exception | password-setup | import | \
+        export | list) ;;
+      *) users_usage ;;
+    esac
+    host_user=${SUDO_USER:-$(id -un)}
+    if ! [[ "$host_user" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; then
+      say "the OS user \"$host_user\" can't be recorded (it must match ^[a-z_][a-z0-9_.-]{0,31}\$): run this as a named user" >&2
+      exit 2
+    fi
+    run=(run --rm --no-deps -e "PMOS_HOST_USER=$host_user")
+    # --oid needs the tenant: the web app's.
+    if [ -n "${PMOS_WEB_ENTRA_TENANT_ID:-}" ]; then
+      run+=(-e "PMOS_ENTRA_TENANT_ID=$PMOS_WEB_ENTRA_TENANT_ID")
+    fi
+    # A terminal only when there is one (`import --allow-admins` asks on it; `export > f` has none).
+    if ! [ -t 0 ] || ! [ -t 1 ]; then run+=(-T); fi
+    if [ "$1" = import ]; then
+      # The file the operator names (an old team.yaml, normally read from the content checkout
+      # at a reviewed commit before the pull request that deletes it) is mounted read-only into
+      # the one-off container under a neutral name; never a URL.
+      shift
+      from=""
+      args=(import)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --from) [ $# -ge 2 ] || users_usage; from=$2; shift 2 ;;
+          *) args+=("$1"); shift ;;
+        esac
+      done
+      [ -n "$from" ] || { say "usage: pmos-admin users import --from <file> [--commit <sha>] [--allow-admins | --bootstrap] [--apply]" >&2; exit 2; }
+      [ -f "$from" ] || { say "no file $from" >&2; exit 2; }
+      from="$(cd "$(dirname "$from")" && pwd)/$(basename "$from")"
+      case "$from" in *:*) say "the path to import can't contain ':'" >&2; exit 2 ;; esac
+      run+=(-v "$from:/run/pmos-import/members.yaml:ro")
+      args+=(--from /run/pmos-import/members.yaml)
+    else
+      args=("$@")
+    fi
+    compose "${run[@]}" toolserver pmos-toolserver users "${args[@]}"
     ;;
 
   ledger)
@@ -292,10 +616,19 @@ for g in s["groups"]:
       say "$bot already has tokens"
       exit 0
     fi
+    # The runtime is recreated with deploy/.env as it is, assertions included: the web app and
+    # the console may be running against it. Checked before anything is written.
+    assertion_checks || exit 2
     rt=$(openssl rand -hex 24)
     gw=$(openssl rand -hex 24)
     set_env PMOS_RT_WORKER_TOKENS "${PMOS_RT_WORKER_TOKENS:+$PMOS_RT_WORKER_TOKENS,}worker-$bot=$rt"
     set_env PMOS_GW_BOT_TOKENS "${PMOS_GW_BOT_TOKENS:+$PMOS_GW_BOT_TOKENS,}bot-$bot=$gw"
+    # Read deploy/.env again: compose prefers this process's environment over --env-file, so
+    # the values sourced at the top would hide the new tokens.
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV"
+    set +a
     compose up -d bots gateway
     say "tokens added for $bot; the runtime and gateway were restarted with them."
     say "next: deploy/pmos-admin sandbox $bot"
@@ -430,7 +763,7 @@ for g in s["groups"]:
 
   smoke)
     # One Docs-bot question through the whole stack, as the Slack bot would send it.
-    [ $# -eq 1 ] || { say "usage: pmos-admin smoke <handle in team.yaml>" >&2; exit 2; }
+    [ $# -eq 1 ] || { say "usage: pmos-admin smoke <handle of an active user>" >&2; exit 2; }
     auth=(-H "Authorization: Bearer $PMOS_RT_SLACK_TOKEN" -H "X-Pmos-User: $1")
     body=$(printf '{"bot":"docs","requested_by":"%s","text":"What does the docs site say about getting started?","source":"slack","slack":{"channel":"smoke","thread_ts":"0.0"}}' "$1")
     task=$(curl -sS --noproxy '*' -X POST http://127.0.0.1:8750/v1/tasks "${auth[@]}" -H 'content-type: application/json' -d "$body")

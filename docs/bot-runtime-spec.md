@@ -62,7 +62,7 @@ It is an alternative to `skill`; send one of the two. It needs the service token
 **Read identity:**
 - **Personal bots** read as `user`, with that PM's linked accounts (unchanged).
 - **Team bots** read as the bot's service identity `bots.<name>`: a vault credential linked by a platform owner with `GET /internal/oauth/{provider}/start?user=bots.<name>`.
-  - The identity check against `team.yaml` is skipped for `bots.*` users, which aren't PMs.
+  - The identity check against the user database is skipped for `bots.*` users, which aren't PMs.
   - Writes from a team-bot session still run as `user` (the approving PM), never as the bot.
 
 **Read scope for team bots** (decision 26), enforced in the connectors:
@@ -83,7 +83,7 @@ It is an alternative to `skill`; send one of the two. It needs the service token
 - `GET /internal/approvals/{id}`;
 - `POST /internal/approvals/{id}/decision`, used by Slack approval cards.
 
-`decided_by` must be a `team.yaml` member. The Slack bot maps the clicking Slack user to their handle; the tool server checks membership and audits `client=bot`.
+`decided_by` must be an active PM OS user (the user database; `team.yaml` until slice U3). The Slack bot maps the clicking Slack user to their handle; the tool server checks membership and audits `client=bot`.
 
 ## 3. Runtime: `pmos-bots` (`crates/bots`)
 
@@ -94,22 +94,75 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
 
 | Client | May |
 | --- | --- |
-| `slack` | create tasks (as `X-Pmos-User`), read their own tasks, notifications, and routines for `X-Pmos-User` |
+| `slack` | create tasks (`source` `slack` or `cli`, as `X-Pmos-User`), read their own tasks, notifications, and routines for `X-Pmos-User` |
+| `web` | the same as `slack` for the PM in `X-Pmos-User`, with source `web`, except the notification feed: create tasks (`source: "web"` only), read their own tasks and events, cancel them, manage their routines, read `GET /v1/bots`, read and set their own member settings. No notifications, worker, console or evals calls |
 | `worker` | claim, heartbeat, events, trace, complete, fail |
-| `console` | read everything; pause, resume and delete routines; cancel tasks |
+| `console` | for the viewer it signs for: their own tasks and routines in full, or for an admin everyone's with the text of anyone else's left out; one task's detail for its PM or an admin; read member settings; pause, resume and delete the viewer's routines (any for an admin); cancel the viewer's tasks (any for an admin). See **The console** below |
 | `evals` | create tasks with `source: "eval"` (and a task `level`) as a handle in `PMOS_EVALS_AS` only, with no Slack target, and read them |
+
+**User assertions (`web`, `console`).** A call from `web` or `console` may carry
+`X-Pmos-Assertion`, a short-lived statement of the person it acts for, signed with a key that
+only that client and the runtime hold (`docs/user-assertion.md`). `PMOS_ASSERTION_MODE` sets
+what the runtime does with it:
+
+| Mode | A valid assertion | A bad one | None |
+| --- | --- | --- | --- |
+| `off` | ignored | ignored | as before |
+| `verify` | its subject is the PM | `401` | as before |
+| `require` | its subject is the PM | `401` | `401` for every console call, and for a `web` call that names a person |
+
+- **Secure by default:** with `web` or `console` in `PMOS_BOTS_TOKENS`, an unset mode is
+  `require`, each of them needs its key in `PMOS_ASSERTION_KEYS`, and `off` or `verify` refuse
+  to start unless `PMOS_ASSERTION_INSECURE_OFF=1` on a fake-data development stack (each start
+  then logs an `INSECURE` line at error level). The override itself refuses to start with
+  `PMOS_BOTS_DATABASE_URL` set without `PMOS_DEV=1` (or with `PMOS_CONNECTORS=live`), and
+  `deploy/compose.yaml` never passes it. Without either client, an unset mode is `off`.
+
+- **Checked:** the signature with the `web:bots` or `console:bots` key from
+  `PMOS_ASSERTION_KEYS`, the issuer (it must be the client whose token was presented), the
+  audience `bots`, the time (60 seconds plus 5 of skew), the request (method, path and query as
+  received, and the raw body), and the nonce (once per process).
+- **Names:** the subject must equal every person the request names: `X-Pmos-User`, the
+  `requested_by` and `owner` filters, and `{handle}` in `/v1/members/{handle}/settings`. A body
+  that names someone else (`requested_by`, a routine's `owner`) is still refused by the `web`
+  client's own rules (`403`).
+- **Answer:** every failure is `401 {"code": "bad_assertion"}`. The log has the client and the
+  kind of failure, never the assertion, a key or a handle.
+- **`X-Pmos-User`** is advisory for `web` once the assertion is required: the subject is the PM,
+  and the header, if sent, must agree.
+- **The console** signs every call for its viewer, and under `require` every console call
+  needs that assertion (`401` without). What the viewer gets depends on who they are, judged
+  by the user directory on a snapshot at most 30 seconds old, else as a non-admin (slice U4a;
+  the assertion's roles don't count):
+  - **Lists** (`GET /v1/tasks`, `GET /v1/routines`): a non-admin gets only their own; a
+    `requested_by` or `owner` naming anyone else is `401`. An admin gets everyone's. Only the
+    viewer's own come in full: anyone else's task is metadata (`id`, `bot`, `requested_by`,
+    `source`, `priority`, `status`, `approvals`, `routine_id`, `attempts`, `created_at`,
+    `updated_at`, with `text: ""`, `result`, `error` null, `checklist: []`, no `slack`, and
+    `hidden: true`), and anyone else's routine comes with `prompt: ""` and `hidden: true`. An
+    unsigned list (only possible in `off` and `verify`) is metadata for everyone.
+  - **One task** (`GET /v1/tasks/{id}`, `…/events`, `…/trace`, `…/drafts`): only when the
+    viewer is the task's PM or an admin, `404` otherwise. A signed read is held to that rule in
+    every mode; in `off` and `verify` an unsigned one still sees any task.
+  - **Cancel** (`POST /v1/tasks/{id}/cancel`): only signed, in every mode (`403` unsigned),
+    by the task's PM or an admin (`404` otherwise), and the task's event says `cancelled by
+    <viewer>`.
+  - **Routine changes** (pause, resume, delete): signed, the viewer's own routine or any for an
+    admin (`404` otherwise).
+- **Not checked:** `slack`, `worker` and `evals`, in every mode.
 
 ### Task
 ```json
-{"id": "tsk_<32 hex>", "bot": "docs", "requested_by": "ana", "source": "slack|routine|cli|eval",
+{"id": "tsk_<32 hex>", "bot": "docs", "requested_by": "ana", "source": "slack|web|routine|cli|eval",
  "priority": "interactive|scheduled|personal", "text": "Does Acme Vault support SAML SSO?",
  "status": "queued|working|needs_approval|done|failed|cancelled",
  "checklist": [{"item": "Search the docs", "done": true}], "result": "markdown or null",
  "error": "stated reason or null", "approvals": ["apr_…"],
  "slack": {"channel": "D0…", "thread_ts": "1731…"} , "routine_id": "rtn_… or null",
- "attempts": 1, "created_at": "…", "updated_at": "…"}
+ "conversation": "cnv_… (optional)", "attempts": 1, "created_at": "…", "updated_at": "…"}
 ```
-- **Priority:** `interactive` for Slack and the CLI, `scheduled` for routines, `personal` for evals and background work. It is passed to the gateway as `X-Pmos-Priority`.
+- **Web tasks:** only client `web` sets `source: "web"`, and `web` sets nothing else (apart from an optional `conversation`; see Conversations). A web task has no `slack` field and writes no notifications (the Slack feed would have nowhere to post them); the web app reads the task and its events instead.
+- **Priority:** `interactive` for Slack, the web app and the CLI, `scheduled` for routines, `personal` for evals and background work. It is passed to the gateway as `X-Pmos-Priority`.
 - **Status flow:** `queued`, then `working`, then `done` or `failed`, or `needs_approval` when the result has pending approvals. A queued or working task can become `cancelled`.
 - **Leaving `needs_approval`:** the runtime polls `GET /internal/approvals/{id}` every 30 seconds with the service token. When none is still `pending` or `executing`, the task becomes `done`, and the notification says what was approved or rejected.
 - **Durability (D2):**
@@ -118,30 +171,68 @@ Postgres, with its own migrations table `_pmos_bots_migrations`. `PMOS_DEV=1` ke
   - Otherwise it becomes `failed`, with the reason "interrupted twice by restarts; ask again".
   - Nothing is lost silently.
 
+### Conversations
+A follow-up in the same thread carries the thread's earlier turns, so a short reply is read as
+an answer to the bot's last question.
+- **The thread:** for a Slack task, its `slack {channel, thread_ts}`; for a web task, the
+  optional `conversation` id (1 to 128 of `A-Z a-z 0-9 . _ : -`) on `POST /v1/tasks`. Only
+  clients `web` and `slack` may set it (`403` otherwise). Only interactive tasks have a
+  thread; routines start fresh, and so does an eval task unless it names a `conversation` (a benchmark thread, `docs/evals.md`).
+- **Whose turns:** earlier tasks of the same bot, the same `requested_by` and the same
+  thread, no longer `queued` or `working`. Never another PM's, never another bot's.
+- **In the claim:** `history: [{text, result?, error?, status, at}]`, oldest first: the
+  newest 6 turns, each field cut to 4,000 bytes with `… [truncated]`, at most 16,000 bytes in
+  all (the oldest dropped first). `[]` for a first message.
+- **Retention:** only turns from the last 24 hours (the Slack-text window, D6), and none whose
+  text has been redacted.
+- **Sensitivity (W6):** a replayed answer may carry what an earlier task read, so a
+  follow-up's session never starts below it.
+  - When a worker completes or fails a task, the runtime asks the tool server for the highest
+    data class that task's sessions read (`GET /internal/runs/{task id}/sensitivity`, service
+    token) and stores it on the task (`sources_sensitivity`). If the tool server can't say
+    (no session stored, or unreachable), it stores `restricted`. A task that failed at claim
+    ran no session and stores `public`; one recovered after a lost lease stores nothing.
+  - At claim, the level of the turns put in `history` is the highest of theirs, a turn with
+    none counting as `restricted`. The runtime sends it as `history_sensitivity` when it
+    creates the session; the tool server starts the session there, and a draft to a channel
+    with someone outside the team is blocked as if this session had read it
+    (`audience_blocked`). The worker never sets or lowers it.
+  - The claim carries it too, as `history_sensitivity` (`null` without history), so the
+    worker can tell the model.
+  - **Revisions (R2).** A task's text can carry data too: the web app's revision of a draft
+    puts the draft's text in the prompt. The `web` client may set `sensitivity_floor`
+    (`public`, `internal` or `restricted`) on `POST /v1/tasks` for a task outside any
+    conversation and without a Slack target (`403` from any other client, or with
+    `conversation` or `slack`). The task stores it as its `sources_sensitivity` until it
+    finishes; at claim the session starts at the higher of it and the history's level, and a
+    task that fails at claim keeps it rather than `public`. When the task finishes, what its
+    sessions reached (never lower, since they started there) replaces it. The web app sends
+    the draft's own level (unrecorded counts as `restricted`).
+
 ### API
 | Method and path | Client | Notes |
 | --- | --- | --- |
-| `GET /v1/members/{handle}/settings` | slack (own handle, from `X-Pmos-User`), console | `{"handle": "ana", "level": "senior"}`. An unset level reads as `senior`. |
-| `PUT /v1/members/{handle}/settings` `{level}` | slack (own handle only) | The same shape. The handle must be a member. An unknown level is `400`; another member's handle is `403`. |
+| `GET /v1/members/{handle}/settings` | slack, web (own handle, from `X-Pmos-User`), console | `{"handle": "ana", "level": "senior"}`. An unset level reads as `senior`. |
+| `PUT /v1/members/{handle}/settings` `{level}` | slack, web (own handle only) | The same shape. The handle must be a member. An unknown level is `400`; another member's handle is `403`. |
 | `GET /v1/bots` | all | `[{name, role, scope, owner, description}]` |
 | `GET /v1/bots/{name}` | all | the bot, its role, its tools, and each write tool's setting |
-| `POST /v1/tasks` `{bot, requested_by, text, source, slack?, level?}` | slack, evals | `201` with the Task. `403` if `requested_by` may not use the bot: personal bots serve their owner only, and team bots serve team members. From `evals`: `403` unless `requested_by` is in `PMOS_EVALS_AS`, and `400` with a `slack` field (see **Eval tasks**). |
-| `GET /v1/tasks/{id}`, `GET /v1/tasks?bot=&requested_by=&status=&limit=` | slack (own), console, evals | |
-| `POST /v1/tasks/{id}/cancel` | slack (own), console | |
-| `GET /v1/tasks/{id}/events` | slack (own), console, evals | `[{at, kind, text}]` |
-| `GET /v1/tasks/{id}/trace` | console | `[{at, kind, body}]` |
-| `POST /v1/worker/claim` `{worker, bots?: [..], wait_ms?}` | worker | Long-polls up to `wait_ms` (at most 25,000). Returns `200` with `{task, bot, role, tools, session_token, lease_until}`, or `204` if nothing is queued. The runtime creates the tool-server session (§2) for the task. |
+| `POST /v1/tasks` `{bot, requested_by, text, source, slack?, level?, conversation?, sensitivity_floor?}` | slack (`slack`/`cli`), web (`web`), evals (`eval`) | `201` with the Task. `403` if `requested_by` may not use the bot: personal bots serve their owner only, and team bots serve team members. From `evals`: `403` unless `requested_by` is in `PMOS_EVALS_AS`, and `400` with a `slack` field (see **Eval tasks**); it may name a `conversation` (a multi-turn eval thread). |
+| `GET /v1/tasks/{id}`, `GET /v1/tasks?bot=&requested_by=&status=&limit=` | slack, web (own), console, evals | The console's reads (its own in full, others' as metadata): see **User assertions**, The console. |
+| `POST /v1/tasks/{id}/cancel` | slack, web (own), console (signed: the task's PM or an admin) | |
+| `GET /v1/tasks/{id}/events` | slack, web (own), console, evals | `[{at, kind, text}]` |
+| `GET /v1/tasks/{id}/trace` | console | `[{at, kind, body}]`; under `require`, signed for the task's PM or an admin |
+| `POST /v1/worker/claim` `{worker, bots?: [..], wait_ms?}` | worker | Long-polls up to `wait_ms` (at most 25,000). Returns `200` with `{task, bot, role, tools, session_token, lease_until, gateway, level, history, history_sensitivity}` (see Conversations), or `204` if nothing is queued. The runtime creates the tool-server session (§2) for the task, starting at `history_sensitivity`. |
 | `POST /v1/worker/tasks/{id}/heartbeat` | worker | extends the lease |
 | `POST /v1/worker/tasks/{id}/events` `{kind: "status"\|"checklist"\|"milestone", text?, checklist?}` | worker | Milestones are what Slack shows. The runtime keeps them all and notifies each one. |
 | `POST /v1/worker/tasks/{id}/trace` `{entries: [{kind: "prompt"\|"model_reply"\|"tool_call"\|"tool_result"\|"policy_denial", body}]}` | worker | to the trace store |
 | `POST /v1/worker/tasks/{id}/complete` `{result, approvals: [..]}` | worker | `needs_approval` if `approvals` is non-empty, else `done` |
 | `POST /v1/worker/tasks/{id}/fail` `{reason}` | worker | |
-| `GET /v1/notifications?after=<cursor>&wait_ms=` | slack | Long-polls. Returns `{cursor, items: [{id, task_id, bot, requested_by, slack, kind: "milestone"\|"done"\|"failed"\|"needs_approval"\|"approval_closed", text, approvals?}]}` in order. |
-| `POST /v1/routines/parse` `{bot, owner, text, tz}` | slack | Returns `{draft, summary}`, or `422` with `{question}` when the request is unclear. |
-| `POST /v1/routines` `{draft}` | slack | `201` with the Routine |
-| `GET /v1/routines?owner=` | slack (own), console | |
-| `PATCH /v1/routines/{id}` `{enabled?, schedule?, prompt?}` | slack (own), console | |
-| `DELETE /v1/routines/{id}` | slack (own), console | |
+| `GET /v1/notifications?after=<cursor>&wait_ms=` | slack | Long-polls. Returns `{cursor, head, items: [{id, task_id, bot, requested_by, slack, kind: "milestone"\|"done"\|"failed"\|"needs_approval"\|"approval_closed", text, approvals?, routine_id?}]}` in order. `routine_id` is there only when a routine created the task. `head` is the last sequence number the feed has issued (pruning never lowers it). A cursor past the head was never issued by this feed (an in-memory runtime restarted, or the database was reset): `409 {"code": "cursor_ahead", "head", "error"}`, the error starting with `cursor_ahead`. The client should start again from `0`. Before this, such a cursor got "nothing new" until the sequence passed it, and every reply in between was lost. |
+| `POST /v1/routines/parse` `{bot, owner, text, tz}` | slack, web | Returns `{draft, summary}`, or `422` with `{question}` when the request is unclear. |
+| `POST /v1/routines` `{draft}` | slack, web | `201` with the Routine |
+| `GET /v1/routines?owner=` | slack, web (own), console (the viewer's own, or every routine for an admin, prompts of others left out) | |
+| `PATCH /v1/routines/{id}` `{enabled?, schedule?, prompt?}` | slack, web (own), console | |
+| `DELETE /v1/routines/{id}` | slack, web (own), console | |
 | `GET /healthz`, `GET /readyz` | none | readiness covers storage plus the tool server and the gateway |
 
 ### Eval tasks
@@ -156,7 +247,8 @@ The benchmark runner's token must not be able to act as a PM or reach Slack:
 
 ### Levels and member settings
 A PM's level (`senior`, `staff` or `principal`; `docs/levels.md`) is their own working
-preference, so it lives in the runtime, which builds each task's claim, and not in `team.yaml`.
+preference, so it lives in the runtime, which builds each task's claim, and not in the user
+database.
 - **Store:** `member_settings {handle (key), level, updated_at}`, on the memory and Postgres
   stores.
 - **The claim carries `level`:** the task's own `level` if it has one, else the setting of
@@ -200,6 +292,12 @@ preference, so it lives in the runtime, which builds each task's claim, and not 
   - the tool server's MCP tools for the claimed `session_token`;
   - only the role's skills;
   - the role's instructions plus the bot's job as system context.
+- **Messages:** each turn of the claim's `history` becomes the PM's message and the bot's reply
+  (its result; for a failed or cancelled turn, a short note saying so), oldest first, then the
+  new request as the last message. With any history, the system prompt adds: "The messages
+  before the last one are this conversation's earlier turns, oldest first; the last message is
+  the new request. A short reply is an answer to your last question." A first message is sent
+  alone, as before. A replayed reply is never taken as the final answer.
 - **Writes:** no harness interrupt. Writes go to the tool server, which returns `pending_approval` items; the worker collects their `approval_id`s.
 - **Progress:** checklist and milestones as the run goes. At least "Working on it" and one milestone per distinct tool family used ("Searching the support docs", "Reading Jira", "Drafting in Confluence"), each sent once. Every model turn and tool call goes to the trace endpoint.
 - **Heartbeat:** every 30 seconds while running.
@@ -213,7 +311,7 @@ preference, so it lives in the runtime, which builds each task's claim, and not 
   4. else `docs`.
 
   The bot posts its replies under its own name (`chat:write.customize`), so each bot reads as its own teammate in the thread. *Deviation to confirm:* D1 says a DM per bot. A Slack app per bot would meet that literally, at the cost of a Slack app per bot.
-- **Tasks:** a message becomes `POST /v1/tasks` (as the PM, mapped through `team.yaml`) with `slack: {channel, thread_ts}`. Replies go in that thread.
+- **Tasks:** a message becomes `POST /v1/tasks` (as the PM, mapped through the user directory since slice U4b) with `slack: {channel, thread_ts}`. Replies go in that thread.
   - **Notifications:** a single long-poll loop on `/v1/notifications`. Each milestone is one message, edited in place as the run goes, so a thread gets at most one message per milestone (D6).
   - **Result:** the final answer is a new message.
 - **Approval cards (D7):** for each `needs_approval` item, a card with the tool, a summary of the arguments, and buttons **Approve**, **Edit** and **Reject**.
@@ -241,7 +339,7 @@ preference, so it lives in the runtime, which builds each task's claim, and not 
 - a state-changing request must carry `Origin` or `Referer` from the console's own origin;
 - the console's tool-server token is its own (`PMOS_CONSOLE_TS_TOKEN` there): it may read approvals and nothing else.
 
-Admins (role `admin` in `team.yaml`) see everything; a PM sees their own bots, routines and tasks plus the team bots.
+Admins (an active `admin` in the user database) see everything; a PM sees their own bots, routines and tasks plus the team bots.
 
 ## 7. Sandbox policies (0f): `crates/policy` and `pmos policy`
 - **Per bot:** `policies/bots/<bot>.yaml` is generated from the bot's role (the D3 role template) by `pmos policy generate`.

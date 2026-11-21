@@ -23,6 +23,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::connectors::registry::registry;
 use crate::store::{StoreError, StoreResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -34,39 +35,25 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// Every provider, in registry order.
+    pub const ALL: [Provider; 3] = [Self::Atlassian, Self::Slack, Self::Github];
+
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Atlassian => "atlassian",
-            Self::Slack => "slack",
-            Self::Github => "github",
-        }
+        registry().spec(self).id
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "atlassian" => Some(Self::Atlassian),
-            "slack" => Some(Self::Slack),
-            "github" => Some(Self::Github),
-            _ => None,
-        }
+        registry().by_id(s).map(|spec| spec.provider)
     }
 
     /// How the provider is named to people.
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Atlassian => "Atlassian (Jira and Confluence)",
-            Self::Slack => "Slack",
-            Self::Github => "GitHub",
-        }
+        registry().spec(self).label
     }
 
     /// The provider whose token a registry system uses.
     pub fn for_system(system: &str) -> Option<Self> {
-        match system {
-            "jira" | "confluence" => Some(Self::Atlassian),
-            "slack" => Some(Self::Slack),
-            _ => None,
-        }
+        registry().for_system(system).map(|spec| spec.provider)
     }
 }
 
@@ -141,6 +128,10 @@ pub struct SealedCredential {
     pub site_url: Option<String>,
     pub external_id: Option<String>,
     pub updated_at: DateTime<Utc>,
+    /// Set while the user is deactivated (`docs/user-database-spec.md` §6): the vault never
+    /// unseals a suspended credential. Only the user store's deactivation and reactivation
+    /// change it; `put` and `replace` keep it as it is.
+    pub suspended_at: Option<DateTime<Utc>>,
 }
 
 /// Storage for sealed credentials. Implementations never see plaintext tokens.
@@ -159,6 +150,12 @@ pub trait CredentialStore: Send + Sync {
     ) -> StoreResult<bool>;
     async fn delete(&self, user: &str, provider: Provider) -> StoreResult<bool>;
     async fn list(&self, user: &str) -> StoreResult<Vec<SealedCredential>>;
+    /// Suspend every credential of `user` that isn't already (deactivation). Returns how many.
+    async fn suspend(&self, user: &str, at: DateTime<Utc>) -> StoreResult<u64>;
+    /// Make `user`'s suspended credentials usable again (reactivation within the grace).
+    async fn restore(&self, user: &str) -> StoreResult<u64>;
+    /// Delete `user`'s suspended credentials (the grace is over). Returns how many.
+    async fn delete_suspended(&self, user: &str) -> StoreResult<u64>;
 }
 
 #[derive(Default)]
@@ -178,9 +175,15 @@ impl CredentialStore for MemoryCredentials {
     }
 
     async fn put(&self, credential: &SealedCredential) -> StoreResult<()> {
-        self.rows.lock().expect("credentials lock").insert(
-            (credential.user.clone(), credential.provider),
-            credential.clone(),
+        let mut rows = self.rows.lock().expect("credentials lock");
+        let key = (credential.user.clone(), credential.provider);
+        let suspended_at = rows.get(&key).and_then(|c| c.suspended_at);
+        rows.insert(
+            key,
+            SealedCredential {
+                suspended_at,
+                ..credential.clone()
+            },
         );
         Ok(())
     }
@@ -193,7 +196,10 @@ impl CredentialStore for MemoryCredentials {
         let mut rows = self.rows.lock().expect("credentials lock");
         match rows.get_mut(&(credential.user.clone(), credential.provider)) {
             Some(row) if row.updated_at == expected => {
-                *row = credential.clone();
+                *row = SealedCredential {
+                    suspended_at: row.suspended_at,
+                    ..credential.clone()
+                };
                 Ok(true)
             }
             _ => Ok(false),
@@ -214,6 +220,39 @@ impl CredentialStore for MemoryCredentials {
         let mut out: Vec<_> = rows.values().filter(|c| c.user == user).cloned().collect();
         out.sort_by_key(|c| c.provider);
         Ok(out)
+    }
+
+    async fn suspend(&self, user: &str, at: DateTime<Utc>) -> StoreResult<u64> {
+        let mut rows = self.rows.lock().expect("credentials lock");
+        let mut n = 0;
+        for c in rows
+            .values_mut()
+            .filter(|c| c.user == user && c.suspended_at.is_none())
+        {
+            c.suspended_at = Some(at);
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    async fn restore(&self, user: &str) -> StoreResult<u64> {
+        let mut rows = self.rows.lock().expect("credentials lock");
+        let mut n = 0;
+        for c in rows
+            .values_mut()
+            .filter(|c| c.user == user && c.suspended_at.is_some())
+        {
+            c.suspended_at = None;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    async fn delete_suspended(&self, user: &str) -> StoreResult<u64> {
+        let mut rows = self.rows.lock().expect("credentials lock");
+        let before = rows.len();
+        rows.retain(|_, c| !(c.user == user && c.suspended_at.is_some()));
+        Ok((before - rows.len()) as u64)
     }
 }
 
@@ -345,6 +384,27 @@ impl KeyRing {
     }
 }
 
+impl KeyRing {
+    /// Seal `plaintext` under the active key, bound to `aad`: for secrets the vault keeps
+    /// outside linked accounts (password sign-in's authenticator secret,
+    /// `crate::password`). The same format and keys as linked accounts' tokens.
+    pub fn seal_bound(&self, plaintext: &str, aad: &str) -> StoreResult<String> {
+        self.seal(plaintext, aad)
+    }
+
+    /// Unseal what [`KeyRing::seal_bound`] sealed with the same `aad`. Copied to another
+    /// owner's `aad`, it does not unseal.
+    pub fn unseal_bound(&self, sealed: &str, aad: &str) -> StoreResult<String> {
+        self.unseal(sealed, aad)
+    }
+
+    /// Was `sealed` sealed with the active key? (An older key's is re-sealed when next used.)
+    pub fn sealed_with_active(&self, sealed: &str) -> bool {
+        let mut parts = sealed.split('.');
+        parts.next() == Some("v1") && parts.next() == Some(self.active.as_str())
+    }
+}
+
 fn aad(user: &str, provider: Provider, field: &str) -> String {
     format!("pmos-vault|{user}|{provider}|{field}")
 }
@@ -383,10 +443,16 @@ impl Vault {
             site_url: c.site_url.clone(),
             external_id: c.external_id.clone(),
             updated_at: c.updated_at,
+            suspended_at: None,
         })
     }
 
     fn unseal(&self, s: &SealedCredential) -> StoreResult<Credential> {
+        if s.suspended_at.is_some() {
+            return Err(StoreError(
+                "a suspended credential is never unsealed".into(),
+            ));
+        }
         Ok(Credential {
             user: s.user.clone(),
             provider: s.provider,
@@ -421,6 +487,11 @@ impl Vault {
         let Some(sealed) = self.store.get(user, provider).await? else {
             return Ok(None);
         };
+        // A deactivated person's accounts: never unsealed, so no connector call can use them.
+        if sealed.suspended_at.is_some() {
+            tracing::info!(user, provider = %provider, "credential suspended: not used");
+            return Ok(None);
+        }
         let credential = self.unseal(&sealed)?;
         if sealed.key_id != self.keys.active_id() {
             // Re-seal under the active key, unless someone wrote a newer credential meanwhile.
@@ -443,6 +514,12 @@ impl Vault {
 
     pub async fn delete(&self, user: &str, provider: Provider) -> StoreResult<bool> {
         self.store.delete(user, provider).await
+    }
+
+    /// Suspend every credential of `user` that isn't already (a link that landed after the
+    /// person was deactivated). Returns how many.
+    pub async fn suspend(&self, user: &str, at: DateTime<Utc>) -> StoreResult<u64> {
+        self.store.suspend(user, at).await
     }
 
     /// The user's linked accounts, without tokens.

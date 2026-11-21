@@ -16,6 +16,9 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 pmos-contract.workspace = true
+pmos-evals.workspace = true
 pmos-policy.workspace = true
 serde_json.workspace = true
-serde_norway.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

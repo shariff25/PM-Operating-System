@@ -70,7 +70,7 @@ The seeded Docs bot's policy is [`policies/bots/docs.yaml`](../policies/bots/doc
 | --- | --- | --- | --- |
 | `include_workdir` | `false` | `true` would make the whole working directory writable, including any content uploaded under it. | Confirmed field and default. |
 | `read_write` | `/sandbox/workspace`, `/tmp`, `/dev/null` | The bot's own workspace. `/tmp` and `/dev/null` are OpenShell's baseline read-write paths, which it adds anyway to any policy with a network rule. `/tmp` is inside the sandbox, not the host's. | Field and baseline confirmed. The path `/sandbox/workspace` needs verifying on the Spark. |
-| `read_only` | `/app /dev/urandom /etc /lib /proc /usr /var/log`, plus `/sandbox/skills/<skill>` for each of the role's skills, `/sandbox/master/AGENTS.md`, and `/sandbox/templates`, `/sandbox/reviewers` and `/sandbox/playbooks` | The system paths are exactly OpenShell's baseline read-only set. They are listed so the file says what the sandbox can read. Content is the role's skills, the bot's master context, and the team's templates, reviewer rubrics and playbooks (shared by every bot; none of them holds customer data); a personal bot also gets `/sandbox/master/people/<owner>/AGENTS.md` if its owner wrote one. | Field and baseline confirmed. The `/sandbox` layout needs verifying on the Spark. |
+| `read_only` | `/app /dev/urandom /etc /lib /proc /usr /var/log`, plus `/sandbox/skills/<skill>` for each of the role's skills (and, for a personal bot of `pm-assistant`, each persona's skills: "Personas" below), `/sandbox/master/AGENTS.md`, and `/sandbox/templates`, `/sandbox/reviewers` and `/sandbox/playbooks` | The system paths are exactly OpenShell's baseline read-only set. They are listed so the file says what the sandbox can read. Content is the role's skills, the bot's master context, and the team's templates, reviewer rubrics and playbooks (shared by every bot; none of them holds customer data); a personal bot also gets `/sandbox/master/people/<owner>/AGENTS.md` if its owner wrote one. | Field and baseline confirmed. The `/sandbox` layout needs verifying on the Spark. |
 
 **Nothing else is mounted.** OpenShell has no host bind mounts in the policy. Content gets in
 only by `--upload`, which copies into the sandbox's own filesystem, and the launch spec lists the
@@ -195,6 +195,39 @@ openshell provider create --name pmos-docs-worker  --type pmos-worker  --credent
 The command names come from OpenShell's docs and its example profile headers. The docs show both
 `openshell profile …` and `openshell provider profile …`; check which one the installed CLI uses.
 
+## Personas: what the bot marketplace adds
+
+The marketplace's bots (Chief, Sprout, Echo) are **personas**: roles a PM's own personal bot
+runs as, chosen per ask, with no sandbox of their own (`docs/bot-marketplace-spec.md` §0 and §4).
+So the generator reads one more input, `content/personas/*/PERSONA.md`, and uses it in one place:
+
+- For a bot with `scope: personal` whose role is the personal role (`pm-assistant`,
+  `PERSONAL_ROLE`), the skill folders uploaded read-only are the role's skills **and** the
+  skills of every persona's role, offered or not (so offering or withdrawing a persona changes no
+  policy). The header then lists `personas/*/PERSONA.md` among its sources.
+- Nothing else depends on the catalog: the `tools/call` allowlist stays the personal role's
+  tools, and the network rules, binaries, credentials, writable paths, process and Landlock
+  settings are byte for byte what they were. Team bots and personal bots of any other role are
+  untouched.
+
+Why that holds: a persona's role may not have a tool the personal role doesn't
+(`persona-exceeds-base`, a lint error), nor a higher data class (`persona-data-class`), nor
+re-enable a write the personal role sets to `never` (`persona-action`); `pmos policy generate`
+refuses content with lint errors. The tests in `crates/policy/tests/policies.rs` generate the
+same content with and without a persona and assert that the only difference is the persona's
+new skill folder in `filesystem_policy.read_only` and in the launch spec's uploads, and that a
+persona reaching a new tool is refused before generation.
+
+A catalog whose personas add no skill folder (today's Nudge alone: its role is the personal
+role) leaves every policy file byte for byte as it was.
+
+**Operations.** A pull request that adds a persona with a new skill regenerates every `pm-*`
+policy in the same pull request (`policy-stale` fails CI otherwise), and the diff shows the new
+read-only folders. That is a filesystem change, not a network change: it gets the content
+repo's review plus a platform owner (POL-2 applies only if `pm-assistant`'s own tools change).
+OpenShell applies filesystem rules only at startup, so after it merges, each `pm-*` sandbox is
+recreated once.
+
 ## Creating a bot's sandbox
 
 The launcher reads `policies/bots/<bot>.sandbox.yaml` and runs, for the Docs bot:
@@ -238,9 +271,9 @@ skills, tools or credentials, and is also reported as `policy-orphan`.
 | `net-middleware` | No network middleware. |
 | `fs-workdir` | `filesystem_policy` is present and `include_workdir` is false. |
 | `fs-writable` | Writable: the workspace, `/tmp` and `/dev/null`, or paths inside them, only. Any content path, or a parent of one (such as `/sandbox`), is reported as making content writable. A path with `..` never counts as inside an allowed one. |
-| `fs-readable` | Readable: the system paths, the role's skills and the bot's master context, or paths inside them, only. Another role's skill, another PM's master file, other content and wider paths are each named. |
+| `fs-readable` | Readable: the system paths, the role's skills (plus the personas' for a personal bot of `pm-assistant`) and the bot's master context, or paths inside them, only. Another role's skill, another PM's master file, other content and wider paths are each named. |
 | `fs-landlock` | `landlock.compatibility` is `hard_requirement`. |
-| `fs-uploads` | The launch spec uploads only the role's skills and the bot's master context, each to its read-only path and never under a writable one. |
+| `fs-uploads` | The launch spec uploads only the role's skills (plus the personas', as above) and the bot's master context, each to its read-only path and never under a writable one. |
 | `cred-binding` | The gateway and runtime endpoints bind exactly this bot's own provider (`pmos-<bot>-gateway`, `pmos-<bot>-worker`), and the tool-server endpoint binds none. Another bot's provider is named as such. No credential rewriting, signing or uninspected credentials. |
 | `cred-providers` | The launch spec attaches this bot's gateway and worker providers and nothing else (no session provider in v1). |
 | `proc-identity` | `run_as_user` and `run_as_group` are `sandbox` (or a numeric id of at least 1000); never root. |
@@ -253,8 +286,9 @@ only as `policy-stale`: it is a broken bot, not a leak.
 
 ## Changing a policy
 
-1. **Change the source.** Edit the bot (`content/bots/<bot>/BOT.md`), its role, or, for a
-   platform-wide change, the constants in `crates/policy/src/lib.rs`. Never edit
+1. **Change the source.** Edit the bot (`content/bots/<bot>/BOT.md`), its role, the catalog
+   (`content/personas/`, for the skill folders of personal bots), or, for a platform-wide
+   change, the constants in `crates/policy/src/lib.rs`. Never edit
    `policies/bots/*` by hand.
 2. **Regenerate and check.** Run `cargo run -q -p pmos -- policy generate`, then
    `cargo run -q -p pmos -- policy check`, and commit the source and the regenerated files

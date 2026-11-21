@@ -16,7 +16,7 @@ use serde::Deserialize;
 use crate::spec::{category_names, load_category, resolve_bot, PERSONAL_BOT};
 
 /// The role every personal bot is made from (`pmos_contract::onboarding::render_personal_bot`).
-pub const PERSONAL_ROLE: &str = "pm-assistant";
+pub const PERSONAL_ROLE: &str = pmos_contract::onboarding::PERSONAL_ROLE;
 
 #[derive(Deserialize)]
 struct BotFront {

@@ -278,15 +278,18 @@ pub fn extract_urls(text: &str) -> Vec<String> {
 }
 
 /// A draft's text, as its `must_include` and `must_not_include` see it: its top-level string
-/// arguments, sorted by key and joined by newlines (as the feedback ledger measures edits).
+/// arguments, sorted by key and joined by newlines (as the feedback ledger measures edits),
+/// as they would be written: without source markers (`[[src-…]]`, which the tool server
+/// removes when it writes), so a marker never splits a phrase a check looks for.
 pub fn draft_text(args: &Value) -> String {
     let Some(map) = args.as_object() else {
-        return args.as_str().unwrap_or_default().to_string();
+        return pmos_contract::cite::strip(args.as_str().unwrap_or_default());
     };
     let mut keys: Vec<&String> = map.keys().collect();
     keys.sort();
     keys.iter()
         .filter_map(|k| map[k.as_str()].as_str())
+        .map(pmos_contract::cite::strip)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -419,7 +422,8 @@ pub fn grade(task: &EvalTask, outcome: &Outcome, decline_phrases: &[String]) -> 
             None => failures.extend(grade_drafts(&task.expect.drafts, &outcome.drafts)),
         }
     }
-    let answer = outcome.result_text();
+    // As Slack and the web app show it: without source markers.
+    let answer = &pmos_contract::cite::strip(outcome.result_text());
     if answer.trim().is_empty() {
         failures.push(Check::NoAnswer);
         return Grade { failures };

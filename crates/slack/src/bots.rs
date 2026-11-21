@@ -3,9 +3,12 @@
 //!
 //! **Which bot a DM goes to:**
 //! 1. a `<bot>:` prefix (`docs: what ports does Acme Vault need?`);
-//! 2. else the bot already working in that thread;
-//! 3. else the PM's personal bot `pm-<handle>`, if it exists;
-//! 4. else `docs`.
+//! 2. else a marketplace bot's name (`Chief: …`, `sprout, …`): the PM's personal bot, run as
+//!    that persona (`personas.rs`, `docs/bot-marketplace-spec.md` §9);
+//! 3. else the bot already working in that thread (with no `persona`, so the runtime keeps
+//!    the thread's);
+//! 4. else the PM's personal bot `pm-<handle>`, if it exists;
+//! 5. else `docs`.
 //!
 //! **Commands first:** typed alone in a DM, `setup` (or `status`, `onboarding`), and for
 //! platform owners `requests` and `remove <handle>`, are handled before any of that
@@ -13,7 +16,9 @@
 //! assistant, in `reply.rs`), `bets review on`, `off` and status (`bets_review.rs`) and
 //! `level` and `level <level>` (`level.rs`), in that order. `docs: setup` still goes to the
 //! `docs` bot. Someone not in
-//! `team.yaml` gets a note with **Request access**.
+//! the user directory gets a note with **Request access**; a deactivated person, an
+//! Auditor-only person and anyone PM OS can't check right now get a plain note instead
+//! (`people.rs`).
 //!
 //! Tagging PM OS in a channel (`app_mention`) is in `mention.rs`, and the App Home
 //! (`app_home_opened` and its clicks) in `home.rs` (`docs/slack-mentions-and-home-spec.md`).
@@ -26,8 +31,8 @@
 //! 3 seconds); the work happens in follow-ups. The one exception is the memory-repo modal,
 //! whose answer must be in the ack to show as a field error: [`Bots::late_ack`] waits for the
 //! tool server, never longer than the ack allows. The PM is always the Slack user mapped
-//! through `team.yaml`: the runtime and the tool server apply that PM's access, never the
-//! bot's.
+//! through the user directory (a snapshot at most 5 minutes old, `people.rs`): the runtime
+//! and the tool server apply that PM's access, never the bot's, and decide it again.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -35,14 +40,14 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pmos_contract::model::TeamFile;
 use pmos_contract::onboarding::personal_bot_name;
 use serde_json::{json, Value};
 
 use crate::blocks::escape;
 use crate::bounded::Bounded;
 use crate::cards::{self, action};
-use crate::commands::{load_team, FollowUp, NOT_A_MEMBER};
+use crate::commands::{FollowUp, NOT_A_MEMBER};
+use crate::people::{self as directory, Identity, Member, People};
 
 /// A click on an approval that isn't the clicker's (the tool server doesn't find it for
 /// them).
@@ -50,16 +55,19 @@ pub const NOT_YOURS: &str = "Only the PM this approval is for can decide it. Not
 use crate::home::Home;
 use crate::member_cards::{self, action as member_action};
 use crate::members::{self, DmCommand, Onboarding};
+use crate::onboard_flow::{self, Flow};
+use crate::personas::{self, Catalog, Persona};
 use crate::reply::{self, SnoozeStore};
 use crate::runtime::{display_name, BotInfo, Runtime, RuntimeError};
 use crate::slackapi::{Posted, SlackApi};
-use crate::toolserver::{ApiError, CallError, ToolServer};
+use crate::toolserver::{ApiError, CallError, Seen, ToolServer};
 use crate::{bets_review, level};
 
 /// The bot a DM goes to when nothing else picks one.
 pub const DEFAULT_BOT: &str = "docs";
 
-const UNAVAILABLE: &str = "PM OS couldn't reach its bots right now. Try again in a minute.";
+pub(crate) const UNAVAILABLE: &str =
+    "PM OS couldn't reach its bots right now. Try again in a minute.";
 /// How long the bot roster from `GET /v1/bots` is reused.
 const ROSTER_TTL: Duration = Duration::from_secs(60);
 
@@ -67,8 +75,10 @@ pub struct BotsConfig {
     pub slack: SlackApi,
     pub runtime: Runtime,
     pub toolserver: ToolServer,
-    /// `content/team.yaml`, read on each message so a merged change applies at once.
-    pub team_file: PathBuf,
+    /// Who each Slack user is: the user directory (`people.rs`). Never `team.yaml`.
+    pub people: People,
+    /// The content repo (`PMOS_CONTENT_ROOT`), for the skills catalog in the App Home.
+    pub content_root: PathBuf,
     /// The time zone for routines when Slack has none for the PM (`PMOS_DEFAULT_TZ`).
     pub default_tz: String,
     /// The GitHub org memory repos live in (`PMOS_GITHUB_ORG`), to prefill the memory-repo
@@ -79,6 +89,9 @@ pub struct BotsConfig {
     pub response_url_prefix: String,
     /// `PMOS_SLACK_STATE_DIR`: the reply cards' snoozes are kept here (`snoozes.json`).
     pub state_dir: PathBuf,
+    /// `PMOS_WEB_PUBLIC_URL`: the web app's `https://` origin, without a trailing `/`. Set,
+    /// the Confluence and Jira approval cards get an **Open in workspace** button.
+    pub web_url: Option<String>,
 }
 
 /// An acknowledgement that has to wait for an answer, and the work after it. It resolves
@@ -120,6 +133,13 @@ struct Inner {
     held_edits: Mutex<Bounded<String, Value>>,
     /// Who has opened the App Home, and the skills catalog.
     home: Home,
+    /// The new first-time flow (`PMOS_ONBOARDING_V2=1`) and what each PM has seen of it.
+    flow: Flow,
+    /// The marketplace bots (`GET /v1/personas`), reused for a minute, shared with the tool
+    /// server client for "Drafted by" on cards.
+    personas: Catalog,
+    /// `(channel, thread_ts, persona)` whose Preview line was already posted in that thread.
+    previewed: Mutex<Bounded<(String, String, String), ()>>,
 }
 
 #[derive(Clone)]
@@ -148,6 +168,9 @@ pub(crate) struct Click {
     pub(crate) value: String,
     /// Where to answer a click on an ephemeral message, which `chat.update` can't change.
     pub(crate) response_url: Option<String>,
+    /// The clicked block's id: an approval card's carries the start of the arguments' hash
+    /// it was posted with (`cards::clicked_hash`).
+    pub(crate) block_id: Option<String>,
 }
 
 impl Click {
@@ -163,6 +186,7 @@ impl Click {
             trigger_id: s(&payload["trigger_id"]).unwrap_or_default(),
             value: s(&payload["actions"][0]["value"]).unwrap_or_default(),
             response_url: s(&payload["response_url"]),
+            block_id: s(&payload["actions"][0]["block_id"]),
         })
     }
 }
@@ -185,6 +209,15 @@ enum Change {
 
 impl Bots {
     pub fn new(cfg: BotsConfig) -> Self {
+        let on = onboard_flow::enabled(std::env::var(onboard_flow::FLAG).ok().as_deref());
+        Self::with_onboarding_v2(cfg, on)
+    }
+
+    /// As [`Bots::new`], with the new first-time flow (`PMOS_ONBOARDING_V2`) set explicitly.
+    pub fn with_onboarding_v2(mut cfg: BotsConfig, onboarding_v2: bool) -> Self {
+        let personas = Catalog::default();
+        cfg.toolserver = cfg.toolserver.with_personas(personas.clone());
+        let flow = Flow::open(&cfg.state_dir, onboarding_v2);
         let onboarding = Onboarding::new(cfg.github_org.clone(), cfg.response_url_prefix.clone());
         let snoozes = SnoozeStore::open(&cfg.state_dir);
         Self {
@@ -193,14 +226,45 @@ impl Bots {
                 snoozes,
                 held_edits: Mutex::new(Bounded::new(500)),
                 home: Home::default(),
+                flow,
                 onboarding,
                 threads: Mutex::new(Bounded::new(5000)),
                 seen: Mutex::new(Bounded::new(5000)),
                 questions: Mutex::new(Bounded::new(500)),
                 drafts: Mutex::new(Bounded::new(500)),
                 roster: Mutex::new(None),
+                personas,
+                previewed: Mutex::new(Bounded::new(5000)),
             }),
         }
+    }
+
+    /// The offered marketplace bots (`GET /v1/personas`), reused for a minute; a stale copy
+    /// if the runtime is down.
+    pub async fn personas(&self) -> Result<Arc<Vec<Persona>>, RuntimeError> {
+        let current = self.inner.personas.current();
+        if let Some((at, list)) = &current {
+            if at.elapsed() < ROSTER_TTL {
+                return Ok(list.clone());
+            }
+        }
+        match self.runtime().personas().await {
+            Ok(list) => Ok(self.inner.personas.store(list)),
+            Err(e) => current.map(|(_, list)| list).ok_or(e),
+        }
+    }
+
+    /// `true` the first time `persona`'s Preview line is to be shown in this thread.
+    pub(crate) fn first_preview(&self, channel: &str, thread_ts: &str, persona: &str) -> bool {
+        self.inner
+            .previewed
+            .lock()
+            .expect("previewed lock")
+            .first_time((
+                channel.to_string(),
+                thread_ts.to_string(),
+                persona.to_string(),
+            ))
     }
 
     pub fn slack(&self) -> &SlackApi {
@@ -215,8 +279,47 @@ impl Bots {
         &self.inner.cfg.toolserver
     }
 
-    pub fn team(&self) -> TeamFile {
-        load_team(&self.inner.cfg.team_file)
+    /// The web app's origin (`PMOS_WEB_PUBLIC_URL`), for the **Open in workspace** button.
+    pub fn web_url(&self) -> Option<&str> {
+        self.inner.cfg.web_url.as_deref()
+    }
+
+    /// Who each Slack user is.
+    pub fn people(&self) -> &People {
+        &self.inner.cfg.people
+    }
+
+    /// The Slack user `slack_id` if they may use PM OS; anyone else gets the private note
+    /// that fits (`people::refusal`, with `stranger` for someone the directory doesn't have)
+    /// in `channel`, in `thread` if given.
+    pub(crate) async fn member_or_refuse(
+        &self,
+        channel: &str,
+        slack_id: &str,
+        thread: Option<&str>,
+        stranger: &'static str,
+    ) -> Option<Member> {
+        let who = self.people().identify(slack_id);
+        if let Identity::Member(m) = who {
+            return Some(m);
+        }
+        tracing::info!(
+            slack_id,
+            who = who.kind(),
+            "not someone who may use PM OS; refused"
+        );
+        self.private(
+            channel,
+            slack_id,
+            thread,
+            directory::refusal(&who, stranger),
+        )
+        .await;
+        None
+    }
+
+    pub(crate) fn flow(&self) -> &Flow {
+        &self.inner.flow
     }
 
     pub(crate) fn onboarding(&self) -> &Onboarding {
@@ -227,14 +330,9 @@ impl Bots {
         &self.inner.home
     }
 
-    /// The content repo (`PMOS_CONTENT_ROOT`): the directory `team.yaml` is in.
+    /// The content repo (`PMOS_CONTENT_ROOT`).
     pub(crate) fn content_root(&self) -> PathBuf {
-        self.inner
-            .cfg
-            .team_file
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
+        self.inner.cfg.content_root.clone()
     }
 
     /// `true` the first time an event is seen: Slack retries an event it thinks was missed.
@@ -378,6 +476,10 @@ impl Bots {
             // The App Home: its clicks have no message, which a `Click` needs.
             Some("block_actions") if payload["view"]["type"] == "home" => self.home_action(payload),
             Some("block_actions") => {
+                // A nudge's **Not now** button; a no-op while the nudge engine is off.
+                if let Some(work) = crate::nudges::action(payload) {
+                    return (None, Some(work));
+                }
                 let Some(click) = Click::from_payload(payload) else {
                     return (None, None);
                 };
@@ -446,6 +548,9 @@ impl Bots {
                     member_action::SETUP_MEMORY => {
                         Box::pin(async move { this.open_memory_modal(click).await })
                     }
+                    a if a.starts_with(cards::ONBOARD_START_PREFIX) => {
+                        Box::pin(async move { this.onboarding_start(click).await })
+                    }
                     _ => return (None, None),
                 };
                 (None, Some(work))
@@ -503,37 +608,61 @@ impl Bots {
     // ---- DMs ----
 
     async fn on_dm(&self, dm: Dm) {
-        let team = self.team();
-        let Some(member) = team.by_slack_id(&dm.user) else {
-            tracing::info!(slack_id = %dm.user, "DM from someone not in team.yaml");
-            let (text, blocks) = member_cards::request_access_note();
-            if let Err(e) = self
-                .slack()
-                .ephemeral_blocks(&dm.channel, &dm.user, None, &text, blocks)
-                .await
-            {
-                tracing::warn!(error = %e, "private note failed");
+        let member = match self.people().identify(&dm.user) {
+            Identity::Member(m) => m,
+            Identity::Stranger => {
+                tracing::info!(slack_id = %dm.user, "DM from someone not in the user directory");
+                let (text, blocks) = member_cards::request_access_note();
+                if let Err(e) = self
+                    .slack()
+                    .ephemeral_blocks(&dm.channel, &dm.user, None, &text, blocks)
+                    .await
+                {
+                    tracing::warn!(error = %e, "private note failed");
+                }
+                return;
             }
-            return;
+            other => {
+                tracing::info!(slack_id = %dm.user, who = other.kind(), "DM refused");
+                self.private(
+                    &dm.channel,
+                    &dm.user,
+                    None,
+                    directory::refusal(&other, NOT_A_MEMBER),
+                )
+                .await;
+                return;
+            }
         };
         let handle = member.handle.clone();
         let text = dm.text.trim().to_string();
         if text.is_empty() {
             return;
         }
-        match members::dm_command(&text, member.is_admin(), &team) {
+        let people = self.people().clone();
+        match members::dm_command(&text, member.admin, |id| people.handle_of(id)) {
             Some(DmCommand::Setup) => return self.post_setup(&dm, &handle).await,
             Some(DmCommand::Requests) => return self.list_requests(&dm).await,
             Some(DmCommand::Remove(who)) => {
-                return self.confirm_remove(&dm, &handle, &who).await;
+                return self.confirm_remove(&dm, &who).await;
             }
             None => {}
         }
+        // The first-time offer, once the PM has linked their account (flag off: no-op).
+        self.onboarding_offer(&dm.channel, &handle).await;
         if let Some(cmd) = reply::command(&text) {
             return self.reply_assistant(&dm, &handle, cmd).await;
         }
         if let Some(cmd) = bets_review::command(&text) {
             return self.bets_review(&dm, &handle, cmd).await;
+        }
+        // `nudges off` and `nudges on`; false while the nudge engine is off.
+        if crate::nudges::handle_dm(&dm.channel, &dm.thread_ts, &handle, &text).await {
+            return;
+        }
+        // `brief me at 8`, `brief off`, `brief`, `brief now`: the daily brief routine.
+        if crate::brief::handle_dm(self, &dm.channel, &dm.thread_ts, &dm.user, &text).await {
+            return;
         }
         if let Some(cmd) = level::command(&text) {
             return self.level_command(&dm, &handle, cmd).await;
@@ -561,6 +690,16 @@ impl Bots {
             }
         };
         let (prefix, rest) = split_prefix(&text, &roster);
+        // A bot's own `<bot>:` prefix comes first, as before; then a marketplace bot's name.
+        let asked = match prefix {
+            Some(_) => None,
+            None => self.persona_prefix(&text).await,
+        };
+        if let Some((persona, ask)) = asked {
+            return self
+                .ask_persona(&dm, &handle, &roster, &persona, &ask)
+                .await;
+        }
         let key = (dm.channel.clone(), dm.thread_ts.clone());
         if prefix.is_none() {
             let pending = self
@@ -595,14 +734,93 @@ impl Bots {
             .await;
     }
 
-    async fn start_task(&self, dm: &Dm, handle: &str, bot: &str, shown: &str, text: &str) {
+    /// The marketplace bot a message's text names (`Chief: …`, `sprout, …`) and the ask after
+    /// the name (`personas::split`), from the runtime's catalog. `None` when no offered
+    /// persona is named, or no catalog can be read (the text then goes as it is, as before).
+    pub(crate) async fn persona_prefix(&self, text: &str) -> Option<(Persona, String)> {
+        let catalog = match self.personas().await {
+            Ok(catalog) => catalog,
+            Err(e) => {
+                tracing::warn!(error = %e, "persona catalog unavailable; no bot prefix read");
+                return None;
+            }
+        };
+        personas::split(text, &catalog).map(|(p, ask)| (p.clone(), ask.to_string()))
+    }
+
+    /// A DM that names a marketplace bot: the PM's personal bot runs it as that persona.
+    /// What the Slack bot can tell before sending is told at once (no personal bot, nothing
+    /// asked, a routine); the team is the tool server's to check at claim, and its sentence
+    /// comes back in the thread.
+    async fn ask_persona(
+        &self,
+        dm: &Dm,
+        handle: &str,
+        roster: &[BotInfo],
+        persona: &Persona,
+        ask: &str,
+    ) {
+        let shown = persona.shown();
+        let note = |text: String| cards::note(&text);
+        let bot = personal_bot_name(handle);
+        let thread = Some(dm.thread_ts.as_str());
+        if !roster.iter().any(|b| b.name == bot) {
+            tracing::info!(user = handle, "persona ask without a personal bot");
+            let text = personas::NEEDS_PERSONAL_BOT.replace("{name}", &shown);
+            self.post(&dm.channel, thread, None, note(text)).await;
+            return;
+        }
+        if ask.is_empty() {
+            self.post(&dm.channel, thread, None, note(personas::empty_ask(&shown)))
+                .await;
+            return;
+        }
+        if routine_request(ask).is_some() {
+            let text = personas::routine_not_yet(&shown);
+            self.post(&dm.channel, thread, None, note(text)).await;
+            return;
+        }
+        self.start_task_as(dm, handle, &bot, &named(roster, &bot), ask, Some(persona))
+            .await;
+    }
+
+    /// Creates the task for a DM; `false` when it was refused or failed (the PM was told).
+    pub(crate) async fn start_task(
+        &self,
+        dm: &Dm,
+        handle: &str,
+        bot: &str,
+        shown: &str,
+        text: &str,
+    ) -> bool {
+        self.start_task_as(dm, handle, bot, shown, text, None).await
+    }
+
+    /// [`Bots::start_task`] as `persona` (`None`: no `persona` is sent, so a reply in a thread
+    /// stays with the thread's bot, as the runtime decides).
+    pub(crate) async fn start_task_as(
+        &self,
+        dm: &Dm,
+        handle: &str,
+        bot: &str,
+        shown: &str,
+        text: &str,
+        persona: Option<&Persona>,
+    ) -> bool {
         // Remembered first, so a second message sent quickly in the thread goes to the same
         // bot; put back if the task isn't created.
         let previous = self.thread_bot(&dm.channel, &dm.thread_ts);
         self.remember_thread(&dm.channel, &dm.thread_ts, bot);
         let created = self
             .runtime()
-            .create_task(handle, bot, text, &dm.channel, &dm.thread_ts)
+            .create_task_as(
+                handle,
+                bot,
+                text,
+                &dm.channel,
+                &dm.thread_ts,
+                persona.map(|p| p.key.as_str()),
+            )
             .await;
         if created.is_err() {
             let key = (dm.channel.clone(), dm.thread_ts.clone());
@@ -614,9 +832,21 @@ impl Bots {
                 }
             }
         }
+        let ok = created.is_ok();
         match created {
             Ok(task) => {
-                tracing::info!(task = %task["id"], bot, user = handle, "task created from a DM");
+                tracing::info!(task = %task["id"], bot, user = handle, persona = persona.map(|p| p.key.as_str()).unwrap_or("nudge"), "task created from a DM");
+            }
+            Err(RuntimeError::Persona(code)) => {
+                tracing::info!(code, user = handle, "persona ask refused by the runtime");
+                let name = persona.map(Persona::shown).unwrap_or_else(|| escape(shown));
+                self.post(
+                    &dm.channel,
+                    Some(&dm.thread_ts),
+                    None,
+                    cards::note(&personas::refusal(&code, &name)),
+                )
+                .await;
             }
             Err(RuntimeError::Refused(why)) => {
                 let message = format!("{} can't take that: {}", escape(shown), escape(&why));
@@ -639,6 +869,7 @@ impl Bots {
                 .await;
             }
         }
+        ok
     }
 
     async fn start_routine(&self, dm: &Dm, handle: &str, bot: &str, text: &str) {
@@ -700,7 +931,8 @@ impl Bots {
                 self.post(&dm.channel, thread, Some(&shown), cards::note(&message))
                     .await;
             }
-            Err(RuntimeError::Unavailable) => {
+            // Only a task names a persona; kept for the match.
+            Err(RuntimeError::Unavailable | RuntimeError::Persona(_)) => {
                 self.post(&dm.channel, thread, None, cards::note(UNAVAILABLE))
                     .await;
             }
@@ -715,22 +947,16 @@ impl Bots {
 
     // ---- Buttons ----
 
-    /// The clicking PM's handle; anyone outside `team.yaml` gets the private note.
+    /// The clicking PM's handle; anyone who may not use PM OS gets the private note.
     pub(crate) async fn clicker(&self, click: &Click) -> Option<String> {
-        let handle = self
-            .team()
-            .by_slack_id(&click.user)
-            .map(|m| m.handle.clone());
-        if handle.is_none() {
-            self.private(
-                &click.channel,
-                &click.user,
-                click.thread_ts.as_deref(),
-                NOT_A_MEMBER,
-            )
-            .await;
-        }
-        handle
+        self.member_or_refuse(
+            &click.channel,
+            &click.user,
+            click.thread_ts.as_deref(),
+            NOT_A_MEMBER,
+        )
+        .await
+        .map(|m| m.handle)
     }
 
     /// Only the item's own PM may decide it. Anyone else gets a private note, and nothing
@@ -763,6 +989,8 @@ impl Bots {
         handle: &str,
         id: &str,
     ) -> Option<Value> {
+        // The card says which bot drafted the item, from a catalog at most a minute old.
+        let _ = self.personas().await;
         match self.toolserver().approval(id, handle).await {
             Ok(item) => Some(item),
             Err(CallError::NotFound) => {
@@ -805,8 +1033,8 @@ impl Bots {
             cards::approval_closed(&item, &line)
         } else {
             match flip {
-                Flip::Reasons => cards::approval_reasons(&item),
-                Flip::Back => cards::approval_card(&item),
+                Flip::Reasons => cards::approval_reasons(&item, self.web_url()),
+                Flip::Back => cards::approval_card(&item, self.web_url()),
             }
         };
         self.update(&click.channel, &click.message_ts, card).await;
@@ -836,6 +1064,30 @@ impl Bots {
             .await;
             return;
         }
+        // What the card showed: the start of the args hash its buttons were posted with. The
+        // card shows other text than the item now has (the PM saved an edit in the web app
+        // since it was posted), or it is from before cards carried the hash: approve nothing;
+        // show the text as it is, to approve again (R4, R5). The tool server checks the hash
+        // again, atomically, when it decides.
+        let shown = click.block_id.as_deref().and_then(cards::clicked_hash);
+        if decision == "approve" {
+            let reshow = match shown {
+                None => Some(cards::approval_reshown(&item, self.web_url())),
+                Some(_) if cards::card_is_stale(click.block_id.as_deref(), &item) => {
+                    Some(cards::approval_changed(&item, self.web_url()))
+                }
+                Some(_) => None,
+            };
+            if let Some(card) = reshow {
+                tracing::info!(approval = %click.value, "approval card was stale or unversioned; shown again");
+                self.update(&click.channel, &click.message_ts, card).await;
+                return;
+            }
+        }
+        let seen = Seen {
+            args_hash: shown.filter(|_| decision == "approve"),
+            confirm_external: false,
+        };
         // Take the buttons away at once, so a second tap can't decide twice.
         let doing = if decision == "approve" && cards::is_reply(&item) {
             ":hourglass_flowing_sand: Posting…"
@@ -852,7 +1104,7 @@ impl Bots {
         .await;
         let outcome = self
             .toolserver()
-            .decide(&click.value, &handle, decision, None, reason, false)
+            .decide(&click.value, &handle, decision, None, reason, seen)
             .await
             .map(|mut decided| {
                 // The card says why, whether or not the item echoes the reason back.
@@ -929,8 +1181,11 @@ impl Bots {
             tracing::warn!("edit submitted without its card's details; ignored");
             return;
         };
-        let Some(handle) = self.team().by_slack_id(&user).map(|m| m.handle.clone()) else {
-            self.private(channel, &user, None, NOT_A_MEMBER).await;
+        let Some(handle) = self
+            .member_or_refuse(channel, &user, None, NOT_A_MEMBER)
+            .await
+            .map(|m| m.handle)
+        else {
             return;
         };
         let Some(item) = self.load_item(channel, &user, &handle, id).await else {
@@ -956,7 +1211,7 @@ impl Bots {
         .await;
         let outcome = self
             .toolserver()
-            .decide(id, &handle, "edit", Some(args), None, false)
+            .decide(id, &handle, "edit", Some(args), None, Seen::default())
             .await;
         self.show_decision(channel, ts, &shown, &handle, outcome, true)
             .await;
@@ -982,6 +1237,7 @@ impl Bots {
             Err(ApiError::Unavailable) => cards::approval_retry(
                 item,
                 "PM OS couldn't reach the tool server, so nothing was decided. Try again.",
+                self.web_url(),
             ),
             Err(ApiError::Refused { code, body, .. }) if code == "audience_blocked" => {
                 tracing::info!(approval = %item["id"], "reply blocked by the audience check");
@@ -1005,18 +1261,40 @@ impl Bots {
                 status: 422, code, ..
             }) if edited || code == "target_changed" => {
                 tracing::info!(approval = %item["id"], "edit refused: it changed a target");
-                cards::approval_retry(item, cards::TARGET_CHANGED)
+                cards::approval_retry(item, cards::TARGET_CHANGED, self.web_url())
             }
             Err(ApiError::Refused { code, .. }) if code == "expired" => {
                 let mut shown = item.clone();
                 shown["status"] = json!("expired");
                 cards::approval_closed(&shown, cards::EXPIRED_LINE)
             }
+            // The text changed between the click and the decision (a save in the web app):
+            // nothing was decided. Show the card as the item is now, to approve again.
+            Err(ApiError::Refused { code, .. }) if code == "stale" => {
+                tracing::info!(approval = %item["id"], "decision refused as stale; card shown again");
+                let id = item["id"].as_str().unwrap_or_default();
+                match self.toolserver().approval(id, handle).await {
+                    Ok(now) if now["status"] == "pending" => {
+                        cards::approval_changed(&now, self.web_url())
+                    }
+                    Ok(now) => {
+                        let line = cards::decision_line(&now, handle, false);
+                        cards::approval_closed(&now, &line)
+                    }
+                    Err(_) => cards::approval_retry(
+                        item,
+                        "This draft changed since this card was posted, so nothing was decided. \
+                         Open it again to see the text as it is now.",
+                        self.web_url(),
+                    ),
+                }
+            }
             Err(ApiError::Refused { code, .. }) if code == "audience_unavailable" => {
                 cards::approval_retry(
                     item,
                     "PM OS couldn't check who is in the channel (Slack didn't answer), so \
                      nothing was posted. Try again in a minute.",
+                    self.web_url(),
                 )
             }
             Err(ApiError::Refused { error, .. }) => {
@@ -1035,7 +1313,11 @@ impl Bots {
                         );
                         cards::approval_closed(&now, &line)
                     }
-                    _ => cards::approval_retry(item, &format!("That didn't go through: {why}")),
+                    _ => cards::approval_retry(
+                        item,
+                        &format!("That didn't go through: {why}"),
+                        self.web_url(),
+                    ),
                 }
             }
         };
@@ -1108,7 +1390,11 @@ impl Bots {
                 )
                 .await;
             }
-            Err(RuntimeError::Refused(why) | RuntimeError::Question(why)) => {
+            Err(
+                RuntimeError::Refused(why)
+                | RuntimeError::Question(why)
+                | RuntimeError::Persona(why),
+            ) => {
                 let line = format!("I couldn't create that routine: {}", escape(&why));
                 self.update(&click.channel, &click.message_ts, cards::note(&line))
                     .await;
@@ -1216,7 +1502,7 @@ fn unavailable_or(e: &RuntimeError) -> String {
 }
 
 /// The display name of `bot` from the roster, or one made from its name.
-fn named(roster: &[BotInfo], bot: &str) -> String {
+pub(crate) fn named(roster: &[BotInfo], bot: &str) -> String {
     roster
         .iter()
         .find(|b| b.name == bot)

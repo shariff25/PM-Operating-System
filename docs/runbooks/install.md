@@ -44,8 +44,30 @@ deploy/setup.sh --content /srv/pmos/content-repo --clone <the content repo> --st
    `PMOS_DOCS_PRODUCTS`) in `deploy/.env`. The site must publish `llms.txt` and markdown
    pages: see "Pointing the Docs bot at your docs" in `docs/docs-server.md`. You can leave it
    blank and add it later; until then the Docs bot says no docs site is configured.
-5. **Save the settings.** Copy `deploy/.env` into the team password manager now. It holds the
-   vault key; without it, stored tokens can't be read.
+5. **The console (optional).** `deploy/setup.sh` generates `PMOS_CONSOLE_PROXY_SECRET` in
+   `deploy/.env`. Its only use is the proxy, so if the console sits behind the Spark's sign-in
+   proxy, do both of these:
+   - set `PMOS_CONSOLE_TRUST_PROXY=1` in `deploy/.env`, after the secret is there (the console
+     won't start with trust on and no secret);
+   - configure the proxy to strip `X-Forwarded-User` and `X-Pmos-Proxy-Secret` from the
+     browser's request, then set `X-Pmos-Proxy-Secret` itself to the same value. The Caddy
+     example is in `docs/console.md`, under "Sign-in". Check it with a request that sends its
+     own headers: neither may reach the console.
+
+   **Existing installs:** run `deploy/setup.sh` again with the same arguments as above. It only
+   fills in missing values, so it adds the secret and leaves the rest alone. Then restart with
+   `deploy/pmos-admin up --models`, and set up the proxy as above before you turn trust on.
+6. **User assertions.** `setup.sh` writes `PMOS_ASSERTION_MODE=require` into `deploy/.env` and
+   generates the web app's and the console's tokens and signing keys. Keep it `require`: the
+   runtime and the tool server refuse to start in `off` or `verify` while those tokens are
+   set, and every `pmos-admin up` (with any options, including the `up --models` restarts in
+   these runbooks), `add-bot` and `restore` checks it before it starts anything
+   (`docs/user-assertion.md`, Modes). There is no override here: the development one
+   (`PMOS_ASSERTION_INSECURE_OFF`) is for fake-data stacks only, `deploy/compose.yaml` doesn't
+   pass it, and the services refuse it with live connectors or a database. `PMOS_ONBOARDING_V2` and `PMOS_NUDGES` (the
+   Slack first-time flow and nudges) are written as `1`; set either to `0` to turn it off.
+7. **Save the settings.** Copy `deploy/.env` into the team password manager now. It holds the
+   vault key and the console proxy secret; without the vault key, stored tokens can't be read.
 
 ## Stage 2: First start, without models or Slack
 
@@ -62,18 +84,28 @@ deploy/pmos-admin status
 - `docs` turns ready once its first sync of your docs site finishes (about a second per page);
   with no `PMOS_DOCS_BASE_URL` it stays not ready (`docs site not configured`), which is expected.
 
-**Add the first platform owners.** Everyone after them joins through the bot.
+**Add the first platform owners.** People and roles live in the tool server's user database
+([users.md](users.md)), never in the content. Everyone after the first owners joins through
+the bot, or an admin's invite in the web app.
 
-1. Add each owner and generate their bots' sandbox policies:
+1. Make yourself the first admin, then give yourself a personal bot and generate its sandbox
+   policy:
 
    ```sh
-   deploy/pmos-admin pmos member add --root content --handle <handle> --slack-id <U…> \
-     --email <atlassian email> --github <login> --roles pm,admin
+   deploy/pmos-admin users bootstrap-admin --handle <handle> --name "<name>" \
+     --sign-in-name <work sign-in name> --atlassian-email <atlassian email> \
+     --slack-id <U…> --github <login> --no-entra        # or --oid <Entra object id>
+   deploy/pmos-admin pmos bot add-personal --root content --handle <handle>
    deploy/pmos-admin pmos policy generate --root content --out policies
    deploy/pmos-admin lint
    ```
 
-2. Commit the changes in `/srv/pmos/content-repo` on a branch, and merge them by pull request.
+   Each other owner then requests access in Slack (or you invite them in the web app); once
+   they are in, make them an admin on the host:
+   `deploy/pmos-admin users grant-admin <handle> --oid <their Entra object id>`.
+
+2. Commit the content changes in `/srv/pmos/content-repo` on a branch, and merge them by pull
+   request.
 3. Then pull the checkout and run `deploy/pmos-admin reindex`.
 4. **Smoke test:** `deploy/pmos-admin smoke <your handle>` should end with
    `smoke test passed`. The answer comes from the stub model, so it reads like test text; this
@@ -177,8 +209,11 @@ Only after the red-team checklist passes.
    ```
    Commit the reports in `/srv/pmos/content-repo/evals/reports`. The load test runs on the
    live stack as the benchmark member `evals`, the only handle the benchmark token may use
-   (`PMOS_EVALS_AS`). Add that member once, with no real Slack account, and merge it:
-   `deploy/pmos-admin pmos member add --root content --handle evals --slack-id U0EVALS --roles pm`.
+   (`PMOS_EVALS_AS`). Add that user once: write a file outside the content holding
+   `members: [{handle: evals, slack-id: U0EVALS, roles: [pm]}]`, import it with
+   `deploy/pmos-admin users import --from <that file> --apply` (the database keeps no Slack id
+   for `evals`; the import says so), then give it its bot with
+   `deploy/pmos-admin pmos bot add-personal --root content --handle evals` and merge that.
    To run it as yourself instead, set `PMOS_EVALS_AS=<your handle>` in `deploy/.env`,
    `deploy/pmos-admin restart bots`, pass `--as <your handle>`, then empty it and restart
    again.
@@ -193,20 +228,24 @@ Gate 1 is passed when:
 
 ## The console behind a sign-in proxy (optional)
 
-The console (`docs/console.md`) starts with `deploy/pmos-admin up --models --console`. Before
-SSO, set `PMOS_CONSOLE_DEV_USER=<your handle>` and reach `127.0.0.1:8760` over an SSH tunnel.
-With SSO, put a sign-in proxy in front of it:
+The console (`docs/console.md`) starts with `deploy/pmos-admin up --models --console`, and only
+behind a sign-in proxy on the Spark. `PMOS_CONSOLE_DEV_USER` is for running the console on your
+own machine: it needs a loopback bind, and the kit's container listens on `0.0.0.0`, so the
+console refuses it here. Step 5 above made the secret; to put the proxy in front:
 
 1. **The settings.** In `deploy/.env`, set `PMOS_CONSOLE_TRUST_PROXY=1`, empty
    `PMOS_CONSOLE_DEV_USER`, and set `PMOS_CONSOLE_PUBLIC_URL` to the address browsers use.
    `setup.sh` has already made `PMOS_CONSOLE_PROXY_SECRET`; the console refuses to start
    without it (or with one under 32 characters).
-2. **The proxy** signs the person in, then forwards every request with two headers: their
-   handle or email in `X-Forwarded-User`, and `X-Pmos-Proxy-Secret` set to
-   `PMOS_CONSOLE_PROXY_SECRET`. It must replace any `X-Forwarded-User` the browser sent. For
-   example, with Caddy and an SSO add-on that sets `{http.auth.user.id}`:
+2. **The proxy** signs the person in, strips any `X-Forwarded-User` and `X-Pmos-Proxy-Secret`
+   the browser sent, then forwards every request with both set itself: their handle or email
+   in `X-Forwarded-User`, and `X-Pmos-Proxy-Secret` set to `PMOS_CONSOLE_PROXY_SECRET`. For
+   example, with Caddy and an SSO add-on that sets `{http.auth.user.id}` (a fuller example is
+   in `docs/console.md`, under "Sign-in"):
    ```
    console.pmos.<your domain> {
+     request_header -X-Forwarded-User
+     request_header -X-Pmos-Proxy-Secret
      # your SSO plugin's directive here
      reverse_proxy 127.0.0.1:8760 {
        header_up X-Forwarded-User {http.auth.user.id}
@@ -217,7 +256,43 @@ With SSO, put a sign-in proxy in front of it:
    Give the proxy the secret through its environment or secret store, never in a file in git.
 3. **Check:** `curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Forwarded-User: <your handle>'
    http://127.0.0.1:8760/bots` on the Spark answers `401`: without the proxy's secret, the
-   user header counts for nothing. Through the proxy, the Bots screen opens.
+   user header counts for nothing. A request through the proxy that sends its own
+   `X-Forwarded-User` and `X-Pmos-Proxy-Secret` must not get them through. Through the proxy,
+   the Bots screen opens.
 
 The console's tool-server token (`PMOS_CONSOLE_TS_TOKEN`) may only read approvals, so even a
 compromised console can't decide one or call a tool.
+
+## Optional: the web app
+
+The web app is **off by default**. Turn it on only for a closed test network: development
+sign-in lets anyone who can reach its port sign in as any member. See
+[docs/web-app-running.md](../web-app-running.md) before you start it.
+
+With **password sign-in** (`PMOS_WEB_PASSWORD_LOGIN=1`, [docs/password-sign-in.md](../password-sign-in.md))
+the web app also needs `PMOS_WEB_PUBLIC_URL` set to its `https://` address and
+`PMOS_WEB_TRUSTED_PROXIES` set to the address the reverse proxy reaches it from: for a proxy on
+this host, the `pmos` network's gateway, which the kit **pins**: `PMOS_NETWORK_SUBNET`
+(`10.201.77.0/24`) and `PMOS_NETWORK_GATEWAY` (`10.201.77.1`) in `deploy/.env`, and
+`env.example` already sets `PMOS_WEB_TRUSTED_PROXIES=10.201.77.1`. Change the pair only if
+your site already routes that range. The proxy must send `X-Forwarded-For` (nginx:
+`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`).
+
+`deploy/pmos-admin up --web` refuses before anything starts, printing the fix, when:
+
+| It says | What to do |
+| --- | --- |
+| `PMOS_WEB_TRUSTED_PROXIES is blank` | Put the printed `PMOS_WEB_TRUSTED_PROXIES=<gateway>` line in `deploy/.env`. |
+| `The pmos network's gateway is <a>, but deploy/.env pins PMOS_NETWORK_GATEWAY=<b>` | The network was made before the kit pinned it (or with other settings). Run `deploy/pmos-admin down && deploy/pmos-admin up --web`: `down` removes the network and `up` makes it at the pinned address. Every service restarts. |
+| `PMOS_WEB_TRUSTED_PROXIES names <x>, but ... the gateway, <g>` | The setting is stale (an old, unpinned gateway such as `172.18.0.1`). Set the printed line. A proxy in a container on the `pmos` network may be listed by its own address inside the subnet. |
+| `PMOS_WEB_PUBLIC_URL must be the web app's https:// address` | Set it. |
+
+**After it starts, if password sign-in answers "PM OS can't sign you in through this
+address"** (`403 proxy_not_trusted`): the requests arrive from somewhere
+`PMOS_WEB_TRUSTED_PROXIES` doesn't name, or the proxy sends no `X-Forwarded-For`. The web app's
+`/readyz` counts them (`untrusted_proxy_refusals`, since it started:
+`curl -s http://127.0.0.1:8770/readyz`) and its log says so at error level once a minute
+(`deploy/pmos-admin logs web`). Check the proxy sets `X-Forwarded-For`, and that its requests
+reach the published port from the gateway; fix `deploy/.env` and run `deploy/pmos-admin up
+--web` again. Nothing is counted against a shared address meanwhile: every such request is
+refused.

@@ -1,8 +1,9 @@
 # Runbooks: running PM OS on the Spark
 
 PM OS runs on one DGX Spark as one Docker Compose stack (`deploy/compose.yaml`), plus one
-OpenShell sandbox per bot. These runbooks are for the platform owners, PMs listed as `admin` in
-`team.yaml`. They assume you're comfortable in a terminal; nothing more.
+OpenShell sandbox per bot. These runbooks are for the platform owners, PMs who hold `admin` in
+the user database ([users.md](users.md)). They assume you're comfortable in a terminal; nothing
+more.
 
 Everything goes through one command, `deploy/pmos-admin`. Run it with no arguments to list its
 commands.
@@ -16,6 +17,7 @@ commands.
 | [quality.md](quality.md) | For each bot's quality owner: the triage digest, trace reviews, case cards, judges and the eval gate |
 | [model-swap.md](model-swap.md) | Changing which model serves a role (D11) |
 | [bots-and-members.md](bots-and-members.md) | A new member's bot, pausing a bot, revoking someone's tokens |
+| [users.md](users.md) | The user database on the host: the first admin, importing an old `team.yaml` once, the pilot exception, break glass |
 | [incidents.md](incidents.md) | Something went wrong: a bot misbehaves, a token leaks, a service won't start |
 
 ## The pieces

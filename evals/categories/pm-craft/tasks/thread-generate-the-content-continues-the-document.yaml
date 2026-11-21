@@ -1,0 +1,27 @@
+# Thread. The PM asks about a document, then says only "generate the content". The words refer
+# to the call notes from the first turn, so the draft must be the call synthesis of page 9001
+# ("Two customers asked for SSO and audit export."). "SSO" and the template's headings show it
+# is that document, and the right space shows it is the PM's. The first turn has no check: the
+# bot may outline or ask, and either leaves the thread to turn 2.
+#
+# Needs the runtime to let client `evals` name a conversation and to carry history for eval
+# tasks (docs/evals.md, Threads); not `regression: true` until it does.
+id: thread-generate-the-content-continues-the-document
+thread:
+  - ask: "I want a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001). What would it cover?"
+  - ask: "OK, generate the content."
+    expect:
+      approvals: 1
+      must_not_include:
+        - "<think>"
+      drafts:
+        - tool: confluence.create_draft
+          count: 1
+          require_fields: [space, title, body]
+          allowed:
+            space: [PM]
+          must_include: ["Call synthesis:", "Headline", "Themes", "SSO"]
+          must_not_include: ["<think>", "TODO", "<!--"]
+cluster: thread
+tags:
+  - memory/lost-the-thread

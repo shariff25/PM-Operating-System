@@ -1,7 +1,15 @@
 //! Configuration from environment variables.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+
+use pmos_assertion::{KeyRing, KeyUse};
+
+use crate::upstream::{Credentials, Signer};
+
+/// The console's client name: the issuer of its user assertions.
+pub const ISSUER: &str = "console";
 
 /// Who the person in front of the browser is.
 #[derive(Clone, PartialEq, Eq)]
@@ -38,16 +46,16 @@ pub struct Config {
     /// `PMOS_BOTS_URL`, default `http://127.0.0.1:8750`.
     pub bots_url: String,
     /// `PMOS_BOTS_TOKEN`: the runtime's `console` client token. Required, at least 32
-    /// characters.
-    pub bots_token: String,
+    /// characters. With a `console:bots` key in `PMOS_ASSERTION_KEYS`, calls that name a
+    /// person also carry a signed user assertion.
+    pub bots_token: Credentials,
     /// `PMOS_TOOLSERVER_URL`, default `http://127.0.0.1:8710`.
     pub toolserver_url: String,
     /// `PMOS_TOOLSERVER_TOKEN`: the tool server's read-only `console` client token
-    /// (`PMOS_CONSOLE_TS_TOKEN` there), which may only read approvals. Required, at least 32
-    /// characters.
-    pub toolserver_token: String,
-    /// `PMOS_CONTENT_ROOT`, default `content`: where `team.yaml` is.
-    pub content_root: PathBuf,
+    /// (`PMOS_CONSOLE_TS_TOKEN` there), which may only read approvals and look users up
+    /// (`resolve`). Required, at least 32 characters. With a `console:toolserver` key in
+    /// `PMOS_ASSERTION_KEYS`, calls that name a person also carry a signed user assertion.
+    pub toolserver_token: Credentials,
     /// `PMOS_CONSOLE_AUDIT_LOG`: the tool server's JSON-lines audit file (its
     /// `PMOS_AUDIT_LOG`), mounted read-only. A task page shows its audit events from it.
     pub audit_log: Option<PathBuf>,
@@ -66,10 +74,9 @@ impl std::fmt::Debug for Config {
             .field("bind", &self.bind)
             .field("identity", &self.identity)
             .field("bots_url", &self.bots_url)
-            .field("bots_token", &"<redacted>")
+            .field("bots_token", &self.bots_token)
             .field("toolserver_url", &self.toolserver_url)
-            .field("toolserver_token", &"<redacted>")
-            .field("content_root", &self.content_root)
+            .field("toolserver_token", &self.toolserver_token)
             .field("audit_log", &self.audit_log)
             .field("slack_url", &self.slack_url)
             .field("public_url", &self.public_url)
@@ -103,8 +110,10 @@ impl Config {
         let identity = match (trust_proxy, set("PMOS_CONSOLE_DEV_USER")) {
             (true, None) => {
                 let secret = set("PMOS_CONSOLE_PROXY_SECRET").ok_or(
-                    "PMOS_CONSOLE_TRUST_PROXY=1 needs PMOS_CONSOLE_PROXY_SECRET: the secret the \
-                     sign-in proxy sends in X-Pmos-Proxy-Secret",
+                    "PMOS_CONSOLE_TRUST_PROXY=1 needs PMOS_CONSOLE_PROXY_SECRET: the shared \
+                     secret (at least 32 characters) the sign-in proxy sends in \
+                     X-Pmos-Proxy-Secret on every request. Run deploy/setup.sh to generate it, \
+                     and set the proxy to send it (docs/console.md, Sign-in)",
                 )?;
                 if secret.len() < MIN_PROXY_SECRET {
                     return Err(format!(
@@ -137,11 +146,42 @@ impl Config {
         if bots_token == toolserver_token {
             return Err("PMOS_BOTS_TOKEN and PMOS_TOOLSERVER_TOKEN must differ".into());
         }
+        if let Identity::Proxy { secret } = &identity {
+            if *secret == bots_token || *secret == toolserver_token {
+                return Err(
+                    "PMOS_CONSOLE_PROXY_SECRET must differ from PMOS_BOTS_TOKEN and \
+                     PMOS_TOOLSERVER_TOKEN"
+                        .into(),
+                );
+            }
+        }
+        let mut keys = match set("PMOS_ASSERTION_KEYS") {
+            None => BTreeMap::new(),
+            Some(spec) => parse_assertion_keys(&spec, "the console", |iss, aud| {
+                iss == ISSUER && (aud == "bots" || aud == "toolserver")
+            })?,
+        };
+        let mut credentials = |token: String, audience: &str| {
+            let c = Credentials::new(token);
+            match keys.remove(&(ISSUER.to_string(), audience.to_string())) {
+                Some(ring) => c.with_signer(Signer::new(ISSUER, audience, ring)),
+                None => c,
+            }
+        };
+        let bots_token = credentials(bots_token, "bots");
+        let toolserver_token = credentials(toolserver_token, "toolserver");
+        let bind: SocketAddr = set("PMOS_CONSOLE_BIND")
+            .unwrap_or_else(|| "127.0.0.1:8760".into())
+            .parse()
+            .map_err(|e| format!("PMOS_CONSOLE_BIND: {e}"))?;
+        if matches!(identity, Identity::Dev(_)) && !bind.ip().is_loopback() {
+            return Err(format!(
+                "PMOS_CONSOLE_DEV_USER makes every request that person, so it needs a loopback \
+                 PMOS_CONSOLE_BIND (such as 127.0.0.1:8760), not {bind}"
+            ));
+        }
         Ok(Self {
-            bind: set("PMOS_CONSOLE_BIND")
-                .unwrap_or_else(|| "127.0.0.1:8760".into())
-                .parse()
-                .map_err(|e| format!("PMOS_CONSOLE_BIND: {e}"))?,
+            bind,
             identity,
             bots_url: http_url(
                 "PMOS_BOTS_URL",
@@ -153,9 +193,6 @@ impl Config {
                 set("PMOS_TOOLSERVER_URL").unwrap_or_else(|| "http://127.0.0.1:8710".into()),
             )?,
             toolserver_token,
-            content_root: set("PMOS_CONTENT_ROOT")
-                .unwrap_or_else(|| "content".into())
-                .into(),
             audit_log: set("PMOS_CONSOLE_AUDIT_LOG").map(PathBuf::from),
             slack_url: set("PMOS_CONSOLE_SLACK_URL")
                 .map(|u| https_origin("PMOS_CONSOLE_SLACK_URL", u))
@@ -165,6 +202,18 @@ impl Config {
                 .transpose()?,
         })
     }
+}
+
+/// `PMOS_ASSERTION_KEYS`: the keys this service signs user assertions with
+/// (`docs/user-assertion.md`; `pmos_assertion::parse_key_list`, shared by every service that
+/// signs or checks). Only pairs `wanted` accepts may appear, so a service never holds a key it
+/// has no use for. Errors name the entry and the pair, never a key.
+pub fn parse_assertion_keys(
+    spec: &str,
+    service: &str,
+    wanted: impl Fn(&str, &str) -> bool,
+) -> Result<BTreeMap<(String, String), KeyRing>, String> {
+    pmos_assertion::parse_key_list(spec, service, KeyUse::Signs, wanted)
 }
 
 /// An `http` or `https` base URL, without a trailing slash.
@@ -206,6 +255,38 @@ mod tests {
     const SECRET: &str = "proxy-secret-0123456789abcdef01234";
 
     #[test]
+    fn assertion_keys_attach_a_signer_per_upstream() {
+        let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let base = [
+            ("PMOS_BOTS_TOKEN", BOTS),
+            ("PMOS_TOOLSERVER_TOKEN", TOOLS),
+            ("PMOS_CONSOLE_DEV_USER", "ana"),
+        ];
+        let with = |keys: &str| {
+            let mut pairs = base.to_vec();
+            pairs.push(("PMOS_ASSERTION_KEYS", keys));
+            Config::from_lookup(lookup(&pairs))
+        };
+        let cfg = with(&format!(
+            "console:bots:c1:{key},console:toolserver:c2:{key}"
+        ))
+        .unwrap();
+        assert!(cfg.bots_token.signs() && cfg.toolserver_token.signs());
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains(key) && !debug.contains(BOTS) && !debug.contains(TOOLS));
+        let plain = Config::from_lookup(lookup(&base)).unwrap();
+        assert!(!plain.bots_token.signs() && !plain.toolserver_token.signs());
+        // The web app's pair is not the console's to hold; a bad key never shows.
+        for (spec, want) in [
+            (format!("web:bots:k1:{key}"), "not a pair"),
+            ("console:bots:k1:not base64!".to_string(), "base64"),
+        ] {
+            let err = with(&spec).unwrap_err();
+            assert!(err.contains(want) && !err.contains(key), "{err}");
+        }
+    }
+
+    #[test]
     fn reads_defaults_and_redacts_tokens() {
         let cfg = Config::from_lookup(lookup(&[
             ("PMOS_BOTS_TOKEN", BOTS),
@@ -217,7 +298,6 @@ mod tests {
         assert_eq!(cfg.identity, Identity::Dev("ana".into()));
         assert_eq!(cfg.bots_url, "http://127.0.0.1:8750");
         assert_eq!(cfg.toolserver_url, "http://127.0.0.1:8710");
-        assert_eq!(cfg.content_root, PathBuf::from("content"));
         assert!(cfg.audit_log.is_none() && cfg.slack_url.is_none());
         let debug = format!("{cfg:?}");
         assert!(!debug.contains(BOTS) && !debug.contains(TOOLS));
@@ -328,5 +408,95 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.bots_url, "http://bots.pmos.internal:8750");
         assert_eq!(cfg.slack_url.as_deref(), Some("https://acme.slack.com"));
+    }
+
+    #[test]
+    fn proxy_trust_needs_a_strong_secret() {
+        let base = [
+            ("PMOS_BOTS_TOKEN", BOTS),
+            ("PMOS_TOOLSERVER_TOKEN", TOOLS),
+            ("PMOS_CONSOLE_TRUST_PROXY", "1"),
+        ];
+        // No secret at all, or a blank one: refuse to start, naming the variable.
+        let err = Config::from_lookup(lookup(&base)).unwrap_err();
+        assert!(err.contains("PMOS_CONSOLE_PROXY_SECRET"), "{err}");
+        let mut blank = base.to_vec();
+        blank.push(("PMOS_CONSOLE_PROXY_SECRET", "  "));
+        let err = Config::from_lookup(lookup(&blank)).unwrap_err();
+        assert!(err.contains("PMOS_CONSOLE_PROXY_SECRET"), "{err}");
+        // Too short.
+        let mut short = base.to_vec();
+        short.push((
+            "PMOS_CONSOLE_PROXY_SECRET",
+            "0123456789abcdef0123456789abcde",
+        ));
+        let err = Config::from_lookup(lookup(&short)).unwrap_err();
+        assert!(err.contains("at least 32"), "{err}");
+        // Reusing a token.
+        let mut reused = base.to_vec();
+        reused.push(("PMOS_CONSOLE_PROXY_SECRET", TOOLS));
+        let err = Config::from_lookup(lookup(&reused)).unwrap_err();
+        assert!(err.contains("must differ"), "{err}");
+        // A good one; the Debug output never shows it.
+        let mut good = base.to_vec();
+        good.push(("PMOS_CONSOLE_PROXY_SECRET", SECRET));
+        let cfg = Config::from_lookup(lookup(&good)).unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains(SECRET), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn the_proxy_secret_is_compared_whole() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let identity = Identity::Proxy {
+            secret: SECRET.into(),
+        };
+        let with = |values: &[&str]| {
+            let mut h = HeaderMap::new();
+            for v in values {
+                h.append(crate::auth::PROXY_SECRET, HeaderValue::from_str(v).unwrap());
+            }
+            crate::auth::from_proxy(&identity, &h)
+        };
+        assert!(with(&[SECRET]));
+        assert!(!with(&[]));
+        assert!(!with(&[""]));
+        assert!(!with(&[&SECRET[..SECRET.len() - 1]]));
+        assert!(!with(&[&format!("{SECRET}x")]));
+        assert!(!with(&[&SECRET.to_uppercase()]));
+        // Exactly one: a client's own copy next to the proxy's is refused, whichever comes
+        // first.
+        assert!(!with(&[SECRET, SECRET]));
+        assert!(!with(&["guess", SECRET]));
+    }
+
+    #[test]
+    fn the_dev_user_needs_a_loopback_bind() {
+        let base = [
+            ("PMOS_BOTS_TOKEN", BOTS),
+            ("PMOS_TOOLSERVER_TOKEN", TOOLS),
+            ("PMOS_CONSOLE_DEV_USER", "ana"),
+        ];
+        for bind in ["0.0.0.0:8760", "10.0.0.2:8760", "[::]:8760"] {
+            let mut pairs = base.to_vec();
+            pairs.push(("PMOS_CONSOLE_BIND", bind));
+            let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
+            assert!(err.contains("loopback"), "{bind}: {err}");
+        }
+        for bind in ["127.0.0.1:8760", "[::1]:8760"] {
+            let mut pairs = base.to_vec();
+            pairs.push(("PMOS_CONSOLE_BIND", bind));
+            assert!(Config::from_lookup(lookup(&pairs)).is_ok(), "{bind}");
+        }
+        // Behind the proxy, any bind is allowed: the secret guards it.
+        let pairs = [
+            ("PMOS_BOTS_TOKEN", BOTS),
+            ("PMOS_TOOLSERVER_TOKEN", TOOLS),
+            ("PMOS_CONSOLE_TRUST_PROXY", "1"),
+            ("PMOS_CONSOLE_PROXY_SECRET", SECRET),
+            ("PMOS_CONSOLE_BIND", "0.0.0.0:8760"),
+        ];
+        assert!(Config::from_lookup(lookup(&pairs)).is_ok());
     }
 }

@@ -44,7 +44,11 @@ fn with_bets(mut f: Fixture) -> Fixture {
         f.slack.clone(),
         Arc::new(FakeConnector::docs()),
     ];
-    f.svc = Arc::new(ToolService::new(catalog, f.stores.clone(), connectors).unwrap());
+    f.svc = Arc::new(
+        ToolService::new(catalog, f.stores.clone(), connectors)
+            .unwrap()
+            .with_open_directory(),
+    );
     f
 }
 
@@ -479,6 +483,8 @@ async fn a_bet_carries_its_sources_sensitivity(f: Fixture) {
                 content_sha: None,
                 model_alias: None,
                 sources_sensitivity: Sensitivity::Restricted,
+                persona: None,
+                draft_notice: None,
             },
             now(),
         )
@@ -681,7 +687,11 @@ async fn an_internal_failure_answers_a_generic_message() {
         f.slack.clone(),
         Arc::new(FakeConnector::docs()),
     ];
-    let svc = Arc::new(ToolService::new(catalog, f.stores.clone(), connectors).unwrap());
+    let svc = Arc::new(
+        ToolService::new(catalog, f.stores.clone(), connectors)
+            .unwrap()
+            .with_open_directory(),
+    );
     let args = new_bet();
     let item = f
         .stores
@@ -697,6 +707,8 @@ async fn an_internal_failure_answers_a_generic_message() {
                 content_sha: None,
                 model_alias: None,
                 sources_sensitivity: Sensitivity::Internal,
+                persona: None,
+                draft_notice: None,
             },
             now(),
         )

@@ -27,6 +27,7 @@
 //! why the launch spec is a separate file. Format details and what is still to verify on the
 //! Spark are in `docs/sandbox-policies.md`.
 
+pub mod admin;
 pub mod check;
 pub mod generate;
 pub mod openshell;

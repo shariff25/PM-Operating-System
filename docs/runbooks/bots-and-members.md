@@ -3,10 +3,22 @@
 ## A new member
 
 New members join through Slack. They tap **Request access**, and a platform owner approves on
-the card (`docs/onboarding-spec.md`). The approval commits:
-- their entry in `team.yaml`;
+the card (`docs/onboarding-spec.md`). The approval first adds them to the user database (they
+can use PM OS at once; [users.md](users.md)), then commits to the content repo:
 - their personal bot `pm-<handle>`;
 - that bot's sandbox policy.
+
+There is no `team.yaml` to edit: people and roles are only in the user database. Someone an
+admin invites in the web app gets no personal bot automatically; write one with
+`deploy/pmos-admin pmos bot add-personal --root content --handle <handle>` and
+`deploy/pmos-admin pmos policy generate --root content --out policies`, and commit both by pull
+request.
+
+A bot's `owner` in its `BOT.md` must be a PM OS handle (`pmos lint`: `bot-owner-handle`).
+Whether that person is still an active user is the database's to say: the admin overview lists
+bots whose owner can't use PM OS (`bots_without_active_owner`), a personal bot serves only its
+owner while they are active, and Slack and the web app won't deactivate someone who owns a
+team bot.
 
 Once the content sync pulls the commit, within about 5 minutes, give their bot a sandbox:
 
@@ -42,8 +54,11 @@ To stop it for good, remove its `BOT.md` by pull request and delete its sandbox 
 
 ## A member leaves
 
-Use `remove <handle>` in a DM to PM OS, as a platform owner. It commits the removal and unlinks
-their accounts. Then delete their bot's sandbox:
+Use `remove <handle>` in a DM to PM OS, as a platform owner. It **deactivates** them in the
+user database (nothing is committed; see [users.md](users.md) "Deactivating someone"): their
+sessions end and their linked accounts are suspended, then deleted after 24 hours unless they
+are reactivated. Slack won't deactivate an Admin or an Auditor, and stops after 3
+deactivations an hour; use the host commands for those. Then delete their bot's sandbox:
 
 ```sh
 openshell sandbox delete pmos-pm-<handle>

@@ -26,6 +26,8 @@ fn line(id: &str, failure: Option<(Tag, &str, Check)>) -> TaskReport {
         repeat: 1,
         cluster: None,
         regression: false,
+        turns: Vec::new(),
+        failed_turn: None,
         judges: Vec::new(),
         task_id: Some(format!("tsk_{id}")),
         status: Some(if passed { "done" } else { "failed" }.into()),
@@ -436,4 +438,85 @@ fn repeats_show_passes_out_of_k_and_pass_hat_k() {
     assert!(md.contains("| `t-b` | **1/3** | model ×2 |"), "{md}");
     assert!(md.contains("### `t-b`, run 3 of 3"), "{md}");
     assert!(md.contains("| Pass rate | 66.7% ± "), "{md}");
+}
+
+/// Copy one of the repository's categories into `root/categories`.
+fn copy_category(root: &std::path::Path, name: &str) {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../evals/categories")
+        .join(name);
+    for entry in walk(&src) {
+        let rel = entry.strip_prefix(&src).unwrap();
+        let dst = root.join("categories").join(name).join(rel);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::copy(&entry, dst).unwrap();
+    }
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// `pmos lint`'s `persona-benchmark` input: a persona passes only when every category naming
+/// it has met its bar two weeks in a row (D10).
+#[test]
+fn a_persona_is_benchmarked_after_two_weeks_at_its_bar() {
+    use pmos_evals::history::benchmarked_personas;
+    // The repository has no report yet: no marketplace bot is benchmarked.
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
+    assert!(benchmarked_personas(&repo).is_empty());
+    assert!(benchmarked_personas(std::path::Path::new("/nonexistent/evals")).is_empty());
+
+    let dir = tempfile::tempdir().unwrap();
+    copy_category(dir.path(), "echo");
+    copy_category(dir.path(), "chief");
+    let reports = dir.path().join("reports");
+    let run = |date: &str, passed: usize| {
+        let mut r = report(date, passed, 10);
+        r.category = "echo".into();
+        r.pass_bar = Some(0.7);
+        write(&reports, &r).unwrap();
+    };
+    // One week at the bar is not enough.
+    run("2026-11-09", 8);
+    assert!(benchmarked_personas(dir.path()).is_empty());
+    // Two weeks in a row: Echo passes; Chief, with no report, does not.
+    run("2026-11-16", 7);
+    let set = benchmarked_personas(dir.path());
+    assert_eq!(
+        set.into_iter().collect::<Vec<_>>(),
+        vec!["echo".to_string()]
+    );
+    // A second category for Echo that hasn't met its bar holds it back.
+    let second = dir.path().join("categories/echo-launch");
+    std::fs::create_dir_all(second.join("tasks")).unwrap();
+    std::fs::copy(
+        dir.path().join("categories/echo/category.yaml"),
+        second.join("category.yaml"),
+    )
+    .unwrap();
+    for t in walk(&dir.path().join("categories/echo/tasks")) {
+        std::fs::copy(&t, second.join("tasks").join(t.file_name().unwrap())).unwrap();
+    }
+    let yaml = std::fs::read_to_string(second.join("category.yaml"))
+        .unwrap()
+        .replace("name: echo\n", "name: echo-launch\n");
+    std::fs::write(second.join("category.yaml"), yaml).unwrap();
+    assert!(benchmarked_personas(dir.path()).is_empty());
+    // A category that doesn't load still counts against the persona it names.
+    std::fs::write(
+        second.join("category.yaml"),
+        "name: echo-launch\nbot: personal\npersona: echo\nunknown: field\n",
+    )
+    .unwrap();
+    assert!(benchmarked_personas(dir.path()).is_empty());
 }

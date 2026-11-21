@@ -17,8 +17,9 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::{Duration, Utc};
-use pmos_contract::model::{Role, TeamFile, TeamMember};
-use pmos_contract::onboarding::{render_personal_bot, render_team_yaml};
+use common::SeedMember;
+use pmos_contract::model::Role;
+use pmos_contract::onboarding::render_personal_bot;
 use pmos_contract::Sensitivity;
 use pmos_toolserver::app::BotAccess;
 use pmos_toolserver::audit::{Client, MemoryAudit, Outcome};
@@ -34,7 +35,7 @@ use pmos_toolserver::oauth::{
 use pmos_toolserver::onboarding::{personal_policies, GitHubSetup, Onboarding};
 use pmos_toolserver::service::ToolError;
 use pmos_toolserver::session::Session;
-use pmos_toolserver::team::Team;
+use pmos_toolserver::users::access::People;
 use pmos_toolserver::vault::{Credential, KeyRing, Provider, Secret, Vault};
 use pmos_toolserver::{router_with, AppConfig, Stores, ToolService};
 use serde_json::{json, Value};
@@ -364,7 +365,13 @@ async fn handle(
     };
     let path = req.path.clone();
     if path == "/user" {
-        return reply(StatusCode::OK, json!({"login": login, "id": 1}));
+        // A numeric id per account, as GitHub's: what decides after the first link.
+        let id = login
+            .to_ascii_lowercase()
+            .bytes()
+            .fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))
+            % 1_000_000_000;
+        return reply(StatusCode::OK, json!({"login": login, "id": id}));
     }
     if path == "/user/emails" {
         return reply(StatusCode::OK, emails(&login));
@@ -632,21 +639,21 @@ const SERVICE_TOKEN: &str = "test-service-token-0123456789abcdef";
 const BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
 const CONTENT_REPO: &str = "example-org/pm-os";
 const MEMORY_REPO: &str = "example-org/pm-os-memory-ana";
-const TEAM_HEADER: &str = "# Who may use PM OS.\n";
 
-fn member(handle: &str, slack: &str, github: Option<&str>, roles: Vec<Role>) -> TeamMember {
-    TeamMember {
+fn member(handle: &str, slack: &str, github: Option<&str>, roles: Vec<Role>) -> SeedMember {
+    SeedMember {
         handle: handle.into(),
         slack_id: slack.into(),
         email: Some(format!("{handle}@example.com")),
         github: github.map(String::from),
+        entra_oid: None,
         roles,
     }
 }
 
 /// Ana and Bo are PMs; Raj (GitHub `Raj-GH`) and Kim are platform owners; Eve isn't in the
 /// GitHub org and Pen's org invitation is still pending.
-fn team() -> Vec<TeamMember> {
+fn team() -> Vec<SeedMember> {
     vec![
         member("ana", "U0ANA", None, vec![Role::Pm]),
         member("bo", "U0BO", None, vec![Role::Pm]),
@@ -681,35 +688,34 @@ async fn env() -> Env {
     let (base, mock) = start_mock().await;
     let (dir, root) = common::content_tree();
     let (mut stores, audit) = Stores::in_memory(&root);
-    let members = Team::of(team());
+    common::seed_users(&stores, team()).await;
+    let people = Arc::new(People::new(stores.users.clone()));
     let vault = Vault::new(
         KeyRing::from_spec(&KeyRing::generate_spec("k1")).unwrap(),
         stores.credentials.clone(),
     );
-    let oauth = Arc::new(
-        OAuth::new(
-            OAuthConfig {
-                public_base_url: "https://pmos.example.com".into(),
-                atlassian: None,
-                atlassian_site: None,
-                slack: None,
-                github: Some(AppCredentials {
-                    client_id: "gh-client".into(),
-                    client_secret: Secret::new("gh-secret"),
-                    scopes: Vec::new(),
-                }),
-                github_org: Some("example-org".into()),
-                state_key: b"test-state-key".to_vec(),
-                endpoints: Endpoints {
-                    github_auth: base.clone(),
-                    github_api: base.clone(),
-                    ..Endpoints::default()
-                },
+    let oauth = Arc::new(OAuth::new(
+        OAuthConfig {
+            public_base_url: "https://pmos.example.com".into(),
+            atlassian: None,
+            atlassian_site: None,
+            slack: None,
+            github: Some(AppCredentials {
+                client_id: "gh-client".into(),
+                client_secret: Secret::new("gh-secret"),
+                scopes: Vec::new(),
+            }),
+            github_org: Some("example-org".into()),
+            state_key: b"test-state-key".to_vec(),
+            endpoints: Endpoints {
+                github_auth: base.clone(),
+                github_api: base.clone(),
+                ..Endpoints::default()
             },
-            vault.clone(),
-        )
-        .with_team(members.clone()),
-    );
+        },
+        vault.clone(),
+        people.clone(),
+    ));
     let github = Arc::new(GitHub::new(base.clone()));
     let tokens: Arc<dyn TokenSource> = oauth.clone();
     stores.memory = Arc::new(GitHubMemory::new(
@@ -728,7 +734,7 @@ async fn env() -> Env {
     let svc = Arc::new(
         ToolService::new(catalog, stores.clone(), connectors)
             .unwrap()
-            .with_team(members),
+            .with_people(people),
     );
     let onboarding = Onboarding::new(
         svc.clone(),
@@ -770,9 +776,8 @@ async fn env() -> Env {
             .unwrap();
     });
 
-    // The content repo: team.yaml for the team above, and Bo's personal bot. Only Raj may
-    // push to it.
-    let team_yaml = render_team_yaml(TEAM_HEADER, &team());
+    // The content repo: Bo's personal bot, and no team file (slice U7). Only Raj may push to
+    // it.
     let bo_bot = render_personal_bot("bo");
     mock.add_repo(
         CONTENT_REPO,
@@ -781,7 +786,6 @@ async fn env() -> Env {
         &["raj-gh"],
         &[
             ("README.md", "# PM OS\n"),
-            ("content/team.yaml", &team_yaml),
             ("content/bots/pm-bo/BOT.md", &bo_bot),
             ("policies/bots/pm-bo.yaml", "# Generated\n"),
             ("policies/bots/pm-bo.sandbox.yaml", "# Generated\n"),
@@ -907,7 +911,7 @@ async fn linking_checks_the_account_then_the_refresh_rotates_the_tokens() {
     assert_eq!(
         e.mock.requests("GET", "/user/emails").len(),
         1,
-        "no github login in team.yaml"
+        "no GitHub login in the user database"
     );
 
     let stored = e.vault.get("ana", Provider::Github).await.unwrap().unwrap();
@@ -999,6 +1003,11 @@ async fn a_mismatched_login_or_email_is_refused() {
     e.mock.clear_log();
     link(&e, "raj", "raj-gh").await;
     assert!(e.mock.requests("GET", "/user/emails").is_empty());
+    // From now on his GitHub numeric id decides: the same account links again; another is
+    // `different_account`.
+    link(&e, "raj", "raj-gh").await;
+    let err = try_link(&e, "raj", "ana").await.unwrap_err();
+    assert_eq!(err, OAuthError::DifferentAccount(Provider::Github));
 
     // Bo's only matching email isn't verified.
     let err = try_link(&e, "bo", "bo").await.unwrap_err();
@@ -1358,8 +1367,7 @@ async fn bets_live_in_the_pms_memory_repo() {
             e.stores.clone(),
             connectors,
         )
-        .unwrap()
-        .with_team(Team::of(team())),
+        .unwrap(),
     );
     let now = Utc::now();
     let s = svc
@@ -1725,7 +1733,6 @@ async fn a_request_then_an_approval_commits_both_files_in_one_commit() {
         e.mock.changed(&commit),
         vec![
             "content/bots/pm-nia-lee/BOT.md",
-            "content/team.yaml",
             "policies/bots/pm-nia-lee.sandbox.yaml",
             "policies/bots/pm-nia-lee.yaml",
         ]
@@ -1734,7 +1741,6 @@ async fn a_request_then_an_approval_commits_both_files_in_one_commit() {
     // The policy files are generated, unchanged, from the content with Nia in it.
     let [policy, spec] = personal_policies(
         &e.root,
-        &files["content/team.yaml"],
         "pm-nia-lee",
         &render_personal_bot("nia-lee"),
         Utc::now().date_naive(),
@@ -1755,14 +1761,16 @@ async fn a_request_then_an_approval_commits_both_files_in_one_commit() {
     )
     .await;
     assert_eq!(status, 200);
-    let yaml = &files["content/team.yaml"];
-    assert!(yaml.starts_with(TEAM_HEADER), "the header is kept");
-    let parsed = TeamFile::from_yaml(yaml).unwrap();
-    assert_eq!(parsed.members.len(), team().len() + 1);
-    let nia = parsed.by_handle("nia-lee").unwrap();
-    assert_eq!(nia.slack_id, "U0NIA");
-    assert_eq!(nia.email.as_deref(), Some("Nia.Lee@example.com"));
-    assert_eq!(nia.roles, vec![Role::Pm]);
+    // No team file is written (slice U7): the user database holds Nia.
+    assert!(
+        !files.keys().any(|p| p.ends_with("team.yaml")),
+        "{:?}",
+        files.keys()
+    );
+    let nia = e.svc.people().user("nia-lee").await.unwrap().unwrap();
+    assert!(nia.active());
+    assert_eq!(nia.atlassian_email.as_deref(), Some("nia.lee@example.com"));
+    assert!(!e.svc.people().is_admin("nia-lee").await.unwrap());
     assert_eq!(
         files["content/bots/pm-nia-lee/BOT.md"],
         render_personal_bot("nia-lee")
@@ -1792,8 +1800,11 @@ async fn a_request_then_an_approval_commits_both_files_in_one_commit() {
     assert_eq!(body["request"]["status"], "approved");
 }
 
+/// Only an admin decides. Since slice U3 the user is created first: an admin who hasn't linked
+/// GitHub still approves, the person can use PM OS at once, and the personal bot is missing
+/// (the request says why) until an admin retries (`docs/user-database-spec.md` §4).
 #[tokio::test]
-async fn only_an_admin_with_github_and_push_access_can_approve() {
+async fn only_an_admin_approves_and_access_doesnt_wait_for_github() {
     let e = env().await;
     let (_, body) = request(&e, "U0NIA", "nia@example.com", "Nia").await;
     let id = body["request"]["id"].as_str().unwrap().to_string();
@@ -1801,6 +1812,7 @@ async fn only_an_admin_with_github_and_push_access_can_approve() {
     // A PM isn't a platform owner.
     let (status, body) = decide(&e, &id, json!({"decision": "approve", "decided_by": "ana"})).await;
     assert_eq!(status, 403, "{body}");
+    assert_eq!(body["code"], "not_admin");
     let denied = e
         .audit
         .events()
@@ -1810,40 +1822,12 @@ async fn only_an_admin_with_github_and_push_access_can_approve() {
     assert_eq!(denied.outcome, Outcome::Denied);
     assert_eq!(denied.user, "ana");
 
-    // Kim is, but hasn't linked GitHub; then can't push to the content repo.
-    let (status, body) = decide(&e, &id, json!({"decision": "approve", "decided_by": "kim"})).await;
-    assert_eq!(
-        (status, body["code"].as_str()),
-        (409, Some("github_not_linked")),
-        "{body}"
-    );
-    link(&e, "kim", "kim").await;
-    let (status, body) = decide(&e, &id, json!({"decision": "approve", "decided_by": "kim"})).await;
-    assert_eq!(
-        (status, body["code"].as_str()),
-        (409, Some("no_push")),
-        "{body}"
-    );
-    let (_, pending) = bot(
-        &e,
-        Method::GET,
-        "/internal/members/requests?status=pending",
-        None,
-    )
-    .await;
-    assert_eq!(pending["requests"][0]["id"], id.as_str(), "still pending");
-    assert!(
-        e.mock.requests("PATCH", "/git/refs/").is_empty(),
-        "nothing committed"
-    );
-
     // A handle that isn't valid, or is taken.
-    link(&e, "raj", "raj-gh").await;
     for handle in ["Nia.L", "ana"] {
         let (status, body) = decide(
             &e,
             &id,
-            json!({"decision": "approve", "decided_by": "raj", "handle": handle}),
+            json!({"decision": "approve", "decided_by": "kim", "handle": handle}),
         )
         .await;
         assert_eq!(
@@ -1852,7 +1836,43 @@ async fn only_an_admin_with_github_and_push_access_can_approve() {
             "{handle}"
         );
     }
+
+    // Kim hasn't linked GitHub: approved all the same, the bot missing.
+    assert!(!e.svc.people().allows("nia").await.unwrap());
+    let (status, body) = decide(&e, &id, json!({"decision": "approve", "decided_by": "kim"})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["request"]["status"], "approved");
+    assert!(body["request"]["commit"].is_null());
+    assert!(
+        body["request"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("hasn't linked GitHub"),
+        "{body}"
+    );
+    assert!(
+        e.mock.requests("PATCH", "/git/refs/").is_empty(),
+        "nothing committed"
+    );
+    // In the database: active, pm only, the sign-in name unconfirmed (it came through the
+    // unsigned Slack client).
+    assert!(e.svc.people().allows("nia").await.unwrap());
+    let nia = e.svc.people().user("nia").await.unwrap().unwrap();
+    assert_eq!(
+        nia.role_set(),
+        [pmos_toolserver::users::UserRole::Pm].into()
+    );
+    assert_eq!(nia.sign_in_name.as_deref(), Some("nia@example.com"));
+    assert!(nia.sign_in_name_confirmed_at.is_none());
+    assert_eq!(nia.created_via, pmos_toolserver::users::Via::Bot);
+    e.svc
+        .create_session("nia", "ask", "run-nia", None, Utc::now())
+        .await
+        .unwrap();
+
     // Kim may reject.
+    let (_, body) = request(&e, "U0OMI", "omi@example.com", "Omi").await;
+    let id = body["request"]["id"].as_str().unwrap().to_string();
     let (status, body) = decide(&e, &id, json!({"decision": "reject", "decided_by": "kim"})).await;
     assert_eq!(status, 200);
     assert_eq!(body["request"]["status"], "rejected");
@@ -1865,10 +1885,12 @@ async fn only_an_admin_with_github_and_push_access_can_approve() {
         .unwrap();
     assert_eq!(rejected.outcome, Outcome::Rejected);
     assert_eq!(rejected.user, "kim");
+    assert!(e.svc.people().user("omi").await.unwrap().is_none());
 }
 
-/// The Slack bot may grant `pm` and `skill-author` only: an `admin` grant from it is
-/// refused (S2), audited, and leaves the request pending. The service token may still.
+/// A join decided through an unsigned client (the Slack bot, or the orchestrator) gets `pm`
+/// only: `admin` is `403 admin_not_from_slack`, any other role `403 role_not_from_slack`,
+/// audited, and the request stays pending with nothing written.
 #[tokio::test]
 async fn an_admin_grant_from_slack_is_refused() {
     let e = env().await;
@@ -1876,7 +1898,13 @@ async fn an_admin_grant_from_slack_is_refused() {
     let (_, body) = request(&e, "U0NIA", "nia@example.com", "Nia").await;
     let id = body["request"]["id"].as_str().unwrap().to_string();
     let head = e.mock.head(CONTENT_REPO);
-    for roles in [json!(["admin"]), json!(["pm", "admin"])] {
+    for (roles, code) in [
+        (json!(["admin"]), "admin_not_from_slack"),
+        (json!(["pm", "admin"]), "admin_not_from_slack"),
+        (json!(["pm", "reviewer"]), "role_not_from_slack"),
+        (json!(["auditor"]), "role_not_from_slack"),
+        (json!(["pm", "skill-author"]), "role_not_from_slack"),
+    ] {
         let (status, body) = decide(
             &e,
             &id,
@@ -1884,7 +1912,7 @@ async fn an_admin_grant_from_slack_is_refused() {
         )
         .await;
         assert_eq!(status, 403, "{body}");
-        assert_eq!(body["code"], "admin_by_pull_request");
+        assert_eq!(body["code"], code, "{roles}");
         let ev = e
             .audit
             .events()
@@ -1893,8 +1921,23 @@ async fn an_admin_grant_from_slack_is_refused() {
             .find(|ev| ev.tool == "members.add")
             .unwrap();
         assert_eq!((ev.outcome, ev.client), (Outcome::Denied, Client::Bot));
+        assert_eq!(ev.detail.as_deref(), Some(code));
     }
+    // The orchestrator's token can't decide a join at all (UM1): refused before the handler.
+    let (status, body) = call(
+        &e,
+        Method::POST,
+        &format!("/internal/members/requests/{id}/decision"),
+        Some(json!({"decision": "approve", "decided_by": "raj", "handle": "nia", "roles": ["pm", "admin"]})),
+        SERVICE_TOKEN,
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("this token may not use this endpoint"))
+    );
     assert_eq!(e.mock.head(CONTENT_REPO), head, "nothing committed");
+    assert!(e.svc.people().user("nia").await.unwrap().is_none());
     let (_, pending) = bot(
         &e,
         Method::GET,
@@ -1904,21 +1947,21 @@ async fn an_admin_grant_from_slack_is_refused() {
     .await;
     assert_eq!(pending["requests"][0]["id"], id.as_str());
 
-    // The orchestrator's token isn't limited.
-    let (status, body) = call(
+    // `pm`: approved, in the database (and in no team file: slice U7).
+    let (status, body) = decide(
         &e,
-        Method::POST,
-        &format!("/internal/members/requests/{id}/decision"),
-        Some(json!({"decision": "approve", "decided_by": "raj", "handle": "nia", "roles": ["pm", "admin"]})),
-        SERVICE_TOKEN,
+        &id,
+        json!({"decision": "approve", "decided_by": "raj", "handle": "nia", "roles": ["pm"]}),
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    let team = TeamFile::from_yaml(&e.mock.files(CONTENT_REPO)["content/team.yaml"]).unwrap();
-    assert_eq!(
-        team.by_handle("nia").unwrap().roles,
-        vec![Role::Pm, Role::Admin]
-    );
+    assert!(!e
+        .mock
+        .files(CONTENT_REPO)
+        .keys()
+        .any(|p| p.ends_with("team.yaml")));
+    assert!(e.svc.people().user("nia").await.unwrap().unwrap().active());
+    assert!(!e.svc.people().is_admin("nia").await.unwrap());
 }
 
 #[tokio::test]
@@ -1933,7 +1976,7 @@ async fn a_ref_conflict_is_retried_and_a_failure_is_recorded() {
     let (status, body) = decide(
         &e,
         &id,
-        json!({"decision": "approve", "decided_by": "raj", "handle": "nia", "roles": ["pm", "skill-author"]}),
+        json!({"decision": "approve", "decided_by": "raj", "handle": "nia"}),
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -1948,19 +1991,18 @@ async fn a_ref_conflict_is_retried_and_a_failure_is_recorded() {
         2,
         "their changes stay"
     );
-    let nia = TeamFile::from_yaml(&files["content/team.yaml"]).unwrap();
-    assert_eq!(
-        nia.by_handle("nia").unwrap().roles,
-        vec![Role::Pm, Role::SkillAuthor]
-    );
+    assert!(files.contains_key("content/bots/pm-nia/BOT.md"));
+    assert!(e.svc.people().user("nia").await.unwrap().unwrap().active());
 
-    // A branch that never stops moving: the request fails, readably.
+    // A branch that never stops moving: the person is in all the same, and the request says
+    // the bot is missing, readably.
     let (_, body) = request(&e, "U0OMI", "omi@example.com", "Omi").await;
     let id = body["request"]["id"].as_str().unwrap().to_string();
     *e.mock.conflicts.lock().unwrap() = 100;
     let (status, body) = decide(&e, &id, json!({"decision": "approve", "decided_by": "raj"})).await;
-    assert_eq!(status, 502, "{body}");
-    assert_eq!(body["request"]["status"], "failed");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["request"]["status"], "approved");
+    assert!(body["request"]["commit"].is_null());
     assert!(
         body["request"]["error"]
             .as_str()
@@ -1968,18 +2010,22 @@ async fn a_ref_conflict_is_retried_and_a_failure_is_recorded() {
             .contains("kept moving"),
         "{body}"
     );
-    let failed = e
+    assert!(e.svc.people().allows("omi").await.unwrap());
+    let approved = e
         .audit
         .events()
         .into_iter()
         .rev()
         .find(|ev| ev.tool == "members.add")
         .unwrap();
-    assert_eq!(failed.outcome, Outcome::Failed);
+    assert_eq!(approved.outcome, Outcome::Approved);
 }
 
+/// "Remove" is a deactivation since slice U3: nothing is committed; the person's sessions end
+/// and their linked accounts are suspended (never unsealed) at once; their memory-repo record
+/// is kept; an Admin or Auditor is never deactivated from Slack.
 #[tokio::test]
-async fn removal_commits_and_unlinks() {
+async fn removal_deactivates_and_suspends() {
     let e = env().await;
     link(&e, "raj", "raj-gh").await;
     // Bo's accounts and memory record.
@@ -2000,6 +2046,11 @@ async fn removal_commits_and_unlinks() {
         })
         .await
         .unwrap();
+    let session = e
+        .svc
+        .create_session("bo", "ask", "run-before", None, Utc::now())
+        .await
+        .unwrap();
 
     let remove = |handle: &str, by: &str| {
         let path = format!("/internal/members/{handle}/remove");
@@ -2011,29 +2062,34 @@ async fn removal_commits_and_unlinks() {
     let (status, body) = remove("raj", "raj").await;
     assert_eq!((status, body["code"].as_str()), (403, Some("self_removal")));
     assert_eq!(remove("zed", "raj").await.0, 404);
-    // Ana owns team bots in the content: removing her would break the lint.
+    // Ana owns team bots: they need another owner first.
     let (status, body) = remove("ana", "raj").await;
     assert_eq!(
         (status, body["code"].as_str()),
         (409, Some("owns_bots")),
         "{body}"
     );
+    // Kim is an admin: never from Slack.
+    let (status, body) = remove("kim", "raj").await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (403, Some("protected_not_from_slack")),
+        "{body}"
+    );
+    assert!(e.svc.people().is_admin("kim").await.unwrap());
 
+    let head = e.mock.head(CONTENT_REPO);
     let (status, body) = remove("bo", "raj").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["handle"], "bo");
-    let commit = body["commit"].as_str().unwrap();
-    assert_eq!(e.mock.head(CONTENT_REPO), commit);
-    assert_eq!(
-        e.mock.changed(commit),
-        vec![
-            "content/bots/pm-bo/BOT.md",
-            "content/team.yaml",
-            "policies/bots/pm-bo.sandbox.yaml",
-            "policies/bots/pm-bo.yaml",
-        ]
-    );
-    // Gone at once.
+    assert_eq!(body["deactivated"], true);
+    assert!(body["commit"].is_null());
+    assert!(body["note"]
+        .as_str()
+        .unwrap()
+        .contains("pmos-admin pause pm-bo"));
+    assert_eq!(e.mock.head(CONTENT_REPO), head, "nothing committed");
+    // Out at once: no new session, the open one is gone, the setup checklist says so.
     let (_, bo) = bot(&e, Method::GET, "/internal/onboarding?user=bo", None).await;
     assert_eq!(bo["member"], false);
     assert!(e
@@ -2041,32 +2097,40 @@ async fn removal_commits_and_unlinks() {
         .create_session("bo", "ask", "run-after", None, Utc::now())
         .await
         .is_err());
-    let files = e.mock.files(CONTENT_REPO);
-    assert!(!files.contains_key("content/bots/pm-bo/BOT.md"));
-    let team = TeamFile::from_yaml(&files["content/team.yaml"]).unwrap();
-    assert!(team.by_handle("bo").is_none());
-    assert_eq!(team.members.len(), 5);
     assert!(e
-        .mock
-        .commit(commit)
-        .message
-        .starts_with("Remove bo from PM OS"));
-
-    assert!(
-        e.vault.list("bo").await.unwrap().is_empty(),
-        "every account unlinked"
+        .svc
+        .session(&session.token, Utc::now())
+        .await
+        .unwrap()
+        .is_none());
+    // Suspended, not deleted: never unsealed for 24 hours.
+    let stored = e.stores.credentials.list("bo").await.unwrap();
+    assert_eq!(stored.len(), 2);
+    assert!(stored.iter().all(|c| c.suspended_at.is_some()));
+    for provider in [Provider::Github, Provider::Atlassian] {
+        assert!(e.vault.get("bo", provider).await.unwrap().is_none());
+    }
+    assert!(e.stores.memory_repos.get("bo").await.unwrap().is_some());
+    // Removing again: already deactivated.
+    let (status, body) = remove("bo", "raj").await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("already_deactivated")),
+        "{body}"
     );
-    assert!(e.stores.memory_repos.get("bo").await.unwrap().is_none());
     let event = e
         .audit
         .events()
         .into_iter()
         .rev()
-        .find(|ev| ev.tool == "members.remove")
+        .find(|ev| ev.tool == "users.deactivate" && ev.outcome == Outcome::Ok)
         .unwrap();
-    assert_eq!(event.outcome, Outcome::Ok);
-    assert_eq!(event.user, "raj");
-    assert_eq!(event.output_ref.as_deref(), Some(commit));
+    assert_eq!((event.user.as_str(), event.client), ("raj", Client::Bot));
+    assert_eq!(event.output_ref.as_deref(), Some("bo"));
+    assert_eq!(event.detail.as_deref(), Some("credentials suspended"));
+    // A request from Bo's Slack id now: turned off, not a new request.
+    let (status, body) = request(&e, "U0BO", "bo@example.com", "Bo").await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("deactivated")));
 }
 
 #[tokio::test]

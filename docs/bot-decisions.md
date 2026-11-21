@@ -19,7 +19,7 @@ the product lessons doc shared on 2026-11-14.
 | Grok Bot | PM OS | Why |
 | --- | --- | --- |
 | Always-on cloud computers | Always-on service on the DGX Spark | On-prem, one box |
-| One cloud computer per bot | One OpenShell sandbox per bot | OpenShell gives each sandbox its own policy and credentials |
+| One cloud computer per bot (unverified: public docs suggest a member's bots may share one computer) | One OpenShell sandbox per bot | OpenShell gives each sandbox its own policy and credentials |
 | Screen-level computer use first | APIs and MCP first, browser second | PM tools have APIs; an open model on one box is less reliable at clicking pixels |
 | "Set it and forget it" | Draft, then a PM approves anything outbound | It speaks for PMs in Slack |
 | Frontier model | Open model, swappable | Constraint |
@@ -40,6 +40,19 @@ the product lessons doc shared on 2026-11-14.
 | D10 | **Finishing the job beats 90%.** A task category launches only when bots finish it end to end. Real tasks are rerun weekly and on every model or harness change, and each failure is tagged to its bottleneck. | Each launched category meets its pass bar two weeks in a row. | **Planned** as 0g evals; reshaped into per-category benchmarks with failure tags. |
 | D11 | **Every workaround has an expiry date.** Scaffolding for model weakness sits behind a flag with a "delete when" test. The model sits behind one OpenAI-compatible endpoint. | Switching models is a config change plus one benchmark. | **Partly:** the harness already calls model roles (`pmos/default`, `pmos/extraction`) through the gateway. Add a workaround registry when the gateway lands (0d). |
 | D12 | **One role per bot; a Chief of Staff only when it emerges.** v1 ships single-role bots, with no coordinator bot that delegates to others. We build one once several PMs (proposed: 3) set it up by hand. A bot may read other bots' outputs in the same scope, nothing more. Count how often PMs chain bots by hand. | Role templates exist. *(Confirmed complete: done for Phase 0, see resolved decision 11.)* | **Built.** Role templates are in `content/roles/`. They also feed D3: each bot's sandbox policy is generated from its role template. **Not a conflict:** `/review`'s parallel reviewer sub-agents stay inside one bot, so they aren't a coordinator. Skill chaining (SKL-6) was already Phase 3. |
+
+> **Note on D10 and D12 (2026-11-21):** The product owner decided on 2026-11-20 to build a bot
+> marketplace with three new bots (a Chief of Staff, a Growth PM and an Outbound PM), chosen in
+> onboarding ([`bot-marketplace-spec.md`](bot-marketplace-spec.md)). That changes **D12**: these
+> bots are built now, not after three PMs set one up by hand. What still holds from D12: no bot
+> directs other bots; each is a role a PM's own bot runs as. It is also an accepted exception to
+> **D10**: until each bot's benchmark passes it is offered only as a **Preview**, labelled "not
+> yet benchmarked" wherever a PM chooses or uses it; it loses the label when its category meets
+> its pass bar. The owner also decided that the Outbound PM's customer-facing drafts carry the
+> line "Draft for internal review. Not approved for external use." until Legal has signed the
+> outbound policy.
+
+> **Note on D1 (2026-11-16):** The product owner decided to build a full web client, so D1's four-screen limit no longer applies to it. The small `pmos-console` keeps its four screens. The D1 requirements about bots and Slack still stand. See [`web-client.md`](web-client.md).
 
 ## Resolved conflicts (decided 2026-11-14)
 
@@ -69,8 +82,8 @@ the product lessons doc shared on 2026-11-14.
    - The content repo keeps its review-by-pull-request rule.
 7. **Slash commands stay as shortcuts (decided 2026-11-14).** `/docs` asks the Docs bot; a command is never a feature of its own (D1).
 8. **Onboarding is done by the bot (decided 2026-11-14).**
-   - Someone not in `team.yaml` taps **Request access** in Slack. A platform owner (`admin`) approves or rejects it on a card.
-   - On approval, PM OS commits the new `team.yaml` entry and the member's personal bot (`pm-<handle>`) to the content repo, with the approver's own GitHub token and an `Approved-by` trailer. Git stays the source of truth.
+   - Someone not in the user database taps **Request access** in Slack. A platform owner (`admin`) approves or rejects it on a card.
+   - On approval, PM OS adds them to the user database, then commits the member's personal bot (`pm-<handle>`) to the content repo, with the approver's own GitHub token and an `Approved-by` trailer. (Until the user database, the commit was a `team.yaml` entry; the file was retired in slice U7, `docs/user-database-spec.md`.)
    - The bot fills in the Slack id and email itself, then walks the new member through `setup`: Jira and Confluence, Slack, GitHub, their memory repo.
    - Platform owners remove members with `remove <handle>`, which also unlinks their accounts.
    - Spec: `docs/onboarding-spec.md`.

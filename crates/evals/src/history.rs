@@ -88,6 +88,50 @@ fn load_where(dir: &Path, keep: impl Fn(&Report) -> bool) -> Result<Vec<(String,
     Ok(reports)
 }
 
+/// The personas (marketplace bots) whose benchmark passes (D10), for `pmos lint`'s
+/// `persona-benchmark` rule: those named by at least one category under `evals_root`
+/// (`persona: <key>` in its `category.yaml`), where **every** category naming it has a pass bar
+/// and has met it two weeks in a row in `<evals_root>/reports`. Fails closed: a category that
+/// doesn't load, has no bar, or whose reports can't be read counts as not met (`pmos-evals
+/// check` reports why), and a missing evals directory gives no persona.
+pub fn benchmarked_personas(evals_root: &Path) -> std::collections::BTreeSet<String> {
+    use std::collections::BTreeMap;
+    let reports = evals_root.join("reports");
+    let mut met: BTreeMap<String, bool> = BTreeMap::new();
+    let Ok(names) = crate::spec::category_names(evals_root) else {
+        return Default::default();
+    };
+    for name in names {
+        let Ok(category) = crate::spec::load_category(evals_root, &name) else {
+            // A category that doesn't load still counts against the persona it names.
+            let named = std::fs::read_to_string(
+                crate::spec::category_dir(evals_root, &name).join("category.yaml"),
+            )
+            .ok()
+            .and_then(|t| serde_norway::from_str::<serde_norway::Value>(&t).ok())
+            .and_then(|v| v.get("persona").and_then(|p| p.as_str()).map(String::from));
+            if let Some(persona) = named {
+                met.insert(persona, false);
+            }
+            continue;
+        };
+        let Some(persona) = category.persona else {
+            continue;
+        };
+        let ok = category.pass_bar.is_some_and(|bar| {
+            load_reports(&reports, &name)
+                .map(|r| evaluate(&name, bar, &r).two_weeks_met)
+                .unwrap_or(false)
+        });
+        let entry = met.entry(persona).or_insert(true);
+        *entry = *entry && ok;
+    }
+    met.into_iter()
+        .filter(|(_, ok)| *ok)
+        .map(|(k, _)| k)
+        .collect()
+}
+
 /// Judge the reports against `pass_bar` (the category's current bar, so raising the bar
 /// applies to earlier runs too).
 pub fn evaluate(category: &str, pass_bar: f64, reports: &[Report]) -> History {

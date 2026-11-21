@@ -92,7 +92,8 @@ migration `0008_slack_reply.sql`).
   to `docs/slack-app-manifest.yaml` and to the default `PMOS_SLACK_SCOPES`.
 - **The rules,** in order:
   1. **Restricted sources reaching outsiders are blocked.** If `sources_sensitivity` is
-     `restricted` and any member isn't in `team.yaml`, or the channel is externally shared,
+     `restricted` and any member isn't a PM OS insider (since slice U3: an active user holding
+     `pm`, `reviewer` or `admin` in the user database), or the channel is externally shared,
      answer `409 {code: "audience_blocked", error, outsiders: <count>}`. Nothing is written
      and the item stays `pending`. An edit doesn't unblock it: the draft was built from
      restricted sources whatever its text now says, so the card offers only Reject, and the
@@ -175,7 +176,7 @@ closed states.
 
   Use `drafts:` checks (tool, count, `channel`, `thread_ts`, `must_include`), and keep "seed:
   replace with case cards".
-- **Its launch bar:** still none, until real case cards exist.
+- **Its launch bar:** a starting bar of 80% over 3 repeats since 2026-11-16, on seed tasks; to be tightened once real case cards exist.
 
 ## 7. Docs
 

@@ -41,6 +41,147 @@ reach PMs until the affected category still meets its bar (D10).
 8. **Check:** run `deploy/pmos-admin smoke <your handle>`, then the benchmarks for any category
    the change touches (`deploy/pmos-admin evals-run --category <c>`).
 
+## The tool server validates first Microsoft sign-ins (review of `b469d5b`)
+
+From this version the tool server checks the ID token of a person's **first** Microsoft
+sign-in itself, instead of taking the web app's word for who it is
+([../entra-sign-in.md](../entra-sign-in.md)). It needs the tenant id and client id:
+
+- **With the deploy kit, nothing to add.** `deploy/compose.yaml` passes the web app's
+  `PMOS_WEB_ENTRA_TENANT_ID`, `PMOS_WEB_ENTRA_CLIENT_ID` and `PMOS_WEB_ENTRA_AUTHORITY` to the
+  tool server as `PMOS_ENTRA_TENANT_ID`, `PMOS_ENTRA_CLIENT_ID` and `PMOS_ENTRA_AUTHORITY`
+  (never the client secret). The tool server now fetches the tenant's keys from
+  `login.microsoftonline.com` itself, through the same outbound proxy as the web app.
+- **Running the services another way:** set those three on the tool server, with the same
+  values as the web app's. Without them a first Microsoft sign-in is refused
+  (`reason=users_unavailable`) and the tool server logs it; people already linked keep signing
+  in.
+- **Check:** `deploy/pmos-admin status` shows the web app's `/readyz`; with Entra on it must
+  include `"entra_link":"ok"`. `down` means the tool server has no Entra settings, or other ids
+  than the web app (its log says which).
+
+The same version also (all automatic, migration `0021`): only the Slack bot's token may decide
+a join request or remove a member (an orchestrator script that did either now gets `403`);
+`resolve` answers at most 600 hits a minute per client; the audit and role-history purges run
+with a fixed search path and their triggers accept only the real function; and a user's old
+sign-in name, Atlassian email or GitHub login can no longer be given to someone else. A
+`PMOS_GITHUB_URL` (or any other connector base override) that is `http://` to anything but
+loopback now stops the tool server at start-up: use `https://`.
+
+## Upgrading to the user database (`team.yaml` retired)
+
+From this version **no service reads `content/team.yaml`**. Who may use PM OS, and their
+roles, come only from the tool server's user database ([users.md](users.md)): sign-in, Slack,
+asking bots, the console, the admin screens and approval decisions. Onboarding no longer
+writes the file, `pmos member add` is gone, and `pmos lint` fails while a `team.yaml` is in the
+content (`team-file-retired`). **Import the people in it before you start the new version.**
+
+1. Back up (step 1 above), get the new code and build it (steps 2 and 3), but don't run `up`
+   yet.
+2. Note the content commit and keep a copy of the file outside the content (the pull request
+   in step 5 deletes it):
+   ```sh
+   sha=$(git -C "$PMOS_CONTENT_CHECKOUT" rev-parse HEAD)
+   git -C "$PMOS_CONTENT_CHECKOUT" show "$sha:content/team.yaml" > ~/team.yaml.$sha
+   ```
+3. Import it with the new image (the one-off container applies the tool server's migrations
+   first). Read the dry run, then apply; admins come in with `--allow-admins`, or run
+   `bootstrap-admin` first ([users.md](users.md), "Importing team.yaml"):
+   ```sh
+   deploy/pmos-admin users import --from ~/team.yaml.$sha --commit "$sha"
+   deploy/pmos-admin users import --from ~/team.yaml.$sha --commit "$sha" --allow-admins --apply
+   deploy/pmos-admin users list
+   ```
+   Then `users set-entra <handle> --oid <object id>` for each Admin and Auditor. On an install
+   that already imported (any release since slice U3), the import is safe to run again: everyone
+   is `unchanged`, and anyone added to the file since then is created.
+4. Start the new version (step 4 above) and check (step 8).
+5. Open a pull request on the content repo that deletes `content/team.yaml` (and its
+   `CODEOWNERS` line, if you have one). Until it merges, CI's `pmos lint` fails on the file;
+   the services only log a warning and ignore it.
+
+**If you start the new version without importing,** nobody gets in, and the tool server says
+so at start-up (`deploy/pmos-admin logs toolserver`): "the user database is empty: nobody can
+use PM OS until `pmos-admin users import` (or bootstrap-admin) runs". The web app answers every sign-in with "not a member",
+Slack offers everyone **Request access**, and the runtime refuses every ask. Nothing is lost:
+run step 3; the services pick the users up within 30 seconds, without a restart.
+
+**Rolling back past this version:** the previous version's Slack service, runtime, web app and
+console may still read `team.yaml`. Write the current database back as one before you roll
+back: `deploy/pmos-admin users export --format team-yaml > team.yaml`, commit it to the content
+repo, then roll back as below.
+
+## Upgrading to user assertions on by default
+
+From this version the runtime and the tool server run in `require` whenever the web app's or
+the console's tokens are set, and refuse to start in `off` or `verify` (`docs/user-assertion.md`,
+Modes). On an existing install:
+
+1. Run `deploy/setup.sh` again (same arguments). It writes `PMOS_ASSERTION_MODE=require` into
+   `deploy/.env` if the line is blank, and `PMOS_ONBOARDING_V2=1` and `PMOS_NUDGES=1`.
+2. If `deploy/.env` says `PMOS_ASSERTION_MODE=off` or `verify`, change it to `require`.
+   `pmos-admin up`, `add-bot` and `restore` now refuse to go on otherwise, and say so.
+3. `deploy/pmos-admin up --models` (with `--console` and `--web` if you run them). The mode now
+   comes from `deploy/.env` on every path, so an `add-bot` or the `up` after a `restore` no
+   longer starts the runtime with assertions off while the web app keeps running.
+
+## Tool-server migrations renumbered (web-app branch databases only)
+
+Which databases: only a tool-server database (`pmos_toolserver`) that was migrated by the
+`claude/web-app` branch **before** it merged `main`'s security fixes (commit 5bb6de4). That
+branch numbered its migrations `0009_audit_source_titles` and `0010_audit_admin_reads`; after
+the merge they are `0010` and `0011`, and `main`'s `0009_note_sensitivity` is new. Such a
+database fails at start-up with sqlx's "migration 9 was previously applied but has been
+modified". Only dev and test stacks of that branch can have it: the Spark runs `main`, and
+`scripts/claude-test-stack.sh` keeps everything in memory. Check with:
+
+```sh
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T postgres \
+  psql -U postgres -d pmos_toolserver -c "SELECT version, description FROM _sqlx_migrations ORDER BY version"
+```
+
+Affected when version 9 reads `audit source titles`.
+
+**Reset (verified path; loses the tool server's data: approvals, sessions, linked accounts,
+audit):** a dev or test stack holds fake data only.
+
+```sh
+deploy/pmos-admin down
+docker compose -f deploy/compose.yaml --env-file deploy/.env up -d postgres
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T postgres psql -U postgres \
+  -v ON_ERROR_STOP=1 -c "DROP DATABASE pmos_toolserver WITH (FORCE)" \
+  -c "CREATE DATABASE pmos_toolserver OWNER pmos_toolserver"
+deploy/pmos-admin up
+```
+
+The tool server makes its tables again at start-up. For a local `cargo run` with its own
+database, drop and recreate that database the same way.
+
+**Repair (keeps the data). Dev and test stacks of that branch only; prefer the reset above.**
+Never edit `_sqlx_migrations` by hand. The repair is one guarded script,
+`scripts/repair-toolserver-migration-numbers.sql`. In one transaction, with the table locked,
+it checks that the database is in exactly the affected state: version 9 is
+`audit source titles` and version 10 `audit admin reads`, both applied, each with the
+checksum of its file, and nothing after 10. Only then does it renumber them to 10 and 11 (the
+SQL of both files is unchanged, so their checksums stay). In any other state (already
+repaired, never affected, a different history) it changes nothing, rolls back and exits
+non-zero with what it found. Take a backup first ([backup-restore.md](backup-restore.md)), then:
+
+```sh
+deploy/pmos-admin down
+docker compose -f deploy/compose.yaml --env-file deploy/.env up -d postgres
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T postgres \
+  psql -U postgres -d pmos_toolserver -v ON_ERROR_STOP=1 \
+  -f - <scripts/repair-toolserver-migration-numbers.sql
+deploy/pmos-admin up
+```
+
+`pmos-admin up` starts the tool server, which applies `0009_note_sensitivity` (it only adds a
+nullable column) and anything newer. Verified on 2026-11-17 against a scratch Postgres 16
+database: the branch's old migrations applied with sqlx, the current tool server refusing them
+("migration 9 was previously applied but has been modified"), the script refusing a tampered
+row and a second run, and after the repair the current migrations applying cleanly.
+
 ## Updating the Slack app
 
 A new scope or event in `docs/slack-app-manifest.yaml` does nothing until the app in Slack has

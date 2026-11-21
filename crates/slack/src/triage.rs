@@ -4,8 +4,8 @@
 //! `PMOS_TRIAGE_MIN_EDIT` (default 0.3) of the text.
 //!
 //! - **Who gets it:** a bot's `owner` from the runtime's `GET /v1/bots`, one DM per owner for
-//!   all their bots. A bot with no owner, or whose owner isn't in `team.yaml`, is logged and
-//!   skipped.
+//!   all their bots. A bot with no owner, or whose owner may not use PM OS (the user
+//!   directory, on a snapshot at most 30 seconds old), is logged and skipped.
 //! - **The rows:** from the tool server's feedback ledger (`GET /internal/ledger`), which holds
 //!   labels and metadata only, never message text, and for the bot's token no approval
 //!   ids (a row names its task by `run_id`). Each shows the tool, who it was for, the
@@ -314,7 +314,16 @@ impl Triage {
             .roster()
             .await
             .map_err(|e| format!("the bot list: {e}"))?;
-        let team = self.bots.team();
+        // Owners must be members on a directory snapshot at most 30 seconds old; past that,
+        // the run fails and is tried again.
+        let members: BTreeMap<String, Option<String>> = self
+            .bots
+            .people()
+            .members()
+            .ok_or_else(|| "the user directory isn't fresh".to_string())?
+            .into_iter()
+            .map(|m| (m.handle, m.slack_id))
+            .collect();
 
         // owner → bot → rows, newest first.
         let mut owners: BTreeMap<String, BTreeMap<String, (BotInfo, Vec<Value>)>> = BTreeMap::new();
@@ -333,7 +342,7 @@ impl Triage {
                 }
                 continue;
             };
-            if team.by_handle(owner).is_none() {
+            if !members.contains_key(owner) {
                 if skipped.insert(name.clone()) {
                     tracing::warn!(bot = %name, owner, "bot's owner isn't a team member; its rows are skipped");
                 }
@@ -355,7 +364,7 @@ impl Triage {
                 tracing::info!(owner, day, "triage digest already sent today");
                 continue;
             }
-            let Some(member) = team.by_handle(&owner) else {
+            let Some(slack_id) = members.get(&owner).cloned().flatten() else {
                 continue;
             };
             let groups: Vec<(BotInfo, Vec<Value>)> = bots.into_values().collect();
@@ -371,7 +380,7 @@ impl Triage {
             save_sent(&self.sent_file, &record);
             if self
                 .bots
-                .post(&member.slack_id, None, None, message)
+                .post(&slack_id, None, None, message)
                 .await
                 .is_some()
             {

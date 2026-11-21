@@ -13,6 +13,11 @@
 //!   there means the branch moved: the commit is rebuilt on the new head and tried again.
 //! - `PUT /repos/{repo}/contents/{path}`: only for the first file in an empty repo, where
 //!   the git data API has nothing to build on.
+//! - Admin proposals (`crate::proposals`), as the acting admin: `POST git/refs` (a new
+//!   branch only; never an update), `POST /repos/{repo}/pulls`,
+//!   `POST /repos/{repo}/issues/{n}/labels`, `GET /repos/{repo}/pulls?state=open`, and for
+//!   the branch-protection check `GET /repos/{repo}/branches/{branch}/protection` and
+//!   `GET /repos/{repo}/rules/branches/{branch}`.
 
 use std::time::Duration;
 
@@ -513,6 +518,352 @@ impl GitHub {
     }
 }
 
+/// A pull request as the proposals list shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pull {
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub branch: String,
+    pub base: String,
+    pub draft: bool,
+    pub author: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub labels: Vec<String>,
+    pub body: String,
+}
+
+/// Open pull requests read for a list, at most (pages of 100).
+pub const MAX_LISTED: usize = 300;
+
+/// What a branch's protection requires of a pull request, as far as the token could read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Protection {
+    /// Approving reviews required before merging; `0` when the rules read require none.
+    pub required_reviews: u64,
+    /// Where it was read: `branch_protection` or `rulesets`.
+    pub source: &'static str,
+    /// Whether the rule binds admins too: classic protection's `enforce_admins.enabled`; for
+    /// a ruleset, no bypass actors at all (an admin exemption is a bypass actor). `None`: the
+    /// answer didn't say (review of `b469d5b`, UM4).
+    pub admins_enforced: Option<bool>,
+    /// Whether anyone may merge without the review: classic protection's
+    /// `bypass_pull_request_allowances` (users, teams, apps), or a ruleset's
+    /// `bypass_actors`. `None`: the answer didn't say.
+    pub bypass_allowed: Option<bool>,
+}
+
+impl Protection {
+    /// Verified: reviews are required and GitHub's answer showed that admins aren't exempt
+    /// and nobody may bypass; or no review is required at all (known, and warned about).
+    /// Anything the answer left out is unknown, never verified.
+    pub fn verified(&self) -> bool {
+        self.required_reviews == 0
+            || (self.admins_enforced == Some(true) && self.bypass_allowed == Some(false))
+    }
+}
+
+/// Classic protection's bypass list, if the answer has one: any user, team or app on it is a
+/// bypass. `None` when the answer has no such object.
+fn classic_bypass(reviews: &Value) -> Option<bool> {
+    let allowances = reviews.get("bypass_pull_request_allowances")?;
+    let mut any = false;
+    for k in ["users", "teams", "apps"] {
+        match allowances.get(k) {
+            Some(Value::Array(a)) => any |= !a.is_empty(),
+            Some(_) => return None,
+            None => {}
+        }
+    }
+    Some(any)
+}
+
+impl GitHub {
+    /// A new branch at `commit` (`POST git/refs`). Fails ([`GitHubError::Invalid`]) if the
+    /// branch exists: it never moves a ref.
+    pub async fn create_branch(
+        &self,
+        token: &Secret,
+        repo: &str,
+        branch: &str,
+        commit: &str,
+    ) -> Result<(), GitHubError> {
+        self.send(
+            self.request(
+                Method::POST,
+                &format!("/repos/{}/git/refs", encode_path(repo)),
+                token,
+            )
+            .json(&json!({"ref": format!("refs/heads/{branch}"), "sha": commit})),
+            &format!("branch {branch} of {repo}"),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Open a pull request from `branch` into `base`, as the token's user: `(number,
+    /// html_url, author login)`.
+    pub async fn open_pull(
+        &self,
+        token: &Secret,
+        repo: &str,
+        title: &str,
+        branch: &str,
+        base: &str,
+        body: &str,
+    ) -> Result<(u64, String, Option<String>), GitHubError> {
+        let v = self
+            .send(
+                self.request(
+                    Method::POST,
+                    &format!("/repos/{}/pulls", encode_path(repo)),
+                    token,
+                )
+                .json(&json!({
+                    "title": title,
+                    "head": branch,
+                    "base": base,
+                    "body": body,
+                    "maintainer_can_modify": false,
+                    "draft": false,
+                })),
+                &format!("a pull request in {repo}"),
+            )
+            .await?;
+        let number = v["number"]
+            .as_u64()
+            .ok_or_else(|| GitHubError::Unavailable("a pull request with no number".into()))?;
+        let url = v["html_url"].as_str().unwrap_or_default().to_string();
+        let author = v["user"]["login"].as_str().map(String::from);
+        Ok((number, url, author))
+    }
+
+    pub async fn add_labels(
+        &self,
+        token: &Secret,
+        repo: &str,
+        number: u64,
+        labels: &[&str],
+    ) -> Result<(), GitHubError> {
+        self.send(
+            self.request(
+                Method::POST,
+                &format!("/repos/{}/issues/{number}/labels", encode_path(repo)),
+                token,
+            )
+            .json(&json!({ "labels": labels })),
+            &format!("the labels of #{number} in {repo}"),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Open pull requests, newest first, at most [`MAX_LISTED`].
+    pub async fn open_pulls(&self, token: &Secret, repo: &str) -> Result<Vec<Pull>, GitHubError> {
+        let mut out = Vec::new();
+        for page in 1..=(MAX_LISTED / 100) {
+            let v = self
+                .send(
+                    self.request(
+                        Method::GET,
+                        &format!("/repos/{}/pulls", encode_path(repo)),
+                        token,
+                    )
+                    .query(&[
+                        ("state", "open"),
+                        ("sort", "created"),
+                        ("direction", "desc"),
+                        ("per_page", "100"),
+                        ("page", &page.to_string()),
+                    ]),
+                    &format!("open pull requests of {repo}"),
+                )
+                .await?;
+            let items = v.as_array().cloned().unwrap_or_default();
+            let n = items.len();
+            out.extend(items.iter().filter_map(pull));
+            if n < 100 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The reviews `branch` requires, read with the token: classic branch protection first
+    /// (it needs the repository's administration read permission), then the branch's ruleset
+    /// rules (metadata read). `None` when neither could be read, which says nothing about
+    /// whether the branch is protected.
+    pub async fn protection(&self, token: &Secret, repo: &str, branch: &str) -> Option<Protection> {
+        let classic = self
+            .send(
+                self.request(
+                    Method::GET,
+                    &format!(
+                        "/repos/{}/branches/{}/protection",
+                        encode_path(repo),
+                        encode_path(branch)
+                    ),
+                    token,
+                ),
+                &format!("the protection of {branch}"),
+            )
+            .await;
+        let rules = self
+            .send(
+                self.request(
+                    Method::GET,
+                    &format!(
+                        "/repos/{}/rules/branches/{}",
+                        encode_path(repo),
+                        encode_path(branch)
+                    ),
+                    token,
+                ),
+                &format!("the rules of {branch}"),
+            )
+            .await;
+        // The pull-request rules that require reviews, and the rulesets they come from.
+        let review_rules: Option<Vec<(u64, Option<u64>)>> = rules.as_ref().ok().map(|v| {
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter(|r| r["type"] == "pull_request")
+                        .filter_map(|r| {
+                            let n = r["parameters"]["required_approving_review_count"].as_u64()?;
+                            (n > 0).then(|| (n, r["ruleset_id"].as_u64()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        let ruleset_reviews = review_rules
+            .as_ref()
+            .map(|r| r.iter().map(|(n, _)| *n).max().unwrap_or(0));
+        match classic {
+            Ok(v) => {
+                let reviews = &v["required_pull_request_reviews"];
+                let n = reviews["required_approving_review_count"]
+                    .as_u64()
+                    .unwrap_or(0);
+                if n > 0 {
+                    // Classic protection binds everyone it names: its own exemptions decide.
+                    return Some(Protection {
+                        required_reviews: n.max(ruleset_reviews.unwrap_or(0)),
+                        source: "branch_protection",
+                        admins_enforced: v["enforce_admins"]["enabled"].as_bool(),
+                        bypass_allowed: classic_bypass(reviews),
+                    });
+                }
+                let rs = ruleset_reviews.unwrap_or(0);
+                if rs > 0 {
+                    let (admins, bypass) = self
+                        .ruleset_bypass(token, repo, review_rules.as_deref().unwrap_or(&[]))
+                        .await;
+                    return Some(Protection {
+                        required_reviews: rs,
+                        source: "rulesets",
+                        admins_enforced: admins,
+                        bypass_allowed: bypass,
+                    });
+                }
+                Some(Protection {
+                    required_reviews: 0,
+                    source: "branch_protection",
+                    admins_enforced: v["enforce_admins"]["enabled"].as_bool(),
+                    bypass_allowed: None,
+                })
+            }
+            // A ruleset that requires reviews is enough to say so; one that doesn't can't
+            // rule out classic protection the token couldn't read.
+            Err(_) => match ruleset_reviews {
+                Some(n) if n > 0 => {
+                    let (admins, bypass) = self
+                        .ruleset_bypass(token, repo, review_rules.as_deref().unwrap_or(&[]))
+                        .await;
+                    Some(Protection {
+                        required_reviews: n,
+                        source: "rulesets",
+                        admins_enforced: admins,
+                        bypass_allowed: bypass,
+                    })
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// Who may bypass the rulesets that require reviews: each ruleset's `bypass_actors`
+    /// (`GET /repos/{repo}/rulesets/{id}`), which GitHub shows only to someone who may edit
+    /// it. An admin exemption is a bypass actor too. `(admins_enforced, bypass_allowed)`:
+    /// `(Some(true), Some(false))` only when every such ruleset was read, is `active` and has
+    /// no bypass actor; `(None, None)` when any answer didn't say (at most five read).
+    async fn ruleset_bypass(
+        &self,
+        token: &Secret,
+        repo: &str,
+        rules: &[(u64, Option<u64>)],
+    ) -> (Option<bool>, Option<bool>) {
+        let mut ids: Vec<u64> = Vec::new();
+        for (_, id) in rules {
+            let Some(id) = id else {
+                return (None, None);
+            };
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        if ids.is_empty() || ids.len() > 5 {
+            return (None, None);
+        }
+        let mut any_bypass = false;
+        for id in ids {
+            let Ok(v) = self
+                .send(
+                    self.request(
+                        Method::GET,
+                        &format!("/repos/{}/rulesets/{id}", encode_path(repo)),
+                        token,
+                    ),
+                    &format!("ruleset {id} of {repo}"),
+                )
+                .await
+            else {
+                return (None, None);
+            };
+            if v["enforcement"] != "active" {
+                return (None, None);
+            }
+            match v.get("bypass_actors") {
+                Some(Value::Array(a)) => any_bypass |= !a.is_empty(),
+                _ => return (None, None),
+            }
+        }
+        // With bypass actors, whether one of them is the admin role isn't read: unknown.
+        ((!any_bypass).then_some(true), Some(any_bypass))
+    }
+}
+
+fn pull(v: &Value) -> Option<Pull> {
+    let s = |v: &Value| v.as_str().map(String::from);
+    Some(Pull {
+        number: v["number"].as_u64()?,
+        url: s(&v["html_url"]).unwrap_or_default(),
+        title: s(&v["title"]).unwrap_or_default(),
+        branch: s(&v["head"]["ref"])?,
+        base: s(&v["base"]["ref"]).unwrap_or_default(),
+        draft: v["draft"].as_bool().unwrap_or(false),
+        author: s(&v["user"]["login"]),
+        created_at: s(&v["created_at"]),
+        updated_at: s(&v["updated_at"]),
+        labels: v["labels"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|l| s(&l["name"])).collect())
+            .unwrap_or_default(),
+        body: s(&v["body"]).unwrap_or_default(),
+    })
+}
+
 /// Base64 content as GitHub sends it (with line breaks), as UTF-8 text.
 fn decode(content: &str, what: &str) -> Result<String, GitHubError> {
     let compact: String = content.chars().filter(|c| !c.is_whitespace()).collect();
@@ -579,7 +930,10 @@ mod tests {
 
     #[test]
     fn paths_are_encoded() {
-        assert_eq!(encode_path("content/team.yaml"), "content/team.yaml");
+        assert_eq!(
+            encode_path("content/bots/pm-ana/BOT.md"),
+            "content/bots/pm-ana/BOT.md"
+        );
         assert_eq!(encode_path("a b?#"), "a%20b%3F%23");
     }
 

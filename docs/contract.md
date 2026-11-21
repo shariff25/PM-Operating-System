@@ -15,7 +15,9 @@ content/
   reviewers/*.md                     reviewer personas
   templates/*.md                     document templates
   playbooks/*.md                     how a kind of PM work is done, and the bar (optional)
-  team.yaml                          who may use PM OS (optional)
+  roles/<role>/ROLE.md               bot roles (optional)
+  bots/<name>/BOT.md                 named bots (optional)
+  personas/<key>/PERSONA.md          the bot marketplace's catalog (optional)
 ```
 
 `README.md` files are documentation and are never linted as content.
@@ -142,26 +144,36 @@ the findings by severity: blocker, major or minor (REV-1, REV-2).
 
 Rules: `reviewer-parse`, `reviewer-flags`, `reviewer-body-empty`.
 
-## Team: `team.yaml`
+## People: not content (`team.yaml` is retired)
 
-Who may use PM OS until SSO replaces this file (Phase 1). It's optional; without it nobody can
-use the Slack bot.
+Who may use PM OS, and their roles, are not in the content. They live in the tool server's
+user database (`docs/user-database-spec.md`, `docs/runbooks/users.md`): the first admin is
+made on the host, and everyone else joins through Slack or an admin's invite in the web app.
+Until slice U7 a `content/team.yaml` listed them; no service reads one any more.
 
-```yaml
-members:
-  - handle: ana            # PM OS handle; matches master/people/<handle>/ if present
-    slack-id: U012AB3CD    # Slack member id (U… or W…)
-    email: ana@example.com # optional; Atlassian account email, needed to link Jira/Confluence
-    roles: [pm, skill-author]   # pm | skill-author | admin (admin = platform owner)
-```
+Rules:
+- `team-file-retired`: a file named `team.yaml` anywhere in the content tree. An **error** for
+  `pmos lint` and CI, pointing to `pmos-admin users import`, which reads an old file once on
+  the host. A service loading its content (the tool server, the bot runtime, the Slack App
+  Home) gets the same finding as a **warning** and ignores the file, so a leftover one, during
+  an upgrade before its pull request deletes it, never stops a service. The lint finds the
+  file; it doesn't read it.
+- `people-handle` (warning): a `master/people/` folder whose name isn't a PM OS handle, so no
+  one's personal context is read from it. Whether that person is a user is the database's to
+  say.
 
-With live connectors the tool server enforces this file: only members get sessions, and a
-linked account must match the member (the Slack member id for Slack, the email for
-Atlassian).
+Roles (what each may do is `pmos_contract::permissions`, the one matrix every service checks):
+- **`pm`**, Product Manager: asks bots; sees and decides their own tasks, approvals, routines
+  and traces; links their own accounts.
+- **`reviewer`**: as `pm`, and sees other PMs' approvals and recommends a decision. The
+  draft's owner confirms; a reviewer never decides someone else's approval.
+- **`auditor`**: searches and exports audit metadata only (no trace bodies, prompts or Slack
+  text). Nothing else.
+- **`admin`**, platform owner: everything, except approving a policy change they authored
+  (POL-2; the caller enforces it).
 
-Rules: `team-parse`, `team-handle`, `team-slack-id`, `team-email`, `team-duplicate` (a
-handle or Slack id listed twice), `team-roles` (no roles), `people-unknown` (warning: a `master/people/` folder
-for someone not on the team).
+Several roles take the union. (`skill-author` was a fifth role in the old file; the import
+drops it and keeps `pm`.)
 
 ## Roles and bots: `roles/<role>/ROLE.md`, `bots/<name>/BOT.md`
 
@@ -202,8 +214,107 @@ The bot's job description.
 
 Rules:
 - **Roles:** `role-parse`, `role-name`, `role-version`, `role-description`, `role-body-empty`, `role-skills`, `role-skill-unknown`, `role-skill-data-class`.
-- **Bots:** `bot-parse`, `bot-name`, `bot-description`, `bot-body-empty`, `bot-role-unknown`, `bot-owner-unknown` (an error once `team.yaml` lists people), `bot-reads-personal`, and `bot-reads-empty` (warning).
+- **Bots:** `bot-parse`, `bot-name`, `bot-description`, `bot-body-empty`, `bot-role-unknown`, `bot-owner-handle` (the owner isn't a PM OS handle; whether they are an active user is the user database's to say: the admin overview lists bots without an active owner), `bot-reads-personal`, and `bot-reads-empty` (warning).
 - **Actions:** `action-auto`, `action-not-write`, `action-unknown-tool`.
+
+## Personas: `personas/<key>/PERSONA.md`
+
+The bot marketplace's catalog (`docs/bot-marketplace-spec.md` §2). In the product Chief,
+Sprout and Echo are "bots"; in code they are **personas**: a role a PM's own personal bot
+(`pm-<handle>`) runs as, chosen per ask. A persona has no sandbox of its own. The folder is
+optional; a catalog with any persona needs Nudge.
+
+```yaml
+# personas/chief/PERSONA.md
+---
+name: chief                   # equals the folder; lowercase, digits, single hyphens, at most 32
+display-name: Chief           # 1-24 ASCII letters, digits and single spaces; the Slack prefix
+title: Chief of Staff         # 1-40 characters
+role: chief-of-staff          # a role in roles/, at most as wide as pm-assistant (below)
+mascot: chief                 # nudge | chief | sprout | echo
+owner: "TODO"
+version: "0.1.0"
+offered: true                 # default false: whether PMs see and may use it
+preview: true                 # default false: offered before its benchmark passes ("not yet benchmarked")
+# benchmarked: true           # default false: the claim that its eval categories pass (lint-checked)
+always-on: false              # default false; exactly one persona, `nudge`, sets true
+order: 20                     # 0-1000, display order
+summary: Runs your week: what needs you, what is slipping, and what to tell your leadership.
+examples:                     # 1 to 6, each 1-80 characters
+  - Prep me for the staff meeting
+  - What slipped since Monday?
+can-do: daily-brief meeting-prep week-review   # optional; skills of the role; default all
+needs:                        # optional
+  - source: analytics         # analytics | crm
+    label: an analytics source                 # 1-40 characters
+    without: I work from numbers you paste in or that a Confluence page holds, and I say so.
+---
+Notes for maintainers (optional): never shown to PMs, never sent to a model.
+```
+
+`title`, `summary`, `examples`, `needs[].label` and `needs[].without` are one line each, not
+blank, with no `<`, `>` or control characters. The persona's instructions are its role's body.
+What it reads and may draft is derived from its role's tools, never written here
+(`crates/contract/src/personas.rs`): "reads" is the systems of its read tools other than
+`context`, `memory`, `stats` and `bets`; "drafts" is the label of each write tool whose setting
+(the stricter of its role's and `pm-assistant`'s) is `approve`. A need is met when the role has
+a `read` tool whose `system` is the need's source.
+
+**The ceiling.** The personal role is `pm-assistant` (`PERSONAL_ROLE` in
+`crates/contract/src/onboarding.rs`). A persona can never do more than a PM's own bot:
+
+| Rule | Code | Severity |
+| --- | --- | --- |
+| Every tool of the persona's role is a tool of `pm-assistant` (each extra one is named) | `persona-exceeds-base` | error |
+| The role's data class is at most `pm-assistant`'s | `persona-data-class` | error |
+| No write that `pm-assistant` sets to `never` is anything but `never` in the role | `persona-action` | error |
+| Every write the role can make (through any of its skills) is listed in its `actions`: there is no fallback to `approve`, and the tool server refuses an unlisted one | `persona-action-unlisted` | error |
+| The role carries the sections "Untrusted data", "Hard limits", "Source markers in drafts", "Look before you ask" and "Point of view" exactly as `pm-assistant` has them, once each; `pm-assistant` must have all five (`STANDING_SECTIONS`) | `persona-role-sections` | error |
+| The role is not a team bot's role | `persona-role-team` | error |
+| Every skill of the role lists `web` or `slack` in `surfaces` | `persona-skill-surface` | warning |
+
+A persona's skills need not be `pm-assistant`'s (that is how a specialist gets a skill Nudge
+doesn't have); their tools must be.
+
+**Offering before a benchmark (D10 and the owner's Preview exception, 2026-11-21).**
+`preview: true` (default `false`) offers a persona as a Preview, shown as "Preview: not yet
+benchmarked". `pmos lint` refuses an offered persona that is neither always-on nor a Preview
+unless every eval category naming it (`persona: <key>` in `evals/categories/*/category.yaml`) has
+met its pass bar two weeks in a row in `evals/reports` (`persona-benchmark`, an error; `--evals`
+names the evals directory, default `evals` beside the content root; a Preview whose category
+passes gets a warning to drop the label). The services, the policy generator and the content
+admin don't read the reports and don't check this rule; CI's `pmos lint` does.
+
+**Fail safe without the lint (gate-fix-4, M2).** Since the services can't read the eval reports,
+they show **every persona but the always-on one as a Preview unless its file says
+`benchmarked: true`** (and not `preview: true`): `Persona::preview` is worked out so
+(`personas::is_preview`), and the tool server's catalog, its admin view, the runtime's
+`GET /v1/personas` and pmos-web all carry it. Content merged without CI (no branch protection,
+a hand edit) that leaves both labels out is therefore still shown as "Preview: not yet
+benchmarked". `benchmarked: true` is the one claim a full bot needs, and `pmos lint` makes it
+true: with the reports read, the claim without a passing report is an error, an offered persona
+with neither label is an error, and a persona whose categories pass without the claim gets a
+warning (it stays a Preview until the file says so). Both labels at once is an error everywhere.
+
+**A draft notice.** `draft-notice: "<one line>"` (optional, at most 160 characters, the text
+rule) is put by the tool server at the top of the body of every Confluence page the persona
+drafts, when it is recorded and again when it is written (`NOTICE_TOOLS`); the role's body must
+state it (`persona-draft-notice`). Echo's is "Draft for internal review. Not approved for external
+use." (`INTERNAL_REVIEW_NOTICE`), pinned by a test.
+
+**Reserved names.** A key or display name that reads as one of `RESERVED_NAMES` (PM OS, its four
+roles, words such as Admin, Owner or System, the systems it talks to, Slack's special words),
+ignoring case and anything but letters and digits, is refused (`persona-reserved`). People's
+names are in the user database: the admin view lists a persona named like a user
+(`name_clashes`).
+
+Other rules: `persona-parse` (front matter missing, unknown field or wrong type),
+`persona-missing-file`, `persona-name` (folder, format, or a key or display name that is another
+persona's in any case), `persona-text`, `persona-mascot`, `persona-version`, `persona-order`
+(out of range; a duplicate is a warning), `persona-role-unknown`, `persona-base-missing` (no
+`pm-assistant` role to check against), `persona-can-do`, `persona-need`, `persona-write-label` (a
+write tool of the role with no "drafts" label in `WRITE_LABELS`), `persona-always-on` (exactly
+one, named `nudge`, of role `pm-assistant`, offered) and `persona-count` (at most 16).
 
 ## Templates: `templates/*.md`
 
@@ -246,7 +357,7 @@ The harness mounts these read-only in a bot's sandbox, each only if the director
 
 | Path in the sandbox | From | Which files |
 | --- | --- | --- |
-| `/content/skills/` | `content/skills/` | Only the skills of the bot's role |
+| `/content/skills/` | `content/skills/` | Only the skills of the bot's role; a personal bot of `pm-assistant` also gets every persona's skills |
 | `/content/templates/` | `content/templates/` | All |
 | `/content/reviewers/` | `content/reviewers/` | All |
 | `/content/playbooks/` | `content/playbooks/` | All |

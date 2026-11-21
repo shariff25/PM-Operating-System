@@ -67,6 +67,46 @@ fn a_category_may_set_a_level() {
 }
 
 #[test]
+fn a_category_may_name_a_persona_on_the_personal_bot_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let task = || {
+        vec![(
+            "a-task",
+            "id: a-task\nask: \"One?\"\nexpect:\n  approvals: 0\n".to_string(),
+        )]
+    };
+    write_category(dir.path(), "cat", "personal", 0.8, &task());
+    let path = dir.path().join("categories/cat/category.yaml");
+    let base = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(load_category(dir.path(), "cat").unwrap().persona, None);
+    std::fs::write(&path, format!("{base}persona: chief\n")).unwrap();
+    assert_eq!(
+        load_category(dir.path(), "cat").unwrap().persona.as_deref(),
+        Some("chief")
+    );
+    // `nudge` is the personal bot's own generalist: no persona is sent.
+    std::fs::write(&path, format!("{base}persona: nudge\n")).unwrap();
+    assert_eq!(load_category(dir.path(), "cat").unwrap().persona, None);
+    std::fs::write(&path, format!("{base}persona: Chief!\n")).unwrap();
+    let errors = load_category(dir.path(), "cat").unwrap_err().0;
+    assert!(
+        errors.iter().any(|e| e.contains("is not a persona key")),
+        "{errors:#?}"
+    );
+    write_category(dir.path(), "team", "docs", 0.8, &task());
+    let path = dir.path().join("categories/team/category.yaml");
+    let base = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{base}persona: chief\n")).unwrap();
+    let errors = load_category(dir.path(), "team").unwrap_err().0;
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("`persona` needs `bot: personal`")),
+        "{errors:#?}"
+    );
+}
+
+#[test]
 fn every_problem_is_reported_with_its_file() {
     let dir = tempfile::tempdir().unwrap();
     write_category(dir.path(), "cat", "Docs Bot", 1.5, &[
@@ -206,8 +246,9 @@ fn docs_qa_is_a_template_on_the_fake_docs() {
     assert_eq!(c.bot, "docs");
     assert_eq!(c.repeats, 3);
     assert_eq!(
-        c.pass_bar, None,
-        "reports only until a team's own tasks are in"
+        c.pass_bar,
+        Some(0.8),
+        "a starting bar since 2026-11-16, to be tightened once a team's own tasks are in"
     );
     assert!(root.join("categories/docs-qa/README.md").is_file());
     let (declines, answerable): (Vec<_>, Vec<_>) =
@@ -318,7 +359,7 @@ fn the_seed_categories_are_ready_to_report() {
     for name in ["jira-draft", "confluence-draft", "slack-reply"] {
         let c = load_category(&root, name).unwrap();
         assert_eq!(c.bot, "personal", "{name}");
-        assert_eq!(c.pass_bar, None, "{name}");
+        assert_eq!(c.pass_bar, Some(0.8), "{name}: the starting bar");
         assert!(c.tasks.len() >= 3, "{name}: {} tasks", c.tasks.len());
         let header =
             std::fs::read_to_string(root.join("categories").join(name).join("category.yaml"))
@@ -486,11 +527,15 @@ fn affected_categories_follow_bot_role_and_skills() {
     assert_eq!(affected(&["content/bots/docs/BOT.md"]), ["docs-qa"]);
     // Personal bots: pm-<requested_by>, made from pm-assistant and its skills.
     let personal = [
+        "chief",
         "confluence-draft",
+        "daily-brief",
+        "echo",
         "jira-draft",
         "pm-craft",
         "principal-craft",
         "slack-reply",
+        "sprout",
         "staff-craft",
     ];
     assert_eq!(affected(&["content/roles/pm-assistant/ROLE.md"]), personal);

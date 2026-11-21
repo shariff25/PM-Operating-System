@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use pmos_bots::catalog::{Catalog, Reloader, RELOAD_EVERY};
 use pmos_bots::clients::{Gateway, ToolServer};
 use pmos_bots::config::Config;
+use pmos_bots::people::SnapshotClient;
 use pmos_bots::pg::PgStore;
 use pmos_bots::store::{BotsStore, MemoryStore};
-use pmos_bots::{router, Runtime};
+use pmos_bots::{router_with, Runtime};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -41,10 +42,19 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Who may ask: the tool server's user directory, read with the orchestrator token and
+    // polled every 10 seconds by `spawn_loops` (docs/user-database-spec.md §2). Never
+    // team.yaml. Until the first answer nobody may ask (503).
+    let people = Arc::new(SnapshotClient::http(
+        &config.toolserver_url,
+        &config.service_token.0,
+    ));
+
     let stop = CancellationToken::new();
     let rt = Arc::new(Runtime::new(
         store,
         Arc::new(catalog),
+        people,
         ToolServer::new(&config.toolserver_url, &config.service_token.0),
         Gateway::new(&config.gateway_url, &config.gateway_token.0),
         stop.clone(),
@@ -54,7 +64,20 @@ async fn main() -> Result<()> {
     let mut loops = rt.spawn_loops();
     loops.push(reloader.spawn(rt.clone(), RELOAD_EVERY));
 
-    let app = router(rt, config.clients.clone(), config.evals_as.clone());
+    tracing::info!(
+        mode = config.assertions.mode().as_str(),
+        keys = ?config.assertions.key_ids(),
+        "user assertions from web and console"
+    );
+    if let Some(warning) = config.assertions.insecure_warning() {
+        tracing::error!("{warning}");
+    }
+    let app = router_with(
+        rt,
+        config.clients.clone(),
+        config.evals_as.clone(),
+        config.assertions.clone(),
+    );
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;

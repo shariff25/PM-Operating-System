@@ -2,6 +2,9 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::assertion::Assertions;
 
 use crate::github::{valid_login, valid_repo};
 use crate::oauth::{AppCredentials, Endpoints};
@@ -63,7 +66,24 @@ pub struct GitHubConfig {
     /// `PMOS_POLICIES_DIR`: where the sandbox policies sit in that repo, from its root.
     /// Default `policies`. A new member's two policy files are committed under it.
     pub policies_dir: String,
+    /// Admin policy and content proposals (`docs/policy-admin.md`): on by default with
+    /// `PMOS_CONTENT_REPO`; `PMOS_PROPOSALS=off` turns them off. `None` when off.
+    pub proposals: Option<ProposalsConfig>,
 }
+
+/// Admin proposals: the tool server opens each as a pull request with the acting admin's own
+/// linked GitHub account, after checking it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalsConfig {
+    /// `PMOS_PROPOSALS_PER_HOUR`, default 10, 1 to 100: per admin, in memory.
+    pub per_hour: u32,
+    /// `PMOS_POLICIES_ROOT`: the checked-in policy files in the local checkout. Default: the
+    /// policies directory of the checkout `PMOS_CONTENT_ROOT` is in, when it exists.
+    pub policies_root: Option<std::path::PathBuf>,
+}
+
+/// The proposals one admin may open per hour, by default.
+pub const DEFAULT_PROPOSALS_PER_HOUR: u32 = 10;
 
 /// A folder in the content repo, from its root: `.` or empty for the root itself.
 fn repo_dir(var: &str, value: &str) -> Result<String, String> {
@@ -114,10 +134,16 @@ pub struct Config {
     /// `PMOS_BOT_TOKEN`: the Slack bot's own token, at least 32 characters and different from
     /// the service token. Optional; without it the bot can't connect.
     pub bot_token: Option<Secret>,
+    /// `PMOS_WEB_TOKEN`: `pmos-web`'s own token, for the approvals routes only. Optional; at
+    /// least 32 characters and different from every other token.
+    pub web_token: Option<Secret>,
     /// `PMOS_CONSOLE_TS_TOKEN`: the web console's own token, at least 32 characters and
-    /// different from the other two. Optional. It may only read approvals
+    /// different from every other token. Optional. It may only read approvals
     /// (`GET /internal/approvals` and `GET /internal/approvals/{id}`).
     pub console_token: Option<Secret>,
+    /// `PMOS_ASSERTION_MODE` and `PMOS_ASSERTION_KEYS`: user assertions from `pmos-web` and
+    /// the console on the approvals routes (`crate::assertion`). Off unless set.
+    pub assertions: Arc<Assertions>,
     /// `PMOS_BOT_SKILLS`: space- or comma-separated skills the bot may start sessions for.
     /// Default `docs`.
     pub bot_skills: Vec<String>,
@@ -148,6 +174,67 @@ pub struct Config {
     /// `PMOS_SLACK_DRAFT_TTL_HOURS`: an undecided Slack draft expires after this many hours,
     /// and a decided one loses its text this long after its decision. 1 to 24; default 24.
     pub slack_draft_ttl_hours: i64,
+    /// `PMOS_AUDIT_RETENTION_DAYS`: audit events older than this many days are deleted once
+    /// a day (`docs/audit-retention.md`). From 90 (the floor, and the default) to 3650.
+    pub audit_retention_days: u32,
+    /// `PMOS_USERS_SEED`: a seed file (a `members:` list, the import's shape; never in the content
+    /// tree) loaded into the in-memory user store at
+    /// start-up (`users::import`). Development and eval stacks only: refused with
+    /// `PMOS_DATABASE_URL` or live connectors. It must name an active admin.
+    pub users_seed: Option<PathBuf>,
+    /// `PMOS_USERS_DEACTIVATIONS_PER_HOUR`: how many deactivations the web and Slack clients
+    /// together may make in any rolling hour (1 to 10, default 3); past it, host only.
+    pub users_deactivations_per_hour: u32,
+    /// The vault's keys for password sign-in's authenticator secrets
+    /// (`docs/password-sign-in.md`): `PMOS_VAULT_KEY`, required with live connectors and
+    /// optional with fake ones. Without it, password sign-in is off (`501 not_configured`).
+    pub password_keys: Option<KeyRing>,
+    /// Development only (`PMOS_DEV_PASSWORD_SETUP_FOR=<handle>` and
+    /// `PMOS_DEV_PASSWORD_SETUP_FILE=<path>`): at start-up, issue a password setup code for
+    /// that seeded user, as the host would, and write it to that new file (mode 0600). Refused
+    /// with a database, live connectors, no seed or no vault key.
+    pub dev_password_setup: Option<(String, PathBuf)>,
+    /// The tenant and application whose ID tokens a first Entra link must carry
+    /// (`docs/entra-sign-in.md`): `PMOS_ENTRA_TENANT_ID` and `PMOS_ENTRA_CLIENT_ID` (the same
+    /// values as `pmos-web`'s `PMOS_WEB_ENTRA_*`; the deploy kit passes them through), and
+    /// `PMOS_ENTRA_AUTHORITY` (default Microsoft's public cloud; loopback for tests). `None`
+    /// without a client id: the first-link route answers `501 not_configured`. The tenant id
+    /// alone is what the host commands (`users set-entra`) read.
+    pub entra: Option<pmos_entra::Tenant>,
+}
+
+/// The tool server's Entra settings: the first-link route validates ID tokens for this tenant
+/// and client id itself. A client id or authority without a tenant id is an error; a tenant
+/// id alone (the host commands' setting) leaves the route off.
+pub fn entra_settings(
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<pmos_entra::Tenant>, String> {
+    let set = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+    let tenant = set("PMOS_ENTRA_TENANT_ID");
+    let client = set("PMOS_ENTRA_CLIENT_ID");
+    let authority = set("PMOS_ENTRA_AUTHORITY");
+    match (tenant, client) {
+        (Some(t), Some(c)) => pmos_entra::Tenant::from_settings(
+            [
+                "PMOS_ENTRA_TENANT_ID",
+                "PMOS_ENTRA_CLIENT_ID",
+                "PMOS_ENTRA_AUTHORITY",
+            ],
+            &t,
+            &c,
+            authority.as_deref(),
+        )
+        .map(Some),
+        (None, Some(_)) => Err(
+            "PMOS_ENTRA_CLIENT_ID needs PMOS_ENTRA_TENANT_ID (the same values as pmos-web's \
+             PMOS_WEB_ENTRA_TENANT_ID and PMOS_WEB_ENTRA_CLIENT_ID)"
+                .into(),
+        ),
+        (_, None) if authority.is_some() => {
+            Err("PMOS_ENTRA_AUTHORITY needs PMOS_ENTRA_TENANT_ID and PMOS_ENTRA_CLIENT_ID".into())
+        }
+        (_, None) => Ok(None),
+    }
 }
 
 impl Config {
@@ -169,18 +256,39 @@ impl Config {
                 return Err("PMOS_BOT_TOKEN must differ from PMOS_SERVICE_TOKEN".into());
             }
         }
-        let console_token = get("PMOS_CONSOLE_TS_TOKEN").filter(|t| !t.is_empty());
-        if let Some(t) = &console_token {
+        let mut seen: Vec<String> = std::iter::once(service_token.clone())
+            .chain(bot_token.clone())
+            .collect();
+        let mut person_token = |k: &str| -> Result<Option<String>, String> {
+            let Some(t) = get(k).filter(|t| !t.is_empty()) else {
+                return Ok(None);
+            };
             if t.len() < 32 {
-                return Err("PMOS_CONSOLE_TS_TOKEN must be at least 32 characters".into());
+                return Err(format!("{k} must be at least 32 characters"));
             }
-            if t == &service_token || bot_token.as_ref() == Some(t) {
-                return Err(
-                    "PMOS_CONSOLE_TS_TOKEN must differ from PMOS_SERVICE_TOKEN and PMOS_BOT_TOKEN"
-                        .into(),
-                );
+            if seen.contains(&t) {
+                return Err(format!(
+                    "{k} must differ from PMOS_SERVICE_TOKEN, PMOS_BOT_TOKEN and the other \
+                     client tokens"
+                ));
             }
-        }
+            seen.push(t.clone());
+            Ok(Some(t))
+        };
+        let web_token = person_token("PMOS_WEB_TOKEN")?;
+        let console_token = person_token("PMOS_CONSOLE_TS_TOKEN")?;
+        // A client that acts for a person makes `require` the default, and `off` or `verify`
+        // refuses to start without the development override (W2).
+        let person_clients: Vec<(&str, &str)> = [
+            web_token.as_ref().map(|_| ("web", "PMOS_WEB_TOKEN")),
+            console_token
+                .as_ref()
+                .map(|_| ("console", "PMOS_CONSOLE_TS_TOKEN")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let assertions = Arc::new(Assertions::from_lookup(&get, &person_clients)?);
         let bot_skills: Vec<String> = get("PMOS_BOT_SKILLS")
             .unwrap_or_else(|| "docs".into())
             .split([' ', ','])
@@ -212,6 +320,54 @@ impl Config {
             }
             None => return Err("PMOS_CONNECTORS is required (`live` or `fake`)".into()),
         };
+        // The dev seed for the in-memory user store (docs/user-database-spec.md §3): never
+        // with a database (users come from the host commands there) or live connectors.
+        let users_seed = get("PMOS_USERS_SEED")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let content_root: PathBuf = get("PMOS_CONTENT_ROOT")
+            .unwrap_or_else(|| "content".into())
+            .into();
+        if let Some(seed) = &users_seed {
+            // Slice U7: nothing about users is read from the content tree, the seed included,
+            // so a file there (a leftover team.yaml) can't become one by a setting.
+            let canon =
+                |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if canon(seed).starts_with(canon(&content_root)) {
+                return Err(
+                    "PMOS_USERS_SEED must be outside the content tree (PMOS_CONTENT_ROOT): users \
+                     are never read from content"
+                        .into(),
+                );
+            }
+            if database_url.is_some() {
+                return Err(
+                    "PMOS_USERS_SEED is for in-memory development and eval stacks only; with \
+                     PMOS_DATABASE_URL, users come from `pmos-admin users import` and \
+                     `bootstrap-admin` (docs/runbooks/users.md)"
+                        .into(),
+                );
+            }
+            if matches!(connectors, Connectors::Live(_)) {
+                return Err(
+                    "PMOS_USERS_SEED is for development and eval stacks only: it can't be used \
+                     with PMOS_CONNECTORS=live"
+                        .into(),
+                );
+            }
+        }
+        let users_deactivations_per_hour =
+            match get("PMOS_USERS_DEACTIVATIONS_PER_HOUR").filter(|s| !s.trim().is_empty()) {
+                None => crate::users::DEFAULT_DEACTIVATIONS_PER_HOUR,
+                Some(s) => match s.trim().parse::<u32>() {
+                    Ok(n) if (1..=10).contains(&n) => n,
+                    _ => {
+                        return Err(format!(
+                        "PMOS_USERS_DEACTIVATIONS_PER_HOUR must be a number from 1 to 10, not `{s}`"
+                    ))
+                    }
+                },
+            };
         let fake_mode_docs = match (&connectors, get("PMOS_DOCS_URL"), get("PMOS_DOCS_TOKEN")) {
             (Connectors::Fake, Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
                 Some((url, Secret::new(token)))
@@ -263,6 +419,65 @@ impl Config {
                 })?,
             None => max_ttl,
         };
+        let (min_days, max_days) = (
+            crate::audit::MIN_RETENTION_DAYS,
+            crate::audit::MAX_RETENTION_DAYS,
+        );
+        let audit_retention_days = match get("PMOS_AUDIT_RETENTION_DAYS").filter(|s| !s.is_empty()) {
+            Some(s) => match s.trim().parse::<u32>() {
+                Ok(d) if d < min_days => {
+                    return Err(format!(
+                        "PMOS_AUDIT_RETENTION_DAYS={d} is shorter than the {min_days}-day minimum: \
+                         audit events are kept at least {min_days} days (docs/audit-retention.md). \
+                         Set {min_days} or more, or leave it out for {min_days}."
+                    ))
+                }
+                Ok(d) if d <= max_days => d,
+                _ => {
+                    return Err(format!(
+                        "PMOS_AUDIT_RETENTION_DAYS must be a whole number of days from {min_days} to {max_days}, not `{s}`"
+                    ))
+                }
+            },
+            None => min_days,
+        };
+        let password_keys = match &connectors {
+            Connectors::Live(live) => Some(live.vault_keys.clone()),
+            Connectors::Fake => match get("PMOS_VAULT_KEY").filter(|v| !v.trim().is_empty()) {
+                Some(spec) => {
+                    Some(KeyRing::from_spec(&spec).map_err(|e| format!("PMOS_VAULT_KEY: {e}"))?)
+                }
+                None => None,
+            },
+        };
+        let dev_password_setup = match (
+            get("PMOS_DEV_PASSWORD_SETUP_FOR").filter(|v| !v.trim().is_empty()),
+            get("PMOS_DEV_PASSWORD_SETUP_FILE").filter(|v| !v.trim().is_empty()),
+        ) {
+            (None, None) => None,
+            (Some(handle), Some(file)) => {
+                if database_url.is_some()
+                    || matches!(connectors, Connectors::Live(_))
+                    || users_seed.is_none()
+                    || password_keys.is_none()
+                {
+                    return Err(
+                        "PMOS_DEV_PASSWORD_SETUP_FOR is for an in-memory development stack \
+                                only: it needs PMOS_USERS_SEED and PMOS_VAULT_KEY, fake connectors \
+                                and no PMOS_DATABASE_URL (a real install uses `pmos-admin users \
+                                password-setup`)"
+                            .into(),
+                    );
+                }
+                Some((handle.trim().to_string(), PathBuf::from(file)))
+            }
+            _ => {
+                return Err(
+                    "PMOS_DEV_PASSWORD_SETUP_FOR and PMOS_DEV_PASSWORD_SETUP_FILE go together"
+                        .into(),
+                )
+            }
+        };
         let bind = get("PMOS_BIND")
             .unwrap_or_else(|| "127.0.0.1:8710".into())
             .parse()
@@ -274,13 +489,13 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
         Ok(Self {
-            content_root: get("PMOS_CONTENT_ROOT")
-                .unwrap_or_else(|| "content".into())
-                .into(),
+            content_root,
             bind,
             service_token: Secret::new(service_token),
             bot_token: bot_token.map(Secret::new),
+            web_token: web_token.map(Secret::new),
             console_token: console_token.map(Secret::new),
+            assertions,
             bot_skills,
             database_url,
             audit_log,
@@ -291,6 +506,12 @@ impl Config {
             content_sync_secs,
             ledger_expire_days,
             slack_draft_ttl_hours,
+            audit_retention_days,
+            users_seed,
+            users_deactivations_per_hour,
+            password_keys,
+            dev_password_setup,
+            entra: entra_settings(&get)?,
         })
     }
 }
@@ -346,6 +567,43 @@ fn github_config(
         "PMOS_POLICIES_DIR",
         &get("PMOS_POLICIES_DIR").unwrap_or_else(|| "policies".into()),
     )?;
+    let proposals_on = match set("PMOS_PROPOSALS").as_deref() {
+        None => content_repo.is_some(),
+        Some("on") => true,
+        Some("off") => false,
+        Some(other) => {
+            return Err(format!(
+                "PMOS_PROPOSALS must be `on` or `off`, not `{other}`"
+            ))
+        }
+    };
+    let proposals = if proposals_on {
+        if content_repo.is_none() {
+            return Err("PMOS_PROPOSALS=on needs PMOS_CONTENT_REPO".into());
+        }
+        // Never the repository root (A6): a proposal could then write anywhere in it.
+        pmos_policy::admin::changeset::Layout::new(&content_dir, &policies_dir).map_err(|why| {
+            format!(
+                "PMOS_CONTENT_DIR, PMOS_POLICIES_DIR: {why}. Admin proposals need both as \
+                     separate folders; set PMOS_PROPOSALS=off to keep this layout for \
+                     onboarding only"
+            )
+        })?;
+        let per_hour = match set("PMOS_PROPOSALS_PER_HOUR") {
+            None => DEFAULT_PROPOSALS_PER_HOUR,
+            Some(v) => v
+                .parse::<u32>()
+                .ok()
+                .filter(|n| (1..=100).contains(n))
+                .ok_or("PMOS_PROPOSALS_PER_HOUR must be a whole number from 1 to 100")?,
+        };
+        Some(ProposalsConfig {
+            per_hour,
+            policies_root: set("PMOS_POLICIES_ROOT").map(std::path::PathBuf::from),
+        })
+    } else {
+        None
+    };
     Ok(GitHubConfig {
         app: AppCredentials {
             client_id,
@@ -357,6 +615,7 @@ fn github_config(
         content_branch,
         content_dir,
         policies_dir,
+        proposals,
     })
 }
 
@@ -417,15 +676,33 @@ fn live_config(get: &impl Fn(&str) -> Option<String>) -> Result<LiveConfig, Stri
         },
         github,
         endpoints: Endpoints {
-            atlassian_auth: get("PMOS_ATLASSIAN_AUTH_URL").unwrap_or(defaults.atlassian_auth),
-            atlassian_api: get("PMOS_ATLASSIAN_API_URL").unwrap_or(defaults.atlassian_api),
-            slack: get("PMOS_SLACK_URL").unwrap_or(defaults.slack),
-            github_auth: get("PMOS_GITHUB_AUTH_URL").unwrap_or(defaults.github_auth),
-            github_api: get("PMOS_GITHUB_URL").unwrap_or(defaults.github_api),
+            atlassian_auth: endpoint(get, "PMOS_ATLASSIAN_AUTH_URL", defaults.atlassian_auth)?,
+            atlassian_api: endpoint(get, "PMOS_ATLASSIAN_API_URL", defaults.atlassian_api)?,
+            slack: endpoint(get, "PMOS_SLACK_URL", defaults.slack)?,
+            github_auth: endpoint(get, "PMOS_GITHUB_AUTH_URL", defaults.github_auth)?,
+            github_api: endpoint(get, "PMOS_GITHUB_URL", defaults.github_api)?,
         },
         docs_url: need("PMOS_DOCS_URL")?,
         docs_token: Secret::new(need("PMOS_DOCS_TOKEN")?),
     })
+}
+
+/// A connector's API or sign-in base override (`PMOS_GITHUB_URL` and the like; for pointing
+/// at mocks), else `default`. Every one of these carries a PM's token or the app's secret, so
+/// it must be `https`; `http` only to a loopback host (`localhost`, `127.0.0.0/8`, `::1`),
+/// which is what the tests' mocks use (review of `b469d5b`, L10).
+fn endpoint(
+    get: &impl Fn(&str) -> Option<String>,
+    var: &str,
+    default: String,
+) -> Result<String, String> {
+    match get(var).filter(|v| !v.trim().is_empty()) {
+        None => Ok(default),
+        Some(v) if pmos_entra::secure_or_loopback(v.trim()) => Ok(v.trim().to_string()),
+        Some(_) => Err(format!(
+            "{var} must be an https:// URL (http:// only to a loopback host, for tests)"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -467,6 +744,102 @@ mod tests {
     }
 
     #[test]
+    fn person_tokens_and_assertions() {
+        let web = "web-token-0123456789abcdef-01234567";
+        let console = "console-token-0123456789abcdef-0123";
+        let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let keys = format!("web:toolserver:k1:{key},console:toolserver:c1:{key}");
+        let base = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        let with = |extra: &[(&str, &str)]| {
+            let mut pairs = base.to_vec();
+            pairs.extend_from_slice(extra);
+            cfg(&pairs)
+        };
+        let ok = with(&[
+            ("PMOS_WEB_TOKEN", web),
+            ("PMOS_CONSOLE_TS_TOKEN", console),
+            ("PMOS_ASSERTION_MODE", "require"),
+            ("PMOS_ASSERTION_KEYS", &keys),
+        ])
+        .unwrap();
+        assert_eq!(ok.assertions.mode(), crate::assertion::Mode::Require);
+        let printed = format!("{ok:?}");
+        for secret in [web, console, key] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
+        // Off by default; on without keys refuses to start.
+        assert_eq!(
+            with(&[]).unwrap().assertions.mode(),
+            crate::assertion::Mode::Off
+        );
+        let err = with(&[("PMOS_ASSERTION_MODE", "verify")]).unwrap_err();
+        assert!(err.contains("PMOS_ASSERTION_KEYS"), "{err}");
+        // With a person client, `require` is the default (W2) ...
+        for token in [("PMOS_WEB_TOKEN", web), ("PMOS_CONSOLE_TS_TOKEN", console)] {
+            let ok = with(&[token, ("PMOS_ASSERTION_KEYS", &keys)]).unwrap();
+            assert_eq!(ok.assertions.mode(), crate::assertion::Mode::Require);
+            assert!(ok.assertions.insecure_warning().is_none());
+            // ... it needs keys ...
+            let err = with(&[token]).unwrap_err();
+            assert!(err.contains("PMOS_ASSERTION_KEYS"), "{err}");
+            // ... and `off` or `verify` refuses to start, naming the token and the fix.
+            for mode in ["off", "verify"] {
+                let err = with(&[
+                    token,
+                    ("PMOS_ASSERTION_MODE", mode),
+                    ("PMOS_ASSERTION_KEYS", &keys),
+                ])
+                .unwrap_err();
+                assert!(
+                    err.contains(token.0) && err.contains("PMOS_ASSERTION_INSECURE_OFF"),
+                    "{err}"
+                );
+            }
+        }
+        // Only the development override lets it start insecurely, with a warning to log.
+        let dev = with(&[
+            ("PMOS_WEB_TOKEN", web),
+            ("PMOS_ASSERTION_MODE", "off"),
+            ("PMOS_ASSERTION_INSECURE_OFF", "1"),
+        ])
+        .unwrap();
+        assert_eq!(dev.assertions.mode(), crate::assertion::Mode::Off);
+        assert!(dev
+            .assertions
+            .insecure_warning()
+            .unwrap()
+            .contains("INSECURE"));
+        // ... and never with live connectors (R3).
+        let err = with(&[
+            ("PMOS_WEB_TOKEN", web),
+            ("PMOS_ASSERTION_MODE", "off"),
+            ("PMOS_ASSERTION_INSECURE_OFF", "1"),
+            ("PMOS_CONNECTORS", "live"),
+        ])
+        .unwrap_err();
+        assert!(
+            err.contains("PMOS_ASSERTION_INSECURE_OFF") && err.contains("fake-data development"),
+            "{err}"
+        );
+        // Tokens are long and distinct.
+        assert!(with(&[("PMOS_WEB_TOKEN", "short")])
+            .unwrap_err()
+            .contains("32"));
+        assert!(with(&[("PMOS_WEB_TOKEN", TOKEN)])
+            .unwrap_err()
+            .contains("differ"));
+        assert!(
+            with(&[("PMOS_WEB_TOKEN", web), ("PMOS_CONSOLE_TS_TOKEN", web)])
+                .unwrap_err()
+                .contains("differ")
+        );
+    }
+
+    #[test]
     fn the_console_token_is_optional_long_and_its_own() {
         let base = [
             ("PMOS_SERVICE_TOKEN", TOKEN),
@@ -475,9 +848,11 @@ mod tests {
             ("PMOS_CONNECTORS", "fake"),
         ];
         assert!(cfg(&base).unwrap().console_token.is_none());
+        let keys = "console:toolserver:c1:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
         let with = |token: &'static str| {
             let mut vars = base.to_vec();
             vars.push(("PMOS_CONSOLE_TS_TOKEN", token));
+            vars.push(("PMOS_ASSERTION_KEYS", keys));
             cfg(&vars)
         };
         let ok = with("console-token-0123456789abcdef-012").unwrap();
@@ -628,6 +1003,85 @@ mod tests {
         v
     }
 
+    /// L10: a connector base that carries tokens is https; http only to loopback (mocks).
+    #[test]
+    fn connector_bases_are_https_or_loopback() {
+        let key = KeyRing::generate_spec("k1");
+        let base = live_base(&key);
+        for var in [
+            "PMOS_GITHUB_URL",
+            "PMOS_GITHUB_AUTH_URL",
+            "PMOS_ATLASSIAN_AUTH_URL",
+            "PMOS_ATLASSIAN_API_URL",
+            "PMOS_SLACK_URL",
+        ] {
+            for bad in [
+                "http://api.github.example",
+                "http://10.0.0.5:8080",
+                "ftp://x",
+            ] {
+                let err = cfg(&with(&base, &[(var, bad)])).unwrap_err();
+                assert!(
+                    err.contains(var) && err.contains("https"),
+                    "{var} {bad}: {err}"
+                );
+            }
+            for good in [
+                "https://ghe.example.com/api/v3",
+                "http://127.0.0.1:9",
+                "http://localhost:8080",
+                "http://[::1]:9",
+            ] {
+                assert!(cfg(&with(&base, &[(var, good)])).is_ok(), "{var} {good}");
+            }
+        }
+    }
+
+    /// U1: the first link's Entra settings: both ids, or the tenant alone (host commands),
+    /// never a client id or an authority without a tenant.
+    #[test]
+    fn entra_settings_for_the_first_link() {
+        let key = KeyRing::generate_spec("k1");
+        let base = live_base(&key);
+        let tenant = (
+            "PMOS_ENTRA_TENANT_ID",
+            "11111111-2222-3333-4444-555555555555",
+        );
+        let client = (
+            "PMOS_ENTRA_CLIENT_ID",
+            "0b7f0c6e-1111-4222-8333-444455556666",
+        );
+        assert!(cfg(&base).unwrap().entra.is_none());
+        assert!(cfg(&with(&base, &[tenant])).unwrap().entra.is_none());
+        let t = cfg(&with(&base, &[tenant, client])).unwrap().entra.unwrap();
+        assert_eq!(t.tenant_id, tenant.1);
+        assert_eq!(t.client_id, client.1);
+        assert_eq!(t.authority, pmos_entra::DEFAULT_AUTHORITY);
+        for (pairs, want) in [
+            (vec![client], "needs PMOS_ENTRA_TENANT_ID"),
+            (
+                vec![("PMOS_ENTRA_AUTHORITY", "http://127.0.0.1:9")],
+                "needs PMOS_ENTRA_TENANT_ID",
+            ),
+            (
+                vec![("PMOS_ENTRA_TENANT_ID", "common"), client],
+                "multi-tenant",
+            ),
+            (vec![tenant, ("PMOS_ENTRA_CLIENT_ID", "app")], "GUID"),
+            (
+                vec![
+                    tenant,
+                    client,
+                    ("PMOS_ENTRA_AUTHORITY", "http://idp.example.com"),
+                ],
+                "https unless",
+            ),
+        ] {
+            let err = cfg(&with(&base, &pairs)).unwrap_err();
+            assert!(err.contains(want), "{pairs:?}: {err}");
+        }
+    }
+
     #[test]
     fn github_settings_are_checked_at_start_up() {
         let key = KeyRing::generate_spec("k1");
@@ -659,6 +1113,8 @@ mod tests {
             &[
                 ("PMOS_CONTENT_REPO", "Example-Org/pm-os"),
                 ("PMOS_CONTENT_DIR", "./"),
+                // A content repo whose root is the content: onboarding only (A6).
+                ("PMOS_PROPOSALS", "off"),
                 ("PMOS_MEMORY", "github"),
                 ("PMOS_CONTENT_SYNC_SECS", "0"),
                 ("PMOS_GITHUB_URL", "http://127.0.0.1:9"),
@@ -673,6 +1129,7 @@ mod tests {
         let gh = live.github.as_ref().unwrap();
         assert_eq!(gh.content_repo.as_deref(), Some("Example-Org/pm-os"));
         assert_eq!(gh.content_dir, "", "`./` is the repo root");
+        assert!(gh.proposals.is_none());
         assert_eq!(live.endpoints.github_api, "http://127.0.0.1:9");
 
         let refused = |extra: &[(&str, &str)], needle: &str| {
@@ -735,6 +1192,61 @@ mod tests {
     }
 
     #[test]
+    fn proposals_never_make_the_repository_root_writable() {
+        let key = KeyRing::generate_spec("k1");
+        let base = live_base(&key);
+        let app = [
+            ("PMOS_GITHUB_CLIENT_ID", "Iv1.gh"),
+            ("PMOS_GITHUB_CLIENT_SECRET", "gh-secret"),
+            ("PMOS_GITHUB_ORG", "example-org"),
+        ];
+        let gh = |extra: &[(&str, &str)]| {
+            cfg(&with(&with(&base, &app), extra)).map(|c| match c.connectors {
+                Connectors::Live(live) => live.github.unwrap(),
+                _ => panic!("expected live"),
+            })
+        };
+        // On by default with a content repo, off without one.
+        let on = gh(&[("PMOS_CONTENT_REPO", "example-org/pm-os")]).unwrap();
+        let p = on.proposals.unwrap();
+        assert_eq!(p.per_hour, DEFAULT_PROPOSALS_PER_HOUR);
+        assert!(p.policies_root.is_none());
+        assert!(gh(&[]).unwrap().proposals.is_none());
+        assert!(gh(&[("PMOS_PROPOSALS", "on")])
+            .unwrap_err()
+            .contains("needs PMOS_CONTENT_REPO"));
+        // The repository root as the content or policies folder: refused at start-up.
+        for (k, v) in [
+            ("PMOS_CONTENT_DIR", ""),
+            ("PMOS_CONTENT_DIR", "./"),
+            ("PMOS_CONTENT_DIR", "/"),
+            ("PMOS_POLICIES_DIR", ""),
+            ("PMOS_POLICIES_DIR", "content/policies"),
+        ] {
+            let err = gh(&[("PMOS_CONTENT_REPO", "example-org/pm-os"), (k, v)]).unwrap_err();
+            assert!(err.contains("PMOS_PROPOSALS=off"), "{k}={v:?}: {err}");
+        }
+        // ... unless proposals are off.
+        assert!(gh(&[
+            ("PMOS_CONTENT_REPO", "example-org/pm-os"),
+            ("PMOS_CONTENT_DIR", ""),
+            ("PMOS_PROPOSALS", "off"),
+        ])
+        .unwrap()
+        .proposals
+        .is_none());
+        for bad in ["0", "101", "x"] {
+            assert!(gh(&[
+                ("PMOS_CONTENT_REPO", "example-org/pm-os"),
+                ("PMOS_PROPOSALS_PER_HOUR", bad)
+            ])
+            .unwrap_err()
+            .contains("PMOS_PROPOSALS_PER_HOUR"));
+        }
+        assert!(gh(&[("PMOS_PROPOSALS", "maybe")]).is_err());
+    }
+
+    #[test]
     fn ledger_expiry_defaults_to_a_week() {
         let fake = [
             ("PMOS_SERVICE_TOKEN", TOKEN),
@@ -775,5 +1287,112 @@ mod tests {
                 .unwrap_err()
                 .contains("PMOS_SLACK_DRAFT_TTL_HOURS"));
         }
+    }
+
+    #[test]
+    fn audit_retention_is_90_days_or_longer() {
+        let fake = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert_eq!(cfg(&fake).unwrap().audit_retention_days, 90);
+        for (set, want) in [("90", 90), ("365", 365), (" 120 ", 120), ("3650", 3650)] {
+            assert_eq!(
+                cfg(&with(&fake, &[("PMOS_AUDIT_RETENTION_DAYS", set)]))
+                    .unwrap()
+                    .audit_retention_days,
+                want
+            );
+        }
+        // Below the floor: refused at start-up, with what to do.
+        for short in ["0", "30", "89"] {
+            let err = cfg(&with(&fake, &[("PMOS_AUDIT_RETENTION_DAYS", short)])).unwrap_err();
+            assert!(err.contains("shorter than the 90-day minimum"), "{err}");
+        }
+        for bad in ["-1", "ninety", "90.5", "3651"] {
+            let err = cfg(&with(&fake, &[("PMOS_AUDIT_RETENTION_DAYS", bad)])).unwrap_err();
+            assert!(err.contains("from 90 to 3650"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_deactivation_cap_is_one_to_ten() {
+        let fake = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert_eq!(cfg(&fake).unwrap().users_deactivations_per_hour, 3);
+        let five = with(&fake, &[("PMOS_USERS_DEACTIVATIONS_PER_HOUR", "5")]);
+        assert_eq!(cfg(&five).unwrap().users_deactivations_per_hour, 5);
+        for bad in ["0", "11", "many"] {
+            let bad = with(&fake, &[("PMOS_USERS_DEACTIVATIONS_PER_HOUR", bad)]);
+            assert!(cfg(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn the_users_seed_is_for_in_memory_dev_stacks_only() {
+        let fake = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert_eq!(cfg(&fake).unwrap().users_seed, None);
+        let seeded = cfg(&with(&fake, &[("PMOS_USERS_SEED", "/srv/users.seed.yaml")])).unwrap();
+        assert_eq!(
+            seeded.users_seed.as_deref(),
+            Some(std::path::Path::new("/srv/users.seed.yaml"))
+        );
+        // With a database: refused, even in dev mode.
+        let err = cfg(&with(
+            &fake,
+            &[
+                ("PMOS_USERS_SEED", "/srv/users.seed.yaml"),
+                ("PMOS_DATABASE_URL", "postgresql://pmos@localhost/pmos"),
+            ],
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("PMOS_USERS_SEED") && err.contains("PMOS_DATABASE_URL"),
+            "{err}"
+        );
+        let err = cfg(&[
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_CONNECTORS", "fake"),
+            ("PMOS_USERS_SEED", "/srv/users.seed.yaml"),
+            ("PMOS_DATABASE_URL", "postgresql://pmos@localhost/pmos"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("PMOS_USERS_SEED"), "{err}");
+        // With live connectors: refused.
+        let key = KeyRing::generate_spec("k1");
+        let live = live_base(&key);
+        assert!(cfg(&live).is_ok());
+        let err = cfg(&with(&live, &[("PMOS_USERS_SEED", "/srv/users.seed.yaml")])).unwrap_err();
+        assert!(err.contains("PMOS_USERS_SEED"), "{err}");
+        // Never from the content tree (slice U7).
+        for inside in ["/srv/content/team.yaml", "/srv/content/x/users.yaml"] {
+            let err = cfg(&with(
+                &fake,
+                &[
+                    ("PMOS_USERS_SEED", inside),
+                    ("PMOS_CONTENT_ROOT", "/srv/content"),
+                ],
+            ))
+            .unwrap_err();
+            assert!(err.contains("outside the content tree"), "{err}");
+        }
+        let err = cfg(&with(&fake, &[("PMOS_USERS_SEED", "content/team.yaml")])).unwrap_err();
+        assert!(err.contains("outside the content tree"), "{err}");
+        assert!(cfg(&with(
+            &fake,
+            &[
+                ("PMOS_USERS_SEED", "/srv/users.seed.yaml"),
+                ("PMOS_CONTENT_ROOT", "/srv/content"),
+            ],
+        ))
+        .is_ok());
     }
 }

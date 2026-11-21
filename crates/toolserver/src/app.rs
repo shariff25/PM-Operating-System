@@ -18,7 +18,32 @@
 //!     grant `admin` to a new member.
 //!   - `PMOS_CONSOLE_TS_TOKEN`: the web console. `GET /internal/approvals` and
 //!     `GET /internal/approvals/{id}` only, answered as for the orchestrator; anything else
-//!     is `403`.
+//!     is `403`. With `PMOS_ASSERTION_MODE`, a read that names a person must carry the
+//!     console's signed user assertion for them.
+//!   - `PMOS_WEB_TOKEN`: `pmos-web`, which acts for a signed-in person. Only the approvals
+//!     routes (list, read, sources, decision), and with `PMOS_ASSERTION_MODE` the person it
+//!     names must match a signed user assertion (`crate::assertion`,
+//!     `docs/user-assertion.md`). At least the Slack bot's limits apply: it reads one item
+//!     only with `?user=` naming the item's PM and can't change where a draft goes when it
+//!     edits one; it reaches neither the ledger nor onboarding (so no `admin` grants). It
+//!     also reaches the read-only admin and auditor routes (`GET /internal/admin/*`,
+//!     `app/admin.rs`), the admin proposal and action routes (`POST
+//!     /internal/admin/proposals/open`, `POST /internal/admin/actions`), which check the named
+//!     viewer's role themselves and need a signed user assertion in every mode, and its
+//!     sign-in events (`POST /internal/admin/events`); never sessions, grants, calls, account
+//!     linking or credentials.
+//!
+//!   The user database's read API (`app/directory.rs`) has its own allow-list per route: the
+//!   directory for the orchestrator and the Slack bot, `resolve` for `pmos-web` and the
+//!   console, the first Entra link for `pmos-web`. Its Admin API (`app/users.rs`, slice U5a)
+//!   is `pmos-web`'s alone, writes only in assertion `require` and with a signed assertion for
+//!   the acting admin; the console's one extra route, `GET /internal/console/members`, lists
+//!   handles for an admin's Approvals screen.
+//!
+//!   The bot marketplace's routes (`app/team.rs`) have their own allow-list: the catalog
+//!   (`GET /internal/personas`) for `pmos-web`, the orchestrator and the Slack bot; a PM's
+//!   own team (`/internal/team/{handle}`) and the admin's read (`GET /internal/admin/personas`)
+//!   for `pmos-web` only, the team with its signed assertion for that person in every mode.
 //!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
@@ -26,7 +51,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, Request, State};
+use axum::body::Body;
+use axum::extract::{OriginalUri, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -40,6 +66,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::approvals::{DecideError, Decision, Status, Verdict};
+use crate::assertion::{self, Assertions, Mode};
 use crate::audit::{AuditEvent, Client, Outcome};
 use crate::ledger::{LedgerOutcome, LedgerQuery, Reason, MAX_LIMIT};
 use crate::mcp::PmosMcp;
@@ -47,13 +74,21 @@ use crate::members::RequestStatus;
 use crate::oauth::{OAuth, OAuthError};
 use crate::onboarding::{DecisionInput, Onboarding, Refusal};
 use crate::service::{
-    DecisionError, ReindexError, SessionError, ToolError, ToolService, AUDIENCE_BLOCKED,
-    AUDIENCE_UNAVAILABLE, NEEDS_EXTERNAL_CONFIRM, TARGET_CHANGED,
+    DecisionError, ReindexError, Revision, SessionError, ToolError, ToolService, AUDIENCE_BLOCKED,
+    AUDIENCE_UNAVAILABLE, NEEDS_EXTERNAL_CONFIRM, STALE, TARGET_CHANGED,
 };
 use crate::session::BOT_IDENTITY_PREFIX;
 use crate::store::StoreError;
 use crate::vault::Provider;
 use pmos_contract::bots::BotScope;
+use pmos_contract::Sensitivity;
+
+mod admin;
+pub mod directory;
+mod password;
+mod reviews;
+mod team;
+mod users;
 
 /// What the Slack bot's token may do.
 #[derive(Clone)]
@@ -97,11 +132,57 @@ pub struct AppConfig {
     pub oauth: Option<Arc<OAuth>>,
 }
 
+/// `pmos-web`'s token, which reaches only the approvals routes (and the read-only admin
+/// routes), and how user assertions from `pmos-web` and the console (whose token is
+/// [`AppConfig::console_token`]) are checked.
+#[derive(Clone, Default)]
+pub struct PersonClients {
+    /// `PMOS_WEB_TOKEN`: `pmos-web`.
+    pub web_token: Option<String>,
+    /// `PMOS_ASSERTION_MODE` and `PMOS_ASSERTION_KEYS`.
+    pub assertions: Arc<Assertions>,
+    /// The first Entra link's own check of the ID token `pmos-web` forwards
+    /// (`PMOS_ENTRA_TENANT_ID`, `PMOS_ENTRA_CLIENT_ID`). `None`: the route answers
+    /// `501 not_configured`.
+    pub entra: Option<Arc<EntraLinkCheck>>,
+}
+
+impl std::fmt::Debug for PersonClients {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersonClients")
+            .field("web", &self.web_token.is_some())
+            .field("assertions", &self.assertions)
+            .field("entra", &self.entra.is_some())
+            .finish()
+    }
+}
+
+/// What the first-link route checks an ID token with: the tenant's keys (fetched and cached).
+/// The tokens already used for a first link are kept by the user store
+/// (`UserStore::first_token_use`: Postgres in a deployment, so a restart doesn't forget them).
+pub struct EntraLinkCheck {
+    pub verifier: pmos_entra::Verifier,
+}
+
+impl EntraLinkCheck {
+    pub fn new(tenant: pmos_entra::Tenant) -> Result<Self, String> {
+        Ok(Self {
+            verifier: pmos_entra::Verifier::new(tenant)?,
+        })
+    }
+}
+
+/// The verified subject of a call's user assertion, if it carried one. Set on every approvals
+/// route.
+#[derive(Clone, Debug, Default)]
+struct Acting(Option<String>);
+
 #[derive(Clone)]
 struct AppState {
     svc: Arc<ToolService>,
     service_token: Arc<str>,
     bot: Option<Arc<BotAccess>>,
+    people: Arc<PersonClients>,
     console_token: Option<Arc<str>>,
     content_root: Arc<std::path::Path>,
     oauth: Option<Arc<OAuth>>,
@@ -122,12 +203,25 @@ pub fn router_with(
     onboarding: Option<Arc<Onboarding>>,
     cancel: CancellationToken,
 ) -> Router {
+    router_full(svc, config, onboarding, PersonClients::default(), cancel)
+}
+
+/// [`router_with`], plus the tokens of the services that act for a person (`pmos-web`, the
+/// console) and how their user assertions are checked.
+pub fn router_full(
+    svc: Arc<ToolService>,
+    config: AppConfig,
+    onboarding: Option<Arc<Onboarding>>,
+    people: PersonClients,
+    cancel: CancellationToken,
+) -> Router {
     let onboarding = onboarding
         .unwrap_or_else(|| Arc::new(Onboarding::new(svc.clone(), config.oauth.clone(), None)));
     let state = AppState {
         svc: svc.clone(),
         service_token: config.service_token.into(),
         bot: config.bot.map(Arc::new),
+        people: Arc::new(people),
         console_token: config.console_token.map(Into::into),
         content_root: config.content_root.into(),
         oauth: config.oauth.clone(),
@@ -161,16 +255,17 @@ pub fn router_with(
         .route("/reindex", post(reindex))
         .route("/ledger/summary", get(ledger_summary))
         .route("/credentials", get(list_credentials))
+        .route("/runs/{run_id}/sensitivity", get(run_sensitivity))
         .layer(middleware::from_fn(orchestrator_only));
 
     // Any internal client; the bot is limited to its own skills inside each handler. Both
     // may read and decide one approval item: the Slack bot does so from approval cards. Both
-    // run onboarding, and the bot gets link URLs for team members only. Both read the
+    // read onboarding requests; only the Slack bot decides a join or removes a member. The
+    // bot gets link URLs for team members only. Both read the
     // ledger: the Slack bot for the daily triage digest. The Slack bot may also list a team
     // member's pending approvals and unlink a team member's account, for the App Home
     // (`docs/slack-mentions-and-home-spec.md` §3); each handler limits it.
     let internal = Router::new()
-        .route("/approvals", get(list_approvals))
         .route(
             "/credentials/{user}/{provider}",
             axum::routing::delete(revoke_credential),
@@ -178,8 +273,6 @@ pub fn router_with(
         .route("/sessions", post(create_session))
         .route("/session", axum::routing::delete(revoke_session))
         .route("/call", post(call_tool))
-        .route("/approvals/{id}", get(get_approval))
-        .route("/approvals/{id}/decision", post(decide))
         .route("/ledger", get(ledger))
         .route("/oauth/{provider}/start", get(oauth_start))
         .route("/memory/repo", post(set_memory_repo).get(get_memory_repo))
@@ -187,17 +280,49 @@ pub fn router_with(
             "/members/requests",
             post(create_member_request).get(list_member_requests),
         )
+        // A join decision and a removal: the Slack bot's token only (UM1).
         .route(
             "/members/requests/{id}/decision",
-            post(decide_member_request),
+            post(decide_member_request).route_layer(middleware::from_fn(slack_bot_only)),
         )
-        .route("/members/{handle}/remove", post(remove_member))
+        .route(
+            "/members/{handle}/remove",
+            post(remove_member).route_layer(middleware::from_fn(slack_bot_only)),
+        )
         .route("/onboarding", get(onboarding_status))
         .merge(admin)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             identify_client,
         ));
+
+    // The approvals inbox: the orchestrator, the Slack bot (not `sources`), and the services
+    // that act for a person (`pmos-web`, the console), whose user assertions are checked.
+    let approvals = Router::new()
+        .route("/approvals", get(list_approvals))
+        .route("/approvals/{id}", get(get_approval))
+        .route("/approvals/{id}/decision", post(decide))
+        .route("/approvals/{id}/draft", axum::routing::put(save_draft))
+        .route("/approvals/{id}/sources", get(approval_sources))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            identify_approvals_client,
+        ));
+    // The admin and auditor reads (`admin.rs`): the orchestrator and pmos-web only.
+    let internal = internal
+        .merge(approvals)
+        .merge(admin::routes(state.clone()))
+        // The user database's read API (`directory.rs`): each route its own clients.
+        .merge(directory::routes(state.clone()))
+        // The Admin API (`users.rs`): pmos-web's writes, and the console's listing.
+        .merge(users::routes(state.clone()))
+        // The Reviewer's inbox, reads and recommendations (`reviews.rs`): pmos-web's only.
+        .merge(reviews::routes(state.clone()))
+        // Password sign-in (`password.rs`): pmos-web's only, in assertion `require` only.
+        .merge(password::routes(state.clone()))
+        // The bot marketplace (`team.rs`): the catalog for pmos-web, the runtime and the
+        // Slack bot; a PM's own team and the admin's read for pmos-web only.
+        .merge(team::routes(state.clone()));
 
     Router::new()
         // Liveness: the process answers. Readiness: its dependencies do too.
@@ -233,7 +358,18 @@ async fn readyz(State(state): State<AppState>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(json!({ "ready": ok, "checks": body }))).into_response()
+    let mut answer = json!({ "ready": ok, "checks": body });
+    // Not readiness checks: plain counts since start-up for an operator, with password sign-in
+    // on (docs/password-sign-in.md, the gate review of 04c175f): wrong setup codes tried (G2;
+    // each is in the audit log too), and rehashes put off while the hashing allowance was full
+    // (GL2; each is done at a later correct sign-in).
+    if let Some(pw) = state.svc.passwords() {
+        answer["password"] = json!({
+            "setup_code_wrong_guesses": pw.setup_wrong_guesses(),
+            "rehashes_deferred": pw.rehashes_deferred(),
+        });
+    }
+    (status, Json(answer)).into_response()
 }
 
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -262,27 +398,50 @@ async fn require_session(State(state): State<AppState>, mut req: Request, next: 
     next.run(req).await
 }
 
-/// Which internal client is calling, from its token.
+/// The internal client a token belongs to.
+fn client_for(state: &AppState, token: Option<&str>) -> Option<Client> {
+    let t = token?;
+    let is = |known: Option<&str>| known.is_some_and(|k| pmos_runtime::token_eq(t, k));
+    if is(Some(&state.service_token)) {
+        Some(Client::Orchestrator)
+    } else if is(state.bot.as_ref().map(|b| b.token.as_str())) {
+        Some(Client::Bot)
+    } else if is(state.people.web_token.as_deref()) {
+        Some(Client::Web)
+    } else if is(state.console_token.as_deref()) {
+        Some(Client::Console)
+    } else {
+        None
+    }
+}
+
+/// Which internal client is calling, from its token. `pmos-web`'s and the console's tokens
+/// reach only the approvals routes (and, for `pmos-web`, the admin reads), which are routed
+/// apart from these.
 async fn identify_client(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
-    let client = match bearer(&req) {
-        Some(t) if pmos_runtime::token_eq(t, &state.service_token) => Client::Orchestrator,
-        Some(t)
-            if state
-                .bot
-                .as_ref()
-                .is_some_and(|b| pmos_runtime::token_eq(t, &b.token)) =>
-        {
-            Client::Bot
-        }
-        Some(t)
-            if state
-                .console_token
-                .as_deref()
-                .is_some_and(|c| pmos_runtime::token_eq(t, c)) =>
-        {
-            Client::Console
+    let client = match client_for(&state, bearer(&req)) {
+        Some(c @ (Client::Orchestrator | Client::Bot)) => c,
+        Some(Client::Web | Client::Console) => {
+            return error(
+                StatusCode::FORBIDDEN,
+                "this token may not use this endpoint",
+            )
         }
         _ => return error(StatusCode::UNAUTHORIZED, "service token required"),
+    };
+    req.extensions_mut().insert(client);
+    next.run(req).await
+}
+
+/// The approvals routes: any internal client. For `pmos-web` and the console, the user
+/// assertion is checked as `PMOS_ASSERTION_MODE` says.
+async fn identify_approvals_client(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(client) = client_for(&state, bearer(&req)) else {
+        return error(StatusCode::UNAUTHORIZED, "service token required");
     };
     if client == Client::Console && !console_may_call(req.method(), req.uri().path()) {
         return error(
@@ -290,8 +449,131 @@ async fn identify_client(State(state): State<AppState>, mut req: Request, next: 
             "this token may not use this endpoint",
         );
     }
+    let mut req = req;
+    let mut acting = Acting(None);
+    let assertions = &state.people.assertions;
+    if matches!(client, Client::Web | Client::Console) && assertions.mode() != Mode::Off {
+        match check_assertion(assertions, client, req).await {
+            Ok((checked, subject)) => {
+                req = checked;
+                acting = Acting(subject);
+            }
+            Err(refused) => return *refused,
+        }
+    }
     req.extensions_mut().insert(client);
+    req.extensions_mut().insert(acting);
     next.run(req).await
+}
+
+/// The largest approvals request body read for a request binding (a decision with edited
+/// arguments).
+const MAX_ASSERTED_BODY: usize = 2 * 1024 * 1024;
+
+/// The one answer to every assertion failure. The log says why, by kind only: never the
+/// assertion, a key, or a handle.
+fn refuse_assertion(client: Client, why: assertion::Refusal) -> Box<Response> {
+    tracing::warn!(client = client.as_str(), reason = %why, "refused a user assertion");
+    // Boxed: a `Response` is a large error to carry in a `Result`.
+    Box::new(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "code": "bad_assertion",
+                "error": "this call needs a valid X-Pmos-Assertion for the person it acts for",
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// The `user=` an approvals call names, if any. A query that doesn't parse counts as naming
+/// someone no assertion can match.
+fn named_user(uri: &axum::http::Uri) -> Option<String> {
+    match Query::<Vec<(String, String)>>::try_from_uri(uri) {
+        Ok(Query(pairs)) => pairs
+            .into_iter()
+            .find(|(k, v)| k == "user" && !v.is_empty())
+            .map(|(_, v)| v),
+        Err(_) => Some(String::new()),
+    }
+}
+
+/// Check a `pmos-web` or console call's assertion, with the mode not `off`. Returns the request
+/// (its body read and put back) and the verified subject, if it carried an assertion.
+async fn check_assertion(
+    assertions: &Assertions,
+    client: Client,
+    req: Request,
+) -> Result<(Request, Option<String>), Box<Response>> {
+    let uri = req
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|u| u.0.clone())
+        .unwrap_or_else(|| req.uri().clone());
+    let is_decision = req.method() == axum::http::Method::POST && uri.path().ends_with("/decision");
+    let is_item_read = req.method() == axum::http::Method::GET && is_item_path(uri.path());
+    let user = named_user(&uri);
+    let Some(header) = req.headers().get(pmos_assertion::HEADER).cloned() else {
+        // A decision always names `decided_by`. A read of one item always reads someone's
+        // item, so under `require` it needs an assertion even when it names no one (W3).
+        if assertions.mode() == Mode::Require && (user.is_some() || is_decision || is_item_read) {
+            return Err(refuse_assertion(client, assertion::Refusal::Missing));
+        }
+        return Ok((req, None));
+    };
+    let Ok(header) = header.to_str() else {
+        return Err(refuse_assertion(client, assertion::Refusal::Header));
+    };
+    let (parts, body) = req.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_ASSERTED_BODY).await else {
+        return Err(refuse_assertion(client, assertion::Refusal::Body));
+    };
+    let target = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let who = assertions
+        .verify(
+            client.as_str(),
+            header,
+            parts.method.as_str(),
+            target,
+            &bytes,
+            pmos_assertion::unix_now(),
+        )
+        .map_err(|why| refuse_assertion(client, why))?;
+    let mut named: Vec<String> = user.into_iter().collect();
+    if is_decision {
+        // The handler reads `decided_by` from this same body; one that doesn't parse is
+        // refused there.
+        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(by) = v.get("decided_by") {
+                named.push(by.as_str().unwrap_or_default().to_string());
+            }
+        }
+    }
+    if named.iter().any(|n| n != who.subject()) {
+        return Err(refuse_assertion(
+            client,
+            assertion::Refusal::SubjectMismatch,
+        ));
+    }
+    tracing::debug!(
+        client = client.as_str(),
+        session = who.session(),
+        "user assertion accepted"
+    );
+    Ok((
+        Request::from_parts(parts, Body::from(bytes)),
+        Some(who.subject().to_string()),
+    ))
+}
+
+/// `/approvals/{id}` (with or without `/internal` or a trailing `/`): one item, not the list,
+/// its decision or its sources.
+fn is_item_path(path: &str) -> bool {
+    let path = path.strip_prefix("/internal").unwrap_or(path);
+    let path = path.strip_suffix('/').unwrap_or(path);
+    path.strip_prefix("/approvals/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// The console reads approvals and nothing else: `GET /approvals` and
@@ -299,19 +581,25 @@ async fn identify_client(State(state): State<AppState>, mut req: Request, next: 
 fn console_may_call(method: &axum::http::Method, path: &str) -> bool {
     let path = path.strip_prefix("/internal").unwrap_or(path);
     let path = path.strip_suffix('/').unwrap_or(path);
-    method == axum::http::Method::GET
-        && match path.strip_prefix("/approvals") {
-            Some("") => true,
-            Some(rest) => rest
-                .strip_prefix('/')
-                .is_some_and(|id| !id.is_empty() && !id.contains('/')),
-            None => false,
-        }
+    method == axum::http::Method::GET && (path == "/approvals" || is_item_path(path))
 }
 
 async fn orchestrator_only(req: Request, next: Next) -> Response {
     match req.extensions().get::<Client>() {
         Some(Client::Orchestrator) => next.run(req).await,
+        _ => error(
+            StatusCode::FORBIDDEN,
+            "this token may not use this endpoint",
+        ),
+    }
+}
+
+/// The Slack bot's token only: a join decision and a removal (`docs/user-database-spec.md`
+/// §4, §6). The orchestrator's token is unsigned like the bot's, and nothing it does needs
+/// these (review of `b469d5b`, UM1).
+async fn slack_bot_only(req: Request, next: Next) -> Response {
+    match req.extensions().get::<Client>() {
+        Some(Client::Bot) => next.run(req).await,
         _ => error(
             StatusCode::FORBIDDEN,
             "this token may not use this endpoint",
@@ -328,7 +616,8 @@ fn client_may_use(state: &AppState, client: Client, skill: Option<&str>) -> bool
             .bot
             .as_ref()
             .is_some_and(|b| b.skills.iter().any(|s| s == skill)),
-        (Client::Bot, None) | (Client::Mcp, _) | (Client::Console, _) => false,
+        (Client::Bot, None)
+        | (Client::Mcp | Client::Web | Client::Console | Client::System | Client::Host, _) => false,
     }
 }
 
@@ -355,14 +644,40 @@ async fn header_session(
     }
 }
 
-/// `{user, skill, run_id, ttl_minutes?}` or `{user, bot, run_id, ttl_minutes?}`.
+/// `{user, skill, run_id, ttl_minutes?, history_sensitivity?}` or
+/// `{user, bot, run_id, ttl_minutes?, history_sensitivity?, persona?}`.
+///
+/// Strict (the marketplace review): a field this server doesn't know is refused (`422`), never
+/// dropped, so a caller newer than this server (one that sends a field a later version adds)
+/// fails closed instead of getting a session without it, as a server before B1 would have
+/// dropped `persona` and run a Chief task with Nudge's tools.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NewSession {
     user: String,
     skill: Option<String>,
     bot: Option<String>,
+    /// The persona (marketplace bot) a bot session runs as (`docs/bot-marketplace-spec.md`
+    /// §6). Absent, `null` or `nudge` is Nudge.
+    #[serde(default)]
+    persona: Option<String>,
     run_id: String,
     ttl_minutes: Option<i64>,
+    /// The highest level the run's conversation history was built from (the runtime sends
+    /// it for a task that carries earlier turns, W6). The session starts at it. It can only
+    /// raise the session, never lower it.
+    #[serde(default)]
+    history_sensitivity: Option<Sensitivity>,
+}
+
+/// `{run_id, sensitivity}`: the highest level the run's sessions reached, or `null` when no
+/// session of it is stored. Orchestrator only: the runtime records it per task when the task
+/// finishes, and starts a follow-up's session at it (W6).
+async fn run_sensitivity(State(state): State<AppState>, Path(run_id): Path<String>) -> Response {
+    match state.svc.run_sensitivity(&run_id).await {
+        Ok(level) => Json(json!({ "run_id": run_id, "sensitivity": level })).into_response(),
+        Err(e) => unavailable(e),
+    }
 }
 
 async fn create_session(
@@ -374,6 +689,12 @@ async fn create_session(
         return error(
             StatusCode::BAD_REQUEST,
             "send either `skill` or `bot`, not both",
+        );
+    }
+    if body.skill.is_some() && body.persona.is_some() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "`persona` goes with `bot`, never with `skill`",
         );
     }
     if !client_may_use(&state, client, body.skill.as_deref()) {
@@ -389,17 +710,26 @@ async fn create_session(
     let ttl = body
         .ttl_minutes
         .map(|m| Duration::minutes(m.clamp(1, 24 * 60)));
+    let floor = body.history_sensitivity.unwrap_or(Sensitivity::Public);
     let created = match (&body.skill, &body.bot) {
         (Some(skill), _) => {
             state
                 .svc
-                .create_session(&body.user, skill, &body.run_id, ttl, Utc::now())
+                .create_session_from(&body.user, skill, &body.run_id, ttl, floor, Utc::now())
                 .await
         }
         (None, Some(bot)) => {
             state
                 .svc
-                .create_bot_session(&body.user, bot, &body.run_id, ttl, Utc::now())
+                .create_bot_session_as(
+                    &body.user,
+                    bot,
+                    body.persona.as_deref(),
+                    &body.run_id,
+                    ttl,
+                    floor,
+                    Utc::now(),
+                )
                 .await
         }
         (None, None) => unreachable!("checked above"),
@@ -412,16 +742,36 @@ async fn create_session(
                 .iter()
                 .map(|t| json!({"name": t.harness_name, "kind": t.kind}))
                 .collect();
+            // The persona the session runs as, for the runtime's claim: its key, name, title
+            // and role. `null` for Nudge and for skill sessions.
+            let persona = session.persona.as_deref().and_then(|key| {
+                let roster = state.svc.roster();
+                roster.persona(key).map(|p| {
+                    json!({
+                        "key": p.name,
+                        "display_name": p.display_name,
+                        "title": p.title,
+                        "role": p.role,
+                    })
+                })
+            });
             (
                 StatusCode::CREATED,
                 Json(json!({
                     "token": session.token,
                     "session": session,
                     "tools": tools,
+                    "persona": persona,
                 })),
             )
                 .into_response()
         }
+        Err(e) if e.persona_code().is_some() => coded(
+            StatusCode::FORBIDDEN,
+            e.persona_code().unwrap_or_default(),
+            e.to_string(),
+            json!({}),
+        ),
         Err(e @ (SessionError::UnknownSkill(_) | SessionError::UnknownBot(_))) => {
             error(StatusCode::NOT_FOUND, e.to_string())
         }
@@ -485,8 +835,11 @@ pub const BOT_PENDING_LIMIT: usize = 50;
 
 /// A PM's approval items.
 ///
-/// - **The orchestrator:** `{"items": [...]}`, every item of `user`'s, newest first,
-///   optionally only those with `status`.
+/// - **The orchestrator, `pmos-web` and the console:** `{"items": [...], "truncated",
+///   "total_pending"}`, `user`'s inbox newest first: every pending item (up to
+///   [`crate::approvals::PENDING_CAP`], `truncated` past it) and the newest
+///   [`crate::approvals::LIST_LIMIT`] decided ones; with `status=pending` the pending ones only.
+///   With another `status`, `{"items": [...]}`, at most `LIST_LIMIT`.
 /// - **The Slack bot** (the App Home Inbox): `{"approvals": [...], "total": n}`, only
 ///   `pending` items whatever `status` says, oldest first, at most [`BOT_PENDING_LIMIT`];
 ///   `total` counts them all. `user` must be a team member.
@@ -499,8 +852,12 @@ async fn list_approvals(
         return error(StatusCode::BAD_REQUEST, "`user` is required");
     };
     if client == Client::Bot {
-        // As for sessions: enforced with live connectors, open in dev and tests.
-        if !state.svc.team().allows(&user) {
+        // As for sessions: an active PM OS user (the user database decides).
+        let allowed = match state.svc.people().allows(&user).await {
+            Ok(allowed) => allowed,
+            Err(e) => return unavailable(e),
+        };
+        if !allowed {
             return error(
                 StatusCode::FORBIDDEN,
                 "this token may list approvals for team members only",
@@ -508,6 +865,7 @@ async fn list_approvals(
         }
         return match state.svc.pending_approvals(&user, BOT_PENDING_LIMIT).await {
             Ok((approvals, total)) => {
+                let approvals = for_client_all(client, state.svc.approvals_json(&approvals).await);
                 Json(json!({ "approvals": approvals, "total": total })).into_response()
             }
             Err(e) => unavailable(e),
@@ -520,8 +878,45 @@ async fn list_approvals(
             None => return error(StatusCode::BAD_REQUEST, format!("unknown status `{s}`")),
         },
     };
+    // The inbox (every status, or only `pending`): pending items are never hidden behind the
+    // cap on decided ones (R12).
+    if matches!(status, None | Some(Status::Pending)) {
+        return match state.svc.inbox(&user).await {
+            Ok(inbox) => {
+                let truncated = inbox.truncated();
+                let total_pending = inbox.total_pending;
+                let mut items = inbox.pending;
+                if status.is_none() {
+                    items.extend(inbox.decided);
+                    items.sort_by(|a, b| {
+                        b.created_at
+                            .cmp(&a.created_at)
+                            .then_with(|| a.id.cmp(&b.id))
+                    });
+                }
+                if truncated {
+                    tracing::warn!(
+                        total_pending,
+                        cap = crate::approvals::PENDING_CAP,
+                        "an inbox listing was truncated"
+                    );
+                }
+                let items = for_client_all(client, state.svc.approvals_json(&items).await);
+                Json(json!({
+                    "items": items,
+                    "truncated": truncated,
+                    "total_pending": total_pending,
+                }))
+                .into_response()
+            }
+            Err(e) => unavailable(e),
+        };
+    }
     match state.svc.approvals(&user, status).await {
-        Ok(items) => Json(json!({ "items": items })).into_response(),
+        Ok(items) => {
+            let items = for_client_all(client, state.svc.approvals_json(&items).await);
+            Json(json!({ "items": items })).into_response()
+        }
         Err(e) => unavailable(e),
     }
 }
@@ -531,27 +926,93 @@ struct OneApprovalQuery {
     user: Option<String>,
 }
 
-/// One approval item. The orchestrator and the console read any item. The Slack bot must
-/// name the PM it acts for, `?user=<handle>`: an item that isn't that team member's, or a
-/// read without `user`, is `404`, the same as a missing item, so the bot can't tell which
-/// ids exist.
+/// One approval item. The orchestrator reads any item. The Slack bot and `pmos-web` must
+/// name the PM they act for, `?user=<handle>`: an item that isn't that team member's, or a
+/// read without `user`, is `404`, the same as a missing item, so they can't tell which ids
+/// exist. With a user assertion (`pmos-web`, the console), only the subject's own item is
+/// answered; anyone else's is `404` too, except that the console's admin view may read any
+/// item when the subject is an active admin in the user database, read for this request.
+/// Under `require`
+/// a read from `pmos-web` or the console without an assertion never gets here (`401`); in
+/// `off` and `verify` the console's read-only token still reads any item by id.
 async fn get_approval(
     State(state): State<AppState>,
     Extension(client): Extension<Client>,
+    Extension(acting): Extension<Acting>,
     Path(id): Path<String>,
     Query(q): Query<OneApprovalQuery>,
 ) -> Response {
     let not_found = || error(StatusCode::NOT_FOUND, "no such approval item");
     let user = q.user.filter(|u| !u.trim().is_empty());
-    if client == Client::Bot && !user.as_deref().is_some_and(|u| state.svc.team().allows(u)) {
-        return not_found();
-    }
-    match state.svc.approval(&id).await {
-        Ok(Some(item)) if client == Client::Bot && user.as_deref() != Some(item.user.as_str()) => {
-            not_found()
+    let must_name = matches!(client, Client::Bot | Client::Web);
+    if must_name {
+        let named = match user.as_deref() {
+            Some(u) => match state.svc.people().allows(u).await {
+                Ok(allowed) => allowed,
+                Err(e) => return unavailable(e),
+            },
+            None => false,
+        };
+        if !named {
+            return not_found();
         }
-        Ok(Some(item)) => Json(item).into_response(),
+    }
+    // The console's admin view: the subject is an active admin in the database, now.
+    let subject_is_admin = match (client, acting.0.as_deref()) {
+        (Client::Console, Some(who)) => match state.svc.people().is_admin(who).await {
+            Ok(admin) => admin,
+            Err(e) => return unavailable(e),
+        },
+        _ => false,
+    };
+    // May the verified subject read `owner`'s item?
+    let subject_may_read = |owner: &str| match acting.0.as_deref() {
+        None => true,
+        Some(who) if who == owner => true,
+        Some(_) => subject_is_admin,
+    };
+    match state.svc.approval(&id).await {
+        Ok(Some(item)) if must_name && user.as_deref() != Some(item.user.as_str()) => not_found(),
+        Ok(Some(item)) if !subject_may_read(&item.user) => not_found(),
+        Ok(Some(item)) => {
+            Json(for_client(client, state.svc.approval_json(&item).await)).into_response()
+        }
         Ok(None) => not_found(),
+        Err(e) => unavailable(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SourcesQuery {
+    user: Option<String>,
+}
+
+/// What the run that drafted an item read (`sources.rs`), for its own user only: `user`
+/// must be the item's user, and anything else answers `404` as a missing item does, so the
+/// answer never confirms that someone else's item exists. The service token, `pmos-web` and
+/// the console; not the Slack bot.
+async fn approval_sources(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Path(id): Path<String>,
+    Query(q): Query<SourcesQuery>,
+) -> Response {
+    if client == Client::Bot {
+        return error(
+            StatusCode::FORBIDDEN,
+            "this token may not use this endpoint",
+        );
+    }
+    let Some(user) = q.user.filter(|u| !u.trim().is_empty()) else {
+        return error(StatusCode::BAD_REQUEST, "`user` is required");
+    };
+    let item = match state.svc.approval(&id).await {
+        Ok(Some(item)) if item.user == user => item,
+        Ok(_) => return error(StatusCode::NOT_FOUND, "no such approval item"),
+        Err(e) => return unavailable(e),
+    };
+    match state.svc.approval_sources(&item).await {
+        Ok(report) => Json(report).into_response(),
         Err(e) => unavailable(e),
     }
 }
@@ -567,6 +1028,32 @@ struct DecisionBody {
     /// For a Slack write to an externally shared channel: the PM confirmed posting there.
     #[serde(default)]
     confirm_external: bool,
+    /// The start (16 to 64 hex characters) of the `args_hash` the person deciding was shown.
+    /// When it no longer matches the item: `409 {code: "stale"}` and nothing is decided.
+    /// Required on `approve` from the Slack bot and `pmos-web`; optional for the orchestrator.
+    #[serde(default)]
+    expected_args_hash: Option<String>,
+}
+
+/// An item's view as `client` gets it: a reviewer's note (`recommendations[].note`) reaches
+/// `pmos-web` and the orchestrator only, never the Slack bot (a card shows who recommended
+/// what, not the note, to keep content out of more Slack messages) or the console.
+fn for_client(client: Client, mut view: Value) -> Value {
+    if matches!(client, Client::Bot | Client::Console) {
+        if let Some(recs) = view
+            .get_mut("recommendations")
+            .and_then(Value::as_array_mut)
+        {
+            for r in recs.iter_mut().filter_map(Value::as_object_mut) {
+                r.remove("note");
+            }
+        }
+    }
+    view
+}
+
+fn for_client_all(client: Client, views: Vec<Value>) -> Vec<Value> {
+    views.into_iter().map(|v| for_client(client, v)).collect()
 }
 
 /// An error with a machine-readable `code`, and any extra fields.
@@ -586,7 +1073,7 @@ async fn decide(
 ) -> Response {
     let reason = match body.reason.as_deref() {
         None => None,
-        Some(r) => match Reason::parse(r) {
+        Some(r) => match Reason::chosen(r) {
             Some(reason) => Some(reason),
             None => {
                 let known: Vec<&str> = Reason::ALL.iter().map(|r| r.as_str()).collect();
@@ -602,14 +1089,31 @@ async fn decide(
         args: body.args,
         reason,
         confirm_external: body.confirm_external,
+        expected_args_hash: body.expected_args_hash,
+        hold: None,
     };
     match state
         .svc
         .decide_verdict(client, &id, &body.decided_by, verdict, Utc::now())
         .await
     {
-        Ok(item) => Json(item).into_response(),
+        Ok(item) => Json(for_client(client, state.svc.approval_json(&item).await)).into_response(),
         Err(DecisionError::Decide(DecideError::Store(e))) => unavailable(e),
+        Err(e @ DecisionError::Decide(DecideError::Stale)) => {
+            coded(StatusCode::CONFLICT, STALE, e.to_string(), json!({}))
+        }
+        Err(e @ DecisionError::ShownHashMissing) => coded(
+            StatusCode::BAD_REQUEST,
+            "expected_args_hash_required",
+            e.to_string(),
+            json!({}),
+        ),
+        Err(e @ DecisionError::ShownHashMalformed) => coded(
+            StatusCode::BAD_REQUEST,
+            "bad_expected_args_hash",
+            e.to_string(),
+            json!({}),
+        ),
         Err(e @ DecisionError::Decide(DecideError::Expired)) => {
             coded(StatusCode::CONFLICT, "expired", e.to_string(), json!({}))
         }
@@ -635,7 +1139,10 @@ async fn decide(
             let status = match e {
                 DecideError::NotFound => StatusCode::NOT_FOUND,
                 DecideError::Forbidden => StatusCode::FORBIDDEN,
-                DecideError::NotPending | DecideError::Expired => StatusCode::CONFLICT,
+                DecideError::NotPending
+                | DecideError::Expired
+                | DecideError::Stale
+                | DecideError::Held => StatusCode::CONFLICT,
                 DecideError::MissingArgs => StatusCode::BAD_REQUEST,
                 DecideError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
             };
@@ -652,6 +1159,12 @@ async fn decide(
             error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
         }
         Err(e @ DecisionError::NotAMember(_)) => error(StatusCode::FORBIDDEN, e.to_string()),
+        Err(e @ DecisionError::Held(_)) => coded(
+            StatusCode::CONFLICT,
+            crate::service::HELD,
+            e.to_string(),
+            json!({}),
+        ),
         Err(
             e @ (DecisionError::UnknownTool(_)
             | DecisionError::NotAllowed(_)
@@ -662,6 +1175,98 @@ async fn decide(
             tracing::error!(error = %e, id = %id, "approved write task failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_FAILURE)
         }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftBody {
+    args: Value,
+    /// The revision run whose answer this text is (the web app's accepted suggestion): its
+    /// runtime task id. The item's level is raised to what the tool server's own sessions for
+    /// that run reached (`restricted` when it has none). Absent for text a person typed.
+    #[serde(default)]
+    revision_run: Option<String>,
+    /// The level the caller recorded for that run: only ever a floor, never trusted to lower
+    /// anything. Ignored without `revision_run`.
+    #[serde(default)]
+    revision_sensitivity: Option<Sensitivity>,
+}
+
+/// `PUT /internal/approvals/{id}/draft?user=<handle>` `{"args": {...}}`: the item's own PM
+/// saves an edit of a pending draft (the web app's **Save**), which every surface then shows
+/// and an approve anywhere writes. `pmos-web` (with a user assertion for `user`, as
+/// `PMOS_ASSERTION_MODE` says) and the orchestrator; never the Slack bot (its edit is a
+/// decision) or the console (read-only). Someone else's item, or a call that names nobody, is
+/// `404` like a missing one. Refusals: `409 not_pending` or `expired`, `400` arguments that
+/// don't fit the tool, `422 target_changed`, `403` not a team member. Answers the item.
+async fn save_draft(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Extension(acting): Extension<Acting>,
+    Path(id): Path<String>,
+    Query(q): Query<OneApprovalQuery>,
+    Json(body): Json<DraftBody>,
+) -> Response {
+    if !matches!(client, Client::Web | Client::Orchestrator) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "this token may not use this endpoint",
+        );
+    }
+    let not_found = || error(StatusCode::NOT_FOUND, "no such approval item");
+    let Some(user) = q.user.filter(|u| !u.trim().is_empty()) else {
+        return not_found();
+    };
+    if acting.0.as_ref().is_some_and(|who| *who != user) {
+        return not_found();
+    }
+    let revision = match body.revision_run {
+        None => None,
+        Some(run_id) if run_id.is_empty() || run_id.len() > 128 => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "`revision_run` must be a run id of 1 to 128 characters",
+            )
+        }
+        Some(run_id) => Some(Revision {
+            run_id,
+            sensitivity: body.revision_sensitivity,
+        }),
+    };
+    match state
+        .svc
+        .save_draft(client, &id, &user, body.args, revision, Utc::now())
+        .await
+    {
+        Ok(item) => Json(state.svc.approval_json(&item).await).into_response(),
+        Err(DecisionError::Decide(DecideError::NotFound | DecideError::Forbidden)) => not_found(),
+        Err(DecisionError::Decide(DecideError::Store(e))) => unavailable(e),
+        Err(e @ DecisionError::Decide(DecideError::Expired)) => {
+            coded(StatusCode::CONFLICT, "expired", e.to_string(), json!({}))
+        }
+        // A withdrawn bot's draft: its owner may reject it, not save an edit (gate-fix-4).
+        Err(e @ DecisionError::Held(_)) => coded(
+            StatusCode::CONFLICT,
+            crate::service::HELD,
+            e.to_string(),
+            json!({}),
+        ),
+        Err(e @ DecisionError::Decide(_)) => coded(
+            StatusCode::CONFLICT,
+            "not_pending",
+            e.to_string(),
+            json!({}),
+        ),
+        Err(e @ DecisionError::InvalidArgs(_)) => error(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e @ DecisionError::TargetChanged(_)) => coded(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            TARGET_CHANGED,
+            e.to_string(),
+            json!({}),
+        ),
+        Err(e @ DecisionError::NotAMember(_)) => error(StatusCode::FORBIDDEN, e.to_string()),
+        Err(e) => error(StatusCode::CONFLICT, e.to_string()),
     }
 }
 
@@ -759,7 +1364,9 @@ async fn ledger(
         Err(why) => return unprocessable(why),
     };
     match state.svc.ledger(query, Utc::now()).await {
-        Ok(rows) if client == Client::Bot => {
+        // Only the orchestrator and the Slack bot reach this route; anyone but the
+        // orchestrator gets no ids.
+        Ok(rows) if client != Client::Orchestrator => {
             let rows: Vec<Value> = rows
                 .iter()
                 .map(|row| {
@@ -838,11 +1445,17 @@ async fn oauth_start(
     Path(provider): Path<String>,
     Query(q): Query<UserQuery>,
 ) -> Response {
-    if client != Client::Orchestrator && state.svc.team().member(&q.user).is_none() {
-        return error(
-            StatusCode::FORBIDDEN,
-            "this token may get link URLs for team members only",
-        );
+    if client != Client::Orchestrator {
+        match state.svc.people().allows(&q.user).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return error(
+                    StatusCode::FORBIDDEN,
+                    "this token may get link URLs for team members only",
+                )
+            }
+            Err(e) => return unavailable(e),
+        }
     }
     let (oauth, provider) = match linking(&state, &provider) {
         Ok(x) => x,
@@ -932,6 +1545,14 @@ async fn oauth_callback(
                 "This sign-in link was made for someone else. Ask PM OS for your own link.",
             )
         }
+        Err(e @ OAuthError::DifferentAccount(..)) => {
+            tracing::warn!(provider = %provider, error = %e, "account linking refused: different_account");
+            page(
+                StatusCode::CONFLICT,
+                "Not connected",
+                "You linked a different account before. Ask a platform owner to unlink it first, then try again.",
+            )
+        }
         Err(e) => {
             tracing::warn!(provider = %provider, error = %e, "account linking failed");
             page(
@@ -979,16 +1600,22 @@ async fn revoke_credential(
                 tool: UNLINK_TOOL.to_string(),
                 outcome,
                 sources: Vec::new(),
+                source_titles: Default::default(),
                 args_hash: None,
                 output_ref: Some(provider),
                 detail: Some(detail),
+                persona: None,
             })
             .await;
         }
     };
     // As for sessions: enforced with live connectors (the only mode that links accounts),
     // and never a team bot's own account.
-    if client != Client::Orchestrator && !state.svc.team().allows(&user) {
+    let allowed = match state.svc.people().allows(&user).await {
+        Ok(allowed) => allowed,
+        Err(e) => return unavailable(e),
+    };
+    if client != Client::Orchestrator && !allowed {
         audit(
             Outcome::Denied,
             "unlink for someone who isn't a team member".into(),
@@ -1209,7 +1836,14 @@ async fn remove_member(
         .remove(client, &handle, &body.decided_by, Utc::now())
         .await
     {
-        Ok(commit) => Json(json!({ "handle": handle, "commit": commit })).into_response(),
+        // A deactivation since slice U3: nothing is committed (`commit` is null).
+        Ok(note) => Json(json!({
+            "handle": handle,
+            "deactivated": true,
+            "commit": null,
+            "note": note,
+        }))
+        .into_response(),
         Err(r) => refusal(r),
     }
 }

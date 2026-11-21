@@ -57,6 +57,25 @@ expect:
 tags: [model/…]
 ```
 
+### A case that took more than one message
+
+If the failure only shows across messages (the bot lost the thread: it took a short reply as a
+new request, asked again what the PM had answered, or dropped a detail the PM said to keep),
+write a `thread` in place of `ask` and `expect`. Paraphrase each message, and give an `expect`
+to each turn that must show the bot kept the thread; a turn with none only has to settle.
+Tag it `memory/lost-the-thread`. A thread needs the runtime to carry history for eval tasks,
+so leave off `regression: true` until it passes (`docs/evals.md`, Threads).
+
+```yaml
+id: <lowercase-and-hyphens, matches the file name>
+thread:
+  - ask: "<the first message, paraphrased and self-contained>"
+    expect: {approvals: 0, must_include: ["?"]}   # e.g. the bot asked first
+  - ask: "<the short reply>"
+    expect: {must_not_include: ["<what it must not ask again>"]}
+tags: [memory/lost-the-thread]
+```
+
 ## 4. The reference outcome
 
 What a good result looks like: the PM's approved final draft is fine, paraphrased if it quotes

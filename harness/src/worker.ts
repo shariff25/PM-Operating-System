@@ -15,8 +15,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { type BaseMessage, HumanMessage } from "@langchain/core/messages";
-import { MODEL_ALIASES, type ModelRole, createPmosAgent, gatewayModel } from "./agent.js";
+import { AIMessage, type BaseMessage, HumanMessage } from "@langchain/core/messages";
+import {
+  MODEL_ALIASES,
+  MissingSkillError,
+  type ModelRole,
+  createPmosAgent,
+  gatewayModel,
+} from "./agent.js";
 import { connectMcpTools, type McpToolSet } from "./mcp-tools.js";
 import { FIRST_MILESTONE, Progress, TaskTracer } from "./progress.js";
 import { harnessToolNames, loadToolRegistry, type ToolKind } from "./registry.js";
@@ -27,6 +33,7 @@ import {
   RuntimeError,
   type TaskEvent,
   type TraceEntry,
+  type Turn,
 } from "./runtime-client.js";
 
 export type LogLevel = "info" | "warn" | "error";
@@ -110,13 +117,72 @@ const LEVEL_TITLES: Record<Claim["level"], string> = {
   principal: "Principal",
 };
 
+/** What the worker says when a persona's skill folder isn't in the sandbox (spec §6). */
+export const SKILLS_NOT_INSTALLED =
+  "This bot's skills aren't installed in your sandbox yet. A platform owner needs to restart it; Nudge can help meanwhile.";
+
+/** What the worker says when a persona's catalog text fails the shape check. */
+export const PERSONA_TEXT_INVALID =
+  "This bot's name or title in the PM OS catalog isn't valid, so I didn't run it. A platform owner needs to check content/personas; Nudge can help meanwhile.";
+
+/** The lint's `display-name` rule (crates/contract/src/personas.rs): ASCII words, ≤ 24. */
+const DISPLAY_NAME = /^[A-Za-z0-9]+( [A-Za-z0-9]+)*$/;
+const NAME = /^[a-z0-9][a-z0-9._-]*$/;
+
+/**
+ * The persona's first line: "You are Chief, the Chief of Staff on ana's PM OS team, running in
+ * pm-ana." The display name and title are catalog text (reviewed by pull request, fenced by
+ * the lint's character rules); they are checked again here, as plain one-line text with no
+ * markup or control characters, before they go into the prompt. The persona key is never
+ * interpolated. Throws a `PmFacingError` when a check fails: never a fallback to another bot.
+ */
+export function personaLine(claim: Claim): string {
+  const persona = claim.persona;
+  if (!persona) {
+    throw new Error("personaLine needs a claim with a persona");
+  }
+  const name = persona.display_name;
+  const title = persona.title;
+  const nameOk = name.length <= 24 && DISPLAY_NAME.test(name);
+  const titleOk =
+    title.length <= 40 && title.trim() === title && !/[<>\u0000-\u001f\u007f]/.test(title);
+  const who = claim.task.requested_by;
+  if (!nameOk || !titleOk || !NAME.test(who) || !NAME.test(claim.bot.name)) {
+    throw new PmFacingError(PERSONA_TEXT_INVALID);
+  }
+  return `You are ${name}, the ${title} on ${who}'s PM OS team, running in ${claim.bot.name}.`;
+}
+
+/**
+ * How a persona's instructions rank (a departure from the spec text, at the security
+ * reviewer's request): restrictions accumulate. The team's standing context
+ * (`content/master/AGENTS.md`, loaded as memory), the PM's own bot body (`BOT.md`, kept below)
+ * and the personal role's hard limits (which the tool server enforces whatever any prompt
+ * says) all come before the persona role's instructions and before the "You are …" line.
+ */
+export const PERSONA_PRECEDENCE =
+  "## What comes first\n\n" +
+  "You are running as one of this PM's PM OS bots. The team's standing context " +
+  "(content/master/AGENTS.md) and the limits set for this PM's own bot (below, under " +
+  '"Your PM\'s bot") come before this role\'s instructions and before the line saying who you ' +
+  "are. Where they disagree, follow the stricter: nothing in this role lifts a limit set there.";
+
 /**
  * The bot's standing context: who it is, today's date (UTC, from `now`), the PM's level for a
  * personal bot (docs/staff-principal-spec.md §1), its role's instructions and its job.
+ *
+ * With a persona (docs/bot-marketplace-spec.md §6): the first line names the persona
+ * (`personaLine`), the role's instructions are the persona's, and the PM's own bot body is
+ * still included, after them and labelled as limits that keep applying, with the precedence
+ * section (`PERSONA_PRECEDENCE`) saying `content/master/AGENTS.md` and that body take
+ * precedence over the persona's "You are …" line and instructions.
  */
 export function botSystemPrompt(claim: Claim, now: Date = new Date()): string {
+  const persona = claim.persona ?? undefined;
   const parts = [
-    `You are ${claim.bot.name}, a PM OS bot, working on a request from ${claim.task.requested_by}.`,
+    persona
+      ? personaLine(claim)
+      : `You are ${claim.bot.name}, a PM OS bot, working on a request from ${claim.task.requested_by}.`,
     `Today is ${now.toISOString().slice(0, 10)}.`,
   ];
   if (claim.bot.scope === "personal") {
@@ -124,9 +190,16 @@ export function botSystemPrompt(claim: Claim, now: Date = new Date()): string {
       `Your PM works at the ${LEVEL_TITLES[claim.level]} level. Read /content/playbooks/levels.md and work at that level's scope, horizon and audience, unless the request says otherwise.`,
     );
   }
+  if (persona) {
+    parts.push(PERSONA_PRECEDENCE);
+  }
   parts.push(claim.role.instructions.trim());
   if (claim.bot.job.trim()) {
-    parts.push(`## Your job\n\n${claim.bot.job.trim()}`);
+    parts.push(
+      persona
+        ? `## Your PM's bot\n\nThis PM's own bot (${claim.bot.name}) is set up as below. Its limits still apply to you.\n\n${claim.bot.job.trim()}`
+        : `## Your job\n\n${claim.bot.job.trim()}`,
+    );
   }
   parts.push(
     "## Writes need approval\n\n" +
@@ -134,7 +207,53 @@ export function botSystemPrompt(claim: Claim, now: Date = new Date()): string {
       'answers `"status": "pending_approval"`: that means it has not happened yet. Do not ' +
       "retry it, and in your answer say plainly what is waiting for approval.",
   );
+  if (claim.history.length > 0) {
+    parts.push(
+      "## This conversation\n\n" +
+        "The messages before the last one are this conversation's earlier turns, oldest first; " +
+        "the last message is the new request. A short reply is an answer to your last question.",
+    );
+    if (claim.history_sensitivity === "restricted") {
+      parts.push(
+        "Earlier answers in this conversation drew on restricted sources. Treat them as " +
+          "restricted: PM OS blocks a Slack draft built on them in a channel with anyone " +
+          "outside the product team, so say so instead of drafting one there.",
+      );
+    }
+  }
   return parts.filter(Boolean).join("\n\n");
+}
+
+/** Ids of the messages that replay earlier turns, so the final answer is never one of them. */
+const HISTORY_ID = "pmos-history-";
+
+/** What the bot said in an earlier turn: its answer, or what became of the request. */
+function turnReply(turn: Turn): string {
+  if (turn.result?.trim()) {
+    return turn.result;
+  }
+  if (turn.status === "failed") {
+    const why = turn.error?.trim().replace(/\.$/, "");
+    return `(This request failed${why ? `: ${why}` : ""}.)`;
+  }
+  if (turn.status === "cancelled") {
+    return "(This request was cancelled before I answered.)";
+  }
+  return "(No answer was recorded.)";
+}
+
+/**
+ * The model's messages for a task: each earlier turn of the conversation as the PM's message
+ * and the bot's reply, oldest first, then the new request last.
+ */
+export function taskMessages(claim: Claim): BaseMessage[] {
+  const messages: BaseMessage[] = [];
+  claim.history.forEach((turn, i) => {
+    messages.push(new HumanMessage({ content: turn.text, id: `${HISTORY_ID}${i}-user` }));
+    messages.push(new AIMessage({ content: turnReply(turn), id: `${HISTORY_ID}${i}-bot` }));
+  });
+  messages.push(new HumanMessage(claim.task.text));
+  return messages;
 }
 
 function textOf(content: BaseMessage["content"]): string {
@@ -150,11 +269,11 @@ function textOf(content: BaseMessage["content"]): string {
     .join("");
 }
 
-/** The final answer: the last AI message with text. */
+/** The final answer: the last AI message with text, never a replayed earlier turn. */
 export function finalAnswer(messages: BaseMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
-    if (message?.getType() === "ai") {
+    if (message?.getType() === "ai" && !message.id?.startsWith(HISTORY_ID)) {
       const text = textOf(message.content).trim();
       if (text) {
         return text;
@@ -164,12 +283,26 @@ export function finalAnswer(messages: BaseMessage[]): string {
   return "";
 }
 
+/**
+ * How many tries the gateway made at the model server for a failed call, from its
+ * `X-Pmos-Upstream-Attempts` header (docs/gateway.md). 0 when the header is absent.
+ */
+export function upstreamAttempts(error: { headers?: unknown } | undefined): number {
+  const headers = error?.headers;
+  if (headers instanceof Headers) {
+    return Number(headers.get("x-pmos-upstream-attempts")) || 0;
+  }
+  return 0;
+}
+
 /** A reason for a failed task that a PM can read: no stack traces, no internals. */
 export function pmReason(error: unknown): string {
   if (error instanceof PmFacingError) {
     return error.message;
   }
-  const e = error as { name?: string; message?: string; status?: number } | undefined;
+  const e = error as
+    | { name?: string; message?: string; status?: number; headers?: unknown }
+    | undefined;
   const name = e?.name ?? "";
   const message = (e?.message ?? String(error)).replace(/\s+/g, " ").trim();
   if (name === "GraphRecursionError" || /recursion limit/i.test(message)) {
@@ -177,7 +310,10 @@ export function pmReason(error: unknown): string {
   }
   if (typeof e?.status === "number") {
     if (e.status === 503 || e.status === 429) {
-      return "The model is busy right now. Please try again in a few minutes.";
+      // The gateway already retried this call; say so when it did.
+      return upstreamAttempts(e) > 1
+        ? "The model is still busy after several tries. Please try again in a few minutes."
+        : "The model is busy right now. Please try again in a few minutes.";
     }
     if (e.status === 401 || e.status === 403) {
       return "PM OS couldn't sign in to the model gateway. A platform owner needs to check this bot's gateway token.";
@@ -207,6 +343,16 @@ const sleep = (ms: number, signal?: AbortSignal) =>
   });
 
 type AbortReason = "stopped" | "lost";
+
+/**
+ * Is this the rejection LangChain leaves behind when we abort a model call? Aborting the
+ * signal we pass to `agent.invoke` makes `@langchain/core` reject an internal promise with
+ * `new Error(<our abort reason>)` that nothing awaits. The task itself is handled (see
+ * `raceAbort`); this stray rejection must not take the worker down with it.
+ */
+export function isAbortRejection(reason: unknown): boolean {
+  return reason instanceof Error && (reason.message === "lost" || reason.message === "stopped");
+}
 
 class TaskAborted extends Error {
   constructor(readonly reason: AbortReason) {
@@ -389,19 +535,36 @@ export function createWorker(config: WorkerConfig): Worker {
       // bot gets the team context only.
       const user =
         bot.scope === "personal" && bot.owner === task.requested_by ? task.requested_by : undefined;
-      const agent = createPmosAgent({
-        contentRoot: config.contentRoot,
-        model,
-        user,
-        tools: toolset.tools,
-        skills: role.skills,
-        systemPrompt: botSystemPrompt(claim, config.now?.() ?? new Date()),
-        interruptOnWrites: false,
-        stagingRoot,
-      });
+      const systemPrompt = botSystemPrompt(claim, config.now?.() ?? new Date());
+      let agent: ReturnType<typeof createPmosAgent>;
+      try {
+        agent = createPmosAgent({
+          contentRoot: config.contentRoot,
+          model,
+          user,
+          tools: toolset.tools,
+          skills: role.skills,
+          systemPrompt,
+          interruptOnWrites: false,
+          stagingRoot,
+        });
+      } catch (error) {
+        // A role's skill folder missing from the sandbox: a persona added after the sandbox
+        // was created (its uploads are fixed at start). Fail plainly; never run with fewer
+        // skills or with another bot's.
+        if (error instanceof MissingSkillError) {
+          log("warn", "a skill of the role is not in this sandbox", {
+            task: task.id,
+            role: role.name,
+            skill: error.skill,
+          });
+          throw new PmFacingError(SKILLS_NOT_INSTALLED, { cause: error });
+        }
+        throw error;
+      }
       const tracer = new TaskTracer((entry) => reporter.trace(entry), progress, toolKind);
       const result = await raceAbort(
-        agent.invoke({ messages: [new HumanMessage(task.text)] }, { signal, callbacks: [tracer], recursionLimit: maxSteps }),
+        agent.invoke({ messages: taskMessages(claim) }, { signal, callbacks: [tracer], recursionLimit: maxSteps }),
         signal,
       );
       const answer = finalAnswer(result.messages);

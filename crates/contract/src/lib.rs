@@ -7,10 +7,13 @@
 //! The formats are documented in `docs/contract.md`.
 
 pub mod bots;
+pub mod cite;
 pub mod frontmatter;
 pub mod lint;
 pub mod model;
 pub mod onboarding;
+pub mod permissions;
+pub mod personas;
 pub mod text;
 
 pub use lint::{lint, Diagnostic, LintOptions, Report, Severity};

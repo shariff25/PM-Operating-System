@@ -12,8 +12,8 @@ evals/
   config.yaml                         runner defaults, decline phrases, load-test targets
   taxonomy.yaml                       second-level failure tags under the five bottlenecks
   case-card.md                        the template for turning a real case into a task
-  categories/<name>/category.yaml     {name, bot, level?, pass_bar?, repeats?, description}
-  categories/<name>/tasks/<id>.yaml   {id, ask, expect, cluster?, regression?, tags?}
+  categories/<name>/category.yaml     {name, bot, level?, persona?, pass_bar?, repeats?, description}
+  categories/<name>/tasks/<id>.yaml   {id, ask, expect | thread, cluster?, regression?, tags?}
   judges/<name>.yaml                  an LLM judge
   judges/<name>.labels.jsonl          its labels (empty: none yet)
   judges/<name>.calibration.json      written by `pmos-evals judge calibrate`
@@ -53,8 +53,10 @@ client `evals`. For each task, `repeats` times, it:
 - **The trace token.** Only client `console` may read traces (§3). Pass a console token as
   `--trace-token` so failures are tagged from the trace. Without one, tagging uses the task's
   status, error and events only, and the report says how many failures were tagged that way.
-- **Who asks.** A team bot serves team members only, so the `--as` handle must be in
-  `content/team.yaml`. The runtime also lets the `evals` token request tasks only as the
+- **Who asks.** The runtime lets only active users who may ask bots (`pm`, `reviewer` or
+  `admin`) ask, from the tool server's user database (slice U4a), so the `--as` handle must
+  be a user there; the eval stack seeds `evals` into it from a seed file beside its copy of
+  the content (`PMOS_USERS_SEED`). The runtime also lets the `evals` token request tasks only as the
   handles in its own `PMOS_EVALS_AS` (default `evals`; anything else is `403`), so a leaked
   benchmark token can't run a PM's bots as them. Add a member for the benchmarks (`evals`,
   as the eval stack does), or, for a run as a real PM, list their handle in the runtime's
@@ -245,6 +247,61 @@ expect:
 - curly apostrophes become straight ones ("don’t" matches "don't");
 - thousands separators between digits are dropped ("1,800" matches "1800");
 - runs of whitespace become one space.
+
+### Threads
+A real PM talks to the bot in a conversation: the bot asks "Who is the user?", the PM answers
+"customer", and the bot must read that as the answer. A task with a `thread` tests this. It has
+`thread`, an ordered list of turns, in place of `ask` and `expect`:
+
+```yaml
+id: thread-one-word-answer-is-an-answer
+thread:
+  - ask: "Write a PRD for adding a dark mode to the Acme Vault console."
+    expect: {approvals: 0, must_include: ["?"]}      # the bot asks first
+  - ask: "customer"
+    expect: {must_not_include: ["who is the user"]}  # and takes this as the answer
+  - ask: "Now draft it."                             # no expect: it only has to settle
+```
+
+- **One or the other.** A task has `ask` and `expect`, or `thread`, never both; `check` says
+  so. A thread has at least two turns, at least one with an `expect`, and no top-level
+  `expect`. Each turn's `expect` is the same as a single task's (every check in **Grading**,
+  drafts included) and is validated the same way, with the turn's number in the message.
+- **What the runner does.** For each attempt it makes a fresh conversation id
+  (`eval-<task id>-r<run>-<time>-<n>`) and creates each turn as its own runtime task with that
+  `conversation`, starting a turn when the one before has settled. It polls, reads drafts and
+  grades each turn with an `expect`, exactly as it does a single task. The thread passes only
+  if every graded turn passes. A turn without an `expect` has to settle and nothing more. A
+  graded turn that fails doesn't stop the thread: the turns after it are still informative.
+- **Timeouts are per turn:** `--timeout-secs` is how long each turn may take, not the thread.
+  A turn that doesn't settle (a timeout, or the runtime failing) ends the thread there: the
+  turns after it would be asked without their context, so they are recorded as "not run".
+- **Repeats** re-run the whole thread, each with a new conversation id, so one run's answers
+  never become the next run's history.
+- **Judges** are asked about the last turn only, shown the earlier asks (not the replies) and
+  the last ask and answer.
+- **The load test** uses a thread task's first turn.
+- **In the report,** a thread attempt is one line, so the pass rate, pass^k and the gate count
+  it once. Its Why column and its failure details start "turn 2:", and the failure's tag
+  reason starts "turn 2 of 3:". A **Threads** section lists every turn of every thread
+  attempt as pass, FAIL, not graded or not run, with its status, time and failed checks. In
+  the `.json`, each thread line has `turns` and `failed_turn`; single tasks have neither.
+- **Tags:** the tag is that of the first failed turn, by the rules in **Failure tags**. A bot
+  that loses the thread usually answers the follow-up as a new request, which is a `model`
+  failure (`model/forbidden-text` or `model/missing-fact`, from the failed check). Tag the
+  task `memory/lost-the-thread` to say what it is there to catch.
+
+**What the runtime must allow.** The runner sends `conversation` on `POST /v1/tasks` and
+expects the runtime to give each turn the earlier turns of that conversation as `history`
+(`docs/bot-runtime-spec.md`, Conversations). The runtime does: the `evals` client may name a
+task's `conversation`, and an eval task that names one gets its earlier turns as history (an
+eval task without one starts fresh). The `evals` client's other limits still hold: the task is
+for a handle in `PMOS_EVALS_AS`, names no Slack target, and sends no notifications. A runtime
+from before this refuses a thread's first turn (`403`, "only the web and Slack clients name a
+task's conversation"); the thread then fails at turn 1 tagged `harness/runtime-unreachable`,
+and the report's reason says why. The thread tasks in `pm-craft` are not `regression: true`
+yet: the gate doesn't fail a change that leaves them failing, and they count in the category's
+pass rate like any task. Mark them once they pass.
 
 ### Failure tags
 Every failure gets exactly one tag. The rules run in this order, and the first match wins.
@@ -557,6 +614,9 @@ So queue time can be over-counted by up to one poll interval when a task has no 
    pass_bar: 0.8         # optional: fraction of attempts that must pass, 0 to 1;
                          # leave it out until the tasks are real, and the category reports only
    repeats: 3            # optional: runs per task (default 1)
+   persona: chief        # optional, with `bot: personal` only: the marketplace bot every
+                         # task asks (sent as the task's `persona`); `pmos-evals check` refuses
+                         # a key that isn't an offered persona in --content; `nudge` sends none
    description: What the category covers and where its answers come from.
    ```
 3. **Write one file per task, `tasks/<id>.yaml`.** The `id` must match the file name. Real
@@ -583,6 +643,8 @@ So queue time can be over-counted by up to one poll interval when a task has no 
    - `must_decline: true`: the sources don't answer it, and the bot must say so. No
      `must_cite`.
    - `drafts`: checks on the drafts, one entry per tool (see **Grading**).
+   - `thread`: in place of `ask` and `expect`, a conversation of turns, each `{ask, expect?}`
+     (see **Threads**).
    - `cluster`: give tasks that share a source one cluster, so the standard error counts them
      as related.
    - `regression`: mark a task that broke once and was fixed.
@@ -596,12 +658,29 @@ So queue time can be over-counted by up to one poll interval when a task has no 
 6. **Launch it.** Add it to the weekly run, and to the runs after model and harness changes.
    It launches once `history` says the bar was met two weeks in a row.
 
+### Categories and bars
+Every category has a `pass_bar` and `repeats`. Each bar is a starting value: the docs give a
+number only as the 80% example, so tighten each one after the category's first valid run.
+
+| Category | Bot | Tasks | `pass_bar` | `repeats` | Source of the numbers |
+| --- | --- | --- | --- | --- | --- |
+| `docs-qa` | `docs` | 4 | 0.8 | 3 | 80% example (`docs/evals.md`, "Adding a category" and `docs-qa`); pass^3 at the Phase 1 gate (`docs/research/self-improvement-loops.md`) |
+| `confluence-draft` | `personal` | 3 | 0.8 | 3 | Starting value; pass^3 as above |
+| `jira-draft` | `personal` | 4 | 0.8 | 3 | Starting value; pass^3 as above |
+| `slack-reply` | `personal` | 9 | 0.8 | 3 | Starting value; reads below the bar until a skill declares `slack.read_thread` and `slack.post_reply` |
+| `pm-craft` | `personal` | 23 | 0.8 | 3 | Starting value; pass^3 as above |
+| `staff-craft` | `personal` (`level: staff`) | 8 | 0.8 | 3 | Starting value; pass^3 as above |
+| `principal-craft` | `personal` (`level: principal`) | 8 | 0.8 | 3 | Starting value; pass^3 as above |
+| `chief` | `personal` (`persona: chief`) | 7 | 0.7 | 3 | Starting value (`docs/bot-marketplace-spec.md` §10); no run yet |
+| `sprout` | `personal` (`persona: sprout`) | 8 | 0.7 | 3 | Starting value (§10); no run yet |
+| `echo` | `personal` (`persona: echo`) | 7 | 0.7 | 3 | Starting value (§10); no run yet |
+
 ### `docs-qa`
 A template category for the Docs bot. PM OS can't ship real questions, because every team's
 docs site is different (`PMOS_DOCS_BASE_URL`, `docs/docs-server.md`). So a team writes its own
 questions against its own docs; `evals/categories/docs-qa/README.md` walks through it. Each
-task runs three times (`repeats: 3`). It has no bar (`pass_bar` unset, so it only reports)
-until your team writes its own questions; then set one, such as 80% of attempts.
+task runs three times (`repeats: 3`). Its bar is 80% of attempts (`pass_bar: 0.8`), a starting value to tighten once your team
+writes its own questions and has a first valid run.
 
 **The example tasks** ask about Acme Vault, a fictional product, and are answered by the fake
 docs fixtures (`https://docs.example.com/docs/vault-saml-sso` and `…/vault-key-rotation`), so
@@ -626,8 +705,8 @@ to answer. The judge `faithful-to-cited-page` applies to the category, advisory 
 labels.
 
 ### The seed categories: `jira-draft`, `confluence-draft`, `slack-reply`
-Three tasks each (four for `jira-draft`, which also checks that an issue already in Jira is
-not recreated) for `bot: personal`, against the fake connectors' fixtures
+Three tasks for `confluence-draft`, four for `jira-draft` (which also checks that an issue already in Jira is
+not recreated) and nine for `slack-reply` (the seed thread plus the triage and tagged tasks) for `bot: personal`, against the fake connectors' fixtures
 (`crates/toolserver/src/connectors/fake.rs`): Jira project PM (epic PM-101, story PM-102, bug
 PM-103 with a planted prompt injection), Confluence space PM (pages 9001 and 9002), and the
 `#field-questions` thread (channel C0FIELD, ts 1731500000.000100). Every task has `drafts:`
@@ -636,7 +715,8 @@ asks for.
 
 - **Marked "seed: replace with case cards".** Replace them with real cases as case cards
   come in.
-- **No `pass_bar`:** they report only until real case cards exist.
+- **`pass_bar: 0.8` and `repeats: 3`:** starting values. The docs give no launch number for
+  these categories, so tighten each bar after the first valid run against real case cards.
 - **`slack-reply` measures a gap.** The `pm-assistant` role's skills don't declare
   `slack.read_thread` or `slack.post_reply` yet, so its tasks fail (as
   `model/wrong-draft-count`) until a skill does.
@@ -646,8 +726,8 @@ asks for.
 ### `pm-craft`
 The senior-PM bar (`docs/pm-craft.md`; the spec is §6 of `docs/pm-craft-spec.md`). Twenty-three
 seed tasks for `bot: personal`, on the same fake fixtures as the seed categories plus the fake
-docs pages. Like them, it is marked "seed: replace with case cards", has no `pass_bar` and
-runs each task once.
+docs pages. Like them, it is marked "seed: replace with case cards", has the starting bar
+(`pass_bar: 0.8`) and runs each task three times (`repeats: 3`).
 
 | Tasks | The ask | What is checked |
 | --- | --- | --- |
@@ -657,6 +737,7 @@ runs each task once.
 | `numbers-sample-size-from-tool` | An experiment plan for a 10% baseline and a 10% relative lift, with the defaults | The draft has the per-arm sample size `stats.sample_size` returns |
 | `ai-spec-failure-modes-and-evaluation` | An AI feature spec | The draft has "Failure modes" and "Evaluation" |
 | `review-prd-by-severity` | A review of fixture page 9002 | No draft or page update; the answer names a "blocker" and ends with the "three changes" that matter most |
+| `thread-*` (3) | A conversation of two turns (see **Threads**): a one-word answer to the bot's own question; "generate the content" after a request about page 9001; a follow-up that changes one detail of a Jira story | The second turn continues the first: no repeated question, the draft is of page 9001, the story is a Task and keeps project, epic and subject. Not `regression: true` until they pass |
 
 - **The headings are the contract.** Each `must_include` heading is written exactly as §1 of
   `docs/pm-craft-spec.md` lists it, and as the template in `content/templates/` has it. Change
@@ -687,7 +768,7 @@ runs each task once.
 The Staff and Principal bars (`docs/levels.md`; the spec is §6 of
 `docs/staff-principal-spec.md`). Eight seed tasks each, for `bot: personal`, on the same fake
 fixtures as `pm-craft` plus the rollup's. Like the others they are marked "seed: replace with
-case cards", have no `pass_bar` and run each task once.
+case cards", have the starting bar (`pass_bar: 0.8`) and run each task three times (`repeats: 3`).
 
 - **`level` in `category.yaml`** is optional: `senior`, `staff` or `principal`. The runner
   sends it as the `level` of each task it creates (`POST /v1/tasks`, client `evals` only), so
@@ -741,7 +822,9 @@ case cards", have no `pass_bar` and run each task once.
 **The eval stack.** Benchmarks run against their own short-lived copy of the services
 (`deploy/compose.evals.yaml`), never against what PMs use. It has:
 - a tool server, runtime and the Docs and `pm-evals` workers, on a checkout's content;
-- the member `evals` added to that copy of `team.yaml`;
+- the user `evals` (with `ben`, `cy` and `eval-admin`) in its in-memory user database, from a
+  seed file written beside that copy of the content, never in it, and a personal bot for each
+  (`pmos bot add-personal`);
 - fake Jira, Confluence, Slack and docs fixtures. To benchmark your own docs site, set
   `PMOS_EVAL_DOCS_URL=http://docs.pmos.internal:8730/mcp` in `deploy/.env`, and the eval
   tool server reads the main stack's docs index, read-only;
@@ -792,7 +875,8 @@ because the load test measures the stack PMs use.
   labelled defaults. Latency isn't a priority, so they're informational unless
   `--enforce-targets` is passed.
 - **Who evals run as:** the spec doesn't name an identity for eval tasks. `requested_by` is a
-  config default (`evals`), so that handle has to be in `team.yaml`, or `--as` must name a PM.
+  config default (`evals`), so that handle has to be a user in the user database, or `--as`
+  must name a PM.
   For `bot: personal` categories that member also needs a personal bot.
 - **The clustered standard error** falls back to the binomial when every cluster holds one
   *attempt*, not one *task*: with repeats, each task's attempts are a cluster, and treating

@@ -3,8 +3,9 @@
 runner:
   # The bot runtime (pmos-bots). Overridden by --bots-url or PMOS_BOTS_URL.
   bots_url: http://127.0.0.1:8750
-  # Who the eval tasks are for (`requested_by`). Team bots serve team members only, so this
-  # handle must be in content/team.yaml. Overridden by --as or PMOS_EVALS_AS.
+  # Who the eval tasks are for (`requested_by`). Team bots serve active PM OS users only, so
+  # this handle must be one in the user database (the eval stack seeds it, `pm` only).
+  # Overridden by --as or PMOS_EVALS_AS.
   requested_by: evals
   # How often a task is polled, and how long one task may take before it is graded as timed out.
   poll_ms: 2000

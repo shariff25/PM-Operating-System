@@ -118,6 +118,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.2.17",
+ "password-hash",
+ "zeroize",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -156,6 +169,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "048006790404103c488e6c5616b3e7e702a71292aadda08e8f7698a9e0d2eb53"
 dependencies = [
  "aws-lc-sys",
+ "untrusted 0.7.1",
  "zeroize",
 ]
 
@@ -240,12 +254,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
+name = "base64ct"
+version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -1427,6 +1456,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "10.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "signature",
+ "zeroize",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1607,6 +1652,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
 name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1656,9 +1712,23 @@ dependencies = [
  "chrono",
  "clap",
  "pmos-contract",
+ "pmos-evals",
  "pmos-policy",
  "serde_json",
- "serde_norway",
+ "tempfile",
+]
+
+[[package]]
+name = "pmos-assertion"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.3.4",
+ "hmac 0.12.1",
+ "pmos-contract",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror",
 ]
 
 [[package]]
@@ -1671,7 +1741,9 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "croner",
+ "pmos-assertion",
  "pmos-contract",
+ "pmos-directory",
  "pmos-runtime",
  "reqwest",
  "serde",
@@ -1696,7 +1768,9 @@ dependencies = [
  "chrono",
  "futures-util",
  "hmac 0.12.1",
+ "pmos-assertion",
  "pmos-contract",
+ "pmos-directory",
  "pmos-runtime",
  "pmos-toolserver",
  "reqwest",
@@ -1717,10 +1791,27 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "serde",
+ "serde_json",
  "serde_norway",
  "tempfile",
  "thiserror",
  "walkdir",
+]
+
+[[package]]
+name = "pmos-directory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "pmos-contract",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -1746,6 +1837,24 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "pmos-entra"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "jsonwebtoken",
+ "pmos-contract",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1794,10 +1903,13 @@ name = "pmos-policy"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "getrandom 0.3.4",
  "pmos-contract",
  "serde",
  "serde_json",
  "serde_norway",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
  "tempfile",
  "walkdir",
 ]
@@ -1806,6 +1918,7 @@ dependencies = [
 name = "pmos-runtime"
 version = "0.1.0"
 dependencies = [
+ "sha2 0.10.9",
  "subtle",
  "tokio",
 ]
@@ -1821,6 +1934,7 @@ dependencies = [
  "chrono-tz",
  "futures-util",
  "pmos-contract",
+ "pmos-directory",
  "pmos-runtime",
  "pmos-toolserver",
  "reqwest",
@@ -1838,27 +1952,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmos-stack-tests"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "pmos-assertion",
+ "pmos-bots",
+ "pmos-console",
+ "pmos-contract",
+ "pmos-slack",
+ "pmos-toolserver",
+ "pmos-web",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "walkdir",
+]
+
+[[package]]
 name = "pmos-toolserver"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "argon2",
  "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
+ "clap",
+ "getrandom 0.3.4",
  "hmac 0.12.1",
+ "pmos-assertion",
+ "pmos-bots",
  "pmos-contract",
  "pmos-docs",
+ "pmos-entra",
  "pmos-policy",
  "pmos-runtime",
+ "pmos-toolserver",
  "pulldown-cmark",
  "reqwest",
  "rmcp",
  "serde",
  "serde_json",
+ "serde_norway",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "sqlx",
+ "subtle",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1866,6 +2011,41 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "walkdir",
+ "zeroize",
+]
+
+[[package]]
+name = "pmos-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "getrandom 0.3.4",
+ "hmac 0.12.1",
+ "jsonwebtoken",
+ "pmos-assertion",
+ "pmos-contract",
+ "pmos-directory",
+ "pmos-entra",
+ "pmos-policy",
+ "pmos-runtime",
+ "pmos-toolserver",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "walkdir",
 ]
 
@@ -2168,7 +2348,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
  "libc",
- "untrusted",
+ "untrusted 0.9.0",
  "windows-sys 0.52.0",
 ]
 
@@ -2321,7 +2501,7 @@ dependencies = [
  "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted",
+ "untrusted 0.9.0",
 ]
 
 [[package]]
@@ -2572,6 +2752,15 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "signature"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
+dependencies = [
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -3297,6 +3486,12 @@ checksum = "b39abd59bf32521c7f2301b52d05a6a2c975b6003521cbd0c6dc1582f0a22104"
 
 [[package]]
 name = "untrusted"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
+
+[[package]]
+name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
@@ -3742,6 +3937,20 @@ name = "zeroize"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "zerotrie"

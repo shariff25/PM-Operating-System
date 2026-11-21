@@ -127,6 +127,9 @@ export async function startFakeRuntime(options: {
   };
 }
 
+/** The `ref` the fake `docs_search` gives its result. */
+export const FAKE_DOCS_REF = "src-3f9a1c";
+
 export interface FakeMcp {
   url: string;
   calls: { name: string; args: unknown; authorization?: string }[];
@@ -161,6 +164,8 @@ export async function startFakeMcp(options: { searchDelayMs?: number } = {}): Pr
         }
         return structured({
           untrusted: true,
+          // Like the tool server: the ref a draft's source marker names this item by.
+          ref: FAKE_DOCS_REF,
           source: "docs",
           content: [{ url: "https://docs.example.com/docs/ports", title: `Ports (${query})` }],
         });
@@ -226,8 +231,14 @@ export interface FakeGateway {
   close(): Promise<void>;
 }
 
-/** An OpenAI-compatible `/v1/chat/completions` that always answers `answer`. */
-export async function startFakeGateway(answer: string): Promise<FakeGateway> {
+/**
+ * An OpenAI-compatible `/v1/chat/completions` that always answers `answer`, or, with `fail`,
+ * always answers that status with the gateway's `X-Pmos-Upstream-Attempts` header.
+ */
+export async function startFakeGateway(
+  answer: string,
+  fail?: { status: number; upstreamAttempts: number },
+): Promise<FakeGateway> {
   const requests: Recorded[] = [];
   const server = createServer(async (req, res) => {
     const recorded: Recorded = {
@@ -237,6 +248,15 @@ export async function startFakeGateway(answer: string): Promise<FakeGateway> {
       body: await readBody(req),
     };
     requests.push(recorded);
+    if (fail) {
+      res
+        .writeHead(fail.status, {
+          "content-type": "application/json",
+          "x-pmos-upstream-attempts": String(fail.upstreamAttempts),
+        })
+        .end(JSON.stringify({ error: { message: "busy", type: "server_error" } }));
+      return;
+    }
     if (recorded.path !== "/v1/chat/completions") {
       json(res, 404, { error: { message: "not found" } });
       return;

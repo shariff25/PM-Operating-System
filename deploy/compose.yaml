@@ -3,6 +3,9 @@
 #   deploy/pmos-admin up              core services (Postgres, docs, tool server, gateway, bots, Slack)
 #   deploy/pmos-admin up --models     plus the two vLLM model servers on the GPU
 #   deploy/pmos-admin up --console    plus the console
+#   deploy/pmos-admin up --web        plus the web app (OFF by default; needs Entra sign-in, or
+#                                     development sign-in on a closed test network only:
+#                                     docs/web-app-running.md)
 #
 # Settings come from deploy/.env (made by deploy/setup.sh, never committed). The live-mode
 # settings for Atlassian, Slack OAuth and GitHub come from deploy/live.env.
@@ -92,14 +95,38 @@ services:
       PMOS_DATABASE_URL: postgresql://pmos_toolserver:${PMOS_DB_TOOLSERVER_PASSWORD}@postgres/pmos_toolserver
       PMOS_SERVICE_TOKEN: ${PMOS_SERVICE_TOKEN:?}
       PMOS_BOT_TOKEN: ${PMOS_BOT_TOKEN:?}
-      # The console's read-only token: it may read approvals and nothing else.
+      # The web app's own token: the approvals routes and the read-only admin routes. Optional:
+      # blank, the tool server has no web client.
+      PMOS_WEB_TOKEN: ${PMOS_TS_WEB_TOKEN:-}
+      # The console's read-only token: it may read approvals and nothing else. Optional.
       PMOS_CONSOLE_TS_TOKEN: ${PMOS_CONSOLE_TS_TOKEN:-}
+      # User assertions from the web app and the console (docs/user-assertion.md). With either
+      # token above set, the tool server runs in `require` (blank means that) and refuses to
+      # start in `off` or `verify`. The development override (PMOS_ASSERTION_INSECURE_OFF) is
+      # deliberately not passed here: it is for fake-data development stacks only, and the
+      # service refuses it with live connectors or a database anyway.
+      # Each set token needs its key; a key is passed only when it is set.
+      PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}
+      PMOS_ASSERTION_KEYS: "${PMOS_AK_WEB_TOOLSERVER:+web:toolserver:${PMOS_AK_WEB_TOOLSERVER},}${PMOS_AK_CONSOLE_TOOLSERVER:+console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER}}"
+      # The first Microsoft sign-in (docs/entra-sign-in.md): the tool server validates the ID
+      # token the web app forwards itself, for the same tenant and application as the web app,
+      # so it gets the web app's settings (never the client secret, which it doesn't need). It
+      # fetches the tenant's keys from Microsoft through the proxy above. Blank: a first link
+      # answers 501 and the web app's /readyz reports `entra_link: down`.
+      PMOS_ENTRA_TENANT_ID: ${PMOS_WEB_ENTRA_TENANT_ID:-}
+      PMOS_ENTRA_CLIENT_ID: ${PMOS_WEB_ENTRA_CLIENT_ID:-}
+      PMOS_ENTRA_AUTHORITY: ${PMOS_WEB_ENTRA_AUTHORITY:-}
       PMOS_VAULT_KEY: ${PMOS_VAULT_KEY:?}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
       PMOS_DOCS_URL: http://docs.pmos.internal:8730/mcp
       PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN}
       PMOS_LEDGER_EXPIRE_DAYS: ${PMOS_LEDGER_EXPIRE_DAYS:-7}
+      # Audit events older than this are deleted daily (docs/audit-retention.md). 90 or more;
+      # the tool server refuses to start with less.
+      PMOS_AUDIT_RETENTION_DAYS: ${PMOS_AUDIT_RETENTION_DAYS:-90}
+      # Deactivations the web app and Slack may make in an hour (1 to 10); past it, host only.
+      PMOS_USERS_DEACTIVATIONS_PER_HOUR: ${PMOS_USERS_DEACTIVATIONS_PER_HOUR:-3}
     volumes:
       # The content checkout: the tool server pulls it (content sync), the others read it.
       - ${PMOS_CONTENT_CHECKOUT:?}:/srv/content-repo
@@ -142,12 +169,18 @@ services:
     environment:
       PMOS_BOTS_BIND: 0.0.0.0:8750
       PMOS_BOTS_DATABASE_URL: postgresql://pmos_bots:${PMOS_DB_BOTS_PASSWORD}@postgres/pmos_bots
-      PMOS_BOTS_TOKENS: slack=${PMOS_RT_SLACK_TOKEN:?},console=${PMOS_RT_CONSOLE_TOKEN:?},evals=${PMOS_RT_EVALS_TOKEN:?},worker-docs=${PMOS_RT_DOCS_WORKER_TOKEN:?},${PMOS_RT_WORKER_TOKENS:-}
+      # The console's and the web app's tokens are listed only when set.
+      PMOS_BOTS_TOKENS: "slack=${PMOS_RT_SLACK_TOKEN:?},${PMOS_RT_CONSOLE_TOKEN:+console=${PMOS_RT_CONSOLE_TOKEN},}${PMOS_RT_WEB_TOKEN:+web=${PMOS_RT_WEB_TOKEN},}evals=${PMOS_RT_EVALS_TOKEN:?},worker-docs=${PMOS_RT_DOCS_WORKER_TOKEN:?},${PMOS_RT_WORKER_TOKENS:-}"
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
       PMOS_SERVICE_TOKEN: ${PMOS_SERVICE_TOKEN}
       PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
       PMOS_GATEWAY_TOKEN: ${PMOS_GW_RUNTIME_TOKEN}
+      # User assertions from the web app and the console (docs/user-assertion.md), as for the
+      # tool server: `require` whenever either is in PMOS_BOTS_TOKENS. No development override
+      # here either (PMOS_ASSERTION_INSECURE_OFF is never passed in production).
+      PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}
+      PMOS_ASSERTION_KEYS: "${PMOS_AK_WEB_BOTS:+web:bots:${PMOS_AK_WEB_BOTS},}${PMOS_AK_CONSOLE_BOTS:+console:bots:${PMOS_AK_CONSOLE_BOTS}}"
       # The handles the evals client may request tasks as (empty: `evals`).
       PMOS_EVALS_AS: ${PMOS_EVALS_AS:-}
     volumes:
@@ -175,10 +208,19 @@ services:
       PMOS_SLACK_STATE_DIR: /var/lib/pmos/slack
       PMOS_DEFAULT_TZ: ${PMOS_DEFAULT_TZ:-America/Los_Angeles}
       PMOS_GITHUB_ORG: ${PMOS_GITHUB_ORG:-}
+      # The first-time flow and the nudges (deploy/env.example): on unless set to 0.
+      PMOS_ONBOARDING_V2: ${PMOS_ONBOARDING_V2:-1}
+      PMOS_NUDGES: ${PMOS_NUDGES:-1}
+      PMOS_NUDGES_HOURS: ${PMOS_NUDGES_HOURS:-}
       # The daily triage digest to each bot's quality owner (docs/runbooks/quality.md).
       PMOS_TRIAGE_AT: ${PMOS_TRIAGE_AT:-09:00}
       PMOS_TRIAGE_MIN_EDIT: ${PMOS_TRIAGE_MIN_EDIT:-0.3}
       PMOS_CONSOLE_PUBLIC_URL: ${PMOS_CONSOLE_PUBLIC_URL:-}
+      # The web app's https:// address, for the "Open in workspace" button. Blank: no button.
+      PMOS_WEB_PUBLIC_URL: ${PMOS_WEB_PUBLIC_URL:-}
+      # Each daily brief also goes to the web app's home page; blank URL: off.
+      PMOS_WEB_URL: ${PMOS_WEB_BRIEF_URL:-}
+      PMOS_WEB_BRIEF_TOKEN: ${PMOS_WEB_BRIEF_TOKEN:-}
     volumes:
       - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
       - ${PMOS_STATE_DIR}/slack:/var/lib/pmos/slack
@@ -187,6 +229,17 @@ services:
       bots: { condition: service_healthy }
     profiles: [slack]
 
+  # The console (profile `console`). It holds its own tool server token (the approvals routes
+  # only), a runtime token that reads everything, and the keys that sign its user assertions,
+  # and it believes X-Forwarded-User. So:
+  # - The port is published on the host's 127.0.0.1 only; the reverse proxy on the host reaches
+  #   it there. Never publish it on another address.
+  # - It still listens on 0.0.0.0 inside its container (published ports need that), so every
+  #   container on the shared `pmos` network can reach console:8760, including the bring-up
+  #   worker. That is why the user header counts only with PMOS_CONSOLE_PROXY_SECRET in
+  #   X-Pmos-Proxy-Secret, and why PMOS_CONSOLE_DEV_USER is refused here (it needs a loopback
+  #   bind). Fully separating it would take its own network shared only with `bots` and
+  #   `toolserver` (docs/console.md, "What this does not fix").
   console:
     <<: *service
     command: ["pmos-console"]
@@ -194,26 +247,98 @@ services:
     environment:
       PMOS_CONSOLE_BIND: 0.0.0.0:8760
       PMOS_BOTS_URL: http://bots.pmos.internal:8750
-      PMOS_BOTS_TOKEN: ${PMOS_RT_CONSOLE_TOKEN}
+      PMOS_BOTS_TOKEN: ${PMOS_RT_CONSOLE_TOKEN:-}
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
       # Its own read-only tool-server token, never the service token.
       PMOS_TOOLSERVER_TOKEN: ${PMOS_CONSOLE_TS_TOKEN:-}
-      PMOS_CONTENT_ROOT: /srv/content-repo/content
+      PMOS_ASSERTION_KEYS: console:bots:${PMOS_AK_CONSOLE_BOTS:-},console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER:-}
+      # Who may use the console comes from the user database, through the tool server's
+      # `resolve` route with PMOS_TOOLSERVER_TOKEN; the console reads no content.
       PMOS_CONSOLE_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
       PMOS_CONSOLE_TRUST_PROXY: ${PMOS_CONSOLE_TRUST_PROXY:-0}
+      # Required with TRUST_PROXY=1: the console refuses to start without it, naming it.
+      # deploy/setup.sh generates it; the reverse proxy sends it on every request.
       PMOS_CONSOLE_PROXY_SECRET: ${PMOS_CONSOLE_PROXY_SECRET:-}
       PMOS_CONSOLE_DEV_USER: ${PMOS_CONSOLE_DEV_USER:-}
       PMOS_CONSOLE_PUBLIC_URL: ${PMOS_CONSOLE_PUBLIC_URL:-}
       PMOS_CONSOLE_SLACK_URL: ${PMOS_CONSOLE_SLACK_URL:-}
     volumes:
-      - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
       - ${PMOS_STATE_DIR}/audit:/var/lib/pmos/audit:ro
     depends_on:
       bots: { condition: service_healthy }
+      toolserver: { condition: service_healthy }
     healthcheck:
       <<: *health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8760/healthz"]
     profiles: [console]
+
+  # The web app (profile `web`), OFF by default. It signs people in with Entra ID when the
+  # PMOS_WEB_ENTRA_* settings and PMOS_WEB_PUBLIC_URL are all set (docs/entra-sign-in.md). Its
+  # other sign-in is DEVELOPMENT sign-in, where anyone who can reach the port signs in as any
+  # team member, behind the loudly named opt-in
+  # PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1, for a closed test network only
+  # (docs/web-app-running.md). Either way it holds the keys that sign user assertions for any
+  # team member (docs/user-assertion.md, "What this does and does not fix"). The port is
+  # published on 127.0.0.1 only: reach it through the reverse proxy (TLS; the session cookie is
+  # Secure) and never expose it directly.
+  web:
+    <<: *service
+    command: ["pmos-web"]
+    networks:
+      pmos: { aliases: [web.pmos.internal] }
+    ports: ["127.0.0.1:8770:8770"]
+    environment:
+      # Entra sign-in reaches login.microsoftonline.com through the Spark's proxy, if it has one.
+      <<: *proxy
+      PMOS_WEB_BIND: 0.0.0.0:8770
+      # pmos-web refuses to start with neither this at 1 nor Entra sign-in configured.
+      PMOS_WEB_DEV_LOGIN: ${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}
+      # Entra ID sign-in (docs/entra-sign-in.md): on when the tenant, the client id, the secret
+      # and PMOS_WEB_PUBLIC_URL are all set; some but not all refuses to start. Blank: off.
+      PMOS_WEB_ENTRA_TENANT_ID: ${PMOS_WEB_ENTRA_TENANT_ID:-}
+      PMOS_WEB_ENTRA_CLIENT_ID: ${PMOS_WEB_ENTRA_CLIENT_ID:-}
+      PMOS_WEB_ENTRA_CLIENT_SECRET: ${PMOS_WEB_ENTRA_CLIENT_SECRET:-}
+      PMOS_WEB_ENTRA_AUTHORITY: ${PMOS_WEB_ENTRA_AUTHORITY:-}
+      # Password sign-in with a required authenticator code (docs/password-sign-in.md): 1 turns
+      # it on, beside Entra or alone; the tool server decides (it seals secrets with
+      # PMOS_VAULT_KEY). pmos-web refuses it unless assertions are `require`, so it gets the
+      # mode from deploy/.env. It also refuses it unless PMOS_WEB_TRUSTED_PROXIES names the
+      # address the reverse proxy reaches it from, so the per-address limit counts browsers, not
+      # the proxy: a proxy on this host comes in through the published port, from the `pmos`
+      # network's gateway (PMOS_NETWORK_GATEWAY, pinned below; `pmos-admin up --web` checks
+      # it), and PMOS_WEB_PUBLIC_URL must be https://. A forwarded header from any other peer
+      # is refused and counted on /readyz. PMOS_WEB_DIRECT is never passed: it is for a
+      # loopback bind with no proxy.
+      PMOS_WEB_PASSWORD_LOGIN: ${PMOS_WEB_PASSWORD_LOGIN:-0}
+      PMOS_WEB_TRUSTED_PROXIES: ${PMOS_WEB_TRUSTED_PROXIES:-}
+      PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}
+      # Sessions, settings and follow-ups in Postgres: the kit's server, its own `pmos_web`
+      # database and role, which the operator creates (deploy/env.example). Blank: in memory,
+      # and a restart signs everyone out.
+      PMOS_WEB_DATABASE_URL: ${PMOS_WEB_DATABASE_URL:-}
+      PMOS_BOTS_URL: http://bots.pmos.internal:8750
+      PMOS_WEB_BOTS_TOKEN: ${PMOS_RT_WEB_TOKEN:-}
+      PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
+      # Its own tool server token (the approvals routes only), not the service token.
+      PMOS_WEB_TOOLSERVER_TOKEN: ${PMOS_TS_WEB_TOKEN:-}
+      PMOS_ASSERTION_KEYS: web:bots:${PMOS_AK_WEB_BOTS:-},web:toolserver:${PMOS_AK_WEB_TOOLSERVER:-}
+      PMOS_CONTENT_ROOT: /srv/content-repo/content
+      # The built app, baked into the image (deploy/Dockerfile).
+      PMOS_WEB_STATIC_DIR: /usr/share/pmos/web
+      PMOS_WEB_PUBLIC_URL: ${PMOS_WEB_PUBLIC_URL:-}
+      # The daily brief panels, filled by the Slack service with the shared token.
+      PMOS_WEB_BRIEF: ${PMOS_WEB_BRIEF:-0}
+      PMOS_WEB_BRIEF_TOKEN: ${PMOS_WEB_BRIEF_TOKEN:-}
+    volumes:
+      - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      bots: { condition: service_healthy }
+      toolserver: { condition: service_healthy }
+    healthcheck:
+      <<: *health
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8770/healthz"]
+    profiles: [web]
 
   # Bring-up only (profile `bringup`): the Docs bot's worker as a plain container, to check the
   # stack end to end before OpenShell is installed. It is NOT isolated; real workers run in
@@ -277,7 +402,18 @@ services:
       - --port=8000
 
 networks:
-  pmos: {}
+  # A fixed subnet and gateway (the re-check of eb24d28, M1), so the address the reverse proxy
+  # on this host reaches the web app from (the gateway) never moves when the network is made
+  # again, and PMOS_WEB_TRUSTED_PROXIES stays right. 10.201.77.0/24 is outside Docker's own
+  # default pools (172.17-172.31.0.0/16, 192.168.0.0/16), so Docker never gives it to another
+  # network; a site that already routes it sets both in deploy/.env (deploy/env.example).
+  # `deploy/pmos-admin up --web` checks the real gateway against these and against
+  # PMOS_WEB_TRUSTED_PROXIES, and refuses on a mismatch.
+  pmos:
+    ipam:
+      config:
+        - subnet: ${PMOS_NETWORK_SUBNET:-10.201.77.0/24}
+          gateway: ${PMOS_NETWORK_GATEWAY:-10.201.77.1}
 
 volumes:
   pgdata: {}

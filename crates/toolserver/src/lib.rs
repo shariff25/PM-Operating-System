@@ -8,6 +8,7 @@
 
 pub mod app;
 pub mod approvals;
+pub mod assertion;
 pub mod audit;
 pub mod bets;
 pub mod catalog;
@@ -24,15 +25,21 @@ pub mod memory;
 pub mod memory_repo;
 pub mod oauth;
 pub mod onboarding;
+pub mod password;
 pub mod pg;
+pub mod proposals;
+pub mod retention;
+pub mod reviews;
 pub mod schemas;
 pub mod service;
 pub mod session;
+pub mod sources;
 pub mod stats;
 pub mod store;
 pub mod team;
+pub mod users;
 pub mod vault;
 
-pub use app::{router, router_with, AppConfig};
+pub use app::{router, router_full, router_with, AppConfig, PersonClients};
 pub use service::ToolService;
 pub use store::Stores;

@@ -478,6 +478,37 @@ fn draft_text_checks() {
     );
 }
 
+/// Source markers are removed before any text check, as the tool server removes them before
+/// it writes: a marker never splits a phrase, and a check can't be met by one.
+#[test]
+fn draft_and_answer_text_is_checked_without_source_markers() {
+    assert_eq!(
+        draft_text(
+            &json!({"summary": "Require SAML [[src-3f9a1c]]", "description": "Per `[[src-3f9a1c]]` [[s2]]."})
+        ),
+        "Per `[[src-3f9a1c]]`.\nRequire SAML"
+    );
+    let mut check = jira_check();
+    check.must_include = vec!["Require SAML SSO".into()];
+    check.must_not_include = vec!["src-0b77d2".into()];
+    let t = drafts_task(vec![check]);
+    let o = with_drafts(vec![draft(
+        "apr_1",
+        "jira.create_issue",
+        json!({"project": "PM", "issue_type": "Story",
+               "summary": "Require SAML [[src-3f9a1c]] SSO [[src-0b77d2]]"}),
+    )]);
+    let g = grade(&t, &o);
+    assert!(g.passed(), "{:?}", g.failures);
+
+    let t = task(Expect {
+        must_include: vec!["ships in 4.2.".into()],
+        ..Expect::default()
+    });
+    let g = grade(&t, &done("SSO ships in 4.2 [[src-3f9a1c]]."));
+    assert!(g.passed(), "{:?}", g.failures);
+}
+
 #[test]
 fn unreadable_drafts_fail_the_drafts_checks() {
     let t = drafts_task(vec![jira_check()]);

@@ -1,0 +1,28 @@
+# `content/context/competitors/` is empty and no page names Globex Vault (a fictional
+# competitor; the fixtures' own company is Acme, so Acme can't be the competitor). Rubric: a
+# passing answer says it couldn't find anything on Globex Vault in the competitors context or
+# in Confluence, lists what it would need (their public product and pricing pages with the date
+# read, won and lost deal notes, or a competitors context file added by pull request), makes no
+# claim about the competitor, and drafts nothing (it may offer a page with our side only,
+# marked incomplete, and waits for a yes). Anything it says about us cites the docs, such as
+# https://docs.example.com/docs/vault-saml-sso. It fails with any claim about Globex Vault
+# (a feature, a price, a weakness), a battlecard draft, or a claim about us with no docs source.
+# This task is a hard gate (answered beyond sources).
+id: battlecard-no-competitor-context
+ask: "Build a battlecard against Globex Vault."
+expect:
+  must_decline: true
+  approvals: 0
+  must_not_include:
+    - "<think>"
+    - "Globex Vault supports"
+    - "Globex Vault offers"
+    - "Globex Vault charges"
+    - "Globex Vault is cheaper"
+    - "Globex Vault lacks"
+    - "$"
+  drafts:
+    - tool: confluence.create_draft
+      count: 0
+tags:
+  - model/answered-beyond-sources

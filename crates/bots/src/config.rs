@@ -3,6 +3,9 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::assertion::Assertions;
 
 /// The runtime's callers. The name in `PMOS_BOTS_TOKENS` decides what each may do (spec §3,
 /// Auth).
@@ -10,6 +13,8 @@ use std::path::PathBuf;
 pub enum ClientKind {
     /// The Slack app: acts for the PM in `X-Pmos-User`.
     Slack,
+    /// The web app's backend: the same per-PM abilities as Slack, but no notification feed.
+    Web,
     /// Harness workers, one per bot sandbox.
     Worker,
     /// The web console: reads everything, pauses routines, cancels tasks.
@@ -22,6 +27,7 @@ impl ClientKind {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "slack" => Some(Self::Slack),
+            "web" => Some(Self::Web),
             "worker" => Some(Self::Worker),
             "console" => Some(Self::Console),
             "evals" => Some(Self::Evals),
@@ -29,9 +35,15 @@ impl ClientKind {
         }
     }
 
+    /// Clients that act for the one PM named in `X-Pmos-User`.
+    pub fn is_pm(self) -> bool {
+        matches!(self, Self::Slack | Self::Web)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Slack => "slack",
+            Self::Web => "web",
             Self::Worker => "worker",
             Self::Console => "console",
             Self::Evals => "evals",
@@ -72,22 +84,27 @@ impl std::fmt::Debug for Secret {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// `PMOS_BOTS_TOKENS`: `name=token,…` with names `slack`, `worker`, `console`, `evals`.
+    /// `PMOS_BOTS_TOKENS`: `name=token,…` with names `slack`, `web`, `worker`, `console`, `evals`.
     pub clients: Vec<Client>,
     /// `PMOS_BOTS_DATABASE_URL`: required unless `PMOS_DEV=1` (in memory).
     pub database_url: Option<Secret>,
     /// `PMOS_BOTS_BIND`, default `127.0.0.1:8750`.
     pub bind: SocketAddr,
-    /// `PMOS_CONTENT_ROOT`, default `content`: bots, roles, skills, tools and `team.yaml`.
+    /// `PMOS_CONTENT_ROOT`, default `content`: bots, roles, skills and tools. Who may use
+    /// them comes from the tool server's user directory, not the content.
     pub content_root: PathBuf,
     /// `PMOS_TOOLSERVER_URL`, such as `http://127.0.0.1:8710`.
     pub toolserver_url: String,
-    /// `PMOS_SERVICE_TOKEN`: the tool server's orchestrator token.
+    /// `PMOS_SERVICE_TOKEN`: the tool server's orchestrator token (bot sessions, approval
+    /// items, and the user directory, `GET /internal/directory`).
     pub service_token: Secret,
     /// `PMOS_GATEWAY_URL`: the gateway's OpenAI base, such as `http://127.0.0.1:8740/v1`.
     pub gateway_url: String,
     /// `PMOS_GATEWAY_TOKEN`: this service's gateway client token.
     pub gateway_token: Secret,
+    /// `PMOS_ASSERTION_MODE` and `PMOS_ASSERTION_KEYS`: user assertions from the `web` and
+    /// `console` clients (`crate::assertion`). Off unless set.
+    pub assertions: Arc<Assertions>,
     /// `PMOS_EVALS_AS`: the handles the `evals` client may request tasks as, comma-separated.
     /// Empty or unset means [`DEFAULT_EVALS_AS`]: the benchmark member only.
     pub evals_as: Vec<String>,
@@ -129,6 +146,7 @@ impl Config {
                 .ok_or_else(|| format!("{k} is required"))
         };
         let clients = parse_clients(&need("PMOS_BOTS_TOKENS")?)?;
+        let assertions = Arc::new(Assertions::from_lookup(&get, &person_clients(&clients))?);
         let dev = get("PMOS_DEV").as_deref() == Some("1");
         let database_url = get("PMOS_BOTS_DATABASE_URL").filter(|u| !u.is_empty());
         if database_url.is_none() && !dev {
@@ -156,9 +174,27 @@ impl Config {
             service_token: Secret(need("PMOS_SERVICE_TOKEN")?),
             gateway_url: url("PMOS_GATEWAY_URL")?,
             gateway_token: Secret(need("PMOS_GATEWAY_TOKEN")?),
+            assertions,
             evals_as: parse_evals_as(get("PMOS_EVALS_AS").as_deref())?,
         })
     }
+}
+
+/// The configured clients that act for a person and must sign user assertions (`web`,
+/// `console`), as they appear in `PMOS_BOTS_TOKENS`. Any of them makes `require` the default
+/// assertion mode, and `off` or `verify` refuse to start without the development override
+/// (`pmos_assertion::receiver::secure_mode`).
+fn person_clients(clients: &[Client]) -> Vec<(&'static str, &'static str)> {
+    let mut out = Vec::new();
+    for (kind, name) in [
+        (ClientKind::Web, "PMOS_BOTS_TOKENS web="),
+        (ClientKind::Console, "PMOS_BOTS_TOKENS console="),
+    ] {
+        if clients.iter().any(|c| c.kind == kind) {
+            out.push((kind.as_str(), name));
+        }
+    }
+    out
 }
 
 /// `name=token,…`. Each name is a known client and appears once; tokens are at least 32
@@ -178,7 +214,7 @@ pub fn parse_clients(spec: &str) -> Result<Vec<Client>, String> {
             _ => (
                 ClientKind::parse(name).ok_or_else(|| {
                     format!(
-                        "PMOS_BOTS_TOKENS: unknown client `{name}`; the clients are slack, worker-<bot>, worker, console and evals"
+                        "PMOS_BOTS_TOKENS: unknown client `{name}`; the clients are slack, web, worker-<bot>, worker, console and evals"
                     )
                 })?,
                 None,
@@ -318,6 +354,62 @@ mod tests {
         assert!(!shown.contains("hunter2"));
         assert!(!shown.contains("service-token"));
         assert!(!shown.contains("gateway-token"));
+    }
+
+    #[test]
+    fn web_or_console_make_assertions_required() {
+        use crate::assertion::Mode;
+        let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let keys = format!("web:bots:k1:{key},console:bots:c1:{key}");
+        let run = |tokens: String, extra: &[(&str, &str)]| {
+            let owned = base(&tokens);
+            let mut pairs: Vec<(&str, &str)> =
+                owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            pairs.push(("PMOS_DEV", "1"));
+            pairs.extend_from_slice(extra);
+            cfg(&pairs)
+        };
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        // Slack and workers only: off by default, as before.
+        let ok = run(format!("slack={a},worker={b}"), &[]).unwrap();
+        assert_eq!(ok.assertions.mode(), Mode::Off);
+        for client in ["web", "console"] {
+            let tokens = format!("slack={a},{client}={b}");
+            // Required by default ...
+            let ok = run(tokens.clone(), &[("PMOS_ASSERTION_KEYS", &keys)]).unwrap();
+            assert_eq!(ok.assertions.mode(), Mode::Require);
+            // ... which needs keys ...
+            assert!(run(tokens.clone(), &[])
+                .unwrap_err()
+                .contains("PMOS_ASSERTION_KEYS"));
+            // ... and off or verify refuse to start, naming the client and the fix.
+            for mode in ["off", "verify"] {
+                let err = run(
+                    tokens.clone(),
+                    &[
+                        ("PMOS_ASSERTION_MODE", mode),
+                        ("PMOS_ASSERTION_KEYS", &keys),
+                    ],
+                )
+                .unwrap_err();
+                assert!(
+                    err.contains(&format!("{client}=")) && err.contains("INSECURE_OFF"),
+                    "{err}"
+                );
+                assert!(!err.contains(&b) && !err.contains(key), "{err}");
+            }
+            // Only the development override starts it insecurely, with a warning.
+            let dev = run(
+                tokens,
+                &[
+                    ("PMOS_ASSERTION_MODE", "off"),
+                    ("PMOS_ASSERTION_INSECURE_OFF", "1"),
+                ],
+            )
+            .unwrap();
+            assert_eq!(dev.assertions.mode(), Mode::Off);
+            assert!(dev.assertions.insecure_warning().is_some());
+        }
     }
 
     #[test]

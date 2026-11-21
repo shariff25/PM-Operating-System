@@ -8,7 +8,9 @@
 //!   card in the DM.
 //! - **Skills:** the member's level ("You're set to the *Staff* level …", left out when the
 //!   runtime doesn't answer), then the skills with the `slack` surface that the member's
-//!   personal bot's role lists (the Docs bot's without one), grouped by `track`.
+//!   personal bot's role lists (the Docs bot's without one): "Start here" with three suggested
+//!   skills, then the rest grouped by the job they do (`GROUPS`; a group over six skills has
+//!   **Show all in …**).
 //! - **Accounts:** Jira and Confluence, Slack and GitHub, each Connected (**Disconnect**) or
 //!   Not connected (**Connect**), and the memory repo.
 //!
@@ -36,13 +38,15 @@ use crate::cards;
 use crate::commands::FollowUp;
 use crate::member_cards::valid_repo;
 use crate::runtime::Runtime;
-use crate::toolserver::{approval_id_ok, ApiError, PROVIDERS};
+use crate::toolserver::{approval_id_ok, ApiError, Seen, PROVIDERS};
 
 /// Action ids in the Home, and the tick boxes' block-id prefix.
 pub mod action {
     pub const TAB_INBOX: &str = "home_tab_inbox";
     pub const TAB_SKILLS: &str = "home_tab_skills";
     pub const TAB_ACCOUNTS: &str = "home_tab_accounts";
+    /// "Show all in <group>": the value is the group's name.
+    pub const SKILLS_GROUP: &str = "home_skills_group";
     pub const APPROVE: &str = "home_approve";
     pub const REJECT: &str = "home_reject";
     pub const REFRESH: &str = "home_refresh";
@@ -72,19 +76,85 @@ const SKILL_LINE_MAX: usize = 150;
 /// How long the skills catalog is reused.
 const CATALOG_TTL: Duration = Duration::from_secs(60);
 
-/// The tracks in the order the Skills section shows them; any other track follows,
-/// alphabetically, then "Other".
-pub const TRACKS: [&str; 10] = [
-    "Everyday",
-    "Product sense",
-    "Strategy and decisions",
-    "Metrics and experiments",
-    "Spec and review",
-    "Customer and market",
-    "AI products",
-    "Delivery and launch",
-    "Leading across teams",
-    "Company bets",
+/// The groups the Skills section shows, in order, and the `track`s that land in each. A skill
+/// goes to the group of its `track`, unless `GROUP_OVERRIDES` names it. A skill with neither
+/// goes to `MORE`.
+pub const GROUPS: [(&str, &[&str]); 7] = [
+    ("Everyday", &["Everyday"]),
+    (
+        "Understand and decide",
+        &[
+            "Product sense",
+            "Customer and market",
+            "Strategy and decisions",
+        ],
+    ),
+    (
+        "Write a document",
+        &["Spec and review", "AI products", "Company bets"],
+    ),
+    (
+        "Plan and prioritise",
+        &["Metrics and experiments", "Leading across teams"],
+    ),
+    ("Launch", &["Delivery and launch"]),
+    ("Review and coach", &[]),
+    ("Communicate", &[]),
+];
+/// The group for skills that fit none of the above.
+pub const MORE: &str = "More";
+/// Skills whose job differs from their track's usual one.
+const GROUP_OVERRIDES: [(&str, &str); 11] = [
+    ("prioritize", "Plan and prioritise"),
+    ("pre-mortem", "Review and coach"),
+    ("review", "Review and coach"),
+    ("experiment-readout", "Review and coach"),
+    ("business-review", "Review and coach"),
+    ("coach-feedback", "Review and coach"),
+    ("status-update", "Communicate"),
+    ("exec-brief", "Communicate"),
+    ("alignment-plan", "Communicate"),
+    ("partner-brief", "Communicate"),
+    ("platform-strategy", "Plan and prioritise"),
+];
+/// How many skills a group lists before "Show all in <group>".
+const GROUP_PREVIEW: usize = 6;
+
+/// "Start here": the skills a new PM gets the most from, in the order they are offered, with
+/// what you get and what to type. The first three that are in the PM's catalog are shown, so
+/// the later ones are stand-ins when an earlier one is missing. The rule: work almost every
+/// PM does in their first week. Edit this list to change the suggestions.
+pub const START_HERE: [(&str, &str, &str); 6] = [
+    (
+        "ask",
+        "A sourced answer to a question about our products, customers or past decisions.",
+        "ask: what did we decide about pricing for small teams?",
+    ),
+    (
+        "meeting-notes",
+        "Decisions, owners and follow-ups from a call, ready for you to approve.",
+        "meeting-notes: the notes from today's customer call",
+    ),
+    (
+        "status-update",
+        "A one-page update for stakeholders, drawn from Jira and Confluence.",
+        "status-update: this week for the checkout project",
+    ),
+    (
+        "prd-draft",
+        "A first draft of a PRD from your brief, with sources.",
+        "prd-draft: bulk export for admins",
+    ),
+    (
+        "problem-framing",
+        "A clear problem statement before anyone picks a solution.",
+        "problem-framing: customers keep asking for dark mode",
+    ),
+    (
+        "slack-reply",
+        "Draft replies to the questions waiting for you in Slack.",
+        "slack-reply: catch me up on what I missed",
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +196,8 @@ impl Tab {
 pub struct Home {
     viewers: Mutex<Bounded<String, Tab>>,
     catalog: Mutex<Option<(Instant, Vec<Skill>)>>,
+    /// The Skills group a viewer opened with "Show all in …", by Slack user id.
+    expanded: Mutex<Bounded<String, String>>,
 }
 
 impl Default for Home {
@@ -133,6 +205,7 @@ impl Default for Home {
         Self {
             viewers: Mutex::new(Bounded::new(2000)),
             catalog: Mutex::new(None),
+            expanded: Mutex::new(Bounded::new(2000)),
         }
     }
 }
@@ -201,12 +274,13 @@ pub fn view(tab: Tab, notice: Option<&str>, body: Vec<Value>) -> Value {
     })
 }
 
-/// The view for someone outside `team.yaml`.
-pub fn not_a_member_view() -> Value {
+/// The view for someone who may not use PM OS: `text` says why (outside the user directory,
+/// deactivated, no role that uses Slack, or PM OS can't check right now).
+pub fn not_a_member_view(text: &str) -> Value {
     json!({
         "type": "home",
         "private_metadata": json!({"tab": Tab::Inbox.code()}).to_string(),
-        "blocks": [header("PM OS"), section(NOT_A_MEMBER)],
+        "blocks": [header("PM OS"), section(text)],
     })
 }
 
@@ -292,7 +366,11 @@ fn preview(item: &Value) -> Option<String> {
 pub fn inbox_row(item: &Value, display: &dyn Fn(&str) -> String, now: DateTime<Utc>) -> Value {
     let id = item["id"].as_str().unwrap_or_default();
     let mut meta = Vec::new();
-    if let Some(bot) = drafted_by(item) {
+    // A marketplace bot's draft names the bot, and a Preview says so on every row
+    // (gate-fix-4, M1); the name is already safe `mrkdwn` (`personas::annotate`).
+    if let Some(drafted) = cards::drafted_by(item) {
+        meta.push(drafted);
+    } else if let Some(bot) = drafted_by(item) {
         meta.push(format!("by {}", escape(&display(bot))));
     }
     if let Some(ago) = ago(item["created_at"].as_str(), now) {
@@ -308,7 +386,12 @@ pub fn inbox_row(item: &Value, display: &dyn Fn(&str) -> String, now: DateTime<U
         text.push_str(&p);
     }
     let mut row = section(&text);
-    row["block_id"] = json!(format!("{}{id}", action::PICK_BLOCK));
+    // The block id carries the start of the args hash of what this row showed, so **Approve
+    // selected** approves exactly that (R5): `pick_<id>:<hash>`.
+    row["block_id"] = json!(match crate::cards::shown_hash(item) {
+        Some(hash) => format!("{}{id}:{hash}", action::PICK_BLOCK),
+        None => format!("{}{id}", action::PICK_BLOCK),
+    });
     row["accessory"] = json!({
         "type": "checkboxes",
         "action_id": action::PICK,
@@ -374,25 +457,47 @@ pub fn inbox(
     blocks
 }
 
-/// The approval ids ticked in a Home view's `state.values`, each checked.
-pub fn ticked(state_values: &Value) -> Vec<String> {
-    let mut ids = Vec::new();
+/// One ticked draft: its approval id and the start of the args hash its row showed (`None`
+/// for a row from before rows carried it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ticked {
+    pub id: String,
+    pub shown: Option<String>,
+}
+
+/// The approval ids ticked in a Home view's `state.values`, each checked, with what each row
+/// showed.
+pub fn ticked(state_values: &Value) -> Vec<Ticked> {
+    let mut out: Vec<Ticked> = Vec::new();
     let Some(blocks) = state_values.as_object() else {
-        return ids;
+        return out;
     };
     for (block_id, actions) in blocks {
-        let Some(id) = block_id.strip_prefix(action::PICK_BLOCK) else {
+        let Some(rest) = block_id.strip_prefix(action::PICK_BLOCK) else {
             continue;
+        };
+        let (id, shown) = match rest.split_once(':') {
+            Some((id, hash))
+                if hash.len() == crate::cards::SHOWN_HASH_LEN
+                    && hash.chars().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                (id, Some(hash.to_string()))
+            }
+            Some(_) => continue,
+            None => (rest, None),
         };
         let picked = actions[action::PICK]["selected_options"]
             .as_array()
             .is_some_and(|o| o.iter().any(|o| o["value"] == id));
-        if picked && approval_id_ok(id) && !ids.iter().any(|i| i == id) {
-            ids.push(id.to_string());
+        if picked && approval_id_ok(id) && !out.iter().any(|t| t.id == id) {
+            out.push(Ticked {
+                id: id.to_string(),
+                shown,
+            });
         }
     }
-    ids.sort();
-    ids
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
 }
 
 /// How each decided draft ended, counted for the notice.
@@ -403,6 +508,9 @@ pub struct Tally {
     pub blocked: usize,
     pub confirm: usize,
     pub closed: usize,
+    /// Drafts whose text changed since the Home showed them (or whose row didn't say what it
+    /// showed): skipped, nothing approved.
+    pub changed: usize,
     /// One reason per failed draft.
     pub failed: Vec<String>,
 }
@@ -429,6 +537,7 @@ impl Tally {
             Err(ApiError::Refused { code, .. }) if code == "needs_external_confirm" => {
                 self.confirm += 1
             }
+            Err(ApiError::Refused { code, .. }) if code == "stale" => self.changed += 1,
             Err(ApiError::Refused { code, status, .. }) if code == "expired" || *status == 409 => {
                 self.closed += 1
             }
@@ -470,6 +579,18 @@ impl Tally {
                 self.confirm
             ));
         }
+        if self.changed > 0 {
+            lines.push(format!(
+                ":pencil2: {} changed since you looked, so {} not approved. Open {} to review.",
+                self.changed,
+                if self.changed == 1 {
+                    "it was"
+                } else {
+                    "they were"
+                },
+                if self.changed == 1 { "it" } else { "each" },
+            ));
+        }
         if self.closed > 0 {
             lines.push(format!(
                 ":hourglass: {} expired, or already decided.",
@@ -497,16 +618,21 @@ impl Tally {
 
 // ---- Skills ----
 
-/// Where a track goes in the list: the known ones in order, then the rest alphabetically,
-/// then skills with none.
-fn track_rank(track: Option<&str>) -> (usize, String) {
-    match track.map(str::trim).filter(|t| !t.is_empty()) {
-        Some(t) => match TRACKS.iter().position(|k| k.eq_ignore_ascii_case(t)) {
-            Some(i) => (i, String::new()),
-            None => (TRACKS.len(), t.to_lowercase()),
-        },
-        None => (TRACKS.len() + 1, String::new()),
+/// The group a skill belongs to: its override, else its track's group, else "More".
+pub fn group_of(name: &str, track: Option<&str>) -> &'static str {
+    if let Some((_, g)) = GROUP_OVERRIDES.iter().find(|(n, _)| *n == name) {
+        return g;
     }
+    let track = track.map(str::trim).unwrap_or_default();
+    GROUPS
+        .iter()
+        .find(|(_, tracks)| tracks.iter().any(|t| t.eq_ignore_ascii_case(track)))
+        .map_or(MORE, |(g, _)| g)
+}
+
+/// Whether `group` is one the Skills section can show.
+fn known_group(group: &str) -> bool {
+    group == MORE || GROUPS.iter().any(|(g, _)| *g == group)
 }
 
 /// A description's first sentence, cut to 150 characters.
@@ -520,13 +646,16 @@ pub fn first_sentence(description: &str) -> String {
     truncate(&d[..end], SKILL_LINE_MAX)
 }
 
-/// The Skills section: the PM's level (when the runtime said), how to use them, then one
-/// header per track and a line per skill. `allowed` is the role's skills; `None` when they
-/// couldn't be loaded (every Slack skill is shown, with a note).
+/// The Skills section: the PM's level (when the runtime said), how to use them, "Start here"
+/// with three suggestions, then the rest by the job they do. A group over `GROUP_PREVIEW`
+/// skills lists the first few and a **Show all in <group>** button, unless it is `expanded`.
+/// `allowed` is the role's skills; `None` when they couldn't be loaded (every Slack skill is
+/// shown, with a note).
 pub fn skills(
     catalog: &[(String, String, Option<String>)],
     allowed: Option<&[String]>,
     level: Option<&str>,
+    expanded: Option<&str>,
 ) -> Vec<Value> {
     let mut blocks = Vec::new();
     if let Some(level) = level {
@@ -546,36 +675,54 @@ pub fn skills(
         blocks.push(section("No skills are available to your bot in Slack yet."));
         return blocks;
     }
-    shown.sort_by(|a, b| {
-        (track_rank(a.2.as_deref()), &a.0).cmp(&(track_rank(b.2.as_deref()), &b.0))
-    });
-    let mut current: Option<(usize, String)> = None;
-    let mut lines: Vec<String> = Vec::new();
-    let flush = |blocks: &mut Vec<Value>, lines: &mut Vec<String>| {
-        if !lines.is_empty() {
-            blocks.extend(cards::sections(&lines.join("\n")));
-            lines.clear();
-        }
-    };
-    for (name, description, track) in shown {
-        let rank = track_rank(track.as_deref());
-        if current.as_ref() != Some(&rank) {
-            flush(&mut blocks, &mut lines);
-            let title = match rank.0 {
-                i if i < TRACKS.len() => TRACKS[i].to_string(),
-                i if i == TRACKS.len() => track.as_deref().unwrap_or_default().trim().to_string(),
-                _ => "Other".to_string(),
-            };
-            blocks.push(header(&title));
-            current = Some(rank);
-        }
-        lines.push(format!(
-            "*{}* {}",
-            escape(name),
-            escape(&first_sentence(description))
-        ));
+    shown.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let start: Vec<String> = START_HERE
+        .iter()
+        .filter(|(name, _, _)| shown.iter().any(|(n, _, _)| n == name))
+        .take(3)
+        .map(|(name, gets, example)| format!("*{name}*: {gets} Try `{example}`"))
+        .collect();
+    if !start.is_empty() {
+        blocks.push(header("Start here"));
+        blocks.extend(cards::sections(&start.join("\n")));
     }
-    flush(&mut blocks, &mut lines);
+
+    let group_names = GROUPS.iter().map(|(g, _)| *g).chain([MORE]);
+    for group in group_names {
+        let members: Vec<&&(String, String, Option<String>)> = shown
+            .iter()
+            .filter(|(name, _, track)| group_of(name, track.as_deref()) == group)
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let open = expanded == Some(group);
+        let limit = if open { members.len() } else { GROUP_PREVIEW };
+        let lines: Vec<String> = members
+            .iter()
+            .take(limit)
+            .map(|(name, description, _)| {
+                format!(
+                    "*{}* {}",
+                    escape(name),
+                    escape(&first_sentence(description))
+                )
+            })
+            .collect();
+        blocks.push(header(group));
+        blocks.extend(cards::sections(&lines.join("\n")));
+        if members.len() > limit {
+            blocks.push(json!({"type": "actions", "elements": [
+                button(
+                    &format!("Show all in {group} ({})", members.len()),
+                    action::SKILLS_GROUP,
+                    group,
+                    None,
+                ),
+            ]}));
+        }
+    }
     blocks
 }
 
@@ -717,6 +864,8 @@ impl Bots {
         let tab = Tab::of_metadata(event["view"]["private_metadata"].as_str());
         let (this, user) = (self.clone(), user.to_string());
         Some(Box::pin(async move {
+            // The first-time offer, if their account is now linked (flag off: no-op).
+            this.onboarding_offer_for_slack_user(&user).await;
             this.publish_home(&user, tab, None).await
         }))
     }
@@ -742,8 +891,26 @@ impl Bots {
             action::TAB_SKILLS => Some(Tab::Skills),
             action::TAB_ACCOUNTS => Some(Tab::Accounts),
             action::REFRESH => Some(current),
+            action::SKILLS_GROUP => Some(Tab::Skills),
             _ => None,
         };
+        let group = (action_id == action::SKILLS_GROUP)
+            .then(|| payload["actions"][0]["value"].as_str())
+            .flatten()
+            .filter(|g| known_group(g))
+            .map(String::from);
+        {
+            let mut expanded = self
+                .home_state()
+                .expanded
+                .lock()
+                .expect("home expanded lock");
+            if let Some(group) = &group {
+                expanded.insert(user.clone(), group.clone());
+            } else if tab.is_some() && action_id != action::REFRESH {
+                expanded.remove(&user);
+            }
+        }
         let work: FollowUp = if let Some(tab) = tab {
             Box::pin(async move { this.publish_home(&user, tab, None).await })
         } else if action_id == action::APPROVE || action_id == action::REJECT {
@@ -769,7 +936,12 @@ impl Bots {
     /// Republish `handle`'s Home if they have opened it, on the section they left it on.
     /// Best effort and in the background: the notifier never waits for it.
     pub fn refresh_home(&self, handle: &str) {
-        let Some(slack_id) = self.team().by_handle(handle).map(|m| m.slack_id.clone()) else {
+        let Some(slack_id) = self
+            .people()
+            .of_handle(handle)
+            .into_member()
+            .and_then(|m| m.slack_id)
+        else {
             return;
         };
         let tab = self
@@ -787,8 +959,9 @@ impl Bots {
 
     /// Build and publish the Home for a Slack user.
     async fn publish_home(&self, user: &str, tab: Tab, notice: Option<String>) {
-        let view = match self.team().by_slack_id(user).map(|m| m.handle.clone()) {
-            None => not_a_member_view(),
+        let who = self.people().identify(user);
+        let view = match who.member().map(|m| m.handle.clone()) {
+            None => not_a_member_view(crate::people::refusal(&who, NOT_A_MEMBER)),
             Some(handle) => {
                 self.home_state()
                     .viewers
@@ -797,7 +970,16 @@ impl Bots {
                     .insert(user.to_string(), tab);
                 let body = match tab {
                     Tab::Inbox => self.inbox_body(&handle).await,
-                    Tab::Skills => self.skills_body(&handle).await,
+                    Tab::Skills => {
+                        let open = self
+                            .home_state()
+                            .expanded
+                            .lock()
+                            .expect("home expanded lock")
+                            .get(&user.to_string())
+                            .cloned();
+                        self.skills_body(&handle, open.as_deref()).await
+                    }
                     Tab::Accounts => self.accounts_body(&handle).await,
                 };
                 view(tab, notice.as_deref(), body)
@@ -844,7 +1026,7 @@ impl Bots {
         }
         let root: PathBuf = self.content_root();
         let linted = tokio::task::spawn_blocking(move || {
-            lint(&root, &LintOptions::new(Utc::now().date_naive())).skills
+            lint(&root, &LintOptions::for_service(Utc::now().date_naive())).skills
         })
         .await;
         match linted {
@@ -860,7 +1042,7 @@ impl Bots {
         }
     }
 
-    async fn skills_body(&self, handle: &str) -> Vec<Value> {
+    async fn skills_body(&self, handle: &str, expanded: Option<&str>) -> Vec<Value> {
         let catalog: Vec<(String, String, Option<String>)> = self
             .catalog()
             .await
@@ -889,7 +1071,7 @@ impl Bots {
                 None
             }
         };
-        skills(&catalog, allowed.as_deref(), level.as_deref())
+        skills(&catalog, allowed.as_deref(), level.as_deref(), expanded)
     }
 
     async fn accounts_body(&self, handle: &str) -> Vec<Value> {
@@ -927,8 +1109,8 @@ impl Bots {
 
     /// **Approve selected** / **Reject selected**: decide each ticked draft, then republish
     /// the Inbox with how each one ended.
-    async fn decide_ticked(&self, user: &str, decision: &str, ids: Vec<String>) {
-        let Some(handle) = self.team().by_slack_id(user).map(|m| m.handle.clone()) else {
+    async fn decide_ticked(&self, user: &str, decision: &str, ids: Vec<Ticked>) {
+        let Some(handle) = self.people().identify(user).into_member().map(|m| m.handle) else {
             return self.publish_home(user, Tab::Inbox, None).await;
         };
         if ids.is_empty() {
@@ -937,10 +1119,22 @@ impl Bots {
                 .await;
         }
         let mut tally = Tally::default();
-        for id in &ids {
+        for Ticked { id, shown } in &ids {
+            // An approve sends what the row showed (R5); the tool server refuses it as
+            // `stale` if the draft changed since. A row that doesn't say (an App Home view
+            // from before this release) is skipped: nothing is approved unseen.
+            let seen = match (decision, shown.as_deref()) {
+                ("approve", None) => {
+                    tracing::info!(approval = %id, "an App Home row without its args hash; skipped");
+                    tally.changed += 1;
+                    continue;
+                }
+                ("approve", Some(hash)) => Seen::hash(hash),
+                _ => Seen::default(),
+            };
             let outcome = self
                 .toolserver()
-                .decide(id, &handle, decision, None, None, false)
+                .decide(id, &handle, decision, None, None, seen)
                 .await;
             if let Err(e) = &outcome {
                 tracing::info!(approval = %id, error = %e, "a Home decision didn't go through");
@@ -960,9 +1154,10 @@ impl Bots {
     /// **Disconnect**: unlink the account, then republish with what happened.
     async fn unlink_account(&self, user: &str, provider: &'static str, tab: Tab) {
         let Some(handle) = self
-            .team()
-            .by_slack_id(user)
-            .map(|m| m.handle.clone())
+            .people()
+            .identify(user)
+            .into_member()
+            .map(|m| m.handle)
             .filter(|h| valid_handle(h))
         else {
             return self.publish_home(user, tab, None).await;
@@ -1075,9 +1270,94 @@ mod tests {
             "pick_apr_2": {"home_pick": {"type": "checkboxes", "selected_options": []}},
             "pick_../x": {"home_pick": {"type": "checkboxes", "selected_options": [{"value": "../x"}]}},
             "pick_apr_3": {"home_pick": {"type": "checkboxes", "selected_options": [{"value": "apr_9"}]}},
+            "pick_apr_4:0123456789abcdef": {"home_pick": {"type": "checkboxes", "selected_options": [{"value": "apr_4"}]}},
+            "pick_apr_5:nothex": {"home_pick": {"type": "checkboxes", "selected_options": [{"value": "apr_5"}]}},
         });
-        assert_eq!(ticked(&values), ["apr_1"]);
+        assert_eq!(
+            ticked(&values),
+            [
+                Ticked {
+                    id: "apr_1".into(),
+                    shown: None
+                },
+                Ticked {
+                    id: "apr_4".into(),
+                    shown: Some("0123456789abcdef".into())
+                },
+            ]
+        );
         assert!(ticked(&json!(null)).is_empty());
+    }
+
+    /// gate-fix-4 (M1): an App Home row names the marketplace bot that drafted it, from the
+    /// tool server's item, and a Preview says so on every row; with no catalog and no fields,
+    /// the row still says Preview.
+    #[test]
+    fn rows_name_their_bot_and_a_preview() {
+        use crate::personas::{annotate, Catalog};
+        let now = Utc::now();
+        let mut item = json!({"id": "apr_1", "tool": "jira.create_issue", "status": "pending",
+                              "bot": "pm-ana", "persona": "chief", "persona_name": "Chief",
+                              "persona_preview": true, "args": {"summary": "x"}});
+        let unread = Catalog::default();
+        annotate(&mut item, &unread);
+        let text = inbox_row(&item, &|b: &str| b.to_string(), now).to_string();
+        assert!(
+            text.contains("Drafted by Chief · Preview: not yet benchmarked"),
+            "{text}"
+        );
+        assert!(!text.contains("by pm-ana"), "{text}");
+        item["persona_preview"] = json!(false);
+        annotate(&mut item, &unread);
+        let text = inbox_row(&item, &|b: &str| b.to_string(), now).to_string();
+        assert!(
+            text.contains("Drafted by Chief") && !text.contains("Preview"),
+            "{text}"
+        );
+        // No fields (an older tool server) and no catalog ever read: unnamed, a Preview.
+        let mut older = json!({"id": "apr_2", "tool": "jira.create_issue", "status": "pending",
+                               "persona": "chief", "args": {"summary": "x"}});
+        annotate(&mut older, &unread);
+        let text = inbox_row(&older, &|b: &str| b.to_string(), now).to_string();
+        assert!(
+            text.contains("Drafted by A marketplace bot · Preview: not yet benchmarked"),
+            "{text}"
+        );
+        // Nudge's rows are as before.
+        let mut nudge = json!({"id": "apr_3", "tool": "jira.create_issue", "status": "pending",
+                               "bot": "pm-ana", "persona": null, "args": {"summary": "x"}});
+        annotate(&mut nudge, &unread);
+        let text = inbox_row(&nudge, &|b: &str| b.to_string(), now).to_string();
+        assert!(
+            text.contains("by pm-ana") && !text.contains("Drafted"),
+            "{text}"
+        );
+    }
+
+    /// R5: a row carries the start of the args hash it showed, and a stale or unversioned
+    /// draft is counted as changed, not approved.
+    #[test]
+    fn rows_carry_what_they_showed_and_changes_are_counted() {
+        let item = json!({"id": "apr_1", "tool": "jira.create_issue", "status": "pending",
+                          "args": {"summary": "x"}, "args_hash": "0123456789abcdef".repeat(4)});
+        let row = inbox_row(&item, &|b: &str| b.to_string(), Utc::now());
+        assert_eq!(row["block_id"], "pick_apr_1:0123456789abcdef");
+        let mut t = Tally::default();
+        t.add(&Ok(json!({"status": "approved"})));
+        t.add(&Ok(json!({"status": "approved"})));
+        t.add(&Err(ApiError::Refused {
+            status: 409,
+            code: "stale".into(),
+            error: "changed".into(),
+            body: Value::Null,
+        }));
+        let n = t.notice();
+        assert!(n.contains("2 approved or posted."), "{n}");
+        assert!(
+            n.contains("1 changed since you looked, so it was not approved. Open it to review."),
+            "{n}"
+        );
+        assert!(!n.contains("expired"));
     }
 
     #[test]
@@ -1111,82 +1391,205 @@ mod tests {
         assert!(!n.contains("rejected"));
     }
 
-    #[test]
-    fn skills_group_by_track() {
-        let s = |n: &str, t: Option<&str>| {
-            (
-                n.to_string(),
-                format!("Does {n} <well>. And more."),
-                t.map(String::from),
-            )
-        };
-        let catalog = vec![
-            s("review", Some("Spec and review")),
-            s("ask", Some("Everyday")),
-            s("zeta", Some("Zany")),
-            s("misc", None),
-            s("alpha", Some("Alpha things")),
-            s("hidden", Some("Everyday")),
-        ];
-        let allowed: Vec<String> = ["review", "ask", "zeta", "misc", "alpha"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let blocks = skills(&catalog, Some(&allowed), None);
-        let headers: Vec<&str> = blocks
+    fn entry(n: &str, t: Option<&str>) -> (String, String, Option<String>) {
+        (
+            n.to_string(),
+            format!("Does {n} <well>. And more."),
+            t.map(String::from),
+        )
+    }
+
+    fn texts(blocks: &[Value]) -> String {
+        Value::Array(blocks.to_vec()).to_string()
+    }
+
+    fn headers(blocks: &[Value]) -> Vec<&str> {
+        blocks
             .iter()
             .filter(|b| b["type"] == "header")
             .map(|b| b["text"]["text"].as_str().unwrap())
+            .collect()
+    }
+
+    /// The real skills' names and tracks, plus invented ones to reach 47.
+    fn full_catalog() -> Vec<(String, String, Option<String>)> {
+        let mut out = Vec::new();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/skills");
+        for dir in std::fs::read_dir(root).unwrap() {
+            let file = dir.unwrap().path().join("SKILL.md");
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let name = file
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let track = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("track:"))
+                .map(|t| t.trim().trim_matches('"').to_string());
+            out.push(entry(&name, track.as_deref()));
+        }
+        let mut i = 0;
+        while out.len() < 47 {
+            out.push(entry(&format!("extra-{i}"), (i % 2 == 0).then_some("Odd")));
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn skills_start_here_shows_three_suggestions() {
+        let catalog = full_catalog();
+        let blocks = skills(&catalog, None, None, None);
+        assert_eq!(headers(&blocks)[0], "Start here");
+        let s = texts(&blocks);
+        for (name, _, example) in START_HERE.iter().take(3) {
+            assert!(s.contains(&format!("*{name}*: ")), "{name}");
+            assert!(s.contains(&format!("Try `{example}`")), "{name}");
+        }
+        assert!(!s.contains("*prd-draft*: "), "only three are suggested");
+        let at = blocks.iter().position(|b| b["type"] == "header").unwrap();
+        let start = blocks[at + 1]["text"]["text"].as_str().unwrap();
+        assert_eq!(start.lines().count(), 3);
+    }
+
+    #[test]
+    fn skills_start_here_falls_back_when_one_is_missing() {
+        let catalog = full_catalog();
+        let allowed: Vec<String> = catalog
+            .iter()
+            .map(|c| c.0.clone())
+            .filter(|n| n != "meeting-notes")
             .collect();
+        let s = texts(&skills(&catalog, Some(&allowed), None, None));
+        assert!(s.contains("*ask*: ") && s.contains("*status-update*: "));
+        assert!(s.contains("*prd-draft*: "), "the next one steps in");
+        assert!(!s.contains("*meeting-notes*"));
+        // Nothing suggested is available: no "Start here" at all.
+        let only = vec!["decision-doc".to_string()];
+        let blocks = skills(&catalog, Some(&only), None, None);
+        assert!(!headers(&blocks).contains(&"Start here"));
+    }
+
+    #[test]
+    fn skills_groups_cover_every_skill_once() {
+        let catalog = full_catalog();
+        assert_eq!(catalog.len(), 47);
+        let all_open = |blocks: &[Value]| {
+            let mut seen: Vec<String> = Vec::new();
+            let mut in_group = false;
+            for b in blocks {
+                if b["type"] == "header" {
+                    in_group = b["text"]["text"] != "Start here";
+                } else if in_group && b["type"] == "section" {
+                    for line in b["text"]["text"].as_str().unwrap().lines() {
+                        seen.push(
+                            line.trim_start_matches('*')
+                                .split('*')
+                                .next()
+                                .unwrap()
+                                .into(),
+                        );
+                    }
+                }
+            }
+            seen
+        };
+        // Collapsed: nothing is listed twice and the block count is well under the limit.
+        let collapsed = skills(&catalog, None, None, None);
+        assert!(collapsed.len() + 4 <= MAX_BLOCKS, "{}", collapsed.len());
+        let seen = all_open(&collapsed);
+        let mut dup = seen.clone();
+        dup.sort();
+        dup.dedup();
+        assert_eq!(dup.len(), seen.len(), "a skill appears twice");
+        // Opening each group in turn lists every skill, exactly once across the groups.
+        let mut listed: Vec<String> = Vec::new();
+        for group in GROUPS.iter().map(|(g, _)| *g).chain([MORE]) {
+            let blocks = skills(&catalog, None, None, Some(group));
+            assert!(blocks.len() + 4 <= MAX_BLOCKS);
+            let in_group: Vec<String> = all_open(&blocks)
+                .into_iter()
+                .filter(|n| {
+                    let (_, _, t) = catalog.iter().find(|c| &c.0 == n).unwrap();
+                    group_of(n, t.as_deref()) == group
+                })
+                .collect();
+            listed.extend(in_group);
+        }
+        listed.sort();
+        let mut names: Vec<String> = catalog.iter().map(|c| c.0.clone()).collect();
+        names.sort();
+        assert_eq!(listed, names);
+        // The rules.
+        assert_eq!(group_of("no-such-skill", None), "More");
+        assert_eq!(group_of("x", Some("Odd")), "More");
+        assert_eq!(group_of("x", Some("everyday")), "Everyday");
         assert_eq!(
-            headers,
-            [
-                "Everyday",
-                "Spec and review",
-                "Alpha things",
-                "Zany",
-                "Other"
-            ]
+            group_of("status-update", Some("Delivery and launch")),
+            "Communicate"
         );
-        let s = Value::Array(blocks).to_string();
-        assert!(s.contains("*ask* Does ask &lt;well&gt;."));
-        assert!(!s.contains("And more"));
-        assert!(!s.contains("hidden"));
-        assert_eq!(first_sentence(&"word ".repeat(100)).chars().count(), 151);
-        assert!(
-            !s.contains("level"),
-            "no level line when the runtime didn't say"
+        for (_, g) in GROUP_OVERRIDES {
+            assert!(GROUPS.iter().any(|(n, _)| *n == g), "{g}");
+        }
+    }
+
+    #[test]
+    fn skills_long_groups_show_a_button_and_open() {
+        let catalog = full_catalog();
+        let blocks = skills(&catalog, None, None, None);
+        let buttons: Vec<&Value> = blocks
+            .iter()
+            .filter(|b| b["type"] == "actions")
+            .map(|b| &b["elements"][0])
+            .collect();
+        assert!(!buttons.is_empty());
+        for b in &buttons {
+            assert_eq!(b["action_id"], action::SKILLS_GROUP);
+            let label = b["text"]["text"].as_str().unwrap();
+            assert!(label.starts_with("Show all in "));
+            assert!(known_group(b["value"].as_str().unwrap()));
+        }
+        let first = buttons[0]["value"].as_str().unwrap();
+        let open = skills(&catalog, None, None, Some(first));
+        assert_eq!(
+            open.iter().filter(|b| b["type"] == "actions").count(),
+            buttons.len() - 1,
+            "the opened group has no button"
         );
     }
 
     #[test]
-    fn skills_show_the_level_first_and_the_new_tracks_last() {
-        let s = |n: &str, t: &str| (n.to_string(), format!("Does {n}."), Some(t.to_string()));
-        let catalog = vec![
-            s("vision-doc", "Company bets"),
-            s("portfolio-review", "Leading across teams"),
-            s("launch-plan", "Delivery and launch"),
-            s("ask", "Everyday"),
-        ];
-        let blocks = skills(&catalog, None, Some("staff"));
+    fn skills_keep_level_note_and_empty_cases() {
+        let catalog = vec![entry("ask", Some("Everyday")), entry("zeta", Some("Zany"))];
+        let allowed = vec!["ask".to_string(), "zeta".to_string()];
+        let blocks = skills(&catalog, Some(&allowed), Some("staff"), None);
         assert_eq!(
             blocks[0]["text"]["text"],
             "You're set to the *Staff* level. Change it by sending me `level …`."
         );
-        let headers: Vec<&str> = blocks
-            .iter()
-            .filter(|b| b["type"] == "header")
-            .map(|b| b["text"]["text"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            headers,
-            [
-                "Everyday",
-                "Delivery and launch",
-                "Leading across teams",
-                "Company bets"
-            ]
-        );
+        assert_eq!(headers(&blocks), ["Start here", "Everyday", "More"]);
+        let s = texts(&blocks);
+        assert!(s.contains("*zeta* Does zeta &lt;well&gt;."));
+        assert!(!s.contains("And more"));
+        assert_eq!(first_sentence(&"word ".repeat(100)).chars().count(), 151);
+        let none = skills(&catalog, Some(&[]), None, None);
+        assert!(texts(&none).contains("No skills are available to your bot in Slack yet."));
+        let note = skills(&catalog, None, None, None);
+        assert!(texts(&note).contains("couldn't load which skills"));
+        assert!(!texts(&note).contains("level"));
+    }
+
+    #[test]
+    fn inbox_and_accounts_do_not_get_skills_blocks() {
+        let s = texts(&inbox(&[], 0, &|b| b.to_string(), Utc::now()));
+        assert!(!s.contains("Start here") && !s.contains(action::SKILLS_GROUP));
+        let state = json!({"linked": {"slack": true}});
+        assert!(!texts(&accounts(&state, &[])).contains("Start here"));
     }
 
     #[test]

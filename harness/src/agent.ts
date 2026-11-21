@@ -83,6 +83,11 @@ export function gatewayModel({
     model: MODEL_ALIASES[role],
     apiKey,
     temperature: 0,
+    // No client-side retries. The gateway already retries 429, 503 and connection failures
+    // (3 tries inside a 20 s budget, honouring Retry-After; docs/gateway.md, "Retrying a busy
+    // model server"). A LangChain retry here would multiply with it, and a PM would wait far
+    // longer than intended. `maxRetries` is LangChain's own retry count, default 6.
+    maxRetries: 0,
     configuration: { baseURL: gatewayUrl, defaultHeaders: headers },
   });
 }
@@ -157,8 +162,21 @@ export function stageMasterContext(
 }
 
 /**
+ * A skill a role names has no folder in the content the worker sees: in a sandbox, a skill
+ * added (by a new persona) after the sandbox was created. Its uploads are fixed at sandbox
+ * start, so the folder arrives only when a platform owner recreates the sandbox.
+ */
+export class MissingSkillError extends Error {
+  constructor(readonly skill: string) {
+    super(`skill ${skill} not found in the content repo`);
+    this.name = "MissingSkillError";
+  }
+}
+
+/**
  * Copy only the named skills into a fresh directory, so a bot sees its role's skills and no
- * others. Throws on a name that isn't a plain skill name or has no `SKILL.md`.
+ * others. Throws on a name that isn't a plain skill name, and `MissingSkillError` on one with
+ * no `SKILL.md`.
  */
 export function stageSkills(
   contentRoot: string,
@@ -172,7 +190,7 @@ export function stageSkills(
     }
     const source = join(contentRoot, "skills", skill);
     if (!existsSync(join(source, "SKILL.md"))) {
-      throw new Error(`skill ${skill} not found in the content repo`);
+      throw new MissingSkillError(skill);
     }
     cpSync(source, join(staged, skill), { recursive: true });
   }

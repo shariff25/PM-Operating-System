@@ -88,12 +88,29 @@ for k in PMOS_POSTGRES_PASSWORD PMOS_DB_TOOLSERVER_PASSWORD PMOS_DB_BOTS_PASSWOR
   fill "$k" "$(password)"
 done
 for k in PMOS_SERVICE_TOKEN PMOS_BOT_TOKEN PMOS_DOCS_TOKEN PMOS_GW_RUNTIME_TOKEN PMOS_GW_EVALS_TOKEN \
-  PMOS_GW_DOCS_BOT_TOKEN PMOS_RT_SLACK_TOKEN PMOS_RT_CONSOLE_TOKEN PMOS_RT_EVALS_TOKEN \
-  PMOS_RT_DOCS_WORKER_TOKEN PMOS_CONSOLE_TS_TOKEN PMOS_CONSOLE_PROXY_SECRET; do
+  PMOS_GW_DOCS_BOT_TOKEN PMOS_RT_SLACK_TOKEN PMOS_RT_CONSOLE_TOKEN PMOS_RT_WEB_TOKEN \
+  PMOS_RT_EVALS_TOKEN PMOS_RT_DOCS_WORKER_TOKEN PMOS_CONSOLE_PROXY_SECRET \
+  PMOS_TS_WEB_TOKEN PMOS_CONSOLE_TS_TOKEN PMOS_WEB_BRIEF_TOKEN; do
   fill "$k" "$(token)"
+done
+# One user assertion key per caller and receiver (docs/user-assertion.md): `<key id>:<base64>`.
+for k in PMOS_AK_WEB_BOTS PMOS_AK_WEB_TOOLSERVER PMOS_AK_CONSOLE_BOTS PMOS_AK_CONSOLE_TOOLSERVER; do
+  fill "$k" "k$(date +%Y%m%d):$(openssl rand -base64 32)"
 done
 fill PMOS_VAULT_KEY "k1:$(openssl rand -base64 32)"
 ok "secrets filled in (existing values kept)"
+# Kept in deploy/.env, so every later `pmos-admin up`, `add-bot` and `restore` keeps it: the
+# runtime and the tool server refuse to start in another mode while the web app's or the
+# console's tokens are set (docs/user-assertion.md, Modes).
+fill PMOS_ASSERTION_MODE require
+fill PMOS_ONBOARDING_V2 1
+fill PMOS_NUDGES 1
+mode=$(grep -E "^PMOS_ASSERTION_MODE=" "$ENV" | head -1 | cut -d= -f2-)
+if [ "$mode" = require ]; then
+  ok "user assertions: require"
+else
+  warn "PMOS_ASSERTION_MODE=$mode in deploy/.env: with the web app or the console configured, the runtime and the tool server refuse to start with it; set it to require"
+fi
 
 missing=()
 for k in PMOS_SLACK_BOT_TOKEN PMOS_SLACK_APP_TOKEN; do

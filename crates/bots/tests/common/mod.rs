@@ -13,23 +13,28 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, TimeZone, Utc};
+use pmos_bots::assertion::Assertions;
 use pmos_bots::catalog::Catalog;
 use pmos_bots::clients::{Gateway, ToolServer};
 use pmos_bots::config::{parse_clients, Client};
 use pmos_bots::pg::PgStore;
 use pmos_bots::store::{BotsStore, MemoryStore};
-use pmos_bots::{router, Runtime};
+use pmos_bots::{router, router_with, Runtime};
 use pmos_contract::bots::{ActionSetting, Bot, BotScope, Reads, Role};
-use pmos_contract::model::{
-    ModelRole, Role as TeamRole, Sensitivity, Skill, TeamFile, TeamMember, ToolDef, ToolKind,
-    ToolRegistry,
+use pmos_contract::model::{ModelRole, Sensitivity, Skill, ToolDef, ToolKind, ToolRegistry};
+use pmos_contract::personas::Persona;
+use pmos_directory::snapshot::{
+    user, DirectoryUser, FakeClock, SnapshotClient, StaticFetcher, UserStatus,
 };
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::Connection;
 use tokio_util::sync::CancellationToken;
 
+pub mod signing;
+
 pub const SLACK: &str = "slack-token-0123456789abcdef0123456789";
+pub const WEB: &str = "web-token-0123456789abcdef0123456789abc";
 pub const WORKER: &str = "worker-token-0123456789abcdef012345678";
 /// The Docs bot's own worker token (`worker-docs`): it serves only `docs`.
 pub const DOCS_WORKER: &str = "docs-worker-token-0123456789abcdef0123";
@@ -40,7 +45,7 @@ pub const GATEWAY: &str = "gateway-token-0123456789abcdef0123456";
 
 pub fn clients() -> Vec<Client> {
     parse_clients(&format!(
-        "slack={SLACK},worker={WORKER},worker-docs={DOCS_WORKER},console={CONSOLE},evals={EVALS}"
+        "slack={SLACK},web={WEB},worker={WORKER},worker-docs={DOCS_WORKER},console={CONSOLE},evals={EVALS}"
     ))
     .unwrap()
 }
@@ -82,19 +87,27 @@ fn tool(name: &str, kind: ToolKind) -> ToolDef {
     }
 }
 
-fn member(handle: &str, slack_id: &str) -> TeamMember {
-    TeamMember {
-        handle: handle.into(),
-        slack_id: slack_id.into(),
-        email: None,
-        github: None,
-        roles: vec![TeamRole::Pm],
+/// The user directory every test runtime starts with (the tool server's
+/// `/internal/directory`): `ana` and `ben` hold `pm`, `cy` holds `pm` and `admin`. `eve` is
+/// nobody.
+pub fn directory() -> Vec<DirectoryUser> {
+    vec![
+        user("ana", &["pm"]),
+        user("ben", &["pm"]),
+        user("cy", &["pm", "admin"]),
+    ]
+}
+
+/// `handle`, deactivated, with the roles they held kept (they grant nothing).
+pub fn deactivated(handle: &str, roles: &[&str]) -> DirectoryUser {
+    DirectoryUser {
+        status: UserStatus::Deactivated,
+        ..user(handle, roles)
     }
 }
 
-/// Two bots: the team bot `docs` (members `ana` and `ben`) and `pm-ana`, Ana's personal
-/// bot, whose role may draft Jira issues (approve) but never send Slack messages. `eve` is
-/// not on the team.
+/// Two bots: the team bot `docs` and `pm-ana`, Ana's personal bot, whose role may draft Jira
+/// issues (approve) but never send Slack messages. Who may use them is the directory's.
 pub fn catalog() -> Catalog {
     let roles = vec![
         Role {
@@ -158,10 +171,79 @@ pub fn catalog() -> Catalog {
             tool("slack.send_message", ToolKind::Write),
         ],
     };
-    let team = TeamFile {
-        members: vec![member("ana", "U0ANA"), member("ben", "U0BEN")],
-    };
-    Catalog::from_parts(bots, roles, skills, registry, team)
+    Catalog::from_parts(bots, roles, skills, registry)
+}
+
+fn persona(name: &str, display: &str, role: &str, offered: bool, order: u32) -> Persona {
+    Persona {
+        name: name.into(),
+        display_name: display.into(),
+        title: format!("{display} title"),
+        role: role.into(),
+        mascot: name.into(),
+        owner: "pm".into(),
+        version: "0.1.0".into(),
+        offered,
+        always_on: name == "nudge",
+        // Chief, like the repository's, is a Preview until its benchmark passes.
+        preview: name == "chief",
+        benchmarked: name != "chief" && name != "nudge",
+        draft_notice: None,
+        order,
+        summary: format!("{display} summary"),
+        examples: vec![format!("Ask {display}")],
+        can_do: vec!["ask".into()],
+        needs: Vec::new(),
+        reads: vec!["jira".into()],
+        drafts: Vec::new(),
+    }
+}
+
+/// [`catalog`] with marketplace bots: Nudge (always on, `pm-assistant`), Chief (offered, role
+/// `chief-of-staff`: `meet` and `ask`'s Jira search only, model `reasoning`), and Ghost
+/// (withdrawn, `offered: false`).
+pub fn persona_catalog() -> Catalog {
+    let base = catalog();
+    let mut bots: Vec<Bot> = ["docs", "pm-ana"]
+        .iter()
+        .map(|n| base.bot(n).unwrap().clone())
+        .collect();
+    // Ben's personal bot too, so a second PM can ask.
+    bots.push(Bot {
+        name: "pm-ben".into(),
+        owner: "ben".into(),
+        description: "Ben's assistant".into(),
+        job: "Help Ben.".into(),
+        ..bots[1].clone()
+    });
+    let mut roles: Vec<Role> = ["docs-helper", "pm-assistant"]
+        .iter()
+        .map(|n| base.role_named(n).unwrap().clone())
+        .collect();
+    roles.push(Role {
+        name: "chief-of-staff".into(),
+        description: "Runs the week".into(),
+        owner: "pm".into(),
+        version: "0.1.0".into(),
+        skills: vec!["meet".into()],
+        data_class: Sensitivity::Restricted,
+        model: ModelRole::Reasoning,
+        actions: BTreeMap::new(),
+        instructions: "Lead with what needs the PM.".into(),
+    });
+    let skills = vec![
+        skill("docs", &["docs.search", "docs.read"]),
+        skill(
+            "ask",
+            &["jira.search", "jira.create_issue", "slack.send_message"],
+        ),
+        skill("meet", &["jira.search"]),
+    ];
+    Catalog::from_parts(bots, roles, skills, base.registry().clone()).with_personas(vec![
+        persona("nudge", "Nudge", "pm-assistant", true, 10),
+        persona("chief", "Chief", "chief-of-staff", true, 20),
+        persona("ghost", "Ghost", "chief-of-staff", false, 30),
+    ])
 }
 
 // ----- mock tool server -------------------------------------------------------------------
@@ -186,12 +268,28 @@ pub struct MockToolServer {
     /// Approval reads answer `503`.
     pub approvals_down: Mutex<bool>,
     pub ready: Mutex<bool>,
+    /// What `GET /internal/runs/{id}/sensitivity` answers per run: a level, or `None` for
+    /// "no session stored". A run not listed answers `public`.
+    pub run_levels: Mutex<HashMap<String, Option<String>>>,
+    /// Run-level reads answer `503`.
+    pub runs_down: Mutex<bool>,
+    /// A persona session is refused with this `(code, sentence)`.
+    pub persona_refusal: Mutex<Option<(String, String)>>,
+    /// Behave like a tool server from before personas: ignore `persona`, answer `persona: null`.
+    pub drop_persona: Mutex<bool>,
+    /// Session tokens revoked (`DELETE /internal/session`), in order.
+    pub revoked: Mutex<Vec<String>>,
 }
 
 impl Default for MockToolServer {
     fn default() -> Self {
         Self {
             mode: Mutex::new(SessionMode::Ok),
+            run_levels: Mutex::default(),
+            runs_down: Mutex::new(false),
+            persona_refusal: Mutex::default(),
+            drop_persona: Mutex::new(false),
+            revoked: Mutex::default(),
             sessions: Mutex::default(),
             approvals: Mutex::default(),
             approval_reads: Mutex::new(0),
@@ -233,12 +331,41 @@ async fn ts_session(
         )
             .into_response();
     }
+    let persona = body["persona"]
+        .as_str()
+        .filter(|p| *p != "nudge")
+        .map(str::to_string);
     let n = {
         let mut s = ts.sessions.lock().unwrap();
         s.push(body);
         s.len()
     };
-    match *ts.mode.lock().unwrap() {
+    let mode = *ts.mode.lock().unwrap();
+    if let (SessionMode::Ok, Some(key)) = (mode, &persona) {
+        if let Some((code, error)) = ts.persona_refusal.lock().unwrap().clone() {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"code": code, "error": error})),
+            )
+                .into_response();
+        }
+        let echoed = if *ts.drop_persona.lock().unwrap() {
+            Value::Null
+        } else {
+            let mut display = key.clone();
+            display[..1].make_ascii_uppercase();
+            json!({"key": key, "display_name": display, "title": format!("{display} title"),
+                   "role": "chief-of-staff"})
+        };
+        return (
+            StatusCode::CREATED,
+            Json(json!({"token": format!("pmos_s_test{n}"), "session": {},
+                        "tools": [{"name": "jira_search", "kind": "read"}],
+                        "persona": echoed})),
+        )
+            .into_response();
+    }
+    match mode {
         SessionMode::Ok => (
             StatusCode::CREATED,
             Json(json!({"token": format!("pmos_s_test{n}"), "session": {}, "tools": []})),
@@ -255,6 +382,18 @@ async fn ts_session(
         )
             .into_response(),
     }
+}
+
+async fn ts_revoke(State(ts): State<Arc<MockToolServer>>, headers: HeaderMap) -> StatusCode {
+    if !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let token = headers
+        .get("x-pmos-session")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    ts.revoked.lock().unwrap().push(token.to_string());
+    StatusCode::NO_CONTENT
 }
 
 async fn ts_approval(
@@ -281,6 +420,27 @@ async fn ts_approval(
         )
             .into_response(),
     }
+}
+
+async fn ts_run_level(
+    State(ts): State<Arc<MockToolServer>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if *ts.runs_down.lock().unwrap() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let level = ts
+        .run_levels
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .unwrap_or(Some("public".into()));
+    Json(json!({"run_id": id, "sensitivity": level})).into_response()
 }
 
 async fn ts_ready(State(ts): State<Arc<MockToolServer>>) -> StatusCode {
@@ -376,23 +536,34 @@ pub struct Env {
     pub ts: Arc<MockToolServer>,
     pub gw: Arc<MockGateway>,
     pub http: reqwest::Client,
+    /// The user directory as the tool server answers it: change it, then [`Env::refresh`].
+    pub people: Arc<StaticFetcher>,
+    /// The directory's clock: frozen unless a test moves it, so the snapshot stays fresh.
+    pub clock: Arc<FakeClock>,
     stop: CancellationToken,
     pg: Option<TestPg>,
 }
 
 impl Env {
     async fn with_store(store: Arc<dyn BotsStore>, pg: Option<TestPg>) -> Self {
-        Self::with_parts(store, pg, catalog()).await
+        Self::with_parts(store, pg, catalog(), None).await
     }
 
-    async fn with_parts(store: Arc<dyn BotsStore>, pg: Option<TestPg>, catalog: Catalog) -> Self {
+    async fn with_parts(
+        store: Arc<dyn BotsStore>,
+        pg: Option<TestPg>,
+        catalog: Catalog,
+        assertions: Option<Assertions>,
+    ) -> Self {
         let stop = CancellationToken::new();
         let ts = Arc::new(MockToolServer::default());
         let gw = Arc::new(MockGateway::default());
         let ts_base = serve(
             Router::new()
                 .route("/internal/sessions", post(ts_session))
+                .route("/internal/session", axum::routing::delete(ts_revoke))
                 .route("/internal/approvals/{id}", get(ts_approval))
+                .route("/internal/runs/{id}/sensitivity", get(ts_run_level))
                 .route("/readyz", get(ts_ready))
                 .with_state(ts.clone()),
             &stop,
@@ -406,14 +577,26 @@ impl Env {
             &stop,
         )
         .await;
+        let people = Arc::new(StaticFetcher::new(directory()));
+        let clock = Arc::new(FakeClock::default());
+        let snapshots = Arc::new(SnapshotClient::new(people.clone(), clock.clone()));
+        snapshots
+            .refresh()
+            .await
+            .expect("the test directory answers");
         let rt = Arc::new(Runtime::new(
             store.clone(),
             Arc::new(catalog),
+            snapshots,
             ToolServer::new(&ts_base, SERVICE),
             Gateway::new(&format!("{gw_base}/v1"), GATEWAY),
             stop.child_token(),
         ));
-        let base = serve(router(rt.clone(), clients(), evals_as()), &stop).await;
+        let app = match assertions {
+            None => router(rt.clone(), clients(), evals_as()),
+            Some(a) => router_with(rt.clone(), clients(), evals_as(), Arc::new(a)),
+        };
+        let base = serve(app, &stop).await;
         Self {
             base,
             rt,
@@ -421,9 +604,26 @@ impl Env {
             ts,
             gw,
             http: reqwest::Client::new(),
+            people,
+            clock,
             stop,
             pg,
         }
+    }
+
+    /// Poll the directory now, as the runtime's 10-second loop would.
+    pub async fn refresh(&self) {
+        self.rt
+            .people()
+            .refresh()
+            .await
+            .expect("the test directory answers");
+    }
+
+    /// Change one user in the directory and poll it.
+    pub async fn set_user(&self, u: DirectoryUser) {
+        self.people.upsert(u);
+        self.refresh().await;
     }
 
     pub async fn memory() -> Self {
@@ -432,7 +632,39 @@ impl Env {
 
     /// In memory, with the bots of `catalog` (such as one loaded from a content tree).
     pub async fn memory_with(catalog: Catalog) -> Self {
-        Self::with_parts(Arc::new(MemoryStore::default()), None, catalog).await
+        Self::with_parts(Arc::new(MemoryStore::default()), None, catalog, None).await
+    }
+
+    /// In memory, checking user assertions from `web` and `console` as `assertions` says.
+    pub async fn memory_with_assertions(assertions: Assertions) -> Self {
+        Self::with_parts(
+            Arc::new(MemoryStore::default()),
+            None,
+            catalog(),
+            Some(assertions),
+        )
+        .await
+    }
+
+    /// In memory, with `catalog`, checking assertions as `assertions` says.
+    pub async fn memory_with_catalog_and_assertions(
+        catalog: Catalog,
+        assertions: Assertions,
+    ) -> Self {
+        Self::with_parts(
+            Arc::new(MemoryStore::default()),
+            None,
+            catalog,
+            Some(assertions),
+        )
+        .await
+    }
+
+    /// On a fresh Postgres schema, with the bots of `catalog`.
+    pub async fn postgres_with(catalog: Catalog) -> Option<Self> {
+        let pg = TestPg::new().await?;
+        let store: Arc<dyn BotsStore> = Arc::new(pg.store.clone());
+        Some(Self::with_parts(store, Some(pg), catalog, None).await)
     }
 
     pub async fn postgres() -> Option<Self> {
@@ -472,7 +704,7 @@ impl Env {
         }
     }
 
-    /// A request as `client` (`slack`, `worker`, `console`, `evals`, or anything else for
+    /// A request as `client` (`slack`, `web`, `worker`, `console`, `evals`, or anything else for
     /// no token), with `X-Pmos-User` for Slack.
     pub fn req(
         &self,
@@ -484,6 +716,7 @@ impl Env {
         let mut r = self.http.request(method, format!("{}{path}", self.base));
         let token = match client {
             "slack" => Some(SLACK),
+            "web" => Some(WEB),
             "worker" => Some(WORKER),
             "worker-docs" => Some(DOCS_WORKER),
             "console" => Some(CONSOLE),

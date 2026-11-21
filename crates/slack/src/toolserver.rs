@@ -20,6 +20,8 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 
+use crate::personas::{annotate, Catalog};
+
 /// The header that carries a session token on the tool server's `/internal` API.
 const SESSION_HEADER: &str = "x-pmos-session";
 
@@ -78,11 +80,33 @@ pub fn request_of(body: &Value) -> &Value {
     }
 }
 
+/// What the PM deciding was shown, sent with a decision ([`ToolServer::decide`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Seen<'a> {
+    /// The start of the item's `args_hash` as the card or the App Home row showed it.
+    pub args_hash: Option<&'a str>,
+    /// The second confirmation for a Slack write to an externally shared channel.
+    pub confirm_external: bool,
+}
+
+impl<'a> Seen<'a> {
+    /// The text with this args hash start was shown.
+    pub fn hash(args_hash: &'a str) -> Self {
+        Self {
+            args_hash: Some(args_hash),
+            confirm_external: false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolServer {
     base: String,
     token: String,
     http: reqwest::Client,
+    /// The persona catalog the Slack bot last read, so each approval item read or decided
+    /// here carries who drafted it for its card (`personas::annotate`).
+    personas: Catalog,
 }
 
 impl ToolServer {
@@ -94,7 +118,14 @@ impl ToolServer {
                 .timeout(Duration::from_secs(20))
                 .build()
                 .expect("http client builds"),
+            personas: Catalog::default(),
         }
+    }
+
+    /// Share `catalog` (the Slack bot's, kept fresh by `Bots::personas`).
+    pub fn with_personas(mut self, catalog: Catalog) -> Self {
+        self.personas = catalog;
+        self
     }
 
     async fn post(
@@ -201,7 +232,9 @@ impl ToolServer {
         if res.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(CallError::NotFound);
         }
-        Self::finish_response(res).await
+        let mut item = Self::finish_response(res).await?;
+        annotate(&mut item, &self.personas);
+        Ok(item)
     }
 
     /// `POST /internal/approvals/{id}/decision`. `decision` is `approve`, `edit` (with `args`)
@@ -214,6 +247,11 @@ impl ToolServer {
     /// A refusal keeps its status, `code` and body: the reply card turns `audience_blocked`,
     /// `needs_external_confirm` and `expired` (`409`) and `audience_unavailable` (`503`) into
     /// their own sentences. Any other `5xx`, or no answer, is [`ApiError::Unavailable`].
+    ///
+    /// `seen.args_hash` is the start of the `args_hash` the PM was shown (a card's buttons
+    /// carry it): the tool server refuses the decision as `409 stale` when the item now holds
+    /// other text, and refuses an `approve` without one. Callers never approve without it: a
+    /// card that carries none is shown again instead.
     pub async fn decide(
         &self,
         id: &str,
@@ -221,7 +259,7 @@ impl ToolServer {
         decision: &str,
         args: Option<Value>,
         reason: Option<&str>,
-        confirm_external: bool,
+        seen: Seen<'_>,
     ) -> Result<Value, ApiError> {
         if !approval_id_ok(id) {
             return Err(refused_locally("not an approval id"));
@@ -233,8 +271,11 @@ impl ToolServer {
         if let Some(reason) = reason {
             body["reason"] = json!(reason);
         }
-        if confirm_external {
+        if seen.confirm_external {
             body["confirm_external"] = json!(true);
+        }
+        if let Some(hash) = seen.args_hash {
+            body["expected_args_hash"] = json!(hash);
         }
         let res = self
             .http
@@ -249,8 +290,9 @@ impl ToolServer {
                 ApiError::Unavailable
             })?;
         let status = res.status();
-        let json: Value = res.json().await.unwrap_or(Value::Null);
+        let mut json: Value = res.json().await.unwrap_or(Value::Null);
         if status.is_success() {
+            annotate(&mut json, &self.personas);
             return Ok(json);
         }
         let code = json["code"].as_str().unwrap_or_default().to_string();
@@ -401,9 +443,9 @@ impl ToolServer {
         if !request_id_ok(id) {
             return Err(refused_locally("not a request id"));
         }
-        // No `roles`: the tool server's default (`pm`) applies. The bot's token may grant
-        // `pm` and `skill-author` only, and never asks for more; admins are added by a pull
-        // request to `team.yaml`.
+        // No `roles`: the tool server's default (`pm`) applies. From the bot's token a join is
+        // `pm` only (`403 admin_not_from_slack`, `403 role_not_from_slack` otherwise), and
+        // this client never asks for more.
         let mut body = json!({"decision": decision, "decided_by": decided_by});
         if let Some(handle) = handle {
             body["handle"] = json!(handle);
@@ -417,7 +459,9 @@ impl ToolServer {
         Ok(request_of(&body).clone())
     }
 
-    /// `POST /internal/members/{handle}/remove`. Returns `{handle, commit}`.
+    /// `POST /internal/members/{handle}/remove`: a deactivation since slice U3. Returns
+    /// `{handle, deactivated, commit: null, note}`; refusals carry a `code`
+    /// (`docs/toolserver.md` "Members").
     pub async fn remove_member(&self, handle: &str, decided_by: &str) -> Result<Value, ApiError> {
         if !pmos_contract::model::valid_handle(handle) {
             return Err(refused_locally("not a handle"));
@@ -474,7 +518,11 @@ impl ToolServer {
                 .query(&[("user", handle)]),
         )
         .await?;
-        let items = body["approvals"].as_array().cloned().unwrap_or_default();
+        let mut items = body["approvals"].as_array().cloned().unwrap_or_default();
+        // Each row names its bot, and a Preview says so (gate-fix-4, M1).
+        for item in &mut items {
+            annotate(item, &self.personas);
+        }
         let total = body["total"]
             .as_u64()
             .map_or(items.len(), |t| (t as usize).max(items.len()));
@@ -570,10 +618,8 @@ mod decision_errors {
         let msg = "PM OS hit an internal error running this write; a platform owner can find \
                    the detail in the tool server's log";
         let ts = answering(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": msg})).await;
-        match ts
-            .decide("apr_1", "ana", "approve", None, None, false)
-            .await
-        {
+        let seen = Seen::hash("0123456789abcdef");
+        match ts.decide("apr_1", "ana", "approve", None, None, seen).await {
             Err(ApiError::Refused {
                 status: 500, error, ..
             }) => assert_eq!(error, msg),
@@ -582,8 +628,7 @@ mod decision_errors {
         // A bare 500 or 503 still means "try again".
         let ts = answering(StatusCode::SERVICE_UNAVAILABLE, json!({})).await;
         assert_eq!(
-            ts.decide("apr_1", "ana", "approve", None, None, false)
-                .await,
+            ts.decide("apr_1", "ana", "approve", None, None, seen).await,
             Err(ApiError::Unavailable)
         );
         // A changed target keeps its code.
@@ -593,10 +638,17 @@ mod decision_errors {
         )
         .await;
         assert_eq!(
-            ts.decide("apr_1", "ana", "edit", Some(json!({})), None, false)
-                .await
-                .unwrap_err()
-                .code(),
+            ts.decide(
+                "apr_1",
+                "ana",
+                "edit",
+                Some(json!({})),
+                None,
+                Seen::default()
+            )
+            .await
+            .unwrap_err()
+            .code(),
             Some("target_changed")
         );
     }

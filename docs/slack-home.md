@@ -8,8 +8,11 @@ what it's connected to, in one place. Three buttons at the top switch between th
 *Staff* level. Change it by sending me `level …`." (`docs/levels.md`). If PM OS can't read your
 level, the line is left out.
 
-You need to be on the product team (`team.yaml`). Anyone else sees "PM OS is for the product
-team. DM me to ask for access."
+You need to be an active PM OS user holding `pm`, `reviewer` or `admin` in the user database
+(the Slack service reads it from the tool server, `docs/user-database-spec.md` §2). Anyone the
+database doesn't have sees "PM OS is for the product team. DM me to ask for access."; a
+deactivated person, an Auditor only, or anyone while PM OS can't check (no directory answer
+for 5 minutes) sees a plain line saying which.
 
 ## Inbox
 
@@ -41,6 +44,7 @@ says "and N more; they appear as you clear these."
 | **rejected** | Discarded; nothing was sent | Nothing |
 | **blocked** | Built from restricted sources, and people in the channel aren't on the product team | Reject it, or answer in the thread yourself |
 | **needs your confirmation** | It goes to a channel shared outside the company | Confirm on its card in our DM |
+| **changed since you looked** | Its text changed after the Home showed it (an edit in the web app), so it wasn't approved | Open it, read it, and approve again |
 | **expired**, or **already decided** | Past its 24 hours, or decided elsewhere (on its card, or by another tap) | Nothing |
 | **failed** | PM OS couldn't reach the tool server, or the write failed (the line gives the error) | Try again, or ask a platform owner |
 | "Tick the drafts first." | You tapped a button with nothing ticked | Tick at least one |
@@ -48,6 +52,28 @@ says "and N more; they appear as you clear these."
 **Edit and Snooze stay on the draft's card in your DM** with PM OS. The Home only approves
 and rejects; the footer says so: "To edit or snooze a draft, use its card in our DM."
 Rejecting from the Home records no reason; to say why, reject on the card.
+
+A Confluence or Jira draft's card in our DM also has **Open in workspace** when the web app is
+set up (`PMOS_WEB_PUBLIC_URL`). It opens the same draft at `/#/d/<id>` in the web app, where
+the PM can read, edit and decide it (cards posted earlier link to `/drafts/<id>`, which the web
+app redirects there). The button is absent when that setting is unset, and on Slack replies and
+messages, which have no web page.
+
+**An edit saved in the web app** is saved on the draft itself, so the card approves it: the
+card says "edited by <PM>", and an **Approve** on a card posted before the edit approves
+nothing, but shows the card again with the text as it is now (its buttons carry the start of
+the text's hash, `approval:<id>:<hash>`), to read and approve again. Every approve sends that
+hash to the tool server (`expected_args_hash`), which refuses the approve as `stale` if the
+draft changed in between, and the card is shown again then too. A card from before cards
+carried the hash approves nothing either: it is shown again as the draft is now, saying it is
+from an older version. The same goes for **Post to external channel**: its buttons carry the
+hash of the text it confirmed.
+
+**Approve selected** works the same way: each row carries the hash of what it showed
+(`pick_<id>:<hash>`). A draft that changed since the Home was published is refused as `stale`,
+and a row from a Home published before rows carried the hash is skipped without a call; the
+notice counts both, as "N changed since you looked, so they were not approved. Open each to
+review."
 
 **What the Slack bot can see and change.** The bot is the approval screen, so the tool server
 limits what its token can do:
@@ -60,28 +86,43 @@ limits what its token can do:
   the card says so and keeps its buttons.
 - **The triage digest** reads the feedback ledger without approval ids: each row links to
   its task by `run_id`.
-- **New members** are added as PMs. Admins are added by a pull request to `team.yaml`.
+- **New members** are added as PMs. Other roles are given in the web app; admins only by
+  someone with host access (`pmos-admin users grant-admin`).
 
 ## Skills
 
-**What PM OS can do for you in Slack,** grouped by track:
+**What PM OS can do for you in Slack.** The level line comes first, then how to ask, then:
 
-| Track | For |
+**Start here** suggests three skills to try first, each with what you get and something to
+type. They are the work almost every PM does in their first week: `ask` (a sourced answer to a
+question), `meeting-notes` (decisions and follow-ups from a call) and `status-update` (a
+stakeholder update). The list lives in `START_HERE` in `crates/slack/src/home.rs`, in the
+order it is offered. If one isn't in your bot's skills, the next in the list takes its place
+(`prd-draft`, `problem-framing`, `slack-reply`); if none is, Start here is left out.
+
+**Then the rest, grouped by the job they do:**
+
+| Group | For |
 | --- | --- |
 | Everyday | Questions, docs, meeting notes, Slack replies |
-| Product sense | Critiques and problem framing |
-| Strategy and decisions | Strategy and decision docs, prioritizing, pre-mortems |
-| Metrics and experiments | Metric trees, experiment design and readouts |
-| Spec and review | PRDs and the review panel |
-| Customer and market | Call synthesis, competitive briefs, sizing, PoC plans, partner briefs |
-| AI products | AI feature specs and eval plans |
-| Delivery and launch | Release notes, status updates, launch checklists, Jira drafts, advisories |
-| Leading across teams | Portfolio reviews, roadmap trade-offs, OKRs, business reviews, alignment plans, coaching, the bets register |
-| Company bets | Vision docs, investment cases, pricing proposals, platform strategy, exec briefs |
+| Understand and decide | Critiques, problem framing, call synthesis, competitive briefs, sizing, strategy and decision docs |
+| Write a document | PRDs, AI feature specs and eval plans, vision docs, investment cases, pricing proposals |
+| Plan and prioritise | Prioritising, roadmap trade-offs, OKRs, the bets register, portfolio reviews, metric trees, experiment design, platform strategy |
+| Launch | Release notes, launch checklists, Jira drafts, advisories |
+| Review and coach | The review panel, pre-mortems, experiment readouts, business reviews, coaching |
+| Communicate | Status updates, exec briefs, alignment plans, partner briefs |
+| More | Any skill that fits none of the above |
 
-Each line is a skill's name and what it's for. You see the skills your personal bot can run;
-without a personal bot, the Docs bot's. If PM OS can't load the bot's details, it lists every
-Slack skill, with a note saying so.
+**How a skill gets its group:** from its `track` in the skill's front matter, through a table
+in `GROUPS`; a few skills whose job differs from their track's (such as `pre-mortem`) are
+named in `GROUP_OVERRIDES`. A skill with a new or missing track goes to **More**, so every
+skill appears exactly once and nothing needs changing in the skill files.
+
+Each group lists a skill's name and what it's for. A group with more than six skills shows
+the first six and a **Show all in <group>** button; tapping it opens that group in full (one
+group at a time, until you open another section). You see the skills your personal bot can
+run; without a personal bot, the Docs bot's. If PM OS can't load the bot's details, it lists
+every Slack skill, with a note saying so.
 
 **To use one:** DM PM OS and ask in your own words, or name the skill first:
 `strategy-doc: our plan for small teams`. What each skill needs from you is in
@@ -114,3 +155,25 @@ Drafts already waiting stay in your Inbox, but one that needs the account fails 
 approve it.
 
 **Memory:** your memory repo's name, when you have set one (`docs/onboarding-spec.md`).
+
+## First time (`PMOS_ONBOARDING_V2=1`)
+
+**Something useful about your own work comes before anything about PM OS.** With the setting
+off (the default) a new member gets the welcome and the setup checklist, as before. With it on:
+
+1. **Hello:** two short lines by first name and one button, **Connect Jira and Confluence**
+   (the Atlassian link). No checklist.
+2. **The offer:** after you have linked the account, the next time you message PM OS or open the
+   Home it posts one message, "Found your account. Want the short version of your week, or shall
+   I start on something?", with **Summarize my week**, **Draft a status update** and **What's
+   blocked?**. Each starts a task for your own bot, as if you had typed it; the answer, with its
+   sources, arrives in the thread under the offer. Nothing polls for the link.
+3. **Slack and your memory repo are not asked for up front.** They are offered, with their
+   connect link and one plain sentence, the first time a request needs them.
+4. **One closing line,** after your first finished task: the Skills section of the Home tab, and
+   `nudges off`. Then no more onboarding messages.
+
+`setup` in the DM still shows the full checklist. Each step is shown once; what you have seen is
+kept in `onboarding.json` in the Slack state directory (`PMOS_SLACK_STATE_DIR`), so a restart
+repeats nothing. When nudges are on, an onboarding message counts as that day's message. The
+wording is in `crates/slack/src/onboard_copy.rs`.

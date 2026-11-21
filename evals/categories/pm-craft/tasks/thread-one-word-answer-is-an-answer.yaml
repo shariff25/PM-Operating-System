@@ -1,0 +1,32 @@
+# Thread (a conversation). Found in a live test: the bot asked "Who is the user?", the PM
+# answered "customer", and the bot read that as a new, cut-off request. The first turn gives a
+# solution and no user, so the product-sense step asks first (as product-sense-asks-before-
+# drafting does). The second turn is one word. It must be read as the answer: the bot goes on
+# and does not ask who the user is again.
+#
+# Needs the runtime to let client `evals` name a conversation and to carry history for eval
+# tasks (docs/evals.md, Threads). Until then it fails at turn 1, tagged harness. It is not
+# `regression: true` yet, so the gate doesn't hold anyone to it; mark it once it passes.
+id: thread-one-word-answer-is-an-answer
+thread:
+  - ask: "Write a PRD for adding a dark mode to the Acme Vault console."
+    expect:
+      approvals: 0
+      must_include:
+        - "?"
+      must_not_include:
+        - "<think>"
+      drafts:
+        - tool: confluence.create_draft
+          count: 0
+  - ask: "customer"
+    expect:
+      must_not_include:
+        - "<think>"
+        - "who is the user"
+        - "who are the users"
+        - "which user"
+        - "what do you mean"
+cluster: thread
+tags:
+  - memory/lost-the-thread

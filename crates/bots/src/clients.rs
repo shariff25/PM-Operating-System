@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use pmos_contract::Sensitivity;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -15,6 +16,81 @@ pub enum CallError {
     /// It answered and said no; the message is its reason.
     #[error("{0}")]
     Refused(String),
+    /// The tool server refused a persona session with one of its persona codes
+    /// (`persona_needs_personal_bot`, `persona_unavailable`, `persona_not_on_team`); the
+    /// message is its sentence for the PM.
+    #[error("{message}")]
+    PersonaRefused { code: String, message: String },
+}
+
+/// The tool server's codes for a refused persona session (`docs/bot-marketplace-spec.md` §6,
+/// "Sessions"; `docs/toolserver.md`).
+pub const PERSONA_CODES: [&str; 3] = [
+    "persona_needs_personal_bot",
+    "persona_unavailable",
+    "persona_not_on_team",
+];
+
+/// The persona a session runs as, as the tool server reports it (`201 {persona}`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SessionPersona {
+    pub key: String,
+    pub display_name: String,
+    pub title: String,
+    pub role: String,
+}
+
+/// A session the tool server started (`POST /internal/sessions`, `201`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionGrant {
+    pub token: String,
+    /// The session's tools by harness name (`jira_search`), when the answer listed them.
+    pub tools: Option<Vec<String>>,
+    /// The persona it runs as; `None` for Nudge.
+    pub persona: Option<SessionPersona>,
+}
+
+/// The token never reaches a log through `Debug`.
+impl std::fmt::Debug for SessionGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionGrant")
+            .field("token", &"<redacted>")
+            .field("tools", &self.tools)
+            .field("persona", &self.persona)
+            .finish()
+    }
+}
+
+/// Read a `201` answer of `POST /internal/sessions`. A missing token, or a `persona` that
+/// doesn't read, is the tool server misbehaving: unavailable, never a guess.
+pub fn read_session_grant(body: &Value) -> Result<SessionGrant, CallError> {
+    let token = body["token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .ok_or(CallError::Unavailable("the tool server"))?
+        .to_string();
+    let tools = match body.get("tools") {
+        Some(Value::Array(items)) => Some(
+            items
+                .iter()
+                .map(|t| t["name"].as_str().or(t.as_str()).map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(CallError::Unavailable("the tool server"))?,
+        ),
+        _ => None,
+    };
+    let persona = match body.get("persona") {
+        None | Some(Value::Null) => None,
+        Some(p) => Some(
+            serde_json::from_value::<SessionPersona>(p.clone())
+                .map_err(|_| CallError::Unavailable("the tool server"))?,
+        ),
+    };
+    Ok(SessionGrant {
+        token,
+        tools,
+        persona,
+    })
 }
 
 fn http(timeout: Duration) -> reqwest::Client {
@@ -96,19 +172,33 @@ impl ToolServer {
     }
 
     /// A bot session for one task (spec §2): the tool server applies the bot's role
-    /// allowlist, data class and write settings to every call made with it. Returns the
-    /// session token.
+    /// allowlist, data class and write settings to every call made with it.
+    ///
+    /// `history` is the highest data class the task's conversation history was built from,
+    /// for a task that carries earlier turns: the session starts there (W6). `persona` is the
+    /// marketplace bot it runs as (`None`: Nudge, and no `persona` field is sent, so an older
+    /// tool server is asked exactly what it was asked before); the tool server checks it is
+    /// offered and on the PM's team, and refuses with a persona code otherwise.
     pub async fn create_session(
         &self,
         user: &str,
         bot: &str,
         run_id: &str,
-    ) -> Result<String, CallError> {
+        history: Option<Sensitivity>,
+        persona: Option<&str>,
+    ) -> Result<SessionGrant, CallError> {
+        let mut body = json!({"user": user, "bot": bot, "run_id": run_id});
+        if let Some(level) = history {
+            body["history_sensitivity"] = json!(level);
+        }
+        if let Some(persona) = persona {
+            body["persona"] = json!(persona);
+        }
         let res = self
             .http
             .post(format!("{}/internal/sessions", self.base))
             .bearer_auth(&self.token)
-            .json(&json!({"user": user, "bot": bot, "run_id": run_id}))
+            .json(&body)
             .send()
             .await
             .map_err(|e| {
@@ -118,14 +208,20 @@ impl ToolServer {
         let status = res.status();
         let body: Value = res.json().await.unwrap_or(Value::Null);
         if status.is_success() {
-            return body["token"]
-                .as_str()
-                .map(str::to_string)
-                .ok_or(CallError::Unavailable("the tool server"));
+            return read_session_grant(&body);
         }
         if status.is_server_error() || status.as_u16() == 429 {
             tracing::warn!(%status, "tool server error creating a session");
             return Err(CallError::Unavailable("the tool server"));
+        }
+        if let Some(code) = body["code"].as_str().filter(|c| PERSONA_CODES.contains(c)) {
+            return Err(CallError::PersonaRefused {
+                code: code.to_string(),
+                message: body["error"]
+                    .as_str()
+                    .unwrap_or("the tool server refused this bot's session")
+                    .to_string(),
+            });
         }
         Err(CallError::Refused(
             body["error"]
@@ -133,6 +229,57 @@ impl ToolServer {
                 .unwrap_or("the tool server refused the session")
                 .to_string(),
         ))
+    }
+
+    /// End a session at once (`DELETE /internal/session`, `X-Pmos-Session`). Best effort: a
+    /// session that can't be revoked still lapses at its TTL, and it is never handed to a
+    /// worker. Used for a session that doesn't match the task's persona.
+    pub async fn revoke_session(&self, token: &str) -> bool {
+        match self
+            .http
+            .delete(format!("{}/internal/session", self.base))
+            .bearer_auth(&self.token)
+            .header("x-pmos-session", token)
+            .send()
+            .await
+        {
+            Ok(res) if res.status().is_success() => true,
+            Ok(res) => {
+                tracing::warn!(status = %res.status(), "the tool server didn't revoke a session");
+                false
+            }
+            Err(_) => {
+                tracing::warn!("the tool server was unreachable revoking a session");
+                false
+            }
+        }
+    }
+
+    /// The highest data class the run's sessions read (`GET /internal/runs/{id}/sensitivity`),
+    /// or `None` when the tool server has no session of it stored.
+    pub async fn run_sensitivity(&self, run_id: &str) -> Result<Option<Sensitivity>, CallError> {
+        let res = self
+            .http
+            .get(format!("{}/internal/runs/{run_id}/sensitivity", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| CallError::Unavailable("the tool server"))?;
+        if !res.status().is_success() {
+            tracing::warn!(status = %res.status(), "tool server error reading a run's level");
+            return Err(CallError::Unavailable("the tool server"));
+        }
+        let body: Value = res
+            .json()
+            .await
+            .map_err(|_| CallError::Unavailable("the tool server"))?;
+        match &body["sensitivity"] {
+            Value::Null => Ok(None),
+            Value::String(s) => Sensitivity::parse(s)
+                .map(Some)
+                .ok_or(CallError::Unavailable("the tool server")),
+            _ => Err(CallError::Unavailable("the tool server")),
+        }
     }
 
     /// One approval item's state, or `None` if the tool server doesn't have it.

@@ -20,7 +20,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use common::{serve, until, Call, FakeSlack, APP_TOKEN, SLACK_BOT_TOKEN};
+use common::{person, serve, until, Call, Directory, FakeSlack, APP_TOKEN, SLACK_BOT_TOKEN};
 use pmos_slack::bots::{Bots, BotsConfig};
 use pmos_slack::commands::Commands;
 use pmos_slack::notify::{Notifier, CURSOR_FILE};
@@ -35,7 +35,13 @@ use tokio_util::sync::CancellationToken;
 
 const BOTS_TOKEN: &str = "test-bots-token-slack-0123456789abcdef";
 const TOOL_BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
-const TEAM: &str = "members:\n  - {handle: ana, slack-id: U0ANA, roles: [pm]}\n  - {handle: bob, slack-id: U0BOB, roles: [pm]}\n";
+/// The user directory: Ana and Bob.
+fn team() -> Vec<pmos_directory::snapshot::DirectoryUser> {
+    vec![
+        person("ana", "U0ANA", &["pm"]),
+        person("bob", "U0BOB", &["pm"]),
+    ]
+}
 
 fn bearer(headers: &HeaderMap) -> &str {
     headers
@@ -318,6 +324,21 @@ async fn ts_decide(
     if item["status"] != "pending" {
         return refuse(StatusCode::CONFLICT, "approval item is already decided");
     }
+    // As the tool server (R4): an approve names the args hash the PM was shown, and a draft
+    // that changed since is refused as `stale`.
+    match body["expected_args_hash"].as_str() {
+        None if body["decision"] == "approve" => {
+            return refuse(StatusCode::BAD_REQUEST, "expected_args_hash required")
+        }
+        Some(h) if !item["args_hash"].as_str().unwrap_or("").starts_with(h) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "changed", "code": "stale"})),
+            )
+                .into_response()
+        }
+        _ => {}
+    }
     // A reason goes only with `reject` (spec §1 of `docs/improvement-loop-spec.md`).
     if body.get("reason").is_some() && body["decision"] != "reject" {
         return refuse(
@@ -367,9 +388,14 @@ fn tools_routes(ts: Arc<MockTools>) -> Router {
 fn approval(id: &str, user: &str, tool: &str, args: Value) -> Value {
     json!({
         "id": id, "user": user, "skill": "bot:docs", "run_id": "tsk_1", "tool": tool,
-        "args": args, "args_hash": "x", "status": "pending", "created_at": "2026-11-14T10:00:00Z",
+        "args": args, "args_hash": ARGS_HASH, "status": "pending", "created_at": "2026-11-14T10:00:00Z",
     })
 }
+
+/// Every fixture item's args hash; cards are posted with its first 16 characters.
+const ARGS_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// What a card posted for a fixture item carries, and an approve sends.
+const SHOWN: &str = "0123456789abcdef";
 
 // ---- The stack ----
 
@@ -380,7 +406,9 @@ struct Stack {
     tools: Arc<MockTools>,
     bots: Bots,
     state: tempfile::TempDir,
-    _team: tempfile::TempDir,
+    /// The content root (empty: no skills).
+    _content: tempfile::TempDir,
+    directory: Directory,
     stop: Vec<CancellationToken>,
     socket: Option<(CancellationToken, JoinHandle<Ended>)>,
 }
@@ -403,20 +431,21 @@ impl Stack {
         let tools = Arc::new(MockTools::default());
         let (ts_base, stop_ts) = serve(tools_routes(tools.clone())).await;
 
-        let team = tempfile::tempdir().unwrap();
-        let team_file = team.path().join("team.yaml");
-        std::fs::write(&team_file, TEAM).unwrap();
+        let content = tempfile::tempdir().unwrap();
+        let directory = Directory::seeded(team()).await;
         let state = tempfile::tempdir().unwrap();
         let http = reqwest::Client::new();
         let bots = Bots::new(BotsConfig {
             slack: SlackApi::new(slack_base, SLACK_BOT_TOKEN, http.clone()),
             runtime: Runtime::new(rt_base, BOTS_TOKEN, http.clone()),
             toolserver: ToolServer::new(ts_base, TOOL_BOT_TOKEN),
-            team_file,
+            people: directory.people(),
+            content_root: content.path().to_path_buf(),
             default_tz: "UTC".into(),
             github_org: None,
             response_url_prefix: "https://hooks.slack.com/".into(),
             state_dir: state.path().to_path_buf(),
+            web_url: None,
         });
         Self {
             slack,
@@ -425,7 +454,8 @@ impl Stack {
             tools,
             bots,
             state,
-            _team: team,
+            _content: content,
+            directory,
             stop: vec![stop_slack, stop_rt, stop_ts],
             socket: None,
         }
@@ -439,7 +469,7 @@ impl Stack {
             APP_TOKEN,
             Commands {
                 toolserver: ToolServer::new("http://127.0.0.1:9", TOOL_BOT_TOKEN),
-                team_file: "/nonexistent/team.yaml".into(),
+                people: self.directory.people(),
                 http: http.clone(),
                 response_url_prefix: "https://hooks.slack.com/".into(),
                 request_access: true,
@@ -531,7 +561,9 @@ fn click(
             "container": {"type": "message", "channel_id": channel, "message_ts": ts},
             "channel": {"id": channel},
             "message": {"ts": ts, "thread_ts": "100.2"},
-            "actions": [{"type": "button", "action_id": action_id, "block_id": "b", "value": value}],
+            // As on a card posted for a fixture item: its buttons carry what it showed.
+            "actions": [{"type": "button", "action_id": action_id,
+                         "block_id": format!("approval:{value}:{SHOWN}"), "value": value}],
         },
     })
 }
@@ -620,7 +652,7 @@ async fn dms_go_to_the_right_bot_as_the_right_pm() {
         .send(dm("e5", "Ev5", "U0BOB", "100.5", None, "hello"))
         .await;
     tasks(5).await;
-    // Not in team.yaml: a private note, no task.
+    // Not in the user directory: a private note, no task.
     stack
         .send(dm("e6", "Ev6", "U0STRANGER", "100.6", None, "hi"))
         .await;
@@ -1048,7 +1080,7 @@ async fn approval_cards_are_decided_by_their_own_pm() {
         vec![
             (
                 "apr_a1".into(),
-                json!({"decided_by": "ana", "decision": "approve"})
+                json!({"decided_by": "ana", "decision": "approve", "expected_args_hash": SHOWN})
             ),
             (
                 "apr_a3".into(),
@@ -1069,6 +1101,137 @@ async fn approval_cards_are_decided_by_their_own_pm() {
     stack.stop().await;
 }
 
+/// A click on an approval card's button, as Slack sends it: with the clicked block's id.
+fn click_in(
+    envelope_id: &str,
+    user: &str,
+    action_id: &str,
+    value: &str,
+    ts: &str,
+    block_id: &str,
+) -> Value {
+    let mut c = click(envelope_id, user, action_id, value, "D0ANA", ts);
+    c["payload"]["actions"][0]["block_id"] = json!(block_id);
+    c
+}
+
+/// The approval actions block's id in a card's blocks.
+fn approval_block_id(blocks: &Value) -> String {
+    blocks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| {
+            b["type"] == "actions"
+                && b["block_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("approval:"))
+        })
+        .and_then(|b| b["block_id"].as_str())
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn an_edit_saved_in_the_web_app_is_what_the_card_approves() {
+    let mut stack = Stack::new().await;
+    let hash = |c: char| c.to_string().repeat(64);
+    let mut item = approval(
+        "apr_w1",
+        "ana",
+        "confluence.create_draft",
+        json!({"space": "PM", "title": "Launch plan", "body": "As the bot drafted it"}),
+    );
+    item["args_hash"] = json!(hash('a'));
+    stack
+        .tools
+        .items
+        .lock()
+        .unwrap()
+        .insert("apr_w1".into(), item);
+    stack.feed(vec![json!({
+        "id": "n1", "task_id": "tsk_1", "bot": "docs", "requested_by": "ana",
+        "slack": {"channel": "D0ANA", "thread_ts": "100.2"}, "kind": "needs_approval",
+        "text": "", "approvals": ["apr_w1"],
+    })]);
+    stack.connect();
+    let (stop, handle) = stack.notifier();
+    let posts = stack.calls("chat.postMessage", 1).await;
+    let card = posts
+        .iter()
+        .find(|p| p.body["blocks"].to_string().contains("approval:apr_w1"))
+        .unwrap()
+        .clone();
+    assert!(text_of(&card).contains("As the bot drafted it"));
+    let posted_block = approval_block_id(&card.body["blocks"]);
+    assert_eq!(
+        posted_block,
+        format!("approval:apr_w1:{}", &hash('a')[..16])
+    );
+    let ts = card.body["ts"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| "1700000000.000001".into());
+
+    // The PM saves an edit in the web app: the tool server's item now holds it.
+    {
+        let mut items = stack.tools.items.lock().unwrap();
+        let it = items.get_mut("apr_w1").unwrap();
+        it["args"]["body"] = json!("Edited in the web app");
+        it["args_hash"] = json!(hash('b'));
+        it["edited"] = json!(true);
+    }
+    // Approve on the card posted before the edit: nothing is decided; the card shows the
+    // text as it is now, says why, and its buttons carry the new text's hash.
+    stack
+        .send(click_in(
+            "w1",
+            "U0ANA",
+            "apr_approve",
+            "apr_w1",
+            &ts,
+            &posted_block,
+        ))
+        .await;
+    let fresh = card_update(&stack, &ts, "the refreshed card", |t| {
+        t.contains("edited after this card was posted")
+    })
+    .await;
+    assert!(text_of(&fresh).contains("Edited in the web app"));
+    assert!(text_of(&fresh).contains("edited by Ana"));
+    assert!(stack.tools.decisions.lock().unwrap().is_empty());
+    let fresh_block = approval_block_id(&fresh.body["blocks"]);
+    assert_eq!(fresh_block, format!("approval:apr_w1:{}", &hash('b')[..16]));
+
+    // Approve again on the refreshed card: an `approve`, so the tool server writes the
+    // arguments it holds, the edit; the closed card shows that text.
+    stack
+        .send(click_in(
+            "w2",
+            "U0ANA",
+            "apr_approve",
+            "apr_w1",
+            &ts,
+            &fresh_block,
+        ))
+        .await;
+    let approved = card_update(&stack, &ts, "the approved card", |t| {
+        t.contains("Approved by Ana")
+    })
+    .await;
+    assert!(text_of(&approved).contains("Edited in the web app"));
+    let decisions = stack.tools.decisions.lock().unwrap().clone();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(
+        decisions[0].2,
+        json!({"decided_by": "ana", "decision": "approve",
+               "expected_args_hash": &hash('b')[..16]})
+    );
+    stop.cancel();
+    handle.await.unwrap();
+    stack.stop().await;
+}
+
 /// The blocks of the latest `chat.update` of the message at `ts`, once one matches `want`.
 async fn card_update(stack: &Stack, ts: &str, what: &str, want: impl Fn(&str) -> bool) -> Call {
     until(what, || {
@@ -1080,6 +1243,52 @@ async fn card_update(stack: &Stack, ts: &str, what: &str, want: impl Fn(&str) ->
             .find(|u| u.body["ts"] == ts && want(&text_of(u)))
     })
     .await
+}
+
+/// R5: a card posted before cards carried the args hash approves nothing: the card is shown
+/// again as the item is now, with buttons that carry its hash; approving that one works.
+#[tokio::test]
+async fn an_old_card_without_its_hash_approves_nothing() {
+    let mut stack = Stack::new().await;
+    stack.tools.items.lock().unwrap().insert(
+        "apr_o1".into(),
+        approval(
+            "apr_o1",
+            "ana",
+            "confluence.create_draft",
+            json!({"space": "PM", "title": "Old card", "body": "Text"}),
+        ),
+    );
+    stack.connect();
+    let ts = "1700000000.000042";
+    stack
+        .send(click_in(
+            "o1",
+            "U0ANA",
+            "apr_approve",
+            "apr_o1",
+            ts,
+            "approval:apr_o1",
+        ))
+        .await;
+    let fresh = card_update(&stack, ts, "the card shown again", |t| {
+        t.contains("from an older version of PM OS")
+    })
+    .await;
+    assert!(stack.tools.decisions.lock().unwrap().is_empty());
+    let block = approval_block_id(&fresh.body["blocks"]);
+    assert_eq!(block, format!("approval:apr_o1:{SHOWN}"));
+    stack
+        .send(click_in("o2", "U0ANA", "apr_approve", "apr_o1", ts, &block))
+        .await;
+    card_update(&stack, ts, "the approved card", |t| {
+        t.contains("Approved by Ana")
+    })
+    .await;
+    let decisions = stack.tools.decisions.lock().unwrap().clone();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].2["expected_args_hash"], SHOWN);
+    stack.stop().await;
 }
 
 #[tokio::test]

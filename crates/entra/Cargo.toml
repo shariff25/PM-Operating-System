@@ -1,0 +1,31 @@
+[package]
+name = "pmos-entra"
+description = "Microsoft Entra ID ID-token validation shared by pmos-web and the tool server: one copy of the claim rules"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version = "1.88"
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+jsonwebtoken.workspace = true
+pmos-contract.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# `testing` only: a fake identity provider (discovery and JWKS) for other crates' tests.
+axum = { workspace = true, optional = true }
+
+[features]
+# `pmos_entra::testing`: test keys, a token signer and a fake discovery/JWKS server. Never
+# in a release binary.
+test-support = ["dep:axum"]
+
+[dev-dependencies]
+axum.workspace = true

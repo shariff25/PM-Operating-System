@@ -19,9 +19,8 @@ use pmos_toolserver::github_memory::GitHubMemory;
 use pmos_toolserver::oauth::{OAuth, OAuthConfig, TokenSource};
 use pmos_toolserver::onboarding::{GitHubSetup, Onboarding};
 use pmos_toolserver::pg::PgStore;
-use pmos_toolserver::team::Team;
 use pmos_toolserver::vault::Vault;
-use pmos_toolserver::{router_with, AppConfig, Stores, ToolService};
+use pmos_toolserver::{router_full, AppConfig, PersonClients, Stores, ToolService};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -30,6 +29,12 @@ const PRUNE_EVERY: Duration = Duration::from_secs(600);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `pmos-toolserver users …`: a host command (docs/runbooks/users.md), not the server.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("users") {
+        std::process::exit(pmos_toolserver::users::host::main(args[1..].to_vec()).await);
+    }
+
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -56,7 +61,8 @@ async fn main() -> Result<()> {
                 "context indexed"
             );
             spawn_pruner(pg.clone(), cancel.clone());
-            pg.stores()
+            pg.with_deactivation_cap(config.users_deactivations_per_hour)
+                .stores()
         }
         None => {
             tracing::warn!("PMOS_DEV=1 and no PMOS_DATABASE_URL: every store is in memory");
@@ -68,13 +74,59 @@ async fn main() -> Result<()> {
             Arc::new(JsonlAudit::open(path).context("opening audit log")?);
         stores.audit = Arc::new(TeeAudit(vec![stores.audit.clone(), file]));
     }
-
-    let live = matches!(config.connectors, Connectors::Live(_));
-    // With live connectors only people in team.yaml may use PM OS, and a linked account must
-    // be theirs.
-    let team = Team::load(&config.content_root, live).map_err(anyhow::Error::msg)?;
+    // The user database (docs/user-database-spec.md): since slice U3 the tool server decides
+    // from it who may use PM OS. In development the in-memory store is seeded (config.rs
+    // refuses a seed with a database or live connectors); with no seed and no database
+    // nobody may use PM OS. Since slice U7 no service reads a team file: the runtime, Slack,
+    // pmos-web and the console ask this server's directory.
+    let rules = pmos_toolserver::users::Rules {
+        evals_slack_allowed: config.database_url.is_none()
+            && matches!(config.connectors, Connectors::Fake),
+        deactivations_per_hour: config.users_deactivations_per_hour,
+    };
+    if let Some(path) = &config.users_seed {
+        let req = pmos_toolserver::users::import::seed_request(path).map_err(anyhow::Error::msg)?;
+        let seeded =
+            pmos_toolserver::users::MemoryUsers::seeded(req, rules, Some(stores.audit.clone()))
+                .await
+                .map_err(anyhow::Error::msg)?
+                .with_linked(stores.linked());
+        stores.users = Arc::new(seeded);
+        tracing::info!("user store seeded from PMOS_USERS_SEED (development only)");
+        // The eval stack's `evals` account gets every offered persona, so eval tasks pass the
+        // team check (docs/bot-marketplace-spec.md §5). In memory only, as the seed is.
+        let seeded = pmos_toolserver::team::seed_evals(
+            stores.teams.as_ref(),
+            stores.users.as_ref(),
+            catalog.roster(),
+            Utc::now(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        if seeded > 0 {
+            tracing::info!(personas = seeded, "the evals account's team seeded");
+        }
+    } else if config.database_url.is_none() {
+        stores.users = Arc::new(
+            pmos_toolserver::users::MemoryUsers::new(rules)
+                .with_audit(stores.audit.clone())
+                .with_linked(stores.linked()),
+        );
+    }
+    match stores.users.directory(Utc::now()).await {
+        Ok(dir) if dir.users.is_empty() => tracing::warn!(
+            "the user database is empty: nobody can use PM OS until `pmos-admin users import` \
+             (or bootstrap-admin) runs, or a dev stack sets PMOS_USERS_SEED"
+        ),
+        Ok(dir) => tracing::info!(users = dir.users.len(), "user database loaded"),
+        Err(e) => tracing::error!(error = %e, "the user database can't be read"),
+    }
+    let people = Arc::new(pmos_toolserver::users::access::People::new(
+        stores.users.clone(),
+    ));
 
     let mut github_setup = None;
+    let mut proposals = None;
     let (connectors, oauth): (Vec<Arc<dyn Connector>>, Option<Arc<OAuth>>) = match &config
         .connectors
     {
@@ -99,22 +151,20 @@ async fn main() -> Result<()> {
         }
         Connectors::Live(live) => {
             let vault = Vault::new(live.vault_keys.clone(), stores.credentials.clone());
-            let oauth = Arc::new(
-                OAuth::new(
-                    OAuthConfig {
-                        public_base_url: live.public_url.clone(),
-                        atlassian: Some(live.atlassian.clone()),
-                        atlassian_site: live.atlassian_site.clone(),
-                        slack: Some(live.slack.clone()),
-                        github: live.github.as_ref().map(|g| g.app.clone()),
-                        github_org: live.github.as_ref().map(|g| g.org.clone()),
-                        state_key: state_key(config.service_token.expose()),
-                        endpoints: live.endpoints.clone(),
-                    },
-                    vault,
-                )
-                .with_team(team.clone()),
-            );
+            let oauth = Arc::new(OAuth::new(
+                OAuthConfig {
+                    public_base_url: live.public_url.clone(),
+                    atlassian: Some(live.atlassian.clone()),
+                    atlassian_site: live.atlassian_site.clone(),
+                    slack: Some(live.slack.clone()),
+                    github: live.github.as_ref().map(|g| g.app.clone()),
+                    github_org: live.github.as_ref().map(|g| g.org.clone()),
+                    state_key: state_key(config.service_token.expose()),
+                    endpoints: live.endpoints.clone(),
+                },
+                vault,
+                people.clone(),
+            ));
             let tokens: Arc<dyn TokenSource> = oauth.clone();
             tracing::info!(
                 public_url = %live.public_url,
@@ -137,6 +187,7 @@ async fn main() -> Result<()> {
                     content_repo = gh.content_repo.as_deref().unwrap_or("none"),
                     "GitHub linking on"
                 );
+                proposals = gh.proposals.clone();
                 github_setup = Some(GitHubSetup {
                     github,
                     org: gh.org.clone(),
@@ -172,12 +223,47 @@ async fn main() -> Result<()> {
     }
     let skills = catalog.skills().count();
     let bots = catalog.roster().bots().count();
-    let svc = ToolService::new(catalog, stores, connectors)
+    let mut svc = ToolService::new(catalog, stores, connectors)
         .map_err(anyhow::Error::msg)?
-        .with_team(team.clone())
+        .with_people(people)
         .with_ledger_expire_days(config.ledger_expire_days)
-        .with_slack_draft_ttl_hours(config.slack_draft_ttl_hours);
+        .with_slack_draft_ttl_hours(config.slack_draft_ttl_hours)
+        .with_audit_retention_days(config.audit_retention_days);
+    // Password sign-in (docs/password-sign-in.md): on when the vault has a key to seal
+    // authenticator secrets with; its routes also need assertion `require`.
+    match &config.password_keys {
+        Some(keys) => {
+            let passwords = pmos_toolserver::password::PasswordService::new(keys.clone())
+                .map_err(anyhow::Error::msg)?;
+            let p = passwords.params();
+            tracing::info!(
+                argon2id_m_kib = p.m_kib,
+                argon2id_t = p.t,
+                argon2id_p = p.p,
+                "password sign-in available (pmos-web turns it on with PMOS_WEB_PASSWORD_LOGIN=1)"
+            );
+            svc = svc.with_passwords(Arc::new(passwords));
+        }
+        None => tracing::info!("password sign-in off: no PMOS_VAULT_KEY"),
+    }
+    if let Some((handle, file)) = &config.dev_password_setup {
+        dev_password_setup(&svc, handle, file).await?;
+    }
     let svc = Arc::new(svc);
+    // Audit retention (docs/audit-retention.md): daily, the first run a few minutes after
+    // start-up; the database itself holds every rule.
+    pmos_toolserver::retention::spawn(
+        svc.stores().audit.clone(),
+        config.audit_retention_days,
+        cancel.clone(),
+    );
+    tracing::info!(
+        retention_days = config.audit_retention_days,
+        "audit retention on: events older than this are deleted daily"
+    );
+    if config.database_url.is_some() {
+        pmos_toolserver::retention::spawn_role_changes(svc.stores().users.clone(), cancel.clone());
+    }
     // One replica: anything still `executing` from a previous process was interrupted.
     match svc.reconcile(chrono::Duration::zero(), Utc::now()).await {
         Ok(0) => {}
@@ -189,7 +275,18 @@ async fn main() -> Result<()> {
     }
     spawn_reconciler(svc.clone(), cancel.clone());
     spawn_draft_sweeper(svc.clone(), cancel.clone());
+    spawn_deactivation_sweeper(svc.clone(), cancel.clone());
     let mut onboarding = Onboarding::new(svc.clone(), oauth.clone(), github_setup);
+    match &proposals {
+        Some(p) => {
+            onboarding = onboarding.with_proposals(p.per_hour, p.policies_root.clone());
+            tracing::info!(
+                per_hour = p.per_hour,
+                "admin proposals on: opened as the acting admin, with their linked GitHub account"
+            );
+        }
+        None => tracing::info!("admin proposals off (PMOS_PROPOSALS, PMOS_CONTENT_REPO)"),
+    }
     if config.content_sync_secs > 0 {
         let sync = ContentSync::new(&config.content_root, svc.clone());
         sync.clone().spawn(
@@ -199,7 +296,40 @@ async fn main() -> Result<()> {
         onboarding = onboarding.with_sync(sync);
         tracing::info!(every_secs = config.content_sync_secs, "content sync on");
     }
-    let app = router_with(
+    tracing::info!(
+        web = config.web_token.is_some(),
+        console = config.console_token.is_some(),
+        mode = config.assertions.mode().as_str(),
+        keys = ?config.assertions.key_ids(),
+        "approvals clients that act for a person, and their user assertions"
+    );
+    if let Some(warning) = config.assertions.insecure_warning() {
+        tracing::error!("{warning}");
+    }
+    let entra = match &config.entra {
+        Some(tenant) => {
+            tracing::info!(
+                tenant = %tenant.tenant_id,
+                client = %tenant.client_id,
+                "first Entra links: ID tokens validated here for this tenant and client"
+            );
+            Some(Arc::new(
+                pmos_toolserver::app::EntraLinkCheck::new(tenant.clone())
+                    .map_err(anyhow::Error::msg)?,
+            ))
+        }
+        None => {
+            if config.web_token.is_some() {
+                tracing::warn!(
+                    "no PMOS_ENTRA_TENANT_ID and PMOS_ENTRA_CLIENT_ID: a first Microsoft sign-in \
+                     can't link (the first-link route answers 501); pmos-web's /readyz reports \
+                     it when Entra sign-in is on"
+                );
+            }
+            None
+        }
+    };
+    let app = router_full(
         svc,
         AppConfig {
             service_token: config.service_token.expose().to_string(),
@@ -216,6 +346,11 @@ async fn main() -> Result<()> {
             oauth,
         },
         Some(Arc::new(onboarding)),
+        PersonClients {
+            web_token: config.web_token.as_ref().map(|t| t.expose().to_string()),
+            assertions: config.assertions.clone(),
+            entra,
+        },
         cancel.clone(),
     );
     let listener = tokio::net::TcpListener::bind(config.bind)
@@ -235,6 +370,35 @@ async fn main() -> Result<()> {
             cancel.cancel();
         })
         .await?;
+    Ok(())
+}
+
+/// Development only (config.rs refuses it anywhere else): a setup code for `handle`, issued as
+/// the host would, written to a new file only its owner can read, so a test stack can print it.
+async fn dev_password_setup(svc: &ToolService, handle: &str, file: &std::path::Path) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let host = pmos_toolserver::users::HostUser::parse("dev")
+        .ok_or_else(|| anyhow::anyhow!("host user"))?;
+    let issued = pmos_toolserver::password::issue_setup_code(
+        svc.stores().users.passwords(),
+        &pmos_toolserver::users::Actor::host(host),
+        handle,
+        Utc::now(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("PMOS_DEV_PASSWORD_SETUP_FOR: {}", e.message()))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(file)
+        .with_context(|| format!("PMOS_DEV_PASSWORD_SETUP_FILE {}", file.display()))?;
+    writeln!(f, "{}", issued.code.expose())?;
+    tracing::warn!(
+        user = %handle,
+        "DEVELOPMENT: a password setup code was written to PMOS_DEV_PASSWORD_SETUP_FILE"
+    );
     Ok(())
 }
 
@@ -288,6 +452,25 @@ fn spawn_draft_sweeper(svc: Arc<ToolService>, cancel: CancellationToken) {
                     ),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "sweeping Slack drafts failed"),
+                },
+            }
+        }
+    });
+}
+
+/// Every 10 minutes, from start-up: people deactivated more than 24 hours ago (and not
+/// reactivated) lose their suspended linked accounts, and their held drafts are closed
+/// (`docs/user-database-spec.md` §6). With the database unavailable it does nothing.
+fn spawn_deactivation_sweeper(svc: Arc<ToolService>, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(PRUNE_EVERY);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick.tick() => match svc.sweep_deactivated(Utc::now()).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(people = n, "deactivation grace over: accounts deleted, drafts closed"),
+                    Err(e) => tracing::warn!(error = %e, "the deactivation sweeper failed"),
                 },
             }
         }

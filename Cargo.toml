@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/contract", "crates/cli", "crates/runtime", "crates/toolserver", "crates/docs", "crates/slack", "crates/gateway", "crates/bots", "crates/console", "crates/evals", "crates/policy"]
+members = ["crates/contract", "crates/cli", "crates/runtime", "crates/toolserver", "crates/docs", "crates/slack", "crates/gateway", "crates/bots", "crates/console", "crates/evals", "crates/policy", "crates/web", "crates/assertion", "crates/stack-tests", "crates/directory", "crates/entra"]
 
 [workspace.package]
 edition = "2021"
@@ -10,6 +10,13 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 aes-gcm = "0.10"
+# Password sign-in (docs/password-sign-in.md): Argon2id from RustCrypto, with its output and
+# inputs zeroized; no random-number feature (salts come from getrandom).
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash", "zeroize"] }
+getrandom = "0.3"
+# TOTP (RFC 6238) is HMAC-SHA-1.
+sha1 = "0.10"
+zeroize = "1.8"
 subtle = "2.6"
 anyhow = "1"
 async-trait = "0.1"
@@ -19,6 +26,9 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 chrono-tz = "0.10"
 croner = "4.0"
 hmac = "0.12"
+# Entra ID tokens (RS256) through aws-lc-rs, which rustls already uses: no OpenSSL. Shared by
+# pmos-web and the tool server through pmos-entra.
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
 clap = { version = "4", features = ["derive"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 reqwest = { version = "0.13", features = ["json", "form", "query"] }
@@ -35,7 +45,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
+pmos-assertion = { path = "crates/assertion" }
 pmos-contract = { path = "crates/contract" }
+pmos-directory = { path = "crates/directory" }
+pmos-entra = { path = "crates/entra" }
+pmos-evals = { path = "crates/evals" }
 pmos-policy = { path = "crates/policy" }
 pmos-runtime = { path = "crates/runtime" }
 
@@ -43,3 +57,9 @@ pmos-runtime = { path = "crates/runtime" }
 # test binaries ~20 GB).
 [profile.dev]
 debug = "line-tables-only"
+
+# Argon2id at OWASP's parameters takes seconds per hash unoptimized; tests hash often.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

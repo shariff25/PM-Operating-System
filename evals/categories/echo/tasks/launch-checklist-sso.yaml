@@ -1,0 +1,23 @@
+# Fixtures: epic PM-101 and story PM-102. A reused skill (launch-checklist): this task is in the
+# parity comparison. Rubric: one Confluence draft in space PM titled `Launch checklist: ...`
+# with the template's headings in order, the launch decision first as a recommendation, a row for
+# each area with an owner, a date and evidence or "not ready" (the fixtures hold no owners or
+# dates, so the rows say not ready and the gaps are open items), and a rollback with a trigger.
+# It fails with an invented owner, date or test result, a missing heading, or no draft.
+id: launch-checklist-sso
+ask: "Draft anyway, no questions: a launch checklist in the PM space for the SAML SSO launch in the Acme Vault console (Jira epic PM-101 and story PM-102)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Launch checklist:", "Launch decision", "Readiness", "Owners and dates", "Go/no-go criteria", "Rollback", "Communications", "Open items"]
+      must_not_include: ["<think>", "TODO", "<!--"]
+cluster: launch-checklist
+tags:
+  - model/draft-content

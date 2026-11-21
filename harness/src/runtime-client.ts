@@ -33,6 +33,15 @@ const BotSchema = z.object({
   job: z.string().default(""),
 });
 
+/** One earlier turn of the task's conversation (docs/bot-runtime-spec.md §3, Conversations). */
+const TurnSchema = z.object({
+  text: z.string(),
+  result: z.string().nullish(),
+  error: z.string().nullish(),
+  status: z.string(),
+  at: z.string().optional(),
+});
+
 export const ClaimSchema = z.object({
   task: TaskSchema,
   bot: BotSchema,
@@ -42,9 +51,38 @@ export const ClaimSchema = z.object({
   lease_until: z.string().optional(),
   /** The level to work at (docs/staff-principal-spec.md §1); an older runtime sends none. */
   level: z.enum(["senior", "staff", "principal"]).default("senior"),
+  /**
+   * The earlier turns of this conversation (the same Slack thread or web conversation, the
+   * same PM and bot), oldest first. Empty for a first message; an older runtime sends none.
+   */
+  history: z.array(TurnSchema).default([]),
+  /**
+   * The highest data class those earlier turns were built from. The tool server already
+   * started this task's session at it, so the worker can neither raise nor lower what the
+   * audience check sees; it only tells the model. Null without history; an older runtime
+   * sends none. An unknown value reads as "restricted".
+   */
+  history_sensitivity: z
+    .enum(["public", "internal", "restricted"])
+    .nullish()
+    .catch("restricted"),
+  /**
+   * The marketplace bot (persona) this task runs as (docs/bot-marketplace-spec.md §6). Absent
+   * (or null) for Nudge and from an older runtime. With one, `role` is the persona's role.
+   * `display_name` and `title` are catalog text: the worker checks their shape again before
+   * putting them in the system prompt (`personaLine`).
+   */
+  persona: z
+    .object({
+      key: z.string().min(1),
+      display_name: z.string().min(1),
+      title: z.string().min(1),
+    })
+    .nullish(),
 });
 
 export type Claim = z.infer<typeof ClaimSchema>;
+export type Turn = Claim["history"][number];
 export type ClaimedTask = Claim["task"];
 
 export interface ChecklistItem {

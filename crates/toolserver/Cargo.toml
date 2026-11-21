@@ -13,13 +13,19 @@ path = "src/main.rs"
 
 [dependencies]
 aes-gcm.workspace = true
+argon2.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 hmac.workspace = true
 chrono.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+pmos-assertion.workspace = true
 pmos-contract.workspace = true
+# The ID token rules pmos-web applies, for the first Entra link (one copy: crates/entra).
+pmos-entra.workspace = true
 pmos-policy.workspace = true
 pmos-runtime.workspace = true
 pulldown-cmark.workspace = true
@@ -27,7 +33,10 @@ reqwest.workspace = true
 rmcp = { version = "3.10", features = ["server", "transport-streamable-http-server", "client", "transport-streamable-http-client-reqwest"] }
 serde.workspace = true
 serde_json.workspace = true
+serde_norway.workspace = true
+sha1.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
@@ -37,7 +46,19 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
+zeroize.workspace = true
+
+[features]
+# An open user directory (any valid handle may use PM OS) for tests only: never in a release
+# binary (docs/user-database-spec.md §3, "Test stacks").
+test-support = []
 
 [dev-dependencies]
+# Itself, with the open directory for the integration tests.
+pmos-toolserver = { path = ".", features = ["test-support"] }
+# The runtime, for the end-to-end conversation test (tests/history_e2e.rs).
+pmos-bots = { path = "../bots" }
 pmos-docs = { path = "../docs" }
+# Test keys and a fake tenant (discovery and JWKS) for the first-link tests.
+pmos-entra = { workspace = true, features = ["test-support"] }
 rmcp = { version = "3.10", features = ["client", "transport-streamable-http-client-reqwest"] }

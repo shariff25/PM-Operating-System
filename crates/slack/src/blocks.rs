@@ -9,6 +9,53 @@ pub fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// A person's display name for `mrkdwn`, at most `max` characters, rendered inert. Display
+/// names come from Slack profiles (`users.info`, and the user database's `display_name`,
+/// which came from there) and are untrusted text (`docs/user-database-spec.md` §1, §11):
+///
+/// - control characters and line breaks become spaces, and runs of spaces one;
+/// - `&`, `<` and `>` are escaped, so `<!channel>`, `<!here>`, `<@U…>`, `<#C…>` and
+///   `<https://…|label>` show as typed and notify or link nothing;
+/// - the `mrkdwn` formatting characters `*`, `_`, `~` and `` ` `` become look-alikes, so a
+///   name can't make bold, italic, strike or code, nor close a span around it;
+/// - `.`, `/`, `:` and `@` become look-alikes, so Slack doesn't auto-link a URL, a domain
+///   or an address written into a name.
+///
+/// It reads the same to a person; only the characters Slack would act on change.
+pub fn name(text: &str, max: usize) -> String {
+    let mut flat = String::with_capacity(text.len());
+    for c in text.chars() {
+        let c = if c.is_control() || c.is_whitespace() {
+            ' '
+        } else {
+            c
+        };
+        if c == ' ' && (flat.is_empty() || flat.ends_with(' ')) {
+            continue;
+        }
+        flat.push(c);
+    }
+    let flat = truncate(flat.trim_end(), max);
+    let mut out = String::with_capacity(flat.len() + 8);
+    for c in flat.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '*' => out.push('\u{2217}'), // ∗ asterisk operator
+            '_' => out.push('\u{2017}'), // ‗ double low line
+            '~' => out.push('\u{223C}'), // ∼ tilde operator
+            '`' => out.push('\u{02CB}'), // ˋ modifier letter grave accent
+            '.' => out.push('\u{2024}'), // ․ one dot leader
+            '/' => out.push('\u{2215}'), // ∕ division slash
+            ':' => out.push('\u{2236}'), // ∶ ratio
+            '@' => out.push('\u{FF20}'), // ＠ fullwidth commercial at
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// A link a Slack message can show: only `https://` URLs, with `|` and `>` removed so they
 /// can't break out of the `<url|label>` syntax.
 pub fn link(url: &str, label: &str) -> String {
@@ -114,6 +161,33 @@ pub fn results(query: &str, result: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_names_render_inert() {
+        for hostile in [
+            "<!channel>",
+            "<!here>",
+            "<@U0ANA>",
+            "<#C0GENERAL>",
+            "<https://evil.example|click>",
+            "<!subteam^S123>",
+        ] {
+            let shown = name(hostile, 100);
+            assert!(!shown.contains('<') && !shown.contains('>'), "{shown}");
+            assert!(shown.starts_with("&lt;"), "{shown}");
+        }
+        let shown = name(
+            "*Bold* _it_ ~st~ `code` https://evil.example ana@example.com",
+            200,
+        );
+        for c in ['*', '_', '~', '`', '.', '/', ':', '@'] {
+            assert!(!shown.contains(c), "{c} in {shown}");
+        }
+        assert_eq!(name("Ana  \n\t Ruiz\u{7}", 100), "Ana Ruiz");
+        assert_eq!(name("Ben & Jerry", 100), "Ben &amp; Jerry");
+        assert_eq!(name("Abcdef", 3), "Abc…");
+        assert_eq!(name("", 10), "");
+    }
 
     #[test]
     fn links_and_escaping() {

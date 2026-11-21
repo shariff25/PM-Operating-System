@@ -1,0 +1,21 @@
+# Rubric. With visits 10,000, sign-ups 1,200 and activated 300, the rates are 12% (visit to
+# sign-up) and 25% (sign-up to activation), 3% overall. Visit to sign-up is the lowest rate and
+# loses 8,800 users; sign-up to activation loses 900. A passing answer names visit to sign-up as
+# the biggest drop, gives 12% and 25% with the counts, and says that the top step counts everyone
+# who arrived, so it may be a traffic-quality question; if it recommends chasing activation
+# first it says why. It fails with a different rate, a benchmark, or a draft.
+id: funnel-measures-disagree
+ask: "Where does the signup funnel leak? This month: 10,000 visits, 1,200 sign-ups, 300 activated. All counts are users."
+expect:
+  approvals: 0
+  must_include:
+    - "12%"
+    - "25%"
+    - "8,800"
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 0
+tags:
+  - model/missing-fact

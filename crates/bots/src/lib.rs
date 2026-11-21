@@ -14,14 +14,16 @@
 //!   removed after 24 hours.
 
 pub mod app;
+pub mod assertion;
 pub mod catalog;
 pub mod clients;
 pub mod config;
 pub mod model;
+pub mod people;
 pub mod pg;
 pub mod routines;
 pub mod runtime;
 pub mod store;
 
-pub use app::router;
+pub use app::{router, router_with};
 pub use runtime::Runtime;

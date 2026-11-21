@@ -25,15 +25,23 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::common::{self, serve, until, Call, FakeSlack, APP_TOKEN, SLACK_BOT_TOKEN};
+use crate::common::{
+    self, person, serve, until, Call, Directory, FakeSlack, APP_TOKEN, SLACK_BOT_TOKEN,
+};
 
 pub const BOTS_TOKEN: &str = "test-bots-token-slack-0123456789abcdef";
 pub const TOOL_BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
 /// The app's own bot user, as `authorizations[0].user_id`.
 pub const APP_USER: &str = "UPMOSAPP";
-/// Ana has a personal bot and Slack linked; Bob has no personal bot; Cat has one but hasn't
-/// linked Slack.
-const TEAM: &str = "members:\n  - {handle: ana, slack-id: U0ANA, roles: [pm]}\n  - {handle: bob, slack-id: U0BOB, roles: [pm]}\n  - {handle: cat, slack-id: U0CAT, roles: [pm]}\n";
+/// The user directory: Ana has a personal bot and Slack linked; Bob has no personal bot; Cat
+/// has one but hasn't linked Slack.
+pub fn team() -> Vec<pmos_directory::snapshot::DirectoryUser> {
+    vec![
+        person("ana", "U0ANA", &["pm"]),
+        person("bob", "U0BOB", &["pm"]),
+        person("cat", "U0CAT", &["pm"]),
+    ]
+}
 
 fn bearer(headers: &HeaderMap) -> &str {
     headers
@@ -72,6 +80,14 @@ pub struct MockRuntime {
     pub routines: Mutex<Vec<Value>>,
     /// Routine writes: (method, routine id, X-Pmos-User, body).
     pub routine_writes: Mutex<Vec<RoutineWrite>>,
+    /// `GET /v1/personas`'s answer; `None` answers `404`, as a runtime from before personas.
+    pub personas: Mutex<Option<Value>>,
+    /// How many times `GET /v1/personas` was read.
+    pub persona_reads: Mutex<usize>,
+    /// Refuse a task naming a persona with `400 {code}`, as the runtime does.
+    pub persona_refusal: Mutex<Option<String>>,
+    /// `POST /v1/routines/parse` bodies.
+    pub parses: Mutex<Vec<Value>>,
 }
 
 type Rt = State<Arc<MockRuntime>>;
@@ -208,6 +224,9 @@ async fn rt_patch_routine(
             if let Some(e) = body.get("enabled") {
                 r["enabled"] = e.clone();
             }
+            if let Some(s) = body.get("schedule") {
+                r["schedule"] = s.clone();
+            }
             Json(r.clone()).into_response()
         }
         None => answer(StatusCode::NOT_FOUND, json!({"error": "no such routine"})),
@@ -272,14 +291,57 @@ async fn rt_create_task(State(rt): Rt, headers: HeaderMap, Json(body): Json<Valu
     if *rt.fail_tasks.lock().unwrap() {
         return answer(StatusCode::SERVICE_UNAVAILABLE, json!({"error": "down"}));
     }
+    if let (Some(code), true) = (
+        rt.persona_refusal.lock().unwrap().clone(),
+        body.get("persona").is_some(),
+    ) {
+        return answer(
+            StatusCode::BAD_REQUEST,
+            json!({"code": code, "error": "a developer's sentence the PM never sees"}),
+        );
+    }
     let n = rt.tasks.lock().unwrap().len();
     let mut task = body;
     task["id"] = json!(format!("tsk_{n:032x}"));
     answer(StatusCode::CREATED, task)
 }
 
+async fn rt_personas(State(rt): Rt, headers: HeaderMap) -> Response {
+    if bearer(&headers) != BOTS_TOKEN {
+        return answer(StatusCode::UNAUTHORIZED, json!({"error": "bad token"}));
+    }
+    *rt.persona_reads.lock().unwrap() += 1;
+    match rt.personas.lock().unwrap().clone() {
+        // A runtime that can't answer just now (gate-fix-4's unreadable catalog).
+        Some(down) if down == json!("unavailable") => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Some(catalog) => Json(catalog).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn rt_parse_routine(State(rt): Rt, Json(body): Json<Value>) -> Response {
+    rt.parses.lock().unwrap().push(body.clone());
+    Json(
+        json!({"draft": {"bot": body["bot"], "owner": body["owner"], "schedule": "0 9 * * 1-5"},
+                "summary": "Every weekday at 9am"}),
+    )
+    .into_response()
+}
+
 async fn rt_notifications(State(rt): Rt, Query(q): Query<HashMap<String, String>>) -> Response {
     let from: usize = q.get("after").and_then(|a| a.parse().ok()).unwrap_or(0);
+    // A cursor past the feed (as after a runtime's database was reset): `409 cursor_ahead`,
+    // with the feed's present.
+    let len = rt.feed.lock().unwrap().len();
+    if from > len {
+        return answer(
+            StatusCode::CONFLICT,
+            json!({"code": "cursor_ahead", "error": "cursor is ahead of the feed",
+                   "cursor": len.to_string()}),
+        );
+    }
     let items: Vec<Value> = rt.feed.lock().unwrap().iter().skip(from).cloned().collect();
     if items.is_empty() {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -437,6 +499,22 @@ async fn ts_decide(
     if item["status"] != "pending" {
         return answer(StatusCode::CONFLICT, json!({"error": "already decided"}));
     }
+    // As the tool server (R4): an approve names what the PM was shown.
+    match body["expected_args_hash"].as_str() {
+        None if body["decision"] == "approve" => {
+            return answer(
+                StatusCode::BAD_REQUEST,
+                json!({"code": "expected_args_hash_required", "error": "required"}),
+            )
+        }
+        Some(h) if !item["args_hash"].as_str().unwrap_or("").starts_with(h) => {
+            return answer(
+                StatusCode::CONFLICT,
+                json!({"code": "stale", "error": "changed"}),
+            )
+        }
+        _ => {}
+    }
     item["decided_by"] = body["decided_by"].clone();
     item["status"] = match body["decision"].as_str() {
         Some("approve") => json!("approved"),
@@ -465,10 +543,14 @@ async fn ts_unlink(
 pub fn approval(id: &str, user: &str, tool: &str, args: Value, created_at: &str) -> Value {
     json!({
         "id": id, "user": user, "skill": null, "bot": format!("pm-{user}"), "run_id": "tsk_1",
-        "tool": tool, "args": args, "args_hash": "x", "status": "pending",
+        "tool": tool, "args": args, "args_hash": ARGS_HASH, "status": "pending",
         "created_at": created_at,
     })
 }
+
+/// Every fixture item's args hash; a card or App Home row carries its first 16 characters.
+pub const ARGS_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+pub const SHOWN: &str = "0123456789abcdef";
 
 // ---- The stack ----
 
@@ -480,6 +562,8 @@ pub struct Stack {
     pub bots: Bots,
     pub content: tempfile::TempDir,
     pub state: tempfile::TempDir,
+    /// The user directory the service reads (seeded with [`team`]).
+    pub directory: Directory,
     stop: Vec<CancellationToken>,
     socket: Option<(CancellationToken, JoinHandle<Ended>)>,
 }
@@ -498,6 +582,8 @@ impl Stack {
                 .route("/v1/bots", get(rt_bots))
                 .route("/v1/bots/{name}", get(rt_bot))
                 .route("/v1/tasks", post(rt_create_task))
+                .route("/v1/personas", get(rt_personas))
+                .route("/v1/routines/parse", post(rt_parse_routine))
                 .route("/v1/notifications", get(rt_notifications))
                 .route(
                     "/v1/members/{handle}/settings",
@@ -529,19 +615,20 @@ impl Stack {
         .await;
 
         let content = tempfile::tempdir().unwrap();
-        let team_file = content.path().join("team.yaml");
-        std::fs::write(&team_file, TEAM).unwrap();
+        let directory = Directory::seeded(team()).await;
         let state = tempfile::tempdir().unwrap();
         let http = reqwest::Client::new();
         let bots = Bots::new(BotsConfig {
             slack: SlackApi::new(slack_base, SLACK_BOT_TOKEN, http.clone()),
             runtime: Runtime::new(rt_base, BOTS_TOKEN, http.clone()),
             toolserver: ToolServer::new(ts_base, TOOL_BOT_TOKEN),
-            team_file,
+            people: directory.people(),
+            content_root: content.path().to_path_buf(),
             default_tz: "UTC".into(),
             github_org: None,
             response_url_prefix: "https://hooks.slack.com/".into(),
             state_dir: state.path().to_path_buf(),
+            web_url: None,
         });
         let mut stack = Self {
             slack,
@@ -551,6 +638,7 @@ impl Stack {
             bots,
             content,
             state,
+            directory,
             stop: vec![stop_slack, stop_rt, stop_ts],
             socket: None,
         };
@@ -565,7 +653,7 @@ impl Stack {
             APP_TOKEN,
             Commands {
                 toolserver: ToolServer::new("http://127.0.0.1:9", TOOL_BOT_TOKEN),
-                team_file: "/nonexistent/team.yaml".into(),
+                people: self.directory.people(),
                 http: http.clone(),
                 response_url_prefix: "https://hooks.slack.com/".into(),
                 request_access: true,
@@ -704,9 +792,21 @@ pub fn home_click(
     ticked: &[&str],
 ) -> Value {
     let mut values = serde_json::Map::new();
+    // Each ticked row's block id as the view showed it (`pick_<id>:<hash>`), else `pick_<id>`.
+    let shown = |id: &str| -> String {
+        let plain = format!("pick_{id}");
+        published["view"]["blocks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|b| b["block_id"].as_str())
+            .find(|b| *b == plain || b.starts_with(&format!("{plain}:")))
+            .map(String::from)
+            .unwrap_or(plain)
+    };
     for id in ticked {
         values.insert(
-            format!("pick_{id}"),
+            shown(id),
             json!({"home_pick": {"type": "checkboxes", "selected_options": [{"text": {"type": "plain_text", "text": "Select"}, "value": id}]}}),
         );
     }

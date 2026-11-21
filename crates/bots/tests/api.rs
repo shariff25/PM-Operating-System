@@ -395,12 +395,22 @@ async fn workers_are_held_to_their_claim(env: &Env) {
     let (status, _) = env
         .post(
             &format!("/v1/tasks/{tid}/cancel"),
+            "slack",
+            Some("ana"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 409, "already cancelled");
+    // The console cancels only signed for a viewer (R1), in every mode.
+    let (status, _) = env
+        .post(
+            &format!("/v1/tasks/{tid}/cancel"),
             "console",
             None,
             json!({}),
         )
         .await;
-    assert_eq!(status, 409, "already cancelled");
+    assert_eq!(status, 403, "an unsigned console cancel");
     let (status, _) = env
         .post(
             "/v1/worker/tasks/tsk_nope/heartbeat",
@@ -439,6 +449,7 @@ async fn a_failed_task_says_why(env: &Env) {
 }
 
 both_envs!(
+    a_cursor_from_another_epoch_is_refused,
     a_task_runs_from_slack_to_a_result,
     results_with_approvals_wait_until_every_item_is_decided,
     a_task_settles_when_its_last_approval_expires,
@@ -676,7 +687,7 @@ async fn a_bots_own_worker_touches_only_that_bots_tasks(env: &Env) {
 async fn only_people_who_may_use_a_bot_can_ask_it() {
     let env = Env::memory().await;
     let new = |bot: &str, user: &str, source: &str| json!({"bot": bot, "requested_by": user, "text": "hello", "source": source});
-    // A team bot serves team members; eve isn't one.
+    // A team bot serves the users who may ask; eve isn't in the directory.
     let (status, body) = env
         .post(
             "/v1/tasks",
@@ -687,7 +698,10 @@ async fn only_people_who_may_use_a_bot_can_ask_it() {
         .await;
     assert_eq!(status, 403);
     assert!(
-        body["error"].as_str().unwrap().contains("team.yaml"),
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("`eve` isn't a PM OS user"),
         "{body}"
     );
     // A personal bot serves its owner only.
@@ -815,6 +829,73 @@ async fn tasks_are_listed_by_who_may_see_them() {
     env.finish().await;
 }
 
+#[tokio::test]
+async fn web_tasks_belong_to_their_pm_and_stay_off_the_slack_feed() {
+    let env = Env::memory().await;
+    let new =
+        |text: &str| json!({"bot": "docs", "requested_by": "ana", "text": text, "source": "web"});
+    let (status, task) = env
+        .post("/v1/tasks", "web", Some("ana"), new("from web"))
+        .await;
+    assert_eq!(status, 201);
+    assert_eq!(task["source"], "web");
+    assert_eq!(task["priority"], "interactive");
+    assert!(task["slack"].is_null());
+    let tid = id(&task);
+    let (_, ben) = env
+        .post(
+            "/v1/tasks",
+            "web",
+            Some("ben"),
+            json!({"bot": "docs", "requested_by": "ben", "text": "ben's", "source": "web"}),
+        )
+        .await;
+    let (_, list) = env.get("/v1/tasks", "web", Some("ana")).await;
+    let ids: Vec<String> = list.as_array().unwrap().iter().map(id).collect();
+    assert_eq!(ids, vec![tid.clone()]);
+    let (status, got) = env
+        .get(&format!("/v1/tasks/{tid}"), "web", Some("ana"))
+        .await;
+    assert_eq!((status, got["source"].clone()), (200, json!("web")));
+    // Slack's PM view of the same handle sees it too; another PM's task is a 404.
+    let (status, _) = env
+        .get(&format!("/v1/tasks/{tid}"), "slack", Some("ana"))
+        .await;
+    assert_eq!(status, 200);
+    for path in [
+        format!("/v1/tasks/{}", id(&ben)),
+        format!("/v1/tasks/{}/events", id(&ben)),
+    ] {
+        let (status, _) = env.get(&path, "web", Some("ana")).await;
+        assert_eq!(status, 404, "{path}");
+    }
+    let (status, _) = env
+        .post(
+            &format!("/v1/tasks/{}/cancel", id(&ben)),
+            "web",
+            Some("ana"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 404);
+    let (status, _) = env
+        .get(&format!("/v1/tasks/{tid}/events"), "web", Some("ana"))
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = env
+        .post(
+            &format!("/v1/tasks/{tid}/cancel"),
+            "web",
+            Some("ana"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    // Cancelling and creating a web task wrote nothing to the Slack feed.
+    assert!(env.feed().await.is_empty());
+    env.finish().await;
+}
+
 // ----- claims and the tool server ----------------------------------------------------------
 
 #[tokio::test]
@@ -930,7 +1011,7 @@ async fn the_feed_long_polls_and_resumes_from_a_cursor() {
     let env = Env::memory().await;
     let (status, empty) = env.get("/v1/notifications", "slack", Some("ana")).await;
     assert_eq!(status, 200);
-    assert_eq!(empty, json!({"cursor": "0", "items": []}));
+    assert_eq!(empty, json!({"cursor": "0", "items": [], "head": "0"}));
 
     let task = env.ask("Q").await;
     env.claim().await;
@@ -991,6 +1072,71 @@ async fn the_feed_long_polls_and_resumes_from_a_cursor() {
         .await;
     assert_eq!(status, 400);
     env.finish().await;
+}
+
+/// A cursor past the feed's head came from another epoch of the feed (an in-memory runtime
+/// that restarted, or a reset database). It is refused with `409 cursor_ahead` and the head,
+/// instead of answering "nothing new" until the sequence catches up, which silently lost
+/// every reply in between. Every case runs on both stores.
+async fn a_cursor_from_another_epoch_is_refused(env: &Env) {
+    let (_, empty) = env.get("/v1/notifications", "slack", Some("ana")).await;
+    assert_eq!(empty["head"], "0");
+    // A cursor the Slack service saved from the runtime before it restarted.
+    let (status, body) = env
+        .get("/v1/notifications?after=57", "slack", Some("ana"))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["code"], "cursor_ahead");
+    assert_eq!(body["head"], "0");
+    assert!(body["error"].as_str().unwrap().starts_with("cursor_ahead"));
+
+    // New notifications arrive: the head moves, and a cursor at or below it is fine.
+    let task = env.ask("Q").await;
+    env.claim().await;
+    env.post(
+        &format!("/v1/worker/tasks/{}/events", id(&task)),
+        "worker",
+        None,
+        json!({"kind": "milestone", "text": "Reading Jira"}),
+    )
+    .await;
+    let (status, page) = env
+        .get("/v1/notifications?after=0", "slack", Some("ana"))
+        .await;
+    assert_eq!(status, 200);
+    let head: i64 = page["head"].as_str().unwrap().parse().unwrap();
+    assert!(head >= 1);
+    assert_eq!(page["cursor"], page["head"]);
+    let (status, _) = env
+        .get(
+            &format!("/v1/notifications?after={head}"),
+            "slack",
+            Some("ana"),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, body) = env
+        .get(
+            &format!("/v1/notifications?after={}", head + 1),
+            "slack",
+            Some("ana"),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    // Pruning never lowers the head: a cursor from before a prune is still this feed's.
+    env.rt
+        .housekeeping(chrono::Utc::now() + chrono::Duration::days(60))
+        .await
+        .unwrap();
+    let (status, page) = env
+        .get(
+            &format!("/v1/notifications?after={head}"),
+            "slack",
+            Some("ana"),
+        )
+        .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["head"], head.to_string());
 }
 
 // ----- routines ---------------------------------------------------------------------------
@@ -1261,13 +1407,13 @@ async fn every_endpoint_checks_the_client() {
             Method::GET,
             "/v1/bots".into(),
             json!(null),
-            &["slack", "worker", "console", "evals"],
+            &["slack", "web", "worker", "console", "evals"],
         ),
         (
             Method::GET,
             "/v1/bots/docs".into(),
             json!(null),
-            &["slack", "worker", "console", "evals"],
+            &["slack", "web", "worker", "console", "evals"],
         ),
         (
             Method::POST,
@@ -1280,20 +1426,20 @@ async fn every_endpoint_checks_the_client() {
             Method::GET,
             "/v1/tasks".into(),
             json!(null),
-            &["slack", "console", "evals"],
+            &["slack", "web", "console", "evals"],
         ),
         // Evals may read tasks, but only eval tasks: this Slack one is a 404 for it.
         (
             Method::GET,
             format!("/v1/tasks/{tid}"),
             json!(null),
-            &["slack", "console", "evals"],
+            &["slack", "web", "console", "evals"],
         ),
         (
             Method::GET,
             format!("/v1/tasks/{tid}/events"),
             json!(null),
-            &["slack", "console", "evals"],
+            &["slack", "web", "console", "evals"],
         ),
         (
             Method::GET,
@@ -1353,42 +1499,44 @@ async fn every_endpoint_checks_the_client() {
             Method::POST,
             "/v1/routines/parse".into(),
             json!({"bot": "docs", "owner": "ana", "text": "t", "tz": "UTC"}),
-            &["slack"],
+            &["slack", "web"],
         ),
         (
             Method::POST,
             "/v1/routines".into(),
             json!({"draft": {}}),
-            &["slack"],
+            &["slack", "web"],
         ),
         (
             Method::GET,
             "/v1/routines".into(),
             json!(null),
-            &["slack", "console"],
+            &["slack", "web", "console"],
         ),
         (
             Method::PATCH,
             format!("/v1/routines/{rid}"),
             json!({"enabled": true}),
-            &["slack", "console"],
+            &["slack", "web", "console"],
         ),
         (
             Method::DELETE,
             format!("/v1/routines/{rid}"),
             json!(null),
-            &["slack", "console"],
+            &["slack", "web", "console"],
         ),
+        // The console cancels only signed for a viewer (R1): unsigned, as here, it is `403`.
+        // `tests/assertion.rs` checks it signed.
         (
             Method::POST,
             format!("/v1/tasks/{tid}/cancel"),
             json!({}),
-            &["slack", "console"],
+            &["slack", "web"],
         ),
     ];
     for (method, path, body, allowed) in &rows {
-        for client in ["slack", "worker", "console", "evals", "none"] {
-            let user = (client == "slack").then_some("ana");
+        for client in ["slack", "web", "worker", "console", "evals", "none"] {
+            let user = matches!(client, "slack" | "web").then_some("ana");
             let mut req = env.req(method.clone(), path, client, user);
             if !body.is_null() {
                 req = req.json(body);
@@ -1455,25 +1603,107 @@ async fn every_endpoint_checks_the_client() {
         )
         .await;
     assert_eq!(status, 403, "evals creates eval tasks only");
+    // Web acts only for its PM too, and creates only `web` tasks; Slack cannot set `web`.
+    let (status, _) = env
+        .post(
+            "/v1/tasks",
+            "web",
+            Some("ben"),
+            json!({"bot": "docs", "requested_by": "ana", "text": "t", "source": "web"}),
+        )
+        .await;
+    assert_eq!(status, 403);
+    let (status, _) = env.get("/v1/tasks", "web", None).await;
+    assert_eq!(status, 403);
+    for (client, source) in [("web", "slack"), ("web", "cli"), ("slack", "web")] {
+        let (status, _) = env
+            .post(
+                "/v1/tasks",
+                client,
+                Some("ana"),
+                json!({"bot": "docs", "requested_by": "ana", "text": "t", "source": source}),
+            )
+            .await;
+        assert_eq!(status, 403, "{client} may not set source {source}");
+    }
     // Health needs no token.
     let (status, _) = env.get("/healthz", "none", None).await;
     assert_eq!(status, 200);
     env.finish().await;
 }
 
+/// R2 (W6 for revisions): the web client may give a task outside any conversation a
+/// sensitivity floor (a draft's revision, whose prompt holds the draft's text). The task's
+/// session starts there; no other client, and no task in a conversation, may set one.
 #[tokio::test]
-async fn readiness_covers_storage_the_tool_server_and_the_gateway() {
+async fn a_revision_task_starts_its_session_at_its_floor() {
+    let env = Env::memory().await;
+    let task = |extra: Value| {
+        let mut body = json!({"bot": "docs", "requested_by": "ana", "text": "Revise: …",
+                              "source": "web", "sensitivity_floor": "restricted"});
+        if let (Some(b), Value::Object(extra)) = (body.as_object_mut(), extra) {
+            b.extend(extra);
+        }
+        body
+    };
+    let (status, t) = env
+        .post("/v1/tasks", "web", Some("ana"), task(json!({})))
+        .await;
+    assert_eq!(status, 201, "{t}");
+    assert_eq!(t["sources_sensitivity"], "restricted");
+    let (status, claim) = env.claim().await;
+    assert_eq!(status, 200, "{claim}");
+    let sessions = env.ts.sessions.lock().unwrap().clone();
+    assert_eq!(
+        sessions.last().unwrap()["history_sensitivity"],
+        "restricted",
+        "{sessions:?}"
+    );
+    // Not in a conversation, and not from Slack.
+    let (status, _) = env
+        .post(
+            "/v1/tasks",
+            "web",
+            Some("ana"),
+            task(json!({"conversation": "cnv_1"})),
+        )
+        .await;
+    assert_eq!(status, 403);
+    let (status, _) = env
+        .post(
+            "/v1/tasks",
+            "slack",
+            Some("ana"),
+            task(json!({"source": "slack"})),
+        )
+        .await;
+    assert_eq!(status, 403);
+    env.finish().await;
+}
+
+#[tokio::test]
+async fn readiness_covers_storage_the_tool_server_the_gateway_and_the_directory() {
     let env = Env::memory().await;
     let (status, body) = env.get("/readyz", "none", None).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body,
-        json!({"ready": true, "checks": {"storage": "ok", "toolserver": "ok", "gateway": "ok"}})
+        json!({"ready": true, "checks": {"storage": "ok", "toolserver": "ok", "gateway": "ok", "directory": "ok"}})
     );
     *env.ts.ready.lock().unwrap() = false;
     let (status, body) = env.get("/readyz", "none", None).await;
     assert_eq!(status, 503);
     assert_eq!(body["checks"]["toolserver"], "down");
     assert_eq!(body["checks"]["gateway"], "ok");
+    // A directory snapshot more than 30 seconds old is not ready either.
+    *env.ts.ready.lock().unwrap() = true;
+    env.clock
+        .advance(pmos_directory::snapshot::ALLOW_AGE + std::time::Duration::from_secs(1));
+    let (status, body) = env.get("/readyz", "none", None).await;
+    assert_eq!(status, 503);
+    assert_eq!(body["checks"]["directory"], "down");
+    env.refresh().await;
+    let (status, _) = env.get("/readyz", "none", None).await;
+    assert_eq!(status, 200);
     env.finish().await;
 }

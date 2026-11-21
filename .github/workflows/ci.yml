@@ -67,6 +67,44 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
 
+  web:
+    name: Web (typecheck, lint, test, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - working-directory: web
+        run: pnpm typecheck
+      - working-directory: web
+        run: pnpm lint
+      - working-directory: web
+        run: pnpm test
+      - working-directory: web
+        run: pnpm build
+      # Browser end-to-end tests (web/e2e). The browser is installed for the pinned
+      # @playwright/test version; pnpm e2e starts its own dev server on port 5191.
+      - name: Install Chromium for Playwright
+        working-directory: web
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Browser tests
+        working-directory: web
+        run: pnpm e2e
+      - name: Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-playwright-report
+          path: |
+            web/playwright-report/
+            web/test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
   deploy:
     name: Deploy kit (images, stack, smoke test)
     runs-on: ubuntu-latest
@@ -88,7 +126,11 @@ jobs:
           deploy/pmos-admin status
       - name: A member and a Docs-bot task end to end
         run: |
-          deploy/pmos-admin pmos member add --root content --handle ci --slack-id U0CI00001 --roles pm,admin
+          # Every service decides from the user database (there is no team file since slice
+          # U7): the CI person is imported into the stack's empty database, then gets a
+          # personal bot in the content.
+          deploy/pmos-admin users import --from deploy/test/ci-users.yaml --bootstrap --apply
+          deploy/pmos-admin pmos bot add-personal --root content --handle ci
           deploy/pmos-admin pmos policy generate --root content --out policies
           deploy/pmos-admin lint
           deploy/pmos-admin reindex

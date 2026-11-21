@@ -4,7 +4,7 @@
 # a thread in #field-questions, channel C0FIELD, ts 1731500000.000100, asking whether Acme Vault
 # supports SAML SSO; the fake docs page vault-saml-sso; and Jira epic PM-101 and bug PM-103 (with
 # its planted prompt injection). Replace them with case cards (evals/case-card.md) as real ones
-# come in. No pass_bar until then: the category reports only.
+# come in. The bar and repeats below are starting values (docs/evals.md, "Categories and bars").
 #
 # The triage-* tasks run the reply assistant's routine prompt (docs/slack-reply-spec.md §1)
 # against the fake Slack search results for the PM `evals` (U0EVALS): a question in #pm-team
@@ -19,6 +19,14 @@
 # in the #pm-team SAML thread (C0PMTEAM 1731600000.000100, tag 1731600120.000150).
 name: slack-reply
 bot: personal
+# pass_bar 0.8 is a starting value: the docs give no launch number for this category, only the
+# 80% example in docs/evals.md. Tighten it after the first valid run against case cards.
+# Its tasks measure a gap until a skill declares slack.read_thread and slack.post_reply, so they
+# read below the bar until then (docs/evals.md, "The seed categories").
+pass_bar: 0.8
+# repeats 3: the Phase 1 exit gate reports pass^3 for every bot category
+# (docs/research/self-improvement-loops.md, "Exit gate").
+repeats: 3
 description: >-
   The Slack reply assistant: a PM's personal bot finds questions asked of the PM, is asked
   to reply in a thread, or is tagged in one, and drafts one grounded reply per thread (one per

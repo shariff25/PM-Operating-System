@@ -50,6 +50,38 @@ fn the_seeded_content_loads() {
     assert!(catalog.summaries().iter().any(|b| b.name == "docs"));
 }
 
+/// The marketplace bots load from `content/personas/` (`docs/bot-marketplace-spec.md` §6),
+/// and a change there is a catalog change.
+#[test]
+fn the_seeded_personas_load_and_are_watched() {
+    let catalog = Catalog::load(&content(), today()).unwrap();
+    let keys: Vec<String> = catalog
+        .persona_summaries()
+        .into_iter()
+        .map(|p| p.key)
+        .collect();
+    assert_eq!(keys.first().map(String::as_str), Some("nudge"));
+    for key in ["chief", "sprout", "echo"] {
+        assert!(keys.contains(&key.to_string()), "{key} in {keys:?}");
+    }
+    let chief = catalog.offered_persona("chief").unwrap();
+    assert_eq!(chief.role, "chief-of-staff");
+    assert!(catalog.role_named("chief-of-staff").is_some());
+    assert!(pmos_bots::catalog::WATCHED.contains(&"personas"));
+
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir(&content(), dir.path());
+    let before = fingerprint(dir.path());
+    let file = dir.path().join("personas/chief/PERSONA.md");
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(&file, text.replace("offered: true", "offered: false")).unwrap();
+    assert_ne!(
+        fingerprint(dir.path()),
+        before,
+        "withdrawing a persona reloads"
+    );
+}
+
 #[test]
 fn a_personal_bot_gets_its_roles_write_settings() {
     let dir = tempfile::tempdir().unwrap();
@@ -97,8 +129,6 @@ fn a_tree_with_lint_errors_refuses_to_load() {
     assert!(err.contains("bots/broken/BOT.md"), "{err}");
 }
 
-const TEAM: &str = "members:\n  - handle: ana\n    slack-id: U0ANA\n    email: ana@example.com\n    roles: [pm, admin]\n";
-
 fn names(bots: &Value) -> Vec<String> {
     bots.as_array()
         .unwrap()
@@ -111,7 +141,6 @@ fn names(bots: &Value) -> Vec<String> {
 async fn a_content_change_is_picked_up_and_a_bad_one_is_not() {
     let dir = tempfile::tempdir().unwrap();
     copy_dir(&content(), dir.path());
-    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
     let mut reloader = Reloader::new(dir.path());
     let env = Env::memory_with(Catalog::load(dir.path(), today()).expect("loads")).await;
     assert_eq!(reloader.check(&env.rt, today()).await, Reload::Unchanged);
@@ -196,6 +225,9 @@ fn the_fingerprint_follows_the_watched_files_only() {
         before,
         "only the catalog's files count"
     );
-    std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
+    // A team.yaml decides nothing (slice U7), so it isn't watched either.
+    std::fs::write(dir.path().join("team.yaml"), "members: []\n").unwrap();
+    assert_eq!(fingerprint(dir.path()), before);
+    std::fs::write(dir.path().join("tools.yaml"), "tools: []\n").unwrap();
     assert_ne!(fingerprint(dir.path()), before);
 }

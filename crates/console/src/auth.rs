@@ -4,16 +4,24 @@
 //!   `PMOS_CONSOLE_TRUST_PROXY=1`, and only on a request that also carries
 //!   `X-Pmos-Proxy-Secret` equal to `PMOS_CONSOLE_PROXY_SECRET` (compared in constant time,
 //!   before the user header is read); otherwise `PMOS_CONSOLE_DEV_USER`. The header may carry
-//!   a PM OS handle or the member's email.
-//! - **Membership:** the person must be in `team.yaml`, re-read on every request so removing
-//!   someone takes effect at once.
+//!   a PM OS handle or the person's sign-in name. Neither header's value is ever logged.
+//! - **Who they are:** the PM OS user database, through the tool server's `resolve` route
+//!   (`docs/user-database-spec.md` §2), by sign-in name or by handle. An answer is used for at
+//!   most 10 seconds ([`pmos_directory::resolve::FRESH_FOR`]), so a deactivation or a removed
+//!   role takes effect here within 10 seconds. There is no stale allowance: when the tool
+//!   server can't give a fresh answer, the console refuses (`503 users_unavailable`), whatever
+//!   answer it kept. The console reads no team file.
+//! - **Who may use it:** an active user holding `pm`, `reviewer` or `admin`. An Admin sees
+//!   everyone's; anyone else sees their own. An Auditor is not a PM: a person whose only role
+//!   is `auditor` gets no console (`403`; the audit log is in the web app).
 //! - **Forms:** every POST carries a token bound to the person (an HMAC under a key made at
 //!   start-up) and must come from the console's own origin: `Origin`, or else `Referer`,
 //!   must be present and match.
 
 use axum::http::{header, HeaderMap};
 use hmac::{Hmac, Mac};
-use pmos_contract::model::{Role, TeamFile};
+use pmos_contract::model::Role;
+use pmos_directory::resolve::{DirectoryUser, ResolveClient, ResolveError};
 use sha2::Sha256;
 
 use crate::config::Identity;
@@ -22,25 +30,39 @@ pub const FORWARDED_USER: &str = "x-forwarded-user";
 /// The header the sign-in proxy sets to `PMOS_CONSOLE_PROXY_SECRET` on every request.
 pub const PROXY_SECRET: &str = "x-pmos-proxy-secret";
 
+/// The roles that may use the console. `auditor` alone is not one of them.
+pub const CONSOLE_ROLES: [&str; 3] = ["pm", "reviewer", "admin"];
+
+/// The longest sign-in name the console will look up.
+const MAX_SIGN_IN_NAME: usize = 254;
+
 /// Whether the request came through the sign-in proxy: with `PMOS_CONSOLE_TRUST_PROXY=1`, it
 /// carries `X-Pmos-Proxy-Secret` equal to the configured secret (constant-time compare). In
 /// development there is no proxy, so every request passes.
 pub fn from_proxy(identity: &Identity, headers: &HeaderMap) -> bool {
     match identity {
-        Identity::Proxy { secret } => headers
-            .get(PROXY_SECRET)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|presented| pmos_runtime::token_eq(presented, secret)),
+        // Exactly one secret header, so a client's own copy next to the proxy's is refused.
+        Identity::Proxy { secret } => {
+            let mut presented = headers.get_all(PROXY_SECRET).iter();
+            match (presented.next(), presented.next()) {
+                (Some(value), None) => value
+                    .to_str()
+                    .is_ok_and(|presented| pmos_runtime::token_eq(presented, secret)),
+                _ => false,
+            }
+        }
         Identity::Dev(_) => true,
     }
 }
 
-/// The person using the console.
+/// The person using the console, as the user database answered for this request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Viewer {
     pub handle: String,
-    /// Role `admin` in `team.yaml`: sees everything.
+    /// Active and holding `admin`: sees everything.
     pub admin: bool,
+    /// Their known roles, from the same answer: what the console's user assertions carry.
+    pub roles: Vec<Role>,
 }
 
 impl Viewer {
@@ -53,6 +75,21 @@ impl Viewer {
     pub fn sees_own(&self, handle: &str) -> bool {
         self.admin || handle == self.handle
     }
+
+    /// The console's decision on one directory answer: status first, then roles.
+    pub fn from_user(user: &DirectoryUser) -> Result<Self, AuthError> {
+        if !user.is_active() {
+            return Err(AuthError::Deactivated);
+        }
+        if !CONSOLE_ROLES.iter().any(|r| user.has_role(r)) {
+            return Err(AuthError::NoConsole);
+        }
+        Ok(Self {
+            handle: user.handle.clone(),
+            admin: user.has_role("admin"),
+            roles: user.roles.iter().filter_map(|r| Role::parse(r)).collect(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,21 +99,33 @@ pub enum AuthError {
     NotFromProxy,
     /// Nobody is signed in (401).
     NoUser,
-    /// Signed in, but not on the team (403).
-    NotMember(String),
+    /// Signed in, but not a PM OS user (403).
+    NotMember,
+    /// A user, but not active (403).
+    Deactivated,
+    /// Found by a sign-in name that no admin has confirmed yet (403; spec §4).
+    SignInUnconfirmed,
+    /// An active user with no console role: an Auditor only, or no role at all (403).
+    NoConsole,
+    /// The tool server couldn't give a fresh answer (`503 users_unavailable`).
+    Unavailable,
 }
 
-/// Find the person behind a request, among `team`.
-pub fn viewer(
-    identity: &Identity,
-    headers: &HeaderMap,
-    team: &TeamFile,
-) -> Result<Viewer, AuthError> {
+/// Who a request names: a sign-in name (the proxy's header, when it holds an `@`) or a
+/// handle. Anything that is neither never reaches the tool server, so junk costs no miss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Presented {
+    SignInName(String),
+    Handle(String),
+    Junk,
+}
+
+fn presented(identity: &Identity, headers: &HeaderMap) -> Result<Presented, AuthError> {
     // The proxy's secret first: until it checks out, X-Forwarded-User is not read at all.
     if !from_proxy(identity, headers) {
         return Err(AuthError::NotFromProxy);
     }
-    let presented = match identity {
+    let value = match identity {
         Identity::Proxy { .. } => headers
             .get(FORWARDED_USER)
             .and_then(|v| v.to_str().ok())
@@ -84,23 +133,46 @@ pub fn viewer(
             .filter(|v| !v.is_empty())
             .ok_or(AuthError::NoUser)?
             .to_string(),
-        Identity::Dev(handle) => handle.clone(),
+        Identity::Dev(handle) => return Ok(Presented::Handle(handle.clone())),
     };
-    let member = team
-        .by_handle(&presented)
-        .or_else(|| {
-            team.members.iter().find(|m| {
-                presented.contains('@')
-                    && m.email
-                        .as_deref()
-                        .is_some_and(|e| e.eq_ignore_ascii_case(&presented))
-            })
-        })
-        .ok_or(AuthError::NotMember(presented))?;
-    Ok(Viewer {
-        handle: member.handle.clone(),
-        admin: member.roles.contains(&Role::Admin),
+    Ok(if value.contains('@') {
+        let plain = !value.chars().any(|c| c.is_control() || c.is_whitespace());
+        if plain && value.len() <= MAX_SIGN_IN_NAME {
+            Presented::SignInName(value)
+        } else {
+            Presented::Junk
+        }
+    } else if pmos_contract::model::valid_handle(&value) {
+        Presented::Handle(value)
+    } else {
+        Presented::Junk
     })
+}
+
+/// Find the person behind a request in the user database, fresh (≤ 10 s) for this request.
+/// Logs (in the resolve client) name the kind of lookup, never the value looked up.
+pub async fn viewer(
+    identity: &Identity,
+    headers: &HeaderMap,
+    directory: &ResolveClient,
+) -> Result<Viewer, AuthError> {
+    let (answer, by_sign_in_name) = match presented(identity, headers)? {
+        Presented::Junk => return Err(AuthError::NotMember),
+        Presented::Handle(h) => (directory.by_handle(&h).await, false),
+        Presented::SignInName(n) => (directory.by_sign_in_name(&n).await, true),
+    };
+    let user = answer.map_err(|e| match e {
+        // `429` answers misses only (hits are always answered): nobody by that name.
+        ResolveError::NotFound | ResolveError::Invalid | ResolveError::RateLimited => {
+            AuthError::NotMember
+        }
+        // No stale allowance in the console: a kept answer never decides anything.
+        ResolveError::Refused { .. } | ResolveError::Unavailable { .. } => AuthError::Unavailable,
+    })?;
+    if by_sign_in_name && user.is_active() && !user.sign_in_name_confirmed {
+        return Err(AuthError::SignInUnconfirmed);
+    }
+    Viewer::from_user(&user)
 }
 
 /// Signs form tokens. The key is made fresh at each start, so a restart invalidates forms
@@ -179,6 +251,7 @@ pub fn same_origin(headers: &HeaderMap, public_url: Option<&str>) -> bool {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use pmos_directory::resolve::{EntraState, Status};
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -188,11 +261,17 @@ mod tests {
         h
     }
 
-    fn team() -> TeamFile {
-        TeamFile::from_yaml(
-            "members:\n  - handle: ana\n    slack-id: U0ANA\n    email: ana@example.com\n    roles: [pm]\n",
-        )
-        .unwrap()
+    fn user(handle: &str, status: Status, roles: &[&str]) -> DirectoryUser {
+        DirectoryUser {
+            handle: handle.into(),
+            display_name: handle.into(),
+            status,
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            entra: EntraState::None,
+            sign_in_name_confirmed: true,
+            dual_role: false,
+            password_epoch: None,
+        }
     }
 
     #[test]
@@ -201,37 +280,88 @@ mod tests {
         let proxy = Identity::Proxy {
             secret: secret.into(),
         };
-        let team = team();
         let user = ("x-forwarded-user", "ana");
         assert_eq!(
-            viewer(&proxy, &headers(&[user]), &team),
+            presented(&proxy, &headers(&[user])),
             Err(AuthError::NotFromProxy),
             "no secret"
         );
         assert_eq!(
-            viewer(
+            presented(
                 &proxy,
                 &headers(&[
                     user,
                     ("x-pmos-proxy-secret", "proxy-secret-0123456789abcdef01235")
-                ]),
-                &team
+                ])
             ),
             Err(AuthError::NotFromProxy),
             "a wrong secret"
         );
         assert_eq!(
-            viewer(&proxy, &headers(&[("x-pmos-proxy-secret", secret)]), &team),
+            presented(&proxy, &headers(&[("x-pmos-proxy-secret", secret)])),
             Err(AuthError::NoUser)
         );
-        let ok = viewer(
-            &proxy,
-            &headers(&[user, ("x-pmos-proxy-secret", secret)]),
-            &team,
-        )
-        .unwrap();
-        assert_eq!(ok.handle, "ana");
+        let with = |who: &str| {
+            presented(
+                &proxy,
+                &headers(&[("x-forwarded-user", who), ("x-pmos-proxy-secret", secret)]),
+            )
+        };
+        assert_eq!(with("ana"), Ok(Presented::Handle("ana".into())));
+        assert_eq!(
+            with("Ana@Example.com"),
+            Ok(Presented::SignInName("Ana@Example.com".into()))
+        );
+        assert_eq!(with("Ana Smith"), Ok(Presented::Junk));
+        assert_eq!(with("a b@example.com"), Ok(Presented::Junk));
+        assert_eq!(
+            with(&format!("{}@example.com", "a".repeat(250))),
+            Ok(Presented::Junk)
+        );
         assert!(from_proxy(&Identity::Dev("ana".into()), &headers(&[])));
+        assert_eq!(
+            presented(
+                &Identity::Dev("ana".into()),
+                &headers(&[("x-forwarded-user", "root")])
+            ),
+            Ok(Presented::Handle("ana".into())),
+            "in development the header is ignored"
+        );
+    }
+
+    #[test]
+    fn the_viewer_is_decided_from_status_then_roles() {
+        let v = Viewer::from_user(&user("ana", Status::Active, &["pm"])).unwrap();
+        assert!(!v.admin);
+        assert_eq!(v.roles, vec![Role::Pm]);
+        assert!(
+            Viewer::from_user(&user("root", Status::Active, &["pm", "admin"]))
+                .unwrap()
+                .admin
+        );
+        assert!(Viewer::from_user(&user("rae", Status::Active, &["reviewer"])).is_ok());
+        // An Auditor is not a PM, and is not an admin either.
+        let v = Viewer::from_user(&user("dot", Status::Active, &["pm", "auditor"])).unwrap();
+        assert!(!v.admin);
+        assert_eq!(
+            Viewer::from_user(&user("aud", Status::Active, &["auditor"])),
+            Err(AuthError::NoConsole)
+        );
+        assert_eq!(
+            Viewer::from_user(&user("none", Status::Active, &[])),
+            Err(AuthError::NoConsole)
+        );
+        // A deactivated user's kept roles grant nothing, admin included; so does a status
+        // this build doesn't know.
+        for status in [Status::Deactivated, Status::Other("suspended".into())] {
+            assert_eq!(
+                Viewer::from_user(&user("old", status, &["pm", "admin"])),
+                Err(AuthError::Deactivated)
+            );
+        }
+        // Unknown role names grant nothing and aren't signed.
+        let v = Viewer::from_user(&user("ana", Status::Active, &["pm", "wizard"])).unwrap();
+        assert_eq!(v.roles, vec![Role::Pm]);
     }
 
     #[test]

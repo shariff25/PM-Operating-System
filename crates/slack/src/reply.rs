@@ -13,6 +13,7 @@
 //! the item is still `pending`. Snoozes are kept in `<state dir>/snoozes.json` (ids and times
 //! only, never message text), so they survive a restart.
 
+use crate::people::Identity;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,7 +29,7 @@ use crate::blocks::escape;
 use crate::bots::{Bots, Click, Dm};
 use crate::cards::{self, action};
 use crate::runtime::RuntimeError;
-use crate::toolserver::CallError;
+use crate::toolserver::{CallError, Seen};
 use crate::triage::local_time;
 
 /// How Slack finds the routine: its prompt starts with this.
@@ -375,17 +376,19 @@ impl Snoozer {
         let store = self.bots.snoozes();
         let mut posted = 0;
         for s in store.due(now) {
-            // The item is read for the PM who snoozed it; one who has left the team is
-            // dropped.
-            let Some(handle) = self
-                .bots
-                .team()
-                .by_slack_id(&s.user)
-                .map(|m| m.handle.clone())
-            else {
-                tracing::info!(approval = %s.approval_id, "snoozed by someone no longer in team.yaml; dropped");
-                store.remove(&s.approval_id);
-                continue;
+            // The item is read for the PM who snoozed it; one who may no longer use PM OS is
+            // dropped. While PM OS can't check who they are, the snooze waits.
+            let handle = match self.bots.people().identify(&s.user) {
+                Identity::Member(m) => m.handle,
+                Identity::CantCheck => {
+                    tracing::info!(approval = %s.approval_id, "the user directory isn't available; the snooze waits");
+                    continue;
+                }
+                other => {
+                    tracing::info!(approval = %s.approval_id, who = other.kind(), "snoozed by someone who may no longer use PM OS; dropped");
+                    store.remove(&s.approval_id);
+                    continue;
+                }
             };
             match self
                 .bots
@@ -396,7 +399,7 @@ impl Snoozer {
                 Ok(item)
                     if item["status"] == "pending" && expiry(&item).is_none_or(|e| e > now) =>
                 {
-                    let card = cards::approval_card(&item);
+                    let card = cards::approval_card(&item, self.bots.web_url());
                     if self.bots.post(&s.channel, None, None, card).await.is_some() {
                         let note =
                             cards::reply_note(&item, ":zzz: Snoozed; the card is back, below.");
@@ -526,7 +529,11 @@ impl Bots {
                                 &escape(&next_run(&created, &default_tz)),
                             )
                         }
-                        Err(RuntimeError::Refused(why) | RuntimeError::Question(why)) => {
+                        Err(
+                            RuntimeError::Refused(why)
+                            | RuntimeError::Question(why)
+                            | RuntimeError::Persona(why),
+                        ) => {
                             format!("I couldn't turn {the} on: {}", escape(&why))
                         }
                         Err(RuntimeError::Unavailable) => UNAVAILABLE.into(),
@@ -677,10 +684,30 @@ impl Bots {
             cards::approval_closed(&shown, ":hourglass_flowing_sand: Posting…"),
         )
         .await;
+        // An approve sends what the confirmation card showed (R4, R5). A card that doesn't
+        // carry it, or whose text has changed since, approves nothing: it is shown again.
+        let shown_hash = click.block_id.as_deref().and_then(cards::confirmed_hash);
+        if !edited {
+            let now = cards::shown_hash(&item);
+            if shown_hash.is_none() || shown_hash != now {
+                tracing::info!(approval = %id, "external confirmation was stale or unversioned; shown again");
+                let card = if shown_hash.is_none() {
+                    cards::approval_reshown(&item, self.web_url())
+                } else {
+                    cards::approval_changed(&item, self.web_url())
+                };
+                self.update(&click.channel, &click.message_ts, card).await;
+                return;
+            }
+        }
         let decision = if edited { "edit" } else { "approve" };
+        let seen = Seen {
+            args_hash: shown_hash.filter(|_| !edited),
+            confirm_external: true,
+        };
         let outcome = self
             .toolserver()
-            .decide(&id, &handle, decision, args, None, true)
+            .decide(&id, &handle, decision, args, None, seen)
             .await;
         self.show_decision(
             &click.channel,

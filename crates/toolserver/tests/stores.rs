@@ -89,6 +89,10 @@ impl Backend {
                 credentials: Arc::new(MemoryCredentials::default()),
                 memory_repos: Arc::new(MemoryRepos::default()),
                 member_requests: Arc::new(MemoryRequests::default()),
+                users: Arc::new(pmos_toolserver::users::MemoryUsers::default()),
+                teams: Arc::new(
+                    pmos_toolserver::team::MemoryTeams::default().with_audit(audit.clone()),
+                ),
             },
             memory_audit: Some(audit),
             pg: None,
@@ -287,6 +291,8 @@ async fn approval_items_and_audit_events_keep_their_bot(b: &Backend) {
                 content_sha: None,
                 model_alias: None,
                 sources_sensitivity: Sensitivity::Internal,
+                persona: None,
+                draft_notice: None,
             },
             now(),
         )
@@ -414,6 +420,8 @@ fn new_item<'a>(user: &'a str, args: &'a Value) -> NewItem<'a> {
         content_sha: Some("0123456789abcdef0123456789abcdef01234567"),
         model_alias: Some("pmos/default"),
         sources_sensitivity: Sensitivity::Internal,
+        persona: None,
+        draft_notice: None,
     }
 }
 
@@ -447,6 +455,60 @@ async fn approvals_list_newest_first_and_filter(b: &Backend) {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, second.id);
     assert!(a.list("cy", None).await.unwrap().is_empty());
+
+    // A listing is capped at the newest LIST_LIMIT, in a fixed order.
+    let limit = pmos_toolserver::approvals::LIST_LIMIT;
+    for i in 0..=limit {
+        a.create(new_item("dee", &args), now() + Duration::seconds(i as i64))
+            .await
+            .unwrap();
+    }
+    let listed = a.list("dee", None).await.unwrap();
+    assert_eq!(listed.len(), limit);
+    assert_eq!(
+        listed[0].created_at,
+        now() + Duration::seconds(limit as i64)
+    );
+    assert!(listed.windows(2).all(|w| w[0].created_at > w[1].created_at));
+    assert_eq!(
+        listed.last().unwrap().created_at,
+        now() + Duration::seconds(1),
+        "the oldest is the one left out"
+    );
+
+    // R12: the inbox never hides a pending item behind that cap. With every one of dee's
+    // `LIST_LIMIT + 1` items pending, and three of them then decided, the inbox has every
+    // pending one, newest first, and the decided ones apart.
+    let inbox = a.inbox("dee", 10_000, 2).await.unwrap();
+    assert_eq!(inbox.pending.len(), limit + 1);
+    assert_eq!(inbox.total_pending, limit + 1);
+    assert!(!inbox.truncated());
+    let oldest = inbox.pending.last().unwrap().clone();
+    assert_eq!(
+        oldest.created_at,
+        now(),
+        "the oldest pending draft is there"
+    );
+    for item in inbox.pending.iter().take(3) {
+        a.decide(&item.id, "dee", Decision::Reject, None, now())
+            .await
+            .unwrap();
+    }
+    let inbox = a.inbox("dee", 10_000, 2).await.unwrap();
+    assert_eq!(inbox.pending.len(), limit - 2);
+    assert!(inbox.pending.iter().all(|i| i.status == Status::Pending));
+    assert!(inbox
+        .pending
+        .windows(2)
+        .all(|w| w[0].created_at > w[1].created_at));
+    assert_eq!(inbox.decided.len(), 2, "decided items are capped");
+    assert!(inbox.decided.iter().all(|i| i.status == Status::Rejected));
+    // Past the safety cap: truncated, with the total.
+    let inbox = a.inbox("dee", 5, 0).await.unwrap();
+    assert_eq!(inbox.pending.len(), 5);
+    assert_eq!(inbox.total_pending, limit - 2);
+    assert!(inbox.truncated());
+    assert!(inbox.decided.is_empty());
 }
 
 async fn decisions_follow_the_rules(b: &Backend) {
@@ -629,6 +691,8 @@ fn slack_item<'a>(tool: &'a str, args: &'a Value) -> NewItem<'a> {
         content_sha: None,
         model_alias: Some("pmos/default"),
         sources_sensitivity: Sensitivity::Restricted,
+        persona: None,
+        draft_notice: None,
     }
 }
 
@@ -829,6 +893,8 @@ fn bot_item<'a>(bot: &'a str, args: &'a Value) -> NewItem<'a> {
         content_sha: None,
         model_alias: Some("pmos/extraction"),
         sources_sensitivity: Sensitivity::Internal,
+        persona: None,
+        draft_notice: None,
     }
 }
 
@@ -883,6 +949,8 @@ async fn ledger_rows_record_every_outcome(b: &Backend) {
             args: None,
             reason: Some(Reason::WrongFacts),
             confirm_external: false,
+            expected_args_hash: None,
+            hold: None,
         },
         decided,
     )
@@ -902,6 +970,8 @@ async fn ledger_rows_record_every_outcome(b: &Backend) {
             args: None,
             reason: Some(Reason::Tone),
             confirm_external: false,
+            expected_args_hash: None,
+            hold: None,
         },
         decided,
     )
@@ -1012,6 +1082,8 @@ async fn ledger_reads_filter_and_order(b: &Backend) {
             args: None,
             reason: Some(Reason::Tone),
             confirm_external: false,
+            expected_args_hash: None,
+            hold: None,
         },
         t(30),
     )
@@ -1132,6 +1204,8 @@ async fn ledger_rows_follow_concurrent_decisions(b: &Backend) {
                     args: None,
                     reason: Some(Reason::Incomplete),
                     confirm_external: false,
+                    expected_args_hash: None,
+                    hold: None,
                 }
             };
             approvals
@@ -1446,9 +1520,13 @@ fn event(outcome: Outcome) -> AuditEvent {
         tool: "confluence.create_draft".into(),
         outcome,
         sources: vec!["context/products/cloud.md".into(), "jira:PM-101".into()],
+        source_titles: [("jira:PM-101".to_string(), "SSO for the console".to_string())]
+            .into_iter()
+            .collect(),
         args_hash: Some("abc".into()),
         output_ref: Some("apr_1".into()),
         detail: None,
+        persona: None,
     }
 }
 
@@ -1476,6 +1554,15 @@ async fn audit_records_events(b: &Backend) {
         assert_eq!(outcomes, vec!["pending", "approved"]);
         let sources: Vec<String> = rows[0].get("sources");
         assert_eq!(sources, vec!["context/products/cloud.md", "jira:PM-101"]);
+        // An event recorded before titles were (the column is null) reads with none.
+        sqlx::query(
+            "INSERT INTO audit_events (at, run_id, user_handle, skill, tool, outcome, sources)
+             VALUES ($1, 'run-a', 'ana', 'prd-draft', 'jira.read', 'ok', ARRAY['jira:PM-7'])",
+        )
+        .bind(now() - Duration::seconds(5))
+        .execute(pg.pool())
+        .await
+        .unwrap();
 
         // Append-only: no update, delete or truncate, even by the table's owner.
         for sql in [
@@ -1490,7 +1577,30 @@ async fn audit_records_events(b: &Backend) {
             .fetch_one(pg.pool())
             .await
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
+    }
+    // A read is read back with its titles, in both stores.
+    let mut read = event(Outcome::Ok);
+    read.tool = "jira.read".into();
+    b.stores.audit.record(read).await.unwrap();
+    let reads = b
+        .stores
+        .audit
+        .reads("ana", "run-a", now() + Duration::seconds(1), 10)
+        .await
+        .unwrap()
+        .unwrap();
+    // Only `ok` events with sources are reads: not the pending and approved ones above.
+    assert!(reads.iter().all(|r| r.tool == "jira.read"));
+    assert_eq!(
+        reads[0].titles.get("jira:PM-101").map(String::as_str),
+        Some("SSO for the console")
+    );
+    if b.pg.is_some() {
+        assert_eq!(reads.len(), 2);
+        assert!(reads[1].titles.is_empty(), "an older event has no titles");
+    } else {
+        assert_eq!(reads.len(), 1);
     }
 }
 
@@ -1509,6 +1619,7 @@ fn sealed(user: &str, provider: Provider, token: &str) -> SealedCredential {
         site_url: Some("https://example.atlassian.net".into()),
         external_id: None,
         updated_at: now(),
+        suspended_at: None,
     }
 }
 
