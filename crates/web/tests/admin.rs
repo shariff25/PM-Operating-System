@@ -659,7 +659,9 @@ async fn team_and_overview() {
                          "deactivation_grace_hours": 24, "bots_without_active_owner": [],
                          "first_links": [{"handle": "ana", "at": "2026-11-16T09:00:00Z",
                                           "provider": "entra"}],
-                         "password_resets": [{"handle": "ana", "by": "ada", "at": "2026-11-16T08:00:00Z"}]}})
+                         "password_resets": [{"handle": "ana", "by": "ada", "at": "2026-11-16T08:00:00Z",
+                                              "dismissed_at": null}],
+                         "password_codes_voided": []}})
     );
 }
 

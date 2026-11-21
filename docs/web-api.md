@@ -66,14 +66,17 @@ Every path below is under `/api`. Bodies are JSON. Times are RFC 3339 in UTC.
 - **Health:** `GET /healthz` (outside `/api`, no session) answers `ok` while the process runs.
   `GET /readyz` answers `200` when it can serve and `503` when it can't, with
   `{"ready": bool, "checks": {"store": "ok"|"down", "bot_runtime": …, "tool_server": …},
-  "unrecorded_sign_in_events": n}`: its own store answers, and the bot runtime and the tool
+  "unrecorded_sign_in_events": n, "untrusted_proxy_refusals": n}`: its own store answers, and the bot runtime and the tool
   server (which answers who may sign in) answer their `/healthz` within two seconds. With
   Entra sign-in on, `checks` also has `entra_link` (since the review of `b469d5b`, U1): `ok`
   only when the tool server validates first-link ID tokens for the same tenant and client id
   (`docs/entra-sign-in.md`); without that a first Microsoft sign-in can't link, so it is
   `down` and the server is not ready. `unrecorded_sign_in_events` counts, since start-up, sign-in events the audit log didn't take
-  (see **Sign-in events**); it never makes the server unready. No detail and no secrets; the
-  reason goes to the server's log.
+  (see **Sign-in events**); it never makes the server unready. `untrusted_proxy_refusals`
+  counts, since start-up, password requests refused `403 proxy_not_trusted` because the proxy
+  setting doesn't match where they came from (`docs/password-sign-in.md`); above zero, the
+  setting is wrong or stale; it never makes the server unready either. No detail and no
+  secrets; the reason goes to the server's log.
 - **Sign-in events.** Every sign-in, sign-out and refused sign-in is recorded in the tool
   server's audit log (`POST /internal/admin/events`, `docs/toolserver.md`, **Sign-in
   events**), and shows in the admin audit list with the usual fields:
