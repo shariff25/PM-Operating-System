@@ -178,6 +178,10 @@ pub struct ApprovalItem {
     /// The bot whose session asked for the write, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot: Option<String>,
+    /// The persona (marketplace bot) whose session drafted it, copied from the session when
+    /// the item is created and never changed (`docs/bot-marketplace-spec.md` §5). `None` (served
+    /// as `null`) is Nudge, and every item from before personas.
+    pub persona: Option<String>,
     pub run_id: String,
     /// Registry name, such as `confluence.create_draft`.
     pub tool: String,
@@ -319,6 +323,8 @@ pub struct NewItem<'a> {
     pub skill: Option<&'a str>,
     /// The session's bot, for a bot session.
     pub bot: Option<&'a str>,
+    /// The session's persona; `None` for Nudge and for a skill session.
+    pub persona: Option<&'a str>,
     pub run_id: &'a str,
     pub tool: &'a str,
     pub args: &'a Value,
@@ -357,6 +363,7 @@ impl NewItem<'_> {
             user: self.user.to_string(),
             skill: self.skill.map(String::from),
             bot: self.bot.map(String::from),
+            persona: self.persona.map(String::from),
             run_id: self.run_id.to_string(),
             tool: self.tool.to_string(),
             args: self.args.clone(),
@@ -583,6 +590,16 @@ pub trait ApprovalRepo: Send + Sync {
 
     /// The live recommendations on `approval_ids`, oldest first (ties by id).
     async fn recommendations(&self, approval_ids: &[String]) -> StoreResult<Vec<Recommendation>>;
+
+    /// How many items each persona drafted since `since` (created at or after it), for `user`
+    /// alone or, with `None`, for everyone: keyed by persona, with Nudge's (`persona` NULL)
+    /// under [`pmos_contract::personas::ALWAYS_ON`]. Keys with no item are left out. Counts
+    /// only: no item's content (`docs/bot-marketplace-spec.md` §6).
+    async fn persona_counts(
+        &self,
+        user: Option<&str>,
+        since: DateTime<Utc>,
+    ) -> StoreResult<BTreeMap<String, u64>>;
 }
 
 /// Why `new` can't be stored on `item` as it is now, checked in this order by both stores:
@@ -1075,6 +1092,26 @@ impl ApprovalRepo for MemoryApprovals {
             }
         }
         Ok(ids)
+    }
+
+    async fn persona_counts(
+        &self,
+        user: Option<&str>,
+        since: DateTime<Utc>,
+    ) -> StoreResult<BTreeMap<String, u64>> {
+        let state = self.state.lock().expect("approvals lock");
+        let mut out = BTreeMap::new();
+        for item in state.items.values() {
+            if item.created_at < since || user.is_some_and(|u| u != item.user) {
+                continue;
+            }
+            let key = item
+                .persona
+                .clone()
+                .unwrap_or_else(|| pmos_contract::personas::ALWAYS_ON.to_string());
+            *out.entry(key).or_insert(0) += 1;
+        }
+        Ok(out)
     }
 
     async fn pending_of(

@@ -442,6 +442,7 @@ async fn caps_the_list_and_skips_what_it_cannot_identify() {
         args_hash: None,
         output_ref: None,
         detail: None,
+        persona: None,
     };
     for n in 0..30 {
         f.stores

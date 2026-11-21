@@ -368,6 +368,7 @@ impl UserStore for MemoryUsers {
             args_hash: None,
             output_ref: None,
             detail: Some(format!("purged {deleted} role changes")),
+            persona: None,
         }])
         .await?;
         Ok(deleted)

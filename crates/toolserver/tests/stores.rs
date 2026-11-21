@@ -90,6 +90,9 @@ impl Backend {
                 memory_repos: Arc::new(MemoryRepos::default()),
                 member_requests: Arc::new(MemoryRequests::default()),
                 users: Arc::new(pmos_toolserver::users::MemoryUsers::default()),
+                teams: Arc::new(
+                    pmos_toolserver::team::MemoryTeams::default().with_audit(audit.clone()),
+                ),
             },
             memory_audit: Some(audit),
             pg: None,
@@ -288,6 +291,7 @@ async fn approval_items_and_audit_events_keep_their_bot(b: &Backend) {
                 content_sha: None,
                 model_alias: None,
                 sources_sensitivity: Sensitivity::Internal,
+                persona: None,
             },
             now(),
         )
@@ -415,6 +419,7 @@ fn new_item<'a>(user: &'a str, args: &'a Value) -> NewItem<'a> {
         content_sha: Some("0123456789abcdef0123456789abcdef01234567"),
         model_alias: Some("pmos/default"),
         sources_sensitivity: Sensitivity::Internal,
+        persona: None,
     }
 }
 
@@ -684,6 +689,7 @@ fn slack_item<'a>(tool: &'a str, args: &'a Value) -> NewItem<'a> {
         content_sha: None,
         model_alias: Some("pmos/default"),
         sources_sensitivity: Sensitivity::Restricted,
+        persona: None,
     }
 }
 
@@ -884,6 +890,7 @@ fn bot_item<'a>(bot: &'a str, args: &'a Value) -> NewItem<'a> {
         content_sha: None,
         model_alias: Some("pmos/extraction"),
         sources_sensitivity: Sensitivity::Internal,
+        persona: None,
     }
 }
 
@@ -1511,6 +1518,7 @@ fn event(outcome: Outcome) -> AuditEvent {
         args_hash: Some("abc".into()),
         output_ref: Some("apr_1".into()),
         detail: None,
+        persona: None,
     }
 }
 
