@@ -665,8 +665,7 @@ async fn team_and_overview() {
                          "first_links": [{"handle": "ana", "at": "2026-11-16T09:00:00Z",
                                           "provider": "entra"}],
                          "password_resets": [{"handle": "ana", "by": "ada", "at": "2026-11-16T08:00:00Z",
-                                              "dismissed_at": null}],
-                         "password_codes_voided": []}})
+                                              "dismissed_at": null}]}})
     );
 }
 
