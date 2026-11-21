@@ -299,9 +299,10 @@ export interface BotCard extends BotUsage {
   new: boolean;
   /**
    * Offered as a Preview: not yet benchmarked by an eval run (the owner's decision of 2026-11-21).
-   * Optional: a server that doesn't send it means false.
+   * pmos-web always sends it (gate-fix-4, H1), `true` for every bot the tool server doesn't
+   * know to be benchmarked; never for Nudge.
    */
-  preview?: boolean;
+  preview: boolean;
 }
 
 /** A bot on the person's team that is no longer offered: "No longer offered", Remove only. */
@@ -419,6 +420,7 @@ export const SERVER_ERROR_CODES = {
   cant_write_brief: 'yes',
   held: 'yes',
   not_held: 'yes',
+  release_own_draft: 'yes',
   bad_content_type: 'yes',
   bad_edit: 'yes',
   bad_brief: 'yes',

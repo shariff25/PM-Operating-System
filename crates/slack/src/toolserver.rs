@@ -518,7 +518,11 @@ impl ToolServer {
                 .query(&[("user", handle)]),
         )
         .await?;
-        let items = body["approvals"].as_array().cloned().unwrap_or_default();
+        let mut items = body["approvals"].as_array().cloned().unwrap_or_default();
+        // Each row names its bot, and a Preview says so (gate-fix-4, M1).
+        for item in &mut items {
+            annotate(item, &self.personas);
+        }
         let total = body["total"]
             .as_u64()
             .map_or(items.len(), |t| (t as usize).max(items.len()));

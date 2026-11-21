@@ -1519,8 +1519,30 @@ fn persona_benchmark() {
         !report.personas.iter().any(|p| p.name == "chief"),
         "refused personas are not in the catalog"
     );
-    // Its category passed: offered in full.
-    assert!(run_with(&dir, &["chief"]).diagnostics.is_empty());
+    // Its category passed but the file doesn't claim it: told to (a warning), and the
+    // catalog still shows it as a Preview (slice gate-fix-4, M2: fail safe without the claim).
+    let report = run_with(&dir, &["chief"]);
+    assert_at(&report, "persona-benchmark", CHIEF, Severity::Warning);
+    assert!(!report.has_errors());
+    let chief = report.personas.iter().find(|p| p.name == "chief").unwrap();
+    assert!(chief.preview && !chief.benchmarked);
+    // Its category passed and the file says so: offered in full.
+    put_chief(&dir, "benchmarked: true\n", &[]);
+    let report = run_with(&dir, &["chief"]);
+    assert!(report.diagnostics.is_empty(), "{:#?}", report.diagnostics);
+    let chief = report.personas.iter().find(|p| p.name == "chief").unwrap();
+    assert!(!chief.preview && chief.benchmarked);
+    // The claim with no passing report is an error, and the claim the services trust without
+    // the reports, so `pmos lint` is what makes it true.
+    let report = run_with(&dir, &[]);
+    assert_at(&report, "persona-benchmark", CHIEF, Severity::Error);
+    assert!(report
+        .errors()
+        .any(|d| d.message.contains("benchmarked: true")));
+    // Both labels at once: an error even where the reports aren't read.
+    put_chief(&dir, "benchmarked: true\npreview: true\n", &[]);
+    assert_at(&run(&dir), "persona-benchmark", CHIEF, Severity::Error);
+    put_chief(&dir, "", &[]);
     // A Preview may be offered before; it is carried into the catalog.
     put_chief(&dir, "preview: true\n", &[]);
     let report = run_with(&dir, &[]);
@@ -1740,7 +1762,9 @@ fn codeowners_lines_cover_every_bot_instruction_file() {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .filter_map(|l| l.split_whitespace().next())
         .collect();
-    for path in pmos_contract::personas::instruction_paths(&report.personas) {
+    let roles: Vec<_> = report.roles.iter().collect();
+    let bots: Vec<_> = report.bots.iter().collect();
+    for path in pmos_contract::personas::instruction_paths(&report.personas, &roles, &bots) {
         let covered = listed.iter().any(|l| {
             let l = l.trim_start_matches("/content/");
             l == path || (l.ends_with('/') && path.starts_with(l))

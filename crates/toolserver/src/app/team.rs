@@ -34,7 +34,7 @@ use chrono::Utc;
 use pmos_contract::permissions::Permission;
 use serde::Deserialize;
 
-use super::admin::{coded, viewer};
+use super::admin::{coded, viewer_coalesced};
 use super::users::writes_allowed;
 use super::{bearer, check_assertion, client_for, error, unavailable, AppState};
 use crate::assertion::{Mode, Refusal};
@@ -298,7 +298,17 @@ async fn admin_personas(
     Query(q): Query<ViewerParams>,
 ) -> Response {
     let need = [Permission::ViewAuditLog, Permission::ManageMembers];
-    if let Err(refused) = viewer(&state, client, q.user.as_deref(), PERSONAS_READ, &need).await {
+    let window = chrono::Duration::minutes(crate::service::PERSONAS_READ_WINDOW_MINUTES);
+    if let Err(refused) = viewer_coalesced(
+        &state,
+        client,
+        q.user.as_deref(),
+        PERSONAS_READ,
+        &need,
+        window,
+    )
+    .await
+    {
         return *refused;
     }
     match state.svc.admin_personas(Utc::now()).await {
@@ -342,7 +352,7 @@ async fn release_held_draft(
         Err(ReleaseRefusal::Store(e)) => unavailable(e),
         Err(e) => {
             let status = match e {
-                ReleaseRefusal::Forbidden => StatusCode::FORBIDDEN,
+                ReleaseRefusal::Forbidden | ReleaseRefusal::OwnDraft => StatusCode::FORBIDDEN,
                 ReleaseRefusal::NotFound => StatusCode::NOT_FOUND,
                 _ => StatusCode::CONFLICT,
             };

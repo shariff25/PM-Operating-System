@@ -40,7 +40,14 @@ no history; `Nudge: …` switches the thread back to Nudge.
   yet benchmarked"; later messages in that thread don't repeat it (the progress message keeps
   it as it is edited).
 - **Approval cards** say "Drafted by Chief" in their context line (Nudge's cards are as
-  before). A draft whose bot was withdrawn from the catalog is **held**: its card says so and
+  before), and every card of a Preview bot adds "· Preview: not yet benchmarked"; so does each
+  App Home Inbox row, which names the bot ("Drafted by Chief") instead of the personal bot. The
+  name and the Preview flag come from the tool server's item (`persona_name`,
+  `persona_preview`; a bot named like a colleague reads "Ana (bot)"), never from the Slack
+  bot's catalog copy. An item from an older tool server falls back to that copy; with no copy
+  at all the card says "Drafted by A marketplace bot · Preview: not yet benchmarked" (fail safe:
+  the line is never dropped for want of a catalog), and a thread's messages are said by "A
+  marketplace bot" with the Preview line (gate-fix-4). A draft whose bot was withdrawn from the catalog is **held**: its card says so and
   offers only **Reject**, until the bot is offered again or an Admin releases it.
 
 ## When a bot can't take the ask

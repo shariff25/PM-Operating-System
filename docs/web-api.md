@@ -699,9 +699,11 @@ and Auditors, is `GET /api/admin/bots`, slice A1; it is not built yet.)
 | `PUT /api/me/settings` | `{ask_persona: key}` | `Me` (**Me**) |
 
 ```json
-// BotCard: an offered bot, Nudge first, then in the catalog's order
+// BotCard: an offered bot, Nudge first, then in the catalog's order. `preview` (always sent,
+// gate-fix-4): "Preview: not yet benchmarked"; true for any bot but Nudge whose catalog entry
+// doesn't say false, so the app shows it on the cards, the picker, "Drafted by" and the thread.
 {"key": "chief", "display_name": "Chief", "title": "Chief of Staff", "mascot": "chief",
- "always_on": false,
+ "always_on": false, "preview": true,
  "summary": "Runs your week: what needs you, what is slipping, and what to tell your leadership.",
  "examples": ["Prep me for the staff meeting", "What slipped since Monday?"],
  "can_do": ["daily-brief", "meeting-prep", "week-review"],
@@ -989,6 +991,7 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `409` | `cant_write_brief` | Choosing a bot to write the daily brief that doesn't write briefs (its `can_do` lacks `daily-brief`) (**Bots**). | Yes |
 | `409` | `held` | Approving, editing or asking for a change to a draft on hold: the bot that drafted it is no longer offered (**Drafts**, "Held drafts"). It can still be rejected. | Yes |
 | `409` | `not_held` | An admin releasing a draft that isn't on hold (decided, its bot offered again, or already released) (**Admin: bots**). | Yes |
+| `403` | `release_own_draft` | An admin releasing their own held draft: another Admin releases it (gate-fix-4) (**Admin: bots**). | Yes |
 | `409` | `github_not_linked` | An admin proposal: the admin hasn't linked GitHub in PM OS. Pull requests are opened as them; `error` says how to link. | Yes |
 | `409` | `stale_base` | An admin proposal or validation made from a copy that differs from the server's or the default branch's (**Admin: policy**). | Yes |
 | `422` | `invalid` | An admin proposal that doesn't pass validation (`errors`, `warnings`). Also a malformed value in an admin's user or role change, and a reviewer's note over 1,000 characters. | Yes |
@@ -1314,7 +1317,7 @@ nothing here changes the catalog or anyone's team. The one write is releasing a 
 | Method and path | Who | Answer |
 | --- | --- | --- |
 | `GET /api/admin/bots` | `view-audit-log` or `manage-members` (Admin, Auditor); others `403 forbidden` before the tool server is asked | `AdminBots` (below). Read from the tool server's `GET /internal/admin/personas?user=<viewer>`, signed for the viewer, which checks the role again and records `admin.personas_read`. `502 upstream_unavailable` when it can't be read. |
-| `POST /api/admin/bots/drafts/{id}/release` | `edit-content` (an Admin); others `403 forbidden` before the tool server is asked. No body. Origin and CSRF as every write | `{id, released: true}`, never the draft. Passed to `POST /internal/admin/personas/drafts/{id}/release?user=<admin>`, signed for the admin, which checks again (an active person with `edit-content`), needs assertion `require`, and records `approvals.release_hold`. Errors: `404 not_found` (a malformed or practice id is never sent), `409 not_held`, `403 forbidden`, `503 assertion_required`, `503 unavailable`. |
+| `POST /api/admin/bots/drafts/{id}/release` | `edit-content` (an Admin); others `403 forbidden` before the tool server is asked. No body. Origin and CSRF as every write | `{id, released: true}`, never the draft. Passed to `POST /internal/admin/personas/drafts/{id}/release?user=<admin>`, signed for the admin, which checks again (an active person with `edit-content`), needs assertion `require`, and records `approvals.release_hold`. Errors: `404 not_found` (a malformed or practice id is never sent), `409 not_held`, `403 release_own_draft` (the draft is the admin's own: two people, as for any approval), `403 forbidden`, `503 assertion_required`, `503 unavailable`. |
 
 ```json
 // AdminBots

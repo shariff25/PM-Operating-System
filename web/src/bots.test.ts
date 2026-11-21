@@ -21,19 +21,22 @@ const ME: Me = {
 
 describe('who drafted it', () => {
   it('null (and the key "nudge") is Nudge', () => {
-    expect(identify(null, true, catalog)).toEqual({ kind: 'nudge', name: 'Nudge', mascot: 'nudge' });
+    expect(identify(null, true, catalog)).toEqual({ kind: 'nudge', name: 'Nudge', mascot: 'nudge', preview: false });
     expect(identify(undefined, undefined, null).kind).toBe('nudge');
     expect(identify('nudge', true, catalog).kind).toBe('nudge');
   });
   it('an offered key is looked up in the catalog', () => {
-    expect(identify('chief', true, catalog)).toEqual({ kind: 'bot', name: 'Chief', mascot: 'chief' });
+    expect(identify('chief', true, catalog)).toEqual({ kind: 'bot', name: 'Chief', mascot: 'chief', preview: true });
+    // A benchmarked bot (its card says `preview: false`) carries no tag.
+    expect(identify('chief', true, [{ ...card('chief'), preview: false }]).preview).toBe(false);
   });
   it('a withdrawn key, or one the catalog does not list, is "a bot no longer offered", never a name from the key', () => {
-    expect(identify('chief', false, catalog)).toEqual({ kind: 'gone', name: copy.bots.gone, mascot: 'unknown' });
-    expect(identify('sprout', true, catalog)).toEqual({ kind: 'gone', name: copy.bots.gone, mascot: 'unknown' });
+    expect(identify('chief', false, catalog)).toEqual({ kind: 'gone', name: copy.bots.gone, mascot: 'unknown', preview: false });
+    expect(identify('sprout', true, catalog)).toEqual({ kind: 'gone', name: copy.bots.gone, mascot: 'unknown', preview: false });
   });
   it('while the catalog can\'t be read, an offered key is named plainly, with the neutral face', () => {
-    expect(identify('chief', true, null)).toEqual({ kind: 'unchecked', name: copy.bots.unchecked, mascot: 'unknown' });
+    // Nothing says it was benchmarked: it carries the Preview tag (fail safe, gate-fix-4).
+    expect(identify('chief', true, null)).toEqual({ kind: 'unchecked', name: copy.bots.unchecked, mascot: 'unknown', preview: true });
   });
 });
 

@@ -2432,6 +2432,7 @@ export const copy = {
       cant_write_brief: "That bot doesn't write daily briefs. Nothing changed.",
       held: 'This draft is on hold: the bot that drafted it isn’t offered any more. You can still reject it. Nothing was sent.',
       not_held: 'That draft isn’t on hold any more: it was decided, its bot is offered again, or someone released it. Nothing changed.',
+      release_own_draft: 'This is your own draft, so another Admin releases it. Nothing changed.',
       bad_content_type: "That request wasn't sent the way I need it. Nothing changed.",
       bad_edit: "That text isn't valid for where this draft goes, so nothing was saved or sent.",
       bad_brief: 'The brief feed sent something I could not read. Nothing was stored.',
