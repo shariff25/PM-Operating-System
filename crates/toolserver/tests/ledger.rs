@@ -592,8 +592,20 @@ async fn reasons_over_http() {
 #[tokio::test]
 async fn who_may_read_the_ledger() {
     let s = start().await;
-    let session = skill_session(&s.fixture, "r1").await;
-    draft(&s.fixture, &session, "SCIM").await;
+    // The HTTP layer reads the ledger against the real clock, and a pending row older than the
+    // expiry window reads as `expired`: so the draft is made now, not at the fixed test time.
+    let today = chrono::Utc::now();
+    let session = s
+        .fixture
+        .svc
+        .create_session("ana", "meeting-notes", "r1", None, today)
+        .await
+        .unwrap();
+    s.fixture
+        .svc
+        .call(&session, "jira_create_issue", issue("SCIM"), today)
+        .await
+        .unwrap();
 
     let (status, body) = s.get(SERVICE_TOKEN, "/internal/ledger").await;
     assert_eq!(status, 200);
