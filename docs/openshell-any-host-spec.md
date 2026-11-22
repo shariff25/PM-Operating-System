@@ -1,11 +1,19 @@
-# OpenShell on any Linux host: the bots off the Spark
+# OpenShell on any Linux host: one platform-agnostic deployment
 
 Status: **design spec; not built.** The reviewer checks it before any slice starts (CLAUDE.md,
 scope item c). Revised on 2026-11-22 after the reviewer's review of `9de1a65` ("sound after
-changes"; §10 lists what changed), and again after the reviewer's re-review the same day (three
-changes required before slice H4; §11 lists each change). File references are to
-`claude/openshell-any-host-spec-r3`, based on `claude/web-app` at `6bb806f`, except where a row
-says `2544d01`.
+changes"; §10 lists what changed), again after the reviewer's re-review the same day (§11), and
+a fourth time for the owner's change of direction later the same day: **the DGX Spark is no
+longer a deployment target**, real data may be processed by the owner's hosted model as well
+as by a local model, and decisions D2, D3, O1 and O6 are answered (§12 summarises it all and
+ends with the points the reviewer must check). Text new in this revision cites `claude/web-app`
+at `57e2e72`; text kept from earlier revisions cites `6bb806f` unless it says `2544d01` (the §2
+tables are the inventory as it was made, kept as the record of why each slice exists). Line
+numbers may have moved since; the slice that edits a file re-checks them.
+
+**Where this revision overrides earlier text.** §10 and §11 are the record of earlier reviews
+and are not rewritten; where they say "the Spark", `spark`, `PMOS_HOST_PROFILE`, H-PROFILE,
+H11, ADM-3 or "fake-data mode off the Spark", §12 and the sections it names apply instead.
 
 **Slice H0 status (2026-11-22): built on `claude/any-host-h0`, not yet reviewed or merged.**
 What it changed: `pmos-admin sandbox` creates with `--from`; the worker runs as the systemd user
@@ -50,30 +58,45 @@ public docs don't show (they show `sandbox delete`).
 **The owner's requirement, 2026-11-22:** "I want to deploy it in another platform apart from
 spark", and, asked which cloud, "OpenShell on another platform generic implementation". So PM OS's
 bots must be able to run in NVIDIA OpenShell sandboxes on hosts other than the DGX Spark, through
-one host-independent implementation that is not tied to a single cloud. The Spark stays a
-supported host.
+one host-independent implementation that is not tied to a single cloud. Later the same day:
+**"Deploy on spark scrap that idea I want to make it platform agnostic."** So PM OS runs on any
+suitable Linux host with OpenShell, and **the DGX Spark is no longer a deployment target**: no
+host profile, check, default or runbook is specific to it. A Spark is just one possible GPU
+host, with no special status.
+
+**What in H0 and H0b was Spark-worded, and is generalised in slice H6 (no behaviour change):**
+the comment heads of `deploy/pmos-admin` ("PM OS operations on the Spark") and `deploy/setup.sh`
+("on the Spark"), the install runbook's "OpenShell: installed on the Spark" line, the
+`pmos-admin` comment that names "the Spark's eval-gate runner" and "Registering the Spark CI
+runner" (`deploy/pmos-admin:82-83`), and the eval gate's `PMOS_SPARK_DIR`, which `evals-gate`
+and the workflow still read. Nothing H0 or H0b decides depends on the host being a Spark: name
+validation, `--from`, the unit, the numeric `USER`, `load_env`, `set_env` and the token
+handling hold on every host as written.
 
 **What has been verified, said first:** nothing in this repository has run on a real OpenShell
-anywhere, the Spark included. Every policy file, launch command and red-team check was written
-from OpenShell's documentation (`docs/sandbox-policies.md`, "Sources"). So this spec cannot be
-"port what works on the Spark"; it makes the deployment generic and defines the checks that must
-pass on a real host, the Spark or any other, before the docs may call that host verified. Every
+anywhere. Every policy file, launch command and red-team check was written from OpenShell's
+documentation (`docs/sandbox-policies.md`, "Sources"). So this spec defines the checks that must
+pass on a real host before the docs may call that kind of host verified. Every
 statement about OpenShell's behaviour that this repo has not seen happen is marked **verify on a
 real host**. The same holds for the fixes in slice H0: they are written from OpenShell's public
 docs, and none of them counts as verified until the acceptance run (§6).
 
-**Naming.** "Decision D1" to "D3" below are this spec's open decisions for the owner (§8).
-`docs/bot-decisions.md` has its own D1 to D12; this spec writes those as "bot decision D2" and so
-on.
+**Naming.** "Decision D1" to "D3" and "O1" to "O8" are this spec's decisions for the owner
+(§8; all answered on 2026-11-22). `docs/bot-decisions.md` has its own D1 to D12; this spec
+writes those as "bot decision D2" and so on. "The owner's hosted model" is the owner's
+connected model provider, an OpenAI-compatible endpoint, the same model used for the eval runs.
+This spec does not name the vendor or its host, and the design keeps the host out of every
+committed file and every report (§3.6), since whether the provider's host name may appear in
+committed eval reports is still the owner's question (CLAUDE.md, "Waiting on the owner").
 
 ## 0. Goal and non-goals
 
 **Goal.** One deployment kit (`deploy/`) and one set of reviewed sandbox policies (`policies/`)
-that run PM OS's bots in OpenShell sandboxes on:
-
-- the DGX Spark (DGX OS, arm64, local models on its GPU), as today;
-- any single Linux host with Docker that meets OpenShell's requirements: a VM on any cloud or an
-  on-prem server, amd64 or arm64, with or without a GPU.
+that run PM OS's bots in OpenShell sandboxes on any single Linux host with Docker that meets
+OpenShell's requirements: a VM on any cloud or an on-prem server, amd64 or arm64, with or
+without a GPU. Its model is either a local model server on the same host (a GPU host the owner
+controls) or the owner's hosted model reached through PM OS's gateway (§3.6); both may serve
+real data. There is no host-specific profile.
 
 What a host needs is checked by a command before anything is installed and again at every start
 (§3.2), and stated as pass or fail per requirement.
@@ -84,14 +107,16 @@ What a host needs is checked by a command before anything is installed and again
   VM is just a Linux host. The one place clouds differ is how the metadata check (H-METADATA,
   §3.2) reads the answer from `169.254.169.254`; it reads one address, with no SDK and no account.
 - **No serverless container platforms** (§4, "Unsupported").
-- **No multi-host PM OS.** One host runs the whole stack, as on the Spark. Kubernetes is Tier 2,
-  designed in outline only (§4).
-- **No model switching or fallback.** That is requirement i (CLAUDE.md): not started, not designed
-  here. This spec only notes where a host without a GPU depends on it (§3.6).
+- **No multi-host PM OS.** One host runs the whole stack. Kubernetes is Tier 2, designed in
+  outline only (§4), and not for the pilot (O2).
+- **No model switching, fallback or second provider.** That is requirement i (CLAUDE.md): not
+  started, not designed here. This spec designs only the minimum for **one** configured hosted
+  model, from an owner-approved list, to serve real data through a `class: production` gateway
+  (§3.6). One gateway serves one model source; mixing sources across roles is requirement i.
 - **No change to what a sandbox may reach.** The three PM OS endpoints, their routes, the MCP
   methods, the binaries, the credentials and the filesystem rules stay exactly as reviewed. The
-  one policy change proposed (§3.5, pinning each of those three names to its own address)
-  narrows, never widens.
+  one policy change (§3.5, each of those three names pinned to its own address, decision O6)
+  narrows, never widens. No sandbox ever reaches the hosted provider or holds its key.
 
 ## 1. What is known about OpenShell, and from where
 
@@ -128,6 +153,14 @@ Classes: **(a)** truly Spark-only (local GPU model serving); **(b)** a host-spec
 should become a setting or a generated, checked value; **(c)** wording only. "Fixed" means the
 value is not host-specific after all and stays a constant. Line numbers are at `2544d01`, except
 the `crates/gateway` rows, re-checked at `6bb806f`.
+
+**Read with the change of direction (§12).** These tables were made while the Spark was still a
+target. Where a row's "Change" says the Spark keeps a behaviour (the `spark` profile, ADM-3 "kept",
+`local` only on the Spark, the hosted path testing-only, decision O4), §3.6 and §12 replace it:
+there is no `spark` profile, ADM-3 is replaced by the approved-hosted-model rule, and O4 is
+withdrawn. Every other row stands. The complete, current list of the word "Spark" in the repo,
+with what happens to each, is H6's inventory (§7.1), which supersedes the "(c) wording" rows
+here.
 
 ### Deployment kit
 
@@ -226,10 +259,13 @@ the `crates/gateway` rows, re-checked at `6bb806f`.
    OpenAI-compatible model makes a GPU-less host usable. It does, but only in the gateway's
    testing-only mode (`PMOS_GATEWAY_CLOUD_TEST=1`), which is for fake data. Using a hosted model
    for real work is a change to ADM-3 and belongs with requirement i (decision O4).
+   **Superseded on 2026-11-22:** the owner decided that the hosted model may process real data
+   (§8, D1), and the minimum for one approved hosted model is designed here (§3.6), not in
+   requirement i.
 8. **CLAUDE.md item i says "OpenShell holds one credential per provider".** Today the gateway is
    a Compose service, not in a sandbox, so OpenShell cannot hold its upstream key: the key is
    `PMOS_GATEWAY_REMOTE_KEY` in `deploy/.env`. Moving that key into OpenShell is part of
-   requirement i's design, not this one (§3.6).
+   requirement i's design, not this one (§3.6, "Where the hosted model's key is held").
 9. **OpenShell's install command points at `ai-openshell/openshell`** on GitHub
    (`about/installation.mdx`), not `NVIDIA/OpenShell`. The runbook should cite NVIDIA's own
    install page rather than copy the command.
@@ -259,32 +295,43 @@ the `crates/gateway` rows, re-checked at `6bb806f`.
 
 ## 3. Design
 
-### 3.1 The host profile: four settings in `deploy/.env`
+### 3.1 The host settings: three in `deploy/.env`
 
-The smallest mechanism is not a new file format. It is four settings in `deploy/.env`, written by
-`setup.sh`, read by `pmos-admin` and the preflight, and **never read by the policy generator**.
-`PMOS_MODEL_SOURCE` and `PMOS_EXPOSURE` are also passed to the services that enforce them
-(§3.6, §3.8), so the refusals hold however the stack is started.
+The smallest mechanism is not a new file format. It is three settings in `deploy/.env`, written
+by `setup.sh`, read by `pmos-admin` and the preflight, and **never read by the policy
+generator**. `PMOS_MODEL_SOURCE` and `PMOS_EXPOSURE` are also passed to the services that enforce
+them (§3.6, §3.8), so the refusals hold however the stack is started.
 
-| Setting | Values | Default | What it decides |
+| Setting | Values | Default written by `setup.sh` | What it decides |
 | --- | --- | --- | --- |
-| `PMOS_HOST_PROFILE` | `spark`, `linux` | `spark` when `setup.sh` finds DGX OS (`/etc/dgx-release`), else `linux` | Which preflight checks are required; wording in `status`. `spark` = `linux` plus the NVIDIA runtime and local models required. Until decision D1 is answered (H11), also **where real data may be used: only on `spark`** (§3.6, "fake-data mode") |
-| `PMOS_MODEL_SOURCE` | `local`, `hosted-test` | `local` on `spark`; `hosted-test` on `linux` with no NVIDIA runtime | `local`: the vLLM profile, NVIDIA runtime required, a `class: production` gateway. `hosted-test`: no vLLM; the gateway runs a hosted test upstream; fake data only, enforced by the services (§3.6) |
-| `PMOS_EXPOSURE` | `private`, `public` | `private` | `public` means the host has a public address or sits on a network you don't control. It turns on the exposure checks and refusals in §3.8. Until H10 is built, `pmos-web` refuses to start with `public` (§3.8) |
+| `PMOS_MODEL_SOURCE` | `local`, `hosted`, `hosted-test` | `hosted-test` unless `setup.sh --model-source` names another | Where prompts go (§3.6). `local`: a model server on this host (the `models` profile, NVIDIA runtime required), a `class: production` gateway, real data allowed. `hosted`: the owner's hosted model, which must be an entry on the approved list, through a `class: production` gateway, real data allowed once the entry's conditions are recorded. `hosted-test`: any OpenAI-compatible endpoint, not approved, through a `class: test` gateway, **fake data only** |
+| `PMOS_EXPOSURE` | `private`, `public` | `public` unless `setup.sh --exposure private` | Who can reach the sign-in page. `public`: the host has a public address or sits on a network you don't control; password sign-in only from an allow-list (decision D2 (a), §3.8) and development sign-in refused. `private`: the host is reachable only from a network the company controls; H-PRIVATE checks that the host looks so (§3.2) |
 | `PMOS_OPENSHELL_DRIVER` | `docker` | `docker` | The OpenShell compute driver. Only `docker` is Tier 1; `podman` and `kubernetes` are refused until verified (§4) |
 
-Existing installs: `setup.sh` fills in missing values only, so a Spark install gets `spark`,
-`local`, `private`, `docker` and behaves as today.
+**What became of `PMOS_HOST_PROFILE`.** The previous revision had a fourth setting,
+`PMOS_HOST_PROFILE` (`spark` or `linux`), which chose the Spark-only preflight checks and,
+until decision D1, was the only thing that allowed real data. With no Spark target and D1
+answered, it decides nothing: every host gets the same checks, and whether real data is allowed
+follows from the model source alone (§3.6). So it is **not added**, and neither is the
+`PMOS_HOST_PLACE` declaration H11 would have added. No generic value replaces it: a setting
+that every host sets to the same thing is not a setting.
+
+**Defaults that allow less.** Each default is the value that allows less: `hosted-test`
+refuses every real source (§3.6), and `public` applies the stricter sign-in rules (§3.8). The
+values that allow more (`local`, `hosted`, `private`) must be chosen, and are checked:
+`local` needs the NVIDIA runtime (H-NVIDIA), `hosted` needs an approved entry whose conditions
+are recorded (the gateway refuses otherwise, §3.6), and `private` must match what the host shows
+(H-PRIVATE, §3.2). `setup.sh` fills in missing values only; no host was ever installed with an
+earlier revision, so there is nothing to migrate.
 
 **These settings are declarations, not measurements.** Nothing in a service can prove that a host
-is the Spark, or on the company's premises, or not reachable from the internet: an operator can
-write `spark` or `private` on a cloud VM. They are still the right defaults, because each value
-that allows more (`spark`, `private`) is checked by the preflight against what the host shows
-(H-PROFILE, H-PRIVATE, §3.2). A `private` mismatch fails until an operator records an
-acknowledgement that `status` shows every time; a `spark` mismatch is a hard fail with no
-acknowledgement until H11 (§3.2). That makes a wrong declaration visible and deliberate; it does
-not make it impossible, because both checks run from `pmos-admin` and the worker unit only, and
-the services see only the declaration (§5).
+is not reachable from the internet: an operator can write `private` on a host with a public
+address. H-PRIVATE checks it against what the host shows, and a mismatch fails until an
+operator records an acknowledgement that `status` shows every time (§3.2). That makes a wrong
+declaration visible and deliberate, not impossible, because the check runs from `pmos-admin`
+and the worker unit only, and the services see only the declaration (§5). `PMOS_MODEL_SOURCE`
+is different in kind: what it allows is enforced by the gateway against reviewed code and a
+reviewed list, not by a declaration (§3.6).
 
 What is deliberately **not** a setting:
 
@@ -297,9 +344,11 @@ What is deliberately **not** a setting:
   change a reviewed policy, and would make the committed `policies/` files differ per host. If
   OpenShell or an architecture ever needs a different value, the constant changes in
   `crates/policy/src/lib.rs` for every host, under POL-2 review.
+- **Which hosted endpoints may see real data.** That is the approved list, a reviewed file
+  compiled into the gateway (§3.6), never an environment variable.
 
-So **the policy files stay host-independent**: one reviewed set in the content repo works on the
-Spark and on any Tier 1 host.
+So **the policy files stay host-independent**: one reviewed set in the content repo works on
+every Tier 1 host.
 
 ### 3.2 The preflight: `deploy/preflight.sh` (and `pmos-admin preflight`)
 
@@ -308,7 +357,7 @@ value. It needs only `bash`, coreutils and `python3` (already needed by `pmos-ad
 changes nothing on the host.
 
 ```
-deploy/preflight.sh [--profile spark|linux] [--model-source local|hosted-test]
+deploy/preflight.sh [--model-source local|hosted|hosted-test]
                     [--exposure private|public] [--stage install|run|quick]
                     [--openshell] [--json] [--root <dir>]
 ```
@@ -332,7 +381,7 @@ fixture directory instead of the host, so every check is unit-tested (§6).
 | Id | Requirement | How it is measured | Fail when |
 | --- | --- | --- | --- |
 | H-ARCH | x86_64 or aarch64 | `uname -m` | anything else |
-| H-OS | Debian or Ubuntu (DGX OS is Ubuntu-based) | `/etc/os-release` `ID`, `ID_LIKE` | other distributions: **warn**, not fail ("not in OpenShell's support matrix") |
+| H-OS | Debian or Ubuntu | `/etc/os-release` `ID`, `ID_LIKE` | other distributions: **warn**, not fail ("not in OpenShell's support matrix") |
 | H-GLIBC | glibc 2.28+ (OpenShell's gateway) | `getconf GNU_LIBC_VERSION` | older |
 | H-KERNEL | Linux 6.2+ | `uname -r` | older. Passing this alone proves nothing, so it never stands in for H-LANDLOCK |
 | H-LSM | Landlock enabled | `landlock` in `/sys/kernel/security/lsm` | absent (a kernel built with Landlock but not listed in `lsm=` fails) |
@@ -341,16 +390,17 @@ fixture directory instead of the host, so every check is unit-tested (§6).
 | H-CGROUP | cgroups v2 | `/sys/fs/cgroup/cgroup.controllers` exists | v1 only (needed by Podman; recorded for Docker) |
 | H-DOCKER | Docker Engine 28.0+, daemon reachable, Compose v2 | `docker version --format '{{.Server.Version}}'`, `docker compose version` | missing, older, or the daemon not reachable by this user |
 | H-DOCKER-SECCOMP | Docker runs containers under its default seccomp profile | `docker info --format '{{.SecurityOptions}}'` contains `seccomp` | `seccomp` missing or `unconfined` |
-| H-NVIDIA | NVIDIA container runtime | `docker info` lists an `nvidia` runtime | missing, **only** when `PMOS_MODEL_SOURCE=local` (fail) |
+| H-NVIDIA | NVIDIA container runtime | `docker info` lists an `nvidia` runtime; `PMOS_VLLM_IMAGE` set (it has no default any more, §3.6) | missing, **only** when `PMOS_MODEL_SOURCE=local` (fail). Not checked for `hosted` or `hosted-test` |
+| H-EGRESS | the gateway can reach the hosted endpoint (`hosted` and `hosted-test` only) | the gateway's own `/readyz` label for its hosted upstream (§3.6), never a request made by the preflight with the key. Only once the gateway runs: `pmos-admin status` and `preflight` by hand; at `up` and `install` it reports "not started", which passes | `down`: **fail** for `hosted`, **warn** for `hosted-test`; the hint names `HTTPS_PROXY` and `NO_PROXY` |
 | H-PORTS | 8710, 8740, 8750, 8760, 8770 free on 127.0.0.1 | `ss -ltnH` | in use by anything other than this stack |
 | H-SUBNET | the `pmos` network as pinned | `ip route`; at stage `run`, `docker network inspect pmos_pmos` (subnet, gateway, `ip_range`, bridge name) | `PMOS_NETWORK_SUBNET` shorter than a `/24` (a `/8` or `/16` would hold the pinned addresses and much else besides); a route overlapping it other than Docker's own `pmos0` bridge; a live network whose subnet, gateway, `ip_range` or bridge name differs from `deploy/.env` and `deploy/compose.yaml` (the fix: `pmos-admin down`, then `up`, which re-creates it); an `ip_range` that contains a pinned address (§3.3), or a `PMOS_WEB_TRUSTED_PROXIES` in-network address that is one. The refusal of a subnet other than the policy's constant belongs to H3 (§3.5) |
 | H-NAMES | **the host's view**: the three names resolve on the host to their pinned addresses, and nothing maps them to loopback | `getent ahostsv4` for each name, on the host; the managed block in `/etc/hosts` | a wrong or loopback address. At stage `install` this reports "not set yet", which passes. It does **not** show what a sandbox gets: OpenShell resolves through "its trusted resolver", which may not be the host's (§1). The sandbox's view is O-REACH |
-| H-METADATA | PM OS's containers cannot get the VM's cloud credentials | after install, from a container on the `pmos` network (`docker run --rm --network pmos_pmos`), with a 2 s timeout: the rule per answer below; and, where `host-firewall apply` was run, that its rules, its `docker.service` drop-in and its timer are in place | per the rule below: **warn** on `private`, **fail** on `public` and on an acknowledged `private` (H-PRIVATE) (§5) |
-| H-EXPOSURE | nothing PM OS runs listens on a non-loopback address except the reverse proxy | `ss -ltnH` on the host: 8710, 8740, 8750, 8760, 8770, 8771 only on `127.0.0.1`; 8772 (the admin listener, §3.8) only on `PMOS_WEB_ADMIN_PUBLISH`; OpenShell's 17670 only on `127.0.0.1` or the host's address on the Docker bridge OpenShell's driver uses (`docker0` by default; which one it binds is **verify on a real host**). The containers' own addresses on `pmos0` are not host listeners and don't appear here | otherwise, **fail** on `public` and on an acknowledged `private` |
-| H-DEVLOGIN | development sign-in off | `PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY` | `1` with `PMOS_EXPOSURE=public` or an acknowledged `private` (fail) |
-| H-SIGNIN | sign-in on a public host as decision D2 says | `PMOS_WEB_PASSWORD_LOGIN`, `PMOS_WEB_PASSWORD_REACH`, `PMOS_WEB_PASSWORD_CLIENTS` (§3.8) | until H10: `public` with the web profile on (fail: "pmos-web does not serve a public host yet"). From H10: per D2's answer (fail) |
-| H-PRIVATE | a host declared `private` looks private | any interface address outside RFC 1918, `100.64.0.0/10`, loopback, link-local and IPv6 unique-local and link-local (`ip -j addr`); and H-METADATA's probe getting any answer. With the acknowledgement, also `ss -ltnH` for anything on the host listening on 80 or 443 | `PMOS_EXPOSURE=private` with either, unless acknowledged (below): **fail**. With the acknowledgement it passes as **warn**, and H-METADATA, H-EXPOSURE and H-DEVLOGIN apply at `public` strength; and it **fails** if any process (PM OS's or not) listens on 80 or 443 on an address outside the private ranges above, or on the unspecified address (`0.0.0.0`, `::`) while the host has a public address, so an operator's own proxy in front of 8770 can't put a public sign-in page back before H10 |
-| H-PROFILE | a host declared `spark` (or, from H11, `company`) looks like one | `spark`: `/etc/dgx-release` present, `uname -m` is `aarch64`, an `nvidia` runtime, and H-METADATA's probe getting no answer. `PMOS_HOST_PLACE=company` (H11): the probe getting no answer | any of these not so: **fail**. On `spark` this **cannot be acknowledged before H11**: it is the only check between a cloud VM and live data before D1, so a real Spark that fails it is a bug in the check, fixed in the check under review. From H11, `company` may be acknowledged only if D1's answer allows it |
+| H-METADATA | PM OS's containers cannot get the VM's cloud credentials | after install, from a container on the `pmos` network (`docker run --rm --network pmos_pmos`), with a 2 s timeout: the rule per answer below; and, where `host-firewall apply` was run, that its rules, its `docker.service` drop-in and its timer are in place | per the rule below: **fail**, on every host (§5). The previous revision only warned on `private`; that existed to spare an office box on a LAN, which answers "no answer" and passes anyway, so the one rule for every host is the stricter one |
+| H-EXPOSURE | nothing PM OS runs listens on a non-loopback address except the reverse proxy | `ss -ltnH` on the host: 8710, 8740, 8750, 8760, 8770, 8771 only on `127.0.0.1`; 8772 (the admin listener, §3.8) only on `PMOS_WEB_ADMIN_PUBLISH`; OpenShell's 17670 only on `127.0.0.1` or the host's address on the Docker bridge OpenShell's driver uses (`docker0` by default; which one it binds is **verify on a real host**). The containers' own addresses on `pmos0` are not host listeners and don't appear here | otherwise, **fail**, on every host (the previous revision failed only on `public` and on an acknowledged `private`; no host needs a PM OS port on another address, so the rule is the same everywhere) |
+| H-DEVLOGIN | development sign-in off | `PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY` | `1` with `PMOS_EXPOSURE=public` or an acknowledged `private` (fail). `pmos-web` refuses the same itself from H10 (§3.8) |
+| H-SIGNIN | sign-in as decision D2 (a) says | `PMOS_EXPOSURE`, `PMOS_WEB_PASSWORD_LOGIN`, `PMOS_WEB_PASSWORD_CLIENTS` (§3.8) | until H10 is merged: `public` with the web profile on (fail: "pmos-web does not serve a public host yet"). From H10: `public` with password sign-in on and `PMOS_WEB_PASSWORD_CLIENTS` empty, or holding an entry shorter than `/16` (IPv4) or `/48` (IPv6) (fail) |
+| H-ADMIN | the admin routes on their own listener (decision D3 (b), every host) | `PMOS_WEB_ADMIN_BIND`, `PMOS_WEB_ADMIN_PUBLISH` (§3.8); from H10 | the web profile on with `PMOS_WEB_ADMIN_BIND` unset, or `PMOS_WEB_ADMIN_PUBLISH` outside loopback, RFC 1918, `100.64.0.0/10` and IPv6 unique-local (fail) |
+| H-PRIVATE | a host declared `private` looks private | any interface address outside RFC 1918, `100.64.0.0/10`, loopback, link-local and IPv6 unique-local and link-local (`ip -j addr`); and H-METADATA's probe getting any answer. With the acknowledgement, also `ss -ltnH` for anything on the host listening on 80 or 443 | `PMOS_EXPOSURE=private` with either, unless acknowledged (below): **fail**. With the acknowledgement it passes as **warn**, and H-DEVLOGIN applies at `public` strength (H-METADATA and H-EXPOSURE already fail on every host); and it **fails** if any process (PM OS's or not) listens on 80 or 443 on an address outside the private ranges above, or on the unspecified address (`0.0.0.0`, `::`) while the host has a public address, so an operator's own proxy in front of 8770 can't put a sign-in page that accepts passwords from anywhere on the internet |
 | H-ASSERT | `PMOS_ASSERTION_MODE=require` | `deploy/.env` (the same rule as `assertion_checks`) | anything else while a web or console token is set |
 | O-CLI | OpenShell CLI installed (with `--openshell`) | `openshell --version`, `openshell status` | missing, or the gateway not reachable |
 | O-GATEWAY | OpenShell's gateway is local and authenticated | the gateway endpoint the CLI uses (`openshell status`) is loopback or the Docker bridge, over TLS | a non-loopback plaintext endpoint |
@@ -412,20 +462,19 @@ itself, so the cloud's own agent keeps working. Which form a GCP or Azure VM's a
 the block holds, and that the drop-in runs after Docker has made `DOCKER-USER`, are **verify on
 a real host** (RT-16).
 
-**Acknowledging a mismatch (H-PRIVATE; H-PROFILE on `company` from H11).** A `private`
-declaration that doesn't match the host fails until an operator runs `pmos-admin host
-acknowledge H-PRIVATE --reason "<text>"` (with `sudo`, so it needs the same rights as
-`host-firewall`); the acceptance run needs this (§6). H-PROFILE on `spark` takes no
-acknowledgement: before H11, `pmos-admin host acknowledge H-PROFILE` refuses with exit 2
-(`H-PROFILE cannot be acknowledged before decision D1 is built (slice H11); if this host is a
-Spark, the check is wrong: report it`), and a `PMOS_HOST_ACK_H_PROFILE` line in `deploy/.env` is
-itself a fail. From H11, H-PROFILE on a `company` declaration may be acknowledged the same way,
-only if D1's answer allows it. An acknowledgement records:
+**Acknowledging a mismatch (H-PRIVATE only).** A `private` declaration that doesn't match the
+host fails until an operator runs `pmos-admin host acknowledge H-PRIVATE --reason "<text>"` (with
+`sudo`, so it needs the same rights as `host-firewall`), for example on a closed test VM whose
+public address is blocked inbound at the cloud's firewall. H-PRIVATE is the only check that takes
+an acknowledgement: `pmos-admin host acknowledge` refuses every other check id with exit 2, and a
+`PMOS_HOST_ACK_<CHECK>` line for any other check in `deploy/.env` is itself a fail. (H-PROFILE,
+which the previous revision made unacknowledgeable, is gone with the Spark target.) An
+acknowledgement records:
 
-- in `deploy/.env`, `PMOS_HOST_ACK_<CHECK>=<fingerprint>`, where the fingerprint is a SHA-256 of
-  what the check saw (for H-PRIVATE, the sorted public addresses and whether the probe answered;
-  for H-PROFILE on `company`, that the probe answered). If the host later shows something else (a new public
-  address), the fingerprint no longer matches and the check fails again;
+- in `deploy/.env`, `PMOS_HOST_ACK_H_PRIVATE=<fingerprint>`, where the fingerprint is a SHA-256
+  of what the check saw (the sorted public addresses and whether the probe answered). If the
+  host later shows something else (a new public address), the fingerprint no longer matches and
+  the check fails again;
 - in a root-owned, append-only log, `/var/log/pmos/host-acknowledgements.log` (`chattr +a` where
   the filesystem supports it), one line per acknowledgement: time, the operator's login
   (`SUDO_USER`), the check, what it saw, the fingerprint and the reason.
@@ -486,15 +535,16 @@ allowed destination.
    `deploy/.env`, as `password_web_checks` already does for the gateway
    (`deploy/pmos-admin:165-180`), and refuses on a mismatch with the fix:
    `deploy/pmos-admin down && deploy/pmos-admin up` (which re-creates the network; no eval stack
-   may be running). On the Spark this is a one-time step at the upgrade that brings H2.
+   may be running). No host has been installed yet, so in practice this only matters to a test
+   stack made before H2.
 4. **The names resolve to those addresses through a managed block in `/etc/hosts`**, written by
    `pmos-admin host-names apply` (with `sudo`), between `# BEGIN pmos (managed by pmos-admin)` and
    `# END pmos` markers. It replaces only its own block, is idempotent, and takes no override: it
    always writes the pinned addresses (RT-13b's test swap is done by the red-team script, §5).
    `pmos-admin host-names
    check` and `status` report a missing, stale or loopback entry, and `pmos-admin sandbox` refuses
-   to start a sandbox while the check fails. Nobody edits `/etc/hosts` by hand, and the Spark gets
-   the same block.
+   to start a sandbox while the check fails. Nobody edits `/etc/hosts` by hand, and every host
+   gets the same block.
 5. **Why this should reach the services:** with the Docker driver's default `host` supervisor
    networking, the sandbox's egress leaves from the host's network namespace, which has a route
    to the `pmos` bridge. The addresses are private, which OpenShell allows for an exact host name.
@@ -518,19 +568,22 @@ Nothing in this changes the policy's hosts, ports or routes.
 | Unpinned range | `PMOS_NETWORK_IP_RANGE` (new) | `10.201.77.128/25` |
 | OpenShell gateway endpoint | OpenShell's own CLI configuration (`openshell status`); PM OS never stores it | the local package's `https://127.0.0.1:17670`, mTLS |
 | Outbound proxy | `HTTPS_PROXY`, `NO_PROXY`, `PMOS_BUILD_CA` (exist); now also passed to the gateway (§3.6) | none |
-| Model source | `PMOS_MODEL_SOURCE` (§3.6) | per profile |
+| Model source | `PMOS_MODEL_SOURCE` (§3.6) | `hosted-test` (fake data only) |
+| Hosted endpoint and key | `PMOS_GATEWAY_HOSTED_URL` in `deploy/.env`; the key in `deploy/secrets/hosted-model.key` (§3.6) | none |
+| Local model server image | `PMOS_VLLM_IMAGE` (exists; its default is removed, §3.6) | none: required with `local` |
 | Eval runner | runner label `pmos-host`, `PMOS_HOST_DIR` (§2) | `/opt/pmos` |
 | Content and state paths | `PMOS_CONTENT_CHECKOUT`, `PMOS_STATE_DIR` (exist) | `/srv/pmos/…` |
 
 ### 3.5 The policy generator, Policy Admin and drift
 
 **The generator takes no host input.** `pmos policy generate` keeps reading only the content
-tree. The host profile is invisible to it, so no setting, file or screen on a host can widen a
+tree. The host settings are invisible to it, so no setting, file or screen on a host can widen a
 sandbox. The fixed parts stay in `crates/policy/src/lib.rs`, reviewed as code under POL-2, and
 Policy Admin keeps showing them as `fixed` (`docs/policy-admin.md`). Policy Admin gains no host
 field.
 
-**One change to the fixed part, which narrows (decision O6):** each of the three endpoints gets
+**One change to the fixed part, which narrows (decision O6, decided by the owner on 2026-11-22:
+yes):** each of the three endpoints gets
 `allowed_ips` with **its own address only**: `toolserver.pmos.internal` →
 `[10.201.77.10/32]`, `gateway.pmos.internal` → `[10.201.77.11/32]`, `bots.pmos.internal` →
 `[10.201.77.12/32]`, from new constants beside the host names (`TOOLSERVER_ADDR`,
@@ -546,13 +599,13 @@ The cost: a site that has to change `PMOS_NETWORK_SUBNET` (because its network a
 setting. That is the intended trade: the address a sandbox may reach is reviewed, never
 configured.
 
-**Drift, and how each check treats a profile:**
+**Drift, and how each check treats a host:**
 
 | Check | Reads | A host can make it fail by |
 | --- | --- | --- |
 | `pmos policy check` (CI and `pmos-admin lint`) | content and `policies/` only | nothing: it never sees the host. A new rule, `net-allowed-ips`, requires each endpoint's `allowed_ips` to be exactly its own `/32` constant (another service's address, a wider range, a missing list, or a second entry fails, each with a failing and a passing unit test, like every rule) |
 | A unit test in `crates/policy` | `deploy/compose.yaml` | nothing on a host: it fails CI when the three `ipv4_address` literals differ from the constants |
-| `pmos-admin preflight` / `status` / `host-names check` | `deploy/.env`, the host | names that resolve elsewhere, a live network unlike `deploy/.env`, a profile check that fails |
+| `pmos-admin preflight` / `status` / `host-names check` | `deploy/.env`, the host | names that resolve elsewhere, a live network unlike `deploy/.env`, a host check that fails |
 | `pmos-admin up` and `sandbox` | the same | `up` refuses when `PMOS_NETWORK_SUBNET` does not contain the three constants, or `PMOS_NETWORK_IP_RANGE` contains one (the policies would refuse every connection, or a service couldn't start); `sandbox` refuses while `host-names check` fails |
 
 The subnet refusal in `up` is built in H3, with the constants it compares against; H2 checks that
@@ -565,31 +618,184 @@ Applying H3's change is a network change: a second platform owner reviews it, ev
 file is regenerated once (the header wording changes in the same commit), and on each host
 `openshell policy set` applies it live.
 
-### 3.6 The model on a host without a GPU, fake data, and where the key is held
+### 3.6 Model sources, real data, and where the hosted model's key is held
 
-| `PMOS_MODEL_SOURCE` | Gateway config | Needs | Data allowed |
-| --- | --- | --- | --- |
-| `local` | `deploy/gateway.yaml` (`class: production`, vLLM upstreams), `up --models` | NVIDIA runtime and a GPU large enough for the two models | real data, after Gate 1, only on `PMOS_HOST_PROFILE=spark` until D1 is answered (below) |
-| `hosted-test` | `deploy/gateway.hosted-test.yaml` (`class: test`): each role an `openai+https://<host>/<base>` upstream (the existing remote test upstream, `docs/gateway.md`), `PMOS_GATEWAY_CLOUD_TEST=1` | an OpenAI-compatible API and its key | **fake data only**, as defined below |
+Revised on 2026-11-22 for decision D1 (§8): real data may be processed by **both** a local model
+on a GPU host the owner controls **and** the owner's hosted model. This replaces ADM-3 ("prompts
+never leave the host"; restricted data only on the Spark's local models). Model sources become
+production options. Requirement i (many providers, switching, automatic fallback) is **not**
+started and not designed here: this is the minimum for **one** configured hosted model to serve
+real data through a `class: production` gateway, and one gateway serves exactly one source.
 
-**Fake-data mode.** The services run in fake-data mode when either holds:
+| `PMOS_MODEL_SOURCE` | Gateway config (`class`) | Upstream form | Needs | Data allowed |
+| --- | --- | --- | --- | --- |
+| `local` | `deploy/gateway.yaml` (`production`), `up --models` | `http://<name>.pmos.internal:<port>/v1` (today's rule) | an NVIDIA GPU and runtime, `PMOS_VLLM_IMAGE` | **real data**, after Gate 1 |
+| `hosted` (new) | `deploy/gateway.hosted.yaml` (`production`, new) | `hosted:<label>` (new), `<label>` an entry on the approved list | an approved entry; `PMOS_GATEWAY_HOSTED_URL`; the key file | **real data**, after Gate 1 and the conditions in §3.9 |
+| `hosted-test` | `deploy/gateway.hosted-test.yaml` (`test`) | `openai+https://<host>/<base>` (today's remote test upstream, `docs/gateway.md`), `PMOS_GATEWAY_CLOUD_TEST=1` | any OpenAI-compatible API and its key | **fake data only** (below) |
 
-- `PMOS_MODEL_SOURCE=hosted-test`: every prompt leaves the host;
-- `PMOS_HOST_PROFILE` is not `spark`, **until decision D1 is answered** and H11 builds the
-  answer. D1 asks whether real data may be held at a cloud provider at all (§8). Until it is
-  answered, nothing but the Spark may hold real data, whatever its model source: a cloud VM with
-  a GPU and `local` models still holds the database, the content checkout and the PMs' tokens on
-  the provider's disks. So `linux` with `local` and `PMOS_CONNECTORS=live` is refused, as
-  `hosted-test` is.
+`hosted` and `hosted-test` may point at the same endpoint. The difference is who decided: a
+`hosted` endpoint is on a reviewed list with the owner's recorded approval; a `hosted-test` one
+is whatever an operator typed, so it never sees real data.
 
-The profile is self-declared (§3.1): an operator can write `spark` on a cloud VM, and no service
-can tell. The preflight's H-PROFILE fails that, and until H11 no acknowledgement can pass it
-(§3.2); but the preflight runs from `pmos-admin` and the worker unit only, so a stack started with
-`docker compose up` on a host that wrote `spark` is not stopped by it (§5). It is still the right default: the declaration that allows real
-data is the one the Spark gets from `/etc/dgx-release`, and every other host gets the refusals
-without anyone choosing them.
+#### The local model path on a generic GPU host
 
-In fake-data mode nothing real may reach a prompt or a database by any path:
+`local` is unchanged in what it enforces: a `class: production` gateway, upstreams named only
+`<label>.pmos.internal` (since review finding F3; `crates/gateway/src/config.rs:543-557`,
+`is_production_host` at `:695-709` at `57e2e72`), and, from H4, a resolver that refuses any
+answer for those names outside the pinned part of the `pmos` subnet (below). What changes is
+that it is no longer sized or defaulted for one machine.
+
+**What in `deploy/` is specific to NVIDIA's vLLM image or to one GPU** (`deploy/compose.yaml`,
+the `vllm-default` and `vllm-extraction` services; `deploy/env.example`, "Models"):
+
+- `image: ${PMOS_VLLM_IMAGE:-nvcr.io/nvidia/vllm:25.10-py3}`: NVIDIA's own build of vLLM, the
+  one the Spark's arm64 GPU needed. **H4 removes the default**: `PMOS_VLLM_IMAGE` becomes
+  required with `local` (`${PMOS_VLLM_IMAGE:?…}` in Compose; H-NVIDIA in the preflight), so a
+  host's operator chooses the image for that host's architecture and GPU. The install runbook
+  (H6) names two candidates, NVIDIA's build and the vLLM project's own published image, each
+  **designed for; not verified** (decision O3) until an acceptance run with `local` has passed
+  on such a host. Whichever is chosen, its tag is pinned in `deploy/.env`, never `latest`.
+- `deploy.resources.reservations.devices: [{driver: nvidia, count: all, capabilities: [gpu]}]`
+  and H-NVIDIA: the NVIDIA container runtime. Other GPU vendors are not offered.
+- `--gpu-memory-utilization` shares (`0.55` and `0.30`), sized for two servers on **one** GPU.
+  They stay settings (`PMOS_MODEL_*_GPU_SHARE`); a host with another GPU layout changes them, or
+  runs one server for both roles, in `deploy/.env` and `deploy/gateway.yaml` (a model swap,
+  `docs/runbooks/model-swap.md`).
+- `ipc: host`, the `/health` health check, the `vllm serve` command line and the Hugging Face
+  cache path are vLLM's own, the same in both images.
+
+**How a generic host chooses its model server.** The gateway does not care which server it is:
+it needs an OpenAI-compatible endpoint answering at `vllm-default.pmos.internal` and
+`vllm-extraction.pmos.internal` on their pinned addresses (`.13`, `.14`, §3.3). The kit ships
+only vLLM; another server would be a Compose change under review, not a setting.
+
+#### The hosted model as a production source (`hosted`)
+
+**The approved list.** A new file, `crates/gateway/approved-hosted.yaml`, compiled into the
+gateway with `include_str!`, so changing it needs a reviewed, merged commit and a rebuilt image.
+It is not read from `deploy/`, a mount or an environment variable. Each entry:
+
+```yaml
+# Owner-approved hosted models (docs/openshell-any-host-spec.md §3.6). Reviewed under
+# CODEOWNERS; compiled into pmos-gateway. Never a host name, a URL or a key in this file.
+- label: owner-hosted            # lowercase letters, digits, hyphens; what every report shows
+  url_sha256: "<64 hex digits>"  # SHA-256 of the normalised base URL (below)
+  models: ["<model id>"]         # the only model ids a role may name with this label
+  record: docs/model-providers/owner-hosted.md   # the owner's approval and conditions (§3.9)
+```
+
+The entry holds a digest of the URL, not the URL: the endpoint is pinned without its host name
+appearing in any committed file while the owner's question about provider host names in
+committed files is open (CLAUDE.md, "Waiting on the owner"). The digest is not a secret (a
+host name can be guessed and hashed); it is a pin. The URL itself is
+`PMOS_GATEWAY_HOSTED_URL` in `deploy/.env`, and the gateway refuses to start unless its
+normalised form hashes to the entry's digest. **So editing an environment variable can only
+break the gateway, never point real data at another endpoint.** Normalised form:
+`https://` + the host in lowercase + `:<port>` only when not 443 + the path without a trailing
+`/`; a URL with user information, a query, a fragment, or a scheme other than `https` is
+refused, not normalised.
+
+**Who may change the list.** A CODEOWNERS line for `crates/gateway/approved-hosted.yaml` and
+`docs/model-providers/`, owned by the platform owners, with "Require review from Code Owners" on
+the default branch, the same mechanism as `policies/README.md`'s lines for bot instructions.
+Those lines wait on the owner (CLAUDE.md, "Waiting on the owner"); **until they are in force, no
+entry may be added**, and the slice that adds the first entry (§7, H13) is not merged before
+then. A unit test in `crates/gateway` checks every entry: a valid label, a 64-hex digest, at
+least one model id, and a `record` file that exists and has the three sections §3.9 requires,
+each saying "confirmed by the owner on <date>". The list ships **empty** with H12.
+
+**The gateway config for `hosted`.** `deploy/gateway.hosted.yaml`, `class: production`, every
+upstream `hosted:<label>` with one label, every role's `model` one of that entry's `models`, no
+`local-hosts`. H12 extends the production rule in `config.rs` by exactly this one form: a
+`class: production` gateway accepts `<name>.pmos.internal` hosts (as today) **or** `hosted:<label>`
+upstreams, never both in one config, and never `openai+https://` or `anthropic+https://`.
+
+**The gateway refuses to start** with `PMOS_MODEL_SOURCE=hosted` and any of: a config whose
+class isn't `production` (the stub may be on, as for `local`, and then serves as class `test`);
+an upstream that isn't `hosted:<label>`, or two labels; a label not on the compiled list; a
+`PMOS_GATEWAY_HOSTED_URL` that is missing, not normalisable or whose digest differs; a model id
+not in the entry; `PMOS_GATEWAY_CLOUD_TEST=1`; an empty or unreadable key file. And with `local`
+or `hosted-test`, it refuses any `hosted:` upstream. Each message names the setting, never the
+URL.
+
+**Where the hosted model's key is held.** In one file, `deploy/secrets/hosted-model.key` (the
+directory mode `700`, the file mode `600`, owned by the platform user; `deploy/secrets/` in
+`.gitignore`), mounted by Compose's `secrets:` into the **gateway container only**, at
+`/run/secrets/pmos-hosted-model-key`, and read through `PMOS_GATEWAY_HOSTED_KEY_FILE`. It is
+never in `deploy/.env`, so it is not in the gateway's environment, `docker inspect`,
+`/proc/<pid>/environ` or any other container; never in `policies/`, the content repo, a
+`gateway.*.yaml` file, a report or a log; and never on a command line: `pmos-admin hosted-key
+set` reads it from standard input and writes it by a rename, as `set_env` does, and refuses a
+file or directory with group or world bits, as `deploy/.env` is refused (H0b). `setup.sh` always
+creates the file, empty, so Compose can mount it on every host; the gateway refuses an empty key
+only under `hosted`. `pmos-admin backup` never copies it into a backup, and the backup runbook
+keeps it apart from the database dump, as for `deploy/.env` (§5). Whether the gateway image's
+user can read the mounted file at mode `600` is a Docker detail, tested in H12's stack test,
+not an OpenShell one. The existing `PMOS_GATEWAY_REMOTE_KEY` in `deploy/.env` stays for
+`hosted-test` only.
+
+**How this relates to CLAUDE.md's "OpenShell holds one credential per provider".** That note
+belongs to requirement i's design, where the gateway might run in a sandbox and OpenShell would
+inject the provider key into its egress. Today the gateway is a Compose service, not in a
+sandbox, so OpenShell cannot hold its key; this spec gives the key to the gateway's container
+alone. **No sandbox ever holds the provider's key or reaches the provider**: a worker holds only
+its own gateway token's placeholder, its policy allows only `POST /v1/chat/completions` on
+`gateway.pmos.internal`, and `net-egress` keeps the provider's host out of every policy. If
+requirement i later moves the key into an OpenShell provider, the key file goes away; nothing
+here prevents that.
+
+**Egress.** The gateway's `environment:` gains `<<: *proxy` (H4), so with `HTTPS_PROXY` set the
+hosted calls go through the host's proxy; the hosted host must not match `NO_PROXY`, which
+`pmos-admin up` checks under `hosted`. Without a proxy, the gateway resolves the hosted host
+itself, and its resolver (the one H4 adds for `local`) refuses for a `hosted:` upstream any
+answer that is loopback, link-local, unspecified, one of the metadata addresses of §3.2, inside
+`PMOS_NETWORK_SUBNET`, or private (RFC 1918, `100.64.0.0/10`, IPv6 unique-local): so a DNS answer
+can't send the key and the prompts to a service inside the host or the VPC. A provider reached
+over a private endpoint is therefore not supported by this minimum; it would be a reviewed change
+to that rule. With a proxy, the proxy resolves the name and the gateway cannot see the address:
+the proxy is then part of the data path (§3.9). TLS is verified against the system trust store;
+there is no setting that turns verification off; a proxy that re-signs TLS needs its CA mounted
+into the gateway at run time (`PMOS_BUILD_CA` covers build time only), which H4 adds if the
+acceptance run behind such a proxy shows it is needed (**verify on a real host**). The hosted
+client follows **no redirects** (`reqwest::redirect::Policy::none()`): a `3xx` is a `502` for
+that call, so the key is never sent on to another host.
+
+**Timeouts and retries,** the remote test upstream's today (`crates/gateway/src/app.rs:132-145`,
+`docs/gateway.md`, "How long a model server may take"): connect 10 s; a streamed answer silent
+for 120 s is cut off; a whole answer gets 600 s; a stream at most `limits.stream-max-secs` (900
+s); `429` and `503` retried as `retry.rs` says. One change: `/readyz` probes the hosted
+endpoint's `/models` with the key (as it does for a remote test upstream today, `app.rs:292-352`)
+at most once per 30 seconds, from a cached result, with a 5 s timeout, because `/readyz` needs no
+token and a sandbox can call it: no caller can make the gateway send keyed requests to the
+provider faster than that.
+
+**What `/readyz`, `/v1/pmos/roles` and the logs report: labels only, never the host.**
+
+- `/readyz` (`200`, `503`, stub): `class`, `stub`, `model_source` (`local`, `hosted` or
+  `hosted-test`), `hosted_label` under `hosted`, and `upstreams` keyed by `<kind>:<role>`, for
+  example `{"hosted:default": "ok"}`, never by URL (H4 replaces today's URL-keyed map).
+- `/v1/pmos/roles`: as today, plus `model_source`, `hosted_label`, and the upstream kind `hosted`
+  beside `local`, `claude-test` and `remote-test`. The model id is the provider's model name, as
+  for every role today.
+- The usage log: today each event carries the upstream's host (`role.upstream_host()`,
+  `app.rs:680`, `:752`), which under `hosted` would put the provider's host in a file shipped
+  off-box. H12 writes `upstream: "hosted:<label>"` for `hosted` and `upstream: "remote-test"`
+  for `hosted-test`; `local` keeps its `*.pmos.internal` name.
+- Errors returned to callers already name the role, never the URL (`docs/gateway.md`).
+
+Tests assert that no `/readyz`, `/v1/pmos/roles`, usage line or start-up message under `hosted`
+contains the configured URL, its host, `pmos` addresses or the key (H12).
+
+#### `hosted-test`, and fake-data mode
+
+`hosted-test` is kept as the separate **testing-only** path for unapproved endpoints: the
+existing remote test upstream, a `class: test` gateway, `PMOS_GATEWAY_CLOUD_TEST=1`, and
+`PMOS_GATEWAY_REMOTE_KEY`. Its eval reports never count, as today.
+
+**Fake-data mode** is now exactly `PMOS_MODEL_SOURCE=hosted-test`. The previous revision also
+put every host whose `PMOS_HOST_PROFILE` wasn't `spark` in fake-data mode until D1; with D1
+answered and no profile, that condition is gone (the table "What this removes", below). In
+fake-data mode nothing real may reach a prompt or a database by any path:
 
 | Source | Real when | In fake-data mode |
 | --- | --- | --- |
@@ -599,150 +805,81 @@ In fake-data mode nothing real may reach a prompt or a database by any path:
 | The databases (the tool server's memory notes, drafts, sealed tokens and user database; the runtime's tasks; the web app's sessions and follow-ups) | the stack ever ran with `PMOS_CONNECTORS=live` or `PMOS_MEMORY=github` | refused: each of the three services writes a permanent `held_real_data` marker into its own database the first time it starts with live connectors or GitHub memory, whatever the model source; no code path clears it (a fresh database is the only way), a restore carries it, and a service in fake-data mode refuses to start on a database that has it ("this database has held real data") |
 | Slack, as a place people type | `PMOS_SLACK_APP_TOKEN` and `PMOS_SLACK_BOT_TOKEN` set (a real workspace; a test workspace can't be told apart) | `pmos-slack` refuses to start |
 | The public docs site | `PMOS_DOCS_BASE_URL` on the `docs` service (the company's **public** product docs, `docs/docs-server.md:3-5`) | allowed |
-| What people type into the web app | always possible | can't be checked by code: the web app shows a "test stack: fake data only" banner on every page (with "prompts go to a hosted model" under `hosted-test`), and the pilot never runs in fake-data mode |
+| What people type into the web app | always possible | can't be checked by code: the web app shows a "test stack: fake data only" banner on every page, with "prompts go to an unapproved hosted model", and the pilot never runs in fake-data mode |
 
-The first revision recorded the model source in the database at its first start only, so a
-database first started under `hosted-test`, then used with `local` and live connectors, then
-switched back, passed. The marker now records what matters (real data went in), at every start
-that could put it there.
+**Where each refusal lives** (unchanged from the previous revision except that
+`PMOS_HOST_PROFILE` is gone). The refusals live in the services and run at their start-up,
+however they are started:
 
-**Where each refusal lives.** The first version put the `hosted-test` plus live-connectors refusal
-in `pmos-admin up` only; `docker compose up`, `pmos-admin add-bot` (which runs `compose up -d
-bots gateway`) and `pmos-admin restart` skip that script. The refusals live in the services and
-run at their start-up, however they are started:
-
-- **Settings:** `PMOS_MODEL_SOURCE` and `PMOS_HOST_PROFILE`, written by `setup.sh` and passed by
-  `deploy/compose.yaml` (and `deploy/compose.evals.yaml`) to `gateway`, `toolserver`, `slack`,
-  `bots` and `web` as `${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}` and likewise, so Compose
-  itself fails without them. Each service also requires them (no default), like
-  `PMOS_CONNECTORS` today, so the choice is always deliberate. `bots` and `web` also get
+- **Settings:** `PMOS_MODEL_SOURCE`, written by `setup.sh` and passed by `deploy/compose.yaml`
+  (and `deploy/compose.evals.yaml`) to `gateway`, `toolserver`, `slack`, `bots` and `web` as
+  `${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}`, so Compose itself fails without it. Each
+  service also requires it (no default), like `PMOS_CONNECTORS` today. `bots` and `web` also get
   `PMOS_CONNECTORS`, for their `held_real_data` marker only.
-- **The gateway** refuses to start:
-  - with `local` and a config whose `class` isn't `production`, or with `PMOS_GATEWAY_CLOUD_TEST=1`
-    (below, "Which gateway may serve `local`");
-  - with `hosted-test` and `PMOS_GATEWAY_CLOUD_TEST` not `1`, unless the stub is on
-    (`PMOS_MODEL_SOURCE=hosted-test needs PMOS_GATEWAY_CLOUD_TEST=1`).
-  `GET /v1/pmos/roles` reports `model_source` beside what it reports today (`class`, `stub`,
-  `cloud_test`, each role's upstream kind; `crates/gateway/src/app.rs:252-290`). Its `/readyz`
-  (both its `200` and `503` bodies, and the stub's) gains `class`, `stub` and `model_source`, and
-  reports each upstream by its kind and role, not by address: today it keys `upstreams` by each
-  upstream's base URL (`app.rs:292-352`), which names the vLLM hosts and, under `hosted-test`,
-  the provider's host. Which labels `/readyz` may carry, and why, is in the cross-check below.
+- **The gateway** refuses to start: with `local` or `hosted` and a config whose `class` isn't
+  `production`, or with `PMOS_GATEWAY_CLOUD_TEST=1`; with `hosted` as above; with `hosted-test`
+  and `PMOS_GATEWAY_CLOUD_TEST` not `1`, unless the stub is on.
 - **The tool server** refuses to start in fake-data mode with any row above marked refused, with
-  one error per cause, for example: `PMOS_MODEL_SOURCE=hosted-test sends every prompt off this
-  host, so it allows fake data only: PMOS_CONNECTORS must be fake (it is live)`,
-  `PMOS_HOST_PROFILE=linux: until decision D1 is answered, real data is allowed only on the
-  Spark: PMOS_CONNECTORS must be fake (it is live)`, `… the content root has no TEST-CONTENT
-  marker`, `… <path> is marked restricted`, or `… this database has held real data`.
-- **The content check runs wherever the checkout is read.** The runtime (`bots`, which reads
-  personas, roles and skills into prompts) and the web app mount the checkout read-only
-  (`deploy/compose.yaml`, the `/srv/content-repo` volumes), and `pmos-admin sandbox` uploads
-  skills and master context into the sandbox straight from it (`deploy/pmos-admin`, the
-  `--upload` loop), none of them through the tool server. So the check is one function in
-  `crates/contract` (beside `Sensitivity`, `model.rs`), run by the tool server, the runtime and the web app at start-up and at every
-  content reload in fake-data mode, and by `pmos-admin sandbox` before it creates a sandbox (as
-  `pmos content check-test` through `pmos_cli`, which refuses with the same message). The bring-up
-  worker (`worker-docs`) reads the same checkout and starts only after `bots` is healthy, so the
-  runtime's refusal stops it too.
+  one error per cause, for example: `PMOS_MODEL_SOURCE=hosted-test sends prompts to an endpoint
+  nobody approved, so it allows fake data only: PMOS_CONNECTORS must be fake (it is live)`,
+  `… the content root has no TEST-CONTENT marker`, `… <path> is marked restricted`, or `… this
+  database has held real data`.
+- **The content check runs wherever the checkout is read**: one function in `crates/contract`
+  (beside `Sensitivity`, `model.rs`), run by the tool server, the runtime and the web app at
+  start-up and at every content reload in fake-data mode, and by `pmos-admin sandbox` before it
+  uploads skills and master context (`pmos content check-test`). The bring-up worker starts only
+  after `bots` is healthy, so the runtime's refusal stops it too.
 - **`pmos-slack`** refuses to start in fake-data mode with Slack tokens set.
-- **The runtime and the tool server cross-check the gateway.** Two containers started with
-  different values must not run work together, and the gateway is the one that decides where
-  prompts go. The runtime's readiness fails while the gateway's reported `model_source` differs
-  from its own (as before). The tool server does the same: it reads the gateway's `/readyz`
-  (`PMOS_GATEWAY_URL` is passed to it in H4) and refuses `POST /internal/sessions` when the
-  gateway's answer is missing (no answer, a timeout, no `model_source` field), unreadable (not
-  JSON, or a value it doesn't know) or differs from its own `PMOS_MODEL_SOURCE`, and its own
-  `/readyz` says so. It fails closed: no answer is never taken as a match. The check runs at every
-  session open, or from a cache of at most 10 seconds that is dropped on any failed read, never
-  only at start-up, so a gateway restarted with another source is caught within that time. So a
-  gateway and runtime on `hosted-test` with a tool server on `local` and live connectors open no
-  session. It reads `/readyz` rather than `/v1/pmos/roles` because `/readyz` needs no client
-  token: a tool-server token at the gateway would also let the tool server make model calls,
-  which it has never needed.
-- **`/readyz` carries labels only.** Because it needs no token, anything that reaches the
-  gateway's port can read it, every sandbox included (the reviewer's premise; today's sandbox
-  policy allows only `POST /v1/chat/completions` there, but the route itself must not depend on
-  that). So the fields H4 adds (`class`, `stub`, `model_source`, and each upstream's kind:
-  `local`, `claude-test` or `remote-test`) are labels, and `/readyz` never carries an address, a
-  host name, a URL, a model server's name or a key, in its `200`, `503` or stub body. Tests
-  assert both (§6, H4): in the tool server, the refusal for each of missing, unreadable and
-  different, a refusal after the gateway's answer changes once the cache has run out, and the
-  pass on a match; in the gateway, that its `/readyz` bodies under `local` and under
-  `hosted-test` with a remote upstream contain none of the configured upstream URLs or host
-  names, no `pmos` address and not the key.
-- **`pmos-admin up`** says the same before anything starts, and skips the Slack profile, so the
-  operator sees one clear message rather than a container that exits.
+- **`pmos-admin up`** says the same before anything starts, and skips the Slack profile.
 
-**Which gateway may serve `local`.** This is mostly in place already. Since review finding F3,
-a `class: production` gateway refuses testing-only upstreams, `local-hosts` and any model server
-not named `<label>.pmos.internal` (`crates/gateway/src/config.rs:375-380`, `:543-557`,
-`is_production_host` at `:691-711`; `docs/gateway.md`, "A production gateway's hosts"), and
-`deploy/gateway.yaml` names its upstreams `vllm-default.pmos.internal` and
-`vllm-extraction.pmos.internal`, the vLLM services' aliases in `deploy/compose.yaml`. So H4 ties
-`local` to that class rather than inventing a second rule:
+**The runtime and the tool server cross-check the gateway.** As in the previous revision: the
+runtime's readiness fails while the gateway's reported `model_source` differs from its own; the
+tool server reads the gateway's `/readyz` (`PMOS_GATEWAY_URL`, passed in H4) and refuses `POST
+/internal/sessions` when the answer is missing, unreadable or differs from its own
+`PMOS_MODEL_SOURCE`, failing closed, at every session open or from a cache of at most 10 seconds
+dropped on any failed read. It reads `/readyz` because `/v1/pmos/roles` needs a client token that
+would also let the tool server call the model. What is new (H12): it keeps the gateway's
+`hosted_label` with the session, for the audit log (§3.9).
 
-- **`local` requires `class: production`.** The gateway refuses to start with
-  `PMOS_MODEL_SOURCE=local` and any other config, and with `local` and
-  `PMOS_GATEWAY_CLOUD_TEST=1`. The stub may be on (a first install runs `deploy/gateway.yaml`
-  with `PMOS_GATEWAY_STUB=1` until the model servers are up): the gateway then serves as class
-  `test` with `stub: true`, as `docs/gateway.md` says, calls no upstream, and reports
-  `model_source: local`. The runtime's and the tool server's cross-checks compare the source,
-  not the class.
-- **What H4 adds to production: the names' answers.** A production name can still resolve
-  anywhere (a VPC resolver answering `*.internal`, a search domain, an `/etc/hosts` line in the
-  gateway's image). The gateway's HTTP clients get a resolver of their own (reqwest's
-  `dns_resolver`) that resolves each upstream name at **every** connection and refuses any answer
-  that is not inside `PMOS_NETWORK_SUBNET` and outside `PMOS_NETWORK_IP_RANGE` (both passed to the
-  gateway). Only pinned containers have addresses there (§3.3), so a vLLM name can't be answered
-  by an unpinned container, or by one that took a vLLM container's address after a restart. A
-  refused answer is a `502` for that call and a warning in the log naming the upstream, never the
-  address. Resolving at every connection rather than once at start-up also means the gateway
-  doesn't depend on the vLLM containers being up before it.
-- **The `local-hosts` exception is gone.** The previous revision kept `local-hosts` as an
-  exception for a model server on the company's LAN beside the Spark, behind
-  `PMOS_GATEWAY_LAN_UPSTREAMS=1`, which only `pmos-admin up` refused on `linux`. A production
-  gateway already refuses `local-hosts` itself, so under `local` there is no such exception and
-  `PMOS_GATEWAY_LAN_UPSTREAMS` is not added. A LAN model server for real data would be a code
-  change to the production rule, reviewed as one.
-- **What is left for `class: test`.** A test gateway keeps `is_local_host` as it is
-  (`config.rs:671-689`: loopback, private and link-local addresses, dotless names, `local-hosts`,
-  plain `http` to a local mock), and its client caps, trusted clients, `from-name` rule and queue
-  caps work exactly as in a production one (`docs/gateway.md`, "Sharing the GPU"). It is allowed
-  only with `hosted-test` (or the stub), which is fake-data mode, so a private address that is
-  really a provider's endpoint can only ever see fake data. Its eval reports never count, as
-  today (`class: test`).
+**Which gateway may serve `local`: the names' answers (H4).** The gateway's HTTP clients get a
+resolver of their own (reqwest's `dns_resolver`) that resolves each upstream name at **every**
+connection. For a `*.pmos.internal` upstream it refuses any answer not inside
+`PMOS_NETWORK_SUBNET` and outside `PMOS_NETWORK_IP_RANGE` (both passed to the gateway): only
+pinned containers have addresses there (§3.3). For a `hosted:` upstream it applies the opposite
+rule given under "Egress". A refused answer is a `502` for that call and a warning naming the
+upstream's label, never the address. The `local-hosts` exception stays gone: a LAN model server
+on another machine is out of scope (§9). `class: test` keeps `is_local_host` as it is
+(`config.rs:674-689` at `57e2e72`) and is allowed only with `hosted-test` (or the stub).
 
-The Spark's own config passes unchanged. This narrows ADM-3's enforcement and changes no reviewed
-behaviour on the Spark.
-
-**The gateway's container settings (H4).** `deploy/compose.yaml`'s `gateway` service gains, under
-its `environment:`, `<<: *proxy` (`HTTPS_PROXY`, and a `NO_PROXY` that already lists
-`vllm-default`, `vllm-extraction`, `postgres` and `.pmos.internal`), as the `docs`, `toolserver`,
-`slack` and `web` services already have it, and beside it `PMOS_GATEWAY_CLOUD_TEST:
+**The gateway's container settings (H4, H12).** `deploy/compose.yaml`'s `gateway` service gains,
+under `environment:`, `<<: *proxy` (`HTTPS_PROXY`, and a `NO_PROXY` that already lists
+`vllm-default`, `vllm-extraction`, `postgres` and `.pmos.internal`), `PMOS_GATEWAY_CLOUD_TEST:
 ${PMOS_GATEWAY_CLOUD_TEST:-0}`, `PMOS_GATEWAY_REMOTE_KEY: ${PMOS_GATEWAY_REMOTE_KEY:-}`,
-`PMOS_MODEL_SOURCE`, `PMOS_HOST_PROFILE`, `PMOS_NETWORK_SUBNET` and `PMOS_NETWORK_IP_RANGE`; its
-config path follows the model source (`gateway.yaml` or `gateway.hosted-test.yaml`). The gateway's
-HTTP clients already use the system proxy and trust store (`crates/gateway/src/app.rs:132-145`;
-the vLLM names are in `NO_PROXY`, so the resolver above sees them directly). A proxy that
-intercepts TLS needs its CA in the gateway's trust store at run time, not only at build time
-(`PMOS_BUILD_CA`): **verify on a real host** behind such a proxy, and add a CA mount in H4 if it
-is needed.
+`PMOS_MODEL_SOURCE`, `PMOS_NETWORK_SUBNET` and `PMOS_NETWORK_IP_RANGE` (H4), and
+`PMOS_GATEWAY_HOSTED_URL`, `PMOS_GATEWAY_HOSTED_KEY_FILE` and the `secrets:` entry (H12); its
+config path follows the model source (`gateway.yaml`, `gateway.hosted.yaml` or
+`gateway.hosted-test.yaml`).
 
-**The hosted model's key:**
+**Benchmarks under `hosted`.** Today a report counts towards a bar only from a `class:
+production` gateway with every upstream `local`, on the models of `deploy/gateway.yaml`
+(`docs/evals.md`, "Which runs count"; `benchmark.production_gateway` in `evals/config.yaml`).
+H12 lets a run count from a `production` gateway whose upstreams are all `hosted:<label>` with a
+label on the approved list, when `benchmark.production_gateway` names
+`../deploy/gateway.hosted.yaml`: which config holds the production role models stays one
+reviewed line in `evals/config.yaml`, not a host setting. Reports carry the label, never the host.
 
-- **Where:** `PMOS_GATEWAY_REMOTE_KEY` in `deploy/.env` (mode `600`, made by `setup.sh`), passed
-  only to the `gateway` container. It is never in `policies/`, the content repo, the
-  `gateway.*.yaml` files, a command line or a log. The gateway already never logs it and strips
-  upstream addresses from errors (`docs/gateway.md`).
-- **What a sandbox sees:** nothing of it. A worker holds only its own gateway client token's
-  placeholder (`pmos-<bot>-gateway`), and its policy allows only `POST /v1/chat/completions` on
-  the gateway. The hosted API's host is not in any sandbox policy, and `net-egress` keeps it out.
-- **Not in this spec:** OpenShell holding the provider key for the gateway's own egress (CLAUDE.md
-  item i). The gateway is not in a sandbox today; putting it in one, or giving it an OpenShell
-  provider, is part of requirement i's design.
+#### What this removes, and what replaces each safeguard
 
-Eval reports from `hosted-test` already say so (`GET /v1/pmos/roles` reports `remote-test`), so
-they never count towards a bar measured on the production role models.
+| Earlier safeguard | Now | What replaces it |
+| --- | --- | --- |
+| **ADM-3**: outside testing, the gateway refuses any model server that isn't on the host ("prompts never leave the Spark"; `crates/gateway/src/lib.rs:6`, `config.rs:673`) | **Removed for `hosted`.** Prompts with real data, restricted included, leave the host for the approved provider | The approved list: compiled into the gateway, the endpoint pinned by digest, changed only by a CODEOWNERS-reviewed commit with the owner's recorded approval and conditions (§3.9). An endpoint not on it is reachable only as `hosted-test`, which is fake-data mode |
+| **Real data only on the Spark** until D1: fake-data mode on every `PMOS_HOST_PROFILE` but `spark`; H-PROFILE a hard fail with no acknowledgement; H11's `PMOS_HOST_PLACE` | **Removed.** Real data is allowed on any host, with `local` or `hosted` | Nothing host-based, by the owner's D1 answer. The protections every host now gets: H-METADATA and H-EXPOSURE fail on every host (§3.2), disk and backup encryption and snapshot control (§5), and, for `local`, the operator's statement that the GPU host is one the owner controls, recorded in the host record (§4) since code can't check it |
+| **Fake-data mode tied to `hosted-test`** because every prompt there leaves the host | **Kept, with a narrower reason**: because nobody approved the endpoint | The same refusals (the table above) |
+| **The `held_real_data` marker**: a database that ever held real data never runs where prompts leave the host | **Purpose narrowed**: it now only stops such a database running under `hosted-test`. A database used with `local` may later be used with `hosted`, so data that so far stayed on the host can reach the provider | The tool server records every change of source: at start, and at a session open whose gateway answer differs from the last recorded `model_source`/`hosted_label`, it writes an audit event `system.model_source` (`from`, `to`, labels only), and `pmos-admin status` shows the current source and when it last changed |
+| **The tool server's cross-check** as the second line keeping real data on the host | **Kept**; it now keeps the tool server and the gateway agreeing on the source, and gives the audit log its label | — |
+| **The metric "restricted data sent off the Spark: zero by construction"** (`docs/implementation-plan.md:118`, `docs/gateway.md:231`, `usage.rs:3`) | **Removed** | Two figures: "real data sent to an endpoint not on the approved list", zero by construction (fake-data mode); and tasks served per source and label, from the audit log (§3.9) |
+| **`class: production` means local model servers only** | **Loosened by one form**: `hosted:<label>` | The label's entry on the compiled list; no `openai+https://` in production, ever |
+| **The usage log's upstream host "lets anyone check"** that prompts stayed local | **Replaced** | The label, checked against the approved list |
 
 ### 3.7 Starting and keeping the worker running
 
@@ -780,36 +917,32 @@ they never count towards a bar measured on the production role models.
   **verify on a real host** (RT-3, O-CANARY). The eval stack's workers use the same image as plain
   containers; their tests must still pass.
 
-### 3.8 Network exposure and TLS on a host that isn't on a private LAN
+### 3.8 Network exposure and TLS on any host
 
-The Spark sat on the company's private LAN. A cloud VM may have a public address.
+Any host may have a public address or sit on a network the company doesn't control.
 
-**Until H10 is built, no public web app.** Nothing in the slices before H10 makes password
-sign-in or the admin routes safe on the internet, and H10 waits for decisions D2 and D3. Without
-a refusal, "password sign-in on the internet as built", which is D2's answer (c), would be the
-default while D2 is open. So the slice that adds `PMOS_EXPOSURE` (H4) makes `pmos-web` read it
-(required, no default) and **refuse to start with `public`**: `PMOS_EXPOSURE=public: this build of
-pmos-web does not serve a public host (decisions D2 and D3 are open; spec slice H10). Reach it
-over a VPN or an SSH tunnel with PMOS_EXPOSURE=private, or leave the web app off`. The same holds
-for D3's default: today it is a `return 404` in a runbook's nginx example, which an operator can
-leave out; with the refusal, the admin routes are not served on a public host at all until H10
-builds D3's answer in the service. `pmos-admin up --web` and H-SIGNIN say it first. The other
-services start on `public`; the console never serves publicly (O7). The acceptance run (§6) is
-done with the web app off, or reached only through an SSH tunnel to `127.0.0.1:8770` on a host
-declared `private` with H-PRIVATE acknowledged. On such a host H-PRIVATE also fails while anything
-listens on 80 or 443 on a non-private address (§3.2), so a proxy of the operator's own in front of
-8770 can't put a public sign-in page back before H10.
+**Until H10 is merged, no public web app.** H4 makes `pmos-web` read `PMOS_EXPOSURE` (required,
+no default) and **refuse to start with `public`**: `PMOS_EXPOSURE=public: this build of
+pmos-web does not serve a public host yet (spec slice H10). Reach it over a VPN or an SSH tunnel
+with PMOS_EXPOSURE=private, or leave the web app off`. With D2 and D3 answered (below), H10 no
+longer waits for the owner and is buildable now; the refusal stays only so that no build between
+H4 and H10 serves a public sign-in page with neither answer built. H10 lifts it together with
+D2's and D3's rules, never alone. `pmos-admin up --web` and H-SIGNIN say it first. The other
+services start on `public`; the console never serves publicly (O7). On a host declared `private`
+with H-PRIVATE acknowledged, H-PRIVATE also fails while anything listens on 80 or 443 on a
+non-private address (§3.2), so an operator's own proxy in front of 8770 can't put a public
+sign-in page there.
 
-The tables and the proxy example below describe the public host **as H10 builds it**. Which port
+The tables and the proxy example below describe every host **as H10 builds it**. Which port
 may be reached from where:
 
 | Listener | Bound to | Reached by | On `PMOS_EXPOSURE=public` |
 | --- | --- | --- | --- |
 | Reverse proxy (nginx or Caddy), 443 | the host's address | browsers | the only public listener. TLS with a publicly trusted certificate; HTTP only to redirect |
 | `/oauth/*` on the tool server | through the proxy only (`install.md`, Stage 6) | PMs' browsers | as today: only `/oauth/`, `404` for everything else |
-| Web app 8770 | `127.0.0.1` | the proxy | sign-in as decision D2 says; development sign-in refused (H-DEVLOGIN). `/healthz`, `/readyz` and `/internal/` never forwarded; `/api/admin/` as decision D3 says |
+| Web app 8770 | `127.0.0.1` | the proxy | Microsoft (Entra) sign-in; password sign-in only from `PMOS_WEB_PASSWORD_CLIENTS` (D2 (a)); development sign-in refused (H-DEVLOGIN). `/healthz`, `/readyz` and `/internal/` never forwarded; `/api/admin/` answers `404` here on **every** host (D3 (b)) |
 | Web app internal 8771 (`PMOS_WEB_INTERNAL_BIND`) | the `pmos` network only, not published | `pmos-slack` (the daily brief) | never public |
-| Web app admin 8772 (`PMOS_WEB_ADMIN_BIND`, D3's answer (b), H10) | published on `PMOS_WEB_ADMIN_PUBLISH` only: loopback or a private address (below) | admins over the VPN or an SSH tunnel | never public |
+| Web app admin 8772 (`PMOS_WEB_ADMIN_BIND`, D3 (b), H10) | published on `PMOS_WEB_ADMIN_PUBLISH` only: loopback or a private address (below) | admins over the VPN, the company's private network, or an SSH tunnel | never public |
 | Console 8760 | `127.0.0.1` | the proxy | **never on a public listener** (decision O7): reachable only over a private network, VPN or SSH tunnel, behind its SSO proxy |
 | Tool server 8710, gateway 8740, runtime 8750 | `127.0.0.1` and their pinned `pmos` addresses | `pmos-admin`; the sandboxes | never public |
 | Postgres, docs, vLLM | the `pmos` network only | the services | never public |
@@ -881,15 +1014,9 @@ server {
         include /etc/nginx/pmos-proxy.conf;
     }
 
-    # The admin routes: decision D3.
-    #   Answer "not on the public listener": keep this block.
+    # The admin routes: decision D3 (b). They are served only on the admin listener (8772),
+    # never through this proxy; pmos-web answers 404 for them on 8770 as well.
     location ^~ /api/admin/ { return 404; }
-    #   Answer "served publicly": replace it with
-    #   location ^~ /api/admin/ {
-    #       client_max_body_size 16m;   # content and policy proposals (proposal.rs, MAX_REQUEST)
-    #       limit_req zone=pmos_api burst=20 nodelay;
-    #       include /etc/nginx/pmos-proxy.conf;
-    #   }
 
     location / {
         limit_req zone=pmos_api burst=40 nodelay;
@@ -918,61 +1045,66 @@ the same `limit_req zone=pmos_signin` and `client_max_body_size 64k`. The exampl
 against a real nginx in this repo: H10 adds `nginx -t` on it in CI's deploy job if the runner has
 nginx, and a run on a public host after H10 checks it from outside (RT-14).
 
-**Sign-in on a public host (decision D2).** For the reviewer's recommended answer, Microsoft
-(Entra) sign-in only unless the web app is behind a VPN or an address allow-list:
+**Sign-in on a public host (decision D2 (a), decided by the owner on 2026-11-22).** Microsoft
+(Entra) sign-in only on a public host; password sign-in only from a VPN or an allow-listed
+range:
 
-- A new setting, `PMOS_WEB_PASSWORD_REACH`: `any` (default on `private`) or `allow-list`.
 - With `PMOS_EXPOSURE=public` and `PMOS_WEB_PASSWORD_LOGIN=1`, `pmos-web` refuses to start unless
-  `PMOS_WEB_PASSWORD_REACH=allow-list` **and** `PMOS_WEB_PASSWORD_CLIENTS` lists at least one CIDR
-  (the VPN's or office's ranges). With it, `pmos-web` refuses every `/api/auth/password/*` request
-  whose client address (from the trusted proxy's `X-Forwarded-For`) is outside the list, with
-  `403 password_sign_in_not_from_here`, before the tool server is asked; Entra sign-in is
-  unaffected. The error at start-up: `PMOS_EXPOSURE=public with password sign-in: set
-  PMOS_WEB_PASSWORD_REACH=allow-list and PMOS_WEB_PASSWORD_CLIENTS (a VPN or office range), or turn
-  password sign-in off and use Microsoft sign-in (decision D2)`.
-- **What counts as an allow-list.** Every entry in `PMOS_WEB_PASSWORD_CLIENTS` must be a CIDR of
-  at least `/16` for IPv4 and at least `/48` for IPv6 (a large VPN pool or a site's IPv6
-  allocation; an office is usually far narrower). `pmos-web` refuses to start on `0.0.0.0/0`,
-  `::/0`, `::ffff:0:0/96` or any shorter prefix, naming the entry: a list that holds the whole
-  internet is not a list. The bounds are a judgement, not a standard: a site whose VPN really
-  hands out a `/12` would need H10's constant changed under review, which is the intended cost.
-- `pmos-web` gets `PMOS_EXPOSURE` from `deploy/.env` (required, like `PMOS_MODEL_SOURCE`; added in
-  H4, which refuses `public` until H10), so the rule holds however it is started; `pmos-admin up
-  --web` and H-SIGNIN say it first.
-- None of the D2 settings exist yet: they are added in `crates/web` in H10, after D2 is answered,
-  and H10 is what lifts H4's refusal of `public`. If the owner answers differently, H10 builds
-  that answer instead.
+  `PMOS_WEB_PASSWORD_CLIENTS` lists at least one CIDR (the VPN's or office's ranges). With it set
+  (on any host), `pmos-web` refuses every `/api/auth/password/*` request whose client address
+  (from the trusted proxy's `X-Forwarded-For`) is outside the list, with `403
+  password_sign_in_not_from_here`, before the tool server is asked; Entra sign-in is unaffected.
+  The error at start-up: `PMOS_EXPOSURE=public with password sign-in: set PMOS_WEB_PASSWORD_CLIENTS
+  (a VPN or office range), or turn password sign-in off and use Microsoft sign-in (decision D2)`.
+- **What counts as an allow-list** (the bounds D2 (a) accepted): every entry in
+  `PMOS_WEB_PASSWORD_CLIENTS` is a CIDR no shorter than `/16` for IPv4 and no shorter than `/48`
+  for IPv6. `pmos-web` refuses to start on `0.0.0.0/0`, `::/0`, `::ffff:0:0/96` or any shorter
+  prefix, naming the entry: a list that holds the whole internet is not a list. A site whose VPN
+  really hands out a `/12` would need H10's constant changed under review, which is the intended
+  cost.
+- **One setting fewer than the previous revision.** `PMOS_WEB_PASSWORD_REACH` (`any` or
+  `allow-list`) is not added: a non-empty `PMOS_WEB_PASSWORD_CLIENTS` is the allow-list, and on
+  `public` it is required. On `private` it is optional.
+- **Development sign-in** (`PMOS_WEB_DEV_LOGIN`) is refused by `pmos-web` itself on `public`, not
+  only by H-DEVLOGIN, so the rule holds however it is started.
+- **Consequence:** PMs without an Entra account sign in over the VPN or from an allow-listed
+  range. Until the owner's Entra app registration exists (CLAUDE.md, "Waiting on the owner"), a
+  public host has no sign-in for anyone outside the allow-list.
+- `pmos-web` gets `PMOS_EXPOSURE` from `deploy/.env` (required; added in H4, which refuses
+  `public` until H10), so the rule holds however it is started; `pmos-admin up --web` and
+  H-SIGNIN say it first.
 
-**The admin routes on a public host (decision D3).** The accepted limit from the user database
-review is that a broken-into web backend can sign as any user to the tool server
-(`docs/user-database-spec.md:931`, "Compromised web backend"). On a private LAN the attacker first
-needs the LAN. On a public listener, the routes that change users, content and policy
-(`/api/admin/users`, `/api/admin/content/proposals` with 16 MiB bodies, `/api/admin/policy`) are
-served by the same internet-facing process as every PM's routes. The two answers:
+**The admin routes (decision D3 (b), decided by the owner on 2026-11-22): a separate admin-only
+listener.** The accepted limit from the user database review stays: a broken-into web backend can
+sign as any user to the tool server (`docs/user-database-spec.md:931`, "Compromised web
+backend"). D3 (b) keeps the routes that change users, content and policy (`/api/admin/users`,
+`/api/admin/content/proposals` with 16 MiB bodies, `/api/admin/policy`) off the browser-facing
+listener:
 
-- **Not on the public listener** (the recommendation, §8): `pmos-web` gains
-  `PMOS_WEB_ADMIN_BIND`, a third listener for `/api/admin/*` (with the static app, so the admin
-  screens load), on port 8772, reached only over the VPN or an SSH tunnel; with it set, the public
-  listener answers `404` for `/api/admin/*`. With `PMOS_EXPOSURE=public` and the web app on,
-  `pmos-web` refuses to start unless `PMOS_WEB_ADMIN_BIND` is set. Its address is checked in two
-  places, because the process can't see where Docker publishes its port:
+- `pmos-web` gains `PMOS_WEB_ADMIN_BIND`, a third listener for `/api/admin/*` (with the static
+  app, so the admin screens load), on port 8772; the browser-facing listener answers `404` for
+  `/api/admin/*`. **This applies on every host, not only on `public`:** with the web app on,
+  `pmos-web` refuses to start without `PMOS_WEB_ADMIN_BIND`. One rule for every host is simpler
+  than two, and on a private network the admin listener is simply published on a private
+  address. (A slight widening of the owner's answer, which named the public listener; the
+  reviewer should confirm it, §12.)
+- Its address is checked in two places, because the process can't see where Docker publishes
+  its port:
   - `pmos-web` refuses a `PMOS_WEB_ADMIN_BIND` whose address is not the unspecified address (the
     container's own `0.0.0.0`, as for 8770), loopback, RFC 1918, `100.64.0.0/10` (VPN overlays
     such as WireGuard set-ups commonly use it) or IPv6 unique-local;
   - `deploy/compose.yaml` publishes 8772 on `${PMOS_WEB_ADMIN_PUBLISH:-127.0.0.1}:8772`, and
-    `pmos-admin up --web` and H-EXPOSURE refuse a `PMOS_WEB_ADMIN_PUBLISH` outside loopback and
-    those private ranges, and fail if 8772 listens anywhere else. RT-14 checks from outside that
-    8772 doesn't answer.
-  The proxy block above returns `404` as a second layer. The setting does not exist in
-  `crates/web` today: H10 adds it. This does not remove the accepted limit (a break-in through
-  the public listener still gets the whole process and its tokens); it keeps the admin handlers'
-  code, and their large bodies, off the internet.
-- **Served publicly, limit accepted:** the proxy uses the commented block, and the runbook
-  records that the owner accepted the limit for a public host. Even then the default stays in the
-  service: H10 makes `pmos-web` on `public` refuse to start unless either `PMOS_WEB_ADMIN_BIND` is
-  set or `PMOS_WEB_ADMIN_ON_PUBLIC_LISTENER=owner-accepted` is, so serving the admin routes
-  publicly is always written down in `deploy/.env` and shown by `status`, never the result of
-  leaving a proxy block out.
+    `pmos-admin up --web`, H-ADMIN and H-EXPOSURE refuse a `PMOS_WEB_ADMIN_PUBLISH` outside
+    loopback and those private ranges, and fail if 8772 listens anywhere else. RT-14 checks from
+    outside that 8772 doesn't answer.
+- The proxy block above returns `404` as a second layer.
+- **Consequence:** admins use the admin screens over the VPN, the company's private network or an
+  SSH tunnel. This does not remove the accepted limit (a break-in through the public listener
+  still gets the whole process and its tokens); it keeps the admin handlers' code, and their
+  large bodies, off the internet.
+- **Not added:** `PMOS_WEB_ADMIN_ON_PUBLIC_LISTENER=owner-accepted`, which the previous revision
+  designed for D3's answer (a). With (b) decided, there is no way to serve the admin routes on the
+  browser-facing listener.
 
 **Firewall expectations** (the operator sets them; the preflight checks what it can see):
 
@@ -987,54 +1119,135 @@ served by the same internet-facing process as every PM's routes. The two answers
   Docker Engine 28 is reported to block direct access to unpublished container ports from other
   hosts; verify on a real host (RT-15, from a second machine).
 - **Outbound:** as the install runbook lists (GitHub, registries, the docs site, Slack, Atlassian,
-  and for `hosted-test` the hosted API). Restricting outbound egress on the host is optional;
-  sandboxes are already default-deny.
+  and for `hosted` or `hosted-test` the hosted endpoint, from the gateway only). Restricting
+  outbound egress on the host is optional; sandboxes are already default-deny.
 
 **The signed user assertion stays required**, exactly as today: `setup.sh` writes
 `PMOS_ASSERTION_MODE=require`, `assertion_checks` runs before every `up`, `add-bot` and `restore`,
-and the runtime and tool server refuse to start otherwise. The host profile has no way to change
+and the runtime and tool server refuse to start otherwise. No host setting has a way to change
 this, and H-ASSERT reports it.
+
+### 3.9 Data handling with a hosted model
+
+This section says plainly what the owner's D1 answer allows, what the spec requires before real
+data flows to the hosted model, and what PM OS does not verify.
+
+**What now leaves the host under `hosted`.** Every model call: the system prompt (the bot's
+persona, role and skill text, and the master context from the content library), the PM's
+messages, and every tool result the harness puts into the conversation. That includes text read
+from Jira, Confluence and Slack with the PM's own tokens, memory notes, drafts, and content
+files marked `sensitivity: restricted`, which 45 of the 46 seed skills may read (§3.6). Nothing
+filters it by data class: this design has no data-class ceiling for the hosted model, and adding
+one (for example "internal only") would be a later slice the owner would have to ask for. What
+does **not** leave the host: the databases, the PMs' sealed tokens, the vault key, the user
+database, `deploy/.env`, and the audit log, except as far as their contents appear in a prompt.
+Under `local`, nothing leaves the host through the model; the host's disks, snapshots and
+backups are wherever the host is (§5).
+
+**What the spec requires before real data flows to the hosted model** (each a condition the
+first approved entry, slice H13, must meet; none is checked by code except where it says so):
+
+1. **The owner's approval of that provider and model, recorded** in
+   `docs/model-providers/<label>.md`: who approved, when, which model ids, and for which data
+   (all classes, as D1 says, unless the owner narrows it). The gateway's unit test refuses an
+   entry without this record (§3.6).
+2. **A data-processing agreement with the provider, and its retention terms** (how long prompts
+   and answers are kept, whether they are used for training, where they are processed), each
+   **confirmed by the owner** in the same record. These are the owner's to confirm; this spec
+   does not state any of them as fact.
+3. **The CODEOWNERS line and branch protection** for the approved list and the records (§3.6),
+   which wait on the owner.
+4. **If the host uses an outbound proxy that re-signs TLS**, the owner's confirmation that the
+   proxy is part of the data path: it can read every prompt and the provider key. Without such a
+   proxy, the provider's host is the only party besides the host that sees prompts in clear.
+5. **Gate 1**, as for any real data.
+
+**The audit log records which model source served each task.** The tool server writes a
+`session.open` audit event for every session (today a session's opening is not itself audited),
+and every audit event of that session carries a new field `model_source`: `local`,
+`hosted:<label>`, `hosted-test` or `stub`, the value the gateway reported at the session's open
+(§3.6, the cross-check). A change of source writes `system.model_source` (§3.6, "What this
+removes"). It is metadata, so an Auditor sees it. The gateway's usage log carries the same label
+on every call, so a gateway restarted with another source during a session is visible there. The
+audit event is the record of what the gateway reported, not proof of where a prompt went: the
+gateway is the one component that knows, and it is reviewed code with the approved list compiled
+in.
+
+**Sandboxes still never hold the provider's key or reach the provider.** Only the gateway does
+(§3.6, "How this relates to … one credential per provider"). RT-18 (§5) checks from a sandbox
+that the provider's host is refused.
+
+**What PM OS does not verify.**
+
+- What the provider does with prompts after they arrive: retention, training use, location, who
+  at the provider can read them. Those are the conditions above, which the owner confirms; PM OS
+  cannot see them.
+- **Any confidential-computing attestation** a provider may offer (a statement that prompts are
+  processed only inside attested hardware). PM OS does not request or check one; it is **not
+  verified**. Checking an attestation before sending a prompt could be a later slice, designed and
+  reviewed on its own.
+- That the endpoint behind the approved URL is the provider the owner approved: PM OS pins the
+  URL and checks TLS against the system trust store, nothing more.
+- That a GPU host used with `local` is one "the owner controls": that is the operator's
+  statement, recorded in the host record (§4).
+
+**Docs elsewhere in the repo that state the old rule** and must change in the docs slice (H6;
+none is edited by this spec): `docs/implementation-plan.md` (`:4` "running on one DGX Spark",
+`:116` "local vLLM routes only (ADM-3)", `:118` the "Restricted data sent off the Spark"
+metric); `docs/gateway.md` (`:3`, `:7-8` "Keeps prompts on the Spark … (ADM-3)", `:231` "zero by
+construction", and the "Allowed upstream hosts" and production-host text); `crates/gateway/src/lib.rs:2-6`,
+`config.rs:265-267`, `:673`, `:693`, `usage.rs:3` (comments); `config/gateway.yaml:4-5` and
+`deploy/gateway.yaml:1-3`, `:11` (comments); `README.md` (`:5` "on the team's DGX Spark with
+open-weight models", `:54` "in front of the local models"); the runbooks (`install.md` Stage 3,
+`runbooks/README.md`, and `model-swap.md`, which describes a swap of local models only); and
+`docs/evals.md` ("Which runs count": every upstream `local`; `:154` and `:640`, "the Spark's"
+gateway).
 
 ## 4. Tiers of support
 
 | Tier | What | Status after this spec's slices | Notes |
 | --- | --- | --- | --- |
-| **Spark** | DGX Spark, DGX OS, arm64, local models | Same kit as Tier 1 with `PMOS_HOST_PROFILE=spark` | Not verified yet: the same acceptance run (§6) applies to it |
-| **Tier 1 (the generic target)** | One Linux host (Debian or Ubuntu), Docker Engine 28+, OpenShell's Docker driver, amd64 or arm64, any cloud VM or on-prem server, with `local` (NVIDIA GPU) or `hosted-test` models | Designed and built here | The generic implementation the owner asked for. Which of these hosts may hold real data is decision D1 |
-| **Tier 2 (later)** | Kubernetes 1.33 through OpenShell's Helm chart, with a CNI that enforces `NetworkPolicy` | Outlined only; a later slice (H8) unless the owner wants it for the pilot (decision O2) | The three names would be cluster Services (or a DNS rewrite), PM OS would move from Compose to manifests, preflight gains a cluster mode (CNI `NetworkPolicy` enforcement, OpenShell's namespaces). That is a second deployment kit, not a small slice |
+| **Tier 1 (the only target)** | One Linux host (Debian or Ubuntu), Docker Engine 28+, OpenShell's Docker driver, amd64 or arm64, any cloud VM or on-prem server, with `hosted` or `hosted-test` models (no GPU needed) or `local` models (an NVIDIA GPU) | Designed and built here | The platform-agnostic implementation the owner asked for. Real data on any of them with `local` or `hosted` (D1, §3.6). A DGX Spark is one such host with `local`, with no profile of its own. Local models on any NVIDIA GPU are **designed for; not verified** (O3) until an acceptance run with `local` passes on one |
+| **Tier 2 (later)** | Kubernetes 1.33 through OpenShell's Helm chart, with a CNI that enforces `NetworkPolicy` | Outlined only; a later slice (H8), not for the pilot (decision O2, decided: no) | The three names would be cluster Services (or a DNS rewrite), PM OS would move from Compose to manifests, preflight gains a cluster mode (CNI `NetworkPolicy` enforcement, OpenShell's namespaces). That is a second deployment kit, not a small slice |
 | **Not offered** | Podman rootless, MicroVM, macOS Docker Desktop, WSL 2 | OpenShell lists them; PM OS does not test them | `PMOS_OPENSHELL_DRIVER` refuses `podman` until someone verifies it. macOS and WSL 2 are development set-ups, not a host for PMs' work |
 | **Unsupported** | Serverless container platforms: Vercel, Cloud Run, Fargate, Fly.io, Railway and similar | Never | OpenShell needs a host it controls: a Docker daemon (or cluster) to create a container per sandbox, Landlock and seccomp on a kernel it can check, and a long-running gateway. These platforms run your one container on their kernel and their runtime, give no Docker daemon, and don't document Landlock. PM OS also needs Postgres with durable disk and always-on bots (bot decision D2). None of that is documented for them, so they are unsupported, not "untested" |
 
 **What "supported" will mean.** The docs may call a host or tier **verified** only after the
 acceptance run in §6 has passed on a real host of that kind, with the record committed
 (`docs/hosts/<date>-<host-kind>.md`: OpenShell version, kernel, Docker version, architecture,
-this repo's commit, the preflight JSON, the red-team script's output). Until then the runbooks say
-"designed for; not yet verified". One passed run verifies that host kind (for example "Ubuntu
-24.04 amd64 VM, Docker 28, no GPU, hosted-test"), not every cloud; a second architecture or
-kernel family needs its own run. Today **no host is verified, the Spark included**, and none of
-H0's fixes has been seen working on OpenShell.
+this repo's commit, the preflight JSON, the red-team script's output, every acknowledgement in
+force, and, for `local`, the operator's statement that the GPU host is one the owner controls).
+Until then the runbooks say "designed for; not yet verified". One passed run verifies that host
+kind (for example "Ubuntu 24.04 amd64 VM, Docker 28, no GPU, hosted-test"), not every cloud; a
+second architecture, kernel family or model source needs its own run (a GPU host with `local`
+is a separate kind). Today **no host is verified**, and none of H0's fixes has been seen working
+on OpenShell.
 
 ## 5. Security analysis
 
-### What changes off the Spark
+### What every host must be protected against
 
-| Threat | On the Spark | On a cloud VM or shared server | Handled by |
-| --- | --- | --- | --- |
-| The host is reachable from the internet | Private LAN | Possibly a public IP | `pmos-web` refuses `PMOS_EXPOSURE=public` until H10 (§3.8); a `private` declaration on a host with a public address fails H-PRIVATE unless acknowledged; §3.8 exposure table and proxy example; H-EXPOSURE, H-DEVLOGIN, H-SIGNIN; console never public; decisions D2 and D3; RT-14 from outside |
-| Other tenants | A box the team owns | The cloud's other customers share the hypervisor; on-prem servers may be shared with other workloads | The hypervisor boundary is the cloud's. Don't run PM OS on a host shared with other workloads: the red team already says "never on a shared machine". Whether restricted data may sit at a cloud provider at all is decision D1 |
-| The cloud metadata service (`169.254.169.254`; `metadata.google.internal`, which resolves to it; AWS's IPv6 `fd00:ec2::254`) | None | Present, and may hand out the VM's cloud credentials | **From a sandbox:** link-local is never allowed by policy (OpenShell docs), the policy allows only three exact names, AAAA answers are empty, and `allowed_ips` (§3.5) pins each name to its own address. RT-11 checks each address. **From PM OS's own containers**, which are not sandboxed and hold the vault key: they *can* reach it. H-METADATA (§3.2) fails a `public` host where a container could get credentials; the generic fix is the `DOCKER-USER` block, and on AWS IMDSv2 with hop limit 1 also passes. Give the VM no cloud role, or one with no permissions, in any case |
-| Metadata services outside link-local (Azure's `168.63.129.16`, Alibaba's `100.100.100.200`) | None | Possible | Not in any policy: default deny. RT-11 includes both, and the block covers them for PM OS's containers. Whether OpenShell treats `100.64.0.0/10` as private is not documented; it doesn't matter while no rule allows it |
-| Name resolution | `/etc/hosts` on a LAN box | VPC resolvers answer `*.internal` names on some clouds | `.internal` is reserved for private use, the managed block decides the three names, and each name's `/32` refuses any other answer |
-| A hosted model on a private address | None | A provider's private endpoint inside the VPC | `local` needs a `class: production` gateway, which takes only `<label>.pmos.internal` names, and H4 refuses any answer for them outside the pinned part of the `pmos` subnet (§3.6). A `class: test` gateway may still reach a private address, but only in fake-data mode |
-| Real data on a host that isn't the Spark | None | A cloud VM's disks, snapshots and backups are at the provider | Fake-data mode on every profile but `spark` until D1 is answered (§3.6); the profile is self-declared, so H-PROFILE fails a `spark` declaration the host doesn't support, with no acknowledgement until H11 (§3.2) |
-| What the services can't see | `docker compose up` by hand skips the preflight | The same, and there a wrong `spark` or `private` declaration is what it would have caught | **A stated limit.** H-PROFILE and H-PRIVATE run only from `pmos-admin` (`up`, `restore`, `add-bot`, `sandbox`, `resume`, `preflight`) and the worker unit's `ExecStartPre`. `docker compose up`, run by hand, skips both, and the services see only the declarations in `deploy/.env`: a `spark` written on a cloud VM and started that way is not caught by any service. What the services do enforce on their own is every refusal that follows from the declarations: on `linux` (and under `hosted-test`) they refuse live connectors, GitHub memory, unmarked or restricted content, a database that has held real data and Slack tokens, however they are started (§3.6; RT-17) |
-| Secrets at rest | `deploy/.env` (vault key), Postgres (sealed tokens), backups on the Spark's disk | Same files on a cloud disk, plus snapshots and images the cloud account can copy | Encrypt the disk (the provider's encryption at rest, or LUKS on-prem). Treat VM snapshots and images as secrets: they hold the vault key and the sealed tokens together. Restrict who in the cloud account may snapshot, attach or read the disk |
-| Backups | "Copy it off the Spark" | Copies go to object storage | Encrypt each backup before it leaves the host (for example `age` to the platform owners' keys), and never copy `deploy/.env` in the same place as the database dump. Restore test as Gate 1 asks |
-| The hosted model | None (local only) | `hosted-test` sends prompts off the host | Fake data only, defined and enforced by the services at start-up (§3.6); the key stays in `deploy/.env`; no sandbox reaches the hosted API |
-| Maintenance reboots | Rare | Routine | The supervised worker and lingering (§3.7, already a bug on the Spark); the runtime already retries a running task once; the preflight re-runs at every start |
-| A bot name used as shell, path or pattern | Same | Same | Validated before use (§3.7, H0) |
-| The OpenShell gateway | Local | Local | Kept on loopback with mTLS; O-GATEWAY. Plaintext mode, which the docs say is for local or tunnelled use only, is not used |
-| Who can run `docker` | Platform owners on one box | The same, plus cloud console access | Membership of the `docker` group is root on the host: give it to platform owners only. Cloud console and serial-console access are equivalent to root |
+The previous revision compared "on the Spark" with "on a cloud VM". With no Spark target, each
+row now states the one rule for every host.
+
+| Threat | On any host | Handled by |
+| --- | --- | --- |
+| The host is reachable from the internet | Possibly a public address | `pmos-web` refuses `PMOS_EXPOSURE=public` until H10 is merged (§3.8); from H10, D2 (a) and D3 (b) as built; `public` is the default; a `private` declaration on a host with a public address fails H-PRIVATE unless acknowledged; the §3.8 exposure table and proxy example; H-EXPOSURE, H-DEVLOGIN, H-SIGNIN, H-ADMIN; console never public (O7); RT-14 from outside |
+| Other tenants | A cloud's other customers share the hypervisor; an on-prem server may be shared with other workloads | The hypervisor boundary is the cloud's. Don't run PM OS on a host shared with other workloads: the red team already says "never on a shared machine" |
+| The cloud metadata service (`169.254.169.254`; `metadata.google.internal`, which resolves to it; AWS's IPv6 `fd00:ec2::254`) | Present on most cloud VMs, and may hand out the VM's cloud credentials | **From a sandbox:** link-local is never allowed by policy (OpenShell docs), the policy allows only three exact names, AAAA answers are empty, and `allowed_ips` (§3.5) pins each name to its own address. RT-11 checks each address. **From PM OS's own containers**, which are not sandboxed and hold the vault key and, in the gateway, the hosted model's key: they *can* reach it. H-METADATA (§3.2) now fails on **every** host where a container could get credentials; the generic fix is the `DOCKER-USER` block, and on AWS IMDSv2 with hop limit 1 also passes. Give the VM no cloud role, or one with no permissions, in any case |
+| Metadata services outside link-local (Azure's `168.63.129.16`, Alibaba's `100.100.100.200`) | Possible | Not in any policy: default deny. RT-11 includes both, and the block covers them for PM OS's containers. Whether OpenShell treats `100.64.0.0/10` as private is not documented; it doesn't matter while no rule allows it |
+| Name resolution | VPC resolvers answer `*.internal` names on some clouds | `.internal` is reserved for private use, the managed block decides the three names, each name's `/32` refuses any other answer, and the gateway's resolver checks every answer for a model server name (§3.6) |
+| A model server name answered by something else | A VPC resolver, a search domain, an `/etc/hosts` line | `local` needs a `class: production` gateway, which takes only `<label>.pmos.internal` names, and H4 refuses any answer for them outside the pinned part of the `pmos` subnet (§3.6). A `class: test` gateway may still reach a private address, but only in fake-data mode |
+| **Real data sent to the hosted provider** (new, by D1) | Under `hosted`, every prompt with its restricted content leaves the host (§3.9) | Only to an endpoint on the compiled, CODEOWNERS-reviewed approved list, pinned by digest, after the owner's recorded approval and conditions (§3.6, §3.9); the key only in the gateway's container; no redirects; the hosted host's DNS answers checked; labels only in every report and log; the audit log records the source per session. Any other endpoint is `hosted-test`, fake data only |
+| An operator points real data at another endpoint | Editing `deploy/.env` | Can't: the URL must hash to an approved entry's digest, and the list is compiled in. Changing the list needs a merged, reviewed commit and a rebuilt image. **A stated limit:** anyone in the `docker` group is root on the host and can build and run any image, as for every other control here; the list makes such a change deliberate and reviewable, not impossible |
+| The hosted model's key | In the gateway's container | One file, mode `600`, mounted only into the gateway, never in `deploy/.env`, a log, a report, a policy or a command line (§3.6); kept out of backups. A sandbox never holds it (RT-18) |
+| What the services can't see | `docker compose up` by hand skips the preflight | **A stated limit.** H-PRIVATE and the other host checks run only from `pmos-admin` (`up`, `restore`, `add-bot`, `sandbox`, `resume`, `preflight`) and the worker unit's `ExecStartPre`. What the services enforce on their own, however they are started: the model source's rules in the gateway (`hosted` only from the approved list), fake-data mode under `hosted-test` (live connectors, GitHub memory, unmarked or restricted content, a database that has held real data and Slack tokens refused; §3.6; RT-17), and `pmos-web`'s sign-in and admin-listener rules (§3.8) |
+| Secrets at rest | `deploy/.env` (vault key), `deploy/secrets/hosted-model.key`, Postgres (sealed tokens), backups on the host's disk; on a cloud VM, also snapshots and images the cloud account can copy | Encrypt the disk (the provider's encryption at rest, or LUKS on-prem). Treat VM snapshots and images as secrets: they hold the vault key, the hosted key and the sealed tokens together. Restrict who in the cloud account may snapshot, attach or read the disk. With real data now allowed on any host (D1), this is a condition of Gate 1 on a cloud VM, recorded in the host record |
+| Backups | Copies go off the host, often to object storage | Encrypt each backup before it leaves the host (for example `age` to the platform owners' keys), and never copy `deploy/.env` or the hosted key in the same place as the database dump. Restore test as Gate 1 asks |
+| Maintenance reboots | Routine on cloud VMs | The supervised worker and lingering (§3.7); the runtime already retries a running task once; the preflight re-runs at every start |
+| A bot name used as shell, path or pattern | — | Validated before use (§3.7, H0) |
+| The OpenShell gateway | Local | Kept on loopback with mTLS; O-GATEWAY. Plaintext mode, which the docs say is for local or tunnelled use only, is not used |
+| Who can run `docker` | Platform owners, plus anyone with cloud console access | Membership of the `docker` group is root on the host: give it to platform owners only. Cloud console and serial-console access are equivalent to root |
 
 The trust boundary itself does not move: the sandbox is still the boundary between a bot and
 everything else, the three services are still the only things a bot reaches, and every service
@@ -1049,19 +1262,21 @@ a new `policies/redteam/exposure.sh` run from another machine.
 | --- | --- | --- |
 | P-0 | `deploy/preflight.sh --openshell --json` on the host | Every check passes, O-REACH included; the JSON is attached to the record. Replaces P-1's "kernel 6.2 on DGX OS" |
 | P-7 | `pmos-admin host-names check` | The three names resolve on the host to `.10`, `.11`, `.12`; no loopback entry anywhere for them |
-| P-8 | On a host that isn't a Spark: `deploy/preflight.sh --profile spark`, then `sudo pmos-admin host acknowledge H-PROFILE --reason test`, then a `PMOS_HOST_ACK_H_PROFILE` line written into `deploy/.env` by hand | H-PROFILE fails; the acknowledgement is refused with exit 2 and nothing is written or logged; the hand-written line makes the check fail too (before H11) |
+| P-8 | `sudo pmos-admin host acknowledge H-METADATA --reason test`, then a `PMOS_HOST_ACK_H_EXPOSURE` line written into `deploy/.env` by hand | The acknowledgement is refused with exit 2 and nothing is written or logged (only H-PRIVATE takes one); the hand-written line makes the preflight fail. (The previous P-8 tested H-PROFILE, which is gone) |
 | P-9 | With H-PRIVATE acknowledged: start a listener on `0.0.0.0:443` (for example `sudo python3 -m http.server 443`) and run the preflight; stop it and run again | The first run fails H-PRIVATE naming the port; the second passes as warn |
 | RT-11 | From A: `169.254.169.254`, `metadata.google.internal`, `[fd00:ec2::254]`, `168.63.129.16`, `100.100.100.200`, each on 80 and 443 | Each blocked by OpenShell and logged as RT-10 describes |
 | RT-12 | From A: the host's own addresses on 22, 17670 (OpenShell's gateway), 2375 and 2376 (Docker's API), and the Docker socket path | Each blocked; the socket is not in A's filesystem |
 | RT-13 | From A: the console and Postgres by their `pmos` addresses (`<console address>:8760`, `<postgres address>:5432`), the network gateway `10.201.77.1` on 8770, and a pinned service address on a port that isn't its own (`10.201.77.10:8740`) | Each blocked: only the three exact names on their own ports are allowed |
-| RT-13b | Point a name at another address for a moment, then call it from A: first `toolserver.pmos.internal` → `10.201.77.11` (the gateway's address, which a `/24` would have allowed), then → `10.201.78.10`. `pmos-admin` has **no** override for this: `isolation.sh` writes the temporary line itself (with `sudo`), under a `trap` that runs `pmos-admin host-names apply` on every exit, and `host-names check` fails while the line is there, so `pmos-admin sandbox` refuses to start a sandbox meanwhile | Both refused by `allowed_ips`; after the script, `host-names check` passes again (only if O6 is adopted) |
-| RT-14 | `exposure.sh <host's public address>` from outside the host's network | Only 443 (and 80 if used) and 22 from the operators' range answer; 5432, 8710, 8730, 8740, 8750, 8760, 8770, 8771, 8772, 17670 do not. Before H10 (the acceptance run) nothing answers on 443 or 80 either, since no public proxy is installed. After H10, through 443, `/healthz`, `/readyz` and `/internal/brief/x` answer `404`, and `/api/admin/users` answers as decision D3 says |
+| RT-13b | Point a name at another address for a moment, then call it from A: first `toolserver.pmos.internal` → `10.201.77.11` (the gateway's address, which a `/24` would have allowed), then → `10.201.78.10`. `pmos-admin` has **no** override for this: `isolation.sh` writes the temporary line itself (with `sudo`), under a `trap` that runs `pmos-admin host-names apply` on every exit, and `host-names check` fails while the line is there, so `pmos-admin sandbox` refuses to start a sandbox meanwhile | Both refused by `allowed_ips`; after the script, `host-names check` passes again (O6, decided) |
+| RT-14 | `exposure.sh <host's public address>` from outside the host's network | Only 443 (and 80 if used) and 22 from the operators' range answer; 5432, 8710, 8730, 8740, 8750, 8760, 8770, 8771, 8772, 17670 do not. With the web app off, nothing answers on 443 or 80 either. With H10 and the web app on, through 443: `/healthz`, `/readyz`, `/internal/brief/x` and `/api/admin/users` answer `404` (D3 (b)), and `POST /api/auth/password/sign-in` (`crates/web/src/app/password.rs:92`, under `/api`) from an address outside `PMOS_WEB_PASSWORD_CLIENTS` answers `403 password_sign_in_not_from_here` (D2 (a)) |
 | RT-15 | From a second machine on the same private network or VPC: `10.201.77.10:8710` (with a route added on that machine towards the host, if the operator can) | No answer |
-| RT-16 | From a container on the `pmos` network: H-METADATA's probe, and a plain TCP connect to `169.254.169.254:80`; then `sudo systemctl restart docker`, wait for the containers to come back without `pmos-admin up`, and probe again; then flush `DOCKER-USER` by hand, wait 70 s, and probe again | On a `public` host: H-METADATA passes; with the block applied, no answer at all, after the Docker restart and after the flush too |
-| RT-17 | Without `pmos-admin`: with `PMOS_HOST_PROFILE=linux` and `PMOS_CONNECTORS=live` (and, in turn, `PMOS_MEMORY=github`, a content checkout without `TEST-CONTENT`, Slack tokens set), run `docker compose up -d` by hand, then `docker compose restart toolserver`, then `docker compose run --rm toolserver` | Each time the tool server (and `pmos-slack` for the tokens, the runtime and the web app for the content) exits with its fake-data error and opens no session; nothing is read from a live source. The services refuse live connectors on `linux` however they are started |
+| RT-16 | From a container on the `pmos` network: H-METADATA's probe, and a plain TCP connect to `169.254.169.254:80`; then `sudo systemctl restart docker`, wait for the containers to come back without `pmos-admin up`, and probe again; then flush `DOCKER-USER` by hand, wait 70 s, and probe again | On every host: H-METADATA passes; with the block applied, no answer at all, after the Docker restart and after the flush too |
+| RT-17 | Without `pmos-admin`: with `PMOS_MODEL_SOURCE=hosted-test` and `PMOS_CONNECTORS=live` (and, in turn, `PMOS_MEMORY=github`, a content checkout without `TEST-CONTENT`, Slack tokens set), run `docker compose up -d` by hand, then `docker compose restart toolserver`, then `docker compose run --rm toolserver` | Each time the tool server (and `pmos-slack` for the tokens, the runtime and the web app for the content) exits with its fake-data error and opens no session; nothing is read from a live source. The services refuse live connectors under `hosted-test` however they are started |
+| RT-18 | From A: the hosted provider's host (taken from `PMOS_GATEWAY_HOSTED_URL` on the host, never written into the record) on 443, by name and by its resolved address | Both blocked by OpenShell: no sandbox reaches the provider. A's filesystem and environment hold no provider key (`grep` of `/proc/self/environ` and the workspace for the key's first 8 characters, done on the host side by `isolation.sh`, which prints only "found" or "not found") |
+| RT-19 | Without `pmos-admin`, with `PMOS_MODEL_SOURCE=hosted` (only once an entry exists, H13): change `PMOS_GATEWAY_HOSTED_URL` to another `https` URL, then to the right URL with a trailing query, then empty the key file; run `docker compose up -d gateway` each time | The gateway exits each time with its message, naming the setting, never the URL; no request leaves for the other URL (checked on the host's proxy log or with `ss` during the start) |
 | E-5 | Reboot the host | The OpenShell gateway, the stack and every bot's worker come back without anyone logging in (the units' `ExecStartPre` preflight passes); a Slack question is answered |
 
-## 6. How to verify without a Spark
+## 6. How to verify
 
 ### In CI and in this build environment (no OpenShell)
 
@@ -1070,233 +1285,277 @@ a new `policies/redteam/exposure.sh` run from another machine.
 | Bot-name validation | `scripts/test-pmos-admin.sh`: `add-bot` and `sandbox` refuse `../x`, `a b`, `x$(id)`, a name with a newline, `x=y`, `a,b`, `-a`, `a--b`, `A`, a 33-character name, each with exit 2 and `deploy/.env` unchanged; `docs` and `pm-ana` pass | H0 |
 | The worker unit | `systemd-analyze verify` on `deploy/systemd/pmos-worker@.service`; the instance name for `pm-ana` is made with `systemd-escape`; the command `sandbox` would run, printed with `--dry-run`, uses `--from` and no `&` | H0 |
 | The worker image's user | `docker build` of `Dockerfile.worker`; `docker run --rm pmos-worker:local id` prints the numeric `sandbox` ids; `docker inspect` shows a numeric `Config.User`; the eval stack's workers still pass their tests | H0 |
-| The preflight's every check, pass and fail | `scripts/test-preflight.sh`: fixture directories under `deploy/test/preflight/` (an Ubuntu 24.04 amd64 host, a DGX OS arm64 host, a 5.15 kernel, Landlock absent from `lsm`, an ABI-2 probe result, cgroups v1, Docker 27, no NVIDIA runtime with `local`, port 8710 taken, a public bind, dev sign-in on `public`, a live network unlike `deploy/.env`, a `/8` and a `/16` `PMOS_NETWORK_SUBNET` that hold the pinned addresses, an `ip_range` holding `.10` or `.13`, a stale or loopback managed hosts block (H2's), each H-METADATA answer shape with and without the block, the block's rules present but its drop-in or timer missing, `private` with a public interface address and with a metadata answer, each with and without an acknowledgement, an acknowledged `private` with a listener on 80 or 443 on a public or unspecified address (fail) and on a private one (pass), an acknowledgement whose fingerprint no longer matches, a `PMOS_HOST_ACK_*` line with no log entry, `spark` without `/etc/dgx-release` and on amd64 (fail, with `host acknowledge H-PROFILE` refused and a hand-written `PMOS_HOST_ACK_H_PROFILE` line failing too), `public` with the web profile on before H10); each asserts the exact status and exit code. The fixtures use H2's pinned addresses, `ip_range` and managed block, so H1 is built after H2. Run in CI's `deploy` job | H1 |
+| The preflight's every check, pass and fail | `scripts/test-preflight.sh`: fixture directories under `deploy/test/preflight/` (an Ubuntu 24.04 amd64 host, a Debian arm64 host, a 5.15 kernel, Landlock absent from `lsm`, an ABI-2 probe result, cgroups v1, Docker 27, no NVIDIA runtime with `local`, `local` with `PMOS_VLLM_IMAGE` empty, port 8710 taken, a public bind on a `private` host and on a `public` one, dev sign-in on `public`, a live network unlike `deploy/.env`, a `/8` and a `/16` `PMOS_NETWORK_SUBNET` that hold the pinned addresses, an `ip_range` holding `.10` or `.13`, a stale or loopback managed hosts block (H2's), each H-METADATA answer shape with and without the block on a `private` and on a `public` host (each answer fails on both), the block's rules present but its drop-in or timer missing, `private` with a public interface address and with a metadata answer, each with and without an acknowledgement, an acknowledged `private` with a listener on 80 or 443 on a public or unspecified address (fail) and on a private one (pass), an acknowledgement whose fingerprint no longer matches, a `PMOS_HOST_ACK_*` line with no log entry, `host acknowledge` of any check but H-PRIVATE refused and a hand-written line for one failing, `public` with the web profile on before H10, and from H10 H-SIGNIN's and H-ADMIN's cases); each asserts the exact status and exit code. The fixtures use H2's pinned addresses, `ip_range` and managed block, so H1 is built after H2. Run in CI's `deploy` job | H1 (H-SIGNIN's and H-ADMIN's H10 cases in H10) |
 | The preflight runs at every start | `scripts/test-pmos-admin.sh`: `up`, `restore`, `add-bot`, `sandbox` and `resume` run the right stage and refuse on a failing fixture | H1 |
-| The metadata block and acknowledgements | `scripts/test-pmos-admin.sh` with stand-ins for `iptables`, `systemctl` and `chattr`, on a temporary root: `host-firewall apply` writes the rules matching `-i pmos0` and `-i docker0`, the `docker.service` drop-in and the timer, and is idempotent; `check` fails when any one is missing; `remove` takes all three away; `host acknowledge` writes the `deploy/.env` line and the log line, `--clear` logs too, and `status` prints every acknowledgement in force | H1 |
+| The metadata block and acknowledgements | `scripts/test-pmos-admin.sh` with stand-ins for `iptables`, `systemctl` and `chattr`, on a temporary root: `host-firewall apply` writes the rules matching `-i pmos0` and `-i docker0`, the `docker.service` drop-in and the timer, and is idempotent; `check` fails when any one is missing; `remove` takes all three away; `host acknowledge H-PRIVATE` writes the `deploy/.env` line and the log line, `--clear` logs too, and `status` prints every acknowledgement in force | H1 |
 | The Landlock probe itself | run on the CI runner and here: it prints an ABI or a clear failure, never a crash. Its result is not asserted (it depends on the runner's kernel) | H1 |
-| The service refusals | `cargo test`: the gateway's config tests (`local` with a `class: test` config, `local` with `CLOUD_TEST=1`, `local` with `deploy/gateway.yaml` and the stub on, which starts; `hosted-test` without `CLOUD_TEST`, and with the stub; a missing `PMOS_MODEL_SOURCE`) and its resolver's tests (a production name answered inside the `ip_range`, outside the subnet, with loopback, and with two answers one of them outside, each refused at connection with a `502`; one answered with a pinned address, accepted); the tool server's config tests (in fake-data mode by `hosted-test` and by `PMOS_HOST_PROFILE=linux` with `local`: live connectors, `PMOS_MEMORY=github`, no `TEST-CONTENT`, a `restricted` file, a `held_real_data` marker; the marker written at a start with live connectors on `spark`, and still there after a restart with fake connectors; a session refused while the gateway's `/readyz` gives no answer, an unreadable one or another source, and refused again once the gateway's answer changes after the cache runs out); the gateway's `/readyz` bodies (`200`, `503`, stub) holding only labels: no upstream URL, host name, `pmos` address or key; the shared content check run by the runtime and the web app at start and at reload; `pmos-web` refusing `PMOS_EXPOSURE=public` and a missing `PMOS_EXPOSURE`; the runtime's and web app's markers; `pmos-slack` with Slack tokens; the runtime's readiness on a mismatch. Each with its passing case | H4 |
-| The refusals hold without `pmos-admin` | a stack test: `docker compose up` with `hosted-test` and `PMOS_CONNECTORS=live` leaves the tool server exited with its error, and so does `linux` with `local` and `PMOS_CONNECTORS=live`; `pmos-admin restart toolserver` the same; `pmos-admin sandbox --dry-run` in fake-data mode on a checkout without `TEST-CONTENT` refuses before any upload | H4 |
-| The gateway's container settings | `docker compose config` shows `HTTPS_PROXY`, `NO_PROXY`, `PMOS_GATEWAY_CLOUD_TEST`, `PMOS_GATEWAY_REMOTE_KEY`, `PMOS_MODEL_SOURCE`, `PMOS_HOST_PROFILE`, `PMOS_NETWORK_SUBNET` and `PMOS_NETWORK_IP_RANGE` in `gateway`'s `environment`; a stack test with a local mock of the hosted API behind a test proxy | H4 |
+| The service refusals | `cargo test`: the gateway's config tests (`local` with a `class: test` config, `local` with `CLOUD_TEST=1`, `local` with `deploy/gateway.yaml` and the stub on, which starts; `hosted-test` without `CLOUD_TEST`, and with the stub; a missing `PMOS_MODEL_SOURCE`; a `hosted:` upstream under `local` or `hosted-test`, refused) and its resolver's tests (a production name answered inside the `ip_range`, outside the subnet, with loopback, and with two answers one of them outside, each refused at connection with a `502`; one answered with a pinned address, accepted); the tool server's config tests (in fake-data mode under `hosted-test`: live connectors, `PMOS_MEMORY=github`, no `TEST-CONTENT`, a `restricted` file, a `held_real_data` marker; the marker written at a start with live connectors under `local`, and still there after a restart with fake connectors; `local` with live connectors accepted; a session refused while the gateway's `/readyz` gives no answer, an unreadable one or another source, and refused again once the gateway's answer changes after the cache runs out); the gateway's `/readyz` bodies (`200`, `503`, stub) holding only labels: no upstream URL, host name, `pmos` address or key; the shared content check run by the runtime and the web app at start and at reload; `pmos-web` refusing `PMOS_EXPOSURE=public` and a missing `PMOS_EXPOSURE`; the runtime's and web app's markers; `pmos-slack` with Slack tokens; the runtime's readiness on a mismatch. Each with its passing case | H4 |
+| The refusals hold without `pmos-admin` | a stack test: `docker compose up` with `hosted-test` and `PMOS_CONNECTORS=live` leaves the tool server exited with its error; `pmos-admin restart toolserver` the same; `pmos-admin sandbox --dry-run` in fake-data mode on a checkout without `TEST-CONTENT` refuses before any upload | H4 |
+| The gateway's container settings | `docker compose config` shows `HTTPS_PROXY`, `NO_PROXY`, `PMOS_GATEWAY_CLOUD_TEST`, `PMOS_GATEWAY_REMOTE_KEY`, `PMOS_MODEL_SOURCE`, `PMOS_NETWORK_SUBNET` and `PMOS_NETWORK_IP_RANGE` in `gateway`'s `environment`; `local` with `PMOS_VLLM_IMAGE` unset fails `compose config`; a stack test with a local mock of the hosted API behind a test proxy | H4 |
+| The hosted production source | `cargo test -p pmos-gateway`: the approved list's own test (a valid label, a 64-hex digest, at least one model, a `record` file with the three confirmed sections; the shipped list empty); URL normalisation (case, default port, trailing `/`; user information, query, fragment, `http` refused); `hosted` refused with a `test` config, two labels, an unknown label, a digest mismatch, a model id outside the entry, `CLOUD_TEST=1`, an empty or missing key file; `hosted` accepted with a test-only list compiled under `cfg(test)` and a local TLS mock; no redirect followed (a `302` to another host is a `502`, and the mock on the other host sees no request); the hosted resolver refusing loopback, link-local, metadata, `pmos` subnet and private answers; `/readyz` probing the hosted `/models` at most once per 30 s under a burst of calls; `/readyz`, `/v1/pmos/roles`, usage lines and start-up messages containing neither the URL, its host nor the key. The tool server: `session.open` written with `model_source`, every event of the session carrying it, `system.model_source` on a change. `pmos-admin hosted-key set` from standard input, refusing group or world bits; `backup` leaving the key out; a stack test that the gateway container reads the mounted key file and no other container has it | H12 |
 | The managed hosts block | `scripts/test-pmos-admin.sh` gains cases on a temporary hosts file: apply is idempotent, keeps other lines, replaces a stale block, takes no override (any extra argument is refused), and `check` fails on each wrong state, a loopback entry and a second line for a name outside the block included | H2 |
 | Compose | `docker compose config -q` with the five pinned addresses (the three services and the two vLLM services), the `ip_range` and the `pmos0` bridge name; a container started on the network first gets an address in the range; `up` refuses a `/16` subnet that holds the pinned addresses; CI's existing bring-up smoke test (it doesn't use sandboxes) and the eval stack still pass | H2 |
 | The internal route | `docker compose config` shows `PMOS_WEB_INTERNAL_BIND`; a stack test: the brief `PUT` works on 8771 and `404`s on 8770 | H9 |
 | The policy change | `cargo test -p pmos-policy`: `net-allowed-ips` fails and passes (another service's `/32`, a `/24`, a missing list, two entries); the compose literals equal the constants; the generated files carry `allowed_ips`; `pmos policy check` green on the regenerated `policies/`; `up` refuses a subnet without the constants | H3 |
-| Sign-in and admin routes on `public` | `cargo test -p pmos-web`: start-up refusals and the allow-list (D2: `0.0.0.0/0`, `::/0`, `::ffff:0:0/96`, a `/15` and a `/47` refused, a `/16` and a `/48` accepted), the admin listener, its address check (a public address refused; loopback, RFC 1918, `100.64.0.0/10` and unique-local accepted) and the public `404` (D3), `public` refused with neither `PMOS_WEB_ADMIN_BIND` nor `PMOS_WEB_ADMIN_ON_PUBLIC_LISTENER`, each for the answer the owner gave; `pmos-admin up --web` refusing a public `PMOS_WEB_ADMIN_PUBLISH`; `nginx -t` on the proxy example if CI has nginx | H10 |
+| Sign-in and admin routes | `cargo test -p pmos-web`: D2 (a): `public` with password sign-in and no `PMOS_WEB_PASSWORD_CLIENTS` refused; the allow-list's bounds (`0.0.0.0/0`, `::/0`, `::ffff:0:0/96`, a `/15` and a `/47` refused, a `/16` and a `/48` accepted); a password request from outside the list `403` before the tool server is asked, Entra unaffected; dev sign-in refused on `public`. D3 (b): the web app refused without `PMOS_WEB_ADMIN_BIND` on `public` **and** on `private`; its address check (a public address refused; loopback, RFC 1918, `100.64.0.0/10` and unique-local accepted); `/api/admin/*` `404` on 8770 and served on 8772. `pmos-admin up --web` refusing a public `PMOS_WEB_ADMIN_PUBLISH`; `nginx -t` on the proxy example if CI has nginx | H10 |
 | The workspace's checks | the full set in CLAUDE.md, unchanged | every slice |
 
 None of this shows what OpenShell enforces. It shows that PM OS's side does what this spec says.
 
 ### On a real host with OpenShell (the acceptance run)
 
-The first non-Spark host (decision O1). All with fake data and the `hosted-test` model, so no real
-token or data is needed (and on `linux` the services are in fake-data mode whatever is set).
-**The web app stays off** (`up` without `--web`), because `pmos-web` refuses `PMOS_EXPOSURE=public`
-until H10 and no public proxy is installed. If the run needs the web app, the host is declared
-`private`, H-PRIVATE is acknowledged (recorded and listed in the record), and the web app is
-reached only through an SSH tunnel to `127.0.0.1:8770`. Each step's output goes into the host
-record (§4).
+**The first host (decision O1, decided by the owner on 2026-11-22): an Ubuntu 24.04 LTS x86
+(amd64) virtual machine without a GPU, with fake data.** So the run uses `hosted-test`, which
+needs no GPU and no owner approval, and fake-data mode holds whatever else is set. The cloud or
+server it runs on is the operator's choice (any will do: that is the point of the run); it is
+recorded in the host record, without the account's identifiers. Declared `--exposure public`
+unless the VM has no public address. The web app is either off, or, once H10 is merged, on with
+password sign-in limited to the operator's own address range in `PMOS_WEB_PASSWORD_CLIENTS`
+(Entra needs the owner's app registration, which may not exist yet) and the admin listener on
+`127.0.0.1` reached through an SSH tunnel. Each step's output goes into the host record (§4).
 
-1. **Before installing anything:** `deploy/preflight.sh --profile linux --model-source hosted-test
-   --exposure public --json` (or `--exposure private` with the acknowledgement above). Every host
-   check passes.
+1. **Before installing anything:** `deploy/preflight.sh --model-source hosted-test --exposure
+   public --json`. Every host check passes (H-NVIDIA is not checked; H-EGRESS waits for step 3).
 2. **Install OpenShell** from NVIDIA's install page; enable lingering;
    `deploy/preflight.sh --openshell`. O-CLI, O-GATEWAY, O-LINGER and O-CANARY pass. Record whether
    `--from` took the local image (surprise 2), how the canary's identity was set (surprise 3), and
    whether `sandbox exec` stays in the foreground.
-3. **Stack, Stages 1–2 of the install runbook** with `hosted-test`: `status` all `ok`; the smoke
-   test passes through the bring-up worker. Then the refusals: set `PMOS_CONNECTORS=live` and run
-   `docker compose up -d toolserver` by hand; the tool server must exit with its error.
+3. **Stack, Stages 1–2 of the install runbook** with `hosted-test` (the owner's hosted model as an
+   unapproved test endpoint is allowed here, with fake data): `status` all `ok`; H-EGRESS passes;
+   the smoke test passes through the bring-up worker. Then the refusals: set
+   `PMOS_CONNECTORS=live` and run `docker compose up -d toolserver` by hand; the tool server must
+   exit with its error (RT-17).
 4. **Names:** `pmos-admin host-names apply`; P-7 passes; O-REACH passes. **H-1, the key unknown:**
    from the Docs bot's sandbox, a heartbeat on a made-up task id reaches the runtime and gets its
    `404` (RT-8's control). If it doesn't, stop at §3.3 step 6.
 5. **Sandboxes:** `pmos-admin sandbox docs`, a personal bot and `pm-redteam`; the smoke test
    passes through the Docs bot's sandbox (E-1: no denials in its log).
-6. **Red team:** `isolation.sh` both ways; RT-1 to RT-17 and P-0 to P-9 pass; the "verify on a
-   real host" table in `docs/sandbox-policies.md` (today's "Verify on the Spark" table) filled
-   in, with anything that differed.
+6. **Red team:** `isolation.sh` both ways; RT-1 to RT-18 and P-0 to P-9 pass (RT-19 only if an
+   approved entry exists by then); the "verify on a real host" table in
+   `docs/sandbox-policies.md` (today's "Verify on the Spark" table) filled in, with anything that
+   differed.
 7. **Reboot** (E-5).
 8. **Write the record** and open a pull request with it; the reviewer session checks it before the
-   docs call that host kind verified.
+   docs call "Ubuntu 24.04 amd64 VM, Docker 28, no GPU, hosted-test" verified.
 
-The same run on the Spark, with `--profile spark --model-source local --exposure private`, is
-what verifies the Spark, H0's fixes included.
+**Not covered by this run:** `local` (no GPU), `hosted` with real data (it needs H13 and Gate 1),
+arm64, and Entra sign-in. A GPU host with `local` needs its own run (O3); which GPU host, if any,
+is the owner's to name (§8).
 
 ## 7. Slices, in build order
 
-One agent, one worktree, one branch per slice (CLAUDE.md). "Before a host" means it can be built
-and fully tested here; its claims about OpenShell are still checked in the acceptance run.
-"Before D1–D3" means it doesn't wait for the owner's decisions in §8.
+One agent, one worktree, one branch per slice (CLAUDE.md). Re-derived on 2026-11-22 for the
+change of direction: every decision the slices waited on (D1, D2, D3, O1, O6) is answered, H11 is
+dropped, and two slices are new (H12, H13). "Buildable now" means it can be built and fully
+tested here with no further owner decision; its claims about OpenShell are still checked in the
+acceptance run. "Needs a real host" means only a host with OpenShell can finish it.
 
-| # | Slice | Files | Tests | Model | Before D1–D3? | Before a host? |
+| # | Slice | Files | Tests | Model | Buildable now? | Needs a real host? |
 | --- | --- | --- | --- | --- | --- | --- |
-| H0 | **Spark fixes that don't depend on the owner's decisions** | `deploy/pmos-admin` (`add-bot`, `sandbox`, `pause`, `resume`: name validation, exact-field token lookup, `--from`, the unit instead of `&`, the lingering check), `deploy/systemd/pmos-worker@.service` (new: `systemd-escape`d instance, `%I`, `Restart=on-failure`, `StartLimit*`; `ExecStartPre` added once H1 exists), `deploy/Dockerfile.worker` (`sandbox` account, numeric `USER`), `docs/runbooks/install.md` (the `127.0.0.1` hosts line removed, with a "stop: sandboxes can't reach the services until H2" note; lingering), `docs/sandbox-policies.md` ("Creating a bot's sandbox") | §6 H0 rows | Strongest (shell injection, the sandbox's identity) | Yes | Yes to build; each fix is from OpenShell's public docs and unverified until the acceptance run |
-| H2 | **Pinned addresses and managed host names** | `deploy/compose.yaml` (`ipv4_address` for the three services and the two vLLM services; `ip_range`; bridge name `pmos0`), `deploy/env.example` (`PMOS_NETWORK_IP_RANGE`; `.10` to `.14` listed as reserved), `deploy/pmos-admin` (`host-names apply`/`check`, with no override; the live-network check; the subnet `/24`-or-longer and holds-the-literals checks; `sandbox` refuses on a failed check; `status`), `scripts/test-pmos-admin.sh`, `docs/runbooks/install.md` Stage 4 step 1 | §6 H2 rows | Strongest (it decides what sandboxes reach) | Yes | Yes to build; H-1 needs a host |
-| H1 | **Preflight** (after H2: its fixtures use H2's addresses, `ip_range` and managed block) | `deploy/preflight.sh` (new; H-PRIVATE with its 80/443 check when acknowledged, and H-PROFILE, a hard fail on `spark` with no acknowledgement), `deploy/test/preflight/**` (fixtures), `scripts/test-preflight.sh` (new), `.github/workflows/ci.yml` (deploy job: parse and run it), `deploy/pmos-admin` (`preflight`, `host-firewall apply/check/remove` with the rules on `pmos0` and `docker0`, the `docker.service` drop-in and the timer, `host acknowledge` for H-PRIVATE only, refusing H-PROFILE; the stages at `up`, `restore`, `add-bot`, `sandbox`, `resume`; acknowledgements in `status`), `deploy/pmos-metadata-block` (new, the root-owned rule script), `deploy/setup.sh` (run it first, stop on fail), the unit's `ExecStartPre` | §6 H1 rows | Strongest (it decides what may be called supported) | Yes (H-SIGNIN refuses `public` with the web app on until H10; its D2 rule lands with H10) | Yes; O-* checks are written now, proven in the acceptance run |
-| H4 | **Model source, fake-data mode and no public web app, enforced by the services** (after H2: its resolver checks against H2's `ip_range`) | `crates/gateway` (`PMOS_MODEL_SOURCE`; `local` only with `class: production`; the resolver that checks each production name's answer at every connection; `model_source` in `/readyz` and `/v1/pmos/roles`; `/readyz` reporting labels only, its address-keyed `upstreams` replaced), `crates/toolserver` (fake-data mode from `PMOS_MODEL_SOURCE` and `PMOS_HOST_PROFILE`; the refusals; `TEST-CONTENT` and the restricted-file check at start and sync; the `held_real_data` marker; the gateway cross-check at every session open or from a short cache, failing closed), a shared content-check function (in `crates/contract`, beside `Sensitivity` in `model.rs`) used by `crates/toolserver`, `crates/bots` and `crates/web`, and `pmos content check-test` in the `pmos` CLI, `crates/slack` (refuse tokens), `crates/bots` (readiness cross-check, the content check, the marker), `crates/web` (`PMOS_EXPOSURE` required and `public` refused; the test banner; the content check; the marker), `deploy/compose.yaml` and `deploy/compose.evals.yaml` (gateway: `<<: *proxy` under `environment:`, `PMOS_GATEWAY_CLOUD_TEST`, `PMOS_GATEWAY_REMOTE_KEY`, `PMOS_MODEL_SOURCE`, `PMOS_HOST_PROFILE`, `PMOS_NETWORK_SUBNET`, `PMOS_NETWORK_IP_RANGE`, config path; `PMOS_MODEL_SOURCE` and `PMOS_HOST_PROFILE` to the other four; `PMOS_CONNECTORS` and `PMOS_EXPOSURE` where §3.6 and §3.8 say; `PMOS_GATEWAY_URL` to the tool server), `deploy/env.example` (host-profile block; model block under `local`), `deploy/setup.sh` (detect DGX OS, fill the four settings, NVIDIA warning only for `local`), `deploy/pmos-admin` (`up`'s early messages, `sandbox`'s content check, `status` lines), `deploy/gateway.hosted-test.yaml` (new, example hosts only, no key), `scripts/claude-test-stack.sh` (passes `hosted-test`), `docs/gateway.md` (`PMOS_MODEL_SOURCE`, the resolver, which class serves which source) | §6 H4 rows | Strongest (security refusals, cross-crate) | Yes: every change refuses more than today (keeps ADM-3; O4 and D1 only widen it later; D2 and D3 are not served at all). The services take `PMOS_HOST_PROFILE=spark` as declared; only H1's H-PROFILE checks it, as a hard fail with no acknowledgement until H11, and only where `pmos-admin` or the unit starts the stack (§3.2, §5) | Yes |
-| H9 | **Internal route, decision-free part** | `deploy/compose.yaml` (`PMOS_WEB_INTERNAL_BIND`), `deploy/env.example` (`PMOS_WEB_BRIEF_URL` on 8771), `docs/runbooks/install.md` (health and internal routes not forwarded and the body sizes, for the proxy a private host already has; a "no public host yet" note pointing at H10), H-EXPOSURE's 8771. **Not** the public nginx example or the public firewall section: they move to H10 | §6 H9 rows | Medium | Yes | Yes |
-| H3 | **Policy: `allowed_ips` per name and wording** (needs decision O6) | `crates/policy/src/lib.rs` (`TOOLSERVER_ADDR`, `GATEWAY_ADDR`, `BOTS_ADDR`; "verify on a real host"), `generate.rs` (emit `allowed_ips`; header wording), `check.rs` (`net-allowed-ips` in `RULES`), `crates/policy/tests/policies.rs` (and the compose-literals test), regenerated `policies/**`, `deploy/pmos-admin` (`up` refuses a subnet without the constants), `docs/sandbox-policies.md` (rule table, "verify on a real host" table), `docs/policy-admin.md` (the fixed list); the web Policy Admin's fixed facts if it lists endpoint fields (`crates/web/src/app/policy.rs`, `crates/policy/src/admin/`) | §6 H3 row; persona tests still show only skill-folder differences | Strongest (cross-crate, POL-2 network change) | Yes (waits for O6 only) | Yes to build and review; applied on hosts after the acceptance run's H-1 |
-| H10 | **Sign-in and admin routes on a public host** (needs D2 and D3) | `crates/web` (lifts H4's refusal of `public` only together with: `PMOS_WEB_PASSWORD_REACH`, `PMOS_WEB_PASSWORD_CLIENTS` with its prefix bounds, `PMOS_WEB_ADMIN_BIND` with its address check or `PMOS_WEB_ADMIN_ON_PUBLIC_LISTENER`, per the answers), `deploy/compose.yaml` (8772 on `PMOS_WEB_ADMIN_PUBLISH`), `deploy/pmos-admin` (`up --web`), `deploy/preflight.sh` (H-SIGNIN per D2; 8772 in H-EXPOSURE), `docs/runbooks/install.md` (the public nginx example and the public firewall section), `.github/workflows/ci.yml` (`nginx -t` if available), `docs/web-app-running.md`, `docs/password-sign-in.md` | §6 H10 row | Strongest (authentication) | **No** | Yes |
-| H11 | **Where real data may run** (needs D1) | per D1's answer: replaces "fake-data mode on every profile but `spark`" (§3.6) with the rule D1 sets, in `crates/toolserver`, `crates/bots` and `crates/web` (a `PMOS_HOST_PLACE=company|cloud` declaration, passed to them; a data-class ceiling if D1 is "internal only"), `deploy/env.example`, `deploy/pmos-admin`, `deploy/preflight.sh` (H-PROFILE also fails `company` when the metadata probe answers; `host acknowledge H-PROFILE` accepted for `company` only if D1's answer allows it; whether `spark` then takes one is decided in H11's review, and until then it does not), `docs/gateway.md` and the runbooks | per D1's answer | Strongest | **No** | Yes |
-| H7 | **Red-team additions** | `policies/redteam/checklist.md` (P-8, P-9, RT-17 included), `policies/redteam/isolation.sh` (RT-11 to RT-13b; RT-13b's temporary hosts line under a `trap`, no `pmos-admin` override), `policies/redteam/exposure.sh` (new; RT-14, 8772 included), RT-16's Docker-restart and flush steps, wording | `bash -n`; `shellcheck` if CI has it; a dry run that prints the probes without OpenShell | Strongest | Yes (RT-14's lines through 443 follow D2 and D3, and apply only after H10) | Yes to write; runs only on a host |
-| H6 | **Docs and wording** | `docs/runbooks/install.md` (per-profile "Before you start", preflight first, two Stage 3 paths, OpenShell install and lingering), `README.md`, `docs/runbooks/README.md`, `upgrade.md` (runner label `pmos-host`, any architecture; the one-time network re-creation), `backup-restore.md` (encrypted off-host copies), `incidents.md`, `daily.md`, `deploy/compose.yaml`, `deploy/pmos-admin`, `deploy/Dockerfile` comments, `policies/README.md`, `.github/workflows/evals-gate.yml` (label, `PMOS_HOST_DIR` with `PMOS_SPARK_DIR` still read), `docs/toolserver.md:1078`, `docs/gateway.md` wording (ADM-3's meaning kept) | the docs lint, if any; CI's workflow syntax | Lighter | Yes, except the lines that state D1–D3's answers | Yes |
-| — | **Acceptance run on the first host** (§6) | `docs/hosts/<date>-<kind>.md` (new) | the run itself | Operator with the conductor; reviewer checks the record | Yes (fake data, `hosted-test`, the web app off or tunnelled); needs O1 | Needs the host |
-| H5 | **Launch confirmation** | whatever the acceptance run's step 2 showed: `deploy/pmos-admin` (`sandbox` flags if `--from` differs), `deploy/systemd/pmos-worker@.service` (if `sandbox exec` doesn't stay in the foreground, or OpenShell's unit has another name), `deploy/Dockerfile.worker` (if OpenShell maps the user differently), `docs/sandbox-policies.md` | `scripts/test-pmos-admin.sh` (`--dry-run`); `systemd-analyze verify`; E-5 on the host | Medium | Yes | After the acceptance run's step 2 |
-| H8 | **Tier 2, Kubernetes** | a separate spec first | — | Strongest | — | Only if decision O2 says so |
+| H0 | **Sandbox launch and worker fixes** (built; awaiting review) | `deploy/pmos-admin` (`add-bot`, `sandbox`, `pause`, `resume`: name validation, exact-field token lookup, `--from`, the unit instead of `&`, the lingering check), `deploy/systemd/pmos-worker@.service` (new: `systemd-escape`d instance, `%I`, `Restart=on-failure`, `StartLimit*`; `ExecStartPre` added once H1 exists), `deploy/Dockerfile.worker` (`sandbox` account, numeric `USER`), `docs/runbooks/install.md` (the `127.0.0.1` hosts line removed, with a "stop: sandboxes can't reach the services until H2" note; lingering), `docs/sandbox-policies.md` ("Creating a bot's sandbox") | §6 H0 rows | Strongest (shell injection, the sandbox's identity) | Built | Each fix is from OpenShell's public docs and unverified until the acceptance run |
+| H0b | **Security review fixes of `6bb806f`** (built; awaiting review) | as its status note says | `scripts/test-pmos-admin.sh` | Strongest | Built | `provider` and `sandbox stop`/`start` behaviour: acceptance run |
+| H2 | **Pinned addresses and managed host names** | `deploy/compose.yaml` (`ipv4_address` for the three services and the two vLLM services; `ip_range`; bridge name `pmos0`), `deploy/env.example` (`PMOS_NETWORK_IP_RANGE`; `.10` to `.14` listed as reserved), `deploy/pmos-admin` (`host-names apply`/`check`, with no override; the live-network check; the subnet `/24`-or-longer and holds-the-literals checks; `sandbox` refuses on a failed check; `status`), `scripts/test-pmos-admin.sh`, `docs/runbooks/install.md` Stage 4 step 1 | §6 H2 rows | Strongest (it decides what sandboxes reach) | **Yes** | H-1 only |
+| H1 | **Preflight** (after H2: its fixtures use H2's addresses, `ip_range` and managed block) | `deploy/preflight.sh` (new; no profile and no H-PROFILE; H-METADATA and H-EXPOSURE fail on every host; H-NVIDIA with `PMOS_VLLM_IMAGE` for `local`; H-EGRESS; H-PRIVATE with its 80/443 check when acknowledged; H-SIGNIN's pre-H10 refusal), `deploy/test/preflight/**` (fixtures), `scripts/test-preflight.sh` (new), `.github/workflows/ci.yml` (deploy job: parse and run it), `deploy/pmos-admin` (`preflight`, `host-firewall apply/check/remove` with the rules on `pmos0` and `docker0`, the `docker.service` drop-in and the timer, `host acknowledge` for H-PRIVATE only; the stages at `up`, `restore`, `add-bot`, `sandbox`, `resume`; acknowledgements in `status`), `deploy/pmos-metadata-block` (new, the root-owned rule script), `deploy/setup.sh` (run it first, stop on fail), the unit's `ExecStartPre` | §6 H1 rows | Strongest (it decides what may be called supported) | **Yes** | O-* checks are written now, proven in the acceptance run |
+| H4 | **Model sources `local` and `hosted-test`, fake-data mode, no public web app yet, enforced by the services** (after H2: its resolver checks against H2's `ip_range`) | `crates/gateway` (`PMOS_MODEL_SOURCE` with `local` and `hosted-test`; `local` only with `class: production`; the resolver that checks each production name's answer at every connection; `model_source` in `/readyz` and `/v1/pmos/roles`; `/readyz` reporting labels only, its URL-keyed `upstreams` replaced), `crates/toolserver` (fake-data mode from `PMOS_MODEL_SOURCE=hosted-test` only; the refusals; `TEST-CONTENT` and the restricted-file check at start and sync; the `held_real_data` marker; the gateway cross-check at every session open or from a short cache, failing closed), a shared content-check function (in `crates/contract`, beside `Sensitivity` in `model.rs`) used by `crates/toolserver`, `crates/bots` and `crates/web`, and `pmos content check-test` in the `pmos` CLI, `crates/slack` (refuse tokens), `crates/bots` (readiness cross-check, the content check, the marker), `crates/web` (`PMOS_EXPOSURE` required and `public` refused until H10; the test banner; the content check; the marker), `deploy/compose.yaml` and `deploy/compose.evals.yaml` (gateway: `<<: *proxy` under `environment:`, `PMOS_GATEWAY_CLOUD_TEST`, `PMOS_GATEWAY_REMOTE_KEY`, `PMOS_MODEL_SOURCE`, `PMOS_NETWORK_SUBNET`, `PMOS_NETWORK_IP_RANGE`, config path; `PMOS_MODEL_SOURCE` to the other four; `PMOS_CONNECTORS` and `PMOS_EXPOSURE` where §3.6 and §3.8 say; `PMOS_GATEWAY_URL` to the tool server; `PMOS_VLLM_IMAGE` without a default), `deploy/env.example` (the host-settings block of §3.1; the model block under `local`, `PMOS_VLLM_IMAGE` empty), `deploy/setup.sh` (the three settings with their defaults, `--model-source` and `--exposure`; the NVIDIA warning only for `local`), `deploy/pmos-admin` (`up`'s early messages, `sandbox`'s content check, `status` lines), `deploy/gateway.hosted-test.yaml` (new, example hosts only, no key), `scripts/claude-test-stack.sh` (passes `hosted-test`), `docs/gateway.md` (`PMOS_MODEL_SOURCE`, the resolver, which class serves which source) | §6 H4 rows | Strongest (security refusals, cross-crate) | **Yes**: every change refuses more than today; `hosted` does not exist until H12 | No |
+| H3 | **Policy: `allowed_ips` per name and wording** (O6, decided) | `crates/policy/src/lib.rs` (`TOOLSERVER_ADDR`, `GATEWAY_ADDR`, `BOTS_ADDR`; "verify on a real host"), `generate.rs` (emit `allowed_ips`; header wording without "Spark"), `check.rs` (`net-allowed-ips` in `RULES`), `crates/policy/tests/policies.rs` (and the compose-literals test), regenerated `policies/**`, `deploy/pmos-admin` (`up` refuses a subnet without the constants), `docs/sandbox-policies.md` (rule table, "verify on a real host" table), `docs/policy-admin.md` (the fixed list); the web Policy Admin's fixed facts if it lists endpoint fields (`crates/web/src/app/policy.rs`, `crates/policy/src/admin/`) | §6 H3 row; persona tests still show only skill-folder differences | Strongest (cross-crate, POL-2 network change) | **Yes** | Applied on a host after the acceptance run's H-1 |
+| H9 | **Internal route** | `deploy/compose.yaml` (`PMOS_WEB_INTERNAL_BIND`), `deploy/env.example` (`PMOS_WEB_BRIEF_URL` on 8771), `docs/runbooks/install.md` (health and internal routes not forwarded, the body sizes), H-EXPOSURE's 8771 | §6 H9 rows | Medium | **Yes** | No |
+| H10 | **Sign-in and admin routes, as D2 (a) and D3 (b) decided** (after H4 and H9) | `crates/web` (lifts H4's refusal of `public` only together with: `PMOS_WEB_PASSWORD_CLIENTS` with its prefix bounds, required on `public` with password sign-in; dev sign-in refused on `public`; `PMOS_WEB_ADMIN_BIND` required on every host with the web app on, its address check, `/api/admin/*` `404` on 8770), `deploy/compose.yaml` (8772 on `PMOS_WEB_ADMIN_PUBLISH`), `deploy/env.example`, `deploy/pmos-admin` (`up --web`), `deploy/preflight.sh` (H-SIGNIN's and H-ADMIN's rules; 8772 in H-EXPOSURE), `docs/runbooks/install.md` (the public nginx example and the firewall section), `.github/workflows/ci.yml` (`nginx -t` if available), `docs/web-app-running.md`, `docs/password-sign-in.md` | §6 H10 row | Strongest (authentication) | **Yes** (D2, D3 decided) | No; RT-14 after it on a host |
+| H12 | **The hosted model as a production source** (after H4; the approved list ships empty) | `crates/gateway` (`hosted` source; `crates/gateway/approved-hosted.yaml`, compiled in, with its unit test; the `hosted:<label>` upstream form as the one addition to `class: production`; URL normalisation and digest; `PMOS_GATEWAY_HOSTED_KEY_FILE`; the hosted client with no redirects; the hosted resolver rule; the cached `/readyz` probe; `hosted_label` in `/readyz` and `/v1/pmos/roles`; labels in the usage log for `hosted` and `hosted-test`; comments that state ADM-3 rewritten), `crates/toolserver` (`session.open` audit event; `model_source` on every event of a session; `system.model_source` on a change), `crates/bots` (cross-check accepts `hosted`), `crates/evals` and `evals/config.yaml` (a `hosted:<label>` production gateway may count, per §3.6), `deploy/compose.yaml` (`PMOS_GATEWAY_HOSTED_URL`, the `secrets:` entry for the gateway only), `deploy/gateway.hosted.yaml` (new, `hosted:` upstream with a placeholder label, no URL), `deploy/env.example`, `deploy/setup.sh` (creates `deploy/secrets/` and the empty key file), `deploy/pmos-admin` (`hosted-key set` from standard input; the mode checks; `backup` leaves the key out; `up` checks `NO_PROXY` under `hosted`; `status` shows the source, the label and its last change), `.gitignore` (`deploy/secrets/`), `docs/model-providers/README.md` (new: what a record must hold, §3.9), `docs/gateway.md`, `docs/audit-retention.md` (the new field) | §6 H12 row | Strongest (the loosened data rule, cross-crate) | **Yes**: with an empty list no endpoint can serve `hosted`, so nothing real can flow until H13 | No |
+| H13 | **The owner's hosted model approved** | `crates/gateway/approved-hosted.yaml` (the first entry: label, digest, model ids, record), `docs/model-providers/<label>.md` (the owner's approval, the data-processing agreement and the retention terms, each confirmed by the owner), `evals/config.yaml` if the production role models move to `deploy/gateway.hosted.yaml` | the list's unit test; RT-19 on a host | Medium (data entry; the reviewer checks the record) | **No**: waits on the owner's approval record, the DPA and retention confirmations, and the CODEOWNERS line and branch protection (§3.9) | Real data also needs Gate 1 |
+| H7 | **Red-team additions** (after H3, H10, H12) | `policies/redteam/checklist.md` (P-0, P-7 to P-9, RT-11 to RT-19, E-5; "Run it on the host"), `policies/redteam/isolation.sh` (RT-11 to RT-13b and RT-18; RT-13b's temporary hosts line under a `trap`, no `pmos-admin` override; RT-18's key search printing only found or not found), `policies/redteam/exposure.sh` (new; RT-14, 8772 included), RT-16's Docker-restart and flush steps, RT-19 as a script step that runs only when an approved entry exists | `bash -n`; `shellcheck` if CI has it; a dry run that prints the probes without OpenShell | Strongest | **Yes** | Runs only on a host |
+| H6 | **Docs and wording, and the Spark inventory** (after the slices it describes) | every file in the inventory below (§7.1), plus the docs §3.9 lists as stating the old rule | the docs lint, if any; CI's workflow syntax; `git grep -i spark` afterwards shows only the rows the inventory keeps | Lighter (a strongest-model pass on `docs/gateway.md`, `docs/implementation-plan.md` and the install runbook, which state security rules) | **Yes** | No |
+| — | **Acceptance run on the first host** (O1: Ubuntu 24.04 amd64 VM, no GPU, fake data, `hosted-test`) | `docs/hosts/<date>-ubuntu-24.04-amd64-vm.md` (new) | the run itself (§6) | Operator with the conductor; reviewer checks the record | Ready once H0, H0b, H2, H1, H4, H3, H9 and H7 are merged (H10 if the web app is wanted) | **Needs the host** |
+| H5 | **Launch confirmation** | whatever the acceptance run's step 2 showed: `deploy/pmos-admin` (`sandbox` flags if `--from` differs), `deploy/systemd/pmos-worker@.service` (if `sandbox exec` doesn't stay in the foreground, or OpenShell's unit has another name), `deploy/Dockerfile.worker` (if OpenShell maps the user differently), `docs/sandbox-policies.md` | `scripts/test-pmos-admin.sh` (`--dry-run`); `systemd-analyze verify`; E-5 on the host | Medium | After the acceptance run's step 2 | Yes |
+| — | **Acceptance run with `local`** on a GPU host | `docs/hosts/<date>-<kind>.md` | the run with `--model-source local` | as above | Only if the owner names a GPU host (§8) | Needs that host |
+| H8 | **Tier 2, Kubernetes** | a separate spec first | — | Strongest | Not for the pilot (O2) | — |
+| ~~H11~~ | **Dropped.** "Where real data may run" waited on D1 and would have added `PMOS_HOST_PLACE` and H-PROFILE's `company` case. D1 is answered with no host-based rule (§3.6), so there is nothing left for it to build; the hosted part of D1's answer is H12 and H13 | — | — | — | — | — |
 
 **Order.**
 
-1. **H0** first: it fixes bugs that affect the Spark today, and later slices build on its
-   `sandbox` function and unit.
-2. **H2** next. It was third; it moves up because H1's fixtures test H-SUBNET's `ip_range` and
-   H-NAMES against the pinned addresses and managed block that H2 brings, and H4's resolver checks
-   answers against H2's `ip_range` and vLLM addresses.
-3. **H1 and H4 in parallel** after H2 (H1 is shell and fixtures; H4 is mostly the crates; both
-   touch `deploy/pmos-admin` and H4 also `compose.yaml`: the conductor merges H1 first).
+1. **H0 and H0b**: built; the reviewer checks them, then the conductor merges them.
+2. **H2** next: H1's fixtures and H4's resolver depend on its addresses and `ip_range`.
+3. **H1, H4 and H3 in parallel** after H2 (H1 is shell and fixtures; H4 is mostly the crates; H3
+   is the policy crate; H1 and H4 both touch `deploy/pmos-admin` and H4 also `compose.yaml`: the
+   conductor merges H1 first, then H3, then H4).
 4. **H9** after H4 (both edit `compose.yaml` and the web app's settings).
-5. **H3** once the owner has answered O6, built in parallel with H1, H4 or H9 and merged after H2
-   (its `up` refusal compares against H2's literals).
-6. **H10** once the owner has answered D2 and D3; **H11** once the owner has answered D1.
-7. **H7 and H6** after H2, H3 and H9 (and H10 and H11 for the lines that describe them), since
-   they describe them.
-8. **The acceptance run** (once O1 names the host), then **H5**.
+5. **H10 and H12 in parallel** after H4 (and H9 for H10). H10 is `crates/web`; H12 is
+   `crates/gateway`, `crates/toolserver` and `crates/evals`; both touch `deploy/compose.yaml`,
+   `deploy/env.example` and `deploy/pmos-admin`: the conductor merges H10 first.
+6. **H7** after H3, H10 and H12. **H6** after H7, in parallel with the acceptance run.
+7. **The acceptance run**, then **H5**.
+8. **H13** whenever the owner's conditions are met; it can come before or after the acceptance
+   run, and needs no host to merge.
 
-**Safe to build now, with no owner decision at all:** H2, H1, H4 and H9 (H0 is built and awaiting
-review), and H7 and H6 except the lines that state an answer (RT-14's lines through 443; D1 to D3
-in the runbooks). Each of these only refuses more than today or moves no boundary: H4 in
-particular makes fake-data mode the default off the Spark and refuses a public web app, so no open
-decision is answered by default. **H3** needs O6, **H10** D2 and D3, **H11** D1, **H8** O2, and
-the acceptance run O1 (which host) as well as the host itself.
+**Buildable now, with no owner decision:** H2, H1, H4, H3, H9, H10, H12, H7 and H6 (H0 and H0b are
+built and awaiting review). **Needs the owner:** H13 only (the approval record, the DPA and
+retention confirmations, the CODEOWNERS line and branch protection). **Needs a real host:** the
+acceptance run and H5 (O1 names the kind: an Ubuntu 24.04 amd64 VM without a GPU); a run with
+`local` needs a GPU host the owner names. No fix in H0 counts as verified until the acceptance
+run.
 
-**Before the owner answers D1 to D3:** H0, H2, H1, H4, H9, H3 (with O6), H7 and H6 (except the
-answer-specific lines), and the acceptance run (with O1, the web app off or tunnelled, fake data).
-**Before a real host exists:** every slice can be built and its PM OS side tested; only the
-acceptance run and H5 need the host, and no fix in H0 counts as verified until then.
+Each batch goes to the reviewer session as the security gate, as usual. **H12 must not merge
+before the reviewer has checked it**, and H13 not before the reviewer has read the record.
 
-Each batch goes to the reviewer session as the security gate, as usual.
+### 7.1 H6's inventory: every "spark" in the repo
 
-## 8. Open decisions for the owner
+Made with `git grep -i -o spark` at `57e2e72`, case-insensitive, over every tracked file
+(`target/` and `node_modules/` are not tracked, so they are excluded). **403 occurrences in 74
+files.** Counts are occurrences. "Rename" means a generic host term ("the host", "PM OS's host",
+"a GPU host", "verify on a real host"); "rewrite" means the sentence states a rule or a step that
+changes; "keep" means the text is a dated record or not about the Spark.
 
-Neither the reviewer nor the conductor may answer these.
+| Area | Occurrences (files) | Files and counts | Action |
+| --- | --- | --- | --- |
+| This spec | 148 (1) | `docs/openshell-any-host-spec.md` | **Keep.** The record of the Spark-era design, the reviews (§10, §11) and the change of direction (§12); its current sections name the Spark only to say it is not a target |
+| Docs that describe current behaviour or rules | 81 (15) | `docs/implementation-plan.md` 23, `docs/sandbox-policies.md` 14, `docs/evals.md` 13, `docs/gateway.md` 6, `docs/toolserver.md` 4, `docs/web-app-running.md` 3, `docs/bots-runtime.md` 3, `docs/bot-decisions.md` 3, `docs/user-assertion.md` 2, `docs/testing-with-claude.md` 2, `docs/password-sign-in.md` 2, `docs/docs-server.md` 2, `docs/console.md` 2, `docs/policy-admin.md` 1, `docs/entra-sign-in.md` 1 | **Rewrite** `implementation-plan.md` (`:4`, ADM-3 at `:116`, the metric at `:118`, Gate 1 "Needs the Spark", Phase 3's "a second Spark" becomes "a second model server"; the status rows' "on the Spark" renamed), `gateway.md` (ADM-3, "Allowed upstream hosts", the usage log's "zero by construction", per §3.6 and §3.9), `sandbox-policies.md` (the "Verify on the Spark" table becomes "Verify on a real host", the host acceptance list of §6; "Apply on the Spark" becomes "Apply on the host"), `evals.md` (the eval gate's runner `pmos-host`; "the Spark's gateway" becomes "the production gateway"; which runs count under `hosted`), and `bot-decisions.md` (bot decision D2 "long-lived services on the Spark" keeps its meaning as "on PM OS's host", with a dated note of the owner's change). **Rename** in the other ten |
+| Specs and research of record | 23 (7) | `docs/security-fixes-spec.md` 7, `docs/research/self-improvement-loops.md` 5, `docs/bot-marketplace-spec.md` 4, `docs/bot-runtime-spec.md` 3, `docs/improvement-loop-spec.md` 2, `docs/user-database-spec.md` 1, `docs/onboarding-spec.md` 1 | **Keep**: dated designs and a research report; rewriting them would misstate what was decided when. Where a living doc cites one of them for a Spark fact, the living doc carries the correction |
+| Runbooks | 48 (8) | `docs/runbooks/upgrade.md` 18, `install.md` 12, `backup-restore.md` 6, `README.md` 5, `quality.md` 3, `incidents.md` 2, `users.md` 1, `daily.md` 1 | **Rewrite** `install.md` ("Before you start" for any host, preflight first; DGX OS and "the NVIDIA container toolkit (both come with DGX OS)" become "for `local` only: an NVIDIA GPU and the NVIDIA container toolkit"; Stage 3 in three paths, `local` with a chosen `PMOS_VLLM_IMAGE`, `hosted` after H13, `hosted-test`; the red-team and console lines), `upgrade.md` ("Registering the Spark CI runner" becomes "Registering the eval-gate runner": any architecture, label `pmos-host`, name `pmos-host-1`, `PMOS_HOST_DIR`), `README.md` ("one DGX Spark" becomes "one Linux host"; ports "on the host"), `incidents.md` ("The Spark is gone" becomes "The host is gone"). **Rename** in `backup-restore.md`, `quality.md`, `users.md`, `daily.md` (and "a second Spark" becomes "a second model server") |
+| Top level | 16 (4) | `README.md` 5, `CLAUDE.md` 5, `CHANGELOG.md` 5, `.gitignore` 1 | **Rewrite** `README.md` (`:5` "runs on the team's DGX Spark with open-weight models", `:67`, `:69`, `:86` "Run it on the Spark", `:112`). **Keep** `CLAUDE.md` (the owner's requirements; the conductor updates it, and it already records the change) and `CHANGELOG.md` (history; H6 adds an entry for the change). **Rename** the `.gitignore` comment |
+| `deploy/` | 15 (6) | `compose.yaml` 4, `pmos-admin` 3, `gateway.yaml` 3, `env.example` 3, `setup.sh` 1, `Dockerfile` 1 | **Rewrite** the model comments in `compose.yaml` (`:368`) and `env.example` ("Models (verify on the Spark)") per §3.6, and `gateway.yaml`'s "the Spark's own gateway" (`class: production` is the deployment's own gateway, `local` or `hosted`). **Rename** the rest ("PM OS on one host", "this host's outbound proxy", "built on the host, for its own architecture", the runner comment at `pmos-admin:82-83`) |
+| `config/` | 4 (2) | `gateway.yaml` 3, `gateway.claude-test.yaml` 1 | **Rewrite** `gateway.yaml`'s "prompts never leave the Spark" (`:4-5`, ADM-3); **rename** the other |
+| `.github/workflows/` | 10 (2) | `evals-gate.yml` 9, `ci.yml` 1 | **Rewrite** `evals-gate.yml`: runner labels `self-hosted, pmos-host`, `PMOS_HOST_DIR` (default `/opt/pmos`), job name "Eval gate (host)". `PMOS_SPARK_DIR` is **deleted**, not kept as a fallback: no runner was ever registered, so nothing reads it. **Rename** in `ci.yml` |
+| Crates, source | 25 (12) | `crates/gateway/src/config.rs` 7 (3 of them in its test module), `crates/policy/src/lib.rs` 5, `crates/gateway/src/lib.rs` 2, `crates/policy/src/generate.rs` 2, `crates/evals/src/report.rs` 2, `crates/gateway/src/usage.rs` 1, `crates/gateway/src/anthropic.rs` 1, `crates/toolserver/src/content_sync.rs` 1, `crates/slack/src/socket.rs` 1, `crates/contract/src/model.rs` 1, `crates/console/src/config.rs` 1, `crates/console/src/auth.rs` 1 | **Rewrite in the slice that changes the rule:** the gateway's ADM-3 comments (`lib.rs:2-6`, `config.rs:265-267`, `:673`, `:693`, `:814`, `usage.rs:3`) in H12; `policy/src/lib.rs` and `generate.rs` (generated headers) in H3, which regenerates `policies/`. **Rename** the test `refuses_anything_off_the_spark` (`config.rs:918`) to `refuses_non_local_upstreams_outside_testing` and its `spark.corp.example` data to `models.corp.example`, in H12. **Rename** the other comments in H6 (`model.rs:253` "Platform owner: runs the Spark" becomes "runs PM OS's host") |
+| Crates, tests | 8 (1) | `crates/gateway/tests/limits.rs` 8 | **Rename** in H12: `spark.corp.example` becomes `models.corp.example`; "the Spark's gateway is the production one" becomes "the deployment's gateway is the production one". The tests' assertions don't change |
+| `policies/` | 11 (6) | `README.md` 4, `redteam/checklist.md` 2, `redteam/isolation.sh` 2, `bots/docs.yaml` 1, `providers/pmos-gateway.yaml` 1, `providers/pmos-worker.yaml` 1 | **Rewrite** `redteam/*` in H7 ("Run it on the host, never on a machine shared with other work"; P-1's DGX OS kernel line becomes P-0). **Regenerated** by H3: the three generated files. **Rename** in `README.md` ("Applying on the host") |
+| `evals/config.yaml` | 1 (1) | `:76`, a quote of the implementation plan's "a second Spark" | **Rewrite** with the plan's new wording, in the same commit |
+| `content/` | 2 (1) | `content/context/decisions/2026-10-product-agent-platform.md` | **Not changed by H6.** The team's platform decision is content the owner's team owns; amending it goes through the content admin flow. Flagged to the owner (§8) |
+| `web/` | 8 (7) | `Palette.tsx`, `bits.tsx`, `icons.tsx`, `DraftPage.tsx` 2, `Home.tsx`, `Thread.tsx`, `admin/Content.tsx` | **Keep.** Every hit is the icon name `sparkle`; no UI text names the Spark |
+| Password list | 3 (1) | `crates/toolserver/data/common-passwords.txt` | **Keep.** Common passwords that contain the letters (data, not wording) |
+
+**Summary:** 148 kept in this spec, 23 kept in dated specs and research, 10 kept in `CLAUDE.md`
+and `CHANGELOG.md`, 2 left to the owner in content, 11 false positives (8 `sparkle`, 3 passwords);
+the other **209** are renamed, rewritten, regenerated or deleted, in H3 (7 in the policy crate,
+3 in generated files), H7 (4), H12 (gateway: 10 in `config.rs`, `lib.rs`, `usage.rs` and 8 in
+`limits.rs`) and H6 (the rest).
+
+## 8. Decisions for the owner
+
+### 8.1 Decided by the owner, 2026-11-22
+
+Neither the reviewer nor the conductor answered these. The owner gave the change of direction
+("Deploy on spark scrap that idea I want to make it platform agnostic") and then accepted every
+recommendation the conductor put ("Let's go with your recommendation"), as CLAUDE.md item c
+records. Each entry gives the answer and its consequences in this spec.
+
+1. **The Spark as a target: dropped.** PM OS runs on any suitable Linux host with OpenShell.
+   *Consequences:* no `PMOS_HOST_PROFILE`, no H-PROFILE, no Spark-only defaults (§3.1, §3.2); Tier
+   1 is the only target (§4); every rule that told a Spark from a cloud VM is replaced by the one
+   rule for every host (H-METADATA and H-EXPOSURE fail everywhere, §3.2; the threat table, §5); the
+   wording slice H6 carries the inventory (§7.1).
+2. **D1. Where real data may be processed: both a hosted model and a local model on a GPU host
+   the owner controls.** The hosted model is the owner's connected provider, the same model used
+   for the eval runs (an OpenAI-compatible endpoint). This **replaces ADM-3** ("prompts never
+   leave the host"; restricted data only on the Spark's local models). *Consequences:*
+   `PMOS_MODEL_SOURCE` gains `hosted`, served by a `class: production` gateway only from an
+   owner-approved, compiled, CODEOWNERS-reviewed list (§3.6, H12); real data flows to it only after
+   the conditions of §3.9 (H13); fake-data mode becomes `hosted-test` alone; H11 is dropped; the
+   earlier answers (a), (b) and (c) of D1, which asked about cloud disks rather than hosted
+   models, are withdrawn, and with them decision O4 ("keep ADM-3"). All data classes may reach the
+   hosted model; no data-class ceiling is designed (§3.9).
+3. **D2. Sign-in on an internet-facing host: (a).** Microsoft (Entra) sign-in only; password
+   sign-in only from a VPN or an allow-listed range, with the bounds in D2's text (every entry no
+   shorter than `/16` for IPv4 or `/48` for IPv6; `0.0.0.0/0`, `::/0` and `::ffff:0:0/96` refused).
+   *Consequences:* H10 is buildable now; `PMOS_WEB_PASSWORD_CLIENTS` is required on `public` with
+   password sign-in, and `PMOS_WEB_PASSWORD_REACH` is not added (§3.8); PMs without Entra use the
+   VPN or an allow-listed range; until the owner's Entra app registration exists, a public host
+   signs in nobody outside the allow-list.
+4. **D3. Admin routes on a public listener: (b), a separate admin-only listener.**
+   *Consequences:* H10 adds `PMOS_WEB_ADMIN_BIND` (8772), published only on loopback or a private
+   address; `/api/admin/*` answers `404` on the browser-facing listener; this spec applies it on
+   **every** host, not only `public` (§3.8; the reviewer should confirm, §12);
+   `PMOS_WEB_ADMIN_ON_PUBLIC_LISTENER` is not added; the accepted limit "a broken-into web backend
+   can act as any PM" remains for the PM routes.
+5. **O1. The first host to verify on: an Ubuntu 24.04 x86 (amd64) virtual machine without a GPU,
+   with fake data.** *Consequences:* the acceptance run (§6) uses `hosted-test` with the owner's
+   hosted model as a test endpoint; it verifies that host kind only; `local`, arm64 and `hosted`
+   with real data need runs of their own.
+6. **O6. Each service name pinned to its own `/32` in the sandbox policy: yes.** *Consequences:*
+   H3 is buildable now; RT-13b's expected result no longer depends on it (§5).
+7. **Earlier recommendations, accepted as they stand:**
+   - **O2.** No Kubernetes for the pilot: H8 stays a later spec.
+   - **O3.** Local models on NVIDIA GPUs (any, a Spark included) are offered as **"designed for;
+     not verified"** until an acceptance run with `local` passes on such a host. `PMOS_VLLM_IMAGE`
+     has no default (§3.6).
+   - **O5.** The web app stays on the host behind a reverse proxy, not on Vercel.
+   - **O7.** The console is never on a public listener.
+   - **O8.** systemd user units supervise the workers (§3.7, built in H0).
+   - **O4** is withdrawn by D1's answer (above).
+
+### 8.2 Still open for the owner
+
+Nothing blocks a slice except H13 and the host runs. What remains:
+
+1. **The hosted model's approval record and conditions (H13):** the owner's recorded approval of
+   the provider and model, and the owner's confirmation of the data-processing agreement and the
+   retention terms (§3.9). This spec lists them as conditions; it states none as fact.
+2. **The CODEOWNERS line and branch protection** for `crates/gateway/approved-hosted.yaml` and
+   `docs/model-providers/` (already waiting on the owner for `policies/README.md`'s lines).
+3. **Which GPU host, if any,** for a run with `local`. None is needed for the pilot if the hosted
+   model serves it.
+4. **The first host itself:** an operator with an Ubuntu 24.04 amd64 VM on a cloud or server the
+   company has (O1 names the kind, not the account).
+5. **Not new, but now on the path to a public host:** the Entra app registration (CLAUDE.md,
+   "Waiting on the owner"), without which a public host signs in only allow-listed password users.
+6. **The team's platform decision** (`content/context/decisions/2026-10-product-agent-platform.md`)
+   still says the team runs its agents on the DGX Spark. Amending it is the owner's team's
+   content, not this spec's.
+7. **Optional, if the owner wants it later:** a data-class ceiling for the hosted model, or a
+   check of a provider's confidential-computing attestation (§3.9). Neither is designed.
+
+### 8.3 The decisions as they were put (record)
+
+The text below is the earlier revision's list, kept so the reviewer can see what was answered.
 
 1. **O1. The first real host to verify on.** Recommendation: **an Ubuntu 24.04 LTS amd64 VM**
-   with Docker Engine 28+, no GPU, on whichever cloud or server the company already has an account
-   on, run as a closed test with fake data and `hosted-test`. Amd64 because the Spark is arm64, so
-   the two runs together cover both architectures; no GPU because that is the case the generic
-   path adds. Then the same run on the Spark.
-2. **O2. Tier 2 (Kubernetes) for the pilot?** Recommendation: **no.** A 20-PM pilot fits one host
-   (the gateway's queue, not the host, is the limit), and Kubernetes is a second deployment kit
-   (§4). Revisit after the pilot if a second host is needed.
+   with Docker Engine 28+, no GPU, run as a closed test with fake data and `hosted-test`.
+2. **O2. Tier 2 (Kubernetes) for the pilot?** Recommendation: **no.**
 3. **O3. Must the local-model path work off the Spark, on other NVIDIA GPUs?** Recommendation:
-   **not as a verified path for now.** The Compose services would run on any NVIDIA host with the
-   container toolkit, but the models and memory shares are sized for the Spark's GB10, and the
-   vLLM image's other-architecture build is unverified. Offer it as "designed for; not verified"
-   until someone runs the acceptance run on such a host with `local`. Whether such a host may hold
-   real data is D1.
-4. **O4. A hosted model for real work on a host without a GPU?** Today ADM-3 says no: prompts
-   never leave the host. Recommendation: **keep ADM-3** and keep `hosted-test` fake-data only,
-   enforced (§3.6), until requirement i is planned; decide ADM-3 together with requirement i
-   (which providers, which data classes may go to which provider, where the keys live).
-5. **O5. The web front end on Vercel, with this back end?** The repo has no Vercel deployment:
-   `pmos-web` serves the built app and is also its back end, holding its runtime and tool-server
-   tokens and the keys that sign user assertions. Recommendation: **keep the web app on the PM OS
-   host behind the reverse proxy.** A Vercel front end would need `pmos-web`'s API reachable from
-   the internet with cross-site sessions, and would be a separate security review.
-6. **O6. Pin each of the three names to its own address in the policy (`allowed_ips`, one `/32`
-   each)?** Recommendation: **yes** (§3.5). It narrows every policy, fails closed on a wrong or
-   swapped name, and costs a code change for the rare site that must move the subnet.
-7. **O7. The console on a public host.** Recommendation: **never on a public listener**; reachable
-   over a private network, VPN or SSH tunnel only, still behind its SSO proxy.
-8. **O8. Worker supervision with systemd.** The reviewer confirmed that the unsupervised worker is
-   a bug on the Spark today, against bot decision D2 ("After a reboot, in-flight tasks resume"),
-   which the owner already decided. So H0 builds the systemd unit without waiting. What stays open
-   is only whether the owner prefers another supervisor. Recommendation: **systemd user units**
-   (§3.7), since OpenShell's own gateway is one.
-9. **D1. May restricted data be stored or processed at a cloud provider at all?** What the repo
-   records of the PRD: it "defines an internal agent workspace for the product team, running on one
-   DGX Spark" (`docs/implementation-plan.md:4`), with "local vLLM routes only (ADM-3)" (`:116`) and
-   a "Restricted data sent off the Spark" metric (`:118`); the gateway "keeps prompts on the
-   Spark" (`docs/gateway.md:7-8`) and counts that metric as "zero by construction" (`:193`). The
-   PRD's own text is not in this repository, so its exact line could not be cited. This spec's
-   first version allowed real data with `local` models on any host, a cloud VM with a GPU
-   included: the prompts stay on that VM, but the VM, its disk, snapshots and backups are at the
-   provider.
-   - **(a) No: real data only on hosts the company owns** (the Spark, on-prem servers); cloud
-     VMs run `hosted-test` with fake data only. Consequence: the generic implementation serves
-     cloud hosts for testing only; the pilot stays on the Spark or an on-prem server; H11
-     enforces it through a `PMOS_HOST_PLACE` declaration that the services read, which code
-     can't prove (H-PROFILE fails a host declared `company` where the metadata probe answers,
-     unless acknowledged and shown in `status`). An on-prem server that isn't a Spark can hold
-     real data only once H11 is built.
-   - **(b) Internal data yes, restricted no.** A cloud VM may run `local` models with live
-     connectors, but the tool server caps every session at `internal` there. Consequence: 45 of
-     the 46 seed skills are `data-class: "restricted"` (all but `docs`), so on such a host they
-     lose every restricted
-     source; the daily brief (`docs/daily-brief.md`, a `restricted` skill) is degraded; and the
-     metric keeps its meaning.
-   - **(c) Yes, all classes, under conditions** (the company's own cloud account, disk and
-     backup encryption, the provider's data-processing terms, Security and Legal's sign-off).
-     Consequence: the metric's "off the Spark" becomes "off PM OS's host"; the cloud account's
-     administrators become people who can read restricted data; Legal and Security must sign off
-     before the pilot uses it.
-   **Recommendation: (a) for now**, the narrowest and the only one that keeps the PRD's metric as
-   written; revisit with Security and Legal, as (b) or (c), if the pilot needs a cloud host.
-   **Until D1 is answered**, the services behave more narrowly than (a): fake-data mode on every
-   profile but `spark` (§3.6, H4), so no answer is taken by default.
-10. **D2. What must a `PMOS_EXPOSURE=public` host require for sign-in?** The reviewer rated the
-    password sign-in findings Medium for an internal network (a flood can block new sign-ins; one
-    IPv6 /48 gets about 86,400 guesses a day at one account) and would rate them higher on the
-    internet.
-    - **(a) Microsoft (Entra) sign-in only on a public host; password sign-in only behind a VPN
-      or an address allow-list** (the reviewer's recommendation). Consequence: PMs without Entra
-      need the VPN; H10 builds the refusal and the allow-list (§3.8). The allow-list's bounds,
-      which this answer accepts: every entry in `PMOS_WEB_PASSWORD_CLIENTS` is a CIDR no shorter
-      than `/16` for IPv4 and no shorter than `/48` for IPv6, and `pmos-web` refuses to start on
-      `0.0.0.0/0`, `::/0`, `::ffff:0:0/96` or any shorter prefix, naming the entry. A site whose
-      VPN hands out a wider range (say a `/12`) would need H10's constant changed under review.
-    - **(b) The web app only behind a VPN** on a public host, any sign-in. Consequence: the host
-      is not really public for browsers; the proxy listens on the VPN address only; H-EXPOSURE
-      checks that instead.
-    - **(c) Password sign-in on the internet as built.** Consequence: the Medium findings rise
-      and must be re-rated and fixed before the pilot (per-network limits that hold against a
-      /48, a captcha or similar on new sign-ins).
-    **Recommendation: (a)**, with (b) as the fallback if the company has no Entra tenant for some
-    PMs. **Until D2 is answered**, `pmos-web` refuses `PMOS_EXPOSURE=public` (§3.8, H4), so (c) is
-    never the default.
-11. **D3. Is the accepted limit "a broken-into web backend can act as any PM" still acceptable on
-    a public listener, where the admin routes share that listener?**
-    - **(a) Accept it, admin routes served publicly.** Consequence: the routes that change users,
-      content and policy are reachable from the internet behind sign-in only; the only code is
-      H10's `PMOS_WEB_ADMIN_ON_PUBLIC_LISTENER=owner-accepted`, so the acceptance is written down
-      on each host (§3.8).
-    - **(b) Keep the limit, but take `/api/admin/*` off the public listener** (`PMOS_WEB_ADMIN_BIND`,
-      §3.8). Consequence: admins use the admin screens over the VPN or an SSH tunnel; H10 adds the
-      listener; the limit itself remains for the PM routes.
-    - **(c) Not acceptable on a public host at all.** Consequence: no `public` web app until the
-      web backend is split so that a break-in can't sign as any PM (a design of its own, not in
-      this spec); D2's (b) becomes the only way to serve PMs from a cloud host.
-    **Recommendation: (b).** Until D3 is answered, no admin route is served on a public host,
-    because `pmos-web` refuses `public` altogether (§3.8, H4).
+   **not as a verified path for now**: "designed for; not verified".
+4. **O4. A hosted model for real work on a host without a GPU?** Recommendation then: **keep
+   ADM-3**. Withdrawn by D1's answer.
+5. **O5. The web front end on Vercel?** Recommendation: **keep the web app on the PM OS host
+   behind the reverse proxy.**
+6. **O6. Pin each of the three names to its own address (`allowed_ips`, one `/32` each)?**
+   Recommendation: **yes**.
+7. **O7. The console on a public host.** Recommendation: **never on a public listener.**
+8. **O8. Worker supervision with systemd.** Recommendation: **systemd user units.**
+9. **D1. May restricted data be stored or processed at a cloud provider at all?** Answers (a) real
+   data only on hosts the company owns, (b) internal yes and restricted no, (c) all classes under
+   conditions; recommendation then (a). The owner's answer, put to them as "where real data may
+   be processed now that there is no Spark", is 8.1 item 2.
+10. **D2. What must a `PMOS_EXPOSURE=public` host require for sign-in?** (a) Entra only, password
+    from a VPN or allow-list; (b) the web app only behind a VPN; (c) password sign-in on the
+    internet as built. Recommendation: (a).
+11. **D3. The accepted limit on a public listener.** (a) accept it, admin routes served
+    publicly; (b) keep the limit, admin routes on their own listener; (c) not acceptable on a
+    public host at all. Recommendation: (b).
 
 ## 9. What this spec does not cover
 
-- **Requirement i** (model providers, switching and fallback, OpenShell holding provider keys for
-  the gateway): not started; the owner's go-ahead is pending. This spec only keeps the hosted
-  model testing-only and notes where i will change that.
+- **Requirement i** (many providers, switching and automatic fallback, like OpenRouter; OpenShell
+  holding provider keys for the gateway): not started; the owner's go-ahead is pending. This spec
+  designs only one approved hosted model as a production source (§3.6); a second provider, a
+  second label in one gateway, a mix of local and hosted roles, and any fallback are requirement
+  i's.
+- **A data-class ceiling for the hosted model**, and **checking a provider's confidential-computing
+  attestation** (§3.9): not designed; possible later slices if the owner asks.
+- **A hosted provider reached over a private endpoint** (an address inside the VPC): the hosted
+  resolver refuses private answers (§3.6); allowing one is a reviewed change of its own.
 - **The OpenShell policy prover in Policy Admin:** a separate plan awaiting approval.
 - **OpenShell's sandbox allow and deny decisions in the audit log:** a separate plan awaiting
   approval. The red-team script still reads OpenShell's logs directly.
 - **MCP servers in place of connectors** (scope item g): a separate plan awaiting approval.
 - **Multi-host PM OS** (the stack split across machines) and **high availability.**
-- **A gateway using a model server on another machine**, for example a second Spark, which
-  `docs/implementation-plan.md:204` (Phase 3) plans "if p90 queue time passes 2 minutes". With the
-  `local-hosts` exception removed (§3.6), a `class: production` gateway reaches only vLLM
-  containers pinned on its own host's `pmos` network, so a second machine is out of scope here
-  and needs its own design (how the gateway reaches it, how that link is authenticated and
-  pinned, and what ADM-3 means across two hosts).
+- **A gateway using a model server on another machine**, which `docs/implementation-plan.md:204`
+  (Phase 3) plans as "a second Spark if p90 queue time passes 2 minutes". With the `local-hosts`
+  exception removed (§3.6), a `class: production` gateway reaches only model servers pinned on
+  its own host's `pmos` network, or the approved hosted model; a second machine of PM OS's own
+  needs its own design (how the gateway reaches it, how that link is authenticated and pinned).
 - **Per-cloud automation** (Terraform, cloud images, managed Postgres, managed load balancers).
+- **Other GPU vendors** for `local`.
 - **Changing the platform decision in the content repo**
-  (`content/context/decisions/2026-10-product-agent-platform.md`), which names the Spark.
-- **Splitting the web backend** so a break-in can't sign as any PM (D3's answer (c)).
+  (`content/context/decisions/2026-10-product-agent-platform.md`), which names the Spark (§8.2).
+- **Splitting the web backend** so a break-in can't sign as any PM (D3's former answer (c)).
 
 ## 10. Review of 2026-11-22
 
@@ -1455,3 +1714,121 @@ The reviewer accepted the second revision with five changes, written in here:
    H-PRIVATE run only from `pmos-admin` and the unit's `ExecStartPre`, so `docker compose up`
    skips them and the services see only the declaration: a stated limit in §5's table, with
    RT-17 proving the services still refuse live connectors on `linux` however they are started.
+
+## 12. Change of direction, 2026-11-22
+
+**What the owner decided.** "Deploy on spark scrap that idea I want to make it platform
+agnostic": the DGX Spark is no longer a deployment target, and PM OS runs on any suitable Linux
+host with OpenShell. The owner then accepted every recommendation the conductor put ("Let's go
+with your recommendation"): real data may be processed by both the owner's hosted model and a
+local model on a GPU host the owner controls (D1, replacing ADM-3); Microsoft sign-in only on an
+internet-facing host, password sign-in only from a VPN or an allow-listed range (D2 (a)); the
+admin routes on a separate admin-only listener (D3 (b)); each service name pinned to its own
+`/32` (O6); the first host an Ubuntu 24.04 amd64 VM without a GPU, with fake data (O1); and
+O2, O3, O5, O7 and O8 as recommended (§8.1).
+
+**What changed in this spec.**
+
+1. **No Spark target.** `PMOS_HOST_PROFILE` and H-PROFILE are removed, not replaced by a generic
+   value; three host settings remain (`PMOS_MODEL_SOURCE`, `PMOS_EXPOSURE`,
+   `PMOS_OPENSHELL_DRIVER`), each defaulting to the value that allows less (§3.1). Where a rule
+   only told a Spark from a cloud VM, the stricter rule now holds on every host: H-METADATA and
+   H-EXPOSURE fail everywhere; only H-PRIVATE takes an acknowledgement (§3.2); the threat table
+   states one rule per threat (§5); Tier 1 is the only target (§4).
+2. **Model sources are production options** (§3.6): `local` (a model server on this host,
+   `PMOS_VLLM_IMAGE` now required, no NVIDIA default), `hosted` (new: the owner's hosted model
+   from a compiled, CODEOWNERS-reviewed approved list, the endpoint pinned by a digest of its URL,
+   the key in one file mounted only into the gateway, no redirects, the hosted host's DNS answers
+   checked, labels only in `/readyz`, `/v1/pmos/roles`, the usage log and reports), and
+   `hosted-test` (the separate testing-only path, fake data only). Requirement i is not designed.
+3. **Data handling** (§3.9): what leaves the host under `hosted` (every prompt, restricted content
+   included), the conditions before real data flows (the owner's recorded approval, the DPA and
+   retention terms confirmed by the owner, CODEOWNERS, any TLS-intercepting proxy acknowledged,
+   Gate 1), the audit log's new `model_source` per session, and what PM OS does not verify
+   (provider behaviour, any confidential-computing attestation, that the URL is the approved
+   provider, that a GPU host is the owner's).
+4. **D2, D3, O1 and O6 applied** (§3.5, §3.8, §6, §8.1); H3 and H10 are buildable now; **H11 is
+   dropped**: with D1 answered by no host-based rule, there is nothing left for it. `PMOS_EXPOSURE`
+   now gates only who can reach the sign-in page: the D2 password allow-list, development sign-in,
+   and H-PRIVATE's check of a `private` declaration. D3's listener applies on every host.
+5. **Slices** (§7): H12 (the hosted production source, list empty) and H13 (the first approved
+   entry, waiting on the owner) are new. Order: H0, H0b (built, in review) → H2 → H1, H3, H4 → H9
+   → H10, H12 → H7 → H6 with the acceptance run → H5; H13 when the owner's conditions are met.
+   Buildable now with no owner decision: H2, H1, H4, H3, H9, H10, H12, H7, H6. Needs the owner: H13.
+   Needs a real host: the acceptance run and H5.
+6. **The "spark" inventory** (§7.1): 403 occurrences in 74 tracked files. 148 are this spec
+   (kept), 23 dated specs and research (kept), 10 `CLAUDE.md` and `CHANGELOG.md` (kept), 2 the
+   team's platform decision in content (the owner's), 11 false positives (`sparkle` icons in
+   `web/`, three common passwords); the other 209 are renamed, rewritten, regenerated or deleted
+   in H3, H7, H12 and H6. No UI text names the Spark. H0 and H0b's Spark wording is listed in
+   their status notes.
+
+**What the earlier safeguards became** (the table at the end of §3.6): ADM-3 removed for
+`hosted`, replaced by the approved list; "real data only on the Spark" removed, replaced by
+protections every host gets; fake-data mode kept for `hosted-test`, for the narrower reason that
+nobody approved the endpoint; the `held_real_data` marker narrowed to stopping `hosted-test` on
+a database that has held real data, with every change of source now audited; the tool server's
+cross-check kept, now also feeding the audit log; the "restricted data sent off the Spark"
+metric replaced by "real data sent to an unapproved endpoint" (zero by construction) and tasks
+per source; `class: production` loosened by exactly one upstream form, `hosted:<label>`.
+
+**Still true: nothing in this spec has run on a real host with OpenShell.** No host is verified,
+none of H0's or H0b's fixes has been seen working on OpenShell, and every statement about
+OpenShell's behaviour beyond its cited public docs is marked "verify on a real host".
+
+**What remains open for the owner** (§8.2): the hosted model's approval record, and the owner's
+confirmation of the data-processing agreement and retention terms; the CODEOWNERS line and branch
+protection for the approved list; which GPU host, if any, for a `local` run; the first VM
+itself; the Entra app registration, now on the path to any public host; the team's platform
+decision in content, which still names the Spark.
+
+### For the reviewer: what to check before anything is built
+
+The loosened data rule first.
+
+1. **Is the approved list enough to keep real data from an arbitrary endpoint?** It is compiled
+   into the gateway, pins the URL by digest, and changes only by a reviewed commit (§3.6). Check
+   that no path (an environment variable, a mount, `deploy/.env`, the stub, `PMOS_GATEWAY_CLOUD_TEST`,
+   a `class: test` config) lets `hosted` or real data reach an endpoint that isn't on the list, and
+   whether the stated limit (anyone in the `docker` group can build another image) is acceptable.
+2. **H13 before CODEOWNERS exists.** The spec forbids adding the first entry until the CODEOWNERS
+   line and branch protection are in force. Is that the right gate, given that nothing in code can
+   check it?
+3. **The digest instead of the URL** in the committed list, and its normalisation (case, default
+   port, trailing slash; user information, query, fragment and `http` refused). Check edge cases
+   the spec doesn't name: an IP-literal host, an internationalised name, an explicit `:443`.
+4. **The key's place:** one file, mode `600`, mounted by Compose only into the gateway, never in
+   `deploy/.env`, the environment, a log, a report or a command line; kept out of backups. Check
+   the Compose `secrets:` mount's permissions against the gateway image's user, and that no other
+   container or `pmos-admin` path reads it.
+5. **Egress:** no redirects followed; the hosted resolver refusing loopback, link-local, metadata,
+   `pmos`-subnet and private answers; a TLS-intercepting proxy treated as part of the data path,
+   a condition the owner confirms, not a check. Behind any proxy the gateway can't see the address:
+   is that acceptable?
+6. **`/readyz` is unauthenticated and now probes the provider with the key.** The spec caches the
+   probe for 30 seconds. Check that no other unauthenticated route causes keyed requests, and that
+   `/readyz`, `/v1/pmos/roles`, the usage log, errors and eval reports carry labels only.
+7. **The `held_real_data` marker's narrower purpose.** A database used only with `local` may now
+   be switched to `hosted`, sending data that never left the host to the provider. The spec records
+   the switch (`system.model_source`, `status`) but does not refuse it. Should a switch from
+   `local` to `hosted` on a database that has held real data need an explicit, logged
+   acknowledgement, like H-PRIVATE's?
+8. **The audit field** records the source the gateway reported at a session's open, not per
+   call; the gateway's usage log has it per call. Is that enough for "which model source served
+   each task"?
+9. **No data-class ceiling.** Restricted content goes to the hosted provider. That is the owner's
+   D1 answer as put; check that §3.9 states it plainly enough and that nothing else in the repo
+   (the audience checks, the Slack reply assistant's restricted-draft rules) assumed restricted
+   data never leaves the host.
+10. **Fake-data mode is now `hosted-test` alone.** A `local` stack with live data on a cloud VM
+    with a GPU is accepted; "a GPU host the owner controls" is a statement in the host record,
+    which code can't check. Is that acceptable?
+11. **D3 (b) on every host**, not only `public` (§3.8): a slight widening of the owner's answer.
+    Confirm, or limit it to `public`.
+12. **The stricter rules on every host:** H-METADATA and H-EXPOSURE now fail on a `private`
+    host too. Check that no legitimate on-prem set-up is refused by them.
+13. **`PMOS_HOST_PROFILE`'s removal:** check that nothing in H1, H4 or the runbooks still keys on
+    it, and that §10 and §11, which describe it, are read as the record (the header says so).
+14. **Benchmarks under `hosted`:** a `production` gateway with an approved `hosted:<label>` may
+    count towards a bar (§3.6). Check this against `docs/evals.md`'s "Which runs count" and the
+    owner's open question on provider host names in committed reports (reports carry the label).
