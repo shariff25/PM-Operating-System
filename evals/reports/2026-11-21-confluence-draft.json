@@ -1,0 +1,170 @@
+{
+  "category": "confluence-draft",
+  "bot": "pm-evals",
+  "date": "2026-11-21",
+  "started_at": "2026-11-21T22:21:30.491010556Z",
+  "finished_at": "2026-11-21T22:45:58.755725732Z",
+  "pass_bar": 0.8,
+  "runtime_url": "http://127.0.0.1:8750",
+  "requested_by": "evals",
+  "gateway_workarounds": null,
+  "note": "model: hosted-model-a (hosted-provider.invalid, OpenAI-compatible, every role); first full run (E1) on the test stack, fake fixtures",
+  "repeats": 3,
+  "tasks": [
+    {
+      "id": "call-notes-summary",
+      "ask": "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, October' that summarises what customers asked for in the October Acme Cloud call notes.",
+      "repeat": 1,
+      "cluster": "call-notes-summary",
+      "task_id": "tsk_c66311eed71749e38e35e7c70b7a31cf",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 228.883,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "call-notes-summary",
+      "ask": "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, October' that summarises what customers asked for in the October Acme Cloud call notes.",
+      "repeat": 2,
+      "cluster": "call-notes-summary",
+      "task_id": "tsk_907c0737b9b34926b6eb6d3e2ca43e63",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 221.115,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "call-notes-summary",
+      "ask": "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, October' that summarises what customers asked for in the October Acme Cloud call notes.",
+      "repeat": 3,
+      "cluster": "call-notes-summary",
+      "task_id": "tsk_ee53213bcdb34299bd66123d962be47e",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "new-page-not-an-edit",
+      "ask": "Draft a new page in the PM space listing next steps for the SSO and audit export asks from the October Acme Cloud call notes. Leave the call notes page itself unchanged.",
+      "repeat": 1,
+      "cluster": "new-page-not-an-edit",
+      "task_id": "tsk_73685b45efb94eccbf0f4797454a74c2",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 334.171,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "new-page-not-an-edit",
+      "ask": "Draft a new page in the PM space listing next steps for the SSO and audit export asks from the October Acme Cloud call notes. Leave the call notes page itself unchanged.",
+      "repeat": 2,
+      "cluster": "new-page-not-an-edit",
+      "task_id": "tsk_81f62119d3d342478ec4af25363bcd60",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 352.787,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "new-page-not-an-edit",
+      "ask": "Draft a new page in the PM space listing next steps for the SSO and audit export asks from the October Acme Cloud call notes. Leave the call notes page itself unchanged.",
+      "repeat": 3,
+      "cluster": "new-page-not-an-edit",
+      "task_id": "tsk_d0d949cd84014e3196d9c5bf2b166eef",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 326.634,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "prd-from-exemplar",
+      "ask": "Draft anyway, no questions: a first-draft PRD in the PM space for exporting audit logs from the Acme Vault console, using the Key export v2 PRD as the exemplar and the October Acme Cloud call notes for customer asks.",
+      "repeat": 1,
+      "cluster": "prd-from-exemplar",
+      "task_id": "tsk_9215f61705874424b51184a5ba5c3767",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 561.734,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "prd-from-exemplar",
+      "ask": "Draft anyway, no questions: a first-draft PRD in the PM space for exporting audit logs from the Acme Vault console, using the Key export v2 PRD as the exemplar and the October Acme Cloud call notes for customer asks.",
+      "repeat": 2,
+      "cluster": "prd-from-exemplar",
+      "task_id": "tsk_14bde464a94246759c9bcb7507969d7e",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 539.291,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "prd-from-exemplar",
+      "ask": "Draft anyway, no questions: a first-draft PRD in the PM space for exporting audit logs from the Acme Vault console, using the Key export v2 PRD as the exemplar and the October Acme Cloud call notes for customer asks.",
+      "repeat": 3,
+      "cluster": "prd-from-exemplar",
+      "task_id": "tsk_6526fc829e39451ca581ec7fb97e31d3",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true
+    }
+  ]
+}
