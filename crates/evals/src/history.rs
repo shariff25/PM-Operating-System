@@ -7,8 +7,9 @@
 //!
 //! Only reports that [`counts`] accepts take part (review finding N5): those whose gateway
 //! reported the production role models (`benchmark.production_gateway` in `config.yaml`,
-//! `deploy/gateway.yaml`), with no stub or testing-only upstream, and, for a persona's
-//! category, on the persona's current version. [`evaluate`] itself judges whatever it's given.
+//! `deploy/gateway.yaml`), from a `production`-class gateway (review finding R3), with no stub
+//! or testing-only upstream, and, for a persona's category, on the persona's current files
+//! (their hash, [`persona_hash`]). [`evaluate`] itself judges whatever it's given.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -129,7 +130,112 @@ pub fn production_models(evals_root: &Path) -> Result<BTreeMap<String, String>, 
     Ok(out)
 }
 
-/// The `version:` in `<content>/personas/<persona>/PERSONA.md`'s front matter.
+/// The front matter of a `PERSONA.md` or `ROLE.md`.
+fn front_matter(path: &Path) -> Result<serde_norway::Value, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("{}: can't read: {e}", path.display()))?;
+    let front = text
+        .strip_prefix("---")
+        .and_then(|t| t.split("\n---").next())
+        .ok_or_else(|| format!("{}: no front matter", path.display()))?;
+    serde_norway::from_str(front).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Every file under `dir`, as (path relative to `base`, contents), in path order. A file that
+/// can't be read fails it; so does a missing `dir`.
+fn files_under(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<(), String> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: can't read: {e}", dir.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("{}: can't read: {e}", dir.display()))?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if kind.is_dir() {
+            files_under(base, &path, out)?;
+        } else {
+            let bytes =
+                std::fs::read(&path).map_err(|e| format!("{}: can't read: {e}", path.display()))?;
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((rel, bytes));
+        }
+    }
+    Ok(())
+}
+
+/// What a persona is, as files: `sha256:<hex>` over every file of its folder
+/// (`personas/<persona>/`, `PERSONA.md` included), of its role's folder (`roles/<role>/`) and
+/// of each skill's folder the role lists (`skills/<skill>/`), each as its path relative to the
+/// content root and its bytes. A run of a persona's category counts only while this is the
+/// same as when it ran (replacing the string compare of `version:`, which an edit that didn't
+/// bump it slipped past). `Err` says which file or field is missing; such a persona has no
+/// run that counts.
+pub fn persona_hash(content: &Path, persona: &str) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let dir = content.join("personas").join(persona);
+    let front = front_matter(&dir.join("PERSONA.md"))?;
+    let role = front
+        .get("role")
+        .and_then(|r| r.as_str())
+        .ok_or_else(|| format!("persona `{persona}` names no `role`"))?
+        .to_string();
+    let role_dir = content.join("roles").join(&role);
+    let role_front = front_matter(&role_dir.join("ROLE.md"))?;
+    let skills: Vec<String> = match role_front.get("skills") {
+        None => Vec::new(),
+        Some(serde_norway::Value::String(s)) => s.split_whitespace().map(String::from).collect(),
+        Some(serde_norway::Value::Sequence(list)) => list
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| format!("role `{role}`: a skill that isn't a name"))
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => {
+            return Err(format!(
+                "role `{role}`: `skills` is neither a list nor a string"
+            ))
+        }
+    };
+    let mut files = Vec::new();
+    files_under(content, &dir, &mut files)?;
+    files_under(content, &role_dir, &mut files)?;
+    let mut skills = skills;
+    skills.sort();
+    skills.dedup();
+    for skill in &skills {
+        if skill.is_empty() || skill.contains(['/', '\\', '.']) {
+            return Err(format!(
+                "role `{role}`: skill `{skill}` isn't a folder name"
+            ));
+        }
+        files_under(content, &content.join("skills").join(skill), &mut files)?;
+    }
+    let mut h = Sha256::new();
+    for (path, bytes) in &files {
+        h.update((path.len() as u64).to_le_bytes());
+        h.update(path.as_bytes());
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    }
+    Ok(h.finalize()
+        .iter()
+        .fold(String::from("sha256:"), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        }))
+}
+
+/// The `version:` in `<content>/personas/<persona>/PERSONA.md`'s front matter. For display:
+/// which files a run measured is [`persona_hash`].
 pub fn persona_version(content: &Path, persona: &str) -> Option<String> {
     let text =
         std::fs::read_to_string(content.join("personas").join(persona).join("PERSONA.md")).ok()?;
@@ -143,11 +249,12 @@ pub fn persona_version(content: &Path, persona: &str) -> Option<String> {
 }
 
 /// Whether `report` counts towards its category's bar (review finding N5): its gateway's
-/// models were recorded ([`Report::gateway_models`]), are exactly the production role models
-/// (`production`), role for role, came from neither the stub nor a testing-only upstream; and,
-/// for a persona's category, the persona's version then (`report.persona_version`) is its
-/// version now (`persona_now`). `Err` says why not. A report without the gateway's models
-/// (every one before 2026-11-22) never counts.
+/// models were recorded ([`Report::gateway_models`]), from a `production`-class gateway (R3),
+/// are exactly the production role models (`production`), role for role, came from neither
+/// the stub nor a testing-only upstream; and, for a persona's category, the hash of the
+/// persona's files then (`report.persona_hash`) is their hash now (`persona_now`,
+/// [`persona_hash`]). `Err` says why not. A report without the gateway's models (every one
+/// before 2026-11-22) never counts.
 pub fn counts(
     report: &Report,
     production: &BTreeMap<String, String>,
@@ -156,6 +263,12 @@ pub fn counts(
     let Some(m) = &report.gateway_models else {
         return Err("the gateway's models weren't recorded".into());
     };
+    if m.class != "production" {
+        return Err(format!(
+            "the runtime's gateway is a `{}` gateway, not the production one",
+            m.class
+        ));
+    }
     if m.stub {
         return Err("the gateway answered with its stub model".into());
     }
@@ -186,17 +299,26 @@ pub fn counts(
         ));
     }
     if let Some(now) = persona_now {
-        match report.persona_version.as_deref() {
-            Some(v) if v == now => {}
-            Some(v) => {
+        match report.persona_hash.as_deref() {
+            Some(h) if h == now => {}
+            Some(h) => {
                 return Err(format!(
-                    "it measured persona version `{v}`; the persona is now `{now}`"
-                ))
+                "it measured the persona's files as `{}`; they are now `{}` (version `{}` then)",
+                short(h),
+                short(now),
+                report.persona_version.as_deref().unwrap_or("none")
+            ))
             }
-            None => return Err("the persona's version wasn't recorded".into()),
+            None => return Err("the hash of the persona's files wasn't recorded".into()),
         }
     }
     Ok(())
+}
+
+/// `sha256:0123456789ab…`, for messages.
+fn short(hash: &str) -> String {
+    let cut = hash.char_indices().nth(19).map_or(hash.len(), |(i, _)| i);
+    format!("{}…", &hash[..cut])
 }
 
 /// The reports that count ([`counts`]), and `(file, date, why not)` for the rest. With no
@@ -257,13 +379,13 @@ pub fn benchmarked_personas(
         let Some(persona) = category.persona else {
             continue;
         };
-        let version = persona_version(content, &persona);
+        let hash = persona_hash(content, &persona).ok();
         let ok = production.is_ok()
-            && version.is_some()
+            && hash.is_some()
             && category.pass_bar.is_some_and(|bar| {
                 load_named(&reports, &name)
                     .map(|r| {
-                        let (kept, _) = split_counting(r, &production, version.as_deref());
+                        let (kept, _) = split_counting(r, &production, hash.as_deref());
                         evaluate(&name, bar, &kept).two_weeks_met
                     })
                     .unwrap_or(false)

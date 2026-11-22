@@ -39,7 +39,7 @@
 //! ([`PASSWORD_CODES`]). Nothing here logs a password, a code, a token, a secret, a sign-in
 //! name or an address.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 
@@ -214,8 +214,151 @@ pub struct Attempt {
 
 #[derive(Default)]
 struct Seen {
-    by_address: HashMap<SourceKey, VecDeque<DateTime<Utc>>>,
-    by_subject: HashMap<(SourceKey, Subject), VecDeque<DateTime<Utc>>>,
+    by_address: Recent<SourceKey>,
+    by_subject: Recent<(SourceKey, Subject)>,
+}
+
+/// A key's place in [`Recent::order`]: its latest time and a tie-breaking sequence number.
+type Place = (DateTime<Utc>, u64);
+
+/// Each key's times in the window, and the keys in the order of their latest time, so making
+/// room for a new key never scans them all under the lock (the 50,000-pair map did, review of
+/// 2efb73f): the idle keys and the one seen longest ago sit at the ends of `order`.
+struct Recent<K> {
+    /// A key's times (as pushed; the latest is the last pushed, as `back()` gives it), and its
+    /// place in `order`: that time and a tie-breaking sequence number. `None` only while its
+    /// times are empty, when the key is in `empty` instead.
+    times: HashMap<K, (VecDeque<DateTime<Utc>>, Option<Place>)>,
+    order: BTreeMap<Place, K>,
+    /// Keys whose times [`room`] emptied: idle, so the first to go.
+    empty: HashSet<K>,
+    next: u64,
+}
+
+impl<K> Default for Recent<K> {
+    fn default() -> Self {
+        Self {
+            times: HashMap::new(),
+            order: BTreeMap::new(),
+            empty: HashSet::new(),
+            next: 0,
+        }
+    }
+}
+
+impl<K: Clone + Eq + std::hash::Hash> Recent<K> {
+    fn len(&self) -> usize {
+        self.times.len()
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        self.times.contains_key(key)
+    }
+
+    /// Puts `key` back in `order` by its latest time, after its times changed.
+    fn reindex(&mut self, key: &K) {
+        let Some((times, place)) = self.times.get_mut(key) else {
+            return;
+        };
+        if let Some(old) = place.take() {
+            self.order.remove(&old);
+        }
+        match times.back().copied() {
+            Some(last) => {
+                self.next += 1;
+                let new = (last, self.next);
+                *place = Some(new);
+                self.order.insert(new, key.clone());
+                self.empty.remove(key);
+            }
+            None => {
+                self.empty.insert(key.clone());
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &K) {
+        if let Some((_, place)) = self.times.remove(key) {
+            if let Some(p) = place {
+                self.order.remove(&p);
+            }
+            self.empty.remove(key);
+        }
+    }
+
+    /// [`room`] for `key`'s times, when it has any.
+    fn room(
+        &mut self,
+        key: &K,
+        most: usize,
+        now: DateTime<Utc>,
+        window: Duration,
+    ) -> Result<(), u64> {
+        let Some((times, _)) = self.times.get_mut(key) else {
+            return Ok(());
+        };
+        let r = room(times, most, now, window);
+        self.reindex(key);
+        r
+    }
+
+    fn push(&mut self, key: K, at: DateTime<Utc>) {
+        self.times
+            .entry(key.clone())
+            .or_insert_with(|| (VecDeque::new(), None))
+            .0
+            .push_back(at);
+        self.reindex(&key);
+    }
+
+    /// Takes back one time `at` of `key`'s (its latest such), and the key once it has none.
+    fn give_back(&mut self, key: &K, at: DateTime<Utc>) {
+        let Some((times, _)) = self.times.get_mut(key) else {
+            return;
+        };
+        if let Some(i) = times.iter().rposition(|t| *t == at) {
+            times.remove(i);
+        }
+        if times.is_empty() {
+            self.remove(key);
+        } else {
+            self.reindex(key);
+        }
+    }
+
+    /// Make room for a new key (at most `most` keys): when full, every idle key goes (no times
+    /// left, or its latest time outside the window or after `now`), and if that frees nothing,
+    /// the one whose latest time is oldest. The rule the scan applied, found at the ends of
+    /// `order` instead: each key leaves `order` at most once per time it was put there.
+    fn evict(&mut self, most: usize, now: DateTime<Utc>, window: Duration) {
+        if self.len() < most {
+            return;
+        }
+        for k in std::mem::take(&mut self.empty) {
+            self.times.remove(&k);
+        }
+        while let Some((&(last, _), _)) = self.order.first_key_value() {
+            if now - last < window {
+                break;
+            }
+            if let Some((_, k)) = self.order.pop_first() {
+                self.times.remove(&k);
+            }
+        }
+        while let Some((&(last, _), _)) = self.order.last_key_value() {
+            if last <= now {
+                break;
+            }
+            if let Some((_, k)) = self.order.pop_last() {
+                self.times.remove(&k);
+            }
+        }
+        if self.len() >= most {
+            if let Some((_, k)) = self.order.pop_first() {
+                self.times.remove(&k);
+            }
+        }
+    }
 }
 
 /// Refused attempts per address, and per address and subject, in a rolling window. In this
@@ -241,29 +384,6 @@ fn room(
     Ok(())
 }
 
-/// Make room for a new key in `map` (at most `most` keys): the idle ones go first, then the one
-/// seen longest ago.
-fn evict<K: Clone + Eq + std::hash::Hash>(
-    map: &mut HashMap<K, VecDeque<DateTime<Utc>>>,
-    most: usize,
-    now: DateTime<Utc>,
-    window: Duration,
-) {
-    if map.len() < most {
-        return;
-    }
-    map.retain(|_, t| t.back().is_some_and(|at| now - *at < window && *at <= now));
-    if map.len() >= most {
-        let stalest = map
-            .iter()
-            .min_by_key(|(_, t)| t.back().copied())
-            .map(|(k, _)| k.clone());
-        if let Some(k) = stalest {
-            map.remove(&k);
-        }
-    }
-}
-
 impl SourceLimiter {
     fn window() -> Duration {
         Duration::minutes(SOURCE_WINDOW_MINUTES)
@@ -284,24 +404,17 @@ impl SourceLimiter {
         let window = Self::window();
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         let s = &mut *seen;
-        if let Some(times) = s.by_address.get_mut(source) {
-            room(times, SOURCE_REFUSALS, now, window)?;
-        }
+        s.by_address.room(source, SOURCE_REFUSALS, now, window)?;
         let pair = (source.clone(), subject.clone());
-        if let Some(times) = s.by_subject.get_mut(&pair) {
-            room(times, SUBJECT_REFUSALS, now, window)?;
+        s.by_subject.room(&pair, SUBJECT_REFUSALS, now, window)?;
+        if !s.by_address.contains(source) {
+            s.by_address.evict(MAX_SOURCES, now, window);
         }
-        if !s.by_address.contains_key(source) {
-            evict(&mut s.by_address, MAX_SOURCES, now, window);
+        if !s.by_subject.contains(&pair) {
+            s.by_subject.evict(MAX_SUBJECTS, now, window);
         }
-        if !s.by_subject.contains_key(&pair) {
-            evict(&mut s.by_subject, MAX_SUBJECTS, now, window);
-        }
-        s.by_address
-            .entry(source.clone())
-            .or_default()
-            .push_back(now);
-        s.by_subject.entry(pair).or_default().push_back(now);
+        s.by_address.push(source.clone(), now);
+        s.by_subject.push(pair, now);
         Ok(Attempt {
             key: source.clone(),
             subject: subject.clone(),
@@ -315,27 +428,10 @@ impl SourceLimiter {
         if counted {
             return;
         }
-        fn give_back<K: Eq + std::hash::Hash>(
-            map: &mut HashMap<K, VecDeque<DateTime<Utc>>>,
-            key: K,
-            at: DateTime<Utc>,
-        ) {
-            if let Some(times) = map.get_mut(&key) {
-                if let Some(i) = times.iter().rposition(|t| *t == at) {
-                    times.remove(i);
-                }
-                if times.is_empty() {
-                    map.remove(&key);
-                }
-            }
-        }
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        give_back(&mut seen.by_address, attempt.key.clone(), attempt.at);
-        give_back(
-            &mut seen.by_subject,
-            (attempt.key, attempt.subject),
-            attempt.at,
-        );
+        seen.by_address.give_back(&attempt.key, attempt.at);
+        seen.by_subject
+            .give_back(&(attempt.key, attempt.subject), attempt.at);
     }
 }
 
@@ -1492,6 +1588,135 @@ mod tests {
 
     fn name(n: usize) -> Subject {
         Subject::name(&format!("p{n}@example.com"))
+    }
+
+    /// The map and scan [`Recent`] replaced, kept here to check it decides the same.
+    #[derive(Default)]
+    struct Scan(HashMap<u32, VecDeque<DateTime<Utc>>>);
+
+    impl Scan {
+        fn evict(&mut self, most: usize, now: DateTime<Utc>, window: Duration) {
+            let map = &mut self.0;
+            if map.len() < most {
+                return;
+            }
+            map.retain(|_, t| t.back().is_some_and(|at| now - *at < window && *at <= now));
+            if map.len() >= most {
+                let stalest = map
+                    .iter()
+                    .min_by_key(|(_, t)| t.back().copied())
+                    .map(|(k, _)| *k);
+                if let Some(k) = stalest {
+                    map.remove(&k);
+                }
+            }
+        }
+    }
+
+    /// The review of 2efb73f: making room no longer scans every key, and decides exactly as
+    /// the scan did: the same keys kept, with the same times, through attempts, refusals,
+    /// give-backs and a clock that sometimes steps back.
+    #[test]
+    fn the_ordered_index_evicts_exactly_as_the_scan_did() {
+        let window = Duration::minutes(SOURCE_WINDOW_MINUTES);
+        let (most, cap) = (6, 3);
+        let mut fast: Recent<u32> = Recent::default();
+        let mut slow = Scan::default();
+        let mut used = std::collections::BTreeSet::new();
+        let mut pushed: Vec<(u32, DateTime<Utc>)> = Vec::new();
+        // A small, fixed pseudo-random sequence (no clock, no dependency).
+        let mut seed: u64 = 0x2efb_73f0_dead_beef;
+        let mut rand = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut clock: i64 = 0;
+        for step in 0..20_000 {
+            // Mostly forward, sometimes far (past the window), sometimes a step back; never a
+            // time used before, so no two keys tie (the scan broke ties arbitrarily).
+            clock += match rand(20) {
+                0 => -(rand(120) as i64) - 1,
+                1 => 16 * 60 + rand(600) as i64,
+                _ => rand(30) as i64 + 1,
+            };
+            while !used.insert(clock) {
+                clock += 1;
+            }
+            let now = at(clock);
+            if rand(5) == 0 && !pushed.is_empty() {
+                let (k, t) = pushed.swap_remove(rand(pushed.len() as u64) as usize);
+                fast.give_back(&k, t);
+                if let Some(times) = slow.0.get_mut(&k) {
+                    if let Some(i) = times.iter().rposition(|x| *x == t) {
+                        times.remove(i);
+                    }
+                    if times.is_empty() {
+                        slow.0.remove(&k);
+                    }
+                }
+            } else {
+                let k = rand(12) as u32;
+                let a = fast.room(&k, cap, now, window);
+                let b = match slow.0.get_mut(&k) {
+                    Some(times) => room(times, cap, now, window),
+                    None => Ok(()),
+                };
+                assert_eq!(a, b, "step {step}");
+                if a.is_ok() {
+                    assert_eq!(fast.contains(&k), slow.0.contains_key(&k));
+                    if !fast.contains(&k) {
+                        fast.evict(most, now, window);
+                        slow.evict(most, now, window);
+                    }
+                    fast.push(k, now);
+                    slow.0.entry(k).or_default().push_back(now);
+                    pushed.push((k, now));
+                }
+            }
+            let kept: HashMap<u32, VecDeque<DateTime<Utc>>> = fast
+                .times
+                .iter()
+                .map(|(k, (t, _))| (*k, t.clone()))
+                .collect();
+            assert_eq!(kept, slow.0, "step {step}");
+            assert!(fast.len() <= most);
+            // The index holds exactly the keys with times.
+            assert_eq!(
+                fast.order.len() + fast.empty.len(),
+                fast.len(),
+                "step {step}"
+            );
+        }
+    }
+
+    /// With the pair map full (50,000), new pairs still go in, each making room without a
+    /// scan, and the limits hold as before: the newest pairs are kept.
+    #[test]
+    fn a_full_pair_map_makes_room_for_new_pairs() {
+        let l = SourceLimiter::default();
+        let a = key("203.0.113.7");
+        // Fill it directly: one refusal each, every one still in the window.
+        {
+            let mut seen = l.seen.lock().unwrap();
+            for n in 0..MAX_SUBJECTS {
+                seen.by_subject.push((a.clone(), name(n)), at(0));
+            }
+            assert_eq!(seen.by_subject.len(), MAX_SUBJECTS);
+        }
+        // From other addresses, so no address is full: each new pair pushes out an old one.
+        for n in 0..20_000 {
+            let from = key(&format!("198.51.{}.{}", n / 250, n % 250 + 1));
+            let t = l
+                .begin(&from, &name(MAX_SUBJECTS + n), at(1 + n as i64 / 1000))
+                .expect("room");
+            l.settle(t, true);
+        }
+        let seen = l.seen.lock().unwrap();
+        assert_eq!(seen.by_subject.len(), MAX_SUBJECTS);
+        let newest = (key("198.51.79.250"), name(MAX_SUBJECTS + 19_999));
+        assert!(seen.by_subject.contains(&newest));
     }
 
     /// N2 (the review of 8e8f8fe): an address waits after a hundred refusals in fifteen

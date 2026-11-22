@@ -18,6 +18,7 @@ bot runtime / harness ──► pmos-gateway ──► vLLM (default role: Qwen)
 Edit `config/gateway.yaml` and restart the gateway.
 
 ```yaml
+class: production        # deploy/gateway.yaml only; any other config is a `test` gateway
 upstreams:
   qwen: http://127.0.0.1:8001/v1
 roles:
@@ -25,6 +26,7 @@ roles:
 limits: {max-in-flight: 4, per-user: 2, max-queue: 64}
 clients:
   runtime: {trusted: true, max-in-flight: 2}
+  bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
   bot-*: {trusted: true, max-in-flight: 3}
   evals: {max-in-flight: 1, priority: personal}
 ```
@@ -59,6 +61,13 @@ it can be deleted.
   `limits.per-client`, itself defaulting to `per-user`), whoever its calls name. So one token
   can't hold every slot (review finding N3); in `deploy/gateway.yaml` the `evals` token, which
   the whole eval stack shares, holds at most one (N4).
+- **Waiting, per client and per person** (review finding R2, 2026-11-22): each client may
+  have at most `clients.<name>.max-queue` calls waiting for a slot (default twice its
+  `max-in-flight`), and each believed person at most `limits.per-user-queue` (default twice
+  `per-user`), whichever client sends them. Before, those caps applied only when a slot was
+  handed out, so one token could fill the whole queue and every other caller got an immediate
+  `503`. A call past its client's or person's share gets `429` with `Retry-After: 5`, and a
+  usage line (`refused`, `attempts: 0`); the others keep their places.
 - **Priority** (`X-Pmos-Priority`): `interactive` (someone waiting in Slack), then `scheduled` (routines), then `personal` (background work). Within a priority it's first come, first served.
 - **Which clients are believed:** only a client listed with `trusted: true` has its
   `X-Pmos-User` and `X-Pmos-Priority` used; with no priority header its calls get its
@@ -66,13 +75,29 @@ it can be deleted.
   name (`client:<name>`, under its own cap only) and always gets its `priority` (default
   `personal`), whatever it sends. Malformed headers are refused (`400`) from every client.
   The usage log's `user` is empty for an untrusted client.
-- **Client names:** an exact client name from `PMOS_GATEWAY_TOKENS`, or a pattern ending in
-  `*` (`bot-*` covers every bot's worker); an exact name wins, then the longest pattern.
-  `deploy/gateway.yaml` trusts `runtime` (it names the PM its caller verified; cap 2) and
-  `bot-*` (each worker names the PM whose task it runs; cap 3 of 4), and caps `evals` at 1,
-  `personal`. A bot worker's token can therefore still name any PM, but no longer holds every
-  slot (S8 is narrowed, not closed).
-- **Queue full:** a call that would have to wait gets `503` with `Retry-After: 5` when `max-queue` calls are already waiting. A call that can start at once always starts.
+- **Client names:** 1 to 40 lowercase letters, digits and `-` (room for `bot-` before the
+  longest personal bot name, 32), in `PMOS_GATEWAY_TOKENS` and in `clients:`. A `clients:`
+  entry is an exact client name or a pattern ending in `*` with **at least 4 characters
+  before the `*`** (`bot-*`), so no pattern covers every client: a bare `*`, `b*` or `bot*` is
+  refused at start-up (the review of 2efb73f). An exact name wins, then the longest pattern.
+- **Whom a trusted client may name** (`clients.<…>.user`, review finding R1): `any` (the
+  default) or `from-name`, on a pattern only: the client may name only the person whose
+  handle the `*` part of its name spells, written as a personal bot's name writes it (`.` and
+  `_` as `-`, `pm-<handle>` cut to 32 characters; `personal_bot_name`). So with
+  `bot-pm-*: {trusted: true, user: from-name}`, `bot-pm-ana-k` may name `ana.k` (or `ana_k`,
+  which would share that bot's name) and no one else; naming anyone else is `403`
+  (`permission_error`), nothing goes to the model server, and the usage log records a line
+  with `status: 403`, `refused`, and in `user` the handle it tried to name. A call naming no
+  one is still accepted. A test checks that every valid handle's `bot-pm-<…>` client name is a
+  valid client name that may name that handle and no other.
+- **`deploy/gateway.yaml`** trusts `runtime` (it names the PM its caller verified; cap 2),
+  `bot-pm-*` with `user: from-name` (each PM's own bot's worker; cap 3 of 4) and `bot-*` (a
+  team bot's worker, such as `bot-docs`, naming the PM whose task it runs; cap 3 of 4), and
+  caps `evals` at 1, `personal`. **Known residual (S8):** a team bot's token can still name any
+  PM, since it serves them all; it holds at most 3 slots and 6 waiting places. The test stack
+  (`scripts/claude-test-stack.sh`) gives all its workers one `worker` token, trusted to name
+  anyone, as before.
+- **Queue full:** a call that would have to wait gets `503` with `Retry-After: 5` when `max-queue` calls are already waiting (and `429` when its client's or person's share of the queue is used, above). A call that can start at once always starts.
 - **Queue deadline:** a call that has waited `limits.queue-wait-secs` (default 300) for a slot
   gives up with the same `503` and leaves the queue. A retry waiting for a slot again gives up
   the same way and returns the upstream's last answer.
@@ -141,7 +166,7 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
 | `POST /v1/embeddings` | client token | Embeddings for a role that serves them |
 | `GET /v1/models` | client token | The role aliases |
 | `GET /v1/pmos/workarounds` | client token | The workaround registry |
-| `GET /v1/pmos/roles` | client token | Each role's model id and upstream kind (`local`, `claude-test` or `remote-test`; never an address), and whether the stub, a testing-only upstream and the workarounds are on. The benchmark runner records it in each report. |
+| `GET /v1/pmos/roles` | client token | The gateway's `class` (`production` or `test`), each role's model id and upstream kind (`local`, `claude-test` or `remote-test`; never an address), and whether the stub, a testing-only upstream and the workarounds are on. The bot runtime passes it to the benchmark runner (`GET /v1/personas`, client `evals`), which records it in each report (`docs/evals.md`). |
 | `GET /healthz` | none | Liveness |
 | `GET /readyz` | none | `200` when every model server answers `/models` within 2 seconds; `503` names the one that doesn't |
 
@@ -161,6 +186,9 @@ One event per call:
 - queue and total time, token counts, workarounds applied;
 - `attempt` and `attempts`: every try at the model server gets a line, with `retrying: true`
   on those that failed and will be retried. The last line of a call is its final outcome.
+- `refused`: on a line for a call refused before any try (`attempts: 0`): a client naming a
+  person it may not name (`403`; `user` is the handle it tried), or a client or person with
+  its share of the queue used (`429`).
 
 It never holds prompts or answers. Events go to the service log, and with `PMOS_GATEWAY_USAGE_LOG` also to a JSON-lines file for shipping off-box. Because every upstream must be local outside testing, "restricted data sent off the Spark" is zero by construction; the upstream host on each event lets anyone check (a testing-only upstream shows its remote host).
 
@@ -192,11 +220,16 @@ bound every client, wait, stream and answer):
 | `limits.queue-wait-secs` | `300` | Longest wait for a slot (1 to 3600), then `503` |
 | `limits.stream-max-secs` | `900` | Longest streamed answer, first byte to last (1 to 7200) |
 | `limits.max-answer-bytes` | `16777216` | Largest answer taken from a model server (1 KiB to 256 MiB) |
+| `limits.per-user-queue` | twice `per-user` | Calls one believed person may have waiting |
+| `class` | `test` | `production` only in `deploy/gateway.yaml`: reported in `GET /v1/pmos/roles`, and only such a gateway's eval reports count. A `production` gateway refuses testing-only upstreams and `PMOS_GATEWAY_STUB=1` at start-up. |
 | `clients.<name or prefix*>.trusted` | `false` | Believe `X-Pmos-User` and `X-Pmos-Priority` |
 | `clients.<…>.max-in-flight` | `limits.per-client` | This client's cap |
+| `clients.<…>.max-queue` | twice its `max-in-flight` | Calls this client may have waiting |
+| `clients.<…>.user` | `any` | `from-name` (a pattern, trusted only): it may name only the person its name spells |
 | `clients.<…>.priority` | `interactive` if trusted, else `personal` | An untrusted client's every call; a trusted one's calls without the header |
 
-At start-up the gateway logs each client's name, trust, cap and priority (never a token).
+At start-up the gateway logs its class, and each client's name, trust, caps, priority and
+`user` rule (never a token).
 
 **Upstream forms:**
 - `http://<local host>/<base>`: an OpenAI-compatible local model server (vLLM). The only form

@@ -729,6 +729,7 @@ pub async fn run_category(
         // Filled in by the caller, which asks the gateway before and after the run.
         gateway_models: None,
         persona_version: None,
+        persona_hash: None,
         repeats,
         isolation: opts.isolation.as_ref().map(Isolation::describe),
         judges: opts

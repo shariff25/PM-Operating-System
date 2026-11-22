@@ -20,7 +20,8 @@ describe('the Admin Bots page', () => {
     await screen.findByRole('table', { name: B.tableLabel });
 
     const chief = rowOf(catalog(), 'Chief');
-    expect(within(chief).getByText('Preview')).toBeInTheDocument();
+    // The state pill (the name beside it also carries the Preview tag, tested below).
+    expect(within(chief).getByText('Preview', { selector: '.pill' })).toBeInTheDocument();
     expect(within(chief).getByText(B.people(4))).toBeInTheDocument();
     expect(within(chief).getByLabelText(B.handlesLabel('Chief'))).toHaveTextContent('ana, ben, dana, ravi');
     expect(within(chief).getByRole('link', { name: B.changeFileLabel('Chief') })).toHaveAttribute(
@@ -49,6 +50,38 @@ describe('the Admin Bots page', () => {
     expect(screen.queryByRole('switch')).not.toBeInTheDocument();
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /offer|withdraw|add|remove/i })).not.toBeInTheDocument();
+  });
+
+  // The review of 2efb73f: the Admin's view named bots without the Preview tag. Every bot named
+  // here that is a Preview carries the short tag, in the catalog and in the drafts on hold;
+  // a benchmarked one (Nudge) and a bot gone from the catalog don't.
+  it('names every Preview bot with the Preview tag, in the catalog and in the drafts on hold', async () => {
+    renderApp({ role: 'admin', hash: '/admin/bots' });
+    await screen.findByRole('table', { name: B.tableLabel });
+    const tag = `${copy.bots.preview}: ${copy.bots.previewNote}`;
+    const tagIn = (el: HTMLElement) => within(el).queryAllByText((_, node) => node?.classList.contains('tag-preview') === true);
+
+    for (const name of ['Chief', 'Sprout', 'Echo', 'Scout']) {
+      const row = rowOf(catalog(), name);
+      const tags = tagIn(row);
+      expect(tags, name).toHaveLength(1);
+      expect(tags[0]).toHaveTextContent(tag);
+      // Beside the bot's name, in the row's header cell.
+      expect(within(row).getByRole('rowheader')).toContainElement(tags[0] ?? null);
+    }
+    expect(tagIn(rowOf(catalog(), 'Nudge'))).toHaveLength(0);
+
+    await screen.findByRole('table', { name: B.heldTableLabel });
+    const heldRows = within(held()).getAllByRole('row').slice(1);
+    const scoutRows = heldRows.filter((r) => within(r).queryByText('Scout'));
+    expect(scoutRows).toHaveLength(2);
+    for (const r of scoutRows) {
+      expect(tagIn(r)).toHaveLength(1);
+      expect(tagIn(r)[0]).toHaveTextContent(tag);
+    }
+    const gone = heldRows.filter((r) => within(r).queryByText(B.heldGoneBot('atlas')));
+    expect(gone).toHaveLength(1);
+    for (const r of gone) expect(tagIn(r)).toHaveLength(0);
   });
 
   it('lets an admin release a held draft after a confirm that says what releasing means', async () => {

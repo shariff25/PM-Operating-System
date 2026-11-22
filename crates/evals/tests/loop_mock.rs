@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use common::{
-    spawn, spawn_gateway, write_category, Gateway, Mock, Script, CONSOLE_TOKEN, GATEWAY_TOKEN,
-    TOKEN,
+    prod_gateway, spawn, spawn_gateway, write_category, Gateway, Mock, Script, CONSOLE_TOKEN,
+    GATEWAY_TOKEN, TOKEN,
 };
 use pmos_evals::client::Runtime;
 use pmos_evals::judge::{self, Judge};
@@ -1007,13 +1007,38 @@ async fn cli_run_records_the_gateways_models_and_history_counts_only_production_
             cli_async(root, &args, None).await
         }
     };
-    // Two weeks with the gateway's models recorded, and one more run without a gateway.
+    // Two weeks with the models of the runtime's own (production) gateway recorded.
+    *mock.gateway.lock().unwrap() = Some(prod_gateway());
     for date in ["2026-11-09", "2026-11-16"] {
         let o = run(date, true).await;
         assert_eq!(o.status.code(), Some(0), "{}", out(&o));
     }
-    let o = run("2026-11-17", false).await;
+    // A runtime that doesn't report its gateway: nothing recorded, though the runner has one.
+    *mock.gateway.lock().unwrap() = None;
+    let o = run("2026-11-17", true).await;
     assert!(out(&o).contains("won't count towards a bar"), "{}", out(&o));
+    // R3: the runtime's gateway is a test one serving the same model names, while the runner
+    // was pointed at another gateway. The report records the runtime's, which doesn't count.
+    let mut test_gw = prod_gateway();
+    test_gw["class"] = json!("test");
+    *mock.gateway.lock().unwrap() = Some(test_gw);
+    let o = run("2026-11-18", true).await;
+    assert!(out(&o).contains("counts towards no bar"), "{}", out(&o));
+    let json18: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("reports/2026-11-18-cat.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json18["gateway_models"]["class"], "test");
+    // Without the runner's own gateway the models are still recorded: they come from the
+    // runtime.
+    *mock.gateway.lock().unwrap() = Some(prod_gateway());
+    let o = run("2026-11-19", false).await;
+    assert_eq!(o.status.code(), Some(0), "{}", out(&o));
+    let json19: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("reports/2026-11-19-cat.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json19["gateway_models"]["class"], "production");
     let json: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(root.join("reports/2026-11-16-cat.json")).unwrap(),
     )
@@ -1040,6 +1065,11 @@ async fn cli_run_records_the_gateways_models_and_history_counts_only_production_
     );
     assert!(
         out(&h).contains("2026-11-17-cat.json: the gateway's models weren't recorded"),
+        "{}",
+        out(&h)
+    );
+    assert!(
+        out(&h).contains("2026-11-18-cat.json: the runtime's gateway is a `test` gateway"),
         "{}",
         out(&h)
     );

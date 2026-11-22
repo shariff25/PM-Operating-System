@@ -70,6 +70,7 @@ fn report(date: &str, passed: usize, total: usize) -> Report {
         note: None,
         gateway_models: None,
         persona_version: None,
+        persona_hash: None,
         repeats: 1,
         judges: Vec::new(),
         judges_skipped: None,
@@ -604,6 +605,7 @@ fn prod_models() -> GatewayModels {
         stub: false,
         cloud_test: false,
         workarounds: true,
+        class: "production".into(),
     }
 }
 
@@ -632,11 +634,28 @@ fn bench_dirs(version: &str) -> (tempfile::TempDir, std::path::PathBuf, std::pat
     (dir, evals, content)
 }
 
+/// Persona `echo` at `version`, with its role `outbound-pm` and the role's skill `battlecard`.
 fn set_persona_version(content: &std::path::Path, version: &str) {
     std::fs::create_dir_all(content.join("personas/echo")).unwrap();
     std::fs::write(
         content.join("personas/echo/PERSONA.md"),
-        format!("---\nname: echo\nversion: \"{version}\"\n---\n\n# Echo\n"),
+        format!("---\nname: echo\nrole: outbound-pm\nversion: \"{version}\"\n---\n\n# Echo\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(content.join("roles/outbound-pm")).unwrap();
+    std::fs::write(
+        content.join("roles/outbound-pm/ROLE.md"),
+        "---\nname: outbound-pm\nskills: \"battlecard\"\n---\n\n# Outbound\n",
+    )
+    .unwrap();
+    set_skill(content, "Write a battlecard.\n");
+}
+
+fn set_skill(content: &std::path::Path, text: &str) {
+    std::fs::create_dir_all(content.join("skills/battlecard")).unwrap();
+    std::fs::write(
+        content.join("skills/battlecard/SKILL.md"),
+        format!("---\nname: battlecard\n---\n\n{text}"),
     )
     .unwrap();
 }
@@ -661,12 +680,18 @@ fn a_persona_is_benchmarked_after_two_weeks_at_its_bar() {
     copy_category(&evals, "echo");
     copy_category(&evals, "chief");
     let reports = evals.join("reports");
+    let hash = pmos_evals::history::persona_hash(&content, "echo").unwrap();
+    assert!(
+        hash.starts_with("sha256:") && hash.len() == 7 + 64,
+        "{hash}"
+    );
     let run = |date: &str, passed: usize| {
         let mut r = report(date, passed, 10);
         r.category = "echo".into();
         r.pass_bar = Some(0.7);
         r.gateway_models = Some(prod_models());
         r.persona_version = Some("0.1.0".into());
+        r.persona_hash = Some(hash.clone());
         write(&reports, &r).unwrap();
     };
     // One week at the bar is not enough.
@@ -683,6 +708,36 @@ fn a_persona_is_benchmarked_after_two_weeks_at_its_bar() {
     set_persona_version(&content, "0.2.0");
     assert!(benchmarked_personas(&evals, &content).is_empty());
     set_persona_version(&content, "0.1.0");
+    assert_eq!(benchmarked_personas(&evals, &content).len(), 1);
+    // So does an edit that leaves `version:` alone: to the role's skill, to the role, or a
+    // new file in the persona's folder.
+    set_skill(&content, "Write a sharper battlecard.\n");
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    set_skill(&content, "Write a battlecard.\n");
+    assert_eq!(benchmarked_personas(&evals, &content).len(), 1);
+    let role = content.join("roles/outbound-pm/ROLE.md");
+    let role_text = std::fs::read_to_string(&role).unwrap();
+    std::fs::write(&role, format!("{role_text}Be bolder.\n")).unwrap();
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    std::fs::write(&role, role_text).unwrap();
+    std::fs::write(content.join("personas/echo/notes.md"), "x").unwrap();
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    std::fs::remove_file(content.join("personas/echo/notes.md")).unwrap();
+    assert_eq!(benchmarked_personas(&evals, &content).len(), 1);
+    // A missing skill folder: nothing can be hashed, so nothing counts.
+    std::fs::remove_dir_all(content.join("skills/battlecard")).unwrap();
+    assert!(pmos_evals::history::persona_hash(&content, "echo").is_err());
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    set_skill(&content, "Write a battlecard.\n");
+    // A report from a test-class gateway never counts (review finding R3).
+    let mut test_class = prod_models();
+    test_class.class = "test".into();
+    let mut r = report("2026-11-16", 9, 10);
+    r.category = "echo".into();
+    r.gateway_models = Some(test_class);
+    assert!(pmos_evals::history::counts(&r, &production(), None)
+        .unwrap_err()
+        .contains("`test` gateway"));
     // Without readable production role models, nothing counts.
     std::fs::remove_file(evals.join("prod-gateway.yaml")).unwrap();
     assert!(benchmarked_personas(&evals, &content).is_empty());
@@ -776,14 +831,28 @@ fn only_runs_on_the_production_role_models_count() {
         r.gateway_models = Some(m);
         assert!(counts(&r, &prod, None).is_err());
     }
-    // For a persona: its version then must be its version now.
-    r.gateway_models = Some(prod_models());
-    assert!(counts(&r, &prod, Some("0.1.0"))
+    // R3: the same models from a test-class gateway (or one too old to say) don't count.
+    let mut m = prod_models();
+    m.class = "test".into();
+    r.gateway_models = Some(m);
+    assert!(counts(&r, &prod, None)
         .unwrap_err()
-        .contains("version wasn't recorded"));
+        .contains("not the production one"));
+    // For a persona: the hash of its files then must be their hash now; the version is
+    // shown, not compared.
+    r.gateway_models = Some(prod_models());
+    let (then, now) = (
+        "sha256:".to_string() + &"a".repeat(64),
+        "sha256:".to_string() + &"b".repeat(64),
+    );
+    assert!(counts(&r, &prod, Some(&then))
+        .unwrap_err()
+        .contains("hash of the persona's files wasn't recorded"));
     r.persona_version = Some("0.1.0".into());
-    assert_eq!(counts(&r, &prod, Some("0.1.0")), Ok(()));
-    assert!(counts(&r, &prod, Some("0.2.0")).is_err());
+    r.persona_hash = Some(then.clone());
+    assert_eq!(counts(&r, &prod, Some(&then)), Ok(()));
+    let why = counts(&r, &prod, Some(&now)).unwrap_err();
+    assert!(why.contains("version `0.1.0` then"), "{why}");
     // Splitting a category's reports; with no production models, none counts.
     let old = report("2026-11-09", 9, 10);
     let (kept, left) = split_counting(
@@ -805,6 +874,8 @@ fn only_runs_on_the_production_role_models_count() {
     // The report says which models ran, never a host, and round-trips.
     let md = r.to_markdown();
     assert!(md.contains("default: `qwen-prod` (local)"), "{md}");
+    assert!(md.contains("production gateway"), "{md}");
+    assert!(md.contains("Persona files"), "{md}");
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), &r).unwrap();
     assert_eq!(load_reports(dir.path(), "docs-qa").unwrap()[0], r);
@@ -821,6 +892,21 @@ fn the_gateways_roles_answer_is_read_as_labels_only() {
     let m = GatewayModels::from_roles_answer(&v).unwrap();
     assert_eq!(m.roles["default"], "qwen-prod");
     assert_eq!(m.upstreams["default"], "local");
+    // A gateway that doesn't say its class is a test one (R3); an unknown class is refused.
+    assert_eq!(m.class, "test");
+    let mut prod = v.clone();
+    prod["class"] = serde_json::json!("production");
+    assert_eq!(
+        GatewayModels::from_roles_answer(&prod).unwrap().class,
+        "production"
+    );
+    prod["class"] = serde_json::json!("prod");
+    assert!(GatewayModels::from_roles_answer(&prod).is_err());
+    // A report written before the class was recorded reads as a test gateway's.
+    let old: GatewayModels = serde_json::from_value(serde_json::json!({"roles": {"default": "q"},
+        "upstreams": {"default": "local"}, "stub": false, "cloud_test": false, "workarounds": true}))
+    .unwrap();
+    assert_eq!(old.class, "test");
     let bad = serde_json::json!({"stub": false, "cloud_test": false, "workarounds": true,
         "roles": [{"role": "default", "model": "m", "upstream": "https://api.example.com"}]});
     assert!(GatewayModels::from_roles_answer(&bad).is_err());

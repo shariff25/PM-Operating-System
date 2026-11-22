@@ -4,7 +4,7 @@ import { canEditContent } from '../../admin/access';
 import { auditTime } from '../../admin/format';
 import { useLoad } from '../../admin/useLoad';
 import { messageOf, useApp } from '../../app-context';
-import { BotFace } from '../../components/BotParts';
+import { BotFace, PreviewTag } from '../../components/BotParts';
 import { Empty, ErrorNote, Skeleton } from '../../components/bits';
 import { Icon } from '../../components/icons';
 import { useToast } from '../../components/Toasts';
@@ -98,7 +98,10 @@ function CatalogTable({ bots, canEdit }: { bots: AdminBot[]; canEdit: boolean })
                 <span className="admin-bot-name">
                   <span className="admin-bot-face"><BotFace mascot={b.mascot ?? 'unknown'} size={28} /></span>
                   <span className="admin-bot-text">
-                    <span className="admin-bot-display">{b.display_name}</span>
+                    <span className="admin-bot-display">
+                      {b.display_name}
+                      {b.preview && <> <PreviewTag short /></>}
+                    </span>
                     <span className="admin-bot-key mono-val">{b.key}</span>
                   </span>
                 </span>
@@ -133,12 +136,14 @@ interface HeldRow {
   /** The bot's name, or the deleted key with "(deleted)". */
   bot: string;
   mascot: string;
+  /** Named with the Preview tag wherever it's shown (the owner's decision of 2026-11-21). */
+  preview: boolean;
 }
 
 function heldRows(data: AdminBotsData): HeldRow[] {
   const rows: HeldRow[] = [];
-  for (const b of data.bots) for (const d of b.held) rows.push({ draft: d, bot: b.display_name, mascot: b.mascot ?? 'unknown' });
-  for (const u of data.unknown) for (const d of u.held) rows.push({ draft: d, bot: B.heldGoneBot(u.key), mascot: 'unknown' });
+  for (const b of data.bots) for (const d of b.held) rows.push({ draft: d, bot: b.display_name, mascot: b.mascot ?? 'unknown', preview: b.preview });
+  for (const u of data.unknown) for (const d of u.held) rows.push({ draft: d, bot: B.heldGoneBot(u.key), mascot: 'unknown', preview: false });
   return rows.sort((a, b) => (b.draft.created_at ?? '').localeCompare(a.draft.created_at ?? ''));
 }
 
@@ -214,6 +219,7 @@ function HeldTable({ rows, canRelease, onRelease }: { rows: HeldRow[]; canReleas
                 <span className="bot-by">
                   <BotFace mascot={r.mascot} size={20} />
                   <span>{r.bot}</span>
+                  {r.preview && <PreviewTag short />}
                 </span>
               </td>
               <td className="c-owner"><span className="mono-val">{r.draft.user}</span></td>

@@ -77,20 +77,47 @@
 #
 # Stop with Ctrl-C; every service is stopped with it.
 #
-# Every service here runs with PMOS_DEV=1 and in-memory stores. So that nothing exported in the
-# caller's shell points one at a real database, a real vault key or another address, the
-# script first unsets every PMOS_*DATABASE_URL, PMOS_VAULT_KEY* and PMOS_*BIND (PMOS_TEST_*,
-# such as PMOS_TEST_DATABASE_URL for cargo test, and the inputs above are kept). It refuses to
-# start if any port it needs is already taken, and checks that every service it started is
-# still running.
+# Every service here runs with PMOS_DEV=1 and in-memory stores, and starts from an EMPTY
+# environment: it gets the settings this script gives it and, of what the caller's shell
+# exports, only an allow-list, so nothing there (a real database URL, vault key, address,
+# connector or OAuth setting) reaches one. Every service inherits PATH, HOME, USER, LOGNAME,
+# TMPDIR, TMP, TEMP, the locale (LANG, LANGUAGE, LC_*, TZ), the proxy and CA variables
+# (HTTPS_PROXY, HTTP_PROXY, ALL_PROXY, NO_PROXY and their lowercase forms, SSL_CERT_FILE,
+# SSL_CERT_DIR, CURL_CA_BUNDLE, REQUESTS_CA_BUNDLE, NODE_EXTRA_CA_CERTS, NODE_OPTIONS) and
+# RUST_LOG and RUST_BACKTRACE; besides, pmos-docs inherits the PMOS_DOCS_* settings above
+# (BASE_URL, NAME, PAGE_PREFIXES, API_PREFIX, PRODUCTS, ALLOWED_HOSTS, CONCURRENCY, SYNC_HOURS,
+# DELAY_MS) and the gateway PMOS_GATEWAY_ANTHROPIC_KEY, PMOS_GATEWAY_REMOTE_KEY,
+# PMOS_GATEWAY_WORKAROUNDS and PMOS_GATEWAY_RETRY_*. The Slack tokens go to the Slack service
+# by name. The script itself (the build, the Slack preflight) still runs in the caller's
+# environment. It refuses to start if any port it needs is already taken, and checks that
+# every service it started is still running.
 set -euo pipefail
 
+# The allow-list: NAME=value for each of these the caller set (above).
+SERVICE_ENV=()
+inherit() { # array name, then variable names: appends NAME=value for each one that is set
+  local -n inherit_into=$1
+  local inherit_v
+  shift
+  for inherit_v in "$@"; do
+    if [ -n "${!inherit_v+x}" ]; then
+      inherit_into+=("$inherit_v=${!inherit_v}")
+    fi
+  done
+}
+inherit SERVICE_ENV PATH HOME USER LOGNAME TMPDIR TMP TEMP LANG LANGUAGE TZ \
+  HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY https_proxy http_proxy all_proxy no_proxy \
+  SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS NODE_OPTIONS \
+  RUST_LOG RUST_BACKTRACE
 for v in $(compgen -e); do
-  case "$v" in
-    PMOS_TEST_*) ;;
-    PMOS_*DATABASE_URL | PMOS_VAULT_KEY* | PMOS_*BIND) unset "$v" ;;
-  esac
+  case "$v" in LC_*) inherit SERVICE_ENV "$v" ;; esac
 done
+DOCS_ENV=() GATEWAY_ENV=()
+inherit DOCS_ENV PMOS_DOCS_BASE_URL PMOS_DOCS_NAME PMOS_DOCS_PAGE_PREFIXES PMOS_DOCS_API_PREFIX \
+  PMOS_DOCS_PRODUCTS PMOS_DOCS_ALLOWED_HOSTS PMOS_DOCS_CONCURRENCY PMOS_DOCS_SYNC_HOURS \
+  PMOS_DOCS_DELAY_MS
+inherit GATEWAY_ENV PMOS_GATEWAY_ANTHROPIC_KEY PMOS_GATEWAY_REMOTE_KEY PMOS_GATEWAY_WORKAROUNDS \
+  PMOS_GATEWAY_RETRY_MAX_ATTEMPTS PMOS_GATEWAY_RETRY_BUDGET_SECS PMOS_GATEWAY_RETRY_BASE_MS
 
 : "${PMOS_SLACK_APP_TOKEN:?set PMOS_SLACK_APP_TOKEN (the test app's xapp- token)}"
 : "${PMOS_SLACK_BOT_TOKEN:?set PMOS_SLACK_BOT_TOKEN (the test app's xoxb- token)}"
@@ -344,9 +371,11 @@ fi
 
 PIDS=() NAMES=() LAST_PID=""
 start() { # name, then the command; logs go to $STATE/logs/<name>.log
+  # The command runs in an empty environment but the allow-list (SERVICE_ENV, above): its own
+  # settings come on its command line (`env NAME=value ...`).
   local name=$1
   shift
-  "$@" >"$STATE/logs/$name.log" 2>&1 &
+  env -i "${SERVICE_ENV[@]}" "$@" >"$STATE/logs/$name.log" 2>&1 &
   LAST_PID=$!
   PIDS+=("$LAST_PID")
   NAMES+=("$name")
@@ -365,11 +394,14 @@ stop() {
   echo
   echo "== stopping"
   for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
-  # The lanes' tool servers: started by scripts/eval-fresh-toolserver.sh, so not in PIDS.
+  # The lanes' tool servers: started by scripts/eval-fresh-toolserver.sh, so not in PIDS. Only
+  # a process running this run's tool server binary is stopped.
   for f in "$STATE"/lanes/*/toolserver.pid; do
     [ -f "$f" ] || continue
     pid=$(cat "$f")
-    if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -q pmos-toolserver; then
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+    if [[ "$pid" =~ ^[0-9]+$ ]] && [ -n "$exe" ] &&
+      [ "${exe% (deleted)}" = "$(readlink -f "$BIN/pmos-toolserver")" ]; then
       kill "$pid" 2>/dev/null || true
     fi
     rm -f "$f"
@@ -407,7 +439,8 @@ for port in "${PORTS[@]}"; do
 done
 
 echo "== starting"
-start docs env PMOS_DEV=1 PMOS_DOCS_TOKEN="$DOCS_TOKEN" PMOS_DOCS_BIND=127.0.0.1:8730 \
+start docs env ${DOCS_ENV[@]+"${DOCS_ENV[@]}"} \
+  PMOS_DEV=1 PMOS_DOCS_TOKEN="$DOCS_TOKEN" PMOS_DOCS_BIND=127.0.0.1:8730 \
   "$BIN/pmos-docs"
 wait_for http://127.0.0.1:8730/healthz docs
 
@@ -430,7 +463,8 @@ start toolserver env PMOS_DEV=1 PMOS_CONNECTORS=fake \
   "$BIN/pmos-toolserver"
 wait_for http://127.0.0.1:8710/healthz toolserver
 
-start gateway env PMOS_GATEWAY_CLOUD_TEST=1 PMOS_GATEWAY_CONFIG="$GATEWAY_CONFIG" \
+start gateway env ${GATEWAY_ENV[@]+"${GATEWAY_ENV[@]}"} \
+  PMOS_GATEWAY_CLOUD_TEST=1 PMOS_GATEWAY_CONFIG="$GATEWAY_CONFIG" \
   PMOS_GATEWAY_TOKENS="$GW_TOKENS" \
   PMOS_GATEWAY_USAGE_LOG="$STATE/usage.jsonl" \
   "$BIN/pmos-gateway"
@@ -469,13 +503,23 @@ if [ "$EVALS_LANES" -gt 0 ]; then
   mkdir -p "$STATE/lanes"
   (
     umask 077
+    # KEY=VALUE lines, read as data (never sourced) by scripts/eval-fresh-toolserver.sh: the
+    # value is the rest of the line, so none may hold a newline.
+    lane_settings=(LANE_TOOLSERVER_BIN "$BIN/pmos-toolserver"
+      PMOS_DEV 1 PMOS_CONNECTORS fake PMOS_USERS_SEED "$STATE/users.seed.yaml"
+      PMOS_SERVICE_TOKEN "$SERVICE_TOKEN" PMOS_BOT_TOKEN "$BOT_TOKEN"
+      PMOS_ASSERTION_MODE off PMOS_CONTENT_ROOT "$STATE/content"
+      PMOS_DOCS_URL "$TS_DOCS_URL" PMOS_DOCS_TOKEN "$DOCS_TOKEN" NO_PROXY "127.0.0.1,localhost")
+    for value in "${lane_settings[@]}"; do
+      case "$value" in *$'\n'* | *$'\r'*)
+        echo "error: a lane setting holds a newline (is \$PMOS_TEST_STATE's path unusual?)" >&2
+        exit 1
+        ;;
+      esac
+    done
     {
       echo "# Written by scripts/claude-test-stack.sh for this run only; it holds tokens."
-      printf '%s=%q\n' LANE_TOOLSERVER_BIN "$BIN/pmos-toolserver" \
-        PMOS_DEV 1 PMOS_CONNECTORS fake PMOS_USERS_SEED "$STATE/users.seed.yaml" \
-        PMOS_SERVICE_TOKEN "$SERVICE_TOKEN" PMOS_BOT_TOKEN "$BOT_TOKEN" \
-        PMOS_ASSERTION_MODE off PMOS_CONTENT_ROOT "$STATE/content" \
-        PMOS_DOCS_URL "$TS_DOCS_URL" PMOS_DOCS_TOKEN "$DOCS_TOKEN" NO_PROXY "127.0.0.1,localhost"
+      printf '%s=%s\n' "${lane_settings[@]}"
     } >"$STATE/lanes/toolserver.env"
     printf '#!/usr/bin/env bash\n# pmos-evals runs this before every attempt, as: <this> <lane>.\nexec %q %q "$@"\n' \
       "$ROOT/scripts/eval-fresh-toolserver.sh" "$STATE" >"$STATE/fresh-toolserver"
@@ -549,8 +593,8 @@ fi
 if [ "${PMOS_TEST_EVALS:-}" = 1 ]; then
   echo "   Benchmarks: set -a; . $STATE/evals.env; set +a; then"
   echo "   target/debug/pmos-evals run --category <c> --note \"test stack\" (tasks for evals, on pm-evals)"
-  echo "   The report records each role's model from the gateway itself (no host); a test-stack run"
-  echo "   never counts towards a bar (a testing-only upstream is on)."
+  echo "   The report records each role's model as the runtime reports its gateway's (no host); a test-stack run"
+  echo "   never counts towards a bar (a test-class gateway, with a testing-only upstream on)."
   if [ "$EVALS_LANES" -gt 0 ]; then
     echo "   Isolated: $EVALS_LANES lane(s), a fresh tool server before every attempt, one attempt per lane at a time."
   else

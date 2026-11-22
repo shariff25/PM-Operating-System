@@ -3,6 +3,10 @@
 //! (review finding N3: one token can no longer hold every slot). A waiting request is started
 //! in priority order: someone waiting in Slack (interactive) before a routine (scheduled)
 //! before a personal agent's background work, and first come, first served within a priority.
+//!
+//! Waiting is capped the same way (review finding R2): at most `max_queue` requests wait in
+//! all, each client at most its own `client_queue` of them and each believed person at most
+//! `per-user-queue`, so one token can't fill the queue and turn everyone else away.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -31,27 +35,44 @@ impl Priority {
     }
 }
 
-/// The queue is full: the caller should try again shortly.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Busy;
+/// The request would have to wait and may not: the caller should try again shortly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Busy {
+    /// The whole queue is full (`max_queue`).
+    Full,
+    /// This client already has its `client_queue` requests waiting.
+    Client,
+    /// This person already has `per-user-queue` requests waiting.
+    Person,
+}
 
 /// Whose a request is, for the caps: the person (when the gateway believes one; capped at
-/// `per_user`), and the client that sent it (capped at `client_cap`).
+/// `per_user` running and `per-user-queue` waiting), and the client that sent it (capped at
+/// `client_cap` running and `client_queue` waiting).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Owner {
     pub person: Option<String>,
     pub client: String,
     pub client_cap: usize,
+    pub client_queue: usize,
 }
 
 impl Owner {
-    /// A request of `client`'s, for `person` when there is one.
+    /// A request of `client`'s, for `person` when there is one, with room to wait for twice
+    /// `client_cap` (see [`Owner::with_queue`]).
     pub fn new(person: Option<&str>, client: &str, client_cap: usize) -> Self {
         Self {
             person: person.map(str::to_string),
             client: client.to_string(),
             client_cap,
+            client_queue: client_cap.saturating_mul(2),
         }
+    }
+
+    /// The same, with `client_queue` requests of this client allowed to wait.
+    pub fn with_queue(mut self, client_queue: usize) -> Self {
+        self.client_queue = client_queue;
+        self
     }
 }
 
@@ -150,12 +171,33 @@ impl Scheduler {
                 tx,
             });
             self.dispatch(&mut st);
-            // Refused only if it would have to wait and the queue is already full; a request
-            // that can start now always starts.
-            if st.waiting.len() > self.limits.max_queue {
-                if let Some(pos) = st.waiting.iter().position(|w| w.id == id) {
+            // Refused only if it would have to wait and there's no room to: the queue is full
+            // (`503`), or its client or its person already has as many waiting as it may
+            // (`429`; they count this one). A request that can start now always starts.
+            if let Some(pos) = st.waiting.iter().position(|w| w.id == id) {
+                let client_waiting = st
+                    .waiting
+                    .iter()
+                    .filter(|w| w.owner.client == owner.client)
+                    .count();
+                let person_waiting = owner.person.as_ref().map_or(0, |p| {
+                    st.waiting
+                        .iter()
+                        .filter(|w| w.owner.person.as_ref() == Some(p))
+                        .count()
+                });
+                let refuse = if st.waiting.len() > self.limits.max_queue {
+                    Some(Busy::Full)
+                } else if client_waiting > owner.client_queue {
+                    Some(Busy::Client)
+                } else if person_waiting > self.limits.person_queue() {
+                    Some(Busy::Person)
+                } else {
+                    None
+                };
+                if let Some(why) = refuse {
                     st.waiting.remove(pos);
-                    return Err(Busy);
+                    return Err(why);
                 }
             }
             id
@@ -352,9 +394,99 @@ mod tests {
         // Cy would have to wait, and there's no room to: refused, and nothing is left behind.
         assert!(matches!(
             s.acquire(&who("cy"), Priority::Interactive).await,
-            Err(Busy)
+            Err(Busy::Full)
         ));
         assert_eq!(s.snapshot(), (2, 1));
+    }
+
+    /// Waits until the scheduler holds `want` (running, waiting).
+    async fn settle(s: &Arc<Scheduler>, want: (usize, usize)) {
+        for _ in 0..200 {
+            if s.snapshot() == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the scheduler never reached {want:?}: {:?}", s.snapshot());
+    }
+
+    #[tokio::test]
+    async fn one_client_cant_fill_the_queue_and_turn_others_away() {
+        // R2: one slot, room for 8 to wait, but each client may have only 2 waiting.
+        let s = sched(1, 8, 8);
+        let busy = Owner::new(None, "worker", 1).with_queue(2);
+        let held = s.acquire(&busy, Priority::Interactive).await.unwrap();
+        let mut waiters = Vec::new();
+        for _ in 0..2 {
+            let (s2, o) = (s.clone(), busy.clone());
+            waiters.push(tokio::spawn(async move {
+                s2.acquire(&o, Priority::Interactive).await.map(drop)
+            }));
+        }
+        settle(&s, (1, 2)).await;
+        // Its third would wait too: refused, as the client's own excess.
+        assert_eq!(
+            s.acquire(&busy, Priority::Interactive).await.err(),
+            Some(Busy::Client)
+        );
+        assert_eq!(s.snapshot(), (1, 2), "nothing is left behind");
+        // Another client still gets its places in the queue.
+        let other = Owner::new(None, "runtime", 1).with_queue(2);
+        for _ in 0..2 {
+            let (s2, o) = (s.clone(), other.clone());
+            waiters.push(tokio::spawn(async move {
+                s2.acquire(&o, Priority::Personal).await.map(drop)
+            }));
+        }
+        settle(&s, (1, 4)).await;
+        drop(held);
+        for w in waiters {
+            assert_eq!(w.await.unwrap(), Ok(()));
+        }
+        assert_eq!(s.snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn one_person_cant_fill_the_queue_through_a_trusted_client() {
+        // A trusted client may name many people; each may have `per-user-queue` waiting
+        // (default twice `per-user`: here 2), whichever client sends them.
+        let s = sched(1, 1, 16);
+        assert_eq!(s.limits.person_queue(), 2);
+        let ana = Owner::new(Some("ana"), "runtime", 8);
+        let held = s.acquire(&ana, Priority::Interactive).await.unwrap();
+        let mut waiters = Vec::new();
+        for client in ["runtime", "bot-docs"] {
+            let (s2, o) = (s.clone(), Owner::new(Some("ana"), client, 8));
+            waiters.push(tokio::spawn(async move {
+                s2.acquire(&o, Priority::Interactive).await.map(drop)
+            }));
+        }
+        settle(&s, (1, 2)).await;
+        assert_eq!(
+            s.acquire(
+                &Owner::new(Some("ana"), "bot-docs", 8),
+                Priority::Interactive
+            )
+            .await
+            .err(),
+            Some(Busy::Person)
+        );
+        // Bo, through the same client, still waits.
+        let (s2, bo) = (s.clone(), Owner::new(Some("bo"), "runtime", 8));
+        waiters.push(tokio::spawn(async move {
+            s2.acquire(&bo, Priority::Interactive).await.map(drop)
+        }));
+        settle(&s, (1, 3)).await;
+        drop(held);
+        for w in waiters {
+            assert_eq!(w.await.unwrap(), Ok(()));
+        }
+        // `per-user-queue` is configurable.
+        let s = Scheduler::new(Limits {
+            per_user_queue: Some(5),
+            ..Limits::default()
+        });
+        assert_eq!(s.limits.person_queue(), 5);
     }
 
     #[tokio::test]

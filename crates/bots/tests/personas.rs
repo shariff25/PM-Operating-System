@@ -457,6 +457,15 @@ async fn personas_are_listed_for_the_clients(env: &Env) {
         // The Preview label is carried for the screens ("Preview: not yet benchmarked").
         assert_eq!(body["personas"][0]["preview"], false);
         assert_eq!(body["personas"][1]["preview"], true);
+        // R3: the benchmark runner (and only it) is told what the runtime's own gateway
+        // serves: model ids, upstream kinds and the class, never an address.
+        if client == "evals" {
+            assert_eq!(body["gateway"]["class"], "production", "{body}");
+            assert_eq!(body["gateway"]["roles"][0]["model"], "qwen-prod");
+            assert!(!body.to_string().contains("10.9.9.9"), "{body}");
+        } else {
+            assert!(body.get("gateway").is_none(), "{client}: {body}");
+        }
     }
     let (status, _) = env.get("/v1/personas", "worker", None).await;
     assert_eq!(status, 403);

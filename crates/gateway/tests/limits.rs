@@ -1,6 +1,8 @@
 //! Review findings N3 and N4 and their Lows: which clients' caller headers are believed, the
 //! per-client cap, the queue deadline, a stream's total time, the answer size cap, a caller
-//! that hangs up, upstream URLs kept from callers, and `GET /v1/pmos/roles`.
+//! that hangs up, upstream URLs kept from callers, and `GET /v1/pmos/roles`; and review
+//! findings R1 (a PM's own bot names only that PM), R2 (caps on calls waiting) and the Low on
+//! bare client patterns.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,7 +13,9 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use pmos_gateway::config::{Client, Models};
+use pmos_gateway::config::{
+    handle_in_name, valid_client_name, Client, Config, GatewayClass, Models, UserRule,
+};
 use pmos_gateway::scheduler::Priority;
 use pmos_gateway::usage::UsageLog;
 use pmos_gateway::{router, GatewayConfig};
@@ -21,6 +25,8 @@ use tokio_util::sync::CancellationToken;
 const RUNTIME: &str = "limits-test-runtime-token-0123456789";
 const EVALS: &str = "limits-test-evals-token-0123456789ab";
 const OTHER: &str = "limits-test-other-token-0123456789ab";
+const BOT_ANA: &str = "limits-test-bot-pm-ana-token-0123456";
+const BOT_DOCS: &str = "limits-test-bot-docs-token-01234567";
 
 async fn serve(app: Router) -> (String, CancellationToken) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -196,6 +202,8 @@ async fn gateway(limits: &str, clients: &str) -> Gw {
             client("runtime", RUNTIME),
             client("evals", EVALS),
             client("other", OTHER),
+            client("bot-pm-ana", BOT_ANA),
+            client("bot-docs", BOT_DOCS),
         ],
         usage: usage.clone(),
         stub: false,
@@ -502,6 +510,10 @@ async fn the_roles_endpoint_names_models_but_never_an_address() {
         .json()
         .await
         .unwrap();
+    assert_eq!(
+        v["class"], "test",
+        "a config that says no class is a test gateway"
+    );
     assert_eq!(v["stub"], false);
     assert_eq!(v["cloud_test"], false);
     assert_eq!(v["workarounds"], true);
@@ -615,4 +627,244 @@ fn the_deploy_config_caps_evals_at_one_slot() {
         );
     }
     assert!(!m.client_policy("stranger").trusted);
+    // R1: each PM's own bot names only that PM; a team bot keeps naming anyone.
+    let own = m.client_policy("bot-pm-ana");
+    assert!(own.may_name("bot-pm-ana", "ana"));
+    assert!(!own.may_name("bot-pm-ana", "bo"));
+    assert!(m.client_policy("bot-docs").may_name("bot-docs", "bo"));
+    // R2: waiting is capped per client too, at twice its slots by default.
+    assert_eq!(own.max_queue, 2 * own.max_in_flight);
+    assert_eq!(m.limits.person_queue(), 2 * m.limits.per_user);
+    // R3: the Spark's gateway is the production one.
+    assert_eq!(m.class, GatewayClass::Production);
+}
+
+/// R1: a client `bot-pm-<handle>` (pattern `bot-pm-*`, `user: from-name`) may name only that
+/// PM. Naming anyone else is `403`, and the usage log records the attempt; a team bot
+/// (`bot-docs`) and the runtime still name anyone.
+#[tokio::test]
+async fn a_pms_own_bot_names_only_that_pm() {
+    let gw = gateway(
+        "{max-in-flight: 4, per-user: 2}",
+        "{runtime: {trusted: true}, bot-pm-*: {trusted: true, user: from-name}, bot-*: {trusted: true}}",
+    )
+    .await;
+    let send = |token: &'static str, user: Option<&'static str>| {
+        let mut req = ask(&gw, token, "hi", false).header("x-pmos-run", "r1");
+        if let Some(u) = user {
+            req = req.header("x-pmos-user", u);
+        }
+        req.send()
+    };
+    assert_eq!(send(BOT_ANA, Some("ana")).await.unwrap().status(), 200);
+    assert_eq!(send(BOT_ANA, None).await.unwrap().status(), 200);
+    let res = send(BOT_ANA, Some("bo")).await.unwrap();
+    assert_eq!(res.status(), 403);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "permission_error");
+    // Nothing went to the model server for it.
+    assert_eq!(gw.up.seen.lock().unwrap().len(), 2);
+    // The team bot and the runtime name anyone.
+    assert_eq!(send(BOT_DOCS, Some("bo")).await.unwrap().status(), 200);
+    assert_eq!(send(RUNTIME, Some("bo")).await.unwrap().status(), 200);
+    let events = gw.usage.recent();
+    let refused: Vec<_> = events.iter().filter(|e| e.status == 403).collect();
+    assert_eq!(refused.len(), 1, "{events:?}");
+    let line = refused[0];
+    assert_eq!(line.client, "bot-pm-ana");
+    assert_eq!(line.user.as_deref(), Some("bo"), "whom it tried to name");
+    assert_eq!(line.attempts, 0);
+    assert!(line.refused.is_some());
+    let ok_for_ana = events
+        .iter()
+        .filter(|e| e.client == "bot-pm-ana" && e.status == 200)
+        .count();
+    assert_eq!(ok_for_ana, 2);
+}
+
+/// R1: every valid handle gives a personal bot whose gateway client name (`bot-pm-<handle>`
+/// as `personal_bot_name` writes it) is a valid client name, falls under the deploy config's
+/// `bot-pm-*` rule, and may name that handle and no other.
+#[test]
+fn every_valid_handle_fits_a_client_name_that_names_only_it() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let m = Models::from_yaml(&std::fs::read_to_string(root.join("deploy/gateway.yaml")).unwrap())
+        .unwrap();
+    let mut handles: Vec<String> = [
+        "ana",
+        "a",
+        "0",
+        "ana.k",
+        "ana_k",
+        "a.b_c-d",
+        "ana--k",
+        "x1.y2",
+        "a.",
+        "a_",
+        "a-",
+        "ben.de-la-cruz",
+        "9lives",
+        "pm",
+        "bot",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    // Long ones: up to the 64 characters a handle may have, with every allowed character.
+    for n in [24, 28, 29, 30, 31, 32, 33, 40, 63, 64] {
+        handles.push("x".repeat(n));
+        handles.push(
+            format!("a{}", ".b_c-".repeat(n / 5))
+                .chars()
+                .take(n)
+                .collect(),
+        );
+    }
+    // Every one- and two-character handle.
+    let first: Vec<char> = ('a'..='z').chain('0'..='9').collect();
+    let rest: Vec<char> = first.iter().copied().chain(['.', '_', '-']).collect();
+    for a in &first {
+        handles.push(a.to_string());
+        for b in &rest {
+            handles.push(format!("{a}{b}"));
+        }
+    }
+    let token = |i: usize| format!("{i:0>40}");
+    for (i, h) in handles.iter().enumerate() {
+        assert!(
+            pmos_contract::model::valid_handle(h),
+            "{h} should be a handle"
+        );
+        let client = format!("bot-{}", pmos_contract::onboarding::personal_bot_name(h));
+        assert!(valid_client_name(&client), "{h}: `{client}`");
+        // PMOS_GATEWAY_TOKENS takes it.
+        let cfg = Config::from_lookup(|k| {
+            (k == "PMOS_GATEWAY_TOKENS").then(|| format!("{client}={}", token(i)))
+        });
+        assert!(cfg.is_ok(), "{h}: {:?}", cfg.err());
+        let p = m.client_policy(&client);
+        assert!(p.trusted, "{client}");
+        assert!(
+            matches!(p.user, UserRule::FromName { .. }),
+            "{client} falls under bot-pm-*"
+        );
+        assert!(p.may_name(&client, h), "{client} may name {h}");
+        for other in ["zz-someone-else", "ana-x"] {
+            if handle_in_name(other) != handle_in_name(h) {
+                assert!(!p.may_name(&client, other), "{client} named {other}");
+            }
+        }
+    }
+    // A client that is only the prefix names no one.
+    assert!(!m.client_policy("bot-pm-").may_name("bot-pm-", "ana"));
+}
+
+/// R2: one client can't fill the queue and so turn every other client away; its own excess
+/// is `429` with `Retry-After` (and a usage line), while another client still queues.
+#[tokio::test]
+async fn one_client_cant_take_every_place_in_the_queue() {
+    let gw = Arc::new(
+        gateway(
+            "{max-in-flight: 1, per-user: 4, max-queue: 6}",
+            "{evals: {max-in-flight: 1, max-queue: 2}, runtime: {trusted: true, max-in-flight: 1}}",
+        )
+        .await,
+    );
+    let send = |token: &'static str, text: &'static str| {
+        let gw = gw.clone();
+        tokio::spawn(async move {
+            let res = ask(&gw, token, text, false).send().await.unwrap();
+            let retry = res
+                .headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap().to_string());
+            (res.status().as_u16(), retry)
+        })
+    };
+    // One call runs; two of the same client's wait; its fourth may not.
+    let running = send(EVALS, "slow 400");
+    eventually("one runs", async || load(&gw).await == (1, 0)).await;
+    let waiting: Vec<_> = (0..2).map(|_| send(EVALS, "slow 10")).collect();
+    eventually("two wait", async || load(&gw).await == (1, 2)).await;
+    assert_eq!(
+        send(EVALS, "slow 10").await.unwrap(),
+        (429, Some("5".to_string()))
+    );
+    // Another client's calls still get places, though the first client asked first.
+    let others: Vec<_> = (0..2).map(|_| send(RUNTIME, "slow 10")).collect();
+    eventually("four wait", async || load(&gw).await == (1, 4)).await;
+    assert_eq!(running.await.unwrap().0, 200);
+    for h in waiting.into_iter().chain(others) {
+        assert_eq!(h.await.unwrap().0, 200);
+    }
+    let refused: Vec<_> = gw
+        .usage
+        .recent()
+        .into_iter()
+        .filter(|e| e.status == 429)
+        .collect();
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].client, "evals");
+    assert!(refused[0].refused.is_some());
+}
+
+/// The Low on client patterns: a bare `*`, or one so short it covers nearly every client, is
+/// refused, and so are `user` rules that can't mean anything; and the class.
+#[test]
+fn client_patterns_and_user_rules_that_cover_too_much_are_refused() {
+    let with = |extra: &str| {
+        Models::parse(
+            &format!(
+                "upstreams: {{a: 'http://vllm/v1', c: 'anthropic+https://api.anthropic.com'}}\n\
+                 roles: {{default: {{upstream: a, model: m}}}}\n{extra}"
+            ),
+            true,
+        )
+    };
+    for (extra, want) in [
+        ("clients: {'*': {trusted: true}}", "at least 4 characters"),
+        ("clients: {'b*': {trusted: true}}", "at least 4 characters"),
+        ("clients: {'bot*': {}}", "at least 4 characters"),
+        (
+            "clients: {runtime: {trusted: true, user: from-name}}",
+            "pattern",
+        ),
+        ("clients: {bot-pm-*: {user: from-name}}", "trusted: true"),
+        (
+            "clients: {bot-pm-*: {trusted: true, user: someone}}",
+            "any` or `from-name",
+        ),
+        ("clients: {evals: {max-queue: 0}}", "at least 1"),
+        ("limits: {per-user-queue: 0}", "at least 1"),
+        ("class: staging", "production` or `test"),
+    ] {
+        let err = with(extra).unwrap_err();
+        assert!(err.contains(want), "{extra}: {err}");
+    }
+    // The shortest pattern allowed, and the rules that are.
+    let m = with("clients: {bot-*: {trusted: true}, bot-pm-*: {trusted: true, user: from-name, max-queue: 9}}")
+        .unwrap();
+    assert_eq!(m.client_policy("bot-pm-ana").max_queue, 9);
+    assert_eq!(m.class, GatewayClass::Test);
+    // A production gateway never serves a testing-only upstream.
+    let err = Models::parse(
+        "upstreams: {c: 'anthropic+https://api.anthropic.com'}\n\
+         roles: {default: {upstream: c, model: m}}\nclass: production\n",
+        true,
+    )
+    .unwrap_err();
+    assert!(err.contains("testing-only"), "{err}");
+    // Nor the stub.
+    let prod = Models::from_yaml(
+        "upstreams: {a: 'http://vllm/v1'}\nroles: {default: {upstream: a, model: m}}\nclass: production\n",
+    )
+    .unwrap();
+    let stub = Config::from_lookup(|k| match k {
+        "PMOS_GATEWAY_TOKENS" => Some(format!("runtime={}", "a".repeat(32))),
+        "PMOS_GATEWAY_STUB" => Some("1".into()),
+        _ => None,
+    })
+    .unwrap();
+    assert!(stub.check_class(&prod).is_err());
+    assert!(stub.check_class(&with("").unwrap()).is_ok());
 }

@@ -42,19 +42,30 @@ pub struct Report {
     /// any rule: which models a run measured is [`Report::gateway_models`].
     #[serde(default)]
     pub note: Option<String>,
-    /// The models the gateway said it served each role with, asked of the gateway itself
-    /// (`GET /v1/pmos/roles`) at the start of the run and again at its end, never typed by
-    /// the operator; model ids and upstream kinds only, never an address. `None`: no gateway
-    /// was configured, it couldn't be asked, or it changed during the run. A run counts
-    /// towards a bar only with this field, matching the production role models
-    /// ([`crate::history::counts`]); reports before 2026-11-22 have none.
+    /// The models the gateway said it served each role with, asked at the start of the run
+    /// and again at its end, never typed by the operator; model ids, upstream kinds and the
+    /// gateway's class only, never an address. Since review finding R3 they come from the
+    /// runtime under test (every lane's), which asks its own gateway (`GET /v1/pmos/roles`),
+    /// so they are the models of the gateway the bots used. `None`: a runtime couldn't say,
+    /// the lanes' runtimes disagreed, or the answer changed during the run. A run counts
+    /// towards a bar only with this field, from a `production` gateway, matching the
+    /// production role models ([`crate::history::counts`]); reports before 2026-11-22 have
+    /// none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_models: Option<GatewayModels>,
     /// The version (`version:` in `PERSONA.md`) of the persona the category's tasks asked,
-    /// read from the content the run used. A persona category's run counts towards
-    /// `benchmarked: true` only while the persona's version is still this one.
+    /// read from the content the run used. For display only: what counts is
+    /// [`Report::persona_hash`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona_version: Option<String>,
+    /// A hash of the persona's files in the content the run used: its `PERSONA.md`, its
+    /// role's `ROLE.md`, and every file of every skill the role lists
+    /// ([`crate::history::persona_hash`]). A persona category's run counts towards
+    /// `benchmarked: true` only while the hash of those files is still this one, so an edit
+    /// that doesn't bump `version:` still starts the streak again. Reports before 2026-11-22
+    /// have none, and count for no persona.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona_hash: Option<String>,
     /// How many times each task ran.
     #[serde(default = "one")]
     pub repeats: u32,
@@ -87,6 +98,15 @@ pub struct GatewayModels {
     pub cloud_test: bool,
     /// The gateway's own workaround switch (`PMOS_GATEWAY_WORKAROUNDS`).
     pub workarounds: bool,
+    /// The gateway's class (`class:` in its config): `production` only for the Spark's own
+    /// gateway (`deploy/gateway.yaml`), `test` otherwise, and for a gateway too old to say.
+    /// Only a `production` class counts towards a bar (review finding R3).
+    #[serde(default = "test_class")]
+    pub class: String,
+}
+
+fn test_class() -> String {
+    "test".into()
 }
 
 impl GatewayModels {
@@ -121,12 +141,18 @@ impl GatewayModels {
         if roles.is_empty() {
             return Err("the gateway reported no roles".into());
         }
+        let class = match v["class"].as_str() {
+            None | Some("test") => "test",
+            Some("production") => "production",
+            Some(c) => return Err(format!("the gateway named an unknown class `{c}`")),
+        };
         Ok(Self {
             roles,
             upstreams,
             stub: flag("stub")?,
             cloud_test: flag("cloud_test")?,
             workarounds: flag("workarounds")?,
+            class: class.to_string(),
         })
     }
 
@@ -149,6 +175,7 @@ impl GatewayModels {
         if !self.workarounds {
             parts.push("workarounds off".into());
         }
+        parts.push(format!("{} gateway", self.class));
         parts.join(", ")
     }
 }
@@ -484,6 +511,9 @@ impl Report {
         );
         if let Some(v) = &self.persona_version {
             let _ = writeln!(s, "| Persona version | `{}` |", cell(v));
+        }
+        if let Some(h) = &self.persona_hash {
+            let _ = writeln!(s, "| Persona files | `{}` |", cell(h));
         }
         if let Some(note) = &self.note {
             let _ = writeln!(s, "| Note | {} |", cell(note));

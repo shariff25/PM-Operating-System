@@ -15,8 +15,11 @@
 //! Every `/v1` call needs a client token. `X-Pmos-User` (a handle), `X-Pmos-Priority`
 //! (`interactive`, `scheduled` or `personal`) and `X-Pmos-Run` place it in the queue and the
 //! usage log. The first two are believed only from a client `clients:` marks `trusted`; any
-//! other client's calls are keyed by its name and get its configured priority. Every client
-//! has its own cap on calls in flight (`config::ClientPolicy`).
+//! other client's calls are keyed by its name and get its configured priority. A trusted
+//! client with `user: from-name` (each PM's own bot, `bot-pm-<handle>`) may name only the PM
+//! its name spells; naming anyone else is `403`, recorded in the usage log (review finding
+//! R1). Every client has its own cap on calls in flight and on calls waiting, and so has each
+//! believed person (`config::ClientPolicy`, review finding R2).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,7 +39,7 @@ use crate::anthropic;
 use crate::config::{Client, ClientPolicy, Models, Role, UpstreamKind};
 use crate::remote::{StreamScanner, ToolCallExtras};
 use crate::retry::RetryPolicy;
-use crate::scheduler::{Owner, Permit, Priority, Scheduler};
+use crate::scheduler::{Busy, Owner, Permit, Priority, Scheduler};
 use crate::usage::{UsageEvent, UsageLog};
 use crate::{stub, workarounds};
 
@@ -233,6 +236,8 @@ async fn list_workarounds(State(state): State<AppState>) -> Response {
 /// records this in its report (review finding N5), so a report says which models it measured
 /// without the operator typing them.
 async fn list_roles(State(state): State<AppState>) -> Response {
+    // `class`: `production` only for a config that says so (`deploy/gateway.yaml`), which
+    // never has the stub or a testing-only upstream on (review finding R3).
     let roles: Vec<Value> = state
         .0
         .models
@@ -254,6 +259,7 @@ async fn list_roles(State(state): State<AppState>) -> Response {
         .values()
         .any(|r| r.kind.is_cloud_test());
     Json(json!({
+        "class": state.0.models.class.as_str(),
         "stub": state.0.stub,
         "cloud_test": cloud_test,
         "workarounds": state.0.workarounds_on,
@@ -350,12 +356,29 @@ struct Caller {
     priority: Priority,
 }
 
+/// Why a call's headers were refused.
+enum Refused {
+    /// Malformed (`400`), from any client.
+    Malformed(String),
+    /// A trusted client named a person it may not name (`403`, review finding R1): the
+    /// handle it named.
+    NotItsPerson(String),
+}
+
 /// The caller's headers, checked, and then believed only as far as its client is trusted:
 /// a client `clients:` doesn't mark `trusted` is keyed by its own name and gets its
 /// configured priority, whatever `X-Pmos-User` and `X-Pmos-Priority` say (review finding
-/// N3). Malformed headers are refused from every client.
-fn caller(headers: &HeaderMap, policy: &ClientPolicy) -> Result<Caller, String> {
-    let declared = declared(headers)?;
+/// N3). A trusted client may name only the people its `user` rule allows (R1). Malformed
+/// headers are refused from every client.
+fn caller(headers: &HeaderMap, client: &str, policy: &ClientPolicy) -> Result<Caller, Refused> {
+    let declared = declared(headers).map_err(Refused::Malformed)?;
+    if policy.trusted {
+        if let Some(u) = &declared.user {
+            if !policy.may_name(client, u) {
+                return Err(Refused::NotItsPerson(u.clone()));
+            }
+        }
+    }
     Ok(if policy.trusted {
         Caller {
             user: declared.user,
@@ -403,19 +426,57 @@ fn declared(headers: &HeaderMap) -> Result<Declared, String> {
     })
 }
 
-/// Waits for a slot for at most `limits.queue-wait-secs`. `None`: the queue was full, or the
-/// wait ran out; either way the place in the queue has been given back.
-async fn slot(inner: &Inner, owner: &Owner, priority: Priority) -> Result<Permit, &'static str> {
-    let wait = Duration::from_secs(inner.models.limits.queue_wait_secs);
-    match tokio::time::timeout(wait, inner.sched.acquire(owner, priority)).await {
-        Ok(Ok(p)) => Ok(p),
-        Ok(Err(_)) => Err("the model queue is full; try again shortly"),
-        Err(_) => Err("no model slot came free in time; try again shortly"),
+/// Why no slot was had.
+#[derive(Clone, Copy)]
+enum NoSlot {
+    /// The queue had no room for it ([`Busy`]).
+    Refused(Busy),
+    /// It waited `limits.queue-wait-secs` and none came free.
+    TimedOut,
+}
+
+impl NoSlot {
+    /// `429` when the caller's own client or person already had its share waiting (R2), else
+    /// `503`; with `Retry-After` either way.
+    fn status(self) -> StatusCode {
+        match self {
+            Self::Refused(Busy::Client | Busy::Person) => StatusCode::TOO_MANY_REQUESTS,
+            Self::Refused(Busy::Full) | Self::TimedOut => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Refused(Busy::Full) => "the model queue is full; try again shortly",
+            Self::Refused(Busy::Client) => {
+                "this client already has as many model calls waiting as it may; try again shortly"
+            }
+            Self::Refused(Busy::Person) => {
+                "this person already has as many model calls waiting as they may; try again shortly"
+            }
+            Self::TimedOut => "no model slot came free in time; try again shortly",
+        }
     }
 }
 
-fn busy(message: &str) -> Response {
-    let mut res = error(StatusCode::SERVICE_UNAVAILABLE, "server_busy", message);
+/// Waits for a slot for at most `limits.queue-wait-secs`. `Err`: no room to wait, or the wait
+/// ran out; either way the place in the queue has been given back.
+async fn slot(inner: &Inner, owner: &Owner, priority: Priority) -> Result<Permit, NoSlot> {
+    let wait = Duration::from_secs(inner.models.limits.queue_wait_secs);
+    match tokio::time::timeout(wait, inner.sched.acquire(owner, priority)).await {
+        Ok(Ok(p)) => Ok(p),
+        Ok(Err(why)) => Err(NoSlot::Refused(why)),
+        Err(_) => Err(NoSlot::TimedOut),
+    }
+}
+
+fn busy(why: NoSlot) -> Response {
+    let kind = if why.status() == StatusCode::TOO_MANY_REQUESTS {
+        "rate_limit_error"
+    } else {
+        "server_busy"
+    };
+    let mut res = error(why.status(), kind, why.message());
     res.headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
     res
@@ -580,20 +641,79 @@ async fn forward(
         );
     };
     let policy = inner.models.client_policy(&client);
-    let who = match caller(&headers, &policy) {
+    let stream = endpoint == Endpoint::Chat && req["stream"] == json!(true);
+    // A usage line for a call refused before it reached the queue or a slot.
+    let refused_line = |status: u16,
+                        user: Option<String>,
+                        run: Option<String>,
+                        priority: Priority,
+                        refused: &'static str| UsageEvent {
+        at: Utc::now(),
+        client: client.clone(),
+        user,
+        run,
+        endpoint: endpoint.path(),
+        role: role.name.clone(),
+        model: role.model.clone(),
+        upstream: role.upstream_host(),
+        priority,
+        stream,
+        stub: inner.stub,
+        status,
+        attempt: 0,
+        attempts: 0,
+        retrying: false,
+        queue_ms: started.elapsed().as_millis() as u64,
+        latency_ms: started.elapsed().as_millis() as u64,
+        prompt_tokens: None,
+        completion_tokens: None,
+        workarounds: Vec::new(),
+        refused: Some(refused),
+    };
+    let who = match caller(&headers, &client, &policy) {
         Ok(c) => c,
-        Err(m) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", m),
+        Err(Refused::Malformed(m)) => {
+            return error(StatusCode::BAD_REQUEST, "invalid_request_error", m)
+        }
+        Err(Refused::NotItsPerson(named)) => {
+            // R1: the client's token is believed only for its own PM. The line names whom it
+            // tried to name, so an operator sees a worker token used for someone else.
+            tracing::warn!(client = %client, named = %named, "a client named a person it may not name");
+            inner.usage.record(refused_line(
+                403,
+                Some(named),
+                None,
+                policy.priority,
+                "names a person this client may not name",
+            ));
+            return error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "this client may not make calls for that person (X-Pmos-User)",
+            );
+        }
     };
     req["model"] = json!(role.model);
-    let stream = endpoint == Endpoint::Chat && req["stream"] == json!(true);
 
     // The person's cap applies when the gateway believes the person (a trusted client's
     // `X-Pmos-User`); the client's own cap always applies. Without a believed person, the
-    // client's cap alone bounds its calls.
-    let owner = Owner::new(who.user.as_deref(), &client, policy.max_in_flight);
+    // client's cap alone bounds its calls. The same holds for calls waiting (R2).
+    let owner =
+        Owner::new(who.user.as_deref(), &client, policy.max_in_flight).with_queue(policy.max_queue);
     let permit = match slot(inner, &owner, who.priority).await {
         Ok(p) => p,
-        Err(m) => return busy(m),
+        Err(why) => {
+            if let NoSlot::Refused(Busy::Client | Busy::Person) = why {
+                inner.usage.record(refused_line(
+                    429,
+                    who.user.clone(),
+                    who.run.clone(),
+                    who.priority,
+                    why.message(),
+                ));
+            }
+            return busy(why);
+        }
     };
     let mut event = UsageEvent {
         at: Utc::now(),
@@ -616,6 +736,7 @@ async fn forward(
         prompt_tokens: None,
         completion_tokens: None,
         workarounds: Vec::new(),
+        refused: None,
     };
     let model_header = HeaderValue::from_str(&role.model).ok();
     let finish = |mut res: Response| {

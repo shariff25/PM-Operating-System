@@ -514,6 +514,23 @@ async fn gw_models(headers: HeaderMap) -> Response {
     Json(json!({"data": [{"id": "pmos/default"}]})).into_response()
 }
 
+/// `GET /v1/pmos/roles` as a production gateway answers it, with a field the runtime must
+/// not pass on.
+async fn gw_roles(headers: HeaderMap) -> Response {
+    if headers.get("authorization").and_then(|v| v.to_str().ok())
+        != Some(&format!("Bearer {GATEWAY}"))
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(json!({
+        "class": "production", "stub": false, "cloud_test": false, "workarounds": true,
+        "roles": [{"role": "default", "alias": "pmos/default", "model": "qwen-prod",
+                   "upstream": "local"}],
+        "upstream_url": "http://10.9.9.9:8000/v1",
+    }))
+    .into_response()
+}
+
 async fn serve(app: Router, cancel: &CancellationToken) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -573,6 +590,7 @@ impl Env {
             Router::new()
                 .route("/v1/chat/completions", post(gw_chat))
                 .route("/v1/models", get(gw_models))
+                .route("/v1/pmos/roles", get(gw_roles))
                 .with_state(gw.clone()),
             &stop,
         )

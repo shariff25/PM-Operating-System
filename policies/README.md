@@ -100,6 +100,9 @@ change"):
    # production role models a report must match to count (docs/evals.md, "Which runs count").
    /evals/                                   @<org>/<team>
    /deploy/gateway.yaml                      @<org>/<team>
+   # The benchmark runner and the rules for which reports count (review of 2efb73f, R3): a
+   # change there could let a forged or test report count.
+   /crates/evals/                            @<org>/<team>
    ```
 
    A new persona whose role is not listed above needs its `ROLE.md` line added in the same pull

@@ -1470,6 +1470,12 @@ impl Runtime {
 
     // ----- readiness and loops -------------------------------------------------------------
 
+    /// What this runtime's gateway says it serves ([`Gateway::roles`]), for the benchmark
+    /// runner (review finding R3).
+    pub async fn gateway_roles(&self) -> std::result::Result<serde_json::Value, &'static str> {
+        self.gateway.roles().await
+    }
+
     /// Each of storage, the tool server, the gateway and the user directory (a snapshot at
     /// most 30 seconds old) is up or not.
     pub async fn readiness(&self) -> Readiness {
