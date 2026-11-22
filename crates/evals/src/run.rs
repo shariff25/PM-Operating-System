@@ -10,7 +10,8 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::client::{status, Runtime, RuntimeTask, TraceEntry};
-use crate::grade::{draft_text, grade, Grade};
+use crate::grade::{draft_text, grade, Check, Grade};
+use crate::isolate::Isolation;
 use crate::judge::{Gateway, Judge, JudgeStatus, JudgeVerdict};
 use crate::outcome::Outcome;
 use crate::report::{Report, TaskReport, TurnReport};
@@ -183,6 +184,10 @@ pub struct RunOptions {
     pub judges: Option<JudgeRun>,
     /// Why judges that apply aren't asked, recorded in the report.
     pub judges_skipped: Option<String>,
+    /// A fresh tool server for every attempt, in lanes ([`crate::isolate`]). `None`: every
+    /// attempt goes to the one runtime given, and its tool server keeps what earlier attempts
+    /// left (their pending drafts too).
+    pub isolation: Option<Isolation>,
 }
 
 /// At most this much of each tool result, and of all of them, goes to a judge.
@@ -531,9 +536,46 @@ async fn attempt_thread(
     }
 }
 
+/// The line for an attempt that never started because its lane couldn't get a fresh tool
+/// server: a harness failure (`harness/runtime-unreachable`), like a runtime that can't be
+/// reached, so it never counts as the bot's.
+fn not_started(task: &EvalTask, repeat: u32, error: String) -> TaskReport {
+    let outcome = Outcome {
+        runtime_error: Some(error.clone()),
+        ..Outcome::default()
+    };
+    let grade = Grade {
+        failures: vec![Check::Runtime { error }],
+    };
+    let tag = tag_failure(&outcome, &grade);
+    TaskReport {
+        id: task.id.clone(),
+        ask: task.first_ask().to_string(),
+        repeat,
+        cluster: Some(task.cluster()),
+        regression: task.regression,
+        task_id: None,
+        status: None,
+        passed: false,
+        failures: grade.failures,
+        tag: Some(tag),
+        queue_secs: None,
+        total_secs: None,
+        attempts: 0,
+        trace_read: false,
+        judges: Vec::new(),
+        turns: Vec::new(),
+        failed_turn: None,
+    }
+}
+
 /// Run every task of a category `opts.repeats` times (at most `concurrency` at once), grade
 /// and tag each attempt, and return the report. Lines are in the category's order, each
 /// task's repeats together.
+///
+/// With `opts.isolation`, each attempt instead takes a lane of its own, gets a fresh tool
+/// server there first, and runs on that lane's runtime (`rt` is not used); as many attempts
+/// run at once as there are lanes, and `concurrency` is not used.
 pub async fn run_category(
     rt: &Runtime,
     runtime_url: &str,
@@ -550,32 +592,58 @@ pub async fn run_category(
         .cloned()
         .collect();
     let limit = Arc::new(Semaphore::new(opts.concurrency.max(1)));
+    let lanes = opts.isolation.as_ref().map(|i| (i.clone(), i.pool()));
     let mut set = JoinSet::new();
     // The first run of every task goes first, so a short timeout still covers each task once.
     for repeat in 1..=repeats {
         for (i, task) in tasks.iter().cloned().enumerate() {
             let rt = rt.clone();
             let limit = limit.clone();
+            let lanes = lanes.clone();
             let bot = bot.clone();
             let level = category.level.clone();
             let persona = category.persona.clone();
             let opts = opts.clone();
             set.spawn(async move {
-                let _permit = limit
-                    .acquire_owned()
-                    .await
-                    .expect("the semaphore is never closed");
-                let line = attempt(
-                    &rt,
-                    &bot,
-                    level.as_deref(),
-                    persona.as_deref(),
-                    &task,
-                    repeat,
-                    &opts,
-                )
-                .await;
-                (i * repeats as usize + (repeat as usize - 1), line)
+                let slot = i * repeats as usize + (repeat as usize - 1);
+                let run_on = |rt: Runtime| {
+                    let (bot, level, persona, task, opts) = (&bot, &level, &persona, &task, &opts);
+                    async move {
+                        attempt(
+                            &rt,
+                            bot,
+                            level.as_deref(),
+                            persona.as_deref(),
+                            task,
+                            repeat,
+                            opts,
+                        )
+                        .await
+                    }
+                };
+                let line = match lanes {
+                    Some((isolation, pool)) => {
+                        // Held until the attempt is graded, so no other attempt shares the
+                        // lane's tool server.
+                        let lane = pool.take().await;
+                        match (isolation.fresh)(lane.n).await {
+                            Ok(()) => run_on(isolation.lanes[lane.n - 1].clone()).await,
+                            Err(e) => not_started(
+                                &task,
+                                repeat,
+                                format!("no fresh tool server for lane {}: {e}", lane.n),
+                            ),
+                        }
+                    }
+                    None => {
+                        let _permit = limit
+                            .acquire_owned()
+                            .await
+                            .expect("the semaphore is never closed");
+                        run_on(rt).await
+                    }
+                };
+                (slot, line)
             });
         }
     }
@@ -584,6 +652,10 @@ pub async fn run_category(
         let (i, line) = joined.expect("a task runner never panics");
         lines[i] = Some(line);
     }
+    let runtime_url = match &opts.isolation {
+        Some(i) => i.urls.join(", "),
+        None => runtime_url.to_string(),
+    };
     Report {
         category: category.name.clone(),
         bot,
@@ -591,11 +663,12 @@ pub async fn run_category(
         started_at,
         finished_at: Utc::now(),
         pass_bar: category.pass_bar,
-        runtime_url: runtime_url.to_string(),
+        runtime_url,
         requested_by: opts.requested_by.clone(),
         gateway_workarounds: opts.gateway_workarounds.clone(),
         note: opts.note.clone(),
         repeats,
+        isolation: opts.isolation.as_ref().map(Isolation::describe),
         judges: opts
             .judges
             .as_ref()

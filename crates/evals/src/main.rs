@@ -11,6 +11,7 @@ use pmos_evals::client::Runtime;
 use pmos_evals::config::Config;
 use pmos_evals::gate::{baseline_from_git, decide};
 use pmos_evals::history::{evaluate, latest_report, load_all, load_reports};
+use pmos_evals::isolate::Isolation;
 use pmos_evals::judge::{self, load_calibration, load_judges, load_labels, Gateway};
 use pmos_evals::load::run_load;
 use pmos_evals::report::Report;
@@ -172,6 +173,51 @@ struct RunArgs {
     no_judges: bool,
     #[command(flatten)]
     gateway: GatewayArgs,
+    /// Isolated attempts: the runtime URL of each lane, comma-separated. Each attempt takes a
+    /// free lane, gets a fresh tool server there (--fresh-cmd), and runs on that lane's
+    /// runtime; as many run at once as there are lanes. Needs --fresh-cmd.
+    #[arg(long, env = "PMOS_EVALS_LANES", value_delimiter = ',')]
+    lanes: Vec<String>,
+    /// With --lanes: the program run as `<program> <lane>` (lanes from 1) before each attempt;
+    /// it exits 0 once that lane has a fresh tool server.
+    #[arg(long, env = "PMOS_EVALS_FRESH_CMD")]
+    fresh_cmd: Option<PathBuf>,
+}
+
+/// `--lanes` and `--fresh-cmd`, both or neither.
+fn isolation(args: &RunArgs, token: &str, trace_token: Option<&str>) -> Result<Option<Isolation>> {
+    let urls: Vec<String> = args
+        .lanes
+        .iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .collect();
+    let fresh = args
+        .fresh_cmd
+        .as_ref()
+        .filter(|p| !p.as_os_str().is_empty());
+    match (urls.is_empty(), fresh) {
+        (true, None) => Ok(None),
+        (true, Some(_)) => bail!("--fresh-cmd needs --lanes (PMOS_EVALS_LANES): the runtime of each lane"),
+        (false, None) => bail!("--lanes needs --fresh-cmd (PMOS_EVALS_FRESH_CMD): how a lane gets a fresh tool server"),
+        (false, Some(program)) => {
+            if let Some(c) = args.concurrency.filter(|c| *c != urls.len()) {
+                eprintln!(
+                    "note: --concurrency {c} ignored: isolated attempts run one per lane, {} at once",
+                    urls.len()
+                );
+            }
+            Ok(Some(Isolation {
+                lanes: urls
+                    .iter()
+                    .map(|u| Runtime::new(u, token, trace_token))
+                    .collect(),
+                urls,
+                fresh: pmos_evals::isolate::command(program.clone()),
+                how: format!("`{}` before each", program.display()),
+            }))
+        }
+    }
 }
 
 #[derive(Args)]
@@ -261,6 +307,11 @@ async fn run_and_write(
         bail!("--repeats must be at least 1");
     }
     let r = resolve(&args.conn, &config, args.trace_token.as_deref())?;
+    let isolation = isolation(
+        &args,
+        args.conn.token.as_deref().unwrap_or_default(),
+        args.trace_token.as_deref(),
+    )?;
     let applicable: Vec<_> = load_judges(root)
         .map_err(|e| anyhow::anyhow!(e.join("\n")))?
         .into_iter()
@@ -297,6 +348,7 @@ async fn run_and_write(
         decline_phrases: config.decline_phrases.clone(),
         judges,
         judges_skipped,
+        isolation,
     };
     let dir = args.reports_dir.unwrap_or_else(|| root.join("reports"));
     let previous = match previous {

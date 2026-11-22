@@ -28,6 +28,7 @@ fn opts(timeout_ms: u64, repeats: u32) -> RunOptions {
         decline_phrases: vec!["don't answer".into()],
         judges: None,
         judges_skipped: None,
+        isolation: None,
     }
 }
 

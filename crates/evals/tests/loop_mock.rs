@@ -36,6 +36,7 @@ fn opts() -> RunOptions {
         decline_phrases: vec!["don't answer".into(), "couldn't find".into()],
         judges: None,
         judges_skipped: None,
+        isolation: None,
     }
 }
 
@@ -113,11 +114,11 @@ async fn repeats_run_each_task_k_times_and_report_pass_hat_k() {
         "{md}"
     );
     assert!(
-        md.contains("| pass^3 | 50% (1 of 2 tasks passed every run) |"),
+        md.contains("| All attempts passed (pass^3) | 50% (1 of 2 tasks passed every run) |"),
         "{md}"
     );
     assert!(
-        md.contains("| `flaky` | **2/3** | model/missing-fact ×1 |"),
+        md.contains("| `flaky` | **2/3** | no | model/missing-fact ×1 |"),
         "{md}"
     );
     // One cluster: the standard error falls back to the binomial.
@@ -386,6 +387,8 @@ fn cli(root: &Path, args: &[&str], stdin: Option<&str>) -> std::process::Output 
         .env_remove("PMOS_EVALS_TOKEN")
         .env_remove("PMOS_BOTS_URL")
         .env_remove("PMOS_EVALS_AS")
+        .env_remove("PMOS_EVALS_LANES")
+        .env_remove("PMOS_EVALS_FRESH_CMD")
         .env_remove("PMOS_GATEWAY_URL")
         .env_remove("PMOS_EVALS_GATEWAY_TOKEN")
         .env_remove("PMOS_EVALS_BASELINE_REF")

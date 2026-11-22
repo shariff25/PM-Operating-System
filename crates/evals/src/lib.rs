@@ -9,6 +9,7 @@ pub mod config;
 pub mod gate;
 pub mod grade;
 pub mod history;
+pub mod isolate;
 pub mod judge;
 pub mod load;
 pub mod outcome;

@@ -44,6 +44,11 @@ pub struct Report {
     /// How many times each task ran.
     #[serde(default = "one")]
     pub repeats: u32,
+    /// How attempts were kept apart, when they were ([`crate::isolate`]): "a fresh tool server
+    /// for every attempt …". `None`: every attempt shared one tool server, so a draft or record
+    /// one attempt left could change a later one (reports before 2026-11-22 are all so).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<String>,
     /// The judges that applied, and whether each was blocking in this run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub judges: Vec<JudgeStatus>,
@@ -124,6 +129,59 @@ pub struct TaskReport {
     pub failed_turn: Option<u32>,
 }
 
+/// The sub-tag of an attempt lost to the model provider or the infrastructure: the model
+/// endpoint unreachable or busy after the gateway's retries, a restart, or the worker or its
+/// sandbox going away (rule `interrupted`, `docs/evals.md`). Not the bot's doing, so the
+/// headline shows it apart; the bar still counts it as a failure.
+pub const INFRA_LOSS: &str = "harness/interrupted";
+
+/// One task's line in [`Summary`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskSummaryLine {
+    pub id: String,
+    pub passes: u32,
+    pub attempts: u32,
+    /// `passes / attempts`.
+    pub pass_rate: f64,
+    /// Every attempt passed.
+    pub all_attempts_passed: bool,
+    /// Attempts lost to the provider or infrastructure ([`INFRA_LOSS`]).
+    pub infra_losses: u32,
+}
+
+/// The run's numbers, written into the `.json` beside the lines as `summary` (computed from
+/// them, never read back). What each means is in `docs/evals.md`, "Reading a report".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Summary {
+    pub attempts: usize,
+    pub passed: usize,
+    /// The average: passes over every attempt. The bar is judged on this.
+    pub pass_rate: f64,
+    pub tasks: usize,
+    /// Tasks where every attempt passed (pass^k).
+    pub tasks_all_attempts_passed: usize,
+    /// `tasks_all_attempts_passed / tasks`: the stricter number, what a PM who asks k times
+    /// sees go right every time.
+    pub all_attempts_pass_rate: f64,
+    /// Attempts lost to the provider or infrastructure ([`INFRA_LOSS`]).
+    pub infra_losses: usize,
+    /// The pass rate over the attempts that weren't lost that way: what the bot did when it
+    /// got to answer. For information only; the bar uses `pass_rate`.
+    pub pass_rate_excluding_infra: Option<f64>,
+    /// The bar and whether `pass_rate` met it; `None` with no bar.
+    pub pass_bar: Option<f64>,
+    pub met_bar: Option<bool>,
+    pub by_task: Vec<TaskSummaryLine>,
+}
+
+/// The `.json` as written: the report, then its summary.
+#[derive(Serialize)]
+struct Written<'a> {
+    #[serde(flatten)]
+    report: &'a Report,
+    summary: Summary,
+}
+
 /// Whether `passed` of `total` meets `bar`.
 pub fn meets(passed: usize, total: usize, bar: f64) -> bool {
     total > 0 && passed as f64 + 1e-9 >= bar * total as f64
@@ -152,6 +210,48 @@ impl Report {
     pub fn met_bar(&self) -> Option<bool> {
         self.pass_bar
             .map(|bar| meets(self.passed(), self.total(), bar))
+    }
+
+    /// Attempts lost to the provider or infrastructure ([`INFRA_LOSS`]).
+    pub fn infra_losses(&self) -> usize {
+        self.tasks.iter().filter(|t| is_infra_loss(t)).count()
+    }
+
+    /// The run's numbers: the average, the all-attempts-pass rate, and the losses that
+    /// weren't the bot's.
+    pub fn summary(&self) -> Summary {
+        let tasks = summaries(self);
+        let all = tasks.iter().filter(|t| t.all_passed()).count();
+        let infra = self.infra_losses();
+        let counted = self.total() - infra;
+        Summary {
+            attempts: self.total(),
+            passed: self.passed(),
+            pass_rate: self.pass_rate(),
+            tasks: tasks.len(),
+            tasks_all_attempts_passed: all,
+            all_attempts_pass_rate: pass_hat_k(&tasks).unwrap_or(0.0),
+            infra_losses: infra,
+            pass_rate_excluding_infra: (counted > 0)
+                .then(|| self.passed() as f64 / counted as f64),
+            pass_bar: self.pass_bar,
+            met_bar: self.met_bar(),
+            by_task: tasks
+                .iter()
+                .map(|t| TaskSummaryLine {
+                    id: t.id.clone(),
+                    passes: t.passes,
+                    attempts: t.runs,
+                    pass_rate: t.rate(),
+                    all_attempts_passed: t.all_passed(),
+                    infra_losses: self
+                        .tasks
+                        .iter()
+                        .filter(|l| l.id == t.id && is_infra_loss(l))
+                        .count() as u32,
+                })
+                .collect(),
+        }
     }
 
     /// Failures per tag, the biggest bottleneck first; ties in [`Tag::ALL`] order.
@@ -241,6 +341,33 @@ impl Report {
                 );
             }
         }
+        let summary = self.summary();
+        if self.repeats > 1 {
+            let _ = writeln!(
+                s,
+                "**All attempts passed** for {} of {} tasks ({}): the share of tasks that passed every one of their {} attempts, the stricter number. The average above counts each attempt on its own; the bar is judged on the average.\n",
+                summary.tasks_all_attempts_passed,
+                summary.tasks,
+                pct(summary.all_attempts_pass_rate),
+                self.repeats
+            );
+        }
+        if summary.infra_losses > 0 {
+            let without = match summary.pass_rate_excluding_infra {
+                Some(r) => format!(
+                    "without them, {passed} of {} attempts passed ({})",
+                    total - summary.infra_losses,
+                    pct(r)
+                ),
+                None => "no attempt was left to grade".to_string(),
+            };
+            let _ = writeln!(
+                s,
+                "**Lost to the model provider or infrastructure:** {} attempt{} (`{INFRA_LOSS}`: the model endpoint unreachable or busy after retries, a restart, or the worker going away), not the bot's answer; {without}. They still count as failures for the bar.\n",
+                summary.infra_losses,
+                if summary.infra_losses == 1 { "" } else { "s" },
+            );
+        }
         let _ = writeln!(s, "| | |\n| --- | --- |");
         let _ = writeln!(s, "| Bot | `{}` |", self.bot);
         let _ = writeln!(s, "| Runtime | {} |", self.runtime_url);
@@ -258,6 +385,14 @@ impl Report {
         }
         let _ = writeln!(
             s,
+            "| Isolation | {} |",
+            match &self.isolation {
+                Some(how) => cell(how),
+                None => "none: every attempt shared one tool server, so a draft one attempt left could change a later one".to_string(),
+            }
+        );
+        let _ = writeln!(
+            s,
             "| Ran | {} to {} UTC |",
             self.started_at.format("%Y-%m-%d %H:%M:%S"),
             self.finished_at.format("%H:%M:%S")
@@ -269,7 +404,7 @@ impl Report {
             };
             let _ = writeln!(
                 s,
-                "| Pass rate | {} ± {} (standard error, {how}) |",
+                "| Pass rate (average over attempts) | {} ± {} (standard error, {how}) |",
                 pct1(self.pass_rate()),
                 pct1(se.se)
             );
@@ -279,7 +414,7 @@ impl Report {
                 let all = tasks.iter().filter(|t| t.all_passed()).count();
                 let _ = writeln!(
                     s,
-                    "| pass^{} | {} ({all} of {} tasks passed every run) |",
+                    "| All attempts passed (pass^{}) | {} ({all} of {} tasks passed every run) |",
                     self.repeats,
                     pct(k),
                     tasks.len()
@@ -363,7 +498,11 @@ impl Report {
         if self.repeats > 1 {
             let _ = writeln!(
                 s,
-                "| Task | Passes | Failure tags | Why (latest failure) |\n| --- | --- | --- | --- |"
+                "Passes counts the attempts that passed; All passed says whether every attempt did.\n"
+            );
+            let _ = writeln!(
+                s,
+                "| Task | Passes | All passed | Failure tags | Why (latest failure) |\n| --- | --- | --- | --- | --- |"
             );
             for t in &tasks {
                 let mine: Vec<&TaskReport> = self.tasks.iter().filter(|l| l.id == t.id).collect();
@@ -391,8 +530,9 @@ impl Report {
                 };
                 let _ = writeln!(
                     s,
-                    "| `{}` | {passes} | {} | {} |",
+                    "| `{}` | {passes} | {} | {} | {} |",
                     t.id,
+                    if t.all_passed() { "yes" } else { "no" },
                     cell(&tags),
                     cell(&why)
                 );
@@ -481,6 +621,13 @@ impl Report {
         }
         s
     }
+}
+
+fn is_infra_loss(t: &TaskReport) -> bool {
+    !t.passed
+        && t.tag
+            .as_ref()
+            .is_some_and(|x| x.sub.as_deref() == Some(INFRA_LOSS))
 }
 
 /// A tag as a report shows it: the sub-tag when there is one, else the bottleneck.
@@ -576,7 +723,11 @@ pub fn write_with(
         }
         n += 1;
     };
-    let body = serde_json::to_string_pretty(report).map_err(std::io::Error::other)?;
+    let written = Written {
+        report,
+        summary: report.summary(),
+    };
+    let body = serde_json::to_string_pretty(&written).map_err(std::io::Error::other)?;
     std::fs::write(&json, body + "\n")?;
     std::fs::write(&md, report.to_markdown_with(previous))?;
     Ok(md)

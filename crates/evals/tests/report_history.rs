@@ -71,6 +71,7 @@ fn report(date: &str, passed: usize, total: usize) -> Report {
         repeats: 1,
         judges: Vec::new(),
         judges_skipped: None,
+        isolation: None,
         tasks,
     }
 }
@@ -431,13 +432,109 @@ fn repeats_show_passes_out_of_k_and_pass_hat_k() {
         "{md}"
     );
     assert!(
-        md.contains("| pass^3 | 50% (1 of 2 tasks passed every run) |"),
+        md.contains("| All attempts passed (pass^3) | 50% (1 of 2 tasks passed every run) |"),
         "{md}"
     );
-    assert!(md.contains("| `t-a` | 3/3 |"), "{md}");
-    assert!(md.contains("| `t-b` | **1/3** | model ×2 |"), "{md}");
+    assert!(md.contains("| `t-a` | 3/3 | yes |"), "{md}");
+    assert!(md.contains("| `t-b` | **1/3** | no | model ×2 |"), "{md}");
     assert!(md.contains("### `t-b`, run 3 of 3"), "{md}");
-    assert!(md.contains("| Pass rate | 66.7% ± "), "{md}");
+    assert!(md.contains("| Pass rate (average over attempts) | 66.7% ± "), "{md}");
+}
+
+/// The all-attempts-pass rate beside the average, per task and per category, in the markdown
+/// and the `.json`; and attempts lost to the provider or infrastructure shown apart in the
+/// headline, while the bar still counts them.
+#[test]
+fn summary_has_the_all_attempts_rate_and_the_infra_losses_apart() {
+    let mut r = report("2026-11-22", 0, 0);
+    r.repeats = 3;
+    let interrupted = || {
+        let mut l = line(
+            "t-b",
+            Some((
+                Tag::Harness,
+                "interrupted",
+                Check::Status {
+                    expected: "`done`".into(),
+                    got: "failed".into(),
+                },
+            )),
+        );
+        l.tag.as_mut().unwrap().sub = Some("harness/interrupted".into());
+        l
+    };
+    // t-a: 3/3. t-b: 2 passes, 1 lost to the provider. t-c: 1 pass, 2 the bot's failures.
+    let mut push = |mut l: TaskReport, k: u32| {
+        l.repeat = k;
+        r.tasks.push(l);
+    };
+    for k in 1..=3 {
+        push(line("t-a", None), k);
+    }
+    push(line("t-b", None), 1);
+    push(interrupted(), 2);
+    push(line("t-b", None), 3);
+    push(line("t-c", None), 1);
+    for k in 2..=3 {
+        push(
+            line(
+                "t-c",
+                Some((Tag::Model, "model", Check::MissingText { text: "x".into() })),
+            ),
+            k,
+        );
+    }
+    let s = r.summary();
+    assert_eq!((s.attempts, s.passed), (9, 6));
+    assert!((s.pass_rate - 6.0 / 9.0).abs() < 1e-9);
+    assert_eq!((s.tasks, s.tasks_all_attempts_passed), (3, 1));
+    assert!((s.all_attempts_pass_rate - 1.0 / 3.0).abs() < 1e-9);
+    assert_eq!(s.infra_losses, 1);
+    assert!((s.pass_rate_excluding_infra.unwrap() - 6.0 / 8.0).abs() < 1e-9);
+    // The bar (80%) is judged on every attempt, losses included: 6 of 9 is below it, though
+    // 6 of 8 would be closer.
+    assert_eq!(s.met_bar, Some(false));
+    assert_eq!(r.met_bar(), Some(false));
+    let b = &s.by_task[1];
+    assert_eq!(
+        (b.id.as_str(), b.passes, b.attempts, b.all_attempts_passed, b.infra_losses),
+        ("t-b", 2, 3, false, 1)
+    );
+    assert!(s.by_task[0].all_attempts_passed);
+
+    let md = r.to_markdown();
+    assert!(
+        md.contains("**All attempts passed** for 1 of 3 tasks (33%)"),
+        "{md}"
+    );
+    assert!(md.contains("the bar is judged on the average"), "{md}");
+    assert!(
+        md.contains("**Lost to the model provider or infrastructure:** 1 attempt (`harness/interrupted`"),
+        "{md}"
+    );
+    assert!(md.contains("without them, 6 of 8 attempts passed (75%)"), "{md}");
+    assert!(md.contains("They still count as failures for the bar."), "{md}");
+    assert!(md.contains("| `t-b` | **2/3** | no |"), "{md}");
+    assert!(md.contains("| `t-a` | 3/3 | yes |"), "{md}");
+    assert!(md.contains("| Isolation | none: every attempt shared one tool server"), "{md}");
+
+    // The .json carries the summary, and still reads back as the same report.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), &r).unwrap();
+    let json_path = path.with_extension("json");
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert_eq!(raw["summary"]["tasks_all_attempts_passed"], 1);
+    assert_eq!(raw["summary"]["infra_losses"], 1);
+    assert_eq!(raw["summary"]["by_task"][2]["id"], "t-c");
+    assert_eq!(raw["summary"]["by_task"][2]["all_attempts_passed"], false);
+    let back = pmos_evals::report::read(&json_path).unwrap();
+    assert_eq!(back, r);
+
+    // No losses: no such line.
+    let clean = report("2026-11-22", 2, 2);
+    assert!(!clean.to_markdown().contains("Lost to the model provider"));
+    assert_eq!(clean.summary().infra_losses, 0);
 }
 
 /// Copy one of the repository's categories into `root/categories`.
