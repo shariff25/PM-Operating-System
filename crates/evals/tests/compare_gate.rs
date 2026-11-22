@@ -51,6 +51,8 @@ fn report(date: &str, tasks: &[(&str, Option<&str>, &[bool])]) -> Report {
         requested_by: "ana".into(),
         gateway_workarounds: None,
         note: None,
+        gateway_models: None,
+        persona_version: None,
         repeats,
         judges: vec![],
         judges_skipped: None,

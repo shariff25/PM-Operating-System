@@ -652,6 +652,27 @@ impl Gateway {
         }
     }
 
+    /// Which model serves each role, as the gateway itself says (`GET /v1/pmos/roles`): the
+    /// report's [`crate::report::GatewayModels`]. Never a URL: errors don't carry one.
+    pub async fn models(&self) -> Result<crate::report::GatewayModels, String> {
+        let resp = self
+            .http
+            .get(format!("{}/pmos/roles", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("the gateway: {}", e.without_url()))?;
+        let code = resp.status();
+        if !code.is_success() {
+            return Err(format!("the gateway answered {code} to GET /v1/pmos/roles"));
+        }
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("the gateway's roles answer: {}", e.without_url()))?;
+        crate::report::GatewayModels::from_roles_answer(&v)
+    }
+
     /// Ask a judge about one output: its [`Reply`], or the error.
     pub async fn ask(&self, judge: &Judge, input: &str, output: &str) -> Result<Reply, String> {
         let body = json!({

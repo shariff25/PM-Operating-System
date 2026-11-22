@@ -76,7 +76,21 @@
 #                         least two).
 #
 # Stop with Ctrl-C; every service is stopped with it.
+#
+# Every service here runs with PMOS_DEV=1 and in-memory stores. So that nothing exported in the
+# caller's shell points one at a real database, a real vault key or another address, the
+# script first unsets every PMOS_*DATABASE_URL, PMOS_VAULT_KEY* and PMOS_*BIND (PMOS_TEST_*,
+# such as PMOS_TEST_DATABASE_URL for cargo test, and the inputs above are kept). It refuses to
+# start if any port it needs is already taken, and checks that every service it started is
+# still running.
 set -euo pipefail
+
+for v in $(compgen -e); do
+  case "$v" in
+    PMOS_TEST_*) ;;
+    PMOS_*DATABASE_URL | PMOS_VAULT_KEY* | PMOS_*BIND) unset "$v" ;;
+  esac
+done
 
 : "${PMOS_SLACK_APP_TOKEN:?set PMOS_SLACK_APP_TOKEN (the test app's xapp- token)}"
 : "${PMOS_SLACK_BOT_TOKEN:?set PMOS_SLACK_BOT_TOKEN (the test app's xoxb- token)}"
@@ -252,6 +266,12 @@ limits:
   max-in-flight: $GW_IN_FLIGHT
   per-user: $GW_PER_USER
   max-queue: 64
+# The runtime and the one \`worker\` token all harness workers here share name the PM (so
+# they're trusted) and may use every slot; \`evals\` is the benchmark judges (docs/gateway.md).
+clients:
+  runtime: {trusted: true, max-in-flight: $GW_IN_FLIGHT}
+  worker: {trusted: true, max-in-flight: $GW_IN_FLIGHT}
+  evals: {max-in-flight: 2, priority: personal}
 EOF
 else
   GATEWAY_CONFIG=config/gateway.claude-test.yaml
@@ -298,6 +318,7 @@ if [ "${PMOS_TEST_EVALS:-}" = 1 ]; then
       "PMOS_BOTS_URL=http://127.0.0.1:8750" "PMOS_EVALS_TOKEN=$RT_EVALS" \
       "PMOS_EVALS_TRACE_TOKEN=$RT_CONSOLE" "PMOS_EVALS_AS=evals" \
       "PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1" "PMOS_EVALS_GATEWAY_TOKEN=$GW_EVALS" \
+      "PMOS_EVALS_CONTENT=$STATE/content" \
       "NO_PROXY=127.0.0.1,localhost" >"$STATE/evals.env"
     if [ "$EVALS_LANES" -gt 0 ]; then
       lanes=()
@@ -321,13 +342,24 @@ if [ "${PMOS_TEST_PASSWORD_LOGIN:-}" = 1 ]; then
   WEB_PASSWORD=(PMOS_WEB_PASSWORD_LOGIN=1 PMOS_WEB_DIRECT=1 PMOS_WEB_DEV_LOGIN_WITH_PASSWORD=1)
 fi
 
-PIDS=()
+PIDS=() NAMES=() LAST_PID=""
 start() { # name, then the command; logs go to $STATE/logs/<name>.log
   local name=$1
   shift
   "$@" >"$STATE/logs/$name.log" 2>&1 &
-  PIDS+=($!)
-  echo "   $name (pid $!)"
+  LAST_PID=$!
+  PIDS+=("$LAST_PID")
+  NAMES+=("$name")
+  echo "   $name (pid $LAST_PID)"
+}
+alive_or_fail() { # pid, name: the service must still be running
+  if ! kill -0 "$1" 2>/dev/null; then
+    echo "error: $2 exited; see $STATE/logs/$2.log" >&2
+    exit 1
+  fi
+}
+port_taken() { # port: something already accepts connections on 127.0.0.1:<port>
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
 }
 stop() {
   echo
@@ -347,14 +379,32 @@ stop() {
   wait 2>/dev/null || true
 }
 trap stop EXIT INT TERM
-wait_for() { # url, name
+wait_for() { # url, name[, pid (default: the last one started)]
+  local pid=${3:-$LAST_PID}
   for _ in $(seq 1 60); do
-    if curl -fsS --noproxy '*' "$1" >/dev/null 2>&1; then return 0; fi
+    # A service that exited can't be what answers: never take another's health check for it.
+    alive_or_fail "$pid" "$2"
+    if curl -fsS --noproxy '*' "$1" >/dev/null 2>&1; then
+      alive_or_fail "$pid" "$2"
+      return 0
+    fi
     sleep 1
   done
   echo "error: $2 didn't come up; see $STATE/logs/$2.log" >&2
   exit 1
 }
+
+# Every port this run listens on must be free first: otherwise a health check could be
+# answered by something else (another stack), and this run would talk to it.
+PORTS=(8730 8710 8740 8750)
+[ "${PMOS_TEST_WEB:-}" = 1 ] && PORTS+=(8770)
+for i in $(seq 1 "$EVALS_LANES"); do PORTS+=($((8710 + 100 * i)) $((8750 + 100 * i))); done
+for port in "${PORTS[@]}"; do
+  if port_taken "$port"; then
+    echo "error: port $port on 127.0.0.1 is already in use; stop what runs there (another test stack?) first" >&2
+    exit 1
+  fi
+done
 
 echo "== starting"
 start docs env PMOS_DEV=1 PMOS_DOCS_TOKEN="$DOCS_TOKEN" PMOS_DOCS_BIND=127.0.0.1:8730 \
@@ -475,6 +525,13 @@ if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
   wait_for http://127.0.0.1:8770/healthz web
 fi
 
+# The workers and the Slack service have no health check to wait for: give them a moment, then
+# make sure every service this script started is still running.
+sleep 2
+for i in "${!PIDS[@]}"; do
+  alive_or_fail "${PIDS[$i]}" "${NAMES[$i]}"
+done
+
 echo
 echo "== PM OS test stack is up, with $MODEL_DESC behind the gateway."
 echo "   In the test Slack workspace, DM the PM OS app:"
@@ -491,7 +548,9 @@ if [ "${PMOS_TEST_PASSWORD_LOGIN:-}" = 1 ]; then
 fi
 if [ "${PMOS_TEST_EVALS:-}" = 1 ]; then
   echo "   Benchmarks: set -a; . $STATE/evals.env; set +a; then"
-  echo "   target/debug/pmos-evals run --category <c> --note \"model: ${PMOS_TEST_MODEL:-the test model}\" (tasks for evals, on pm-evals)"
+  echo "   target/debug/pmos-evals run --category <c> --note \"test stack\" (tasks for evals, on pm-evals)"
+  echo "   The report records each role's model from the gateway itself (no host); a test-stack run"
+  echo "   never counts towards a bar (a testing-only upstream is on)."
   if [ "$EVALS_LANES" -gt 0 ]; then
     echo "   Isolated: $EVALS_LANES lane(s), a fresh tool server before every attempt, one attempt per lane at a time."
   else

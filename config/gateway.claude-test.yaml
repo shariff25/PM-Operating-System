@@ -26,3 +26,9 @@ limits:
   max-in-flight: 4
   per-user: 2
   max-queue: 64
+# scripts/claude-test-stack.sh's clients: the runtime and the one `worker` token every harness
+# worker uses (trusted: they name the PM), and `evals` for the benchmark judges.
+clients:
+  runtime: {trusted: true, max-in-flight: 4}
+  worker: {trusted: true, max-in-flight: 4}
+  evals: {max-in-flight: 2, priority: personal}

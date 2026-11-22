@@ -123,7 +123,7 @@ fn main() -> Result<ExitCode> {
             let evals = evals.unwrap_or_else(|| evals_beside(&root));
             let opts = LintOptions {
                 stale_after_days,
-                benchmarked: Some(pmos_evals::history::benchmarked_personas(&evals)),
+                benchmarked: Some(pmos_evals::history::benchmarked_personas(&evals, &root)),
                 ..LintOptions::new(today.unwrap_or_else(|| Local::now().date_naive()))
             };
             run_lint(&root, &opts, deny_warnings, format)

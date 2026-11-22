@@ -726,6 +726,9 @@ pub async fn run_category(
         requested_by: opts.requested_by.clone(),
         gateway_workarounds: opts.gateway_workarounds.clone(),
         note: opts.note.clone(),
+        // Filled in by the caller, which asks the gateway before and after the run.
+        gateway_models: None,
+        persona_version: None,
         repeats,
         isolation: opts.isolation.as_ref().map(Isolation::describe),
         judges: opts

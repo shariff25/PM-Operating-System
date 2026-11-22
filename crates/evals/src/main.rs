@@ -10,7 +10,10 @@ use clap::{Args, Parser, Subcommand};
 use pmos_evals::client::Runtime;
 use pmos_evals::config::Config;
 use pmos_evals::gate::{baseline_from_git, decide};
-use pmos_evals::history::{evaluate, latest_report, load_all, load_reports};
+use pmos_evals::history::{
+    evaluate, latest_report, load_all, load_named, persona_version, production_models,
+    split_counting,
+};
 use pmos_evals::isolate::Isolation;
 use pmos_evals::judge::{self, load_calibration, load_judges, load_labels, Gateway};
 use pmos_evals::load::run_load;
@@ -56,13 +59,17 @@ enum Command {
         /// The later report.
         candidate: PathBuf,
     },
-    /// Say whether a category met its bar two weeks in a row, from its reports.
+    /// Say whether a category met its bar two weeks in a row, from the reports that count
+    /// (run on the production role models; for a persona, on its current version).
     History {
         #[arg(long)]
         category: String,
         /// Where the reports are (default: <root>/reports).
         #[arg(long)]
         reports_dir: Option<PathBuf>,
+        /// The content root, for a persona's current version.
+        #[arg(long, default_value = "content")]
+        content: PathBuf,
     },
     /// Send N tasks at once and report p50 and p90 queue and total time against the targets.
     Load(LoadArgs),
@@ -167,9 +174,14 @@ struct RunArgs {
     /// Runs per task (default: the category's `repeats`, else 1).
     #[arg(long)]
     repeats: Option<u32>,
-    /// Why this run happened, recorded in the report ("weekly", "model swap to …").
+    /// Why this run happened, recorded in the report ("weekly", "model swap to …"). Free
+    /// text that no rule reads: the models are recorded from the gateway itself, so the note
+    /// needn't (and shouldn't) name a provider's host.
     #[arg(long)]
     note: Option<String>,
+    /// The content root the runtime runs on, for the persona's version (persona categories).
+    #[arg(long, env = "PMOS_EVALS_CONTENT", default_value = "content")]
+    content: PathBuf,
     /// Run only this task (repeatable).
     #[arg(long = "task")]
     tasks: Vec<String>,
@@ -332,6 +344,23 @@ async fn run_and_write(
         args.conn.token.as_deref().unwrap_or_default(),
         args.trace_token.as_deref(),
     )?;
+    // Which models the gateway serves, asked of the gateway itself before the run (and again
+    // after it, below), so the report records them without anyone typing them (N5).
+    let models_gateway = args.gateway.gateway();
+    let models_before = match &models_gateway {
+        Some(g) => Some(g.models().await),
+        None => None,
+    };
+    let persona_version = category.persona.as_deref().map(|p| {
+        let v = pmos_evals::history::persona_version(&args.content, p);
+        if v.is_none() {
+            eprintln!(
+                "warning: no `version` for persona `{p}` in {}; this run won't count towards its bar",
+                args.content.join("personas").join(p).join("PERSONA.md").display()
+            );
+        }
+        v
+    });
     let applicable: Vec<_> = load_judges(root)
         .map_err(|e| anyhow::anyhow!(e.join("\n")))?
         .into_iter()
@@ -386,7 +415,29 @@ async fn run_and_write(
         Some(p) => Some(p),
         None => latest_report(&dir, &category.name).map_err(anyhow::Error::msg)?,
     };
-    let report = run_category(&r.rt, &r.url, &category, &opts).await;
+    let mut report = run_category(&r.rt, &r.url, &category, &opts).await;
+    report.persona_version = persona_version.flatten();
+    report.gateway_models = match (&models_gateway, models_before) {
+        (None, _) | (_, None) => {
+            eprintln!("warning: no gateway configured (PMOS_GATEWAY_URL and PMOS_EVALS_GATEWAY_TOKEN), so the report can't record which models ran; it won't count towards a bar");
+            None
+        }
+        (Some(_), Some(Err(e))) => {
+            eprintln!("warning: couldn't ask the gateway which models it serves ({e}); the report won't count towards a bar");
+            None
+        }
+        (Some(g), Some(Ok(before))) => match g.models().await {
+            Ok(after) if after == before => Some(before),
+            Ok(_) => {
+                eprintln!("warning: the gateway's models changed during the run; the report records none and won't count towards a bar");
+                None
+            }
+            Err(e) => {
+                eprintln!("warning: couldn't ask the gateway which models it serves after the run ({e}); the report won't count towards a bar");
+                None
+            }
+        },
+    };
     if let (Some(out), Some(sink)) = (
         args.label_candidates.as_ref(),
         opts.judges.as_ref().and_then(|j| j.labels.as_ref()),
@@ -491,6 +542,19 @@ fn check(root: &Path, category: Option<String>, content: &Path) -> Result<bool> 
     if let Err(e) = &config {
         problems.push(e.clone());
     }
+    // The production role models every counted run is matched against (N5).
+    if config.is_ok() {
+        match production_models(root) {
+            Ok(m) => println!(
+                "production role models: {}",
+                m.iter()
+                    .map(|(r, model)| format!("{r} `{model}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Err(e) => problems.push(e),
+        }
+    }
     let registry = std::fs::read_to_string(content.join("tools.yaml"))
         .ok()
         .and_then(|t| pmos_contract::model::ToolRegistry::from_yaml(&t).ok());
@@ -517,6 +581,12 @@ fn check(root: &Path, category: Option<String>, content: &Path) -> Result<bool> 
                 println!("{}", check_line(&c));
                 if let Some(persona) = &c.persona {
                     problems.extend(check_persona(root, &c.name, persona, content, &mut catalog));
+                    if persona_version(content, persona).is_none() {
+                        problems.push(format!(
+                            "{}: persona `{persona}` has no `version` in its PERSONA.md, so no run of this category could count towards its bar",
+                            c.name
+                        ));
+                    }
                 }
                 if let Some(reg) = &registry {
                     problems.extend(check_draft_tools(root, &c, reg));
@@ -713,6 +783,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
         Command::History {
             category,
             reports_dir,
+            content,
         } => {
             let cat = load_category(&root, &category)?;
             let Some(bar) = cat.pass_bar else {
@@ -720,9 +791,29 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 return Ok(false);
             };
             let dir = reports_dir.unwrap_or_else(|| root.join("reports"));
-            let reports = load_reports(&dir, &category).map_err(anyhow::Error::msg)?;
-            let h = evaluate(&category, bar, &reports);
+            let reports = load_named(&dir, &category).map_err(anyhow::Error::msg)?;
+            let production = production_models(&root);
+            let persona_now = cat.persona.as_deref().map(|p| persona_version(&content, p));
+            if let Some(None) = &persona_now {
+                println!(
+                    "{category}: persona `{}` has no readable `version` in {}, so no run counts.",
+                    cat.persona.as_deref().unwrap_or_default(),
+                    content.display()
+                );
+            }
+            let (kept, left) = match &persona_now {
+                Some(None) => (Vec::new(), Vec::new()),
+                Some(Some(v)) => split_counting(reports, &production, Some(v)),
+                None => split_counting(reports, &production, None),
+            };
+            let h = evaluate(&category, bar, &kept);
             print!("{}", h.to_text());
+            if !left.is_empty() {
+                println!("Not counted ({}):", left.len());
+                for (file, date, why) in &left {
+                    println!("  {date} {file}: {why}");
+                }
+            }
             Ok(h.two_weeks_met)
         }
         Command::Load(args) => {

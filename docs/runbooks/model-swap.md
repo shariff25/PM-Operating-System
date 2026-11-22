@@ -13,6 +13,12 @@ changes only `deploy/.env` and `deploy/gateway.yaml`, and then has to pass the b
    - In `deploy/compose.yaml`, also change `--served-model-name` for that server if the name
      changes.
    - Leave `workarounds:` as they are for now: step 5 tells you whether they're still needed.
+   - The roles' models in `deploy/gateway.yaml` are the production role models: only eval
+     runs whose gateway reported these models count towards a bar (`docs/evals.md`, "Which
+     runs count"). Merging the swap therefore starts every category's two-week streak again,
+     and a marketplace bot marked `benchmarked: true` fails `pmos lint` until two weeks of runs
+     on the new model pass. The change needs a second platform owner (CODEOWNERS,
+     `policies/README.md`).
 4. **Restart both:**
    ```sh
    deploy/pmos-admin up --models

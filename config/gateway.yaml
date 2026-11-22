@@ -28,3 +28,9 @@ limits:
   max-in-flight: 4
   per-user: 2
   max-queue: 64
+# Clients whose X-Pmos-User and X-Pmos-Priority are believed, and each client's cap on calls
+# in flight (docs/gateway.md). Unlisted clients: not trusted, `personal`, `per-user` slots.
+clients:
+  runtime: {trusted: true, max-in-flight: 2}
+  bot-*: {trusted: true, max-in-flight: 3}
+  evals: {max-in-flight: 1, priority: personal}

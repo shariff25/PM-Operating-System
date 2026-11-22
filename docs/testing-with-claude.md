@@ -97,7 +97,14 @@ including why it isn't ready for production.
 benchmark member `evals` with a personal bot `pm-evals` and every offered persona on its team,
 the runner's and judges' tokens, the fake docs fixtures, and `PMOS_TEST_EVALS_LANES` isolated
 lanes (default 1) that give every attempt a fresh tool server. It can't be combined with
-`PMOS_TEST_WEB=1`. See "On the test stack" in [Benchmarks](evals.md).
+`PMOS_TEST_WEB=1`. See "On the test stack" in [Benchmarks](evals.md). Each report records the
+models the gateway served (model ids and `remote-test` or `claude-test`, never the provider's
+host), and a test-stack report never counts towards a bar.
+
+The script unsets any `PMOS_*DATABASE_URL`, `PMOS_VAULT_KEY*` and `PMOS_*BIND` in your shell
+before it starts anything (its services run with `PMOS_DEV=1`), refuses to start if one of its
+ports on 127.0.0.1 is already taken (another stack, say), and stops with an error if a service
+it started exits.
 
 ## The model
 

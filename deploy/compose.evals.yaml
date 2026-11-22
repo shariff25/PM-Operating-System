@@ -13,7 +13,11 @@
 #   docs site instead, set PMOS_EVAL_DOCS_URL=http://docs.pmos.internal:8730/mcp in
 #   deploy/.env: the tool server then reads the main stack's docs index (read-only).
 # - **Shared models.** It shares only the main stack's gateway (the models, under the `evals`
-#   client's token), over the main stack's network.
+#   client's token), over the main stack's network. deploy/gateway.yaml caps that token at one
+#   call in flight, at `personal` priority, and ignores the X-Pmos-User its workers send, so a
+#   benchmark never holds more than one of production's slots (review finding N4). A run
+#   therefore goes one model call at a time; the runner also asks the gateway which models it
+#   serves (GET /v1/pmos/roles), which the report records (docs/evals.md, "Which runs count").
 #
 # pmos-admin starts it with fresh tokens for every run and removes it afterwards; everything is
 # in memory. The workers here are plain containers, not OpenShell sandboxes: acceptable only

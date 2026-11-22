@@ -57,6 +57,14 @@ fi
 # Start a new one, detached from the caller (its output goes to the lane's log, never to the
 # caller), and wait for it.
 (
+  # Nothing the caller exported reaches this PMOS_DEV=1 tool server: no database, vault key or
+  # address but the settings file's (as scripts/claude-test-stack.sh does).
+  for v in $(compgen -e); do
+    case "$v" in
+      PMOS_TEST_*) ;;
+      PMOS_*DATABASE_URL | PMOS_VAULT_KEY* | PMOS_*BIND) unset "$v" ;;
+    esac
+  done
   set -a
   # shellcheck disable=SC1090
   . "$SETTINGS"

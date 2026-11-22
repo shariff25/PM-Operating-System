@@ -13,6 +13,32 @@ pub struct Config {
     /// as text is (see [`crate::grade::normalize_text`]).
     #[serde(default)]
     pub decline_phrases: Vec<String>,
+    /// Which runs count towards a bar ([`crate::history::counts`]).
+    #[serde(default)]
+    pub benchmark: Benchmark,
+}
+
+/// Where the production role models are declared.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Benchmark {
+    /// The production gateway config, relative to the evals directory: the `model` of each of
+    /// its roles is what production uses, so only runs whose gateway reported exactly these
+    /// count. Default `../deploy/gateway.yaml`.
+    #[serde(default = "default_production_gateway")]
+    pub production_gateway: String,
+}
+
+fn default_production_gateway() -> String {
+    "../deploy/gateway.yaml".into()
+}
+
+impl Default for Benchmark {
+    fn default() -> Self {
+        Self {
+            production_gateway: default_production_gateway(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -90,6 +116,9 @@ impl Config {
             .any(|p| crate::grade::normalize_text(p).is_empty())
         {
             errors.push("decline_phrases has an empty entry".to_string());
+        }
+        if config.benchmark.production_gateway.trim().is_empty() {
+            errors.push("benchmark.production_gateway is empty".to_string());
         }
         if errors.is_empty() {
             Ok(config)

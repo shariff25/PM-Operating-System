@@ -96,6 +96,10 @@ change"):
    # Sandbox policies and their generator (POL-2).
    /policies/                                @<org>/<team>
    /crates/policy/                           @<org>/<team>
+   # The benchmarks and their reports, which decide `benchmarked: true` (D10), and the
+   # production role models a report must match to count (docs/evals.md, "Which runs count").
+   /evals/                                   @<org>/<team>
+   /deploy/gateway.yaml                      @<org>/<team>
    ```
 
    A new persona whose role is not listed above needs its `ROLE.md` line added in the same pull

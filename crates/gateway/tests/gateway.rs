@@ -116,8 +116,9 @@ async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_o
          roles:\n  default: {{upstream: a, model: qwen-test, workarounds: [strip-think]}}\n  \
          reasoning: {{upstream: a, model: qwen-test, workarounds: [strip-think]}}\n  \
          extraction: {{upstream: a, model: nemo-test}}\n  embedding: {{upstream: a, model: embed-test}}\n\
-         limits: {{max-in-flight: {}, per-user: {}, max-queue: {}}}\n",
-        limits.max_in_flight, limits.per_user, limits.max_queue
+         limits: {{max-in-flight: {}, per-user: {}, max-queue: {}}}\n\
+         clients: {{runtime: {{trusted: true, max-in-flight: {}}}}}\n",
+        limits.max_in_flight, limits.per_user, limits.max_queue, limits.max_in_flight
     );
     let models = Models::from_yaml(&yaml).unwrap();
     let usage = Arc::new(UsageLog::new(None).unwrap());
@@ -144,6 +145,7 @@ fn wide() -> Limits {
         max_in_flight: 8,
         per_user: 8,
         max_queue: 16,
+        ..Limits::default()
     }
 }
 
@@ -384,6 +386,7 @@ async fn interactive_work_overtakes_background_work() {
                 max_in_flight: 1,
                 per_user: 4,
                 max_queue: 8,
+                ..Limits::default()
             },
             false,
             true,
@@ -437,6 +440,7 @@ async fn one_person_cant_hold_every_slot_and_a_full_queue_says_busy() {
                 max_in_flight: 2,
                 per_user: 1,
                 max_queue: 1,
+                ..Limits::default()
             },
             false,
             true,

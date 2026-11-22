@@ -38,9 +38,23 @@ pub struct Report {
     /// declared it. The runner can't see the gateway's own setting.
     #[serde(default)]
     pub gateway_workarounds: Option<String>,
-    /// Free text saying why this run happened ("weekly", "model swap to …").
+    /// Free text saying why this run happened ("weekly", "model swap to …"). Never read by
+    /// any rule: which models a run measured is [`Report::gateway_models`].
     #[serde(default)]
     pub note: Option<String>,
+    /// The models the gateway said it served each role with, asked of the gateway itself
+    /// (`GET /v1/pmos/roles`) at the start of the run and again at its end, never typed by
+    /// the operator; model ids and upstream kinds only, never an address. `None`: no gateway
+    /// was configured, it couldn't be asked, or it changed during the run. A run counts
+    /// towards a bar only with this field, matching the production role models
+    /// ([`crate::history::counts`]); reports before 2026-11-22 have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_models: Option<GatewayModels>,
+    /// The version (`version:` in `PERSONA.md`) of the persona the category's tasks asked,
+    /// read from the content the run used. A persona category's run counts towards
+    /// `benchmarked: true` only while the persona's version is still this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona_version: Option<String>,
     /// How many times each task ran.
     #[serde(default = "one")]
     pub repeats: u32,
@@ -56,6 +70,87 @@ pub struct Report {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judges_skipped: Option<String>,
     pub tasks: Vec<TaskReport>,
+}
+
+/// What the gateway said about its roles for one run ([`Report::gateway_models`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayModels {
+    /// Role name (`default`) to the model id that served it.
+    pub roles: BTreeMap<String, String>,
+    /// Role name to a neutral label for its upstream: `local` (a model server on the Spark),
+    /// `claude-test` or `remote-test` (testing-only upstreams off the machine). Never a host.
+    pub upstreams: BTreeMap<String, String>,
+    /// The gateway answered with its stub model.
+    pub stub: bool,
+    /// A testing-only upstream was on (prompts left the machine).
+    pub cloud_test: bool,
+    /// The gateway's own workaround switch (`PMOS_GATEWAY_WORKAROUNDS`).
+    pub workarounds: bool,
+}
+
+impl GatewayModels {
+    /// From the gateway's `GET /v1/pmos/roles` answer.
+    pub fn from_roles_answer(v: &serde_json::Value) -> Result<Self, String> {
+        let flag = |k: &str| {
+            v[k].as_bool()
+                .ok_or_else(|| format!("the gateway's roles answer has no `{k}`"))
+        };
+        let list = v["roles"]
+            .as_array()
+            .ok_or("the gateway's roles answer has no `roles`")?;
+        let mut roles = BTreeMap::new();
+        let mut upstreams = BTreeMap::new();
+        for r in list {
+            let (Some(role), Some(model), Some(up)) = (
+                r["role"].as_str(),
+                r["model"].as_str(),
+                r["upstream"].as_str(),
+            ) else {
+                return Err(
+                    "a role in the gateway's roles answer lacks role, model or upstream".into(),
+                );
+            };
+            // A label, never an address: anything else the gateway might send is refused.
+            if !matches!(up, "local" | "claude-test" | "remote-test") {
+                return Err(format!("the gateway named an unknown upstream kind `{up}`"));
+            }
+            roles.insert(role.to_string(), model.to_string());
+            upstreams.insert(role.to_string(), up.to_string());
+        }
+        if roles.is_empty() {
+            return Err("the gateway reported no roles".into());
+        }
+        Ok(Self {
+            roles,
+            upstreams,
+            stub: flag("stub")?,
+            cloud_test: flag("cloud_test")?,
+            workarounds: flag("workarounds")?,
+        })
+    }
+
+    /// `default: qwen3.6-35b-a3b (local), extraction: …`, plus the stub or test flags.
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = self
+            .roles
+            .iter()
+            .map(|(role, model)| {
+                let up = self.upstreams.get(role).map(String::as_str).unwrap_or("?");
+                format!("{role}: `{model}` ({up})")
+            })
+            .collect();
+        if self.stub {
+            parts.push("STUB model".into());
+        }
+        if self.cloud_test {
+            parts.push("testing-only upstream on".into());
+        }
+        if !self.workarounds {
+            parts.push("workarounds off".into());
+        }
+        parts.join(", ")
+    }
 }
 
 /// One turn of a thread attempt. The report keeps no answer text.
@@ -379,6 +474,17 @@ impl Report {
                 None => "not declared".to_string(),
             }
         );
+        let _ = writeln!(
+            s,
+            "| Models (reported by the gateway) | {} |",
+            match &self.gateway_models {
+                Some(m) => cell(&m.describe()),
+                None => "not recorded, so this run counts towards no bar".to_string(),
+            }
+        );
+        if let Some(v) = &self.persona_version {
+            let _ = writeln!(s, "| Persona version | `{}` |", cell(v));
+        }
         if let Some(note) = &self.note {
             let _ = writeln!(s, "| Note | {} |", cell(note));
         }
