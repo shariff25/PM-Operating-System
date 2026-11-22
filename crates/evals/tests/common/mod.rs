@@ -105,6 +105,19 @@ pub struct Mock {
     pub(crate) drafted: Mutex<std::collections::HashSet<String>>,
     /// How many times [`Mock::fresh`] ran.
     pub fresh_calls: Mutex<usize>,
+    /// What `GET /v1/personas` says the runtime's own gateway serves (its `gateway` field,
+    /// review finding R3); `None` leaves the field out, as a runtime before it did.
+    pub gateway: Mutex<Option<Value>>,
+}
+
+/// What a production gateway serving `qwen-prod` and `nemo-prod` reports, as the runtime
+/// passes it on.
+pub fn prod_gateway() -> Value {
+    json!({"class": "production", "stub": false, "cloud_test": false, "workarounds": true,
+    "roles": [
+        {"role": "default", "alias": "pmos/default", "model": "qwen-prod", "upstream": "local"},
+        {"role": "extraction", "alias": "pmos/extraction", "model": "nemo-prod", "upstream": "local"},
+    ]})
 }
 
 impl Mock {
@@ -369,9 +382,22 @@ async fn drafts(
     Json(json!({"drafts": out})).into_response()
 }
 
+/// `GET /v1/personas` for client `evals`: no personas, and the runtime's gateway.
+async fn personas(State(m): State<Arc<Mock>>, headers: HeaderMap) -> Response {
+    if bearer(&headers).as_deref() != Some(TOKEN) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let mut body = json!({"personas": []});
+    if let Some(g) = m.gateway.lock().unwrap().clone() {
+        body["gateway"] = g;
+    }
+    Json(body).into_response()
+}
+
 /// Start the mock on a free port. Returns its base URL.
 pub async fn spawn(mock: Arc<Mock>) -> String {
     let app = Router::new()
+        .route("/v1/personas", get(personas))
         .route("/v1/tasks", post(create))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/events", get(events))

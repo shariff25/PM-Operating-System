@@ -44,10 +44,10 @@ client `evals`. For each task, `repeats` times, it:
 | Milliseconds between polls | `--poll-ms` | | `runner.poll_ms` (2000) |
 | Tasks in flight at once (`run` only) | `--concurrency` | | `runner.concurrency` (1) |
 | Runs per task (`run`, `gate`) | `--repeats` | | the category's `repeats` (1) |
-| Gateway, for judges and the run's models | `--gateway-url` | `PMOS_GATEWAY_URL` | none: judges aren't asked, and the run counts towards no bar |
+| Gateway, for judges | `--gateway-url` | `PMOS_GATEWAY_URL` | none: judges aren't asked (the run's models come from the runtime, below) |
 | Gateway token, client `evals` | `--gateway-token` | `PMOS_EVALS_GATEWAY_TOKEN` | none |
 | Content root, for `check`, `affected` and `history` | `--content` | | `content` |
-| Content root the runtime runs on, for a persona's version (`run`, `gate`) | `--content` | `PMOS_EVALS_CONTENT` | `content` |
+| Content root the runtime runs on, for a persona's files and version (`run`, `gate`) | `--content` | `PMOS_EVALS_CONTENT` | `content` |
 | Isolated attempts: each lane's runtime (`run`, `gate`) | `--lanes` (comma-separated) | `PMOS_EVALS_LANES` | none: not isolated |
 | Isolated attempts: the fresh command | `--fresh-cmd` | `PMOS_EVALS_FRESH_CMD` | none |
 | Keep labelling-pack candidates (`run`, `gate`) | `--label-candidates <dir>` | | none |
@@ -72,8 +72,9 @@ client `evals`. For each task, `repeats` times, it:
 - **The gateway token.** Judges call the gateway as client `evals`: the `evals=<token>` entry
   in the gateway's `PMOS_GATEWAY_TOKENS` (`PMOS_GW_EVALS_TOKEN` on the Spark), with
   `PMOS_GATEWAY_URL` such as `http://127.0.0.1:8740/v1` (`/v1` is added if missing). Without
-  both, judges aren't asked and the report says so. The runner also asks the gateway which
-  model serves each role (below), so set both for every run that should count, judges or not.
+  both, judges aren't asked and the report says so. Which model served each role is no
+  longer asked of this gateway but of the runtime under test (below), so a run without it
+  can still count.
   The gateway doesn't believe this client's `X-Pmos-User` or `X-Pmos-Priority`: the `evals`
   token's calls are `personal`, and `deploy/gateway.yaml` lets it have one in flight
   (`docs/gateway.md`, "Sharing the GPU").
@@ -140,16 +141,30 @@ and whether a workaround can be deleted:
   runner's environment", so step 2 is what marks the report. The gateway's own setting is
   also in `gateway_models.workarounds` (below).
 - **The models (`gateway_models`).** Before the run and again after it, the runner asks the
-  gateway `GET /v1/pmos/roles` with the `evals` token. If both answers agree, the report's
-  `gateway_models` holds, per role, the model id the gateway served it with and a neutral
-  upstream label (`local`, `claude-test` or `remote-test`), and whether the stub or a
-  testing-only upstream was on. Never a URL or host, so a committed report names no
-  provider's address. No gateway, an error, or a change during the run leaves the field out
-  (with a warning), and the run counts towards no bar. The report's table shows it as
-  "Models (reported by the gateway)".
-- **The persona's version (`persona_version`).** For a category with `persona:`, the
-  `version:` of `<content>/personas/<persona>/PERSONA.md` (`--content`, `PMOS_EVALS_CONTENT`),
-  the content the runtime runs on.
+  **runtime under test** which models its gateway serves: the `gateway` field the runtime
+  adds to `GET /v1/personas` for client `evals`, which the runtime fills by asking its own
+  gateway `GET /v1/pmos/roles` with its own token. With lanes, every lane's runtime is asked,
+  and they must all agree. So the models recorded are those of the gateway the runtime and
+  its workers were configured with, not of whichever gateway `PMOS_GATEWAY_URL` names in the
+  runner's shell (review finding R3, 2026-11-22; before it, the runner asked that gateway
+  itself, which need not have been the one the bots used). If both answers agree, the
+  report's `gateway_models` holds, per role, the model id the gateway served it with and a
+  neutral upstream label (`local`, `claude-test` or `remote-test`), whether the stub or a
+  testing-only upstream was on, and the gateway's **class**: `production` only for a gateway
+  whose config says `class: production` (`deploy/gateway.yaml`, the Spark's), `test` for any
+  other, and for a runtime or gateway too old to say (`docs/gateway.md`). Never a URL or
+  host, so a committed report names no provider's address. A runtime that can't say, lanes
+  that disagree, or a change during the run leave the field out (with a warning), and the
+  run counts towards no bar. The report's table shows it as "Models (reported by the
+  gateway)", ending with the class. `PMOS_GATEWAY_URL` and `PMOS_EVALS_GATEWAY_TOKEN` are now
+  for the judges only.
+- **The persona's files (`persona_hash`) and version (`persona_version`).** For a category
+  with `persona:`, a hash (`sha256:…`) of every file in the persona's folder
+  (`<content>/personas/<persona>/`), its role's folder (`roles/<role>/`) and each skill folder
+  the role lists (`skills/<skill>/`), path and bytes, in the content the runtime runs on
+  (`--content`, `PMOS_EVALS_CONTENT`); and the `version:` of its `PERSONA.md`, shown in the
+  report ("Persona version", "Persona files") but no longer compared. A persona whose files
+  can't be hashed (a missing role or skill folder) gives a report that counts for no persona.
 - Every `docs-qa` task has `must_not_include: ["<think>"]`. A model that leaks its reasoning
   without `strip-think` fails visibly, tagged `model`.
 
@@ -182,11 +197,20 @@ target/debug/pmos-evals run --category jira-draft --note "test stack"
 ```
 
 `evals.env` sets everything a run needs: the runtime and trace tokens, `PMOS_EVALS_AS`, the
-gateway URL and `evals` token (for the judges and the run's models), `PMOS_EVALS_CONTENT`
-(the stack's copy of the content, for the persona's version) and, with lanes,
-`PMOS_EVALS_LANES` and `PMOS_EVALS_FRESH_CMD`. The report records each role's model from the
-gateway, so `--note` needn't name it or the provider's host. A test-stack report never counts
-towards a bar: a testing-only upstream is on (see **Which runs count**).
+gateway URL and `evals` token (for the judges), `PMOS_EVALS_CONTENT` (the stack's copy of the
+content, for the persona's files) and, with lanes, `PMOS_EVALS_LANES` and
+`PMOS_EVALS_FRESH_CMD`. The report records each role's model as the runtime under test
+reports its gateway's (each lane's runtime, with lanes), so `--note` needn't name it or the
+provider's host. A test-stack report never counts towards a bar: its gateway is a `test`
+gateway and a testing-only upstream is on (see **Which runs count**).
+
+**What a real eval run on the test stack sets** (nothing new since 2026-11-22's review
+fixes): the Slack tokens `PMOS_SLACK_APP_TOKEN` and `PMOS_SLACK_BOT_TOKEN`,
+`PMOS_TEST_SLACK_ID`, `PMOS_TEST_MODEL_URL`, `PMOS_TEST_MODEL` and `PMOS_GATEWAY_REMOTE_KEY`
+(in a Claude Code cloud session, `proxy-injected`: the session's proxy puts the real key on
+the request), `PMOS_TEST_EVALS=1`, `PMOS_TEST_EVALS_LANES`, optionally
+`PMOS_TEST_EVALS_WORKERS` and `PMOS_TEST_STATE`, and the session's proxy and CA variables,
+which the services inherit (the list is in the script's header).
 
 The gateway lets one person have two model calls in flight (`limits.per-user`). With another
 provider (`PMOS_TEST_MODEL_URL`) and more than two lanes or workers, the script raises that to
@@ -198,9 +222,22 @@ two calls in flight. With four lanes that is four worker calls (one per lane) pl
 calls, the six slots there are. The Claude test config (`config/gateway.claude-test.yaml`)
 keeps two calls per person, so more than two lanes wait for each other there.
 
-The script unsets every `PMOS_*DATABASE_URL`, `PMOS_VAULT_KEY*` and `PMOS_*BIND` it inherits
-(`PMOS_TEST_*` are kept), refuses to start when a port it needs on 127.0.0.1 is taken, and
-fails if a service it started has exited.
+Since 2026-11-22 the gateway also caps calls *waiting* per client and per person (twice
+their in-flight caps by default, `docs/gateway.md`); with the script's settings that is
+always at least as many as its workers and judges can have waiting at once, so a run waits as
+before and is never refused with `429` for it. The stack keeps one `worker` gateway token for
+all its harness workers, trusted to name anyone (unlike the Spark's `bot-pm-<handle>` tokens,
+which may name only their PM): a known difference, on a single-machine stack with fresh
+tokens per run.
+
+The script starts every service from an empty environment with an explicit allow-list of
+what it inherits (the script's header lists it: `PATH`, `HOME`, `TMPDIR`, the locale, the
+proxy and CA variables, the Slack tokens by name, the docs site settings for `pmos-docs`, and
+the model keys and `PMOS_GATEWAY_WORKAROUNDS` / `PMOS_GATEWAY_RETRY_*` for the gateway), so a
+database URL, vault key, address or connector setting exported in the caller's shell reaches
+none of them; the lanes' fresh command does the same, and reads its settings file as
+`KEY=VALUE` data rather than running it. It refuses to start when a port it needs on 127.0.0.1
+is taken, and fails if a service it started has exited.
 
 **Stopping it.** Ctrl-C in its shell, or `pkill -TERM -f scripts/claude-test-stack.sh` from
 another (a script started in the background ignores `SIGINT`, so `-INT` may do nothing). The
@@ -395,6 +432,32 @@ number, and one that ends with a digit doesn't match the start of one. So "25%" 
 set off by "PM-1012". E1 failed "25.0%" against "25%"; these two rules make equal numbers pass
 and keep different ones failing (`numbers_compare_as_numbers` in `tests/grading.rs`).
 
+#### Grader changes since E1
+E1 (the first eval run, 2026-11-21) was graded before these changes, all in commit `f4d6199`
+(2026-11-22, E2). A later run is graded by the new rules, so compare it with E1 with them in
+mind: re-grading E1's answers isn't possible (its transcripts weren't kept).
+- **New decline phrases** in `evals/config.yaml`: the ones with the docs as subject ("docs
+  don't have", "docs do not have", "docs don't include", "docs don't mention", "docs don't
+  say" and their "do not" forms, and "documentation doesn't have / include / mention" and
+  their "does not" forms). Effect: a `must_decline` task that E1 failed with such a decline
+  ("The public docs don't have this") now passes; no task E1 passed can fail by it.
+- **A decimal's trailing zeros are dropped** on both sides before comparing ("25.0%" is
+  "25%", "1.70" is "1.7"; versions and addresses untouched). Effect: a `must_include` E1
+  failed on a number written with trailing zeros (sprout's `funnel-pasted-numbers`, "25.0%")
+  now passes, and a `must_not_include` naming such a number now also catches it.
+- **Whole-number matching:** a number no longer matches inside a longer one ("25%" isn't in
+  "125%" or "0.25%"; "PM-101" isn't in "PM-1012"). Effect: a `must_include` that E1 passed
+  only because the number sat inside a longer one now fails, and a `must_not_include` that E1
+  failed for the same reason now passes; E1's reports show no task that passed or failed that
+  way, but it can't be confirmed without transcripts.
+- **The reworded `slack-reply/triage-skips-fyi-and-bots` task:** its ask now names the two
+  messages to answer instead of "anything there" (which could mean all of #pm-team, where an
+  open question does need a reply). The expectation (which drafts, how many) is unchanged, but
+  the ask is not, so its results before and after aren't the same measurement: compare that
+  task from E2 on only.
+- `slack-reply/triage-drafts-only-what-needs-an-answer` gained a comment only; its ask and
+  grading are unchanged.
+
 ### Threads
 A real PM talks to the bot in a conversation: the bot asks "Who is the user?", the PM answers
 "customer", and the bot must read that as the answer. A task with a `thread` tests this. It has
@@ -563,6 +626,10 @@ when all of these hold:
 - **It recorded the gateway's models** (`gateway_models`, above). Reports without it never
   count, which is every report before 2026-11-22 (the E1 runs, whose model was only in the
   free-text note).
+- **From a production gateway:** `gateway_models.class` is `production`, which only a gateway
+  run with `class: production` (`deploy/gateway.yaml`) reports, and which comes from the
+  runtime under test (review finding R3). A test stack, a developer's gateway or one too old
+  to say is `test`, and never counts, even on the production role models' names.
 - **They are the production role models**, role for role: the same roles, each with the same
   model id, as the `model` of each role in the production gateway config. That file is named
   by `benchmark.production_gateway` in `evals/config.yaml`, relative to `evals/`; it is
@@ -571,20 +638,26 @@ when all of these hold:
   there (a model swap) means every streak starts again.
 - **No stub and no testing-only upstream:** `stub` and `cloud_test` false, every upstream
   `local`.
-- **For a persona's category, the same persona version:** the report's `persona_version` is
-  the `version:` in that persona's `PERSONA.md` now. Bumping a persona's version restarts its
-  streak, so a changed bot isn't shown as benchmarked on the old one's runs. (A date window
-  was the alternative; the version was chosen because it ties a count to what was measured,
-  and keeps the lint's answer the same from one day to the next. A change to a persona's role
-  or skills that doesn't bump its version isn't caught by this; the eval gate measures those.)
+- **For a persona's category, the same persona files:** the report's `persona_hash` is the
+  hash of the persona's, its role's and its skills' files now (`persona_hash`, above). Any
+  change to them (the persona's file, its role's instructions, one of its skills) restarts its
+  streak, whether or not it bumps `version:`, so a changed bot isn't shown as benchmarked on
+  the old one's runs. (Before 2026-11-22 the version string was compared, so a change that
+  didn't bump it kept the old runs counting; reports from then have no hash and count for no
+  persona. A date window was the alternative; a hash ties a count to what was measured and
+  keeps the lint's answer the same from one day to the next. A change outside those folders,
+  such as `content/master/AGENTS.md` or the harness, isn't in the hash; the eval gate measures
+  those.)
 
 `history` lists the reports that don't count, each with the reason ("its models aren't the
 production role models (default: `x`, production `y`)"). `pmos-evals check` reads the
 production role models and prints them, and fails if they can't be read (with no production
-models, no run counts) or if a persona a category names has no `version`.
+models, no run counts), if a persona a category names has no `version`, or if its
+files can't be hashed.
 
-`evals/` and `deploy/gateway.yaml` are in the CODEOWNERS lines of `policies/README.md`, so a
-change to a report, a bar or the production role models needs a second platform owner.
+`evals/`, `deploy/gateway.yaml` and `crates/evals/` (the runner and these rules) are in the
+CODEOWNERS lines of `policies/README.md`, so a change to a report, a bar, the production role
+models or the rules that count them needs a second platform owner.
 
 ### Repeats and statistics
 A model's answers vary from run to run, so one run of 20 tasks can't tell a real drop from
@@ -1081,6 +1154,14 @@ next gate compares against it. `deploy/pmos-admin evals load` still runs on the 
 because the load test measures the stack PMs use.
 
 ## Gaps against the spec
+- **Reports aren't signed (open, review of 2efb73f, R3).** A report is a JSON file anyone with
+  write access can edit or forge, so `benchmarked: true` rests on review: `evals/` and
+  `crates/evals/` need a second platform owner (CODEOWNERS), and the models come from the
+  runtime under test and a `production`-class gateway rather than the runner's own settings.
+  What is not covered: a runtime pointed at a gateway that falsely says `class: production`
+  (anyone who can run a gateway with `deploy/gateway.yaml` can), a runtime that lies about its
+  gateway, and a report edited by hand. Signing reports (by the eval stack, with a key the
+  runner doesn't hold) would close it; it is out of scope for now.
 - **Traces are console-only (§3),** but D10 tags failures from the trace. The runner takes an
   optional console token (`--trace-token`). Without one it tags from status, error and events.
 - **The trace body's shape isn't specified.** The rules read a tool's name from the body's

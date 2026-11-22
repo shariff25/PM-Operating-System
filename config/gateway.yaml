@@ -32,5 +32,7 @@ limits:
 # in flight (docs/gateway.md). Unlisted clients: not trusted, `personal`, `per-user` slots.
 clients:
   runtime: {trusted: true, max-in-flight: 2}
+  # A PM's own bot (bot-pm-<handle>) may name only that PM; a team bot (bot-docs) anyone.
+  bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
   bot-*: {trusted: true, max-in-flight: 3}
   evals: {max-in-flight: 1, priority: personal}

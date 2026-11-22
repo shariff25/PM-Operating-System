@@ -6,11 +6,18 @@
 #
 #   scripts/eval-fresh-toolserver.sh <state dir> <lane>
 #
-# It stops the lane's tool server (only a pmos-toolserver process it started), starts a new one
-# with the same settings ($STATE/lanes/toolserver.env, mode 0600, written by the stack script:
-# in-memory stores, fake connectors, the stack's seed and content), and exits 0 once the new
-# one answers /healthz. Lane n's tool server listens on 127.0.0.1:(8710 + 100 n). Prints no
-# token: the settings go to the tool server through its environment only.
+# It stops the lane's tool server (only a process it started, running the lane's tool server
+# binary), starts a new one with the same settings ($STATE/lanes/toolserver.env, mode 0600,
+# written by the stack script: in-memory stores, fake connectors, the stack's seed and content),
+# and exits 0 once the new one answers /healthz. Lane n's tool server listens on
+# 127.0.0.1:(8710 + 100 n). Prints no token: the settings go to the tool server through its
+# environment only.
+#
+# The settings file is read as data, never run: one KEY=VALUE per line (the value is the rest
+# of the line, as written), `#` comments and blank lines skipped, and only the keys
+# LANE_TOOLSERVER_BIN, NO_PROXY and PMOS_* taken; anything else stops it. The tool server starts
+# from an empty environment with those settings and an allow-list of what it inherits (PATH,
+# HOME, TMPDIR, the locale, and the proxy and CA variables), as the stack's services do.
 set -euo pipefail
 
 STATE=${1:?usage: eval-fresh-toolserver.sh <state dir> <lane>}
@@ -29,14 +36,61 @@ mkdir -p "$DIR"
 PORT=$((8710 + 100 * LANE))
 PIDFILE="$DIR/toolserver.pid"
 
-is_ours() { # pid: a live pmos-toolserver process
-  [ -r "/proc/$1/cmdline" ] && tr '\0' ' ' <"/proc/$1/cmdline" | grep -q 'pmos-toolserver'
+# The settings, as KEY=VALUE data.
+SET_ENV=() LANE_TOOLSERVER_BIN=""
+n=0
+while IFS= read -r line || [ -n "$line" ]; do
+  n=$((n + 1))
+  case "$line" in '' | '#'*) continue ;; esac
+  key=${line%%=*}
+  if [ "$key" = "$line" ] || ! [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+    echo "eval-fresh-toolserver: $SETTINGS line $n isn't KEY=VALUE" >&2
+    exit 2
+  fi
+  value=${line#*=}
+  case "$key" in
+    LANE_TOOLSERVER_BIN) LANE_TOOLSERVER_BIN=$value ;;
+    NO_PROXY | PMOS_*) SET_ENV+=("$key=$value") ;;
+    *)
+      echo "eval-fresh-toolserver: $SETTINGS line $n sets $key, which a lane's tool server doesn't take" >&2
+      exit 2
+      ;;
+  esac
+done <"$SETTINGS"
+case "$LANE_TOOLSERVER_BIN" in
+  /*) [ -x "$LANE_TOOLSERVER_BIN" ] || {
+    echo "eval-fresh-toolserver: LANE_TOOLSERVER_BIN in $SETTINGS isn't an executable" >&2
+    exit 2
+  } ;;
+  *) echo "eval-fresh-toolserver: $SETTINGS has no absolute LANE_TOOLSERVER_BIN" >&2; exit 2 ;;
+esac
+BIN_REAL=$(readlink -f "$LANE_TOOLSERVER_BIN")
+
+# What the tool server inherits: nothing but these (a database URL, vault key, address or
+# connector setting exported in the caller's shell never reaches it).
+KEEP_ENV=()
+for v in PATH HOME USER LOGNAME TMPDIR TMP TEMP LANG LANGUAGE TZ \
+  HTTPS_PROXY HTTP_PROXY ALL_PROXY https_proxy http_proxy all_proxy no_proxy \
+  SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE REQUESTS_CA_BUNDLE RUST_LOG RUST_BACKTRACE; do
+  [ -n "${!v+x}" ] && KEEP_ENV+=("$v=${!v}")
+done
+for v in $(compgen -e); do
+  case "$v" in LC_*) KEEP_ENV+=("$v=${!v}") ;; esac
+done
+
+is_ours() { # pid: a live process running the lane's tool server binary, by command line and exe
+  [ -r "/proc/$1/cmdline" ] && tr '\0' ' ' <"/proc/$1/cmdline" | grep -q 'pmos-toolserver' || return 1
+  local exe
+  exe=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1
+  # A binary rebuilt since it started shows as "<path> (deleted)": still the same path.
+  exe=${exe% (deleted)}
+  [ "$exe" = "$BIN_REAL" ]
 }
 
 # Stop the lane's current tool server, and wait until it has gone (its memory with it).
 if [ -f "$PIDFILE" ]; then
   old=$(cat "$PIDFILE")
-  if [ -n "$old" ] && is_ours "$old"; then
+  if [[ "$old" =~ ^[0-9]+$ ]] && is_ours "$old"; then
     kill "$old" 2>/dev/null || true
     for _ in $(seq 1 100); do
       is_ours "$old" || break
@@ -57,20 +111,9 @@ fi
 # Start a new one, detached from the caller (its output goes to the lane's log, never to the
 # caller), and wait for it.
 (
-  # Nothing the caller exported reaches this PMOS_DEV=1 tool server: no database, vault key or
-  # address but the settings file's (as scripts/claude-test-stack.sh does).
-  for v in $(compgen -e); do
-    case "$v" in
-      PMOS_TEST_*) ;;
-      PMOS_*DATABASE_URL | PMOS_VAULT_KEY* | PMOS_*BIND) unset "$v" ;;
-    esac
-  done
-  set -a
-  # shellcheck disable=SC1090
-  . "$SETTINGS"
-  set +a
-  export PMOS_BIND="127.0.0.1:$PORT" PMOS_AUDIT_LOG="$DIR/audit.jsonl"
-  exec setsid "$LANE_TOOLSERVER_BIN" >>"$DIR/toolserver.log" 2>&1 </dev/null
+  exec env -i "${KEEP_ENV[@]}" "${SET_ENV[@]}" \
+    PMOS_BIND="127.0.0.1:$PORT" PMOS_AUDIT_LOG="$DIR/audit.jsonl" \
+    setsid "$LANE_TOOLSERVER_BIN" >>"$DIR/toolserver.log" 2>&1 </dev/null
 ) &
 new=$!
 echo "$new" >"$PIDFILE"

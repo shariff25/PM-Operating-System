@@ -392,6 +392,31 @@ impl Gateway {
             .ok_or(CallError::Unavailable("the model gateway"))
     }
 
+    /// What this runtime's own gateway says it serves (`GET /v1/pmos/roles`, asked with this
+    /// service's token), for the benchmark runner's report (review finding R3): its class,
+    /// the stub and test flags, and each role's model id and upstream kind. Rebuilt from the
+    /// fields the runner reads ([`gateway_roles`]), so nothing else the gateway might send
+    /// (and never an address or a token) passes through. `Err` says, without a URL, why it
+    /// couldn't be had.
+    pub async fn roles(&self) -> Result<Value, &'static str> {
+        let res = self
+            .http
+            .get(format!("{}/pmos/roles", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| "the runtime couldn't reach its gateway")?;
+        if !res.status().is_success() {
+            return Err("the runtime's gateway refused GET /v1/pmos/roles");
+        }
+        let v: Value = res
+            .json()
+            .await
+            .map_err(|_| "the runtime's gateway answered something other than JSON")?;
+        gateway_roles(&v).ok_or("the runtime's gateway answered a roles list it can't read")
+    }
+
     /// `GET /models` answers with this service's token: the gateway is up and lets us in.
     pub async fn ready(&self) -> bool {
         self.http
@@ -404,9 +429,67 @@ impl Gateway {
     }
 }
 
+/// The parts of a gateway's `GET /v1/pmos/roles` answer the benchmark runner records, and
+/// nothing else: `class` (`production` or `test`; a gateway too old to say is `test`), the
+/// `stub`, `cloud_test` and `workarounds` flags, and per role its name, alias, model and
+/// upstream kind (`local`, `claude-test` or `remote-test`, never an address). `None`: the
+/// answer doesn't have that shape.
+pub fn gateway_roles(v: &Value) -> Option<Value> {
+    let class = match v.get("class").and_then(Value::as_str) {
+        None | Some("test") => "test",
+        Some("production") => "production",
+        Some(_) => return None,
+    };
+    let flag = |k: &str| v.get(k).and_then(Value::as_bool);
+    let mut roles = Vec::new();
+    for r in v.get("roles")?.as_array()? {
+        let s = |k: &str| r.get(k).and_then(Value::as_str);
+        let upstream = s("upstream")?;
+        if !matches!(upstream, "local" | "claude-test" | "remote-test") {
+            return None;
+        }
+        roles.push(json!({
+            "role": s("role")?, "alias": s("alias").unwrap_or_default(),
+            "model": s("model")?, "upstream": upstream,
+        }));
+    }
+    Some(json!({
+        "class": class,
+        "stub": flag("stub")?,
+        "cloud_test": flag("cloud_test")?,
+        "workarounds": flag("workarounds")?,
+        "roles": roles,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gateway_roles_keep_only_what_the_runner_reads() {
+        let v = json!({
+            "class": "production", "stub": false, "cloud_test": false, "workarounds": true,
+            "roles": [{"role": "default", "alias": "pmos/default", "model": "qwen",
+                       "upstream": "local", "url": "http://10.0.0.5:8000/v1"}],
+            "extra": "http://10.0.0.5",
+        });
+        let out = gateway_roles(&v).unwrap();
+        assert!(!out.to_string().contains("10.0.0.5"));
+        assert_eq!(out["class"], "production");
+        assert_eq!(out["roles"][0]["model"], "qwen");
+        // A gateway that says no class is a test one; an address as the upstream kind, or an
+        // unknown class, is refused.
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("class");
+        assert_eq!(gateway_roles(&old).unwrap()["class"], "test");
+        let mut bad = v.clone();
+        bad["roles"][0]["upstream"] = json!("http://10.0.0.5");
+        assert!(gateway_roles(&bad).is_none());
+        bad = v.clone();
+        bad["class"] = json!("prod");
+        assert!(gateway_roles(&bad).is_none());
+    }
 
     #[test]
     fn approval_ids_are_plain() {

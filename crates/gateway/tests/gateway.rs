@@ -117,8 +117,14 @@ async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_o
          reasoning: {{upstream: a, model: qwen-test, workarounds: [strip-think]}}\n  \
          extraction: {{upstream: a, model: nemo-test}}\n  embedding: {{upstream: a, model: embed-test}}\n\
          limits: {{max-in-flight: {}, per-user: {}, max-queue: {}}}\n\
-         clients: {{runtime: {{trusted: true, max-in-flight: {}}}}}\n",
-        limits.max_in_flight, limits.per_user, limits.max_queue, limits.max_in_flight
+         clients: {{runtime: {{trusted: true, max-in-flight: {}, max-queue: {}}}}}\n",
+        limits.max_in_flight,
+        limits.per_user,
+        limits.max_queue,
+        limits.max_in_flight,
+        // The one client here stands for every caller, so it may fill the whole queue; the
+        // per-client cap on waiting calls has its own tests (limits.rs).
+        limits.max_queue
     );
     let models = Models::from_yaml(&yaml).unwrap();
     let usage = Arc::new(UsageLog::new(None).unwrap());

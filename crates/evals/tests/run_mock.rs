@@ -394,9 +394,11 @@ async fn cli_run_history_and_check() {
             ..Script::default()
         },
     );
+    // The runtime reports which models its own gateway serves (a run counts only with them,
+    // N5, from a production gateway, R3).
+    *mock.gateway.lock().unwrap() = Some(common::prod_gateway());
     let url = spawn(mock.clone()).await;
-    // The gateway the runner asks which models ran (a run counts only with them, N5); the
-    // category has no judges, so nothing else is asked of it.
+    // A gateway for the runner's judges; the category has none, so nothing is asked of it.
     let gw_url = common::spawn_gateway(Arc::new(common::Gateway {
         reply: Box::new(|_: &str| "yes".into()),
         calls: std::sync::Mutex::new(Vec::new()),

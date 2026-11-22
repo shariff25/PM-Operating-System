@@ -11,8 +11,8 @@ use pmos_evals::client::Runtime;
 use pmos_evals::config::Config;
 use pmos_evals::gate::{baseline_from_git, decide};
 use pmos_evals::history::{
-    evaluate, latest_report, load_all, load_named, persona_version, production_models,
-    split_counting,
+    evaluate, latest_report, load_all, load_named, persona_hash, persona_version,
+    production_models, split_counting,
 };
 use pmos_evals::isolate::Isolation;
 use pmos_evals::judge::{self, load_calibration, load_judges, load_labels, Gateway};
@@ -344,22 +344,36 @@ async fn run_and_write(
         args.conn.token.as_deref().unwrap_or_default(),
         args.trace_token.as_deref(),
     )?;
-    // Which models the gateway serves, asked of the gateway itself before the run (and again
-    // after it, below), so the report records them without anyone typing them (N5).
-    let models_gateway = args.gateway.gateway();
-    let models_before = match &models_gateway {
-        Some(g) => Some(g.models().await),
-        None => None,
+    // Which models the gateway serves, asked before the run (and again after it, below), so
+    // the report records them without anyone typing them (N5). They are asked of the runtime
+    // under test (every lane's, when isolated), which asks its own gateway: the gateway the
+    // bots under test used, not whichever one PMOS_GATEWAY_URL names here (review finding R3).
+    let under_test: Vec<Runtime> = match &isolation {
+        Some(i) => i.lanes.clone(),
+        None => vec![r.rt.clone()],
     };
+    let models_before = runtime_models(&under_test).await;
     let persona_version = category.persona.as_deref().map(|p| {
         let v = pmos_evals::history::persona_version(&args.content, p);
         if v.is_none() {
             eprintln!(
-                "warning: no `version` for persona `{p}` in {}; this run won't count towards its bar",
-                args.content.join("personas").join(p).join("PERSONA.md").display()
+                "warning: no `version` for persona `{p}` in {}",
+                args.content
+                    .join("personas")
+                    .join(p)
+                    .join("PERSONA.md")
+                    .display()
             );
         }
         v
+    });
+    // What counts is the persona's files, by hash, not the version they claim.
+    let persona_hash = category.persona.as_deref().map(|p| {
+        let h = pmos_evals::history::persona_hash(&args.content, p);
+        if let Err(e) = &h {
+            eprintln!("warning: can't hash persona `{p}`'s files ({e}); this run won't count towards its bar");
+        }
+        h.ok()
     });
     let applicable: Vec<_> = load_judges(root)
         .map_err(|e| anyhow::anyhow!(e.join("\n")))?
@@ -417,27 +431,32 @@ async fn run_and_write(
     };
     let mut report = run_category(&r.rt, &r.url, &category, &opts).await;
     report.persona_version = persona_version.flatten();
-    report.gateway_models = match (&models_gateway, models_before) {
-        (None, _) | (_, None) => {
-            eprintln!("warning: no gateway configured (PMOS_GATEWAY_URL and PMOS_EVALS_GATEWAY_TOKEN), so the report can't record which models ran; it won't count towards a bar");
+    report.persona_hash = persona_hash.flatten();
+    report.gateway_models = match models_before {
+        Err(e) => {
+            eprintln!("warning: couldn't learn which models the runtime's gateway serves ({e}); the report won't count towards a bar");
             None
         }
-        (Some(_), Some(Err(e))) => {
-            eprintln!("warning: couldn't ask the gateway which models it serves ({e}); the report won't count towards a bar");
-            None
-        }
-        (Some(g), Some(Ok(before))) => match g.models().await {
+        Ok(before) => match runtime_models(&under_test).await {
             Ok(after) if after == before => Some(before),
             Ok(_) => {
                 eprintln!("warning: the gateway's models changed during the run; the report records none and won't count towards a bar");
                 None
             }
             Err(e) => {
-                eprintln!("warning: couldn't ask the gateway which models it serves after the run ({e}); the report won't count towards a bar");
+                eprintln!("warning: couldn't learn which models the runtime's gateway serves after the run ({e}); the report won't count towards a bar");
                 None
             }
         },
     };
+    if let Some(m) = &report.gateway_models {
+        if m.class != "production" {
+            eprintln!(
+                "note: the runtime's gateway is a `{}` gateway, so this run counts towards no bar",
+                m.class
+            );
+        }
+    }
     if let (Some(out), Some(sink)) = (
         args.label_candidates.as_ref(),
         opts.judges.as_ref().and_then(|j| j.labels.as_ref()),
@@ -456,6 +475,26 @@ async fn run_and_write(
     )
     .with_context(|| format!("writing the report into {}", dir.display()))?;
     Ok((report, path))
+}
+
+/// What the gateway of every runtime under test serves, as each runtime reports it
+/// (`GatewayModels`, review finding R3). `Err` when one can't say, or two say different
+/// things (the lanes must share one gateway for a report to say which models it measured).
+async fn runtime_models(
+    runtimes: &[Runtime],
+) -> std::result::Result<pmos_evals::report::GatewayModels, String> {
+    let mut seen: Option<pmos_evals::report::GatewayModels> = None;
+    for rt in runtimes {
+        let m = rt.gateway_models().await?;
+        match &seen {
+            Some(first) if *first != m => {
+                return Err("the runtimes under test report different gateways".into())
+            }
+            Some(_) => {}
+            None => seen = Some(m),
+        }
+    }
+    seen.ok_or_else(|| "no runtime under test".to_string())
 }
 
 fn read_report(path: &Path) -> Result<Report> {
@@ -583,7 +622,13 @@ fn check(root: &Path, category: Option<String>, content: &Path) -> Result<bool> 
                     problems.extend(check_persona(root, &c.name, persona, content, &mut catalog));
                     if persona_version(content, persona).is_none() {
                         problems.push(format!(
-                            "{}: persona `{persona}` has no `version` in its PERSONA.md, so no run of this category could count towards its bar",
+                            "{}: persona `{persona}` has no `version` in its PERSONA.md (reports show it)",
+                            c.name
+                        ));
+                    }
+                    if let Err(e) = persona_hash(content, persona) {
+                        problems.push(format!(
+                            "{}: persona `{persona}`'s files can't be hashed ({e}), so no run of this category could count towards its bar",
                             c.name
                         ));
                     }
@@ -793,14 +838,19 @@ async fn real_main(cli: Cli) -> Result<bool> {
             let dir = reports_dir.unwrap_or_else(|| root.join("reports"));
             let reports = load_named(&dir, &category).map_err(anyhow::Error::msg)?;
             let production = production_models(&root);
-            let persona_now = cat.persona.as_deref().map(|p| persona_version(&content, p));
-            if let Some(None) = &persona_now {
-                println!(
-                    "{category}: persona `{}` has no readable `version` in {}, so no run counts.",
-                    cat.persona.as_deref().unwrap_or_default(),
-                    content.display()
-                );
-            }
+            let persona_now = cat
+                .persona
+                .as_deref()
+                .map(|p| match persona_hash(&content, p) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        println!(
+                            "{category}: persona `{p}`'s files in {} can't be hashed ({e}), so no run counts.",
+                            content.display()
+                        );
+                        None
+                    }
+                });
             let (kept, left) = match &persona_now {
                 Some(None) => (Vec::new(), Vec::new()),
                 Some(Some(v)) => split_counting(reports, &production, Some(v)),

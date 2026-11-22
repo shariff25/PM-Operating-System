@@ -45,6 +45,12 @@ pub struct UsageEvent {
     pub completion_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub workarounds: Vec<&'static str>,
+    /// Set on a line for a call the gateway refused before it reached a model server: why
+    /// (a client naming a person it may not name, `403`; a client or person with too many
+    /// calls waiting, `429`). Such a line has `attempts: 0`; on a `403` line `user` is the
+    /// person the client tried to name, not one it was allowed to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<&'static str>,
 }
 
 /// Recent events in memory, plus an optional JSON-lines file for shipping off-box.

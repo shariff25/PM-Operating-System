@@ -25,6 +25,8 @@ async fn main() -> Result<()> {
         tracing::warn!("PMOS_GATEWAY_WORKAROUNDS=off: every workaround is switched off");
     }
     config.check_keys(&models).map_err(anyhow::Error::msg)?;
+    config.check_class(&models).map_err(anyhow::Error::msg)?;
+    tracing::info!(class = models.class.as_str(), "gateway class");
     if models
         .roles
         .values()
@@ -55,7 +57,7 @@ async fn main() -> Result<()> {
         let p = models.client_policy(&client.name);
         tracing::info!(
             client = %client.name, trusted = p.trusted, max_in_flight = p.max_in_flight,
-            priority = ?p.priority, "client"
+            max_queue = p.max_queue, priority = ?p.priority, user = ?p.user, "client"
         );
     }
     let app = router(GatewayConfig {

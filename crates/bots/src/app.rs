@@ -476,7 +476,18 @@ async fn list_personas(
         ],
         "list personas",
     )?;
-    Ok(Json(json!({"personas": state.rt.catalog().persona_summaries()})).into_response())
+    let mut body = json!({"personas": state.rt.catalog().persona_summaries()});
+    // For the benchmark runner only: what this runtime's own gateway serves, so a report
+    // records the models of the gateway the bots under test used, not one the runner was
+    // pointed at (review finding R3). Model ids, upstream kinds and the gateway's class;
+    // never an address or a token.
+    if caller.kind == ClientKind::Evals {
+        body["gateway"] = match state.rt.gateway_roles().await {
+            Ok(roles) => roles,
+            Err(why) => json!({"error": why}),
+        };
+    }
+    Ok(Json(body).into_response())
 }
 
 /// `Some(x)` for a field that is present, `null` included, so `{"persona": null}` (move to

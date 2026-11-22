@@ -53,6 +53,7 @@ fn report(date: &str, tasks: &[(&str, Option<&str>, &[bool])]) -> Report {
         note: None,
         gateway_models: None,
         persona_version: None,
+        persona_hash: None,
         repeats,
         judges: vec![],
         judges_skipped: None,

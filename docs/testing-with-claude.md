@@ -101,10 +101,15 @@ lanes (default 1) that give every attempt a fresh tool server. It can't be combi
 models the gateway served (model ids and `remote-test` or `claude-test`, never the provider's
 host), and a test-stack report never counts towards a bar.
 
-The script unsets any `PMOS_*DATABASE_URL`, `PMOS_VAULT_KEY*` and `PMOS_*BIND` in your shell
-before it starts anything (its services run with `PMOS_DEV=1`), refuses to start if one of its
-ports on 127.0.0.1 is already taken (another stack, say), and stops with an error if a service
-it started exits.
+The script starts every service from an empty environment (its services run with
+`PMOS_DEV=1`): each gets only the settings the script gives it and an explicit allow-list of
+what your shell exports, listed in the script's header (`PATH`, `HOME`, `TMPDIR`, the locale,
+the proxy and CA variables, `RUST_LOG`; the docs site settings for `pmos-docs`; the model keys,
+`PMOS_GATEWAY_WORKAROUNDS` and `PMOS_GATEWAY_RETRY_*` for the gateway; the Slack tokens by
+name). So a database URL, vault key, address or connector setting in your shell reaches none of
+them. Every input documented above still works. It refuses to start if one of its ports on
+127.0.0.1 is already taken (another stack, say), and stops with an error if a service it
+started exits.
 
 ## The model
 

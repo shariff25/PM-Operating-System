@@ -7,6 +7,12 @@
 # bar (the two-weeks rule, and a marketplace bot's `benchmarked: true`) only when the models
 # the gateway reported for that run match these, role for role (docs/evals.md, "Which runs
 # count"). Swapping a model here therefore restarts every benchmark streak.
+#
+# `class: production` marks this as the Spark's own gateway: it reports it in
+# GET /v1/pmos/roles, and an eval report counts towards a bar only when the runtime under test
+# reports a production-class gateway (docs/evals.md, "Which runs count"). A production gateway
+# refuses testing-only upstreams and the stub model at start-up.
+class: production
 upstreams:
   qwen: http://vllm-default:8000/v1
   nemotron: http://vllm-extraction:8000/v1
@@ -33,6 +39,10 @@ limits:
   queue-wait-secs: 300
   stream-max-secs: 900
   max-answer-bytes: 16777216
+  # How many calls one person may have waiting for a slot (the default, twice per-user). Each
+  # client may have twice its max-in-flight waiting (its `max-queue`), so no one token fills
+  # the queue (review finding R2).
+  per-user-queue: 4
 # Who may say which person a call is for (X-Pmos-User) and how urgent it is (X-Pmos-Priority),
 # and how many calls each client token may have in flight (review findings N3 and N4). A client
 # not listed here is not trusted: its calls are keyed by its own name, run as `personal`, and
@@ -40,8 +50,11 @@ limits:
 clients:
   # The bot runtime: it parses routines for the PM its caller verified.
   runtime: {trusted: true, max-in-flight: 2}
-  # Each bot's worker (bot-docs, bot-pm-<handle>, ...): it names the PM whose task it runs.
-  # At most 3 of the 4 slots each, so no one bot's token holds them all.
+  # Each PM's own bot's worker (bot-pm-<handle>): it may name only the PM its name spells
+  # (`user: from-name`; naming anyone else is 403, in the usage log; review finding R1).
+  bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
+  # Each team bot's worker (bot-docs, ...): it names the PM whose task it runs, any PM. At most
+  # 3 of the 4 slots each, so no one bot's token holds them all.
   bot-*: {trusted: true, max-in-flight: 3}
   # The eval stack (deploy/compose.evals.yaml): its runtime, workers and judges share this
   # token. One slot, background priority, so a benchmark never takes production's capacity.

@@ -40,6 +40,10 @@ pub struct Limits {
     /// The largest answer taken from a model server, streamed or not.
     #[serde(default = "default_max_answer")]
     pub max_answer_bytes: usize,
+    /// How many calls one (believed) person may have waiting for a slot (review finding R2).
+    /// `None`: twice `per-user`.
+    #[serde(default)]
+    pub per_user_queue: Option<usize>,
 }
 
 fn default_in_flight() -> usize {
@@ -71,6 +75,7 @@ impl Default for Limits {
             queue_wait_secs: default_queue_wait(),
             stream_max_secs: default_stream_max(),
             max_answer_bytes: default_max_answer(),
+            per_user_queue: None,
         }
     }
 }
@@ -81,8 +86,19 @@ impl Limits {
         self.per_client.unwrap_or(self.per_user)
     }
 
+    /// How many calls one believed person may have waiting: `per-user-queue`, else twice
+    /// `per-user`.
+    pub fn person_queue(&self) -> usize {
+        self.per_user_queue
+            .unwrap_or_else(|| self.per_user.saturating_mul(2))
+    }
+
     fn check(&self) -> Result<(), String> {
-        if self.max_in_flight == 0 || self.per_user == 0 || self.per_client == Some(0) {
+        if self.max_in_flight == 0
+            || self.per_user == 0
+            || self.per_client == Some(0)
+            || self.per_user_queue == Some(0)
+        {
             return Err("gateway config: limits must be at least 1".into());
         }
         if !(1..=3600).contains(&self.queue_wait_secs) {
@@ -112,6 +128,27 @@ struct ClientSpec {
     /// `X-Pmos-Priority`, for one that is.
     #[serde(default)]
     priority: Option<String>,
+    /// The most calls this client may have waiting for a slot. `None`: twice its
+    /// `max-in-flight` (review finding R2).
+    #[serde(default)]
+    max_queue: Option<usize>,
+    /// Which people a trusted client may name in `X-Pmos-User`: `any` (the default), or
+    /// `from-name` (a `prefix*` pattern only): just the one whose handle the `*` part of the
+    /// client's name spells, as a personal bot's name does (review finding R1).
+    #[serde(default)]
+    user: Option<String>,
+}
+
+/// Which people a trusted client may name in `X-Pmos-User` (review finding R1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserRule {
+    /// Anyone: the client verified the person itself (the runtime), or serves the whole team
+    /// (a team bot such as `bot-docs`).
+    Any,
+    /// Only the person whose handle the client's name spells after its first `prefix`
+    /// bytes, in the form a personal bot's name gives it ([`handle_in_name`]): `bot-pm-ana-k`
+    /// (pattern `bot-pm-*`) may name `ana.k`, and no one else.
+    FromName { prefix: usize },
 }
 
 /// How the gateway treats one client (review finding N3).
@@ -125,6 +162,48 @@ pub struct ClientPolicy {
     /// For an untrusted client, every call's priority; for a trusted one, the priority of a
     /// call without `X-Pmos-Priority`.
     pub priority: Priority,
+    /// The most calls this client may have waiting for a slot.
+    pub max_queue: usize,
+    /// Which people it may name, when trusted.
+    pub user: UserRule,
+}
+
+impl ClientPolicy {
+    /// May `client` (whose policy this is) name `handle` in `X-Pmos-User`?
+    pub fn may_name(&self, client: &str, handle: &str) -> bool {
+        match self.user {
+            UserRule::Any => true,
+            UserRule::FromName { prefix } => client
+                .get(prefix..)
+                .is_some_and(|rest| !rest.is_empty() && rest == handle_in_name(handle)),
+        }
+    }
+}
+
+/// A handle as PM OS writes it in a personal bot's name, `pm-<this>`
+/// ([`pmos_contract::onboarding::personal_bot_name`]): `.` and `_` become `-`, a run of
+/// hyphens one, and it is cut so the bot name fits 32 characters. Two handles can give the
+/// same form (`ana.k`, `ana_k`); they would also share one personal bot name.
+pub fn handle_in_name(handle: &str) -> String {
+    let bot = pmos_contract::onboarding::personal_bot_name(handle);
+    bot.strip_prefix("pm-").unwrap_or(&bot).to_string()
+}
+
+/// The shortest prefix a `prefix*` client pattern may have, so a pattern can never cover every
+/// client (a bare `*`) or nearly every one (`b*`). `bot-` is the shortest in use.
+pub const MIN_PATTERN_PREFIX: usize = 4;
+
+/// The longest client name: room for `bot-` before the longest personal bot name (32).
+pub const MAX_CLIENT_NAME: usize = 40;
+
+/// A client name, as in `PMOS_GATEWAY_TOKENS`: 1 to [`MAX_CLIENT_NAME`] lowercase letters,
+/// digits and `-`.
+pub fn valid_client_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_CLIENT_NAME
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,6 +230,29 @@ struct ModelsFile {
     /// Per-client trust, cap and priority, by client name or `prefix*` pattern.
     #[serde(default)]
     clients: BTreeMap<String, ClientSpec>,
+    /// `production` or `test` (the default): what `GET /v1/pmos/roles` reports, so a
+    /// benchmark report says which kind of gateway its models came from (review finding R3).
+    #[serde(default)]
+    class: Option<String>,
+}
+
+/// What kind of gateway this is (review finding R3): only the Spark's own gateway
+/// (`deploy/gateway.yaml`) says `production`; anything else, a config that says nothing
+/// included, is `test`. A `production` gateway refuses testing-only upstreams and the stub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GatewayClass {
+    Production,
+    #[default]
+    Test,
+}
+
+impl GatewayClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Test => "test",
+        }
+    }
 }
 
 /// One model role, such as `default`, which callers address as `pmos/default`.
@@ -211,6 +313,8 @@ pub struct Models {
     pub limits: Limits,
     /// `clients:`, resolved: an exact client name, or a pattern ending in `*`.
     pub clients: BTreeMap<String, ClientPolicy>,
+    /// `class:` (default `test`).
+    pub class: GatewayClass,
 }
 
 impl Models {
@@ -233,23 +337,66 @@ impl Models {
         }
         let limits = file.limits;
         limits.check()?;
+        let class = match file.class.as_deref() {
+            None | Some("test") => GatewayClass::Test,
+            Some("production") => GatewayClass::Production,
+            Some(other) => {
+                return Err(format!(
+                    "gateway config: class must be `production` or `test`, not `{other}`"
+                ))
+            }
+        };
         let mut clients = BTreeMap::new();
         for (name, spec) in file.clients {
-            let ok = match name.strip_suffix('*') {
-                Some(prefix) => prefix.is_empty() || valid_role_name(prefix),
-                None => valid_role_name(&name),
+            let pattern = name.strip_suffix('*');
+            if pattern.is_some_and(|p| p.len() < MIN_PATTERN_PREFIX) {
+                return Err(format!(
+                    "gateway config: client pattern `{name}` must have at least \
+                     {MIN_PATTERN_PREFIX} characters before its `*`, so it can't cover every client"
+                ));
+            }
+            let ok = match pattern {
+                Some(prefix) => valid_client_name(prefix),
+                None => valid_client_name(&name),
             };
             if !ok {
                 return Err(format!(
                     "gateway config: client `{name}` must be a client name (lowercase letters, \
-                     digits and `-`), optionally ending in `*`"
+                     digits and `-`, at most {MAX_CLIENT_NAME}), optionally ending in `*`"
                 ));
             }
-            if spec.max_in_flight == Some(0) {
+            if spec.max_in_flight == Some(0) || spec.max_queue == Some(0) {
                 return Err(format!(
-                    "gateway config: client `{name}`: max-in-flight must be at least 1"
+                    "gateway config: client `{name}`: max-in-flight and max-queue must be at least 1"
                 ));
             }
+            let user = match spec.user.as_deref() {
+                None | Some("any") => UserRule::Any,
+                Some("from-name") => match pattern {
+                    Some(prefix) if spec.trusted => UserRule::FromName {
+                        prefix: prefix.len(),
+                    },
+                    Some(_) => {
+                        return Err(format!(
+                            "gateway config: client `{name}`: `user: from-name` needs \
+                             `trusted: true` (an untrusted client names no one)"
+                        ))
+                    }
+                    None => {
+                        return Err(format!(
+                            "gateway config: client `{name}`: `user: from-name` is for a pattern \
+                             ending in `*`, whose `*` part spells the handle"
+                        ))
+                    }
+                },
+                Some(other) => {
+                    return Err(format!(
+                        "gateway config: client `{name}`: user must be `any` or `from-name`, not \
+                         `{other}`"
+                    ))
+                }
+            };
+            let max_in_flight = spec.max_in_flight.unwrap_or(limits.client_default());
             let priority = match spec.priority.as_deref() {
                 None if spec.trusted => Priority::Interactive,
                 None => Priority::Personal,
@@ -264,8 +411,12 @@ impl Models {
                 name,
                 ClientPolicy {
                     trusted: spec.trusted,
-                    max_in_flight: spec.max_in_flight.unwrap_or(limits.client_default()),
+                    max_in_flight,
                     priority,
+                    max_queue: spec
+                        .max_queue
+                        .unwrap_or_else(|| max_in_flight.saturating_mul(2)),
+                    user,
                 },
             );
         }
@@ -356,6 +507,12 @@ impl Models {
                     ));
                 }
             }
+            if kind.is_cloud_test() && class == GatewayClass::Production {
+                return Err(format!(
+                    "gateway config: role `{name}` uses a testing-only upstream, which a \
+                     `class: production` gateway never serves"
+                ));
+            }
             roles.insert(
                 name.clone(),
                 Role {
@@ -372,6 +529,7 @@ impl Models {
             roles,
             limits,
             clients,
+            class,
         })
     }
 
@@ -394,6 +552,8 @@ impl Models {
                 trusted: false,
                 max_in_flight: self.limits.client_default(),
                 priority: Priority::Personal,
+                max_queue: self.limits.client_default().saturating_mul(2),
+                user: UserRule::Any,
             })
     }
 
@@ -539,6 +699,18 @@ impl Config {
         })
     }
 
+    /// Refuses to start a `class: production` gateway with the stub model on.
+    pub fn check_class(&self, models: &Models) -> Result<(), String> {
+        if self.stub && models.class == GatewayClass::Production {
+            return Err(
+                "PMOS_GATEWAY_STUB=1 with a `class: production` config: the stub is never a \
+                 production gateway"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Refuses to start when a role uses a testing-only upstream whose key is missing.
     pub fn check_keys(&self, models: &Models) -> Result<(), String> {
         let uses = |kind| models.roles.values().any(|r| r.kind == kind);
@@ -565,9 +737,10 @@ fn parse_clients(spec: &str) -> Result<Vec<Client>, String> {
         let (name, token) = entry
             .split_once('=')
             .ok_or("PMOS_GATEWAY_TOKENS entries are `name=token`")?;
-        if !valid_role_name(name) {
+        if !valid_client_name(name) {
             return Err(format!(
-                "PMOS_GATEWAY_TOKENS: client name `{name}` must be lowercase letters, digits and `-`"
+                "PMOS_GATEWAY_TOKENS: client name `{name}` must be 1 to {MAX_CLIENT_NAME} \
+                 lowercase letters, digits and `-`"
             ));
         }
         if token.len() < 32 {

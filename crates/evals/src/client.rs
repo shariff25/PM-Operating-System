@@ -258,6 +258,27 @@ impl Runtime {
         Self::decode::<Drafts>("GET", &path, v).map(|d| d.drafts)
     }
 
+    /// Which models the runtime's own gateway serves, and that gateway's class: the `gateway`
+    /// field the runtime adds to `GET /v1/personas` for client `evals` (review finding R3).
+    /// This is the gateway the runtime and its workers were configured with, not one the
+    /// runner names itself. Never a URL: the field holds model ids and upstream kinds only.
+    pub async fn gateway_models(&self) -> Result<crate::report::GatewayModels, String> {
+        let v = self
+            .send("GET", "/v1/personas", &self.token, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let g = &v["gateway"];
+        if let Some(why) = g["error"].as_str() {
+            return Err(why.to_string());
+        }
+        if g.is_null() {
+            return Err(
+                "the runtime doesn't report its gateway (a runtime from before 2026-11-22?)".into(),
+            );
+        }
+        crate::report::GatewayModels::from_roles_answer(g)
+    }
+
     /// `GET /v1/tasks/{id}/trace`, or `None` when this client may not read it (401, 403) or
     /// the runtime keeps none for the task (404).
     pub async fn trace(&self, id: &str) -> Result<Option<Vec<TraceEntry>>, ApiError> {
