@@ -313,8 +313,11 @@ describe("harness worker", () => {
       config: { heartbeatMs: 40 },
     });
     await waitFor(() => finished(runtime, "tsk_1"));
+    expect(runtime.forTask("tsk_1", "heartbeat").length).toBeGreaterThanOrEqual(3);
+    // The runtime sees the task finish before the worker's own call returns and clears its
+    // timer, so one beat can still be on its way. Let that settle, then nothing more may come.
+    await new Promise((r) => setTimeout(r, 120));
     const beats = runtime.forTask("tsk_1", "heartbeat").length;
-    expect(beats).toBeGreaterThanOrEqual(3);
     await new Promise((r) => setTimeout(r, 150));
     expect(runtime.forTask("tsk_1", "heartbeat").length).toBe(beats);
   });
