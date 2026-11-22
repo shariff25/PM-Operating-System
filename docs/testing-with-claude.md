@@ -95,7 +95,8 @@ including why it isn't ready for production.
 
 `PMOS_TEST_EVALS=1 scripts/claude-test-stack.sh` also sets the stack up for `pmos-evals`: the
 benchmark member `evals` with a personal bot `pm-evals` and every offered persona on its team,
-the runner's and judges' tokens, and the fake docs fixtures. It can't be combined with
+the runner's and judges' tokens, the fake docs fixtures, and `PMOS_TEST_EVALS_LANES` isolated
+lanes (default 1) that give every attempt a fresh tool server. It can't be combined with
 `PMOS_TEST_WEB=1`. See "On the test stack" in [Benchmarks](evals.md).
 
 ## The model
