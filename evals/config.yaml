@@ -14,6 +14,14 @@ runner:
   # adds queue time; `load` ignores this and sends all of its tasks at once.
   concurrency: 1
 
+# Which runs count towards a bar (the two-weeks rule, and a marketplace bot's
+# `benchmarked: true`; docs/evals.md, "Which runs count"). The production role models are the
+# `model` of each role in this gateway config (relative to this directory): a report counts
+# only when the models its gateway reported for the run match them, role for role, with no
+# stub and no testing-only upstream. Reports without the gateway's models never count.
+benchmark:
+  production_gateway: ../deploy/gateway.yaml
+
 # What a `must_decline` answer says when its sources don't answer the question. It passes when
 # it contains any of these, compared loosely (lowercase, dashes as spaces, curly apostrophes as
 # straight ones). Keep them specific to declining: a phrase a normal answer could contain

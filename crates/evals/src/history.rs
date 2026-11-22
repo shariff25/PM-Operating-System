@@ -4,7 +4,13 @@
 //! run in it does, so a rerun after a model or harness change that falls below the bar counts
 //! against that week. The category passes when the latest week with a run and the calendar
 //! week right before it both meet the bar. A week with no run breaks the streak.
+//!
+//! Only reports that [`counts`] accepts take part (review finding N5): those whose gateway
+//! reported the production role models (`benchmark.production_gateway` in `config.yaml`,
+//! `deploy/gateway.yaml`), with no stub or testing-only upstream, and, for a persona's
+//! category, on the persona's current version. [`evaluate`] itself judges whatever it's given.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -88,15 +94,148 @@ fn load_where(dir: &Path, keep: impl Fn(&Report) -> bool) -> Result<Vec<(String,
     Ok(reports)
 }
 
+/// The production role models: role name to model id, from the `model` of each role in the
+/// production gateway config that `config.yaml`'s `benchmark.production_gateway` names
+/// (`deploy/gateway.yaml`). Only the model ids are read, never an upstream address.
+pub fn production_models(evals_root: &Path) -> Result<BTreeMap<String, String>, String> {
+    let config = crate::config::Config::load(evals_root)?;
+    let path = evals_root.join(&config.benchmark.production_gateway);
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "{}: can't read the production gateway config: {e}",
+            path.display()
+        )
+    })?;
+    let v: serde_norway::Value =
+        serde_norway::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let roles = v
+        .get("roles")
+        .and_then(|r| r.as_mapping())
+        .ok_or_else(|| format!("{}: no `roles`", path.display()))?;
+    let mut out = BTreeMap::new();
+    for (name, role) in roles {
+        let (Some(name), Some(model)) = (name.as_str(), role.get("model").and_then(|m| m.as_str()))
+        else {
+            return Err(format!(
+                "{}: a role without a name or `model`",
+                path.display()
+            ));
+        };
+        out.insert(name.to_string(), model.to_string());
+    }
+    if out.is_empty() {
+        return Err(format!("{}: no roles", path.display()));
+    }
+    Ok(out)
+}
+
+/// The `version:` in `<content>/personas/<persona>/PERSONA.md`'s front matter.
+pub fn persona_version(content: &Path, persona: &str) -> Option<String> {
+    let text =
+        std::fs::read_to_string(content.join("personas").join(persona).join("PERSONA.md")).ok()?;
+    let front = text.strip_prefix("---")?.split("\n---").next()?;
+    let v: serde_norway::Value = serde_norway::from_str(front).ok()?;
+    match v.get("version")? {
+        serde_norway::Value::String(s) => Some(s.clone()),
+        serde_norway::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether `report` counts towards its category's bar (review finding N5): its gateway's
+/// models were recorded ([`Report::gateway_models`]), are exactly the production role models
+/// (`production`), role for role, came from neither the stub nor a testing-only upstream; and,
+/// for a persona's category, the persona's version then (`report.persona_version`) is its
+/// version now (`persona_now`). `Err` says why not. A report without the gateway's models
+/// (every one before 2026-11-22) never counts.
+pub fn counts(
+    report: &Report,
+    production: &BTreeMap<String, String>,
+    persona_now: Option<&str>,
+) -> Result<(), String> {
+    let Some(m) = &report.gateway_models else {
+        return Err("the gateway's models weren't recorded".into());
+    };
+    if m.stub {
+        return Err("the gateway answered with its stub model".into());
+    }
+    if m.cloud_test {
+        return Err("a testing-only upstream was on".into());
+    }
+    if m.upstreams.values().any(|u| u != "local") {
+        return Err("a role was served by an upstream that isn't local".into());
+    }
+    if &m.roles != production {
+        let differ: Vec<String> = production
+            .keys()
+            .chain(m.roles.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|r| production.get(*r) != m.roles.get(*r))
+            .map(|r| {
+                format!(
+                    "{r}: `{}`, production `{}`",
+                    m.roles.get(r).map(String::as_str).unwrap_or("none"),
+                    production.get(r).map(String::as_str).unwrap_or("none")
+                )
+            })
+            .collect();
+        return Err(format!(
+            "its models aren't the production role models ({})",
+            differ.join("; ")
+        ));
+    }
+    if let Some(now) = persona_now {
+        match report.persona_version.as_deref() {
+            Some(v) if v == now => {}
+            Some(v) => {
+                return Err(format!(
+                    "it measured persona version `{v}`; the persona is now `{now}`"
+                ))
+            }
+            None => return Err("the persona's version wasn't recorded".into()),
+        }
+    }
+    Ok(())
+}
+
+/// The reports that count ([`counts`]), and `(file, date, why not)` for the rest. With no
+/// production models (`Err`), none counts.
+pub fn split_counting(
+    reports: Vec<(String, Report)>,
+    production: &Result<BTreeMap<String, String>, String>,
+    persona_now: Option<&str>,
+) -> (Vec<Report>, Vec<(String, NaiveDate, String)>) {
+    let mut kept = Vec::new();
+    let mut left = Vec::new();
+    for (file, r) in reports {
+        let verdict = match production {
+            Ok(p) => counts(&r, p, persona_now),
+            Err(e) => Err(format!("no production role models: {e}")),
+        };
+        match verdict {
+            Ok(()) => kept.push(r),
+            Err(why) => left.push((file, r.date, why)),
+        }
+    }
+    (kept, left)
+}
+
 /// The personas (marketplace bots) whose benchmark passes (D10), for `pmos lint`'s
 /// `persona-benchmark` rule: those named by at least one category under `evals_root`
 /// (`persona: <key>` in its `category.yaml`), where **every** category naming it has a pass bar
-/// and has met it two weeks in a row in `<evals_root>/reports`. Fails closed: a category that
-/// doesn't load, has no bar, or whose reports can't be read counts as not met (`pmos-evals
-/// check` reports why), and a missing evals directory gives no persona.
-pub fn benchmarked_personas(evals_root: &Path) -> std::collections::BTreeSet<String> {
-    use std::collections::BTreeMap;
+/// and has met it two weeks in a row in `<evals_root>/reports`, counting only the reports that
+/// [`counts`] accepts: run on the production role models, and on the persona's current version
+/// in `content`. Fails closed: a category that doesn't load, has no bar, or whose reports
+/// can't be read, a persona whose version can't be read, and production models that can't be
+/// read all count as not met (`pmos-evals check` reports why), and a missing evals directory
+/// gives no persona.
+pub fn benchmarked_personas(
+    evals_root: &Path,
+    content: &Path,
+) -> std::collections::BTreeSet<String> {
     let reports = evals_root.join("reports");
+    let production = production_models(evals_root);
     let mut met: BTreeMap<String, bool> = BTreeMap::new();
     let Ok(names) = crate::spec::category_names(evals_root) else {
         return Default::default();
@@ -118,11 +257,17 @@ pub fn benchmarked_personas(evals_root: &Path) -> std::collections::BTreeSet<Str
         let Some(persona) = category.persona else {
             continue;
         };
-        let ok = category.pass_bar.is_some_and(|bar| {
-            load_reports(&reports, &name)
-                .map(|r| evaluate(&name, bar, &r).two_weeks_met)
-                .unwrap_or(false)
-        });
+        let version = persona_version(content, &persona);
+        let ok = production.is_ok()
+            && version.is_some()
+            && category.pass_bar.is_some_and(|bar| {
+                load_named(&reports, &name)
+                    .map(|r| {
+                        let (kept, _) = split_counting(r, &production, version.as_deref());
+                        evaluate(&name, bar, &kept).two_weeks_met
+                    })
+                    .unwrap_or(false)
+            });
         let entry = met.entry(persona).or_insert(true);
         *entry = *entry && ok;
     }

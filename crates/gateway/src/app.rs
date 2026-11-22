@@ -9,9 +9,14 @@
 //! - `GET /healthz` (process up), `GET /readyz` (every model server answers; `cloud_test` says
 //!   whether a testing-only upstream, whose prompts leave this machine, is on).
 //!
+//! - `GET /v1/pmos/roles`: each role's model id and upstream kind (never an address), and
+//!   whether the stub or a testing-only upstream is on, for the benchmark runner's report.
+//!
 //! Every `/v1` call needs a client token. `X-Pmos-User` (a handle), `X-Pmos-Priority`
 //! (`interactive`, `scheduled` or `personal`) and `X-Pmos-Run` place it in the queue and the
-//! usage log.
+//! usage log. The first two are believed only from a client `clients:` marks `trusted`; any
+//! other client's calls are keyed by its name and get its configured priority. Every client
+//! has its own cap on calls in flight (`config::ClientPolicy`).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,10 +33,10 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::anthropic;
-use crate::config::{Client, Models, Role, UpstreamKind};
+use crate::config::{Client, ClientPolicy, Models, Role, UpstreamKind};
 use crate::remote::{StreamScanner, ToolCallExtras};
 use crate::retry::RetryPolicy;
-use crate::scheduler::{Permit, Priority, Scheduler};
+use crate::scheduler::{Owner, Permit, Priority, Scheduler};
 use crate::usage::{UsageEvent, UsageLog};
 use crate::{stub, workarounds};
 
@@ -148,6 +153,7 @@ pub fn router(cfg: GatewayConfig) -> Router {
         .route("/chat/completions", post(chat))
         .route("/embeddings", post(embeddings))
         .route("/pmos/workarounds", get(list_workarounds))
+        .route("/pmos/roles", get(list_roles))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
     Router::new()
@@ -219,6 +225,41 @@ async fn list_workarounds(State(state): State<AppState>) -> Response {
         })
         .collect();
     Json(json!({"enabled": state.0.workarounds_on, "workarounds": entries})).into_response()
+}
+
+/// Which model serves each role, as this gateway runs now: the model id and the kind of
+/// upstream (`local`, `claude-test` or `remote-test`), never its address or host, and whether
+/// the stub model, a testing-only upstream or the workarounds are on. The benchmark runner
+/// records this in its report (review finding N5), so a report says which models it measured
+/// without the operator typing them.
+async fn list_roles(State(state): State<AppState>) -> Response {
+    let roles: Vec<Value> = state
+        .0
+        .models
+        .roles
+        .values()
+        .map(|r| {
+            let upstream = match r.kind {
+                UpstreamKind::OpenAi => "local",
+                UpstreamKind::ClaudeTest => "claude-test",
+                UpstreamKind::RemoteOpenAi => "remote-test",
+            };
+            json!({"role": r.name, "alias": r.alias(), "model": r.model, "upstream": upstream})
+        })
+        .collect();
+    let cloud_test = state
+        .0
+        .models
+        .roles
+        .values()
+        .any(|r| r.kind.is_cloud_test());
+    Json(json!({
+        "stub": state.0.stub,
+        "cloud_test": cloud_test,
+        "workarounds": state.0.workarounds_on,
+        "roles": roles,
+    }))
+    .into_response()
 }
 
 async fn readyz(State(state): State<AppState>) -> Response {
@@ -309,7 +350,35 @@ struct Caller {
     priority: Priority,
 }
 
-fn caller(headers: &HeaderMap) -> Result<Caller, String> {
+/// The caller's headers, checked, and then believed only as far as its client is trusted:
+/// a client `clients:` doesn't mark `trusted` is keyed by its own name and gets its
+/// configured priority, whatever `X-Pmos-User` and `X-Pmos-Priority` say (review finding
+/// N3). Malformed headers are refused from every client.
+fn caller(headers: &HeaderMap, policy: &ClientPolicy) -> Result<Caller, String> {
+    let declared = declared(headers)?;
+    Ok(if policy.trusted {
+        Caller {
+            user: declared.user,
+            run: declared.run,
+            priority: declared.priority.unwrap_or(policy.priority),
+        }
+    } else {
+        Caller {
+            user: None,
+            run: declared.run,
+            priority: policy.priority,
+        }
+    })
+}
+
+/// What the headers declare, before trust is applied.
+struct Declared {
+    user: Option<String>,
+    run: Option<String>,
+    priority: Option<Priority>,
+}
+
+fn declared(headers: &HeaderMap) -> Result<Declared, String> {
     let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let user = match text("x-pmos-user") {
         None => None,
@@ -317,21 +386,66 @@ fn caller(headers: &HeaderMap) -> Result<Caller, String> {
         Some(u) => return Err(format!("X-Pmos-User `{u}` is not a PM OS handle")),
     };
     let priority = match text("x-pmos-priority") {
-        None => Priority::Interactive,
-        Some(p) => Priority::parse(p).ok_or_else(|| {
+        None => None,
+        Some(p) => Some(Priority::parse(p).ok_or_else(|| {
             format!("X-Pmos-Priority must be interactive, scheduled or personal, not `{p}`")
-        })?,
+        })?),
     };
     let run = match text("x-pmos-run") {
         None => None,
         Some(r) if !r.is_empty() && r.len() <= 128 => Some(r.to_string()),
         Some(_) => return Err("X-Pmos-Run must be 1–128 characters".into()),
     };
-    Ok(Caller {
+    Ok(Declared {
         user,
         run,
         priority,
     })
+}
+
+/// Waits for a slot for at most `limits.queue-wait-secs`. `None`: the queue was full, or the
+/// wait ran out; either way the place in the queue has been given back.
+async fn slot(inner: &Inner, owner: &Owner, priority: Priority) -> Result<Permit, &'static str> {
+    let wait = Duration::from_secs(inner.models.limits.queue_wait_secs);
+    match tokio::time::timeout(wait, inner.sched.acquire(owner, priority)).await {
+        Ok(Ok(p)) => Ok(p),
+        Ok(Err(_)) => Err("the model queue is full; try again shortly"),
+        Err(_) => Err("no model slot came free in time; try again shortly"),
+    }
+}
+
+fn busy(message: &str) -> Response {
+    let mut res = error(StatusCode::SERVICE_UNAVAILABLE, "server_busy", message);
+    res.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    res
+}
+
+/// Why an upstream's whole answer couldn't be read.
+enum ReadError {
+    /// More than `limits.max-answer-bytes`.
+    TooLarge,
+    /// The connection broke, or the answer timed out (the error, without its URL).
+    Broken(reqwest::Error),
+}
+
+/// Reads a whole answer, refusing one larger than `max` bytes.
+async fn read_capped(mut res: reqwest::Response, max: usize) -> Result<Bytes, ReadError> {
+    if res.content_length().is_some_and(|n| n > max as u64) {
+        return Err(ReadError::TooLarge);
+    }
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = res
+        .chunk()
+        .await
+        .map_err(|e| ReadError::Broken(e.without_url()))?
+    {
+        if buf.len() + chunk.len() > max {
+            return Err(ReadError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
 }
 
 /// What one try at the upstream came to.
@@ -364,6 +478,77 @@ impl Drop for StreamEnd {
     }
 }
 
+type Upstream = std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>;
+
+/// What a stream that runs past its limits ends with, as the caller sees it.
+const STREAM_TOO_LONG: &str = "the streamed answer took longer than this gateway allows";
+const STREAM_TOO_LARGE: &str = "the streamed answer is larger than this gateway accepts";
+
+/// The caller's side of a streamed answer: the upstream's bytes as they come, until the
+/// upstream ends, breaks, passes `max_bytes` in all, or reaches `deadline`. A stream cut off
+/// that way ends with an error, so the caller sees a broken answer rather than a short one
+/// that looks whole, and the usage line says `504` (too long) or `502` (broken or too large).
+///
+/// `end` lives as long as the stream: when the answer ends, or the caller hangs up and the
+/// body is dropped, it logs the call and frees the slot, and dropping the upstream stream with
+/// it closes the connection to the model server, so generation stops there too.
+fn bounded_stream(
+    upstream: Upstream,
+    end: StreamEnd,
+    scanner: Option<StreamScanner>,
+    deadline: tokio::time::Instant,
+    max_bytes: usize,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    struct Flow {
+        upstream: Upstream,
+        end: StreamEnd,
+        scanner: Option<StreamScanner>,
+        seen: usize,
+        done: bool,
+    }
+    let flow = Flow {
+        upstream,
+        end,
+        scanner,
+        seen: 0,
+        done: false,
+    };
+    futures_util::stream::unfold(flow, move |mut f| async move {
+        if f.done {
+            return None;
+        }
+        let cut = |f: &mut Flow, status: u16, why: String| {
+            f.done = true;
+            f.end.event.status = status;
+            tracing::warn!(role = %f.end.event.role, status, reason = %why, "streamed answer cut off");
+            Err(std::io::Error::other(why))
+        };
+        match tokio::time::timeout_at(deadline, f.upstream.next()).await {
+            Err(_) => {
+                let e = cut(&mut f, 504, STREAM_TOO_LONG.into());
+                Some((e, f))
+            }
+            Ok(None) => None,
+            // Never the upstream's URL.
+            Ok(Some(Err(e))) => {
+                let e = cut(&mut f, 502, e.without_url().to_string());
+                Some((e, f))
+            }
+            Ok(Some(Ok(bytes))) => {
+                f.seen += bytes.len();
+                if f.seen > max_bytes {
+                    let e = cut(&mut f, 502, STREAM_TOO_LARGE.into());
+                    return Some((e, f));
+                }
+                if let Some(s) = &mut f.scanner {
+                    s.feed(&bytes);
+                }
+                Some((Ok(bytes), f))
+            }
+        }
+    })
+}
+
 async fn forward(
     state: AppState,
     client: String,
@@ -394,30 +579,21 @@ async fn forward(
             ),
         );
     };
-    let who = match caller(&headers) {
+    let policy = inner.models.client_policy(&client);
+    let who = match caller(&headers, &policy) {
         Ok(c) => c,
         Err(m) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", m),
     };
     req["model"] = json!(role.model);
     let stream = endpoint == Endpoint::Chat && req["stream"] == json!(true);
 
-    // Without a person, the client's own name shares the per-person cap.
-    let queue_key = who
-        .user
-        .clone()
-        .unwrap_or_else(|| format!("client:{client}"));
-    let permit = match inner.sched.acquire(&queue_key, who.priority).await {
+    // The person's cap applies when the gateway believes the person (a trusted client's
+    // `X-Pmos-User`); the client's own cap always applies. Without a believed person, the
+    // client's cap alone bounds its calls.
+    let owner = Owner::new(who.user.as_deref(), &client, policy.max_in_flight);
+    let permit = match slot(inner, &owner, who.priority).await {
         Ok(p) => p,
-        Err(_) => {
-            let mut res = error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_busy",
-                "the model queue is full; try again shortly",
-            );
-            res.headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
-            return res;
-        }
+        Err(m) => return busy(m),
     };
     let mut event = UsageEvent {
         at: Utc::now(),
@@ -510,7 +686,9 @@ async fn forward(
             Ok(r) => {
                 let status = r.status().as_u16();
                 let headers = r.headers().clone();
-                let body = r.bytes().await.unwrap_or_default();
+                let body = read_capped(r, inner.models.limits.max_answer_bytes)
+                    .await
+                    .unwrap_or_default();
                 Attempt::Failed {
                     status,
                     headers,
@@ -550,9 +728,10 @@ async fn forward(
         drop(permit.take());
         tokio::time::sleep(wait).await;
         let waited = Instant::now();
-        match inner.sched.acquire(&queue_key, who.priority).await {
+        match slot(inner, &owner, who.priority).await {
             Ok(p) => permit = Some(p),
-            // No room to wait again: the caller gets what the upstream last said.
+            // No room to wait again, or no slot in time: the caller gets what the upstream
+            // last said.
             Err(_) => break this,
         }
         event.queue_ms += waited.elapsed().as_millis() as u64;
@@ -617,14 +796,15 @@ async fn forward(
             _permit: permit,
         };
         // Remote test upstreams: remember tool-call extra_content as it passes (`remote.rs`).
-        let mut scanner = remote.then(|| StreamScanner::new(inner.extras.clone(), &role.upstream));
-        let body = res.bytes_stream().map(move |chunk| {
-            let _hold = &end;
-            if let (Some(s), Ok(bytes)) = (&mut scanner, &chunk) {
-                s.feed(bytes);
-            }
-            chunk.map_err(std::io::Error::other)
-        });
+        let scanner = remote.then(|| StreamScanner::new(inner.extras.clone(), &role.upstream));
+        let limits = inner.models.limits;
+        let body = bounded_stream(
+            Box::pin(res.bytes_stream()),
+            end,
+            scanner,
+            tokio::time::Instant::now() + Duration::from_secs(limits.stream_max_secs),
+            limits.max_answer_bytes,
+        );
         return finish(
             (
                 [
@@ -637,17 +817,23 @@ async fn forward(
         );
     }
 
-    let bytes = match res.bytes().await {
+    let bytes = match read_capped(res, inner.models.limits.max_answer_bytes).await {
         Ok(b) => b,
         Err(e) => {
             event.status = 502;
             event.latency_ms = started.elapsed().as_millis() as u64;
             inner.usage.record(event);
-            return error(
-                StatusCode::BAD_GATEWAY,
-                "upstream_error",
-                format!("the `{}` model server stopped mid-answer: {e}", role.name),
-            );
+            // Never the upstream's URL: `read_capped` strips it from the error.
+            let message = match e {
+                ReadError::TooLarge => format!(
+                    "the `{}` model server's answer is larger than this gateway accepts",
+                    role.name
+                ),
+                ReadError::Broken(e) => {
+                    format!("the `{}` model server stopped mid-answer: {e}", role.name)
+                }
+            };
+            return finish(error(StatusCode::BAD_GATEWAY, "upstream_error", message));
         }
     };
     if !status.is_success() {
@@ -746,7 +932,21 @@ async fn claude(
     };
     let status = res.status();
     event.status = status.as_u16();
-    let answer: Value = res.json().await.unwrap_or(Value::Null);
+    let answer: Value = match read_capped(res, inner.models.limits.max_answer_bytes).await {
+        Ok(b) => serde_json::from_slice(&b).unwrap_or(Value::Null),
+        Err(ReadError::TooLarge) => {
+            event.status = 502;
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                format!(
+                    "the `{}` model's answer (Claude test upstream) is larger than this gateway accepts",
+                    role.name
+                ),
+            );
+        }
+        Err(ReadError::Broken(_)) => Value::Null,
+    };
     if !status.is_success() {
         tracing::warn!(
             status = status.as_u16(),

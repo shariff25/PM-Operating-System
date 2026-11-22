@@ -428,10 +428,23 @@ async fn completions(
         .into_response()
 }
 
+/// The gateway's `GET /v1/pmos/roles`: two local roles.
+async fn roles(headers: HeaderMap) -> Response {
+    if bearer(&headers).as_deref() != Some(GATEWAY_TOKEN) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(json!({"stub": false, "cloud_test": false, "workarounds": true, "roles": [
+        {"role": "default", "alias": "pmos/default", "model": "qwen-prod", "upstream": "local"},
+        {"role": "extraction", "alias": "pmos/extraction", "model": "nemo-prod", "upstream": "local"},
+    ]}))
+    .into_response()
+}
+
 /// Start the mock gateway. Returns its base URL, without `/v1`.
 pub async fn spawn_gateway(g: Arc<Gateway>) -> String {
     let app = Router::new()
         .route("/v1/chat/completions", post(completions))
+        .route("/v1/pmos/roles", get(roles))
         .with_state(g);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -465,11 +478,23 @@ latency_targets:
   total_p50: {seconds: 60, source: test default}
   total_p90: {seconds: 180, source: test default}
 decline_phrases: [\"don't answer\", \"couldn't find\"]
+benchmark:
+  production_gateway: prod-gateway.yaml
+";
+
+/// The production gateway config [`write_category`] writes beside `config.yaml`: the models
+/// the mock gateway reports.
+pub const PROD_GATEWAY: &str = "\
+upstreams: {q: 'http://vllm:8000/v1'}
+roles:
+  default: {upstream: q, model: qwen-prod}
+  extraction: {upstream: q, model: nemo-prod}
 ";
 
 /// Write `config.yaml` and a category with the given task files (`(id, yaml)`) under `root`.
 pub fn write_category(root: &Path, name: &str, bot: &str, bar: f64, tasks: &[(&str, String)]) {
     std::fs::write(root.join("config.yaml"), CONFIG).unwrap();
+    std::fs::write(root.join("prod-gateway.yaml"), PROD_GATEWAY).unwrap();
     let dir = root.join("categories").join(name);
     std::fs::create_dir_all(dir.join("tasks")).unwrap();
     std::fs::write(

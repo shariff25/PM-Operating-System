@@ -23,11 +23,18 @@ upstreams:
 roles:
   default: {upstream: qwen, model: qwen3.6-35b-a3b, workarounds: [strip-think]}
 limits: {max-in-flight: 4, per-user: 2, max-queue: 64}
+clients:
+  runtime: {trusted: true, max-in-flight: 2}
+  bot-*: {trusted: true, max-in-flight: 3}
+  evals: {max-in-flight: 1, priority: personal}
 ```
 
 - **`model`** is the vLLM server's `--served-model-name`.
 - **No caller changes:** the harness and the bots keep asking for `pmos/default`.
-- **Re-run the benchmark** (0g) after any swap, as D11 requires.
+- **Re-run the benchmark** (0g) after any swap, as D11 requires. The roles' models in
+  `deploy/gateway.yaml` are the *production role models*: an eval report counts towards a bar
+  only if the models the gateway reported for its run are these (`docs/evals.md`, "Which runs
+  count"), so a swap there starts every streak again.
 - **The `reasoning` role** serves the PM-craft skills (`docs/pm-craft.md`). It ships pointing
   at the same upstream and model as `default`. If the `pm-craft` benchmarks show that model
   doesn't meet the bar, point `reasoning` at a larger one here; no skill changes.
@@ -46,10 +53,33 @@ it can be deleted.
 
 ## Sharing the GPU (MOD-4)
 - **Concurrency:** at most `max-in-flight` calls run at once.
-- **Per person:** at most `per-user` of them belong to one person (`X-Pmos-User`).
-- **Priority** (`X-Pmos-Priority`): `interactive` (someone waiting in Slack), then `scheduled` (routines), then `personal` (background work). Within a priority it's first come, first served. With no header, a call is interactive.
+- **Per person:** at most `per-user` of them belong to one person (`X-Pmos-User`), counted
+  only when the gateway believes the header (below).
+- **Per client:** each client token has its own cap, `clients.<name>.max-in-flight` (default
+  `limits.per-client`, itself defaulting to `per-user`), whoever its calls name. So one token
+  can't hold every slot (review finding N3); in `deploy/gateway.yaml` the `evals` token, which
+  the whole eval stack shares, holds at most one (N4).
+- **Priority** (`X-Pmos-Priority`): `interactive` (someone waiting in Slack), then `scheduled` (routines), then `personal` (background work). Within a priority it's first come, first served.
+- **Which clients are believed:** only a client listed with `trusted: true` has its
+  `X-Pmos-User` and `X-Pmos-Priority` used; with no priority header its calls get its
+  `priority` (default `interactive`). Every other client, listed or not, is keyed by its own
+  name (`client:<name>`, under its own cap only) and always gets its `priority` (default
+  `personal`), whatever it sends. Malformed headers are refused (`400`) from every client.
+  The usage log's `user` is empty for an untrusted client.
+- **Client names:** an exact client name from `PMOS_GATEWAY_TOKENS`, or a pattern ending in
+  `*` (`bot-*` covers every bot's worker); an exact name wins, then the longest pattern.
+  `deploy/gateway.yaml` trusts `runtime` (it names the PM its caller verified; cap 2) and
+  `bot-*` (each worker names the PM whose task it runs; cap 3 of 4), and caps `evals` at 1,
+  `personal`. A bot worker's token can therefore still name any PM, but no longer holds every
+  slot (S8 is narrowed, not closed).
 - **Queue full:** a call that would have to wait gets `503` with `Retry-After: 5` when `max-queue` calls are already waiting. A call that can start at once always starts.
-- **Hang-ups:** a caller that hangs up while waiting gives its place back.
+- **Queue deadline:** a call that has waited `limits.queue-wait-secs` (default 300) for a slot
+  gives up with the same `503` and leaves the queue. A retry waiting for a slot again gives up
+  the same way and returns the upstream's last answer.
+- **Hang-ups:** a caller that hangs up while waiting gives its place back. One that hangs up
+  while its call runs (streamed or not) cancels it: the gateway drops the upstream request,
+  which closes its connection to the model server, and frees the slot at once (tested in
+  `crates/gateway/tests/limits.rs`).
 
 ## Retrying a busy model server
 A model provider can answer `429` ("quota exceeded", a per-minute limit) or `503` for a
@@ -92,6 +122,17 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
   off every non-streamed generation longer than that as a `502` (found in the first eval run,
   on a remote model writing long Confluence drafts).
 - Both are `Timeouts` in `crates/gateway/src/app.rs`.
+- **A streamed answer's total time** is at most `limits.stream-max-secs` (default 900), from
+  its first byte, however steadily it sends: a stream past it is cut off. Before 2026-11-22 a
+  stream that kept sending could hold its slot for ever.
+- **How large an answer may be:** at most `limits.max-answer-bytes` (default 16 MiB), streamed
+  or not, and for the Claude test upstream too. A larger whole answer gets `502` ("larger than
+  this gateway accepts"); a larger stream is cut off.
+- **A stream cut off** (too long, too large, or broken by the model server) ends with an error
+  rather than a clean end, so the caller never takes half an answer for a whole one; its usage
+  line says `504` (too long) or `502`.
+- **No upstream address reaches a caller:** errors returned to callers name the role, never
+  the model server's URL or host (reqwest's errors are stripped of it).
 
 ## API
 | Endpoint | Auth | Purpose |
@@ -100,12 +141,13 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
 | `POST /v1/embeddings` | client token | Embeddings for a role that serves them |
 | `GET /v1/models` | client token | The role aliases |
 | `GET /v1/pmos/workarounds` | client token | The workaround registry |
+| `GET /v1/pmos/roles` | client token | Each role's model id and upstream kind (`local`, `claude-test` or `remote-test`; never an address), and whether the stub, a testing-only upstream and the workarounds are on. The benchmark runner records it in each report. |
 | `GET /healthz` | none | Liveness |
 | `GET /readyz` | none | `200` when every model server answers `/models` within 2 seconds; `503` names the one that doesn't |
 
 **Optional headers:**
-- `X-Pmos-User`: a handle;
-- `X-Pmos-Priority`;
+- `X-Pmos-User`: a handle (used only from a trusted client);
+- `X-Pmos-Priority` (used only from a trusted client);
 - `X-Pmos-Run`: logged with the call;
 - each response carries `X-Pmos-Model`, the model that answered, and (for model-server
   calls) `X-Pmos-Upstream-Attempts`.
@@ -126,7 +168,7 @@ It never holds prompts or answers. Events go to the service log, and with `PMOS_
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `PMOS_GATEWAY_TOKENS` | required | `name=token,…`, one per caller (the bot runtime, the benchmark runner). Each token is at least 32 characters, and all are distinct. |
-| `PMOS_GATEWAY_CONFIG` | `config/gateway.yaml` | Roles, upstreams, limits |
+| `PMOS_GATEWAY_CONFIG` | `config/gateway.yaml` | Roles, upstreams, limits, clients (below) |
 | `PMOS_GATEWAY_BIND` | `127.0.0.1:8740` | |
 | `PMOS_GATEWAY_USAGE_LOG` | none | JSON-lines usage file |
 | `PMOS_GATEWAY_STUB` | off | `1` answers with a deterministic stub model and no model server, for CI and development |
@@ -137,6 +179,24 @@ It never holds prompts or answers. Events go to the service log, and with `PMOS_
 | `PMOS_GATEWAY_CLOUD_TEST` | off | **Testing only.** `1` accepts the Claude test upstream and remote test upstreams (below) |
 | `PMOS_GATEWAY_ANTHROPIC_KEY` | none | **Testing only.** The Claude API key for the Claude test upstream |
 | `PMOS_GATEWAY_REMOTE_KEY` | none | **Testing only.** The API key for remote test upstreams (`openai+https://…`), sent as `Authorization: Bearer`. Never logged. |
+
+**In the config file** (`limits:` and `clients:`; every setting is optional, and the defaults
+bound every client, wait, stream and answer):
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `limits.max-in-flight` | `4` | Calls running at once |
+| `limits.per-user` | `2` | Calls running for one (believed) person |
+| `limits.max-queue` | `64` | Calls that may wait |
+| `limits.per-client` | `per-user` | Calls running for a client `clients:` gives no `max-in-flight` |
+| `limits.queue-wait-secs` | `300` | Longest wait for a slot (1 to 3600), then `503` |
+| `limits.stream-max-secs` | `900` | Longest streamed answer, first byte to last (1 to 7200) |
+| `limits.max-answer-bytes` | `16777216` | Largest answer taken from a model server (1 KiB to 256 MiB) |
+| `clients.<name or prefix*>.trusted` | `false` | Believe `X-Pmos-User` and `X-Pmos-Priority` |
+| `clients.<…>.max-in-flight` | `limits.per-client` | This client's cap |
+| `clients.<…>.priority` | `interactive` if trusted, else `personal` | An untrusted client's every call; a trusted one's calls without the header |
+
+At start-up the gateway logs each client's name, trust, cap and priority (never a token).
 
 **Upstream forms:**
 - `http://<local host>/<base>`: an OpenAI-compatible local model server (vLLM). The only form

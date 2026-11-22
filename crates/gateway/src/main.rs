@@ -50,6 +50,14 @@ async fn main() -> Result<()> {
     for role in models.roles.values() {
         tracing::info!(role = %role.alias(), model = %role.model, upstream = %role.upstream, "model role");
     }
+    // Names and settings only, never a token.
+    for client in &config.clients {
+        let p = models.client_policy(&client.name);
+        tracing::info!(
+            client = %client.name, trusted = p.trusted, max_in_flight = p.max_in_flight,
+            priority = ?p.priority, "client"
+        );
+    }
     let app = router(GatewayConfig {
         models,
         clients: config.clients.clone(),

@@ -944,3 +944,112 @@ async fn cli_affected_reads_changed_paths() {
         "{all}"
     );
 }
+
+/// Review finding N5: `run` records the models the gateway itself reports (never what the
+/// operator types in `--note`), and `history` counts a run only when they are the production
+/// role models; the others are listed with the reason.
+#[tokio::test]
+async fn cli_run_records_the_gateways_models_and_history_counts_only_production_ones() {
+    let mock = Arc::new(Mock::default());
+    mock.script(
+        "q-a",
+        Script {
+            result: Some("KMIP is 5696.".into()),
+            ..Script::default()
+        },
+    );
+    let url = spawn(mock.clone()).await;
+    let gw_url = spawn_gateway(gateway()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_category(
+        root,
+        "cat",
+        "docs",
+        0.5,
+        &[(
+            "a",
+            "id: a\nask: \"q-a\"\nexpect:\n  must_include: [\"5696\"]\n".to_string(),
+        )],
+    );
+    // `write_category` names `prod-gateway.yaml` as the production gateway config.
+    let prod = |default: &str| {
+        std::fs::write(
+            root.join("prod-gateway.yaml"),
+            format!("upstreams: {{q: 'http://vllm:8000/v1'}}\nroles:\n  default: {{upstream: q, model: {default}}}\n  extraction: {{upstream: q, model: nemo-prod}}\n"),
+        )
+        .unwrap();
+    };
+    prod("qwen-prod");
+    let run = |date: &'static str, with_gateway: bool| {
+        let url = url.clone();
+        let gw_url = gw_url.clone();
+        async move {
+            let mut args = vec![
+                "run",
+                "--category",
+                "cat",
+                "--bots-url",
+                &url,
+                "--token",
+                TOKEN,
+                "--as",
+                "ana",
+                "--date",
+                date,
+                "--no-judges",
+                "--note",
+                "model: whatever the operator typed",
+            ];
+            if with_gateway {
+                args.extend(["--gateway-url", &gw_url, "--gateway-token", GATEWAY_TOKEN]);
+            }
+            cli_async(root, &args, None).await
+        }
+    };
+    // Two weeks with the gateway's models recorded, and one more run without a gateway.
+    for date in ["2026-11-09", "2026-11-16"] {
+        let o = run(date, true).await;
+        assert_eq!(o.status.code(), Some(0), "{}", out(&o));
+    }
+    let o = run("2026-11-17", false).await;
+    assert!(out(&o).contains("won't count towards a bar"), "{}", out(&o));
+    let json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("reports/2026-11-16-cat.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        json["gateway_models"]["roles"],
+        json!({"default": "qwen-prod", "extraction": "nemo-prod"})
+    );
+    assert_eq!(json["gateway_models"]["upstreams"]["default"], "local");
+    assert!(
+        !json.to_string().contains(&gw_url),
+        "no gateway address in a report"
+    );
+    let md = std::fs::read_to_string(root.join("reports/2026-11-16-cat.md")).unwrap();
+    assert!(md.contains("default: `qwen-prod` (local)"), "{md}");
+
+    let history = || cli(root, &["history", "--category", "cat"], None);
+    let h = history();
+    assert_eq!(h.status.code(), Some(0), "{}", out(&h));
+    assert!(
+        out(&h).contains("met its bar two weeks in a row"),
+        "{}",
+        out(&h)
+    );
+    assert!(
+        out(&h).contains("2026-11-17-cat.json: the gateway's models weren't recorded"),
+        "{}",
+        out(&h)
+    );
+    // Production moves to another model: the earlier runs no longer count.
+    prod("qwen-next");
+    let h = history();
+    assert_eq!(h.status.code(), Some(1), "{}", out(&h));
+    assert!(
+        out(&h).contains("default: `qwen-prod`, production `qwen-next`"),
+        "{}",
+        out(&h)
+    );
+}

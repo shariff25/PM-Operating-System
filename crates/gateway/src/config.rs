@@ -9,10 +9,15 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::scheduler::Priority;
 use crate::workarounds;
 
-/// How many requests run at once, how many any one person may have running, and how many
-/// may wait before the gateway answers "busy".
+/// How many requests run at once, how many any one person may have running, how many may
+/// wait before the gateway answers "busy", and how long and how large one call may be.
+///
+/// The settings added for review findings N3 and N4 (`per-client`, `queue-wait-secs`,
+/// `stream-max-secs`, `max-answer-bytes`) have safe defaults, so a config that doesn't
+/// mention them still bounds every client, every wait, every stream and every answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Limits {
@@ -22,6 +27,19 @@ pub struct Limits {
     pub per_user: usize,
     #[serde(default = "default_queue")]
     pub max_queue: usize,
+    /// How many calls one client (one gateway token) may have running, for a client that
+    /// `clients:` doesn't give its own `max-in-flight`. `None`: `per-user`.
+    #[serde(default)]
+    pub per_client: Option<usize>,
+    /// How long a call may wait for a slot before it gets `503` (with `Retry-After`).
+    #[serde(default = "default_queue_wait")]
+    pub queue_wait_secs: u64,
+    /// The most a streamed answer may take in all, from its first byte to its last.
+    #[serde(default = "default_stream_max")]
+    pub stream_max_secs: u64,
+    /// The largest answer taken from a model server, streamed or not.
+    #[serde(default = "default_max_answer")]
+    pub max_answer_bytes: usize,
 }
 
 fn default_in_flight() -> usize {
@@ -33,6 +51,15 @@ fn default_per_user() -> usize {
 fn default_queue() -> usize {
     64
 }
+fn default_queue_wait() -> u64 {
+    300
+}
+fn default_stream_max() -> u64 {
+    900
+}
+fn default_max_answer() -> usize {
+    16 * 1024 * 1024
+}
 
 impl Default for Limits {
     fn default() -> Self {
@@ -40,8 +67,64 @@ impl Default for Limits {
             max_in_flight: default_in_flight(),
             per_user: default_per_user(),
             max_queue: default_queue(),
+            per_client: None,
+            queue_wait_secs: default_queue_wait(),
+            stream_max_secs: default_stream_max(),
+            max_answer_bytes: default_max_answer(),
         }
     }
+}
+
+impl Limits {
+    /// The cap for a client that `clients:` doesn't give one.
+    pub fn client_default(&self) -> usize {
+        self.per_client.unwrap_or(self.per_user)
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.max_in_flight == 0 || self.per_user == 0 || self.per_client == Some(0) {
+            return Err("gateway config: limits must be at least 1".into());
+        }
+        if !(1..=3600).contains(&self.queue_wait_secs) {
+            return Err("gateway config: limits.queue-wait-secs must be 1 to 3600".into());
+        }
+        if !(1..=7200).contains(&self.stream_max_secs) {
+            return Err("gateway config: limits.stream-max-secs must be 1 to 7200".into());
+        }
+        if !(1024..=256 * 1024 * 1024).contains(&self.max_answer_bytes) {
+            return Err("gateway config: limits.max-answer-bytes must be 1024 to 268435456".into());
+        }
+        Ok(())
+    }
+}
+
+/// What `clients:` says about one client (a gateway token's name, or a `prefix*` pattern).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct ClientSpec {
+    /// Believe the client's `X-Pmos-User` and `X-Pmos-Priority`.
+    #[serde(default)]
+    trusted: bool,
+    /// The most calls this client may have running at once.
+    #[serde(default)]
+    max_in_flight: Option<usize>,
+    /// The priority of its calls: always, for a client that isn't trusted; when it sends no
+    /// `X-Pmos-Priority`, for one that is.
+    #[serde(default)]
+    priority: Option<String>,
+}
+
+/// How the gateway treats one client (review finding N3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientPolicy {
+    /// `X-Pmos-User` and `X-Pmos-Priority` are believed. Otherwise the client's calls are
+    /// keyed by its name (`client:<name>`) and get `priority`, whatever they declare.
+    pub trusted: bool,
+    /// The most calls this client may have running at once.
+    pub max_in_flight: usize,
+    /// For an untrusted client, every call's priority; for a trusted one, the priority of a
+    /// call without `X-Pmos-Priority`.
+    pub priority: Priority,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +148,9 @@ struct ModelsFile {
     local_hosts: Vec<String>,
     #[serde(default)]
     limits: Limits,
+    /// Per-client trust, cap and priority, by client name or `prefix*` pattern.
+    #[serde(default)]
+    clients: BTreeMap<String, ClientSpec>,
 }
 
 /// One model role, such as `default`, which callers address as `pmos/default`.
@@ -123,6 +209,8 @@ impl Role {
 pub struct Models {
     pub roles: BTreeMap<String, Role>,
     pub limits: Limits,
+    /// `clients:`, resolved: an exact client name, or a pattern ending in `*`.
+    pub clients: BTreeMap<String, ClientPolicy>,
 }
 
 impl Models {
@@ -144,8 +232,42 @@ impl Models {
             return Err("gateway config: a `default` role is required".into());
         }
         let limits = file.limits;
-        if limits.max_in_flight == 0 || limits.per_user == 0 {
-            return Err("gateway config: limits must be at least 1".into());
+        limits.check()?;
+        let mut clients = BTreeMap::new();
+        for (name, spec) in file.clients {
+            let ok = match name.strip_suffix('*') {
+                Some(prefix) => prefix.is_empty() || valid_role_name(prefix),
+                None => valid_role_name(&name),
+            };
+            if !ok {
+                return Err(format!(
+                    "gateway config: client `{name}` must be a client name (lowercase letters, \
+                     digits and `-`), optionally ending in `*`"
+                ));
+            }
+            if spec.max_in_flight == Some(0) {
+                return Err(format!(
+                    "gateway config: client `{name}`: max-in-flight must be at least 1"
+                ));
+            }
+            let priority = match spec.priority.as_deref() {
+                None if spec.trusted => Priority::Interactive,
+                None => Priority::Personal,
+                Some(p) => Priority::parse(p).ok_or_else(|| {
+                    format!(
+                        "gateway config: client `{name}`: priority must be interactive, \
+                         scheduled or personal, not `{p}`"
+                    )
+                })?,
+            };
+            clients.insert(
+                name,
+                ClientPolicy {
+                    trusted: spec.trusted,
+                    max_in_flight: spec.max_in_flight.unwrap_or(limits.client_default()),
+                    priority,
+                },
+            );
         }
         let mut roles = BTreeMap::new();
         for (name, spec) in file.roles {
@@ -246,7 +368,33 @@ impl Models {
                 },
             );
         }
-        Ok(Self { roles, limits })
+        Ok(Self {
+            roles,
+            limits,
+            clients,
+        })
+    }
+
+    /// How `client` is treated: its exact entry in `clients:`, else the longest `prefix*`
+    /// pattern that matches it, else the default: not trusted (its `X-Pmos-User` and
+    /// `X-Pmos-Priority` are ignored), `personal`, and `limits.per-client` in flight.
+    pub fn client_policy(&self, client: &str) -> ClientPolicy {
+        if let Some(p) = self.clients.get(client) {
+            return *p;
+        }
+        self.clients
+            .iter()
+            .filter_map(|(k, p)| {
+                let prefix = k.strip_suffix('*')?;
+                client.starts_with(prefix).then_some((prefix.len(), p))
+            })
+            .max_by_key(|(n, _)| *n)
+            .map(|(_, p)| *p)
+            .unwrap_or(ClientPolicy {
+                trusted: false,
+                max_in_flight: self.limits.client_default(),
+                priority: Priority::Personal,
+            })
     }
 
     /// The role a request's `model` names: `pmos/<role>`. A concrete model name is refused,

@@ -505,7 +505,7 @@ impl Cx {
                 "persona-benchmark",
                 path,
                 format!(
-                    "`{}` says `benchmarked: true` but no eval category for it (`persona: {}` in evals/categories/*/category.yaml) has met its pass bar two weeks in a row in evals/reports (D10). Drop the claim and offer it as a Preview (`preview: true`) until it has",
+                    "`{}` says `benchmarked: true` but no eval category for it (`persona: {}` in evals/categories/*/category.yaml) has met its pass bar two weeks in a row in evals/reports, counting only runs on the production role models and the persona's current version (D10; docs/evals.md, \"Which runs count\"). Drop the claim and offer it as a Preview (`preview: true`) until it has",
                     fm.name, fm.name
                 ),
             );
@@ -515,7 +515,7 @@ impl Cx {
                 "persona-benchmark",
                 path,
                 format!(
-                    "`{}` is `offered: true` but no eval category for it (`persona: {}` in evals/categories/*/category.yaml) has met its pass bar two weeks in a row in evals/reports (D10). Offer it as a Preview (`preview: true`, shown as \"Preview: not yet benchmarked\") until it has, or set `offered: false`",
+                    "`{}` is `offered: true` but no eval category for it (`persona: {}` in evals/categories/*/category.yaml) has met its pass bar two weeks in a row in evals/reports, counting only runs on the production role models and the persona's current version (D10; docs/evals.md, \"Which runs count\"). Offer it as a Preview (`preview: true`, shown as \"Preview: not yet benchmarked\") until it has, or set `offered: false`",
                     fm.name, fm.name
                 ),
             );

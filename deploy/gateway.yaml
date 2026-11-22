@@ -2,6 +2,11 @@
 # Same roles as config/gateway.yaml; only the upstream addresses differ (compose service names).
 # Confirm the served model names on the Spark before first use; swapping a model is
 # docs/runbooks/model-swap.md.
+#
+# The `model` of each role here is the PRODUCTION ROLE MODEL: an eval report counts towards a
+# bar (the two-weeks rule, and a marketplace bot's `benchmarked: true`) only when the models
+# the gateway reported for that run match these, role for role (docs/evals.md, "Which runs
+# count"). Swapping a model here therefore restarts every benchmark streak.
 upstreams:
   qwen: http://vllm-default:8000/v1
   nemotron: http://vllm-extraction:8000/v1
@@ -22,3 +27,22 @@ limits:
   max-in-flight: 4
   per-user: 2
   max-queue: 64
+  # How long a call may wait for a slot (then 503 with Retry-After), how long a streamed
+  # answer may take in all, and the largest answer taken from a model server. These are the
+  # defaults, written out (docs/gateway.md, "Sharing the GPU").
+  queue-wait-secs: 300
+  stream-max-secs: 900
+  max-answer-bytes: 16777216
+# Who may say which person a call is for (X-Pmos-User) and how urgent it is (X-Pmos-Priority),
+# and how many calls each client token may have in flight (review findings N3 and N4). A client
+# not listed here is not trusted: its calls are keyed by its own name, run as `personal`, and
+# hold at most `per-user` (2) slots.
+clients:
+  # The bot runtime: it parses routines for the PM its caller verified.
+  runtime: {trusted: true, max-in-flight: 2}
+  # Each bot's worker (bot-docs, bot-pm-<handle>, ...): it names the PM whose task it runs.
+  # At most 3 of the 4 slots each, so no one bot's token holds them all.
+  bot-*: {trusted: true, max-in-flight: 3}
+  # The eval stack (deploy/compose.evals.yaml): its runtime, workers and judges share this
+  # token. One slot, background priority, so a benchmark never takes production's capacity.
+  evals: {max-in-flight: 1, priority: personal}

@@ -395,6 +395,13 @@ async fn cli_run_history_and_check() {
         },
     );
     let url = spawn(mock.clone()).await;
+    // The gateway the runner asks which models ran (a run counts only with them, N5); the
+    // category has no judges, so nothing else is asked of it.
+    let gw_url = common::spawn_gateway(Arc::new(common::Gateway {
+        reply: Box::new(|_: &str| "yes".into()),
+        calls: std::sync::Mutex::new(Vec::new()),
+    }))
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let (id, yaml) = task("t-pass", "q-pass", "  approvals: 0\n");
     write_category(dir.path(), "cat", "docs", 1.0, &[(id.as_str(), yaml)]);
@@ -404,6 +411,7 @@ async fn cli_run_history_and_check() {
     let bin = env!("CARGO_BIN_EXE_pmos-evals");
     let run = |args: Vec<String>| {
         let root = root.clone();
+        let gw_url = gw_url.clone();
         tokio::task::spawn_blocking(move || {
             std::process::Command::new(bin)
                 .arg("--root")
@@ -415,6 +423,8 @@ async fn cli_run_history_and_check() {
                 .env_remove("PMOS_EVALS_LANES")
                 .env_remove("PMOS_EVALS_FRESH_CMD")
                 .env("PMOS_GATEWAY_WORKAROUNDS", "off")
+                .env("PMOS_GATEWAY_URL", &gw_url)
+                .env("PMOS_EVALS_GATEWAY_TOKEN", common::GATEWAY_TOKEN)
                 .output()
                 .unwrap()
         })
