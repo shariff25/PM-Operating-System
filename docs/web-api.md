@@ -297,7 +297,9 @@ ten (case, spaces and hyphens ignored).
 ### What a screen should say
 
 - **Passwords:** 12 to 128 characters, any characters (spaces and symbols welcome), no
-  composition rules; not your handle or sign-in name, and not a common password. On
+  composition rules; not your handle or sign-in name, and not a common password. Spaces at
+  either end, a run of spaces counted once, and characters that show nothing (a zero-width
+  space) don't make up the 12. On
   `422 weak_password`, word `reason`: `too_short`, `too_long`, `matches_name`, `common`.
 - **A wrong password, name or setup code** never says which was wrong, nor whether the account
   exists, has a password, is turned off or is waiting (`401 sign_in_failed`,
@@ -307,14 +309,20 @@ ten (case, spaces and hyphens ignored).
   address meanwhile. Say "wait a few minutes" rather than a number.
 - **Codes:** 3 tries per sign-in (`attempts_left`), 5 at the setup's confirmation. Each code
   works once; if one was just used, wait for the next.
-- **Too many tries from one place:** `429 too_many_attempts` with `Retry-After` (seconds): 20
-  refused attempts from one address (an IPv6 address counts by its /64) in 15 minutes, or the
-  server's own limit. **Every** refused attempt counts: a wrong password or code, an unknown or
+- **Too many tries from one place:** `429 too_many_attempts` with `Retry-After` (seconds): 10
+  refused attempts from one address (an IPv6 address counts by its /64) about one sign-in name
+  (or one sign-in or setup in progress, or one signed-in person) in 15 minutes, then that name
+  waits there; or 100 from the address about anything, then every password route from it
+  waits (since the re-check of the `8e8f8fe` fixes, N2: before, 20 for the address, so a few
+  typos behind one office address shut the whole office out); or the server's own limit.
+  Someone else's mistakes from the same address never make a person wait unless they come to
+  100. **Every** refused attempt counts: a wrong password or code, an unknown or
   expired sign-in or setup, a step out of order, a body that isn't the route's JSON; only PM OS's
   own failures (`5xx`) and the tool server's shared-limit `429`s on sign-in and on setting a
   password (since the gate review of `8e8f8fe`) don't. The tool server has limits of its own behind the same answer
   (since the gate review of `04c175f`): a share of its hashing allowance per network (an IPv4
-  /24, an IPv6 /48) once that allowance is nearly used up, and 100 wrong setup codes per network in 15 minutes. A `429` or `503` from
+  /24, an IPv6 /48: a fifth of it at any time, less once it is nearly used up), and 100 wrong
+  setup codes per network in 15 minutes. A `429` or `503` from
   them never costs a setup code or a setup token one of its tries: try again after
   `Retry-After`.
 - **Setup codes** last 24 hours and work once; a new one replaces the old one. Wrong guesses

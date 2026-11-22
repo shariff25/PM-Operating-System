@@ -14,7 +14,9 @@ Mediums and nine Lows here and in the Entra first link; what changed is in **Re-
 eb24d28**, at the end. The security gate at `04c175f` (2026-11-21) passed with no High or
 Critical open and five Mediums (G1 to G5) and five Lows (GL1 to GL5) here; what changed is in
 **Gate review of 04c175f**, at the end. The review of `8e8f8fe` (2026-11-21) found two Mediums
-(M3, M4) and six Lows here; what changed is in **Review of 8e8f8fe**, at the end.
+(M3, M4) and six Lows here; what changed is in **Review of 8e8f8fe**, at the end. Its re-check
+of those fixes found one Medium (N2: `pmos-web` still locked a shared office address out) and
+four Lows; what changed is in **Re-check of the 8e8f8fe fixes**, at the end.
 
 There is no email. A person gets a password by a **one-time setup code** an Admin makes on the
 Team page (or, for an Admin or Auditor, someone with host access makes with
@@ -101,7 +103,10 @@ their recovery codes**, in its own tables (migrations 0020, 0022, 0023):
    attempt can tell is only whether its name and code are a right pair (a 100-bit code), and,
    by timing, whether the name exists, as below the limit (an unknown name costs one lookup, a
    real one a lookup and a short read); `pmos-web` counts each such `429` against the address
-   (20 per 15 minutes per address). A setup code is 100 bits, so it needs no guess
+   and the name (10 per name and address, 100 per address, per 15 minutes), the tool server
+   counts every one on `/readyz` (`password.setup_block_refusals`) and records them thinned:
+   at most one audit row a minute per block, with no target, standing for the refusals since
+   the block's last row (`block_limit; refused <n>`). A setup code is 100 bits, so it needs no guess
    cap of its own: voiding it protected nothing and let anyone who knew a sign-in name end the
    person's setup. An operator sees a plain count of wrong guesses on the tool server's
    `/readyz` (`password.setup_code_wrong_guesses`, since start-up), and each one in the audit
@@ -218,14 +223,17 @@ step), so a compromised admin session or `pmos-web` can reset only people who ho
 
 ## The rules for a password
 
-- **At least 12 characters, not counting whitespace at either end and counting each run of
-  whitespace inside once; at most 128 as typed** (Unicode scalar values), any characters, no
-  composition rules. Twelve spaces, or `password` and four spaces, is too short (the review of
-  `8e8f8fe`, M3).
+- **At least 12 characters, not counting whitespace at either end, counting each run of
+  whitespace inside once and not counting characters that show nothing; at most 128 as typed**
+  (Unicode scalar values), any characters, no composition rules. Twelve spaces, `password` and
+  four spaces, or twelve zero-width spaces, is too short (the review of `8e8f8fe`, M3, and its
+  re-check).
 - Not the handle, not the sign-in name, not the part of the sign-in name before `@`, and not a
   common password, each compared case-insensitively with the password **as the rules read it**
-  (whitespace at either end dropped, each inner run one space) **and with every space taken
-  out**, so `password1234` padded, or spelled `pass word 1234`, is refused: **46,146 entries**
+  (characters that show nothing dropped, whitespace at either end dropped, each inner run one
+  space, then in Unicode's compatibility composition, NFKC) **and with every space taken
+  out**, so `password1234` padded, spelled `pass word 1234`, with a zero-width space inside, or
+  in full-width letters (`ｐａｓｓｗｏｒｄ１２３４`), is refused: **46,146 entries**
   (`crates/toolserver/data/common-passwords.txt`, since the gate review of `04c175f`, G5),
   every entry of SecLists' list of the **1,000,000** most frequent passwords
   (`xato-net-10-million-passwords-1000000.txt`, MIT licence) that is 12 to 128 characters,
@@ -236,17 +244,28 @@ step), so a compromised admin session or `pmos-web` can reset only people who ho
   once (SipHash with a random key), so its time depends on the candidate's length, not on
   whether or where it is in the list; the candidate is never logged.
 - **What is normalised, and what isn't.** Whitespace is Unicode's `White_Space` (the space,
-  tabs, line breaks, the no-break space, the ideographic space and the other Unicode spaces),
-  and only the rules read the password that way. **What is hashed, and checked at sign-in, is
+  tabs, line breaks, the no-break space, the ideographic space and the other Unicode spaces).
+  **Characters that show nothing** are Unicode's `Default_Ignorable_Code_Point` (15.1),
+  exactly: U+00AD (soft hyphen), U+034F (combining grapheme joiner), U+061C (Arabic letter
+  mark), U+115F–U+1160 and U+3164, U+FFA0 (Hangul fillers), U+17B4–U+17B5, U+180B–U+180F
+  (Mongolian free variation selectors and vowel separator), U+200B–U+200F (zero-width space,
+  non-joiner, joiner, left-to-right and right-to-left marks), U+202A–U+202E (bidirectional
+  embeddings and overrides), U+2060–U+206F (word joiner, invisible operators, bidirectional
+  isolates, deprecated format characters), U+FE00–U+FE0F (variation selectors), U+FEFF (byte
+  order mark), U+FFF0–U+FFF8, U+1BCA0–U+1BCA3 (shorthand format controls), U+1D173–U+1D17A
+  (musical format controls) and U+E0000–U+E0FFF (tags, variation selectors supplement), unassigned code points in those ranges included
+  (`hash::is_ignorable`). Format characters outside that property show a glyph and count (the
+  Arabic and Kaithi number signs, U+0600–U+0605, U+06DD, U+070F, U+0890–U+0891, U+08E2,
+  U+110BD, U+110CD). **NFKC** (from `unicode-normalization`, already in the build through
+  sqlx) is used for the name and common-list comparisons only, not for the length. Only the
+  rules read the password these ways. **What is hashed, and checked at sign-in, is
   exactly what was typed**, byte for byte, so every password set before this change signs in
   as it always did, inner spaces and all (tested, with one the rules now refuse), and a
-  password with inner runs of spaces must be typed with them. Not normalised: Unicode
-  compatibility forms (NFKC: full-width letters, ligatures; `ｐａｓｓｗｏｒｄ１２３４` isn't
-  caught as common), canonical forms (NFC and NFD: a browser that sends an accented letter
-  decomposed won't match a hash of it composed), characters that show nothing but aren't
-  whitespace (a zero-width space), and letters that look alike. Normalising before the hash
-  would change what existing hashes were computed over; NFKC for the rules alone needs a
-  Unicode normalisation library the tool server doesn't use yet. Both are left as they are.
+  password with inner runs of spaces must be typed with them. Not normalised before the hash:
+  canonical forms (NFC and NFD: a browser that sends an accented letter decomposed won't match
+  a hash of it composed), and nothing else either; normalising before the hash would change
+  what existing hashes were computed over, so it is left as it is. Not caught by the rules:
+  letters that only look alike (a Cyrillic `а` for a Latin `a`; NFKC doesn't fold scripts).
 - A refused one is `422 weak_password` with `reason`: `too_short`, `too_long`,
   `matches_name` or `common`.
 - **Never logged, never in an audit detail, never in an error.** Inputs are held in zeroizing
@@ -275,7 +294,7 @@ request waits at most 10 seconds for a slot, then `503 sign_in_busy`.
 
 | Limit | Value | Where |
 | --- | --- | --- |
-| Password length | 12 to 128 characters: at least 12 without whitespace at either end and with each inner run counted once, at most 128 as typed (M3) | tool server |
+| Password length | 12 to 128 characters: at least 12 without whitespace at either end, with each inner run counted once and without characters that show nothing, at most 128 as typed (M3 and its re-check) | tool server |
 | Request body on the password routes | 4 KiB (`413` at `pmos-web`) | tool server and `pmos-web` |
 | Failures per account **per address** before that address waits (passwords and second-step codes **counted together**) | 5 | tool server, per person and address (an IPv4 address, an IPv6 /64) |
 | The wait | 30 s after the 5th failure, doubling with each further one (1, 2, 4, 8 min), **at most 15 min** from the 10th; **for that address only** | tool server |
@@ -284,16 +303,16 @@ request waits at most 10 seconds for a slot, then `503 sign_in_busy`.
 | Failures forgotten | 24 hours after the last one | tool server |
 | Back to zero | a full sign-in (that address's count), a finished setup or reset (every address's), a password change (the person's re-authentication count) | tool server |
 | Setup-code guesses | the same schedule per address (5, then 30 s doubling to 15 min), a counter of their own; **no** account-wide ceiling; **never** counted against the code, which no guess can void (G2); a new code clears every address's count | tool server, per person and address |
-| Setup-code guesses per network block | **100** wrong codes (or unknown names) at the setup's first step from one IPv4 /24 or IPv6 /48 in any rolling 15 minutes; past it, until the window moves, every refusal before the code matched is `429` for that block whatever the name, writes nothing and counts at `pmos-web`, and **a right code still begins** (the review of `8e8f8fe`); a right code gives its slot back; idle blocks are forgotten every 5 minutes | tool server, per process |
+| Setup-code guesses per network block | **100** wrong codes (or unknown names) at the setup's first step from one IPv4 /24 or IPv6 /48 in any rolling 15 minutes; past it, until the window moves, every refusal before the code matched is `429` for that block whatever the name, changes nothing and counts at `pmos-web`, and **a right code still begins** (the review of `8e8f8fe`); those refusals are counted on `/readyz` and recorded, at most one audit row a minute per block (its re-check); a right code gives its slot back; idle blocks are forgotten every 5 minutes | tool server, per process |
 | Re-authentication while signed in (change the password, new recovery codes) | the same schedule, in one bucket per person apart from every address | tool server, per person |
 | Hashing work after an authentication (a correct password step, a setup's password, a password change, new recovery codes) | **10** per account in any rolling 15 minutes, then `429` for that account, to every attempt on it; a correct password step is checked before its hash and taken, in one step, once the password proved right (GL1: parallel ones can't pass together; a wrong guess by anyone never uses the room); the others are counted before their work, whatever its outcome, and given back when the shared allowance refuses it or no hashing slot was free (G3; for a change since the review of `8e8f8fe`, with its re-authentication failure); idle accounts are forgotten every 5 minutes | tool server, per person, per process |
 | A setup token | **3** password sets and **5** new authenticator secrets; past either, the token is spent (`401 setup_expired`) | tool server, per token |
 | A setup code, across its tokens | **5** setups started and **6** password sets (two tokens' worth: room for a typo or a setup abandoned and started again); past either, the code is spent (`409 setup_code_spent`) until an admin issues a new one; a set refused `429` by the shared limits, or `503` with no free hashing slot, isn't counted (G3) | tool server, per code |
 | Password hashes, all callers together | **300** in any rolling minute, plus a **reserve of 120** that only a **password step from an address someone fully signed in from in the last 30 days** may use, decided from the address before the name is looked up (`429 too_many_attempts`); setup and the signed-in routes take from the 300 only; routes that compute no hash take none, and an invalid token is checked before anything; a rehash draws like any hash (GL2) | tool server, whole process |
-| One network block's share of the 300 | **none while fewer than 240 (80%)** were taken in the rolling minute; from then on, **6** of the last 60 per IPv4 /24 or IPv6 /48 (G1, as changed by M4 of the review of `8e8f8fe`), so a block takes at most 246 a minute and filling the 300 takes at least ten blocks besides the first; setup and signed-in work count under the account's own key instead (bounded per account above) | tool server, per process |
+| One network block's share of the 300 | **60** (a fifth) in any rolling minute per IPv4 /24 or IPv6 /48, at any load (the re-check of the `8e8f8fe` fixes: before, a block took freely up to 240); once 240 (80%) were taken in the minute, also at most **6** of the last 60 per block (G1, M4); so filling the 300 takes at least fourteen blocks (four of 60, then ten of 6); setup and signed-in work count under the account's own key instead (bounded per account above) | tool server, per process |
 | One address's share of the reserve | **2** in any rolling minute (an IPv4 address or IPv6 /64), and **24** per block (G1) | tool server, per process |
 | Hashing | 2 at a time; a 10-second wait at most (`503 sign_in_busy`) | tool server |
-| Refused attempts per source address | 20 in any rolling 15 minutes, **every** refusal counted (a wrong password or code, an unknown or expired token, a step out of order, a malformed body; not PM OS's own `5xx`, and not a `429` from a limit the tool server shares on `sign-in` and `setup/password`: M4 and a Low of the review of `8e8f8fe`), and **every** `setup/password`, `setup/authenticator`, `change` and `recovery-codes` call, successes included (except, for `setup/password`, a shared limit's `429`); a tool-server `429` about this address's own guessing (the second step's and a setup confirmation's wait, a setup's first step over its block's guesses) counts; then those routes answer `429 too_many_attempts` with `Retry-After`; the check and the count are one step | `pmos-web`, per process, per IPv4 address or IPv6 /64; at most 10,000 addresses tracked |
+| Refused attempts per source address, and per subject from it | **10** about one subject (a sign-in name, trimmed and lower-cased, shared by the password step and a setup's first step; one pending or setup token; one signed-in person; or nothing readable) and **100** about anything, in any rolling 15 minutes (N2 of the re-check of the `8e8f8fe` fixes: before, 20 per address); a refusal for a subject past its 10 is `429` and **not counted against the address**, so a shared address waits only after refusals about at least ten subjects at their limit, or a hundred mistakes; **every** refusal counted (a wrong password or code, an unknown or expired token, a step out of order, a malformed body; not PM OS's own `5xx`, and not a `429` from a limit the tool server shares on `sign-in` and `setup/password`: M4 and a Low of the review of `8e8f8fe`), and **every** `setup/password`, `setup/authenticator`, `change` and `recovery-codes` call, successes included (except, for `setup/password`, a shared limit's `429`); a tool-server `429` about this address's own guessing (the second step's and a setup confirmation's wait, a setup's first step over its block's guesses) counts; then that subject (or, past 100, every password route) answers `429 too_many_attempts` with `Retry-After`; the check and both counts are one step | `pmos-web`, per process, per IPv4 address or IPv6 /64; at most 10,000 addresses and 50,000 (address, subject) pairs tracked, subjects held only as SHA-256 |
 | Pending token (after the password) | 5 minutes, 3 tries, single use | tool server |
 | Setup token | 15 minutes (never past the code), 5 tries at the confirmation | tool server |
 | Setup or reset code | 100 bits, 24 hours, single use; a new one replaces the old | tool server |
@@ -316,28 +335,31 @@ finishes).
 **Why guessing stays bounded** (stated again for the gate review of `04c175f`, G5). Per
 account, from addresses the person has never fully signed in from: **50** wrong guesses from
 anywhere until the count is forgotten (24 hours with no failure at all); past that, **one guess
-per 15 minutes per address** (96 a day). Each guess is a hash. Since the review of `8e8f8fe`
-(M4) a network block (an IPv4 /24 or IPv6 /48) takes hashes freely until 240 of the open 300
-were taken in the minute, then 6 more: at most **246** a minute (**354,240 a day**); the open
+per 15 minutes per address** (96 a day). Each guess is a hash. Since the re-check of the
+`8e8f8fe` fixes a network block (an IPv4 /24 or IPv6 /48) takes at most **60** of the open 300
+hashes a minute (**86,400 a day**; it was 246 a minute, 354,240 a day, after M4); the open
 allowance is **432,000** a day for everyone together. So with A addresses (IPv4 addresses or
-IPv6 /64s) in B blocks, an attacker checks at most **50 + min(96 × A, 354,240 × B, 432,000)**
+IPv6 /64s) in B blocks, an attacker checks at most **50 + min(96 × A, 86,400 × B, 432,000)**
 passwords a day against one account. For example: one IPv4 /24 (256 addresses), 24,626 a day
-(unchanged: the address count binds); one IPv6 /48 (65,536 /64s), 354,290 a day (43,250 with
-the old share of 30, which also shut a busy office out); two /48s, 432,050 a day, the whole
-open allowance (it took ten). From the person's own recent addresses, each has its own schedule (about **104**
+(unchanged: the address count binds); one IPv6 /48 (65,536 /64s), **86,450** a day (354,290
+before); two /48s, 172,850; the whole open allowance takes at least five blocks for one
+account and fourteen to fill it. From the person's own recent addresses, each has its own schedule (about **104**
 a day: 5, then waits of 30 s, 1, 2, 4 and 8 minutes, then one every 15 minutes), usable only from
 that network. **Against the whole service**, at most **300** hashes a minute from the open
 allowance (432,000 a day) and **120** from the reserve (172,800 a day), so at most **604,800**
 password guesses a day across every account together; the reserve only for addresses someone
 fully signed in from, at most 2 a minute each (2,880 a day) and 24 a minute per block. `pmos-web`
-adds 20 refused attempts per address per 15 minutes on top (for browsers: see "What holds
-against a compromised `pmos-web`"). Every guess is behind Argon2id, against a 12-character
+adds, for browsers, **10** refused attempts per address per account (sign-in name) and **100**
+per address in all, per 15 minutes, on top (N2): from one address at most 960 refused attempts
+a day reach the tool server for one account (its own schedule, about 104 a day, binds first)
+and **9,600** a day across every account (spraying; it was 1,920 with the old 20, which locked
+out an office behind one address). See "What holds against a compromised `pmos-web`". Every guess is behind Argon2id, against a 12-character
 minimum with the 46,146 common passwords above refused; and a right password still needs the
 authenticator code (3 tries per pending token, counted the same way), so a guessed password
 alone signs no one in.
 
-**What an attacker with a large address range can still do.** With addresses in eleven or
-more blocks (one to take the first 240, ten for the last 60) they can fill the open allowance
+**What an attacker with a large address range can still do.** With addresses in fourteen or
+more blocks (four to take the first 240, ten for the last 60) they can fill the open allowance
 for as long as they keep sending: then a sign-in from
 an address nobody has signed in from in 30 days (a new person on a new network) gets `429`
 until the flood stops; a known address still has the reserve. To fill the reserve too they
@@ -354,22 +376,30 @@ new address, both the uniform `401` from a known one). A flood of junk can't sto
 a known address (tested), and setup and the signed-in routes never use the reserve (H1, LA).
 Junk sent from a known address may use the reserve too, but each address takes at most 2 of it
 a minute and each block 24 (G1), so filling 120 a minute takes known addresses in five blocks.
-**Shares** (G1, as changed by M4 of the review of `8e8f8fe`): while fewer than 240 of the open
-300 were taken in the minute, anyone takes one; from then on each IPv4 /24 or IPv6 /48 takes at
-most 6 of the last 60 a minute, so a flood from one or a few blocks can take most of a quiet
-minute but never the last fifth, which is left for everyone else (tested: 600 unknown-name
-guesses from three /24s take 258; a sign-in from a fourth block, from an address nobody has
-used, goes through). Before M4 the share was 30 from the first hash: a 30-person office behind
+**Shares** (G1, as changed by M4 of the review of `8e8f8fe` and by its re-check): each IPv4 /24
+or IPv6 /48 takes at most 60 of the open 300 a minute, and once 240 were taken in the minute at
+most 6 of the last 60, so a flood from a few blocks takes at most 60 a minute each and never
+the last fifth, which is left for everyone else (tested: 600 unknown-name guesses from three
+/24s take 180; a sign-in from a fourth block, from an address nobody has used, goes through). Before M4 the share was 30 from the first hash: a 30-person office behind
 one address, signing in during a morning rush with a few typos, was refused `429`, and
 `pmos-web` counted each `429` against the office's address until it waited 15 minutes. Now the
-office takes what it needs in a quiet minute (tested: 30 people, each mistyping once, 60 hashes
-from one address nobody had used, all sign in), and `pmos-web` doesn't count the tool server's
-shared-limit `429`s. The choice of /24 and /48: the smallest networks commonly handed to one
+office takes up to 60 hashes a minute at any load (tested: 30 people, each mistyping once, 60
+hashes from one address nobody had used, all sign in), `pmos-web` doesn't count the tool
+server's shared-limit `429`s, and it counts wrong passwords per sign-in name as well as per
+address (N2, tested at `pmos-web`: 30 people mistyping twice and three people stuck on a wrong
+password, all from one address, and everyone but the three signs in). **The trade-off of 60**
+(the re-check of the `8e8f8fe` fixes, which asked for a block's share well below 240): an
+office whose sign-ins in one minute need more than 60 hashes (more than 30 people with one typo
+each, or 60 without) gets `429 too_many_attempts` for the rest of that minute, with a
+`Retry-After` of at most 60 seconds, not counted against the office's address at `pmos-web`;
+its known addresses also have the reserve (2 a minute each, 24 per block). That is a wait of
+under a minute, never the 15-minute lockout M4 fixed; in exchange, one /48 guesses against one
+account at a quarter of the rate it could (86,450 a day, not 354,290). The choice of /24 and /48: the smallest networks commonly handed to one
 customer or one site, so one subscriber's whole range is one block; the cost is that, while
 the allowance is nearly full, a large office or a carrier-grade NAT behind one /24 shares 6
 hashes a minute for sign-ins from addresses nobody signed in from (its known addresses also
 have the reserve).
-What it costs: under a flood from eleven or more blocks, someone signing in from an address nobody
+What it costs: under a flood from fourteen or more blocks, someone signing in from an address nobody
 has signed in from (a new person on a new network) waits until the flood ends; a new person's
 first sign-in is usually from the address they finished setup from, which is known. Routes that compute no hash
 (the second step, a setup's first step and confirmation) don't touch it, and a made-up or
@@ -380,7 +410,7 @@ authentication is bounded per token, per account and per address:
 
 | Route | Per token | Per account | Per address (`pmos-web`) | Global |
 | --- | --- | --- | --- | --- |
-| `sign-in` (a correct password) | (n/a) | 10 correct steps / 15 min | refusals only (a NAT'd office's sign-ins don't share a cap) | open, or the reserve from a known address |
+| `sign-in` (a correct password) | (n/a) | 10 correct steps / 15 min | refusals only, 10 per name and 100 in all (a NAT'd office's sign-ins don't share a cap, and its typos share only the 100) | open (60 a minute per block), or the reserve from a known address |
 | `second-step` (no hash) | 3 tries | the failure counts above | every refusal | none |
 | `setup/password` | 3 | 10 / 15 min; 6 per code | every call | open only |
 | `setup/authenticator` (a seal) | 5 | 5 setups per code | every call | none |
@@ -478,9 +508,9 @@ shows it.
 
 | Threat | How the design answers it |
 | --- | --- |
-| Guessing passwords online | Argon2id per guess; 46,146 common passwords refused, with or without their spaces, and nothing shorter than 12 without its spaces (M3); 5 failures per account per address then a growing wait to 15 min; 50 per account from anywhere new until 24 quiet hours, then one guess per 15 minutes per new address, and at most 246 hashes a minute per network block (at most 50 + min(96 × A, 354,240 × B, 432,000) a day with A addresses in B blocks; at most 604,800 a day for the whole service); 20 refused attempts per address per 15 min at `pmos-web`; 2 hashes at a time; and a right password still needs the second step. The address rules hold against browsers, not against a compromised `pmos-web` (G4, above). Guesses in parallel can't pass the threshold: a failure is counted before the hash is checked and taken back when the password was right (tested with 12 at once); `pmos-web`'s check and count are one step. |
+| Guessing passwords online | Argon2id per guess; 46,146 common passwords refused, with or without their spaces, and nothing shorter than 12 without its spaces (M3); 5 failures per account per address then a growing wait to 15 min; 50 per account from anywhere new until 24 quiet hours, then one guess per 15 minutes per new address, and at most 60 hashes a minute per network block (at most 50 + min(96 × A, 86,400 × B, 432,000) a day with A addresses in B blocks; at most 604,800 a day for the whole service); 10 refused attempts per account per address, and 100 per address, per 15 min at `pmos-web`; 2 hashes at a time; and a right password still needs the second step. The address rules hold against browsers, not against a compromised `pmos-web` (G4, above). Guesses in parallel can't pass the threshold: a failure is counted before the hash is checked and taken back when the password was right (tested with 12 at once); `pmos-web`'s check and count are one step. |
 | Telling which accounts exist | One answer, status and work at the password step and the setup's first step for every reason; a dummy hash where there is no real one; a waiting address answers the same; **under load too**: whether an attempt may use the reserve is decided from the address alone, before the name is looked up (M3, tested with the open allowance full). An Auditor reading the audit log sees one reason (`sign_in_failed`, `setup_failed`) and no target for those refusals; an Admin sees each reason. The one other answer: an account whose correct password was given 10 times in 15 minutes answers `429`, which only the password's holder can cause (kept after the review of `8e8f8fe`: "Signing in", step 2). Past a block's setup guesses every refusal is `429` whatever the name; a right code still begins (the pair is 100 bits). |
-| Shutting everyone out with junk | Once 240 of the open 300 hashes a minute are taken, each network block takes at most 6 of the rest, so filling it takes eleven or more blocks (G1, M4); `pmos-web` doesn't count the tool server's shared-limit `429`s, so a full minute never locks an office's address out; the global limit has a reserve only password steps from known addresses may use, at most 2 a minute per address and 24 per block, so filling it takes known addresses in five blocks; an invalid token costs nothing; every refused attempt counts against its address at `pmos-web`, which counts real browser addresses (a trusted proxy is required, or a loopback-only direct setting). **Residual:** eleven or more blocks can hold off sign-ins from addresses nobody has signed in from while they flood. |
+| Shutting everyone out with junk | Each network block takes at most 60 of the open 300 hashes a minute, and once 240 are taken at most 6 of the rest, so filling it takes fourteen or more blocks (G1, M4, and the re-check of the `8e8f8fe` fixes); `pmos-web` doesn't count the tool server's shared-limit `429`s, so a full minute never locks an office's address out; the global limit has a reserve only password steps from known addresses may use, at most 2 a minute per address and 24 per block, so filling it takes known addresses in five blocks; an invalid token costs nothing; every refused attempt counts against its address and its subject at `pmos-web`, which counts real browser addresses (a trusted proxy is required, or a loopback-only direct setting); a few people's mistakes behind one address never lock the others there out (N2). **Residual:** fourteen or more blocks can hold off sign-ins from addresses nobody has signed in from while they flood; and someone behind a shared address who sends refused attempts about ten or more names (or made-up tokens) at their limit, or a hundred at different ones, in 15 minutes makes that address wait for everyone there until the window moves (the cost of bounding spraying per address). |
 | A compromised `pmos-web`, or its token, or a process on the host reaching the published port (G4, GL4) | It chooses the address each attempt is counted under, so the per-address and per-block rules don't bind it, and it can claim a person's known address (the reserve, no rationing past the ceiling, and a wait for the person there); the per-account work and per-token and per-code counts, the global limit, Argon2id and the second step still do. `pmos-admin` trusts only the network's gateway by default; the host is part of the trust boundary (above). |
 | A credential holder spending what everyone shares (H1) | A new invitee, someone with an intercepted setup code, a signed-in user or someone with a password: every route that hashes or makes a secret after an authentication is bounded per token, per account (10 pieces of work in 15 minutes) and per address (every call counted at `pmos-web`), a setup code gives at most 5 setups and 6 password sets, and setup and the signed-in routes hash from the open allowance only, never the reserve. The loop from the re-check is a test: one code sets 6 passwords in all, and a sign-in from another address goes through meanwhile; since the gate review of `04c175f` also run in parallel (ten setups at once, ten sets each: still at most 6), with a sign-in from an address nobody had used going through during it (GL5). A refusal by the shared limits never costs the invitee a try (G3). |
 | A wrong or stale trusted-proxy setting (M1) | The `pmos` network's gateway is pinned; `pmos-admin up --web` refuses a network whose real gateway differs, a trusted address outside the subnet, and one inside it unless `PMOS_WEB_TRUST_PROXY_IN_NETWORK=1` (with a warning, GL4); `pmos-web` refuses a forwarded header from a peer not on the list and a trusted proxy that names no client, counts both on `/readyz` with an error in its log, and while one is under 15 minutes old `/readyz` carries the warning `untrusted_proxy_refusals`, which `pmos-admin status` shows as `WARN` (GL3). No setting makes every browser share one count silently. |
@@ -515,7 +545,7 @@ only:
 | `password.reset_notice` | the person | `ok` | the person | `dismissed` |
 | `password.lockout` | `anonymous` | `denied` | the person | `failures 5` (`; setup` for setup-code guesses); `ceiling` when the account reaches 50 failures |
 | `password.setup_code` | the admin / `host` / `anonymous` | `ok` / `denied` | the person | `setup` or `reset` (`host_user <name>; …` from the host) / the refusal's code (before `04c175f` also `voided; failures 20`, a code void after wrong guesses; no longer made) |
-| `password.setup_begin` | `anonymous` | `ok` / `denied` | the person, or none | `begin; setup` / `unknown_name`, `wrong_code`, `expired`, `locked`, `deactivated`, `spent`, … |
+| `password.setup_begin` | `anonymous` | `ok` / `denied` | the person, or none | `begin; setup` / `unknown_name`, `wrong_code`, `expired`, `locked`, `deactivated`, `spent`, …; `block_limit; refused <n>` (no target: refusals past a block's guesses, at most one row a minute per block, each standing for the refusals since the block's last row) |
 | `password.setup_complete` | the person / `anonymous` | `ok` / `denied` | the person | `setup` or `reset` / `wrong_code`, `locked`, `host_only`, … |
 | `password.change` | the person | `ok` / `denied` | the person | `change` / `reauth_failed`, `locked` |
 | `password.recovery_codes` | the person | `ok` / `denied` | the person | `regenerated` / `reauth_failed`, `locked` |
@@ -672,6 +702,41 @@ a minute open, no share below 240, then 6 of the last 60 per block; a reserve of
 address and 24 per block; 2 hashes at a time, 10 seconds' wait; 20 refused attempts per address
 per 15 minutes at `pmos-web` (the tool server's shared-limit `429`s not counted); 46,146 common
 passwords; idle guess and work entries forgotten every 5 minutes.
+
+## Re-check of the 8e8f8fe fixes
+
+The reviewer's re-check of branch `claude/gate-fix-4-password` (2026-11-22): one Medium and four
+Lows, and what was done (branch `claude/gate-fix-5-password`). No migration. N2's office test
+was run with the old limits put back (twenty per address, no subject count) and failed there;
+the other new or changed tests assert behaviour or values the code before the fix didn't have
+(a `429` at the 11th refusal, a refused zero-width password, an audit row, a share of 60), so
+they fail against it by construction.
+
+| Finding | Confirmed? | What changed | The test |
+| --- | --- | --- | --- |
+| N2 (Medium): `pmos-web` still locked a shared office address out | Yes (`crates/web/src/app/password.rs`: every wrong password counted against the client address, 20 per 15 minutes, then every password route answered `429` for everyone behind it; the tool server's office test covered only the tool server) | `pmos-web` counts each refused attempt against the address **and** what it is about from there (`Subject`: a sign-in name as the tool server reads it, one pending or setup token, one signed-in person, or nothing readable): **10** per subject and **100** per address in any 15 minutes. A subject past its 10 answers `429` and isn't counted against the address, so one person's mistakes add at most 10 to the address's count and only refusals about ten subjects at their limit, or a hundred mistakes, make the address wait. Successes, PM OS's own `5xx` and the tool server's shared-limit `429`s still give both slots back; `setup/password`, `setup/authenticator`, `change` and `recovery-codes` still count every call (H1, LA). The authenticator step is unchanged and still required. **Worst cases from one browser address**, per 15 minutes: 10 refused attempts about one account (960 a day; the tool server's own per-account, per-address schedule, about 104 checked guesses a day, binds first) and 100 across every account (spraying: 9,600 a day, from 1,920). Against a compromised `pmos-web` nothing here binds (G4). | `a_busy_office_behind_one_address_is_not_locked_out_by_a_few_peoples_mistakes` (30 people behind one address mistype twice each and sign in; three stuck people wait alone after 10 each; everyone else, and Ana, still sign in); `guessing_at_one_account_and_spraying_from_one_address_stay_bounded` (10 at one name then `429` without asking the tool server, the name spelled another way and a setup's first step at it included; 100 names from one address, then every route from it `429`, the right password too; other addresses unaffected; the window moves on); `every_refused_attempt_counts_against_the_address` (rewritten: 10 for one made-up token, 10 for nothing readable, 100 for the address); unit: `an_address_waits_after_a_hundred_refusals_and_a_subject_after_ten`, `concurrent_attempts_cannot_pass_the_limit_together` |
+| Low (M3's residual): zero-width and other format characters passed the length rule | Yes (`split_whitespace` doesn't treat U+200B as whitespace; twelve of them were accepted) | The rules drop Unicode's `Default_Ignorable_Code_Point` characters (the exact list is in "The rules for a password") before measuring and comparing; and, since `unicode-normalization` was already in the build (through sqlx's `stringprep`) and the change is a few lines, the name and common-list checks compare in NFKC too, so full-width and other compatibility forms of a common password are refused. What is hashed is unchanged. The unit test that asserted `ｐａｓｓｗｏｒｄ１２３４` and `password` + U+200B + `1234` were accepted now asserts they are refused. | `new_password_rules` (unit: twelve and 128 zero-width spaces, joiners, a variation selector, a tag, a Hangul filler, a bidi override, full-width forms, a full-width sign-in name; still accepted: a Cyrillic look-alike, a visible password with an invisible character in it) |
+| Low: a setup's first step refused past its block's 100 wrote no audit row | Yes | Counted on `/readyz` (`password.setup_block_refusals`, every one) and recorded thinned: the first refusal of a block, then the first one at least a minute after its last row, writes `password.setup_begin` `denied` with no target and `block_limit; refused <n>` (the refusals since the block's last row). So a flood writes at most one row a minute per block, fewer than the hundred rows its wrong guesses wrote to get there. Refusals after a block's last row appear in its next row, if one comes, and on `/readyz` always; past 10,000 blocks over their limit at once, a new block's refusals are on `/readyz` only. | `setup_code_guesses_are_bounded_per_block` (changed: it asserted nothing was written; now one row for three refusals, none for fifty more within the minute, then one standing for 53; the `/readyz` count); unit: `refusals_past_a_blocks_guesses_are_recorded_thinned` |
+| Low: with `PMOS_WRITE_FIXTURES` set, the H1 fixture test wrote the fixture and compared it with itself | Yes (`crates/web/tests/bots.rs`) | The test refuses the variable while `CI` is set (it fails, saying the fixture is written on a developer's machine and committed). | `the_real_bots_answer_carries_the_preview_label_the_app_shows` |
+| Low: one IPv6 /48 could take 246 of the 300 open hashes a minute (about 354,000 guesses a day against one account) | Yes | Each block takes at most **60** of the open allowance a minute at any load (`BLOCK_OPEN_PER_MINUTE`, a fifth), the band share of 6 past 240 stays: one /48 now checks at most 86,450 passwords a day against one account; filling the allowance takes fourteen blocks. The busy office (30 people, each one typo, 60 hashes in a minute) still fits; the trade-off past 60 is in "The global limit can't shut everyone out". The tests that asserted the old figures (240 + 6, 258 of 600, 186 for the flood after the office) now assert 60, 180 and 60. | `one_block_takes_only_its_share_of_the_open_allowance` (60, then fourteen or more blocks to fill); `a_quiet_minute_has_no_shares_and_a_nearly_full_one_does` (the office's 60 and no 61st); `a_flood_from_a_few_blocks_leaves_room_for_another`; `a_busy_office_behind_one_address_signs_in_in_a_quiet_minute` (tool server) |
+
+**Every limit's value after this re-check:** 12 to 128 characters (12 counted without
+whitespace at either end, with each run once and without characters that show nothing; name and
+common checks in NFKC); 5 failures per account per address, then 30 s doubling to 15 min; 50 per
+account from every address, then one attempt per 15 minutes per new address; 24 hours to
+forget; setup-code guesses: the same per address, and 100 per block per 15 minutes (past it only
+a right code begins; refusals recorded at most once a minute per block); 10 pieces of work per
+account per 15 minutes; 3 password sets and 5 secrets per setup token; 5 setups and 6 password
+sets per code; 300 hashes a minute open, at most 60 per block, and past 240 at most 6 of the
+last 60 per block; a reserve of 120, 2 per address and 24 per block; 2 hashes at a time, 10
+seconds' wait; at `pmos-web`, 10 refused attempts per address per subject and 100 per address
+per 15 minutes (the tool server's shared-limit `429`s not counted); 46,146 common passwords;
+idle guess and work entries forgotten every 5 minutes.
+
+**Not verified:** a real office behind a real NAT (the tests drive pmos-web with
+`X-Forwarded-For` from a trusted loopback proxy); the 60-hash share under real morning traffic
+(only the 30-person case is tested); and NFKC's effect on passwords typed through real
+keyboards and input methods (only the rule's unit test).
 
 ## Not built
 

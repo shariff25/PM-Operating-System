@@ -2068,7 +2068,8 @@ fn repo_catalog() -> Vec<Value> {
 }
 
 /// The fixture the web app's tests render (`web/src/api/fixtures/realBots.json`): this test's
-/// real answer, exactly. `PMOS_WRITE_FIXTURES=1` writes it again after a deliberate change.
+/// real answer, exactly. `PMOS_WRITE_FIXTURES=1` writes it again after a deliberate change, on
+/// a developer's machine only: with `CI` set the test refuses it.
 const REAL_BOTS_FIXTURE: &str = "../../web/src/api/fixtures/realBots.json";
 
 #[tokio::test]
@@ -2123,6 +2124,13 @@ async fn the_real_bots_answer_carries_the_preview_label_the_app_shows() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(REAL_BOTS_FIXTURE);
     let text = format!("{}\n", serde_json::to_string_pretty(&r.body).unwrap());
     if std::env::var_os("PMOS_WRITE_FIXTURES").is_some() {
+        // In CI the fixture is only ever compared: writing it there would compare the answer
+        // with itself and pass whatever the committed file says (the review of 8e8f8fe).
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "PMOS_WRITE_FIXTURES is refused while CI is set: the fixture is written on a \
+             developer's machine and committed, never in CI"
+        );
         std::fs::write(&path, &text).unwrap();
     }
     let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

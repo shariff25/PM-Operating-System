@@ -12,10 +12,15 @@
 //! - **The session**, exactly as every other sign-in makes it ([`super::start_session`]), with
 //!   the credential's epoch: every request checks it against the user database, so a reset or
 //!   a password change ends it within 10 seconds (at once in this server).
-//! - **A per-address limit** ([`SourceLimiter`]): at most [`SOURCE_REFUSALS`] refused attempts
-//!   from one address (an IPv4 address, or an IPv6 /64) in any [`SOURCE_WINDOW_MINUTES`]
-//!   minutes; past it every unauthenticated password route answers `429 too_many_attempts`.
-//!   **Every** attempt that doesn't succeed counts: a wrong password, code or setup code, an
+//! - **A per-address and per-subject limit** ([`SourceLimiter`], the review of 8e8f8fe, N2):
+//!   at most [`SUBJECT_REFUSALS`] refused attempts from one address (an IPv4 address, or an
+//!   IPv6 /64) about one [`Subject`] (a sign-in name; one pending or setup token; one signed-in
+//!   person; or nothing readable) in any [`SOURCE_WINDOW_MINUTES`] minutes, then that subject
+//!   answers `429 too_many_attempts` from there; and at most [`SOURCE_REFUSALS`] from the
+//!   address about anything, then every password route from it does. A refusal for a full
+//!   subject is not counted against the address, so a few people's mistakes behind one shared
+//!   address (an office's NAT) never lock the others out: that takes refusals about at least
+//!   ten different subjects. **Every** attempt that doesn't succeed counts: a wrong password, code or setup code, an
 //!   unknown or expired token, a step out of order, a body that isn't the route's JSON. Only
 //!   PM OS's own failures (a `5xx`) don't, and nor does a `429` from a limit the tool server
 //!   shares (on the password step and a setup's password: the global allowance, its block
@@ -56,12 +61,21 @@ use super::{
 };
 use crate::upstream::UpstreamError;
 
-/// Refused attempts from one address before it waits.
-pub const SOURCE_REFUSALS: usize = 20;
+/// Refused attempts from one address, about anything, before every password route from it
+/// waits (N2: a ceiling well above what a busy office's typos come to; it was 20 for
+/// everything, so twenty mistakes behind one NAT shut everyone there out for 15 minutes).
+pub const SOURCE_REFUSALS: usize = 100;
+/// Refused attempts from one address about one [`Subject`] before that subject waits from
+/// there. A subject's refusals past it are answered `429` and not counted against the address,
+/// so one subject adds at most this many to [`SOURCE_REFUSALS`].
+pub const SUBJECT_REFUSALS: usize = 10;
 /// The window those are counted in.
 pub const SOURCE_WINDOW_MINUTES: i64 = 15;
 /// Addresses tracked at once; past it the one seen longest ago goes.
 pub const MAX_SOURCES: usize = 10_000;
+/// (Address, subject) pairs tracked at once; past it the idle ones go, then the one seen
+/// longest ago (the address's own count, which bounds spraying, is kept apart).
+pub const MAX_SUBJECTS: usize = 50_000;
 /// The largest body a password route reads (the tool server's limit too).
 pub const MAX_BODY: usize = 4 * 1024;
 
@@ -145,16 +159,109 @@ pub fn source_key(ip: Option<IpAddr>) -> SourceKey {
     })
 }
 
-/// One attempt's slot in the per-address count ([`SourceLimiter::begin`]).
+/// What an attempt is about, kept only as a SHA-256 (never the name or token itself): a
+/// sign-in name (trimmed and lower-cased, as the tool server reads it; the password step and a
+/// setup's first step share it), one pending or setup token, one signed-in person, or
+/// [`Subject::none`] when the request carries nothing readable (a body that isn't the route's
+/// JSON, no step cookie).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Subject([u8; 32]);
+
+impl std::fmt::Debug for Subject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Subject(..)")
+    }
+}
+
+impl Subject {
+    fn of(kind: &str, value: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"pmos-web-password-subject\0");
+        h.update(kind.as_bytes());
+        h.update(b"\0");
+        h.update(value.as_bytes());
+        Self(h.finalize().into())
+    }
+
+    /// A sign-in name, as the tool server reads it.
+    pub fn name(sign_in_name: &str) -> Self {
+        Self::of("name", &sign_in_name.trim().to_lowercase())
+    }
+
+    /// One step token (`pending` or `setup`).
+    pub fn token(kind: &str, token: &str) -> Self {
+        Self::of(kind, token)
+    }
+
+    /// One signed-in person (their `change` and `recovery-codes` calls).
+    pub fn user(handle: &str) -> Self {
+        Self::of("user", handle)
+    }
+
+    /// Nothing readable.
+    pub fn none() -> Self {
+        Self::of("none", "")
+    }
+}
+
+/// One attempt's slots in the per-address and per-subject counts ([`SourceLimiter::begin`]).
 pub struct Attempt {
     key: SourceKey,
+    subject: Subject,
     at: DateTime<Utc>,
 }
 
-/// Refused attempts per address in a rolling window. In this process only.
+#[derive(Default)]
+struct Seen {
+    by_address: HashMap<SourceKey, VecDeque<DateTime<Utc>>>,
+    by_subject: HashMap<(SourceKey, Subject), VecDeque<DateTime<Utc>>>,
+}
+
+/// Refused attempts per address, and per address and subject, in a rolling window. In this
+/// process only.
 #[derive(Default)]
 pub struct SourceLimiter {
-    seen: Mutex<HashMap<SourceKey, VecDeque<DateTime<Utc>>>>,
+    seen: Mutex<Seen>,
+}
+
+/// Times in the window at `now`; `Err(retry_after_secs)` when there are `most` of them.
+fn room(
+    times: &mut VecDeque<DateTime<Utc>>,
+    most: usize,
+    now: DateTime<Utc>,
+    window: Duration,
+) -> Result<(), u64> {
+    times.retain(|t| now - *t < window && *t <= now);
+    if times.len() >= most {
+        let oldest = times.front().copied().unwrap_or(now);
+        let wait = (oldest + window - now).num_seconds().max(1);
+        return Err(u64::try_from(wait).unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// Make room for a new key in `map` (at most `most` keys): the idle ones go first, then the one
+/// seen longest ago.
+fn evict<K: Clone + Eq + std::hash::Hash>(
+    map: &mut HashMap<K, VecDeque<DateTime<Utc>>>,
+    most: usize,
+    now: DateTime<Utc>,
+    window: Duration,
+) {
+    if map.len() < most {
+        return;
+    }
+    map.retain(|_, t| t.back().is_some_and(|at| now - *at < window && *at <= now));
+    if map.len() >= most {
+        let stalest = map
+            .iter()
+            .min_by_key(|(_, t)| t.back().copied())
+            .map(|(k, _)| k.clone());
+        if let Some(k) = stalest {
+            map.remove(&k);
+        }
+    }
 }
 
 impl SourceLimiter {
@@ -162,50 +269,73 @@ impl SourceLimiter {
         Duration::minutes(SOURCE_WINDOW_MINUTES)
     }
 
-    /// Check `source` and take a slot for this attempt at `now`, in one step (L2): concurrent
-    /// attempts from one address can't pass the limit together. `Err(retry_after_secs)` when
-    /// the address has used its refusals. The slot counts as a refusal unless the attempt is
+    /// Check `source` and `subject` and take a slot in both for this attempt at `now`, in one
+    /// step (L2): concurrent attempts can't pass either limit together. `Err(retry_after_secs)`
+    /// when the address has used its [`SOURCE_REFUSALS`], or the subject its
+    /// [`SUBJECT_REFUSALS`] from that address; then nothing is taken, so a full subject never
+    /// adds to the address's count (N2). The slots count as a refusal unless the attempt is
     /// [`Self::settle`]d as not counted.
-    pub fn begin(&self, source: &SourceKey, now: DateTime<Utc>) -> Result<Attempt, u64> {
+    pub fn begin(
+        &self,
+        source: &SourceKey,
+        subject: &Subject,
+        now: DateTime<Utc>,
+    ) -> Result<Attempt, u64> {
+        let window = Self::window();
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(times) = seen.get_mut(source) {
-            times.retain(|t| now - *t < Self::window() && *t <= now);
-            if times.len() >= SOURCE_REFUSALS {
-                let oldest = times.front().copied().unwrap_or(now);
-                let wait = (oldest + Self::window() - now).num_seconds().max(1);
-                return Err(u64::try_from(wait).unwrap_or(1));
-            }
-        } else if seen.len() >= MAX_SOURCES {
-            let stalest = seen
-                .iter()
-                .min_by_key(|(_, t)| t.back().copied())
-                .map(|(k, _)| k.clone());
-            if let Some(k) = stalest {
-                seen.remove(&k);
-            }
+        let s = &mut *seen;
+        if let Some(times) = s.by_address.get_mut(source) {
+            room(times, SOURCE_REFUSALS, now, window)?;
         }
-        seen.entry(source.clone()).or_default().push_back(now);
+        let pair = (source.clone(), subject.clone());
+        if let Some(times) = s.by_subject.get_mut(&pair) {
+            room(times, SUBJECT_REFUSALS, now, window)?;
+        }
+        if !s.by_address.contains_key(source) {
+            evict(&mut s.by_address, MAX_SOURCES, now, window);
+        }
+        if !s.by_subject.contains_key(&pair) {
+            evict(&mut s.by_subject, MAX_SUBJECTS, now, window);
+        }
+        s.by_address
+            .entry(source.clone())
+            .or_default()
+            .push_back(now);
+        s.by_subject.entry(pair).or_default().push_back(now);
         Ok(Attempt {
             key: source.clone(),
+            subject: subject.clone(),
             at: now,
         })
     }
 
-    /// The attempt's outcome: `counted` keeps its slot (a refusal); otherwise (it succeeded,
-    /// or PM OS itself failed) the slot is given back.
+    /// The attempt's outcome: `counted` keeps its slots (a refusal); otherwise (it succeeded,
+    /// or PM OS itself failed) both are given back.
     pub fn settle(&self, attempt: Attempt, counted: bool) {
         if counted {
             return;
         }
-        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(times) = seen.get_mut(&attempt.key) {
-            if let Some(i) = times.iter().rposition(|t| *t == attempt.at) {
-                times.remove(i);
-            }
-            if times.is_empty() {
-                seen.remove(&attempt.key);
+        fn give_back<K: Eq + std::hash::Hash>(
+            map: &mut HashMap<K, VecDeque<DateTime<Utc>>>,
+            key: K,
+            at: DateTime<Utc>,
+        ) {
+            if let Some(times) = map.get_mut(&key) {
+                if let Some(i) = times.iter().rposition(|t| *t == at) {
+                    times.remove(i);
+                }
+                if times.is_empty() {
+                    map.remove(&key);
+                }
             }
         }
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        give_back(&mut seen.by_address, attempt.key.clone(), attempt.at);
+        give_back(
+            &mut seen.by_subject,
+            (attempt.key, attempt.subject),
+            attempt.at,
+        );
     }
 }
 
@@ -514,12 +644,14 @@ impl super::Inner {
 }
 
 /// An unauthenticated password route's checks: on; same origin; JSON; no forwarded header
-/// unless a proxy is trusted; the address not over its limit. Takes the attempt's slot (it
-/// counts unless it is given back), so every refusal from here on is counted.
+/// unless a proxy is trusted; the address, and `subject` from it, not over their limits.
+/// Takes the attempt's slots (they count unless given back), so every refusal from here on is
+/// counted.
 fn pre(
     state: &AppState,
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
+    subject: &Subject,
 ) -> Result<Try, Box<Response>> {
     if !state.0.password_login {
         return Err(Box::new(off().into_response()));
@@ -539,16 +671,21 @@ fn pre(
         return Err(Box::new(bad_content_type().into_response()));
     }
     let from = address(state, headers, peer)?;
-    match state.0.sources.begin(&from, now(state)) {
+    match state.0.sources.begin(&from, subject, now(state)) {
         Ok(attempt) => Ok(Try {
             from,
             attempt: Some(attempt),
         }),
         Err(wait) => {
-            tracing::warn!("password sign-in: an address over its limit");
+            tracing::warn!("password sign-in: an address, or a subject from it, over its limit");
             Err(Box::new(too_many(wait)))
         }
     }
+}
+
+/// What a step that carries `cookie` is about: its token, or nothing readable.
+fn token_subject(headers: &HeaderMap, cookie: &str, kind: &str) -> Subject {
+    read_cookie(headers, cookie).map_or_else(Subject::none, |t| Subject::token(kind, &t))
 }
 
 fn proxy_not_trusted() -> Box<Response> {
@@ -590,15 +727,21 @@ fn address(
 }
 
 /// A signed-in password route that hashes or makes new secrets (`change`, `recovery-codes`):
-/// counted against the caller's address like every unauthenticated attempt, whatever its
-/// outcome (the re-check of eb24d28, LA), so one session can't spend the address's share.
+/// counted against the caller's address, and the person from it, like every unauthenticated
+/// attempt, whatever its outcome (the re-check of eb24d28, LA), so one session can't spend the
+/// address's share.
 fn count_signed(
     state: &AppState,
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
+    handle: &str,
 ) -> Result<(), Box<Response>> {
     let from = address(state, headers, peer)?;
-    match state.0.sources.begin(&from, now(state)) {
+    match state
+        .0
+        .sources
+        .begin(&from, &Subject::user(handle), now(state))
+    {
         Ok(_kept) => Ok(()),
         Err(wait) => {
             tracing::warn!("password route: an address over its limit");
@@ -640,11 +783,15 @@ async fn sign_in(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mut t = match pre(&state, &headers, peer) {
+    let parsed: Result<SignInBody, _> = parse(&body);
+    let subject = parsed
+        .as_ref()
+        .map_or_else(|_| Subject::none(), |b| Subject::name(&b.sign_in_name));
+    let mut t = match pre(&state, &headers, peer, &subject) {
         Ok(t) => t,
         Err(r) => return *r,
     };
-    let b: SignInBody = match parse(&body) {
+    let b = match parsed {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
@@ -741,7 +888,8 @@ async fn second_step(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mut t = match pre(&state, &headers, peer) {
+    let subject = token_subject(&headers, PENDING_COOKIE, "pending");
+    let mut t = match pre(&state, &headers, peer, &subject) {
         Ok(t) => t,
         Err(r) => return *r,
     };
@@ -825,11 +973,15 @@ async fn setup_begin(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mut t = match pre(&state, &headers, peer) {
+    let parsed: Result<BeginBody, _> = parse(&body);
+    let subject = parsed
+        .as_ref()
+        .map_or_else(|_| Subject::none(), |b| Subject::name(&b.sign_in_name));
+    let mut t = match pre(&state, &headers, peer, &subject) {
         Ok(t) => t,
         Err(r) => return *r,
     };
-    let b: BeginBody = match parse(&body) {
+    let b = match parsed {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
@@ -906,7 +1058,8 @@ async fn setup_password(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mut t = match pre(&state, &headers, peer) {
+    let subject = token_subject(&headers, SETUP_COOKIE, "setup");
+    let mut t = match pre(&state, &headers, peer, &subject) {
         Ok(t) => t,
         Err(r) => return *r,
     };
@@ -953,7 +1106,8 @@ async fn setup_authenticator(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mut t = match pre(&state, &headers, peer) {
+    let subject = token_subject(&headers, SETUP_COOKIE, "setup");
+    let mut t = match pre(&state, &headers, peer, &subject) {
         Ok(t) => t,
         Err(r) => return *r,
     };
@@ -1008,7 +1162,8 @@ async fn setup_confirm(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mut t = match pre(&state, &headers, peer) {
+    let subject = token_subject(&headers, SETUP_COOKIE, "setup");
+    let mut t = match pre(&state, &headers, peer, &subject) {
         Ok(t) => t,
         Err(r) => return *r,
     };
@@ -1118,7 +1273,7 @@ async fn change(
     if !state.0.password_login {
         return Err(off());
     }
-    if let Err(r) = count_signed(&state, &headers, peer) {
+    if let Err(r) = count_signed(&state, &headers, peer, signed.handle()) {
         return Ok(*r);
     }
     let b: ChangeBody = parse(&body)?;
@@ -1182,7 +1337,7 @@ async fn recovery_codes(
     if !state.0.password_login {
         return Err(off());
     }
-    if let Err(r) = count_signed(&state, &headers, peer) {
+    if let Err(r) = count_signed(&state, &headers, peer, signed.handle()) {
         return Ok(*r);
     }
     let b: CodeBody = parse(&body)?;
@@ -1335,40 +1490,96 @@ mod tests {
         source_key(Some(s.parse().unwrap()))
     }
 
+    fn name(n: usize) -> Subject {
+        Subject::name(&format!("p{n}@example.com"))
+    }
+
+    /// N2 (the review of 8e8f8fe): an address waits after a hundred refusals in fifteen
+    /// minutes, about anything (before: twenty); one subject from it after ten. (Before, this
+    /// test asserted the address waited after twenty refusals; it now asserts a hundred, with
+    /// ten per subject.)
     #[test]
-    fn an_address_waits_after_twenty_refusals_in_fifteen_minutes() {
+    fn an_address_waits_after_a_hundred_refusals_and_a_subject_after_ten() {
         let l = SourceLimiter::default();
         let (a, b) = (key("203.0.113.7"), key("203.0.113.8"));
-        for i in 0..SOURCE_REFUSALS as i64 {
-            let t = l.begin(&a, at(i)).expect("room");
+        assert_eq!((SOURCE_REFUSALS, SUBJECT_REFUSALS), (100, 10));
+        for i in 0..SOURCE_REFUSALS {
+            let t = l.begin(&a, &name(i), at(i as i64)).expect("room");
             l.settle(t, true);
         }
-        assert_eq!(l.begin(&a, at(30)).err(), Some(15 * 60 - 30));
+        assert_eq!(l.begin(&a, &name(500), at(150)).err(), Some(15 * 60 - 150));
         assert!(
-            l.begin(&b, at(30)).is_ok(),
+            l.begin(&b, &name(0), at(150)).is_ok(),
             "another address has its own count"
         );
         // The first refusal leaves the window after 15 minutes: one more try.
-        assert!(l.begin(&a, at(15 * 60)).is_ok());
-        assert!(l.begin(&a, at(15 * 60)).is_err());
-        assert!(l.begin(&a, at(15 * 60 + 20 * 60)).is_ok());
+        assert!(l.begin(&a, &name(501), at(15 * 60)).is_ok());
+        assert!(l.begin(&a, &name(502), at(15 * 60)).is_err());
+        assert!(l.begin(&a, &name(503), at(15 * 60 + 20 * 60)).is_ok());
+
+        // One subject: ten, then it waits from there; nothing past them reaches the address's
+        // count, so the others there are not held up.
+        let l = SourceLimiter::default();
+        let ana = Subject::name(" Ana@Example.com ");
+        for i in 0..SUBJECT_REFUSALS as i64 {
+            let t = l.begin(&a, &ana, at(i)).expect("room");
+            l.settle(t, true);
+        }
+        for i in 0..200 {
+            assert_eq!(
+                l.begin(&a, &Subject::name("ana@example.com"), at(20 + i))
+                    .err(),
+                Some(15 * 60 - 20 - i as u64),
+                "the same name as the tool server reads it"
+            );
+        }
+        assert!(l.begin(&b, &ana, at(30)).is_ok(), "from another address");
+        for n in 0..(SOURCE_REFUSALS - SUBJECT_REFUSALS) {
+            let t = l.begin(&a, &name(n), at(300)).expect("the others' room");
+            l.settle(t, true);
+        }
+        assert!(
+            l.begin(&a, &name(999), at(300)).is_err(),
+            "now the address is full"
+        );
     }
 
-    /// L2: the check and the count are one step. Twenty attempts in flight at once from one
-    /// address take every slot; the twenty-first is refused before it reaches the tool server,
-    /// and a success gives its slot back.
+    /// L2: the check and the count are one step. A hundred attempts in flight at once from one
+    /// address take every slot; the next is refused before it reaches the tool server, and a
+    /// success gives its slot back. The same for one subject's ten.
     #[test]
     fn concurrent_attempts_cannot_pass_the_limit_together() {
         let l = SourceLimiter::default();
         let a = key("203.0.113.7");
         let held: Vec<Attempt> = (0..SOURCE_REFUSALS)
-            .map(|_| l.begin(&a, at(0)).expect("room"))
+            .map(|n| l.begin(&a, &name(n), at(0)).expect("room"))
             .collect();
-        assert!(l.begin(&a, at(0)).is_err(), "all twenty are in flight");
+        assert!(
+            l.begin(&a, &name(1000), at(0)).is_err(),
+            "all hundred are in flight"
+        );
         let mut held = held.into_iter();
         l.settle(held.next().unwrap(), false);
-        assert!(l.begin(&a, at(1)).is_ok(), "a success gave its slot back");
-        assert!(l.begin(&a, at(1)).is_err());
+        assert!(
+            l.begin(&a, &name(1000), at(1)).is_ok(),
+            "a success gave its slot back"
+        );
+        assert!(l.begin(&a, &name(1001), at(1)).is_err());
+        let l = SourceLimiter::default();
+        let one = Subject::token("pending", &"p".repeat(43));
+        let held: Vec<Attempt> = (0..SUBJECT_REFUSALS)
+            .map(|_| l.begin(&a, &one, at(0)).expect("room"))
+            .collect();
+        assert!(l.begin(&a, &one, at(0)).is_err(), "all ten are in flight");
+        l.settle(held.into_iter().next().unwrap(), false);
+        assert!(l.begin(&a, &one, at(1)).is_ok());
+        // Subjects of different kinds never share a count.
+        assert_ne!(Subject::token("pending", "x"), Subject::token("setup", "x"));
+        assert_ne!(Subject::name("x"), Subject::user("x"));
+        assert_eq!(
+            format!("{:?}", Subject::name("ana@example.com")),
+            "Subject(..)"
+        );
     }
 
     /// L3: IPv6 counts by /64; an IPv4-mapped address counts as IPv4.
@@ -1384,12 +1595,16 @@ mod tests {
         let l = SourceLimiter::default();
         for i in 0..SOURCE_REFUSALS {
             let t = l
-                .begin(&key(&format!("2001:db8:1:2::{:x}", i + 1)), at(0))
+                .begin(&key(&format!("2001:db8:1:2::{:x}", i + 1)), &name(i), at(0))
                 .unwrap();
             l.settle(t, true);
         }
-        assert!(l.begin(&key("2001:db8:1:2::abcd"), at(1)).is_err());
-        assert!(l.begin(&key("2001:db8:1:99::1"), at(1)).is_ok());
+        assert!(l
+            .begin(&key("2001:db8:1:2::abcd"), &name(1000), at(1))
+            .is_err());
+        assert!(l
+            .begin(&key("2001:db8:1:99::1"), &name(1000), at(1))
+            .is_ok());
     }
 
     fn xff(values: &[&'static str]) -> HeaderMap {

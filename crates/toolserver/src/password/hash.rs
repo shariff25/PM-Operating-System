@@ -5,10 +5,12 @@
 //!   PHC string (`$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`), so the parameters travel with
 //!   the hash. A stored hash below the current parameters is re-hashed at the next correct
 //!   sign-in ([`needs_rehash`]).
-//! - **Rules** ([`check_new`]): at least 12 characters not counting whitespace at either end
-//!   and counting a run of whitespace once ([`collapsed`]), at most 128 as typed; any
+//! - **Rules** ([`check_new`]): at least 12 characters not counting whitespace at either end,
+//!   counting a run of whitespace once and not counting characters that show nothing
+//!   ([`collapsed`], [`is_ignorable`]), at most 128 as typed; any
 //!   characters, no composition rules; not the handle, the sign-in name or its local part, and
-//!   not one of [`COMMON`] (with or without its spaces). The rules never change what is hashed.
+//!   not one of [`COMMON`] (with or without its spaces, compared in NFKC). The rules never
+//!   change what is hashed.
 //! - The work runs on the blocking pool (the caller does that, `password::PasswordService`),
 //!   never on the async executor.
 //! - Never logged, never in an error: errors here are fixed words. Inputs are taken by
@@ -187,14 +189,52 @@ pub fn common_count() -> usize {
     common_set().len()
 }
 
-/// `password` as the rules read it (the gate review of 8e8f8fe, M3): whitespace at either end
-/// dropped and every run of whitespace inside made one space. Whitespace is Unicode's
-/// `White_Space` (spaces, tabs, line breaks, the no-break and ideographic spaces and the other
-/// Unicode spaces), as [`char::is_whitespace`] reads it. For the rules only: what is hashed,
-/// and checked at sign-in, is always exactly what the person typed.
+/// Characters that show nothing and are dropped when the rules read a password (the review of
+/// 8e8f8fe, a Low after M3): Unicode's `Default_Ignorable_Code_Point` (Unicode 15.1,
+/// `DerivedCoreProperties.txt`), which holds the invisible format characters (the zero-width
+/// space, the joiners and non-joiner, the word joiner, the byte-order mark, the bidirectional
+/// marks and controls, the soft hyphen, the invisible operators, the tags) plus the variation
+/// selectors, the Hangul fillers, the combining grapheme joiner and the Mongolian free
+/// variation selectors and vowel separator, and the code points Unicode keeps unassigned in
+/// those ranges. **Not** dropped: the format characters outside that property, which show a
+/// glyph (the Arabic number signs U+0600..U+0605, U+06DD, U+070F, U+0890..U+0891, U+08E2, the
+/// Kaithi number signs U+110BD, U+110CD). For the rules only: what is hashed is exactly what
+/// was typed.
+pub fn is_ignorable(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x00AD
+            | 0x034F
+            | 0x061C
+            | 0x115F..=0x1160
+            | 0x17B4..=0x17B5
+            | 0x180B..=0x180F
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0x3164
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+            | 0xFFA0
+            | 0xFFF0..=0xFFF8
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0000..=0xE0FFF
+    )
+}
+
+/// `password` as the rules read it (the gate review of 8e8f8fe, M3): every character that
+/// shows nothing ([`is_ignorable`]) dropped, then whitespace at either end dropped and every
+/// run of whitespace inside made one space. Whitespace is Unicode's `White_Space` (spaces,
+/// tabs, line breaks, the no-break and ideographic spaces and the other Unicode spaces), as
+/// [`char::is_whitespace`] reads it. So twelve zero-width spaces are nothing, and a run of
+/// spaces with zero-width spaces between them is one space. For the rules only: what is
+/// hashed, and checked at sign-in, is always exactly what the person typed.
 pub fn collapsed(password: &str) -> Zeroizing<String> {
-    let mut out = Zeroizing::new(String::with_capacity(password.len()));
-    for word in password.split_whitespace() {
+    let visible: Zeroizing<String> =
+        Zeroizing::new(password.chars().filter(|c| !is_ignorable(*c)).collect());
+    let mut out = Zeroizing::new(String::with_capacity(visible.len()));
+    for word in visible.split_whitespace() {
         if !out.is_empty() {
             out.push(' ');
         }
@@ -203,15 +243,25 @@ pub fn collapsed(password: &str) -> Zeroizing<String> {
     out
 }
 
+/// `text` in Unicode's compatibility composition (NFKC), lower-cased: the form the name and
+/// common-list checks compare, so full-width letters, ligatures and other compatibility forms
+/// of a common password are caught (`ｐａｓｓｗｏｒｄ１２３４` is `password1234`). Never what is
+/// hashed, and not what the length is counted on.
+fn compared(text: &str) -> Zeroizing<String> {
+    use unicode_normalization::UnicodeNormalization;
+    let nfkc: Zeroizing<String> = Zeroizing::new(text.nfkc().collect());
+    Zeroizing::new(nfkc.to_lowercase())
+}
+
 /// Check a new password for `handle` (with `sign_in_name`, when they have one).
 ///
 /// The length is counted on [`collapsed`] (M3): twelve spaces, or a short word padded with
 /// spaces to twelve, is too short. The name and common-list checks are made on the collapsed
-/// text lower-cased, and again with every space taken out, so `password` padded with spaces,
-/// or `pass word 1234`, is refused as the common password it is. Not normalised: Unicode
-/// compatibility forms (NFKC: full-width letters, ligatures) and characters that aren't
-/// whitespace but show nothing (a zero-width space): `docs/password-sign-in.md`, "The rules
-/// for a password".
+/// text in NFKC, lower-cased ([`compared`]), and again with every whitespace character taken
+/// out, so `password` padded with spaces, `pass word 1234`, `password` and a zero-width space
+/// and `1234`, or `password1234` in full-width letters, is refused as the common password it
+/// is. Not normalised: letters that only look alike (a Cyrillic `а` for a Latin `a`), and what
+/// is hashed (`docs/password-sign-in.md`, "The rules for a password").
 pub fn check_new(password: &str, handle: &str, sign_in_name: Option<&str>) -> Result<(), Weak> {
     if password.chars().count() > MAX_LEN {
         return Err(Weak::TooLong);
@@ -220,11 +270,12 @@ pub fn check_new(password: &str, handle: &str, sign_in_name: Option<&str>) -> Re
     if collapsed.chars().count() < MIN_LEN {
         return Err(Weak::TooShort);
     }
-    let lowered = Zeroizing::new(collapsed.to_lowercase());
-    let joined = Zeroizing::new(lowered.replace(' ', ""));
-    let mut names = vec![handle.to_lowercase()];
+    let lowered = compared(&collapsed);
+    let joined: Zeroizing<String> =
+        Zeroizing::new(lowered.chars().filter(|c| !c.is_whitespace()).collect());
+    let mut names = vec![compared(handle).to_string()];
     if let Some(name) = sign_in_name {
-        let name = name.to_lowercase();
+        let name = compared(name).to_string();
         if let Some((local, _)) = name.split_once('@') {
             names.push(local.to_string());
         }
@@ -375,9 +426,56 @@ mod tests {
         assert_eq!(ok("p a s s w o r d 1 2 3 4"), Err(Weak::Common));
         assert_eq!(ok("password\u{a0}1234"), Err(Weak::Common));
         assert_eq!(ok("ana . silva @ example . com"), Err(Weak::MatchesName));
-        // Not normalised (documented): compatibility forms and invisible characters.
-        assert_eq!(ok("ｐａｓｓｗｏｒｄ１２３４"), Ok(()));
-        assert_eq!(ok("password\u{200b}1234"), Ok(()));
+        // The review of 8e8f8fe, a Low after M3: characters that show nothing don't make up
+        // the length, and compatibility forms are compared as what they are. Before, these
+        // asserted that `ｐａｓｓｗｏｒｄ１２３４` and `password`, a zero-width space and `1234` were
+        // accepted; they now assert the refusals.
+        assert_eq!(ok(&"\u{200b}".repeat(12)), Err(Weak::TooShort));
+        assert_eq!(ok(&"\u{200b}".repeat(128)), Err(Weak::TooShort));
+        assert_eq!(
+            ok("abc\u{200b}\u{200c}\u{200d}\u{2060}\u{feff}\u{ad}defgh"),
+            Err(Weak::TooShort)
+        );
+        assert_eq!(
+            ok("abcdefghijk\u{fe0f}"),
+            Err(Weak::TooShort),
+            "a variation selector"
+        );
+        assert_eq!(ok("abcdefghijk\u{e0041}"), Err(Weak::TooShort), "a tag");
+        assert_eq!(
+            ok("abcdefghijk\u{3164}"),
+            Err(Weak::TooShort),
+            "a Hangul filler"
+        );
+        assert_eq!(
+            ok("abcdefghijk\u{202e}"),
+            Err(Weak::TooShort),
+            "a bidi override"
+        );
+        assert_eq!(ok("password\u{200b}1234"), Err(Weak::Common));
+        assert_eq!(ok("pass\u{200b} \u{200b} word1234"), Err(Weak::Common));
+        assert_eq!(ok("ｐａｓｓｗｏｒｄ１２３４"), Err(Weak::Common));
+        assert_eq!(ok("ＰＡＳＳＷＯＲＤ１２３４"), Err(Weak::Common));
+        assert_eq!(ok("ana.silva@ｅｘａｍｐｌｅ.com"), Err(Weak::MatchesName));
+        // Still not normalised (documented): letters that only look alike. A visible
+        // character with an invisible one beside it counts as one.
+        assert_eq!(ok("p\u{430}ssword1234"), Ok(()), "a Cyrillic a");
+        assert_eq!(ok("plum kettle\u{200b} orbit 42"), Ok(()));
+        assert_eq!(collapsed("a\u{200b} \u{200b} \u{feff}b").as_str(), "a b");
+        assert_eq!(collapsed(&"\u{200b}".repeat(12)).as_str(), "");
+        for c in [
+            '\u{200b}',
+            '\u{ad}',
+            '\u{feff}',
+            '\u{2064}',
+            '\u{1d173}',
+            '\u{e0fff}',
+        ] {
+            assert!(is_ignorable(c), "{c:?}");
+        }
+        for c in ['a', ' ', '\u{600}', '\u{6dd}', '\u{110bd}', '\u{2070}'] {
+            assert!(!is_ignorable(c), "{c:?}");
+        }
         // At most 128 as typed: spaces count there, since they are hashed.
         assert_eq!(
             ok(&format!("{}{}", "x".repeat(20), " ".repeat(109))),

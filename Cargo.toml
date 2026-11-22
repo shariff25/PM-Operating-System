@@ -17,6 +17,9 @@ getrandom = "0.3"
 # TOTP (RFC 6238) is HMAC-SHA-1.
 sha1 = "0.10"
 zeroize = "1.8"
+# The password rules read a password in NFKC for the name and common-list checks only (never
+# what is hashed). Already in the lock through sqlx's stringprep.
+unicode-normalization = "0.1.26"
 subtle = "2.6"
 anyhow = "1"
 async-trait = "0.1"
