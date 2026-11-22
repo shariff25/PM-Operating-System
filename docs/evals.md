@@ -922,4 +922,6 @@ because the load test measures the stack PMs use.
   has no way to clear an attempt's drafts (no client may decide an eval task's drafts), so
   the fix needs a decision: for example a runtime route for client `evals` that rejects an
   `eval` task's pending drafts after grading, or a fresh tool server per attempt. Until then,
-  measure those tasks one attempt per fresh stack (E1 did, on the test stack).
+  measure those tasks one attempt per fresh stack. E1 did, on the test stack: `slack-reply`
+  passed 20 of 27 attempts that way against 7 of 27 in the shared run, and
+  `nudge-on-request` 3 of 3 against 0 of 3.
