@@ -56,7 +56,23 @@ it can be deleted.
 ## Sharing the GPU (MOD-4)
 - **Concurrency:** at most `max-in-flight` calls run at once.
 - **Per person:** at most `per-user` of them belong to one person (`X-Pmos-User`), counted
-  only when the gateway believes the header (below).
+  only when the gateway believes the header (below), and counted together across every client
+  that names them. A person is counted under one key, the spelled form of their handle (`.`
+  and `_` as `-`, a run of hyphens as one; `spelled_handle`), whichever client names them and
+  in whatever spelling: `ana.k` from the runtime or a team bot and `ana-k` from `bot-pm-ana-k`
+  are one person with `per-user` slots in all (finding G1 of the review at 6bb806f; before,
+  the runtime and team bots kept the handle as named and the PM's own bot its spelled form, so
+  a PM with `.` or `_` in their handle had `per-user` slots under each, and their usage was
+  split across two names). Tested in `crates/gateway/tests/limits.rs`,
+  `a_persons_running_cap_holds_across_clients_for_a_dotted_handle`.
+- **A client's share of one person** (`clients.<name>.per-user-share`, finding G3 of the review
+  at 6bb806f): a trusted client that may name anyone (`user: any`: a team bot such as
+  `bot-docs`, or the runtime) holds at most this many of one person's `per-user` running slots,
+  **1 by default**; a `from-name` client (the PM's own bot) may hold all of them. Dispatch is
+  oldest-first within a priority, so before, a team bot's token whose calls for a PM came
+  first could hold both of that PM's slots and the PM's own bot waited behind it; now the PM's
+  own client always finds a slot. The share is 1 to `per-user`, and only for a trusted client.
+  The test stack's configs raise it for their shared `runtime` and `worker` tokens (below).
 - **Per client:** each client token has its own cap, `clients.<name>.max-in-flight` (default
   `limits.per-client`, itself defaulting to `per-user`), whoever its calls name. So one token
   can't hold every slot (review finding N3); in `deploy/gateway.yaml` the `evals` token, which
@@ -76,7 +92,7 @@ it can be deleted.
   `one_client_cant_take_all_of_a_persons_places`). The trade-off: one person may have up to
   `per-user-queue` calls waiting through each client that names them, still bounded by each
   client's `max-queue` and the whole `max-queue`. The running cap (`per-user`) still counts a
-  person's calls from every client together.
+  person's calls from every client together, under the one key above.
 - **Priority** (`X-Pmos-Priority`): `interactive` (someone waiting in Slack), then `scheduled` (routines), then `personal` (background work). Within a priority it's first come, first served.
 - **Which clients are believed:** only a client listed with `trusted: true` has its
   `X-Pmos-User` and `X-Pmos-Priority` used; with no priority header its calls get its
@@ -106,12 +122,17 @@ it can be deleted.
     handle (24 at most, `valid_new_handle`), but an Admin can create one (up to 64 characters,
     from the web app, the host or a reviewed import file); that person's own bot can't name
     them, and their calls go through `runtime` instead.
-  - **One person key** (the Low on canonical handles, review at 2544d01): `bot-pm-ana` may
-    name `ana`, `ana.`, `ana-` or `ana..`, which all spell `ana`. Its calls are kept under the
-    one form its name spells (`ana`; `ana-k` for `bot-pm-ana-k`), for the caps and in the
-    usage log's `user`, so a bot can't spread one person over several keys. The trade-off: a
-    PM whose handle has `.` or `_` (`ana.k`) appears as `ana-k` on their own bot's lines, and
-    as `ana.k` on the runtime's.
+  - **One person key** (the Low on canonical handles, review at 2544d01, and G1 of the review
+    at 6bb806f): `bot-pm-ana` may name `ana`, `ana.`, `ana-` or `ana..`, which all spell
+    `ana`. Every client's calls are kept under the spelled form (`ana`; `ana-k` for `ana.k`),
+    for the caps and in the usage log's `user`, so no client can spread one person over
+    several keys, and the runtime's, a team bot's and the PM's own bot's calls for one PM
+    count together. The trade-off: a PM whose handle has `.` or `_` (`ana.k`) appears as
+    `ana-k` on every usage line. Handles that spell the same (`ana.k`, `ana_k`) would share a
+    key, so PM OS refuses to create a handle spelled as an existing user's
+    (`docs/toolserver.md`, "Handles that spell the same"); rows that already clash share
+    their caps. A `403` line's `user` is still the handle as the client sent it (the evidence
+    of whom it tried to name).
   - **Names that only look like it** (the Low on `bot-pm` names): a client named `bot-pm` or
     `bot-pmana` (no hyphen) would fall under `bot-*` and may name anyone. A name that starts
     with a `from-name` pattern's prefix without its trailing hyphen, but not with the whole
@@ -123,10 +144,16 @@ it can be deleted.
 - **`deploy/gateway.yaml`** trusts `runtime` (it names the PM its caller verified; cap 2),
   `bot-pm-*` with `user: from-name` (each PM's own bot's worker; cap 3 of 4) and `bot-*` (a
   team bot's worker, such as `bot-docs`, naming the PM whose task it runs; cap 3 of 4), and
-  caps `evals` at 1, `personal`. **Known residual (S8):** a team bot's token can still name any
-  PM, since it serves them all; it holds at most 3 slots and 6 waiting places. The test stack
-  (`scripts/claude-test-stack.sh`) gives all its workers one `worker` token, trusted to name
-  anyone, as before.
+  caps `evals` at 1, `personal`. `runtime` and `bot-*` keep the default `per-user-share` of 1,
+  so neither holds both of a PM's 2 running slots; `bot-pm-*` may. **Known residual (S8):** a
+  team bot's token can still name any PM, since it serves them all; it holds at most 3 slots,
+  one of any one PM's, and 6 waiting places. The test stack (`scripts/claude-test-stack.sh`)
+  gives all its workers one `worker` token, trusted to name anyone, as before, with
+  `per-user-share` equal to `per-user` for `worker` and `runtime` (in the config it writes for
+  another provider and in `config/gateway.claude-test.yaml`): its eval mode runs every attempt
+  as the one user `evals`, one call per lane, so with 4 lanes (`per-user` 4) the 4 lanes still
+  have 4 calls in flight beside the judges' 2 (tested by reading the script's config in
+  `limits.rs`, `the_test_stacks_eval_lanes_keep_one_call_in_flight_each`).
 - **Queue full:** a call that would have to wait gets `503` with `Retry-After: 5` when `max-queue` calls are already waiting (and `429` when its client's or person's share of the queue is used, above). A call that can start at once always starts.
 - **Queue deadline:** a call that has waited `limits.queue-wait-secs` (default 300) for a slot
   gives up with the same `503` and leaves the queue. A retry waiting for a slot again gives up
@@ -198,7 +225,7 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
 | `GET /v1/pmos/workarounds` | client token | The workaround registry |
 | `GET /v1/pmos/roles` | client token | The gateway's `class` (`production` or `test`), each role's model id and upstream kind (`local`, `claude-test` or `remote-test`; never an address), and whether the stub, a testing-only upstream and the workarounds are on. The bot runtime passes it to the benchmark runner (`GET /v1/personas`, client `evals`), which records it in each report (`docs/evals.md`). |
 | `GET /healthz` | none | Liveness |
-| `GET /readyz` | none | `200` when every model server answers `/models` within 2 seconds; `503` names the one that doesn't |
+| `GET /readyz` | none | `200` when every model server answers `/models` within 2 seconds; `503` when one doesn't. `upstreams` is keyed by role, each with its upstream's kind label (`local`, `claude-test`, `remote-test`, as in `GET /v1/pmos/roles`) and `ok` or `down`: `{"default": {"upstream": "local", "status": "ok"}, …}`. Labels only, never an address, host name, URL or key (review at 6bb806f: before, the keys were the model servers' base URLs, so this unauthenticated route named their hosts and a remote test upstream's provider). Every answer also has `class` (as served: `test` with the stub on) and `stub` (G2); with the stub on it is always `200`, has no `upstreams`, and asks no model server. `deploy/pmos-admin status` shows a `WARN` line for the gateway when `stub` is true or `class` isn't `production`. Docker's health check uses `/healthz`, so neither changes whether the stack starts. |
 
 **Optional headers:**
 - `X-Pmos-User`: a handle (used only from a trusted client);
@@ -225,8 +252,11 @@ One event per call:
   only counted, and one summary line, the last of them with `refused_count: <n>`, follows when
   the minute ends (checked every 5 seconds, and at shutdown). So each client writes at most
   about two refusal lines of each status a minute, and every refusal is counted. A summary's
-  `user` is the last handle tried; the `403` warning in the service log is written only with
-  a line of its own.
+  `user` is the last handle tried; `refused_users` lists the distinct handles the held
+  refusals named, first seen first, at most 8 (`REFUSAL_USERS`), and `refused_users_more`, when
+  there were more, how many of the held refusals named someone not listed (the Low on refusal
+  summaries, review at 6bb806f: before, only the first and last handle of a minute were
+  kept). The `403` warning in the service log is written only with a line of its own.
 
 It never holds prompts or answers. Events go to the service log, and with `PMOS_GATEWAY_USAGE_LOG` also to a JSON-lines file for shipping off-box. Because every upstream must be local outside testing, "restricted data sent off the Spark" is zero by construction; the upstream host on each event lets anyone check (a testing-only upstream shows its remote host).
 
@@ -264,10 +294,11 @@ bound every client, wait, stream and answer):
 | `clients.<…>.max-in-flight` | `limits.per-client` | This client's cap |
 | `clients.<…>.max-queue` | twice its `max-in-flight` | Calls this client may have waiting |
 | `clients.<…>.user` | `any` | `from-name` (a pattern, trusted only): it may name only the person its name spells |
+| `clients.<…>.per-user-share` | `1` for a trusted `user: any` client, else `per-user` | How many of one person's `per-user` running slots this client may hold (1 to `per-user`; trusted only) |
 | `clients.<…>.priority` | `interactive` if trusted, else `personal` | An untrusted client's every call; a trusted one's calls without the header |
 
 At start-up the gateway logs its class (as served: `test` with the stub on), and each client's
-name, trust, caps, priority and `user` rule (never a token).
+name, trust, caps, priority, `user` rule and `per-user-share` (never a token).
 
 **Upstream forms:**
 - `http://<local host>/<base>`: an OpenAI-compatible local model server (vLLM). The only form
@@ -300,6 +331,10 @@ Spark's own `deploy/gateway.yaml` (`class: production`) with `PMOS_GATEWAY_STUB=
 model servers are up (`deploy/env.example`; the install runbook's "Turn off the stub" comes
 later). The gateway then starts as before, logs a warning, and serves as class `test`:
 `GET /v1/pmos/roles` says `class: test` and `stub: true`, so no eval run against it counts.
+`GET /readyz` says the same (G2, review at 6bb806f: before, it answered ready with nothing
+but two start-up log lines to show a host left on the stub), and `deploy/pmos-admin status`
+shows `gateway WARN the STUB model answers every call`, so a host left on the first
+install's default is plain to see.
 The config's rules (testing-only upstreams refused, the `.pmos.internal` hosts) still apply
 with the stub on: the stub never calls an upstream, but the shipped config passes them, so
 nothing valid is refused. At 2544d01 the gateway refused to start instead, which stopped CI's

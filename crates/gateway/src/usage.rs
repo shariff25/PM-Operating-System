@@ -58,25 +58,67 @@ pub struct UsageEvent {
     /// which got a line of its own. The rest of the line is the last of them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refused_count: Option<u64>,
+    /// On a refusal summary line only: the distinct people the held refusals named, in the
+    /// order first seen, at most [`REFUSAL_USERS`] of them (the Low on refusal summaries,
+    /// review at 6bb806f: before, a summary kept only the last one).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refused_users: Vec<String>,
+    /// On a refusal summary line only, when some were left out of `refused_users`: how many
+    /// of the held refusals named someone not in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused_users_more: Option<u64>,
 }
 
 /// How long a client's refusals of one status are counted into one summary line, after the
 /// first is recorded on its own (the Low on refusal lines, review at 2544d01).
 pub const REFUSAL_WINDOW: Duration = Duration::from_secs(60);
 
+/// The most distinct people one refusal summary line names.
+pub const REFUSAL_USERS: usize = 8;
+
 /// The refusals of one client with one status since its last line.
 struct Window {
     opened: Instant,
     held: u64,
     last: Option<UsageEvent>,
+    /// Distinct people the held refusals named, at most [`REFUSAL_USERS`].
+    users: Vec<String>,
+    /// Held refusals that named someone not in `users`, once it was full.
+    more: u64,
 }
 
 impl Window {
+    fn new(opened: Instant) -> Self {
+        Self {
+            opened,
+            held: 0,
+            last: None,
+            users: Vec::new(),
+            more: 0,
+        }
+    }
+
+    /// Counts a refusal into the window, without a line of its own.
+    fn hold(&mut self, event: UsageEvent) {
+        self.held += 1;
+        if let Some(u) = event.user.as_ref().filter(|u| !self.users.contains(u)) {
+            if self.users.len() < REFUSAL_USERS {
+                self.users.push(u.clone());
+            } else {
+                self.more += 1;
+            }
+        }
+        self.last = Some(event);
+    }
+
     /// The summary line for the refusals held, if any.
     fn summary(&mut self) -> Option<UsageEvent> {
         let mut last = self.last.take()?;
         last.refused_count = Some(self.held);
+        last.refused_users = std::mem::take(&mut self.users);
+        last.refused_users_more = (self.more > 0).then_some(self.more);
         self.held = 0;
+        self.more = 0;
         Some(last)
     }
 }
@@ -123,8 +165,7 @@ impl UsageLog {
         let mut map = self.refusals.lock().expect("refusals lock");
         let summary = match map.get_mut(&key) {
             Some(w) if now.saturating_duration_since(w.opened) < REFUSAL_WINDOW => {
-                w.held += 1;
-                w.last = Some(event);
+                w.hold(event);
                 return false;
             }
             Some(w) => {
@@ -133,14 +174,7 @@ impl UsageLog {
                 s
             }
             None => {
-                map.insert(
-                    key,
-                    Window {
-                        opened: now,
-                        held: 0,
-                        last: None,
-                    },
-                );
+                map.insert(key, Window::new(now));
                 None
             }
         };
@@ -237,7 +271,51 @@ mod tests {
             workarounds: Vec::new(),
             refused: Some("why"),
             refused_count: None,
+            refused_users: Vec::new(),
+            refused_users_more: None,
         }
+    }
+
+    #[test]
+    fn a_summary_names_up_to_eight_distinct_people_and_counts_the_rest() {
+        let log = UsageLog::new(None).unwrap();
+        let t0 = Instant::now();
+        assert!(log.refusal_at(refusal("bot-docs", 429, "first"), t0));
+        // 30 people, each refused three times, after the first line.
+        for round in 0..3u64 {
+            for p in 0..30u64 {
+                let at = t0 + Duration::from_millis(round * 100 + p);
+                assert!(!log.refusal_at(refusal("bot-docs", 429, &format!("p{p}")), at));
+            }
+        }
+        log.flush_at(Some(t0 + REFUSAL_WINDOW));
+        let recent = log.recent();
+        let summary = recent.last().unwrap();
+        assert_eq!(summary.refused_count, Some(90));
+        let want: Vec<String> = (0..REFUSAL_USERS).map(|p| format!("p{p}")).collect();
+        assert_eq!(summary.refused_users, want, "distinct, first seen, capped");
+        assert_eq!(
+            summary.refused_users_more,
+            Some(3 * (30 - REFUSAL_USERS as u64))
+        );
+        assert_eq!(
+            summary.user.as_deref(),
+            Some("p29"),
+            "the line is the last refusal"
+        );
+        // A summary of refusals that named few people names each once, and nothing more.
+        let t1 = t0 + Duration::from_secs(300);
+        assert!(log.refusal_at(refusal("evals", 403, "a"), t1));
+        for p in ["b", "a", "b", "c"] {
+            assert!(!log.refusal_at(refusal("evals", 403, p), t1));
+        }
+        log.flush_all_refusals();
+        let summary = log.recent().pop().unwrap();
+        assert_eq!(summary.refused_users, ["b", "a", "c"]);
+        assert_eq!(summary.refused_users_more, None);
+        // A line of its own carries neither field.
+        let text = serde_json::to_string(&log.recent()[0]).unwrap();
+        assert!(!text.contains("refused_users"), "{text}");
     }
 
     #[test]

@@ -57,6 +57,21 @@ pub fn spelled_handle(handle: &str) -> String {
     out.trim_end_matches('-').to_string()
 }
 
+/// Of `existing` handles, the first other than `handle` that a personal bot's name and the
+/// model gateway would spell the same ([`spelled_handle`]): `ana.k` for a new `ana_k` or
+/// `ana-k`. The gateway keeps each person's calls under their spelled form, so two such users
+/// would share one person's model slots, and their bots one name; PM OS therefore refuses to
+/// create a handle that clashes (the Low on colliding handles, review at 6bb806f).
+pub fn spelling_clash<'a>(
+    handle: &str,
+    existing: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    let spelled = spelled_handle(handle);
+    existing
+        .into_iter()
+        .find(|other| *other != handle && spelled_handle(other) == spelled)
+}
+
 /// The personal bot of the member with this handle: `pm-<handle>`, with `.` and `_` turned into
 /// hyphens so it is a valid bot name ([`spelled_handle`]), cut to [`MAX_BOT_NAME`] characters.
 /// A handle whose spelled form is longer than [`MAX_SPELLED_HANDLE`] is cut, so it can share
@@ -175,6 +190,20 @@ mod tests {
         assert!(valid_new_handle(&h));
         assert!(spelled_handle(&h).len() <= MAX_SPELLED_HANDLE);
         assert_eq!(personal_bot_name(&h), format!("pm-{h}"));
+    }
+
+    #[test]
+    fn handles_that_spell_the_same_clash() {
+        let existing = ["ana.k", "bo", "cy_d"];
+        for new in ["ana_k", "ana-k", "ana..k", "ana.k."] {
+            assert_eq!(spelling_clash(new, existing), Some("ana.k"), "{new}");
+        }
+        assert_eq!(spelling_clash("cy-d", existing), Some("cy_d"));
+        // The handle itself, and handles that spell differently, don't clash.
+        for new in ["ana.k", "anak", "ana-kk", "b0", "bo-x"] {
+            assert_eq!(spelling_clash(new, existing), None, "{new}");
+        }
+        assert_eq!(spelling_clash("bo.", existing), Some("bo"));
     }
 
     #[test]

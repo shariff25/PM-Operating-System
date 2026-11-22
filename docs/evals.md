@@ -220,7 +220,9 @@ provider (`PMOS_TEST_MODEL_URL`) and more than two lanes or workers, the script 
 one call per lane or worker, whichever is more (and `max-in-flight` to that plus two), so the
 lanes run in parallel; watch the provider's rate limits (`429`s in `$STATE/usage.jsonl`).
 Its gateway config trusts the `runtime` and the one `worker` token all its workers share
-(they name the PM, `evals`), each allowed every slot, and lets the judges' `evals` token have
+(they name the PM, `evals`), each allowed every slot and all of one person's `per-user` slots
+(`per-user-share`, set explicitly: since the review at 6bb806f a client that may name anyone
+holds one of a person's slots by default), and lets the judges' `evals` token have
 two calls in flight. With four lanes that is four worker calls (one per lane) plus two judge
 calls, the six slots there are. The Claude test config (`config/gateway.claude-test.yaml`)
 keeps two calls per person, so more than two lanes wait for each other there.

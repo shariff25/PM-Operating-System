@@ -1024,7 +1024,7 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `503` | `assertion_required` | An admin's user or role change, a reviewer's recommendation, a team change (**Bots**), or any password sign-in route, while the tool server runs without signed user assertions (a development stack): it makes none. | Yes |
 | `403` | `host_only` | A user or role change only someone with host access may make: granting `admin`, an Admin's or Auditor's addresses or Microsoft link, or their password setup code (also when a code the web made is used by someone who holds Admin or Auditor now). | Yes |
 | `403` | `self_change` | An admin changing their own roles, status, addresses, links or reviewer assignments, or making a password setup code for themselves. | Yes |
-| `409` | `exists` | Inviting a handle that is already taken (handles are never reused). | Yes |
+| `409` | `exists` | Inviting a handle that is already taken (handles are never reused), or one spelled as another user's in a bot's name and by the model gateway (`ana_k` or `ana-k` beside `ana.k`; review at 6bb806f). | Yes |
 | `409` | `taken` | An address or account that belongs to another user. | Yes |
 | `409` | `unchanged` | A user or role change that changes nothing. | Yes |
 | `409` | `last_admin` | A change that would leave PM OS without an active admin. | Yes |

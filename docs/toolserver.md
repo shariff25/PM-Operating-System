@@ -1182,7 +1182,8 @@ Someone not in the user database asks in Slack; a platform owner (an active `adm
 user database) approves or rejects there (`src/onboarding.rs`, `docs/onboarding-spec.md`).
 Requests are stored in `member_requests`; at most one is pending per Slack id, and at most 20
 in all. The proposed handle comes from `propose_handle`, avoiding every handle in the user
-database (deactivated people's too: handles are never reused) and pending requests. A Slack
+database (deactivated people's too: handles are never reused), every such handle's spelled form
+(`ana-k` for `ana.k`, see below) and pending requests. A Slack
 id that belongs to a deactivated user is `409 deactivated` ("your access was turned off"),
 not a new request.
 
@@ -1335,6 +1336,16 @@ ids; one person per key, one key of each kind per person; Entra links carry
 `host_confirmed`), `role_changes` (the authoritative history), `pilot_exceptions` and
 `directory_version` (the directory's ETag for U2). Handles are never reused, users are never
 deleted, and addresses are unique across every user, active or not.
+
+**Handles that spell the same** (the Low on colliding handles, review at 6bb806f): a personal
+bot's name and the model gateway's per-person caps write a handle in its spelled form (`.` and
+`_` as `-`, a run of hyphens as one, no hyphen at either end: `spelled_handle` in
+`crates/contract/src/onboarding.rs`), so `ana.k`, `ana_k` and `ana-k` would share one bot name
+and one person's model slots. Creating a user whose handle is spelled as an existing user's
+(deactivated or not), or as one created earlier in the same write, is refused `exists`, from
+every client (`users.create` in the web app and on the host, `bootstrap-admin`, a Slack join's
+approval); `users import` reports such a member as a `conflict` and creates the rest. Users
+that already clash are left as they are (no migration), and share their caps at the gateway.
 
 **The database is the guarantee.** A deferred constraint trigger, `users_invariants()`, runs
 at commit for any change to `users`, `user_roles`, `user_identities` or `pilot_exceptions`.

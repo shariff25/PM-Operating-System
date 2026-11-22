@@ -52,6 +52,9 @@ limits:
 # not listed here is not trusted: its calls are keyed by its own name, run as `personal`, and
 # hold at most `per-user` (2) slots.
 clients:
+  # A client that may name any PM (runtime, bot-*) holds at most one of a PM's per-user (2)
+  # running slots (`per-user-share`, default 1 for such a client; review at 6bb806f, G3), so a
+  # PM's own bot always finds one. bot-pm-* (user: from-name) may hold both.
   # The bot runtime: it parses routines for the PM its caller verified.
   runtime: {trusted: true, max-in-flight: 2}
   # Each PM's own bot's worker (bot-pm-<handle>): it may name only the PM its name spells

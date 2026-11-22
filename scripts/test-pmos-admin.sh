@@ -111,8 +111,8 @@ printf 'evals_token=%s https_proxy=%s\n' "${PMOS_EVALS_TOKEN-unset}" "${HTTPS_PR
 [ "${FAKE_DOCKER_FAIL:-0}" != 1 ]
 EOF
 chmod +x "$WORK/bin/docker"
-# A stand-in `curl`: every /readyz and /healthz answers FAKE_READYZ with 200 (for `status`); the
-# runtime's task routes answer as for a finished task (for `smoke`). It records its arguments
+# A stand-in `curl`: every /readyz and /healthz answers FAKE_READYZ with 200 (for `status`), the
+# gateway's /readyz FAKE_GW_READYZ when the test gives one; the runtime's task routes answer as for a finished task (for `smoke`). It records its arguments
 # (CURL_LOG, one call per line), what it read with `--config -` (CURL_CONFIG_LOG) and a `-d`
 # body (CURL_BODY_LOG).
 cat >"$WORK/bin/curl" <<'EOF'
@@ -127,6 +127,7 @@ done
 if [ "$config" = 1 ]; then cat >>"${CURL_CONFIG_LOG:-/dev/null}"; fi
 [ -z "$body" ] || printf '%s\n' "$body" >>"${CURL_BODY_LOG:-/dev/null}"
 case "$*" in
+  *8740/readyz*) printf '%s\n200' "${FAKE_GW_READYZ:-${FAKE_READYZ:-{\}}}" ;;
   *readyz* | *healthz*) printf '%s\n200' "${FAKE_READYZ:-{\}}" ;;
   *"-X POST http://127.0.0.1:8750/v1/tasks "*) echo '{"id":"tsk_0abc12","status":"queued"}' ;;
   *8750/v1/tasks/*/events*) echo '[{"kind":"answer","text":"see the getting started page"}]' ;;
@@ -254,6 +255,18 @@ out=$(FAKE_PS=web FAKE_READYZ='{"checks":{},"ready":true,"untrusted_proxy_refusa
   fail "status doesn't show the web app's warning: $out"
 out=$(FAKE_PS=web FAKE_READYZ='{"checks":{},"ready":true,"warnings":[]}' run_stack status 2>&1)
 [[ "$out" != *"WARN"* ]] || fail "status warns with no warning: $out"
+# `status` reads the gateway's /readyz as it is now (labels only, keyed by role; G2 and G8b): the
+# stub and a gateway that isn't production-class each get one WARN line; a production one none.
+gw_up='{"class":"production","cloud_test":false,"ready":true,"running":0,"stub":false,"upstreams":{"default":{"status":"ok","upstream":"local"}},"waiting":0}'
+out=$(FAKE_GW_READYZ="$gw_up" run_stack status 2>&1)
+[[ "$out" != *"WARN"* ]] || fail "status warns about a production gateway: $out"
+[[ "$out" == *"gateway"*"ok"*'"class":"production"'* ]] || fail "status doesn't show the gateway ready: $out"
+out=$(FAKE_GW_READYZ='{"class":"test","ready":true,"running":0,"stub":true,"waiting":0}' run_stack status 2>&1)
+[[ "$out" == *"gateway"*"WARN"*"STUB model answers every call"* ]] || fail "status doesn't warn about the stub: $out"
+[[ "$out" != *"not a production-class gateway"* ]] || fail "status warns twice about the stub: $out"
+out=$(FAKE_GW_READYZ="${gw_up/production/test}" run_stack status 2>&1)
+[[ "$out" == *"gateway"*"WARN"*"not a production-class gateway"* ]] || fail "status doesn't warn about a test-class gateway: $out"
+[[ "$out" != *"STUB"* ]] || fail "status calls a test-class gateway the stub: $out"
 stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
   "PMOS_NETWORK_SUBNET=10.50.0.0/24" "PMOS_NETWORK_GATEWAY=10.50.0.1" \
   "PMOS_WEB_TRUSTED_PROXIES=10.50.0.1" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"

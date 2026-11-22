@@ -1060,6 +1060,19 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
         .unwrap();
     assert_eq!(ready["ready"], true);
     assert_eq!(ready["cloud_test"], true);
+    // Labels only, by role: never the remote provider's or the local server's address (the
+    // route needs no token; review at 6bb806f).
+    assert_eq!(
+        ready["upstreams"],
+        json!({"default": {"upstream": "remote-test", "status": "ok"},
+               "extraction": {"upstream": "local", "status": "ok"}})
+    );
+    for addr in [&remote, &local] {
+        let host = addr.trim_start_matches("http://");
+        let host = host.split('/').next().unwrap();
+        assert!(!ready.to_string().contains(host), "{ready}");
+    }
+    assert!(!ready.to_string().contains("127.0.0.1"), "{ready}");
     {
         let seen = seen_remote.seen.lock().unwrap();
         let (_, headers, _) = seen.iter().find(|s| s.0 == "models").unwrap();
@@ -1078,6 +1091,162 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
 
     stop_gw.cancel();
     stop_local.cancel();
+}
+
+/// `/readyz` needs no token, so anything that reaches the gateway's port can read it: its
+/// `200` and `503` bodies carry labels only (role names, upstream kinds, `ok`/`down`), never an
+/// upstream's base URL, host, port or path, the config's name for it, a model id or a key
+/// (G8b, after the review at 6bb806f; `docs/openshell-any-host-spec.md` §3.6). Every upstream
+/// kind is covered: a local model server, a remote test upstream with its key, and a Claude
+/// test upstream that doesn't answer.
+#[tokio::test]
+async fn readiness_names_no_upstream_host_url_model_or_key() {
+    const ANTHROPIC_KEY: &str = "anthropic-test-key-never-in-readyz-77";
+    let (local, _seen_local, stop_local) = start_recorder("/secret-local-path/v1").await;
+    let (remote, _seen_remote, stop_remote) = start_recorder("/secret-remote-path/openai").await;
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let claude = format!("http://127.0.0.1:{dead_port}/secret-claude-path");
+    let yaml = format!(
+        "upstreams: {{secret-remote-server: 'openai+{remote}', secret-local-server: '{local}', \
+                      secret-claude-server: 'anthropic+{claude}'}}\n\
+         roles:\n  default: {{upstream: secret-remote-server, model: secret-remote-model}}\n  \
+         extraction: {{upstream: secret-local-server, model: secret-local-model}}\n  \
+         reasoning: {{upstream: secret-claude-server, model: secret-claude-model}}\n"
+    );
+    let start = |yaml: String| async move {
+        serve(router(GatewayConfig {
+            models: Models::parse(&yaml, true).unwrap(),
+            clients: vec![Client {
+                name: "worker".into(),
+                token: TOKEN.into(),
+            }],
+            usage: Arc::new(UsageLog::new(None).unwrap()),
+            stub: false,
+            workarounds_on: true,
+            anthropic_key: ANTHROPIC_KEY.into(),
+            remote_key: REMOTE_KEY.into(),
+            retry: Default::default(),
+            timeouts: Default::default(),
+        }))
+        .await
+    };
+    // Nothing from the config but labels: each base URL, its host and port, its path, the
+    // config's names for the servers, the model ids, both keys and any URL at all.
+    let mut forbidden: Vec<String> = vec![
+        REMOTE_KEY.into(),
+        ANTHROPIC_KEY.into(),
+        TOKEN.into(),
+        "127.0.0.1".into(),
+        "localhost".into(),
+        "http".into(),
+        "://".into(),
+        "secret".into(),
+        "openai+".into(),
+        "anthropic+".into(),
+        dead_port.to_string(),
+    ];
+    for base in [&local, &remote, &claude] {
+        let url = reqwest::Url::parse(base).unwrap();
+        forbidden.push(base.to_string());
+        forbidden.push(url.port().unwrap().to_string());
+        forbidden.push(url.path().to_string());
+    }
+    let check = |body: &str| {
+        for f in &forbidden {
+            assert!(!body.contains(f.as_str()), "/readyz carries `{f}`: {body}");
+        }
+    };
+    let ready = |gw: String| async move {
+        let res = reqwest::get(format!("{gw}/readyz")).await.unwrap();
+        let status = res.status().as_u16();
+        let text = res.text().await.unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        (status, text, v)
+    };
+
+    // The Claude test upstream doesn't answer: 503, each role by its label.
+    let (gw, stop_gw) = start(yaml.clone()).await;
+    let (status, text, v) = ready(gw).await;
+    assert_eq!(status, 503, "{text}");
+    check(&text);
+    assert_eq!(
+        v["upstreams"],
+        json!({"default": {"upstream": "remote-test", "status": "ok"},
+               "extraction": {"upstream": "local", "status": "ok"},
+               "reasoning": {"upstream": "claude-test", "status": "down"}})
+    );
+    assert_eq!((&v["class"], &v["stub"]), (&json!("test"), &json!(false)));
+    assert_eq!(v["cloud_test"], true);
+    stop_gw.cancel();
+
+    // Without it, both upstreams answer: 200.
+    let two = yaml
+        .lines()
+        .filter(|l| !l.contains("reasoning:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (gw, stop_gw) = start(two).await;
+    let (status, text, v) = ready(gw.clone()).await;
+    assert_eq!(status, 200, "{text}");
+    check(&text);
+    assert_eq!(v["upstreams"]["default"]["status"], "ok");
+    // The remote one goes away: 503, and still nothing but labels.
+    stop_remote.cancel();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (status, text, v) = ready(gw).await;
+    assert_eq!(status, 503, "{text}");
+    check(&text);
+    assert_eq!(
+        v["upstreams"]["default"],
+        json!({"upstream": "remote-test", "status": "down"})
+    );
+    assert_eq!(v["upstreams"]["extraction"]["status"], "ok");
+    stop_gw.cancel();
+    stop_local.cancel();
+}
+
+/// The shipped production config (`deploy/gateway.yaml`, model servers at
+/// `<service>.pmos.internal`) with the stub on, as a first install runs it: `/readyz` names
+/// none of its hosts, server names or model ids.
+#[tokio::test]
+async fn readiness_of_the_shipped_config_names_none_of_its_hosts() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join("deploy/gateway.yaml")).unwrap();
+    let models = Models::from_yaml(&text).unwrap();
+    let (gw, stop_gw) = serve(router(GatewayConfig {
+        models,
+        clients: vec![Client {
+            name: "runtime".into(),
+            token: TOKEN.into(),
+        }],
+        usage: Arc::new(UsageLog::new(None).unwrap()),
+        stub: true,
+        workarounds_on: true,
+        anthropic_key: String::new(),
+        remote_key: String::new(),
+        retry: Default::default(),
+        timeouts: Default::default(),
+    }))
+    .await;
+    let res = reqwest::get(format!("{gw}/readyz")).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let body = res.text().await.unwrap();
+    for f in [
+        "pmos.internal",
+        "vllm",
+        "8000",
+        "http",
+        "qwen",
+        "nemotron",
+        TOKEN,
+    ] {
+        assert!(!body.contains(f), "/readyz carries `{f}`: {body}");
+    }
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((&v["class"], &v["stub"]), (&json!("test"), &json!(true)));
+    stop_gw.cancel();
 }
 
 /// The real binary: it won't start without the remote key, says at start-up that a remote

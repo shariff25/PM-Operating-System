@@ -715,6 +715,23 @@ impl<'a> Builder<'a> {
         self.writes.push(Write::UpdateUser(Box::new(user)));
     }
 
+    /// A user, existing or created earlier in this write, whose handle is spelled as `handle`
+    /// is ([`pmos_contract::onboarding::spelling_clash`]): `ana.k` for a new `ana_k`. The model
+    /// gateway keeps each person's calls under that spelling, and a personal bot is named by
+    /// it, so two such users would share both (the Low on colliding handles, review at
+    /// 6bb806f). Existing rows that already clash are left as they are.
+    pub(crate) fn spelling_clash(&self, handle: &str) -> Option<String> {
+        let pending = self.writes.iter().filter_map(|w| match w {
+            Write::InsertUser(u) => Some(u.handle.as_str()),
+            _ => None,
+        });
+        pmos_contract::onboarding::spelling_clash(
+            handle,
+            self.dir.users.keys().map(String::as_str).chain(pending),
+        )
+        .map(str::to_string)
+    }
+
     /// Create `user` with its roles and Slack key. `confirmed`: the sign-in name counts as
     /// confirmed (an admin or the host entered it, or a reviewed file did).
     pub(crate) fn create(
@@ -738,6 +755,17 @@ impl<'a> Builder<'a> {
                 format!(
                     "`{}` is already a user (handles are never reused)",
                     user.handle
+                ),
+            ));
+        }
+        if let Some(other) = self.spelling_clash(&user.handle) {
+            return Err(refused(
+                Refusal::Exists,
+                format!(
+                    "`{}` is spelled `{}` in a bot's name and by the model gateway, as `{other}` \
+                     already is: pick a handle that differs by more than `.`, `_` and `-`",
+                    user.handle,
+                    pmos_contract::onboarding::spelled_handle(&user.handle)
                 ),
             ));
         }

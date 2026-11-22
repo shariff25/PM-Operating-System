@@ -58,6 +58,9 @@ pub struct Owner {
     pub client: String,
     pub client_cap: usize,
     pub client_queue: usize,
+    /// The most of this person's running slots this client may hold (G3, review at
+    /// 6bb806f): `ClientPolicy::per_user_share`.
+    pub person_share: usize,
 }
 
 impl Owner {
@@ -69,7 +72,14 @@ impl Owner {
             client: client.to_string(),
             client_cap,
             client_queue: client_cap.saturating_mul(2),
+            person_share: usize::MAX,
         }
+    }
+
+    /// The same, with this client allowed at most `share` of the person's running slots.
+    pub fn with_person_share(mut self, share: usize) -> Self {
+        self.person_share = share;
+        self
     }
 
     /// The same, with `client_queue` requests of this client allowed to wait.
@@ -91,6 +101,8 @@ struct State {
     in_flight: usize,
     per_user: HashMap<String, usize>,
     per_client: HashMap<String, usize>,
+    /// Running calls by (client, person): each client's share of a person's slots (G3).
+    per_client_person: HashMap<(String, String), usize>,
     waiting: Vec<Waiter>,
     /// Started but not yet picked up by their caller.
     granted: HashSet<u64>,
@@ -138,7 +150,11 @@ impl Drop for Waiting {
     }
 }
 
-fn decrement(map: &mut HashMap<String, usize>, key: &str) {
+fn decrement<K, Q>(map: &mut HashMap<K, usize>, key: &Q)
+where
+    K: std::borrow::Borrow<Q> + std::hash::Hash + Eq,
+    Q: std::hash::Hash + Eq + ?Sized,
+{
     if let Some(n) = map.get_mut(key) {
         *n = n.saturating_sub(1);
         if *n == 0 {
@@ -234,13 +250,18 @@ impl Scheduler {
         st.in_flight = st.in_flight.saturating_sub(1);
         if let Some(p) = &owner.person {
             decrement(&mut st.per_user, p);
+            decrement(
+                &mut st.per_client_person,
+                &(owner.client.clone(), p.clone()),
+            );
         }
         decrement(&mut st.per_client, &owner.client);
         self.dispatch(&mut st);
     }
 
     /// Start waiters while there is room: the highest priority whose person and client are
-    /// both under their caps, oldest first.
+    /// both under their caps, and whose client is under its share of that person's slots
+    /// (G3), oldest first.
     fn dispatch(&self, st: &mut State) {
         while st.in_flight < self.limits.max_in_flight {
             let pick = st
@@ -250,6 +271,12 @@ impl Scheduler {
                 .filter(|(_, w)| {
                     let person_ok = w.owner.person.as_ref().is_none_or(|p| {
                         st.per_user.get(p).copied().unwrap_or(0) < self.limits.per_user
+                            && st
+                                .per_client_person
+                                .get(&(w.owner.client.clone(), p.clone()))
+                                .copied()
+                                .unwrap_or(0)
+                                < w.owner.person_share
                     });
                     let client_ok = st.per_client.get(&w.owner.client).copied().unwrap_or(0)
                         < w.owner.client_cap;
@@ -262,6 +289,9 @@ impl Scheduler {
             if w.tx.send(()).is_ok() {
                 st.in_flight += 1;
                 if let Some(p) = w.owner.person {
+                    *st.per_client_person
+                        .entry((w.owner.client.clone(), p.clone()))
+                        .or_default() += 1;
                     *st.per_user.entry(p).or_default() += 1;
                 }
                 *st.per_client.entry(w.owner.client).or_default() += 1;
@@ -540,6 +570,35 @@ mod tests {
         for w in waiters {
             assert_eq!(w.await.unwrap(), Ok(()));
         }
+        assert_eq!(s.snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_client_holds_at_most_its_share_of_a_persons_slots() {
+        // G3 (review at 6bb806f): Ana has two slots; `bot-docs` may hold one of them, however
+        // early its calls came, so her own bot's call starts while bot-docs' second waits.
+        let s = sched(4, 2, 16);
+        let docs = Owner::new(Some("ana"), "bot-docs", 8).with_person_share(1);
+        let d1 = s.acquire(&docs, Priority::Interactive).await.unwrap();
+        let (s2, o) = (s.clone(), docs.clone());
+        let d2 = tokio::spawn(async move { s2.acquire(&o, Priority::Interactive).await });
+        settle(&s, (1, 1)).await;
+        // Bo, through the same client, isn't held up by Ana's share.
+        let bo = s
+            .acquire(
+                &Owner::new(Some("bo"), "bot-docs", 8).with_person_share(1),
+                Priority::Interactive,
+            )
+            .await
+            .unwrap();
+        let own = Owner::new(Some("ana"), "bot-pm-ana", 8).with_person_share(2);
+        let o1 = s.acquire(&own, Priority::Personal).await.unwrap();
+        settle(&s, (3, 1)).await;
+        // Ana is at her two now: bot-docs' second waits for her, not for its share.
+        drop(d1);
+        let d2 = d2.await.unwrap().unwrap();
+        settle(&s, (3, 0)).await;
+        drop((d2, bo, o1));
         assert_eq!(s.snapshot(), (0, 0));
     }
 
