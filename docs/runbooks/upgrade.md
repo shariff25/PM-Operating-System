@@ -255,6 +255,11 @@ run, and no secret file is linked into it. So:
    sudo useradd --create-home --groups docker gh-runner
    sudo setfacl -m u:gh-runner:r /opt/pmos/deploy/.env
    ```
+   Read only, never write, and never `chmod` it wider: `pmos-admin` refuses to run while every
+   account can read `deploy/.env` or its group can write it. It warns (and goes on) when the
+   file is readable through an ACL or owned by another account, which is what the runner sees.
+   `pmos-admin` and `setup.sh` keep the ACL when they rewrite the file (with `getfacl` and
+   `setfacl` from the `acl` package; without them they say to run the `setfacl` line again).
    If PM OS isn't in `/opt/pmos`, set `PMOS_SPARK_DIR=<that path>` in the runner's `.env`
    file (in its install directory) after step 3; the workflow runs that copy's
    `deploy/pmos-admin`, which reads its own `deploy/.env`.
@@ -268,7 +273,11 @@ run, and no secret file is linked into it. So:
      --name spark-1 --labels pmos-spark --unattended
    exit
    ```
-   GitHub adds `self-hosted`, `Linux` and `ARM64` itself.
+   GitHub adds `self-hosted`, `Linux` and `ARM64` itself. The registration token is on
+   `config.sh`'s command line, the only way GitHub's runner instructions give it, so any
+   account on the Spark can read it while `config.sh` runs: it is good for one registration
+   and expires within the hour, but run this when no one else is logged in, and remove the
+   runner on GitHub if you think it leaked. The same holds for the removal token below.
 4. **Run it as a service,** so it survives reboots:
    ```sh
    cd ~gh-runner/actions-runner

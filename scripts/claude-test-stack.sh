@@ -380,12 +380,27 @@ if [ "${PMOS_TEST_PASSWORD_LOGIN:-}" = 1 ]; then
 fi
 
 PIDS=() NAMES=() LAST_PID=""
-start() { # name, then the command; logs go to $STATE/logs/<name>.log
-  # The command runs in an empty environment but the allow-list (SERVICE_ENV, above): its own
-  # settings come on its command line (`env NAME=value ...`).
+# Run a command with only the given settings in its environment: NAME=value arguments, then the
+# command. The settings are exported by this shell (a builtin), never passed to `env` on a
+# command line, where every account on this machine could read the tokens among them in
+# /proc/<pid>/cmdline until `env` replaced itself (the security review of 6bb806f, S1). Run it
+# in a subshell: it clears that shell's environment, then execs the command.
+exec_with_only() {
+  local v
+  for v in $(compgen -e); do unset "$v" 2>/dev/null || true; done
+  while [ $# -gt 0 ] && [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do
+    export "$1"
+    shift
+  done
+  exec "$@"
+}
+start() { # name, then `env NAME=value ... command`; logs go to $STATE/logs/<name>.log
+  # The command runs in an empty environment but the allow-list (SERVICE_ENV, above) and its
+  # own settings (the NAME=value words after `env`), which exec_with_only exports.
   local name=$1
   shift
-  env -i "${SERVICE_ENV[@]}" "$@" >"$STATE/logs/$name.log" 2>&1 &
+  [ "${1:-}" != env ] || shift
+  (exec_with_only "${SERVICE_ENV[@]}" "$@") >"$STATE/logs/$name.log" 2>&1 &
   LAST_PID=$!
   PIDS+=("$LAST_PID")
   NAMES+=("$name")
