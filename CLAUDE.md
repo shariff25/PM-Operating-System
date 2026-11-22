@@ -17,9 +17,12 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   Built 2026-11-18 (slices U1 to U7): every service decides from the database and `team.yaml`
   is retired. Security gate passed on 2026-11-21 at `04c175f` (no open High or Critical for the
   user database and password sign-in; Medium findings G1 to G5 were fixed afterwards).
-  Gate passed again on 2026-11-22 at `11a5768`, from reading the code (no open High or Critical
-  for the user database, password sign-in, the bot marketplace and the first eval run; Medium
-  findings N1 to N5 are being fixed).
+  Gate passed again on 2026-11-22 at `11a5768`, `2efb73f`, `2544d01` and `6bb806f`, each time
+  from reading the code (no open High or Critical). The Medium findings of each round (N1 to N5,
+  R1 to R3, F1 to F4, G1 to G3, S1 and S2) were fixed and pushed; the reviewer has not yet read
+  the last two batches (the admin-script fixes at `0e1f4b8` and the gateway fixes at `c78b5fb`).
+  Still open by the reviewer's own account: eval reports are unsigned, and the CODEOWNERS file
+  and branch protection that protect them wait on the owner.
 - **c. Policy Admin** for NVIDIA OpenShell. The app opens a pull request; the merge happens in
   GitHub.
   Owner, 2026-11-18, plan only (build nothing until the plan is approved): add OpenShell's
@@ -122,9 +125,29 @@ follow-up tracking.
 - **Report honestly:** say what was verified and what was not. Nothing counts as measured
   against a model until an eval run has happened.
 
+## Where the build stood when work stopped on 2026-11-22
+
+- Pushed and checked: `claude/web-app` (draft pull request #10). Nothing is unmerged on a side
+  branch and no agent is running.
+- Next, in order: (1) the reviewer's answers on the batches at `0e1f4b8` and `c78b5fb` and on
+  the revised any-host spec (`docs/openshell-any-host-spec.md`, "Change of direction,
+  2026-11-22"); act on them. (2) Only after the reviewer has read that revision, build its
+  slices in its order: H2, then H1, H3 and H4, then H9, H10 and H12, H7, H6. H0 and H0b are
+  built. Nothing in the spec has run on real OpenShell on any host.
+- The eval re-run is scheduled for Tuesday 2026-11-24 at 10:00 am Pacific (a scheduled task in
+  the conductor session): isolated attempts, the owner's hosted model, fake data, 4 lanes; start
+  the test stack once with no model calls first, because its scripts changed after the last
+  real run. The model key is a network secret for the provider's host; the variable holds the
+  placeholder `proxy-injected`.
+- The checks need Postgres running (`pg_ctlcluster 16 main start`); a restarted container has
+  it stopped, and the database tests then fail with "connection refused".
+
 ## Waiting on the owner
 
-An Entra app registration, with `acct` as an optional claim; human labels for the eval judges
+For real data on a hosted model (`docs/openshell-any-host-spec.md` §3.9 and slice H13): the
+owner's recorded approval of the provider and confirmation of its data-processing and retention
+terms; the first host (an Ubuntu 24.04 x86 virtual machine); an Entra app registration, with
+`acct` as an optional claim; human labels for the eval judges
 (`evals/judges/LABELLING.md`); pilot PM names; edits to the nudge wording; a GitHub App
 with pull-request permission and branch protection on the content branch; approval of the three
 plans (MCP servers and which ones for the pilot, the OpenShell prover, sandbox decisions in the
