@@ -2,6 +2,10 @@
 # The routine prompt over all the fixture mentions: drafts for the three threads that need an
 # answer, none for the answered thread, the FYI or the bot reminder, and one (not two) for the
 # thread with two mentions.
+# The original #field-questions thread (C0FIELD 1731500000.000100) is in the search results too,
+# but it mentions nobody, so it is not an ask of the PM (the slack-reply skill, step 1, and
+# docs/slack-reply-spec.md §2: candidates mention the PM or are DMs): no draft there. E1's
+# isolated run drafted a fourth reply to it in all three attempts (see docs/evals.md, E2 notes).
 id: triage-drafts-only-what-needs-an-answer
 ask: "[reply-assistant] Check Slack for messages since the last run that ask me something or need my answer, and draft a reply to each with the slack-reply skill. Skip anything I already answered."
 expect:

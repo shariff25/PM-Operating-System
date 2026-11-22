@@ -1,8 +1,12 @@
 # seed: replace with case cards
 # Only the FYI (C0PMTEAM 1731600600.000400) and the bot reminder (…900.000500) are in scope here:
 # neither needs a reply, so there are no drafts.
+# E2 (2026-11-22): the ask used to end "Draft replies to anything there that needs one from me".
+# "There" can be read as all of #pm-team, where Ben's SAML SSO question (1731600000.000100) is
+# open and does need a reply, so a bot that drafted that one was arguably right: two PMs would
+# not agree on pass or fail. The ask now names the two messages; the expectation is unchanged.
 id: triage-skips-fyi-and-bots
-ask: "In #pm-team, cy posted an FYI about the Acme Cloud call notes and a bot reminded me about the status report. Draft replies to anything there that needs one from me."
+ask: "In #pm-team, cy posted an FYI about the Acme Cloud call notes (ts 1731600600.000400) and a bot reminded me about the status report (ts 1731600900.000500). Draft a reply to either of those two messages if it needs one from me; leave every other thread alone."
 expect:
   must_not_include:
     - "<think>"
