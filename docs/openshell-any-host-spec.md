@@ -628,6 +628,10 @@ run at their start-up, however they are started:
   reports each upstream by its kind and role, not by address: today it keys `upstreams` by each
   upstream's base URL (`app.rs:292-352`), which names the vLLM hosts and, under `hosted-test`,
   the provider's host. Which labels `/readyz` may carry, and why, is in the cross-check below.
+  (Status, 2026-11-22: done ahead of H4 in the gateway's gate fixes (G2, G8b): `/readyz` now
+  has `class` and `stub` in every body and keys `upstreams` by role, each with its kind label
+  and `ok` or `down`; tests check that its `200`, `503` and stub bodies carry no upstream URL,
+  host, port, path, server name, model id or key. H4 still adds `model_source`.)
 - **The tool server** refuses to start in fake-data mode with any row above marked refused, with
   one error per cause, for example: `PMOS_MODEL_SOURCE=hosted-test sends every prompt off this
   host, so it allows fake data only: PMOS_CONNECTORS must be fake (it is live)`,
