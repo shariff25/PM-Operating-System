@@ -230,15 +230,43 @@ recreated once.
 
 ## Creating a bot's sandbox
 
-The launcher reads `policies/bots/<bot>.sandbox.yaml` and runs, for the Docs bot:
+The launcher (`deploy/pmos-admin sandbox <bot>`) checks the bot name first (PM OS's
+`valid_name`: lowercase letters, digits and single hyphens, at most 32 characters), reads
+`policies/bots/<bot>.sandbox.yaml` and runs, for the Docs bot (`sandbox docs --dry-run` prints
+it, without the tokens):
 
 ```sh
-openshell sandbox create --name pmos-docs --policy policies/bots/docs.yaml \
+openshell sandbox create --name pmos-docs --from pmos-worker:local --policy policies/bots/docs.yaml \
   --provider pmos-docs-gateway --provider pmos-docs-worker \
   --upload content/master/AGENTS.md:/sandbox/master/AGENTS.md \
   --upload content/skills/docs:/sandbox/skills/docs
-openshell sandbox exec -n pmos-docs --workdir /sandbox/workspace -- /usr/local/bin/node <worker>
+systemctl --user enable --now pmos-worker@docs.service
 ```
+
+The worker is the systemd user unit `deploy/systemd/pmos-worker@.service`, installed for the user
+whose OpenShell gateway runs. Its `ExecStart` is
+`openshell sandbox exec -n pmos-%I --workdir /sandbox/workspace -- env … /usr/local/bin/node
+/opt/pmos/harness/dist/main.js`, with `Restart=on-failure` and a start limit of five tries in ten
+minutes. The instance name is made with `systemd-escape` (`pm-ana` → `pm\x2dana`) and the unit
+reads it back with `%I`. It holds no token: the two credentials are the sandbox's providers.
+`pmos-admin sandbox` and `resume` refuse to start it unless lingering is on
+(`loginctl show-user <user> -p Linger` is `yes`), since without it the user's services stop at
+logout and don't start at boot. `pause` disables and stops the unit, then stops the sandbox.
+
+The worker image (`deploy/Dockerfile.worker`) has a `sandbox` account (uid and gid 10100) and
+ends with `USER 10100:10100`, so the policy's `run_as_user: sandbox` names an account that exists
+and the image declares the numeric identity OpenShell's docs ask for.
+
+What each part rests on (slice H0, `docs/openshell-any-host-spec.md` §3.7):
+
+| Part | From OpenShell's docs | Verify on a real host |
+| --- | --- | --- |
+| `--from pmos-worker:<version>` (it was `--image`, which isn't documented) | `--from` takes "an explicit OCI image reference", built and tagged "with the container engine used by your local gateway" (`sandboxes/overview.mdx`) | that the local tag is taken without a registry |
+| A numeric `USER` and a `sandbox` account | a Docker target "must declare an explicit numeric `USER UID:GID`"; "symbolic or implicit identities are rejected" (said for sandbox updates) | whether OpenShell runs the workload as the image's `USER`, as `run_as_user`, or makes the account itself (RT-3) |
+| The worker under systemd, not `&` | `sandbox exec -n … --workdir …` runs a command in a running sandbox; the docs call it "one-shot" | that `sandbox exec` stays in the foreground for the worker's life, and that stopping it stops the worker inside |
+| `After=`/`Wants=openshell-gateway.service`; lingering | the Linux package runs the gateway as the user service `openshell-gateway`; `sudo loginctl enable-linger $USER` keeps it after logout (`about/installation.mdx`) | the unit's name on the installed version; that the gateway and every worker come back after a reboot (E-5) |
+
+None of these has run on a real OpenShell. If one differs, slice H5 changes it.
 
 - `--upload` can't be combined with a trailing command yet, so the worker starts with
   `sandbox exec` (confirmed).
@@ -344,6 +372,9 @@ be checked without a live OpenShell. Each one is also marked in the code comment
 | Runtime path globs | `/v1/worker/tasks/*/heartbeat` matches a real task id (`tsk_<hex>`), and nothing with more segments | RT-9, E-1 |
 | Node's `fetch` | goes through the sandbox proxy with no proxy settings | RT-8, RT-9 |
 | CLI command names | `openshell provider profile import`, `policy set --wait`, `logs --source sandbox`, `settings get` | P-3, RT-2 |
+| Creating from the local image | `sandbox create --from pmos-worker:<version>` takes a local tag | O-CANARY (`docs/openshell-any-host-spec.md` §3.2) |
+| The workload's identity | OpenShell runs the worker as `sandbox` (uid 10100, the image's numeric `USER`) | RT-3, O-CANARY |
+| The worker unit | `sandbox exec` stays in the foreground while the worker runs; OpenShell's gateway unit is `openshell-gateway.service`; the workers come back after a reboot | E-5 |
 | Landlock ABI | kernel 6.2 or later on DGX OS | P-1 |
 
 ## Decisions on the first version's gaps (2026-11-14)
