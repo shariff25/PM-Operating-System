@@ -135,10 +135,26 @@ the bot, or an admin's invite in the web app.
 
 The bring-up worker isn't isolated. Replace it with the Docs bot's real sandbox.
 
-1. **Let sandboxes find the services.** Add this line to `/etc/hosts` on the Spark:
+> **Stop here until slice H2 is built.** Sandboxes can't reach the three services yet, on the
+> Spark or any other host. This step used to map `toolserver.pmos.internal`,
+> `gateway.pmos.internal` and `bots.pmos.internal` to `127.0.0.1` in `/etc/hosts`, which can't
+> work: OpenShell's network rules never allow a loopback destination, and inside a sandbox
+> `127.0.0.1` is the sandbox itself. The services publish their ports on `127.0.0.1` only, so no
+> other address on the host serves them today. Slice H2 pins each service to its own address on
+> the `pmos` network and writes the names with `pmos-admin host-names apply`
+> (`docs/openshell-any-host-spec.md`, §3.3). Don't add a hosts line by hand. If you have the old
+> `127.0.0.1` line, remove it. Until H2, keep using the bring-up worker (Stage 2) with fake data
+> only. Steps 2 to 5 below are written for when H2 is in.
+
+1. **Turn on lingering** for the user OpenShell runs as (once). OpenShell's gateway and each
+   bot's worker are that user's systemd services, and without lingering they stop when you log
+   out and don't start after a reboot. Run it as that user (not root):
+   ```sh
+   sudo loginctl enable-linger "$USER"
+   loginctl show-user "$USER" -p Linger    # Linger=yes
    ```
-   127.0.0.1 toolserver.pmos.internal gateway.pmos.internal bots.pmos.internal
-   ```
+   `deploy/pmos-admin sandbox` and `resume` refuse to start a worker until this says `yes`.
+   Run every `pmos-admin sandbox`, `pause` and `resume` as this same user, never with `sudo`.
 2. **Load the provider profiles** (once). Each command is from `docs/sandbox-policies.md`:
    ```sh
    openshell provider profile import -f /srv/pmos/content-repo/policies/providers/pmos-gateway.yaml --global
@@ -147,9 +163,20 @@ The bring-up worker isn't isolated. Replace it with the Docs bot's real sandbox.
 3. **Start the Docs bot's sandbox, without the bring-up worker:**
    ```sh
    deploy/pmos-admin down && deploy/pmos-admin up --models
+   deploy/pmos-admin sandbox docs --dry-run    # what it will run; no tokens are printed
    deploy/pmos-admin sandbox docs
+   systemctl --user status 'pmos-worker@docs.service'
    deploy/pmos-admin smoke <your handle>
    ```
+   `sandbox` creates the sandbox from the worker image (`openshell sandbox create --from
+   pmos-worker:<version>`), then starts the bot's worker as the systemd user unit
+   `pmos-worker@<bot>.service` (from `deploy/systemd/pmos-worker@.service`), which restarts it
+   if it fails and starts it again after a reboot. A name with a hyphen is escaped in the unit's
+   name: `pm-ana`'s unit is `pmos-worker@pm\x2dana.service` (`systemd-escape -- pm-ana` prints
+   it); quote it in the shell. Its log: `journalctl --user -u 'pmos-worker@docs.service'`.
+   Not yet seen on a real OpenShell: whether `--from` takes the local image tag, and whether
+   `sandbox exec` stays in the foreground for as long as the worker runs. Note in the record what
+   you saw (`docs/openshell-any-host-spec.md` §6, step 2).
 4. **Create each platform owner's personal bot sandbox:**
    ```sh
    deploy/pmos-admin add-bot pm-<handle>

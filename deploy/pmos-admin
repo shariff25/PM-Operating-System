@@ -22,9 +22,11 @@
 #   pmos-admin ledger [--since 7d] [--export]
 #                                     what happened to the bots' drafts (feedback ledger)
 #   pmos-admin add-bot <bot>          give a new bot its own runtime and gateway tokens
-#   pmos-admin sandbox <bot>          create the bot's OpenShell sandbox and start its worker
+#   pmos-admin sandbox <bot> [--dry-run]
+#                                     create the bot's OpenShell sandbox and start its worker as
+#                                     a systemd user unit (--dry-run: print what it would run)
 #   pmos-admin pause <bot> / resume <bot>
-#                                     stop or restart a bot's sandbox
+#                                     stop or restart a bot's sandbox and its worker unit
 #   pmos-admin lint                   pmos lint and pmos policy check on the content checkout
 #   pmos-admin pmos <args>            the pmos CLI on the checkout, e.g. `pmos bot add-personal …`
 #                                     (paths are relative to the checkout: --root content)
@@ -44,13 +46,46 @@ DEPLOY="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DEPLOY/.." && pwd)"
 ENV="$DEPLOY/.env"
 [ -f "$ENV" ] || { echo "no deploy/.env yet: run deploy/setup.sh first" >&2; exit 1; }
-set -a
-# shellcheck disable=SC1090
-. "$ENV"
-set +a
 
 compose() { docker compose --project-directory "$DEPLOY" -f "$DEPLOY/compose.yaml" --env-file "$ENV" "$@"; }
 say() { printf '%s\n' "$*"; }
+
+# deploy/.env is read as data, never run as shell (slice H0; docs/openshell-any-host-spec.md,
+# surprise 12). It used to be sourced (`set -a; . deploy/.env`), so a value holding `$(…)`, a
+# backtick or a newline ran as the operator. Each line is `KEY=VALUE` (or `export KEY=VALUE`), a
+# comment or blank. The value is taken literally: one pair of surrounding quotes is removed, and
+# an unquoted value ends at ` #`, as Docker Compose reads the same file. Nothing is expanded, so a
+# value is written out in full (`k2:<base64>`, never `k2:$(openssl …)`). Only the settings this
+# script reads are exported (PMOS_*, HF_TOKEN and the proxy settings); Compose reads the whole
+# file itself through --env-file. Any other kind of line stops the script.
+load_env() {
+  local line key value n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=${line%$'\r'}
+    [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      key=${BASH_REMATCH[2]}
+      value=${BASH_REMATCH[3]}
+    else
+      say "deploy/.env line $n isn't KEY=VALUE, a comment or blank: fix it (nothing in it is run as shell)" >&2
+      exit 2
+    fi
+    case "$key" in
+      PMOS_* | HF_TOKEN | HTTPS_PROXY | HTTP_PROXY | NO_PROXY | https_proxy | http_proxy | no_proxy) ;;
+      *) continue ;;
+    esac
+    if [[ "$value" =~ ^\"([^\"]*)\"([[:space:]]+#.*)?[[:space:]]*$ ||
+      "$value" =~ ^\'([^\']*)\'([[:space:]]+#.*)?[[:space:]]*$ ]]; then
+      value=${BASH_REMATCH[1]}
+    else
+      value=${value%%[[:space:]]#*}
+      value=${value%"${value##*[![:space:]]}"}
+    fi
+    export "$key=$value"
+  done <"$ENV"
+}
+load_env
 row() { printf '  %-12s %-6s %s\n' "$1" "$2" "$3"; }
 
 # The console's sign-in settings. The console checks them too; this says so before anything
@@ -346,9 +381,22 @@ eval_stack_down() {
 }
 evals_runner() { evals_compose --profile runner run --rm -T runner "$@"; }
 
-# Replace or append KEY=VALUE in deploy/.env.
+# Does $1 consist only of the characters listed one by one in $2 (no ranges, so no locale can
+# widen them)? An empty $1 does.
+only_chars() { case "$1" in *[!$2]*) return 1 ;; esac; }
+ENV_KEY_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_
+# What pmos-admin may write as a value into deploy/.env (tokens, `key=token` lists): nothing a
+# shell or Compose gives a meaning to (no `$`, quote, backslash, space, `#`, `~` or newline).
+ENV_VALUE_CHARS='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.,:=/+-'
+
+# Replace or append KEY=VALUE in deploy/.env. A key or value with any other character is
+# refused (exit 2) before the file is touched.
 set_env() {
   local tmp
+  if [ -z "$1" ] || ! only_chars "$1" "$ENV_KEY_CHARS" || ! only_chars "$2" "$ENV_VALUE_CHARS"; then
+    say "refusing to write $(printf '%q' "$1") to deploy/.env: only plain characters may go there" >&2
+    exit 2
+  fi
   tmp=$(mktemp)
   if grep -qE "^$1=" "$ENV"; then
     awk -v k="$1" -v v="$2" -F= 'BEGIN{OFS="="} $1==k{print k, v; next} {print}' "$ENV" >"$tmp"
@@ -358,6 +406,87 @@ set_env() {
   fi
   cat "$tmp" >"$ENV"
   rm -f "$tmp"
+}
+
+# --- Bots: names, tokens, sandboxes and their workers ---------------------------------------
+# docs/openshell-any-host-spec.md §3.7 (slice H0).
+
+# PM OS's own rule for a bot name, the same as `valid_name` in crates/contract/src/bots.rs:
+# lowercase ASCII letters, digits and single hyphens, not starting or ending with one, 1 to 32
+# characters. The letters are listed one by one, so no locale widens them. `add-bot`, `sandbox`,
+# `pause` and `resume` check it before the name reaches deploy/.env, a path, a lookup, an
+# OpenShell argument or a systemd unit name.
+BOT_NAME_CHARS=abcdefghijklmnopqrstuvwxyz0123456789-
+valid_bot_name() {
+  [ -n "$1" ] && [ ${#1} -le 32 ] && only_chars "$1" "$BOT_NAME_CHARS" || return 1
+  case "$1" in -* | *- | *--*) return 1 ;; esac
+}
+require_bot_name() { # command name
+  valid_bot_name "$2" && return 0
+  say "pmos-admin $1: $(printf '%q' "$2") isn't a bot name (lowercase letters, digits and single hyphens, at most 32 characters)" >&2
+  exit 2
+}
+
+# The value for KEY in a `key=value,key=value` list (PMOS_RT_WORKER_TOKENS, PMOS_GW_BOT_TOKENS),
+# by an exact match of the whole key: the key is never a pattern.
+list_value() { # list key
+  tr ',' '\n' <<<"$1" | LIST_KEY=$2 awk -F= '$1 == ENVIRON["LIST_KEY"] { print substr($0, length($1) + 2); exit }'
+}
+
+# The worker unit (deploy/systemd/pmos-worker@.service), installed as a user unit of the user
+# whose OpenShell gateway runs (OpenShell's gateway is a systemd user service:
+# about/installation.mdx in OpenShell's docs).
+WORKER_UNIT_TEMPLATE="$DEPLOY/systemd/pmos-worker@.service"
+user_unit_dir() { printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; }
+# The instance's unit name: systemd-escape turns `pm-ana` into `pm\x2dana`; the unit reads the
+# name back with %I.
+worker_unit() { # bot
+  local escaped
+  escaped=$(systemd-escape -- "$1")
+  printf 'pmos-worker@%s.service\n' "$escaped"
+}
+# Only the path of `openshell` on the template's ExecStart line is replaced, with the absolute
+# path on this PATH; a path with any character outside a plain set (a `%` would be a systemd
+# specifier, a space would split the command) is refused.
+PATH_CHARS='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./+-'
+install_worker_unit() {
+  local openshell dir
+  openshell=$(command -v openshell)
+  case "$openshell" in /*) ;; *) say "openshell isn't an absolute path on PATH ($openshell)" >&2; exit 1 ;; esac
+  if ! only_chars "$openshell" "$PATH_CHARS"; then
+    say "the path of openshell, $(printf '%q' "$openshell"), has characters a unit file can't hold" >&2
+    exit 1
+  fi
+  dir=$(user_unit_dir)
+  mkdir -p "$dir"
+  OPENSHELL_PATH=$openshell awk '
+    index($0, "ExecStart=/usr/bin/openshell ") == 1 { print "ExecStart=" ENVIRON["OPENSHELL_PATH"] substr($0, length("ExecStart=/usr/bin/openshell") + 1); next }
+    { print }
+  ' "$WORKER_UNIT_TEMPLATE" >"$dir/.pmos-worker@.service.new"
+  mv "$dir/.pmos-worker@.service.new" "$dir/pmos-worker@.service"
+}
+# What a worker unit needs before it is installed or started: a user's systemd (not root's) and
+# lingering, without which the user's services, OpenShell's gateway included, stop at logout and
+# don't start at boot (bot decision D2: "After a reboot, in-flight tasks resume"). The check is
+# from OpenShell's and systemd's docs (`loginctl enable-linger`); that it is enough to bring the
+# gateway and every worker back after a reboot is check E-5 on a real host.
+worker_unit_checks() {
+  local me linger
+  if [ "$(id -u)" = 0 ]; then
+    say "run this as the user whose OpenShell gateway runs, not as root: the worker is that user's systemd unit" >&2
+    exit 1
+  fi
+  for t in systemctl systemd-escape loginctl; do
+    command -v "$t" >/dev/null || { say "$t is not installed: the worker runs as a systemd user unit" >&2; exit 1; }
+  done
+  me=$(id -un)
+  linger=$(loginctl show-user "$me" -p Linger --value 2>/dev/null || true)
+  if [ "$linger" != yes ]; then
+    say "lingering is off for $me: OpenShell's gateway and the bots' workers would stop at logout and" >&2
+    say "not start after a reboot. Turn it on once, then run this again:" >&2
+    say "  sudo loginctl enable-linger $me" >&2
+    exit 1
+  fi
 }
 
 cmd=${1:-help}
@@ -608,11 +737,14 @@ for g in s["groups"]:
   add-bot)
     [ $# -eq 1 ] || { say "usage: pmos-admin add-bot <bot>" >&2; exit 2; }
     bot=$1
+    # Checked before anything: the name goes into deploy/.env (`worker-<bot>=<token>`), where a
+    # comma or `=` would add or override another bot's token.
+    require_bot_name add-bot "$bot"
     if [ "$bot" = docs ]; then
       say "the Docs bot's tokens are built in (PMOS_RT_DOCS_WORKER_TOKEN)"
       exit 0
     fi
-    if [[ ",${PMOS_RT_WORKER_TOKENS:-}," == *",worker-$bot="* ]]; then
+    if [ -n "$(list_value "${PMOS_RT_WORKER_TOKENS:-}" "worker-$bot")" ]; then
       say "$bot already has tokens"
       exit 0
     fi
@@ -624,22 +756,39 @@ for g in s["groups"]:
     set_env PMOS_RT_WORKER_TOKENS "${PMOS_RT_WORKER_TOKENS:+$PMOS_RT_WORKER_TOKENS,}worker-$bot=$rt"
     set_env PMOS_GW_BOT_TOKENS "${PMOS_GW_BOT_TOKENS:+$PMOS_GW_BOT_TOKENS,}bot-$bot=$gw"
     # Read deploy/.env again: compose prefers this process's environment over --env-file, so
-    # the values sourced at the top would hide the new tokens.
-    set -a
-    # shellcheck disable=SC1090
-    . "$ENV"
-    set +a
+    # the values read at the top would hide the new tokens.
+    load_env
     compose up -d bots gateway
     say "tokens added for $bot; the runtime and gateway were restarted with them."
     say "next: deploy/pmos-admin sandbox $bot"
     ;;
 
   sandbox)
-    # Verify on the Spark: the OpenShell command names and flags (`--image`, keeping the worker
-    # running after `sandbox exec`), as listed in docs/sandbox-policies.md.
-    [ $# -eq 1 ] || { say "usage: pmos-admin sandbox <bot>" >&2; exit 2; }
-    bot=$1
-    command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
+    # What each step rests on (slice H0; docs/openshell-any-host-spec.md §3.7). Nothing here
+    # has run on a real OpenShell yet; the acceptance run (§6) checks each "verify" below.
+    # - `sandbox create --from <image>`: OpenShell's sandbox page documents `--from` with "an
+    #   explicit OCI image reference" built and tagged "with the container engine used by your
+    #   local gateway" (the earlier `--image` isn't documented). Verify on a real host: that it
+    #   takes the local tag pmos-worker:<version> without a registry.
+    # - The worker runs as the systemd user unit deploy/systemd/pmos-worker@.service (no more
+    #   `&` from the operator's shell, which died at logout and never came back after a reboot).
+    #   Verify on a real host: that `sandbox exec` stays in the foreground for the worker's life,
+    #   and the name of OpenShell's gateway unit (see the unit file).
+    # - `provider create`, `--policy`, `--provider` and `--upload`: as in docs/sandbox-policies.md.
+    sandbox_usage() { say "usage: pmos-admin sandbox <bot> [--dry-run]" >&2; exit 2; }
+    dry=0
+    names=()
+    for a in "$@"; do
+      case "$a" in
+        --dry-run) dry=1 ;;
+        -*) sandbox_usage ;;
+        *) names+=("$a") ;;
+      esac
+    done
+    [ ${#names[@]} -eq 1 ] || sandbox_usage
+    bot=${names[0]}
+    require_bot_name sandbox "$bot"
+    [ "$dry" = 1 ] || command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
     spec="$PMOS_CONTENT_CHECKOUT/policies/bots/$bot.sandbox.yaml"
     policy="$PMOS_CONTENT_CHECKOUT/policies/bots/$bot.yaml"
     [ -f "$spec" ] && [ -f "$policy" ] || { say "no generated policy for $bot in the content checkout; run pmos policy generate and merge it" >&2; exit 1; }
@@ -647,38 +796,70 @@ for g in s["groups"]:
       rt=$PMOS_RT_DOCS_WORKER_TOKEN
       gw=$PMOS_GW_DOCS_BOT_TOKEN
     else
-      rt=$(tr ',' '\n' <<<"${PMOS_RT_WORKER_TOKENS:-}" | sed -n "s/^worker-$bot=//p")
-      gw=$(tr ',' '\n' <<<"${PMOS_GW_BOT_TOKENS:-}" | sed -n "s/^bot-$bot=//p")
+      rt=$(list_value "${PMOS_RT_WORKER_TOKENS:-}" "worker-$bot")
+      gw=$(list_value "${PMOS_GW_BOT_TOKENS:-}" "bot-$bot")
       [ -n "$rt" ] && [ -n "$gw" ] || { say "run deploy/pmos-admin add-bot $bot first" >&2; exit 1; }
     fi
+    [ "$dry" = 1 ] || worker_unit_checks
     sandbox="pmos-$bot"
+    unit=$(worker_unit "$bot")
     # Uploads come from the generated spec: `from` is relative to the content root.
     uploads=()
     while read -r from to; do
       uploads+=(--upload "$PMOS_CONTENT_CHECKOUT/content/$from:$to")
     done < <(awk '/^  - from: /{f=$3} /^    to: /{print f, $2}' "$spec")
+    create=(sandbox create --name "$sandbox" --from "pmos-worker:${PMOS_VERSION:-local}" --policy "$policy"
+      --provider "$sandbox-gateway" --provider "$sandbox-worker" "${uploads[@]}")
+    if [ "$dry" = 1 ]; then
+      # What would run; the tokens are never printed.
+      say "openshell provider create --name $sandbox-gateway --type pmos-gateway --credential PMOS_GATEWAY_TOKEN  (the token from deploy/.env)"
+      say "openshell provider create --name $sandbox-worker --type pmos-worker --credential PMOS_WORKER_TOKEN  (the token from deploy/.env)"
+      say "openshell ${create[*]}"
+      say "install $WORKER_UNIT_TEMPLATE as $(user_unit_dir)/pmos-worker@.service"
+      say "systemctl --user daemon-reload"
+      say "systemctl --user enable --now $unit"
+      exit 0
+    fi
     PMOS_GATEWAY_TOKEN=$gw openshell provider create --name "$sandbox-gateway" --type pmos-gateway --credential PMOS_GATEWAY_TOKEN
     PMOS_WORKER_TOKEN=$rt openshell provider create --name "$sandbox-worker" --type pmos-worker --credential PMOS_WORKER_TOKEN
-    openshell sandbox create --name "$sandbox" --image "pmos-worker:${PMOS_VERSION:-local}" --policy "$policy" \
-      --provider "$sandbox-gateway" --provider "$sandbox-worker" "${uploads[@]}"
-    openshell sandbox exec -n "$sandbox" --workdir /sandbox/workspace -- env \
-      PMOS_BOTS_URL=http://bots.pmos.internal:8750 PMOS_WORKER_BOT="$bot" \
-      PMOS_GATEWAY_URL=http://gateway.pmos.internal:8740/v1 \
-      PMOS_TOOLSERVER_MCP_URL=http://toolserver.pmos.internal:8710/mcp \
-      PMOS_CONTENT_ROOT=/sandbox \
-      /usr/local/bin/node /opt/pmos/harness/dist/main.js &
-    say "sandbox $sandbox created and its worker started"
+    openshell "${create[@]}"
+    install_worker_unit
+    systemctl --user daemon-reload
+    systemctl --user enable --now "$unit"
+    say "sandbox $sandbox created; its worker runs as the user unit $unit"
+    say "check it with: systemctl --user status '$unit'"
     ;;
 
   pause)
+    # The unit is disabled as well as stopped, so a paused bot stays paused after a reboot.
     [ $# -eq 1 ] || { say "usage: pmos-admin pause <bot>" >&2; exit 2; }
+    require_bot_name pause "$1"
+    if command -v systemctl >/dev/null && command -v systemd-escape >/dev/null &&
+      [ -f "$(user_unit_dir)/pmos-worker@.service" ]; then
+      unit=$(worker_unit "$1")
+      # A pause is the first step of an incident (docs/runbooks/incidents.md): if the unit can't
+      # be stopped, say so and stop the sandbox all the same.
+      systemctl --user disable --now "$unit" ||
+        say "couldn't stop $unit; stopping the sandbox anyway (check: systemctl --user status '$unit')" >&2
+    fi
     openshell sandbox stop -n "pmos-$1"
     say "pmos-$1 stopped; its queued tasks wait (and fail after their retry) until resume"
     ;;
 
   resume)
+    # Also how a sandbox made before the worker unit existed gets one (docs/runbooks/upgrade.md).
     [ $# -eq 1 ] || { say "usage: pmos-admin resume <bot>" >&2; exit 2; }
+    require_bot_name resume "$1"
+    command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
+    worker_unit_checks
+    unit=$(worker_unit "$1")
     openshell sandbox start -n "pmos-$1"
+    install_worker_unit
+    systemctl --user daemon-reload
+    # A unit that hit its start limit stays failed until this.
+    systemctl --user reset-failed "$unit" 2>/dev/null || true
+    systemctl --user enable --now "$unit"
+    say "pmos-$1 started; its worker runs as the user unit $unit"
     ;;
 
   lint)
@@ -733,6 +914,9 @@ for g in s["groups"]:
         *) gate_usage ;;
       esac
     done
+    # The base goes to `git diff` and `git archive` as a revision: one that starts with `-` would
+    # be read as an option (`--output=<file>`, `--remote=…`).
+    case "$base" in -* | '') say "--base must name a revision, not $(printf '%q' "$base")" >&2; exit 2 ;; esac
     [ -d "$checkout" ] || { say "no directory $checkout" >&2; exit 2; }
     checkout=$(cd "$checkout" && pwd)
     if [ "$dry" = 1 ]; then

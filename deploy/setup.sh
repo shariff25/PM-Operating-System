@@ -23,6 +23,20 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# The two paths go into deploy/.env, which pmos-admin reads as data and Docker Compose
+# interpolates: only an absolute path of plain characters is taken (no space, `$`, quote, `#`,
+# `%` or newline). The clone URL goes to git after `--`, and may not look like an option.
+PATH_CHARS='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./+-'
+for p in "$CONTENT" "$STATE"; do
+  case "$p" in
+    /*[!$PATH_CHARS]* | [!/]* | '')
+      echo "$(printf '%q' "$p") must be an absolute path of letters, digits and _ . / + -" >&2
+      exit 2
+      ;;
+  esac
+done
+case "$CLONE" in -*) echo "--clone takes a git URL, not $(printf '%q' "$CLONE")" >&2; exit 2 ;; esac
+
 ok() { printf '  \033[32mok\033[0m   %s\n' "$1"; }
 warn() { printf '  \033[33mwarn\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mfail\033[0m %s\n' "$1"; exit 1; }
@@ -49,7 +63,7 @@ echo "== content checkout"
 if [ ! -d "$CONTENT/.git" ]; then
   [ -n "$CLONE" ] || fail "$CONTENT is not a git checkout; pass --clone <git url> or clone it first"
   mkdir -p "$(dirname "$CONTENT")"
-  git clone "$CLONE" "$CONTENT"
+  git clone -- "$CLONE" "$CONTENT"
 fi
 [ -f "$CONTENT/content/tools.yaml" ] || fail "$CONTENT has no content/tools.yaml; is it the PM OS content repo?"
 ok "$CONTENT"
@@ -67,8 +81,16 @@ chmod 600 "$ENV"
 token() { openssl rand -hex 24; }
 password() { openssl rand -hex 16; }
 # Set KEY to VALUE when it is empty or still `generated`; never replace a real value.
+# Every value it writes is a path checked above, a number, hex or base64: anything else is a bug,
+# refused before the file is touched.
 fill() {
   local key=$1 value=$2 current
+  case "$value" in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.,:=/+-]*)
+      echo "refusing to write $key with characters deploy/.env can't hold" >&2
+      exit 2
+      ;;
+  esac
   current=$(grep -E "^$key=" "$ENV" | head -1 | cut -d= -f2- || true)
   if ! grep -qE "^$key=" "$ENV"; then
     printf '%s=%s\n' "$key" "$value" >>"$ENV"

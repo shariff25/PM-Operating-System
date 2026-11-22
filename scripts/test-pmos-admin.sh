@@ -5,6 +5,11 @@
 # - the eval gate treats a checkout as data: every line of the gate and of eval_stack_up that
 #   touches the checkout is one of the reviewed forms (git on it, a copy of its content/, a
 #   read-only check, the runner's mount). A new use fails here until it is reviewed.
+# - deploy/.env is read as data, not run as shell, and setup.sh writes only plain values (H0);
+# - bot names are checked as PM OS's valid_name before they reach deploy/.env, a path, a lookup,
+#   OpenShell or systemd; tokens are found by exact key; `sandbox` creates with `--from` and
+#   starts the worker as the systemd user unit deploy/systemd/pmos-worker@.service (checked
+#   with systemd-analyze), only with lingering on; `pause` and `resume` drive the unit (H0).
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)/deploy/pmos-admin"
@@ -72,8 +77,10 @@ compose="$(dirname "$SRC")/compose.evals.yaml"
 # A stand-in `docker` records the command and the assertion mode, the worker tokens and the
 # env file that compose would read; nothing runs.
 DEPLOY_SRC="$(dirname "$SRC")"
-mkdir -p "$WORK/bin" "$WORK/stack/deploy"
+ROOT_SRC="$(dirname "$DEPLOY_SRC")"
+mkdir -p "$WORK/bin" "$WORK/stack/deploy/systemd"
 cp "$SRC" "$WORK/stack/deploy/pmos-admin"
+cp "$DEPLOY_SRC/systemd/pmos-worker@.service" "$WORK/stack/deploy/systemd/"
 cat >"$WORK/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 envfile=""
@@ -319,6 +326,222 @@ run_stack users grant-admin ana --keep-entra </dev/null >/dev/null ||
   fail "users grant-admin was refused over the assertion mode"
 grep -qF -- "pmos-toolserver users grant-admin ana --keep-entra" "$DOCKER_LOG" ||
   fail "users grant-admin didn't run: $(cat "$DOCKER_LOG")"
+
+# --- deploy/.env is data, never shell (slice H0) ---------------------------------------------
+# A value holding a command substitution or a backtick isn't run, a quoted value loses its
+# quotes, an unquoted one its ` # comment`; a line that isn't an assignment stops the script.
+stack_env require "PMOS_PWN=\$(touch $WORK/pwned)" "PMOS_PWN2=\`touch $WORK/pwned2\`" \
+  "export PMOS_PWN3=x; touch $WORK/pwned3"
+run_stack up >/dev/null 2>&1 || fail "up with odd values in deploy/.env failed"
+[ ! -e "$WORK/pwned" ] && [ ! -e "$WORK/pwned2" ] && [ ! -e "$WORK/pwned3" ] ||
+  fail "a value in deploy/.env was run as shell"
+grep -q '^mode=require ' "$DOCKER_LOG" || fail "up didn't read the mode: $(cat "$DOCKER_LOG")"
+stack_env require
+sed -i 's/^PMOS_ASSERTION_MODE=.*/PMOS_ASSERTION_MODE="require"  # set by setup.sh/' "$WORK/stack/deploy/.env"
+run_stack up >/dev/null || fail "up with a quoted, commented mode failed"
+grep -q '^mode=require ' "$DOCKER_LOG" || fail "a quoted value kept its quotes or comment: $(cat "$DOCKER_LOG")"
+stack_env require "PMOS_ASSERTION_MODE=require # set by setup.sh"
+run_stack up >/dev/null || fail "up with an unquoted, commented mode failed"
+grep -q '^mode=require ' "$DOCKER_LOG" || fail "an unquoted value kept its comment: $(cat "$DOCKER_LOG")"
+stack_env require "touch $WORK/pwned4"
+code=0
+run_stack up >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "a line that isn't KEY=VALUE exits $code, not 2"
+[ ! -e "$WORK/pwned4" ] && [ ! -s "$DOCKER_LOG" ] || fail "a line that isn't KEY=VALUE ran or started something"
+
+# --- The eval gate's base is a revision, never an option (slice H0) --------------------------
+for base in --output=x -x ""; do
+  code=0
+  "${admin[@]}" evals-gate --base "$base" --dry-run >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "evals-gate --base '$base' exits $code, not 2"
+done
+
+# --- setup.sh writes only plain paths into deploy/.env (slice H0) ----------------------------
+mkdir -p "$WORK/setup/deploy"
+cp "$DEPLOY_SRC/setup.sh" "$WORK/setup/deploy/setup.sh"
+for args in "--content /srv/x\$(touch $WORK/pwned5)" "--content relative/path" "--state /srv/a b" \
+  "--state /srv/x\`id\`" "--content /srv/x#y" "--clone --upload-pack=touch"; do
+  code=0
+  # shellcheck disable=SC2086
+  bash "$WORK/setup/deploy/setup.sh" $args >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "setup.sh $args exits $code, not 2"
+  [ ! -e "$WORK/setup/deploy/.env" ] || fail "setup.sh $args wrote deploy/.env"
+done
+code=0
+bash "$WORK/setup/deploy/setup.sh" --content $'/srv/a\nPMOS_X=1' >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "setup.sh with a newline in --content exits $code, not 2"
+[ ! -e "$WORK/pwned5" ] || fail "setup.sh ran a path as shell"
+
+# --- Bot names, token lookup, `--from` and the worker unit (slice H0) ------------------------
+# Stand-ins for openshell, systemctl, loginctl and id (only on this PATH, so `users` above still
+# sees the real id) record what they were asked; nothing runs. systemd-escape is the real one.
+command -v systemd-escape >/dev/null || fail "systemd-escape is needed for these checks (CI's runner has it)"
+command -v systemd-analyze >/dev/null || fail "systemd-analyze is needed for these checks (CI's runner has it)"
+SBIN="$WORK/sbin"
+mkdir -p "$SBIN"
+export OPENSHELL_LOG="$WORK/openshell.log" SYSTEMCTL_LOG="$WORK/systemctl.log"
+cat >"$SBIN/openshell" <<'EOF'
+#!/usr/bin/env bash
+printf 'args=%s worker=%s gateway=%s\n' "$*" "${PMOS_WORKER_TOKEN:-}" "${PMOS_GATEWAY_TOKEN:-}" >>"$OPENSHELL_LOG"
+EOF
+cat >"$SBIN/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+[ "${FAKE_SYSTEMCTL_FAIL:-0}" != 1 ]
+EOF
+cat >"$SBIN/loginctl" <<'EOF'
+#!/usr/bin/env bash
+[ "$*" = "show-user pmosop -p Linger --value" ] && echo "${FAKE_LINGER-yes}"
+EOF
+cat >"$SBIN/id" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in -u) echo "${FAKE_UID:-1000}" ;; -un) echo pmosop ;; *) exec /usr/bin/id "$@" ;; esac
+EOF
+chmod +x "$SBIN"/*
+export XDG_CONFIG_HOME="$WORK/xdg"
+UNIT="$XDG_CONFIG_HOME/systemd/user/pmos-worker@.service"
+checkout="$WORK/content-checkout"
+mkdir -p "$checkout/policies/bots"
+for b in docs pm-ana pm abcdefghijklmnopqrstuvwxyz-12345; do
+  cp "$ROOT_SRC/policies/bots/docs.yaml" "$checkout/policies/bots/$b.yaml"
+  cp "$ROOT_SRC/policies/bots/docs.sandbox.yaml" "$checkout/policies/bots/$b.sandbox.yaml"
+done
+bot_env() { # extra lines...
+  stack_env require "PMOS_CONTENT_CHECKOUT=$checkout" "PMOS_RT_DOCS_WORKER_TOKEN=rt-docs-token" \
+    "PMOS_GW_DOCS_BOT_TOKEN=gw-docs-token" "$@"
+  : >"$OPENSHELL_LOG"
+  : >"$SYSTEMCTL_LOG"
+  rm -rf "$XDG_CONFIG_HOME"
+}
+run_bot() { PATH="$SBIN:$WORK/bin:$PATH" "${stack[@]}" "$@"; }
+
+# Refused names: shell metacharacters, path separators, a leading dash, a newline, the
+# characters that add or override a token entry, uppercase, non-ASCII, too long; exit 2 with
+# deploy/.env, openshell, systemctl and docker untouched.
+bad_names=("../x" "a/b" "a b" "x\$(touch $WORK/pwned6)" "x\`id\`" "x;id" "x|id" "x&" "x>y" $'a\nb'
+  "x=y" "a,b" "-a" "--dry-run-x" "a-" "a--b" "A" "Docs" "é" "a.b" "a_b" "" "x*" "x?" "[a]"
+  "abcdefghijklmnopqrstuvwxyz-123456")
+bot_env
+cp "$WORK/stack/deploy/.env" "$WORK/env.before"
+for name in "${bad_names[@]}"; do
+  for cmd in add-bot sandbox pause resume; do
+    code=0
+    run_bot "$cmd" "$name" >/dev/null 2>&1 || code=$?
+    [ "$code" = 2 ] || fail "$cmd $(printf '%q' "$name") exits $code, not 2"
+  done
+  code=0
+  run_bot sandbox "$name" --dry-run >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "sandbox $(printf '%q' "$name") --dry-run exits $code, not 2"
+done
+cmp -s "$WORK/env.before" "$WORK/stack/deploy/.env" || fail "a refused name changed deploy/.env"
+[ ! -s "$DOCKER_LOG" ] && [ ! -s "$OPENSHELL_LOG" ] && [ ! -s "$SYSTEMCTL_LOG" ] ||
+  fail "a refused name reached docker, openshell or systemctl"
+[ ! -e "$WORK/pwned6" ] && [ ! -e "$UNIT" ] || fail "a refused name ran or installed something"
+# Valid names pass: the Docs bot, a personal bot, one of exactly 32 characters.
+run_bot add-bot docs >/dev/null || fail "add-bot docs was refused"
+run_bot add-bot pm-ana >/dev/null || fail "add-bot pm-ana was refused"
+run_bot add-bot abcdefghijklmnopqrstuvwxyz-12345 >/dev/null || fail "a 32-character name was refused"
+grep -qE '^PMOS_RT_WORKER_TOKENS=worker-pm-ana=[0-9a-f]{48},worker-abcdefghijklmnopqrstuvwxyz-12345=[0-9a-f]{48}$' \
+  "$WORK/stack/deploy/.env" || fail "add-bot didn't write the worker tokens: $(grep WORKER "$WORK/stack/deploy/.env")"
+grep -qE '^PMOS_GW_BOT_TOKENS=bot-pm-ana=[0-9a-f]{48},bot-abcdefghijklmnopqrstuvwxyz-12345=[0-9a-f]{48}$' \
+  "$WORK/stack/deploy/.env" || fail "add-bot didn't write the gateway tokens"
+out=$(run_bot add-bot pm-ana) && [[ "$out" == *"already has tokens"* ]] || fail "add-bot pm-ana twice: $out"
+
+# The lookup is an exact match of the whole key: `pm` is neither `pm-ana` nor `xpm`, and a
+# similar key before the right one is never taken.
+bot_env "PMOS_RT_WORKER_TOKENS=worker-xpm-ana=rt-wrong1,worker-pm-ana-2=rt-wrong2,worker-pm-ana=rt-right" \
+  "PMOS_GW_BOT_TOKENS=bot-pm-ana-2=gw-wrong2,bot-pm-ana=gw-right,bot-pm-anaa=gw-wrong3"
+run_bot sandbox pm-ana >/dev/null || fail "sandbox pm-ana failed: $(cat "$OPENSHELL_LOG")"
+grep -q 'provider create --name pmos-pm-ana-worker .* worker=rt-right gateway=$' "$OPENSHELL_LOG" ||
+  fail "the worker provider didn't get the exact token: $(cat "$OPENSHELL_LOG")"
+grep -q 'provider create --name pmos-pm-ana-gateway .* worker= gateway=gw-right$' "$OPENSHELL_LOG" ||
+  fail "the gateway provider didn't get the exact token: $(cat "$OPENSHELL_LOG")"
+bot_env "PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt-1" "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw-1"
+code=0
+out=$(run_bot sandbox pm 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"add-bot pm first"* ]] || fail "sandbox pm took pm-ana's tokens ($code): $out"
+[ ! -s "$OPENSHELL_LOG" ] || fail "sandbox pm without tokens called openshell"
+run_bot add-bot pm >/dev/null
+grep -q '^PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt-1,worker-pm=' "$WORK/stack/deploy/.env" ||
+  fail "add-bot pm thought pm-ana's token was its own"
+
+# `sandbox`: `--from`, no `&`, the unit installed and started, tokens nowhere but the providers.
+bot_env "PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt-secret-1" "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw-secret-1"
+out=$(run_bot sandbox pm-ana --dry-run) || fail "sandbox --dry-run failed"
+[[ "$out" == *"openshell sandbox create --name pmos-pm-ana --from pmos-worker:local --policy $checkout/policies/bots/pm-ana.yaml --provider pmos-pm-ana-gateway --provider pmos-pm-ana-worker --upload "* ]] ||
+  fail "sandbox --dry-run doesn't create with --from: $out"
+[[ "$out" != *"--image"* && "$out" != *"&"* && "$out" != *secret* ]] ||
+  fail "sandbox --dry-run has --image, an & or a token: $out"
+[[ "$out" == *'systemctl --user enable --now pmos-worker@pm\x2dana.service'* ]] ||
+  fail "sandbox --dry-run doesn't start the systemd-escaped unit: $out"
+[ ! -s "$OPENSHELL_LOG" ] && [ ! -s "$SYSTEMCTL_LOG" ] && [ ! -e "$UNIT" ] || fail "sandbox --dry-run ran something"
+run_bot sandbox pm-ana >/dev/null || fail "sandbox pm-ana failed"
+grep -q '^args=sandbox create --name pmos-pm-ana --from pmos-worker:local ' "$OPENSHELL_LOG" ||
+  fail "sandbox didn't create with --from: $(cat "$OPENSHELL_LOG")"
+! grep -q -- '--image\|sandbox exec' "$OPENSHELL_LOG" || fail "sandbox used --image or ran sandbox exec itself"
+[ "$(grep -c '^args=sandbox create .* worker= gateway=$' "$OPENSHELL_LOG")" = 1 ] ||
+  fail "sandbox create got a token in its environment"
+[ "$(cat "$SYSTEMCTL_LOG")" = $'--user daemon-reload\n--user enable --now pmos-worker@pm\\x2dana.service' ] ||
+  fail "sandbox didn't start the unit: $(cat "$SYSTEMCTL_LOG")"
+# The installed unit: the template with only openshell's path changed.
+[ -f "$UNIT" ] || fail "sandbox didn't install the unit"
+[ "$(diff "$DEPLOY_SRC/systemd/pmos-worker@.service" "$UNIT" | grep -c '^[<>]')" = 2 ] ||
+  fail "the installed unit differs from the template in more than the ExecStart line"
+grep -qxF "ExecStart=$SBIN/openshell sandbox exec -n pmos-%I --workdir /sandbox/workspace -- \\" "$UNIT" ||
+  fail "the unit's ExecStart isn't openshell's path and sandbox exec: $(grep ExecStart "$UNIT")"
+for want in 'PMOS_WORKER_BOT=%I' '/usr/local/bin/node /opt/pmos/harness/dist/main.js' 'Restart=on-failure' \
+  'RestartSec=10' 'StartLimitIntervalSec=600' 'StartLimitBurst=5' 'After=openshell-gateway.service' \
+  'Wants=openshell-gateway.service' 'WantedBy=default.target' 'Type=exec'; do
+  grep -qF -- "$want" "$UNIT" || fail "the unit has no $want"
+done
+! grep -v '^#' "$UNIT" | grep -q '%i' || fail "the unit uses %i (escaped) instead of %I"
+! grep -qE 'secret|TOKEN=|&$' "$UNIT" || fail "the unit holds a token or backgrounds the worker"
+# systemd itself accepts it, as an instance for pm-ana.
+cp "$UNIT" "$WORK/pmos-worker@pm\\x2dana.service"
+verify=$(systemd-analyze verify "$WORK/pmos-worker@pm\\x2dana.service" 2>&1) ||
+  fail "systemd-analyze verify refused the unit: $verify"
+[ -z "$verify" ] || fail "systemd-analyze verify warned: $verify"
+# The Docs bot uses its built-in tokens.
+bot_env
+run_bot sandbox docs >/dev/null || fail "sandbox docs failed"
+grep -q 'provider create --name pmos-docs-worker .* worker=rt-docs-token ' "$OPENSHELL_LOG" ||
+  fail "sandbox docs didn't use the built-in worker token"
+grep -qF -- '--user enable --now pmos-worker@docs.service' "$SYSTEMCTL_LOG" || fail "sandbox docs didn't start its unit"
+
+# Lingering off, or running as root: refused before any sandbox, provider or unit is made.
+for case in "FAKE_LINGER=no" "FAKE_LINGER=" "FAKE_UID=0"; do
+  bot_env "PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt-1" "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw-1"
+  for cmd in sandbox resume; do
+    code=0
+    out=$(env "$case" PATH="$SBIN:$WORK/bin:$PATH" "${stack[@]}" "$cmd" pm-ana 2>&1) || code=$?
+    [ "$code" = 1 ] || fail "$cmd with $case exits $code, not 1"
+    [ ! -s "$OPENSHELL_LOG" ] && [ ! -s "$SYSTEMCTL_LOG" ] && [ ! -e "$UNIT" ] ||
+      fail "$cmd with $case created something"
+    if [ "$case" != FAKE_UID=0 ]; then
+      [[ "$out" == *"sudo loginctl enable-linger pmosop"* ]] || fail "$cmd with $case doesn't say how to turn lingering on: $out"
+    fi
+  done
+done
+
+# pause disables and stops the unit, then the sandbox (even when systemctl fails); resume starts
+# the sandbox, reinstalls the unit, clears a start-limit failure and starts it.
+bot_env
+run_bot resume pm-ana >/dev/null || fail "resume failed"
+[ "$(cat "$OPENSHELL_LOG")" = "args=sandbox start -n pmos-pm-ana worker= gateway=" ] ||
+  fail "resume didn't start the sandbox: $(cat "$OPENSHELL_LOG")"
+[ "$(cat "$SYSTEMCTL_LOG")" = $'--user daemon-reload\n--user reset-failed pmos-worker@pm\\x2dana.service\n--user enable --now pmos-worker@pm\\x2dana.service' ] ||
+  fail "resume didn't start the unit: $(cat "$SYSTEMCTL_LOG")"
+[ -f "$UNIT" ] || fail "resume didn't install the unit"
+: >"$OPENSHELL_LOG"
+: >"$SYSTEMCTL_LOG"
+run_bot pause pm-ana >/dev/null || fail "pause failed"
+[ "$(cat "$SYSTEMCTL_LOG")" = '--user disable --now pmos-worker@pm\x2dana.service' ] ||
+  fail "pause didn't stop the unit: $(cat "$SYSTEMCTL_LOG")"
+[ "$(cat "$OPENSHELL_LOG")" = "args=sandbox stop -n pmos-pm-ana worker= gateway=" ] || fail "pause didn't stop the sandbox"
+: >"$OPENSHELL_LOG"
+FAKE_SYSTEMCTL_FAIL=1 run_bot pause pm-ana >/dev/null 2>&1 || fail "pause failed when systemctl did"
+[ "$(cat "$OPENSHELL_LOG")" = "args=sandbox stop -n pmos-pm-ana worker= gateway=" ] ||
+  fail "pause didn't stop the sandbox when systemctl failed"
 
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
 if docker compose version >/dev/null 2>&1; then

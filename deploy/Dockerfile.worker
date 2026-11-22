@@ -17,9 +17,33 @@ COPY harness/ harness/
 RUN pnpm -C harness build
 
 FROM node:22-bookworm-slim
+# The workload's identity (slice H0, docs/openshell-any-host-spec.md §3.7):
+# - OpenShell's sandbox page says a Docker target "must declare an explicit numeric
+#   `USER UID:GID`" and that "symbolic or implicit identities are rejected"
+#   (how-it-works/sandboxes/overview.mdx; said there for sandbox updates). So the image ends
+#   with a numeric USER, not a name.
+# - Every generated policy asks for `run_as_user: sandbox` and `run_as_group: sandbox`
+#   (crates/policy/src/lib.rs, RUN_AS), an account the node image doesn't have; this adds it,
+#   with fixed ids at or above the policy check's minimum of 1000 (MIN_NUMERIC_ID), and apart
+#   from the image's own `node` (1000) and the services' default 10001.
+# Verify on a real host (RT-3 and O-CANARY in the acceptance run): whether OpenShell runs the
+# workload as the image's USER, as the policy's run_as_user, or creates the account itself.
+# Slice H5 changes this if it differs.
+#
+# /opt/pmos stays root's and read-only to the worker (it was copied as root and is world-readable,
+# as it was for `node`); only the workspace, the worker's working directory, is the account's.
+# The eval stack and the bring-up worker run this image as plain containers with the content
+# mounted read-only: they need only to read it, which takes the same world-readable files that
+# `node` (uid 1000, also not the checkout's owner) needed before, and the harness writes only
+# under the system temporary directory (harness/src/worker.ts, agent.ts: os.tmpdir()).
+RUN groupadd --gid 10100 sandbox \
+ && useradd --uid 10100 --gid 10100 --no-log-init --create-home --home-dir /home/sandbox \
+      --shell /bin/bash sandbox \
+ && mkdir -p /sandbox/workspace \
+ && chown 10100:10100 /sandbox/workspace
 COPY --from=build /src /opt/pmos
 # The sandbox uploads the bot's skills, master context and tools.yaml under /sandbox.
 ENV PMOS_CONTENT_ROOT=/sandbox NODE_ENV=production
 WORKDIR /sandbox/workspace
-USER node
+USER 10100:10100
 CMD ["/usr/local/bin/node", "/opt/pmos/harness/dist/main.js"]

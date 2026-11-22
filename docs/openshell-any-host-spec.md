@@ -5,6 +5,27 @@ scope item c). Revised on 2026-11-22 after the reviewer's review of `9de1a65` ("
 changes"; §10 lists what changed). File references are to `claude/openshell-any-host-spec-r2`,
 based on `claude/web-app` at `2544d01`.
 
+**Slice H0 status (2026-11-22): built on `claude/any-host-h0`, not yet reviewed or merged.**
+What it changed: `pmos-admin sandbox` creates with `--from`; the worker runs as the systemd user
+unit `deploy/systemd/pmos-worker@.service` (instance made with `systemd-escape`, `%I`,
+`Restart=on-failure`, `StartLimitIntervalSec=600`, `StartLimitBurst=5`, `After=`/`Wants=`
+`openshell-gateway.service`), installed only with lingering on and never as root; `pause`
+disables and stops it, `resume` reinstalls, clears and starts it; `sandbox --dry-run` prints the
+commands without tokens; the worker image has a `sandbox` account (10100:10100) and ends with
+`USER 10100:10100`; the `127.0.0.1` hosts line is gone from the install runbook, with a "stop
+until H2" note; bot names are checked as `valid_name` in `add-bot`, `sandbox`, `pause` and
+`resume`, and tokens are found by exact key, not a `sed` pattern. The same flaw was looked for
+elsewhere, and fixed: `deploy/.env` is now read as data (`load_env`), not sourced as shell, so
+no value in it is ever run; `set_env` refuses any character outside a plain set; `setup.sh`
+refuses a `--content` or `--state` that isn't an absolute path of plain characters, and passes
+`--clone` to git after `--`; `evals-gate` refuses a `--base` that starts with `-`. Tested in
+`scripts/test-pmos-admin.sh` with stand-ins for `openshell`, `systemctl`, `loginctl` and `id`
+(the unit also through `systemd-analyze verify`). **Not verified:** the worker image was not
+built here (no Docker daemon), and nothing ran on OpenShell: `--from` with a local tag, which
+identity OpenShell uses, whether `sandbox exec` stays in the foreground and the gateway unit's
+name are still for the acceptance run (§6, step 2) and H5. The `ExecStartPre=` preflight comes
+with H1.
+
 **The owner's requirement, 2026-11-22:** "I want to deploy it in another platform apart from
 spark", and, asked which cloud, "OpenShell on another platform generic implementation". So PM OS's
 bots must be able to run in NVIDIA OpenShell sandboxes on hosts other than the DGX Spark, through
@@ -75,7 +96,8 @@ Two sources, kept apart:
 | Gateway install | A systemd **user** service at `https://127.0.0.1:17670` with an mTLS bundle made automatically; `loginctl enable-linger` keeps it running after logout. | [`about/installation.mdx`](https://github.com/NVIDIA/OpenShell/blob/main/docs/about/installation.mdx), [`gateways/authentication.mdx`](https://github.com/NVIDIA/OpenShell/blob/main/docs/how-it-works/gateways/authentication.mdx) | Reported |
 | Plaintext gateway | "Intended for local port-forwarding or gateways behind a trusted reverse proxy or tunnel." The research reported that unauthenticated mode "must not be exposed to shared or public networks". The page read on 2026-11-22 says it for the Helm overlay only. | `gateways/authentication.mdx` | Reported |
 | Remote gateway over SSH | `openshell gateway start --remote user@hostname` appeared in search snippets only; the page returned 404, and the installation page has no such command. | — | **Unconfirmed: not used by this design** |
-| Custom images | `--from` takes an OCI image reference; "the target must declare an explicit numeric `USER UID:GID`" (said for Docker updates). | [`sandboxes/overview.mdx`](https://github.com/NVIDIA/OpenShell/blob/main/docs/how-it-works/sandboxes/overview.mdx) | Reported; see §2 surprises 2 and 3 |
+| Custom images | `--from` takes an OCI image reference; "the target must declare an explicit numeric `USER UID:GID`" (said for Docker updates). Re-read for H0 on 2026-11-22: `--from` takes "an explicit OCI image reference or a rootfs tar archive", "does not build local Dockerfiles or directories", and a local image is built and tagged "with the container engine used by your local gateway"; `sandbox exec` is "a one-shot command inside a running sandbox", with nothing said about long-running commands. | [`sandboxes/overview.mdx`](https://github.com/NVIDIA/OpenShell/blob/main/docs/how-it-works/sandboxes/overview.mdx) | Reported; see §2 surprises 2 and 3 |
+| Gateway unit | The Linux package's gateway is the user service `openshell-gateway` (`systemctl --user status openshell-gateway`); `sudo loginctl enable-linger $USER` keeps it running after logout. Read for H0 on 2026-11-22. | [`about/installation.mdx`](https://github.com/NVIDIA/OpenShell/blob/main/docs/about/installation.mdx) | Reported; verify on a real host |
 | Resources | No GPU, RAM or disk requirement is stated. | support matrix | — |
 | Cloud | Not named, except Amazon Linux 2023+ for the glibc requirement. Serverless platforms are not documented. | support matrix | — |
 

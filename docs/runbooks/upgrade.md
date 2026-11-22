@@ -23,11 +23,20 @@ reach PMs until the affected category still meets its bar (D10).
    ```
    The services run their own database migrations at start-up. Each service stops on SIGTERM
    only after finishing in-flight work, and a running task is retried once.
-5. **If the worker image changed,** recreate each bot's sandbox so it runs the new one:
+5. **If the worker image changed,** recreate each bot's sandbox so it runs the new one. Stop
+   its worker first (`pause` stops and disables its systemd unit as well as the sandbox):
    ```sh
+   deploy/pmos-admin pause <bot>
    openshell sandbox delete pmos-<bot>
    deploy/pmos-admin sandbox <bot>
    ```
+   **The upgrade that brings slice H0** (the worker unit and the image's numeric `sandbox`
+   user) changes the worker image, so every sandbox is recreated this way. A worker started
+   before it was started with `&` from someone's shell: find it with
+   `pgrep -af 'openshell sandbox exec'` and stop it (`kill <pid>`) before `pause`. Turn on
+   lingering first if it isn't (`docs/runbooks/install.md`, Stage 4 step 1). Until slice H2 is
+   in, sandboxes can't reach the services (Stage 4's note), so there is nothing to recreate on a
+   stack that still runs the bring-up worker.
 6. **If a role's skills or tools changed** (the changelog says so), regenerate the bots'
    sandbox policies in your content repo, commit the result, then recreate each bot's
    sandbox as in step 5. A policy lists the tools its bot may call, so a bot keeps its old

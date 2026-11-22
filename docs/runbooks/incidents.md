@@ -9,7 +9,9 @@ Write down what happened, when, and what you did; it becomes the post-incident n
 - a bot read a channel or project outside its scope;
 - a policy denial in a trace that you don't understand.
 
-1. **Pause the bot:** `deploy/pmos-admin pause <bot>`.
+1. **Pause the bot:** `deploy/pmos-admin pause <bot>`, as the user OpenShell runs as. It stops
+   and disables the bot's worker unit, then stops its sandbox; if the unit can't be stopped it
+   says so and stops the sandbox anyway. Check with `openshell sandbox list`.
 2. **Find the task:**
    - in the console's Activity screen, open the task's trace and audit events;
    - or search the audit log:
@@ -39,12 +41,15 @@ Write down what happened, when, and what you did; it becomes the post-incident n
 1. Generate a new value: `openssl rand -hex 24`.
 2. Replace it in `deploy/.env` and run `deploy/pmos-admin up`.
 3. If it was a bot's worker or gateway token, recreate that bot's sandbox:
-   `openshell sandbox delete pmos-<bot>`, then `deploy/pmos-admin sandbox <bot>`.
+   `deploy/pmos-admin pause <bot>`, `openshell sandbox delete pmos-<bot>`, then
+   `deploy/pmos-admin sandbox <bot>`.
 
 **The vault key (`PMOS_VAULT_KEY`):**
-1. Put a new key first and keep the old one after it, comma-separated:
+1. Make a new key with `openssl rand -base64 32`, and put it first, with the old one after it,
+   comma-separated. Write the value out in full: `deploy/.env` is read as plain text, so
+   `$(…)` in it is not run.
    ```
-   k2:$(openssl rand -base64 32),k1:<old>
+   PMOS_VAULT_KEY=k2:<the new base64>,k1:<old>
    ```
 2. Run `deploy/pmos-admin up`. Stored tokens are re-sealed under the new key as they're read.
 3. Once every PM has used PM OS again, remove the old key.

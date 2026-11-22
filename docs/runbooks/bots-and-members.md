@@ -26,7 +26,14 @@ Once the content sync pulls the commit, within about 5 minutes, give their bot a
 cd /opt/pmos
 deploy/pmos-admin add-bot pm-<handle>        # their bot's own runtime and gateway tokens
 deploy/pmos-admin sandbox pm-<handle>        # its OpenShell sandbox and worker
+systemctl --user status "pmos-worker@$(systemd-escape -- pm-<handle>).service"
 ```
+
+Run them as the user OpenShell runs as, not with `sudo`. A bot name is lowercase letters, digits
+and single hyphens, at most 32 characters; `pmos-admin` refuses anything else before it writes a
+token or creates a sandbox. The worker runs as that user's systemd unit, which restarts it if it
+fails (at most five times in ten minutes, then it stays failed until `resume`) and starts it
+again after a reboot, as long as lingering is on (`install.md`, Stage 4 step 1).
 
 Until you do, their bot's tasks wait in the queue. Their `setup` checklist shows the bot as
 "being set up".
@@ -45,12 +52,15 @@ A team bot is a `BOT.md` under `content/bots/` with `scope: team`.
 When a bot misbehaves, pause it before you investigate:
 
 ```sh
-deploy/pmos-admin pause <bot>      # stops its sandbox; its tasks wait
-deploy/pmos-admin resume <bot>
+deploy/pmos-admin pause <bot>      # stops and disables its worker unit, then its sandbox; its tasks wait
+deploy/pmos-admin resume <bot>     # starts the sandbox, then the worker unit (clearing a failed one)
 ```
 
-To stop it for good, remove its `BOT.md` by pull request and delete its sandbox with
-`openshell sandbox delete pmos-<bot>`.
+A paused bot stays paused after a reboot: `pause` disables the unit, and only `resume` enables
+it again.
+
+To stop it for good, remove its `BOT.md` by pull request, `pause` it, and delete its sandbox
+with `openshell sandbox delete pmos-<bot>`.
 
 ## A member leaves
 
