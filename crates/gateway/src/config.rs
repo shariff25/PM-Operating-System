@@ -137,6 +137,12 @@ struct ClientSpec {
     /// client's name spells, as a personal bot's name does (review finding R1).
     #[serde(default)]
     user: Option<String>,
+    /// How many of one person's `limits.per-user` running slots this client may hold at once
+    /// (finding G3 of the review at 6bb806f). `None`: 1 for a trusted `user: any` client (a
+    /// team bot, or the runtime), so it can never hold all of a PM's slots; `per-user` for a
+    /// `from-name` client, which names only its own PM.
+    #[serde(default)]
+    per_user_share: Option<usize>,
 }
 
 /// Which people a trusted client may name in `X-Pmos-User` (review finding R1).
@@ -166,6 +172,10 @@ pub struct ClientPolicy {
     pub max_queue: usize,
     /// Which people it may name, when trusted.
     pub user: UserRule,
+    /// The most of one believed person's `per-user` running slots this client may hold
+    /// (G3, review at 6bb806f): 1 by default for a trusted `user: any` client, so a team
+    /// bot's token naming a PM leaves that PM a slot for their own calls.
+    pub per_user_share: usize,
 }
 
 impl ClientPolicy {
@@ -185,23 +195,20 @@ impl ClientPolicy {
             }),
         }
     }
+}
 
-    /// The person a call that `client` makes for `handle` (which it [may name]) is kept
-    /// under, for the caps and the usage log. Under `from-name` it is the one form the
-    /// client's name spells, so `ana`, `ana.` and `ana..` from `bot-pm-ana` are one person,
-    /// not three (the Low on canonical handles, review at 2544d01). Otherwise the handle as
-    /// named.
-    ///
-    /// [may name]: Self::may_name
-    pub fn person_key(&self, client: &str, handle: &str) -> String {
-        match self.user {
-            UserRule::Any => handle.to_string(),
-            UserRule::FromName { prefix } => client
-                .get(prefix..)
-                .filter(|rest| !rest.is_empty())
-                .map_or_else(|| handle.to_string(), str::to_string),
-        }
-    }
+/// The one key a call for `handle` is kept under, for the caps and the usage log's `user`,
+/// whichever client makes it: the handle's spelled form ([`spelled_handle`]), as a personal
+/// bot's name spells it. So `ana.k` through the runtime or a team bot and `ana-k` through
+/// `bot-pm-ana-k` are one person, under one running cap (finding G1 of the review at
+/// 6bb806f; before, the runtime kept `ana.k` and the PM's own bot `ana-k`, so the person had
+/// `per-user` slots under each), and `ana`, `ana.` and `ana..` from `bot-pm-ana` are one
+/// person, not three (the Low on canonical handles, review at 2544d01). Handles whose spelled
+/// forms are the same (`ana.k`, `ana_k`) share one key: PM OS refuses to create such a handle
+/// beside an existing one (`users.create`, `users import`, onboarding), and rows made before
+/// that check share their caps.
+pub fn person_key(handle: &str) -> String {
+    spelled_handle(handle)
 }
 
 pub use pmos_contract::onboarding::{spelled_handle, MAX_SPELLED_HANDLE};
@@ -429,6 +436,26 @@ impl Models {
                     ))
                 }
             };
+            // G3 (review at 6bb806f): a client that may name anyone holds at most this many of
+            // one person's running slots, 1 unless it says otherwise.
+            let per_user_share = match spec.per_user_share {
+                Some(n) if !spec.trusted => {
+                    return Err(format!(
+                        "gateway config: client `{name}`: per-user-share ({n}) needs \
+                         `trusted: true` (an untrusted client names no one)"
+                    ))
+                }
+                Some(n) if n == 0 || n > limits.per_user => {
+                    return Err(format!(
+                        "gateway config: client `{name}`: per-user-share must be 1 to \
+                         limits.per-user ({}), not {n}",
+                        limits.per_user
+                    ))
+                }
+                Some(n) => n,
+                None if spec.trusted && user == UserRule::Any => 1,
+                None => limits.per_user,
+            };
             let max_in_flight = spec.max_in_flight.unwrap_or(limits.client_default());
             let priority = match spec.priority.as_deref() {
                 None if spec.trusted => Priority::Interactive,
@@ -450,6 +477,7 @@ impl Models {
                         .max_queue
                         .unwrap_or_else(|| max_in_flight.saturating_mul(2)),
                     user,
+                    per_user_share,
                 },
             );
         }
@@ -591,6 +619,8 @@ impl Models {
             priority: Priority::Personal,
             max_queue: self.limits.client_default().saturating_mul(2),
             user: UserRule::Any,
+            // Untrusted: it names no one, so no person's slots are counted for it.
+            per_user_share: self.limits.per_user,
         };
         if let Some(p) = self.clients.get(client) {
             return *p;

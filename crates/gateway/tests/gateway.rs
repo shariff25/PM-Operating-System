@@ -1060,6 +1060,19 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
         .unwrap();
     assert_eq!(ready["ready"], true);
     assert_eq!(ready["cloud_test"], true);
+    // Labels only, by role: never the remote provider's or the local server's address (the
+    // route needs no token; review at 6bb806f).
+    assert_eq!(
+        ready["upstreams"],
+        json!({"default": {"upstream": "remote-test", "status": "ok"},
+               "extraction": {"upstream": "local", "status": "ok"}})
+    );
+    for addr in [&remote, &local] {
+        let host = addr.trim_start_matches("http://");
+        let host = host.split('/').next().unwrap();
+        assert!(!ready.to_string().contains(host), "{ready}");
+    }
+    assert!(!ready.to_string().contains("127.0.0.1"), "{ready}");
     {
         let seen = seen_remote.seen.lock().unwrap();
         let (_, headers, _) = seen.iter().find(|s| s.0 == "models").unwrap();

@@ -556,6 +556,13 @@ case "$cmd" in
     }
     check toolserver http://127.0.0.1:8710/readyz
     check gateway http://127.0.0.1:8740/readyz
+    # G2: the gateway's /readyz says its class and whether the stub model is on.
+    gw=$(curl -sS --noproxy '*' -m 5 http://127.0.0.1:8740/readyz 2>/dev/null) || gw=""
+    if [[ "$gw" == *'"stub":true'* ]]; then
+      row gateway WARN "the STUB model answers every call (PMOS_GATEWAY_STUB=1): set it to 0 once the model servers are up (docs/runbooks/install.md)"
+    elif [[ "$gw" == *'"class":"'* && "$gw" != *'"class":"production"'* ]]; then
+      row gateway WARN "not a production-class gateway: its eval runs don't count (deploy/gateway.yaml has class: production; docs/gateway.md)"
+    fi
     check bots http://127.0.0.1:8750/readyz
     if compose --profile console ps --status running --services 2>/dev/null | grep -qx console; then
       check console http://127.0.0.1:8760/healthz

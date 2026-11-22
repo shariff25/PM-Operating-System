@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pmos_gateway::config::{
-    handle_in_name, spelled_handle, valid_client_name, Client, Config, GatewayClass, Models,
-    UserRule, MAX_SPELLED_HANDLE,
+    handle_in_name, person_key, spelled_handle, valid_client_name, Client, Config, GatewayClass,
+    Models, UserRule, MAX_SPELLED_HANDLE,
 };
 use pmos_gateway::scheduler::Priority;
 use pmos_gateway::usage::UsageLog;
@@ -28,6 +28,8 @@ const EVALS: &str = "limits-test-evals-token-0123456789ab";
 const OTHER: &str = "limits-test-other-token-0123456789ab";
 const BOT_ANA: &str = "limits-test-bot-pm-ana-token-0123456";
 const BOT_DOCS: &str = "limits-test-bot-docs-token-01234567";
+const BOT_ANA_K: &str = "limits-test-bot-pm-ana-k-token-01234";
+const WORKER: &str = "limits-test-worker-token-0123456789a";
 
 async fn serve(app: Router) -> (String, CancellationToken) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -180,18 +182,29 @@ impl Drop for Gw {
 /// A gateway with clients `runtime`, `evals` and `other`, the given `limits:` and `clients:`
 /// (YAML flow mappings), in front of [`mock`].
 async fn gateway(limits: &str, clients: &str) -> Gw {
+    gateway_from(
+        |upstream| {
+            format!(
+                "upstreams: {{a: '{upstream}/v1'}}\n\
+                 roles:\n  default: {{upstream: a, model: qwen-test}}\n  extraction: {{upstream: a, model: nemo-test}}\n\
+                 limits: {limits}\nclients: {clients}\n"
+            )
+        },
+        false,
+    )
+    .await
+}
+
+/// A gateway whose whole config `yaml` makes from the mock's address (`http://127.0.0.1:…`,
+/// no `/v1`), parsed with `cloud_test` as given; clients as [`gateway`]'s, plus `worker`.
+async fn gateway_from(yaml: impl FnOnce(&str) -> String, cloud_test: bool) -> Gw {
     let up = Arc::new(Upstream::default());
     let app = Router::new()
         .route("/v1/models", get(|| async { Json(json!({"data": []})) }))
         .route("/v1/chat/completions", post(mock))
         .with_state(up.clone());
     let (upstream, stop_up) = serve(app).await;
-    let models = Models::from_yaml(&format!(
-        "upstreams: {{a: '{upstream}/v1'}}\n\
-         roles:\n  default: {{upstream: a, model: qwen-test}}\n  extraction: {{upstream: a, model: nemo-test}}\n\
-         limits: {limits}\nclients: {clients}\n"
-    ))
-    .unwrap();
+    let models = Models::parse(&yaml(&upstream), cloud_test).unwrap();
     let usage = Arc::new(UsageLog::new(None).unwrap());
     let client = |name: &str, token: &str| Client {
         name: name.into(),
@@ -205,12 +218,14 @@ async fn gateway(limits: &str, clients: &str) -> Gw {
             client("other", OTHER),
             client("bot-pm-ana", BOT_ANA),
             client("bot-docs", BOT_DOCS),
+            client("bot-pm-ana-k", BOT_ANA_K),
+            client("worker", WORKER),
         ],
         usage: usage.clone(),
         stub: false,
         workarounds_on: true,
         anthropic_key: String::new(),
-        remote_key: String::new(),
+        remote_key: "limits-test-remote-key".into(),
         retry: Default::default(),
         timeouts: Default::default(),
     }))
@@ -638,6 +653,16 @@ fn the_deploy_config_caps_evals_at_one_slot() {
     assert_eq!(m.limits.person_queue(), 2 * m.limits.per_user);
     // R3: the Spark's gateway is the production one.
     assert_eq!(m.class, GatewayClass::Production);
+    // G3 (review at 6bb806f): a client that may name anyone holds one of a PM's two running
+    // slots at most; the PM's own bot may hold both.
+    for c in ["runtime", "bot-docs"] {
+        assert_eq!(m.client_policy(c).per_user_share, 1, "{c}");
+    }
+    assert_eq!(own.per_user_share, m.limits.per_user);
+    assert!(
+        m.limits.per_user >= 2,
+        "a PM keeps a slot beside a team bot"
+    );
 }
 
 /// R1: a client `bot-pm-<handle>` (pattern `bot-pm-*`, `user: from-name`) may name only that
@@ -755,8 +780,8 @@ fn every_valid_handle_fits_a_client_name_that_names_only_it() {
         assert_eq!(p.may_name(&client, h), fits, "{client} naming {h}");
         if fits {
             // The one key it is kept under is the form its name spells.
-            assert_eq!(p.person_key(&client, h), spelled_handle(h));
-            assert_eq!(format!("bot-pm-{}", p.person_key(&client, h)), client);
+            assert_eq!(person_key(h), spelled_handle(h));
+            assert_eq!(format!("bot-pm-{}", person_key(h)), client);
         }
         for other in ["zz-someone-else", "ana-x"] {
             if handle_in_name(other) != handle_in_name(h) {
@@ -1107,7 +1132,269 @@ async fn the_deploy_config_serves_as_test_with_the_stub_and_production_without()
                 .await
                 .unwrap();
             assert_eq!(res.status(), 200);
+            // G2 (review at 6bb806f): readiness says so too, so `pmos-admin status` can show
+            // it; it names no address. (With the stub off, readiness asks the model servers,
+            // which aren't here; `a_production_gateway_says_its_class_when_ready` covers it.)
+            let ready = reqwest::get(format!("{base}/readyz")).await.unwrap();
+            assert_eq!(ready.status(), 200, "the stub answers, so it is ready");
+            let ready: Value = ready.json().await.unwrap();
+            assert_eq!(
+                (&ready["class"], &ready["stub"]),
+                (&json!("test"), &json!(true))
+            );
+            assert!(!ready.to_string().contains("pmos.internal"), "{ready}");
         }
         stop.cancel();
+    }
+}
+
+/// G2 (review at 6bb806f): `/readyz` says the class and that the stub is off, without an
+/// address or a key, for a production gateway and a test one alike.
+#[tokio::test]
+async fn a_production_gateway_says_its_class_when_ready() {
+    // A test gateway in front of a model server that answers: ready, class `test`.
+    let gw = gateway("{}", "{}").await;
+    let v: Value = reqwest::get(format!("{}/readyz", gw.base))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["ready"], true);
+    assert_eq!((&v["class"], &v["stub"]), (&json!("test"), &json!(false)));
+    // Labels by role, never the model server's address (the route needs no token).
+    assert_eq!(
+        v["upstreams"],
+        json!({"default": {"upstream": "local", "status": "ok"},
+               "extraction": {"upstream": "local", "status": "ok"}})
+    );
+    let host = gw.upstream.trim_start_matches("http://");
+    assert!(!v.to_string().contains(host), "{v}");
+    assert!(!v.to_string().contains("127.0.0.1"), "{v}");
+    drop(gw);
+    // A production one (its hosts are `<name>.pmos.internal`, which don't resolve here, so
+    // the class is set after parsing a local config): nothing listens on port 9, so it isn't
+    // ready, and still says what it is.
+    let mut models = Models::from_yaml(
+        "upstreams: {a: 'http://127.0.0.1:9/v1'}\nroles: {default: {upstream: a, model: m}}\n",
+    )
+    .unwrap();
+    models.class = GatewayClass::Production;
+    let (base, stop) = serve(router(GatewayConfig {
+        models,
+        clients: vec![Client {
+            name: "runtime".into(),
+            token: RUNTIME.into(),
+        }],
+        usage: Arc::new(UsageLog::new(None).unwrap()),
+        stub: false,
+        workarounds_on: true,
+        anthropic_key: String::new(),
+        remote_key: String::new(),
+        retry: Default::default(),
+        timeouts: Default::default(),
+    }))
+    .await;
+    let res = reqwest::get(format!("{base}/readyz")).await.unwrap();
+    assert_eq!(res.status(), 503);
+    let v: Value = res.json().await.unwrap();
+    assert_eq!(
+        (&v["class"], &v["stub"]),
+        (&json!("production"), &json!(false))
+    );
+    // The one that doesn't answer is named by its role, not its address.
+    assert_eq!(v["upstreams"]["default"]["status"], "down");
+    assert!(!v.to_string().contains("127.0.0.1"), "{v}");
+    stop.cancel();
+}
+
+/// G1 (review at 6bb806f): one person's running cap (`per-user`) holds across clients for a
+/// handle with `.` or `_`. Before, the runtime and team bots kept `ana.k` and `bot-pm-ana-k`
+/// kept `ana-k`, so Ana had `per-user` slots under each key and her usage was split.
+#[tokio::test]
+async fn a_persons_running_cap_holds_across_clients_for_a_dotted_handle() {
+    let gw = Arc::new(
+        gateway(
+            "{max-in-flight: 8, per-user: 2}",
+            "{runtime: {trusted: true, max-in-flight: 8, per-user-share: 2}, \
+              bot-pm-*: {trusted: true, max-in-flight: 8, user: from-name}, \
+              bot-*: {trusted: true, max-in-flight: 8, per-user-share: 2}}",
+        )
+        .await,
+    );
+    let send = |token: &'static str, user: &'static str| {
+        let gw = gw.clone();
+        tokio::spawn(async move {
+            ask(&gw, token, "slow 300", false)
+                .header("x-pmos-user", user)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+    // The runtime names `ana.k`, her own bot `ana-k`: two of her two slots.
+    let a = send(RUNTIME, "ana.k");
+    let b = send(BOT_ANA_K, "ana.k");
+    eventually("both run", async || load(&gw).await == (2, 0)).await;
+    // A third call for her waits, through any client and in any spelling...
+    let c = send(BOT_DOCS, "ana_k");
+    let d = send(RUNTIME, "ana-k");
+    eventually("two wait", async || load(&gw).await == (2, 2)).await;
+    // ...while someone else's starts at once.
+    assert_eq!(send(RUNTIME, "bo").await.unwrap(), 200);
+    for h in [a, b, c, d] {
+        assert_eq!(h.await.unwrap(), 200);
+    }
+    // Her usage is under one name, whichever client made the call.
+    let users: std::collections::BTreeSet<_> = gw
+        .usage
+        .recent()
+        .into_iter()
+        .filter(|e| e.user.as_deref() != Some("bo"))
+        .map(|e| (e.user, e.status))
+        .collect();
+    assert_eq!(users, [(Some("ana-k".to_string()), 200)].into());
+}
+
+/// G3 (review at 6bb806f): a client that may name anyone (`user: any`, such as a team bot's
+/// token) holds at most its `per-user-share` of one person's running slots, 1 by default, so
+/// that person's own calls always find one; dispatch is oldest-first, so before, two of the
+/// team bot's calls could take both.
+#[tokio::test]
+async fn a_team_bot_holds_at_most_its_share_of_a_pms_slots() {
+    let gw = Arc::new(
+        gateway(
+            "{max-in-flight: 4, per-user: 2}",
+            "{runtime: {trusted: true}, bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}, \
+              bot-*: {trusted: true, max-in-flight: 3}}",
+        )
+        .await,
+    );
+    let send = |token: &'static str, text: &'static str| {
+        let gw = gw.clone();
+        tokio::spawn(async move {
+            ask(&gw, token, text, false)
+                .header("x-pmos-user", "ana")
+                .send()
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+    let docs: Vec<_> = (0..3).map(|_| send(BOT_DOCS, "slow 400")).collect();
+    eventually("one runs, two wait", async || load(&gw).await == (1, 2)).await;
+    // Ana's own bot gets her other slot at once, though bot-docs asked first.
+    let t = std::time::Instant::now();
+    assert_eq!(send(BOT_ANA, "now").await.unwrap(), 200);
+    assert!(
+        t.elapsed() < Duration::from_millis(300),
+        "her own bot waited"
+    );
+    // Her own bot may hold both of her slots; one of them is still bot-docs'.
+    let own: Vec<_> = (0..2).map(|_| send(BOT_ANA, "slow 300")).collect();
+    eventually("her bot holds her second slot", async || {
+        load(&gw).await == (2, 3)
+    })
+    .await;
+    for h in docs.into_iter().chain(own) {
+        assert_eq!(h.await.unwrap(), 200);
+    }
+    // The share is configurable, up to `per-user`, and only for a trusted client.
+    let m = |clients: &str| {
+        Models::from_yaml(&format!(
+            "upstreams: {{a: 'http://vllm/v1'}}\nroles: {{default: {{upstream: a, model: m}}}}\n\
+             limits: {{per-user: 2}}\nclients: {clients}\n"
+        ))
+    };
+    let ok = m("{bot-*: {trusted: true, per-user-share: 2}, bot-pm-*: {trusted: true, user: from-name}, runtime: {trusted: true}}").unwrap();
+    assert_eq!(ok.client_policy("bot-docs").per_user_share, 2);
+    assert_eq!(
+        ok.client_policy("bot-pm-ana").per_user_share,
+        2,
+        "from-name: its own PM"
+    );
+    assert_eq!(
+        ok.client_policy("runtime").per_user_share,
+        1,
+        "user: any: 1 by default"
+    );
+    for (clients, want) in [
+        (
+            "{bot-*: {trusted: true, per-user-share: 0}}",
+            "1 to limits.per-user",
+        ),
+        (
+            "{bot-*: {trusted: true, per-user-share: 3}}",
+            "1 to limits.per-user",
+        ),
+        ("{evals: {per-user-share: 1}}", "trusted: true"),
+    ] {
+        let err = m(clients).unwrap_err();
+        assert!(err.contains(want), "{clients}: {err}");
+    }
+}
+
+/// G3 and the test stack's eval mode: `scripts/claude-test-stack.sh` with `PMOS_TEST_EVALS=1`
+/// runs every attempt as the one user `evals` through its one trusted `worker` token, one
+/// call per lane. Its gateway config (the heredoc in the script, read here as written) gives
+/// `worker` the whole of that person's `per-user`, so 4 lanes still have 4 calls in flight,
+/// and the judges' `evals` token its 2 beside them.
+#[tokio::test]
+async fn the_test_stacks_eval_lanes_keep_one_call_in_flight_each() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let script = std::fs::read_to_string(root.join("scripts/claude-test-stack.sh")).unwrap();
+    // The script's rule: more than two lanes raise per-user to the lanes, in-flight to that + 2.
+    assert!(script.contains("GW_PER_USER=$EVALS_PARALLEL GW_IN_FLIGHT=$((EVALS_PARALLEL + 2))"));
+    let start = script.find("cat >\"$GATEWAY_CONFIG\" <<EOF\n").unwrap();
+    let body = &script[start..];
+    let body = &body[body.find('\n').unwrap() + 1..body.find("\nEOF\n").unwrap()];
+    // The config as the shell writes it, for a model server at `up`.
+    let render = |up: &str, per_user: usize, in_flight: usize| {
+        let text = body
+            .replace("${PMOS_TEST_MODEL_URL%/}", &format!("{up}/v1"))
+            .replace("${PMOS_TEST_MODEL_FAST:-$PMOS_TEST_MODEL}", "m-fast")
+            .replace("$PMOS_TEST_MODEL", "m")
+            .replace("$GW_IN_FLIGHT", &in_flight.to_string())
+            .replace("$GW_PER_USER", &per_user.to_string())
+            .replace("\\`", "`");
+        assert!(!text.contains('$'), "{text}");
+        text
+    };
+    for (lanes, per_user, in_flight) in [(4usize, 4usize, 6usize), (2, 2, 4)] {
+        let m = Models::parse(&render("http://127.0.0.1:9", per_user, in_flight), true).unwrap();
+        for c in ["runtime", "worker"] {
+            assert_eq!(
+                m.client_policy(c).per_user_share,
+                per_user,
+                "{c}'s share of `evals` is all of per-user"
+            );
+        }
+        let gw = Arc::new(gateway_from(|up| render(up, per_user, in_flight), true).await);
+        let send = |token: &'static str, user: Option<&'static str>| {
+            let gw = gw.clone();
+            tokio::spawn(async move {
+                let mut req = ask(&gw, token, "slow 400", false);
+                if let Some(u) = user {
+                    req = req.header("x-pmos-user", u);
+                }
+                req.send().await.unwrap().status()
+            })
+        };
+        let mut calls: Vec<_> = (0..lanes).map(|_| send(WORKER, Some("evals"))).collect();
+        calls.extend((0..2).map(|_| send(EVALS, None)));
+        eventually("every lane and judge runs", async || {
+            load(&gw).await == ((lanes + 2) as u64, 0)
+        })
+        .await;
+        for h in calls {
+            assert_eq!(h.await.unwrap(), 200);
+        }
+    }
+    // The Claude test config the script uses otherwise keeps two calls per person, as before.
+    let text = std::fs::read_to_string(root.join("config/gateway.claude-test.yaml")).unwrap();
+    let m = Models::parse(&text, true).unwrap();
+    for c in ["runtime", "worker"] {
+        assert_eq!(m.client_policy(c).per_user_share, m.limits.per_user, "{c}");
     }
 }

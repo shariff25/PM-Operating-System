@@ -1060,6 +1060,24 @@ async fn unique_keys_and_addresses_never_reused(env: &Env) {
         )
         .await;
     assert_eq!(refusal(r), Refusal::Exists);
+    // Nor is a handle spelled as another's (the Low on colliding handles, review at 6bb806f):
+    // `ana.`, `ana_` and `ana-` are all `ana` in a bot's name and to the model gateway, which
+    // keeps each person's calls under that spelling.
+    for h in ["ana.", "ana_", "ana-", "ana.."] {
+        let r = env
+            .apply(
+                &host(),
+                Op::CreateUser {
+                    user: person(h, &[UserRole::Pm]),
+                },
+            )
+            .await;
+        let Err(e) = r else {
+            panic!("{h} was created beside ana")
+        };
+        assert!(e.to_string().contains("as `ana` already is"), "{h}: {e}");
+    }
+    assert!(env.dir().await.get("ana.").is_none());
     // Sign-in name and Atlassian email are separate columns.
     env.apply(
         &host(),
@@ -1381,6 +1399,42 @@ async fn import_bootstrap_idempotent_and_conflicts(env: &Env) {
     let ana = env.dir().await.get("ana").cloned().unwrap();
     assert_eq!(ana.sign_in_name.as_deref(), Some("ana@contoso.com"));
     assert!(ana.has(UserRole::Reviewer));
+
+    // A new handle spelled as an existing one (`ana_`), or as one created earlier in the same
+    // file (`zed_q` after `zed.q`), is a conflict and not created; the rest are (the Low on
+    // colliding handles, review at 6bb806f).
+    let clashing = format!(
+        "{TEAM}  - handle: ana_\n    slack-id: U0ANAU\n    roles: [pm]\n  \
+         - handle: zed.q\n    slack-id: U0ZEDQ\n    roles: [pm]\n  \
+         - handle: zed_q\n    slack-id: U0ZEDQU\n    roles: [pm]\n"
+    );
+    let preview = env
+        .store
+        .preview(
+            &importer(),
+            &import(&clashing, ImportMode::Members),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    for (h, other) in [("ana_", "ana"), ("zed_q", "zed.q")] {
+        let line = preview
+            .lines
+            .iter()
+            .find(|l| l.contains(&format!("`{h}`")))
+            .unwrap();
+        assert!(
+            line.contains("conflict") && line.contains(&format!("as `{other}` is")),
+            "{line}"
+        );
+    }
+    assert!(
+        preview
+            .lines
+            .iter()
+            .any(|l| l.contains("create ") && l.contains("`zed.q`")),
+        "{preview:?}"
+    );
     let import_events = env
         .events()
         .await

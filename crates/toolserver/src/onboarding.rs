@@ -34,7 +34,8 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use pmos_contract::model::{valid_email, valid_slack_id};
 use pmos_contract::onboarding::{
-    bot_path, personal_bot_name, propose_handle, render_personal_bot, valid_new_handle,
+    bot_path, personal_bot_name, propose_handle, render_personal_bot, spelled_handle,
+    valid_new_handle,
 };
 use serde_json::{json, Value};
 
@@ -453,7 +454,11 @@ impl Onboarding {
         }
         let store = &self.svc.stores().member_requests;
         // Handles are never reused, deactivated people's included.
+        // So are their spelled forms (`ana-k` for `ana.k`): a proposed handle is always spelled
+        // as itself, and one spelled as another user's would share that user's model slots
+        // and bot name (the Low on colliding handles, review at 6bb806f).
         let mut taken: BTreeSet<String> = dir.users.keys().cloned().collect();
+        taken.extend(dir.users.keys().map(|h| spelled_handle(h)));
         taken.extend(
             store
                 .list(Some(RequestStatus::Pending))

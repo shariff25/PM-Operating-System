@@ -6,8 +6,9 @@
 //!   local server. A concrete model name is refused, so callers never depend on one.
 //! - `GET /v1/models`: the role aliases.
 //! - `GET /v1/pmos/workarounds`: the workaround registry and which roles use what (D11).
-//! - `GET /healthz` (process up), `GET /readyz` (every model server answers; `cloud_test` says
-//!   whether a testing-only upstream, whose prompts leave this machine, is on).
+//! - `GET /healthz` (process up), `GET /readyz` (every model server answers; `class` and `stub`
+//!   say what kind of gateway is serving, `cloud_test` whether a testing-only upstream, whose
+//!   prompts leave this machine, is on).
 //!
 //! - `GET /v1/pmos/roles`: each role's model id and upstream kind (never an address), and
 //!   whether the stub or a testing-only upstream is on, for the benchmark runner's report.
@@ -265,12 +266,8 @@ async fn list_roles(State(state): State<AppState>) -> Response {
         .roles
         .values()
         .map(|r| {
-            let upstream = match r.kind {
-                UpstreamKind::OpenAi => "local",
-                UpstreamKind::ClaudeTest => "claude-test",
-                UpstreamKind::RemoteOpenAi => "remote-test",
-            };
-            json!({"role": r.name, "alias": r.alias(), "model": r.model, "upstream": upstream})
+            json!({"role": r.name, "alias": r.alias(), "model": r.model,
+                   "upstream": upstream_label(r.kind)})
         })
         .collect();
     let cloud_test = state
@@ -289,11 +286,33 @@ async fn list_roles(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
+/// The neutral label for an upstream's kind, never its address: what `GET /v1/pmos/roles` and
+/// `GET /readyz` show.
+fn upstream_label(kind: UpstreamKind) -> &'static str {
+    match kind {
+        UpstreamKind::OpenAi => "local",
+        UpstreamKind::ClaudeTest => "claude-test",
+        UpstreamKind::RemoteOpenAi => "remote-test",
+    }
+}
+
+/// `GET /readyz`. Every answer says the gateway's `class` as served (`production` only for a
+/// `class: production` config with the stub off) and whether the stub is on, never an address
+/// or a key, so `deploy/pmos-admin status` can say plainly when a host serves stub answers or
+/// isn't production-class (finding G2 of the review at 6bb806f: a host left on the first
+/// install's `PMOS_GATEWAY_STUB=1` answered ready with nothing else to show it).
+///
+/// `upstreams` is keyed by role (`default`, `extraction`, ...), each with its upstream's kind
+/// label and `ok` or `down`: labels only, never an address, host name, URL or key. The route
+/// needs no token, and before the review at 6bb806f its keys were the model servers' base
+/// URLs, so it named their hosts (and a remote test upstream's provider).
 async fn readyz(State(state): State<AppState>) -> Response {
     let (running, waiting) = state.0.sched.snapshot();
+    let class = state.0.models.class.as_str();
     if state.0.stub {
-        return Json(json!({"ready": true, "stub": true, "running": running, "waiting": waiting}))
-            .into_response();
+        return Json(json!({"ready": true, "class": class, "stub": true,
+                           "running": running, "waiting": waiting}))
+        .into_response();
     }
     let mut upstreams: Vec<String> = state
         .0
@@ -310,7 +329,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
         .roles
         .values()
         .any(|r| r.kind.is_cloud_test());
-    let mut checks = serde_json::Map::new();
+    let mut up_by_base = std::collections::HashMap::new();
     let mut ok = true;
     for base in upstreams {
         let remote = state
@@ -335,8 +354,23 @@ async fn readyz(State(state): State<AppState>) -> Response {
         .await
         .is_ok_and(|r| r.is_ok_and(|r| r.status().is_success()));
         ok &= up;
-        checks.insert(base, json!(if up { "ok" } else { "down" }));
+        up_by_base.insert(base, up);
     }
+    // By role, with labels only (no address, host, URL or key).
+    let checks: serde_json::Map<String, Value> = state
+        .0
+        .models
+        .roles
+        .values()
+        .map(|r| {
+            let up = up_by_base.get(&r.upstream).copied().unwrap_or(false);
+            (
+                r.name.clone(),
+                json!({"upstream": upstream_label(r.kind),
+                       "status": if up { "ok" } else { "down" }}),
+            )
+        })
+        .collect();
     let status = if ok {
         StatusCode::OK
     } else {
@@ -345,8 +379,8 @@ async fn readyz(State(state): State<AppState>) -> Response {
     (
         status,
         Json(
-            json!({"ready": ok, "upstreams": checks, "cloud_test": cloud_test,
-                    "running": running, "waiting": waiting}),
+            json!({"ready": ok, "class": class, "stub": false, "upstreams": checks,
+                    "cloud_test": cloud_test, "running": running, "waiting": waiting}),
         ),
     )
         .into_response()
@@ -402,8 +436,8 @@ fn caller(headers: &HeaderMap, client: &str, policy: &ClientPolicy) -> Result<Ca
     }
     Ok(if policy.trusted {
         Caller {
-            // One key per person a `from-name` client may name (`ClientPolicy::person_key`).
-            user: declared.user.map(|u| policy.person_key(client, &u)),
+            // One key per person, whichever client names them (`config::person_key`, G1).
+            user: declared.user.map(|u| crate::config::person_key(&u)),
             run: declared.run,
             priority: declared.priority.unwrap_or(policy.priority),
         }
@@ -692,6 +726,8 @@ async fn forward(
         workarounds: Vec::new(),
         refused: Some(refused),
         refused_count: None,
+        refused_users: Vec::new(),
+        refused_users_more: None,
     };
     let who = match caller(&headers, &client, &policy) {
         Ok(c) => c,
@@ -724,8 +760,10 @@ async fn forward(
     // The person's cap applies when the gateway believes the person (a trusted client's
     // `X-Pmos-User`); the client's own cap always applies. Without a believed person, the
     // client's cap alone bounds its calls. The same holds for calls waiting (R2).
-    let owner =
-        Owner::new(who.user.as_deref(), &client, policy.max_in_flight).with_queue(policy.max_queue);
+    // A client may hold only its share of the person's running slots (G3).
+    let owner = Owner::new(who.user.as_deref(), &client, policy.max_in_flight)
+        .with_queue(policy.max_queue)
+        .with_person_share(policy.per_user_share);
     let permit = match slot(inner, &owner, who.priority).await {
         Ok(p) => p,
         Err(why) => {
@@ -764,6 +802,8 @@ async fn forward(
         workarounds: Vec::new(),
         refused: None,
         refused_count: None,
+        refused_users: Vec::new(),
+        refused_users_more: None,
     };
     let model_header = HeaderValue::from_str(&role.model).ok();
     let finish = |mut res: Response| {

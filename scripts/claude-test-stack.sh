@@ -301,9 +301,11 @@ limits:
   max-queue: 64
 # The runtime and the one \`worker\` token all harness workers here share name the PM (so
 # they're trusted) and may use every slot; \`evals\` is the benchmark judges (docs/gateway.md).
+# Each eval lane asks as the one user evals through \`worker\`, so it may hold all of that
+# person's per-user slots (per-user-share; a client that may name anyone holds 1 by default).
 clients:
-  runtime: {trusted: true, max-in-flight: $GW_IN_FLIGHT}
-  worker: {trusted: true, max-in-flight: $GW_IN_FLIGHT}
+  runtime: {trusted: true, max-in-flight: $GW_IN_FLIGHT, per-user-share: $GW_PER_USER}
+  worker: {trusted: true, max-in-flight: $GW_IN_FLIGHT, per-user-share: $GW_PER_USER}
   evals: {max-in-flight: 2, priority: personal}
 EOF
 else

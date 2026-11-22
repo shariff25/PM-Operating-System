@@ -408,7 +408,16 @@ pub(crate) fn plan_import(
                         taken.push(format!("the Slack id (`{}`)", other.handle));
                     }
                 }
-                if !taken.is_empty() {
+                // A handle spelled as an existing one, or one created earlier in this file, is
+                // (`ana_k` beside `ana.k`): the model gateway and a bot's name would share it.
+                if let Some(other) = b.spelling_clash(h) {
+                    conflicts += 1;
+                    b.lines.push(format!(
+                        "conflict   `{h}`: not created; it is spelled `{}` in a bot's name and by \
+                         the model gateway, as `{other}` is",
+                        pmos_contract::onboarding::spelled_handle(h)
+                    ));
+                } else if !taken.is_empty() {
                     conflicts += 1;
                     b.lines.push(format!(
                         "conflict   `{h}`: not created; {} belong to another user",
