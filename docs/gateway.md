@@ -83,6 +83,16 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
   as "The model is busy" (`harness/src/worker.ts`). An SDK retry in the harness would
   multiply with this one, so keep it off or small.
 
+## How long a model server may take
+- **A streamed answer** may go silent for at most 120 seconds between bytes; a server silent
+  that long is stuck, and the caller gets a `502`.
+- **An answer that isn't streamed** (most of the harness's calls, and every call to the Claude
+  test upstream) sends nothing until it is whole, so it gets 600 seconds from the request to
+  its last byte instead. Before 2026-11-21 it had the 120-second silence limit too, which cut
+  off every non-streamed generation longer than that as a `502` (found in the first eval run,
+  on a remote model writing long Confluence drafts).
+- Both are `Timeouts` in `crates/gateway/src/app.rs`.
+
 ## API
 | Endpoint | Auth | Purpose |
 | --- | --- | --- |

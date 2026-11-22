@@ -136,6 +136,32 @@ and whether a workaround can be deleted:
 run is lost. Every run counts toward its week, so a change that breaks a category fails that
 week (see **History** below).
 
+### On the test stack
+Before the Spark's eval stack is available, the benchmarks run on this machine's test stack
+(`scripts/claude-test-stack.sh`, `docs/testing-with-claude.md`) with a cloud model behind the
+gateway. Prompts leave the machine, so it runs on the fake fixtures only.
+`PMOS_TEST_EVALS=1` sets it up the way `deploy/compose.evals.yaml` does:
+- `evals`, `ben` and `cy` join the seed (`pm` only), so the tool server gives `evals` every
+  offered persona (`chief`, `sprout`, `echo`) and the persona categories pass the team check;
+- a personal bot `pm-evals`, with `PMOS_TEST_EVALS_WORKERS` workers (default 1, at most 8);
+- runtime clients `evals` and `console` (the trace reader), `PMOS_EVALS_AS=evals`, and
+  assertions off with the development override, as on the eval stack (so it can't be combined
+  with `PMOS_TEST_WEB=1`); a gateway client `evals` for the judges;
+- the docs tools on the fake docs fixtures, unless `PMOS_DOCS_BASE_URL` is set.
+
+It writes the runner's settings, with this run's fresh tokens, to `$STATE/evals.env`
+(mode 0600). In a second shell:
+
+```sh
+set -a; . state/claude-test/evals.env; set +a
+target/debug/pmos-evals run --category jira-draft --concurrency 3 --note "model: <name>"
+```
+
+The gateway lets one person have two model calls in flight (`limits.per-user`). With another
+provider (`PMOS_TEST_MODEL_URL`) and more than two workers, the script raises that to one call
+per worker, so `--concurrency` up to the number of workers runs in parallel; watch the
+provider's rate limits (`429`s in `$STATE/usage.jsonl`).
+
 ## Reading a report
 
 `evals/reports/<date>-<category>.md` has these parts.
@@ -308,7 +334,8 @@ Every failure gets exactly one tag. The rules run in this order, and the first m
 
 **Terms in the rules:**
 - **"Error"** is the task's `error` field, lowercased, checked only for tasks that ended
-  `failed`.
+  `failed`. A word in a rule matches only at the start of a word: `restart` matches
+  "restarts", but `lease` doesn't match "please".
 - **"Trace"** is the task's trace, when the runner could read it. Entry kinds are
   `prompt`, `model_reply`, `tool_call`, `tool_result` and `policy_denial`.
 - **A tool's name** is the `tool` or `name` field of an entry's body.
@@ -320,7 +347,7 @@ Every failure gets exactly one tag. The rules run in this order, and the first m
 | 3 | `policy-error` | policy | `policy/refused` | The error says `policy`, `denied`, `forbidden`, `not permitted` or `403` |
 | 4 | `never-claimed` | harness | `harness/never-claimed` | Timed out while still `queued`: no worker picked it up |
 | 5 | `cancelled` | harness | `harness/cancelled` | The task was cancelled; nothing in a benchmark cancels tasks |
-| 6 | `interrupted` | harness | `harness/interrupted` | The error says `interrupted`, `restart`, `lease`, `heartbeat`, `worker`, `sandbox` or `gateway`. This covers restarts (D2), the worker and its sandbox, and the model endpoint being unreachable. |
+| 6 | `interrupted` | harness | `harness/interrupted` | The error says `interrupted`, `restart`, `lease`, `heartbeat`, `worker`, `sandbox`, `gateway`, `model is busy` or `model is still busy`. This covers restarts (D2), the worker and its sandbox, and the model endpoint being unreachable or busy (a `429` or `503` after the gateway's retries). |
 | 7 | `silent-timeout` | harness | `harness/silent-timeout` | Timed out while `working`, with no events: the worker never reported progress |
 | 8 | `done-without-answer` | harness | `harness/empty-answer` | Ended `done` with an empty result |
 | 9 | `drafts-unreadable` | harness | `harness/drafts-unreadable` | The task has `drafts` checks and its drafts couldn't be read |
@@ -884,3 +911,17 @@ because the load test measures the stack PMs use.
 - **A check "now fails"** in the gate when it fails in every candidate attempt, and "passed in
   the baseline" when it failed in none. A check that fails in only some attempts shows in the
   paired difference instead, so one unlucky run doesn't fail the gate on its own.
+- **Attempts are not isolated: a pending Slack reply blocks the next one (found in E1, open).**
+  Every attempt asks as `evals` on one tool server, and nobody decides eval drafts. The tool
+  server allows one pending `slack.post_reply` per person and message (or thread), so once one
+  attempt drafts a reply, every later attempt that drafts to that message (a repeat, another
+  task on the seed thread, or another category, such as `chief`'s `nudge-on-request` after
+  `slack-reply`) gets `already_drafted`, drafts nothing, and fails as
+  `model/wrong-draft-count`. `slack-reply` and `nudge-on-request` therefore measure nothing
+  after their first draft in a run. No other write tool is deduplicated this way. The runner
+  has no way to clear an attempt's drafts (no client may decide an eval task's drafts), so
+  the fix needs a decision: for example a runtime route for client `evals` that rejects an
+  `eval` task's pending drafts after grading, or a fresh tool server per attempt. Until then,
+  measure those tasks one attempt per fresh stack. E1 did, on the test stack: `slack-reply`
+  passed 20 of 27 attempts that way against 7 of 27 in the shared run, and
+  `nudge-on-request` 3 of 3 against 0 of 3.

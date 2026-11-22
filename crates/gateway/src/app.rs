@@ -50,6 +50,28 @@ pub struct GatewayConfig {
     pub remote_key: String,
     /// How a `429`/`503` from an upstream is retried (`retry.rs`).
     pub retry: RetryPolicy,
+    /// How long an upstream may take ([`Timeouts`]).
+    pub timeouts: Timeouts,
+}
+
+/// How long an upstream may take. A streamed answer sends bytes as it goes, so a stream that
+/// goes silent for `stream_silence` is stuck. An answer that isn't streamed (most calls the
+/// harness makes, and every call to the Claude test upstream) sends nothing until it's
+/// whole, so it gets `whole_answer` from the request to its last byte: with only the silence
+/// limit, every generation longer than it was cut off as a `502`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    pub stream_silence: Duration,
+    pub whole_answer: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            stream_silence: Duration::from_secs(120),
+            whole_answer: Duration::from_secs(600),
+        }
+    }
 }
 
 struct Inner {
@@ -58,9 +80,11 @@ struct Inner {
     clients: Vec<Client>,
     usage: Arc<UsageLog>,
     sched: Arc<Scheduler>,
+    /// For streamed answers: [`Timeouts::stream_silence`] between bytes.
     http: reqwest::Client,
-    /// For the testing-only Claude upstream: a whole answer arrives at once, so allow longer.
-    claude_http: reqwest::Client,
+    /// For answers that arrive whole (not streamed, and the testing-only Claude upstream):
+    /// [`Timeouts::whole_answer`] in all.
+    whole_http: reqwest::Client,
     stub: bool,
     workarounds_on: bool,
     anthropic_key: String,
@@ -97,12 +121,12 @@ pub fn router(cfg: GatewayConfig) -> Router {
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         // A long generation streams for minutes; a server that goes silent this long is stuck.
-        .read_timeout(Duration::from_secs(120))
+        .read_timeout(cfg.timeouts.stream_silence)
         .build()
         .expect("http client builds");
-    let claude_http = reqwest::Client::builder()
+    let whole_http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(600))
+        .timeout(cfg.timeouts.whole_answer)
         .build()
         .expect("http client builds");
     let state = AppState(Arc::new(Inner {
@@ -111,7 +135,7 @@ pub fn router(cfg: GatewayConfig) -> Router {
         usage: cfg.usage,
         sched,
         http,
-        claude_http,
+        whole_http,
         stub: cfg.stub,
         workarounds_on: cfg.workarounds_on,
         anthropic_key: cfg.anthropic_key,
@@ -467,7 +491,14 @@ async fn forward(
     let mut attempt = 0u32;
     let outcome = loop {
         attempt += 1;
-        let post = inner.http.post(&url);
+        // Not streamed: nothing arrives until the answer is whole, so the silence limit
+        // would cut off every long generation.
+        let client = if stream {
+            &inner.http
+        } else {
+            &inner.whole_http
+        };
+        let post = client.post(&url);
         // The client's own gateway token never goes upstream; the remote key does.
         let post = if remote {
             post.bearer_auth(&inner.remote_key)
@@ -557,7 +588,13 @@ async fn forward(
             return finish(res);
         }
         Attempt::Down(e) => {
-            tracing::warn!(upstream = %role.upstream, error = %e, "model server unreachable");
+            tracing::warn!(
+                upstream = %role.upstream,
+                error = %e,
+                cause = %causes(&e),
+                timeout = e.is_timeout(),
+                "model server unreachable"
+            );
             event.status = 502;
             event.latency_ms = started.elapsed().as_millis() as u64;
             inner.usage.record(event);
@@ -684,7 +721,7 @@ async fn claude(
         }
     };
     let res = inner
-        .claude_http
+        .whole_http
         .post(format!("{}/v1/messages", role.upstream))
         .header("x-api-key", &inner.anthropic_key)
         .header("anthropic-version", anthropic::API_VERSION)
@@ -735,5 +772,50 @@ async fn claude(
             .into_response()
     } else {
         Json(answer).into_response()
+    }
+}
+
+/// What lies under a transport error ("connection reset by peer", "operation timed out"),
+/// which reqwest's own message ("error sending request for url ...") leaves out. Never holds
+/// a header, so never the remote key.
+fn causes(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = Vec::new();
+    let mut next = e.source();
+    while let Some(cause) = next {
+        out.push(cause.to_string());
+        next = cause.source();
+    }
+    out.join(": ")
+}
+
+#[cfg(test)]
+mod causes_tests {
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as _)
+        }
+    }
+
+    #[test]
+    fn lists_every_cause_under_the_error() {
+        let e = Layer(
+            "error sending request",
+            Some(Box::new(Layer(
+                "client error (SendRequest)",
+                Some(Box::new(Layer("connection reset by peer", None))),
+            ))),
+        );
+        assert_eq!(
+            super::causes(&e),
+            "client error (SendRequest): connection reset by peer"
+        );
+        assert_eq!(super::causes(&Layer("alone", None)), "");
     }
 }

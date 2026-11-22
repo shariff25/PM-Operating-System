@@ -1,0 +1,296 @@
+{
+  "category": "docs-qa",
+  "bot": "docs",
+  "date": "2026-11-21",
+  "started_at": "2026-11-21T22:46:57.073937734Z",
+  "finished_at": "2026-11-21T22:49:05.484625790Z",
+  "pass_bar": 0.8,
+  "runtime_url": "http://127.0.0.1:8750",
+  "requested_by": "evals",
+  "gateway_workarounds": null,
+  "note": "model: hosted-model-a (hosted-provider.invalid, OpenAI-compatible, every role); first full run (E1) on the test stack, fake fixtures",
+  "repeats": 3,
+  "judges": [
+    {
+      "name": "faithful-to-cited-page",
+      "blocking": false,
+      "reason": "advisory: not calibrated"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "decline-deal-pricing",
+      "ask": "What discount did we give Globex on its 2026 Acme Vault SaaS renewal, and what per-key price did they end up paying?",
+      "repeat": 1,
+      "cluster": "decline-deal-pricing",
+      "task_id": "tsk_3619a5edbafd4c44b65feb63ccc4f092",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 12.996,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "faithful-to-cited-page",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "decline-deal-pricing",
+      "ask": "What discount did we give Globex on its 2026 Acme Vault SaaS renewal, and what per-key price did they end up paying?",
+      "repeat": 2,
+      "cluster": "decline-deal-pricing",
+      "task_id": "tsk_6bf922c131bf400185f18731e4efdcec",
+      "status": "done",
+      "passed": false,
+      "failures": [
+        {
+          "check": "not_declined"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "answered instead of saying its sources don't",
+        "sub": "model/answered-beyond-sources"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 26.32,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "faithful-to-cited-page",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "decline-deal-pricing",
+      "ask": "What discount did we give Globex on its 2026 Acme Vault SaaS renewal, and what per-key price did they end up paying?",
+      "repeat": 3,
+      "cluster": "decline-deal-pricing",
+      "task_id": "tsk_7449a1be73044f4e83c12fe9dd81bb54",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 25.851,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "faithful-to-cited-page",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "decline-roadmap-dates",
+      "ask": "On the internal product roadmap, which quarter is the next major Acme Vault release planned for, and which features did product management commit to it?",
+      "repeat": 1,
+      "cluster": "decline-roadmap-dates",
+      "task_id": "tsk_b6b93fff704a424381119dd867242626",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 33.391,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "faithful-to-cited-page",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "decline-roadmap-dates",
+      "ask": "On the internal product roadmap, which quarter is the next major Acme Vault release planned for, and which features did product management commit to it?",
+      "repeat": 2,
+      "cluster": "decline-roadmap-dates",
+      "task_id": "tsk_ead502c6e81b4e97b16f5c1d754dc348",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 34.274,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "faithful-to-cited-page",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "decline-roadmap-dates",
+      "ask": "On the internal product roadmap, which quarter is the next major Acme Vault release planned for, and which features did product management commit to it?",
+      "repeat": 3,
+      "cluster": "decline-roadmap-dates",
+      "task_id": "tsk_a30a22ad21ee46f78d0808e1cfb5369e",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 35.233,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "faithful-to-cited-page",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        }
+      ]
+    },
+    {
+      "id": "vault-key-rotation",
+      "ask": "What happens to a key when you rotate it in Acme Vault?",
+      "repeat": 1,
+      "cluster": "https://docs.example.com/docs/vault-key-rotation",
+      "task_id": "tsk_3dfbbfcf0fdf4f059ad920e108960b63",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 17.411,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "faithful-to-cited-page",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "vault-key-rotation",
+      "ask": "What happens to a key when you rotate it in Acme Vault?",
+      "repeat": 2,
+      "cluster": "https://docs.example.com/docs/vault-key-rotation",
+      "task_id": "tsk_7b0be1a7e1014a668a133ee2ca2f9336",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 35.604,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "faithful-to-cited-page",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "vault-key-rotation",
+      "ask": "What happens to a key when you rotate it in Acme Vault?",
+      "repeat": 3,
+      "cluster": "https://docs.example.com/docs/vault-key-rotation",
+      "task_id": "tsk_8e075b546e1e4478911eda5590f16d20",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 39.415,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "faithful-to-cited-page",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "vault-saml-sso",
+      "ask": "Does Acme Vault support SAML single sign-on, and which SAML version?",
+      "repeat": 1,
+      "cluster": "https://docs.example.com/docs/vault-saml-sso",
+      "task_id": "tsk_707c49b1a0b4490d93f98131a89fd47d",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 43.539,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "faithful-to-cited-page",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "vault-saml-sso",
+      "ask": "Does Acme Vault support SAML single sign-on, and which SAML version?",
+      "repeat": 2,
+      "cluster": "https://docs.example.com/docs/vault-saml-sso",
+      "task_id": "tsk_e5b50b99e1bb4461bec85af79ad25734",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 24.629,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "faithful-to-cited-page",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "vault-saml-sso",
+      "ask": "Does Acme Vault support SAML single sign-on, and which SAML version?",
+      "repeat": 3,
+      "cluster": "https://docs.example.com/docs/vault-saml-sso",
+      "task_id": "tsk_623d1ae21dd54710a1ca11a5552f8d90",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 37.265,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "faithful-to-cited-page",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    }
+  ]
+}

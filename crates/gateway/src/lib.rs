@@ -20,4 +20,4 @@ pub mod stub;
 pub mod usage;
 pub mod workarounds;
 
-pub use app::{router, GatewayConfig};
+pub use app::{router, GatewayConfig, Timeouts};

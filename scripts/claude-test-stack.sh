@@ -49,6 +49,21 @@
 #                         for this run, and print a one-time setup code for you (sign-in name
 #                         <handle>@example.com) once the stack is up. Fake data only.
 #
+# Optional benchmarks (docs/evals.md, "On the test stack"):
+#   PMOS_TEST_EVALS=1     also set the stack up for `pmos-evals run`, the way the eval stack
+#                         (deploy/compose.evals.yaml) is: the users evals, ben and cy in the
+#                         seed (so the evals account gets every offered persona on its team),
+#                         a personal bot pm-evals with its own worker, runtime clients `evals`
+#                         and `console` (the runner's trace reader; so assertions stay off with
+#                         the development override, and this can't be combined with
+#                         PMOS_TEST_WEB=1), and a gateway client `evals` for the judges. The
+#                         runner's settings are written to $STATE/evals.env (mode 0600; it holds
+#                         this run's tokens): `set -a; . $STATE/evals.env; set +a`.
+#   PMOS_TEST_EVALS_WORKERS  with PMOS_TEST_EVALS=1: how many pm-evals workers (default 1), for
+#                         `pmos-evals run --concurrency N`. With another provider and more than
+#                         two, the gateway lets the evals user have one model call in flight
+#                         per worker (two otherwise).
+#
 # Stop with Ctrl-C; every service is stopped with it.
 set -euo pipefail
 
@@ -72,6 +87,15 @@ if [ "${PMOS_TEST_PASSWORD_LOGIN:-}" = 1 ] && [ "${PMOS_TEST_WEB:-}" != 1 ]; the
   echo "error: PMOS_TEST_PASSWORD_LOGIN=1 needs PMOS_TEST_WEB=1 (it is a way to sign in to the web app)" >&2
   exit 1
 fi
+if [ "${PMOS_TEST_EVALS:-}" = 1 ] && [ "${PMOS_TEST_WEB:-}" = 1 ]; then
+  echo "error: PMOS_TEST_EVALS=1 can't be combined with PMOS_TEST_WEB=1 (the runner's trace reader needs assertions off)" >&2
+  exit 1
+fi
+EVALS_WORKERS="${PMOS_TEST_EVALS_WORKERS:-1}"
+case "$EVALS_WORKERS" in
+  [1-8]) ;;
+  *) echo "error: PMOS_TEST_EVALS_WORKERS must be 1 to 8" >&2; exit 1 ;;
+esac
 
 # --- Slack app preflight -------------------------------------------------------------------
 # Before anything starts: both tokens are valid and belong to the same Slack app, and the bot
@@ -176,10 +200,24 @@ else
   printf 'members:\n  - {handle: "%s", slack-id: "%s", roles: [pm, admin]}\n' \
     "$HANDLE" "$PMOS_TEST_SLACK_ID" >"$STATE/users.seed.yaml"
 fi
+if [ "${PMOS_TEST_EVALS:-}" = 1 ]; then
+  # As deploy/pmos-admin's eval_stack_up: `evals` (whom the tasks are for; the tool server
+  # seeds its team with every offered persona) and the teammates the fake Slack fixtures name.
+  printf '  - {handle: %s, slack-id: %s, roles: [pm]}\n' evals U0EVALS ben U0BEN cy U0CY \
+    >>"$STATE/users.seed.yaml"
+  "$BIN/pmos" bot add-personal --root "$STATE/content" --handle evals >/dev/null
+  echo "   benchmarks: evals, ben and cy in the seed; bot pm-evals"
+fi
 "$BIN/pmos" lint --root "$STATE/content" | tail -1
 
 if [ -n "${PMOS_TEST_MODEL_URL:-}" ]; then
   GATEWAY_CONFIG="$STATE/gateway.yaml"
+  # One person may have two model calls in flight; the benchmarks ask as one person (evals), so
+  # with more pm-evals workers that person may have one call in flight per worker.
+  GW_PER_USER=2 GW_IN_FLIGHT=4
+  if [ "${PMOS_TEST_EVALS:-}" = 1 ] && [ "$EVALS_WORKERS" -gt 2 ]; then
+    GW_PER_USER=$EVALS_WORKERS GW_IN_FLIGHT=$((EVALS_WORKERS + 2))
+  fi
   echo "== gateway config in $GATEWAY_CONFIG ($MODEL_DESC)"
   cat >"$GATEWAY_CONFIG" <<EOF
 # TESTING ONLY, written by scripts/claude-test-stack.sh: every role on a remote
@@ -191,8 +229,8 @@ roles:
   reasoning: {upstream: remote, model: "$PMOS_TEST_MODEL"}
   extraction: {upstream: remote, model: "${PMOS_TEST_MODEL_FAST:-$PMOS_TEST_MODEL}"}
 limits:
-  max-in-flight: 4
-  per-user: 2
+  max-in-flight: $GW_IN_FLIGHT
+  per-user: $GW_PER_USER
   max-queue: 64
 EOF
 else
@@ -221,6 +259,27 @@ if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
   SLACK_WEB_FEED=(PMOS_WEB_URL=http://127.0.0.1:8770 PMOS_WEB_BRIEF_TOKEN="$WEB_BRIEF_TOKEN")
 else
   SLACK_WEB_FEED=()
+fi
+# Benchmarks: the runner's runtime clients (`evals`, and `console` to read traces), the
+# pm-evals workers' token, and a gateway client `evals` for the judges. With a console token
+# the runtime requires assertions unless the development override is set; the runner can't
+# sign them, so this stack runs them off, as deploy/compose.evals.yaml does (fake data, fresh
+# tokens, this machine only).
+GW_TOKENS="runtime=$GW_RUNTIME,worker=$GW_WORKER" BOTS_EVALS=()
+if [ "${PMOS_TEST_EVALS:-}" = 1 ]; then
+  RT_EVALS=$(tok) RT_CONSOLE=$(tok) RT_EVALS_WORKER=$(tok) GW_EVALS=$(tok)
+  BOTS_TOKENS="$BOTS_TOKENS,evals=$RT_EVALS,console=$RT_CONSOLE,worker-pm-evals=$RT_EVALS_WORKER"
+  GW_TOKENS="$GW_TOKENS,evals=$GW_EVALS"
+  ASSERTION_MODE=off
+  BOTS_EVALS=(PMOS_EVALS_AS=evals PMOS_ASSERTION_INSECURE_OFF=1)
+  (
+    umask 077
+    printf '%s\n' "# Written by scripts/claude-test-stack.sh for this run only; it holds tokens." \
+      "PMOS_BOTS_URL=http://127.0.0.1:8750" "PMOS_EVALS_TOKEN=$RT_EVALS" \
+      "PMOS_EVALS_TRACE_TOKEN=$RT_CONSOLE" "PMOS_EVALS_AS=evals" \
+      "PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1" "PMOS_EVALS_GATEWAY_TOKEN=$GW_EVALS" \
+      "NO_PROXY=127.0.0.1,localhost" >"$STATE/evals.env"
+  )
 fi
 # Password sign-in (docs/password-sign-in.md): a vault key for this run to seal the
 # authenticator secret with, and a setup code the tool server writes to a 0600 file at start-up
@@ -264,6 +323,13 @@ start docs env PMOS_DEV=1 PMOS_DOCS_TOKEN="$DOCS_TOKEN" PMOS_DOCS_BIND=127.0.0.1
   "$BIN/pmos-docs"
 wait_for http://127.0.0.1:8730/healthz docs
 
+# The docs tools read pmos-docs (your docs site); with PMOS_TEST_EVALS=1 and no
+# PMOS_DOCS_BASE_URL they read the fake docs fixtures instead, which docs-qa and pm-craft's
+# tasks are written against (as deploy/compose.evals.yaml, PMOS_DOCS_URL empty).
+TS_DOCS_URL=http://127.0.0.1:8730/mcp
+if [ "${PMOS_TEST_EVALS:-}" = 1 ] && [ -z "${PMOS_DOCS_BASE_URL:-}" ]; then
+  TS_DOCS_URL=""
+fi
 # Every service decides who may use PM OS from the tool server's user database, in memory
 # here, seeded from $STATE/users.seed.yaml (you, as pm and admin).
 start toolserver env PMOS_DEV=1 PMOS_CONNECTORS=fake \
@@ -271,13 +337,13 @@ start toolserver env PMOS_DEV=1 PMOS_CONNECTORS=fake \
   PMOS_SERVICE_TOKEN="$SERVICE_TOKEN" PMOS_BOT_TOKEN="$BOT_TOKEN" \
   PMOS_WEB_TOKEN="$TS_WEB" PMOS_ASSERTION_MODE="$ASSERTION_MODE" PMOS_ASSERTION_KEYS="$AK_TOOLS" \
   PMOS_CONTENT_ROOT="$STATE/content" PMOS_AUDIT_LOG="$STATE/audit.jsonl" \
-  PMOS_DOCS_URL=http://127.0.0.1:8730/mcp PMOS_DOCS_TOKEN="$DOCS_TOKEN" \
+  PMOS_DOCS_URL="$TS_DOCS_URL" PMOS_DOCS_TOKEN="$DOCS_TOKEN" \
   ${TS_PASSWORD[@]+"${TS_PASSWORD[@]}"} \
   "$BIN/pmos-toolserver"
 wait_for http://127.0.0.1:8710/healthz toolserver
 
 start gateway env PMOS_GATEWAY_CLOUD_TEST=1 PMOS_GATEWAY_CONFIG="$GATEWAY_CONFIG" \
-  PMOS_GATEWAY_TOKENS="runtime=$GW_RUNTIME,worker=$GW_WORKER" \
+  PMOS_GATEWAY_TOKENS="$GW_TOKENS" \
   PMOS_GATEWAY_USAGE_LOG="$STATE/usage.jsonl" \
   "$BIN/pmos-gateway"
 wait_for http://127.0.0.1:8740/healthz gateway
@@ -285,13 +351,14 @@ wait_for http://127.0.0.1:8740/healthz gateway
 start bots env PMOS_DEV=1 PMOS_CONTENT_ROOT="$STATE/content" \
   PMOS_BOTS_TOKENS="$BOTS_TOKENS" \
   PMOS_ASSERTION_MODE="$ASSERTION_MODE" PMOS_ASSERTION_KEYS="$AK_BOTS" \
+  ${BOTS_EVALS[@]+"${BOTS_EVALS[@]}"} \
   PMOS_TOOLSERVER_URL=http://127.0.0.1:8710 PMOS_SERVICE_TOKEN="$SERVICE_TOKEN" \
   PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1 PMOS_GATEWAY_TOKEN="$GW_RUNTIME" \
   "$BIN/pmos-bots"
 wait_for http://127.0.0.1:8750/healthz bots
 
-worker() { # bot, token
-  start "worker-$1" env PMOS_BOTS_URL=http://127.0.0.1:8750 PMOS_WORKER_BOT="$1" \
+worker() { # bot, token[, log name]
+  start "${3:-worker-$1}" env PMOS_BOTS_URL=http://127.0.0.1:8750 PMOS_WORKER_BOT="$1" \
     PMOS_WORKER_TOKEN="$2" PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1 \
     PMOS_GATEWAY_TOKEN="$GW_WORKER" PMOS_TOOLSERVER_MCP_URL=http://127.0.0.1:8710/mcp \
     PMOS_CONTENT_ROOT="$STATE/content" NO_PROXY="127.0.0.1,localhost" \
@@ -299,6 +366,11 @@ worker() { # bot, token
 }
 worker docs "$RT_DOCS"
 worker "$BOT_PERSONAL" "$RT_PERSONAL"
+if [ "${PMOS_TEST_EVALS:-}" = 1 ]; then
+  for i in $(seq 1 "$EVALS_WORKERS"); do
+    worker pm-evals "$RT_EVALS_WORKER" "worker-pm-evals-$i"
+  done
+fi
 
 start slack env PMOS_SLACK_APP_TOKEN="$PMOS_SLACK_APP_TOKEN" \
   PMOS_SLACK_BOT_TOKEN="$PMOS_SLACK_BOT_TOKEN" \
@@ -334,6 +406,10 @@ if [ "${PMOS_TEST_PASSWORD_LOGIN:-}" = 1 ]; then
   # TESTING ONLY: a one-time code for this run's fake account, shown so you can set it up.
   echo "   Password sign-in: set up with sign-in name $HANDLE@example.com and the one-time code"
   echo "   $(cat "$STATE/password-setup-code") (24 hours; you'll need an authenticator app)."
+fi
+if [ "${PMOS_TEST_EVALS:-}" = 1 ]; then
+  echo "   Benchmarks: set -a; . $STATE/evals.env; set +a; then"
+  echo "   target/debug/pmos-evals run --category <c> --note \"model: ${PMOS_TEST_MODEL:-the test model}\" (tasks for evals, on pm-evals)"
 fi
 echo "   Logs: $STATE/logs; model calls (who, role, tokens; never text): $STATE/usage.jsonl."
 echo "   Prompts go to the test model off this machine: fake data only. Ctrl-C stops everything."
