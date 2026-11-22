@@ -214,7 +214,7 @@ fn isolation(args: &RunArgs, token: &str, trace_token: Option<&str>) -> Result<O
                     .collect(),
                 urls,
                 fresh: pmos_evals::isolate::command(program.clone()),
-                how: format!("`{}` before each", program.display()),
+                how: format!("`{}` before each", file_name(program)),
             }))
         }
     }

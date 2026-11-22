@@ -59,10 +59,21 @@
 #                         PMOS_TEST_WEB=1), and a gateway client `evals` for the judges. The
 #                         runner's settings are written to $STATE/evals.env (mode 0600; it holds
 #                         this run's tokens): `set -a; . $STATE/evals.env; set +a`.
-#   PMOS_TEST_EVALS_WORKERS  with PMOS_TEST_EVALS=1: how many pm-evals workers (default 1), for
-#                         `pmos-evals run --concurrency N`. With another provider and more than
-#                         two, the gateway lets the evals user have one model call in flight
-#                         per worker (two otherwise).
+#   PMOS_TEST_EVALS_LANES with PMOS_TEST_EVALS=1: how many isolated benchmark lanes (default 1,
+#                         at most 8; 0 for none). A lane is a runtime of its own (127.0.0.1:
+#                         8750 + 100 n) with a docs and a pm-evals worker, and a tool server of
+#                         its own (8710 + 100 n) that scripts/eval-fresh-toolserver.sh replaces
+#                         with a fresh one before every attempt, so no attempt sees a draft an
+#                         earlier one left (docs/evals.md, "Isolated attempts"). evals.env then
+#                         names the lanes and the fresh command (PMOS_EVALS_LANES,
+#                         PMOS_EVALS_FRESH_CMD), and `pmos-evals run` runs one attempt per lane
+#                         at a time.
+#   PMOS_TEST_EVALS_WORKERS  with PMOS_TEST_EVALS=1: how many pm-evals workers on the main
+#                         runtime (default 1), for runs without lanes (`pmos-evals run
+#                         --concurrency N` with PMOS_EVALS_LANES unset: attempts share one tool
+#                         server). With another provider, the gateway lets the evals user have
+#                         one model call in flight per lane or worker, whichever is more (at
+#                         least two).
 #
 # Stop with Ctrl-C; every service is stopped with it.
 set -euo pipefail
@@ -96,6 +107,12 @@ case "$EVALS_WORKERS" in
   [1-8]) ;;
   *) echo "error: PMOS_TEST_EVALS_WORKERS must be 1 to 8" >&2; exit 1 ;;
 esac
+EVALS_LANES="${PMOS_TEST_EVALS_LANES:-1}"
+case "$EVALS_LANES" in
+  [0-8]) ;;
+  *) echo "error: PMOS_TEST_EVALS_LANES must be 0 to 8" >&2; exit 1 ;;
+esac
+[ "${PMOS_TEST_EVALS:-}" = 1 ] || EVALS_LANES=0
 
 # --- Slack app preflight -------------------------------------------------------------------
 # Before anything starts: both tokens are valid and belong to the same Slack app, and the bot
@@ -214,9 +231,12 @@ if [ -n "${PMOS_TEST_MODEL_URL:-}" ]; then
   GATEWAY_CONFIG="$STATE/gateway.yaml"
   # One person may have two model calls in flight; the benchmarks ask as one person (evals), so
   # with more pm-evals workers that person may have one call in flight per worker.
+  # Isolated lanes ask as evals too: one call in flight per lane or worker, whichever is more.
   GW_PER_USER=2 GW_IN_FLIGHT=4
-  if [ "${PMOS_TEST_EVALS:-}" = 1 ] && [ "$EVALS_WORKERS" -gt 2 ]; then
-    GW_PER_USER=$EVALS_WORKERS GW_IN_FLIGHT=$((EVALS_WORKERS + 2))
+  EVALS_PARALLEL=$EVALS_WORKERS
+  [ "$EVALS_LANES" -gt "$EVALS_PARALLEL" ] && EVALS_PARALLEL=$EVALS_LANES
+  if [ "${PMOS_TEST_EVALS:-}" = 1 ] && [ "$EVALS_PARALLEL" -gt 2 ]; then
+    GW_PER_USER=$EVALS_PARALLEL GW_IN_FLIGHT=$((EVALS_PARALLEL + 2))
   fi
   echo "== gateway config in $GATEWAY_CONFIG ($MODEL_DESC)"
   cat >"$GATEWAY_CONFIG" <<EOF
@@ -279,8 +299,15 @@ if [ "${PMOS_TEST_EVALS:-}" = 1 ]; then
       "PMOS_EVALS_TRACE_TOKEN=$RT_CONSOLE" "PMOS_EVALS_AS=evals" \
       "PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1" "PMOS_EVALS_GATEWAY_TOKEN=$GW_EVALS" \
       "NO_PROXY=127.0.0.1,localhost" >"$STATE/evals.env"
+    if [ "$EVALS_LANES" -gt 0 ]; then
+      lanes=()
+      for i in $(seq 1 "$EVALS_LANES"); do lanes+=("http://127.0.0.1:$((8750 + 100 * i))"); done
+      printf '%s\n' "PMOS_EVALS_LANES=$(IFS=,; echo "${lanes[*]}")" \
+        "PMOS_EVALS_FRESH_CMD=$STATE/fresh-toolserver" >>"$STATE/evals.env"
+    fi
   )
 fi
+rm -rf "$STATE/lanes" "$STATE/fresh-toolserver"
 # Password sign-in (docs/password-sign-in.md): a vault key for this run to seal the
 # authenticator secret with, and a setup code the tool server writes to a 0600 file at start-up
 # (development only; it refuses with a database or live connectors).
@@ -306,6 +333,17 @@ stop() {
   echo
   echo "== stopping"
   for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+  # The lanes' tool servers: started by scripts/eval-fresh-toolserver.sh, so not in PIDS.
+  for f in "$STATE"/lanes/*/toolserver.pid; do
+    [ -f "$f" ] || continue
+    pid=$(cat "$f")
+    if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -q pmos-toolserver; then
+      kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$f"
+  done
+  # Token files: the runner's settings and the lanes' tool server settings.
+  rm -f "$STATE/evals.env" "$STATE/lanes/toolserver.env"
   wait 2>/dev/null || true
 }
 trap stop EXIT INT TERM
@@ -357,10 +395,10 @@ start bots env PMOS_DEV=1 PMOS_CONTENT_ROOT="$STATE/content" \
   "$BIN/pmos-bots"
 wait_for http://127.0.0.1:8750/healthz bots
 
-worker() { # bot, token[, log name]
-  start "${3:-worker-$1}" env PMOS_BOTS_URL=http://127.0.0.1:8750 PMOS_WORKER_BOT="$1" \
+worker() { # bot, token[, log name[, runtime port, tool server port]]
+  start "${3:-worker-$1}" env PMOS_BOTS_URL="http://127.0.0.1:${4:-8750}" PMOS_WORKER_BOT="$1" \
     PMOS_WORKER_TOKEN="$2" PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1 \
-    PMOS_GATEWAY_TOKEN="$GW_WORKER" PMOS_TOOLSERVER_MCP_URL=http://127.0.0.1:8710/mcp \
+    PMOS_GATEWAY_TOKEN="$GW_WORKER" PMOS_TOOLSERVER_MCP_URL="http://127.0.0.1:${5:-8710}/mcp" \
     PMOS_CONTENT_ROOT="$STATE/content" NO_PROXY="127.0.0.1,localhost" \
     node harness/dist/main.js
 }
@@ -369,6 +407,50 @@ worker "$BOT_PERSONAL" "$RT_PERSONAL"
 if [ "${PMOS_TEST_EVALS:-}" = 1 ]; then
   for i in $(seq 1 "$EVALS_WORKERS"); do
     worker pm-evals "$RT_EVALS_WORKER" "worker-pm-evals-$i"
+  done
+fi
+
+# Isolated benchmark lanes (docs/evals.md, "Isolated attempts"). Lane n: a tool server on
+# 8710 + 100 n, a runtime on 8750 + 100 n with the benchmark clients only, and a docs and a
+# pm-evals worker. scripts/eval-fresh-toolserver.sh starts the lane's tool server, and replaces
+# it before every attempt, with these settings: the main tool server's (mode 0600: they hold
+# this run's tokens).
+if [ "$EVALS_LANES" -gt 0 ]; then
+  mkdir -p "$STATE/lanes"
+  (
+    umask 077
+    {
+      echo "# Written by scripts/claude-test-stack.sh for this run only; it holds tokens."
+      printf '%s=%q\n' LANE_TOOLSERVER_BIN "$BIN/pmos-toolserver" \
+        PMOS_DEV 1 PMOS_CONNECTORS fake PMOS_USERS_SEED "$STATE/users.seed.yaml" \
+        PMOS_SERVICE_TOKEN "$SERVICE_TOKEN" PMOS_BOT_TOKEN "$BOT_TOKEN" \
+        PMOS_ASSERTION_MODE off PMOS_CONTENT_ROOT "$STATE/content" \
+        PMOS_DOCS_URL "$TS_DOCS_URL" PMOS_DOCS_TOKEN "$DOCS_TOKEN" NO_PROXY "127.0.0.1,localhost"
+    } >"$STATE/lanes/toolserver.env"
+    printf '#!/usr/bin/env bash\n# pmos-evals runs this before every attempt, as: <this> <lane>.\nexec %q %q "$@"\n' \
+      "$ROOT/scripts/eval-fresh-toolserver.sh" "$STATE" >"$STATE/fresh-toolserver"
+  )
+  chmod 700 "$STATE/fresh-toolserver"
+  LANE_TOKENS="evals=$RT_EVALS,console=$RT_CONSOLE,worker-docs=$RT_DOCS,worker-pm-evals=$RT_EVALS_WORKER"
+  for i in $(seq 1 "$EVALS_LANES"); do
+    ts_port=$((8710 + 100 * i)) rt_port=$((8750 + 100 * i))
+    for port in "$ts_port" "$rt_port"; do
+      if curl -fsS --noproxy '*' -m 2 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
+        echo "error: port $port is in use (lane $i); stop what runs there first" >&2
+        exit 1
+      fi
+    done
+    "$ROOT/scripts/eval-fresh-toolserver.sh" "$STATE" "$i"
+    echo "   toolserver-lane-$i (127.0.0.1:$ts_port; replaced before every attempt)"
+    start "bots-lane-$i" env PMOS_DEV=1 PMOS_CONTENT_ROOT="$STATE/content" \
+      PMOS_BOTS_BIND="127.0.0.1:$rt_port" PMOS_BOTS_TOKENS="$LANE_TOKENS" \
+      PMOS_ASSERTION_MODE=off PMOS_ASSERTION_KEYS="" PMOS_EVALS_AS=evals PMOS_ASSERTION_INSECURE_OFF=1 \
+      PMOS_TOOLSERVER_URL="http://127.0.0.1:$ts_port" PMOS_SERVICE_TOKEN="$SERVICE_TOKEN" \
+      PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1 PMOS_GATEWAY_TOKEN="$GW_RUNTIME" \
+      "$BIN/pmos-bots"
+    wait_for "http://127.0.0.1:$rt_port/healthz" "bots-lane-$i"
+    worker docs "$RT_DOCS" "worker-docs-lane-$i" "$rt_port" "$ts_port"
+    worker pm-evals "$RT_EVALS_WORKER" "worker-pm-evals-lane-$i" "$rt_port" "$ts_port"
   done
 fi
 
@@ -410,6 +492,11 @@ fi
 if [ "${PMOS_TEST_EVALS:-}" = 1 ]; then
   echo "   Benchmarks: set -a; . $STATE/evals.env; set +a; then"
   echo "   target/debug/pmos-evals run --category <c> --note \"model: ${PMOS_TEST_MODEL:-the test model}\" (tasks for evals, on pm-evals)"
+  if [ "$EVALS_LANES" -gt 0 ]; then
+    echo "   Isolated: $EVALS_LANES lane(s), a fresh tool server before every attempt, one attempt per lane at a time."
+  else
+    echo "   Not isolated (PMOS_TEST_EVALS_LANES=0): attempts share one tool server, so a pending draft blocks later attempts."
+  fi
 fi
 echo "   Logs: $STATE/logs; model calls (who, role, tokens; never text): $STATE/usage.jsonl."
 echo "   Prompts go to the test model off this machine: fake data only. Ctrl-C stops everything."
