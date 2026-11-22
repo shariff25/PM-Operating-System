@@ -468,7 +468,7 @@ impl Report {
             if !self.judges.is_empty() {
                 let _ = writeln!(
                     s,
-                    "| Judge | Status | Yes | No | No verdict |\n| --- | --- | --- | --- | --- |"
+                    "| Judge | Status | Yes | No | Unknown | No verdict |\n| --- | --- | --- | --- | --- | --- |"
                 );
                 for j in &self.judges {
                     let verdicts = self
@@ -476,17 +476,18 @@ impl Report {
                         .iter()
                         .flat_map(|t| t.judges.iter())
                         .filter(|v| v.name == j.name);
-                    let (mut yes, mut no, mut none) = (0, 0, 0);
+                    let (mut yes, mut no, mut unknown, mut none) = (0, 0, 0, 0);
                     for v in verdicts {
                         match v.verdict {
                             Some(true) => yes += 1,
                             Some(false) => no += 1,
+                            None if v.unknown => unknown += 1,
                             None => none += 1,
                         }
                     }
                     let _ = writeln!(
                         s,
-                        "| `{}` | {} | {yes} | {no} | {none} |",
+                        "| `{}` | {} | {yes} | {no} | {unknown} | {none} |",
                         j.name,
                         cell(&j.reason)
                     );

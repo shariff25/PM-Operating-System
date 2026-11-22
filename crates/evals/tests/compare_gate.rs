@@ -351,6 +351,7 @@ fn judged(mut r: Report, task: &str, verdict: bool, blocking: bool) -> Report {
             name: "faithful".into(),
             verdict: Some(if l.id == task { verdict } else { true }),
             blocking,
+            unknown: false,
             error: None,
         }];
     }

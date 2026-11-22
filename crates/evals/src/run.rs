@@ -12,7 +12,7 @@ use tokio::task::JoinSet;
 use crate::client::{status, Runtime, RuntimeTask, TraceEntry};
 use crate::grade::{draft_text, grade, Check, Grade};
 use crate::isolate::Isolation;
-use crate::judge::{Gateway, Judge, JudgeStatus, JudgeVerdict};
+use crate::judge::{Gateway, Human, Judge, JudgeStatus, JudgeVerdict, Label, Reply};
 use crate::outcome::Outcome;
 use crate::report::{Report, TaskReport, TurnReport};
 use crate::spec::{resolve_bot, Category, EvalTask, Expect};
@@ -164,6 +164,38 @@ pub struct JudgeRun {
     pub gateway: Gateway,
     /// Each judge that applies to the category, and whether it blocks.
     pub judges: Vec<(Judge, JudgeStatus)>,
+    /// Collects a labelling-pack line (label still empty) for every attempt a judge answered,
+    /// with what it saw and said (`--label-candidates`); `None`: nothing is kept.
+    pub labels: Option<LabelSink>,
+}
+
+/// Labelling-pack lines, by judge name, from one run.
+pub type LabelSink = Arc<std::sync::Mutex<Vec<(String, Label)>>>;
+
+/// What a labelling-pack line shows as the input: [`judge_input`], but with every Slack tool
+/// result left out, because labels are kept in the repository and hold no Slack text
+/// (`docs/evals.md`, LLM judges).
+pub fn judge_input_for_labels(ask: &str, trace: Option<&[TraceEntry]>) -> String {
+    let kept: Vec<TraceEntry> = trace
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| {
+            let tool = e.body["tool"]
+                .as_str()
+                .or_else(|| e.body["name"].as_str())
+                .unwrap_or_default();
+            !(e.kind == "tool_result" && tool.starts_with("slack."))
+        })
+        .cloned()
+        .collect();
+    let dropped = trace.map_or(0, |t| t.len()) - kept.len();
+    let mut s = judge_input(ask, Some(&kept));
+    if dropped > 0 {
+        s.push_str(&format!(
+            "\n\n({dropped} Slack tool result(s) left out of this label: labels hold no Slack text.)"
+        ));
+    }
+    s
 }
 
 /// Options for [`run_category`].
@@ -257,6 +289,8 @@ struct TurnRequest<'a> {
     expect: Option<&'a Expect>,
     /// What the judges are shown as the request; `None`: they aren't asked.
     judge_ask: Option<&'a str>,
+    /// Where a labelling-pack line comes from: `<task> run <n>`.
+    label_from: &'a str,
 }
 
 /// Run one request: follow it, read its drafts when `expect` checks them, grade it, read the
@@ -275,6 +309,7 @@ async fn run_turn(
         ask,
         expect,
         judge_ask,
+        label_from,
     } = req;
     let mut outcome = follow_turn(
         rt,
@@ -335,22 +370,42 @@ async fn run_turn(
             .as_deref()
             .is_some_and(|t| t.iter().any(|e| e.kind == "tool_result"));
         for (judge, status) in &j.judges {
-            let (verdict, error) = if judge.needs_sources && !has_sources {
+            let (reply, error) = if judge.needs_sources && !has_sources {
                 (
                     None,
                     Some("no tool results in the trace to judge against".to_string()),
                 )
             } else {
                 match j.gateway.ask(judge, &input, &output).await {
-                    Ok(Some(v)) => (Some(v), None),
-                    Ok(None) => (None, Some("the reply was neither yes nor no".to_string())),
+                    Ok(r @ (Reply::Yes | Reply::No)) => (Some(r), None),
+                    Ok(Reply::Unknown) => (
+                        Some(Reply::Unknown),
+                        Some("the judge said unknown: not enough to decide".to_string()),
+                    ),
+                    Ok(Reply::Unparsed) => (
+                        None,
+                        Some("the reply was neither yes, no nor unknown".to_string()),
+                    ),
                     Err(e) => (None, Some(e)),
                 }
             };
+            if let (Some(sink), Some(r)) = (&j.labels, reply) {
+                sink.lock().unwrap_or_else(|p| p.into_inner()).push((
+                    judge.name.clone(),
+                    Label {
+                        input: judge_input_for_labels(judge_ask, outcome.trace.as_deref()),
+                        output: output.clone(),
+                        label: Human::Pending,
+                        from: Some(label_from.to_string()),
+                        judge_said: Some(r.word().to_string()),
+                    },
+                ));
+            }
             verdicts.push(JudgeVerdict {
                 name: judge.name.clone(),
-                verdict,
+                verdict: reply.and_then(Reply::verdict),
                 blocking: status.blocking,
+                unknown: reply == Some(Reply::Unknown),
                 error,
             });
         }
@@ -375,11 +430,13 @@ async fn attempt(
     if task.is_thread() {
         return attempt_thread(rt, bot, level, persona, task, repeat, opts).await;
     }
+    let from = format!("{} run {repeat}", task.id);
     let req = TurnRequest {
         conversation: None,
         ask: &task.ask,
         expect: Some(&task.expect),
         judge_ask: Some(&task.ask),
+        label_from: &from,
     };
     let r = run_turn(rt, bot, level, persona, req, opts).await;
     let tag = (!r.grade.passed()).then(|| tag_failure(&r.outcome, &r.grade));
@@ -464,11 +521,13 @@ async fn attempt_thread(
             continue;
         }
         let judge_ask = (i == last).then(|| thread_judge_ask(task, last));
+        let from = format!("{} run {repeat}, turn {n}", task.id);
         let req = TurnRequest {
             conversation: Some(&conversation),
             ask: &turn.ask,
             expect: turn.expect.as_ref(),
             judge_ask: judge_ask.as_deref(),
+            label_from: &from,
         };
         let r = run_turn(rt, bot, level, persona, req, opts).await;
         let tag = (!r.grade.passed()).then(|| {
