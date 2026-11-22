@@ -16,7 +16,10 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   written as a spec and reviewed before it is built (`docs/user-database-spec.md`).
   Built 2026-11-18 (slices U1 to U7): every service decides from the database and `team.yaml`
   is retired. Security gate passed on 2026-11-21 at `04c175f` (no open High or Critical for the
-  user database and password sign-in; Medium findings G1 to G5 are being fixed).
+  user database and password sign-in; Medium findings G1 to G5 were fixed afterwards).
+  Gate passed again on 2026-11-22 at `11a5768`, from reading the code (no open High or Critical
+  for the user database, password sign-in, the bot marketplace and the first eval run; Medium
+  findings N1 to N5 are being fixed).
 - **c. Policy Admin** for NVIDIA OpenShell. The app opens a pull request; the merge happens in
   GitHub.
   Owner, 2026-11-18, plan only (build nothing until the plan is approved): add OpenShell's
@@ -64,10 +67,15 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   screens, Slack, the Admin's view, and Chief writing the daily brief. Every bot but Nudge is a
   Preview until its content file claims a benchmark that lint verifies against an eval report.
   The security gate did not pass at `8e8f8fe` (one High: the web app dropped the Preview label);
-  the fixes are at `c00e682` and the reviewer's re-check is pending. Real run on the test stack
+  the fixes are at `c00e682` and the reviewer confirmed the High closed on 2026-11-22. Real run on the test stack
   at `c00e682` with fake data: pick a team in onboarding, ask Chief and Echo, attributed drafts,
   Echo's draft line, approving after a bot left the team, the Admin's view. Not verified: a real
-  Slack workspace, a held draft and the brief switch on the stack, and any eval run.
+  Slack workspace, a held draft and the brief switch on the stack.
+  First eval run on 2026-11-21 and 22 (E1, the owner's model `hosted-model-a`, fake data, 93 tasks
+  three times each; reports in `evals/reports/`): 4 of 11 categories met their bar. It is not a
+  valid benchmark: attempts shared one inbox, 28 attempts were lost to the provider's connection,
+  and the judges have no human labels. Attempts are isolated since E2 (test stack only). Every
+  new bot stays a Preview.
 - **h. Dropped by the owner on 2026-11-17:** the review of how the Grok bot was built. Do not
   build it.
 
@@ -103,8 +111,10 @@ follow-up tracking.
 ## Waiting on the owner
 
 GitHub Actions starting jobs again on the account (every CI job on pull request #10 ends within
-seconds without running); an Entra app registration, with `acct` as an optional claim; a model
-key with enough quota for an eval run; pilot PM names; edits to the nudge wording; a GitHub App
+seconds without running: check whether this still holds); an Entra app registration, with `acct`
+as an optional claim; human labels for the eval judges (`evals/judges/LABELLING.md`); the two
+edits to Chief's role text and whether the model provider's host name may appear in committed
+eval reports; pilot PM names; edits to the nudge wording; a GitHub App
 with pull-request permission and branch protection on the content branch; approval of the three
 plans (MCP servers and which ones for the pilot, the OpenShell prover, sandbox decisions in the
 audit log) and the go-ahead for requirement i; the CODEOWNERS lines and branch-protection settings in
