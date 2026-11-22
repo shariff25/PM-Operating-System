@@ -24,11 +24,12 @@
 //!   signed-in routes use the open allowance only, never the reserve (H1, LA). Routes that
 //!   compute no hash (the second step, a setup's first step and confirmation) take nothing.
 //!   **Shares** (the gate review of 04c175f, G1 and G5, as changed by the review of 8e8f8fe,
-//!   M4): while fewer than [`SHARES_FROM_PER_MINUTE`] hashes (80%) of the open allowance were
-//!   taken in the last minute, anyone takes one; past that, each network block ([`block_key`]:
-//!   an IPv4 /24, an IPv6 /48) takes at most [`BLOCK_SHARE_PER_MINUTE`] of the last fifth, so
-//!   a quiet minute never holds up a busy office behind one address, and a flood from one or a
-//!   few blocks still can't fill the allowance (that takes ten blocks); each address takes at most
+//!   M4): each network block ([`block_key`]: an IPv4 /24, an IPv6 /48) takes at most
+//!   [`BLOCK_OPEN_PER_MINUTE`] (a fifth) of the open allowance in any rolling minute (the review
+//!   of 8e8f8fe, a Low: before, one block took up to 246); once [`SHARES_FROM_PER_MINUTE`]
+//!   hashes (80%) were taken in the minute, each block takes at most [`BLOCK_SHARE_PER_MINUTE`]
+//!   of the last fifth too. So a busy office behind one address takes its 60 in a minute, and a
+//!   flood from a few blocks can't fill the allowance (that takes fourteen); each address takes at most
 //!   [`RESERVE_PER_ADDRESS_PER_MINUTE`] of the reserve and each block at most
 //!   [`RESERVE_PER_BLOCK_PER_MINUTE`], so someone who signed in from many addresses can't fill
 //!   the reserve either.
@@ -77,12 +78,20 @@ pub const GLOBAL_PER_MINUTE: usize = 300;
 /// signed in from in the last [`KNOWN_SOURCE_DAYS`] days.
 pub const GLOBAL_RESERVE_PER_MINUTE: usize = 120;
 /// Hashes of the open allowance taken in the last minute (80% of [`GLOBAL_PER_MINUTE`]) from
-/// which the block shares apply (the review of 8e8f8fe, M4). Below it, any block takes one: a
-/// 30-person office behind one address signs in during a quiet minute, typos included.
+/// which the band shares apply (the review of 8e8f8fe, M4). Below it, a block takes up to
+/// [`BLOCK_OPEN_PER_MINUTE`]: a 30-person office behind one address signs in during a quiet
+/// minute, typos included.
 pub const SHARES_FROM_PER_MINUTE: usize = GLOBAL_PER_MINUTE * 4 / 5;
+/// The most one network block ([`block_key`]) takes of the open allowance in any rolling
+/// minute, at any load (the review of 8e8f8fe, a Low): a fifth of [`GLOBAL_PER_MINUTE`]. A
+/// 30-person office behind one address, each person mistyping once, takes 60 hashes: all of
+/// them. Before, a block took hashes freely up to [`SHARES_FROM_PER_MINUTE`], so one IPv6 /48
+/// could take 246 a minute (354,240 guesses a day against one account); now 60 (86,400).
+pub const BLOCK_OPEN_PER_MINUTE: usize = GLOBAL_PER_MINUTE / 5;
 /// The most one network block ([`block_key`]) takes, in any rolling minute, of the open
 /// allowance's last fifth (the 60 past [`SHARES_FROM_PER_MINUTE`]): a tenth of it, so filling
-/// the allowance takes at least ten blocks however much one flood took below it (G1, M4).
+/// the last fifth takes at least ten blocks however much one flood took below it (G1, M4), and
+/// the whole allowance fourteen (four of [`BLOCK_OPEN_PER_MINUTE`] first).
 pub const BLOCK_SHARE_PER_MINUTE: usize = 6;
 /// The most of the reserve one address takes in any rolling minute (G1): someone who signed in
 /// from many addresses can't fill it from a few.
@@ -96,6 +105,12 @@ pub const RESERVE_PER_BLOCK_PER_MINUTE: usize = 24;
 pub const SETUP_GUESSES_PER_BLOCK: usize = 100;
 /// The window [`SETUP_GUESSES_PER_BLOCK`] is counted in.
 pub const SETUP_GUESS_WINDOW_MINUTES: i64 = 15;
+/// How often, at most, a block's refusals past its setup guesses are recorded in the audit log
+/// (the review of 8e8f8fe, a Low: before, they wrote nothing). One row stands for every refusal
+/// since the block's last one.
+pub const OVER_LIMIT_ROW_EVERY_MINUTES: i64 = 1;
+/// The largest count one such row carries (an audit detail's count has at most six digits).
+pub const OVER_LIMIT_ROW_MAX_COUNT: u32 = 999_999;
 /// Hashing work that follows an authentication, per account, in any [`ACCOUNT_WORK_MINUTES`].
 pub const ACCOUNT_WORK: usize = 10;
 /// The window [`ACCOUNT_WORK`] is counted in.
@@ -462,6 +477,8 @@ struct Seen {
     /// Per block, the hashes it took while the open allowance was past
     /// [`GlobalLimit::shares_from`].
     band_by_block: Windows,
+    /// Per block, every hash it took from the open allowance.
+    open_by_block: Windows,
     reserve_by_block: Windows,
     reserve_by_address: Windows,
 }
@@ -478,6 +495,8 @@ pub struct GlobalLimit {
     shares_from: usize,
     /// Each block's share of the open allowance past `shares_from`.
     block_share: usize,
+    /// Each block's share of the open allowance at any load.
+    block_open: usize,
     reserve_per_address: usize,
     reserve_per_block: usize,
     seen: Mutex<Seen>,
@@ -505,6 +524,13 @@ impl GlobalLimit {
                 band if band >= 10 => BLOCK_SHARE_PER_MINUTE.min(band / 10),
                 _ => per_minute,
             },
+            // A fifth of the whole; an allowance too small to share out in five (a test's few
+            // hashes a minute) has no such share.
+            block_open: if per_minute >= 50 {
+                BLOCK_OPEN_PER_MINUTE.min(per_minute / 5)
+            } else {
+                per_minute
+            },
             reserve_per_address: RESERVE_PER_ADDRESS_PER_MINUTE.min(reserve),
             reserve_per_block: RESERVE_PER_BLOCK_PER_MINUTE.min(reserve),
             seen: Mutex::new(Seen::default()),
@@ -524,9 +550,9 @@ impl GlobalLimit {
         self
     }
 
-    /// Take one hash at `now`: from the open allowance while it has room and, once
-    /// `shares_from` of it were taken in the minute, while the block's share of the rest has
-    /// room too; otherwise, for a draw with `reserve_for`, from the reserve while it, the
+    /// Take one hash at `now`: from the open allowance while it and the block's share of it
+    /// have room and, once `shares_from` of it were taken in the minute, while the block's
+    /// share of the rest has room too; otherwise, for a draw with `reserve_for`, from the reserve while it, the
     /// block's share of it and the address's have room. `Err(retry_after_secs)` when neither.
     pub fn take(&self, now: DateTime<Utc>, draw: Draw<'_>) -> Result<(), u64> {
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
@@ -536,9 +562,12 @@ impl GlobalLimit {
         let open_full = s.open.0.len() >= self.per_minute;
         // M4: the shares apply only once the allowance is nearly full.
         let in_band = s.open.0.len() >= self.shares_from;
-        let block_full = in_band && s.band_by_block.count(draw.block, now) >= self.block_share;
+        let block_open_full = s.open_by_block.count(draw.block, now) >= self.block_open;
+        let band_full = in_band && s.band_by_block.count(draw.block, now) >= self.block_share;
+        let block_full = block_open_full || band_full;
         if !open_full && !block_full {
             s.open.0.push_back(now);
+            s.open_by_block.push(draw.block, now);
             if in_band {
                 s.band_by_block.push(draw.block, now);
             }
@@ -546,6 +575,8 @@ impl GlobalLimit {
         }
         let open_retry = if open_full {
             s.open.retry(now)
+        } else if block_open_full {
+            s.open_by_block.retry(draw.block, now)
         } else {
             s.band_by_block.retry(draw.block, now)
         };
@@ -586,6 +617,9 @@ impl GlobalLimit {
 #[derive(Debug, Default)]
 pub struct BlockGuesses {
     seen: Mutex<Timed>,
+    /// Per block past its guesses: when its last audit row was written, and the refusals since
+    /// ([`Self::note_over_limit`]).
+    over: Mutex<std::collections::HashMap<String, (DateTime<Utc>, u32)>>,
 }
 
 /// Rolling windows of times by key, swept of idle keys on time (each
@@ -674,6 +708,42 @@ impl BlockGuesses {
     /// Blocks tracked now (tests: the sweep).
     pub fn tracked(&self) -> usize {
         self.seen.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Note one refusal past `block`'s guesses at `now`. `Some(n)` when an audit row is due,
+    /// standing for `n` refusals (this one and those since the block's last row): the first
+    /// refusal of a block, then the first one at least [`OVER_LIMIT_ROW_EVERY_MINUTES`] after
+    /// its last row. So a flood writes at most one row a minute per block, fewer than the
+    /// hundred wrong guesses (each a row) it took to get there. Refusals after a block's last
+    /// row are in its next row, if one comes; the tool server's `/readyz` counts every one.
+    pub fn note_over_limit(&self, block: &str, now: DateTime<Utc>) -> Option<u32> {
+        let every = Duration::minutes(OVER_LIMIT_ROW_EVERY_MINUTES);
+        let mut over = self.over.lock().unwrap_or_else(|p| p.into_inner());
+        if over.len() >= MAX_GUESS_BLOCKS && !over.contains_key(block) {
+            // Forget blocks whose last row is a window old (their guesses are forgotten too).
+            over.retain(|_, (at, _)| now - *at < Self::window() && *at <= now);
+            if over.len() >= MAX_GUESS_BLOCKS {
+                // Every one is recent (each took a hundred recorded wrong guesses to get
+                // here): this refusal is counted on `/readyz` only.
+                return None;
+            }
+        }
+        match over.get_mut(block) {
+            Some((at, since)) if now - *at < every && *at <= now => {
+                *since = since.saturating_add(1);
+                None
+            }
+            Some((at, since)) => {
+                let n = since.saturating_add(1).min(OVER_LIMIT_ROW_MAX_COUNT);
+                *at = now;
+                *since = 0;
+                Some(n)
+            }
+            None => {
+                over.insert(block.to_string(), (now, 0));
+                Some(1)
+            }
+        }
     }
 }
 
@@ -834,6 +904,12 @@ mod tests {
         assert!(g.take(at(60), open).is_ok(), "the first left the window");
         assert!(g.take(at(61), open).is_err());
         let d = GlobalLimit::default();
+        assert_eq!(d.block_open, BLOCK_OPEN_PER_MINUTE);
+        assert_eq!(
+            GlobalLimit::new(3, 2).block_open,
+            3,
+            "no fifth of a test's few"
+        );
         assert_eq!(
             (
                 d.per_minute,
@@ -955,10 +1031,22 @@ mod tests {
         assert_ne!(account_block("ana"), b("203.0.113.7"));
     }
 
-    // G1, as changed by M4 (the review of 8e8f8fe): a flood from many addresses in one block
-    // takes the open allowance only up to the point where the shares apply (80%) and its share
-    // of the rest; another block still gets hashes. Before M4 this asserted the flood got 30
-    // (a share from the first hash, which also held up a busy office); it now asserts 240 + 6.
+    /// Fill the open allowance at `now` from blocks nobody else uses, each up to its shares.
+    fn fill_open(g: &GlobalLimit, now: DateTime<Utc>) {
+        for net in 0..=255 {
+            let block = block_key(Some(&format!("10.99.{net}.1")));
+            while g.take(now, Draw::open(&block)).is_ok() {}
+            if g.seen.lock().unwrap().open.0.len() >= GLOBAL_PER_MINUTE {
+                return;
+            }
+        }
+        panic!("the open allowance didn't fill");
+    }
+
+    // G1, as changed by M4 and a Low of the review of 8e8f8fe: a flood from many addresses in
+    // one block takes at most a fifth of the open allowance; another block still gets hashes.
+    // Before M4 this asserted the flood got 30 (a share from the first hash, which also held
+    // up a busy office); after M4 240 + 6 (one /48 could take 246 a minute); it now asserts 60.
     #[test]
     fn one_block_takes_only_its_share_of_the_open_allowance() {
         let g = GlobalLimit::default();
@@ -972,17 +1060,30 @@ mod tests {
                 granted += 1;
             }
         }
-        assert_eq!(granted, SHARES_FROM_PER_MINUTE + BLOCK_SHARE_PER_MINUTE);
+        assert_eq!(granted, BLOCK_OPEN_PER_MINUTE);
+        assert_eq!(BLOCK_OPEN_PER_MINUTE, 60);
         let elsewhere = block_key(Some("198.51.100.66"));
         assert!(g.take(at(1), Draw::open(&elsewhere)).is_ok());
-        // Ten blocks' floods can fill it: then only the reserve is left.
-        for net in 0..10 {
+        // Filling it takes fourteen blocks: four of 60 to 80%, then ten of 6.
+        let mut blocks = 1;
+        let mut taken = BLOCK_OPEN_PER_MINUTE + 1;
+        for net in 0..20 {
             let block = block_key(Some(&format!("192.0.{net}.1")));
-            for _ in 0..BLOCK_SHARE_PER_MINUTE {
-                g.take(at(2), Draw::open(&block)).ok();
+            let mut got = 0;
+            while g.take(at(2), Draw::open(&block)).is_ok() {
+                got += 1;
+            }
+            taken += got;
+            if got > 0 {
+                blocks += 1;
+            }
+            if taken >= GLOBAL_PER_MINUTE {
+                break;
             }
         }
         assert_eq!(g.seen.lock().unwrap().open.0.len(), GLOBAL_PER_MINUTE);
+        // The flood's block and `elsewhere` (one hash) count among them.
+        assert!(blocks >= 14, "{blocks}");
         let fresh = block_key(Some("100.64.0.1"));
         assert!(g.take(at(3), Draw::open(&fresh)).is_err());
         let addr = source_key(Some("100.64.0.1"));
@@ -998,12 +1099,12 @@ mod tests {
         assert!(g.take(at(61), Draw::open(&flood)).is_ok(), "a minute on");
     }
 
-    // M4 (the review of 8e8f8fe): in a quiet minute one block, even one address, takes as much
-    // of the open allowance as it needs up to 80%: a 30-person office behind one address, each
-    // mistyping once, takes 60 hashes and none is refused. Once the allowance is nearly full,
-    // G1 holds: each block then takes at most 6 more, so the flood that brought it there is
-    // held to its share, filling the rest takes ten blocks, and a block nobody used still gets
-    // a hash while two other floods run.
+    // M4 (the review of 8e8f8fe): in a quiet minute one block, even one address, takes what it
+    // needs up to its fifth: a 30-person office behind one address, each mistyping once, takes
+    // 60 hashes and none is refused (a Low of the same review capped a block at that fifth at
+    // any load; before, it asserted the office could go on to 80%). Once the allowance is
+    // nearly full, G1 holds: each block then takes at most 6 more, so filling the rest takes
+    // ten blocks, and a block nobody used still gets a hash while two other floods run.
     #[test]
     fn a_quiet_minute_has_no_shares_and_a_nearly_full_one_does() {
         let g = GlobalLimit::default();
@@ -1011,12 +1112,20 @@ mod tests {
         for i in 0..60 {
             assert!(g.take(at(i % 60), Draw::open(&office)).is_ok(), "{i}");
         }
-        // Junk from elsewhere brings it to 80%.
-        let flood = block_key(Some("192.0.2.1"));
-        for _ in 0..(SHARES_FROM_PER_MINUTE - 60) {
-            assert!(g.take(at(59), Draw::open(&flood)).is_ok());
+        assert!(
+            g.take(at(59), Draw::open(&office)).is_err(),
+            "a block's fifth, even in a quiet minute"
+        );
+        // Junk from three other blocks brings it to 80%.
+        for net in 0..3 {
+            let b = block_key(Some(&format!("192.0.{net}.1")));
+            for _ in 0..BLOCK_OPEN_PER_MINUTE {
+                assert!(g.take(at(59), Draw::open(&b)).is_ok());
+            }
         }
-        // Past it, the flood gets its share of the rest and no more; so does the office.
+        assert_eq!(g.seen.lock().unwrap().open.0.len(), SHARES_FROM_PER_MINUTE);
+        // Past it, a block that took little before gets its share of the rest and no more.
+        let flood = block_key(Some("192.0.20.1"));
         let granted = (0..50)
             .filter(|_| g.take(at(59), Draw::open(&flood)).is_ok())
             .count();
@@ -1024,7 +1133,7 @@ mod tests {
         let granted = (0..50)
             .filter(|_| g.take(at(59), Draw::open(&office)).is_ok())
             .count();
-        assert_eq!(granted, BLOCK_SHARE_PER_MINUTE);
+        assert_eq!(granted, 0, "the office already took its fifth");
         // Two more floods take theirs; a fourth block still gets in.
         for net in [10, 11] {
             let b = block_key(Some(&format!("192.0.{net}.1")));
@@ -1035,10 +1144,6 @@ mod tests {
         let newcomer = block_key(Some("100.64.0.1"));
         assert!(g.take(at(59), Draw::open(&newcomer)).is_ok());
         // A minute after the office's first hashes, they left the window: room again.
-        assert!(
-            g.take(at(61), Draw::open(&office)).is_err(),
-            "still in the band"
-        );
         assert!(g.take(at(120), Draw::open(&office)).is_ok());
         assert_eq!(GlobalLimit::default().shares_from, SHARES_FROM_PER_MINUTE);
         assert_eq!(SHARES_FROM_PER_MINUTE, 240);
@@ -1076,17 +1181,8 @@ mod tests {
     #[test]
     fn the_reserve_is_shared_by_address_and_by_block() {
         let g = GlobalLimit::default();
-        let filler = block_key(Some("192.0.2.1"));
-        for _ in 0..GLOBAL_PER_MINUTE {
-            let _ = g.take(at(0), Draw::open(&filler));
-        }
-        // The open allowance is full (from one block, up to its share; fill the rest).
-        for net in 0..10 {
-            let block = block_key(Some(&format!("192.0.{}.1", 10 + net)));
-            for _ in 0..BLOCK_SHARE_PER_MINUTE {
-                let _ = g.take(at(0), Draw::open(&block));
-            }
-        }
+        // The open allowance is full (each block up to its shares).
+        fill_open(&g, at(0));
         let known = |a: &str| (block_key(Some(a)), source_key(Some(a)));
         let (block, addr) = known("198.51.100.7");
         let draw = |block: &str, addr: &str| {
@@ -1112,6 +1208,32 @@ mod tests {
         assert_eq!(granted, RESERVE_PER_BLOCK_PER_MINUTE);
         let (b, a) = known("203.0.113.9");
         assert!(draw(&b, &a).is_ok(), "another block's known address");
+    }
+
+    // The review of 8e8f8fe, a Low: refusals past a block's guesses are recorded, at most one
+    // row a minute per block, each standing for the refusals since the last.
+    #[test]
+    fn refusals_past_a_blocks_guesses_are_recorded_thinned() {
+        let g = BlockGuesses::default();
+        let a = block_key(Some("203.0.113.5"));
+        let b = block_key(Some("198.51.100.5"));
+        assert_eq!(g.note_over_limit(&a, at(0)), Some(1), "the first");
+        let rows: Vec<u32> = (1..60)
+            .filter_map(|i| g.note_over_limit(&a, at(i)))
+            .collect();
+        assert!(rows.is_empty(), "none within the minute: {rows:?}");
+        assert_eq!(
+            g.note_over_limit(&b, at(30)),
+            Some(1),
+            "another block's own"
+        );
+        assert_eq!(
+            g.note_over_limit(&a, at(60)),
+            Some(60),
+            "59 since, and this one"
+        );
+        assert_eq!(g.note_over_limit(&a, at(61)), None);
+        assert_eq!(g.note_over_limit(&a, at(200)), Some(2));
     }
 
     #[test]

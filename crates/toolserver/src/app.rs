@@ -361,11 +361,13 @@ async fn readyz(State(state): State<AppState>) -> Response {
     let mut answer = json!({ "ready": ok, "checks": body });
     // Not readiness checks: plain counts since start-up for an operator, with password sign-in
     // on (docs/password-sign-in.md, the gate review of 04c175f): wrong setup codes tried (G2;
-    // each is in the audit log too), and rehashes put off while the hashing allowance was full
-    // (GL2; each is done at a later correct sign-in).
+    // each is in the audit log too), refusals past a block's setup guesses (the review of
+    // 8e8f8fe; thinned in the audit log), and rehashes put off while the hashing allowance was
+    // full (GL2; each is done at a later correct sign-in).
     if let Some(pw) = state.svc.passwords() {
         answer["password"] = json!({
             "setup_code_wrong_guesses": pw.setup_wrong_guesses(),
+            "setup_block_refusals": pw.setup_block_refusals(),
             "rehashes_deferred": pw.rehashes_deferred(),
         });
     }

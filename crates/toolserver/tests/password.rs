@@ -1878,9 +1878,10 @@ both!(a_rehash_draws_from_the_shared_allowance, |t| {
 
 // G1: a flood from a few hundred addresses in a few blocks can't fill the open allowance.
 // Before, 300 unknown-name guesses from anywhere filled it and a sign-in from an address
-// nobody had used was refused (`429`). Since M4 (the review of 8e8f8fe) the shares apply from
-// 80% of the allowance: the three /24s take 240 between them, then 6 each of the rest, and a
-// fourth block still gets in. (Before M4 this asserted 3 x 30 taken; it now asserts 240 + 18.)
+// nobody had used was refused (`429`). Since a Low of the review of 8e8f8fe each block takes
+// at most a fifth of the allowance (60 a minute), so the three /24s take 180 between them and
+// a fourth block still gets in. (Before M4 this asserted 3 x 30 taken; after M4, 240 + 18; it
+// now asserts 3 x 60.)
 both!(a_flood_from_a_few_blocks_leaves_room_for_another, |t| {
     let now = t0();
     let (secret, _) = t.enrolled("ana", now).await;
@@ -1906,8 +1907,8 @@ both!(a_flood_from_a_few_blocks_leaves_room_for_another, |t| {
     }
     assert_eq!(
         refused,
-        600 - limits::SHARES_FROM_PER_MINUTE - 3 * limits::BLOCK_SHARE_PER_MINUTE,
-        "80% for anyone, then three blocks' shares"
+        600 - 3 * limits::BLOCK_OPEN_PER_MINUTE,
+        "a fifth of the allowance for each block"
     );
     let new_address = "100.64.9.1";
     let p = t
@@ -2112,7 +2113,10 @@ both!(wrong_setup_guesses_never_void_a_code_or_end_a_setup, |t| {
 // one /24, every refusal of the setup's first step from that block is 429, whatever the name,
 // and other blocks are not held up. The review of 8e8f8fe (a Low): the invitee's right code
 // from that block is no longer refused (before, this test asserted it was `429`; it now
-// asserts it begins), and an over-limit wrong guess writes nothing.
+// asserts it begins), and an over-limit wrong guess changes nothing. Another Low of the same
+// review: those refusals are recorded, thinned (before, this test asserted that nothing at all
+// was written; it now asserts one row a minute for the block, with no target, standing for the
+// refusals since the last, and a count of every one on `/readyz`).
 both!(setup_code_guesses_are_bounded_per_block, |t| {
     let now = t0();
     let wrong = "AAAAA-AAAAA-AAAAA-AAAAA";
@@ -2140,7 +2144,67 @@ both!(setup_code_guesses_are_bounded_per_block, |t| {
             "{who}"
         );
     }
-    assert_eq!(t.all_events().await.len(), events, "nothing written");
+    assert_eq!(
+        t.all_events().await.len(),
+        events + 1,
+        "one row for the three, the first"
+    );
+    let rows = |v: Vec<(String, Outcome, Option<String>, Option<String>)>| {
+        v.into_iter()
+            .filter(|e| e.3.as_deref().is_some_and(|d| d.starts_with("block_limit")))
+            .collect::<Vec<_>>()
+    };
+    let over = rows(t.events("password.setup_begin").await);
+    assert_eq!(
+        over,
+        vec![(
+            "anonymous".to_string(),
+            Outcome::Denied,
+            None,
+            Some("block_limit; refused 1".to_string())
+        )],
+        "no target, nothing typed"
+    );
+    assert_eq!(t.svc.setup_wrong_guesses(), guesses);
+    assert_eq!(t.svc.setup_block_refusals(), 3);
+    // Fifty more within the minute write nothing more; the first after it stands for them all
+    // (the two after the first row, the fifty, and itself).
+    for n in 0..50 {
+        let from = format!("203.0.113.{}", 150 + n);
+        assert!(matches!(
+            begin_from(
+                t,
+                &t.svc,
+                "nobody",
+                wrong,
+                &from,
+                now + Duration::seconds(30)
+            )
+            .await,
+            Err(PwError::TooMany { .. })
+        ));
+    }
+    assert_eq!(t.all_events().await.len(), events + 1, "thinned");
+    assert!(matches!(
+        begin_from(
+            t,
+            &t.svc,
+            "ana",
+            wrong,
+            "203.0.113.9",
+            now + Duration::seconds(61)
+        )
+        .await,
+        Err(PwError::TooMany { .. })
+    ));
+    let over = rows(t.events("password.setup_begin").await);
+    assert_eq!(over.len(), 2, "{over:?}");
+    assert!(
+        over.iter()
+            .any(|e| e.3.as_deref() == Some("block_limit; refused 53") && e.2.is_none()),
+        "{over:?}"
+    );
+    assert_eq!(t.svc.setup_block_refusals(), 54);
     assert_eq!(t.svc.setup_wrong_guesses(), guesses);
     // Ana's own right code, from the flooded block, begins her setup.
     let token = begin_from(t, &t.svc, "ana", &code, "203.0.113.201", now)
@@ -2242,8 +2306,9 @@ both!(a_password_set_before_the_new_rules_still_signs_in, |t| {
 // behind one address nobody signed in from (so no reserve), everyone mistyping once, takes 60
 // hashes from one /24 in a quiet minute: all of them sign in. (Before, the block's share of 30
 // refused the second half `429`, and pmos-web counted each `429` against the office's
-// address.) Then G1 still holds: junk from another block fills the allowance to 80% and takes
-// only its share past it, and Ana, from a block and an address nobody used, still gets in.
+// address.) Then G1 still holds: junk from another block takes only its fifth (60; a Low of the
+// review of 8e8f8fe: before, it took the allowance to 80% and its share past it), and Ana,
+// from a block and an address nobody used, still gets in.
 both!(
     a_busy_office_behind_one_address_signs_in_in_a_quiet_minute,
     |t| {
@@ -2284,8 +2349,7 @@ both!(
                 .await
                 .unwrap_or_else(|e| panic!("{h}: {e:?}"));
         }
-        // G1 once nearly full: a flood from one block takes the allowance to 80% and then only its
-        // share of the rest.
+        // G1: a flood from one block takes only its fifth of the allowance.
         let mut granted = 0;
         for n in 0..300 {
             let junk = format!("198.18.0.{}", n % 250 + 1);
@@ -2305,10 +2369,7 @@ both!(
                 other => panic!("{other:?}"),
             }
         }
-        assert_eq!(
-            granted,
-            limits::SHARES_FROM_PER_MINUTE - 60 + limits::BLOCK_SHARE_PER_MINUTE
-        );
+        assert_eq!(granted, limits::BLOCK_OPEN_PER_MINUTE);
         let new_address = "100.64.9.1";
         let p = t
             .sign_in_from(new_address, "ana", PASSWORD, at)

@@ -293,8 +293,11 @@ fn totp_aad(handle: &str) -> String {
 }
 
 /// The fixed words an audit detail of a password event is made of (see [`is_safe_detail`]).
-pub const DETAIL_WORDS: [&str; 36] = [
+pub const DETAIL_WORDS: [&str; 37] = [
     "dismissed",
+    // The review of 8e8f8fe: refusals past a block's setup guesses, recorded thinned (with
+    // `refused <n>`).
+    "block_limit",
     // The re-check of eb24d28: an account reaching its ceiling (M2), a setup code that gave
     // all its work (H1). The gate review of 04c175f: a rehash put off while the hashing
     // allowance was full (GL2).
@@ -338,7 +341,8 @@ pub const DETAIL_WORDS: [&str; 36] = [
 ];
 
 /// Is `detail` one of the password events' fixed formats: parts joined by `"; "`, each a
-/// [`DETAIL_WORDS`] word, `host_user <name>`, `failures <n>` or `recovery_left <n>`? Never a
+/// [`DETAIL_WORDS`] word, `host_user <name>`, `failures <n>`, `recovery_left <n>` or
+/// `refused <n>`? Never a
 /// value anyone typed.
 pub fn is_safe_detail(detail: &str) -> bool {
     let count = |s: &str| !s.is_empty() && s.len() <= 6 && s.bytes().all(|b| b.is_ascii_digit());
@@ -350,6 +354,7 @@ pub fn is_safe_detail(detail: &str) -> bool {
                     .is_some_and(|h| HostUser::parse(h).is_some())
                 || part.strip_prefix("failures ").is_some_and(count)
                 || part.strip_prefix("recovery_left ").is_some_and(count)
+                || part.strip_prefix("refused ").is_some_and(count)
         })
 }
 
@@ -529,6 +534,7 @@ pub struct PasswordService {
     setup_guesses: BlockGuesses,
     /// Plain counts since start-up, for an operator (the tool server's `/readyz`).
     setup_wrong_guesses: AtomicU64,
+    setup_block_refusals: AtomicU64,
     rehashes_deferred: AtomicU64,
 }
 
@@ -561,6 +567,7 @@ impl PasswordService {
             work: AccountWork::default(),
             setup_guesses: BlockGuesses::default(),
             setup_wrong_guesses: AtomicU64::new(0),
+            setup_block_refusals: AtomicU64::new(0),
             rehashes_deferred: AtomicU64::new(0),
         })
     }
@@ -602,6 +609,13 @@ impl PasswordService {
     /// count for an operator, on the tool server's `/readyz` (G2). Each is in the audit log too.
     pub fn setup_wrong_guesses(&self) -> u64 {
         self.setup_wrong_guesses.load(Ordering::Relaxed)
+    }
+
+    /// Refusals of a setup's first step past its block's guesses since start-up (`429`, every
+    /// one): a plain count for an operator, on `/readyz`. The audit log has them thinned, at
+    /// most one row a minute per block (the review of 8e8f8fe, a Low).
+    pub fn setup_block_refusals(&self) -> u64 {
+        self.setup_block_refusals.load(Ordering::Relaxed)
     }
 
     /// Rehashes put off since start-up because the hashing allowance was full (GL2): each is
@@ -1213,7 +1227,10 @@ impl PasswordService {
         // tell is whether its (name, code) pair is right, which takes a 100-bit code, and, by
         // timing, whether the name exists (one lookup for an unknown name; a lookup and a short
         // read for a real one), as below the limit. `pmos-web` counts each of these `429`s
-        // against the address (20 per 15 minutes).
+        // against the address and the name (10 per name and address, 100 per address, per 15
+        // minutes). Each is counted on `/readyz` and recorded, thinned: at most one audit row a
+        // minute per block, with no target, standing for the refusals since the block's last
+        // (the review of 8e8f8fe, a Low: before, none was recorded).
         let block = limits::block_key(source);
         let over = match self.setup_guesses.take(&block, now) {
             limits::Guess::Counted => None,
@@ -1227,6 +1244,22 @@ impl PasswordService {
             .await;
         if over.is_none() && !matches!(out, Err(PwError::SetupFailed)) {
             self.setup_guesses.give_back(&block, now);
+        }
+        if over.is_some() && matches!(out, Err(PwError::TooMany { .. })) {
+            self.setup_block_refusals.fetch_add(1, Ordering::Relaxed);
+            if let Some(n) = self.setup_guesses.note_over_limit(&block, now) {
+                store
+                    .password_events(vec![event(
+                        Client::Web,
+                        ANONYMOUS,
+                        "password.setup_begin",
+                        Outcome::Denied,
+                        None,
+                        &format!("block_limit; refused {n}"),
+                        now,
+                    )])
+                    .await?;
+            }
         }
         out
     }

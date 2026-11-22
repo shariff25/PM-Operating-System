@@ -2010,6 +2010,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "uuid",
  "walkdir",
  "zeroize",

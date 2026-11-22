@@ -1,6 +1,9 @@
 //! `pmos-web`'s password sign-in routes against a stand-in tool server, served with peer
 //! addresses (as `main` serves them), after the review of 2026-11-20: every refused attempt
-//! counts against the address (P1); the address is the real browser's behind a trusted proxy
+//! counts against the address (P1), and since the review of 8e8f8fe (N2) against what it is
+//! about from there too (a sign-in name, a token, a person: 10 each, 100 per address), so a
+//! busy office behind one address isn't locked out by a few people's mistakes while guessing
+//! at one account and spraying across accounts stay bounded; the address is the real browser's behind a trusted proxy
 //! and never a value an untrusted peer forwards (P2, L1); a forwarded header with no trusted
 //! proxy is refused; bodies are bounded (L6); a sign-in without an epoch starts no session
 //! (L7); a password session fails closed when the user database can't be reached (PM4); the
@@ -114,7 +117,11 @@ async fn toolserver(
             if b["password"] == SHARED_FULL {
                 return too_many_from_tools();
             }
-            if b["sign_in_name"] == "ana@example.com" && b["password"] == RIGHT {
+            let name = b["sign_in_name"].as_str().unwrap_or_default();
+            // Ana, and the office's people (N2), each with the right password.
+            if (name == "ana@example.com" || name.ends_with("@office.example"))
+                && b["password"] == RIGHT
+            {
                 Json(json!({"pending_token": PENDING, "expires_at": "2026-11-20T09:05:00Z"}))
                     .into_response()
             } else {
@@ -318,18 +325,27 @@ impl Web {
     }
 
     async fn sign_in(&self, headers: &[(&str, String)], password: &str) -> Reply {
+        self.sign_in_as(headers, "ana@example.com", password).await
+    }
+
+    async fn sign_in_as(&self, headers: &[(&str, String)], name: &str, password: &str) -> Reply {
         self.send(
             Method::POST,
             "/api/auth/password/sign-in",
             headers,
-            Some(json!({"sign_in_name": "ana@example.com", "password": password})),
+            Some(json!({"sign_in_name": name, "password": password})),
         )
         .await
     }
 
     /// The password and the second step from `headers`: the session cookie.
     async fn full_sign_in(&self, headers: &[(&str, String)]) -> Option<String> {
-        let r = self.sign_in(headers, RIGHT).await;
+        self.full_sign_in_as(headers, "ana@example.com").await
+    }
+
+    /// [`Self::full_sign_in`] as `name`.
+    async fn full_sign_in_as(&self, headers: &[(&str, String)], name: &str) -> Option<String> {
+        let r = self.sign_in_as(headers, name, RIGHT).await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.body);
         let pending = r.cookie("__Host-pmos-pending").expect("a pending cookie");
         let mut h = headers.to_vec();
@@ -365,37 +381,90 @@ fn xff(v: &str) -> (&'static str, String) {
 }
 
 /// P1: every refused attempt counts against the address, not only a wrong password: an
-/// unknown or expired pending token, a body that isn't the route's JSON, a missing cookie.
-/// After twenty the address waits, and the tool server isn't asked again.
+/// unknown or expired pending or setup token, a wrong password, a body that isn't the route's
+/// JSON, a missing cookie. Since N2 (the review of 8e8f8fe) each counts against what it is
+/// about from there as well (10 each, and the refusals past them aren't counted against the
+/// address), and the address waits after a hundred, about anything, and the tool server isn't
+/// asked again. (Before, this test asserted the address waited after twenty refusals of three
+/// kinds; it now asserts ten for one subject, ten for requests with nothing readable, and a
+/// hundred for the address.)
 #[tokio::test]
 async fn every_refused_attempt_counts_against_the_address() {
     let w = web(&[]).await;
+    // One made-up pending token, ten times: then that token waits from here.
     let random = format!("__Host-pmos-pending={}", "r".repeat(43));
-    for i in 0..20 {
+    let second_step = |cookie: String| {
+        let w = &w;
+        async move {
+            w.send(
+                Method::POST,
+                "/api/auth/password/second-step",
+                &[("cookie", cookie)],
+                Some(json!({"code": "000000"})),
+            )
+            .await
+        }
+    };
+    for i in 0..10 {
+        let r = second_step(random.clone()).await;
+        assert_eq!(
+            (r.status, r.code()),
+            (StatusCode::UNAUTHORIZED, "sign_in_expired"),
+            "{i}"
+        );
+    }
+    let r = second_step(random.clone()).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "that token waits");
+    // Nothing readable (a body that isn't the route's JSON, no step cookie): one subject.
+    for i in 0..10 {
+        let r = if i % 2 == 0 {
+            w.send(
+                Method::POST,
+                "/api/auth/password/sign-in",
+                &[],
+                Some(json!({"bogus": true})),
+            )
+            .await
+        } else {
+            w.send(
+                Method::POST,
+                "/api/auth/password/setup/password",
+                &[],
+                Some(json!({"password": "whatever it is here"})),
+            )
+            .await
+        };
+        assert!(
+            r.status.is_client_error() && r.status != StatusCode::TOO_MANY_REQUESTS,
+            "{i}: {} {}",
+            r.status,
+            r.body
+        );
+    }
+    let r = w
+        .send(
+            Method::POST,
+            "/api/auth/password/setup/confirm",
+            &[],
+            Some(json!({"code": CODE})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
+    // Ana signs in meanwhile (20 refusals so far from this address, none hers).
+    assert!(w.full_sign_in(&[]).await.is_some());
+    // Eighty more, of every kind, about eighty other subjects: the address's hundred.
+    for i in 0..80 {
         let r = match i % 3 {
-            0 => {
-                w.send(
-                    Method::POST,
-                    "/api/auth/password/second-step",
-                    &[("cookie", random.clone())],
-                    Some(json!({"code": "000000"})),
-                )
-                .await
-            }
+            0 => second_step(format!("__Host-pmos-pending={:0>43}", i)).await,
             1 => {
-                w.send(
-                    Method::POST,
-                    "/api/auth/password/sign-in",
-                    &[],
-                    Some(json!({"bogus": true})),
-                )
-                .await
+                w.sign_in_as(&[], &format!("p{i}@example.com"), "a wrong guess here")
+                    .await
             }
             _ => {
                 w.send(
                     Method::POST,
                     "/api/auth/password/setup/password",
-                    &[],
+                    &[("cookie", format!("__Host-pmos-setup={:x>43}", i))],
                     Some(json!({"password": "whatever it is here"})),
                 )
                 .await
@@ -421,6 +490,159 @@ async fn every_refused_attempt_counts_against_the_address() {
     assert_eq!(w.sign_in(&[], RIGHT).await.status, StatusCode::OK);
 }
 
+/// N2 (the review of 8e8f8fe): thirty people behind one office address, signing in in the
+/// same quarter of an hour. Before, pmos-web counted every wrong password against the address,
+/// twenty in 15 minutes for everyone: the office's twenty-first typo locked every password
+/// route out for all of them, and only the tool server's own office test covered the case.
+/// Now each person mistypes twice (60 refusals, three times what used to lock the office out)
+/// and all thirty sign in; three more who keep trying wrong passwords (thirty times each) wait
+/// alone, ten refusals each, and nobody else does; and Ana, from the same address, signs in
+/// after all of it. (Ninety refusals: the address's hundred takes refusals about ten names at
+/// their limit, or a hundred people's mistakes, in 15 minutes.)
+#[tokio::test]
+async fn a_busy_office_behind_one_address_is_not_locked_out_by_a_few_peoples_mistakes() {
+    let w = web(&["127.0.0.1"]).await;
+    let office = [xff("203.0.113.10")];
+    for n in 0..30 {
+        let name = format!("p{n:02}@office.example");
+        for typo in 0..2 {
+            let r = w.sign_in_as(&office, &name, "a wrong guess here").await;
+            assert_eq!(
+                (r.status, r.code()),
+                (StatusCode::UNAUTHORIZED, "sign_in_failed"),
+                "{name}, typo {typo}"
+            );
+        }
+        assert!(
+            w.full_sign_in_as(&office, &name).await.is_some(),
+            "{name} signs in after two typos"
+        );
+    }
+    // Three people who keep getting it wrong: ten refusals each are counted, then each waits
+    // alone (pmos-web's own `429`, the tool server not asked), and the rest of the office
+    // doesn't.
+    for n in 0..3 {
+        let name = format!("stuck{n}@office.example");
+        let mut statuses = Vec::new();
+        for _ in 0..30 {
+            statuses.push(
+                w.sign_in_as(&office, &name, "a wrong guess here")
+                    .await
+                    .status,
+            );
+        }
+        let refused = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::UNAUTHORIZED)
+            .count();
+        assert_eq!(refused, 10, "{name}: {statuses:?}");
+        let asked = w.password_calls();
+        let r = w.sign_in_as(&office, &name, RIGHT).await;
+        assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{name} waits");
+        assert_eq!(w.password_calls(), asked, "pmos-web's own wait");
+    }
+    // 60 + 30 refusals from the address, and still room: the others sign in.
+    for n in 0..30 {
+        let name = format!("p{n:02}@office.example");
+        assert!(w.full_sign_in_as(&office, &name).await.is_some(), "{name}");
+    }
+    assert!(w.full_sign_in(&office).await.is_some(), "Ana too");
+    // A stuck person's wait ends with the window, from the office as from anywhere.
+    *w.clock.lock().unwrap() += Duration::minutes(15);
+    assert!(w
+        .full_sign_in_as(&office, "stuck0@office.example")
+        .await
+        .is_some());
+}
+
+/// N2: the guessing bounds still hold at pmos-web. **One account from one address**: ten
+/// refused attempts in 15 minutes, then that name waits there (the tool server isn't asked;
+/// it has its own, tighter schedule per account and address behind this); the same name from
+/// another address, and another name from this one, are not held up. **Spraying across
+/// accounts from one address**: a hundred refused attempts at a hundred names in 15 minutes,
+/// then every password route from that address waits, whatever the name, the right password
+/// included, until the window moves; another address is not held up. So from one address at
+/// most 10 refused attempts per account and 100 in all per 15 minutes reach the tool server
+/// (960 and 9,600 a day).
+#[tokio::test]
+async fn guessing_at_one_account_and_spraying_from_one_address_stay_bounded() {
+    let w = web(&["127.0.0.1"]).await;
+    let guesser = [xff("198.51.100.66")];
+    for i in 0..10 {
+        assert_eq!(
+            w.sign_in(&guesser, &format!("guess {i} at ana"))
+                .await
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let asked = w.password_calls();
+    for _ in 0..20 {
+        let r = w.sign_in(&guesser, "another guess at ana").await;
+        assert_eq!(
+            (r.status, r.code()),
+            (StatusCode::TOO_MANY_REQUESTS, "too_many_attempts")
+        );
+    }
+    // Spelled another way, it is the same name (as the tool server reads it).
+    let r = w
+        .sign_in_as(&guesser, "  ANA@Example.COM ", "and another")
+        .await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        w.password_calls(),
+        asked,
+        "none of them reached the tool server"
+    );
+    // A setup's first step at her name waits there too: one count per name.
+    let r = w
+        .send(
+            Method::POST,
+            "/api/auth/password/setup/begin",
+            &guesser,
+            Some(json!({"sign_in_name": "ana@example.com", "setup_code": "AAAAA"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        w.full_sign_in(&[xff("203.0.113.10")]).await.is_some(),
+        "Ana, from her own address"
+    );
+
+    // Spraying: 90 more names from the same address (ten refusals counted already).
+    let sprayer = [xff("192.0.2.77")];
+    for n in 0..100 {
+        let r = w
+            .sign_in_as(&sprayer, &format!("n{n}@example.com"), "Summer2026!!")
+            .await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{n}");
+    }
+    let asked = w.password_calls();
+    for name in ["n0@example.com", "fresh@example.com", "ana@example.com"] {
+        let r = w.sign_in_as(&sprayer, name, RIGHT).await;
+        assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{name}");
+    }
+    let r = w
+        .send(
+            Method::POST,
+            "/api/auth/password/setup/begin",
+            &sprayer,
+            Some(json!({"sign_in_name": "fresh@example.com", "setup_code": "AAAAA"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(w.password_calls(), asked, "the tool server wasn't asked");
+    assert!(
+        w.full_sign_in(&[xff("192.0.2.78")]).await.is_some(),
+        "another address"
+    );
+    *w.clock.lock().unwrap() += Duration::minutes(15);
+    assert!(
+        w.full_sign_in(&sprayer).await.is_some(),
+        "the window moved on"
+    );
+}
+
 /// P1 and P2: behind a trusted proxy, two browsers have separate limits. A flood of junk from
 /// one doesn't stop the other's sign-in, and the tool server is told each one's address.
 #[tokio::test]
@@ -435,7 +657,7 @@ async fn behind_a_trusted_proxy_a_flood_from_one_browser_does_not_stop_another()
             break;
         }
     }
-    assert!(limited, "the attacker's address waits");
+    assert!(limited, "the attacker waits for that name there");
     let owner = [xff("203.0.113.10")];
     let session = w.full_sign_in(&owner).await;
     assert!(
@@ -525,9 +747,10 @@ async fn a_wrong_or_stale_proxy_setting_is_refused_and_counted() {
 }
 
 /// H1 (the re-check of eb24d28): every `setup/password` call hashes at the tool server, so
-/// each counts against the caller's address even when it succeeds; after twenty the address
-/// waits and the tool server isn't asked again. Another browser's sign-in still goes through.
-/// LA: the signed-in routes that do work (`recovery-codes`, `change`) count the same way.
+/// each counts against the caller's address, and its setup token from there, even when it
+/// succeeds; after ten for the token (N2; before, twenty for the address) it waits and the tool
+/// server isn't asked again. Another browser's sign-in still goes through. LA: the signed-in
+/// routes that do work (`recovery-codes`, `change`) count the same way, per person.
 #[tokio::test]
 async fn setup_passwords_count_against_the_address_even_when_they_succeed() {
     let w = web(&["127.0.0.1"]).await;
@@ -535,7 +758,7 @@ async fn setup_passwords_count_against_the_address_even_when_they_succeed() {
         xff("198.51.100.66"),
         ("cookie", format!("__Host-pmos-setup={SETUP}")),
     ];
-    for i in 0..20 {
+    for i in 0..10 {
         let r = w
             .send(
                 Method::POST,
@@ -563,7 +786,7 @@ async fn setup_passwords_count_against_the_address_even_when_they_succeed() {
     // Another browser signs in meanwhile.
     let owner = [xff("203.0.113.10")];
     let session = w.full_sign_in(&owner).await.expect("signed in");
-    // Its recovery codes, twenty times: then its address waits too.
+    // Its recovery codes, ten times: then that person waits there too.
     let me = w
         .send(
             Method::GET,
@@ -579,7 +802,7 @@ async fn setup_passwords_count_against_the_address_even_when_they_succeed() {
         ("x-pmos-csrf", csrf),
     ];
     let mut statuses = Vec::new();
-    for _ in 0..20 {
+    for _ in 0..10 {
         statuses.push(
             w.send(
                 Method::POST,
@@ -591,7 +814,7 @@ async fn setup_passwords_count_against_the_address_even_when_they_succeed() {
             .status,
         );
     }
-    // The full sign-in's two steps succeeded (not counted); so twenty calls fit, then a wait.
+    // The full sign-in's two steps succeeded (not counted); so ten calls fit, then a wait.
     assert!(
         statuses.iter().all(|s| *s == StatusCode::OK),
         "{statuses:?}"
@@ -669,9 +892,9 @@ async fn the_tool_servers_shared_limit_refusals_are_not_counted_against_the_addr
         )
         .await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.body);
-    // Wrong passwords still count, as before: with the set that hashed (counted, H1), twenty,
-    // then the address waits.
-    for _ in 0..19 {
+    // Wrong passwords still count, as before: ten at Ana's name, then her name waits there
+    // (N2; before, nineteen and the set that hashed, twenty for the address).
+    for _ in 0..10 {
         assert_eq!(
             w.sign_in(&office, "a wrong guess here").await.status,
             StatusCode::UNAUTHORIZED
@@ -681,6 +904,12 @@ async fn the_tool_servers_shared_limit_refusals_are_not_counted_against_the_addr
     let r = w.sign_in(&office, RIGHT).await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(w.password_calls(), asked, "pmos-web's own wait");
+    assert!(
+        w.full_sign_in_as(&office, "p01@office.example")
+            .await
+            .is_some(),
+        "and only hers"
+    );
 }
 
 /// With no trusted proxy (`PMOS_WEB_DIRECT=1`), a forwarded header means a proxy nobody named
