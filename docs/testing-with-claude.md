@@ -104,7 +104,9 @@ host), and a test-stack report never counts towards a bar.
 The script starts every service from an empty environment (its services run with
 `PMOS_DEV=1`): each gets only the settings the script gives it and an explicit allow-list of
 what your shell exports, listed in the script's header (`PATH`, `HOME`, `TMPDIR`, the locale,
-the proxy and CA variables, `RUST_LOG`; the docs site settings for `pmos-docs`; the model keys,
+the proxy and CA variables, `RUST_LOG`; `NODE_OPTIONS` for the harness workers only, the one
+Node service, so a proxy's CA trusted through `NODE_OPTIONS=--use-openssl-ca` still reaches
+them, and no Rust service gets it; the docs site settings for `pmos-docs`; the model keys,
 `PMOS_GATEWAY_WORKAROUNDS` and `PMOS_GATEWAY_RETRY_*` for the gateway; the Slack tokens by
 name). So a database URL, vault key, address or connector setting in your shell reaches none of
 them. Every input documented above still works. It refuses to start if one of its ports on

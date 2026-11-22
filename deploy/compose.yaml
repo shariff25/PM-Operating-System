@@ -366,7 +366,10 @@ services:
     &vllm
     image: ${PMOS_VLLM_IMAGE:-nvcr.io/nvidia/vllm:25.10-py3}
     restart: unless-stopped
-    networks: [pmos]
+    # deploy/gateway.yaml (`class: production`) names each model server
+    # `<service>.pmos.internal`, the only form a production gateway accepts (docs/gateway.md).
+    networks:
+      pmos: { aliases: [vllm-default.pmos.internal] }
     ipc: host
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
@@ -393,6 +396,8 @@ services:
 
   vllm-extraction:
     <<: *vllm
+    networks:
+      pmos: { aliases: [vllm-extraction.pmos.internal] }
     command:
       - vllm
       - serve

@@ -151,8 +151,10 @@ and whether a workaround can be deleted:
   report's `gateway_models` holds, per role, the model id the gateway served it with and a
   neutral upstream label (`local`, `claude-test` or `remote-test`), whether the stub or a
   testing-only upstream was on, and the gateway's **class**: `production` only for a gateway
-  whose config says `class: production` (`deploy/gateway.yaml`, the Spark's), `test` for any
-  other, and for a runtime or gateway too old to say (`docs/gateway.md`). Never a URL or
+  whose config says `class: production` (`deploy/gateway.yaml`, the Spark's) and that runs
+  with the stub off, `test` for any other (a production config with `PMOS_GATEWAY_STUB=1`
+  included: it starts and reports `test` with `stub: true`), and for a runtime or gateway too
+  old to say (`docs/gateway.md`). Never a URL or
   host, so a committed report names no provider's address. A runtime that can't say, lanes
   that disagree, or a change during the run leave the field out (with a warning), and the
   run counts towards no bar. The report's table shows it as "Models (reported by the
@@ -189,7 +191,8 @@ gateway. Prompts leave the machine, so it runs on the fake fixtures only.
 - the docs tools on the fake docs fixtures, unless `PMOS_DOCS_BASE_URL` is set.
 
 It writes the runner's settings, with this run's fresh tokens, to `$STATE/evals.env`
-(mode 0600; the lanes and the fresh command too). In a second shell:
+(mode 0600; the lanes and the fresh command too), each value quoted for the shell (`%q`), so a
+`$STATE` path with a space or `$` in it is sourced back as written. In a second shell:
 
 ```sh
 set -a; . state/claude-test/evals.env; set +a
@@ -627,8 +630,9 @@ when all of these hold:
   count, which is every report before 2026-11-22 (the E1 runs, whose model was only in the
   free-text note).
 - **From a production gateway:** `gateway_models.class` is `production`, which only a gateway
-  run with `class: production` (`deploy/gateway.yaml`) reports, and which comes from the
-  runtime under test (review finding R3). A test stack, a developer's gateway or one too old
+  run with `class: production` (`deploy/gateway.yaml`) and the stub off reports, and which
+  comes from the runtime under test (review finding R3). With the stub on, such a gateway
+  reports `test` (the fix to the deploy-kit regression at 2544d01). A test stack, a developer's gateway or one too old
   to say is `test`, and never counts, even on the production role models' names.
 - **They are the production role models**, role for role: the same roles, each with the same
   model id, as the `model` of each role in the production gateway config. That file is named
@@ -639,7 +643,10 @@ when all of these hold:
 - **No stub and no testing-only upstream:** `stub` and `cloud_test` false, every upstream
   `local`.
 - **For a persona's category, the same persona files:** the report's `persona_hash` is the
-  hash of the persona's, its role's and its skills' files now (`persona_hash`, above). Any
+  hash of the persona's, its role's and its skills' files now (`persona_hash`, above). The
+  persona's name and the `role` its `PERSONA.md` names must be plain names (lowercase letters,
+  digits and single hyphens) before either is joined into a path; anything else (`../x`, a
+  path) can't be hashed, so that persona's runs count for nothing. Any
   change to them (the persona's file, its role's instructions, one of its skills) restarts its
   streak, whether or not it bumps `version:`, so a changed bot isn't shown as benchmarked on
   the old one's runs. (Before 2026-11-22 the version string was compared, so a change that

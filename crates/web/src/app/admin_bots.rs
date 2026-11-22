@@ -140,7 +140,10 @@ fn bot_row(p: &Value, lint: &LintByKey, dir: &str) -> Option<Value> {
     let display_name = p.get("display_name")?.as_str()?;
     let offered = p.get("offered")?.as_bool()?;
     let always_on = p.get("always_on").and_then(Value::as_bool).unwrap_or(false);
-    let preview = p.get("preview").and_then(Value::as_bool).unwrap_or(false);
+    // Fail safe, as the PM's view does (`bots.rs`): a bot other than the always-on one whose
+    // entry doesn't say `preview: false` in so many words is shown as a Preview (the Low on
+    // the admin view, review at 2544d01).
+    let preview = !always_on && p.get("preview").and_then(Value::as_bool) != Some(false);
     let state = if !offered {
         "withdrawn"
     } else if preview {
@@ -376,6 +379,21 @@ mod tests {
             row(true, false)["path"],
             "content/personas/chief/PERSONA.md"
         );
+        // An entry that doesn't say, or says something other than a boolean, is a Preview;
+        // the always-on bot (Nudge) never is.
+        let entry = |extra: Value| {
+            let mut v = json!({"key": "chief", "display_name": "Chief", "offered": true});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            bot_row(&v, &lint, "content").unwrap()["state"].clone()
+        };
+        assert_eq!(entry(json!({})), "preview");
+        assert_eq!(entry(json!({"preview": null})), "preview");
+        assert_eq!(entry(json!({"preview": "no"})), "preview");
+        assert_eq!(entry(json!({"preview": false})), "offered");
+        assert_eq!(entry(json!({"always_on": true})), "offered");
+        assert_eq!(entry(json!({"offered": false})), "withdrawn");
         assert!(bot_row(
             &json!({"key": "Bad Key", "display_name": "x", "offered": true}),
             &lint,

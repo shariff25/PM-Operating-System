@@ -15,7 +15,10 @@ async fn main() -> Result<()> {
     let config = Config::from_env().map_err(anyhow::Error::msg)?;
     let text = std::fs::read_to_string(&config.models_path)
         .with_context(|| format!("reading {}", config.models_path.display()))?;
-    let models = Models::parse(&text, config.cloud_test).map_err(anyhow::Error::msg)?;
+    let mut models = Models::parse(&text, config.cloud_test).map_err(anyhow::Error::msg)?;
+    for w in models.lookalike_warnings(&config.clients) {
+        tracing::warn!("{w}");
+    }
     let usage =
         Arc::new(UsageLog::new(config.usage_log.as_deref()).context("opening the usage log")?);
     if config.stub {
@@ -25,7 +28,11 @@ async fn main() -> Result<()> {
         tracing::warn!("PMOS_GATEWAY_WORKAROUNDS=off: every workaround is switched off");
     }
     config.check_keys(&models).map_err(anyhow::Error::msg)?;
-    config.check_class(&models).map_err(anyhow::Error::msg)?;
+    let (class, warning) = config.served_class(&models);
+    if let Some(w) = warning {
+        tracing::warn!("{w}");
+    }
+    models.class = class;
     tracing::info!(class = models.class.as_str(), "gateway class");
     if models
         .roles
@@ -63,7 +70,7 @@ async fn main() -> Result<()> {
     let app = router(GatewayConfig {
         models,
         clients: config.clients.clone(),
-        usage,
+        usage: usage.clone(),
         stub: config.stub,
         workarounds_on: config.workarounds_on,
         anthropic_key: config.anthropic_key.clone(),
@@ -81,5 +88,7 @@ async fn main() -> Result<()> {
             tracing::info!("shutting down: finishing in-flight requests");
         })
         .await?;
+    // Refusals still held for a summary line are counted in the log before exiting.
+    usage.flush_all_refusals();
     Ok(())
 }
