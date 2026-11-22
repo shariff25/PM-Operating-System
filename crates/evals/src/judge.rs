@@ -378,12 +378,7 @@ pub struct Packed {
 /// labels file are skipped. Picked lines are appended to the judge's labels file with `label`
 /// empty (`null`), for a person to fill in. Candidates are taken in file and line order, so
 /// the same candidates give the same pack.
-pub fn pack(
-    root: &Path,
-    judge: &Judge,
-    dir: &Path,
-    per_judge: usize,
-) -> Result<Packed, String> {
+pub fn pack(root: &Path, judge: &Judge, dir: &Path, per_judge: usize) -> Result<Packed, String> {
     use std::io::Write as _;
     let suffix = format!("-{}.jsonl", judge.name);
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -739,13 +734,22 @@ mod tests {
     #[test]
     fn labels_are_yes_no_unknown_or_pending() {
         let read = |s: &str| serde_json::from_str::<Label>(s).map(|l| l.label);
-        assert_eq!(read(r#"{"input":"i","output":"o","label":true}"#).unwrap(), Human::Yes);
-        assert_eq!(read(r#"{"input":"i","output":"o","label":false}"#).unwrap(), Human::No);
+        assert_eq!(
+            read(r#"{"input":"i","output":"o","label":true}"#).unwrap(),
+            Human::Yes
+        );
+        assert_eq!(
+            read(r#"{"input":"i","output":"o","label":false}"#).unwrap(),
+            Human::No
+        );
         assert_eq!(
             read(r#"{"input":"i","output":"o","label":"unknown"}"#).unwrap(),
             Human::Unknown
         );
-        assert_eq!(read(r#"{"input":"i","output":"o","label":null}"#).unwrap(), Human::Pending);
+        assert_eq!(
+            read(r#"{"input":"i","output":"o","label":null}"#).unwrap(),
+            Human::Pending
+        );
         // The field must be there, even when empty: a line with no `label` is a mistake.
         assert!(read(r#"{"input":"i","output":"o"}"#).is_err());
         assert!(read(r#"{"input":"i","output":"o","label":"yes"}"#).is_err());

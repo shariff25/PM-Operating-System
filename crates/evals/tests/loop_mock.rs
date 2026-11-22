@@ -449,9 +449,7 @@ async fn unknown_verdicts_label_candidates_and_the_pack() {
     });
     let rt = Runtime::new(&url, TOKEN, Some(CONSOLE_TOKEN));
     let report = run_category(&rt, &url, &category, &o).await;
-    let v = |id: &str| {
-        report.tasks.iter().find(|t| t.id == id).unwrap().judges[0].clone()
-    };
+    let v = |id: &str| report.tasks.iter().find(|t| t.id == id).unwrap().judges[0].clone();
     assert_eq!(v("good").verdict, Some(true));
     assert_eq!(v("bad").verdict, Some(false));
     let vague = v("vague");
@@ -476,7 +474,11 @@ async fn unknown_verdicts_label_candidates_and_the_pack() {
         assert_eq!(l.label, judge::Human::Pending);
         assert!(l.input.contains("KMIP uses port 5696."), "{}", l.input);
         assert!(!l.input.contains("a fixture Slack message"), "{}", l.input);
-        assert!(l.input.contains("Slack tool result(s) left out"), "{}", l.input);
+        assert!(
+            l.input.contains("Slack tool result(s) left out"),
+            "{}",
+            l.input
+        );
     }
     let said: Vec<_> = lines
         .iter()
@@ -487,8 +489,7 @@ async fn unknown_verdicts_label_candidates_and_the_pack() {
     // The candidates on disk, then the pack: two lines, one the judge said no to and one yes.
     let root = dir.path();
     let cands = root.join("candidates");
-    let written =
-        judge::write_candidates(&cands, &report.date, "cat", &lines).unwrap();
+    let written = judge::write_candidates(&cands, &report.date, "cat", &lines).unwrap();
     assert_eq!(written.len(), 1);
     std::fs::create_dir_all(root.join("judges")).unwrap();
     std::fs::write(root.join("judges/faithful.labels.jsonl"), "").unwrap();
@@ -499,7 +500,10 @@ async fn unknown_verdicts_label_candidates_and_the_pack() {
     assert!(labels.iter().all(|l| l.label == judge::Human::Pending));
     // Packing again adds the one left, never a line already there.
     let again = judge::pack(root, &faithful, &cands, 20).unwrap();
-    assert_eq!((again.no, again.yes, again.unknown, again.already), (0, 0, 1, 2));
+    assert_eq!(
+        (again.no, again.yes, again.unknown, again.already),
+        (0, 0, 1, 2)
+    );
     assert_eq!(judge::load_labels(root, &faithful).unwrap().len(), 3);
 }
 
@@ -890,7 +894,9 @@ async fn cli_judge_calibration_decides_blocking() {
 
     let check = cli_async(root, &["check", "--content", "missing"], None).await;
     assert!(
-        out(&check).contains("judge faithful: 120 labels (1 labelled unknown, 2 waiting for a person), blocking"),
+        out(&check).contains(
+            "judge faithful: 120 labels (1 labelled unknown, 2 waiting for a person), blocking"
+        ),
         "{}",
         out(&check)
     );

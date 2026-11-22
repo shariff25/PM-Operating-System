@@ -214,8 +214,12 @@ fn isolation(args: &RunArgs, token: &str, trace_token: Option<&str>) -> Result<O
         .filter(|p| !p.as_os_str().is_empty());
     match (urls.is_empty(), fresh) {
         (true, None) => Ok(None),
-        (true, Some(_)) => bail!("--fresh-cmd needs --lanes (PMOS_EVALS_LANES): the runtime of each lane"),
-        (false, None) => bail!("--lanes needs --fresh-cmd (PMOS_EVALS_FRESH_CMD): how a lane gets a fresh tool server"),
+        (true, Some(_)) => {
+            bail!("--fresh-cmd needs --lanes (PMOS_EVALS_LANES): the runtime of each lane")
+        }
+        (false, None) => bail!(
+            "--lanes needs --fresh-cmd (PMOS_EVALS_FRESH_CMD): how a lane gets a fresh tool server"
+        ),
         (false, Some(program)) => {
             if let Some(c) = args.concurrency.filter(|c| *c != urls.len()) {
                 eprintln!(
@@ -552,7 +556,8 @@ fn check(root: &Path, category: Option<String>, content: &Path) -> Result<bool> 
                 let labels = load_labels(root, &j).unwrap_or_default();
                 let n = labels.iter().filter(|l| l.label.answer().is_some()).count();
                 let count = |h: judge::Human| labels.iter().filter(|l| l.label == h).count();
-                let (unknown, pending) = (count(judge::Human::Unknown), count(judge::Human::Pending));
+                let (unknown, pending) =
+                    (count(judge::Human::Unknown), count(judge::Human::Pending));
                 let extra = match (unknown, pending) {
                     (0, 0) => String::new(),
                     _ => format!(" ({unknown} labelled unknown, {pending} waiting for a person)"),

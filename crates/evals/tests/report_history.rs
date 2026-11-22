@@ -438,7 +438,10 @@ fn repeats_show_passes_out_of_k_and_pass_hat_k() {
     assert!(md.contains("| `t-a` | 3/3 | yes |"), "{md}");
     assert!(md.contains("| `t-b` | **1/3** | no | model ×2 |"), "{md}");
     assert!(md.contains("### `t-b`, run 3 of 3"), "{md}");
-    assert!(md.contains("| Pass rate (average over attempts) | 66.7% ± "), "{md}");
+    assert!(
+        md.contains("| Pass rate (average over attempts) | 66.7% ± "),
+        "{md}"
+    );
 }
 
 /// The all-attempts-pass rate beside the average, per task and per category, in the markdown
@@ -497,7 +500,13 @@ fn summary_has_the_all_attempts_rate_and_the_infra_losses_apart() {
     assert_eq!(r.met_bar(), Some(false));
     let b = &s.by_task[1];
     assert_eq!(
-        (b.id.as_str(), b.passes, b.attempts, b.all_attempts_passed, b.infra_losses),
+        (
+            b.id.as_str(),
+            b.passes,
+            b.attempts,
+            b.all_attempts_passed,
+            b.infra_losses
+        ),
         ("t-b", 2, 3, false, 1)
     );
     assert!(s.by_task[0].all_attempts_passed);
@@ -509,14 +518,25 @@ fn summary_has_the_all_attempts_rate_and_the_infra_losses_apart() {
     );
     assert!(md.contains("the bar is judged on the average"), "{md}");
     assert!(
-        md.contains("**Lost to the model provider or infrastructure:** 1 attempt (`harness/interrupted`"),
+        md.contains(
+            "**Lost to the model provider or infrastructure:** 1 attempt (`harness/interrupted`"
+        ),
         "{md}"
     );
-    assert!(md.contains("without them, 6 of 8 attempts passed (75%)"), "{md}");
-    assert!(md.contains("They still count as failures for the bar."), "{md}");
+    assert!(
+        md.contains("without them, 6 of 8 attempts passed (75%)"),
+        "{md}"
+    );
+    assert!(
+        md.contains("They still count as failures for the bar."),
+        "{md}"
+    );
     assert!(md.contains("| `t-b` | **2/3** | no |"), "{md}");
     assert!(md.contains("| `t-a` | 3/3 | yes |"), "{md}");
-    assert!(md.contains("| Isolation | none: every attempt shared one tool server"), "{md}");
+    assert!(
+        md.contains("| Isolation | none: every attempt shared one tool server"),
+        "{md}"
+    );
 
     // The .json carries the summary, and still reads back as the same report.
     let dir = tempfile::tempdir().unwrap();

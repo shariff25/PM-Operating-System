@@ -232,8 +232,7 @@ impl Report {
             tasks_all_attempts_passed: all,
             all_attempts_pass_rate: pass_hat_k(&tasks).unwrap_or(0.0),
             infra_losses: infra,
-            pass_rate_excluding_infra: (counted > 0)
-                .then(|| self.passed() as f64 / counted as f64),
+            pass_rate_excluding_infra: (counted > 0).then(|| self.passed() as f64 / counted as f64),
             pass_bar: self.pass_bar,
             met_bar: self.met_bar(),
             by_task: tasks

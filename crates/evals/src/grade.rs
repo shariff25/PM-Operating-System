@@ -250,8 +250,8 @@ fn drop_zero_fractions(s: &str) -> String {
             while end < c.len() && c[end].is_ascii_digit() {
                 end += 1;
             }
-            let more_number = c.get(end) == Some(&'.')
-                && c.get(end + 1).is_some_and(|x| x.is_ascii_digit());
+            let more_number =
+                c.get(end) == Some(&'.') && c.get(end + 1).is_some_and(|x| x.is_ascii_digit());
             if !after_point && !more_number {
                 let fraction: String = c[i + 1..end].iter().collect();
                 let kept = fraction.trim_end_matches('0');

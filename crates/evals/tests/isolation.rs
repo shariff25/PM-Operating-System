@@ -135,11 +135,17 @@ async fn with_isolation_every_attempt_gets_a_fresh_tool_server() {
         }
     }
     let what = report.isolation.as_deref().unwrap();
-    assert!(what.contains("a fresh tool server for every attempt"), "{what}");
+    assert!(
+        what.contains("a fresh tool server for every attempt"),
+        "{what}"
+    );
     assert!(what.contains("2 lanes"), "{what}");
     assert_eq!(report.runtime_url, urls.join(", "));
     let md = report.to_markdown();
-    assert!(md.contains("| Isolation | a fresh tool server for every attempt"), "{md}");
+    assert!(
+        md.contains("| Isolation | a fresh tool server for every attempt"),
+        "{md}"
+    );
 }
 
 /// A lane that can't get a fresh tool server runs nothing there: the attempt fails as the
@@ -184,7 +190,11 @@ async fn a_failed_fresh_start_is_a_harness_failure_not_a_bot_one() {
     assert!(failed.failures[0]
         .to_string()
         .contains("no fresh tool server for lane 1: the tool server didn't come up"));
-    assert_eq!(mock.created_bodies().len(), 1, "nothing ran on the failed lane");
+    assert_eq!(
+        mock.created_bodies().len(),
+        1,
+        "nothing ran on the failed lane"
+    );
 }
 
 /// The CLI: `--lanes` and `--fresh-cmd` (both or neither), and the command runs as
@@ -294,9 +304,15 @@ async fn cli_runs_the_fresh_command_before_each_attempt() {
     let logged = std::fs::read_to_string(&log).unwrap();
     let lines: Vec<&str> = logged.lines().collect();
     assert_eq!(lines.len(), 3, "{logged}");
-    assert!(lines.iter().all(|l| *l == "lane 1" || *l == "lane 2"), "{logged}");
+    assert!(
+        lines.iter().all(|l| *l == "lane 1" || *l == "lane 2"),
+        "{logged}"
+    );
     let json = std::fs::read_to_string(root.join("reports/2026-11-22-cat.json")).unwrap();
-    assert!(json.contains("a fresh tool server for every attempt"), "{json}");
+    assert!(
+        json.contains("a fresh tool server for every attempt"),
+        "{json}"
+    );
 
     // A command that fails: every attempt fails as the harness's, with its stderr.
     let out = run(base(&[
