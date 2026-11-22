@@ -25,6 +25,10 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   Owner, 2026-11-18, plan only (build nothing until the plan is approved): add OpenShell's
   policy prover to Policy Admin, and bring OpenShell's sandbox allow and deny decisions into
   the audit log.
+  Owner, 2026-11-22: the bots must also be able to run in OpenShell sandboxes on hosts other
+  than the Spark ("I want to deploy it in another platform apart from spark"), as a generic,
+  host-independent implementation, not one tied to a single cloud. The design is written as a
+  spec and reviewed before it is built (`docs/openshell-any-host-spec.md`).
 - **d. Front end:** a web app PMs love. The owner holds the design to the standard of the
   Baseten and WorkOS dashboards and will keep challenging it. Design approved for the MVP on
   2026-11-16: `web/` as rebuilt in `claude/web-redesign-v3`.
