@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 import type { FocusEvent, KeyboardEvent } from 'react';
 import type { BotCard } from '../api';
 import { copy } from '../copy';
-import { BotFace, Words } from './BotParts';
+import { BotFace, PreviewTag, Words } from './BotParts';
 import { Icon } from './icons';
 
 const P = copy.bots.picker;
@@ -163,6 +163,7 @@ export function BotPicker({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={open ? `${id}-list` : undefined}
+        aria-describedby={selected.preview ? `${id}-preview` : undefined}
         onClick={() => (open ? close(false) : show())}
         onKeyDown={onButtonKey}
         disabled={disabled}
@@ -171,8 +172,10 @@ export function BotPicker({
         <BotFace mascot={selected.mascot} size={22} />
         <span className="picker-name" aria-hidden="true">{selected.name}</span>
         <span className="sr-only">{P.button(selected.name)}</span>
+        {selected.preview && <span aria-hidden="true"><PreviewTag short /></span>}
         <Icon name="chevronDown" size={14} className="picker-caret" />
       </button>
+      {selected.preview && <span id={`${id}-preview`} className="sr-only">{copy.bots.preview}: {copy.bots.previewNote}</span>}
       {open && (
         <div className="picker-pop" onKeyDown={onPopKey}>
           <p className="micro-label picker-label" id={`${id}-label`}>{P.listLabel}</p>

@@ -53,6 +53,7 @@ export function BotByIdentity({ who, size = 20, className }: { who: BotIdentity;
       <BotFace mascot={who.mascot} size={size} />
       <span className="bot-by-name" aria-hidden="true">{who.name}</span>
       <span className="sr-only">{copy.bots.byLabel(who.name)}</span>
+      {who.preview && <PreviewTag short />}
     </span>
   );
 }

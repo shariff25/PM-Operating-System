@@ -118,6 +118,30 @@ test('drafts say which bot drafted them', async ({ page }) => {
   await expect(page.getByText('Drafted by Chief')).toBeVisible();
 });
 
+test('a Preview bot is tagged on a Today decide row and in the Drafts list, Nudge is not', async ({ page }) => {
+  await signIn(page);
+  await expect(page.getByLabel('What do you need?')).toBeVisible();
+  const rows = page.locator('a.decide-row');
+  await expect(rows.first()).toBeVisible();
+  const chiefRow = rows.filter({ hasText: 'By Chief' }).first();
+  const nudgeRow = rows.filter({ hasText: 'By Nudge' }).first();
+  await expect(chiefRow.locator('.tag-preview')).toBeVisible();
+  await expect(chiefRow.locator('.tag-preview')).toHaveText(/^Preview/);
+  await expect(nudgeRow).toBeVisible();
+  await expect(nudgeRow.locator('.tag-preview')).toHaveCount(0);
+  await scan(page, 'Today with Preview tags on the decide rows');
+
+  await go(page, '/drafts');
+  const list = page.locator('a.trow');
+  await expect(list.first()).toBeVisible();
+  const chiefDraft = list.filter({ hasText: 'By Chief' }).first();
+  const nudgeDraft = list.filter({ hasText: 'By Nudge' }).first();
+  await expect(chiefDraft.locator('.tag-preview')).toBeVisible();
+  await expect(nudgeDraft).toBeVisible();
+  await expect(nudgeDraft.locator('.tag-preview')).toHaveCount(0);
+  await scan(page, 'Drafts with Preview tags');
+});
+
 for (const theme of ['light', 'dark'] as const) {
   for (const width of [1280, 390] as const) {
     test(`axe on the marketplace screens, ${theme} theme, ${width}px wide`, async ({ page }) => {
