@@ -500,7 +500,10 @@ done
 cp "$UNIT" "$WORK/pmos-worker@pm\\x2dana.service"
 verify=$(systemd-analyze verify "$WORK/pmos-worker@pm\\x2dana.service" 2>&1) ||
   fail "systemd-analyze verify refused the unit: $verify"
-[ -z "$verify" ] || fail "systemd-analyze verify warned: $verify"
+# It also reports on the host's own units (a CI runner's warn about options systemd dropped), so
+# only what it says about this unit counts.
+verify=$(printf '%s\n' "$verify" | grep -F 'pmos-worker@' || true)
+[ -z "$verify" ] || fail "systemd-analyze verify warned about the unit: $verify"
 # The Docs bot uses its built-in tokens.
 bot_env
 run_bot sandbox docs >/dev/null || fail "sandbox docs failed"
