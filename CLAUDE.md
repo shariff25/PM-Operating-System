@@ -29,6 +29,16 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   than the Spark ("I want to deploy it in another platform apart from spark"), as a generic,
   host-independent implementation, not one tied to a single cloud. The design is written as a
   spec and reviewed before it is built (`docs/openshell-any-host-spec.md`).
+  Owner, 2026-11-22, later the same day: "Deploy on spark scrap that idea I want to make it
+  platform agnostic." The Spark is no longer a deployment target; PM OS runs on any suitable
+  Linux host. The owner accepted the conductor's recommendations: real data may be processed by
+  a hosted model (the owner's connected model, the same one used for the eval runs) and by a
+  local model on a GPU host the owner controls; an internet-facing host takes Microsoft sign-in
+  only, with password sign-in only from a VPN or an allowed range; admin routes go on a separate
+  admin-only listener; each service name is pinned to its own address in the sandbox policy;
+  the first host to verify on is an Ubuntu 24.04 x86 virtual machine without a GPU, with fake
+  data. This replaces the earlier rule that restricted data is processed only on the Spark's
+  local models; the spec is revised and reviewed before anything is built from it.
 - **d. Front end:** a web app PMs love. The owner holds the design to the standard of the
   Baseten and WorkOS dashboards and will keep challenging it. Design approved for the MVP on
   2026-11-16: `web/` as rebuilt in `claude/web-redesign-v3`.
@@ -114,11 +124,8 @@ follow-up tracking.
 
 ## Waiting on the owner
 
-GitHub Actions starting jobs again on the account (every CI job on pull request #10 ends within
-seconds without running: check whether this still holds); an Entra app registration, with `acct`
-as an optional claim; human labels for the eval judges (`evals/judges/LABELLING.md`); the two
-edits to Chief's role text and whether the model provider's host name may appear in committed
-eval reports; pilot PM names; edits to the nudge wording; a GitHub App
+An Entra app registration, with `acct` as an optional claim; human labels for the eval judges
+(`evals/judges/LABELLING.md`); pilot PM names; edits to the nudge wording; a GitHub App
 with pull-request permission and branch protection on the content branch; approval of the three
 plans (MCP servers and which ones for the pilot, the OpenShell prover, sandbox decisions in the
 audit log) and the go-ahead for requirement i; the CODEOWNERS lines and branch-protection settings in

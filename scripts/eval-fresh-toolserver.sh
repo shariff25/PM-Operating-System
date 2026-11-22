@@ -110,10 +110,16 @@ fi
 
 # Start a new one, detached from the caller (its output goes to the lane's log, never to the
 # caller), and wait for it.
+# The settings (tokens among them) are exported by this subshell, never passed to `env` on a
+# command line, where every account on this machine could read them in /proc/<pid>/cmdline
+# (the security review of 6bb806f, S1): the subshell clears its environment, exports them and
+# execs setsid.
 (
-  exec env -i "${KEEP_ENV[@]}" "${SET_ENV[@]}" \
-    PMOS_BIND="127.0.0.1:$PORT" PMOS_AUDIT_LOG="$DIR/audit.jsonl" \
-    setsid "$LANE_TOOLSERVER_BIN" >>"$DIR/toolserver.log" 2>&1 </dev/null
+  for v in $(compgen -e); do unset "$v" 2>/dev/null || true; done
+  for kv in "${KEEP_ENV[@]}" "${SET_ENV[@]}" PMOS_BIND="127.0.0.1:$PORT" PMOS_AUDIT_LOG="$DIR/audit.jsonl"; do
+    export "$kv"
+  done
+  exec setsid "$LANE_TOOLSERVER_BIN" >>"$DIR/toolserver.log" 2>&1 </dev/null
 ) &
 new=$!
 echo "$new" >"$PIDFILE"

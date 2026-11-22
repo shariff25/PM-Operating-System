@@ -10,6 +10,7 @@ dist/
 
 # Spark deployment: secrets and backups stay on the machine
 /deploy/.env
+/deploy/.env.*
 /deploy/live.env
 /deploy/backups/
 

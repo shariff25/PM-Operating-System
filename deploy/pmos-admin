@@ -45,10 +45,66 @@ set -euo pipefail
 DEPLOY="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DEPLOY/.." && pwd)"
 ENV="$DEPLOY/.env"
-[ -f "$ENV" ] || { echo "no deploy/.env yet: run deploy/setup.sh first" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+cmd=${1:-help}
+
+# `pause` and `down` are how an incident is stopped (docs/runbooks/incidents.md), so a
+# deploy/.env that can't be parsed, or that fails the checks below, warns loudly instead of
+# blocking them (the security review of 6bb806f, S3). `pause` needs nothing from the file (the
+# bot's name, this user's systemd and openshell); `down` needs only what Docker Compose reads
+# from it itself. Every other command stops.
+ENV_LENIENT=0
+case "$cmd" in pause | down) ENV_LENIENT=1 ;; esac
+env_problem() { # message: stop (exit 2), or for pause and down, warn and go on
+  if [ "$ENV_LENIENT" = 1 ]; then
+    say "WARNING: $*" >&2
+    say "WARNING: pmos-admin $cmd goes on, as it needs nothing pmos-admin reads from deploy/.env; fix the file afterwards." >&2
+  else
+    say "$*" >&2
+    exit 2
+  fi
+}
+if [ ! -f "$ENV" ]; then
+  if [ "$cmd" = pause ]; then
+    say "WARNING: there is no deploy/.env; pmos-admin pause goes on without it." >&2
+  else
+    echo "no deploy/.env yet: run deploy/setup.sh first" >&2
+    exit 1
+  fi
+fi
 
 compose() { docker compose --project-directory "$DEPLOY" -f "$DEPLOY/compose.yaml" --env-file "$ENV" "$@"; }
-say() { printf '%s\n' "$*"; }
+
+# deploy/.env holds the vault key and every service token, so (the security review of 6bb806f):
+# - a file every account may read or write, or its group may write, is refused (only warned
+#   about for pause and down): `chmod 600 deploy/.env`;
+# - a file its group may read, or that is readable through an ACL, is warned about, not
+#   refused: the Spark's eval-gate runner reads it through an ACL by design
+#   (docs/runbooks/upgrade.md, "Registering the Spark CI runner": `setfacl -m u:gh-runner:r`),
+#   and an ACL shows as group read;
+# - a file owned by another account than the caller is warned about, not refused, for the
+#   same runner (root is not warned: it reads every file anyway).
+env_file_checks() {
+  [ -f "$ENV" ] || return 0
+  local mode owner me
+  if ! read -r mode owner < <(stat -L -c '%a %u' -- "$ENV" 2>/dev/null); then
+    env_problem "couldn't read deploy/.env's owner and mode (stat failed)"
+    return 0
+  fi
+  me=$(id -u)
+  if (((8#$mode & 8#007) != 0)); then
+    env_problem "deploy/.env (mode $mode) can be read or written by every account on this machine, and it holds the vault key and every token: run chmod 600 deploy/.env, and rotate the tokens if anyone else may have read it (docs/runbooks/incidents.md)"
+  elif (((8#$mode & 8#020) != 0)); then
+    env_problem "deploy/.env (mode $mode) can be written by its group: run chmod 600 deploy/.env (the eval runner needs read only: setfacl -m u:gh-runner:r deploy/.env)"
+  fi
+  if (((8#$mode & 8#040) != 0)); then
+    say "WARNING: deploy/.env (mode $mode) is readable by its group or through an ACL: check with getfacl deploy/.env that only the eval runner's account is named (docs/runbooks/upgrade.md)" >&2
+  fi
+  if [ "$owner" != "$me" ] && [ "$me" != 0 ]; then
+    say "WARNING: deploy/.env is owned by uid $owner, not by you (uid $me): whoever owns it decides every setting in it" >&2
+  fi
+}
+env_file_checks
 
 # deploy/.env is read as data, never run as shell (slice H0; docs/openshell-any-host-spec.md,
 # surprise 12). It used to be sourced (`set -a; . deploy/.env`), so a value holding `$(…)`, a
@@ -57,7 +113,8 @@ say() { printf '%s\n' "$*"; }
 # an unquoted value ends at ` #`, as Docker Compose reads the same file. Nothing is expanded, so a
 # value is written out in full (`k2:<base64>`, never `k2:$(openssl …)`). Only the settings this
 # script reads are exported (PMOS_*, HF_TOKEN and the proxy settings); Compose reads the whole
-# file itself through --env-file. Any other kind of line stops the script.
+# file itself through --env-file. Any other kind of line stops the script (pause and down warn,
+# skip the line and go on: env_problem above).
 load_env() {
   local line key value n=0
   while IFS= read -r line || [ -n "$line" ]; do
@@ -68,8 +125,8 @@ load_env() {
       key=${BASH_REMATCH[2]}
       value=${BASH_REMATCH[3]}
     else
-      say "deploy/.env line $n isn't KEY=VALUE, a comment or blank: fix it (nothing in it is run as shell)" >&2
-      exit 2
+      env_problem "deploy/.env line $n isn't KEY=VALUE, a comment or blank: fix it (nothing in it is run as shell)"
+      continue
     fi
     case "$key" in
       PMOS_* | HF_TOKEN | HTTPS_PROXY | HTTP_PROXY | NO_PROXY | https_proxy | http_proxy | no_proxy) ;;
@@ -85,7 +142,7 @@ load_env() {
     export "$key=$value"
   done <"$ENV"
 }
-load_env
+[ ! -f "$ENV" ] || load_env
 row() { printf '  %-12s %-6s %s\n' "$1" "$2" "$3"; }
 
 # The console's sign-in settings. The console checks them too; this says so before anything
@@ -317,11 +374,28 @@ profiles() {
   [ ${#p[@]} -eq 0 ] || printf '%s\n' "${p[@]}"
 }
 
+# Tokens reach curl on its standard input, as a config file (`--config -`), never on its
+# command line, where every account on this machine can read them in /proc/<pid>/cmdline while
+# it runs (the security review of 6bb806f, S1). printf is a shell builtin, so the token is on
+# no command line on the way either. A token with a quote, a backslash or a line break can't be
+# written in curl's config syntax as it is, so it is refused before curl runs.
+token_ok() { # name of the variable holding the token
+  local t=${!1:-}
+  case "$t" in
+    '' | generated) say "$1 isn't set in deploy/.env: run deploy/setup.sh" >&2; return 1 ;;
+    *[\"\\]* | *$'\n'* | *$'\r'*) say "$1 in deploy/.env holds a quote, backslash or line break: generate a new one (openssl rand -hex 24)" >&2; return 1 ;;
+  esac
+}
+bearer_config() { # name of the variable holding the token (checked with token_ok first)
+  printf 'header = "Authorization: Bearer %s"\n' "${!1}"
+}
+
 # A call to the tool server's internal API as the orchestrator.
 internal() { # method path [json]
-  curl -fsS --noproxy '*' -X "$1" "http://127.0.0.1:8710$2" \
-    -H "Authorization: Bearer $PMOS_SERVICE_TOKEN" -H 'content-type: application/json' \
-    ${3:+-d "$3"}
+  token_ok PMOS_SERVICE_TOKEN || exit 2
+  bearer_config PMOS_SERVICE_TOKEN |
+    curl --config - -fsS --noproxy '*' -X "$1" "http://127.0.0.1:8710$2" \
+      -H 'content-type: application/json' ${3:+-d "$3"}
 }
 
 # The `pmos` CLI in the image, in the content checkout, as the checkout's owner.
@@ -389,6 +463,39 @@ ENV_KEY_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_
 # shell or Compose gives a meaning to (no `$`, quote, backslash, space, `#`, `~` or newline).
 ENV_VALUE_CHARS='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.,:=/+-'
 
+# Changes to deploy/.env (the security review of 6bb806f) are made under a lock
+# (deploy/.env.lock, with flock when it is installed), so two commands that change it at once
+# can't lose one change, and atomically: the new file is written beside it (mktemp: mode 0600),
+# given the old file's owner and ACL (the eval runner's read ACL, docs/runbooks/upgrade.md),
+# then renamed over it, so no reader ever sees half a file. deploy/setup.sh does the same.
+ENV_LOCK_HELD=0
+lock_env() {
+  [ "$ENV_LOCK_HELD" = 0 ] || return 0
+  if command -v flock >/dev/null; then
+    (umask 077 && : >>"$DEPLOY/.env.lock")
+    exec 9>>"$DEPLOY/.env.lock"
+    flock -w 60 9 || {
+      say "another pmos-admin or setup.sh has been changing deploy/.env for a minute ($DEPLOY/.env.lock): try again" >&2
+      exit 1
+    }
+  else
+    say "note: flock isn't installed, so deploy/.env is changed without a lock" >&2
+  fi
+  ENV_LOCK_HELD=1
+}
+# Put the file $1 (a new deploy/.env, in the same directory) in place of deploy/.env.
+replace_env() {
+  chmod 600 "$1"
+  chown --reference="$ENV" "$1" 2>/dev/null || true
+  if command -v getfacl >/dev/null && command -v setfacl >/dev/null; then
+    getfacl -p -- "$ENV" 2>/dev/null | setfacl --set-file=- -- "$1" 2>/dev/null ||
+      say "WARNING: couldn't copy deploy/.env's ACL; if the eval runner reads it, run again: sudo setfacl -m u:gh-runner:r $ENV" >&2
+  elif [[ "$(ls -ld -- "$ENV")" == ??????????+* ]]; then
+    say "WARNING: deploy/.env had an ACL and getfacl/setfacl aren't installed to keep it: run again: sudo setfacl -m u:gh-runner:r $ENV" >&2
+  fi
+  mv -f -- "$1" "$ENV"
+}
+
 # Replace or append KEY=VALUE in deploy/.env. A key or value with any other character is
 # refused (exit 2) before the file is touched.
 set_env() {
@@ -397,15 +504,21 @@ set_env() {
     say "refusing to write $(printf '%q' "$1") to deploy/.env: only plain characters may go there" >&2
     exit 2
   fi
-  tmp=$(mktemp)
-  if grep -qE "^$1=" "$ENV"; then
-    awk -v k="$1" -v v="$2" -F= 'BEGIN{OFS="="} $1==k{print k, v; next} {print}' "$ENV" >"$tmp"
+  lock_env
+  tmp=$(mktemp "$DEPLOY/.env.XXXXXX")
+  if {
+    if grep -qE "^$1=" "$ENV"; then
+      awk -v k="$1" -v v="$2" -F= 'BEGIN{OFS="="} $1==k{print k, v; next} {print}' "$ENV" >"$tmp"
+    else
+      cat "$ENV" >"$tmp" && printf '%s=%s\n' "$1" "$2" >>"$tmp"
+    fi
+  }; then
+    replace_env "$tmp"
   else
-    cat "$ENV" >"$tmp"
-    printf '%s=%s\n' "$1" "$2" >>"$tmp"
+    rm -f "$tmp"
+    say "couldn't write deploy/.env; it is unchanged" >&2
+    exit 1
   fi
-  cat "$tmp" >"$ENV"
-  rm -f "$tmp"
 }
 
 # --- Bots: names, tokens, sandboxes and their workers ---------------------------------------
@@ -424,6 +537,38 @@ valid_bot_name() {
 require_bot_name() { # command name
   valid_bot_name "$2" && return 0
   say "pmos-admin $1: $(printf '%q' "$2") isn't a bot name (lowercase letters, digits and single hyphens, at most 32 characters)" >&2
+  exit 2
+}
+
+# A PM's handle, the same rule as `valid_handle` in crates/contract/src/model.rs: a lowercase
+# letter or digit, then lowercase letters, digits, `.`, `_` and `-`, at most 64 characters. So
+# `.`, `..` and anything with a `/` are refused before they reach a URL path, where curl would
+# collapse `..` (`revoke .. reindex` would have sent DELETE /internal/reindex).
+HANDLE_FIRST_CHARS=abcdefghijklmnopqrstuvwxyz0123456789
+HANDLE_CHARS=abcdefghijklmnopqrstuvwxyz0123456789._-
+require_handle() { # command handle
+  if [ -n "$2" ] && [ ${#2} -le 64 ] && only_chars "${2:0:1}" "$HANDLE_FIRST_CHARS" &&
+    only_chars "$2" "$HANDLE_CHARS"; then
+    return 0
+  fi
+  say "pmos-admin $1: $(printf '%q' "$2") isn't a handle (lowercase letters, digits, . _ -, starting with a letter or digit)" >&2
+  exit 2
+}
+
+# The stack's services, as Docker Compose lists them from deploy/compose.yaml with every
+# profile. `logs` and `restart` take only one of these (never an option, never anything else).
+ALL_PROFILES=(--profile slack --profile console --profile web --profile models --profile bringup)
+require_service() { # command service
+  local list
+  case "$2" in
+    '' | -*) say "usage: pmos-admin $1 <service> (a service name, not $(printf '%q' "$2"))" >&2; exit 2 ;;
+  esac
+  list=$(compose "${ALL_PROFILES[@]}" config --services 2>/dev/null) || {
+    say "couldn't list the stack's services (docker compose config failed on deploy/compose.yaml or deploy/.env)" >&2
+    exit 1
+  }
+  grep -qxF -- "$2" <<<"$list" && return 0
+  say "pmos-admin $1: no service $(printf '%q' "$2"); the services are: $(tr '\n' ' ' <<<"$list")" >&2
   exit 2
 }
 
@@ -489,11 +634,24 @@ worker_unit_checks() {
   fi
 }
 
+# A sandbox's provider, made or brought up to date (see `sandbox` for what this rests on). The
+# token is already in the environment under the variable's name ($3); only the name is passed.
+provider_upsert() { # name type variable
+  if openshell provider get "$1" >/dev/null 2>&1; then
+    openshell provider update "$1" --credential "$3"
+  else
+    openshell provider create --name "$1" --type "$2" --credential "$3"
+  fi
+}
+
 cmd=${1:-help}
 shift || true
 case "$cmd" in
   build)
-    args=(--build-arg "HTTPS_PROXY=${HTTPS_PROXY:-}" --build-arg "NO_PROXY=${NO_PROXY:-}")
+    # The proxy settings by name only: Docker takes each value from this environment, so a proxy
+    # URL with a password in it isn't on docker's command line (the security review of 6bb806f).
+    export HTTPS_PROXY="${HTTPS_PROXY:-}" NO_PROXY="${NO_PROXY:-}"
+    args=(--build-arg HTTPS_PROXY --build-arg NO_PROXY)
     if [ -n "${HTTPS_PROXY:-}" ]; then args+=(--network host); fi
     if [ -n "${PMOS_BUILD_CA:-}" ]; then args+=(--secret "id=ca,src=$PMOS_BUILD_CA"); fi
     tag=${PMOS_VERSION:-local}
@@ -528,7 +686,12 @@ case "$cmd" in
     ;;
 
   down)
-    compose --profile slack --profile console --profile web --profile models --profile bringup down
+    compose --profile slack --profile console --profile web --profile models --profile bringup down || {
+      say "docker compose couldn't stop the stack (it may not be able to read deploy/.env either)." >&2
+      say "Stop PM OS's containers directly (data is kept):" >&2
+      say "  docker ps -q --filter label=com.docker.compose.project=pmos | xargs -r docker stop" >&2
+      exit 1
+    }
     ;;
 
   status)
@@ -583,12 +746,21 @@ case "$cmd" in
     [ $# -ge 1 ] || { say "usage: pmos-admin logs <service> [-f]" >&2; exit 2; }
     svc=$1
     shift
-    compose --profile slack --profile console --profile web --profile models --profile bringup logs --tail 200 "$@" "$svc"
+    require_service logs "$svc"
+    opts=()
+    for a in "$@"; do
+      case "$a" in
+        -f | --follow | -t | --timestamps) opts+=("$a") ;;
+        *) say "usage: pmos-admin logs <service> [-f] [-t]" >&2; exit 2 ;;
+      esac
+    done
+    compose "${ALL_PROFILES[@]}" logs --tail 200 "${opts[@]}" "$svc"
     ;;
 
   restart)
     [ $# -eq 1 ] || { say "usage: pmos-admin restart <service>" >&2; exit 2; }
-    compose --profile slack --profile console --profile web --profile models --profile bringup restart "$1"
+    require_service restart "$1"
+    compose "${ALL_PROFILES[@]}" restart "$1"
     ;;
 
   backup)
@@ -649,6 +821,11 @@ case "$cmd" in
 
   revoke)
     [ $# -eq 2 ] || { say "usage: pmos-admin revoke <handle> <atlassian|slack|github>" >&2; exit 2; }
+    require_handle revoke "$1"
+    case "$2" in
+      atlassian | slack | github) ;;
+      *) say "usage: pmos-admin revoke <handle> <atlassian|slack|github> (not $(printf '%q' "$2"))" >&2; exit 2 ;;
+    esac
     internal DELETE "/internal/credentials/$1/$2" && say "revoked $2 for $1"
     ;;
 
@@ -751,6 +928,10 @@ for g in s["groups"]:
       say "the Docs bot's tokens are built in (PMOS_RT_DOCS_WORKER_TOKEN)"
       exit 0
     fi
+    # Read deploy/.env again under the lock, so another add-bot's tokens, written since the
+    # top of this script, are kept.
+    lock_env
+    load_env
     if [ -n "$(list_value "${PMOS_RT_WORKER_TOKENS:-}" "worker-$bot")" ]; then
       say "$bot already has tokens"
       exit 0
@@ -781,7 +962,19 @@ for g in s["groups"]:
     #   `&` from the operator's shell, which died at logout and never came back after a reboot).
     #   Verify on a real host: that `sandbox exec` stays in the foreground for the worker's life,
     #   and the name of OpenShell's gateway unit (see the unit file).
-    # - `provider create`, `--policy`, `--provider` and `--upload`: as in docs/sandbox-policies.md.
+    # - `--policy`, `--provider` and `--upload`: as in docs/sandbox-policies.md.
+    # - The providers (provider_upsert): OpenShell's providers page (how-it-works/providers/
+    #   overview.mdx, read 2026-11-22) makes providers their own resources, attached to
+    #   sandboxes and deleted separately ("first detach the providers from any sandboxes that
+    #   still use them. Then delete the providers"), and documents `provider get <name>` and
+    #   `provider update <name> --credential <VAR>` (it replaces the credential, and attached
+    #   sandboxes apply it for new processes). So a provider survives `sandbox delete`, and
+    #   creating it again would collide: an existing one is updated with the token from
+    #   deploy/.env instead, which is also how a rotated token reaches it (docs/runbooks/
+    #   incidents.md). `--credential <VAR>` without a value reads the token from the
+    #   environment, never the command line (the same page: a value there is in "the host
+    #   process table"). Verify on a real host: that `provider get` exits non-zero only for a
+    #   provider that doesn't exist, and that `provider create` refuses an existing name.
     sandbox_usage() { say "usage: pmos-admin sandbox <bot> [--dry-run]" >&2; exit 2; }
     dry=0
     names=()
@@ -819,16 +1012,16 @@ for g in s["groups"]:
       --provider "$sandbox-gateway" --provider "$sandbox-worker" "${uploads[@]}")
     if [ "$dry" = 1 ]; then
       # What would run; the tokens are never printed.
-      say "openshell provider create --name $sandbox-gateway --type pmos-gateway --credential PMOS_GATEWAY_TOKEN  (the token from deploy/.env)"
-      say "openshell provider create --name $sandbox-worker --type pmos-worker --credential PMOS_WORKER_TOKEN  (the token from deploy/.env)"
+      say "openshell provider get $sandbox-gateway: if it exists, openshell provider update $sandbox-gateway --credential PMOS_GATEWAY_TOKEN; else openshell provider create --name $sandbox-gateway --type pmos-gateway --credential PMOS_GATEWAY_TOKEN  (the token from deploy/.env, in the environment)"
+      say "openshell provider get $sandbox-worker: if it exists, openshell provider update $sandbox-worker --credential PMOS_WORKER_TOKEN; else openshell provider create --name $sandbox-worker --type pmos-worker --credential PMOS_WORKER_TOKEN  (the token from deploy/.env, in the environment)"
       say "openshell ${create[*]}"
       say "install $WORKER_UNIT_TEMPLATE as $(user_unit_dir)/pmos-worker@.service"
       say "systemctl --user daemon-reload"
       say "systemctl --user enable --now $unit"
       exit 0
     fi
-    PMOS_GATEWAY_TOKEN=$gw openshell provider create --name "$sandbox-gateway" --type pmos-gateway --credential PMOS_GATEWAY_TOKEN
-    PMOS_WORKER_TOKEN=$rt openshell provider create --name "$sandbox-worker" --type pmos-worker --credential PMOS_WORKER_TOKEN
+    PMOS_GATEWAY_TOKEN=$gw provider_upsert "$sandbox-gateway" pmos-gateway PMOS_GATEWAY_TOKEN
+    PMOS_WORKER_TOKEN=$rt provider_upsert "$sandbox-worker" pmos-worker PMOS_WORKER_TOKEN
     openshell "${create[@]}"
     install_worker_unit
     systemctl --user daemon-reload
@@ -839,18 +1032,49 @@ for g in s["groups"]:
 
   pause)
     # The unit is disabled as well as stopped, so a paused bot stays paused after a reboot.
+    # A pause is the first step of an incident (docs/runbooks/incidents.md). So (the security
+    # review of 6bb806f, S2): as root it refuses, as `sandbox` and `resume` do, because root's
+    # `systemctl --user` and openshell aren't the gateway user's, and the worker unit would stay
+    # enabled and start the worker again; when the unit can't be found or stopped it says so
+    # plainly; and the sandbox is stopped whatever happened to the unit. Anything left undone is
+    # listed at the end, and then the exit is 1.
     [ $# -eq 1 ] || { say "usage: pmos-admin pause <bot>" >&2; exit 2; }
-    require_bot_name pause "$1"
-    if command -v systemctl >/dev/null && command -v systemd-escape >/dev/null &&
-      [ -f "$(user_unit_dir)/pmos-worker@.service" ]; then
-      unit=$(worker_unit "$1")
-      # A pause is the first step of an incident (docs/runbooks/incidents.md): if the unit can't
-      # be stopped, say so and stop the sandbox all the same.
-      systemctl --user disable --now "$unit" ||
-        say "couldn't stop $unit; stopping the sandbox anyway (check: systemctl --user status '$unit')" >&2
+    bot=$1
+    require_bot_name pause "$bot"
+    if [ "$(id -u)" = 0 ]; then
+      say "run pause as the user whose OpenShell gateway runs, not as root or with sudo: root's systemctl --user" >&2
+      say "and openshell aren't that user's, so the worker unit would stay enabled and start the worker again." >&2
+      say "As that user: deploy/pmos-admin pause $bot" >&2
+      say "or by hand: systemctl --user disable --now 'pmos-worker@<systemd-escape -- $bot>.service'; openshell sandbox stop -n pmos-$bot" >&2
+      exit 1
     fi
-    openshell sandbox stop -n "pmos-$1"
-    say "pmos-$1 stopped; its queued tasks wait (and fail after their retry) until resume"
+    left=()
+    if ! command -v systemctl >/dev/null || ! command -v systemd-escape >/dev/null; then
+      left+=("systemctl or systemd-escape isn't installed, so no worker unit was stopped: if pmos-$bot's worker runs, stop it (pgrep -af 'openshell sandbox exec -n pmos-$bot')")
+    else
+      unit=$(worker_unit "$bot")
+      if [ ! -f "$(user_unit_dir)/pmos-worker@.service" ]; then
+        say "no worker unit is installed for $(id -un) ($(user_unit_dir)/pmos-worker@.service is missing)" >&2
+        left+=("no worker unit was found for $(id -un): if pmos-$bot's worker was started another way (with & before slice H0, or as another user), find and stop it: pgrep -af 'openshell sandbox exec -n pmos-$bot'")
+      elif systemctl --user disable --now "$unit"; then
+        say "worker unit $unit stopped and disabled"
+      else
+        say "couldn't stop and disable $unit; stopping the sandbox anyway" >&2
+        left+=("the worker unit $unit may still be enabled or running: systemctl --user status '$unit', then systemctl --user disable --now '$unit'")
+      fi
+    fi
+    if ! command -v openshell >/dev/null; then
+      left+=("openshell isn't on PATH, so the sandbox pmos-$bot was NOT stopped: openshell sandbox stop -n pmos-$bot (or openshell sandbox delete pmos-$bot)")
+    elif openshell sandbox stop -n "pmos-$bot"; then
+      say "pmos-$bot stopped; its queued tasks wait (and fail after their retry) until resume"
+    else
+      left+=("the sandbox pmos-$bot was NOT stopped: openshell sandbox stop -n pmos-$bot (or openshell sandbox delete pmos-$bot), then check openshell sandbox list")
+    fi
+    if [ ${#left[@]} -gt 0 ]; then
+      say "pause of $bot is NOT complete. Left to do:" >&2
+      for l in "${left[@]}"; do say "  - $l" >&2; done
+      exit 1
+    fi
     ;;
 
   resume)
@@ -880,9 +1104,11 @@ for g in s["groups"]:
   evals)
     # The benchmarks and load test (docs/evals.md), run in the image on the stack's network.
     # Reports are written to evals/reports in the content checkout; commit them.
-    docker run --rm --user "${PMOS_UID:-10001}:${PMOS_GID:-10001}" --network pmos_pmos \
-      -v "$PMOS_CONTENT_CHECKOUT:/srv/content-repo" -w /srv/content-repo \
-      -e PMOS_BOTS_URL=http://bots.pmos.internal:8750 -e PMOS_EVALS_TOKEN="$PMOS_RT_EVALS_TOKEN" \
+    # The token by name only (`-e NAME`): docker takes the value from this environment, so it
+    # isn't on docker's command line (the security review of 6bb806f, S1).
+    PMOS_EVALS_TOKEN=${PMOS_RT_EVALS_TOKEN:-} docker run --rm --user "${PMOS_UID:-10001}:${PMOS_GID:-10001}" \
+      --network pmos_pmos -v "$PMOS_CONTENT_CHECKOUT:/srv/content-repo" -w /srv/content-repo \
+      -e PMOS_BOTS_URL=http://bots.pmos.internal:8750 -e PMOS_EVALS_TOKEN \
       -e PMOS_EVALS_ROOT=evals "pmos:${PMOS_VERSION:-local}" pmos-evals "$@"
     ;;
 
@@ -922,7 +1148,9 @@ for g in s["groups"]:
       esac
     done
     # The base goes to `git diff` and `git archive` as a revision: one that starts with `-` would
-    # be read as an option (`--output=<file>`, `--remote=…`).
+    # be read as an option (`--output=<file>`, `--remote=…`). So it is refused here, and both git
+    # commands also get it after `--end-of-options` (git 2.24 and later), which ends their
+    # options without making what follows a path, as `--` would.
     case "$base" in -* | '') say "--base must name a revision, not $(printf '%q' "$base")" >&2; exit 2 ;; esac
     [ -d "$checkout" ] || { say "no directory $checkout" >&2; exit 2; }
     checkout=$(cd "$checkout" && pwd)
@@ -932,7 +1160,7 @@ for g in s["groups"]:
       say "base=$base"
       exit 0
     fi
-    changed=$(git -C "$checkout" diff --name-only "$base"...HEAD)
+    changed=$(git -C "$checkout" diff --name-only --end-of-options "$base"...HEAD)
     eval_stack_up "$checkout"
     mapfile -t categories < <(printf '%s\n' "$changed" | evals_runner affected --content content)
     if [ ${#categories[@]} -eq 0 ]; then
@@ -940,7 +1168,7 @@ for g in s["groups"]:
       exit 0
     fi
     # The baseline: the base branch's committed reports, unpacked where the runner can read them.
-    git -C "$checkout" archive "$base" evals/reports | tar -x -C "$PMOS_EVAL_BASELINE"
+    git -C "$checkout" archive --end-of-options "$base" evals/reports | tar -x -C "$PMOS_EVAL_BASELINE"
     worst=0
     for c in "${categories[@]}"; do
       code=0
@@ -955,19 +1183,39 @@ for g in s["groups"]:
   smoke)
     # One Docs-bot question through the whole stack, as the Slack bot would send it.
     [ $# -eq 1 ] || { say "usage: pmos-admin smoke <handle of an active user>" >&2; exit 2; }
-    auth=(-H "Authorization: Bearer $PMOS_RT_SLACK_TOKEN" -H "X-Pmos-User: $1")
-    body=$(printf '{"bot":"docs","requested_by":"%s","text":"What does the docs site say about getting started?","source":"slack","slack":{"channel":"smoke","thread_ts":"0.0"}}' "$1")
-    task=$(curl -sS --noproxy '*' -X POST http://127.0.0.1:8750/v1/tasks "${auth[@]}" -H 'content-type: application/json' -d "$body")
+    handle=$1
+    require_handle smoke "$handle"
+    token_ok PMOS_RT_SLACK_TOKEN || exit 2
+    # The Slack runtime token on curl's standard input (bearer_config), never its command line.
+    rt_curl() {
+      { bearer_config PMOS_RT_SLACK_TOKEN; printf 'header = "X-Pmos-User: %s"\n' "$handle"; } |
+        curl --config - -sS --noproxy '*' "$@"
+    }
+    # The task's JSON from a real encoder (jq, or python3 where jq isn't installed).
+    if command -v jq >/dev/null; then
+      body=$(jq -cn --arg who "$handle" '{bot: "docs", requested_by: $who,
+        text: "What does the docs site say about getting started?", source: "slack",
+        slack: {channel: "smoke", thread_ts: "0.0"}}')
+    elif command -v python3 >/dev/null; then
+      body=$(python3 -I -c 'import json, sys
+print(json.dumps({"bot": "docs", "requested_by": sys.argv[1],
+  "text": "What does the docs site say about getting started?", "source": "slack",
+  "slack": {"channel": "smoke", "thread_ts": "0.0"}}, separators=(",", ":")))' "$handle")
+    else
+      say "smoke needs jq or python3 to write the task's JSON" >&2
+      exit 1
+    fi
+    task=$(rt_curl -X POST http://127.0.0.1:8750/v1/tasks -H 'content-type: application/json' -d "$body")
     id=$(sed -n 's/.*"id":"\(tsk_[0-9a-f]*\)".*/\1/p' <<<"$task")
     [ -n "$id" ] || { say "the runtime refused the task: $task" >&2; exit 1; }
     say "task $id queued; waiting up to 3 minutes for a worker"
     status=queued
     for _ in $(seq 1 90); do
-      status=$(curl -sS --noproxy '*' "http://127.0.0.1:8750/v1/tasks/$id" "${auth[@]}" | sed -n 's/.*"status":"\([a-z_]*\)".*/\1/p')
+      status=$(rt_curl "http://127.0.0.1:8750/v1/tasks/$id" | sed -n 's/.*"status":"\([a-z_]*\)".*/\1/p')
       case "$status" in done|failed|cancelled|needs_approval) break ;; esac
       sleep 2
     done
-    curl -sS --noproxy '*' "http://127.0.0.1:8750/v1/tasks/$id/events" "${auth[@]}" | tr '{' '\n' | sed -n 's/.*"kind":"\([a-z_]*\)".*"text":"\([^"]*\)".*/  \1: \2/p'
+    rt_curl "http://127.0.0.1:8750/v1/tasks/$id/events" | tr '{' '\n' | sed -n 's/.*"kind":"\([a-z_]*\)".*"text":"\([^"]*\)".*/  \1: \2/p'
     echo
     if [ "$status" = done ]; then say "smoke test passed"; else say "smoke test ended as: $status" >&2; exit 1; fi
     ;;

@@ -53,6 +53,7 @@ When a bot misbehaves, pause it before you investigate:
 
 ```sh
 deploy/pmos-admin pause <bot>      # stops and disables its worker unit, then its sandbox; its tasks wait
+                                   # (not as root; exit 1 and a list of what is left if a step failed)
 deploy/pmos-admin resume <bot>     # starts the sandbox, then the worker unit (clearing a failed one)
 ```
 

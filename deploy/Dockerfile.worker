@@ -33,9 +33,11 @@ FROM node:22-bookworm-slim
 # /opt/pmos stays root's and read-only to the worker (it was copied as root and is world-readable,
 # as it was for `node`); only the workspace, the worker's working directory, is the account's.
 # The eval stack and the bring-up worker run this image as plain containers with the content
-# mounted read-only: they need only to read it, which takes the same world-readable files that
-# `node` (uid 1000, also not the checkout's owner) needed before, and the harness writes only
-# under the system temporary directory (harness/src/worker.ts, agent.ts: os.tmpdir()).
+# mounted read-only, with `user:` set to the checkout's owner (PMOS_UID:PMOS_GID, as the
+# services), not 10100: 10100 can't read a checkout that isn't world-readable (made with umask
+# 077), where `node` (1000) could when the operator was uid 1000. The harness writes only under
+# the system temporary directory (harness/src/worker.ts, agent.ts: os.tmpdir()), so any uid
+# works there.
 RUN groupadd --gid 10100 sandbox \
  && useradd --uid 10100 --gid 10100 --no-log-init --create-home --home-dir /home/sandbox \
       --shell /bin/bash sandbox \

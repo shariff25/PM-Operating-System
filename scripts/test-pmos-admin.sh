@@ -10,6 +10,14 @@
 #   OpenShell or systemd; tokens are found by exact key; `sandbox` creates with `--from` and
 #   starts the worker as the systemd user unit deploy/systemd/pmos-worker@.service (checked
 #   with systemd-analyze), only with lingering on; `pause` and `resume` drive the unit (H0).
+# - from the security review of 6bb806f (H0b): no token reaches curl's, docker's or openshell's
+#   arguments (curl reads it with --config -, docker and openshell from their environment);
+#   existing providers are updated, not created again; `pause` refuses root, says what is left
+#   and stops the sandbox whatever happened to the unit; `pause` and `down` go on with a
+#   deploy/.env that can't be parsed, has the wrong mode or (pause) is missing, and everything
+#   else stops; deploy/.env's mode and owner are checked; it is rewritten by a rename, under a
+#   lock, keeping its ACL; `revoke`, `smoke`, `logs` and `restart` take only a handle, a known
+#   provider or a known service; setup.sh refuses a clone URL with credentials in it.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)/deploy/pmos-admin"
@@ -22,6 +30,7 @@ bash -n "$SRC"
 mkdir -p "$WORK/repo/deploy" "$WORK/pr"
 cp "$SRC" "$WORK/repo/deploy/pmos-admin"
 : >"$WORK/repo/deploy/.env"
+chmod 600 "$WORK/repo/deploy/.env"
 admin=("$WORK/repo/deploy/pmos-admin")
 
 out=$("${admin[@]}" evals-gate --checkout "$WORK/pr" --base origin/release --dry-run)
@@ -57,9 +66,9 @@ allowed=(
   '[ -d "$checkout" ] || { say "no directory $checkout" >&2; exit 2; }'
   'checkout=$(cd "$checkout" && pwd)'
   'say "checkout=$checkout"'
-  'changed=$(git -C "$checkout" diff --name-only "$base"...HEAD)'
+  'changed=$(git -C "$checkout" diff --name-only --end-of-options "$base"...HEAD)'
   'eval_stack_up "$checkout"'
-  'git -C "$checkout" archive "$base" evals/reports | tar -x -C "$PMOS_EVAL_BASELINE"'
+  'git -C "$checkout" archive --end-of-options "$base" evals/reports | tar -x -C "$PMOS_EVAL_BASELINE"'
 )
 while IFS= read -r line; do
   [ -n "$line" ] || continue
@@ -93,15 +102,41 @@ printf 'mode=%s file=%s workers=%s args=%s\n' "${PMOS_ASSERTION_MODE:-}" "$filem
 if [ "${1:-}" = network ] && [ -n "${FAKE_GATEWAY:-}" ]; then echo "$FAKE_GATEWAY"; fi
 # `compose … ps --services`: the running services, when the test gives them.
 if [[ " $* " == *" ps "*"--services"* ]] && [ -n "${FAKE_PS:-}" ]; then echo "$FAKE_PS"; fi
+# `compose … config --services`: the stack's services (logs and restart check against them).
+if [[ " $* " == *" config --services "* ]]; then
+  printf '%s\n' ${FAKE_SERVICES:-postgres docs toolserver gateway bots slack console web worker-docs vllm-default vllm-extraction}
+fi
+# What reached docker through its environment, never its arguments (S1).
+printf 'evals_token=%s https_proxy=%s\n' "${PMOS_EVALS_TOKEN-unset}" "${HTTPS_PROXY-unset}" >>"${DOCKER_ENV_LOG:-/dev/null}"
+[ "${FAKE_DOCKER_FAIL:-0}" != 1 ]
 EOF
 chmod +x "$WORK/bin/docker"
-# A stand-in `curl` for `status`: every /readyz answers FAKE_READYZ with 200.
+# A stand-in `curl`: every /readyz and /healthz answers FAKE_READYZ with 200 (for `status`); the
+# runtime's task routes answer as for a finished task (for `smoke`). It records its arguments
+# (CURL_LOG, one call per line), what it read with `--config -` (CURL_CONFIG_LOG) and a `-d`
+# body (CURL_BODY_LOG).
 cat >"$WORK/bin/curl" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n200' "${FAKE_READYZ:-{\}}"
+printf '%s\n' "$*" >>"${CURL_LOG:-/dev/null}"
+config=0 prev="" body=""
+for a in "$@"; do
+  [ "$prev" = --config ] && [ "$a" = - ] && config=1
+  [ "$prev" = -d ] && body=$a
+  prev=$a
+done
+if [ "$config" = 1 ]; then cat >>"${CURL_CONFIG_LOG:-/dev/null}"; fi
+[ -z "$body" ] || printf '%s\n' "$body" >>"${CURL_BODY_LOG:-/dev/null}"
+case "$*" in
+  *readyz* | *healthz*) printf '%s\n200' "${FAKE_READYZ:-{\}}" ;;
+  *"-X POST http://127.0.0.1:8750/v1/tasks "*) echo '{"id":"tsk_0abc12","status":"queued"}' ;;
+  *8750/v1/tasks/*/events*) echo '[{"kind":"answer","text":"see the getting started page"}]' ;;
+  *8750/v1/tasks/*) echo '{"id":"tsk_0abc12","status":"done"}' ;;
+  *) echo '{}' ;;
+esac
 EOF
 chmod +x "$WORK/bin/curl"
-export DOCKER_LOG="$WORK/docker.log"
+export DOCKER_LOG="$WORK/docker.log" DOCKER_ENV_LOG="$WORK/docker-env.log"
+export CURL_LOG="$WORK/curl.log" CURL_CONFIG_LOG="$WORK/curl-config.log" CURL_BODY_LOG="$WORK/curl-body.log"
 stack_env() { # mode [extra lines...]
   {
     echo "PMOS_ASSERTION_MODE=$1"
@@ -119,7 +154,12 @@ stack_env() { # mode [extra lines...]
     echo "PMOS_GW_BOT_TOKENS="
     printf '%s\n' "$@"
   } >"$WORK/stack/deploy/.env"
+  chmod 600 "$WORK/stack/deploy/.env"
   : >"$DOCKER_LOG"
+  : >"$DOCKER_ENV_LOG"
+  : >"$CURL_LOG"
+  : >"$CURL_CONFIG_LOG"
+  : >"$CURL_BODY_LOG"
 }
 stack=("$WORK/stack/deploy/pmos-admin")
 run_stack() { PATH="$WORK/bin:$PATH" "${stack[@]}" "$@"; }
@@ -371,6 +411,36 @@ code=0
 bash "$WORK/setup/deploy/setup.sh" --content $'/srv/a\nPMOS_X=1' >/dev/null 2>&1 || code=$?
 [ "$code" = 2 ] || fail "setup.sh with a newline in --content exits $code, not 2"
 [ ! -e "$WORK/pwned5" ] || fail "setup.sh ran a path as shell"
+# A clone URL with a user or token in it would be on git's command line: refused (S1).
+for url in "https://x-access-token:tok@github.com/o/r.git" "https://user@example.com/r.git"; do
+  code=0
+  bash "$WORK/setup/deploy/setup.sh" --clone "$url" >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "setup.sh --clone $url exits $code, not 2"
+done
+# A whole run, with the stand-in docker: deploy/.env made 0600 and filled; a value set back to
+# `generated` is filled again by a rename (a new file), not rewritten in place; nothing left over.
+cp "$DEPLOY_SRC/env.example" "$WORK/setup/deploy/env.example"
+mkdir -p "$WORK/setup-content/.git" "$WORK/setup-content/content"
+: >"$WORK/setup-content/content/tools.yaml"
+setup_run() { PATH="$WORK/bin:$PATH" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" --state "$WORK/setup-state"; }
+setup_run >/dev/null 2>&1 || fail "setup.sh failed: $(setup_run 2>&1 | tail -5)"
+senv="$WORK/setup/deploy/.env"
+[ "$(stat -c %a "$senv")" = 600 ] || fail "setup.sh's deploy/.env isn't 0600"
+grep -qE '^PMOS_SERVICE_TOKEN=[0-9a-f]{48}$' "$senv" || fail "setup.sh didn't fill PMOS_SERVICE_TOKEN"
+grep -qx "PMOS_CONTENT_CHECKOUT=$WORK/setup-content" "$senv" || fail "setup.sh didn't write the checkout"
+kept=$(grep '^PMOS_VAULT_KEY=' "$senv")
+sed -i 's/^PMOS_SERVICE_TOKEN=.*/PMOS_SERVICE_TOKEN=generated/' "$senv"
+# A hard link to the old file: a rename leaves it as it was (and deploy/.env with one link);
+# a rewrite in place would change it. (An inode number can be reused, so it isn't compared.)
+ln "$senv" "$WORK/setup-env.old"
+cp "$senv" "$WORK/setup-env.copy"
+setup_run >/dev/null 2>&1 || fail "setup.sh failed the second time"
+cmp -s "$WORK/setup-env.old" "$WORK/setup-env.copy" && [ "$(stat -c %h "$senv")" = 1 ] ||
+  fail "setup.sh rewrote deploy/.env in place, not by a rename"
+grep -qE '^PMOS_SERVICE_TOKEN=[0-9a-f]{48}$' "$senv" || fail "setup.sh didn't fill a generated value again"
+[ "$(grep '^PMOS_VAULT_KEY=' "$senv")" = "$kept" ] || fail "setup.sh replaced a real value"
+[ "$(stat -c %a "$senv")" = 600 ] || fail "setup.sh's deploy/.env isn't 0600 after a fill"
+[ -z "$(find "$WORK/setup/deploy" -maxdepth 1 -name '.env.??????')" ] || fail "setup.sh left a temporary file"
 
 # --- Bot names, token lookup, `--from` and the worker unit (slice H0) ------------------------
 # Stand-ins for openshell, systemctl, loginctl and id (only on this PATH, so `users` above still
@@ -383,6 +453,9 @@ export OPENSHELL_LOG="$WORK/openshell.log" SYSTEMCTL_LOG="$WORK/systemctl.log"
 cat >"$SBIN/openshell" <<'EOF'
 #!/usr/bin/env bash
 printf 'args=%s worker=%s gateway=%s\n' "$*" "${PMOS_WORKER_TOKEN:-}" "${PMOS_GATEWAY_TOKEN:-}" >>"$OPENSHELL_LOG"
+# `provider get`: a provider exists only when the test says so (FAKE_PROVIDERS_EXIST=1).
+case "$*" in "provider get "*) [ "${FAKE_PROVIDERS_EXIST:-0}" = 1 ] || exit 1 ;; esac
+[ "${FAKE_OPENSHELL_FAIL:-0}" != 1 ]
 EOF
 cat >"$SBIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -395,7 +468,7 @@ cat >"$SBIN/loginctl" <<'EOF'
 EOF
 cat >"$SBIN/id" <<'EOF'
 #!/usr/bin/env bash
-case "$*" in -u) echo "${FAKE_UID:-1000}" ;; -un) echo pmosop ;; *) exec /usr/bin/id "$@" ;; esac
+case "$*" in -u) real=$(/usr/bin/id -u); [ "$real" != 0 ] || real=1000; echo "${FAKE_UID:-$real}" ;; -un) echo pmosop ;; *) exec /usr/bin/id "$@" ;; esac
 EOF
 chmod +x "$SBIN"/*
 export XDG_CONFIG_HOME="$WORK/xdg"
@@ -541,10 +614,239 @@ run_bot pause pm-ana >/dev/null || fail "pause failed"
 [ "$(cat "$SYSTEMCTL_LOG")" = '--user disable --now pmos-worker@pm\x2dana.service' ] ||
   fail "pause didn't stop the unit: $(cat "$SYSTEMCTL_LOG")"
 [ "$(cat "$OPENSHELL_LOG")" = "args=sandbox stop -n pmos-pm-ana worker= gateway=" ] || fail "pause didn't stop the sandbox"
+# When systemctl fails, the sandbox is still stopped, and pause says what is left and exits 1
+# (S2: it used to exit 0, so a script calling it couldn't tell).
 : >"$OPENSHELL_LOG"
-FAKE_SYSTEMCTL_FAIL=1 run_bot pause pm-ana >/dev/null 2>&1 || fail "pause failed when systemctl did"
+code=0
+out=$(FAKE_SYSTEMCTL_FAIL=1 run_bot pause pm-ana 2>&1) || code=$?
+[ "$code" = 1 ] || fail "pause exits $code, not 1, when systemctl failed"
 [ "$(cat "$OPENSHELL_LOG")" = "args=sandbox stop -n pmos-pm-ana worker= gateway=" ] ||
   fail "pause didn't stop the sandbox when systemctl failed"
+[[ "$out" == *"NOT complete"* && "$out" == *"systemctl --user disable --now 'pmos-worker@pm\x2dana.service'"* ]] ||
+  fail "pause doesn't say what is left when systemctl failed: $out"
+
+# --- pause in an incident (the security review of 6bb806f, S2 and S3) -------------------------
+# As root (sudo): refused before anything is stopped, with the way to do it as the right user.
+bot_env
+run_bot resume pm-ana >/dev/null
+: >"$OPENSHELL_LOG"
+: >"$SYSTEMCTL_LOG"
+code=0
+out=$(FAKE_UID=0 run_bot pause pm-ana 2>&1) || code=$?
+[ "$code" = 1 ] || fail "pause as root exits $code, not 1"
+[[ "$out" == *"not as root"* && "$out" == *"openshell sandbox stop -n pmos-pm-ana"* ]] ||
+  fail "pause as root doesn't say how to pause: $out"
+[ ! -s "$OPENSHELL_LOG" ] && [ ! -s "$SYSTEMCTL_LOG" ] || fail "pause as root stopped something"
+# No unit installed for this user: said plainly, the sandbox stopped all the same, exit 1.
+rm -rf "$XDG_CONFIG_HOME"
+code=0
+out=$(run_bot pause pm-ana 2>&1) || code=$?
+[ "$code" = 1 ] || fail "pause with no unit installed exits $code, not 1"
+[[ "$out" == *"no worker unit is installed for pmosop"* && "$out" == *"pgrep -af 'openshell sandbox exec -n pmos-pm-ana'"* ]] ||
+  fail "pause with no unit doesn't say so: $out"
+[ "$(cat "$OPENSHELL_LOG")" = "args=sandbox stop -n pmos-pm-ana worker= gateway=" ] ||
+  fail "pause with no unit didn't stop the sandbox"
+[ ! -s "$SYSTEMCTL_LOG" ] || fail "pause with no unit called systemctl"
+# The sandbox can't be stopped: said, exit 1, after the unit was stopped.
+run_bot resume pm-ana >/dev/null
+: >"$SYSTEMCTL_LOG"
+code=0
+out=$(FAKE_OPENSHELL_FAIL=1 run_bot pause pm-ana 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"pmos-pm-ana was NOT stopped"* ]] || fail "a failed sandbox stop isn't reported ($code): $out"
+grep -qF -- '--user disable --now pmos-worker@pm\x2dana.service' "$SYSTEMCTL_LOG" || fail "pause didn't stop the unit first"
+# A deploy/.env that can't be parsed, or is readable by everyone, or is missing: pause and down
+# warn and go on (they need nothing pmos-admin reads from it); every other command stops.
+for broken in "not an assignment" "MODE644" "MISSING"; do
+  bot_env
+  run_bot resume pm-ana >/dev/null
+  case "$broken" in
+    MODE644) chmod 644 "$WORK/stack/deploy/.env" ;;
+    MISSING) mv "$WORK/stack/deploy/.env" "$WORK/env.aside" ;;
+    *) echo "$broken" >>"$WORK/stack/deploy/.env" ;;
+  esac
+  : >"$OPENSHELL_LOG"
+  : >"$DOCKER_LOG"
+  out=$(run_bot pause pm-ana 2>&1) || fail "pause with deploy/.env $broken failed: $out"
+  [[ "$out" == *WARNING* ]] || fail "pause with deploy/.env $broken didn't warn: $out"
+  [ "$(cat "$OPENSHELL_LOG")" = "args=sandbox stop -n pmos-pm-ana worker= gateway=" ] ||
+    fail "pause with deploy/.env $broken didn't stop the sandbox"
+  if [ "$broken" != MISSING ]; then
+    out=$(run_bot down 2>&1) || fail "down with deploy/.env $broken failed: $out"
+    [[ "$out" == *WARNING* ]] || fail "down with deploy/.env $broken didn't warn: $out"
+    grep -q ' down$' "$DOCKER_LOG" || fail "down with deploy/.env $broken didn't run compose down"
+    : >"$DOCKER_LOG"
+    for cmd in up "logs bots" "restart bots" "add-bot scout" "sandbox pm-ana"; do
+      code=0
+      # shellcheck disable=SC2086
+      run_bot $cmd >/dev/null 2>&1 || code=$?
+      [ "$code" = 2 ] || fail "$cmd with deploy/.env $broken exits $code, not 2"
+    done
+    [ ! -s "$DOCKER_LOG" ] || fail "a command refused over deploy/.env $broken called docker"
+  else
+    mv "$WORK/env.aside" "$WORK/stack/deploy/.env"
+  fi
+done
+# down when compose itself can't: says how to stop the containers directly.
+bot_env
+code=0
+out=$(FAKE_DOCKER_FAIL=1 run_bot down 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"label=com.docker.compose.project=pmos"* ]] || fail "down's fallback isn't given ($code): $out"
+
+# --- deploy/.env's mode and owner (the security review of 6bb806f) ----------------------------
+# Group-writable: refused. Group-readable (as the eval runner's ACL shows): warned. Owned by
+# another account: warned. 0600 and yours: silent.
+bot_env
+chmod 660 "$WORK/stack/deploy/.env"
+code=0
+out=$(run_bot up 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"written by its group"* ]] || fail "a group-writable deploy/.env isn't refused ($code): $out"
+[ ! -s "$DOCKER_LOG" ] || fail "up with a group-writable deploy/.env called docker"
+chmod 640 "$WORK/stack/deploy/.env"
+out=$(run_bot up 2>&1) || fail "up with a group-readable deploy/.env was refused: $out"
+[[ "$out" == *"WARNING: deploy/.env (mode 640) is readable by its group"* ]] || fail "group read isn't warned about: $out"
+chmod 600 "$WORK/stack/deploy/.env"
+out=$(FAKE_UID=4242 run_bot up 2>&1) || fail "up with another owner was refused: $out"
+[[ "$out" == *"not by you (uid 4242)"* ]] || fail "another owner isn't warned about: $out"
+out=$(PATH="$WORK/bin:$PATH" "${stack[@]}" up 2>&1) || fail "up with a private deploy/.env failed: $out"
+[[ "$out" != *WARNING* ]] || fail "a private deploy/.env of the caller's is warned about: $out"
+
+# --- No token on a command line (the security review of 6bb806f, S1) --------------------------
+# Distinctive tokens; the stand-in curl and docker record their arguments, and must never see
+# one there. curl gets them on its standard input (--config -), docker in its environment.
+tok_env() {
+  bot_env "PMOS_SERVICE_TOKEN=svc0SECRET0123456789abcdef0123456789abcdef" \
+    "PMOS_RT_SLACK_TOKEN=slk0SECRET0123456789abcdef0123456789abcdef" \
+    "PMOS_RT_EVALS_TOKEN=evl0SECRET0123456789abcdef0123456789abcdef" \
+    "HTTPS_PROXY=http://proxyuser:prx0SECRET@proxy.example:3128" "$@"
+}
+no_secret_in_args() { # what ran: no SECRET in the arguments curl, docker and openshell got (the
+  # docker and openshell logs also record some of their environment, which may hold one)
+  local args
+  args=$(cat "$CURL_LOG"; sed 's/^.* args=//' "$DOCKER_LOG"; sed 's/^args=//; s/ worker=.*$//' "$OPENSHELL_LOG")
+  [[ "$args" != *SECRET* ]] || fail "$1 put a token on a command line: $(grep SECRET <<<"$args")"
+}
+tok_env
+run_stack reindex >/dev/null || fail "reindex failed"
+grep -qx -- '--config - -fsS --noproxy \* -X POST http://127.0.0.1:8710/internal/reindex -H content-type: application/json' "$CURL_LOG" ||
+  fail "reindex didn't call curl with --config -: $(cat "$CURL_LOG")"
+grep -qxF 'header = "Authorization: Bearer svc0SECRET0123456789abcdef0123456789abcdef"' "$CURL_CONFIG_LOG" ||
+  fail "reindex didn't give curl the service token on stdin"
+no_secret_in_args reindex
+run_stack revoke ana slack >/dev/null || fail "revoke ana slack failed"
+grep -q -- '-X DELETE http://127.0.0.1:8710/internal/credentials/ana/slack ' "$CURL_LOG" || fail "revoke didn't call the route: $(cat "$CURL_LOG")"
+no_secret_in_args revoke
+out=$(run_stack smoke ana.b 2>&1) || fail "smoke failed: $out"
+[[ "$out" == *"smoke test passed"* ]] || fail "smoke didn't pass: $out"
+[ "$(grep -c '^header = "Authorization: Bearer slk0SECRET0123456789abcdef0123456789abcdef"$' "$CURL_CONFIG_LOG")" = 3 ] ||
+  fail "smoke didn't give every curl the Slack runtime token on stdin: $(sed 's/SECRET.*/…/' "$CURL_CONFIG_LOG")"
+[ "$(grep -c '^header = "X-Pmos-User: ana.b"$' "$CURL_CONFIG_LOG")" = 3 ] || fail "smoke didn't send X-Pmos-User"
+python3 -I -c 'import json, sys
+b = json.loads(open(sys.argv[1]).read())
+assert b == {"bot": "docs", "requested_by": "ana.b", "text": "What does the docs site say about getting started?", "source": "slack", "slack": {"channel": "smoke", "thread_ts": "0.0"}}, b' "$CURL_BODY_LOG" ||
+  fail "smoke's body isn't the task's JSON: $(cat "$CURL_BODY_LOG")"
+no_secret_in_args smoke
+run_stack evals run --category docs-qa >/dev/null || fail "evals failed"
+grep -q -- '-e PMOS_EVALS_TOKEN -e PMOS_EVALS_ROOT=evals ' "$DOCKER_LOG" || fail "evals didn't pass the token by name: $(cat "$DOCKER_LOG")"
+grep -qx 'evals_token=evl0SECRET0123456789abcdef0123456789abcdef https_proxy=.*' "$DOCKER_ENV_LOG" ||
+  fail "evals didn't give docker the token in its environment"
+no_secret_in_args evals
+: >"$DOCKER_LOG"
+: >"$DOCKER_ENV_LOG"
+run_stack build >/dev/null || fail "build failed"
+grep -q -- '--build-arg HTTPS_PROXY --build-arg NO_PROXY ' "$DOCKER_LOG" || fail "build didn't pass the proxy by name: $(cat "$DOCKER_LOG")"
+grep -q 'https_proxy=http://proxyuser:prx0SECRET@proxy.example:3128$' "$DOCKER_ENV_LOG" || fail "build didn't give docker the proxy in its environment"
+no_secret_in_args build
+# sandbox: the provider tokens only in openshell's environment; an existing provider (one that
+# survived `sandbox delete`, or a rotated token) is updated, not created again.
+tok_env "PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt0SECRET1" "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw0SECRET1"
+FAKE_PROVIDERS_EXIST=1 run_bot sandbox pm-ana >/dev/null || fail "sandbox with existing providers failed"
+grep -qx 'args=provider update pmos-pm-ana-gateway --credential PMOS_GATEWAY_TOKEN worker= gateway=gw0SECRET1' "$OPENSHELL_LOG" ||
+  fail "an existing gateway provider wasn't updated: $(cat "$OPENSHELL_LOG")"
+grep -qx 'args=provider update pmos-pm-ana-worker --credential PMOS_WORKER_TOKEN worker=rt0SECRET1 gateway=' "$OPENSHELL_LOG" ||
+  fail "an existing worker provider wasn't updated"
+! grep -q 'provider create' "$OPENSHELL_LOG" || fail "an existing provider was created again"
+no_secret_in_args "sandbox (update)"
+: >"$OPENSHELL_LOG"
+rm -rf "$XDG_CONFIG_HOME"
+run_bot sandbox pm-ana >/dev/null || fail "sandbox with new providers failed"
+grep -qx 'args=provider create --name pmos-pm-ana-gateway --type pmos-gateway --credential PMOS_GATEWAY_TOKEN worker= gateway=gw0SECRET1' "$OPENSHELL_LOG" ||
+  fail "a missing provider wasn't created: $(cat "$OPENSHELL_LOG")"
+no_secret_in_args sandbox
+# A token curl's config can't hold as it is: refused before curl runs.
+tok_env 'PMOS_SERVICE_TOKEN=abc"def'
+code=0
+run_stack reindex >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] && [ ! -s "$CURL_LOG" ] || fail "a token with a quote reached curl ($code)"
+
+# --- revoke, smoke, logs and restart take only what they name (the review of 6bb806f) ---------
+tok_env
+for args in ".. reindex" "../x slack" ". slack" "ana reindex" "ana ../reindex" "-x slack" "Ana slack" \
+  "a/b slack" "ana slack/x" "'' slack"; do
+  code=0
+  eval "run_stack revoke $args" >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "revoke $args exits $code, not 2"
+done
+for h in ".." "." "-x" 'a"b' "x\$(id)" "A" "a b" "a/b" "" "$(printf 'a%.0s' {1..65})"; do
+  code=0
+  run_stack smoke "$h" >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "smoke $(printf '%q' "$h") exits $code, not 2"
+done
+[ ! -s "$CURL_LOG" ] || fail "a refused revoke or smoke called curl: $(cat "$CURL_LOG")"
+for args in "-f" "--tail=1" "nosuch" "bots;id" "bots --since=1h" "bots -f x"; do
+  code=0
+  # shellcheck disable=SC2086
+  run_stack logs $args >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "logs $args exits $code, not 2"
+done
+for svc in "-x" "--help" "nosuch" "bots;id" ""; do
+  code=0
+  run_stack restart "$svc" >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "restart $(printf '%q' "$svc") exits $code, not 2"
+done
+! grep -qE ' (logs|restart) ' "$DOCKER_LOG" || fail "a refused logs or restart reached compose: $(cat "$DOCKER_LOG")"
+run_stack logs bots -f >/dev/null || fail "logs bots -f was refused"
+grep -q ' logs --tail 200 -f bots$' "$DOCKER_LOG" || fail "logs bots -f didn't run: $(cat "$DOCKER_LOG")"
+run_stack restart worker-docs >/dev/null || fail "restart worker-docs was refused"
+grep -q ' restart worker-docs$' "$DOCKER_LOG" || fail "restart worker-docs didn't run"
+
+# --- deploy/.env is rewritten atomically, under a lock (the review of 6bb806f) ----------------
+bot_env
+envf="$WORK/stack/deploy/.env"
+acl=0
+if command -v setfacl >/dev/null && command -v getfacl >/dev/null && setfacl -m u:65534:r "$envf" 2>/dev/null; then
+  acl=1
+fi
+# A hard link to the old file: a rename leaves it as it was (and deploy/.env with one link).
+ln "$envf" "$WORK/env.old"
+cp "$envf" "$WORK/env.copy"
+out=$(run_bot add-bot scout 2>&1) || fail "add-bot scout failed: $out"
+cmp -s "$WORK/env.old" "$WORK/env.copy" && [ "$(stat -c %h "$envf")" = 1 ] ||
+  fail "add-bot rewrote deploy/.env in place, not by a rename"
+grep -qE '^PMOS_RT_WORKER_TOKENS=worker-scout=[0-9a-f]{48}$' "$envf" || fail "add-bot scout didn't write its token"
+rm -f "$WORK/env.old"
+if [ "$acl" = 1 ]; then
+  getfacl -pn "$envf" 2>/dev/null | grep -q '^user:65534:r--' || fail "add-bot lost deploy/.env's ACL: $(getfacl -p "$envf" 2>&1)"
+  [ "$(stat -c %a "$envf")" = 640 ] || fail "deploy/.env with an ACL isn't 640 after add-bot: $(stat -c %a "$envf")"
+  setfacl -b "$envf"
+else
+  echo "the ACL check skipped: setfacl isn't installed here, or this filesystem has no ACLs"
+fi
+chmod 600 "$envf"
+[ "$(stat -c %a "$envf")" = 600 ] || fail "deploy/.env isn't 0600 after add-bot"
+[ -e "$WORK/stack/deploy/.env.lock" ] || fail "add-bot took no lock"
+[ -z "$(find "$WORK/stack/deploy" -maxdepth 1 -name '.env.??????')" ] || fail "add-bot left a temporary file"
+# Four add-bots at once all keep their tokens.
+bot_env
+pids=()
+for b in pa pb pc pd; do
+  run_bot add-bot "$b" >/dev/null 2>&1 &
+  pids+=($!)
+done
+for p in "${pids[@]}"; do wait "$p" || fail "a concurrent add-bot failed"; done
+for b in pa pb pc pd; do
+  grep -qE "^PMOS_RT_WORKER_TOKENS=.*worker-$b=[0-9a-f]{48}" "$envf" || fail "a concurrent add-bot lost $b's token: $(grep WORKER "$envf")"
+  grep -qE "^PMOS_GW_BOT_TOKENS=.*bot-$b=[0-9a-f]{48}" "$envf" || fail "a concurrent add-bot lost $b's gateway token"
+done
 
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
 if docker compose version >/dev/null 2>&1; then
