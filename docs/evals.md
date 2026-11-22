@@ -911,3 +911,15 @@ because the load test measures the stack PMs use.
 - **A check "now fails"** in the gate when it fails in every candidate attempt, and "passed in
   the baseline" when it failed in none. A check that fails in only some attempts shows in the
   paired difference instead, so one unlucky run doesn't fail the gate on its own.
+- **Attempts are not isolated: a pending Slack reply blocks the next one (found in E1, open).**
+  Every attempt asks as `evals` on one tool server, and nobody decides eval drafts. The tool
+  server allows one pending `slack.post_reply` per person and message (or thread), so once one
+  attempt drafts a reply, every later attempt that drafts to that message (a repeat, another
+  task on the seed thread, or another category, such as `chief`'s `nudge-on-request` after
+  `slack-reply`) gets `already_drafted`, drafts nothing, and fails as
+  `model/wrong-draft-count`. `slack-reply` and `nudge-on-request` therefore measure nothing
+  after their first draft in a run. No other write tool is deduplicated this way. The runner
+  has no way to clear an attempt's drafts (no client may decide an eval task's drafts), so
+  the fix needs a decision: for example a runtime route for client `evals` that rejects an
+  `eval` task's pending drafts after grading, or a fresh tool server per attempt. Until then,
+  measure those tasks one attempt per fresh stack (E1 did, on the test stack).
