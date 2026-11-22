@@ -11,11 +11,15 @@
 # `class: production` marks this as the Spark's own gateway: it reports it in
 # GET /v1/pmos/roles, and an eval report counts towards a bar only when the runtime under test
 # reports a production-class gateway (docs/evals.md, "Which runs count"). A production gateway
-# refuses testing-only upstreams and the stub model at start-up.
+# refuses testing-only upstreams, `local-hosts`, and any model server not named
+# `<name>.pmos.internal` (the vLLM services' aliases in deploy/compose.yaml) at start-up.
+# With the stub model on (PMOS_GATEWAY_STUB=1, a first install's default until the model
+# servers are up) it still starts, warns, and reports class `test`, so no eval run against a
+# stub counts.
 class: production
 upstreams:
-  qwen: http://vllm-default:8000/v1
-  nemotron: http://vllm-extraction:8000/v1
+  qwen: http://vllm-default.pmos.internal:8000/v1
+  nemotron: http://vllm-extraction.pmos.internal:8000/v1
 roles:
   default:
     upstream: qwen

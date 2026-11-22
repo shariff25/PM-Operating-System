@@ -103,6 +103,13 @@ change"):
    # The benchmark runner and the rules for which reports count (review of 2efb73f, R3): a
    # change there could let a forged or test report count.
    /crates/evals/                            @<org>/<team>
+   # The gateway and the shared contract, which decide whom a token may name, the queue's
+   # caps, the gateway class a report records, and lint's `benchmarked` and Preview rules; and
+   # the runtime's reading of the gateway's class (review at 2544d01, F4).
+   /crates/contract/                         @<org>/<team>
+   /crates/gateway/                          @<org>/<team>
+   /crates/bots/src/clients.rs               @<org>/<team>
+   /config/gateway.yaml                      @<org>/<team>
    ```
 
    A new persona whose role is not listed above needs its `ROLE.md` line added in the same pull
@@ -115,6 +122,7 @@ change"):
 
 The file isn't committed here because the owners' GitHub handles aren't in the repository
 (they are in the user database), and a CODEOWNERS line with no valid owner protects nothing.
+It waits on the owner: until it exists, none of the lines above is enforced.
 
 ## Applying on the Spark
 

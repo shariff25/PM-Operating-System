@@ -729,6 +729,27 @@ fn a_persona_is_benchmarked_after_two_weeks_at_its_bar() {
     assert!(pmos_evals::history::persona_hash(&content, "echo").is_err());
     assert!(benchmarked_personas(&evals, &content).is_empty());
     set_skill(&content, "Write a battlecard.\n");
+    // A role (or persona) that isn't a plain name is never joined into a path (the Low on
+    // the persona's role, review at 2544d01).
+    let persona_md = content.join("personas/echo/PERSONA.md");
+    let persona_text = std::fs::read_to_string(&persona_md).unwrap();
+    for bad in [
+        "../outbound-pm",
+        "outbound-pm/../outbound-pm",
+        "/etc",
+        "Outbound",
+    ] {
+        std::fs::write(
+            &persona_md,
+            persona_text.replacen("role: outbound-pm", &format!("role: \"{bad}\""), 1),
+        )
+        .unwrap();
+        let err = pmos_evals::history::persona_hash(&content, "echo").unwrap_err();
+        assert!(err.contains("plain role name"), "{bad}: {err}");
+    }
+    std::fs::write(&persona_md, persona_text).unwrap();
+    assert!(pmos_evals::history::persona_hash(&content, "..").is_err());
+    assert!(pmos_evals::history::persona_hash(&content, "echo").is_ok());
     // A report from a test-class gateway never counts (review finding R3).
     let mut test_class = prod_models();
     test_class.class = "test".into();

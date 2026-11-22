@@ -20,7 +20,7 @@ Edit `config/gateway.yaml` and restart the gateway.
 ```yaml
 class: production        # deploy/gateway.yaml only; any other config is a `test` gateway
 upstreams:
-  qwen: http://127.0.0.1:8001/v1
+  qwen: http://vllm-default.pmos.internal:8000/v1   # production: <name>.pmos.internal only
 roles:
   default: {upstream: qwen, model: qwen3.6-35b-a3b, workarounds: [strip-think]}
 limits: {max-in-flight: 4, per-user: 2, max-queue: 64}
@@ -64,10 +64,19 @@ it can be deleted.
 - **Waiting, per client and per person** (review finding R2, 2026-11-22): each client may
   have at most `clients.<name>.max-queue` calls waiting for a slot (default twice its
   `max-in-flight`), and each believed person at most `limits.per-user-queue` (default twice
-  `per-user`), whichever client sends them. Before, those caps applied only when a slot was
+  `per-user`) **through each client**. Before, those caps applied only when a slot was
   handed out, so one token could fill the whole queue and every other caller got an immediate
   `503`. A call past its client's or person's share gets `429` with `Retry-After: 5`, and a
-  usage line (`refused`, `attempts: 0`); the others keep their places.
+  usage line (`refused`, `attempts: 0`; see "Usage log" for how repeats are counted); the
+  others keep their places.
+- **Why per client** (review at 2544d01, F1): with one count per person across clients, a
+  team bot's token (`bot-docs`, `user: any`) naming one PM could fill all that PM's waiting
+  places, and the PM's own calls through `runtime` got an immediate `429`. Now no client can
+  take a place another client has for the same person (tested in `scheduler.rs`,
+  `one_client_cant_take_all_of_a_persons_places`). The trade-off: one person may have up to
+  `per-user-queue` calls waiting through each client that names them, still bounded by each
+  client's `max-queue` and the whole `max-queue`. The running cap (`per-user`) still counts a
+  person's calls from every client together.
 - **Priority** (`X-Pmos-Priority`): `interactive` (someone waiting in Slack), then `scheduled` (routines), then `personal` (background work). Within a priority it's first come, first served.
 - **Which clients are believed:** only a client listed with `trusted: true` has its
   `X-Pmos-User` and `X-Pmos-Priority` used; with no priority header its calls get its
@@ -83,13 +92,34 @@ it can be deleted.
 - **Whom a trusted client may name** (`clients.<…>.user`, review finding R1): `any` (the
   default) or `from-name`, on a pattern only: the client may name only the person whose
   handle the `*` part of its name spells, written as a personal bot's name writes it (`.` and
-  `_` as `-`, `pm-<handle>` cut to 32 characters; `personal_bot_name`). So with
+  `_` as `-`, a run of hyphens as one; `spelled_handle`). So with
   `bot-pm-*: {trusted: true, user: from-name}`, `bot-pm-ana-k` may name `ana.k` (or `ana_k`,
   which would share that bot's name) and no one else; naming anyone else is `403`
   (`permission_error`), nothing goes to the model server, and the usage log records a line
   with `status: 403`, `refused`, and in `user` the handle it tried to name. A call naming no
   one is still accepted. A test checks that every valid handle's `bot-pm-<…>` client name is a
   valid client name that may name that handle and no other.
+  - **Handles too long to spell** (review at 2544d01, F2): a personal bot's name is cut to 32
+    characters, so `bot-pm-<29 characters>` would spell every handle that starts with those
+    29. A `from-name` client therefore never names a handle whose spelled form is longer than
+    29 characters (`MAX_SPELLED_HANDLE`): `403`, as above. Onboarding never gives out such a
+    handle (24 at most, `valid_new_handle`), but an Admin can create one (up to 64 characters,
+    from the web app, the host or a reviewed import file); that person's own bot can't name
+    them, and their calls go through `runtime` instead.
+  - **One person key** (the Low on canonical handles, review at 2544d01): `bot-pm-ana` may
+    name `ana`, `ana.`, `ana-` or `ana..`, which all spell `ana`. Its calls are kept under the
+    one form its name spells (`ana`; `ana-k` for `bot-pm-ana-k`), for the caps and in the
+    usage log's `user`, so a bot can't spread one person over several keys. The trade-off: a
+    PM whose handle has `.` or `_` (`ana.k`) appears as `ana-k` on their own bot's lines, and
+    as `ana.k` on the runtime's.
+  - **Names that only look like it** (the Low on `bot-pm` names): a client named `bot-pm` or
+    `bot-pmana` (no hyphen) would fall under `bot-*` and may name anyone. A name that starts
+    with a `from-name` pattern's prefix without its trailing hyphen, but not with the whole
+    prefix, gets the untrusted default (never a shorter pattern): its `X-Pmos-User` is
+    ignored and its calls are `personal`. The gateway logs a warning at start-up for each such
+    token rather than refusing to start, because a team bot may be named so (`pmo` gives
+    `bot-pmo`); such a bot's worker then runs untrusted. An exact entry in `clients:` is
+    taken as written (list `bot-pmo: {trusted: true}` to trust it on purpose).
 - **`deploy/gateway.yaml`** trusts `runtime` (it names the PM its caller verified; cap 2),
   `bot-pm-*` with `user: from-name` (each PM's own bot's worker; cap 3 of 4) and `bot-*` (a
   team bot's worker, such as `bot-docs`, naming the PM whose task it runs; cap 3 of 4), and
@@ -189,6 +219,14 @@ One event per call:
 - `refused`: on a line for a call refused before any try (`attempts: 0`): a client naming a
   person it may not name (`403`; `user` is the handle it tried), or a client or person with
   its share of the queue used (`429`).
+- `refused_count` (the Low on refusal lines, review at 2544d01): so a looping token can't
+  flood the JSON-lines file, the service log or the recent list, a client's first refusal of
+  a status (`403` or `429`) gets its own line at once; further ones within the next minute are
+  only counted, and one summary line, the last of them with `refused_count: <n>`, follows when
+  the minute ends (checked every 5 seconds, and at shutdown). So each client writes at most
+  about two refusal lines of each status a minute, and every refusal is counted. A summary's
+  `user` is the last handle tried; the `403` warning in the service log is written only with
+  a line of its own.
 
 It never holds prompts or answers. Events go to the service log, and with `PMOS_GATEWAY_USAGE_LOG` also to a JSON-lines file for shipping off-box. Because every upstream must be local outside testing, "restricted data sent off the Spark" is zero by construction; the upstream host on each event lets anyone check (a testing-only upstream shows its remote host).
 
@@ -221,19 +259,20 @@ bound every client, wait, stream and answer):
 | `limits.stream-max-secs` | `900` | Longest streamed answer, first byte to last (1 to 7200) |
 | `limits.max-answer-bytes` | `16777216` | Largest answer taken from a model server (1 KiB to 256 MiB) |
 | `limits.per-user-queue` | twice `per-user` | Calls one believed person may have waiting |
-| `class` | `test` | `production` only in `deploy/gateway.yaml`: reported in `GET /v1/pmos/roles`, and only such a gateway's eval reports count. A `production` gateway refuses testing-only upstreams and `PMOS_GATEWAY_STUB=1` at start-up. |
+| `class` | `test` | `production` only in `deploy/gateway.yaml`: reported in `GET /v1/pmos/roles`, and only such a gateway's eval reports count. A `production` config refuses testing-only upstreams, `local-hosts` and any model server not named `<name>.pmos.internal` at start-up. With `PMOS_GATEWAY_STUB=1` it starts, logs a warning, and reports class `test` (with `stub: true`), so a stub run never counts (below). |
 | `clients.<name or prefix*>.trusted` | `false` | Believe `X-Pmos-User` and `X-Pmos-Priority` |
 | `clients.<…>.max-in-flight` | `limits.per-client` | This client's cap |
 | `clients.<…>.max-queue` | twice its `max-in-flight` | Calls this client may have waiting |
 | `clients.<…>.user` | `any` | `from-name` (a pattern, trusted only): it may name only the person its name spells |
 | `clients.<…>.priority` | `interactive` if trusted, else `personal` | An untrusted client's every call; a trusted one's calls without the header |
 
-At start-up the gateway logs its class, and each client's name, trust, caps, priority and
-`user` rule (never a token).
+At start-up the gateway logs its class (as served: `test` with the stub on), and each client's
+name, trust, caps, priority and `user` rule (never a token).
 
 **Upstream forms:**
 - `http://<local host>/<base>`: an OpenAI-compatible local model server (vLLM). The only form
-  outside testing.
+  outside testing; a `class: production` gateway takes only `<name>.pmos.internal` hosts
+  (below).
 - `anthropic+https://api.anthropic.com`: the Claude test upstream (testing only, below).
 - `openai+https://<host>/<base path>`: a remote test upstream, any OpenAI-compatible API on the
   internet (testing only, below).
@@ -245,6 +284,26 @@ At start-up the gateway logs its class, and each client's name, trust, caps, pri
 - anything listed under `local-hosts:` in the config.
 
 Anything else stops the gateway at start-up.
+
+**A production gateway's hosts** (review at 2544d01, F3): with `class: production`, every
+upstream's host must be a name `<name>.pmos.internal` (lowercase letters, digits and inner
+hyphens per label), and `local-hosts` must be empty. An address, a name without a dot or a
+`local-hosts` entry, all of which a test gateway accepts, could point at a machine off the
+Spark (a search domain, a typo, an extra entry) without anyone reviewing it as such.
+`.internal` is reserved for private networks, so these names never resolve on the internet.
+`deploy/gateway.yaml` names the vLLM services `vllm-default.pmos.internal` and
+`vllm-extraction.pmos.internal`, their network aliases in `deploy/compose.yaml` (as every
+other service there already has one); before 2026-11-22 it used the bare service names.
+
+**The stub with a production config** (the regression at 2544d01): a first install runs the
+Spark's own `deploy/gateway.yaml` (`class: production`) with `PMOS_GATEWAY_STUB=1` until the
+model servers are up (`deploy/env.example`; the install runbook's "Turn off the stub" comes
+later). The gateway then starts as before, logs a warning, and serves as class `test`:
+`GET /v1/pmos/roles` says `class: test` and `stub: true`, so no eval run against it counts.
+The config's rules (testing-only upstreams refused, the `.pmos.internal` hosts) still apply
+with the stub on: the stub never calls an upstream, but the shipped config passes them, so
+nothing valid is refused. At 2544d01 the gateway refused to start instead, which stopped CI's
+deploy-kit job and a fresh install.
 
 **The Claude test upstream (testing only, decided 2026-11-14):**
 - **What it is:** an upstream written `anthropic+https://api.anthropic.com` sends a role's

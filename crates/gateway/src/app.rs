@@ -122,7 +122,12 @@ impl Endpoint {
     }
 }
 
-pub fn router(cfg: GatewayConfig) -> Router {
+pub fn router(mut cfg: GatewayConfig) -> Router {
+    // With the stub model on, the gateway is a `test` one whatever its config says, so a stub
+    // run never reports `production` (`Config::served_class`).
+    if cfg.stub {
+        cfg.models.class = crate::config::GatewayClass::Test;
+    }
     let sched = Scheduler::new(cfg.models.limits);
     // Both clients use the system proxy (`HTTPS_PROXY`, `NO_PROXY`) and trust store, so a
     // remote test upstream works from behind a proxy.
@@ -137,6 +142,21 @@ pub fn router(cfg: GatewayConfig) -> Router {
         .timeout(cfg.timeouts.whole_answer)
         .build()
         .expect("http client builds");
+    // Summary lines for held refusals (`UsageLog::record_refusal`), a few seconds after
+    // their minute ends. The task stops when the log is gone.
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        let usage = Arc::downgrade(&cfg.usage);
+        rt.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                match usage.upgrade() {
+                    Some(u) => u.flush_refusals(),
+                    None => break,
+                }
+            }
+        });
+    }
     let state = AppState(Arc::new(Inner {
         models: cfg.models,
         clients: cfg.clients,
@@ -237,7 +257,8 @@ async fn list_workarounds(State(state): State<AppState>) -> Response {
 /// without the operator typing them.
 async fn list_roles(State(state): State<AppState>) -> Response {
     // `class`: `production` only for a config that says so (`deploy/gateway.yaml`), which
-    // never has the stub or a testing-only upstream on (review finding R3).
+    // never has a testing-only upstream (review finding R3), and only with the stub off
+    // (`router` serves a stub gateway as `test`).
     let roles: Vec<Value> = state
         .0
         .models
@@ -381,7 +402,8 @@ fn caller(headers: &HeaderMap, client: &str, policy: &ClientPolicy) -> Result<Ca
     }
     Ok(if policy.trusted {
         Caller {
-            user: declared.user,
+            // One key per person a `from-name` client may name (`ClientPolicy::person_key`).
+            user: declared.user.map(|u| policy.person_key(client, &u)),
             run: declared.run,
             priority: declared.priority.unwrap_or(policy.priority),
         }
@@ -669,6 +691,7 @@ async fn forward(
         completion_tokens: None,
         workarounds: Vec::new(),
         refused: Some(refused),
+        refused_count: None,
     };
     let who = match caller(&headers, &client, &policy) {
         Ok(c) => c,
@@ -677,15 +700,18 @@ async fn forward(
         }
         Err(Refused::NotItsPerson(named)) => {
             // R1: the client's token is believed only for its own PM. The line names whom it
-            // tried to name, so an operator sees a worker token used for someone else.
-            tracing::warn!(client = %client, named = %named, "a client named a person it may not name");
-            inner.usage.record(refused_line(
+            // tried to name, so an operator sees a worker token used for someone else. A
+            // looping token gets its first refusal recorded and then a count a minute.
+            let line = refused_line(
                 403,
-                Some(named),
+                Some(named.clone()),
                 None,
                 policy.priority,
                 "names a person this client may not name",
-            ));
+            );
+            if inner.usage.record_refusal(line) {
+                tracing::warn!(client = %client, named = %named, "a client named a person it may not name");
+            }
             return error(
                 StatusCode::FORBIDDEN,
                 "permission_error",
@@ -704,7 +730,7 @@ async fn forward(
         Ok(p) => p,
         Err(why) => {
             if let NoSlot::Refused(Busy::Client | Busy::Person) = why {
-                inner.usage.record(refused_line(
+                inner.usage.record_refusal(refused_line(
                     429,
                     who.user.clone(),
                     who.run.clone(),
@@ -737,6 +763,7 @@ async fn forward(
         completion_tokens: None,
         workarounds: Vec::new(),
         refused: None,
+        refused_count: None,
     };
     let model_header = HeaderValue::from_str(&role.model).ok();
     let finish = |mut res: Response| {

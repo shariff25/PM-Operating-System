@@ -6,7 +6,10 @@
 //!
 //! Waiting is capped the same way (review finding R2): at most `max_queue` requests wait in
 //! all, each client at most its own `client_queue` of them and each believed person at most
-//! `per-user-queue`, so one token can't fill the queue and turn everyone else away.
+//! `per-user-queue` through each client, so one token can't fill the queue and turn everyone
+//! else away. The person's cap counts per client (finding F1 of the review at 2544d01): before,
+//! a team bot's token naming one PM (`bot-docs`, `user: any`) could fill that PM's places and
+//! the PM's own calls through the runtime got an immediate `429`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -42,7 +45,7 @@ pub enum Busy {
     Full,
     /// This client already has its `client_queue` requests waiting.
     Client,
-    /// This person already has `per-user-queue` requests waiting.
+    /// This person already has `per-user-queue` requests waiting through this client.
     Person,
 }
 
@@ -180,10 +183,14 @@ impl Scheduler {
                     .iter()
                     .filter(|w| w.owner.client == owner.client)
                     .count();
+                // Per client and person (F1): another client's calls for this person never
+                // use this client's places for them, nor the other way round.
                 let person_waiting = owner.person.as_ref().map_or(0, |p| {
                     st.waiting
                         .iter()
-                        .filter(|w| w.owner.person.as_ref() == Some(p))
+                        .filter(|w| {
+                            w.owner.client == owner.client && w.owner.person.as_ref() == Some(p)
+                        })
                         .count()
                 });
                 let refuse = if st.waiting.len() > self.limits.max_queue {
@@ -449,14 +456,14 @@ mod tests {
     #[tokio::test]
     async fn one_person_cant_fill_the_queue_through_a_trusted_client() {
         // A trusted client may name many people; each may have `per-user-queue` waiting
-        // (default twice `per-user`: here 2), whichever client sends them.
+        // (default twice `per-user`: here 2) through that client.
         let s = sched(1, 1, 16);
         assert_eq!(s.limits.person_queue(), 2);
         let ana = Owner::new(Some("ana"), "runtime", 8);
         let held = s.acquire(&ana, Priority::Interactive).await.unwrap();
         let mut waiters = Vec::new();
-        for client in ["runtime", "bot-docs"] {
-            let (s2, o) = (s.clone(), Owner::new(Some("ana"), client, 8));
+        for _ in 0..2 {
+            let (s2, o) = (s.clone(), Owner::new(Some("ana"), "bot-docs", 8));
             waiters.push(tokio::spawn(async move {
                 s2.acquire(&o, Priority::Interactive).await.map(drop)
             }));
@@ -472,7 +479,7 @@ mod tests {
             Some(Busy::Person)
         );
         // Bo, through the same client, still waits.
-        let (s2, bo) = (s.clone(), Owner::new(Some("bo"), "runtime", 8));
+        let (s2, bo) = (s.clone(), Owner::new(Some("bo"), "bot-docs", 8));
         waiters.push(tokio::spawn(async move {
             s2.acquire(&bo, Priority::Interactive).await.map(drop)
         }));
@@ -487,6 +494,53 @@ mod tests {
             ..Limits::default()
         });
         assert_eq!(s.limits.person_queue(), 5);
+    }
+
+    #[tokio::test]
+    async fn one_client_cant_take_all_of_a_persons_places() {
+        // F1 (review at 2544d01): `bot-docs` (it may name anyone) fills every place Ana has
+        // through it, as fast as it likes; Ana's own calls through the runtime still get
+        // theirs, and wait rather than being refused.
+        let s = sched(1, 1, 16);
+        let person_queue = s.limits.person_queue();
+        let held = s
+            .acquire(&Owner::new(None, "other", 8), Priority::Interactive)
+            .await
+            .unwrap();
+        let docs = Owner::new(Some("ana"), "bot-docs", 8);
+        let mut waiters = Vec::new();
+        for _ in 0..person_queue {
+            let (s2, o) = (s.clone(), docs.clone());
+            waiters.push(tokio::spawn(async move {
+                s2.acquire(&o, Priority::Interactive).await.map(drop)
+            }));
+        }
+        settle(&s, (1, person_queue)).await;
+        for _ in 0..3 {
+            assert_eq!(
+                s.acquire(&docs, Priority::Interactive).await.err(),
+                Some(Busy::Person),
+                "bot-docs has used its places for Ana"
+            );
+        }
+        let runtime = Owner::new(Some("ana"), "runtime", 8);
+        for _ in 0..person_queue {
+            let (s2, o) = (s.clone(), runtime.clone());
+            waiters.push(tokio::spawn(async move {
+                s2.acquire(&o, Priority::Interactive).await.map(drop)
+            }));
+        }
+        settle(&s, (1, 2 * person_queue)).await;
+        // The runtime's places for Ana are bounded the same way.
+        assert_eq!(
+            s.acquire(&runtime, Priority::Interactive).await.err(),
+            Some(Busy::Person)
+        );
+        drop(held);
+        for w in waiters {
+            assert_eq!(w.await.unwrap(), Ok(()));
+        }
+        assert_eq!(s.snapshot(), (0, 0));
     }
 
     #[tokio::test]

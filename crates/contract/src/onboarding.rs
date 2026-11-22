@@ -29,25 +29,42 @@ pub fn valid_github_login(login: &str) -> bool {
         && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// The personal bot of the member with this handle: `pm-<handle>`, with `.` and `_` turned into
-/// hyphens so it is a valid bot name.
-pub fn personal_bot_name(handle: &str) -> String {
-    let mut name = String::from("pm-");
+/// The longest bot name ([`crate::bots::valid_name`]).
+pub const MAX_BOT_NAME: usize = 32;
+
+/// The most characters of a handle's spelled form ([`spelled_handle`]) that fit in a personal
+/// bot's name, `pm-<this>`, without being cut.
+pub const MAX_SPELLED_HANDLE: usize = MAX_BOT_NAME - "pm-".len();
+
+/// A handle as a personal bot's name spells it, in full (not cut to fit): `.` and `_` become
+/// `-`, a run of hyphens one, and leading and trailing hyphens go. Several handles can give
+/// one spelled form (`ana.k`, `ana_k`, `ana-k`; `ana`, `ana.`, `ana..`).
+pub fn spelled_handle(handle: &str) -> String {
+    let mut out = String::new();
     let mut last_hyphen = true;
     for c in handle.chars() {
         let c = if c == '.' || c == '_' { '-' } else { c };
         if c == '-' {
             if !last_hyphen {
-                name.push('-');
+                out.push('-');
             }
             last_hyphen = true;
         } else {
-            name.push(c);
+            out.push(c);
             last_hyphen = false;
         }
     }
-    let mut name = name.trim_end_matches('-').to_string();
-    name.truncate(32);
+    out.trim_end_matches('-').to_string()
+}
+
+/// The personal bot of the member with this handle: `pm-<handle>`, with `.` and `_` turned into
+/// hyphens so it is a valid bot name ([`spelled_handle`]), cut to [`MAX_BOT_NAME`] characters.
+/// A handle whose spelled form is longer than [`MAX_SPELLED_HANDLE`] is cut, so it can share
+/// its bot name with other handles; onboarding never gives out such a handle
+/// ([`valid_new_handle`]).
+pub fn personal_bot_name(handle: &str) -> String {
+    let mut name = format!("pm-{}", spelled_handle(handle));
+    name.truncate(MAX_BOT_NAME);
     name.trim_end_matches('-').to_string()
 }
 
@@ -148,6 +165,16 @@ mod tests {
         assert_eq!(personal_bot_name("a..b"), "pm-a-b");
         let long = personal_bot_name(&"x".repeat(64));
         assert!(valid_name(&long), "{long}");
+        // The spelled form is the bot name's part after `pm-`, uncut.
+        assert_eq!(spelled_handle("ana.k_r"), "ana-k-r");
+        assert_eq!(spelled_handle("ana.."), "ana");
+        assert_eq!(spelled_handle(&"x".repeat(64)).len(), 64);
+        assert_eq!(MAX_SPELLED_HANDLE, 29);
+        // Every handle onboarding gives out is spelled in full in its bot name.
+        let h = "a".repeat(MAX_PROPOSED_HANDLE);
+        assert!(valid_new_handle(&h));
+        assert!(spelled_handle(&h).len() <= MAX_SPELLED_HANDLE);
+        assert_eq!(personal_bot_name(&h), format!("pm-{h}"));
     }
 
     #[test]

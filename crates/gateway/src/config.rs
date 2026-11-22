@@ -170,15 +170,41 @@ pub struct ClientPolicy {
 
 impl ClientPolicy {
     /// May `client` (whose policy this is) name `handle` in `X-Pmos-User`?
+    ///
+    /// Under `from-name`, only when the handle's spelled form, in full, is the `*` part of
+    /// the client's name. A handle whose spelled form is longer than a personal bot's name can
+    /// hold ([`MAX_SPELLED_HANDLE`], 29) is never named this way (review finding F2 of the
+    /// review at 2544d01): its bot name is cut, so the name would also spell every other
+    /// handle that starts the same way.
     pub fn may_name(&self, client: &str, handle: &str) -> bool {
         match self.user {
             UserRule::Any => true,
+            UserRule::FromName { prefix } => client.get(prefix..).is_some_and(|rest| {
+                let spelled = spelled_handle(handle);
+                !rest.is_empty() && spelled.len() <= MAX_SPELLED_HANDLE && rest == spelled
+            }),
+        }
+    }
+
+    /// The person a call that `client` makes for `handle` (which it [may name]) is kept
+    /// under, for the caps and the usage log. Under `from-name` it is the one form the
+    /// client's name spells, so `ana`, `ana.` and `ana..` from `bot-pm-ana` are one person,
+    /// not three (the Low on canonical handles, review at 2544d01). Otherwise the handle as
+    /// named.
+    ///
+    /// [may name]: Self::may_name
+    pub fn person_key(&self, client: &str, handle: &str) -> String {
+        match self.user {
+            UserRule::Any => handle.to_string(),
             UserRule::FromName { prefix } => client
                 .get(prefix..)
-                .is_some_and(|rest| !rest.is_empty() && rest == handle_in_name(handle)),
+                .filter(|rest| !rest.is_empty())
+                .map_or_else(|| handle.to_string(), str::to_string),
         }
     }
 }
+
+pub use pmos_contract::onboarding::{spelled_handle, MAX_SPELLED_HANDLE};
 
 /// A handle as PM OS writes it in a personal bot's name, `pm-<this>`
 /// ([`pmos_contract::onboarding::personal_bot_name`]): `.` and `_` become `-`, a run of
@@ -346,6 +372,13 @@ impl Models {
                 ))
             }
         };
+        if class == GatewayClass::Production && !file.local_hosts.is_empty() {
+            return Err(
+                "gateway config: `local-hosts` is for a test gateway; a `class: production` \
+                 gateway's model servers are named `<name>.pmos.internal`"
+                    .into(),
+            );
+        }
         let mut clients = BTreeMap::new();
         for (name, spec) in file.clients {
             let pattern = name.strip_suffix('*');
@@ -513,6 +546,16 @@ impl Models {
                      `class: production` gateway never serves"
                 ));
             }
+            // F3 (review at 2544d01): a production gateway's model servers are named only
+            // `<name>.pmos.internal`, never by address, a bare name or a `local-hosts` entry,
+            // all of which `is_local_host` accepts for a test gateway.
+            if class == GatewayClass::Production && !is_production_host(host) {
+                return Err(format!(
+                    "gateway config: upstream `{}` ({host}): a `class: production` gateway's \
+                     model servers must be named `<name>.pmos.internal`",
+                    spec.upstream
+                ));
+            }
             roles.insert(
                 name.clone(),
                 Role {
@@ -536,9 +579,24 @@ impl Models {
     /// How `client` is treated: its exact entry in `clients:`, else the longest `prefix*`
     /// pattern that matches it, else the default: not trusted (its `X-Pmos-User` and
     /// `X-Pmos-Priority` are ignored), `personal`, and `limits.per-client` in flight.
+    ///
+    /// A name that looks like a `from-name` pattern's but doesn't match it (`bot-pm` or
+    /// `bot-pmana` beside `bot-pm-*`; [`Models::lookalike_of`]) gets the default too, never a
+    /// shorter pattern such as `bot-*`, which may name anyone (the Low on `bot-pm` names,
+    /// review at 2544d01). The gateway warns at start-up about a token of such a name.
     pub fn client_policy(&self, client: &str) -> ClientPolicy {
+        let default = ClientPolicy {
+            trusted: false,
+            max_in_flight: self.limits.client_default(),
+            priority: Priority::Personal,
+            max_queue: self.limits.client_default().saturating_mul(2),
+            user: UserRule::Any,
+        };
         if let Some(p) = self.clients.get(client) {
             return *p;
+        }
+        if self.lookalike_of(client).is_some() {
+            return default;
         }
         self.clients
             .iter()
@@ -548,13 +606,45 @@ impl Models {
             })
             .max_by_key(|(n, _)| *n)
             .map(|(_, p)| *p)
-            .unwrap_or(ClientPolicy {
-                trusted: false,
-                max_in_flight: self.limits.client_default(),
-                priority: Priority::Personal,
-                max_queue: self.limits.client_default().saturating_mul(2),
-                user: UserRule::Any,
+            .unwrap_or(default)
+    }
+
+    /// The `from-name` pattern that `client` looks like but doesn't match, if any: one whose
+    /// prefix, without its trailing hyphens, starts `client`'s name, which then doesn't go on
+    /// with the full prefix (`bot-pm`, `bot-pmana` for `bot-pm-*`). An exact entry in
+    /// `clients:` is never a lookalike.
+    pub fn lookalike_of(&self, client: &str) -> Option<&str> {
+        if self.clients.contains_key(client) {
+            return None;
+        }
+        self.clients.iter().find_map(|(k, p)| {
+            let prefix = k.strip_suffix('*')?;
+            if !matches!(p.user, UserRule::FromName { .. }) {
+                return None;
+            }
+            let stem = prefix.trim_end_matches('-');
+            (stem.len() < prefix.len() && client.starts_with(stem) && !client.starts_with(prefix))
+                .then_some(k.as_str())
+        })
+    }
+
+    /// What to warn about at start-up: each client token whose name looks like a `from-name`
+    /// pattern's but doesn't match it ([`Models::lookalike_of`]). Such a client is served, as
+    /// untrusted, rather than stopping the gateway, since a team bot may be named so
+    /// (`pmo` gives `bot-pmo`).
+    pub fn lookalike_warnings(&self, clients: &[Client]) -> Vec<String> {
+        clients
+            .iter()
+            .filter_map(|c| {
+                let pattern = self.lookalike_of(&c.name)?;
+                Some(format!(
+                    "client `{}` looks like `{pattern}` but doesn't match it: it is not trusted \
+                     (it names no one and gets `personal`), and never falls under a shorter \
+                     pattern; a PM's own bot is `{pattern}` with the handle after it",
+                    c.name
+                ))
             })
+            .collect()
     }
 
     /// The role a request's `model` names: `pmos/<role>`. A concrete model name is refused,
@@ -596,6 +686,26 @@ pub fn is_local_host(host: &str, extra: &[String]) -> bool {
         || !host.contains('.')
         || host.ends_with(".pmos.internal")
         || extra.iter().any(|h| h.eq_ignore_ascii_case(&host))
+}
+
+/// A `class: production` gateway's model server host (F3, review at 2544d01): a DNS name
+/// `<label>.<…>.pmos.internal`, each label lowercase letters, digits and inner hyphens. On
+/// the Spark these are the vLLM services' network aliases in `deploy/compose.yaml`.
+/// `.internal` is reserved for private use, so such a name never resolves on the internet.
+pub fn is_production_host(host: &str) -> bool {
+    let Some(name) = host.strip_suffix(".pmos.internal") else {
+        return false;
+    };
+    !name.is_empty()
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
 }
 
 /// One caller and its token, such as the bot runtime or the benchmark runner.
@@ -699,16 +809,23 @@ impl Config {
         })
     }
 
-    /// Refuses to start a `class: production` gateway with the stub model on.
-    pub fn check_class(&self, models: &Models) -> Result<(), String> {
+    /// The class this gateway serves as: the config's, except that with the stub model on it
+    /// is always `test`, so a stub run never counts as production. A first install runs the
+    /// Spark's own `class: production` config with `PMOS_GATEWAY_STUB=1` until the model
+    /// servers are up (`deploy/env.example`), so the gateway starts then, with a warning
+    /// (`Some`, the text to log), rather than refusing as it did at 2544d01. The router applies
+    /// the same rule ([`crate::router`]).
+    pub fn served_class(&self, models: &Models) -> (GatewayClass, Option<&'static str>) {
         if self.stub && models.class == GatewayClass::Production {
-            return Err(
-                "PMOS_GATEWAY_STUB=1 with a `class: production` config: the stub is never a \
-                 production gateway"
-                    .into(),
+            return (
+                GatewayClass::Test,
+                Some(
+                    "PMOS_GATEWAY_STUB=1 with a `class: production` config: serving as class \
+                     `test` (stub on); no eval run against this gateway counts",
+                ),
             );
         }
-        Ok(())
+        (models.class, None)
     }
 
     /// Refuses to start when a role uses a testing-only upstream whose key is missing.

@@ -83,8 +83,10 @@
 # connector or OAuth setting) reaches one. Every service inherits PATH, HOME, USER, LOGNAME,
 # TMPDIR, TMP, TEMP, the locale (LANG, LANGUAGE, LC_*, TZ), the proxy and CA variables
 # (HTTPS_PROXY, HTTP_PROXY, ALL_PROXY, NO_PROXY and their lowercase forms, SSL_CERT_FILE,
-# SSL_CERT_DIR, CURL_CA_BUNDLE, REQUESTS_CA_BUNDLE, NODE_EXTRA_CA_CERTS, NODE_OPTIONS) and
-# RUST_LOG and RUST_BACKTRACE; besides, pmos-docs inherits the PMOS_DOCS_* settings above
+# SSL_CERT_DIR, CURL_CA_BUNDLE, REQUESTS_CA_BUNDLE, NODE_EXTRA_CA_CERTS) and
+# RUST_LOG and RUST_BACKTRACE; NODE_OPTIONS goes to the Node services only (the harness
+# workers, which trust a proxy's CA through e.g. `--use-openssl-ca`), never to the Rust ones,
+# which don't read it; besides, pmos-docs inherits the PMOS_DOCS_* settings above
 # (BASE_URL, NAME, PAGE_PREFIXES, API_PREFIX, PRODUCTS, ALLOWED_HOSTS, CONCURRENCY, SYNC_HOURS,
 # DELAY_MS) and the gateway PMOS_GATEWAY_ANTHROPIC_KEY, PMOS_GATEWAY_REMOTE_KEY,
 # PMOS_GATEWAY_WORKAROUNDS and PMOS_GATEWAY_RETRY_*. The Slack tokens go to the Slack service
@@ -107,11 +109,15 @@ inherit() { # array name, then variable names: appends NAME=value for each one t
 }
 inherit SERVICE_ENV PATH HOME USER LOGNAME TMPDIR TMP TEMP LANG LANGUAGE TZ \
   HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY https_proxy http_proxy all_proxy no_proxy \
-  SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS NODE_OPTIONS \
+  SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS \
   RUST_LOG RUST_BACKTRACE
 for v in $(compgen -e); do
   case "$v" in LC_*) inherit SERVICE_ENV "$v" ;; esac
 done
+# The Node services' own (the harness workers, `worker` below): NODE_OPTIONS can load code
+# into a Node process (`--require`), so only they get it.
+NODE_ENV_VARS=()
+inherit NODE_ENV_VARS NODE_OPTIONS
 DOCS_ENV=() GATEWAY_ENV=()
 inherit DOCS_ENV PMOS_DOCS_BASE_URL PMOS_DOCS_NAME PMOS_DOCS_PAGE_PREFIXES PMOS_DOCS_API_PREFIX \
   PMOS_DOCS_PRODUCTS PMOS_DOCS_ALLOWED_HOSTS PMOS_DOCS_CONCURRENCY PMOS_DOCS_SYNC_HOURS \
@@ -341,17 +347,21 @@ if [ "${PMOS_TEST_EVALS:-}" = 1 ]; then
   BOTS_EVALS=(PMOS_EVALS_AS=evals PMOS_ASSERTION_INSECURE_OFF=1)
   (
     umask 077
-    printf '%s\n' "# Written by scripts/claude-test-stack.sh for this run only; it holds tokens." \
-      "PMOS_BOTS_URL=http://127.0.0.1:8750" "PMOS_EVALS_TOKEN=$RT_EVALS" \
-      "PMOS_EVALS_TRACE_TOKEN=$RT_CONSOLE" "PMOS_EVALS_AS=evals" \
-      "PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1" "PMOS_EVALS_GATEWAY_TOKEN=$GW_EVALS" \
-      "PMOS_EVALS_CONTENT=$STATE/content" \
-      "NO_PROXY=127.0.0.1,localhost" >"$STATE/evals.env"
+    # The operator sources this file (`set -a; . evals.env`), so every value is quoted for
+    # the shell (%q): a $STATE path with a space, `$` or `;` is read back as the same text.
+    {
+      echo "# Written by scripts/claude-test-stack.sh for this run only; it holds tokens."
+      printf '%s=%q\n' PMOS_BOTS_URL "http://127.0.0.1:8750" PMOS_EVALS_TOKEN "$RT_EVALS" \
+        PMOS_EVALS_TRACE_TOKEN "$RT_CONSOLE" PMOS_EVALS_AS evals \
+        PMOS_GATEWAY_URL "http://127.0.0.1:8740/v1" PMOS_EVALS_GATEWAY_TOKEN "$GW_EVALS" \
+        PMOS_EVALS_CONTENT "$STATE/content" \
+        NO_PROXY "127.0.0.1,localhost"
+    } >"$STATE/evals.env"
     if [ "$EVALS_LANES" -gt 0 ]; then
       lanes=()
       for i in $(seq 1 "$EVALS_LANES"); do lanes+=("http://127.0.0.1:$((8750 + 100 * i))"); done
-      printf '%s\n' "PMOS_EVALS_LANES=$(IFS=,; echo "${lanes[*]}")" \
-        "PMOS_EVALS_FRESH_CMD=$STATE/fresh-toolserver" >>"$STATE/evals.env"
+      printf '%s=%q\n' PMOS_EVALS_LANES "$(IFS=,; echo "${lanes[*]}")" \
+        PMOS_EVALS_FRESH_CMD "$STATE/fresh-toolserver" >>"$STATE/evals.env"
     fi
   )
 fi
@@ -480,7 +490,8 @@ start bots env PMOS_DEV=1 PMOS_CONTENT_ROOT="$STATE/content" \
 wait_for http://127.0.0.1:8750/healthz bots
 
 worker() { # bot, token[, log name[, runtime port, tool server port]]
-  start "${3:-worker-$1}" env PMOS_BOTS_URL="http://127.0.0.1:${4:-8750}" PMOS_WORKER_BOT="$1" \
+  start "${3:-worker-$1}" env ${NODE_ENV_VARS[@]+"${NODE_ENV_VARS[@]}"} \
+    PMOS_BOTS_URL="http://127.0.0.1:${4:-8750}" PMOS_WORKER_BOT="$1" \
     PMOS_WORKER_TOKEN="$2" PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1 \
     PMOS_GATEWAY_TOKEN="$GW_WORKER" PMOS_TOOLSERVER_MCP_URL="http://127.0.0.1:${5:-8710}/mcp" \
     PMOS_CONTENT_ROOT="$STATE/content" NO_PROXY="127.0.0.1,localhost" \

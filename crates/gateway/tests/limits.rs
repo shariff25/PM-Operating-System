@@ -14,7 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pmos_gateway::config::{
-    handle_in_name, valid_client_name, Client, Config, GatewayClass, Models, UserRule,
+    handle_in_name, spelled_handle, valid_client_name, Client, Config, GatewayClass, Models,
+    UserRule, MAX_SPELLED_HANDLE,
 };
 use pmos_gateway::scheduler::Priority;
 use pmos_gateway::usage::UsageLog;
@@ -748,7 +749,15 @@ fn every_valid_handle_fits_a_client_name_that_names_only_it() {
             matches!(p.user, UserRule::FromName { .. }),
             "{client} falls under bot-pm-*"
         );
-        assert!(p.may_name(&client, h), "{client} may name {h}");
+        // F2 (review at 2544d01): a handle whose spelled form doesn't fit a personal bot's
+        // name is cut there, so that client name would spell other handles too: refused.
+        let fits = spelled_handle(h).len() <= MAX_SPELLED_HANDLE;
+        assert_eq!(p.may_name(&client, h), fits, "{client} naming {h}");
+        if fits {
+            // The one key it is kept under is the form its name spells.
+            assert_eq!(p.person_key(&client, h), spelled_handle(h));
+            assert_eq!(format!("bot-pm-{}", p.person_key(&client, h)), client);
+        }
         for other in ["zz-someone-else", "ana-x"] {
             if handle_in_name(other) != handle_in_name(h) {
                 assert!(!p.may_name(&client, other), "{client} named {other}");
@@ -757,6 +766,99 @@ fn every_valid_handle_fits_a_client_name_that_names_only_it() {
     }
     // A client that is only the prefix names no one.
     assert!(!m.client_policy("bot-pm-").may_name("bot-pm-", "ana"));
+}
+
+/// F2 (review at 2544d01): `bot-pm-<29 characters>` names only the handle it spells in full,
+/// never one that is longer and starts the same way (whose bot name would be cut to it).
+#[test]
+fn a_cut_bot_name_names_no_one_longer() {
+    let m = Models::from_yaml(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/gateway.yaml"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let stem = "a".repeat(MAX_SPELLED_HANDLE);
+    let client = format!("bot-pm-{stem}");
+    assert!(valid_client_name(&client));
+    let p = m.client_policy(&client);
+    assert!(p.may_name(&client, &stem), "the handle it spells in full");
+    for longer in [
+        format!("{stem}b"),
+        format!("{stem}.b"),
+        format!("{stem}-zz"),
+        format!("{stem}{}", "c".repeat(30)),
+    ] {
+        assert_eq!(
+            format!(
+                "bot-{}",
+                pmos_contract::onboarding::personal_bot_name(&longer)
+            ),
+            client,
+            "{longer} shares the cut bot name"
+        );
+        assert!(!p.may_name(&client, &longer), "{client} named {longer}");
+    }
+}
+
+/// The Low on canonical handles (review at 2544d01): `bot-pm-ana` may name `ana`, `ana.`,
+/// `ana-` or `ana..`, but its calls are kept under one person, `ana`, for the caps and the
+/// usage log; and a name that only looks like `bot-pm-*` falls under no trusted pattern.
+#[tokio::test]
+async fn a_pms_own_bot_is_kept_under_one_person_key() {
+    let gw = gateway(
+        "{max-in-flight: 4, per-user: 2}",
+        "{bot-pm-*: {trusted: true, user: from-name}, bot-*: {trusted: true}}",
+    )
+    .await;
+    for named in ["ana", "ana.", "ana-", "ana..", "ana_"] {
+        let res = ask(&gw, BOT_ANA, "hi", false)
+            .header("x-pmos-user", named)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "{named}");
+    }
+    let users: std::collections::BTreeSet<_> = gw
+        .usage
+        .recent()
+        .into_iter()
+        .filter(|e| e.client == "bot-pm-ana")
+        .map(|e| e.user)
+        .collect();
+    assert_eq!(users, [Some("ana".to_string())].into());
+    // `bot-pm` and `bot-pmana` look like `bot-pm-*` but aren't: not trusted, not `bot-*`.
+    let m = Models::from_yaml(
+        "upstreams: {a: 'http://vllm/v1'}\nroles: {default: {upstream: a, model: m}}\n\
+         clients: {bot-pm-*: {trusted: true, user: from-name}, bot-*: {trusted: true}, bot-pmx: {trusted: true}}\n",
+    )
+    .unwrap();
+    for name in ["bot-pm", "bot-pmana", "bot-pm0"] {
+        let p = m.client_policy(name);
+        assert!(!p.trusted, "{name}");
+        assert_eq!(m.lookalike_of(name), Some("bot-pm-*"));
+        assert_eq!(p.priority, Priority::Personal);
+        let c = Client {
+            name: name.into(),
+            token: "t".repeat(32),
+        };
+        let warnings = m.lookalike_warnings(&[c]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("not trusted"), "{warnings:?}");
+    }
+    // An exact entry is what it says; real team bots and PMs' bots are untouched.
+    assert!(m.client_policy("bot-pmx").trusted);
+    assert_eq!(m.lookalike_of("bot-pmx"), None);
+    for name in ["bot-docs", "bot-pm-ana", "bot-p", "runtime"] {
+        assert_eq!(m.lookalike_of(name), None, "{name}");
+    }
+    assert!(m.client_policy("bot-docs").trusted);
+    let ok = ["bot-docs", "bot-pm-ana"].map(|n| Client {
+        name: n.into(),
+        token: "t".repeat(32),
+    });
+    assert!(m.lookalike_warnings(&ok).is_empty());
 }
 
 /// R2: one client can't fill the queue and so turn every other client away; its own excess
@@ -854,17 +956,158 @@ fn client_patterns_and_user_rules_that_cover_too_much_are_refused() {
     )
     .unwrap_err();
     assert!(err.contains("testing-only"), "{err}");
-    // Nor the stub.
+    // With the stub on, a production config starts but serves as `test`, with a warning; the
+    // stub is never a production gateway (and a first install runs exactly that).
     let prod = Models::from_yaml(
-        "upstreams: {a: 'http://vllm/v1'}\nroles: {default: {upstream: a, model: m}}\nclass: production\n",
+        "upstreams: {a: 'http://vllm.pmos.internal/v1'}\nroles: {default: {upstream: a, model: m}}\nclass: production\n",
     )
     .unwrap();
-    let stub = Config::from_lookup(|k| match k {
-        "PMOS_GATEWAY_TOKENS" => Some(format!("runtime={}", "a".repeat(32))),
-        "PMOS_GATEWAY_STUB" => Some("1".into()),
-        _ => None,
-    })
-    .unwrap();
-    assert!(stub.check_class(&prod).is_err());
-    assert!(stub.check_class(&with("").unwrap()).is_ok());
+    let config = |stub: &'static str| {
+        Config::from_lookup(move |k| match k {
+            "PMOS_GATEWAY_TOKENS" => Some(format!("runtime={}", "a".repeat(32))),
+            "PMOS_GATEWAY_STUB" => Some(stub.into()),
+            _ => None,
+        })
+        .unwrap()
+    };
+    let (class, warning) = config("1").served_class(&prod);
+    assert_eq!(class, GatewayClass::Test);
+    assert!(warning.is_some_and(|w| w.contains("class `test`")));
+    assert_eq!(
+        config("0").served_class(&prod),
+        (GatewayClass::Production, None)
+    );
+    assert_eq!(
+        config("1").served_class(&with("").unwrap()),
+        (GatewayClass::Test, None)
+    );
+}
+
+/// F3 (review at 2544d01): a `class: production` gateway names its model servers
+/// `<name>.pmos.internal` only: no address, bare name or `local-hosts` entry, though a test
+/// gateway accepts all three.
+#[test]
+fn a_production_gateway_names_its_model_servers_under_pmos_internal() {
+    let config = |upstream: &str, extra: &str, class: &str| {
+        Models::from_yaml(&format!(
+            "upstreams: {{a: '{upstream}'}}\nroles: {{default: {{upstream: a, model: m}}}}\n{extra}class: {class}\n"
+        ))
+    };
+    for upstream in [
+        "http://vllm/v1",
+        "http://localhost:8000/v1",
+        "http://127.0.0.1:8001/v1",
+        "http://10.0.0.5:8000/v1",
+        "http://[::1]:8000/v1",
+        "http://gpu.corp.example/v1",
+        "http://pmos.internal/v1",
+        "http://.pmos.internal/v1",
+        "http://x.pmos.internal.example/v1",
+        "http://-x.pmos.internal/v1",
+    ] {
+        let err = config(upstream, "", "production").err();
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("pmos.internal")
+                || e.contains("only to local models")
+                || e.contains("upstream `a`")),
+            "{upstream}: {err:?}"
+        );
+    }
+    // A `local-hosts` entry is refused outright, used or not.
+    let err = config(
+        "http://vllm-default.pmos.internal:8000/v1",
+        "local-hosts: [spark.corp.example]\n",
+        "production",
+    )
+    .unwrap_err();
+    assert!(err.contains("local-hosts"), "{err}");
+    let err = config(
+        "http://spark.corp.example/v1",
+        "local-hosts: [spark.corp.example]\n",
+        "production",
+    )
+    .unwrap_err();
+    assert!(err.contains("local-hosts"), "{err}");
+    // What the Spark uses, over http or https.
+    for upstream in [
+        "http://vllm-default.pmos.internal:8000/v1",
+        "https://gpu.models.pmos.internal/v1",
+        "http://VLLM.pmos.internal/v1",
+    ] {
+        assert!(config(upstream, "", "production").is_ok(), "{upstream}");
+    }
+    // A test gateway keeps accepting the local forms.
+    for upstream in ["http://vllm/v1", "http://127.0.0.1:8001/v1"] {
+        assert!(config(upstream, "", "test").is_ok(), "{upstream}");
+    }
+    assert!(config(
+        "http://spark.corp.example/v1",
+        "local-hosts: [spark.corp.example]\n",
+        "test"
+    )
+    .is_ok());
+    // The shipped deploy config passes.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let m = Models::from_yaml(&std::fs::read_to_string(root.join("deploy/gateway.yaml")).unwrap())
+        .unwrap();
+    assert_eq!(m.class, GatewayClass::Production);
+    for r in m.roles.values() {
+        assert!(r.upstream_host().ends_with(".pmos.internal"), "{}", r.name);
+    }
+}
+
+/// The regression at 2544d01 (CI's deploy kit): a first install runs the Spark's own
+/// `class: production` config with the stub on. The gateway starts and reports class `test`
+/// with `stub: true`; with the stub off the same config reports `production`.
+#[tokio::test]
+async fn the_deploy_config_serves_as_test_with_the_stub_and_production_without() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join("deploy/gateway.yaml")).unwrap();
+    for (stub, class) in [(true, "test"), (false, "production")] {
+        let models = Models::parse(&text, false).unwrap();
+        let config = Config::from_lookup(|k| match k {
+            "PMOS_GATEWAY_TOKENS" => Some(format!("runtime={RUNTIME}")),
+            "PMOS_GATEWAY_STUB" => Some(if stub { "1" } else { "0" }.into()),
+            _ => None,
+        })
+        .unwrap();
+        config.check_keys(&models).unwrap();
+        assert!(models.lookalike_warnings(&config.clients).is_empty());
+        let (base, stop) = serve(router(GatewayConfig {
+            models,
+            clients: config.clients.clone(),
+            usage: Arc::new(UsageLog::new(None).unwrap()),
+            stub: config.stub,
+            workarounds_on: true,
+            anthropic_key: String::new(),
+            remote_key: String::new(),
+            retry: Default::default(),
+            timeouts: Default::default(),
+        }))
+        .await;
+        let v: Value = reqwest::Client::new()
+            .get(format!("{base}/v1/pmos/roles"))
+            .bearer_auth(RUNTIME)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["class"], class, "stub {stub}");
+        assert_eq!(v["stub"], stub);
+        if stub {
+            // And it answers, with no model server behind it.
+            let res = reqwest::Client::new()
+                .post(format!("{base}/v1/chat/completions"))
+                .bearer_auth(RUNTIME)
+                .json(&json!({"model": "pmos/default",
+                    "messages": [{"role": "user", "content": "hi"}]}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200);
+        }
+        stop.cancel();
+    }
 }

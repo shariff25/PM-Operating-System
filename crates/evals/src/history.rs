@@ -178,7 +178,15 @@ fn files_under(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Res
 /// bump it slipped past). `Err` says which file or field is missing; such a persona has no
 /// run that counts.
 pub fn persona_hash(content: &Path, persona: &str) -> Result<String, String> {
+    use pmos_contract::bots::valid_name;
     use sha2::{Digest, Sha256};
+    // Both are joined into paths under the content root: plain names only, never `..` or a
+    // path (the Low on the persona's role, review at 2544d01).
+    if !valid_name(persona) {
+        return Err(format!(
+            "persona `{persona}` isn't a plain name (lowercase letters, digits and single hyphens)"
+        ));
+    }
     let dir = content.join("personas").join(persona);
     let front = front_matter(&dir.join("PERSONA.md"))?;
     let role = front
@@ -186,6 +194,12 @@ pub fn persona_hash(content: &Path, persona: &str) -> Result<String, String> {
         .and_then(|r| r.as_str())
         .ok_or_else(|| format!("persona `{persona}` names no `role`"))?
         .to_string();
+    if !valid_name(&role) {
+        return Err(format!(
+            "persona `{persona}`: role `{role}` isn't a plain role name (lowercase letters, \
+             digits and single hyphens)"
+        ));
+    }
     let role_dir = content.join("roles").join(&role);
     let role_front = front_matter(&role_dir.join("ROLE.md"))?;
     let skills: Vec<String> = match role_front.get("skills") {
