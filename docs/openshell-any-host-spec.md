@@ -28,6 +28,25 @@ identity OpenShell uses, whether `sandbox exec` stays in the foreground and the 
 name are still for the acceptance run (§6, step 2) and H5. The `ExecStartPre=` preflight comes
 with H1.
 
+**Slice H0b status (2026-11-22): built on `claude/any-host-h0b`, not yet reviewed or merged.**
+The fixes for the security review of `6bb806f`: no token on a command line (`pmos-admin`'s
+curl calls read the bearer header with `--config -`; `evals` and `build` pass `-e NAME` and
+`--build-arg NAME` with the value in the environment; the test stack's scripts export their
+services' settings instead of passing them to `env`; `setup.sh` refuses a clone URL with
+credentials); `pause` refuses root, says plainly when the unit is missing or can't be
+stopped, always stops the sandbox and exits 1 with what is left; `pause` and `down` go on, with
+a warning, when `deploy/.env` can't be parsed or has the wrong mode; `deploy/.env` is refused
+when every account can read it or its group can write it, warned about when its group (or an
+ACL) can read it or another account owns it, and rewritten by a rename under a `flock` lock,
+keeping owner and ACL; `revoke`, `smoke`, `logs` and `restart` take only a handle, a known
+provider or a known service (and `smoke` writes its JSON with jq or python3); the eval gate
+passes `--base` after `--end-of-options`; the bring-up and eval workers run as the checkout's
+owner; `sandbox` updates a provider that already exists (`provider get`, then `provider update`
+or `provider create`, from OpenShell's providers page). **Not verified on OpenShell:** the
+provider commands' exit codes and that `provider create` refuses an existing name, and
+`openshell sandbox stop`/`start`, which `pause` and `resume` use but OpenShell's current
+public docs don't show (they show `sandbox delete`).
+
 **The owner's requirement, 2026-11-22:** "I want to deploy it in another platform apart from
 spark", and, asked which cloud, "OpenShell on another platform generic implementation". So PM OS's
 bots must be able to run in NVIDIA OpenShell sandboxes on hosts other than the DGX Spark, through

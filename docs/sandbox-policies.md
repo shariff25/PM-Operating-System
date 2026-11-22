@@ -192,6 +192,16 @@ openshell provider create --name pmos-docs-gateway --type pmos-gateway --credent
 openshell provider create --name pmos-docs-worker  --type pmos-worker  --credential PMOS_WORKER_TOKEN
 ```
 
+`--credential <NAME>` with no value reads the token from that environment variable; never write
+`--credential NAME=<value>`, which OpenShell's providers page says "exposes it in shell history
+and the host process table". A provider is its own resource, attached to sandboxes and deleted
+separately, so it outlives `openshell sandbox delete`. `pmos-admin sandbox <bot>` therefore runs
+`openshell provider get <name>` first and, for a provider that exists, `openshell provider update
+<name> --credential <NAME>` instead of creating it again; that is also how a rotated token
+reaches it (`docs/runbooks/incidents.md`). From OpenShell's public docs
+(`how-it-works/providers/overview.mdx`, read 2026-11-22); verify on a real host that `provider
+get` fails only for a provider that doesn't exist.
+
 The command names come from OpenShell's docs and its example profile headers. The docs show both
 `openshell profile …` and `openshell provider profile …`; check which one the installed CLI uses.
 
@@ -251,7 +261,9 @@ minutes. The instance name is made with `systemd-escape` (`pm-ana` → `pm\x2dan
 reads it back with `%I`. It holds no token: the two credentials are the sandbox's providers.
 `pmos-admin sandbox` and `resume` refuse to start it unless lingering is on
 (`loginctl show-user <user> -p Linger` is `yes`), since without it the user's services stop at
-logout and don't start at boot. `pause` disables and stops the unit, then stops the sandbox.
+logout and don't start at boot. `pause` disables and stops the unit, then stops the sandbox
+(even when the unit step fails); it refuses to run as root, and exits 1, listing what is left
+to do, when the unit isn't installed, can't be stopped or the sandbox can't be stopped.
 
 The worker image (`deploy/Dockerfile.worker`) has a `sandbox` account (uid and gid 10100) and
 ends with `USER 10100:10100`, so the policy's `run_as_user: sandbox` names an account that exists

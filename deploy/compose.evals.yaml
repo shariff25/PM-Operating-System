@@ -34,6 +34,10 @@ x-service: &service
 x-worker: &worker
   image: pmos-worker:${PMOS_VERSION:-local}
   init: true
+  # As the content's owner (pmos-admin chowns the copy to PMOS_UID), like the services, not the
+  # image's `sandbox` (10100): the copy keeps the checkout's modes, which a umask of 077 makes
+  # unreadable to any other account. The worker writes only under /tmp.
+  user: "${PMOS_UID:-10001}:${PMOS_GID:-10001}"
   networks: [evals, pmos]
   volumes:
     - ${PMOS_EVAL_CONTENT:?}:/srv/content:ro

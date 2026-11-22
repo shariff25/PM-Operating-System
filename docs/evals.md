@@ -36,8 +36,8 @@ client `evals`. For each task, `repeats` times, it:
 | Setting | Flag | Environment | Default |
 | --- | --- | --- | --- |
 | Runtime URL | `--bots-url` | `PMOS_BOTS_URL` | `runner.bots_url` (`http://127.0.0.1:8750`) |
-| Runtime token, client `evals` | `--token` | `PMOS_EVALS_TOKEN` | required |
-| Console token, for traces | `--trace-token` | `PMOS_EVALS_TRACE_TOKEN` | none |
+| Runtime token, client `evals` | `--token` (avoid: on a command line any account can read it) | `PMOS_EVALS_TOKEN` | required |
+| Console token, for traces | `--trace-token` (avoid, as `--token`) | `PMOS_EVALS_TRACE_TOKEN` | none |
 | Who the tasks are for | `--as` | `PMOS_EVALS_AS` | `runner.requested_by` (`evals`) |
 | Evals directory | `--root` | `PMOS_EVALS_ROOT` | `evals` |
 | Seconds one task may take | `--timeout-secs` | | `runner.task_timeout_seconds` (600) |

@@ -36,6 +36,13 @@ for p in "$CONTENT" "$STATE"; do
   esac
 done
 case "$CLONE" in -*) echo "--clone takes a git URL, not $(printf '%q' "$CLONE")" >&2; exit 2 ;; esac
+# A URL with a password or token in it (https://user:<token>@host/…) would be on git's command
+# line, where every account on this machine can read it, and in the checkout's .git/config. Use
+# the content repo's read-only deploy key (an ssh URL) or a git credential helper instead.
+if [[ "$CLONE" =~ ^[A-Za-z][A-Za-z0-9+.-]*://[^/@]*@ ]]; then
+  echo "--clone: don't put a user, password or token in the URL; use an ssh deploy key (git@host:org/repo.git) or a git credential helper" >&2
+  exit 2
+fi
 
 ok() { printf '  \033[32mok\033[0m   %s\n' "$1"; }
 warn() { printf '  \033[33mwarn\033[0m %s\n' "$1"; }
@@ -76,15 +83,38 @@ chown -R "$OWNER_UID:$OWNER_GID" "$STATE" 2>/dev/null || warn "couldn't chown $S
 ok "$STATE (owned by $OWNER_UID:$OWNER_GID, the checkout's owner)"
 
 echo "== deploy/.env"
-[ -f "$ENV" ] || { cp "$DEPLOY/env.example" "$ENV"; ok "created from env.example"; }
+# Under the same lock as pmos-admin (deploy/.env.lock), so the two never change it at once.
+if command -v flock >/dev/null; then
+  (umask 077 && : >>"$DEPLOY/.env.lock")
+  exec 9>>"$DEPLOY/.env.lock"
+  flock -w 60 9 || fail "another setup.sh or pmos-admin has been changing deploy/.env for a minute: try again"
+else
+  warn "flock isn't installed: don't run pmos-admin add-bot while this runs"
+fi
+# Made private before it holds anything (umask), then kept so.
+[ -f "$ENV" ] || { (umask 077 && cp "$DEPLOY/env.example" "$ENV"); ok "created from env.example"; }
 chmod 600 "$ENV"
 token() { openssl rand -hex 24; }
 password() { openssl rand -hex 16; }
+# Put the file $1 (a new deploy/.env, in the same directory) in place of deploy/.env: mode 0600,
+# the old file's owner and ACL (the eval runner's, docs/runbooks/upgrade.md), then renamed over
+# it, so no reader ever sees half a file (as pmos-admin's replace_env).
+replace_env() {
+  chmod 600 "$1"
+  chown --reference="$ENV" "$1" 2>/dev/null || true
+  if command -v getfacl >/dev/null && command -v setfacl >/dev/null; then
+    getfacl -p -- "$ENV" 2>/dev/null | setfacl --set-file=- -- "$1" 2>/dev/null ||
+      warn "couldn't copy deploy/.env's ACL; if the eval runner reads it: sudo setfacl -m u:gh-runner:r $ENV"
+  elif [[ "$(ls -ld -- "$ENV")" == ??????????+* ]]; then
+    warn "deploy/.env had an ACL and getfacl/setfacl aren't installed to keep it: sudo setfacl -m u:gh-runner:r $ENV"
+  fi
+  mv -f -- "$1" "$ENV"
+}
 # Set KEY to VALUE when it is empty or still `generated`; never replace a real value.
 # Every value it writes is a path checked above, a number, hex or base64: anything else is a bug,
 # refused before the file is touched.
 fill() {
-  local key=$1 value=$2 current
+  local key=$1 value=$2 current tmp
   case "$value" in
     *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.,:=/+-]*)
       echo "refusing to write $key with characters deploy/.env can't hold" >&2
@@ -92,15 +122,21 @@ fill() {
       ;;
   esac
   current=$(grep -E "^$key=" "$ENV" | head -1 | cut -d= -f2- || true)
-  if ! grep -qE "^$key=" "$ENV"; then
-    printf '%s=%s\n' "$key" "$value" >>"$ENV"
-  elif [ -z "$current" ] || [ "$current" = generated ]; then
-    local tmp
-    tmp=$(mktemp)
-    awk -v k="$key" -v v="$value" -F= 'BEGIN{OFS="="} $1==k{print k, v; next} {print}' "$ENV" >"$tmp"
-    cat "$tmp" >"$ENV"
-    rm -f "$tmp"
+  if grep -qE "^$key=" "$ENV" && [ -n "$current" ] && [ "$current" != generated ]; then
+    return 0
   fi
+  tmp=$(mktemp "$DEPLOY/.env.XXXXXX")
+  if ! {
+    if ! grep -qE "^$key=" "$ENV"; then
+      cat "$ENV" >"$tmp" && printf '%s=%s\n' "$key" "$value" >>"$tmp"
+    else
+      awk -v k="$key" -v v="$value" -F= 'BEGIN{OFS="="} $1==k{print k, v; next} {print}' "$ENV" >"$tmp"
+    fi
+  }; then
+    rm -f "$tmp"
+    fail "couldn't write deploy/.env; it is unchanged"
+  fi
+  replace_env "$tmp"
 }
 fill PMOS_CONTENT_CHECKOUT "$CONTENT"
 fill PMOS_STATE_DIR "$STATE"
