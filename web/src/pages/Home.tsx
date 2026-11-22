@@ -16,7 +16,7 @@ import { draftHref, taskHref } from '../url';
 import { TaskTable } from './Activity';
 import { ApiError } from '../api';
 import { cardOf, defaultPersona, identify, isUnknownOutcome, teamErrorText, teamOf } from '../bots';
-import { BotBy, BotFace } from '../components/BotParts';
+import { BotBy, BotFace, PreviewTag } from '../components/BotParts';
 import { BotPicker, pickerBot } from '../components/BotPicker';
 import type { PickerBot } from '../components/BotPicker';
 import { TeamNote } from '../components/TeamNote';
@@ -367,6 +367,7 @@ function BriefBy({ persona, offered }: { persona: string | null; offered: boolea
       <span className={`today-brief-by bot-by-${who.kind}`} data-bot={who.kind === 'bot' || who.kind === 'nudge' ? who.mascot : who.kind}>
         <BotFace mascot={who.mascot} size={16} />
         <span>{copy.today.briefBy(who.name)}</span>
+        {who.preview && <PreviewTag short />}
       </span>
     </>
   );
