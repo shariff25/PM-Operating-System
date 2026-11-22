@@ -11,6 +11,7 @@ use pmos_evals::client::Runtime;
 use pmos_evals::config::Config;
 use pmos_evals::gate::{baseline_from_git, decide};
 use pmos_evals::history::{evaluate, latest_report, load_all, load_reports};
+use pmos_evals::isolate::Isolation;
 use pmos_evals::judge::{self, load_calibration, load_judges, load_labels, Gateway};
 use pmos_evals::load::run_load;
 use pmos_evals::report::Report;
@@ -99,6 +100,17 @@ enum JudgeCommand {
         #[arg(long)]
         date: Option<NaiveDate>,
     },
+    /// Add a labelling pack to each judge's labels file: up to --per-judge lines picked from a
+    /// run's --label-candidates, mixing what the judge said, each with `label` empty for a
+    /// person to fill in. Every judge when none is named.
+    Pack {
+        name: Option<String>,
+        /// The --label-candidates directory of one or more runs.
+        #[arg(long)]
+        from: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        per_judge: usize,
+    },
 }
 
 #[derive(Args)]
@@ -172,6 +184,60 @@ struct RunArgs {
     no_judges: bool,
     #[command(flatten)]
     gateway: GatewayArgs,
+    /// Isolated attempts: the runtime URL of each lane, comma-separated. Each attempt takes a
+    /// free lane, gets a fresh tool server there (--fresh-cmd), and runs on that lane's
+    /// runtime; as many run at once as there are lanes. Needs --fresh-cmd.
+    #[arg(long, env = "PMOS_EVALS_LANES", value_delimiter = ',')]
+    lanes: Vec<String>,
+    /// With --lanes: the program run as `<program> <lane>` (lanes from 1) before each attempt;
+    /// it exits 0 once that lane has a fresh tool server.
+    #[arg(long, env = "PMOS_EVALS_FRESH_CMD")]
+    fresh_cmd: Option<PathBuf>,
+    /// Keep a labelling-pack candidate for every attempt a judge answered (what it saw, what
+    /// it said, the label empty) in <dir>/<date>-<category>-<judge>.jsonl. They hold answer
+    /// text: keep them out of evals/reports. `pmos-evals judge pack` picks from them.
+    #[arg(long)]
+    label_candidates: Option<PathBuf>,
+}
+
+/// `--lanes` and `--fresh-cmd`, both or neither.
+fn isolation(args: &RunArgs, token: &str, trace_token: Option<&str>) -> Result<Option<Isolation>> {
+    let urls: Vec<String> = args
+        .lanes
+        .iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .collect();
+    let fresh = args
+        .fresh_cmd
+        .as_ref()
+        .filter(|p| !p.as_os_str().is_empty());
+    match (urls.is_empty(), fresh) {
+        (true, None) => Ok(None),
+        (true, Some(_)) => {
+            bail!("--fresh-cmd needs --lanes (PMOS_EVALS_LANES): the runtime of each lane")
+        }
+        (false, None) => bail!(
+            "--lanes needs --fresh-cmd (PMOS_EVALS_FRESH_CMD): how a lane gets a fresh tool server"
+        ),
+        (false, Some(program)) => {
+            if let Some(c) = args.concurrency.filter(|c| *c != urls.len()) {
+                eprintln!(
+                    "note: --concurrency {c} ignored: isolated attempts run one per lane, {} at once",
+                    urls.len()
+                );
+            }
+            Ok(Some(Isolation {
+                lanes: urls
+                    .iter()
+                    .map(|u| Runtime::new(u, token, trace_token))
+                    .collect(),
+                urls,
+                fresh: pmos_evals::isolate::command(program.clone()),
+                how: format!("`{}` before each", file_name(program)),
+            }))
+        }
+    }
 }
 
 #[derive(Args)]
@@ -261,6 +327,11 @@ async fn run_and_write(
         bail!("--repeats must be at least 1");
     }
     let r = resolve(&args.conn, &config, args.trace_token.as_deref())?;
+    let isolation = isolation(
+        &args,
+        args.conn.token.as_deref().unwrap_or_default(),
+        args.trace_token.as_deref(),
+    )?;
     let applicable: Vec<_> = load_judges(root)
         .map_err(|e| anyhow::anyhow!(e.join("\n")))?
         .into_iter()
@@ -277,7 +348,18 @@ async fn run_and_write(
             let status = judge::status(&j, cal.as_ref());
             judges.push((j, status));
         }
-        (Some(JudgeRun { gateway, judges }), None)
+        let labels = args
+            .label_candidates
+            .as_ref()
+            .map(|_| pmos_evals::run::LabelSink::default());
+        (
+            Some(JudgeRun {
+                gateway,
+                judges,
+                labels,
+            }),
+            None,
+        )
     } else {
         eprintln!("warning: judges apply to {} but no gateway is configured (PMOS_GATEWAY_URL and PMOS_EVALS_GATEWAY_TOKEN); not asking them", category.name);
         (
@@ -297,6 +379,7 @@ async fn run_and_write(
         decline_phrases: config.decline_phrases.clone(),
         judges,
         judges_skipped,
+        isolation,
     };
     let dir = args.reports_dir.unwrap_or_else(|| root.join("reports"));
     let previous = match previous {
@@ -304,6 +387,17 @@ async fn run_and_write(
         None => latest_report(&dir, &category.name).map_err(anyhow::Error::msg)?,
     };
     let report = run_category(&r.rt, &r.url, &category, &opts).await;
+    if let (Some(out), Some(sink)) = (
+        args.label_candidates.as_ref(),
+        opts.judges.as_ref().and_then(|j| j.labels.as_ref()),
+    ) {
+        let lines = std::mem::take(&mut *sink.lock().unwrap_or_else(|p| p.into_inner()));
+        let written = judge::write_candidates(out, &report.date, &category.name, &lines)
+            .with_context(|| format!("writing label candidates into {}", out.display()))?;
+        for (path, n) in written {
+            eprintln!("label candidates: {n} in {}", path.display());
+        }
+    }
     let path = pmos_evals::report::write_with(
         &dir,
         &report,
@@ -459,10 +553,18 @@ fn check(root: &Path, category: Option<String>, content: &Path) -> Result<bool> 
                     }
                 }
                 used.push((format!("judges/{}.yaml", j.name), j.failure_mode.clone()));
-                let n = load_labels(root, &j).map(|l| l.len()).unwrap_or(0);
+                let labels = load_labels(root, &j).unwrap_or_default();
+                let n = labels.iter().filter(|l| l.label.answer().is_some()).count();
+                let count = |h: judge::Human| labels.iter().filter(|l| l.label == h).count();
+                let (unknown, pending) =
+                    (count(judge::Human::Unknown), count(judge::Human::Pending));
+                let extra = match (unknown, pending) {
+                    (0, 0) => String::new(),
+                    _ => format!(" ({unknown} labelled unknown, {pending} waiting for a person)"),
+                };
                 let cal = load_calibration(root, &j).ok().flatten();
                 println!(
-                    "judge {}: {n} labels, {}",
+                    "judge {}: {n} labels{extra}, {}",
                     j.name,
                     judge::status(&j, cal.as_ref()).reason
                 );
@@ -655,6 +757,37 @@ async fn real_main(cli: Cli) -> Result<bool> {
         }
         Command::Judge {
             command:
+                JudgeCommand::Pack {
+                    name,
+                    from,
+                    per_judge,
+                },
+        } => {
+            let judges = load_judges(&root).map_err(|e| anyhow::anyhow!(e.join("\n")))?;
+            let chosen: Vec<_> = judges
+                .into_iter()
+                .filter(|j| name.as_ref().is_none_or(|n| &j.name == n))
+                .collect();
+            if chosen.is_empty() {
+                bail!("no judge `{}`", name.unwrap_or_default());
+            }
+            for j in chosen {
+                let p = judge::pack(&root, &j, &from, per_judge).map_err(anyhow::Error::msg)?;
+                println!(
+                    "{}: added {} line(s) to {} ({} the judge said no to, {} yes, {} unknown; {} already there), each waiting for a person's label",
+                    j.name,
+                    p.no + p.yes + p.unknown,
+                    j.labels_path(&root).display(),
+                    p.no,
+                    p.yes,
+                    p.unknown,
+                    p.already
+                );
+            }
+            Ok(true)
+        }
+        Command::Judge {
+            command:
                 JudgeCommand::Calibrate {
                     name,
                     gateway,
@@ -669,40 +802,52 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 );
             };
             let labels = load_labels(&root, &j).map_err(anyhow::Error::msg)?;
-            if labels.is_empty() {
+            if !labels.iter().any(|l| l.label.answer().is_some()) {
+                let pending = labels
+                    .iter()
+                    .filter(|l| l.label == judge::Human::Pending)
+                    .count();
                 bail!(
-                    "{}: no labels yet; add {{input, output, label}} lines first",
+                    "{}: no labels yet ({pending} line(s) waiting for a person); a person sets `label` to true, false or \"unknown\" first (docs/evals.md, Labelling a judge)",
                     j.labels_path(&root).display()
                 );
             }
             let Some(gw) = gateway.gateway() else {
                 bail!("no gateway: set PMOS_GATEWAY_URL and PMOS_EVALS_GATEWAY_TOKEN (the `evals` client's token in PMOS_GATEWAY_TOKENS)");
             };
-            let mut verdicts = Vec::new();
+            let mut replies = Vec::new();
             for (i, l) in labels.iter().enumerate() {
+                // Only labels a person answered yes or no are asked about.
+                if l.label.answer().is_none() {
+                    replies.push(judge::Reply::Unparsed);
+                    continue;
+                }
                 let v = gw
                     .ask(&j, &l.input, &l.output)
                     .await
                     .map_err(|e| anyhow::anyhow!("label {}: {e}", i + 1))?;
-                verdicts.push(v);
+                replies.push(v);
             }
-            let truth: Vec<bool> = labels.iter().map(|l| l.label).collect();
+            let truth: Vec<judge::Human> = labels.iter().map(|l| l.label).collect();
             let date = date.unwrap_or_else(|| Utc::now().date_naive());
-            let cal = judge::calibrate(&j, date, &truth, &verdicts);
+            let cal = judge::calibrate(&j, date, &truth, &replies);
             let path = j.calibration_path(&root);
             std::fs::write(&path, serde_json::to_string_pretty(&cal)? + "\n")
                 .with_context(|| format!("writing {}", path.display()))?;
             let rate =
                 |r: Option<f64>| r.map(|x| format!("{x:.2}")).unwrap_or_else(|| "n/a".into());
             println!(
-                "{}: n {} ({} yes, {} no), TPR {}, TNR {}, {} unparsed",
+                "{}: n {} ({} yes, {} no), TPR {}, TNR {}, {} unparsed ({} unknown); left out: {} labelled unknown, {} not labelled yet",
                 j.name,
                 cal.n,
                 cal.positives,
                 cal.negatives,
                 rate(cal.tpr),
                 rate(cal.tnr),
-                cal.unparsed
+                cal.unparsed,
+                cal.judge_unknown,
+                cal.labels_unknown,
+                cal.labels_pending
             );
             println!("{}", judge::status(&j, Some(&cal)).reason);
             println!("wrote {}", path.display());

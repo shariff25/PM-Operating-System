@@ -10,8 +10,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::client::{status, Runtime, RuntimeTask, TraceEntry};
-use crate::grade::{draft_text, grade, Grade};
-use crate::judge::{Gateway, Judge, JudgeStatus, JudgeVerdict};
+use crate::grade::{draft_text, grade, Check, Grade};
+use crate::isolate::Isolation;
+use crate::judge::{Gateway, Human, Judge, JudgeStatus, JudgeVerdict, Label, Reply};
 use crate::outcome::Outcome;
 use crate::report::{Report, TaskReport, TurnReport};
 use crate::spec::{resolve_bot, Category, EvalTask, Expect};
@@ -163,6 +164,38 @@ pub struct JudgeRun {
     pub gateway: Gateway,
     /// Each judge that applies to the category, and whether it blocks.
     pub judges: Vec<(Judge, JudgeStatus)>,
+    /// Collects a labelling-pack line (label still empty) for every attempt a judge answered,
+    /// with what it saw and said (`--label-candidates`); `None`: nothing is kept.
+    pub labels: Option<LabelSink>,
+}
+
+/// Labelling-pack lines, by judge name, from one run.
+pub type LabelSink = Arc<std::sync::Mutex<Vec<(String, Label)>>>;
+
+/// What a labelling-pack line shows as the input: [`judge_input`], but with every Slack tool
+/// result left out, because labels are kept in the repository and hold no Slack text
+/// (`docs/evals.md`, LLM judges).
+pub fn judge_input_for_labels(ask: &str, trace: Option<&[TraceEntry]>) -> String {
+    let kept: Vec<TraceEntry> = trace
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| {
+            let tool = e.body["tool"]
+                .as_str()
+                .or_else(|| e.body["name"].as_str())
+                .unwrap_or_default();
+            !(e.kind == "tool_result" && tool.starts_with("slack."))
+        })
+        .cloned()
+        .collect();
+    let dropped = trace.map_or(0, |t| t.len()) - kept.len();
+    let mut s = judge_input(ask, Some(&kept));
+    if dropped > 0 {
+        s.push_str(&format!(
+            "\n\n({dropped} Slack tool result(s) left out of this label: labels hold no Slack text.)"
+        ));
+    }
+    s
 }
 
 /// Options for [`run_category`].
@@ -183,6 +216,10 @@ pub struct RunOptions {
     pub judges: Option<JudgeRun>,
     /// Why judges that apply aren't asked, recorded in the report.
     pub judges_skipped: Option<String>,
+    /// A fresh tool server for every attempt, in lanes ([`crate::isolate`]). `None`: every
+    /// attempt goes to the one runtime given, and its tool server keeps what earlier attempts
+    /// left (their pending drafts too).
+    pub isolation: Option<Isolation>,
 }
 
 /// At most this much of each tool result, and of all of them, goes to a judge.
@@ -252,6 +289,8 @@ struct TurnRequest<'a> {
     expect: Option<&'a Expect>,
     /// What the judges are shown as the request; `None`: they aren't asked.
     judge_ask: Option<&'a str>,
+    /// Where a labelling-pack line comes from: `<task> run <n>`.
+    label_from: &'a str,
 }
 
 /// Run one request: follow it, read its drafts when `expect` checks them, grade it, read the
@@ -270,6 +309,7 @@ async fn run_turn(
         ask,
         expect,
         judge_ask,
+        label_from,
     } = req;
     let mut outcome = follow_turn(
         rt,
@@ -330,22 +370,42 @@ async fn run_turn(
             .as_deref()
             .is_some_and(|t| t.iter().any(|e| e.kind == "tool_result"));
         for (judge, status) in &j.judges {
-            let (verdict, error) = if judge.needs_sources && !has_sources {
+            let (reply, error) = if judge.needs_sources && !has_sources {
                 (
                     None,
                     Some("no tool results in the trace to judge against".to_string()),
                 )
             } else {
                 match j.gateway.ask(judge, &input, &output).await {
-                    Ok(Some(v)) => (Some(v), None),
-                    Ok(None) => (None, Some("the reply was neither yes nor no".to_string())),
+                    Ok(r @ (Reply::Yes | Reply::No)) => (Some(r), None),
+                    Ok(Reply::Unknown) => (
+                        Some(Reply::Unknown),
+                        Some("the judge said unknown: not enough to decide".to_string()),
+                    ),
+                    Ok(Reply::Unparsed) => (
+                        None,
+                        Some("the reply was neither yes, no nor unknown".to_string()),
+                    ),
                     Err(e) => (None, Some(e)),
                 }
             };
+            if let (Some(sink), Some(r)) = (&j.labels, reply) {
+                sink.lock().unwrap_or_else(|p| p.into_inner()).push((
+                    judge.name.clone(),
+                    Label {
+                        input: judge_input_for_labels(judge_ask, outcome.trace.as_deref()),
+                        output: output.clone(),
+                        label: Human::Pending,
+                        from: Some(label_from.to_string()),
+                        judge_said: Some(r.word().to_string()),
+                    },
+                ));
+            }
             verdicts.push(JudgeVerdict {
                 name: judge.name.clone(),
-                verdict,
+                verdict: reply.and_then(Reply::verdict),
                 blocking: status.blocking,
+                unknown: reply == Some(Reply::Unknown),
                 error,
             });
         }
@@ -370,11 +430,13 @@ async fn attempt(
     if task.is_thread() {
         return attempt_thread(rt, bot, level, persona, task, repeat, opts).await;
     }
+    let from = format!("{} run {repeat}", task.id);
     let req = TurnRequest {
         conversation: None,
         ask: &task.ask,
         expect: Some(&task.expect),
         judge_ask: Some(&task.ask),
+        label_from: &from,
     };
     let r = run_turn(rt, bot, level, persona, req, opts).await;
     let tag = (!r.grade.passed()).then(|| tag_failure(&r.outcome, &r.grade));
@@ -459,11 +521,13 @@ async fn attempt_thread(
             continue;
         }
         let judge_ask = (i == last).then(|| thread_judge_ask(task, last));
+        let from = format!("{} run {repeat}, turn {n}", task.id);
         let req = TurnRequest {
             conversation: Some(&conversation),
             ask: &turn.ask,
             expect: turn.expect.as_ref(),
             judge_ask: judge_ask.as_deref(),
+            label_from: &from,
         };
         let r = run_turn(rt, bot, level, persona, req, opts).await;
         let tag = (!r.grade.passed()).then(|| {
@@ -531,9 +595,46 @@ async fn attempt_thread(
     }
 }
 
+/// The line for an attempt that never started because its lane couldn't get a fresh tool
+/// server: a harness failure (`harness/runtime-unreachable`), like a runtime that can't be
+/// reached, so it never counts as the bot's.
+fn not_started(task: &EvalTask, repeat: u32, error: String) -> TaskReport {
+    let outcome = Outcome {
+        runtime_error: Some(error.clone()),
+        ..Outcome::default()
+    };
+    let grade = Grade {
+        failures: vec![Check::Runtime { error }],
+    };
+    let tag = tag_failure(&outcome, &grade);
+    TaskReport {
+        id: task.id.clone(),
+        ask: task.first_ask().to_string(),
+        repeat,
+        cluster: Some(task.cluster()),
+        regression: task.regression,
+        task_id: None,
+        status: None,
+        passed: false,
+        failures: grade.failures,
+        tag: Some(tag),
+        queue_secs: None,
+        total_secs: None,
+        attempts: 0,
+        trace_read: false,
+        judges: Vec::new(),
+        turns: Vec::new(),
+        failed_turn: None,
+    }
+}
+
 /// Run every task of a category `opts.repeats` times (at most `concurrency` at once), grade
 /// and tag each attempt, and return the report. Lines are in the category's order, each
 /// task's repeats together.
+///
+/// With `opts.isolation`, each attempt instead takes a lane of its own, gets a fresh tool
+/// server there first, and runs on that lane's runtime (`rt` is not used); as many attempts
+/// run at once as there are lanes, and `concurrency` is not used.
 pub async fn run_category(
     rt: &Runtime,
     runtime_url: &str,
@@ -550,32 +651,58 @@ pub async fn run_category(
         .cloned()
         .collect();
     let limit = Arc::new(Semaphore::new(opts.concurrency.max(1)));
+    let lanes = opts.isolation.as_ref().map(|i| (i.clone(), i.pool()));
     let mut set = JoinSet::new();
     // The first run of every task goes first, so a short timeout still covers each task once.
     for repeat in 1..=repeats {
         for (i, task) in tasks.iter().cloned().enumerate() {
             let rt = rt.clone();
             let limit = limit.clone();
+            let lanes = lanes.clone();
             let bot = bot.clone();
             let level = category.level.clone();
             let persona = category.persona.clone();
             let opts = opts.clone();
             set.spawn(async move {
-                let _permit = limit
-                    .acquire_owned()
-                    .await
-                    .expect("the semaphore is never closed");
-                let line = attempt(
-                    &rt,
-                    &bot,
-                    level.as_deref(),
-                    persona.as_deref(),
-                    &task,
-                    repeat,
-                    &opts,
-                )
-                .await;
-                (i * repeats as usize + (repeat as usize - 1), line)
+                let slot = i * repeats as usize + (repeat as usize - 1);
+                let run_on = |rt: Runtime| {
+                    let (bot, level, persona, task, opts) = (&bot, &level, &persona, &task, &opts);
+                    async move {
+                        attempt(
+                            &rt,
+                            bot,
+                            level.as_deref(),
+                            persona.as_deref(),
+                            task,
+                            repeat,
+                            opts,
+                        )
+                        .await
+                    }
+                };
+                let line = match lanes {
+                    Some((isolation, pool)) => {
+                        // Held until the attempt is graded, so no other attempt shares the
+                        // lane's tool server.
+                        let lane = pool.take().await;
+                        match (isolation.fresh)(lane.n).await {
+                            Ok(()) => run_on(isolation.lanes[lane.n - 1].clone()).await,
+                            Err(e) => not_started(
+                                &task,
+                                repeat,
+                                format!("no fresh tool server for lane {}: {e}", lane.n),
+                            ),
+                        }
+                    }
+                    None => {
+                        let _permit = limit
+                            .acquire_owned()
+                            .await
+                            .expect("the semaphore is never closed");
+                        run_on(rt).await
+                    }
+                };
+                (slot, line)
             });
         }
     }
@@ -584,6 +711,10 @@ pub async fn run_category(
         let (i, line) = joined.expect("a task runner never panics");
         lines[i] = Some(line);
     }
+    let runtime_url = match &opts.isolation {
+        Some(i) => i.urls.join(", "),
+        None => runtime_url.to_string(),
+    };
     Report {
         category: category.name.clone(),
         bot,
@@ -591,11 +722,12 @@ pub async fn run_category(
         started_at,
         finished_at: Utc::now(),
         pass_bar: category.pass_bar,
-        runtime_url: runtime_url.to_string(),
+        runtime_url,
         requested_by: opts.requested_by.clone(),
         gateway_workarounds: opts.gateway_workarounds.clone(),
         note: opts.note.clone(),
         repeats,
+        isolation: opts.isolation.as_ref().map(Isolation::describe),
         judges: opts
             .judges
             .as_ref()

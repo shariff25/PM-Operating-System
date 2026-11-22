@@ -130,6 +130,7 @@ fn opts(timeout_ms: u64) -> RunOptions {
         decline_phrases: vec!["don't answer".into()],
         judges: None,
         judges_skipped: None,
+        isolation: None,
     }
 }
 
@@ -411,6 +412,8 @@ async fn cli_run_history_and_check() {
                 .env_remove("PMOS_EVALS_TOKEN")
                 .env_remove("PMOS_BOTS_URL")
                 .env_remove("PMOS_EVALS_AS")
+                .env_remove("PMOS_EVALS_LANES")
+                .env_remove("PMOS_EVALS_FRESH_CMD")
                 .env("PMOS_GATEWAY_WORKAROUNDS", "off")
                 .output()
                 .unwrap()

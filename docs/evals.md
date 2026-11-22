@@ -47,6 +47,9 @@ client `evals`. For each task, `repeats` times, it:
 | Gateway, for judges | `--gateway-url` | `PMOS_GATEWAY_URL` | none: judges aren't asked |
 | Gateway token, client `evals` | `--gateway-token` | `PMOS_EVALS_GATEWAY_TOKEN` | none |
 | Content root, for `check` and `affected` | `--content` | | `content` |
+| Isolated attempts: each lane's runtime (`run`, `gate`) | `--lanes` (comma-separated) | `PMOS_EVALS_LANES` | none: not isolated |
+| Isolated attempts: the fresh command | `--fresh-cmd` | `PMOS_EVALS_FRESH_CMD` | none |
+| Keep labelling-pack candidates (`run`, `gate`) | `--label-candidates <dir>` | | none |
 
 **Tokens and identity:**
 - **The `evals` token.** Add `evals=<token>` to the runtime's `PMOS_BOTS_TOKENS`.
@@ -80,6 +83,7 @@ client `evals`. For each task, `repeats` times, it:
 | `pmos-evals compare <report> <report>` | Compares two runs of one category, task by task | 0 |
 | `pmos-evals history --category docs-qa` | Has the bar been met two weeks in a row? | 0 yes, 1 no (or no bar) |
 | `pmos-evals judge calibrate <name>` | Runs a judge over its labels and writes `<name>.calibration.json` | 0 written, 2 no labels or no gateway |
+| `pmos-evals judge pack [<name>] --from <dir> [--per-judge 20]` | Adds a labelling pack, picked from a run's `--label-candidates`, to each judge's labels file, every label empty (see **Labelling a judge**) | 0 |
 | `pmos-evals affected [--changed <file>]` | Lists the categories a change affects, from changed paths on stdin | 0 |
 | `pmos-evals load --tasks 5` | The load test | 0 if every task finished, 1 if not (`--enforce-targets`: also 1 on a missed latency target) |
 
@@ -143,24 +147,81 @@ gateway. Prompts leave the machine, so it runs on the fake fixtures only.
 `PMOS_TEST_EVALS=1` sets it up the way `deploy/compose.evals.yaml` does:
 - `evals`, `ben` and `cy` join the seed (`pm` only), so the tool server gives `evals` every
   offered persona (`chief`, `sprout`, `echo`) and the persona categories pass the team check;
-- a personal bot `pm-evals`, with `PMOS_TEST_EVALS_WORKERS` workers (default 1, at most 8);
+- a personal bot `pm-evals`, with `PMOS_TEST_EVALS_WORKERS` workers on the main runtime
+  (default 1, at most 8);
+- `PMOS_TEST_EVALS_LANES` isolated lanes (default 1, at most 8; `0` for none), each with a
+  fresh tool server before every attempt (see **Isolated attempts** below);
 - runtime clients `evals` and `console` (the trace reader), `PMOS_EVALS_AS=evals`, and
   assertions off with the development override, as on the eval stack (so it can't be combined
   with `PMOS_TEST_WEB=1`); a gateway client `evals` for the judges;
 - the docs tools on the fake docs fixtures, unless `PMOS_DOCS_BASE_URL` is set.
 
 It writes the runner's settings, with this run's fresh tokens, to `$STATE/evals.env`
-(mode 0600). In a second shell:
+(mode 0600; the lanes and the fresh command too). In a second shell:
 
 ```sh
 set -a; . state/claude-test/evals.env; set +a
-target/debug/pmos-evals run --category jira-draft --concurrency 3 --note "model: <name>"
+target/debug/pmos-evals run --category jira-draft --note "model: <name>"
 ```
 
 The gateway lets one person have two model calls in flight (`limits.per-user`). With another
-provider (`PMOS_TEST_MODEL_URL`) and more than two workers, the script raises that to one call
-per worker, so `--concurrency` up to the number of workers runs in parallel; watch the
+provider (`PMOS_TEST_MODEL_URL`) and more than two lanes or workers, the script raises that to
+one call per lane or worker, whichever is more, so the lanes run in parallel; watch the
 provider's rate limits (`429`s in `$STATE/usage.jsonl`).
+
+**Stopping it.** Ctrl-C in its shell, or `pkill -TERM -f scripts/claude-test-stack.sh` from
+another (a script started in the background ignores `SIGINT`, so `-INT` may do nothing). The
+stop kills every service and the lanes' tool servers, and deletes `evals.env` and the lanes'
+settings file. Check with `ps` that nothing is left.
+
+### Isolated attempts
+Every attempt asks as `evals`, and the tool server keeps what an attempt leaves: a pending
+draft, a memory, a recorded bet. It allows one pending `slack.post_reply` per person and
+message, so without isolation one attempt's draft makes every later attempt on that message
+(a repeat, another task on the thread, another category) get `already_drafted` and fail as
+`model/wrong-draft-count`. E1 found this; nobody decides eval drafts, and no route lets the
+runner clear them. The owner chose (2026-11-22) **a fresh tool server for every attempt**, not
+a new route: nothing about who may create, approve, reject or release drafts changed.
+
+**How it works.**
+- **Lanes.** A lane is one bot runtime with its own docs and `pm-evals` workers and its own tool
+  server, all in memory, on the same content, seed and gateway. On the test stack lane `n` has
+  its tool server on `127.0.0.1:8710 + 100n` and its runtime on `8750 + 100n`.
+- **Before each attempt** the runner takes a free lane and runs the fresh command,
+  `<PMOS_EVALS_FRESH_CMD> <n>` (no shell, nothing but the lane number). On the test stack that
+  is `$STATE/fresh-toolserver`, which runs `scripts/eval-fresh-toolserver.sh`: it stops the
+  lane's tool server (only a `pmos-toolserver` it started), starts a new one with the lane's
+  settings (`$STATE/lanes/toolserver.env`, mode 0600) and exits 0 once `/healthz` answers. The
+  runtime keeps its user directory snapshot across the restart and picks up the new tool server
+  on its next call; each task gets its own tool session, so nothing carries over.
+- **One attempt per lane.** The attempt then runs on that lane's runtime, and no other attempt
+  uses the lane until it is graded (drafts and trace read). A thread is one attempt: its turns
+  share one tool server.
+- **Concurrency is the number of lanes.** `--concurrency` is ignored with `--lanes` (the runner
+  says so). E1 ran 3 to 4 workers; 4 lanes give the same parallelism. In the smoke test the old
+  tool server stopped and the new one listened 0.05 to 0.15 s later, small beside a 30 to 200 s
+  attempt, so isolation costs no measurable concurrency.
+- **A lane that can't get a fresh tool server** (the command fails or takes over 120 s) runs
+  nothing: the attempt fails as `harness/runtime-unreachable`, with the command's last stderr
+  lines, and the lane is tried again for the next attempt.
+- **The report** says how attempts were kept apart (the **Isolation** row, `isolation` in the
+  `.json`), and lists the lanes' runtimes. A report with no isolation says so: its attempts
+  shared one tool server, so a pending draft could change a later attempt (E1's are all so).
+- **Without lanes** (`PMOS_TEST_EVALS_LANES=0`, or `PMOS_EVALS_LANES` unset) the runner works as
+  before, against `--bots-url` with `--concurrency`. Don't use that for categories with Slack
+  replies.
+
+**Checked on the test stack (E2, 2026-11-22):** `slack-reply`'s `answer-sso-question` twice in a
+row on one lane passed 2 of 2 isolated; the same two attempts without isolation passed 1 of 2,
+the second getting `already_drafted`. The tests in `crates/evals/tests/isolation.rs` fail without
+the isolation.
+
+**The eval stack (`deploy/compose.evals.yaml`) is not isolated yet.** Its runner runs in a
+container with no way to restart the tool server container (it has no Docker socket, and
+should not get one), so `pmos-admin evals-run` and `evals-gate` still share one tool server per
+run. Until it gets lanes, a weekly or gate run of `slack-reply` or `chief` on the eval stack
+reads the same defect E1 found; run those on the test stack with lanes, or give each lane its
+own compose project, which this slice did not build.
 
 ## Reading a report
 
@@ -169,10 +230,20 @@ provider's rate limits (`429`s in `$STATE/usage.jsonl`).
 1. **Verdict:** "Met the bar" or "Below the bar", with passed of total, the pass rate and the
    bar. A category with no `pass_bar` says "Reports only". With repeats, the count is of
    attempts ("50 of 60 attempts passed (83%) over 20 tasks run 3 times each").
-   - A table follows: the bot, the runtime, who asked, the declared workaround setting, the
-     note, the run's start and end times, and the **pass rate ± its standard error** (see
-     **Repeats and statistics**).
-   - With repeats, a **pass^k** row: the share of tasks that passed every run.
+   - **Two numbers, two meanings.** The **pass rate** (the average) counts each attempt on its
+     own: passes ÷ attempts. The **all-attempts-pass rate** (pass^k) is the share of tasks where
+     every attempt passed, the stricter number: what a PM who asks k times sees go right every
+     time. With repeats, a line under the verdict gives it ("All attempts passed for 12 of 20
+     tasks (60%)"). The bar is judged on the average only, as before.
+   - **Lost to the model provider or infrastructure.** Attempts tagged `harness/interrupted`
+     (the model endpoint unreachable or busy after the gateway's retries, a restart, the worker
+     or sandbox going away) aren't the bot's answer, so when there are any, a line gives their
+     count and the pass rate without them. They still count as failures for the bar.
+   - A table follows: the bot, the runtime (each lane's, when isolated), who asked, the
+     declared workaround setting, the note, the **isolation**, the run's start and end times,
+     and the **pass rate (the average over attempts) ± its standard error** (see **Repeats and
+     statistics**).
+   - With repeats, an **All attempts passed (pass^k)** row.
    - A **Traces** row appears when some failures were tagged without a trace.
 2. **Failures by tag:** the top bottleneck first ("Top bottleneck: **tool** (3 of 5
    failures)"). Then each tag's failure count and its tasks, by count, ties in the order model,
@@ -184,8 +255,8 @@ provider's rate limits (`429`s in `$STATE/usage.jsonl`).
 4. **Tasks:** with one run per task, one row per task: pass or **FAIL**, the tag (the sub-tag
    when there is one) and the rule that gave it, the final status, and queue and total seconds.
    **Why** lists every failed check. With repeats, one row per task: its passes out of k (in
-   bold unless all passed), the tags its failures got with their counts, and why its latest
-   failure failed.
+   bold unless all passed), **All passed** (yes when every attempt passed), the tags its
+   failures got with their counts, and why its latest failure failed.
 5. **Compared with the previous run:** the paired difference with the category's previous
    report, its 95% interval, and flips (see **Comparing runs**). Absent for a first run.
 6. **Failure details:** for each failed attempt ("run 2 of 3" with repeats), the question, the
@@ -193,7 +264,13 @@ provider's rate limits (`429`s in `$STATE/usage.jsonl`).
    and each failed check.
 
 The `.json` next to it holds the same data, every failed check, tag and judge verdict included,
-one line per attempt (`repeat` numbers them from 1). It holds no answer or draft text.
+one line per attempt (`repeat` numbers them from 1). It holds no answer or draft text. Since
+E2 it also has a `summary`, computed from the lines when written and never read back:
+`attempts`, `passed`, `pass_rate` (the average; the bar uses it), `tasks`,
+`tasks_all_attempts_passed`, `all_attempts_pass_rate`, `infra_losses` (attempts tagged
+`harness/interrupted`), `pass_rate_excluding_infra` (for information), `pass_bar`, `met_bar`,
+and `by_task` (each task's `passes`, `attempts`, `pass_rate`, `all_attempts_passed` and
+`infra_losses`). Reports from before have no `summary` and load as before.
 
 **Old reports** (written before repeats) have one line per task and no `repeats`, `cluster`,
 sub-tags or judges. They load as `repeats: 1`, each task its own cluster, and work with
@@ -220,7 +297,10 @@ answer, where the right answer says so. The answer passes when it contains any o
 `decline_phrases` in `evals/config.yaml` ("don't answer", "couldn't find", "not documented",
 …), compared as text is. A `must_decline` task has no `must_cite`; `check` refuses one that
 does, and refuses `must_decline` tasks when `decline_phrases` is empty. Keep the phrases
-specific to declining: one a normal answer could contain lets a made-up answer pass.
+specific to declining: one a normal answer could contain lets a made-up answer pass. E2 added
+phrases with the docs as their subject ("docs don't have", "documentation doesn't include",
+…), after E1 failed the correct decline "The public docs don't have this"; the test
+`checked_in_decline_phrases_accept_a_plain_decline_and_refuse_an_answer` checks both ways.
 
 **`drafts:`** checks the approval items the task ended with, read from the runtime's
 `GET /v1/tasks/{id}/drafts` (`{drafts: [{id, tool, args, status}]}`). One entry per tool:
@@ -272,7 +352,15 @@ expect:
 - `*` and `` ` `` are dropped (markdown emphasis and code);
 - curly apostrophes become straight ones ("don’t" matches "don't");
 - thousands separators between digits are dropped ("1,800" matches "1800");
+- a decimal's trailing zeros are dropped ("25.0%" matches "25%", "1.70" matches "1.7"), but
+  not in a version or address ("1.0.3", "10.0.0.1");
 - runs of whitespace become one space.
+
+**Numbers are whole** (since E2): a text that starts with a digit doesn't match inside a longer
+number, and one that ends with a digit doesn't match the start of one. So "25%" is not in
+"125%" or "0.25%", "1.7" is not in "1.75" or "11.7", and `must_not_include: ["PM-101"]` is not
+set off by "PM-1012". E1 failed "25.0%" against "25%"; these two rules make equal numbers pass
+and keep different ones failing (`numbers_compare_as_numbers` in `tests/grading.rs`).
 
 ### Threads
 A real PM talks to the bot in a conversation: the bot asks "Who is the user?", the PM answers
@@ -549,17 +637,49 @@ needs_sources: true                    # optional: skip attempts whose trace has
   and 24,000 in all. The output is the answer, then each draft's tool and text. It is asked
   through `POST /v1/chat/completions` at temperature 0 for exactly one word, yes or no, with
   `X-Pmos-Priority: personal`.
-- **Parsing the reply.** Reasoning in `<think>…</think>` is dropped. If the first word is yes
-  or no, that's the verdict; otherwise a reply that says only one of them as a word is that.
-  Anything else is no verdict, and so is a call that fails; neither counts either way.
+- **Unknown is allowed** (since E2). The judge is told to answer yes, no, or unknown, and to say
+  unknown only when what it is shown is not enough to decide, rather than guess.
+- **Parsing the reply.** Reasoning in `<think>…</think>` is dropped. If the first word is yes,
+  no or unknown, that's the reply; otherwise a reply that says only one of them as a word is
+  that. Anything else is no verdict, and so is a call that fails; neither counts either way.
+  Unknown is no verdict too, but the report counts it in its own **Unknown** column (and
+  `unknown: true` on the verdict in the `.json`).
 - **Judges never change a task's pass or fail.** Their verdicts go into the report next to the
   checks, and a blocking judge counts only in the gate.
 
-**Labels** are a JSON-lines file of `{"input": …, "output": …, "label": true|false}`, where
-`label` is a person's answer to the question (`true` is yes, a pass). They are paraphrased like
-case cards: no Slack text. **No labels yet** is an empty file: commit the judge with an empty
+**Labels** are a JSON-lines file of `{"input": …, "output": …, "label": …}`, where `label` is a
+person's answer to the question: `true` (yes, a pass), `false` (no), `"unknown"` (they couldn't
+tell from what is shown), or `null` (a pack line still waiting for a person). The `label` key
+is required. A line may also carry `from` (which task and run it came from) and `judge_said`
+(what the judge said in that run); calibration reads neither. They are paraphrased like case
+cards: no Slack text. **No labels yet** is an empty file: commit the judge with an empty
 `<name>.labels.jsonl`. `check` accepts it and calls the judge advisory, and `judge calibrate`
-refuses to run until there are labels. A missing file is an error.
+refuses to run until a person has answered at least one line yes or no. A missing file is an
+error. `check` prints, per judge, the yes-or-no labels and how many are unknown or waiting.
+
+### Labelling a judge
+Labels must come from a person; nothing in PM OS fills them in.
+1. **Collect candidates** in a run on the test stack (fake fixtures only):
+   `pmos-evals run --category pm-craft --label-candidates <dir outside evals/reports> …`.
+   For every attempt a judge answered, it keeps what the judge saw (with every Slack tool
+   result left out), the output, and what the judge said, with `label: null`, in
+   `<dir>/<date>-<category>-<judge>.jsonl`. These files hold answer text: never commit them.
+2. **Build the pack:** `pmos-evals judge pack --from <dir> --per-judge 20` appends up to 20
+   lines to each judge's `<name>.labels.jsonl`, taking in turn one the judge said no to, one it
+   said yes to and one it said unknown to, so the sample mixes verdicts; lines already in the
+   file are skipped. Read every line before committing: no real Slack text, customer data or
+   token may be in one.
+3. **A person labels** each `null`, following `evals/judges/LABELLING.md`: `true`, `false` or
+   `"unknown"`, deciding from the input and output alone, without looking at `judge_said`.
+4. **Calibrate** with the gateway: `pmos-evals judge calibrate <name>`, and commit the labels
+   and `<name>.calibration.json`. Unknown and unlabelled lines are left out of `n` and the
+   rates (and aren't sent to the judge); the output says how many.
+
+Twenty per judge is a first look, not a calibration: a judge blocks only at 100 labels or more.
+`faithful-to-cited-page` judges `docs-qa`, whose 4 tasks give at most 12 candidates a run, so
+its pack takes more than one run. E1's transcripts could not be used: the runtime kept them in
+memory, and reports hold no answer text, so E2 built the tools and the pack waits for the next
+run.
 
 **Calibration.** `pmos-evals judge calibrate <name>` asks the judge about every label and
 writes `evals/judges/<name>.calibration.json`:
@@ -571,7 +691,9 @@ writes `evals/judges/<name>.calibration.json`:
 ```
 
 - **TPR** (true-positive rate) is how often the judge says yes when the label is yes; **TNR**
-  how often it says no when the label is no. A reply with no verdict counts as wrong.
+  how often it says no when the label is no. A reply with no verdict, unknown included, counts
+  as wrong. `n` counts only labels a person answered yes or no; the file also records
+  `judge_unknown`, `labels_unknown` and `labels_pending`.
 - **`question_sha256`** is the sha256 of the question text, a newline, and the alias.
 - Commit the calibration file with the labels.
 
@@ -911,17 +1033,32 @@ because the load test measures the stack PMs use.
 - **A check "now fails"** in the gate when it fails in every candidate attempt, and "passed in
   the baseline" when it failed in none. A check that fails in only some attempts shows in the
   paired difference instead, so one unlucky run doesn't fail the gate on its own.
-- **Attempts are not isolated: a pending Slack reply blocks the next one (found in E1, open).**
-  Every attempt asks as `evals` on one tool server, and nobody decides eval drafts. The tool
-  server allows one pending `slack.post_reply` per person and message (or thread), so once one
-  attempt drafts a reply, every later attempt that drafts to that message (a repeat, another
-  task on the seed thread, or another category, such as `chief`'s `nudge-on-request` after
-  `slack-reply`) gets `already_drafted`, drafts nothing, and fails as
-  `model/wrong-draft-count`. `slack-reply` and `nudge-on-request` therefore measure nothing
-  after their first draft in a run. No other write tool is deduplicated this way. The runner
-  has no way to clear an attempt's drafts (no client may decide an eval task's drafts), so
-  the fix needs a decision: for example a runtime route for client `evals` that rejects an
-  `eval` task's pending drafts after grading, or a fresh tool server per attempt. Until then,
-  measure those tasks one attempt per fresh stack. E1 did, on the test stack: `slack-reply`
-  passed 20 of 27 attempts that way against 7 of 27 in the shared run, and
+- **The eval stack's attempts are not isolated (open).** The test stack isolates every attempt
+  (**Isolated attempts**, E2); `deploy/compose.evals.yaml` doesn't yet, so on it a pending
+  Slack reply from one attempt still blocks later ones (see that section). E1's numbers for
+  `slack-reply` and `chief`'s `nudge-on-request` in the shared run measure that defect, not the
+  bot: one attempt per fresh stack, `slack-reply` passed 20 of 27 against 7 of 27 shared, and
   `nudge-on-request` 3 of 3 against 0 of 3.
+- **E1's 0-of-3 tasks (E2's reading, 2026-11-22).** E1's transcripts were not kept (the runtime
+  was in memory), and E2 ran no tasks for them, so these causes come from the reports' failed
+  checks, the fixtures, the skills and the roles; confirm each from transcripts in the next
+  run. Every task has a reference answer that passes and a wrong one that fails
+  (`crates/evals/tests/references.rs`).
+  - `chief/week-review-undated` (says PM-101, PM-102, PM-103, ×3): the task matches the
+    `week-review` skill ("show no item from" undated sources), but the `chief-of-staff` role
+    says "a line the tools cannot date is not shown as late or slipping; say what you could
+    not date", which invites naming the undated keys. **The bot's instructions conflict**;
+    proposed change to the role, not made.
+  - `chief/daily-brief-as-chief` (says "call notes", ×3, while the same task in `daily-brief`
+    on Nudge never did): the `daily-brief` skill says skip FYIs, but the role says "separate
+    'needs you' from 'FYI'", which invites an FYI part with Cy's call-notes message. **The
+    bot's instructions conflict**; proposed change to the role, not made.
+  - `slack-reply/triage-skips-fyi-and-bots` (1 or 2 drafts, ×3): **the task was ambiguous.**
+    "Draft replies to anything there" can mean all of #pm-team, where Ben's SAML question is
+    open and needs a reply. The ask now names the two messages; the expectation is unchanged.
+  - `slack-reply/triage-drafts-only-what-needs-an-answer` (a fourth draft, to the
+    `#field-questions` thread that mentions nobody, ×3): the task, the skill (step 1:
+    candidates mention the PM or are DMs) and the spec agree, and the search result shows no
+    mention. **The model's**, as far as the reports show; a comment in the task now says why
+    that thread gets no draft. A one-line clarification in the skill's step 2 ("skip a search
+    result that doesn't mention the PM and isn't a DM") is proposed, not made.

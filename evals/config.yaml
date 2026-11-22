@@ -40,6 +40,22 @@ decline_phrases:
   - "not in the support docs"
   - "not in the public docs"
   - "not publicly documented"
+  # Added in E2 (2026-11-22): E1 failed a correct decline, "The public docs don't have this".
+  # Each names the docs as the subject, so a normal answer rarely says it.
+  - "docs don't have"
+  - "docs do not have"
+  - "docs don't include"
+  - "docs do not include"
+  - "docs don't mention"
+  - "docs do not mention"
+  - "docs don't say"
+  - "docs do not say"
+  - "documentation doesn't have"
+  - "documentation does not have"
+  - "documentation doesn't include"
+  - "documentation does not include"
+  - "documentation doesn't mention"
+  - "documentation does not mention"
 
 # Latency targets for `pmos-evals load`, in seconds, at p50 and p90. Queue time is from task
 # creation until a worker picks it up; total time is from creation until the task settles.

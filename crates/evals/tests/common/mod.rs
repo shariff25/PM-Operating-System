@@ -98,9 +98,32 @@ pub struct Mock {
     pub(crate) last_finish: Mutex<Option<DateTime<Utc>>>,
     pub created: Mutex<Vec<Value>>,
     pub drafts_read: Mutex<Vec<String>>,
+    /// Plays the tool server's one-pending-draft rule (`already_drafted`): once an ask has
+    /// drafted, later creations of it draft nothing (done, no approvals) until [`Mock::fresh`]
+    /// replaces the "tool server".
+    pub one_draft_until_fresh: bool,
+    pub(crate) drafted: Mutex<std::collections::HashSet<String>>,
+    /// How many times [`Mock::fresh`] ran.
+    pub fresh_calls: Mutex<usize>,
 }
 
 impl Mock {
+    /// A fresh "tool server": forgets every draft.
+    pub fn fresh(&self) {
+        self.drafted.lock().unwrap().clear();
+        *self.fresh_calls.lock().unwrap() += 1;
+    }
+
+    /// Each created task's `(created, finish)`, in creation order.
+    pub fn spans(&self) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+        let order = self.order.lock().unwrap();
+        let tasks = self.tasks.lock().unwrap();
+        order
+            .iter()
+            .map(|id| (tasks[id].created, tasks[id].finish))
+            .collect()
+    }
+
     pub fn script(&self, ask: &str, s: Script) {
         self.script_seq(ask, vec![s]);
     }
@@ -204,6 +227,18 @@ async fn create(
             .unwrap_or_default();
         *n += 1;
         s
+    };
+    let script = if m.one_draft_until_fresh && !script.drafts.is_empty() {
+        if m.drafted.lock().unwrap().insert(ask.clone()) {
+            script
+        } else {
+            Script {
+                result: Some("A draft for that message is already waiting.".into()),
+                ..Script::default()
+            }
+        }
+    } else {
+        script
     };
     let created = Utc::now();
     let mut start = created + Duration::milliseconds(script.queue_ms);

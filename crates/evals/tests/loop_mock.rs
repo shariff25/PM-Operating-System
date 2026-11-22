@@ -36,6 +36,7 @@ fn opts() -> RunOptions {
         decline_phrases: vec!["don't answer".into(), "couldn't find".into()],
         judges: None,
         judges_skipped: None,
+        isolation: None,
     }
 }
 
@@ -113,11 +114,11 @@ async fn repeats_run_each_task_k_times_and_report_pass_hat_k() {
         "{md}"
     );
     assert!(
-        md.contains("| pass^3 | 50% (1 of 2 tasks passed every run) |"),
+        md.contains("| All attempts passed (pass^3) | 50% (1 of 2 tasks passed every run) |"),
         "{md}"
     );
     assert!(
-        md.contains("| `flaky` | **2/3** | model/missing-fact ×1 |"),
+        md.contains("| `flaky` | **2/3** | no | model/missing-fact ×1 |"),
         "{md}"
     );
     // One cluster: the standard error falls back to the binomial.
@@ -343,6 +344,7 @@ async fn judges_record_verdicts_without_changing_pass_or_fail() {
     o.judges = Some(JudgeRun {
         gateway: pmos_evals::judge::Gateway::new(&gw_url, GATEWAY_TOKEN),
         judges: vec![(faithful, status)],
+        labels: None,
     });
 
     // Without a console token the trace can't be read, so a judge that needs sources skips.
@@ -371,9 +373,138 @@ async fn judges_record_verdicts_without_changing_pass_or_fail() {
     assert!(user.contains("KMIP uses port 5696"), "the sources: {user}");
     let md = report.to_markdown();
     assert!(
-        md.contains("| `faithful` | advisory: not calibrated | 1 | 1 | 0 |"),
+        md.contains("| `faithful` | advisory: not calibrated | 1 | 1 | 0 | 0 |"),
         "{md}"
     );
+}
+
+/// A judge may answer "unknown"; the report counts it apart. With a label sink the run keeps
+/// a labelling-pack candidate per judged attempt (Slack results left out, label empty), and
+/// `judge::pack` adds a mix of them to the labels file for a person, which `calibrate` then
+/// leaves out until they are labelled.
+#[tokio::test]
+async fn unknown_verdicts_label_candidates_and_the_pack() {
+    let mock = Arc::new(Mock::default());
+    let docs = common::entry(
+        "tool_result",
+        json!({"tool": "docs.read", "content": "KMIP uses port 5696."}),
+    );
+    let slack = common::entry(
+        "tool_result",
+        json!({"tool": "slack.read_thread", "content": "a fixture Slack message"}),
+    );
+    for (ask, answer) in [
+        ("q-good", "KMIP is 5696."),
+        ("q-bad", "KMIP is 443."),
+        ("q-vague", "KMIP is maybe somewhere."),
+    ] {
+        mock.script(
+            ask,
+            Script {
+                result: Some(answer.into()),
+                trace: vec![docs.clone(), slack.clone()],
+                ..Script::default()
+            },
+        );
+    }
+    let url = spawn(mock.clone()).await;
+    let gw = Arc::new(Gateway {
+        reply: Box::new(|user: &str| {
+            let output = user.split("<output>").nth(1).unwrap_or_default();
+            if output.contains("5696") {
+                "yes".into()
+            } else if output.contains("maybe") {
+                "Unknown.".into()
+            } else {
+                "no".into()
+            }
+        }),
+        calls: Mutex::new(Vec::new()),
+    });
+    let gw_url = spawn_gateway(gw.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = |id: &str, ask: &str| {
+        format!("id: {id}\nask: \"{ask}\"\nexpect:\n  must_include: [KMIP]\n")
+    };
+    write_category(
+        dir.path(),
+        "cat",
+        "docs",
+        0.5,
+        &[
+            ("good", yaml("good", "q-good")),
+            ("bad", yaml("bad", "q-bad")),
+            ("vague", yaml("vague", "q-vague")),
+        ],
+    );
+    let category = load_category(dir.path(), "cat").unwrap();
+    let faithful = judge("faithful", true);
+    let status = judge::status(&faithful, None);
+    let sink = pmos_evals::run::LabelSink::default();
+    let mut o = opts();
+    o.judges = Some(JudgeRun {
+        gateway: pmos_evals::judge::Gateway::new(&gw_url, GATEWAY_TOKEN),
+        judges: vec![(faithful.clone(), status)],
+        labels: Some(sink.clone()),
+    });
+    let rt = Runtime::new(&url, TOKEN, Some(CONSOLE_TOKEN));
+    let report = run_category(&rt, &url, &category, &o).await;
+    let v = |id: &str| report.tasks.iter().find(|t| t.id == id).unwrap().judges[0].clone();
+    assert_eq!(v("good").verdict, Some(true));
+    assert_eq!(v("bad").verdict, Some(false));
+    let vague = v("vague");
+    assert_eq!((vague.verdict, vague.unknown), (None, true));
+    assert!(vague.error.unwrap().contains("unknown"));
+    let md = report.to_markdown();
+    assert!(
+        md.contains("| `faithful` | advisory: not calibrated | 1 | 1 | 1 | 0 |"),
+        "{md}"
+    );
+    // The judge is told it may say unknown.
+    let calls = gw.calls.lock().unwrap().clone();
+    assert!(calls[0]["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("yes, no, or unknown"));
+
+    let lines = sink.lock().unwrap().clone();
+    assert_eq!(lines.len(), 3);
+    for (name, l) in &lines {
+        assert_eq!(name, "faithful");
+        assert_eq!(l.label, judge::Human::Pending);
+        assert!(l.input.contains("KMIP uses port 5696."), "{}", l.input);
+        assert!(!l.input.contains("a fixture Slack message"), "{}", l.input);
+        assert!(
+            l.input.contains("Slack tool result(s) left out"),
+            "{}",
+            l.input
+        );
+    }
+    let said: Vec<_> = lines
+        .iter()
+        .map(|(_, l)| l.judge_said.clone().unwrap())
+        .collect();
+    assert!(said.contains(&"unknown".to_string()));
+
+    // The candidates on disk, then the pack: two lines, one the judge said no to and one yes.
+    let root = dir.path();
+    let cands = root.join("candidates");
+    let written = judge::write_candidates(&cands, &report.date, "cat", &lines).unwrap();
+    assert_eq!(written.len(), 1);
+    std::fs::create_dir_all(root.join("judges")).unwrap();
+    std::fs::write(root.join("judges/faithful.labels.jsonl"), "").unwrap();
+    let packed = judge::pack(root, &faithful, &cands, 2).unwrap();
+    assert_eq!((packed.no, packed.yes, packed.unknown), (1, 1, 0));
+    let labels = judge::load_labels(root, &faithful).unwrap();
+    assert_eq!(labels.len(), 2);
+    assert!(labels.iter().all(|l| l.label == judge::Human::Pending));
+    // Packing again adds the one left, never a line already there.
+    let again = judge::pack(root, &faithful, &cands, 20).unwrap();
+    assert_eq!(
+        (again.no, again.yes, again.unknown, again.already),
+        (0, 0, 1, 2)
+    );
+    assert_eq!(judge::load_labels(root, &faithful).unwrap().len(), 3);
 }
 
 fn cli(root: &Path, args: &[&str], stdin: Option<&str>) -> std::process::Output {
@@ -386,6 +517,8 @@ fn cli(root: &Path, args: &[&str], stdin: Option<&str>) -> std::process::Output 
         .env_remove("PMOS_EVALS_TOKEN")
         .env_remove("PMOS_BOTS_URL")
         .env_remove("PMOS_EVALS_AS")
+        .env_remove("PMOS_EVALS_LANES")
+        .env_remove("PMOS_EVALS_FRESH_CMD")
         .env_remove("PMOS_GATEWAY_URL")
         .env_remove("PMOS_EVALS_GATEWAY_TOKEN")
         .env_remove("PMOS_EVALS_BASELINE_REF")
@@ -730,16 +863,23 @@ async fn cli_judge_calibration_decides_blocking() {
         );
         lines.push('\n');
     }
+    // Plus a line a person marked unknown and two still waiting: neither counts.
+    lines.push_str("{\"input\": \"qu\", \"output\": \"Port 443.\", \"label\": \"unknown\"}\n");
+    lines.push_str("{\"input\": \"qp1\", \"output\": \"Port 443.\", \"label\": null, \"from\": \"t run 1\", \"judge_said\": \"no\"}\n");
+    lines.push_str("{\"input\": \"qp2\", \"output\": \"Port 5696.\", \"label\": null}\n");
     std::fs::write(judges.join("faithful.labels.jsonl"), lines).unwrap();
     let mut args = vec!["judge", "calibrate", "faithful", "--date", "2026-11-15"];
     args.extend(gw_args);
+    let calls_before = gw.calls.lock().unwrap().len();
     let cal = cli_async(root, &args, None).await;
     assert_eq!(cal.status.code(), Some(0), "{}", out(&cal));
     assert!(
-        out(&cal).contains("n 120 (60 yes, 60 no), TPR 0.90, TNR 1.00, 0 unparsed"),
+        out(&cal).contains("n 120 (60 yes, 60 no), TPR 0.90, TNR 1.00, 0 unparsed (0 unknown); left out: 1 labelled unknown, 2 not labelled yet"),
         "{}",
         out(&cal)
     );
+    // Only the 120 answered labels were put to the judge.
+    assert_eq!(gw.calls.lock().unwrap().len() - calls_before, 120);
     assert!(out(&cal).contains("blocking: n 120"), "{}", out(&cal));
     let written: judge::Calibration = serde_json::from_str(
         &std::fs::read_to_string(judges.join("faithful.calibration.json")).unwrap(),
@@ -754,7 +894,9 @@ async fn cli_judge_calibration_decides_blocking() {
 
     let check = cli_async(root, &["check", "--content", "missing"], None).await;
     assert!(
-        out(&check).contains("judge faithful: 120 labels, blocking"),
+        out(&check).contains(
+            "judge faithful: 120 labels (1 labelled unknown, 2 waiting for a person), blocking"
+        ),
         "{}",
         out(&check)
     );

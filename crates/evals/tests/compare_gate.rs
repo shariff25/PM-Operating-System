@@ -54,6 +54,7 @@ fn report(date: &str, tasks: &[(&str, Option<&str>, &[bool])]) -> Report {
         repeats,
         judges: vec![],
         judges_skipped: None,
+        isolation: None,
         tasks: tasks
             .iter()
             .flat_map(|(id, c, runs)| {
@@ -350,6 +351,7 @@ fn judged(mut r: Report, task: &str, verdict: bool, blocking: bool) -> Report {
             name: "faithful".into(),
             verdict: Some(if l.id == task { verdict } else { true }),
             blocking,
+            unknown: false,
             error: None,
         }];
     }
