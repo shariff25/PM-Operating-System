@@ -797,11 +797,23 @@ written to the reports directory as by `run`, and its path goes to stderr.
 relative to the repository root) on stdin or from `--changed <file>`, and prints the affected
 categories, one per line:
 - a change under `evals/`, or to `deploy/gateway.yaml`, affects every category;
-- otherwise a category is affected when the change is under its bot's directory
-  (`content/bots/<bot>/`), its role's (`content/roles/<role>/`), or a directory of a skill the
-  role runs (`content/skills/<skill>/`). For `bot: personal` the bot is `pm-<handle>` for the
-  `--as` handle (default `runner.requested_by`); with no such `BOT.md`, its role is
-  `pm-assistant`, the role every personal bot is made from.
+- so does any change under `content/roles/`, `content/skills/` or `content/bots/` (since
+  2026-11-23, the owner's decision): a change tuned for one bot can regress another's
+  behaviour, and skills are shared across personas. Before, only the categories whose bot's
+  directory (`content/bots/<bot>/`), role (`content/roles/<role>/`) or role's skills
+  (`content/skills/<skill>/`) the change touched ran;
+- any other change (`content/context/`, `content/templates/`, `content/playbooks/`, the code)
+  affects none.
+
+For a content change it still resolves each category's bot, role and skills, and exits 2 if
+one doesn't (a broken `BOT.md` or `ROLE.md`), rather than gate a broken bot. For `bot: personal`
+the bot is `pm-<handle>` for the `--as` handle (default `runner.requested_by`); with no such
+`BOT.md`, its role is `pm-assistant`, the role every personal bot is made from.
+
+**The cost.** A full run is every task times its repeats: 103 tasks × 3 = 309 attempts on
+2026-11-23. On the eval stack, which makes one model call at a time, at the 30 to 200 s an
+attempt took on the test stack, that is roughly 3 to 17 hours (an estimate, not measured), for
+every pull request that touches a role, a skill or a bot.
 
 In CI, `deploy/pmos-admin evals-gate` puts these together (see **CI** below).
 
@@ -1099,8 +1111,8 @@ docs pages. Like them, it is marked "seed: replace with case cards", has the sta
 - **Clusters.** Tasks that exercise one skill share a `cluster` (`decision-doc`,
   `experiment-design`, `ai-feature-spec`, `prd-draft`), so the standard error treats them as
   related.
-- **The gate.** `pmos-evals affected` lists `pm-craft` for a change under `evals/`, the
-  `pm-assistant` role or any of its skills. A change to only `content/playbooks/`,
+- **The gate.** `pmos-evals affected` lists `pm-craft`, with every other category, for a
+  change under `evals/`, `content/roles/`, `content/skills/` or `content/bots/`. A change to only `content/playbooks/`,
   `content/templates/`, `content/reviewers/` or `content/context/exemplars/` doesn't trigger
   the gate, though every pm-craft skill reads them. Run the category by hand after one
   (`deploy/pmos-admin evals-run --category pm-craft --note "…"`).
@@ -1146,8 +1158,8 @@ case cards", have the starting bar (`pass_bar: 0.8`) and run each task three tim
 - **Structure, not judgment.** Two advisory judges read for the argument: `says-what-stops`
   (Staff) and `business-effect-as-range` (Principal). Until calibrated they are reported and
   nothing more.
-- **The gate.** As for `pm-craft`: `pmos-evals affected` lists both categories for a change
-  under `evals/`, the `pm-assistant` role or any of its skills.
+- **The gate.** As for `pm-craft`: `pmos-evals affected` lists both categories, with every
+  other, for a change under `evals/`, `content/roles/`, `content/skills/` or `content/bots/`.
 - **Running them** needs the stack on the fake connectors, the `stats.*`, `jira.rollup` and
   `bets.*` tools, and a member whose personal bot runs the new skills.
 
@@ -1187,6 +1199,11 @@ case cards", have the starting bar (`pass_bar: 0.8`) and run each task three tim
 - **Where:** a self-hosted runner on the Spark (labels `self-hosted, pmos-spark`), where the
   runtime, the worker and the models are. PRs from forks never run there. Registering the
   runner is in `docs/runbooks/upgrade.md`.
+  **The runner's home is to be decided:** the label is from the earlier Spark plan, and the
+  owner dropped the Spark as a target on 2026-11-22. Wherever it moves, it must be a host the
+  improver's sandbox cannot reach. The workflow keeps the label until then, and its
+  `timeout-minutes` (240) predates running every category: a full run on the eval stack can
+  outlast it.
 - **What:** the Spark's own `/opt/pmos/deploy/pmos-admin evals-gate --checkout pr --base
   origin/<base branch>`. The workflow runs on `pull_request_target` and checks the PR's head
   out into `pr/` as data: nothing in it is run, and the stack uses the Spark's installed

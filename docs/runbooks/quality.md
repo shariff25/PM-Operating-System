@@ -141,9 +141,16 @@ calibrated judge can fail the eval gate.
 ## Reading the eval gate's result
 
 A pull request that changes a role, a skill, a bot, the evals or the gateway's model config
-runs the eval gate on the Spark. Its summary is the job summary of the "Eval gate" check (or,
-until the runner is registered, pasted into the PR by a platform owner). One section per
-affected category:
+runs the eval gate. Since 2026-11-23 every one of these runs **every category**, not only
+the categories of the bot whose files changed (owner's decision): a change tuned for one bot
+can regress another, and skills are shared across personas. So a one-line skill edit costs a
+full run, every task times its repeats (103 tasks × 3 = 309 attempts on 2026-11-23), and a PR
+that touches only `content/context/`, `content/templates/` or `content/playbooks/` runs none
+(run the categories that read them by hand). The workflow still names the Spark's
+self-hosted runner label (`pmos-spark`) from the earlier plan; where the runner lives is to be
+decided, since the Spark is no longer a target. Its summary is the job summary of the "Eval
+gate" check (or, until a runner is registered, pasted into the PR by a platform owner). One
+section per category:
 
 - **"passed" or "FAILED"**, then the baseline (the category's latest report on `main`) and the
   candidate (this PR's run).

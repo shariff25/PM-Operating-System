@@ -196,9 +196,21 @@ with `edit_distance ≥ PMOS_TRIAGE_MIN_EDIT` (default 0.3).
 - `deploy/gateway.yaml`.
 
 It runs on a **self-hosted runner on the Spark** (labels `self-hosted, pmos-spark`) with
-`deploy/pmos-admin evals-gate`. That runs `pmos-evals gate` for every category whose bot's role
-or skills changed, or all of them for gateway and evals changes, then posts the markdown as the
-job summary.
+`deploy/pmos-admin evals-gate`. That runs `pmos-evals gate` for **every category** whenever any
+of those paths changed, then posts the markdown as the job summary.
+
+- **Why every category (owner, 2026-11-23).** Before, a role, skill or bot change ran only the
+  categories whose bot's role or skills it touched. A change tuned for one bot can regress
+  another's behaviour, skills are shared across personas, and edits don't add up cleanly
+  (`docs/research/frontier-labs-self-improving-agents.md`, "What PM OS should change, by
+  phase"). A change elsewhere (`content/context/`, `content/templates/`, the code) still runs
+  none. `pmos-evals affected` makes the selection (`crates/evals/src/affected.rs`).
+- **The cost.** A full run is every task times its repeats: 103 tasks × 3 = 309 attempts on
+  2026-11-23, one model call at a time on the eval stack, for every PR that touches a role, a
+  skill or a bot.
+- **The runner's home is to be decided.** The `pmos-spark` label is from the earlier Spark plan;
+  the owner dropped the Spark as a target on 2026-11-22. Wherever the runner moves, it must be
+  a host the improver's sandbox cannot reach. The label is unchanged until that is decided.
 
 **Registering the runner** is in `docs/runbooks/upgrade.md`. Until a runner is registered, the
 job waits; a platform owner runs `pmos-admin evals-gate` by hand and pastes the result into the

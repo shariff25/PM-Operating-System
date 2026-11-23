@@ -1,8 +1,18 @@
 name: Eval gate
 
 # The eval gate (docs/evals.md, "The gate"): a change to a bot's role, skills or bot file, to
-# the evals, or to the gateway's model config must not make the benchmarks worse. It runs on
-# the Spark, where the runtime, the worker and the models are; registering that runner is in
+# the evals, or to the gateway's model config must not make the benchmarks worse. Every one of
+# these paths runs every category (owner, 2026-11-23; `pmos-evals affected`): a change tuned
+# for one bot can regress another, and skills are shared across personas. A full run is every
+# task times its repeats (103 tasks x 3 = 309 attempts on 2026-11-23), one model call at a time
+# on the eval stack, which can outlast `timeout-minutes` below.
+#
+# RUNNER TO BE DECIDED: the `pmos-spark` label below is from the earlier Spark plan. The owner
+# dropped the Spark as a deployment target on 2026-11-22, so where this runner lives is still
+# to be decided (docs/evals.md, "CI"); it must be a host the improver's sandbox cannot reach.
+# The label is left as it is until then. The rest of this comment describes the Spark setup.
+#
+# It runs on the Spark, where the runtime, the worker and the models are; registering that runner is in
 # docs/runbooks/upgrade.md. Until one is registered this job waits in the queue, and a platform
 # owner runs `deploy/pmos-admin evals-gate` by hand and pastes the result into the PR.
 #
