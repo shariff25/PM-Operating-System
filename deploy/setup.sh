@@ -44,6 +44,21 @@ if [[ "$CLONE" =~ ^[A-Za-z][A-Za-z0-9+.-]*://[^/@]*@ ]]; then
   exit 2
 fi
 
+# What is removed however the script stops (an error, Ctrl-C, a kill; the review of eb49991): a
+# new deploy/.env not yet renamed into place (fill) and the mkdir lock. A signal becomes an exit,
+# so the EXIT trap runs for it too.
+ENV_TMP=""
+ENV_LOCK_DIR=""
+cleanup() {
+  [ -z "$ENV_TMP" ] || rm -f -- "$ENV_TMP"
+  [ -z "$ENV_LOCK_DIR" ] || rmdir -- "$ENV_LOCK_DIR" 2>/dev/null || true
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 ok() { printf '  \033[32mok\033[0m   %s\n' "$1"; }
 warn() { printf '  \033[33mwarn\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mfail\033[0m %s\n' "$1"; exit 1; }
@@ -76,6 +91,11 @@ fi
 ok "$CONTENT"
 OWNER_UID=$(stat -c %u "$CONTENT")
 OWNER_GID=$(stat -c %g "$CONTENT")
+# The services and the bots' bring-up and eval workers run as the checkout's owner (PMOS_UID and
+# PMOS_GID): a root-owned checkout would make them root (the review of eb49991, T3).
+if [ "$OWNER_UID" = 0 ] || [ "$OWNER_GID" = 0 ]; then
+  fail "$CONTENT is owned by root (uid $OWNER_UID, gid $OWNER_GID), and the services and the bots' workers run as the checkout's owner, so they would run as root. Give it to a service account, then run this again: sudo useradd --system --no-create-home --shell /usr/sbin/nologin pmos; sudo chown -R pmos:pmos $CONTENT"
+fi
 
 echo "== state directories"
 mkdir -p "$STATE"/{audit,usage,slack} "$DEPLOY/backups"
@@ -83,13 +103,22 @@ chown -R "$OWNER_UID:$OWNER_GID" "$STATE" 2>/dev/null || warn "couldn't chown $S
 ok "$STATE (owned by $OWNER_UID:$OWNER_GID, the checkout's owner)"
 
 echo "== deploy/.env"
-# Under the same lock as pmos-admin (deploy/.env.lock), so the two never change it at once.
+# Under the same lock as pmos-admin (deploy/.env.lock with flock; where flock isn't installed,
+# the directory deploy/.env.lock.d, made by mkdir, which either makes it or fails, atomically),
+# so the two never change it at once.
 if command -v flock >/dev/null; then
   (umask 077 && : >>"$DEPLOY/.env.lock")
   exec 9>>"$DEPLOY/.env.lock"
   flock -w 60 9 || fail "another setup.sh or pmos-admin has been changing deploy/.env for a minute: try again"
 else
-  warn "flock isn't installed: don't run pmos-admin add-bot while this runs"
+  waited=0
+  until mkdir -- "$DEPLOY/.env.lock.d" 2>/dev/null; do
+    [ "$waited" -lt 60 ] ||
+      fail "another setup.sh or pmos-admin has been changing deploy/.env for a minute (flock isn't installed). If none is running (one was killed), remove the lock and try again: rmdir $DEPLOY/.env.lock.d"
+    sleep 1
+    waited=$((waited + 1))
+  done
+  ENV_LOCK_DIR="$DEPLOY/.env.lock.d"
 fi
 # Made private before it holds anything (umask), then kept so.
 [ -f "$ENV" ] || { (umask 077 && cp "$DEPLOY/env.example" "$ENV"); ok "created from env.example"; }
@@ -126,22 +155,37 @@ fill() {
     return 0
   fi
   tmp=$(mktemp "$DEPLOY/.env.XXXXXX")
+  ENV_TMP=$tmp
+  # The value (the vault key, a password, a token) reaches awk through its environment, never
+  # its command line (`-v`), where every account on this machine can read it in
+  # /proc/<pid>/cmdline while awk runs (the review of eb49991, T1); printf is a builtin.
   if ! {
     if ! grep -qE "^$key=" "$ENV"; then
       cat "$ENV" >"$tmp" && printf '%s=%s\n' "$key" "$value" >>"$tmp"
     else
-      awk -v k="$key" -v v="$value" -F= 'BEGIN{OFS="="} $1==k{print k, v; next} {print}' "$ENV" >"$tmp"
+      FILL_VALUE=$value awk -v k="$key" -F= 'BEGIN{OFS="="} $1==k{print k, ENVIRON["FILL_VALUE"]; next} {print}' "$ENV" >"$tmp"
     fi
   }; then
-    rm -f "$tmp"
-    fail "couldn't write deploy/.env; it is unchanged"
+    fail "couldn't write deploy/.env; it is unchanged" # cleanup removes the new file
   fi
   replace_env "$tmp"
+  ENV_TMP=""
 }
 fill PMOS_CONTENT_CHECKOUT "$CONTENT"
 fill PMOS_STATE_DIR "$STATE"
 fill PMOS_UID "$OWNER_UID"
 fill PMOS_GID "$OWNER_GID"
+# A value kept from an earlier run (an older setup.sh wrote 0 for a root-owned checkout): only a
+# number other than 0 is taken (pmos-admin refuses anything else too).
+for k in PMOS_UID PMOS_GID; do
+  v=$(grep -E "^$k=" "$ENV" | head -1 | cut -d= -f2- || true)
+  [[ "$v" =~ ^\"(.*)\"$ || "$v" =~ ^\'(.*)\'$ ]] && v=${BASH_REMATCH[1]}
+  case "$v" in
+    '' | *[!0123456789]*) fail "$k=$v in deploy/.env isn't a number: set it to the checkout's owner ($OWNER_UID:$OWNER_GID)" ;;
+  esac
+  [ ${#v} -le 10 ] && [ $((10#$v)) != 0 ] ||
+    fail "$k=$v in deploy/.env: the services and the bots' workers would run as root (or root's group). Set PMOS_UID=$OWNER_UID and PMOS_GID=$OWNER_GID (the checkout's owner) in deploy/.env, then run this again"
+done
 for k in PMOS_POSTGRES_PASSWORD PMOS_DB_TOOLSERVER_PASSWORD PMOS_DB_BOTS_PASSWORD PMOS_DB_DOCS_PASSWORD; do
   fill "$k" "$(password)"
 done

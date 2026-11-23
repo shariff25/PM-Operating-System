@@ -18,6 +18,11 @@
 #   else stops; deploy/.env's mode and owner are checked; it is rewritten by a rename, under a
 #   lock, keeping its ACL; `revoke`, `smoke`, `logs` and `restart` take only a handle, a known
 #   provider or a known service; setup.sh refuses a clone URL with credentials in it.
+# - from the review of eb49991: no value written to deploy/.env reaches awk's (or any recorded
+#   tool's) arguments, from pmos-admin or setup.sh (T1); `pause` never reads deploy/.env, so one
+#   the caller can't read doesn't stop it (T2); a PMOS_UID or PMOS_GID of 0 is refused, and
+#   setup.sh refuses a root-owned checkout (T3); `pause` always tries the unit and names it when
+#   refusing root; without flock, an mkdir lock; an interrupted write leaves deploy/.env as it was.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)/deploy/pmos-admin"
@@ -136,6 +141,19 @@ case "$*" in
 esac
 EOF
 chmod +x "$WORK/bin/curl"
+# Stand-ins for the tools pmos-admin and setup.sh run on deploy/.env and its values: each records
+# its arguments (ARGV_LOG, "<tool> <arguments>" per call), then runs the real one. Only on the
+# PATH of the runs that check them. No secret may be among those arguments (the review of
+# eb49991, T1: awk got every bot's tokens, the vault key and the database passwords).
+ARGV_BIN="$WORK/argv"
+mkdir -p "$ARGV_BIN"
+for t in awk grep cut tr sed cat head mv cp chmod chown getfacl setfacl mktemp rm rmdir mkdir stat date \
+  openssl flock sleep ls; do
+  real=$(command -v "$t") || continue
+  printf '#!/bin/sh\nprintf "%%s %%s\\n" %s "$*" >>"${ARGV_LOG:-/dev/null}"\nexec %s "$@"\n' "$t" "$real" >"$ARGV_BIN/$t"
+done
+chmod +x "$ARGV_BIN"/*
+export ARGV_LOG="$WORK/argv.log"
 export DOCKER_LOG="$WORK/docker.log" DOCKER_ENV_LOG="$WORK/docker-env.log"
 export CURL_LOG="$WORK/curl.log" CURL_CONFIG_LOG="$WORK/curl-config.log" CURL_BODY_LOG="$WORK/curl-body.log"
 stack_env() { # mode [extra lines...]
@@ -161,6 +179,7 @@ stack_env() { # mode [extra lines...]
   : >"$CURL_LOG"
   : >"$CURL_CONFIG_LOG"
   : >"$CURL_BODY_LOG"
+  : >"$ARGV_LOG"
 }
 stack=("$WORK/stack/deploy/pmos-admin")
 run_stack() { PATH="$WORK/bin:$PATH" "${stack[@]}" "$@"; }
@@ -402,6 +421,37 @@ run_stack up >/dev/null 2>&1 || code=$?
 [ "$code" = 2 ] || fail "a line that isn't KEY=VALUE exits $code, not 2"
 [ ! -e "$WORK/pwned4" ] && [ ! -s "$DOCKER_LOG" ] || fail "a line that isn't KEY=VALUE ran or started something"
 
+# --- The containers never run as root (the review of eb49991, T3) ----------------------------
+# PMOS_UID or PMOS_GID of 0 (a root-owned checkout), or not a number: every command that starts
+# a container refuses before docker runs; `down` warns and stops the stack; `pause` never reads
+# the file. A real id, or none (the images' default), starts.
+for bad in PMOS_UID=0 PMOS_GID=0 PMOS_UID=00 PMOS_UID=abc PMOS_UID=-1 "PMOS_GID=10 01" PMOS_UID=12345678901; do
+  stack_env require "$bad"
+  for cmd in up "up --web" "add-bot scout" "evals run" "users list" lint "restart bots"; do
+    code=0
+    # shellcheck disable=SC2086
+    out=$(run_stack $cmd </dev/null 2>&1) || code=$?
+    [ "$code" = 2 ] || fail "$cmd with $bad exits $code, not 2"
+    [[ "$out" == *"${bad%%=*}="* ]] || fail "$cmd with $bad doesn't name the setting: $out"
+  done
+  [ ! -s "$DOCKER_LOG" ] || fail "a command with $bad called docker: $(cat "$DOCKER_LOG")"
+  grep -q '^PMOS_RT_WORKER_TOKENS=$' "$WORK/stack/deploy/.env" || fail "add-bot with $bad wrote tokens"
+  out=$(run_stack down 2>&1) || fail "down with $bad failed: $out"
+  [[ "$out" == *"WARNING: ${bad%%=*}="* ]] || fail "down with $bad didn't warn: $out"
+  grep -q ' down$' "$DOCKER_LOG" || fail "down with $bad didn't stop the stack"
+done
+stack_env require PMOS_UID=0
+out=$(run_stack up 2>&1) || true
+[[ "$out" == *"would run as root"* && "$out" == *"chown -R pmos:pmos"* ]] || fail "PMOS_UID=0 isn't explained: $out"
+# The same from the caller's environment (Compose prefers it to deploy/.env).
+stack_env require
+code=0
+PMOS_UID=0 run_stack up >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] && [ ! -s "$DOCKER_LOG" ] || fail "PMOS_UID=0 from the environment wasn't refused ($code)"
+stack_env require PMOS_UID=1000 PMOS_GID=1000
+run_stack up >/dev/null || fail "up with PMOS_UID=1000 was refused"
+grep -q ' up -d' "$DOCKER_LOG" || fail "up with PMOS_UID=1000 didn't start"
+
 # --- The eval gate's base is a revision, never an option (slice H0) --------------------------
 for base in --output=x -x ""; do
   code=0
@@ -435,10 +485,30 @@ done
 cp "$DEPLOY_SRC/env.example" "$WORK/setup/deploy/env.example"
 mkdir -p "$WORK/setup-content/.git" "$WORK/setup-content/content"
 : >"$WORK/setup-content/content/tools.yaml"
-setup_run() { PATH="$WORK/bin:$PATH" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" --state "$WORK/setup-state"; }
+# A root-owned checkout is refused (T3, below): when these checks run as root, it gets another owner.
+if [ "$(id -u)" = 0 ]; then chown -R 4321:4321 "$WORK/setup-content"; fi
+# With the argument-recording stand-ins (ARGV_LOG) first on its PATH.
+setup_run() { PATH="$ARGV_BIN:$WORK/bin:$PATH" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" --state "$WORK/setup-state"; }
+: >"$ARGV_LOG"
 setup_run >/dev/null 2>&1 || fail "setup.sh failed: $(setup_run 2>&1 | tail -5)"
 senv="$WORK/setup/deploy/.env"
 [ "$(stat -c %a "$senv")" = 600 ] || fail "setup.sh's deploy/.env isn't 0600"
+# No secret it wrote reached a command line (T1): the vault key, the database passwords, every
+# token and assertion key went to awk (a value env.example has as `generated`) or printf only.
+grep -q '^awk .*\$1==k{print k, ' "$ARGV_LOG" || fail "setup.sh's awk didn't run through the stand-in"
+setup_secrets_not_in_args() {
+  local line k v n=0
+  while IFS= read -r line; do
+    k=${line%%=*}
+    v=${line#*=}
+    case "$k" in *TOKEN | *PASSWORD | *SECRET | *_KEY | PMOS_AK_*) ;; *) continue ;; esac
+    [ -n "$v" ] && [ "$v" != generated ] || continue
+    n=$((n + 1))
+    ! grep -qF -- "$v" "$ARGV_LOG" || fail "setup.sh put $k on a command line"
+  done <"$senv"
+  [ "$n" -ge 20 ] || fail "setup.sh wrote only $n secrets"
+}
+setup_secrets_not_in_args
 grep -qE '^PMOS_SERVICE_TOKEN=[0-9a-f]{48}$' "$senv" || fail "setup.sh didn't fill PMOS_SERVICE_TOKEN"
 grep -qx "PMOS_CONTENT_CHECKOUT=$WORK/setup-content" "$senv" || fail "setup.sh didn't write the checkout"
 kept=$(grep '^PMOS_VAULT_KEY=' "$senv")
@@ -454,6 +524,53 @@ grep -qE '^PMOS_SERVICE_TOKEN=[0-9a-f]{48}$' "$senv" || fail "setup.sh didn't fi
 [ "$(grep '^PMOS_VAULT_KEY=' "$senv")" = "$kept" ] || fail "setup.sh replaced a real value"
 [ "$(stat -c %a "$senv")" = 600 ] || fail "setup.sh's deploy/.env isn't 0600 after a fill"
 [ -z "$(find "$WORK/setup/deploy" -maxdepth 1 -name '.env.??????')" ] || fail "setup.sh left a temporary file"
+setup_secrets_not_in_args
+# Stopped (a kill, Ctrl-C) while the new deploy/.env is written: the new file is removed and
+# deploy/.env is as it was (the review of eb49991). The stand-in mv sends TERM to setup.sh.
+mkdir -p "$WORK/killmv"
+printf '#!/bin/sh\nkill -TERM "$PPID"\nexit 1\n' >"$WORK/killmv/mv"
+chmod +x "$WORK/killmv/mv"
+sed -i 's/^PMOS_SERVICE_TOKEN=.*/PMOS_SERVICE_TOKEN=generated/' "$senv"
+cp "$senv" "$WORK/setup-env.before"
+code=0
+PATH="$WORK/killmv:$WORK/bin:$PATH" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" \
+  --state "$WORK/setup-state" >/dev/null 2>&1 || code=$?
+[ "$code" = 143 ] || fail "setup.sh stopped by TERM exits $code, not 143"
+cmp -s "$WORK/setup-env.before" "$senv" || fail "setup.sh stopped by TERM changed deploy/.env"
+[ -z "$(find "$WORK/setup/deploy" -maxdepth 1 -name '.env.??????')" ] || fail "setup.sh stopped by TERM left its new deploy/.env"
+setup_run >/dev/null 2>&1 || fail "setup.sh failed after a stopped run"
+# A root-owned checkout (T3): refused before the state directories or deploy/.env are made. The
+# stand-in stat gives the checkout's owner as root (uid, or gid).
+mkdir -p "$WORK/rootstat" "$WORK/setup2/deploy"
+cp "$DEPLOY_SRC/setup.sh" "$DEPLOY_SRC/env.example" "$WORK/setup2/deploy/"
+cat >"$WORK/rootstat/stat" <<EOF
+#!/bin/sh
+case "\$1 \$2 \$3" in
+  "-c %u $WORK/setup-content") echo "\${FAKE_OWNER_UID:-4321}"; exit 0 ;;
+  "-c %g $WORK/setup-content") echo "\${FAKE_OWNER_GID:-4321}"; exit 0 ;;
+esac
+exec $(command -v stat) "\$@"
+EOF
+chmod +x "$WORK/rootstat/stat"
+for owner in FAKE_OWNER_UID=0 FAKE_OWNER_GID=0; do
+  code=0
+  out=$(env "$owner" PATH="$WORK/rootstat:$WORK/bin:$PATH" bash "$WORK/setup2/deploy/setup.sh" \
+    --content "$WORK/setup-content" --state "$WORK/setup2-state" 2>&1) || code=$?
+  [ "$code" = 1 ] && [[ "$out" == *"is owned by root"* && "$out" == *"chown -R pmos:pmos"* ]] ||
+    fail "setup.sh with a root-owned checkout ($owner) wasn't refused ($code): $out"
+  [ ! -e "$WORK/setup2/deploy/.env" ] && [ ! -e "$WORK/setup2-state" ] ||
+    fail "setup.sh with a root-owned checkout ($owner) wrote deploy/.env or the state"
+done
+# A PMOS_UID or PMOS_GID of 0 (or not a number) kept in deploy/.env from an earlier run: refused.
+cp "$senv" "$WORK/setup-env.good"
+for bad in PMOS_UID=0 PMOS_GID=0 PMOS_UID=000 PMOS_UID=x1 'PMOS_UID="0"'; do
+  sed -i "s/^${bad%%=*}=.*/$bad/" "$senv"
+  code=0
+  out=$(setup_run 2>&1) || code=$?
+  [ "$code" = 1 ] && [[ "$out" == *"${bad%%=*}="* ]] || fail "setup.sh kept $bad ($code): $out"
+  cp "$WORK/setup-env.good" "$senv"
+done
+setup_run >/dev/null 2>&1 || fail "setup.sh failed after the PMOS_UID checks"
 
 # --- Bot names, token lookup, `--from` and the worker unit (slice H0) ------------------------
 # Stand-ins for openshell, systemctl, loginctl and id (only on this PATH, so `users` above still
@@ -649,17 +766,58 @@ out=$(FAKE_UID=0 run_bot pause pm-ana 2>&1) || code=$?
 [ "$code" = 1 ] || fail "pause as root exits $code, not 1"
 [[ "$out" == *"not as root"* && "$out" == *"openshell sandbox stop -n pmos-pm-ana"* ]] ||
   fail "pause as root doesn't say how to pause: $out"
+# ... naming the real unit, not a placeholder (the review of eb49991).
+[[ "$out" == *"systemctl --user disable --now 'pmos-worker@pm\x2dana.service'"* && "$out" != *"<systemd-escape"* ]] ||
+  fail "pause as root doesn't name the unit: $out"
 [ ! -s "$OPENSHELL_LOG" ] && [ ! -s "$SYSTEMCTL_LOG" ] || fail "pause as root stopped something"
-# No unit installed for this user: said plainly, the sandbox stopped all the same, exit 1.
+# No unit template under this caller's XDG_CONFIG_HOME: the unit is disabled and stopped all the
+# same (the user's systemd may have it from elsewhere; the review of eb49991), and the sandbox.
 rm -rf "$XDG_CONFIG_HOME"
+out=$(run_bot pause pm-ana 2>&1) || fail "pause with the unit installed elsewhere failed: $out"
+[ "$(cat "$SYSTEMCTL_LOG")" = '--user disable --now pmos-worker@pm\x2dana.service' ] ||
+  fail "pause without the template under XDG_CONFIG_HOME didn't try the unit: $(cat "$SYSTEMCTL_LOG")"
+[ "$(cat "$OPENSHELL_LOG")" = "args=sandbox stop -n pmos-pm-ana worker= gateway=" ] ||
+  fail "pause without the template under XDG_CONFIG_HOME didn't stop the sandbox"
+# No unit installed at all (systemctl fails, as it does for a unit that doesn't exist): said
+# plainly, the sandbox stopped all the same, exit 1.
+: >"$OPENSHELL_LOG"
+: >"$SYSTEMCTL_LOG"
 code=0
-out=$(run_bot pause pm-ana 2>&1) || code=$?
+out=$(FAKE_SYSTEMCTL_FAIL=1 run_bot pause pm-ana 2>&1) || code=$?
 [ "$code" = 1 ] || fail "pause with no unit installed exits $code, not 1"
 [[ "$out" == *"no worker unit is installed for pmosop"* && "$out" == *"pgrep -af 'openshell sandbox exec -n pmos-pm-ana'"* ]] ||
   fail "pause with no unit doesn't say so: $out"
 [ "$(cat "$OPENSHELL_LOG")" = "args=sandbox stop -n pmos-pm-ana worker= gateway=" ] ||
   fail "pause with no unit didn't stop the sandbox"
-[ ! -s "$SYSTEMCTL_LOG" ] || fail "pause with no unit called systemctl"
+[ "$(cat "$SYSTEMCTL_LOG")" = '--user disable --now pmos-worker@pm\x2dana.service' ] ||
+  fail "pause with no unit didn't try the unit: $(cat "$SYSTEMCTL_LOG")"
+# A deploy/.env the caller can't read (root's, mode 0600, after `sudo deploy/setup.sh`; the
+# review of eb49991, T2): pause never reads it, so it still stops the unit and the sandbox. Root
+# reads every file, so as root this runs pause as nobody (setpriv), with what it needs opened up.
+bot_env
+run_bot resume pm-ana >/dev/null
+: >"$OPENSHELL_LOG"
+: >"$SYSTEMCTL_LOG"
+envf="$WORK/stack/deploy/.env"
+code=0
+if [ "$(/usr/bin/id -u)" != 0 ]; then
+  chmod 000 "$envf"
+  out=$(run_bot pause pm-ana 2>&1) || code=$?
+  chmod 600 "$envf"
+elif command -v setpriv >/dev/null; then
+  chmod 711 "$WORK" "$WORK/stack" "$WORK/stack/deploy"
+  chmod 755 "$SBIN"
+  chmod 666 "$OPENSHELL_LOG" "$SYSTEMCTL_LOG"
+  out=$(PATH="$SBIN:$WORK/bin:$PATH" setpriv --reuid=65534 --regid=65534 --clear-groups "${stack[@]}" pause pm-ana 2>&1) || code=$?
+  chmod 700 "$WORK" "$WORK/stack" "$WORK/stack/deploy" "$SBIN"
+else
+  fail "these checks run as root and setpriv isn't installed to run pause as another user"
+fi
+[ "$code" = 0 ] || fail "pause with an unreadable deploy/.env exits $code: $out"
+[ "$(cat "$SYSTEMCTL_LOG")" = '--user disable --now pmos-worker@pm\x2dana.service' ] ||
+  fail "pause with an unreadable deploy/.env didn't stop the unit: $(cat "$SYSTEMCTL_LOG")"
+[ "$(cat "$OPENSHELL_LOG")" = "args=sandbox stop -n pmos-pm-ana worker= gateway=" ] ||
+  fail "pause with an unreadable deploy/.env didn't stop the sandbox: $(cat "$OPENSHELL_LOG")"
 # The sandbox can't be stopped: said, exit 1, after the unit was stopped.
 run_bot resume pm-ana >/dev/null
 : >"$SYSTEMCTL_LOG"
@@ -680,7 +838,12 @@ for broken in "not an assignment" "MODE644" "MISSING"; do
   : >"$OPENSHELL_LOG"
   : >"$DOCKER_LOG"
   out=$(run_bot pause pm-ana 2>&1) || fail "pause with deploy/.env $broken failed: $out"
-  [[ "$out" == *WARNING* ]] || fail "pause with deploy/.env $broken didn't warn: $out"
+  if [ "$broken" = "not an assignment" ]; then
+    # pause never reads the file (T2), so it has no line to complain about.
+    [[ "$out" != *"isn't KEY=VALUE"* ]] || fail "pause read deploy/.env: $out"
+  else
+    [[ "$out" == *WARNING* ]] || fail "pause with deploy/.env $broken didn't warn: $out"
+  fi
   [ "$(cat "$OPENSHELL_LOG")" = "args=sandbox stop -n pmos-pm-ana worker= gateway=" ] ||
     fail "pause with deploy/.env $broken didn't stop the sandbox"
   if [ "$broken" != MISSING ]; then
@@ -732,10 +895,11 @@ tok_env() {
     "PMOS_RT_EVALS_TOKEN=evl0SECRET0123456789abcdef0123456789abcdef" \
     "HTTPS_PROXY=http://proxyuser:prx0SECRET@proxy.example:3128" "$@"
 }
-no_secret_in_args() { # what ran: no SECRET in the arguments curl, docker and openshell got (the
-  # docker and openshell logs also record some of their environment, which may hold one)
+no_secret_in_args() { # what ran: no SECRET in the arguments curl, docker, openshell and the
+  # recorded tools (awk, grep, …: ARGV_LOG) got (the docker and openshell logs also record some
+  # of their environment, which may hold one)
   local args
-  args=$(cat "$CURL_LOG"; sed 's/^.* args=//' "$DOCKER_LOG"; sed 's/^args=//; s/ worker=.*$//' "$OPENSHELL_LOG")
+  args=$(cat "$CURL_LOG" "$ARGV_LOG"; sed 's/^.* args=//' "$DOCKER_LOG"; sed 's/^args=//; s/ worker=.*$//' "$OPENSHELL_LOG")
   [[ "$args" != *SECRET* ]] || fail "$1 put a token on a command line: $(grep SECRET <<<"$args")"
 }
 tok_env
@@ -785,11 +949,43 @@ run_bot sandbox pm-ana >/dev/null || fail "sandbox with new providers failed"
 grep -qx 'args=provider create --name pmos-pm-ana-gateway --type pmos-gateway --credential PMOS_GATEWAY_TOKEN worker= gateway=gw0SECRET1' "$OPENSHELL_LOG" ||
   fail "a missing provider wasn't created: $(cat "$OPENSHELL_LOG")"
 no_secret_in_args sandbox
-# A token curl's config can't hold as it is: refused before curl runs.
-tok_env 'PMOS_SERVICE_TOKEN=abc"def'
-code=0
-run_stack reindex >/dev/null 2>&1 || code=$?
-[ "$code" = 2 ] && [ ! -s "$CURL_LOG" ] || fail "a token with a quote reached curl ($code)"
+# add-bot: the whole token lists (every bot's tokens) and the new tokens reach awk through its
+# environment, never its arguments (the review of eb49991, T1).
+tok_env "PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt0SECRET1" "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw0SECRET1"
+PATH="$ARGV_BIN:$SBIN:$WORK/bin:$PATH" "${stack[@]}" add-bot scout >/dev/null || fail "add-bot scout failed"
+grep -q '^awk .*\$1==k{print k, ' "$ARGV_LOG" || fail "add-bot's awk didn't run through the stand-in"
+grep -qE '^PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt0SECRET1,worker-scout=[0-9a-f]{48}$' "$WORK/stack/deploy/.env" &&
+  grep -qE '^PMOS_GW_BOT_TOKENS=bot-pm-ana=gw0SECRET1,bot-scout=[0-9a-f]{48}$' "$WORK/stack/deploy/.env" ||
+  fail "add-bot didn't keep the old tokens and add the new ones"
+no_secret_in_args add-bot
+for k in PMOS_RT_WORKER_TOKENS PMOS_GW_BOT_TOKENS; do
+  # (stack_env's deploy/.env has each list twice, blank then set: set_env rewrites both lines.)
+  new=$(sed -n "s/^$k=.*-scout=//p" "$WORK/stack/deploy/.env" | head -1)
+  [ ${#new} = 48 ] && ! grep -qF -- "$new" "$ARGV_LOG" || fail "add-bot put scout's new token from $k on a command line"
+done
+# A token curl's config can't hold as it is: refused before curl runs. A quote, a backslash or a
+# carriage return in deploy/.env; a line feed from the caller's environment (deploy/.env's lines
+# can't hold one).
+for bad in 'abc"def' 'abc\def' 'abc\' $'abc\rdef'; do
+  tok_env "PMOS_SERVICE_TOKEN=$bad"
+  code=0
+  run_stack reindex >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] && [ ! -s "$CURL_LOG" ] || fail "a token $(printf '%q' "$bad") reached curl ($code)"
+  tok_env "PMOS_RT_SLACK_TOKEN=$bad"
+  code=0
+  run_stack smoke ana >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] && [ ! -s "$CURL_LOG" ] || fail "a Slack token $(printf '%q' "$bad") reached curl ($code)"
+done
+bot_env
+for bad in $'abc\ndef' $'abc\rdef' 'abc\def'; do
+  : >"$CURL_LOG"
+  code=0
+  PMOS_SERVICE_TOKEN=$bad run_stack reindex >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] && [ ! -s "$CURL_LOG" ] || fail "a token $(printf '%q' "$bad") from the environment reached curl ($code)"
+  code=0
+  PMOS_RT_SLACK_TOKEN=$bad run_stack smoke ana >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] && [ ! -s "$CURL_LOG" ] || fail "a Slack token $(printf '%q' "$bad") from the environment reached curl ($code)"
+done
 
 # --- revoke, smoke, logs and restart take only what they name (the review of 6bb806f) ---------
 tok_env
@@ -840,14 +1036,30 @@ rm -f "$WORK/env.old"
 if [ "$acl" = 1 ]; then
   getfacl -pn "$envf" 2>/dev/null | grep -q '^user:65534:r--' || fail "add-bot lost deploy/.env's ACL: $(getfacl -p "$envf" 2>&1)"
   [ "$(stat -c %a "$envf")" = 640 ] || fail "deploy/.env with an ACL isn't 640 after add-bot: $(stat -c %a "$envf")"
+  # Without the ACL again, for the mode check below.
   setfacl -b "$envf"
+  chmod 600 "$envf"
+  ln "$envf" "$WORK/env.old"
+  run_bot add-bot scout2 >/dev/null 2>&1 || fail "add-bot scout2 failed"
+  [ "$(stat -c %h "$envf")" = 1 ] || fail "add-bot scout2 rewrote deploy/.env in place, not by a rename"
+  rm -f "$WORK/env.old"
 else
   echo "the ACL check skipped: setfacl isn't installed here, or this filesystem has no ACLs"
 fi
-chmod 600 "$envf"
-[ "$(stat -c %a "$envf")" = 600 ] || fail "deploy/.env isn't 0600 after add-bot"
+# The mode of the file add-bot made (a new file, renamed into place, checked above), as it made it.
+[ "$(stat -c %a "$envf")" = 600 ] || fail "deploy/.env isn't 0600 after add-bot: $(stat -c %a "$envf")"
 [ -e "$WORK/stack/deploy/.env.lock" ] || fail "add-bot took no lock"
 [ -z "$(find "$WORK/stack/deploy" -maxdepth 1 -name '.env.??????')" ] || fail "add-bot left a temporary file"
+# Stopped (a kill, Ctrl-C) while the new deploy/.env is written: the new file is removed and
+# deploy/.env is as it was (the review of eb49991). The stand-in mv sends TERM to pmos-admin.
+bot_env
+cp "$envf" "$WORK/env.before"
+code=0
+PATH="$WORK/killmv:$SBIN:$WORK/bin:$PATH" "${stack[@]}" add-bot scout >/dev/null 2>&1 || code=$?
+[ "$code" = 143 ] || fail "add-bot stopped by TERM exits $code, not 143"
+cmp -s "$WORK/env.before" "$envf" || fail "add-bot stopped by TERM changed deploy/.env"
+[ -z "$(find "$WORK/stack/deploy" -maxdepth 1 -name '.env.??????')" ] || fail "add-bot stopped by TERM left its new deploy/.env"
+[ ! -s "$DOCKER_LOG" ] || fail "add-bot stopped by TERM went on to restart the runtime"
 # Four add-bots at once all keep their tokens.
 bot_env
 pids=()
@@ -860,6 +1072,53 @@ for b in pa pb pc pd; do
   grep -qE "^PMOS_RT_WORKER_TOKENS=.*worker-$b=[0-9a-f]{48}" "$envf" || fail "a concurrent add-bot lost $b's token: $(grep WORKER "$envf")"
   grep -qE "^PMOS_GW_BOT_TOKENS=.*bot-$b=[0-9a-f]{48}" "$envf" || fail "a concurrent add-bot lost $b's gateway token"
 done
+# The same where flock isn't installed (the review of eb49991: there was no lock at all): the
+# mkdir lock, removed afterwards. A PATH of links to every tool on this one but flock.
+NOFLOCK="$WORK/noflock"
+mkdir -p "$NOFLOCK"
+IFS=: read -ra path_dirs <<<"$PATH"
+for d in "${path_dirs[@]}"; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do
+    n=${f##*/}
+    [ "$n" != flock ] && [ -x "$f" ] && [ ! -e "$NOFLOCK/$n" ] || continue
+    ln -s "$f" "$NOFLOCK/$n"
+  done
+done
+! PATH="$NOFLOCK" command -v flock >/dev/null || fail "the PATH without flock has flock"
+bot_env
+rm -f "$WORK/stack/deploy/.env.lock"
+pids=()
+for b in pa pb pc pd; do
+  PATH="$SBIN:$WORK/bin:$NOFLOCK" "${stack[@]}" add-bot "$b" >/dev/null 2>&1 &
+  pids+=($!)
+done
+for p in "${pids[@]}"; do wait "$p" || fail "a concurrent add-bot without flock failed"; done
+for b in pa pb pc pd; do
+  grep -qE "^PMOS_RT_WORKER_TOKENS=.*worker-$b=[0-9a-f]{48}" "$envf" || fail "a concurrent add-bot without flock lost $b's token: $(grep WORKER "$envf")"
+  grep -qE "^PMOS_GW_BOT_TOKENS=.*bot-$b=[0-9a-f]{48}" "$envf" || fail "a concurrent add-bot without flock lost $b's gateway token"
+done
+[ ! -e "$WORK/stack/deploy/.env.lock.d" ] || fail "add-bot without flock left its lock"
+[ ! -e "$WORK/stack/deploy/.env.lock" ] || fail "add-bot without flock used flock's lock file"
+# setup.sh too.
+rm -f "$WORK/setup/deploy/.env.lock"
+sed -i 's/^PMOS_SERVICE_TOKEN=.*/PMOS_SERVICE_TOKEN=generated/' "$senv"
+PATH="$WORK/bin:$NOFLOCK" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" \
+  --state "$WORK/setup-state" >/dev/null 2>&1 || fail "setup.sh without flock failed"
+grep -qE '^PMOS_SERVICE_TOKEN=[0-9a-f]{48}$' "$senv" || fail "setup.sh without flock didn't fill a value"
+[ ! -e "$WORK/setup/deploy/.env.lock.d" ] && [ ! -e "$WORK/setup/deploy/.env.lock" ] ||
+  fail "setup.sh without flock left a lock, or used flock's"
+# ... and it waits while another holds the lock, then goes on once it is released.
+sed -i 's/^PMOS_SERVICE_TOKEN=.*/PMOS_SERVICE_TOKEN=generated/' "$senv"
+mkdir "$WORK/setup/deploy/.env.lock.d"
+PATH="$WORK/bin:$NOFLOCK" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" \
+  --state "$WORK/setup-state" >/dev/null 2>&1 &
+held=$!
+sleep 3
+grep -qx 'PMOS_SERVICE_TOKEN=generated' "$senv" || fail "setup.sh without flock didn't wait for the lock"
+rmdir "$WORK/setup/deploy/.env.lock.d"
+wait "$held" || fail "setup.sh without flock failed after the lock was released"
+grep -qE '^PMOS_SERVICE_TOKEN=[0-9a-f]{48}$' "$senv" || fail "setup.sh without flock didn't go on after the lock was released"
 
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
 if docker compose version >/dev/null 2>&1; then
