@@ -521,7 +521,8 @@ run_stack up >/dev/null 2>&1 || code=$?
 # PMOS_UID or PMOS_GID of 0 (a root-owned checkout), or not a number: every command that starts
 # a container refuses before docker runs; `down` warns and stops the stack; `pause` never reads
 # the file. A real id, or none (the images' default), starts.
-for bad in PMOS_UID=0 PMOS_GID=0 PMOS_UID=00 PMOS_UID=abc PMOS_UID=-1 "PMOS_GID=10 01" PMOS_UID=12345678901; do
+for bad in PMOS_UID=0 PMOS_GID=0 PMOS_UID=00 PMOS_UID=abc PMOS_UID=-1 "PMOS_GID=10 01" PMOS_UID=12345678901 \
+  PMOS_UID=+0 PMOS_UID=0x0 "PMOS_UID= 0" PMOS_UID=root; do
   stack_env require "$bad"
   for cmd in up "up --web" "add-bot scout" "evals run" "users list" lint "restart bots"; do
     code=0
@@ -544,6 +545,24 @@ stack_env require
 code=0
 PMOS_UID=0 run_stack up >/dev/null 2>&1 || code=$?
 [ "$code" = 2 ] && [ ! -s "$DOCKER_LOG" ] || fail "PMOS_UID=0 from the environment wasn't refused ($code)"
+# The commands that start no container as that user (status, logs, backup, reindex, revoke) work
+# with a uid or gid of 0 or a name left by an older install, so an incident isn't blocked; `up`
+# still refuses (above). The five reach docker or curl, so the run is checked, not just the exit.
+for bad in PMOS_UID=0 PMOS_GID=0 PMOS_UID=root; do
+  stack_env require "PMOS_SERVICE_TOKEN=svc0-0123456789abcdef0123456789abcdef" "PMOS_STATE_DIR=$WORK/state-uid" "$bad"
+  for cmd in "revoke ana slack" status "logs bots" reindex backup; do
+    code=0
+    # shellcheck disable=SC2086
+    out=$(run_stack $cmd </dev/null 2>&1) || code=$?
+    [ "$code" = 0 ] || fail "$cmd with $bad exits $code, not 0: $out"
+    [[ "$out" != *"would run as root"* && "$out" != *"isn't a number"* ]] || fail "$cmd with $bad was held up by the uid check: $out"
+  done
+  grep -q -- '-X DELETE http://127.0.0.1:8710/internal/credentials/ana/slack ' "$CURL_LOG" || fail "revoke with $bad didn't call the route"
+  code=0
+  run_stack up >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "up with $bad exits $code, not 2"
+done
+rm -rf "$WORK/stack/deploy/backups"
 stack_env require PMOS_UID=1000 PMOS_GID=1000
 run_stack up >/dev/null || fail "up with PMOS_UID=1000 was refused"
 grep -q ' up -d' "$DOCKER_LOG" || fail "up with PMOS_UID=1000 didn't start"
@@ -955,9 +974,39 @@ for broken in "not an assignment" "MODE644" "MISSING"; do
     done
     [ ! -s "$DOCKER_LOG" ] || fail "a command refused over deploy/.env $broken called docker"
   else
+    # down with no deploy/.env at all: the manual advice, exit 1, nothing read.
+    code=0
+    out=$(run_bot down 2>&1) || code=$?
+    [ "$code" = 1 ] && [[ "$out" == *"docker ps -q --filter label=com.docker.compose.project=pmos | xargs -r docker stop"* ]] ||
+      fail "down with no deploy/.env exits $code, or gives no manual advice: $out"
+    [[ "$out" != *"No such file"* && "$out" != *"Permission denied"* ]] || fail "down with no deploy/.env died on a shell error: $out"
+    [ ! -s "$DOCKER_LOG" ] || fail "down with no deploy/.env called docker"
     mv "$WORK/env.aside" "$WORK/stack/deploy/.env"
   fi
 done
+# down with a deploy/.env the caller can't read (root's, 0600, after a `sudo deploy/setup.sh`):
+# it doesn't die reading it, and when Compose can't read it either, prints the manual advice.
+if [ "$(/usr/bin/id -u)" != 0 ]; then
+  bot_env
+  chmod 000 "$WORK/stack/deploy/.env"
+  code=0
+  out=$(FAKE_DOCKER_FAIL=1 run_bot down 2>&1) || code=$?
+  chmod 600 "$WORK/stack/deploy/.env"
+elif command -v setpriv >/dev/null; then
+  bot_env
+  chmod 711 "$WORK" "$WORK/stack" "$WORK/stack/deploy"
+  chmod 755 "$SBIN" "$WORK/bin"
+  chmod 666 "$DOCKER_LOG" "$DOCKER_ENV_LOG"
+  code=0
+  out=$(FAKE_DOCKER_FAIL=1 PATH="$SBIN:$WORK/bin:$PATH" setpriv --reuid=65534 --regid=65534 --clear-groups "${stack[@]}" down 2>&1) || code=$?
+  chmod 700 "$WORK" "$WORK/stack" "$WORK/stack/deploy" "$SBIN" "$WORK/bin"
+else
+  fail "these checks run as root and setpriv isn't installed to run down as another user"
+fi
+[ "$code" = 1 ] && [[ "$out" == *"docker ps -q --filter label=com.docker.compose.project=pmos | xargs -r docker stop"* ]] ||
+  fail "down with an unreadable deploy/.env exits $code, or gives no manual advice: $out"
+[[ "$out" != *"Permission denied"* ]] || fail "down with an unreadable deploy/.env died on a shell error: $out"
+grep -q ' down$' "$DOCKER_LOG" || fail "down with an unreadable deploy/.env didn't try compose down"
 # down when compose itself can't: says how to stop the containers directly.
 bot_env
 code=0
@@ -1135,16 +1184,44 @@ if [ "$acl" = 1 ]; then
   # Without the ACL again, for the mode check below.
   setfacl -b "$envf"
   chmod 600 "$envf"
-  ln "$envf" "$WORK/env.old"
-  run_bot add-bot scout2 >/dev/null 2>&1 || fail "add-bot scout2 failed"
-  [ "$(stat -c %h "$envf")" = 1 ] || fail "add-bot scout2 rewrote deploy/.env in place, not by a rename"
-  rm -f "$WORK/env.old"
 else
   echo "the ACL check skipped: setfacl isn't installed here, or this filesystem has no ACLs"
 fi
+# A second add-bot, with no ACL: still a rename, whether or not this host has ACLs.
+ln "$envf" "$WORK/env.old"
+run_bot add-bot scout2 >/dev/null 2>&1 || fail "add-bot scout2 failed"
+[ "$(stat -c %h "$envf")" = 1 ] || fail "add-bot scout2 rewrote deploy/.env in place, not by a rename"
+rm -f "$WORK/env.old"
 # The mode of the file add-bot made (a new file, renamed into place, checked above), as it made it.
 [ "$(stat -c %a "$envf")" = 600 ] || fail "deploy/.env isn't 0600 after add-bot: $(stat -c %a "$envf")"
 [ -e "$WORK/stack/deploy/.env.lock" ] || fail "add-bot took no lock"
+# A lock file the caller can't write (root's, 0644, after a `sudo deploy/setup.sh`) doesn't stop
+# add-bot: flock needs only a read-only descriptor.
+bot_env
+lock="$WORK/stack/deploy/.env.lock"
+chmod 644 "$lock"
+if [ "$(/usr/bin/id -u)" != 0 ]; then
+  chmod 444 "$lock"
+  code=0
+  out=$(run_bot add-bot lockbot 2>&1) || code=$?
+  chmod 600 "$lock"
+elif command -v setpriv >/dev/null; then
+  chown 65534:65534 "$WORK/stack/deploy" "$envf"
+  chmod 711 "$WORK" "$WORK/stack"
+  chmod 755 "$WORK/stack/deploy" "$SBIN" "$WORK/bin"
+  chmod 666 "$DOCKER_LOG" "$DOCKER_ENV_LOG" "$OPENSHELL_LOG" "$SYSTEMCTL_LOG"
+  if setpriv --reuid=65534 --regid=65534 --clear-groups sh -c ": >>'$lock'" 2>/dev/null; then
+    fail "the test's lock file is writable by the other account"
+  fi
+  code=0
+  out=$(PATH="$SBIN:$WORK/bin:$PATH" setpriv --reuid=65534 --regid=65534 --clear-groups "${stack[@]}" add-bot lockbot 2>&1) || code=$?
+  chown root:root "$WORK/stack/deploy" "$envf"
+  chmod 700 "$WORK" "$WORK/stack" "$WORK/stack/deploy" "$SBIN" "$WORK/bin"
+else
+  fail "these checks run as root and setpriv isn't installed to run add-bot as another user"
+fi
+[ "$code" = 0 ] || fail "add-bot with a lock file the caller can't write exits $code: $out"
+grep -qE '^PMOS_RT_WORKER_TOKENS=.*worker-lockbot=[0-9a-f]{48}' "$envf" || fail "add-bot with a read-only lock file didn't write its token"
 [ -z "$(find "$WORK/stack/deploy" -maxdepth 1 -name '.env.??????')" ] || fail "add-bot left a temporary file"
 # Stopped (a kill, Ctrl-C) while the new deploy/.env is written: the new file is removed and
 # deploy/.env is as it was (the review of eb49991). The stand-in mv sends TERM to pmos-admin.
@@ -1195,7 +1272,7 @@ cp "$senv" "$WORK/senv.before"
 code=0
 out=$(PATH="$WORK/bin:$NOFLOCK" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" \
   --state "$WORK/setup-state" 2>&1) || code=$?
-[ "$code" != 0 ] && [[ "$out" == *"flock (util-linux) isn't installed"* ]] || fail "setup.sh without flock exits $code: $out"
+[ "$code" != 0 ] && [[ "$out" == *"flock is not installed"* ]] || fail "setup.sh without flock exits $code: $out"
 cmp -s "$WORK/senv.before" "$senv" || fail "setup.sh without flock changed deploy/.env"
 
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------

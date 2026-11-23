@@ -24,6 +24,8 @@ x-service: &service
   init: true
   networks: [pmos]
   # The content checkout's owner; never root (pmos-admin and setup.sh refuse a uid or gid of 0).
+  # Compose itself does not: a direct `docker compose up` accepts PMOS_UID=0 or a name, so
+  # deploy/pmos-admin is the gate. Start the stack with it (docs/runbooks/install.md, "Service uid").
   user: "${PMOS_UID:-10001}:${PMOS_GID:-10001}"
   logging:
     driver: json-file
