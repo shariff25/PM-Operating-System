@@ -26,16 +26,20 @@ roles:
     model: nemotron-3-nano-30b-a3b
 limits:
   max-in-flight: 4
-  per-user: 2
+  # Per PM: one slot for the runtime, one for the team bots together, one for their own bot.
+  per-user: 3
+  per-client: 2
   max-queue: 64
+# How many of one PM's running slots each pool's clients hold together (docs/gateway.md,
+# "A person's slots"): what the pools leave of per-user (here 1) is the PM's own bot's.
+person-pools:
+  runtime: 1
+  team-bots: 1
 # Clients whose X-Pmos-User and X-Pmos-Priority are believed, and each client's cap on calls
-# in flight (docs/gateway.md). Unlisted clients: not trusted, `personal`, `per-user` slots.
+# in flight (docs/gateway.md). Unlisted clients: not trusted, `personal`, `per-client` slots.
 clients:
-  runtime: {trusted: true, max-in-flight: 2}
+  runtime: {trusted: true, max-in-flight: 2, person-pool: runtime}
   # A PM's own bot (bot-pm-<handle>) may name only that PM; a team bot (bot-docs) anyone.
-  # Because a `from-name` client is listed, the clients that may name anyone (runtime, bot-*)
-  # hold at most one of a PM's two running slots together, so the other is only ever taken
-  # by the PM's own bot (docs/gateway.md, "A person's own bot's slot").
   bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
-  bot-*: {trusted: true, max-in-flight: 3}
+  bot-*: {trusted: true, max-in-flight: 3, person-pool: team-bots}
   evals: {max-in-flight: 1, priority: personal}

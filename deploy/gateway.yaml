@@ -35,7 +35,12 @@ roles:
     model: nemotron-3-nano-30b-a3b
 limits:
   max-in-flight: 4
-  per-user: 2
+  # One PM's running calls: one for the runtime, one for the team bots together and one for
+  # their own bot (person-pools below). So one PM can hold 3 of the 4 model slots at once.
+  per-user: 3
+  # A client not listed under `clients:` holds at most this many slots, as before per-user
+  # went to 3 (it would otherwise default to per-user).
+  per-client: 2
   max-queue: 64
   # How long a call may wait for a slot (then 503 with Retry-After), how long a streamed
   # answer may take in all, and the largest answer taken from a model server. These are the
@@ -43,32 +48,40 @@ limits:
   queue-wait-secs: 300
   stream-max-secs: 900
   max-answer-bytes: 16777216
-  # How many calls one person may have waiting for a slot (the default, twice per-user). Each
-  # client may have twice its max-in-flight waiting (its `max-queue`), so no one token fills
-  # the queue (review finding R2).
+  # How many calls one person may have waiting for a slot through each client. Each client may
+  # have twice its max-in-flight waiting (its `max-queue`), so no one token fills the queue
+  # (review finding R2). Kept at 4 when per-user went from 2 to 3 (W1).
   per-user-queue: 4
+# Person pools (finding W1 of the review at 52dbae2): how many of one PM's per-user (3) running
+# slots the clients of each pool hold together. The runtime has a pool of its own, so a team
+# bot's token, even a stolen one, can never keep the slot a PM's routine parsing needs; the team
+# bots share the other; and what the pools leave (3 - 1 - 1 = 1) is the PM's own bot's
+# (bot-pm-*), whose share can be no more than that, so every pool's slot is really kept.
+person-pools:
+  runtime: 1
+  team-bots: 1
 # Who may say which person a call is for (X-Pmos-User) and how urgent it is (X-Pmos-Priority),
 # and how many calls each client token may have in flight (review findings N3 and N4). A client
 # not listed here is not trusted: its calls are keyed by its own name, run as `personal`, and
-# hold at most `per-user` (2) slots.
+# hold at most `per-client` (2) slots.
 clients:
-  # What is guaranteed (review at 6bb806f, G3, and at c78b5fb, U1): the clients that may name
-  # any PM (runtime and every bot-* team bot) hold at most one of a PM's per-user (2) running
-  # slots *together*, because bot-pm-* (user: from-name) is listed: the other slot is only
-  # ever taken by that PM's own bot, so their own bot's call starts as soon as a GPU slot
-  # (max-in-flight) is free, whatever the runtime and team bots are doing for them. The PM's
-  # own bot may hold both of their slots. Each client's `per-user-share` (default 1 for a
-  # client that may name anyone) is at most per-user - 1 here (docs/gateway.md).
-  # The bot runtime: it parses routines for the PM its caller verified. Within the shared
-  # slot, it runs one call per PM at a time (U2): a PM's second routine waits for the first,
+  # What is guaranteed for each PM (W1, review at 52dbae2; G3 and U1 before it): one of their
+  # three running slots is only ever the runtime's, one only ever the team bots' (all of them
+  # together), and one only ever their own bot's. So each of the three starts as soon as a GPU
+  # slot (max-in-flight) is free, whatever the other two are doing for that PM, and no PM ever
+  # has more than 3 running (docs/gateway.md, "A person's slots").
+  # The bot runtime: it parses routines for the PM its caller verified. In its own pool of
+  # one, it runs one call per PM at a time (U2): a PM's second routine waits for the first,
   # up to queue-wait-secs (300), then gets 503 with Retry-After (docs/gateway.md, U2).
-  runtime: {trusted: true, max-in-flight: 2}
+  runtime: {trusted: true, max-in-flight: 2, person-pool: runtime}
   # Each PM's own bot's worker (bot-pm-<handle>): it may name only the PM its name spells
-  # (`user: from-name`; naming anyone else is 403, in the usage log; review finding R1).
+  # (`user: from-name`; naming anyone else is 403, in the usage log; review finding R1). It
+  # holds the one slot of its PM's the pools leave.
   bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
-  # Each team bot's worker (bot-docs, ...): it names the PM whose task it runs, any PM. At most
-  # 3 of the 4 slots each, so no one bot's token holds them all.
-  bot-*: {trusted: true, max-in-flight: 3}
+  # Each team bot's worker (bot-docs, ...): it names the PM whose task it runs, any PM, in the
+  # team bots' pool of one per PM. At most 3 of the 4 slots each, so no one bot's token holds
+  # them all.
+  bot-*: {trusted: true, max-in-flight: 3, person-pool: team-bots}
   # The eval stack (deploy/compose.evals.yaml): its runtime, workers and judges share this
   # token. One slot, background priority, so a benchmark never takes production's capacity.
   evals: {max-in-flight: 1, priority: personal}

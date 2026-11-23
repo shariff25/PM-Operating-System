@@ -587,18 +587,20 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 /// The production role models of the test evals directory (its `prod-gateway.yaml`).
-fn production() -> std::collections::BTreeMap<String, String> {
+fn production() -> pmos_evals::history::ProductionModels {
     [("default", "qwen-prod"), ("extraction", "nemo-prod")]
         .into_iter()
         .map(|(a, b)| (a.to_string(), b.to_string()))
-        .collect()
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into()
 }
 
 /// What a gateway serving the production role models reports.
 fn prod_models() -> GatewayModels {
     GatewayModels {
-        roles: production(),
+        roles: production().roles,
         upstreams: production()
+            .roles
             .keys()
             .map(|r| (r.clone(), "local".to_string()))
             .collect(),
@@ -606,6 +608,7 @@ fn prod_models() -> GatewayModels {
         cloud_test: false,
         workarounds: true,
         class: "production".into(),
+        model_sha256: Default::default(),
     }
 }
 
@@ -931,6 +934,36 @@ fn the_gateways_roles_answer_is_read_as_labels_only() {
     let bad = serde_json::json!({"stub": false, "cloud_test": false, "workarounds": true,
         "roles": [{"role": "default", "model": "m", "upstream": "https://api.example.com"}]});
     assert!(GatewayModels::from_roles_answer(&bad).is_err());
+    // A labelled role's model hash is recorded, and shown, when it is a SHA-256 in hex; it is
+    // left out of a report that has none, so old reports read and write as they were.
+    assert!(m.model_sha256.is_empty());
+    assert!(!serde_json::to_string(&m).unwrap().contains("model_sha256"));
+    let hash = pmos_evals::report::sha256_hex("hidden-model-x");
+    let mut labelled = v.clone();
+    labelled["roles"][0]["model"] = serde_json::json!("model-a");
+    labelled["roles"][0]["model_sha256"] = serde_json::json!(hash);
+    let m = GatewayModels::from_roles_answer(&labelled).unwrap();
+    assert_eq!(m.model_sha256["default"], hash);
+    assert!(
+        m.describe().contains(&format!(
+            "default: `model-a` (local, model sha256 {}…)",
+            &hash[..12]
+        )),
+        "{}",
+        m.describe()
+    );
+    let back: GatewayModels = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+    assert_eq!(back, m);
+    for bad in [
+        serde_json::json!("hidden-model-x"),
+        serde_json::json!(hash.to_uppercase()),
+        serde_json::json!(&hash[..40]),
+        serde_json::json!(7),
+    ] {
+        let mut v = labelled.clone();
+        v["roles"][0]["model_sha256"] = bad.clone();
+        assert!(GatewayModels::from_roles_answer(&v).is_err(), "{bad}");
+    }
     assert!(GatewayModels::from_roles_answer(&serde_json::json!({"roles": []})).is_err());
 }
 
@@ -943,19 +976,67 @@ fn a_labelled_production_role_is_compared_by_its_label() {
     let (_dir, evals, _content) = bench_dirs("1");
     std::fs::write(
         evals.join("prod-gateway.yaml"),
-        "upstreams: {q: 'http://vllm:8000/v1'}\nroles:\n  default: {upstream: q, model: qwen-prod, label: model-a}\n  extraction: {upstream: q, model: nemo-prod}\n",
+        "upstreams: {q: 'http://vllm:8000/v1'}\nroles:\n  default: {upstream: q, model: hidden-model-x, label: model-a}\n  extraction: {upstream: q, model: nemo-prod}\n",
     )
     .unwrap();
     let prod = production_models(&evals).unwrap();
     assert_eq!(prod["default"], "model-a");
     assert_eq!(prod["extraction"], "nemo-prod");
+    // The label hardening (review at 52dbae2): the labelled role also has the hash of its
+    // model id; the unlabelled one none.
+    let hash = pmos_evals::report::sha256_hex("hidden-model-x");
+    assert_eq!(
+        prod.model_sha256,
+        [("default".to_string(), hash.clone())].into()
+    );
     let mut r = report("2026-11-16", 9, 10);
     let mut m = prod_models();
     m.roles.insert("default".into(), "model-a".into());
-    r.gateway_models = Some(m);
+    m.model_sha256.insert("default".into(), hash.clone());
+    r.gateway_models = Some(m.clone());
     assert_eq!(counts(&r, &prod, None), Ok(()));
     r.gateway_models = Some(prod_models());
-    assert!(counts(&r, &prod, None)
-        .unwrap_err()
-        .contains("default: `qwen-prod`, production `model-a`"));
+    let why = counts(&r, &prod, None).unwrap_err();
+    assert!(
+        why.contains("(no model hash recorded), production `model-a`"),
+        "{why}"
+    );
+    // The same label over another model: the hash differs, so the run doesn't count.
+    let mut swapped = m.clone();
+    swapped.model_sha256.insert(
+        "default".into(),
+        pmos_evals::report::sha256_hex("other-model"),
+    );
+    r.gateway_models = Some(swapped);
+    let why = counts(&r, &prod, None).unwrap_err();
+    assert!(why.contains("default: `model-a` (model sha256"), "{why}");
+    // A report from before the gateway reported the hash (the label only, as the eval run of
+    // 2026-11-23 records) never matches a labelled production role...
+    let mut no_hash = m.clone();
+    no_hash.model_sha256.clear();
+    r.gateway_models = Some(no_hash.clone());
+    let why = counts(&r, &prod, None).unwrap_err();
+    assert!(why.contains("(no model hash recorded)"), "{why}");
+    // ...still parses as written then...
+    let old = serde_json::json!({"roles": {"default": "model-a", "extraction": "nemo-prod"},
+        "upstreams": {"default": "local", "extraction": "local"}, "stub": false,
+        "cloud_test": false, "workarounds": true, "class": "production"});
+    let old: GatewayModels = serde_json::from_value(old).unwrap();
+    assert_eq!(old, no_hash);
+    // ...and still matches production roles that have no label (so no hash), as before.
+    std::fs::write(
+        evals.join("prod-gateway.yaml"),
+        "upstreams: {q: 'http://vllm:8000/v1'}
+roles:
+  default: {upstream: q, model: model-a}
+  extraction: {upstream: q, model: nemo-prod}
+",
+    )
+    .unwrap();
+    let unlabelled = production_models(&evals).unwrap();
+    assert!(unlabelled.model_sha256.is_empty());
+    assert_eq!(counts(&r, &unlabelled, None), Ok(()));
+    // A hash for a role production doesn't label doesn't match either.
+    r.gateway_models = Some(m);
+    assert!(counts(&r, &unlabelled, None).is_err());
 }

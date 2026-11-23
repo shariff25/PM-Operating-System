@@ -104,10 +104,31 @@ pub struct GatewayModels {
     /// Only a `production` class counts towards a bar (review finding R3).
     #[serde(default = "test_class")]
     pub class: String,
+    /// For each labelled role (one the gateway reports by a neutral `label:`), the lowercase
+    /// hex SHA-256 of the real model id behind the label, as the gateway reported it
+    /// (`model_sha256`), so a model swapped behind an unchanged label shows
+    /// ([`crate::history::counts`]). Empty in reports written before the gateway reported it
+    /// (2026-11-23), and for roles without a label.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_sha256: BTreeMap<String, String>,
 }
 
 fn test_class() -> String {
     "test".into()
+}
+
+/// Lowercase hex SHA-256 of `text`, as the gateway hashes a labelled role's model id.
+pub fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A SHA-256 in lowercase hex: 64 of `0-9a-f`.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 impl GatewayModels {
@@ -122,6 +143,7 @@ impl GatewayModels {
             .ok_or("the gateway's roles answer has no `roles`")?;
         let mut roles = BTreeMap::new();
         let mut upstreams = BTreeMap::new();
+        let mut model_sha256 = BTreeMap::new();
         for r in list {
             let (Some(role), Some(model), Some(up)) = (
                 r["role"].as_str(),
@@ -135,6 +157,20 @@ impl GatewayModels {
             // A label, never an address: anything else the gateway might send is refused.
             if !matches!(up, "local" | "claude-test" | "remote-test") {
                 return Err(format!("the gateway named an unknown upstream kind `{up}`"));
+            }
+            // A labelled role's model hash: a SHA-256 in hex, never anything else.
+            match r.get("model_sha256") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(h) => match h.as_str().filter(|h| is_sha256_hex(h)) {
+                    Some(h) => {
+                        model_sha256.insert(role.to_string(), h.to_string());
+                    }
+                    None => {
+                        return Err(format!(
+                            "the gateway's model_sha256 for role `{role}` isn't a SHA-256 in hex"
+                        ))
+                    }
+                },
             }
             roles.insert(role.to_string(), model.to_string());
             upstreams.insert(role.to_string(), up.to_string());
@@ -154,6 +190,7 @@ impl GatewayModels {
             cloud_test: flag("cloud_test")?,
             workarounds: flag("workarounds")?,
             class: class.to_string(),
+            model_sha256,
         })
     }
 
@@ -164,7 +201,10 @@ impl GatewayModels {
             .iter()
             .map(|(role, model)| {
                 let up = self.upstreams.get(role).map(String::as_str).unwrap_or("?");
-                format!("{role}: `{model}` ({up})")
+                match self.model_sha256.get(role) {
+                    Some(h) => format!("{role}: `{model}` ({up}, model sha256 {}…)", &h[..12]),
+                    None => format!("{role}: `{model}` ({up})"),
+                }
             })
             .collect();
         if self.stub {

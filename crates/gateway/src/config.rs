@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::scheduler::Priority;
+use crate::scheduler::{PersonPool, Priority};
 use crate::workarounds;
 
 /// How many requests run at once, how many any one person may have running, how many may
@@ -139,11 +139,17 @@ struct ClientSpec {
     user: Option<String>,
     /// How many of one person's `limits.per-user` running slots this client may hold at once
     /// (finding G3 of the review at 6bb806f). `None`: 1 for a trusted `user: any` client (a
-    /// team bot, or the runtime); `per-user` for a `from-name` client, which names only its
-    /// own PM. When `clients:` lists a `from-name` client, a `user: any` client's share is at
-    /// most `per-user - 1` ([`Models::shared_person_cap`], finding U1).
+    /// team bot, or the runtime); for a `from-name` client, which names only its own PM,
+    /// `per-user`, or, with `person-pools:`, what the pools leave of it. A `user: any`
+    /// client's share is at most its person pool's slots ([`Models::pools`], U1 and W1).
     #[serde(default)]
     per_user_share: Option<usize>,
+    /// The person pool (`person-pools:`) this client's calls are counted in, for a trusted
+    /// `user: any` client: the pool's clients together hold at most its slots of one person's
+    /// `per-user` (finding W1 of the review at 52dbae2). Required for every such client when
+    /// `person-pools:` is given; refused when it isn't.
+    #[serde(default)]
+    person_pool: Option<String>,
 }
 
 /// Which people a trusted client may name in `X-Pmos-User` (review finding R1).
@@ -176,11 +182,11 @@ pub struct ClientPolicy {
     /// The most of one believed person's `per-user` running slots this client may hold
     /// (G3, review at 6bb806f): 1 by default for a trusted `user: any` client.
     pub per_user_share: usize,
-    /// For a trusted `user: any` client: the most of one person's running slots that all
-    /// such clients together may hold ([`Models::shared_person_cap`], finding U1). `None`
-    /// for a `from-name` client (it names only its own PM) and an untrusted one (it names
-    /// no one).
-    pub shared_person_cap: Option<usize>,
+    /// For a trusted `user: any` client: its person pool, whose clients together hold at
+    /// most the pool's `cap` of one person's running slots ([`Models::pools`], findings U1
+    /// and W1). `None` for a `from-name` client (it names only its own PM) and an untrusted
+    /// one (it names no one).
+    pub pool: Option<PersonPool>,
 }
 
 impl ClientPolicy {
@@ -271,6 +277,11 @@ struct ModelsFile {
     /// Per-client trust, cap and priority, by client name or `prefix*` pattern.
     #[serde(default)]
     clients: BTreeMap<String, ClientSpec>,
+    /// Person pools (finding W1 of the review at 52dbae2): pool name to how many of one
+    /// person's `limits.per-user` running slots the pool's clients (`person-pool:`) may hold
+    /// together. Empty: one pool, [`IMPLICIT_POOL`], for every trusted `user: any` client.
+    #[serde(default)]
+    person_pools: BTreeMap<String, usize>,
     /// `production` or `test` (the default): what `GET /v1/pmos/roles` reports, so a
     /// benchmark report says which kind of gateway its models came from (review finding R3).
     #[serde(default)]
@@ -353,6 +364,16 @@ impl Role {
         self.label.as_deref().unwrap_or(&self.model)
     }
 
+    /// For a labelled role only: the lowercase hex SHA-256 of its real model id (`model`), so
+    /// a benchmark report and the usage log can tell when the model behind an unchanged label
+    /// was swapped, without naming it. `None` for a role without a label, which reports its
+    /// model id itself. A hash of a short id from a known list can be matched by trying the
+    /// list; the reviewer judged that acceptable (`docs/gateway.md`, "Hiding the model behind
+    /// a label").
+    pub fn model_sha256(&self) -> Option<String> {
+        self.label.as_ref().map(|_| sha256_hex(&self.model))
+    }
+
     /// The neutral name for the upstream's kind, never its address: `local`, `claude-test` or
     /// `remote-test`.
     pub fn upstream_kind_label(&self) -> &'static str {
@@ -391,6 +412,13 @@ impl Role {
     }
 }
 
+/// The one person pool of a config without `person-pools:`: every trusted `user: any` client
+/// is in it, and its slots are `per-user`, less one when a `from-name` client is listed (U1).
+pub const IMPLICIT_POOL: &str = "user-any";
+
+/// A person pool's name and its slots of each person's `per-user`.
+pub type NamedPool = (String, usize);
+
 #[derive(Debug, Clone)]
 pub struct Models {
     pub roles: BTreeMap<String, Role>,
@@ -399,6 +427,13 @@ pub struct Models {
     pub clients: BTreeMap<String, ClientPolicy>,
     /// `class:` (default `test`).
     pub class: GatewayClass,
+    /// The person pools, by [`PersonPool::id`]: each one's name and slots (`person-pools:`,
+    /// or the one [`IMPLICIT_POOL`]).
+    pub pools: Vec<NamedPool>,
+    /// With `person-pools:`, what the pools leave of `per-user`: the most a `from-name`
+    /// client (a PM's own bot) may hold of its PM's slots, and its default share. `None`
+    /// without `person-pools:`, where that is `per-user`.
+    pub own_bot_slots: Option<usize>,
 }
 
 impl Models {
@@ -437,22 +472,9 @@ impl Models {
                     .into(),
             );
         }
-        // U1: when a PM's own bot (`from-name`) is configured, one of each person's slots is
-        // kept for it, so the clients that may name anyone (the runtime and every team bot)
-        // together hold at most `per-user - 1` of them.
-        let reserve = usize::from(
-            file.clients
-                .values()
-                .any(|c| c.user.as_deref() == Some("from-name")),
-        );
-        if reserve > 0 && limits.per_user < 2 {
-            return Err(
-                "gateway config: a `user: from-name` client keeps one of each person's running \
-                 slots for that person's own bot, so limits.per-user must be at least 2"
-                    .into(),
-            );
-        }
-        let shared_cap = limits.per_user - reserve;
+        let (pools, own_bot_slots) = person_pools(&file, &limits)?;
+        let explicit_pools = own_bot_slots.is_some();
+        let mut pool_used = vec![false; pools.len()];
         let mut clients = BTreeMap::new();
         for (name, spec) in file.clients {
             let pattern = name.strip_suffix('*');
@@ -503,16 +525,73 @@ impl Models {
                     ))
                 }
             };
-            // G3 (review at 6bb806f): a client that may name anyone holds at most this many of
-            // one person's running slots, 1 unless it says otherwise; with a `from-name` client
-            // listed, never more than all such clients together may hold (U1).
+            // W1 (review at 52dbae2): a client that may name anyone is counted in a person
+            // pool, whose clients together hold at most the pool's slots of one person's.
             let shared = spec.trusted && user == UserRule::Any;
-            let most = if shared { shared_cap } else { limits.per_user };
+            let pool_id = match (&spec.person_pool, shared) {
+                (Some(p), false) => {
+                    return Err(format!(
+                        "gateway config: client `{name}`: person-pool `{p}` is for a trusted \
+                         client that may name anyone (`trusted: true`, `user: any`)"
+                    ))
+                }
+                (Some(p), true) => Some(
+                    pools
+                        .iter()
+                        .position(|(n, _)| n == p)
+                        .filter(|_| explicit_pools)
+                        .ok_or_else(|| {
+                            format!(
+                                "gateway config: client `{name}`: person-pool `{p}` isn't \
+                                 listed in `person-pools:`"
+                            )
+                        })?,
+                ),
+                (None, true) if explicit_pools => {
+                    return Err(format!(
+                        "gateway config: client `{name}` may name anyone, so with \
+                         `person-pools:` it must say which pool it is in (`person-pool:`)"
+                    ))
+                }
+                (None, true) => Some(0),
+                (None, false) => None,
+            };
+            let pool = pool_id.map(|id| {
+                pool_used[id] = true;
+                PersonPool {
+                    id,
+                    cap: pools[id].1,
+                }
+            });
+            // G3 (review at 6bb806f): a client that may name anyone holds at most this many of
+            // one person's running slots, 1 unless it says otherwise, and never more than its
+            // pool's (U1, W1). With `person-pools:`, a PM's own bot holds at most what the
+            // pools leave, so each pool's slots are really kept for its clients.
+            let own = matches!(user, UserRule::FromName { .. });
+            let most = match (pool, own_bot_slots) {
+                (Some(p), _) => p.cap,
+                (None, Some(left)) if own => left,
+                _ => limits.per_user,
+            };
             let per_user_share = match spec.per_user_share {
                 Some(n) if !spec.trusted => {
                     return Err(format!(
                         "gateway config: client `{name}`: per-user-share ({n}) needs \
                          `trusted: true` (an untrusted client names no one)"
+                    ))
+                }
+                Some(n) if (n == 0 || n > most) && explicit_pools && pool.is_some() => {
+                    return Err(format!(
+                        "gateway config: client `{name}`: per-user-share must be 1 to {most}, \
+                         the slots of its person pool `{}`, not {n}",
+                        pools[pool_id.unwrap_or(0)].0
+                    ))
+                }
+                Some(n) if (n == 0 || n > most) && explicit_pools && own => {
+                    return Err(format!(
+                        "gateway config: client `{name}`: per-user-share must be 1 to {most}, \
+                         what the person pools leave of limits.per-user ({}), not {n}",
+                        limits.per_user
                     ))
                 }
                 Some(n) if (n == 0 || n > most) && most < limits.per_user => {
@@ -531,7 +610,8 @@ impl Models {
                     ))
                 }
                 Some(n) => n,
-                None if spec.trusted && user == UserRule::Any => 1,
+                None if shared => 1,
+                None if own => most,
                 None => limits.per_user,
             };
             let max_in_flight = spec.max_in_flight.unwrap_or(limits.client_default());
@@ -556,9 +636,16 @@ impl Models {
                         .unwrap_or_else(|| max_in_flight.saturating_mul(2)),
                     user,
                     per_user_share,
-                    shared_person_cap: shared.then_some(shared_cap),
+                    pool,
                 },
             );
+        }
+        if explicit_pools {
+            if let Some(((name, _), _)) = pools.iter().zip(&pool_used).find(|(_, used)| !**used) {
+                return Err(format!(
+                    "gateway config: person pool `{name}` has no client (`person-pool: {name}`)"
+                ));
+            }
         }
         let mut roles = BTreeMap::new();
         for (name, spec) in file.roles {
@@ -689,6 +776,8 @@ impl Models {
             limits,
             clients,
             class,
+            pools,
+            own_bot_slots,
         })
     }
 
@@ -709,7 +798,7 @@ impl Models {
             user: UserRule::Any,
             // Untrusted: it names no one, so no person's slots are counted for it.
             per_user_share: self.limits.per_user,
-            shared_person_cap: None,
+            pool: None,
         };
         if let Some(p) = self.clients.get(client) {
             return *p;
@@ -766,18 +855,9 @@ impl Models {
             .collect()
     }
 
-    /// The most of one person's `per-user` running slots that the trusted `user: any`
-    /// clients (the runtime, every team bot) may hold **together** (finding U1 of the review
-    /// at c78b5fb): `per-user - 1` when `clients:` lists a `user: from-name` client, so the
-    /// last slot is only ever taken by that person's own bot; `per-user` when none is listed
-    /// (the test stack's configs), as there is no own bot to keep it for. Each such client
-    /// also holds at most its own `per-user-share`.
-    pub fn shared_person_cap(&self) -> usize {
-        let reserve = self
-            .clients
-            .values()
-            .any(|p| matches!(p.user, UserRule::FromName { .. }));
-        self.limits.per_user - usize::from(reserve)
+    /// A person pool's name, by its [`PersonPool::id`].
+    pub fn pool_name(&self, id: usize) -> &str {
+        self.pools.get(id).map_or("", |(n, _)| n.as_str())
     }
 
     /// The role a request's `model` names: `pmos/<role>`. A concrete model name is refused,
@@ -791,6 +871,80 @@ impl Models {
     pub fn aliases(&self) -> Vec<String> {
         self.roles.values().map(Role::alias).collect()
     }
+}
+
+/// The person pools (finding W1 of the review at 52dbae2), and, with `person-pools:`, what
+/// they leave of `per-user` for a PM's own bot.
+///
+/// Without `person-pools:`, one pool, [`IMPLICIT_POOL`], holds every trusted `user: any`
+/// client, as U1 had it: `per-user - 1` of each person's slots when a `from-name` client is
+/// listed (the last is kept for that person's own bot), else `per-user`. With it, each pool
+/// has the slots it names; together they must leave at least one slot for a PM's own bot
+/// when a `from-name` client is listed, and may never hold more than `per-user`.
+fn person_pools(
+    file: &ModelsFile,
+    limits: &Limits,
+) -> Result<(Vec<NamedPool>, Option<usize>), String> {
+    let own_bot = file
+        .clients
+        .values()
+        .any(|c| c.user.as_deref() == Some("from-name"));
+    let reserve = usize::from(own_bot);
+    if file.person_pools.is_empty() {
+        if own_bot && limits.per_user < 2 {
+            return Err(
+                "gateway config: a `user: from-name` client keeps one of each person's running \
+                 slots for that person's own bot, so limits.per-user must be at least 2"
+                    .into(),
+            );
+        }
+        return Ok((
+            vec![(IMPLICIT_POOL.to_string(), limits.per_user - reserve)],
+            None,
+        ));
+    }
+    let mut total = 0usize;
+    for (name, slots) in &file.person_pools {
+        if !valid_client_name(name) {
+            return Err(format!(
+                "gateway config: person pool `{name}` must be lowercase letters, digits and `-`"
+            ));
+        }
+        if *slots == 0 {
+            return Err(format!(
+                "gateway config: person pool `{name}` must have at least 1 slot"
+            ));
+        }
+        total = total.saturating_add(*slots);
+    }
+    if total.saturating_add(reserve) > limits.per_user {
+        return Err(format!(
+            "gateway config: the person pools hold {total} of each person's running slots{}, \
+             more than limits.per-user ({})",
+            if own_bot {
+                " and one more is kept for their own bot (a `user: from-name` client is listed)"
+            } else {
+                ""
+            },
+            limits.per_user
+        ));
+    }
+    Ok((
+        file.person_pools
+            .iter()
+            .map(|(n, s)| (n.clone(), *s))
+            .collect(),
+        Some(limits.per_user - total),
+    ))
+}
+
+/// Lowercase hex SHA-256 of `text`.
+pub fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// A role's `label:`: 1 to 64 ASCII letters, digits, `.`, `_` and `-`.

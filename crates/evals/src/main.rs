@@ -584,13 +584,7 @@ fn check(root: &Path, category: Option<String>, content: &Path) -> Result<bool> 
     // The production role models every counted run is matched against (N5).
     if config.is_ok() {
         match production_models(root) {
-            Ok(m) => println!(
-                "production role models: {}",
-                m.iter()
-                    .map(|(r, model)| format!("{r} `{model}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            Ok(m) => println!("production role models: {}", m.describe()),
             Err(e) => problems.push(e),
         }
     }

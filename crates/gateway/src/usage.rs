@@ -26,6 +26,11 @@ pub struct UsageEvent {
     pub endpoint: &'static str,
     pub role: String,
     pub model: String,
+    /// For a labelled role only: the SHA-256 of the real model id (`config::Role::model_sha256`)
+    /// beside its label in `model`, so an auditor can tell which model served a past call
+    /// (by hashing the ids the config has held) without the log naming it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_sha256: Option<String>,
     pub upstream: String,
     pub priority: Priority,
     pub stream: bool,
@@ -262,6 +267,7 @@ mod tests {
             endpoint: "chat/completions",
             role: "default".into(),
             model: "m".into(),
+            model_sha256: None,
             upstream: "vllm".into(),
             priority: Priority::Personal,
             stream: false,

@@ -1342,6 +1342,75 @@ async fn readiness_reuses_its_probe_for_a_while() {
     stop_gw.cancel();
 }
 
+/// The Low on `/readyz` (review at 52dbae2): a caller that hangs up mid-probe no longer leaves
+/// the cache unfilled. The probe runs in a task of its own, so it completes and fills the
+/// cache anyway; before, it ran in the caller's request and was cancelled with it, so a
+/// client that connected and hung up over and over kept a probe round in flight forever.
+#[tokio::test]
+async fn a_caller_that_hangs_up_mid_probe_still_fills_the_readiness_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let probes = Arc::new(AtomicUsize::new(0));
+    // A model server whose `/models` takes 300 ms to answer.
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|State(n): State<Arc<AtomicUsize>>| async move {
+                n.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Json(json!({"data": []}))
+            }),
+        )
+        .with_state(probes.clone());
+    let (up, stop_up) = serve(app).await;
+    let yaml = format!(
+        "upstreams: {{a: '{up}/v1'}}\nroles: {{default: {{upstream: a, model: m}}}}\n\
+         clients: {{runtime: {{trusted: true}}}}\n"
+    );
+    let (gw, stop_gw) = serve(router(GatewayConfig {
+        models: Models::from_yaml(&yaml).unwrap(),
+        clients: vec![Client {
+            name: "runtime".into(),
+            token: TOKEN.into(),
+        }],
+        usage: Arc::new(UsageLog::new(None).unwrap()),
+        stub: false,
+        workarounds_on: true,
+        anthropic_key: String::new(),
+        remote_key: String::new(),
+        retry: Default::default(),
+        timeouts: pmos_gateway::Timeouts {
+            ready_cache: Duration::from_secs(30),
+            ..Default::default()
+        },
+    }))
+    .await;
+    // Five callers, one after another, each hanging up 50 ms into the probe.
+    for _ in 0..5 {
+        let hung_up = tokio::time::timeout(
+            Duration::from_millis(50),
+            reqwest::get(format!("{gw}/readyz")),
+        )
+        .await;
+        assert!(
+            hung_up.is_err(),
+            "the probe answered before the caller left"
+        );
+    }
+    // The first probe went on without its caller and filled the cache: the next caller is
+    // answered from it at once, and no other probe was ever sent.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let t = std::time::Instant::now();
+    let res = reqwest::get(format!("{gw}/readyz")).await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "answered from the cache"
+    );
+    assert_eq!(probes.load(Ordering::SeqCst), 1, "one probe in all");
+    stop_gw.cancel();
+    stop_up.cancel();
+}
+
 /// The real binary: it won't start without the remote key, says at start-up that a remote
 /// test upstream is on, and never prints the key, even when the upstream is down.
 #[tokio::test]

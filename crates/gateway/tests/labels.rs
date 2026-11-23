@@ -1,6 +1,9 @@
 //! A role's `label:`: the gateway reports the label to its clients and in its logs in place of
 //! the model id (the roles answer, `x-pmos-model`, an answer's `model`, the usage log), while
 //! the real model id is what goes upstream. A role without a label is reported as before.
+//! For a labelled role the upstream's own words never reach the caller either: pass-through
+//! fields, a broken last streamed line and error bodies (the label hardening of the review
+//! at 52dbae2); the roles answer and the usage log carry the hash of the real id.
 
 use std::sync::{Arc, Mutex};
 
@@ -25,11 +28,67 @@ struct Upstream {
     seen: Mutex<Vec<String>>,
 }
 
-/// Answers with the model id it was sent, as a real model server does, streamed or not.
+/// What a provider adds that names it.
+const PROVIDER: &str = "ProviderCo";
+
+/// Answers with the model id it was sent, as a real model server does, streamed or not. The
+/// ask decides the rest:
+/// - `leaky`: the answer also carries `system_fingerprint` and `provider` naming the model and
+///   the provider, and, streamed, a comment naming them and an unterminated last line;
+/// - `bad`: `400` with an error naming the model and the provider;
+/// - `busy`: `429` with `Retry-After: 0` and such an error (retried, then passed on);
+/// - `quota`: `429` saying the daily quota is spent (not retried);
+/// - `down`: `503` with `Retry-After: 0`.
 async fn mock_chat(State(u): State<Arc<Upstream>>, body: Bytes) -> Response {
     let body: Value = serde_json::from_slice(&body).unwrap();
     let model = body["model"].as_str().unwrap().to_string();
     u.seen.lock().unwrap().push(model.clone());
+    let ask = body["messages"][0]["content"].as_str().unwrap_or_default();
+    let named = format!("{model} at {PROVIDER}");
+    let failed = |status: u16, kind: &str| {
+        let mut res = (
+            axum::http::StatusCode::from_u16(status).unwrap(),
+            Json(
+                json!({"error": {"message": format!("{named}: {kind}"), "type": kind,
+                                  "code": kind}}),
+            ),
+        )
+            .into_response();
+        res.headers_mut()
+            .insert("retry-after", axum::http::HeaderValue::from_static("0"));
+        res
+    };
+    match ask {
+        "bad" => return failed(400, "invalid_request_error"),
+        "busy" => return failed(429, "rate_limit_exceeded"),
+        "quota" => return failed(429, "insufficient_quota"),
+        "down" => return failed(503, "overloaded"),
+        _ => {}
+    }
+    if ask == "leaky" {
+        if body["stream"] == json!(true) {
+            let chunk = |text: &str| {
+                json!({"id": "c", "object": "chat.completion.chunk", "model": model,
+                       "system_fingerprint": format!("fp-{model}"), "provider": PROVIDER,
+                       "choices": [{"index": 0, "delta": {"content": text}}]})
+            };
+            let sse = format!(
+                ": {named}\n\ndata: {}\n\ndata: {}\n\n\
+                 data: {{\"id\":\"c\",\"model\":\"{model}\",\"provider\":\"{PROVIDER}",
+                chunk("Hello"),
+                chunk(" there")
+            );
+            return ([("content-type", "text/event-stream")], sse).into_response();
+        }
+        return Json(json!({
+            "id": "x", "object": "chat.completion", "created": 1, "model": model,
+            "system_fingerprint": format!("fp-{model}"), "provider": PROVIDER,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "The answer."}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        }))
+        .into_response();
+    }
     if body["stream"] == json!(true) {
         let chunk = |text: &str| {
             json!({"id": "c", "object": "chat.completion.chunk", "model": model,
@@ -99,7 +158,10 @@ async fn setup() -> Setup {
         workarounds_on: true,
         anthropic_key: String::new(),
         remote_key: String::new(),
-        retry: Default::default(),
+        retry: pmos_gateway::retry::RetryPolicy {
+            base: std::time::Duration::from_millis(1),
+            ..Default::default()
+        },
         timeouts: Default::default(),
     });
     let (gw, stop_gw) = serve(app).await;
@@ -112,11 +174,24 @@ async fn setup() -> Setup {
 }
 
 fn chat(s: &Setup, role: &str, stream: bool) -> reqwest::RequestBuilder {
+    ask(s, role, stream, "hi")
+}
+
+fn ask(s: &Setup, role: &str, stream: bool, text: &str) -> reqwest::RequestBuilder {
     reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", s.gw))
         .bearer_auth(TOKEN)
         .json(&json!({"model": role, "stream": stream,
-                      "messages": [{"role": "user", "content": "hi"}]}))
+                      "messages": [{"role": "user", "content": text}]}))
+}
+
+/// Lowercase hex SHA-256, as the gateway reports a labelled role's model id.
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[tokio::test]
@@ -133,10 +208,13 @@ async fn a_labelled_role_is_reported_by_its_label_and_still_sends_the_real_id_up
         .json()
         .await
         .unwrap();
+    // The labelled role also carries the hash of its real id (so a benchmark can tell a model
+    // swapped behind an unchanged label); the unlabelled one has none, its model is its id.
     assert_eq!(
         v["roles"],
         json!([
-            {"role": "default", "alias": "pmos/default", "model": LABEL, "upstream": "local"},
+            {"role": "default", "alias": "pmos/default", "model": LABEL, "upstream": "local",
+             "model_sha256": sha256_hex(REAL)},
             {"role": "extraction", "alias": "pmos/extraction", "model": "nemo-test", "upstream": "local"},
         ])
     );
@@ -186,8 +264,121 @@ async fn a_labelled_role_is_reported_by_its_label_and_still_sends_the_real_id_up
     assert_eq!(labelled.len(), 2);
     for e in labelled {
         assert_eq!(e.model, LABEL);
+        assert_eq!(e.model_sha256.as_deref(), Some(sha256_hex(REAL).as_str()));
         assert_eq!(e.upstream, "local");
+        let line = serde_json::to_string(e).unwrap();
+        assert!(line.contains("\"model_sha256\""), "{line}");
+        assert!(!line.contains(REAL), "{line}");
     }
+}
+
+/// The label hardening (review at 52dbae2): fields the upstream adds that can name the model
+/// or the provider (`system_fingerprint`, `provider`), a streamed comment naming them, and an
+/// unterminated last line that doesn't parse never reach the caller of a labelled role.
+#[tokio::test]
+async fn a_labelled_roles_answers_carry_nothing_of_the_upstreams_own() {
+    let s = setup().await;
+    let res = ask(&s, "pmos/default", false, "leaky")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body = res.text().await.unwrap();
+    for f in [REAL, PROVIDER, "system_fingerprint", "provider"] {
+        assert!(!body.contains(f), "`{f}` reached the caller: {body}");
+    }
+    let answer: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(answer["model"], LABEL);
+    assert_eq!(answer["choices"][0]["message"]["content"], "The answer.");
+    assert_eq!(answer["usage"]["total_tokens"], 5);
+
+    let res = ask(&s, "pmos/default", true, "leaky").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let body = res.text().await.unwrap();
+    for f in [REAL, PROVIDER, "system_fingerprint", "provider"] {
+        assert!(!body.contains(f), "`{f}` reached the caller: {body}");
+    }
+    let events: Vec<Value> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2, "the broken last line is dropped: {body}");
+    assert!(events.iter().all(|e| e["model"] == LABEL), "{body}");
+    assert_eq!(events[1]["choices"][0]["delta"]["content"], " there");
+
+    // An unlabelled role's answer is passed on as it came, extra fields and all.
+    let res = ask(&s, "pmos/extraction", false, "leaky")
+        .send()
+        .await
+        .unwrap();
+    let answer: Value = res.json().await.unwrap();
+    assert_eq!(answer["provider"], PROVIDER);
+    assert_eq!(answer["system_fingerprint"], "fp-nemo-test");
+}
+
+/// The spec's point V3, for labelled roles (review at 52dbae2): an upstream's error answer
+/// names the model and the provider, so a labelled role's caller gets a neutral one instead,
+/// with the status, a coarse type it can act on and `Retry-After`; a role without a label
+/// still gets the model server's own error, which helps its caller.
+#[tokio::test]
+async fn a_labelled_roles_errors_name_nothing_but_keep_what_callers_act_on() {
+    let s = setup().await;
+    for (text, status, kind, retry_after) in [
+        ("bad", 400, "bad_request", false),
+        ("busy", 429, "rate_limit", true),
+        ("quota", 429, "quota_exhausted", true),
+        ("down", 503, "overloaded", true),
+    ] {
+        for stream in [false, true] {
+            let res = ask(&s, "pmos/default", stream, text).send().await.unwrap();
+            assert_eq!(res.status().as_u16(), status, "{text}");
+            assert_eq!(res.headers()["x-pmos-model"], LABEL);
+            assert_eq!(
+                res.headers().contains_key("retry-after"),
+                retry_after,
+                "{text}: Retry-After"
+            );
+            let body = res.text().await.unwrap();
+            for f in [REAL, PROVIDER, "insufficient_quota", "rate_limit_exceeded"] {
+                assert!(
+                    !body.contains(f),
+                    "{text}: `{f}` reached the caller: {body}"
+                );
+            }
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["error"]["type"], kind, "{text}: {body}");
+            assert_eq!(v["error"]["status"], status, "{text}");
+        }
+    }
+    // The gateway still judged the upstream's own words: a spent quota isn't retried, a busy
+    // server is, up to its attempts.
+    let attempts = |text: &str| {
+        let s = &s;
+        let text = text.to_string();
+        async move {
+            let before = s.upstream.seen.lock().unwrap().len();
+            let res = ask(s, "pmos/default", false, &text).send().await.unwrap();
+            let header = res.headers()["x-pmos-upstream-attempts"]
+                .to_str()
+                .unwrap()
+                .to_string();
+            (s.upstream.seen.lock().unwrap().len() - before, header)
+        }
+    };
+    assert_eq!(attempts("quota").await, (1, "1".to_string()));
+    assert_eq!(attempts("busy").await, (3, "3".to_string()));
+    // Unlabelled: the model server's own error, as it came.
+    let res = ask(&s, "pmos/extraction", false, "bad")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    let v: Value = res.json().await.unwrap();
+    assert_eq!(
+        v["error"]["message"],
+        format!("nemo-test at {PROVIDER}: invalid_request_error")
+    );
 }
 
 #[tokio::test]

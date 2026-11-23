@@ -12,11 +12,13 @@
 //! the PM's own calls through the runtime got an immediate `429`.
 //!
 //! Running, a person's slots are shared out by client (U1, review at c78b5fb): each client
-//! holds at most its `person_share` of them, and the clients that may name anyone (the
-//! runtime, the team bots; [`Owner::with_shared_cap`]) at most `shared_cap` of them
-//! **together**, so with `per-user` 2 and a PM's own bot configured, one slot is only ever
-//! taken by that bot. Before, the share was per client only, so two such clients (`bot-docs`
-//! and `runtime`) could hold both of a PM's slots and the PM's own bot waited.
+//! holds at most its `person_share` of them, and the clients of one **person pool**
+//! ([`PersonPool`], [`Owner::with_pool`]) at most the pool's `cap` of them together. Clients
+//! that may name anyone are put in pools (`config::Models::parse`): the runtime in its own,
+//! the team bots in another (finding W1 of the review at 52dbae2), so a team bot's token, even
+//! a stolen one, can never take the slot a PM's routine parsing needs, and neither can take
+//! the one left for that PM's own bot. A config without `person-pools:` puts every such client
+//! in one pool, as U1 did.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -68,10 +70,19 @@ pub struct Owner {
     /// The most of this person's running slots this client may hold (G3, review at
     /// 6bb806f): `ClientPolicy::per_user_share`.
     pub person_share: usize,
-    /// For a client that may name anyone: the most of this person's running slots that all
-    /// such clients together may hold (U1): `ClientPolicy::shared_person_cap`. `None` for a
-    /// PM's own bot's client and for a call that names no one.
-    pub shared_cap: Option<usize>,
+    /// For a client that may name anyone: its person pool, whose clients together hold at
+    /// most the pool's `cap` of this person's running slots (U1, W1): `ClientPolicy::pool`.
+    /// `None` for a PM's own bot's client and for a call that names no one.
+    pub pool: Option<PersonPool>,
+}
+
+/// A group of clients that together hold at most `cap` of one person's running slots
+/// (`person-pools:` in the config, finding W1 of the review at 52dbae2). `id` tells pools
+/// apart; [`crate::config::Models::pool_name`] names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PersonPool {
+    pub id: usize,
+    pub cap: usize,
 }
 
 impl Owner {
@@ -84,20 +95,21 @@ impl Owner {
             client_cap,
             client_queue: client_cap.saturating_mul(2),
             person_share: usize::MAX,
-            shared_cap: None,
+            pool: None,
         }
     }
 
-    /// The same, from a client that may name anyone: such clients together hold at most
-    /// `cap` of the person's running slots (U1). `None` leaves the call out of that count.
-    pub fn with_shared_cap(mut self, cap: Option<usize>) -> Self {
-        self.shared_cap = cap;
+    /// The same, from a client in a person pool: the pool's clients together hold at most
+    /// its `cap` of the person's running slots (U1, W1). `None` leaves the call out of every
+    /// pool's count.
+    pub fn with_pool(mut self, pool: Option<PersonPool>) -> Self {
+        self.pool = pool;
         self
     }
 
-    /// Counted among the calls of clients that may name anyone, for its person.
-    fn shared(&self) -> bool {
-        self.person.is_some() && self.shared_cap.is_some()
+    /// The pool and person this call is counted under, when it names a person.
+    fn pool_key(&self) -> Option<(usize, String)> {
+        Some((self.pool?.id, self.person.clone()?))
     }
 
     /// The same, with this client allowed at most `share` of the person's running slots.
@@ -127,8 +139,8 @@ struct State {
     per_client: HashMap<String, usize>,
     /// Running calls by (client, person): each client's share of a person's slots (G3).
     per_client_person: HashMap<(String, String), usize>,
-    /// Running calls by person, of clients that may name anyone, together (U1).
-    per_user_shared: HashMap<String, usize>,
+    /// Running calls by (person pool, person), of the pool's clients together (U1, W1).
+    per_pool_person: HashMap<(usize, String), usize>,
     waiting: Vec<Waiter>,
     /// Started but not yet picked up by their caller.
     granted: HashSet<u64>,
@@ -280,8 +292,8 @@ impl Scheduler {
                 &mut st.per_client_person,
                 &(owner.client.clone(), p.clone()),
             );
-            if owner.shared() {
-                decrement(&mut st.per_user_shared, p);
+            if let Some(key) = owner.pool_key() {
+                decrement(&mut st.per_pool_person, &key);
             }
         }
         decrement(&mut st.per_client, &owner.client);
@@ -290,8 +302,8 @@ impl Scheduler {
 
     /// Start waiters while there is room: the highest priority whose person and client are
     /// both under their caps, whose client is under its share of that person's slots (G3),
-    /// and, for a client that may name anyone, whose person's calls from all such clients
-    /// are under their shared cap (U1); oldest first.
+    /// and, for a client in a person pool, whose person's calls from all the pool's clients
+    /// are under the pool's cap (U1, W1); oldest first.
     fn dispatch(&self, st: &mut State) {
         while st.in_flight < self.limits.max_in_flight {
             let pick = st
@@ -307,8 +319,12 @@ impl Scheduler {
                                 .copied()
                                 .unwrap_or(0)
                                 < w.owner.person_share
-                            && w.owner.shared_cap.is_none_or(|cap| {
-                                st.per_user_shared.get(p).copied().unwrap_or(0) < cap
+                            && w.owner.pool.is_none_or(|pool| {
+                                st.per_pool_person
+                                    .get(&(pool.id, p.clone()))
+                                    .copied()
+                                    .unwrap_or(0)
+                                    < pool.cap
                             })
                     });
                     let client_ok = st.per_client.get(&w.owner.client).copied().unwrap_or(0)
@@ -321,8 +337,8 @@ impl Scheduler {
             let w = st.waiting.remove(i);
             if w.tx.send(()).is_ok() {
                 st.in_flight += 1;
-                if let Some(p) = w.owner.person.as_ref().filter(|_| w.owner.shared()) {
-                    *st.per_user_shared.entry(p.clone()).or_default() += 1;
+                if let Some(key) = w.owner.pool_key() {
+                    *st.per_pool_person.entry(key).or_default() += 1;
                 }
                 if let Some(p) = w.owner.person {
                     *st.per_client_person
@@ -638,6 +654,9 @@ mod tests {
         assert_eq!(s.snapshot(), (0, 0));
     }
 
+    /// One pool for every client that may name anyone, of one slot (U1's shape).
+    const SHARED: PersonPool = PersonPool { id: 0, cap: 1 };
+
     #[tokio::test]
     async fn clients_that_may_name_anyone_together_leave_a_pm_their_own_bots_slot() {
         // U1 (review at c78b5fb): Ana has two slots. `runtime` and `bot-docs` may each hold
@@ -648,7 +667,7 @@ mod tests {
         let any = |client: &str| {
             Owner::new(Some("ana"), client, 8)
                 .with_person_share(1)
-                .with_shared_cap(Some(1))
+                .with_pool(Some(SHARED))
         };
         let r1 = s
             .acquire(&any("runtime"), Priority::Interactive)
@@ -668,7 +687,7 @@ mod tests {
             .acquire(
                 &Owner::new(Some("bo"), "bot-docs", 8)
                     .with_person_share(1)
-                    .with_shared_cap(Some(1)),
+                    .with_pool(Some(SHARED)),
                 Priority::Personal,
             )
             .await
@@ -702,6 +721,146 @@ mod tests {
         }
         assert_eq!(s.snapshot(), (1, 0));
         drop(o2);
+        assert_eq!(s.snapshot(), (0, 0));
+    }
+
+    /// W1 (review at 52dbae2), the production shape: `per-user` 3 = the runtime's pool 1, the
+    /// team bots' pool 1, and 1 for the PM's own bot (its share is what the pools leave).
+    const RUNTIME_POOL: PersonPool = PersonPool { id: 0, cap: 1 };
+    const TEAM_POOL: PersonPool = PersonPool { id: 1, cap: 1 };
+
+    fn runtime_for(p: &str) -> Owner {
+        Owner::new(Some(p), "runtime", 2)
+            .with_person_share(1)
+            .with_pool(Some(RUNTIME_POOL))
+    }
+    fn team_bot_for(client: &str, p: &str) -> Owner {
+        Owner::new(Some(p), client, 3)
+            .with_person_share(1)
+            .with_pool(Some(TEAM_POOL))
+    }
+    fn own_bot_for(p: &str) -> Owner {
+        Owner::new(Some(p), &format!("bot-pm-{p}"), 3).with_person_share(1)
+    }
+
+    /// Starts `owner`'s call within 200 ms, or panics with `what`.
+    async fn starts(s: &Arc<Scheduler>, owner: &Owner, what: &str) -> Permit {
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            s.acquire(owner, Priority::Personal),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{what}"))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn team_bots_saturated_the_runtime_still_starts() {
+        // W1: before, the runtime shared one slot of Ana's with every team bot, so a team bot's
+        // token (a stolen one, say) that kept it busy made her routine parsing wait.
+        let s = sched(4, 3, 32);
+        let held = starts(&s, &team_bot_for("bot-docs", "ana"), "bot-docs starts").await;
+        // More team-bot calls for her, from two different team bots, all wait: the team
+        // bots' pool is full.
+        let mut waiting = Vec::new();
+        for client in ["bot-docs", "bot-jira", "bot-jira"] {
+            let (s2, o) = (s.clone(), team_bot_for(client, "ana"));
+            waiting.push(tokio::spawn(async move {
+                s2.acquire(&o, Priority::Interactive).await.map(drop)
+            }));
+            settle(&s, (1, waiting.len())).await;
+        }
+        // Her routine parsing starts at once, though those waiting have a higher priority.
+        let r = starts(
+            &s,
+            &runtime_for("ana"),
+            "the runtime waited behind team bots",
+        )
+        .await;
+        assert_eq!(s.snapshot(), (2, 3));
+        // The runtime's second call for her waits for its own pool, not for the team bots.
+        let (s2, o) = (s.clone(), runtime_for("ana"));
+        let r2 = tokio::spawn(async move { s2.acquire(&o, Priority::Personal).await.map(drop) });
+        settle(&s, (2, 4)).await;
+        drop(r);
+        assert_eq!(r2.await.unwrap(), Ok(()));
+        drop(held);
+        for w in waiting {
+            assert_eq!(w.await.unwrap(), Ok(()));
+        }
+        assert_eq!(s.snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn runtime_and_team_bots_saturated_her_own_bot_still_starts() {
+        let s = sched(4, 3, 32);
+        let r = starts(&s, &runtime_for("ana"), "the runtime starts").await;
+        let d = starts(&s, &team_bot_for("bot-docs", "ana"), "bot-docs starts").await;
+        let mut waiting = Vec::new();
+        for o in [runtime_for("ana"), team_bot_for("bot-jira", "ana")] {
+            let s2 = s.clone();
+            waiting.push(tokio::spawn(async move {
+                s2.acquire(&o, Priority::Interactive).await.map(drop)
+            }));
+            settle(&s, (2, waiting.len())).await;
+        }
+        let own = starts(&s, &own_bot_for("ana"), "her own bot waited").await;
+        assert_eq!(s.snapshot(), (3, 2));
+        // Her own bot holds its one slot; its second call waits for it.
+        let (s2, o) = (s.clone(), own_bot_for("ana"));
+        let own2 =
+            tokio::spawn(async move { s2.acquire(&o, Priority::Interactive).await.map(drop) });
+        settle(&s, (3, 3)).await;
+        drop(own);
+        assert_eq!(own2.await.unwrap(), Ok(()));
+        drop((r, d));
+        for w in waiting {
+            assert_eq!(w.await.unwrap(), Ok(()));
+        }
+        assert_eq!(s.snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn one_person_never_holds_more_than_per_user() {
+        // Pools and shares that add up to more than `per-user` (a config would be refused at
+        // start-up; the scheduler holds the line anyway): Ana still never has more than 3
+        // running, through any mix of clients, while there are GPU slots to spare.
+        let s = sched(8, 3, 64);
+        let wide = |client: &str, id: usize| {
+            Owner::new(Some("ana"), client, 8)
+                .with_person_share(3)
+                .with_pool(Some(PersonPool { id, cap: 3 }))
+        };
+        let owners = [
+            wide("runtime", 0),
+            wide("bot-docs", 1),
+            Owner::new(Some("ana"), "bot-pm-ana", 8).with_person_share(3),
+        ];
+        let mut calls = Vec::new();
+        for _ in 0..3 {
+            for o in &owners {
+                let (s2, o) = (s.clone(), o.clone());
+                calls.push(tokio::spawn(async move {
+                    let p = s2.acquire(&o, Priority::Interactive).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    drop(p);
+                }));
+            }
+        }
+        // A second person isn't held up by her.
+        let bo = starts(&s, &runtime_for("bo"), "bo waited behind ana").await;
+        let mut most = 0;
+        for _ in 0..100 {
+            let ana = s.state.lock().unwrap().per_user.get("ana").copied();
+            most = most.max(ana.unwrap_or(0));
+            assert!(ana.unwrap_or(0) <= 3, "ana has {ana:?} running");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(most, 3, "she did reach her three");
+        for c in calls {
+            c.await.unwrap();
+        }
+        drop(bo);
         assert_eq!(s.snapshot(), (0, 0));
     }
 

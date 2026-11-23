@@ -95,12 +95,67 @@ fn load_where(dir: &Path, keep: impl Fn(&Report) -> bool) -> Result<Vec<(String,
     Ok(reports)
 }
 
+/// The production role models ([`production_models`]): what the production gateway reports
+/// for each role, and, for a labelled role, the hash of the model id behind the label.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProductionModels {
+    /// Role name to the model id, or the role's `label` when it has one, since a labelled
+    /// role is reported by its label (`GET /v1/pmos/roles`), so that is what a report records.
+    pub roles: BTreeMap<String, String>,
+    /// For a labelled role only: role name to the lowercase hex SHA-256 of its `model`, as
+    /// the gateway reports it (`model_sha256`), so a model swapped behind an unchanged label
+    /// restarts the streak (the label hardening of the review at 52dbae2).
+    pub model_sha256: BTreeMap<String, String>,
+}
+
+impl From<BTreeMap<String, String>> for ProductionModels {
+    /// Production role models with no labelled role.
+    fn from(roles: BTreeMap<String, String>) -> Self {
+        Self {
+            roles,
+            model_sha256: BTreeMap::new(),
+        }
+    }
+}
+
+impl std::ops::Index<&str> for ProductionModels {
+    type Output = String;
+    fn index(&self, role: &str) -> &String {
+        &self.roles[role]
+    }
+}
+
+impl ProductionModels {
+    /// `default `model-a` (model sha256 0123456789ab…), extraction `nemo``, for messages.
+    pub fn describe(&self) -> String {
+        self.roles
+            .keys()
+            .map(|r| format!("{r} {}", shown_model(&self.roles, &self.model_sha256, r)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// A role's model as a message shows it: `` `model-a` (model sha256 0123456789ab…) ``, or
+/// `` `none` `` for a missing role.
+fn shown_model(
+    roles: &BTreeMap<String, String>,
+    hashes: &BTreeMap<String, String>,
+    role: &str,
+) -> String {
+    let model = roles.get(role).map(String::as_str).unwrap_or("none");
+    match hashes.get(role) {
+        Some(h) => format!("`{model}` (model sha256 {}…)", &h[..h.len().min(12)]),
+        None => format!("`{model}`"),
+    }
+}
+
 /// The production role models: role name to model id, from the `model` of each role in the
 /// production gateway config that `config.yaml`'s `benchmark.production_gateway` names
-/// (`deploy/gateway.yaml`), or its `label` when it has one, since a labelled role is reported
-/// by its label (`GET /v1/pmos/roles`), so that is what a report records. Only the model ids
-/// and labels are read, never an upstream address.
-pub fn production_models(evals_root: &Path) -> Result<BTreeMap<String, String>, String> {
+/// (`deploy/gateway.yaml`), or its `label` when it has one, with the hash of its `model`
+/// beside it ([`ProductionModels`]). Only the model ids and labels are read, never an
+/// upstream address.
+pub fn production_models(evals_root: &Path) -> Result<ProductionModels, String> {
     let config = crate::config::Config::load(evals_root)?;
     let path = evals_root.join(&config.benchmark.production_gateway);
     let text = std::fs::read_to_string(&path).map_err(|e| {
@@ -115,21 +170,24 @@ pub fn production_models(evals_root: &Path) -> Result<BTreeMap<String, String>, 
         .get("roles")
         .and_then(|r| r.as_mapping())
         .ok_or_else(|| format!("{}: no `roles`", path.display()))?;
-    let mut out = BTreeMap::new();
+    let mut out = ProductionModels::default();
     for (name, role) in roles {
-        let reported = role
-            .get("label")
-            .and_then(|l| l.as_str())
-            .or_else(|| role.get("model").and_then(|m| m.as_str()));
-        let (Some(name), Some(model)) = (name.as_str(), reported) else {
+        let label = role.get("label").and_then(|l| l.as_str());
+        let model = role.get("model").and_then(|m| m.as_str());
+        let (Some(name), Some(model)) = (name.as_str(), model) else {
             return Err(format!(
                 "{}: a role without a name or `model`",
                 path.display()
             ));
         };
-        out.insert(name.to_string(), model.to_string());
+        out.roles
+            .insert(name.to_string(), label.unwrap_or(model).to_string());
+        if label.is_some() {
+            out.model_sha256
+                .insert(name.to_string(), crate::report::sha256_hex(model));
+        }
     }
-    if out.is_empty() {
+    if out.roles.is_empty() {
         return Err(format!("{}: no roles", path.display()));
     }
     Ok(out)
@@ -274,9 +332,15 @@ pub fn persona_version(content: &Path, persona: &str) -> Option<String> {
 /// persona's files then (`report.persona_hash`) is their hash now (`persona_now`,
 /// [`persona_hash`]). `Err` says why not. A report without the gateway's models (every one
 /// before 2026-11-22) never counts.
+///
+/// A labelled production role matches only a report that recorded both its label and the
+/// hash of its model id (`model_sha256`), so a model swapped behind an unchanged label
+/// doesn't keep earlier runs counting. A report written before the gateway reported the hash
+/// has none, so it never matches a labelled production role; it still matches a role without
+/// a label (which has no hash either), as it did before.
 pub fn counts(
     report: &Report,
-    production: &BTreeMap<String, String>,
+    production: &ProductionModels,
     persona_now: Option<&str>,
 ) -> Result<(), String> {
     let Some(m) = &report.gateway_models else {
@@ -297,18 +361,31 @@ pub fn counts(
     if m.upstreams.values().any(|u| u != "local") {
         return Err("a role was served by an upstream that isn't local".into());
     }
-    if &m.roles != production {
+    if m.roles != production.roles || m.model_sha256 != production.model_sha256 {
         let differ: Vec<String> = production
+            .roles
             .keys()
             .chain(m.roles.keys())
+            .chain(m.model_sha256.keys())
+            .chain(production.model_sha256.keys())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .filter(|r| production.get(*r) != m.roles.get(*r))
+            .filter(|r| {
+                production.roles.get(*r) != m.roles.get(*r)
+                    || production.model_sha256.get(*r) != m.model_sha256.get(*r)
+            })
             .map(|r| {
+                let then = shown_model(&m.roles, &m.model_sha256, r);
+                let then = match (
+                    production.model_sha256.contains_key(r),
+                    m.model_sha256.contains_key(r),
+                ) {
+                    (true, false) => format!("{then} (no model hash recorded)"),
+                    _ => then,
+                };
                 format!(
-                    "{r}: `{}`, production `{}`",
-                    m.roles.get(r).map(String::as_str).unwrap_or("none"),
-                    production.get(r).map(String::as_str).unwrap_or("none")
+                    "{r}: {then}, production {}",
+                    shown_model(&production.roles, &production.model_sha256, r)
                 )
             })
             .collect();
@@ -344,7 +421,7 @@ fn short(hash: &str) -> String {
 /// production models (`Err`), none counts.
 pub fn split_counting(
     reports: Vec<(String, Report)>,
-    production: &Result<BTreeMap<String, String>, String>,
+    production: &Result<ProductionModels, String>,
     persona_now: Option<&str>,
 ) -> (Vec<Report>, Vec<(String, NaiveDate, String)>) {
     let mut kept = Vec::new();
