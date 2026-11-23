@@ -280,6 +280,20 @@ host
 printf 'LISTEN 0 4096 *:8772 *:*\n' >>"$R/cmd/ss"
 pf
 expect H-EXPOSURE fail 1 "8772 on every address before H10"
+# 8771 (the web app's internal listener, H9) is never published: a host listener on it fails on
+# every address, loopback included, and on every host (the rule is the same everywhere).
+for exposure in public private; do
+  for l in '0.0.0.0:8771' '127.0.0.1:8771' '10.0.0.5:8771' '[::]:8771' '[::1]:8771' '*:8771'; do
+    host
+    printf 'LISTEN 0 4096 %s 0.0.0.0:*\n' "$l" >>"$R/cmd/ss"
+    pf --exposure "$exposure"
+    expect H-EXPOSURE fail 1 "8771 on $l, $exposure"
+  done
+done
+host
+printf 'LISTEN 0 4096 127.0.0.1:8770 0.0.0.0:*\nLISTEN 0 4096 127.0.0.1:8771 0.0.0.0:*\n' >>"$R/cmd/ss"
+pf
+expect H-EXPOSURE fail 1 "8771 beside a published 8770"
 host
 printf 'LISTEN 0 4096 172.17.0.1:17670 0.0.0.0:*\n' >>"$R/cmd/ss"
 pf
@@ -716,6 +730,11 @@ done
 for p in 8710 8740 8750 8760 8770; do
   grep -q "127.0.0.1:\${PMOS_[A-Z]*_PORT:-$p}:$p" "$REPO/deploy/compose.yaml" || fail "compose.yaml doesn't publish $p as the preflight reads it"
 done
+# 8771 is the web app's internal listener: the preflight refuses any host listener on it, so
+# compose.yaml must set it and publish nothing for it.
+grep -qxF 'INTERNAL_PORT=8771' "$PF" || fail "the preflight's internal port isn't 8771"
+grep -qxF '      PMOS_WEB_INTERNAL_BIND: 0.0.0.0:8771' "$REPO/deploy/compose.yaml" || fail "compose.yaml doesn't set PMOS_WEB_INTERNAL_BIND to 8771"
+[ -z "$(grep '8771' "$REPO/deploy/compose.yaml" | grep -vE '^[[:space:]]*#|^      PMOS_WEB_INTERNAL_BIND: ')" ] || fail "compose.yaml mentions 8771 outside a comment and PMOS_WEB_INTERNAL_BIND (published?)"
 # The block's drop-in text is the same in the preflight and pmos-admin.
 [ "$(sed -n "/^BLOCK_DROPIN_TEXT='/,/'$/p" "$PF")" = "$(sed -n "/^BLOCK_DROPIN_TEXT='/,/'$/p" "$REPO/deploy/pmos-admin")" ] ||
   fail "the drop-in's text differs between the preflight and pmos-admin"

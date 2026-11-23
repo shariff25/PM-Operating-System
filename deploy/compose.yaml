@@ -317,6 +317,11 @@ services:
       # Entra sign-in reaches login.microsoftonline.com through the Spark's proxy, if it has one.
       <<: *proxy
       PMOS_WEB_BIND: 0.0.0.0:8770
+      # The server-to-server route (PUT /internal/brief/{handle}, the daily brief from the Slack
+      # service) on its own listener, reached as http://web.pmos.internal:8771 on the `pmos`
+      # network only: no `ports:` entry publishes it, and the browser-facing listener above
+      # answers 404 for it. Fixed here, not a setting: blank would put the route back on 8770.
+      PMOS_WEB_INTERNAL_BIND: 0.0.0.0:8771
       # pmos-web refuses to start with neither this at 1 nor Entra sign-in configured.
       PMOS_WEB_DEV_LOGIN: ${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}
       # Entra ID sign-in (docs/entra-sign-in.md): on when the tenant, the client id, the secret

@@ -381,6 +381,31 @@ your site already routes that range. The proxy must send `X-Forwarded-For` (ngin
 | `PMOS_WEB_TRUSTED_PROXIES names <x>, but ... the gateway, <g>` | The setting is stale (an old, unpinned gateway such as `172.18.0.1`). Set the printed line. A proxy in a container on the `pmos` network may be listed by its own address inside the subnet. |
 | `PMOS_WEB_PUBLIC_URL must be the web app's https:// address` | Set it. |
 
+**What a reverse proxy in front of the web app must not forward, and how big a body it takes.**
+These rules hold on every host, private or not:
+
+- `/healthz` and `/readyz`: answer `404` at the proxy. `/readyz` names which of the web app's
+  dependencies are down, which tells an outsider what to attack and when. `deploy/pmos-admin
+  status` and the container's health check reach both on `127.0.0.1:8770`.
+- `/internal/`: answer `404` at the proxy. The daily brief route, `PUT /internal/brief/{handle}`,
+  is served only on the web app's internal listener, `8771` (`PMOS_WEB_INTERNAL_BIND`, set by
+  `deploy/compose.yaml`). `8771` is on the `pmos` network only and is **not published**: no host
+  port, no proxy rule, and the preflight's H-EXPOSURE fails if anything on the host listens on it.
+  The Slack service reaches it by name, so with the brief on set
+  `PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771` (`deploy/env.example`). The browser-facing
+  port answers `404` for the route, so a URL ending in `:8770` sends no brief.
+- Body sizes: `client_max_body_size 2m;` on the web app's server block (nginx; axum's own default).
+  The web app's limits are lower on most routes (the brief's route takes 128 KiB, password
+  sign-in 4 KiB). The admin routes' 16 MiB bodies are not served on this port.
+
+```nginx
+location = /healthz    { return 404; }
+location = /readyz     { return 404; }
+location ^~ /internal/ { return 404; }
+```
+
+The full public example (rate limits, TLS, the admin listener) comes with slice H10.
+
 **After it starts, if password sign-in answers "PM OS can't sign you in through this
 address"** (`403 proxy_not_trusted`): the requests arrive from somewhere
 `PMOS_WEB_TRUSTED_PROXIES` doesn't name, or the proxy sends no `X-Forwarded-For`. The web app's
